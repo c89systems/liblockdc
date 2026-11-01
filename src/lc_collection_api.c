@@ -207,3 +207,32 @@ void lc_collection_close(lc_collection *collection) {
   if (collection != NULL && collection->close != NULL)
     collection->close(collection);
 }
+
+void lc_collection_edit_req_init(lc_collection_edit_req *req) {
+  if (req != NULL)
+    memset(req, 0, sizeof(*req));
+}
+int lc_collection_head(lc_collection *c, lc_collection_head_res *out,
+                       lc_error *e) {
+  if (out != NULL)
+    memset(out, 0, sizeof(*out));
+  if (c == NULL || c->head == NULL)
+    return lc_collection_bad_receiver(e);
+  return c->head(c, out, e);
+}
+int lc_collection_edit(lc_collection *c, const lc_collection_edit_req *req,
+                       lc_source *s, lc_collection_edit_res *out, lc_error *e) {
+  if (out != NULL)
+    memset(out, 0, sizeof(*out));
+  if (c == NULL || c->edit == NULL)
+    return lc_collection_bad_receiver(e);
+  return c->edit(c, req, s, out, e);
+}
+int lc_collection_edit_status(lc_collection *c, const char *id,
+                              lc_collection_edit_status_res *out, lc_error *e) {
+  if (out != NULL)
+    memset(out, 0, sizeof(*out));
+  if (c == NULL || c->edit_status == NULL)
+    return lc_collection_bad_receiver(e);
+  return c->edit_status(c, id, out, e);
+}

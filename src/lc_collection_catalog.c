@@ -404,6 +404,7 @@ int lc_client_collection_capabilities_method(lc_client *self,
     out->append_writer = 1;
     out->append_staged = 1;
     out->leases = out->lease_takeover = out->private_reads = 1;
+    out->atomic_edit = 1;
   }
   return LC_OK;
 }

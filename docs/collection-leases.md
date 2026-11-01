@@ -111,8 +111,9 @@ changes advance the core ABI once from the latest released ABI.
 
 ## Storage upgrade
 
-This change extends the canonical collection-head layout and uses core ABI 8,
-one step after released ABI 7. On Pouch root open, released 128-byte collection
+Lease support introduced the extended canonical head in v0.25.0 with ABI 8.
+Current receivers use ABI 9 for [atomic edits](collection-edits.md). On Pouch
+root open, released 128-byte collection
 heads are automatically upgraded to the 384-byte ownership layout, with no
 active lease and an initial fencing token of zero. Positions, identities,
 retention and canonical entry files are preserved; no entry replay or body

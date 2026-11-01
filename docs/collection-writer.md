@@ -3,9 +3,10 @@
 Implementation contract extending [ordered collections](collections.md).
 The initial backend is Pouch, with matching C and Lua surfaces. Remote
 collections remain unsupported. Collection receiver and capability additions
-use core ABI 8, advancing once from ABI 7 in v0.24.0. Rebuild C consumers and
-the optional PostgreSQL provider; see
-[upgrade instructions](../CHANGELOG.md#upgrading-from-024x).
+now use core ABI 9, advancing once from ABI 8 in v0.25.0 for atomic edits and
+read preconditions. Rebuild C consumers and the optional PostgreSQL provider.
+For an atomic cut/replacement/recovery marker, use an [edit](collection-edits.md);
+ordinary append and staged/push writer behavior is unchanged.
 
 ## Scope and publication
 

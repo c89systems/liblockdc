@@ -73,8 +73,6 @@ struct lc_pouch_writer_root_lock_entry {
 
 static lc_pouch_writer_root_lock_entry *lc_pouch_writer_root_locks;
 
-/* Match Go disk's bounded durable group-commit window. */
-#define LC_POUCH_FSYNC_BATCH_DELAY_NS 2000000L
 #define LC_POUCH_EXCLUSIVE_WRITER_TOUCH_NS 1000000000L
 #define LC_POUCH_EXCLUSIVE_WRITER_TTL_NS ((int64_t)3 * (int64_t)1000000000)
 #define LC_POUCH_WRITER_PRESENCE_MISSING (-1001)
@@ -139,6 +137,7 @@ static lc_pouch_fsync_batcher *lc_pouch_fsync_batchers;
 #ifdef LOCKDC_TEST_BUILD
 long lc_pouch_test_fsync_batch_delay_ns;
 int (*lc_pouch_test_sync_fd)(int fd);
+void (*lc_pouch_test_fsync_enqueued)(void);
 #endif
 
 static int lc_pouch_mutex_init_recursive(pthread_mutex_t *mutex) {
@@ -170,6 +169,7 @@ static int lc_pouch_sync_fd(int fd) {
 #endif
 }
 
+#ifdef LOCKDC_TEST_BUILD
 static void lc_pouch_fsync_deadline(struct timespec *deadline, long delay_ns) {
   if (deadline == NULL) {
     return;
@@ -181,6 +181,7 @@ static void lc_pouch_fsync_deadline(struct timespec *deadline, long delay_ns) {
     deadline->tv_nsec %= 1000000000L;
   }
 }
+#endif
 
 static uint64_t lc_pouch_elapsed_ns(const struct timespec *started,
                                     const struct timespec *finished) {
@@ -237,6 +238,7 @@ static void lc_pouch_fsync_record_batch_locked(lc_pouch_fsync_batcher *batcher,
   ++batcher->stats.counts[bucket];
 }
 
+#ifdef LOCKDC_TEST_BUILD
 static int
 lc_pouch_fsync_batch_limit_reached(const lc_pouch_fsync_batcher *batcher) {
   if (batcher == NULL || batcher->batch_max_ops == 0U) {
@@ -244,6 +246,7 @@ lc_pouch_fsync_batch_limit_reached(const lc_pouch_fsync_batcher *batcher) {
   }
   return (uint64_t)batcher->queue_count >= batcher->batch_max_ops;
 }
+#endif
 
 static void
 lc_pouch_fsync_batcher_recompute_limit_locked(lc_pouch_fsync_batcher *batcher) {
@@ -434,10 +437,12 @@ static void *lc_pouch_fsync_worker(void *arg) {
   lc_pouch_fsync_batcher *batcher;
   lc_pouch_fsync_request *batch;
   lc_pouch_fsync_request *request;
-  struct timespec deadline;
   size_t batch_count;
   uint64_t sync_ns;
+#ifdef LOCKDC_TEST_BUILD
+  struct timespec deadline;
   long batch_delay_ns;
+#endif
 
   batcher = (lc_pouch_fsync_batcher *)arg;
   pthread_mutex_lock(&batcher->mutex);
@@ -449,12 +454,9 @@ static void *lc_pouch_fsync_worker(void *arg) {
       pthread_mutex_unlock(&batcher->mutex);
       return NULL;
     }
-    batch_delay_ns = LC_POUCH_FSYNC_BATCH_DELAY_NS;
 #ifdef LOCKDC_TEST_BUILD
-    if (lc_pouch_test_fsync_batch_delay_ns > 0L) {
-      batch_delay_ns = lc_pouch_test_fsync_batch_delay_ns;
-    }
-#endif
+    /* Tests can hold this window open to coordinate exact group membership. */
+    batch_delay_ns = lc_pouch_test_fsync_batch_delay_ns;
     if (!batcher->stop && batch_delay_ns > 0L &&
         !lc_pouch_fsync_batch_limit_reached(batcher)) {
       lc_pouch_fsync_deadline(&deadline, batch_delay_ns);
@@ -465,6 +467,9 @@ static void *lc_pouch_fsync_worker(void *arg) {
         }
       }
     }
+#endif
+    /* Flush the ready group immediately. Requests arriving during I/O form
+     * the next group; a sequential producer cannot fill a deliberate wait. */
     batch = lc_pouch_fsync_take_batch(batcher, &batch_count);
     pthread_mutex_unlock(&batcher->mutex);
     sync_ns = 0U;
@@ -3342,6 +3347,10 @@ int lc_pouch_fsync_commit(lc_pouch *pouch, int fd, lc_error *error) {
   }
   batcher->tail = &request;
   ++batcher->queue_count;
+#ifdef LOCKDC_TEST_BUILD
+  if (lc_pouch_test_fsync_enqueued != NULL)
+    lc_pouch_test_fsync_enqueued();
+#endif
   pthread_cond_signal(&batcher->cond);
   while (!request.done) {
     pthread_cond_wait(&request.cond, &batcher->mutex);

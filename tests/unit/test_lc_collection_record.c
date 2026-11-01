@@ -35,7 +35,45 @@ typedef struct fixture {
   lc_pouch_unix_seconds now;
   int clock_failed;
   unsigned int next_case;
+  lc_allocator allocator;
+  size_t live, rejected_size, rejected;
+  int custom_allocator, reject_metadata;
 } fixture;
+
+static void *record_alloc(void *context, size_t size) {
+  fixture *f = context;
+  void *p;
+  if (f->reject_metadata && size == f->rejected_size) {
+    ++f->rejected;
+    return NULL;
+  }
+  p = malloc(size);
+  if (p)
+    ++f->live;
+  return p;
+}
+static void record_free(void *context, void *p) {
+  fixture *f = context;
+  if (p) {
+    assert_true(f->live > 0);
+    --f->live;
+    free(p);
+  }
+}
+static void *record_resize(void *context, void *p, size_t size) {
+  fixture *f = context;
+  if (!p)
+    return record_alloc(context, size);
+  if (!size) {
+    record_free(context, p);
+    return NULL;
+  }
+  if (f->reject_metadata && size == f->rejected_size) {
+    ++f->rejected;
+    return NULL;
+  }
+  return realloc(p, size);
+}
 
 static void clear_error(fixture *f) {
   lc_error_cleanup(&f->error);
@@ -74,6 +112,7 @@ static int teardown(void **state) {
   lc_pouch_test_queue_clock_gettime = NULL;
   lc_pouch_test_queue_time_context = NULL;
   lc_pouch_close(f->pouch);
+  assert_int_equal(f->live, 0);
   lc_pouch_crypto_key_string_free(f->key);
   lc_error_cleanup(&f->error);
   lc_test_tmp_cleanup_path(f->root, PREFIX);
@@ -99,7 +138,9 @@ static void open_case(fixture *f, int mode, int durable) {
   opts.durable_sync = durable;
   assert_true(
       snprintf(root, sizeof(root), "%s/case-%u", f->root, f->next_case++) > 0);
-  assert_int_equal(lc_pouch_open(root, NULL, &opts, &f->pouch, &f->error),
+  assert_int_equal(lc_pouch_open(root,
+                                 f->custom_allocator ? &f->allocator : NULL,
+                                 &opts, &f->pouch, &f->error),
                    LC_OK);
   assert_true(snprintf(f->path, sizeof(f->path), "%s/%s", root, leaf) > 0);
   f->fd = open(f->path, O_CREAT | O_RDWR | O_TRUNC, 0600);
@@ -126,14 +167,15 @@ static int append_json(fixture *f, const char *id, const char *json,
   return rc;
 }
 
-static void assert_body(fixture *f, const lc_pouch_collection_record *record,
-                        const char *expected) {
+static void assert_body_context(fixture *f,
+                                const lc_pouch_collection_record *record,
+                                const char *binding, const char *expected) {
   const void *bytes;
   size_t length;
   size_t written;
   assert_int_equal(lc_pouch_crypto_source_from_file_span(
-                       f->pouch->crypto, record->context, record->context,
-                       f->path, record->payload_offset, record->stored_bytes,
+                       f->pouch->crypto, record->context, binding, f->path,
+                       record->payload_offset, record->stored_bytes,
                        record->descriptor[0] ? record->descriptor : NULL,
                        &f->decoded, &f->error),
                    LC_OK);
@@ -147,6 +189,11 @@ static void assert_body(fixture *f, const lc_pouch_collection_record *record,
   lc_sink_close(f->sink);
   f->decoded = NULL;
   f->sink = NULL;
+}
+
+static void assert_body(fixture *f, const lc_pouch_collection_record *record,
+                        const char *expected) {
+  assert_body_context(f, record, record->context, expected);
 }
 
 static int record_clock(clockid_t clock_id, struct timespec *out,
@@ -844,7 +891,7 @@ test_staged_encoded_copy_checks_integrity_and_rolls_back(void **state) {
   unsigned char *copy;
   uint64_t end;
   for (int mode = 0; mode < 4; ++mode) {
-    for (int failure = 0; failure < 3; ++failure) {
+    for (int failure = 0; failure < 4; ++failure) {
       open_case(f, mode, 0);
       assert_int_equal(append_json(f, "prior", "{}", 1, 1, &prior), LC_OK);
       end = file_end(f);
@@ -871,9 +918,25 @@ test_staged_encoded_copy_checks_integrity_and_rolls_back(void **state) {
       assert_int_equal(lc_source_from_memory(copy, length - (failure == 1),
                                              &f->source, &f->error),
                        LC_OK);
+      if (failure == 3) {
+        f->clock_failed = 1;
+        lc_pouch_test_queue_clock_gettime = record_clock;
+        lc_pouch_test_queue_time_context = f;
+      }
       int rc = lc_pouch_collection_writer_copy_staged(writer, f->fd, leaf,
                                                       f->source, &f->error);
-      assert_int_equal(rc, failure ? LC_ERR_PROTOCOL : LC_OK);
+      f->clock_failed = 0;
+      lc_pouch_test_queue_clock_gettime = NULL;
+      lc_pouch_test_queue_time_context = NULL;
+      assert_int_equal(rc, failure == 3 ? LC_ERR_TRANSPORT
+                           : failure    ? LC_ERR_PROTOCOL
+                                        : LC_OK);
+      if (failure == 3) {
+        clear_error(f);
+        assert_int_equal(lc_pouch_collection_writer_publish(
+                             writer, leaf, 2, 2, &published, &f->error),
+                         LC_ERR_INVALID);
+      }
       if (!failure) {
         assert_int_equal(lc_pouch_collection_writer_publish(
                              writer, leaf, 2, 2, &published, &f->error),
@@ -906,8 +969,58 @@ test_staged_encoded_copy_checks_integrity_and_rolls_back(void **state) {
   }
 }
 
+static void test_publication_reuses_reserved_metadata(void **state) {
+  fixture *f = *state;
+  lc_pouch_collection_writer *writer = NULL;
+  lc_pouch_collection_record record, replayed;
+  char binding[256];
+  int rc;
+  snprintf(binding, sizeof(binding), "collection:%s:reserved:1", f->id);
+  f->custom_allocator = 1;
+  f->allocator.malloc_fn = record_alloc;
+  f->allocator.realloc_fn = record_resize;
+  f->allocator.free_fn = record_free;
+  f->allocator.context = f;
+  for (int mode = 0; mode < 4; ++mode) {
+    for (int deferred = 0; deferred < 2; ++deferred) {
+      open_case(f, mode, 0);
+      assert_int_equal(lc_pouch_collection_writer_open(
+                           f->pouch, f->fd, leaf, f->id, "reserved",
+                           deferred ? 0 : 1, deferred ? 0 : 1, -60, 1, -120,
+                           &writer, &f->error),
+                       LC_OK);
+      assert_int_equal(
+          lc_source_from_memory("{\"small\":1}", 11, &f->source, &f->error),
+          LC_OK);
+      assert_int_equal(lc_pouch_collection_writer_consume(
+                           writer, f->pouch, f->source, &record, &f->error),
+                       LC_OK);
+      lc_source_close(f->source);
+      f->source = NULL;
+      f->rejected_size = record.metadata_length;
+      f->reject_metadata = 1;
+      rc = lc_pouch_collection_writer_publish(writer, leaf, 1, 1, &record,
+                                              &f->error);
+      f->reject_metadata = 0;
+      lc_pouch_collection_writer_close(writer);
+      writer = NULL;
+      assert_int_equal(rc, LC_OK);
+      assert_int_equal(f->rejected, 0);
+      assert_int_equal(lc_pouch_collection_record_read(
+                           f->fd, 0, file_end(f), leaf, &replayed, &f->error),
+                       LC_OK);
+      assert_body_context(f, &replayed, binding, "{\"small\":1}");
+      assert_true(replayed.retention > 0 &&
+                  replayed.collection_retention > replayed.retention);
+      assert_string_equal(replayed.etag, record.etag);
+    }
+  }
+}
+
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(test_publication_reuses_reserved_metadata,
+                                      setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_staged_encoded_copy_checks_integrity_and_rolls_back, setup,
           teardown),

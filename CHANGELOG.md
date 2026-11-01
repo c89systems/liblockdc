@@ -1,5 +1,54 @@
 # Release notes
 
+## Unreleased
+
+## 0.26.0
+
+- Add atomic collection range edits with an optional streaming replacement,
+  bounded recovery descriptor, head preconditions and persistent retry receipts.
+  Preserve entry positions, pinned readers, lease fencing, retention and codec
+  conversion through matching C and Lua APIs. Edits are collection-local and
+  supported by Pouch; remote capability discovery reports unsupported.
+- Advance the core shared-library ABI once from released ABI 8 to ABI 9 for the
+  collection receiver, capability and read-option layouts. Rebuild C consumers,
+  Lua native bindings and the optional PostgreSQL provider together.
+- Reuse bounded decoding, key-derivation and binding contexts across collection
+  entries, coalesce encrypted frame reads, and reduce metadata decoding and
+  callback-lock overhead. Preserve independent entry authentication, payload
+  fingerprints and streaming backpressure without caching document bodies.
+- Encrypt streaming frames in place, removing a separate 64 KiB plaintext
+  allocation, copy and wipe per encrypted writer. Keep key/nonce handling,
+  frame boundaries and complete scratch cleanup on failure.
+- Coalesce residual encrypted output and its terminal frame at EOF, preserving
+  immediate full-frame delivery and byte-identical framing. Reuse each
+  collection writer's metadata reservation through publication, eliminating
+  a second metadata allocation without changing durability or storage format.
+- Reduce collection edit CPU and read calls with page-level range counting,
+  direct validated seeks for dense positions and projection from the writer's
+  bounded control metadata. Preserve canonical receipt validation on recovery,
+  sparse-position lookup, pinned-reader visibility and configured durability.
+- Dispatch ready Pouch durable-sync groups without the fixed two-millisecond
+  coalescing delay. Preserve per-file deduplication, arrivals grouped during
+  I/O, live request-count bounds and shared failure outcomes. Keep durable
+  acknowledgement, collection publication and NoSync policy unchanged.
+
+### Upgrading from 0.25.x
+
+Rebuild C/C++ consumers, Lua native bindings and the optional PostgreSQL provider
+against core ABI **9** (`liblockdc.so.9` or `liblockdc.9.dylib`). Collection
+receivers, capabilities and read-option layouts changed; the provider's own ABI
+remains **0**. Existing append calls and reads configured through
+`lc_collection_read_opts_init` retain their behavior when optional edit/head
+preconditions are unused.
+
+Existing 0.25.x Pouch roots require no conversion or entry-body rewrite. Upgrade
+all clients before using atomic edits: older binaries cannot replay the new
+edit records. Do not mix older clients with collections that contain edits.
+Receipts remain until the collection is dropped, including after payload
+deletion, expiry and compaction. See the [atomic edit contract](docs/collection-edits.md)
+for retry, reconciliation and NoSync durability semantics. Remote collections
+remain unsupported.
+
 ## 0.25.0
 
 - Add explicit staged pull through `lc_collection_append_staged` and the Lua

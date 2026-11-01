@@ -52,19 +52,58 @@ function(lc_add_unit_test target_name)
       endif()
     endforeach()
   endif()
-  add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
+  set(test_names ${target_name})
+  if(target_name STREQUAL "lc_unit_collections")
+    # Partition the selected table in every configuration. QEMU portability
+    # selections need the same bounded fork/fsync work as the full native table.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_collections.c")
+    set(selected_cases ${cases})
+    if(NOT selected_cases)
+      file(READ "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_collections.c" case_source)
+      string(REGEX MATCHALL "cmocka_unit_test_setup_teardown\\([ \r\n]*[A-Za-z0-9_]+"
+        registrations "${case_source}")
+      foreach(registration IN LISTS registrations)
+        string(REGEX REPLACE ".*\\([ \r\n]*" "" case "${registration}")
+        list(APPEND selected_cases ${case})
+      endforeach()
+    endif()
+    list(APPEND test_names ${target_name}_append ${target_name}_recovery)
+    set(cases)
+    set(append_cases)
+    set(recovery_cases)
+    foreach(case IN LISTS selected_cases)
+      if(case MATCHES "^test_push_")
+        list(APPEND append_cases ${case})
+      elseif(case MATCHES "migration|compaction|transforms|^test_segment_seals_")
+        list(APPEND recovery_cases ${case})
+      else()
+        list(APPEND cases ${case})
+      endif()
+    endforeach()
+    foreach(group cases append_cases recovery_cases)
+      if(NOT ${group})
+        message(FATAL_ERROR "Empty collection test partition: ${group}")
+      endif()
+    endforeach()
+    add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
+    add_test(NAME ${target_name}_append COMMAND ${target_name} ${append_cases})
+    add_test(NAME ${target_name}_recovery COMMAND ${target_name} ${recovery_cases})
+  else()
+    add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
+  endif()
   # Every portable unit executable runs on each Linux target. The three large
   # storage tables use named portability cases in optimized configurations.
-  set_tests_properties(${target_name} PROPERTIES
+  set_tests_properties(${test_names} PROPERTIES
     LABELS "unit;cross-runtime"
     TIMEOUT 60)
-  if(cases)
-    set_property(TEST ${target_name} APPEND PROPERTY LABELS portability)
+  if(cases AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    set_property(TEST ${test_names} APPEND PROPERTY LABELS portability)
   endif()
   set_property(GLOBAL APPEND PROPERTY LOCKDC_CROSS_RUNTIME_TEST_TARGETS
     ${target_name})
   if(LOCKDC_C_TEST_ENVIRONMENT)
-    set_tests_properties(${target_name} PROPERTIES
+    set_tests_properties(${test_names} PROPERTIES
       ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
   endif()
 endfunction()
@@ -80,22 +119,21 @@ lc_add_unit_test(lc_unit_collection_json test_lc_collection_json.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 lc_add_unit_test(lc_unit_collection_record test_lc_collection_record.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+lc_add_unit_test(lc_unit_pouch_reader test_lc_pouch_reader.c
+  ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+lc_add_unit_test(lc_unit_pouch_writer test_lc_pouch_writer.c
+  ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+target_compile_definitions(lc_unit_pouch_writer PRIVATE LOCKDC_TEST_BUILD=1)
 target_compile_definitions(lc_unit_collection_record PRIVATE LOCKDC_TEST_BUILD=1)
 lc_add_unit_test(lc_unit_collection_ids test_lc_collection_ids.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+lc_add_unit_test(lc_unit_collection_edits test_lc_collection_edits.c
+  ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+target_compile_definitions(lc_unit_collection_edits PRIVATE LOCKDC_TEST_BUILD=1
+  LC_COLLECTION_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
 lc_add_unit_test(lc_unit_collections test_lc_collections.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_collections PRIVATE LOCKDC_TEST_BUILD=1)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  # The full storage table approaches the per-test deadline. Keep append
-  # coverage separate so focused work and cumulative fork/fsync costs stay bounded.
-  set_property(TEST lc_unit_collections APPEND PROPERTY ENVIRONMENT
-    "CMOCKA_SKIP_FILTER=test_push_*")
-  add_test(NAME lc_unit_collections_append COMMAND lc_unit_collections)
-  set_tests_properties(lc_unit_collections_append PROPERTIES
-    LABELS "unit;local" TIMEOUT 60
-    ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT};CMOCKA_TEST_FILTER=test_push_*;CMOCKA_SKIP_FILTER=")
-endif()
 lc_add_unit_test(lc_unit_collection_sync test_lc_collection_sync.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_collection_sync PRIVATE LOCKDC_TEST_BUILD=1)
@@ -105,7 +143,7 @@ target_compile_definitions(lc_unit_collection_staged PRIVATE LOCKDC_TEST_BUILD=1
 lc_add_unit_test(lc_unit_mixed_storage test_lc_mixed_storage.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_mixed_storage PRIVATE LOCKDC_TEST_BUILD=1)
-foreach(collection_test lc_unit_collection_order lc_unit_collection_json lc_unit_collection_record lc_unit_collection_ids lc_unit_collections lc_unit_collection_sync lc_unit_collection_staged lc_unit_mixed_storage)
+foreach(collection_test lc_unit_collection_order lc_unit_collection_json lc_unit_collection_record lc_unit_pouch_reader lc_unit_pouch_writer lc_unit_collection_ids lc_unit_collections lc_unit_collection_sync lc_unit_collection_staged lc_unit_mixed_storage)
   target_compile_definitions(${collection_test} PRIVATE
     LC_COLLECTION_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
 endforeach()
@@ -374,18 +412,22 @@ endif()
 set_property(GLOBAL APPEND PROPERTY LOCKDC_CROSS_RUNTIME_TEST_TARGETS lc_unit_transport_https)
 
 # Validate unit registration before the parent assembles the runtime build
-# closure shared with integration tests. Unit test names match their targets.
+# closure shared with integration tests. Collection partitions share one target.
 get_property(lc_cross_runtime_test_targets GLOBAL PROPERTY
   LOCKDC_CROSS_RUNTIME_TEST_TARGETS)
 get_property(lc_registered_unit_tests DIRECTORY PROPERTY TESTS)
 foreach(lc_registered_test IN LISTS lc_registered_unit_tests)
   get_test_property(${lc_registered_test} LABELS lc_registered_test_labels)
   if("cross-runtime" IN_LIST lc_registered_test_labels)
-    if(NOT TARGET ${lc_registered_test})
+    set(lc_registered_target ${lc_registered_test})
+    if(lc_registered_test MATCHES "^lc_unit_collections_(append|recovery)$")
+      set(lc_registered_target lc_unit_collections)
+    endif()
+    if(NOT TARGET ${lc_registered_target})
       message(FATAL_ERROR
         "cross-runtime test ${lc_registered_test} has no executable target")
     endif()
-    if(NOT lc_registered_test IN_LIST lc_cross_runtime_test_targets)
+    if(NOT lc_registered_target IN_LIST lc_cross_runtime_test_targets)
       message(FATAL_ERROR
         "cross-runtime test ${lc_registered_test} is missing from the QEMU build closure")
     endif()

@@ -385,7 +385,7 @@ order without entry bodies. The visitor accepts a description by returning
 operations. Pouch currently enables `collections`, `lql_filter`, `resume`,
 `checkpoint`, `ranges`, `first_n`, `count_retention`, `append_writer`,
 `append_staged`, `append_collection_retention`, `leases`, `lease_takeover`, and
-`private_reads`; `last_n` and `position_selection` are false.
+`private_reads`, and `atomic_edit`; `last_n` and `position_selection` are false.
 A remote client's capability query returns all false without a network request;
 other collection operations are unsupported. Unknown selection options are
 rejected rather than ignored.
@@ -396,6 +396,9 @@ rejected rather than ignored.
 | `takeover(request, observed_lease_id)` | Owned receiver replacing exactly the observed live lease |
 | `keepalive({ttl_seconds=30})` | Refreshed ownership metadata, without changing retention |
 | `release()` | True; releases ownership and closes this receiver on success |
+| `head()` | Coherent identity, opaque ETag, counts and bounded recovery descriptor/anchor availability |
+| `edit(request, source?)` | Atomic range cut, optional streamed replacement and recovery descriptor; original result on an identical retry |
+| `edit_status(operation_id)` | `found` and the original committed `result`; absence does not cancel an in-flight edit |
 | `describe()` | Namespace, name, collection ID, upper position, live count, indexing, retention and lease metadata |
 | `metadata({retention_seconds=..., max_entries="1000"})` | Updated collection description |
 | `append({append_id=..., retention_seconds=..., collection_retention_seconds=...}, source)` | Position, ETag, bytes, duplicate/deleted and retention facts |
@@ -407,6 +410,31 @@ rejected rather than ignored.
 | `delete_entry(position)` | Position, `deleted`, and `already_deleted` |
 | `drop()` | `true` after logical removal; physical cleanup follows maintenance |
 | `close()` | Release only this local receiver; repeat close is harmless |
+
+Atomic [edits](collection-edits.md) require `operation_id` and `expected_head`
+from `head().etag`. Ranges are sorted disjoint `{after="...", through="..."}`
+intervals (at most 64). Optional `replacement` contains ordinary append options;
+pass its raw JSON source as the second argument. Its append ID must be unused.
+Optional `recovery` is at most 1024 UTF-8 bytes: omit to preserve, `""` to clear.
+A selected `recovery_anchor="replacement"` binds the newly assigned position;
+otherwise use a live decimal position or omit it for no anchor. The marker does
+not retain that entry. `head().recovery_anchor_available` becomes false after
+entry removal. `read({expected_head=token}, sink)` rejects a changed head before
+any output. A stale edit returns `error.current_head` with the observed token
+and counts. Errors after publication carry `uncertain=true` and the original
+`result`; reconcile them through `edit_status` or an identical retry. Do not automatically rebase a changed request under its old ID.
+
+```lua
+local observed = assert(collection:head())
+local edited = assert(collection:edit({
+  operation_id = "trim-command-42", expected_head = observed.etag,
+  ranges = {{after="100", through=observed.upper_position}},
+  replacement = {append_id="baseline-42"},
+  recovery = '{"replay":"baseline"}', recovery_anchor="replacement",
+}, source))
+-- Persist the request/operation ID before attempting it. After an uncertain
+-- error, inspect edit_status or retry the identical request and compact bytes.
+```
 
 All uint64 positions, byte counts and record counts are canonical decimal
 strings, including small values. Position inputs use those strings too; Lua

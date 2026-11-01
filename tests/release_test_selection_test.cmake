@@ -46,9 +46,8 @@ foreach(selection all runtime cross)
 endforeach()
 
 include("${LOCKDC_ROOT}/tests/unit/portability.cmake")
-foreach(target lc_unit_pouch lc_unit_outbox lc_unit_collections)
-    # The full native table must remain argument-free. Optimized configurations
-    # must execute exactly the declared cases, never an accidentally empty list.
+foreach(target lc_unit_pouch lc_unit_outbox)
+    # Collections have their own per-configuration partition contract.
     string(JSON command_length LENGTH "${${target}_command}")
     math(EXPR last_argument "${command_length} - 1")
     set(found_binary FALSE)
@@ -81,6 +80,7 @@ foreach(version 15 16 17 18)
     endif()
 endforeach()
 foreach(name lc_unit_pouch lc_unit_outbox lc_unit_collections lc_unit_state_retention
+        collection_test_selection_test
         lc_unit_collection_sync lc_unit_mixed_storage lc_unit_pouch_xa lc_unit_xa_borrow
         lc_allocator_exit_probe pouch_compaction_background_test pouch_compaction_small-stack_test)
     if(NOT name IN_LIST runtime_tests OR NOT name IN_LIST cross_tests)

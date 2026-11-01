@@ -70,8 +70,12 @@ int lc_pouch_crypto_stream_to_fd_crc_with_compression(
 typedef int (*lc_pouch_crypto_producer_fn)(void *context, lc_sink *sink,
                                            lc_error *error);
 typedef struct lc_pouch_crypto_output lc_pouch_crypto_writer;
-/* Owns bounded encoder scratch; borrows fd, crypto and context until close.
- * Finish flushes frames but never fsyncs, closes or publishes the record. */
+/* Owns bounded encoder scratch; encrypted output shares one heap frame between
+ * plaintext and ciphertext and wipes the whole allocation on close. Borrows
+ * fd, crypto and context until close. Full frames flow before EOF; finish
+ * coalesces a residual encrypted frame and its terminal in one bounded write.
+ * Finish flushes frames but never fsyncs,
+ * closes or publishes the record. */
 int lc_pouch_crypto_writer_open(lc_pouch_crypto *crypto, const char *context,
                                 int fd, int allow_compression,
                                 lc_pouch_crypto_writer **out, lc_error *error);
@@ -115,12 +119,31 @@ int lc_pouch_crypto_source_from_file_span(
     lc_pouch_crypto *crypto, const char *context, const char *binding_context,
     const char *path, uint64_t offset, uint64_t length, const char *descriptor,
     lc_source **out, lc_error *error);
+/* Consumes fd on success or failure; the returned source owns it. */
 int lc_pouch_crypto_source_from_fd_span(lc_pouch_crypto *crypto,
                                         const char *context,
                                         const char *binding_context, int fd,
                                         uint64_t offset, uint64_t length,
                                         const char *descriptor, lc_source **out,
                                         lc_error *error);
+
+/* Operation-owned decoding scratch, reused across independent payload spans.
+ * Crypto and fd are borrowed; neither is closed by clear/bind/close. Each bind
+ * checks the new descriptor/binding and starts independent authentication and
+ * decompression state. The returned source borrows the reader until clear or
+ * the next bind. Its reset replays this span; close destroys the reader.
+ * All scratch is bounded, heap allocated and released by reader_close. */
+typedef struct lc_pouch_crypto_reader lc_pouch_crypto_reader;
+int lc_pouch_crypto_reader_open(lc_pouch_crypto *crypto,
+                                lc_pouch_crypto_reader **out, lc_error *error);
+int lc_pouch_crypto_reader_bind(lc_pouch_crypto_reader *reader,
+                                const char *context,
+                                const char *binding_context, int fd,
+                                uint64_t offset, uint64_t length,
+                                const char *descriptor, lc_source **out,
+                                lc_error *error);
+void lc_pouch_crypto_reader_clear(lc_pouch_crypto_reader *reader);
+void lc_pouch_crypto_reader_close(lc_pouch_crypto_reader *reader);
 
 #ifdef LOCKDC_TEST_BUILD
 int lc_pouch_crypto_test_check_byte_counter(uint64_t total, size_t delta,

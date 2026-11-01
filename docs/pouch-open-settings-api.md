@@ -80,6 +80,12 @@ and also drives state/collection expiry and dropped-partition cleanup, normally
 on a 30-minute cadence. Outbox receipt/dead-letter reclamation instead belongs
 to its explicitly acquired dispatcher.
 
+The durable-sync worker dispatches ready requests without a batching delay.
+Requests arriving during I/O form the next group. `fsync_batch_max_ops` is an
+upper bound, not a minimum group size; zero is unbounded. Handles in one
+process share the root's batcher and use their lowest nonzero bound. Separate
+processes have separate SDK queues.
+
 ## Resolution rules
 
 Each field resolves once during client construction, in this order:

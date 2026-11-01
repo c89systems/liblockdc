@@ -387,6 +387,8 @@ extern void *lc_pouch_test_before_terminal_reclaim_marker_remove_context;
  */
 extern long lc_pouch_test_fsync_batch_delay_ns;
 extern int (*lc_pouch_test_sync_fd)(int fd);
+/* Invoked under the batch mutex after enqueue; must not reenter Pouch. */
+extern void (*lc_pouch_test_fsync_enqueued)(void);
 size_t lc_pouch_test_resident_descriptor_count(lc_pouch *pouch);
 void lc_pouch_test_indexer_deadline(lc_pouch *pouch, struct timespec *deadline);
 void lc_pouch_test_compaction_run_pass(lc_pouch *pouch);

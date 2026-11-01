@@ -323,7 +323,9 @@ typedef struct lc_pouch_settings {
    * Default zero is NoSync. Recovery/retirement barriers can still force sync.
    */
   int durable_sync;
-  /** Maximum durable group-commit requests; zero leaves it unbounded. */
+  /** Maximum durable group-commit requests; zero leaves it unbounded.
+   * Ready requests dispatch without a fill delay. The root queue is shared
+   * among handles in this process; separate processes have separate queues. */
   uint64_t fsync_batch_max_ops;
   /** Target immutable segment size; zero uses the Pouch default. */
   uint64_t segment_target_bytes;
@@ -632,9 +634,9 @@ typedef struct lc_collection_info {
 
 /** Endpoint-local capabilities, queried without a network request. Pouch
  * supports LQL, both cursors, ranges, first-N, count retention, append writers,
- * explicit staged pull, atomic parent renewal and optional collection leases.
- * Last-N and position selection are currently false.
- * Remote clients currently return all fields as zero. */
+ * explicit staged pull, atomic parent renewal, collection leases and atomic
+ * edits. Last-N and position selection are currently false. Remote clients
+ * currently return all fields as zero. */
 typedef struct lc_collection_capabilities {
   int collections;
   int lql_filter;
@@ -658,6 +660,9 @@ typedef struct lc_collection_capabilities {
   int lease_takeover;
   /** Supports private payload visibility during ownership. */
   int private_reads;
+  /** Atomic range edits, retry receipts, recovery heads and read preconditions.
+   */
+  int atomic_edit;
 } lc_collection_capabilities;
 
 /** Required retry identity, scoped to a collection incarnation. Supply 1..128
@@ -727,6 +732,73 @@ typedef struct lc_collection_append_status_res {
   lc_collection_append_res entry;
 } lc_collection_append_status_res;
 
+#define LC_COLLECTION_EDIT_MAX_RANGES 64U
+#define LC_COLLECTION_RECOVERY_MAX_BYTES 1024U
+
+/** One finite, after-exclusive / through-inclusive pre-edit interval. */
+typedef struct lc_collection_edit_range {
+  uint64_t after;
+  uint64_t through;
+} lc_collection_edit_range;
+
+/** Coherent payload-protected observation. Fixed storage needs no cleanup.
+ * etag is opaque, incarnation-scoped and may change on canonical recovery.
+ * Zero anchor means no required entry and reports available. An unavailable
+ * nonzero anchor does not pin or resurrect the referenced entry. */
+typedef struct lc_collection_head_res {
+  char collection_id[LC_XID_STRING_SIZE];
+  char etag[65];
+  uint64_t upper_position;
+  uint64_t live_count;
+  uint64_t recovery_revision;
+  uint64_t recovery_anchor;
+  int recovery_anchor_available;
+  char recovery[LC_COLLECTION_RECOVERY_MAX_BYTES + 1U];
+} lc_collection_head_res;
+
+/** Bounded options and metadata are copied before input callbacks. Keep
+ * original retry metadata separate from result storage. Ranges must be
+ * ordered/disjoint. A source requires replacement and vice versa; a new
+ * replacement ID must be unused. Omitted recovery preserves; a selected empty
+ * string clears it. A selected anchor of UINT64_MAX refers to this edit's
+ * replacement. Other nonzero anchors must survive the cut. Recovery is bounded
+ * opaque UTF-8 text. Identical committed retries return their original outcome,
+ * including after later mutations. Retries revalidate writer ownership after
+ * input; only the stale head precondition is bypassed. Errors after publication
+ * can be uncertain (use status). */
+typedef struct lc_collection_edit_req {
+  const char *operation_id;
+  const char *expected_head;
+  const lc_collection_edit_range *ranges;
+  size_t range_count;
+  const lc_collection_append_req *replacement;
+  int has_recovery;
+  const char *recovery;
+  uint64_t recovery_anchor;
+} lc_collection_edit_req;
+
+/** Original edit facts; never refreshed on retry. No owned allocations. */
+typedef struct lc_collection_edit_res {
+  char head_etag[65];
+  uint64_t upper_position;
+  uint64_t live_count;
+  uint64_t deleted_count;
+  int has_replacement;
+  lc_collection_append_res replacement;
+  int duplicate;
+  /** A receipt was published or an identical committed retry passed validation.
+   * If the call
+   * fails with this set, reconcile the outcome/durability through status or
+   * an identical retry. A conflict observation has published == 0. */
+  int published;
+} lc_collection_edit_res;
+
+/** found == 0 observes absence only; it does not cancel a preparing call. */
+typedef struct lc_collection_edit_status_res {
+  int found;
+  lc_collection_edit_res result;
+} lc_collection_edit_status_res;
+
 typedef struct lc_collection_delete_res {
   uint64_t position;
   int deleted;
@@ -771,6 +843,8 @@ typedef int (*lc_collection_visit_fn)(void *context,
  * borrowed for the call.
  * No projection, reverse output, last-N or explicit position lists. */
 typedef struct lc_collection_read_opts {
+  /** Optional opaque head precondition, checked before delivering any bytes. */
+  const char *expected_head;
   const char *selector_lql;
   const char *cursor;
   lc_collection_read_metadata_fn on_metadata;
@@ -830,6 +904,14 @@ typedef struct lc_collection_read_res {
  * reclamation until the active call unwinds. Each returned collection must
  * still be closed separately. */
 struct lc_collection {
+  /** Observes counts, head token and bounded recovery metadata atomically. */
+  int (*head)(lc_collection *, lc_collection_head_res *, lc_error *);
+  /** One atomic cut/replacement/marker, preserving existing lease ownership. */
+  int (*edit)(lc_collection *, const lc_collection_edit_req *, lc_source *,
+              lc_collection_edit_res *, lc_error *);
+  /** Observes a committed receipt without opening replacement payloads. */
+  int (*edit_status)(lc_collection *, const char *,
+                     lc_collection_edit_status_res *, lc_error *);
   /** Returns another owned receiver carrying fresh credentials. */
   int (*acquire)(lc_collection *self, const lc_collection_lease_req *req,
                  lc_collection **out, lc_error *error);
@@ -911,6 +993,23 @@ struct lc_collection_writer {
 
 /** Initializes a creation/open config with no selected retention policy. */
 void lc_collection_config_init(lc_collection_config *config);
+/** Zero-initialize edit options; operation ID and expected head are required.
+ */
+void lc_collection_edit_req_init(lc_collection_edit_req *req);
+/** Captures a coherent head without traversing entry payloads. */
+int lc_collection_head(lc_collection *collection, lc_collection_head_res *out,
+                       lc_error *error);
+/** Publishes one collection-local edit. On collection_changed, out contains
+ * the observed current token/counts, with no mutation. On publication errors,
+ * reconcile the original operation ID before issuing another operation. */
+int lc_collection_edit(lc_collection *collection,
+                       const lc_collection_edit_req *req, lc_source *source,
+                       lc_collection_edit_res *out, lc_error *error);
+/** Finds the original operation outcome; absence reserves nothing. */
+int lc_collection_edit_status(lc_collection *collection,
+                              const char *operation_id,
+                              lc_collection_edit_status_res *out,
+                              lc_error *error);
 /** Initializes a request with a 30-second TTL, public reads and no owner. */
 void lc_collection_lease_req_init(lc_collection_lease_req *req);
 /** Acquires collection-wide ownership. Unleased collections remain multiwriter.

@@ -35,6 +35,9 @@ int lc_collection_ids_open(const char *path, int create,
                            lc_collection_ids *out, lc_error *error);
 void lc_collection_ids_close(lc_collection_ids *ids);
 int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error);
+/* Bounded physical iteration for compaction of typed operation bindings. */
+int lc_collection_ids_slot(lc_collection_ids *, lc_u64, lc_collection_id_ref *,
+                           int *, lc_error *);
 /* Caller holds collection metadata authority. No document bodies are read or
  * retained here; match sees only equal-digest candidates. */
 int lc_collection_ids_find(lc_collection_ids *ids,

@@ -21,6 +21,7 @@ typedef struct lc_compact {
   lc_collection_order captured;
   lc_collection_order order;
   lc_collection_ids ids;
+  lc_collection_ids captured_ids;
   lc_u64 count;
   lc_u64 generation;
   lc_u64 metadata_generation;
@@ -95,7 +96,7 @@ static int lc_cm_capture(lc_compact *work, int force, int *selected,
   rc = lc_collection_write_enter(&work->call, &guard, error);
   if (rc != LC_OK)
     return rc;
-  if (collection->order.count != 0U &&
+  if ((collection->order.count != 0U || collection->order.edit_count != 0U) &&
       collection->order.generation != collection->head.snapshot_generation &&
       (force || (collection->order.reclaimable_bytes != 0U &&
                  collection->order.reclaimable_bytes >=
@@ -116,6 +117,11 @@ static int lc_cm_capture(lc_compact *work, int force, int *selected,
             "failed to capture collection compaction order");
     }
     if (rc == LC_OK) {
+      work->captured_ids = collection->ids;
+      work->captured_ids.fd = dup(collection->ids.fd);
+      if (work->captured_ids.fd < 0)
+        rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
+                                   "failed to pin edit receipts");
       work->count = collection->order.count;
       work->generation = collection->order.generation;
       work->metadata_generation = collection->order.metadata_generation;
@@ -206,7 +212,6 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
   size_t i;
   int fd;
   int body_fd;
-  int found;
   int rc;
   collection = work->collection;
   ordinal = 0U;
@@ -253,23 +258,14 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
       }
       if (rows[i].deleted_at != 0U && rows[i].deleted_at <= work->generation &&
           !source.deleted) {
-        rc = lc_collection_metadata_enter(collection, 0, error);
-        if (rc == LC_OK) {
-          rc = lc_collection_ids_refresh(&collection->ids, error);
-          if (rc == LC_OK)
-            rc = lc_collection_lookup_id(collection, source.append_id, &source,
-                                         &segment, &found, error);
-          if (rc == LC_OK && (!found || !source.deleted ||
-                              source.generation != rows[i].deleted_at))
-            rc = lc_collection_failure(
-                error, LC_ERR_PROTOCOL, "collection_corrupt",
-                "collection tombstone binding is missing during compaction");
-          lc_collection_metadata_leave(collection);
-        }
+        rc = lc_pouch_collection_record_delete(
+            collection->pouch, work->snapshot_fd, &source, rows[i].deleted_at,
+            &copied, error);
         if (rc == LC_OK)
-          rc = lc_collection_record_ref(
-              collection, segment, source.record_offset, &fd, &file_segment,
-              &file_end, &source, error);
+          rc = lc_collection_project_record(
+              &work->order, &work->ids, &copied,
+              work->snapshot | LC_COLLECTION_SNAPSHOT_BIT, 1, error);
+        continue;
       }
       if (rc == LC_OK && source.deleted &&
           (rows[i].deleted_at == 0U || rows[i].deleted_at > work->generation))
@@ -297,6 +293,11 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
     (void)close(fd);
   if (body_fd >= 0)
     (void)close(body_fd);
+  if (rc == LC_OK && work->captured_ids.count > work->count)
+    rc = lc_collection_edit_compact(
+        collection, &work->captured_ids, work->generation, work->snapshot_fd,
+        work->leaf, work->snapshot | LC_COLLECTION_SNAPSHOT_BIT, &work->order,
+        &work->ids, work->buffer, LC_CM_BUFFER_BYTES, error);
   if (rc == LC_OK && fsync(work->snapshot_fd) != 0)
     rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                "failed to sync collection snapshot");
@@ -334,15 +335,16 @@ static int lc_cm_publish(lc_compact *work, lc_error *error) {
   if (rc == LC_OK)
     rc = lc_collection_order_checkpoint(&work->order, work->tail, 0U, error);
   if (rc == LC_OK)
-    rc = lc_collection_ids_checkpoint(&work->ids, work->order.count,
-                                      work->order.generation, work->tail, 0U,
-                                      error);
+    rc = lc_collection_ids_checkpoint(
+        &work->ids, lc_collection_binding_count(&work->order),
+        work->order.generation, work->tail, 0U, error);
   for (segment = work->tail; rc == LC_OK && segment <= collection->head.active;
        ++segment)
     rc = lc_collection_replay_into(collection, &work->order, &work->ids,
                                    segment, 0U, 0, work->generation, error);
   if (rc == LC_OK &&
-      (work->order.count != collection->order.count ||
+      (work->order.edit_count != collection->order.edit_count ||
+       work->order.count != collection->order.count ||
        work->order.generation != collection->order.generation ||
        work->order.live_count != collection->order.live_count ||
        work->order.upper_position != collection->order.upper_position))
@@ -413,6 +415,8 @@ static int lc_cm_publish(lc_compact *work, lc_error *error) {
 static void lc_cm_release(lc_compact *work) {
   const lc_allocator *allocator;
   allocator = &work->collection->allocator;
+  if (work->captured_ids.fd >= 0)
+    close(work->captured_ids.fd);
   lc_collection_order_close(&work->captured);
   lc_collection_order_close(&work->order);
   lc_collection_ids_close(&work->ids);
@@ -442,6 +446,7 @@ int lc_collection_compact(lc_collection *self, int force, int cleanup_only,
   int rc;
   memset(&work, 0, sizeof(work));
   work.lock_fd = work.pin_fd = work.snapshot_fd = -1;
+  work.captured_ids.fd = -1;
   work.captured.fd = work.order.fd = work.ids.fd = -1;
   rc = lc_collection_call_begin(self, 1, &work.call, error);
   if (rc != LC_OK)

@@ -47,7 +47,7 @@ All producers and dispatchers for one namespace must use the same retention
 configuration. Explicit settings are rejected for remote lockd; this policy
 qualifies local Pouch only. The added public configuration and statistics
 fields were introduced in shared-library ABI generation 5. Current collection
-receiver/capability layouts use core ABI 8; rebuild C consumers and the optional
+receiver/capability layouts use core ABI 9; rebuild C consumers and the optional
 PostgreSQL provider against the same core. See
 [ABI compatibility](../README.md#c-abi-and-storage-compatibility) and
 [upgrade instructions](../CHANGELOG.md#upgrading-from-024x).

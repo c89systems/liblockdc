@@ -450,6 +450,8 @@ int lc_collection_read_method(lc_collection *self,
       rc = lc_collection_refresh_view(collection, error);
       if (rc == LC_OK)
         rc = lc_collection_lease_check(collection, 0, error);
+      if (rc == LC_OK)
+        rc = lc_collection_head_match(collection, opts->expected_head, error);
       if (rc == LC_OK) {
         captured_upper = collection->order.upper_position;
         if (opts->cursor == NULL || checkpoint) {

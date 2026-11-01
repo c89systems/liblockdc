@@ -40,6 +40,9 @@ typedef struct lc_collection_order {
   /* Last entry metadata mutation. Compaction retries if it changes during
    * copying, so its new topology never leaves references to retired inputs. */
   lc_u64 metadata_generation;
+  lc_u64 edit_count;
+  /* A canonical edit exists, but its derived page updates may be incomplete. */
+  int edit_in_progress;
   /* Conservative derived hint. False proves no entry expiry needs scanning;
    * canonical rebuild/compaction recomputes it without a separate TTL store. */
   int retention_present;
@@ -62,6 +65,10 @@ typedef struct lc_collection_order_iter {
   lc_u64 page_number;
   unsigned char page[LC_COLLECTION_ORDER_PAGE_BYTES];
 } lc_collection_order_iter;
+
+#ifdef LOCKDC_TEST_BUILD
+int lc_collection_edit_page_test(lc_error *);
+#endif
 
 /* Opens an owned descriptor. A missing file is created only with create != 0.
  * A corrupt existing index is reported, never silently replaced. */
@@ -90,6 +97,19 @@ int lc_collection_order_append_recovered(lc_collection_order *order,
 int lc_collection_order_delete(lc_collection_order *order, lc_u64 position,
                                lc_u64 generation, lc_u64 replay_segment,
                                lc_u64 replay_offset, lc_error *error);
+/* Caller owns metadata authority; dirty publication precedes all page writes.
+ * A failed mutation requires canonical rebuild, never best-effort rollback. */
+int lc_collection_order_edit_begin(lc_collection_order *, lc_u64, lc_error *);
+int lc_collection_order_cut(lc_collection_order *, const lc_allocator *,
+                            const lc_collection_edit_range *, size_t, lc_u64,
+                            lc_u64 *, lc_error *);
+/* Counts the current view without modifying it. Whole selected pages use
+ * their live summary; only range boundaries require decoding individual rows.
+ */
+int lc_collection_order_count_ranges(lc_collection_order *,
+                                     const lc_allocator *,
+                                     const lc_collection_edit_range *, size_t,
+                                     lc_u64 *, lc_error *);
 /* Repoints a live row to canonical STATE_META without changing order, body
  * identity, page counts or deletion visibility. Snapshot replay can encounter
  * metadata generations out of position order; the watermark takes their max. */

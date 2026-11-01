@@ -352,6 +352,24 @@ if(TARGET lockdc_lua_core AND LOCKDC_LUA_RUNNABLE)
     LOCKDC_TEST_BUILD=1 LOCKDC_LUA_COLLECTION_MAINTENANCE=1)
   target_link_libraries(lc_lua_collections_test PRIVATE ${lc_test_link_target} Lua::Lua)
   lc_configure_c_test_target(lc_lua_collections_test)
+  add_test(NAME lua_collection_edits_shared_test
+    COMMAND ${CMAKE_COMMAND}
+      -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+      -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
+      -DLOCKDC_LUA_XA_BINARY=$<TARGET_FILE:lc_lua_xa_test>
+      -DLOCKDC_LUA_TEST_CASE=collection_edits
+      -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
+  set_tests_properties(lua_collection_edits_shared_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
+  add_test(NAME lua_collection_edits_test
+    COMMAND ${CMAKE_COMMAND}
+      -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+      -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
+      -DLOCKDC_LUA_XA_BINARY=$<TARGET_FILE:lc_lua_collections_test>
+      -DLOCKDC_LUA_TEST_CASE=collection_edits
+      -P ${CMAKE_SOURCE_DIR}/tests/lua_xa_test.cmake)
+  set_tests_properties(lua_collection_edits_test PROPERTIES
+    RUN_SERIAL TRUE TIMEOUT 30 LABELS "unit;local;lua;collections")
   add_test(NAME lua_collection_count_retention_test
     COMMAND ${CMAKE_COMMAND}
       -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -441,6 +459,14 @@ endif()
 
 add_subdirectory(unit)
 add_subdirectory(integration)
+
+add_test(NAME collection_test_selection_test COMMAND "${CMAKE_COMMAND}"
+  -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+  -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
+  -DLOCKDC_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+  -P "${CMAKE_SOURCE_DIR}/tests/collection_test_selection_test.cmake")
+set_tests_properties(collection_test_selection_test PROPERTIES
+  LABELS "unit;cross-runtime" TIMEOUT 15)
 # Bootlin sets CMAKE_CROSSCOMPILING even for a host-architecture Linux build.
 # The Python driver launches the binary directly, without a QEMU wrapper.
 if(TARGET lockdc_pouch_replay_probe

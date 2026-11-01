@@ -3,6 +3,11 @@
 
 #include "lc_pouch.h"
 
+/* Collection-only canonical kinds. Bodies become visible only through the
+ * immediately following edit receipt. Both use the ordinary payload codec. */
+#define LC_POUCH_COLLECTION_EDIT_BODY 112U
+#define LC_POUCH_COLLECTION_EDIT 113U
+
 /* Bounded view of Pouch's canonical state record. A collection uses append ID
  * as the record key, permanent position as its logical version, and mutation
  * generation as its index sequence. No collection-specific JSON type exists. */
@@ -32,9 +37,12 @@ typedef struct lc_pouch_collection_record {
   int metadata_only;
   int deleted;
   int published;
+  unsigned char kind;
 } lc_pouch_collection_record;
 
 typedef struct lc_pouch_collection_writer lc_pouch_collection_writer;
+void lc_pouch_collection_writer_kind(lc_pouch_collection_writer *writer,
+                                     unsigned char kind);
 /* fd == -1 selects hash-only retry verification. Position zero selects an
  * upload context with position assigned at publication. No method owns fd. */
 int lc_pouch_collection_writer_open(

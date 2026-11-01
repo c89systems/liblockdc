@@ -92,7 +92,7 @@ set(LOCKDC_CMOCKA_VERSION "2.0.2" CACHE STRING "Pinned cmocka release used for u
 set(LOCKDC_PSLOG_VERSION "0.12.0" CACHE STRING "Pinned libpslog release used for SDK logging." FORCE)
 set(LOCKDC_CPKT_VERSION "0.6.1" CACHE STRING "Pinned cpkt dependency bundle version." FORCE)
 set(LOCKDC_CPKTDB_VERSION "0.3.1" CACHE STRING "Pinned cpktdb database bundle version." FORCE)
-set(LOCKDC_MIN_ABI_VERSION "8")
+set(LOCKDC_MIN_ABI_VERSION "9")
 set(LOCKDC_ABI_VERSION "${LOCKDC_MIN_ABI_VERSION}" CACHE STRING "Shared-library ABI/SOVERSION for liblockdc.")
 if(LOCKDC_ABI_VERSION MATCHES "^[0-9]+$" AND LOCKDC_ABI_VERSION LESS LOCKDC_MIN_ABI_VERSION)
     set(LOCKDC_ABI_VERSION "${LOCKDC_MIN_ABI_VERSION}" CACHE STRING "Shared-library ABI/SOVERSION for liblockdc." FORCE)
@@ -533,6 +533,7 @@ set(lc_sources
     src/lc_collection_query_plan.c
     src/lc_collection_query_maintenance.c
     src/lc_collection_query_cleanup.c
+    src/lc_collection_edit.c
     src/lc_collection_api.c
     src/lc_collection_lease.c
     src/lc_collection_migration.c

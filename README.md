@@ -67,7 +67,9 @@ through the C and Lua APIs. Count limits lazily retain the newest N entries
 without trimming on append. [Push-fed append writers](docs/collection-writer.md)
 accept bounded raw JSON fragments; all append forms can renew parent retention
 atomically with a new entry. Explicit staged pull feeds a source through the
-same writer for slow or concurrent transfers.
+same writer for slow or concurrent transfers. [Atomic collection edits](docs/collection-edits.md)
+remove position ranges with an optional streamed replacement and recovery marker,
+using head preconditions and durable retry receipts.
 Optional [collection leases](docs/collection-leases.md)
 grant exclusive ownership across many committed appends, with keepalive,
 conditional takeover and optional private reads. Unleased collections retain
@@ -154,11 +156,13 @@ ordered streams.
 
 ## C ABI and storage compatibility
 
-The collection lease, receiver and staged-append capability layouts use core
-ABI **8**, advancing once from ABI **7** in v0.24.0. Rebuild C consumers and
-the optional PostgreSQL provider together; the provider's own ABI remains **0**.
-This single ABI change covers the combined collection additions. See
-[upgrade instructions](CHANGELOG.md#upgrading-from-024x).
+The collection receiver, capability and read-option layouts use core
+ABI **9**, advancing once from ABI **8** in v0.25.0. Rebuild C consumers, Lua
+native bindings and the optional PostgreSQL provider together; the provider's
+own ABI remains **0**.
+This single ABI change covers atomic collection edits and recovery heads in
+0.26.0; see [the edit contract](docs/collection-edits.md) and
+[upgrade instructions](CHANGELOG.md#upgrading-from-025x).
 
 Pouch upgrades released collection heads on open under exclusive root access,
 preserving positions, retry identities, retention and entry bodies. Close other
@@ -450,6 +454,13 @@ including mixed state/collection churn, allocator probes and the small-stack
 compaction regression. Every target retains its SDK and ABI checks.
 Executing a storage test binary without case arguments still runs its full
 table, including on a release target.
+
+Every configuration partitions collection checks into `lc_unit_collections`,
+`lc_unit_collections_append` and `lc_unit_collections_recovery`, sharing one
+executable. Debug runs the complete table; optimized GNU/musl and QEMU lanes
+partition their declared portability cases. A configuration-specific selection
+contract runs in each runtime lane and checks that every case runs exactly once.
+Select all three with `ctest --test-dir build/debug -R '^lc_unit_collections'`.
 
 Debug runs the complete PostgreSQL 14–18 matrix, with two servers, Pouch and
 the C/Lua driver variants. Optimized native GNU repeats PostgreSQL 14; the
@@ -808,7 +819,7 @@ if (lc_acquire_for_update(client, &acquire, update_order, NULL, &error) !=
 
 Queue APIs follow the same handle-oriented pattern: dequeue or subscribe, operate on the returned `lc_message`, and then finish with `ack()`, `nack()`, or `close()`.
 
-The examples in the repository at <https://github.com/sa6mwa/liblockdc/tree/main/examples> are complete programs intended to be runnable from the build tree and illustrate how an application would wire client configuration, logging, and request structures directly.
+The examples in the repository at <https://github.com/sa6mwa/liblockdc/tree/trunk/examples> are complete programs intended to be runnable from the build tree and illustrate how an application would wire client configuration, logging, and request structures directly.
 
 ## Repository layout
 

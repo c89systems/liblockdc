@@ -20,7 +20,8 @@ if(DEFINED LOCKDC_NINJA)
     foreach(required_command "test_pouch_compaction_stack.c" "tests/integration/lc_pouch_compaction_stack_test"
             "test_lc_allocator_exit.c" "tests/unit/lc_allocator_exit_probe"
             "test_lc_allocator_public_exit.c" "tests/unit/lc_allocator_public_exit_probe"
-            "test_lc_transport_https.c" "tests/unit/lc_unit_transport_https")
+            "test_lc_transport_https.c" "tests/unit/lc_unit_transport_https"
+            "test_lc_collections.c" "tests/unit/lc_unit_collections")
         string(FIND "${closure_commands}" "${required_command}" command_index)
         if(command_index EQUAL -1)
             message(FATAL_ERROR "cross-runtime build closure is missing ${required_command}")
@@ -30,6 +31,11 @@ if(DEFINED LOCKDC_NINJA)
     list(LENGTH https_compiles https_compile_count)
     if(NOT https_compile_count EQUAL 1)
         message(FATAL_ERROR "HTTPS fixture must compile once, got ${https_compile_count}")
+    endif()
+    string(REGEX MATCHALL " -c [^\n]*test_lc_collections.c" collection_compiles "${closure_commands}")
+    list(LENGTH collection_compiles collection_compile_count)
+    if(NOT collection_compile_count EQUAL 1)
+        message(FATAL_ERROR "Collection partitions must compile once, got ${collection_compile_count}")
     endif()
     execute_process(COMMAND "${LOCKDC_NINJA}" -C "${LOCKDC_BINARY_DIR}" -t commands ${LOCKDC_LIBRARY_TARGETS}
         RESULT_VARIABLE library_result OUTPUT_VARIABLE library_commands ERROR_VARIABLE library_error)

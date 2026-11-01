@@ -616,6 +616,8 @@ end
 -- Explicit none/zlib converts before open returns when exclusively owned;
 -- competing shared writers cause a warning and use of the stored mode.
 -- Conversion errors return the usual structured open error.
+-- Durable sync dispatches ready groups without a fill delay. Its process-local
+-- fsync_batch_max_ops is an upper bound (0 is unbounded), not a minimum to await.
 function M.open(config)
   local client, err = core.open(config)
 
@@ -726,6 +728,18 @@ function Collection:metadata(request) return self._core:metadata(request) end
 function Collection:entry_metadata(position, request)
   return self._core:entry_metadata(position, request)
 end
+-- Atomic collection-local cut/replacement/marker. Observe head().etag first;
+-- retain operation_id and the original request for uncertain-outcome retries.
+-- Ranges are ordered {after=..., through=...} intervals. Optional replacement
+-- uses append options and a borrowed streaming source. Recovery is <=1024 UTF-8
+-- bytes; omission preserves and "" clears. recovery_anchor="replacement" binds
+-- this edit's new entry without guessing its position. It does not pin entries.
+function Collection:head() return self._core:head() end
+-- Identical retries bypass a stale head, while still revalidating ownership
+-- after source callbacks; rejection never rolls back the prior commit.
+function Collection:edit(request, source) return self._core:edit(request, source) end
+function Collection:edit_status(operation_id) return self._core:edit_status(operation_id) end
+
 -- Exactly one JSON object. Keep append_id before a single-pass upload; retry
 -- the same compact body/ID or inspect append_status after an ambiguous error.
 -- An identical retry preserves the original position and retention deadline.
@@ -2011,5 +2025,7 @@ function Service:close()
   self:stop()
   self._completed = true
 end
+
+
 
 return M

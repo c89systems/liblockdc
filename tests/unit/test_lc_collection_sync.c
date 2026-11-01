@@ -30,6 +30,9 @@ typedef struct fixture {
   pthread_cond_t condition;
   unsigned int staged;
   unsigned int sync_calls;
+  unsigned int enqueued;
+  unsigned int expected_requests;
+  uint64_t batch_limit;
   int fail_sync;
   int release;
   const char *body;
@@ -82,7 +85,7 @@ static void open_client(fixture *f, size_t index, int exclusive, long segment) {
       LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
   settings.single_writer = exclusive;
   settings.durable_sync = 1;
-  settings.fsync_batch_max_ops = WRITERS;
+  settings.fsync_batch_max_ops = f->batch_limit;
   settings.segment_target_bytes = (uint64_t)segment;
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
@@ -111,6 +114,8 @@ static int setup(void **state) {
   char template_path[] = PREFIX "XXXXXX";
   fixture *f = calloc(1, sizeof(*f));
   assert_non_null(f);
+  f->batch_limit = WRITERS;
+  f->expected_requests = WRITERS;
   lc_error_init(&f->error);
   assert_true(
       lc_test_tmp_mkdtemp(template_path, f->root, sizeof(f->root), PREFIX));
@@ -127,6 +132,7 @@ static int teardown(void **state) {
   lc_collection_commit_wait_test_context = NULL;
   lc_pouch_test_fsync_batch_delay_ns = 0;
   lc_pouch_test_sync_fd = NULL;
+  lc_pouch_test_fsync_enqueued = NULL;
   sync_fixture = NULL;
   close_all(f);
   lc_error_cleanup(&f->error);
@@ -191,12 +197,34 @@ static void *append_thread(void *context) {
   return NULL;
 }
 
+static void enqueued(void) {
+  fixture *f = sync_fixture;
+  pthread_mutex_lock(&f->mutex);
+  ++f->enqueued;
+  pthread_cond_broadcast(&f->condition);
+  pthread_mutex_unlock(&f->mutex);
+}
+
 static int tracked_sync(int fd) {
   fixture *f = sync_fixture;
   struct stat st;
+  struct timespec deadline;
+  int rc = 0;
   if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
     return -1;
   ++f->sync_calls; /* Only the root batcher's worker calls this hook. */
+  /* Hold the first I/O until every caller is queued. Arrivals during I/O
+   * must form a group without a timer or a scheduling-dependent sleep. */
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&f->mutex);
+  while (f->enqueued < f->expected_requests && rc == 0)
+    rc = pthread_cond_timedwait(&f->condition, &f->mutex, &deadline);
+  pthread_mutex_unlock(&f->mutex);
+  if (rc != 0) {
+    errno = rc;
+    return -1;
+  }
   if (f->fail_sync) {
     errno = EIO;
     return -1;
@@ -215,11 +243,10 @@ static void parallel(fixture *f, int exclusive, int same_receiver,
   open_handles(f, exclusive, segment);
   lc_collection_commit_wait_test_hook = staged;
   lc_collection_commit_wait_test_context = f;
-  /* The count bound ends this window as soon as all four requests arrive. */
-  lc_pouch_test_fsync_batch_delay_ns = 1000000000L;
   f->fail_sync = failure;
   sync_fixture = f;
   lc_pouch_test_sync_fd = tracked_sync;
+  lc_pouch_test_fsync_enqueued = enqueued;
   for (size_t i = 0; i < WRITERS; ++i) {
     workers[i].collection = f->handles[same_receiver ? 0 : i];
     workers[i].id = ids[duplicate ? 0 : i];
@@ -231,8 +258,8 @@ static void parallel(fixture *f, int exclusive, int same_receiver,
   for (size_t i = 0; i < WRITERS; ++i)
     assert_int_equal(pthread_join(threads[i], NULL), 0);
   lc_collection_commit_wait_test_hook = NULL;
-  lc_pouch_test_fsync_batch_delay_ns = 0;
   lc_pouch_test_sync_fd = NULL;
+  lc_pouch_test_fsync_enqueued = NULL;
   assert_int_equal(f->staged, WRITERS);
   for (size_t i = 0; i < WRITERS; ++i) {
     assert_int_equal(workers[i].rc, failure ? LC_ERR_TRANSPORT : LC_OK);
@@ -246,7 +273,15 @@ static void parallel(fixture *f, int exclusive, int same_receiver,
   check(f, lc_pouch_fsync_stats_read(((lc_client_handle *)f->clients[0])->pouch,
                                      &stats, &f->error));
   assert_int_equal(stats.total_requests, WRITERS);
-  assert_true(stats.max_batch_size > 1 && stats.total_batches < WRITERS);
+  assert_int_equal(f->enqueued, WRITERS);
+  if (f->batch_limit == 1) {
+    assert_int_equal(stats.max_batch_size, 1);
+    assert_int_equal(stats.total_batches, WRITERS);
+  } else {
+    assert_true(stats.max_batch_size > 1 && stats.total_batches < WRITERS);
+    if (f->batch_limit != 0)
+      assert_true(stats.max_batch_size <= f->batch_limit);
+  }
   assert_int_equal(f->sync_calls,
                    segment == 256 ? WRITERS : stats.total_batches);
   lc_collection_info info;
@@ -270,6 +305,64 @@ static void parallel(fixture *f, int exclusive, int same_receiver,
 
 static void test_shared_handles(void **state) {
   parallel(*state, 0, 0, 0, 0, 65536, 0);
+}
+static void single_request(fixture *f, append_kind kind) {
+  writer work = {0};
+  lc_pouch_fsync_stats stats;
+  open_handles(f, 0, 65536);
+  f->expected_requests = 1;
+  sync_fixture = f;
+  lc_pouch_test_sync_fd = tracked_sync;
+  lc_pouch_test_fsync_enqueued = enqueued;
+  work.collection = f->handles[0];
+  work.id = "single";
+  work.body = "{\"event\":true}";
+  work.kind = kind;
+  append_thread(&work);
+  lc_pouch_test_sync_fd = NULL;
+  lc_pouch_test_fsync_enqueued = NULL;
+  assert_int_equal(work.rc, LC_OK);
+  assert_int_equal(work.result.position, 1);
+  assert_int_equal(f->sync_calls, 1);
+  assert_int_equal(f->enqueued, 1);
+  check(f, lc_pouch_fsync_stats_read(((lc_client_handle *)f->clients[0])->pouch,
+                                     &stats, &f->error));
+  assert_int_equal(stats.total_requests, 1);
+  assert_int_equal(stats.total_batches, 1);
+}
+static void test_single_direct_needs_no_peer(void **state) {
+  single_request(*state, DIRECT_APPEND);
+}
+static void test_single_push_needs_no_peer(void **state) {
+  single_request(*state, PUSH_APPEND);
+}
+static void test_single_staged_needs_no_peer(void **state) {
+  single_request(*state, STAGED_APPEND);
+}
+static void test_unbounded_direct_group(void **state) {
+  fixture *f = *state;
+  f->batch_limit = 0;
+  parallel(f, 0, 0, 0, 0, 65536, DIRECT_APPEND);
+}
+static void test_unbounded_push_group(void **state) {
+  fixture *f = *state;
+  f->batch_limit = 0;
+  parallel(f, 0, 1, 0, 0, 65536, PUSH_APPEND);
+}
+static void test_unbounded_staged_group(void **state) {
+  fixture *f = *state;
+  f->batch_limit = 0;
+  parallel(f, 0, 1, 0, 0, 65536, STAGED_APPEND);
+}
+static void test_group_limit_two(void **state) {
+  fixture *f = *state;
+  f->batch_limit = 2;
+  parallel(f, 0, 0, 0, 0, 65536, DIRECT_APPEND);
+}
+static void test_group_limit_one(void **state) {
+  fixture *f = *state;
+  f->batch_limit = 1;
+  parallel(f, 0, 0, 0, 0, 65536, DIRECT_APPEND);
 }
 static void test_exclusive_handles(void **state) {
   parallel(*state, 1, 0, 0, 0, 65536, 0);
@@ -665,6 +758,20 @@ static void test_process_writers_release_shared_root_before_sync(void **state) {
 
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(test_single_direct_needs_no_peer, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_single_push_needs_no_peer, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_single_staged_needs_no_peer, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_unbounded_direct_group, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_unbounded_push_group, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_unbounded_staged_group, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_group_limit_two, setup, teardown),
+      cmocka_unit_test_setup_teardown(test_group_limit_one, setup, teardown),
       cmocka_unit_test_setup_teardown(test_staged_shared_group, setup,
                                       teardown),
       cmocka_unit_test_setup_teardown(test_staged_exclusive_same_receiver_group,

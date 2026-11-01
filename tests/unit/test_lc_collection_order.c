@@ -435,8 +435,139 @@ static void test_oldest_live_hint_skips_gaps_and_survives_reopen(void **state) {
               f->order.first_live == total);
 }
 
+static void
+test_dense_seek_checks_rows_and_preserves_deleted_views(void **state) {
+  fixture *f = *state;
+  lc_collection_order_iter *it = calloc(1, sizeof(*it));
+  lc_collection_order_row row;
+  int found;
+  assert_non_null(it);
+  for (lc_u64 i = 1; i <= 128; ++i)
+    append(f, i);
+  for (lc_u64 i = 1; i <= 63; ++i)
+    remove_position(f, i);
+  for (lc_u64 after = 0; after <= 128; ++after) {
+    for (int old = 0; old <= 1; ++old) {
+      lc_u64 expected = old || after >= 63 ? after + 1 : 64;
+      assert_int_equal(lc_collection_order_seek(&f->order, after, LC_U64_MAX,
+                                                old ? 128 : f->order.generation,
+                                                0, it, &f->error),
+                       LC_OK);
+      assert_int_equal(
+          lc_collection_order_next(&f->order, it, &row, &found, &f->error),
+          LC_OK);
+      assert_true(found == (expected <= 128));
+      if (found)
+        assert_true(row.position == expected);
+    }
+  }
+  corrupt_byte(f, LC_COLLECTION_ORDER_ROOT_BYTES + 4096 + 64);
+  assert_int_equal(lc_collection_order_seek(&f->order, 63, 128,
+                                            f->order.generation, 0, it,
+                                            &f->error),
+                   LC_ERR_PROTOCOL);
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  assert_int_equal(
+      lc_collection_order_find(&f->order, 64, &row, &found, &f->error),
+      LC_ERR_PROTOCOL);
+  free(it);
+}
+
+static void test_range_counts_and_cuts_match_sparse_model(void **state) {
+  fixture *f = *state;
+  enum { TOTAL = LC_COLLECTION_ORDER_PAGE_ROWS * 4 + 11 };
+  unsigned char live[TOTAL];
+  lc_collection_edit_range ranges[LC_COLLECTION_EDIT_MAX_RANGES];
+  lc_allocator allocator;
+  lc_collection_order_iter *old = calloc(1, sizeof(*old));
+  lc_collection_order_row row;
+  lc_u64 expected, counted, removed, before, generation;
+  size_t count, i, r, round;
+  int found;
+  assert_non_null(old);
+  lc_allocator_init(&allocator);
+  memset(live, 1, sizeof(live));
+  for (i = 0; i < TOTAL; ++i)
+    append(f, (i + 1) * 3);
+  for (i = 0; i < TOTAL; ++i)
+    if (i % 5 == 0 || (i >= 63 && i < 126)) {
+      remove_position(f, (i + 1) * 3);
+      live[i] = 0;
+    }
+  for (round = 0; round < 5; ++round) {
+    count = 2;
+    ranges[0] = (lc_collection_edit_range){4, 41};
+    ranges[1] = (lc_collection_edit_range){43, 48};
+    if (round == 1) {
+      count = LC_COLLECTION_EDIT_MAX_RANGES;
+      for (r = 0; r < count; ++r)
+        ranges[r] = (lc_collection_edit_range){r * 9 + 1, r * 9 + 6};
+    } else if (round == 2 || round == 3) {
+      count = 1;
+      ranges[0] = (lc_collection_edit_range){0, LC_U64_MAX};
+    } else if (round == 4)
+      count = 0;
+    expected = 0;
+    for (i = 0; i < TOTAL; ++i)
+      for (r = 0; r < count; ++r)
+        if (live[i] && (i + 1) * 3 > ranges[r].after &&
+            (i + 1) * 3 <= ranges[r].through)
+          ++expected;
+    before = f->order.live_count;
+    generation = f->order.generation;
+    assert_int_equal(lc_collection_order_count_ranges(&f->order, &allocator,
+                                                      ranges, count, &counted,
+                                                      &f->error),
+                     LC_OK);
+    assert_true(counted == expected);
+    assert_int_equal(lc_collection_order_refresh(&f->order, &f->error), LC_OK);
+    assert_true(f->order.live_count == before &&
+                f->order.generation == generation);
+    assert_int_equal(lc_collection_order_seek(&f->order, 0, LC_U64_MAX,
+                                              generation, 0, old, &f->error),
+                     LC_OK);
+    assert_int_equal(
+        lc_collection_order_edit_begin(&f->order, generation + 1, &f->error),
+        LC_OK);
+    assert_int_equal(lc_collection_order_cut(&f->order, &allocator, ranges,
+                                             count, generation + 1, &removed,
+                                             &f->error),
+                     LC_OK);
+    assert_true(removed == expected &&
+                f->order.live_count == before - expected);
+    assert_int_equal(lc_collection_order_checkpoint(
+                         &f->order, 1, f->order.replay_offset, &f->error),
+                     LC_OK);
+    counted = 0;
+    do {
+      assert_int_equal(
+          lc_collection_order_next(&f->order, old, &row, &found, &f->error),
+          LC_OK);
+      if (found)
+        ++counted;
+    } while (found);
+    assert_true(counted == before);
+    for (i = 0; i < TOTAL; ++i) {
+      for (r = 0; r < count; ++r)
+        if ((i + 1) * 3 > ranges[r].after && (i + 1) * 3 <= ranges[r].through)
+          live[i] = 0;
+      assert_int_equal(lc_collection_order_find(&f->order, (i + 1) * 3, &row,
+                                                &found, &f->error),
+                       LC_OK);
+      assert_true(found && (row.deleted_at == 0) == (live[i] != 0));
+    }
+  }
+  free(old);
+}
+
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(
+          test_dense_seek_checks_rows_and_preserves_deleted_views, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_range_counts_and_cuts_match_sparse_model, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_oldest_live_hint_skips_gaps_and_survives_reopen, setup,
           teardown),

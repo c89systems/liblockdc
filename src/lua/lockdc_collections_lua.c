@@ -28,6 +28,9 @@ enum collection_operation {
   TAKEOVER,
   KEEPALIVE,
   RELEASE,
+  HEAD,
+  EDIT,
+  EDIT_STATUS,
   WRITER_WRITE,
   WRITER_COMMIT,
   WRITER_ABORT
@@ -48,6 +51,16 @@ typedef struct writer_ud {
 /* This userdata owns every temporary native allocation before another Lua
  * operation can raise. Its owner uservalue also pins the receiver across GC,
  * callbacks, explicit close, and protected result/error construction. */
+/* Only edit/head calls pay for bounded recovery/range storage. Ordinary
+ * append/read userdata retains its small allocation and existing lifecycle. */
+typedef struct collection_edit_data {
+  lc_collection_head_res head;
+  lc_collection_edit_req edit;
+  lc_collection_edit_res edited;
+  lc_collection_edit_status_res edit_status;
+  lc_collection_edit_range ranges[LC_COLLECTION_EDIT_MAX_RANGES];
+} collection_edit_data;
+
 typedef struct collection_call {
   lua_State *L;
   int operation;
@@ -61,6 +74,7 @@ typedef struct collection_call {
   lc_sink *sink;
   lc_error error;
   lc_collection_read_res read;
+  collection_edit_data *extra;
   const lc_collection_read_metadata *frame;
   const lc_collection_info *info;
 } collection_call;
@@ -187,6 +201,30 @@ static void push_entry(lua_State *L, const lc_collection_append_res *entry) {
         (lc_version)entry->collection_retention_expires_at_unix);
 }
 
+static void push_head(lua_State *L, const lc_collection_head_res *head) {
+  lua_newtable(L);
+  set_text(L, "collection_id", head->collection_id);
+  set_text(L, "etag", head->etag);
+  lcdc_set_u64_decimal(L, "upper_position", head->upper_position);
+  lcdc_set_u64_decimal(L, "live_count", head->live_count);
+  lcdc_set_u64_decimal(L, "recovery_revision", head->recovery_revision);
+  lcdc_set_u64_decimal(L, "recovery_anchor", head->recovery_anchor);
+  set_bool(L, "recovery_anchor_available", head->recovery_anchor_available);
+  set_text(L, "recovery", head->recovery);
+}
+static void push_edit(lua_State *L, const lc_collection_edit_res *result) {
+  lua_newtable(L);
+  set_text(L, "head_etag", result->head_etag);
+  set_bool(L, "published", result->published);
+  lcdc_set_u64_decimal(L, "upper_position", result->upper_position);
+  lcdc_set_u64_decimal(L, "live_count", result->live_count);
+  lcdc_set_u64_decimal(L, "deleted_count", result->deleted_count);
+  set_bool(L, "duplicate", result->duplicate);
+  if (result->has_replacement) {
+    push_entry(L, &result->replacement);
+    lua_setfield(L, -2, "replacement");
+  }
+}
 static void push_read(lua_State *L, const lc_collection_read_res *read) {
   lua_newtable(L);
   lcdc_set_u64_decimal(L, "upper_position", read->upper_position);
@@ -204,6 +242,23 @@ static void push_read(lua_State *L, const lc_collection_read_res *read) {
 
 static int failure(lua_State *L, collection_call *call, int rc) {
   int results = lcdc_push_status_error(L, rc, &call->error);
+  if (call->operation == EDIT && call->extra->edited.published) {
+    int error_index = lua_gettop(L) - results + 2;
+    if (lua_istable(L, error_index)) {
+      lua_pushboolean(L, 1);
+      lua_setfield(L, error_index, "uncertain");
+      push_edit(L, &call->extra->edited);
+      lua_setfield(L, error_index, "result");
+    }
+  }
+  if (call->operation == EDIT && call->error.server_code &&
+      strcmp(call->error.server_code, "collection_changed") == 0) {
+    int error_index = lua_gettop(L) - results + 2;
+    if (lua_istable(L, error_index)) {
+      push_edit(L, &call->extra->edited);
+      lua_setfield(L, error_index, "current_head");
+    }
+  }
   if (call->operation == READ) {
     call->read.stop_reason = LC_COLLECTION_READ_ERROR;
     push_read(L, &call->read);
@@ -496,8 +551,12 @@ static int worker(lua_State *L) {
   static const char *const append_keys[] = {
       "append_id", "retention_seconds", "collection_retention_seconds", NULL};
   static const char *const read_keys[] = {
-      "selector_lql", "cursor",      "after",     "through",
-      "first_n",      "on_metadata", "cancelled", NULL};
+      "selector_lql", "cursor",    "after",         "through", "first_n",
+      "on_metadata",  "cancelled", "expected_head", NULL};
+  static const char *const edit_keys[] = {
+      "operation_id", "expected_head",   "ranges", "replacement",
+      "recovery",     "recovery_anchor", NULL};
+  static const char *const range_keys[] = {"after", "through", NULL};
   static const char *const list_keys[] = {"namespace", NULL};
   collection_call *call = lua_touserdata(L, 4);
   lc_client *client = NULL;
@@ -632,6 +691,7 @@ static int worker(lua_State *L) {
     set_bool(L, "leases", capabilities.leases);
     set_bool(L, "lease_takeover", capabilities.lease_takeover);
     set_bool(L, "private_reads", capabilities.private_reads);
+    set_bool(L, "atomic_edit", capabilities.atomic_edit);
     return 1;
   }
   ud = luaL_testudata(L, 1, COLLECTION_MT);
@@ -674,13 +734,98 @@ static int worker(lua_State *L) {
     if (rc == LC_OK &&
         (call->operation == APPEND || call->operation == APPEND_STAGED))
       rc = lcdc_source_from_value(L, 3, &call->source, &call->error);
-  } else if (call->operation == APPEND_STATUS)
+  } else if (call->operation == EDIT) {
+    lc_collection_edit_req *req = &call->extra->edit;
+    int index, selected;
+    size_t i, count;
+    lc_collection_edit_req_init(req);
+    rc = options(call, 2, edit_keys, 1);
+    if (rc == LC_OK)
+      rc = text_field(call, 2, "operation_id", 0, &req->operation_id);
+    if (rc == LC_OK)
+      rc = text_field(call, 2, "expected_head", 0, &req->expected_head);
+    if (rc == LC_OK)
+      rc = text_field(call, 2, "recovery", 1, &req->recovery);
+    req->has_recovery = req->recovery != NULL;
+    if (rc == LC_OK) {
+      lua_getfield(L, 2, "recovery_anchor");
+      if (lua_type(L, -1) == LUA_TSTRING && lua_rawlen(L, -1) == 11 &&
+          strcmp(lua_tostring(L, -1), "replacement") == 0)
+        req->recovery_anchor = UINT64_MAX;
+      else if (!lua_isnil(L, -1))
+        rc = position(call, -1, &req->recovery_anchor);
+      lua_pop(L, 1);
+    }
+    if (rc == LC_OK) {
+      lua_getfield(L, 2, "ranges");
+      index = lua_gettop(L);
+      if (!lua_isnil(L, index) && !lua_istable(L, index))
+        rc = invalid(call, "edit ranges must be a dense array");
+      count = lua_istable(L, index) ? lua_rawlen(L, index) : 0;
+      if (count > LC_COLLECTION_EDIT_MAX_RANGES)
+        rc = invalid(call, "too many edit ranges");
+      if (rc == LC_OK && lua_istable(L, index)) {
+        lua_pushnil(L);
+        while (lua_next(L, index) != 0) {
+          int exact;
+          lua_Integer key = lua_tointegerx(L, -2, &exact);
+          if (!exact || lua_type(L, -2) != LUA_TNUMBER || key < 1 ||
+              (lua_Unsigned)key > count)
+            rc = invalid(call, "edit ranges must be a dense array");
+          lua_pop(L, 1);
+        }
+      }
+      req->range_count = count;
+      req->ranges = call->extra->ranges;
+      for (i = 0; rc == LC_OK && i < count; ++i) {
+        int item;
+        lua_rawgeti(L, index, (lua_Integer)i + 1);
+        item = lua_gettop(L);
+        rc = options(call, item, range_keys, 1);
+        if (rc == LC_OK)
+          rc = position_field(call, item, "after", &selected,
+                              &call->extra->ranges[i].after);
+        if (rc == LC_OK && !selected)
+          rc = invalid(call, "edit range requires after");
+        if (rc == LC_OK)
+          rc = position_field(call, item, "through", &selected,
+                              &call->extra->ranges[i].through);
+        if (rc == LC_OK && !selected)
+          rc = invalid(call, "edit range requires through");
+        lua_pop(L, 1);
+      }
+    }
+    if (rc == LC_OK) {
+      lua_getfield(L, 2, "replacement");
+      index = lua_gettop(L);
+      if (!lua_isnil(L, index)) {
+        lc_collection_append_req_init(&append);
+        req->replacement = &append;
+        rc = options(call, index, append_keys, 1);
+        if (rc == LC_OK)
+          rc = text_field(call, index, "append_id", 0, &append.append_id);
+        if (rc == LC_OK)
+          rc = retention_field(call, index, "retention_seconds",
+                               &append.has_retention_seconds,
+                               &append.retention_seconds);
+        if (rc == LC_OK)
+          rc = retention_field(call, index, "collection_retention_seconds",
+                               &append.has_collection_retention_seconds,
+                               &append.collection_retention_seconds);
+        if (rc == LC_OK)
+          rc = lcdc_source_from_value(L, 3, &call->source, &call->error);
+      } else if (!lua_isnoneornil(L, 3))
+        rc = invalid(call, "edit source requires replacement options");
+    }
+  } else if (call->operation == APPEND_STATUS || call->operation == EDIT_STATUS)
     rc = text(call, 2, 0, &value);
   else if (call->operation == DELETE_ENTRY)
     rc = position(call, 2, &seq);
   else if (call->operation == READ) {
     lc_collection_read_opts_init(&read);
     rc = options(call, 2, read_keys, 0);
+    if (rc == LC_OK)
+      rc = text_field(call, 2, "expected_head", 1, &read.expected_head);
     if (rc == LC_OK)
       rc = text_field(call, 2, "selector_lql", 1, &read.selector_lql);
     if (rc == LC_OK)
@@ -740,6 +885,17 @@ static int worker(lua_State *L) {
     if (rc == LC_OK)
       ud->handle = NULL;
     break;
+  case HEAD:
+    rc = lc_collection_head(handle, &call->extra->head, &call->error);
+    break;
+  case EDIT:
+    rc = lc_collection_edit(handle, &call->extra->edit, call->source,
+                            &call->extra->edited, &call->error);
+    break;
+  case EDIT_STATUS:
+    rc = lc_collection_edit_status(handle, value, &call->extra->edit_status,
+                                   &call->error);
+    break;
   case DESCRIBE:
     rc = lc_collection_describe(handle, &info, &call->error);
     break;
@@ -791,7 +947,18 @@ static int worker(lua_State *L) {
   }
   if (rc != LC_OK)
     return failure(L, call, rc);
-  if (call->operation == KEEPALIVE)
+  if (call->operation == HEAD)
+    push_head(L, &call->extra->head);
+  else if (call->operation == EDIT)
+    push_edit(L, &call->extra->edited);
+  else if (call->operation == EDIT_STATUS) {
+    lua_newtable(L);
+    set_bool(L, "found", call->extra->edit_status.found);
+    if (call->extra->edit_status.found) {
+      push_edit(L, &call->extra->edit_status.result);
+      lua_setfield(L, -2, "result");
+    }
+  } else if (call->operation == KEEPALIVE)
     push_lease(L, &ownership);
   else if (call->operation == DESCRIBE || call->operation == METADATA)
     push_info(L, &info);
@@ -827,8 +994,18 @@ static int dispatch(lua_State *L, int operation) {
   const char *message;
   int status, count;
   lua_settop(L, 3);
-  call = lua_newuserdatauv(L, sizeof(*call), 2);
+  call = lua_newuserdatauv(
+      L,
+      sizeof(*call) +
+          ((operation == HEAD || operation == EDIT || operation == EDIT_STATUS)
+               ? sizeof(collection_edit_data)
+               : 0),
+      2);
   memset(call, 0, sizeof(*call));
+  if (operation == HEAD || operation == EDIT || operation == EDIT_STATUS) {
+    call->extra = (collection_edit_data *)(call + 1);
+    memset(call->extra, 0, sizeof(*call->extra));
+  }
   call->L = L;
   call->operation = operation;
   call->metadata_ref = call->cancel_ref = call->visitor_ref = LUA_NOREF;
@@ -875,6 +1052,9 @@ COLLECTION_METHOD(writer_write, WRITER_WRITE)
 COLLECTION_METHOD(writer_commit, WRITER_COMMIT)
 COLLECTION_METHOD(writer_abort, WRITER_ABORT)
 COLLECTION_METHOD(append_status, APPEND_STATUS)
+COLLECTION_METHOD(head, HEAD)
+COLLECTION_METHOD(edit, EDIT)
+COLLECTION_METHOD(edit_status, EDIT_STATUS)
 COLLECTION_METHOD(read_entries, READ)
 COLLECTION_METHOD(delete_entry, DELETE_ENTRY)
 COLLECTION_METHOD(drop, DROP)
@@ -887,7 +1067,10 @@ int lcdc_collection_capabilities(lua_State *L) {
 }
 
 void lcdc_collections_install(lua_State *L) {
-  static const luaL_Reg methods[] = {{"describe", describe},
+  static const luaL_Reg methods[] = {{"head", head},
+                                     {"edit", edit},
+                                     {"edit_status", edit_status},
+                                     {"describe", describe},
                                      {"acquire", acquire},
                                      {"takeover", takeover},
                                      {"keepalive", keepalive},

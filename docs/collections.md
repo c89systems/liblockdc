@@ -164,10 +164,22 @@ scratch has a fixed heap ceiling. Test keys larger than an input chunk and
 string values much larger than the parser's scratch ceiling.
 
 Store compact JSON once so reads can stream the stored body and a newline
-without reparsing or materializing the document for presentation. Use lonejson's
-public incremental parser/writer facilities. Its push-fed value stream is a
-sink interface. Push writers validate and encode incrementally into at most
-64 KiB of staging memory, then an anonymous spool. Commit copies encoded bytes
+without reparsing or materializing the document for presentation. Each read
+operation reuses bounded heap storage for decoding and hashing across entries;
+it borrows the pinned segment file descriptor instead of reopening it for each
+body. Every entry verifies its identity, decoded length, and committed
+fingerprint. Encrypted entries also verify descriptor bindings and frame
+authentication. Decoder buffers hold bounded chunks and are released when the
+read ends.
+
+The decoder can read several authentication frames into its bounded input
+buffer together, while read-ahead stays within the current entry's encoded
+span. Key derivation and binding contexts belong to one read operation; every
+entry still derives its own keys and starts independent authentication.
+
+Use lonejson's public incremental parser/writer facilities. Its push-fed value
+stream is a sink interface. Push writers validate and encode incrementally into
+at most 64 KiB of staging memory, then an anonymous spool. Commit copies encoded bytes
 into shared rolling segments without reparsing or re-encoding. Read output
 remains a direct stream; it is never buffered or spooled as a whole.
 
@@ -615,6 +627,9 @@ zero/default initializers. Keep physical storage and query-plan types private.
 | `client.open_collection` / `lc_client_open_collection` | Open an existing name and bind its collection ID |
 | `client.list_collections` / `lc_client_list_collections` | Visit collection descriptions in namespace/name order without entry bodies |
 | `client.collection_capabilities` / `lc_client_collection_capabilities` | Report endpoint-local collection/filter/index/resume support and later selection capabilities |
+| `collection.head` / `lc_collection_head` | Observe identity, opaque head token, counts and bounded recovery metadata coherently |
+| `collection.edit` / `lc_collection_edit` | Atomically remove position ranges and optionally append a streamed replacement and update recovery metadata |
+| `collection.edit_status` / `lc_collection_edit_status` | Observe a persistent original edit outcome; absence does not cancel an in-flight operation |
 | `collection.describe` / `lc_collection_describe` | Return ID, name, namespace, current upper boundary, live count, indexing availability, and collection retention |
 | `collection.metadata` / `lc_collection_metadata` | Change collection expiry and/or max_entries and return its description |
 | `collection.append` / `lc_collection_append` | Consume `lc_source`, with required append ID and optional entry/parent retention; return position, ETag, byte count, duplicate/deleted and retention facts |
@@ -713,12 +728,16 @@ new version inferred from the liblockdc release number.
 | `GET C/appends/{append_id}` | Required `X-Collection-ID`; 200 append status, including `state=absent` when no binding is committed |
 | `PATCH C/entries/{position}/metadata` | Required `X-Collection-ID`; empty body and optional retention header; 200 entry metadata |
 | `DELETE C/entries/{position}` | Required `X-Collection-ID`; 200 deletion result including whether it was already deleted |
-| `POST C/entries/read` | Required `X-Collection-ID`; JSON with optional `selector_lql`, `cursor`, `after`, `through`, `first_n`; one streaming multipart response with raw state bodies and separate metadata headers |
+| `POST C/entries/read` | Required `X-Collection-ID`; JSON with optional `selector_lql`, `cursor`, `after`, `through`, `first_n`, `expected_head`; one streaming multipart response with raw state bodies and separate metadata headers |
+
+See [atomic edit wire bindings](collection-edits.md#future-lockd-wire-binding) for
+head, edit and edit-status routes. These server bindings remain planned; the
+current remote client reports collection capabilities as false.
 
 The capabilities response uses boolean fields `collections`, `lql_filter`,
 `resume`, `checkpoint`, `ranges`, `first_n`, `last_n`, `position_selection`,
 `count_retention`, `append_writer`, `append_staged`, `append_collection_retention`,
-`leases`, `lease_takeover`, and `private_reads`.
+`leases`, `lease_takeover`, `private_reads`, and `atomic_edit`.
 Wire bounds/counts use canonical uint64 decimal strings, preserving exact values
 through JSON runtimes with limited numeric precision. Omission, zero, ranges,
 input limits and both cursor purposes have the same semantics as the C/Lua
@@ -1147,9 +1166,10 @@ CMOCKA_SKIP_FILTER='test_crash_*' bash scripts/valgrind.sh
 ```
 
 Follow the public C ABI policy when adding receiver fields. Collection leases,
-receiver methods and staged-append capabilities share core ABI 8, advancing once
-from ABI 7 in v0.24.0; see
-[upgrade instructions](../CHANGELOG.md#upgrading-from-024x).
+receiver methods, atomic edits and read preconditions now use core ABI 9,
+advancing once from ABI 8 in v0.25.0. Rebuild consumers and optional providers.
+See [atomic edits](collection-edits.md) for range cuts, recovery descriptors and
+persistent retry outcomes. Ordinary appends remain independent operations.
 Count-retention layouts were introduced with ABI 7. Do not tie
 Pouch record or HTTP protocol version markers to the repository release tag.
 

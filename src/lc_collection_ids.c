@@ -362,6 +362,14 @@ static int lc_ci_insert(lc_collection_ids *ids, const lc_collection_id_ref *ref,
                      "collection identity index has no insertion slot");
 }
 
+int lc_collection_ids_slot(lc_collection_ids *ids, lc_u64 slot,
+                           lc_collection_id_ref *ref, int *occupied,
+                           lc_error *error) {
+  if (slot >= ids->capacity)
+    return lc_ci_error(error, LC_ERR_INVALID, "identity slot outside capacity");
+  return lc_ci_entry_read(ids, slot, ref, occupied, error);
+}
+
 static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
   lc_collection_ids grown;
   lc_collection_id_ref ref;

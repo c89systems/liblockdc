@@ -2,6 +2,7 @@
 #define LC_COLLECTION_PAYLOAD_H
 
 #include "lc_collection_internal.h"
+#include "lc_pouch_crypto.h"
 #include <openssl/evp.h>
 
 /* Reusable bounded reader for one canonical collection body. The source view
@@ -9,11 +10,12 @@
  * cleanup. No payload buffer, spool, or presentation serialization is used.
  * The canonical record and direct record descriptor remain borrowed until the
  * next open/cleanup. Metadata-only records reuse one owned payload descriptor.
- * Transformed bodies use a duplicate descriptor and the codec's bounded
- * scratch. */
+ * Transformed bodies borrow the pinned descriptor and reuse operation-owned,
+ * bounded codec scratch across entries. */
 typedef struct lc_collection_payload {
   lc_source source;
   lc_source *decoded;
+  lc_pouch_crypto_reader *decoder;
   EVP_MD_CTX *hash;
   const lc_pouch_collection_record *record;
   int fd;
@@ -35,7 +37,7 @@ int lc_collection_payload_read(lc_collection_payload *payload, void *bytes,
  * Verifies the complete decoded length and committed plaintext fingerprint. */
 int lc_collection_payload_finish(lc_collection_payload *payload,
                                  lc_error *error);
-/* Ends this body while keeping the reusable hash context for the next open. */
+/* Ends this body while keeping hash/codec scratch for the next open. */
 void lc_collection_payload_reset(lc_collection_payload *payload);
 void lc_collection_payload_cleanup(lc_collection_payload *payload);
 

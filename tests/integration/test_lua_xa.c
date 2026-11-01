@@ -97,7 +97,21 @@ static int collection_result_oom(void *context, lc_collection *collection,
   return LC_OK;
 }
 
+static int edit_result_oom(void *context, lc_collection *collection, int phase,
+                           lc_error *error) {
+  if (phase != LC_COLLECTION_EDIT_PROJECTED)
+    return LC_OK;
+  lc_collection_edit_test_hook = NULL;
+  lc_collection_edit_test_context = NULL;
+  return collection_result_oom(context, collection,
+                               LC_COLLECTION_APPEND_PROJECTED, error);
+}
 static int fail_collection_result(lua_State *L) {
+  if (lua_toboolean(L, 1)) {
+    lc_collection_edit_test_hook = edit_result_oom;
+    lc_collection_edit_test_context = L;
+    return 0;
+  }
   lc_collection_append_test_hook = collection_result_oom;
   lc_collection_append_test_context = L;
   return 0;

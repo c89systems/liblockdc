@@ -1098,6 +1098,111 @@ static void test_deferred_close_from_metadata(void **state) {
   assert_output(f, "{\"n\":1}\n{\"n\":2}\n{\"n\":3}\n");
 }
 
+typedef struct callback_reader {
+  lc_collection *owner;
+  lc_collection *peer;
+  pthread_barrier_t *barrier;
+  size_t bytes;
+  unsigned int entries;
+  int failed;
+  int rc;
+} callback_reader;
+
+static int callback_reader_sink(lc_sink *sink, const void *bytes, size_t size,
+                                lc_error *error) {
+  callback_reader *reader = sink->impl;
+  (void)bytes;
+  (void)error;
+  reader->bytes += size;
+  return 1;
+}
+
+static int callback_reader_metadata(void *context,
+                                    const lc_collection_read_metadata *item,
+                                    lc_error *error) {
+  callback_reader *reader = context;
+  lc_collection_info info;
+  lc_error nested;
+  (void)error;
+  if (item->kind != LC_COLLECTION_READ_METADATA_ENTRY)
+    return LC_OK;
+  ++reader->entries;
+  if (item->position != reader->entries)
+    reader->failed = 1;
+  /* Both callers are inside a callback on the same receiver. The third
+   * participant closes its public reference during the final callback. */
+  pthread_barrier_wait(reader->barrier);
+  lc_error_init(&nested);
+  if (lc_collection_describe(reader->owner, &info, &nested) != LC_ERR_INVALID)
+    reader->failed = 1;
+  lc_error_cleanup(&nested);
+  lc_error_init(&nested);
+  if (lc_collection_describe(reader->peer, &info, &nested) != LC_OK)
+    reader->failed = 1;
+  lc_error_cleanup(&nested);
+  pthread_barrier_wait(reader->barrier);
+  return LC_OK;
+}
+
+static void *read_with_concurrent_callbacks(void *context) {
+  callback_reader *reader = context;
+  lc_collection_read_opts opts;
+  lc_collection_read_res result;
+  lc_sink sink;
+  lc_error error;
+  lc_collection_read_opts_init(&opts);
+  lc_collection_read_res_init(&result);
+  lc_error_init(&error);
+  memset(&sink, 0, sizeof(sink));
+  sink.write = callback_reader_sink;
+  sink.impl = reader;
+  opts.on_metadata = callback_reader_metadata;
+  opts.metadata_context = reader;
+  reader->rc = lc_collection_read(reader->owner, &opts, &sink, &result, &error);
+  if (!result.complete || result.completed_records != 3)
+    reader->failed = 1;
+  lc_collection_read_res_cleanup(&result);
+  lc_error_cleanup(&error);
+  return NULL;
+}
+
+static void test_concurrent_callback_reentry_and_owner_close(void **state) {
+  fixture *f = *state;
+  callback_reader readers[2];
+  pthread_t threads[2];
+  pthread_barrier_t barrier;
+  unsigned int i, entry;
+  seed_three(f);
+  bind_collection(f, "events", 0, &f->b);
+  assert_int_equal(pthread_barrier_init(&barrier, NULL, 3), 0);
+  memset(readers, 0, sizeof(readers));
+  for (i = 0; i < 2; ++i) {
+    readers[i].owner = f->a;
+    readers[i].peer = f->b;
+    readers[i].barrier = &barrier;
+    assert_int_equal(pthread_create(&threads[i], NULL,
+                                    read_with_concurrent_callbacks,
+                                    &readers[i]),
+                     0);
+  }
+  for (entry = 0; entry < 3; ++entry) {
+    pthread_barrier_wait(&barrier);
+    if (entry == 2) {
+      lc_collection_close(f->a);
+      f->a = NULL;
+    }
+    pthread_barrier_wait(&barrier);
+  }
+  for (i = 0; i < 2; ++i) {
+    assert_int_equal(pthread_join(threads[i], NULL), 0);
+    assert_int_equal(readers[i].rc, LC_OK);
+    assert_false(readers[i].failed);
+    assert_int_equal(readers[i].entries, 3);
+    assert_int_equal(readers[i].bytes, 24);
+  }
+  assert_int_equal(pthread_barrier_destroy(&barrier), 0);
+}
+
 static void test_transforms_rotation_and_reopen(void **state) {
   fixture *f = *state;
   char *key = NULL;
@@ -2186,6 +2291,7 @@ static int push_at_publication(void *context, lc_collection *collection,
 
 static void test_segment_seals_recover_lost_projections(void **state) {
   fixture *f = *state;
+  enum { entries = 8 };
   char paths[2][768], expected[512];
   check(f, lc_pouch_crypto_generate_key_string(&f->crypto_key, &f->error));
   for (int mode = 0; mode < 8; ++mode) {
@@ -2201,9 +2307,12 @@ static void test_segment_seals_recover_lost_projections(void **state) {
         close(descriptors[0]);
         open_client(f, mode & 4 ? f->crypto_key : NULL, (mode & 2) != 0,
                     mode & 1);
+        /* Reach the same multi-segment recovery boundary with fewer commits.
+         * Keep every codec/durability/loss combination and real sync calls. */
+        root_pouch(f)->segment_target_bytes = 512;
         set_collection_clock(f, 1000);
         bind_collection(f, "events", 1, &f->a);
-        for (unsigned int position = 1; position <= 40; ++position) {
+        for (unsigned int position = 1; position <= entries; ++position) {
           char id[32], json[32];
           snprintf(id, sizeof(id), "event-%u", position);
           snprintf(json, sizeof(json), "{\"n\":%u}", position);
@@ -2259,19 +2368,22 @@ static void test_segment_seals_recover_lost_projections(void **state) {
       lc_collection_info info;
       lc_collection_append_res result;
       check(f, lc_collection_describe(f->a, &info, &f->error));
-      assert_true(info.live_count == 39 && info.upper_position == 40 &&
+      assert_true(info.live_count == entries - 1 &&
+                  info.upper_position == entries &&
                   info.retention_expires_at_unix == 1100);
       check(f, append_json(f, f->a, "event-2", "{\"n\":2}", &result));
       assert_true(result.duplicate && result.deleted && result.position == 2);
-      append(f, "next", "{\"n\":41}", 41);
+      char next[32];
+      snprintf(next, sizeof(next), "{\"n\":%u}", entries + 1);
+      append(f, "next", next, entries + 1);
       size_t used = 0;
-      for (unsigned int position = 1; position <= 41; ++position)
+      for (unsigned int position = 1; position <= entries + 1; ++position)
         if (position != 2)
           used += (size_t)snprintf(expected + used, sizeof(expected) - used,
                                    "{\"n\":%u}\n", position);
       check(f, read_into_memory(f, NULL));
       assert_output(f, expected);
-      assert_int_equal(f->read.completed_records, 40);
+      assert_int_equal(f->read.completed_records, entries);
       lc_pouch_maintenance_result maintained = {0};
       check(f, maintain(f, 1, 0, &maintained));
       lc_pouch_maintenance_result_cleanup(NULL, &maintained);
@@ -5745,6 +5857,8 @@ int main(int argc, char **argv) {
           test_catalog_incarnations_names_and_stale_cursor, setup, teardown),
       cmocka_unit_test_setup_teardown(test_deferred_close_from_metadata, setup,
                                       teardown),
+      cmocka_unit_test_setup_teardown(
+          test_concurrent_callback_reentry_and_owner_close, setup, teardown),
       cmocka_unit_test_setup_teardown(test_transforms_rotation_and_reopen,
                                       setup, teardown),
       cmocka_unit_test_setup_teardown(

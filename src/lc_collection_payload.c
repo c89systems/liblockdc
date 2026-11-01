@@ -16,7 +16,7 @@ static size_t lc_cp_source_read(lc_source *source, void *bytes, size_t capacity,
 }
 
 void lc_collection_payload_reset(lc_collection_payload *payload) {
-  lc_source_close(payload->decoded);
+  lc_pouch_crypto_reader_clear(payload->decoder);
   payload->decoded = NULL;
   payload->record = NULL;
   payload->fd = -1;
@@ -26,6 +26,7 @@ void lc_collection_payload_cleanup(lc_collection_payload *payload) {
   if (payload == NULL)
     return;
   lc_collection_payload_reset(payload);
+  lc_pouch_crypto_reader_close(payload->decoder);
   if (payload->body_fd_initialized && payload->body_fd >= 0)
     (void)close(payload->body_fd);
   EVP_MD_CTX_free(payload->hash);
@@ -40,7 +41,6 @@ int lc_collection_payload_open(lc_collection_payload *payload,
   char context[256];
   char upload_context[256];
   int n;
-  int owned;
   int rc;
   const EVP_MD *digest;
   lc_collection_payload_reset(payload);
@@ -95,14 +95,15 @@ int lc_collection_payload_open(lc_collection_payload *payload,
                                  "failed to initialize collection body hash");
   if (record->descriptor[0] != '\0' ||
       lc_pouch_crypto_enabled(collection->pouch->crypto)) {
-    owned = dup(fd);
-    if (owned < 0)
-      return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to pin collection body descriptor");
-    return lc_pouch_crypto_source_from_fd_span(
-        collection->pouch->crypto, record->context, context, owned,
-        record->payload_offset, record->stored_bytes, record->descriptor,
-        &payload->decoded, error);
+    if (payload->decoder == NULL) {
+      rc = lc_pouch_crypto_reader_open(collection->pouch->crypto,
+                                       &payload->decoder, error);
+      if (rc != LC_OK)
+        return rc;
+    }
+    return lc_pouch_crypto_reader_bind(
+        payload->decoder, record->context, context, fd, record->payload_offset,
+        record->stored_bytes, record->descriptor, &payload->decoded, error);
   }
   return LC_OK;
 }

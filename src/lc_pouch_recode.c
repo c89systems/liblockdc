@@ -211,7 +211,7 @@ static int rc_tree(lc_pouch_recode *work, const char *source,
 static int rc_collection(lc_pouch_recode *work, const char *source,
                          const char *target, const char *ns, const char *id,
                          lc_error *error) {
-  lc_collection_head head;
+  lc_collection_disk_head head;
   char leaf[64], *from = NULL, *to = NULL;
   struct stat st;
   lc_u64 segment;

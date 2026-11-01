@@ -137,6 +137,8 @@ static int lc_co_root_write(lc_collection_order *order, lc_error *error) {
   lc_co_put64(bytes + 112U, order->first_live);
   lc_co_put64(bytes + 120U, order->collection_retention_generation);
   lc_co_put64(bytes + 128U, (lc_u64)order->collection_retention);
+  lc_co_put64(bytes + 136U, order->edit_count);
+  lc_co_put64(bytes + 144U, order->edit_in_progress ? 1U : 0U);
   lc_co_seal(bytes, sizeof(bytes));
   return lc_co_io(order->fd, 0U, bytes, sizeof(bytes), 1, error);
 }
@@ -160,9 +162,13 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
                        "collection index header is invalid");
   }
   for (i = 92U; i < sizeof(bytes) - 4U; ++i)
-    if ((i < 96U || i >= 136U) && bytes[i] != 0U)
+    if ((i < 96U || i >= 152U) && bytes[i] != 0U)
       return lc_co_error(error, LC_ERR_PROTOCOL,
                          "collection index header has unknown fields");
+  order->edit_count = lc_co_get64(bytes + 136U);
+  order->edit_in_progress = lc_co_get64(bytes + 144U) != 0U;
+  if (lc_co_get64(bytes + 144U) > 1U)
+    return lc_co_error(error, LC_ERR_PROTOCOL, "invalid edit repair boundary");
   order->count = lc_co_get64(bytes + 8U);
   order->generation = lc_co_get64(bytes + 16U);
   order->upper_position = lc_co_get64(bytes + 24U);
@@ -421,8 +427,10 @@ static int lc_co_append(lc_collection_order *order,
   int rc;
   if (order == NULL || order->fd < 0 || row == NULL ||
       row->position <= order->upper_position || row->published_at == 0U ||
-      (!recovered &&
-       (row->published_at <= order->generation || row->deleted_at != 0U)) ||
+      (!recovered && ((row->published_at <= order->generation &&
+                       !(order->edit_in_progress &&
+                         row->published_at == order->generation)) ||
+                      row->deleted_at != 0U)) ||
       (row->deleted_at != 0U && row->deleted_at <= row->published_at) ||
       row->segment == 0U || replay_segment == 0U ||
       replay_segment < order->replay_segment ||
@@ -507,6 +515,19 @@ static int lc_co_upper_bound(lc_collection_order *order, lc_u64 after,
   lc_u64 mid;
   lc_collection_order_row row;
   int rc;
+  /* Strictly increasing positive positions ending at count are necessarily
+   * dense, even with tombstones. Validate the selected row as usual; sparse
+   * recovered indexes retain the general unsigned-key binary search below. */
+  if (order->upper_position == order->count) {
+    *ordinal = after < order->count ? after : order->count;
+    if (*ordinal == order->count)
+      return LC_OK;
+    rc = lc_co_row_read(order, *ordinal, &row, error);
+    if (rc == LC_OK && row.position != *ordinal + 1U)
+      rc = lc_co_error(error, LC_ERR_PROTOCOL,
+                       "dense collection position contradicts its row");
+    return rc;
+  }
   lo = 0U;
   hi = order->count;
   while (lo < hi) {
@@ -916,4 +937,136 @@ int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
   }
   *count = size;
   return LC_OK;
+}
+
+int lc_collection_order_edit_begin(lc_collection_order *order,
+                                   lc_u64 generation, lc_error *error) {
+  if (generation <= order->generation)
+    return lc_co_error(error, LC_ERR_PROTOCOL,
+                       "invalid edit projection boundary");
+  order->edit_in_progress = 1;
+  order->generation = order->metadata_generation = generation;
+  return lc_co_root_write(order, error);
+}
+
+static int lc_co_ranges(lc_collection_order *order,
+                        const lc_allocator *allocator,
+                        const lc_collection_edit_range *ranges, size_t count,
+                        lc_u64 generation, lc_u64 *removed, lc_error *error) {
+  unsigned char *bytes;
+  lc_collection_order_row row;
+  lc_co_page page;
+  lc_u64 ordinal, number, offset, through, stamp, rows;
+  size_t r, q, i, length;
+  int rc = LC_OK, changed;
+  *removed = 0;
+  if (!count)
+    return LC_OK;
+  bytes = lc_alloc_with_allocator(allocator, LC_CO_PAGE_BYTES);
+  if (bytes == NULL)
+    return lc_co_error(error, LC_ERR_NOMEM,
+                       "failed to allocate edit metadata page");
+  r = 0;
+  ordinal = order->count;
+  rc = lc_co_upper_bound(order, ranges[0].after, &ordinal, error);
+  while (rc == LC_OK && r < count && ordinal < order->count) {
+    number = ordinal / LC_COLLECTION_ORDER_PAGE_ROWS;
+    rc = lc_co_page_offset(number, &offset, error);
+    rows = order->count - number * LC_COLLECTION_ORDER_PAGE_ROWS;
+    if (rows > LC_COLLECTION_ORDER_PAGE_ROWS)
+      rows = LC_COLLECTION_ORDER_PAGE_ROWS;
+    length = LC_CO_PAGE_HEADER_BYTES + (size_t)rows * LC_CO_ROW_BYTES;
+    if (rc == LC_OK)
+      rc = lc_co_io(order->fd, offset, bytes, length, 0, error);
+    if (rc == LC_OK)
+      rc = lc_co_page_decode(order, number, bytes, &page, error);
+    if (rc != LC_OK)
+      break;
+    if (page.first > ranges[r].through) {
+      ++r;
+      if (r < count)
+        rc = lc_co_upper_bound(order, ranges[r].after, &ordinal, error);
+      continue;
+    }
+    changed = 0;
+    through = 0;
+    q = r;
+    /* Zero generation selects a read-only count under current metadata
+     * authority. Mutation still stamps rows to preserve older reader views. */
+    if (!generation && page.first > ranges[r].after &&
+        page.last <= ranges[r].through) {
+      *removed += page.live;
+      i = (size_t)page.count;
+    } else
+      i = generation ? 0 : (size_t)(ordinal % LC_COLLECTION_ORDER_PAGE_ROWS);
+    for (; rc == LC_OK && i < (size_t)page.count; ++i) {
+      unsigned char *encoded =
+          bytes + LC_CO_PAGE_HEADER_BYTES + i * LC_CO_ROW_BYTES;
+      rc = lc_co_row_decode(order, encoded, &row, error);
+      if (rc != LC_OK)
+        break;
+      while (q < count && row.position > ranges[q].through)
+        ++q;
+      /* Counting does not need mutation's whole-page deletion watermark.
+       * Do not decode the rest of a page after a tiny selected interval. */
+      if (!generation && (q == count || ranges[q].after >= page.last))
+        break;
+      if (q < count && row.position > ranges[q].after && row.deleted_at == 0) {
+        ++*removed;
+        if (!generation)
+          continue;
+        lc_co_put64(encoded + 16U, generation);
+        lc_co_seal(encoded, LC_CO_ROW_BYTES);
+        --page.live;
+        --order->live_count;
+        stamp = row.stored_bytes;
+        order->reclaimable_bytes = stamp > LC_U64_MAX - order->reclaimable_bytes
+                                       ? LC_U64_MAX
+                                       : order->reclaimable_bytes + stamp;
+        row.deleted_at = generation;
+        changed = 1;
+      }
+      if (row.deleted_at > through)
+        through = row.deleted_at;
+    }
+    if (rc == LC_OK && changed) {
+      lc_co_put64(bytes + 32U, page.live);
+      lc_co_put64(bytes + 40U, page.live ? 0 : through);
+      lc_co_seal(bytes, LC_CO_PAGE_HEADER_BYTES);
+      rc = lc_co_io(order->fd, offset, bytes, length, 1, error);
+#ifdef LOCKDC_TEST_BUILD
+      if (rc == LC_OK)
+        rc = lc_collection_edit_page_test(error);
+#endif
+    }
+    if (rc != LC_OK)
+      break;
+    while (r < count && ranges[r].through <= page.last)
+      ++r;
+    if (r < count && ranges[r].after >= page.last)
+      rc = lc_co_upper_bound(order, ranges[r].after, &ordinal, error);
+    else
+      ordinal = (number + 1U) * LC_COLLECTION_ORDER_PAGE_ROWS;
+  }
+  if (generation && order->live_count == 0)
+    order->first_live = order->count;
+  lc_free_with_allocator(allocator, bytes);
+  return rc;
+}
+
+int lc_collection_order_count_ranges(lc_collection_order *order,
+                                     const lc_allocator *allocator,
+                                     const lc_collection_edit_range *ranges,
+                                     size_t count, lc_u64 *out,
+                                     lc_error *error) {
+  return lc_co_ranges(order, allocator, ranges, count, 0, out, error);
+}
+
+int lc_collection_order_cut(lc_collection_order *order,
+                            const lc_allocator *allocator,
+                            const lc_collection_edit_range *ranges,
+                            size_t count, lc_u64 generation, lc_u64 *removed,
+                            lc_error *error) {
+  return lc_co_ranges(order, allocator, ranges, count, generation, removed,
+                      error);
 }

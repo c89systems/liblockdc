@@ -12,7 +12,7 @@
 #define LC_COLLECTION_CURSOR_BYTES 256U
 #define LC_COLLECTION_SNAPSHOT_BIT ((lc_u64)LC_I64_MAX + 1U)
 
-typedef struct lc_collection_head {
+typedef struct lc_collection_disk_head {
   lc_u64 active;
   lc_u64 snapshot;
   lc_u64 snapshot_generation;
@@ -26,7 +26,7 @@ typedef struct lc_collection_head {
   lc_u64 max_entries;
   lc_collection_lease_info lease;
   int dropped;
-} lc_collection_head;
+} lc_collection_disk_head;
 
 typedef struct lc_collection_handle {
   lc_collection pub;
@@ -55,7 +55,7 @@ typedef struct lc_collection_handle {
   pthread_mutex_t append_mutex;
   int metadata_mutex_initialized;
   int append_mutex_initialized;
-  lc_collection_head head;
+  lc_collection_disk_head head;
   uint64_t head_device;
   uint64_t head_inode;
   int head_loaded;
@@ -74,6 +74,9 @@ typedef struct lc_collection_call {
   lc_collection_handle *collection;
   lc_pouch *pouch;
   pthread_t thread;
+  /* Callback flags are confined to thread. Registry readers must test the
+   * owning thread before examining them; membership and lifetime use the
+   * lifecycle mutex. */
   int callback;
   int source_callback;
   int mode_guard;
@@ -148,6 +151,7 @@ int lc_collection_write_enter(lc_collection_call *call,
 /* Upload admission does not drain in-flight durable append groups. */
 int lc_collection_append_enter(lc_collection_call *call,
                                lc_collection_guard *guard, lc_error *error);
+int lc_collection_edit_barrier(lc_collection_guard *, lc_error *);
 void lc_collection_write_leave(lc_collection_guard *guard);
 int lc_collection_head_write(lc_collection_handle *collection, lc_error *error);
 int lc_collection_head_read(lc_collection_handle *collection, lc_error *error);
@@ -216,6 +220,40 @@ int lc_collection_record_path(lc_collection_handle *collection, lc_u64 segment,
 int lc_collection_record_leaf(lc_u64 segment, char leaf[64], lc_error *error);
 int lc_collection_hash(const void *bytes, size_t length, unsigned char out[32],
                        lc_error *error);
+int lc_collection_head_token(lc_collection_handle *, char[65], lc_error *);
+int lc_collection_head_match(lc_collection_handle *, const char *, lc_error *);
+int lc_collection_head_method(lc_collection *, lc_collection_head_res *,
+                              lc_error *);
+int lc_collection_edit_method(lc_collection *, const lc_collection_edit_req *,
+                              lc_source *, lc_collection_edit_res *,
+                              lc_error *);
+int lc_collection_edit_status_method(lc_collection *, const char *,
+                                     lc_collection_edit_status_res *,
+                                     lc_error *);
+int lc_collection_edit_project(lc_collection_handle *, lc_collection_order *,
+                               lc_collection_ids *, int,
+                               const lc_pouch_collection_record *,
+                               const lc_pouch_collection_record *, lc_u64, int,
+                               lc_error *);
+int lc_collection_edit_compact(lc_collection_handle *, lc_collection_ids *,
+                               lc_u64, int, const char *, lc_u64,
+                               lc_collection_order *, lc_collection_ids *,
+                               unsigned char *, size_t, lc_error *);
+lc_u64 lc_collection_binding_count(const lc_collection_order *);
+enum {
+  LC_COLLECTION_EDIT_PREPARED = 1,
+  LC_COLLECTION_EDIT_PUBLISHED,
+  LC_COLLECTION_EDIT_DIRTY,
+  LC_COLLECTION_EDIT_PROJECTED,
+  LC_COLLECTION_EDIT_PAGE,
+  LC_COLLECTION_EDIT_BODY
+};
+#ifdef LOCKDC_TEST_BUILD
+typedef int (*lc_collection_edit_hook_fn)(void *, lc_collection *, int,
+                                          lc_error *);
+extern lc_collection_edit_hook_fn lc_collection_edit_test_hook;
+extern void *lc_collection_edit_test_context;
+#endif
 int lc_collection_failure(lc_error *error, int code, const char *reason,
                           const char *message);
 int lc_collection_read_method(lc_collection *self,
@@ -280,7 +318,7 @@ extern void *lc_collection_append_test_context;
 
 struct lc_pouch_recode;
 int lc_collection_recode_head(lc_pouch *pouch, const char *directory,
-                              lc_collection_head *head, lc_error *error);
+                              lc_collection_disk_head *head, lc_error *error);
 int lc_collection_recode_finish(struct lc_pouch_recode *work,
                                 const char *source, const char *target,
                                 const char *id, lc_error *error);
