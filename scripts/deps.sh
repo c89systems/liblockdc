@@ -235,7 +235,7 @@ if [ "$build_postgres" = ON ]; then
 fi
 
 lonejson_asset_name="liblonejson-$lonejson_version-${preset#deps-}.tar.gz"
-lonejson_download_url="https://github.com/sa6mwa/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
+lonejson_download_url="https://github.com/c89systems/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
 case "$lonejson_asset_name" in
   liblonejson-0.45.0-x86_64-linux-gnu.tar.gz)
     lonejson_asset_hash=aef11c4511bb6aa8ed4e0646204e14b7934affd6e5cec5b8e8bff36e80217826
@@ -266,7 +266,7 @@ esac
 
 liblql_version=$(resolve_cmake_cache_string LOCKDC_LIBLQL_VERSION "${LOCKDC_LIBLQL_VERSION:-}")
 liblql_asset_name="liblql-$liblql_version-${preset#deps-}.tar.gz"
-liblql_download_url="https://github.com/sa6mwa/liblql/releases/download/v$liblql_version/$liblql_asset_name"
+liblql_download_url="https://github.com/c89systems/liblql/releases/download/v$liblql_version/$liblql_asset_name"
 case "$liblql_asset_name" in
   liblql-0.4.0-x86_64-linux-gnu.tar.gz)
     liblql_asset_hash=a64ec9860305e48739e35d4609bd03796de7262ab9ca011755c696c85f8f65d3
@@ -296,7 +296,7 @@ case "$liblql_asset_name" in
 esac
 
 pslog_asset_name="libpslog-$pslog_version-${preset#deps-}.tar.gz"
-pslog_download_url="https://github.com/sa6mwa/libpslog/releases/download/v$pslog_version/$pslog_asset_name"
+pslog_download_url="https://github.com/c89systems/libpslog/releases/download/v$pslog_version/$pslog_asset_name"
 case "$pslog_asset_name" in
   libpslog-0.12.0-x86_64-linux-gnu.tar.gz)
     pslog_asset_hash=21239262bc06eecb504e45e0902f374ccd86751dcb32087dd84af4d2553ea0e2

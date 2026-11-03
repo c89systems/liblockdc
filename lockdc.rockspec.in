@@ -11,7 +11,7 @@ Idiomatic Lua client bindings for liblockdc, including lease, queue, attachment,
 namespace configuration, XA resources/branches/coordinator, and consumer helper
 APIs backed by the liblockdc C SDK. PostgreSQL registration is a separate optional rock.
 ]],
-  homepage = "https://github.com/sa6mwa/liblockdc",
+  homepage = "https://github.com/c89systems/liblockdc",
   license = "MIT",
 }
 dependencies = {

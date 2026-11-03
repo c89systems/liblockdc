@@ -119,12 +119,14 @@ int lc_pouch_recode_find(lc_pouch_recode *work, const char *scope,
 }
 
 static int rc_copy(lc_pouch_recode *work, const char *source,
-                   const char *target, lc_error *error) {
+                   const char *target, int writable, lc_error *error) {
   unsigned char *buffer;
   ssize_t got, written;
   struct stat st;
   size_t offset;
   int in, out, rc = LC_OK;
+  if (!strcmp(source, target))
+    return LC_OK;
   buffer = lc_alloc_with_allocator(&work->pouch->allocator, 65536);
   if (buffer == NULL)
     return LC_ERR_NOMEM;
@@ -157,7 +159,7 @@ static int rc_copy(lc_pouch_recode *work, const char *source,
       offset += (size_t)written;
     }
   }
-  if (rc == LC_OK && fchmod(out, st.st_mode & 0777) != 0)
+  if (rc == LC_OK && fchmod(out, writable ? 0600 : st.st_mode & 0777) != 0)
     rc = rc_error(error, "failed to preserve conversion metadata mode");
   if (rc == LC_OK && fsync(out) != 0)
     rc = rc_error(error, "failed to sync conversion metadata");
@@ -175,6 +177,7 @@ static int rc_file(lc_pouch_recode *work, const char *source,
                    lc_error *error) {
   lc_pouch_recode_file *file, *next;
   size_t capacity;
+  (void)error;
   if (work->count == work->capacity) {
     capacity = work->capacity == 0 ? 16 : work->capacity * 2;
     if (capacity < work->capacity || capacity > (size_t)-1 / sizeof(*next))
@@ -199,7 +202,7 @@ static int rc_file(lc_pouch_recode *work, const char *source,
   if (!file->source || !file->target || !file->scope || !file->ns ||
       !file->leaf)
     return LC_ERR_NOMEM;
-  return lc_pouch_state_recode_file(work, file, error);
+  return LC_OK;
 }
 
 /* Only authoritative manifest/head files enter the converted canonical tree;
@@ -448,7 +451,7 @@ static int rc_tree(lc_pouch_recode *work, const char *source,
         rc = rc_tree(work, from, to, ns, next_kind, error);
       }
     } else if (S_ISREG(st.st_mode))
-      rc = rc_copy(work, from, to, error);
+      rc = rc_copy(work, from, to, 0, error);
     else
       rc =
           lc_error_set(error, LC_ERR_INVALID, 0,
@@ -464,97 +467,650 @@ static int rc_tree(lc_pouch_recode *work, const char *source,
   return rc;
 }
 
-static int rc_sync_tree(const char *source, const char *path, lc_error *error) {
-  DIR *dir = opendir(path);
-  struct dirent *entry;
-  struct stat st;
-  char *child, *original;
+/* The private journal contains an immutable inventory and one offset table per
+ * canonical file. Only `payload` contains duplicated payload bytes. A durable
+ * table/receipt names both inodes before rename, so a restart distinguishes a
+ * prepared replacement from an installed one without translating twice. */
+static int rc_phase(int phase, lc_error *error) {
+#ifdef LOCKDC_TEST_BUILD
+  if (lc_pouch_recode_test_hook)
+    return lc_pouch_recode_test_hook(lc_pouch_recode_test_context, phase,
+                                     error);
+#else
+  (void)phase;
+  (void)error;
+#endif
+  return LC_OK;
+}
+
+static int rc_put64(FILE *fp, lc_u64 value) {
+  unsigned char bytes[8];
+  unsigned int i;
+  for (i = 0; i < 8; ++i) {
+    bytes[7 - i] = (unsigned char)value;
+    value >>= 8;
+  }
+  return fwrite(bytes, 1, 8, fp) == 8;
+}
+
+static int rc_get64(FILE *fp, lc_u64 *value) {
+  unsigned char bytes[8];
+  unsigned int i;
+  if (fread(bytes, 1, 8, fp) != 8)
+    return 0;
+  *value = 0;
+  for (i = 0; i < 8; ++i)
+    *value = (*value << 8) | bytes[i];
+  return 1;
+}
+
+static int rc_put_string(FILE *fp, const char *text) {
+  size_t length = strlen(text);
+  return rc_put64(fp, (lc_u64)length) && fwrite(text, 1, length, fp) == length;
+}
+
+static int rc_get_string(lc_pouch_recode *work, FILE *fp, char **out, int *rc) {
+  lc_u64 length;
+  if (!rc_get64(fp, &length) || length > 1048576)
+    return 0;
+  *out = lc_alloc_with_allocator(&work->pouch->allocator, (size_t)length + 1);
+  if (!*out) {
+    *rc = LC_ERR_NOMEM;
+    return 0;
+  }
+  if (fread(*out, 1, (size_t)length, fp) != length ||
+      memchr(*out, 0, (size_t)length))
+    return 0;
+  (*out)[length] = 0;
+  return 1;
+}
+
+static int rc_journal_error(lc_error *error) {
+  return lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                      "invalid compression conversion journal", NULL, NULL,
+                      "pouch");
+}
+
+static int rc_commit(FILE *fp, const char *tmp, const char *path,
+                     const char *directory, int valid, lc_error *error) {
+  int rc =
+      valid ? LC_OK : rc_error(error, "failed to write conversion journal");
+  if (rc == LC_OK && (fflush(fp) != 0 || fsync(fileno(fp)) != 0))
+    rc = rc_error(error, "failed to sync conversion journal");
+  if (fclose(fp) != 0 && rc == LC_OK)
+    rc = rc_error(error, "failed to close conversion journal");
+  if (rc == LC_OK && rename(tmp, path) != 0)
+    rc = rc_error(error, "failed to publish conversion journal");
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        directory, "failed to sync conversion journal directory", error);
+  return rc;
+}
+
+static FILE *rc_create(const char *path) {
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
+  if (!fp && fd >= 0)
+    (void)close(fd);
+  return fp;
+}
+
+static int rc_inventory(lc_pouch_recode *work, const char *source,
+                        const char *directory, lc_error *error) {
+  char *path = lc_pouch_path_join(&work->pouch->allocator, directory, "plan");
+  char *tmp =
+      lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
+  char *relative = NULL, *scope = NULL, *ns = NULL, *id = NULL;
+  lc_pouch_recode_file *file;
+  lc_u64 count, active;
+  FILE *fp;
+  size_t i, base = strlen(source) + 1;
+  int valid, rc = LC_OK;
+  if (!path || !tmp) {
+    rc = LC_ERR_NOMEM;
+    goto done;
+  }
+  fp = fopen(path, "rb");
+  if (fp) {
+    valid = rc_get64(fp, &count) && count <= (size_t)-1 / sizeof(*work->files);
+    for (i = 0; valid && i < count; ++i) {
+      valid = rc_get_string(work, fp, &relative, &rc) &&
+              rc_get_string(work, fp, &scope, &rc) &&
+              rc_get_string(work, fp, &ns, &rc) &&
+              rc_get_string(work, fp, &id, &rc) && rc_get64(fp, &active) &&
+              active <= 1 && strlen(id) < LC_XID_STRING_SIZE;
+      if (valid) {
+        char *from =
+            lc_pouch_path_join(&work->pouch->allocator, source, relative);
+        char *owner =
+            lc_pouch_path_join(&work->pouch->allocator, source, scope);
+        const char *leaf = strrchr(relative, '/');
+        rc = from && owner && leaf ? rc_file(work, from, from, owner, ns,
+                                             leaf + 1, id, (int)active, error)
+                                   : LC_ERR_NOMEM;
+        lc_free_with_allocator(&work->pouch->allocator, from);
+        lc_free_with_allocator(&work->pouch->allocator, owner);
+        valid = rc == LC_OK;
+      }
+      lc_free_with_allocator(&work->pouch->allocator, relative);
+      relative = NULL;
+      lc_free_with_allocator(&work->pouch->allocator, scope);
+      scope = NULL;
+      lc_free_with_allocator(&work->pouch->allocator, ns);
+      ns = NULL;
+      lc_free_with_allocator(&work->pouch->allocator, id);
+      id = NULL;
+    }
+    if (!valid || fgetc(fp) != EOF || ferror(fp))
+      rc = rc != LC_OK ? rc : rc_journal_error(error);
+    (void)fclose(fp);
+    goto done;
+  }
+  if (errno != ENOENT) {
+    rc = rc_error(error, "failed to read conversion inventory");
+    goto done;
+  }
+  /* No canonical file is modified until the complete inventory is durable. */
+  rc = rc_tree(work, source, source, NULL, 0, error);
+  if (rc == LC_OK && work->count > 1)
+    qsort(work->files, work->count, sizeof(*work->files), rc_compare);
+  if (rc != LC_OK)
+    goto done;
+  fp = rc_create(tmp);
+  if (!fp) {
+    rc = rc_error(error, "failed to create conversion inventory");
+    goto done;
+  }
+  valid = rc_put64(fp, (lc_u64)work->count);
+  for (i = 0; valid && i < work->count; ++i) {
+    file = &work->files[i];
+    valid = rc_put_string(fp, file->source + base) &&
+            rc_put_string(fp, file->scope + base) &&
+            rc_put_string(fp, file->ns) &&
+            rc_put_string(fp, file->collection_id) &&
+            rc_put64(fp, (lc_u64)file->active);
+  }
+  rc = rc_commit(fp, tmp, path, directory, valid, error);
+done:
+  lc_free_with_allocator(&work->pouch->allocator, path);
+  lc_free_with_allocator(&work->pouch->allocator, tmp);
+  return rc;
+}
+
+static char *rc_progress(lc_pouch_recode *work, const char *directory,
+                         size_t index, const char *suffix) {
+  char leaf[64];
+  (void)snprintf(leaf, sizeof(leaf), "%lu.%s", (unsigned long)index, suffix);
+  return lc_pouch_path_join(&work->pouch->allocator, directory, leaf);
+}
+
+static int rc_install(const char *directory, const char *payload,
+                      const char *source, lc_u64 before, lc_u64 after,
+                      int phase, lc_error *error) {
+  struct stat st, staged;
+  char *parent;
   int rc = LC_OK;
-  if (!dir)
-    return rc_error(error, "failed to open completed conversion tree");
+  if (stat(source, &st) != 0)
+    return rc_error(error, "failed to inspect conversion segment");
+  if ((lc_u64)st.st_ino != after) {
+    if ((lc_u64)st.st_ino != before || stat(payload, &staged) != 0 ||
+        (lc_u64)staged.st_ino != after)
+      return rc_journal_error(error);
+    if (rename(payload, source) != 0)
+      return rc_error(error, "failed to install converted segment");
+    rc = rc_phase(phase, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  /* Also sync after a recovered rename: it may have reached either directory
+   * before power loss, even when the current in-memory lookup sees `after`. */
+  parent = lc_strdup_with_allocator(NULL, source);
+  if (parent && strrchr(parent, '/'))
+    *strrchr(parent, '/') = 0;
+  rc = parent ? lc_pouch_path_fsync_directory(
+                    parent, "failed to sync converted segment directory", error)
+              : LC_ERR_NOMEM;
+  lc_free_with_allocator(NULL, parent);
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        directory, "failed to sync conversion staging directory", error);
+  return rc;
+}
+
+static int rc_segment(lc_pouch_recode *work, size_t index,
+                      const char *directory, const char *payload,
+                      lc_error *error) {
+  lc_pouch_recode_file *file = &work->files[index];
+  char *path = rc_progress(work, directory, index, "map");
+  char *refs = rc_progress(work, directory, index, "refs");
+  char *tmp =
+      lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
+  char *target;
+  struct stat source_st, target_st, journal_st;
+  FILE *fp;
+  lc_u64 before = 0, after = 0, count = 0, input = 0, output = 0, has_refs = 0;
+  size_t i;
+  int valid, rc = LC_OK;
+  if (!path || !refs || !tmp) {
+    rc = LC_ERR_NOMEM;
+    goto done;
+  }
+  fp = fopen(path, "rb");
+  if (fp) {
+    valid = rc_get64(fp, &before) && rc_get64(fp, &after) &&
+            rc_get64(fp, &input) && rc_get64(fp, &output) &&
+            rc_get64(fp, &has_refs) && has_refs <= 1 && rc_get64(fp, &count) &&
+            fstat(fileno(fp), &journal_st) == 0 && journal_st.st_size >= 48 &&
+            count == (lc_u64)(journal_st.st_size - 48) / 16 &&
+            (journal_st.st_size - 48) % 16 == 0 &&
+            count <= (size_t)-1 / sizeof(*file->offsets);
+    for (i = 0; valid && i < count; ++i) {
+      lc_u64 old_offset, new_offset;
+      valid = rc_get64(fp, &old_offset) && rc_get64(fp, &new_offset);
+      if (valid) {
+        rc = lc_pouch_recode_offset_add(work, file, old_offset, new_offset,
+                                        error);
+        valid = rc == LC_OK;
+      }
+    }
+    if (!valid || fgetc(fp) != EOF || ferror(fp))
+      rc = rc != LC_OK ? rc : rc_journal_error(error);
+    (void)fclose(fp);
+    if (rc == LC_OK) {
+      file->has_refs = (int)has_refs;
+      work->input_bytes += input;
+      work->output_bytes += output;
+    }
+    /* A reference receipt supersedes the first replacement's inode. Its
+     * installation is completed by rc_references before translating anything.
+     */
+    if (rc == LC_OK && lstat(refs, &journal_st) != 0) {
+      if (errno != ENOENT)
+        rc = rc_error(error, "failed to inspect reference progress");
+      else
+        rc = rc_install(directory, payload, file->source, before, after,
+                        LC_POUCH_RECODE_SEGMENT_RENAMED, error);
+    }
+    goto done;
+  }
+  if (errno != ENOENT) {
+    rc = rc_error(error, "failed to read conversion offset map");
+    goto done;
+  }
+  if (unlink(payload) != 0 && errno != ENOENT) {
+    rc = rc_error(error, "failed to discard unfinished segment");
+    goto done;
+  }
+  if (stat(file->source, &source_st) != 0) {
+    rc = rc_error(error, "failed to inspect original segment");
+    goto done;
+  }
+  input = work->input_bytes;
+  output = work->output_bytes;
+  target = file->target;
+  file->target = (char *)payload;
+  rc = lc_pouch_state_recode_file(work, file, error);
+  file->target = target;
+  if (rc != LC_OK)
+    goto done;
+  if (stat(payload, &target_st) != 0) {
+    rc = rc_error(error, "failed to inspect converted segment");
+    goto done;
+  }
+  before = (lc_u64)source_st.st_ino;
+  after = (lc_u64)target_st.st_ino;
+  fp = rc_create(tmp);
+  if (!fp) {
+    rc = rc_error(error, "failed to create conversion offset map");
+    goto done;
+  }
+  valid = rc_put64(fp, before) && rc_put64(fp, after) &&
+          rc_put64(fp, work->input_bytes - input) &&
+          rc_put64(fp, work->output_bytes - output) &&
+          rc_put64(fp, (lc_u64)file->has_refs) &&
+          rc_put64(fp, (lc_u64)file->count);
+  for (i = 0; valid && i < file->count; ++i)
+    valid = rc_put64(fp, file->offsets[i].before) &&
+            rc_put64(fp, file->offsets[i].after);
+  rc = rc_commit(fp, tmp, path, directory, valid, error);
+  if (rc == LC_OK)
+    rc = rc_phase(LC_POUCH_RECODE_SEGMENT_READY, error);
+  if (rc == LC_OK)
+    rc = rc_install(directory, payload, file->source, before, after,
+                    LC_POUCH_RECODE_SEGMENT_RENAMED, error);
+  if (rc == LC_OK)
+    rc = rc_phase(LC_POUCH_RECODE_SEGMENT_INSTALLED, error);
+done:
+  lc_free_with_allocator(&work->pouch->allocator, path);
+  lc_free_with_allocator(&work->pouch->allocator, refs);
+  lc_free_with_allocator(&work->pouch->allocator, tmp);
+  return rc;
+}
+
+static int rc_references(lc_pouch_recode *work, size_t index,
+                         const char *directory, const char *payload,
+                         lc_error *error) {
+  lc_pouch_recode_file *file = &work->files[index];
+  char *path = rc_progress(work, directory, index, "refs");
+  char *tmp =
+      lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
+  char *target;
+  struct stat source_st, target_st;
+  lc_u64 before = 0, after = 0;
+  FILE *fp;
+  int valid, rc = LC_OK;
+  if (!file->has_refs)
+    goto done;
+  if (!path || !tmp) {
+    rc = LC_ERR_NOMEM;
+    goto done;
+  }
+  fp = fopen(path, "rb");
+  if (fp) {
+    valid = rc_get64(fp, &before) && rc_get64(fp, &after) && fgetc(fp) == EOF &&
+            !ferror(fp);
+    (void)fclose(fp);
+    rc = valid ? rc_install(directory, payload, file->source, before, after,
+                            LC_POUCH_RECODE_REFS_RENAMED, error)
+               : rc_journal_error(error);
+    goto done;
+  }
+  if (errno != ENOENT) {
+    rc = rc_error(error, "failed to read reference progress");
+    goto done;
+  }
+  if (unlink(payload) != 0 && errno != ENOENT) {
+    rc = rc_error(error, "failed to discard unfinished reference rewrite");
+    goto done;
+  }
+  if (stat(file->source, &source_st) != 0) {
+    rc = rc_error(error, "failed to inspect reference segment");
+    goto done;
+  }
+  /* The private scratch copy must be writable even for sealed read-only
+   * segments. recode_refs restores the original mode before publication. */
+  rc = rc_copy(work, file->source, payload, 1, error);
+  target = file->target;
+  file->target = (char *)payload;
+  if (rc == LC_OK)
+    rc = lc_pouch_state_recode_refs(work, file, error);
+  file->target = target;
+  if (rc != LC_OK)
+    goto done;
+  if (stat(payload, &target_st) != 0) {
+    rc = rc_error(error, "failed to inspect rewritten reference segment");
+    goto done;
+  }
+  before = (lc_u64)source_st.st_ino;
+  after = (lc_u64)target_st.st_ino;
+  fp = rc_create(tmp);
+  if (!fp) {
+    rc = rc_error(error, "failed to create reference receipt");
+    goto done;
+  }
+  valid = rc_put64(fp, before) && rc_put64(fp, after);
+  rc = rc_commit(fp, tmp, path, directory, valid, error);
+  if (rc == LC_OK)
+    rc = rc_phase(LC_POUCH_RECODE_REFS_READY, error);
+  if (rc == LC_OK)
+    rc = rc_install(directory, payload, file->source, before, after,
+                    LC_POUCH_RECODE_REFS_RENAMED, error);
+  if (rc == LC_OK)
+    rc = rc_phase(LC_POUCH_RECODE_REFS_INSTALLED, error);
+done:
+  lc_free_with_allocator(&work->pouch->allocator, path);
+  lc_free_with_allocator(&work->pouch->allocator, tmp);
+  return rc;
+}
+
+static int rc_query_id(lc_pouch_recode *work, const char *directory,
+                       size_t index, const char *scope,
+                       char id[LC_XID_STRING_SIZE], lc_error *error) {
+  char *saved = rc_progress(work, directory, index, "query-id");
+  char *path = lc_pouch_path_join(&work->pouch->allocator, scope, "order");
+  lc_collection_order order;
+  FILE *fp;
+  lc_error ignored;
+  int rc = LC_OK;
+  memset(id, 0, LC_XID_STRING_SIZE);
+  if (!saved || !path) {
+    rc = LC_ERR_NOMEM;
+    goto done;
+  }
+  fp = fopen(saved, "rb");
+  if (fp) {
+    if (fread(id, 1, LC_XID_STRING_SIZE, fp) != LC_XID_STRING_SIZE ||
+        fgetc(fp) != EOF || ferror(fp) || id[LC_XID_STRING_SIZE - 1] ||
+        (id[0] && !lc_xid_is_valid(id)))
+      rc = rc_journal_error(error);
+    (void)fclose(fp);
+    goto done;
+  }
+  if (errno != ENOENT) {
+    rc = rc_error(error, "failed to read saved collection query identity");
+    goto done;
+  }
+  memset(&order, 0, sizeof(order));
+  order.fd = -1;
+  lc_error_init(&ignored);
+  if (lc_collection_order_open(path, 0, &order, &ignored) == LC_OK)
+    strcpy(id, order.query_id);
+  lc_collection_order_close(&order);
+  lc_error_cleanup(&ignored);
+  rc = lc_pouch_path_write_bytes_file_mode(saved, id, LC_XID_STRING_SIZE, 0600,
+                                           error);
+done:
+  lc_free_with_allocator(&work->pouch->allocator, saved);
+  lc_free_with_allocator(&work->pouch->allocator, path);
+  return rc;
+}
+
+static int rc_reset_projection(lc_pouch_recode *work, const char *scope,
+                               lc_error *error) {
+  DIR *dir = opendir(scope);
+  struct dirent *entry;
+  char *path;
+  int rc =
+      dir ? LC_OK
+          : rc_error(error, "failed to inspect converted collection indexes");
   while (rc == LC_OK) {
     errno = 0;
     entry = readdir(dir);
     if (!entry) {
       if (errno)
-        rc = rc_error(error, "failed to read completed conversion tree");
+        rc =
+            rc_error(error, "failed to enumerate converted collection indexes");
+      break;
+    }
+    if (strcmp(entry->d_name, "order") && strcmp(entry->d_name, "ids") &&
+        strcmp(entry->d_name, "clean") && strcmp(entry->d_name, "query") &&
+        strncmp(entry->d_name, "order.rebuild-", 14) &&
+        strncmp(entry->d_name, "ids.rebuild-", 12))
+      continue;
+    path = lc_pouch_path_join(&work->pouch->allocator, scope, entry->d_name);
+    rc = path ? lc_pouch_recode_remove_tree(path, error) : LC_ERR_NOMEM;
+    lc_free_with_allocator(&work->pouch->allocator, path);
+  }
+  if (dir)
+    (void)closedir(dir);
+  return rc == LC_OK ? lc_pouch_path_fsync_directory(
+                           scope, "failed to sync converted index reset", error)
+                     : rc;
+}
+
+static int rc_heads(lc_pouch_recode *work, const char *directory,
+                    lc_error *error) {
+  lc_pouch_recode_file *file;
+  struct stat st;
+  size_t i;
+  char *saved, *head, *tmp;
+  char query_id[LC_XID_STRING_SIZE];
+  int rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < work->count; ++i) {
+    file = &work->files[i];
+    if (!file->collection_id[0] ||
+        (i && !strcmp(file->scope, work->files[i - 1].scope)))
+      continue;
+    rc = rc_query_id(work, directory, i, file->scope, query_id, error);
+    if (rc != LC_OK)
+      break;
+    saved = rc_progress(work, directory, i, "head");
+    head = lc_pouch_path_join(&work->pouch->allocator, file->scope, "head");
+    tmp = lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
+    if (!saved || !head || !tmp)
+      rc = LC_ERR_NOMEM;
+    else if (stat(saved, &st) != 0) {
+      if (errno != ENOENT)
+        rc = rc_error(error, "failed to inspect original collection head");
+      else {
+        if (unlink(tmp) != 0 && errno != ENOENT)
+          rc = rc_error(error, "failed to discard unfinished head backup");
+        if (rc == LC_OK)
+          rc = rc_copy(work, head, tmp, 0, error);
+        if (rc == LC_OK && rename(tmp, saved) != 0)
+          rc = rc_error(error, "failed to save original collection head");
+        if (rc == LC_OK)
+          rc = lc_pouch_path_fsync_directory(
+              directory, "failed to sync saved collection head", error);
+      }
+    }
+    if (rc == LC_OK)
+      rc = rc_reset_projection(work, file->scope, error);
+    /* Always restart head/index publication from the original small head.
+     * Reapplying the offset translation to an already translated head is wrong.
+     */
+    if (rc == LC_OK) {
+      if (unlink(tmp) != 0 && errno != ENOENT)
+        rc = rc_error(error, "failed to discard unfinished head restore");
+      if (rc == LC_OK)
+        rc = rc_copy(work, saved, tmp, 0, error);
+      if (rc == LC_OK && rename(tmp, head) != 0)
+        rc = rc_error(error, "failed to restore original collection head");
+      if (rc == LC_OK)
+        rc = lc_collection_migrate_head(work->pouch, file->scope, error);
+      if (rc == LC_OK)
+        rc = lc_collection_recode_finish(work, file->scope, file->scope,
+                                         file->collection_id, query_id, error);
+      if (rc == LC_OK)
+        rc = rc_phase(LC_POUCH_RECODE_HEAD, error);
+    }
+    lc_free_with_allocator(&work->pouch->allocator, saved);
+    lc_free_with_allocator(&work->pouch->allocator, head);
+    lc_free_with_allocator(&work->pouch->allocator, tmp);
+  }
+  return rc;
+}
+
+/* Derived offsets must not survive the physical rewrite. Reclaim only files
+ * already retired by the authoritative manifest; no live record is deleted. */
+static int rc_cleanup(lc_pouch_recode *work, const char *source,
+                      lc_error *error) {
+  DIR *dir = opendir(source);
+  struct dirent *entry;
+  lc_pouch_namespace_manifest manifest;
+  char *ns, *base, *path, *logs;
+  unsigned long i;
+  size_t j;
+  int rc =
+      dir ? LC_OK : rc_error(error, "failed to open conversion cleanup root");
+  while (rc == LC_OK) {
+    errno = 0;
+    entry = readdir(dir);
+    if (!entry) {
+      if (errno)
+        rc = rc_error(error, "failed to enumerate conversion cleanup");
       break;
     }
     if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
       continue;
-    child = lc_pouch_path_join(NULL, path, entry->d_name);
-    original = lc_pouch_path_join(NULL, source, entry->d_name);
-    if (!child || !original)
-      rc = LC_ERR_NOMEM;
-    else if (lstat(child, &st) != 0)
-      rc = rc_error(error, "failed to inspect completed conversion tree");
-    else if (S_ISDIR(st.st_mode))
-      rc = rc_sync_tree(original, child, error);
-    lc_free_with_allocator(NULL, child);
-    lc_free_with_allocator(NULL, original);
+    ns = lc_pouch_path_unescape_name(&work->pouch->allocator, entry->d_name);
+    memset(&manifest, 0, sizeof(manifest));
+    rc = ns ? lc_pouch_namespace_manifest_open(&work->pouch->allocator,
+                                               work->pouch->root_path, ns,
+                                               &manifest, NULL, NULL, error)
+            : LC_ERR_NOMEM;
+    base = manifest.namespace_path;
+    if (rc == LC_OK) {
+      const char *derived[] = {"index", "sequence.clean"};
+      for (j = 0; rc == LC_OK && j < 2; ++j) {
+        path = lc_pouch_path_join(&work->pouch->allocator, base, derived[j]);
+        rc = path ? lc_pouch_recode_remove_tree(path, error) : LC_ERR_NOMEM;
+        lc_free_with_allocator(&work->pouch->allocator, path);
+      }
+    }
+    for (j = 0; rc == LC_OK && j < 2; ++j) {
+      unsigned long count = j ? manifest.obsolete_snapshot_count
+                              : manifest.obsolete_segment_count;
+      logs = lc_pouch_path_join(&work->pouch->allocator, base,
+                                j ? "snapshots" : "segments");
+      if (!logs)
+        rc = LC_ERR_NOMEM;
+      for (i = 0; rc == LC_OK && i < count; ++i) {
+        path = lc_pouch_path_join(&work->pouch->allocator, logs,
+                                  j ? manifest.obsolete_snapshots[i]
+                                    : manifest.obsolete_segments[i]);
+        rc = path ? lc_pouch_recode_remove_tree(path, error) : LC_ERR_NOMEM;
+        lc_free_with_allocator(&work->pouch->allocator, path);
+      }
+      if (rc == LC_OK)
+        rc = lc_pouch_path_fsync_directory(
+            logs, "failed to sync obsolete conversion cleanup", error);
+      lc_free_with_allocator(&work->pouch->allocator, logs);
+    }
+    if (rc == LC_OK)
+      rc = lc_pouch_path_fsync_directory(
+          base, "failed to sync derived index invalidation", error);
+    lc_pouch_namespace_manifest_cleanup(&work->pouch->allocator, &manifest);
+    lc_free_with_allocator(&work->pouch->allocator, ns);
   }
-  (void)closedir(dir);
-  if (rc == LC_OK) {
-    if (stat(source, &st) == 0) {
-      if (chmod(path, st.st_mode & 0777) != 0)
-        rc = rc_error(error, "failed to preserve conversion directory mode");
-    } else if (errno != ENOENT)
-      rc = rc_error(error, "failed to inspect conversion directory mode");
-  }
-  return rc == LC_OK ? lc_pouch_path_fsync_directory(
-                           path, "failed to sync conversion directory", error)
-                     : rc;
+  if (dir)
+    (void)closedir(dir);
+  return rc;
 }
 
 int lc_pouch_recode_build(lc_pouch *pouch, const char *source,
-                          const char *target, lc_u64 *input_bytes,
+                          const char *directory, lc_u64 *input_bytes,
                           lc_u64 *output_bytes, lc_error *error) {
   lc_pouch_recode work;
   lc_pouch_recode_file *file;
-  const char *slash;
-  char *parent;
+  struct stat st;
+  char *payload;
   size_t i;
-  int rc;
+  int rc = LC_OK;
   memset(&work, 0, sizeof(work));
   work.pouch = pouch;
-  rc = lc_pouch_recode_remove_tree(target, error);
-  /* Copies can have public file modes beneath private source directories.
-   * Keep the entire replacement inaccessible to peers until rc_sync_tree has
-   * restored descendant modes and finally the staging root's source mode. */
-  if (rc == LC_OK && mkdir(target, 0700) != 0)
-    rc = rc_error(error, "failed to create private conversion directory");
+  if (mkdir(directory, 0700) != 0 && errno != EEXIST)
+    rc = rc_error(error, "failed to create private conversion journal");
+  if (rc == LC_OK && (lstat(directory, &st) != 0 || !S_ISDIR(st.st_mode) ||
+                      chmod(directory, 0700) != 0))
+    rc = rc_error(error, "failed to secure conversion journal");
+  payload = lc_pouch_path_join(&pouch->allocator, directory, "payload");
+  if (rc == LC_OK && !payload)
+    rc = LC_ERR_NOMEM;
   if (rc == LC_OK)
-    rc = rc_tree(&work, source, target, NULL, 0, error);
-#ifdef LOCKDC_TEST_BUILD
-  if (rc == LC_OK && lc_pouch_recode_test_hook != NULL)
-    rc = lc_pouch_recode_test_hook(lc_pouch_recode_test_context,
-                                   LC_POUCH_RECODE_COPIED, error);
-#endif
-  if (rc == LC_OK && work.count > 1)
-    qsort(work.files, work.count, sizeof(*work.files), rc_compare);
+    rc = lc_pouch_path_fsync_directory(
+        pouch->root_path, "failed to sync conversion journal creation", error);
+  /* A previous publication may be visible after its directory sync failed.
+   * Make all recovered receipts/backups durable before replacing canonical
+   * files or discarding the originals they describe. */
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        directory, "failed to sync recovered conversion journal", error);
+  if (rc == LC_OK)
+    rc = rc_inventory(&work, source, directory, error);
+  if (rc == LC_OK)
+    rc = rc_phase(LC_POUCH_RECODE_COPIED, error);
   for (i = 0; rc == LC_OK && i < work.count; ++i)
-    rc = lc_pouch_state_recode_refs(&work, &work.files[i], error);
-  for (i = 0; rc == LC_OK && i < work.count; ++i) {
-    file = &work.files[i];
-    if (!file->collection_id[0] ||
-        (i && !strcmp(file->scope, work.files[i - 1].scope)))
-      continue;
-    slash = strrchr(file->target, '/');
-    parent = slash ? lc_alloc_with_allocator(&pouch->allocator,
-                                             (size_t)(slash - file->target) + 1)
-                   : NULL;
-    if (!parent) {
-      rc = LC_ERR_NOMEM;
-      break;
-    }
-    memcpy(parent, file->target, (size_t)(slash - file->target));
-    parent[slash - file->target] = '\0';
-    rc = lc_collection_recode_finish(&work, file->scope, parent,
-                                     file->collection_id, error);
-    lc_free_with_allocator(&pouch->allocator, parent);
-  }
+    rc = rc_segment(&work, i, directory, payload, error);
+  /* Prepared reference replacements must be installed before another file
+   * reads their payload descriptors. rc_references installs its own receipt
+   * before doing new work; at most one prepared payload exists. */
+  for (i = 0; rc == LC_OK && i < work.count; ++i)
+    rc = rc_references(&work, i, directory, payload, error);
   if (rc == LC_OK)
-    rc = rc_sync_tree(source, target, error);
+    rc = rc_heads(&work, directory, error);
+  if (rc == LC_OK)
+    rc = rc_cleanup(&work, source, error);
   *input_bytes = work.input_bytes;
   *output_bytes = work.output_bytes;
   for (i = 0; i < work.count; ++i) {
@@ -567,8 +1123,9 @@ int lc_pouch_recode_build(lc_pouch *pouch, const char *source,
     lc_free_with_allocator(&pouch->allocator, file->offsets);
   }
   lc_free_with_allocator(&pouch->allocator, work.files);
+  lc_free_with_allocator(&pouch->allocator, payload);
   if (rc != LC_OK && error && error->code == LC_OK)
-    lc_error_set(error, rc, 0, "failed to prepare Pouch compression conversion",
+    lc_error_set(error, rc, 0, "failed to resume Pouch compression conversion",
                  NULL, NULL, "pouch");
   return rc;
 }

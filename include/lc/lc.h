@@ -358,7 +358,9 @@ typedef struct lc_pouch_settings {
    * root's mode; new roots default to none. A differing explicit mode converts
    * the entire root synchronously with exclusive ownership. If other writers
    * prevent conversion, open warns and uses the stored mode. Conversion errors
-   * fail the open; interrupted publication is recovered on the next open. */
+   * fail the open. Conversion replaces one canonical file at a time, with
+   * temporary payload space for that file rather than a second root. Any
+   * interrupted conversion resumes on the next open, even with omission. */
   const char *compression;
 } lc_pouch_settings;
 
@@ -477,6 +479,8 @@ typedef struct lc_client_config {
    * (none for new roots). Explicit "none"/"zlib" requests whole-root conversion
    * if different, before open returns. Other writers prevent conversion and
    * the open warns and adopts the stored mode. Conversion errors fail the open.
+   * Conversion uses one canonical-file replacement plus recovery metadata;
+   * interrupted work resumes before clients are admitted, even with NULL.
    * Consumer service workers retain the mode actually opened.
    */
   const char *pouch_compression;

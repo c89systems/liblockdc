@@ -25,7 +25,7 @@ resource_object_path="${build_root}/lockdc_xa_resource_lua.${obj_ext}"
 provider_object_path="${build_root}/lockdc_xa_provider_lua.${obj_ext}"
 module_path="${module_dir}/core.${lib_ext}"
 rock_install_module_path="${module_dir}/core.so"
-lockdc_release_base_url="https://github.com/sa6mwa/liblockdc/releases/download/v${expected_lockdc_version}"
+lockdc_release_base_url="https://github.com/c89systems/liblockdc/releases/download/v${expected_lockdc_version}"
 
 # shellcheck source=assert_generated_path.sh
 . "$repo_root/scripts/assert_generated_path.sh"
@@ -75,7 +75,7 @@ lockdc_release_url() {
       "$expected_lockdc_version" \
       "$lockdc_target_id"
   else
-    printf 'https://github.com/sa6mwa/liblockdc/releases/tag/v%s' "$expected_lockdc_version"
+    printf 'https://github.com/c89systems/liblockdc/releases/tag/v%s' "$expected_lockdc_version"
   fi
 }
 

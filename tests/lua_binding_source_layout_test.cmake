@@ -39,7 +39,7 @@ file(READ "${LOCKDC_ROOT}/scripts/build_lua_rock.sh" build_luarock_script)
 foreach(required_snippet
     "package = \"lockdc\""
     "\"lonejson == 0.45.0-1\""
-    "url = \"git+https://github.com/sa6mwa/liblockdc.git\""
+    "url = \"git+https://github.com/c89systems/liblockdc.git\""
     "tag = \"v"
     "scripts/build_lua_rock.sh"
     [==[\"$(LUA_INCDIR)\"]==]
@@ -83,7 +83,7 @@ endforeach()
 
 foreach(required_snippet
     "set -euo pipefail"
-    "https://github.com/sa6mwa/lonejson/releases/download/v0.45.0/lonejson-0.45.0-1.src.rock"
+    "https://github.com/c89systems/lonejson/releases/download/v0.45.0/lonejson-0.45.0-1.src.rock"
     "export LONEJSON_LIBDIR"
     "unset LD_LIBRARY_PATH"
     "unset LD_PRELOAD"
@@ -97,8 +97,8 @@ endforeach()
 
 foreach(stale_snippet
     "lonejson == 0.41.0-1"
-    "https://github.com/sa6mwa/lonejson/releases/download/v0.41.0/lonejson-0.41.0-1.src.rock"
-    "https://github.com/sa6mwa/lonejson/releases/download/v0.16.0/lonejson-0.16.0-1.src.rock"
+    "https://github.com/c89systems/lonejson/releases/download/v0.41.0/lonejson-0.41.0-1.src.rock"
+    "https://github.com/c89systems/lonejson/releases/download/v0.16.0/lonejson-0.16.0-1.src.rock"
 )
     string(FIND "${rockspec_text}" "${stale_snippet}" rockspec_stale_index)
     string(FIND "${validate_luarocks_script}" "${stale_snippet}" script_stale_index)

@@ -112,7 +112,9 @@ Common legacy options are:
 
 - `compression=zlib` for streaming at-rest zlib compression. Omission inherits
   an existing root; explicitly changing mode converts it before open returns
-  when no other writers are active. See [compression changes](docs/pouch-compression.md).
+  when no other writers are active. Conversion resumes after interruption and
+  replaces one segment or snapshot at a time without a second root. See
+  [compression changes](docs/pouch-compression.md).
 - `crypto_key_file=/path/to/pouch.key` with
   `crypto_generate_key_file=true` for encrypted local roots
 - `durable_sync=true` and `fsync_batch_max_ops=<u64>` for root-scoped durable
@@ -156,12 +158,12 @@ ordered streams.
 
 ## C ABI and storage compatibility
 
-The collection receiver, capability and read-option layouts use core
-ABI **9**, advancing once from ABI **8** in v0.25.0. Rebuild C consumers, Lua
-native bindings and the optional PostgreSQL provider together; the provider's
-own ABI remains **0**.
-This single ABI change covers atomic collection edits and recovery heads in
-0.26.0; see [the edit contract](docs/collection-edits.md) and
+Core ABI **9**, introduced in v0.26.0 from ABI **8** in v0.25.0, remains
+unchanged in v0.27.0. ABI 9 consumers remain compatible; the PostgreSQL
+provider's own ABI remains **0**. When upgrading from ABI 8, rebuild C consumers,
+Lua native bindings and the optional PostgreSQL provider together.
+That ABI change covers atomic collection edits and recovery heads;
+see [the edit contract](docs/collection-edits.md) and
 [upgrade instructions](CHANGELOG.md#upgrading-from-025x).
 
 Pouch upgrades released collection heads on open under exclusive root access,
@@ -173,7 +175,7 @@ with state retention, remain documented in the [release notes](CHANGELOG.md).
 
 ## Build system
 
-The repository (<https://github.com/sa6mwa/liblockdc>) uses a Makefile-first lifecycle with CMake as the build backend:
+The repository (<https://github.com/c89systems/liblockdc>) uses a Makefile-first lifecycle with CMake as the build backend:
 
 - `Makefile`
   - primary developer entry point
@@ -819,7 +821,7 @@ if (lc_acquire_for_update(client, &acquire, update_order, NULL, &error) !=
 
 Queue APIs follow the same handle-oriented pattern: dequeue or subscribe, operate on the returned `lc_message`, and then finish with `ack()`, `nack()`, or `close()`.
 
-The examples in the repository at <https://github.com/sa6mwa/liblockdc/tree/trunk/examples> are complete programs intended to be runnable from the build tree and illustrate how an application would wire client configuration, logging, and request structures directly.
+The examples in the repository at <https://github.com/c89systems/liblockdc/tree/trunk/examples> are complete programs intended to be runnable from the build tree and illustrate how an application would wire client configuration, logging, and request structures directly.
 
 ## Repository layout
 
@@ -857,4 +859,4 @@ The CMake presets resolve the matching pinned Bootlin collection and dependency
 root. Use the Make targets for normal builds, package production, verification,
 and release orchestration.
 
-See <https://github.com/sa6mwa/liblockdc> for the full source code.
+See <https://github.com/c89systems/liblockdc> for the full source code.

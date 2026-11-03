@@ -294,6 +294,8 @@ extern void *lc_pouch_test_queue_time_context;
 typedef int (*lc_pouch_test_hook)(void *context, lc_error *error);
 extern lc_pouch_test_hook lc_pouch_test_after_snapshot_write_hook;
 extern void *lc_pouch_test_after_snapshot_write_context;
+extern int (*lc_pouch_test_candidate_open_errno)(const char *path,
+                                                 const char *phase);
 /* Invoked after an indexed query borrows a document-table cache entry and
  * before it dereferences that borrowed table. */
 extern lc_pouch_test_hook lc_pouch_test_after_doc_table_cache_borrow_hook;

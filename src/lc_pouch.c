@@ -2564,12 +2564,13 @@ static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
     lc_error_init(&maintenance_error);
     rc = lc_pouch_maintenance_run(pouch, &options, &result, &maintenance_error);
     if (rc != LC_OK) {
-      pslog_field fields[3];
+      pslog_field fields[4];
 
       fields[0] = lc_log_str_field("ns", ns);
       fields[1] = lc_log_error_field("error", &maintenance_error);
       fields[2] = lc_log_code_field(&maintenance_error);
-      lc_log_warn(pouch->logger, "compaction.background.error", fields, 3U);
+      fields[3] = lc_log_str_field("detail", maintenance_error.detail);
+      lc_log_warn(pouch->logger, "compaction.background.error", fields, 4U);
     } else if (result.cleanup_pending_count != 0UL) {
       lc_error queue_error;
       int queued;
@@ -6201,25 +6202,76 @@ invalid:
                       "pouch");
 }
 
+/* The root intent is durable before the first segment changes. While present,
+ * no client may use the mixed physical tree. The final manifest is written only
+ * after all segments, references, heads and derived-index invalidations sync.
+ */
+static int lc_pc_resume(lc_pouch *pouch, const char *intent, const char *work,
+                        const char *current, const char *stored,
+                        const char *target, lc_u64 *input, lc_u64 *output,
+                        lc_error *error) {
+  char text[128], in[32], out[32];
+  int rc = lc_collection_migrate_heads(pouch, error);
+  if (rc == LC_OK)
+    rc = lc_pc_mode(pouch, target, error);
+  if (rc == LC_OK && strcmp(stored, target))
+    rc = lc_pouch_recode_build(pouch, current, work, input, output, error);
+  if (rc == LC_OK && strcmp(stored, target)) {
+    (void)lc_u64_format_base10(*input, in, sizeof(in));
+    (void)lc_u64_format_base10(*output, out, sizeof(out));
+    (void)snprintf(text, sizeof(text), "pouch-compression-v1\n%s\n%s\n%s\n%s\n",
+                   stored, target, in, out);
+    rc = lc_pouch_path_write_text_file(intent, text, error);
+  }
+  if (rc == LC_OK)
+    rc = lc_pc_phase(LC_POUCH_RECODE_BUILT, error);
+  if (rc == LC_OK)
+    rc = lc_pc_phase(LC_POUCH_RECODE_OLD_MOVED, error);
+  if (rc == LC_OK)
+    rc = lc_pc_phase(LC_POUCH_RECODE_INSTALLED, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_write_root_manifest(pouch, error);
+  if (rc == LC_OK)
+    rc = lc_pc_phase(LC_POUCH_RECODE_MANIFEST, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_recode_remove_tree(work, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        pouch->root_path, "failed to sync conversion reclamation", error);
+  if (rc == LC_OK)
+    rc = lc_pc_phase(LC_POUCH_RECODE_RECLAIMED, error);
+  if (rc == LC_OK && unlink(intent) != 0)
+    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0,
+                      "failed to retire compression intent", strerror(errno),
+                      NULL, "pouch");
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        pouch->root_path, "failed to sync compression completion", error);
+  return rc;
+}
+
 static int lc_pouch_resolve_compression(lc_pouch *pouch, const char *stored,
                                         lc_error *error) {
-  char requested[5], previous[5], target[5], text[128], in[32], out[32];
-  char *intent, *fresh, *old, *current;
+  char requested[5], previous[5], target[5], text[128];
+  char *intent, *work, *fresh, *old, *current;
   struct timespec started = {0, 0}, ended = {0, 0};
   lc_u64 input = 0, output = 0, elapsed = 0;
-  int pending, shared, rc;
+  int pending, shared, has_fresh = 0, has_old = 0, rc;
   strcpy(requested, pouch->compression);
   strcpy(previous, stored);
   intent = lc_pouch_path_join(&pouch->allocator, pouch->root_path,
                               ".compression-ready");
+  work = lc_pouch_path_join(&pouch->allocator, pouch->root_path,
+                            ".compression-work");
   fresh = lc_pouch_path_join(&pouch->allocator, pouch->root_path,
                              ".compression-new");
   old = lc_pouch_path_join(&pouch->allocator, pouch->root_path,
                            ".compression-old");
   current =
       lc_pouch_path_join(&pouch->allocator, pouch->root_path, "namespaces");
-  rc = intent && fresh && old && current ? lc_pc_exists(intent, &pending, error)
-                                         : LC_ERR_NOMEM;
+  rc = intent && work && fresh && old && current
+           ? lc_pc_exists(intent, &pending, error)
+           : LC_ERR_NOMEM;
   shared = pouch->writer_root_lock_mode == LC_POUCH_WRITER_ROOT_LOCK_SHARED;
   if (rc == LC_OK && !pending &&
       (!pouch->compression_explicit || !strcmp(requested, stored))) {
@@ -6245,12 +6297,21 @@ static int lc_pouch_resolve_compression(lc_pouch *pouch, const char *stored,
   }
   if (rc == LC_OK && pending) {
     rc = lc_pc_read_intent(intent, previous, target, &input, &output, error);
+    if (rc == LC_OK)
+      rc = lc_pc_exists(fresh, &has_fresh, error);
+    if (rc == LC_OK)
+      rc = lc_pc_exists(old, &has_old, error);
     if (rc == LC_OK) {
       (void)clock_gettime(CLOCK_MONOTONIC, &started);
       lc_pc_log(pouch, "compression.convert.start", 1, previous, target, input,
                 output, 0, 1);
-      rc = lc_pc_publish(pouch, intent, fresh, old, current, stored, target, 1,
-                         error);
+      /* Finish publication left by released whole-tree converters. New
+       * conversions never create either of these payload trees. */
+      rc = has_fresh || has_old
+               ? lc_pc_publish(pouch, intent, fresh, old, current, stored,
+                               target, 1, error)
+               : lc_pc_resume(pouch, intent, work, current, stored, target,
+                              &input, &output, error);
       (void)clock_gettime(CLOCK_MONOTONIC, &ended);
       elapsed = (lc_u64)(ended.tv_sec - started.tv_sec) * 1000 +
                 (ended.tv_nsec - started.tv_nsec) / 1000000;
@@ -6266,24 +6327,20 @@ static int lc_pouch_resolve_compression(lc_pouch *pouch, const char *stored,
     (void)clock_gettime(CLOCK_MONOTONIC, &started);
     lc_pc_log(pouch, "compression.convert.start", 1, previous, requested, 0, 0,
               0, 0);
-    rc = lc_pc_mode(pouch, requested, error);
+    rc = lc_pouch_recode_remove_tree(work, error);
+    /* Discard unpublished staging left by a released whole-tree converter. */
     if (rc == LC_OK)
-      rc = lc_pouch_recode_build(pouch, current, fresh, &input, &output, error);
-    if (rc == LC_OK)
-      rc = lc_pc_phase(0, error);
+      rc = lc_pouch_recode_remove_tree(fresh, error);
     if (rc == LC_OK) {
-      (void)lc_u64_format_base10(input, in, sizeof(in));
-      (void)lc_u64_format_base10(output, out, sizeof(out));
-      (void)snprintf(text, sizeof(text),
-                     "pouch-compression-v1\n%s\n%s\n%s\n%s\n", previous,
-                     requested, in, out);
+      (void)snprintf(text, sizeof(text), "pouch-compression-v1\n%s\n%s\n0\n0\n",
+                     previous, requested);
       rc = lc_pouch_path_write_text_file(intent, text, error);
     }
     if (rc == LC_OK)
-      rc = lc_pc_phase(1, error);
+      rc = lc_pc_phase(LC_POUCH_RECODE_READY, error);
     if (rc == LC_OK)
-      rc = lc_pc_publish(pouch, intent, fresh, old, current, previous,
-                         requested, 0, error);
+      rc = lc_pc_resume(pouch, intent, work, current, previous, requested,
+                        &input, &output, error);
     (void)clock_gettime(CLOCK_MONOTONIC, &ended);
     elapsed = (lc_u64)(ended.tv_sec - started.tv_sec) * 1000 +
               (ended.tv_nsec - started.tv_nsec) / 1000000;
@@ -6296,6 +6353,7 @@ static int lc_pouch_resolve_compression(lc_pouch *pouch, const char *stored,
         pouch, LC_POUCH_WRITER_ROOT_LOCK_SHARED, error);
 done:
   lc_free_with_allocator(&pouch->allocator, intent);
+  lc_free_with_allocator(&pouch->allocator, work);
   lc_free_with_allocator(&pouch->allocator, fresh);
   lc_free_with_allocator(&pouch->allocator, old);
   lc_free_with_allocator(&pouch->allocator, current);

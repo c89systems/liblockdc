@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.27.0
+
+- Convert Pouch compression on open using resumable segment/snapshot
+  replacements instead of duplicating the retained root. Resume after partial
+  writes or crashes before admitting clients, including opens without an
+  explicit compression option. Preserve payload references, collection
+  continuations, permissions and logical identities through cutover.
+- Keep obsolete-file cleanup and compaction candidate views coherent, including
+  partial failures and retries. Sync deleted-file directories before retiring
+  obsolete markers and retain candidate path, errno and phase in diagnostics.
+- Cover compression recovery after loss of unsynced staging bytes and directory
+  updates, in both directions with plaintext and encrypted storage.
+- Use the `c89systems` GitHub organization for liblockdc, liblql, lonejson and
+  libpslog source, dependency and release references.
+
+### Upgrading from 0.26.x
+
+Core shared-library ABI remains **9**; the PostgreSQL provider's ABI remains
+**0**. Public C layouts and canonical storage formats are unchanged.
+
+Explicit compression changes still complete synchronously before open returns,
+under exclusive root ownership. Temporary payload duplication is now limited to
+one converted segment or snapshot, plus recovery metadata and index scratch;
+snapshots can exceed the normal segment target. Decompression also needs space
+for the final root's growth. See [compression conversion](docs/pouch-compression.md).
+
+An interrupted conversion resumes even when the next open omits compression.
+Correct the underlying space, I/O or integrity problem and reopen with this
+release. Keep using this release until conversion finishes; do not remove its
+intent or recovery metadata to bypass it. Pending publication from the previous
+whole-tree converter is completed automatically before clients are admitted.
+
 ## 0.26.0
 
 - Add atomic collection range edits with an optional streaming replacement,

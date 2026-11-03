@@ -321,7 +321,8 @@ int lc_collection_recode_head(lc_pouch *pouch, const char *directory,
                               lc_collection_disk_head *head, lc_error *error);
 int lc_collection_recode_finish(struct lc_pouch_recode *work,
                                 const char *source, const char *target,
-                                const char *id, lc_error *error);
+                                const char *id, const char *query_id,
+                                lc_error *error);
 
 int lc_collection_catalog_paths(lc_client_handle *client, const char *ns,
                                 const char *name, int create, char **base,

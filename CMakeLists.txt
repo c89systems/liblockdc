@@ -944,7 +944,7 @@ file(GENERATE
     CONTENT "${LOCKDC_PACKAGE_METADATA_CONTENT}"
 )
 
-set(SOURCE_URL "git+https://github.com/sa6mwa/liblockdc.git")
+set(SOURCE_URL "git+https://github.com/c89systems/liblockdc.git")
 set(SOURCE_TAG_LINE "  tag = \"v${LOCKDC_RESOLVED_VERSION}\",")
 set(LOCKDC_LUA_ROCKSPEC_PATH "${CMAKE_CURRENT_BINARY_DIR}/lockdc-${PROJECT_VERSION}-1.rockspec")
 file(GLOB LOCKDC_STALE_LUA_ROCKSPEC_PATHS "${CMAKE_CURRENT_BINARY_DIR}/lockdc-*-1.rockspec")

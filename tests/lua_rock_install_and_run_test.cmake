@@ -163,7 +163,7 @@ endif()
 
 set(lonejson_cache_dir "${LOCKDC_BINARY_DIR}/lua-rock-cache")
 set(lonejson_src_rock "${lonejson_cache_dir}/lonejson-0.45.0-1.src.rock")
-set(lonejson_src_rock_url "https://github.com/sa6mwa/lonejson/releases/download/v0.45.0/lonejson-0.45.0-1.src.rock")
+set(lonejson_src_rock_url "https://github.com/c89systems/lonejson/releases/download/v0.45.0/lonejson-0.45.0-1.src.rock")
 set(lonejson_src_rock_sha256 "22306c264c3645654acbc95a9147fe07b3920e442195cf12c59beeb60f3ab93e")
 set(lua_tree_dir "${LOCKDC_BINARY_DIR}/lua-rock-tests/${LOCKDC_TEST_NAME}/tree")
 if(DEFINED LOCKDC_LUA_FIXTURE_ROOT AND NOT LOCKDC_LUA_FIXTURE_ROOT STREQUAL "")

@@ -21,6 +21,7 @@ typedef struct lc_pouch_recode_file {
   size_t count;
   size_t capacity;
   int active;
+  int has_refs;
 } lc_pouch_recode_file;
 
 typedef struct lc_pouch_recode {
@@ -49,7 +50,6 @@ int lc_pouch_state_recode_file(lc_pouch_recode *work,
 int lc_pouch_state_recode_refs(lc_pouch_recode *work,
                                lc_pouch_recode_file *file, lc_error *error);
 
-#ifdef LOCKDC_TEST_BUILD
 enum {
   LC_POUCH_RECODE_BUILT,
   LC_POUCH_RECODE_READY,
@@ -57,8 +57,18 @@ enum {
   LC_POUCH_RECODE_INSTALLED,
   LC_POUCH_RECODE_MANIFEST,
   LC_POUCH_RECODE_RECLAIMED,
-  LC_POUCH_RECODE_COPIED
+  LC_POUCH_RECODE_COPIED,
+  LC_POUCH_RECODE_SEGMENT_READY,
+  LC_POUCH_RECODE_SEGMENT_INSTALLED,
+  LC_POUCH_RECODE_REFS_READY,
+  LC_POUCH_RECODE_REFS_INSTALLED,
+  LC_POUCH_RECODE_HEAD,
+  LC_POUCH_RECODE_SEGMENT_RENAMED,
+  LC_POUCH_RECODE_REFS_RENAMED,
+  LC_POUCH_RECODE_HEAD_WRITTEN,
+  LC_POUCH_RECODE_ORDER_REBUILT
 };
+#ifdef LOCKDC_TEST_BUILD
 typedef int (*lc_pouch_recode_hook_fn)(void *context, int phase,
                                        lc_error *error);
 extern lc_pouch_recode_hook_fn lc_pouch_recode_test_hook;

@@ -280,7 +280,10 @@ The supported compression values are `"none"` and `"zlib"`. Omitting
 none. Explicitly selecting a different mode converts the entire root before
 `open` returns, with warning/info logs at start/completion. Competing shared
 writers prevent conversion: open warns and uses the stored mode. Conversion
-errors return the normal structured open error. See
+errors return the normal structured open error. Conversion replaces one
+canonical segment or snapshot at a time without duplicating the root. A failed
+or interrupted conversion resumes before the next open returns, even when
+`pouch.compression` is omitted. See
 [compression changes on open](pouch-compression.md) for recovery and disk-space
 requirements. Pouch remains
 exclusive single-writer by default; opening another writer for the same root

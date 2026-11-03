@@ -267,7 +267,7 @@ function(lc_add_pslog)
   file(MAKE_DIRECTORY "${install_dir}/include" "${install_dir}/lib")
 
   if(LOCKDC_BUILD_DEPENDENCIES)
-    set(pslog_archive_url "https://github.com/sa6mwa/libpslog/releases/download/v${LOCKDC_PSLOG_VERSION}/${asset_name}")
+    set(pslog_archive_url "https://github.com/c89systems/libpslog/releases/download/v${LOCKDC_PSLOG_VERSION}/${asset_name}")
     if(NOT LOCKDC_PSLOG_ARCHIVE_PATH STREQUAL "")
       if(NOT EXISTS "${LOCKDC_PSLOG_ARCHIVE_PATH}")
         message(FATAL_ERROR "configured libpslog archive does not exist: ${LOCKDC_PSLOG_ARCHIVE_PATH}")

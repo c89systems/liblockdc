@@ -138,6 +138,7 @@ static int lc_pouch_state_retention_commit(lc_pouch_unix_seconds retention,
 #ifdef LOCKDC_TEST_BUILD
 lc_pouch_test_hook lc_pouch_test_after_snapshot_write_hook = NULL;
 void *lc_pouch_test_after_snapshot_write_context = NULL;
+int (*lc_pouch_test_candidate_open_errno)(const char *, const char *) = NULL;
 lc_pouch_test_metadata_append_hook_fn lc_pouch_test_metadata_append_hook = NULL;
 void *lc_pouch_test_metadata_append_context = NULL;
 lc_pouch_test_hook lc_pouch_test_before_metadata_append_entry_copy_hook = NULL;
@@ -6374,7 +6375,24 @@ static int lc_pouch_state_file_size(const char *path, uint64_t *size,
   return LC_OK;
 }
 
-static int lc_pouch_state_file_checksum(const char *path,
+static int lc_pouch_state_candidate_open_error(const char *path,
+                                               const char *phase, int cause,
+                                               lc_error *error) {
+  const char *reason = strerror(cause);
+  size_t capacity = strlen(path) + strlen(phase) + strlen(reason) + 64U;
+  char *detail = lc_alloc_with_allocator(NULL, capacity);
+  int rc;
+  if (detail != NULL)
+    (void)snprintf(detail, capacity, "phase=%s errno=%d path=%s: %s", phase,
+                   cause, path, reason);
+  rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                    "failed to open pouch compaction candidate",
+                    detail != NULL ? detail : reason, NULL, "pouch");
+  lc_free_with_allocator(NULL, detail);
+  return rc;
+}
+
+static int lc_pouch_state_file_checksum(const char *path, const char *phase,
                                         uint64_t expected_size,
                                         unsigned char *buffer,
                                         unsigned long *checksum,
@@ -6390,11 +6408,19 @@ static int lc_pouch_state_file_checksum(const char *path,
                         "pouch state checksum requires path, buffer and output",
                         NULL, NULL, NULL);
   }
-  fd = open(path, O_RDONLY);
+#ifdef LOCKDC_TEST_BUILD
+  if (lc_pouch_test_candidate_open_errno != NULL) {
+    int cause = lc_pouch_test_candidate_open_errno(path, phase);
+    if (cause != 0) {
+      errno = cause;
+      fd = -1;
+    } else
+      fd = open(path, O_RDONLY);
+  } else
+#endif
+    fd = open(path, O_RDONLY);
   if (fd < 0) {
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to open pouch compaction candidate",
-                        strerror(errno), NULL, "pouch");
+    return lc_pouch_state_candidate_open_error(path, phase, errno, error);
   }
   if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
       (uint64_t)st.st_size != expected_size) {
@@ -10622,7 +10648,7 @@ static int lc_pouch_state_compaction_candidate_add(
   rc = lc_pouch_state_file_size(path, &size, error);
   if (rc == LC_OK) {
     rc = lc_pouch_state_file_checksum(
-        path, size, capture->io_buffer,
+        path, "capture", size, capture->io_buffer,
         &capture->candidate_checksums[capture->candidate_count], error);
   }
   lc_free_with_allocator(&pouch->allocator, path);
@@ -10920,7 +10946,8 @@ static int lc_pouch_state_compaction_validate_candidates(
                           NULL, NULL, NULL);
     }
     checksum = 0UL;
-    rc = lc_pouch_state_file_checksum(path, capture->candidate_sizes[index],
+    rc = lc_pouch_state_file_checksum(path, "validation",
+                                      capture->candidate_sizes[index],
                                       capture->io_buffer, &checksum, error);
     lc_free_with_allocator(&pouch->allocator, path);
     if (rc != LC_OK) {
@@ -11961,12 +11988,14 @@ static int lc_pouch_maintenance_run_locked(
         "pending", out != NULL ? out->cleanup_pending_count : 0UL);
     lc_log_debug(pouch->logger, "maintenance.complete", fields, 7U);
   } else {
-    pslog_field fields[3];
+    pslog_field fields[4];
 
     fields[0] = lc_log_str_field("ns", ns);
     fields[1] = lc_log_error_field("error", error);
     fields[2] = lc_log_code_field(error);
-    lc_log_error(pouch->logger, "maintenance.error", fields, 3U);
+    fields[3] =
+        lc_log_str_field("detail", error != NULL ? error->detail : NULL);
+    lc_log_error(pouch->logger, "maintenance.error", fields, 4U);
   }
   return rc;
 }
@@ -19015,6 +19044,7 @@ int lc_pouch_state_recode_file(lc_pouch_recode *work,
               entry.record_type == LC_POUCH_STATE_RECORD_STATE_META)) {
       /* Reserve final descriptor room now; a second pass resolves old spans
        * to their already encoded bodies, including forward references. */
+      file->has_refs = 1;
       rc = lc_ps_recode_meta(work, &entry, &entry.payload_span,
                              entry.descriptor, &meta, &length, error);
       if (rc == LC_OK)
@@ -19054,6 +19084,10 @@ int lc_pouch_state_recode_file(lc_pouch_recode *work,
       work->output_bytes += after;
     }
   }
+  if (rc == LC_OK && (fchmod(fd, st.st_mode & 0777) != 0 || fsync(fd) != 0))
+    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0,
+                      "failed to sync converted canonical file",
+                      strerror(errno), file->target, "pouch");
   if (fp)
     (void)fclose(fp);
   if (fd >= 0 && close(fd) != 0 && rc == LC_OK)

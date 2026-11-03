@@ -98,11 +98,11 @@ function(lockdc_write_sdk_metadata package_root)
     set(_lockdc_cpkt_source_url
         "https://github.com/c89systems/cpkt/releases/download/v${_lockdc_cpkt_version}/${_lockdc_cpkt_asset_name}")
     set(_lockdc_lonejson_source_url
-        "https://github.com/sa6mwa/lonejson/releases/download/v${LOCKDC_LONEJSON_VERSION}/${_lockdc_lonejson_asset_name}")
+        "https://github.com/c89systems/lonejson/releases/download/v${LOCKDC_LONEJSON_VERSION}/${_lockdc_lonejson_asset_name}")
     set(_lockdc_liblql_source_url
-        "https://github.com/sa6mwa/liblql/releases/download/v${LOCKDC_LIBLQL_VERSION}/${_lockdc_liblql_asset_name}")
+        "https://github.com/c89systems/liblql/releases/download/v${LOCKDC_LIBLQL_VERSION}/${_lockdc_liblql_asset_name}")
     set(_lockdc_pslog_source_url
-        "https://github.com/sa6mwa/libpslog/releases/download/v${LOCKDC_PSLOG_VERSION}/${LOCKDC_PSLOG_ASSET_NAME}")
+        "https://github.com/c89systems/libpslog/releases/download/v${LOCKDC_PSLOG_VERSION}/${LOCKDC_PSLOG_ASSET_NAME}")
 
     file(WRITE "${package_root}/share/lockdc/package-metadata.cmake"
         "set(LOCKDC_PACKAGE_NAME \"liblockdc\")\n"

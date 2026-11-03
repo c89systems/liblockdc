@@ -1,13 +1,16 @@
 #include <cmocka.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pslog.h>
 #include <setjmp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -462,7 +465,7 @@ static void test_failed_build_keeps_source_and_retry_succeeds(void **state) {
   lc_error_cleanup(&f->error);
   lc_error_init(&f->error);
   check(f, open_client(f, NULL, &f->client));
-  expect_mode(f, f->client, "none");
+  expect_mode(f, f->client, "zlib");
   read_state(f, etag, &version);
   close_client(f);
   check(f, open_client(f, "zlib", &f->client));
@@ -700,7 +703,7 @@ test_corruption_fails_before_publication_and_preserves_mode(void **state) {
   lc_error_cleanup(&f->error);
   lc_error_init(&f->error);
   check(f, open_client(f, NULL, &f->client));
-  expect_mode(f, f->client, "none");
+  expect_mode(f, f->client, "zlib");
   read_state(f, etag, &version);
   close_client(f);
   check(f, open_client(f, "zlib", &f->client));
@@ -891,7 +894,7 @@ static void test_allocation_failure_keeps_source_and_retries(void **state) {
   lc_error_cleanup(&f->error);
   lc_error_init(&f->error);
   check(f, open_client(f, NULL, &f->client));
-  expect_mode(f, f->client, "none");
+  expect_mode(f, f->client, "zlib");
   read_state(f, etag, &version);
   close_client(f);
   check(f, open_client(f, "zlib", &f->client));
@@ -1061,8 +1064,8 @@ static void unbound_partition_conversion(fixture *f, int dropped) {
     close_client(f);
     check(f, open_client(f, modes[1 - direction], &f->client));
     expect_mode(f, f->client, modes[1 - direction]);
-    assert_int_equal(stat(partition, &st), -1);
-    assert_int_equal(errno, ENOENT);
+    /* Unbound partitions remain available to ordinary orphan maintenance. */
+    assert_int_equal(stat(partition, &st), 0);
     check(f, lc_client_open_collection(f->client, &config, &collection,
                                        &f->error));
     assert_string_equal(collection->collection_id, live_id);
@@ -1119,12 +1122,13 @@ static void bound_head_conversion(fixture *f, int corrupt) {
                          LC_OK);
     assert_null(f->client);
     assert_non_null(f->error.message);
-    assert_non_null(strstr(f->error.message, "collection head"));
+    assert_non_null(strstr(f->error.message, "head"));
     lc_error_cleanup(&f->error);
     lc_error_init(&f->error);
-    check(f, open_client(f, NULL, &f->client));
-    expect_mode(f, f->client, modes[direction]);
-    close_client(f);
+    assert_int_not_equal(open_client(f, NULL, &f->client), LC_OK);
+    assert_null(f->client);
+    lc_error_cleanup(&f->error);
+    lc_error_init(&f->error);
     check(f, lc_pouch_path_write_bytes_file(head, bytes, sizeof(bytes),
                                             &f->error));
     check(f, open_client(f, modes[1 - direction], &f->client));
@@ -1370,11 +1374,11 @@ static void published_collection_truncation(fixture *f, int part) {
       assert_null(f->client);
       lc_error_cleanup(&f->error);
       lc_error_init(&f->error);
-      /* A refused conversion must retain both the old mode and the exact
-       * damaged source, so repairing the missing bytes remains possible. */
-      check(f, open_client(f, NULL, &f->client));
-      expect_mode(f, f->client, modes[direction]);
-      close_client(f);
+      /* Pending conversion must keep failing until the source is repaired. */
+      assert_int_equal(open_client(f, NULL, &f->client), LC_ERR_PROTOCOL);
+      assert_null(f->client);
+      lc_error_cleanup(&f->error);
+      lc_error_init(&f->error);
       fd = open(saved.path, O_RDWR);
       assert_true(fd >= 0);
       assert_int_equal(fstat(fd, &st), 0);
@@ -1469,12 +1473,14 @@ test_conversion_recovers_unpublished_collection_tails(void **state) {
     }
   }
 }
-typedef struct private_stage {
-  char root[512], stage[640], source_namespace[640], staged_namespace[768];
-  char source_catalog[1024], staged_catalog[1024], head[1024];
-  char marker[1024], backup[1024], staged_child[1024];
-  int failure, copied, built, poisoned;
-} private_stage;
+typedef struct conversion_probe {
+  fixture *fixture;
+  char root[640], stage[768], catalog[1024], ns[768];
+  char cursor[LC_COLLECTION_CURSOR_BYTES];
+  char query_id[LC_XID_STRING_SIZE];
+  int fail_phase, fail_after, observed, installed, refs;
+  lc_u64 max_payload;
+} conversion_probe;
 
 static void privacy_path(char *out, size_t capacity, const char *parent,
                          const char *leaf) {
@@ -1486,167 +1492,970 @@ static void expect_permissions(const char *path, mode_t mode) {
   assert_int_equal(stat(path, &st), 0);
   assert_int_equal(st.st_mode & 0777, mode);
 }
-static int observe_private_stage(void *context, int phase, lc_error *error) {
-  private_stage *p = context;
-  int fd;
-  if (phase == LC_POUCH_RECODE_COPIED) {
-    ++p->copied;
-    expect_permissions(p->staged_catalog, 0644);
+
+static int observe_conversion(void *context, int phase, lc_error *error) {
+  conversion_probe *p = context;
+  DIR *dir;
+  struct dirent *entry;
+  struct stat st;
+  char path[1024];
+  int payloads = 0;
+  if (phase == LC_POUCH_RECODE_SEGMENT_INSTALLED)
+    ++p->installed;
+  if (phase == LC_POUCH_RECODE_REFS_INSTALLED)
+    ++p->refs;
+  privacy_path(path, sizeof(path), p->root, ".compression-new");
+  assert_int_equal(lstat(path, &st), -1);
+  assert_int_equal(errno, ENOENT);
+  privacy_path(path, sizeof(path), p->root, ".compression-old");
+  assert_int_equal(lstat(path, &st), -1);
+  assert_int_equal(errno, ENOENT);
+  if (phase != LC_POUCH_RECODE_READY && phase != LC_POUCH_RECODE_RECLAIMED) {
     expect_permissions(p->stage, 0700);
-    if (p->failure == 1)
-      return lc_error_set(error, LC_ERR_TRANSPORT, 0,
-                          "injected conversion preparation failure", NULL, NULL,
-                          "pouch");
-    if (p->failure == 2) {
-      /* Make stat of the copied child fail during permission restoration,
-       * without touching the namespace's canonical state or catalog. */
-      assert_int_equal(rename(p->marker, p->backup), 0);
-      fd = open(p->marker, O_WRONLY | O_CREAT | O_EXCL, 0600);
-      assert_true(fd >= 0);
-      close(fd);
-      p->poisoned = 1;
+    expect_permissions(p->ns, 0700);
+    expect_permissions(p->catalog, 0644);
+    dir = opendir(p->stage);
+    assert_non_null(dir);
+    while ((entry = readdir(dir)) != NULL) {
+      if (entry->d_name[0] == '.')
+        continue;
+      privacy_path(path, sizeof(path), p->stage, entry->d_name);
+      assert_int_equal(lstat(path, &st), 0);
+      /* There is no namespace copy and no duplicated directory hierarchy. */
+      assert_true(S_ISREG(st.st_mode));
+      if (!strcmp(entry->d_name, "payload")) {
+        ++payloads;
+        if ((lc_u64)st.st_size > p->max_payload)
+          p->max_payload = (lc_u64)st.st_size;
+      }
     }
-  } else if (phase == LC_POUCH_RECODE_BUILT) {
-    ++p->built;
-    /* The root may become accessible only with private descendants restored. */
-    expect_permissions(p->stage, 0755);
-    expect_permissions(p->staged_namespace, 0700);
-    expect_permissions(p->staged_catalog, 0644);
-    expect_permissions(p->staged_child, 0700);
+    closedir(dir);
+    assert_true(payloads <= 1);
   }
+  if (phase == p->fail_phase && ++p->observed == p->fail_after)
+    return lc_error_set(error, LC_ERR_TRANSPORT, 0,
+                        "injected per-segment conversion failure", NULL, NULL,
+                        "pouch");
   return LC_OK;
 }
 
-static void private_stage_conversion(fixture *f, int failure) {
-  const char *modes[] = {"none", "zlib"};
-  const mode_t masks[] = {0022, 0000};
+static void conversion_noise(unsigned char *bytes, size_t length) {
+  uint32_t random = 123456789U;
+  size_t i;
+  for (i = 0; i < length; ++i) {
+    random ^= random << 13;
+    random ^= random >> 17;
+    random ^= random << 5;
+    bytes[i] = (unsigned char)random;
+  }
+}
+
+static void write_conversion_noise(fixture *f) {
+  unsigned char *bytes = malloc(65536);
+  lc_source *source = NULL;
+  lc_pouch_state_write_options options = {0};
+  lc_pouch_state_write_result result = {0};
+  assert_non_null(bytes);
+  conversion_noise(bytes, 65536);
+  check(f, lc_source_from_memory(bytes, 65536, &source, &f->error));
+  check(f,
+        lc_pouch_state_write(((lc_client_handle *)f->client)->pouch, "noise",
+                             "random", source, &options, &result, &f->error));
+  lc_pouch_state_write_result_cleanup(NULL, &result);
+  lc_source_close(source);
+  free(bytes);
+}
+
+static void read_conversion_noise(fixture *f) {
+  unsigned char *expected = malloc(65536);
+  lc_sink *sink = NULL;
+  lc_pouch_state_read_result result = {0};
+  const void *bytes;
+  size_t length;
+  assert_non_null(expected);
+  conversion_noise(expected, 65536);
+  check(f, lc_sink_to_memory(&sink, &f->error));
+  check(f, lc_pouch_state_copy(((lc_client_handle *)f->client)->pouch, "noise",
+                               "random", sink, &result, &f->error));
+  check(f, lc_sink_memory_bytes(sink, &bytes, &length, &f->error));
+  assert_true(result.found);
+  assert_int_equal(length, 65536);
+  assert_memory_equal(bytes, expected, length);
+  lc_pouch_state_read_result_cleanup(NULL, &result);
+  lc_sink_close(sink);
+  free(expected);
+}
+
+static void seed_conversion(fixture *f, conversion_probe *p, const char *mode) {
   lc_collection_config config;
+  lc_collection_metadata_req metadata = {0};
+  lc_collection_append_res changed = {0};
   lc_collection_handle *handle;
-  lc_collection_read_opts options = {0};
-  private_stage p;
-  unsigned char head_bytes[LC_COLLECTION_HEAD_BYTES], bad;
-  char namespaces[640], child[1024];
-  unsigned int mask, direction;
-  int fd, rc, n;
-  f->saved_umask = umask(masks[0]);
-  f->restore_umask = 1;
-  assert_int_equal(chmod(f->root, 0755), 0);
+  lc_collection_read_opts read = {0};
+  memset(p, 0, sizeof(*p));
+  p->fixture = f;
+  p->fail_phase = -1;
+  strcpy(p->root, f->endpoint + 8);
+  privacy_path(p->stage, sizeof(p->stage), p->root, ".compression-work");
+  privacy_path(p->ns, sizeof(p->ns), p->root, "namespaces/test");
+  check(f, open_client(f, mode, &f->client));
+  ((lc_client_handle *)f->client)->pouch->segment_target_bytes = 4096;
+  write_state(f);
+  compacted_write(f, "payload");
+  write_conversion_noise(f);
   lc_collection_config_init(&config);
   config.name = "private-metadata";
+  f->collection = create_event(f, &config);
+  handle = f->collection->impl;
+  strcpy(p->catalog, handle->catalog_path);
+  metadata.has_retention_seconds = 1;
+  metadata.retention_seconds = 7776000;
+  check(f, lc_collection_entry_metadata(f->collection, 1, &metadata, &changed,
+                                        &f->error));
+  expect_json(f, f->collection, &read, "{}\n", p->cursor);
+  strcpy(p->query_id, handle->order.query_id);
+  assert_int_equal(chmod(p->catalog, 0644), 0);
+  assert_int_equal(chmod(p->ns, 0700), 0);
+  lc_collection_close(f->collection);
+  f->collection = NULL;
+  close_client(f);
+}
+
+static void verify_conversion(fixture *f, conversion_probe *p,
+                              const char *mode) {
+  lc_collection_config config;
+  lc_collection_read_opts options = {0};
+  lc_pouch_maintenance_options maintenance = {0};
+  lc_pouch_maintenance_result maintained = {0};
+  lc_collection_append_status_res status = {0};
+  char etag[65] = {0}, path[1024];
+  lc_version version = 0;
+  struct stat st;
+  expect_mode(f, f->client, mode);
+  read_state(f, etag, &version);
+  expect_permissions(p->ns, 0700);
+  expect_permissions(p->catalog, 0644);
+  read_conversion_noise(f);
+  lc_collection_config_init(&config);
+  config.name = "private-metadata";
+  check(f, lc_client_open_collection(f->client, &config, &f->collection,
+                                     &f->error));
+  assert_string_equal(
+      ((lc_collection_handle *)f->collection->impl)->order.query_id,
+      p->query_id);
+  expect_json(f, f->collection, &options, "{}\n", NULL);
+  options.cursor = p->cursor;
+  expect_json(f, f->collection, &options, "", NULL);
+  check(f, lc_collection_append_status(f->collection, "event", &status,
+                                       &f->error));
+  lc_collection_close(f->collection);
+  f->collection = NULL;
+  maintenance.ns = "test";
+  maintenance.force = 1;
+  check(f, lc_pouch_maintenance_run(((lc_client_handle *)f->client)->pouch,
+                                    &maintenance, &maintained, &f->error));
+  lc_pouch_maintenance_result_cleanup(NULL, &maintained);
+  read_state(f, etag, &version);
+  privacy_path(path, sizeof(path), p->root, ".compression-ready");
+  assert_int_equal(lstat(path, &st), -1);
+  assert_int_equal(errno, ENOENT);
+  assert_int_equal(lstat(p->stage, &st), -1);
+  assert_int_equal(errno, ENOENT);
+}
+
+static void private_segment_conversion(fixture *f, int fault) {
+  const char *modes[] = {"none", "zlib"};
+  const int phases[] = {LC_POUCH_RECODE_COPIED, LC_POUCH_RECODE_SEGMENT_READY,
+                        LC_POUCH_RECODE_SEGMENT_INSTALLED,
+                        LC_POUCH_RECODE_REFS_READY, LC_POUCH_RECODE_HEAD};
+  const mode_t masks[] = {0022, 0000};
+  conversion_probe p;
+  unsigned int mask, direction;
+  f->saved_umask = umask(masks[0]);
+  f->restore_umask = 1;
   for (mask = 0; mask < 2; ++mask) {
     umask(masks[mask]);
     for (direction = 0; direction < 2; ++direction) {
-      memset(&p, 0, sizeof(p));
-      p.failure = failure;
-      n = snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/private-%u-%u",
-                   f->root, mask, direction);
-      assert_true(n > 0 && (size_t)n < sizeof(f->endpoint));
-      strcpy(p.root, f->endpoint + 8);
-      check(f, open_client(f, modes[direction], &f->client));
-      f->collection = create_event(f, &config);
-      handle = f->collection->impl;
-      privacy_path(namespaces, sizeof(namespaces), p.root, "namespaces");
-      privacy_path(p.source_namespace, sizeof(p.source_namespace), namespaces,
-                   "test");
-      privacy_path(p.stage, sizeof(p.stage), p.root, ".compression-new");
-      privacy_path(p.staged_namespace, sizeof(p.staged_namespace), p.stage,
-                   "test");
-      assert_true(strlen(handle->catalog_path) < sizeof(p.source_catalog));
-      strcpy(p.source_catalog, handle->catalog_path);
-      n = snprintf(p.staged_catalog, sizeof(p.staged_catalog), "%s%s",
-                   p.staged_namespace,
-                   p.source_catalog + strlen(p.source_namespace));
-      assert_true(n > 0 && (size_t)n < sizeof(p.staged_catalog));
-      assert_true(strlen(handle->head_path) < sizeof(p.head));
-      strcpy(p.head, handle->head_path);
-      privacy_path(p.marker, sizeof(p.marker), p.source_namespace,
-                   "mode-marker");
-      privacy_path(p.backup, sizeof(p.backup), p.source_namespace,
-                   "mode-marker.saved");
-      privacy_path(child, sizeof(child), p.marker, "child");
-      privacy_path(p.staged_child, sizeof(p.staged_child), p.staged_namespace,
-                   "mode-marker/child");
-      assert_int_equal(mkdir(p.marker, 0755), 0);
-      assert_int_equal(mkdir(child, 0700), 0);
-      assert_int_equal(chmod(p.source_catalog, 0644), 0);
-      assert_int_equal(chmod(p.source_namespace, 0700), 0);
-      assert_int_equal(chmod(namespaces, 0755), 0);
-      assert_int_equal(chmod(p.root, 0755), 0);
-      lc_collection_close(f->collection);
-      f->collection = NULL;
-      close_client(f);
-      if (failure == 3) {
-        fd = open(p.head, O_RDWR);
-        assert_true(fd >= 0);
-        assert_int_equal(pread(fd, head_bytes, sizeof(head_bytes), 0),
-                         sizeof(head_bytes));
-        bad = head_bytes[0] ^ 0x40;
-        assert_int_equal(pwrite(fd, &bad, 1, 0), 1);
-        assert_int_equal(fsync(fd), 0);
-        close(fd);
-      }
-      lc_pouch_recode_test_hook = observe_private_stage;
+      snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/private-%u-%u",
+               f->root, mask, direction);
+      seed_conversion(f, &p, modes[direction]);
+      p.fail_phase = fault ? phases[fault - 1] : -1;
+      p.fail_after = 1;
+      lc_pouch_recode_test_hook = observe_conversion;
       lc_pouch_recode_test_context = &p;
-      rc = open_client(f, modes[1 - direction], &f->client);
-      if (failure) {
-        assert_int_equal(rc, failure == 3 ? LC_ERR_PROTOCOL : LC_ERR_TRANSPORT);
+      if (fault) {
+        assert_int_equal(open_client(f, modes[1 - direction], &f->client),
+                         LC_ERR_TRANSPORT);
         assert_null(f->client);
-        expect_permissions(p.source_namespace, 0700);
-        expect_permissions(p.staged_catalog, 0644);
         expect_permissions(p.stage, 0700);
-        assert_int_equal(p.built, 0);
-        if (failure == 2)
-          assert_string_equal(f->error.message,
-                              "failed to inspect conversion directory mode");
-        if (p.poisoned) {
-          assert_int_equal(unlink(p.marker), 0);
-          assert_int_equal(rename(p.backup, p.marker), 0);
-        }
-        if (failure == 3)
-          check(f, lc_pouch_path_write_bytes_file(
-                       p.head, head_bytes, sizeof(head_bytes), &f->error));
+        expect_permissions(p.ns, 0700);
+        expect_permissions(p.catalog, 0644);
         lc_error_cleanup(&f->error);
         lc_error_init(&f->error);
-        lc_pouch_recode_test_hook = NULL;
+        p.fail_phase = -1;
         check(f, open_client(f, NULL, &f->client));
-        expect_mode(f, f->client, modes[direction]);
-        close_client(f);
-        p.failure = p.copied = p.built = p.poisoned = 0;
-        lc_pouch_recode_test_hook = observe_private_stage;
-        check(f, open_client(f, modes[1 - direction], &f->client));
       } else
-        check(f, rc);
-      assert_int_equal(p.copied, 1);
-      assert_int_equal(p.built, 1);
+        check(f, open_client(f, modes[1 - direction], &f->client));
       lc_pouch_recode_test_hook = NULL;
       lc_pouch_recode_test_context = NULL;
-      expect_permissions(namespaces, 0755);
-      expect_permissions(p.source_namespace, 0700);
-      expect_permissions(p.source_catalog, 0644);
-      expect_permissions(child, 0700);
-      check(f, lc_client_open_collection(f->client, &config, &f->collection,
-                                         &f->error));
-      expect_json(f, f->collection, &options, "{}\n", NULL);
-      lc_collection_close(f->collection);
-      f->collection = NULL;
+      /* The test has several segments but only one can be duplicated. The
+       * state body is 64 KiB; include bounded codec and metadata overhead. */
+      assert_true(p.max_payload < 131072);
+      assert_true(p.installed > 2);
+      assert_true(p.refs > 0);
+      verify_conversion(f, &p, modes[1 - direction]);
       close_client(f);
     }
   }
 }
-static void test_conversion_failure_keeps_private_staging(void **state) {
-  private_stage_conversion(*state, 3);
+static void test_conversion_keeps_private_segment_staging(void **state) {
+  private_segment_conversion(*state, 0);
+}
+static void test_inventory_failure_resumes_with_private_journal(void **state) {
+  private_segment_conversion(*state, 1);
+}
+static void test_prepared_segment_failure_resumes(void **state) {
+  private_segment_conversion(*state, 2);
+}
+static void test_installed_segment_failure_resumes(void **state) {
+  private_segment_conversion(*state, 3);
+}
+static void test_reference_failure_resumes(void **state) {
+  private_segment_conversion(*state, 4);
+}
+static void test_head_publication_failure_resumes(void **state) {
+  private_segment_conversion(*state, 5);
+}
+
+static void
+test_segment_crashes_resume_encrypted_both_directions(void **state) {
+  fixture *f = *state;
+  const char *modes[] = {"none", "zlib"};
+  const int phases[] = {LC_POUCH_RECODE_SEGMENT_READY,
+                        LC_POUCH_RECODE_SEGMENT_RENAMED,
+                        LC_POUCH_RECODE_SEGMENT_INSTALLED,
+                        LC_POUCH_RECODE_REFS_READY,
+                        LC_POUCH_RECODE_REFS_RENAMED,
+                        LC_POUCH_RECODE_REFS_INSTALLED,
+                        LC_POUCH_RECODE_HEAD_WRITTEN,
+                        LC_POUCH_RECODE_ORDER_REBUILT,
+                        LC_POUCH_RECODE_HEAD};
+  conversion_probe p;
+  unsigned int encrypted, direction, i;
+  int status, phase;
+  pid_t child;
+  for (encrypted = 0; encrypted < 2; ++encrypted) {
+    if (encrypted)
+      check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+    for (direction = 0; direction < 2; ++direction) {
+      for (i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+        snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/crash-%u-%u-%u",
+                 f->root, encrypted, direction, i);
+        seed_conversion(f, &p, modes[direction]);
+        phase = phases[i];
+        child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+          lc_pouch_recode_test_hook = crash_at;
+          lc_pouch_recode_test_context = &phase;
+          (void)open_client(f, modes[1 - direction], &f->client);
+          _exit(42);
+        }
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
+        check(f, open_client(f, NULL, &f->client));
+        verify_conversion(f, &p, modes[1 - direction]);
+        close_client(f);
+      }
+    }
+  }
+}
+
+static void test_repeated_failures_preserve_completed_segments(void **state) {
+  fixture *f = *state;
+  conversion_probe p;
+  unsigned char bytes[8];
+  lc_u64 total = 0;
+  unsigned int i;
+  char path[1024];
+  FILE *fp;
+  seed_conversion(f, &p, "none");
+  p.fail_phase = LC_POUCH_RECODE_SEGMENT_INSTALLED;
+  p.fail_after = 1;
+  lc_pouch_recode_test_hook = observe_conversion;
+  lc_pouch_recode_test_context = &p;
+  assert_int_equal(open_client(f, "zlib", &f->client), LC_ERR_TRANSPORT);
+  assert_null(f->client);
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  p.observed = 0;
+  assert_int_equal(open_client(f, NULL, &f->client), LC_ERR_TRANSPORT);
+  assert_null(f->client);
+  assert_int_equal(p.installed, 2);
+  privacy_path(path, sizeof(path), p.stage, "plan");
+  fp = fopen(path, "rb");
+  assert_non_null(fp);
+  assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
+  fclose(fp);
+  for (i = 0; i < 8; ++i)
+    total = (total << 8) | bytes[i];
+  assert_true(total > 2);
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  p.fail_phase = -1;
+  check(f, open_client(f, NULL, &f->client));
+  assert_int_equal(p.installed, total);
+  lc_pouch_recode_test_hook = NULL;
+  lc_pouch_recode_test_context = NULL;
+  verify_conversion(f, &p, "zlib");
+}
+
+static void test_partial_output_write_failure_resumes(void **state) {
+  fixture *f = *state;
+  const char *modes[] = {"none", "zlib"};
+  conversion_probe p;
+  struct rlimit limit;
+  struct stat st;
+  char path[1024];
+  unsigned int direction;
+  int status, rc;
+  pid_t child;
+  for (direction = 0; direction < 2; ++direction) {
+    snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/short-%u", f->root,
+             direction);
+    seed_conversion(f, &p, modes[direction]);
+    child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+      if (getrlimit(RLIMIT_FSIZE, &limit) != 0)
+        _exit(43);
+      limit.rlim_cur = 16384;
+      if (setrlimit(RLIMIT_FSIZE, &limit) != 0 ||
+          signal(SIGXFSZ, SIG_IGN) == SIG_ERR)
+        _exit(44);
+      rc = open_client(f, modes[1 - direction], &f->client);
+      _exit(rc == LC_ERR_TRANSPORT && f->client == NULL ? 41 : 42);
+    }
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
+    privacy_path(path, sizeof(path), p.stage, "payload");
+    assert_int_equal(stat(path, &st), 0);
+    assert_true(st.st_size > 0 && st.st_size <= 16384);
+    check(f, open_client(f, NULL, &f->client));
+    verify_conversion(f, &p, modes[1 - direction]);
+    close_client(f);
+  }
+}
+
+static void test_opposite_request_finishes_pending_cutover_first(void **state) {
+  fixture *f = *state;
+  conversion_probe p;
+  seed_conversion(f, &p, "none");
+  p.fail_phase = LC_POUCH_RECODE_SEGMENT_INSTALLED;
+  p.fail_after = 1;
+  lc_pouch_recode_test_hook = observe_conversion;
+  lc_pouch_recode_test_context = &p;
+  assert_int_equal(open_client(f, "zlib", &f->client), LC_ERR_TRANSPORT);
+  assert_null(f->client);
+  lc_pouch_recode_test_hook = NULL;
+  lc_pouch_recode_test_context = NULL;
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  check(f, open_client(f, "none", &f->client));
+  verify_conversion(f, &p, "none");
+}
+
+static void test_inventory_resume_reports_allocation_failure(void **state) {
+  fixture *f = *state;
+  conversion_probe p;
+  unsigned char bytes[8];
+  lc_u64 length = 0;
+  char path[1024];
+  FILE *fp;
+  unsigned int i;
+  snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/allocation-resume",
+           f->root);
+  seed_conversion(f, &p, "none");
+  p.fail_phase = LC_POUCH_RECODE_COPIED;
+  p.fail_after = 1;
+  lc_pouch_recode_test_hook = observe_conversion;
+  lc_pouch_recode_test_context = &p;
+  assert_int_equal(open_client(f, "zlib", &f->client), LC_ERR_TRANSPORT);
+  lc_pouch_recode_test_hook = NULL;
+  lc_pouch_recode_test_context = NULL;
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  privacy_path(path, sizeof(path), p.stage, "plan");
+  fp = fopen(path, "rb");
+  assert_non_null(fp);
+  assert_int_equal(fseek(fp, 8, SEEK_SET), 0);
+  assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
+  fclose(fp);
+  for (i = 0; i < 8; ++i)
+    length = (length << 8) | bytes[i];
+  f->custom_allocator = 1;
+  f->fail_allocation_size = (size_t)length + 1;
+  assert_int_equal(open_client(f, NULL, &f->client), LC_ERR_NOMEM);
+  assert_null(f->client);
+  assert_int_equal(f->fail_allocation_size, 0);
+  assert_string_equal(f->error.message,
+                      "failed to resume Pouch compression conversion");
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+  f->custom_allocator = 0;
+  check(f, open_client(f, NULL, &f->client));
+  verify_conversion(f, &p, "zlib");
+}
+
+static void test_conversion_reclaims_interrupted_index_builds(void **state) {
+  fixture *f = *state;
+  conversion_probe p;
+  lc_collection_config config;
+  char paths[2][1024];
+  const char *leaves[] = {"order.rebuild-interrupted",
+                          "ids.rebuild-interrupted"};
+  struct stat st;
+  unsigned int i;
+  int fd;
+  seed_conversion(f, &p, "none");
+  check(f, open_client(f, NULL, &f->client));
+  lc_collection_config_init(&config);
+  config.name = "private-metadata";
+  check(f, lc_client_open_collection(f->client, &config, &f->collection,
+                                     &f->error));
+  for (i = 0; i < 2; ++i)
+    privacy_path(paths[i], sizeof(paths[i]),
+                 ((lc_collection_handle *)f->collection->impl)->directory,
+                 leaves[i]);
+  lc_collection_close(f->collection);
+  f->collection = NULL;
+  close_client(f);
+  for (i = 0; i < 2; ++i) {
+    fd = open(paths[i], O_WRONLY | O_CREAT | O_EXCL, 0600);
+    assert_true(fd >= 0);
+    assert_int_equal(ftruncate(fd, 1048576), 0);
+    assert_int_equal(fsync(fd), 0);
+    close(fd);
+  }
+  check(f, open_client(f, "zlib", &f->client));
+  for (i = 0; i < 2; ++i) {
+    assert_int_equal(stat(paths[i], &st), -1);
+    assert_int_equal(errno, ENOENT);
+  }
+  verify_conversion(f, &p, "zlib");
+}
+
+static void test_conversion_preserves_readonly_sealed_segments(void **state) {
+  fixture *f = *state;
+  conversion_probe p;
+  lc_pouch_namespace_manifest manifest = {0};
+  char path[1024];
+  unsigned long i;
+  seed_conversion(f, &p, "none");
+  check(f, open_client(f, NULL, &f->client));
+  write_state(f);
+  check(f, lc_pouch_namespace_manifest_open(NULL, p.root, "test", &manifest,
+                                            NULL, NULL, &f->error));
+  close_client(f);
+  assert_true(manifest.segment_count > 2);
+  for (i = 0; i < manifest.segment_count; ++i) {
+    if (!strcmp(manifest.segment_leaves[i], manifest.active_segment))
+      continue;
+    snprintf(path, sizeof(path), "%s/segments/%s", manifest.namespace_path,
+             manifest.segment_leaves[i]);
+    assert_int_equal(chmod(path, 0440), 0);
+  }
+  check(f, open_client(f, "zlib", &f->client));
+  for (i = 0; i < manifest.segment_count; ++i) {
+    if (!strcmp(manifest.segment_leaves[i], manifest.active_segment))
+      continue;
+    snprintf(path, sizeof(path), "%s/segments/%s", manifest.namespace_path,
+             manifest.segment_leaves[i]);
+    expect_permissions(path, 0440);
+  }
+  lc_pouch_namespace_manifest_cleanup(NULL, &manifest);
+  verify_conversion(f, &p, "zlib");
+}
+
+/* A small crash-image fixture, not a filesystem emulator. Restore only the
+ * targeted bytes/dentries that were not covered by a successful real fsync.
+ * Unrelated durable files and journal entries deliberately remain intact. */
+enum {
+  POWER_BODY,
+  POWER_REFS,
+  POWER_RENAME_UNDONE,
+  POWER_RENAME_ALIAS,
+  POWER_SYNC_ERROR
+};
+typedef struct power_watch {
+  char directory[1024], payload[1024], image[1024], original[1024];
+  char source[1024], source_directory[1024];
+  int mode, output, syncs, refs_started, renamed, destination_synced;
+  unsigned long files, installed;
+  dev_t device;
+  ino_t inode;
+} power_watch;
+static power_watch *power_sync_watch;
+typedef struct receipt_watch {
+  char directory[1024], path[1200];
+  const char *suffix;
+  int retry, fail_retry, durable, renamed, output;
+} receipt_watch;
+static receipt_watch *receipt_sync_watch;
+int __real_fsync(int fd);
+
+static void power_cut(power_watch *watch, int rc) {
+  int report[3];
+  report[0] = watch->mode;
+  report[1] = watch->syncs;
+  report[2] = rc;
+  if (write(watch->output, report, sizeof(report)) != sizeof(report))
+    _exit(43);
+  if (write(watch->output, watch->source, sizeof(watch->source)) !=
+      sizeof(watch->source))
+    _exit(43);
+  _exit(41);
+}
+static void power_copy_fd(int in, int out) {
+  unsigned char bytes[2048];
+  off_t offset = 0;
+  ssize_t got, written;
+  size_t done;
+  for (;;) {
+    got = pread(in, bytes, sizeof(bytes), offset);
+    assert_true(got >= 0);
+    if (got == 0)
+      break;
+    done = 0;
+    while (done < (size_t)got) {
+      written = write(out, bytes + done, (size_t)got - done);
+      assert_true(written > 0);
+      done += (size_t)written;
+    }
+    offset += got;
+  }
+  assert_int_equal(ftruncate(out, offset), 0);
+  assert_int_equal(__real_fsync(out), 0);
+}
+static int power_same_file(int fd, const char *path) {
+  struct stat a, b;
+  return fstat(fd, &a) == 0 && stat(path, &b) == 0 && a.st_dev == b.st_dev &&
+         a.st_ino == b.st_ino;
+}
+static int receipt_sync(int fd, receipt_watch *w) {
+  DIR *dir;
+  struct dirent *entry;
+  struct stat st;
+  const char *suffix;
+  int rc;
+  if (power_same_file(fd, w->directory)) {
+    if (!w->retry && !w->path[0]) {
+      dir = opendir(w->directory);
+      assert_non_null(dir);
+      while ((entry = readdir(dir)) != NULL) {
+        suffix = strrchr(entry->d_name, '.');
+        if (suffix && !strcmp(suffix, w->suffix)) {
+          privacy_path(w->path, sizeof(w->path), w->directory, entry->d_name);
+          break;
+        }
+      }
+      closedir(dir);
+    }
+    /* The receipt's contents were synced, but its published name was not.
+     * Keep it visible for a warm retry after the reported I/O error. */
+    if ((!w->retry && w->path[0]) || (w->retry && w->fail_retry)) {
+      errno = EIO;
+      return -1;
+    }
+    rc = __real_fsync(fd);
+    if (rc == 0 && w->retry)
+      w->durable = 1;
+    return rc;
+  }
+  rc = __real_fsync(fd);
+  if (rc == 0 && w->retry && !w->fail_retry && w->renamed &&
+      fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
+    /* Cut power after the canonical directory is durable, before the next
+     * journal sync. The parent drops only a still-unsynced receipt name. */
+    if (write(w->output, &w->durable, sizeof(w->durable)) != sizeof(w->durable))
+      _exit(43);
+    _exit(41);
+  }
+  return rc;
+}
+int __wrap_fsync(int fd) {
+  power_watch *w = power_sync_watch;
+  struct stat st;
+  int rc, image, input;
+  if (receipt_sync_watch)
+    return receipt_sync(fd, receipt_sync_watch);
+  if (!w)
+    return __real_fsync(fd);
+  if (w->renamed && w->mode == POWER_RENAME_ALIAS) {
+    if (power_same_file(fd, w->directory)) {
+      assert_true(w->destination_synced);
+      power_cut(w, LC_OK);
+    }
+    rc = __real_fsync(fd);
+    if (rc == 0 && power_same_file(fd, w->source_directory))
+      w->destination_synced = 1;
+    return rc;
+  }
+  if (w->mode > POWER_REFS && w->mode != POWER_SYNC_ERROR)
+    return __real_fsync(fd);
+  if (!power_same_file(fd, w->payload) || fstat(fd, &st) != 0)
+    return __real_fsync(fd);
+  if (w->mode == POWER_BODY || w->mode == POWER_SYNC_ERROR) {
+    if (st.st_size < 16384)
+      return __real_fsync(fd);
+    if (w->mode == POWER_BODY)
+      power_cut(w, LC_OK); /* This payload has no successful sync yet. */
+    errno = EIO;
+    return -1;
+  }
+  if (!w->refs_started)
+    return __real_fsync(fd);
+  if (w->device != st.st_dev || w->inode != st.st_ino) {
+    w->device = st.st_dev;
+    w->inode = st.st_ino;
+    w->syncs = 0;
+  }
+  if (w->syncs != 0)
+    power_cut(w, LC_OK); /* Lose the reference patches, keep the synced copy. */
+  rc = __real_fsync(fd);
+  if (rc == 0) {
+    ++w->syncs;
+    image = open(w->image, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    input = open(w->payload, O_RDONLY);
+    assert_true(image >= 0 && input >= 0);
+    power_copy_fd(input, image);
+    close(input);
+    close(image);
+  }
+  return rc;
+}
+static int power_phase(void *context, int phase, lc_error *error) {
+  power_watch *w = context;
+  unsigned char bytes[8];
+  FILE *fp;
+  char path[1200];
+  char relative[1024];
+  lc_u64 length = 0;
+  unsigned int i;
+  (void)error;
+  if (phase == LC_POUCH_RECODE_COPIED) {
+    snprintf(path, sizeof(path), "%s/plan", w->directory);
+    fp = fopen(path, "rb");
+    assert_non_null(fp);
+    assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
+    for (i = 0; i < 8; ++i)
+      w->files = (w->files << 8) | bytes[i];
+    assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
+    for (i = 0; i < 8; ++i)
+      length = (length << 8) | bytes[i];
+    assert_true(length < sizeof(relative));
+    assert_int_equal(fread(relative, 1, (size_t)length, fp), length);
+    relative[length] = 0;
+    fclose(fp);
+    privacy_path(w->source, sizeof(w->source), w->source_directory, relative);
+    strcpy(w->source_directory, w->source);
+    *strrchr(w->source_directory, '/') = 0;
+  }
+  if (phase == LC_POUCH_RECODE_SEGMENT_INSTALLED && ++w->installed == w->files)
+    w->refs_started = 1;
+  if (w->mode != POWER_RENAME_UNDONE && w->mode != POWER_RENAME_ALIAS)
+    return LC_OK;
+  if (phase == LC_POUCH_RECODE_SEGMENT_READY && w->installed == 0)
+    assert_int_equal(link(w->source, w->original), 0);
+  if (phase == LC_POUCH_RECODE_SEGMENT_RENAMED && w->installed == 0) {
+    w->renamed = 1;
+    if (w->mode == POWER_RENAME_UNDONE)
+      power_cut(w, LC_OK);
+  }
+  return LC_OK;
+}
+static void exercise_conversion_power_loss(fixture *f, int mode) {
+  const char *modes[] = {"none", "zlib"};
+  conversion_probe *p = calloc(1, sizeof(*p));
+  power_watch *w = calloc(1, sizeof(*w));
+  unsigned int direction, encrypted, torn;
+  int pipefd[2], report[3], status, in, out, rc;
+  pid_t child;
+  assert_non_null(w);
+  assert_non_null(p);
+  for (encrypted = 0; encrypted < 2; ++encrypted) {
+    if (encrypted)
+      check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+    for (direction = 0; direction < 2; ++direction) {
+      for (torn = 0; torn < (mode == POWER_BODY ? 2U : 1U); ++torn) {
+        memset(w, 0, sizeof(*w));
+        snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/power-%u-%u-%u",
+                 f->root, encrypted, direction, torn);
+        seed_conversion(f, p, modes[direction]);
+        strcpy(w->directory, p->stage);
+        privacy_path(w->payload, sizeof(w->payload), p->stage, "payload");
+        privacy_path(w->image, sizeof(w->image), p->root,
+                     ".test-durable-image");
+        privacy_path(w->original, sizeof(w->original), p->root,
+                     ".test-original");
+        privacy_path(w->source_directory, sizeof(w->source_directory), p->root,
+                     "namespaces");
+        assert_int_equal(pipe(pipefd), 0);
+        w->mode = mode;
+        w->output = pipefd[1];
+        child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+          close(pipefd[0]);
+          power_sync_watch = w;
+          lc_pouch_recode_test_hook = power_phase;
+          lc_pouch_recode_test_context = w;
+          rc = open_client(f, modes[1 - direction], &f->client);
+          if (mode == POWER_SYNC_ERROR)
+            power_cut(w, rc);
+          _exit(42);
+        }
+        close(pipefd[1]);
+        assert_int_equal(read(pipefd[0], report, sizeof(report)),
+                         sizeof(report));
+        assert_int_equal(read(pipefd[0], w->source, sizeof(w->source)),
+                         sizeof(w->source));
+        close(pipefd[0]);
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
+        assert_int_equal(report[0], mode);
+        assert_int_equal(report[2],
+                         mode == POWER_SYNC_ERROR ? LC_ERR_TRANSPORT : LC_OK);
+        if (mode == POWER_BODY || mode == POWER_SYNC_ERROR) {
+          out = open(w->payload, O_WRONLY);
+          assert_true(out >= 0);
+          assert_int_equal(ftruncate(out, torn ? 7 : 0), 0);
+          assert_int_equal(__real_fsync(out), 0);
+          close(out);
+        } else if (mode == POWER_REFS) {
+          assert_int_equal(report[1], 1);
+          in = open(w->image, O_RDONLY);
+          out = open(w->payload, O_WRONLY | O_TRUNC);
+          assert_true(in >= 0 && out >= 0);
+          power_copy_fd(in, out);
+          close(in);
+          close(out);
+          assert_int_equal(unlink(w->image), 0);
+        } else if (mode == POWER_RENAME_UNDONE) {
+          /* Neither directory sync completed: restore the durable old name
+           * and staged replacement, retaining their recorded inode identities.
+           */
+          assert_int_equal(rename(w->source, w->payload), 0);
+          assert_int_equal(rename(w->original, w->source), 0);
+        } else {
+          /* Destination synced, staging directory did not: its old payload
+           * name can survive as a second link to the installed replacement. */
+          assert_int_equal(link(w->source, w->payload), 0);
+          assert_int_equal(unlink(w->original), 0);
+        }
+        check(f, open_client(f, NULL, &f->client));
+        verify_conversion(f, p, modes[1 - direction]);
+        close_client(f);
+      }
+    }
+    if (encrypted) {
+      lc_pouch_crypto_key_string_free(f->key);
+      f->key = NULL;
+    }
+  }
+  free(w);
+  free(p);
+}
+static void test_conversion_recovers_lost_unsynced_payload_bytes(void **state) {
+  exercise_conversion_power_loss(*state, POWER_BODY);
 }
 static void
-test_conversion_restores_modes_before_opening_staging(void **state) {
-  private_stage_conversion(*state, 0);
+test_conversion_recovers_lost_unsynced_reference_patches(void **state) {
+  exercise_conversion_power_loss(*state, POWER_REFS);
 }
-static void test_preparation_failure_keeps_private_staging(void **state) {
-  private_stage_conversion(*state, 1);
+static void test_conversion_recovers_unsynced_rename_rollback(void **state) {
+  exercise_conversion_power_loss(*state, POWER_RENAME_UNDONE);
 }
 static void
-test_permission_restoration_failure_keeps_private_staging(void **state) {
-  private_stage_conversion(*state, 2);
+test_conversion_recovers_unsynced_staging_directory_alias(void **state) {
+  exercise_conversion_power_loss(*state, POWER_RENAME_ALIAS);
 }
+static void test_conversion_failed_payload_sync_never_publishes(void **state) {
+  exercise_conversion_power_loss(*state, POWER_SYNC_ERROR);
+}
+
+static int receipt_phase(void *context, int phase, lc_error *error) {
+  receipt_watch *w = context;
+  int expected = !strcmp(w->suffix, ".map") ? LC_POUCH_RECODE_SEGMENT_RENAMED
+                                            : LC_POUCH_RECODE_REFS_RENAMED;
+  (void)error;
+  if (phase == expected)
+    w->renamed = 1;
+  return LC_OK;
+}
+
+static int64_t receipt_entries(fixture *f, int verify) {
+  static const char first[] =
+      "{\"padding\":"
+      "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
+  lc_collection_config config;
+  lc_collection_append_req request;
+  lc_collection_append_res result = {0};
+  lc_collection_metadata_req metadata = {0};
+  lc_collection_append_status_res status = {0};
+  lc_collection_read_opts options = {0};
+  lc_source *source = NULL;
+  char expected[256];
+  lc_collection_config_init(&config);
+  config.name = "private-metadata";
+  if (verify) {
+    check(f, lc_client_open_collection(f->client, &config, &f->collection,
+                                       &f->error));
+    snprintf(expected, sizeof(expected), "%s\n{\"n\":2}\n", first);
+    expect_json(f, f->collection, &options, expected, NULL);
+    check(f, lc_collection_append_status(f->collection, "second-event", &status,
+                                         &f->error));
+    assert_int_equal(status.state, LC_COLLECTION_APPEND_COMMITTED);
+    assert_int_equal(status.entry.position, 2);
+    assert_true(status.entry.retention_expires_at_unix > 0);
+  } else {
+    check(f, lc_client_create_collection(f->client, &config, &f->collection,
+                                         &f->error));
+    lc_collection_append_req_init(&request);
+    request.append_id = "first-event";
+    check(f,
+          lc_source_from_memory(first, sizeof(first) - 1, &source, &f->error));
+    check(f, lc_collection_append(f->collection, &request, source, &result,
+                                  &f->error));
+    lc_source_close(source);
+    lc_collection_append_req_init(&request);
+    request.append_id = "second-event";
+    check(f, lc_source_from_memory("{\"n\":2}", 7, &source, &f->error));
+    check(f, lc_collection_append(f->collection, &request, source, &result,
+                                  &f->error));
+    lc_source_close(source);
+    assert_int_equal(result.position, 2);
+    metadata.has_retention_seconds = 1;
+    metadata.retention_seconds = 7776000;
+    check(f, lc_collection_entry_metadata(f->collection, 2, &metadata, &result,
+                                          &f->error));
+  }
+  lc_collection_close(f->collection);
+  f->collection = NULL;
+  return verify ? status.entry.retention_expires_at_unix
+                : result.retention_expires_at_unix;
+}
+
+static void exercise_recovered_receipt(fixture *f, const char *suffix,
+                                       int fail_retry) {
+  const char *modes[] = {"none", "zlib"};
+  receipt_watch *w = calloc(1, sizeof(*w));
+  char payload[1024];
+  struct stat before, after;
+  int64_t retention;
+  unsigned int encrypted, direction;
+  int rc, pipefd[2], durable, status;
+  pid_t child;
+  assert_non_null(w);
+  for (encrypted = 0; encrypted < 2; ++encrypted) {
+    if (encrypted)
+      check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+    for (direction = 0; direction < 2; ++direction) {
+      memset(w, 0, sizeof(*w));
+      snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/receipt-%u-%u",
+               f->root, encrypted, direction);
+      /* Keep the referenced body in the first converted file, after a body
+       * whose compression changes its offset. Earlier installed maps would
+       * incidentally sync the journal and hide this recovery ordering gap. */
+      check(f, open_client(f, modes[direction], &f->client));
+      retention = receipt_entries(f, 0);
+      close_client(f);
+      privacy_path(w->directory, sizeof(w->directory), f->endpoint + 8,
+                   ".compression-work");
+      w->suffix = suffix;
+      receipt_sync_watch = w;
+      rc = open_client(f, modes[1 - direction], &f->client);
+      receipt_sync_watch = NULL;
+      assert_int_equal(rc, LC_ERR_TRANSPORT);
+      assert_null(f->client);
+      assert_true(w->path[0] != 0);
+      lc_error_cleanup(&f->error);
+      lc_error_init(&f->error);
+      privacy_path(payload, sizeof(payload), w->directory, "payload");
+      assert_int_equal(stat(payload, &before), 0);
+      w->retry = 1;
+      w->fail_retry = fail_retry;
+      if (fail_retry) {
+        receipt_sync_watch = w;
+        lc_pouch_recode_test_hook = receipt_phase;
+        lc_pouch_recode_test_context = w;
+        rc = open_client(f, NULL, &f->client);
+        receipt_sync_watch = NULL;
+        lc_pouch_recode_test_hook = NULL;
+        lc_pouch_recode_test_context = NULL;
+        assert_int_equal(rc, LC_ERR_TRANSPORT);
+        assert_null(f->client);
+        /* Failure to establish receipt durability must leave the prepared
+         * replacement untouched and available for the next recovery. */
+        assert_int_equal(stat(payload, &after), 0);
+        assert_int_equal(after.st_ino, before.st_ino);
+        assert_int_equal(w->renamed, 0);
+        lc_error_cleanup(&f->error);
+        lc_error_init(&f->error);
+      } else {
+        assert_int_equal(pipe(pipefd), 0);
+        w->output = pipefd[1];
+        child = fork();
+        assert_true(child >= 0);
+        if (child == 0) {
+          close(pipefd[0]);
+          receipt_sync_watch = w;
+          lc_pouch_recode_test_hook = receipt_phase;
+          lc_pouch_recode_test_context = w;
+          (void)open_client(f, NULL, &f->client);
+          _exit(42);
+        }
+        close(pipefd[1]);
+        assert_int_equal(read(pipefd[0], &durable, sizeof(durable)),
+                         sizeof(durable));
+        close(pipefd[0]);
+        assert_int_equal(waitpid(child, &status, 0), child);
+        assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
+        if (!durable)
+          assert_int_equal(unlink(w->path), 0);
+      }
+      check(f, open_client(f, NULL, &f->client));
+      expect_mode(f, f->client, modes[1 - direction]);
+      assert_int_equal(receipt_entries(f, 1), retention);
+      if (!fail_retry)
+        assert_int_equal(durable, 1);
+      close_client(f);
+    }
+    if (encrypted) {
+      lc_pouch_crypto_key_string_free(f->key);
+      f->key = NULL;
+    }
+  }
+  free(w);
+}
+
+static void test_recovered_offset_map_survives_second_power_loss(void **state) {
+  exercise_recovered_receipt(*state, ".map", 0);
+}
+static void
+test_recovered_reference_receipt_survives_second_power_loss(void **state) {
+  exercise_recovered_receipt(*state, ".refs", 0);
+}
+static void
+test_recovered_offset_map_sync_failure_preserves_source(void **state) {
+  exercise_recovered_receipt(*state, ".map", 1);
+}
+static void
+test_recovered_reference_sync_failure_preserves_source(void **state) {
+  exercise_recovered_receipt(*state, ".refs", 1);
+}
+
 int main(int argc, char **argv) {
   const struct CMUnitTest cases[] = {
       cmocka_unit_test_setup_teardown(
@@ -1731,14 +2540,57 @@ int main(int argc, char **argv) {
           test_conversion_recovers_unpublished_collection_tails, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
-          test_conversion_failure_keeps_private_staging, setup, teardown),
+          test_conversion_keeps_private_segment_staging, setup, teardown),
       cmocka_unit_test_setup_teardown(
-          test_conversion_restores_modes_before_opening_staging, setup,
+          test_inventory_failure_resumes_with_private_journal, setup, teardown),
+      cmocka_unit_test_setup_teardown(test_prepared_segment_failure_resumes,
+                                      setup, teardown),
+      cmocka_unit_test_setup_teardown(test_installed_segment_failure_resumes,
+                                      setup, teardown),
+      cmocka_unit_test_setup_teardown(test_reference_failure_resumes, setup,
+                                      teardown),
+      cmocka_unit_test_setup_teardown(test_head_publication_failure_resumes,
+                                      setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_segment_crashes_resume_encrypted_both_directions, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
-          test_preparation_failure_keeps_private_staging, setup, teardown),
+          test_repeated_failures_preserve_completed_segments, setup, teardown),
+      cmocka_unit_test_setup_teardown(test_partial_output_write_failure_resumes,
+                                      setup, teardown),
       cmocka_unit_test_setup_teardown(
-          test_permission_restoration_failure_keeps_private_staging, setup,
+          test_opposite_request_finishes_pending_cutover_first, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_inventory_resume_reports_allocation_failure, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_reclaims_interrupted_index_builds, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_preserves_readonly_sealed_segments, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_recovers_lost_unsynced_payload_bytes, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_recovers_lost_unsynced_reference_patches, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_recovers_unsynced_rename_rollback, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_recovers_unsynced_staging_directory_alias, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_failed_payload_sync_never_publishes, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_recovered_offset_map_survives_second_power_loss, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_recovered_reference_receipt_survives_second_power_loss, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_recovered_offset_map_sync_failure_preserves_source, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_recovered_reference_sync_failure_preserves_source, setup,
           teardown)};
   if (lc_allocator_tracking_configure(1, NULL) != LC_OK)
     return 2;

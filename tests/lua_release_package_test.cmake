@@ -294,7 +294,7 @@ file(READ "${lockdc_lua_rockspec_path}" lockdc_lua_rockspec_text)
 foreach(required_snippet
     "package = \"lockdc\""
     "version = \"${LOCKDC_VERSION}-1\""
-    "url = \"git+https://github.com/sa6mwa/liblockdc.git\""
+    "url = \"git+https://github.com/c89systems/liblockdc.git\""
     "tag = \"v${LOCKDC_VERSION}\""
     "\"lonejson == 0.45.0-1\""
     "scripts/build_lua_rock.sh"
@@ -309,7 +309,7 @@ endforeach()
 
 foreach(stale_snippet
     "lonejson == 0.41.0-1"
-    "https://github.com/sa6mwa/lonejson/releases/download/v0.41.0/lonejson-0.41.0-1.src.rock"
+    "https://github.com/c89systems/lonejson/releases/download/v0.41.0/lonejson-0.41.0-1.src.rock"
 )
     string(FIND "${lockdc_lua_rockspec_text}" "${stale_snippet}" standalone_stale_index)
     string(FIND "${lockdc_lua_inner_rockspec_text}" "${stale_snippet}" inner_stale_index)

@@ -1,4 +1,4 @@
-module github.com/sa6mwa/liblockdc/benchmark
+module github.com/c89systems/liblockdc/benchmark
 
 go 1.25.0
 

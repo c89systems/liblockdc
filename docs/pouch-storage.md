@@ -642,6 +642,15 @@ snapshot, updates manifest state, and deletes obsolete files only after grace
 and live-ref checks. Pouch has the same active-segment exclusion: the rolling
 active segment is never a candidate.
 
+Obsolete cleanup removes each deleted segment from the current manifest's
+candidate view immediately, including after an earlier unlink in the same
+batch succeeded. It synchronizes deletions once per affected directory before
+retiring their obsolete markers. An unlink or directory-sync failure leaves
+markers available for retry; already missing obsolete files are handled
+idempotently. A missing live compaction candidate remains an error. Candidate
+open failures retain the filename, numeric errno and capture/validation phase
+in the SDK error detail and maintenance/background logs.
+
 Pouch must compact with the same lifecycle. It must not compact by dumping an
 entire cache, reparsing payload JSON, or materializing large values. Object,
 state, metadata, queue, attachment, transaction, and lease metadata refs must
@@ -1282,7 +1291,9 @@ Omitted compression inherits the stored mode (none for a new root). Explicit
 `none` or `zlib` converts the entire root synchronously when exclusive ownership
 is available; other active writers cause a warning and use of the stored mode.
 Conversion preserves logical identities and retained history, streams payloads
-in bounded chunks, and recovers interrupted publication before opening. See
+in bounded chunks, replaces one segment or snapshot at a time, and resumes any
+interrupted conversion before opening, even when compression is omitted. It
+does not build a second payload tree. See
 [compression changes on open](pouch-compression.md) for space and recovery rules.
 
 When a root is first opened by a release that supports historical binary

@@ -1196,14 +1196,25 @@ int lc_pouch_namespace_manifest_save(const lc_allocator *allocator,
   return lc_pouch_namespace_manifest_write(allocator, ns, manifest, error);
 }
 
+static int lc_pouch_namespace_obsolete_due(const char *leaf, uint64_t marked_at,
+                                           const char *current_leaf,
+                                           uint64_t now_unix,
+                                           uint64_t grace_seconds) {
+  return leaf != NULL && marked_at != 0U &&
+         (current_leaf == NULL || strcmp(leaf, current_leaf) != 0) &&
+         now_unix >= marked_at && now_unix - marked_at >= grace_seconds;
+}
+
 static int lc_pouch_namespace_manifest_prune_obsolete_list(
     const lc_allocator *allocator, char ***items, uint64_t **marked_at,
     unsigned long *count, const char *namespace_path, const char *directory,
-    const char *current_leaf, uint64_t now_unix, uint64_t delete_grace_seconds,
-    int *changed, unsigned long *deleted_count, unsigned long *pending_count,
+    const char *current_leaf, lc_pouch_namespace_manifest *segments,
+    uint64_t now_unix, uint64_t delete_grace_seconds, int *changed,
+    unsigned long *deleted_count, unsigned long *pending_count,
     lc_error *error) {
   unsigned long index;
-  int rc;
+  char *directory_path = NULL;
+  int rc = LC_OK;
 
   if (items == NULL || marked_at == NULL || count == NULL ||
       namespace_path == NULL || directory == NULL || changed == NULL) {
@@ -1211,42 +1222,65 @@ static int lc_pouch_namespace_manifest_prune_obsolete_list(
                         "pouch obsolete cleanup requires list context", NULL,
                         NULL, "pouch");
   }
-  index = 0UL;
-  while (index < *count) {
-    char *directory_path;
+  /* Keep retirement markers until all unlinks in this directory are durable.
+   * On partial failure a retry may see ENOENT, but must never resurrect an
+   * already deleted leaf as a candidate in this same manifest view. */
+  for (index = 0; index < *count; ++index) {
     char *path;
-
-    if ((*items)[index] == NULL || (*marked_at)[index] == 0U ||
-        (current_leaf != NULL && strcmp((*items)[index], current_leaf) == 0) ||
-        now_unix < (*marked_at)[index] ||
-        now_unix - (*marked_at)[index] < delete_grace_seconds) {
-      if (pending_count != NULL) {
+    if (!lc_pouch_namespace_obsolete_due((*items)[index], (*marked_at)[index],
+                                         current_leaf, now_unix,
+                                         delete_grace_seconds)) {
+      if (pending_count != NULL)
         ++*pending_count;
-      }
-      ++index;
       continue;
     }
-    directory_path = lc_pouch_path_join(allocator, namespace_path, directory);
+    if (directory_path == NULL)
+      directory_path = lc_pouch_path_join(allocator, namespace_path, directory);
     path = directory_path != NULL
                ? lc_pouch_path_join(allocator, directory_path, (*items)[index])
                : NULL;
-    lc_free_with_allocator(allocator, directory_path);
     if (path == NULL) {
-      return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                          "failed to allocate pouch obsolete path", NULL, NULL,
-                          NULL);
+      rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to allocate pouch obsolete path", NULL, NULL,
+                        NULL);
+      goto done;
     }
     if (unlink(path) != 0 && errno != ENOENT) {
-      int saved_errno;
-
-      saved_errno = errno;
+      int saved_errno = errno;
       rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
                         "failed to delete obsolete pouch log file",
                         strerror(saved_errno), NULL, "pouch");
       lc_free_with_allocator(allocator, path);
-      return rc;
+      goto done;
     }
     lc_free_with_allocator(allocator, path);
+    if (segments != NULL && segments->segment_count != 0UL) {
+      char **found = bsearch(&(*items)[index], segments->segment_leaves,
+                             segments->segment_count, sizeof(char *),
+                             lc_pouch_namespace_segment_leaf_compare);
+      if (found != NULL) {
+        size_t position = (size_t)(found - segments->segment_leaves);
+        lc_free_with_allocator(allocator, *found);
+        memmove(found, found + 1,
+                (segments->segment_count - position - 1) * sizeof(*found));
+        --segments->segment_count;
+      }
+    }
+  }
+  if (directory_path == NULL)
+    goto done;
+  rc = lc_pouch_path_fsync_directory(
+      directory_path, "failed to sync obsolete pouch log deletion", error);
+  if (rc != LC_OK)
+    goto done;
+  index = 0;
+  while (index < *count) {
+    if (!lc_pouch_namespace_obsolete_due((*items)[index], (*marked_at)[index],
+                                         current_leaf, now_unix,
+                                         delete_grace_seconds)) {
+      ++index;
+      continue;
+    }
     lc_free_with_allocator(allocator, (*items)[index]);
     if (index + 1UL < *count) {
       memmove(*items + index, *items + index + 1UL,
@@ -1256,11 +1290,12 @@ static int lc_pouch_namespace_manifest_prune_obsolete_list(
     }
     --*count;
     *changed = 1;
-    if (deleted_count != NULL) {
+    if (deleted_count != NULL)
       ++*deleted_count;
-    }
   }
-  return LC_OK;
+done:
+  lc_free_with_allocator(allocator, directory_path);
+  return rc;
 }
 
 int lc_pouch_namespace_manifest_cleanup_obsolete(
@@ -1287,8 +1322,9 @@ int lc_pouch_namespace_manifest_cleanup_obsolete(
   rc = lc_pouch_namespace_manifest_prune_obsolete_list(
       allocator, &manifest->obsolete_segments,
       &manifest->obsolete_segment_marked_at, &manifest->obsolete_segment_count,
-      manifest->namespace_path, "segments", manifest->active_segment, now_unix,
-      delete_grace_seconds, &changed, deleted_count, pending_count, error);
+      manifest->namespace_path, "segments", manifest->active_segment, manifest,
+      now_unix, delete_grace_seconds, &changed, deleted_count, pending_count,
+      error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -1296,7 +1332,7 @@ int lc_pouch_namespace_manifest_cleanup_obsolete(
       allocator, &manifest->obsolete_snapshots,
       &manifest->obsolete_snapshot_marked_at,
       &manifest->obsolete_snapshot_count, manifest->namespace_path, "snapshots",
-      manifest->latest_snapshot, now_unix, delete_grace_seconds, &changed,
+      manifest->latest_snapshot, NULL, now_unix, delete_grace_seconds, &changed,
       deleted_count, pending_count, error);
   if (rc != LC_OK) {
     return rc;

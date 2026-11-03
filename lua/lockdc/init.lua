@@ -616,6 +616,8 @@ end
 -- Explicit none/zlib converts before open returns when exclusively owned;
 -- competing shared writers cause a warning and use of the stored mode.
 -- Conversion errors return the usual structured open error.
+-- Conversion replaces one segment/snapshot at a time, with no second root.
+-- Interrupted conversion resumes on the next open even when compression is nil.
 -- Durable sync dispatches ready groups without a fill delay. Its process-local
 -- fsync_batch_max_ops is an upper bound (0 is unbounded), not a minimum to await.
 function M.open(config)

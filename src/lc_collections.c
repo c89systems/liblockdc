@@ -2797,18 +2797,13 @@ int lc_collection_recode_head(lc_pouch *pouch, const char *directory,
 
 int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
                                 const char *target, const char *id,
-                                lc_error *error) {
+                                const char *query_id, lc_error *error) {
   lc_collection_handle collection;
-  lc_collection_order previous;
   lc_pouch_recode_file *file;
   lc_u64 translated;
-  char leaf[64], query_id[LC_XID_STRING_SIZE];
-  char *old_order;
+  char leaf[64];
   int rc, valid;
   memset(&collection, 0, sizeof(collection));
-  memset(&previous, 0, sizeof(previous));
-  previous.fd = -1;
-  query_id[0] = '\0';
   collection.pouch = work->pouch;
   collection.allocator = work->pouch->allocator;
   collection.directory = (char *)target;
@@ -2818,20 +2813,11 @@ int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
   collection.order_path = lc_cc_path(&collection, "order");
   collection.ids_path = lc_cc_path(&collection, "ids");
   collection.head_path = lc_cc_path(&collection, "head");
-  old_order = lc_pouch_path_join(&collection.allocator, source, "order");
-  rc = collection.order_path && collection.ids_path && collection.head_path &&
-               old_order
+  rc = collection.order_path && collection.ids_path && collection.head_path
            ? LC_OK
            : LC_ERR_NOMEM;
-  if (rc == LC_OK) {
-    lc_error ignored;
-    lc_error_init(&ignored);
-    if (lc_collection_order_open(old_order, 0, &previous, &ignored) == LC_OK)
-      strcpy(query_id, previous.query_id);
-    lc_collection_order_close(&previous);
-    lc_error_cleanup(&ignored);
+  if (rc == LC_OK)
     rc = lc_collection_head_read(&collection, error);
-  }
   if (rc == LC_OK)
     rc = lc_collection_record_leaf(collection.head.tail_segment, leaf, error);
   if (rc == LC_OK)
@@ -2841,8 +2827,18 @@ int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
     collection.head.tail_offset = translated;
     rc = lc_collection_head_write(&collection, error);
   }
+#ifdef LOCKDC_TEST_BUILD
+  if (rc == LC_OK && lc_pouch_recode_test_hook)
+    rc = lc_pouch_recode_test_hook(lc_pouch_recode_test_context,
+                                   LC_POUCH_RECODE_HEAD_WRITTEN, error);
+#endif
   if (rc == LC_OK)
     rc = lc_cc_rebuild(&collection, error);
+#ifdef LOCKDC_TEST_BUILD
+  if (rc == LC_OK && lc_pouch_recode_test_hook)
+    rc = lc_pouch_recode_test_hook(lc_pouch_recode_test_context,
+                                   LC_POUCH_RECODE_ORDER_REBUILT, error);
+#endif
   if (rc == LC_OK && query_id[0]) {
     strcpy(collection.order.query_id, query_id);
     rc = lc_collection_order_checkpoint(&collection.order,
@@ -2860,6 +2856,5 @@ int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
   lc_free_with_allocator(&collection.allocator, collection.order_path);
   lc_free_with_allocator(&collection.allocator, collection.ids_path);
   lc_free_with_allocator(&collection.allocator, collection.head_path);
-  lc_free_with_allocator(&collection.allocator, old_order);
   return rc;
 }

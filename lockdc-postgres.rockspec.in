@@ -1,12 +1,12 @@
 package = "lockdc-postgres"
 version = "@PROJECT_VERSION@-1"
 source = {
-  url = "https://github.com/sa6mwa/liblockdc/releases/download/v@PROJECT_VERSION@/liblockdc-lua-@PROJECT_VERSION@.tar.gz",
+  url = "https://github.com/c89systems/liblockdc/releases/download/v@PROJECT_VERSION@/liblockdc-lua-@PROJECT_VERSION@.tar.gz",
   dir = "liblockdc-lua-@PROJECT_VERSION@",
 }
 description = {
   summary = "Optional PostgreSQL XA driver registration for lockdc",
-  homepage = "https://github.com/sa6mwa/liblockdc",
+  homepage = "https://github.com/c89systems/liblockdc",
   license = "MIT",
 }
 dependencies = { "lua >= 5.5, < 5.6", "lockdc == @PROJECT_VERSION@-1" }

@@ -318,15 +318,14 @@ exec "$(dirname "$0")/devenv-real.sh" "$@"
             ctest.write_text('''#!/usr/bin/env bash
 echo "ctest $*" >> "$FAKE_PODMAN_LOG"
 if [ "${FAKE_CTEST_WAIT:-0}" = 1 ]; then
-  # Install handlers before readiness; keep the blocking wait in this shell.
+  # Handle startup interrupts. Publish readiness only after exec: Bash can
+  # discard a pending INT while entering a timed read or replacing itself.
+  # Native flock creates the marker with default signal handling, then
+  # replaces itself with sleep, keeping one foreground process throughout.
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  mkfifo "$FAKE_PODMAN_LOG.wait"
-  exec 8<> "$FAKE_PODMAN_LOG.wait"
-  rm "$FAKE_PODMAN_LOG.wait"
-  touch "$FAKE_PODMAN_LOG.ctest"
-  read -r -t 30 -u 8 || :
-  exit 0
+  touch "$FAKE_PODMAN_LOG.ctest-starting"
+  exec flock --no-fork "$FAKE_PODMAN_LOG.ctest" sleep 30
 fi
 touch "$FAKE_PODMAN_LOG.ctest"
 exit "${FAKE_CTEST_RC:-0}"
@@ -440,7 +439,12 @@ exit "${FAKE_CTEST_RC:-0}"
         touch = self.bin / 'touch'
         touch.write_text(f'''#!/usr/bin/env bash
 "{shutil.which('touch')}" "$@"
-if [[ "$1" == *.ctest ]]; then kill -INT "$PPID"; fi
+if [[ "$1" == *.ctest-starting ]]; then
+  # This case deliberately interrupts before native readiness. Unblock the
+  # test driver too, so it can assert the startup signal status and teardown.
+  "{shutil.which('touch')}" "${{1%-starting}}"
+  kill -INT "$PPID"
+fi
 ''')
         touch.chmod(0o700)
         process = self.start_waiting_e2e()

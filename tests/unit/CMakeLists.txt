@@ -298,9 +298,15 @@ target_sources(lc_unit_mutate_stream PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c
 )
 lc_add_unit_test(lc_unit_pouch test_lc_pouch.c)
+lc_add_unit_test(lc_unit_pouch_cleanup test_lc_pouch_cleanup.c
+  ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+target_compile_definitions(lc_unit_pouch_cleanup PRIVATE LOCKDC_TEST_BUILD=1)
+target_link_options(lc_unit_pouch_cleanup PRIVATE
+  "LINKER:--wrap=unlink" "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_pouch_compression test_lc_pouch_compression.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_pouch_compression PRIVATE LOCKDC_TEST_BUILD=1)
+target_link_options(lc_unit_pouch_compression PRIVATE "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_state_retention test_lc_state_retention.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_state_retention PRIVATE LOCKDC_TEST_BUILD=1)
