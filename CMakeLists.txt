@@ -86,7 +86,7 @@ set(LOCKDC_NGHTTP2_VERSION "1.70.0" CACHE STRING "Pinned nghttp2 release supplie
 set(LOCKDC_LIBSSH2_VERSION "1.11.1" CACHE STRING "Pinned libssh2 release supplied by cpkt.")
 set(LOCKDC_LONEJSON_VERSION "0.45.0" CACHE STRING "Pinned lonejson release used for mapped JSON load/save and internal JSON parsing helpers." FORCE)
 set(LOCKDC_LONEJSON_ABI_VERSION "26" CACHE STRING "Pinned lonejson shared-library ABI/SOVERSION." FORCE)
-set(LOCKDC_LIBLQL_VERSION "0.4.0" CACHE STRING "Pinned liblql release used for pouch LQL query support." FORCE)
+set(LOCKDC_LIBLQL_VERSION "0.4.1" CACHE STRING "Pinned liblql release used for pouch LQL query support." FORCE)
 set(LOCKDC_LIBLQL_ABI_VERSION "0" CACHE STRING "Pinned liblql shared-library ABI/SOVERSION." FORCE)
 set(LOCKDC_CMOCKA_VERSION "2.0.2" CACHE STRING "Pinned cmocka release used for unit tests.")
 set(LOCKDC_PSLOG_VERSION "0.12.0" CACHE STRING "Pinned libpslog release used for SDK logging." FORCE)

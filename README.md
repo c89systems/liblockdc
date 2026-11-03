@@ -248,7 +248,7 @@ The separately pinned dependencies are:
 | [cpktdb](https://github.com/c89systems/cpktdb) | 0.3.1 | Optional PostgreSQL C89 facade and database SDK |
 | lonejson | 0.45.0 (ABI 26) | JSON parsing, mapping, and streaming |
 | libpslog | 0.12.0 | SDK diagnostics |
-| liblql | 0.4.0 | Pouch query support |
+| liblql | 0.4.1 | Pouch query support |
 | cmocka | 2.0.2 | Unit tests only; target-specific static library from cpkt |
 
 OpenSSL, curl, zlib, nghttp2, libssh2, and Lua come from cpkt.

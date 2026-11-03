@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Upgrade liblql to 0.4.1 from c89systems, with verified SDK checksums for all
+  supported targets. Its public C API and shared-library ABI remain unchanged.
+
 ## 0.27.0
 
 - Convert Pouch compression on open using resumable segment/snapshot
