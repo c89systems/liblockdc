@@ -683,7 +683,7 @@ test_indexed_filters_agree_with_scan_and_cover_unindexed_tail(void **state) {
   indexed_seed(f, 68);
   int found;
   check(f, load_query(f, NULL, &found));
-  assert_true(found && f->query_index.rows == 63);
+  assert_true(found && f->query_index.rows == LC_COLLECTION_ORDER_PAGE_ROWS);
   for (size_t i = 0; i < sizeof(predicates) / sizeof(predicates[0]); ++i) {
     lc_collection_read_opts options = {0};
     const void *bytes;
@@ -755,15 +755,16 @@ test_query_index_does_not_retry_valid_out_of_range_numbers(void **state) {
   lc_collection_append_res entry;
   lc_pouch_maintenance_result result = {0};
   int found;
-  indexed_seed(f, 62);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
   check(f, append_json(f, f->a, "huge-number", "{\"huge\":1e99999}", &entry));
-  assert_int_equal(entry.position, 63);
+  assert_int_equal(entry.position, LC_COLLECTION_ORDER_PAGE_ROWS);
   check(f, load_query(f, NULL, &found));
-  assert_true(found && f->query_index.rows == 63);
-  assert_true((f->query_index.covered & ((lc_u64)1 << 62)) == 0);
+  assert_true(found && f->query_index.rows == LC_COLLECTION_ORDER_PAGE_ROWS);
+  assert_true((f->query_index.covered &
+               ((lc_u64)1 << (LC_COLLECTION_ORDER_PAGE_ROWS - 1U))) == 0);
   check(f, maintain(f, 0, 0, &result));
   check(f, read_into_memory(f, NULL));
-  assert_int_equal(f->read.completed_records, 63);
+  assert_int_equal(f->read.completed_records, LC_COLLECTION_ORDER_PAGE_ROWS);
   const void *bytes;
   size_t length;
   const char *last = "{\"huge\":1e99999}\n";
@@ -779,7 +780,7 @@ static void test_query_pruning_does_not_read_retained_payloads(void **state) {
   lc_collection_delete_res removed;
   lc_pouch_maintenance_result result = {0};
   int found;
-  indexed_seed(f, 63);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS);
   root_pouch(f)->compaction_min_reclaimable_bytes = LC_U64_MAX;
   first_body_byte(f, '[');
   check(f, lc_collection_delete_entry(f->a, 2, &removed, &f->error));
@@ -789,7 +790,8 @@ static void test_query_pruning_does_not_read_retained_payloads(void **state) {
   assert_true(found && (f->query_index.covered & 2U) == 0U);
   first_body_byte(f, '{');
   check(f, read_into_memory(f, NULL));
-  assert_int_equal(f->read.completed_records, 62);
+  assert_int_equal(f->read.completed_records,
+                   LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
   lc_pouch_maintenance_result_cleanup(NULL, &result);
 }
 
@@ -873,18 +875,19 @@ test_index_build_failure_preserves_committed_append_and_maintenance_repairs(
   lc_pouch_maintenance_result maintained = {0};
   lc_collection_append_status_res status;
   lc_collection_delete_res removed;
-  char path[640];
+  char path[640], id[32];
   int found;
-  indexed_seed(f, 62);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
   lc_collection_handle *handle = f->a->impl;
   snprintf(path, sizeof(path), "%s/query", handle->directory);
   f->owned_fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
   assert_true(f->owned_fd >= 0);
   close(f->owned_fd);
   f->owned_fd = -1;
-  indexed_append(f, 63, 1);
+  indexed_append(f, LC_COLLECTION_ORDER_PAGE_ROWS, 1);
   assert_int_equal(f->error.code, LC_OK);
-  check(f, lc_collection_append_status(f->a, "entry-63", &status, &f->error));
+  snprintf(id, sizeof(id), "entry-%u", LC_COLLECTION_ORDER_PAGE_ROWS);
+  check(f, lc_collection_append_status(f->a, id, &status, &f->error));
   assert_int_equal(status.state, LC_COLLECTION_APPEND_COMMITTED);
   check(f, load_query(f, NULL, &found));
   assert_false(found);
@@ -2171,13 +2174,14 @@ test_push_writer_streams_and_publishes_in_commit_order(void **state) {
   for (int i = 0; i < 8; ++i)
     check(f, lc_collection_writer_write(first, fragment, sizeof(fragment),
                                         &f->error));
-  /* Oversized input has an anonymous encoded spool, never a canonical inode. */
+  /* Unpublished chunks are canonical but have no visible entry binding. */
   assert_int_equal(pending_appends(f, NULL, 0), 0);
   check(f, lc_collection_describe(f->a, &info, &f->error));
   assert_int_equal(info.live_count, 0);
   check(f, maintain(f, 0, 1, &maintained));
-  assert_int_equal(pending_appends(f, NULL, 0),
-                   0); /* Maintenance cannot consume a producer's spool. */
+  assert_int_equal(
+      pending_appends(f, NULL, 0),
+      0); /* Maintenance cannot reclaim a live producer's chunks. */
   append(f, "pull", "{\"n\":1}", 1);
   req.append_id = "second";
   req.has_collection_retention_seconds = 0;
@@ -2391,6 +2395,93 @@ static void test_segment_seals_recover_lost_projections(void **state) {
       assert_output(f, expected);
     }
   }
+}
+
+typedef struct chunk_crash {
+  int phase, seen;
+} chunk_crash;
+static int push_chunk_crash(void *context, lc_collection *collection, int phase,
+                            lc_error *error) {
+  chunk_crash *fault = context;
+  (void)collection;
+  (void)error;
+  if (phase == fault->phase && ++fault->seen == 2) {
+    if (phase == LC_COLLECTION_APPEND_CHUNK_PENDING) {
+      lc_collection_handle *handle = collection->impl;
+      off_t end = lseek(handle->active_fd, 0, SEEK_END);
+      if (end < 3 || ftruncate(handle->active_fd, end - 3) != 0)
+        _exit(61);
+    }
+    _exit(59);
+  }
+  return LC_OK;
+}
+static void
+test_push_chunk_crashes_leave_no_outcome_and_reclaim_storage(void **state) {
+  fixture *f = *state;
+  unsigned char *chunk = malloc(4096);
+  assert_non_null(chunk);
+  check(f, lc_pouch_crypto_generate_key_string(&f->crypto_key, &f->error));
+  for (int mode = 0; mode < 8; ++mode) {
+    for (int phase = LC_COLLECTION_APPEND_CHUNK_PENDING;
+         phase <= LC_COLLECTION_APPEND_CHUNK_LINKED; ++phase) {
+      close_handles(f);
+      snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/chunk-crash-%d-%d",
+               f->root, mode, phase);
+      pid_t child = fork();
+      assert_true(child >= 0);
+      if (child == 0) {
+        lc_collection_append_req req = {"interrupted"};
+        lc_collection_writer *writer = NULL;
+        chunk_crash fault = {phase, 0};
+        unsigned long random = 17;
+        open_client(f, mode & 1 ? f->crypto_key : NULL, mode & 2, mode & 4);
+        bind_collection(f, "events", 1, &f->a);
+        check(f, lc_collection_append_begin(f->a, &req, &writer, &f->error));
+        check(f, lc_collection_writer_write(writer, "{\"v\":\"", 6, &f->error));
+        lc_collection_append_test_hook = push_chunk_crash;
+        lc_collection_append_test_context = &fault;
+        for (size_t at = 0; at < 1024U * 1024U; at += 4096) {
+          for (size_t i = 0; i < 4096; ++i) {
+            random = (random * 1664525UL + 1013904223UL) & 0xffffffffUL;
+            chunk[i] = (unsigned char)('a' + ((random >> 24) % 26));
+          }
+          check(f, lc_collection_writer_write(writer, chunk, 4096, &f->error));
+        }
+        _exit(60);
+      }
+      int exited;
+      assert_int_equal(waitpid(child, &exited, 0), child);
+      assert_true(WIFEXITED(exited) && WEXITSTATUS(exited) == 59);
+      open_client(f, mode & 1 ? f->crypto_key : NULL, mode & 2, mode & 4);
+      bind_collection(f, "events", 0, &f->a);
+      lc_collection_append_status_res status;
+      check(f, lc_collection_append_status(f->a, "interrupted", &status,
+                                           &f->error));
+      assert_int_equal(status.state, LC_COLLECTION_APPEND_ABSENT);
+      lc_collection_handle *handle = f->a->impl;
+      struct stat before, after;
+      lc_collection_info info;
+      assert_int_equal(fstat(handle->active_fd, &before), 0);
+      lc_pouch_maintenance_result maintained = {0};
+      check(f, maintain(f, 1, 0, &maintained));
+      /* Recovery may already have discarded a torn reservation. Otherwise
+       * maintenance must reclaim the complete but unpublished chunks. */
+      assert_int_equal(maintained.compacted_collection_count,
+                       before.st_size == 0 ? 0 : 1);
+      lc_pouch_maintenance_result_cleanup(NULL, &maintained);
+      check(f, lc_collection_describe(f->a, &info, &f->error));
+      assert_int_equal(info.live_count, 0);
+      assert_int_equal(info.upper_position, 0);
+      assert_int_equal(handle->order.reclaimable_bytes, 0);
+      assert_int_equal(fstat(handle->active_fd, &after), 0);
+      assert_int_equal(after.st_size, 0);
+      append(f, "interrupted", "{}", 1);
+      check(f, read_into_memory(f, NULL));
+      assert_output(f, "{}\n");
+    }
+  }
+  free(chunk);
 }
 
 static void test_push_writer_recovers_every_publication_boundary(void **state) {
@@ -3605,7 +3696,7 @@ test_query_cleanup_retires_epochs_and_abandoned_temporaries(void **state) {
   lc_pouch_maintenance_result result = {0};
   char id[LC_XID_STRING_SIZE], temporary[768], obsolete[768], page[800];
   int found;
-  indexed_seed(f, 63);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS);
   handle = f->a->impl;
   check(f, lc_xid_new(id, &f->error));
   snprintf(temporary, sizeof(temporary), "%s/query/%s/.page-%s.tmp",
@@ -3632,7 +3723,7 @@ test_query_cleanup_retires_epochs_and_abandoned_temporaries(void **state) {
   assert_int_equal(errno, ENOENT);
   indexed_mode(f, 1, 0);
   check(f, load_query(f, NULL, &found));
-  assert_true(found && f->query_index.rows == 63);
+  assert_true(found && f->query_index.rows == LC_COLLECTION_ORDER_PAGE_ROWS);
   lc_pouch_maintenance_result_cleanup(NULL, &result);
 }
 
@@ -3659,7 +3750,7 @@ static int query_during_publication(void *context,
     return LC_OK;
   work->fired = 1;
   if (work->mode == 2)
-    return append_json(work->f, work->f->b, "entry-63", "{}", &appended);
+    return append_json(work->f, work->f->b, "complete-page", "{}", &appended);
   if (work->mode == 1) {
     if (unlink(peer->order_path) != 0)
       return lc_error_set(error, LC_ERR_TRANSPORT, 0,
@@ -3680,7 +3771,7 @@ static void test_query_cleanup_preserves_active_publication(void **state) {
   fixture *f = *state;
   query_publish_context work = {f, 0, 0, 0, 0};
   int found;
-  indexed_seed(f, 62);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
   bind_collection(f, "events", 0, &f->b);
   lc_collection_query_test_hook = query_during_publication;
   lc_collection_query_test_context = &work;
@@ -3688,7 +3779,8 @@ static void test_query_cleanup_preserves_active_publication(void **state) {
   lc_collection_query_test_hook = NULL;
   assert_true(work.fired && work.temporary_survived && work.pending > 0);
   check(f, load_query(f, NULL, &found));
-  assert_true(found && f->query_index.rows == 62);
+  assert_true(found &&
+              f->query_index.rows == LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
 }
 
 static void
@@ -3698,7 +3790,7 @@ test_late_query_publication_cannot_revive_a_retired_epoch(void **state) {
   char old[768];
   struct stat st;
   int found;
-  indexed_seed(f, 63);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS);
   bind_collection(f, "events", 0, &f->b);
   lc_collection_handle *handle = f->a->impl;
   snprintf(old, sizeof(old), "%s/query/%s", handle->directory,
@@ -3713,7 +3805,7 @@ test_late_query_publication_cannot_revive_a_retired_epoch(void **state) {
   check(f, load_query(f, NULL, &found));
   assert_false(found);
   check(f, read_into_memory(f, NULL));
-  assert_int_equal(f->read.completed_records, 63);
+  assert_int_equal(f->read.completed_records, LC_COLLECTION_ORDER_PAGE_ROWS);
   check(f, build_query(f, 0));
   check(f, load_query(f, NULL, &found));
   assert_true(found);
@@ -3724,7 +3816,7 @@ test_late_partial_query_page_cannot_replace_a_complete_page(void **state) {
   fixture *f = *state;
   query_publish_context work = {f, 2, 0, 0, 0};
   int found;
-  indexed_seed(f, 62);
+  indexed_seed(f, LC_COLLECTION_ORDER_PAGE_ROWS - 1U);
   bind_collection(f, "events", 0, &f->b);
   lc_collection_query_test_hook = query_during_publication;
   lc_collection_query_test_context = &work;
@@ -3732,7 +3824,7 @@ test_late_partial_query_page_cannot_replace_a_complete_page(void **state) {
   lc_collection_query_test_hook = NULL;
   assert_true(work.fired);
   check(f, load_query(f, NULL, &found));
-  assert_true(found && f->query_index.rows == 63);
+  assert_true(found && f->query_index.rows == LC_COLLECTION_ORDER_PAGE_ROWS);
 }
 
 static void test_selection_ranges_empty_gaps_and_uint64(void **state) {
@@ -4811,7 +4903,7 @@ test_push_buffer_boundaries_codecs_and_packed_segments(void **state) {
 }
 
 static void
-test_push_spool_creation_failure_is_terminal_and_retryable(void **state) {
+test_push_canonical_write_failure_is_terminal_and_retryable(void **state) {
   fixture *f = *state;
   lc_collection_writer *writer = NULL;
   lc_collection_append_req req = {"io-failure"};
@@ -4825,8 +4917,7 @@ test_push_spool_creation_failure_is_terminal_and_retryable(void **state) {
   snprintf(moved, sizeof(moved), "%s-away", handle->directory);
   check(f, lc_collection_append_begin(f->a, &req, &writer, &f->error));
   assert_int_equal(rename(handle->directory, moved), 0);
-  check(f, lc_collection_writer_write(writer, "{\"v\":\"", 6, &f->error));
-  int rc = LC_OK;
+  int rc = lc_collection_writer_write(writer, "{\"v\":\"", 6, &f->error);
   for (unsigned int i = 0; i < 12 && rc == LC_OK; ++i)
     rc = lc_collection_writer_write(writer, chunk, 16384, &f->error);
   assert_int_equal(rename(moved, handle->directory), 0);
@@ -4984,8 +5075,7 @@ static void *lease_reallocate(void *context, void *bytes, size_t size) {
   return result;
 }
 
-static void
-test_push_staging_allocation_failure_and_bounded_heap(void **state) {
+static void test_push_allocation_failure_and_bounded_heap(void **state) {
   fixture *f = *state;
   lease_allocations stats = {0};
   lc_client_config config;
@@ -4994,9 +5084,9 @@ test_push_staging_allocation_failure_and_bounded_heap(void **state) {
   lc_collection_append_req req = {"bounded"};
   lc_collection_append_res entry;
   lc_collection_writer *writer = NULL;
-  char *chunk = malloc(16384);
+  char *chunk = malloc(4096);
   assert_non_null(chunk);
-  memset(chunk, 'x', 16384);
+  memset(chunk, 'x', 4096);
   close_handles(f);
   lc_client_config_init(&config);
   lc_pouch_settings_init(&settings);
@@ -5016,11 +5106,11 @@ test_push_staging_allocation_failure_and_bounded_heap(void **state) {
   stats.largest = 0;
   check(f, lc_collection_writer_write(writer, "{\"v\":\"", 6, &f->error));
   for (unsigned int i = 0; i < 256; ++i)
-    check(f, lc_collection_writer_write(writer, chunk, 16384, &f->error));
+    check(f, lc_collection_writer_write(writer, chunk, 4096, &f->error));
   check(f, lc_collection_writer_write(writer, "\"}", 2, &f->error));
   check(f, lc_collection_writer_commit(writer, &entry, &f->error));
   lc_collection_writer_close(writer);
-  assert_true(entry.bytes == 4U * 1024U * 1024U + 8U);
+  assert_true(entry.bytes == 1024U * 1024U + 8U);
   assert_true(stats.largest <= 65536U);
   for (int failure = 0; failure < 2; ++failure) {
     req.append_id = failure ? "fail-write" : "fail-finish";
@@ -5030,8 +5120,12 @@ test_push_staging_allocation_failure_and_bounded_heap(void **state) {
     stats.fail = 1;
     int rc = LC_OK;
     if (failure) {
-      for (unsigned int i = 0; i < 16 && rc == LC_OK; ++i)
-        rc = lc_collection_writer_write(writer, chunk, 16384, &f->error);
+      for (unsigned int i = 0; i < 256; ++i)
+        check(f, lc_collection_writer_write(writer, chunk, 4096, &f->error));
+      stats.fail = 0;
+      check(f, lc_collection_writer_write(writer, "\"}", 2, &f->error));
+      stats.fail = 1;
+      rc = lc_collection_writer_commit(writer, &entry, &f->error);
     } else {
       rc = lc_collection_writer_commit(writer, &entry, &f->error);
     }
@@ -5640,6 +5734,9 @@ static void test_collection_migration_catalog_and_existing_lease(void **state) {
 int main(int argc, char **argv) {
   const struct CMUnitTest tests[] = {
       cmocka_unit_test_setup_teardown(
+          test_push_chunk_crashes_leave_no_outcome_and_reclaim_storage, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
           test_collection_migration_recovers_staged_conversion, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
@@ -5746,11 +5843,10 @@ int main(int argc, char **argv) {
           test_packed_push_metadata_survives_compression_conversion, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
-          test_push_spool_creation_failure_is_terminal_and_retryable, setup,
+          test_push_canonical_write_failure_is_terminal_and_retryable, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
-          test_push_staging_allocation_failure_and_bounded_heap, setup,
-          teardown),
+          test_push_allocation_failure_and_bounded_heap, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_push_writer_nosync_loss_recovers_parent_and_count, setup,
           teardown),

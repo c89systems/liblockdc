@@ -150,7 +150,7 @@ creating another transaction outcome log.
 
 An append accepts exactly one JSON object through a direct/staged `lc_source`
 or an owned push-fed writer. [Incremental appends](collection-writer.md) describe
-the writer lifecycle, bounded encoded staging, and atomic parent renewal.
+the writer lifecycle, bounded canonical chunks, and atomic parent renewal.
 Arrays, scalars, empty input, trailing non-whitespace, malformed JSON, source failure, and limit
 violations fail before publication. Validation and compaction of structural
 whitespace are incremental. Preserve JSON values and member order; this is not
@@ -179,9 +179,9 @@ entry still derives its own keys and starts independent authentication.
 
 Use lonejson's public incremental parser/writer facilities. Its push-fed value
 stream is a sink interface. Push writers validate and encode incrementally into
-at most 64 KiB of staging memory, then an anonymous spool. Commit copies encoded bytes
-into shared rolling segments without reparsing or re-encoding. Read output
-remains a direct stream; it is never buffered or spooled as a whole.
+bounded canonical extents in shared rolling segments. Commit publishes metadata
+without rereading or copying the payload. No whole-entry staging is used.
+Readers follow the stored extents and stream raw JSON without reconstruction.
 
 Each request requires a caller-supplied `append_id`: 1 to 128 ASCII characters
 from letters, digits, `-`, `_`, `.`, and `~`. It is scoped to the collection ID.
@@ -223,9 +223,10 @@ receiver to read the preceding committed view during upload. Snapshot capture
 releases its exclusive pin before delivery callbacks. The commit barrier uses
 an advisory `.commit.lock` file with an independent descriptor per call; it
 stores no state or transaction outcomes and introduces no worker or body
-buffer. Push commit copies its encoded staging into the shared active segment
-and uses the same shared commit pin; no collection lock is held between push
-calls. NoSync appends bypass the synchronization wait.
+buffer. Push commit publishes its canonical extent index and uses the same
+shared commit pin; no publication lock is held between push calls. A separate
+`.streams.lock` pin defers compaction capture until active uploads finish.
+NoSync appends bypass the synchronization wait.
 
 Keep the canonical binding after individual deletion until collection drop.
 Status lookup reports `absent`, `committed`, or `deleted`, with the original
@@ -1019,6 +1020,13 @@ copy raw stored records outside mutation locks, then reconcile newer committed
 tail records before publishing. Preserve ciphertext/compressed payload bytes,
 timestamps, fingerprints, positions, and tombstone retry bindings.
 
+Streamed entries retain independently encoded units during compaction; only
+their physical index is rebuilt. Replacement snapshots roll into a group of
+segment-sized files under one head publication and read-generation pin.
+Recovery replays the complete named group before its append tail. Cleanup must
+retain every current part, including parts containing only payload units or
+index nodes, until the next snapshot publication makes the group obsolete.
+
 Automatic compaction selects reclaimable deleted payload according to the
 existing root threshold; a pure append journal does not need repeated copying
 of live history. Explicit forced maintenance can consolidate it. Track the
@@ -1106,9 +1114,9 @@ separately. No benchmark introduces a body cache or buffers streamed output.
 
 `LOCKDC_COLLECTION_BENCH_PUSH=1` selects the public append writer and feeds
 4096-byte fragments; the default uses pull append. Both publish into shared
-rolling segments and use the same durability batcher. Push additionally stages
-up to 64 KiB of encoded bytes in memory, then spills/copies larger encoded
-payloads. Both workloads verify the same raw results.
+rolling segments and use the same durability batcher. Push writes bounded
+canonical extents as input arrives and commits metadata without a payload copy.
+Both workloads verify the same raw results.
 
 `LOCKDC_COLLECTION_BENCH_WRITERS` selects 1..32 concurrent append callers
 (default 1), each using its own receiver and input buffer. Set

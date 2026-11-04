@@ -72,7 +72,8 @@ typedef int (*lc_pouch_crypto_producer_fn)(void *context, lc_sink *sink,
 typedef struct lc_pouch_crypto_output lc_pouch_crypto_writer;
 /* Owns bounded encoder scratch; encrypted output shares one heap frame between
  * plaintext and ciphertext and wipes the whole allocation on close. Borrows
- * fd, crypto and context until close. Full frames flow before EOF; finish
+ * fd and crypto until close, and context until restart/close. Full frames
+ * flow before EOF; finish
  * coalesces a residual encrypted frame and its terminal in one bounded write.
  * Finish flushes frames but never fsyncs,
  * closes or publishes the record. */
@@ -89,6 +90,23 @@ int lc_pouch_crypto_writer_finish(lc_pouch_crypto_writer *writer,
                                   uint64_t *plain_bytes, uint64_t *cipher_bytes,
                                   unsigned long *stored_crc,
                                   char **descriptor_out, lc_error *error);
+/* Completes one independent codec unit without transferring descriptor
+ * ownership or releasing scratch. Its descriptor is borrowed until restart or
+ * close. Restart requires a successful borrowed finish, reuses allocated
+ * codec/descriptor storage, and starts new counters with fresh encryption key
+ * and nonce material. Context remains borrowed until the next restart/close.
+ * Failed units are terminal; they cannot be restarted or published. */
+int lc_pouch_crypto_writer_finish_borrowed(lc_pouch_crypto_writer *writer,
+                                           uint64_t *plain_bytes,
+                                           uint64_t *cipher_bytes,
+                                           unsigned long *stored_crc,
+                                           const char **descriptor_out,
+                                           lc_error *error);
+int lc_pouch_crypto_writer_restart(lc_pouch_crypto_writer *writer,
+                                   const char *context, lc_error *error);
+/* Conservative total encoded size for a fresh unit with this writer's codec
+ * settings. The bound does not allocate or inspect/retain input bytes. */
+uint64_t lc_pouch_crypto_writer_bound(lc_pouch_crypto_writer *, uint64_t);
 void lc_pouch_crypto_writer_close(lc_pouch_crypto_writer *writer);
 int lc_pouch_crypto_produce_to_fd(lc_pouch_crypto *crypto, const char *context,
                                   int fd, lc_pouch_crypto_producer_fn producer,
@@ -110,6 +128,15 @@ int lc_pouch_crypto_rebind_descriptor(lc_pouch_crypto *crypto,
                                       const char *old_binding_context,
                                       const char *new_binding_context,
                                       char **out, lc_error *error);
+/* Compare immutable payload facts, excluding only the binding nonce/tag.
+ * Compact evidence is metadata, not authentication by itself: restoration
+ * must be followed by verifying its binding against the expected context. */
+int lc_pouch_crypto_descriptor_same_payload(const char *, const char *,
+                                            lc_error *);
+int lc_pouch_crypto_descriptor_proof(const char *, unsigned char[32], int *,
+                                     lc_error *);
+int lc_pouch_crypto_descriptor_restore(const char *, const unsigned char[32],
+                                       char[128], int *, lc_error *);
 int lc_pouch_crypto_source_from_file(lc_pouch_crypto *crypto,
                                      const char *context,
                                      const char *binding_context,
@@ -136,6 +163,14 @@ int lc_pouch_crypto_source_from_fd_span(lc_pouch_crypto *crypto,
 typedef struct lc_pouch_crypto_reader lc_pouch_crypto_reader;
 int lc_pouch_crypto_reader_open(lc_pouch_crypto *crypto,
                                 lc_pouch_crypto_reader **out, lc_error *error);
+/* Verify metadata using this operation's reusable derivation/MAC scratch,
+ * without opening a body or changing the currently bound source. */
+int lc_pouch_crypto_reader_verify(lc_pouch_crypto_reader *, const char *,
+                                  const char *, lc_error *);
+/* Borrows a resettable, bounded canonical encoded source until clear. */
+int lc_pouch_crypto_reader_bind_source(lc_pouch_crypto_reader *, const char *,
+                                       const char *, lc_source *, uint64_t,
+                                       const char *, lc_source **, lc_error *);
 int lc_pouch_crypto_reader_bind(lc_pouch_crypto_reader *reader,
                                 const char *context,
                                 const char *binding_context, int fd,

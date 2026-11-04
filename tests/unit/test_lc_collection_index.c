@@ -237,9 +237,10 @@ static void test_last_slot_roundtrip_and_page_binding(void **state) {
   lc_u64 high = (lc_u64)1 << (LC_COLLECTION_ORDER_PAGE_ROWS - 1);
   for (size_t i = 0; i < LC_COLLECTION_ORDER_PAGE_ROWS; ++i)
     assert_int_equal(add(&f->index,
-                         i == 31             ? NULL
-                         : i == 0 || i == 62 ? "{\"k\":\"x\"}"
-                                             : "{\"k\":\"y\"}",
+                         i == 31 ? NULL
+                         : i == 0 || i == LC_COLLECTION_ORDER_PAGE_ROWS - 1U
+                             ? "{\"k\":\"x\"}"
+                             : "{\"k\":\"y\"}",
                          &f->error),
                      LC_OK);
   assert_int_equal(add(&f->index, "{}", &f->error), LC_ERR_INVALID);

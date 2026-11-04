@@ -2,6 +2,7 @@
 #include "lc_collection_payload.h"
 #include "lc_collection_query.h"
 #include "lc_pouch_path.h"
+#include "lc_pouch_record.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -27,10 +29,18 @@ typedef struct lc_collection_reader {
   lc_collection_order order;
   lc_collection_order_iter iter;
   lc_pouch_collection_record record;
+  lc_collection_unit unit;
+  int direct_unit;
+  unsigned char *prefix;
+  size_t prefix_size;
   lc_collection_payload payload;
   lc_collection_query_plan plan;
   int reader_fd;
   int record_fd;
+#if defined(__linux__)
+  int read_advice;
+  int file_changed;
+#endif
   lc_u64 file_segment;
   lc_u64 file_end;
   lc_u64 upper;
@@ -270,7 +280,116 @@ static int lc_cr_accept(lc_collection_reader *reader, lc_u64 after, int entry) {
   return LC_OK;
 }
 
+static int lc_cr_unit_record(lc_collection_reader *reader,
+                             const lc_collection_order_row *row) {
+  lc_collection_handle *c = reader->call->collection;
+  lc_pouch_collection_record *record = &reader->record;
+  lc_collection_unit *unit = &reader->unit;
+  char prefix[48];
+  const char *id, *tail;
+  size_t length, prefix_length;
+  lc_u64 end;
+  struct stat st;
+  int rc, encrypted;
+  if (!row->unit_segment || row->unit_segment > row->segment ||
+      ((row->unit_segment ^ row->segment) & LC_COLLECTION_SNAPSHOT_BIT) ||
+      row->stored_bytes > LC_COLLECTION_CHUNK_MAX ||
+      row->unit_offset >
+          (lc_u64)LC_I64_MAX - LC_COLLECTION_UNIT_HEADER - row->stored_bytes)
+    goto corrupt;
+  end = row->unit_offset + LC_COLLECTION_UNIT_HEADER + row->stored_bytes;
+  if (row->unit_segment == row->segment && end > row->record_offset)
+    goto corrupt;
+  rc = lc_collection_record_file(c, row->unit_segment, &reader->record_fd,
+                                 &reader->file_segment, &reader->file_end,
+                                 reader->error);
+  if (rc != LC_OK)
+    return rc;
+  if (end > reader->file_end) {
+    if (fstat(reader->record_fd, &st) != 0 || st.st_size < 0)
+      return lc_collection_failure(reader->error, LC_ERR_TRANSPORT, NULL,
+                                   "failed to inspect direct collection unit");
+    reader->file_end = (lc_u64)st.st_size;
+    if (end > reader->file_end)
+      goto corrupt;
+  }
+  reader->prefix_size = row->stored_bytes < LC_CR_CHUNK_BYTES
+                            ? (size_t)row->stored_bytes
+                            : LC_CR_CHUNK_BYTES;
+  rc = lc_collection_unit_read_prefix(reader->record_fd, row->unit_offset,
+                                      row->stored_bytes, unit, reader->prefix,
+                                      reader->prefix_size, reader->error);
+  if (rc != LC_OK)
+    return rc;
+  if (unit->ordinal || unit->plain != row->bytes ||
+      unit->stored != row->stored_bytes || strlen(unit->etag) != 64U)
+    goto corrupt;
+  (void)snprintf(prefix, sizeof(prefix), "collection:%s:", c->id);
+  prefix_length = strlen(prefix);
+  if (strncmp(unit->context, prefix, prefix_length))
+    goto corrupt;
+  id = unit->context + prefix_length;
+  tail = strrchr(id, ':');
+  if (!tail || (!lc_xid_is_valid(tail + 1U) && strcmp(tail + 1U, "upload")))
+    goto corrupt;
+  length = (size_t)(tail - id);
+  if (!length || length >= sizeof(record->append_id))
+    goto corrupt;
+  memset(record, 0, sizeof(*record));
+  record->kind = LC_POUCH_COLLECTION_STREAM;
+  record->position = row->position;
+  record->generation = record->published_at = row->published_at;
+  record->record_offset = record->payload_record_offset = row->record_offset;
+  record->bytes = row->bytes;
+  record->stored_bytes = record->stream_root_bytes = row->stored_bytes;
+  record->stored_crc = unit->crc;
+  record->stream_extents = 1U;
+  record->stream_segment = row->unit_segment;
+  record->stream_offset = row->unit_offset;
+  memcpy(record->append_id, id, length);
+  strcpy(record->context, unit->context);
+  rc = lc_pouch_crypto_descriptor_restore(unit->descriptor, row->proof,
+                                          record->descriptor, &encrypted,
+                                          reader->error);
+  if (rc != LC_OK)
+    return rc;
+  strcpy(record->etag, unit->etag);
+  rc = lc_collection_unit_manifest(record, c->id,
+                                   &reader->payload.chunks.manifest, NULL,
+                                   record->manifest, reader->error);
+  if (rc != LC_OK)
+    return rc;
+  if (!encrypted && memcmp(record->manifest, row->proof, sizeof(row->proof)))
+    goto corrupt;
+  return lc_collection_record_leaf(row->segment, record->payload_container,
+                                   reader->error);
+corrupt:
+  return lc_collection_failure(reader->error, LC_ERR_PROTOCOL,
+                               "collection_corrupt",
+                               "collection order points to an invalid unit");
+}
+
 static int lc_cr_body_open(lc_collection_reader *reader) {
+  size_t prefix_size = reader->prefix_size;
+#if defined(__linux__)
+  int advice = reader->direct_unit             ? POSIX_FADV_SEQUENTIAL
+               : reader->record.stream_extents ? POSIX_FADV_RANDOM
+                                               : POSIX_FADV_NORMAL;
+#endif
+  reader->prefix_size = 0U;
+#if defined(__linux__)
+  /* Sparse root metadata must not compete with separate payload descriptors.
+   * A direct unit instead reads its complete contiguous body on this fd. */
+  if (advice != reader->read_advice || reader->file_changed)
+    (void)posix_fadvise(reader->record_fd, 0, 0, advice);
+  reader->read_advice = advice;
+  reader->file_changed = 0;
+#endif
+  if (reader->direct_unit)
+    return lc_collection_payload_open_unit(
+        &reader->payload, reader->call->collection, reader->record_fd,
+        &reader->record, &reader->unit, reader->prefix, prefix_size,
+        reader->error);
   return lc_collection_payload_open(&reader->payload, reader->call->collection,
                                     reader->record_fd, &reader->record,
                                     reader->error);
@@ -500,6 +619,7 @@ int lc_collection_read_method(lc_collection *self,
         (char *)lc_alloc_with_allocator(NULL, LC_COLLECTION_CURSOR_BYTES);
     chunk = (unsigned char *)lc_alloc_with_allocator(&collection->allocator,
                                                      LC_CR_CHUNK_BYTES);
+    reader.prefix = chunk;
     if (out->resume_cursor == NULL || out->checkpoint_cursor == NULL ||
         chunk == NULL) {
       rc = lc_collection_failure(
@@ -575,11 +695,26 @@ int lc_collection_read_method(lc_collection *self,
           continue;
         }
       }
-      if (rc == LC_OK)
+      reader.direct_unit = rows[i].unit_segment != 0U;
+#if defined(__linux__)
+      reader.file_changed =
+          (reader.direct_unit ? rows[i].unit_segment : rows[i].segment) !=
+          reader.file_segment;
+#endif
+      if (rc == LC_OK && reader.direct_unit)
+        rc = lc_cr_unit_record(&reader, &rows[i]);
+      else if (rc == LC_OK)
         rc = lc_collection_record_ref(collection, rows[i].segment,
                                       rows[i].record_offset, &reader.record_fd,
                                       &reader.file_segment, &reader.file_end,
                                       &reader.record, error);
+#if defined(__linux__)
+      /* Following an older visible version can close and reopen this same
+       * segment, so its final identity alone cannot prove the advice survived.
+       */
+      if (rc == LC_OK && reader.record.generation > reader.iter.generation)
+        reader.file_changed = 1;
+#endif
       if (rc == LC_OK)
         rc = lc_collection_record_at(collection, reader.iter.generation,
                                      &reader.record_fd, &reader.file_segment,

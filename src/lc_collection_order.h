@@ -7,7 +7,8 @@
 /* Derived, seekable collection order. All calls require the owning collection's
  * metadata authority. No payload, per-entry allocation, or process-local cache
  * is stored here. Canonical replay repairs an interrupted projection update. */
-#define LC_COLLECTION_ORDER_PAGE_ROWS 63U
+#define LC_COLLECTION_ORDER_PAGE_ROWS 38U
+#define LC_COLLECTION_ORDER_ROW_BYTES 104U
 #define LC_COLLECTION_ORDER_PAGE_BYTES 4096U
 #define LC_COLLECTION_ORDER_ROOT_BYTES 160U
 
@@ -19,6 +20,10 @@ typedef struct lc_collection_order_row {
   lc_u64 record_offset;
   lc_u64 bytes;
   lc_u64 stored_bytes;
+  /* Direct location of an unmodified single-unit entry without expiry.
+   * Canonical record references above remain authoritative for mutations. */
+  lc_u64 unit_segment, unit_offset;
+  unsigned char proof[32];
 } lc_collection_order_row;
 
 typedef struct lc_collection_order {

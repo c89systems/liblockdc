@@ -652,7 +652,7 @@ typedef struct lc_collection_capabilities {
   int position_selection;
   /** Supports per-collection max_entries and lazy oldest-first trimming. */
   int count_retention;
-  /** Supports owned push-fed append writers with bounded encoded staging. */
+  /** Supports owned push-fed append writers with bounded canonical chunks. */
   int append_writer;
   /** Supports explicit single-pass sources through that same staged writer. */
   int append_staged;
@@ -942,7 +942,7 @@ struct lc_collection {
   int (*append)(lc_collection *self, const lc_collection_append_req *req,
                 lc_source *source, lc_collection_append_res *out,
                 lc_error *error);
-  /** Borrows a single-pass source through the writer's bounded encoded staging
+  /** Borrows a single-pass source through the writer's canonical streaming
    * path; source reads hold no publication locks. Never resets/closes source.
    */
   int (*append_staged)(lc_collection *self, const lc_collection_append_req *req,
@@ -982,9 +982,11 @@ struct lc_collection {
  * between calls. Sequential thread transfer is allowed; overlapping operations
  * fail. Closing an active writer defers destruction until its call unwinds.
  * The writer retains its collection/client even after their public close.
- * Pouch validates/encodes once and stages up to 64 KiB of encoded bytes on
- * the heap, then an anonymous spool. Commit copies to shared rolling segments;
- * encrypted roots spool ciphertext. Parser/codec scratch is additional. */
+ * Pouch validates/encodes once into bounded chunks in shared canonical
+ * segments. Commit publishes metadata without reading back or copying the
+ * payload. Scratch is bounded independently of entry size; no whole-entry spool
+ * is used. A live writer defers compaction capture until commit, abort or
+ * close. */
 struct lc_collection_writer {
   int (*write)(lc_collection_writer *self, const void *bytes, size_t count,
                lc_error *error);
@@ -1093,13 +1095,13 @@ int lc_collection_append(lc_collection *collection,
                          lc_collection_append_res *out, lc_error *error);
 /** Explicit staged pull for slow or concurrent producers. Borrows and consumes
  * source once, never resets or closes it, and never retries automatically.
- * Uses the same validation, 64 KiB encoded staging/spill, fencing and commit
+ * Uses the same validation, bounded canonical chunks, fencing and commit
  * protocol as append_begin/write/commit. No publication locks are held while
  * reading source. Source callbacks retain append's reentry rules: same-receiver
  * operations and peer mutations of this collection fail; peer reads and other
  * collections may progress. Closing public owners does not invalidate the call.
  * Source/validation failures publish nothing; commit errors can be uncertain.
- * Compare direct append for fast inputs: staging may cost more CPU and I/O. */
+ * Direct append can be cheaper for fast inputs that do not wait externally. */
 int lc_collection_append_staged(lc_collection *collection,
                                 const lc_collection_append_req *req,
                                 lc_source *source,
@@ -1122,8 +1124,9 @@ int lc_collection_writer_commit(lc_collection_writer *writer,
 /** Idempotently discards an unfinished append; safe after write/commit failure.
  */
 int lc_collection_writer_abort(lc_collection_writer *writer, lc_error *error);
-/** Releases the owned writer, discarding any unfinished staging. Never commits
- * or undoes publication. The C pointer is invalid after this call. */
+/** Releases the owned writer, abandoning unfinished chunks for maintenance.
+ * Never commits or undoes publication. The C pointer is invalid after this
+ * call. */
 void lc_collection_writer_close(lc_collection_writer *writer);
 /** Observes ABSENT/COMMITTED/DELETED without a body. ABSENT returns LC_OK and
  * does not cancel an upload in progress. Deleted retry identities are retained.

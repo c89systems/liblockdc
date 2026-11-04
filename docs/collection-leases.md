@@ -59,9 +59,8 @@ needed. Privacy changes neither payload bytes nor the streaming format.
 Keep a bounded ownership record in the existing atomically published collection
 head, refreshed under metadata authority. Ownership transitions serialize with
 final publication, not with the entire lifetime of an upload or lease. Direct
-pull encodes under append authority; push and explicit staged pull stage encoded
-bytes in bounded memory or an anonymous spool and copy them into the shared
-active segment at commit. Ownership checks add no per-entry lease update,
+pull encodes under append authority; push and explicit staged pull write bounded
+encoded chunks into shared canonical segments and publish metadata at commit. Ownership checks add no per-entry lease update,
 extra client/worker per lease, or full history scan.
 
 Acquisition, keepalive, release and takeover durably replace control metadata.

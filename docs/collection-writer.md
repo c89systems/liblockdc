@@ -1,21 +1,23 @@
 # Incremental collection appends
 
 Implementation contract extending [ordered collections](collections.md).
-The initial backend is Pouch, with matching C and Lua surfaces. Remote
+The initial backend is Pouch, with matching C and Lua surfaces. Chunk/index
+records add no public ABI change; older libraries cannot read these new record
+kinds, while existing contiguous records remain readable. Remote
 collections remain unsupported. Collection receiver and capability additions
 now use core ABI 9, advancing once from ABI 8 in v0.25.0 for atomic edits and
 read preconditions. Rebuild C consumers and the optional PostgreSQL provider.
 For an atomic cut/replacement/recovery marker, use an [edit](collection-edits.md);
-ordinary append and staged/push writer behavior is unchanged.
+ordinary append and push writers remain independent atomic appends.
 
 ## Scope and publication
 
 A bound append writer validates, compacts, hashes and encodes pushed JSON
-fragments once. Pouch stages at most 64 KiB of encoded payload on the heap,
-then spills to an anonymous file. Commit copies those encoded bytes into the
-shared active segment without reparsing or re-encoding. No producer thread or
-body cache is introduced. Pull and push share the canonical record format,
-codecs, projection publication and durable group-sync protocol.
+fragments once. Bounded codec chunks go directly into shared rolling canonical
+segments. A small final state record publishes the complete entry; commit does
+not read back or copy its payload. No whole-entry buffer, spool, producer thread
+or body cache is used. Pull and push share codecs, projection publication and
+the durable group-sync protocol.
 
 This does not enlist collections in XA or add append batches. A downstream
 repository may publish immutable collection-position references through its
@@ -37,7 +39,7 @@ The writer has matching receiver methods and free functions:
 - `commit(result, error)` finishes validation and publishes one complete entry.
   Its result and retry rules match pull append. Position is assigned at
   publication, so concurrent writers are ordered by commit rather than begin.
-- `abort(error)` discards unpublished storage. It is idempotent and cannot
+- `abort(error)` abandons unpublished chunks for maintenance. It is idempotent and cannot
   undo a committed or uncertain published append.
 - `close()` releases the writer, aborting any unfinished append. Cleanup never
   publishes. Callers close successful and failed writers as well.
@@ -59,7 +61,7 @@ The C source remains borrowed: the helper never resets or closes it. Lua owns
 its normal source adapter and closes that adapter on every outcome, as for
 ordinary append. A zero-length read without error supplies EOF and attempts
 commit; a source error, malformed input or oversized read discards unpublished
-staging. Signal cancellation through the source's error convention. A commit
+chunks. Signal cancellation through the source's error convention. A commit
 error may still represent publication; reconcile with append status and a fresh
 source, never by implicitly replaying an exhausted source.
 
@@ -83,20 +85,84 @@ explicit abort between fragment calls, or close. No cancellation worker is creat
 ## Pending storage and concurrency
 
 Public push writers keep no root, namespace, catalog, append, commit or metadata
-publication lock while waiting for the producer. Small entries allocate no
-staging file. Staging grows from 2 KiB up to a 64 KiB cap per live writer,
-measured in encoded bytes. Larger payloads spill the prefix and subsequent
-encoded bytes into a private mode-0600 file, immediately unlinked. The writer
-owns its descriptor; close, abort and process exit reclaim it. Compression may
-keep a large JSON body within the memory cap; encrypted roots never write a
-plaintext spool. Parser and codec scratch are additional bounded allocations.
+publication lock while waiting for the producer. Parser and codec scratch are
+bounded independently of entry size; producer fragments are borrowed only for
+the call. Encoding can retain one bounded codec chunk before emitting it.
 
 All append forms use shared rolling canonical segments. Direct pull validates
-and encodes into an unpublished canonical range while retaining append
-authority. Push and staged pull validate/encode before acquiring that authority;
-commit copies the staged payload, checks its stored checksum, then finalizes
-the canonical record. Failed copies roll back only the unpublished range while
-append authority still excludes peers. There is no segment per small push commit.
+and encodes into an unpublished contiguous range while retaining append
+authority. Push and staged pull encode independent units directly into exclusive
+ranges under short append authority. A unit covers at most 8 MiB of plaintext,
+but consumes only bounded codec scratch, never an 8 MiB input buffer. A shorter
+available range reduces that unit's input limit before it fills. Ranges share
+segment inodes; neither units nor entries require an inode of their own.
+Reservations include bounded framing headroom, so a target-sized plaintext
+value does not need another codec unit just for its metadata or authentication
+tag. This headroom is canonical address space, not an input buffer.
+Payload writes within a reserved unit run without append authority, so slow
+storage does not retain that lock. Ownership is checked when reserving and
+finalizing units and again at publication.
+
+A compact immutable index records canonical unit offsets. Full index pages are
+appended as input arrives. Its 64-way carry stack is fixed in size, and
+finalization writes only the remaining bounded index pages. The final state
+record assigns a position and publishes the index root. Each upload has its own
+identity and each unit its own ordinal and codec context. Unit metadata is
+immutable. The publication records a logical manifest covering committed entry
+identity, whole-body fingerprint and unit count. Its descriptor authenticates
+that manifest while retaining the first unit's exact cipher core. Root metadata
+references reuse the publication's exact descriptor. Retention changes leave
+this logical evidence unchanged.
+
+Concurrent uploads may interleave units and publish in either order. No
+entry-sized offset array or commit-time payload copy is needed. Streaming
+input and publication allow one additional target's worth of reserved bytes
+before sealing. A producer can
+still finish its exclusively owned range after a peer rotates; those late
+writes are synced before publication from another inode, including in NoSync
+mode. Completed immutable first-inode data is synced outside append authority
+when already rotated. Publication checks again and retains a synchronous seal
+if a rotation raced preparation. Same-inode durable publication shares the
+ordinary commit sync.
+Rotation always seals the old segment before advancing the durable head,
+including unpublished reservations: their framing must survive recovery even
+when the producer aborts. Owners still sync any later private writes before
+publishing a reference from another inode.
+Range allocation owns rotation; the bounded index carry and publication that
+follow it do not rotate again merely for metadata overhead.
+
+Compaction copies encoded units unchanged, rebuilds their physical index and
+preserves the stream publication. Its output rolls into a snapshot group at the
+segment target. It does not concatenate a large entry or the collection into one
+oversized snapshot file. The head names the whole group, and recovery and reader
+protection cover every part. Deleting a derived projection rebuilds it from all
+retained parts before replaying the newer append tail.
+An indivisible codec unit may exceed the target by its bounded framing overhead;
+that part contains only that unit. Very small targets also retain the minimum
+unit budget. Neither exception grows with the total entry or collection size.
+
+If no codec chunk was emitted before commit, its final bounded chunk writes
+directly into a normal contiguous record under the existing publication lock.
+This preserves the small-entry path without an entry-sized buffer or spool.
+Parser/codec chunk capacities remain independent of the complete entry size.
+Reads retain bounded 16 KiB delivery chunks and cancellation granularity.
+
+For an unchanged single-unit entry without an entry deadline, the derived
+ordered projection also records its unit location. Reads can validate the unit
+metadata and begin consuming its encoded body together, using the existing
+16 KiB output scratch for that first input chunk. Identity validation precedes
+output; complete length and fingerprint validation precede accepting the entry
+and its cursor. An LQL pass consumes that input once; a subsequent presentation
+pass reads the canonical body again. No payload cache is retained. Other entries
+follow their canonical publication and unit index normally. Entry metadata
+updates clear the direct location; compaction can restore it after folding the
+metadata. All these locations are rebuilt from canonical records with the rest
+of the derived projection.
+
+An advisory `.streams.lock` pin protects unfinished canonical extents. Compaction
+defers capture while a producer is live, then seals the capture boundary under
+append authority. Producers admitted after capture can append to its retained
+tail. Abandoned chunks are reclaimable; process exit releases the pin.
 
 Both paths use the same incremental JSON validator and compression/encryption
 encoder. Fixed chunk/parser scratch limits remain independent of item size.
@@ -105,9 +171,11 @@ not compressed bytes or semantic key ordering.
 The validator coalesces tiny parser emissions into at most 4096 bytes before
 hashing/encoding, flushing the tail before each public write returns. This is
 bounded chunk scratch, not a whole-value buffer or a body cache.
-Plain output uses a 2 KiB chunk inside the allocated writer and grows to the
-existing 64 KiB chunk only when needed. Encryption and compression retain their
-64 KiB frame/workspace behavior; large writes keep the same write cadence.
+Push and staged pull reserve their 64 KiB codec chunk at admission (plus fixed
+frame/tag storage for encryption), so payload progress and segment rollover do
+not need further SDK allocations. Direct pull retains its small
+plain-output optimization. Encryption and compression retain their 64 KiB
+frame/workspace behavior; large writes keep the same write cadence.
 
 Commit obtains normal collection authority, rechecks the incarnation and append
 identity, assigns position/generation, finalizes metadata, and publishes through
@@ -122,16 +190,23 @@ generation, including after public receiver close. Takeover, release or expiry
 cannot let an obsolete writer publish or bind a new append ID. Each successful
 append commits while that same lease remains held; it does not renew ownership.
 
-Uncommitted staging is invisible to reads and recovery. Recovery discards a
-canonical PENDING tail left by interruption during the commit copy; a finalized
-canonical record remains authoritative even when its projection publication
-or acknowledgement was interrupted. Maintenance also reclaims any abandoned
-named pending files left by an interrupted spool creation/unlink, while live
-anonymous spools remain owned solely by their descriptors.
+Uncommitted extents are invisible to reads. Recovery skips complete extents
+without a publication record and repairs incomplete active tails. A finalized
+publication remains authoritative if projection updates or acknowledgement were
+interrupted. Maintenance reclaims abandoned extents after their producer pin
+has been released. Readers traverse the immutable index with bounded scratch and
+verify the committed body; they never reconstruct a complete entry in memory.
+On Linux, the reader disables lookahead on its sparse stream-metadata descriptor.
+Payload descriptors retain the normal policy, and contiguous records restore
+that policy when sharing the metadata descriptor.
 Segment transitions sync the preceding canonical history. They do not separately
 sync the rebuildable order and identity projections. A clean-close checkpoint
 syncs both projections before publishing its marker; an unclean open repairs
 them from canonical history, including missing or torn projection files.
+Reserved addresses can extend a replay hint beyond an interrupted active file.
+Recovery reconstructs canonical metadata and checks the existing published
+positions, generations and counts before replacing projections or trimming
+that unfinished tail. Truncated finalized records remain corruption errors.
 
 The selected NoSync or durable-sync policy still applies. Durable commits pin
 their exact canonical inode and use the existing root fsync batcher and commit
@@ -140,7 +215,8 @@ to join a durable group. Writer admission does not drain that group. Canonical
 rotation still applies the normal topology fences; ordinary pushes do not
 rotate solely because they use incremental input.
 A paused push/staged-pull producer holds no publication lock, allowing other
-appends and maintenance to progress. Direct pull retains append authority while
+appends and retention/control maintenance to progress. Compaction capture waits
+for uploads with unpublished canonical chunks to finish. Direct pull retains append authority while
 reading its source; use staged pull or push for input that may wait externally.
 If collection deletion wins before commit, the writer fails without
 reviving that incarnation. Captured readers retain their existing protection.
@@ -184,7 +260,8 @@ policy, without changing native read semantics.
 ## Verification
 
 Prove fragmented keys, escapes, UTF-8 and nesting; invalid/truncated/trailing
-input; bounded memory for multi-megabyte strings; exact staging boundaries;
+input; allocation-free payload progress for generated one-megabyte strings;
+canonical payload writes before commit and bounded commit I/O;
 and no canonical publication before commit. Cover codecs, abort/close/owner-close,
 allocation/I/O failure, concurrent writers, duplicate/conflicting IDs,
 captured readers, rotation, restart and compaction. Use controlled clocks for

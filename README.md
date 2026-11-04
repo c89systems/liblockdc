@@ -152,7 +152,7 @@ The public API remains the same receiver-function SDK surface for remote and
 Pouch clients. State bodies, queue payloads, attachments, scan output,
 query-document output, crypto, and compression use real streaming paths unless
 the caller explicitly chooses an in-memory source or sink.
-Collection push and staged-pull appends use bounded encoded staging as described
+Collection push and staged-pull appends write bounded canonical chunks as described
 in [the append contract](docs/collection-writer.md); collection reads remain raw
 ordered streams.
 

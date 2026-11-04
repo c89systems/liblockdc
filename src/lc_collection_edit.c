@@ -486,8 +486,7 @@ static int ce_project(lc_collection_handle *c, lc_collection_order *order,
     if (record->generation > order->generation)
       order->generation = record->generation;
     order->edit_in_progress = 0;
-    rc = lc_collection_order_checkpoint(order, snapshot ? 1U : segment,
-                                        record->next_offset, e);
+    rc = lc_collection_order_checkpoint(order, segment, record->next_offset, e);
   }
   return rc;
 }
@@ -915,8 +914,8 @@ int lc_collection_edit_method(lc_collection *self,
 
 int lc_collection_edit_compact(lc_collection_handle *c,
                                lc_collection_ids *captured, lc_u64 generation,
-                               int destination, const char *leaf,
-                               lc_u64 snapshot, lc_collection_order *order,
+                               lc_collection_compact_output_fn output,
+                               void *context, lc_collection_order *order,
                                lc_collection_ids *ids, unsigned char *buffer,
                                size_t capacity, lc_error *e) {
   lc_collection_id_ref ref;
@@ -924,7 +923,9 @@ int lc_collection_edit_compact(lc_collection_handle *c,
   lc_u64 slot, segment = 0, end = 0, copied_count = 0;
   unsigned char digest[32];
   char source_leaf[64];
-  int rc = LC_OK, occupied, fd = -1;
+  const char *leaf = NULL;
+  lc_u64 snapshot = 0;
+  int rc = LC_OK, occupied, fd = -1, destination = -1;
   for (slot = 0; rc == LC_OK && slot < captured->capacity; ++slot) {
     rc = lc_collection_metadata_enter(c, 0, e);
     if (rc == LC_OK) {
@@ -947,6 +948,11 @@ int lc_collection_edit_compact(lc_collection_handle *c,
       ++copied_count;
     if (rc == LC_OK)
       rc = lc_collection_record_leaf(ref.segment, source_leaf, e);
+    if (rc == LC_OK)
+      rc = output(context,
+                  record.stored_bytes + record.metadata_length +
+                      strlen(record.append_id) + 32U,
+                  &destination, &leaf, &snapshot, e);
     if (rc == LC_OK)
       rc = lc_pouch_collection_record_copy(c->pouch, fd, fd, source_leaf,
                                            &record, destination, leaf, buffer,

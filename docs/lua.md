@@ -405,8 +405,8 @@ rejected rather than ignored.
 | `describe()` | Namespace, name, collection ID, upper position, live count, indexing, retention and lease metadata |
 | `metadata({retention_seconds=..., max_entries="1000"})` | Updated collection description |
 | `append({append_id=..., retention_seconds=..., collection_retention_seconds=...}, source)` | Position, ETag, bytes, duplicate/deleted and retention facts |
-| `append_staged(request, source)` | Same request, sources and result as append, using the existing writer's bounded encoded staging and commit path |
-| `append_begin(request)` | Owned raw-JSON writer; Pouch stages up to 64 KiB of encoded bytes, then spools; commit copies into a shared segment |
+| `append_staged(request, source)` | Same request, sources and result as append, using the existing writer's bounded canonical chunks and commit path |
+| `append_begin(request)` | Owned raw-JSON writer; bounded chunks go into canonical segments and commit publishes metadata |
 | `append_status(append_id)` | `state="absent"`, `"committed"`, or `"deleted"`; assigned identities include an `entry` table |
 | `entry_metadata(position, {retention_seconds=...})` | Entry facts after a body-preserving retention change |
 | `read(options, sink)` | `nil, result`; on failure `nil, error, code, partial_result` |
@@ -460,9 +460,9 @@ An append writer accepts `writer:write(raw_json_string)` repeatedly, then
 `abort` return true on success; `commit` returns the normal append result.
 Failures return `nil, error, code`. Empty writes are not EOF. Strings are
 borrowed for each call; the binding does not decode JSON or introduce a producer
-thread. Native Pouch stages up to 64 KiB of encoded bytes, then an anonymous
-spool, and copies them into a shared segment at commit. No collection lock is
-held between calls.
+thread. Native Pouch writes bounded chunks directly into shared canonical
+segments. Commit publishes metadata without copying the payload. No publication
+lock is held between calls; live uploads defer compaction capture.
 Writers retain their owners independently of public collection/client close.
 Commit is terminal, abort is idempotent, and close/GC never publishes. After
 an uncertain commit error, use `append_status`, including when constructing

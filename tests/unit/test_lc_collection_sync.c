@@ -35,7 +35,7 @@ typedef struct fixture {
   uint64_t batch_limit;
   int fail_sync;
   int release;
-  const char *body;
+  char *body;
 } fixture;
 
 static fixture *sync_fixture;
@@ -139,6 +139,7 @@ static int teardown(void **state) {
   pthread_cond_destroy(&f->condition);
   pthread_mutex_destroy(&f->mutex);
   lc_test_tmp_cleanup_path(f->root, PREFIX);
+  free(f->body);
   free(f);
   return 0;
 }

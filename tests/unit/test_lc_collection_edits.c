@@ -337,7 +337,11 @@ static void test_ranges_and_receipts(void **state) {
   clear(f);
   f->req.recovery = "{\"baseline\":true}";
 
+  /* Force ordinary rows and the receipt into distinct snapshot parts. */
+  lc_collection_handle *collection = f->collection->impl;
+  collection->pouch->segment_target_bytes = 512U;
   compact(f);
+  assert_true(collection->head.snapshot_extra_parts > 0);
   check(f,
         lc_collection_edit_status(f->collection, "trim", &receipt, &f->error));
   assert_true(receipt.found);

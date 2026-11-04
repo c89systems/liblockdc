@@ -545,6 +545,9 @@ set(lc_sources
     src/lc_collection_retention.c
     src/lc_collections.c
     src/lc_collection_writer.c
+    src/lc_collection_chunks.c
+    src/lc_collection_unit.c
+    src/lc_collection_recode.c
     src/lc_consumer_service.c
     src/lc_core.c
     src/lc_intcompat.c

@@ -761,9 +761,9 @@ function Collection:append(request, source) return self._core:append(request, so
 function Collection:append_staged(request, source)
   return self._core:append_staged(request, source)
 end
--- Push raw JSON fragments; Pouch validates/encodes once, buffers up to 64 KiB
--- of encoded bytes, then uses an anonymous spool for larger entries. Commit
--- copies those bytes into a shared segment. Close after commit or failure.
+-- Push raw JSON fragments through bounded codec chunks into shared canonical
+-- segments. Commit publishes metadata without a whole-entry spool or payload
+-- copy. A live writer defers compaction capture; close after commit or failure.
 -- collection_retention_seconds is atomic with a new append; omission preserves,
 -- 0 clears, positive seconds reset from commit. Identical retries do not renew.
 function Collection:append_begin(request)

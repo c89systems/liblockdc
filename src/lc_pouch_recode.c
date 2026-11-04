@@ -1,5 +1,6 @@
 #include "lc_pouch_recode.h"
 #include "lc_collection_internal.h"
+#include "lc_collection_recode.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_path.h"
@@ -77,6 +78,7 @@ int lc_pouch_recode_offset_add(lc_pouch_recode *work,
     file->offsets = next;
     file->capacity = capacity;
   }
+  memset(&file->offsets[file->count], 0, sizeof(*file->offsets));
   file->offsets[file->count].before = before;
   file->offsets[file->count++].after = after;
   return LC_OK;
@@ -88,10 +90,11 @@ static int rc_compare(const void *a, const void *b) {
   return order != 0 ? order : strcmp(x->leaf, y->leaf);
 }
 
-int lc_pouch_recode_find(lc_pouch_recode *work, const char *scope,
-                         const char *leaf, lc_u64 offset,
-                         lc_pouch_recode_file **file, lc_u64 *translated,
-                         lc_error *error) {
+int lc_pouch_recode_lookup(lc_pouch_recode *work, const char *scope,
+                           const char *leaf, lc_u64 offset,
+                           lc_pouch_recode_file **file,
+                           lc_pouch_recode_offset **translated,
+                           lc_error *error) {
   lc_pouch_recode_file key, *found;
   size_t first = 0, last, mid;
   memset(&key, 0, sizeof(key));
@@ -109,13 +112,38 @@ int lc_pouch_recode_find(lc_pouch_recode *work, const char *scope,
     }
     if (first < found->count && found->offsets[first].before == offset) {
       *file = found;
-      *translated = found->offsets[first].after;
+      *translated = &found->offsets[first];
       return LC_OK;
     }
   }
   return lc_error_set(error, LC_ERR_PROTOCOL, 0,
                       "conversion reference has no retained canonical record",
                       leaf, NULL, "pouch");
+}
+
+int lc_pouch_recode_find(lc_pouch_recode *work, const char *scope,
+                         const char *leaf, lc_u64 offset,
+                         lc_pouch_recode_file **file, lc_u64 *translated,
+                         lc_error *error) {
+  lc_pouch_recode_offset *location;
+  int rc =
+      lc_pouch_recode_lookup(work, scope, leaf, offset, file, &location, error);
+  if (rc == LC_OK)
+    *translated = location->after;
+  return rc;
+}
+char *lc_pouch_recode_location(lc_pouch_recode *work,
+                               lc_pouch_recode_file *file, lc_u64 segment,
+                               char leaf[64], lc_error *error) {
+  if (!segment) {
+    if (strlen(file->leaf) >= 64U)
+      return NULL;
+    strcpy(leaf, file->leaf);
+    return lc_strdup_with_allocator(&work->pouch->allocator, file->target);
+  }
+  if (lc_collection_record_leaf(segment, leaf, error) != LC_OK)
+    return NULL;
+  return lc_pouch_path_join(&work->pouch->allocator, file->scope, leaf);
 }
 
 static int rc_copy(lc_pouch_recode *work, const char *source,
@@ -240,18 +268,25 @@ static int rc_collection(lc_pouch_recode *work, const char *source,
       rc = from && to ? rc_file(work, from, to, source, ns, leaf, id,
                                 segment == head.active, error)
                       : LC_ERR_NOMEM;
+      if (rc == LC_OK)
+        work->files[work->count - 1U].output_floor = head.active;
       lc_free_with_allocator(&work->pouch->allocator, from);
       lc_free_with_allocator(&work->pouch->allocator, to);
     }
   }
-  if (rc == LC_OK && head.snapshot != 0) {
-    rc = lc_collection_record_leaf(head.snapshot | LC_COLLECTION_SNAPSHOT_BIT,
-                                   leaf, error);
+  for (segment = head.snapshot;
+       rc == LC_OK && segment != 0 &&
+       segment <= head.snapshot + head.snapshot_extra_parts;
+       ++segment) {
+    rc = lc_collection_record_leaf(segment | LC_COLLECTION_SNAPSHOT_BIT, leaf,
+                                   error);
     if (rc == LC_OK) {
       from = lc_pouch_path_join(&work->pouch->allocator, source, leaf);
       to = lc_pouch_path_join(&work->pouch->allocator, target, leaf);
       rc = from && to ? rc_file(work, from, to, source, ns, leaf, id, 0, error)
                       : LC_ERR_NOMEM;
+      if (rc == LC_OK)
+        work->files[work->count - 1U].output_floor = head.next_snapshot;
       lc_free_with_allocator(&work->pouch->allocator, from);
       lc_free_with_allocator(&work->pouch->allocator, to);
     }
@@ -467,11 +502,11 @@ static int rc_tree(lc_pouch_recode *work, const char *source,
   return rc;
 }
 
-/* The private journal contains an immutable inventory and one offset table per
- * canonical file. Only `payload` contains duplicated payload bytes. A durable
- * table/receipt names both inodes before rename, so a restart distinguishes a
- * prepared replacement from an installed one without translating twice. */
-static int rc_phase(int phase, lc_error *error) {
+/* The private journal contains inventory, reachability and relocation metadata.
+ * Ordinary files share one staged payload; collection units write directly to
+ * final canonical parts. Durable receipts precede replacement or retirement,
+ * so restart never translates already converted offsets a second time. */
+int lc_pouch_recode_phase(int phase, lc_error *error) {
 #ifdef LOCKDC_TEST_BUILD
   if (lc_pouch_recode_test_hook)
     return lc_pouch_recode_test_hook(lc_pouch_recode_test_context, phase,
@@ -483,7 +518,7 @@ static int rc_phase(int phase, lc_error *error) {
   return LC_OK;
 }
 
-static int rc_put64(FILE *fp, lc_u64 value) {
+int lc_pouch_recode_put64(FILE *fp, lc_u64 value) {
   unsigned char bytes[8];
   unsigned int i;
   for (i = 0; i < 8; ++i) {
@@ -493,7 +528,7 @@ static int rc_put64(FILE *fp, lc_u64 value) {
   return fwrite(bytes, 1, 8, fp) == 8;
 }
 
-static int rc_get64(FILE *fp, lc_u64 *value) {
+int lc_pouch_recode_get64(FILE *fp, lc_u64 *value) {
   unsigned char bytes[8];
   unsigned int i;
   if (fread(bytes, 1, 8, fp) != 8)
@@ -506,12 +541,13 @@ static int rc_get64(FILE *fp, lc_u64 *value) {
 
 static int rc_put_string(FILE *fp, const char *text) {
   size_t length = strlen(text);
-  return rc_put64(fp, (lc_u64)length) && fwrite(text, 1, length, fp) == length;
+  return lc_pouch_recode_put64(fp, (lc_u64)length) &&
+         fwrite(text, 1, length, fp) == length;
 }
 
 static int rc_get_string(lc_pouch_recode *work, FILE *fp, char **out, int *rc) {
   lc_u64 length;
-  if (!rc_get64(fp, &length) || length > 1048576)
+  if (!lc_pouch_recode_get64(fp, &length) || length > 1048576)
     return 0;
   *out = lc_alloc_with_allocator(&work->pouch->allocator, (size_t)length + 1);
   if (!*out) {
@@ -525,14 +561,14 @@ static int rc_get_string(lc_pouch_recode *work, FILE *fp, char **out, int *rc) {
   return 1;
 }
 
-static int rc_journal_error(lc_error *error) {
+int lc_pouch_recode_journal_error(lc_error *error) {
   return lc_error_set(error, LC_ERR_PROTOCOL, 0,
                       "invalid compression conversion journal", NULL, NULL,
                       "pouch");
 }
 
-static int rc_commit(FILE *fp, const char *tmp, const char *path,
-                     const char *directory, int valid, lc_error *error) {
+int lc_pouch_recode_commit(FILE *fp, const char *tmp, const char *path,
+                           const char *directory, int valid, lc_error *error) {
   int rc =
       valid ? LC_OK : rc_error(error, "failed to write conversion journal");
   if (rc == LC_OK && (fflush(fp) != 0 || fsync(fileno(fp)) != 0))
@@ -547,7 +583,7 @@ static int rc_commit(FILE *fp, const char *tmp, const char *path,
   return rc;
 }
 
-static FILE *rc_create(const char *path) {
+FILE *lc_pouch_recode_create(const char *path) {
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   FILE *fp = fd >= 0 ? fdopen(fd, "wb") : NULL;
   if (!fp && fd >= 0)
@@ -562,7 +598,7 @@ static int rc_inventory(lc_pouch_recode *work, const char *source,
       lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
   char *relative = NULL, *scope = NULL, *ns = NULL, *id = NULL;
   lc_pouch_recode_file *file;
-  lc_u64 count, active;
+  lc_u64 count, active, floor;
   FILE *fp;
   size_t i, base = strlen(source) + 1;
   int valid, rc = LC_OK;
@@ -572,13 +608,17 @@ static int rc_inventory(lc_pouch_recode *work, const char *source,
   }
   fp = fopen(path, "rb");
   if (fp) {
-    valid = rc_get64(fp, &count) && count <= (size_t)-1 / sizeof(*work->files);
+    valid = lc_pouch_recode_get64(fp, &count) &&
+            count <= (size_t)-1 / sizeof(*work->files);
     for (i = 0; valid && i < count; ++i) {
       valid = rc_get_string(work, fp, &relative, &rc) &&
               rc_get_string(work, fp, &scope, &rc) &&
               rc_get_string(work, fp, &ns, &rc) &&
-              rc_get_string(work, fp, &id, &rc) && rc_get64(fp, &active) &&
-              active <= 1 && strlen(id) < LC_XID_STRING_SIZE;
+              rc_get_string(work, fp, &id, &rc) &&
+              lc_pouch_recode_get64(fp, &active) &&
+              lc_pouch_recode_get64(fp, &floor) && active <= 1 &&
+              floor < LC_COLLECTION_SNAPSHOT_BIT &&
+              strlen(id) < LC_XID_STRING_SIZE;
       if (valid) {
         char *from =
             lc_pouch_path_join(&work->pouch->allocator, source, relative);
@@ -591,6 +631,8 @@ static int rc_inventory(lc_pouch_recode *work, const char *source,
         lc_free_with_allocator(&work->pouch->allocator, from);
         lc_free_with_allocator(&work->pouch->allocator, owner);
         valid = rc == LC_OK;
+        if (valid)
+          work->files[work->count - 1U].output_floor = floor;
       }
       lc_free_with_allocator(&work->pouch->allocator, relative);
       relative = NULL;
@@ -602,7 +644,7 @@ static int rc_inventory(lc_pouch_recode *work, const char *source,
       id = NULL;
     }
     if (!valid || fgetc(fp) != EOF || ferror(fp))
-      rc = rc != LC_OK ? rc : rc_journal_error(error);
+      rc = rc != LC_OK ? rc : lc_pouch_recode_journal_error(error);
     (void)fclose(fp);
     goto done;
   }
@@ -616,29 +658,30 @@ static int rc_inventory(lc_pouch_recode *work, const char *source,
     qsort(work->files, work->count, sizeof(*work->files), rc_compare);
   if (rc != LC_OK)
     goto done;
-  fp = rc_create(tmp);
+  fp = lc_pouch_recode_create(tmp);
   if (!fp) {
     rc = rc_error(error, "failed to create conversion inventory");
     goto done;
   }
-  valid = rc_put64(fp, (lc_u64)work->count);
+  valid = lc_pouch_recode_put64(fp, (lc_u64)work->count);
   for (i = 0; valid && i < work->count; ++i) {
     file = &work->files[i];
     valid = rc_put_string(fp, file->source + base) &&
             rc_put_string(fp, file->scope + base) &&
             rc_put_string(fp, file->ns) &&
             rc_put_string(fp, file->collection_id) &&
-            rc_put64(fp, (lc_u64)file->active);
+            lc_pouch_recode_put64(fp, (lc_u64)file->active) &&
+            lc_pouch_recode_put64(fp, file->output_floor);
   }
-  rc = rc_commit(fp, tmp, path, directory, valid, error);
+  rc = lc_pouch_recode_commit(fp, tmp, path, directory, valid, error);
 done:
   lc_free_with_allocator(&work->pouch->allocator, path);
   lc_free_with_allocator(&work->pouch->allocator, tmp);
   return rc;
 }
 
-static char *rc_progress(lc_pouch_recode *work, const char *directory,
-                         size_t index, const char *suffix) {
+char *lc_pouch_recode_progress(lc_pouch_recode *work, const char *directory,
+                               size_t index, const char *suffix) {
   char leaf[64];
   (void)snprintf(leaf, sizeof(leaf), "%lu.%s", (unsigned long)index, suffix);
   return lc_pouch_path_join(&work->pouch->allocator, directory, leaf);
@@ -655,10 +698,10 @@ static int rc_install(const char *directory, const char *payload,
   if ((lc_u64)st.st_ino != after) {
     if ((lc_u64)st.st_ino != before || stat(payload, &staged) != 0 ||
         (lc_u64)staged.st_ino != after)
-      return rc_journal_error(error);
+      return lc_pouch_recode_journal_error(error);
     if (rename(payload, source) != 0)
       return rc_error(error, "failed to install converted segment");
-    rc = rc_phase(phase, error);
+    rc = lc_pouch_recode_phase(phase, error);
     if (rc != LC_OK)
       return rc;
   }
@@ -681,8 +724,8 @@ static int rc_segment(lc_pouch_recode *work, size_t index,
                       const char *directory, const char *payload,
                       lc_error *error) {
   lc_pouch_recode_file *file = &work->files[index];
-  char *path = rc_progress(work, directory, index, "map");
-  char *refs = rc_progress(work, directory, index, "refs");
+  char *path = lc_pouch_recode_progress(work, directory, index, "map");
+  char *refs = lc_pouch_recode_progress(work, directory, index, "refs");
   char *tmp =
       lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
   char *target;
@@ -697,24 +740,38 @@ static int rc_segment(lc_pouch_recode *work, size_t index,
   }
   fp = fopen(path, "rb");
   if (fp) {
-    valid = rc_get64(fp, &before) && rc_get64(fp, &after) &&
-            rc_get64(fp, &input) && rc_get64(fp, &output) &&
-            rc_get64(fp, &has_refs) && has_refs <= 1 && rc_get64(fp, &count) &&
+    valid = lc_pouch_recode_get64(fp, &before) &&
+            lc_pouch_recode_get64(fp, &after) &&
+            lc_pouch_recode_get64(fp, &input) &&
+            lc_pouch_recode_get64(fp, &output) &&
+            lc_pouch_recode_get64(fp, &has_refs) && has_refs <= 1 &&
+            lc_pouch_recode_get64(fp, &count) &&
             fstat(fileno(fp), &journal_st) == 0 && journal_st.st_size >= 48 &&
-            count == (lc_u64)(journal_st.st_size - 48) / 16 &&
-            (journal_st.st_size - 48) % 16 == 0 &&
+            count == (lc_u64)(journal_st.st_size - 48) / 56 &&
+            (journal_st.st_size - 48) % 56 == 0 &&
             count <= (size_t)-1 / sizeof(*file->offsets);
     for (i = 0; valid && i < count; ++i) {
       lc_u64 old_offset, new_offset;
-      valid = rc_get64(fp, &old_offset) && rc_get64(fp, &new_offset);
+      valid = lc_pouch_recode_get64(fp, &old_offset) &&
+              lc_pouch_recode_get64(fp, &new_offset);
       if (valid) {
         rc = lc_pouch_recode_offset_add(work, file, old_offset, new_offset,
                                         error);
-        valid = rc == LC_OK;
+        valid =
+            rc == LC_OK &&
+            lc_pouch_recode_get64(fp,
+                                  &file->offsets[file->count - 1U].segment) &&
+            lc_pouch_recode_get64(fp,
+                                  &file->offsets[file->count - 1U].stored) &&
+            lc_pouch_recode_get64(fp, &file->offsets[file->count - 1U].units) &&
+            lc_pouch_recode_get64(
+                fp, &file->offsets[file->count - 1U].first_segment) &&
+            lc_pouch_recode_get64(
+                fp, &file->offsets[file->count - 1U].first_offset);
       }
     }
     if (!valid || fgetc(fp) != EOF || ferror(fp))
-      rc = rc != LC_OK ? rc : rc_journal_error(error);
+      rc = rc != LC_OK ? rc : lc_pouch_recode_journal_error(error);
     (void)fclose(fp);
     if (rc == LC_OK) {
       file->has_refs = (int)has_refs;
@@ -759,27 +816,33 @@ static int rc_segment(lc_pouch_recode *work, size_t index,
   }
   before = (lc_u64)source_st.st_ino;
   after = (lc_u64)target_st.st_ino;
-  fp = rc_create(tmp);
+  fp = lc_pouch_recode_create(tmp);
   if (!fp) {
     rc = rc_error(error, "failed to create conversion offset map");
     goto done;
   }
-  valid = rc_put64(fp, before) && rc_put64(fp, after) &&
-          rc_put64(fp, work->input_bytes - input) &&
-          rc_put64(fp, work->output_bytes - output) &&
-          rc_put64(fp, (lc_u64)file->has_refs) &&
-          rc_put64(fp, (lc_u64)file->count);
+  valid = lc_pouch_recode_put64(fp, before) &&
+          lc_pouch_recode_put64(fp, after) &&
+          lc_pouch_recode_put64(fp, work->input_bytes - input) &&
+          lc_pouch_recode_put64(fp, work->output_bytes - output) &&
+          lc_pouch_recode_put64(fp, (lc_u64)file->has_refs) &&
+          lc_pouch_recode_put64(fp, (lc_u64)file->count);
   for (i = 0; valid && i < file->count; ++i)
-    valid = rc_put64(fp, file->offsets[i].before) &&
-            rc_put64(fp, file->offsets[i].after);
-  rc = rc_commit(fp, tmp, path, directory, valid, error);
+    valid = lc_pouch_recode_put64(fp, file->offsets[i].before) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].after) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].segment) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].stored) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].units) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].first_segment) &&
+            lc_pouch_recode_put64(fp, file->offsets[i].first_offset);
+  rc = lc_pouch_recode_commit(fp, tmp, path, directory, valid, error);
   if (rc == LC_OK)
-    rc = rc_phase(LC_POUCH_RECODE_SEGMENT_READY, error);
+    rc = lc_pouch_recode_phase(LC_POUCH_RECODE_SEGMENT_READY, error);
   if (rc == LC_OK)
     rc = rc_install(directory, payload, file->source, before, after,
                     LC_POUCH_RECODE_SEGMENT_RENAMED, error);
   if (rc == LC_OK)
-    rc = rc_phase(LC_POUCH_RECODE_SEGMENT_INSTALLED, error);
+    rc = lc_pouch_recode_phase(LC_POUCH_RECODE_SEGMENT_INSTALLED, error);
 done:
   lc_free_with_allocator(&work->pouch->allocator, path);
   lc_free_with_allocator(&work->pouch->allocator, refs);
@@ -791,7 +854,7 @@ static int rc_references(lc_pouch_recode *work, size_t index,
                          const char *directory, const char *payload,
                          lc_error *error) {
   lc_pouch_recode_file *file = &work->files[index];
-  char *path = rc_progress(work, directory, index, "refs");
+  char *path = lc_pouch_recode_progress(work, directory, index, "refs");
   char *tmp =
       lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
   char *target;
@@ -807,12 +870,13 @@ static int rc_references(lc_pouch_recode *work, size_t index,
   }
   fp = fopen(path, "rb");
   if (fp) {
-    valid = rc_get64(fp, &before) && rc_get64(fp, &after) && fgetc(fp) == EOF &&
+    valid = lc_pouch_recode_get64(fp, &before) &&
+            lc_pouch_recode_get64(fp, &after) && fgetc(fp) == EOF &&
             !ferror(fp);
     (void)fclose(fp);
     rc = valid ? rc_install(directory, payload, file->source, before, after,
                             LC_POUCH_RECODE_REFS_RENAMED, error)
-               : rc_journal_error(error);
+               : lc_pouch_recode_journal_error(error);
     goto done;
   }
   if (errno != ENOENT) {
@@ -843,20 +907,20 @@ static int rc_references(lc_pouch_recode *work, size_t index,
   }
   before = (lc_u64)source_st.st_ino;
   after = (lc_u64)target_st.st_ino;
-  fp = rc_create(tmp);
+  fp = lc_pouch_recode_create(tmp);
   if (!fp) {
     rc = rc_error(error, "failed to create reference receipt");
     goto done;
   }
-  valid = rc_put64(fp, before) && rc_put64(fp, after);
-  rc = rc_commit(fp, tmp, path, directory, valid, error);
+  valid = lc_pouch_recode_put64(fp, before) && lc_pouch_recode_put64(fp, after);
+  rc = lc_pouch_recode_commit(fp, tmp, path, directory, valid, error);
   if (rc == LC_OK)
-    rc = rc_phase(LC_POUCH_RECODE_REFS_READY, error);
+    rc = lc_pouch_recode_phase(LC_POUCH_RECODE_REFS_READY, error);
   if (rc == LC_OK)
     rc = rc_install(directory, payload, file->source, before, after,
                     LC_POUCH_RECODE_REFS_RENAMED, error);
   if (rc == LC_OK)
-    rc = rc_phase(LC_POUCH_RECODE_REFS_INSTALLED, error);
+    rc = lc_pouch_recode_phase(LC_POUCH_RECODE_REFS_INSTALLED, error);
 done:
   lc_free_with_allocator(&work->pouch->allocator, path);
   lc_free_with_allocator(&work->pouch->allocator, tmp);
@@ -866,7 +930,7 @@ done:
 static int rc_query_id(lc_pouch_recode *work, const char *directory,
                        size_t index, const char *scope,
                        char id[LC_XID_STRING_SIZE], lc_error *error) {
-  char *saved = rc_progress(work, directory, index, "query-id");
+  char *saved = lc_pouch_recode_progress(work, directory, index, "query-id");
   char *path = lc_pouch_path_join(&work->pouch->allocator, scope, "order");
   lc_collection_order order;
   FILE *fp;
@@ -882,7 +946,7 @@ static int rc_query_id(lc_pouch_recode *work, const char *directory,
     if (fread(id, 1, LC_XID_STRING_SIZE, fp) != LC_XID_STRING_SIZE ||
         fgetc(fp) != EOF || ferror(fp) || id[LC_XID_STRING_SIZE - 1] ||
         (id[0] && !lc_xid_is_valid(id)))
-      rc = rc_journal_error(error);
+      rc = lc_pouch_recode_journal_error(error);
     (void)fclose(fp);
     goto done;
   }
@@ -954,7 +1018,7 @@ static int rc_heads(lc_pouch_recode *work, const char *directory,
     rc = rc_query_id(work, directory, i, file->scope, query_id, error);
     if (rc != LC_OK)
       break;
-    saved = rc_progress(work, directory, i, "head");
+    saved = lc_pouch_recode_progress(work, directory, i, "head");
     head = lc_pouch_path_join(&work->pouch->allocator, file->scope, "head");
     tmp = lc_pouch_path_join(&work->pouch->allocator, directory, "journal.tmp");
     if (!saved || !head || !tmp)
@@ -992,7 +1056,7 @@ static int rc_heads(lc_pouch_recode *work, const char *directory,
         rc = lc_collection_recode_finish(work, file->scope, file->scope,
                                          file->collection_id, query_id, error);
       if (rc == LC_OK)
-        rc = rc_phase(LC_POUCH_RECODE_HEAD, error);
+        rc = lc_pouch_recode_phase(LC_POUCH_RECODE_HEAD, error);
     }
     lc_free_with_allocator(&work->pouch->allocator, saved);
     lc_free_with_allocator(&work->pouch->allocator, head);
@@ -1099,9 +1163,22 @@ int lc_pouch_recode_build(lc_pouch *pouch, const char *source,
   if (rc == LC_OK)
     rc = rc_inventory(&work, source, directory, error);
   if (rc == LC_OK)
-    rc = rc_phase(LC_POUCH_RECODE_COPIED, error);
+    rc = lc_pouch_recode_phase(LC_POUCH_RECODE_COPIED, error);
+  if (rc == LC_OK)
+    rc = lc_collection_recode_references(&work, directory, error);
+  for (i = work.count; rc == LC_OK && i > 0; --i)
+    if (!work.files[i - 1U].collection_id[0])
+      rc = rc_segment(&work, i - 1U, directory, payload, error);
+  /* A metadata alias can reference the snapshot body. Within each class,
+   * physical children precede their unit indexes and publication records. */
   for (i = 0; rc == LC_OK && i < work.count; ++i)
-    rc = rc_segment(&work, i, directory, payload, error);
+    if (work.files[i].collection_id[0] &&
+        !strncmp(work.files[i].leaf, "snapshot-", 9))
+      rc = lc_collection_recode_segment(&work, i, directory, error);
+  for (i = 0; rc == LC_OK && i < work.count; ++i)
+    if (work.files[i].collection_id[0] &&
+        !strncmp(work.files[i].leaf, "seg-", 4))
+      rc = lc_collection_recode_segment(&work, i, directory, error);
   /* Prepared reference replacements must be installed before another file
    * reads their payload descriptors. rc_references installs its own receipt
    * before doing new work; at most one prepared payload exists. */
@@ -1121,6 +1198,7 @@ int lc_pouch_recode_build(lc_pouch *pouch, const char *source,
     lc_free_with_allocator(&pouch->allocator, file->ns);
     lc_free_with_allocator(&pouch->allocator, file->leaf);
     lc_free_with_allocator(&pouch->allocator, file->offsets);
+    lc_free_with_allocator(&pouch->allocator, file->references);
   }
   lc_free_with_allocator(&pouch->allocator, work.files);
   lc_free_with_allocator(&pouch->allocator, payload);

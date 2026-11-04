@@ -99,8 +99,9 @@ Compression omission inherits the existing root's stored mode; only new roots
 default to `none`. Explicit `none`/`zlib` requests synchronous whole-root
 conversion when different. Competing writers cause a warning and use of the
 stored mode, while conversion errors fail the open. See
-[compression changes on open](pouch-compression.md). Conversion replaces one
-segment or snapshot at a time. Interrupted work resumes even if the next open
+[compression changes on open](pouch-compression.md). Conversion retires one
+source segment or snapshot at a time; indexed collections roll their converted
+output into final canonical parts. Interrupted work resumes even if the next open
 omits compression; no client is admitted to a partly converted root.
 
 The selected typed setting always wins. For C callers,

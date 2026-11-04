@@ -1291,7 +1291,8 @@ Omitted compression inherits the stored mode (none for a new root). Explicit
 `none` or `zlib` converts the entire root synchronously when exclusive ownership
 is available; other active writers cause a warning and use of the stored mode.
 Conversion preserves logical identities and retained history, streams payloads
-in bounded chunks, replaces one segment or snapshot at a time, and resumes any
+in bounded chunks, retires one source segment or snapshot at a time, and rolls
+indexed collection output into final canonical parts. It resumes any
 interrupted conversion before opening, even when compression is omitted. It
 does not build a second payload tree. See
 [compression changes on open](pouch-compression.md) for space and recovery rules.
