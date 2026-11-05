@@ -274,6 +274,12 @@ add_test(NAME coverage_pkgconfig_metadata_test
     -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
     -P "${CMAKE_SOURCE_DIR}/tests/coverage_pkgconfig_metadata_test.cmake"
 )
+add_test(NAME sdk_dist_dir_test COMMAND "${CMAKE_COMMAND}"
+  -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+  -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
+  -P "${CMAKE_SOURCE_DIR}/tests/sdk_dist_dir_test.cmake")
+set_tests_properties(sdk_dist_dir_test PROPERTIES
+  LABELS "unit;lifecycle-host;packaging" TIMEOUT 10)
 
 add_test(NAME coverage_gcov_toolchain_test
   COMMAND "${CMAKE_COMMAND}"
