@@ -27,7 +27,7 @@
 
 typedef struct allocations {
   size_t live;
-  size_t maximum, denied;
+  size_t maximum, denied, deny_size;
   int fail;
 } allocations;
 
@@ -660,8 +660,9 @@ static void test_uncertain_sync_retains_cross_api_retry_identity(void **state) {
 
 static void *allocate(void *context, size_t size) {
   allocations *stats = context;
-  void *bytes = stats->fail ? NULL : malloc(size);
-  if (stats->fail)
+  int denied = stats->fail || (stats->deny_size && size == stats->deny_size);
+  void *bytes = denied ? NULL : malloc(size);
+  if (denied)
     ++stats->denied;
   if (bytes != NULL && size > stats->maximum)
     stats->maximum = size;
@@ -684,8 +685,9 @@ static void *resize(void *context, void *bytes, size_t size) {
     release(context, bytes);
     return NULL;
   }
-  void *result = stats->fail ? NULL : realloc(bytes, size);
-  if (stats->fail)
+  int denied = stats->fail || (stats->deny_size && size == stats->deny_size);
+  void *result = denied ? NULL : realloc(bytes, size);
+  if (denied)
     ++stats->denied;
   if (result != NULL && size > stats->maximum)
     stats->maximum = size;
@@ -940,7 +942,7 @@ static int stream_output(lc_sink *sink, const void *bytes, size_t length,
   stream_check *check = sink->impl;
   const unsigned char *p = bytes;
   (void)error;
-  assert_true(length <= 16384);
+  assert_true(length <= 65536);
   for (size_t i = 0; i < length; ++i, ++check->offset) {
     unsigned char expected;
     if (check->offset == STREAM_BYTES + 9) {
@@ -1103,29 +1105,44 @@ static void test_stream_units_survive_compression_conversion(void **state) {
 
 typedef struct direct_check {
   fixture *f;
-  size_t offset;
+  size_t offset, calls, largest, fail_at;
+  int initial_empty;
 } direct_check;
 
 static int direct_output(lc_sink *sink, const void *bytes, size_t length,
                          lc_error *error) {
   direct_check *output = sink->impl;
   const unsigned char *p = bytes;
-  (void)error;
-  assert_true(length <= 16384);
+  assert_true(length <= 65536);
+  ++output->calls;
+  if (length > output->largest)
+    output->largest = length;
+  if (output->calls == output->fail_at) {
+    lc_error_set(error, LC_ERR_TRANSPORT, 0, "injected read sink rejection",
+                 NULL, NULL, NULL);
+    return 0;
+  }
   for (size_t i = 0; i < length; ++i, ++output->offset) {
-    assert_true(output->offset <= BODY_BYTES);
-    assert_int_equal(p[i], output->offset == BODY_BYTES
-                               ? '\n'
-                               : output->f->body[output->offset]);
+    size_t at = output->offset;
+    if (output->initial_empty) {
+      if (at < 3U) {
+        assert_int_equal(p[i], "{}\n"[at]);
+        continue;
+      }
+      at -= 3U;
+    }
+    assert_true(at <= BODY_BYTES);
+    assert_int_equal(p[i], at == BODY_BYTES ? '\n' : output->f->body[at]);
   }
   return 1;
 }
 
 static void direct_verify(fixture *f, int filter, int expected) {
-  direct_check output = {f, 0};
+  direct_check output = {0};
   lc_sink sink = {0};
   lc_collection_read_opts options = {0};
   lc_collection_read_res result;
+  output.f = f;
   options.selector_lql = filter ? "exists{/v}" : NULL;
   sink.write = direct_output;
   sink.impl = &output;
@@ -1149,6 +1166,98 @@ static lc_collection_order_row direct_row(fixture *f) {
   check(f, lc_collection_order_find(&c->order, 1, &row, &found, &f->error));
   assert_true(found);
   return row;
+}
+
+static void test_direct_reader_bounded_chunks_failure_and_resume(void **state) {
+  fixture *f = *state;
+  allocations *stats = &f->allocation_stats;
+  lc_collection_append_res appended;
+  unsigned long random = 17;
+  for (size_t i = 6; i < BODY_BYTES - 2U; ++i)
+    f->body[i] = (char)stream_next(&random);
+  close_owners(f);
+  check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+  f->allocator.malloc_fn = allocate;
+  f->allocator.realloc_fn = resize;
+  f->allocator.free_fn = release;
+  f->allocator.context = stats;
+  f->segment_target = 2U * 1024U * 1024U;
+  for (int mode = 0; mode < 4; ++mode) {
+    char cursor[LC_COLLECTION_CURSOR_BYTES];
+    direct_check output = {0};
+    lc_sink sink = {0};
+    lc_collection_read_opts options = {0};
+    lc_collection_read_res result;
+    snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/read-chunks-%d",
+             f->root, mode);
+    open_owners(f, mode, 1);
+    check(f, push(f->collection, "small-read", "{}", 2, &appended, &f->error));
+    check(f, push(f->collection, "bounded-read", f->body, BODY_BYTES, &appended,
+                  &f->error));
+    assert_int_equal(appended.position, 2);
+    output.f = f;
+    output.initial_empty = 1;
+    sink.impl = &output;
+    sink.write = direct_output;
+    size_t live = stats->live;
+    stats->deny_size = 65536;
+    stats->denied = 0;
+    lc_collection_read_res_init(&result);
+    int rc = lc_collection_read(f->collection, NULL, &sink, &result, &f->error);
+    stats->deny_size = 0;
+    assert_int_equal(rc, LC_ERR_NOMEM);
+    assert_int_equal(stats->denied, 1);
+    assert_int_equal(output.offset, 3);
+    assert_int_equal(result.completed_records, 1);
+    assert_int_equal(result.last_examined_position, 1);
+    assert_non_null(result.resume_cursor);
+    assert_true(strlen(result.resume_cursor) < sizeof(cursor));
+    strcpy(cursor, result.resume_cursor);
+    lc_collection_read_res_cleanup(&result);
+    lc_error_cleanup(&f->error);
+    lc_error_init(&f->error);
+    assert_int_equal(stats->live, live);
+
+    memset(&output, 0, sizeof(output));
+    output.f = f;
+    output.fail_at = 2;
+    options.cursor = cursor;
+    stats->maximum = 0;
+    lc_collection_read_res_init(&result);
+    rc = lc_collection_read(f->collection, &options, &sink, &result, &f->error);
+    assert_int_equal(rc, LC_ERR_TRANSPORT);
+    assert_int_equal(output.offset, 65536);
+    assert_false(result.complete);
+    assert_int_equal(result.completed_records, 0);
+    assert_int_equal(result.last_examined_position, 1);
+    assert_null(result.checkpoint_cursor);
+    assert_non_null(result.resume_cursor);
+    assert_true(strlen(result.resume_cursor) < sizeof(cursor));
+    strcpy(cursor, result.resume_cursor);
+    lc_collection_read_res_cleanup(&result);
+    lc_error_cleanup(&f->error);
+    lc_error_init(&f->error);
+
+    memset(&output, 0, sizeof(output));
+    output.f = f;
+    options.cursor = cursor;
+    lc_collection_read_res_init(&result);
+    check(f, lc_collection_read(f->collection, &options, &sink, &result,
+                                &f->error));
+    assert_true(result.complete);
+    assert_int_equal(result.completed_records, 1);
+    assert_int_equal(output.offset, BODY_BYTES + 1U);
+    assert_int_equal(output.largest, 65536);
+    /* Four codec-sized deliveries and LF; avoid many small decode/callback
+     * cycles while keeping the bound independent of the entry length. */
+    assert_int_equal(output.calls, BODY_BYTES / 65536U + 1U);
+    assert_true(stats->maximum < BODY_BYTES);
+    lc_collection_read_res_cleanup(&result);
+    direct_verify(f, 1, LC_OK);
+    close_owners(f);
+    assert_int_equal(stats->live, 0);
+  }
+  memset(&f->allocator, 0, sizeof(f->allocator));
 }
 
 static void
@@ -2278,6 +2387,9 @@ int main(int argc, char **argv) {
           teardown),
       cmocka_unit_test_setup_teardown(
           test_private_seal_allows_peer_publication_and_retry, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_direct_reader_bounded_chunks_failure_and_resume, setup,
+          teardown),
       cmocka_unit_test_setup_teardown(
           test_direct_units_filter_metadata_corruption_and_rebuild, setup,
           teardown),

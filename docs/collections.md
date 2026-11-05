@@ -67,7 +67,10 @@ ordered iterator. An unfiltered read does not parse or reconstruct JSON for
 presentation. An exact indexed predicate can use that same payload path;
 residual LQL evaluation is the explicitly additional work described below.
 
-Reuse bounded per-read metadata/chunk buffers. Metadata delivery must not
+Reads reuse one heap chunk for encoded input/output transfer, initially 16 KiB
+and growing at most once to 64 KiB for larger entries, plus bounded metadata and
+codec scratch. This memory stays bounded independently of entry size.
+Metadata delivery must not
 introduce per-entry clients, threads, network requests, whole-object buffers,
 or mandatory per-entry heap allocation on the native path. This is direct
 stored-byte delivery, not a claim of kernel zero-copy with crypto enabled.

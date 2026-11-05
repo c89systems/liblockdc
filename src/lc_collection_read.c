@@ -17,7 +17,10 @@
 #include <zlib.h>
 
 #define LC_CR_TOKEN_BYTES 136U
-#define LC_CR_CHUNK_BYTES 16384U
+/* Small reads retain their original allocation. Grow once to the codec
+ * transfer size for large entries, independently of total entry length. */
+#define LC_CR_INITIAL_CHUNK_BYTES 16384U
+#define LC_CR_CHUNK_BYTES 65536U
 #define LC_CR_PROGRESS_PAGES 4U
 
 typedef struct lc_collection_reader {
@@ -32,7 +35,7 @@ typedef struct lc_collection_reader {
   lc_collection_unit unit;
   int direct_unit;
   unsigned char *prefix;
-  size_t prefix_size;
+  size_t prefix_size, chunk_capacity;
   lc_collection_payload payload;
   lc_collection_query_plan plan;
   int reader_fd;
@@ -313,9 +316,9 @@ static int lc_cr_unit_record(lc_collection_reader *reader,
     if (end > reader->file_end)
       goto corrupt;
   }
-  reader->prefix_size = row->stored_bytes < LC_CR_CHUNK_BYTES
+  reader->prefix_size = row->stored_bytes < reader->chunk_capacity
                             ? (size_t)row->stored_bytes
-                            : LC_CR_CHUNK_BYTES;
+                            : reader->chunk_capacity;
   rc = lc_collection_unit_read_prefix(reader->record_fd, row->unit_offset,
                                       row->stored_bytes, unit, reader->prefix,
                                       reader->prefix_size, reader->error);
@@ -617,8 +620,9 @@ int lc_collection_read_method(lc_collection *self,
         (char *)lc_alloc_with_allocator(NULL, LC_COLLECTION_CURSOR_BYTES);
     out->checkpoint_cursor =
         (char *)lc_alloc_with_allocator(NULL, LC_COLLECTION_CURSOR_BYTES);
+    reader.chunk_capacity = LC_CR_INITIAL_CHUNK_BYTES;
     chunk = (unsigned char *)lc_alloc_with_allocator(&collection->allocator,
-                                                     LC_CR_CHUNK_BYTES);
+                                                     reader.chunk_capacity);
     reader.prefix = chunk;
     if (out->resume_cursor == NULL || out->checkpoint_cursor == NULL ||
         chunk == NULL) {
@@ -695,6 +699,19 @@ int lc_collection_read_method(lc_collection *self,
           continue;
         }
       }
+      if (rc == LC_OK && reader.chunk_capacity < LC_CR_CHUNK_BYTES &&
+          rows[i].bytes > reader.chunk_capacity) {
+        unsigned char *grown = (unsigned char *)lc_realloc_with_allocator(
+            &collection->allocator, chunk, LC_CR_CHUNK_BYTES);
+        if (grown == NULL)
+          rc = lc_collection_failure(
+              error, LC_ERR_NOMEM, NULL,
+              "failed to grow bounded collection read buffer");
+        else {
+          chunk = reader.prefix = grown;
+          reader.chunk_capacity = LC_CR_CHUNK_BYTES;
+        }
+      }
       reader.direct_unit = rows[i].unit_segment != 0U;
       reader.prefix_size = 0;
 #if defined(__linux__)
@@ -708,7 +725,7 @@ int lc_collection_read_method(lc_collection *self,
         rc = lc_collection_record_ref_prefix(
             collection, rows[i].segment, rows[i].record_offset,
             &reader.record_fd, &reader.file_segment, &reader.file_end,
-            &reader.record, reader.prefix, LC_CR_CHUNK_BYTES,
+            &reader.record, reader.prefix, reader.chunk_capacity,
             &reader.prefix_size, error);
 #if defined(__linux__)
       /* Following an older visible version can close and reopen this same
@@ -754,7 +771,7 @@ int lc_collection_read_method(lc_collection *self,
         if (rc == LC_OK)
           rc = lc_cr_body_open(&reader);
         while (rc == LC_OK) {
-          rc = lc_cr_body_read(&reader, chunk, LC_CR_CHUNK_BYTES, &got);
+          rc = lc_cr_body_read(&reader, chunk, reader.chunk_capacity, &got);
           if (rc != LC_OK || got == 0U)
             break;
           rc = lc_cr_write(&reader, chunk, got);

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Deliver large collection reads in bounded 64 KiB heap chunks matching the
+  codec transfer size, retaining the 16 KiB allocation for small reads.
+  Preserve retry cursors, filtering and integrity checks after read failures.
 - Upgrade lonejson to 0.46.0 and libpslog to 0.13.0, including all target SDK
   checksums and the matching lonejson Lua dependency. Lonejson retains ABI 26.
 - Upgrade liblql to 0.4.1 from c89systems, with verified SDK checksums for all
