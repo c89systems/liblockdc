@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Upgrade lonejson to 0.46.0 and libpslog to 0.13.0, including all target SDK
+  checksums and the matching lonejson Lua dependency. Lonejson retains ABI 26.
 - Upgrade liblql to 0.4.1 from c89systems, with verified SDK checksums for all
   supported targets. Its public C API and shared-library ABI remain unchanged.
 

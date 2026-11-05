@@ -237,26 +237,26 @@ fi
 lonejson_asset_name="liblonejson-$lonejson_version-${preset#deps-}.tar.gz"
 lonejson_download_url="https://github.com/c89systems/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
 case "$lonejson_asset_name" in
-  liblonejson-0.45.0-x86_64-linux-gnu.tar.gz)
-    lonejson_asset_hash=aef11c4511bb6aa8ed4e0646204e14b7934affd6e5cec5b8e8bff36e80217826
+  liblonejson-0.46.0-x86_64-linux-gnu.tar.gz)
+    lonejson_asset_hash=068c56590669dc152010407ddee7221b40bed587404494810c7d818e11146d1b
     ;;
-  liblonejson-0.45.0-x86_64-linux-musl.tar.gz)
-    lonejson_asset_hash=823efad9719011af0602cefacf0506ac603bfb54d5986883fcabed60db93544b
+  liblonejson-0.46.0-x86_64-linux-musl.tar.gz)
+    lonejson_asset_hash=fc1f49db3956f50f098580442e29845e87b28e565d538dab8212f2d7239d3457
     ;;
-  liblonejson-0.45.0-aarch64-linux-gnu.tar.gz)
-    lonejson_asset_hash=659cc67e2c26c9615f84fa6f1c26fae4a3a4b00980d8bbb02c04625b2facaf7e
+  liblonejson-0.46.0-aarch64-linux-gnu.tar.gz)
+    lonejson_asset_hash=5dd4e877624627ddd337e02461daf0821cc6527f8b6c703b0dea3ce61f7a38d7
     ;;
-  liblonejson-0.45.0-aarch64-linux-musl.tar.gz)
-    lonejson_asset_hash=96e020ce3dab9de5dc13a64e83a278b7519cdf7fcc2d3c93fdfc740fe5fb0cd5
+  liblonejson-0.46.0-aarch64-linux-musl.tar.gz)
+    lonejson_asset_hash=014611825f2c6f2ae38cb896ea633163ee9815678bfa9b2ec8328f5bf3f90353
     ;;
-  liblonejson-0.45.0-armhf-linux-gnu.tar.gz)
-    lonejson_asset_hash=ab2f89eb4054fbb1b4cd85b6be5d9d2005b364459ba362b910bc35ac1c6511b5
+  liblonejson-0.46.0-armhf-linux-gnu.tar.gz)
+    lonejson_asset_hash=24739d2b08660f8530e37b124d2897c9e5d77b3e6709231307f3ee4e89365f85
     ;;
-  liblonejson-0.45.0-armhf-linux-musl.tar.gz)
-    lonejson_asset_hash=8b103a732181b06d90fc5f39c074a887969522d29e0d9006b30982f31969982d
+  liblonejson-0.46.0-armhf-linux-musl.tar.gz)
+    lonejson_asset_hash=2cc2df629bdcfb42bcf0c5c6760e29565777a57168222dc986f0a4aeb9339a29
     ;;
-  liblonejson-0.45.0-arm64-apple-darwin.tar.gz)
-    lonejson_asset_hash=9dc6b277241068a2ab1a737357cf18982c5612ec43280f161044ce719aed50dc
+  liblonejson-0.46.0-arm64-apple-darwin.tar.gz)
+    lonejson_asset_hash=d3e12ce3904974fe2ea51bce639f12645102c11fca137a85214fbb7dea5ba34a
     ;;
   *)
     printf 'unsupported lonejson release asset: %s\n' "$lonejson_asset_name" >&2
@@ -298,26 +298,26 @@ esac
 pslog_asset_name="libpslog-$pslog_version-${preset#deps-}.tar.gz"
 pslog_download_url="https://github.com/c89systems/libpslog/releases/download/v$pslog_version/$pslog_asset_name"
 case "$pslog_asset_name" in
-  libpslog-0.12.0-x86_64-linux-gnu.tar.gz)
-    pslog_asset_hash=21239262bc06eecb504e45e0902f374ccd86751dcb32087dd84af4d2553ea0e2
+  libpslog-0.13.0-x86_64-linux-gnu.tar.gz)
+    pslog_asset_hash=3fa68da666c70470f0f09041b05561f807cd241fae30421410033932d2b8c1c4
     ;;
-  libpslog-0.12.0-x86_64-linux-musl.tar.gz)
-    pslog_asset_hash=3a43206260bbf1095a363ffc4ddb5514dac2a621aa030db0e7f9b4364a93bb4d
+  libpslog-0.13.0-x86_64-linux-musl.tar.gz)
+    pslog_asset_hash=c195881181b1cbe08acb705ab91a8cd0e8cabe470c9fdb391b40820529836f80
     ;;
-  libpslog-0.12.0-aarch64-linux-gnu.tar.gz)
-    pslog_asset_hash=304575fa07f14e5ff4d7614f7c450a3e88a586d5f353352bff8b678ee739da76
+  libpslog-0.13.0-aarch64-linux-gnu.tar.gz)
+    pslog_asset_hash=d15b172c076324c05d7596cb7b01ba036c2d1aeb0eb7264bd4e77cc6c103c71f
     ;;
-  libpslog-0.12.0-aarch64-linux-musl.tar.gz)
-    pslog_asset_hash=72a3b4e1f89c339cadb996137a79db8ee6e67be1f580f482269f6b0088cda115
+  libpslog-0.13.0-aarch64-linux-musl.tar.gz)
+    pslog_asset_hash=44c295a5ade15ce30dcbca6ba7775b6ea521560941306312e33bbbfade2f8059
     ;;
-  libpslog-0.12.0-armhf-linux-gnu.tar.gz)
-    pslog_asset_hash=993461d481ec6c3912be29f5a0f95bcf5274aae6a1d2d698350e804c688122a9
+  libpslog-0.13.0-armhf-linux-gnu.tar.gz)
+    pslog_asset_hash=55bfb03089697d01abfad14bb631c6cc69bfc361f09e8e0064bba1f48c086290
     ;;
-  libpslog-0.12.0-armhf-linux-musl.tar.gz)
-    pslog_asset_hash=037fa1d56a01dc8b9fccf54960b8083337cbc5edfaa5f15d715f96413d1f6b77
+  libpslog-0.13.0-armhf-linux-musl.tar.gz)
+    pslog_asset_hash=5ba1d3c16f864a3c6010ece642b6ecaa85273c2ba282d72856c9e7af6ac6320e
     ;;
-  libpslog-0.12.0-arm64-apple-darwin.tar.gz)
-    pslog_asset_hash=a5945f2dc4ad16dd8a71572f40117ddfdfae371d185cb03dab5205cdf780c321
+  libpslog-0.13.0-arm64-apple-darwin.tar.gz)
+    pslog_asset_hash=7f3b8e89f7f1a3ac27d47cb92aa68c4989ed4c8cdb51c80c81692412ba75cacb
     ;;
   *)
     printf 'unsupported libpslog release asset: %s\n' "$pslog_asset_name" >&2

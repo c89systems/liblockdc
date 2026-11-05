@@ -246,8 +246,8 @@ The separately pinned dependencies are:
 | --- | --- | --- |
 | [cpkt](https://github.com/c89systems/cpkt) | 0.6.1 | Core SDK dependencies and Lua runtime |
 | [cpktdb](https://github.com/c89systems/cpktdb) | 0.3.1 | Optional PostgreSQL C89 facade and database SDK |
-| lonejson | 0.45.0 (ABI 26) | JSON parsing, mapping, and streaming |
-| libpslog | 0.12.0 | SDK diagnostics |
+| lonejson | 0.46.0 (ABI 26) | JSON parsing, mapping, and streaming |
+| libpslog | 0.13.0 | SDK diagnostics |
 | liblql | 0.4.1 | Pouch query support |
 | cmocka | 2.0.2 | Unit tests only; target-specific static library from cpkt |
 
@@ -600,7 +600,7 @@ This keeps lease identity, transaction identifiers, and related lifecycle state 
 
 ### JSON and lonejson
 
-`liblockdc` depends on `lonejson 0.45.0` with shared-library ABI `26`.
+`liblockdc` depends on `lonejson 0.46.0` with shared-library ABI `26`.
 `lonejson` is used for:
 
 - typed JSON response parsing for management, attachment, queue, namespace,
