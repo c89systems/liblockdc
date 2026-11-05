@@ -50,7 +50,11 @@ typedef struct lc_collection_chunks {
   int region_fd;
   /* Pin the first inode through final identity binding, including rollover.
    * Ownership is explicit so a zero-initialized chunks object owns no fd. */
-  int first_fd, first_fd_owned, first_sealed;
+  int first_fd, first_fd_owned;
+  /* Cross-inode sync is covered: either explicitly sealed, or finalized
+   * while active so any later rotation must seal it. Further writes clear it.
+   */
+  int first_sealed;
   lc_u64 bytes, extents;
   unsigned int height;
   lc_collection_index_append_fn append_index;

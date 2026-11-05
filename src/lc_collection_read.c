@@ -385,11 +385,11 @@ static int lc_cr_body_open(lc_collection_reader *reader) {
   reader->read_advice = advice;
   reader->file_changed = 0;
 #endif
-  if (reader->direct_unit)
-    return lc_collection_payload_open_unit(
+  if (reader->direct_unit || prefix_size)
+    return lc_collection_payload_open_prefix(
         &reader->payload, reader->call->collection, reader->record_fd,
-        &reader->record, &reader->unit, reader->prefix, prefix_size,
-        reader->error);
+        &reader->record, reader->direct_unit ? &reader->unit : NULL,
+        reader->prefix, prefix_size, reader->error);
   return lc_collection_payload_open(&reader->payload, reader->call->collection,
                                     reader->record_fd, &reader->record,
                                     reader->error);
@@ -696,6 +696,7 @@ int lc_collection_read_method(lc_collection *self,
         }
       }
       reader.direct_unit = rows[i].unit_segment != 0U;
+      reader.prefix_size = 0;
 #if defined(__linux__)
       reader.file_changed =
           (reader.direct_unit ? rows[i].unit_segment : rows[i].segment) !=
@@ -704,10 +705,11 @@ int lc_collection_read_method(lc_collection *self,
       if (rc == LC_OK && reader.direct_unit)
         rc = lc_cr_unit_record(&reader, &rows[i]);
       else if (rc == LC_OK)
-        rc = lc_collection_record_ref(collection, rows[i].segment,
-                                      rows[i].record_offset, &reader.record_fd,
-                                      &reader.file_segment, &reader.file_end,
-                                      &reader.record, error);
+        rc = lc_collection_record_ref_prefix(
+            collection, rows[i].segment, rows[i].record_offset,
+            &reader.record_fd, &reader.file_segment, &reader.file_end,
+            &reader.record, reader.prefix, LC_CR_CHUNK_BYTES,
+            &reader.prefix_size, error);
 #if defined(__linux__)
       /* Following an older visible version can close and reopen this same
        * segment, so its final identity alone cannot prove the advice survived.
@@ -715,6 +717,8 @@ int lc_collection_read_method(lc_collection *self,
       if (rc == LC_OK && reader.record.generation > reader.iter.generation)
         reader.file_changed = 1;
 #endif
+      if (rc == LC_OK && reader.record.generation > reader.iter.generation)
+        reader.prefix_size = 0;
       if (rc == LC_OK)
         rc = lc_collection_record_at(collection, reader.iter.generation,
                                      &reader.record_fd, &reader.file_segment,

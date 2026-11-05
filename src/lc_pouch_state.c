@@ -1,3 +1,9 @@
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "lc_pouch.h"
 
 #include "lc_api_internal.h"
@@ -18423,10 +18429,48 @@ static int lc_pouch_collection_record_text(char *out, size_t capacity,
   return 1;
 }
 
-int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
-                                    const char *container_leaf,
-                                    lc_pouch_collection_record *out,
-                                    lc_error *error) {
+static int lc_pouch_collection_read_pair(int fd, uint64_t offset,
+                                         void *metadata, size_t metadata_size,
+                                         void *body, size_t body_size,
+                                         lc_error *error) {
+  struct iovec parts[2];
+  size_t used;
+  ssize_t n;
+  int first = 0;
+  parts[0].iov_base = metadata;
+  parts[0].iov_len = metadata_size;
+  parts[1].iov_base = body;
+  parts[1].iov_len = body_size;
+  while (first < 2) {
+    if (!parts[first].iov_len) {
+      ++first;
+      continue;
+    }
+    n = preadv(fd, parts + first, 2 - first, (off_t)offset);
+    if (n < 0 && errno == EINTR)
+      continue;
+    if (n <= 0)
+      return lc_error_set(error, n ? LC_ERR_TRANSPORT : LC_ERR_PROTOCOL, 0L,
+                          "failed to read collection record prefix", NULL,
+                          "collection_corrupt", "pouch");
+    offset += (size_t)n;
+    used = (size_t)n;
+    while (first < 2 && used >= parts[first].iov_len) {
+      used -= parts[first].iov_len;
+      ++first;
+    }
+    if (first < 2) {
+      parts[first].iov_base = (unsigned char *)parts[first].iov_base + used;
+      parts[first].iov_len -= used;
+    }
+  }
+  return LC_OK;
+}
+
+static int lc_pouch_collection_record_read_internal(
+    int fd, uint64_t offset, uint64_t file_end, const char *container_leaf,
+    lc_pouch_collection_record *out, void *body_prefix, size_t capacity,
+    size_t *body_size, lc_error *error) {
   unsigned char prefix[LC_POUCH_STATE_RECORD_HEADER_BYTES];
   unsigned char bytes[128U + LC_POUCH_COLLECTION_META_BYTES];
   const unsigned char *meta;
@@ -18440,8 +18484,11 @@ int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
   size_t used;
   size_t binding_length;
   size_t i;
+  size_t prefetched = 0;
   uint64_t metadata_end;
   int rc;
+  if (body_size)
+    *body_size = 0;
   if (fd < 0 || out == NULL ||
       !lc_pouch_state_payload_container_is_valid(container_leaf)) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -18532,9 +18579,19 @@ int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
   if (header.payload_len > file_end - metadata_end) {
     goto corrupt;
   }
-  rc =
-      lc_pouch_collection_record_pread(fd, offset + sizeof(prefix), bytes,
-                                       header.key_len + header.meta_len, error);
+  if (body_prefix && body_size &&
+      header.type == LC_POUCH_STATE_RECORD_STATE_PUT) {
+    prefetched =
+        header.payload_len < capacity ? (size_t)header.payload_len : capacity;
+  }
+  if (prefetched)
+    rc = lc_pouch_collection_read_pair(fd, offset + sizeof(prefix), bytes,
+                                       header.key_len + header.meta_len,
+                                       body_prefix, prefetched, error);
+  else
+    rc = lc_pouch_collection_record_pread(fd, offset + sizeof(prefix), bytes,
+                                          header.key_len + header.meta_len,
+                                          error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -18754,12 +18811,32 @@ int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
     return rc;
   }
   out->published = 1;
+  if (body_size && !out->metadata_only)
+    *body_size = prefetched;
   return LC_OK;
 corrupt:
   memset(out, 0, sizeof(*out));
   return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                       "collection canonical state record is inconsistent", NULL,
                       "collection_corrupt", "pouch");
+}
+
+int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
+                                    const char *container_leaf,
+                                    lc_pouch_collection_record *out,
+                                    lc_error *error) {
+  return lc_pouch_collection_record_read_internal(
+      fd, offset, file_end, container_leaf, out, NULL, 0, NULL, error);
+}
+
+int lc_pouch_collection_record_read_prefix(int fd, uint64_t offset,
+                                           uint64_t file_end,
+                                           const char *container_leaf,
+                                           lc_pouch_collection_record *out,
+                                           void *prefix, size_t capacity,
+                                           size_t *size, lc_error *error) {
+  return lc_pouch_collection_record_read_internal(
+      fd, offset, file_end, container_leaf, out, prefix, capacity, size, error);
 }
 
 int lc_pouch_collection_record_check_body(

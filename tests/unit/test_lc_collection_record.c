@@ -1320,6 +1320,70 @@ static void test_unit_metadata_lengths_and_maximum_text(void **state) {
   assert_string_equal(decoded.descriptor, unit.descriptor);
 }
 
+static void
+test_contiguous_prefix_validates_metadata_and_truncation(void **state) {
+  fixture *f = *state;
+  const char *json =
+      "{\"event\":\"bounded prefix with no retained body buffer\"}";
+  lc_pouch_collection_record written, ordinary, prefixed, alias;
+  unsigned char prefix[256], expected[256], zero = 0;
+  size_t size;
+  for (int mode = 0; mode < 4; ++mode) {
+    open_case(f, mode, 0);
+    assert_int_equal(append_json(f, "prefix", json, 1, 1, &written), LC_OK);
+    uint64_t end = file_end(f);
+    assert_int_equal(lc_pouch_collection_record_read(f->fd, 0, end, leaf,
+                                                     &ordinary, &f->error),
+                     LC_OK);
+    assert_int_equal(lseek(f->fd, 7, SEEK_SET), 7);
+    for (size_t capacity = 0; capacity <= sizeof(prefix); capacity += 7) {
+      size_t wanted = written.stored_bytes < capacity
+                          ? (size_t)written.stored_bytes
+                          : capacity;
+      assert_int_equal(lc_pouch_collection_record_read_prefix(
+                           f->fd, 0, end, leaf, &prefixed, prefix, capacity,
+                           &size, &f->error),
+                       LC_OK);
+      assert_int_equal(size, wanted);
+      assert_memory_equal(&prefixed, &ordinary, sizeof(ordinary));
+      assert_int_equal(pread(f->fd, expected, wanted, written.payload_offset),
+                       wanted);
+      assert_memory_equal(prefix, expected, wanted);
+      assert_int_equal(lseek(f->fd, 0, SEEK_CUR), 7);
+    }
+    assert_int_equal(pwrite(f->fd, &zero, 1, 32), 1);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, 0, end, leaf, &prefixed, prefix, sizeof(prefix),
+                         &size, &f->error),
+                     LC_ERR_PROTOCOL);
+    assert_int_equal(size, 0);
+    clear_error(f);
+    assert_int_equal(pwrite(f->fd, "p", 1, 32), 1);
+    assert_int_equal(lc_pouch_collection_record_metadata(f->pouch, f->fd, leaf,
+                                                         &written, 1, 2, 0,
+                                                         &alias, &f->error),
+                     LC_OK);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, alias.record_offset, file_end(f), leaf,
+                         &prefixed, prefix, sizeof(prefix), &size, &f->error),
+                     LC_OK);
+    assert_true(prefixed.metadata_only);
+    assert_int_equal(size, 0);
+    /* A stale captured end must not let a partial vector read expose a
+     * prefix from a truncated published body as a successful record. */
+    assert_int_equal(ftruncate(f->fd, (off_t)end - 1), 0);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, 0, end, leaf, &prefixed, prefix, sizeof(prefix),
+                         &size, &f->error),
+                     LC_ERR_PROTOCOL);
+    assert_int_equal(size, 0);
+    clear_error(f);
+  }
+}
+
 static void test_chunk_cleanup_releases_owned_descriptors_once(void **state) {
   fixture *f = *state;
   lc_collection_chunks *chunks = calloc(1, sizeof(*chunks));
@@ -1350,6 +1414,9 @@ static void test_chunk_cleanup_releases_owned_descriptors_once(void **state) {
 
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(
+          test_contiguous_prefix_validates_metadata_and_truncation, setup,
+          teardown),
       cmocka_unit_test_setup_teardown(
           test_chunk_cleanup_releases_owned_descriptors_once, setup, teardown),
       cmocka_unit_test_setup_teardown(

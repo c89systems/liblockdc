@@ -143,6 +143,12 @@ int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
                                     const char *container_leaf,
                                     lc_pouch_collection_record *out,
                                     lc_error *error);
+/* Scatter bounded metadata and the caller-owned first body chunk together.
+ * Prefix bytes become usable only after all canonical metadata validates. */
+int lc_pouch_collection_record_read_prefix(int, uint64_t, uint64_t,
+                                           const char *,
+                                           lc_pouch_collection_record *, void *,
+                                           size_t, size_t *, lc_error *);
 /* Relocates a validated canonical record into a distinct append-only output
  * file. Payload ciphertext/compressed bytes and retry/deletion facts remain
  * unchanged; storage spans are rebased and metadata history is collapsed.

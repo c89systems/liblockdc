@@ -124,10 +124,17 @@ mode. Completed immutable first-inode data is synced outside append authority
 when already rotated. Publication checks again and retains a synchronous seal
 if a rotation raced preparation. Same-inode durable publication shares the
 ordinary commit sync.
+Final compression and private-file seals run before acquiring publication
+authority. A bounded final inline chunk acquires that authority only when its
+encoded bytes are ready, then retains it through publication. An exactly full
+codec frame waits for either the next input byte or commit, within the same
+fixed chunk bound.
 Rotation always seals the old segment before advancing the durable head,
 including unpublished reservations: their framing must survive recovery even
 when the producer aborts. Owners still sync any later private writes before
 publishing a reference from another inode.
+Units finalized before rotation are already covered by that seal; later writes
+invalidate this proof and require their own seal before publication.
 Range allocation owns rotation; the bounded index carry and publication that
 follow it do not rotate again merely for metadata overhead.
 
@@ -158,6 +165,10 @@ follow their canonical publication and unit index normally. Entry metadata
 updates clear the direct location; compaction can restore it after folding the
 metadata. All these locations are rebuilt from canonical records with the rest
 of the derived projection.
+Contiguous records also read metadata and their bounded first body chunk
+together into the existing consumer scratch. Historical metadata references
+discard that prefix before following the visible version; LQL replay still
+reads canonical bytes again after consuming the prefix.
 
 An advisory `.streams.lock` pin protects unfinished canonical extents. Compaction
 defers capture while a producer is live, then seals the capture boundary under

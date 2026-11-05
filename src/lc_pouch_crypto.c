@@ -2518,6 +2518,14 @@ static int lc_pouch_crypto_output_feed(lc_pouch_crypto_output *out,
     target = out->desc.encrypted && out->counter == 0UL
                  ? LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES
                  : LC_POUCH_FRAME_PLAINTEXT_BYTES;
+    /* Keep an exactly full final frame until more input proves it is not
+     * final. Commit can then emit its bounded bytes and terminal together. */
+    if (out->fill == target) {
+      rc = lc_pouch_crypto_output_flush(out, 0, error);
+      if (rc != LC_OK)
+        return rc;
+      continue;
+    }
     take = target - out->fill;
     if (take > count) {
       take = count;
@@ -2526,12 +2534,6 @@ static int lc_pouch_crypto_output_feed(lc_pouch_crypto_output *out,
     out->fill += take;
     bytes += take;
     count -= take;
-    if (out->fill == target) {
-      rc = lc_pouch_crypto_output_flush(out, 0, error);
-      if (rc != LC_OK) {
-        return rc;
-      }
-    }
   }
   return LC_OK;
 }

@@ -424,6 +424,11 @@ int lc_collection_chunks_end_unit(lc_collection_handle *c,
   if (rc == LC_OK) {
     s->pending.offset += LC_COLLECTION_UNIT_HEADER + ref.bytes;
     s->pending.bytes = 0;
+    /* Under append authority, finishing on the active inode proves a later
+     * rotation will seal these final bytes before naming its successor.
+     * Any later producer write to this inode clears the proof again. */
+    if (ref.segment == s->first.segment)
+      s->first_sealed = ref.segment == c->head.active;
   }
 #ifdef LOCKDC_TEST_BUILD
   if (rc == LC_OK)

@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <zlib.h>
 
+#include "../support/lc_test_cases.h"
 #include "../support/lc_test_tmp.h"
 #include "lc_allocation_tracking.h"
 #include "lc_collection_chunks.h"
@@ -1731,11 +1732,13 @@ static void test_private_seal_allows_peer_publication_and_retry(void **state) {
   lc_collection_append_res peer, result;
   lc_collection_delete_res deleted;
   f->segment_target = BODY_BYTES;
-  for (int failure = 0; failure < 2; ++failure) {
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    int failure = scenario & 1;
+    int mode = scenario & 2 ? 4 : 0;
     int ready[2], proceed[2], status, peers = 0;
     close_owners(f);
     snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/seal-progress-%d",
-             f->root, failure);
+             f->root, scenario);
     assert_int_equal(pipe(ready), 0);
     assert_int_equal(pipe(proceed), 0);
     pid_t child = fork();
@@ -1747,7 +1750,7 @@ static void test_private_seal_allows_peer_publication_and_retry(void **state) {
       struct pollfd go = {proceed[0], POLLIN, 0};
       close(ready[0]);
       close(proceed[1]);
-      open_owners(f, 4, 1);
+      open_owners(f, mode, 1);
       lc_collection_handle *c = f->collection->impl;
       int rc = lc_collection_append_begin(f->collection, &req, &f->pending,
                                           &f->error);
@@ -1781,7 +1784,7 @@ static void test_private_seal_allows_peer_publication_and_retry(void **state) {
     close(ready[1]);
     close(proceed[0]);
     pipe_event(ready[0]);
-    open_owners(f, 4, 0);
+    open_owners(f, mode, 0);
     lc_collection_handle *c = f->collection->impl;
     lc_u64 original = c->head.active;
     while (c->head.active == original && peers < 8) {
@@ -1815,7 +1818,78 @@ static void test_private_seal_allows_peer_publication_and_retry(void **state) {
                                           &f->error));
     read_one(f, f->body, BODY_BYTES);
     close_owners(f);
-    open_owners(f, 4, 0);
+    open_owners(f, mode, 0);
+    read_one(f, f->body, BODY_BYTES);
+  }
+}
+
+static void test_exact_final_frames_keep_contiguous_records(void **state) {
+  fixture *f = *state;
+  lc_collection_append_res result;
+  lc_collection_delete_res deleted;
+  lc_pouch_collection_record record;
+  lc_u64 segment;
+  int found;
+  const int modes[] = {0, 1, 4, 5};
+  check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+  f->stream_chunk = malloc(65538);
+  assert_non_null(f->stream_chunk);
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); ++i) {
+    int mode = modes[i];
+    size_t boundary = mode & 1 ? 4096 : 65536;
+    close_owners(f);
+    snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/exact-frame-%d",
+             f->root, mode);
+    open_owners(f, mode, 1);
+    lc_collection_handle *c = f->collection->impl;
+    for (size_t bytes = boundary - 1; bytes <= boundary + 1; ++bytes) {
+      char id[32];
+      snprintf(id, sizeof(id), "frame-%lu", (unsigned long)bytes);
+      memcpy(f->stream_chunk, "{\"v\":\"", 6);
+      memset(f->stream_chunk + 6, 'x', bytes - 8);
+      memcpy(f->stream_chunk + bytes - 2, "\"}", 2);
+      check(f, push(f->collection, id, (char *)f->stream_chunk, bytes, &result,
+                    &f->error));
+      check(f, lc_collection_lookup_id(c, id, &record, &segment, &found,
+                                       &f->error));
+      assert_true(found);
+      if (bytes <= boundary)
+        assert_int_equal(record.stream_extents, 0);
+      else
+        assert_true(record.stream_extents > 0);
+      read_one(f, (char *)f->stream_chunk, bytes);
+      check(f, lc_collection_delete_entry(f->collection, result.position,
+                                          &deleted, &f->error));
+    }
+  }
+}
+
+static void test_rotation_seal_covers_finished_private_units(void **state) {
+  fixture *f = *state;
+  lc_collection_append_res result;
+  struct stat st;
+  for (int mode = 0; mode <= 4; mode += 4) {
+    close_owners(f);
+    snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/covered-seal-%d",
+             f->root, mode);
+    f->segment_target = 65536;
+    open_owners(f, mode, 1);
+    lc_collection_handle *c = f->collection->impl;
+    lc_u64 original = c->head.active;
+    assert_int_equal(fstat(c->active_fd, &st), 0);
+    memset(&old_range_sync, 0, sizeof(old_range_sync));
+    old_range_sync.device = st.st_dev;
+    old_range_sync.inode = st.st_ino;
+    old_range_sync.fail = 1;
+    lc_collection_chunks_test_sync_fd = observe_old_range_sync;
+    check(f, push(f->collection, "covered", f->body, BODY_BYTES, &result,
+                  &f->error));
+    lc_collection_chunks_test_sync_fd = NULL;
+    assert_int_equal(old_range_sync.calls, 0);
+    assert_true(c->head.active > original);
+    read_one(f, f->body, BODY_BYTES);
+    close_owners(f);
+    open_owners(f, mode, 0);
     read_one(f, f->body, BODY_BYTES);
   }
 }
@@ -2193,8 +2267,12 @@ static void test_failed_tail_recovery_preserves_corrupt_source(void **state) {
   }
 }
 
-int main(void) {
+int main(int argc, char **argv) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(
+          test_exact_final_frames_keep_contiguous_records, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_rotation_seal_covers_finished_private_units, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_abandoned_reservation_rotation_survives_power_loss, setup,
           teardown),
@@ -2252,5 +2330,6 @@ int main(void) {
           test_allocation_failure_closes_internal_writer, setup, teardown)};
   if (lc_allocator_tracking_configure(1, NULL) != LC_OK)
     return 1;
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return lc_test_run_cases(tests, sizeof(tests) / sizeof(tests[0]), argc, argv,
+                           NULL, NULL);
 }

@@ -467,6 +467,14 @@ add_test(NAME collection_test_selection_test COMMAND "${CMAKE_COMMAND}"
   -P "${CMAKE_SOURCE_DIR}/tests/collection_test_selection_test.cmake")
 set_tests_properties(collection_test_selection_test PROPERTIES
   LABELS "unit;cross-runtime" TIMEOUT 15)
+add_test(NAME collection_staged_test_selection_test COMMAND "${CMAKE_COMMAND}"
+  -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+  -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
+  -DLOCKDC_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+  -DLOCKDC_COLLECTION_TEST_SUITE=lc_unit_collection_staged
+  -P "${CMAKE_SOURCE_DIR}/tests/collection_test_selection_test.cmake")
+set_tests_properties(collection_staged_test_selection_test PROPERTIES
+  LABELS "unit;cross-runtime" TIMEOUT 15)
 # Bootlin sets CMAKE_CROSSCOMPILING even for a host-architecture Linux build.
 # The Python driver launches the binary directly, without a QEMU wrapper.
 if(TARGET lockdc_pouch_replay_probe
@@ -520,6 +528,13 @@ endif()
 # registered their executables, including integration tests with modal cases.
 get_property(lc_cross_runtime_test_targets GLOBAL PROPERTY
   LOCKDC_CROSS_RUNTIME_TEST_TARGETS)
+# Cross runners may not execute Lua, but every selected facade must still
+# compile with that target's C89 headers and fixed-width integer definitions.
+foreach(lua_module IN ITEMS lockdc_lua_core lockdc_lua_postgres)
+  if(TARGET ${lua_module})
+    list(APPEND lc_cross_runtime_test_targets ${lua_module})
+  endif()
+endforeach()
 add_custom_target(lockdc_cross_runtime_tests DEPENDS
   ${lc_cross_runtime_test_targets})
 lc_apply_test_defaults()

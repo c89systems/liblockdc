@@ -744,10 +744,12 @@ int lc_collection_record_file(lc_collection_handle *collection, lc_u64 segment,
   return LC_OK;
 }
 
-int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
-                             lc_u64 offset, int *fd, lc_u64 *fd_segment,
-                             lc_u64 *fd_end, lc_pouch_collection_record *out,
-                             lc_error *error) {
+int lc_collection_record_ref_prefix(lc_collection_handle *collection,
+                                    lc_u64 segment, lc_u64 offset, int *fd,
+                                    lc_u64 *fd_segment, lc_u64 *fd_end,
+                                    lc_pouch_collection_record *out,
+                                    void *prefix, size_t capacity, size_t *size,
+                                    lc_error *error) {
   char leaf[64];
   struct stat st;
   int rc = lc_collection_record_file(collection, segment, fd, fd_segment,
@@ -756,7 +758,8 @@ int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
     rc = lc_collection_record_leaf(segment, leaf, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_pouch_collection_record_read(*fd, offset, *fd_end, leaf, out, error);
+  rc = lc_pouch_collection_record_read_prefix(*fd, offset, *fd_end, leaf, out,
+                                              prefix, capacity, size, error);
   /* A metadata projection may advance after the view was captured. Its
    * backward link is safe, but the shared append file may have grown since
    * this reader's previous stat. Never treat that stale bound as corruption. */
@@ -765,10 +768,19 @@ int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
     *fd_end = (lc_u64)st.st_size;
     lc_error_cleanup(error);
     lc_error_init(error);
-    rc =
-        lc_pouch_collection_record_read(*fd, offset, *fd_end, leaf, out, error);
+    rc = lc_pouch_collection_record_read_prefix(*fd, offset, *fd_end, leaf, out,
+                                                prefix, capacity, size, error);
   }
   return rc;
+}
+
+int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
+                             lc_u64 offset, int *fd, lc_u64 *fd_segment,
+                             lc_u64 *fd_end, lc_pouch_collection_record *out,
+                             lc_error *error) {
+  return lc_collection_record_ref_prefix(collection, segment, offset, fd,
+                                         fd_segment, fd_end, out, NULL, 0, NULL,
+                                         error);
 }
 
 int lc_collection_record_at(lc_collection_handle *collection, lc_u64 generation,

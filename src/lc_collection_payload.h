@@ -12,9 +12,10 @@
  * The canonical record and direct record descriptor remain borrowed until the
  * next open/cleanup. Metadata-only records reuse one owned payload descriptor.
  * Transformed bodies borrow the pinned descriptor and reuse operation-owned,
- * bounded codec scratch across entries. A direct unit can also borrow the
- * caller's first encoded input chunk until consumed. It may alias subsequent
- * output scratch; replay drops consumed input and reads the canonical fd. */
+ * bounded codec scratch across entries. Contiguous records and direct units
+ * can borrow the caller's first encoded input chunk until consumed. It may
+ * alias subsequent output scratch; replay drops consumed input and reads the
+ * canonical fd. */
 typedef struct lc_collection_payload {
   lc_source source;
   lc_source encoded;
@@ -38,11 +39,13 @@ int lc_collection_payload_open(lc_collection_payload *payload,
                                lc_collection_handle *collection, int fd,
                                const lc_pouch_collection_record *record,
                                lc_error *error);
-int lc_collection_payload_open_unit(lc_collection_payload *,
-                                    lc_collection_handle *, int,
-                                    const lc_pouch_collection_record *,
-                                    const lc_collection_unit *, const void *,
-                                    size_t, lc_error *);
+/* unit is NULL for a contiguous record; either form borrows the bounded prefix.
+ */
+int lc_collection_payload_open_prefix(lc_collection_payload *,
+                                      lc_collection_handle *, int,
+                                      const lc_pouch_collection_record *,
+                                      const lc_collection_unit *, const void *,
+                                      size_t, lc_error *);
 int lc_collection_payload_read(lc_collection_payload *payload, void *bytes,
                                size_t capacity, size_t *got, lc_error *error);
 /* Call only after consuming EOF, before accepting an output or an index row.

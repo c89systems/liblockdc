@@ -310,8 +310,7 @@ static void test_roundtrip_boundaries_and_owned_heap_budget(void **state) {
   }
 }
 
-static void
-test_final_frames_coalesce_without_delaying_full_frames(void **state) {
+static void test_final_frames_coalesce_with_one_frame_bound(void **state) {
   fixture *f = *state;
   const size_t lengths[] = {0,
                             1,
@@ -322,7 +321,7 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
                             4096 + FRAME - 1,
                             4096 + FRAME,
                             4096 + FRAME + 1};
-  const size_t calls[] = {1, 1, 1, 1, 2, 2, 2, 3, 3};
+  const size_t calls[] = {1, 1, 1, 1, 1, 2, 2, 2, 3};
   lc_sink *sink;
   for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
     reset_output(f);
@@ -339,8 +338,10 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
                    LC_OK);
   sink = lc_pouch_crypto_writer_sink(f->writer);
   assert_true(sink->write(sink, f->body, 4096, &f->error));
-  assert_int_equal(f->sink_calls,
-                   1); /* Producer-to-consumer flow before EOF. */
+  assert_int_equal(f->sink_calls, 0);
+  /* One additional byte must deliver the full frame before EOF. */
+  assert_true(sink->write(sink, f->body + 4096, 1, &f->error));
+  assert_int_equal(f->sink_calls, 1);
   assert_int_equal(lc_pouch_crypto_writer_finish(f->writer, &f->plain,
                                                  &f->stored, &f->crc,
                                                  &f->descriptor, &f->error),
@@ -357,10 +358,10 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
     }
     reset_output(f);
     lc_pouch_crypto_set_compression(f->crypto, 0);
-    f->reject_call = 2; /* A standalone terminal after a full first frame. */
+    f->reject_call = 2; /* Final delivery after a full first frame. */
     f->partial = 7;
     f->sink_error = explicit_error;
-    assert_int_equal(write_body(f, 4096, 17, 1), LC_ERR_TRANSPORT);
+    assert_int_equal(write_body(f, 4097, 17, 1), LC_ERR_TRANSPORT);
     assert_null(f->descriptor);
   }
 }
@@ -732,7 +733,7 @@ static void test_failed_or_transferred_units_cannot_restart(void **state) {
   f->sink_error = 1;
   f->partial = 7;
   sink = lc_pouch_crypto_writer_sink(f->writer);
-  assert_false(sink->write(sink, f->body, 4096, &f->error));
+  assert_false(sink->write(sink, f->body, 4097, &f->error));
   clear_error(f);
   assert_int_equal(lc_pouch_crypto_writer_finish_borrowed(f->writer, &f->plain,
                                                           &f->stored, &f->crc,
@@ -771,8 +772,7 @@ static void test_writer_uses_default_worker_stack(void **state) {
 int main(void) {
   const struct CMUnitTest tests[] = {
       cmocka_unit_test_setup_teardown(
-          test_final_frames_coalesce_without_delaying_full_frames, setup,
-          teardown),
+          test_final_frames_coalesce_with_one_frame_bound, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_roundtrip_boundaries_and_owned_heap_budget, setup, teardown),
       cmocka_unit_test_setup_teardown(

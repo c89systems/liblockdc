@@ -232,12 +232,12 @@ int lc_collection_payload_open(lc_collection_payload *payload,
   return lc_cp_open(payload, collection, fd, record, NULL, NULL, 0U, error);
 }
 
-int lc_collection_payload_open_unit(lc_collection_payload *payload,
-                                    lc_collection_handle *collection, int fd,
-                                    const lc_pouch_collection_record *record,
-                                    const lc_collection_unit *unit,
-                                    const void *prefix, size_t prefix_size,
-                                    lc_error *error) {
+int lc_collection_payload_open_prefix(lc_collection_payload *payload,
+                                      lc_collection_handle *collection, int fd,
+                                      const lc_pouch_collection_record *record,
+                                      const lc_collection_unit *unit,
+                                      const void *prefix, size_t prefix_size,
+                                      lc_error *error) {
   return lc_cp_open(payload, collection, fd, record, unit, prefix, prefix_size,
                     error);
 }

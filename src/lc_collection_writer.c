@@ -64,7 +64,9 @@ static int lc_cw_storage_enter(lc_collection_writer_handle *writer,
   int rc;
   if (writer->entered)
     return LC_OK;
-  rc = lc_collection_stream_enter(writer->call, writer->guard, error);
+  rc = writer->committing
+           ? lc_collection_append_enter(writer->call, writer->guard, error)
+           : lc_collection_stream_enter(writer->call, writer->guard, error);
   if (rc != LC_OK)
     return rc;
   writer->entered = 1;
@@ -404,7 +406,7 @@ static int lc_cw_commit(lc_collection_writer *self,
   lc_pouch_collection_record body;
   lc_pouch_collection_writer *encoder;
   lc_error local;
-  int rc, prepared = 0;
+  int rc;
   error = lc_cw_error(error, &local);
   if (out == NULL) {
     rc = lc_collection_failure(error, LC_ERR_INVALID, NULL,
@@ -420,23 +422,17 @@ static int lc_cw_commit(lc_collection_writer *self,
       writer->call = &call;
       writer->guard = &guard;
       writer->entered = 0;
-      writer->committing = 0;
-      /* Durable data seals can overlap producers. NoSync keeps its usual
-       * single publication scope; cross-inode prerequisites remain mandatory
-       * in bind when a producer hasn't already sealed them. */
-      if (writer->emitted && !writer->hash_only &&
-          writer->collection->pouch->durable_sync) {
-        rc = lc_cw_finish_body(writer, &body, error);
-        rc = lc_cw_storage_leave(writer, rc, error);
-        prepared = rc == LC_OK;
-      }
-      if (rc == LC_OK)
+      /* Finish compression and private data seals before publication. A
+       * bounded final inline chunk acquires append authority lazily in its
+       * sink callback, after encoding, and retains it through publication. */
+      writer->committing = !writer->emitted;
+      rc = lc_cw_finish_body(writer, &body, error);
+      if (rc == LC_OK && !writer->entered) {
         rc = lc_collection_append_enter(&call, &guard, error);
-      if (rc == LC_OK) {
-        writer->entered = 1;
+        writer->entered = rc == LC_OK;
+      }
+      if (writer->entered) {
         writer->committing = 1;
-        if (!prepared)
-          rc = lc_cw_finish_body(writer, &body, error);
         if (rc == LC_OK && !writer->hash_only && !writer->direct)
           rc = lc_collection_chunks_finish(writer->collection, &writer->chunks,
                                            error);

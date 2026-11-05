@@ -231,6 +231,10 @@ int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
                              lc_u64 offset, int *fd, lc_u64 *fd_segment,
                              lc_u64 *fd_end, lc_pouch_collection_record *out,
                              lc_error *error);
+int lc_collection_record_ref_prefix(lc_collection_handle *, lc_u64, lc_u64,
+                                    int *, lc_u64 *, lc_u64 *,
+                                    lc_pouch_collection_record *, void *,
+                                    size_t, size_t *, lc_error *);
 /* Resolves metadata history for a pinned read generation. The current record
  * must already be loaded, and fd describes it. Only bounded metadata is read.
  */
