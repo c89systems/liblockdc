@@ -432,7 +432,7 @@ The compatibility requirement concerns existing calls and older remote
 servers. Extending transparent public C structures changes the shared-library
 ABI. State retention introduced core ABI 6 in v0.22.0, after ABI 5 in v0.21.0.
 Subsequent collection layout changes use core ABI 9; see
-[current ABI compatibility](../README.md#c-abi-and-storage-compatibility).
+[current ABI compatibility](c-api.md#abi-and-storage-compatibility).
 Package metadata and provider linkage must agree. Recompile C consumers
 and rebuild the optional PostgreSQL provider against the matching core. Existing
 initialized request calls retain their behavior after recompilation. Callers

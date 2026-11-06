@@ -49,7 +49,7 @@ qualifies local Pouch only. The added public configuration and statistics
 fields were introduced in shared-library ABI generation 5. Current collection
 receiver/capability layouts use core ABI 9; rebuild C consumers and the optional
 PostgreSQL provider against the same core. See
-[ABI compatibility](../README.md#c-abi-and-storage-compatibility) and
+[ABI compatibility](c-api.md#abi-and-storage-compatibility) and
 [upgrade instructions](../CHANGELOG.md#upgrading-from-024x).
 
 ## Scheduling and safety
