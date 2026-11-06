@@ -22,6 +22,7 @@ typedef struct lc_collection_payload {
   const unsigned char *prefix;
   size_t prefix_size, prefix_used;
   lc_source *decoded;
+  lc_pouch_crypto_read_fn read_decoded;
   lc_collection_chunk_reader chunks;
   lc_pouch_crypto_reader *decoder;
   EVP_MD_CTX *hash;
@@ -40,12 +41,14 @@ int lc_collection_payload_open(lc_collection_payload *payload,
                                const lc_pouch_collection_record *record,
                                lc_error *error);
 /* unit is NULL for a contiguous record; either form borrows the bounded prefix.
+ * A direct unit requires the manifest binding already constructed from this
+ * record by the order reader. Payload opening still authenticates its proof.
  */
 int lc_collection_payload_open_prefix(lc_collection_payload *,
                                       lc_collection_handle *, int,
                                       const lc_pouch_collection_record *,
-                                      const lc_collection_unit *, const void *,
-                                      size_t, lc_error *);
+                                      const lc_collection_unit *, const char *,
+                                      const void *, size_t, lc_error *);
 int lc_collection_payload_read(lc_collection_payload *payload, void *bytes,
                                size_t capacity, size_t *got, lc_error *error);
 /* Call only after consuming EOF, before accepting an output or an index row.

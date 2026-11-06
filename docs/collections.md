@@ -70,6 +70,9 @@ residual LQL evaluation is the explicitly additional work described below.
 Reads reuse one heap chunk for encoded input/output transfer, initially 16 KiB
 and growing at most once to 64 KiB for larger entries, plus bounded metadata and
 codec scratch. This memory stays bounded independently of entry size.
+Uncompressed encrypted frames can decrypt directly into that private chunk;
+authentication finishes before delivery. Callback sizes may follow frame
+boundaries and must not be assumed to fill the chunk.
 Metadata delivery must not
 introduce per-entry clients, threads, network requests, whole-object buffers,
 or mandatory per-entry heap allocation on the native path. This is direct

@@ -1226,7 +1226,7 @@ static void test_direct_reader_bounded_chunks_failure_and_resume(void **state) {
     lc_collection_read_res_init(&result);
     rc = lc_collection_read(f->collection, &options, &sink, &result, &f->error);
     assert_int_equal(rc, LC_ERR_TRANSPORT);
-    assert_int_equal(output.offset, 65536);
+    assert_uint_in_range(output.offset, 1U, 65536U);
     assert_false(result.complete);
     assert_int_equal(result.completed_records, 0);
     assert_int_equal(result.last_examined_position, 1);
@@ -1248,9 +1248,9 @@ static void test_direct_reader_bounded_chunks_failure_and_resume(void **state) {
     assert_int_equal(result.completed_records, 1);
     assert_int_equal(output.offset, BODY_BYTES + 1U);
     assert_int_equal(output.largest, 65536);
-    /* Four codec-sized deliveries and LF; avoid many small decode/callback
-     * cycles while keeping the bound independent of the entry length. */
-    assert_int_equal(output.calls, BODY_BYTES / 65536U + 1U);
+    /* AES can deliver its short first frame separately to decrypt subsequent
+     * complete frames directly into output. Still forbid many small cycles. */
+    assert_true(output.calls <= BODY_BYTES / 65536U + (mode == 1 ? 2U : 1U));
     assert_true(stats->maximum < BODY_BYTES);
     lc_collection_read_res_cleanup(&result);
     direct_verify(f, 1, LC_OK);
@@ -1297,7 +1297,7 @@ test_direct_units_filter_metadata_corruption_and_rebuild(void **state) {
     lc_collection_unit original, altered;
     check(f, lc_collection_unit_read(fd, row.unit_offset, row.stored_bytes,
                                      &original, &f->error));
-    for (int corrupt = 0; corrupt < 4; ++corrupt) {
+    for (int corrupt = 0; corrupt < 5; ++corrupt) {
       altered = original;
       if (corrupt == 0)
         ++altered.ordinal;
@@ -1307,6 +1307,13 @@ test_direct_units_filter_metadata_corruption_and_rebuild(void **state) {
         altered.etag[0] = altered.etag[0] == 'a' ? 'b' : 'a';
       if (corrupt == 3)
         altered.context[0] = 'x';
+      if (corrupt == 4) {
+        /* Keep a well-formed upload identity. Its changed manifest must still
+         * fail the order proof or encrypted descriptor binding. */
+        char *id = strstr(altered.context, ":direct:");
+        assert_non_null(id);
+        id[1] = 'e';
+      }
       check(f, lc_collection_unit_write_meta(fd, row.unit_offset, &altered,
                                              &f->error));
       direct_verify(f, corrupt & 1, LC_ERR_PROTOCOL);

@@ -784,6 +784,7 @@ function Collection:append_status(append_id) return self._core:append_status(app
 -- Requires a sink. Raw JSONL reaches it directly; cursor/retention facts arrive
 -- separately through on_metadata. Success is nil, result; errors also return
 -- the accepted partial result as the fourth value. All uint64 facts are strings.
+-- Sink writes are byte fragments; their lengths and entry boundaries may vary.
 -- after (exclusive), through (inclusive), and first_n are optional canonical
 -- uint64 decimal strings. first_n selects live inputs before LQL; filtered-out
 -- inputs consume N, deleted entries do not. Resume retains the input budget;

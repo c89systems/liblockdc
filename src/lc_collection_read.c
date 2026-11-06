@@ -35,6 +35,7 @@ typedef struct lc_collection_reader {
   lc_collection_unit unit;
   int direct_unit;
   unsigned char *prefix;
+  char unit_binding[256];
   size_t prefix_size, chunk_capacity;
   lc_collection_payload payload;
   lc_collection_query_plan plan;
@@ -357,9 +358,9 @@ static int lc_cr_unit_record(lc_collection_reader *reader,
   if (rc != LC_OK)
     return rc;
   strcpy(record->etag, unit->etag);
-  rc = lc_collection_unit_manifest(record, c->id,
-                                   &reader->payload.chunks.manifest, NULL,
-                                   record->manifest, reader->error);
+  rc = lc_collection_unit_manifest(
+      record, c->id, &reader->payload.chunks.manifest, reader->unit_binding,
+      record->manifest, reader->error);
   if (rc != LC_OK)
     return rc;
   if (!encrypted && memcmp(record->manifest, row->proof, sizeof(row->proof)))
@@ -392,7 +393,8 @@ static int lc_cr_body_open(lc_collection_reader *reader) {
     return lc_collection_payload_open_prefix(
         &reader->payload, reader->call->collection, reader->record_fd,
         &reader->record, reader->direct_unit ? &reader->unit : NULL,
-        reader->prefix, prefix_size, reader->error);
+        reader->direct_unit ? reader->unit_binding : NULL, reader->prefix,
+        prefix_size, reader->error);
   return lc_collection_payload_open(&reader->payload, reader->call->collection,
                                     reader->record_fd, &reader->record,
                                     reader->error);

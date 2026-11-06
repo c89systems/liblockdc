@@ -243,6 +243,128 @@ static void test_rebind_replay_partial_and_codec_changes(void **state) {
   }
 }
 
+static size_t read_chunk(lc_pouch_crypto_reader *reader, lc_source *source,
+                         void *buffer, size_t capacity, lc_error *error) {
+  lc_pouch_crypto_read_fn read =
+      lc_pouch_crypto_reader_select_read(reader, source);
+  return read(source, buffer, capacity, error);
+}
+
+static void reserve_frame_output(fixture *f) {
+  unsigned char *grown = realloc(f->chunk, 65536U + 2U);
+  assert_non_null(grown);
+  f->chunk = grown;
+}
+
+static void assert_chunk_body(fixture *f, lc_source *source,
+                              size_t sample_index, int mixed) {
+  static const size_t capacities[] = {65536, 17, 65536, 4093};
+  size_t offset = 0, iteration = 0, got;
+  assert_int_equal(read_chunk(f->reader, source, f->chunk + 1, 0, &f->error),
+                   0);
+  do {
+    size_t capacity = mixed ? capacities[iteration++ % 4] : 65536;
+    memset(f->chunk, 0xa5, capacity + 2);
+    got = read_chunk(f->reader, source, f->chunk + 1, capacity, &f->error);
+    assert_int_equal(f->error.code, LC_OK);
+    assert_int_equal(f->chunk[0], 0xa5);
+    assert_int_equal(f->chunk[capacity + 1], 0xa5);
+    assert_true(got <= capacity);
+    assert_true(got <= f->samples[sample_index].length - offset);
+    assert_memory_equal(f->chunk + 1, f->body + offset, got);
+    offset += got;
+  } while (got != 0);
+  assert_int_equal(offset, f->samples[sample_index].length);
+}
+
+static void test_chunk_reads_preserve_replay_and_partial_frames(void **state) {
+  fixture *f = *state;
+  reserve_frame_output(f);
+  for (int mode = 0; mode < 4; ++mode) {
+    open_case(f, mode);
+    for (size_t i = 0; i < 3; ++i) {
+      lc_source *source = bind_sample(f, i);
+      size_t calls = f->allocations.calls;
+      assert_chunk_body(f, source, i, 0);
+      assert_int_equal(source->reset(source, &f->error), LC_OK);
+      assert_chunk_body(f, source, i, 1);
+      assert_int_equal(source->reset(source, &f->error), LC_OK);
+      /* Start with the ordinary small-buffer API, then switch back to chunks.
+       * The buffered remainder must not be skipped or exposed twice. */
+      size_t first = source->read(source, f->chunk, 17, &f->error);
+      assert_int_equal(first, f->samples[i].length ? 17 : 0);
+      assert_memory_equal(f->chunk, f->body, first);
+      size_t offset = first, got;
+      do {
+        got = read_chunk(f->reader, source, f->chunk, 65536, &f->error);
+        assert_int_equal(f->error.code, LC_OK);
+        assert_true(got <= f->samples[i].length - offset);
+        assert_memory_equal(f->chunk, f->body + offset, got);
+        offset += got;
+      } while (got != 0);
+      assert_int_equal(offset, f->samples[i].length);
+      assert_int_equal(f->allocations.calls, calls);
+    }
+    lc_source *foreign = NULL;
+    assert_int_equal(lc_source_from_memory("other", 5, &foreign, &f->error),
+                     LC_OK);
+    assert_int_equal(read_chunk(f->reader, foreign, f->chunk, 65536, &f->error),
+                     5);
+    assert_memory_equal(f->chunk, "other", 5);
+    assert_int_equal(read_chunk(NULL, foreign, f->chunk, 65536, &f->error), 0);
+    lc_source_close(foreign);
+    assert_true(fcntl(f->fd, F_GETFD) >= 0);
+  }
+}
+
+static void test_direct_frame_failure_wipes_tentative_output(void **state) {
+  fixture *f = *state;
+  unsigned char header[8], original;
+  reserve_frame_output(f);
+  open_case(f, 1);
+  sample *s = &f->samples[0];
+  assert_int_equal(pread(f->fd, header, sizeof(header), (off_t)s->offset),
+                   sizeof(header));
+  size_t length = ((size_t)header[4] << 24) | ((size_t)header[5] << 16) |
+                  ((size_t)header[6] << 8) | (size_t)header[7];
+  assert_uint_in_range(length, 1, 65536);
+  for (int failure = 0; failure < 2; ++failure) {
+    off_t at = (off_t)(s->offset + 8U + (failure ? length : 0U));
+    assert_int_equal(pread(f->fd, &original, 1, at), 1);
+    unsigned char altered = original ^ 0x80;
+    assert_int_equal(pwrite(f->fd, &altered, 1, at), 1);
+    lc_source *source = bind_sample(f, 0);
+    memset(f->chunk, 0xa5, 65536U + 2U);
+    assert_int_equal(
+        read_chunk(f->reader, source, f->chunk + 1, 65536, &f->error), 0);
+    assert_int_equal(f->error.code, LC_ERR_PROTOCOL);
+    assert_int_equal(f->chunk[0], 0xa5);
+    for (size_t i = 0; i < length; ++i)
+      assert_int_equal(f->chunk[i + 1], 0);
+    for (size_t i = length + 1; i < 65536U + 2U; ++i)
+      assert_int_equal(f->chunk[i], 0xa5);
+    assert_int_equal(pwrite(f->fd, &original, 1, at), 1);
+    clear_error(f);
+    assert_chunk_body(f, bind_sample(f, 0), 0, 0);
+  }
+  /* Valid data frames do not excuse a missing authenticated terminal frame. */
+  off_t terminal = (off_t)(s->offset + s->stored - 1);
+  assert_int_equal(pread(f->fd, &original, 1, terminal), 1);
+  unsigned char altered = original ^ 1;
+  assert_int_equal(pwrite(f->fd, &altered, 1, terminal), 1);
+  lc_source *source = bind_sample(f, 0);
+  size_t got, total = 0;
+  do {
+    got = read_chunk(f->reader, source, f->chunk, 65536, &f->error);
+    total += got;
+  } while (got != 0 && f->error.code == LC_OK);
+  assert_int_equal(total, s->length);
+  assert_int_equal(f->error.code, LC_ERR_PROTOCOL);
+  assert_int_equal(pwrite(f->fd, &original, 1, terminal), 1);
+  clear_error(f);
+  assert_chunk_body(f, bind_sample(f, 0), 0, 0);
+}
+
 static void test_corrupt_spans_do_not_poison_next_body(void **state) {
   fixture *f = *state;
   lc_source *source;
@@ -364,6 +486,7 @@ static void test_allocation_failures_and_fd_ownership(void **state) {
 
 typedef struct reader_work {
   fixture *f;
+  size_t capacity;
   int rc;
 } reader_work;
 
@@ -472,11 +595,13 @@ static void *read_worker(void *context) {
   lc_pouch_crypto_reader *reader = NULL;
   lc_source *source;
   lc_error error;
-  unsigned char chunk[1024];
+  unsigned char *chunk;
   size_t i, offset, got;
   int rc;
   lc_error_init(&error);
-  rc = lc_pouch_crypto_reader_open(f->crypto, &reader, &error);
+  chunk = lc_alloc_with_allocator(&f->allocator, work->capacity);
+  rc = chunk != NULL ? lc_pouch_crypto_reader_open(f->crypto, &reader, &error)
+                     : LC_ERR_NOMEM;
   for (i = 0; rc == LC_OK && i < 12; ++i) {
     sample *s = &f->samples[i % 3];
     rc = lc_pouch_crypto_reader_bind(reader, s->context, s->context, f->fd,
@@ -485,7 +610,7 @@ static void *read_worker(void *context) {
     offset = 0;
     got = 1;
     while (rc == LC_OK && got != 0) {
-      got = source->read(source, chunk, sizeof(chunk), &error);
+      got = read_chunk(reader, source, chunk, work->capacity, &error);
       rc = error.code;
       if (rc == LC_OK && (got > s->length - offset ||
                           memcmp(chunk, f->body + offset, got) != 0))
@@ -497,6 +622,7 @@ static void *read_worker(void *context) {
       rc = LC_ERR_PROTOCOL;
   }
   lc_pouch_crypto_reader_close(reader);
+  lc_free_with_allocator(&f->allocator, chunk);
   lc_error_cleanup(&error);
   work->rc = rc;
   return NULL;
@@ -507,16 +633,19 @@ static void test_parallel_readers_use_default_worker_stacks(void **state) {
   pthread_t threads[2];
   reader_work work[2];
   size_t i;
-  open_case(f, 3);
-  for (i = 0; i < 2; ++i) {
-    work[i].f = f;
-    work[i].rc = LC_ERR_INVALID;
-    assert_int_equal(pthread_create(&threads[i], NULL, read_worker, &work[i]),
-                     0);
-  }
-  for (i = 0; i < 2; ++i) {
-    assert_int_equal(pthread_join(threads[i], NULL), 0);
-    assert_int_equal(work[i].rc, LC_OK);
+  for (int mode = 1; mode < 4; mode += 2) {
+    open_case(f, mode);
+    for (i = 0; i < 2; ++i) {
+      work[i].f = f;
+      work[i].capacity = i == 0 ? 1024 : 65536;
+      work[i].rc = LC_ERR_INVALID;
+      assert_int_equal(pthread_create(&threads[i], NULL, read_worker, &work[i]),
+                       0);
+    }
+    for (i = 0; i < 2; ++i) {
+      assert_int_equal(pthread_join(threads[i], NULL), 0);
+      assert_int_equal(work[i].rc, LC_OK);
+    }
   }
   assert_true(fcntl(f->fd, F_GETFD) >= 0);
 }
@@ -634,6 +763,10 @@ static void test_root_key_decoding_matches_independent_vectors(void **state) {
 
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(
+          test_chunk_reads_preserve_replay_and_partial_frames, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_direct_frame_failure_wipes_tentative_output, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_rebind_replay_partial_and_codec_changes, setup, teardown),
       cmocka_unit_test_setup_teardown(

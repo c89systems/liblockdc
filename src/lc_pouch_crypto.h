@@ -179,6 +179,19 @@ int lc_pouch_crypto_reader_bind(lc_pouch_crypto_reader *reader,
                                 lc_error *error);
 void lc_pouch_crypto_reader_clear(lc_pouch_crypto_reader *reader);
 void lc_pouch_crypto_reader_close(lc_pouch_crypto_reader *reader);
+typedef size_t (*lc_pouch_crypto_read_fn)(lc_source *, void *, size_t,
+                                          lc_error *);
+/* Select once after binding a readable source; reselect after another bind.
+ * The returned callback reads into operation-owned scratch. An uncompressed
+ * decryptor can authenticate one frame directly into a buffer of at least 64
+ * KiB; short reads at frame boundaries are intentional. Other sources, codecs
+ * and partial frames use the ordinary source read. reader may be NULL for that
+ * fallback. Do not alias unconsumed input or expose scratch until the call
+ * succeeds; tentative output is wiped on authentication failure. No storage is
+ * retained beyond the existing decoder buffers. */
+lc_pouch_crypto_read_fn
+lc_pouch_crypto_reader_select_read(lc_pouch_crypto_reader *reader,
+                                   lc_source *source);
 
 #ifdef LOCKDC_TEST_BUILD
 int lc_pouch_crypto_test_check_byte_counter(uint64_t total, size_t delta,

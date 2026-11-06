@@ -64,6 +64,7 @@ static int lc_cp_encoded_reset(lc_source *source, lc_error *error) {
 void lc_collection_payload_reset(lc_collection_payload *payload) {
   lc_pouch_crypto_reader_clear(payload->decoder);
   payload->decoded = NULL;
+  payload->read_decoded = NULL;
   payload->record = NULL;
   payload->fd = -1;
   payload->prefix = NULL;
@@ -85,15 +86,14 @@ void lc_collection_payload_cleanup(lc_collection_payload *payload) {
 static int lc_cp_open(lc_collection_payload *payload,
                       lc_collection_handle *collection, int fd,
                       const lc_pouch_collection_record *record,
-                      const lc_collection_unit *unit, const void *prefix,
-                      size_t prefix_size, lc_error *error) {
+                      const lc_collection_unit *unit, const char *unit_binding,
+                      const void *prefix, size_t prefix_size, lc_error *error) {
   char position[32];
   char context[256];
   char upload_context[256];
-  unsigned char proof[32];
   const char *descriptor = record->descriptor;
   int n;
-  int rc, indexed = 0;
+  int rc = LC_OK, indexed = 0;
   const EVP_MD *digest;
   lc_collection_payload_reset(payload);
   if (record->metadata_only) {
@@ -116,25 +116,27 @@ static int lc_cp_open(lc_collection_payload *payload,
   payload->bytes = 0U;
   payload->record = record;
   payload->fd = fd;
-  if (lc_u64_format_base10(record->position, position, sizeof(position)) < 0)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection position cannot be formatted");
-  n = snprintf(context, sizeof(context), "collection:%s:%s:%s", collection->id,
-               record->append_id, position);
-  if (n < 0 || (size_t)n >= sizeof(context))
-    return lc_collection_failure(
-        error, LC_ERR_PROTOCOL, "collection_corrupt",
-        "collection identity context exceeds its bound");
-  if (strcmp(record->context, context) != 0) {
-    n = snprintf(upload_context, sizeof(upload_context),
-                 "collection:%s:%s:", collection->id, record->append_id);
-    if (n < 0 || (size_t)n >= sizeof(upload_context) ||
-        strncmp(record->context, upload_context, (size_t)n) ||
-        (strcmp(record->context + n, "upload") &&
-         !lc_xid_is_valid(record->context + n)))
+  if (!unit) {
+    if (lc_u64_format_base10(record->position, position, sizeof(position)) < 0)
+      return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
+                                   "collection position cannot be formatted");
+    n = snprintf(context, sizeof(context), "collection:%s:%s:%s",
+                 collection->id, record->append_id, position);
+    if (n < 0 || (size_t)n >= sizeof(context))
       return lc_collection_failure(
           error, LC_ERR_PROTOCOL, "collection_corrupt",
-          "collection body has a different identity binding");
+          "collection identity context exceeds its bound");
+    if (strcmp(record->context, context) != 0) {
+      n = snprintf(upload_context, sizeof(upload_context),
+                   "collection:%s:%s:", collection->id, record->append_id);
+      if (n < 0 || (size_t)n >= sizeof(upload_context) ||
+          strncmp(record->context, upload_context, (size_t)n) ||
+          (strcmp(record->context + n, "upload") &&
+           !lc_xid_is_valid(record->context + n)))
+        return lc_collection_failure(
+            error, LC_ERR_PROTOCOL, "collection_corrupt",
+            "collection body has a different identity binding");
+    }
   }
   digest = NULL;
   if (payload->hash == NULL) {
@@ -151,18 +153,12 @@ static int lc_cp_open(lc_collection_payload *payload,
     return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                  "failed to initialize collection body hash");
   if (unit) {
-    rc = lc_collection_unit_manifest(record, collection->id,
-                                     &payload->chunks.manifest, context, proof,
-                                     error);
-    if (rc != LC_OK)
-      return rc;
-    if (memcmp(proof, record->manifest, sizeof(proof)))
-      return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                   "collection unit has a different identity");
-    rc = lc_pouch_crypto_descriptor_same_payload(record->descriptor,
-                                                 unit->descriptor, error);
-    if (rc != LC_OK)
-      return rc;
+    /* The direct order reader already constructed this record and manifest
+     * from the validated unit and order row. Authenticate that binding below
+     * without hashing the same manifest a second time. */
+    strcpy(context, unit_binding);
+    /* Its publication descriptor was restored from this exact unit descriptor;
+     * their payload fields are identical by construction. */
     if (descriptor[0] || lc_pouch_crypto_enabled(collection->pouch->crypto)) {
       if (!payload->decoder)
         rc = lc_pouch_crypto_reader_open(collection->pouch->crypto,
@@ -196,8 +192,10 @@ static int lc_cp_open(lc_collection_payload *payload,
       payload->decoded = &payload->chunks.source;
     }
   }
-  if (indexed)
+  if (indexed) {
+    payload->read_decoded = payload->decoded->read;
     return LC_OK;
+  }
   if (prefix_size) {
     payload->prefix = prefix;
     payload->prefix_size = prefix_size;
@@ -215,13 +213,19 @@ static int lc_cp_open(lc_collection_payload *payload,
         return rc;
     }
     if (prefix_size)
-      return lc_pouch_crypto_reader_bind_source(
+      rc = lc_pouch_crypto_reader_bind_source(
           payload->decoder, record->context, context, &payload->encoded,
           record->stored_bytes, descriptor, &payload->decoded, error);
-    return lc_pouch_crypto_reader_bind(
-        payload->decoder, record->context, context, fd, payload->start,
-        record->stored_bytes, descriptor, &payload->decoded, error);
+    else
+      rc = lc_pouch_crypto_reader_bind(
+          payload->decoder, record->context, context, fd, payload->start,
+          record->stored_bytes, descriptor, &payload->decoded, error);
+    if (rc != LC_OK)
+      return rc;
   }
+  if (payload->decoded != NULL)
+    payload->read_decoded =
+        lc_pouch_crypto_reader_select_read(payload->decoder, payload->decoded);
   return LC_OK;
 }
 
@@ -229,17 +233,19 @@ int lc_collection_payload_open(lc_collection_payload *payload,
                                lc_collection_handle *collection, int fd,
                                const lc_pouch_collection_record *record,
                                lc_error *error) {
-  return lc_cp_open(payload, collection, fd, record, NULL, NULL, 0U, error);
+  return lc_cp_open(payload, collection, fd, record, NULL, NULL, NULL, 0U,
+                    error);
 }
 
 int lc_collection_payload_open_prefix(lc_collection_payload *payload,
                                       lc_collection_handle *collection, int fd,
                                       const lc_pouch_collection_record *record,
                                       const lc_collection_unit *unit,
+                                      const char *unit_binding,
                                       const void *prefix, size_t prefix_size,
                                       lc_error *error) {
-  return lc_cp_open(payload, collection, fd, record, unit, prefix, prefix_size,
-                    error);
+  return lc_cp_open(payload, collection, fd, record, unit, unit_binding, prefix,
+                    prefix_size, error);
 }
 
 int lc_collection_payload_read(lc_collection_payload *payload, void *bytes,
@@ -255,7 +261,7 @@ int lc_collection_payload_read(lc_collection_payload *payload, void *bytes,
   if (capacity == 0U)
     return LC_OK;
   if (payload->decoded != NULL) {
-    *got = payload->decoded->read(payload->decoded, bytes, capacity, error);
+    *got = payload->read_decoded(payload->decoded, bytes, capacity, error);
     if (error != NULL && error->code != LC_OK)
       return error->code;
   } else {

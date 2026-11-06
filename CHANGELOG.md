@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Decrypt uncompressed collection frames directly into bounded read scratch,
+  avoiding an intermediate plaintext copy. Retain authentication before delivery
+  and wipe tentative output on authentication failure.
+- Reuse per-operation HMAC key setup and the direct reader's manifest binding;
+  avoid repeating identity construction and descriptor comparison for a unit
+  whose publication descriptor was constructed from that same unit.
 - Deliver large collection reads in bounded 64 KiB heap chunks matching the
   codec transfer size, retaining the 16 KiB allocation for small reads.
   Preserve retry cursors, filtering and integrity checks after read failures.

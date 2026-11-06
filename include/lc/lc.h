@@ -960,7 +960,10 @@ struct lc_collection {
                         const lc_collection_metadata_req *req,
                         lc_collection_append_res *out, lc_error *error);
   /** Streams original compact JSON + LF, with separate per-object cursor
-   * metadata. A captured committed EOD bounds this invocation. */
+   * metadata. A captured committed EOD bounds this invocation. Sink writes are
+   * byte fragments whose sizes and boundaries can vary independently of
+   * entries.
+   */
   int (*read)(lc_collection *self, const lc_collection_read_opts *opts,
               lc_sink *sink, lc_collection_read_res *out, lc_error *error);
   int (*delete_entry)(lc_collection *self, uint64_t position,
