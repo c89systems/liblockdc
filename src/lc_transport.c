@@ -274,15 +274,6 @@ void lc_engine_release_response_cleanup(lc_engine_release_response *response) {
   memset(response, 0, sizeof(*response));
 }
 
-void lc_engine_query_response_cleanup(lc_engine_query_response *response) {
-  if (response == NULL) {
-    return;
-  }
-  lc_engine_free_string(&response->cursor);
-  lc_engine_free_string(&response->correlation_id);
-  memset(response, 0, sizeof(*response));
-}
-
 void lc_engine_enqueue_response_cleanup(lc_engine_enqueue_response *response) {
   if (response == NULL) {
     return;
@@ -485,14 +476,6 @@ int lc_engine_buffer_append_limited(lc_engine_buffer *buffer, const char *bytes,
     }
   }
   return lc_engine_buffer_append(buffer, bytes, count);
-}
-
-int lc_engine_buffer_append_cstr_limited(lc_engine_buffer *buffer,
-                                         const char *value, size_t limit) {
-  if (value == NULL) {
-    return LC_ENGINE_OK;
-  }
-  return lc_engine_buffer_append_limited(buffer, value, strlen(value), limit);
 }
 
 static int lc_engine_case_equal_n(const char *left, const char *right,

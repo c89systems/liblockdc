@@ -16167,16 +16167,6 @@ int lc_pouch_state_promote_staged(lc_pouch *pouch, const char *ns,
       pouch, ns, key, txn_id, expected_committed_etag, out, 0, 0L, error);
 }
 
-int lc_pouch_state_promote_staged_for_active_operation(
-    lc_pouch *pouch, const char *ns, const char *key, const char *txn_id,
-    const char *expected_committed_etag,
-    lc_pouch_unix_seconds operation_expires_at_unix,
-    lc_pouch_state_write_result *out, lc_error *error) {
-  return lc_pouch_state_promote_staged_with_operation(
-      pouch, ns, key, txn_id, expected_committed_etag, out, 1,
-      operation_expires_at_unix, error);
-}
-
 int lc_pouch_state_commit_staged_locked(lc_pouch *pouch, const char *ns,
                                         const char *key, const char *txn_id,
                                         lc_pouch_state_write_result *out,
@@ -17026,14 +17016,6 @@ int lc_pouch_state_read_many_cached(lc_pouch *pouch, const char *ns,
                                     void *context, lc_error *error) {
   return lc_pouch_state_read_many_internal(pouch, ns, keys, key_count, visitor,
                                            context, 1, 0, error);
-}
-
-int lc_pouch_state_read_many_metadata(lc_pouch *pouch, const char *ns,
-                                      const char *const *keys, size_t key_count,
-                                      lc_pouch_state_read_many_fn visitor,
-                                      void *context, lc_error *error) {
-  return lc_pouch_state_read_many_internal(pouch, ns, keys, key_count, visitor,
-                                           context, 0, 1, error);
 }
 
 int lc_pouch_state_scan_summary_read_body(

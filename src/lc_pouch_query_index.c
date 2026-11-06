@@ -451,12 +451,6 @@ typedef struct lc_pouch_query_index_presence_reader {
   void *context;
 } lc_pouch_query_index_presence_reader;
 
-typedef struct lc_pouch_query_index_any_merge_context {
-  const lc_allocator *allocator;
-  lc_pouch_index_result_row_list *lists;
-  size_t list_count;
-} lc_pouch_query_index_any_merge_context;
-
 typedef struct lc_pouch_query_index_exact_generation_docids {
   unsigned long term_id;
   lc_pouch_index_docid_set docids;
@@ -17340,190 +17334,6 @@ static int lc_pouch_query_index_visit_exact_generation(
   return rc;
 }
 
-static int
-lc_pouch_query_index_any_merge_collect(const lc_pouch_query_index_key_view *key,
-                                       void *context, lc_error *error) {
-  lc_pouch_query_index_any_merge_context *merge_context;
-
-  merge_context = (lc_pouch_query_index_any_merge_context *)context;
-  if (merge_context == NULL || key == NULL ||
-      key->value_index >= merge_context->list_count) {
-    return LC_OK;
-  }
-  return lc_pouch_index_result_row_list_add(
-      merge_context->allocator, &merge_context->lists[key->value_index],
-      key->key, key->key_hex, key->doc_id, key->version, key->bytes,
-      key->has_query_hidden, key->query_hidden, key->value_index, error);
-}
-
-static int lc_pouch_query_index_any_merge_emit(
-    lc_pouch_query_index_any_merge_context *merge_context,
-    lc_pouch_query_index_key_visit_fn visit, void *context, lc_error *error) {
-  size_t *positions;
-  size_t index;
-  size_t min_index;
-  const char *min_key;
-  int rc;
-
-  if (merge_context == NULL || visit == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch query-index merge emit requires context and "
-                        "visitor",
-                        NULL, NULL, NULL);
-  }
-  positions = (size_t *)lc_alloc_with_allocator(
-      merge_context->allocator, merge_context->list_count * sizeof(*positions));
-  if (positions == NULL) {
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch query-index merge cursors",
-                        NULL, NULL, NULL);
-  }
-  memset(positions, 0, merge_context->list_count * sizeof(*positions));
-  rc = LC_OK;
-  while (rc == LC_OK) {
-    min_index = merge_context->list_count;
-    min_key = NULL;
-    for (index = 0U; index < merge_context->list_count; ++index) {
-      lc_pouch_index_result_row_list *list;
-
-      list = &merge_context->lists[index];
-      if (positions[index] >= list->count) {
-        continue;
-      }
-      if (min_key == NULL ||
-          strcmp(list->items[positions[index]].key, min_key) < 0) {
-        min_key = list->items[positions[index]].key;
-        min_index = index;
-      }
-    }
-    if (min_key == NULL || min_index >= merge_context->list_count) {
-      break;
-    }
-    {
-      lc_pouch_index_result_row *row;
-      lc_pouch_query_index_key_view key_view;
-
-      row = &merge_context->lists[min_index].items[positions[min_index]];
-      memset(&key_view, 0, sizeof(key_view));
-      key_view.key = row->key;
-      key_view.key_hex = row->key_hex;
-      key_view.doc_id = row->doc_id;
-      key_view.version = row->version;
-      key_view.bytes = row->bytes;
-      key_view.has_query_hidden = row->has_query_hidden;
-      key_view.query_hidden = row->query_hidden;
-      key_view.value_index = row->value_index;
-      rc = visit(&key_view, context, error);
-    }
-    for (index = 0U; index < merge_context->list_count; ++index) {
-      lc_pouch_index_result_row_list *list;
-
-      list = &merge_context->lists[index];
-      while (positions[index] < list->count &&
-             strcmp(list->items[positions[index]].key, min_key) == 0) {
-        ++positions[index];
-      }
-    }
-  }
-  if (rc == LC_POUCH_STATE_READ_MANY_STOP) {
-    rc = LC_OK;
-  }
-  lc_free_with_allocator(merge_context->allocator, positions);
-  return rc;
-}
-
-int lc_pouch_query_index_visit_scalar_any_merged(
-    lc_pouch *pouch, const char *ns, const char *field,
-    const char *const *values, const char *value_types, size_t value_count,
-    lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error) {
-  lc_pouch_query_index_any_merge_context merge_context;
-  size_t index;
-  int rc;
-
-  memset(&merge_context, 0, sizeof(merge_context));
-  if (pouch == NULL || value_count == 0U) {
-    return lc_pouch_query_index_visit_scalar_any(
-        pouch, ns, field, values, value_types, value_count, visit, context,
-        index_seq, error);
-  }
-  if (value_count == 1U) {
-    return lc_pouch_query_index_visit_scalar(pouch, ns, field, values[0],
-                                             value_types[0], visit, context,
-                                             index_seq, error);
-  }
-  merge_context.allocator = &pouch->allocator;
-  merge_context.list_count = value_count;
-  merge_context.lists =
-      (lc_pouch_index_result_row_list *)lc_alloc_with_allocator(
-          &pouch->allocator, value_count * sizeof(*merge_context.lists));
-  if (merge_context.lists == NULL) {
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch query-index merge lists",
-                        NULL, NULL, NULL);
-  }
-  memset(merge_context.lists, 0, value_count * sizeof(*merge_context.lists));
-  rc = lc_pouch_query_index_visit_scalar_any(
-      pouch, ns, field, values, value_types, value_count,
-      lc_pouch_query_index_any_merge_collect, &merge_context, index_seq, error);
-  if (rc == LC_OK) {
-    rc = lc_pouch_query_index_any_merge_emit(&merge_context, visit, context,
-                                             error);
-  }
-  for (index = 0U; index < value_count; ++index) {
-    lc_pouch_index_result_row_list_cleanup(&pouch->allocator,
-                                           &merge_context.lists[index]);
-  }
-  lc_free_with_allocator(&pouch->allocator, merge_context.lists);
-  return rc;
-}
-
-int lc_pouch_query_index_visit_scalar_terms_merged(
-    lc_pouch *pouch, const char *ns,
-    const lc_pouch_query_index_scalar_term *terms, size_t term_count,
-    lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error) {
-  lc_pouch_query_index_any_merge_context merge_context;
-  size_t index;
-  int rc;
-
-  memset(&merge_context, 0, sizeof(merge_context));
-  if (pouch == NULL || term_count == 0U) {
-    return lc_pouch_query_index_visit_scalar_terms(
-        pouch, ns, terms, term_count, visit, context, index_seq, error);
-  }
-  if (term_count == 1U) {
-    return lc_pouch_query_index_visit_scalar(
-        pouch, ns, terms[0].field, terms[0].value, terms[0].value_type, visit,
-        context, index_seq, error);
-  }
-  merge_context.allocator = &pouch->allocator;
-  merge_context.list_count = term_count;
-  merge_context.lists =
-      (lc_pouch_index_result_row_list *)lc_alloc_with_allocator(
-          &pouch->allocator, term_count * sizeof(*merge_context.lists));
-  if (merge_context.lists == NULL) {
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch query-index term merge "
-                        "lists",
-                        NULL, NULL, NULL);
-  }
-  memset(merge_context.lists, 0, term_count * sizeof(*merge_context.lists));
-  rc = lc_pouch_query_index_visit_scalar_terms(
-      pouch, ns, terms, term_count, lc_pouch_query_index_any_merge_collect,
-      &merge_context, index_seq, error);
-  if (rc == LC_OK) {
-    rc = lc_pouch_query_index_any_merge_emit(&merge_context, visit, context,
-                                             error);
-  }
-  for (index = 0U; index < term_count; ++index) {
-    lc_pouch_index_result_row_list_cleanup(&pouch->allocator,
-                                           &merge_context.lists[index]);
-  }
-  lc_free_with_allocator(&pouch->allocator, merge_context.lists);
-  return rc;
-}
-
 int lc_pouch_query_index_visit_scalar_terms_docids(
     lc_pouch *pouch, const char *ns,
     const lc_pouch_query_index_scalar_term *terms, size_t term_count,
@@ -17668,21 +17478,6 @@ int lc_pouch_query_index_visit_prefix_candidates(
   return rc;
 }
 
-int lc_pouch_query_index_visit_contains(
-    lc_pouch *pouch, const char *ns, const char *field, const char *needle,
-    int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error) {
-  if (needle == NULL || needle[0] == '\0') {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch query-index contains lookup requires non-empty "
-                        "needle",
-                        NULL, NULL, NULL);
-  }
-  return lc_pouch_query_index_visit_text_generation(
-      pouch, ns, field, needle, 0, 1, ignore_case, visit, context, NULL,
-      index_seq, NULL, error);
-}
-
 static int lc_pouch_query_index_visit_contains_complete_with_snapshot(
     lc_pouch *pouch, const char *ns, const char *field, const char *needle,
     int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
@@ -17704,15 +17499,6 @@ static int lc_pouch_query_index_visit_contains_complete_with_snapshot(
   return lc_pouch_query_index_visit_text_generation(
       pouch, ns, field, needle, 0, 1, ignore_case, visit, context,
       state_index_seq_snapshot, index_seq, complete, error);
-}
-
-int lc_pouch_query_index_visit_contains_complete(
-    lc_pouch *pouch, const char *ns, const char *field, const char *needle,
-    int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, int *complete, lc_error *error) {
-  return lc_pouch_query_index_visit_contains_complete_with_snapshot(
-      pouch, ns, field, needle, ignore_case, visit, context, NULL, index_seq,
-      complete, error);
 }
 
 int lc_pouch_query_index_visit_contains_complete_at_snapshot(

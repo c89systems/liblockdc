@@ -25,6 +25,8 @@ int lc_lua_client_view(lua_State *L, int index, lc_client **out,
  * open copies configuration before this temporary is released. */
 typedef int (*lc_lua_xa_configure_fn)(lua_State *L, int index, void **out,
                                       lc_error *error);
+/** Releases temporary provider configuration after native open or a protected
+ * configuration failure. It does not close the copied native resource. */
 typedef void (*lc_lua_xa_config_cleanup_fn)(void *configuration);
 /** Explicitly registers linked callbacks for coordinator:register_start(name,
  * configuration) and journal:resource(name, configuration). Copies the table

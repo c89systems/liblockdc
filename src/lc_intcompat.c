@@ -309,13 +309,6 @@ int lc_parse_ulong_base10_checked(const char *text, unsigned long *out_value) {
          lc_u64_to_ulong_checked(value, out_value);
 }
 
-int lc_parse_size_base10_checked(const char *text, size_t *out_value) {
-  lc_u64 value;
-
-  return lc_u64_parse_base10(text, &value) &&
-         lc_u64_to_size_checked(value, out_value);
-}
-
 static int lc_parse_base10_copy(const char *text, size_t length, char *buffer,
                                 size_t buffer_size, size_t *out_length) {
   size_t start;
@@ -357,19 +350,6 @@ int lc_parse_long_base10_range_checked(const char *text, size_t length,
   }
   (void)parsed_length;
   return lc_parse_long_base10_checked(buffer, out_value);
-}
-
-int lc_parse_ulong_base10_range_checked(const char *text, size_t length,
-                                        unsigned long *out_value) {
-  char buffer[64];
-  size_t parsed_length;
-
-  if (!lc_parse_base10_copy(text, length, buffer, sizeof(buffer),
-                            &parsed_length)) {
-    return 0;
-  }
-  (void)parsed_length;
-  return lc_parse_ulong_base10_checked(buffer, out_value);
 }
 
 int lc_parse_i64_base10_range_checked(const char *text, size_t length,

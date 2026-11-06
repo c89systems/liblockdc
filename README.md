@@ -1,17 +1,18 @@
 # liblockdc
 
 `liblockdc` is a C89/C90 client library for `lockd`, providing persistent state,
-leases, queues, attachments, queries, and built-in implicit XA transactions
-with coordinated commit, rollback, and recovery. It also includes Pouch, an
-embedded storage engine that makes these capabilities available directly
-inside your application without a separate `lockd` server.
+ordered collections, leases, queues, attachments, queries, and built-in implicit
+XA transactions with coordinated commit, rollback, and recovery. It also
+includes Pouch, an embedded storage engine that makes these capabilities
+available directly inside your application without a separate `lockd` server.
 
 Its installed header is also usable from C++98-or-later applications through C
 linkage. It provides a receiver-function public API for client, lease, queue
-delivery, attachment, management, and consumer-service handles, plus stream-based
-JSON and payload I/O. The project ships both static and shared libraries, a
-local development environment, a cross-architecture release pipeline, and
-dependency-backed unit, e2e, sanitizer, coverage, fuzz, and benchmark targets.
+delivery, collection, attachment, management, and consumer-service handles, plus
+stream-based JSON and payload I/O. The project ships both static and shared
+libraries, a local development environment, a cross-architecture release
+pipeline, and dependency-backed unit, e2e, sanitizer, coverage, fuzz, and
+benchmark targets.
 
 ## Supported targets
 

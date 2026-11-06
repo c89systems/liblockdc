@@ -36,23 +36,6 @@ int lc_pouch_crypto_compression_enabled(const lc_pouch_crypto *crypto);
 void lc_pouch_crypto_set_compression(lc_pouch_crypto *crypto, int enabled);
 int lc_pouch_crypto_key_id(const lc_pouch_crypto *crypto, char **out,
                            lc_error *error);
-int lc_pouch_crypto_stream_to_file(lc_pouch_crypto *crypto, const char *context,
-                                   const char *path, lc_source *body,
-                                   uint64_t *plain_bytes,
-                                   uint64_t *cipher_bytes,
-                                   char **descriptor_out, lc_error *error);
-int lc_pouch_crypto_stream_to_file_relaxed(
-    lc_pouch_crypto *crypto, const char *context, const char *path,
-    lc_source *body, uint64_t *plain_bytes, uint64_t *cipher_bytes,
-    char **descriptor_out, lc_error *error);
-int lc_pouch_crypto_stream_to_file_relaxed_uncompressed(
-    lc_pouch_crypto *crypto, const char *context, const char *path,
-    lc_source *body, uint64_t *plain_bytes, uint64_t *cipher_bytes,
-    char **descriptor_out, lc_error *error);
-int lc_pouch_crypto_stream_to_fd(lc_pouch_crypto *crypto, const char *context,
-                                 int fd, lc_source *body, uint64_t *plain_bytes,
-                                 uint64_t *cipher_bytes, char **descriptor_out,
-                                 lc_error *error);
 int lc_pouch_crypto_stream_to_fd_crc(lc_pouch_crypto *crypto,
                                      const char *context, int fd,
                                      lc_source *body, uint64_t *plain_bytes,
@@ -201,8 +184,6 @@ int lc_pouch_crypto_test_generate_key_file_status(const char *path,
                                                   lc_error *error);
 void lc_pouch_crypto_test_set_random_material(const unsigned char *bytes,
                                               size_t length);
-int lc_pouch_crypto_test_descriptor_compressed(const char *descriptor, int *out,
-                                               lc_error *error);
 int lc_pouch_crypto_test_descriptor_set_compressed(const char *descriptor,
                                                    int compressed, char **out,
                                                    lc_error *error);

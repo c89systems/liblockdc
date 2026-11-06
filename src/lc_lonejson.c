@@ -585,26 +585,6 @@ int lc_engine_lonejson_error_from_status(lc_engine_error *error,
   }
 }
 
-int lc_engine_file_write_callback(void *context, const void *bytes,
-                                  size_t count, lc_engine_error *error) {
-  FILE *fp;
-
-  fp = (FILE *)context;
-  if (fp == NULL || (count > 0U && bytes == NULL)) {
-    return lc_engine_set_client_error(
-        error, LC_ENGINE_ERROR_INVALID_ARGUMENT,
-        "file write callback requires file and bytes");
-  }
-  if (count > 0U && fwrite(bytes, 1U, count, fp) != count) {
-    if (ferror(fp)) {
-      return lc_engine_set_transport_error(error, strerror(errno));
-    }
-    return lc_engine_set_transport_error(error,
-                                         "failed to write temporary JSON file");
-  }
-  return 1;
-}
-
 int lc_lonejson_parse_file(lonejson *runtime, FILE *fp, const lonejson_map *map,
                            void *dst, lc_error *error, const char *message) {
   if (runtime == NULL || fp == NULL || map == NULL || dst == NULL) {

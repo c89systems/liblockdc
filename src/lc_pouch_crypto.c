@@ -1812,26 +1812,6 @@ static int lc_pouch_crypto_descriptor_decode(const char *descriptor,
 }
 
 #ifdef LOCKDC_TEST_BUILD
-int lc_pouch_crypto_test_descriptor_compressed(const char *descriptor, int *out,
-                                               lc_error *error) {
-  lc_pouch_crypto_desc desc;
-  int rc;
-
-  if (out == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch crypto descriptor test requires output", NULL,
-                        NULL, "pouch");
-  }
-  *out = 0;
-  memset(&desc, 0, sizeof(desc));
-  rc = lc_pouch_crypto_descriptor_decode(descriptor, &desc, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  *out = desc.compressed;
-  return LC_OK;
-}
-
 int lc_pouch_crypto_test_descriptor_set_compressed(const char *descriptor,
                                                    int compressed, char **out,
                                                    lc_error *error) {
@@ -2331,95 +2311,6 @@ static int lc_pouch_zlib_source_open(const lc_allocator *allocator,
   source->pub.impl = source;
   *out = source;
   return LC_OK;
-}
-
-static int lc_pouch_crypto_stream_to_fd_crc_impl(
-    lc_pouch_crypto *crypto, const char *context, int fd, lc_source *body,
-    uint64_t *plain_bytes, uint64_t *cipher_bytes, unsigned long *stored_crc,
-    char **descriptor_out, int allow_compression, lc_error *error);
-
-static int lc_pouch_crypto_stream_to_file_impl(
-    lc_pouch_crypto *crypto, const char *context, const char *path,
-    lc_source *body, uint64_t *plain_bytes, uint64_t *cipher_bytes,
-    char **descriptor_out, int sync_file, int allow_compression,
-    lc_error *error) {
-  int fd;
-  int rc;
-
-  if (path == NULL || body == NULL || plain_bytes == NULL ||
-      cipher_bytes == NULL || descriptor_out == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch crypto stream write requires path, body, byte "
-                        "outputs, and descriptor output",
-                        NULL, NULL, "pouch");
-  }
-  *descriptor_out = NULL;
-  fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0666);
-  if (fd < 0) {
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to create pouch state payload", strerror(errno),
-                        NULL, "pouch");
-  }
-  rc = lc_pouch_crypto_stream_to_fd_crc_impl(
-      crypto, context, fd, body, plain_bytes, cipher_bytes, NULL,
-      descriptor_out, allow_compression, error);
-  if (rc == LC_OK && sync_file && fsync(fd) != 0) {
-    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                      "failed to fsync pouch state payload", strerror(errno),
-                      NULL, "pouch");
-  }
-  if (close(fd) != 0 && rc == LC_OK) {
-    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                      "failed to close pouch state payload", strerror(errno),
-                      NULL, "pouch");
-  }
-  if (rc != LC_OK) {
-    unlink(path);
-    if (*descriptor_out != NULL) {
-      lc_free_with_allocator(crypto != NULL ? &crypto->allocator : NULL,
-                             *descriptor_out);
-      *descriptor_out = NULL;
-    }
-    return rc;
-  }
-  return LC_OK;
-}
-
-int lc_pouch_crypto_stream_to_file(lc_pouch_crypto *crypto, const char *context,
-                                   const char *path, lc_source *body,
-                                   uint64_t *plain_bytes,
-                                   uint64_t *cipher_bytes,
-                                   char **descriptor_out, lc_error *error) {
-  return lc_pouch_crypto_stream_to_file_impl(crypto, context, path, body,
-                                             plain_bytes, cipher_bytes,
-                                             descriptor_out, 1, 1, error);
-}
-
-int lc_pouch_crypto_stream_to_file_relaxed(
-    lc_pouch_crypto *crypto, const char *context, const char *path,
-    lc_source *body, uint64_t *plain_bytes, uint64_t *cipher_bytes,
-    char **descriptor_out, lc_error *error) {
-  return lc_pouch_crypto_stream_to_file_impl(crypto, context, path, body,
-                                             plain_bytes, cipher_bytes,
-                                             descriptor_out, 0, 1, error);
-}
-
-int lc_pouch_crypto_stream_to_file_relaxed_uncompressed(
-    lc_pouch_crypto *crypto, const char *context, const char *path,
-    lc_source *body, uint64_t *plain_bytes, uint64_t *cipher_bytes,
-    char **descriptor_out, lc_error *error) {
-  return lc_pouch_crypto_stream_to_file_impl(crypto, context, path, body,
-                                             plain_bytes, cipher_bytes,
-                                             descriptor_out, 0, 0, error);
-}
-
-int lc_pouch_crypto_stream_to_fd(lc_pouch_crypto *crypto, const char *context,
-                                 int fd, lc_source *body, uint64_t *plain_bytes,
-                                 uint64_t *cipher_bytes, char **descriptor_out,
-                                 lc_error *error) {
-  return lc_pouch_crypto_stream_to_fd_crc_impl(crypto, context, fd, body,
-                                               plain_bytes, cipher_bytes, NULL,
-                                               descriptor_out, 1, error);
 }
 
 typedef struct lc_pouch_crypto_output {

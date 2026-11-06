@@ -104,6 +104,10 @@ set(lockdc_lua_documentation_sources
     docs/pouch-storage.md
     docs/collections.md
     docs/collection-writer.md
+    docs/collection-leases.md
+    docs/collection-edits.md
+    docs/collection-read-comparison.md
+    docs/logging.md
     docs/state-retention.md
     docs/worst-case-scenario.md
     examples/lua/README.md

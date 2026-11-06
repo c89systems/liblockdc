@@ -8,7 +8,7 @@ this work does not implement or modify lockd.
 Existing storage/durability policy is documented in [Pouch storage](pouch-storage.md)
 and language ownership conventions in [the Lua SDK guide](lua.md).
 
-## Purpose and first scope
+## Purpose and scope
 
 A collection is an ordered owner of state objects with immutable JSON bodies
 within a namespace.
@@ -162,7 +162,7 @@ violations fail before publication. Validation and compaction of structural
 whitespace are incremental. Preserve JSON values and member order; this is not
 semantic canonicalization or object-key sorting.
 
-The initial validator supports nesting through 128 levels, decoded object keys
+The validator supports nesting through 128 levels, decoded object keys
 through 64 KiB, and number tokens through 4096 bytes. String values and total
 document size are not constrained by a whole-value buffer; normal storage and
 checked byte-counter limits still apply. Input chunks are bounded, and parser
@@ -1187,12 +1187,10 @@ persistent retry outcomes. Ordinary appends remain independent operations.
 Count-retention layouts were introduced with ABI 7. Do not tie
 Pouch record or HTTP protocol version markers to the repository release tag.
 
-Document the final C declarations, Lua facade, ownership, errors, and server
-framing together. Add executable public-only examples and installed static,
-shared, and Lua consumer proof. Native/storage/C/Lua cases below apply to the
-first Pouch implementation. The
-multipart/HTTP cases additionally gate enabling the future remote capability;
-they do not require implementing or modifying lockd in the Pouch change.
+The native/storage/C/Lua verification contract includes public-only examples
+and installed static, shared and Lua consumers. The multipart/HTTP cases below
+are requirements for a future remote capability, not claims of current remote
+support or implemented server tests.
 
 - Empty, large, pretty-printed, chunk-split, invalid/trailing JSON and source
   failures; bounded memory with keys/strings/objects larger than the chunk size.
@@ -1251,8 +1249,3 @@ Report bytes, entries, examined candidates, file opens, memory, worker count,
 and elapsed time. Use structural assertions rather than host-sensitive latency
 thresholds in regression tests. "Best in class" requires measured evidence.
 Ordinary state operations must retain their existing performance envelope.
-
-The separate CAI adoption must demonstrate its real resume/export workload.
-v1 checkpoints allow incremental recovery reads; efficient last-turn console
-selection remains a later collection-read feature and must not be claimed by
-merely adding filtered full-history replay.

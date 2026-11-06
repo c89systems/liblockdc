@@ -148,6 +148,7 @@ methods, result shapes, or convenience behavior.
 Primary entrypoints:
 
 - `lockdc.open(config)`
+- `lockdc.allocator_tracking_configure(enabled)` before creating SDK objects
 - `lockdc.version_string()`
 - `lockdc.xid_new()`
 - `lockdc.encode_json(value)`
@@ -174,6 +175,8 @@ Primary handle types:
 
 - `Client`
 - `Lease`
+- `Collection`
+- `CollectionWriter`
 - `Message`
 - `Outbox`
 - `OutboxDispatcher`
@@ -182,6 +185,9 @@ Primary handle types:
 - `OutboxJob`
 - `HistoryConsumer`
 - `Service`
+- `XACoordinator`, `XATransaction`, and `XAOperation`
+- `XAStore`, `XAResource`, `XABranch`, and `XAResourceOperation`
+- `XABorrow` for scoped native connection access
 
 ## Byte sources, sinks, and explicit materialization
 

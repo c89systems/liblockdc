@@ -79,7 +79,7 @@ LQL page files, apparent bytes and allocated blocks. Process I/O counters report
 read/write calls and kernel-accounted storage bytes. These are not physical
 device IOPS and exclude filesystem journal/metadata traffic not charged there.
 
-## What compaction does today
+## Compaction accounting
 
 Forced collection compaction copies retained records into a rolling snapshot
 group, keeping their stored payload bytes and building matching projections.
@@ -96,11 +96,12 @@ collection compaction is not evidence of sustainable incremental consolidation.
 The probe verifies the data again after forced compaction and reports its
 time, I/O, resulting file count and sequential read costs.
 
-Public push packs canonical chunks into rolling segments. LQL pages still
-use one artifact per covered group of up to 63 positions. Packed indexing and
-lock consolidation are separate changes. This experiment supplies evidence for
-a design decision; it does not establish production readiness, huge-history
-scalability or journalctl-equivalent performance.
+Public push packs canonical chunks into rolling segments. LQL pages use one
+artifact per covered ordered-index page. The current storage and concurrency
+contract is documented in [incremental appends](collection-writer.md); this
+diagnostic measures it rather than proposing a replacement implementation.
+Results do not establish huge-history scalability or journalctl-equivalent
+performance.
 
 ## Direct versus staged pull
 
@@ -146,8 +147,8 @@ quantiles are descriptive and have limited tail resolution for small profiles.
 For direct invocation, `LOCKDC_LAYOUT_SOURCE_CHUNK` selects 1..16384 bytes and
 `LOCKDC_LAYOUT_SOURCE_DELAY_US` selects 0..10000 microseconds, for these two modes.
 `LOCKDC_LAYOUT_COMPACT=0` skips compaction while retaining reopen/read checks.
-Defaults are 16384, 0 and 1 respectively. The smoke target covers small,
-threshold-sized, spilled, delayed and one-byte-fragment sources, with concurrent
+Defaults are 16384, 0 and 1 respectively. The pull smoke target covers small,
+threshold-sized, multi-chunk, delayed and one-byte-fragment sources, with concurrent
 and durable cases under sanitizers and allocation tracking.
 
 These measurements compare the public direct and explicitly staged APIs.

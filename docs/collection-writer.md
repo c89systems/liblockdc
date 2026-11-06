@@ -152,12 +152,14 @@ If no codec chunk was emitted before commit, its final bounded chunk writes
 directly into a normal contiguous record under the existing publication lock.
 This preserves the small-entry path without an entry-sized buffer or spool.
 Parser/codec chunk capacities remain independent of the complete entry size.
-Reads retain bounded 16 KiB delivery chunks and cancellation granularity.
+Reads start with bounded 16 KiB heap scratch and grow at most once to 64 KiB
+for larger entries. Cancellation remains cooperative between bounded chunks;
+callback lengths may follow codec-frame boundaries.
 
 For an unchanged single-unit entry without an entry deadline, the derived
 ordered projection also records its unit location. Reads can validate the unit
 metadata and begin consuming its encoded body together, using the existing
-16 KiB output scratch for that first input chunk. Identity validation precedes
+bounded output scratch for that first input chunk. Identity validation precedes
 output; complete length and fingerprint validation precede accepting the entry
 and its cursor. An LQL pass consumes that input once; a subsequent presentation
 pass reads the canonical body again. No payload cache is retained. Other entries
@@ -207,8 +209,9 @@ publication remains authoritative if projection updates or acknowledgement were
 interrupted. Maintenance reclaims abandoned extents after their producer pin
 has been released. Readers traverse the immutable index with bounded scratch and
 verify the committed body; they never reconstruct a complete entry in memory.
-On Linux, the reader disables lookahead on its sparse stream-metadata descriptor.
-Payload descriptors retain the normal policy, and contiguous records restore
+On Linux, the reader disables lookahead on sparse stream-metadata descriptors.
+Direct single-unit reads use sequential advice on their contiguous payload;
+other payload descriptors retain the normal policy. Contiguous records restore
 that policy when sharing the metadata descriptor.
 Segment transitions sync the preceding canonical history. They do not separately
 sync the rebuildable order and identity projections. A clean-close checkpoint

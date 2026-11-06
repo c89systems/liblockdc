@@ -79,6 +79,9 @@ typedef struct lc_consumer_service lc_consumer_service;
 typedef struct lc_history_consumer lc_history_consumer;
 /** Ordered owner of immutable JSON state objects. */
 typedef struct lc_collection lc_collection;
+/** Owned incremental JSON append; commit/abort do not replace the required
+ * close.
+ */
 typedef struct lc_collection_writer lc_collection_writer;
 /** Opaque transactional outbox handle. */
 typedef struct lc_outbox lc_outbox;
@@ -121,8 +124,13 @@ typedef uint64_t lc_tc_term;
  * A known expiry value of zero confirms no expiry; a positive duration staged
  * in a transaction has no final deadline until commit. */
 typedef enum lc_state_retention_support {
+  /** No authoritative support observation; a server may have ignored the
+   * requested policy.
+   */
   LC_STATE_RETENTION_UNKNOWN = 0,
+  /** Backend explicitly supports state-retention metadata. */
   LC_STATE_RETENTION_SUPPORTED = 1,
+  /** Backend explicitly reports that state retention is unsupported. */
   LC_STATE_RETENTION_UNSUPPORTED = 2
 } lc_state_retention_support;
 
@@ -584,6 +592,8 @@ typedef struct lc_collection_lease_req {
 typedef struct lc_collection_lease_info {
   /** Nonzero only while the observed lease has not expired. */
   int active;
+  /** Recorded application owner label; observation alone grants no authority.
+   */
   char owner[129];
   /** Observation/precondition for takeover, not a receiver credential. */
   char lease_id[LC_XID_STRING_SIZE];
@@ -591,6 +601,7 @@ typedef struct lc_collection_lease_info {
   uint64_t fencing_token;
   /** Absolute Unix seconds; zero means no recorded lease. */
   lc_unix_seconds expires_at_unix;
+  /** Nonzero when the recorded owner requested private payload reads. */
   int private_read;
 } lc_collection_lease_info;
 
@@ -599,7 +610,9 @@ typedef struct lc_collection_lease_info {
  * Collection expiry drops the owner and all remaining entries; it does not
  * assign a maximum age to each entry. New collections default to no expiry. */
 typedef struct lc_collection_config {
+  /** Namespace; NULL selects the client's default on input. */
   const char *ns;
+  /** Collection name within its namespace. */
   const char *name;
   /** Creation-only retention metadata. Omission creates without expiry.
    * Opening with this flag selected is invalid. */
@@ -610,6 +623,7 @@ typedef struct lc_collection_config {
    * this flag selected is invalid. Maintenance lazily removes oldest entries;
    * appends may temporarily exceed the limit. */
   int has_max_entries;
+  /** Creation-only live-entry limit; zero is unlimited. */
   uint64_t max_entries;
   /** Optional creation-only lease, established before publishing the name.
    * The returned receiver is credentialed; borrowed only during creation. */
@@ -620,19 +634,33 @@ typedef struct lc_collection_config {
  * collection receiver, or for the duration of a list callback. Counts describe
  * one committed observation and can change after the call returns. */
 typedef struct lc_collection_info {
+  /** Namespace; NULL selects the client's default on input. */
   const char *ns;
+  /** Collection name within its namespace. */
   const char *name;
+  /** Immutable collection-incarnation identifier. */
   const char *collection_id;
+  /** Permanent position high-water mark, including gaps and deleted entries. */
   uint64_t upper_position;
+  /** Live-entry count at the captured observation, before deferred
+   * maintenance.
+   */
   uint64_t live_count;
+  /** Nonzero when payload query indexing is enabled for this collection. */
   int query_indexing;
+  /** Backend support for per-object retention metadata. */
   lc_state_retention_support retention_support;
+  /** Nonzero when the expiry observation is known, including a zero deadline.
+   */
   int has_retention_expires_at_unix;
   /** Collection's own expiry; lazy removal drops all its entries as well. */
   lc_unix_seconds retention_expires_at_unix;
   /** Configured live entry limit, zero for unlimited. This is not a disk cap.
    */
   uint64_t max_entries;
+  /** Copied ownership observation; does not credential the observing
+   * receiver.
+   */
   lc_collection_lease_info lease;
 } lc_collection_info;
 
@@ -642,13 +670,23 @@ typedef struct lc_collection_info {
  * edits. Last-N and position selection are currently false. Remote clients
  * currently return all fields as zero. */
 typedef struct lc_collection_capabilities {
+  /** Supports collection lifecycle and independently atomic append/read
+   * operations.
+   */
   int collections;
+  /** Supports LQL predicates on ordered collection reads. */
   int lql_filter;
+  /** Supports resuming an incomplete read from an accepted boundary. */
   int resume;
+  /** Supports starting a new read window from a completed checkpoint. */
   int checkpoint;
+  /** Supports after-exclusive and through-inclusive position bounds. */
   int ranges;
+  /** Supports a live-input limit applied before LQL filtering. */
   int first_n;
+  /** Reserved capability; last-N selection is currently unsupported. */
   int last_n;
+  /** Reserved capability; explicit position sets are currently unsupported. */
   int position_selection;
   /** Supports per-collection max_entries and lazy oldest-first trimming. */
   int count_retention;
@@ -676,7 +714,9 @@ typedef struct lc_collection_capabilities {
  * Appends commit independently and do not participate in implicit/managed XA.
  */
 typedef struct lc_collection_append_req {
+  /** Caller-supplied retry identity, scoped to this collection incarnation. */
   const char *append_id;
+  /** Nonzero selects explicit retention for this new entry. */
   int has_retention_seconds;
   /** Entry retention from commit. Omission/zero means no expiry for a new
    * entry. An identical retry preserves the existing deadline. */
@@ -686,6 +726,8 @@ typedef struct lc_collection_append_req {
    * Duplicates and aborted/failed-before-publication appends never renew it.
    * A commit error after publication is uncertain; reconcile through status. */
   int has_collection_retention_seconds;
+  /** Parent lifetime from the new append's commit; zero clears parent expiry.
+   */
   long collection_retention_seconds;
 } lc_collection_append_req;
 
@@ -694,8 +736,12 @@ typedef struct lc_collection_append_req {
  * remain ordinary objects until maintenance deletes them. max_entries applies
  * only to the collection owner; selecting it for entry_metadata is invalid. */
 typedef struct lc_collection_metadata_req {
+  /** Nonzero selects the retention_seconds metadata update. */
   int has_retention_seconds;
+  /** Zero clears expiry; positive seconds reset it from this metadata commit.
+   */
   long retention_seconds;
+  /** Nonzero selects max_entries; invalid for entry-only metadata updates. */
   int has_max_entries;
   /** Zero disables count retention; positive values retain newest live entries
    * by permanent position, independently of age retention and LQL filtering.
@@ -707,41 +753,67 @@ typedef struct lc_collection_metadata_req {
  * lowercase SHA-256 of the compact stored JSON, excluding the output LF.
  * A deleted duplicate returns its original identity without recreating it. */
 typedef struct lc_collection_append_res {
+  /** Permanent collection position; deletion never renumbers other entries. */
   uint64_t position;
+  /** Compact plaintext JSON byte count, excluding the output LF. */
   uint64_t bytes;
+  /** Fingerprint of the compact stored JSON bytes. */
   char etag[65];
+  /** Nonzero when returning the original outcome of an identical committed
+   * retry.
+   */
   int duplicate;
+  /** Nonzero when the original published entry has since been deleted. */
   int deleted;
+  /** Backend support for per-object retention metadata. */
   lc_state_retention_support retention_support;
   /** A deleted binding has no current state deadline. */
   int has_retention_expires_at_unix;
+  /** Unix-second expiry eligibility boundary; zero means no expiry. Cleanup
+   * is deferred.
+   */
   lc_unix_seconds retention_expires_at_unix;
   /** Original append's selected parent deadline, also retained for retries.
    * It is not the parent's current deadline; use collection.describe for that.
    * Absent when the original append selected no parent directive. */
   int has_collection_retention_expires_at_unix;
+  /** Observed parent deadline; zero means no parent expiry when the
+   * corresponding flag is set.
+   */
   lc_unix_seconds collection_retention_expires_at_unix;
 } lc_collection_append_res;
 
+/** Published append-ID status; absence does not cancel an in-flight producer.
+ */
 typedef enum lc_collection_append_state {
+  /** No committed identity was observed; an upload may still be in flight. */
   LC_COLLECTION_APPEND_ABSENT = 0,
+  /** The append identity has an authoritative committed entry. */
   LC_COLLECTION_APPEND_COMMITTED = 1,
+  /** The original entry was deleted; its retry identity remains reserved. */
   LC_COLLECTION_APPEND_DELETED = 2
 } lc_collection_append_state;
 
 /** An absent observation neither cancels nor resolves an upload still running.
  * entry facts are zero when state is ABSENT. */
 typedef struct lc_collection_append_status_res {
+  /** Absent, committed or deleted observation for the requested append ID. */
   lc_collection_append_state state;
+  /** Original entry facts; zeroed when state is LC_COLLECTION_APPEND_ABSENT. */
   lc_collection_append_res entry;
 } lc_collection_append_status_res;
 
+/** Maximum disjoint position intervals accepted by one atomic collection edit.
+ */
 #define LC_COLLECTION_EDIT_MAX_RANGES 64U
+/** Maximum UTF-8 recovery descriptor bytes, excluding the terminating NUL. */
 #define LC_COLLECTION_RECOVERY_MAX_BYTES 1024U
 
 /** One finite, after-exclusive / through-inclusive pre-edit interval. */
 typedef struct lc_collection_edit_range {
+  /** Exclusive lower permanent position in the pre-edit view. */
   uint64_t after;
+  /** Inclusive upper permanent position; must exceed after. */
   uint64_t through;
 } lc_collection_edit_range;
 
@@ -750,13 +822,23 @@ typedef struct lc_collection_edit_range {
  * Zero anchor means no required entry and reports available. An unavailable
  * nonzero anchor does not pin or resurrect the referenced entry. */
 typedef struct lc_collection_head_res {
+  /** Immutable collection-incarnation identifier. */
   char collection_id[LC_XID_STRING_SIZE];
+  /** Opaque incarnation-scoped head token for edit/read preconditions. */
   char etag[65];
+  /** Permanent position high-water mark, including gaps and deleted entries. */
   uint64_t upper_position;
+  /** Live-entry count at the captured observation, before deferred
+   * maintenance.
+   */
   uint64_t live_count;
+  /** Revision of the currently published application recovery descriptor. */
   uint64_t recovery_revision;
+  /** Referenced entry position, or zero when no entry is required. */
   uint64_t recovery_anchor;
+  /** Nonzero when the anchor is zero or its entry is still live. */
   int recovery_anchor_available;
+  /** NUL-terminated opaque UTF-8 application recovery descriptor. */
   char recovery[LC_COLLECTION_RECOVERY_MAX_BYTES + 1U];
 } lc_collection_head_res;
 
@@ -771,24 +853,57 @@ typedef struct lc_collection_head_res {
  * input; only the stale head precondition is bypassed. Errors after publication
  * can be uncertain (use status). */
 typedef struct lc_collection_edit_req {
+  /** Required durable retry identity; retain the original request until
+   * reconciled.
+   */
   const char *operation_id;
+  /** Required opaque head token captured before preparing this edit. */
   const char *expected_head;
+  /** Borrowed ordered, disjoint cuts in the pre-edit position space. */
   const lc_collection_edit_range *ranges;
+  /** Number of ranges, at most LC_COLLECTION_EDIT_MAX_RANGES; zero permits
+   * append-only edits.
+   */
   size_t range_count;
+  /** Optional append request paired with the supplied replacement source. */
   const lc_collection_append_req *replacement;
+  /** Nonzero replaces the recovery descriptor and anchor; zero preserves
+   * both.
+   */
   int has_recovery;
+  /** Borrowed UTF-8 descriptor, at most LC_COLLECTION_RECOVERY_MAX_BYTES;
+   * empty clears it.
+   */
   const char *recovery;
+  /** Zero requires no entry; UINT64_MAX selects this edit's replacement
+   * position.
+   */
   uint64_t recovery_anchor;
 } lc_collection_edit_req;
 
 /** Original edit facts; never refreshed on retry. No owned allocations. */
 typedef struct lc_collection_edit_res {
+  /** Original resulting head token, or the observed current token on
+   * collection_changed.
+   */
   char head_etag[65];
+  /** Permanent position high-water mark, including gaps and deleted entries. */
   uint64_t upper_position;
+  /** Live-entry count at the captured observation, before deferred
+   * maintenance.
+   */
   uint64_t live_count;
+  /** Number of live entries newly removed by this edit. */
   uint64_t deleted_count;
+  /** Nonzero when this edit appended a replacement entry. */
   int has_replacement;
+  /** Original replacement outcome; meaningful only when has_replacement is
+   * nonzero.
+   */
   lc_collection_append_res replacement;
+  /** Nonzero when returning the original outcome of an identical committed
+   * retry.
+   */
   int duplicate;
   /** A receipt was published or an identical committed retry passed validation.
    * If the call
@@ -799,18 +914,35 @@ typedef struct lc_collection_edit_res {
 
 /** found == 0 observes absence only; it does not cancel a preparing call. */
 typedef struct lc_collection_edit_status_res {
+  /** Nonzero when an authoritative committed receipt exists for the operation
+   * ID.
+   */
   int found;
+  /** Original committed edit outcome; zeroed when found is zero. */
   lc_collection_edit_res result;
 } lc_collection_edit_status_res;
 
+/** Position-preserving deletion outcome, copied by value without owned
+ * allocations.
+ */
 typedef struct lc_collection_delete_res {
+  /** Permanent collection position; deletion never renumbers other entries. */
   uint64_t position;
+  /** Nonzero when this call deleted a live entry. */
   int deleted;
+  /** Nonzero when the position was already deleted; its identity remains
+   * reserved.
+   */
   int already_deleted;
 } lc_collection_delete_res;
 
+/** Distinguishes delivered-entry metadata from examined-input progress. */
 typedef enum lc_collection_read_metadata_kind {
+  /** One complete JSON object and LF have reached the sink. */
   LC_COLLECTION_READ_METADATA_ENTRY = 1,
+  /** Examined nonmatches advanced the proposed input boundary without payload
+   * output.
+   */
   LC_COLLECTION_READ_METADATA_PROGRESS = 2
 } lc_collection_read_metadata_kind;
 
@@ -819,15 +951,32 @@ typedef enum lc_collection_read_metadata_kind {
  * has no payload and only last_examined_position/resume_cursor are meaningful.
  * Copy strings before retaining them beyond the callback. */
 typedef struct lc_collection_read_metadata {
+  /** ENTRY acknowledges a delivered object; PROGRESS acknowledges examined
+   * nonmatches.
+   */
   lc_collection_read_metadata_kind kind;
+  /** Delivered entry position; meaningful only for ENTRY metadata. */
   uint64_t position;
+  /** Caller-supplied retry identity, scoped to this collection incarnation. */
   const char *append_id;
+  /** Fingerprint of the compact stored JSON bytes. */
   const char *etag;
+  /** Compact plaintext JSON byte count, excluding the output LF. */
   uint64_t bytes;
+  /** Last examined input boundary proposed for acknowledgement. */
   uint64_t last_examined_position;
+  /** Borrowed opaque cursor for this boundary; copy before returning from the
+   * callback.
+   */
   const char *resume_cursor;
+  /** Backend support for per-object retention metadata. */
   lc_state_retention_support retention_support;
+  /** Nonzero when the expiry observation is known, including a zero deadline.
+   */
   int has_retention_expires_at_unix;
+  /** Unix-second expiry eligibility boundary; zero means no expiry. Cleanup
+   * is deferred.
+   */
   lc_unix_seconds retention_expires_at_unix;
 } lc_collection_read_metadata;
 
@@ -837,6 +986,9 @@ typedef struct lc_collection_read_metadata {
 typedef int (*lc_collection_read_metadata_fn)(
     void *context, const lc_collection_read_metadata *metadata,
     lc_error *error);
+/** Synchronous metadata visitor. Return LC_OK to continue or an error to
+ * stop; copy borrowed fields before retaining them.
+ */
 typedef int (*lc_collection_visit_fn)(void *context,
                                       const lc_collection_info *collection,
                                       lc_error *error);
@@ -849,13 +1001,24 @@ typedef int (*lc_collection_visit_fn)(void *context,
 typedef struct lc_collection_read_opts {
   /** Optional opaque head precondition, checked before delivering any bytes. */
   const char *expected_head;
+  /** Optional borrowed LQL predicate, applied after position and input-count
+   * selection.
+   */
   const char *selector_lql;
+  /** Optional borrowed resume or checkpoint token; repeat the original
+   * selection fields.
+   */
   const char *cursor;
+  /** Optional synchronous boundary acknowledgement callback, separate from
+   * the byte sink.
+   */
   lc_collection_read_metadata_fn on_metadata;
+  /** Borrowed context passed to on_metadata during this call. */
   void *metadata_context;
   /** Nonzero requests cooperative cancellation, checked between bounded chunks.
    */
   int (*cancelled)(void *context);
+  /** Borrowed context passed to the cooperative cancellation callback. */
   void *cancel_context;
   /** Selects after; zero preserves the default start at the beginning. */
   int has_after;
@@ -873,9 +1036,15 @@ typedef struct lc_collection_read_opts {
   uint64_t first_n;
 } lc_collection_read_opts;
 
+/** Reason ordered delivery stopped; completion and accepted cursors are
+ * reported separately.
+ */
 typedef enum lc_collection_read_stop_reason {
+  /** The selected input window has been fully examined. */
   LC_COLLECTION_READ_FINISHED = 0,
+  /** Cooperative cancellation stopped before completing the selected window. */
   LC_COLLECTION_READ_CANCELLED = 1,
+  /** Input, validation, sink or metadata acknowledgement failed. */
   LC_COLLECTION_READ_ERROR = 2
 } lc_collection_read_stop_reason;
 
@@ -894,11 +1063,23 @@ typedef struct lc_collection_read_res {
   /** Captured EOD capped by through. A first-N window may complete earlier;
    * an empty future range can start beyond this position. */
   uint64_t upper_position;
+  /** Entries whose bytes, LF and optional metadata acknowledgement were
+   * accepted.
+   */
   uint64_t completed_records;
+  /** Last safely acknowledged input, including accepted nonmatch progress. */
   uint64_t last_examined_position;
+  /** Nonzero when the selected input window is fully examined. */
   int complete;
+  /** Finished, cooperatively cancelled or failed outcome. */
   lc_collection_read_stop_reason stop_reason;
+  /** Owned continuation for incomplete reads; release with
+   * lc_collection_read_res_cleanup().
+   */
   char *resume_cursor;
+  /** Owned next-window token after completion; release with
+   * lc_collection_read_res_cleanup().
+   */
   char *checkpoint_cursor;
 } lc_collection_read_res;
 
@@ -966,13 +1147,28 @@ struct lc_collection {
    */
   int (*read)(lc_collection *self, const lc_collection_read_opts *opts,
               lc_sink *sink, lc_collection_read_res *out, lc_error *error);
+  /** Deletes one permanent position without renumbering or resetting append
+   * identities.
+   */
   int (*delete_entry)(lc_collection *self, uint64_t position,
                       lc_collection_delete_res *out, lc_error *error);
+  /** Logically removes this incarnation; deferred reclamation respects active
+   * readers.
+   */
   int (*drop)(lc_collection *self, lc_error *error);
+  /** Releases this local receiver; never releases a durable collection lease.
+   */
   void (*close)(lc_collection *self);
+  /** Borrowed namespace name, valid until receiver close. */
   const char *ns;
+  /** Borrowed collection name, valid until receiver close. */
   const char *name;
+  /** Borrowed incarnation ID, valid until receiver close; distinct from its
+   * reusable name.
+   */
   const char *collection_id;
+  /** Private SDK implementation; applications must not inspect or replace it.
+   */
   void *impl;
 };
 
@@ -991,12 +1187,24 @@ struct lc_collection {
  * is used. A live writer defers compaction capture until commit, abort or
  * close. */
 struct lc_collection_writer {
+  /** Accepts raw JSON fragments synchronously, using bounded validation and
+   * codec scratch.
+   */
   int (*write)(lc_collection_writer *self, const void *bytes, size_t count,
                lc_error *error);
+  /** Finishes validation and publishes one entry; reconcile uncertain errors
+   * by append ID.
+   */
   int (*commit)(lc_collection_writer *self, lc_collection_append_res *out,
                 lc_error *error);
+  /** Abandons unpublished work; cannot undo an already published entry. */
   int (*abort)(lc_collection_writer *self, lc_error *error);
+  /** Releases the owned writer, abandoning unfinished canonical extents for
+   * maintenance.
+   */
   void (*close)(lc_collection_writer *self);
+  /** Private SDK implementation; applications must not inspect or replace it.
+   */
   void *impl;
 };
 
@@ -1038,15 +1246,29 @@ int lc_collection_takeover(lc_collection *collection,
                            const lc_collection_lease_req *req,
                            const char *observed_lease_id, lc_collection **out,
                            lc_error *error);
+/** Renews the live owned collection lease; ttl_seconds is positive and does
+ * not alter retention.
+ */
 int lc_collection_keepalive(lc_collection *collection, long ttl_seconds,
                             lc_collection_lease_info *out, lc_error *error);
 /** Releases ownership and closes the receiver on success, without rolling
  * back any committed entry. On failure it remains open for retry/close. */
 int lc_collection_release(lc_collection *collection, lc_error *error);
+/** Zeroes append options; the caller must supply append_id before use. */
 void lc_collection_append_req_init(lc_collection_append_req *req);
+/** Zeroes metadata options so omitted retention/count fields preserve
+ * existing policy.
+ */
 void lc_collection_metadata_req_init(lc_collection_metadata_req *req);
+/** Zeroes selection options for an unfiltered, unlimited read from the
+ * beginning.
+ */
 void lc_collection_read_opts_init(lc_collection_read_opts *opts);
+/** Initializes empty owned cursor storage; cleanup before reinitializing a
+ * populated result.
+ */
 void lc_collection_read_res_init(lc_collection_read_res *result);
+/** Releases owned cursors and clears the result; accepts NULL. */
 void lc_collection_read_res_cleanup(lc_collection_read_res *result);
 /** Creates a new collection incarnation; an existing name is a conflict.
  * The returned receiver is owned and must be closed separately from client. */
@@ -1069,6 +1291,9 @@ int lc_client_list_collections(lc_client *client, const char *ns,
 int lc_client_collection_capabilities(lc_client *client,
                                       lc_collection_capabilities *out,
                                       lc_error *error);
+/** Observes copied identity, counts, retention and ownership without reading
+ * payload bytes.
+ */
 int lc_collection_describe(lc_collection *collection, lc_collection_info *out,
                            lc_error *error);
 /** Updates collection expiry and/or max_entries. Omitted fields preserve their
@@ -1800,13 +2025,21 @@ typedef struct lc_txn_decision_res {
  * .txns owns the decision; this descriptor only records participant progress.
  */
 typedef struct lc_xa_branch_record {
+  /** Global transaction XID, distinct from a native database transaction ID. */
   char txn_id[LC_XID_STRING_SIZE];
+  /** Stable registered resource XID used during enrollment and recovery. */
   char resource_id[LC_XID_STRING_SIZE];
+  /** Stable enrolled branch XID within the global transaction. */
   char branch_id[LC_XID_STRING_SIZE];
+  /** Exact native prepared-transaction identifier, NUL-terminated. */
   char gid[200];
+  /** Exact epoch-qualified native transaction ID as decimal text. */
   char full_xid[21];
+  /** Exact database-cluster system identifier as decimal text. */
   char system_id[21];
+  /** Exact database OID as decimal text, NUL-terminated. */
   char database_oid[11];
+  /** Exact role OID as decimal text, NUL-terminated. */
   char role_oid[11];
   /** Durable native prepare acknowledgement/inventory observation. This is
    * distinct from a coordinator YES vote, including recovery after ABORT. */
@@ -1818,18 +2051,34 @@ typedef struct lc_xa_branch_record {
 } lc_xa_branch_record;
 
 enum {
+  /** Exact branch identity is durably enrolled; native prepare is not yet
+   * acknowledged.
+   */
   LC_XA_ENROLLED = 0,
+  /** Prepare transmission intent is durable; native outcome may need
+   * reconciliation.
+   */
   LC_XA_PREPARE_SENT = 1,
+  /** Native preparation was observed; coordinator votes remain separate. */
   LC_XA_PREPARED = 2,
+  /** Commit transmission intent matches the durable global COMMIT decision. */
   LC_XA_COMMIT_SENT = 3,
+  /** Rollback transmission intent matches the durable global ABORT decision. */
   LC_XA_ROLLBACK_SENT = 4,
+  /** Native branch commit has been proven. */
   LC_XA_COMMITTED = 5,
+  /** Native branch rollback/abort has been proven. */
   LC_XA_ABORTED = 6
 };
 enum {
+  /** No branch-completion evidence has been recorded. */
   LC_XA_EVIDENCE_NONE = 0,
+  /** Completion was acknowledged by the native operation. */
   LC_XA_EVIDENCE_ACK = 1,
+  /** Completion was established from native transaction status. */
   LC_XA_EVIDENCE_NATIVE = 2,
+  /** Completion was established from durable prepare/resolution protocol
+   * evidence, without replaying application SQL. */
   LC_XA_EVIDENCE_RECONCILED = 3
 };
 
@@ -1875,20 +2124,41 @@ int lc_xa_store_read_blocking(lc_xa_store *store, const char *txn_id,
  * before native access. owner_thread is an opaque identity, not pthread data.
  */
 typedef struct lc_xa_connection_view {
+  /** Structure byte size used to validate the adapter boundary. */
   size_t size;
+  /** Independently versioned adapter ABI; initialize with the matching
+   * LC_XA_*_ABI constant.
+   */
   unsigned long abi_version;
+  /** Native provider kind, such as LC_XA_RESOURCE_POSTGRES. */
   int resource_kind;
+  /** Stable registered resource XID used during enrollment and recovery. */
   char resource_id[LC_XID_STRING_SIZE];
+  /** Global transaction XID, distinct from a native database transaction ID. */
   char txn_id[LC_XID_STRING_SIZE];
+  /** Stable enrolled branch XID within the global transaction. */
   char branch_id[LC_XID_STRING_SIZE];
+  /** Borrowed provider connection; retain/validate its scope before every
+   * native use.
+   */
   void *native_connection;
+  /** Process identity owning this native connection scope. */
   uint64_t owner_process;
+  /** Opaque owning-thread identity; not a portable pthread_t representation. */
   const void *owner_thread;
+  /** Validity epoch used to reject stale connection views. */
   uint64_t generation;
 } lc_xa_connection_view;
 
+/** Native connection-view ABI, independent of the library release version. */
 #define LC_XA_CONNECTION_VIEW_ABI 1UL
-enum { LC_XA_RESOURCE_POSTGRES = 1 };
+enum {
+  /** Explicitly linked PostgreSQL participant provider. */
+  LC_XA_RESOURCE_POSTGRES = 1
+};
+/** Retained owning-process/thread validity token for a borrowed native
+ * connection.
+ */
 typedef struct lc_xa_borrow lc_xa_borrow;
 /** Provider callbacks stay linked while any borrow reference lives. view must
  * validate its retained native token before returning a pointer. release
@@ -1896,7 +2166,13 @@ typedef struct lc_xa_borrow lc_xa_borrow;
  * ownership to an adapter. No callback is invoked from a foreign thread/fork.
  */
 typedef struct lc_xa_borrow_callbacks {
+  /** Validates the live scope and copies a borrowed view; transfers no
+   * connection ownership.
+   */
   int (*view)(void *context, lc_xa_connection_view *out, lc_error *error);
+  /** Consumes the callback context on final release, including when protocol
+   * cleanup fails.
+   */
   int (*release)(void *context, lc_error *error);
 } lc_xa_borrow_callbacks;
 /** Zeroes the view and sets the supported size/ABI before validation. */
@@ -1923,71 +2199,151 @@ int lc_xa_borrow_release(lc_xa_borrow *borrow, lc_error *error);
  * callbacks linked until the last resource/branch/operation/borrow is released.
  */
 #define LC_XA_DRIVER_ABI 1UL
+/** Nonterminal operation readiness, copied without transferring descriptor
+ * ownership.
+ */
 typedef struct lc_xa_wait {
+  /** Borrowed readiness descriptor; do not close it. */
   int fd;
   unsigned int events; /**< READ=1, WRITE=2; zero when terminal. */
   int64_t
       deadline_ms; /**< Absolute CLOCK_MONOTONIC milliseconds, -1 infinity. */
 } lc_xa_wait;
 enum {
+  /** Native outcome is unavailable or ambiguous; preserve recovery intent. */
   LC_XA_OUTCOME_UNKNOWN = 0,
+  /** Native transaction status proves commit. */
   LC_XA_OUTCOME_COMMITTED = 1,
+  /** Native transaction status proves abort. */
   LC_XA_OUTCOME_ABORTED = 2,
+  /** Native transaction remains active or prepared. */
   LC_XA_OUTCOME_IN_PROGRESS = 3,
+  /** Native status history has expired; this observation alone proves no
+   * terminal outcome. */
   LC_XA_OUTCOME_DISCARDED = 4
 };
+/** One diagnostic native prepared-transaction observation; not authority to
+ * resolve it.
+ */
 typedef struct lc_xa_inventory_row {
+  /** Exact native prepared-transaction identifier, NUL-terminated. */
   char gid[200];
+  /** Exact native 32-bit XID as decimal text; not a global or full epoch-
+   * qualified ID.
+   */
   char xid[11];
+  /** Exact database OID as decimal text, NUL-terminated. */
   char database_oid[11];
+  /** Exact role OID as decimal text, NUL-terminated. */
   char role_oid[11];
 } lc_xa_inventory_row;
 /** Terminal operation snapshot. Diagnostics contain SQLSTATE only, never SQL,
  * parameters, credentials or raw native diagnostic text. */
 typedef struct lc_xa_result {
+  /** Copied durable identity/progress of the observed branch. */
   lc_xa_branch_record record;
+  /** LC_XA_OUTCOME_* observation; not a coordinator decision or publication
+   * authority.
+   */
   int native_outcome;
+  /** Number of populated inventory rows, at most 64. */
   size_t row_count;
+  /** Bounded inventory page; only row_count entries are populated. */
   lc_xa_inventory_row rows[64];
+  /** Five-character SQLSTATE plus NUL, or empty when unavailable; never raw
+   * SQL diagnostics.
+   */
   char sqlstate[6];
 } lc_xa_result;
+/** Explicit provider callbacks. Size and ABI are checked; retain linked
+ * callbacks until every derived handle/borrow is released.
+ */
 typedef struct lc_xa_driver {
+  /** Structure byte size used to validate the adapter boundary. */
   size_t size;
+  /** Independently versioned adapter ABI; initialize with the matching
+   * LC_XA_*_ABI constant.
+   */
   unsigned long abi_version;
+  /** Native provider kind, such as LC_XA_RESOURCE_POSTGRES. */
   int resource_kind;
+  /** Copies provider configuration and returns an owned resource retaining
+   * the supplied journal.
+   */
   int (*open)(lc_xa_store *store, const void *configuration, void **resource,
               lc_error *error);
+  /** Consumes a provider resource after draining its durability cleanup. */
   void (*close_blocking)(void *resource);
+  /** Returns the resource's borrowed durable backend identity. */
   const lc_xa_branch_record *(*identity)(void *resource);
+  /** Starts backend validation and durable resource identity registration. */
   int (*register_start)(void *resource, int64_t deadline_ms, void **operation,
                         lc_error *error);
+  /** Starts and enrolls a branch under the supplied global transaction ID. */
   int (*branch_start)(void *resource, const char *txn_id, int64_t deadline_ms,
                       void **operation, lc_error *error);
+  /** Starts durable prepare intent and native prepare after application
+   * access ends.
+   */
   int (*prepare_start)(void *branch, int64_t deadline_ms, void **operation,
                        lc_error *error);
+  /** Starts commit or rollback matching the authoritative global decision. */
   int (*resolve_start)(void *branch, int commit, int64_t deadline_ms,
                        void **operation, lc_error *error);
+  /** Starts exact-identity reconciliation/resolution of an enrolled branch. */
   int (*recover_start)(void *resource, const char *txn_id,
                        const char *branch_id, int commit, int64_t deadline_ms,
                        void **operation, lc_error *error);
+  /** Observes the exact enrolled native outcome without choosing or applying
+   * a decision.
+   */
   int (*status_start)(void *resource, const char *txn_id, const char *branch_id,
                       int64_t deadline_ms, void **operation, lc_error *error);
+  /** Starts a bounded diagnostic inventory; prefix membership is never
+   * resolution authority.
+   */
   int (*inventory_start)(void *resource, const char *after_gid, size_t limit,
                          int64_t deadline_ms, void **operation,
                          lc_error *error);
+  /** Performs bounded nonblocking progress; LC_ERR_PENDING may also describe
+   * a terminal result.
+   */
   int (*advance)(void *operation, lc_error *error);
+  /** Copies readiness and an absolute monotonic deadline for a nonterminal
+   * operation.
+   */
   int (*wait)(void *operation, lc_xa_wait *out, lc_error *error);
   /** Returns zero until terminal; otherwise copies the result. A successful
    * start/recover yields one owned branch. Other operations yield none. */
   int (*result)(void *operation, lc_xa_result *out, void **branch);
+  /** Stops native work while preserving possibly prepared branches and
+   * durable recovery intent.
+   */
   int (*cancel)(void *operation, lc_error *error);
+  /** Consumes an operation after in-flight journal cleanup completes. */
   void (*operation_close_blocking)(void *operation);
+  /** Returns an owned validity token for the branch's exact native
+   * connection.
+   */
   int (*borrow)(void *branch, lc_xa_borrow **out, lc_error *error);
+  /** Returns the branch's borrowed durable identity/progress snapshot. */
   const lc_xa_branch_record *(*branch_record)(void *branch);
+  /** Releases provider branch state; prepared work remains durable for
+   * recovery.
+   */
   void (*branch_close)(void *branch);
 } lc_xa_driver;
+/** Owned explicitly registered participant resource, independent of native
+ * client types in core.
+ */
 typedef struct lc_xa_resource lc_xa_resource;
+/** Owned enrolled native branch; close its active operation before closing
+ * the branch.
+ */
 typedef struct lc_xa_branch lc_xa_branch;
+/** Owned participant operation; advance readiness until terminal, then close
+ * explicitly.
+ */
 typedef struct lc_xa_operation lc_xa_operation;
 /** The resource copies the function table and pins the journal. Its owning
  * process/thread drives native I/O. Zero deadlines select the provider's 30s
@@ -2074,8 +2430,17 @@ int lc_xa_operation_close_blocking(lc_xa_operation *operation, lc_error *error);
 /** Managed participation in the existing Pouch transaction coordinator. Native
  * providers are linked explicitly and registered through lc_xa_driver. */
 typedef struct lc_xa_coordinator lc_xa_coordinator;
+/** Owned global transaction whose decision is persisted by the Pouch
+ * coordinator.
+ */
 typedef struct lc_xa_transaction lc_xa_transaction;
+/** Owned coordinator operation with nonblocking progress and explicit
+ * durability cleanup.
+ */
 typedef struct lc_xa_coordinator_operation lc_xa_coordinator_operation;
+/** Copied owner-lifetime and completed-history policy; zero fields select
+ * their documented defaults.
+ */
 typedef struct lc_xa_coordinator_config {
   /** Zero selects 30 seconds. Renew during long application work; operations
    * renew automatically while advanced at their advertised readiness/deadline.
@@ -2089,21 +2454,37 @@ typedef struct lc_xa_coordinator_config {
   size_t completed_max_records;
 } lc_xa_coordinator_config;
 enum {
+  /** No immutable global terminal decision has been recorded. */
   LC_XA_DECISION_UNDECIDED = 0,
+  /** Global COMMIT is durable and must be completed, never reversed. */
   LC_XA_DECISION_COMMIT = 1,
+  /** Global ABORT is durable and must be completed, never reversed. */
   LC_XA_DECISION_ABORT = 2
 };
 /** Borrowed operation snapshot. IDs exist before durable work starts and remain
  * available after errors/cancellation. decision is observed from .txns; applied
  * is true only after this operation proves every participant's application. */
 typedef struct lc_xa_coordinator_result {
+  /** Global transaction XID, distinct from a native database transaction ID. */
   char txn_id[LC_XID_STRING_SIZE];
+  /** Stable registered resource XID used during enrollment and recovery. */
   char resource_id[LC_XID_STRING_SIZE];
+  /** Nonzero when this operation is terminal; inspect its status and decision
+   * independently.
+   */
   int done;
+  /** LC_XA_DECISION_* observation from the authoritative coordinator journal.
+   */
   int decision;
+  /** Nonzero only after every participant's application is proven by this
+   * operation.
+   */
   int applied;
   /** Number of complete histories removed by a retirement operation. */
   size_t retired_count;
+  /** Five-character SQLSTATE plus NUL, or empty when unavailable; never raw
+   * SQL diagnostics.
+   */
   char sqlstate[6];
 } lc_xa_coordinator_result;
 /** Opens the local Pouch coordinator with zero/default policy when config is
@@ -3143,8 +3524,13 @@ typedef struct lc_command_request {
 } lc_command_request;
 
 enum {
+  /** Command acceptance is durable but no terminal command result is
+   * published.
+   */
   LC_COMMAND_PENDING = 1,
+  /** Command completed successfully with its terminal result metadata. */
   LC_COMMAND_COMPLETED = 2,
+  /** Command completed with a durable failure result. */
   LC_COMMAND_FAILED = 3
 };
 
@@ -3748,8 +4134,14 @@ struct lc_outbox_transaction {
    * across operations; no SQL/provider types enter the outbox interface. */
   int (*bind_xa)(lc_outbox_transaction *self, lc_xa_transaction *transaction,
                  lc_error *error);
+  /** Starts phase-two commit through the bound coordinator; drive/close the
+   * returned operation.
+   */
   int (*commit_start)(lc_outbox_transaction *self, int64_t deadline_ms,
                       lc_xa_coordinator_operation **out, lc_error *error);
+  /** Starts phase-two rollback through the bound coordinator; does not
+   * discard recovery intent.
+   */
   int (*rollback_start)(lc_outbox_transaction *self, int64_t deadline_ms,
                         lc_xa_coordinator_operation **out, lc_error *error);
   /**
@@ -4473,11 +4865,20 @@ struct lc_client {
    * remote lockd returns LC_ERR_UNSUPPORTED until it implements collections. */
   int (*create_collection)(lc_client *self, const lc_collection_config *config,
                            lc_collection **out, lc_error *error);
+  /** Opens an existing collection incarnation; never creates one or renews
+   * retention.
+   */
   int (*open_collection)(lc_client *self, const lc_collection_config *config,
                          lc_collection **out, lc_error *error);
+  /** Visits namespace collection metadata in name order, without reading
+   * entry bodies.
+   */
   int (*list_collections)(lc_client *self, const char *ns,
                           lc_collection_visit_fn visitor, void *context,
                           lc_error *error);
+  /** Observes endpoint-local support; remote collection operations remain
+   * unsupported.
+   */
   int (*collection_capabilities)(lc_client *self,
                                  lc_collection_capabilities *out,
                                  lc_error *error);
@@ -5486,7 +5887,11 @@ void lc_outbox_job_close(lc_outbox_job *job);
 int lc_outbox_transaction_acquire(lc_outbox_transaction *transaction,
                                   const lc_outbox_participant_request *request,
                                   lc_outbox_participant **out, lc_error *error);
+/** Returns the borrowed global XID while this transaction remains open. */
 const char *lc_outbox_transaction_id(lc_outbox_transaction *transaction);
+/** Binds to a managed XA owner. After staging participants, xa must already
+ * carry this outbox's global ID; participants cannot move to another ID.
+ */
 int lc_outbox_transaction_bind_xa(lc_outbox_transaction *transaction,
                                   lc_xa_transaction *xa, lc_error *error);
 /** Delegates terminal work to the bound coordinator. Drive/close the returned
@@ -5497,6 +5902,9 @@ int lc_outbox_transaction_commit_start(lc_outbox_transaction *transaction,
                                        int64_t deadline_ms,
                                        lc_xa_coordinator_operation **out,
                                        lc_error *error);
+/** Starts rollback through the bound coordinator; drive and close the
+ * returned operation before releasing transaction state.
+ */
 int lc_outbox_transaction_rollback_start(lc_outbox_transaction *transaction,
                                          int64_t deadline_ms,
                                          lc_xa_coordinator_operation **out,

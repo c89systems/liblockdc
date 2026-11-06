@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Remove unused private transport, codec and index helpers. Complete public C
+  and Lua contract comments, retire superseded implementation notes, and include
+  the linked collection guides in Lua source packages.
 - Decrypt uncompressed collection frames directly into bounded read scratch,
   avoiding an intermediate plaintext copy. Retain authentication before delivery
   and wipe tentative output on authentication failure.
