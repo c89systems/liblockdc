@@ -33,6 +33,8 @@ typedef struct lc_pouch_indexer_pending_namespace
 /* Shared wall clock for lease validation, retention publication and cleanup.
  * Failure is explicit; a retention deadline must never use a guessed clock. */
 int lc_pouch_now_unix(lc_pouch_unix_seconds *out, lc_error *error);
+/* Shared bounded-copy I/O budget for ordinary and collection compaction. */
+int lc_pouch_state_compaction_throttle(lc_pouch *, size_t, lc_error *);
 /* Canonical nonnegative deadlines pass through; a negative staged duration
  * is resolved once against the chosen immutable commit timestamp. */
 int lc_pouch_retention_resolve(lc_pouch_unix_seconds retention,
@@ -388,6 +390,7 @@ extern void *lc_pouch_test_before_terminal_reclaim_marker_remove_context;
 /* Extends only test batch coalescing, without changing production scheduling.
  */
 extern long lc_pouch_test_fsync_batch_delay_ns;
+/* Commit-batcher I/O only; private canonical seals have their own hook. */
 extern int (*lc_pouch_test_sync_fd)(int fd);
 /* Invoked under the batch mutex after enqueue; must not reenter Pouch. */
 extern void (*lc_pouch_test_fsync_enqueued)(void);

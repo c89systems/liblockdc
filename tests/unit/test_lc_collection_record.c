@@ -12,6 +12,8 @@
 
 #include "../support/lc_test_tmp.h"
 #include "lc_api_internal.h"
+#include "lc_collection_chunks.h"
+#include "lc_collection_unit.h"
 #include "lc_pouch_collection_record.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_record.h"
@@ -100,6 +102,7 @@ static int setup(void **state) {
 
 static int teardown(void **state) {
   fixture *f = *state;
+  lc_collection_unit_test_preadv = NULL;
   lc_source_close(f->source);
   lc_source_close(f->decoded);
   lc_sink_close(f->sink);
@@ -882,89 +885,136 @@ static void test_relocation_crosses_large_buffer_boundaries(void **state) {
 }
 
 static void
-test_staged_encoded_copy_checks_integrity_and_rolls_back(void **state) {
+test_stream_publication_is_metadata_only_and_rolls_back(void **state) {
   fixture *f = *state;
   lc_pouch_collection_writer *writer = NULL;
   lc_pouch_collection_record body, published, prior, read;
   const void *encoded;
   size_t length;
-  unsigned char *copy;
-  uint64_t end;
+  uint64_t end, extent_offset;
   for (int mode = 0; mode < 4; ++mode) {
-    for (int failure = 0; failure < 4; ++failure) {
+    for (int failure = 0; failure < 2; ++failure) {
       open_case(f, mode, 0);
       assert_int_equal(append_json(f, "prior", "{}", 1, 1, &prior), LC_OK);
       end = file_end(f);
       assert_int_equal(lc_sink_to_memory(&f->sink, &f->error), LC_OK);
-      assert_int_equal(
-          lc_pouch_collection_writer_open_staged(
-              f->pouch, f->sink, f->id, "staged", 0, 0, 0, &writer, &f->error),
-          LC_OK);
+      char context[256], binding[256];
+      lc_pouch_crypto_writer *codec = NULL;
+      lc_collection_unit unit = {0};
+      char *descriptor = NULL, *rebound = NULL;
+      uint64_t plain_bytes, stored_bytes;
+      unsigned long stored_crc;
+      snprintf(context, sizeof(context), "collection:%s:streamed:upload",
+               f->id);
+      assert_int_equal(lc_pouch_crypto_writer_open_sink(f->pouch->crypto,
+                                                        context, f->sink,
+                                                        &codec, &f->error),
+                       LC_OK);
+      assert_int_equal(lc_pouch_collection_writer_open_sink(
+                           f->pouch, lc_pouch_crypto_writer_sink(codec), f->id,
+                           "streamed", context, 0, 0, 0, &writer, &f->error),
+                       LC_OK);
       assert_int_equal(lc_pouch_collection_writer_write(writer, "{ \"n\" : 2 }",
                                                         11, &f->error),
                        LC_OK);
       assert_int_equal(
           lc_pouch_collection_writer_finish(writer, &body, &f->error), LC_OK);
-      assert_int_equal(file_end(f), end);
+      assert_int_equal(lc_pouch_crypto_writer_finish(codec, &plain_bytes,
+                                                     &stored_bytes, &stored_crc,
+                                                     &descriptor, &f->error),
+                       LC_OK);
+      lc_pouch_crypto_writer_close(codec);
+      body.position = body.published_at = 2;
+      body.stream_extents = 1;
+      body.stored_bytes = stored_bytes;
+      body.stored_crc = 0;
+      assert_int_equal(lc_collection_unit_manifest(&body, f->id, NULL, binding,
+                                                   body.manifest, &f->error),
+                       LC_OK);
+      if (descriptor && descriptor[0])
+        assert_int_equal(lc_pouch_crypto_rebind_descriptor(
+                             f->pouch->crypto, descriptor, context, binding,
+                             &rebound, &f->error),
+                         LC_OK);
+      if (rebound)
+        strcpy(body.descriptor, rebound);
+      unit.plain = plain_bytes;
+      unit.stored = stored_bytes;
+      unit.crc = stored_crc;
+      strcpy(unit.context, context);
+      if (descriptor)
+        strcpy(unit.descriptor, descriptor);
+      lc_free_with_allocator(&f->pouch->allocator, descriptor);
+      lc_free_with_allocator(&f->pouch->allocator, rebound);
+      assert_int_equal(
+          lc_pouch_collection_writer_storage(writer, &body, &f->error), LC_OK);
       assert_int_equal(
           lc_sink_memory_bytes(f->sink, &encoded, &length, &f->error), LC_OK);
       assert_int_equal(length, body.stored_bytes);
-      assert_true(length > 0);
-      copy = malloc(length);
-      assert_non_null(copy);
-      memcpy(copy, encoded, length);
-      if (failure == 2)
-        copy[length / 2] ^= 1;
-      assert_int_equal(lc_source_from_memory(copy, length - (failure == 1),
-                                             &f->source, &f->error),
-                       LC_OK);
-      if (failure == 3) {
+      unsigned char prefix[LC_COLLECTION_UNIT_HEADER] = {0};
+      extent_offset = end;
+      assert_int_equal(lseek(f->fd, 0, SEEK_END), end);
+      assert_int_equal(write(f->fd, prefix, sizeof(prefix)), sizeof(prefix));
+      assert_int_equal(write(f->fd, encoded, length), length);
+      assert_int_equal(
+          lc_collection_unit_write_meta(f->fd, extent_offset, &unit, &f->error),
+          LC_OK);
+      end = file_end(f);
+      if (failure) {
         f->clock_failed = 1;
         lc_pouch_test_queue_clock_gettime = record_clock;
         lc_pouch_test_queue_time_context = f;
       }
-      int rc = lc_pouch_collection_writer_copy_staged(writer, f->fd, leaf,
-                                                      f->source, &f->error);
+      int rc = lc_pouch_collection_writer_publish_stream(
+          writer, f->fd, leaf, 1, extent_offset, 1, length, 0, 2, 2, &published,
+          &f->error);
       f->clock_failed = 0;
       lc_pouch_test_queue_clock_gettime = NULL;
       lc_pouch_test_queue_time_context = NULL;
-      assert_int_equal(rc, failure == 3 ? LC_ERR_TRANSPORT
-                           : failure    ? LC_ERR_PROTOCOL
-                                        : LC_OK);
-      if (failure == 3) {
-        clear_error(f);
-        assert_int_equal(lc_pouch_collection_writer_publish(
-                             writer, leaf, 2, 2, &published, &f->error),
-                         LC_ERR_INVALID);
-      }
+      assert_int_equal(rc, failure ? LC_ERR_TRANSPORT : LC_OK);
       if (!failure) {
-        assert_int_equal(lc_pouch_collection_writer_publish(
-                             writer, leaf, 2, 2, &published, &f->error),
-                         LC_OK);
         assert_int_equal(lc_pouch_collection_record_read(
                              f->fd, end, file_end(f), leaf, &read, &f->error),
                          LC_OK);
-        assert_true(read.published && read.position == 2 && read.bytes == 7);
+        assert_int_equal(read.stream_extents, 1);
+        assert_int_equal(read.stream_offset, extent_offset);
+        assert_int_equal(read.stored_bytes, length);
+        assert_int_equal(read.next_offset, read.payload_offset);
         assert_string_equal(read.etag, body.etag);
-        memset(copy, 0, length);
-        assert_int_equal(pread(f->fd, copy, length, (off_t)read.payload_offset),
-                         length);
-        assert_memory_equal(copy, encoded, length); /* No re-encoding. */
+        /* Metadata corruption must fail even while the outer header CRC and
+         * the referenced payload remain valid. */
+        unsigned char metadata[1024];
+        size_t at = 0;
+        off_t meta_offset = (off_t)(end + 32U + strlen(read.append_id));
+        assert_true(read.metadata_length <= sizeof(metadata));
+        assert_int_equal(
+            pread(f->fd, metadata, read.metadata_length, meta_offset),
+            read.metadata_length);
+        while (at + sizeof(read.manifest) <= read.metadata_length &&
+               memcmp(metadata + at, read.manifest, sizeof(read.manifest)))
+          ++at;
+        assert_true(at + sizeof(read.manifest) <= read.metadata_length);
+        unsigned char original = metadata[at];
+        metadata[at] ^= 1U;
+        assert_int_equal(pwrite(f->fd, metadata + at, 1, meta_offset + at), 1);
+        assert_int_equal(lc_pouch_collection_record_read(
+                             f->fd, end, file_end(f), leaf, &read, &f->error),
+                         LC_ERR_PROTOCOL);
+        clear_error(f);
+        assert_int_equal(pwrite(f->fd, &original, 1, meta_offset + at), 1);
+        assert_int_equal(lc_pouch_collection_record_read(
+                             f->fd, end, file_end(f), leaf, &read, &f->error),
+                         LC_OK);
       }
       lc_pouch_collection_writer_close(writer);
       writer = NULL;
-      lc_source_close(f->source);
-      f->source = NULL;
       if (failure) {
         assert_int_equal(file_end(f), end);
         clear_error(f);
-        assert_int_equal(append_json(f, "next", "{}", 2, 2, &published), LC_OK);
-        assert_int_equal(published.record_offset, end);
       }
       lc_sink_close(f->sink);
       f->sink = NULL;
       assert_body(f, &prior, "{}");
-      free(copy);
     }
   }
 }
@@ -1017,12 +1067,373 @@ static void test_publication_reuses_reserved_metadata(void **state) {
   }
 }
 
+static void test_only_pending_extent_tails_are_discardable(void **state) {
+  fixture *f = *state;
+  lc_pouch_record_header header = {0};
+  lc_pouch_collection_record record;
+  unsigned char bytes[64] = {0};
+  open_case(f, 0, 0);
+  for (int node = 0; node < 2; ++node) {
+    assert_int_equal(ftruncate(f->fd, 0), 0);
+    assert_int_equal(lseek(f->fd, 0, SEEK_SET), 0);
+    header.type = node ? LC_POUCH_COLLECTION_NODE : LC_POUCH_COLLECTION_CHUNK;
+    header.flags = 0;
+    header.meta_len = node ? 8 : 0;
+    header.payload_len = node ? 24 : 16;
+    lc_pouch_record_header_encode(&header, bytes);
+    size_t n = 32 + header.meta_len + header.payload_len - 1;
+    assert_int_equal(write(f->fd, bytes, n), n);
+    assert_int_equal(
+        lc_pouch_collection_record_read(f->fd, 0, n, leaf, &record, &f->error),
+        LC_ERR_PROTOCOL);
+    clear_error(f);
+    header.flags = LC_POUCH_RECORD_FLAG_PENDING;
+    lc_pouch_record_header_encode(&header, bytes);
+    assert_int_equal(pwrite(f->fd, bytes, 32, 0), 32);
+    assert_int_equal(
+        lc_pouch_collection_record_read(f->fd, 0, n, leaf, &record, &f->error),
+        LC_ERR_PENDING);
+    clear_error(f);
+  }
+}
+
+static void test_incomplete_allocation_is_not_a_published_entry(void **state) {
+  fixture *f = *state;
+  lc_pouch_record_header header = {0};
+  lc_pouch_collection_record record;
+  unsigned char prefix[32];
+  open_case(f, 0, 0);
+  header.type = LC_POUCH_COLLECTION_REGION;
+  header.payload_len = LC_COLLECTION_REGION_MAX;
+  lc_pouch_record_header_encode(&header, prefix);
+  assert_int_equal(write(f->fd, prefix, sizeof(prefix)), sizeof(prefix));
+  /* A short allocation may be retired by active-tail recovery. Its payload
+   * prefix is never a published document; finalized document/chunk truncation
+   * remains an error in test_only_pending_extent_tails_are_discardable. */
+  assert_int_equal(lc_pouch_collection_record_read(f->fd, 0, sizeof(prefix),
+                                                   leaf, &record, &f->error),
+                   LC_ERR_PENDING);
+  clear_error(f);
+  assert_int_equal(ftruncate(f->fd, 32U + header.payload_len), 0);
+  assert_int_equal(lc_pouch_collection_record_read(f->fd, 0,
+                                                   32U + header.payload_len,
+                                                   leaf, &record, &f->error),
+                   LC_OK);
+  assert_int_equal(record.kind, LC_POUCH_COLLECTION_REGION);
+  assert_int_equal(record.next_offset, 32U + header.payload_len);
+  /* The address reservation has bounded framing headroom, separate from the
+   * encoded-unit limit. Reject even one byte beyond that reservation bound. */
+  ++header.payload_len;
+  lc_pouch_record_header_encode(&header, prefix);
+  assert_int_equal(pwrite(f->fd, prefix, sizeof(prefix), 0), sizeof(prefix));
+  assert_int_equal(ftruncate(f->fd, 32U + header.payload_len), 0);
+  assert_int_equal(lc_pouch_collection_record_read(f->fd, 0,
+                                                   32U + header.payload_len,
+                                                   leaf, &record, &f->error),
+                   LC_ERR_PROTOCOL);
+  clear_error(f);
+}
+
+static void
+test_manifest_reuse_preserves_identity_and_relocation(void **state) {
+  fixture *f = *state;
+  const char *collection = "00000000000000000001";
+  const char *golden =
+      "collection-manifest:"
+      "af809ec51560989e40213ea5fcc5483b81bada9098d0ae491738267347a874d2";
+  lc_pouch_collection_record *records =
+      lc_calloc_with_allocator(NULL, 2, sizeof(*records));
+  EVP_MD_CTX *hash = NULL;
+  char once[256], reused[256];
+  assert_non_null(records);
+  records[0].position = 7;
+  records[0].published_at = 9;
+  records[0].bytes = 2;
+  records[0].stream_extents = 1;
+  strcpy(records[0].append_id, "event-1");
+  strcpy(records[0].context, "collection:00000000000000000001:event-1:upload");
+  strcpy(records[0].etag,
+         "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a");
+  assert_int_equal(lc_collection_unit_binding(&records[0], collection, &hash,
+                                              reused, &f->error),
+                   LC_OK);
+  assert_string_equal(reused, golden);
+  records[0].generation = 99;
+  records[0].retention = 100;
+  records[0].collection_retention = 200;
+  records[0].stored_bytes = 300;
+  records[0].stream_segment = 4;
+  records[0].stream_offset = 500;
+  assert_int_equal(lc_collection_unit_binding(&records[0], collection, &hash,
+                                              reused, &f->error),
+                   LC_OK);
+  assert_string_equal(reused, golden);
+  for (int part = 0; part < 8; ++part) {
+    const char *id = collection;
+    records[1] = records[0];
+    switch (part) {
+    case 0:
+      ++records[1].position;
+      break;
+    case 1:
+      ++records[1].published_at;
+      break;
+    case 2:
+      ++records[1].bytes;
+      break;
+    case 3:
+      ++records[1].stream_extents;
+      break;
+    case 4:
+      strcpy(records[1].append_id, "event-2");
+      break;
+    case 5:
+      strcat(records[1].context, ":1");
+      break;
+    case 6:
+      records[1].etag[0] = '5';
+      break;
+    case 7:
+      id = "00000000000000000002";
+      break;
+    }
+    assert_int_equal(
+        lc_collection_unit_binding(&records[1], id, NULL, once, &f->error),
+        LC_OK);
+    assert_int_equal(
+        lc_collection_unit_binding(&records[1], id, &hash, reused, &f->error),
+        LC_OK);
+    assert_string_equal(reused, once);
+    assert_true(strcmp(reused, golden) != 0);
+  }
+  records[1].position = 0;
+  assert_int_equal(lc_collection_unit_binding(&records[1], collection, &hash,
+                                              reused, &f->error),
+                   LC_ERR_PROTOCOL);
+  clear_error(f);
+  assert_int_equal(lc_collection_unit_binding(&records[0], collection, &hash,
+                                              reused, &f->error),
+                   LC_OK);
+  assert_string_equal(reused, golden);
+  EVP_MD_CTX_free(hash);
+  lc_free_with_allocator(NULL, records);
+}
+
+static unsigned int prefix_calls, prefix_fail_at;
+static ssize_t prefix_short_read(int fd, const struct iovec *parts, int count,
+                                 off_t offset) {
+  size_t length;
+  assert_true(count > 0 && count <= 2);
+  ++prefix_calls;
+  if (prefix_calls == 1) {
+    errno = EINTR;
+    return -1;
+  }
+  if (prefix_calls == prefix_fail_at) {
+    errno = EIO;
+    return -1;
+  }
+  length = parts[0].iov_len;
+  if (length > 17)
+    length = 17;
+  return pread(fd, parts[0].iov_base, length, offset);
+}
+
+static void test_unit_prefix_partial_reads_and_failures(void **state) {
+  fixture *f = *state;
+  lc_collection_unit unit = {0}, decoded;
+  unsigned char body[512], prefix[128];
+  const off_t start = 37;
+  size_t i;
+  open_case(f, 0, 0);
+  for (i = 0; i < sizeof(body); ++i)
+    body[i] = (unsigned char)(i * 17U);
+  unit.plain = unit.stored = sizeof(body);
+  strcpy(unit.context, "collection:test:event:upload");
+  memset(unit.etag, 'a', 64);
+  assert_int_equal(
+      pwrite(f->fd, body, sizeof(body), start + LC_COLLECTION_UNIT_HEADER),
+      sizeof(body));
+  assert_int_equal(
+      lc_collection_unit_write_meta(f->fd, start, &unit, &f->error), LC_OK);
+  assert_int_equal(lseek(f->fd, 11, SEEK_SET), 11);
+  prefix_calls = prefix_fail_at = 0;
+  lc_collection_unit_test_preadv = prefix_short_read;
+  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
+                                                  &decoded, prefix,
+                                                  sizeof(prefix), &f->error),
+                   LC_OK);
+  assert_true(prefix_calls > 2);
+  assert_memory_equal(prefix, body, sizeof(prefix));
+  assert_string_equal(decoded.etag, unit.etag);
+  assert_string_equal(decoded.context, unit.context);
+  assert_int_equal(lseek(f->fd, 0, SEEK_CUR), 11);
+  prefix_calls = 0;
+  prefix_fail_at = 7;
+  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
+                                                  &decoded, prefix,
+                                                  sizeof(prefix), &f->error),
+                   LC_ERR_TRANSPORT);
+  clear_error(f);
+  lc_collection_unit_test_preadv = NULL;
+  /* A readable metadata header cannot hide a truncated first input chunk. */
+  assert_int_equal(
+      ftruncate(f->fd, start + LC_COLLECTION_UNIT_HEADER + sizeof(prefix) - 1),
+      0);
+  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
+                                                  &decoded, prefix,
+                                                  sizeof(prefix), &f->error),
+                   LC_ERR_PROTOCOL);
+  clear_error(f);
+  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
+                                                  &decoded, prefix,
+                                                  sizeof(body) + 1U, &f->error),
+                   LC_ERR_PROTOCOL);
+  clear_error(f);
+  assert_int_equal(lc_collection_unit_read_prefix(
+                       f->fd, (lc_u64)LC_I64_MAX, sizeof(body), &decoded,
+                       prefix, sizeof(prefix), &f->error),
+                   LC_ERR_PROTOCOL);
+}
+
+static void test_unit_metadata_lengths_and_maximum_text(void **state) {
+  fixture *f = *state;
+  lc_collection_unit unit = {0};
+  open_case(f, 0, 0);
+  unit.plain = unit.stored = 1;
+  memset(unit.descriptor, 'd', sizeof(unit.descriptor) - 1);
+  memset(unit.context, 'c', sizeof(unit.context) - 1);
+  memset(unit.etag, 'a', sizeof(unit.etag) - 2);
+  assert_int_equal(lc_collection_unit_write_meta(f->fd, 0, &unit, &f->error),
+                   LC_ERR_PROTOCOL);
+  assert_int_equal(file_end(f), 0);
+  clear_error(f);
+  unit.etag[63] = 'a';
+  assert_int_equal(pwrite(f->fd, "x", 1, LC_COLLECTION_UNIT_HEADER), 1);
+  assert_int_equal(lc_collection_unit_write_meta(f->fd, 0, &unit, &f->error),
+                   LC_OK);
+  lc_collection_unit decoded;
+  assert_int_equal(lc_collection_unit_read(f->fd, 0, 1, &decoded, &f->error),
+                   LC_OK);
+  assert_string_equal(decoded.etag, unit.etag);
+  assert_string_equal(decoded.context, unit.context);
+  assert_string_equal(decoded.descriptor, unit.descriptor);
+}
+
+static void
+test_contiguous_prefix_validates_metadata_and_truncation(void **state) {
+  fixture *f = *state;
+  const char *json =
+      "{\"event\":\"bounded prefix with no retained body buffer\"}";
+  lc_pouch_collection_record written, ordinary, prefixed, alias;
+  unsigned char prefix[256], expected[256], zero = 0;
+  size_t size;
+  for (int mode = 0; mode < 4; ++mode) {
+    open_case(f, mode, 0);
+    assert_int_equal(append_json(f, "prefix", json, 1, 1, &written), LC_OK);
+    uint64_t end = file_end(f);
+    assert_int_equal(lc_pouch_collection_record_read(f->fd, 0, end, leaf,
+                                                     &ordinary, &f->error),
+                     LC_OK);
+    assert_int_equal(lseek(f->fd, 7, SEEK_SET), 7);
+    for (size_t capacity = 0; capacity <= sizeof(prefix); capacity += 7) {
+      size_t wanted = written.stored_bytes < capacity
+                          ? (size_t)written.stored_bytes
+                          : capacity;
+      assert_int_equal(lc_pouch_collection_record_read_prefix(
+                           f->fd, 0, end, leaf, &prefixed, prefix, capacity,
+                           &size, &f->error),
+                       LC_OK);
+      assert_int_equal(size, wanted);
+      assert_memory_equal(&prefixed, &ordinary, sizeof(ordinary));
+      assert_int_equal(pread(f->fd, expected, wanted, written.payload_offset),
+                       wanted);
+      assert_memory_equal(prefix, expected, wanted);
+      assert_int_equal(lseek(f->fd, 0, SEEK_CUR), 7);
+    }
+    assert_int_equal(pwrite(f->fd, &zero, 1, 32), 1);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, 0, end, leaf, &prefixed, prefix, sizeof(prefix),
+                         &size, &f->error),
+                     LC_ERR_PROTOCOL);
+    assert_int_equal(size, 0);
+    clear_error(f);
+    assert_int_equal(pwrite(f->fd, "p", 1, 32), 1);
+    assert_int_equal(lc_pouch_collection_record_metadata(f->pouch, f->fd, leaf,
+                                                         &written, 1, 2, 0,
+                                                         &alias, &f->error),
+                     LC_OK);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, alias.record_offset, file_end(f), leaf,
+                         &prefixed, prefix, sizeof(prefix), &size, &f->error),
+                     LC_OK);
+    assert_true(prefixed.metadata_only);
+    assert_int_equal(size, 0);
+    /* A stale captured end must not let a partial vector read expose a
+     * prefix from a truncated published body as a successful record. */
+    assert_int_equal(ftruncate(f->fd, (off_t)end - 1), 0);
+    size = 99;
+    assert_int_equal(lc_pouch_collection_record_read_prefix(
+                         f->fd, 0, end, leaf, &prefixed, prefix, sizeof(prefix),
+                         &size, &f->error),
+                     LC_ERR_PROTOCOL);
+    assert_int_equal(size, 0);
+    clear_error(f);
+  }
+}
+
+static void test_chunk_cleanup_releases_owned_descriptors_once(void **state) {
+  fixture *f = *state;
+  lc_collection_chunks *chunks = calloc(1, sizeof(*chunks));
+  int first, pending;
+  assert_non_null(chunks);
+  open_case(f, 0, 0);
+  /* Zero initialization must not acquire ownership of descriptor zero. */
+  lc_collection_chunks_close(chunks);
+  first = dup(f->fd);
+  pending = dup(f->fd);
+  assert_true(first >= 0 && pending >= 0);
+  chunks->first_fd = first;
+  chunks->first_fd_owned = 1;
+  chunks->pending.segment = 2;
+  chunks->region_fd = pending;
+  lc_collection_chunks_close(chunks);
+  assert_int_equal(fcntl(first, F_GETFD), -1);
+  assert_int_equal(errno, EBADF);
+  assert_int_equal(fcntl(pending, F_GETFD), -1);
+  assert_int_equal(errno, EBADF);
+  /* A repeated close must not close a descriptor recycled by the caller. */
+  f->copy_fd = dup(f->fd);
+  assert_true(f->copy_fd >= 0);
+  lc_collection_chunks_close(chunks);
+  assert_true(fcntl(f->copy_fd, F_GETFD) >= 0);
+  free(chunks);
+}
+
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(
+          test_contiguous_prefix_validates_metadata_and_truncation, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_chunk_cleanup_releases_owned_descriptors_once, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_unit_prefix_partial_reads_and_failures, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_unit_metadata_lengths_and_maximum_text, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_manifest_reuse_preserves_identity_and_relocation, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_incomplete_allocation_is_not_a_published_entry, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_only_pending_extent_tails_are_discardable, setup, teardown),
       cmocka_unit_test_setup_teardown(test_publication_reuses_reserved_metadata,
                                       setup, teardown),
       cmocka_unit_test_setup_teardown(
-          test_staged_encoded_copy_checks_integrity_and_rolls_back, setup,
+          test_stream_publication_is_metadata_only_and_rolls_back, setup,
           teardown),
       cmocka_unit_test_setup_teardown(
           test_invalid_retention_metadata_and_payload_references_fail, setup,

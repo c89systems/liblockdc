@@ -30,11 +30,8 @@ int lc_u64_to_size_checked(lc_u64 value, size_t *out_value);
 int lc_parse_long_base10_checked(const char *text, long *out_value);
 int lc_parse_int_base10_checked(const char *text, int *out_value);
 int lc_parse_ulong_base10_checked(const char *text, unsigned long *out_value);
-int lc_parse_size_base10_checked(const char *text, size_t *out_value);
 int lc_parse_long_base10_range_checked(const char *text, size_t length,
                                        long *out_value);
-int lc_parse_ulong_base10_range_checked(const char *text, size_t length,
-                                        unsigned long *out_value);
 int lc_parse_i64_base10_range_checked(const char *text, size_t length,
                                       lc_i64 *out_value);
 int lc_parse_u64_base10_range_checked(const char *text, size_t length,

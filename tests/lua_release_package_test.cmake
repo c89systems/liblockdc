@@ -166,6 +166,9 @@ foreach(required_source
     "CHANGELOG.md"
     "RELEASE_MANIFEST"
     "VERSION"
+    "docs/c-api.md"
+    "docs/development.md"
+    "docs/releases.md"
     "docs/lua.md"
     "docs/pouch-terminal-retention.md"
     "docs/pouch-dead-letter-retention.md"
@@ -178,9 +181,16 @@ foreach(required_source
     "docs/pouch-storage.md"
     "docs/collections.md"
     "docs/collection-writer.md"
+    "docs/collection-leases.md"
+    "docs/collection-edits.md"
+    "docs/collection-read-comparison.md"
+    "docs/logging.md"
     "docs/state-retention.md"
     "docs/worst-case-scenario.md"
     "examples/lua/README.md"
+    "examples/client_and_lease_methods.c"
+    "examples/acquire_for_update.c"
+    "examples/state_stream_roundtrip.c"
     "examples/lua/outbox_dispatcher.lua"
     "examples/outbox_producer.c"
     "examples/collection_journal.c"
@@ -283,7 +293,7 @@ if(NOT lockdc_lua_expected_manifest STREQUAL lockdc_lua_actual_manifest)
         "expected:\n  ${lockdc_lua_expected_manifest_text}\n"
         "actual:\n  ${lockdc_lua_actual_manifest_text}")
 endif()
-string(FIND "${lockdc_lua_inner_rockspec_text}" "\"lonejson == 0.45.0-1\"" inner_lonejson_index)
+string(FIND "${lockdc_lua_inner_rockspec_text}" "\"lonejson == 0.46.0-1\"" inner_lonejson_index)
 if(inner_lonejson_index EQUAL -1)
     message(FATAL_ERROR
         "Lua source rock embedded rockspec is missing the pinned lonejson dependency\n"
@@ -296,7 +306,7 @@ foreach(required_snippet
     "version = \"${LOCKDC_VERSION}-1\""
     "url = \"git+https://github.com/c89systems/liblockdc.git\""
     "tag = \"v${LOCKDC_VERSION}\""
-    "\"lonejson == 0.45.0-1\""
+    "\"lonejson == 0.46.0-1\""
     "scripts/build_lua_rock.sh"
 )
     string(FIND "${lockdc_lua_rockspec_text}" "${required_snippet}" snippet_index)

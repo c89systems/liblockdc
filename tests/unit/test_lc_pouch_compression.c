@@ -26,7 +26,12 @@
 #include "lc_pouch_recode.h"
 #include "lc_pouch_record.h"
 
-#define PREFIX "/tmp/liblockdc-compression-"
+#define PREFIX LC_COLLECTION_TMP_PARENT "/liblockdc-compression-"
+typedef struct unit_sync_probe {
+  char output[1024], source[1024], directory[1024];
+  int mode, calls;
+} unit_sync_probe;
+static unit_sync_probe *unit_sync_watch;
 typedef struct fixture {
   char root[256], endpoint[320];
   lc_client *client;
@@ -133,6 +138,7 @@ static int teardown(void **state) {
   fixture *f = *state;
   lc_pouch_recode_test_hook = NULL;
   lc_pouch_recode_test_context = NULL;
+  unit_sync_watch = NULL;
   if (f) {
     if (f->restore_umask)
       umask(f->saved_umask);
@@ -976,11 +982,19 @@ static void test_empty_collection_torn_tail_and_storage_modes(void **state) {
   check(f, open_client(f, "zlib", &f->client));
   assert_int_equal(stat(directory, &st), 0);
   assert_int_equal(st.st_mode & 0777, 0750);
+  assert_int_equal(stat(path, &st), -1);
+  assert_int_equal(errno, ENOENT);
+  check(f,
+        lc_client_open_collection(f->client, &config, &collection, &f->error));
+  handle = collection->impl;
+  check(f, lc_collection_record_leaf(handle->head.active, leaf, &f->error));
+  assert_true(strlen(directory) + strlen(leaf) + 2 < sizeof(path));
+  strcpy(path, directory);
+  strcat(path, "/");
+  strcat(path, leaf);
   assert_int_equal(stat(path, &st), 0);
   assert_int_equal(st.st_mode & 0777, 0640);
   assert_int_equal(st.st_size, 0);
-  check(f,
-        lc_client_open_collection(f->client, &config, &collection, &f->error));
   expect_json(f, collection, &options, "", NULL);
   lc_collection_close(collection);
 }
@@ -1478,6 +1492,9 @@ typedef struct conversion_probe {
   char root[640], stage[768], catalog[1024], ns[768];
   char cursor[LC_COLLECTION_CURSOR_BYTES];
   char query_id[LC_XID_STRING_SIZE];
+  char etag[65];
+  lc_pouch_generation version;
+  lc_pouch_unix_seconds retention;
   int fail_phase, fail_after, observed, installed, refs;
   lc_u64 max_payload;
 } conversion_probe;
@@ -1550,8 +1567,10 @@ static void conversion_noise(unsigned char *bytes, size_t length) {
   }
 }
 
-static void write_conversion_noise(fixture *f) {
+static void write_conversion_noise(fixture *f, conversion_probe *p) {
   unsigned char *bytes = malloc(65536);
+  lc_pouch *pouch = ((lc_client_handle *)f->client)->pouch;
+  lc_u64 target = pouch->segment_target_bytes;
   lc_source *source = NULL;
   lc_pouch_state_write_options options = {0};
   lc_pouch_state_write_result result = {0};
@@ -1564,9 +1583,26 @@ static void write_conversion_noise(fixture *f) {
   lc_pouch_state_write_result_cleanup(NULL, &result);
   lc_source_close(source);
   free(bytes);
+  /* Rotate after the large body and retain a metadata-only cross-file
+   * reference. Fault fixtures need this seam, not a complete lease and
+   * attachment transaction history in every crash scenario. */
+  /* Retain two reference files: resuming a prepared receipt must also
+   * convert a subsequent reference, rather than exhausting the work queue. */
+  pouch->segment_target_bytes = 1;
+  options.has_retention = 1;
+  for (unsigned int i = 0; i < 2; ++i) {
+    options.retention = (lc_pouch_unix_seconds)4102444800UL + i;
+    check(f, lc_pouch_state_update_metadata(pouch, "noise", "random", &options,
+                                            &result, &f->error));
+    strcpy(p->etag, result.etag);
+    p->version = result.version;
+    p->retention = result.retention;
+    lc_pouch_state_write_result_cleanup(NULL, &result);
+  }
+  pouch->segment_target_bytes = target;
 }
 
-static void read_conversion_noise(fixture *f) {
+static void read_conversion_noise(fixture *f, const conversion_probe *p) {
   unsigned char *expected = malloc(65536);
   lc_sink *sink = NULL;
   lc_pouch_state_read_result result = {0};
@@ -1581,6 +1617,9 @@ static void read_conversion_noise(fixture *f) {
   assert_true(result.found);
   assert_int_equal(length, 65536);
   assert_memory_equal(bytes, expected, length);
+  assert_string_equal(result.etag, p->etag);
+  assert_int_equal(result.version, p->version);
+  assert_int_equal(result.retention, p->retention);
   lc_pouch_state_read_result_cleanup(NULL, &result);
   lc_sink_close(sink);
   free(expected);
@@ -1592,6 +1631,7 @@ static void seed_conversion(fixture *f, conversion_probe *p, const char *mode) {
   lc_collection_append_res changed = {0};
   lc_collection_handle *handle;
   lc_collection_read_opts read = {0};
+  lc_pouch_namespace_manifest manifest = {0};
   memset(p, 0, sizeof(*p));
   p->fixture = f;
   p->fail_phase = -1;
@@ -1600,9 +1640,12 @@ static void seed_conversion(fixture *f, conversion_probe *p, const char *mode) {
   privacy_path(p->ns, sizeof(p->ns), p->root, "namespaces/test");
   check(f, open_client(f, mode, &f->client));
   ((lc_client_handle *)f->client)->pouch->segment_target_bytes = 4096;
-  write_state(f);
-  compacted_write(f, "payload");
-  write_conversion_noise(f);
+  write_conversion_noise(f, p);
+  check(f, lc_pouch_namespace_manifest_open(NULL, p->root, "noise", &manifest,
+                                            NULL, NULL, &f->error));
+  assert_true(manifest.segment_count >= 3);
+  assert_true(p->retention > 0);
+  lc_pouch_namespace_manifest_cleanup(NULL, &manifest);
   lc_collection_config_init(&config);
   config.name = "private-metadata";
   f->collection = create_event(f, &config);
@@ -1628,14 +1671,12 @@ static void verify_conversion(fixture *f, conversion_probe *p,
   lc_pouch_maintenance_options maintenance = {0};
   lc_pouch_maintenance_result maintained = {0};
   lc_collection_append_status_res status = {0};
-  char etag[65] = {0}, path[1024];
-  lc_version version = 0;
+  char path[1024];
   struct stat st;
   expect_mode(f, f->client, mode);
-  read_state(f, etag, &version);
   expect_permissions(p->ns, 0700);
   expect_permissions(p->catalog, 0644);
-  read_conversion_noise(f);
+  read_conversion_noise(f, p);
   lc_collection_config_init(&config);
   config.name = "private-metadata";
   check(f, lc_client_open_collection(f->client, &config, &f->collection,
@@ -1655,7 +1696,7 @@ static void verify_conversion(fixture *f, conversion_probe *p,
   check(f, lc_pouch_maintenance_run(((lc_client_handle *)f->client)->pouch,
                                     &maintenance, &maintained, &f->error));
   lc_pouch_maintenance_result_cleanup(NULL, &maintained);
-  read_state(f, etag, &version);
+  read_conversion_noise(f, p);
   privacy_path(path, sizeof(path), p->root, ".compression-ready");
   assert_int_equal(lstat(path, &st), -1);
   assert_int_equal(errno, ENOENT);
@@ -1744,29 +1785,34 @@ test_segment_crashes_resume_encrypted_both_directions(void **state) {
   unsigned int encrypted, direction, i;
   int status, phase;
   pid_t child;
-  for (encrypted = 0; encrypted < 2; ++encrypted) {
+  /* Codec roundtrips and output-sync faults cover every transform pair.
+   * Exercise every journal boundary once, rotating those pairs, instead of
+   * rebuilding the same fixture four times for each mode-independent phase. */
+  for (i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+    direction = i & 1U;
+    encrypted = (i >> 1U) & 1U;
     if (encrypted)
       check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
-    for (direction = 0; direction < 2; ++direction) {
-      for (i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
-        snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/crash-%u-%u-%u",
-                 f->root, encrypted, direction, i);
-        seed_conversion(f, &p, modes[direction]);
-        phase = phases[i];
-        child = fork();
-        assert_true(child >= 0);
-        if (child == 0) {
-          lc_pouch_recode_test_hook = crash_at;
-          lc_pouch_recode_test_context = &phase;
-          (void)open_client(f, modes[1 - direction], &f->client);
-          _exit(42);
-        }
-        assert_int_equal(waitpid(child, &status, 0), child);
-        assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
-        check(f, open_client(f, NULL, &f->client));
-        verify_conversion(f, &p, modes[1 - direction]);
-        close_client(f);
-      }
+    snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/crash-%u-%u-%u",
+             f->root, encrypted, direction, i);
+    seed_conversion(f, &p, modes[direction]);
+    phase = phases[i];
+    child = fork();
+    assert_true(child >= 0);
+    if (child == 0) {
+      lc_pouch_recode_test_hook = crash_at;
+      lc_pouch_recode_test_context = &phase;
+      (void)open_client(f, modes[1 - direction], &f->client);
+      _exit(42);
+    }
+    assert_int_equal(waitpid(child, &status, 0), child);
+    assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
+    check(f, open_client(f, NULL, &f->client));
+    verify_conversion(f, &p, modes[1 - direction]);
+    close_client(f);
+    if (encrypted) {
+      lc_pouch_crypto_key_string_free(f->key);
+      f->key = NULL;
     }
   }
 }
@@ -1953,6 +1999,7 @@ static void test_conversion_preserves_readonly_sealed_segments(void **state) {
   unsigned long i;
   seed_conversion(f, &p, "none");
   check(f, open_client(f, NULL, &f->client));
+  ((lc_client_handle *)f->client)->pouch->segment_target_bytes = 4096;
   write_state(f);
   check(f, lc_pouch_namespace_manifest_open(NULL, p.root, "test", &manifest,
                                             NULL, NULL, &f->error));
@@ -2089,6 +2136,13 @@ int __wrap_fsync(int fd) {
   int rc, image, input;
   if (receipt_sync_watch)
     return receipt_sync(fd, receipt_sync_watch);
+  if (unit_sync_watch && power_same_file(fd, unit_sync_watch->output)) {
+    ++unit_sync_watch->calls;
+    if (unit_sync_watch->mode)
+      _exit(61); /* The targeted output has not passed a successful fsync. */
+    errno = EIO;
+    return -1;
+  }
   if (!w)
     return __real_fsync(fd);
   if (w->renamed && w->mode == POWER_RENAME_ALIAS) {
@@ -2134,28 +2188,49 @@ int __wrap_fsync(int fd) {
   }
   return rc;
 }
+static lc_u64 power_inventory_number(FILE *fp) {
+  unsigned char bytes[8];
+  lc_u64 value = 0;
+  assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
+  for (unsigned int i = 0; i < sizeof(bytes); ++i)
+    value = (value << 8) | bytes[i];
+  return value;
+}
 static int power_phase(void *context, int phase, lc_error *error) {
   power_watch *w = context;
-  unsigned char bytes[8];
   FILE *fp;
   char path[1200];
-  char relative[1024];
-  lc_u64 length = 0;
-  unsigned int i;
+  char relative[1024], candidate[1024];
+  int collection;
   (void)error;
   if (phase == LC_POUCH_RECODE_COPIED) {
     snprintf(path, sizeof(path), "%s/plan", w->directory);
     fp = fopen(path, "rb");
     assert_non_null(fp);
-    assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
-    for (i = 0; i < 8; ++i)
-      w->files = (w->files << 8) | bytes[i];
-    assert_int_equal(fread(bytes, 1, sizeof(bytes), fp), sizeof(bytes));
-    for (i = 0; i < 8; ++i)
-      length = (length << 8) | bytes[i];
-    assert_true(length < sizeof(relative));
-    assert_int_equal(fread(relative, 1, (size_t)length, fp), length);
-    relative[length] = 0;
+    w->files = (unsigned long)power_inventory_number(fp);
+    assert_true(w->files > 0);
+    /* Ordinary namespace files retain the reverse conversion order. Observe
+     * their actual first destination; collections convert their units forward
+     * separately and never use the payload staging inode. */
+    for (unsigned long file = 0; file < w->files; ++file) {
+      collection = 0;
+      for (unsigned int field = 0; field < 4; ++field) {
+        lc_u64 length = power_inventory_number(fp);
+        assert_true(length < sizeof(relative));
+        if (field == 0) {
+          assert_int_equal(fread(candidate, 1, (size_t)length, fp), length);
+          candidate[length] = 0;
+        } else {
+          if (field == 3)
+            collection = length != 0;
+          assert_int_equal(fseeko(fp, (off_t)length, SEEK_CUR), 0);
+        }
+      }
+      if (!collection)
+        strcpy(relative, candidate);
+      (void)power_inventory_number(fp); /* active */
+      (void)power_inventory_number(fp); /* original collection identity floor */
+    }
     fclose(fp);
     privacy_path(w->source, sizeof(w->source), w->source_directory, relative);
     strcpy(w->source_directory, w->source);
@@ -2299,52 +2374,52 @@ static int64_t receipt_entries(fixture *f, int verify) {
       "{\"padding\":"
       "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}";
-  lc_collection_config config;
-  lc_collection_append_req request;
-  lc_collection_append_res result = {0};
-  lc_collection_metadata_req metadata = {0};
-  lc_collection_append_status_res status = {0};
-  lc_collection_read_opts options = {0};
+  const char *bodies[] = {first, "{\"n\":2}"};
+  const char *keys[] = {"first-event", "second-event"};
+  lc_acquire_req acquire;
+  lc_metadata_req metadata = {0};
   lc_source *source = NULL;
-  char expected[256];
-  lc_collection_config_init(&config);
-  config.name = "private-metadata";
-  if (verify) {
-    check(f, lc_client_open_collection(f->client, &config, &f->collection,
-                                       &f->error));
-    snprintf(expected, sizeof(expected), "%s\n{\"n\":2}\n", first);
-    expect_json(f, f->collection, &options, expected, NULL);
-    check(f, lc_collection_append_status(f->collection, "second-event", &status,
-                                         &f->error));
-    assert_int_equal(status.state, LC_COLLECTION_APPEND_COMMITTED);
-    assert_int_equal(status.entry.position, 2);
-    assert_true(status.entry.retention_expires_at_unix > 0);
-  } else {
-    check(f, lc_client_create_collection(f->client, &config, &f->collection,
-                                         &f->error));
-    lc_collection_append_req_init(&request);
-    request.append_id = "first-event";
+  lc_lease *lease = NULL;
+  lc_get_res result = {0};
+  lc_sink *sink = NULL;
+  const void *bytes;
+  size_t length;
+  int64_t retention;
+  /* The generic reference-patch receipt now applies only to ordinary states:
+   * collection aliases resolve inline after their already converted bodies.
+   * Keep the same changing-offset/referenced-body power-loss invariant here. */
+  for (unsigned int i = 0; i < 2; ++i) {
+    if (!verify) {
+      lc_acquire_req_init(&acquire);
+      acquire.key = keys[i];
+      acquire.owner = "receipt-test";
+      acquire.ttl_seconds = 3600;
+      check(f, f->client->acquire(f->client, &acquire, &lease, &f->error));
+      check(f, lc_source_from_memory(bodies[i], strlen(bodies[i]), &source,
+                                     &f->error));
+      check(f, lease->update(lease, source, NULL, &f->error));
+      lc_source_close(source);
+      if (i) {
+        metadata.has_retention_seconds = 1;
+        metadata.retention_seconds = 7776000;
+        check(f, lease->metadata(lease, &metadata, &f->error));
+      }
+      check(f, lease->release(lease, NULL, &f->error));
+    }
+    check(f, lc_sink_to_memory(&sink, &f->error));
     check(f,
-          lc_source_from_memory(first, sizeof(first) - 1, &source, &f->error));
-    check(f, lc_collection_append(f->collection, &request, source, &result,
-                                  &f->error));
-    lc_source_close(source);
-    lc_collection_append_req_init(&request);
-    request.append_id = "second-event";
-    check(f, lc_source_from_memory("{\"n\":2}", 7, &source, &f->error));
-    check(f, lc_collection_append(f->collection, &request, source, &result,
-                                  &f->error));
-    lc_source_close(source);
-    assert_int_equal(result.position, 2);
-    metadata.has_retention_seconds = 1;
-    metadata.retention_seconds = 7776000;
-    check(f, lc_collection_entry_metadata(f->collection, 2, &metadata, &result,
-                                          &f->error));
+          f->client->get(f->client, keys[i], NULL, sink, &result, &f->error));
+    check(f, lc_sink_memory_bytes(sink, &bytes, &length, &f->error));
+    assert_int_equal(length, strlen(bodies[i]));
+    assert_memory_equal(bytes, bodies[i], length);
+    if (i)
+      assert_true(result.retention_expires_at_unix > 0);
+    retention = result.retention_expires_at_unix;
+    lc_get_res_cleanup(&result);
+    lc_sink_close(sink);
+    sink = NULL;
   }
-  lc_collection_close(f->collection);
-  f->collection = NULL;
-  return verify ? status.entry.retention_expires_at_unix
-                : result.retention_expires_at_unix;
+  return retention;
 }
 
 static void exercise_recovered_receipt(fixture *f, const char *suffix,
@@ -2456,8 +2531,174 @@ test_recovered_reference_sync_failure_preserves_source(void **state) {
   exercise_recovered_receipt(*state, ".refs", 1);
 }
 
+/* Two or more physical units suffice for sync-loss faults. The separate
+ * streaming allocation and snapshot regressions use1MiB generated entries. */
+#define UNIT_IMAGE_BYTES (256U * 1024U)
+typedef struct unit_image {
+  lc_source source;
+  lc_sink sink;
+  size_t at;
+  uint32_t random;
+} unit_image;
+static unsigned char unit_image_byte(unit_image *image, size_t at) {
+  static const char alphabet[] =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+  if (at < 6)
+    return (unsigned char)"{\"v\":\""[at];
+  if (at < UNIT_IMAGE_BYTES + 6U) {
+    image->random = image->random * 1664525U + 1013904223U;
+    return (unsigned char)alphabet[(image->random >> 24U) & 63U];
+  }
+  return (unsigned char)"\"}\n"[at - UNIT_IMAGE_BYTES - 6U];
+}
+static size_t unit_image_read(lc_source *source, void *bytes, size_t capacity,
+                              lc_error *error) {
+  unit_image *image = source->impl;
+  unsigned char *out = bytes;
+  size_t take = UNIT_IMAGE_BYTES + 8U - image->at;
+  (void)error;
+  if (take > capacity)
+    take = capacity;
+  if (take > 4096U)
+    take = 4096U;
+  for (size_t i = 0; i < take; ++i)
+    out[i] = unit_image_byte(image, image->at++);
+  return take;
+}
+static int unit_image_write(lc_sink *sink, const void *bytes, size_t count,
+                            lc_error *error) {
+  unit_image *image = sink->impl;
+  const unsigned char *p = bytes;
+  (void)error;
+  assert_true(count <= UNIT_IMAGE_BYTES + 9U - image->at);
+  for (size_t i = 0; i < count; ++i)
+    assert_int_equal(p[i], unit_image_byte(image, image->at++));
+  return 1;
+}
+static void test_stream_unit_output_sync_and_power_loss(void **state) {
+  fixture *f = *state;
+  unit_sync_probe *watch = calloc(1, sizeof(*watch));
+  lc_collection_config config = {0};
+  lc_collection_append_req request = {"event"};
+  lc_collection_append_res appended;
+  lc_collection_append_status_res status;
+  lc_collection_read_res read;
+  unit_image image;
+  struct stat source, after;
+  char leaf[64], etag[65];
+  const char *modes[] = {"none", "zlib"};
+  int rc, exited;
+  pid_t child;
+  assert_non_null(watch);
+  config.name = "streamed";
+  for (int encrypted = 0; encrypted < 2; ++encrypted) {
+    if (encrypted)
+      check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+    for (int direction = 0; direction < 2; ++direction) {
+      for (int failure = 0; failure < 3; ++failure) {
+        memset(watch, 0, sizeof(*watch));
+        snprintf(f->endpoint, sizeof(f->endpoint),
+                 "pouch://%s/unit-sync-%d-%d-%d", f->root, encrypted, direction,
+                 failure);
+        check(f, open_client(f, modes[direction], &f->client));
+        check(f, lc_client_create_collection(f->client, &config, &f->collection,
+                                             &f->error));
+        lc_collection_handle *collection = f->collection->impl;
+        collection->pouch->segment_target_bytes = 131072U;
+        memset(&image, 0, sizeof(image));
+        image.random = 17;
+        image.source.read = unit_image_read;
+        image.source.impl = &image;
+        check(f,
+              lc_collection_append_staged(f->collection, &request,
+                                          &image.source, &appended, &f->error));
+        strcpy(etag, appended.etag);
+        strcpy(watch->directory, collection->directory);
+        check(f, lc_collection_record_leaf(collection->head.active + 1U, leaf,
+                                           &f->error));
+        privacy_path(watch->output, sizeof(watch->output), watch->directory,
+                     leaf);
+        check(f, lc_collection_record_leaf(collection->head.tail_segment, leaf,
+                                           &f->error));
+        privacy_path(watch->source, sizeof(watch->source), watch->directory,
+                     leaf);
+        assert_int_equal(stat(watch->source, &source), 0);
+        lc_collection_close(f->collection);
+        f->collection = NULL;
+        close_client(f);
+        watch->mode = failure;
+        if (!failure) {
+          unit_sync_watch = watch;
+          rc = open_client(f, modes[1 - direction], &f->client);
+          unit_sync_watch = NULL;
+          assert_int_equal(rc, LC_ERR_TRANSPORT);
+          assert_null(f->client);
+          assert_int_equal(watch->calls, 1);
+          lc_error_cleanup(&f->error);
+          lc_error_init(&f->error);
+        } else {
+          child = fork();
+          assert_true(child >= 0);
+          if (!child) {
+            unit_sync_watch = watch;
+            (void)open_client(f, modes[1 - direction], &f->client);
+            _exit(62);
+          }
+          assert_int_equal(waitpid(child, &exited, 0), child);
+          assert_true(WIFEXITED(exited) && WEXITSTATUS(exited) == 61);
+        }
+        assert_int_equal(stat(watch->source, &after), 0);
+        assert_int_equal(after.st_ino, source.st_ino);
+        assert_int_equal(after.st_size, source.st_size);
+        assert_int_equal(stat(watch->output, &after), 0);
+        assert_true(after.st_size > 65536);
+        if (failure == 1) {
+          /* Lose only the unsynced new name, retaining durable source and
+           * reachability metadata. No other file is rewound or removed. */
+          assert_int_equal(unlink(watch->output), 0);
+        } else if (failure == 2) {
+          int fd = open(watch->output, O_WRONLY | O_CLOEXEC);
+          assert_true(fd >= 0);
+          assert_int_equal(ftruncate(fd, 17), 0);
+          assert_int_equal(__real_fsync(fd), 0);
+          close(fd);
+        }
+        check(f, open_client(f, NULL, &f->client));
+        expect_mode(f, f->client, modes[1 - direction]);
+        check(f, lc_client_open_collection(f->client, &config, &f->collection,
+                                           &f->error));
+        check(f, lc_collection_append_status(f->collection, "event", &status,
+                                             &f->error));
+        assert_int_equal(status.state, LC_COLLECTION_APPEND_COMMITTED);
+        assert_int_equal(status.entry.position, 1);
+        assert_string_equal(status.entry.etag, etag);
+        memset(&image, 0, sizeof(image));
+        image.random = 17;
+        image.sink.write = unit_image_write;
+        image.sink.impl = &image;
+        lc_collection_read_res_init(&read);
+        check(f, lc_collection_read(f->collection, NULL, &image.sink, &read,
+                                    &f->error));
+        assert_int_equal(image.at, UNIT_IMAGE_BYTES + 9U);
+        assert_int_equal(read.completed_records, 1);
+        lc_collection_read_res_cleanup(&read);
+        lc_collection_close(f->collection);
+        f->collection = NULL;
+        close_client(f);
+      }
+    }
+    if (encrypted) {
+      lc_pouch_crypto_key_string_free(f->key);
+      f->key = NULL;
+    }
+  }
+  free(watch);
+}
+
 int main(int argc, char **argv) {
   const struct CMUnitTest cases[] = {
+      cmocka_unit_test_setup_teardown(
+          test_stream_unit_output_sync_and_power_loss, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_omission_inherits_and_explicit_changes_empty_root, setup,
           teardown),

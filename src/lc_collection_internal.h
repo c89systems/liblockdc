@@ -16,6 +16,8 @@ typedef struct lc_collection_disk_head {
   lc_u64 active;
   lc_u64 snapshot;
   lc_u64 snapshot_generation;
+  /* Latest immutable snapshot group: snapshot .. snapshot + extra_parts. */
+  lc_u64 snapshot_extra_parts;
   lc_u64 tail_segment;
   lc_u64 tail_offset;
   lc_u64 next_snapshot;
@@ -27,6 +29,14 @@ typedef struct lc_collection_disk_head {
   lc_collection_lease_info lease;
   int dropped;
 } lc_collection_disk_head;
+
+/* Unused canonical address ranges, owned exclusively by this handle. Only
+ * metadata is retained; no payload or extra descriptor is held by idle ranges.
+ * Append authority serializes transfer to/from a live upload. */
+typedef struct lc_collection_region {
+  lc_u64 segment, next, end;
+} lc_collection_region;
+#define LC_COLLECTION_IDLE_REGIONS 16U
 
 typedef struct lc_collection_handle {
   lc_collection pub;
@@ -47,6 +57,9 @@ typedef struct lc_collection_handle {
   int metadata_fd;
   int append_fd;
   int active_fd;
+  int streams_fd;
+  unsigned long stream_writers;
+  lc_collection_region stream_regions[LC_COLLECTION_IDLE_REGIONS];
   /* Keep the immutable cached head inode alive across atomic replacements:
    * an unpinned device/inode pair can be reused for a different head. */
   int head_fd;
@@ -116,12 +129,14 @@ int lc_collection_append_staged_method(lc_collection *self,
                                        lc_source *source,
                                        lc_collection_append_res *out,
                                        lc_error *error);
-/* Consumes the finished encoder. Copy and rollback happen under append
- * authority; the staging source remains borrowed. */
-int lc_collection_publish_staged(lc_collection_call *call,
+struct lc_collection_chunks;
+/* Consumes the finished encoder and publishes its immutable canonical index. */
+int lc_collection_publish_stream(lc_collection_call *call,
+                                 lc_collection_guard *guard,
                                  lc_pouch_collection_writer *writer,
-                                 lc_source *source, lc_u64 ownership_generation,
+                                 lc_u64 ownership_generation,
                                  const lc_pouch_collection_record *body,
+                                 struct lc_collection_chunks *storage,
                                  lc_collection_append_res *out,
                                  lc_error *error);
 void lc_collection_call_callback(lc_collection_call *call, int enabled,
@@ -151,6 +166,11 @@ int lc_collection_write_enter(lc_collection_call *call,
 /* Upload admission does not drain in-flight durable append groups. */
 int lc_collection_append_enter(lc_collection_call *call,
                                lc_collection_guard *guard, lc_error *error);
+/* Physical chunks require a valid append boundary, not an identity-table read.
+ */
+int lc_collection_stream_enter(lc_collection_call *, lc_collection_guard *,
+                               lc_error *);
+
 int lc_collection_edit_barrier(lc_collection_guard *, lc_error *);
 void lc_collection_write_leave(lc_collection_guard *guard);
 int lc_collection_head_write(lc_collection_handle *collection, lc_error *error);
@@ -179,15 +199,20 @@ lc_pouch_unix_seconds
 lc_collection_retention_deadline(const lc_collection_handle *collection);
 int lc_collection_rotate(lc_collection_handle *collection, int force,
                          lc_error *error);
+/* Bound mid-upload overshoot while retaining normal publication rollovers. */
+int lc_collection_rotate_stream(lc_collection_handle *, lc_error *);
+
 int lc_collection_project_record(lc_collection_order *order,
                                  lc_collection_ids *ids,
                                  const lc_pouch_collection_record *record,
                                  lc_u64 segment, int snapshot, lc_error *error);
+/* Disable tail repair while building replacement projections: canonical
+ * history must be validated before discarding any unfinished active tail. */
 int lc_collection_replay_into(lc_collection_handle *collection,
                               lc_collection_order *order,
                               lc_collection_ids *ids, lc_u64 segment,
                               lc_u64 offset, int snapshot, lc_u64 cutoff,
-                              lc_error *error);
+                              int repair, lc_error *error);
 int lc_collection_lookup_id(lc_collection_handle *collection,
                             const char *append_id,
                             lc_pouch_collection_record *out, lc_u64 *segment,
@@ -200,10 +225,16 @@ int lc_collection_read_pin(lc_collection_handle *collection, lc_u64 snapshot,
                            int *fd, lc_error *error);
 int lc_collection_refresh_view(lc_collection_handle *collection,
                                lc_error *error);
+int lc_collection_record_file(lc_collection_handle *, lc_u64, int *, lc_u64 *,
+                              lc_u64 *, lc_error *);
 int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
                              lc_u64 offset, int *fd, lc_u64 *fd_segment,
                              lc_u64 *fd_end, lc_pouch_collection_record *out,
                              lc_error *error);
+int lc_collection_record_ref_prefix(lc_collection_handle *, lc_u64, lc_u64,
+                                    int *, lc_u64 *, lc_u64 *,
+                                    lc_pouch_collection_record *, void *,
+                                    size_t, size_t *, lc_error *);
 /* Resolves metadata history for a pinned read generation. The current record
  * must already be loaded, and fd describes it. Only bounded metadata is read.
  */
@@ -235,8 +266,11 @@ int lc_collection_edit_project(lc_collection_handle *, lc_collection_order *,
                                const lc_pouch_collection_record *,
                                const lc_pouch_collection_record *, lc_u64, int,
                                lc_error *);
+typedef int (*lc_collection_compact_output_fn)(void *, lc_u64, int *,
+                                               const char **, lc_u64 *,
+                                               lc_error *);
 int lc_collection_edit_compact(lc_collection_handle *, lc_collection_ids *,
-                               lc_u64, int, const char *, lc_u64,
+                               lc_u64, lc_collection_compact_output_fn, void *,
                                lc_collection_order *, lc_collection_ids *,
                                unsigned char *, size_t, lc_error *);
 lc_u64 lc_collection_binding_count(const lc_collection_order *);
@@ -253,6 +287,7 @@ typedef int (*lc_collection_edit_hook_fn)(void *, lc_collection *, int,
                                           lc_error *);
 extern lc_collection_edit_hook_fn lc_collection_edit_test_hook;
 extern void *lc_collection_edit_test_context;
+extern int (*lc_collection_test_rotate_sync_fd)(int);
 #endif
 int lc_collection_failure(lc_error *error, int code, const char *reason,
                           const char *message);
@@ -308,7 +343,10 @@ extern void *lc_collection_commit_wait_test_context;
 enum {
   LC_COLLECTION_APPEND_STAGED = 1,
   LC_COLLECTION_APPEND_PUBLISHED,
-  LC_COLLECTION_APPEND_PROJECTED
+  LC_COLLECTION_APPEND_PROJECTED,
+  LC_COLLECTION_APPEND_CHUNK_PENDING,
+  LC_COLLECTION_APPEND_CHUNK_WRITTEN,
+  LC_COLLECTION_APPEND_CHUNK_LINKED
 };
 typedef int (*lc_collection_append_hook_fn)(void *, lc_collection *, int,
                                             lc_error *);

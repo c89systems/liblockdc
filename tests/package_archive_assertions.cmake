@@ -483,7 +483,8 @@ function(assert_archive_layout archive_path version target_id shared_lib_name sh
     if(NOT extract_result EQUAL 0)
         message(FATAL_ERROR "failed to extract archive for validation: ${archive_path}")
     endif()
-    foreach(public_doc README.md CHANGELOG.md docs/xa.md docs/postgres.md
+    foreach(public_doc README.md CHANGELOG.md docs/c-api.md docs/development.md
+        docs/releases.md docs/xa.md docs/postgres.md
         docs/lua.md docs/pouch-terminal-retention.md)
         set(packaged_doc "${extract_root}/${archive_prefix}/share/doc/liblockdc/${public_doc}")
         if(NOT EXISTS "${packaged_doc}")

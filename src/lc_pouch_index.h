@@ -104,20 +104,6 @@ typedef struct lc_pouch_index_result_row_list {
   size_t capacity;
 } lc_pouch_index_result_row_list;
 
-typedef struct lc_pouch_index_result_page {
-  size_t offset;
-  size_t limit;
-  size_t seen;
-  size_t matched;
-  size_t emitted;
-  size_t next_offset;
-} lc_pouch_index_result_page;
-
-typedef struct lc_pouch_index_result_page_cache {
-  char *key;
-  lc_pouch_index_result_row_list rows;
-} lc_pouch_index_result_page_cache;
-
 typedef struct lc_pouch_index_term_field {
   char *field_hex;
   unsigned long first_line;
@@ -254,10 +240,6 @@ int lc_pouch_index_docid_set_subtract_sorted(
     lc_error *error);
 void lc_pouch_index_doc_table_cleanup(const lc_allocator *allocator,
                                       lc_pouch_index_doc_table *table);
-int lc_pouch_index_doc_table_append_unique(
-    lc_pouch_index_doc_table *table, const char *key_hex, uint64_t version,
-    uint64_t bytes, int has_query_hidden, int query_hidden,
-    unsigned long *doc_id, const lc_allocator *allocator, lc_error *error);
 int lc_pouch_index_doc_table_append_owned(
     lc_pouch_index_doc_table *table, const char *key_hex, uint64_t version,
     uint64_t bytes, int has_query_hidden, int query_hidden,
@@ -278,10 +260,6 @@ int lc_pouch_index_doc_table_generation_encode(
     const lc_pouch_index_doc_table *table, uint64_t index_seq,
     unsigned long row_hash, const lc_allocator *allocator, char **out_bytes,
     size_t *out_length, lc_error *error);
-int lc_pouch_index_doc_table_generation_validate_file(
-    const lc_allocator *allocator, const char *path,
-    uint64_t expected_index_seq, unsigned long expected_row_count,
-    unsigned long expected_row_hash, int *present, int *valid, lc_error *error);
 int lc_pouch_index_doc_table_generation_load_bytes(
     const lc_allocator *allocator, char **bytes_inout, size_t length,
     uint64_t expected_index_seq, unsigned long expected_row_count,
@@ -313,14 +291,6 @@ int lc_pouch_index_result_docid_list_add(const lc_allocator *allocator,
 int lc_pouch_index_result_docid_list_sort_compact(
     const lc_allocator *allocator, lc_pouch_index_result_docid_list *list,
     lc_error *error);
-void lc_pouch_index_result_page_init(lc_pouch_index_result_page *page,
-                                     size_t offset, size_t limit);
-int lc_pouch_index_result_page_enter_candidate(lc_pouch_index_result_page *page,
-                                               int *active, lc_error *error);
-int lc_pouch_index_result_page_accept_match(lc_pouch_index_result_page *page,
-                                            int *emit, int *stop,
-                                            lc_error *error);
-void lc_pouch_index_result_page_mark_emitted(lc_pouch_index_result_page *page);
 void lc_pouch_index_result_row_list_cleanup(
     const lc_allocator *allocator, lc_pouch_index_result_row_list *list);
 int lc_pouch_index_result_row_list_add(const lc_allocator *allocator,
@@ -330,14 +300,6 @@ int lc_pouch_index_result_row_list_add(const lc_allocator *allocator,
                                        uint64_t bytes, int has_query_hidden,
                                        int query_hidden, size_t value_index,
                                        lc_error *error);
-void lc_pouch_index_result_page_cache_cleanup(
-    const lc_allocator *allocator, lc_pouch_index_result_page_cache *cache);
-int lc_pouch_index_result_page_cache_lookup(
-    const lc_pouch_index_result_page_cache *cache, const char *key,
-    const lc_pouch_index_result_row_list **rows, int *hit, lc_error *error);
-int lc_pouch_index_result_page_cache_store(
-    const lc_allocator *allocator, lc_pouch_index_result_page_cache *cache,
-    const char *key, lc_pouch_index_result_row_list *rows, lc_error *error);
 void lc_pouch_index_term_fields_cleanup(const lc_allocator *allocator,
                                         lc_pouch_index_term_field *fields,
                                         size_t count);
@@ -411,10 +373,6 @@ int lc_pouch_index_term_posting_table_put(
     const lc_allocator *allocator, lc_pouch_index_term_posting_table *table,
     unsigned long term_id, const unsigned long *doc_ids, size_t doc_id_count,
     lc_error *error);
-int lc_pouch_index_term_posting_table_put_sorted_unique_trusted(
-    const lc_allocator *allocator, lc_pouch_index_term_posting_table *table,
-    unsigned long term_id, const unsigned long *doc_ids, size_t doc_id_count,
-    lc_error *error);
 int lc_pouch_index_term_posting_table_append_sorted_unique_trusted(
     const lc_allocator *allocator, lc_pouch_index_term_posting_table *table,
     unsigned long term_id, const unsigned long *doc_ids, size_t doc_id_count,
@@ -464,15 +422,6 @@ int lc_pouch_index_term_generation_load_bytes(
     uint64_t expected_index_seq, unsigned long expected_row_count,
     unsigned long expected_row_hash, lc_pouch_index_term_generation *generation,
     int *valid, lc_error *error);
-int lc_pouch_index_term_generation_validate_file(
-    const lc_allocator *allocator, const char *path,
-    uint64_t expected_index_seq, unsigned long expected_row_count,
-    unsigned long expected_row_hash, int *present, int *valid, lc_error *error);
-int lc_pouch_index_term_generation_load_file(
-    const lc_allocator *allocator, const char *path,
-    uint64_t expected_index_seq, unsigned long expected_row_count,
-    unsigned long expected_row_hash, lc_pouch_index_term_generation *generation,
-    int *present, int *valid, lc_error *error);
 int lc_pouch_index_term_field_parse_line(char *line,
                                          lc_pouch_index_term_field *field,
                                          const lc_allocator *allocator,
@@ -481,8 +430,6 @@ int lc_pouch_index_term_value_parse_line(char *line,
                                          lc_pouch_index_term_value *value,
                                          const lc_allocator *allocator,
                                          lc_error *error);
-void lc_pouch_index_term_ranges_cleanup(const lc_allocator *allocator,
-                                        lc_pouch_index_term_range *ranges);
 int lc_pouch_index_term_fields_select_range(
     const lc_pouch_index_term_field *fields, size_t field_count,
     const char *field_hex, const lc_pouch_index_term_key *terms,

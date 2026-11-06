@@ -246,16 +246,6 @@ static void lc_engine_default_free(void *context, void *ptr) {
   lc_builtin_free(ptr);
 }
 
-void lc_engine_allocator_init(lc_engine_allocator *allocator) {
-  if (allocator == NULL) {
-    return;
-  }
-  allocator->malloc_fn = NULL;
-  allocator->realloc_fn = NULL;
-  allocator->free_fn = NULL;
-  allocator->context = NULL;
-}
-
 int lc_engine_client_set_allocator(lc_engine_client *client,
                                    const lc_engine_allocator *allocator,
                                    lc_engine_error *error) {

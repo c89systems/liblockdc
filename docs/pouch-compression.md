@@ -27,17 +27,20 @@ complete document or root is buffered in memory. Only retained canonical
 history, live collection records and staging are converted. Structural metadata
 is not a compressed archive of the directory.
 
-Temporary duplicated payload space is bounded by one replacement canonical file
-at a time, which can be a segment or snapshot. A large record can exceed the
-configured segment target, and snapshots can be larger than a segment. Allow
-space for the largest converted file, the conversion journal and rebuilt derived
-indexes. Decompression also needs the unavoidable space increase in the final
-root; this is not temporary duplication.
+Temporary duplication is limited to the current source file and its converted
+output. Ordinary state files stage one replacement. Indexed collection data goes
+directly into final canonical parts, rolling at the soft segment target plus
+one independently encoded unit; conversion never concatenates a large streamed
+entry into one file. Decompression needs the unavoidable increase in final
+payload space, plus headroom for the old source until that step is durable.
+Legacy contiguous records or snapshots can exceed the configured segment target;
+allow for the largest retained source file, journal metadata and rebuilt indexes.
 
 The private `.compression-work/` directory contains an immutable file inventory,
-per-file offset maps and replacement receipts, small original collection heads
-and continuation identities, and at most one staged payload file. Maps use space
-proportional to record count; they do not contain document bodies. The directory
+per-file offset maps, collection reachability tables and replacement receipts,
+small original collection heads and continuation identities, and at most one
+staged ordinary payload file. Maps contain offsets, output identities and tree
+totals, never document bodies. Their space scales with canonical record count. The directory
 remains mode `0700` until reclamation. Namespace directories and catalogs stay
 in place with their existing permissions; each replacement preserves its source
 file's mode before installation.
@@ -62,10 +65,29 @@ or backup. A prior publication can remain visible after its directory sync
 failed; it must become durable before a canonical replacement can become
 durable. If that recovery sync fails, stop before installing replacements.
 
-After encoding all payload files, repair references using the durable offset
-maps. Files without references need no second rewrite. A reference-bearing file
-is copied individually, repaired and durably replaced with the same protocol,
-so temporary payload duplication remains limited to one file. Original
+Ordinary state references are repaired after encoding their payload files, using
+the durable offset maps. Files without references need no second rewrite. A
+reference-bearing ordinary file is copied individually, repaired and durably
+replaced with the same protocol.
+
+Collection conversion first validates the published roots and saves durable
+metadata-only reachability tables. Unpublished private ranges need not contain
+parseable units. Referenced units and index pages must validate, and their source
+files are synced before the reachability boundary becomes durable. Units precede
+their index pages and publications during conversion; snapshots precede segment
+aliases. Unit data crosses the codec once through bounded scratch. New index
+references and subtree totals live in the relocation maps, so reads need no new
+index format or prefetch cache. Unit zero retains the logical manifest binding;
+its converted descriptor is reused exactly by its publication and retention
+aliases.
+
+All output parts and their names are synced before a source-retirement receipt
+becomes durable. Only then is that source removed. After interruption, completed
+parts are reused and only the unfinished source step is regenerated. Head
+publication translates segment identities and the complete snapshot group.
+Collection aliases resolve inline and need no second payload rewrite.
+
+ Original
 collection heads and continuation identities are saved before translating tail
 boundaries and rebuilding indexes. Recovery can repeat that step without
 translating a translated offset or changing an existing continuation identity.
@@ -132,7 +154,9 @@ updates: discard or tear an unflushed staged payload, restore a reference copy
 to its last successfully synced bytes, undo an unsynced rename, or retain the
 staging name when only the destination directory was synced. The tests preserve
 successfully synced journal/data state and assert recovery through ordinary
-open. They also leave offset-map and reference receipts visible after a failed
+open. Indexed collection tests also fail the final unit-output sync, or discard
+its unsynced name or bytes, and require the original source to remain available
+for a successful retry. They also leave offset-map and reference receipts visible after a failed
 publication sync, then interrupt a retry after its canonical-directory sync,
 discarding only receipt names that were not made durable. Recovery sync errors
 must preserve the prepared replacement and original canonical file. Together

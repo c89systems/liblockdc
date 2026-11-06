@@ -332,25 +332,9 @@ Preserve bounded SQLSTATE/provider diagnostics separately from coordinator state
 and completion evidence. Never automatically log SQL, parameters, connection
 secrets or raw diagnostic bodies.
 
-## Implementation and acceptance
+## Verification
 
-Keep resource-specific operations behind the PostgreSQL driver and extend the
-existing coordinator's enrollment, decision and application machinery. Remove
-obsolete immediate-application paths as their callers migrate; do not keep a
-parallel legacy coordinator. No caches or compatibility parsers are introduced.
-Honor the project's independent public ABI and storage-format policies.
-Link official PostgreSQL static/shared closure and update installed CMake,
-pkg-config, notices and provenance when the driver becomes executable.
-
-Implement and verify coherent steps:
-
-1. Durable resource enrollment and decision/application separation.
-2. PostgreSQL branch ownership, borrows and asynchronous native operations.
-3. Crash recovery, acknowledgement reconciliation and bounded inventory.
-4. Pouch/outbox application gates, receipts and recovery notifications.
-5. Public C usage, Lua/facade documentation and installed artifacts.
-
-Acceptance tests assert observable behavior using deterministic fault barriers:
+Tests assert observable behavior using deterministic fault barriers:
 
 - Core configure, build and installed consumers work with the entire cpktdb SDK
   absent. ON fails clearly if that provider SDK is missing. Optional provider
@@ -386,7 +370,3 @@ Acceptance tests assert observable behavior using deterministic fault barriers:
 - Rootless Podman Kube tests start their stack when needed, use real readiness
   and host-writable state, tear it down on every exit and assert owned pod/container
   absence. Generated state/credentials stay under ignored build directories.
-
-If the released cpkt C89 facade cannot supply a required operation or failure
-distinction, stop dependent implementation and record a focused upstream report
-under `stash/`. Do not patch an adjacent dependency or bypass its public facade.

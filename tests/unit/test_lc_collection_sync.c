@@ -30,12 +30,15 @@ typedef struct fixture {
   pthread_cond_t condition;
   unsigned int staged;
   unsigned int sync_calls;
+  dev_t sync_device;
+  ino_t sync_inode;
+  int multiple_sync_files;
   unsigned int enqueued;
   unsigned int expected_requests;
   uint64_t batch_limit;
   int fail_sync;
   int release;
-  const char *body;
+  char *body;
 } fixture;
 
 static fixture *sync_fixture;
@@ -139,6 +142,7 @@ static int teardown(void **state) {
   pthread_cond_destroy(&f->condition);
   pthread_mutex_destroy(&f->mutex);
   lc_test_tmp_cleanup_path(f->root, PREFIX);
+  free(f->body);
   free(f);
   return 0;
 }
@@ -212,6 +216,12 @@ static int tracked_sync(int fd) {
   int rc = 0;
   if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
     return -1;
+  if (f->sync_calls == 0) {
+    f->sync_device = st.st_dev;
+    f->sync_inode = st.st_ino;
+  } else if (f->sync_device != st.st_dev || f->sync_inode != st.st_ino) {
+    f->multiple_sync_files = 1;
+  }
   ++f->sync_calls; /* Only the root batcher's worker calls this hook. */
   /* Hold the first I/O until every caller is queued. Arrivals during I/O
    * must form a group without a timer or a scheduling-dependent sleep. */
@@ -282,6 +292,7 @@ static void parallel(fixture *f, int exclusive, int same_receiver,
     if (f->batch_limit != 0)
       assert_true(stats.max_batch_size <= f->batch_limit);
   }
+  assert_int_equal(f->multiple_sync_files, segment == 256);
   assert_int_equal(f->sync_calls,
                    segment == 256 ? WRITERS : stats.total_batches);
   lc_collection_info info;
@@ -404,7 +415,10 @@ static void spilled_group(void **state, append_kind kind) {
   memset(body + 6, 'x', 131064);
   memcpy(body + 131070, "\"}", 3);
   f->body = body;
-  parallel(f, 0, 1, 0, 0, 1024 * 1024, kind);
+  /* Concurrent private ranges need space beyond their 128 KiB bodies.
+   * Keep this deduplication fixture on one inode; separate cases test rotation.
+   */
+  parallel(f, 0, 1, 0, 0, 64 * 1024 * 1024, kind);
   f->body = NULL;
   free(body);
 }

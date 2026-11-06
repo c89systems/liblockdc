@@ -287,12 +287,6 @@ typedef struct lc_engine_query_request {
   const char *refresh;
 } lc_engine_query_request;
 
-typedef struct lc_engine_query_response {
-  char *cursor;
-  lc_index_seq index_seq;
-  char *correlation_id;
-} lc_engine_query_response;
-
 typedef struct lc_engine_query_stream_response {
   char *cursor;
   char *correlation_id;
@@ -755,7 +749,6 @@ void lc_engine_error_cleanup(lc_engine_error *error);
  * this private, one-shot client. A NULL value clears that constraint. */
 void lc_engine_client_set_request_deadline(lc_engine_client *client,
                                            const struct timespec *deadline);
-void lc_engine_allocator_init(lc_engine_allocator *allocator);
 int lc_engine_client_open(const lc_engine_client_config *config,
                           lc_engine_client **out_client,
                           lc_engine_error *error);
@@ -783,7 +776,6 @@ void lc_engine_mutate_response_cleanup(lc_engine_mutate_response *response);
 void lc_engine_metadata_response_cleanup(lc_engine_metadata_response *response);
 void lc_engine_remove_response_cleanup(lc_engine_remove_response *response);
 void lc_engine_describe_response_cleanup(lc_engine_describe_response *response);
-void lc_engine_query_response_cleanup(lc_engine_query_response *response);
 void lc_engine_query_stream_response_cleanup(
     lc_engine_client *client, lc_engine_query_stream_response *response);
 void lc_engine_enqueue_response_cleanup(lc_engine_enqueue_response *response);
@@ -855,10 +847,6 @@ int lc_engine_client_release(lc_engine_client *client,
                              const lc_engine_release_request *request,
                              lc_engine_release_response *response,
                              lc_engine_error *error);
-int lc_engine_client_update(lc_engine_client *client,
-                            const lc_engine_update_request *request,
-                            lc_engine_update_response *response,
-                            lc_engine_error *error);
 int lc_engine_client_update_from(lc_engine_client *client,
                                  const lc_engine_update_request *request,
                                  lc_engine_read_callback reader,
@@ -881,10 +869,6 @@ int lc_engine_client_describe(lc_engine_client *client,
                               const lc_engine_describe_request *request,
                               lc_engine_describe_response *response,
                               lc_engine_error *error);
-int lc_engine_client_query(lc_engine_client *client,
-                           const lc_engine_query_request *request,
-                           lc_engine_query_response *response,
-                           lc_engine_error *error);
 int lc_engine_client_query_into(lc_engine_client *client,
                                 const lc_engine_query_request *request,
                                 lc_engine_write_callback writer,
@@ -903,13 +887,6 @@ int lc_engine_client_enqueue_from(lc_engine_client *client,
                                   void *reader_context,
                                   lc_engine_enqueue_response *response,
                                   lc_engine_error *error);
-int lc_engine_client_dequeue(lc_engine_client *client,
-                             const lc_engine_dequeue_request *request,
-                             lc_engine_dequeue_response *response,
-                             lc_engine_error *error);
-int lc_engine_client_dequeue_with_state(
-    lc_engine_client *client, const lc_engine_dequeue_request *request,
-    lc_engine_dequeue_response *response, lc_engine_error *error);
 int lc_engine_client_dequeue_into(lc_engine_client *client,
                                   const lc_engine_dequeue_request *request,
                                   const lc_engine_queue_stream_handler *handler,

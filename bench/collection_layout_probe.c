@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -155,13 +156,25 @@ static int layout_write(int fd, const void *bytes, size_t count) {
   return 1;
 }
 
+static int layout_random_padding;
+
 static void layout_body(char *body, size_t size, size_t id) {
   char prefix[64];
   size_t count;
   count = (size_t)snprintf(prefix, sizeof(prefix),
                            "{\"id\":\"%020lu\",\"data\":\"", (unsigned long)id);
   memcpy(body, prefix, count);
-  memset(body + count, 'x', size - count - 2U);
+  if (layout_random_padding) {
+    static const char alphabet[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    unsigned long random = 17;
+    size_t at;
+    for (at = count; at < size - 2U; ++at) {
+      random = (random * 1664525UL + 1013904223UL) & 0xffffffffUL;
+      body[at] = alphabet[(random >> 24) & 63];
+    }
+  } else
+    memset(body + count, 'x', size - count - 2U);
   memcpy(body + size - 2U, "\"}", 3U);
 }
 
@@ -427,6 +440,7 @@ static int layout_read_all(layout_run *run, lc_collection *collection,
                            lc_error *error) {
   layout_read counters;
   layout_io io;
+  struct rusage usage_before = {0}, usage_after = {0};
   lc_collection_read_opts options;
   lc_collection_read_res result;
   unsigned char *buffer = NULL;
@@ -464,6 +478,7 @@ static int layout_read_all(layout_run *run, lc_collection *collection,
     rc = layout_error(error, "cannot read process I/O counters");
     goto done;
   }
+  (void)getrusage(RUSAGE_SELF, &usage_before);
   cpu = layout_time(CLOCK_PROCESS_CPUTIME_ID);
   start = layout_time(CLOCK_MONOTONIC);
   if (collection != NULL)
@@ -488,6 +503,7 @@ static int layout_read_all(layout_run *run, lc_collection *collection,
   }
   start = layout_time(CLOCK_MONOTONIC) - start;
   cpu = layout_time(CLOCK_PROCESS_CPUTIME_ID) - cpu;
+  (void)getrusage(RUSAGE_SELF, &usage_after);
   if (!verify)
     layout_io_report(phase, &io);
   if (rc == LC_OK &&
@@ -498,9 +514,19 @@ static int layout_read_all(layout_run *run, lc_collection *collection,
     rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L, "read is incomplete", NULL,
                       NULL, "layout-probe");
   if (!verify)
-    printf("phase=%s seconds=%.6f cpu_seconds=%.6f bytes=%lu MiBps=%.3f\n",
-           phase, start, cpu, (unsigned long)counters.bytes,
-           start > 0.0 ? (double)counters.bytes / 1048576.0 / start : 0.0);
+    printf(
+        "phase=%s seconds=%.6f cpu_seconds=%.6f bytes=%lu MiBps=%.3f "
+        "user_seconds=%.6f system_seconds=%.6f\n",
+        phase, start, cpu, (unsigned long)counters.bytes,
+        start > 0.0 ? (double)counters.bytes / 1048576.0 / start : 0.0,
+        (double)(usage_after.ru_utime.tv_sec - usage_before.ru_utime.tv_sec) +
+            (double)(usage_after.ru_utime.tv_usec -
+                     usage_before.ru_utime.tv_usec) /
+                1000000.0,
+        (double)(usage_after.ru_stime.tv_sec - usage_before.ru_stime.tv_sec) +
+            (double)(usage_after.ru_stime.tv_usec -
+                     usage_before.ru_stime.tv_usec) /
+                1000000.0);
 done:
   if (fd >= 0)
     (void)close(fd);
@@ -597,7 +623,8 @@ int main(int argc, char **argv) {
   const char *endpoints[1];
   size_t i, created = 0U, spooled = 0U, memory = 0U;
   size_t sync, index;
-  size_t compact;
+  size_t compact, compress, encrypt, entropy, extra_reads;
+  char *crypto_key = NULL;
   uint64_t source_calls = 0U;
   double start, cpu;
   int rc = LC_OK;
@@ -621,11 +648,22 @@ int main(int argc, char **argv) {
       run.source_chunk == 0U ||
       !layout_option("LOCKDC_LAYOUT_SOURCE_DELAY_US", 0U, 10000U,
                      &run.source_delay_us) ||
-      !layout_option("LOCKDC_LAYOUT_COMPACT", 1U, 1U, &compact)) {
+      !layout_option("LOCKDC_LAYOUT_COMPACT", 1U, 1U, &compact) ||
+      !layout_option("LOCKDC_LAYOUT_COMPRESS", 0U, 1U, &compress) ||
+      !layout_option("LOCKDC_LAYOUT_CRYPTO", 0U, 1U, &encrypt) ||
+      !layout_option("LOCKDC_LAYOUT_ENTROPY", 0U, 1U, &entropy) ||
+      !layout_option("LOCKDC_LAYOUT_EXTRA_READS", 0U, 1000U, &extra_reads)) {
     fprintf(stderr, "invalid layout source/compaction options\n");
     return 2;
   }
   run.compact = (int)compact;
+  layout_random_padding = (int)entropy;
+  if (!strcmp(run.mode, "raw") && (compress || encrypt)) {
+    fprintf(
+        stderr,
+        "codec options require a collection mode; raw is plaintext JSONL\n");
+    return 2;
+  }
   if (!layout_number(argv[2], &run.rows) ||
       !layout_number(argv[3], &run.body_bytes) ||
       !layout_number(argv[4], &run.limit) ||
@@ -676,6 +714,14 @@ int main(int argc, char **argv) {
   settings.background_compaction_enabled = 0;
   settings.query_indexing_enabled = (int)index;
   settings.segment_target_bytes = 1024U * 1024U;
+  settings.set_mask |= LC_POUCH_SETTING_COMPRESSION;
+  settings.compression = compress ? "zlib" : "none";
+  if (encrypt) {
+    if (rc == LC_OK)
+      rc = lc_pouch_crypto_generate_key_string(&crypto_key, &error);
+    settings.set_mask |= LC_POUCH_SETTING_CRYPTO_KEY;
+    settings.crypto_key = crypto_key;
+  }
   config.endpoints = endpoints;
   config.endpoint_count = 1U;
   config.default_namespace = "layout";
@@ -692,11 +738,14 @@ int main(int argc, char **argv) {
       rc = lc_client_create_collection(client, &cc, &run.collection, &error);
   }
   printf("mode=%s rows=%lu body_bytes=%lu buffer_limit=%lu writers=%lu sync=%d "
-         "index=%d source_chunk=%lu source_delay_us=%lu compact=%d\n",
+         "index=%d source_chunk=%lu source_delay_us=%lu compact=%d "
+         "compress=%lu crypto=%lu entropy=%lu\n",
          run.mode, (unsigned long)run.rows, (unsigned long)run.body_bytes,
          (unsigned long)run.limit, (unsigned long)run.writers, run.sync,
          settings.query_indexing_enabled, (unsigned long)run.source_chunk,
-         (unsigned long)run.source_delay_us, run.compact);
+         (unsigned long)run.source_delay_us, run.compact,
+         (unsigned long)compress, (unsigned long)encrypt,
+         (unsigned long)entropy);
   if (!layout_io_read(&io))
     rc = layout_error(&error, "cannot read process I/O counters");
   cpu = layout_time(CLOCK_PROCESS_CPUTIME_ID);
@@ -755,8 +804,6 @@ int main(int argc, char **argv) {
          layout_time(CLOCK_MONOTONIC) - start,
          layout_time(CLOCK_PROCESS_CPUTIME_ID) - cpu);
   layout_io_report("checkpoint_io", &io);
-  if (rc == LC_OK && !layout_inventory(&run, "files_before", 1))
-    rc = layout_error(&error, "cannot inspect or advise probe files");
   start = layout_time(CLOCK_MONOTONIC);
   if (rc == LC_OK && strcmp(run.mode, "raw")) {
     rc = lc_client_open(&config, &client, &error);
@@ -764,10 +811,17 @@ int main(int argc, char **argv) {
       rc = lc_client_open_collection(client, &cc, &collection, &error);
   }
   printf("phase=open seconds=%.6f\n", layout_time(CLOCK_MONOTONIC) - start);
+  /* Recovery reads canonical metadata and may warm adjacent payload pages.
+   * Advise after opening so both layouts start the read with the same policy.
+   */
+  if (rc == LC_OK && !layout_inventory(&run, "files_before", 1))
+    rc = layout_error(&error, "cannot inspect or advise probe files");
   if (rc == LC_OK)
     rc = layout_read_all(&run, collection, raw, 0, "read_advised_cold", &error);
   if (rc == LC_OK)
     rc = layout_read_all(&run, collection, raw, 0, "read_warm", &error);
+  for (i = 0; rc == LC_OK && i < extra_reads; ++i)
+    rc = layout_read_all(&run, collection, raw, 0, "read_repeat", &error);
   if (rc == LC_OK)
     rc = layout_read_all(&run, collection, raw, 1, "verify", &error);
   if (rc == LC_OK && collection != NULL && run.compact) {
@@ -796,12 +850,12 @@ int main(int argc, char **argv) {
     collection = NULL;
     lc_client_close(client);
     client = NULL;
-    if (rc == LC_OK && !layout_inventory(&run, "files_after", 1))
-      rc = layout_error(&error, "cannot inspect compacted files");
     if (rc == LC_OK)
       rc = lc_client_open(&config, &client, &error);
     if (rc == LC_OK)
       rc = lc_client_open_collection(client, &cc, &collection, &error);
+    if (rc == LC_OK && !layout_inventory(&run, "files_after", 1))
+      rc = layout_error(&error, "cannot inspect compacted files");
     if (rc == LC_OK)
       rc = layout_read_all(&run, collection, raw, 0, "read_packed_advised_cold",
                            &error);
@@ -816,6 +870,7 @@ int main(int argc, char **argv) {
             error.message != NULL ? error.message : "unknown error");
   lc_collection_close(collection);
   lc_client_close(client);
+  lc_pouch_crypto_key_string_free(crypto_key);
   lc_error_cleanup(&error);
   pthread_mutex_destroy(&run.raw_mutex);
   lc_free_with_allocator(NULL, run.latencies);

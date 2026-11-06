@@ -41,7 +41,11 @@ static int lc_cl_kind(lc_collection_handle *collection, const char *name) {
                : 2;
   if (lc_cl_number(name, "snapshot-", ".log", &id) && id != 0U &&
       id < LC_COLLECTION_SNAPSHOT_BIT)
-    return id == collection->head.snapshot ? 1 : 2;
+    return id >= collection->head.snapshot &&
+                   id - collection->head.snapshot <=
+                       collection->head.snapshot_extra_parts
+               ? 1
+               : 2;
   if (strncmp(name, "order.rebuild-", 14U) == 0 ||
       strncmp(name, "ids.rebuild-", 12U) == 0 ||
       strncmp(name, "order.compact-", 14U) == 0 ||

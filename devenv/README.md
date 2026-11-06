@@ -138,7 +138,7 @@ each bundle:
 
 Normal packaging flows:
 
-Follow the [release/signing sequence](../README.md#packaging-and-release-archives)
+Follow the [release/signing sequence](../docs/releases.md#release-process)
 on local `trunk` before invoking the final release gate.
 
 ```bash

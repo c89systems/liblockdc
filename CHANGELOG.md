@@ -2,6 +2,54 @@
 
 ## Unreleased
 
+## 0.28.0
+
+- Stream pushed and staged-pull collection entries directly into shared
+  canonical segments using bounded codec chunks and immutable offset indexes.
+  Publish each entry atomically without a whole-entry buffer, temporary spool,
+  commit-time payload copy, or segment inode per entry. Preserve concurrent
+  producers, lease fencing, retry identities and durable group commits.
+- Read, compact, recover and convert compression for chunked entries with
+  bounded memory. Roll compacted output across snapshot parts rather than
+  collecting a large entry or collection into one oversized file. Preserve
+  metadata references, retention, atomic edits and pinned-reader visibility.
+- Reject entry-sized allocation regressions and cover interrupted uploads,
+  publication failures, lost unsynced writes, concurrent producers, rotation,
+  projection recovery and encrypted/compressed storage.
+- Remove unused private transport, codec and index helpers. Complete public C
+  and Lua contract comments, retire superseded implementation notes, and include
+  the linked collection guides in Lua source packages.
+- Decrypt uncompressed collection frames directly into bounded read scratch,
+  avoiding an intermediate plaintext copy. Retain authentication before delivery
+  and wipe tentative output on authentication failure.
+- Reuse per-operation HMAC key setup and the direct reader's manifest binding;
+  avoid repeating identity construction and descriptor comparison for a unit
+  whose publication descriptor was constructed from that same unit.
+- Deliver large collection reads in bounded 64 KiB heap chunks matching the
+  codec transfer size, retaining the 16 KiB allocation for small reads.
+  Preserve retry cursors, filtering and integrity checks after read failures.
+- Upgrade lonejson to 0.46.0 and libpslog to 0.13.0, including all target SDK
+  checksums and the matching lonejson Lua dependency. Lonejson retains ABI 26.
+- Upgrade liblql to 0.4.1 from c89systems, with verified SDK checksums for all
+  supported targets. Its public C API and shared-library ABI remain unchanged.
+
+### Upgrading from 0.27.x
+
+Core shared-library ABI remains **9**; the optional PostgreSQL provider's ABI
+remains **0**. Public C layouts and existing append APIs are unchanged.
+
+Existing contiguous collection records remain readable without rewriting their
+payloads. Push and staged-pull appends can now publish new chunk/index record
+kinds; older libraries cannot read those records. Upgrade every client of a
+shared Pouch root before using these append paths, and do not downgrade after
+writing chunked entries. See
+[incremental collection appends](docs/collection-writer.md).
+
+The `append_staged` name is retained, but its implementation now feeds the same
+bounded canonical writer as push without staging a complete entry. Direct pull
+remains available. Source and writer ownership, atomic publication and the
+selected NoSync or durable-sync policy retain their existing contracts.
+
 ## 0.27.0
 
 - Convert Pouch compression on open using resumable segment/snapshot

@@ -1,6 +1,12 @@
 #ifndef LC_POSTGRES_H
 #define LC_POSTGRES_H
 
+/** @file lc/postgres.h
+ * Optional explicitly linked PostgreSQL XA provider. Include this header only
+ * when building with the PostgreSQL provider SDK and cpktdb facade available.
+ * The core public API in lc/lc.h has no PostgreSQL client dependency.
+ */
+
 #include <lc/lc.h>
 
 #ifdef __cplusplus
@@ -15,8 +21,17 @@ extern "C" {
  * owning thread/process drives native connections; one serialized journal
  * worker performs Pouch durability. No SQL is saved or replayed. */
 typedef struct lc_postgres lc_postgres;
+/** Owned enrolled PostgreSQL branch; close its active operation before branch
+ * close.
+ */
 typedef struct lc_postgres_branch lc_postgres_branch;
+/** Owned PostgreSQL operation; drive readiness and close after terminal
+ * observation.
+ */
 typedef struct lc_postgres_operation lc_postgres_operation;
+/** Owned validity token for the branch's exact native connection; release
+ * even after invalidation.
+ */
 typedef struct lc_sql_borrow lc_sql_borrow;
 
 /** Copied at open. Use an explicit Unix socket host, numeric host or hostaddr;
@@ -26,7 +41,11 @@ typedef struct lc_sql_borrow lc_sql_borrow;
  * and capacity. The role needs EXECUTE on pg_control_system(), in addition to
  * ordinary access. No DDL or server configuration is performed. */
 typedef struct lc_postgres_config {
+  /** Stable resource XID, reused unchanged across restarts and recovery. */
   const char *resource_id;
+  /** Copied libpq-style connection settings; credentials never enter the
+   * durable journal.
+   */
   const char *connection_info;
 } lc_postgres_config;
 
@@ -39,10 +58,16 @@ const lc_xa_driver *lc_postgres_driver(void);
 /** Native outcome, distinct from coordinator decision and completion evidence.
  */
 enum {
+  /** Native outcome is unavailable or ambiguous; preserve recovery intent. */
   LC_POSTGRES_OUTCOME_UNKNOWN = 0,
+  /** Native transaction status proves commit. */
   LC_POSTGRES_OUTCOME_COMMITTED = 1,
+  /** Native transaction status proves abort. */
   LC_POSTGRES_OUTCOME_ABORTED = 2,
+  /** Native transaction remains active or prepared. */
   LC_POSTGRES_OUTCOME_IN_PROGRESS = 3,
+  /** Native status history has expired; this observation alone proves no
+   * terminal outcome. */
   LC_POSTGRES_OUTCOME_DISCARDED = 4
 };
 
@@ -54,15 +79,29 @@ enum {
  * recovery attempt. Never wait on a terminal descriptor. Errors preserve
  * durable intent and exclude raw provider diagnostics. */
 typedef struct lc_postgres_wait {
+  /** Borrowed readiness descriptor; do not close it. */
   int fd;
+  /** READ=1 and WRITE=2 readiness mask; do not wait when the operation is
+   * terminal.
+   */
   unsigned int events;
+  /** Absolute CLOCK_MONOTONIC milliseconds; -1 denotes an infinite deadline. */
   int64_t deadline_ms;
 } lc_postgres_wait;
 
+/** Bounded diagnostic prepared-transaction identity; membership never
+ * authorizes resolution.
+ */
 typedef struct lc_postgres_inventory_row {
+  /** Exact native prepared-transaction identifier, NUL-terminated. */
   char gid[200];
+  /** Exact native 32-bit XID as decimal text, distinct from the epoch-
+   * qualified enrollment ID.
+   */
   char xid[11];
+  /** Exact database OID as decimal text, NUL-terminated. */
   char database_oid[11];
+  /** Exact role OID as decimal text, NUL-terminated. */
   char role_oid[11];
 } lc_postgres_inventory_row;
 
@@ -74,10 +113,19 @@ typedef struct lc_postgres_inventory_row {
  */
 typedef struct lc_postgres_result {
   lc_postgres_branch *branch; /**< Owned only for successful start/recovery. */
+  /** Copied durable branch identity/progress snapshot. */
   lc_xa_branch_record record;
+  /** LC_POSTGRES_OUTCOME_* observation, distinct from the coordinator
+   * decision.
+   */
   int native_outcome;
+  /** Number of populated inventory rows, at most 64. */
   size_t row_count;
+  /** Bounded inventory page; only row_count entries are populated. */
   lc_postgres_inventory_row rows[64];
+  /** Five-character SQLSTATE plus NUL, or empty when unavailable; never raw
+   * SQL diagnostics.
+   */
   char sqlstate[6];
 } lc_postgres_result;
 

@@ -89,14 +89,83 @@ function(lc_add_unit_test target_name)
     add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
     add_test(NAME ${target_name}_append COMMAND ${target_name} ${append_cases})
     add_test(NAME ${target_name}_recovery COMMAND ${target_name} ${recovery_cases})
+  elseif(target_name STREQUAL "lc_unit_collection_staged")
+    # Keep all producer cases on every runtime, but separate bounded-memory
+    # and conversion work so the cumulative QEMU job stays below 60 seconds.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_collection_staged.c")
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_collection_staged.c" case_source)
+    string(REGEX MATCHALL "cmocka_unit_test_setup_teardown\\([ \r\n]*[A-Za-z0-9_]+"
+      registrations "${case_source}")
+    set(streaming_cases)
+    set(conversion_cases)
+    foreach(registration IN LISTS registrations)
+      string(REGEX REPLACE ".*\\([ \r\n]*" "" case "${registration}")
+      if(case MATCHES "^test_stream_units_survive_compression_conversion$")
+        list(APPEND conversion_cases ${case})
+      elseif(case MATCHES "^test_push_is_canonical_|^test_stream_units_survive_rolling_")
+        list(APPEND streaming_cases ${case})
+      else()
+        list(APPEND cases ${case})
+      endif()
+    endforeach()
+    foreach(group cases streaming_cases conversion_cases)
+      if(NOT ${group})
+        message(FATAL_ERROR "Empty staged collection partition: ${group}")
+      endif()
+    endforeach()
+    list(APPEND test_names ${target_name}_streaming ${target_name}_conversion)
+    add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
+    add_test(NAME ${target_name}_streaming COMMAND ${target_name} ${streaming_cases})
+    add_test(NAME ${target_name}_conversion COMMAND ${target_name} ${conversion_cases})
+  elseif(target_name STREQUAL "lc_unit_pouch_compression")
+    # The native table includes independent codec and journal durability
+    # scenarios. Keep each bounded CTest job under the standard limit, with
+    # no duplicated cases or extra executable/build configuration.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_pouch_compression.c")
+    set(selected_cases ${cases})
+    if(NOT selected_cases)
+      file(READ "${CMAKE_CURRENT_SOURCE_DIR}/test_lc_pouch_compression.c" case_source)
+      string(REGEX MATCHALL "cmocka_unit_test_setup_teardown\\([ \r\n]*[A-Za-z0-9_]+"
+        registrations "${case_source}")
+      foreach(registration IN LISTS registrations)
+        string(REGEX REPLACE ".*\\([ \r\n]*" "" case "${registration}")
+        list(APPEND selected_cases ${case})
+      endforeach()
+    endif()
+    set(cases)
+    set(durability_cases)
+    set(recovery_cases)
+    foreach(case IN LISTS selected_cases)
+      if(case MATCHES "crashes|power_loss|unsynced|recovered_|failed_payload_sync")
+        list(APPEND durability_cases ${case})
+      elseif(case MATCHES "private_segment|private_journal|prepared_segment|installed_segment|reference_failure|head_publication|repeated_failures|partial_output|opposite_request|inventory_resume|interrupted_index|readonly_sealed")
+        list(APPEND recovery_cases ${case})
+      else()
+        list(APPEND cases ${case})
+      endif()
+    endforeach()
+    if(NOT cases OR NOT durability_cases OR NOT recovery_cases)
+      message(FATAL_ERROR "Empty compression test partition")
+    endif()
+    list(APPEND test_names ${target_name}_durability ${target_name}_recovery)
+    add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
+    add_test(NAME ${target_name}_durability COMMAND ${target_name} ${durability_cases})
+    add_test(NAME ${target_name}_recovery COMMAND ${target_name} ${recovery_cases})
   else()
     add_test(NAME ${target_name} COMMAND ${target_name} ${cases})
   endif()
-  # Every portable unit executable runs on each Linux target. The three large
+  # Every portable unit executable runs on each Linux target. The large
   # storage tables use named portability cases in optimized configurations.
   set_tests_properties(${test_names} PROPERTIES
     LABELS "unit;cross-runtime"
     TIMEOUT 60)
+  if(target_name MATCHES "^lc_unit_(collections|collection_staged)$")
+    # Collection suites fork workers and issue real durability barriers. Two
+    # slots bound simultaneous heavy groups within the normal four-job lane.
+    set_tests_properties(${test_names} PROPERTIES PROCESSORS 2)
+  endif()
   if(cases AND CMAKE_BUILD_TYPE STREQUAL "Release")
     set_property(TEST ${test_names} APPEND PROPERTY LABELS portability)
   endif()
@@ -305,7 +374,8 @@ target_link_options(lc_unit_pouch_cleanup PRIVATE
   "LINKER:--wrap=unlink" "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_pouch_compression test_lc_pouch_compression.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-target_compile_definitions(lc_unit_pouch_compression PRIVATE LOCKDC_TEST_BUILD=1)
+target_compile_definitions(lc_unit_pouch_compression PRIVATE LOCKDC_TEST_BUILD=1
+  LC_COLLECTION_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
 target_link_options(lc_unit_pouch_compression PRIVATE "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_state_retention test_lc_state_retention.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
@@ -418,7 +488,7 @@ endif()
 set_property(GLOBAL APPEND PROPERTY LOCKDC_CROSS_RUNTIME_TEST_TARGETS lc_unit_transport_https)
 
 # Validate unit registration before the parent assembles the runtime build
-# closure shared with integration tests. Collection partitions share one target.
+# closure shared with integration tests. Partitioned suites share one target.
 get_property(lc_cross_runtime_test_targets GLOBAL PROPERTY
   LOCKDC_CROSS_RUNTIME_TEST_TARGETS)
 get_property(lc_registered_unit_tests DIRECTORY PROPERTY TESTS)
@@ -428,6 +498,10 @@ foreach(lc_registered_test IN LISTS lc_registered_unit_tests)
     set(lc_registered_target ${lc_registered_test})
     if(lc_registered_test MATCHES "^lc_unit_collections_(append|recovery)$")
       set(lc_registered_target lc_unit_collections)
+    elseif(lc_registered_test MATCHES "^lc_unit_collection_staged_(streaming|conversion)$")
+      set(lc_registered_target lc_unit_collection_staged)
+    elseif(lc_registered_test MATCHES "^lc_unit_pouch_compression_(durability|recovery)$")
+      set(lc_registered_target lc_unit_pouch_compression)
     endif()
     if(NOT TARGET ${lc_registered_target})
       message(FATAL_ERROR

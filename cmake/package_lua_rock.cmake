@@ -91,6 +91,9 @@ file(COPY "${LOCKDC_ROOT}/lockdc-postgres.rockspec.in" DESTINATION "${lockdc_lua
 # Ship the facade's durable API guides and runnable examples, using an explicit
 # guide list so investigations and temporary release notes cannot enter a rock.
 set(lockdc_lua_documentation_sources
+    docs/c-api.md
+    docs/development.md
+    docs/releases.md
     docs/lua.md
     docs/pouch-terminal-retention.md
     docs/pouch-dead-letter-retention.md
@@ -104,9 +107,16 @@ set(lockdc_lua_documentation_sources
     docs/pouch-storage.md
     docs/collections.md
     docs/collection-writer.md
+    docs/collection-leases.md
+    docs/collection-edits.md
+    docs/collection-read-comparison.md
+    docs/logging.md
     docs/state-retention.md
     docs/worst-case-scenario.md
     examples/lua/README.md
+    examples/client_and_lease_methods.c
+    examples/acquire_for_update.c
+    examples/state_stream_roundtrip.c
     examples/outbox_producer.c
     examples/collection_journal.c)
 file(GLOB lockdc_lua_example_sources RELATIVE "${LOCKDC_ROOT}"

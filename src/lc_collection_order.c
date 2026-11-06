@@ -9,7 +9,7 @@
 #include <zlib.h>
 
 #define LC_CO_ROOT_BYTES LC_COLLECTION_ORDER_ROOT_BYTES
-#define LC_CO_ROW_BYTES 64U
+#define LC_CO_ROW_BYTES LC_COLLECTION_ORDER_ROW_BYTES
 #define LC_CO_PAGE_BYTES 4096U
 #define LC_CO_PAGE_HEADER_BYTES 64U
 #define LC_CO_ROOT_MAGIC 0x4c434f49UL
@@ -139,6 +139,7 @@ static int lc_co_root_write(lc_collection_order *order, lc_error *error) {
   lc_co_put64(bytes + 128U, (lc_u64)order->collection_retention);
   lc_co_put64(bytes + 136U, order->edit_count);
   lc_co_put64(bytes + 144U, order->edit_in_progress ? 1U : 0U);
+  bytes[152] = LC_CO_ROW_BYTES;
   lc_co_seal(bytes, sizeof(bytes));
   return lc_co_io(order->fd, 0U, bytes, sizeof(bytes), 1, error);
 }
@@ -157,12 +158,12 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
     return rc;
   }
   if (!lc_co_valid(bytes, sizeof(bytes)) ||
-      lc_co_get64(bytes) != LC_CO_ROOT_MAGIC) {
+      lc_co_get64(bytes) != LC_CO_ROOT_MAGIC || bytes[152] != LC_CO_ROW_BYTES) {
     return lc_co_error(error, LC_ERR_PROTOCOL,
                        "collection index header is invalid");
   }
   for (i = 92U; i < sizeof(bytes) - 4U; ++i)
-    if ((i < 96U || i >= 152U) && bytes[i] != 0U)
+    if ((i < 96U || i >= 153U) && bytes[i] != 0U)
       return lc_co_error(error, LC_ERR_PROTOCOL,
                          "collection index header has unknown fields");
   order->edit_count = lc_co_get64(bytes + 136U);
@@ -284,10 +285,12 @@ int lc_collection_order_checkpoint(lc_collection_order *order,
 }
 
 static int lc_co_row_decode(lc_collection_order *order,
-                            const unsigned char bytes[64],
+                            const unsigned char bytes[LC_CO_ROW_BYTES],
                             lc_collection_order_row *row, lc_error *error) {
-  if (!lc_co_valid(bytes, LC_CO_ROW_BYTES) || bytes[56] != 0U ||
-      bytes[57] != 0U || bytes[58] != 0U || bytes[59] != 0U) {
+  static const unsigned char empty[32] = {0};
+  lc_u64 packed, delta;
+  if (!lc_co_valid(bytes, LC_CO_ROW_BYTES) || bytes[96] != 0U ||
+      bytes[97] != 0U || bytes[98] != 0U || bytes[99] != 0U) {
     return lc_co_error(error, LC_ERR_PROTOCOL,
                        "collection ordered row checksum is invalid");
   }
@@ -298,11 +301,28 @@ static int lc_co_row_decode(lc_collection_order *order,
   row->record_offset = lc_co_get64(bytes + 32U);
   row->bytes = lc_co_get64(bytes + 40U);
   row->stored_bytes = lc_co_get64(bytes + 48U);
+  packed = lc_co_get64(bytes + 56U);
+  memcpy(row->proof, bytes + 64U, sizeof(row->proof));
+  row->unit_segment = row->unit_offset = 0;
+  if (packed) {
+    if (!(packed >> 32U))
+      return lc_co_error(error, LC_ERR_PROTOCOL,
+                         "collection unit locator is invalid");
+    delta = (packed >> 32U) - 1U;
+    if (delta >= (row->segment & (lc_u64)LC_I64_MAX))
+      return lc_co_error(error, LC_ERR_PROTOCOL,
+                         "collection unit locator precedes history");
+    row->unit_segment = row->segment - delta;
+    row->unit_offset = packed & (lc_u64)0xffffffffUL;
+  } else if (memcmp(row->proof, empty, sizeof(empty)))
+    return lc_co_error(error, LC_ERR_PROTOCOL,
+                       "collection unit evidence has no location");
   if (row->position == 0U || row->position > order->upper_position ||
       row->published_at == 0U || row->published_at > order->generation ||
       (row->deleted_at != 0U && (row->deleted_at <= row->published_at ||
                                  row->deleted_at > order->generation)) ||
-      row->segment == 0U) {
+      row->segment == 0U || row->unit_segment > row->segment ||
+      (!row->unit_segment && row->unit_offset)) {
     return lc_co_error(error, LC_ERR_PROTOCOL,
                        "collection ordered row bounds are inconsistent");
   }
@@ -311,7 +331,7 @@ static int lc_co_row_decode(lc_collection_order *order,
 
 static int lc_co_row_read(lc_collection_order *order, lc_u64 ordinal,
                           lc_collection_order_row *row, lc_error *error) {
-  unsigned char bytes[64];
+  unsigned char bytes[LC_CO_ROW_BYTES];
   lc_u64 offset;
   int rc;
   if (ordinal >= order->count) {
@@ -328,9 +348,19 @@ static int lc_co_row_read(lc_collection_order *order, lc_u64 ordinal,
 static int lc_co_row_write(lc_collection_order *order, lc_u64 ordinal,
                            const lc_collection_order_row *row,
                            lc_error *error) {
-  unsigned char bytes[64];
-  lc_u64 offset;
+  unsigned char bytes[LC_CO_ROW_BYTES];
+  lc_u64 offset, packed = 0;
   int rc;
+  if (row->unit_segment) {
+    if (row->unit_segment > row->segment ||
+        ((row->unit_segment ^ row->segment) & ~(lc_u64)LC_I64_MAX) ||
+        row->unit_offset > (lc_u64)0xffffffffUL ||
+        row->segment - row->unit_segment >= (lc_u64)0xffffffffUL)
+      return lc_co_error(error, LC_ERR_PROTOCOL,
+                         "collection unit locator exceeds its hint bounds");
+    packed =
+        ((row->segment - row->unit_segment + 1U) << 32U) | row->unit_offset;
+  }
   memset(bytes, 0, sizeof(bytes));
   lc_co_put64(bytes, row->position);
   lc_co_put64(bytes + 8U, row->published_at);
@@ -339,6 +369,8 @@ static int lc_co_row_write(lc_collection_order *order, lc_u64 ordinal,
   lc_co_put64(bytes + 32U, row->record_offset);
   lc_co_put64(bytes + 40U, row->bytes);
   lc_co_put64(bytes + 48U, row->stored_bytes);
+  lc_co_put64(bytes + 56U, packed);
+  memcpy(bytes + 64U, row->proof, sizeof(row->proof));
   lc_co_seal(bytes, sizeof(bytes));
   rc = lc_co_row_offset(ordinal, &offset, error);
   if (rc == LC_OK) {

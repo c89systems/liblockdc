@@ -141,22 +141,12 @@ int lc_pouch_query_index_visit_scalar_terms(
     const lc_pouch_query_index_scalar_term *terms, size_t term_count,
     lc_pouch_query_index_key_visit_fn visit, void *context,
     lc_pouch_generation *index_seq, lc_error *error);
-int lc_pouch_query_index_visit_scalar_terms_merged(
-    lc_pouch *pouch, const char *ns,
-    const lc_pouch_query_index_scalar_term *terms, size_t term_count,
-    lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error);
 int lc_pouch_query_index_visit_scalar_terms_docids(
     lc_pouch *pouch, const char *ns,
     const lc_pouch_query_index_scalar_term *terms, size_t term_count,
     lc_pouch_query_index_key_visit_fn visit, void *context,
     lc_pouch_generation *index_seq, lc_error *error);
 int lc_pouch_query_index_visit_scalar_any_docids(
-    lc_pouch *pouch, const char *ns, const char *field,
-    const char *const *values, const char *value_types, size_t value_count,
-    lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error);
-int lc_pouch_query_index_visit_scalar_any_merged(
     lc_pouch *pouch, const char *ns, const char *field,
     const char *const *values, const char *value_types, size_t value_count,
     lc_pouch_query_index_key_visit_fn visit, void *context,
@@ -170,14 +160,6 @@ int lc_pouch_query_index_visit_prefix_candidates(
     lc_pouch *pouch, const char *ns, const char *field, const char *prefix,
     int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
     lc_pouch_generation *index_seq, lc_error *error);
-int lc_pouch_query_index_visit_contains(
-    lc_pouch *pouch, const char *ns, const char *field, const char *needle,
-    int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, lc_error *error);
-int lc_pouch_query_index_visit_contains_complete(
-    lc_pouch *pouch, const char *ns, const char *field, const char *needle,
-    int ignore_case, lc_pouch_query_index_key_visit_fn visit, void *context,
-    lc_pouch_generation *index_seq, int *complete, lc_error *error);
 /* Uses a caller-held exclusive-Pouch query snapshot. The snapshot must come
  * from lc_pouch_state_query_index_seq() and have been made current before this
  * call. Shared-writer Pouch retains its ordinary durable-read behavior. */

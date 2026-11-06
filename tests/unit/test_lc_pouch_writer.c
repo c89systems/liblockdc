@@ -25,6 +25,12 @@ typedef struct allocation {
   size_t size;
 } allocation;
 
+typedef struct unit_record {
+  uint64_t offset, bytes, stored;
+  unsigned long crc;
+  char descriptor[256], context[64];
+} unit_record;
+
 typedef struct fixture {
   allocation slots[32];
   size_t calls, fail_at, live, peak, large, peak_large, wiped;
@@ -32,6 +38,7 @@ typedef struct fixture {
   lc_allocator allocator;
   lc_pouch_crypto *crypto;
   lc_pouch_crypto_writer *writer;
+  unit_record *units;
   lc_error error;
   lc_sink sink;
   char root[256], *key, *descriptor, *reference_descriptor;
@@ -198,6 +205,7 @@ static int teardown(void **state) {
   lc_pouch_crypto_key_string_free(f->key);
   lc_error_cleanup(&f->error);
   free(f->body);
+  free(f->units);
   lc_test_tmp_cleanup_path(f->root, PREFIX);
   free(f);
   return 0;
@@ -302,8 +310,7 @@ static void test_roundtrip_boundaries_and_owned_heap_budget(void **state) {
   }
 }
 
-static void
-test_final_frames_coalesce_without_delaying_full_frames(void **state) {
+static void test_final_frames_coalesce_with_one_frame_bound(void **state) {
   fixture *f = *state;
   const size_t lengths[] = {0,
                             1,
@@ -314,7 +321,7 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
                             4096 + FRAME - 1,
                             4096 + FRAME,
                             4096 + FRAME + 1};
-  const size_t calls[] = {1, 1, 1, 1, 2, 2, 2, 3, 3};
+  const size_t calls[] = {1, 1, 1, 1, 1, 2, 2, 2, 3};
   lc_sink *sink;
   for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
     reset_output(f);
@@ -331,8 +338,10 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
                    LC_OK);
   sink = lc_pouch_crypto_writer_sink(f->writer);
   assert_true(sink->write(sink, f->body, 4096, &f->error));
-  assert_int_equal(f->sink_calls,
-                   1); /* Producer-to-consumer flow before EOF. */
+  assert_int_equal(f->sink_calls, 0);
+  /* One additional byte must deliver the full frame before EOF. */
+  assert_true(sink->write(sink, f->body + 4096, 1, &f->error));
+  assert_int_equal(f->sink_calls, 1);
   assert_int_equal(lc_pouch_crypto_writer_finish(f->writer, &f->plain,
                                                  &f->stored, &f->crc,
                                                  &f->descriptor, &f->error),
@@ -349,10 +358,10 @@ test_final_frames_coalesce_without_delaying_full_frames(void **state) {
     }
     reset_output(f);
     lc_pouch_crypto_set_compression(f->crypto, 0);
-    f->reject_call = 2; /* A standalone terminal after a full first frame. */
+    f->reject_call = 2; /* Final delivery after a full first frame. */
     f->partial = 7;
     f->sink_error = explicit_error;
-    assert_int_equal(write_body(f, 4096, 17, 1), LC_ERR_TRANSPORT);
+    assert_int_equal(write_body(f, 4097, 17, 1), LC_ERR_TRANSPORT);
     assert_null(f->descriptor);
   }
 }
@@ -529,6 +538,214 @@ static void test_source_and_fd_failures_release_scratch(void **state) {
   }
 }
 
+static int verify_unit(fixture *f, const unit_record *unit,
+                       const char *binding) {
+  lc_source *source = NULL;
+  size_t got = 0, offset = 0;
+  int fd = dup(f->fd), rc;
+  if (fd < 0)
+    return LC_ERR_TRANSPORT;
+  rc = lc_pouch_crypto_source_from_fd_span(
+      f->crypto, unit->context, binding, fd, unit->offset, unit->stored,
+      unit->descriptor, &source, &f->error);
+  if (rc != LC_OK)
+    return rc;
+  do {
+    got = source->read(source, f->chunk, sizeof(f->chunk), &f->error);
+    rc = f->error.code;
+    if (rc == LC_OK && (got > unit->bytes - offset ||
+                        memcmp(f->chunk, f->body + offset, got) != 0))
+      rc = LC_ERR_PROTOCOL;
+    offset += got;
+  } while (rc == LC_OK && got);
+  lc_source_close(source);
+  return rc != LC_OK ? rc : offset == unit->bytes ? LC_OK : LC_ERR_PROTOCOL;
+}
+
+static void clear_error(fixture *f) {
+  lc_error_cleanup(&f->error);
+  lc_error_init(&f->error);
+}
+
+static void
+test_restartable_units_are_independent_without_allocations(void **state) {
+  fixture *f = *state;
+  lc_pouch_crypto_open_options opts;
+  lc_sink *sink;
+  const char *borrowed = NULL;
+  size_t calls, unit, at, take, base;
+  unsigned char raw[4093];
+  char saved_descriptor[256];
+  unsigned long crc;
+  ssize_t got;
+  int mode;
+  f->units = calloc(12U, sizeof(*f->units));
+  assert_non_null(f->units);
+  for (mode = 0; mode < 4; ++mode) {
+    reset_output(f);
+    lc_pouch_crypto_close(f->crypto);
+    f->crypto = NULL;
+    memset(&opts, 0, sizeof(opts));
+    opts.key_string = mode < 2 ? f->key : NULL;
+    opts.compression_enabled = mode == 1 || mode == 2;
+    assert_int_equal(
+        lc_pouch_crypto_open(&f->allocator, &opts, &f->crypto, NULL, &f->error),
+        LC_OK);
+    snprintf(f->units[0].context, sizeof(f->units[0].context), "unit:0");
+    base = f->live;
+    assert_int_equal(
+        lc_pouch_crypto_writer_open_sink(f->crypto, f->units[0].context,
+                                         &f->sink, &f->writer, &f->error),
+        LC_OK);
+    calls = f->calls;
+    f->check_wipe = 1;
+    f->fail_at = calls + 1U;
+    sink = lc_pouch_crypto_writer_sink(f->writer);
+    assert_int_equal(
+        lc_pouch_crypto_writer_restart(f->writer, "premature", &f->error),
+        LC_ERR_INVALID);
+    clear_error(f);
+    for (unit = 0; unit < 12U; ++unit) {
+      unit_record *record = &f->units[unit];
+      /* Include empty/short/frame boundaries, and enough repeated units to
+       * stream more than 1 MiB through one admitted 64 KiB scratch frame. */
+      record->bytes = unit == 0 ? 0 : unit == 1 ? 1 : unit == 2 ? FRAME : BODY;
+      snprintf(record->context, sizeof(record->context), "unit:%lu",
+               (unsigned long)(unit / 2U));
+      if (unit) {
+        /* Invalid restart does not consume the previous completed unit. */
+        if (mode < 2) {
+          assert_int_equal(
+              lc_pouch_crypto_writer_restart(f->writer, "", &f->error),
+              LC_ERR_INVALID);
+          clear_error(f);
+        }
+        assert_int_equal(lc_pouch_crypto_writer_restart(
+                             f->writer, record->context, &f->error),
+                         LC_OK);
+      }
+      record->offset = (uint64_t)lseek(f->fd, 0, SEEK_CUR);
+      for (at = 0; at < record->bytes; at += take) {
+        take = (size_t)(record->bytes - at);
+        if (take > 4093U)
+          take = 4093U;
+        assert_true(sink->write(sink, f->body + at, take, &f->error));
+      }
+      assert_int_equal(lc_pouch_crypto_writer_finish_borrowed(
+                           f->writer, &f->plain, &record->stored, &record->crc,
+                           &borrowed, &f->error),
+                       LC_OK);
+      assert_int_equal(f->plain, record->bytes);
+      snprintf(record->descriptor, sizeof(record->descriptor), "%s",
+               borrowed ? borrowed : "");
+      if (mode < 2 && unit)
+        assert_string_not_equal(record->descriptor,
+                                f->units[unit - 1U].descriptor);
+      assert_int_equal(f->calls, calls);
+      assert_true(f->live - base < 72U * 1024U);
+      assert_false(sink->write(sink, f->body, 1, &f->error));
+      clear_error(f);
+    }
+    f->fail_at = 0;
+    lc_pouch_crypto_writer_close(f->writer);
+    f->writer = NULL;
+    assert_int_equal(f->live, base);
+    assert_false(f->dirty_free);
+    f->check_wipe = 0;
+    for (unit = 0; unit < 12U; ++unit) {
+      unit_record *record = &f->units[unit];
+      assert_int_equal(verify_unit(f, record, record->context), LC_OK);
+      crc = (unsigned long)crc32(0L, Z_NULL, 0);
+      for (at = 0; at < record->stored; at += (size_t)got) {
+        take = (size_t)(record->stored - at);
+        if (take > sizeof(raw))
+          take = sizeof(raw);
+        got = pread(f->fd, raw, take, (off_t)(record->offset + at));
+        assert_true(got > 0);
+        crc = (unsigned long)crc32((uLong)crc, raw, (uInt)got);
+      }
+      assert_int_equal(crc, record->crc);
+    }
+    if (mode < 2) {
+      /* Units 4/5 have identical plaintext and identity context. A descriptor
+       * from the earlier unit must not authenticate the next unit's bytes. */
+      strcpy(saved_descriptor, f->units[5].descriptor);
+      strcpy(f->units[5].descriptor, f->units[4].descriptor);
+      assert_int_equal(verify_unit(f, &f->units[5], f->units[5].context),
+                       LC_ERR_PROTOCOL);
+      clear_error(f);
+      strcpy(f->units[5].descriptor, saved_descriptor);
+      assert_int_equal(verify_unit(f, &f->units[3], "another-unit"),
+                       LC_ERR_PROTOCOL);
+      clear_error(f);
+      assert_int_equal(ftruncate(f->fd, (off_t)(f->units[11].offset +
+                                                f->units[11].stored - 1U)),
+                       0);
+      assert_int_equal(verify_unit(f, &f->units[11], f->units[11].context),
+                       LC_ERR_PROTOCOL);
+      clear_error(f);
+    }
+  }
+}
+
+static void test_failed_or_transferred_units_cannot_restart(void **state) {
+  fixture *f = *state;
+  const char *borrowed = NULL;
+  lc_sink *sink;
+  unsigned char material = 1;
+  size_t calls, emitted;
+  assert_int_equal(write_body(f, 7, 7, 1), LC_OK);
+  assert_int_equal(lc_pouch_crypto_writer_restart(f->writer, "next", &f->error),
+                   LC_ERR_INVALID);
+  reset_output(f);
+  assert_int_equal(lc_pouch_crypto_writer_open_sink(
+                       f->crypto, CONTEXT, &f->sink, &f->writer, &f->error),
+                   LC_OK);
+  sink = lc_pouch_crypto_writer_sink(f->writer);
+  assert_true(sink->write(sink, f->body, 7, &f->error));
+  assert_int_equal(lc_pouch_crypto_writer_finish_borrowed(f->writer, &f->plain,
+                                                          &f->stored, &f->crc,
+                                                          &borrowed, &f->error),
+                   LC_OK);
+  calls = f->calls;
+  emitted = f->sink_calls;
+  lc_pouch_crypto_test_set_random_material(&material, 1);
+  assert_int_equal(lc_pouch_crypto_writer_restart(f->writer, "next", &f->error),
+                   LC_ERR_TRANSPORT);
+  lc_pouch_crypto_test_set_random_material(NULL, 0);
+  assert_int_equal(f->calls, calls);
+  clear_error(f);
+  assert_false(sink->write(sink, f->body, 7, &f->error));
+  clear_error(f);
+  assert_int_equal(lc_pouch_crypto_writer_restart(f->writer, "next", &f->error),
+                   LC_ERR_INVALID);
+  clear_error(f);
+  assert_int_equal(lc_pouch_crypto_writer_finish_borrowed(f->writer, &f->plain,
+                                                          &f->stored, &f->crc,
+                                                          &borrowed, &f->error),
+                   LC_ERR_INVALID);
+  assert_int_equal(f->sink_calls, emitted);
+  reset_output(f);
+  assert_int_equal(lc_pouch_crypto_writer_open_sink(
+                       f->crypto, CONTEXT, &f->sink, &f->writer, &f->error),
+                   LC_OK);
+  f->reject_call = 1;
+  f->sink_error = 1;
+  f->partial = 7;
+  sink = lc_pouch_crypto_writer_sink(f->writer);
+  assert_false(sink->write(sink, f->body, 4097, &f->error));
+  clear_error(f);
+  assert_int_equal(lc_pouch_crypto_writer_finish_borrowed(f->writer, &f->plain,
+                                                          &f->stored, &f->crc,
+                                                          &borrowed, &f->error),
+                   LC_ERR_TRANSPORT);
+  assert_null(borrowed);
+  clear_error(f);
+  assert_int_equal(lc_pouch_crypto_writer_restart(f->writer, "next", &f->error),
+                   LC_ERR_INVALID);
+  assert_int_equal(f->sink_calls, 1);
+}
+
 static void *worker(void *context) {
   fixture *f = context;
   f->rc = write_body(f, BODY, 4093, 1);
@@ -555,8 +772,7 @@ static void test_writer_uses_default_worker_stack(void **state) {
 int main(void) {
   const struct CMUnitTest tests[] = {
       cmocka_unit_test_setup_teardown(
-          test_final_frames_coalesce_without_delaying_full_frames, setup,
-          teardown),
+          test_final_frames_coalesce_with_one_frame_bound, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_roundtrip_boundaries_and_owned_heap_budget, setup, teardown),
       cmocka_unit_test_setup_teardown(
@@ -567,6 +783,11 @@ int main(void) {
           test_open_failures_wipe_and_release_scratch, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_source_and_fd_failures_release_scratch, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_restartable_units_are_independent_without_allocations, setup,
+          teardown),
+      cmocka_unit_test_setup_teardown(
+          test_failed_or_transferred_units_cannot_restart, setup, teardown),
       cmocka_unit_test_setup_teardown(test_writer_uses_default_worker_stack,
                                       setup, teardown),
   };

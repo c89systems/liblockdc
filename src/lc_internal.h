@@ -166,8 +166,6 @@ lonejson_read_result lc_engine_json_memory_reader(void *user,
                                                   size_t capacity);
 int lc_engine_buffer_append_limited(lc_engine_buffer *buffer, const char *bytes,
                                     size_t count, size_t limit);
-int lc_engine_buffer_append_cstr_limited(lc_engine_buffer *buffer,
-                                         const char *value, size_t limit);
 
 void lc_engine_http_result_cleanup(lc_engine_http_result *result);
 int lc_engine_http_json_request(

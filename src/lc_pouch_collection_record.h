@@ -3,10 +3,15 @@
 
 #include "lc_pouch.h"
 
-/* Collection-only canonical kinds. Bodies become visible only through the
- * immediately following edit receipt. Both use the ordinary payload codec. */
+/* Collection-only canonical kinds: edit bodies use their following receipt;
+ * pushed extents/index pages use a final stream publication. Payload bytes use
+ * the ordinary codec and remain separate from index/publication metadata. */
 #define LC_POUCH_COLLECTION_EDIT_BODY 112U
 #define LC_POUCH_COLLECTION_EDIT 113U
+#define LC_POUCH_COLLECTION_CHUNK 114U
+#define LC_POUCH_COLLECTION_STREAM 115U
+#define LC_POUCH_COLLECTION_NODE 116U
+#define LC_POUCH_COLLECTION_REGION 117U
 
 /* Bounded view of Pouch's canonical state record. A collection uses append ID
  * as the record key, permanent position as its logical version, and mutation
@@ -23,12 +28,22 @@ typedef struct lc_pouch_collection_record {
   uint64_t payload_record_offset;
   uint64_t previous_segment;
   uint64_t previous_offset;
+  /* The span identifies the publication for metadata-reference validation.
+   * Indexed bodies themselves live at this immutable canonical index root. */
+  uint64_t stream_segment;
+  uint64_t stream_offset;
+  uint64_t stream_extents;
+  uint64_t stream_root_bytes;
+  unsigned int stream_height;
   size_t metadata_length;
   lc_pouch_unix_seconds updated_at_unix;
   lc_pouch_unix_seconds retention;
   lc_pouch_unix_seconds collection_retention;
   int has_collection_retention;
   unsigned long stored_crc;
+  /* Logical publication identity, independent of transforms/offsets/retention.
+   */
+  unsigned char manifest[32];
   char append_id[129];
   char etag[65];
   char descriptor[257];
@@ -68,17 +83,30 @@ int lc_pouch_collection_writer_publish(lc_pouch_collection_writer *writer,
                                        lc_pouch_collection_record *out,
                                        lc_error *error);
 void lc_pouch_collection_writer_close(lc_pouch_collection_writer *writer);
-/* Stages only encoded payload bytes in a borrowed sink. NULL hashes retries.
- * Copy borrows a finished staging source and canonical fd under append
- * authority; close rolls its unpublished range back before authority leaves. */
-int lc_pouch_collection_writer_open_staged(
+/* Attach the final bounded codec chunk to a normal pending contiguous record.
+ * The caller retains append authority through publication or rollback. */
+int lc_pouch_collection_writer_attach(lc_pouch_collection_writer *, int,
+                                      const char *, lc_error *);
+int lc_pouch_collection_writer_publish_stream(
+    lc_pouch_collection_writer *writer, int fd, const char *leaf,
+    uint64_t segment, uint64_t offset, uint64_t extents, uint64_t root_bytes,
+    unsigned int height, uint64_t position, uint64_t generation,
+    lc_pouch_collection_record *out, lc_error *error);
+/* Emits compact plaintext into a borrowed sink. NULL hashes retries.
+ * Final publication and rollback of its small record require append authority.
+ */
+int lc_pouch_collection_writer_open_sink(
     lc_pouch *pouch, lc_sink *destination, const char *collection_id,
-    const char *append_id, lc_pouch_unix_seconds retention,
+    const char *append_id, const char *context, lc_pouch_unix_seconds retention,
     int has_collection_retention, lc_pouch_unix_seconds collection_retention,
     lc_pouch_collection_writer **out, lc_error *error);
-int lc_pouch_collection_writer_copy_staged(lc_pouch_collection_writer *writer,
-                                           int fd, const char *leaf,
-                                           lc_source *source, lc_error *error);
+
+/* Supplies the finished codec's bounded storage facts; never changes the
+ * JSON validator's byte count or fingerprint. May update a pending inline row.
+ */
+int lc_pouch_collection_writer_storage(lc_pouch_collection_writer *,
+                                       const lc_pouch_collection_record *,
+                                       lc_error *);
 
 /* Caller owns append authority and a repaired tail. Borrows fd and source.
  * Validation failure rolls back the unpublished byte range. After published is
@@ -115,12 +143,27 @@ int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
                                     const char *container_leaf,
                                     lc_pouch_collection_record *out,
                                     lc_error *error);
+/* Scatter bounded metadata and the caller-owned first body chunk together.
+ * Prefix bytes become usable only after all canonical metadata validates. */
+int lc_pouch_collection_record_read_prefix(int, uint64_t, uint64_t,
+                                           const char *,
+                                           lc_pouch_collection_record *, void *,
+                                           size_t, size_t *, lc_error *);
 /* Relocates a validated canonical record into a distinct append-only output
  * file. Payload ciphertext/compressed bytes and retry/deletion facts remain
  * unchanged; storage spans are rebased and metadata history is collapsed.
  * Borrows metadata, payload and output descriptors and a reusable bounded
- * buffer. out must not alias current. The caller syncs/publishes replacement.
+ * buffer. Indexed streams must already have their encoded units copied;
+ * relocated_stream supplies their rebuilt physical index. Their immutable
+ * descriptors, contexts and logical identity remain unchanged. out must not
+ * alias current. The caller syncs/publishes replacement.
  */
+int lc_pouch_collection_record_copy_source(
+    lc_pouch *pouch, int source_fd, int payload_fd,
+    const lc_pouch_collection_record *relocated_stream, const char *source_leaf,
+    const lc_pouch_collection_record *current, int destination_fd,
+    const char *destination_leaf, unsigned char *buffer, size_t capacity,
+    lc_pouch_collection_record *out, lc_error *error);
 int lc_pouch_collection_record_copy(
     lc_pouch *pouch, int source_fd, int payload_fd, const char *source_leaf,
     const lc_pouch_collection_record *current, int destination_fd,

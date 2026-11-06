@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include "../support/lc_test_tmp.h"
 #include "lc_collection_order.h"
@@ -302,19 +303,21 @@ static void test_corruption_is_explicit_and_open_is_bounded(void **state) {
   lc_collection_order_iter it;
   lc_collection_order_row row;
   int found;
+  lc_u64 after = LC_COLLECTION_ORDER_PAGE_ROWS * 10U;
   for (lc_u64 i = 1; i <= 1000; ++i)
     append(f, i);
   /* A distant row is validated on demand, not scanned during cold open. */
   corrupt_byte(f, LC_COLLECTION_ORDER_ROOT_BYTES + 4096 * 10 + 64);
   assert_int_equal(lc_collection_order_open(f->path, 0, &other, &f->error),
                    LC_OK);
-  assert_int_equal(lc_collection_order_seek(&other, 630, 631, other.generation,
-                                            0, &it, &f->error),
+  assert_int_equal(lc_collection_order_seek(&other, after, after + 1U,
+                                            other.generation, 0, &it,
+                                            &f->error),
                    LC_ERR_PROTOCOL);
   lc_error_cleanup(&f->error);
   lc_error_init(&f->error);
   assert_int_equal(
-      lc_collection_order_find(&other, 631, &row, &found, &f->error),
+      lc_collection_order_find(&other, after + 1U, &row, &found, &f->error),
       LC_ERR_PROTOCOL);
   lc_collection_order_close(&other);
   lc_error_cleanup(&f->error);
@@ -461,7 +464,12 @@ test_dense_seek_checks_rows_and_preserves_deleted_views(void **state) {
         assert_true(row.position == expected);
     }
   }
-  corrupt_byte(f, LC_COLLECTION_ORDER_ROOT_BYTES + 4096 + 64);
+  corrupt_byte(f, LC_COLLECTION_ORDER_ROOT_BYTES +
+                      (63U / LC_COLLECTION_ORDER_PAGE_ROWS) *
+                          LC_COLLECTION_ORDER_PAGE_BYTES +
+                      64U +
+                      (63U % LC_COLLECTION_ORDER_PAGE_ROWS) *
+                          LC_COLLECTION_ORDER_ROW_BYTES);
   assert_int_equal(lc_collection_order_seek(&f->order, 63, 128,
                                             f->order.generation, 0, it,
                                             &f->error),
@@ -561,8 +569,62 @@ static void test_range_counts_and_cuts_match_sparse_model(void **state) {
   free(old);
 }
 
+static void test_unit_locator_bounds_and_evidence(void **state) {
+  fixture *f = *state;
+  lc_collection_order_row row = {0}, decoded;
+  unsigned char encoded[LC_COLLECTION_ORDER_ROW_BYTES], saved[sizeof(encoded)];
+  const off_t offset = LC_COLLECTION_ORDER_ROOT_BYTES + 64U;
+  int found;
+  row.position = row.published_at = 1;
+  row.segment = (lc_u64)0xffffffffUL + 10U;
+  row.record_offset = 100;
+  row.bytes = row.stored_bytes = 2;
+  row.unit_segment = 11;
+  row.unit_offset = (lc_u64)0xffffffffUL;
+  memset(row.proof, 0xa5, sizeof(row.proof));
+  assert_int_equal(
+      lc_collection_order_append(&f->order, &row, row.segment, 200, &f->error),
+      LC_OK);
+  lc_collection_order_close(&f->order);
+  assert_int_equal(lc_collection_order_open(f->path, 0, &f->order, &f->error),
+                   LC_OK);
+  assert_int_equal(
+      lc_collection_order_find(&f->order, 1, &decoded, &found, &f->error),
+      LC_OK);
+  assert_true(found && decoded.unit_segment == row.unit_segment &&
+              decoded.unit_offset == row.unit_offset);
+  assert_memory_equal(decoded.proof, row.proof, sizeof(row.proof));
+  assert_int_equal(pread(f->order.fd, saved, sizeof(saved), offset),
+                   sizeof(saved));
+  for (int fault = 0; fault < 2; ++fault) {
+    memcpy(encoded, saved, sizeof(encoded));
+    memset(encoded + 56U, 0, 8U);
+    if (!fault)
+      encoded[56] = 1; /* Offset with no segment delta. */
+    unsigned long crc = crc32(0L, encoded, sizeof(encoded) - 4U);
+    for (size_t i = 0; i < 4; ++i)
+      encoded[sizeof(encoded) - 4U + i] = (unsigned char)(crc >> (8U * i));
+    assert_int_equal(pwrite(f->order.fd, encoded, sizeof(encoded), offset),
+                     sizeof(encoded));
+    assert_int_equal(
+        lc_collection_order_find(&f->order, 1, &decoded, &found, &f->error),
+        LC_ERR_PROTOCOL);
+    lc_error_cleanup(&f->error);
+    lc_error_init(&f->error);
+  }
+  assert_int_equal(pwrite(f->order.fd, saved, sizeof(saved), offset),
+                   sizeof(saved));
+  row.position = row.published_at = 2;
+  row.unit_offset = (lc_u64)0xffffffffUL + 1U;
+  assert_int_equal(
+      lc_collection_order_append(&f->order, &row, row.segment, 300, &f->error),
+      LC_ERR_PROTOCOL);
+}
+
 int main(void) {
   const struct CMUnitTest tests[] = {
+      cmocka_unit_test_setup_teardown(test_unit_locator_bounds_and_evidence,
+                                      setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_dense_seek_checks_rows_and_preserves_deleted_views, setup,
           teardown),

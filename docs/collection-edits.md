@@ -196,8 +196,8 @@ tracking. Final target coverage includes a default-stack musl worker.
 Disposable benchmarks compare ordinary appends before/after, append-only edits,
 suffix and disjoint cuts at increasing collection sizes, and head/tail reads.
 Report CPU, wall time, bytes written and retained-prefix independence; avoid
-noisy timing thresholds in CI. CAI's released 0.25.0 read report predates the
-current performance changes and is not a matched baseline for this work.
+noisy timing thresholds in CI. Compare matching dependency, codec, durability,
+input, writer and read settings when evaluating different builds.
 
 ## Disposable performance comparison
 

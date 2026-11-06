@@ -350,8 +350,6 @@ void *lc_realloc_with_allocator(const lc_allocator *allocator, void *ptr,
 void lc_free_with_allocator(const lc_allocator *allocator, void *ptr);
 char *lc_strdup_with_allocator(const lc_allocator *allocator,
                                const char *value);
-char *lc_dup_bytes_with_allocator(const lc_allocator *allocator,
-                                  const void *bytes, size_t length);
 void lc_secret_wipe(void *ptr, size_t length);
 void lc_secret_free_string_with_allocator(const lc_allocator *allocator,
                                           char *value);
@@ -816,8 +814,6 @@ int lc_message_write_payload_method(lc_message *self, lc_sink *dst,
 int lc_lonejson_error_from_status(lc_error *error, lonejson_status status,
                                   const lonejson_error *lj_error,
                                   const char *message);
-int lc_engine_file_write_callback(void *context, const void *bytes,
-                                  size_t count, lc_engine_error *error);
 size_t lc_lonejson_runtime_limit(size_t configured_limit);
 void lc_lonejson_config_init(lonejson_config *config, size_t limit);
 lonejson *lc_engine_lonejson_runtime(lc_engine_client *client);

@@ -8,7 +8,7 @@ this work does not implement or modify lockd.
 Existing storage/durability policy is documented in [Pouch storage](pouch-storage.md)
 and language ownership conventions in [the Lua SDK guide](lua.md).
 
-## Purpose and first scope
+## Purpose and scope
 
 A collection is an ordered owner of state objects with immutable JSON bodies
 within a namespace.
@@ -67,7 +67,13 @@ ordered iterator. An unfiltered read does not parse or reconstruct JSON for
 presentation. An exact indexed predicate can use that same payload path;
 residual LQL evaluation is the explicitly additional work described below.
 
-Reuse bounded per-read metadata/chunk buffers. Metadata delivery must not
+Reads reuse one heap chunk for encoded input/output transfer, initially 16 KiB
+and growing at most once to 64 KiB for larger entries, plus bounded metadata and
+codec scratch. This memory stays bounded independently of entry size.
+Uncompressed encrypted frames can decrypt directly into that private chunk;
+authentication finishes before delivery. Callback sizes may follow frame
+boundaries and must not be assumed to fill the chunk.
+Metadata delivery must not
 introduce per-entry clients, threads, network requests, whole-object buffers,
 or mandatory per-entry heap allocation on the native path. This is direct
 stored-byte delivery, not a claim of kernel zero-copy with crypto enabled.
@@ -150,13 +156,13 @@ creating another transaction outcome log.
 
 An append accepts exactly one JSON object through a direct/staged `lc_source`
 or an owned push-fed writer. [Incremental appends](collection-writer.md) describe
-the writer lifecycle, bounded encoded staging, and atomic parent renewal.
+the writer lifecycle, bounded canonical chunks, and atomic parent renewal.
 Arrays, scalars, empty input, trailing non-whitespace, malformed JSON, source failure, and limit
 violations fail before publication. Validation and compaction of structural
 whitespace are incremental. Preserve JSON values and member order; this is not
 semantic canonicalization or object-key sorting.
 
-The initial validator supports nesting through 128 levels, decoded object keys
+The validator supports nesting through 128 levels, decoded object keys
 through 64 KiB, and number tokens through 4096 bytes. String values and total
 document size are not constrained by a whole-value buffer; normal storage and
 checked byte-counter limits still apply. Input chunks are bounded, and parser
@@ -179,9 +185,9 @@ entry still derives its own keys and starts independent authentication.
 
 Use lonejson's public incremental parser/writer facilities. Its push-fed value
 stream is a sink interface. Push writers validate and encode incrementally into
-at most 64 KiB of staging memory, then an anonymous spool. Commit copies encoded bytes
-into shared rolling segments without reparsing or re-encoding. Read output
-remains a direct stream; it is never buffered or spooled as a whole.
+bounded canonical extents in shared rolling segments. Commit publishes metadata
+without rereading or copying the payload. No whole-entry staging is used.
+Readers follow the stored extents and stream raw JSON without reconstruction.
 
 Each request requires a caller-supplied `append_id`: 1 to 128 ASCII characters
 from letters, digits, `-`, `_`, `.`, and `~`. It is scoped to the collection ID.
@@ -223,9 +229,10 @@ receiver to read the preceding committed view during upload. Snapshot capture
 releases its exclusive pin before delivery callbacks. The commit barrier uses
 an advisory `.commit.lock` file with an independent descriptor per call; it
 stores no state or transaction outcomes and introduces no worker or body
-buffer. Push commit copies its encoded staging into the shared active segment
-and uses the same shared commit pin; no collection lock is held between push
-calls. NoSync appends bypass the synchronization wait.
+buffer. Push commit publishes its canonical extent index and uses the same
+shared commit pin; no publication lock is held between push calls. A separate
+`.streams.lock` pin defers compaction capture until active uploads finish.
+NoSync appends bypass the synchronization wait.
 
 Keep the canonical binding after individual deletion until collection drop.
 Status lookup reports `absent`, `committed`, or `deleted`, with the original
@@ -1019,6 +1026,13 @@ copy raw stored records outside mutation locks, then reconcile newer committed
 tail records before publishing. Preserve ciphertext/compressed payload bytes,
 timestamps, fingerprints, positions, and tombstone retry bindings.
 
+Streamed entries retain independently encoded units during compaction; only
+their physical index is rebuilt. Replacement snapshots roll into a group of
+segment-sized files under one head publication and read-generation pin.
+Recovery replays the complete named group before its append tail. Cleanup must
+retain every current part, including parts containing only payload units or
+index nodes, until the next snapshot publication makes the group obsolete.
+
 Automatic compaction selects reclaimable deleted payload according to the
 existing root threshold; a pure append journal does not need repeated copying
 of live history. Explicit forced maintenance can consolidate it. Track the
@@ -1106,9 +1120,9 @@ separately. No benchmark introduces a body cache or buffers streamed output.
 
 `LOCKDC_COLLECTION_BENCH_PUSH=1` selects the public append writer and feeds
 4096-byte fragments; the default uses pull append. Both publish into shared
-rolling segments and use the same durability batcher. Push additionally stages
-up to 64 KiB of encoded bytes in memory, then spills/copies larger encoded
-payloads. Both workloads verify the same raw results.
+rolling segments and use the same durability batcher. Push writes bounded
+canonical extents as input arrives and commits metadata without a payload copy.
+Both workloads verify the same raw results.
 
 `LOCKDC_COLLECTION_BENCH_WRITERS` selects 1..32 concurrent append callers
 (default 1), each using its own receiver and input buffer. Set
@@ -1173,12 +1187,10 @@ persistent retry outcomes. Ordinary appends remain independent operations.
 Count-retention layouts were introduced with ABI 7. Do not tie
 Pouch record or HTTP protocol version markers to the repository release tag.
 
-Document the final C declarations, Lua facade, ownership, errors, and server
-framing together. Add executable public-only examples and installed static,
-shared, and Lua consumer proof. Native/storage/C/Lua cases below apply to the
-first Pouch implementation. The
-multipart/HTTP cases additionally gate enabling the future remote capability;
-they do not require implementing or modifying lockd in the Pouch change.
+The native/storage/C/Lua verification contract includes public-only examples
+and installed static, shared and Lua consumers. The multipart/HTTP cases below
+are requirements for a future remote capability, not claims of current remote
+support or implemented server tests.
 
 - Empty, large, pretty-printed, chunk-split, invalid/trailing JSON and source
   failures; bounded memory with keys/strings/objects larger than the chunk size.
@@ -1237,8 +1249,3 @@ Report bytes, entries, examined candidates, file opens, memory, worker count,
 and elapsed time. Use structural assertions rather than host-sensitive latency
 thresholds in regression tests. "Best in class" requires measured evidence.
 Ordinary state operations must retain their existing performance envelope.
-
-The separate CAI adoption must demonstrate its real resume/export workload.
-v1 checkpoints allow incremental recovery reads; efficient last-turn console
-selection remains a later collection-read feature and must not be claimed by
-merely adding filtered full-history replay.

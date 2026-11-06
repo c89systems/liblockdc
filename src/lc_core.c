@@ -256,21 +256,6 @@ char *lc_strdup_with_allocator(const lc_allocator *allocator,
   return copy;
 }
 
-char *lc_dup_bytes_with_allocator(const lc_allocator *allocator,
-                                  const void *bytes, size_t length) {
-  char *copy;
-
-  copy = (char *)lc_alloc_with_allocator(allocator, length + 1U);
-  if (copy == NULL) {
-    return NULL;
-  }
-  if (length > 0U) {
-    memcpy(copy, bytes, length);
-  }
-  copy[length] = '\0';
-  return copy;
-}
-
 void *lc_client_alloc(lc_client_handle *client, size_t size) {
   return lc_alloc_with_allocator(client != NULL ? &client->allocator : NULL,
                                  size);

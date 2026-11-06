@@ -751,7 +751,8 @@ static int worker(lua_State *L) {
       lua_getfield(L, 2, "recovery_anchor");
       if (lua_type(L, -1) == LUA_TSTRING && lua_rawlen(L, -1) == 11 &&
           strcmp(lua_tostring(L, -1), "replacement") == 0)
-        req->recovery_anchor = UINT64_MAX;
+        /* musl's UINT64_MAX literal is not C89-compatible on 32-bit targets. */
+        req->recovery_anchor = (uint64_t)-1;
       else if (!lua_isnil(L, -1))
         rc = position(call, -1, &req->recovery_anchor);
       lua_pop(L, 1);
