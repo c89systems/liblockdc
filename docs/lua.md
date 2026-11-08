@@ -41,7 +41,7 @@ described below.
 The generated rockspec expects:
 
 - package `lockdc`
-- `lonejson == 0.46.0-1`
+- `lonejson == 0.47.0-1`
 - Lua `>= 5.5, < 5.6`
 
 The lifecycle executes and packages only Lua 5.5. Each release includes the
@@ -77,10 +77,15 @@ The LuaRocks path export supplies the installed `lonejson` module as well as
 interpreter: prefix-selected `lockdc` modules carry their SDK runtime path and
 the lifecycle checks them through the Bootlin runner.
 
-The C SDK is pinned to the matching `lonejson 0.46.0` native dependency for
+The C SDK is pinned to the matching `lonejson 0.47.0` native dependency for
 mapped state load/save and internal typed JSON parsing. The Lua rock declares
 the corresponding Lua-facing `lonejson` rock so Lua JSON behavior and the C
 SDK JSON boundary stay in the same release line.
+
+Lonejson 0.47.0 uses native ABI **27**, replacing ABI 26. When upgrading from
+liblockdc 0.28.x, rebuild the Lua native modules against the new SDK and install
+the matching lonejson rock; do not mix its previous receiver headers or native
+modules with ABI 27 libraries. Liblockdc's own core ABI remains **9**.
 
 ## Dependency ownership
 

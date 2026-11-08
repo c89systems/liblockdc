@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.29.0
+
+- Upgrade lonejson to 0.47.0 (ABI 27), including all seven target SDK checksums
+  and the matching Lua dependency. Rebuild lonejson consumers and Lua modules
+  against the new SDK; its public receiver layouts changed. Liblockdc's public
+  C layouts and core ABI 9 remain unchanged.
+
+### Upgrading from 0.28.x
+
+Lonejson's receiver layouts changed from ABI **26** to **27**. Rebuild
+applications that use those receivers and Lua native modules against this
+release's SDK and the pinned `lonejson == 0.47.0-1` rock. Keep headers, native
+libraries and Lua modules on the matching dependency release.
+
+Liblockdc's core ABI remains **9**, and the optional PostgreSQL provider ABI
+remains **0**. Its public C layouts and the lonejson map layouts used by
+mapped load/save are unchanged. This release introduces no Pouch storage
+changes; the v0.28.0 chunked-entry upgrade requirements below still apply.
+
 ## 0.28.0
 
 - Stream pushed and staged-pull collection entries directly into shared

@@ -164,12 +164,18 @@ acknowledge, negatively acknowledge, or close the local handle explicitly.
 ## ABI and storage compatibility
 
 Core ABI **9**, introduced in v0.26.0 from ABI **8** in v0.25.0, remains
-unchanged through v0.28.0. ABI 9 consumers remain compatible; the PostgreSQL
+unchanged through v0.29.0. ABI 9 consumers remain compatible; the PostgreSQL
 provider's own ABI remains **0**. When upgrading from ABI 8, rebuild C
 consumers, Lua native bindings and the optional PostgreSQL provider together.
 That ABI change covers atomic collection edits and recovery heads; see
 [the edit contract](collection-edits.md) and
 [upgrade instructions](../CHANGELOG.md#upgrading-from-025x).
+
+The dependency ABI is separate: v0.29.0 uses lonejson 0.47.0 with ABI **27**.
+Its public receiver layouts changed from ABI 26, so rebuild applications using
+those receivers and Lua native modules against the matching SDK. Liblockdc's
+mapped load/save boundary uses unchanged lonejson map layouts. See
+[the dependency upgrade notes](../CHANGELOG.md#upgrading-from-028x).
 
 Pouch upgrades released collection heads on open under exclusive root access,
 preserving positions, retry identities, retention and entry bodies. Close other

@@ -293,7 +293,7 @@ if(NOT lockdc_lua_expected_manifest STREQUAL lockdc_lua_actual_manifest)
         "expected:\n  ${lockdc_lua_expected_manifest_text}\n"
         "actual:\n  ${lockdc_lua_actual_manifest_text}")
 endif()
-string(FIND "${lockdc_lua_inner_rockspec_text}" "\"lonejson == 0.46.0-1\"" inner_lonejson_index)
+string(FIND "${lockdc_lua_inner_rockspec_text}" "\"lonejson == 0.47.0-1\"" inner_lonejson_index)
 if(inner_lonejson_index EQUAL -1)
     message(FATAL_ERROR
         "Lua source rock embedded rockspec is missing the pinned lonejson dependency\n"
@@ -306,7 +306,7 @@ foreach(required_snippet
     "version = \"${LOCKDC_VERSION}-1\""
     "url = \"git+https://github.com/c89systems/liblockdc.git\""
     "tag = \"v${LOCKDC_VERSION}\""
-    "\"lonejson == 0.46.0-1\""
+    "\"lonejson == 0.47.0-1\""
     "scripts/build_lua_rock.sh"
 )
     string(FIND "${lockdc_lua_rockspec_text}" "${required_snippet}" snippet_index)

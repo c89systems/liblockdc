@@ -22,7 +22,7 @@ unset LD_LIBRARY_PATH
 dry_run=${LOCKDC_DEPS_DRY_RUN:-0}
 download_timeout=${LOCKDC_DEPENDENCY_DOWNLOAD_TIMEOUT:-300}
 local_download_root=${LOCKDC_DOWNLOAD_ROOT:-$repo_root/.cache/downloads}
-lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-26}
+lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-27}
 liblql_abi_version=${LOCKDC_LIBLQL_ABI_VERSION:-0}
 
 # shellcheck source=assert_generated_path.sh
@@ -237,26 +237,26 @@ fi
 lonejson_asset_name="liblonejson-$lonejson_version-${preset#deps-}.tar.gz"
 lonejson_download_url="https://github.com/c89systems/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
 case "$lonejson_asset_name" in
-  liblonejson-0.46.0-x86_64-linux-gnu.tar.gz)
-    lonejson_asset_hash=068c56590669dc152010407ddee7221b40bed587404494810c7d818e11146d1b
+  liblonejson-0.47.0-x86_64-linux-gnu.tar.gz)
+    lonejson_asset_hash=a2dbc1db962f8dcdf8398435043a85031c4f195d7e3d4ec9ee27b985a2f7c353
     ;;
-  liblonejson-0.46.0-x86_64-linux-musl.tar.gz)
-    lonejson_asset_hash=fc1f49db3956f50f098580442e29845e87b28e565d538dab8212f2d7239d3457
+  liblonejson-0.47.0-x86_64-linux-musl.tar.gz)
+    lonejson_asset_hash=4f91b5d601f7264487ff6f3b103d15d8a954a94eb79cf515aea2dd16971b9784
     ;;
-  liblonejson-0.46.0-aarch64-linux-gnu.tar.gz)
-    lonejson_asset_hash=5dd4e877624627ddd337e02461daf0821cc6527f8b6c703b0dea3ce61f7a38d7
+  liblonejson-0.47.0-aarch64-linux-gnu.tar.gz)
+    lonejson_asset_hash=d6d6c98ec9e86a7f57bbf1f748976048bb8f99a069eb3ffed7e0f16e3223eae7
     ;;
-  liblonejson-0.46.0-aarch64-linux-musl.tar.gz)
-    lonejson_asset_hash=014611825f2c6f2ae38cb896ea633163ee9815678bfa9b2ec8328f5bf3f90353
+  liblonejson-0.47.0-aarch64-linux-musl.tar.gz)
+    lonejson_asset_hash=dc6ec6c4e694ede21f54a0b7fb8197df122f5b052441b9c4862dde10842d13ef
     ;;
-  liblonejson-0.46.0-armhf-linux-gnu.tar.gz)
-    lonejson_asset_hash=24739d2b08660f8530e37b124d2897c9e5d77b3e6709231307f3ee4e89365f85
+  liblonejson-0.47.0-armhf-linux-gnu.tar.gz)
+    lonejson_asset_hash=90bd654dda6461be943ebb9e198d43af489b2501502f02a421589968d78d7eaf
     ;;
-  liblonejson-0.46.0-armhf-linux-musl.tar.gz)
-    lonejson_asset_hash=2cc2df629bdcfb42bcf0c5c6760e29565777a57168222dc986f0a4aeb9339a29
+  liblonejson-0.47.0-armhf-linux-musl.tar.gz)
+    lonejson_asset_hash=fb4ac6dfaff38cdc229feb074e594b4eb1b5e30a5448906e0c91cf31d9d8924c
     ;;
-  liblonejson-0.46.0-arm64-apple-darwin.tar.gz)
-    lonejson_asset_hash=d3e12ce3904974fe2ea51bce639f12645102c11fca137a85214fbb7dea5ba34a
+  liblonejson-0.47.0-arm64-apple-darwin.tar.gz)
+    lonejson_asset_hash=35d4fa113896fbcc3f8d5095a3e859fecf6b14423460541b8326aa32d9dcaeb8
     ;;
   *)
     printf 'unsupported lonejson release asset: %s\n' "$lonejson_asset_name" >&2
