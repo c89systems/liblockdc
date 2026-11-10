@@ -45,8 +45,9 @@ The existing atomic append validates JSON and fences publication at commit.
 The adapter does not preserve public push admission-time fencing or write-time
 validation. The public `push` path preserves both and supports configured
 codecs; its canonical chunks contain ciphertext on encrypted roots. The runner
-defaults to plaintext, uncompressed roots. The adapter's CLI buffer limit controls only
-the adapter; public push uses bounded codec chunks with no whole-entry spool.
+defaults to plaintext, uncompressed roots. The adapter's CLI buffer limit
+controls only the adapter; public push uses bounded codec chunks with no
+whole-entry spool.
 
 ## Workloads and accounting
 
@@ -89,9 +90,9 @@ reclaimed only after reader protection and the deletion grace period permit it.
 The experiment sets that grace to zero
 only for its owned fixtures, with no outstanding readers.
 
-Automatic selection requires reclaimable deleted payload or abandoned chunks. A pure
-append journal therefore reports no automatic consolidation. Forced compaction
-can reduce the inode count, but rewrites the retained history; repeating whole
+Automatic selection requires reclaimable deleted payload or abandoned chunks.
+A pure append journal therefore reports no automatic consolidation. Forced
+compaction can reduce the inode count, but rewrites the retained history; repeating whole
 collection compaction is not evidence of sustainable incremental consolidation.
 The probe verifies the data again after forced compaction and reports its
 time, I/O, resulting file count and sequential read costs.
@@ -134,8 +135,8 @@ collection receiver under shared-root policy, NoSync and selected durable cases.
 This does not measure independent-process scheduling. Fast sources use 16 KiB
 reads. Controlled slow sources sleep 100 microseconds before each nonempty
 256-byte or 4096-byte read. This models waiting on input, not an actual disk or
-network transport. Scheduler overhead
-can lengthen each sleep; both paths use the identical source routine.
+network transport. Scheduler overhead can lengthen each sleep; both paths use
+the identical source routine.
 
 Alongside amortized append time, process CPU and kernel-accounted write bytes,
 the summary reports medians of each run's per-entry p50/p95/p99 latency.

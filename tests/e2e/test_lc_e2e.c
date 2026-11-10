@@ -59,7 +59,8 @@ static void e2e_lonejson_cleanup(const lonejson_map *map, void *value) {
 
   runtime = e2e_lonejson_runtime();
   assert_non_null(runtime);
-  runtime->cleanup(runtime, map, value);
+  assert_int_equal(runtime->cleanup(runtime, map, value, NULL),
+                   LONEJSON_STATUS_OK);
 }
 
 static void save_json_text_or_die(lc_lease *lease, const char *json_text,

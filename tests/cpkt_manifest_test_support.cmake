@@ -1,7 +1,7 @@
 function(lockdc_assert_cpkt_component manifest component expected_version)
     file(READ "${manifest}" content)
     string(JSON release GET "${content}" release_version)
-    if(NOT release STREQUAL "0.6.1")
+    if(NOT release STREQUAL "0.7.0")
         message(FATAL_ERROR "Unexpected cpkt release: ${release}")
     endif()
     string(JSON count LENGTH "${content}" components)

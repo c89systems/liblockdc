@@ -2100,7 +2100,7 @@ static int lc_outbox_reclaim_one_stateful_checkpoint(lc_outbox_handle *outbox,
 
 cleanup:
   if (runtime != NULL)
-    runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   lc_pouch_state_write_result_cleanup(&outbox->dispatcher_client->allocator,
                                       &delete_result);
@@ -3048,7 +3048,7 @@ static int lc_outbox_existing_outbox(lc_outbox_handle *outbox, lc_lease *lease,
                      "outbox immutable fields conflict with an existing record",
                      NULL, NULL, NULL);
   }
-  runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   if (rc == LC_OK) {
     receipt->outbox_key = lc_strdup_local(key);
@@ -3108,7 +3108,7 @@ static int lc_outbox_existing_inbox(lc_outbox_handle *outbox, lc_lease *lease,
                       "inbox immutable fields conflict with an existing record",
                       NULL, NULL, NULL);
   }
-  runtime->cleanup(runtime, &lc_outbox_inbox_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_inbox_record_map, &record, NULL);
   lc_get_res_cleanup(&load_result);
   if (rc == LC_OK)
     result->duplicate = 1;
@@ -3163,7 +3163,7 @@ static int lc_outbox_existing_command(lc_outbox_handle *outbox, lc_lease *lease,
   }
   if (rc == LC_OK)
     rc = lc_outbox_command_receipt_from_record(&record, receipt, error);
-  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
   lc_get_res_cleanup(&load_result);
   if (rc == LC_OK && request != NULL)
     receipt->duplicate = 1;
@@ -3337,12 +3337,12 @@ lc_outbox_stage_command_terminal(lc_outbox_transaction_handle *transaction,
   }
 #endif
   if (rc != LC_OK) {
-    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
     lc_get_res_cleanup(&load_result);
     return rc;
   }
   if (record.state == NULL || strcmp(record.state, "pending") != 0) {
-    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
     lc_get_res_cleanup(&load_result);
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "command receipt is already terminal", NULL, NULL,
@@ -3351,13 +3351,13 @@ lc_outbox_stage_command_terminal(lc_outbox_transaction_handle *transaction,
   rc = lc_outbox_validate_command_terminal_metadata(
       transaction->outbox->client, &record, result, failed, error);
   if (rc != LC_OK) {
-    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
     lc_get_res_cleanup(&load_result);
     return rc;
   }
   now = time(NULL);
   if (now == (time_t)-1) {
-    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
     lc_get_res_cleanup(&load_result);
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "failed to read command terminal clock", NULL, NULL,
@@ -3402,7 +3402,7 @@ lc_outbox_stage_command_terminal(lc_outbox_transaction_handle *transaction,
                                                  transaction->command_lease);
     }
   }
-  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
   lc_get_res_cleanup(&load_result);
   if (rc == LC_OK)
     transaction->command_terminal = 1;
@@ -3688,7 +3688,8 @@ static lc_unix_seconds lc_outbox_effective_claim_deadline(
         lc_outbox_select_claim_deadline(&record, record_outbox, fallback);
   }
   if (runtime != NULL) {
-    runtime->cleanup(runtime, &lc_outbox_claim_deadline_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_claim_deadline_record_map, &record,
+                     NULL);
   }
 done:
   free(key);
@@ -4288,7 +4289,7 @@ static int lc_outbox_pouch_shared_live_claim(lc_outbox_handle *outbox,
     lc_outbox_schedule_claim_recovery(
         outbox, key, (lc_unix_seconds)record.claim_expires_at_unix);
   }
-  runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   lc_error_cleanup(&load_error);
   return active;
@@ -4341,7 +4342,7 @@ static void lc_outbox_schedule_conflicted_claim_recovery(
     durable_deadline = (lc_unix_seconds)record.claim_expires_at_unix;
   }
   if (runtime != NULL)
-    runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   lc_error_cleanup(&load_error);
   now = time(NULL);
@@ -4710,7 +4711,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
         lc_outbox_timestamp_add((lc_unix_seconds)now, outbox->claim_ttl_seconds,
                                 "claim ttl", &claim_expires_at_unix, error);
     if (rc != LC_OK) {
-      runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+      runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
       lc_get_res_cleanup(&result);
       lc_outbox_rollback_lease(lease);
       return rc;
@@ -4747,7 +4748,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
     record.attempt_count = original_attempt_count;
     record.claim_expires_at_unix = original_claim_expires_at_unix;
   }
-  runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   if (rc != LC_OK) {
     lc_outbox_rollback_lease(lease);
@@ -4819,7 +4820,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
                       "durable outbox claim changed before hand-off", NULL,
                       NULL, NULL);
   }
-  runtime->cleanup(runtime, &lc_outbox_record_map, &verified);
+  runtime->cleanup(runtime, &lc_outbox_record_map, &verified, NULL);
   lc_get_res_cleanup(&verify_result);
   if (rc != LC_OK) {
     lc_outbox_rollback_lease(lease);
@@ -4942,18 +4943,18 @@ static int lc_outbox_recovery_key_end(void *context, lc_error *error) {
                                         (lc_unix_seconds)now)) {
       lc_outbox_schedule_retry(capture->outbox, capture->key,
                                (lc_unix_seconds)record.not_before_unix);
-      runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+      runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
       lc_get_res_cleanup(&result);
       return 1;
     }
     if (rc == LC_OK && !result.no_content &&
         (strcmp(record.dispatch_state, "pending") != 0 &&
          strcmp(record.dispatch_state, "retry_wait") != 0)) {
-      runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+      runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
       lc_get_res_cleanup(&result);
       return 1;
     }
-    runtime->cleanup(runtime, &lc_outbox_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_record_map, &record, NULL);
     lc_get_res_cleanup(&result);
     if (rc != LC_OK)
       return 0;
@@ -7321,7 +7322,7 @@ static int lc_outbox_get_command_receipt_by_id_from_client(
   if (rc == LC_OK)
     rc = lc_outbox_command_receipt_from_record(&record, receipt, error);
   if (runtime != NULL)
-    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+    runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
   lc_get_res_cleanup(&result);
   free(key);
   return rc;
@@ -7584,7 +7585,7 @@ static int lc_outbox_resume_command_method(lc_outbox *self,
     if (rc == LC_OK)
       receipt->duplicate = 1;
   }
-  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record);
+  runtime->cleanup(runtime, &lc_outbox_command_record_map, &record, NULL);
   lc_get_res_cleanup(&load_result);
   if (rc != LC_OK || receipt->state != LC_COMMAND_PENDING) {
     lc_outbox_rollback_lease(lease);
@@ -7796,7 +7797,7 @@ static int lc_outbox_open_terminal_outbox(
                       NULL, NULL, NULL);
   }
   if (rc != LC_OK) {
-    runtime->cleanup(runtime, &lc_outbox_record_map, record);
+    runtime->cleanup(runtime, &lc_outbox_record_map, record, NULL);
     lc_outbox_rollback_lease(*lease_out);
     *lease_out = NULL;
   }
@@ -8396,8 +8397,8 @@ static int lc_outbox_delete_terminal_receipt(
   }
   if (lease != NULL)
     lc_outbox_rollback_lease(lease);
-  runtime->cleanup(runtime, &lc_outbox_command_record_map, &command);
-  runtime->cleanup(runtime, &lc_outbox_inbox_record_map, &inbox);
+  runtime->cleanup(runtime, &lc_outbox_command_record_map, &command, NULL);
+  runtime->cleanup(runtime, &lc_outbox_inbox_record_map, &inbox, NULL);
   lc_get_res_cleanup(&result);
   return rc;
 }

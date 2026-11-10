@@ -592,7 +592,13 @@ static int lc_engine_json_http_init_parser(lc_engine_json_http_state *state) {
   }
 
   runtime = lc_engine_runtime(state->client);
-  runtime->init(runtime, map, dst);
+  status = runtime->init(runtime, map, dst, &state->parse.error);
+  if (status != LONEJSON_STATUS_OK) {
+    lc_engine_lonejson_error_from_status(
+        state->error, status, &state->parse.error,
+        "failed to initialize JSON response destination");
+    return 0;
+  }
   status = runtime->curl_parse_init(runtime, &state->parse, map, dst);
   if (status != LONEJSON_STATUS_OK) {
     lc_engine_lonejson_error_from_status(
@@ -708,7 +714,7 @@ lc_engine_json_http_state_cleanup(lc_engine_json_http_state *state) {
   if (state->parser_is_error) {
     lc_engine_runtime(state->client)
         ->cleanup(lc_engine_runtime(state->client), &lc_engine_http_error_map,
-                  &state->error_body);
+                  &state->error_body, NULL);
   }
   state->parser_initialized = 0;
   state->parser_is_error = 0;
@@ -1169,8 +1175,9 @@ int lc_engine_http_json_request(
       lc_engine_buffer_cleanup(&url);
       if (state.parser_initialized != 0 && state.parser_is_error == 0 &&
           state.response_map != NULL && state.response_dst != NULL) {
-        lc_engine_runtime(client)->cleanup(
-            lc_engine_runtime(client), state.response_map, state.response_dst);
+        lc_engine_runtime(client)->cleanup(lc_engine_runtime(client),
+                                           state.response_map,
+                                           state.response_dst, NULL);
       }
       lc_engine_json_http_state_cleanup(&state);
       lc_engine_http_result_cleanup(result);
@@ -1529,8 +1536,9 @@ int lc_engine_http_json_request_stream(
       lc_engine_buffer_cleanup(&url);
       if (state.parser_initialized != 0 && state.parser_is_error == 0 &&
           state.response_map != NULL && state.response_dst != NULL) {
-        lc_engine_runtime(client)->cleanup(
-            lc_engine_runtime(client), state.response_map, state.response_dst);
+        lc_engine_runtime(client)->cleanup(lc_engine_runtime(client),
+                                           state.response_map,
+                                           state.response_dst, NULL);
       }
       lc_engine_json_http_state_cleanup(&state);
       lc_engine_http_result_cleanup(result);
@@ -2027,16 +2035,19 @@ int lc_engine_set_server_error_from_json(lc_engine_client *client,
 
   memset(&parsed, 0, sizeof(parsed));
   memset(&lj_error, 0, sizeof(lj_error));
-  lc_engine_runtime(client)->init(lc_engine_runtime(client),
-                                  &lc_engine_http_error_map, &parsed);
+  status = lc_engine_runtime(client)->init(
+      lc_engine_runtime(client), &lc_engine_http_error_map, &parsed, &lj_error);
+  if (status != LONEJSON_STATUS_OK)
+    return lc_engine_lonejson_error_from_status(
+        error, status, &lj_error, "failed to initialize error response");
   status = lc_engine_runtime(client)->parse_cstr(lc_engine_runtime(client),
                                                  &lc_engine_http_error_map,
                                                  &parsed, json, &lj_error);
   rc = lc_engine_lonejson_error_from_status(
       error, status, &lj_error, "failed to decode error response body");
   if (rc != LC_ENGINE_OK) {
-    lc_engine_runtime(client)->cleanup(lc_engine_runtime(client),
-                                       &lc_engine_http_error_map, &parsed);
+    lc_engine_runtime(client)->cleanup(
+        lc_engine_runtime(client), &lc_engine_http_error_map, &parsed, NULL);
     return rc;
   }
 
@@ -2051,7 +2062,7 @@ int lc_engine_set_server_error_from_json(lc_engine_client *client,
   synthetic.retry_after_seconds = (long)parsed.retry_after_seconds;
   rc = lc_engine_set_server_error_from_result(error, &synthetic);
   lc_engine_runtime(client)->cleanup(lc_engine_runtime(client),
-                                     &lc_engine_http_error_map, &parsed);
+                                     &lc_engine_http_error_map, &parsed, NULL);
   return rc;
 }
 

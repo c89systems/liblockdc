@@ -140,9 +140,11 @@ void lc_lonejson_cleanup_value(lonejson *runtime, const lonejson_map *map,
                                void *value);
 void lc_engine_lonejson_cleanup(lc_engine_client *client,
                                 const lonejson_map *map, void *value);
-void lc_lonejson_prepare_parse_destination(lonejson *runtime,
-                                           const lonejson_map *map,
-                                           void *value);
+/* Iterative walk; traversal allocation failure leaves the destination intact.
+ */
+int lc_lonejson_prepare_parse_destination(lonejson *runtime,
+                                          const lonejson_map *map, void *value,
+                                          lc_error *error);
 int lc_lonejson_parse_file(lonejson *runtime, FILE *fp, const lonejson_map *map,
                            void *dst, lc_error *error, const char *message);
 int lc_lonejson_parse_prepared_file(lonejson *runtime, FILE *fp,

@@ -25,6 +25,9 @@ typedef struct branch_ud {
 } branch_ud;
 typedef struct operation_ud {
   lc_xa_operation *handle;
+  /* The rooted receiver owns this copy even if a Lua allocation re-enters
+   * close(). Keep the bounded inventory off the native worker stack. */
+  lc_xa_result snapshot;
 } operation_ud;
 typedef struct borrow_ud {
   lc_xa_borrow *handle;
@@ -491,7 +494,6 @@ static int operation_wait(lua_State *L) {
 static int operation_result(lua_State *L) {
   operation_ud *ud = luaL_testudata(L, 1, OP_MT);
   const lc_xa_result *result;
-  lc_xa_result snapshot;
   lc_xa_wait wait;
   lc_error *error = scope(L, 1);
   int rc;
@@ -506,8 +508,8 @@ static int operation_result(lua_State *L) {
   }
   lc_error_cleanup(error);
   if (result != NULL) {
-    snapshot = *result;
-    result = &snapshot;
+    ud->snapshot = *result;
+    result = &ud->snapshot;
     if (result->row_count > 64U)
       return bad(L, "XA inventory exceeds its bounded result capacity");
   }

@@ -461,4 +461,11 @@ int lc_pouch_state_query_index_seq(lc_pouch *pouch, const char *ns,
 void lc_pouch_state_read_result_cleanup(const lc_allocator *allocator,
                                         lc_pouch_state_read_result *result);
 
+#ifdef LOCKDC_TEST_BUILD
+/* Exercises the owned scalar fast path without involving dependency parsers. */
+int lc_pouch_test_scalar_scan(lc_source *source, const char *field,
+                              const char *value, char type, int *decided,
+                              int *matched, lc_error *error);
+#endif
+
 #endif

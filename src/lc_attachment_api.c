@@ -647,7 +647,13 @@ lc_engine_stream_json_init_parser(lc_engine_stream_request_state *state) {
     return 0;
   }
   runtime = lc_engine_lonejson_runtime(state->client);
-  runtime->init(runtime, map, dst);
+  status = runtime->init(runtime, map, dst, &state->parse.error);
+  if (status != LONEJSON_STATUS_OK) {
+    lc_engine_lonejson_error_from_status(
+        state->error, status, &state->parse.error,
+        "failed to initialize JSON response destination");
+    return 0;
+  }
   status = runtime->curl_parse_init(runtime, &state->parse, map, dst);
   if (status != LONEJSON_STATUS_OK) {
     lc_engine_lonejson_error_from_status(
@@ -1259,40 +1265,44 @@ int lc_engine_parse_attach_response_json(const char *json,
   }
   memset(&parsed, 0, sizeof(parsed));
   memset(&lj_error, 0, sizeof(lj_error));
-  runtime->init(runtime, &lc_engine_attach_response_map, &parsed);
+  status = runtime->init(runtime, &lc_engine_attach_response_map, &parsed,
+                         &lj_error);
+  if (status != LONEJSON_STATUS_OK)
+    return lc_engine_lonejson_error_from_status(
+        error, status, &lj_error, "failed to initialize attach response");
   status = runtime->parse_cstr(runtime, &lc_engine_attach_response_map, &parsed,
                                json, &lj_error);
   rc = lc_engine_lonejson_error_from_status(error, status, &lj_error,
                                             "failed to parse attach response");
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed, NULL);
     return rc;
   }
   rc = lc_engine_attachment_info_from_json(&response->attachment,
                                            &parsed.attachment, error);
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed, NULL);
     lc_engine_attach_response_cleanup(response);
     return rc;
   }
   response->noop = parsed.noop ? 1 : 0;
   rc = lc_engine_i64_assign(parsed.version, &response->version, error);
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed, NULL);
     lc_engine_attach_response_cleanup(response);
     return rc;
   }
   if (correlation_id != NULL) {
     response->correlation_id = lc_engine_strdup_local(correlation_id);
     if (response->correlation_id == NULL) {
-      runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed);
+      runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed, NULL);
       lc_engine_attach_response_cleanup(response);
       return lc_engine_set_client_error(
           error, LC_ENGINE_ERROR_NO_MEMORY,
           "failed to allocate attachment correlation id");
     }
   }
-  runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_attach_response_map, &parsed, NULL);
   return LC_ENGINE_OK;
 }
 
@@ -1320,23 +1330,27 @@ int lc_engine_parse_list_attachments_response_json(
   }
   memset(&parsed, 0, sizeof(parsed));
   memset(&lj_error, 0, sizeof(lj_error));
-  runtime->init(runtime, &lc_engine_list_attachments_response_map, &parsed);
+  status = runtime->init(runtime, &lc_engine_list_attachments_response_map,
+                         &parsed, &lj_error);
+  if (status != LONEJSON_STATUS_OK)
+    return lc_engine_lonejson_error_from_status(
+        error, status, &lj_error, "failed to initialize attachment list");
   status =
       runtime->parse_cstr(runtime, &lc_engine_list_attachments_response_map,
                           &parsed, json, &lj_error);
   rc = lc_engine_lonejson_error_from_status(
       error, status, &lj_error, "failed to parse list_attachments response");
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_list_attachments_response_map,
-                     &parsed);
+    runtime->cleanup(runtime, &lc_engine_list_attachments_response_map, &parsed,
+                     NULL);
     return rc;
   }
   response->ns = lc_engine_strdup_local(parsed.ns);
   response->key = lc_engine_strdup_local(parsed.key);
   if ((parsed.ns != NULL && response->ns == NULL) ||
       (parsed.key != NULL && response->key == NULL)) {
-    runtime->cleanup(runtime, &lc_engine_list_attachments_response_map,
-                     &parsed);
+    runtime->cleanup(runtime, &lc_engine_list_attachments_response_map, &parsed,
+                     NULL);
     lc_engine_list_attachments_response_cleanup(response);
     return lc_engine_set_client_error(
         error, LC_ENGINE_ERROR_NO_MEMORY,
@@ -1350,7 +1364,7 @@ int lc_engine_parse_list_attachments_response_json(
         parsed.attachments.count, sizeof(lc_engine_attachment_info));
     if (response->attachments == NULL) {
       runtime->cleanup(runtime, &lc_engine_list_attachments_response_map,
-                       &parsed);
+                       &parsed, NULL);
       lc_engine_list_attachments_response_cleanup(response);
       return lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                         "failed to allocate attachments array");
@@ -1362,7 +1376,7 @@ int lc_engine_parse_list_attachments_response_json(
                                                &items[index], error);
       if (rc != LC_ENGINE_OK) {
         runtime->cleanup(runtime, &lc_engine_list_attachments_response_map,
-                         &parsed);
+                         &parsed, NULL);
         lc_engine_list_attachments_response_cleanup(response);
         return rc;
       }
@@ -1372,13 +1386,14 @@ int lc_engine_parse_list_attachments_response_json(
     response->correlation_id = lc_engine_strdup_local(correlation_id);
     if (response->correlation_id == NULL) {
       runtime->cleanup(runtime, &lc_engine_list_attachments_response_map,
-                       &parsed);
+                       &parsed, NULL);
       lc_engine_list_attachments_response_cleanup(response);
       return lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                         "failed to allocate correlation id");
     }
   }
-  runtime->cleanup(runtime, &lc_engine_list_attachments_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_list_attachments_response_map, &parsed,
+                   NULL);
   return LC_ENGINE_OK;
 }
 

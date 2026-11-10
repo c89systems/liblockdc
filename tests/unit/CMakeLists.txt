@@ -487,6 +487,27 @@ if(LOCKDC_C_TEST_ENVIRONMENT)
 endif()
 set_property(GLOBAL APPEND PROPERTY LOCKDC_CROSS_RUNTIME_TEST_TARGETS lc_unit_transport_https)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  lc_add_unit_test(lc_unit_stack test_lc_stack.c
+    ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_compile_definitions(lc_unit_stack PRIVATE LOCKDC_TEST_BUILD=1
+    LC_STACK_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
+  target_link_options(lc_unit_stack PRIVATE "LINKER:--wrap=lc_alloc_with_allocator")
+  set_tests_properties(lc_unit_stack PROPERTIES
+    LABELS "unit;cross-runtime;stack" TIMEOUT 60)
+  if(LOCKDC_TEST_SMALL_STACK)
+    add_test(NAME stack_allocation_policy_test COMMAND ${CMAKE_COMMAND}
+      -DLOCKDC_COMPILER=${CMAKE_C_COMPILER}
+      -DLOCKDC_SYSROOT=${CMAKE_SYSROOT}
+      -DLOCKDC_WORK=${CMAKE_BINARY_DIR}/stack-policy-test
+      "-DLOCKDC_CORE_OPTIONS=$<TARGET_PROPERTY:lc_objects,COMPILE_OPTIONS>"
+      "-DLOCKDC_TEST_OPTIONS=$<TARGET_PROPERTY:lc_unit_stack,COMPILE_OPTIONS>"
+      -P ${CMAKE_SOURCE_DIR}/tests/stack_allocation_policy_test.cmake)
+    set_tests_properties(stack_allocation_policy_test PROPERTIES
+      LABELS "unit;local;lifecycle-host;stack" TIMEOUT 30)
+  endif()
+endif()
+
 # Validate unit registration before the parent assembles the runtime build
 # closure shared with integration tests. Partitioned suites share one target.
 get_property(lc_cross_runtime_test_targets GLOBAL PROPERTY

@@ -463,20 +463,22 @@ static void test_lonejson_prepare_parse_destination_resets_reused_allocations(
   assert_non_null(runtime);
 
   lc_lonejson_prepare_parse_destination(runtime, &runtime_alloc_string_map,
-                                        &doc);
+                                        &doc, NULL);
   status = runtime->parse_cstr(runtime, &runtime_alloc_string_map, &doc,
                                "{\"label\":\"first\"}", &error);
   assert_int_equal(status, LONEJSON_STATUS_OK);
   assert_string_equal(doc.label, "first");
 
   lc_lonejson_prepare_parse_destination(runtime, &runtime_alloc_string_map,
-                                        &doc);
+                                        &doc, NULL);
   status = runtime->parse_cstr(runtime, &runtime_alloc_string_map, &doc,
                                "{\"label\":\"second\"}", &error);
   assert_int_equal(status, LONEJSON_STATUS_OK);
   assert_string_equal(doc.label, "second");
 
-  runtime->cleanup(runtime, &runtime_alloc_string_map, &doc);
+  assert_int_equal(
+      runtime->cleanup(runtime, &runtime_alloc_string_map, &doc, NULL),
+      LONEJSON_STATUS_OK);
   lonejson_free(runtime);
 }
 

@@ -37,6 +37,8 @@ typedef struct lc_pouch_recode_file {
 
 typedef struct lc_pouch_recode {
   lc_pouch *pouch;
+  /* Reused only by this conversion operation's canonical CRC reader. */
+  unsigned char *state_scratch;
   lc_pouch_recode_file *files;
   size_t count;
   size_t capacity;

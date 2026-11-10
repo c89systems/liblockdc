@@ -3824,9 +3824,11 @@ struct lc_lease {
    *
    * Callers define their struct and map with `LONEJSON_FIELD_*` and
    * `LONEJSON_MAP_DEFINE(...)`, then release lonejson-owned field storage with
-   * a lonejson runtime cleanup call when finished. For very large string or
-   * byte values, use lonejson spool-backed field mappings so load can spill
-   * those fields instead of forcing them to stay resident in memory.
+   * a compatible lonejson runtime cleanup call, including after a failed load.
+   * Start with a zeroed or runtime-initialized destination. Check lifecycle
+   * call status; failed cleanup retains ownership that must be retried.
+   * For very large string or byte values, use lonejson spool-backed field
+   * mappings so those fields can spill instead of staying resident in memory.
    */
   int (*load)(lc_lease *self, const lonejson_map *map, void *dst,
               const lc_get_opts *opts, lc_get_res *out, lc_error *error);
@@ -4608,7 +4610,9 @@ struct lc_client {
    *
    * Callers define their struct and map with `LONEJSON_FIELD_*` and
    * `LONEJSON_MAP_DEFINE(...)`, then release lonejson-owned field storage with
-   * a lonejson runtime cleanup call when finished.
+   * a compatible lonejson runtime cleanup call, including after a failed load.
+   * Start with a zeroed or runtime-initialized destination. Check lifecycle
+   * call status; failed cleanup retains ownership that must be retried.
    */
   int (*load)(lc_client *self, const char *key, const lonejson_map *map,
               void *dst, const lc_get_opts *opts, lc_get_res *out,
@@ -5204,9 +5208,9 @@ int lc_sink_memory_bytes(lc_sink *sink, const void **bytes, size_t *length,
  * The copy is streaming and starts with a small bounded chunk. Longer copies
  * use a bounded heap buffer from the built-in allocator; allocation failure
  * returns `LC_ERR_NOMEM`. Errors can leave either stream partially advanced.
- * It resets `error`
- * for this operation before reading the source. It advances `src`, does not
- * reset it, and leaves both handles open. `written` may be `NULL`; on success
+ * It resets `error` for this operation before reading the source. It advances
+ * `src` without resetting it and leaves both handles open. `written` may be
+ * `NULL`; on success
  * it receives the total bytes copied.
  */
 int lc_copy(lc_source *src, lc_sink *dst, size_t *written, lc_error *error);
@@ -5404,6 +5408,9 @@ int lc_get_in_namespace(lc_client *client, const char *ns, const char *key,
  *
  * Ordinary mapped fields are materialized. Spool-backed lonejson fields may
  * remain file-backed; use `lc_get()` with a sink for fully streamed transfer.
+ * Start with a zeroed or runtime-initialized destination; reused storage is
+ * reset before parsing. The caller cleans mapped fields even after failure.
+ * Check lonejson lifecycle status and retain ownership if cleanup fails.
  */
 int lc_load(lc_client *client, const char *key, const lonejson_map *map,
             void *dst, const lc_get_opts *opts, lc_get_res *out,
@@ -5413,7 +5420,7 @@ int lc_load(lc_client *client, const char *key, const lonejson_map *map,
  *
  * This is the namespace-aware counterpart to `lc_load()`. It is useful for
  * component records that deliberately live outside the client's default
- * namespace.
+ * namespace. The same destination initialization and cleanup rules apply.
  */
 int lc_load_in_namespace(lc_client *client, const char *ns, const char *key,
                          const lonejson_map *map, void *dst,
@@ -5606,6 +5613,7 @@ int lc_lease_get(lc_lease *lease, lc_sink *dst, const lc_get_opts *opts,
  *
  * Ordinary mapped fields are materialized. Spool-backed lonejson fields may
  * remain file-backed; use `lc_lease_get()` for fully streamed transfer.
+ * Destination initialization and fallible cleanup follow `lc_load()`.
  */
 int lc_lease_load(lc_lease *lease, const lonejson_map *map, void *dst,
                   const lc_get_opts *opts, lc_get_res *out, lc_error *error);

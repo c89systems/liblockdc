@@ -492,7 +492,7 @@ lc_engine_watch_sse_json_event(void *user, const lonejson_sse_event *sse_event,
       (parsed->queue != NULL && event.queue == NULL) ||
       (parsed->head_message_id != NULL && event.head_message_id == NULL)) {
     lc_engine_queue_watch_event_cleanup(&event);
-    runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
+    runtime->reset(runtime, &lc_engine_watch_event_map, parsed, NULL);
     lc_engine_set_client_error(state->error, LC_ENGINE_ERROR_NO_MEMORY,
                                "failed to copy queue watch event");
     return LONEJSON_STATUS_CALLBACK_FAILED;
@@ -502,14 +502,14 @@ lc_engine_watch_sse_json_event(void *user, const lonejson_sse_event *sse_event,
       &event.changed_at_unix, state->error);
   if (rc != LC_ENGINE_OK) {
     lc_engine_queue_watch_event_cleanup(&event);
-    runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
+    runtime->reset(runtime, &lc_engine_watch_event_map, parsed, NULL);
     return LONEJSON_STATUS_CALLBACK_FAILED;
   }
   if (parsed->correlation_id != NULL) {
     event.correlation_id = lc_engine_strdup_local(parsed->correlation_id);
     if (event.correlation_id == NULL) {
       lc_engine_queue_watch_event_cleanup(&event);
-      runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
+      runtime->reset(runtime, &lc_engine_watch_event_map, parsed, NULL);
       lc_engine_set_client_error(
           state->error, LC_ENGINE_ERROR_NO_MEMORY,
           "failed to allocate queue watch correlation_id");
@@ -519,7 +519,7 @@ lc_engine_watch_sse_json_event(void *user, const lonejson_sse_event *sse_event,
     event.correlation_id = lc_engine_strdup_local(state->correlation_id);
     if (event.correlation_id == NULL) {
       lc_engine_queue_watch_event_cleanup(&event);
-      runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
+      runtime->reset(runtime, &lc_engine_watch_event_map, parsed, NULL);
       lc_engine_set_client_error(
           state->error, LC_ENGINE_ERROR_NO_MEMORY,
           "failed to allocate queue watch correlation_id");
@@ -529,7 +529,7 @@ lc_engine_watch_sse_json_event(void *user, const lonejson_sse_event *sse_event,
 
   if (!state->handler(state->handler_context, &event, state->error)) {
     lc_engine_queue_watch_event_cleanup(&event);
-    runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
+    runtime->reset(runtime, &lc_engine_watch_event_map, parsed, NULL);
     if (state->error->code == LC_ENGINE_OK) {
       lc_engine_set_transport_error(state->error, "queue watch handler failed");
     }
@@ -537,8 +537,7 @@ lc_engine_watch_sse_json_event(void *user, const lonejson_sse_event *sse_event,
   }
 
   lc_engine_queue_watch_event_cleanup(&event);
-  runtime->reset(runtime, &lc_engine_watch_event_map, parsed);
-  return LONEJSON_STATUS_OK;
+  return runtime->reset(runtime, &lc_engine_watch_event_map, parsed, lj_error);
 }
 
 static size_t lc_engine_watch_write_callback(char *ptr, size_t size,
@@ -634,7 +633,7 @@ static void lc_engine_watch_state_cleanup(lc_engine_watch_state *state) {
   lc_engine_buffer_cleanup(&state->error_body);
   lonejson_sse_close(state->sse);
   if (runtime != NULL) {
-    runtime->cleanup(runtime, &lc_engine_watch_event_map, &state->parsed);
+    runtime->cleanup(runtime, &lc_engine_watch_event_map, &state->parsed, NULL);
   }
   lc_engine_free_string(&state->correlation_id);
 }
@@ -764,13 +763,17 @@ int lc_engine_parse_subscribe_meta_json(const char *json,
   }
   memset(&parsed, 0, sizeof(parsed));
   memset(&lj_error, 0, sizeof(lj_error));
-  runtime->init(runtime, &lc_engine_subscribe_meta_map, &parsed);
+  status =
+      runtime->init(runtime, &lc_engine_subscribe_meta_map, &parsed, &lj_error);
+  if (status != LONEJSON_STATUS_OK)
+    return lc_engine_lonejson_error_from_status(
+        error, status, &lj_error, "failed to initialize subscribe metadata");
   status = runtime->parse_cstr(runtime, &lc_engine_subscribe_meta_map, &parsed,
                                json, &lj_error);
   rc = lc_engine_lonejson_error_from_status(
       error, status, &lj_error, "failed to parse subscribe meta body");
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed, NULL);
     return rc;
   }
 
@@ -848,7 +851,7 @@ int lc_engine_parse_subscribe_meta_json(const char *json,
     }
   }
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed, NULL);
     lc_engine_dequeue_response_cleanup(response);
     return lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                       "failed to copy subscribe meta response");
@@ -907,14 +910,14 @@ int lc_engine_parse_subscribe_meta_json(const char *json,
         &response->state_fencing_token, error);
   }
   if (rc != LC_ENGINE_OK) {
-    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed, NULL);
     lc_engine_dequeue_response_cleanup(response);
     return rc;
   }
   if (response->correlation_id == NULL && fallback_correlation_id != NULL) {
     response->correlation_id = lc_engine_strdup_local(fallback_correlation_id);
     if (response->correlation_id == NULL) {
-      runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed);
+      runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed, NULL);
       lc_engine_dequeue_response_cleanup(response);
       return lc_engine_set_client_error(
           error, LC_ENGINE_ERROR_NO_MEMORY,
@@ -922,7 +925,7 @@ int lc_engine_parse_subscribe_meta_json(const char *json,
     }
   }
 
-  runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_subscribe_meta_map, &parsed, NULL);
   return LC_ENGINE_OK;
 }
 

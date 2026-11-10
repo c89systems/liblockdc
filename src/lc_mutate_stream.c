@@ -1198,9 +1198,15 @@ static int lc_ms_build_set(const char *path_text, const char *value_text,
                                    &mutation->value, error);
 }
 
-static int lc_ms_parse_expr(const char *expr,
-                            const lc_mutation_parse_options *options,
-                            lc_mutation_plan *plan, lc_error *error) {
+typedef struct lc_ms_pending {
+  struct lc_ms_pending *next;
+  char expression[1];
+} lc_ms_pending;
+
+static int lc_ms_parse_expr_one(const char *expr,
+                                const lc_mutation_parse_options *options,
+                                lc_mutation_plan *plan, lc_ms_pending **pending,
+                                lc_error *error) {
   const char *cursor;
   const char *path_text;
   const char *value_text;
@@ -1335,33 +1341,37 @@ static int lc_ms_parse_expr(const char *expr,
                             "failed to allocate brace prefix", NULL, NULL,
                             NULL);
       }
-      for (i = 0U; i < subcount; ++i) {
-        char *combined;
-        size_t combined_len;
-        combined_len = strlen(copy) + strlen(subparts[i]) + 1U;
-        combined = (char *)malloc(combined_len + 1U);
-        if (combined == NULL) {
+      /* Push in reverse so the iterative expansion retains depth-first order.
+       */
+      for (i = subcount; i > 0U; --i) {
+        lc_ms_pending *task;
+        size_t prefix_len = strlen(copy);
+        size_t suffix_len = strlen(subparts[i - 1U]);
+        if (prefix_len > (size_t)-1 - sizeof(*task) ||
+            suffix_len > (size_t)-1 - sizeof(*task) - prefix_len) {
+          task = NULL;
+        } else {
+          task = lc_alloc_with_allocator(NULL, sizeof(*task) + prefix_len +
+                                                   suffix_len);
+        }
+        if (task == NULL) {
+          size_t j;
           free(copy);
-          while (i < subcount)
-            free(subparts[i++]);
+          for (j = 0U; j < subcount; ++j)
+            free(subparts[j]);
           free(subparts);
           return lc_error_set(error, LC_ERR_NOMEM, 0L,
                               "failed to allocate brace mutation", NULL, NULL,
                               NULL);
         }
-        strcpy(combined, copy);
-        strcat(combined, subparts[i]);
-        if (lc_ms_parse_expr(combined, options, plan, error) != LC_OK) {
-          free(combined);
-          free(copy);
-          while (i < subcount)
-            free(subparts[i++]);
-          free(subparts);
-          return LC_ERR_INVALID;
-        }
-        free(combined);
-        free(subparts[i]);
+        memcpy(task->expression, copy, prefix_len);
+        memcpy(task->expression + prefix_len, subparts[i - 1U],
+               suffix_len + 1U);
+        task->next = *pending;
+        *pending = task;
       }
+      for (i = 0U; i < subcount; ++i)
+        free(subparts[i]);
       free(subparts);
       free(copy);
       return LC_OK;
@@ -1413,6 +1423,28 @@ static int lc_ms_parse_expr(const char *expr,
     return rc;
   }
   return LC_OK;
+}
+
+static int lc_ms_parse_expr(const char *expr,
+                            const lc_mutation_parse_options *options,
+                            lc_mutation_plan *plan, lc_error *error) {
+  lc_ms_pending *pending = NULL;
+  lc_ms_pending *task;
+  int rc = lc_ms_parse_expr_one(expr, options, plan, &pending, error);
+  while (rc == LC_OK && pending != NULL) {
+    task = pending;
+    pending = task->next;
+    rc = lc_ms_parse_expr_one(task->expression, options, plan, &pending, error);
+    lc_free_with_allocator(NULL, task);
+    if (rc != LC_OK)
+      rc = LC_ERR_INVALID;
+  }
+  while (pending != NULL) {
+    task = pending;
+    pending = task->next;
+    lc_free_with_allocator(NULL, task);
+  }
+  return rc;
 }
 
 int lc_mutation_plan_build(const char *const *exprs, size_t expr_count,

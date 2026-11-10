@@ -68,7 +68,7 @@ command provisions the pinned Linux host MIG helper in the shared toolchain
 cache, without obtaining Apple content. Darwin configure requires both tools;
 MIG is build tooling and is excluded from SDK packages.
 
-The pinned `cpkt` 0.6.1 GNU SDKs require glibc 2.43 or newer at deployment. This
+The pinned `cpkt` 0.7.0 GNU SDKs require glibc 2.43 or newer at deployment. This
 does not change the `liblockdc` public ABI, but deployments using the shared GNU
 SDK must upgrade their runtime accordingly. Development executables, tests,
 examples, Lua module checks, and SDK consumer probes run directly with their
@@ -79,17 +79,18 @@ use `LD_LIBRARY_PATH` or a host Lua interpreter.
 
 | Dependency | Version | Use |
 | --- | --- | --- |
-| [cpkt](https://github.com/c89systems/cpkt) | 0.6.1 | Core SDK dependencies and Lua runtime |
-| [cpktdb](https://github.com/c89systems/cpktdb) | 0.3.1 | Optional PostgreSQL C89 facade and database SDK |
-| lonejson | 0.47.0 (ABI 27) | JSON parsing, mapping, and streaming |
+| [cpkt](https://github.com/c89systems/cpkt) | 0.7.0 | Core SDK dependencies and Lua runtime |
+| [cpktdb](https://github.com/c89systems/cpktdb) | 0.4.0 | Optional PostgreSQL C89 facade and database SDK |
+| lonejson | 0.48.0 (ABI 28) | JSON parsing, mapping, and streaming |
 | libpslog | 0.13.0 | SDK diagnostics |
 | liblql | 0.4.1 | Pouch query support |
 | cmocka | 2.0.2 | Unit tests only; target-specific static library from cpkt |
 
-Lonejson 0.47.0 advances its ABI from 26 to 27 because its public receiver
-layouts changed. Rebuild lonejson consumers and Lua native modules together
-against the matching SDK. Liblockdc's public C layouts and core ABI 9 remain
-unchanged; its mapped load/save boundary uses unchanged lonejson map layouts.
+Lonejson 0.48.0 advances its ABI from 27 to 28: mapped-record init/reset/cleanup
+calls now return status and accept an optional error output. Rebuild lonejson
+consumers and Lua native modules together against the matching SDK. Liblockdc
+checks initialization/reset errors before parsing; its public C layouts and
+core ABI 9 remain unchanged. See the [upgrade notes](../CHANGELOG.md#upgrading-from-029x).
 
 OpenSSL, curl, zlib, nghttp2, libssh2, and Lua come from cpkt. cmocka comes from
 cpkt's target-specific SDK and remains a test-only dependency.
@@ -98,15 +99,16 @@ Core and database SDKs remain in separate `cpkt/install` and `cpktdb/install`
 prefixes under each target's dependency root. cpktdb records its exact core
 build pin as provenance and requests a compatible minimum core through CMake.
 Core's declared compatibility floor governs independent upgrades; matching
-major/minor versions alone do not establish compatibility. cpkt 0.6.1 accepts
-baselines from 0.2.0 through 0.6.1; cpktdb 0.3.1 requires at least 0.5.1. Target
+major/minor versions alone do not establish compatibility. cpkt 0.7.0 accepts
+baselines from 0.2.0 through 0.7.0; cpktdb 0.4.0 requires at least 0.7.0. Target
 and payload integrity checks remain enforced. `scripts/deps.sh` pins each
 provider release and checksum independently; cpktdb is acquired/discovered only
 when PostgreSQL is enabled. Consumers use the official imported targets.
 pkg-config consumers must also run the provider's CMake compatibility preflight.
-cpktmisc is not required by liblockdc. PostgreSQL applications use cpktdb's
-checked result retrieval API to distinguish drainage from local retrieval
-failures.
+cpktmisc is not required by liblockdc. Only cpktdb's PostgreSQL facade/client
+is selected; its SQLite and iODBC facades are not used. PostgreSQL applications
+use the checked result retrieval API to distinguish drainage from local
+retrieval failures.
 
 ## Common commands
 
@@ -209,6 +211,29 @@ All significant Make targets print total elapsed time on completion.
 
 `make format` runs `clang-format` over the C source/header tree and is also part
 of the clean-slate release pipeline.
+
+### Worker stack budget
+
+Design library code for musl's nominal 128 KiB default worker stack. Keep
+input-dependent traversal state on the project allocator, with allocation
+errors and cleanup covered by tests. Keep large buffers and aggregates off the
+native stack; owned C library and test targets reject VLAs and `alloca()` with
+compiler errors.
+
+Linux glibc Debug CTest runs set default pthread stacks to 128 KiB, including
+nested workers and SDK-linked child applications. CTest disables glibc's thread
+stack cache at process startup with
+`GLIBC_TUNABLES=glibc.pthread.stack_cache_size=0`, so a default worker cannot reuse
+a previously larger stack. Main-thread limits, explicit pthread stack requests,
+and build-tool defaults remain unchanged. The initializer is confined to Debug
+test builds and requires CTest's `LOCKDC_TEST_STACK_BYTES=131072` environment;
+Release SDKs contain no initializer.
+
+The `stack`-labelled regressions check actual worker sizes, guard faults, child
+inheritance, deep traversal, malformed input, and allocation/read failures.
+Run `ctest --test-dir build/debug -L stack --output-on-failure` after building.
+The traversal regression also runs on the Linux cross-runtime matrix; native
+musl runs verify the actual default worker stack without overriding its size.
 
 ## Local development environment
 

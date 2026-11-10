@@ -689,7 +689,9 @@ static int lc_client_load_with_namespace_method(
   load_state.byte_limit = client->http_json_response_limit_bytes > 0U
                               ? client->http_json_response_limit_bytes
                               : (size_t)LC_HTTP_JSON_RESPONSE_LIMIT_DEFAULT;
-  lc_lonejson_prepare_parse_destination(runtime, map, dst);
+  rc = lc_lonejson_prepare_parse_destination(runtime, map, dst, error);
+  if (rc != LC_OK)
+    return rc;
   rc = runtime->curl_parse_init(runtime, &load_state.parse, map, dst);
   if (rc != LONEJSON_STATUS_OK) {
     return lc_lonejson_error_from_status(

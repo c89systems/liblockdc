@@ -413,7 +413,8 @@ int lc_engine_client_queue_stats(lc_engine_client *client,
   }
   if (result.http_status < 200 || result.http_status >= 300) {
     rc = lc_engine_set_server_error_from_result(error, &result);
-    runtime->cleanup(runtime, &lc_engine_queue_stats_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_queue_stats_response_map, &parsed,
+                     NULL);
     lc_engine_http_result_cleanup(&result);
     return rc;
   }
@@ -425,7 +426,7 @@ int lc_engine_client_queue_stats(lc_engine_client *client,
         lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                    "failed to copy queue_stats correlation_id");
   }
-  runtime->cleanup(runtime, &lc_engine_queue_stats_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_queue_stats_response_map, &parsed, NULL);
   lc_engine_http_result_cleanup(&result);
   return rc;
 }
@@ -500,7 +501,7 @@ int lc_engine_client_queue_ack(lc_engine_client *client,
   }
   if (result.http_status < 200 || result.http_status >= 300) {
     rc = lc_engine_set_server_error_from_result(error, &result);
-    runtime->cleanup(runtime, &lc_engine_queue_ack_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_queue_ack_response_map, &parsed, NULL);
     lc_engine_http_result_cleanup(&result);
     return rc;
   }
@@ -511,7 +512,7 @@ int lc_engine_client_queue_ack(lc_engine_client *client,
     rc = lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                     "failed to copy queue_ack correlation_id");
   }
-  runtime->cleanup(runtime, &lc_engine_queue_ack_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_queue_ack_response_map, &parsed, NULL);
   lc_engine_http_result_cleanup(&result);
   return rc;
 }
@@ -628,7 +629,8 @@ int lc_engine_client_queue_nack(lc_engine_client *client,
   }
   if (result.http_status < 200 || result.http_status >= 300) {
     rc = lc_engine_set_server_error_from_result(error, &result);
-    runtime->cleanup(runtime, &lc_engine_queue_nack_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_queue_nack_response_map, &parsed,
+                     NULL);
     lc_engine_http_result_cleanup(&result);
     return rc;
   }
@@ -639,7 +641,7 @@ int lc_engine_client_queue_nack(lc_engine_client *client,
     rc = lc_engine_set_client_error(error, LC_ENGINE_ERROR_NO_MEMORY,
                                     "failed to copy queue_nack correlation_id");
   }
-  runtime->cleanup(runtime, &lc_engine_queue_nack_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_queue_nack_response_map, &parsed, NULL);
   lc_engine_http_result_cleanup(&result);
   return rc;
 }
@@ -715,7 +717,8 @@ int lc_engine_client_queue_extend(lc_engine_client *client,
   }
   if (result.http_status < 200 || result.http_status >= 300) {
     rc = lc_engine_set_server_error_from_result(error, &result);
-    runtime->cleanup(runtime, &lc_engine_queue_extend_response_map, &parsed);
+    runtime->cleanup(runtime, &lc_engine_queue_extend_response_map, &parsed,
+                     NULL);
     lc_engine_http_result_cleanup(&result);
     return rc;
   }
@@ -727,7 +730,8 @@ int lc_engine_client_queue_extend(lc_engine_client *client,
         error, LC_ENGINE_ERROR_NO_MEMORY,
         "failed to copy queue_extend correlation_id");
   }
-  runtime->cleanup(runtime, &lc_engine_queue_extend_response_map, &parsed);
+  runtime->cleanup(runtime, &lc_engine_queue_extend_response_map, &parsed,
+                   NULL);
   lc_engine_http_result_cleanup(&result);
   return rc;
 }

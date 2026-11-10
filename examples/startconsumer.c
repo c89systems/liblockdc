@@ -98,7 +98,7 @@ static int parse_hello_json(const char *json_text, char *hello_out,
   status = runtime->parse_cstr(runtime, &example_hello_map, &parsed, json_text,
                                &error);
   if (status != LONEJSON_STATUS_OK || parsed.hello == NULL) {
-    runtime->cleanup(runtime, &example_hello_map, &parsed);
+    runtime->cleanup(runtime, &example_hello_map, &parsed, NULL);
     return 1;
   }
   hello_length = strlen(parsed.hello);
@@ -107,7 +107,7 @@ static int parse_hello_json(const char *json_text, char *hello_out,
   }
   memcpy(hello_out, parsed.hello, hello_length);
   hello_out[hello_length] = '\0';
-  runtime->cleanup(runtime, &example_hello_map, &parsed);
+  runtime->cleanup(runtime, &example_hello_map, &parsed, NULL);
   return 0;
 }
 
@@ -148,12 +148,12 @@ static int load_state_counter(lc_lease *state, long *counter_out,
 
   if (doc.counter < (lonejson_int64)LONG_MIN ||
       doc.counter > (lonejson_int64)LONG_MAX) {
-    runtime->cleanup(runtime, &example_counter_map, &doc);
+    runtime->cleanup(runtime, &example_counter_map, &doc, NULL);
     lc_get_res_cleanup(&get_res);
     return LC_ERR_PROTOCOL;
   }
   *counter_out = (long)doc.counter;
-  runtime->cleanup(runtime, &example_counter_map, &doc);
+  runtime->cleanup(runtime, &example_counter_map, &doc, NULL);
   lc_get_res_cleanup(&get_res);
   return LC_OK;
 }

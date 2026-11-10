@@ -349,7 +349,7 @@ function(assert_sdk_metadata extract_root archive_path version target_id shared_
         string(JSON url GET "${dependencies_text}" sdk_prerequisites ${index} source_url)
         string(JSON sha GET "${dependencies_text}" sdk_prerequisites ${index} sha256)
         string(LENGTH "${sha}" sha_length)
-        if(NOT name STREQUAL expected_name OR NOT release STREQUAL "0.6.1"
+        if(NOT name STREQUAL expected_name OR NOT release STREQUAL "0.7.0"
            OR NOT sha_length EQUAL 64 OR NOT sha MATCHES "^[a-f0-9]+$"
            OR NOT url STREQUAL "https://github.com/c89systems/${name}/releases/download/v${release}/${name}-${release}-${target_id}.tar.gz")
             message(FATAL_ERROR "Invalid ${expected_name} SDK provenance in ${archive_path}")

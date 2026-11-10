@@ -1,9 +1,13 @@
+-- Drive each Lua state serially, including callbacks. Runtime support for
+-- serialized VM/coroutine migration does not relax native resource thread affinity.
+-- Streaming methods use bounded chunks; read_* and JSON helpers materialize values.
 local core = require("lockdc.core")
 local lonejson = require("lonejson")
 
 local M = {}
 
 -- Process-wide startup selection; call before creating any SDK objects.
+-- Defaults to false/0. Pass true/1 to enable; a successful selection is final.
 -- Custom allocator callbacks and Lua's own heap remain outside this tracker.
 function M.allocator_tracking_configure(enabled)
   return core.allocator_tracking_configure(enabled)

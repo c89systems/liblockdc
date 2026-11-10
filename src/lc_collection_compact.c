@@ -426,7 +426,7 @@ static int lc_cm_stream(lc_compact *work, lc_collection_chunk_reader *reader,
 
 static int lc_cm_copy(lc_compact *work, lc_error *error) {
   lc_collection_chunk_reader chunks = {0};
-  lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  lc_collection_order_row *rows;
   lc_pouch_collection_record source;
   lc_pouch_collection_record copied;
   lc_pouch_collection_record relocated;
@@ -444,6 +444,11 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
   int body_fd;
   int rc;
   collection = work->collection;
+  rows = lc_alloc_with_allocator(&collection->allocator,
+                                 LC_COLLECTION_ORDER_PAGE_ROWS * sizeof(*rows));
+  if (rows == NULL)
+    return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
+                                 "failed to allocate compaction row page");
   ordinal = 0U;
   file_segment = file_end = 0U;
   body_segment = body_end = 0U;
@@ -537,6 +542,7 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
     (void)close(fd);
   if (body_fd >= 0)
     (void)close(body_fd);
+  lc_free_with_allocator(&collection->allocator, rows);
   lc_collection_chunks_reader_close(&chunks);
   if (rc == LC_OK && work->captured_ids.count > work->count)
     rc = lc_collection_edit_compact(

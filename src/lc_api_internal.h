@@ -822,9 +822,11 @@ void lc_lonejson_cleanup_value(lonejson *runtime, const lonejson_map *map,
                                void *value);
 void lc_engine_lonejson_cleanup(lc_engine_client *client,
                                 const lonejson_map *map, void *value);
-void lc_lonejson_prepare_parse_destination(lonejson *runtime,
-                                           const lonejson_map *map,
-                                           void *value);
+/* Iterative metadata walk; traversal allocation failure leaves dst intact.
+ * Runtime init/reset remains the dependency's responsibility. */
+int lc_lonejson_prepare_parse_destination(lonejson *runtime,
+                                          const lonejson_map *map, void *value,
+                                          lc_error *error);
 lonejson_status lc_lonejson_parse_cstr_value(lonejson *runtime,
                                              const lonejson_map *map, void *dst,
                                              const char *json,

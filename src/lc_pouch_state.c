@@ -8074,14 +8074,14 @@ static int lc_pouch_state_decode_record(
 
 static int lc_pouch_state_read_next_record(
     FILE *fp, const lc_allocator *allocator, const char *container_leaf,
-    int allow_truncated_tail, int verify_payload, uint64_t file_size,
-    lc_pouch_state_entry *entry, int *found, int *truncated_tail,
-    lc_error *error) {
+    int allow_truncated_tail, int verify_payload, unsigned char **scratch,
+    uint64_t file_size, lc_pouch_state_entry *entry, int *found,
+    int *truncated_tail, lc_error *error) {
   lc_pouch_record_header header;
   unsigned char encoded[LC_POUCH_STATE_RECORD_HEADER_BYTES];
   unsigned char *key;
   unsigned char *meta;
-  unsigned char payload_buffer[16384];
+  unsigned char *payload_buffer;
   uint64_t remaining;
   uint64_t payload_offset;
   uint64_t payload_length;
@@ -8218,18 +8218,27 @@ static int lc_pouch_state_read_next_record(
                         "pouch");
   }
   if (verify_payload) {
+    if (scratch == NULL ||
+        (*scratch == NULL &&
+         (*scratch = lc_alloc_with_allocator(allocator, 16384U)) == NULL)) {
+      lc_free_with_allocator(allocator, key);
+      lc_free_with_allocator(allocator, meta);
+      return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                          "failed to allocate state verification scratch", NULL,
+                          NULL, "pouch");
+    }
+    payload_buffer = *scratch;
     crc = (unsigned long)crc32(0L, Z_NULL, 0);
     remaining = header.payload_len;
     while (remaining > 0U) {
       size_t want;
 
-      want = remaining > sizeof(payload_buffer) ? sizeof(payload_buffer)
-                                                : (size_t)remaining;
+      want = remaining > 16384U ? 16384U : (size_t)remaining;
       got = fread(payload_buffer, 1U, want, fp);
       if (got != want) {
         lc_free_with_allocator(allocator, key);
         lc_free_with_allocator(allocator, meta);
-        OPENSSL_cleanse(payload_buffer, sizeof(payload_buffer));
+        OPENSSL_cleanse(payload_buffer, 16384U);
         return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                             "pouch state segment payload is truncated", NULL,
                             NULL, "pouch");
@@ -8237,7 +8246,7 @@ static int lc_pouch_state_read_next_record(
       crc = (unsigned long)crc32((uLong)crc, payload_buffer, (uInt)got);
       remaining -= (uint64_t)got;
     }
-    OPENSSL_cleanse(payload_buffer, sizeof(payload_buffer));
+    OPENSSL_cleanse(payload_buffer, 16384U);
     if (crc != header.payload_crc) {
       lc_free_with_allocator(allocator, key);
       lc_free_with_allocator(allocator, meta);
@@ -8353,7 +8362,7 @@ lc_pouch_state_scan_file(lc_pouch *pouch, const char *segment_path,
     found = 0;
     truncated_tail = 0;
     rc = lc_pouch_state_read_next_record(
-        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0,
+        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0, NULL,
         file_size, &entry, &found, &truncated_tail, error);
     if (rc != LC_OK) {
       break;
@@ -8858,7 +8867,7 @@ static int lc_pouch_state_collect_decisions_file(
     found = 0;
     truncated_tail = 0;
     rc = lc_pouch_state_read_next_record(
-        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0,
+        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0, NULL,
         file_size, &entry, &found, &truncated_tail, error);
     if (rc != LC_OK) {
       break;
@@ -8982,7 +8991,7 @@ static int lc_pouch_state_cache_replay_file(
     found = 0;
     truncated_tail = 0;
     rc = lc_pouch_state_read_next_record(
-        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0,
+        fp, &pouch->allocator, container_leaf, allow_truncated_tail, 0, NULL,
         file_size, &entry, &found, &truncated_tail, error);
     if (rc != LC_OK) {
       break;
@@ -19266,8 +19275,8 @@ int lc_pouch_collection_recode_record(lc_pouch_recode *work,
     goto done;
   }
   rc = lc_pouch_state_read_next_record(fp, &work->pouch->allocator, file->leaf,
-                                       0, 1, limit, &entry, &found, &truncated,
-                                       error);
+                                       0, 1, &work->state_scratch, limit,
+                                       &entry, &found, &truncated, error);
   if (rc != LC_OK)
     goto done;
   if (!found || truncated) {
@@ -19450,9 +19459,9 @@ int lc_pouch_state_recode_file(lc_pouch_recode *work,
   limit = rc == LC_OK ? (lc_u64)st.st_size : 0;
   while (rc == LC_OK) {
     before = (lc_u64)ftello(fp);
-    rc = lc_pouch_state_read_next_record(fp, &work->pouch->allocator,
-                                         file->leaf, file->active, 1, limit,
-                                         &entry, &found, &truncated, error);
+    rc = lc_pouch_state_read_next_record(
+        fp, &work->pouch->allocator, file->leaf, file->active, 1,
+        &work->state_scratch, limit, &entry, &found, &truncated, error);
     if (rc == LC_OK && !found && truncated && before < limit) {
       /* Preserve a checkpoint at the committed end before an incomplete
        * unpublished suffix, as well as the physical EOF boundary. */
@@ -19554,7 +19563,7 @@ int lc_pouch_state_recode_refs(lc_pouch_recode *work,
   while (rc == LC_OK) {
     start = (lc_u64)ftello(fp);
     rc = lc_pouch_state_read_next_record(fp, &work->pouch->allocator,
-                                         file->leaf, 0, 0, limit, &entry,
+                                         file->leaf, 0, 0, NULL, limit, &entry,
                                          &found, &truncated, error);
     if (rc != LC_OK || !found)
       break;
@@ -19574,7 +19583,7 @@ int lc_pouch_state_recode_refs(lc_pouch_recode *work,
       }
       if (rc == LC_OK)
         rc = lc_pouch_state_read_next_record(
-            body_fp, &work->pouch->allocator, owner->leaf, 0, 0,
+            body_fp, &work->pouch->allocator, owner->leaf, 0, 0, NULL,
             (lc_u64)st.st_size, &body, &found, &truncated, error);
       if (body_fp) {
         (void)fclose(body_fp);

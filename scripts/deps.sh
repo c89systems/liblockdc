@@ -22,7 +22,7 @@ unset LD_LIBRARY_PATH
 dry_run=${LOCKDC_DEPS_DRY_RUN:-0}
 download_timeout=${LOCKDC_DEPENDENCY_DOWNLOAD_TIMEOUT:-300}
 local_download_root=${LOCKDC_DOWNLOAD_ROOT:-$repo_root/.cache/downloads}
-lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-27}
+lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-28}
 liblql_abi_version=${LOCKDC_LIBLQL_ABI_VERSION:-0}
 
 # shellcheck source=assert_generated_path.sh
@@ -174,26 +174,26 @@ pslog_version=$(resolve_cmake_cache_string LOCKDC_PSLOG_VERSION "${LOCKDC_PSLOG_
 cpkt_asset_name="cpkt-$cpkt_version-${preset#deps-}.tar.gz"
 cpkt_download_url="https://github.com/c89systems/cpkt/releases/download/v$cpkt_version/$cpkt_asset_name"
 case "$cpkt_asset_name" in
-  cpkt-0.6.1-x86_64-linux-gnu.tar.gz)
-    cpkt_asset_hash=99625b7889f78b6e467d38e7dbec08d9d0ed6f599ff4571244060ce67c6ca62f
+  cpkt-0.7.0-x86_64-linux-gnu.tar.gz)
+    cpkt_asset_hash=e898960071bc5f30a00f5308d559b60c7495fce442f9d9e1fce54d112a959d84
     ;;
-  cpkt-0.6.1-x86_64-linux-musl.tar.gz)
-    cpkt_asset_hash=f4b1b0b2b257d2347be7d2b437dbb84891c19e39067bba24464b415dd76eb67e
+  cpkt-0.7.0-x86_64-linux-musl.tar.gz)
+    cpkt_asset_hash=8c5de2f414c1c99147e22d9651de600b047299c7d547c53830c3c8fe15d34dbc
     ;;
-  cpkt-0.6.1-aarch64-linux-gnu.tar.gz)
-    cpkt_asset_hash=3c5f172a50b7df7e37e99dbf52014d3b09114cbc143339f1109c23715fa117a1
+  cpkt-0.7.0-aarch64-linux-gnu.tar.gz)
+    cpkt_asset_hash=0ba48a8ca621ec9a1045bb2081ec440970695bfcc34aa75683dec8bdaff64e1c
     ;;
-  cpkt-0.6.1-aarch64-linux-musl.tar.gz)
-    cpkt_asset_hash=bf39981f557b1ed10940ee376bb81d0fa734d3d290e5d95cbc4f786ac466cb93
+  cpkt-0.7.0-aarch64-linux-musl.tar.gz)
+    cpkt_asset_hash=7146f274e3fbff74b7e1e4c3b3b8276c1c62843f2517f1940a65a17683a17230
     ;;
-  cpkt-0.6.1-armhf-linux-gnu.tar.gz)
-    cpkt_asset_hash=c2200e3a4a05ed8807d0bb19b0042179bd47c7ce83174932f521d36aee11b935
+  cpkt-0.7.0-armhf-linux-gnu.tar.gz)
+    cpkt_asset_hash=8eb105e3d19328619c8274a64dcfe39df8d00861d0d31ca3dd3b692f21b25734
     ;;
-  cpkt-0.6.1-armhf-linux-musl.tar.gz)
-    cpkt_asset_hash=eb1ed255f3ea60c82c3973f1246571872b4f0fd7866364e544b5627e5cd3ee98
+  cpkt-0.7.0-armhf-linux-musl.tar.gz)
+    cpkt_asset_hash=7dbdeaa6b4c8180e14fbd3cc9388c81b88015a306ae268cc12468eb775969f15
     ;;
-  cpkt-0.6.1-arm64-apple-darwin.tar.gz)
-    cpkt_asset_hash=8f32fe4a9e477196d75a927af329dafcc91eda5e4b505012a7319edcf92e8579
+  cpkt-0.7.0-arm64-apple-darwin.tar.gz)
+    cpkt_asset_hash=b1c0d9eee975a1e30f7395db0bcc42fddcca45cbae6919a2d49b4e42ebbb88d3
     ;;
   *)
     printf 'unsupported cpkt release asset: %s\n' "$cpkt_asset_name" >&2
@@ -206,26 +206,26 @@ if [ "$build_postgres" = ON ]; then
   cpktdb_asset_name="cpktdb-$cpktdb_version-${preset#deps-}.tar.gz"
   cpktdb_download_url="https://github.com/c89systems/cpktdb/releases/download/v$cpktdb_version/$cpktdb_asset_name"
   case "$cpktdb_asset_name" in
-    cpktdb-0.3.1-x86_64-linux-gnu.tar.gz)
-      cpktdb_asset_hash=e18d96e0c7cc5456ec963a068075a2e3dc25966e81d11cb9beea6faf11273f3a
+    cpktdb-0.4.0-x86_64-linux-gnu.tar.gz)
+      cpktdb_asset_hash=43bd8e77334c49f07bcf558083fb0ec07fdf55532c92fde6bd536184ec04e327
       ;;
-    cpktdb-0.3.1-x86_64-linux-musl.tar.gz)
-      cpktdb_asset_hash=d2299b9cd5c66037c68875ae4bf0b77ef89c22fb6f3372d9c08ff7f9d988fa90
+    cpktdb-0.4.0-x86_64-linux-musl.tar.gz)
+      cpktdb_asset_hash=3db21f9f88c3d700f0cba3ecaaa939aa43e070a8c3ece9bdeae102c96bb046f8
       ;;
-    cpktdb-0.3.1-aarch64-linux-gnu.tar.gz)
-      cpktdb_asset_hash=08614da32caca445c3813c60a6e0ea81dad54467b8539adb213e61fefbea2db3
+    cpktdb-0.4.0-aarch64-linux-gnu.tar.gz)
+      cpktdb_asset_hash=e826a183d1815d634af8407de6b531b6b1f9990f98e36ae03b7fe62fc9e1c7c4
       ;;
-    cpktdb-0.3.1-aarch64-linux-musl.tar.gz)
-      cpktdb_asset_hash=d027eb9f77e37c84c835172a535a2fabbd01e59124a88237ab7fbc85f045dc61
+    cpktdb-0.4.0-aarch64-linux-musl.tar.gz)
+      cpktdb_asset_hash=ea6b637afd287539edf5e3ffa7fe8b668ada96ce50a9fd16ce3b435538c01557
       ;;
-    cpktdb-0.3.1-armhf-linux-gnu.tar.gz)
-      cpktdb_asset_hash=5215fffc8009019f748a60d51fc5e85f9f476c2c9b55a55ee444ec1bf43c0b51
+    cpktdb-0.4.0-armhf-linux-gnu.tar.gz)
+      cpktdb_asset_hash=69008b4322869335eff0a6835fa8313c465bc1aa5556c83c39216b8e1833c2a9
       ;;
-    cpktdb-0.3.1-armhf-linux-musl.tar.gz)
-      cpktdb_asset_hash=33e47b891988f638433fcc65eb79e621999396eba902d9927eb26eb851dd8c6c
+    cpktdb-0.4.0-armhf-linux-musl.tar.gz)
+      cpktdb_asset_hash=fda1f9d1cf1657fbd3b6af07776920b2d5b380c1b9b1237588f4d6396baf3956
       ;;
-    cpktdb-0.3.1-arm64-apple-darwin.tar.gz)
-      cpktdb_asset_hash=f6483a79d768eb09e3258b404b6e5ced84f5b5b5e3c4be6500834f79957be919
+    cpktdb-0.4.0-arm64-apple-darwin.tar.gz)
+      cpktdb_asset_hash=a29d1123e7c3ca79ebc20c01da0313ba0aeadd5dbe79620bd3a2c497df9b3511
       ;;
     *)
       printf 'unsupported cpktdb release asset: %s\n' "$cpktdb_asset_name" >&2
@@ -237,26 +237,26 @@ fi
 lonejson_asset_name="liblonejson-$lonejson_version-${preset#deps-}.tar.gz"
 lonejson_download_url="https://github.com/c89systems/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
 case "$lonejson_asset_name" in
-  liblonejson-0.47.0-x86_64-linux-gnu.tar.gz)
-    lonejson_asset_hash=a2dbc1db962f8dcdf8398435043a85031c4f195d7e3d4ec9ee27b985a2f7c353
+  liblonejson-0.48.0-x86_64-linux-gnu.tar.gz)
+    lonejson_asset_hash=9332421c5ba884605b088d14a4edc5cc318c2bf9e0d80744c10c7971eb7c0481
     ;;
-  liblonejson-0.47.0-x86_64-linux-musl.tar.gz)
-    lonejson_asset_hash=4f91b5d601f7264487ff6f3b103d15d8a954a94eb79cf515aea2dd16971b9784
+  liblonejson-0.48.0-x86_64-linux-musl.tar.gz)
+    lonejson_asset_hash=731fcd090091269e92e60edfe15a7190a85c90b716f5bc53435902d475cc813d
     ;;
-  liblonejson-0.47.0-aarch64-linux-gnu.tar.gz)
-    lonejson_asset_hash=d6d6c98ec9e86a7f57bbf1f748976048bb8f99a069eb3ffed7e0f16e3223eae7
+  liblonejson-0.48.0-aarch64-linux-gnu.tar.gz)
+    lonejson_asset_hash=2f523a0296dd757f5f517e98311a210bb90a1beac7e067d2b6ee9c7c223ddd02
     ;;
-  liblonejson-0.47.0-aarch64-linux-musl.tar.gz)
-    lonejson_asset_hash=dc6ec6c4e694ede21f54a0b7fb8197df122f5b052441b9c4862dde10842d13ef
+  liblonejson-0.48.0-aarch64-linux-musl.tar.gz)
+    lonejson_asset_hash=cf04c1c98882281bd7f5349c568cc4eb60267d8f7f940e616341b4c12a87ccd3
     ;;
-  liblonejson-0.47.0-armhf-linux-gnu.tar.gz)
-    lonejson_asset_hash=90bd654dda6461be943ebb9e198d43af489b2501502f02a421589968d78d7eaf
+  liblonejson-0.48.0-armhf-linux-gnu.tar.gz)
+    lonejson_asset_hash=e21cdac358af4bb20c53b37980c46c931d0706b3bea182a22344c6a27699c5d0
     ;;
-  liblonejson-0.47.0-armhf-linux-musl.tar.gz)
-    lonejson_asset_hash=fb4ac6dfaff38cdc229feb074e594b4eb1b5e30a5448906e0c91cf31d9d8924c
+  liblonejson-0.48.0-armhf-linux-musl.tar.gz)
+    lonejson_asset_hash=189583ebfe77e4ac5c49a647315a5c40bba0f83d262d43717cee9f14f0a273cf
     ;;
-  liblonejson-0.47.0-arm64-apple-darwin.tar.gz)
-    lonejson_asset_hash=35d4fa113896fbcc3f8d5095a3e859fecf6b14423460541b8326aa32d9dcaeb8
+  liblonejson-0.48.0-arm64-apple-darwin.tar.gz)
+    lonejson_asset_hash=0a2afe2715c8e78cffaa3e8486c569142ffc46406b45b0456b5637dba754d325
     ;;
   *)
     printf 'unsupported lonejson release asset: %s\n' "$lonejson_asset_name" >&2

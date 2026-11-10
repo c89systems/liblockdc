@@ -1,3 +1,9 @@
+#ifdef LOCKDC_TEST_SMALL_STACK
+/* Keep the initializer in a required archive member, so independently built
+ * Debug SDK consumers inherit the same test-only worker-stack policy. */
+#include "../tests/support/lc_test_stack.c"
+#endif
+
 #include "lc/lc.h"
 #include "lc_allocation_tracking.h"
 #include "lc_engine_api.h"

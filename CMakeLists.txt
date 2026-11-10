@@ -84,14 +84,14 @@ set(LOCKDC_ZLIB_VERSION "1.3.2" CACHE STRING "Pinned zlib release supplied by cp
 set(LOCKDC_CURL_VERSION "8.22.0" CACHE STRING "Pinned curl release supplied by cpkt.")
 set(LOCKDC_NGHTTP2_VERSION "1.70.0" CACHE STRING "Pinned nghttp2 release supplied by cpkt.")
 set(LOCKDC_LIBSSH2_VERSION "1.11.1" CACHE STRING "Pinned libssh2 release supplied by cpkt.")
-set(LOCKDC_LONEJSON_VERSION "0.47.0" CACHE STRING "Pinned lonejson release used for mapped JSON load/save and internal JSON parsing helpers." FORCE)
-set(LOCKDC_LONEJSON_ABI_VERSION "27" CACHE STRING "Pinned lonejson shared-library ABI/SOVERSION." FORCE)
+set(LOCKDC_LONEJSON_VERSION "0.48.0" CACHE STRING "Pinned lonejson release used for mapped JSON load/save and internal JSON parsing helpers." FORCE)
+set(LOCKDC_LONEJSON_ABI_VERSION "28" CACHE STRING "Pinned lonejson shared-library ABI/SOVERSION." FORCE)
 set(LOCKDC_LIBLQL_VERSION "0.4.1" CACHE STRING "Pinned liblql release used for pouch LQL query support." FORCE)
 set(LOCKDC_LIBLQL_ABI_VERSION "0" CACHE STRING "Pinned liblql shared-library ABI/SOVERSION." FORCE)
 set(LOCKDC_CMOCKA_VERSION "2.0.2" CACHE STRING "Pinned cmocka release used for unit tests.")
 set(LOCKDC_PSLOG_VERSION "0.13.0" CACHE STRING "Pinned libpslog release used for SDK logging." FORCE)
-set(LOCKDC_CPKT_VERSION "0.6.1" CACHE STRING "Pinned cpkt dependency bundle version." FORCE)
-set(LOCKDC_CPKTDB_VERSION "0.3.1" CACHE STRING "Pinned cpktdb database bundle version." FORCE)
+set(LOCKDC_CPKT_VERSION "0.7.0" CACHE STRING "Pinned cpkt dependency bundle version." FORCE)
+set(LOCKDC_CPKTDB_VERSION "0.4.0" CACHE STRING "Pinned cpktdb database bundle version." FORCE)
 set(LOCKDC_MIN_ABI_VERSION "9")
 set(LOCKDC_ABI_VERSION "${LOCKDC_MIN_ABI_VERSION}" CACHE STRING "Shared-library ABI/SOVERSION for liblockdc.")
 if(LOCKDC_ABI_VERSION MATCHES "^[0-9]+$" AND LOCKDC_ABI_VERSION LESS LOCKDC_MIN_ABI_VERSION)
@@ -198,6 +198,23 @@ if(LOCKDC_BUILD_DEPENDENCIES)
 endif()
 
 set(LOCKDC_C_TEST_ENVIRONMENT "")
+set(LOCKDC_TEST_SMALL_STACK OFF)
+if(LOCKDC_BUILD_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Debug" AND
+   CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LOCKDC_TARGET_LIBC STREQUAL "gnu")
+    set(LOCKDC_TEST_SMALL_STACK ON)
+    # CTest owns this environment. Build tools do not link the test initializer;
+    # tested children inherit the policy through their Debug SDK or runner.
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/CTestCustom.cmake" [=[
+set(ENV{LOCKDC_TEST_STACK_BYTES} "131072")
+if("$ENV{GLIBC_TUNABLES}" STREQUAL "")
+  set(ENV{GLIBC_TUNABLES} "glibc.pthread.stack_cache_size=0")
+else()
+  set(ENV{GLIBC_TUNABLES} "$ENV{GLIBC_TUNABLES}:glibc.pthread.stack_cache_size=0")
+endif()
+]=])
+else()
+    file(REMOVE "${CMAKE_CURRENT_BINARY_DIR}/CTestCustom.cmake")
+endif()
 if(CMAKE_CROSSCOMPILING)
     list(APPEND LOCKDC_C_TEST_ENVIRONMENT "LOCKDC_SLOW_TEST_RUNTIME=1")
 endif()
@@ -266,6 +283,11 @@ function(lc_configure_development_runtime target)
     get_target_property(target_type ${target} TYPE)
     if(NOT target_type STREQUAL "EXECUTABLE")
         return()
+    endif()
+    get_target_property(stack_from_sdk ${target} LOCKDC_TEST_STACK_FROM_SDK)
+    if(LOCKDC_TEST_SMALL_STACK AND NOT stack_from_sdk)
+        target_sources(${target} PRIVATE
+            "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/lc_test_stack.c")
     endif()
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSROOT)
         return()
@@ -410,6 +432,8 @@ function(lc_configure_c_target target)
             -Wall
             -Wextra
             -Wpedantic
+            -Wvla
+            -Walloca
             -pedantic-errors
             -Werror
         )
@@ -432,6 +456,8 @@ function(lc_configure_c_test_target target)
             -Wall
             -Wextra
             -Wpedantic
+            -Wvla
+            -Walloca
             -Wno-missing-field-initializers
             -Wno-unused-function
             -Werror
@@ -649,6 +675,9 @@ if(LOCKDC_LIBLQL_INCLUDE_DIR STREQUAL "")
 endif()
 
 function(lc_configure_library_target target)
+    if(LOCKDC_TEST_SMALL_STACK)
+        target_compile_definitions(${target} PRIVATE LOCKDC_TEST_SMALL_STACK=1)
+    endif()
     if(target STREQUAL "lc_static" OR target STREQUAL "lc_shared")
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:lc_objects>)
     else()

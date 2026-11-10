@@ -13,21 +13,23 @@ The Lua binding is distributed as a LuaRocks package that links against an
 already-built `liblockdc` SDK installation.
 
 - the Lua rock builds only the Lua extension module
-- the C SDK and bundled native dependencies come from the installed
-  `liblockdc` release
+- the C SDK comes from the matching `liblockdc` release; its public native
+  dependencies come from their separately installed SDKs
 - the required `liblockdc` version is an exact match for the Lua rock version
 - supported runtime architectures are the same ones shipped by the `liblockdc`
   binary SDK bundle
 
 Normal LuaRocks installs are expected to be a two-step flow:
 
-1. install or unpack the matching `liblockdc` SDK release for the target host
+1. install or unpack the matching `liblockdc` SDK and its required dependency
+   SDKs for the target host; expose their pkg-config metadata
 2. install the `lockdc` Lua rock against that SDK
 
 The rock build checks the installed `liblockdc` version and fails early if it is
 missing or does not match. Normal LuaRocks installs also require a shared
-`liblockdc` SDK; static-only SDK bundles are reserved for `vectis` or other
-in-tree embedded-Lua builds.
+`liblockdc` SDK. Fully static applications compile and preload the bindings
+instead; see [PostgreSQL embedding](#optional-postgresql-participation) for the
+optional provider's registration bridge.
 
 The failure message points at the matching GitHub release tarball URL for the
 current rock version and tells the user to set `LOCKDC_PREFIX` to the extracted
@@ -41,7 +43,7 @@ described below.
 The generated rockspec expects:
 
 - package `lockdc`
-- `lonejson == 0.47.0-1`
+- `lonejson == 0.48.0-1`
 - Lua `>= 5.5, < 5.6`
 
 The lifecycle executes and packages only Lua 5.5. Each release includes the
@@ -77,17 +79,29 @@ The LuaRocks path export supplies the installed `lonejson` module as well as
 interpreter: prefix-selected `lockdc` modules carry their SDK runtime path and
 the lifecycle checks them through the Bootlin runner.
 
-The C SDK is pinned to the matching `lonejson 0.47.0` native dependency for
+The C SDK is pinned to the matching `lonejson 0.48.0` native dependency for
 mapped state load/save and internal typed JSON parsing. The Lua rock declares
 the corresponding Lua-facing `lonejson` rock so Lua JSON behavior and the C
 SDK JSON boundary stay in the same release line.
 
-Lonejson 0.47.0 uses native ABI **27**, replacing ABI 26. When upgrading from
-liblockdc 0.28.x, rebuild the Lua native modules against the new SDK and install
+Lonejson 0.48.0 uses native ABI **28**, replacing ABI 27. When upgrading from
+liblockdc 0.29.x, rebuild the Lua native modules against the new SDK and install
 the matching lonejson rock; do not mix its previous receiver headers or native
-modules with ABI 27 libraries. Liblockdc's own core ABI remains **9**.
+modules with ABI 28 libraries. Liblockdc's own core ABI remains **9**.
 
 ## Dependency ownership
+
+The pinned cpkt 0.7.0 Lua 5.5.1 runtime checks native recursion against each
+OS thread's stack bounds. Excessive native re-entry raises a Lua error that
+protected calls can catch, allowing reuse of the VM afterward. Trusted native
+callbacks must still bound their own stack consumption; the guard does not
+intercept arbitrary C recursion or large C stack allocations.
+
+The runtime supports serialized VM/coroutine migration between workers; never
+access one Lua state concurrently. This does not relax native resource rules:
+PostgreSQL resources and connection borrows retain their owning-thread checks.
+The `lua_worker_stack_*_test` checks cover recovery and liblockdc calls on
+default workers, including the 128 KiB glibc Debug policy and native musl.
 
 `liblockdc` owns the Lua dependency boundary for the APIs it exposes.
 
@@ -1248,8 +1262,7 @@ The [`lc_lua_postgres_register`](../src/lua/lockdc_postgres_lua.h) C helper also
 remains available. This capability is absent from the base core module; requiring
 the optional module is explicit Lua module loading, not core plugin discovery.
 Provider callbacks and query adapters must remain linked for all retained tokens.
-Its
-configuration is `{resource_id=stable_id, connection_info=connection_string}`;
+Its configuration is `{resource_id=stable_id, connection_info=connection_string}`;
 the helper copies both strings and does not log connection configuration.
 An embedding can replace the default registry name by supplying another name.
 

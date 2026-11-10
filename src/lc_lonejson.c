@@ -199,7 +199,7 @@ void lc_lonejson_cleanup_value(lonejson *runtime, const lonejson_map *map,
   if (runtime == NULL || map == NULL || value == NULL) {
     return;
   }
-  runtime->cleanup(runtime, map, value);
+  runtime->cleanup(runtime, map, value, NULL);
 }
 
 void lc_engine_lonejson_cleanup(lc_engine_client *client,
@@ -207,301 +207,181 @@ void lc_engine_lonejson_cleanup(lc_engine_client *client,
   lc_lonejson_cleanup_value(lc_engine_lonejson_runtime(client), map, value);
 }
 
-static int lc_lonejson_has_configured_json_value(const lonejson_map *map,
-                                                 const void *value) {
-  const unsigned char *base;
+typedef struct lc_lonejson_map_frame {
+  const lonejson_map *map;
+  unsigned char *value;
   size_t index;
+} lc_lonejson_map_frame;
 
-  if (map == NULL || value == NULL) {
+typedef struct lc_lonejson_parse_config {
+  lonejson_json_value *value;
+  lonejson_json_value_parse_mode mode;
+  lonejson_sink_fn sink;
+  void *sink_user;
+  const lonejson_value_visitor *visitor;
+  void *visitor_user;
+} lc_lonejson_parse_config;
+
+static int lc_lonejson_field_initialized(const lonejson_field *field,
+                                         const void *value) {
+  switch (field->kind) {
+  case LONEJSON_FIELD_KIND_STRING:
+    return field->storage == LONEJSON_STORAGE_DYNAMIC &&
+           *(char *const *)value != NULL;
+  case LONEJSON_FIELD_KIND_STRING_STREAM:
+  case LONEJSON_FIELD_KIND_BASE64_STREAM:
+    return ((const lonejson_spooled *)value)->cleanup != NULL;
+  case LONEJSON_FIELD_KIND_STRING_SOURCE:
+  case LONEJSON_FIELD_KIND_BASE64_SOURCE:
+    return ((const lonejson_source *)value)->cleanup != NULL;
+  case LONEJSON_FIELD_KIND_JSON_VALUE:
+    return ((const lonejson_json_value *)value)->methods != NULL;
+  case LONEJSON_FIELD_KIND_STRING_ARRAY:
+    return ((const lonejson_string_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_I64_ARRAY:
+    return ((const lonejson_i64_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_U64_ARRAY:
+    return ((const lonejson_u64_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_F64_ARRAY:
+    return ((const lonejson_f64_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_BOOL_ARRAY:
+    return ((const lonejson_bool_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_OBJECT_ARRAY:
+    return ((const lonejson_object_array *)value)->items != NULL;
+  case LONEJSON_FIELD_KIND_STRING_ARRAY_STREAM:
+    return ((const lonejson_string_array_stream *)value)->set_handler != NULL;
+  case LONEJSON_FIELD_KIND_MAPPED_ARRAY_STREAM:
+    return ((const lonejson_mapped_array_stream *)value)->set_handler != NULL;
+  default:
     return 0;
   }
-  base = (const unsigned char *)value;
-  for (index = 0U; index < map->field_count; ++index) {
+}
+
+int lc_lonejson_prepare_parse_destination(lonejson *runtime,
+                                          const lonejson_map *map, void *value,
+                                          lc_error *error) {
+  lc_lonejson_map_frame local_frames[8], *frames = local_frames;
+  lc_lonejson_parse_config local_configs[4], *configs = local_configs;
+  size_t depth = 1U, frame_capacity = 8U, count = 0U, config_capacity = 4U;
+  size_t i;
+  int initialized = 0, rc = LC_OK;
+  lonejson_error parse_error;
+  lonejson_status lifecycle_status;
+  if (runtime == NULL || map == NULL || value == NULL)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "mapped destination requires runtime, map, and value",
+                        NULL, NULL, NULL);
+  frames[0].map = map;
+  frames[0].value = value;
+  frames[0].index = 0U;
+  /* One metadata walk preserves capture settings without native recursion.
+   * Ordinary shallow maps use only the small inline work arrays. */
+  while (depth != 0U) {
+    lc_lonejson_map_frame *frame = &frames[depth - 1U];
     const lonejson_field *field;
-    const void *field_value;
-
-    field = &map->fields[index];
-    field_value = base + field->struct_offset;
-    if (field->kind == LONEJSON_FIELD_KIND_JSON_VALUE) {
-      const lonejson_json_value *json_value;
-
-      json_value = (const lonejson_json_value *)field_value;
-      if (json_value->methods != NULL &&
-          json_value->parse_mode != LONEJSON_JSON_VALUE_PARSE_NONE) {
-        return 1;
-      }
-    } else if (field->kind == LONEJSON_FIELD_KIND_OBJECT &&
-               field->submap != NULL &&
-               lc_lonejson_has_configured_json_value(field->submap,
-                                                     field_value)) {
-      return 1;
+    unsigned char *field_value;
+    if (frame->index == frame->map->field_count) {
+      --depth;
+      continue;
     }
-  }
-  return 0;
-}
-
-static int lc_lonejson_has_initialized_destination(const lonejson_map *map,
-                                                   const void *value) {
-  const unsigned char *base;
-  size_t index;
-
-  if (map == NULL || value == NULL) {
-    return 0;
-  }
-  base = (const unsigned char *)value;
-  for (index = 0U; index < map->field_count; ++index) {
-    const lonejson_field *field;
-    const void *field_value;
-
-    field = &map->fields[index];
-    field_value = base + field->struct_offset;
-    switch (field->kind) {
-    case LONEJSON_FIELD_KIND_STRING:
-      if (field->storage == LONEJSON_STORAGE_DYNAMIC &&
-          *(char *const *)field_value != NULL) {
-        return 1;
+    field = &frame->map->fields[frame->index++];
+    field_value = frame->value + field->struct_offset;
+    if (field->kind == LONEJSON_FIELD_KIND_OBJECT && field->submap != NULL) {
+      if (depth == frame_capacity) {
+        lc_lonejson_map_frame *next;
+        if (frame_capacity > (size_t)-1 / 2U / sizeof(*next)) {
+          rc = LC_ERR_NOMEM;
+          break;
+        }
+        next =
+            lc_alloc_with_allocator(NULL, frame_capacity * 2U * sizeof(*next));
+        if (next == NULL) {
+          rc = LC_ERR_NOMEM;
+          break;
+        }
+        memcpy(next, frames, depth * sizeof(*next));
+        if (frames != local_frames)
+          lc_free_with_allocator(NULL, frames);
+        frames = next;
+        frame_capacity *= 2U;
       }
-      break;
-    case LONEJSON_FIELD_KIND_STRING_STREAM:
-    case LONEJSON_FIELD_KIND_BASE64_STREAM:
-      if (((const lonejson_spooled *)field_value)->cleanup != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_STRING_SOURCE:
-    case LONEJSON_FIELD_KIND_BASE64_SOURCE:
-      if (((const lonejson_source *)field_value)->cleanup != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_JSON_VALUE:
-      if (((const lonejson_json_value *)field_value)->methods != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_OBJECT:
-      if (field->submap != NULL &&
-          lc_lonejson_has_initialized_destination(field->submap, field_value)) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_STRING_ARRAY:
-      if (((const lonejson_string_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_I64_ARRAY:
-      if (((const lonejson_i64_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_U64_ARRAY:
-      if (((const lonejson_u64_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_F64_ARRAY:
-      if (((const lonejson_f64_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_BOOL_ARRAY:
-      if (((const lonejson_bool_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_OBJECT_ARRAY:
-      if (((const lonejson_object_array *)field_value)->items != NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_STRING_ARRAY_STREAM:
-      if (((const lonejson_string_array_stream *)field_value)->set_handler !=
-          NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_MAPPED_ARRAY_STREAM:
-      if (((const lonejson_mapped_array_stream *)field_value)->set_handler !=
-          NULL) {
-        return 1;
-      }
-      break;
-    case LONEJSON_FIELD_KIND_I64:
-    case LONEJSON_FIELD_KIND_U64:
-    case LONEJSON_FIELD_KIND_F64:
-    case LONEJSON_FIELD_KIND_BOOL:
-    default:
-      break;
+      frames[depth].map = field->submap;
+      frames[depth].value = field_value;
+      frames[depth++].index = 0U;
+      continue;
     }
-  }
-  return 0;
-}
-
-static void lc_lonejson_prepare_parse_storage(lonejson *runtime,
-                                              const lonejson_map *map,
-                                              void *value) {
-  if (lc_lonejson_has_initialized_destination(map, value)) {
-    runtime->reset(runtime, map, value);
-  } else {
-    runtime->init(runtime, map, value);
-  }
-}
-
-typedef struct lc_lonejson_json_value_parse_config {
-  lonejson_json_value_parse_mode parse_mode;
-  lonejson_sink_fn parse_sink;
-  void *parse_sink_user;
-  const lonejson_value_visitor *parse_visitor;
-  void *parse_visitor_user;
-} lc_lonejson_json_value_parse_config;
-
-static size_t lc_lonejson_count_json_value_fields(const lonejson_map *map) {
-  size_t count;
-  size_t index;
-
-  if (map == NULL) {
-    return 0U;
-  }
-  count = 0U;
-  for (index = 0U; index < map->field_count; ++index) {
-    const lonejson_field *field;
-
-    field = &map->fields[index];
+    initialized |= lc_lonejson_field_initialized(field, field_value);
     if (field->kind == LONEJSON_FIELD_KIND_JSON_VALUE) {
-      ++count;
-    } else if (field->kind == LONEJSON_FIELD_KIND_OBJECT &&
-               field->submap != NULL) {
-      count += lc_lonejson_count_json_value_fields(field->submap);
-    }
-  }
-  return count;
-}
-
-static void lc_lonejson_collect_json_value_parse_configs(
-    const lonejson_map *map, const void *value,
-    lc_lonejson_json_value_parse_config *configs, size_t *config_index) {
-  const unsigned char *base;
-  size_t index;
-
-  if (map == NULL || value == NULL || configs == NULL || config_index == NULL) {
-    return;
-  }
-  base = (const unsigned char *)value;
-  for (index = 0U; index < map->field_count; ++index) {
-    const lonejson_field *field;
-    const void *field_value;
-
-    field = &map->fields[index];
-    field_value = base + field->struct_offset;
-    if (field->kind == LONEJSON_FIELD_KIND_JSON_VALUE) {
-      const lonejson_json_value *json_value;
-      lc_lonejson_json_value_parse_config *config;
-
-      json_value = (const lonejson_json_value *)field_value;
-      config = &configs[*config_index];
-      config->parse_mode = json_value->parse_mode;
-      config->parse_sink = json_value->parse_sink;
-      config->parse_sink_user = json_value->parse_sink_user;
-      config->parse_visitor = json_value->parse_visitor;
-      config->parse_visitor_user = json_value->parse_visitor_user;
-      ++(*config_index);
-    } else if (field->kind == LONEJSON_FIELD_KIND_OBJECT &&
-               field->submap != NULL) {
-      lc_lonejson_collect_json_value_parse_configs(field->submap, field_value,
-                                                   configs, config_index);
-    }
-  }
-}
-
-static void lc_lonejson_restore_json_value_parse_configs(
-    const lonejson_map *map, void *value,
-    const lc_lonejson_json_value_parse_config *configs, size_t *config_index) {
-  unsigned char *base;
-  lonejson_error error;
-  size_t index;
-
-  if (map == NULL || value == NULL || configs == NULL || config_index == NULL) {
-    return;
-  }
-  memset(&error, 0, sizeof(error));
-  base = (unsigned char *)value;
-  for (index = 0U; index < map->field_count; ++index) {
-    const lonejson_field *field;
-    void *field_value;
-
-    field = &map->fields[index];
-    field_value = base + field->struct_offset;
-    if (field->kind == LONEJSON_FIELD_KIND_JSON_VALUE) {
-      lonejson_json_value *json_value;
-      const lc_lonejson_json_value_parse_config *config;
-
-      json_value = (lonejson_json_value *)field_value;
-      config = &configs[*config_index];
-      ++(*config_index);
-      if (json_value->methods == NULL) {
+      lonejson_json_value *json = (lonejson_json_value *)field_value;
+      if (json->methods == NULL ||
+          json->parse_mode == LONEJSON_JSON_VALUE_PARSE_NONE)
         continue;
-      }
-      switch (config->parse_mode) {
-      case LONEJSON_JSON_VALUE_PARSE_SINK:
-        if (config->parse_sink != NULL) {
-          (void)json_value->methods->set_parse_sink(
-              json_value, config->parse_sink, config->parse_sink_user, &error);
+      if (count == config_capacity) {
+        lc_lonejson_parse_config *next;
+        if (config_capacity > (size_t)-1 / 2U / sizeof(*next)) {
+          rc = LC_ERR_NOMEM;
+          break;
         }
-        break;
-      case LONEJSON_JSON_VALUE_PARSE_VISITOR:
-        if (config->parse_visitor != NULL) {
-          (void)json_value->methods->set_parse_visitor(
-              json_value, config->parse_visitor, config->parse_visitor_user,
-              &error);
+        next =
+            lc_alloc_with_allocator(NULL, config_capacity * 2U * sizeof(*next));
+        if (next == NULL) {
+          rc = LC_ERR_NOMEM;
+          break;
         }
-        break;
-      case LONEJSON_JSON_VALUE_PARSE_CAPTURE:
-        (void)json_value->methods->enable_parse_capture(json_value, &error);
-        break;
-      case LONEJSON_JSON_VALUE_PARSE_NONE:
-      default:
-        break;
+        memcpy(next, configs, count * sizeof(*next));
+        if (configs != local_configs)
+          lc_free_with_allocator(NULL, configs);
+        configs = next;
+        config_capacity *= 2U;
       }
-    } else if (field->kind == LONEJSON_FIELD_KIND_OBJECT &&
-               field->submap != NULL) {
-      lc_lonejson_restore_json_value_parse_configs(field->submap, field_value,
-                                                   configs, config_index);
+      configs[count].value = json;
+      configs[count].mode = json->parse_mode;
+      configs[count].sink = json->parse_sink;
+      configs[count].sink_user = json->parse_sink_user;
+      configs[count].visitor = json->parse_visitor;
+      configs[count++].visitor_user = json->parse_visitor_user;
     }
   }
-}
-
-void lc_lonejson_prepare_parse_destination(lonejson *runtime,
-                                           const lonejson_map *map,
-                                           void *value) {
-  lc_lonejson_json_value_parse_config *configs;
-  size_t config_count;
-  size_t config_index;
-
-  if (runtime == NULL || map == NULL || value == NULL) {
-    return;
+  if (rc == LC_OK) {
+    lonejson_error_init(&parse_error);
+    if (initialized)
+      lifecycle_status = runtime->reset(runtime, map, value, &parse_error);
+    else
+      lifecycle_status = runtime->init(runtime, map, value, &parse_error);
+    rc = lc_lonejson_error_from_status(error, lifecycle_status, &parse_error,
+                                       "failed to prepare mapped destination");
+    for (i = 0U; i < count && rc == LC_OK; ++i) {
+      lc_lonejson_parse_config *config = &configs[i];
+      lonejson_json_value *json = config->value;
+      lonejson_status status = LONEJSON_STATUS_OK;
+      if (json->methods == NULL)
+        continue;
+      lonejson_error_init(&parse_error);
+      if (config->mode == LONEJSON_JSON_VALUE_PARSE_SINK &&
+          config->sink != NULL)
+        status = json->methods->set_parse_sink(json, config->sink,
+                                               config->sink_user, &parse_error);
+      else if (config->mode == LONEJSON_JSON_VALUE_PARSE_VISITOR &&
+               config->visitor != NULL)
+        status = json->methods->set_parse_visitor(
+            json, config->visitor, config->visitor_user, &parse_error);
+      else if (config->mode == LONEJSON_JSON_VALUE_PARSE_CAPTURE)
+        status = json->methods->enable_parse_capture(json, &parse_error);
+      if (status != LONEJSON_STATUS_OK)
+        rc = lc_lonejson_error_from_status(
+            error, status, &parse_error,
+            "failed to restore mapped capture settings");
+    }
+  } else {
+    rc = lc_error_set(error, rc, 0L,
+                      "failed to allocate mapped destination traversal", NULL,
+                      NULL, NULL);
   }
-  if (!lc_lonejson_has_configured_json_value(map, value)) {
-    lc_lonejson_prepare_parse_storage(runtime, map, value);
-    return;
-  }
-  config_count = lc_lonejson_count_json_value_fields(map);
-  configs = NULL;
-  if (config_count > 0U) {
-    configs = calloc(config_count, sizeof(*configs));
-  }
-  if (configs != NULL) {
-    config_index = 0U;
-    lc_lonejson_collect_json_value_parse_configs(map, value, configs,
-                                                 &config_index);
-  }
-  lc_lonejson_prepare_parse_storage(runtime, map, value);
-  if (configs != NULL) {
-    config_index = 0U;
-    lc_lonejson_restore_json_value_parse_configs(map, value, configs,
-                                                 &config_index);
-    free(configs);
-  }
+  if (frames != local_frames)
+    lc_free_with_allocator(NULL, frames);
+  if (configs != local_configs)
+    lc_free_with_allocator(NULL, configs);
+  return rc;
 }
 
 #ifdef LONEJSON_WITH_CURL
@@ -522,13 +402,16 @@ lonejson_status lc_lonejson_parse_cstr_value(lonejson *runtime,
                                              const lonejson_map *map, void *dst,
                                              const char *json,
                                              lonejson_error *error) {
+  lonejson_status status;
   if (runtime == NULL || map == NULL || dst == NULL || json == NULL) {
     if (error != NULL) {
       error->code = LONEJSON_STATUS_INVALID_ARGUMENT;
     }
     return LONEJSON_STATUS_INVALID_ARGUMENT;
   }
-  runtime->init(runtime, map, dst);
+  status = runtime->init(runtime, map, dst, error);
+  if (status != LONEJSON_STATUS_OK)
+    return status;
   return runtime->parse_cstr(runtime, map, dst, json, error);
 }
 
@@ -587,6 +470,7 @@ int lc_engine_lonejson_error_from_status(lc_engine_error *error,
 
 int lc_lonejson_parse_file(lonejson *runtime, FILE *fp, const lonejson_map *map,
                            void *dst, lc_error *error, const char *message) {
+  int rc;
   if (runtime == NULL || fp == NULL || map == NULL || dst == NULL) {
     return lc_error_set(
         error, LC_ERR_INVALID, 0L,
@@ -595,7 +479,9 @@ int lc_lonejson_parse_file(lonejson *runtime, FILE *fp, const lonejson_map *map,
             : "lonejson parse requires runtime, file, map, and destination",
         NULL, NULL, NULL);
   }
-  lc_lonejson_prepare_parse_destination(runtime, map, dst);
+  rc = lc_lonejson_prepare_parse_destination(runtime, map, dst, error);
+  if (rc != LC_OK)
+    return rc;
   return lc_lonejson_parse_prepared_file(runtime, fp, map, dst, error, message);
 }
 

@@ -40,10 +40,10 @@ The private `.compression-work/` directory contains an immutable file inventory,
 per-file offset maps, collection reachability tables and replacement receipts,
 small original collection heads and continuation identities, and at most one
 staged ordinary payload file. Maps contain offsets, output identities and tree
-totals, never document bodies. Their space scales with canonical record count. The directory
-remains mode `0700` until reclamation. Namespace directories and catalogs stay
-in place with their existing permissions; each replacement preserves its source
-file's mode before installation.
+totals, never document bodies. Their space scales with canonical record count.
+The directory remains mode `0700` until reclamation. Namespace directories and
+catalogs stay in place with their existing permissions; each replacement
+preserves its source file's mode before installation.
 
 ## Durable progress and recovery
 
@@ -87,10 +87,10 @@ parts are reused and only the unfinished source step is regenerated. Head
 publication translates segment identities and the complete snapshot group.
 Collection aliases resolve inline and need no second payload rewrite.
 
- Original
-collection heads and continuation identities are saved before translating tail
-boundaries and rebuilding indexes. Recovery can repeat that step without
-translating a translated offset or changing an existing continuation identity.
+Original collection heads and continuation identities are saved before
+translating tail boundaries and rebuilding indexes. Recovery can repeat that
+step without translating a translated offset or changing an existing
+continuation identity.
 Discard original derived collection indexes and interrupted rebuild files before
 rebuilding, so retries do not accumulate full index copies.
 Invalidate ordinary derived indexes and collection query artifacts whose

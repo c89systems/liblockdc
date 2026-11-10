@@ -313,13 +313,13 @@ static int lc_engine_mgmt_call_json_stream(
   if (result.http_status < 200L || result.http_status >= 300L) {
     rc = lc_engine_set_server_error_from_result(error, &result);
     lc_engine_lonejson_runtime(client)->cleanup(
-        lc_engine_lonejson_runtime(client), response_map, response_json);
+        lc_engine_lonejson_runtime(client), response_map, response_json, NULL);
     lc_engine_http_result_cleanup(&result);
     return rc;
   }
   rc = copy_fn(response_json, &result, response, error);
   lc_engine_lonejson_runtime(client)->cleanup(
-      lc_engine_lonejson_runtime(client), response_map, response_json);
+      lc_engine_lonejson_runtime(client), response_map, response_json, NULL);
   lc_engine_http_result_cleanup(&result);
   return rc;
 }

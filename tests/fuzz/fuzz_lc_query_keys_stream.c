@@ -139,16 +139,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   reader.data = json;
   reader.len = json_size;
   reader.chunk_size = chunk_size;
-  runtime->init(runtime, &fuzz_query_keys_response_map, &response);
+  if (runtime->init(runtime, &fuzz_query_keys_response_map, &response,
+                    &error) != LONEJSON_STATUS_OK)
+    return 0;
   if (response.keys.set_handler(&response.keys, &handler, &capture, &error) !=
       LONEJSON_STATUS_OK) {
-    runtime->cleanup(runtime, &fuzz_query_keys_response_map, &response);
+    runtime->cleanup(runtime, &fuzz_query_keys_response_map, &response, NULL);
     return 0;
   }
   (void)response.metadata.methods->enable_parse_capture(&response.metadata,
                                                         &error);
   (void)runtime->parse_reader(runtime, &fuzz_query_keys_response_map, &response,
                               fuzz_query_keys_read, &reader, &error);
-  runtime->cleanup(runtime, &fuzz_query_keys_response_map, &response);
+  runtime->cleanup(runtime, &fuzz_query_keys_response_map, &response, NULL);
   return 0;
 }

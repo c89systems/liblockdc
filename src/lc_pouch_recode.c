@@ -19,8 +19,12 @@ static int rc_error(lc_error *error, const char *message) {
 }
 
 int lc_pouch_recode_remove_tree(const char *path, lc_error *error) {
+  struct remove_frame {
+    const char *path;
+    DIR *dir;
+    struct remove_frame *parent;
+  } root, *frame = &root, *next;
   struct stat st;
-  DIR *dir;
   struct dirent *entry;
   char *child;
   int rc = LC_OK;
@@ -32,29 +36,77 @@ int lc_pouch_recode_remove_tree(const char *path, lc_error *error) {
     return unlink(path) == 0
                ? LC_OK
                : rc_error(error, "failed to remove conversion file");
-  dir = opendir(path);
-  if (dir == NULL)
+  root.path = path;
+  root.parent = NULL;
+  root.dir = opendir(path);
+  if (root.dir == NULL)
     return rc_error(error, "failed to open conversion tree");
   while (rc == LC_OK) {
     errno = 0;
-    entry = readdir(dir);
+    entry = readdir(frame->dir);
     if (entry == NULL) {
-      if (errno != 0)
+      if (errno != 0) {
         rc = rc_error(error, "failed to read conversion tree");
-      break;
+        break;
+      }
+      (void)closedir(frame->dir);
+      frame->dir = NULL;
+      if (rmdir(frame->path) != 0) {
+        rc = rc_error(error, "failed to remove conversion directory");
+        break;
+      }
+      if (frame == &root)
+        break;
+      next = frame->parent;
+      lc_free_with_allocator(NULL, (void *)frame->path);
+      lc_free_with_allocator(NULL, frame);
+      frame = next;
+      continue;
     }
     if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
       continue;
-    child = lc_pouch_path_join(NULL, path, entry->d_name);
-    if (child == NULL)
-      rc = LC_ERR_NOMEM;
-    else
-      rc = lc_pouch_recode_remove_tree(child, error);
+    child = lc_pouch_path_join(NULL, frame->path, entry->d_name);
+    if (child == NULL) {
+      rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to allocate conversion cleanup path", NULL,
+                        NULL, "pouch");
+      break;
+    }
+    if (lstat(child, &st) != 0) {
+      if (errno != ENOENT)
+        rc = rc_error(error, "failed to inspect conversion tree");
+    } else if (S_ISDIR(st.st_mode)) {
+      next = lc_alloc_with_allocator(NULL, sizeof(*next));
+      if (next == NULL)
+        rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                          "failed to allocate conversion cleanup traversal",
+                          NULL, NULL, "pouch");
+      else {
+        next->dir = opendir(child);
+        if (next->dir == NULL) {
+          lc_free_with_allocator(NULL, next);
+          rc = rc_error(error, "failed to open conversion tree");
+        } else {
+          next->path = child;
+          next->parent = frame;
+          frame = next;
+          continue;
+        }
+      }
+    } else if (unlink(child) != 0)
+      rc = rc_error(error, "failed to remove conversion file");
     lc_free_with_allocator(NULL, child);
   }
-  (void)closedir(dir);
-  if (rc == LC_OK && rmdir(path) != 0)
-    rc = rc_error(error, "failed to remove conversion directory");
+  for (;;) {
+    if (frame->dir != NULL)
+      (void)closedir(frame->dir);
+    if (frame == &root)
+      break;
+    next = frame->parent;
+    lc_free_with_allocator(NULL, (void *)frame->path);
+    lc_free_with_allocator(NULL, frame);
+    frame = next;
+  }
   return rc;
 }
 
@@ -433,57 +485,101 @@ static int rc_namespace(lc_pouch_recode *work, const char *source,
 static int rc_tree(lc_pouch_recode *work, const char *source,
                    const char *target, const char *ns, int kind,
                    lc_error *error) {
-  DIR *dir;
+  struct tree_frame {
+    const char *source, *target, *ns;
+    int kind;
+    DIR *dir;
+    struct tree_frame *parent;
+  } root, *frame = &root, *next;
   struct dirent *entry;
   struct stat st;
   char *from, *to, *decoded;
-  int next_kind, rc;
-  rc = lc_pouch_path_ensure_directory(
-      target, "failed to create conversion directory", error);
-  if (rc != LC_OK)
-    return rc;
-  dir = opendir(source);
-  if (!dir)
-    return rc_error(error, "failed to read source namespace directory");
+  int rc = LC_OK;
+  memset(&root, 0, sizeof(root));
+  root.source = source;
+  root.target = target;
+  root.ns = ns;
+  root.kind = kind;
   while (rc == LC_OK) {
+    if (frame->dir == NULL) {
+      rc = lc_pouch_path_ensure_directory(
+          frame->target, "failed to create conversion directory", error);
+      if (rc != LC_OK)
+        break;
+      frame->dir = opendir(frame->source);
+      if (frame->dir == NULL) {
+        rc = rc_error(error, "failed to read source namespace directory");
+        break;
+      }
+    }
     errno = 0;
-    entry = readdir(dir);
-    if (!entry) {
-      if (errno)
+    entry = readdir(frame->dir);
+    if (entry == NULL) {
+      if (errno != 0) {
         rc = rc_error(error, "failed to enumerate conversion source");
-      break;
+        break;
+      }
+      (void)closedir(frame->dir);
+      frame->dir = NULL;
+      if (frame->kind == 2)
+        rc = rc_collection_data(work, frame->source, frame->target, frame->ns,
+                                error);
+      if (rc != LC_OK || frame == &root)
+        break;
+      next = frame->parent;
+      lc_free_with_allocator(&work->pouch->allocator, (void *)frame->source);
+      lc_free_with_allocator(&work->pouch->allocator, (void *)frame->target);
+      lc_free_with_allocator(&work->pouch->allocator, frame);
+      frame = next;
+      continue;
     }
     if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
       continue;
-    if (kind == 2 && !strcmp(entry->d_name, "data"))
+    if (frame->kind == 2 && !strcmp(entry->d_name, "data"))
       continue;
-    if (kind == 1 && (!strcmp(entry->d_name, "index") ||
-                      !strcmp(entry->d_name, "segments") ||
-                      !strcmp(entry->d_name, "snapshots") ||
-                      !strcmp(entry->d_name, "sequence.clean")))
+    if (frame->kind == 1 && (!strcmp(entry->d_name, "index") ||
+                             !strcmp(entry->d_name, "segments") ||
+                             !strcmp(entry->d_name, "snapshots") ||
+                             !strcmp(entry->d_name, "sequence.clean")))
       continue;
-    if (kind == 4 &&
+    if (frame->kind == 4 &&
         (!strcmp(entry->d_name, "order") || !strcmp(entry->d_name, "ids") ||
          !strcmp(entry->d_name, "clean") || strstr(entry->d_name, ".log") ||
          !strncmp(entry->d_name, "query", 5) ||
          !strncmp(entry->d_name, ".obsolete-", 10)))
       continue;
-    from = lc_pouch_path_join(&work->pouch->allocator, source, entry->d_name);
-    to = lc_pouch_path_join(&work->pouch->allocator, target, entry->d_name);
+    from = lc_pouch_path_join(&work->pouch->allocator, frame->source,
+                              entry->d_name);
+    to = lc_pouch_path_join(&work->pouch->allocator, frame->target,
+                            entry->d_name);
     decoded = NULL;
     if (!from || !to)
       rc = LC_ERR_NOMEM;
     else if (lstat(from, &st) != 0)
       rc = rc_error(error, "failed to inspect conversion source");
     else if (S_ISDIR(st.st_mode)) {
-      if (kind == 0) {
+      if (frame->kind == 0) {
         decoded =
             lc_pouch_path_unescape_name(&work->pouch->allocator, entry->d_name);
         rc = decoded ? rc_namespace(work, from, to, decoded, error)
                      : LC_ERR_PROTOCOL;
       } else {
-        next_kind = kind == 1 && !strcmp(entry->d_name, "collections") ? 2 : 5;
-        rc = rc_tree(work, from, to, ns, next_kind, error);
+        next = lc_calloc_with_allocator(&work->pouch->allocator, 1U,
+                                        sizeof(*next));
+        if (next == NULL)
+          rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                            "failed to allocate conversion inventory traversal",
+                            NULL, NULL, "pouch");
+        else {
+          next->source = from;
+          next->target = to;
+          next->ns = frame->ns;
+          next->kind =
+              frame->kind == 1 && !strcmp(entry->d_name, "collections") ? 2 : 5;
+          next->parent = frame;
+          frame = next;
+          continue;
+        }
       }
     } else if (S_ISREG(st.st_mode))
       rc = rc_copy(work, from, to, 0, error);
@@ -496,9 +592,17 @@ static int rc_tree(lc_pouch_recode *work, const char *source,
     lc_free_with_allocator(&work->pouch->allocator, to);
     lc_free_with_allocator(&work->pouch->allocator, decoded);
   }
-  (void)closedir(dir);
-  if (rc == LC_OK && kind == 2)
-    rc = rc_collection_data(work, source, target, ns, error);
+  for (;;) {
+    if (frame->dir != NULL)
+      (void)closedir(frame->dir);
+    if (frame == &root)
+      break;
+    next = frame->parent;
+    lc_free_with_allocator(&work->pouch->allocator, (void *)frame->source);
+    lc_free_with_allocator(&work->pouch->allocator, (void *)frame->target);
+    lc_free_with_allocator(&work->pouch->allocator, frame);
+    frame = next;
+  }
   return rc;
 }
 
@@ -1202,6 +1306,7 @@ int lc_pouch_recode_build(lc_pouch *pouch, const char *source,
   }
   lc_free_with_allocator(&pouch->allocator, work.files);
   lc_free_with_allocator(&pouch->allocator, payload);
+  lc_free_with_allocator(&pouch->allocator, work.state_scratch);
   if (rc != LC_OK && error && error->code == LC_OK)
     lc_error_set(error, rc, 0, "failed to resume Pouch compression conversion",
                  NULL, NULL, "pouch");

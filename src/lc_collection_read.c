@@ -484,15 +484,21 @@ static int lc_cr_lql_failure(lc_collection_reader *reader, lql_status status,
                       "liblql");
 }
 
+struct lc_cr_work {
+  lc_collection_reader reader;
+  lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
+  lc_collection_order_row physical[LC_COLLECTION_ORDER_PAGE_ROWS];
+};
+
 int lc_collection_read_method(lc_collection *self,
                               const lc_collection_read_opts *opts,
                               lc_sink *sink, lc_collection_read_res *out,
                               lc_error *error) {
   lc_collection_call call;
-  lc_collection_reader reader;
+  lc_collection_reader *reader;
+  struct lc_cr_work *work;
   lc_collection_read_opts defaults;
-  lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
-  lc_collection_order_row physical[LC_COLLECTION_ORDER_PAGE_ROWS];
+  lc_collection_order_row *rows, *physical;
   lc_collection_handle *collection;
   lql *runtime;
   lql_selector *selector;
@@ -525,29 +531,41 @@ int lc_collection_read_method(lc_collection *self,
     return rc;
   error = call.error;
   collection = call.collection;
+  work = lc_alloc_with_allocator(&collection->allocator, sizeof(*work));
+  if (work == NULL) {
+    memset(out, 0, sizeof(*out));
+    out->stop_reason = LC_COLLECTION_READ_ERROR;
+    rc = lc_collection_failure(error, LC_ERR_NOMEM, NULL,
+                               "failed to allocate collection read workspace");
+    lc_collection_call_end(&call);
+    return rc;
+  }
+  reader = &work->reader;
+  rows = work->rows;
+  physical = work->physical;
   memset(&defaults, 0, sizeof(defaults));
   if (opts != NULL)
     defaults = *opts;
   opts = &defaults;
-  memset(&reader, 0, sizeof(reader));
-  reader.call = &call;
-  reader.opts = opts;
-  reader.sink = sink;
-  reader.result = out;
-  reader.error = error;
-  reader.order.fd = reader.reader_fd = reader.record_fd = -1;
+  memset(reader, 0, sizeof(*reader));
+  reader->call = &call;
+  reader->opts = opts;
+  reader->sink = sink;
+  reader->result = out;
+  reader->error = error;
+  reader->order.fd = reader->reader_fd = reader->record_fd = -1;
   runtime = NULL;
   selector = NULL;
   chunk = NULL;
   memset(out, 0, sizeof(*out));
   out->stop_reason = LC_COLLECTION_READ_ERROR;
   expression = opts->selector_lql != NULL ? opts->selector_lql : "";
-  rc = lc_cr_selection(&reader, expression);
+  rc = lc_cr_selection(reader, expression);
   if (rc == LC_OK)
     rc = lc_collection_hash(collection->ns, strlen(collection->ns),
-                            reader.namespace_hash, error);
+                            reader->namespace_hash, error);
   if (rc == LC_OK)
-    rc = lc_cr_resume(&reader, &after, &checkpoint);
+    rc = lc_cr_resume(reader, &after, &checkpoint);
   lql_error_init(&query_error);
   memset(&request, 0, sizeof(request));
   if (rc == LC_OK && expression[0] != '\0') {
@@ -559,14 +577,14 @@ int lc_collection_read_method(lc_collection *self,
       request.reader = lc_cr_lql_empty;
       request.selector = selector;
       request.time_now = lc_cr_now;
-      request.time_user = &reader;
+      request.time_user = reader;
       status = lql_stream_apply(runtime, &request, &result, &query_error);
     }
     if (status != LQL_STATUS_OK)
-      rc = lc_cr_lql_failure(&reader, status, &query_error);
+      rc = lc_cr_lql_failure(reader, status, &query_error);
   }
   if (rc == LC_OK && collection->pouch->query_indexing_enabled)
-    rc = lc_collection_query_plan_init(&reader.plan, &collection->allocator,
+    rc = lc_collection_query_plan_init(&reader->plan, &collection->allocator,
                                        runtime, selector, error);
   if (rc == LC_OK) {
     rc = lc_collection_capture_enter(collection, &commit_pin, error);
@@ -579,39 +597,39 @@ int lc_collection_read_method(lc_collection *self,
       if (rc == LC_OK) {
         captured_upper = collection->order.upper_position;
         if (opts->cursor == NULL || checkpoint) {
-          reader.upper = captured_upper;
-          if (opts->has_through && reader.upper > opts->through)
-            reader.upper = opts->through;
+          reader->upper = captured_upper;
+          if (opts->has_through && reader->upper > opts->through)
+            reader->upper = opts->through;
           now = time(NULL);
           if (now < (time_t)0)
             rc = lc_collection_failure(
                 error, LC_ERR_TRANSPORT, NULL,
                 "failed to obtain collection evaluation time");
           else
-            reader.instant = (lc_u64)now;
-        } else if (reader.upper > captured_upper)
+            reader->instant = (lc_u64)now;
+        } else if (reader->upper > captured_upper)
           rc = lc_collection_failure(
               error, LC_ERR_INVALID, "cursor_unavailable",
               "collection cursor exceeds retained committed history");
-        if (rc == LC_OK && after > reader.upper &&
+        if (rc == LC_OK && after > reader->upper &&
             !(opts->has_after && after == opts->after))
           rc = lc_collection_failure(
               error, LC_ERR_INVALID, "cursor_unavailable",
               "collection checkpoint exceeds retained committed history");
         if (rc == LC_OK) {
           rc = lc_collection_read_pin(collection, collection->head.snapshot,
-                                      &reader.reader_fd, error);
+                                      &reader->reader_fd, error);
         }
         if (rc == LC_OK) {
-          reader.order = collection->order;
-          reader.order.fd = dup(collection->order.fd);
-          if (reader.order.fd < 0)
+          reader->order = collection->order;
+          reader->order.fd = dup(collection->order.fd);
+          if (reader->order.fd < 0)
             rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                        "failed to pin collection order view");
           else
-            rc = lc_collection_order_seek(&reader.order, after, reader.upper,
-                                          reader.order.generation, 0,
-                                          &reader.iter, error);
+            rc = lc_collection_order_seek(&reader->order, after, reader->upper,
+                                          reader->order.generation, 0,
+                                          &reader->iter, error);
         }
       }
       lc_collection_capture_leave(collection, &commit_pin);
@@ -622,10 +640,10 @@ int lc_collection_read_method(lc_collection *self,
         (char *)lc_alloc_with_allocator(NULL, LC_COLLECTION_CURSOR_BYTES);
     out->checkpoint_cursor =
         (char *)lc_alloc_with_allocator(NULL, LC_COLLECTION_CURSOR_BYTES);
-    reader.chunk_capacity = LC_CR_INITIAL_CHUNK_BYTES;
+    reader->chunk_capacity = LC_CR_INITIAL_CHUNK_BYTES;
     chunk = (unsigned char *)lc_alloc_with_allocator(&collection->allocator,
-                                                     reader.chunk_capacity);
-    reader.prefix = chunk;
+                                                     reader->chunk_capacity);
+    reader->prefix = chunk;
     if (out->resume_cursor == NULL || out->checkpoint_cursor == NULL ||
         chunk == NULL) {
       rc = lc_collection_failure(
@@ -635,17 +653,17 @@ int lc_collection_read_method(lc_collection *self,
       out->resume_cursor = NULL;
     } else {
       out->resume_cursor[0] = out->checkpoint_cursor[0] = '\0';
-      out->upper_position = reader.upper;
+      out->upper_position = reader->upper;
       out->last_examined_position = after;
       rc =
-          lc_cr_cursor(&reader, after, reader.remaining, 0, out->resume_cursor);
+          lc_cr_cursor(reader, after, reader->remaining, 0, out->resume_cursor);
     }
   }
   pending = out->last_examined_position;
   quiet_pages = 0U;
-  while (rc == LC_OK && !reader.iter.done &&
-         (!opts->has_first_n || reader.remaining != 0U)) {
-    if (lc_cr_cancel(&reader))
+  while (rc == LC_OK && !reader->iter.done &&
+         (!opts->has_first_n || reader->remaining != 0U)) {
+    if (lc_cr_cancel(reader))
       break;
     rc = lc_collection_metadata_enter(collection, 0, error);
     count = 0U;
@@ -654,35 +672,35 @@ int lc_collection_read_method(lc_collection *self,
     proven = 0U;
     examined = 0U;
     if (rc == LC_OK) {
-      rc = lc_collection_order_refresh(&reader.order, error);
+      rc = lc_collection_order_refresh(&reader->order, error);
       if (rc == LC_OK)
-        rc = lc_collection_order_batch(&reader.order, &reader.iter, rows,
+        rc = lc_collection_order_batch(&reader->order, &reader->iter, rows,
                                        LC_COLLECTION_ORDER_PAGE_ROWS, &count,
                                        &examined, error);
-      if (rc == LC_OK && count != 0U && reader.plan.count != 0U)
+      if (rc == LC_OK && count != 0U && reader->plan.count != 0U)
         rc = lc_collection_order_rows(
-            &reader.order,
-            reader.iter.page_number * LC_COLLECTION_ORDER_PAGE_ROWS, physical,
+            &reader->order,
+            reader->iter.page_number * LC_COLLECTION_ORDER_PAGE_ROWS, physical,
             LC_COLLECTION_ORDER_PAGE_ROWS, &physical_count, error);
       lc_collection_metadata_leave(collection);
     }
-    if (rc == LC_OK && count != 0U && reader.plan.count != 0U)
-      rc = lc_cr_query_page(&reader, physical, physical_count, &possible,
+    if (rc == LC_OK && count != 0U && reader->plan.count != 0U)
+      rc = lc_cr_query_page(reader, physical, physical_count, &possible,
                             &proven);
     slot = 0U;
-    for (i = 0U; rc == LC_OK && !reader.cancelled && i < count &&
-                 (!opts->has_first_n || reader.remaining != 0U);
+    for (i = 0U; rc == LC_OK && !reader->cancelled && i < count &&
+                 (!opts->has_first_n || reader->remaining != 0U);
          ++i) {
-      if (lc_cr_cancel(&reader))
+      if (lc_cr_cancel(reader))
         break;
       /* A gap is known examined before any bytes of the next live object. */
       if (rows[i].position > pending + 1U) {
         pending = rows[i].position - 1U;
-        rc = lc_cr_accept(&reader, pending, 0);
+        rc = lc_cr_accept(reader, pending, 0);
         quiet_pages = 0U;
       }
       bit = 0U;
-      if (rc == LC_OK && reader.plan.count != 0U) {
+      if (rc == LC_OK && reader->plan.count != 0U) {
         while (slot < physical_count &&
                physical[slot].position < rows[i].position)
           ++slot;
@@ -696,13 +714,13 @@ int lc_collection_read_method(lc_collection *self,
         bit = (lc_u64)1U << slot;
         if ((possible & bit) == 0U) {
           if (opts->has_first_n)
-            --reader.remaining;
+            --reader->remaining;
           pending = rows[i].position;
           continue;
         }
       }
-      if (rc == LC_OK && reader.chunk_capacity < LC_CR_CHUNK_BYTES &&
-          rows[i].bytes > reader.chunk_capacity) {
+      if (rc == LC_OK && reader->chunk_capacity < LC_CR_CHUNK_BYTES &&
+          rows[i].bytes > reader->chunk_capacity) {
         unsigned char *grown = (unsigned char *)lc_realloc_with_allocator(
             &collection->allocator, chunk, LC_CR_CHUNK_BYTES);
         if (grown == NULL)
@@ -710,110 +728,110 @@ int lc_collection_read_method(lc_collection *self,
               error, LC_ERR_NOMEM, NULL,
               "failed to grow bounded collection read buffer");
         else {
-          chunk = reader.prefix = grown;
-          reader.chunk_capacity = LC_CR_CHUNK_BYTES;
+          chunk = reader->prefix = grown;
+          reader->chunk_capacity = LC_CR_CHUNK_BYTES;
         }
       }
-      reader.direct_unit = rows[i].unit_segment != 0U;
-      reader.prefix_size = 0;
+      reader->direct_unit = rows[i].unit_segment != 0U;
+      reader->prefix_size = 0;
 #if defined(__linux__)
-      reader.file_changed =
-          (reader.direct_unit ? rows[i].unit_segment : rows[i].segment) !=
-          reader.file_segment;
+      reader->file_changed =
+          (reader->direct_unit ? rows[i].unit_segment : rows[i].segment) !=
+          reader->file_segment;
 #endif
-      if (rc == LC_OK && reader.direct_unit)
-        rc = lc_cr_unit_record(&reader, &rows[i]);
+      if (rc == LC_OK && reader->direct_unit)
+        rc = lc_cr_unit_record(reader, &rows[i]);
       else if (rc == LC_OK)
         rc = lc_collection_record_ref_prefix(
             collection, rows[i].segment, rows[i].record_offset,
-            &reader.record_fd, &reader.file_segment, &reader.file_end,
-            &reader.record, reader.prefix, reader.chunk_capacity,
-            &reader.prefix_size, error);
+            &reader->record_fd, &reader->file_segment, &reader->file_end,
+            &reader->record, reader->prefix, reader->chunk_capacity,
+            &reader->prefix_size, error);
 #if defined(__linux__)
       /* Following an older visible version can close and reopen this same
        * segment, so its final identity alone cannot prove the advice survived.
        */
-      if (rc == LC_OK && reader.record.generation > reader.iter.generation)
-        reader.file_changed = 1;
+      if (rc == LC_OK && reader->record.generation > reader->iter.generation)
+        reader->file_changed = 1;
 #endif
-      if (rc == LC_OK && reader.record.generation > reader.iter.generation)
-        reader.prefix_size = 0;
+      if (rc == LC_OK && reader->record.generation > reader->iter.generation)
+        reader->prefix_size = 0;
       if (rc == LC_OK)
-        rc = lc_collection_record_at(collection, reader.iter.generation,
-                                     &reader.record_fd, &reader.file_segment,
-                                     &reader.file_end, &reader.record, error);
-      if (rc == LC_OK && (reader.record.deleted ||
-                          reader.record.position != rows[i].position ||
-                          reader.record.published_at != rows[i].published_at ||
-                          reader.record.bytes != rows[i].bytes))
+        rc = lc_collection_record_at(collection, reader->iter.generation,
+                                     &reader->record_fd, &reader->file_segment,
+                                     &reader->file_end, &reader->record, error);
+      if (rc == LC_OK && (reader->record.deleted ||
+                          reader->record.position != rows[i].position ||
+                          reader->record.published_at != rows[i].published_at ||
+                          reader->record.bytes != rows[i].bytes))
         rc = lc_collection_failure(
             error, LC_ERR_PROTOCOL, "collection_corrupt",
             "collection order points to a different canonical entry");
       matched = 1;
       if (rc == LC_OK && selector != NULL && (proven & bit) == 0U) {
-        rc = lc_cr_body_open(&reader);
+        rc = lc_cr_body_open(reader);
         if (rc == LC_OK) {
           request.reader = lc_cr_lql_read;
-          request.reader_user = &reader;
+          request.reader_user = reader;
           status = lql_stream_apply(runtime, &request, &result, &query_error);
           if (status != LQL_STATUS_OK)
-            rc = lc_cr_lql_failure(&reader, status, &query_error);
+            rc = lc_cr_lql_failure(reader, status, &query_error);
           else if (result.records_seen != 1U)
             rc = lc_collection_failure(
                 error, LC_ERR_PROTOCOL, "collection_corrupt",
                 "collection entry is not one JSON object");
           if (rc == LC_OK)
-            rc = lc_cr_body_finish(&reader);
+            rc = lc_cr_body_finish(reader);
           matched = result.records_matched == 1U;
         }
       }
       if (rc == LC_OK && matched) {
         if (pending > out->last_examined_position)
-          rc = lc_cr_accept(&reader, pending, 0);
+          rc = lc_cr_accept(reader, pending, 0);
         if (rc == LC_OK)
-          rc = lc_cr_body_open(&reader);
+          rc = lc_cr_body_open(reader);
         while (rc == LC_OK) {
-          rc = lc_cr_body_read(&reader, chunk, reader.chunk_capacity, &got);
+          rc = lc_cr_body_read(reader, chunk, reader->chunk_capacity, &got);
           if (rc != LC_OK || got == 0U)
             break;
-          rc = lc_cr_write(&reader, chunk, got);
+          rc = lc_cr_write(reader, chunk, got);
         }
         if (rc == LC_OK)
-          rc = lc_cr_body_finish(&reader);
+          rc = lc_cr_body_finish(reader);
         if (rc == LC_OK)
-          rc = lc_cr_write(&reader, "\n", 1U);
+          rc = lc_cr_write(reader, "\n", 1U);
       }
       if (rc == LC_OK && matched) {
-        rc = lc_cr_accept(&reader, rows[i].position, 1);
+        rc = lc_cr_accept(reader, rows[i].position, 1);
         quiet_pages = 0U;
       }
       if (rc == LC_OK && !matched && opts->has_first_n)
-        --reader.remaining;
+        --reader->remaining;
       if (rc == LC_OK)
         pending = rows[i].position;
-      lc_collection_payload_reset(&reader.payload);
+      lc_collection_payload_reset(&reader->payload);
     }
-    if (rc == LC_OK && !reader.cancelled &&
-        (!opts->has_first_n || reader.remaining != 0U)) {
+    if (rc == LC_OK && !reader->cancelled &&
+        (!opts->has_first_n || reader->remaining != 0U)) {
       if (examined > pending)
         pending = examined;
       ++quiet_pages;
       if (quiet_pages >= LC_CR_PROGRESS_PAGES &&
           pending > out->last_examined_position) {
-        rc = lc_cr_accept(&reader, pending, 0);
+        rc = lc_cr_accept(reader, pending, 0);
         quiet_pages = 0U;
       }
     }
   }
-  if (rc == LC_OK && !reader.cancelled) {
-    if (opts->has_first_n && reader.remaining == 0U &&
+  if (rc == LC_OK && !reader->cancelled) {
+    if (opts->has_first_n && reader->remaining == 0U &&
         pending > out->last_examined_position)
-      rc = lc_cr_accept(&reader, pending, 0);
-    if (rc == LC_OK && out->last_examined_position < reader.upper &&
-        (!opts->has_first_n || reader.remaining != 0U))
-      rc = lc_cr_accept(&reader, reader.upper, 0);
+      rc = lc_cr_accept(reader, pending, 0);
+    if (rc == LC_OK && out->last_examined_position < reader->upper &&
+        (!opts->has_first_n || reader->remaining != 0U))
+      rc = lc_cr_accept(reader, reader->upper, 0);
     if (rc == LC_OK)
-      rc = lc_cr_cursor(&reader, out->last_examined_position,
+      rc = lc_cr_cursor(reader, out->last_examined_position,
                         opts->has_first_n ? opts->first_n : 0U, 1,
                         out->checkpoint_cursor);
     if (rc == LC_OK) {
@@ -821,7 +839,7 @@ int lc_collection_read_method(lc_collection *self,
       out->stop_reason = LC_COLLECTION_READ_FINISHED;
     }
   }
-  if (reader.cancelled &&
+  if (reader->cancelled &&
       (rc == LC_OK || (rc == LC_ERR_PENDING && error->code == LC_OK))) {
     rc = LC_OK;
     out->stop_reason = LC_COLLECTION_READ_CANCELLED;
@@ -833,18 +851,19 @@ int lc_collection_read_method(lc_collection *self,
     lc_free_with_allocator(NULL, out->resume_cursor);
     out->resume_cursor = NULL;
   }
-  lc_collection_payload_cleanup(&reader.payload);
-  lc_collection_query_plan_cleanup(&reader.plan);
-  if (reader.reader_fd >= 0)
-    (void)close(reader.reader_fd);
-  if (reader.record_fd >= 0)
-    (void)close(reader.record_fd);
-  lc_collection_order_close(&reader.order);
+  lc_collection_payload_cleanup(&reader->payload);
+  lc_collection_query_plan_cleanup(&reader->plan);
+  if (reader->reader_fd >= 0)
+    (void)close(reader->reader_fd);
+  if (reader->record_fd >= 0)
+    (void)close(reader->record_fd);
+  lc_collection_order_close(&reader->order);
   lc_free_with_allocator(&collection->allocator, chunk);
   if (selector != NULL)
     runtime->selector_destroy(runtime, selector);
   if (runtime != NULL)
     runtime->destroy(runtime);
+  lc_free_with_allocator(&collection->allocator, work);
   lc_collection_call_end(&call);
   return rc;
 }

@@ -789,20 +789,24 @@ int lc_engine_client_query_keys(lc_engine_client *client,
   string_handler.begin = lc_engine_query_key_stream_begin;
   string_handler.chunk = lc_engine_query_key_stream_chunk;
   string_handler.end = lc_engine_query_key_stream_end;
-  runtime->init(runtime, &lc_engine_query_keys_response_map, &key_response);
+  rc = runtime->init(runtime, &lc_engine_query_keys_response_map, &key_response,
+                     &lj_error);
+  if (rc != LONEJSON_STATUS_OK)
+    return lc_engine_lonejson_error_from_status(
+        error, rc, &lj_error, "failed to initialize query keys response");
   rc = key_response.keys.set_handler(&key_response.keys, &string_handler,
                                      &bridge, &lj_error);
   if (rc != LONEJSON_STATUS_OK) {
-    runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                     &key_response);
+    runtime->cleanup(runtime, &lc_engine_query_keys_response_map, &key_response,
+                     NULL);
     return lc_engine_lonejson_error_from_status(
         error, rc, &lj_error, "failed to configure query keys stream");
   }
   rc = key_response.metadata.methods->enable_parse_capture(
       &key_response.metadata, &lj_error);
   if (rc != LONEJSON_STATUS_OK) {
-    runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                     &key_response);
+    runtime->cleanup(runtime, &lc_engine_query_keys_response_map, &key_response,
+                     NULL);
     return lc_engine_lonejson_error_from_status(
         error, rc, &lj_error, "failed to configure query metadata capture");
   }
@@ -819,8 +823,8 @@ int lc_engine_client_query_keys(lc_engine_client *client,
                                              lc_engine_json_memory_reader,
                                              &selector_source, &lj_error);
   if (rc != LONEJSON_STATUS_OK) {
-    runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                     &key_response);
+    runtime->cleanup(runtime, &lc_engine_query_keys_response_map, &key_response,
+                     NULL);
     lc_engine_buffer_cleanup(&state.error_body);
     return lc_engine_lonejson_error_from_status(
         error, rc, &lj_error, "failed to configure query selector");
@@ -835,7 +839,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
                                              &fields_source, &lj_error);
     if (rc != LONEJSON_STATUS_OK) {
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       lc_engine_buffer_cleanup(&state.error_body);
       return lc_engine_lonejson_error_from_status(
@@ -875,7 +879,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
     url = lc_engine_query_url(client->endpoints[endpoint_index], &url_request);
     if (url == NULL) {
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -897,7 +901,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
     if (rc != LONEJSON_STATUS_OK) {
       free(url);
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -905,9 +909,11 @@ int lc_engine_client_query_keys(lc_engine_client *client,
       return lc_engine_lonejson_error_from_status(
           error, rc, NULL, "failed to prepare query request body");
     }
-    runtime->reset(runtime, &lc_engine_query_keys_response_map, &key_response);
-    rc = key_response.keys.set_handler(&key_response.keys, &string_handler,
-                                       &bridge, &lj_error);
+    rc = runtime->reset(runtime, &lc_engine_query_keys_response_map,
+                        &key_response, &lj_error);
+    if (rc == LONEJSON_STATUS_OK)
+      rc = key_response.keys.set_handler(&key_response.keys, &string_handler,
+                                         &bridge, &lj_error);
     if (rc == LONEJSON_STATUS_OK) {
       rc = key_response.metadata.methods->enable_parse_capture(
           &key_response.metadata, &lj_error);
@@ -916,7 +922,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
       lc_lonejson_curl_upload_cleanup(&body_upload);
       free(url);
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -930,7 +936,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
       lc_lonejson_curl_upload_cleanup(&body_upload);
       free(url);
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -946,7 +952,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
     if (rc != LC_ENGINE_OK) {
       lc_lonejson_curl_parse_cleanup(&key_parse);
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -958,7 +964,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
       if (rc != LONEJSON_STATUS_OK) {
         lc_lonejson_curl_parse_cleanup(&key_parse);
         runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                         &key_response);
+                         &key_response, NULL);
         runtime->json_value_cleanup(runtime, &body_src.selector);
         runtime->json_value_cleanup(runtime, &body_src.fields);
         lc_engine_buffer_cleanup(&state.error_body);
@@ -971,7 +977,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
                                                     &key_response, error);
       if (rc != LC_ENGINE_OK) {
         runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                         &key_response);
+                         &key_response, NULL);
         runtime->json_value_cleanup(runtime, &body_src.selector);
         runtime->json_value_cleanup(runtime, &body_src.fields);
         lc_engine_buffer_cleanup(&state.error_body);
@@ -979,7 +985,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
         return rc;
       }
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -993,7 +999,7 @@ int lc_engine_client_query_keys(lc_engine_client *client,
     if (error->server_error_code == NULL ||
         strcmp(error->server_error_code, "node_passive") != 0) {
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -1001,16 +1007,18 @@ int lc_engine_client_query_keys(lc_engine_client *client,
       return rc;
     }
     lc_engine_query_stream_response_cleanup(client, response);
-    runtime->reset(runtime, &lc_engine_query_keys_response_map, &key_response);
-    rc = key_response.keys.set_handler(&key_response.keys, &string_handler,
-                                       &bridge, &lj_error);
+    rc = runtime->reset(runtime, &lc_engine_query_keys_response_map,
+                        &key_response, &lj_error);
+    if (rc == LONEJSON_STATUS_OK)
+      rc = key_response.keys.set_handler(&key_response.keys, &string_handler,
+                                         &bridge, &lj_error);
     if (rc == LONEJSON_STATUS_OK) {
       rc = key_response.metadata.methods->enable_parse_capture(
           &key_response.metadata, &lj_error);
     }
     if (rc != LONEJSON_STATUS_OK) {
       runtime->cleanup(runtime, &lc_engine_query_keys_response_map,
-                       &key_response);
+                       &key_response, NULL);
       runtime->json_value_cleanup(runtime, &body_src.selector);
       runtime->json_value_cleanup(runtime, &body_src.fields);
       lc_engine_buffer_cleanup(&state.error_body);
@@ -1020,7 +1028,8 @@ int lc_engine_client_query_keys(lc_engine_client *client,
     lc_engine_error_reset(error);
   }
 
-  runtime->cleanup(runtime, &lc_engine_query_keys_response_map, &key_response);
+  runtime->cleanup(runtime, &lc_engine_query_keys_response_map, &key_response,
+                   NULL);
   runtime->json_value_cleanup(runtime, &body_src.selector);
   runtime->json_value_cleanup(runtime, &body_src.fields);
   lc_engine_buffer_cleanup(&state.error_body);

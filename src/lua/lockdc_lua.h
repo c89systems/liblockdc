@@ -11,7 +11,9 @@ extern "C" {
 #endif
 
 /** Public facade interop, compiled/linked with the Lua binding. It introduces
- * no Lua or native-client dependency into the core C library. */
+ * no Lua or native-client dependency into the core C library. Drive each Lua
+ * state serially. Native resources retain their own thread-affinity rules
+ * when the runtime migrates a VM or coroutine between workers. */
 int luaopen_lockdc_core(lua_State *L);
 /** Reads a live client userdata without transferring ownership. Its Lua owner
  * must stay reachable until the consuming public C operation has retained it.
@@ -22,7 +24,9 @@ int lc_lua_client_view(lua_State *L, int index, lc_client **out,
 /** Build copied provider configuration from a Lua value. Return project status
  * for validation failures. Set *out before any later Lua call that can throw;
  * cleanup runs on both returned errors and protected Lua exceptions. Native
- * open copies configuration before this temporary is released. */
+ * open copies configuration before this temporary is released. Keep native
+ * callback stack use bounded; Lua's re-entry guard cannot protect arbitrary
+ * C recursion or stack allocations. */
 typedef int (*lc_lua_xa_configure_fn)(lua_State *L, int index, void **out,
                                       lc_error *error);
 /** Releases temporary provider configuration after native open or a protected

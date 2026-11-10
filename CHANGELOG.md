@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 0.30.0
+
+- Upgrade the optional cpktdb SDK to 0.4.0 across all seven targets, requiring
+  the already pinned cpkt 0.7.0. Retain the PostgreSQL facade and provider ABI
+  majors; SQLite is not consumed by liblockdc.
+
+- Upgrade cpkt to 0.7.0 with verified SDK pins for all seven targets. Include
+  its Lua native-stack guards and heap-backed CRC scratch. Verify protected-call
+  failure/recovery and serialized VM/coroutine migration on default workers.
+
+- Upgrade lonejson to 0.48.0 (ABI 28), including all seven target SDK checksums
+  and the matching Lua dependency. Check its fallible mapped-record lifecycle
+  calls before parsing or reusing records.
+
+- Replace input-dependent native recursion in mutation expansion, scalar query
+  scanning, mapped destination preparation, and compression directory walks with
+  allocator-backed traversal. Move large read, compaction, conversion and Lua XA
+  result workspaces off worker stacks.
+- Constrain glibc Debug test workers and SDK-linked child applications to 128 KiB,
+  disable glibc's stack cache for tests, and reject VLA/`alloca()` compilation.
+  Add default-musl-worker, guard, nesting, error-cleanup and SDK child regressions.
+
+### Upgrading from 0.29.x
+
+Lonejson advances from ABI **27** to **28**. Its `init`, `reset` and `cleanup`
+functions and receiver methods now return `lonejson_status` and accept an
+optional error output. Check init/reset results before using records. If
+cleanup cannot allocate traversal workspace, retain the record and retry when
+memory is available. Rebuild lonejson consumers and Lua native modules against
+the matching headers, libraries and `lonejson == 0.48.0-1` rock.
+
+Liblockdc's public C layouts and core ABI **9** remain unchanged, as does the
+optional PostgreSQL provider ABI **0**. This dependency upgrade changes no Pouch
+storage format.
+
 ## 0.29.0
 
 - Upgrade lonejson to 0.47.0 (ABI 27), including all seven target SDK checksums

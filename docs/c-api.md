@@ -86,11 +86,17 @@ parsing. It does not cap request-side JSON serialization; large mapped saves
 should use lonejson source-backed fields when the source value is naturally
 file-backed or stream-backed.
 
-Mapped `load()` destinations may be reused. The SDK prepares destinations with
+Mapped `load()` destinations must start zero-initialized or initialized by the
+compatible lonejson runtime, and may then be reused. The SDK prepares them with
 the runtime `reset` path when they already own lonejson-managed storage and with
 `init` on first use, while preserving preconfigured `lonejson_json_value`
 capture sinks. Callers still own final cleanup of lonejson-owned mapped fields
-with a compatible lonejson runtime after the loaded value is no longer needed.
+with a compatible lonejson runtime after the loaded value is no longer needed,
+including partially populated fields after a failed load. Check the status of
+lonejson initialization, reset and cleanup calls. If cleanup cannot allocate
+its traversal workspace, retain the record and retry instead of discarding
+its remaining ownership. Deep map preparation uses allocator-backed traversal;
+workspace exhaustion is reported as `LC_ERR_NOMEM`.
 
 ## Client configuration and credentials
 
@@ -164,18 +170,20 @@ acknowledge, negatively acknowledge, or close the local handle explicitly.
 ## ABI and storage compatibility
 
 Core ABI **9**, introduced in v0.26.0 from ABI **8** in v0.25.0, remains
-unchanged through v0.29.0. ABI 9 consumers remain compatible; the PostgreSQL
+unchanged in v0.30.0. ABI 9 consumers remain compatible; the PostgreSQL
 provider's own ABI remains **0**. When upgrading from ABI 8, rebuild C
 consumers, Lua native bindings and the optional PostgreSQL provider together.
 That ABI change covers atomic collection edits and recovery heads; see
 [the edit contract](collection-edits.md) and
 [upgrade instructions](../CHANGELOG.md#upgrading-from-025x).
 
-The dependency ABI is separate: v0.29.0 uses lonejson 0.47.0 with ABI **27**.
-Its public receiver layouts changed from ABI 26, so rebuild applications using
-those receivers and Lua native modules against the matching SDK. Liblockdc's
-mapped load/save boundary uses unchanged lonejson map layouts. See
-[the dependency upgrade notes](../CHANGELOG.md#upgrading-from-028x).
+The dependency ABI is separate: the SDK uses lonejson 0.48.0 with ABI **28**.
+Its mapped-record init/reset/cleanup calls now return status and accept an
+optional error output. Check initialization/reset before using records; on a
+cleanup workspace allocation failure, retain the record and retry. Rebuild
+lonejson consumers and Lua native modules against the matching SDK. Liblockdc's
+mapped load/save signatures and lonejson map layouts remain unchanged. See
+[the dependency upgrade notes](../CHANGELOG.md#upgrading-from-029x).
 
 Pouch upgrades released collection heads on open under exclusive root access,
 preserving positions, retry identities, retention and entry bodies. Close other

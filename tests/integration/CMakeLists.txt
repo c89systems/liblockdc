@@ -339,4 +339,36 @@ if(LOCKDC_BUILD_POSTGRES AND LOCKDC_TARGET_ID STREQUAL "x86_64-linux-gnu"
   endforeach()
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND LOCKDC_TARGET_ARCH STREQUAL "x86_64")
+  foreach(linkage runner static shared)
+    if(NOT linkage STREQUAL "runner" AND NOT TARGET lc_${linkage})
+      continue()
+    endif()
+    set(target lc_default_stack_${linkage}_test)
+    add_executable(${target} test_default_stack.c)
+    target_link_libraries(${target} PRIVATE Threads::Threads)
+    if(NOT linkage STREQUAL "runner")
+      set_property(TARGET ${target} PROPERTY LOCKDC_TEST_STACK_FROM_SDK TRUE)
+      target_compile_definitions(${target} PRIVATE LC_TEST_STACK_FROM_SDK=1)
+      target_link_libraries(${target} PRIVATE lc_${linkage})
+      if(linkage STREQUAL "shared")
+        # The shipped DSO uses $ORIGIN. Declare its dependencies directly in
+        # this build-tree application so its private toolchain RPATH applies.
+        get_target_property(shared_dependencies lc_shared LINK_LIBRARIES)
+        target_link_libraries(${target} PRIVATE ${shared_dependencies})
+        target_link_options(${target} PRIVATE "LINKER:--no-as-needed")
+      endif()
+    endif()
+    lc_configure_c_test_target(${target})
+    add_test(NAME default_worker_stack_${linkage}_test COMMAND ${target})
+    set_tests_properties(default_worker_stack_${linkage}_test PROPERTIES
+      LABELS "integration;offline;cross-runtime;stack" TIMEOUT 30)
+    if(LOCKDC_C_TEST_ENVIRONMENT)
+      set_tests_properties(default_worker_stack_${linkage}_test PROPERTIES
+        ENVIRONMENT "${LOCKDC_C_TEST_ENVIRONMENT}")
+    endif()
+    set_property(GLOBAL APPEND PROPERTY LOCKDC_CROSS_RUNTIME_TEST_TARGETS ${target})
+  endforeach()
+endif()
+
 lc_apply_test_defaults()

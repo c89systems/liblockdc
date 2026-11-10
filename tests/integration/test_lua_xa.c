@@ -198,12 +198,16 @@ static int wait_ready(lua_State *L) {
     return luaL_error(L, "test readiness poll failed");
   return 0;
 }
+int lc_test_lua_worker_stack(void);
+
 int main(int argc, char **argv) {
   lua_State *L;
   lua_heap_probe heap = {0};
   lc_xa_driver driver;
   lc_error error;
   int rc;
+  if (argc == 2 && strcmp(argv[1], "--stack") == 0)
+    return lc_test_lua_worker_stack();
   if (argc != 3)
     return 2;
   L = luaL_newstate();

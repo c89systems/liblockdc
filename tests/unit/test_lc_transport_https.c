@@ -115,7 +115,8 @@ static void test_lonejson_cleanup_value(const lonejson_map *map, void *value) {
   lonejson *runtime;
 
   runtime = lc_thread_lonejson_runtime();
-  runtime->cleanup(runtime, map, value);
+  assert_int_equal(runtime->cleanup(runtime, map, value, NULL),
+                   LONEJSON_STATUS_OK);
 }
 
 typedef struct https_expectation {
@@ -7120,7 +7121,9 @@ static void test_public_client_load_preserves_preinitialized_json_value_capture(
   assert_int_equal(rc, LC_OK);
 
   runtime = lc_thread_lonejson_runtime();
-  runtime->init(runtime, &test_json_value_map, &value_doc);
+  assert_int_equal(
+      runtime->init(runtime, &test_json_value_map, &value_doc, NULL),
+      LONEJSON_STATUS_OK);
   rc = value_doc.payload.methods->enable_parse_capture(&value_doc.payload,
                                                        &lj_error);
   assert_int_equal(rc, LONEJSON_STATUS_OK);
@@ -7196,7 +7199,9 @@ static void test_public_client_load_clears_mixed_json_value_mapped_destination(
   assert_int_equal(rc, LC_OK);
 
   runtime = lc_thread_lonejson_runtime();
-  runtime->init(runtime, &test_json_value_with_label_map, &value_doc);
+  assert_int_equal(
+      runtime->init(runtime, &test_json_value_with_label_map, &value_doc, NULL),
+      LONEJSON_STATUS_OK);
   rc = value_doc.payload.methods->enable_parse_capture(&value_doc.payload,
                                                        &lj_error);
   assert_int_equal(rc, LONEJSON_STATUS_OK);
@@ -7775,7 +7780,9 @@ static void test_public_lease_load_preserves_preinitialized_json_value_capture(
   assert_non_null(lease);
 
   runtime = lc_thread_lonejson_runtime();
-  runtime->init(runtime, &test_json_value_map, &value_doc);
+  assert_int_equal(
+      runtime->init(runtime, &test_json_value_map, &value_doc, NULL),
+      LONEJSON_STATUS_OK);
   rc = value_doc.payload.methods->enable_parse_capture(&value_doc.payload,
                                                        &lj_error);
   assert_int_equal(rc, LONEJSON_STATUS_OK);

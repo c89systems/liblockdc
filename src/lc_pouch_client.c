@@ -2155,105 +2155,109 @@ static int lc_pouch_query_scan_scalar_json_number(
 }
 
 static int
-lc_pouch_query_scan_scalar_skip_value(lc_pouch_query_scan_scalar_reader *reader,
-                                      lc_error *error);
-
-static int lc_pouch_query_scan_scalar_skip_container(
-    lc_pouch_query_scan_scalar_reader *reader, int object, lc_error *error) {
-  int c;
-  int rc;
-
-  rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  if (c != (object ? '{' : '[')) {
-    return LC_ERR_INVALID;
-  }
-  rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  if (c == (object ? '}' : ']')) {
-    return lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
-  }
-  for (;;) {
-    if (object) {
-      int equal;
-
-      rc = lc_pouch_query_scan_scalar_json_string(reader, NULL, NULL, 0U, 0,
-                                                  &equal, error);
-      if (rc != LC_OK) {
-        return rc;
-      }
-      rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
-      if (rc != LC_OK) {
-        return rc;
-      }
-      if (c != ':') {
-        return LC_ERR_INVALID;
-      }
-      rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
-      if (rc != LC_OK) {
-        return rc;
-      }
-    }
-    rc = lc_pouch_query_scan_scalar_skip_value(reader, error);
-    if (rc != LC_OK) {
-      return rc;
-    }
+lc_pouch_query_scan_scalar_skip_key(lc_pouch_query_scan_scalar_reader *reader,
+                                    lc_error *error) {
+  int c, equal, rc;
+  rc = lc_pouch_query_scan_scalar_json_string(reader, NULL, NULL, 0U, 0, &equal,
+                                              error);
+  if (rc == LC_OK)
     rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
-    if (rc != LC_OK) {
-      return rc;
-    }
-    if (c == (object ? '}' : ']')) {
-      return lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
-    }
-    if (c != ',') {
-      return LC_ERR_INVALID;
-    }
+  if (rc == LC_OK && c != ':')
+    rc = LC_ERR_INVALID;
+  if (rc == LC_OK)
     rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
-    if (rc != LC_OK) {
-      return rc;
-    }
-    rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
-    if (rc != LC_OK) {
-      return rc;
-    }
-  }
+  return rc;
 }
 
 static int
 lc_pouch_query_scan_scalar_skip_value(lc_pouch_query_scan_scalar_reader *reader,
                                       lc_error *error) {
-  int c;
-  int equal;
-  int rc;
-
-  rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  if (c == '"') {
-    return lc_pouch_query_scan_scalar_json_string(reader, NULL, NULL, 0U, 0,
+  unsigned char local[32], *frames = local;
+  size_t depth = 0U, capacity = sizeof(local);
+  int c, equal, rc;
+  for (;;) {
+    rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
+    if (rc != LC_OK)
+      break;
+    if (c == '{' || c == '[') {
+      int object = c == '{';
+      if (depth == capacity) {
+        unsigned char *next;
+        if (capacity > (size_t)-1 / 2U) {
+          rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                            "scalar-query traversal is too large", NULL, NULL,
+                            "pouch");
+          break;
+        }
+        next = lc_alloc_with_allocator(NULL, capacity * 2U);
+        if (next == NULL) {
+          rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                            "failed to allocate scalar-query traversal", NULL,
+                            NULL, "pouch");
+          break;
+        }
+        memcpy(next, frames, depth);
+        if (frames != local)
+          lc_free_with_allocator(NULL, frames);
+        frames = next;
+        capacity *= 2U;
+      }
+      frames[depth++] = (unsigned char)object;
+      rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
+      if (rc == LC_OK)
+        rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
+      if (rc != LC_OK)
+        break;
+      if (c == (object ? '}' : ']')) {
+        rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
+        --depth;
+      } else {
+        if (object)
+          rc = lc_pouch_query_scan_scalar_skip_key(reader, error);
+        if (rc != LC_OK)
+          break;
+        continue;
+      }
+    } else if (c == '"') {
+      rc = lc_pouch_query_scan_scalar_json_string(reader, NULL, NULL, 0U, 0,
                                                   &equal, error);
+    } else if (c == 't') {
+      rc = lc_pouch_query_scan_scalar_json_literal(reader, "true", error);
+    } else if (c == 'f') {
+      rc = lc_pouch_query_scan_scalar_json_literal(reader, "false", error);
+    } else if (c == 'n') {
+      rc = lc_pouch_query_scan_scalar_json_literal(reader, "null", error);
+    } else {
+      rc = lc_pouch_query_scan_scalar_json_number(reader, NULL, error);
+    }
+    /* A completed value can close many parents, without recursive returns. */
+    while (rc == LC_OK && depth != 0U) {
+      int object = frames[depth - 1U] != 0;
+      rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
+      if (rc != LC_OK)
+        break;
+      if (c == (object ? '}' : ']')) {
+        rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
+        --depth;
+        continue;
+      }
+      if (c != ',') {
+        rc = LC_ERR_INVALID;
+        break;
+      }
+      rc = lc_pouch_query_scan_scalar_reader_next(reader, &c, error);
+      if (rc == LC_OK)
+        rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
+      if (rc == LC_OK && object)
+        rc = lc_pouch_query_scan_scalar_skip_key(reader, error);
+      break;
+    }
+    if (rc != LC_OK || depth == 0U)
+      break;
   }
-  if (c == '{') {
-    return lc_pouch_query_scan_scalar_skip_container(reader, 1, error);
-  }
-  if (c == '[') {
-    return lc_pouch_query_scan_scalar_skip_container(reader, 0, error);
-  }
-  if (c == 't') {
-    return lc_pouch_query_scan_scalar_json_literal(reader, "true", error);
-  }
-  if (c == 'f') {
-    return lc_pouch_query_scan_scalar_json_literal(reader, "false", error);
-  }
-  if (c == 'n') {
-    return lc_pouch_query_scan_scalar_json_literal(reader, "null", error);
-  }
-  return lc_pouch_query_scan_scalar_json_number(reader, NULL, error);
+  if (frames != local)
+    lc_free_with_allocator(NULL, frames);
+  return rc;
 }
 
 static int lc_pouch_query_scan_scalar_parse_target(
@@ -2330,6 +2334,7 @@ static int lc_pouch_query_scan_scalar_scan_object(
   if (matched != NULL) {
     *matched = 0;
   }
+next_object:
   if (!object_open) {
     rc = lc_pouch_query_scan_scalar_reader_ws(reader, &c, error);
     if (rc != LC_OK) {
@@ -2404,8 +2409,9 @@ static int lc_pouch_query_scan_scalar_scan_object(
       if (rc != LC_OK) {
         return rc;
       }
-      return lc_pouch_query_scan_scalar_scan_object(
-          reader, state, depth + 1U, segment_count, 1, decided, matched, error);
+      ++depth;
+      object_open = 1;
+      goto next_object;
     }
     rc = lc_pouch_query_scan_scalar_skip_value(reader, error);
     if (rc != LC_OK) {
@@ -2622,6 +2628,32 @@ static lonejson_status lc_pouch_query_scan_scalar_null_value(
   }
   return lc_pouch_query_scan_scalar_stop_after_decision(state, 0, lj_error);
 }
+
+#ifdef LOCKDC_TEST_BUILD
+int lc_pouch_test_scalar_scan(lc_source *source, const char *field,
+                              const char *value, char type, int *decided,
+                              int *matched, lc_error *error) {
+  lc_pouch_query_scan_scalar_match_state state;
+  lc_pouch_query_index_plan plan;
+  char *values[1];
+  char types[1];
+  int rc;
+  memset(&state, 0, sizeof(state));
+  memset(&plan, 0, sizeof(plan));
+  values[0] = (char *)value;
+  types[0] = type;
+  plan.field = (char *)field;
+  plan.values = values;
+  plan.value_types = types;
+  plan.value_count = 1U;
+  state.source = source;
+  state.plan = &plan;
+  rc = lc_pouch_query_match_scan_scalar_body_direct(&state, decided, matched,
+                                                    error);
+  lc_pouch_query_scan_scalar_match_state_cleanup(&state);
+  return rc;
+}
+#endif
 
 static int lc_pouch_query_scan_scalar_plan_supported(
     const lc_pouch_query_index_plan *plan) {
@@ -5694,29 +5726,39 @@ static void lc_pouch_mutate_file_cleanup(lc_pouch_mutate_file *file) {
 
 static int lc_pouch_copy_source_to_file(lc_source *source, FILE *fp,
                                         lc_error *error) {
-  unsigned char buffer[8192];
+  unsigned char *buffer;
+  int rc = LC_OK;
 
   if (source == NULL || fp == NULL) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch mutate copy requires source and file", NULL,
                         NULL, NULL);
   }
+  buffer = lc_alloc_with_allocator(NULL, 8192U);
+  if (buffer == NULL)
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to allocate pouch mutate copy buffer", NULL,
+                        NULL, "pouch");
   for (;;) {
     size_t nread;
 
-    nread = source->read(source, buffer, sizeof(buffer), error);
+    nread = source->read(source, buffer, 8192U, error);
     if (nread == 0U) {
       if (error != NULL && error->code != LC_OK) {
-        return error->code;
+        rc = error->code;
       }
       break;
     }
     if (fwrite(buffer, 1U, nread, fp) != nread) {
-      return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                          "failed to write pouch mutate scratch file",
-                          strerror(errno), NULL, NULL);
+      rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                        "failed to write pouch mutate scratch file",
+                        strerror(errno), NULL, NULL);
+      break;
     }
   }
+  lc_free_with_allocator(NULL, buffer);
+  if (rc != LC_OK)
+    return rc;
   if (fflush(fp) != 0) {
     return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
                         "failed to flush pouch mutate scratch file",
@@ -12714,9 +12756,11 @@ static int lc_pouch_client_load_namespace(lc_client_handle *client,
     memcpy(json, bytes, length);
     json[length] = '\0';
     runtime = lc_thread_lonejson_runtime();
-    lc_lonejson_prepare_parse_destination(runtime, map, dst);
+    rc = lc_lonejson_prepare_parse_destination(runtime, map, dst, error);
     memset(&lj_error, 0, sizeof(lj_error));
-    status = lc_lonejson_parse_cstr_value(runtime, map, dst, json, &lj_error);
+    status = rc == LC_OK ? lc_lonejson_parse_cstr_value(runtime, map, dst, json,
+                                                        &lj_error)
+                         : LONEJSON_STATUS_OK;
     if (status != LONEJSON_STATUS_OK) {
       rc = lc_lonejson_error_from_status(error, status, &lj_error,
                                          "failed to parse pouch mapped state");
@@ -21869,10 +21913,11 @@ static int lc_pouch_lease_load_method(lc_lease *self, const lonejson_map *map,
         memcpy(json, bytes, length);
         json[length] = '\0';
         runtime = lc_thread_lonejson_runtime();
-        lc_lonejson_prepare_parse_destination(runtime, map, dst);
+        rc = lc_lonejson_prepare_parse_destination(runtime, map, dst, error);
         memset(&lj_error, 0, sizeof(lj_error));
-        status =
-            lc_lonejson_parse_cstr_value(runtime, map, dst, json, &lj_error);
+        status = rc == LC_OK ? lc_lonejson_parse_cstr_value(runtime, map, dst,
+                                                            json, &lj_error)
+                             : LONEJSON_STATUS_OK;
         if (status != LONEJSON_STATUS_OK) {
           rc = lc_lonejson_error_from_status(
               error, status, &lj_error, "failed to parse pouch lease state");

@@ -152,19 +152,27 @@ embeddings preload the same entry point. See the
 
 ### Release archive contents
 
-The release archive contains:
+The core release archive contains:
 
-- `liblockdc` public headers
-- bundled dependency headers for `libpslog`, `curl`, `OpenSSL`, `nghttp2`, and
-  `lonejson`
-- `liblockdc.so*`
-- `liblockdc.a`
-- the static archives for the bundled third-party dependencies
-- bundled shared runtime dependencies
-- `pkg-config` metadata
-- CMake package metadata
-- project documentation and license files
-- bundled third-party license files
+- `include/lc/lc.h` and the generated `include/lc/version.h`
+- `liblockdc.a` and the target's versioned shared library and symlinks
+- CMake and pkg-config consumer metadata
+- `share/lockdc/package-metadata.cmake` and `share/lockdc/dependencies.json`
+- project documentation, licenses and dependency notices
+
+Supply dependency SDKs separately: cpkt, libpslog, lonejson and liblql, using
+the versions and compatibility requirements recorded in the package metadata.
+Add their prefixes to `CMAKE_PREFIX_PATH` or their pkg-config directories to
+`PKG_CONFIG_PATH` as required by the consumer. The core archive includes no
+third-party headers, static archives or shared libraries, and no PostgreSQL or
+Lua module payload. cmocka is used only for tests; cpktmisc is not required.
+
+PostgreSQL applications also install the matching optional provider archive and
+the compatible cpktdb SDK. The provider archive supplies its own public header,
+static/shared libraries, consumer metadata, documentation, licenses and SDK
+provenance. See the [PostgreSQL installation guide](postgres.md#build-link-and-install)
+and [Lua distribution model](lua.md#distribution-model) for their separate
+artifacts and linkage.
 
 Archive layout and contents are regression-tested. The release verification
 suite asserts the complete shipped matrix, expected archive names, checksum

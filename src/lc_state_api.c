@@ -617,7 +617,7 @@ int lc_engine_client_acquire(lc_engine_client *client,
 
   lc_engine_lonejson_runtime(client)->cleanup(
       lc_engine_lonejson_runtime(client), &lc_engine_acquire_response_map,
-      &response_json);
+      &response_json, NULL);
   lc_engine_http_result_cleanup(&result);
   return LC_ENGINE_OK;
 }
@@ -807,7 +807,7 @@ int lc_engine_client_keepalive(lc_engine_client *client,
 
   lc_engine_lonejson_runtime(client)->cleanup(
       lc_engine_lonejson_runtime(client), &lc_engine_keepalive_response_map,
-      &response_json);
+      &response_json, NULL);
   lc_engine_http_result_cleanup(&result);
   return LC_ENGINE_OK;
 }
@@ -1019,7 +1019,7 @@ int lc_engine_client_update_stream(lc_engine_client *client,
 
   lc_engine_lonejson_runtime(client)->cleanup(
       lc_engine_lonejson_runtime(client), &lc_engine_update_response_map,
-      &response_json);
+      &response_json, NULL);
   lc_engine_http_result_cleanup(&result);
   return LC_ENGINE_OK;
 }
