@@ -81,16 +81,15 @@ use `LD_LIBRARY_PATH` or a host Lua interpreter.
 | --- | --- | --- |
 | [cpkt](https://github.com/c89systems/cpkt) | 0.7.0 | Core SDK dependencies and Lua runtime |
 | [cpktdb](https://github.com/c89systems/cpktdb) | 0.4.0 | Optional PostgreSQL C89 facade and database SDK |
-| lonejson | 0.48.0 (ABI 28) | JSON parsing, mapping, and streaming |
+| lonejson | 0.49.0 (ABI 29) | JSON parsing, mapping, and streaming |
 | libpslog | 0.13.0 | SDK diagnostics |
 | liblql | 0.4.1 | Pouch query support |
 | cmocka | 2.0.2 | Unit tests only; target-specific static library from cpkt |
 
-Lonejson 0.48.0 advances its ABI from 27 to 28: mapped-record init/reset/cleanup
-calls now return status and accept an optional error output. Rebuild lonejson
-consumers and Lua native modules together against the matching SDK. Liblockdc
-checks initialization/reset errors before parsing; its public C layouts and
-core ABI 9 remain unchanged. See the [upgrade notes](../CHANGELOG.md#upgrading-from-029x).
+Lonejson 0.49.0 advances its ABI from 28 to 29 by adding a push-fed value visitor
+to the runtime receiver. Rebuild lonejson consumers and Lua native modules
+together against the matching SDK. Check the status of mapped-record
+init/reset/cleanup calls. See the [upgrade notes](../CHANGELOG.md#upgrading-from-030x).
 
 OpenSSL, curl, zlib, nghttp2, libssh2, and Lua come from cpkt. cmocka comes from
 cpkt's target-specific SDK and remains a test-only dependency.

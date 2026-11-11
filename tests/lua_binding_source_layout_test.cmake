@@ -38,7 +38,7 @@ file(READ "${LOCKDC_ROOT}/scripts/validate_luarocks.sh" validate_luarocks_script
 file(READ "${LOCKDC_ROOT}/scripts/build_lua_rock.sh" build_luarock_script)
 foreach(required_snippet
     "package = \"lockdc\""
-    "\"lonejson == 0.48.0-1\""
+    "\"lonejson == 0.49.0-1\""
     "url = \"git+https://github.com/c89systems/liblockdc.git\""
     "tag = \"v"
     "scripts/build_lua_rock.sh"
@@ -83,7 +83,7 @@ endforeach()
 
 foreach(required_snippet
     "set -euo pipefail"
-    "https://github.com/c89systems/lonejson/releases/download/v0.48.0/lonejson-0.48.0-1.src.rock"
+    "https://github.com/c89systems/lonejson/releases/download/v0.49.0/lonejson-0.49.0-1.src.rock"
     "export LONEJSON_LIBDIR"
     "unset LD_LIBRARY_PATH"
     "unset LD_PRELOAD"

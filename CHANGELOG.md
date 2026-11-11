@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.31.0
+
+- Upgrade lonejson to 0.49.0 (ABI 29) across all seven SDK targets and pin the
+  matching Lua rock. The runtime receiver adds `value_visitor_stream_open` for
+  push-fed value visitors.
+
+### Upgrading from 0.30.x
+
+Rebuild lonejson consumers and Lua native modules against ABI **29** and install
+`lonejson == 0.49.0-1`. The runtime receiver layout changes from ABI 28.
+Liblockdc's public C layouts retain core ABI **9** and PostgreSQL provider ABI
+**0**. Mapped-record lifecycle calls retain their fallible status contract.
+
 ## 0.30.0
 
 - Upgrade the optional cpktdb SDK to 0.4.0 across all seven targets, requiring

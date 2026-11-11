@@ -161,6 +161,10 @@ foreach(symbol IN ITEMS
     lonejson_value_rewrite_selector_reader
     lonejson_value_rewrite_selector_filep
     lonejson_value_rewrite_selector_path
+    lonejson_value_visitor_stream_open
+    lonejson_value_visitor_stream_push
+    lonejson_value_visitor_stream_finish
+    lonejson_value_visitor_stream_close
     lonejson_default_sse_options
     lonejson_sse_open
     lonejson_sse_push

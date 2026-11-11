@@ -51,7 +51,7 @@ assert_contains(deps_script "toolchain_archive=$toolchain_archive" "dependency m
 assert_contains(deps_script "toolchain_root=$toolchain_root" "dependency manifest toolchain root")
 assert_contains(deps_script "toolchain_sysroot=$toolchain_sysroot" "dependency manifest toolchain sysroot")
 assert_contains(deps_script "toolchain_target_triple=$toolchain_target_triple" "dependency manifest toolchain target triple")
-assert_contains(deps_script [=[lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-28}]=] "lonejson ABI readiness check knob")
+assert_contains(deps_script [=[lonejson_abi_version=${LOCKDC_LONEJSON_ABI_VERSION:-29}]=] "lonejson ABI readiness check knob")
 assert_contains(deps_script [=[liblql_abi_version=${LOCKDC_LIBLQL_ABI_VERSION:-0}]=] "liblql ABI readiness check knob")
 assert_contains(deps_script "liblql-0.4.1-x86_64-linux-gnu.tar.gz)\n    liblql_asset_hash=d6b3d12afcf6ba2582cb9103cc6a6a97a7378870d969e0755d467d72b9f43030" "x86_64 GNU liblql 0.4.1 release artifact")
 assert_contains(deps_script "liblql-0.4.1-x86_64-linux-musl.tar.gz)\n    liblql_asset_hash=0379c745309924310155f0270d4199263ba8273ae138d7e5d45c956588aa608a" "x86_64 musl liblql 0.4.1 release artifact")
