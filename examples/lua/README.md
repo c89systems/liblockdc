@@ -27,8 +27,8 @@ native provider/cpktdb SDKs. Core Lua remains usable without them. Static hosts
 preload the linked registration entry point. See the [Lua XA guide](../../docs/lua.md#optional-postgresql-participation)
 for managed transactions, manual participant APIs and checked query adapters.
 
-For this release line, the `lockdc` rock declares `lonejson == 0.49.0-1`. That
-matches the native `lonejson 0.49.0` dependency used by the C SDK for mapped
+For this release line, the `lockdc` rock declares `lonejson == 0.50.0-1`. That
+matches the native `lonejson 0.50.0` dependency used by the C SDK for mapped
 state load/save and internal JSON response parsing.
 
 When running from this repository after installing `lockdc` and `lonejson` into

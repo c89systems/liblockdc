@@ -177,13 +177,14 @@ That ABI change covers atomic collection edits and recovery heads; see
 [the edit contract](collection-edits.md) and
 [upgrade instructions](../CHANGELOG.md#upgrading-from-025x).
 
-The dependency ABI is separate: the SDK uses lonejson 0.49.0 with ABI **29**.
-Its runtime receiver adds `value_visitor_stream_open`, changing the layout from
-ABI 28. Mapped-record init/reset/cleanup calls return status and accept an
-optional error output. Check initialization/reset before using records; on a
-cleanup workspace allocation failure, retain the record and retry. Rebuild
-lonejson consumers and Lua native modules against the matching SDK. Liblockdc's
-mapped load/save signatures and lonejson map layouts remain unchanged. See
+The dependency ABI is separate: the SDK uses lonejson 0.50.0 with ABI **29**.
+ABI 29 was introduced in lonejson 0.49.0 with `value_visitor_stream_open` on
+the runtime receiver. Mapped-record init/reset/cleanup calls return status and
+accept an optional error output. Check initialization/reset before using records;
+on a cleanup workspace allocation failure, retain the record and retry. When
+upgrading from ABI 28, rebuild lonejson consumers and Lua native modules against
+the matching SDK. Liblockdc's mapped load/save signatures and lonejson map layouts
+remain unchanged. See
 [the dependency upgrade notes](../CHANGELOG.md#upgrading-from-030x).
 
 Pouch upgrades released collection heads on open under exclusive root access,

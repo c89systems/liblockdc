@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.31.1
+
+- Upgrade lonejson to 0.50.0 (ABI 29) and the matching Lua rock across all seven
+  SDK targets. This includes upstream fixes for array-stream constructor error
+  initialization and incomplete Lua record cleanup, plus parser/writer hot-path
+  simplifications.
+
 ## 0.31.0
 
 - Upgrade lonejson to 0.49.0 (ABI 29) across all seven SDK targets and pin the
