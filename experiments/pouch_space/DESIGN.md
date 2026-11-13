@@ -23,9 +23,10 @@ zero-filling fallback exists. Two 4 KiB root pages, a protected 128 KiB metadata
 allocation region and a 128 KiB publication journal occupy 264 KiB. The typed
 copy-on-write directory and packed descriptor pages start in that metadata
 region and can allocate further pages from the common pool. The global 64 KiB
-checkpoint ceiling is removed. A single publication descriptor still fits the
-128 KiB journal; extent manifests for larger individual streams remain required
-before large-capacity testing. No 250 MiB or 100 GB test is claimed.
+checkpoint ceiling is removed. An immutable prototype value's publication
+descriptor still fits the 128 KiB journal. Canonical streams instead publish
+one fixed-size descriptor per owned run, without a growing single manifest.
+No 250 MiB or 100 GB test is claimed.
 
 Foreground admission preserves 16 KiB of payload capacity for maintenance plus
 a conservative allowance for the next complete live metadata directory and its
@@ -136,8 +137,73 @@ incremental metadata checkpoint; no live payload is copied. Checkpoint/growth
 serialize publication and allocation, but never wait on a producer callback or
 on readers to finish.
 
+## Canonical append-owned streams
+
+`stream.[ch]` adds one cached owner per typed logical stream. A stream head is an
+80-byte metadata record with stable incarnation, checkpoint tail, capacity and
+grant count. Each grant has an 88-byte descriptor and owns whole physical pages.
+Its immutable 64-byte header binds container identity, head and grant
+incarnations, logical base, physical offset and size. Its descriptor checksum
+covers that header; the canonical record owner checks its mutable record bytes.
+The head/grant chain is validated on recovery, including orphan and capacity
+mismatches. Normal immutable-value APIs reject these types.
+
+Grants normally grow from 4 KiB through 16, 64 and 256 KiB to 1 MiB, then remain
+at 1 MiB; fragmentation or protected-capacity admission can reduce a grant. A
+grant's header is hidden from logical offsets. The heap run vector follows
+actual grants and supports binary lookup; readers capture immutable mappings
+under a short stream mutex. The 16 KiB producer buffer flushes directly into
+owned ranges, with no document materialization or spool. Private-range patching
+supports canonical metadata and PENDING-header finalization, including records
+crossing run boundaries. A second appender on the same owner gets a busy error;
+other streams and readers remain independent.
+
+Only creation and run grants add structural journal events. A complete canonical
+append advances an in-memory readiness sequence and tail hint; durable commit
+waits for the root barrier covering that sequence before exposing its new tail
+through the stream owner. Ready sequences are separate from structural journal
+LSNs, including mixed immutable/stream groups. They use the existing caller-led
+coordinator without a timer or background writer. A lone steady-state durable
+appender still syncs each commit. Creating a head and preparing uncertified
+space can require additional barriers. Read handles snapshot committed ranges
+and retain the owner across later appends and checkpoints.
+
+Fresh creation certifies initially zero free pages. Reopen, retirement and growth
+do not: growth can encounter an existing ignored file tail. Before publishing a
+grant from uncertified space, reserve a private batch of at most 1 MiB, initialize
+it, write the first grant header and wait for preparation durability. Only after
+that barrier may spare zeroed pages return to the common free list. Concurrent
+preparations may share a commit barrier; no other allocator may use an in-flight
+spare range. The zero certificate exists only in memory and disappears on reopen.
+Admission preserves full checkpoint/maintenance allowance even while the whole
+batch is private. Unsupported allocation and I/O failures follow the normal
+cleanup or poisoned-handle rules.
+
+Native initialization uses Linux `FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE`:
+the range reads as zero while remaining allocated and retaining file size
+([Linux fallocate contract](https://www.man7.org/linux/man-pages/man2/fallocate.2.html)).
+Missing/unsupported zero-range operations fall back to 16 KiB offset writes;
+initial creation and growth still require real preallocation. Tests cover both
+paths, interrupted zero-range calls, backing reservation, partial failures and
+durable zero provenance. This is initialization of private/free space, not a
+hole-punching storage policy.
+
+The canonical owner's recovery callback validates records from the trusted
+checkpoint tail, using bounded read-ahead and its existing record checksums.
+Only this callback may inspect candidate bytes beyond the published tail. The
+stream then clears the entire rejected suffix and synchronizes before write
+admission, preventing later valid-looking debris from resurrecting. An abandoned
+written append is likewise cleared and synced before another appender; its
+existing buffer supplies the bounded fallback. Failed cleanup poisons the space.
+Opening a checkpointed stream does not scan its acknowledged bodies.
+
+These streams have no sealing, retirement, logical name catalogs, public retry
+authority or process-shared ownership yet. Their comparison fixture uses the
+actual Pouch header codec and canonical finalization rules, but minimal metadata;
+it does not establish full public semantics or feature parity.
+
 The protected metadata region cannot be consumed by payloads. Relocating
-compaction, metadata repacking, transforms,
+compaction, metadata repacking, transforms, stream retirement,
 multi-process coordination and full Pouch integration remain future work. The
 foundation implements retirement/reuse without relocation and makes no claim
 that all draft acceptance criteria are already satisfied.

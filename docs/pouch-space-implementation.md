@@ -78,8 +78,31 @@ free-span selection and ownership reconstructed from all replay dependencies.
 Tests cover fragmented spans, every cell boundary, pinned retirement, independent
 publication/checkpoint during a held neighbouring write, malformed ownership,
 and each publication I/O/heap failure, including mixed whole-run/cell cleanup.
-Canonical append-owned streams, metadata repacking and production integration
-remain to be implemented.
+Canonical append-owned streams are now implemented in the experimental target.
+An immutable identity header binds each whole-page grant to its stream and
+logical base; a typed head checkpoints its tail and grant directory. Appending
+inside an existing grant adds no container journal entry. The existing canonical
+record owner supplies validation and recovery, including PENDING-header fixups;
+the physical boundary does not parse JSON or introduce another document WAL.
+Read handles snapshot committed ranges, while append/patch and physical mapping
+use bounded buffers outside the allocator mutex.
+
+Reused, reopened and grown free intervals carry no zero certificate. Before a
+grant becomes recoverable, initialize and sync at most 1 MiB of private space;
+only then return its unused zeroed spare pages to the allocator. Preparation
+uses the same caller-led readiness coordinator as commits and may share a
+barrier. Linux zero-range allocation preserves backing reservation; bounded
+offset writes provide the unsupported-filesystem fallback. Recovery clears the
+complete rejected suffix and syncs before admitting appenders. Tests cover
+persisted grant metadata ahead of body writes, held preparation concurrent with
+unrelated publication/checkpoint, all preparation/recovery I/O and allocation
+failures, and pre-existing bytes beyond the committed capacity during growth.
+
+These streams do not yet implement sealing/retirement, typed name catalogs,
+public collection positions, receipts or shared-root ownership. Metadata
+repacking and production integration also remain to be implemented. See the
+[stream design](../experiments/pouch_space/stream.h) and
+[measured scope and regressions](pouch-space-experiment.md).
 
 ## Integration and acceptance
 
@@ -90,7 +113,7 @@ behavior suites. Remove filesystem assumptions at their owning typed boundary;
 do not create hidden persistent sidecars. Explicitly accepted disposable scratch
 retains bounded ownership, cleanup and measured I/O, including process death.
 
-Maintenance includes compaction, retention and bounded resumable conversion.
+Maintenance includes compaction, retention and bounded resumable codec conversion.
 Shared-root coordination must protect publication and reader generations across
 process death; an exclusive whole-file open alone does not implement it.
 

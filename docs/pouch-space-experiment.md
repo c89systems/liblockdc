@@ -389,12 +389,172 @@ and `packing-paired/`. The pre-packing executable is retained as
 unchanged. The physical foundation still lacks the public semantics described
 in the measurement contract, so these results are not full-backend acceptance.
 
+## Canonical stream follow-up
+
+The experimental target now has append-owned canonical streams, with fixed-size
+run grants and checkpoint tail hints. Appending inside a grant emits no
+per-document container journal event. Producers and readers use 16 KiB buffers;
+the record owner supplies canonical validation, metadata/header patches and
+tail recovery. Reused space is durably initialized before grant publication.
+Preparation batches at most 1 MiB, returns spare zeroed pages only after its
+barrier, and can share that barrier with other ready work. The
+[design contract](../experiments/pouch_space/DESIGN.md#canonical-append-owned-streams)
+describes ownership, suffix repair and the native/fallback initialization paths.
+
+The stream fixture uses the actual Pouch binary header codec, payload CRC and
+PENDING-finalization rules, with a key and minimal 16-byte row/round metadata.
+Collection-shaped input also passes the existing incremental JSON validator.
+It lacks public catalogs, SHA-256 identities, receipts, permanent positions,
+leases, codecs, indexes and XA/outbox semantics. Normal Pouch still uses its
+multifile implementation. These comparisons measure the physical foundation
+and do not establish feature parity or production-backend acceptance.
+
+All 31 experiment tests pass under Debug ASan/UBSan and native glibc/musl
+Release; affected stream additions were rerun after the final test edits.
+All seven storage tests pass under ThreadSanitizer. Final stream Memcheck
+reports 3,257,946 observable checks, zero errors and every heap allocation freed.
+Coverage includes every append, preparation, checkpoint and open/repair I/O or
+heap failure; persisted torn prefixes; grant-before-body persistence; complete
+rejected-suffix clearing; fixed reader views; fragmented grants; full capacity
+and growth; and held sync/preparation concurrent with independent publication
+and checkpoint. Mixed immutable/stream groups prove exact durable-prefix
+visibility. Stale/foreign references, failed-open cleanup, invalid read ranges
+and empty reads at the committed tail are covered too.
+
+A growth regression was reproduced before its correction: an ignored existing
+file tail could contain valid-looking canonical records, and preallocation did
+not erase them. Grown free intervals now remain uncertified until preparation.
+The regression verifies both native zero-range allocation and bounded-write
+fallback, durable zero provenance and successful append/reopen afterward.
+These are deterministic storage-protocol tests, not hardware power-loss proof.
+
+### Fresh stores
+
+The final comparison contains 240 fresh-store runs, alternating all six variants
+over five samples and the same eight profiles. Each cell lists median write
+milliseconds as **stream / packed immutable prototype / current Pouch**:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-nosync-1w | 1.35 / 1.58 / 13.08 | 1.39 / 1.64 / 29.39 |
+| small-nosync-4w | 1.33 / 2.71 / 15.77 | 1.12 / 2.08 / 14.49 |
+| small-durable-1w | 624.17 / 811.62 / 1248.50 | 318.97 / 392.11 / 628.90 |
+| small-durable-4w | 509.48 / 516.71 / 939.37 | 218.52 / 231.42 / 414.41 |
+| large-nosync-1w | 5.29 / 4.51 / 39.04 | 3.58 / 3.69 / 24.39 |
+| large-nosync-4w | 2.79 / 3.20 / 15.70 | 1.78 / 2.04 / 2.26 |
+| large-durable-1w | 322.63 / 353.48 / 352.19 | 157.35 / 189.90 / 158.87 |
+| large-durable-4w | 174.61 / 184.55 / 338.63 | 102.56 / 83.42 / 158.11 |
+
+Small single-writer durable state ranges are disjoint: stream 610–653 ms,
+packed 775–932 ms and Pouch 1119–1290 ms. Its 256 record publications still use
+256 steady-state data syncs, plus one stream-head creation sync. Stream kernel
+write accounting is 1,343,488 bytes versus packed 2,117,632 and Pouch 1,458,176.
+This result does not come from weakening sync-on-commit.
+
+There is no universal win. Large single-writer durable ranges overlap across
+all three variants. Large durable four-writer collections are slower than the
+packed prototype: 98–107 ms versus 80–94 ms, although Pouch takes 125–237 ms.
+Large single-writer NoSync state has a worse median close/open/first-read cycle:
+23.90 ms versus Pouch 15.91 ms, with overlapping ranges of 20.17–36.18 and
+14.03–33.55 ms. Warm verified state reads take about 0.2–0.5 ms for small
+profiles versus Pouch 1.9–4.8 ms, and 1.9–2.9 ms for large profiles versus
+2.7–3.9 ms. These remain cached physical reads, not concurrent scans or
+cold-cache query measurements.
+
+Geometric grants reserve slack: the fresh large four-writer collection profile
+reserves 5,586,944 payload bytes for 2 MiB of application payload. Grant policy,
+many-small-owner behavior and maintenance reclamation still need measurement
+and tuning before production integration.
+
+### Longer append histories
+
+Another 120 runs publish 2,048 records of 1 KiB each, with five samples. State
+writes 1,024 keys twice; collections append 2,048 keys once. The packed prototype
+checkpoints once in every write phase; streams checkpoint zero times:
+
+| Profile | State, stream / packed / Pouch ms | Collection, stream / packed / Pouch ms |
+| --- | ---: | ---: |
+| long-nosync-1w | 4.46 / 23.24 / 51.03 | 8.18 / 24.31 / 160.15 |
+| long-nosync-4w | 2.98 / 26.22 / 21.51 | 4.22 / 32.79 / 79.12 |
+| long-durable-1w | 5203.32 / 6446.37 / 9907.10 | 4909.55 / 5517.78 / 10129.48 |
+| long-durable-4w | 3742.90 / 3746.34 / 6260.15 | 3792.48 / 3634.73 / 7040.06 |
+
+Four-writer NoSync state stream ranges are disjoint from both references:
+2.23–3.40 ms versus packed 23.10–28.98 ms and Pouch 20.18–50.62 ms.
+The median per-run maximum operation is 0.325 ms versus 14.44 ms for each
+reference; p99 alone would hide the packed prototype's checkpoint stall.
+A single stream uses six grants and 608 journal bytes for all 2,048 records;
+four streams use 20 grants and 2,080 journal bytes. Fresh NoSync streams issue
+no write-phase syncs, while the packed prototype issues three structural barriers.
+
+All four long durable stream/Pouch write-time ranges are disjoint. A lone
+durable state writer uses 2,049 data syncs including head creation, versus
+2,048 for Pouch. Four state writers use a median 1,003 versus 2,048. Tail
+latency is still noisy: the largest observed single-writer durable stream state
+operation is 224 ms versus Pouch's 54 ms in that profile. A lower total time
+or p99 does not establish a bound on the worst operation.
+
+Verified long warm state reads take about 1.4–2.1 ms versus Pouch 13.7–20.7 ms.
+The four-writer NoSync close/open/first-read cycle is 32.82 ms versus Pouch
+74.78 ms. The packed prototype's corresponding cycle is faster, at 12.07 ms;
+canonical tail recovery and rejected-suffix stabilization remain real costs.
+
+### Writing after reopen
+
+The initial unbatched stream implementation exposed a material regression.
+Four-writer NoSync state after reopening took a median 138.46 ms, with a
+98.53–151.58 ms range, and performed 20 separate preparation syncs. Kernel
+write accounting was 7,991,296 bytes. This prompted private preparation batches,
+shared readiness barriers and the native zero-range operation, with bounded
+writes retained as its fallback.
+
+The corrected comparison reopens each empty store before writing, then repeats
+the long workload across all six variants and three samples (72 runs). The
+pre-write close/open cost is reported separately as `preopen_ms` for every
+engine. Median write-phase milliseconds:
+
+| Profile | State, stream / packed / Pouch ms | Collection, stream / packed / Pouch ms |
+| --- | ---: | ---: |
+| long-nosync-1w | 30.62 / 19.86 / 52.53 | 37.59 / 23.76 / 143.96 |
+| long-nosync-4w | 19.19 / 30.38 / 21.35 | 13.28 / 30.09 / 77.11 |
+| long-durable-1w | 4527.27 / 5014.84 / 9718.41 | 5153.06 / 7067.01 / 9951.51 |
+| long-durable-4w | 3891.64 / 3806.71 / 6913.02 | 3699.47 / 3276.16 / 6950.86 |
+
+Four-writer NoSync state now takes 14.80–20.71 ms, with 2–3 preparation syncs
+and median kernel writes of 2,252,800 bytes. Pouch takes 19.57–24.54 ms, so
+their ranges overlap. Stream collections take 12.41–14.13 ms and two syncs,
+versus Pouch 60.76–78.94 ms. State's median maximum operation falls from
+35.36 ms before batching to 9.91 ms afterward. Preparation remains a visible
+cost relative to the fresh state median of 2.98 ms; reopened single-writer
+NoSync streams also remain slower than the packed prototype.
+
+Across all 432 corrected runs, payloads verify before and after reopen, record
+counts match, each container is exactly one store file with reserved backing,
+and every stream write phase has zero metadata checkpoints. The 240 fresh and
+120 long runs exercise unchanged fixed-capacity paths; the subsequent growth
+certificate correction is covered separately by the final verification and
+the reopened matrix. Structural LSNs and runtime readiness now differ, so
+`max_sync_batch` counts readiness units, including grants/preparation and prior
+NoSync work, rather than a comparable number of application commits.
+
+Raw corrected logs are in `build/pouch-space-integrated/streams-batched-measure/`,
+`streams-batched-long/` and `streams-batched-reopen/`. Earlier unbatched logs
+remain in `streams-measure/`, `streams-long/` and `streams-reopen/`.
+`streams-results.json` retains all 864 raw rows and their median/min/max
+summaries. The unbatched executable is retained as
+`pouch_space_compare-streams-unbatched`. No source or artifact of the normal
+Pouch backend was changed by this stream stage.
+
 ## Reproduce
 
 ```sh
 bash scripts/compare_pouch_space.sh smoke
 bash scripts/compare_pouch_space.sh measure "$PWD/build/pouch-space-comparison"
 bash scripts/compare_pouch_space.sh rollover "$PWD/build/pouch-space-rollover"
+bash scripts/compare_pouch_space.sh streams "$PWD/build/pouch-space-streams"
+bash scripts/compare_pouch_space.sh streams-long "$PWD/build/pouch-space-streams-long"
+POUCH_SPACE_RUNS=3 bash scripts/compare_pouch_space.sh streams-long-reopen \
+  "$PWD/build/pouch-space-streams-reopened"
 ```
 
 `POUCH_SPACE_RUNS` accepts 3, 5 (default), 7 or 9. An optional absolute directory
@@ -424,11 +584,12 @@ The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
-packing follow-up. Before a production adapter, complete canonical append-owned
-streams and their typed catalogs, checkpoint scheduling,
+packing and canonical-stream follow-ups. Before a production adapter, complete
+stream sealing/retirement, typed catalogs, checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection
-position or retry authority. Full codec/index/XA/outbox integration and migration
-remain outside this first milestone. Production adoption still requires the
+position or retry authority. Full codec/index/XA/outbox integration remains part
+of the authorized native implementation; existing-root conversion is excluded.
+Production adoption still requires the
 broader [draft acceptance evidence](pouch-space.md).

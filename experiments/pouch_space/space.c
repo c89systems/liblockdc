@@ -3,10 +3,12 @@
 #include "space.h"
 #include "directory.h"
 #include "lc_api_internal.h"
+#include "owned.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <linux/falloc.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,8 @@
 #define TOKEN_RANGE UINT64_C(4294967296)
 enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS };
 #define EXTENT_PACKED 1U
+#define EXTENT_OWNED 2U
+#define OWNED_MAGIC UINT64_C(0x314e55524f5350)
 #define CELLS (PS_PAGE / PS_CELL)
 
 typedef struct ps_extent {
@@ -36,6 +40,8 @@ typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
   uint64_t publication_sequence;
+  uint64_t stream_capacity, stream_runs;
+  int stream_open;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
@@ -45,9 +51,11 @@ typedef struct ps_entry {
   struct ps_entry *retired_next, **retired_link;
   struct ps_entry *dirty_next, **dirty_link;
   ps_directory_value checkpoint_ref, pending_ref;
+  struct ps_entry *stream_next;
 } ps_entry;
 typedef struct ps_run {
   uint64_t offset, bytes;
+  int clean;
   struct ps_run *next;
 } ps_run;
 typedef struct ps_payload_page {
@@ -82,6 +90,7 @@ struct ps_space {
   size_t packed_pages;
   uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
+  ps_entry *stream_buckets[BUCKETS];
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];
   ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
@@ -100,6 +109,14 @@ struct ps_reader {
   ps_entry *entry;
   size_t extent, offset, loaded;
   unsigned char buffer[PS_CHUNK];
+};
+struct ps_owned_head {
+  ps_space *space;
+  ps_entry *entry;
+};
+struct ps_owned_run {
+  ps_space *space;
+  ps_entry *entry;
 };
 
 static void put64(unsigned char *p, uint64_t n) {
@@ -156,6 +173,10 @@ static int native_reserve(void *c, int fd, off_t o, off_t n) {
   (void)c;
   return fallocate(fd, 0, o, n);
 }
+static int native_zero(void *c, int fd, off_t o, off_t n) {
+  (void)c;
+  return fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, o, n);
+}
 static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
                     int writing, lc_error *error) {
   unsigned char *p = bytes;
@@ -175,6 +196,31 @@ static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
     p += result;
     n -= (size_t)result;
     offset += (uint64_t)result;
+  }
+  return LC_OK;
+}
+static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
+                            unsigned char *zero, lc_error *error) {
+  size_t n;
+  int rc;
+  if (!bytes)
+    return LC_OK;
+  if (s->io.zero) {
+    do {
+      rc = s->io.zero(s->io.context, s->fd, (off_t)offset, (off_t)bytes);
+    } while (rc < 0 && errno == EINTR);
+    if (rc == 0)
+      return LC_OK;
+    if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL)
+      return io_error(s, error, "container zero initialization failed");
+  }
+  while (bytes) {
+    n = bytes > PS_CHUNK ? PS_CHUNK : (size_t)bytes;
+    rc = transfer(s, zero, n, offset, 1, error);
+    if (rc != LC_OK)
+      return rc;
+    offset += n;
+    bytes -= n;
   }
   return LC_OK;
 }
@@ -252,6 +298,9 @@ static uint64_t aligned(uint64_t n) {
   return (n + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
 }
 static int valid_key(ps_key k) {
+  return k.kind >= PS_STATE && k.kind <= PS_OWNED_RUN;
+}
+static int immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION;
 }
 static size_t bucket(ps_key k) {
@@ -270,7 +319,20 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
       return p;
   return NULL;
 }
-static size_t entry_bytes(const ps_entry *p) { return 64 + 24 * p->count; }
+static size_t entry_bytes(const ps_entry *p) {
+  return p->key.kind == PS_STREAM ? 80 : 64 + 24 * p->count;
+}
+static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
+  ps_entry *p;
+  for (p = s->stream_buckets[token % BUCKETS]; p; p = p->stream_next)
+    if (p->token == token)
+      return p;
+  return NULL;
+}
+static void stream_register(ps_space *s, ps_entry *p) {
+  p->stream_next = s->stream_buckets[p->token % BUCKETS];
+  s->stream_buckets[p->token % BUCKETS] = p;
+}
 static void register_entry(ps_space *s, ps_entry *p) {
   p->all_next = s->entries;
   p->all_link = &s->entries;
@@ -304,6 +366,12 @@ static void retire(ps_space *s, ps_entry *p) {
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
+  if (p->key.kind == PS_STREAM && !p->deleted) {
+    link = &s->stream_buckets[p->token % BUCKETS];
+    while (*link != p)
+      link = &(*link)->stream_next;
+    *link = p->stream_next;
+  }
   p->hash_next = NULL;
   p->state = 2;
   p->retired_link = &s->retired;
@@ -324,6 +392,8 @@ static void install(ps_space *s, ps_entry *p) {
   p->state = 1;
   p->hash_next = s->buckets[bucket(p->key)];
   s->buckets[bucket(p->key)] = p;
+  if (p->key.kind == PS_STREAM && !p->deleted)
+    stream_register(s, p);
   if (!p->deleted) {
     s->metadata += entry_bytes(p);
     ++s->live_entries;
@@ -349,7 +419,8 @@ static void free_insert(ps_space *s, ps_run *node) {
   link = head;
   while (*link && (*link)->next) {
     next = (*link)->next;
-    if ((*link)->offset + (*link)->bytes == next->offset) {
+    if ((*link)->offset + (*link)->bytes == next->offset &&
+        (*link)->clean == next->clean) {
       (*link)->bytes += next->bytes;
       (*link)->next = next->next;
       lc_free_with_allocator(NULL, next);
@@ -357,9 +428,23 @@ static void free_insert(ps_space *s, ps_run *node) {
       link = &(*link)->next;
   }
 }
+static void take_selected(ps_run **link, uint64_t *available, uint64_t bytes,
+                          uint64_t *out, int *clean) {
+  ps_run *node = *link;
+  if (clean)
+    *clean = node->clean;
+  *available -= bytes;
+  *out = node->offset;
+  node->offset += bytes;
+  node->bytes -= bytes;
+  if (!node->bytes) {
+    *link = node->next;
+    lc_free_with_allocator(NULL, node);
+  }
+}
 static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
-                         uint64_t *out, lc_error *error) {
-  ps_run **link = head, *node;
+                         uint64_t *out, int *clean, lc_error *error) {
+  ps_run **link = head;
   while (*link && (*link)->bytes < *bytes)
     link = &(*link)->next;
   /* Fragmentation must not strand usable pages behind a preferred run size. */
@@ -370,20 +455,12 @@ static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
   if (!*link)
     return err(error, LC_ERR_INVALID,
                "container payload capacity exhausted; checkpoint or grow");
-  node = *link;
-  *available -= *bytes;
-  *out = node->offset;
-  node->offset += *bytes;
-  node->bytes -= *bytes;
-  if (!node->bytes) {
-    *link = node->next;
-    lc_free_with_allocator(NULL, node);
-  }
+  take_selected(link, available, *bytes, out, clean);
   return LC_OK;
 }
 static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
                     lc_error *error) {
-  return take_interval(&s->free, &s->free_bytes, bytes, out, error);
+  return take_interval(&s->free, &s->free_bytes, bytes, out, NULL, error);
 }
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
@@ -415,6 +492,7 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
     tail->offset = offset + bytes;
     tail->bytes = node->offset + node->bytes - tail->offset;
     tail->next = node->next;
+    tail->clean = node->clean;
     node->next = tail;
   }
   *available -= bytes;
@@ -603,6 +681,10 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       put32(wire + 80 + 24 * i, p->extents[i].crc);
       put32(wire + 84 + 24 * i, p->extents[i].flags);
     }
+    if (p->key.kind == PS_STREAM) {
+      put64(wire + 64, p->stream_capacity);
+      put64(wire + 72, p->stream_runs);
+    }
   }
   put32(wire + 60,
         (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
@@ -618,7 +700,10 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
   count = get32(wire + 56);
-  if (count > (PS_JOURNAL - 64) / 24 || bytes != 64 + count * 24 ||
+  if (count > (PS_JOURNAL - 64) / 24 ||
+      bytes != (get32(wire + 16) == PS_STREAM && get32(wire + 20) == PS_PUT
+                    ? 80
+                    : 64 + count * 24) ||
       get32(wire + 20) > PS_RESERVE_IDS)
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -638,8 +723,19 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     return LC_OK;
   }
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
-      (*event == PS_REMOVE && (count || p->bytes)))
+      (*event == PS_REMOVE && (count || p->bytes || !immutable_key(p->key))))
     goto invalid;
+  if (p->key.kind == PS_STREAM && *event == PS_PUT) {
+    p->stream_capacity = get64(wire + 64);
+    p->stream_runs = get64(wire + 72);
+    if (count || p->bytes > p->stream_capacity ||
+        p->stream_capacity > s->capacity ||
+        (p->stream_runs == 0) != (p->stream_capacity == 0) ||
+        p->stream_runs > p->stream_capacity / (PS_PAGE - PS_RUN_HEADER))
+      goto invalid;
+    *out = p;
+    return LC_OK;
+  }
   if (count) {
     p->extents = lc_calloc_with_allocator(NULL, count, sizeof(*p->extents));
     if (!p->extents) {
@@ -653,9 +749,12 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     offset = get64(wire + 64 + 24 * i);
     n = get64(wire + 72 + 24 * i);
     p->extents[i].flags = get32(wire + 84 + 24 * i);
-    if (!n || n > PS_CHUNK || offset < PS_DATA || offset > s->capacity ||
-        n > s->capacity - offset ||
-        (p->extents[i].flags == EXTENT_PACKED
+    if (!n || n > (p->key.kind == PS_OWNED_RUN ? PS_MIB : PS_CHUNK) ||
+        offset < PS_DATA || offset > s->capacity || n > s->capacity - offset ||
+        (p->key.kind == PS_OWNED_RUN
+             ? (count != 1 || p->extents[i].flags != EXTENT_OWNED ||
+                offset % PS_PAGE || n % PS_PAGE)
+         : p->extents[i].flags == EXTENT_PACKED
              ? (n >= PS_PAGE || offset % PS_CELL ||
                 cell_count(n) * PS_CELL > PS_PAGE - offset % PS_PAGE)
              : (p->extents[i].flags || offset % PS_PAGE || n % PS_PAGE)) ||
@@ -674,10 +773,24 @@ invalid:
   entry_free(p);
   return err(error, LC_ERR_PROTOCOL, "invalid container ownership descriptor");
 }
+static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
+                        lc_error *error) {
+  int rc = transfer(s, header, PS_RUN_HEADER, p->extents[0].offset, 0, error);
+  if (rc == LC_OK &&
+      (checksum(header, PS_RUN_HEADER) != p->extents[0].crc ||
+       get64(header) != OWNED_MAGIC || get64(header + 8) != p->token ||
+       get64(header + 16) != p->key.owner || get64(header + 24) != p->key.key ||
+       get64(header + 32) != p->extents[0].offset ||
+       get64(header + 40) != p->bytes || memcmp(header + 48, s->identity, 16)))
+    rc = err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
+  return rc;
+}
 static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
                         lc_error *error) {
   size_t i;
   int rc;
+  if (p->key.kind == PS_OWNED_RUN)
+    return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
     rc = transfer(s, buffer, (size_t)p->extents[i].bytes, p->extents[i].offset,
                   0, error);
@@ -696,8 +809,10 @@ static int initial_free(ps_space *s, lc_error *error) {
     return err(error, LC_ERR_NOMEM, "cannot allocate container free intervals");
   s->free->offset = PS_DATA;
   s->free->bytes = s->free_bytes = s->capacity - PS_DATA;
+  s->free->clean = s->generation == 0;
   s->metadata_free->offset = 2 * PS_PAGE;
   s->metadata_free->bytes = s->metadata_free_bytes = PS_METADATA_RESERVE;
+  s->metadata_free->clean = s->generation == 0;
   return LC_OK;
 }
 static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
@@ -801,7 +916,7 @@ static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
     return err(error, LC_ERR_NOMEM, "cannot allocate metadata ownership");
   rc = s->metadata_free
            ? take_interval(&s->metadata_free, &s->metadata_free_bytes, &bytes,
-                           &p->run.offset, error)
+                           &p->run.offset, NULL, error)
            : take_run(s, &bytes, &p->run.offset, error);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, p);
@@ -1030,7 +1145,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   ++s->checkpoints;
   s->directory = new_root;
   s->journal = 0;
-  mark_durable(s, s->sequence);
+  mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
   ps_directory_changed_pages(directory, &changes);
   for (i = 0; i < changes.retired_count; ++i) {
     page = metadata_find(s, changes.retired[i].offset);
@@ -1070,7 +1185,8 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   size_t bytes = event == PS_PUT ? entry_bytes(p) : 64;
   unsigned char *wire;
   int rc;
-  if (s->sequence == UINT64_MAX)
+  if (s->sequence == UINT64_MAX ||
+      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container publication sequence exhausted");
   wire = lc_alloc_with_allocator(NULL, bytes);
@@ -1086,7 +1202,7 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   if (rc == LC_OK) {
     ++s->sequence;
     s->journal += bytes;
-    __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
   }
   return rc;
 }
@@ -1292,6 +1408,48 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
     entry_free(p);
   return rc;
 }
+static int validate_owned_directory(ps_space *s, lc_error *error) {
+  ps_entry *p, *run;
+  uint64_t i, base, expected = 0, actual = 0;
+  ps_key key;
+  key.kind = PS_OWNED_RUN;
+  for (p = s->entries; p; p = p->all_next) {
+    if (p->key.kind == PS_OWNED_RUN) {
+      ++actual;
+      if (!stream_lookup(s, p->key.owner))
+        return err(error, LC_ERR_PROTOCOL, "owned run has no stream head");
+    }
+    if (p->key.kind != PS_STREAM)
+      continue;
+    key.owner = p->token;
+    base = 0;
+    for (i = 0; i < p->stream_runs; ++i) {
+      key.key = base;
+      run = lookup(s, key);
+      if (!run || run->deleted ||
+          run->bytes - PS_RUN_HEADER > s->capacity - base)
+        return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
+      base += run->bytes - PS_RUN_HEADER;
+    }
+    if (base != p->stream_capacity)
+      return err(error, LC_ERR_PROTOCOL, "owned stream capacity mismatch");
+    expected += p->stream_runs;
+  }
+  return actual == expected
+             ? LC_OK
+             : err(error, LC_ERR_PROTOCOL, "unreferenced owned run directory");
+}
+static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
+  ps_entry *head = stream_lookup(s, p->key.owner);
+  if (!head || p->key.key != head->stream_capacity ||
+      p->bytes - PS_RUN_HEADER > s->capacity - head->stream_capacity)
+    return err(error, LC_ERR_PROTOCOL, "owned run grant is not contiguous");
+  head->stream_capacity += p->bytes - PS_RUN_HEADER;
+  ++head->stream_runs;
+  if (!head->dirty_link)
+    dirty_entry(s, head, NULL);
+  return LC_OK;
+}
 static int recover(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire,
                                           *buffer;
@@ -1348,6 +1506,8 @@ static int recover(ps_space *s, lc_error *error) {
     rc = ps_directory_visit(directory, recover_directory_entry,
                             recover_directory_page, &recovery, error);
   ps_directory_close(directory);
+  if (rc == LC_OK)
+    rc = validate_owned_directory(s, error);
   if (rc != LC_OK)
     goto done;
   rc = transfer(s, wire, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
@@ -1387,10 +1547,22 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
       old = lookup(s, p->key);
-      if (p->key.kind == PS_COLLECTION && old && !old->deleted) {
+      if (p->key.kind != PS_STATE && old && !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
                  "collection position overwritten in journal");
+        goto done;
+      }
+      if (p->key.kind == PS_OWNED_RUN) {
+        rc = install_owned_grant(s, p, error);
+        if (rc != LC_OK) {
+          entry_free(p);
+          goto done;
+        }
+      } else if (p->key.kind == PS_STREAM &&
+                 (p->bytes || p->stream_capacity || p->stream_runs)) {
+        entry_free(p);
+        rc = err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
         goto done;
       }
       register_entry(s, p);
@@ -1436,6 +1608,7 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
+  __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
   rc = grant_tokens(s, error);
   if (rc == LC_OK)
     rc = sync_file(s, error); /* accepted tail, retired sibling and grant */
@@ -1520,6 +1693,7 @@ int ps_open(const char *path, int create, const ps_options *options,
   s->io.write = native_write;
   s->io.sync = native_sync;
   s->io.reserve = native_reserve;
+  s->io.zero = native_zero;
   if (options->io) {
     s->io = *options->io;
     if (!s->io.read || !s->io.write || !s->io.sync || !s->io.reserve) {
@@ -1571,7 +1745,7 @@ int ps_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
-  mark_durable(s, s->sequence);
+  mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
   *out = s;
   return LC_OK;
 }
@@ -1594,7 +1768,7 @@ int ps_begin(ps_space *s, ps_key key, ps_writer **out, lc_error *error) {
   int rc;
   if (out)
     *out = NULL;
-  if (!s || !out || !valid_key(key))
+  if (!s || !out || !immutable_key(key))
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
   w = lc_calloc_with_allocator(NULL, 1, sizeof(*w));
@@ -1738,12 +1912,13 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   if (rc == LC_OK)
     rc = append_event(s, w->entry, PS_PUT, error);
   if (rc == LC_OK) {
-    w->entry->publication_sequence = s->sequence;
+    w->entry->publication_sequence =
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     old = lookup(s, w->entry->key); /* rollover may have retired a tombstone */
     dirty_entry(s, w->entry, old);
     install(s, w->entry);
     w->published = 1;
-    sequence = s->sequence;
+    sequence = w->entry->publication_sequence;
     memcpy(published_ref.container, s->identity, 16);
     published_ref.incarnation = w->entry->token;
   } else
@@ -1784,7 +1959,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   int rc;
   if (out)
     *out = NULL;
-  if (!s || !out || !valid_key(key))
+  if (!s || !out || !immutable_key(key))
     return err(error, LC_ERR_INVALID,
                "container reader requires typed key and output");
   r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
@@ -1870,7 +2045,7 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
   ps_entry *p, *tombstone;
   int rc;
   uint64_t sequence = 0;
-  if (!s || !valid_key(key))
+  if (!s || !immutable_key(key))
     return err(error, LC_ERR_INVALID, "container delete requires typed key");
   tombstone = lc_calloc_with_allocator(NULL, 1, sizeof(*tombstone));
   if (!tombstone)
@@ -1886,11 +2061,12 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
     tombstone->key = key;
     tombstone->token = p->token;
     tombstone->deleted = 1;
-    tombstone->publication_sequence = s->sequence;
+    tombstone->publication_sequence =
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     register_entry(s, tombstone);
     dirty_entry(s, tombstone, p);
     install(s, tombstone);
-    sequence = s->sequence;
+    sequence = tombstone->publication_sequence;
   } else
     entry_free(tombstone);
   pthread_mutex_unlock(&s->mutex);
@@ -1937,6 +2113,9 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   if (rc == LC_OK) {
     run->offset = capacity;
     run->bytes = bytes;
+    /* An ignored trailing range may already exist. fallocate reserves it but
+     * does not erase its contents; only owned preparation can certify zeros. */
+    run->clean = 0;
     free_insert(s, run);
   } else
     lc_free_with_allocator(NULL, run);
@@ -1976,7 +2155,8 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
     }
     if (p->state == 1 && !p->deleted) {
       ++out->entries;
-      out->live_bytes += p->bytes;
+      if (p->key.kind != PS_OWNED_RUN)
+        out->live_bytes += p->bytes;
     } else if (p->state == 2)
       out->retired_bytes += n;
     else
@@ -1984,4 +2164,430 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   }
   pthread_mutex_unlock(&s->mutex);
   return LC_OK;
+}
+
+static void owned_status(ps_owned_head *head, ps_owned_status *out) {
+  memcpy(out->ref.container, head->space->identity, 16);
+  out->ref.incarnation = head->entry->token;
+  out->tail = head->entry->bytes;
+  out->capacity = head->entry->stream_capacity;
+  out->runs = head->entry->stream_runs;
+}
+int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
+                  ps_owned_head **out, ps_owned_status *status,
+                  lc_error *error) {
+  ps_owned_head *head;
+  ps_entry *p = NULL;
+  uint64_t sequence = 0;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!s || !out || !status || key.kind != PS_STREAM || (create && ref))
+    return err(error, LC_ERR_INVALID, "owned stream open arguments invalid");
+  head = lc_calloc_with_allocator(NULL, 1, sizeof(*head));
+  if (!head)
+    return err(error, LC_ERR_NOMEM, "cannot allocate owned stream handle");
+  if (create) {
+    p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+    if (!p) {
+      lc_free_with_allocator(NULL, head);
+      return err(error, LC_ERR_NOMEM, "cannot allocate owned stream head");
+    }
+    p->key = key;
+  }
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK && create && lookup(s, key))
+    rc = err(error, LC_ERR_INVALID, "owned stream already exists");
+  if (rc == LC_OK && create && s->token_next > s->token_limit)
+    rc = err(error, LC_ERR_INVALID, "incarnation grant consumed; reopen");
+  if (rc == LC_OK && create)
+    rc = checkpoint_allowance(s, s->metadata + 80, s->live_entries + 1, 0,
+                              error);
+  if (rc == LC_OK && create) {
+    p->token = s->token_next++;
+    rc = append_event(s, p, PS_PUT, error);
+    if (rc == LC_OK) {
+      sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+      p->publication_sequence = sequence;
+      register_entry(s, p);
+      dirty_entry(s, p, NULL);
+      install(s, p);
+    }
+  }
+  if (!create)
+    p = lookup(s, key);
+  if (rc == LC_OK && (!p || p->deleted || p->stream_open))
+    rc = err(error, LC_ERR_INVALID,
+             "owned stream missing or already has an open owner");
+  if (rc == LC_OK && ref &&
+      (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
+    rc = err(error, LC_ERR_INVALID, "stale or foreign owned stream reference");
+  if (rc == LC_OK) {
+    head->space = s;
+    head->entry = p;
+    p->stream_open = 1;
+    ++p->pins;
+    ++s->readers;
+    owned_status(head, status);
+  } else if (create && p->state == 0)
+    entry_free(p);
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && create && s->durable)
+    rc = wait_durable(s, sequence, error);
+  if (rc == LC_OK)
+    *out = head;
+  else if (head->entry)
+    ps_owned_close(head);
+  else
+    lc_free_with_allocator(NULL, head);
+  return rc;
+}
+void ps_owned_close(ps_owned_head *head) {
+  ps_space *s;
+  if (!head)
+    return;
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  head->entry->stream_open = 0;
+  --head->entry->pins;
+  --s->readers;
+  if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
+    collect(s);
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, head);
+}
+int ps_owned_status_get(ps_owned_head *head, ps_owned_status *out,
+                        lc_error *error) {
+  int rc;
+  if (!head || !out)
+    return err(error, LC_ERR_INVALID, "owned status requires head and output");
+  pthread_mutex_lock(&head->space->mutex);
+  rc = healthy(head->space, error);
+  if (rc == LC_OK)
+    owned_status(head, out);
+  pthread_mutex_unlock(&head->space->mutex);
+  return rc;
+}
+static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
+                          ps_owned_run *run, lc_error *error) {
+  ps_space *s = head->space;
+  ps_entry *p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
+  unsigned char header[PS_RUN_HEADER];
+  uint64_t bytes = desired, reserved = 0, sequence = 0;
+  ps_run **choice = NULL, **link, **partial, **fit;
+  ps_run *spare = NULL;
+  int rc, clean = 0, registered = 0;
+  if (p)
+    p->extents = lc_calloc_with_allocator(NULL, 1, sizeof(*p->extents));
+  if (!p || !p->extents || !zero) {
+    if (p)
+      entry_free(p);
+    lc_free_with_allocator(NULL, zero);
+    return err(error, LC_ERR_NOMEM, "cannot allocate owned run preparation");
+  }
+  p->key.kind = PS_OWNED_RUN;
+  p->key.owner = head->entry->token;
+  p->key.key = base;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (base != head->entry->stream_capacity || s->token_next > s->token_limit))
+    rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
+  if (rc == LC_OK) {
+    for (;;) {
+      partial = fit = NULL;
+      choice = NULL;
+      for (link = &s->free; *link; link = &(*link)->next) {
+        if ((*link)->clean && (*link)->bytes >= bytes) {
+          choice = link;
+          break;
+        }
+        if ((*link)->clean && !partial)
+          partial = link;
+        if ((*link)->bytes >= bytes && !fit)
+          fit = link;
+      }
+      if (!choice)
+        choice = partial ? partial : fit ? fit : &s->free;
+      if (!*choice) {
+        rc = err(error, LC_ERR_INVALID,
+                 "owned payload capacity exhausted; grow");
+        break;
+      }
+      if (bytes > (*choice)->bytes)
+        bytes = (*choice)->bytes;
+      rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, bytes,
+                                error);
+      if (rc == LC_OK || bytes == PS_PAGE)
+        break;
+      lc_error_cleanup(error);
+      bytes /= 4;
+      if (bytes < PS_PAGE)
+        bytes = PS_PAGE;
+      bytes = bytes / PS_PAGE * PS_PAGE;
+    }
+  }
+  if (rc == LC_OK) {
+    reserved = bytes;
+    if (!(*choice)->clean && bytes < PS_MIB) {
+      reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
+      while (reserved > bytes) {
+        rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1,
+                                  reserved, error);
+        if (rc == LC_OK)
+          break;
+        lc_error_cleanup(error);
+        rc = LC_OK;
+        reserved = reserved / 2 / PS_PAGE * PS_PAGE;
+        if (reserved < bytes)
+          reserved = bytes;
+      }
+      if (reserved > bytes) {
+        spare = lc_calloc_with_allocator(NULL, 1, sizeof(*spare));
+        if (!spare)
+          rc = err(error, LC_ERR_NOMEM,
+                   "cannot allocate prepared free interval");
+      }
+    }
+  }
+  if (rc == LC_OK)
+    take_selected(choice, &s->free_bytes, reserved, &p->extents[0].offset,
+                  &clean);
+  if (rc == LC_OK) {
+    p->token = s->token_next++;
+    p->bytes = p->extents[0].bytes = reserved; /* entire private preparation */
+    p->count = p->capacity = 1;
+    p->extents[0].flags = EXTENT_OWNED;
+    register_entry(s, p);
+    ++s->writers;
+    registered = 1;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && !clean)
+    rc = initialize_range(s, p->extents[0].offset, reserved, zero, error);
+  if (rc == LC_OK) {
+    put64(header, OWNED_MAGIC);
+    put64(header + 8, p->token);
+    put64(header + 16, p->key.owner);
+    put64(header + 24, base);
+    put64(header + 32, p->extents[0].offset);
+    put64(header + 40, bytes);
+    memcpy(header + 48, s->identity, 16);
+    p->extents[0].crc = checksum(header, sizeof(header));
+    rc = transfer(s, header, sizeof(header), p->extents[0].offset, 1, error);
+  }
+  if (rc == LC_OK && !clean) {
+    pthread_mutex_lock(&s->mutex);
+    rc = healthy(s, error);
+    if (rc == LC_OK &&
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+      rc = err(error, LC_ERR_TRANSPORT,
+               "preparation readiness exhausted; reopen");
+    }
+    if (rc == LC_OK)
+      sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&s->mutex);
+    if (rc == LC_OK)
+      rc = wait_durable(s, sequence, error);
+  }
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK)
+    rc = healthy(s, error);
+  if (rc == LC_OK) {
+    p->bytes = p->extents[0].bytes = bytes;
+    if (spare) {
+      spare->offset = p->extents[0].offset + bytes;
+      spare->bytes = reserved - bytes;
+      spare->clean = 1;
+      free_insert(s, spare); /* only fully synchronized zeros become reusable */
+      spare = NULL;
+    }
+  }
+  if (rc == LC_OK)
+    rc = append_event(s, p, PS_PUT, error);
+  if (rc == LC_OK) {
+    rc = install_owned_grant(s, p, error);
+    if (rc != LC_OK)
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+  }
+  if (rc == LC_OK) {
+    p->publication_sequence =
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+    dirty_entry(s, p, NULL);
+    install(s, p);
+    ++p->pins;
+    ++s->readers;
+    run->space = s;
+    run->entry = p;
+  } else {
+    if (registered) {
+      if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
+          release_entry_runs(s, p, NULL) != LC_OK)
+        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+      unregister_entry(p);
+    }
+    entry_free(p);
+  }
+  if (registered)
+    --s->writers;
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, zero);
+  lc_free_with_allocator(NULL, spare);
+  return rc;
+}
+int ps_owned_grant(ps_owned_head *head, uint64_t base, uint64_t desired,
+                   ps_owned_run **out, int *found, lc_error *error) {
+  ps_owned_run *run;
+  ps_space *s;
+  ps_entry *p;
+  ps_key key;
+  unsigned char header[PS_RUN_HEADER];
+  int rc;
+  if (out)
+    *out = NULL;
+  if (found)
+    *found = 0;
+  if (!head || !out || !found ||
+      (desired && (desired < PS_PAGE || desired > PS_MIB || desired % PS_PAGE)))
+    return err(error, LC_ERR_INVALID, "owned run grant arguments invalid");
+  s = head->space;
+  run = lc_calloc_with_allocator(NULL, 1, sizeof(*run));
+  if (!run)
+    return err(error, LC_ERR_NOMEM, "cannot allocate owned run handle");
+  if (desired)
+    rc = owned_allocate(head, base, desired, run, error);
+  else {
+    key.kind = PS_OWNED_RUN;
+    key.owner = head->entry->token;
+    key.key = base;
+    pthread_mutex_lock(&s->mutex);
+    rc = healthy(s, error);
+    p = lookup(s, key);
+    if (rc == LC_OK && p && !p->deleted) {
+      ++p->pins;
+      ++s->readers;
+      run->space = s;
+      run->entry = p;
+    }
+    pthread_mutex_unlock(&s->mutex);
+    if (rc == LC_OK && run->entry)
+      rc = verify_owned(s, p, header, error);
+  }
+  if (rc == LC_OK && run->entry) {
+    *out = run;
+    *found = 1;
+  } else if (run->entry)
+    ps_owned_run_close(run);
+  else
+    lc_free_with_allocator(NULL, run);
+  return rc;
+}
+uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
+  return run ? run->entry->bytes - PS_RUN_HEADER : 0;
+}
+void ps_owned_run_close(ps_owned_run *run) {
+  ps_space *s;
+  if (!run)
+    return;
+  s = run->space;
+  pthread_mutex_lock(&s->mutex);
+  --run->entry->pins;
+  --s->readers;
+  if (run->entry->state == 2 && run->entry->safe && !run->entry->pins)
+    collect(s);
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, run);
+}
+static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
+                    int writing, lc_error *error) {
+  int rc;
+  if (!run || (!bytes && n) || offset > ps_owned_run_capacity(run) ||
+      n > ps_owned_run_capacity(run) - offset)
+    return err(error, LC_ERR_INVALID, "owned run I/O outside granted range");
+  rc = healthy(run->space, error);
+  return rc == LC_OK
+             ? transfer(run->space, bytes, n,
+                        run->entry->extents[0].offset + PS_RUN_HEADER + offset,
+                        writing, error)
+             : rc;
+}
+int ps_owned_read(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
+                  lc_error *error) {
+  return owned_io(run, offset, bytes, n, 0, error);
+}
+int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
+                   size_t n, lc_error *error) {
+  return owned_io(run, offset, (void *)bytes, n, 1, error);
+}
+int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
+                   void *scratch, lc_error *error) {
+  int rc;
+  if (!run || !scratch || offset > ps_owned_run_capacity(run) ||
+      bytes > ps_owned_run_capacity(run) - offset)
+    return err(error, LC_ERR_INVALID, "owned clear outside granted range");
+  rc = healthy(run->space, error);
+  if (rc != LC_OK)
+    return rc;
+  memset(scratch, 0, PS_CHUNK);
+  return initialize_range(
+      run->space, run->entry->extents[0].offset + PS_RUN_HEADER + offset, bytes,
+      scratch, error);
+}
+int ps_owned_commit(ps_owned_head *head, uint64_t tail, lc_error *error) {
+  ps_space *s;
+  uint64_t sequence = 0;
+  int rc;
+  if (!head)
+    return err(error, LC_ERR_INVALID, "owned commit requires head");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (tail < head->entry->bytes || tail > head->entry->stream_capacity))
+    rc = err(error, LC_ERR_INVALID, "owned commit tail outside append range");
+  if (rc == LC_OK &&
+      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    rc = err(error, LC_ERR_TRANSPORT, "owned readiness exhausted; reopen");
+  }
+  if (rc == LC_OK) {
+    head->entry->bytes = tail;
+    if (!head->entry->dirty_link)
+      dirty_entry(s, head->entry, NULL);
+    sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && s->durable)
+    rc = wait_durable(s, sequence, error);
+  return rc;
+}
+int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
+  return head ? sync_file(head->space, error)
+              : err(error, LC_ERR_INVALID, "owned barrier requires head");
+}
+int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
+  ps_space *s;
+  int rc;
+  if (!head)
+    return err(error, LC_ERR_INVALID, "owned recovery requires head");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (tail < head->entry->bytes || tail > head->entry->stream_capacity))
+    rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK)
+    rc = sync_file(s, error);
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK) {
+    head->entry->bytes = tail;
+    if (!head->entry->dirty_link)
+      dirty_entry(s, head->entry, NULL);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
 }

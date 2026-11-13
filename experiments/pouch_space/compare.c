@@ -2,7 +2,9 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "lc_collection_json.h"
 #include "lc_pouch.h"
+#include "lc_pouch_record.h"
 #include "space.h"
+#include "stream.h"
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
@@ -13,6 +15,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 /* Time the real synchronization calls of both engines in this executable,
  * without clocks or profiling modes in the storage implementation. */
@@ -51,11 +54,13 @@ typedef struct worker {
   comparison *run;
   size_t ordinal;
   lc_collection *collection;
+  ps_stream *stream;
+  size_t round, records;
   char *body;
   int rc;
 } worker;
 struct comparison {
-  int container, collection, sync;
+  int container, collection, sync, streams, existing_records;
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   lc_pouch *pouch;
@@ -63,6 +68,8 @@ struct comparison {
   worker *workers;
   pthread_t *threads;
   double *latencies;
+  uint64_t *offsets;
+  uint32_t *payload_crcs;
   pthread_mutex_t mutex;
   pthread_cond_t condition;
   int started;
@@ -142,6 +149,179 @@ static int space_sink(lc_sink *sink, const void *bytes, size_t count,
                       lc_error *e) {
   return ps_write(sink->impl, bytes, count, e) == LC_OK;
 }
+static void stream_put64(unsigned char *p, uint64_t value) {
+  size_t i;
+  for (i = 0; i < 8; ++i)
+    p[i] = (unsigned char)(value >> (i * 8));
+}
+static uint64_t stream_get64(const unsigned char *p) {
+  size_t i;
+  uint64_t value = 0;
+  for (i = 0; i < 8; ++i)
+    value |= (uint64_t)p[i] << (i * 8);
+  return value;
+}
+static ps_key stream_storage_key(size_t ordinal) {
+  ps_key key;
+  key.kind = PS_STREAM;
+  key.owner = ordinal + 1;
+  key.key = 1;
+  return key;
+}
+/* Rebuild the benchmark's derived latest-row offsets from canonical headers
+ * and metadata. Verify payload CRCs beyond the trusted checkpoint boundary.
+ * This is a storage experiment, not Pouch catalog/receipt/lease semantics. */
+static int stream_recover(ps_stream *stream, uint64_t checkpoint,
+                          uint64_t capacity, uint64_t *accepted, void *context,
+                          lc_error *e) {
+  worker *w = context;
+  comparison *c = w->run;
+  lc_pouch_record_header record;
+  unsigned char header[32], meta[80], buffer[4096], zero[32] = {0};
+  uint64_t cursor = 0, payload, end, id, round;
+  unsigned long crc;
+  size_t take;
+  char ns[64], name[64];
+  int rc = LC_OK;
+  w->records = 0;
+  while (capacity - cursor >= sizeof(header)) {
+    rc = ps_stream_recovery_read(stream, cursor, header, sizeof(header), e);
+    if (rc != LC_OK || !memcmp(header, zero, sizeof(header)))
+      break;
+    rc = lc_pouch_record_header_decode(header, &record, e);
+    if (rc == LC_ERR_PROTOCOL && cursor >= checkpoint) {
+      lc_error_cleanup(e);
+      rc = LC_OK;
+      break;
+    }
+    if (rc != LC_OK)
+      break;
+    if (record.flags || record.type != 1 || !record.key_len ||
+        record.key_len >= 64 || record.meta_len != 16 ||
+        record.payload_len != c->bytes ||
+        record.key_len + 48 > capacity - cursor ||
+        record.payload_len > capacity - cursor - record.key_len - 48)
+      break;
+    rc = ps_stream_recovery_read(stream, cursor + 32, meta,
+                                 (size_t)record.key_len + 16, e);
+    if (rc != LC_OK)
+      break;
+    id = stream_get64(meta + record.key_len);
+    round = stream_get64(meta + record.key_len + 8);
+    require(id < c->rows && id % c->writers == w->ordinal && round < c->rounds,
+            "canonical row identity");
+    names(w->ordinal, (size_t)id, ns, name);
+    require(strlen(name) == record.key_len &&
+                !memcmp(meta, name, record.key_len),
+            "canonical key binding");
+    payload = cursor + record.key_len + 48;
+    end = payload + record.payload_len;
+    require(cursor >= checkpoint || end <= checkpoint,
+            "checkpoint record boundary");
+    if (cursor >= checkpoint) {
+      crc = 0;
+      while (payload < end && rc == LC_OK) {
+        take = (size_t)(end - payload);
+        if (take > sizeof(buffer))
+          take = sizeof(buffer);
+        rc = ps_stream_recovery_read(stream, payload, buffer, take, e);
+        if (rc == LC_OK)
+          crc = crc32(crc, buffer, (uInt)take);
+        payload += take;
+      }
+      if (rc != LC_OK || crc != record.payload_crc)
+        break;
+    }
+    c->offsets[id] = cursor + record.key_len + 48;
+    c->payload_crcs[id] = (uint32_t)record.payload_crc;
+    cursor = end;
+    ++w->records;
+  }
+  *accepted = cursor;
+  return rc;
+}
+typedef struct stream_output {
+  ps_stream_writer *writer;
+  uint64_t bytes;
+  unsigned long crc;
+} stream_output;
+static int stream_sink(lc_sink *sink, const void *bytes, size_t count,
+                       lc_error *e) {
+  stream_output *out = sink->impl;
+  if (ps_stream_write(out->writer, bytes, count, e) != LC_OK)
+    return 0;
+  out->crc = crc32(out->crc, bytes, (uInt)count);
+  out->bytes += count;
+  return 1;
+}
+static int stream_write_one(worker *w, size_t id, lc_source *source,
+                            lc_error *e) {
+  comparison *c = w->run;
+  ps_stream_writer *destination = NULL;
+  stream_output out;
+  lc_pouch_record_header record;
+  lc_sink sink;
+  unsigned char header[32], meta[16], buffer[4096];
+  char ns[64], name[64];
+  uint64_t start = 0;
+  lc_u64 written;
+  size_t n;
+  int rc = LC_OK;
+  names(w->ordinal, id, ns, name);
+  if (!w->stream)
+    rc = ps_stream_open(c->space, stream_storage_key(w->ordinal), 1, NULL,
+                        stream_recover, w, &w->stream, e);
+  if (rc == LC_OK)
+    rc = ps_stream_begin(w->stream, &destination, e);
+  memset(&record, 0, sizeof(record));
+  memset(&out, 0, sizeof(out));
+  memset(&sink, 0, sizeof(sink));
+  record.type = 1;
+  record.flags = LC_POUCH_RECORD_FLAG_PENDING;
+  record.key_len = (unsigned long)strlen(name);
+  record.meta_len = sizeof(meta);
+  lc_pouch_record_header_encode(&record, header);
+  stream_put64(meta, id);
+  stream_put64(meta + 8, w->round);
+  if (rc == LC_OK) {
+    start = ps_stream_writer_start(destination);
+    rc = ps_stream_write(destination, header, sizeof(header), e);
+  }
+  if (rc == LC_OK)
+    rc = ps_stream_write(destination, name, strlen(name), e);
+  if (rc == LC_OK)
+    rc = ps_stream_write(destination, meta, sizeof(meta), e);
+  out.writer = destination;
+  sink.impl = &out;
+  sink.write = stream_sink;
+  if (rc == LC_OK && c->collection) {
+    rc = lc_collection_json_copy(source, &sink, NULL, &written, e);
+    if (rc == LC_OK && written != c->bytes)
+      rc = LC_ERR_PROTOCOL;
+  } else if (rc == LC_OK)
+    while ((n = source->read(source, buffer, sizeof(buffer), e)) != 0) {
+      if (!stream_sink(&sink, buffer, n, e)) {
+        rc = e->code;
+        break;
+      }
+    }
+  if (rc == LC_OK) {
+    record.flags = 0;
+    record.payload_len = out.bytes;
+    record.payload_crc = out.crc;
+    lc_pouch_record_header_encode(&record, header);
+    rc = ps_stream_write_at(destination, 0, header, sizeof(header), e);
+  }
+  if (rc == LC_OK)
+    rc = ps_stream_commit(destination, e);
+  if (rc == LC_OK) {
+    c->offsets[id] = start + strlen(name) + 48;
+    c->payload_crcs[id] = (uint32_t)out.crc;
+    ++w->records;
+  }
+  ps_stream_writer_close(destination);
+  return rc;
+}
 static int write_one(worker *w, size_t id, lc_error *e) {
   comparison *c = w->run;
   lc_source *source = NULL;
@@ -165,7 +345,9 @@ static int write_one(worker *w, size_t id, lc_error *e) {
   rc = lc_source_from_callbacks(source_read, NULL, NULL, &in, &source, e);
   if (rc != LC_OK)
     return rc;
-  if (c->container) {
+  if (c->streams) {
+    rc = stream_write_one(w, id, source, e);
+  } else if (c->container) {
     rc = ps_begin(c->space, storage_key(c, w->ordinal, id), &destination, e);
     if (rc == LC_OK && c->collection) {
       memset(&sink, 0, sizeof(sink));
@@ -218,6 +400,7 @@ static void *writer_main(void *context) {
   for (round = 0; round < c->rounds && w->rc == LC_OK; ++round)
     for (id = w->ordinal; id < c->rows; id += c->writers) {
       make_body(w->body, c->bytes, id, round);
+      w->round = round;
       start = now(CLOCK_MONOTONIC);
       w->rc = write_one(w, id, &e);
       c->latencies[round * c->rows + id] = now(CLOCK_MONOTONIC) - start;
@@ -242,6 +425,16 @@ static void open_stores(comparison *c, int create, lc_error *e) {
   if (c->container) {
     space_options.durable_sync = c->sync;
     check(ps_open(c->store, create, &space_options, &c->space, e), e);
+    if (c->streams) {
+      for (i = 0; i < c->rows; ++i)
+        c->offsets[i] = UINT64_MAX;
+      for (i = 0; i < c->writers; ++i)
+        if (c->existing_records || c->collection)
+          check(ps_stream_open(c->space, stream_storage_key(i), create, NULL,
+                               stream_recover, &c->workers[i],
+                               &c->workers[i].stream, e),
+                e);
+    }
     return;
   }
   if (!c->collection) {
@@ -285,6 +478,11 @@ static void open_stores(comparison *c, int create, lc_error *e) {
 static void close_stores(comparison *c, lc_error *e) {
   size_t i;
   if (c->container) {
+    if (c->streams)
+      for (i = 0; i < c->writers; ++i) {
+        check(ps_stream_close(c->workers[i].stream, e), e);
+        c->workers[i].stream = NULL;
+      }
     check(ps_close(c->space, e), e);
     c->space = NULL;
   } else if (c->collection) {
@@ -301,15 +499,34 @@ static void close_stores(comparison *c, lc_error *e) {
 }
 static void verify_states(comparison *c, lc_error *e) {
   ps_reader *reader;
+  ps_stream_reader *stream_reader;
   lc_pouch_state_read_result result;
   char ns[64], name[64];
   unsigned char buffer[4096];
   size_t id, ordinal, offset, got;
+  unsigned long crc;
   for (id = 0; id < c->rows; ++id) {
     ordinal = id % c->writers;
     make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
     offset = 0;
-    if (c->container) {
+    if (c->streams) {
+      crc = 0;
+      require(c->offsets[id] != UINT64_MAX, "canonical latest row exists");
+      check(ps_stream_read_open(c->workers[ordinal].stream, c->offsets[id],
+                                c->bytes, &stream_reader, e),
+            e);
+      do {
+        check(ps_stream_read(stream_reader, buffer, sizeof(buffer), &got, e),
+              e);
+        crc = crc32(crc, buffer, (uInt)got);
+        require(got <= c->bytes - offset &&
+                    !memcmp(buffer, c->workers[ordinal].body + offset, got),
+                "canonical stream entry bytes");
+        offset += got;
+      } while (got);
+      ps_stream_reader_close(stream_reader);
+      require(crc == c->payload_crcs[id], "canonical stream payload CRC");
+    } else if (c->container) {
       check(
           ps_read_open(c->space, storage_key(c, ordinal, id), NULL, &reader, e),
           e);
@@ -466,25 +683,34 @@ int main(int argc, char **argv) {
   long checkpoints = -1, directory_writes = -1, descriptor_writes = -1;
   long metadata_pages = -1;
   long packed_pages = -1, packed_bytes = -1, payload_allocated = -1;
+  long journal_used = -1, stream_grants = -1;
+  ps_stream_info stream_info;
   struct rusage usage;
   char prefix[1024], template_path[1100];
   size_t i, count;
   double start, cpu, seconds, cpu_seconds, read_seconds, close_seconds,
-      open_seconds, create_seconds, reopen_read_seconds;
-  if (argc != 8) {
-    fprintf(
-        stderr,
-        "usage: %s space-state|pouch-state|space-collection|pouch-collection "
-        "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK\n",
-        argv[0]);
+      open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0;
+  int preopen;
+  if (argc != 8 && argc != 9) {
+    fprintf(stderr,
+            "usage: %s space-state|stream-state|pouch-state|space-collection|"
+            "stream-collection|pouch-collection "
+            "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
+            argv[0]);
     return 2;
   }
   memset(&c, 0, sizeof(c));
+  preopen = argc == 9;
+  require(!preopen || !strcmp(argv[8], "--reopen"),
+          "optional flag must be --reopen");
   require(!strcmp(argv[1], "space-state") || !strcmp(argv[1], "pouch-state") ||
               !strcmp(argv[1], "space-collection") ||
-              !strcmp(argv[1], "pouch-collection"),
+              !strcmp(argv[1], "pouch-collection") ||
+              !strcmp(argv[1], "stream-state") ||
+              !strcmp(argv[1], "stream-collection"),
           "mode");
-  c.container = !strncmp(argv[1], "space-", 6);
+  c.streams = !strncmp(argv[1], "stream-", 7);
+  c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.collection = strstr(argv[1], "collection") != NULL;
   c.rows = number(argv[3], 1, PS_DEFAULT_CAPACITY / PS_PAGE);
   c.bytes = number(argv[4], 64, 2 * PS_MIB);
@@ -514,7 +740,10 @@ int main(int argc, char **argv) {
   c.threads = calloc(c.writers, sizeof(*c.threads));
   count = c.rows * c.rounds;
   c.latencies = calloc(count, sizeof(*c.latencies));
-  require(c.workers && c.threads && c.latencies, "benchmark allocations");
+  c.offsets = calloc(c.rows, sizeof(*c.offsets));
+  c.payload_crcs = calloc(c.rows, sizeof(*c.payload_crcs));
+  require(c.workers && c.threads && c.latencies && c.offsets && c.payload_crcs,
+          "benchmark allocations");
   require(pthread_mutex_init(&c.mutex, NULL) == 0, "benchmark mutex");
   require(pthread_cond_init(&c.condition, NULL) == 0, "benchmark condition");
   lc_error_init(&e);
@@ -527,6 +756,12 @@ int main(int argc, char **argv) {
   start = now(CLOCK_MONOTONIC);
   open_stores(&c, 1, &e);
   create_seconds = now(CLOCK_MONOTONIC) - start;
+  if (preopen) {
+    start = now(CLOCK_MONOTONIC);
+    close_stores(&c, &e);
+    open_stores(&c, 0, &e);
+    preopen_seconds = now(CLOCK_MONOTONIC) - start;
+  }
   for (i = 0; i < c.writers; ++i)
     require(pthread_create(&c.threads[i], NULL, writer_main, &c.workers[i]) ==
                 0,
@@ -547,6 +782,7 @@ int main(int argc, char **argv) {
     require(pthread_join(c.threads[i], NULL) == 0, "join writer");
     check(c.workers[i].rc, &e);
   }
+  c.existing_records = 1;
   seconds = now(CLOCK_MONOTONIC) - start;
   cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - cpu;
   fd_calls = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED) - fd_before;
@@ -566,6 +802,14 @@ int main(int argc, char **argv) {
     packed_pages = (long)stats.packed_pages;
     packed_bytes = (long)stats.packed_bytes;
     payload_allocated = (long)stats.allocated_bytes;
+    journal_used = (long)stats.journal_bytes;
+    if (c.streams) {
+      stream_grants = 0;
+      for (i = 0; i < c.writers; ++i) {
+        check(ps_stream_status(c.workers[i].stream, &stream_info, &e), &e);
+        stream_grants += (long)stream_info.runs;
+      }
+    }
   }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
   start = now(CLOCK_MONOTONIC);
@@ -589,7 +833,15 @@ int main(int argc, char **argv) {
                 artifacts.regular == 1 && artifacts.directories == 0,
             "exactly one container and no sidecars");
     check(ps_status(c.space, &stats, &e), &e);
-    require(stats.entries == c.rows, "recovered entry count");
+    if (c.streams) {
+      require(stats.entries == (uint64_t)stream_grants + c.writers,
+              "recovered physical stream/grant count");
+      for (i = 0; i < c.writers; ++i)
+        require(c.workers[i].records ==
+                    c.rounds * ((c.rows + c.writers - 1 - i) / c.writers),
+                "recovered canonical record count");
+    } else
+      require(stats.entries == c.rows, "recovered entry count");
   }
   require(getrusage(RUSAGE_SELF, &usage) == 0, "peak RSS");
   printf(
@@ -620,13 +872,18 @@ int main(int argc, char **argv) {
       (double)sync_ns / 1e6, max_sync_batch);
   printf("checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
          "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
-         "payload_allocated=%ld verified=1\n",
+         "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
+         "preopened=%d preopen_ms=%.6f max_us=%.3f verified=1\n",
          checkpoints, directory_writes, descriptor_writes, metadata_pages,
-         packed_pages, packed_bytes, payload_allocated);
+         packed_pages, packed_bytes, payload_allocated, journal_used,
+         stream_grants, preopen, preopen_seconds * 1000,
+         c.latencies[count - 1] * 1e6);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);
   free(c.latencies);
+  free(c.offsets);
+  free(c.payload_crcs);
   free(c.threads);
   free(c.workers);
   pthread_cond_destroy(&c.condition);

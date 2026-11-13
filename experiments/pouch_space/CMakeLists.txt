@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c)
+add_library(pouch_space_experiment STATIC space.c directory.c stream.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -20,7 +20,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode space-state pouch-state space-collection pouch-collection)
+    foreach(mode space-state stream-state pouch-state space-collection stream-collection pouch-collection)
       add_test(NAME pouch_space_compare_${mode}
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096)
       set_tests_properties(pouch_space_compare_${mode} PROPERTIES TIMEOUT 60
@@ -28,6 +28,14 @@ if(LOCKDC_BUILD_BENCHMARKS)
       add_test(NAME pouch_space_compare_${mode}_durable
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 8 65536 1 2 4096)
       set_tests_properties(pouch_space_compare_${mode}_durable PROPERTIES TIMEOUT 60
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      add_test(NAME pouch_space_compare_${mode}_reopened
+        COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096 --reopen)
+      set_tests_properties(pouch_space_compare_${mode}_reopened PROPERTIES TIMEOUT 60
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      add_test(NAME pouch_space_compare_${mode}_reopened_durable
+        COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 8 65536 1 2 4096 --reopen)
+      set_tests_properties(pouch_space_compare_${mode}_reopened_durable PROPERTIES TIMEOUT 60
         LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
     endforeach()
   endif()
@@ -57,6 +65,9 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
   add_test(NAME pouch_space_packing COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} packing)
+  add_test(NAME pouch_space_streams COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} streams)
+  set_tests_properties(pouch_space_streams PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_packing PROPERTIES TIMEOUT 60
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_metadata PROPERTIES TIMEOUT 120

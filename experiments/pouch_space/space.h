@@ -23,7 +23,7 @@
 #define PS_MAINTENANCE_RESERVE PS_CHUNK
 #define PS_ROOT_BYTES 80U
 
-enum ps_kind { PS_STATE = 1, PS_COLLECTION = 2 };
+enum ps_kind { PS_STATE = 1, PS_COLLECTION = 2, PS_STREAM = 3 };
 typedef struct ps_space ps_space;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
@@ -55,6 +55,10 @@ typedef struct ps_io {
   ssize_t (*write)(void *, int, const void *, size_t, off_t);
   int (*sync)(void *, int);
   int (*reserve)(void *, int, off_t, off_t);
+  /* Optional preallocated zero-range operation; NULL or unsupported selects
+   * bounded offset writes. It must preserve file size and backing allocation.
+   */
+  int (*zero)(void *, int, off_t, off_t);
 } ps_io;
 typedef struct ps_options {
   uint64_t initial_capacity; /* zero selects 10 MiB; creation only */

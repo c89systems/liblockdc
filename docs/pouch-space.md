@@ -17,7 +17,9 @@ Full native x86_64 implementation is now authorized in verified stages under the
 authorize conversion of existing roots or a production cutover. The foundation
 now checkpoints through the growable typed directory and packed descriptor
 pages. Small payload tails also share physical pages through independently owned
-cells. Canonical append-owned streams and normal Pouch integration remain ahead.
+cells. The experimental canonical append-owned stream boundary is implemented
+and fault-tested; typed catalogs, stream retirement and normal Pouch integration
+remain ahead.
 
 ## Intent
 
