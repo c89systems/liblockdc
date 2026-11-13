@@ -29,9 +29,11 @@ typedef struct ps_extent {
 typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
+  uint64_t publication_sequence;
   ps_extent *extents;
   size_t count, capacity, pins;
-  int state, safe; /* 0 private, 1 live, 2 retired */
+  int state, safe, deleted; /* 0 private, 1 live, 2 retired */
+  struct ps_entry *previous;
   struct ps_entry *all_next, *hash_next;
 } ps_entry;
 typedef struct ps_run {
@@ -41,10 +43,15 @@ typedef struct ps_run {
 struct ps_space {
   int fd, poisoned, durable, root;
   pthread_mutex_t mutex;
+  pthread_mutex_t sync_io_mutex, commit_mutex;
+  pthread_cond_t commit_cond;
+  int locks_initialized, syncing;
   ps_io io;
   unsigned char identity[16];
   uint64_t capacity, maximum, generation, sequence, syncs, checkpoints;
   uint64_t token_next, token_limit;
+  uint64_t pending_sequence, durable_sequence;
+  uint64_t sync_requests, sync_batches, max_sync_batch;
   size_t journal, metadata, readers, writers;
   ps_entry *entries, *buckets[BUCKETS];
   ps_run *free;
@@ -141,11 +148,65 @@ static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
 }
 static int sync_file(ps_space *s, lc_error *error) {
   int rc;
+  pthread_mutex_lock(&s->sync_io_mutex);
+  rc = healthy(s, error);
+  if (rc != LC_OK) {
+    pthread_mutex_unlock(&s->sync_io_mutex);
+    return rc;
+  }
   do {
     rc = s->io.sync(s->io.context, s->fd);
   } while (rc < 0 && errno == EINTR);
-  ++s->syncs;
-  return rc == 0 ? LC_OK : io_error(s, error, "container sync failed");
+  __atomic_fetch_add(&s->syncs, 1, __ATOMIC_RELAXED);
+  if (rc != 0)
+    rc = io_error(s, error, "container sync failed");
+  pthread_mutex_unlock(&s->sync_io_mutex);
+  return rc;
+}
+static void mark_durable(ps_space *s, uint64_t sequence) {
+  pthread_mutex_lock(&s->commit_mutex);
+  if (sequence > __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED))
+    __atomic_store_n(&s->durable_sequence, sequence, __ATOMIC_RELEASE);
+  pthread_cond_broadcast(&s->commit_cond);
+  pthread_mutex_unlock(&s->commit_mutex);
+}
+/* The caller has already published complete immutable bytes. One caller leads
+ * a sync of the ready prefix; arrivals during I/O form the next group. Neither
+ * the directory mutex nor the commit mutex is held across the actual sync.
+ * Structural and commit barriers share the separate sync I/O mutex. */
+static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
+  uint64_t target, covered;
+  int rc = LC_OK;
+  pthread_mutex_lock(&s->commit_mutex);
+  ++s->sync_requests;
+  while (__atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED) < sequence) {
+    rc = healthy(s, error);
+    if (rc != LC_OK)
+      break;
+    if (s->syncing) {
+      pthread_cond_wait(&s->commit_cond, &s->commit_mutex);
+      continue;
+    }
+    target = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+    covered = target - __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED);
+    s->syncing = 1;
+    pthread_mutex_unlock(&s->commit_mutex);
+    rc = sync_file(s, error);
+    pthread_mutex_lock(&s->commit_mutex);
+    ++s->sync_batches;
+    if (rc == LC_OK) {
+      if (target > __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED))
+        __atomic_store_n(&s->durable_sequence, target, __ATOMIC_RELEASE);
+      if (covered > s->max_sync_batch)
+        s->max_sync_batch = covered;
+    }
+    s->syncing = 0;
+    pthread_cond_broadcast(&s->commit_cond);
+    if (rc != LC_OK)
+      break;
+  }
+  pthread_mutex_unlock(&s->commit_mutex);
+  return rc;
 }
 static int reserve_file(ps_space *s, uint64_t begin, uint64_t bytes,
                         lc_error *error) {
@@ -185,16 +246,19 @@ static void retire(ps_space *s, ps_entry *p) {
   *link = p->hash_next;
   p->hash_next = NULL;
   p->state = 2;
-  s->metadata -= entry_bytes(p);
+  if (!p->deleted)
+    s->metadata -= entry_bytes(p);
 }
 static void install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);
+  p->previous = old;
   if (old)
     retire(s, old);
   p->state = 1;
   p->hash_next = s->buckets[bucket(p->key)];
   s->buckets[bucket(p->key)] = p;
-  s->metadata += entry_bytes(p);
+  if (!p->deleted)
+    s->metadata += entry_bytes(p);
 }
 static void entry_free(ps_entry *p) {
   lc_free_with_allocator(NULL, p->extents);
@@ -426,7 +490,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   grant.token = s->token_limit;
   encode_entry(snapshot, &grant, s->sequence, PS_RESERVE_IDS);
   for (p = s->entries; p; p = p->all_next)
-    if (p->state == 1) {
+    if (p->state == 1 && !p->deleted) {
       encode_entry(snapshot + cursor, p, s->sequence, PS_PUT);
       cursor += entry_bytes(p);
     }
@@ -458,14 +522,21 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   ++s->generation;
   ++s->checkpoints;
   s->journal = 0;
+  mark_durable(s, s->sequence);
+  /* The checkpoint covers every projected version. Existing readers retain
+   * their own pins, and new readers no longer need pending version history. */
+  for (p = s->entries; p; p = p->all_next) {
+    p->previous = NULL;
+    if (p->state == 1 && p->deleted)
+      retire(s, p);
+  }
   for (p = s->entries; p; p = p->all_next)
     if (p->state == 2)
       p->safe = 1;
   collect(s);
   return LC_OK;
 }
-static int append_event(ps_space *s, ps_entry *p, int event, int durable,
-                        lc_error *error) {
+static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   size_t bytes = event == PS_PUT ? entry_bytes(p) : 64;
   unsigned char *wire;
   int rc;
@@ -481,12 +552,11 @@ static int append_event(ps_space *s, ps_entry *p, int event, int durable,
   encode_entry(wire, p, s->sequence + 1, event);
   if (rc == LC_OK)
     rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
-  if (rc == LC_OK && durable)
-    rc = sync_file(s, error);
   lc_free_with_allocator(NULL, wire);
   if (rc == LC_OK) {
     ++s->sequence;
     s->journal += bytes;
+    __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
   }
   return rc;
 }
@@ -500,7 +570,7 @@ static int grant_tokens(ps_space *s, lc_error *error) {
     return err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
   memset(&grant, 0, sizeof(grant));
   grant.token = limit + TOKEN_RANGE;
-  rc = append_event(s, &grant, PS_RESERVE_IDS, 0, error);
+  rc = append_event(s, &grant, PS_RESERVE_IDS, error);
   if (rc == LC_OK) {
     s->token_next = limit + 1;
     s->token_limit = grant.token;
@@ -522,7 +592,14 @@ static void destroy(ps_space *s) {
   }
   if (s->fd >= 0)
     (void)close(s->fd);
-  (void)pthread_mutex_destroy(&s->mutex);
+  if (s->locks_initialized >= 4)
+    (void)pthread_cond_destroy(&s->commit_cond);
+  if (s->locks_initialized >= 3)
+    (void)pthread_mutex_destroy(&s->commit_mutex);
+  if (s->locks_initialized >= 2)
+    (void)pthread_mutex_destroy(&s->sync_io_mutex);
+  if (s->locks_initialized >= 1)
+    (void)pthread_mutex_destroy(&s->mutex);
   lc_free_with_allocator(NULL, s);
 }
 static int random_bytes(void *bytes, size_t n, lc_error *error) {
@@ -722,8 +799,10 @@ static int recover(ps_space *s, lc_error *error) {
       if (p->state == 2) {
         *link = p->all_next;
         entry_free(p);
-      } else
+      } else {
+        p->previous = NULL;
         link = &p->all_next;
+      }
     }
   }
   rc = grant_tokens(s, error);
@@ -790,6 +869,22 @@ int ps_open(const char *path, int create, const ps_options *options,
     lc_free_with_allocator(NULL, s);
     return err(error, LC_ERR_TRANSPORT, "cannot initialize container mutex");
   }
+  s->locks_initialized = 1;
+  rc = pthread_mutex_init(&s->sync_io_mutex, NULL);
+  if (rc == 0) {
+    s->locks_initialized = 2;
+    rc = pthread_mutex_init(&s->commit_mutex, NULL);
+  }
+  if (rc == 0) {
+    s->locks_initialized = 3;
+    rc = pthread_cond_init(&s->commit_cond, NULL);
+  }
+  if (rc != 0) {
+    destroy(s);
+    return err(error, LC_ERR_TRANSPORT,
+               "cannot initialize durability coordination");
+  }
+  s->locks_initialized = 4;
   s->io.read = native_read;
   s->io.write = native_write;
   s->io.sync = native_sync;
@@ -852,6 +947,7 @@ int ps_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
+  mark_durable(s, s->sequence);
   *out = s;
   return LC_OK;
 }
@@ -985,6 +1081,8 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   ps_space *s;
   ps_entry *old;
   size_t prior;
+  uint64_t sequence = 0;
+  ps_ref published_ref;
   int rc;
   if (!w || w->failed || w->published)
     return err(error, LC_ERR_INVALID, "container writer cannot publish");
@@ -997,25 +1095,32 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   old = lookup(s, w->entry->key);
-  prior = old ? entry_bytes(old) : 0;
-  if (rc == LC_OK && old && w->entry->key.kind == PS_COLLECTION)
+  prior = old && !old->deleted ? entry_bytes(old) : 0;
+  if (rc == LC_OK && old && !old->deleted &&
+      w->entry->key.kind == PS_COLLECTION)
     rc = err(error, LC_ERR_INVALID, "collection position already published");
   if (rc == LC_OK &&
       entry_bytes(w->entry) > PS_BANK - 64 - (s->metadata - prior))
     rc = err(error, LC_ERR_INVALID,
              "container checkpoint metadata capacity exhausted");
   if (rc == LC_OK)
-    rc = append_event(s, w->entry, PS_PUT, s->durable, error);
+    rc = append_event(s, w->entry, PS_PUT, error);
   if (rc == LC_OK) {
+    w->entry->publication_sequence = s->sequence;
     install(s, w->entry);
     w->published = 1;
-    if (ref) {
-      memcpy(ref->container, s->identity, 16);
-      ref->incarnation = w->entry->token;
-    }
+    sequence = s->sequence;
+    memcpy(published_ref.container, s->identity, 16);
+    published_ref.incarnation = w->entry->token;
   } else
     w->failed = 1;
   pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && s->durable)
+    rc = wait_durable(s, sequence, error);
+  if (rc == LC_OK && ref)
+    *ref = published_ref;
+  if (rc != LC_OK)
+    w->failed = 1;
   return rc;
 }
 void ps_writer_close(ps_writer *w) {
@@ -1045,6 +1150,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
                  lc_error *error) {
   ps_reader *r;
   ps_entry *p;
+  uint64_t visible;
   int rc;
   if (out)
     *out = NULL;
@@ -1057,7 +1163,11 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   p = lookup(s, key);
-  if (rc == LC_OK && !p)
+  visible = s->durable ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
+                       : UINT64_MAX;
+  while (p && p->publication_sequence > visible)
+    p = p->previous;
+  if (rc == LC_OK && (!p || p->deleted))
     rc = err(error, LC_ERR_INVALID, "container key not found");
   if (rc == LC_OK && ref &&
       (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
@@ -1127,20 +1237,35 @@ void ps_reader_close(ps_reader *r) {
   lc_free_with_allocator(NULL, r);
 }
 int ps_delete(ps_space *s, ps_key key, lc_error *error) {
-  ps_entry *p;
+  ps_entry *p, *tombstone;
   int rc;
+  uint64_t sequence = 0;
   if (!s || !valid_key(key))
     return err(error, LC_ERR_INVALID, "container delete requires typed key");
+  tombstone = lc_calloc_with_allocator(NULL, 1, sizeof(*tombstone));
+  if (!tombstone)
+    return err(error, LC_ERR_NOMEM, "cannot allocate pending retirement");
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   p = lookup(s, key);
-  if (rc == LC_OK && !p)
+  if (rc == LC_OK && (!p || p->deleted))
     rc = err(error, LC_ERR_INVALID, "container key not found");
   if (rc == LC_OK)
-    rc = append_event(s, p, PS_REMOVE, s->durable, error);
-  if (rc == LC_OK)
-    retire(s, p);
+    rc = append_event(s, p, PS_REMOVE, error);
+  if (rc == LC_OK) {
+    tombstone->key = key;
+    tombstone->token = p->token;
+    tombstone->deleted = 1;
+    tombstone->publication_sequence = s->sequence;
+    tombstone->all_next = s->entries;
+    s->entries = tombstone;
+    install(s, tombstone);
+    sequence = s->sequence;
+  } else
+    entry_free(tombstone);
   pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && s->durable)
+    rc = wait_durable(s, sequence, error);
   return rc;
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
@@ -1199,14 +1324,19 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->capacity = s->capacity;
   out->metadata_bytes = s->metadata + 64;
   out->journal_bytes = s->journal;
-  out->syncs = s->syncs;
+  out->syncs = __atomic_load_n(&s->syncs, __ATOMIC_RELAXED);
   out->checkpoints = s->checkpoints;
+  pthread_mutex_lock(&s->commit_mutex);
+  out->sync_requests = s->sync_requests;
+  out->sync_batches = s->sync_batches;
+  out->max_sync_batch = s->max_sync_batch;
+  pthread_mutex_unlock(&s->commit_mutex);
   for (p = s->entries; p; p = p->all_next) {
     n = 0;
     for (i = 0; i < p->count; ++i)
       n += aligned(p->extents[i].bytes);
     out->allocated_bytes += n;
-    if (p->state == 1) {
+    if (p->state == 1 && !p->deleted) {
       ++out->entries;
       out->live_bytes += p->bytes;
     } else if (p->state == 2)

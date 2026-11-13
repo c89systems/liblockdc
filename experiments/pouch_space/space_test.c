@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static lc_error error;
@@ -952,14 +953,286 @@ static void incarnation_grants(void) {
        "interrupted opens");
 }
 
+typedef struct commit_gate {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int enabled, entered, released, fail_sync, publications, finished;
+  int maintenance, fd;
+  int hold_second, second_entered, second_released;
+  size_t syncs;
+} commit_gate;
+typedef struct commit_actor {
+  ps_space *space;
+  commit_gate *gate;
+  int ordinal, rc, maintenance, remove, same_key;
+  ps_ref ref;
+} commit_actor;
+static ssize_t gate_read(void *v, int fd, void *p, size_t n, off_t offset) {
+  (void)v;
+  return pread(fd, p, n, offset);
+}
+static ssize_t gate_write(void *v, int fd, const void *p, size_t n,
+                          off_t offset) {
+  commit_gate *g = v;
+  ssize_t written = pwrite(fd, p, n, offset);
+  pthread_mutex_lock(&g->mutex);
+  if (g->enabled && written == (ssize_t)n) {
+    if (offset >= 2 * PS_PAGE + 2 * PS_BANK && offset < PS_DATA && n >= 64)
+      ++g->publications;
+    if (offset >= 2 * PS_PAGE && offset < 2 * PS_PAGE + 2 * PS_BANK)
+      g->maintenance = 1;
+    pthread_cond_broadcast(&g->cond);
+  }
+  pthread_mutex_unlock(&g->mutex);
+  return written;
+}
+static int gate_sync(void *v, int fd) {
+  commit_gate *g = v;
+  int failed = 0;
+  pthread_mutex_lock(&g->mutex);
+  g->fd = fd;
+  ++g->syncs;
+  if (g->enabled && !g->entered) {
+    g->entered = 1;
+    pthread_cond_broadcast(&g->cond);
+    while (!g->released)
+      pthread_cond_wait(&g->cond, &g->mutex);
+    failed = g->fail_sync;
+  } else if (g->enabled && g->hold_second && !g->second_entered) {
+    g->second_entered = 1;
+    pthread_cond_broadcast(&g->cond);
+    while (!g->second_released)
+      pthread_cond_wait(&g->cond, &g->mutex);
+  }
+  pthread_mutex_unlock(&g->mutex);
+  if (failed) {
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static int gate_reserve(void *v, int fd, off_t offset, off_t bytes) {
+  (void)v;
+  return fallocate(fd, 0, offset, bytes);
+}
+static void await_gate(commit_gate *g, int phase) {
+  struct timespec deadline;
+  int rc = 0, ready;
+  CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&g->mutex);
+  for (;;) {
+    ready = phase == 0   ? g->entered
+            : phase == 1 ? g->publications == 4
+            : phase == 2 ? g->maintenance
+                         : g->second_entered;
+    if (ready || rc != 0)
+      break;
+    rc = pthread_cond_timedwait(&g->cond, &g->mutex, &deadline);
+  }
+  pthread_mutex_unlock(&g->mutex);
+  CHECK(ready && rc == 0);
+}
+static void *commit_worker(void *context) {
+  commit_actor *actor = context;
+  lc_error e;
+  ps_writer *w = NULL;
+  unsigned char body[1024];
+  lc_error_init(&e);
+  memset(body, 'A' + actor->ordinal, sizeof(body));
+  if (actor->maintenance)
+    actor->rc = ps_checkpoint(actor->space, &e);
+  else if (actor->remove)
+    actor->rc = ps_delete(actor->space, state(actor->ordinal + 1), &e);
+  else {
+    actor->rc = ps_begin(
+        actor->space, state(actor->same_key ? 1 : actor->ordinal + 1), &w, &e);
+    if (actor->rc == LC_OK)
+      actor->rc = ps_write(w, body, sizeof(body), &e);
+    if (actor->rc == LC_OK)
+      actor->rc = ps_publish(w, &actor->ref, &e);
+    ps_writer_close(w);
+  }
+  lc_error_cleanup(&e);
+  pthread_mutex_lock(&actor->gate->mutex);
+  ++actor->gate->finished;
+  pthread_cond_broadcast(&actor->gate->cond);
+  pthread_mutex_unlock(&actor->gate->mutex);
+  return NULL;
+}
+static void commit_coordination(void) {
+  commit_gate gate;
+  commit_actor actors[5];
+  pthread_t threads[5];
+  ps_io io;
+  ps_space *s;
+  ps_writer *private_writer;
+  ps_reader *old_reader;
+  ps_reader *current_reader;
+  ps_stats before, after;
+  model saved;
+  unsigned char *body = malloc(PS_CHUNK);
+  size_t mode, i, matches;
+  CHECK(body != NULL);
+  memset(&saved, 0, sizeof(saved));
+  saved.stable_bytes = (size_t)PS_MIB;
+  saved.stable = malloc(saved.stable_bytes);
+  CHECK(saved.stable != NULL);
+  for (mode = 0; mode < 5; ++mode) {
+    clean();
+    memset(&gate, 0, sizeof(gate));
+    memset(actors, 0, sizeof(actors));
+    CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+    CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+    io.context = &gate;
+    io.read = gate_read;
+    io.write = gate_write;
+    io.sync = gate_sync;
+    io.reserve = gate_reserve;
+    s = create(PS_MIB, 1, &io);
+    OK(ps_status(s, &before, &error));
+    put(s, state(1), "old", 3, 1);
+    OK(ps_status(s, &after, &error));
+    CHECK(after.syncs ==
+          before.syncs + 1); /* one writer still syncs each commit */
+    if (mode == 3)
+      for (i = 2; i <= 4; ++i)
+        put(s, state(i), "old", 3, 1);
+    OK(ps_checkpoint(s, &error));
+    CHECK(pread(gate.fd, saved.stable, saved.stable_bytes, 0) ==
+          (ssize_t)saved.stable_bytes);
+    OK(ps_read_open(s, state(1), NULL, &old_reader, &error));
+    OK(ps_status(s, &before, &error));
+    gate.enabled = 1;
+    gate.fail_sync = mode == 1;
+    gate.hold_second = mode == 4;
+    for (i = 0; i < 5; ++i) {
+      actors[i].space = s;
+      actors[i].gate = &gate;
+      actors[i].ordinal = (int)i;
+      actors[i].maintenance = i == 4;
+      actors[i].remove = mode == 3;
+      actors[i].same_key = mode == 4;
+    }
+    CHECK(pthread_create(&threads[0], NULL, commit_worker, &actors[0]) == 0);
+    await_gate(&gate, 0);
+    for (i = 1; i < 4; ++i)
+      CHECK(pthread_create(&threads[i], NULL, commit_worker, &actors[i]) == 0);
+    await_gate(&gate, 1);
+    /* Reads must expose the committed prefix during a held sync, including
+     * replacements, deletions, and multiple pending versions of one key. */
+    memset(body, 'A', PS_CHUNK);
+    expect(s, state(1), NULL, "old", 3);
+    for (i = 2; i <= 4; ++i) {
+      if (mode == 3)
+        expect(s, state(i), NULL, "old", 3);
+      else
+        absent(s, state(i));
+    }
+    OK(ps_begin(s, state(99), &private_writer, &error));
+    OK(ps_write(private_writer, body, PS_CHUNK, &error));
+    ps_writer_close(private_writer);
+    absent(s, state(99));
+    pthread_mutex_lock(&gate.mutex);
+    CHECK(gate.finished == 0); /* no durable success before the barrier */
+    pthread_mutex_unlock(&gate.mutex);
+    if (mode == 2) {
+      CHECK(pthread_create(&threads[4], NULL, commit_worker, &actors[4]) == 0);
+      await_gate(&gate, 2);
+    }
+    pthread_mutex_lock(&gate.mutex);
+    gate.released = 1;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.mutex);
+    if (mode == 4) {
+      await_gate(&gate, 3);
+      expect(s, state(1), NULL, body, 1024);
+      pthread_mutex_lock(&gate.mutex);
+      CHECK(gate.finished <= 1);
+      gate.second_released = 1;
+      pthread_cond_broadcast(&gate.cond);
+      pthread_mutex_unlock(&gate.mutex);
+    }
+    for (i = 0; i < (mode == 2 ? 5U : 4U); ++i) {
+      CHECK(pthread_join(threads[i], NULL) == 0);
+      CHECK(mode == 1 ? actors[i].rc != LC_OK : actors[i].rc == LC_OK);
+    }
+    read_value(old_reader, "old", 3);
+    ps_reader_close(old_reader);
+    OK(ps_status(s, &after, &error));
+    if (mode == 0 || mode == 3 || mode == 4) {
+      CHECK(after.sync_requests == before.sync_requests + 4);
+      CHECK(after.syncs == before.syncs + 2);
+      CHECK(after.max_sync_batch >= 3);
+    }
+    if (mode == 3) {
+      for (i = 1; i <= 4; ++i)
+        absent(s, state(i));
+    } else if (mode == 4) {
+      matches = 0;
+      for (i = 0; i < 4; ++i) {
+        if (ps_read_open(s, state(1), &actors[i].ref, &current_reader,
+                         &error) == LC_OK) {
+          ++matches;
+          memset(body, 'A' + (int)i, 1024);
+          read_value(current_reader, body, 1024);
+          ps_reader_close(current_reader);
+        } else
+          lc_error_cleanup(&error);
+      }
+      CHECK(matches == 1);
+    } else if (mode != 1) {
+      for (i = 0; i < 4; ++i) {
+        memset(body, 'A' + (int)i, 1024);
+        expect(s, state(i + 1), NULL, body, 1024);
+      }
+    }
+    OK(ps_close(s, &error));
+    if (mode == 1)
+      crash(&saved); /* failed barrier must not erase prior durable state */
+    s = reopen(NULL);
+    if (mode == 1) {
+      expect(s, state(1), NULL, "old", 3);
+      for (i = 2; i <= 4; ++i)
+        absent(s, state(i));
+    } else if (mode == 3) {
+      for (i = 1; i <= 4; ++i)
+        absent(s, state(i));
+    } else if (mode == 4) {
+      expect(s, state(1), NULL, body, 1024);
+    } else {
+      for (i = 0; i < 4; ++i) {
+        memset(body, 'A' + (int)i, 1024);
+        expect(s, state(i + 1), NULL, body, 1024);
+      }
+    }
+    OK(ps_close(s, &error));
+    CHECK(pthread_cond_destroy(&gate.cond) == 0);
+    CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
+  }
+  free(saved.stable);
+  free(body);
+  clean();
+  puts("commit coordination: reader/writer progress, grouped durability, "
+       "failure and checkpoint ordering");
+}
+
 int main(int argc, char **argv) {
-  if (argc != 2)
+  if (argc != 2 && argc != 3)
     return 2;
   lc_error_init(&error);
   CHECK(snprintf(path, sizeof(path), "%s/space-test-%ld", argv[1],
                  (long)getpid()) > 0);
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
+  if (argc == 3) {
+    if (strcmp(argv[2], "commit") != 0)
+      return 2;
+    commit_coordination();
+    lc_error_cleanup(&error);
+    printf("pouch-space commits: %zu observable checks passed\n", checks);
+    return 0;
+  }
   basic();
   streaming_capacity();
   fault_boundaries();

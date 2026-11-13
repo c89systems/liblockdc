@@ -14,6 +14,34 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Time the real synchronization calls of both engines in this executable,
+ * without clocks or profiling modes in the storage implementation. */
+static uint64_t fd_sync_calls, full_sync_calls, syscall_sync_ns;
+int __real_fdatasync(int);
+int __real_fsync(int);
+static int timed_sync(int fd, int data_only) {
+  struct timespec begin, end;
+  int measured, rc, saved_errno;
+  int64_t elapsed;
+  measured = clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+  rc = data_only ? __real_fdatasync(fd) : __real_fsync(fd);
+  saved_errno = errno;
+  if (measured && clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+    elapsed = (int64_t)(end.tv_sec - begin.tv_sec) * INT64_C(1000000000) +
+              (int64_t)end.tv_nsec - (int64_t)begin.tv_nsec;
+    if (elapsed > 0)
+      __atomic_fetch_add(&syscall_sync_ns, (uint64_t)elapsed, __ATOMIC_RELAXED);
+  }
+  if (data_only)
+    __atomic_fetch_add(&fd_sync_calls, 1, __ATOMIC_RELAXED);
+  else
+    __atomic_fetch_add(&full_sync_calls, 1, __ATOMIC_RELAXED);
+  errno = saved_errno;
+  return rc;
+}
+int __wrap_fdatasync(int fd) { return timed_sync(fd, 1); }
+int __wrap_fsync(int fd) { return timed_sync(fd, 0); }
+
 typedef struct input {
   const char *body;
   size_t bytes, offset, chunk;
@@ -433,6 +461,8 @@ int main(int argc, char **argv) {
   io_counts before, after;
   files artifacts = {0}, audit = {0};
   ps_stats stats;
+  uint64_t fd_before, full_before, ns_before, fd_calls, full_calls, sync_ns;
+  long max_sync_batch = -1;
   struct rusage usage;
   char prefix[1024], template_path[1100];
   size_t i, count;
@@ -499,6 +529,9 @@ int main(int argc, char **argv) {
                 0,
             "start writer");
   before = io_sample();
+  fd_before = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED);
+  full_before = __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED);
+  ns_before = __atomic_load_n(&syscall_sync_ns, __ATOMIC_RELAXED);
   cpu = now(CLOCK_PROCESS_CPUTIME_ID);
   start = now(CLOCK_MONOTONIC);
   pthread_mutex_lock(&c.mutex);
@@ -511,7 +544,15 @@ int main(int argc, char **argv) {
   }
   seconds = now(CLOCK_MONOTONIC) - start;
   cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - cpu;
+  fd_calls = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED) - fd_before;
+  full_calls =
+      __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED) - full_before;
+  sync_ns = __atomic_load_n(&syscall_sync_ns, __ATOMIC_RELAXED) - ns_before;
   after = io_sample();
+  if (c.container) {
+    check(ps_status(c.space, &stats, &e), &e);
+    max_sync_batch = (long)stats.max_sync_batch;
+  }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
   start = now(CLOCK_MONOTONIC);
   verify_all(&c, &e);
@@ -545,7 +586,8 @@ int main(int argc, char **argv) {
       "reopen_read_ms=%.6f ready_ms=%.6f "
       "write_calls=%lu read_calls=%lu syscall_written=%lu kernel_written=%lu "
       "files=%lu directories=%lu logical_bytes=%lu allocated_bytes=%lu "
-      "peak_RSS_KiB=%ld verified=1\n",
+      "peak_RSS_KiB=%ld fdatasync_calls=%lu fsync_calls=%lu sync_ms=%.6f "
+      "max_sync_batch=%ld verified=1\n",
       argv[1], (unsigned long)c.rows, (unsigned long)c.bytes,
       (unsigned long)c.rounds, (unsigned long)c.writers, c.sync, seconds * 1000,
       cpu_seconds * 1000, (double)c.bytes * count / 1048576.0 / seconds,
@@ -560,7 +602,8 @@ int main(int argc, char **argv) {
       (unsigned long)(after.write_bytes - before.write_bytes),
       (unsigned long)artifacts.regular, (unsigned long)artifacts.directories,
       (unsigned long)artifacts.logical, (unsigned long)artifacts.allocated,
-      usage.ru_maxrss);
+      usage.ru_maxrss, (unsigned long)fd_calls, (unsigned long)full_calls,
+      (double)sync_ns / 1e6, max_sync_batch);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

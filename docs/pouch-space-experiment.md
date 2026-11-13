@@ -15,7 +15,7 @@ I/O and peak space must be included when those operations are integrated.
 
 ## Correctness evidence
 
-Native x86_64 verification on 2026-11-13:
+Initial foundation verification on native x86_64, 2026-11-13:
 
 - 75 selected Debug unit/contract tests passed, including existing Pouch,
   collection, compression durability/recovery, retention, XA and allocator cases.
@@ -139,6 +139,87 @@ also performs exactly one `fallocate`.
 | Collection NoSync | 4 / 1 | 0 / 110 |
 | Collection durable | 36 / 1 | 32 / 110 |
 
+## Commit coordination follow-up
+
+The original implementation held the directory mutex throughout each commit's
+`fdatasync`. That serialized durable writers and blocked read admission and
+allocation during the barrier. The revised implementation appends/installs under
+the directory mutex, then releases it before callers coordinate a sync of the
+ready sequence prefix. Arrivals during one barrier form the next group. There
+is no fill delay or background worker. Readers retain the prior committed view
+until the appropriate barrier completes, including pending deletes and multiple
+replacements of the same key. Checkpoint and commit barriers share a separate
+I/O mutex; commit completion never acquires the directory mutex.
+
+A second series on the same host compared the original `fcdde32` executable,
+the revised container, and current Pouch. Five samples rotate these three
+executables in order, with identical workloads and serial execution. All 240
+runs verified complete payloads before and after reopen and checked store
+artifacts. Logs and consolidated medians/ranges are in `build/pouch-space-fix/`
+and `results.json`. The original executable is retained there as
+`pouch_space_compare-before`. The revised benchmark times real `fdatasync` and
+`fsync` calls for both engines, outside the library; the original executable
+does not include those new timing counters. No tracing is enabled in these runs.
+
+Median durable write-phase milliseconds:
+
+| Profile | Kind | Original container | Revised container | Current Pouch |
+| --- | --- | ---: | ---: | ---: |
+| small-durable-1w | State | 1539.16 | 1576.89 | 1469.46 |
+| small-durable-1w | Collection | 754.96 | 724.49 | 723.54 |
+| small-durable-4w | State | 1399.77 | 708.14 | 849.55 |
+| small-durable-4w | Collection | 623.29 | 385.30 | 454.02 |
+| large-durable-1w | State | 337.81 | 365.26 | 349.74 |
+| large-durable-1w | Collection | 204.75 | 174.86 | 200.26 |
+| large-durable-4w | State | 340.85 | 180.65 | 366.13 |
+| large-durable-4w | Collection | 172.62 | 93.13 | 166.66 |
+
+Four-writer phases use half as many container commit barriers: 128 for 256
+small state writes, 64 for 128 small collection writes, 32 for 64 large state
+writes, and 16 for 32 large collection writes. The largest observed group is
+three. Compared with the original container, the four-writer medians improve
+by 49%, 38%, 47% and 46%, respectively; all four observed before/after ranges
+are disjoint. Small state samples span 610–852 ms after the change versus
+1089–1516 ms before it. Current Pouch spans 819–954 ms, overlapping the revised
+container range, so the 17% lower median does not establish a universal win.
+Median small state p99 falls from 67.39 ms to 29.63 ms, versus 39.10 ms for Pouch.
+
+Single-writer durability is unchanged: every successful commit still waits for
+one sync. Small state uses 256 barriers and spends a median 1541 ms inside sync
+calls out of a 1577 ms write phase, approximately 98%. Its revised median is 7%
+above Pouch, with overlapping ranges. The coordinator removes contention and
+amortizes concurrent barriers; it does not solve single-writer storage latency.
+`sync_ms` sums call durations across threads and is not device busy time.
+
+Physical pages remain 4 KiB, matching this filesystem's block size. The device
+reports 512-byte logical and physical sectors. Payloads allocate whole pages;
+small payload writes and their separate journal records can dirty separate
+filesystem blocks. Kernel write accounting remains about 2 MiB for the small
+single-writer durable state phase. Packing small logical records into aligned
+pages is a separate layout problem; neither its performance effect nor a
+single-writer improvement has been demonstrated here.
+
+NoSync write medians remain within 0.7 ms of the original container in every
+profile. Small state warm reads are 0.27–0.57 ms for the revised container across
+the profiles versus 2.19–4.12 ms for Pouch; large state reads are 1.90–2.07 ms
+versus 3.42–3.96 ms. These remain serial, verified physical reads after writers
+join. Concurrent scan performance is not measured by this comparison.
+
+The follow-up adds a deterministic commit test that holds sync while proving
+reader/allocation/publication progress, prior committed visibility for writes
+and deletes, grouped acknowledgments, failed-barrier wakeups, checkpoint lock
+ordering and same-key version selection between successive barriers. All ten
+experiment tests pass under Debug ASan/UBSan, native glibc Release and native
+musl Release. Memcheck reports zero errors and no lost allocations for both the
+foundation and commit tests. The parent process frees every allocation.
+Both tests also pass with ThreadSanitizer and `halt_on_error=1`, without race
+diagnostics. Helgrind reports one conflict on the existing `__atomic` poison
+flag; every access is atomic, including the reported read and write, whose
+relaxed operations compile to plain x86 instructions. No Helgrind clean-pass
+claim is made. Logs for all three tools are retained beside the paired runs.
+The broader Debug unit/contract gate passes all 76 selected tests with the
+documented native configuration.
+
 ## Reproduce
 
 ```sh
@@ -170,7 +251,7 @@ Valgrind output is retained in `build/pouch-space-comparison/valgrind.log`.
 
 Before larger-scale tests, replace the fixed 64 KiB checkpoint directory ceiling
 with growable typed metadata. Before a production adapter, resolve small-value
-packing, grouped durability/publication contention, checkpoint scheduling,
+packing and single-writer sync cost, checkpoint scheduling,
 relocating compaction and maintenance payload reserve, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection

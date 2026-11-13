@@ -11,6 +11,8 @@
  * Stop concurrent calls before closing the space itself. */
 #define PS_MIB UINT64_C(1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
+/* Native experiment: filesystem block-sized physical allocation; logical
+ * records need not eventually consume a whole physical page each. */
 #define PS_PAGE 4096U
 #define PS_CHUNK 16384U
 #define PS_BANK 65536U
@@ -32,6 +34,7 @@ typedef struct ps_ref {
 typedef struct ps_stats {
   uint64_t capacity, live_bytes, allocated_bytes, retired_bytes, private_bytes;
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
+  uint64_t sync_requests, sync_batches, max_sync_batch;
 } ps_stats;
 
 /* Optional syscall seam for deterministic storage faults, not another backend.
@@ -64,10 +67,15 @@ int ps_write(ps_writer *, const void *, size_t, lc_error *);
  * tombstone/receipt authority belong to the future Pouch adapter. Deletion
  * removes the binding; this foundation does not remember deleted positions.
  * Publication consumes no writer handle.
+ * Durable success waits for a file sync covering this publication; concurrent
+ * callers can share a barrier, without an artificial batching delay.
  * I/O errors poison the space; outcome may be uncertain. Reopen/reconcile. */
 int ps_publish(ps_writer *, ps_ref *, lc_error *);
 void ps_writer_close(ps_writer *);
-/* Readers pin an immutable incarnation across replacement, delete/reclaim. */
+/* Readers pin an immutable incarnation across replacement, delete/reclaim.
+ * Durable reads select the completed commit prefix, keeping the prior value
+ * visible while replacements/deletions await sync. NoSync reads select the
+ * latest complete publication. */
 int ps_read_open(ps_space *, ps_key, const ps_ref *, ps_reader **, lc_error *);
 int ps_read(ps_reader *, void *, size_t, size_t *, lc_error *);
 uint64_t ps_read_size(const ps_reader *);
