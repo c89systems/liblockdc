@@ -499,6 +499,8 @@ file(GLOB_RECURSE LOCKDC_FORMAT_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.h
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/*.c
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/*.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/pouch_space/*.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/pouch_space/*.h
 )
 
 if(CLANG_FORMAT_BIN)
@@ -1148,6 +1150,10 @@ macro(lc_apply_test_defaults)
         endif()
     endforeach()
 endmacro()
+
+if(LOCKDC_BUILD_TESTS OR LOCKDC_BUILD_BENCHMARKS)
+    add_subdirectory(experiments/pouch_space)
+endif()
 
 if(LOCKDC_BUILD_TESTS)
     add_subdirectory(tests)
