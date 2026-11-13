@@ -25,10 +25,12 @@
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
 #define TOKEN_RANGE UINT64_C(4294967296)
 enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS };
+#define EXTENT_PACKED 1U
+#define CELLS (PS_PAGE / PS_CELL)
 
 typedef struct ps_extent {
   uint64_t offset, bytes;
-  uint32_t crc;
+  uint32_t crc, flags;
 } ps_extent;
 typedef struct ps_entry {
   ps_key key;
@@ -48,6 +50,12 @@ typedef struct ps_run {
   uint64_t offset, bytes;
   struct ps_run *next;
 } ps_run;
+typedef struct ps_payload_page {
+  ps_run run; /* reusable free-interval node; must be first */
+  uint64_t occupied;
+  struct ps_payload_page *next, **link, *hash_next;
+  struct ps_payload_page *available_next, **available_link;
+} ps_payload_page;
 typedef struct ps_meta_page {
   ps_run run; /* reusable free-interval node; must be first */
   uint64_t generation, following;
@@ -71,9 +79,13 @@ struct ps_space {
   uint64_t live_entries, free_bytes, metadata_free_bytes;
   uint64_t directory_page_writes, descriptor_page_writes;
   size_t metadata_pages;
+  size_t packed_pages;
+  uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];
+  ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
+  ps_payload_page *available[CELLS + 1];
   ps_run *free, *metadata_free;
 };
 struct ps_writer {
@@ -409,18 +421,132 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
   node->bytes = offset - node->offset;
   return LC_OK;
 }
+static size_t cell_count(uint64_t bytes) {
+  return (size_t)((bytes + PS_CELL - 1) / PS_CELL);
+}
+static uint64_t cell_mask(size_t at, size_t count) {
+  return count == CELLS ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << at;
+}
+static uint64_t extent_mask(const ps_extent *extent) {
+  return cell_mask((size_t)(extent->offset % PS_PAGE / PS_CELL),
+                   cell_count(extent->bytes));
+}
+static uint64_t extent_allocation(const ps_extent *extent) {
+  return extent->flags & EXTENT_PACKED ? cell_count(extent->bytes) * PS_CELL
+                                       : aligned(extent->bytes);
+}
+static ps_payload_page *payload_find(ps_space *s, uint64_t offset) {
+  ps_payload_page *p;
+  offset = offset / PS_PAGE * PS_PAGE;
+  for (p = s->payload_buckets[(offset / PS_PAGE) % BUCKETS]; p;
+       p = p->hash_next)
+    if (p->run.offset == offset)
+      return p;
+  return NULL;
+}
+static void payload_unavailable(ps_payload_page *p) {
+  if (p->available_link) {
+    *p->available_link = p->available_next;
+    if (p->available_next)
+      p->available_next->available_link = p->available_link;
+    p->available_link = NULL;
+  }
+}
+/* One bin per largest contiguous free cell span. Admission probes at most 64
+ * bins and 64 cells, independent of the number of partially occupied pages. */
+static void payload_available(ps_space *s, ps_payload_page *p) {
+  size_t i, span = 0, largest = 0;
+  payload_unavailable(p);
+  for (i = 0; i < CELLS; ++i) {
+    span = p->occupied & (UINT64_C(1) << i) ? 0 : span + 1;
+    if (span > largest)
+      largest = span;
+  }
+  if (largest) {
+    p->available_next = s->available[largest];
+    p->available_link = &s->available[largest];
+    if (p->available_next)
+      p->available_next->available_link = &p->available_next;
+    s->available[largest] = p;
+  }
+}
+static void payload_register(ps_space *s, ps_payload_page *p) {
+  size_t hash = (size_t)((p->run.offset / PS_PAGE) % BUCKETS);
+  p->next = s->payload_pages;
+  p->link = &s->payload_pages;
+  if (p->next)
+    p->next->link = &p->next;
+  s->payload_pages = p;
+  p->hash_next = s->payload_buckets[hash];
+  s->payload_buckets[hash] = p;
+  ++s->packed_pages;
+}
+static void payload_release(ps_space *s, ps_extent *extent) {
+  ps_payload_page *p = payload_find(s, extent->offset), **link;
+  p->occupied &= ~extent_mask(extent);
+  s->packed_bytes -= extent_allocation(extent);
+  payload_unavailable(p);
+  if (p->occupied) {
+    payload_available(s, p);
+    return;
+  }
+  link = &s->payload_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
+  while (*link != p)
+    link = &(*link)->hash_next;
+  *link = p->hash_next;
+  *p->link = p->next;
+  if (p->next)
+    p->next->link = p->link;
+  --s->packed_pages;
+  free_insert(s, &p->run);
+}
+static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
+  ps_payload_page *p;
+  uint64_t mask;
+  int rc;
+  if (!(extent->flags & EXTENT_PACKED))
+    return exclude_run(s, extent->offset, aligned(extent->bytes), error);
+  mask = extent_mask(extent);
+  p = payload_find(s, extent->offset);
+  if (!p) {
+    p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+    if (!p)
+      return err(error, LC_ERR_NOMEM, "cannot recover packed payload page");
+    p->run.offset = extent->offset / PS_PAGE * PS_PAGE;
+    p->run.bytes = PS_PAGE;
+    rc = exclude_run(s, p->run.offset, PS_PAGE, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, p);
+      return rc;
+    }
+    payload_register(s, p);
+  }
+  if (p->occupied & mask)
+    return err(error, LC_ERR_PROTOCOL, "overlapping packed payload ownership");
+  p->occupied |= mask;
+  s->packed_bytes += extent_allocation(extent);
+  payload_available(s, p);
+  return LC_OK;
+}
 static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
   size_t i;
   ps_run *list = NULL, *node;
+  ps_payload_page *page;
+  int rc = LC_OK;
   for (i = 0; i < p->count; ++i) {
+    if (p->extents[i].flags & EXTENT_PACKED) {
+      page = payload_find(s, p->extents[i].offset);
+      if (!page || (page->occupied & extent_mask(&p->extents[i])) !=
+                       extent_mask(&p->extents[i])) {
+        rc = err(error, LC_ERR_PROTOCOL, "packed payload retirement mismatch");
+        break;
+      }
+      continue;
+    }
     node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
     if (!node) {
-      while (list) {
-        node = list;
-        list = node->next;
-        lc_free_with_allocator(NULL, node);
-      }
-      return err(error, LC_ERR_NOMEM, "cannot allocate retired free intervals");
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate retired free intervals");
+      break;
     }
     node->offset = p->extents[i].offset;
     node->bytes = aligned(p->extents[i].bytes);
@@ -430,9 +556,16 @@ static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
   while (list) {
     node = list;
     list = node->next;
-    free_insert(s, node);
+    if (rc == LC_OK)
+      free_insert(s, node);
+    else
+      lc_free_with_allocator(NULL, node);
   }
-  return LC_OK;
+  if (rc == LC_OK)
+    for (i = 0; i < p->count; ++i)
+      if (p->extents[i].flags & EXTENT_PACKED)
+        payload_release(s, &p->extents[i]);
+  return rc;
 }
 static void collect(ps_space *s) {
   ps_entry **link = &s->retired, *p;
@@ -468,6 +601,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       put64(wire + 64 + 24 * i, p->extents[i].offset);
       put64(wire + 72 + 24 * i, p->extents[i].bytes);
       put32(wire + 80 + 24 * i, p->extents[i].crc);
+      put32(wire + 84 + 24 * i, p->extents[i].flags);
     }
   }
   put32(wire + 60,
@@ -518,8 +652,13 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   for (i = 0; i < count; ++i) {
     offset = get64(wire + 64 + 24 * i);
     n = get64(wire + 72 + 24 * i);
-    if (!n || n > PS_CHUNK || offset < PS_DATA || offset % PS_PAGE ||
-        offset > s->capacity || aligned(n) > s->capacity - offset ||
+    p->extents[i].flags = get32(wire + 84 + 24 * i);
+    if (!n || n > PS_CHUNK || offset < PS_DATA || offset > s->capacity ||
+        n > s->capacity - offset ||
+        (p->extents[i].flags == EXTENT_PACKED
+             ? (n >= PS_PAGE || offset % PS_CELL ||
+                cell_count(n) * PS_CELL > PS_PAGE - offset % PS_PAGE)
+             : (p->extents[i].flags || offset % PS_PAGE || n % PS_PAGE)) ||
         UINT64_MAX - sum < n)
       goto invalid;
     p->extents[i].offset = offset;
@@ -578,6 +717,46 @@ static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
                "container capacity reserved for checkpoint and maintenance; "
                "checkpoint or grow");
   return LC_OK;
+}
+static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
+                           size_t bytes, lc_error *error) {
+  ps_payload_page *p = NULL;
+  size_t count = cell_count(bytes), bin, at;
+  uint64_t mask, reserve = PS_PAGE;
+  int rc;
+  for (bin = count; bin <= CELLS; ++bin)
+    if (s->available[bin]) {
+      p = s->available[bin];
+      break;
+    }
+  rc = checkpoint_allowance(s, s->metadata + entry_bytes(entry) + 24,
+                            s->live_entries + 1, p ? 0 : PS_PAGE, error);
+  if (rc != LC_OK)
+    return rc;
+  if (!p) {
+    p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+    if (!p)
+      return err(error, LC_ERR_NOMEM, "cannot allocate packed payload page");
+    rc = take_run(s, &reserve, &p->run.offset, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, p);
+      return rc;
+    }
+    p->run.bytes = PS_PAGE;
+    payload_register(s, p);
+  }
+  for (at = 0; at + count <= CELLS; ++at) {
+    mask = cell_mask(at, count);
+    if (!(p->occupied & mask)) {
+      p->occupied |= mask;
+      s->packed_bytes += count * PS_CELL;
+      payload_available(s, p);
+      extent->offset = p->run.offset + at * PS_CELL;
+      extent->flags = EXTENT_PACKED;
+      return LC_OK;
+    }
+  }
+  return err(error, LC_ERR_PROTOCOL, "packed payload free-span mismatch");
 }
 static int metadata_offset(ps_space *s, uint64_t offset) {
   return offset % PS_PAGE == 0 && offset >= 2 * PS_PAGE &&
@@ -932,6 +1111,7 @@ static void destroy(ps_space *s) {
   ps_entry *p;
   ps_run *r;
   ps_meta_page *page;
+  ps_payload_page *payload;
   while (s->entries) {
     p = s->entries;
     s->entries = p->all_next;
@@ -951,6 +1131,11 @@ static void destroy(ps_space *s) {
     page = s->pages;
     s->pages = page->next;
     lc_free_with_allocator(NULL, page);
+  }
+  while (s->payload_pages) {
+    payload = s->payload_pages;
+    s->payload_pages = payload->next;
+    lc_free_with_allocator(NULL, payload);
   }
   if (s->fd >= 0)
     (void)close(s->fd);
@@ -1245,8 +1430,7 @@ static int recover(ps_space *s, lc_error *error) {
    */
   for (p = s->entries; p; p = p->all_next) {
     for (i = 0; i < p->count; ++i) {
-      rc = exclude_run(s, p->extents[i].offset, aligned(p->extents[i].bytes),
-                       error);
+      rc = payload_claim(s, &p->extents[i], error);
       if (rc != LC_OK)
         goto done;
     }
@@ -1471,12 +1655,18 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       p->capacity = n;
     }
     extent = &p->extents[p->count];
+    memset(extent, 0, sizeof(*extent));
     take = w->used - done;
-    run_bytes = aligned(take);
-    rc = checkpoint_allowance(s, s->metadata + entry_bytes(p) + 24,
-                              s->live_entries + 1, run_bytes, error);
-    if (rc == LC_OK)
-      rc = take_run(s, &run_bytes, &extent->offset, error);
+    run_bytes = take / PS_PAGE * PS_PAGE;
+    if (!run_bytes) {
+      run_bytes = take;
+      rc = payload_reserve(s, p, extent, take, error);
+    } else {
+      rc = checkpoint_allowance(s, s->metadata + entry_bytes(p) + 24,
+                                s->live_entries + 1, run_bytes, error);
+      if (rc == LC_OK)
+        rc = take_run(s, &run_bytes, &extent->offset, error);
+    }
     if (rc == LC_OK) {
       if (run_bytes < take)
         take = (size_t)run_bytes;
@@ -1766,6 +1956,9 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->metadata_pages = s->metadata_pages;
   out->directory_page_writes = s->directory_page_writes;
   out->descriptor_page_writes = s->descriptor_page_writes;
+  out->packed_pages = s->packed_pages;
+  out->packed_bytes = s->packed_bytes;
+  out->allocated_bytes = s->packed_pages * (uint64_t)PS_PAGE;
   out->journal_bytes = s->journal;
   out->syncs = __atomic_load_n(&s->syncs, __ATOMIC_RELAXED);
   out->checkpoints = s->checkpoints;
@@ -1776,9 +1969,11 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   pthread_mutex_unlock(&s->commit_mutex);
   for (p = s->entries; p; p = p->all_next) {
     n = 0;
-    for (i = 0; i < p->count; ++i)
-      n += aligned(p->extents[i].bytes);
-    out->allocated_bytes += n;
+    for (i = 0; i < p->count; ++i) {
+      n += extent_allocation(&p->extents[i]);
+      if (!(p->extents[i].flags & EXTENT_PACKED))
+        out->allocated_bytes += extent_allocation(&p->extents[i]);
+    }
     if (p->state == 1 && !p->deleted) {
       ++out->entries;
       out->live_bytes += p->bytes;

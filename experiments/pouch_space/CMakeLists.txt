@@ -56,6 +56,9 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
+  add_test(NAME pouch_space_packing COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} packing)
+  set_tests_properties(pouch_space_packing PROPERTIES TIMEOUT 60
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_metadata PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_reopen PROPERTIES TIMEOUT 30

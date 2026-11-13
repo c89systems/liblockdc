@@ -16,7 +16,8 @@ Full native x86_64 implementation is now authorized in verified stages under the
 [implementation contract](pouch-space-implementation.md). This does not
 authorize conversion of existing roots or a production cutover. The foundation
 now checkpoints through the growable typed directory and packed descriptor
-pages. Payload packing and normal Pouch integration remain ahead.
+pages. Small payload tails also share physical pages through independently owned
+cells. Canonical append-owned streams and normal Pouch integration remain ahead.
 
 ## Intent
 

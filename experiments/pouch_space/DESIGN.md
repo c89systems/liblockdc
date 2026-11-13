@@ -37,10 +37,25 @@ possible. These constants and the experimental format apply to fresh fixtures.
 
 Private payloads flow through a 16 KiB buffer into page-aligned runs. Allocation
 uses 4 KiB physical pages, matching the measurement host's filesystem blocks;
-its device reports 512-byte sectors. Physical alignment and packing small
-logical records are separate decisions. The current allocator reserves at least
-one page per nonempty payload unit and writes only its actual bytes. Packing
-small values into shared pages remains future work.
+its device reports 512-byte sectors. Whole-page portions retain whole runs;
+subpage tails own contiguous 64-byte cells within shared physical pages. Each
+extent encodes its ownership kind and CRC. Writes cover only the caller's actual
+byte range; no page image is read and rewritten to append a neighbour. Payload
+I/O remains outside the allocator mutex, including independent writers sharing
+one physical page.
+
+Each participating packed page has a 64-bit occupancy mask. Free-span bins
+classify pages by their largest contiguous free span: reservation probes at most
+64 bins and 64 cells, rather than scanning every partially occupied page.
+Recovery derives masks from every accepted checkpoint and journal body,
+including superseded entries; it rejects overlapping cell/whole-page ownership.
+There is no separately persisted payload bitmap. Retirement follows the same
+checkpoint and reader-pin rules as whole runs. A page returns to the common
+pool only after its last cell owner is released. Mixed whole-run/cell cleanup
+prepares fallible allocations before returning any ownership; failure during
+private abort poisons the handle until reopen. `allocated_bytes` counts physical
+payload reservations once per page; attributed retired/private bytes and
+`packed_bytes` count rounded cells, excluding unused shared-page slack.
 Allocation uses sorted free intervals, split/merged on demand, and metadata
 grows with actual extents and participation, not reserved capacity. Each run
 records its offset, byte length and CRC32. References bind a random container

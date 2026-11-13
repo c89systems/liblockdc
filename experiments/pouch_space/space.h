@@ -11,9 +11,10 @@
  * Stop concurrent calls before closing the space itself. */
 #define PS_MIB UINT64_C(1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
-/* Native experiment: filesystem block-sized physical allocation; logical
- * records need not eventually consume a whole physical page each. */
+/* Native experiment: filesystem block-sized physical allocation with small
+ * logical tails sharing independently owned cells. */
 #define PS_PAGE 4096U
+#define PS_CELL 64U
 #define PS_CHUNK 16384U
 #define PS_METADATA_RESERVE 131072U
 #define PS_JOURNAL 131072U
@@ -35,10 +36,14 @@ typedef struct ps_ref {
   uint64_t incarnation;
 } ps_ref;
 typedef struct ps_stats {
+  /* allocated_bytes counts physical payload reservations once per page.
+   * Retired/private bytes attribute whole runs or rounded cells to owners;
+   * packed_bytes includes those owners and excludes unused page slack. */
   uint64_t capacity, live_bytes, allocated_bytes, retired_bytes, private_bytes;
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   uint64_t metadata_pages, directory_page_writes, descriptor_page_writes;
+  uint64_t packed_pages, packed_bytes;
 } ps_stats;
 
 /* Optional syscall seam for deterministic storage faults, not another backend.

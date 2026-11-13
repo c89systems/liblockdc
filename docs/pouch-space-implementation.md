@@ -72,8 +72,14 @@ incarnation limit; retired metadata pages are released after root retirement.
 It reserves 16 KiB of payload capacity and a conservative full-directory allowance
 before foreground admission. Tests cover 12,000 entries in 10 MiB, incremental
 checkpoint I/O, spanning descriptors, private-build allocation failures and
-torn/missing writes at multi-page checkpoint boundaries. Payload packing,
-metadata repacking and production integration remain to be implemented.
+torn/missing writes at multi-page checkpoint boundaries. Small payload tails now
+share independently reserved 64-byte cells within 4 KiB pages, with bounded
+free-span selection and ownership reconstructed from all replay dependencies.
+Tests cover fragmented spans, every cell boundary, pinned retirement, independent
+publication/checkpoint during a held neighbouring write, malformed ownership,
+and each publication I/O/heap failure, including mixed whole-run/cell cleanup.
+Canonical append-owned streams, metadata repacking and production integration
+remain to be implemented.
 
 ## Integration and acceptance
 

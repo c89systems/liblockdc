@@ -465,6 +465,7 @@ int main(int argc, char **argv) {
   long max_sync_batch = -1;
   long checkpoints = -1, directory_writes = -1, descriptor_writes = -1;
   long metadata_pages = -1;
+  long packed_pages = -1, packed_bytes = -1, payload_allocated = -1;
   struct rusage usage;
   char prefix[1024], template_path[1100];
   size_t i, count;
@@ -562,6 +563,9 @@ int main(int argc, char **argv) {
     descriptor_writes = (long)(stats.descriptor_page_writes -
                                initial_stats.descriptor_page_writes);
     metadata_pages = (long)stats.metadata_pages;
+    packed_pages = (long)stats.packed_pages;
+    packed_bytes = (long)stats.packed_bytes;
+    payload_allocated = (long)stats.allocated_bytes;
   }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
   start = now(CLOCK_MONOTONIC);
@@ -615,8 +619,10 @@ int main(int argc, char **argv) {
       usage.ru_maxrss, (unsigned long)fd_calls, (unsigned long)full_calls,
       (double)sync_ns / 1e6, max_sync_batch);
   printf("checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
-         "metadata_pages=%ld verified=1\n",
-         checkpoints, directory_writes, descriptor_writes, metadata_pages);
+         "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
+         "payload_allocated=%ld verified=1\n",
+         checkpoints, directory_writes, descriptor_writes, metadata_pages,
+         packed_pages, packed_bytes, payload_allocated);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

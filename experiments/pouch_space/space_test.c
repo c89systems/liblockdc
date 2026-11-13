@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static lc_error error;
 static char path[1024], other[1024];
@@ -175,7 +176,7 @@ static void basic(void) {
   BAD(ps_close(s, &error));
   OK(ps_checkpoint(s, &error));
   OK(ps_status(s, &stats, &error));
-  CHECK(stats.retired_bytes == PS_PAGE); /* held reader still pins first */
+  CHECK(stats.retired_bytes == PS_CELL); /* held reader still pins first */
   ps_reader_close(held);
   OK(ps_status(s, &stats, &error));
   CHECK(stats.retired_bytes == 0);
@@ -437,7 +438,7 @@ static void reordered_nosync(void) {
   OK(ps_read_open(s, state(1), NULL, &r, &error));
   OK(ps_delete(s, state(1), &error));
   OK(ps_status(s, &stats, &error));
-  CHECK(stats.retired_bytes == PS_PAGE);
+  CHECK(stats.retired_bytes == PS_CELL);
   OK(ps_checkpoint(s, &error)); /* NoSync retirement must become durable */
   ps_reader_close(r);
   put(s, state(4), "overwrites-free-space", 21, 1);
@@ -960,7 +961,7 @@ typedef struct commit_gate {
   pthread_mutex_t mutex;
   pthread_cond_t cond;
   int enabled, entered, released, fail_sync, publications, finished;
-  int maintenance, fd;
+  int maintenance, fd, hold_payload;
   int hold_second, second_entered, second_released;
   size_t syncs;
 } commit_gate;
@@ -977,7 +978,16 @@ static ssize_t gate_read(void *v, int fd, void *p, size_t n, off_t offset) {
 static ssize_t gate_write(void *v, int fd, const void *p, size_t n,
                           off_t offset) {
   commit_gate *g = v;
-  ssize_t written = pwrite(fd, p, n, offset);
+  ssize_t written;
+  pthread_mutex_lock(&g->mutex);
+  if (g->enabled && g->hold_payload && !g->entered && offset >= PS_DATA) {
+    g->entered = 1;
+    pthread_cond_broadcast(&g->cond);
+    while (!g->released)
+      pthread_cond_wait(&g->cond, &g->mutex);
+  }
+  pthread_mutex_unlock(&g->mutex);
+  written = pwrite(fd, p, n, offset);
   pthread_mutex_lock(&g->mutex);
   if (g->enabled && written == (ssize_t)n) {
     if (offset >= PS_JOURNAL_OFFSET && offset < PS_DATA && n >= 64)
@@ -1255,7 +1265,7 @@ static void reopen_retirement(void) {
     expect(s, state(101), NULL, later, sizeof(later));
     expect(s, state(102), NULL, later, sizeof(later));
     OK(ps_status(s, &stats, &error));
-    CHECK(stats.retired_bytes >= 2 * PS_PAGE);
+    CHECK(stats.retired_bytes >= 2 * 4 * PS_CELL);
     OK(ps_checkpoint(s, &error));
     OK(ps_status(s, &stats, &error));
     CHECK(stats.retired_bytes == 0);
@@ -1430,6 +1440,311 @@ static void metadata_recovery_allocations(void) {
   puts("metadata: every allocation during multi-page descriptor recovery");
 }
 
+static void packing_lifecycle(void) {
+  ps_space *s;
+  ps_reader *held;
+  ps_stats stats;
+  unsigned char *body = malloc(PS_CHUNK + 1);
+  size_t i, n, k = 0;
+  CHECK(body != NULL);
+  for (i = 0; i <= PS_CHUNK; ++i)
+    body[i] = (unsigned char)(i * 19 + i / 31);
+  clean();
+  s = create(2 * PS_MIB, 0, NULL);
+  for (i = 0; i < 64; ++i)
+    put(s, state(i), body, 1, 1);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.allocated_bytes == PS_PAGE && stats.packed_pages == 1 &&
+        stats.packed_bytes == PS_PAGE && stats.live_bytes == 64);
+  OK(ps_read_open(s, state(0), NULL, &held, &error));
+  for (i = 0; i < 64; i += 2)
+    OK(ps_delete(s, state(i), &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.packed_bytes == 33 * PS_CELL && stats.retired_bytes == PS_CELL);
+  /* Only isolated one-cell holes are free; fill them without new pages. */
+  for (i = 0; i < 31; ++i)
+    put(s, state(100 + i), body, PS_CELL, 7);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.allocated_bytes == PS_PAGE && stats.packed_bytes == PS_PAGE);
+  put(s, state(1000), body, PS_CELL + 1, 7);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.packed_pages == 2 && stats.packed_bytes == PS_PAGE + 2 * PS_CELL);
+  read_value(held, body, 1);
+  ps_reader_close(held);
+  for (i = 1; i < 64; i += 2)
+    OK(ps_delete(s, state(i), &error));
+  for (i = 0; i < 31; ++i)
+    OK(ps_delete(s, state(100 + i), &error));
+  OK(ps_delete(s, state(1000), &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(!stats.allocated_bytes && !stats.packed_bytes && !stats.packed_pages);
+  /* Both sides of every cell boundary, including 63->64 cells, and whole-page
+   * plus packed-tail splits. Producer chunking does not change ownership. */
+  for (n = 1; n <= PS_PAGE; ++n)
+    if (n % PS_CELL <= 1 || n % PS_CELL == PS_CELL - 1)
+      put(s, state(k++), body, n, 37);
+  for (n = PS_PAGE + 1; n <= PS_CHUNK + 1; n += PS_PAGE)
+    put(s, state(k++), body, n, 317);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  k = 0;
+  for (n = 1; n <= PS_PAGE; ++n)
+    if (n % PS_CELL <= 1 || n % PS_CELL == PS_CELL - 1)
+      expect(s, state(k++), NULL, body, n);
+  for (n = PS_PAGE + 1; n <= PS_CHUNK + 1; n += PS_PAGE)
+    expect(s, state(k++), NULL, body, n);
+  OK(ps_close(s, &error));
+  free(body);
+  clean();
+  puts("packing: cell boundaries, shared-page pins, fragmented spans and full "
+       "page return");
+}
+static void packing_faults(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *s;
+  ps_writer *w;
+  ps_reader *r;
+  ps_stats stats;
+  unsigned char *body = malloc(PS_CHUNK + PS_PAGE);
+  size_t kind, fresh, phase, count, old_size, wanted;
+  int rc;
+  CHECK(body != NULL);
+  memset(body, 0xb3, PS_CHUNK + PS_PAGE);
+  for (fresh = 0; fresh < 3; ++fresh)
+    for (kind = 0; kind < 2; ++kind) {
+      count = 0;
+      old_size = fresh ? PS_PAGE - 1 : 1024;
+      wanted = fresh == 2 ? PS_CHUNK + 65 : 1024;
+      for (phase = 0; phase <= count; ++phase) {
+        clean();
+        m.operations = m.fail_at = 0;
+        s = create(PS_MIB, 1, &io);
+        put(s, state(1), body, old_size, 317);
+        OK(ps_checkpoint(s, &error));
+        m.operations = 0;
+        m.fail_at = kind == 0 ? phase : 0;
+        m.tear = m.persist_torn = 1;
+        allocation_call = 0;
+        allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+        w = NULL;
+        rc = ps_begin(s, state(2), &w, &error);
+        if (rc == LC_OK)
+          rc = ps_write(w, body, wanted, &error);
+        if (rc == LC_OK)
+          rc = ps_publish(w, NULL, &error);
+        allocation_fail = 0;
+        m.fail_at = 0;
+        if (!phase)
+          count = kind == 0 ? m.operations : allocation_call;
+        if (rc != LC_OK) {
+          CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+          lc_error_cleanup(&error);
+        }
+        ps_writer_close(w);
+        if (kind == 1) {
+          expect(s, state(1), NULL, body, old_size);
+          OK(ps_status(s, &stats, &error));
+          CHECK(!stats.private_bytes);
+          if (rc != LC_OK)
+            CHECK(stats.allocated_bytes == PS_PAGE && stats.packed_pages == 1 &&
+                  stats.packed_bytes ==
+                      (old_size + PS_CELL - 1) / PS_CELL * PS_CELL);
+        }
+        OK(ps_close(s, &error));
+        crash(&m);
+        s = reopen(&io);
+        expect(s, state(1), NULL, body, old_size);
+        r = NULL;
+        if (rc == LC_OK) {
+          expect(s, state(2), NULL, body, wanted);
+        } else if (ps_read_open(s, state(2), NULL, &r, &error) == LC_OK) {
+          read_value(r, body, wanted);
+          ps_reader_close(r);
+        } else
+          lc_error_cleanup(&error);
+        put(s, state(3), body, 65, 1);
+        expect(s, state(1), NULL, body, old_size);
+        OK(ps_checkpoint(s, &error));
+        OK(ps_status(s, &stats, &error));
+        CHECK(stats.packed_pages == (fresh ? 2 : 1));
+        OK(ps_close(s, &error));
+      }
+      CHECK(count >= 3);
+    }
+  /* A mixed whole-run/packed-tail abort cannot partly return ownership when
+   * free-interval allocation fails. Poison prevents reuse until recovery. */
+  clean();
+  s = create(PS_MIB, 1, NULL);
+  ps_key collection = key(PS_COLLECTION, 9, 1);
+  put(s, collection, body, PS_CELL, 1);
+  OK(ps_begin(s, collection, &w, &error));
+  OK(ps_write(w, body, PS_CHUNK + 65, &error));
+  BAD(ps_publish(w, NULL, &error)); /* existing live collection binding */
+  allocation_call = 0;
+  allocation_fail = 1;
+  ps_writer_close(w);
+  allocation_fail = 0;
+  CHECK(allocation_call >= 1);
+  BAD(ps_begin(s, state(99), &w, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, collection, NULL, body, PS_CELL);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.allocated_bytes == PS_PAGE && stats.packed_bytes == PS_CELL);
+  put(s, state(99), body, PS_CELL + 1, 1);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  free(body);
+  free(m.stable);
+  clean();
+  puts("packing: each publication I/O/heap failure in shared and fresh pages, "
+       "persistent torn prefixes and neighbour survival");
+}
+static void packing_concurrency(void) {
+  commit_gate gate;
+  commit_actor actor;
+  ps_io io;
+  ps_space *s;
+  ps_stats stats;
+  pthread_t thread;
+  unsigned char body[1024];
+  size_t durable;
+  for (durable = 0; durable < 2; ++durable) {
+    clean();
+    memset(&gate, 0, sizeof(gate));
+    memset(&actor, 0, sizeof(actor));
+    CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+    CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+    io.context = &gate;
+    io.read = gate_read;
+    io.write = gate_write;
+    io.sync = gate_sync;
+    io.reserve = gate_reserve;
+    s = create(PS_MIB, (int)durable, &io);
+    gate.enabled = gate.hold_payload = 1;
+    actor.space = s;
+    actor.gate = &gate;
+    CHECK(pthread_create(&thread, NULL, commit_worker, &actor) == 0);
+    await_gate(&gate, 0); /* first writer has reserved cells, no payload I/O */
+    memset(body, 'B', sizeof(body));
+    put(s, state(2), body, sizeof(body), 31);
+    OK(ps_checkpoint(s, &error));
+    expect(s, state(2), NULL, body, sizeof(body));
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.packed_pages == 1 && stats.private_bytes == sizeof(body));
+    pthread_mutex_lock(&gate.mutex);
+    gate.released = 1;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.mutex);
+    CHECK(pthread_join(thread, NULL) == 0 && actor.rc == LC_OK);
+    expect(s, state(2), NULL, body, sizeof(body));
+    memset(body, 'A', sizeof(body));
+    expect(s, state(1), &actor.ref, body, sizeof(body));
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, state(1), &actor.ref, body, sizeof(body));
+    memset(body, 'B', sizeof(body));
+    expect(s, state(2), NULL, body, sizeof(body));
+    OK(ps_close(s, &error));
+    CHECK(pthread_cond_destroy(&gate.cond) == 0);
+    CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
+  }
+  clean();
+  puts("packing: independent publication and checkpoint on a shared page "
+       "during held payload I/O, NoSync and durable");
+}
+static uint64_t fixture_get64(const unsigned char *p) {
+  uint64_t value = 0;
+  size_t i;
+  for (i = 0; i < 8; ++i)
+    value |= (uint64_t)p[i] << (i * 8);
+  return value;
+}
+static void fixture_put(unsigned char *p, uint64_t value, size_t bytes) {
+  size_t i;
+  for (i = 0; i < bytes; ++i)
+    p[i] = (unsigned char)(value >> (i * 8));
+}
+static void fixture_entry_crc(unsigned char *record) {
+  uint32_t crc = (uint32_t)crc32(0, record, 60);
+  fixture_put(record + 60, crc32(crc, record + 64, 24), 4);
+}
+static void packing_invalid_ownership(void) {
+  ps_space *s = NULL;
+  unsigned char *buffer = malloc(PS_PAGE), *body = malloc(PS_PAGE);
+  unsigned char roots[PS_ROOT_BYTES], records[176];
+  unsigned char *record;
+  uint64_t directory, reference, offset;
+  size_t phase;
+  int fd;
+  CHECK(buffer && body);
+  memset(body, 'A', PS_PAGE);
+  /* Keep all outer CRCs valid so these cases exercise ownership validation,
+   * rather than being rejected merely as damaged encoded bytes. */
+  for (phase = 0; phase < 8; ++phase) {
+    clean();
+    s = create(PS_MIB, 0, NULL);
+    put(s, state(1), body,
+        phase == 1   ? PS_PAGE
+        : phase == 7 ? PS_CELL + 1
+                     : PS_CELL,
+        31);
+    put(s, state(2), body, phase == 2 ? PS_PAGE : PS_CELL, 31);
+    if (phase >= 3)
+      OK(ps_checkpoint(s, &error));
+    OK(ps_close(s, &error));
+    fd = open(path, O_RDWR);
+    CHECK(fd >= 0);
+    if (phase < 3) {
+      CHECK(pread(fd, records, sizeof(records), PS_JOURNAL_OFFSET) ==
+            (ssize_t)sizeof(records));
+      /* Alias two packed cells, a whole page with packed cells, and the
+       * reverse recovery order. Bodies match, so both payload CRCs pass. */
+      record = records + (phase == 2 ? 0 : 88);
+      offset = fixture_get64(records + (phase == 2 ? 88 : 0) + 64);
+      fixture_put(record + 64, offset, 8);
+      fixture_entry_crc(record);
+      CHECK(pwrite(fd, records, sizeof(records), PS_JOURNAL_OFFSET) ==
+            (ssize_t)sizeof(records));
+    } else {
+      CHECK(pread(fd, roots, sizeof(roots), 0) == (ssize_t)sizeof(roots));
+      directory = fixture_get64(roots + 32);
+      CHECK(pread(fd, buffer, PS_PAGE, (off_t)directory) == PS_PAGE);
+      reference = fixture_get64(buffer + 64 + 24); /* first sorted leaf key */
+      offset = reference / PS_PAGE * PS_PAGE;
+      CHECK(pread(fd, buffer, PS_PAGE, (off_t)offset) == PS_PAGE);
+      record = buffer + reference % PS_PAGE;
+      if (phase == 3)
+        fixture_put(record + 84, 2, 4); /* unknown extent flags */
+      else if (phase == 4)
+        fixture_put(record + 64, PS_DATA + 1, 8); /* cell misalignment */
+      else if (phase == 5)
+        fixture_put(record + 84, 0, 4); /* packed address as whole page */
+      else if (phase == 6)
+        fixture_put(record + 64, PS_DATA + PS_CELL, 8); /* duplicate cells */
+      else
+        fixture_put(record + 64, PS_DATA + PS_PAGE - PS_CELL,
+                    8); /* span crosses physical page */
+      fixture_entry_crc(record);
+      uint32_t crc = (uint32_t)crc32(0, buffer, 48);
+      fixture_put(buffer + 48, crc32(crc, buffer + 52, PS_PAGE - 52), 4);
+      CHECK(pwrite(fd, buffer, PS_PAGE, (off_t)offset) == PS_PAGE);
+    }
+    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    CHECK(ps_open(path, 0, NULL, &s, &error) == LC_ERR_PROTOCOL && s == NULL);
+    lc_error_cleanup(&error);
+  }
+  free(buffer);
+  free(body);
+  clean();
+  puts("packing: checksummed duplicate/cross-kind ownership, invalid flags "
+       "and alignment rejected on recovery");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -1447,6 +1762,11 @@ int main(int argc, char **argv) {
       metadata_lifecycle();
       metadata_faults();
       metadata_recovery_allocations();
+    } else if (strcmp(argv[2], "packing") == 0) {
+      packing_lifecycle();
+      packing_faults();
+      packing_concurrency();
+      packing_invalid_ownership();
     } else
       return 2;
     lc_error_cleanup(&error);

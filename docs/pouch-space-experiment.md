@@ -304,6 +304,91 @@ artifacts. Raw standard and rollover logs are in
 summary ranges. These are foundation measurements, with the semantic scope
 differences described above, rather than full-backend acceptance evidence.
 
+## Payload packing follow-up
+
+Small payload tails now reserve 64-byte cells inside shared, aligned 4 KiB pages.
+Whole-page portions remain whole runs. Writers reserve disjoint ranges under
+the allocator mutex and perform payload I/O outside it. Free-span bins bound
+selection work independently of the number of participating pages. Recovery
+reconstructs ownership from the existing descriptors; cell reuse still waits
+for journal/root retirement and reader pins. No payload cache or spool is added.
+
+All 14 experiment tests pass under Debug ASan/UBSan and native glibc/musl
+Release. Five storage tests pass with ThreadSanitizer. The extended packing test
+also passes in each configuration and Memcheck, with 26,403 observable checks,
+zero errors and every heap allocation freed. It covers both sides of every
+cell boundary, fragmented spans, return of completely freed pages, mixed
+whole-run/tail allocation failures and failed abort cleanup, persistent torn
+write prefixes, checksummed invalid ownership, and a blocked payload write
+while a neighbour commits and checkpoints, in both durability modes.
+
+The standard comparison repeats all 160 verified runs. Median write-phase
+milliseconds, **packed container / current Pouch**:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-nosync-1w | 2.11 / 16.08 | 2.01 / 49.46 |
+| small-nosync-4w | 3.69 / 20.62 | 3.11 / 24.50 |
+| small-durable-1w | 1016.82 / 1540.54 | 484.22 / 893.51 |
+| small-durable-4w | 598.30 / 1081.97 | 327.82 / 507.72 |
+| large-nosync-1w | 5.13 / 44.90 | 4.41 / 29.27 |
+| large-nosync-4w | 3.68 / 18.29 | 2.29 / 2.67 |
+| large-durable-1w | 367.15 / 463.99 | 202.82 / 209.90 |
+| large-durable-4w | 187.12 / 414.98 | 93.34 / 168.08 |
+
+The 80-run rollover comparison also repeats, with exactly one checkpoint in
+each container write phase:
+
+| Profile | State, container / Pouch ms | Collection-shaped, container / Pouch ms |
+| --- | ---: | ---: |
+| rollover-nosync-1w | 22.29 / 59.37 | 28.72 / 195.95 |
+| rollover-nosync-4w | 30.78 / 24.23 | 34.95 / 76.45 |
+| rollover-durable-1w | 6889.49 / 10607.43 | 6402.42 / 11018.26 |
+| rollover-durable-4w | 3846.47 / 7588.40 | 4048.93 / 7687.74 |
+
+All four durable rollover container/Pouch sample ranges are disjoint. This
+does not establish a general win: four-writer NoSync state rollover remains
+slower, and the standard large four-writer collection ranges overlap despite
+the lower median. Small NoSync state p99 with four writers remains worse:
+245 us versus 73 us. Serial verified warm state reads take 0.27–0.48 ms versus
+2.49–5.86 ms in small profiles, and 2.07–2.20 ms versus 3.71–4.16 ms in large
+profiles. Concurrent scans and cold-cache behavior remain unmeasured.
+
+A separate 60-run check rotates the packed executable, the preserved
+pre-packing executable corresponding to `e0c19a2`, and Pouch across five samples:
+
+| Profile | Kind | Before packing, ms | Packed, ms | Pouch, ms |
+| --- | --- | ---: | ---: | ---: |
+| small-durable-1w | State | 1326.56 | 857.03 | 1274.69 |
+| small-durable-1w | Collection | 654.07 | 452.42 | 673.81 |
+| rollover-nosync-4w | State | 37.94 | 26.00 | 22.69 |
+| rollover-nosync-4w | Collection | 48.23 | 31.86 | 66.53 |
+
+Packing reduces the paired single-writer durable medians by 35% for state and
+31% for collections. Their before/after ranges are disjoint, as are packed/Pouch
+ranges: state takes 701–966 ms versus 1193–1686 ms for Pouch, and collections
+383–477 ms versus 554–769 ms. Each engine still issues one data sync per
+successful publication: 256 state syncs or 128 collection syncs. Kernel write
+accounting is unchanged by packing in these single-writer durable fixtures
+(2,117,632 bytes for state, 1,056,768 for collections), and remains above Pouch.
+The measured latency gain does not imply fewer barriers or fewer durable bytes.
+
+For paired four-writer NoSync state rollover, packing cuts kernel writes from
+8,802,304 to 2,596,864 bytes, below Pouch's 3,244,032 bytes, and write time by
+31%. The remaining 15% median slowdown versus Pouch and overlapping ranges
+remain explicit. Container checkpoint sync time sums fall from a 23.79 ms
+median to 12.42 ms, but three structural barriers still lie on the write path.
+P99 again excludes the rare checkpoint. Canonical append-owned streams and
+checkpoint scheduling remain necessary integration/performance work.
+
+All 300 runs verify payloads before and after reopen and audit file artifacts.
+Logs, the paired runner, and `packing-results.json` are retained in
+`build/pouch-space-integrated/`, under `packing-measure/`, `packing-rollover/`
+and `packing-paired/`. The pre-packing executable is retained as
+`pouch_space_compare-multifile-baseline`; its normal Pouch implementation is
+unchanged. The physical foundation still lacks the public semantics described
+in the measurement contract, so these results are not full-backend acceptance.
+
 ## Reproduce
 
 ```sh
@@ -338,9 +423,9 @@ Valgrind output is retained in `build/pouch-space-comparison/valgrind.log`.
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
-above describe the original and commit-coordination implementations. Before a
-production adapter, resolve small-value
-packing and single-writer sync cost, checkpoint scheduling,
+above identify their implementation stages, including the current payload
+packing follow-up. Before a production adapter, complete canonical append-owned
+streams and their typed catalogs, checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection
