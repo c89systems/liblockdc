@@ -105,6 +105,7 @@ set(lockdc_lua_documentation_sources
     docs/pouch-open-settings-api.md
     docs/pouch-compression.md
     docs/pouch-storage.md
+    docs/pouch-space.md
     docs/collections.md
     docs/collection-writer.md
     docs/collection-leases.md

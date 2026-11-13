@@ -13,6 +13,9 @@ default runtime is an exclusive root writer with a resident namespace
 logstore. An explicit shared-root runtime is supported over that same format.
 This is not Go-disk interoperability or a parallel durable format.
 
+The [segment-space draft](pouch-space.md) explores a possible future single-file
+physical container. It is not implemented and does not change this contract.
+
 ## Reference Principle
 
 Go lockd disk is the reference for storage semantics and operational model
