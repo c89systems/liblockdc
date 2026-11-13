@@ -783,27 +783,18 @@ static int recover(ps_space *s, lc_error *error) {
   }
   s->free->offset = PS_DATA;
   s->free->bytes = s->capacity - PS_DATA;
-  for (p = s->entries; p; p = p->all_next)
-    if (p->state == 1)
-      for (i = 0; i < p->count; ++i) {
-        rc = exclude_run(s, p->extents[i].offset, aligned(p->extents[i].bytes),
-                         error);
-        if (rc != LC_OK)
-          goto done;
-      }
-  /* Retired entries were not excluded, and must not be freed into intervals. */
-  {
-    ps_entry **link = &s->entries;
-    while (*link) {
-      p = *link;
-      if (p->state == 2) {
-        *link = p->all_next;
-        entry_free(p);
-      } else {
-        p->previous = NULL;
-        link = &p->all_next;
-      }
+  /* Replay verifies every accepted PUT body, including superseded versions.
+   * Reopening must preserve that ownership until a new checkpoint retires the
+   * journal; otherwise reuse can make the next replay discard a durable tail.
+   */
+  for (p = s->entries; p; p = p->all_next) {
+    for (i = 0; i < p->count; ++i) {
+      rc = exclude_run(s, p->extents[i].offset, aligned(p->extents[i].bytes),
+                       error);
+      if (rc != LC_OK)
+        goto done;
     }
+    p->previous = NULL;
   }
   rc = grant_tokens(s, error);
   if (rc == LC_OK)

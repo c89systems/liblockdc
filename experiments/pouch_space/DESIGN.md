@@ -83,6 +83,11 @@ and accepted journal, invalidates its sibling, and clears the rejected journal
 suffix durably before admitting allocation. Arbitrary corruption of previously
 durable journal bytes is outside the torn-tail recovery guarantee.
 
+Reopening retains ownership of every accepted checkpoint and journal body,
+including superseded values. The next replay still verifies older PUT bodies
+before reaching later replacements or deletions. Only a durable checkpoint
+retires that dependency and permits reuse; an opening sync alone cannot do so.
+
 Retired payload runs remain unavailable until a checkpoint has synchronized
 payloads and metadata, published the alternate root durably, and invalidated the
 previous root durably. Only then can unpinned runs be reused. Active readers pin

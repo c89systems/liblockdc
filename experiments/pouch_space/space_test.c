@@ -801,8 +801,9 @@ static void model_churn(void) {
     random = random * 1664525U + 1013904223U;
     slot = (random >> 16) % 64;
     k = key(slot % 2 ? PS_COLLECTION : PS_STATE, slot / 16, slot % 16);
-    if (step % 43 == 0) {
-      OK(ps_checkpoint(s, &error));
+    if (step % 43 == 0 || step % 17 == 0) {
+      if (step % 43 == 0)
+        OK(ps_checkpoint(s, &error));
       if (held) {
         read_value(held, held_value, held_size);
         ps_reader_close(held);
@@ -867,7 +868,7 @@ static void model_churn(void) {
   free(held_value);
   clean();
   puts("reference model: 3000 mixed typed writes, aborts, deletes, pins and "
-       "reopen cycles");
+       "checkpointed/uncheckpointed reopen cycles");
 }
 
 static void incarnation_grants(void) {
@@ -1217,6 +1218,57 @@ static void commit_coordination(void) {
        "failure and checkpoint ordering");
 }
 
+static void reopen_retirement(void) {
+  ps_space *s;
+  ps_key k;
+  ps_ref committed;
+  ps_stats stats;
+  unsigned char body[193], later[193];
+  size_t kind, revision;
+  memset(later, 'D', sizeof(later));
+  for (kind = PS_STATE; kind <= PS_COLLECTION; ++kind) {
+    clean();
+    k = key((unsigned int)kind, 7, 1);
+    s = create(PS_MIB, 1, NULL);
+    memset(body, 'A', sizeof(body));
+    put(s, k, body, sizeof(body), 17);
+    OK(ps_checkpoint(s, &error));
+    for (revision = 1; revision <= 2; ++revision) {
+      if (kind == PS_COLLECTION)
+        OK(ps_delete(s, k, &error));
+      memset(body, 'A' + (int)revision, sizeof(body));
+      committed = put(s, k, body, sizeof(body), 17);
+    }
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, k, &committed, body, sizeof(body));
+    /* These allocations must not overwrite checkpoint/journal bodies needed
+     * by the next replay, even though only the newest value is logically live.
+     */
+    put(s, state(101), later, sizeof(later), 19);
+    put(s, state(102), later, sizeof(later), 19);
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, k, &committed, body, sizeof(body));
+    expect(s, state(101), NULL, later, sizeof(later));
+    expect(s, state(102), NULL, later, sizeof(later));
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.retired_bytes >= 2 * PS_PAGE);
+    OK(ps_checkpoint(s, &error));
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.retired_bytes == 0);
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, k, &committed, body, sizeof(body));
+    expect(s, state(101), NULL, later, sizeof(later));
+    expect(s, state(102), NULL, later, sizeof(later));
+    OK(ps_close(s, &error));
+  }
+  clean();
+  puts("reopen: retain replay-dependent retired bodies until durable "
+       "checkpoint");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -1226,11 +1278,14 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "commit") != 0)
+    if (strcmp(argv[2], "commit") == 0)
+      commit_coordination();
+    else if (strcmp(argv[2], "reopen") == 0)
+      reopen_retirement();
+    else
       return 2;
-    commit_coordination();
     lc_error_cleanup(&error);
-    printf("pouch-space commits: %zu observable checks passed\n", checks);
+    printf("pouch-space %s: %zu observable checks passed\n", argv[2], checks);
     return 0;
   }
   basic();

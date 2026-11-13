@@ -48,14 +48,17 @@ The container coordinator must order publication as follows:
 3. Build changed directory pages and synchronize their dependencies.
 4. Publish an independently checksummed alternate root and synchronize it.
 5. Invalidate the old recoverable root and synchronize that retirement.
-6. Reclaim old directory pages and unpinned payload runs.
+6. Reclaim unpinned retired directory pages and payload runs.
 
 An aborted directory build may release its new pages only before root
 publication. After uncertain root publication, recovery determines ownership.
 Unchanged pages shared by old and new roots never enter the retirement set.
+Active directory views also retain their page ownership until they quiesce.
 Recovery explicitly walks verified reachable pages and typed entries to rebuild
 ownership. Read callbacks do not implicitly mutate the allocator. Ownership
 walks require an unmodified directory view.
+Journal verification dependencies also remain owned across reopen, including
+superseded bodies, until a durable checkpoint retires that journal history.
 Corruption of the selected root's directory is an error; recovery cannot fall
 back to an obsolete root whose pages may already have been reused.
 

@@ -14,7 +14,8 @@ typedef struct ps_directory_value {
 } ps_directory_value;
 /* read/write transfer exactly one PS_PAGE block; the container handles short
  * I/O and EINTR. allocate reserves a distinct aligned page on success and no
- * page on failure. Pages reachable from any recoverable root remain owned.
+ * page on failure. Pages reachable from any recoverable root or active
+ * directory view remain owned.
  * Callbacks report their own errors and run under one checkpoint owner. */
 typedef struct ps_directory_io {
   void *context;
@@ -51,7 +52,7 @@ int ps_directory_visit(ps_directory *, ps_directory_visit_fn,
  * borrowed until close. The caller owns disk allocation/reclamation:
  * - on abort before root publication, release allocated pages;
  * - after publishing/syncing the new root AND durably retiring the old root,
- *   release retired pages;
+ *   and after old directory views quiesce, release retired pages;
  * - after uncertain root publication, recover before releasing either set.
  * Never release old pages merely because flush succeeded. */
 int ps_directory_flush(ps_directory *, uint64_t, ps_directory_root *,
