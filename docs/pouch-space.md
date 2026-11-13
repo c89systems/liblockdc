@@ -20,6 +20,14 @@ catalogs and indexes. Preserve the existing distinction between authoritative
 records and rebuildable projections. This proposal adds no transaction semantics,
 SQL layer, payload cache, point-in-time recovery or log-archive product.
 
+Single-file storage means that all persistent store state, rebuildable indexes,
+coordination metadata and journals reside in the container, with no persistent
+sidecars. Transient scratch files are permitted for explicitly documented
+operations, including mutation processing, private snapshots and lonejson
+spool-backed fields. They are disposable working state: losing them may abort
+an in-flight operation, but must never prevent recovery of committed data.
+Define their ownership and cleanup on success, failure and process death.
+
 Use a narrow typed storage boundary for allocation, offset I/O, publication,
 retirement and growth. Do not implement a general filesystem inside the file or
 translate every existing pathname operation into a virtual pathname operation.
@@ -77,8 +85,11 @@ architecture-sized structs.
 Read and write by explicit offsets through bounded buffers. Whole-file mapping
 is not required. An entry larger than one extent consumes additional extents as
 input arrives; entry size must not determine buffer size. Preserve incremental
-JSON validation, compression, encryption, hashing and backpressure. No whole-entry
-buffer, temporary payload spool or payload-copy commit is introduced.
+JSON validation, compression, encryption, hashing and backpressure. Preserve
+existing direct streaming paths; the physical-storage refactor must not add a
+whole-entry buffer, temporary payload spool or payload-copy commit to those
+paths. Operations that explicitly use transient scratch remain spooled or
+file-backed operations and must be described and measured as such.
 
 Published bodies and their descriptors retain their existing validation rules.
 Keep references to metadata-only retention changes bound to the correct stored
@@ -250,6 +261,12 @@ open/recovery time, inode use, allocation fragmentation, working memory and
 p95/p99 operation latency. Include small entries, large bounded-chunk streams,
 many small collections, pure append, deletion/retention churn and slow producers.
 
+Include temporary-file I/O in operation timings, bytes written and syscall
+counts. Report peak scratch-space use separately from container capacity and
+working memory, along with peak temporary-file count. A small preallocated
+container must not conceal additional disk-space or inode requirements from
+spooled operations.
+
 Establish measurement noise before acceptance. Require preserved or improved
 throughput and latency outside that noise, bounded metadata overhead and a
 material reduction in inode/metadata lifecycle costs. Report any competing result
@@ -277,6 +294,8 @@ Cover at least:
   aliases, incremental conversion and independent large-entry extents;
 - existing leases, atomic edits, append/edit idempotency, XA decisions and outbox
   recovery across checkpoint/restart;
+- scratch-file failure and loss, including process death during a spooled
+  operation, without loss of committed data or a recovery dependency on scratch;
 - very large reserved but mostly unused capacity without proportional startup
   scanning or memory allocation;
 - the supported integer widths, musl default 128 KiB worker stacks and portable
