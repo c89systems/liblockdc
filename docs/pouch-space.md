@@ -12,6 +12,12 @@ It uses 10 MiB initial capacity and explicit 1 MiB growth steps on native x86_64
 Linux. Its measurements and correctness envelope do not establish a production
 cutover or freeze the policy choices in this draft.
 
+Full native x86_64 implementation is now authorized in verified stages under the
+[implementation contract](pouch-space-implementation.md). This does not
+authorize conversion of existing roots or a production cutover. The growable
+checkpoint directory is being implemented separately before replacing the
+foundation's fixed metadata banks and integrating normal Pouch behavior.
+
 ## Intent
 
 Store a Pouch root in one preallocated, extensible file, called its segment

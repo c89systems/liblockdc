@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c)
+add_library(pouch_space_experiment STATIC space.c directory.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -34,6 +34,15 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_directory_test directory_test.c)
+  target_link_libraries(pouch_space_directory_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_directory_test PRIVATE
+    "LINKER:--wrap=lc_alloc_with_allocator"
+    "LINKER:--wrap=lc_calloc_with_allocator")
+  lc_configure_c_test_target(pouch_space_directory_test)
+  add_test(NAME pouch_space_directory COMMAND pouch_space_directory_test)
+  set_tests_properties(pouch_space_directory PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_executable(pouch_space_test space_test.c)
   target_link_libraries(pouch_space_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_test PRIVATE
