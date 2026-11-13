@@ -15,6 +15,7 @@ typedef struct ps_owned_run ps_owned_run;
 typedef struct ps_owned_status {
   ps_ref ref;
   uint64_t tail, capacity, runs;
+  int sealed, retired;
 } ps_owned_status;
 
 int ps_owned_open(ps_space *, ps_key, int create, const ps_ref *,
@@ -46,5 +47,11 @@ int ps_owned_barrier(ps_owned_head *, lc_error *);
 /* Canonical recovery has validated [checkpoint tail, tail) and cleared the
  * rejected suffix. Stabilize it before accepting the recovered tail hint. */
 int ps_owned_recovered(ps_owned_head *, uint64_t tail, lc_error *);
+/* Structural transitions always synchronize. Seal first stabilizes canonical
+ * bytes, then publishes the immutable final tail. Retirement journals one
+ * head removal and atomically retires its complete run directory. Held handles
+ * retain payload pins through durable root retirement. */
+int ps_owned_seal(ps_owned_head *, lc_error *);
+int ps_owned_retire(ps_owned_head *, lc_error *);
 
 #endif

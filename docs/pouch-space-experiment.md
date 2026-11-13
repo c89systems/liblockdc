@@ -545,6 +545,73 @@ summaries. The unbatched executable is retained as
 `pouch_space_compare-streams-unbatched`. No source or artifact of the normal
 Pouch backend was changed by this stream stage.
 
+## Stream lifecycle follow-up
+
+Native x86_64 verification on 2026-11-14 adds immutable sealing and atomic
+whole-stream retirement. These are internal physical ownership operations;
+normal Pouch remains multifile, and typed name catalogs/public integration
+remain outstanding.
+
+Seal records the final tail in one 80-byte structural event. It first stabilizes
+unsynced canonical bytes; an already durable tail skips that prerequisite.
+The marker itself always waits for durability. Sealed streams reopen with
+only owned-header validation, without scanning bodies or repairing unused
+suffix capacity. Retirement uses one 64-byte head-removal event for the complete
+run set, while existing readers retain their immutable pins. Reuse still waits
+for durable checkpoint retirement and pin release. Rebinding uses a fresh
+incarnation and rejects stale references. These operations are idempotent and
+reject an active appender. Journal rollover retains its existing checkpoint cost.
+
+All 32 experiment tests pass under Debug ASan/UBSan and native glibc/musl
+Release; eight storage groups pass under ThreadSanitizer. Lifecycle Memcheck
+reports 22,378 observable checks, zero errors and every heap allocation freed.
+Deterministic tests cover each transition and checkpoint I/O/heap failure,
+persisted torn events, valid seal-marker persistence ahead of its failed final
+sync, both durability modes, held barriers with independent ready producers,
+reader pins across retirement/rebinding, zero sealed-body scanning, empty
+streams and full-capacity reclamation. Checksummed invalid flags, tails, run
+counts and identities are also covered.
+
+The full-journal rebinding regression reproduced a use-after-free before its
+fix: automatic checkpointing could collect the old tombstone before the
+replacement head used it. The implementation now refreshes that lookup after
+checkpoint completion. Retirement of over 100 grants fits one 64-byte
+allocation/event when no journal rollover is needed; no allocation per grant
+occurs in the retirement operation.
+
+A 90-run paired check rotates the preserved `46d07ad` executable, the lifecycle
+implementation and current Pouch across five samples. The same unsealed append
+fixtures verify payloads before/after reopen and audit reserved backing and
+single-file artifacts. Median write milliseconds are **before / lifecycle /
+Pouch**:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-durable-1w | 623.78 / 614.47 / 1309.55 | 294.72 / 314.32 / 611.87 |
+| long-nosync-4w | 2.65 / 2.16 / 20.87 | 3.88 / 3.57 / 66.19 |
+| reopened-long-nosync-4w | 21.74 / 25.03 / 20.77 | 26.74 / 26.64 / 77.04 |
+
+Before/after ranges overlap in every cell; these samples establish no append
+regression or improvement from the lifecycle change. Small single-writer durable
+state spans 587–716 ms before and 605–718 ms afterward, versus Pouch 1180–1599 ms.
+Fresh four-writer NoSync state spans 1.93–3.29 ms before and 1.84–3.72 ms afterward,
+versus Pouch 17.69–22.12 ms.
+
+Reopened state remains variable and has a worse median than Pouch in this run:
+12.09–42.25 ms afterward versus 12.94–26.76 ms before and Pouch 15.33–22.49 ms.
+The existing preparation cost and device/scheduling noise remain visible; these
+results do not establish a general reopened-state win. Public semantic parity,
+cold-cache reads, concurrent public scans, compaction and shared-root acceptance
+are still required by the full implementation goal.
+
+Raw logs and the paired runner are retained under
+`build/pouch-space-integrated/lifecycle-paired/` and `lifecycle-paired.sh`;
+`lifecycle-results.json` retains all rows and median/min/max summaries.
+Verification logs use the `lifecycle-*` prefix in the same directory. This
+comparison measures ordinary unsealed appends; transition barrier/allocation
+costs above are proven separately by deterministic tests, not presented as a
+public Pouch deletion benchmark.
+
 ## Reproduce
 
 ```sh
@@ -584,8 +651,8 @@ The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
-packing and canonical-stream follow-ups. Before a production adapter, complete
-stream sealing/retirement, typed catalogs, checkpoint scheduling,
+packing, canonical-stream and lifecycle follow-ups. Full native integration still
+requires typed catalogs, checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection

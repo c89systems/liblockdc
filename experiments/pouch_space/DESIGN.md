@@ -197,13 +197,57 @@ written append is likewise cleared and synced before another appender; its
 existing buffer supplies the bounded fallback. Failed cleanup poisons the space.
 Opening a checkpointed stream does not scan its acknowledged bodies.
 
-These streams have no sealing, retirement, logical name catalogs, public retry
-authority or process-shared ownership yet. Their comparison fixture uses the
+## Stream lifecycle
+
+An active stream may be sealed once its appender is idle. The 80-byte seal event
+binds its existing incarnation, final canonical tail and complete grant shape.
+The head's reserved word at offset 56 carries the sealed bit instead of an extent
+count; other bits are rejected. A checkpoint preserves the same sealed head.
+Sealing is irreversible and idempotent. New appenders are rejected, while readers
+may open immutable ranges through the final tail.
+
+The last canonical commit records its ready sequence in memory. If that sequence
+is not already covered by completed root durability, sealing first synchronizes
+canonical data outside the allocator mutex. Only then may it append its seal
+marker and wait for the shared readiness barrier. This prerequisite matters
+even for an unacknowledged seal: a valid marker must never recover ahead of its
+body. A last-commit sequence already covered by completed root durability avoids
+the extra data barrier.
+Structural seal/retirement wait for durability in both sync modes. Journal
+rollover may additionally require the ordinary checkpoint barriers.
+
+A sealed open verifies its grant headers but neither calls active-tail recovery
+nor clears/synchronizes unused capacity. The final tail is authoritative because
+its dependencies precede its structural marker. Payload checksums and projection
+reconstruction remain the canonical owner's responsibility through bounded reads
+of that committed prefix. Sealing retains unused capacity until retirement;
+there is no implicit truncation or relocation.
+
+Retirement appends one 64-byte head-removal event, bound to its incarnation.
+Validate the run chain before publication, then mark that head and all its grants
+deleted without further allocation or per-run journal actions. Replay performs
+the same complete transition. Descriptors, payloads and journal-verification
+dependencies remain owned until a durable checkpoint retires their history.
+Pins can retain them longer. Existing stream readers keep working; after
+retirement succeeds, the owner rejects new readers and appenders. Close still
+requires its readers to drain. Repeating retirement adds no journal event.
+
+Rebinding a retired typed key requires its retirement sequence to be durable
+and allocates a fresh incarnation. Existing readers of the old owner remain
+independent. The new head inherits any prior checkpoint reference for replacement
+accounting; refresh that lookup after automatic journal-rollover checkpointing,
+which may have collected the old tombstone. A deterministic sanitizer regression
+reproduces the stale-pointer failure before its correction. Another full-capacity
+test retires over 100 grants using one 64-byte allocation/event and proves that
+checkpointing restores capacity without copying payloads.
+
+Logical name catalogs, public retry authority and process-shared ownership
+remain unimplemented. The comparison fixture uses the
 actual Pouch header codec and canonical finalization rules, but minimal metadata;
 it does not establish full public semantics or feature parity.
 
 The protected metadata region cannot be consumed by payloads. Relocating
-compaction, metadata repacking, transforms, stream retirement,
+compaction, metadata repacking, transforms,
 multi-process coordination and full Pouch integration remain future work. The
 foundation implements retirement/reuse without relocation and makes no claim
 that all draft acceptance criteria are already satisfied.

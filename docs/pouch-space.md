@@ -18,8 +18,8 @@ authorize conversion of existing roots or a production cutover. The foundation
 now checkpoints through the growable typed directory and packed descriptor
 pages. Small payload tails also share physical pages through independently owned
 cells. The experimental canonical append-owned stream boundary is implemented
-and fault-tested; typed catalogs, stream retirement and normal Pouch integration
-remain ahead.
+and fault-tested, including sealing and atomic retirement of complete run sets.
+Typed catalogs and normal Pouch integration remain ahead.
 
 ## Intent
 

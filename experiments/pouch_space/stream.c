@@ -19,7 +19,7 @@ struct ps_stream {
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
-  int appending, recovering;
+  int appending, recovering, sealed, retired;
 };
 struct ps_stream_writer {
   ps_stream *stream;
@@ -158,6 +158,7 @@ int ps_stream_open(ps_space *space, ps_key key, int create, const ps_ref *ref,
   if (rc == LC_OK) {
     s->ref = status.ref;
     s->tail = status.tail;
+    s->sealed = status.sealed;
   }
   for (i = 0; rc == LC_OK && i < status.runs; ++i) {
     rc = stream_grow(s, error);
@@ -177,7 +178,7 @@ int ps_stream_open(ps_space *space, ps_key key, int create, const ps_ref *ref,
   if (rc == LC_OK && s->capacity != status.capacity)
     rc = stream_error(error, LC_ERR_PROTOCOL,
                       "stream directory capacity mismatch");
-  if (rc == LC_OK && s->capacity) {
+  if (rc == LC_OK && s->capacity && !s->sealed) {
     if (!recover)
       rc = stream_error(error, LC_ERR_INVALID,
                         "existing stream requires canonical recovery");
@@ -236,9 +237,47 @@ int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
     out->tail = s->tail;
     out->capacity = s->capacity;
     out->runs = s->count;
+    out->sealed = s->sealed;
+    out->retired = s->retired;
     pthread_mutex_unlock(&s->mutex);
   }
   return rc;
+}
+static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
+  ps_owned_status status;
+  int rc;
+  if (!s)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream transition requires owner");
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_owned_status_get(s->head, &status, error);
+  if (rc == LC_OK &&
+      (s->appending || s->recovering || (!retirement && s->retired)))
+    rc = stream_error(error, LC_ERR_INVALID,
+                      "stream transition is busy or retired");
+  if (rc == LC_OK)
+    s->appending = 1;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    return rc;
+  rc = retirement ? ps_owned_retire(s->head, error)
+                  : ps_owned_seal(s->head, error);
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK) {
+    if (retirement)
+      s->retired = 1;
+    else
+      s->sealed = 1;
+  }
+  s->appending = 0;
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+int ps_stream_seal(ps_stream *s, lc_error *error) {
+  return stream_transition(s, 0, error);
+}
+int ps_stream_retire(ps_stream *s, lc_error *error) {
+  return stream_transition(s, 1, error);
 }
 int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
                             size_t n, lc_error *error) {
@@ -287,9 +326,9 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
                         "cannot allocate bounded stream appender");
   pthread_mutex_lock(&s->mutex);
   rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK && (s->appending || s->recovering))
+  if (rc == LC_OK && (s->appending || s->recovering || s->sealed || s->retired))
     rc = stream_error(error, LC_ERR_INVALID,
-                      "stream already has an active appender");
+                      "stream is busy, sealed or retired");
   if (rc == LC_OK) {
     s->appending = 1;
     w->stream = s;
@@ -449,8 +488,8 @@ int ps_stream_read_open(ps_stream *s, uint64_t offset, uint64_t bytes,
                         "cannot allocate bounded stream reader");
   pthread_mutex_lock(&s->mutex);
   rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK &&
-      (s->recovering || offset > s->tail || bytes > s->tail - offset))
+  if (rc == LC_OK && (s->recovering || s->retired || offset > s->tail ||
+                      bytes > s->tail - offset))
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream read outside committed prefix");
   if (rc == LC_OK) {

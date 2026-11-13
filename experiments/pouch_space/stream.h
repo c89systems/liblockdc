@@ -9,6 +9,7 @@ typedef struct ps_stream_reader ps_stream_reader;
 typedef struct ps_stream_info {
   ps_ref ref;
   uint64_t tail, capacity, runs;
+  int sealed, retired;
 } ps_stream_info;
 
 /* The canonical owner validates its existing record format, starting at the
@@ -27,6 +28,15 @@ int ps_stream_open(ps_space *, ps_key, int create, const ps_ref *,
  * appender. Stop concurrent API calls before close; readers pin this owner. */
 int ps_stream_close(ps_stream *, lc_error *);
 int ps_stream_status(ps_stream *, ps_stream_info *, lc_error *);
+/* No active appender; readers may remain open. These structural operations
+ * always wait for durability, including NoSync stores. Sealing is idempotent
+ * and forbids further appends. Retirement is idempotent and forbids new read
+ * admission; existing readers remain valid until closed. Neither closes the
+ * owner. Physical reuse still waits for checkpoint retirement and reader pins.
+ * A sealed reopen trusts its final tail and does not call canonical recovery.
+ */
+int ps_stream_seal(ps_stream *, lc_error *);
+int ps_stream_retire(ps_stream *, lc_error *);
 int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
                             lc_error *);
 /* At most one appender per logical stream; contention is an explicit error.

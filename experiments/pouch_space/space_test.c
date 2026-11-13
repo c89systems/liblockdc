@@ -1729,8 +1729,10 @@ static void fixture_put(unsigned char *p, uint64_t value, size_t bytes) {
     p[i] = (unsigned char)(value >> (i * 8));
 }
 static void fixture_entry_crc(unsigned char *record) {
+  size_t bytes = (size_t)(uint32_t)fixture_get64(record + 4);
+  CHECK(bytes >= 64 && bytes <= PS_JOURNAL);
   uint32_t crc = (uint32_t)crc32(0, record, 60);
-  fixture_put(record + 60, crc32(crc, record + 64, 24), 4);
+  fixture_put(record + 60, crc32(crc, record + 64, (uInt)(bytes - 64)), 4);
 }
 static void packing_invalid_ownership(void) {
   ps_space *s = NULL;
@@ -3000,6 +3002,565 @@ static void canonical_stream_preparation_faults(int native_zero) {
        "heap failure, no early spare reuse and usable post-crash ownership");
 }
 
+static void stream_reader_expect(ps_stream_reader *r, const void *bytes,
+                                 size_t n) {
+  unsigned char buffer[317];
+  size_t at = 0, got;
+  do {
+    OK(ps_stream_read(r, buffer, sizeof(buffer), &got, &error));
+    CHECK(got <= n - at &&
+          (!got || !memcmp(buffer, (const unsigned char *)bytes + at, got)));
+    at += got;
+  } while (got);
+  CHECK(at == n);
+}
+static void stream_lifecycle(int durable) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *space;
+  ps_stream *old, *fresh, *missing = NULL;
+  ps_stream_writer *w = NULL;
+  ps_stream_reader *held = NULL;
+  ps_stream_info info;
+  ps_stats before, after;
+  ps_ref prior, current;
+  recovery_trace trace = {0};
+  unsigned char *body = malloc(PS_CHUNK * 4 + 17);
+  uint64_t offset;
+  CHECK(body != NULL);
+  memset(body, 0x37, PS_CHUNK * 4 + 17);
+  clean();
+  space = create(3 * PS_MIB, durable, &io);
+  old = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_begin(old, &w, &error));
+  BAD(ps_stream_seal(old, &error));
+  BAD(ps_stream_retire(old, &error));
+  ps_stream_writer_close(w);
+  OK(canonical_append(old, body, PS_CHUNK * 4 + 17, 31, 1, &offset, &error));
+  OK(ps_stream_status(old, &info, &error));
+  prior = info.ref;
+  OK(ps_status(space, &before, &error));
+  OK(ps_stream_seal(old, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.journal_bytes == before.journal_bytes + 80 &&
+        after.syncs == before.syncs + (durable ? 1 : 2));
+  OK(ps_stream_seal(old, &error));
+  OK(ps_status(space, &before, &error));
+  CHECK(before.journal_bytes == after.journal_bytes &&
+        before.syncs == after.syncs);
+  BAD(ps_stream_begin(old, &w, &error));
+  stream_expect(old, offset, body, PS_CHUNK * 4 + 17, 1);
+  OK(ps_stream_close(old, &error));
+  OK(ps_close(space, &error));
+  space = reopen(&io);
+  m.read_bytes = 0;
+  old = stream_open(space, 1, 0, &prior, &trace);
+  OK(ps_stream_status(old, &info, &error));
+  CHECK(info.sealed && !info.retired && !trace.bytes &&
+        m.read_bytes == info.runs * PS_RUN_HEADER);
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(old, &error));
+  OK(ps_close(space, &error));
+  space = reopen(&io);
+  OK(ps_stream_open(space, stream_key(1), 0, &prior, NULL, NULL, &old, &error));
+  stream_expect(old, offset, body, PS_CHUNK * 4 + 17, 1);
+  OK(ps_stream_read_open(old, 43, PS_CHUNK * 4 + 17, &held, &error));
+  OK(ps_status(space, &before, &error));
+  OK(ps_stream_retire(old, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(!after.entries && !after.live_bytes &&
+        after.retired_bytes == before.allocated_bytes &&
+        after.journal_bytes == before.journal_bytes + 64 &&
+        after.syncs == before.syncs + 1);
+  OK(ps_stream_retire(old, &error));
+  BAD(ps_stream_seal(old, &error));
+  BAD(ps_stream_begin(old, &w, &error));
+  ps_stream_reader *rejected = NULL;
+  BAD(ps_stream_read_open(old, 0, 1, &rejected, &error));
+  BAD(ps_stream_open(space, stream_key(1), 0, &prior, canonical_recover, NULL,
+                     &missing, &error));
+  fresh = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_status(fresh, &info, &error));
+  current = info.ref;
+  CHECK(current.incarnation != prior.incarnation && !info.sealed &&
+        !info.retired);
+  OK(canonical_append(fresh, body, 64, 7, 2, &offset, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.entries == 2 && after.retired_bytes > 0);
+  stream_reader_expect(held, body, PS_CHUNK * 4 + 17);
+  ps_stream_reader_close(held);
+  OK(ps_stream_close(old, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(!after.retired_bytes);
+  OK(ps_stream_close(fresh, &error));
+  OK(ps_close(space, &error));
+  space = reopen(&io);
+  BAD(ps_stream_open(space, stream_key(1), 0, &prior, canonical_recover, NULL,
+                     &missing, &error));
+  fresh = stream_open(space, 1, 0, &current, NULL);
+  stream_expect(fresh, offset, body, 64, 2);
+  OK(ps_stream_retire(fresh, &error));
+  OK(ps_stream_close(fresh, &error));
+  OK(ps_checkpoint(space, &error));
+  fresh = stream_open(space, 2, 1, NULL, NULL);
+  OK(ps_stream_seal(fresh, &error));
+  OK(ps_stream_close(fresh, &error));
+  OK(ps_close(space, &error));
+  space = reopen(&io);
+  OK(ps_stream_open(space, stream_key(2), 0, NULL, NULL, NULL, &fresh, &error));
+  OK(ps_stream_status(fresh, &info, &error));
+  CHECK(info.sealed && !info.tail && !info.capacity);
+  OK(ps_stream_retire(fresh, &error));
+  OK(ps_stream_close(fresh, &error));
+  OK(ps_close(space, &error));
+  free(body);
+  free(m.stable);
+  clean();
+  puts("lifecycle: durable seal/retirement, fixed sealed tail, zero body scan, "
+       "reader pins, rebinding and empty streams");
+}
+static void stream_lifecycle_faults(int durable) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *space;
+  ps_stream *stream, *found = NULL;
+  ps_stream_info info;
+  ps_stats stats;
+  unsigned char *body = malloc(PS_CHUNK * 2 + 17);
+  unsigned char event[80];
+  uint64_t first, second;
+  size_t operation, kind, phase, count, event_bytes;
+  int rc, opened;
+  CHECK(body != NULL);
+  memset(body, 0x39, PS_CHUNK * 2 + 17);
+  for (operation = 0; operation < 2; ++operation)
+    for (kind = 0; kind < 2; ++kind) {
+      count = 0;
+      for (phase = 0; phase <= count; ++phase) {
+        clean();
+        m.fail_at = m.operations = 0;
+        space = create(3 * PS_MIB, durable, &io);
+        stream = stream_open(space, 1, 1, NULL, NULL);
+        OK(canonical_append(stream, body, PS_CHUNK * 2 + 17, 31, 1, &first,
+                            &error));
+        OK(ps_checkpoint(space, &error));
+        OK(canonical_append(stream, body, 1027, 7, 2, &second, &error));
+        OK(ps_status(space, &stats, &error));
+        m.operations = 0;
+        m.fail_at = kind == 0 ? phase : 0;
+        m.tear = m.persist_torn = 1;
+        allocation_call = 0;
+        allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+        rc = operation ? ps_stream_retire(stream, &error)
+                       : ps_stream_seal(stream, &error);
+        allocation_fail = 0;
+        m.fail_at = 0;
+        if (!phase)
+          count = kind == 0 ? m.operations : allocation_call;
+        if (rc != LC_OK) {
+          CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+          lc_error_cleanup(&error);
+        }
+        /* Persist a complete lifecycle event ahead of its failed final sync.
+         * Seal's first barrier must already cover the new canonical body. */
+        if (kind == 0 && phase == count) {
+          int fd = open(path, O_RDONLY);
+          event_bytes = operation ? 64 : 80;
+          CHECK(fd >= 0 && pread(fd, event, event_bytes,
+                                 PS_JOURNAL_OFFSET + stats.journal_bytes) ==
+                               (ssize_t)event_bytes);
+          CHECK(close(fd) == 0);
+          memcpy(m.stable + PS_JOURNAL_OFFSET + stats.journal_bytes, event,
+                 event_bytes);
+        }
+        OK(ps_stream_close(stream, &error));
+        OK(ps_close(space, &error));
+        crash(&m);
+        space = reopen(&io);
+        opened = ps_stream_open(space, stream_key(1), 0, NULL,
+                                canonical_recover, NULL, &found, &error);
+        if (opened == LC_OK) {
+          CHECK(!operation || rc != LC_OK);
+          stream_expect(found, first, body, PS_CHUNK * 2 + 17, 1);
+          OK(ps_stream_status(found, &info, &error));
+          CHECK(info.tail == second || info.tail == second + 1070);
+          if (durable)
+            CHECK(info.tail == second + 1070);
+          if (info.sealed || rc == LC_OK) {
+            CHECK(!operation && info.sealed && info.tail == second + 1070);
+            stream_expect(found, second, body, 1027, 2);
+          }
+          if (kind == 0 && phase == count && !operation)
+            CHECK(info.sealed);
+          OK(ps_stream_retire(found, &error));
+          OK(ps_stream_close(found, &error));
+        } else {
+          CHECK(operation && opened == LC_ERR_INVALID && found == NULL);
+          lc_error_cleanup(&error);
+        }
+        found = stream_open(space, 1, 1, NULL, NULL);
+        OK(canonical_append(found, body, 65, 7, 3, &first, &error));
+        OK(ps_stream_close(found, &error));
+        OK(ps_close(space, &error));
+        /* A second replay must retain the old journal's verification bodies
+         * even after deletion/rebinding, until checkpoint retirement. */
+        space = reopen(&io);
+        found = stream_open(space, 1, 0, NULL, NULL);
+        stream_expect(found, first, body, 65, 3);
+        OK(ps_checkpoint(space, &error));
+        OK(ps_stream_close(found, &error));
+        OK(ps_close(space, &error));
+      }
+      CHECK(count >= 1);
+    }
+  free(body);
+  free(m.stable);
+  clean();
+  puts("lifecycle: each seal/retirement I/O and heap fault, torn events, "
+       "metadata-before-body persistence, replay after rebinding");
+}
+static void stream_lifecycle_checkpoint_faults(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *space;
+  ps_stream *old, *fresh;
+  ps_stream_reader *held;
+  ps_stream_info info;
+  ps_ref ref;
+  unsigned char *body = malloc(PS_CHUNK * 2 + 17);
+  uint64_t offset;
+  size_t kind, phase, count;
+  int rc;
+  CHECK(body != NULL);
+  memset(body, 0x43, PS_CHUNK * 2 + 17);
+  for (kind = 0; kind < 2; ++kind) {
+    count = 0;
+    for (phase = 0; phase <= count; ++phase) {
+      clean();
+      m.fail_at = m.operations = 0;
+      space = create(3 * PS_MIB, 1, &io);
+      old = stream_open(space, 1, 1, NULL, NULL);
+      OK(canonical_append(old, body, PS_CHUNK * 2 + 17, 31, 1, &offset,
+                          &error));
+      OK(ps_checkpoint(space, &error));
+      OK(ps_stream_read_open(old, 43, PS_CHUNK * 2 + 17, &held, &error));
+      OK(ps_stream_seal(old, &error));
+      OK(ps_stream_retire(old, &error));
+      fresh = stream_open(space, 1, 1, NULL, NULL);
+      OK(canonical_append(fresh, body, 64, 7, 2, &offset, &error));
+      OK(ps_stream_status(fresh, &info, &error));
+      ref = info.ref;
+      m.operations = 0;
+      m.fail_at = kind == 0 ? phase : 0;
+      m.tear = m.persist_torn = 1;
+      allocation_call = 0;
+      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+      rc = ps_checkpoint(space, &error);
+      allocation_fail = 0;
+      m.fail_at = 0;
+      if (!phase)
+        count = kind == 0 ? m.operations : allocation_call;
+      if (rc == LC_ERR_NOMEM) {
+        lc_error_cleanup(&error);
+        stream_reader_expect(held, body, PS_CHUNK * 2 + 17);
+        OK(ps_checkpoint(space, &error));
+      } else if (rc != LC_OK)
+        lc_error_cleanup(&error);
+      else
+        stream_reader_expect(held, body, PS_CHUNK * 2 + 17);
+      ps_stream_reader_close(held);
+      OK(ps_stream_close(old, &error));
+      OK(ps_stream_close(fresh, &error));
+      OK(ps_close(space, &error));
+      crash(&m);
+      space = reopen(&io);
+      fresh = stream_open(space, 1, 0, &ref, NULL);
+      stream_expect(fresh, offset, body, 64, 2);
+      OK(ps_stream_retire(fresh, &error));
+      OK(ps_stream_close(fresh, &error));
+      OK(ps_checkpoint(space, &error));
+      OK(ps_close(space, &error));
+    }
+    CHECK(count > 5);
+  }
+  free(body);
+  free(m.stable);
+  clean();
+  puts("lifecycle: each checkpoint I/O/heap fault with retired pinned runs and "
+       "rebound head; acknowledged new incarnation survives");
+}
+static void stream_lifecycle_capacity(void) {
+  ps_space *space;
+  ps_owned_head *head;
+  ps_owned_run *run = NULL;
+  ps_owned_status status;
+  ps_stats before, after;
+  size_t count = 0;
+  uint64_t base = 0;
+  int found, rc;
+  clean();
+  space = create(PS_MIB, 0, NULL);
+  OK(ps_owned_open(space, stream_key(1), 1, NULL, &head, &status, &error));
+  for (;;) {
+    rc = ps_owned_grant(head, base, PS_PAGE, &run, &found, &error);
+    if (rc != LC_OK)
+      break;
+    CHECK(found);
+    base += ps_owned_run_capacity(run);
+    ps_owned_run_close(run);
+    ++count;
+  }
+  CHECK(rc == LC_ERR_INVALID && count > 100);
+  lc_error_cleanup(&error);
+  OK(ps_owned_seal(head, &error));
+  BAD(ps_owned_recovered(head, 0, &error));
+  BAD(ps_owned_commit(head, 0, &error));
+  OK(ps_status(space, &before, &error));
+  allocation_max = allocation_call = 0;
+  measure_allocations = 1;
+  allocation_fail = (size_t)-1;
+  OK(ps_owned_retire(head, &error));
+  allocation_fail = 0;
+  measure_allocations = 0;
+  CHECK(allocation_call == 1 && allocation_max == 64);
+  BAD(ps_owned_recovered(head, 0, &error));
+  BAD(ps_owned_commit(head, 0, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.journal_bytes == before.journal_bytes + 64 && !after.entries &&
+        after.retired_bytes == before.allocated_bytes);
+  OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(!after.allocated_bytes && !after.retired_bytes);
+  ps_owned_close(head);
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  OK(ps_status(space, &after, &error));
+  CHECK(!after.entries && !after.allocated_bytes);
+  OK(ps_owned_open(space, stream_key(1), 1, NULL, &head, &status, &error));
+  OK(ps_owned_grant(head, 0, PS_PAGE, &run, &found, &error));
+  CHECK(found);
+  ps_owned_run_close(run);
+  ps_owned_close(head);
+  OK(ps_close(space, &error));
+  clean();
+  puts("lifecycle: full capacity, hundreds of grants retired with one 64-byte "
+       "event, bounded allocation and complete reuse");
+}
+typedef struct lifecycle_actor {
+  ps_stream *stream;
+  commit_gate *gate;
+  int retirement, rc;
+} lifecycle_actor;
+static void *lifecycle_worker(void *context) {
+  lifecycle_actor *actor = context;
+  lc_error e;
+  lc_error_init(&e);
+  actor->rc = actor->retirement ? ps_stream_retire(actor->stream, &e)
+                                : ps_stream_seal(actor->stream, &e);
+  lc_error_cleanup(&e);
+  pthread_mutex_lock(&actor->gate->mutex);
+  ++actor->gate->finished;
+  pthread_cond_broadcast(&actor->gate->cond);
+  pthread_mutex_unlock(&actor->gate->mutex);
+  return NULL;
+}
+static void stream_lifecycle_concurrency(int retirement) {
+  commit_gate gate = {0};
+  ps_io io = {&gate, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  lifecycle_actor actor = {0};
+  stream_actor other_actor = {0};
+  ps_space *space;
+  ps_stream *stream, *other, *rejected = NULL;
+  ps_stream_writer *busy = NULL;
+  ps_stream_reader *held, *reader = NULL;
+  ps_stream_info info;
+  ps_stats before, after;
+  pthread_t threads[2];
+  unsigned char body[1024];
+  uint64_t offset;
+  size_t syncs;
+  clean();
+  CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+  space = create(PS_MIB, 1, &io);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  other = stream_open(space, 2, 1, NULL, NULL);
+  memset(body, 'O', sizeof(body));
+  OK(canonical_append(stream, body, 64, 7, 1, &offset, &error));
+  OK(canonical_append(other, body, 64, 7, 1, &offset, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_read_open(stream, 43, 64, &held, &error));
+  OK(ps_status(space, &before, &error));
+  actor.stream = stream;
+  actor.gate = &gate;
+  actor.retirement = retirement;
+  other_actor.stream = other;
+  other_actor.gate = &gate;
+  other_actor.ordinal = 1;
+  syncs = gate.syncs;
+  gate.enabled = gate.hold_second = 1;
+  CHECK(pthread_create(&threads[0], NULL, lifecycle_worker, &actor) == 0);
+  await_gate(&gate, 0);
+  CHECK(pthread_create(&threads[1], NULL, stream_commit_worker, &other_actor) ==
+        0);
+  await_stream_requests(space, before.sync_requests + 2);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(!info.sealed && !info.retired);
+  stream_expect(stream, 0, body, 64, 1);
+  BAD(ps_stream_begin(stream, &busy, &error));
+  BAD(ps_stream_open(space, stream_key(1), 1, NULL, canonical_recover, NULL,
+                     &rejected, &error));
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  await_gate(&gate, 3);
+  await_stream_finished(&gate, 1);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(retirement ? info.retired : info.sealed);
+  OK(ps_stream_status(other, &info, &error));
+  CHECK(info.tail == 107);
+  if (retirement)
+    BAD(ps_stream_read_open(stream, 43, 64, &reader, &error));
+  else {
+    OK(ps_stream_read_open(stream, 43, 64, &reader, &error));
+    ps_stream_reader_close(reader);
+  }
+  pthread_mutex_lock(&gate.mutex);
+  gate.second_released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  CHECK(pthread_join(threads[0], NULL) == 0);
+  CHECK(pthread_join(threads[1], NULL) == 0);
+  CHECK(actor.rc == LC_OK && other_actor.rc == LC_OK &&
+        gate.syncs == syncs + 2);
+  OK(ps_status(space, &after, &error));
+  CHECK(after.sync_batches == before.sync_batches + 2);
+  if (!retirement)
+    OK(ps_stream_retire(stream, &error));
+  OK(ps_checkpoint(space, &error));
+  stream_reader_expect(held, body, 64);
+  ps_stream_reader_close(held);
+  OK(ps_stream_close(stream, &error));
+  memset(body, 'B', sizeof(body));
+  stream_expect(other, 107, body, sizeof(body), 2);
+  OK(ps_stream_close(other, &error));
+  OK(ps_close(space, &error));
+  CHECK(pthread_cond_destroy(&gate.cond) == 0);
+  CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
+  clean();
+  puts("lifecycle: held transition barriers, independent ready producer, exact "
+       "prefix visibility, pinned reader and no early rebinding");
+}
+static void stream_lifecycle_invalid_events(void) {
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info info;
+  ps_stats stats;
+  unsigned char body[64], wire[80];
+  uint64_t offset, creation_position;
+  size_t phase;
+  int fd;
+  memset(body, 0x47, sizeof(body));
+  for (phase = 0; phase < 8; ++phase) {
+    clean();
+    space = create(PS_MIB, 0, NULL);
+    OK(ps_status(space, &stats, &error));
+    creation_position = stats.journal_bytes;
+    stream = stream_open(space, 1, 1, NULL, NULL);
+    if (phase != 7)
+      OK(ps_checkpoint(space, &error));
+    OK(canonical_append(stream, body, sizeof(body), 7, 1, &offset, &error));
+    OK(ps_status(space, &stats, &error));
+    OK(ps_stream_seal(stream, &error));
+    OK(ps_stream_close(stream, &error));
+    OK(ps_close(space, &error));
+    off_t at = PS_JOURNAL_OFFSET +
+               (phase == 7 ? creation_position : stats.journal_bytes);
+    fd = open(path, O_RDWR);
+    CHECK(fd >= 0 &&
+          pread(fd, wire, sizeof(wire), at) == (ssize_t)sizeof(wire));
+    if (phase == 0)
+      fixture_put(wire + 56, 2, 4);
+    else if (phase == 1)
+      fixture_put(wire + 48, fixture_get64(wire + 64) + 1, 8);
+    else if (phase == 2)
+      fixture_put(wire + 56, 0, 4);
+    else if (phase == 3)
+      fixture_put(wire + 16, PS_STATE, 4);
+    else if (phase == 4)
+      fixture_put(wire + 40, fixture_get64(wire + 40) + 1, 8);
+    else if (phase == 5)
+      fixture_put(wire + 64, fixture_get64(wire + 64) + PS_PAGE, 8);
+    else if (phase == 6)
+      fixture_put(wire + 72, 2, 8);
+    else
+      fixture_put(wire + 56, 1,
+                  4); /* sealed creation cannot bypass dependency ordering */
+    fixture_entry_crc(wire);
+    CHECK(pwrite(fd, wire, sizeof(wire), at) == (ssize_t)sizeof(wire));
+    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    if (phase == 4 || phase == 5 || phase == 7) {
+      CHECK(ps_open(path, 0, NULL, &space, &error) == LC_ERR_PROTOCOL &&
+            space == NULL);
+      lc_error_cleanup(&error);
+    } else {
+      space = reopen(NULL);
+      stream = stream_open(space, 1, 0, NULL, NULL);
+      OK(ps_stream_status(stream, &info, &error));
+      CHECK(!info.sealed && info.tail == 107);
+      stream_expect(stream, 0, body, sizeof(body), 1);
+      OK(ps_stream_close(stream, &error));
+      OK(ps_close(space, &error));
+    }
+  }
+  clean();
+  puts("lifecycle: malformed checksummed seal flags/bounds/type/count, "
+       "identity mismatch and sealed-creation bypass rejected");
+}
+static void stream_lifecycle_rebind_rollover(void) {
+  ps_space *space;
+  ps_stream *stream;
+  ps_stats before, after;
+  ps_stream_info info;
+  ps_ref ref;
+  uint64_t offset, checkpoints;
+  clean();
+  space = create(3 * PS_MIB, 0, NULL);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_retire(stream, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_status(space, &before, &error));
+  checkpoints = before.checkpoints;
+  while (PS_JOURNAL - before.journal_bytes >= 88) {
+    put(space, state(1), "x", 1, 1);
+    OK(ps_status(space, &before, &error));
+  }
+  CHECK(PS_JOURNAL - before.journal_bytes < 80 &&
+        before.checkpoints == checkpoints);
+  /* Creating the new head checkpoints and collects the unpinned old
+   * tombstone before installing the replacement. */
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_status(space, &after, &error));
+  CHECK(after.checkpoints == checkpoints + 1);
+  OK(canonical_append(stream, "new", 3, 1, 1, &offset, &error));
+  OK(ps_stream_status(stream, &info, &error));
+  ref = info.ref;
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  stream = stream_open(space, 1, 0, &ref, NULL);
+  stream_expect(stream, offset, "new", 3, 1);
+  expect(space, state(1), NULL, "x", 1);
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  clean();
+  puts("lifecycle: rebinding checkpoints a full journal and collects the "
+       "previous unpinned tombstone safely");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -3022,6 +3583,17 @@ int main(int argc, char **argv) {
       packing_faults();
       packing_concurrency();
       packing_invalid_ownership();
+    } else if (strcmp(argv[2], "lifecycle") == 0) {
+      stream_lifecycle(0);
+      stream_lifecycle(1);
+      stream_lifecycle_faults(0);
+      stream_lifecycle_faults(1);
+      stream_lifecycle_checkpoint_faults();
+      stream_lifecycle_capacity();
+      stream_lifecycle_concurrency(0);
+      stream_lifecycle_concurrency(1);
+      stream_lifecycle_invalid_events();
+      stream_lifecycle_rebind_rollover();
     } else if (strcmp(argv[2], "streams") == 0) {
       canonical_stream_lifecycle();
       canonical_stream_faults();

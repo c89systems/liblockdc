@@ -26,7 +26,7 @@
 #define META_HEADER 64U
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
 #define TOKEN_RANGE UINT64_C(4294967296)
-enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS };
+enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS, PS_SEAL };
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
 #define OWNED_MAGIC UINT64_C(0x314e55524f5350)
@@ -40,8 +40,8 @@ typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
   uint64_t publication_sequence;
-  uint64_t stream_capacity, stream_runs;
-  int stream_open;
+  uint64_t stream_capacity, stream_runs, stream_ready;
+  int stream_open, stream_sealed;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
@@ -333,6 +333,12 @@ static void stream_register(ps_space *s, ps_entry *p) {
   p->stream_next = s->stream_buckets[p->token % BUCKETS];
   s->stream_buckets[p->token % BUCKETS] = p;
 }
+static void stream_unregister(ps_space *s, ps_entry *p) {
+  ps_entry **link = &s->stream_buckets[p->token % BUCKETS];
+  while (*link != p)
+    link = &(*link)->stream_next;
+  *link = p->stream_next;
+}
 static void register_entry(ps_space *s, ps_entry *p) {
   p->all_next = s->entries;
   p->all_link = &s->entries;
@@ -367,10 +373,7 @@ static void retire(ps_space *s, ps_entry *p) {
     link = &(*link)->hash_next;
   *link = p->hash_next;
   if (p->key.kind == PS_STREAM && !p->deleted) {
-    link = &s->stream_buckets[p->token % BUCKETS];
-    while (*link != p)
-      link = &(*link)->stream_next;
-    *link = p->stream_next;
+    stream_unregister(s, p);
   }
   p->hash_next = NULL;
   p->state = 2;
@@ -660,9 +663,12 @@ static void collect(ps_space *s) {
       link = &p->retired_next;
   }
 }
+static size_t event_bytes(const ps_entry *p, int event) {
+  return event == PS_PUT || event == PS_SEAL ? entry_bytes(p) : 64;
+}
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
-  size_t i, bytes = event == PS_PUT ? entry_bytes(p) : 64;
+  size_t i, bytes = event_bytes(p, event);
   memset(wire, 0, bytes);
   put32(wire, (uint32_t)EVENT_MAGIC);
   put32(wire + 4, (uint32_t)bytes);
@@ -672,7 +678,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
   put64(wire + 24, p->key.owner);
   put64(wire + 32, p->key.key);
   put64(wire + 40, p->token);
-  if (event == PS_PUT) {
+  if (event == PS_PUT || event == PS_SEAL) {
     put64(wire + 48, p->bytes);
     put32(wire + 56, (uint32_t)p->count);
     for (i = 0; i < p->count; ++i) {
@@ -682,6 +688,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       put32(wire + 84 + 24 * i, p->extents[i].flags);
     }
     if (p->key.kind == PS_STREAM) {
+      put32(wire + 56, (uint32_t)p->stream_sealed);
       put64(wire + 64, p->stream_capacity);
       put64(wire + 72, p->stream_runs);
     }
@@ -699,12 +706,13 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
       get32(wire + 60) !=
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
-  count = get32(wire + 56);
+  count = get32(wire + 16) == PS_STREAM ? 0 : get32(wire + 56);
   if (count > (PS_JOURNAL - 64) / 24 ||
-      bytes != (get32(wire + 16) == PS_STREAM && get32(wire + 20) == PS_PUT
+      bytes != (get32(wire + 16) == PS_STREAM && (get32(wire + 20) == PS_PUT ||
+                                                  get32(wire + 20) == PS_SEAL)
                     ? 80
                     : 64 + count * 24) ||
-      get32(wire + 20) > PS_RESERVE_IDS)
+      get32(wire + 20) > PS_SEAL)
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
   if (!p)
@@ -723,13 +731,17 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     return LC_OK;
   }
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
-      (*event == PS_REMOVE && (count || p->bytes || !immutable_key(p->key))))
+      (*event == PS_REMOVE &&
+       (count || p->bytes || get32(wire + 56) ||
+        (!immutable_key(p->key) && p->key.kind != PS_STREAM))) ||
+      (*event == PS_SEAL && p->key.kind != PS_STREAM))
     goto invalid;
-  if (p->key.kind == PS_STREAM && *event == PS_PUT) {
+  if (p->key.kind == PS_STREAM && (*event == PS_PUT || *event == PS_SEAL)) {
+    p->stream_sealed = (int)get32(wire + 56);
     p->stream_capacity = get64(wire + 64);
     p->stream_runs = get64(wire + 72);
-    if (count || p->bytes > p->stream_capacity ||
-        p->stream_capacity > s->capacity ||
+    if (get32(wire + 56) > 1 || (*event == PS_SEAL && !p->stream_sealed) ||
+        p->bytes > p->stream_capacity || p->stream_capacity > s->capacity ||
         (p->stream_runs == 0) != (p->stream_capacity == 0) ||
         p->stream_runs > p->stream_capacity / (PS_PAGE - PS_RUN_HEADER))
       goto invalid;
@@ -1182,7 +1194,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   return LC_OK;
 }
 static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
-  size_t bytes = event == PS_PUT ? entry_bytes(p) : 64;
+  size_t bytes = event_bytes(p, event);
   unsigned char *wire;
   int rc;
   if (s->sequence == UINT64_MAX ||
@@ -1441,13 +1453,49 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 }
 static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
   ps_entry *head = stream_lookup(s, p->key.owner);
-  if (!head || p->key.key != head->stream_capacity ||
+  if (!head || head->stream_sealed || p->key.key != head->stream_capacity ||
       p->bytes - PS_RUN_HEADER > s->capacity - head->stream_capacity)
     return err(error, LC_ERR_PROTOCOL, "owned run grant is not contiguous");
   head->stream_capacity += p->bytes - PS_RUN_HEADER;
   ++head->stream_runs;
   if (!head->dirty_link)
     dirty_entry(s, head, NULL);
+  return LC_OK;
+}
+static void mark_removed(ps_space *s, ps_entry *p, uint64_t sequence) {
+  if (p->key.kind == PS_STREAM)
+    stream_unregister(s, p);
+  s->metadata -= entry_bytes(p);
+  --s->live_entries;
+  p->deleted = 1;
+  p->publication_sequence = sequence;
+  if (!p->dirty_link)
+    dirty_entry(s, p, NULL);
+}
+/* Two walks, no allocation after the journal action. Each owned key belongs
+ * exclusively to this head incarnation. Deleted entries retain their payload
+ * and checkpoint references until the usual root-retirement protocol. */
+static int remove_owned(ps_space *s, ps_entry *head, uint64_t sequence,
+                        int apply, lc_error *error) {
+  ps_key key;
+  ps_entry *run;
+  uint64_t i, base = 0;
+  key.kind = PS_OWNED_RUN;
+  key.owner = head->token;
+  for (i = 0; i < head->stream_runs; ++i) {
+    key.key = base;
+    run = lookup(s, key);
+    if (!run || run->deleted ||
+        run->bytes - PS_RUN_HEADER > head->stream_capacity - base)
+      return err(error, LC_ERR_PROTOCOL, "retired stream grant mismatch");
+    base += run->bytes - PS_RUN_HEADER;
+    if (apply)
+      mark_removed(s, run, sequence);
+  }
+  if (base != head->stream_capacity)
+    return err(error, LC_ERR_PROTOCOL, "retired stream capacity mismatch");
+  if (apply)
+    mark_removed(s, head, sequence);
   return LC_OK;
 }
 static int recover(ps_space *s, lc_error *error) {
@@ -1560,7 +1608,8 @@ static int recover(ps_space *s, lc_error *error) {
           goto done;
         }
       } else if (p->key.kind == PS_STREAM &&
-                 (p->bytes || p->stream_capacity || p->stream_runs)) {
+                 (p->bytes || p->stream_capacity || p->stream_runs ||
+                  p->stream_sealed)) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
         goto done;
@@ -1575,10 +1624,32 @@ static int recover(ps_space *s, lc_error *error) {
         rc = err(error, LC_ERR_PROTOCOL, "journal retirement owner mismatch");
         goto done;
       }
-      p->deleted = 1;
-      register_entry(s, p);
-      dirty_entry(s, p, old);
-      install(s, p);
+      if (event == PS_SEAL) {
+        if (old->stream_sealed || p->bytes < old->bytes ||
+            p->stream_capacity != old->stream_capacity ||
+            p->stream_runs != old->stream_runs) {
+          entry_free(p);
+          rc = err(error, LC_ERR_PROTOCOL, "journal stream seal mismatch");
+          goto done;
+        }
+        old->bytes = p->bytes;
+        old->stream_sealed = 1;
+        if (!old->dirty_link)
+          dirty_entry(s, old, NULL);
+        entry_free(p);
+      } else if (p->key.kind == PS_STREAM) {
+        rc = remove_owned(s, old, s->sequence + 1, 0, error);
+        if (rc == LC_OK)
+          rc = remove_owned(s, old, s->sequence + 1, 1, error);
+        entry_free(p);
+        if (rc != LC_OK)
+          goto done;
+      } else {
+        p->deleted = 1;
+        register_entry(s, p);
+        dirty_entry(s, p, old);
+        install(s, p);
+      }
     }
     cursor += bytes;
     ++s->sequence;
@@ -2157,7 +2228,7 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
       ++out->entries;
       if (p->key.kind != PS_OWNED_RUN)
         out->live_bytes += p->bytes;
-    } else if (p->state == 2)
+    } else if (p->state == 2 || p->deleted)
       out->retired_bytes += n;
     else
       out->private_bytes += n;
@@ -2172,12 +2243,14 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->tail = head->entry->bytes;
   out->capacity = head->entry->stream_capacity;
   out->runs = head->entry->stream_runs;
+  out->sealed = head->entry->stream_sealed;
+  out->retired = head->entry->deleted;
 }
 int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
                   ps_owned_head **out, ps_owned_status *status,
                   lc_error *error) {
   ps_owned_head *head;
-  ps_entry *p = NULL;
+  ps_entry *p = NULL, *old;
   uint64_t sequence = 0;
   int rc;
   if (out)
@@ -2197,7 +2270,11 @@ int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
   }
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
-  if (rc == LC_OK && create && lookup(s, key))
+  old = lookup(s, key);
+  if (rc == LC_OK && create && old &&
+      (!old->deleted ||
+       old->publication_sequence >
+           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
     rc = err(error, LC_ERR_INVALID, "owned stream already exists");
   if (rc == LC_OK && create && s->token_next > s->token_limit)
     rc = err(error, LC_ERR_INVALID, "incarnation grant consumed; reopen");
@@ -2208,10 +2285,12 @@ int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
     p->token = s->token_next++;
     rc = append_event(s, p, PS_PUT, error);
     if (rc == LC_OK) {
+      /* Journal rollover may checkpoint and collect the prior tombstone. */
+      old = lookup(s, key);
       sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
       p->publication_sequence = sequence;
       register_entry(s, p);
-      dirty_entry(s, p, NULL);
+      dirty_entry(s, p, old);
       install(s, p);
     }
   }
@@ -2292,6 +2371,8 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
   p->key.key = base;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
+    rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
       (base != head->entry->stream_capacity || s->token_next > s->token_limit))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
@@ -2546,7 +2627,8 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK &&
-      (tail < head->entry->bytes || tail > head->entry->stream_capacity))
+      (head->entry->deleted || head->entry->stream_sealed ||
+       tail < head->entry->bytes || tail > head->entry->stream_capacity))
     rc = err(error, LC_ERR_INVALID, "owned commit tail outside append range");
   if (rc == LC_OK &&
       __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
@@ -2558,6 +2640,7 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail, lc_error *error) {
     if (!head->entry->dirty_link)
       dirty_entry(s, head->entry, NULL);
     sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+    head->entry->stream_ready = sequence;
   }
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && s->durable)
@@ -2577,7 +2660,8 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK &&
-      (tail < head->entry->bytes || tail > head->entry->stream_capacity))
+      (head->entry->deleted || head->entry->stream_sealed ||
+       tail < head->entry->bytes || tail > head->entry->stream_capacity))
     rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
@@ -2590,4 +2674,67 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   }
   pthread_mutex_unlock(&s->mutex);
   return rc;
+}
+int ps_owned_seal(ps_owned_head *head, lc_error *error) {
+  ps_space *s;
+  ps_entry snapshot;
+  uint64_t sequence = 0;
+  int rc, sealed, needs_sync;
+  if (!head)
+    return err(error, LC_ERR_INVALID, "owned seal requires head");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  sealed = head->entry->stream_sealed;
+  needs_sync = head->entry->stream_ready >
+               __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  if (rc == LC_OK && head->entry->deleted)
+    rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK || sealed)
+    return rc;
+  /* Any valid seal event may recover before its acknowledgement. Its final
+   * canonical tail must already be durable, even if journal bytes reorder. */
+  if (needs_sync)
+    rc = sync_file(s, error);
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK)
+    rc = healthy(s, error);
+  if (rc == LC_OK) {
+    snapshot = *head->entry;
+    snapshot.stream_sealed = 1;
+    rc = append_event(s, &snapshot, PS_SEAL, error);
+  }
+  if (rc == LC_OK) {
+    head->entry->stream_sealed = 1;
+    if (!head->entry->dirty_link)
+      dirty_entry(s, head->entry, NULL);
+    sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+}
+int ps_owned_retire(ps_owned_head *head, lc_error *error) {
+  ps_space *s;
+  uint64_t sequence = 0;
+  int rc;
+  if (!head)
+    return err(error, LC_ERR_INVALID, "owned retirement requires head");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK && !head->entry->deleted)
+    rc = remove_owned(s, head->entry, 0, 0, error);
+  if (rc == LC_OK && !head->entry->deleted) {
+    rc = append_event(s, head->entry, PS_REMOVE, error);
+    if (rc == LC_OK) {
+      sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+      rc = remove_owned(s, head->entry, sequence, 1, error);
+      if (rc != LC_OK)
+        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    }
+  } else if (rc == LC_OK)
+    sequence = head->entry->publication_sequence;
+  pthread_mutex_unlock(&s->mutex);
+  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
 }

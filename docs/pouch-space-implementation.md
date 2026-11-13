@@ -98,8 +98,24 @@ persisted grant metadata ahead of body writes, held preparation concurrent with
 unrelated publication/checkpoint, all preparation/recovery I/O and allocation
 failures, and pre-existing bytes beyond the committed capacity during growth.
 
-These streams do not yet implement sealing/retirement, typed name catalogs,
-public collection positions, receipts or shared-root ownership. Metadata
+Stream sealing and atomic retirement are now implemented. Seal freezes the
+canonical tail in an 80-byte structural event. A prerequisite barrier stabilizes
+unsynced canonical bytes before that event can recover; an already durable tail
+needs only the marker barrier. Reopening a sealed stream validates its owned-run
+headers without candidate-tail recovery or suffix repair. Canonical projections
+can read the committed prefix through the ordinary bounded reader.
+
+Retirement emits one 64-byte head-removal event and retires every grant belonging
+to that incarnation. It adds no per-run publication records or allocations.
+Both transitions require an idle appender and wait for durability even in NoSync
+mode. Existing readers retain their pins; retirement rejects new read admission
+after success. Physical reuse still waits for checkpoint root retirement and
+pins to drain. The same typed key may then bind a fresh incarnation; old refs
+cannot resolve it. Tests cover both durability modes, each transition/checkpoint
+fault, malformed checksummed events, held barriers and full-journal rebinding.
+
+These streams do not yet implement typed name catalogs, public collection
+positions, receipts or shared-root ownership. Metadata
 repacking and production integration also remain to be implemented. See the
 [stream design](../experiments/pouch_space/stream.h) and
 [measured scope and regressions](pouch-space-experiment.md).
