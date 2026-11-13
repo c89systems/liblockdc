@@ -220,11 +220,96 @@ claim is made. Logs for all three tools are retained beside the paired runs.
 The broader Debug unit/contract gate passes all 76 selected tests with the
 documented native configuration.
 
+## Growable metadata checkpoint follow-up
+
+The foundation now checkpoints through the typed copy-on-write directory and
+packed immutable descriptor pages. Metadata can grow into the common pool;
+the fixed 64 KiB snapshot ceiling is gone. Foreground admission reserves space
+for a complete replacement metadata tree plus 16 KiB of maintenance payload
+capacity. This is a fresh experimental format: recreate prototype fixtures.
+Normal Pouch files and open behavior are unchanged.
+
+The 12,000-entry regression crosses the old metadata limit and the protected
+metadata region. Updating one entry writes at most four directory pages and
+one descriptor page. Tests also cover shared descriptor pages, records spanning
+pages, old reader pins across reuse, rebinding at implicit journal rollover,
+every checkpoint I/O/allocation failure, and recovery allocation failures.
+Opening the large-value fixture reads at most the journal, two root headers
+and six metadata pages; it does not read the checkpointed 3 MiB payload.
+
+The broader Debug unit/contract gate passed 79 tests. After the final metadata
+changes, all 13 affected experiment tests passed under Debug ASan/UBSan,
+native glibc Release and native musl Release. ThreadSanitizer passed the
+directory, commit and metadata tests; the final recovery-cache change was
+rechecked with the metadata test. Memcheck reports zero errors and no lost
+allocations for foundation and metadata tests, including the final metadata
+recheck. Logs are retained under `build/pouch-space-integrated/`.
+
+Five alternating samples of the original eight profiles produced these write
+medians, in milliseconds, **container / current Pouch**:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-nosync-1w | 1.98 / 14.30 | 1.97 / 30.73 |
+| small-nosync-4w | 3.51 / 15.76 | 2.34 / 13.18 |
+| small-durable-1w | 1484.92 / 1312.22 | 725.11 / 743.40 |
+| small-durable-4w | 822.43 / 964.22 | 395.04 / 483.11 |
+| large-nosync-1w | 4.59 / 48.61 | 4.02 / 25.94 |
+| large-nosync-4w | 2.95 / 16.12 | 1.89 / 2.22 |
+| large-durable-1w | 331.72 / 354.33 | 170.80 / 190.18 |
+| large-durable-4w | 163.22 / 326.63 | 94.21 / 167.02 |
+
+Single-writer durable state remains slower in the small profile, with
+overlapping sample ranges. The large durable four-writer ranges are disjoint:
+151–210 ms versus 297–788 ms for state, and 76–111 ms versus 159–260 ms for
+collections. Small NoSync state with four writers still has a worse median p99:
+148 us versus 84 us. Serial verified warm reads take 0.28–0.59 ms for small
+state versus 2.37–4.23 ms for Pouch; large state takes 2.02–2.09 ms versus
+3.33–3.68 ms. These are physical reads, without a concurrent query/scan claim.
+
+A further 80 runs force journal rollover: each writes 2,048 publications of
+1 KiB into the same preallocated 10 MiB container. State uses 1,024 keys written
+twice; collections use 2,048 keys appended once. Every container run checkpoints
+exactly once during its write phase. Median write-phase milliseconds:
+
+| Profile | State, container / Pouch | Collection-shaped, container / Pouch |
+| --- | ---: | ---: |
+| rollover-nosync-1w | 38.24 / 59.06 | 46.29 / 188.70 |
+| rollover-nosync-4w | 39.83 / 24.76 | 47.20 / 73.62 |
+| rollover-durable-1w | 10410.92 / 10760.75 | 11656.87 / 11053.77 |
+| rollover-durable-4w | 5063.87 / 7953.45 | 5611.59 / 8067.42 |
+
+The four-writer NoSync state median regresses by 61%. Sample ranges overlap
+(37–67 ms versus 23–82 ms); four of five Pouch samples are below 32 ms.
+The container issues three structural checkpoint syncs even in NoSync mode and
+accounts for about 8.8 MB of kernel writes versus 3.2 MB for Pouch. Its summed
+sync durations are 23–48 ms; Pouch's namespace syncs overlap across writers, so
+summed sync durations alone cannot identify the critical path. Payload packing
+and checkpoint scheduling remain performance work. The rare checkpoint also
+falls outside p99 in this workload; p99 cannot establish checkpoint latency.
+
+Durable four-writer rollover ranges are disjoint: 4.56–5.70 s versus
+7.11–8.60 s for state, and 4.80–5.88 s versus 7.01–8.25 s for collections.
+Container state uses a median 1,020 data syncs versus 2,048 for Pouch, including
+its three checkpoint barriers. Single-writer durable ranges overlap; these
+measurements establish no single-writer advantage. Verified warm state reads
+take about 2–2.6 ms versus 16–19 ms, and collection-shaped reads about
+4.4–5.1 ms versus 7.3–8.3 ms. Durably written state reopens and completes its
+first verified read in about 8 ms versus 18 ms; NoSync recovery remains mixed.
+
+All 240 runs verified payloads before and after reopen, entry counts and store
+artifacts. Raw standard and rollover logs are in
+`build/pouch-space-integrated/measure/` and
+`build/pouch-space-integrated/rollover/`; `results.json` retains the raw rows and
+summary ranges. These are foundation measurements, with the semantic scope
+differences described above, rather than full-backend acceptance evidence.
+
 ## Reproduce
 
 ```sh
 bash scripts/compare_pouch_space.sh smoke
 bash scripts/compare_pouch_space.sh measure "$PWD/build/pouch-space-comparison"
+bash scripts/compare_pouch_space.sh rollover "$PWD/build/pouch-space-rollover"
 ```
 
 `POUCH_SPACE_RUNS` accepts 3, 5 (default), 7 or 9. An optional absolute directory
@@ -244,15 +329,19 @@ ctest --test-dir build/debug -L unit -LE lifecycle-host \
 
 For native musl, provision `deps-x86_64-linux-musl`, configure the
 `x86_64-linux-musl-release` preset with benchmarks enabled, build
-`pouch_space_test pouch_space_compare`, then run CTest with `-R '^pouch_space_'`.
+`pouch_space_test pouch_space_directory_test pouch_space_compare`, then run
+CTest with `-R '^pouch_space_'`.
 Valgrind output is retained in `build/pouch-space-comparison/valgrind.log`.
 
 ## Next commitments
 
-Before larger-scale tests, replace the fixed 64 KiB checkpoint directory ceiling
-with growable typed metadata. Before a production adapter, resolve small-value
+The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
+the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
+pages and protected checkpoint/maintenance capacity. Earlier measurement tables
+above describe the original and commit-coordination implementations. Before a
+production adapter, resolve small-value
 packing and single-writer sync cost, checkpoint scheduling,
-relocating compaction and maintenance payload reserve, process-shared reader
+relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection
 position or retry authority. Full codec/index/XA/outbox integration and migration

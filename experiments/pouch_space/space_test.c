@@ -417,14 +417,14 @@ static void reordered_nosync(void) {
   put(s, state(2), "later-tail", 10, 2);
   fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
-  CHECK(pread(fd, tail, PS_JOURNAL, 2 * PS_PAGE + 2 * PS_BANK) == PS_JOURNAL);
+  CHECK(pread(fd, tail, PS_JOURNAL, PS_JOURNAL_OFFSET) == PS_JOURNAL);
   CHECK(close(fd) == 0);
   OK(ps_close(s, &error));
   crash(&m);
   /* Persist metadata ahead of payload: valid checksums alone cannot publish. */
   fd = open(path, O_RDWR);
   CHECK(fd >= 0);
-  CHECK(pwrite(fd, tail, PS_JOURNAL, 2 * PS_PAGE + 2 * PS_BANK) == PS_JOURNAL);
+  CHECK(pwrite(fd, tail, PS_JOURNAL, PS_JOURNAL_OFFSET) == PS_JOURNAL);
   CHECK(close(fd) == 0);
   s = reopen(&io);
   expect(s, state(1), NULL, "old-durable", 11);
@@ -586,10 +586,9 @@ static void concurrency(void) {
 
 static void churn_and_metadata_limit(void) {
   ps_space *s;
-  ps_writer *w;
-  ps_stats stats;
+  ps_stats stats, before;
+  ps_ref replacement;
   size_t i;
-  int rc;
   clean();
   s = create(PS_MIB, 0, NULL);
   for (i = 0; i < 1800; ++i) {
@@ -617,37 +616,40 @@ static void churn_and_metadata_limit(void) {
   OK(ps_close(s, &error));
   clean();
   s = create(10 * PS_MIB, 0, NULL);
-  for (i = 0; i < 1200; ++i) {
-    OK(ps_begin(s, state(i), &w, &error));
-    rc = ps_publish(w, NULL,
-                    &error); /* empty values isolate metadata capacity */
-    ps_writer_close(w);
-    if (rc != LC_OK) {
-      lc_error_cleanup(&error);
-      break;
-    }
-  }
-  CHECK(i == (PS_BANK - 64) / 64);
+  for (i = 0; i < 12000; ++i)
+    put(s, state(i), NULL, 0, 1); /* isolate growable directory capacity */
   OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &before, &error));
+  CHECK(before.entries == 12000 && before.metadata_bytes > 65536);
+  CHECK(before.metadata_pages > PS_METADATA_RESERVE / PS_PAGE);
+  replacement = put(s, state(1), NULL, 0, 1);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.directory_page_writes - before.directory_page_writes <= 4);
+  CHECK(stats.descriptor_page_writes == before.descriptor_page_writes + 1);
   OK(ps_delete(s, state(0), &error));
-  put(s, state(2000), NULL, 0, 1);
+  put(s, state(20000), NULL, 0, 1);
+  OK(ps_checkpoint(s, &error));
   OK(ps_close(s, &error));
   s = reopen(NULL);
   absent(s, state(0));
-  expect(s, state(2000), NULL, NULL, 0);
+  expect(s, state(1), &replacement, NULL, 0);
+  for (i = 2; i < 12000; ++i)
+    expect(s, state(i), NULL, NULL, 0);
+  expect(s, state(20000), NULL, NULL, 0);
   OK(ps_close(s, &error));
   clean();
-  puts("churn: repeated reuse, recovery of fragmented ownership and explicit "
-       "metadata ceiling");
+  puts("churn: repeated reuse, growable typed directory and incremental "
+       "checkpoint I/O");
 }
 
 static void fragmented_allocation(void) {
   ps_space *s;
-  unsigned char *page = malloc(PS_PAGE), *large = malloc(PS_CHUNK);
-  size_t i, pages = (PS_MIB - PS_DATA) / PS_PAGE;
+  unsigned char *page = malloc(PS_PAGE), *large = malloc(2 * PS_CHUNK);
+  size_t i, pages = (PS_MIB - PS_DATA - PS_MAINTENANCE_RESERVE) / PS_PAGE;
   CHECK(page && large);
   memset(page, 0xa5, PS_PAGE);
-  memset(large, 0x37, PS_CHUNK);
+  memset(large, 0x37, 2 * PS_CHUNK);
   clean();
   s = create(PS_MIB, 0, NULL);
   for (i = 0; i < pages; ++i)
@@ -655,19 +657,19 @@ static void fragmented_allocation(void) {
   for (i = 0; i < pages; i += 2)
     OK(ps_delete(s, state(i), &error));
   OK(ps_checkpoint(s, &error));
-  put(s, state(1000), large, PS_CHUNK, 7);
-  expect(s, state(1000), NULL, large, PS_CHUNK);
+  put(s, state(1000), large, 2 * PS_CHUNK, 7);
+  expect(s, state(1000), NULL, large, 2 * PS_CHUNK);
   OK(ps_checkpoint(s, &error));
   OK(ps_close(s, &error));
   s = reopen(NULL);
   for (i = 1; i < pages; i += 2)
     expect(s, state(i), NULL, page, PS_PAGE);
-  expect(s, state(1000), NULL, large, PS_CHUNK);
+  expect(s, state(1000), NULL, large, 2 * PS_CHUNK);
   OK(ps_close(s, &error));
   free(page);
   free(large);
   clean();
-  puts("fragmentation: a 16 KiB input reuses isolated 4 KiB holes without "
+  puts("fragmentation: a 32 KiB input reuses isolated 4 KiB holes without "
        "false exhaustion");
 }
 
@@ -978,9 +980,9 @@ static ssize_t gate_write(void *v, int fd, const void *p, size_t n,
   ssize_t written = pwrite(fd, p, n, offset);
   pthread_mutex_lock(&g->mutex);
   if (g->enabled && written == (ssize_t)n) {
-    if (offset >= 2 * PS_PAGE + 2 * PS_BANK && offset < PS_DATA && n >= 64)
+    if (offset >= PS_JOURNAL_OFFSET && offset < PS_DATA && n >= 64)
       ++g->publications;
-    if (offset >= 2 * PS_PAGE && offset < 2 * PS_PAGE + 2 * PS_BANK)
+    if (offset >= 2 * PS_PAGE && offset < PS_JOURNAL_OFFSET)
       g->maintenance = 1;
     pthread_cond_broadcast(&g->cond);
   }
@@ -1269,6 +1271,165 @@ static void reopen_retirement(void) {
        "checkpoint");
 }
 
+static void metadata_lifecycle(void) {
+  ps_space *s;
+  ps_reader *held;
+  ps_key collection = key(PS_COLLECTION, 1, 1);
+  ps_stats stats;
+  unsigned char *large = malloc(3 * (size_t)PS_MIB + 7);
+  size_t i;
+  CHECK(large != NULL);
+  memset(large, 0x8b, 3 * (size_t)PS_MIB + 7);
+  clean();
+  s = create(10 * PS_MIB, 0, NULL);
+  put(s, state(1), large, 3 * (size_t)PS_MIB + 7, 37);
+  for (i = 2; i < 18; ++i)
+    put(s, state(i), "small", 5, 3);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_read_open(s, state(1), NULL, &held, &error));
+  OK(ps_delete(s, state(1), &error));
+  OK(ps_checkpoint(s, &error));
+  put(s, state(99), large, 3 * (size_t)PS_MIB + 7, 4093);
+  OK(ps_checkpoint(s, &error));
+  read_value(held, large, 3 * (size_t)PS_MIB + 7);
+  ps_reader_close(held);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  absent(s, state(1));
+  expect(s, state(99), NULL, large, 3 * (size_t)PS_MIB + 7);
+  for (i = 2; i < 18; ++i) {
+    expect(s, state(i), NULL, "small", 5);
+    OK(ps_delete(s, state(i), &error));
+  }
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, state(99), NULL, large, 3 * (size_t)PS_MIB + 7);
+  OK(ps_close(s, &error));
+  clean();
+  s = create(PS_MIB, 0, NULL);
+  put(s, collection, NULL, 0, 1);
+  OK(ps_delete(s, collection, &error));
+  for (i = 2; i < PS_JOURNAL / 64; ++i)
+    put(s, state(1), NULL, 0, 1);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.journal_bytes == PS_JOURNAL);
+  put(s, collection, "rebound", 7, 3);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, collection, NULL, "rebound", 7);
+  OK(ps_close(s, &error));
+  free(large);
+  clean();
+  puts("metadata: spanning packed records, shared-page retirement and rollover "
+       "rebinding");
+}
+static void metadata_faults(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *s;
+  ps_reader *r;
+  unsigned char actual[16];
+  size_t kind, phase, count, i, n;
+  int rc;
+  for (kind = 0; kind < 2; ++kind) {
+    count = 0;
+    for (phase = 0; phase <= count; ++phase) {
+      clean();
+      m.operations = m.fail_at = 0;
+      s = create(3 * PS_MIB, 0, &io);
+      for (i = 0; i < 512; ++i)
+        put(s, state(i), "A", 1, 1);
+      OK(ps_checkpoint(s, &error));
+      for (i = 0; i < 16; ++i)
+        put(s, state(i * 31), "B", 1, 1);
+      m.operations = 0;
+      m.fail_at = kind == 0 ? phase : 0;
+      m.tear = m.persist_torn = 1;
+      allocation_call = 0;
+      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+      rc = ps_checkpoint(s, &error);
+      allocation_fail = 0;
+      m.fail_at = 0;
+      if (!phase)
+        count = kind == 0 ? m.operations : allocation_call;
+      if (rc != LC_OK) {
+        CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+        lc_error_cleanup(&error);
+        if (kind == 1)
+          OK(ps_checkpoint(s,
+                           &error)); /* failed private builds are retryable */
+      }
+      OK(ps_close(s, &error));
+      crash(&m);
+      s = reopen(&io);
+      for (i = 0; i < 512; ++i) {
+        OK(ps_read_open(s, state(i), NULL, &r, &error));
+        OK(ps_read(r, actual, sizeof(actual), &n, &error));
+        CHECK(n == 1 && (actual[0] == 'A' ||
+                         (i % 31 == 0 && i / 31 < 16 && actual[0] == 'B')));
+        ps_reader_close(r);
+      }
+      put(s, state(9999), "after", 5, 1);
+      OK(ps_checkpoint(s, &error));
+      OK(ps_close(s, &error));
+    }
+    CHECK(count > 15);
+  }
+  free(m.stable);
+  clean();
+  puts("metadata: every multi-page checkpoint I/O and heap failure, "
+       "abort/retry and reuse");
+}
+static void metadata_recovery_allocations(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_options options = {0};
+  ps_space *s;
+  unsigned char *large = malloc(3 * (size_t)PS_MIB + 7);
+  unsigned char *baseline = malloc(4 * (size_t)PS_MIB);
+  size_t phase, count = 0;
+  int rc;
+  CHECK(large && baseline);
+  memset(large, 0x49, 3 * (size_t)PS_MIB + 7);
+  options.io = &io;
+  clean();
+  s = create(4 * PS_MIB, 0, &io);
+  put(s, state(1), large, 3 * (size_t)PS_MIB + 7, 8191);
+  put(s, state(2), "small", 5, 3);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  memcpy(baseline, m.stable, 4 * (size_t)PS_MIB);
+  for (phase = 0; phase <= count; ++phase) {
+    memcpy(m.stable, baseline, 4 * (size_t)PS_MIB);
+    crash(&m);
+    allocation_call = 0;
+    allocation_fail = phase ? phase : (size_t)-1;
+    rc = ps_open(path, 0, &options, &s, &error);
+    allocation_fail = 0;
+    if (!phase)
+      count = allocation_call;
+    if (rc == LC_OK)
+      OK(ps_close(s, &error));
+    else {
+      CHECK(rc == LC_ERR_NOMEM && s == NULL);
+      lc_error_cleanup(&error);
+    }
+    m.read_bytes = 0;
+    s = reopen(&io);
+    CHECK(m.read_bytes <= PS_JOURNAL + 2 * PS_ROOT_BYTES + 6 * PS_PAGE);
+    expect(s, state(1), NULL, large, 3 * (size_t)PS_MIB + 7);
+    expect(s, state(2), NULL, "small", 5);
+    OK(ps_close(s, &error));
+  }
+  CHECK(count > 10);
+  free(baseline);
+  free(large);
+  free(m.stable);
+  clean();
+  puts("metadata: every allocation during multi-page descriptor recovery");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -1282,7 +1443,11 @@ int main(int argc, char **argv) {
       commit_coordination();
     else if (strcmp(argv[2], "reopen") == 0)
       reopen_retirement();
-    else
+    else if (strcmp(argv[2], "metadata") == 0) {
+      metadata_lifecycle();
+      metadata_faults();
+      metadata_recovery_allocations();
+    } else
       return 2;
     lc_error_cleanup(&error);
     printf("pouch-space %s: %zu observable checks passed\n", argv[2], checks);

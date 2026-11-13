@@ -32,6 +32,10 @@ typedef int (*ps_directory_visit_fn)(void *, ps_key, ps_directory_value,
                                      lc_error *);
 typedef int (*ps_directory_page_fn)(void *, ps_directory_root, lc_error *);
 
+/* Conservative complete-tree page allowance for every valid post-deletion
+ * shape, including small directories that still retain multiple leaves. */
+uint64_t ps_directory_page_bound(uint64_t entries);
+
 /* root {0,0} is empty. A handle belongs to one checkpoint owner. Reads and
  * mutations cache only index pages actually visited. Any error after open
  * makes the handle unusable except for pages/close. */

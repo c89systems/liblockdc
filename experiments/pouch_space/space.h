@@ -15,9 +15,12 @@
  * records need not eventually consume a whole physical page each. */
 #define PS_PAGE 4096U
 #define PS_CHUNK 16384U
-#define PS_BANK 65536U
+#define PS_METADATA_RESERVE 131072U
 #define PS_JOURNAL 131072U
-#define PS_DATA (2U * PS_PAGE + 2U * PS_BANK + PS_JOURNAL)
+#define PS_JOURNAL_OFFSET (2U * PS_PAGE + PS_METADATA_RESERVE)
+#define PS_DATA (PS_JOURNAL_OFFSET + PS_JOURNAL)
+#define PS_MAINTENANCE_RESERVE PS_CHUNK
+#define PS_ROOT_BYTES 80U
 
 enum ps_kind { PS_STATE = 1, PS_COLLECTION = 2 };
 typedef struct ps_space ps_space;
@@ -35,6 +38,7 @@ typedef struct ps_stats {
   uint64_t capacity, live_bytes, allocated_bytes, retired_bytes, private_bytes;
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
   uint64_t sync_requests, sync_batches, max_sync_batch;
+  uint64_t metadata_pages, directory_page_writes, descriptor_page_writes;
 } ps_stats;
 
 /* Optional syscall seam for deterministic storage faults, not another backend.

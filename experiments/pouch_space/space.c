@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include "space.h"
+#include "directory.h"
 #include "lc_api_internal.h"
 
 #include <errno.h>
@@ -18,7 +19,10 @@
 #define ROOT_MAGIC UINT64_C(0x31544f4f525350)
 #define EVENT_MAGIC UINT64_C(0x31565350)
 #define BUCKETS 257U
-#define JOURNAL_OFFSET (2U * PS_PAGE + 2U * PS_BANK)
+#define JOURNAL_OFFSET PS_JOURNAL_OFFSET
+#define META_MAGIC UINT32_C(0x3141544d)
+#define META_HEADER 64U
+#define META_PAYLOAD (PS_PAGE - META_HEADER)
 #define TOKEN_RANGE UINT64_C(4294967296)
 enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS };
 
@@ -35,11 +39,22 @@ typedef struct ps_entry {
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
   struct ps_entry *previous;
   struct ps_entry *all_next, *hash_next;
+  struct ps_entry **all_link;
+  struct ps_entry *retired_next, **retired_link;
+  struct ps_entry *dirty_next, **dirty_link;
+  ps_directory_value checkpoint_ref, pending_ref;
 } ps_entry;
 typedef struct ps_run {
   uint64_t offset, bytes;
   struct ps_run *next;
 } ps_run;
+typedef struct ps_meta_page {
+  ps_run run; /* reusable free-interval node; must be first */
+  uint64_t generation, following;
+  size_t used, references;
+  int index;
+  struct ps_meta_page *next, **link, *hash_next;
+} ps_meta_page;
 struct ps_space {
   int fd, poisoned, durable, root;
   pthread_mutex_t mutex;
@@ -53,8 +68,13 @@ struct ps_space {
   uint64_t pending_sequence, durable_sequence;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   size_t journal, metadata, readers, writers;
-  ps_entry *entries, *buckets[BUCKETS];
-  ps_run *free;
+  uint64_t live_entries, free_bytes, metadata_free_bytes;
+  uint64_t directory_page_writes, descriptor_page_writes;
+  size_t metadata_pages;
+  ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
+  ps_directory_root directory;
+  ps_meta_page *pages, *page_buckets[BUCKETS];
+  ps_run *free, *metadata_free;
 };
 struct ps_writer {
   ps_space *space;
@@ -239,6 +259,34 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
   return NULL;
 }
 static size_t entry_bytes(const ps_entry *p) { return 64 + 24 * p->count; }
+static void register_entry(ps_space *s, ps_entry *p) {
+  p->all_next = s->entries;
+  p->all_link = &s->entries;
+  if (p->all_next)
+    p->all_next->all_link = &p->all_next;
+  s->entries = p;
+}
+static void unregister_entry(ps_entry *p) {
+  *p->all_link = p->all_next;
+  if (p->all_next)
+    p->all_next->all_link = p->all_link;
+}
+static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
+  if (old) {
+    p->checkpoint_ref = old->checkpoint_ref;
+    if (old->dirty_link) {
+      *old->dirty_link = old->dirty_next;
+      if (old->dirty_next)
+        old->dirty_next->dirty_link = old->dirty_link;
+      old->dirty_link = NULL;
+    }
+  }
+  p->dirty_link = &s->dirty;
+  p->dirty_next = s->dirty;
+  if (p->dirty_next)
+    p->dirty_next->dirty_link = &p->dirty_next;
+  s->dirty = p;
+}
 static void retire(ps_space *s, ps_entry *p) {
   ps_entry **link = &s->buckets[bucket(p->key)];
   while (*link != p)
@@ -246,8 +294,15 @@ static void retire(ps_space *s, ps_entry *p) {
   *link = p->hash_next;
   p->hash_next = NULL;
   p->state = 2;
-  if (!p->deleted)
+  p->retired_link = &s->retired;
+  p->retired_next = s->retired;
+  if (p->retired_next)
+    p->retired_next->retired_link = &p->retired_next;
+  s->retired = p;
+  if (!p->deleted) {
     s->metadata -= entry_bytes(p);
+    --s->live_entries;
+  }
 }
 static void install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);
@@ -257,8 +312,10 @@ static void install(ps_space *s, ps_entry *p) {
   p->state = 1;
   p->hash_next = s->buckets[bucket(p->key)];
   s->buckets[bucket(p->key)] = p;
-  if (!p->deleted)
+  if (!p->deleted) {
     s->metadata += entry_bytes(p);
+    ++s->live_entries;
+  }
 }
 static void entry_free(ps_entry *p) {
   lc_free_with_allocator(NULL, p->extents);
@@ -267,12 +324,17 @@ static void entry_free(ps_entry *p) {
 /* Sorted free intervals. Their number follows fragmentation, not capacity.
  * Nodes are preallocated before irreversible metadata changes when needed. */
 static void free_insert(ps_space *s, ps_run *node) {
-  ps_run **link = &s->free, *next;
+  ps_run **head = node->offset < PS_DATA ? &s->metadata_free : &s->free;
+  ps_run **link = head, *next;
+  if (node->offset < PS_DATA)
+    s->metadata_free_bytes += node->bytes;
+  else
+    s->free_bytes += node->bytes;
   while (*link && (*link)->offset < node->offset)
     link = &(*link)->next;
   node->next = *link;
   *link = node;
-  link = &s->free;
+  link = head;
   while (*link && (*link)->next) {
     next = (*link)->next;
     if ((*link)->offset + (*link)->bytes == next->offset) {
@@ -283,20 +345,21 @@ static void free_insert(ps_space *s, ps_run *node) {
       link = &(*link)->next;
   }
 }
-static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
-                    lc_error *error) {
-  ps_run **link = &s->free, *node;
+static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
+                         uint64_t *out, lc_error *error) {
+  ps_run **link = head, *node;
   while (*link && (*link)->bytes < *bytes)
     link = &(*link)->next;
   /* Fragmentation must not strand usable pages behind a preferred run size. */
-  if (!*link && s->free) {
-    link = &s->free;
+  if (!*link && *head) {
+    link = head;
     *bytes = (*link)->bytes;
   }
   if (!*link)
     return err(error, LC_ERR_INVALID,
                "container payload capacity exhausted; checkpoint or grow");
   node = *link;
+  *available -= *bytes;
   *out = node->offset;
   node->offset += *bytes;
   node->bytes -= *bytes;
@@ -306,11 +369,17 @@ static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
   }
   return LC_OK;
 }
+static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
+                    lc_error *error) {
+  return take_interval(&s->free, &s->free_bytes, bytes, out, error);
+}
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
 static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
                        lc_error *error) {
-  ps_run **link = &s->free, *node, *tail;
+  ps_run **link = offset < PS_DATA ? &s->metadata_free : &s->free, *node, *tail;
+  uint64_t *available =
+      offset < PS_DATA ? &s->metadata_free_bytes : &s->free_bytes;
   while (*link && (*link)->offset + (*link)->bytes <= offset)
     link = &(*link)->next;
   node = *link;
@@ -318,6 +387,7 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
       offset - node->offset > node->bytes - bytes)
     return err(error, LC_ERR_PROTOCOL, "overlapping container ownership");
   if (node->offset == offset) {
+    *available -= bytes;
     node->offset += bytes;
     node->bytes -= bytes;
     if (!node->bytes) {
@@ -335,6 +405,7 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
     tail->next = node->next;
     node->next = tail;
   }
+  *available -= bytes;
   node->bytes = offset - node->offset;
   return LC_OK;
 }
@@ -364,15 +435,18 @@ static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
   return LC_OK;
 }
 static void collect(ps_space *s) {
-  ps_entry **link = &s->entries, *p;
+  ps_entry **link = &s->retired, *p;
   while (*link) {
     p = *link;
     if (p->state == 2 && p->safe && !p->pins &&
         release_entry_runs(s, p, NULL) == LC_OK) {
-      *link = p->all_next;
+      *link = p->retired_next;
+      if (*link)
+        (*link)->retired_link = link;
+      unregister_entry(p);
       entry_free(p);
     } else
-      link = &p->all_next;
+      link = &p->retired_next;
   }
 }
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
@@ -410,7 +484,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
   count = get32(wire + 56);
-  if (count > (PS_BANK - 64) / 24 || bytes != 64 + count * 24 ||
+  if (count > (PS_JOURNAL - 64) / 24 || bytes != 64 + count * 24 ||
       get32(wire + 20) > PS_RESERVE_IDS)
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -475,39 +549,286 @@ static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
   }
   return LC_OK;
 }
+static int initial_free(ps_space *s, lc_error *error) {
+  s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
+  s->metadata_free =
+      lc_calloc_with_allocator(NULL, 1, sizeof(*s->metadata_free));
+  if (!s->free || !s->metadata_free)
+    return err(error, LC_ERR_NOMEM, "cannot allocate container free intervals");
+  s->free->offset = PS_DATA;
+  s->free->bytes = s->free_bytes = s->capacity - PS_DATA;
+  s->metadata_free->offset = 2 * PS_PAGE;
+  s->metadata_free->bytes = s->metadata_free_bytes = PS_METADATA_RESERVE;
+  return LC_OK;
+}
+static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
+                                uint64_t payload, lc_error *error) {
+  uint64_t pages;
+  if (bytes > (uint64_t)INT64_MAX / 2 ||
+      entries > (uint64_t)INT64_MAX / PS_PAGE)
+    return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
+  pages = (bytes + META_PAYLOAD - 1) / META_PAYLOAD;
+  pages += ps_directory_page_bound(entries);
+  if (payload > s->free_bytes ||
+      s->free_bytes - payload < PS_MAINTENANCE_RESERVE ||
+      pages > (s->free_bytes + s->metadata_free_bytes - payload -
+               PS_MAINTENANCE_RESERVE) /
+                  PS_PAGE)
+    return err(error, LC_ERR_INVALID,
+               "container capacity reserved for checkpoint and maintenance; "
+               "checkpoint or grow");
+  return LC_OK;
+}
+static int metadata_offset(ps_space *s, uint64_t offset) {
+  return offset % PS_PAGE == 0 && offset >= 2 * PS_PAGE &&
+         offset <= s->capacity - PS_PAGE &&
+         (offset < JOURNAL_OFFSET || offset >= PS_DATA);
+}
+static ps_meta_page *metadata_find(ps_space *s, uint64_t offset) {
+  ps_meta_page *p;
+  for (p = s->page_buckets[(offset / PS_PAGE) % BUCKETS]; p; p = p->hash_next)
+    if (p->run.offset == offset)
+      return p;
+  return NULL;
+}
+static void metadata_register(ps_space *s, ps_meta_page *p) {
+  size_t hash = (size_t)((p->run.offset / PS_PAGE) % BUCKETS);
+  p->next = s->pages;
+  p->link = &s->pages;
+  if (p->next)
+    p->next->link = &p->next;
+  s->pages = p;
+  p->hash_next = s->page_buckets[hash];
+  s->page_buckets[hash] = p;
+  ++s->metadata_pages;
+}
+static void metadata_release(ps_space *s, ps_meta_page *p) {
+  ps_meta_page **link = &s->page_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
+  while (*link != p)
+    link = &(*link)->hash_next;
+  *link = p->hash_next;
+  *p->link = p->next;
+  if (p->next)
+    p->next->link = p->link;
+  --s->metadata_pages;
+  free_insert(s, &p->run);
+}
+static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
+                             lc_error *error) {
+  ps_meta_page *p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  uint64_t bytes = PS_PAGE;
+  int rc;
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot allocate metadata ownership");
+  rc = s->metadata_free
+           ? take_interval(&s->metadata_free, &s->metadata_free_bytes, &bytes,
+                           &p->run.offset, error)
+           : take_run(s, &bytes, &p->run.offset, error);
+  if (rc != LC_OK) {
+    lc_free_with_allocator(NULL, p);
+    return rc;
+  }
+  p->run.bytes = PS_PAGE;
+  p->generation = s->generation + 1;
+  p->index = index;
+  p->references = index != 0;
+  metadata_register(s, p);
+  *out = p;
+  return LC_OK;
+}
+static int directory_read(void *v, uint64_t offset, void *page,
+                          lc_error *error) {
+  ps_space *s = v;
+  if (!metadata_offset(s, offset))
+    return err(error, LC_ERR_PROTOCOL, "directory page outside metadata space");
+  return transfer(s, page, PS_PAGE, offset, 0, error);
+}
+static int directory_allocate(void *v, uint64_t *offset, lc_error *error) {
+  ps_meta_page *p = NULL;
+  int rc = metadata_allocate(v, 1, &p, error);
+  if (rc == LC_OK)
+    *offset = p->run.offset;
+  return rc;
+}
+static int directory_write(void *v, uint64_t offset, const void *page,
+                           lc_error *error) {
+  ps_space *s = v;
+  int rc = transfer(s, (void *)page, PS_PAGE, offset, 1, error);
+  if (rc == LC_OK)
+    ++s->directory_page_writes;
+  return rc;
+}
+static int directory_open(ps_space *s, ps_directory **out, lc_error *error) {
+  ps_directory_io io;
+  memset(&io, 0, sizeof(io));
+  io.context = s;
+  memcpy(io.identity, s->identity, 16);
+  io.read = directory_read;
+  io.allocate = directory_allocate;
+  io.write = directory_write;
+  return ps_directory_open(&io, s->directory, out, error);
+}
+static uint32_t metadata_crc(const unsigned char *page) {
+  return (uint32_t)crc32(checksum(page, 48), page + 52, PS_PAGE - 52);
+}
+typedef struct metadata_builder {
+  ps_space *space;
+  ps_meta_page *page;
+  unsigned char *buffer;
+} metadata_builder;
+static int metadata_flush(metadata_builder *b, lc_error *error) {
+  ps_space *s = b->space;
+  ps_meta_page *p = b->page;
+  int rc;
+  if (!p)
+    return LC_OK;
+  put32(b->buffer, META_MAGIC);
+  put32(b->buffer + 4, (uint32_t)p->used);
+  put64(b->buffer + 8, p->following);
+  put64(b->buffer + 16, p->generation);
+  put64(b->buffer + 24, p->run.offset);
+  memcpy(b->buffer + 32, s->identity, 16);
+  put32(b->buffer + 48, metadata_crc(b->buffer));
+  rc = transfer(s, b->buffer, PS_PAGE, p->run.offset, 1, error);
+  if (rc == LC_OK)
+    ++s->descriptor_page_writes;
+  return rc;
+}
+static int metadata_next(metadata_builder *b, int continuation,
+                         lc_error *error) {
+  ps_meta_page *p;
+  int rc = metadata_allocate(b->space, 0, &p, error);
+  if (rc != LC_OK)
+    return rc;
+  if (b->page && continuation)
+    b->page->following = p->run.offset;
+  rc = metadata_flush(b, error);
+  if (rc == LC_OK) {
+    b->page = p;
+    memset(b->buffer, 0, PS_PAGE);
+  }
+  return rc;
+}
+static int metadata_append(metadata_builder *b, const unsigned char *wire,
+                           size_t bytes, ps_directory_value *ref,
+                           lc_error *error) {
+  size_t done = 0, take;
+  int rc;
+  if (!b->page || b->page->used == META_PAYLOAD) {
+    rc = metadata_next(b, 0, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  ref->offset = b->page->run.offset + META_HEADER + b->page->used;
+  ref->bytes = bytes;
+  ref->incarnation = get64(wire + 40);
+  for (;;) {
+    ++b->page->references;
+    take = META_PAYLOAD - b->page->used;
+    if (take > bytes - done)
+      take = bytes - done;
+    memcpy(b->buffer + META_HEADER + b->page->used, wire + done, take);
+    b->page->used += take;
+    done += take;
+    if (done == bytes)
+      return LC_OK;
+    rc = metadata_next(b, 1, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+}
+static int metadata_unref(ps_space *s, ps_directory_value ref,
+                          lc_error *error) {
+  uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, following;
+  size_t at = (size_t)(ref.offset % PS_PAGE), take;
+  ps_meta_page *p;
+  if (!ref.offset)
+    return LC_OK;
+  while (ref.bytes) {
+    p = metadata_find(s, offset);
+    if (!p || p->index || !p->references || at < META_HEADER ||
+        at >= META_HEADER + p->used)
+      return err(error, LC_ERR_PROTOCOL,
+                 "metadata retirement ownership mismatch");
+    take = META_HEADER + p->used - at;
+    if (take > ref.bytes)
+      take = (size_t)ref.bytes;
+    ref.bytes -= take;
+    following = p->following;
+    if (--p->references == 0)
+      metadata_release(s, p);
+    offset = following;
+    at = META_HEADER;
+  }
+  return LC_OK;
+}
+static void metadata_abort(ps_space *s, uint64_t generation) {
+  ps_meta_page *p = s->pages, *next;
+  while (p) {
+    next = p->next;
+    if (p->generation == generation)
+      metadata_release(s, p);
+    p = next;
+  }
+}
 static int checkpoint_locked(ps_space *s, lc_error *error) {
-  unsigned char root[64], zero[64] = {0}, *snapshot;
-  ps_entry *p, grant;
-  size_t cursor = 64;
-  int next = 1 - s->root, rc;
+  unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire = NULL;
+  ps_entry *p;
+  ps_meta_page *page;
+  ps_directory *directory = NULL;
+  ps_directory_root new_root = {0};
+  ps_directory_pages changes;
+  metadata_builder builder;
+  size_t i;
+  int next = 1 - s->root, rc, removed;
   if (s->generation == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
-  snapshot = lc_alloc_with_allocator(NULL, s->metadata + 64);
-  if (!snapshot)
-    return err(error, LC_ERR_NOMEM, "cannot allocate metadata checkpoint");
-  memset(&grant, 0, sizeof(grant));
-  grant.token = s->token_limit;
-  encode_entry(snapshot, &grant, s->sequence, PS_RESERVE_IDS);
-  for (p = s->entries; p; p = p->all_next)
-    if (p->state == 1 && !p->deleted) {
-      encode_entry(snapshot + cursor, p, s->sequence, PS_PUT);
-      cursor += entry_bytes(p);
-    }
-  rc = transfer(s, snapshot, cursor, 2U * PS_PAGE + (uint64_t)next * PS_BANK, 1,
-                error);
+  memset(&builder, 0, sizeof(builder));
+  builder.space = s;
+  rc = checkpoint_allowance(s, s->metadata, s->live_entries, 0, error);
   if (rc == LC_OK)
-    rc = sync_file(s, error); /* payloads, old journal, and new bank */
+    rc = directory_open(s, &directory, error);
+  if (rc == LC_OK && s->dirty) {
+    builder.buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
+    if (!builder.buffer)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate descriptor page buffer");
+  }
+  for (p = s->dirty; p && rc == LC_OK; p = p->dirty_next) {
+    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
+    if (p->deleted)
+      rc = ps_directory_remove(directory, p->key, &removed, error);
+    else {
+      wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
+      if (!wire) {
+        rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
+        break;
+      }
+      encode_entry(wire, p, s->sequence, PS_PUT);
+      rc = metadata_append(&builder, wire, entry_bytes(p), &p->pending_ref,
+                           error);
+      lc_free_with_allocator(NULL, wire);
+      wire = NULL;
+      if (rc == LC_OK)
+        rc = ps_directory_put(directory, p->key, p->pending_ref, error);
+    }
+  }
+  if (rc == LC_OK)
+    rc = metadata_flush(&builder, error);
+  if (rc == LC_OK)
+    rc = ps_directory_flush(directory, s->generation + 1, &new_root, error);
+  if (rc == LC_OK)
+    rc = sync_file(s, error); /* payloads, journal and new metadata pages */
   memset(root, 0, sizeof(root));
   put64(root, ROOT_MAGIC);
   put64(root + 8, s->generation + 1);
   put64(root + 16, s->capacity);
   put64(root + 24, s->sequence);
-  put64(root + 32, cursor);
-  memcpy(root + 40, s->identity, 16);
-  put32(root + 56, checksum(snapshot, cursor));
-  put32(root + 60, checksum(root, 60));
-  lc_free_with_allocator(NULL, snapshot);
+  put64(root + 32, new_root.offset);
+  put64(root + 40, new_root.generation);
+  put64(root + 48, s->token_limit);
+  memcpy(root + 56, s->identity, 16);
+  put32(root + 76, checksum(root, 76));
   if (rc == LC_OK)
     rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
   if (rc == LC_OK)
@@ -516,23 +837,53 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
   if (rc == LC_OK)
     rc = sync_file(s, error); /* obsolete root cannot survive reuse */
-  if (rc != LC_OK)
+  lc_free_with_allocator(NULL, builder.buffer);
+  if (rc != LC_OK) {
+    if (rc == LC_ERR_PROTOCOL)
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+      metadata_abort(s, s->generation + 1);
+    ps_directory_close(directory);
     return rc;
+  }
   s->root = next;
   ++s->generation;
   ++s->checkpoints;
+  s->directory = new_root;
   s->journal = 0;
   mark_durable(s, s->sequence);
-  /* The checkpoint covers every projected version. Existing readers retain
-   * their own pins, and new readers no longer need pending version history. */
-  for (p = s->entries; p; p = p->all_next) {
+  ps_directory_changed_pages(directory, &changes);
+  for (i = 0; i < changes.retired_count; ++i) {
+    page = metadata_find(s, changes.retired[i].offset);
+    if (!page || !page->index ||
+        page->generation != changes.retired[i].generation) {
+      rc = err(error, LC_ERR_PROTOCOL,
+               "directory retirement ownership mismatch");
+      break;
+    }
+    metadata_release(s, page);
+  }
+  ps_directory_close(directory);
+  while (s->dirty && rc == LC_OK) {
+    p = s->dirty;
+    rc = metadata_unref(s, p->checkpoint_ref, error);
+    s->dirty = p->dirty_next;
+    if (s->dirty)
+      s->dirty->dirty_link = &s->dirty;
+    p->dirty_link = NULL;
+    p->checkpoint_ref = p->pending_ref;
     p->previous = NULL;
-    if (p->state == 1 && p->deleted)
+    if (p->deleted)
       retire(s, p);
   }
-  for (p = s->entries; p; p = p->all_next)
-    if (p->state == 2)
-      p->safe = 1;
+  if (rc != LC_OK) {
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    return rc;
+  }
+  for (p = s->retired; p; p = p->retired_next) {
+    p->previous = NULL;
+    p->safe = 1;
+  }
   collect(s);
   return LC_OK;
 }
@@ -580,6 +931,7 @@ static int grant_tokens(ps_space *s, lc_error *error) {
 static void destroy(ps_space *s) {
   ps_entry *p;
   ps_run *r;
+  ps_meta_page *page;
   while (s->entries) {
     p = s->entries;
     s->entries = p->all_next;
@@ -589,6 +941,16 @@ static void destroy(ps_space *s) {
     r = s->free;
     s->free = r->next;
     lc_free_with_allocator(NULL, r);
+  }
+  while (s->metadata_free) {
+    r = s->metadata_free;
+    s->metadata_free = r->next;
+    lc_free_with_allocator(NULL, r);
+  }
+  while (s->pages) {
+    page = s->pages;
+    s->pages = page->next;
+    lc_free_with_allocator(NULL, page);
   }
   if (s->fd >= 0)
     (void)close(s->fd);
@@ -619,37 +981,165 @@ static int random_bytes(void *bytes, size_t n, lc_error *error) {
 }
 static int root_valid(const unsigned char *p) {
   uint64_t capacity = get64(p + 16);
+  uint64_t offset = get64(p + 32), generation = get64(p + 40);
   return get64(p) == ROOT_MAGIC && get64(p + 8) && capacity >= PS_MIB &&
          capacity <= INT64_MAX && capacity % PS_MIB == 0 &&
-         get64(p + 32) <= PS_BANK && checksum(p, 60) == get32(p + 60);
+         ((!offset && !generation) ||
+          (offset >= 2 * PS_PAGE && offset % PS_PAGE == 0 &&
+           offset <= capacity - PS_PAGE &&
+           (offset < JOURNAL_OFFSET || offset >= PS_DATA) && generation &&
+           generation <= get64(p + 8))) &&
+         get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 && !get32(p + 72) &&
+         checksum(p, 76) == get32(p + 76);
+}
+typedef struct metadata_recovery {
+  ps_space *space;
+  unsigned char *wire, *buffer;
+  uint64_t loaded;
+} metadata_recovery;
+static int recover_directory_page(void *v, ps_directory_root ref,
+                                  lc_error *error) {
+  ps_space *s = ((metadata_recovery *)v)->space;
+  ps_meta_page *p;
+  int rc;
+  if (metadata_find(s, ref.offset))
+    return err(error, LC_ERR_PROTOCOL, "overlapping directory ownership");
+  p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot recover directory ownership");
+  rc = exclude_run(s, ref.offset, PS_PAGE, error);
+  if (rc != LC_OK) {
+    lc_free_with_allocator(NULL, p);
+    return rc;
+  }
+  p->run.offset = ref.offset;
+  p->run.bytes = PS_PAGE;
+  p->generation = ref.generation;
+  p->index = 1;
+  p->references = 1;
+  metadata_register(s, p);
+  return LC_OK;
+}
+static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
+                         lc_error *error) {
+  ps_space *s = recovery->space;
+  unsigned char *wire = recovery->wire, *buffer = recovery->buffer;
+  uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0, next;
+  size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take, used;
+  ps_meta_page *p;
+  int rc, fresh;
+  while (done < ref.bytes) {
+    if (!metadata_offset(s, offset))
+      return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
+    fresh = recovery->loaded != offset;
+    if (fresh) {
+      rc = transfer(s, buffer, PS_PAGE, offset, 0, error);
+      if (rc != LC_OK)
+        return rc;
+    }
+    used = get32(buffer + 4);
+    next = get64(buffer + 8);
+    if (get32(buffer) != META_MAGIC || !used || used > META_PAYLOAD ||
+        !get64(buffer + 16) || get64(buffer + 16) > s->generation ||
+        (generation && get64(buffer + 16) != generation) ||
+        get64(buffer + 24) != offset || memcmp(buffer + 32, s->identity, 16) ||
+        (fresh && get32(buffer + 48) != metadata_crc(buffer)) ||
+        get32(buffer + 52) || get64(buffer + 56) ||
+        (next && !metadata_offset(s, next)) || at < META_HEADER ||
+        at >= META_HEADER + used)
+      return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
+    recovery->loaded = offset;
+    generation = get64(buffer + 16);
+    p = metadata_find(s, offset);
+    if (p && (p->index || p->generation != generation || p->used != used ||
+              p->following != next))
+      return err(error, LC_ERR_PROTOCOL, "conflicting metadata ownership");
+    if (!p) {
+      p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+      if (!p)
+        return err(error, LC_ERR_NOMEM, "cannot recover descriptor ownership");
+      rc = exclude_run(s, offset, PS_PAGE, error);
+      if (rc != LC_OK) {
+        lc_free_with_allocator(NULL, p);
+        return rc;
+      }
+      p->run.offset = offset;
+      p->run.bytes = PS_PAGE;
+      p->generation = generation;
+      p->used = used;
+      p->following = next;
+      metadata_register(s, p);
+    }
+    ++p->references;
+    take = META_HEADER + used - at;
+    if (take > ref.bytes - done)
+      take = (size_t)ref.bytes - done;
+    memcpy(wire + done, buffer + at, take);
+    done += take;
+    if (done < ref.bytes && (!next || used != META_PAYLOAD))
+      return err(error, LC_ERR_PROTOCOL, "truncated packed metadata record");
+    offset = next;
+    at = META_HEADER;
+  }
+  return LC_OK;
+}
+static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
+                                   lc_error *error) {
+  metadata_recovery *recovery = v;
+  ps_space *s = recovery->space;
+  unsigned char *wire = recovery->wire;
+  ps_entry *p = NULL;
+  int event, rc;
+  if (ref.bytes < 64 || ref.bytes > PS_JOURNAL)
+    return err(error, LC_ERR_PROTOCOL, "invalid checkpoint descriptor span");
+  rc = metadata_read(recovery, ref, error);
+  if (rc == LC_OK)
+    rc = decode_entry(s, wire, (size_t)ref.bytes, &p, &event, error);
+  if (rc == LC_OK && (event != PS_PUT || !same_key(p->key, key) ||
+                      p->token != ref.incarnation ||
+                      get64(wire + 8) > s->sequence || lookup(s, key)))
+    rc = err(error, LC_ERR_PROTOCOL, "checkpoint descriptor binding mismatch");
+  if (rc == LC_OK) {
+    p->checkpoint_ref = ref;
+    register_entry(s, p);
+    install(s, p);
+  } else if (p)
+    entry_free(p);
+  return rc;
 }
 static int recover(ps_space *s, lc_error *error) {
-  unsigned char roots[128], zero[1024] = {0}, *wire, *buffer;
+  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire,
+                                          *buffer;
   const unsigned char *root;
+  ps_directory *directory = NULL;
+  metadata_recovery recovery;
   ps_entry *p = NULL, *old;
   struct stat st;
-  size_t cursor = 0, bytes, end, i;
+  size_t cursor = 0, bytes, i;
   int a, b, event, rc;
-  rc = transfer(s, roots, 64, 0, 0, error);
+  rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
-    rc = transfer(s, roots + 64, 64, PS_PAGE, 0, error);
+    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
   if (rc != LC_OK)
     return rc;
   a = root_valid(roots);
-  b = root_valid(roots + 64);
+  b = root_valid(roots + PS_ROOT_BYTES);
   if (!a && !b)
     return err(error, LC_ERR_PROTOCOL, "no recoverable container root");
   if (a && b &&
-      (memcmp(roots + 40, roots + 104, 16) == 0
-           ? get64(roots + 8) == get64(roots + 72)
+      (memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16) == 0
+           ? get64(roots + 8) == get64(roots + PS_ROOT_BYTES + 8)
            : 1))
     return err(error, LC_ERR_PROTOCOL, "conflicting container roots");
-  s->root = b && (!a || get64(roots + 72) > get64(roots + 8));
-  root = roots + 64 * s->root;
+  s->root = b && (!a || get64(roots + PS_ROOT_BYTES + 8) > get64(roots + 8));
+  root = roots + PS_ROOT_BYTES * s->root;
   s->generation = get64(root + 8);
   s->capacity = get64(root + 16);
   s->sequence = get64(root + 24);
-  memcpy(s->identity, root + 40, 16);
+  s->directory.offset = get64(root + 32);
+  s->directory.generation = get64(root + 40);
+  s->token_limit = get64(root + 48);
+  memcpy(s->identity, root + 56, 16);
   if (s->maximum && s->capacity > s->maximum)
     return err(error, LC_ERR_INVALID,
                "committed capacity exceeds configured maximum");
@@ -662,45 +1152,19 @@ static int recover(ps_space *s, lc_error *error) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate recovery buffers");
     goto done;
   }
-  end = (size_t)get64(root + 32);
-  rc = transfer(s, wire, end, 2U * PS_PAGE + (uint64_t)s->root * PS_BANK, 0,
-                error);
+  memset(&recovery, 0, sizeof(recovery));
+  recovery.space = s;
+  recovery.wire = wire;
+  recovery.buffer = buffer;
+  rc = initial_free(s, error);
+  if (rc == LC_OK)
+    rc = directory_open(s, &directory, error);
+  if (rc == LC_OK)
+    rc = ps_directory_visit(directory, recover_directory_entry,
+                            recover_directory_page, &recovery, error);
+  ps_directory_close(directory);
   if (rc != LC_OK)
     goto done;
-  if (checksum(wire, end) != get32(root + 56)) {
-    rc = err(error, LC_ERR_PROTOCOL,
-             "selected container checkpoint checksum mismatch");
-    goto done;
-  }
-  while (cursor < end) {
-    if (end - cursor < 64 ||
-        (bytes = get32(wire + cursor + 4)) > end - cursor || bytes < 64) {
-      rc = err(error, LC_ERR_PROTOCOL, "truncated container checkpoint");
-      goto done;
-    }
-    rc = decode_entry(s, wire + cursor, bytes, &p, &event, error);
-    if (rc != LC_OK)
-      goto done;
-    if (event == PS_RESERVE_IDS && cursor == 0) {
-      s->token_limit = p->token;
-      entry_free(p);
-      cursor += bytes;
-      continue;
-    }
-    if (event != PS_PUT || !s->token_limit || lookup(s, p->key)) {
-      entry_free(p);
-      rc = err(error, LC_ERR_PROTOCOL, "duplicate or deleted checkpoint entry");
-      goto done;
-    }
-    p->all_next = s->entries;
-    s->entries = p;
-    install(s, p);
-    cursor += bytes;
-  }
-  if (!s->token_limit) {
-    rc = err(error, LC_ERR_PROTOCOL, "checkpoint lacks incarnation grant");
-    goto done;
-  }
   rc = transfer(s, wire, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
   if (rc != LC_OK)
     goto done;
@@ -737,32 +1201,30 @@ static int recover(ps_space *s, lc_error *error) {
         lc_error_cleanup(error);
         break;
       }
-      if (p->key.kind == PS_COLLECTION && lookup(s, p->key)) {
+      old = lookup(s, p->key);
+      if (p->key.kind == PS_COLLECTION && old && !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
                  "collection position overwritten in journal");
         goto done;
       }
-      p->all_next = s->entries;
-      s->entries = p;
+      register_entry(s, p);
+      dirty_entry(s, p, old);
       install(s, p);
     } else {
       old = lookup(s, p->key);
-      if (!old || old->token != p->token) {
+      if (!old || old->deleted || old->token != p->token) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL, "journal retirement owner mismatch");
         goto done;
       }
-      retire(s, old);
-      entry_free(p);
+      p->deleted = 1;
+      register_entry(s, p);
+      dirty_entry(s, p, old);
+      install(s, p);
     }
     cursor += bytes;
     ++s->sequence;
-  }
-  if (s->metadata > PS_BANK - 64) {
-    rc = err(error, LC_ERR_PROTOCOL,
-             "recovered metadata exceeds checkpoint capacity");
-    goto done;
   }
   s->journal = cursor;
   /* Clear all of the rejected tail, not only its first record: subsequent
@@ -773,16 +1235,10 @@ static int recover(ps_space *s, lc_error *error) {
                 1, error);
   if (rc != LC_OK)
     goto done;
-  rc = transfer(s, zero, 64, (uint64_t)(1 - s->root) * PS_PAGE, 1, error);
+  rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
+                error);
   if (rc != LC_OK)
     goto done;
-  s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
-  if (!s->free) {
-    rc = err(error, LC_ERR_NOMEM, "cannot allocate free space directory");
-    goto done;
-  }
-  s->free->offset = PS_DATA;
-  s->free->bytes = s->capacity - PS_DATA;
   /* Replay verifies every accepted PUT body, including superseded versions.
    * Reopening must preserve that ownership until a new checkpoint retires the
    * journal; otherwise reuse can make the next replay discard a durable tail.
@@ -917,18 +1373,11 @@ int ps_open(const char *path, int create, const ps_options *options,
     s->token_next = 1;
     s->token_limit = TOKEN_RANGE;
     if (rc == LC_OK)
+      rc = initial_free(s, error);
+    if (rc == LC_OK)
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
-    if (rc == LC_OK) {
-      s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
-      if (!s->free)
-        rc = err(error, LC_ERR_NOMEM, "cannot allocate initial free interval");
-      else {
-        s->free->offset = PS_DATA;
-        s->free->bytes = s->capacity - PS_DATA;
-      }
-    }
   } else
     rc = recover(s, error);
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
@@ -981,8 +1430,7 @@ int ps_begin(ps_space *s, ps_key key, ps_writer **out, lc_error *error) {
              "incarnation grant consumed; close and reopen");
   if (rc == LC_OK) {
     p->token = s->token_next++;
-    p->all_next = s->entries;
-    s->entries = p;
+    register_entry(s, p);
     ++s->writers;
   }
   pthread_mutex_unlock(&s->mutex);
@@ -1003,9 +1451,9 @@ static int flush_writer(ps_writer *w, lc_error *error) {
   if (!w->used)
     return LC_OK;
   while (done < w->used) {
-    if (p->count == (PS_BANK - 64) / 24)
+    if (p->count == (PS_JOURNAL - 64) / 24)
       return err(error, LC_ERR_INVALID,
-                 "value extent metadata exceeds checkpoint capacity");
+                 "value extent metadata exceeds journal capacity");
     pthread_mutex_lock(&s->mutex);
     rc = healthy(s, error);
     if (rc != LC_OK) {
@@ -1025,7 +1473,10 @@ static int flush_writer(ps_writer *w, lc_error *error) {
     extent = &p->extents[p->count];
     take = w->used - done;
     run_bytes = aligned(take);
-    rc = take_run(s, &run_bytes, &extent->offset, error);
+    rc = checkpoint_allowance(s, s->metadata + entry_bytes(p) + 24,
+                              s->live_entries + 1, run_bytes, error);
+    if (rc == LC_OK)
+      rc = take_run(s, &run_bytes, &extent->offset, error);
     if (rc == LC_OK) {
       if (run_bytes < take)
         take = (size_t)run_bytes;
@@ -1090,14 +1541,16 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   if (rc == LC_OK && old && !old->deleted &&
       w->entry->key.kind == PS_COLLECTION)
     rc = err(error, LC_ERR_INVALID, "collection position already published");
-  if (rc == LC_OK &&
-      entry_bytes(w->entry) > PS_BANK - 64 - (s->metadata - prior))
-    rc = err(error, LC_ERR_INVALID,
-             "container checkpoint metadata capacity exhausted");
+  if (rc == LC_OK)
+    rc = checkpoint_allowance(s, s->metadata - prior + entry_bytes(w->entry),
+                              s->live_entries + (old && !old->deleted ? 0 : 1),
+                              0, error);
   if (rc == LC_OK)
     rc = append_event(s, w->entry, PS_PUT, error);
   if (rc == LC_OK) {
     w->entry->publication_sequence = s->sequence;
+    old = lookup(s, w->entry->key); /* rollover may have retired a tombstone */
+    dirty_entry(s, w->entry, old);
     install(s, w->entry);
     w->published = 1;
     sequence = s->sequence;
@@ -1115,7 +1568,6 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   return rc;
 }
 void ps_writer_close(ps_writer *w) {
-  ps_entry **link;
   ps_space *s;
   if (!w)
     return;
@@ -1128,10 +1580,7 @@ void ps_writer_close(ps_writer *w) {
     if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
         release_entry_runs(s, w->entry, NULL) != LC_OK)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-    link = &s->entries;
-    while (*link != w->entry)
-      link = &(*link)->all_next;
-    *link = w->entry->all_next;
+    unregister_entry(w->entry);
     entry_free(w->entry);
   }
   pthread_mutex_unlock(&s->mutex);
@@ -1248,8 +1697,8 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
     tombstone->token = p->token;
     tombstone->deleted = 1;
     tombstone->publication_sequence = s->sequence;
-    tombstone->all_next = s->entries;
-    s->entries = tombstone;
+    register_entry(s, tombstone);
+    dirty_entry(s, tombstone, p);
     install(s, tombstone);
     sequence = s->sequence;
   } else
@@ -1313,7 +1762,10 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   memset(out, 0, sizeof(*out));
   out->capacity = s->capacity;
-  out->metadata_bytes = s->metadata + 64;
+  out->metadata_bytes = s->metadata;
+  out->metadata_pages = s->metadata_pages;
+  out->directory_page_writes = s->directory_page_writes;
+  out->descriptor_page_writes = s->descriptor_page_writes;
   out->journal_bytes = s->journal;
   out->syncs = __atomic_load_n(&s->syncs, __ATOMIC_RELAXED);
   out->checkpoints = s->checkpoints;

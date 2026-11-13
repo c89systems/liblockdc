@@ -460,9 +460,11 @@ int main(int argc, char **argv) {
   lc_error e;
   io_counts before, after;
   files artifacts = {0}, audit = {0};
-  ps_stats stats;
+  ps_stats stats, initial_stats = {0};
   uint64_t fd_before, full_before, ns_before, fd_calls, full_calls, sync_ns;
   long max_sync_batch = -1;
+  long checkpoints = -1, directory_writes = -1, descriptor_writes = -1;
+  long metadata_pages = -1;
   struct rusage usage;
   char prefix[1024], template_path[1100];
   size_t i, count;
@@ -483,7 +485,7 @@ int main(int argc, char **argv) {
           "mode");
   c.container = !strncmp(argv[1], "space-", 6);
   c.collection = strstr(argv[1], "collection") != NULL;
-  c.rows = number(argv[3], 1, 512);
+  c.rows = number(argv[3], 1, PS_DEFAULT_CAPACITY / PS_PAGE);
   c.bytes = number(argv[4], 64, 2 * PS_MIB);
   c.sync = (int)number(argv[5], 0, 1);
   c.writers = number(argv[6], 1, 16);
@@ -528,6 +530,8 @@ int main(int argc, char **argv) {
     require(pthread_create(&c.threads[i], NULL, writer_main, &c.workers[i]) ==
                 0,
             "start writer");
+  if (c.container)
+    check(ps_status(c.space, &initial_stats, &e), &e);
   before = io_sample();
   fd_before = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED);
   full_before = __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED);
@@ -552,6 +556,12 @@ int main(int argc, char **argv) {
   if (c.container) {
     check(ps_status(c.space, &stats, &e), &e);
     max_sync_batch = (long)stats.max_sync_batch;
+    checkpoints = (long)(stats.checkpoints - initial_stats.checkpoints);
+    directory_writes = (long)(stats.directory_page_writes -
+                              initial_stats.directory_page_writes);
+    descriptor_writes = (long)(stats.descriptor_page_writes -
+                               initial_stats.descriptor_page_writes);
+    metadata_pages = (long)stats.metadata_pages;
   }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
   start = now(CLOCK_MONOTONIC);
@@ -587,7 +597,7 @@ int main(int argc, char **argv) {
       "write_calls=%lu read_calls=%lu syscall_written=%lu kernel_written=%lu "
       "files=%lu directories=%lu logical_bytes=%lu allocated_bytes=%lu "
       "peak_RSS_KiB=%ld fdatasync_calls=%lu fsync_calls=%lu sync_ms=%.6f "
-      "max_sync_batch=%ld verified=1\n",
+      "max_sync_batch=%ld ",
       argv[1], (unsigned long)c.rows, (unsigned long)c.bytes,
       (unsigned long)c.rounds, (unsigned long)c.writers, c.sync, seconds * 1000,
       cpu_seconds * 1000, (double)c.bytes * count / 1048576.0 / seconds,
@@ -604,6 +614,9 @@ int main(int argc, char **argv) {
       (unsigned long)artifacts.logical, (unsigned long)artifacts.allocated,
       usage.ru_maxrss, (unsigned long)fd_calls, (unsigned long)full_calls,
       (double)sync_ns / 1e6, max_sync_batch);
+  printf("checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
+         "metadata_pages=%ld verified=1\n",
+         checkpoints, directory_writes, descriptor_writes, metadata_pages);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

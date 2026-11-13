@@ -11,6 +11,16 @@
 #define MINIMUM (LIMIT / 2U)
 #define MAX_LEVEL 15U
 
+uint64_t ps_directory_page_bound(uint64_t entries) {
+  uint64_t pages = 0;
+  uint64_t nodes = entries / MINIMUM + (entries % MINIMUM != 0);
+  while (nodes) {
+    pages += nodes;
+    nodes = nodes == 1 ? 0 : nodes / MINIMUM + (nodes % MINIMUM != 0);
+  }
+  return pages;
+}
+
 typedef struct directory_node directory_node;
 typedef struct directory_item {
   ps_key key;

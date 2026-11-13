@@ -66,8 +66,14 @@ Reserve enough capacity for the next checkpoint's metadata, journal progress,
 and bounded maintenance replacement work before admitting foreground payload
 allocation. Full capacity must not prevent deletion, durable retirement or
 recovery. Publication never exposes backing capacity before growth commits.
-These admission and packed-record rules must be implemented and tested before
-normal Pouch uses the container; the old prototype does not yet implement them.
+The experimental container now uses the growable directory and packed immutable
+descriptor pages. Its roots bind directory offset/generation and the reserved
+incarnation limit; retired metadata pages are released after root retirement.
+It reserves 16 KiB of payload capacity and a conservative full-directory allowance
+before foreground admission. Tests cover 12,000 entries in 10 MiB, incremental
+checkpoint I/O, spanning descriptors, private-build allocation failures and
+torn/missing writes at multi-page checkpoint boundaries. Payload packing,
+metadata repacking and production integration remain to be implemented.
 
 ## Integration and acceptance
 

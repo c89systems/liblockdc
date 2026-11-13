@@ -19,16 +19,21 @@ and writers before closing their space.
 
 The initial capacity defaults to 10 MiB with real Linux `fallocate`. Growth is
 explicit in 1 MiB multiples; fixed-capacity failure is the default. No sparse or
-zero-filling fallback exists. Two 4 KiB root pages, two 64 KiB metadata checkpoint
-banks and a 128 KiB metadata journal occupy 264 KiB. These are explicit prototype
-ceilings: live descriptors must fit one bank; a publication must fit the journal.
-Capacity errors leave the prior publication intact. This is not yet a directory
-layout for arbitrarily many tiny objects.
+zero-filling fallback exists. Two 4 KiB root pages, a protected 128 KiB metadata
+allocation region and a 128 KiB publication journal occupy 264 KiB. The typed
+copy-on-write directory and packed descriptor pages start in that metadata
+region and can allocate further pages from the common pool. The global 64 KiB
+checkpoint ceiling is removed. A single publication descriptor still fits the
+128 KiB journal; extent manifests for larger individual streams remain required
+before large-capacity testing. No 250 MiB or 100 GB test is claimed.
 
-With 16 KiB payload units, the fixed bank also limits total live payload to at
-most roughly 42 MiB, less with many keys or partially filled units. Larger-scale
-experiments require a growable metadata directory; preallocating a larger file
-alone does not remove that ceiling. No 250 MiB or 100 GB test is claimed.
+Foreground admission preserves 16 KiB of payload capacity for maintenance plus
+a conservative allowance for the next complete live metadata directory and its
+packed records. Actual checkpoints copy only changed descriptors and tree paths.
+The allowance uses the directory's minimum occupancy and current logical
+metadata size; it grows with live metadata rather than preallocated capacity.
+Capacity errors preserve prior publications and leave checkpoint/deletion work
+possible. These constants and the experimental format apply to fresh fixtures.
 
 Private payloads flow through a 16 KiB buffer into page-aligned runs. Allocation
 uses 4 KiB physical pages, matching the measurement host's filesystem blocks;
@@ -38,13 +43,16 @@ one page per nonempty payload unit and writes only its actual bytes. Packing
 small values into shared pages remains future work.
 Allocation uses sorted free intervals, split/merged on demand, and metadata
 grows with actual extents and participation, not reserved capacity. Each run
-records its offset, byte length and CRC32. References bind a random container identity and a
-monotonically allocated incarnation; keys bind type, owner and numeric key. Each
-open durably reserves a range of 2^32 incarnation numbers before admission, so a
+records its offset, byte length and CRC32. References bind a random container
+identity and a monotonically allocated incarnation; keys bind type, owner and
+numeric key. Each open durably reserves a range of 2^32 incarnation numbers
+before admission, so a
 returned NoSync reference cannot alias a later value even if its publication is
 lost. Reserving ranges amortizes durability without a per-writer sync or entropy
 syscall. Unused numbers are abandoned on restart; exhaustion fails explicitly.
-A 64-byte grant record is included in checkpoint metadata. Payload reads
+The 80-byte root header checkpoints the incarnation limit alongside capacity,
+sequence, directory offset/generation and container identity, with an independent
+checksum. Further grants use 64-byte journal events. Payload reads
 use a pinned extent vector and a bounded verification buffer, without consulting
 the directory on every chunk. Hash buckets resolve keys. CRC32 detects accidental
 damage and torn writes; this is not authenticated storage.
@@ -72,8 +80,9 @@ or overwrite an uncertain journal suffix. Reopen reconciles the outcome.
 Status counters describe in-memory accounting; reopen to reconcile durable state
 after an I/O error.
 
-Recovery selects the highest valid root, validates its bound metadata bank, then
-replays the contiguous checksummed journal suffix. Journal bodies are verified
+Recovery selects the highest valid root, validates its bound directory and
+packed descriptors, then replays the contiguous checksummed journal suffix.
+Journal bodies are verified
 with bounded buffers, allowing torn or reordered unsynced tails to be discarded.
 Checkpoint bodies are verified when read; open does not scan them or unused
 capacity. A valid newest root with a damaged checkpoint is an error, not grounds
@@ -96,14 +105,24 @@ the old durable publication cannot recover after its runs become writable.
 Private abandoned reservations need no durable ownership record: recovery finds
 only published extents, so their complement is free after its opening barrier.
 
+Descriptors share immutable 4 KiB pages with checksummed identity, location and
+generation headers. A descriptor may span pages; its checked span determines
+ownership. An unused continuation pointer does not retain a page after the
+spanning record is retired. Pages are reclaimed after their last current record
+and old recoverable root are retired. Reader extent vectors retain payload pins
+independently of descriptor-page lifetime. Packing fragmented metadata pages is
+future maintenance work.
+
 Growth reserves backing space first and publishes capacity through that same
 checkpoint protocol. Uncommitted trailing space is ignored on open. Any failed
-structural I/O poisons the handle. Journal exhaustion uses a bounded metadata
-checkpoint; no live payload is copied. Checkpoint/growth serialize publication
-and allocation, but never wait on a producer callback or on readers to finish.
+structural I/O poisons the handle. Allocation failure before root publication
+reclaims private metadata pages and permits retry. Journal exhaustion uses an
+incremental metadata checkpoint; no live payload is copied. Checkpoint/growth
+serialize publication and allocation, but never wait on a producer callback or
+on readers to finish.
 
 The protected metadata region cannot be consumed by payloads. Relocating
-compaction, maintenance payload reserves, transforms, dynamic metadata capacity,
+compaction, metadata repacking, transforms,
 multi-process coordination and full Pouch integration remain future work. The
 foundation implements retirement/reuse without relocation and makes no claim
 that all draft acceptance criteria are already satisfied.

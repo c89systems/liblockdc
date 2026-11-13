@@ -14,9 +14,9 @@ cutover or freeze the policy choices in this draft.
 
 Full native x86_64 implementation is now authorized in verified stages under the
 [implementation contract](pouch-space-implementation.md). This does not
-authorize conversion of existing roots or a production cutover. The growable
-checkpoint directory is being implemented separately before replacing the
-foundation's fixed metadata banks and integrating normal Pouch behavior.
+authorize conversion of existing roots or a production cutover. The foundation
+now checkpoints through the growable typed directory and packed descriptor
+pages. Payload packing and normal Pouch integration remain ahead.
 
 ## Intent
 

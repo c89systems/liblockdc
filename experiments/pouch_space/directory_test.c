@@ -203,6 +203,7 @@ static void verify(ps_directory_io *io, ps_directory_root root,
   }
   OK(ps_directory_visit(d, scan_entry, scan_page, &s, &error));
   CHECK(s.count == count);
+  CHECK(s.pages <= ps_directory_page_bound(count));
   CHECK((s.pages != 0) == (root.offset != 0));
   free(s.seen);
   ps_directory_close(d);
@@ -667,6 +668,25 @@ static void api_boundaries(void) {
   expect(d, 1, 1);
   BAD(ps_directory_visit(d, failed_visit, NULL, NULL, &error));
   BAD(ps_directory_get(d, key(1), &actual, &found, &error));
+  ps_directory_close(d);
+  pager_clear(&p);
+  empty.offset = empty.generation = 0;
+  d = open_directory(&io, empty);
+  for (i = 0; i < 64; ++i)
+    OK(ps_directory_put(d, key(i), value(i, i + 1), &error));
+  root = flush(&p, d, 1, 1);
+  d = open_directory(&io, root);
+  OK(ps_directory_remove(d, key(0), &removed, &error));
+  OK(ps_directory_remove(d, key(63), &removed, &error));
+  root = flush(&p, d, 2, 1);
+  CHECK(used_pages(&p) == 3 && ps_directory_page_bound(62) >= used_pages(&p));
+  CHECK(ps_directory_page_bound(0) == 0 && ps_directory_page_bound(1) == 1);
+  CHECK(ps_directory_page_bound(UINT64_MAX) >= UINT64_MAX / 63);
+  d = open_directory(&io, root);
+  expect(d, 0, 0);
+  expect(d, 1, 2);
+  expect(d, 62, 63);
+  expect(d, 63, 0);
   ps_directory_close(d);
   pager_close(&p);
   puts("directory: empty, finalized, invalid-span and failed-visitor "
