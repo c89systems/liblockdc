@@ -1,9 +1,8 @@
 #ifndef LC_COLLECTION_MIGRATION_H
 #define LC_COLLECTION_MIGRATION_H
 
+#include "lc_collection_head.h"
 #include "lc_pouch.h"
-
-#define LC_COLLECTION_HEAD_BYTES 384U
 
 /* Root-open only, under exclusive root ownership and the manifest lock.
  * Walk catalog bindings, never entry bodies or derived projections. */

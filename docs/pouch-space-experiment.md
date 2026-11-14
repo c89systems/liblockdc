@@ -858,6 +858,110 @@ verification logs use `record-io-scalar-final-*` and
 `record-io-case-selection-tests.log`.
 No Darwin, QEMU, 250 MiB or larger measurements were run.
 
+## Canonical control follow-up
+
+On 2026-11-14 collection heads gain a shared production codec and a container
+control adapter. The 384-byte canonical bytes retain lease fencing, retention,
+snapshot groups and dropped state. Normal Pouch's existing atomic file owner uses
+the same codec; public headers and format markers are unchanged. Container heads
+occupy packed immutable cells with always-durable replacement/deletion and
+completed-prefix reads, even in NoSync roots. Caller-owned metadata authority and
+durable canonical dependencies remain prerequisites. Root/namespace ownership,
+public collection admission and dependency bindings are still pending.
+
+Control values are bounded to 4 KiB. Existing replacements can use one page of
+the protected maintenance allowance, while new controls retain foreground
+limits. Checkpoint keeps the metadata shadow allowance and can reclaim obsolete
+controls after root retirement and pins drain. Tests exhaust foreground capacity,
+force a new head page, reject a new control and repeat replacement/checkpoint
+without growth. No writer queue, background sync timer, sidecar or payload WAL
+is introduced.
+
+Verification on the executable source passed:
+
+- 124 selected Debug jobs and 82 native musl Release jobs, including production
+  Pouch/collection, compression, XA, retention, outbox and Lua behavior.
+- 68 affected GNU Release jobs and all eleven ThreadSanitizer storage groups.
+- Over 11,900 control assertions: fixed wire bytes, every single-bit CRC
+  mutation, checksummed semantic corruption, atomic failed decode, exact/stale
+  references, pinned replacement, replay/delete, a 500-head set, capacity,
+  every creation/replacement/deletion/checkpoint write or barrier failure,
+  volatile/persisted torn writes with crash restoration, and read I/O failure.
+- Held creation/replacement/deletion barriers in both root modes, independent
+  NoSync publication during a held control sync, and four independent control
+  writers sharing two barriers after all four publications reach the journal.
+- Memcheck: zero errors/leaks, all 27,707 control-test allocations freed. Both
+  component comparison engines also pass Memcheck. Formatting and diff checks
+  pass. Allocation failures in the reused physical primitives remain covered by
+  the existing foundation suites.
+
+Five alternating paired samples compare 128 durable head replacements and 1,024
+warm complete-head reloads. The native side calls the actual atomic file head
+owner; the container uses its typed slot in a 10 MiB file. Both use the production
+codec under caller metadata authority. The reload phase bypasses the native
+inode cache on every call; these are complete control reloads, not public reads.
+
+| Component | Container median (range), ms | Atomic file head median (range), ms |
+| --- | ---: | ---: |
+| 128 replacements | 256.31 (195.89–284.24) | 815.73 (742.48–942.49) |
+| Replacement CPU | 9.51 (7.98–11.11) | 25.36 (20.59–26.01) |
+| 1,024 complete reloads | 1.74 (1.70–2.07) | 4.15 (3.53–5.51) |
+
+Every container sample uses 128 write barriers; every file sample uses 256.
+This measures bounded head persistence, not complete root/namespace integration.
+
+A further 150 verified runs repeat the three earlier state/collection profiles
+with five samples, alternating engine order. References include the immediate
+previous stage (`ccb242d`) for both streams and actual multifile Pouch, plus the
+untouched multifile implementation (`02b7fc3`). Row counts, 1 KiB values, writer
+counts, 4 KiB chunks and reopened-empty-store procedure match the previous
+follow-up. Median write times are:
+
+| Profile | Previous stream, ms | Current stream, ms | Untouched Pouch, ms | Current Pouch, ms |
+| --- | ---: | ---: | ---: | ---: |
+| State, small durable, one writer | 575.04 | 562.63 | 977.86 | 1,075.66 |
+| Collection, small durable, one writer | 337.13 | 260.05 | 577.80 | 609.91 |
+| State, fresh NoSync, four writers | 7.49 | 8.73 | 22.50 | 25.07 |
+| Collection, fresh NoSync, four writers | 12.33 | 11.03 | 75.64 | 80.79 |
+| State, reopened NoSync, four writers | 17.58 | 20.51 | 23.37 | 22.40 |
+| Collection, reopened NoSync, four writers | 28.13 | 27.99 | 82.99 | 80.35 |
+
+Every current/previous stream write range overlaps. For example, fresh collection
+is 10.61–14.26 ms versus 9.13–12.97 ms; reopened state is 16.78–26.57 versus
+14.96–24.84 ms. This series demonstrates no new stream speed change. Journal
+usage and grant counts match the prior stage for every profile. Durable/fresh
+kernel write counts match exactly; reopened counts have overlapping ranges.
+Every stream store remains one file, without persistent directories.
+
+Current warm stream versus untouched public Pouch read medians are 2.49/27.68 ms
+for fresh state and 6.93/9.35 ms for fresh collection; reopened results are
+2.81/34.65 and 4.96/10.54 ms. These remain physical cached spans versus public
+operations, without full index/receipt authority, cold reads or concurrent scans.
+The earlier native file-adapter CPU concern is unresolved: fresh/reopened actual
+Pouch collection CPU medians are 111.97/124.88 ms versus untouched
+110.19/105.90 ms, with overlapping sample ranges. This change does not establish
+that the adapter overhead has disappeared.
+
+Raw samples are in `build/pouch-space-integrated/control-paired/`;
+`control-results.json` retains all 160 rows and median/min/max summaries.
+`control-paired.sh` reproduces the local archived-reference series. Exact ELF,
+results and runner checksums are in `control-artifacts.sha256`; current ELF
+archives are `pouch_space_compare-controls-current` and
+`pouch_space_control_compare-current`. Final verification logs use
+`control-final-{debug,musl,release,tsan}-tests.log`,
+`control-final-memcheck.log` and `control-compare-*-memcheck.log`.
+
+The component comparison can be repeated directly after a native Release build:
+
+```sh
+build/x86_64-linux-gnu-release/experiments/pouch_space/pouch_space_control_compare space "$PWD/build/pouch-space-integrated" 128
+build/x86_64-linux-gnu-release/experiments/pouch_space/pouch_space_control_compare file "$PWD/build/pouch-space-integrated" 128
+```
+
+No Darwin, QEMU or 250 MiB-and-larger tests were run. The full implementation goal
+remains active; this stage completes physical control persistence and shared
+encoding. Normal public Pouch roots remain multifile.
+
 ## Reproduce
 
 The current `streams` modes include the production collection codec described in

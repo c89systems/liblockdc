@@ -153,6 +153,34 @@ concurrent publication can bind it after capture. A deterministic test proves
 that commit completion during snapshot allocation cannot change the captured
 prefix or overrun the counted vector.
 
+## Bounded canonical controls
+
+Collection heads now share one production codec between the native file owner
+and the container's typed control adapter. The existing 384-byte representation
+retains segment/snapshot facts, retention, dropped state and lease fencing.
+Decode validates before replacing the caller's value. The adapter stores these
+bytes directly in packed immutable cells; it creates no head file or second log.
+
+The new `PS_CONTROL` kind supports values up to 4 KiB. Publication and deletion
+always wait for the existing caller-led durability coordinator, including NoSync
+roots; reads select its completed prefix. Independent control writers can publish
+while another waits for sync and share subsequent barriers. Metadata authority
+still belongs to the caller. Referenced canonical dependencies must be stabilized
+before publishing a head that can recover independently; encoding numeric IDs
+does not establish those cross-stream bindings.
+
+Existing control replacements may use one 4 KiB page of the protected 16 KiB
+maintenance allowance. New controls retain ordinary foreground admission limits.
+Checkpoint admission preserves metadata shadow capacity without reserving that
+same maintenance payload twice. It reclaims superseded controls after root
+retirement and reader pins drain. Tests prove repeated replacement/checkpoint
+after foreground exhaustion, without growth or shrinking.
+
+This completes control encoding and physical persistence, not collection/root
+ownership. Public lease operations still exercise the native owner. Namespace
+catalogs, dependency ordering, guard lifetime and control cleanup must be joined
+to the container before the public Pouch cutover.
+
 ## Integration and acceptance
 
 The production canonical record I/O boundary is now shared with the container
@@ -183,7 +211,7 @@ checkpoint/reopen and retirement. The comparison uses this real collection
 codec; its state-shaped fixture still has minimal metadata.
 
 This is record integration, not root-wide adoption. Namespace/collection owners,
-ordinary state payload/replay I/O, metadata mutation/copy paths, control heads,
+ordinary state payload/replay I/O, metadata mutation/copy paths, control ownership,
 position/receipt authority, projections and root lifetime still need conversion
 to container ownership. Normal public Pouch tests continue to exercise the
 segmented backend through the shared record I/O boundary.

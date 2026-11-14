@@ -216,10 +216,10 @@ static uint64_t aligned(uint64_t n) {
   return (n + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
 }
 static int valid_key(ps_key k) {
-  return k.kind >= PS_STATE && k.kind <= PS_CATALOG;
+  return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL;
 }
 static int immutable_key(ps_key k) {
-  return k.kind == PS_STATE || k.kind == PS_COLLECTION;
+  return k.kind == PS_STATE || k.kind == PS_COLLECTION || k.kind == PS_CONTROL;
 }
 static size_t bucket(ps_key k) {
   uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^ k.kind;
@@ -769,23 +769,38 @@ static int initial_free(ps_space *s, lc_error *error) {
   s->metadata_free->clean = s->generation == 0;
   return LC_OK;
 }
-static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
-                                uint64_t payload, lc_error *error) {
+static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
+                                      uint64_t entries, uint64_t payload,
+                                      uint64_t floor, lc_error *error) {
   uint64_t pages;
   if (bytes > (uint64_t)INT64_MAX / 2 ||
       entries > (uint64_t)INT64_MAX / PS_PAGE)
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   pages = (bytes + META_PAYLOAD - 1) / META_PAYLOAD;
   pages += ps_directory_page_bound(entries);
-  if (payload > s->free_bytes ||
-      s->free_bytes - payload < PS_MAINTENANCE_RESERVE ||
-      pages > (s->free_bytes + s->metadata_free_bytes - payload -
-               PS_MAINTENANCE_RESERVE) /
-                  PS_PAGE)
+  if (payload > s->free_bytes || s->free_bytes - payload < floor ||
+      pages >
+          (s->free_bytes + s->metadata_free_bytes - payload - floor) / PS_PAGE)
     return err(error, LC_ERR_INVALID,
                "container capacity reserved for checkpoint and maintenance; "
                "checkpoint or grow");
   return LC_OK;
+}
+static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
+                                uint64_t payload, lc_error *error) {
+  return checkpoint_allowance_floor(s, bytes, entries, payload,
+                                    PS_MAINTENANCE_RESERVE, error);
+}
+static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
+                               uint64_t entries, uint64_t payload,
+                               lc_error *error) {
+  uint64_t floor = PS_MAINTENANCE_RESERVE;
+  if (entry->key.kind == PS_CONTROL) {
+    ps_entry *old = lookup(s, entry->key);
+    if (old && !old->deleted)
+      floor -= PS_PAGE;
+  }
+  return checkpoint_allowance_floor(s, bytes, entries, payload, floor, error);
 }
 static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
                            size_t bytes, lc_error *error) {
@@ -798,8 +813,8 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
       p = s->available[bin];
       break;
     }
-  rc = checkpoint_allowance(s, s->metadata + entry_bytes(entry) + 24,
-                            s->live_entries + 1, p ? 0 : PS_PAGE, error);
+  rc = immutable_allowance(s, entry, s->metadata + entry_bytes(entry) + 24,
+                           s->live_entries + 1, p ? 0 : PS_PAGE, error);
   if (rc != LC_OK)
     return rc;
   if (!p) {
@@ -1034,7 +1049,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
                "container checkpoint generation exhausted");
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
-  rc = checkpoint_allowance(s, s->metadata, s->live_entries, 0, error);
+  rc = checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0, 0, error);
   if (rc == LC_OK)
     rc = directory_open(s, &directory, error);
   if (rc == LC_OK && s->dirty) {
@@ -1544,8 +1559,8 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
       old = lookup(s, p->key);
-      if (p->key.kind != PS_STATE && p->key.kind != PS_CATALOG && old &&
-          !old->deleted) {
+      if (p->key.kind != PS_STATE && p->key.kind != PS_CONTROL &&
+          p->key.kind != PS_CATALOG && old && !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
                  "collection position overwritten in journal");
@@ -1871,8 +1886,8 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       run_bytes = take;
       rc = payload_reserve(s, p, extent, take, error);
     } else {
-      rc = checkpoint_allowance(s, s->metadata + entry_bytes(p) + 24,
-                                s->live_entries + 1, run_bytes, error);
+      rc = immutable_allowance(s, p, s->metadata + entry_bytes(p) + 24,
+                               s->live_entries + 1, run_bytes, error);
       if (rc == LC_OK)
         rc = take_run(s, &run_bytes, &extent->offset, error);
     }
@@ -1903,6 +1918,9 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   if (!w || (!bytes && count) || w->failed || w->published)
     return err(error, LC_ERR_INVALID,
                "container writer is invalid, failed or published");
+  if (w->entry->key.kind == PS_CONTROL &&
+      count > PS_PAGE - w->entry->bytes - w->used)
+    return err(error, LC_ERR_INVALID, "container control exceeds one page");
   while (count) {
     n = PS_CHUNK - w->used;
     if (n > count)
@@ -1924,7 +1942,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   size_t prior;
   uint64_t sequence = 0;
   ps_ref published_ref;
-  int rc;
+  int rc, durable;
   if (!w || w->failed || w->published)
     return err(error, LC_ERR_INVALID, "container writer cannot publish");
   rc = flush_writer(w, error);
@@ -1933,6 +1951,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     return rc;
   }
   s = w->space;
+  durable = s->durable || w->entry->key.kind == PS_CONTROL;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   old = lookup(s, w->entry->key);
@@ -1941,9 +1960,9 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
       w->entry->key.kind == PS_COLLECTION)
     rc = err(error, LC_ERR_INVALID, "collection position already published");
   if (rc == LC_OK)
-    rc = checkpoint_allowance(s, s->metadata - prior + entry_bytes(w->entry),
-                              s->live_entries + (old && !old->deleted ? 0 : 1),
-                              0, error);
+    rc = immutable_allowance(
+        s, w->entry, s->metadata - prior + entry_bytes(w->entry),
+        s->live_entries + (old && !old->deleted ? 0 : 1), 0, error);
   if (rc == LC_OK)
     rc = append_event(s, w->entry, PS_PUT, error);
   if (rc == LC_OK) {
@@ -1959,7 +1978,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   } else
     w->failed = 1;
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && s->durable)
+  if (rc == LC_OK && durable)
     rc = wait_durable(s, sequence, error);
   if (rc == LC_OK && ref)
     *ref = published_ref;
@@ -2003,8 +2022,9 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   p = lookup(s, key);
-  visible = s->durable ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
-                       : UINT64_MAX;
+  visible = s->durable || key.kind == PS_CONTROL
+                ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
+                : UINT64_MAX;
   while (p && p->publication_sequence > visible)
     p = p->previous;
   if (rc == LC_OK && (!p || p->deleted))
@@ -2105,7 +2125,7 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
   } else
     entry_free(tombstone);
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && s->durable)
+  if (rc == LC_OK && (s->durable || key.kind == PS_CONTROL))
     rc = wait_durable(s, sequence, error);
   return rc;
 }

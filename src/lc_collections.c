@@ -19,7 +19,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#define LC_CC_HEAD_MAGIC 0x4c434348UL
 #define LC_CC_CLEAN_MAGIC 0x4c43434cUL
 
 static pthread_mutex_t lc_collection_lifecycle_mutex =
@@ -67,15 +66,6 @@ static void lc_cc_put(unsigned char *bytes, lc_u64 value) {
   }
 }
 
-static lc_u64 lc_cc_get(const unsigned char *bytes) {
-  lc_u64 value;
-  unsigned int i;
-  value = 0U;
-  for (i = 8U; i > 0U; --i)
-    value = (value << 8U) | bytes[i - 1U];
-  return value;
-}
-
 static void lc_cc_seal(unsigned char *bytes, size_t length) {
   unsigned long crc;
   crc = (unsigned long)crc32(0L, bytes, (uInt)(length - 4U));
@@ -83,15 +73,6 @@ static void lc_cc_seal(unsigned char *bytes, size_t length) {
   bytes[length - 3U] = (unsigned char)(crc >> 8U);
   bytes[length - 2U] = (unsigned char)(crc >> 16U);
   bytes[length - 1U] = (unsigned char)(crc >> 24U);
-}
-
-static int lc_cc_valid(const unsigned char *bytes, size_t length) {
-  unsigned long stored;
-  stored = (unsigned long)bytes[length - 4U] |
-           ((unsigned long)bytes[length - 3U] << 8U) |
-           ((unsigned long)bytes[length - 2U] << 16U) |
-           ((unsigned long)bytes[length - 1U] << 24U);
-  return stored == (unsigned long)crc32(0L, bytes, (uInt)(length - 4U));
 }
 
 static int lc_cc_read_file(const char *path, unsigned char *bytes,
@@ -455,25 +436,6 @@ void lc_collection_metadata_leave(lc_collection_handle *collection) {
   pthread_mutex_unlock(&collection->metadata_mutex);
 }
 
-static int lc_cc_head_prefix_valid(const unsigned char *bytes, size_t length,
-                                   lc_error *error) {
-  if (!lc_cc_valid(bytes, length) || lc_cc_get(bytes) != LC_CC_HEAD_MAGIC)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection head checksum is invalid");
-  if (lc_cc_get(bytes + 72U) > (lc_u64)LC_I64_MAX)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection retention deadline is invalid");
-  if (lc_cc_get(bytes + 8U) == 0U ||
-      lc_cc_get(bytes + 8U) >= LC_COLLECTION_SNAPSHOT_BIT ||
-      lc_cc_get(bytes + 16U) >= LC_COLLECTION_SNAPSHOT_BIT ||
-      lc_cc_get(bytes + 32U) == 0U ||
-      lc_cc_get(bytes + 32U) > lc_cc_get(bytes + 8U) ||
-      lc_cc_get(bytes + 16U) > lc_cc_get(bytes + 48U))
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection head bounds are invalid");
-  return LC_OK;
-}
-
 int lc_collection_head_write(lc_collection_handle *collection,
                              lc_error *error) {
   unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
@@ -481,26 +443,9 @@ int lc_collection_head_write(lc_collection_handle *collection,
   size_t done;
   ssize_t written;
   int directory, fd, rc, mode = -1;
-  memset(bytes, 0, sizeof(bytes));
-  lc_cc_put(bytes, LC_CC_HEAD_MAGIC);
-  lc_cc_put(bytes + 8U, collection->head.active);
-  lc_cc_put(bytes + 16U, collection->head.snapshot);
-  lc_cc_put(bytes + 24U, collection->head.snapshot_generation);
-  lc_cc_put(bytes + 32U, collection->head.tail_segment);
-  lc_cc_put(bytes + 40U, collection->head.tail_offset);
-  lc_cc_put(bytes + 48U, collection->head.next_snapshot);
-  lc_cc_put(bytes + 56U, collection->head.dropped ? 1U : 0U);
-  lc_cc_put(bytes + 64U, collection->head.published_at);
-  lc_cc_put(bytes + 72U, (lc_u64)collection->head.retention);
-  lc_cc_put(bytes + 80U, collection->head.max_entries);
-  lc_cc_put(bytes + 88U, collection->head.retention_generation);
-  lc_cc_put(bytes + 96U, collection->head.lease.fencing_token);
-  lc_cc_put(bytes + 104U, (lc_u64)collection->head.lease.expires_at_unix);
-  lc_cc_put(bytes + 112U, collection->head.lease.private_read ? 1U : 0U);
-  memcpy(bytes + 120U, collection->head.lease.lease_id, LC_XID_STRING_SIZE);
-  memcpy(bytes + 144U, collection->head.lease.owner, 129U);
-  lc_cc_put(bytes + 280U, collection->head.snapshot_extra_parts);
-  lc_cc_seal(bytes, sizeof(bytes));
+  rc = lc_collection_head_encode(&collection->head, bytes, error);
+  if (rc != LC_OK)
+    return rc;
   /* Metadata authority serializes this bounded atomic replacement. A fixed
    * private temporary leaf can be reclaimed after a crash without allocating
    * paths at every segment boundary. Published head is never overwritten. */
@@ -561,7 +506,6 @@ int lc_collection_head_write(lc_collection_handle *collection,
 int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
   unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
   struct stat identity;
-  size_t i;
   int rc;
   if (stat(collection->head_path, &identity) != 0)
     return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
@@ -580,51 +524,9 @@ int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
                        &collection->head_fd, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_cc_head_prefix_valid(bytes, sizeof(bytes), error);
+  rc = lc_collection_head_decode(bytes, &collection->head, error);
   if (rc != LC_OK)
     return rc;
-  for (i = 273U; i < sizeof(bytes) - 4U; ++i)
-    if ((i < 280U || i >= 288U) && bytes[i] != 0U)
-      return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                   "collection head has unknown fields");
-  collection->head.active = lc_cc_get(bytes + 8U);
-  collection->head.snapshot = lc_cc_get(bytes + 16U);
-  collection->head.snapshot_generation = lc_cc_get(bytes + 24U);
-  collection->head.tail_segment = lc_cc_get(bytes + 32U);
-  collection->head.tail_offset = lc_cc_get(bytes + 40U);
-  collection->head.next_snapshot = lc_cc_get(bytes + 48U);
-  collection->head.snapshot_extra_parts = lc_cc_get(bytes + 280U);
-  if (collection->head.next_snapshot >= LC_COLLECTION_SNAPSHOT_BIT ||
-      (!collection->head.snapshot && collection->head.snapshot_extra_parts) ||
-      collection->head.snapshot_extra_parts >
-          collection->head.next_snapshot - collection->head.snapshot)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection snapshot group is invalid");
-  collection->head.dropped = lc_cc_get(bytes + 56U) != 0U;
-  collection->head.published_at = lc_cc_get(bytes + 64U);
-  collection->head.retention = (lc_pouch_unix_seconds)lc_cc_get(bytes + 72U);
-  collection->head.max_entries = lc_cc_get(bytes + 80U);
-  collection->head.retention_generation = lc_cc_get(bytes + 88U);
-  if (lc_cc_get(bytes + 104U) > (lc_u64)LC_I64_MAX ||
-      lc_cc_get(bytes + 112U) > 1U ||
-      memchr(bytes + 120U, 0, LC_XID_STRING_SIZE) == NULL ||
-      memchr(bytes + 144U, 0, 129U) == NULL)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection ownership metadata is invalid");
-  collection->head.lease.fencing_token = lc_cc_get(bytes + 96U);
-  collection->head.lease.expires_at_unix =
-      (lc_pouch_unix_seconds)lc_cc_get(bytes + 104U);
-  collection->head.lease.private_read = (int)lc_cc_get(bytes + 112U);
-  memcpy(collection->head.lease.lease_id, bytes + 120U, LC_XID_STRING_SIZE);
-  memcpy(collection->head.lease.owner, bytes + 144U, 129U);
-  if ((collection->head.lease.expires_at_unix == 0) !=
-          (collection->head.lease.lease_id[0] == '\0') ||
-      (collection->head.lease.lease_id[0] != '\0' &&
-       (!lc_xid_is_valid(collection->head.lease.lease_id) ||
-        collection->head.lease.fencing_token == 0U ||
-        collection->head.lease.owner[0] == '\0')))
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection ownership binding is invalid");
   collection->head_device = (uint64_t)identity.st_dev;
   collection->head_inode = (uint64_t)identity.st_ino;
   collection->head_loaded = 1;
@@ -660,7 +562,7 @@ int lc_collection_migrate_head(lc_pouch *pouch, const char *directory,
     memset(bytes, 0, sizeof(bytes));
     rc = lc_cc_read_file(path, bytes, 128U, 0, NULL, NULL, error);
     if (rc == LC_OK)
-      rc = lc_cc_head_prefix_valid(bytes, 128U, error);
+      rc = lc_collection_head_prefix_valid(bytes, 128U, error);
     for (i = 96U; rc == LC_OK && i < 124U; ++i)
       if (bytes[i] != 0U)
         rc =

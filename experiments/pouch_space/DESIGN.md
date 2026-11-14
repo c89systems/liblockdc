@@ -342,6 +342,35 @@ still use the real header codec with minimal metadata. Public retry/position
 authority and process-shared ownership remain unimplemented, so neither fixture
 establishes full public semantics or performance parity.
 
+## Bounded canonical control values
+
+`PS_CONTROL` is an immutable, replaceable value of at most 4 KiB. Its publication,
+read visibility and deletion follow the completed durable prefix in both root
+modes. It reuses packed payload cells, checksummed descriptors, journal replay,
+pins and the caller-led readiness coordinator. It adds no writer queue or
+per-payload-record synchronization. Capture its durability policy before releasing
+the allocator mutex; a subsequent replacement/checkpoint can retire the entry.
+
+`control.[ch]` stores collection heads under `(PS_CONTROL, collection owner, 1)`.
+`src/lc_collection_head.[ch]` owns the production 384-byte codec, also called by
+the existing native file head owner. Failed decode leaves output unchanged;
+dropped is data for the owning admission policy. Callers retain metadata
+authority and establish durability of referenced canonical dependencies first.
+This adapter neither allocates public positions nor validates snapshot bindings.
+
+Existing control replacements may consume one page of the 16 KiB maintenance
+allowance across the root. New controls cannot consume it. Both cases retain the
+conservative metadata shadow allowance. Checkpoint can spend that shadow without
+charging the maintenance payload floor again, then releases superseded values
+after root retirement and pins drain. A full-capacity test fills the initial head
+page and foreground space, requires a fresh replacement page, rejects a new
+control and proves repeated checkpoint/replacement and reopen without growth.
+
+The component comparison uses actual native atomic head replacement and the
+container adapter with the same codec and caller authority. Its complete head
+reload phase bypasses the native owner's inode cache. Neither it nor the stream
+fixture establishes integrated public collection ownership or query performance.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, transforms,
 multi-process coordination and full Pouch integration remain future work. The

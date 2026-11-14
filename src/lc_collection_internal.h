@@ -2,6 +2,7 @@
 #define LC_COLLECTION_INTERNAL_H
 
 #include "lc_api_internal.h"
+#include "lc_collection_head.h"
 #include "lc_collection_ids.h"
 #include "lc_collection_maintenance.h"
 #include "lc_collection_migration.h"
@@ -10,25 +11,6 @@
 #include "lc_pouch_internal.h"
 
 #define LC_COLLECTION_CURSOR_BYTES 256U
-#define LC_COLLECTION_SNAPSHOT_BIT ((lc_u64)LC_I64_MAX + 1U)
-
-typedef struct lc_collection_disk_head {
-  lc_u64 active;
-  lc_u64 snapshot;
-  lc_u64 snapshot_generation;
-  /* Latest immutable snapshot group: snapshot .. snapshot + extra_parts. */
-  lc_u64 snapshot_extra_parts;
-  lc_u64 tail_segment;
-  lc_u64 tail_offset;
-  lc_u64 next_snapshot;
-  lc_u64 published_at;
-  lc_pouch_unix_seconds retention;
-  /* Explicit expiry overrides append directives through this generation. */
-  lc_u64 retention_generation;
-  lc_u64 max_entries;
-  lc_collection_lease_info lease;
-  int dropped;
-} lc_collection_disk_head;
 
 /* Unused canonical address ranges, owned exclusively by this handle. Only
  * metadata is retained; no payload or extra descriptor is held by idle ranges.

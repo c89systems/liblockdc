@@ -6,13 +6,27 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c)
+add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
 lc_configure_c_target(pouch_space_experiment)
 
 if(LOCKDC_BUILD_BENCHMARKS)
+  add_executable(pouch_space_control_compare control_compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_control_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_control_compare PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_control_compare PRIVATE
+    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
+  lc_configure_c_target(pouch_space_control_compare)
+  if(LOCKDC_BUILD_TESTS)
+    foreach(mode file space)
+      add_test(NAME pouch_space_control_compare_${mode}
+        COMMAND pouch_space_control_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 16)
+      set_tests_properties(pouch_space_control_compare_${mode} PROPERTIES TIMEOUT 60
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+  endif()
   add_executable(pouch_space_compare compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_compare PRIVATE pouch_space_experiment)
@@ -42,6 +56,13 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_control_test control_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_control_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_control_test PRIVATE pouch_space_experiment)
+  lc_configure_c_test_target(pouch_space_control_test)
+  add_test(NAME pouch_space_controls COMMAND pouch_space_control_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(pouch_space_controls PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_executable(pouch_space_record_test record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_record_test PRIVATE pouch_space_experiment)

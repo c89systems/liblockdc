@@ -23,7 +23,16 @@
 #define PS_MAINTENANCE_RESERVE PS_CHUNK
 #define PS_ROOT_BYTES 80U
 
-enum ps_kind { PS_STATE = 1, PS_COLLECTION = 2, PS_STREAM = 3 };
+enum ps_kind {
+  PS_STATE = 1,
+  PS_COLLECTION = 2,
+  PS_STREAM = 3,
+  /* Canonical control values, at most one page: replaceable like STATE, but
+   * always publish, read and delete at a completed durable prefix, even in
+   * NoSync. Replacements may use 4 KiB of the protected maintenance reserve;
+   * checkpoint releases superseded values before that allowance is reused. */
+  PS_CONTROL = 6
+};
 typedef struct ps_space ps_space;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
