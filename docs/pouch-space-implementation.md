@@ -155,6 +155,39 @@ prefix or overrun the counted vector.
 
 ## Integration and acceptance
 
+The production canonical record I/O boundary is now shared with the container
+experiment. `lc_pouch_record_io` borrows an owner and provides exact vectored
+reads, append, private-range patching, tail observation and discard. Canonical
+prefix/finalization and vectored writes in normal Pouch use this boundary;
+collection writers and decoders accept it directly. Existing segmented owners
+use the native file adapter, retaining descriptor authority/cursor rules and
+their previous cleanup policy. There is no backend-selection flag or public ABI
+change. The canonical wire format is unchanged.
+
+The experimental bridge owns one private stream append, checks patch bounds,
+and admits reads through an already pinned window. Offset reads preserve that
+window across append/retirement without changing the sequential cursor. Recovery
+uses a separate input capability restricted to the canonical recovery callback.
+Finalizing the canonical header does not publish the stream tail or synchronize
+it; the owner must commit through the existing container readiness coordinator.
+Discard clears the private suffix through the stream's existing stabilization
+protocol and poisons storage if cleanup fails.
+
+The same production collection writer now validates JSON, hashes compact bytes,
+encodes transforms, reserves/finalizes real metadata and writes canonical spans
+inside the container. Its decoder and reusable crypto reader consume those
+bytes directly, without a payload spool or another WAL. Tests cover all four
+transform combinations, both durability modes, output before EOF, failed
+producers, every canonical callback failure before/after I/O, pinned windows,
+checkpoint/reopen and retirement. The comparison uses this real collection
+codec; its state-shaped fixture still has minimal metadata.
+
+This is record integration, not root-wide adoption. Namespace/collection owners,
+ordinary state payload/replay I/O, metadata mutation/copy paths, control heads,
+position/receipt authority, projections and root lifetime still need conversion
+to container ownership. Normal public Pouch tests continue to exercise the
+segmented backend through the shared record I/O boundary.
+
 Complete storage integration covers states, objects, attachments, leases,
 collections and permanent positions, retry receipts, catalogs, indexes, codecs,
 queues/outbox and XA authority. Preserve public semantics through the existing

@@ -1,9 +1,13 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "catalog.h"
+#include "lc_api_internal.h"
 #include "lc_collection_json.h"
 #include "lc_pouch.h"
+#include "lc_pouch_collection_record.h"
+#include "lc_pouch_internal.h"
 #include "lc_pouch_record.h"
+#include "record_io.h"
 #include "space.h"
 #include "stream.h"
 #include <dirent.h>
@@ -58,6 +62,7 @@ typedef struct worker {
   ps_stream *stream;
   size_t round, records;
   char *body;
+  char collection_id[LC_XID_STRING_SIZE];
   int rc;
 } worker;
 struct comparison {
@@ -65,6 +70,7 @@ struct comparison {
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   lc_pouch *pouch;
+  lc_pouch *record_owner;
   lc_client *client;
   worker *workers;
   pthread_t *threads;
@@ -169,6 +175,70 @@ static ps_key stream_storage_key(size_t ordinal) {
   key.key = 1;
   return key;
 }
+static const char canonical_leaf[] = "seg-00000000000000000001.log";
+/* Use the production collection decoder, including its full identity,
+ * retention, descriptor and payload-span checks. The derived row offset table
+ * still belongs to this benchmark, not to the public collection projection. */
+static int collection_stream_recover(ps_stream *stream, uint64_t checkpoint,
+                                     uint64_t capacity, uint64_t *accepted,
+                                     worker *w, lc_error *e) {
+  comparison *c = w->run;
+  lc_pouch_record_io io = ps_record_recovery_input(stream);
+  lc_pouch_collection_record record;
+  unsigned char buffer[4096];
+  struct iovec part;
+  uint64_t cursor = 0, payload;
+  unsigned long id, crc;
+  char *end;
+  int rc;
+  w->records = 0;
+  while (capacity - cursor >= LC_POUCH_RECORD_HEADER_BYTES) {
+    rc = lc_pouch_collection_record_read(io, cursor, capacity, canonical_leaf,
+                                         &record, e);
+    if (rc != LC_OK) {
+      if (cursor < checkpoint ||
+          (rc != LC_ERR_PROTOCOL && rc != LC_ERR_PENDING))
+        return rc;
+      lc_error_cleanup(e);
+      lc_error_init(e);
+      break;
+    }
+    require(!strncmp(record.append_id, "key-", 4), "canonical append ID");
+    errno = 0;
+    id = strtoul(record.append_id + 4, &end, 10);
+    require(!errno && !*end && end != record.append_id + 4 && id < c->rows &&
+                id % c->writers == w->ordinal && record.kind == 1 &&
+                record.bytes == c->bytes && record.stored_bytes == c->bytes &&
+                record.position == id / c->writers + 1 &&
+                record.generation == record.position,
+            "canonical collection row identity");
+    require(cursor >= checkpoint || record.next_offset <= checkpoint,
+            "checkpoint canonical collection boundary");
+    if (cursor >= checkpoint) {
+      payload = record.payload_offset;
+      crc = 0;
+      while (payload < record.next_offset) {
+        part.iov_base = buffer;
+        part.iov_len = record.next_offset - payload < sizeof(buffer)
+                           ? (size_t)(record.next_offset - payload)
+                           : sizeof(buffer);
+        rc = lc_pouch_record_io_read(io, payload, &part, 1, e);
+        if (rc != LC_OK)
+          return rc;
+        crc = crc32(crc, buffer, (uInt)part.iov_len);
+        payload += part.iov_len;
+      }
+      if (crc != record.stored_crc)
+        break;
+    }
+    c->offsets[id] = record.payload_offset;
+    c->payload_crcs[id] = (uint32_t)record.stored_crc;
+    cursor = record.next_offset;
+    ++w->records;
+  }
+  *accepted = cursor;
+  return LC_OK;
+}
 /* Rebuild the benchmark's derived latest-row offsets from canonical headers
  * and metadata. Verify payload CRCs beyond the trusted checkpoint boundary.
  * This is a storage experiment, not Pouch catalog/receipt/lease semantics. */
@@ -184,6 +254,9 @@ static int stream_recover(ps_stream *stream, uint64_t checkpoint,
   size_t take;
   char ns[64], name[64];
   int rc = LC_OK;
+  if (c->collection)
+    return collection_stream_recover(stream, checkpoint, capacity, accepted, w,
+                                     e);
   w->records = 0;
   while (capacity - cursor >= sizeof(header)) {
     rc = ps_stream_recovery_read(stream, cursor, header, sizeof(header), e);
@@ -296,6 +369,32 @@ static int stream_sink(lc_sink *sink, const void *bytes, size_t count,
   out->bytes += count;
   return 1;
 }
+static int collection_stream_write(worker *w, size_t id, lc_source *source,
+                                   lc_error *e) {
+  comparison *c = w->run;
+  ps_record_writer output;
+  lc_pouch_collection_record record;
+  char ns[64], name[64];
+  uint64_t position = id / c->writers + 1;
+  int rc = ps_record_begin(w->stream, &output, e);
+  names(w->ordinal, id, ns, name);
+  if (rc == LC_OK)
+    rc = lc_pouch_collection_record_append(
+        c->record_owner, ps_record_output(&output), canonical_leaf,
+        w->collection_id, name, position, position, 0, 0, 0, source, &record,
+        e);
+  if (rc == LC_OK)
+    rc = ps_record_commit(&output, e);
+  if (rc == LC_OK) {
+    require(record.bytes == c->bytes && record.stored_bytes == c->bytes,
+            "canonical collection write bytes");
+    c->offsets[id] = record.payload_offset;
+    c->payload_crcs[id] = (uint32_t)record.stored_crc;
+    ++w->records;
+  }
+  ps_record_abort(&output);
+  return rc;
+}
 static int stream_write_one(worker *w, size_t id, lc_source *source,
                             lc_error *e) {
   comparison *c = w->run;
@@ -306,9 +405,10 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   unsigned char header[32], meta[16], buffer[4096];
   char ns[64], name[64];
   uint64_t start = 0;
-  lc_u64 written;
   size_t n;
   int rc = LC_OK;
+  if (c->collection)
+    return collection_stream_write(w, id, source, e);
   names(w->ordinal, id, ns, name);
   if (!w->stream)
     rc = stream_named_open(w, 1, e);
@@ -335,11 +435,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   out.writer = destination;
   sink.impl = &out;
   sink.write = stream_sink;
-  if (rc == LC_OK && c->collection) {
-    rc = lc_collection_json_copy(source, &sink, NULL, &written, e);
-    if (rc == LC_OK && written != c->bytes)
-      rc = LC_ERR_PROTOCOL;
-  } else if (rc == LC_OK)
+  if (rc == LC_OK)
     while ((n = source->read(source, buffer, sizeof(buffer), e)) != 0) {
       if (!stream_sink(&sink, buffer, n, e)) {
         rc = e->code;
@@ -785,11 +881,19 @@ int main(int argc, char **argv) {
   require(pthread_mutex_init(&c.mutex, NULL) == 0, "benchmark mutex");
   require(pthread_cond_init(&c.condition, NULL) == 0, "benchmark condition");
   lc_error_init(&e);
+  if (c.streams && c.collection) {
+    /* Canonical record codec context only: no second Pouch root or sidecars.
+     * The public namespace/collection owner is still pending integration. */
+    c.record_owner = calloc(1, sizeof(*c.record_owner));
+    require(c.record_owner != NULL, "canonical record owner context");
+  }
   for (i = 0; i < c.writers; ++i) {
     c.workers[i].run = &c;
     c.workers[i].ordinal = i;
     c.workers[i].body = malloc(c.bytes);
     require(c.workers[i].body != NULL, "worker payload fixture");
+    if (c.record_owner)
+      check(lc_xid_new(c.workers[i].collection_id, &e), &e);
   }
   start = now(CLOCK_MONOTONIC);
   open_stores(&c, 1, &e);
@@ -924,6 +1028,7 @@ int main(int argc, char **argv) {
   free(c.payload_crcs);
   free(c.threads);
   free(c.workers);
+  free(c.record_owner);
   pthread_cond_destroy(&c.condition);
   pthread_mutex_destroy(&c.mutex);
   lc_error_cleanup(&e);

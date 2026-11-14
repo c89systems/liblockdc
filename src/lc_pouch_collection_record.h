@@ -2,6 +2,7 @@
 #define LC_POUCH_COLLECTION_RECORD_H
 
 #include "lc_pouch.h"
+#include "lc_pouch_record_io.h"
 
 /* Collection-only canonical kinds: edit bodies use their following receipt;
  * pushed extents/index pages use a final stream publication. Payload bytes use
@@ -58,10 +59,10 @@ typedef struct lc_pouch_collection_record {
 typedef struct lc_pouch_collection_writer lc_pouch_collection_writer;
 void lc_pouch_collection_writer_kind(lc_pouch_collection_writer *writer,
                                      unsigned char kind);
-/* fd == -1 selects hash-only retry verification. Position zero selects an
- * upload context with position assigned at publication. No method owns fd. */
+/* NULL output ops selects hash-only retry verification. Position zero selects
+ * an upload context with position assigned at publication. I/O is borrowed. */
 int lc_pouch_collection_writer_open(
-    lc_pouch *pouch, int fd, const char *container_leaf,
+    lc_pouch *pouch, lc_pouch_record_io output, const char *container_leaf,
     const char *collection_id, const char *append_id, uint64_t position,
     uint64_t generation, lc_pouch_unix_seconds retention,
     int has_collection_retention, lc_pouch_unix_seconds collection_retention,
@@ -85,13 +86,14 @@ int lc_pouch_collection_writer_publish(lc_pouch_collection_writer *writer,
 void lc_pouch_collection_writer_close(lc_pouch_collection_writer *writer);
 /* Attach the final bounded codec chunk to a normal pending contiguous record.
  * The caller retains append authority through publication or rollback. */
-int lc_pouch_collection_writer_attach(lc_pouch_collection_writer *, int,
-                                      const char *, lc_error *);
+int lc_pouch_collection_writer_attach(lc_pouch_collection_writer *,
+                                      lc_pouch_record_io, const char *,
+                                      lc_error *);
 int lc_pouch_collection_writer_publish_stream(
-    lc_pouch_collection_writer *writer, int fd, const char *leaf,
-    uint64_t segment, uint64_t offset, uint64_t extents, uint64_t root_bytes,
-    unsigned int height, uint64_t position, uint64_t generation,
-    lc_pouch_collection_record *out, lc_error *error);
+    lc_pouch_collection_writer *writer, lc_pouch_record_io output,
+    const char *leaf, uint64_t segment, uint64_t offset, uint64_t extents,
+    uint64_t root_bytes, unsigned int height, uint64_t position,
+    uint64_t generation, lc_pouch_collection_record *out, lc_error *error);
 /* Emits compact plaintext into a borrowed sink. NULL hashes retries.
  * Final publication and rollback of its small record require append authority.
  */
@@ -108,7 +110,7 @@ int lc_pouch_collection_writer_storage(lc_pouch_collection_writer *,
                                        const lc_pouch_collection_record *,
                                        lc_error *);
 
-/* Caller owns append authority and a repaired tail. Borrows fd and source.
+/* Caller owns append authority and a repaired tail. Borrows output and source.
  * Validation failure rolls back the unpublished byte range. After published is
  * set, any error can have a committed outcome and must be reconciled. The
  * collection owner performs the shared root's sync/projection publication.
@@ -116,7 +118,7 @@ int lc_pouch_collection_writer_storage(lc_pouch_collection_writer *,
  * after source validation at publication; zero means no expiry; a positive
  * absolute deadline is preserved. */
 int lc_pouch_collection_record_append(
-    lc_pouch *pouch, int fd, const char *container_leaf,
+    lc_pouch *pouch, lc_pouch_record_io output, const char *container_leaf,
     const char *collection_id, const char *append_id, uint64_t position,
     uint64_t generation, lc_pouch_unix_seconds retention,
     int has_collection_retention, lc_pouch_unix_seconds collection_retention,
@@ -136,17 +138,18 @@ int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
                                       uint64_t generation,
                                       lc_pouch_collection_record *out,
                                       lc_error *error);
-/* Reads only bounded key/metadata bytes with pread. file_end comes from the
- * owner's captured segment stat, avoiding an fstat or open per object. Payload
+/* Reads only bounded key/metadata bytes. file_end is the owner's captured
+ * readable bound, avoiding a stat or open per object. Payload
  * integrity is checked by the body reader, not by materializing it here. */
-int lc_pouch_collection_record_read(int fd, uint64_t offset, uint64_t file_end,
+int lc_pouch_collection_record_read(lc_pouch_record_io input, uint64_t offset,
+                                    uint64_t file_end,
                                     const char *container_leaf,
                                     lc_pouch_collection_record *out,
                                     lc_error *error);
 /* Scatter bounded metadata and the caller-owned first body chunk together.
  * Prefix bytes become usable only after all canonical metadata validates. */
-int lc_pouch_collection_record_read_prefix(int, uint64_t, uint64_t,
-                                           const char *,
+int lc_pouch_collection_record_read_prefix(lc_pouch_record_io, uint64_t,
+                                           uint64_t, const char *,
                                            lc_pouch_collection_record *, void *,
                                            size_t, size_t *, lc_error *);
 /* Relocates a validated canonical record into a distinct append-only output

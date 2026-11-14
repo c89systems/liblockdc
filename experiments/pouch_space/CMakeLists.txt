@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c)
+add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -42,6 +42,20 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_record_test record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_record_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_record_test PRIVATE "LINKER:--wrap=writev" "LINKER:--wrap=write")
+  if(LOCKDC_TARGET_LIBC STREQUAL "gnu")
+    target_compile_definitions(pouch_space_record_test PRIVATE RECORD_PREADV64=1)
+    target_link_options(pouch_space_record_test PRIVATE "LINKER:--wrap=preadv64" "LINKER:--wrap=pread64")
+  else()
+    target_link_options(pouch_space_record_test PRIVATE "LINKER:--wrap=preadv" "LINKER:--wrap=pread")
+  endif()
+  lc_configure_c_test_target(pouch_space_record_test)
+  add_test(NAME pouch_space_records COMMAND pouch_space_record_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(pouch_space_records PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_executable(pouch_space_directory_test directory_test.c)
   target_link_libraries(pouch_space_directory_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_directory_test PRIVATE

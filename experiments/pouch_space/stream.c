@@ -30,7 +30,7 @@ struct ps_stream_writer {
 };
 struct ps_stream_reader {
   ps_stream *stream;
-  uint64_t offset, end;
+  uint64_t start, offset, end;
   size_t at, used;
   unsigned char buffer[PS_CHUNK];
 };
@@ -494,6 +494,7 @@ int ps_stream_read_open(ps_stream *s, uint64_t offset, uint64_t bytes,
                       "stream read outside committed prefix");
   if (rc == LC_OK) {
     r->stream = s;
+    r->start = offset;
     r->offset = offset;
     r->end = offset + bytes;
     ++s->readers;
@@ -535,6 +536,14 @@ int ps_stream_read(ps_stream_reader *r, void *bytes, size_t n, size_t *out,
     *out += take;
   }
   return LC_OK;
+}
+int ps_stream_read_at(ps_stream_reader *r, uint64_t offset, void *bytes,
+                      size_t n, lc_error *error) {
+  if (!r || (!bytes && n) || offset < r->start || offset > r->end ||
+      n > r->end - offset)
+    return stream_error(error, LC_ERR_INVALID,
+                        "offset read outside captured stream window");
+  return stream_io(r->stream, offset, bytes, n, 0, error);
 }
 void ps_stream_reader_close(ps_stream_reader *r) {
   if (!r)

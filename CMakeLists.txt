@@ -605,6 +605,7 @@ set(lc_sources
     src/lc_pouch_namespace.c
     src/lc_pouch_path.c
     src/lc_pouch_record.c
+    src/lc_pouch_record_io.c
     src/lc_pouch_state.c
     src/lc_pouch_retention.c
     src/lc_queue_api.c

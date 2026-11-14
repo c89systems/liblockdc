@@ -758,7 +758,8 @@ int lc_collection_record_ref_prefix(lc_collection_handle *collection,
     rc = lc_collection_record_leaf(segment, leaf, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_pouch_collection_record_read_prefix(*fd, offset, *fd_end, leaf, out,
+  rc = lc_pouch_collection_record_read_prefix(lc_pouch_record_file_io(*fd),
+                                              offset, *fd_end, leaf, out,
                                               prefix, capacity, size, error);
   /* A metadata projection may advance after the view was captured. Its
    * backward link is safe, but the shared append file may have grown since
@@ -768,7 +769,8 @@ int lc_collection_record_ref_prefix(lc_collection_handle *collection,
     *fd_end = (lc_u64)st.st_size;
     lc_error_cleanup(error);
     lc_error_init(error);
-    rc = lc_pouch_collection_record_read_prefix(*fd, offset, *fd_end, leaf, out,
+    rc = lc_pouch_collection_record_read_prefix(lc_pouch_record_file_io(*fd),
+                                                offset, *fd_end, leaf, out,
                                                 prefix, capacity, size, error);
   }
   return rc;
@@ -1054,7 +1056,8 @@ int lc_collection_replay_into(lc_collection_handle *collection,
      * headers and truncated published bodies remain explicit corruption. */
     rc = limit - offset < LC_POUCH_RECORD_HEADER_BYTES
              ? LC_ERR_PENDING
-             : lc_pouch_collection_record_read(fd, offset, limit, leaf, &record,
+             : lc_pouch_collection_record_read(lc_pouch_record_file_io(fd),
+                                               offset, limit, leaf, &record,
                                                error);
     if (rc == LC_ERR_PENDING && !snapshot &&
         segment == collection->head.active) {
@@ -2241,8 +2244,8 @@ static int lc_cc_append(lc_collection *self,
     rc = lc_cc_verify_retry(collection, &guarded.pub, &record, error);
   } else if (rc == LC_OK) {
     rc = lc_pouch_collection_writer_open(
-        collection->pouch, collection->active_fd, leaf, collection->id,
-        req->append_id, position, generation,
+        collection->pouch, lc_pouch_record_file_io(collection->active_fd), leaf,
+        collection->id, req->append_id, position, generation,
         req->has_retention_seconds
             ? -(lc_pouch_unix_seconds)req->retention_seconds
             : 0,
@@ -2396,9 +2399,10 @@ int lc_collection_publish_stream(
       }
       if (rc == LC_OK && !found && body->stream_extents)
         rc = lc_pouch_collection_writer_publish_stream(
-            writer, collection->active_fd, leaf, body->stream_segment,
-            body->stream_offset, body->stream_extents, body->stream_root_bytes,
-            body->stream_height, collection->order.upper_position + 1U,
+            writer, lc_pouch_record_file_io(collection->active_fd), leaf,
+            body->stream_segment, body->stream_offset, body->stream_extents,
+            body->stream_root_bytes, body->stream_height,
+            collection->order.upper_position + 1U,
             collection->order.generation + 1U, &current, error);
       else if (rc == LC_OK && !found)
         rc = lc_pouch_collection_writer_publish(

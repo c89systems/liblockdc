@@ -717,8 +717,8 @@ int lc_collection_edit_method(lc_collection *self,
   if (rc == LC_OK && req->replacement) {
     const lc_collection_append_req *r = req->replacement;
     rc = lc_pouch_collection_writer_open(
-        c->pouch, found ? -1 : c->active_fd, found ? NULL : leaf, c->id,
-        r->append_id, 0, 0,
+        c->pouch, lc_pouch_record_file_io(found ? -1 : c->active_fd),
+        found ? NULL : leaf, c->id, r->append_id, 0, 0,
         r->has_retention_seconds ? -(lc_unix_seconds)r->retention_seconds : 0,
         r->has_collection_retention_seconds,
         r->has_collection_retention_seconds
@@ -857,8 +857,9 @@ int lc_collection_edit_method(lc_collection *self,
                                    error);
       if (rc == LC_OK)
         rc = lc_pouch_collection_writer_open(
-            c->pouch, c->active_fd, leaf, c->id, req->operation_id,
-            c->order.edit_count + 1U, generation, 0, 0, 0, &writer, error);
+            c->pouch, lc_pouch_record_file_io(c->active_fd), leaf, c->id,
+            req->operation_id, c->order.edit_count + 1U, generation, 0, 0, 0,
+            &writer, error);
       if (rc == LC_OK)
         lc_pouch_collection_writer_kind(writer, LC_POUCH_COLLECTION_EDIT);
       if (rc == LC_OK)

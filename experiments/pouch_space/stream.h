@@ -62,6 +62,10 @@ void ps_stream_writer_close(ps_stream_writer *);
 int ps_stream_read_open(ps_stream *, uint64_t offset, uint64_t bytes,
                         ps_stream_reader **, lc_error *);
 int ps_stream_read(ps_stream_reader *, void *, size_t, size_t *, lc_error *);
+/* Exact offset reads inside this reader's captured logical window. Does not
+ * change its sequential cursor or buffer; no fresh admission or allocation. */
+int ps_stream_read_at(ps_stream_reader *, uint64_t offset, void *, size_t,
+                      lc_error *);
 void ps_stream_reader_close(ps_stream_reader *);
 
 #endif

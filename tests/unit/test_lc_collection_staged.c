@@ -1433,8 +1433,9 @@ test_stream_units_survive_rolling_snapshots_and_rebuild(void **state) {
           lc_pouch_collection_record record;
           int fd = open(path, O_RDONLY | O_CLOEXEC);
           assert_true(fd >= 0);
-          check(f, lc_pouch_collection_record_read(fd, 0, (lc_u64)st.st_size,
-                                                   leaf, &record, &f->error));
+          check(f, lc_pouch_collection_record_read(lc_pouch_record_file_io(fd),
+                                                   0, (lc_u64)st.st_size, leaf,
+                                                   &record, &f->error));
           assert_int_equal(record.kind, LC_POUCH_COLLECTION_CHUNK);
           assert_int_equal(record.next_offset, (lc_u64)st.st_size);
           assert_int_equal(close(fd), 0);

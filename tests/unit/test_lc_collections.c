@@ -4018,10 +4018,10 @@ static void test_selection_does_not_open_excluded_payloads(void **state) {
   check(f,
         lc_collection_order_find(&handle->order, 2, &row, &found, &f->error));
   assert_true(found);
-  check(f, lc_pouch_collection_record_read(handle->active_fd, row.record_offset,
-                                           handle->order.replay_offset,
-                                           "seg-00000000000000000001.log",
-                                           &record, &f->error));
+  check(f, lc_pouch_collection_record_read(
+               lc_pouch_record_file_io(handle->active_fd), row.record_offset,
+               handle->order.replay_offset, "seg-00000000000000000001.log",
+               &record, &f->error));
   assert_int_equal(
       pwrite(handle->active_fd, "[", 1, (off_t)record.payload_offset), 1);
   opts.has_first_n = 1;

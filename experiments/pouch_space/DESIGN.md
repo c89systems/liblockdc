@@ -8,6 +8,10 @@ Neither implements public leases, JSON validation, codecs, indexes, XA or
 receipts. Comparisons must identify these differences rather than claim feature
 parity. The comparison adapter separately applies the existing collection JSON
 validator before publishing collection-shaped values.
+The canonical stream collection variant now uses the production collection
+record writer and decoder, including SHA-256 and full record metadata; this is
+separate from the immutable-value fixture above. Normal public Pouch still opens
+multifile roots.
 
 One exclusive Linux `flock` protects the container lifetime. Independent threads
 reserve private extents under a short mutex; producer callbacks run outside it.
@@ -294,10 +298,49 @@ publish a binding after capture; stream retirement rechecks these guards.
 Recovered staged streams are therefore discoverable without inventing a second
 authoritative manifest or scanning document bodies.
 
-Public retry authority and process-shared ownership remain unimplemented.
-The stream comparison fixture now creates/reopens real catalog bindings. It uses the
-actual Pouch header codec and canonical finalization rules, but minimal metadata;
-it does not establish full public semantics or feature parity.
+## Production record I/O
+
+`src/lc_pouch_record_io.[ch]` is a borrowed canonical byte boundary: exact
+vectored reads, append, private patching, tail observation and discard. It has no
+pathname, directory, rename, lock or allocation API. The owning namespace or
+collection retains those typed responsibilities. Normal Pouch's canonical
+prefix/finalization and vectored writes use the same implementation; collection
+writers and bounded decoders accept this I/O directly. All existing callers now
+use the new internal signature. Public headers and canonical wire bytes are
+unchanged. The temporary native file adapter retains existing descriptor cursor
+and cleanup semantics; it introduces no permanent backend option.
+
+Single-buffer native operations use `pread`/`write`; multi-part operations retain
+the bounded vector path. Dispatch occurs before entering its vector workspace.
+This keeps the original scalar syscalls and avoids paying for the larger stack
+frame on small metadata reads. Both paths retry EINTR and partial transfers,
+preserve caller vectors and reject invalid ranges before I/O. Zero/error and
+short-transfer tests exercise the actual libc symbols, including glibc's
+64-bit aliases.
+
+`record_io.[ch]` bridges a private append to that production boundary. It records
+the private logical start/tail, permits patches only inside that range, and
+discards the whole append on failure. Canonical finalization writes key/metadata
+before the final non-PENDING header; it neither commits the container tail nor
+adds synchronization. The caller commits through the existing readiness group
+only after its canonical records finish. Failed discard uses the stream's
+existing suffix clearing, synchronization and poisoned-handle behavior.
+
+Input borrows an already admitted stream reader. Exact offset reads stay inside
+its captured logical window, preserve its sequential cursor and require no new
+allocation/admission. They retain the same stream/run pins across later append,
+retirement and checkpoints. A distinct recovery input permits candidate-tail
+reads only during the owner's recovery callback. No body cache, payload spool,
+second WAL or filesystem emulation is introduced.
+
+The comparison creates/reopens real catalog bindings. Collection-shaped streams
+now use production JSON validation, SHA-256, transforms, full canonical metadata
+and span finalization. The benchmark's record-codec context is memory-only; it
+does not open a second Pouch root. Positions/generations are supplied by the
+fixture, not by an integrated public collection owner. State-shaped streams
+still use the real header codec with minimal metadata. Public retry/position
+authority and process-shared ownership remain unimplemented, so neither fixture
+establishes full public semantics or performance parity.
 
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, transforms,

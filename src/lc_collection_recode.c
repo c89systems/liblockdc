@@ -173,9 +173,9 @@ static int cr_alias(lc_pouch_recode *work, lc_pouch_recode_file *file,
   if (rc == LC_OK && (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 0))
     rc = cr_error(e, "failed to inspect collection conversion reference");
   if (rc == LC_OK)
-    rc = lc_pouch_collection_record_read(fd, record->payload_record_offset,
-                                         (lc_u64)st.st_size,
-                                         record->payload_container, &body, e);
+    rc = lc_pouch_collection_record_read(
+        lc_pouch_record_file_io(fd), record->payload_record_offset,
+        (lc_u64)st.st_size, record->payload_container, &body, e);
   if (rc == LC_OK)
     rc = lc_pouch_collection_record_check_body(record, &body, e);
   if (fd >= 0)
@@ -203,7 +203,8 @@ static int cr_scan(lc_pouch_recode *work, lc_pouch_recode_file *file,
   while (rc == LC_OK && at < limit) {
     if (limit - at < LC_POUCH_RECORD_HEADER_BYTES && file->active)
       break;
-    rc = lc_pouch_collection_record_read(fd, at, limit, file->leaf, &record, e);
+    rc = lc_pouch_collection_record_read(lc_pouch_record_file_io(fd), at, limit,
+                                         file->leaf, &record, e);
     if (rc == LC_ERR_PENDING && file->active) {
       lc_error_cleanup(e);
       lc_error_init(e);
@@ -638,8 +639,9 @@ static int cr_convert(cr_output *out, lc_error *e) {
   while (rc == LC_OK && at < limit) {
     if (limit - at < 32U && out->file->active)
       break;
-    rc = lc_pouch_collection_record_read(out->source_fd, at, limit,
-                                         out->file->leaf, &record, e);
+    rc =
+        lc_pouch_collection_record_read(lc_pouch_record_file_io(out->source_fd),
+                                        at, limit, out->file->leaf, &record, e);
     if (rc == LC_ERR_PENDING && out->file->active) {
       lc_error_cleanup(e);
       lc_error_init(e);

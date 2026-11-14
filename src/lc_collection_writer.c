@@ -124,7 +124,9 @@ static int lc_cw_emit(lc_sink *sink, const void *bytes, size_t count,
                                        error);
       if (rc == LC_OK)
         rc = lc_pouch_collection_writer_attach(
-            writer->encoder, writer->collection->active_fd, leaf, error);
+            writer->encoder,
+            lc_pouch_record_file_io(writer->collection->active_fd), leaf,
+            error);
       if (rc != LC_OK)
         return 0;
       writer->direct = 1;

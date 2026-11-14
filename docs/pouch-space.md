@@ -21,7 +21,10 @@ cells. The experimental canonical append-owned stream boundary is implemented
 and fault-tested, including sealing and atomic retirement of complete run sets.
 Typed name catalogs now publish exact-byte names with revision checks, durable
 stream references, pinned views and metadata-only enumeration. Normal Pouch
-integration, maintenance and shared-root coordination remain ahead.
+still opens multifile roots. Its production collection record writer and decoder
+now operate directly on container streams in the experiment through borrowed
+record I/O. Root ownership integration, maintenance and shared-root coordination
+remain ahead.
 
 ## Intent
 

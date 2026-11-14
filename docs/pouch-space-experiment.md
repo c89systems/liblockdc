@@ -725,7 +725,144 @@ Final verification logs are `catalog-final-{debug,release,musl,tsan}-tests.log`
 and `catalog-memcheck.log` in the same parent directory. No Darwin, QEMU,
 250 MiB or larger tests were run.
 
+## Production collection record follow-up
+
+On 2026-11-14 the container experiment starts using the production collection
+record writer and bounded decoder through a shared, borrowed record I/O boundary.
+Normal Pouch uses that same boundary with its existing file owners. Canonical
+prefix/finalization and vectored writes are shared too. Public headers and the
+canonical wire format are unchanged; normal Pouch roots are still multifile.
+
+Collection-shaped stream writes now include real JSON validation, SHA-256,
+collection XID/context, timestamps, metadata reservation, stored CRC/span facts
+and pending-header finalization. The comparison no longer substitutes 16-byte
+metadata for these collection records. Its state-shaped stream fixture still
+does. The benchmark supplies collection positions/generations and a memory-only
+codec context; public collection ownership, receipts, leases and index authority
+are not integrated by this change. No second root, payload spool or document WAL
+is introduced.
+
+The bridge writes through one private append, bounds patches to that append and
+commits separately from canonical header finalization. Reads borrow a pinned
+window and preserve its sequential cursor across exact offset reads. Recovery
+has a separate candidate-tail input capability. The existing stream stabilization
+protocol handles failed/discarded suffixes. Native file operations retain their
+original scalar `pread`/`write` calls for a single buffer and bounded vectors for
+multiple parts; scalar dispatch avoids entering the vector stack workspace.
+
+Verification on the final executable source includes:
+
+- The selected Debug unit gate: 151 registered jobs, including 87 reusable
+  passes from the same final code and 64 passing remaining jobs. All 34
+  experiment tests and existing public Pouch behavior cases are included.
+- All 110 selected native musl Release jobs, including default-stack workers,
+  and 65 affected glibc Release jobs passed. Optimized builds use the project's
+  existing portability case selections.
+- All ten storage groups passed under ThreadSanitizer.
+- Record integration Memcheck: 165,301 observable checks, zero errors, all
+  12,192 heap allocations freed. The updated comparison is also clean, with
+  all 6,934 allocations freed.
+
+The new integration test runs a real producer through the production JSON/hash/
+codec pipeline into container extents before EOF. It covers plain, zlib,
+encrypted and combined transforms in both durability modes; verifies decoded
+bytes, SHA-256 and retention facts; rebinds reusable readers; checks fixed read
+windows after append/retirement; and recovers across checkpoint/reopen. Every
+canonical append/patch/tail callback is failed before and after its operation.
+Those fixtures exceed the private buffer, so finalization/cleanup also touches
+physical grants. Failed producers and valid final-header writes followed by
+reported failure leave the old committed prefix readable. Native transport tests
+exercise scalar/vector short I/O, EINTR, zero/error returns, immutable caller
+vectors and invalid ranges, using the actual glibc/musl syscall symbols.
+
+The final gate exposed cumulative timeouts in the existing compression suite.
+Its original 30-case sequence passes untraced in 149.31 seconds with 2.01 seconds
+of CPU time. Compression scenarios now run one case per invocation of the same
+test executable, retaining the 60-second limit. Configuration readback proves
+that the same 54 Debug cases and 12 optimized cases run exactly once; none are
+dropped. This changes registered job counts, not behavioral coverage. The
+explicit case-selection contract test passes as well.
+
+A final 120-run paired series rotates four engines across five samples:
+preserved `02b7fc3` streams, current streams, untouched multifile Pouch from that
+executable, and current multifile Pouch after the I/O refactor. This controls for
+cost added to the baseline itself. Profiles retain 1 KiB values, 4 KiB producer
+chunks and a genuinely reserved 10 MiB container. Small durable uses one writer
+and 128 rows; state writes two rounds. Long NoSync uses four writers and 2,048
+total operations. The reopened profile opens an empty store again before
+writing; it exercises uncertified free space, not a cold page cache. All 120
+runs verify payloads before/after reopen, recovered counts and one-file backing.
+Median write milliseconds are:
+
+| Workload/profile | Earlier stream | Current stream | Untouched Pouch | Current Pouch |
+| --- | ---: | ---: | ---: | ---: |
+| State, small durable, 1 writer | 551.84 | 653.39 | 1156.01 | 1158.78 |
+| State, long NoSync, 4 writers | 8.01 | 7.49 | 28.12 | 24.81 |
+| State, reopened long NoSync, 4 writers | 23.61 | 18.58 | 27.99 | 26.18 |
+| Collection, small durable, 1 writer | 234.20 | 345.13 | 529.29 | 536.35 |
+| Collection, long NoSync, 4 writers | 6.17 | 11.61 | 69.99 | 79.95 |
+| Collection, reopened long NoSync, 4 writers | 16.98 | 29.08 | 87.91 | 77.83 |
+
+Real collection encoding has a measurable cost. Fresh NoSync spans 9.46–13.81 ms
+versus the earlier minimal fixture's 5.41–7.84 ms. Its median CPU time rises from
+20.42 to 38.19 ms, still below untouched Pouch's 97.72 ms. Timed kernel write
+accounting rises from 2,232,320 to 3,280,896 bytes, versus Pouch 4,800,512. The
+same 20 grants and 2,544 journal bytes cover the fresh workload: records do not
+acquire per-record container journal entries or syncs. Small durable collection
+kernel writes rise from 675,840 to 741,376 bytes versus Pouch 815,104; its 128
+per-record barriers are unchanged. Collection creation/binding remains outside
+timed append on both sides.
+
+State-shaped append ranges overlap before/after in all three profiles, with the
+same bytes/barrier counts except preparation grouping. Small durable spans
+512–729 ms before and 468–754 ms afterward. Reopened state uses four or five
+barriers, including catalog startup. Its lower median than Pouch in this series
+does not overturn earlier mixed results or establish a general reopened-state
+win. Full state metadata/semantics are still missing from this stream fixture.
+
+The file adapter is not proven free of performance cost. All multifile Pouch
+write ranges overlap before/after, but fresh NoSync collection median CPU time
+is 110.87 ms versus untouched Pouch 97.72 ms; reopened is 111.92 versus 103.21 ms.
+A focused 30-run original/vector/scalar check likewise leaves roughly 10–14%
+higher scalar-adapter CPU medians, with overlapping ranges. Scalar dispatch
+preserves the old syscalls and removes the vector stack frame, but does not
+establish elimination of that overhead. Retain the untouched executable as the
+performance reference during root integration; no zero-cost abstraction claim
+or production performance acceptance follows from these measurements.
+
+Current warm verified read medians, **stream / untouched Pouch**, are:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| Small durable, 1 writer | 0.31 / 4.00 | 0.39 / 0.85 |
+| Long NoSync, 4 writers | 2.30 / 27.53 | 4.81 / 10.17 |
+| Reopened long NoSync, 4 writers | 2.25 / 29.63 | 4.69 / 9.88 |
+
+The fresh long collection close/open/first-verified-read cycle is 39.10 ms versus
+untouched Pouch 132.02 ms; reopened is 35.80 versus 123.51 ms. The stream fixture
+still lacks public ownership and index/receipt work. Reads are cached physical
+spans versus Pouch's public operations, not concurrent public scans or cold-cache
+acceptance. Full root ownership, ordinary states/objects/attachments, logical
+position and retry authority, indexes, XA/outbox, maintenance and shared-root
+integration remain required by the active goal.
+
+Raw final logs are in `build/pouch-space-integrated/record-io-scalar-paired/`;
+`record-io-paired.sh` reproduces that series and `record-io-final-results.json`
+retains every row and median/min/max summaries. The first 120-run vector-only
+series is retained in `record-io-paired/` and `record-io-vector-results.json`.
+Focused ablation data is in `record-io-scalar-final-ablation/` and its results
+JSON. Debug proof combines 87 passes from
+`record-io-scalar-final-debug-tests.log` (which also retains the pre-split timeout)
+with 64 passes in `record-io-single-case-debug-tests.log`. Other final passing
+verification logs use `record-io-scalar-final-*` and
+`record-io-case-selection-tests.log`.
+No Darwin, QEMU, 250 MiB or larger measurements were run.
+
 ## Reproduce
+
+The current `streams` modes include the production collection codec described in
+the follow-up above; earlier tables identify the preserved implementation they
+measured.
 
 ```sh
 bash scripts/compare_pouch_space.sh smoke
@@ -764,8 +901,9 @@ The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
-packing, canonical-stream, lifecycle and typed catalog follow-ups. The next
-major task is connecting the existing canonical Pouch owners to this boundary
+packing, canonical-stream, lifecycle, typed catalog and production collection
+record follow-ups. The next major task is connecting the existing namespace
+and collection owners to this boundary
 and proving the actual public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
