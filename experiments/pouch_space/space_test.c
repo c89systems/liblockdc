@@ -1939,7 +1939,7 @@ static int canonical_append(ps_stream *s, const void *bytes, size_t n,
   if (rc == LC_OK)
     rc = ps_stream_write_at(w, 0, header, sizeof(header), e);
   if (rc == LC_OK)
-    rc = ps_stream_commit(w, e);
+    rc = ps_stream_commit(w, NULL, NULL, e);
   ps_stream_writer_close(w);
   return rc;
 }
@@ -3330,7 +3330,7 @@ static void stream_lifecycle_capacity(void) {
   lc_error_cleanup(&error);
   OK(ps_owned_seal(head, &error));
   BAD(ps_owned_recovered(head, 0, &error));
-  BAD(ps_owned_commit(head, 0, &error));
+  BAD(ps_owned_commit(head, 0, NULL, NULL, &error));
   OK(ps_status(space, &before, &error));
   allocation_max = allocation_call = 0;
   measure_allocations = 1;
@@ -3340,7 +3340,7 @@ static void stream_lifecycle_capacity(void) {
   measure_allocations = 0;
   CHECK(allocation_call == 1 && allocation_max == 64);
   BAD(ps_owned_recovered(head, 0, &error));
-  BAD(ps_owned_commit(head, 0, &error));
+  BAD(ps_owned_commit(head, 0, NULL, NULL, &error));
   OK(ps_status(space, &after, &error));
   CHECK(after.journal_bytes == before.journal_bytes + 64 && !after.entries &&
         after.retired_bytes == before.allocated_bytes);

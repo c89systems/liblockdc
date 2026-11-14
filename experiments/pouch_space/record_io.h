@@ -15,7 +15,8 @@ int ps_record_begin(ps_stream *, ps_record_writer *, lc_error *);
 /* Reserve a known private span without emitting or publishing record bytes. */
 int ps_record_reserve(ps_record_writer *, uint64_t bytes, lc_error *);
 lc_pouch_record_io ps_record_output(ps_record_writer *);
-int ps_record_commit(ps_record_writer *, lc_error *);
+int ps_record_commit(ps_record_writer *, ps_commit_publish_fn, void *,
+                     lc_error *);
 void ps_record_abort(ps_record_writer *);
 /* Input borrows one already admitted reader, preserving its captured window.
  * Recovery input is usable only inside the stream's canonical recovery call. */

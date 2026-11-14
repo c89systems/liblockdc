@@ -596,16 +596,43 @@ static void groups(const char *path, int durable) {
   REQUIRE(pthread_cond_destroy(&m.cond) == 0);
   REQUIRE(pthread_mutex_destroy(&m.mutex) == 0);
 }
-static void capacity(const char *path) {
+static int bounded_store(ps_space *s, ps_key k,
+                         const lc_collection_disk_head *h, lc_error *e) {
+  unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
+  ps_writer *w = NULL;
+  int rc = lc_collection_head_encode(h, bytes, e);
+  if (rc == LC_OK)
+    rc = ps_begin(s, k, &w, e);
+  if (rc == LC_OK)
+    rc = ps_write(w, bytes, sizeof(bytes), e);
+  if (rc == LC_OK)
+    rc = ps_publish(w, NULL, e);
+  ps_writer_close(w);
+  return rc;
+}
+static void bounded_load(ps_space *s, ps_key k, lc_collection_disk_head *h,
+                         lc_error *e) {
+  ps_reader *r = NULL;
+  unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
+  size_t got;
+  ok(ps_read_open(s, k, NULL, &r, e), e);
+  REQUIRE(ps_read_size(r) == sizeof(bytes));
+  ok(ps_read(r, bytes, sizeof(bytes), &got, e), e);
+  REQUIRE(got == sizeof(bytes));
+  ps_reader_close(r);
+  ok(lc_collection_head_decode(bytes, h, e), e);
+}
+static void capacity(const char *path, unsigned kind) {
   ps_options options = {PS_MIB, PS_MIB, 0, NULL};
   ps_space *s;
   ps_writer *w = NULL;
   lc_error e;
   lc_collection_disk_head h = sample(), got;
   unsigned char page[PS_PAGE] = {0};
+  ps_key existing = {11, 1, kind}, fresh = {12, 1, kind};
   lc_error_init(&e);
   ok(ps_open(path, 1, &options, &s, &e), &e);
-  ok(ps_collection_head_store(s, 11, &h, NULL, &e), &e);
+  ok(bounded_store(s, existing, &h, &e), &e);
   /* Fill the head's packed page, forcing its replacement to need a new page. */
   ps_key filler = {99, 1, PS_STATE};
   raw_store(s, filler, page, PS_PAGE - LC_COLLECTION_HEAD_BYTES, &e);
@@ -624,28 +651,28 @@ static void capacity(const char *path) {
   REQUIRE(count > 100 && count < 300);
   /* Foreground exhaustion cannot consume the bounded replacement allowance. */
   h.lease.fencing_token++;
-  ok(ps_collection_head_store(s, 11, &h, NULL, &e), &e);
-  REQUIRE(ps_collection_head_store(s, 12, &h, NULL, &e) != LC_OK);
+  ok(bounded_store(s, existing, &h, &e), &e);
+  REQUIRE(bounded_store(s, fresh, &h, &e) != LC_OK);
   clear(&e);
   for (unsigned i = 0; i < 24; ++i) {
     ok(ps_checkpoint(s, &e), &e);
     h.lease.fencing_token++;
-    ok(ps_collection_head_store(s, 11, &h, NULL, &e), &e);
+    ok(bounded_store(s, existing, &h, &e), &e);
   }
-  ok(ps_collection_head_load(s, 11, NULL, &got, &e), &e);
+  bounded_load(s, existing, &got, &e);
   equal_head(&h, &got, &e);
   ok(ps_close(s, &e), &e);
   ok(ps_open(path, 0, &options, &s, &e), &e);
-  ok(ps_collection_head_load(s, 11, NULL, &got, &e), &e);
+  bounded_load(s, existing, &got, &e);
   equal_head(&h, &got, &e);
-  ok(ps_delete(s, key(11), &e), &e);
+  ok(ps_delete(s, existing, &e), &e);
   ok(ps_checkpoint(s, &e), &e);
   filler.key = count - 1;
   ok(ps_delete(s, filler, &e), &e);
   ok(ps_checkpoint(s, &e), &e);
   /* A maximum control is one page, including incremental writes. A rejected
    * oversized write contributes no bytes to the eventual publication. */
-  ok(ps_begin(s, key(12), &w, &e), &e);
+  ok(ps_begin(s, fresh, &w, &e), &e);
   ok(ps_write(w, page, sizeof(page) - 1, &e), &e);
   REQUIRE(ps_write(w, page, 2, &e) == LC_ERR_INVALID);
   clear(&e);
@@ -653,7 +680,7 @@ static void capacity(const char *path) {
   ok(ps_publish(w, NULL, &e), &e);
   ps_writer_close(w);
   ps_reader *reader = NULL;
-  ok(ps_read_open(s, key(12), NULL, &reader, &e), &e);
+  ok(ps_read_open(s, fresh, NULL, &reader, &e), &e);
   REQUIRE(ps_read_size(reader) == sizeof(page));
   ps_reader_close(reader);
   ok(ps_close(s, &e), &e);
@@ -688,7 +715,8 @@ static void *run(void *v) {
   lifecycle(path, 0);
   lifecycle(path, 1);
   faults(path);
-  capacity(path);
+  capacity(path, PS_CONTROL);
+  capacity(path, PS_ROUTING);
   read_fault(path);
   groups(path, 0);
   groups(path, 1);

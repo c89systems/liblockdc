@@ -25,12 +25,14 @@ int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
  * namespaces and captured readers progress independently. target==0 disables
  * automatic rotation; otherwise rotate before the next append when the active
  * committed tail has reached target. Reserve minimum bytes (or one byte when
- * zero) before selecting a successor head. A failed reservation leaves the old
- * head selected and may retain reusable empty successor grants. No lock spans
- * the producer callback. */
+ * zero) in a private successor. Commit selects its head only after canonical
+ * bytes are complete; abort leaves the predecessor selected. No lock spans the
+ * producer callback. Routing follows root durability; a predecessor seal waits
+ * for durable routing before the next mutation proceeds. */
 int ps_namespace_append_begin(ps_namespace *, uint64_t target, uint64_t minimum,
                               ps_namespace_append **, lc_error *);
 lc_pouch_record_io ps_namespace_append_output(ps_namespace_append *);
+/* Label remains stable after append close while a namespace pin is held. */
 const char *ps_namespace_append_leaf(const ps_namespace_append *);
 uint64_t ps_namespace_append_segment(const ps_namespace_append *);
 /* Caller has finalized complete canonical records and retains logical mutation

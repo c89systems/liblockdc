@@ -42,7 +42,8 @@ int ps_owned_clear(ps_owned_run *, uint64_t offset, uint64_t bytes,
 /* Complete canonical bytes precede this call. Head tail checkpoints are
  * structural hints, not a second per-record commit journal. Durable success
  * waits for the shared root readiness prefix, independently of journal seq. */
-int ps_owned_commit(ps_owned_head *, uint64_t tail, lc_error *);
+int ps_owned_commit(ps_owned_head *, uint64_t tail, ps_commit_publish_fn,
+                    void *, lc_error *);
 int ps_owned_barrier(ps_owned_head *, lc_error *);
 /* Canonical recovery has validated [checkpoint tail, tail) and cleared the
  * rejected suffix. Stabilize it before accepting the recovered tail hint. */

@@ -1802,6 +1802,153 @@ The manifest checks all 184 artifacts, including both preserved executables.
 The paired runner reproduces the complete series with Bash. Normal public
 `lc_pouch_open` still uses multifile roots; the complete backend goal stays active.
 
+## Private first records and root-durable routing
+
+Automatic append now prepares/reserves its successor, completes the first
+canonical record, then publishes the namespace head before exposing that stream's
+tail. A failed producer or healthy publication failure leaves the predecessor
+selected. An owned-commit callback performs logical publication outside allocator
+and commit mutexes; ordinary within-segment commits retain their existing path.
+The production logical manifest also stays private until physical success.
+Interned segment labels survive array growth, append close and projection
+invalidation while the namespace capability is retained.
+
+Making that late head always durable would force the whole first value to disk
+at EOF even for NoSync. The bounded `PS_ROUTING` kind instead follows root
+durability while retaining CONTROL's one-page replacement allowance. Durable
+head publication covers the completed first record in the same barrier.
+NoSync publication need not do so. Before predecessor sealing, `ps_flush`
+stabilizes the ready routing prefix; the durable seal cannot recover ahead of
+its replacement head. Seal cleanup runs before the next mutation, without
+fallible work after successful append publication. Explicit empty rotation
+remains durable under both policies. Ownership grants, catalogs, root policy
+and retention markers retain their existing durability protocols.
+
+A peer checkpoint can flush complete private successor bytes while retaining
+their checkpoint tail of zero. Recovery discards those bytes when the containing
+head was never selected or its NoSync selection was lost. A published checkpoint
+tail in an unselected successor is rejected. The namespace head payload remains
+128 bytes, but its prototype typed key changes directly from CONTROL to ROUTING.
+No legacy parser, migration, format-version increment or public ABI change.
+
+### Verification
+
+The full Debug preset passed 272 checks under ASan/UBSan, including all 81
+container checks. GNU and native musl release each passed 99 affected checks:
+81 container checks plus 18 existing Pouch groups. All 24 affected integration,
+namespace, root and canonical-record groups passed ThreadSanitizer. Musl uses
+its default worker stacks; no Darwin, QEMU or large-machine runs were added.
+
+The namespace matrix covers every observed allocation/I/O failure point in
+first-record automatic publication under both sync policies, including missing
+writes and torn synchronization models. The held-publication test lets another
+namespace append and checkpoint while complete first-record bytes remain private,
+then proves recovery and retry with either successful or failed head publication.
+It also rejects an authoritative tail in an unselected successor. Generic routing
+tests prove replacement/deletion rollback, explicit flush, pinned prior values
+and already-covered flushes. Capacity tests prove both bounded metadata kinds
+can replace at foreground exhaustion and reject oversized writes.
+
+A reserved first-record commit adds zero syncs under NoSync and one under durable
+sync. Eight Memcheck groups passed with 948,597 allocations/frees and no remaining
+blocks, errors or suppressions. They cover namespace publication, reservation and
+faults; PUT allocation/I/O faults; mutation allocation/I/O faults; and controls.
+Final evidence is `publication-verified-{debug,gnu,musl,tsan}-*` and
+`publication-*-memcheck.log` under `build/pouch-space-integrated/`.
+
+### Matched current, prior and multifile measurements
+
+The primary series has 210 serial GNU release runs: five alternating-order
+samples per operation/profile/engine. Current container and multifile call the
+production APIs from the same executable; prior container uses the preserved
+`59a5218` executable. Original profiles retain 1 KiB bodies, 32-byte application
+metadata for metadata updates, 4 KiB source chunks and fixed 10 MiB containers.
+Two additional PUT profiles use two keys with 1 MiB values and one/two writers.
+Each writer owns a distinct namespace. PUT and metadata have two rounds; delete
+one. Metadata/delete seeding is outside mutation timing. Transforms, indexing,
+background maintenance and positive expiry are disabled. OS page cache remains.
+All runs verify after mutation and populated-root reopen; all 140 container
+runs audit one file and no sidecars.
+
+Median mutation milliseconds:
+
+| Operation / workload | Current container | Prior container | Current multifile |
+| --- | ---: | ---: | ---: |
+| PUT, durable, 128 keys, 1 writer | 798.01 | 812.31 | 1253.99 |
+| PUT, fresh NoSync, 1,024 keys, 4 writers | 19.72 | 30.10 | 28.85 |
+| PUT, empty-root reopen, NoSync, 4 writers | 52.24 | 57.73 | 25.88 |
+| PUT, NoSync, 1,024 keys, 1 writer | 88.43 | 99.62 | 73.62 |
+| Metadata, durable, 128 keys, 1 writer | 431.97 | 437.54 | 1162.52 |
+| Metadata, hot seeded NoSync, 4 writers | 27.57 | 29.69 | 24.15 |
+| Metadata, populated-root reopen, NoSync, 4 writers | 33.01 | 33.27 | 41.04 |
+| Metadata, seeded NoSync, 1,024 keys, 1 writer | 94.20 | 98.29 | 85.14 |
+| Delete, durable, 128 keys, 1 writer | 174.46 | 175.99 | 536.50 |
+| Delete, hot seeded NoSync, 4 writers | 5.28 | 3.36 | 3.40 |
+| Delete, populated-root reopen, NoSync, 4 writers | 12.28 | 14.05 | 24.27 |
+| Delete, seeded NoSync, 1,024 keys, 1 writer | 5.54 | 5.73 | 6.63 |
+| PUT, NoSync, 2 keys, 1 MiB values, 1 writer | 62.37 | 72.66 | 42.81 |
+| PUT, NoSync, 2 keys, 1 MiB values, 2 writers | 38.84 | 61.26 | 28.14 |
+
+Fresh four-writer PUT improves from 30.10 to
+19.72 ms, versus
+28.85 ms for multifile. Its five-sample ranges
+are 15.88–31.41 / 23.88–37.31 / 22.28–33.16 ms
+(current/prior/multifile), so timing attribution remains limited. Sync calls
+fall from six to four; kernel-accounted writes fall by 28 KiB. One-writer
+1 KiB PUT uses 11 rather than 12 syncs and writes 8 KiB less; 1 MiB-value PUT
+uses nine rather than 12 syncs and writes 28 KiB less. Two-writer large-value
+PUT uses six rather than 11 syncs. These are measured structural reductions,
+not a complete explanation of every elapsed-time difference.
+
+Durable mutation medians remain faster than multifile. NoSync is not accepted
+as solved: empty-root reopened PUT, one-writer PUT/metadata, large-value PUT and
+hot metadata/delete still trail multifile in the primary series.
+
+Hot delete's higher primary median prompted a separate 60-run diagnostic:
+ten alternating-order samples for seeded NoSync metadata/delete with four
+writers and unchanged executables/inputs. Delete medians were
+9.87 / 10.27 / 9.20 ms;
+metadata 43.16 / 37.29 /
+35.19 ms (current/prior/multifile). Absolute timings
+shifted across all engines; delete did not reproduce a consistent current/prior
+penalty and metadata stayed mixed. This diagnostic is retained separately in
+the JSON and does not replace the primary samples or establish causal attribution.
+
+For fresh four-writer PUT, current/multifile live verification takes
+4.16 /
+32.50 ms. Reopen plus verification
+alone takes 57.25 /
+37.59 ms; including preceding close,
+per-sample sum medians are 57.53 /
+103.82 ms. Hot metadata live
+verification takes 4.95 /
+30.44 ms, with close/reopen/verification
+sum medians 53.25 /
+84.66 ms. These are point-read
+verification passes; public scan performance remains unmeasured.
+
+Preopened PUT reopens an empty root; metadata/delete reopen a populated seed.
+Including the preopen close/open, current/multifile mutation sum medians are
+58.40 /
+26.26 ms for PUT,
+52.84 /
+88.51 ms for metadata
+and 22.76 /
+79.20 ms for delete.
+Lazy replay and multifile close work remain visible in that comparison.
+Metadata/delete `MiB_s` remains a reference-body-size statistic, not actual
+mutation byte throughput.
+
+Artifacts under `build/pouch-space-integrated/` are
+`publication-paired/`, `publication-paired.sh`,
+`publication-hot-mutations/`, `publication-hot-mutations.sh`,
+`publication-results.json`, `pouch_space_compare-publication-current` and
+`publication-artifacts.sha256`. The manifest covers 275 artifacts: both frozen
+executables, both Bash runners, the JSON and all 270 logs. The preceding admission
+manifest is checked without replacing either preserved executable.
+Whole-operation maintenance admission, reclamation, remaining public semantics
+and shared-root coordination remain in the active full-backend goal.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1813,7 +1960,7 @@ and ordinary state record follow-ups. Namespace segments now have a real
 container owner. Ordinary production state PUT/projection/point-read, metadata
 update and deletion now join it through the private integration harness. The
 next work must close whole-operation maintenance admission at capacity, address
-the measured cutover cost, and connect the remaining advanced mutation/scan paths
+remaining NoSync and cold-reopen costs, and connect advanced mutation/scan paths
 and public collection ownership, then
 complete the public behavior suites. Full native integration still
 requires checkpoint scheduling,

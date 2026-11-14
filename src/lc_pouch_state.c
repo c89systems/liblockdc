@@ -374,6 +374,11 @@ static int lc_pouch_state_storage_append_open(lc_pouch *,
                                               lc_pouch_namespace_manifest *,
                                               lc_pouch_storage_append *,
                                               uint64_t *, lc_error *);
+static void lc_pouch_state_storage_append_publish(lc_pouch *,
+                                                  lc_pouch_namespace_logstore *,
+                                                  lc_pouch_namespace_manifest *,
+                                                  lc_pouch_storage_append *,
+                                                  uint64_t);
 static int
 lc_pouch_state_cache_lookup(lc_pouch *pouch, const char *ns,
                             const lc_pouch_namespace_manifest *manifest,
@@ -6916,6 +6921,9 @@ binary_append_ready:
       if (rc == LC_OK)
         rc = pouch->storage.ops->append_commit(pouch->storage.context,
                                                &storage_append, error);
+      if (rc == LC_OK)
+        lc_pouch_state_storage_append_publish(pouch, cache, manifest,
+                                              &storage_append, appended_end);
     } else
       rc = lc_pouch_state_defer_fsync(pouch, fd, error);
   }
@@ -13112,15 +13120,31 @@ static int lc_pouch_state_storage_append_open(
     }
   }
   lc_pouch_namespace_manifest_cleanup(&pouch->allocator, manifest);
-  if (leaf != NULL) {
+  memset(manifest, 0, sizeof(*manifest));
+  /* The owner keeps labels stable while its namespace capability is held.
+   * Reserve a logical cache copy before publication, without changing the
+   * committed projection while this private append is producing bytes. */
+  manifest->active_segment = leaf ? leaf : (char *)append->leaf;
+  manifest->borrowed = leaf == NULL;
+  manifest->active_segment_id = manifest->max_segment_id = append->segment;
+  manifest->segment_count = (unsigned long)append->segment;
+  manifest->state_max_version = cache->max_version;
+  *start = append->start;
+  return LC_OK;
+}
+static void lc_pouch_state_storage_append_publish(
+    lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
+    lc_pouch_namespace_manifest *manifest, lc_pouch_storage_append *append,
+    uint64_t tail) {
+  if (!manifest->borrowed) {
     lc_free_with_allocator(&pouch->allocator, cache->active_segment_leaf);
-    cache->active_segment_leaf = leaf;
+    cache->active_segment_leaf = manifest->active_segment;
+    manifest->active_segment = (char *)append->leaf;
+    manifest->borrowed = 1;
   }
   cache->active_segment_id = cache->max_segment_id = append->segment;
   cache->segment_count = (unsigned long)append->segment;
-  cache->active_segment_offset = append->start;
-  *start = append->start;
-  return lc_pouch_state_cache_manifest_borrow(pouch, cache, manifest, error);
+  cache->active_segment_offset = tail;
 }
 
 static int lc_pouch_state_write_resolved_locked(
@@ -13879,6 +13903,9 @@ append_finish:
       if (rc == LC_OK)
         rc = projection_rc;
     }
+    if (rc == LC_OK)
+      lc_pouch_state_storage_append_publish(pouch, cache, &manifest,
+                                            &storage_append, payload_offset);
   }
   if (rc == LC_OK && options != NULL && options->query_index_operation_active &&
       !options->object_record) {

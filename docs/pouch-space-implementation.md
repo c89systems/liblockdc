@@ -177,6 +177,13 @@ same maintenance payload twice. It reclaims superseded controls after root
 retirement and reader pins drain. Tests prove repeated replacement/checkpoint
 after foreground exhaustion, without growth or shrinking.
 
+`PS_ROUTING` has the same one-page bound and replacement allowance, but its
+publication, reads and deletion follow root durability. It holds logical routing
+decisions that may roll back with NoSync canonical data. Allocation/ownership
+authority remains in always-durable controls, catalogs and grants. `ps_flush`
+completes the ready publication prefix through the existing sync coordinator,
+without a checkpoint or another sync for an already covered prefix.
+
 This completes control encoding and physical persistence, not public collection
 ownership. Public lease operations still exercise the native owner. Namespace
 data manifests, dependency ordering, guard lifetime and control cleanup must be
@@ -186,23 +193,31 @@ joined to the container before the public Pouch cutover.
 
 `ps_namespace` now caches its canonical segment owner under the real root.
 The namespace has no segment/head until its first append or explicit rotation.
-A 128-byte `PS_CONTROL` head identifies the namespace owner, active segment,
+A 128-byte `PS_ROUTING` head identifies the namespace owner, active segment,
 rotation epoch and canonical record width, with checked reserved bytes and CRC.
 Typed segment catalog entries hold the growing segment set and exact stream
 incarnations. Numeric segment labels remain canonical metadata, never files.
 No growing manifest value or per-record head publication is introduced.
 
 Rotation prepares an empty successor and commits its catalog binding. Automatic
-append rotation reserves its known private span before durably publishing head
-cutover and sealing the predecessor. Metadata/delete reserve the complete
+append rotation reserves its known private span, finishes its canonical bytes,
+then publishes head cutover before making the new stream tail visible.
+The head follows root durability: durable publication covers the canonical
+bytes in the same barrier; NoSync does not force a whole large value to disk.
+Predecessor sealing is deferred until the next mutation, which first flushes
+the routing decision. No fallible seal follows successful append publication.
+Metadata/delete reserve the complete
 canonical batch; a streaming PUT reserves its known header/key prefix, not the
 unknown body. Zero minimum reserves one byte of logical capacity. Explicit
-empty structural rotation has no append span to reserve. A caller-supplied
+empty structural rotation has no append span to reserve and remains durable
+under either root policy. A caller-supplied
 expected active segment fences retries: an already selected successor succeeds
 without another rotation, including after reopen. Recovery recognizes a staged
 empty successor and a cutover whose predecessor still needs sealing. It completes
-that seal before admitting another producer. A nonempty unpublished successor,
-missing segment, wrong binding or sealed active segment is a protocol error.
+that seal before admitting another producer. A staged successor with checkpoint
+tail zero is discarded even if complete private canonical bytes survived a peer
+checkpoint. A published tail in an unselected successor, missing segment, wrong
+binding or sealed active segment is a protocol error.
 Uncertain physical I/O retains the container's poison/reopen rule.
 
 `ps_stream_reserve` and its canonical record adapter acquire existing bounded
@@ -211,6 +226,12 @@ allocation/preparation failure fails that writer, which must be closed. It may
 retain reusable zero grants in a staged empty successor. Capacity failure during
 reservation preserves the predecessor; retry after growth reuses the staged
 owner. This is span reservation, not an atomic budget for the whole operation.
+
+Logical append manifests remain private until physical publication succeeds.
+Their segment labels remain stable while the namespace capability is held,
+including across segment-array growth and projection invalidation. This direct
+prototype cutover changes the namespace head's typed key from CONTROL to ROUTING;
+its 128-byte payload is unchanged. There is no legacy reader or migration.
 
 One producer/rotation owns a namespace at a time; contention is explicit. Producer
 callbacks hold neither registry nor namespace mutexes. Other namespaces and

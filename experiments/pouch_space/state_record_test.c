@@ -337,7 +337,7 @@ static void lifecycle(const char *path, const char *key) {
         metadata(&r, &q, sizes[n]);
         REQUIRE(s.at == sizes[n]);
         ends[disable * 3 + n] = writer.tail;
-        ok(ps_record_commit(&writer, &e), &e);
+        ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
         ps_record_abort(&writer);
         lc_pouch_state_entry_cleanup(&allocator, &r);
         if (disable == 0 && n == 2 && mode % 2)
@@ -606,7 +606,7 @@ static void *parallel_writer(void *p) {
     ok(lc_pouch_state_record_append(&allocator, job->crypto, io, leaf, &q,
                                     &s.pub, (int)(job->ordinal % 2), &r, &e),
        &e);
-    ok(ps_record_commit(&writer, &e), &e);
+    ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
     metadata(&r, &q, body_bytes);
     ps_stream_reader *reader = NULL;
     ok(ps_stream_read_open(stream, 0,

@@ -216,10 +216,12 @@ static uint64_t aligned(uint64_t n) {
   return (n + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
 }
 static int valid_key(ps_key k) {
-  return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL;
+  return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL ||
+         k.kind == PS_ROUTING;
 }
 static int immutable_key(ps_key k) {
-  return k.kind == PS_STATE || k.kind == PS_COLLECTION || k.kind == PS_CONTROL;
+  return k.kind == PS_STATE || k.kind == PS_COLLECTION ||
+         k.kind == PS_CONTROL || k.kind == PS_ROUTING;
 }
 static size_t bucket(ps_key k) {
   uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^ k.kind;
@@ -795,7 +797,7 @@ static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
                                uint64_t entries, uint64_t payload,
                                lc_error *error) {
   uint64_t floor = PS_MAINTENANCE_RESERVE;
-  if (entry->key.kind == PS_CONTROL) {
+  if (entry->key.kind == PS_CONTROL || entry->key.kind == PS_ROUTING) {
     ps_entry *old = lookup(s, entry->key);
     if (old && !old->deleted)
       floor -= PS_PAGE;
@@ -1560,7 +1562,8 @@ static int recover(ps_space *s, lc_error *error) {
       }
       old = lookup(s, p->key);
       if (p->key.kind != PS_STATE && p->key.kind != PS_CONTROL &&
-          p->key.kind != PS_CATALOG && old && !old->deleted) {
+          p->key.kind != PS_ROUTING && p->key.kind != PS_CATALOG && old &&
+          !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
                  "collection position overwritten in journal");
@@ -1918,9 +1921,10 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   if (!w || (!bytes && count) || w->failed || w->published)
     return err(error, LC_ERR_INVALID,
                "container writer is invalid, failed or published");
-  if (w->entry->key.kind == PS_CONTROL &&
+  if ((w->entry->key.kind == PS_CONTROL || w->entry->key.kind == PS_ROUTING) &&
       count > PS_PAGE - w->entry->bytes - w->used)
-    return err(error, LC_ERR_INVALID, "container control exceeds one page");
+    return err(error, LC_ERR_INVALID,
+               "container bounded metadata exceeds one page");
   while (count) {
     n = PS_CHUNK - w->used;
     if (n > count)
@@ -2128,6 +2132,17 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
   if (rc == LC_OK && (s->durable || key.kind == PS_CONTROL))
     rc = wait_durable(s, sequence, error);
   return rc;
+}
+int ps_flush(ps_space *s, lc_error *error) {
+  int rc;
+  uint64_t sequence;
+  if (!s)
+    return err(error, LC_ERR_INVALID, "flush requires container");
+  rc = healthy(s, error);
+  if (rc != LC_OK)
+    return rc;
+  sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+  return wait_durable(s, sequence, error);
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
   int rc;
@@ -2606,7 +2621,16 @@ int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
       run->space, run->entry->extents[0].offset + PS_RUN_HEADER + offset, bytes,
       scratch, error);
 }
-int ps_owned_commit(ps_owned_head *head, uint64_t tail, lc_error *error) {
+static void owned_publish_tail(ps_space *s, ps_owned_head *head, uint64_t tail,
+                               uint64_t sequence) {
+  head->entry->bytes = tail;
+  if (!head->entry->dirty_link)
+    dirty_entry(s, head->entry, NULL);
+  head->entry->stream_ready = sequence;
+}
+int ps_owned_commit(ps_owned_head *head, uint64_t tail,
+                    ps_commit_publish_fn publish, void *context,
+                    lc_error *error) {
   ps_space *s;
   uint64_t sequence = 0;
   int rc;
@@ -2625,14 +2649,26 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail, lc_error *error) {
     rc = err(error, LC_ERR_TRANSPORT, "owned readiness exhausted; reopen");
   }
   if (rc == LC_OK) {
-    head->entry->bytes = tail;
-    if (!head->entry->dirty_link)
-      dirty_entry(s, head->entry, NULL);
     sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
-    head->entry->stream_ready = sequence;
+    if (!publish)
+      owned_publish_tail(s, head, tail, sequence);
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && s->durable)
+  if (rc == LC_OK && publish) {
+    rc = publish(context, tail, error);
+    pthread_mutex_lock(&s->mutex);
+    if (rc == LC_OK)
+      rc = healthy(s, error);
+    if (rc == LC_OK && s->durable &&
+        __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) < sequence) {
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+      rc = err(error, LC_ERR_PROTOCOL,
+               "logical publication did not cover prepared canonical bytes");
+    }
+    if (rc == LC_OK)
+      owned_publish_tail(s, head, tail, sequence);
+    pthread_mutex_unlock(&s->mutex);
+  } else if (rc == LC_OK && s->durable)
     rc = wait_durable(s, sequence, error);
   return rc;
 }

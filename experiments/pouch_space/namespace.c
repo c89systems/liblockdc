@@ -11,9 +11,10 @@
 #define NS_LEAF_BYTES 29U
 typedef struct segment {
   uint64_t id;
-  char leaf[NS_LEAF_BYTES];
+  char *leaf; /* Interned for the lifetime of this namespace storage owner. */
   ps_catalog_info binding;
   ps_stream *stream;
+  int unselected;
 } segment;
 struct ps_namespace_data {
   ps_namespace *ns;
@@ -29,7 +30,7 @@ struct ps_namespace_append {
   struct ps_namespace_data *data;
   ps_record_writer writer;
   uint64_t segment;
-  char leaf[NS_LEAF_BYTES];
+  const char *leaf;
 };
 struct ps_namespace_window {
   ps_namespace *ns;
@@ -65,7 +66,7 @@ static uint64_t get64(const unsigned char *p) {
   return value;
 }
 static ps_key head_key(ps_namespace *ns) {
-  ps_key key = {0, 1, PS_CONTROL};
+  ps_key key = {0, 1, PS_ROUTING};
   key.owner = ns->identity.owner;
   return key;
 }
@@ -156,7 +157,9 @@ static int collect(void *context, const void *name, size_t length,
   s = &d->items[d->count++];
   memset(s, 0, sizeof(*s));
   s->id = id;
-  memcpy(s->leaf, leaf, sizeof(leaf));
+  s->leaf = lc_strdup_with_allocator(NULL, leaf);
+  if (!s->leaf)
+    return failure(e, LC_ERR_NOMEM, "cannot retain namespace segment label");
   s->binding = *binding;
   return LC_OK;
 }
@@ -172,6 +175,15 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   unsigned char *scratch = NULL;
   uint64_t cursor = 0, next;
   int rc = LC_OK, found, truncated;
+  if (s->unselected) {
+    if (checkpoint)
+      return failure(e, LC_ERR_PROTOCOL,
+                     "unselected namespace stream has a published tail");
+    /* A containing head never selected these bytes. A concurrent checkpoint
+     * can retain its zero-tail grants, but not make its private append live. */
+    *accepted = 0;
+    return LC_OK;
+  }
   while (cursor < capacity) {
     rc = lc_pouch_state_record_read(ps_record_recovery_input(stream),
                                     &allocator, s->leaf, cursor, capacity, 1,
@@ -203,8 +215,10 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   size_t i;
   if (!d)
     return;
-  for (i = 0; i < d->count; ++i)
+  for (i = 0; i < d->count; ++i) {
     ps_stream_close(d->items[i].stream, NULL);
+    lc_free_with_allocator(NULL, d->items[i].leaf);
+  }
   lc_free_with_allocator(NULL, d->items);
   pthread_mutex_destroy(&d->mutex);
   lc_free_with_allocator(NULL, d);
@@ -237,6 +251,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
       rc = failure(e, LC_ERR_PROTOCOL, "namespace segment directory has a gap");
       break;
     }
+    s->unselected = s->id > d->active;
     rc = ps_stream_open(ns->root->space, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
@@ -318,7 +333,11 @@ static void leave(struct ps_namespace_data *d) {
 static int finish_seal(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
   if (d->pending_seal) {
-    rc = ps_stream_seal(d->items[d->pending_seal - 1].stream, e);
+    /* A durable seal must never outlive the routing decision that made its
+     * predecessor inactive. NoSync publication can defer this dependency. */
+    rc = ps_flush(d->ns->root->space, e);
+    if (rc == LC_OK)
+      rc = ps_stream_seal(d->items[d->pending_seal - 1].stream, e);
     if (rc == LC_OK)
       d->pending_seal = 0;
   }
@@ -340,15 +359,15 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
   s = &d->items[d->count];
   memset(s, 0, sizeof(*s));
   s->id = id;
+  s->unselected = 1;
   leaf = lc_pouch_namespace_segment_leaf(NULL, id);
   if (!leaf)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace segment label");
-  if (strlen(leaf) != sizeof(s->leaf) - 1) {
+  if (strlen(leaf) != NS_LEAF_BYTES - 1) {
     lc_free_with_allocator(NULL, leaf);
     return failure(e, LC_ERR_PROTOCOL, "namespace segment label width changed");
   }
-  memcpy(s->leaf, leaf, sizeof(s->leaf));
-  lc_free_with_allocator(NULL, leaf);
+  s->leaf = leaf;
   rc = ps_catalog_get(d->ns->root->space, d->ns->identity.owner,
                       PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), &view, e);
   if (rc == LC_OK && view)
@@ -389,6 +408,7 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
     pthread_mutex_unlock(&d->mutex);
   } else {
     ps_stream_close(s->stream, NULL);
+    lc_free_with_allocator(NULL, s->leaf);
     memset(s, 0, sizeof(*s));
   }
   return rc;
@@ -400,33 +420,30 @@ static int begin_reserve(ps_stream *stream, uint64_t minimum,
     rc = ps_record_reserve(writer, minimum ? minimum : 1, e);
   return rc;
 }
-static int rotate(struct ps_namespace_data *d, ps_record_writer *writer,
-                  uint64_t minimum, lc_error *e) {
+static int rotate(struct ps_namespace_data *d, lc_error *e) {
   uint64_t next;
   int rc;
   if (d->active == UINT64_MAX)
     return failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
   next = d->active + 1;
   rc = prepare(d, next, e);
-  /* Retain the predecessor until the new append owns its known span. Empty
-   * structural rotation has no append span to reserve. Prepared zero grants
-   * survive a failed admission and are reused by the next attempt. */
-  if (rc == LC_OK && writer)
-    rc = begin_reserve(d->items[(size_t)next - 1].stream, minimum, writer, e);
   if (rc == LC_OK)
     rc = head_write(d, next, e);
+  if (rc == LC_OK)
+    rc = ps_flush(d->ns->root->space, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
     d->pending_seal = (size_t)d->active;
     d->active = next;
     d->tail = 0;
+    d->items[(size_t)next - 1].unselected = 0;
     pthread_mutex_unlock(&d->mutex);
     rc = finish_seal(d, e);
   }
   return rc;
 }
-/* Namespace control slot 2 is its conservative maintenance marker; slot 1 is
- * the segment head. A marker binds its owner and validates reserved bytes. */
+/* Namespace control slot 2 is its conservative maintenance marker; routing
+ * slot 1 is the segment head. A marker binds its owner and reserved bytes. */
 static int retention_read(ps_namespace *ns, int *present, lc_error *e) {
   ps_key key = {0, 2, PS_CONTROL};
   unsigned char bytes[32];
@@ -532,6 +549,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
                               lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_append *append;
+  uint64_t selected;
   int rc;
   if (out)
     *out = NULL;
@@ -552,17 +570,22 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     return rc;
   }
   rc = finish_seal(d, e);
+  selected = d->active;
   if (rc == LC_OK) {
-    if (!d->active || (target && d->tail >= target))
-      rc = rotate(d, &append->writer, minimum, e);
-    else
-      rc = begin_reserve(d->items[(size_t)d->active - 1].stream, minimum,
-                         &append->writer, e);
+    if (!selected || (target && d->tail >= target)) {
+      if (selected == UINT64_MAX)
+        rc = failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
+      else {
+        ++selected;
+        rc = prepare(d, selected, e);
+      }
+    }
   }
   if (rc == LC_OK) {
-    segment *s = &d->items[(size_t)d->active - 1];
+    segment *s = &d->items[(size_t)selected - 1];
+    rc = begin_reserve(s->stream, minimum, &append->writer, e);
     append->segment = s->id;
-    memcpy(append->leaf, s->leaf, sizeof(s->leaf));
+    append->leaf = s->leaf;
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
@@ -585,17 +608,34 @@ const char *ps_namespace_append_leaf(const ps_namespace_append *append) {
 uint64_t ps_namespace_append_segment(const ps_namespace_append *append) {
   return append ? append->segment : 0;
 }
+static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
+  ps_namespace_append *append = context;
+  (void)tail;
+  return head_write(append->data, append->segment, e);
+}
 int ps_namespace_append_commit(ps_namespace_append *append, lc_error *e) {
   uint64_t tail;
-  int rc;
+  int rc, selecting;
   if (!append)
     return failure(e, LC_ERR_INVALID, "namespace append is not open");
   tail = append->writer.tail;
-  rc = ps_record_commit(&append->writer, e);
+  selecting = append->segment != append->data->active;
+  rc = ps_record_commit(&append->writer, selecting ? publish_append_head : NULL,
+                        append, e);
   /* Mutation authority remains held until append_close. Only that authority
    * reads this cache; captured readers use their independently pinned tails. */
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&append->data->mutex);
+    if (selecting) {
+      append->data->pending_seal = (size_t)append->data->active;
+      append->data->active = append->segment;
+      append->data->items[(size_t)append->segment - 1].unselected = 0;
+    }
     append->data->tail = tail;
+    pthread_mutex_unlock(&append->data->mutex);
+    /* Seal cleanup stabilizes routing before the next mutation, never as
+     * fallible work after this successful logical publication. */
+  }
   return rc;
 }
 void ps_namespace_append_close(ps_namespace_append *append) {
@@ -617,7 +657,7 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   if (d->active == expected) {
     rc = finish_seal(d, e);
     if (rc == LC_OK)
-      rc = rotate(d, NULL, 0, e);
+      rc = rotate(d, e);
   } else if (expected != UINT64_MAX && d->active == expected + 1) {
     rc = finish_seal(d, e);
   } else {

@@ -58,8 +58,11 @@ int ps_stream_write_at(ps_stream_writer *, uint64_t, const void *, size_t,
                        lc_error *);
 /* The canonical owner has completed its records before commit. Durable
  * success waits for the root sync covering these bytes; no publication journal
- * entry is emitted when appending inside an already owned run. */
-int ps_stream_commit(ps_stream_writer *, lc_error *);
+ * entry is emitted when appending inside an already owned run. An optional
+ * publisher selects a containing logical head before exposing this tail;
+ * durable roots check its success against the shared ready prefix. */
+int ps_stream_commit(ps_stream_writer *, ps_commit_publish_fn, void *,
+                     lc_error *);
 /* An abandoned written suffix is cleared and synced before the next appender.
  * A failed cleanup poisons storage; close/reopen reconciles uncertain I/O. */
 void ps_stream_writer_close(ps_stream_writer *);

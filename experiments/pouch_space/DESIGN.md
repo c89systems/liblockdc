@@ -427,15 +427,21 @@ provider. Public collection IDs, positions, receipts, namespace mutation policy,
 maintenance and process-shared ownership remain pending integration. Normal
 public Pouch roots still use files and directories.
 
-Ordinary stream runs now use a cached namespace segment owner. A small durable
+Ordinary stream runs now use a cached namespace segment owner. A small routing
 head selects the active numeric segment; typed catalog entries own the segment
 set. Initialization and rotation publish structural metadata, while normal
 record commits only publish the canonical tail. Rotation prepares/binds a new
-empty stream, reserves the known span for an automatic append, commits head
-cutover, then seals its predecessor. Explicit empty rotation reserves no append
-span. Expected-active
+empty stream, reserves the known span for an automatic append, completes its
+canonical bytes, then commits head cutover before exposing its tail. The bounded
+`PS_ROUTING` head follows root durability and shares CONTROL's replacement
+allowance. Durable publication covers the first record in that same barrier;
+NoSync does not force a whole value to disk. The next mutation flushes the ready
+routing prefix before durably sealing the predecessor. Explicit empty rotation
+reserves no append span and remains durable under either policy. Expected-active
 fences make interrupted rotations retryable across reopen. Unpublished empty
-successors are reusable; recovery rejects inconsistent membership. Logical
+successors are reusable; complete private bytes with checkpoint tail zero are
+discarded if their head was never selected. A published tail in an unselected
+successor is rejected. Recovery rejects inconsistent membership. Logical
 mutation authority still owns versions, index sequences and public policy.
 
 Namespace views capture identities/tails using small stream-window pins, with
@@ -462,6 +468,17 @@ does not cut over or seal the predecessor. Reopen accepts this staged empty
 owner, and a 1 MiB growth can satisfy a later retry. Committing within the
 reserved span needs no additional grant. Complete maintenance dependency
 admission remains separate work; no per-root writer queue is introduced.
+
+The owned commit boundary accepts an optional logical publisher outside the
+allocator/commit mutexes. Its canonical tail stays private through publication;
+durable roots require that publisher to cover the prepared ready sequence.
+Ordinary within-segment commits retain their existing single-lock fast path.
+Production state appends prepare a private prospective manifest and update the
+committed cache only after physical success. Interned segment labels remain
+stable until namespace-owner destruction, including across array growth and
+append close. No public ABI or canonical record payload changes. The namespace
+head's prototype typed key changes directly from CONTROL to ROUTING without
+legacy parsing, migration or a format-version increment.
 
 The private Pouch harness now also admits ordinary metadata updates and delete
 tombstones through the production canonical batch writer and typed appender.

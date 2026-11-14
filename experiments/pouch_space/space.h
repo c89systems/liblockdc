@@ -31,11 +31,22 @@ enum ps_kind {
    * always publish, read and delete at a completed durable prefix, even in
    * NoSync. Replacements may use 4 KiB of the protected maintenance reserve;
    * checkpoint releases superseded values before that allowance is reused. */
-  PS_CONTROL = 6
+  PS_CONTROL = 6,
+  /* Bounded logical routing values use the same replacement allowance as
+   * CONTROL, but follow root durability. Ownership and allocation authority
+   * must remain in always-durable controls/catalogs/grants. */
+  PS_ROUTING = 7
 };
 typedef struct ps_space ps_space;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
+/* Optional logical publication after complete canonical bytes are ready,
+ * before their tail becomes visible. On durable roots, success must durably
+ * cover those bytes through this same space. NoSync logical publication may
+ * roll back together with its canonical bytes. Failure on a
+ * healthy space must leave no authoritative logical publication. Called
+ * outside allocator/commit locks; no callback may reuse its active appender. */
+typedef int (*ps_commit_publish_fn)(void *, uint64_t tail, lc_error *);
 typedef struct ps_key {
   uint64_t owner, key;
   unsigned int kind;
@@ -103,6 +114,10 @@ int ps_read(ps_reader *, void *, size_t, size_t *, lc_error *);
 uint64_t ps_read_size(const ps_reader *);
 void ps_reader_close(ps_reader *);
 int ps_delete(ps_space *, ps_key, lc_error *);
+/* Complete the ready publication prefix, including on NoSync roots. Does not
+ * checkpoint or publish private/unready bytes. Already covered prefixes avoid
+ * another file sync. */
+int ps_flush(ps_space *, lc_error *);
 /* Durably checkpoint metadata, retire the previous recoverable root, then
  * reclaim unpinned retired runs. No live payload copying or file shrinking. */
 int ps_checkpoint(ps_space *, lc_error *);

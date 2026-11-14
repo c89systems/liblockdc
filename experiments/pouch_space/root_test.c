@@ -279,7 +279,7 @@ static void lifecycle(const char *path, const char *key_string,
     REQUIRE(plain == 1048601 && stored == destination.bytes);
     lc_pouch_crypto_writer_close(codec);
     codec = NULL;
-    ok(ps_stream_commit(writer, &e), &e);
+    ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
     ps_stream_writer_close(writer);
     writer = NULL;
     ok(ps_stream_seal(stream, &e), &e);
@@ -461,7 +461,7 @@ static void malformed(const char *path) {
     if (variant == 1) {
       ok(ps_stream_begin(anchor, &writer, &e), &e);
       ok(ps_stream_write(writer, "data", 4, &e), &e);
-      ok(ps_stream_commit(writer, &e), &e);
+      ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
       ps_stream_writer_close(writer);
     }
     if (variant != 0)

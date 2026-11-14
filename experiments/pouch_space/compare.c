@@ -340,7 +340,7 @@ static int collection_stream_write(worker *w, size_t id, lc_source *source,
         w->collection_id, name, position, position, 0, 0, 0, source, &record,
         e);
   if (rc == LC_OK)
-    rc = ps_record_commit(&output, e);
+    rc = ps_record_commit(&output, NULL, NULL, e);
   if (rc == LC_OK) {
     require(record.bytes == c->bytes && record.stored_bytes == c->bytes,
             "canonical collection write bytes");
