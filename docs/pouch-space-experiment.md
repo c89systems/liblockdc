@@ -1405,7 +1405,7 @@ selected through an SDK flag. It requires disabled indexing, background
 maintenance and watches, exclusive root ownership and no generated external key
 file. Other Pouch APIs are outside its current call contract. State PUT
 staged/lease publication and staged decision replay explicitly return
-unsupported. Remaining metadata-only mutation/delete, read-many/scans,
+unsupported. At this PUT/read stage, metadata-only mutation/delete, read-many/scans,
 collections, queues, indexes, XA, maintenance, snapshot/obsolete ownership and
 shared-root semantics still require integration.
 
@@ -1540,6 +1540,132 @@ build/x86_64-linux-gnu-release/experiments/pouch_space/pouch_space_compare \
   pouch-state "$PWD/build/pouch-space-integrated" 1024 1024 0 4 4096 --reopen
 ```
 
+## Production metadata and deletion integration
+
+The private harness now admits ordinary `lc_pouch_state_update_metadata` and
+`lc_pouch_state_delete` through the same production policy engine. Metadata
+batching retains its existing per-namespace worker, bounded aggregation and
+canonical vectored writer. The production state engine reserves index sequences
+and uses the typed appender to publish the complete canonical batch, without
+rewriting bodies. Tombstones
+use the same boundary. Borrowed manifests are refreshed under append authority
+before rotation. Old body sources remain readable after deletion and Pouch close.
+
+Positive expiry now publishes a conservative durable marker inside the file,
+rather than attempting to create the native retention hint sidecar. Namespace
+control slot 2 contains the checked 32-byte marker described in the
+[foundation design](../experiments/pouch_space/DESIGN.md). It is durable before
+expiry-bearing publication even under NoSync. A failed mutation may leave a
+positive hint. Get reads only metadata; marker clearing and retention execution
+are not implemented yet. No SDK selector or public-open cutover is introduced.
+
+### Verification and remaining capacity gap
+
+Debug passed all 269 selected checks under ASan/UBSan. Native GNU and musl release
+each passed all 173 selected unit checks, including all 78 pouch-space checks.
+Twenty-one affected integration/root/namespace/canonical-record groups passed
+ThreadSanitizer. Native musl workers retain their default 128 KiB stacks.
+
+New lifecycle cases cover all four transform combinations and both durability
+policies, metadata-only placeholders, metadata inheritance, version/etag/view
+preconditions, hidden/expiry fields, index sequence preservation, forced
+rotation, no-op repeated deletion, recreation, pinned bodies and populated-root
+reopen. Eight concurrent callers update distinct keys in one namespace, preserving
+their bodies and producing 64 unique sequences under both sync policies.
+
+Fault matrices exercise all 558 observed allocation and 173 I/O positions for
+metadata over an existing body, deletion and metadata-only creation, using plain
+and combined encryption/compression under both sync policies. A 20,001-byte
+metadata value crosses append-buffer boundaries. I/O failures include written
+prefixes. Recovery requires the old or complete new outcome, intact anchor
+bytes, poison admission and a successful retry. Faults found and fixed shared
+state-engine bugs: metadata-worker setup masked allocation errors as transport
+errors, and tombstone sequence-allocation failure leaked encoded metadata.
+
+Retention tests corrupt every marker byte plus short/long size, wrong owner,
+flag and reserved-field cases with valid outer storage checksums. Both get and
+ensure fail closed. Reading the marker of a namespace with a 1 MiB body performs
+at most 16 KiB of physical reads without initializing its segment owner.
+Memcheck passed all six new groups: 432,836 allocations and frees, no remaining
+blocks, errors or suppressions.
+
+The fixed 10 MiB capacity probe fills 117 keys after seeding a peer namespace.
+Deletion in the filling namespace succeeds; deletion in the peer can fail when
+rotation needs foreground capacity. The prior value survives failure and reopen.
+This passing probe proves safety, **not full-capacity deletion admission**.
+Connecting protected capacity to the complete maintenance dependency set, then
+reclamation, remains an unmet requirement of the active full-backend goal.
+
+Logs and full CTest details are under
+`build/pouch-space-integrated/mutations-final-{debug,gnu,musl,tsan}-*`.
+The six `mutations-*-memcheck.log` files preserve leak/error evidence. No Darwin,
+QEMU or large-machine execution was run.
+
+### Matched mutation measurements
+
+Sixty serial GNU release runs use five alternating-order samples for each
+operation/profile/engine. Both engines call the real production APIs. Ordinary
+PUT seeds 1 KiB bodies before the mutation timer; `seed_ms` records that cost
+separately. Metadata performs two rounds with 32-byte application metadata;
+delete performs one. Indexing, transforms, background maintenance and positive
+expiry are disabled. Each writer owns a distinct namespace. Every run verifies
+the resulting bodies/metadata or absence before close and after populated-root
+reopen. All 30 container runs require one store file without sidecars.
+
+Median mutation milliseconds, container / current multifile:
+
+| Workload | Metadata update | Delete |
+| --- | ---: | ---: |
+| Durable, 128 keys, 1 writer | 553.63 / 1308.48 | 323.18 / 769.57 |
+| Hot seeded root, NoSync, 1,024 keys, 4 writers | 38.40 / 27.13 | 3.46 / 3.87 |
+| Populated-root reopen, NoSync, 1,024 keys, 4 writers | 45.57 / 46.85 | 14.79 / 18.89 |
+
+Durable mutation medians are about 2.4 times faster. Hot NoSync metadata is
+about 1.4 times slower and remains a performance target: CPU medians are
+92.90 / 71.64 ms, while both issue 2,048 write calls and 683,688 syscall bytes.
+Those counters do not isolate the cause. Hot NoSync delete is close. Five-sample
+wall ranges overlap materially: hot metadata spans 22.40–43.12 / 25.54–44.21 ms;
+durable metadata spans 447.95–657.27 / 1111.95–4003.57 ms. These are local
+measurements, not a statistical acceptance claim.
+
+Unlike the preceding PUT benchmark's empty-root reopen, the new preopened modes
+close/reopen a **populated seeded root** before mutation. Container projection
+replay is lazy and can fall within the first mutation, while multifile pays for
+its clean projection hint during close. Median preopen-close/open plus mutation
+is 59.13 / 133.40 ms for metadata and 25.82 / 101.27 ms for delete. These are
+medians of per-sample sums; seeding remains separate. OS page cache is retained.
+
+After mutation, median close + reopen + verification milliseconds:
+
+| Workload | Metadata update | Delete |
+| --- | ---: | ---: |
+| Durable, 128 keys, 1 writer | 17.07 / 18.63 | 15.19 / 21.40 |
+| Hot seeded root, NoSync, 4 writers | 50.29 / 104.76 | 44.11 / 88.02 |
+| Populated-root reopen, NoSync, 4 writers | 47.95 / 108.79 | 41.29 / 100.13 |
+
+Container reopen alone remains slower: for the hot NoSync profile, reopen plus
+verification takes 49.87 / 33.44 ms after metadata and 43.86 / 24.58 ms after
+delete. Container close is much cheaper. The metadata hot-projection first body
+pass takes 4.34 / 30.95 ms. Delete verification checks absence and is not a body
+read benchmark. Neither mode measures public scans.
+
+Durable mutation sync counts match: 256 fdatasync calls for metadata and 128 for
+delete, with no fsync calls in either engine. Hot NoSync mutation uses neither;
+populated-root-reopened NoSync uses container 4/0 versus multifile 0/8
+fdatasync/fsync calls for both operations. The logical container remains 10 MiB;
+filesystem-accounted allocated bytes are 10 MiB or 10 MiB + 4 KiB. The common
+probe's `MiB_s` field uses reference body size and is not metadata/delete byte
+throughput; use mutation timings and actual byte counters for these modes.
+
+The earlier runtime reference manifest passed verification and its executables
+were preserved. New raw logs, runner, JSON rows/group medians and preserved ELF
+are `mutations-paired/`, `mutations-paired.sh`, `mutations-results.json` and
+`pouch_space_compare-mutations-current` under `build/pouch-space-integrated/`.
+`mutations-artifacts.sha256` verifies all 63 artifacts. Reproduce the paired
+series with `bash build/pouch-space-integrated/mutations-paired.sh`, or substitute
+`runtime-metadata`/`pouch-metadata` and `runtime-delete`/`pouch-delete` in the
+current-source comparison command above.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1548,10 +1674,11 @@ pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
 packing, canonical-stream, lifecycle, typed catalog and production collection
 and ordinary state record follow-ups. Namespace segments now have a real
-container owner. Ordinary production state PUT/projection/point-read paths now
-join it through the private integration harness. The next work connects the
-remaining state mutation/scan paths and public collection ownership, then
-completes the public behavior suites. Full native integration still
+container owner. Ordinary production state PUT/projection/point-read, metadata
+update and deletion now join it through the private integration harness. The
+next work must close maintenance admission at capacity and connect the
+remaining advanced mutation/scan paths and public collection ownership, then
+complete the public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits

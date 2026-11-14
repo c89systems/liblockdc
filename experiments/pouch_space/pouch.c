@@ -159,9 +159,19 @@ static int source_open(void *context, void *ns, const char *leaf,
   *out = &source->pub;
   return LC_OK;
 }
+static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = ps_root_namespace_acquire(owner->root, name, 1, &ns, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_retention_hint_ensure(ns, e);
+  ps_namespace_release(ns);
+  return rc;
+}
 static const lc_pouch_storage_ops storage_ops = {
-    check,        namespace_open, namespace_close, namespace_info, replay,
-    append_begin, append_commit,  append_close,    source_open,    release};
+    check,       namespace_open,        namespace_close, namespace_info,
+    replay,      append_begin,          append_commit,   append_close,
+    source_open, retention_hint_ensure, release};
 
 int ps_pouch_state_open(const char *path, int create,
                         const lc_allocator *allocator,

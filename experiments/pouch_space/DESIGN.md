@@ -447,6 +447,30 @@ admission checks poison before its atomic pointer lookup. The owner caches its
 committed tail under append authority to avoid a duplicate metadata query per
 record. Snapshot/obsolete transitions remain pending.
 
+The private Pouch harness now also admits ordinary metadata updates and delete
+tombstones through the production canonical batch writer and typed appender.
+Logical preconditions, versions, sequences and body references remain owned by
+the state engine. The existing metadata worker batches within a namespace;
+independent namespaces retain their own append authority. Metadata-only changes
+and tombstones do not rewrite body bytes.
+
+Namespace control slot 2 holds a conservative retention work marker. Its 32-byte
+payload contains `LCPSRETN`, the little-endian namespace owner at byte 8, a
+present byte of 1 at byte 16, seven zero reserved bytes, and a little-endian
+64-bit slot at byte 24 containing CRC32 of bytes 0 through 23 (upper half zero).
+Ensure validates an existing marker and publishes a missing marker durably,
+including under NoSync, before expiry-bearing canonical publication. A failed
+mutation can leave a harmless positive marker. Get reads only that control;
+it neither initializes segment ownership nor replays body records. Clearing
+markers and executing retention maintenance remain pending.
+
+The physical reserve is not yet connected to the complete logical maintenance
+dependency set. A peer namespace can exhaust foreground capacity needed for
+rotation before a delete, despite protected physical capacity. The fixed-size
+capacity probe verifies preservation of the prior value across failure/reopen;
+it does not prove full-capacity deletion. Guaranteed admission and reclamation
+remain requirements of the full backend.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The

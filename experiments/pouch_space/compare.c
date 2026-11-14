@@ -72,6 +72,7 @@ typedef struct worker {
 } worker;
 struct comparison {
   int container, collection, sync, streams, existing_records, runtime;
+  int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -412,6 +413,27 @@ static int write_one(worker *w, size_t id, lc_error *e) {
   char ns[64], name[64];
   int rc;
   names(w->ordinal, id, ns, name);
+  if (c->mutation) {
+    memset(&options, 0, sizeof(options));
+    memset(&result, 0, sizeof(result));
+    options.has_expected_version = 1;
+    options.expected_version = 1;
+    if (c->mutation == 1) {
+      options.has_metadata = 1;
+      options.metadata = (const unsigned char *)w->body;
+      options.metadata_length = 32;
+      rc = lc_pouch_state_update_metadata(c->pouch, ns, name, &options, &result,
+                                          e);
+      if (rc == LC_OK && (result.version != 1 || result.bytes != c->bytes))
+        rc = LC_ERR_PROTOCOL;
+    } else {
+      rc = lc_pouch_state_delete(c->pouch, ns, name, &options, &result, e);
+      if (rc == LC_OK && (result.version != 2 || result.bytes != 0))
+        rc = LC_ERR_PROTOCOL;
+    }
+    lc_pouch_state_write_result_cleanup(NULL, &result);
+    return rc;
+  }
   in.body = w->body;
   in.bytes = c->bytes;
   in.offset = 0;
@@ -591,6 +613,26 @@ static void close_stores(comparison *c, lc_error *e) {
     c->pouch = NULL;
   }
 }
+static void seed_mutations(comparison *c, lc_error *e) {
+  size_t id, ordinal;
+  char ns[64], name[64];
+  lc_source *source = NULL;
+  lc_pouch_state_write_result result;
+  for (id = 0; id < c->rows; ++id) {
+    ordinal = id % c->writers;
+    names(ordinal, id, ns, name);
+    make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
+    check(lc_source_from_memory(c->workers[ordinal].body, c->bytes, &source, e),
+          e);
+    memset(&result, 0, sizeof(result));
+    check(lc_pouch_state_write(c->pouch, ns, name, source, NULL, &result, e),
+          e);
+    require(result.version == 1 && result.bytes == c->bytes,
+            "seed mutation key");
+    lc_pouch_state_write_result_cleanup(NULL, &result);
+    lc_source_close(source);
+  }
+}
 static void verify_states(comparison *c, lc_error *e) {
   ps_reader *reader;
   ps_stream_reader *stream_reader;
@@ -662,8 +704,18 @@ static void verify_states(comparison *c, lc_error *e) {
       names(ordinal, id, ns, name);
       memset(&result, 0, sizeof(result));
       check(lc_pouch_state_read(c->pouch, ns, name, &result, e), e);
+      if (c->mutation == 2) {
+        require(!result.found && !result.body, "deleted key remains absent");
+        lc_pouch_state_read_result_cleanup(NULL, &result);
+        continue;
+      }
       require(result.found && result.body && result.bytes == c->bytes,
               "Pouch state metadata");
+      if (c->mutation == 1)
+        require(
+            result.version == 1 && result.metadata_length == 32 &&
+                !memcmp(result.metadata, c->workers[ordinal].body, 32),
+            "metadata retained body/version with final application metadata");
       while ((got = result.body->read(result.body, buffer, sizeof(buffer),
                                       e)) != 0) {
         require(got <= c->bytes - offset &&
@@ -810,13 +862,15 @@ int main(int argc, char **argv) {
   char prefix[1024], template_path[1100];
   size_t i, count;
   double start, cpu, seconds, cpu_seconds, read_seconds, close_seconds,
-      open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0;
+      open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0,
+                                                         seed_seconds = 0;
   int preopen;
   if (argc != 8 && argc != 9) {
     fprintf(
         stderr,
         "usage: %s "
         "space-state|stream-state|runtime-state|pouch-state|space-collection|"
+        "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
         "stream-collection|pouch-collection "
         "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
         argv[0]);
@@ -831,11 +885,18 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-collection") ||
               !strcmp(argv[1], "stream-state") ||
               !strcmp(argv[1], "runtime-state") ||
+              !strcmp(argv[1], "runtime-metadata") ||
+              !strcmp(argv[1], "pouch-metadata") ||
+              !strcmp(argv[1], "runtime-delete") ||
+              !strcmp(argv[1], "pouch-delete") ||
               !strcmp(argv[1], "stream-collection"),
           "mode");
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
-  c.runtime = !strcmp(argv[1], "runtime-state");
+  c.runtime = !strncmp(argv[1], "runtime-", 8);
+  c.mutation = strstr(argv[1], "metadata") ? 1
+               : strstr(argv[1], "delete") ? 2
+                                           : 0;
   c.collection = strstr(argv[1], "collection") != NULL;
   c.rows = number(argv[3], 1, PS_DEFAULT_CAPACITY / PS_PAGE);
   c.bytes = number(argv[4], 64, 2 * PS_MIB);
@@ -843,7 +904,7 @@ int main(int argc, char **argv) {
   c.writers = number(argv[6], 1, 16);
   /* argv[7] is the input chunk size, deliberately shared by both engines. */
   require(!strcmp(argv[7], "4096"), "input chunk must currently be 4096");
-  c.rounds = c.collection ? 1 : 2;
+  c.rounds = c.collection || c.mutation == 2 ? 1 : 2;
   require(c.writers <= c.rows &&
               c.rows * ((c.bytes + PS_PAGE - 1) / PS_PAGE * PS_PAGE) *
                       c.rounds <
@@ -891,6 +952,11 @@ int main(int argc, char **argv) {
   start = now(CLOCK_MONOTONIC);
   open_stores(&c, 1, &e);
   create_seconds = now(CLOCK_MONOTONIC) - start;
+  if (c.mutation) {
+    start = now(CLOCK_MONOTONIC);
+    seed_mutations(&c, &e);
+    seed_seconds = now(CLOCK_MONOTONIC) - start;
+  }
   if (preopen) {
     start = now(CLOCK_MONOTONIC);
     close_stores(&c, &e);
@@ -1038,11 +1104,12 @@ int main(int argc, char **argv) {
          "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
          "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
          "logical_segments=%lu "
-         "preopened=%d preopen_ms=%.6f max_us=%.3f verified=1\n",
+         "preopened=%d preopen_ms=%.6f seed_ms=%.6f max_us=%.3f verified=1\n",
          checkpoints, directory_writes, descriptor_writes, metadata_pages,
          packed_pages, packed_bytes, payload_allocated, journal_used,
          stream_grants, (unsigned long)logical_segments, preopen,
-         preopen_seconds * 1000, c.latencies[count - 1] * 1e6);
+         preopen_seconds * 1000, seed_seconds * 1000,
+         c.latencies[count - 1] * 1e6);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

@@ -31,6 +31,7 @@ typedef struct lc_pouch_storage_ops {
    * It may outlive the Pouch runtime that opened it. */
   int (*source_open)(void *, void *, const char *, uint64_t, uint64_t,
                      lc_source **, lc_error *);
+  int (*retention_hint_ensure)(void *, const char *, lc_error *);
   void (*close)(void *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {

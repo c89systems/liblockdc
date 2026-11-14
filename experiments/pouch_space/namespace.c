@@ -22,6 +22,7 @@ struct ps_namespace_data {
   size_t count, capacity, pending_seal;
   uint64_t active, tail;
   int busy;
+  int retention_loaded, retention_present;
 };
 struct ps_namespace_append {
   ps_namespace *ns;
@@ -411,6 +412,83 @@ static int rotate(struct ps_namespace_data *d, lc_error *e) {
   }
   return rc;
 }
+/* Namespace control slot 2 is its conservative maintenance marker; slot 1 is
+ * the segment head. A marker binds its owner and validates reserved bytes. */
+static int retention_read(ps_namespace *ns, int *present, lc_error *e) {
+  ps_key key = {0, 2, PS_CONTROL};
+  unsigned char bytes[32];
+  ps_reader *reader = NULL;
+  size_t got = 0, i;
+  int rc;
+  *present = 0;
+  key.owner = ns->identity.owner;
+  rc = ps_read_open(ns->root->space, key, NULL, &reader, e);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    return LC_OK;
+  }
+  if (rc != LC_OK)
+    return rc;
+  if (ps_read_size(reader) != sizeof(bytes))
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "namespace retention hint has invalid size");
+  if (rc == LC_OK)
+    rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
+  ps_reader_close(reader);
+  if (rc != LC_OK)
+    return rc;
+  if (got != sizeof(bytes) || memcmp(bytes, "LCPSRETN", 8) ||
+      get64(bytes + 8) != key.owner || bytes[16] != 1 ||
+      get64(bytes + 24) != (uint64_t)crc32(0L, bytes, 24))
+    return failure(e, LC_ERR_PROTOCOL, "namespace retention hint is invalid");
+  for (i = 17; i < 24; ++i)
+    if (bytes[i])
+      return failure(e, LC_ERR_PROTOCOL,
+                     "namespace retention hint has unknown fields");
+  *present = 1;
+  return LC_OK;
+}
+int ps_namespace_retention_hint_get(ps_namespace *ns, int *out, lc_error *e) {
+  if (!ns || !out)
+    return failure(e, LC_ERR_INVALID, "namespace retention hint needs output");
+  /* Work enumeration reads only the marker, without opening segments or
+   * replaying any canonical body. Physical admission checks poison. */
+  return retention_read(ns, out, e);
+}
+int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
+  struct ps_namespace_data *d;
+  ps_key key = {0, 2, PS_CONTROL};
+  unsigned char bytes[32];
+  ps_writer *writer = NULL;
+  int rc = data_get(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&d->mutex);
+  if (!d->retention_loaded) {
+    rc = retention_read(ns, &d->retention_present, e);
+    if (rc == LC_OK)
+      d->retention_loaded = 1;
+  }
+  if (rc == LC_OK && !d->retention_present) {
+    key.owner = ns->identity.owner;
+    memset(bytes, 0, sizeof(bytes));
+    memcpy(bytes, "LCPSRETN", 8);
+    put64(bytes + 8, key.owner);
+    bytes[16] = 1;
+    put64(bytes + 24, (uint64_t)crc32(0L, bytes, 24));
+    rc = ps_begin(ns->root->space, key, &writer, e);
+    if (rc == LC_OK)
+      rc = ps_write(writer, bytes, sizeof(bytes), e);
+    if (rc == LC_OK)
+      rc = ps_publish(writer, NULL, e);
+    ps_writer_close(writer);
+    if (rc == LC_OK)
+      d->retention_present = 1;
+  }
+  pthread_mutex_unlock(&d->mutex);
+  return rc;
+}
+
 int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
                             lc_error *e) {
   struct ps_namespace_data *d;

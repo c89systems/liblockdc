@@ -15,6 +15,12 @@ typedef struct ps_namespace_status {
  * One cached storage owner per namespace, never a pathname/virtual filesystem.
  * An empty namespace has no head/segment until its first append or rotation. */
 int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
+/* Conservative durable work marker, independent of the segment head/tail.
+ * Ensure precedes expiry-bearing publication, including for NoSync roots. A
+ * failed mutation may leave a harmless positive hint. */
+int ps_namespace_retention_hint_ensure(ps_namespace *, lc_error *);
+/* Metadata-only: no segment opening, canonical replay or body reads. */
+int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
 /* One active producer per namespace, explicit BUSY on contention. Unrelated
  * namespaces and captured readers progress independently. target==0 disables
  * automatic rotation; otherwise rotate before the next append when the active

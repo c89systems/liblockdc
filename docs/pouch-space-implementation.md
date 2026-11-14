@@ -226,7 +226,8 @@ ownership and process-shared coordination remain required. Normal
 ## Production state integration
 
 A private `ps_pouch_state_open` harness now connects ordinary production state
-PUT, point read, metadata read, copy and namespace creation to the container.
+PUT, metadata update, delete, point read, metadata read, copy and namespace
+creation to the container.
 Common Pouch runtime initialization owns options, logging and coordination;
 the storage owner supplies typed namespace admission, canonical replay, private
 append/commit and bounded encoded sources. It supplies no pathname operations.
@@ -244,9 +245,16 @@ Replay uses the production projection application rules, with no manufactured
 namespace path. Failed replay clears the partial projection before retry.
 Hot operations check physical poison. One appender per namespace retains the
 existing logical append authority; independent namespaces share the physical
-coordinator. Producer callbacks and durable commit waits release the projection
-mutex while exact-key and append authority remain held. Competing stale
-preconditions fail before consuming their source.
+coordinator. Ordinary PUT producer callbacks and durable commit waits release
+the projection mutex while exact-key and append authority remain held. Competing
+stale preconditions fail before consuming their source.
+
+Metadata updates retain the existing per-namespace batching worker and bounded
+metadata aggregation. Its canonical vectored append now uses the typed record
+I/O boundary; tombstones use that boundary too. Neither operation copies body
+payloads. Rotation accounts for the complete metadata batch size. This worker
+retains its existing projection coordination during durable commit; it does not
+inherit ordinary PUT's projection-unlock behavior or add a root-wide writer queue.
 
 Encoded read windows retain the namespace and storage owner. Their decoded
 sources retain their original body and crypto binding across replacement,
@@ -256,11 +264,24 @@ retain their original allocation domain. Shared append completion cleanup also
 releases reserved metadata and precomputed transforms after failed reservation
 or finalization.
 
+A conservative namespace retention marker occupies control slot 2, separate
+from the segment head in slot 1. Its 32 bytes bind a magic, namespace owner,
+present flag, zero reserved fields and CRC32. Ensure publishes it durably even
+under NoSync before an expiry-bearing record. Failed mutation may leave a
+harmless positive hint. Reading the hint does not open segments or replay
+bodies. Marker removal, retention scheduling and reclamation remain pending.
+
+Protected physical capacity does not yet provide end-to-end maintenance
+admission. At a fixed 10 MiB capacity, another namespace can consume the space
+needed to rotate before deletion. The capacity probe checks safe failure and
+reopen, not guaranteed deletion or reclamation. Reserving the complete
+maintenance dependency set before cutover remains an acceptance requirement.
+
 This harness explicitly requires disabled query indexing, background maintenance
 and queue watches, exclusive root ownership and no generated external key file.
-State PUT staged/lease publication requests and staged decision replay return
+State staged/lease publication requests and staged decision replay return
 unsupported. Other Pouch APIs are outside this harness's current call contract.
-Metadata-only mutation/delete, read-many/scans, collections, queues, XA, indexes,
+Read-many/scans, prepared/namespace mutation APIs, collections, queues, XA, indexes,
 snapshot/obsolete ownership, maintenance and shared-root operation remain
 integration work. This is a verified ordinary-state slice, not full backend
 acceptance or deployment authorization.
@@ -296,8 +317,8 @@ The stream comparison now opens through this root owner and obtains its actual
 namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
 Namespace heads, segment ownership/rotation and bounded canonical replay now use
 this owner too. The private ordinary-state harness now uses the production
-projection and PUT/read policy. Remaining state mutation/scan paths,
-snapshot/obsolete sets and public collection ownership still require
+projection and ordinary PUT/read/metadata/delete policy. Advanced mutation and
+scan paths, snapshot/obsolete sets and public collection ownership still require
 integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
@@ -346,10 +367,10 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-This is partial integration, not root-wide adoption. Namespace data and collection
-owners, ordinary namespace mutation/replay policy, metadata mutation/copy paths,
-control ownership, position/receipt authority, projections and public root lifetime still
-need conversion to container ownership. Normal public Pouch tests continue to
+This is partial integration, not root-wide adoption. Collection owners, advanced
+namespace mutation policy, scans, snapshot/obsolete ownership, position/receipt
+authority and remaining control/projection owners still need conversion to
+container ownership. Normal public Pouch tests continue to
 exercise the segmented backend through the shared record I/O boundary.
 
 Complete storage integration covers states, objects, attachments, leases,

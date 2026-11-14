@@ -9,8 +9,11 @@ typedef struct ps_pouch_state_options {
   const ps_io *io;
 } ps_pouch_state_options;
 
-/* Private integration harness, never installed: ordinary state PUT, point
- * read/metadata/copy and namespace creation use the production logical engine.
+/* Private integration harness, never installed: ordinary state PUT, metadata
+ * update, delete, point read/metadata/copy and namespace creation use the
+ * production logical engine. Retention work hints are durable in-file markers;
+ * reclamation and guaranteed maintenance admission at capacity remain pending.
+ * Rotation can still require foreground capacity before a delete.
  * Other Pouch operations are outside this harness's current call contract.
  * Explicitly disable indexing, background maintenance and queue watches; shared
  * root mode and generated external key files are not admitted. No public

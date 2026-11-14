@@ -25,7 +25,11 @@ still opens multifile roots. Its production collection record writer and decoder
 now operate directly on container streams in the experiment through borrowed
 record I/O. The experimental root owner now binds codec policy and durable
 namespace identities inside that file. Namespace segment ownership and a private
-integration of production ordinary-state PUT/read policy are now implemented.
+integration of production ordinary-state PUT/read, metadata update and deletion
+policy are now implemented. Retention work hints are durable records inside the
+container. Full-capacity deletion is not yet guaranteed: a required rotation can
+still exhaust foreground capacity. The experiment verifies that such failure
+preserves the prior value; protected maintenance admission remains required.
 Remaining public Pouch semantics, maintenance and shared-root coordination
 remain ahead; normal public open behavior has not changed.
 
