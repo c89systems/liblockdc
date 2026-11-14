@@ -18,6 +18,16 @@ metadata before clearing PENDING and never commits or syncs its owner's stream.
 The caller retains namespace policy and append/publication authority. No payload
 spool is introduced. Normal public Pouch still opens multifile roots.
 
+The private `ps_pouch_state_open` harness now runs ordinary production state PUT,
+point read, metadata read, copy and namespace creation through typed storage
+capabilities. It reuses the real projection and mutation policy, with no fake
+filesystem paths or container body cache. Read sources retain their original
+body/crypto binding across replacement, rotation and Pouch close. Indexing,
+background maintenance and watches must be explicitly disabled; other APIs are
+outside this harness's current call contract. The `runtime-state` comparison
+mode uses these production calls for both writes and reads, separately from the
+older codec-only stream fixtures. Full public backend integration remains ahead.
+
 One exclusive Linux `flock` protects the container lifetime. Independent threads
 reserve private extents under a short mutex; producer callbacks run outside it.
 A second open, including another process, fails. After the exclusive owner

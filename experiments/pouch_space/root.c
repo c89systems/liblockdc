@@ -123,7 +123,8 @@ static int config_read(ps_root *root, int compression_explicit,
   if (bytes[9] && !root->crypto) {
     lc_pouch_crypto_open_options options = {0};
     options.compression_enabled = 1;
-    rc = lc_pouch_crypto_open(NULL, &options, &root->crypto, NULL, error);
+    rc = lc_pouch_crypto_open(&root->crypto_allocator, &options, &root->crypto,
+                              NULL, error);
     if (rc != LC_OK)
       return rc;
   }
@@ -157,9 +158,11 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
     pthread_mutex_destroy(&root->mutex);
     goto mutex_failed;
   }
-  rc = lc_pouch_crypto_open(NULL, &options->crypto, &root->crypto, &key_file,
-                            error);
-  lc_free_with_allocator(NULL, key_file);
+  if (options->crypto_allocator)
+    root->crypto_allocator = *options->crypto_allocator;
+  rc = lc_pouch_crypto_open(&root->crypto_allocator, &options->crypto,
+                            &root->crypto, &key_file, error);
+  lc_free_with_allocator(&root->crypto_allocator, key_file);
   if (rc == LC_OK)
     rc = ps_open(path, create, &options->storage, &root->space, error);
   if (rc == LC_OK)

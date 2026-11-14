@@ -9,6 +9,8 @@ typedef struct ps_namespace ps_namespace;
 typedef struct ps_root_options {
   ps_options storage;
   lc_pouch_crypto_open_options crypto;
+  /* Codec outputs share the logical Pouch owner's allocation domain. */
+  const lc_allocator *crypto_allocator;
   /* Creation uses crypto.compression_enabled. Reopen inherits the stored
    * policy unless explicit; a different explicit policy requires conversion,
    * which is not yet implemented by this owner. No implicit reinterpretation.

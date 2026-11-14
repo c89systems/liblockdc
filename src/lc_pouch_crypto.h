@@ -143,6 +143,11 @@ int lc_pouch_crypto_source_from_fd_span(lc_pouch_crypto *crypto,
                                         uint64_t offset, uint64_t length,
                                         const char *descriptor, lc_source **out,
                                         lc_error *error);
+/* Consumes a resettable bounded encoded source on success or failure. The
+ * input may retain the crypto owner until this decoded source is closed. */
+int lc_pouch_crypto_source_from_source(lc_pouch_crypto *, const char *,
+                                       const char *, lc_source *, uint64_t,
+                                       const char *, lc_source **, lc_error *);
 
 /* Operation-owned decoding scratch, reused across independent payload spans.
  * Crypto and fd are borrowed; neither is closed by clear/bind/close. Each bind

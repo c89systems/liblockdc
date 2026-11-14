@@ -9,6 +9,7 @@
 #include "lc_pouch_record.h"
 #include "lc_pouch_state_record.h"
 #include "namespace.h"
+#include "pouch.h"
 #include "record_io.h"
 #include "root.h"
 #include "space.h"
@@ -70,7 +71,7 @@ typedef struct worker {
   int rc;
 } worker;
 struct comparison {
-  int container, collection, sync, streams, existing_records;
+  int container, collection, sync, streams, existing_records, runtime;
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -522,7 +523,14 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     options.background_compaction_enabled_set = 1;
     options.segment_target_bytes = PS_MIB;
     options.compression = "none";
-    check(lc_pouch_open(c->store, NULL, &options, &c->pouch, e), e);
+    if (c->runtime) {
+      ps_pouch_state_options integrated = {0};
+      integrated.logical = options;
+      check(ps_pouch_state_open(c->store, create, NULL, &integrated, &c->pouch,
+                                e),
+            e);
+    } else
+      check(lc_pouch_open(c->store, NULL, &options, &c->pouch, e), e);
     return;
   }
   lc_client_config_init(&config);
@@ -805,11 +813,13 @@ int main(int argc, char **argv) {
       open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0;
   int preopen;
   if (argc != 8 && argc != 9) {
-    fprintf(stderr,
-            "usage: %s space-state|stream-state|pouch-state|space-collection|"
-            "stream-collection|pouch-collection "
-            "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
-            argv[0]);
+    fprintf(
+        stderr,
+        "usage: %s "
+        "space-state|stream-state|runtime-state|pouch-state|space-collection|"
+        "stream-collection|pouch-collection "
+        "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
+        argv[0]);
     return 2;
   }
   memset(&c, 0, sizeof(c));
@@ -820,10 +830,12 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "space-collection") ||
               !strcmp(argv[1], "pouch-collection") ||
               !strcmp(argv[1], "stream-state") ||
+              !strcmp(argv[1], "runtime-state") ||
               !strcmp(argv[1], "stream-collection"),
           "mode");
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
+  c.runtime = !strcmp(argv[1], "runtime-state");
   c.collection = strstr(argv[1], "collection") != NULL;
   c.rows = number(argv[3], 1, PS_DEFAULT_CAPACITY / PS_PAGE);
   c.bytes = number(argv[4], 64, 2 * PS_MIB);
@@ -943,6 +955,23 @@ int main(int argc, char **argv) {
       }
     }
   }
+  if (c.runtime) {
+    /* Observe the same typed owner once, outside the measured mutation loop. */
+    for (i = 0; i < c.writers; ++i) {
+      lc_pouch_storage_namespace_info info;
+      void *ns = NULL;
+      char ns_name[64], key_name[64];
+      names(i, i, ns_name, key_name);
+      check(c.pouch->storage.ops->namespace_open(c.pouch->storage.context,
+                                                 ns_name, 0, &ns, &e),
+            &e);
+      check(c.pouch->storage.ops->namespace_info(c.pouch->storage.context, ns,
+                                                 &info, &e),
+            &e);
+      logical_segments += info.segments;
+      c.pouch->storage.ops->namespace_close(c.pouch->storage.context, ns);
+    }
+  }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
   start = now(CLOCK_MONOTONIC);
   verify_all(&c, &e);
@@ -957,13 +986,15 @@ int main(int argc, char **argv) {
   verify_all(&c, &e);
   reopen_read_seconds = now(CLOCK_MONOTONIC) - start;
   count_files(c.store, &artifacts);
-  if (c.container) {
+  if (c.container || c.runtime) {
     /* The test helper owns one marker in the parent, outside the store. Audit
      * the whole parent too so an accidental store sidecar cannot hide. */
     count_files(c.root, &audit);
     require(audit.regular == 2 && audit.directories == 1 &&
                 artifacts.regular == 1 && artifacts.directories == 0,
             "exactly one container and no sidecars");
+  }
+  if (c.container) {
     check(ps_status(c.space, &stats, &e), &e);
     if (c.streams) {
       require(stats.entries == (uint64_t)stream_grants + 2 * logical_segments +

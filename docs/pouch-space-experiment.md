@@ -1379,11 +1379,166 @@ and final memory reports `namespace-final-*-memcheck.log`.
 Exactly one container file and no store directories are verified in every
 stream case. No Darwin, QEMU or 250 MiB-and-larger execution was run.
 
-This completes namespace segment storage and bounded canonical replay in the
-experimental owner. Normal public `lc_pouch_open` remains multifile. Public
-namespace projection/mutation policy, snapshot/obsolete ownership, public
-collections, maintenance and shared-root coordination remain required by the
-active full implementation goal.
+This completed namespace segment storage and bounded canonical replay in the
+experimental owner. The following integration now connects ordinary production
+state projection/mutation policy. Normal public `lc_pouch_open` remains
+multifile; remaining public semantics, snapshot/obsolete ownership, collections,
+maintenance and shared-root coordination remain part of the active goal.
+
+## Production ordinary-state integration
+
+The private `ps_pouch_state_open` harness now connects production ordinary-state
+PUT, point read, metadata read, copy and namespace creation to the container's
+namespace owner. This uses the real precondition, version, metadata, sequence,
+retention, SHA-256, codec and projection rules. Timestamp, retention and sequence
+publication remain after the producer. Replay rebuilds the production projection
+without a manufactured namespace pathname; failed replay cannot admit a partial
+projection. Encoded read windows retain their storage owner and original crypto
+binding across replacement, rotation and Pouch close. The container path creates
+no body cache or payload spool.
+
+The internal capability table supplies namespace admission/info, canonical
+replay, private append/commit and bounded encoded sources. Common runtime
+initialization owns Pouch coordination and options. Native public
+`lc_pouch_open` remains multifile; the integration harness is not installed or
+selected through an SDK flag. It requires disabled indexing, background
+maintenance and watches, exclusive root ownership and no generated external key
+file. Other Pouch APIs are outside its current call contract. State PUT
+staged/lease publication and staged decision replay explicitly return
+unsupported. Remaining metadata-only mutation/delete, read-many/scans,
+collections, queues, indexes, XA, maintenance, snapshot/obsolete ownership and
+shared-root semantics still require integration.
+
+### Verification
+
+The native Debug preset passed all 247 checks, with ASan/UBSan and constrained
+worker stacks. GNU and musl release each passed all 151 selected unit checks,
+including all 56 pouch-space checks. The extended held-read lifecycle passed
+again in Debug/GNU and in the full musl run. Fifteen affected
+Pouch/root/namespace/state-codec groups passed ThreadSanitizer.
+
+The new integration groups cover all four crypto/compression combinations,
+both sync policies, 1 MiB streaming bodies, small caller-owned memory bodies,
+empty bodies, version rejection before source consumption, failed-producer
+rollback, metadata inheritance, namespace names containing slashes, rotation,
+populated-root reopen and inherited compression policy. Read sources retain
+their old body across replacement/rotation, reset after Pouch close, keep the
+root exclusively owned until their last close, and then permit reopening.
+A held producer allows a reader in its namespace and a writer in another
+namespace to finish. A same-key contender fails its stale version precondition
+without consuming its source.
+
+Allocation tests inject all 790 observed positions across creation, streaming
+and memory PUT, cold replay and warm reads in plaintext and encrypted/compressed
+modes, under both sync policies. I/O tests inject all 58 observed write,
+reservation and synchronization positions, including a written prefix followed
+by failure. They verify that the anchor survives, an update is absent or fully
+committed, and reopen admits another write. Producer failure preserves the
+previous value. A failed publication/result allocation can have a complete
+committed outcome, consistent with the existing mutation engine; an error is
+not treated as an instruction to undo durable publication. Cached metadata
+admission after physical poison is separately asserted in Debug, GNU, musl and
+TSAN. These integration I/O tests use real native files; the foundation's
+existing deterministic durable-image tests remain the power-loss model.
+
+Memcheck passed all five new groups: 396,026 allocations and frees, zero bytes
+or blocks remaining, zero errors and zero suppressions. Crypto outputs use the
+logical owner's allocation domain. Tests found and fixed a root key-ID cleanup
+domain mismatch and shared append reservation cleanup leaks.
+
+Logs are under `build/pouch-space-integrated/runtime-*`: Debug is split between
+`runtime-debug-tests.log` (the first 16 checks) and
+`runtime-debug-remaining-tests.log` (the remaining 231 selected checks).
+GNU/musl logs, focused held-read/admission checks, TSAN and the five
+`runtime-*-memcheck.log` files retain their respective evidence.
+
+### Matched production-state measurements
+
+Native GNU release, 10 MiB initial container, 1 KiB bodies delivered through
+4 KiB source callbacks, two PUT rounds, no crypto/compression, indexing or
+background maintenance. Five samples per profile/engine alternate execution
+order. Both integrated and current multifile modes call production
+`lc_pouch_state_write` and `lc_pouch_state_read`; the older stream fixture is
+not substituted for the integrated engine. Each writer owns a distinct
+namespace. The rotating profile uses one namespace and four logical segments;
+same-namespace contention is covered by the correctness tests.
+
+Every run verifies the current bodies before close and after reopening the
+populated root. All 20 integrated runs also audit the parent directory and
+require exactly one store file and no store sidecars. The “empty-root reopen”
+profile reopens an empty root before writes; populated reopen plus verification
+is measured separately in every profile. OS page cache is retained. The point
+read column is a hot-projection first body pass, including any multifile body
+cache population; it is not a repeated body-cache hit or a public scan.
+
+Median milliseconds, container versus current multifile:
+
+| Workload | Container PUT | Multifile PUT | Container point read | Multifile point read |
+| --- | ---: | ---: | ---: | ---: |
+| Durable, 128 keys, 1 writer | 687.52 | 1233.71 | 0.52 | 3.46 |
+| Fresh NoSync, 1,024 keys, 4 writers | 21.85 | 26.20 | 3.65 | 30.60 |
+| Empty-root reopen, NoSync, 4 writers | 46.74 | 24.78 | 3.59 | 30.51 |
+| Rotating NoSync, 1,024 keys, 1 writer | 89.62 | 68.91 | 3.68 | 29.08 |
+
+Durable PUT is about 1.8 times faster here. Fresh NoSync PUT is faster, while
+empty-root-reopened NoSync is about 1.9 times slower and rotating NoSync about
+1.3 times slower. Point-read passes are roughly 7–8 times faster. Public scan
+performance is still unmeasured through this integration.
+
+The container does not yet publish Pouch's clean projection hint at close and
+replays canonical records when building the next projection. Multifile pays
+for that hint during close. Include that work when comparing restart:
+
+| Workload | Close C / MF | Reopen + verify C / MF | Close + reopen + verify C / MF |
+| --- | ---: | ---: | ---: |
+| Durable, 128 keys, 1 writer | 0.04 / 11.88 | 11.98 / 3.87 | 12.06 / 16.69 |
+| Fresh NoSync, 1,024 keys, 4 writers | 0.15 / 64.11 | 46.74 / 31.70 | 46.89 / 99.21 |
+| Empty-root reopen, NoSync, 4 writers | 0.16 / 46.89 | 44.00 / 30.20 | 44.19 / 78.05 |
+| Rotating NoSync, 1,024 keys, 1 writer | 0.15 / 15.27 | 19.05 / 31.74 | 19.18 / 47.53 |
+
+The combined column is the median of per-sample sums. Container reopen alone is
+slower in the first three profiles, while its close work is much smaller. Sealed
+segments avoid physical candidate-tail recovery; logical projection replay
+still verifies canonical records. Typed snapshot/clean-projection integration
+remains necessary before full backend acceptance.
+
+Median write CPU times C/MF are 32.50/47.30 ms (durable), 50.44/49.27 ms
+(fresh four-writer), 49.56/46.20 ms (reopened four-writer), and 33.20/34.43 ms
+(rotating single-writer). Similar NoSync CPU with larger wall time suggests
+waiting/coordination as the next performance target, but the counters do not
+isolate the critical path.
+
+Count both synchronization APIs. During PUT, container fdatasync/fsync counts
+are 260/0, 6/0, 9/0 and 12/0 respectively; multifile counts are 256/2, 0/8, 0/8
+and 0/8. They cover different dependency sets. Timed synchronization sums can
+overlap across workers and cannot be subtracted from wall time as a causal
+breakdown. Reopened-space preparation and rotation remain the NoSync targets.
+
+The preserved `02b7fc3` multifile reference was measured in the same run;
+its PUT medians were 1243.33, 31.96, 29.46 and 67.39 ms respectively. Wall
+times varied materially: rotating PUT ranged 68.25–149.42 ms for the container
+and 57.04–110.00 ms for current multifile. Do not infer a shared-code speedup
+from current/reference wall differences. These are local measurements at the
+specified scale, not evidence for larger deployments.
+
+The 60 complete logs, paired Bash runner, JSON metric rows/group summaries,
+two preserved executables and their SHA-256 manifest are in
+`build/pouch-space-integrated/runtime-paired/`,
+`runtime-paired.sh`, `runtime-results.json`,
+`pouch_space_compare-runtime-current`,
+`pouch_space_compare-catalog-02b7fc3` and
+`runtime-artifacts.sha256`. The earlier namespace artifact manifest also
+passed verification before this run; those reference files were not replaced.
+
+For a current-source comparison after the normal native GNU configuration:
+
+```sh
+cmake --build build/x86_64-linux-gnu-release --target pouch_space_compare
+build/x86_64-linux-gnu-release/experiments/pouch_space/pouch_space_compare \
+  runtime-state "$PWD/build/pouch-space-integrated" 1024 1024 0 4 4096 --reopen
+build/x86_64-linux-gnu-release/experiments/pouch_space/pouch_space_compare \
+  pouch-state "$PWD/build/pouch-space-integrated" 1024 1024 0 4 4096 --reopen
+```
 
 ## Next commitments
 
@@ -1393,9 +1548,10 @@ pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
 packing, canonical-stream, lifecycle, typed catalog and production collection
 and ordinary state record follow-ups. Namespace segments now have a real
-container owner. The next major task joins resident namespace projections and
-mutation/source paths to it, followed by public collection ownership, and proves
-the actual public behavior suites. Full native integration still
+container owner. Ordinary production state PUT/projection/point-read paths now
+join it through the private integration harness. The next work connects the
+remaining state mutation/scan paths and public collection ownership, then
+completes the public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits

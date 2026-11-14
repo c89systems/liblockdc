@@ -18,6 +18,7 @@ struct ps_namespace {
 struct ps_root {
   ps_space *space;
   lc_pouch_crypto *crypto;
+  lc_allocator crypto_allocator;
   pthread_mutex_t mutex;
   pthread_cond_t changed;
   ps_namespace *namespaces, **buckets;

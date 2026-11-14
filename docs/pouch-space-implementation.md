@@ -223,6 +223,48 @@ policy. Snapshot installation, obsolete ownership/reclamation, public collection
 ownership and process-shared coordination remain required. Normal
 `lc_pouch_open` still opens multifile roots; there is no deployment cutover.
 
+## Production state integration
+
+A private `ps_pouch_state_open` harness now connects ordinary production state
+PUT, point read, metadata read, copy and namespace creation to the container.
+Common Pouch runtime initialization owns options, logging and coordination;
+the storage owner supplies typed namespace admission, canonical replay, private
+append/commit and bounded encoded sources. It supplies no pathname operations.
+Native `lc_pouch_open` remains multifile until full integration and acceptance;
+there is no SDK backend selector.
+
+The existing state engine retains preconditions, generations, index sequence
+allocation, metadata inheritance, retention publication, SHA-256, codecs and
+projection application. Timestamp, retention and sequence publication remain
+after the streaming producer. Caller-owned small memory sources retain the
+existing bounded memory transform optimization. Other producers flow directly
+through bounded codec/append buffers; container reads populate no body cache.
+
+Replay uses the production projection application rules, with no manufactured
+namespace path. Failed replay clears the partial projection before retry.
+Hot operations check physical poison. One appender per namespace retains the
+existing logical append authority; independent namespaces share the physical
+coordinator. Producer callbacks and durable commit waits release the projection
+mutex while exact-key and append authority remain held. Competing stale
+preconditions fail before consuming their source.
+
+Encoded read windows retain the namespace and storage owner. Their decoded
+sources retain their original body and crypto binding across replacement,
+rotation and Pouch close. The last source releases exclusive container ownership.
+Crypto outputs use the logical owner's allocator; default-allocated key IDs
+retain their original allocation domain. Shared append completion cleanup also
+releases reserved metadata and precomputed transforms after failed reservation
+or finalization.
+
+This harness explicitly requires disabled query indexing, background maintenance
+and queue watches, exclusive root ownership and no generated external key file.
+State PUT staged/lease publication requests and staged decision replay return
+unsupported. Other Pouch APIs are outside this harness's current call contract.
+Metadata-only mutation/delete, read-many/scans, collections, queues, XA, indexes,
+snapshot/obsolete ownership, maintenance and shared-root operation remain
+integration work. This is a verified ordinary-state slice, not full backend
+acceptance or deployment authorization.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and
@@ -253,8 +295,10 @@ bypassed through a cached namespace.
 The stream comparison now opens through this root owner and obtains its actual
 namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
 Namespace heads, segment ownership/rotation and bounded canonical replay now use
-this owner too. Public mutation/replay policy, snapshot/obsolete sets and public
-collection ownership still require integration. Normal `lc_pouch_open` uses
+this owner too. The private ordinary-state harness now uses the production
+projection and PUT/read policy. Remaining state mutation/scan paths,
+snapshot/obsolete sets and public collection ownership still require
+integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
 

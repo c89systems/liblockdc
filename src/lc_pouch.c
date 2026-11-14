@@ -4935,16 +4935,12 @@ static void lc_pouch_writer_presence_stop_abrupt(lc_pouch *pouch) {
   lc_pouch_writer_presence_stop_internal(pouch, 0);
 }
 
-int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
-                  const lc_pouch_open_options *options, lc_pouch **out,
-                  lc_error *error) {
+int lc_pouch_runtime_open(const char *root_path, const lc_allocator *allocator,
+                          const lc_pouch_open_options *options, lc_pouch **out,
+                          lc_error *error) {
   lc_pouch *pouch;
-  lc_pouch_crypto_open_options crypto_options;
-  int requested_single_writer;
   int pthread_rc;
-  int rc;
   size_t key_mutex_index;
-  struct stat root_stat;
 
   if (root_path == NULL || root_path[0] == '\0' || out == NULL) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -5054,8 +5050,6 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
                         "failed to copy pouch root path", NULL, NULL, NULL);
   }
   lc_pouch_init_options(pouch, options);
-  requested_single_writer = pouch->single_writer;
-  pouch->single_writer = 0;
   pouch->single_writer_epoch = 1U;
   pouch->base_logger = options != NULL && options->logger != NULL
                            ? options->logger
@@ -5097,6 +5091,28 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
                         "pouch compression must be none or zlib", NULL, NULL,
                         "pouch");
   }
+  *out = pouch;
+  return LC_OK;
+}
+
+int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
+                  const lc_pouch_open_options *options, lc_pouch **out,
+                  lc_error *error) {
+  lc_pouch *pouch = NULL;
+  lc_pouch_crypto_open_options crypto_options;
+  struct stat root_stat;
+  int requested_single_writer, rc;
+  if (out)
+    *out = NULL;
+  if (!out)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "lc_pouch_open requires output", NULL, NULL, NULL);
+  rc = lc_pouch_runtime_open(root_path, allocator, options, &pouch, error);
+  if (rc != LC_OK)
+    return rc;
+  *out = NULL;
+  requested_single_writer = pouch->single_writer;
+  pouch->single_writer = 0;
   memset(&crypto_options, 0, sizeof(crypto_options));
   if (options != NULL) {
     crypto_options.key_string = options->crypto_key;
@@ -5227,14 +5243,17 @@ void lc_pouch_close(lc_pouch *pouch) {
   lc_pouch_compaction_worker_close(pouch);
   lc_pouch_state_metadata_append_worker_close(pouch);
   lc_pouch_fsync_batcher_close(pouch);
-  if (!pouch->aborted) {
+  if (!pouch->aborted && !pouch->storage.ops) {
     lc_pouch_state_checkpoint_clean_close(pouch);
   }
   lc_pouch_state_cache_cleanup(pouch);
   lc_pouch_state_source_cache_cleanup(pouch);
   lc_pouch_query_index_cache_cleanup(pouch);
   lc_pouch_writer_root_lock_release(pouch);
-  lc_pouch_crypto_close(pouch->crypto);
+  if (pouch->storage.ops)
+    pouch->storage.ops->close(pouch->storage.context);
+  else
+    lc_pouch_crypto_close(pouch->crypto);
   lc_free_with_allocator(&allocator, pouch->crypto_key_file);
   lc_free_with_allocator(&allocator, pouch->writer_presence_path);
   lc_free_with_allocator(&allocator, pouch->writer_presence_leaf);
@@ -5988,6 +6007,8 @@ int lc_pouch_ensure_namespace(lc_pouch *pouch, const char *ns,
                         "lc_pouch_ensure_namespace requires pouch", NULL, NULL,
                         NULL);
   }
+  if (pouch->storage.ops != NULL)
+    return lc_pouch_state_recover_staged_decisions(pouch, ns, error);
   rc =
       lc_pouch_namespace_ensure(&pouch->allocator, pouch->root_path, ns, error);
   if (rc != LC_OK) {

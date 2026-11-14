@@ -3,6 +3,7 @@
 
 #include "lc_pouch.h"
 #include "lc_pouch_crypto.h"
+#include "lc_pouch_storage.h"
 
 #include <pthread.h>
 #include <time.h>
@@ -161,6 +162,7 @@ typedef int (*lc_pouch_state_scan_summary_visit_fn)(
 
 struct lc_pouch {
   lc_allocator allocator;
+  lc_pouch_storage storage;
   char *root_path;
   uint64_t segment_target_bytes;
   uint64_t indexer_flush_docs;

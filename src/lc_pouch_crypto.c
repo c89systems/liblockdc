@@ -123,6 +123,7 @@ struct lc_pouch_crypto_reader {
   EVP_MAC_CTX *derivation;
   EVP_CIPHER_CTX *binding;
   lc_source *active;
+  lc_source *owned_input;
   int owned_fd;
 };
 
@@ -3621,6 +3622,9 @@ void lc_pouch_crypto_reader_clear(lc_pouch_crypto_reader *reader) {
     reader->decryptor->fd = -1;
     reader->decryptor->input = NULL;
   }
+  if (reader->owned_input != NULL)
+    reader->owned_input->close(reader->owned_input);
+  reader->owned_input = NULL;
 }
 
 void lc_pouch_crypto_reader_close(lc_pouch_crypto_reader *reader) {
@@ -3894,6 +3898,35 @@ int lc_pouch_crypto_reader_bind_source(lc_pouch_crypto_reader *reader,
                                        lc_error *error) {
   return lc_pouch_crypto_reader_bind_input(reader, context, binding, -1, input,
                                            0, length, descriptor, out, error);
+}
+
+int lc_pouch_crypto_source_from_source(lc_pouch_crypto *crypto,
+                                       const char *context, const char *binding,
+                                       lc_source *input, uint64_t length,
+                                       const char *descriptor, lc_source **out,
+                                       lc_error *error) {
+  lc_pouch_crypto_reader *reader = NULL;
+  int rc;
+  if (out != NULL)
+    *out = NULL;
+  if (input == NULL || out == NULL) {
+    if (input != NULL)
+      input->close(input);
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch crypto source requires input and output", NULL,
+                        NULL, "pouch");
+  }
+  rc = lc_pouch_crypto_reader_open(crypto, &reader, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_crypto_reader_bind_source(reader, context, binding, input,
+                                            length, descriptor, out, error);
+  if (rc != LC_OK) {
+    lc_pouch_crypto_reader_close(reader);
+    input->close(input);
+    return rc;
+  }
+  reader->owned_input = input;
+  return LC_OK;
 }
 
 /* Fill one bounded frame buffer. Small spans include their terminal frame in
