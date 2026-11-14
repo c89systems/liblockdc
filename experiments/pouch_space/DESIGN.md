@@ -8,10 +8,14 @@ Neither implements public leases, JSON validation, codecs, indexes, XA or
 receipts. Comparisons must identify these differences rather than claim feature
 parity. The comparison adapter separately applies the existing collection JSON
 validator before publishing collection-shaped values.
-The canonical stream collection variant now uses the production collection
-record writer and decoder, including SHA-256 and full record metadata; this is
-separate from the immutable-value fixture above. Normal public Pouch still opens
-multifile roots.
+The canonical stream variants now use production collection/state metadata,
+SHA-256 and bounded codecs, separately from those immutable-value fixtures.
+Ordinary segmented and container replay share one bounded reader; borrowed
+stdio preserves native readahead. State/object PUT byte output accepts borrowed
+record I/O and caller-owned versions, sequences and timestamps. It finalizes
+metadata before clearing PENDING and never commits or syncs its owner's stream.
+The caller retains namespace policy and append/publication authority. No payload
+spool is introduced. Normal public Pouch still opens multifile roots.
 
 One exclusive Linux `flock` protects the container lifetime. Independent threads
 reserve private extents under a short mutex; producer callbacks run outside it.

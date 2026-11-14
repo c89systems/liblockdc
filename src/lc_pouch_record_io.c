@@ -92,6 +92,46 @@ static int file_read(void *context, uint64_t offset, const struct iovec *parts,
                        parts[0].iov_len, 1, e);
   return file_transfer((int)(intptr_t)context, offset, parts, count, 1, e);
 }
+static int stdio_read(void *context, uint64_t offset, const struct iovec *parts,
+                      int count, lc_error *e) {
+  FILE *fp = context;
+  off_t current = ftello(fp);
+  int i;
+  if (current < 0 ||
+      ((uint64_t)current != offset && fseeko(fp, (off_t)offset, SEEK_SET) != 0))
+    return lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                        "failed to seek pouch record input", strerror(errno),
+                        NULL, "pouch");
+  for (i = 0; i < count; ++i) {
+    size_t remaining = parts[i].iov_len;
+    unsigned char *p = parts[i].iov_base;
+    while (remaining) {
+      size_t got = fread(p, 1, remaining, fp);
+      remaining -= got;
+      p += got;
+      if (ferror(fp)) {
+        if (errno == EINTR) {
+          clearerr(fp);
+          continue;
+        }
+        return lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                            "failed to read pouch record input",
+                            strerror(errno), NULL, "pouch");
+      }
+      if (!got)
+        return io_error(e, LC_ERR_PROTOCOL, "pouch record input is truncated");
+    }
+  }
+  return LC_OK;
+}
+lc_pouch_record_io lc_pouch_record_stdio_io(FILE *fp) {
+  static const lc_pouch_record_io_ops ops = {stdio_read, NULL, NULL, NULL,
+                                             NULL};
+  lc_pouch_record_io io;
+  io.ops = fp != NULL ? &ops : NULL;
+  io.context = fp;
+  return io;
+}
 static int file_append(void *context, const struct iovec *parts, int count,
                        lc_error *e) {
   if (count == 1)

@@ -2971,6 +2971,41 @@ int lc_pouch_crypto_stream_to_fd_crc(lc_pouch_crypto *crypto,
       descriptor_out, 1, error);
 }
 
+int lc_pouch_crypto_stream_to_sink(lc_pouch_crypto *crypto, const char *context,
+                                   lc_sink *sink, lc_source *body,
+                                   uint64_t *plain_bytes,
+                                   uint64_t *stored_bytes,
+                                   unsigned long *stored_crc, char **descriptor,
+                                   int allow_compression, lc_error *error) {
+  lc_pouch_crypto_pull_producer producer;
+  lc_pouch_crypto_writer *writer = NULL;
+  int rc;
+  if (descriptor != NULL)
+    *descriptor = NULL;
+  if (sink == NULL || sink->write == NULL || body == NULL ||
+      body->read == NULL || plain_bytes == NULL || stored_bytes == NULL ||
+      stored_crc == NULL || descriptor == NULL)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch crypto stream requires source, sink and outputs",
+                        NULL, NULL, "pouch");
+  *plain_bytes = *stored_bytes = 0U;
+  *stored_crc = 0UL;
+  producer.source = body;
+  producer.allocator = crypto != NULL ? &crypto->allocator : NULL;
+  rc = lc_pouch_crypto_writer_open_output(crypto, context, -1, sink,
+                                          allow_compression, &writer, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_crypto_produce_source(
+        &producer, lc_pouch_crypto_writer_sink(writer), error);
+  if (rc == LC_OK && error != NULL && error->code != LC_OK)
+    rc = error->code;
+  if (rc == LC_OK)
+    rc = lc_pouch_crypto_writer_finish(writer, plain_bytes, stored_bytes,
+                                       stored_crc, descriptor, error);
+  lc_pouch_crypto_writer_close(writer);
+  return rc;
+}
+
 int lc_pouch_crypto_stream_to_fd_crc_with_compression(
     lc_pouch_crypto *crypto, const char *context, int fd, lc_source *body,
     uint64_t *plain_bytes, uint64_t *cipher_bytes, unsigned long *stored_crc,

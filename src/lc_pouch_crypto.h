@@ -46,6 +46,13 @@ int lc_pouch_crypto_stream_to_fd_crc_with_compression(
     lc_pouch_crypto *crypto, const char *context, int fd, lc_source *body,
     uint64_t *plain_bytes, uint64_t *cipher_bytes, unsigned long *stored_crc,
     char **descriptor_out, int allow_compression, lc_error *error);
+/* Same bounded pull encoder, with borrowed encoded-byte destination. */
+int lc_pouch_crypto_stream_to_sink(lc_pouch_crypto *, const char *context,
+                                   lc_sink *, lc_source *,
+                                   uint64_t *plain_bytes,
+                                   uint64_t *stored_bytes,
+                                   unsigned long *stored_crc, char **descriptor,
+                                   int allow_compression, lc_error *);
 /* A synchronous producer writes bounded chunks into the borrowed sink. The
  * same codec serves pull sources and validated JSON push writers; no bridge
  * thread, spool, or whole-value buffer is needed. Failure leaves an unpublished

@@ -212,9 +212,9 @@ bypassed through a cached namespace.
 The stream comparison now opens through this root owner and obtains its actual
 namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
 This is root bootstrap and namespace identity ownership; namespace manifests,
-ordinary data/replay, snapshot/obsolete sets and public collection ownership
-still require integration. Normal `lc_pouch_open` continues to use multifile
-roots. The experimental owner retains exclusive physical open ownership; it
+ordinary namespace mutation/replay ownership, snapshot/obsolete sets and public
+collection ownership still require integration. Normal `lc_pouch_open` uses
+multifile roots. The experimental owner retains exclusive physical open ownership; it
 does not implement shared-root coordination.
 
 The production canonical record I/O boundary is now shared with the container
@@ -242,11 +242,28 @@ bytes directly, without a payload spool or another WAL. Tests cover all four
 transform combinations, both durability modes, output before EOF, failed
 producers, every canonical callback failure before/after I/O, pinned windows,
 checkpoint/reopen and retirement. The comparison uses this real collection
-codec; its state-shaped fixture still has minimal metadata.
+codec. The ordinary state variant now uses complete production metadata too.
+
+`lc_pouch_state_record_read` is the shared bounded canonical reader for native
+segmented replay and container streams. Native replay uses borrowed stdio I/O
+to preserve readahead. It validates captured bounds before allocating, retains
+the production metadata/control dispatch, optionally checks stored payload CRC
+with reusable 16 KiB scratch, and replaces a decoded entry only after success.
+Incomplete/PENDING tails are distinct from corruption and transport errors.
+
+The ordinary container byte writer uses the existing state metadata encoders,
+SHA-256 and bounded pull encoder with an encoded-byte sink. It supports state
+and object PUTs with all four codec combinations and compression override.
+Metadata/result allocations finish before PENDING is cleared; failure discards
+the owner's private append. It owns neither namespace mutation policy nor
+version/index allocation, publication or sync. Logical segment labels remain
+metadata; no file is created for a label. Native Pouch's mutation authority and
+write sequencing are unchanged. The shared hash source rejects oversized
+producer returns before hashing.
 
 This is partial integration, not root-wide adoption. Namespace data and collection
-owners, ordinary state payload/replay I/O, metadata mutation/copy paths, control
-ownership, position/receipt authority, projections and public root lifetime still
+owners, ordinary namespace mutation/replay policy, metadata mutation/copy paths,
+control ownership, position/receipt authority, projections and public root lifetime still
 need conversion to container ownership. Normal public Pouch tests continue to
 exercise the segmented backend through the shared record I/O boundary.
 

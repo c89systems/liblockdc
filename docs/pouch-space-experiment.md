@@ -1134,6 +1134,108 @@ For native musl, provision `deps-x86_64-linux-musl`, configure the
 CTest with `-R '^pouch_space_'`.
 Valgrind output is retained in `build/pouch-space-comparison/valgrind.log`.
 
+## Canonical ordinary state records
+
+The ordinary stream comparison now writes the production state record format:
+versions, timestamps, SHA-256 etags, payload references/CRC, content type,
+descriptor reservation, payload context, side metadata and index trailer. The
+previous 16-byte metadata fixture is removed from the current implementation.
+Both native segmented replay and container replay now use the same bounded
+reader and existing production metadata decoders. A borrowed stdio adapter keeps
+the native owner's readahead; container access remains offset based. There is
+no whole-payload staging. The codec leaves namespace policy, sequence allocation,
+publication and durability with its caller.
+
+The shared pull encoder now accepts an encoded-byte sink with an explicit
+compression choice. The ordinary container writer hashes plaintext while
+producing encoded bytes, reserves canonical metadata, and clears PENDING only
+after the final metadata and result allocations succeed. Errors discard the
+owner's private append. State/object PUT output supports plain, compressed,
+encrypted and combined records. The shared decoder also retains the existing
+metadata, delete, decision and high-water dispatch used by native Pouch.
+
+Tests cover empty, one-byte and 1 MiB-plus payloads, staged and deadline retention,
+compression override, exact plaintext/hash/metadata recovery, trusted checkpoint
+prefixes and verified candidate tails. Encoded output must flow before producer
+EOF. Every captured-end cut, pending/invalid flags, wrong payload identities,
+partial stdio reads/EINTR, transport errors, record I/O/allocation failures and
+oversized producer returns are exercised. Failed reads preserve a previously
+decoded entry; failed appends preserve earlier records. Four independent state
+streams share one crypto provider in the concurrency test. That retention stress
+fixture reserves 32 MiB for sixteen 1 MiB records; performance fixtures remain
+at the 10 MiB default.
+
+Verification passed the standard Debug gate (233 tests), GNU Release unit gate
+(137), musl Release unit gate (138), and all seventeen ThreadSanitizer storage
+checks. After the final writer-only input-contract tightening, all seven affected
+state/benchmark checks passed again on Debug, GNU and musl, and all three state
+record checks passed again under ThreadSanitizer. The three final state record
+groups passed Memcheck with zero errors, no suppressions and all 25,982 allocations
+freed. Formatting and diff checks apply to the final sources. These are native
+x86_64 checks; no Darwin, QEMU or 250 MiB-and-larger execution is claimed.
+
+The final matched series contains 150 verified cases: five samples, three
+profiles, both record kinds, and five engines. Engine order reverses between
+samples. The pre-stage executable is `026fd33`; the untouched multifile baseline
+is `02b7fc3`. Every sample verifies values before and after reopening. All stream
+cases have exactly one physical file and no store directories. Write medians
+are milliseconds:
+
+| Workload | Pre-stage stream | Complete stream | Untouched multifile | Pre-stage multifile | Current multifile |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Durable, one writer, state | 702.85 | 715.75 | 1207.96 | 1249.72 | 1231.89 |
+| Durable, one writer, collection | 348.47 | 386.42 | 703.39 | 654.52 | 730.39 |
+| Fresh NoSync, four writers, state | 13.87 | 15.42 | 32.01 | 29.26 | 30.29 |
+| Fresh NoSync, four writers, collection | 13.32 | 14.33 | 92.18 | 94.39 | 92.64 |
+| Preopened NoSync, four writers, state | 34.25 | 38.65 | 28.43 | 28.23 | 28.44 |
+| Preopened NoSync, four writers, collection | 33.72 | 33.31 | 86.91 | 90.99 | 91.72 |
+
+All cases use 1 KiB values and 4 KiB source chunks. Durable state writes perform
+128 records twice; collection appends perform 128 records once. Long state runs
+perform 1,024 records twice; long collection runs append 2,048 records. The
+preopened profile closes/reopens an empty root before writing; it is neither a
+cold-cache test nor writing again to an already populated store.
+
+The final state stream ranges were 638.46–936.88 ms durable, 14.80–18.25 ms fresh
+NoSync and 33.65–58.46 ms preopened NoSync. Current multifile ranges were
+1,156.05–1,364.85, 29.52–33.04 and 24.01–33.03 ms respectively. The preopened
+NoSync slowdown remains: the stream performs seven synchronization calls at the
+median (range seven to eight), against zero in multifile Pouch. Durable namespace
+metadata and safe preparation of untrusted free extents still have costs. Fresh
+NoSync uses four barriers; durable state uses 259 versus 256 in current
+multifile Pouch. No writer queue or weaker commit guarantee was introduced.
+
+Complete metadata also makes the fresh state kernel-write counts comparable:
+3,248,128 bytes for the stream versus 3,244,032 for current multifile Pouch,
+instead of roughly 2.23 MB for the old stream fixture. The added format/hash
+work is included in these measurements. Absolute timings shifted across both
+engines between measurement rounds; use matched results and ranges, not a
+cross-round causal claim.
+
+The same long state runs measured these read medians in milliseconds. Reopen +
+read includes the run's final filled-store recovery and payload verification:
+
+| State profile | Stream warm read | Multifile warm read | Stream reopen + read | Multifile reopen + read |
+| --- | ---: | ---: | ---: | ---: |
+| Fresh NoSync, four writers | 3.38 | 35.38 | 47.99 | 53.61 |
+| Preopened NoSync, four writers | 2.95 | 47.76 | 35.44 | 37.59 |
+
+These remain warm physical-span reads against public Pouch reads. They do not
+establish public scan/index performance or complete namespace-policy parity.
+Total reopen readiness remains variable; the experiment has no general startup
+advantage. Current collection warm reads measured 5.57/7.11 ms for fresh/preopened
+roots, versus 10.84/10.87 ms for current multifile Pouch.
+
+Local evidence is retained under `build/pouch-space-integrated/`: the pinned
+`pouch_space_compare-state-current`, previous/root and untouched/catalog
+executables, `state-paired.sh`, all 150 `state-paired/*.log` files,
+`state-results.json` with samples/ranges, and `state-artifacts.sha256`. Verification
+logs use the `state-*` prefix; `state-last-*` and `state-final-release-*` record
+the final focused checks. Normal `lc_pouch_open` still uses multifile storage.
+The full implementation goal remains active: namespace mutation/manifests,
+snapshot/obsolete ownership, public collection integration, maintenance and
+shared-root coordination are still required.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1141,8 +1243,8 @@ the fixed 64 KiB checkpoint banks with growable typed metadata, packed descripto
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
 packing, canonical-stream, lifecycle, typed catalog and production collection
-record follow-ups. The next major task is connecting the existing namespace
-and collection owners to this boundary
+and ordinary state record follow-ups. The next major task is connecting the
+existing namespace and collection owners to this boundary
 and proving the actual public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader

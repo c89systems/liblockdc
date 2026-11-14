@@ -7,6 +7,7 @@
 #include "lc_pouch_collection_record.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_record.h"
+#include "lc_pouch_state_record.h"
 #include "record_io.h"
 #include "root.h"
 #include "space.h"
@@ -159,18 +160,6 @@ static int space_sink(lc_sink *sink, const void *bytes, size_t count,
                       lc_error *e) {
   return ps_write(sink->impl, bytes, count, e) == LC_OK;
 }
-static void stream_put64(unsigned char *p, uint64_t value) {
-  size_t i;
-  for (i = 0; i < 8; ++i)
-    p[i] = (unsigned char)(value >> (i * 8));
-}
-static uint64_t stream_get64(const unsigned char *p) {
-  size_t i;
-  uint64_t value = 0;
-  for (i = 0; i < 8; ++i)
-    value |= (uint64_t)p[i] << (i * 8);
-  return value;
-}
 static const char canonical_leaf[] = "seg-00000000000000000001.log";
 /* Use the production collection decoder, including its full identity,
  * retention, descriptor and payload-span checks. The derived row offset table
@@ -243,73 +232,49 @@ static int stream_recover(ps_stream *stream, uint64_t checkpoint,
                           lc_error *e) {
   worker *w = context;
   comparison *c = w->run;
-  lc_pouch_record_header record;
-  unsigned char header[32], meta[80], buffer[4096], zero[32] = {0};
-  uint64_t cursor = 0, payload, end, id, round;
-  unsigned long crc;
-  size_t take;
-  char ns[64], name[64];
-  int rc = LC_OK;
+  lc_allocator allocator = {0};
+  lc_pouch_state_entry entry = {0};
+  unsigned char *scratch = NULL;
+  uint64_t cursor = 0, next;
+  unsigned long id;
+  int rc = LC_OK, found, truncated;
+  char ns[64], name[64], extra;
   if (c->collection)
     return collection_stream_recover(stream, checkpoint, capacity, accepted, w,
                                      e);
   w->records = 0;
-  while (capacity - cursor >= sizeof(header)) {
-    rc = ps_stream_recovery_read(stream, cursor, header, sizeof(header), e);
-    if (rc != LC_OK || !memcmp(header, zero, sizeof(header)))
-      break;
-    rc = lc_pouch_record_header_decode(header, &record, e);
+  while (cursor < capacity) {
+    rc = lc_pouch_state_record_read(ps_record_recovery_input(stream),
+                                    &allocator, canonical_leaf, cursor,
+                                    capacity, 1, cursor >= checkpoint, &scratch,
+                                    &entry, &next, &found, &truncated, e);
     if (rc == LC_ERR_PROTOCOL && cursor >= checkpoint) {
       lc_error_cleanup(e);
       rc = LC_OK;
       break;
     }
-    if (rc != LC_OK)
+    if (rc != LC_OK || !found)
       break;
-    if (record.flags || record.type != 1 || !record.key_len ||
-        record.key_len >= 64 || record.meta_len != 16 ||
-        record.payload_len != c->bytes ||
-        record.key_len + 48 > capacity - cursor ||
-        record.payload_len > capacity - cursor - record.key_len - 48)
-      break;
-    rc = ps_stream_recovery_read(stream, cursor + 32, meta,
-                                 (size_t)record.key_len + 16, e);
-    if (rc != LC_OK)
-      break;
-    id = stream_get64(meta + record.key_len);
-    round = stream_get64(meta + record.key_len + 8);
-    require(id < c->rows && id % c->writers == w->ordinal && round < c->rounds,
-            "canonical row identity");
+    require(sscanf(entry.key, "key-%lu%c", &id, &extra) == 1 && id < c->rows &&
+                id % c->writers == w->ordinal && entry.version >= 1 &&
+                entry.version <= c->rounds && entry.bytes == c->bytes &&
+                entry.record_type == 1,
+            "canonical state identity and metadata");
     names(w->ordinal, (size_t)id, ns, name);
-    require(strlen(name) == record.key_len &&
-                !memcmp(meta, name, record.key_len),
-            "canonical key binding");
-    payload = cursor + record.key_len + 48;
-    end = payload + record.payload_len;
-    require(cursor >= checkpoint || end <= checkpoint,
+    require(!strcmp(entry.key, name), "canonical state key");
+    require(cursor >= checkpoint || next <= checkpoint,
             "checkpoint record boundary");
-    if (cursor >= checkpoint) {
-      crc = 0;
-      while (payload < end && rc == LC_OK) {
-        take = (size_t)(end - payload);
-        if (take > sizeof(buffer))
-          take = sizeof(buffer);
-        rc = ps_stream_recovery_read(stream, payload, buffer, take, e);
-        if (rc == LC_OK)
-          crc = crc32(crc, buffer, (uInt)take);
-        payload += take;
-      }
-      if (rc != LC_OK || crc != record.payload_crc)
-        break;
-    }
-    c->offsets[id] = cursor + record.key_len + 48;
-    c->payload_crcs[id] = (uint32_t)record.payload_crc;
-    cursor = end;
+    c->offsets[id] = entry.payload_span.payload_offset;
+    c->payload_crcs[id] = (uint32_t)entry.payload_span.payload_crc;
+    cursor = next;
     ++w->records;
   }
+  lc_pouch_state_entry_cleanup(&allocator, &entry);
+  lc_free_with_allocator(&allocator, scratch);
   *accepted = cursor;
   return rc;
 }
+
 static int stream_named_open(worker *w, int create, lc_error *e) {
   comparison *c = w->run;
   ps_catalog_view *view = NULL;
@@ -372,20 +337,6 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
   }
   return rc;
 }
-typedef struct stream_output {
-  ps_stream_writer *writer;
-  uint64_t bytes;
-  unsigned long crc;
-} stream_output;
-static int stream_sink(lc_sink *sink, const void *bytes, size_t count,
-                       lc_error *e) {
-  stream_output *out = sink->impl;
-  if (ps_stream_write(out->writer, bytes, count, e) != LC_OK)
-    return 0;
-  out->crc = crc32(out->crc, bytes, (uInt)count);
-  out->bytes += count;
-  return 1;
-}
 static int collection_stream_write(worker *w, size_t id, lc_source *source,
                                    lc_error *e) {
   comparison *c = w->run;
@@ -415,67 +366,48 @@ static int collection_stream_write(worker *w, size_t id, lc_source *source,
 static int stream_write_one(worker *w, size_t id, lc_source *source,
                             lc_error *e) {
   comparison *c = w->run;
-  ps_stream_writer *destination = NULL;
-  stream_output out;
-  lc_pouch_record_header record;
-  lc_sink sink;
-  unsigned char header[32], meta[16], buffer[4096];
+  lc_allocator allocator = {0};
+  lc_pouch_state_entry request = {0}, result = {0};
+  ps_record_writer output;
   char ns[64], name[64];
-  uint64_t start = 0;
-  size_t n;
   int rc = LC_OK;
   if (c->collection)
     return collection_stream_write(w, id, source, e);
   names(w->ordinal, id, ns, name);
+  request.key = name;
+  request.content_type = "application/octet-stream";
+  request.record_type = 1;
+  request.version = w->round + 1;
+  request.index_seq = (lc_pouch_generation)(w->round * c->rows + id + 1);
+  request.updated_at_unix = (lc_pouch_unix_seconds)time(NULL);
+  request.payload_context =
+      lc_pouch_state_crypto_context(&allocator, ns, name, request.version, 1);
+  if (!request.payload_context)
+    return LC_ERR_NOMEM;
   if (!w->stream)
     rc = stream_named_open(w, 1, e);
+  memset(&output, 0, sizeof(output));
   if (rc == LC_OK)
-    rc = ps_stream_begin(w->stream, &destination, e);
-  memset(&record, 0, sizeof(record));
-  memset(&out, 0, sizeof(out));
-  memset(&sink, 0, sizeof(sink));
-  record.type = 1;
-  record.flags = LC_POUCH_RECORD_FLAG_PENDING;
-  record.key_len = (unsigned long)strlen(name);
-  record.meta_len = sizeof(meta);
-  lc_pouch_record_header_encode(&record, header);
-  stream_put64(meta, id);
-  stream_put64(meta + 8, w->round);
+    rc = ps_record_begin(w->stream, &output, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_append(&allocator, ps_root_crypto(c->owner),
+                                      ps_record_output(&output), canonical_leaf,
+                                      &request, source, 0, &result, e);
+  if (rc == LC_OK)
+    rc = ps_record_commit(&output, e);
   if (rc == LC_OK) {
-    start = ps_stream_writer_start(destination);
-    rc = ps_stream_write(destination, header, sizeof(header), e);
-  }
-  if (rc == LC_OK)
-    rc = ps_stream_write(destination, name, strlen(name), e);
-  if (rc == LC_OK)
-    rc = ps_stream_write(destination, meta, sizeof(meta), e);
-  out.writer = destination;
-  sink.impl = &out;
-  sink.write = stream_sink;
-  if (rc == LC_OK)
-    while ((n = source->read(source, buffer, sizeof(buffer), e)) != 0) {
-      if (!stream_sink(&sink, buffer, n, e)) {
-        rc = e->code;
-        break;
-      }
-    }
-  if (rc == LC_OK) {
-    record.flags = 0;
-    record.payload_len = out.bytes;
-    record.payload_crc = out.crc;
-    lc_pouch_record_header_encode(&record, header);
-    rc = ps_stream_write_at(destination, 0, header, sizeof(header), e);
-  }
-  if (rc == LC_OK)
-    rc = ps_stream_commit(destination, e);
-  if (rc == LC_OK) {
-    c->offsets[id] = start + strlen(name) + 48;
-    c->payload_crcs[id] = (uint32_t)out.crc;
+    require(result.bytes == c->bytes && result.cipher_bytes == c->bytes,
+            "canonical state write bytes");
+    c->offsets[id] = result.payload_span.payload_offset;
+    c->payload_crcs[id] = (uint32_t)result.payload_span.payload_crc;
     ++w->records;
   }
-  ps_stream_writer_close(destination);
+  ps_record_abort(&output);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
+  lc_free_with_allocator(&allocator, request.payload_context);
   return rc;
 }
+
 static int write_one(worker *w, size_t id, lc_error *e) {
   comparison *c = w->run;
   lc_source *source = NULL;

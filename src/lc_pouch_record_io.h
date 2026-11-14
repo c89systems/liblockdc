@@ -2,6 +2,7 @@
 #define LC_POUCH_RECORD_IO_H
 
 #include "lc_pouch_record.h"
+#include <stdio.h>
 #include <sys/uio.h>
 
 /* Borrowed canonical-record byte access, not a pathname/filesystem interface.
@@ -30,6 +31,9 @@ typedef struct lc_pouch_record_io {
  * hash-only access. No descriptor or callback context allocation is required.
  */
 lc_pouch_record_io lc_pouch_record_file_io(int fd);
+/* Read-only borrowed stdio access preserves the segmented replay owner's
+ * existing readahead. Reads leave its cursor immediately after the bytes. */
+lc_pouch_record_io lc_pouch_record_stdio_io(FILE *);
 int lc_pouch_record_io_read(lc_pouch_record_io, uint64_t, const struct iovec *,
                             int, lc_error *);
 int lc_pouch_record_io_append(lc_pouch_record_io, const struct iovec *, int,
