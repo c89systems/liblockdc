@@ -2177,6 +2177,11 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+int ps_check(ps_space *s, lc_error *error) {
+  if (!s)
+    return err(error, LC_ERR_INVALID, "container admission requires space");
+  return healthy(s, error);
+}
 int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   ps_entry *p;
   uint64_t n;

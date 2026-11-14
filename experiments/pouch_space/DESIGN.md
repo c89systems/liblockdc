@@ -371,6 +371,47 @@ container adapter with the same codec and caller authority. Its complete head
 reload phase bypasses the native owner's inode cache. Neither it nor the stream
 fixture establishes integrated public collection ownership or query performance.
 
+## Root policy and namespace ownership
+
+`root.[ch]` owns one physical space, its production crypto provider and a dynamic
+namespace registry. Its 128-byte control at `(PS_CONTROL, 0, 1)` contains a magic,
+encryption/compression flags, a bounded nonsecret key ID, canonical head/record
+widths, zero reserved fields and CRC32. It is always durable. Reopen validates
+this policy before admitting namespaces; a bare or interrupted physical space
+cannot silently adopt another policy. A wrong key/mode fails closed. Compression
+inherits stored policy unless explicit. A different explicit setting requires
+the still-pending container conversion, rather than changing interpretation.
+
+Namespace creation is one self-contained catalog record. Its stable ID equals
+its initial revision, identifying the logical owner and incarnation. Stream and
+target fields are zero. This variant is valid only at the global namespace
+surface, with zero target facts; it cannot be replaced by a stream binding.
+Removal/recreation allocates a fresh ID. Catalog views pin the metadata itself;
+ordinary stream bindings still pin targets and retain their retirement guards.
+No empty stream, grant, payload page or second publication is needed for a
+namespace identity. The initial measured empty-stream representation is retained
+only as an archived benchmark executable, not an implementation path.
+
+Root namespace names are nonempty C strings, retaining exact bytes including
+slashes and non-UTF-8 bytes. The registry grows with visited names; failed misses
+do not remain cached. Same-name initialization waits on that owner, while other
+names can prepare and publish independently. Registry ownership never spans
+storage I/O or user callbacks. Namespace pins and active calls protect root
+lifetime; physical child handles also reject close. Callers stop new calls before
+final close, and do not reuse physical/root handles after fork.
+
+`ps_check` provides the atomic admission check for cached logical owners. Success
+allocates nothing, locks nothing and performs no I/O. After uncertain physical
+I/O, new namespace admission fails even when its identity is cached. Existing
+pins and diagnostic status can still be released/inspected before reopen.
+
+The comparison's stream modes now use this owner for root creation/reopen,
+namespace identities and the production crypto provider. Child stream catalogs
+use their real namespace scope; the memory-only record context borrows that
+provider. Public collection IDs, positions, receipts, namespace state replay,
+maintenance and process-shared ownership remain pending integration. Normal
+public Pouch roots still use files and directories.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, transforms,
 multi-process coordination and full Pouch integration remain future work. The

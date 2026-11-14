@@ -155,12 +155,16 @@ int ps_catalog_decode_record(ps_entry *p, const unsigned char *wire,
     return cat_error(e, LC_ERR_PROTOCOL, "truncated catalog record");
   length = read32(wire + 68);
   if (!arguments(read32(wire + 64), wire + 104, length) ||
-      bytes != 104 + length || read32(wire + 72) != PS_STREAM ||
-      read32(wire + 76) || !read64(wire + 96))
+      bytes != 104 + length || read32(wire + 76) ||
+      (read32(wire + 72) == PS_STREAM
+           ? !read64(wire + 96)
+           : read32(wire + 72) || read32(wire + 64) != PS_CATALOG_NAMESPACE ||
+                 p->key.owner || p->token != p->key.key || read64(wire + 80) ||
+                 read64(wire + 88) || read64(wire + 96)))
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog record");
   rc = attach_record(p, read32(wire + 64), wire + 104, length, e);
   if (rc == LC_OK) {
-    p->catalog->stream.kind = PS_STREAM;
+    p->catalog->stream.kind = read32(wire + 72);
     p->catalog->stream.owner = read64(wire + 80);
     p->catalog->stream.key = read64(wire + 88);
     p->catalog->token = read64(wire + 96);
@@ -184,7 +188,12 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
        (old->deleted ? old->key.key == p->key.key
                      : old->key.key != p->key.key || old->token >= p->token)))
     return cat_error(e, LC_ERR_PROTOCOL, "catalog name identity mismatch");
-  if (!checkpoint) {
+  if (!p->catalog->stream.kind &&
+      (p->key.owner || p->catalog->kind != PS_CATALOG_NAMESPACE ||
+       p->token != p->key.key || p->catalog->stream.owner ||
+       p->catalog->stream.key || p->catalog->token))
+    return cat_error(e, LC_ERR_PROTOCOL, "invalid namespace owner record");
+  if (!checkpoint && p->catalog->stream.kind) {
     p->catalog->target = target_entry(s, p->catalog);
     if (!p->catalog->target)
       return cat_error(e, LC_ERR_PROTOCOL,
@@ -212,6 +221,8 @@ int ps_catalog_validate_directory(ps_space *s, lc_error *e) {
   ps_entry *p;
   for (i = 0; i < s->catalogs.capacity; ++i)
     for (p = s->catalogs.buckets[i]; p; p = p->catalog->next) {
+      if (!p->catalog->stream.kind)
+        continue;
       p->catalog->target = target_entry(s, p->catalog);
       if (!p->catalog->target)
         return cat_error(e, LC_ERR_PROTOCOL,
@@ -221,9 +232,11 @@ int ps_catalog_validate_directory(ps_space *s, lc_error *e) {
   return LC_OK;
 }
 void ps_catalog_drop_record(ps_space *s, ps_entry *p, uint64_t sequence) {
-  --p->catalog->target->catalog_refs;
-  if (sequence > p->catalog->target->catalog_release)
-    p->catalog->target->catalog_release = sequence;
+  if (p->catalog->target) {
+    --p->catalog->target->catalog_refs;
+    if (sequence > p->catalog->target->catalog_release)
+      p->catalog->target->catalog_release = sequence;
+  }
   ps_internal_remove(s, p, sequence);
 }
 static int ref_matches(ps_space *s, ps_entry *p, const ps_ref *ref) {
@@ -245,8 +258,11 @@ static void information(ps_space *s, const ps_entry *p, ps_catalog_info *out) {
   out->id = p->key.key;
   memcpy(out->revision.container, s->identity, 16);
   out->revision.incarnation = p->token;
-  memcpy(out->target.container, s->identity, 16);
-  out->target.incarnation = p->catalog->token;
+  memset(&out->target, 0, sizeof(out->target));
+  if (p->catalog->stream.kind) {
+    memcpy(out->target.container, s->identity, 16);
+    out->target.incarnation = p->catalog->token;
+  }
   out->stream = p->catalog->stream;
 }
 int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
@@ -265,17 +281,20 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-int ps_catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
-                   const void *name, size_t length, const ps_ref *expected,
-                   ps_key stream, const ps_ref *target, ps_catalog_info *out,
-                   lc_error *e) {
+static int catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
+                       const void *name, size_t length, const ps_ref *expected,
+                       ps_key stream, const ps_ref *target,
+                       ps_catalog_info *out, int identity, lc_error *e) {
   ps_entry *p, *old, *head;
   ps_catalog_info info;
   uint64_t sequence = 0;
   int rc, installed = 0;
   if (out)
     memset(out, 0, sizeof(*out));
-  if (!s || !out || !target || stream.kind != PS_STREAM ||
+  if (!s || !out ||
+      (identity ? owner || kind != PS_CATALOG_NAMESPACE || expected || target ||
+                      stream.kind || stream.owner || stream.key
+                : !target || stream.kind != PS_STREAM) ||
       !arguments(kind, name, length))
     return cat_error(e, LC_ERR_INVALID,
                      "catalog publication arguments invalid");
@@ -287,21 +306,23 @@ int ps_catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
   rc = attach_record(p, kind, name, length, e);
   if (rc == LC_OK) {
     p->catalog->stream = stream;
-    p->catalog->token = target->incarnation;
+    p->catalog->token = target ? target->incarnation : 0;
     pthread_mutex_lock(&s->mutex);
     rc = ps_internal_healthy(s, e);
     old = named(s, owner, kind, name, length);
-    head = ps_internal_lookup(s, stream);
+    head = identity ? NULL : ps_internal_lookup(s, stream);
     if (rc == LC_OK && pending(s, old))
       rc = cat_error(e, LC_ERR_INVALID, "catalog change in flight; retry");
     if (rc == LC_OK &&
         (expected ? !ref_matches(s, old, expected) : old && !old->deleted))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
-    if (rc == LC_OK &&
-        (!ref_matches(s, head, target) || s->token_next > s->token_limit))
+    if (rc == LC_OK && (s->token_next > s->token_limit ||
+                        (!identity && !ref_matches(s, head, target))))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog stream reference or identity invalid");
+    if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind)
+      rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
     if (rc == LC_OK) {
       p->token = s->token_next++;
       p->key.key = old && !old->deleted ? old->key.key : p->token;
@@ -334,6 +355,19 @@ int ps_catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
   if (rc == LC_OK)
     *out = info;
   return rc;
+}
+int ps_catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
+                   const void *name, size_t length, const ps_ref *expected,
+                   ps_key stream, const ps_ref *target, ps_catalog_info *out,
+                   lc_error *e) {
+  return catalog_put(s, owner, kind, name, length, expected, stream, target,
+                     out, 0, e);
+}
+int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
+                                ps_catalog_info *out, lc_error *e) {
+  ps_key stream = {0};
+  return catalog_put(s, 0, PS_CATALOG_NAMESPACE, name, length, NULL, stream,
+                     NULL, out, 1, e);
 }
 int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
@@ -379,8 +413,10 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   p = visible(p, prefix);
   if (rc == LC_OK && p) {
     ++p->pins;
-    ++p->catalog->target->pins;
-    ++p->catalog->target->catalog_pins;
+    if (p->catalog->target) {
+      ++p->catalog->target->pins;
+      ++p->catalog->target->catalog_pins;
+    }
     ++s->readers;
     view->space = s;
     view->entry = p;
@@ -407,8 +443,10 @@ void ps_catalog_view_close(ps_catalog_view *view) {
   s = view->space;
   pthread_mutex_lock(&s->mutex);
   --s->readers;
-  --view->target->pins;
-  --view->target->catalog_pins;
+  if (view->target) {
+    --view->target->pins;
+    --view->target->catalog_pins;
+  }
   --view->entry->pins;
   if (view->entry->state == 2 && view->entry->safe && !view->entry->pins)
     ps_internal_collect(s);
@@ -449,8 +487,10 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
           (v = visible(p, prefix)) != NULL) {
         entries[at++] = v;
         ++v->pins;
-        ++v->catalog->target->pins;
-        ++v->catalog->target->catalog_pins;
+        if (v->catalog->target) {
+          ++v->catalog->target->pins;
+          ++v->catalog->target->catalog_pins;
+        }
         ++s->readers;
       }
   pthread_mutex_unlock(&s->mutex);
@@ -464,8 +504,10 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
     for (i = 0; i < at; ++i) {
       p = entries[i];
       --p->pins;
-      --p->catalog->target->pins;
-      --p->catalog->target->catalog_pins;
+      if (p->catalog->target) {
+        --p->catalog->target->pins;
+        --p->catalog->target->catalog_pins;
+      }
       --s->readers;
       if (p->state == 2 && p->safe && !p->pins)
         collect = 1;

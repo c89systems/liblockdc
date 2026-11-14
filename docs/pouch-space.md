@@ -23,8 +23,9 @@ Typed name catalogs now publish exact-byte names with revision checks, durable
 stream references, pinned views and metadata-only enumeration. Normal Pouch
 still opens multifile roots. Its production collection record writer and decoder
 now operate directly on container streams in the experiment through borrowed
-record I/O. Root ownership integration, maintenance and shared-root coordination
-remain ahead.
+record I/O. The experimental root owner now binds codec policy and durable
+namespace identities inside that file. Ordinary namespace data ownership,
+public Pouch integration, maintenance and shared-root coordination remain ahead.
 
 ## Intent
 

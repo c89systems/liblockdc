@@ -109,6 +109,11 @@ int ps_checkpoint(ps_space *, lc_error *);
 /* Explicit growth only, in whole MiB increments. Never exposes trailing
  * physical capacity until its checkpoint publication has completed. */
 int ps_grow(ps_space *, uint64_t, lc_error *);
+/* Cached logical owners still check admission after uncertain I/O. Success
+ * performs no allocation, lock acquisition, I/O or durability barrier. Existing
+ * reader pins and diagnostic status remain usable after admission is poisoned.
+ */
+int ps_check(ps_space *, lc_error *);
 int ps_status(ps_space *, ps_stats *, lc_error *);
 
 #endif

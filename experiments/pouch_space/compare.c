@@ -8,6 +8,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_record.h"
 #include "record_io.h"
+#include "root.h"
 #include "space.h"
 #include "stream.h"
 #include <dirent.h>
@@ -60,6 +61,7 @@ typedef struct worker {
   size_t ordinal;
   lc_collection *collection;
   ps_stream *stream;
+  ps_namespace *namespace;
   size_t round, records;
   char *body;
   char collection_id[LC_XID_STRING_SIZE];
@@ -69,6 +71,7 @@ struct comparison {
   int container, collection, sync, streams, existing_records;
   size_t rows, bytes, writers, rounds;
   ps_space *space;
+  ps_root *owner;
   lc_pouch *pouch;
   lc_pouch *record_owner;
   lc_client *client;
@@ -167,13 +170,6 @@ static uint64_t stream_get64(const unsigned char *p) {
   for (i = 0; i < 8; ++i)
     value |= (uint64_t)p[i] << (i * 8);
   return value;
-}
-static ps_key stream_storage_key(size_t ordinal) {
-  ps_key key;
-  key.kind = PS_STREAM;
-  key.owner = ordinal + 1;
-  key.key = 1;
-  return key;
 }
 static const char canonical_leaf[] = "seg-00000000000000000001.log";
 /* Use the production collection decoder, including its full identity,
@@ -319,23 +315,36 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
   ps_catalog_view *view = NULL;
   ps_catalog_info binding;
   ps_stream_info info;
-  ps_key key = stream_storage_key(w->ordinal);
+  ps_key key = {0, 1, PS_STREAM};
+  ps_namespace_info identity;
   unsigned int kind =
-      c->collection ? PS_CATALOG_COLLECTION : PS_CATALOG_NAMESPACE;
-  char name[64];
+      c->collection ? PS_CATALOG_COLLECTION : PS_CATALOG_SEGMENT;
+  char name[64], ns[64];
   int rc;
-  snprintf(name, sizeof(name), c->collection ? "collection-%lu" : "owner-%lu",
+  snprintf(ns, sizeof(ns), c->collection ? "bench" : "owner-%lu",
            (unsigned long)w->ordinal);
+  snprintf(name, sizeof(name), c->collection ? "collection-%lu" : "active",
+           (unsigned long)w->ordinal);
+  rc = ps_root_namespace_acquire(c->owner, ns, create, &w->namespace, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_identity(w->namespace, &identity, e);
+  if (rc != LC_OK)
+    return rc;
+  key.owner = identity.owner;
   if (create) {
-    rc = ps_stream_open(c->space, key, 1, NULL, stream_recover, w, &w->stream,
-                        e);
+    if (c->collection)
+      rc = ps_catalog_allocate_id(c->space, &key.owner, e);
+    if (rc == LC_OK)
+      rc = ps_stream_open(c->space, key, 1, NULL, stream_recover, w, &w->stream,
+                          e);
     if (rc == LC_OK)
       rc = ps_stream_status(w->stream, &info, e);
     if (rc == LC_OK)
-      rc = ps_catalog_put(c->space, 0, kind, name, strlen(name), NULL, key,
-                          &info.ref, &binding, e);
+      rc = ps_catalog_put(c->space, identity.owner, kind, name, strlen(name),
+                          NULL, key, &info.ref, &binding, e);
   } else {
-    rc = ps_catalog_get(c->space, 0, kind, name, strlen(name), &view, e);
+    rc = ps_catalog_get(c->space, identity.owner, kind, name, strlen(name),
+                        &view, e);
     if (rc == LC_OK && !view)
       rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
                         "comparison catalog binding missing", NULL, NULL,
@@ -343,7 +352,9 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
     if (rc == LC_OK)
       rc = ps_catalog_view_info(view, &binding, e);
     if (rc == LC_OK &&
-        (binding.stream.kind != key.kind || binding.stream.owner != key.owner ||
+        (binding.stream.kind != key.kind || !binding.stream.owner ||
+         (!c->collection && binding.stream.owner != identity.owner) ||
+         (c->collection && binding.stream.owner == identity.owner) ||
          binding.stream.key != key.key))
       rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
                         "comparison catalog target mismatch", NULL, NULL,
@@ -352,6 +363,12 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
       rc = ps_stream_open(c->space, binding.stream, 0, &binding.target,
                           stream_recover, w, &w->stream, e);
     ps_catalog_view_close(view);
+  }
+  if (rc != LC_OK) {
+    ps_stream_close(w->stream, NULL);
+    w->stream = NULL;
+    ps_namespace_release(w->namespace);
+    w->namespace = NULL;
   }
   return rc;
 }
@@ -552,6 +569,7 @@ static void *writer_main(void *context) {
 }
 static void open_stores(comparison *c, int create, lc_error *e) {
   ps_options space_options = {0};
+  ps_root_options root_options = {0};
   lc_pouch_open_options options;
   lc_client_config config;
   lc_pouch_settings settings;
@@ -561,7 +579,14 @@ static void open_stores(comparison *c, int create, lc_error *e) {
   size_t i;
   if (c->container) {
     space_options.durable_sync = c->sync;
-    check(ps_open(c->store, create, &space_options, &c->space, e), e);
+    if (c->streams) {
+      root_options.storage = space_options;
+      check(ps_root_open(c->store, create, &root_options, &c->owner, e), e);
+      c->space = ps_root_space(c->owner);
+      if (c->record_owner)
+        c->record_owner->crypto = ps_root_crypto(c->owner);
+    } else
+      check(ps_open(c->store, create, &space_options, &c->space, e), e);
     if (c->streams) {
       for (i = 0; i < c->rows; ++i)
         c->offsets[i] = UINT64_MAX;
@@ -616,8 +641,16 @@ static void close_stores(comparison *c, lc_error *e) {
       for (i = 0; i < c->writers; ++i) {
         check(ps_stream_close(c->workers[i].stream, e), e);
         c->workers[i].stream = NULL;
+        ps_namespace_release(c->workers[i].namespace);
+        c->workers[i].namespace = NULL;
       }
-    check(ps_close(c->space, e), e);
+    if (c->streams) {
+      if (c->record_owner)
+        c->record_owner->crypto = NULL;
+      check(ps_root_close(c->owner, e), e);
+      c->owner = NULL;
+    } else
+      check(ps_close(c->space, e), e);
     c->space = NULL;
   } else if (c->collection) {
     for (i = 0; i < c->writers; ++i) {
@@ -976,7 +1009,8 @@ int main(int argc, char **argv) {
             "exactly one container and no sidecars");
     check(ps_status(c.space, &stats, &e), &e);
     if (c.streams) {
-      require(stats.entries == (uint64_t)stream_grants + 2 * c.writers,
+      require(stats.entries == (uint64_t)stream_grants + 2 * c.writers + 1 +
+                                   (c.collection ? 1 : c.writers),
               "recovered physical stream/grant count");
       for (i = 0; i < c.writers; ++i)
         require(c.workers[i].records ==

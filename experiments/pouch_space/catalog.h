@@ -20,11 +20,19 @@ typedef struct ps_catalog_info {
 /* IDs share the durably reserved incarnation allocator; unused IDs are lost
  * on reopen, never reused. This does not write a per-ID journal record. */
 int ps_catalog_allocate_id(ps_space *, uint64_t *, lc_error *);
+/* A namespace is its own immutable metadata owner, not an empty payload
+ * stream. Create-only at global namespace scope. id/revision identify the
+ * owner; stream and target are zero. Publication always waits for durability.
+ * Exact byte names retain the catalog's general bounds; public name policy
+ * belongs to the root owner. Removal/recreation allocates a fresh identity. */
+int ps_catalog_create_namespace(ps_space *, const void *, size_t,
+                                ps_catalog_info *, lc_error *);
 /* Names are exact byte strings, including empty names, not filesystem paths.
  * NULL expected means create-only; otherwise replace exactly that revision.
  * Structural publication always waits for durability, even in NoSync stores.
  * A same-name change in flight returns an error; other names stay independent.
- * The target must be a currently live stream incarnation in this container. */
+ * The target must be a currently live stream incarnation in this container.
+ * This method cannot replace a namespace's self-owned identity record. */
 int ps_catalog_put(ps_space *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, const ps_ref *expected,
                    ps_key stream, const ps_ref *target, ps_catalog_info *,
@@ -33,7 +41,7 @@ int ps_catalog_remove(ps_space *, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
                       lc_error *);
 /* Missing is success with *out==NULL. Views select the completed durable
- * prefix and pin both binding and target; retirement cannot invalidate them.
+ * prefix and pin the binding and any target; retirement cannot invalidate them.
  * Release a view after admitting the stream/read handles that will use it. */
 int ps_catalog_get(ps_space *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, ps_catalog_view **,

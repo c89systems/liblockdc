@@ -962,6 +962,141 @@ No Darwin, QEMU or 250 MiB-and-larger tests were run. The full implementation go
 remains active; this stage completes physical control persistence and shared
 encoding. Normal public Pouch roots remain multifile.
 
+## Container root and namespace follow-up
+
+On 2026-11-14 the stream experiment gains a root owner for the single container,
+production crypto provider and namespace identities. Its 128-byte root control
+binds encryption mode/key ID, compression and canonical head/record widths.
+Creation is durable; reopen rejects missing/corrupt policy or a wrong key/mode
+before admitting namespaces. Implicit compression inherits stored policy,
+including allocating the plaintext transform provider when needed. Explicit
+compression changes currently return unsupported: resumable container conversion
+remains part of the active goal.
+
+Namespace identities are now self-contained catalog metadata. They have a
+stable owner ID/revision, no stream target and no payload extents. Creation needs
+one durable publication. They cannot be replaced by stream bindings; deletion
+and recreation produce a fresh ID. Catalog views pin the metadata across
+checkpoint/recreation. Existing stream bindings retain target/retirement guards.
+The root registry caches one owner per exact nonempty C-string name, grows with
+metadata participation, and does not retain failed misses. Same-name callers
+wait for initialization; unrelated names publish outside the registry mutex.
+
+Namespace pins, active calls and physical child handles reject root close while
+leaving the owner usable. Enumeration permits reentrant acquisition/creation
+outside locks. Cached namespace admission now checks the physical poison state;
+an uncertain write cannot be bypassed by a cache hit. This check performs no
+allocation or I/O on success.
+
+The stream comparison now creates/reopens this root, uses its real namespace
+IDs and scopes child catalogs accordingly. Its record-codec context borrows the
+root's production crypto provider. Normal public `lc_pouch_open` still uses the
+multifile backend. Ordinary namespace data/manifests/replay, public collection
+ownership, positions, receipts, indexes, maintenance and shared-root coordination
+remain pending. Namespace identity metadata is not a complete namespace store.
+
+Final-source verification passed all 40 affected storage jobs on Debug, native
+GNU Release and native musl Release, plus all fourteen ThreadSanitizer storage
+groups. Production sources/public headers are unchanged in this stage, so the
+preceding full Pouch/collection/outbox/XA/compression/Lua gates are reused.
+New proof covers:
+
+- Four codec combinations through 1 MiB-plus bounded streaming before EOF,
+  read/reopen, policy inheritance/mismatch, and retained child/root lifetimes.
+- Missing root initialization, each control byte's CRC corruption, correctly
+  checksummed invalid fields/lengths, invalid namespace bindings and names.
+- 500 namespaces, the maximum catalog name, registry growth, immutable identity,
+  stale references after recreation, pinned views across checkpoint and
+  reentrant enumeration with a fixed captured prefix.
+- Every creation/reopen/namespace publication write, barrier and read failure;
+  volatile and selectively persisted torn writes with durable-image restoration;
+  every framework allocation failure in plain/encrypted open, compression
+  inheritance, namespace initialization, registry growth and enumeration.
+- Independent/same-name initialization in both modes, held barriers, a failed
+  initializer followed by waiting callers' successful retry, and uncertain sync
+  failure/reopen. Complete unacknowledged metadata may recover after uncertain
+  I/O; incomplete namespace state is never admitted. A killed owning child
+  releases exclusive file ownership and its durable namespace reopens.
+
+Memcheck reports zero errors/leaks and frees all 131,173 allocations across the
+three root groups. Both stream comparison paths also pass Memcheck. A regression
+first demonstrated cached admission after a poisoned write and then proved the
+fix. Formatting, configuration builds and diff checks pass.
+
+An initial root design represented namespace identity with an empty sealed
+stream. Its first 150 matched runs exposed fresh four-writer state startup cost:
+17.18 ms versus pre-root streams 7.84 ms and untouched Pouch 25.14 ms. The final
+design removes that empty stream and its publication barrier. That implementation
+is absent from current source; its exact executable and samples remain archived
+for comparison.
+
+The final series contains 180 verified runs: five alternating samples of six
+engines across the same three state/collection profiles. Engines include the
+previous stage (`1ccf226`) for streams and actual Pouch, the archived empty-stream
+root design, the final root, and untouched multifile Pouch (`02b7fc3`). Parameters
+remain 10 MiB reservation, 1 KiB values, 4 KiB chunks; small durable uses one writer
+and 128 rows (state has two rounds), long NoSync uses four writers with 1,024
+two-round state rows or 2,048 collection entries. Reopened means writing after
+closing/reopening an empty store, not dropping the OS cache.
+
+| Write profile | Pre-root streams, ms | Empty-stream root, ms | Final root, ms | Untouched Pouch, ms | Current Pouch, ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| State, small durable | 599.47 | 629.22 | 585.30 | 1,097.80 | 1,102.63 |
+| Collection, small durable | 288.40 | 352.55 | 323.12 | 584.98 | 602.00 |
+| State, fresh NoSync | 8.15 | 16.90 | 11.84 | 26.19 | 24.10 |
+| Collection, fresh NoSync | 11.72 | 8.94 | 10.21 | 70.62 | 78.91 |
+| State, reopened NoSync | 19.04 | 29.66 | 27.76 | 26.56 | 26.05 |
+| Collection, reopened NoSync | 29.38 | 31.63 | 30.80 | 72.51 | 79.89 |
+
+Fresh state final/empty-stream ranges are 7.50–15.04 / 6.98–18.41 ms. The median
+improves, but ranges overlap. The structural change is deterministic: namespace
+birth needs one record/barrier, and that profile uses four write barriers versus
+six or seven with empty streams. Its journal is 3,052 versus 3,692 bytes, with the
+same 20 data grants. A root control and real namespace creation still add fixed
+cost versus the earlier partial stream fixture; this is not a free integration.
+
+Collection creation is outside the write interval on all sides. Its fresh final
+root creation median is 23.54 ms versus pre-root 26.97 ms and untouched Pouch
+141.08 ms, with overlapping pre-root/final ranges. Fresh state root creation
+(before lazy namespace creation) is 17.15 versus pre-root 11.98 ms and untouched
+Pouch 19.02 ms. These fixed costs must be retained in deployment comparisons.
+Reopened state write ranges overlap untouched Pouch, so this series shows no
+reliable write advantage there. All collection write ranges
+also overlap their pre-root/empty-stream counterparts; no further body-codec
+optimization is established.
+
+| Warm read profile | Final root median, ms | Untouched public Pouch median, ms |
+| --- | ---: | ---: |
+| State, small | 0.34 | 4.39 |
+| Collection, small | 0.32 | 0.77 |
+| State, fresh | 2.64 | 28.87 |
+| Collection, fresh | 5.15 | 9.95 |
+| State, reopened | 2.33 | 31.67 |
+| Collection, reopened | 5.01 | 11.12 |
+
+These remain cached physical stream reads versus public Pouch operations, without
+full namespace replay/index/receipt authority, cold reads or concurrent public
+scans. Collection close/open/first-verified-read medians are 37.20 ms fresh and
+29.77 ms reopened versus untouched 115.10/122.24 ms. Every final stream store
+remains exactly one file with no persistent directories or sidecars. The earlier
+native file-adapter CPU concern is unresolved: current/untouched actual Pouch
+collection CPU medians are 104.65/95.50 ms fresh and 116.45/105.57 ms reopened,
+with overlapping ranges. This stage changes no production Pouch implementation.
+
+Final raw samples are in `build/pouch-space-integrated/root-paired/`; all 180
+selected numeric rows and median/min/max summaries are in `root-results.json`.
+`root-paired.sh` repeats the local archived-reference series. The initial 150
+empty-stream samples are in `root-anchors-paired/` and `root-anchor-results.json`,
+with their archived executable/runner. `root-artifacts.sha256` binds the current,
+empty-stream, previous-stage and untouched executables, results and runners.
+Final test logs use `root-direct-final-{debug,musl,release,tsan}-tests.log`;
+Memcheck logs use `root-direct-*-memcheck.log`. The cached-poison falsifier and
+repair are retained in `root-poison-{before,after}-tests.log`.
+
+The full implementation goal remains active. No Darwin, QEMU or 250 MiB-and-larger
+tests were run. Existing-root conversion remains excluded; production cutover
+requires its separate decision after full integration and acceptance.
+
 ## Reproduce
 
 The current `streams` modes include the production collection codec described in

@@ -123,7 +123,8 @@ to be implemented. See the
 ## Typed name catalogs
 
 The internal catalog boundary now maps `(owner, surface, exact name bytes)` to
-a stable binding identity, revision and live stream incarnation. Surfaces cover
+a stable binding identity, revision and, for stream bindings, live stream
+incarnation. Surfaces cover
 namespaces, collections, segments, snapshots, projections and control metadata;
 their public Pouch behavior still belongs to the pending adapter. Empty and
 binary names are accepted without pathname interpretation. A dynamic hash index
@@ -140,7 +141,7 @@ name, bounded by the 128 KiB journal record limit.
 Catalog changes always wait for structural durability, including NoSync stores.
 A concurrent change to the same name returns busy; independent names may share
 the existing commit barrier. Get and enumeration capture one completed durable
-prefix. Views pin both the binding and target until actual stream/read handles
+prefix. Views pin the binding and any target until actual stream/read handles
 are admitted. Stream retirement rejects live bindings, catalog pins and releases
 whose durability is pending. Recovery rebuilds the name index and live target
 references, rejecting stale targets and conflicting name identities.
@@ -176,12 +177,45 @@ same maintenance payload twice. It reclaims superseded controls after root
 retirement and reader pins drain. Tests prove repeated replacement/checkpoint
 after foreground exhaustion, without growth or shrinking.
 
-This completes control encoding and physical persistence, not collection/root
+This completes control encoding and physical persistence, not public collection
 ownership. Public lease operations still exercise the native owner. Namespace
-catalogs, dependency ordering, guard lifetime and control cleanup must be joined
-to the container before the public Pouch cutover.
+data manifests, dependency ordering, guard lifetime and control cleanup must be
+joined to the container before the public Pouch cutover.
 
 ## Integration and acceptance
+
+The experimental root owner now owns the physical container, crypto provider and
+namespace registry. A 128-byte `PS_CONTROL` value binds encryption mode, root key
+identity, compression policy and canonical record/head widths. Creation commits
+it durably; reopen rejects missing/corrupt policy or a mismatched key/mode before
+namespace admission. Implicit compression inherits the stored policy, allocating
+a plaintext transform provider when necessary. An explicit compression change
+currently returns unsupported; resumable container conversion remains required.
+
+Namespaces now own their catalog metadata directly. `ps_catalog_create_namespace`
+creates an immutable global namespace owner with `id == revision.incarnation`,
+zero stream/target fields and one durable publication. The owning record has no
+payload stream or extents. Name removal/recreation allocates a fresh owner;
+pinned catalog views survive checkpoint and recreation. Ordinary stream bindings
+retain their target references and retirement guards. Root namespace names are
+nonempty C strings with exact bytes, without pathname interpretation.
+
+A dynamic registry caches one namespace owner per name. Same-name initialization
+waits for that owner; unrelated names publish outside the registry mutex and can
+share physical barriers. A failed initializer releases its pending ownership so
+waiting callers can retry. Namespace pins, active calls and physical child
+handles reject root close without destroying the root. Enumeration captures one
+durable prefix and invokes callbacks outside locks. Cached admission checks the
+physical poison state without allocation or I/O; an uncertain write cannot be
+bypassed through a cached namespace.
+
+The stream comparison now opens through this root owner and obtains its actual
+namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
+This is root bootstrap and namespace identity ownership; namespace manifests,
+ordinary data/replay, snapshot/obsolete sets and public collection ownership
+still require integration. Normal `lc_pouch_open` continues to use multifile
+roots. The experimental owner retains exclusive physical open ownership; it
+does not implement shared-root coordination.
 
 The production canonical record I/O boundary is now shared with the container
 experiment. `lc_pouch_record_io` borrows an owner and provides exact vectored
@@ -210,11 +244,11 @@ producers, every canonical callback failure before/after I/O, pinned windows,
 checkpoint/reopen and retirement. The comparison uses this real collection
 codec; its state-shaped fixture still has minimal metadata.
 
-This is record integration, not root-wide adoption. Namespace/collection owners,
-ordinary state payload/replay I/O, metadata mutation/copy paths, control ownership,
-position/receipt authority, projections and root lifetime still need conversion
-to container ownership. Normal public Pouch tests continue to exercise the
-segmented backend through the shared record I/O boundary.
+This is partial integration, not root-wide adoption. Namespace data and collection
+owners, ordinary state payload/replay I/O, metadata mutation/copy paths, control
+ownership, position/receipt authority, projections and public root lifetime still
+need conversion to container ownership. Normal public Pouch tests continue to
+exercise the segmented backend through the shared record I/O boundary.
 
 Complete storage integration covers states, objects, attachments, leases,
 collections and permanent positions, retry receipts, catalogs, indexes, codecs,

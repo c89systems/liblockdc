@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c)
+add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c root.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -56,6 +56,21 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_root_test root_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_root_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_root_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_root_test PRIVATE
+    "LINKER:--wrap=lc_alloc_with_allocator"
+    "LINKER:--wrap=lc_calloc_with_allocator"
+    "LINKER:--wrap=lc_realloc_with_allocator"
+    "LINKER:--wrap=lc_strdup_with_allocator")
+  lc_configure_c_test_target(pouch_space_root_test)
+  foreach(mode lifecycle faults concurrency)
+    add_test(NAME pouch_space_root_${mode}
+      COMMAND pouch_space_root_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_root_${mode} PROPERTIES TIMEOUT 120
+      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
   add_executable(pouch_space_control_test control_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_control_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_control_test PRIVATE pouch_space_experiment)
