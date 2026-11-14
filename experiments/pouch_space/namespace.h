@@ -24,8 +24,11 @@ int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
 /* One active producer per namespace, explicit BUSY on contention. Unrelated
  * namespaces and captured readers progress independently. target==0 disables
  * automatic rotation; otherwise rotate before the next append when the active
- * committed tail has reached target. No lock spans the producer callback. */
-int ps_namespace_append_begin(ps_namespace *, uint64_t target,
+ * committed tail has reached target. Reserve minimum bytes (or one byte when
+ * zero) before selecting a successor head. A failed reservation leaves the old
+ * head selected and may retain reusable empty successor grants. No lock spans
+ * the producer callback. */
+int ps_namespace_append_begin(ps_namespace *, uint64_t target, uint64_t minimum,
                               ps_namespace_append **, lc_error *);
 lc_pouch_record_io ps_namespace_append_output(ps_namespace_append *);
 const char *ps_namespace_append_leaf(const ps_namespace_append *);

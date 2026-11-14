@@ -373,6 +373,16 @@ static int ensure_capacity(ps_stream *s, uint64_t end, lc_error *error) {
   }
   return rc;
 }
+int ps_stream_reserve(ps_stream_writer *w, uint64_t bytes, lc_error *error) {
+  int rc;
+  if (!w || w->failed || w->published || bytes > (uint64_t)INT64_MAX - w->start)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream reservation arguments invalid");
+  rc = ensure_capacity(w->stream, w->start + bytes, error);
+  if (rc != LC_OK)
+    w->failed = 1;
+  return rc;
+}
 static int stream_flush(ps_stream_writer *w, lc_error *error) {
   int rc;
   if (!w->used)

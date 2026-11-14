@@ -375,7 +375,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   if (!w->namespace)
     rc = stream_named_open(w, 1, e);
   if (rc == LC_OK)
-    rc = ps_namespace_append_begin(w->namespace, PS_MIB, &output, e);
+    rc = ps_namespace_append_begin(w->namespace, PS_MIB, 0, &output, e);
   if (rc == LC_OK)
     rc = lc_pouch_state_record_append(&allocator, ps_root_crypto(c->owner),
                                       ps_namespace_append_output(output),

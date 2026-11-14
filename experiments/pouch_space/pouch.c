@@ -69,12 +69,13 @@ static int replay(void *context, void *ns, lc_pouch_storage_visit_fn visit,
   return rc;
 }
 static int append_begin(void *context, void *ns, uint64_t target,
-                        lc_pouch_storage_append *out, lc_error *e) {
+                        uint64_t minimum, lc_pouch_storage_append *out,
+                        lc_error *e) {
   ps_namespace_append *append = NULL;
   int rc;
   (void)context;
   memset(out, 0, sizeof(*out));
-  rc = ps_namespace_append_begin(ns, target, &append, e);
+  rc = ps_namespace_append_begin(ns, target, minimum, &append, e);
   if (rc != LC_OK)
     return rc;
   out->handle = append;

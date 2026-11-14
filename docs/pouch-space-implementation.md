@@ -192,14 +192,25 @@ Typed segment catalog entries hold the growing segment set and exact stream
 incarnations. Numeric segment labels remain canonical metadata, never files.
 No growing manifest value or per-record head publication is introduced.
 
-Rotation prepares an empty successor and commits its catalog binding, durably
-publishes the head cutover, then seals the predecessor. A caller-supplied
+Rotation prepares an empty successor and commits its catalog binding. Automatic
+append rotation reserves its known private span before durably publishing head
+cutover and sealing the predecessor. Metadata/delete reserve the complete
+canonical batch; a streaming PUT reserves its known header/key prefix, not the
+unknown body. Zero minimum reserves one byte of logical capacity. Explicit
+empty structural rotation has no append span to reserve. A caller-supplied
 expected active segment fences retries: an already selected successor succeeds
 without another rotation, including after reopen. Recovery recognizes a staged
 empty successor and a cutover whose predecessor still needs sealing. It completes
 that seal before admitting another producer. A nonempty unpublished successor,
 missing segment, wrong binding or sealed active segment is a protocol error.
 Uncertain physical I/O retains the container's poison/reopen rule.
+
+`ps_stream_reserve` and its canonical record adapter acquire existing bounded
+zero-owned grants without advancing a tail or emitting canonical bytes. Valid
+allocation/preparation failure fails that writer, which must be closed. It may
+retain reusable zero grants in a staged empty successor. Capacity failure during
+reservation preserves the predecessor; retry after growth reuses the staged
+owner. This is span reservation, not an atomic budget for the whole operation.
 
 One producer/rotation owns a namespace at a time; contention is explicit. Producer
 callbacks hold neither registry nor namespace mutexes. Other namespaces and
@@ -256,6 +267,12 @@ payloads. Rotation accounts for the complete metadata batch size. This worker
 retains its existing projection coordination during durable commit; it does not
 inherit ordinary PUT's projection-unlock behavior or add a root-wide writer queue.
 
+Mutation admission now rejects state keys beyond the decoder's existing 1 MiB
+limit before consuming a producer. Header/batch encoding applies matching key
+and metadata bounds. This fixes durable metadata-only writes that could report
+success for an oversized key and disappear after replay. Exact-limit metadata
+keys remain supported; existing individual metadata-field limits still apply.
+
 Encoded read windows retain the namespace and storage owner. Their decoded
 sources retain their original body and crypto binding across replacement,
 rotation and Pouch close. The last source releases exclusive container ownership.
@@ -273,8 +290,9 @@ bodies. Marker removal, retention scheduling and reclamation remain pending.
 
 Protected physical capacity does not yet provide end-to-end maintenance
 admission. At a fixed 10 MiB capacity, another namespace can consume the space
-needed to rotate before deletion. The capacity probe checks safe failure and
-reopen, not guaranteed deletion or reclamation. Reserving the complete
+needed to rotate before deletion. The capacity probe checks the prior value,
+selected head and tail across failure/reopen, not guaranteed deletion or
+reclamation. Reserving the complete
 maintenance dependency set before cutover remains an acceptance requirement.
 
 This harness explicitly requires disabled query indexing, background maintenance

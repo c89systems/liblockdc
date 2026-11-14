@@ -1334,6 +1334,13 @@ The header is for physical traversal and corruption detection. Logical facts
 belong in record metadata, where replay can inspect them without opening the
 payload.
 
+State record keys and encoded metadata each have a 1 MiB local bound, matching
+the decoder. State mutations reject longer keys before consuming body input;
+header and batch encoders enforce the same bounds. A metadata-only key exactly
+at the limit remains valid. Individual metadata fields retain their existing
+width limits, including the 16-bit payload-context length, so a body write can
+reach that field's limit earlier. This changes no record encoding or version.
+
 `flags` currently defines `LC_POUCH_RECORD_FLAG_PENDING`. A payload write
 appends a pending record to the active segment, streams the payload, rewrites
 the final key/metadata while the header remains pending, then publishes the

@@ -45,6 +45,12 @@ int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
  * or allocator locks. Buffers are bounded at PS_CHUNK. */
 int ps_stream_begin(ps_stream *, ps_stream_writer **, lc_error *);
 uint64_t ps_stream_writer_start(const ps_stream_writer *);
+/* Reserve at least bytes from this append's start without advancing its tail
+ * or writing canonical bytes. Existing grants stay private to this stream.
+ * Allocation failure may leave reusable zero grants and fails this writer.
+ * Caller knows a bounded canonical span, not necessarily the producer's size.
+ */
+int ps_stream_reserve(ps_stream_writer *, uint64_t bytes, lc_error *);
 int ps_stream_write(ps_stream_writer *, const void *, size_t, lc_error *);
 /* Relative to this private append, never to previously committed bytes.
  * Supports the canonical PENDING-header/metadata fixup before publication. */

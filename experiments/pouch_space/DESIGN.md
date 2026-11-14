@@ -431,7 +431,9 @@ Ordinary stream runs now use a cached namespace segment owner. A small durable
 head selects the active numeric segment; typed catalog entries own the segment
 set. Initialization and rotation publish structural metadata, while normal
 record commits only publish the canonical tail. Rotation prepares/binds a new
-empty stream, commits head cutover, then seals its predecessor. Expected-active
+empty stream, reserves the known span for an automatic append, commits head
+cutover, then seals its predecessor. Explicit empty rotation reserves no append
+span. Expected-active
 fences make interrupted rotations retryable across reopen. Unpublished empty
 successors are reusable; recovery rejects inconsistent membership. Logical
 mutation authority still owns versions, index sequences and public policy.
@@ -446,6 +448,20 @@ namespaces progress during a blocked producer or initialization. Cached storage
 admission checks poison before its atomic pointer lookup. The owner caches its
 committed tail under append authority to avoid a duplicate metadata query per
 record. Snapshot/obsolete transitions remain pending.
+
+`ps_stream_reserve` acquires enough zero-owned grants from the append start for
+a caller's known minimum. It changes neither the private record cursor nor the
+published tail and does not buffer a body. The record adapter exposes the same
+operation. Automatic namespace append reserves at least one logical byte before
+selecting a successor. Pouch metadata/delete supply their complete canonical
+batch size; ordinary streaming PUT supplies only its header/key prefix. Later
+unknown producer bytes still acquire bounded grants as they arrive.
+
+Allocation failure may retain empty grants for retry, but a failed reservation
+does not cut over or seal the predecessor. Reopen accepts this staged empty
+owner, and a 1 MiB growth can satisfy a later retry. Committing within the
+reserved span needs no additional grant. Complete maintenance dependency
+admission remains separate work; no per-root writer queue is introduced.
 
 The private Pouch harness now also admits ordinary metadata updates and delete
 tombstones through the production canonical batch writer and typed appender.
@@ -468,7 +484,8 @@ The physical reserve is not yet connected to the complete logical maintenance
 dependency set. A peer namespace can exhaust foreground capacity needed for
 rotation before a delete, despite protected physical capacity. The fixed-size
 capacity probe verifies preservation of the prior value across failure/reopen;
-it does not prove full-capacity deletion. Guaranteed admission and reclamation
+it also checks selected-head/tail preservation. It does not prove full-capacity
+deletion. Guaranteed admission and reclamation
 remain requirements of the full backend.
 
 The protected metadata region cannot be consumed by payloads. Relocating

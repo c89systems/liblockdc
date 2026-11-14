@@ -1666,6 +1666,142 @@ series with `bash build/pouch-space-integrated/mutations-paired.sh`, or substitu
 `runtime-metadata`/`pouch-metadata` and `runtime-delete`/`pouch-delete` in the
 current-source comparison command above.
 
+## Reserved spans before cutover and bounded key admission
+
+Automatic append rotation now prepares/binds its successor and reserves the
+known canonical span before selecting its head and sealing the predecessor.
+`ps_stream_reserve` and `ps_record_reserve` acquire existing zero-owned grants
+without publishing a tail or writing canonical bytes. Metadata/delete reserve
+their complete batch; ordinary streaming PUT reserves its header/key prefix,
+with unknown body bytes still flowing through bounded buffers. A zero minimum
+reserves one logical byte. Explicit empty structural rotation has no append span.
+
+A failed reservation can retain reusable empty grants, but leaves the prior
+head selected and appendable. The new 1 MiB-capacity test requires failure
+before cutover, appends to the predecessor, closes/reopens, grows by 1 MiB and
+retries the prepared successor. Captured readers survive growth and cutover;
+reserved bytes are unreadable until publication. Publishing within the reserved
+span must not allocate another grant or emit another grant journal event.
+Raw stream tests also extend a reservation after buffering a prefix and check
+cursor/tail stability, invalid arguments and both durability policies.
+
+This does **not** complete protected maintenance admission. The fixed 10 MiB
+probe still fills 117 keys and can reject peer-namespace deletion for lack of
+rotation capacity. It now additionally asserts selected head and tail remain
+unchanged across that capacity failure and reopen. Complete operation budgets,
+reclamation and NoSync performance remain work in the full native goal.
+
+### A reproduced write/replay boundary defect
+
+Checking the largest reservation exposed a shared state-engine defect. A durable
+metadata-only write with a 1 MiB + 1-byte key returned success; after container
+reopen the key was absent. The decoder already rejects keys above 1 MiB, while
+mutation/header admission permitted that metadata record. The reproduced output
+is in `build/pouch-space-integrated/admission-key-bounds-repro2.log`.
+
+Shared mutation admission now rejects oversized keys before producer input;
+header/batch encoding applies the decoder's key/metadata limits too. No encoding,
+version, compatibility path or public backend selector changes. The regression
+tests both current multifile and container roots, plain and combined codecs,
+under both sync policies. It rejects oversized PUT/metadata/delete requests,
+requires no source consumption, preserves an exact-limit metadata-only key
+across reopen, and verifies body/update/delete plus sequences using a 60 KiB
+key. Body keys also occupy the existing 16-bit payload-context field.
+
+### Verification
+
+After that repair, the full Debug preset passed 271 checks under ASan/UBSan.
+GNU and native musl release each passed all 98 affected checks: all 80 pouch-space
+checks plus 18 existing Pouch groups. Twenty-three affected integration,
+namespace, root and canonical-record groups passed ThreadSanitizer. Musl workers
+retain their default 128 KiB stacks. No Darwin, QEMU or large-machine tests ran.
+
+The namespace durable-image fault matrix now includes pre-reserved automatic
+rotation, covering every observed allocation/I/O point under both sync policies,
+missing writes and torn synchronization models. It requires the old canonical
+prefix and a usable retry after recovery. The existing PUT and mutation fault
+matrices also pass with the new admission order. Six affected Memcheck groups
+passed: 786,869 allocations/frees, no remaining blocks, errors or suppressions.
+
+Final logs and CTest details are `admission-verified-{debug,gnu,musl,tsan}-*`
+under `build/pouch-space-integrated/`; the six
+`admission-{namespace,pouch}-*-memcheck.log` files retain memory evidence.
+Earlier `admission-final-*` logs predate the key-boundary repair; the final
+counts above refer to `admission-verified-*`.
+
+### Matched current and prior container measurements
+
+The 180 serial GNU release runs use five alternating-order samples per
+operation/profile/engine. Current container and current multifile call production
+APIs from the same executable. Prior container uses the preserved `91632cc`
+executable from the preceding mutation stage. Inputs remain 1 KiB bodies,
+32-byte application metadata for metadata updates, 4 KiB source chunks, no
+transforms/indexing, background maintenance or positive expiry, and a fixed
+10 MiB container. NoSync profiles use 1,024 keys. Each writer owns a distinct
+namespace. Every run verifies after mutation and after populated-root reopen;
+all 120 container runs audit one file and no
+sidecars. Metadata/delete seeding is outside the mutation timer and reported as
+`seed_ms`; PUT and metadata have two rounds, deletion one. OS page cache remains.
+
+Median mutation milliseconds:
+
+| Operation / workload | Current container | Prior container | Current multifile |
+| --- | ---: | ---: | ---: |
+| PUT, durable, 128 keys, 1 writer | 738.47 | 831.30 | 1143.44 |
+| PUT, fresh NoSync, 1,024 keys, 4 writers | 33.23 | 26.43 | 27.04 |
+| PUT, empty-root reopen, NoSync, 4 writers | 52.96 | 48.84 | 28.80 |
+| PUT, NoSync, 1,024 keys, 1 writer | 86.63 | 82.00 | 71.63 |
+| Metadata, durable, 128 keys, 1 writer | 369.03 | 417.42 | 1168.81 |
+| Metadata, hot seeded NoSync, 4 writers | 24.25 | 22.48 | 21.66 |
+| Metadata, populated-root reopen, NoSync, 4 writers | 35.08 | 34.63 | 43.28 |
+| Metadata, seeded NoSync, 1,024 keys, 1 writer | 90.21 | 88.57 | 83.06 |
+| Delete, durable, 128 keys, 1 writer | 160.71 | 174.95 | 537.25 |
+| Delete, hot seeded NoSync, 4 writers | 4.77 | 3.34 | 3.90 |
+| Delete, populated-root reopen, NoSync, 4 writers | 10.33 | 13.42 | 15.50 |
+| Delete, seeded NoSync, 1,024 keys, 1 writer | 6.21 | 5.58 | 6.38 |
+
+Durable medians remain faster than multifile. NoSync is not accepted as solved:
+fresh four-writer PUT is about 26% slower than prior container, metadata 8%
+slower and deletion 43% slower by these medians. Five-sample ranges overlap:
+PUT is 28.28–39.83 / 20.21–30.93 ms (current/prior); metadata
+21.35–32.01 / 21.80–31.55 ms; deletion 2.64–7.12 / 2.59–6.60 ms. Fresh PUT
+CPU medians are nearly equal, 56.68 / 56.62 ms, while other CPU ranges also
+overlap. These measurements do not establish a causal timing breakdown or a
+performance acceptance result. Raw rows, CPU/latency ranges and phase metrics
+remain in the JSON.
+
+Median syscall write counts/bytes and sync counts match prior container in each
+profile. One-writer PUT uses four logical segments and accounts for 16 KiB more
+kernel writes; one-writer metadata ends with three segments and accounts for
+4 KiB more during its timed phase. This is consistent with stabilizing a new
+grant-header page at head cutover before canonical writes dirty that page again.
+It is a concrete cost to investigate, not proof that it explains every timing
+regression. Both PUT variants have 12 fdatasync calls in that one-writer profile;
+metadata has 3; delete has none. Sync-duration sums may overlap across workers.
+
+For the fresh/hot NoSync four-writer profiles, current-container / multifile
+verification passes take 3.82 / 43.30 ms after PUT and 3.77 / 28.65 ms after
+metadata. Delete verification checks absence, not bodies. Reopen plus verification
+alone remains slower for container: 45.22 / 33.07 ms after PUT, 50.60 / 34.27 ms
+after metadata and 44.63 / 28.08 ms after delete. Including the preceding close,
+per-sample sum medians are 45.41 / 105.46, 50.94 / 95.81 and 44.93 / 88.66 ms.
+Public scan performance remains unmeasured.
+
+Preopened PUT closes/reopens an empty root before work; metadata/delete do so
+with a populated seeded root. Including that preopen close/open, current / MF
+mutation medians are 59.47 / 29.12 ms for PUT, 49.23 / 106.70 ms for metadata
+and 20.76 / 74.09 ms for delete. Lazy container replay and multifile close hints
+must remain visible in that comparison. Do not treat metadata/delete `MiB_s`
+as actual byte throughput; the common field uses reference body size.
+
+The prior mutation manifest passed verification without replacing its ELF.
+New artifacts under `build/pouch-space-integrated/` are `admission-paired/`,
+`admission-paired.sh`, `admission-results.json`,
+`pouch_space_compare-admission-current` and `admission-artifacts.sha256`.
+The manifest checks all 184 artifacts, including both preserved executables.
+The paired runner reproduces the complete series with Bash. Normal public
+`lc_pouch_open` still uses multifile roots; the complete backend goal stays active.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1676,8 +1812,9 @@ packing, canonical-stream, lifecycle, typed catalog and production collection
 and ordinary state record follow-ups. Namespace segments now have a real
 container owner. Ordinary production state PUT/projection/point-read, metadata
 update and deletion now join it through the private integration harness. The
-next work must close maintenance admission at capacity and connect the
-remaining advanced mutation/scan paths and public collection ownership, then
+next work must close whole-operation maintenance admission at capacity, address
+the measured cutover cost, and connect the remaining advanced mutation/scan paths
+and public collection ownership, then
 complete the public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader

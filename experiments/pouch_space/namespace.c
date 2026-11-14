@@ -393,13 +393,26 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
   }
   return rc;
 }
-static int rotate(struct ps_namespace_data *d, lc_error *e) {
+static int begin_reserve(ps_stream *stream, uint64_t minimum,
+                         ps_record_writer *writer, lc_error *e) {
+  int rc = ps_record_begin(stream, writer, e);
+  if (rc == LC_OK)
+    rc = ps_record_reserve(writer, minimum ? minimum : 1, e);
+  return rc;
+}
+static int rotate(struct ps_namespace_data *d, ps_record_writer *writer,
+                  uint64_t minimum, lc_error *e) {
   uint64_t next;
   int rc;
   if (d->active == UINT64_MAX)
     return failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
   next = d->active + 1;
   rc = prepare(d, next, e);
+  /* Retain the predecessor until the new append owns its known span. Empty
+   * structural rotation has no append span to reserve. Prepared zero grants
+   * survive a failed admission and are reused by the next attempt. */
+  if (rc == LC_OK && writer)
+    rc = begin_reserve(d->items[(size_t)next - 1].stream, minimum, writer, e);
   if (rc == LC_OK)
     rc = head_write(d, next, e);
   if (rc == LC_OK) {
@@ -515,7 +528,8 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
   return rc;
 }
 int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
-                              ps_namespace_append **out, lc_error *e) {
+                              uint64_t minimum, ps_namespace_append **out,
+                              lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_append *append;
   int rc;
@@ -523,6 +537,9 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
+  if (minimum > (uint64_t)INT64_MAX)
+    return failure(e, LC_ERR_INVALID,
+                   "namespace append minimum exceeds local offset limit");
   rc = data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
@@ -535,15 +552,20 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     return rc;
   }
   rc = finish_seal(d, e);
-  if (rc == LC_OK && (!d->active || (target && d->tail >= target)))
-    rc = rotate(d, e);
+  if (rc == LC_OK) {
+    if (!d->active || (target && d->tail >= target))
+      rc = rotate(d, &append->writer, minimum, e);
+    else
+      rc = begin_reserve(d->items[(size_t)d->active - 1].stream, minimum,
+                         &append->writer, e);
+  }
   if (rc == LC_OK) {
     segment *s = &d->items[(size_t)d->active - 1];
-    rc = ps_record_begin(s->stream, &append->writer, e);
     append->segment = s->id;
     memcpy(append->leaf, s->leaf, sizeof(s->leaf));
   }
   if (rc != LC_OK) {
+    ps_record_abort(&append->writer);
     leave(d);
     lc_free_with_allocator(NULL, append);
     return rc;
@@ -595,7 +617,7 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   if (d->active == expected) {
     rc = finish_seal(d, e);
     if (rc == LC_OK)
-      rc = rotate(d, e);
+      rc = rotate(d, NULL, 0, e);
   } else if (expected != UINT64_MAX && d->active == expected + 1) {
     rc = finish_seal(d, e);
   } else {

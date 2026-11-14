@@ -2,6 +2,7 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "lc_api_internal.h"
 #include "namespace.h"
+#include "record_io.h"
 #include "stream.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -108,7 +109,7 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
   request.version = version;
   request.index_seq = version;
   request.record_type = 1;
-  int rc = ps_namespace_append_begin(ns, target, &append, e);
+  int rc = ps_namespace_append_begin(ns, target, 0, &append, e);
   if (rc == LC_OK) {
     if (segment)
       *segment = ps_namespace_append_segment(append);
@@ -358,7 +359,7 @@ static void faults(const char *path) {
   lc_error_init(&e);
   for (int durable = 0; durable < 2; ++durable)
     for (int kind = 0; kind < 4; ++kind)
-      for (int phase = 0; phase < 3; ++phase) {
+      for (int phase = 0; phase < 4; ++phase) {
         size_t operations = 0;
         for (size_t at = 0; at <= operations; ++at) {
           memset(m.live, 0, PS_MIB);
@@ -394,8 +395,14 @@ static void faults(const char *path) {
             rc = append(root, ns, 1, 0, 31, &e);
           else if (phase == 1)
             rc = ps_namespace_rotate(ns, 1, &e);
-          else
+          else if (phase == 2)
             rc = capture(ns, &scanned, &e);
+          else {
+            ps_namespace_append *reserved = NULL;
+            rc = ps_namespace_append_begin(ns, 1, sizeof(body) + 2048,
+                                           &reserved, &e);
+            ps_namespace_append_close(reserved);
+          }
           if (!at)
             operations = kind == 1 ? allocation : m.calls;
           m.fail = fail_allocation = 0;
@@ -432,13 +439,17 @@ static void faults(const char *path) {
             ok(append(root, ns, recovered.count + 1, 0, 7, &e), &e);
             count(ns, recovered.count + 1, &e);
           } else
-            REQUIRE(recovered.count == (size_t)phase);
+            REQUIRE(recovered.count == (phase == 2 ? 2U : 1U));
           if (phase == 1) {
             ok(ps_namespace_rotate(ns, 1, &e), &e);
             ps_namespace_status status;
             ok(ps_namespace_status_get(ns, &status, &e), &e);
             REQUIRE(status.active_segment == 2);
             ok(append(root, ns, 2, 0, 13, &e), &e);
+            count(ns, 2, &e);
+          }
+          if (phase == 3) {
+            ok(append(root, ns, 2, 0, sizeof(body), &e), &e);
             count(ns, 2, &e);
           }
           ps_namespace_release(ns);
@@ -709,7 +720,8 @@ static void concurrency(const char *path) {
     pthread_cond_wait(&g.changed, &g.mutex);
   pthread_mutex_unlock(&g.mutex);
   ps_namespace_append *contended = NULL;
-  REQUIRE(ps_namespace_append_begin(a, 0, &contended, &e) == LC_ERR_INVALID &&
+  REQUIRE(ps_namespace_append_begin(a, 0, 0, &contended, &e) ==
+              LC_ERR_INVALID &&
           !contended);
   clear(&e);
   REQUIRE(ps_namespace_rotate(a, 1, &e) == LC_ERR_INVALID);
@@ -775,6 +787,168 @@ static void concurrency(const char *path) {
   REQUIRE(unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static void stream_reservation(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_options o = {0};
+    ps_space *space = NULL;
+    ps_stream *stream = NULL;
+    ps_stream_writer *writer = NULL;
+    ps_stream_reader *reader = NULL;
+    ps_stream_info info;
+    ps_stats before, after;
+    ps_key key = {1, 1, PS_STREAM};
+    lc_error e;
+    unsigned char bytes[1024];
+    size_t at = 0, got;
+    o.durable_sync = sync;
+    lc_error_init(&e);
+    ok(ps_open(path, 1, &o, &space, &e), &e);
+    ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+    ok(ps_stream_begin(stream, &writer, &e), &e);
+    ok(ps_status(space, &before, &e), &e);
+    ok(ps_stream_reserve(writer, 0, &e), &e);
+    ok(ps_status(space, &after, &e), &e);
+    REQUIRE(before.entries == after.entries &&
+            before.journal_bytes == after.journal_bytes);
+    ok(ps_stream_reserve(writer, PS_CHUNK + 1, &e), &e);
+    ok(ps_stream_status(stream, &info, &e), &e);
+    REQUIRE(!info.tail && info.capacity >= PS_CHUNK + 1 && info.runs > 1);
+    REQUIRE(ps_stream_read_open(stream, 0, 1, &reader, &e) == LC_ERR_INVALID &&
+            !reader);
+    clear(&e);
+    ok(ps_stream_write(writer, body, 17, &e), &e);
+    ok(ps_stream_reserve(writer, sizeof(body), &e), &e);
+    ok(ps_stream_status(stream, &info, &e), &e);
+    REQUIRE(!info.tail && info.capacity >= sizeof(body));
+    ok(ps_status(space, &before, &e), &e);
+    ok(ps_stream_reserve(writer, sizeof(body), &e), &e);
+    ok(ps_stream_write(writer, body + 17, sizeof(body) - 17, &e), &e);
+    ok(ps_stream_commit(writer, &e), &e);
+    REQUIRE(ps_stream_reserve(writer, 1, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ps_stream_writer_close(writer);
+    writer = NULL;
+    ok(ps_status(space, &after, &e), &e);
+    REQUIRE(before.entries == after.entries &&
+            before.journal_bytes == after.journal_bytes &&
+            after.syncs == before.syncs + (unsigned)sync);
+    ok(ps_stream_read_open(stream, 0, sizeof(body), &reader, &e), &e);
+    while ((got = 0, ps_stream_read(reader, bytes, sizeof(bytes), &got, &e)) ==
+               LC_OK &&
+           got) {
+      REQUIRE(got <= sizeof(body) - at && !memcmp(bytes, body + at, got));
+      at += got;
+    }
+    REQUIRE(e.code == LC_OK && at == sizeof(body));
+    ok(ps_stream_begin(stream, &writer, &e), &e);
+    REQUIRE(ps_stream_reserve(writer, (uint64_t)INT64_MAX, &e) ==
+            LC_ERR_INVALID);
+    clear(&e);
+    ok(ps_stream_reserve(writer, 0, &e), &e);
+    ps_stream_writer_close(writer);
+    ps_stream_reader_close(reader);
+    ok(ps_stream_close(stream, &e), &e);
+    ok(ps_close(space, &e), &e);
+    REQUIRE(ps_stream_reserve(NULL, 1, &e) == LC_ERR_INVALID);
+    clear(&e);
+    REQUIRE(ps_record_reserve(NULL, 1, &e) == LC_ERR_INVALID);
+    clear(&e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
+static void reservation(const char *path) {
+  stream_reservation(path);
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    ps_root *root = NULL;
+    ps_namespace *ns;
+    ps_namespace_append *reserved = NULL;
+    ps_namespace_window *rejected = NULL;
+    ps_namespace_view *old = NULL;
+    ps_namespace_status before, after;
+    ps_stats allocated, committed;
+    lc_pouch_state_entry request = {0}, result = {0};
+    input source = {0};
+    records seen = {0};
+    lc_error e;
+    lc_error_init(&e);
+    o.storage.initial_capacity = PS_MIB;
+    o.storage.maximum_capacity = 2 * PS_MIB;
+    o.storage.durable_sync = sync;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ns = acquire(root, "reserve", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    ok(ps_namespace_status_get(ns, &before, &e), &e);
+    REQUIRE(ps_namespace_append_begin(ns, 1, PS_MIB, &reserved, &e) ==
+                LC_ERR_INVALID &&
+            !reserved && e.message && strstr(e.message, "capacity"));
+    clear(&e);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(before.active_segment == 1 && after.active_segment == 1 &&
+            after.tail == before.tail);
+    /* Failed successor admission must leave the predecessor appendable. */
+    ok(append(root, ns, 2, 0, 17, &e), &e);
+    count(ns, 2, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "reserve", 0, &e);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(after.active_segment == 1);
+    count(ns, 2, &e);
+    ok(ps_namespace_view_open(ns, &old, &e), &e);
+    ok(ps_grow(ps_root_space(root), PS_MIB, &e), &e);
+    REQUIRE(ps_namespace_append_begin(ns, 1, UINT64_MAX, &reserved, &e) ==
+                LC_ERR_INVALID &&
+            !reserved);
+    clear(&e);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(after.active_segment == 1);
+    ok(ps_namespace_append_begin(ns, 1, PS_MIB, &reserved, &e), &e);
+    REQUIRE(ps_namespace_append_segment(reserved) == 2);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(after.active_segment == 2 && !after.tail);
+    REQUIRE(ps_namespace_read_open(ns, 2, 0, 1, &rejected, &e) ==
+                LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    count(ns, 2, &e);
+    ok(ps_status(ps_root_space(root), &allocated, &e), &e);
+    request.key = "key";
+    request.content_type = "application/test";
+    request.payload_context = "namespace-test";
+    request.version = request.index_seq = 3;
+    request.record_type = 1;
+    source.pub.impl = &source;
+    source.pub.read = pull;
+    source.bytes = sizeof(body);
+    ok(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
+                                    ps_namespace_append_output(reserved),
+                                    ps_namespace_append_leaf(reserved),
+                                    &request, &source.pub, 0, &result, &e),
+       &e);
+    ok(ps_namespace_append_commit(reserved, &e), &e);
+    ps_namespace_append_close(reserved);
+    lc_pouch_state_entry_cleanup(&allocator, &result);
+    ok(ps_status(ps_root_space(root), &committed, &e), &e);
+    REQUIRE(allocated.entries == committed.entries &&
+            allocated.journal_bytes == committed.journal_bytes);
+    ok(ps_namespace_view_visit(old, 1, visit, &seen, &e), &e);
+    REQUIRE(seen.count == 2);
+    ps_namespace_view_close(old);
+    count(ns, 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "reserve", 0, &e);
+    count(ns, 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -786,6 +960,8 @@ static void *worker(void *p) {
     faults(r->path);
   else if (!strcmp(r->mode, "validation"))
     validation(r->path);
+  else if (!strcmp(r->mode, "reservation"))
+    reservation(r->path);
   else
     concurrency(r->path);
   return NULL;

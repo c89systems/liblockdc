@@ -29,7 +29,10 @@ integration of production ordinary-state PUT/read, metadata update and deletion
 policy are now implemented. Retention work hints are durable records inside the
 container. Full-capacity deletion is not yet guaranteed: a required rotation can
 still exhaust foreground capacity. The experiment verifies that such failure
-preserves the prior value; protected maintenance admission remains required.
+preserves the prior value. Automatic append rotation now reserves its known
+span before selecting the successor, preserving the prior head on reservation
+failure. Protected admission for the complete maintenance operation remains
+required.
 Remaining public Pouch semantics, maintenance and shared-root coordination
 remain ahead; normal public open behavior has not changed.
 

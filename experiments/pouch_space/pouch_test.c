@@ -1134,6 +1134,15 @@ static void mutation_concurrency(const char *path, const char *directory) {
   }
 }
 
+static lc_pouch_storage_namespace_info
+storage_info(lc_pouch *p, const char *name, lc_error *e) {
+  lc_pouch_storage_namespace_info info = {0};
+  void *ns = NULL;
+  ok(p->storage.ops->namespace_open(p->storage.context, name, 0, &ns, e), e);
+  ok(p->storage.ops->namespace_info(p->storage.context, ns, &info, e), e);
+  p->storage.ops->namespace_close(p->storage.context, ns);
+  return info;
+}
 static void mutation_capacity(const char *path, const char *directory) {
   ps_pouch_state_options o = options(0, 0);
   lc_pouch *p = NULL;
@@ -1143,6 +1152,8 @@ static void mutation_capacity(const char *path, const char *directory) {
   size_t count;
   char key[32];
   int rc, removed, peer_removed;
+  lc_pouch_storage_namespace_info full_before, full_after, peer_before,
+      peer_after, reopened;
   o.logical.segment_target_bytes = 1;
   lc_error_init(&e);
   ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
@@ -1164,6 +1175,8 @@ static void mutation_capacity(const char *path, const char *directory) {
     }
   }
   REQUIRE(count > 0 && count < 256);
+  full_before = storage_info(p, "full", &e);
+  peer_before = storage_info(p, "victim", &e);
   read_value(p, "full", "key-0", 65569, 0, 1, &e);
   rc = lc_pouch_state_delete(p, "full", "key-0", NULL, &w, &e);
   REQUIRE(rc == LC_OK || rc == LC_ERR_INVALID);
@@ -1172,6 +1185,10 @@ static void mutation_capacity(const char *path, const char *directory) {
   removed = rc == LC_OK;
   clear(&e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
+  full_after = storage_info(p, "full", &e);
+  if (!removed)
+    REQUIRE(full_after.active_segment == full_before.active_segment &&
+            full_after.tail == full_before.tail);
   ok(lc_pouch_state_read_metadata(p, "full", "key-0", &r, &e), &e);
   REQUIRE(r.found == !removed);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
@@ -1182,9 +1199,19 @@ static void mutation_capacity(const char *path, const char *directory) {
   peer_removed = rc == LC_OK;
   clear(&e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
+  peer_after = storage_info(p, "victim", &e);
+  if (!peer_removed)
+    REQUIRE(peer_after.active_segment == peer_before.active_segment &&
+            peer_after.tail == peer_before.tail);
   lc_pouch_close(p);
   REQUIRE(live == 0);
   ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  reopened = storage_info(p, "full", &e);
+  REQUIRE(reopened.active_segment == full_after.active_segment &&
+          reopened.tail == full_after.tail);
+  reopened = storage_info(p, "victim", &e);
+  REQUIRE(reopened.active_segment == peer_after.active_segment &&
+          reopened.tail == peer_after.tail);
   ok(lc_pouch_state_read_metadata(p, "full", "key-0", &r, &e), &e);
   REQUIRE(r.found == !removed);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
@@ -1207,6 +1234,136 @@ static void mutation_capacity(const char *path, const char *directory) {
   lc_error_cleanup(&e);
 }
 
+static int bounds_failed;
+static void key_bounds(const char *directory) {
+  char path[1400];
+  const size_t body_key_bytes = 60U * 1024U;
+  char *key = lc_alloc_with_allocator(&allocator, PS_MIB + 2);
+  lc_error e;
+  REQUIRE(key != NULL);
+  memset(key, 'k', PS_MIB + 1);
+  key[PS_MIB + 1] = 0;
+  lc_error_init(&e);
+  for (int container = 1; container >= 0; --container)
+    for (int transform = 0; transform <= 3; transform += 3)
+      for (int sync = 1; sync >= 0; --sync) {
+        ps_pouch_state_options o = options(transform, sync);
+        lc_pouch *p = NULL;
+        lc_pouch_state_write_result w = {0};
+        lc_pouch_state_write_options change = {0};
+        lc_pouch_state_read_result r = {0};
+        input in = source(17, 12);
+        int rc;
+        REQUIRE(snprintf(path, sizeof(path), "%s/bounds-%d-%d-%d", directory,
+                         container, transform, sync) < (int)sizeof(path));
+        if (container)
+          ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+        else
+          ok(lc_pouch_open(path, &allocator, &o.logical, &p, &e), &e);
+        key[PS_MIB] = 'k';
+        rc = put(p, "bounds", key, &in, NULL, &w, &e);
+        if (rc != LC_ERR_INVALID || in.calls) {
+          fprintf(stderr,
+                  "oversized key admitted/consumed source: container=%d "
+                  "transform=%d sync=%d rc=%d calls=%lu\n",
+                  container, transform, sync, rc, (unsigned long)in.calls);
+          bounds_failed = 1;
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          lc_pouch_close(p);
+          lc_free_with_allocator(&allocator, key);
+          lc_error_cleanup(&e);
+          return; /* Let main remove the owned fixture before failing. */
+        }
+        clear(&e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        change.has_metadata = 1;
+        change.metadata = (const unsigned char *)"bound";
+        change.metadata_length = 5;
+        rc = lc_pouch_state_update_metadata(p, "bounds", key, &change, &w, &e);
+        if (rc != LC_ERR_INVALID) {
+          fprintf(stderr,
+                  "oversized metadata key: container=%d sync=%d rc=%d\n",
+                  container, sync, rc);
+          bounds_failed = 1;
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          lc_pouch_close(p);
+          if (container && rc == LC_OK) {
+            ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+            rc = lc_pouch_state_read_metadata(p, "bounds", key, &r, &e);
+            fprintf(stderr, "oversized key after reopen: rc=%d found=%d\n", rc,
+                    r.found);
+            lc_pouch_state_read_result_cleanup(&allocator, &r);
+            lc_pouch_close(p);
+          }
+          lc_free_with_allocator(&allocator, key);
+          lc_error_cleanup(&e);
+          return;
+        }
+        clear(&e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        REQUIRE(lc_pouch_state_delete(p, "bounds", key, NULL, &w, &e) ==
+                LC_ERR_INVALID);
+        clear(&e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        key[PS_MIB] = 0;
+        /* Metadata-only keys reach the decoder limit. Body keys also occupy
+         * the existing 16-bit payload-context field, so exercise 60 KiB. */
+        ok(lc_pouch_state_update_metadata(p, "bounds", key, &change, &w, &e),
+           &e);
+        REQUIRE(w.version == 0 && w.index_seq == 1);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        lc_pouch_close(p);
+        if (container)
+          ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+        else
+          ok(lc_pouch_open(path, &allocator, &o.logical, &p, &e), &e);
+        ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+        REQUIRE(r.found && !r.has_body && r.version == 0 && r.index_seq == 1 &&
+                r.metadata_length == 5 && !memcmp(r.metadata, "bound", 5));
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        key[body_key_bytes] = 0;
+        in = source(17, 12);
+        ok(put(p, "bounds", key, &in, NULL, &w, &e), &e);
+        REQUIRE(w.version == 1 && w.index_seq == 2);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        ok(lc_pouch_state_update_metadata(p, "bounds", key, &change, &w, &e),
+           &e);
+        REQUIRE(w.version == 1 && w.index_seq == 3);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        lc_pouch_close(p);
+        REQUIRE(live == 1); /* Caller-owned key. */
+        if (container)
+          ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+        else
+          ok(lc_pouch_open(path, &allocator, &o.logical, &p, &e), &e);
+        read_value(p, "bounds", key, 17, 12, 1, &e);
+        ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+        REQUIRE(r.index_seq == 3 && r.metadata_length == 5 &&
+                !memcmp(r.metadata, "bound", 5));
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        ok(lc_pouch_state_delete(p, "bounds", key, NULL, &w, &e), &e);
+        REQUIRE(w.version == 2 && w.index_seq == 4);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        lc_pouch_close(p);
+        if (container)
+          ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+        else
+          ok(lc_pouch_open(path, &allocator, &o.logical, &p, &e), &e);
+        ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+        REQUIRE(!r.found);
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        key[body_key_bytes] = 'k';
+        ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+        REQUIRE(r.found && r.version == 0 && r.index_seq == 1 &&
+                r.metadata_length == 5 && !memcmp(r.metadata, "bound", 5));
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        lc_pouch_close(p);
+        REQUIRE(live == 1);
+      }
+  lc_free_with_allocator(&allocator, key);
+  REQUIRE(live == 0);
+  lc_error_cleanup(&e);
+}
 static void validation(const char *path) {
   lc_error e;
   lc_error_init(&e);
@@ -1264,6 +1421,8 @@ static void *worker(void *context) {
     mutation_concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "mutation-capacity"))
     mutation_capacity(r->path, r->directory);
+  else if (!strcmp(r->mode, "key-bounds"))
+    key_bounds(r->directory);
   else
     REQUIRE(0);
   return NULL;
@@ -1296,6 +1455,7 @@ int main(int argc, char **argv) {
   lc_error_cleanup(&e);
   lc_test_tmp_cleanup_path(directory, prefix);
   REQUIRE(access(directory, F_OK) != 0);
+  REQUIRE(!bounds_failed);
   printf("container production state: %lu checks\n", (unsigned long)checks);
   return 0;
 }

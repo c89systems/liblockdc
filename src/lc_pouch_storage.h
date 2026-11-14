@@ -23,8 +23,9 @@ typedef struct lc_pouch_storage_ops {
   int (*namespace_info)(void *, void *, lc_pouch_storage_namespace_info *,
                         lc_error *);
   int (*replay)(void *, void *, lc_pouch_storage_visit_fn, void *, lc_error *);
-  int (*append_begin)(void *, void *, uint64_t, lc_pouch_storage_append *,
-                      lc_error *);
+  /* Rotation target and known minimum private span. Reserve before cutover. */
+  int (*append_begin)(void *, void *, uint64_t, uint64_t,
+                      lc_pouch_storage_append *, lc_error *);
   int (*append_commit)(void *, lc_pouch_storage_append *, lc_error *);
   void (*append_close)(void *, lc_pouch_storage_append *);
   /* Encoded, resettable bounded source owns its read pin and storage lifetime.
