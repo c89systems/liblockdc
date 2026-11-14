@@ -317,6 +317,40 @@ retention scheduling and complete maintenance-capacity budgets remain required.
 The fixed-capacity churn proof uses a caller-supplied complete one-key snapshot;
 it does not establish full-store maintenance admission.
 
+## Canonical snapshot serialization
+
+The state codec now supplies `lc_pouch_state_record_write_snapshot` and
+`lc_pouch_state_record_write_high_water` through the existing borrowed record-I/O
+boundary. Native compaction and clean-close projections use this same writer.
+The caller supplies resolved logical entries, selection/history policy, physical
+commit and durability. A raw namespace view alone does not resolve inherited
+per-key query generations; the logical producer must do that before writing.
+An absent explicit query sequence defaults to the entry's index sequence.
+
+With no encoded source, the writer emits a reference, metadata-only placeholder
+or tombstone without reading a body. With an encoded source, it copies exactly
+the declared stored span into the destination label, retaining the descriptor,
+immutable crypto context, versions, timestamps, metadata and both sequences.
+Caller-owned scratch bounds each chunk to at most 128 KiB; smaller buffers are
+supported. The source and output advance together, without decoding,
+re-encryption, payload spooling or a whole-body buffer. Empty encoded bodies
+need no scratch.
+
+Copied bodies retain PENDING until their original stored CRC has been checked
+and final metadata has been patched. Source errors, short input, invalid input,
+allocation failures and output failures prevent completion; an output failure
+after writing begins invokes the owner's private discard boundary. No logical
+snapshot is selected by this byte writer.
+
+Object references explicitly retain the existing OBJECT_LINK flag. This also
+corrects native clean-close projection writing, which previously passed that
+flag as unused descriptor reserve instead of setting the payload flag.
+Native reopen tests now assert that internal objects remain objects.
+
+Logical projection capture, safe obsolete-source decisions, history protection
+and complete maintenance-capacity admission remain integration work. These
+helpers introduce no public ABI or persistent format/version change.
+
 ## Production state integration
 
 A private `ps_pouch_state_open` harness now connects ordinary production state

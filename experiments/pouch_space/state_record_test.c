@@ -96,17 +96,26 @@ static int cookie_seek(void *p, off_t *offset, int whence) {
 typedef struct observed {
   lc_pouch_record_io underlying;
   size_t calls, fail, written, discards;
+  int after;
 } observed;
 static int io_fail(observed *o, lc_error *e) {
-  return ++o->calls == o->fail
+  return ++o->calls == o->fail && !o->after
              ? lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected record I/O", NULL,
                             NULL, "test")
              : LC_OK;
 }
+static int io_finish(observed *o, int rc, lc_error *e) {
+  return rc == LC_OK && o->after && o->calls == o->fail
+             ? lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected completed I/O",
+                            NULL, NULL, "test")
+             : rc;
+}
 static int rd(void *p, uint64_t at, const struct iovec *v, int n, lc_error *e) {
   observed *o = p;
   int rc = io_fail(o, e);
-  return rc == LC_OK ? lc_pouch_record_io_read(o->underlying, at, v, n, e) : rc;
+  return io_finish(
+      o, rc == LC_OK ? lc_pouch_record_io_read(o->underlying, at, v, n, e) : rc,
+      e);
 }
 static int wr(void *p, const struct iovec *v, int n, lc_error *e) {
   observed *o = p;
@@ -117,19 +126,22 @@ static int wr(void *p, const struct iovec *v, int n, lc_error *e) {
       for (int i = 0; i < n; ++i)
         o->written += v[i].iov_len;
   }
-  return rc;
+  return io_finish(o, rc, e);
 }
 static int patch(void *p, uint64_t at, const struct iovec *v, int n,
                  lc_error *e) {
   observed *o = p;
   int rc = io_fail(o, e);
-  return rc == LC_OK ? lc_pouch_record_io_patch(o->underlying, at, v, n, e)
-                     : rc;
+  return io_finish(
+      o,
+      rc == LC_OK ? lc_pouch_record_io_patch(o->underlying, at, v, n, e) : rc,
+      e);
 }
 static int tail(void *p, uint64_t *at, lc_error *e) {
   observed *o = p;
   int rc = io_fail(o, e);
-  return rc == LC_OK ? lc_pouch_record_io_tail(o->underlying, at, e) : rc;
+  return io_finish(
+      o, rc == LC_OK ? lc_pouch_record_io_tail(o->underlying, at, e) : rc, e);
 }
 static void discard(void *p, uint64_t at) {
   observed *o = p;
@@ -579,6 +591,502 @@ static void faults(const char *path) {
   REQUIRE(close(fd) == 0 && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static const char snapshot_leaf[] = "snapshot-00000000000000000002.log";
+typedef struct snapshot_source {
+  lc_source pub;
+  encoded range;
+  observed *output;
+  size_t calls, largest;
+  int failure;
+} snapshot_source;
+static size_t snapshot_pull(lc_source *pub, void *bytes, size_t count,
+                            lc_error *e) {
+  snapshot_source *s = pub->impl;
+  ++s->calls;
+  if (count > s->largest)
+    s->largest = count;
+  REQUIRE(count <= LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES);
+  if (s->failure == 3)
+    return SIZE_MAX;
+  if (s->failure == 2 || s->failure == 5) {
+    lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected encoded source error", NULL,
+                 NULL, "test");
+    return s->failure == 5 ? 1 : 0;
+  }
+  if (s->range.at > 65536 && s->range.bytes > 1000000)
+    REQUIRE(s->output->written > 65536);
+  size_t got = encoded_read(&s->range.pub, bytes, count, e);
+  if (got && s->failure == 4)
+    ((unsigned char *)bytes)[0] ^= 1;
+  return got;
+}
+static void snapshot_source_init(snapshot_source *s, lc_pouch_record_io input,
+                                 const lc_pouch_state_entry *r, observed *o) {
+  memset(s, 0, sizeof(*s));
+  s->pub.impl = s;
+  s->pub.read = snapshot_pull;
+  s->range.pub.impl = &s->range;
+  s->range.io = input;
+  s->range.start = r->payload_span.payload_offset;
+  s->range.bytes = r->cipher_bytes;
+  s->output = o;
+}
+static void snapshot_fields(const lc_pouch_state_entry *r,
+                            const lc_pouch_state_entry *expected) {
+  REQUIRE(!strcmp(r->key, expected->key));
+  REQUIRE(r->version == expected->version &&
+          r->index_seq == expected->index_seq);
+  REQUIRE(r->has_query_index_seq &&
+          r->query_index_seq == (expected->has_query_index_seq
+                                     ? expected->query_index_seq
+                                     : expected->index_seq));
+  REQUIRE(r->found == expected->found);
+  if (r->found) {
+    REQUIRE(!strcmp(r->content_type, expected->content_type));
+    REQUIRE(!strcmp(r->etag, expected->etag));
+    REQUIRE(r->bytes == expected->bytes &&
+            r->cipher_bytes == expected->cipher_bytes);
+    REQUIRE(r->retention == expected->retention &&
+            r->updated_at_unix == expected->updated_at_unix);
+    REQUIRE(r->metadata_length == expected->metadata_length &&
+            !memcmp(r->metadata, expected->metadata, r->metadata_length));
+    REQUIRE(r->has_query_hidden == expected->has_query_hidden &&
+            r->query_hidden == expected->query_hidden &&
+            r->staged_delete_marker == expected->staged_delete_marker);
+    REQUIRE((!r->descriptor && !expected->descriptor) ||
+            (r->descriptor && expected->descriptor &&
+             !strcmp(r->descriptor, expected->descriptor)));
+  }
+}
+static void snapshot_records(const char *path, const char *key) {
+  lc_error e;
+  lc_error_init(&e);
+  unsigned char *buffer = lc_alloc_with_allocator(
+      &allocator, 2 * LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES);
+  REQUIRE(buffer != NULL);
+  for (int mode = 0; mode < 4; ++mode)
+    for (int durable = 0; durable < 2; ++durable)
+      for (int file = 0; file < 2; ++file)
+        for (int object = 0; object < 2; ++object)
+          for (size_t size = 0; size < 3; ++size) {
+            ps_options options = {0};
+            options.durable_sync = durable;
+            lc_pouch_crypto_open_options crypto_options = {0};
+            crypto_options.key_string = mode & 1 ? key : NULL;
+            crypto_options.compression_enabled = mode & 2;
+            lc_pouch_crypto *crypto = NULL;
+            if (mode)
+              ok(lc_pouch_crypto_open(&allocator, &crypto_options, &crypto,
+                                      NULL, &e),
+                 &e);
+            ps_space *space = NULL;
+            ps_stream *original = NULL, *destination = NULL;
+            ps_key a = {1, 1, PS_STREAM}, b = {2, 1, PS_STREAM};
+            ok(ps_open(path, 1, &options, &space, &e), &e);
+            ok(ps_stream_open(space, a, 1, NULL, NULL, NULL, &original, &e),
+               &e);
+            size_t bytes = size == 0 ? 0 : size == 1 ? 1 : body_bytes;
+            lc_pouch_state_entry q = request(), stored = {0};
+            q.record_type = object ? 7 : 1;
+            q.retention = size == 0 ? 0 : size == 1 ? -3600 : 1770003600;
+            q.staged_delete_marker = size == 0;
+            ps_record_writer first;
+            observed origin;
+            input s = source(bytes, &origin);
+            s.pub.impl = &s;
+            ok(ps_record_begin(original, &first, &e), &e);
+            lc_pouch_record_io original_output =
+                observing(&origin, ps_record_output(&first));
+            ok(lc_pouch_state_record_append(&allocator, crypto, original_output,
+                                            leaf, &q, &s.pub, 0, &stored, &e),
+               &e);
+            ok(ps_record_commit(&first, NULL, NULL, &e), &e);
+            stored.has_query_index_seq = 1;
+            stored.query_index_seq = 11;
+            ps_stream_reader *original_reader = NULL;
+            ok(ps_stream_read_open(original, 0, first.tail, &original_reader,
+                                   &e),
+               &e);
+            lc_pouch_record_io original_input =
+                ps_record_input(original_reader);
+            char file_path[1200];
+            REQUIRE(snprintf(file_path, sizeof(file_path), "%s.snapshot",
+                             path) > 0);
+            int fd = -1;
+            ps_record_writer writer = {0};
+            lc_pouch_record_io underlying;
+            if (file) {
+              fd = open(file_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+              REQUIRE(fd >= 0);
+              underlying = lc_pouch_record_file_io(fd);
+            } else {
+              ok(ps_stream_open(space, b, 1, NULL, NULL, NULL, &destination,
+                                &e),
+                 &e);
+              ok(ps_record_begin(destination, &writer, &e), &e);
+              underlying = ps_record_output(&writer);
+            }
+            observed o;
+            lc_pouch_record_io output = observing(&o, underlying);
+            ok(lc_pouch_state_record_write_high_water(&allocator, output, 1000,
+                                                      900, &e),
+               &e);
+            size_t before = o.written;
+            ok(lc_pouch_state_record_write_snapshot(&allocator, output,
+                                                    snapshot_leaf, &stored,
+                                                    NULL, NULL, 0, &e),
+               &e);
+            REQUIRE(o.written - before < 4096);
+            snapshot_source copy;
+            snapshot_source_init(&copy, original_input, &stored, &o);
+            ok(lc_pouch_state_record_write_snapshot(
+                   &allocator, output, snapshot_leaf, &stored, &copy.pub,
+                   stored.cipher_bytes ? buffer : NULL,
+                   stored.cipher_bytes ? 2 * LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES
+                                       : 0,
+                   &e),
+               &e);
+            REQUIRE(copy.range.at == stored.cipher_bytes &&
+                    copy.largest <= LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES);
+            lc_pouch_state_entry deleted = {0}, placeholder = {0};
+            deleted.key = "deleted";
+            deleted.record_type = object ? 8 : 2;
+            deleted.version = 22;
+            deleted.index_seq = 43;
+            deleted.has_query_index_seq = 1;
+            deleted.query_index_seq = 29;
+            deleted.etag = "deleted-etag";
+            ok(lc_pouch_state_record_write_snapshot(
+                   &allocator, output, NULL, &deleted, NULL, NULL, 0, &e),
+               &e);
+            placeholder = q;
+            placeholder.key = "metadata-only";
+            placeholder.record_type = 4;
+            placeholder.found = 1;
+            placeholder.control = 0;
+            placeholder.version = 0;
+            placeholder.index_seq = 45;
+            placeholder.has_query_index_seq = 1;
+            placeholder.query_index_seq = 0;
+            placeholder.retention = 1770003600;
+            placeholder.staged_delete_marker = 0;
+            placeholder.etag = "";
+            placeholder.bytes = placeholder.cipher_bytes = 0;
+            placeholder.payload_span.present = 0;
+            placeholder.descriptor = NULL;
+            ok(lc_pouch_state_record_write_snapshot(
+                   &allocator, output, NULL, &placeholder, NULL, NULL, 0, &e),
+               &e);
+            lc_pouch_state_entry inherited = stored;
+            inherited.has_query_index_seq = 0;
+            inherited.query_index_seq = 9000;
+            ok(lc_pouch_state_record_write_snapshot(
+                   &allocator, output, NULL, &inherited, NULL, NULL, 0, &e),
+               &e);
+            uint64_t end;
+            ok(lc_pouch_record_io_tail(output, &end, &e), &e);
+            REQUIRE(!o.discards);
+            ps_stream_reader *destination_reader = NULL;
+            lc_pouch_record_io input;
+            if (file) {
+              REQUIRE(close(fd) == 0);
+              fd = open(file_path, O_RDWR);
+              REQUIRE(fd >= 0);
+              input = lc_pouch_record_file_io(fd);
+            } else {
+              ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
+              ok(ps_stream_seal(destination, &e), &e);
+              ok(ps_stream_close(destination, &e), &e);
+              ok(ps_stream_open(space, b, 0, NULL, NULL, NULL, &destination,
+                                &e),
+                 &e);
+              ok(ps_stream_read_open(destination, 0, end, &destination_reader,
+                                     &e),
+                 &e);
+              input = ps_record_input(destination_reader);
+            }
+            unsigned char *verify = NULL;
+            uint64_t at = 0, next;
+            for (int record = 0; record < 6; ++record) {
+              lc_pouch_state_entry r = {0};
+              int found, truncated;
+              ok(lc_pouch_state_record_read(input, &allocator, snapshot_leaf,
+                                            at, end, 0, 1, &verify, &r, &next,
+                                            &found, &truncated, &e),
+                 &e);
+              REQUIRE(found && !truncated);
+              if (!record)
+                REQUIRE(r.control && r.version == 1000 &&
+                        r.query_index_seq == 900);
+              else if (record < 3) {
+                snapshot_fields(&r, &stored);
+                REQUIRE(r.payload_span.present);
+                if (record == 1) {
+                  REQUIRE(r.record_type == 3 && r.object_link == object);
+                  REQUIRE(!strcmp(r.payload_span.container_leaf, leaf));
+                  plaintext(original_input, crypto, &r, bytes, &e);
+                } else {
+                  REQUIRE(r.record_type == (object ? 7 : 1));
+                  REQUIRE(
+                      !strcmp(r.payload_span.container_leaf, snapshot_leaf));
+                  uint64_t copied = 0;
+                  while (copied < stored.cipher_bytes) {
+                    size_t n = stored.cipher_bytes - copied <
+                                       LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES
+                                   ? (size_t)(stored.cipher_bytes - copied)
+                                   : LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES;
+                    struct iovec before = {buffer, n};
+                    struct iovec after = {
+                        buffer + LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES, n};
+                    ok(lc_pouch_record_io_read(
+                           original_input,
+                           stored.payload_span.payload_offset + copied, &before,
+                           1, &e),
+                       &e);
+                    ok(lc_pouch_record_io_read(
+                           input, r.payload_span.payload_offset + copied,
+                           &after, 1, &e),
+                       &e);
+                    REQUIRE(!memcmp(before.iov_base, after.iov_base, n));
+                    copied += n;
+                  }
+                  plaintext(input, crypto, &r, bytes, &e);
+                }
+              } else if (record < 5) {
+                snapshot_fields(&r, record == 3 ? &deleted : &placeholder);
+                REQUIRE(!r.payload_span.present &&
+                        r.record_type ==
+                            (record == 3 ? deleted.record_type : 4));
+              } else {
+                snapshot_fields(&r, &inherited);
+                REQUIRE(r.record_type == 3 && r.object_link == object);
+              }
+              lc_pouch_state_entry_cleanup(&allocator, &r);
+              at = next;
+            }
+            REQUIRE(at == end);
+            lc_free_with_allocator(&allocator, verify);
+            if (file) {
+              REQUIRE(close(fd) == 0 && unlink(file_path) == 0);
+            } else {
+              ps_stream_reader_close(destination_reader);
+              ok(ps_stream_close(destination, &e), &e);
+            }
+            lc_pouch_state_entry_cleanup(&allocator, &stored);
+            ps_stream_reader_close(original_reader);
+            ok(ps_stream_close(original, &e), &e);
+            ok(ps_close(space, &e), &e);
+            lc_pouch_crypto_close(crypto);
+            REQUIRE(unlink(path) == 0);
+          }
+  lc_free_with_allocator(&allocator, buffer);
+  lc_error_cleanup(&e);
+}
+static void snapshot_prefix_preserved(int fd) {
+  struct stat st;
+  char prefix[4];
+  REQUIRE(fstat(fd, &st) == 0 && st.st_size == 4);
+  REQUIRE(pread(fd, prefix, sizeof(prefix), 0) == 4 &&
+          !memcmp(prefix, "KEEP", 4));
+}
+static void snapshot_reset(int fd) {
+  REQUIRE(ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0);
+  REQUIRE(write(fd, "KEEP", 4) == 4);
+}
+static int far_tail(void *p, uint64_t *tail, lc_error *e) {
+  (void)p;
+  (void)e;
+  *tail = UINT64_MAX;
+  return LC_OK;
+}
+static void snapshot_faults(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  int input_fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+  REQUIRE(input_fd >= 0);
+  lc_pouch_record_io input_io = lc_pouch_record_file_io(input_fd);
+  observed original;
+  input plain = source(257, &original);
+  plain.pub.impl = &plain;
+  lc_pouch_state_entry q = request(), stored = {0}, deleted = {0}, placeholder;
+  ok(lc_pouch_state_record_append(&allocator, NULL,
+                                  observing(&original, input_io), leaf, &q,
+                                  &plain.pub, 0, &stored, &e),
+     &e);
+  stored.has_query_index_seq = 1;
+  stored.query_index_seq = 11;
+  deleted.key = "deleted";
+  deleted.version = 22;
+  deleted.index_seq = 43;
+  deleted.query_index_seq = 29;
+  deleted.has_query_index_seq = 1;
+  deleted.record_type = 2;
+  deleted.etag = "";
+  placeholder = stored;
+  placeholder.key = "metadata-only";
+  placeholder.version = 0;
+  placeholder.index_seq = 45;
+  placeholder.query_index_seq = 0;
+  placeholder.record_type = 4;
+  placeholder.bytes = placeholder.cipher_bytes = 0;
+  memset(&placeholder.payload_span, 0, sizeof(placeholder.payload_span));
+  placeholder.descriptor = NULL;
+  placeholder.retention = 0;
+  placeholder.staged_delete_marker = 0;
+  char output_path[1200];
+  REQUIRE(snprintf(output_path, sizeof(output_path), "%s.snapshot", path) > 0);
+  int output_fd = open(output_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+  REQUIRE(output_fd >= 0);
+  lc_pouch_record_io underlying = lc_pouch_record_file_io(output_fd);
+  unsigned char buffer[193];
+  size_t cases = 0;
+  for (int operation = 0; operation < 5; ++operation)
+    for (int kind = 0; kind < 3; ++kind) {
+      size_t operations = 0;
+      for (size_t at = 0; at <= operations; ++at) {
+        snapshot_reset(output_fd);
+        observed o;
+        lc_pouch_record_io output = observing(&o, underlying);
+        o.after = kind == 2;
+        snapshot_source encoded;
+        snapshot_source_init(&encoded, input_io, &stored, &o);
+        allocation = 0;
+        if (!kind)
+          fail_allocation = at ? at : SIZE_MAX;
+        else
+          o.fail = at;
+        const lc_pouch_state_entry *r = operation < 2    ? &stored
+                                        : operation == 2 ? &deleted
+                                                         : &placeholder;
+        int rc = operation == 4 ? lc_pouch_state_record_write_high_water(
+                                      &allocator, output, 1000, 900, &e)
+                                : lc_pouch_state_record_write_snapshot(
+                                      &allocator, output, snapshot_leaf, r,
+                                      operation ? NULL : &encoded.pub, buffer,
+                                      sizeof(buffer), &e);
+        if (!at)
+          operations = !kind ? allocation : o.calls;
+        fail_allocation = 0;
+        if (at ? rc == LC_OK : rc != LC_OK)
+          fprintf(stderr,
+                  "snapshot operation=%d kind=%d at=%lu/%lu rc=%d: %s\n",
+                  operation, kind, (unsigned long)at, (unsigned long)operations,
+                  rc, e.message ? e.message : "?");
+        REQUIRE(at ? rc != LC_OK : rc == LC_OK);
+        ++cases;
+        clear(&e);
+        if (at)
+          snapshot_prefix_preserved(output_fd);
+        else {
+          struct stat st;
+          REQUIRE(fstat(output_fd, &st) == 0 && st.st_size > 4);
+          lc_pouch_state_entry decoded = {0};
+          uint64_t next;
+          int found, truncated;
+          unsigned char *verify = NULL;
+          ok(lc_pouch_state_record_read(
+                 underlying, &allocator, snapshot_leaf, 4, (uint64_t)st.st_size,
+                 0, 1, &verify, &decoded, &next, &found, &truncated, &e),
+             &e);
+          REQUIRE(found && !truncated && next == (uint64_t)st.st_size);
+          if (operation == 4)
+            REQUIRE(decoded.version == 1000 && decoded.query_index_seq == 900);
+          else
+            snapshot_fields(&decoded, r);
+          lc_free_with_allocator(&allocator, verify);
+          lc_pouch_state_entry_cleanup(&allocator, &decoded);
+        }
+      }
+    }
+  for (int failure = 1; failure <= 5; ++failure)
+    for (int null_error = 0; null_error < 2; ++null_error) {
+      snapshot_reset(output_fd);
+      observed o;
+      lc_pouch_record_io output = observing(&o, underlying);
+      snapshot_source encoded;
+      snapshot_source_init(&encoded, input_io, &stored, &o);
+      encoded.failure = failure == 1 ? 0 : failure;
+      if (failure == 1)
+        --encoded.range.bytes;
+      int rc = lc_pouch_state_record_write_snapshot(
+          &allocator, output, snapshot_leaf, &stored, &encoded.pub, buffer,
+          sizeof(buffer), null_error ? NULL : &e);
+      REQUIRE(rc == (failure == 3                   ? LC_ERR_INVALID
+                     : failure == 2 || failure == 5 ? LC_ERR_TRANSPORT
+                                                    : LC_ERR_PROTOCOL));
+      REQUIRE(o.discards == 1);
+      snapshot_prefix_preserved(output_fd);
+      clear(&e);
+    }
+  char *overlong = malloc(1048578);
+  REQUIRE(overlong != NULL);
+  memset(overlong, 'k', 1048577);
+  overlong[1048577] = 0;
+  for (int bad = 0; bad < 11; ++bad) {
+    snapshot_reset(output_fd);
+    observed o;
+    lc_pouch_record_io output = observing(&o, underlying);
+    snapshot_source encoded;
+    snapshot_source_init(&encoded, input_io, &stored, &o);
+    lc_pouch_state_entry invalid = stored;
+    const char *label = snapshot_leaf;
+    if (bad == 0)
+      invalid.control = 1;
+    if (bad == 1)
+      invalid.key = NULL;
+    if (bad == 2)
+      ++invalid.cipher_bytes;
+    if (bad == 4)
+      invalid.payload_span.present = 0;
+    if (bad == 5)
+      invalid.retention = LC_I64_MIN;
+    if (bad == 6)
+      invalid.key = "unstaged-key";
+    if (bad == 7)
+      label = "../invalid";
+    if (bad == 8)
+      invalid.version = 0;
+    if (bad == 9)
+      invalid.key = overlong;
+    if (bad == 10) {
+      invalid.metadata = (unsigned char *)overlong;
+      invalid.metadata_length = 1048577;
+    }
+    REQUIRE(lc_pouch_state_record_write_snapshot(
+                &allocator, output, label, &invalid, &encoded.pub,
+                bad == 3 ? NULL : buffer, sizeof(buffer),
+                &e) == LC_ERR_INVALID);
+    REQUIRE(!encoded.calls);
+    snapshot_prefix_preserved(output_fd);
+    clear(&e);
+  }
+  free(overlong);
+  snapshot_reset(output_fd);
+  observed o;
+  lc_pouch_record_io output = observing(&o, underlying);
+  lc_pouch_record_io_ops far = *output.ops;
+  far.tail = far_tail;
+  output.ops = &far;
+  snapshot_source encoded;
+  snapshot_source_init(&encoded, input_io, &stored, &o);
+  REQUIRE(lc_pouch_state_record_write_snapshot(
+              &allocator, output, snapshot_leaf, &stored, &encoded.pub, buffer,
+              sizeof(buffer), &e) == LC_ERR_INVALID);
+  REQUIRE(!encoded.calls && !o.written);
+  snapshot_prefix_preserved(output_fd);
+  clear(&e);
+  REQUIRE(lc_pouch_state_record_write_high_water(&allocator, output, 1000, 900,
+                                                 &e) == LC_ERR_INVALID);
+  REQUIRE(!o.written);
+  snapshot_prefix_preserved(output_fd);
+  clear(&e);
+  printf("snapshot codec allocation/I/O failure cases: %lu\n",
+         (unsigned long)cases);
+  lc_pouch_state_entry_cleanup(&allocator, &stored);
+  REQUIRE(close(output_fd) == 0 && unlink(output_path) == 0);
+  REQUIRE(close(input_fd) == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 typedef struct parallel {
   ps_space *space;
   lc_pouch_crypto *crypto;
@@ -667,6 +1175,10 @@ static void *worker(void *p) {
     lifecycle(r->path, r->key);
   else if (!strcmp(r->mode, "concurrency"))
     concurrency(r->path, r->key);
+  else if (!strcmp(r->mode, "snapshots"))
+    snapshot_records(r->path, r->key);
+  else if (!strcmp(r->mode, "snapshot-faults"))
+    snapshot_faults(r->path);
   else
     faults(r->path);
   return NULL;

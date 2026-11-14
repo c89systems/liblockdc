@@ -5,6 +5,8 @@
 #include "lc_pouch_crypto.h"
 #include "lc_pouch_record_io.h"
 
+#define LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES (128U * 1024U)
+
 typedef struct lc_pouch_state_payload_span {
   char *container_leaf;
   uint64_t record_offset;
@@ -83,5 +85,28 @@ int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
                                  const lc_pouch_state_entry *request,
                                  lc_source *, int disable_compression,
                                  lc_pouch_state_entry *result, lc_error *);
+
+/* Canonical snapshot bytes. Preserve resolved versions and both index
+ * sequences; the owner supplies selection, history protection, commit and
+ * durability. An absent per-key query sequence defaults to its index sequence.
+ * NULL encoded writes a body reference, metadata-only placeholder or tombstone
+ * without payload I/O. Otherwise copy exactly cipher_bytes from the borrowed
+ * source at its current cursor into leaf, retaining crypto descriptors and
+ * checking the original stored CRC before completing PENDING. No decoding,
+ * re-encryption, spool or whole-body buffer. Scratch is borrowed; chunks are
+ * capped at 128 KiB; owners may supply smaller buffers. Scratch may be NULL for
+ * an empty encoded body. Failure
+ * after output starts discards through the owner's private append boundary.
+ * Source, record and their fields remain owned by the caller. */
+int lc_pouch_state_record_write_snapshot(const lc_allocator *,
+                                         lc_pouch_record_io, const char *leaf,
+                                         const lc_pouch_state_entry *,
+                                         lc_source *encoded, void *scratch,
+                                         size_t scratch_bytes, lc_error *);
+int lc_pouch_state_record_write_high_water(const lc_allocator *,
+                                           lc_pouch_record_io,
+                                           lc_pouch_generation version,
+                                           lc_pouch_generation query_version,
+                                           lc_error *);
 
 #endif

@@ -1925,6 +1925,47 @@ static void validation(const char *path) {
   }
   lc_error_cleanup(&e);
 }
+typedef struct snapshot_copy {
+  lc_pouch *pouch;
+  ps_namespace *ns;
+  ps_namespace_snapshot *builder;
+  unsigned char *buffer;
+  size_t count;
+} snapshot_copy;
+static int copy_snapshot_record(void *context, uint64_t segment,
+                                const lc_pouch_state_entry *record,
+                                lc_error *e) {
+  snapshot_copy *copy = context;
+  lc_source *encoded = NULL;
+  (void)segment;
+  REQUIRE(record->found && record->payload_span.present);
+  int rc = copy->pouch->storage.ops->source_open(
+      copy->pouch->storage.context, copy->ns,
+      record->payload_span.container_leaf, record->payload_span.payload_offset,
+      record->payload_span.payload_length, &encoded, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_write_snapshot(
+        &allocator, ps_namespace_snapshot_output(copy->builder),
+        ps_namespace_snapshot_leaf(copy->builder), record, encoded,
+        copy->buffer, 16384, e);
+  if (encoded)
+    encoded->close(encoded);
+  ++copy->count;
+  return rc;
+}
+static int projection_object(const lc_pouch_state_visit_entry *entry,
+                             void *context, lc_error *e) {
+  unsigned int *seen = context;
+  (void)e;
+  if (!strcmp(entry->key, "object")) {
+    REQUIRE(entry->object_record && entry->has_payload);
+    *seen |= 1U;
+  } else {
+    REQUIRE(!strcmp(entry->key, "state") && !entry->object_record);
+    *seen |= 2U;
+  }
+  return LC_OK;
+}
 static void snapshots(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -1945,22 +1986,17 @@ static void snapshots(const char *path, const char *directory) {
       ps_namespace *ns = handle;
       ps_namespace_snapshot *b = NULL;
       ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
-      lc_pouch_state_entry request = {0}, result = {0};
-      request.key = "key";
-      request.version = request.index_seq = 1;
-      request.record_type = 1;
-      request.payload_context =
-          lc_pouch_state_crypto_context(&allocator, "snapshot", "key", 1, 1);
-      REQUIRE(request.payload_context != NULL);
-      request.content_type = "application/octet-stream";
-      in = source(65569, 37);
-      in.pub.impl = &in;
-      ok(lc_pouch_state_record_append(
-             &allocator, p->crypto, ps_namespace_snapshot_output(b),
-             ps_namespace_snapshot_leaf(b), &request, &in.pub, 0, &result, &e),
+      snapshot_copy copy = {p, ns, b,
+                            lc_alloc_with_allocator(&allocator, 16384), 0};
+      REQUIRE(copy.buffer != NULL);
+      ok(lc_pouch_state_record_write_high_water(
+             &allocator, ps_namespace_snapshot_output(b), 1, 1, &e),
          &e);
-      lc_pouch_state_entry_cleanup(&allocator, &result);
-      lc_free_with_allocator(&allocator, request.payload_context);
+      ok(ps_namespace_view_visit(ps_namespace_snapshot_view(b), 1,
+                                 copy_snapshot_record, &copy, &e),
+         &e);
+      REQUIRE(copy.count == 1);
+      lc_free_with_allocator(&allocator, copy.buffer);
       ok(ps_namespace_snapshot_commit(b, &e), &e);
       ps_namespace_snapshot_close(b);
       p->storage.ops->namespace_close(p->storage.context, ns);
@@ -2008,6 +2044,44 @@ static void snapshots(const char *path, const char *directory) {
       lc_pouch_close(p);
       REQUIRE(live == 0 && unlink(path) == 0);
     }
+  /* The same reference writer serves native clean-close projections. Internal
+   * objects must retain their classification after that projection is loaded.
+   */
+  for (int sync = 0; sync < 2; ++sync) {
+    char native[1400];
+    REQUIRE(snprintf(native, sizeof(native), "%s/native-projection-%d",
+                     directory, sync) > 0);
+    ps_pouch_state_options o = options(0, sync);
+    lc_pouch *p = NULL;
+    lc_pouch_state_write_options object = {0};
+    object.object_record = 1;
+    lc_pouch_state_write_result w = {0};
+    ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+    input in = source(65569, 55);
+    ok(put(p, "projection", "object", &in, &object, &w, &e), &e);
+    REQUIRE(w.index_seq == 1);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    in = source(31, 56);
+    ok(put(p, "projection", "state", &in, NULL, &w, &e), &e);
+    REQUIRE(w.index_seq == 2);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    unsigned int seen = 0;
+    ok(lc_pouch_state_visit(p, "projection", projection_object, &seen, &e), &e);
+    REQUIRE(seen == 3);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+    seen = 0;
+    ok(lc_pouch_state_visit(p, "projection", projection_object, &seen, &e), &e);
+    REQUIRE(seen == 3);
+    read_value(p, "projection", "object", 65569, 55, 1, &e);
+    in = source(31, 57);
+    ok(put(p, "projection", "state", &in, NULL, &w, &e), &e);
+    REQUIRE(w.index_seq == 3 && w.version == 2);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+  }
   lc_error_cleanup(&e);
 }
 typedef struct run {

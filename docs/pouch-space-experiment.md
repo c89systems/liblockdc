@@ -2260,6 +2260,122 @@ Actual maintenance performance, complete capacity admission, advanced public
 semantics and shared-root ownership remain in the active full-backend goal.
 Normal public open remains multifile.
 
+## Shared snapshot serialization and regression checks
+
+The production state codec now writes canonical snapshot records through
+borrowed record I/O. Native compaction and clean-close projection writing use
+the same implementation. A caller supplies resolved entries and either keeps
+an existing body reference with zero body I/O or copies the encoded body
+incrementally using borrowed scratch capped at 128 KiB. The original stored CRC
+must match before PENDING is completed. Descriptors, immutable crypto context,
+metadata, flags, timestamps, retention, versions and both index sequences are
+preserved. This stage adds no decode/re-encrypt pass, payload spool or whole-body
+buffer, public backend selector, ABI change or persistent format/version change.
+
+The writer also fixes an existing native clean-close projection defect: the
+object-link flag was passed as descriptor reserve rather than written to the
+payload flags. A native close/reopen regression now checks object classification
+under both sync policies.
+
+Verification on native x86_64:
+
+- Full Debug ASan/UBSan: all 346 CTest groups passed.
+- GNU release and musl release: all 21 selected groups passed in each build,
+  including native Pouch, compression/durability/recovery, background compaction,
+  small-stack compaction, all state-record tests and the Pouch snapshot test.
+- ThreadSanitizer: all eight selected state-record and Pouch snapshot/concurrency
+  groups passed.
+- The new codec matrix has 96 cases: four codec modes, two durability policies,
+  file/container outputs, state/object records and empty/one-byte/large bodies.
+  Readback checks copied ciphertext byte for byte as well as decoded plaintext.
+  It also checks references, high-water marks, tombstones, placeholders and
+  explicit/default query sequences. Large-body cases assert interleaved input
+  and output and the chunk cap.
+- Fault coverage includes 41 injected allocation/output failures with 15
+  successful baselines, ten source-failure cases with and without an error
+  object, eleven invalid inputs and two offset-limit cases. Failed output
+  retains its pre-existing prefix. Pouch tests build snapshots from captured
+  encoded sources, then reopen, reclaim the old segment, update metadata and
+  reopen again across all eight codec/durability combinations.
+- Three Memcheck groups completed 41,342 matched allocations/frees with zero
+  errors, leaks or suppressions. Changed-line clang-format checks and
+  `git diff --check` passed.
+
+Logs use the `build/pouch-space-integrated/snapshot-codec-` prefix:
+`debug-build.log`, `debug-tests.log`, `gnu-build.log`, `gnu-tests.log`,
+`musl-build.log`, `musl-tests.log`, `tsan-build.log`, `tsan-tests.log`
+and the three `*-memcheck.log` files.
+
+### Matched ordinary-path performance
+
+Five alternating samples compare current/prior container and current/prior
+multifile executables. The 280 runs comprise 240 read profiles and 40
+four-writer PUT profiles. All values verify after populated-root reopen; all
+140 container runs audit one fixed 10 MiB file without sidecars. Inputs are
+plaintext with 4 KiB producer chunks and two PUT rounds. Reads use NoSync; PUT
+runs cover both durability policies. The OS cache remains warm; reopened resident
+projections are rebuilt. These runs do not execute logical compaction or install
+snapshots, so they are ordinary-path regression evidence.
+
+Read medians follow. C / MF means container / multifile. Close-plus-readiness
+sums close, open and reopened read for each sample before taking the median.
+
+| Profile / method | Live read C / MF (ms) | Close + open + read C / MF (ms) | Prior close + open + read C / MF (ms) |
+| --- | ---: | ---: | ---: |
+| 1,024 × 1 KiB, 1 reader: Point | 3.984 / 33.931 | 22.727 / 51.341 | 23.035 / 55.167 |
+| 1,024 × 1 KiB, 1 reader: Read-many | 4.475 / 7.623 | 25.713 / 24.115 | 24.274 / 28.661 |
+| 1,024 × 1 KiB, 1 reader: Body scan | 4.097 / 3.449 | 21.986 / 22.587 | 21.527 / 25.421 |
+| 1,024 × 1 KiB, 1 reader: Metadata scan | 1.360 / 1.150 | 19.670 / 21.790 | 20.620 / 20.818 |
+| 1,024 × 1 KiB, 4 readers: Point | 1.957 / 12.543 | 28.498 / 71.618 | 25.722 / 77.544 |
+| 1,024 × 1 KiB, 4 readers: Read-many | 1.546 / 2.692 | 28.973 / 62.961 | 27.779 / 67.933 |
+| 1,024 × 1 KiB, 4 readers: Body scan | 1.675 / 1.621 | 27.314 / 56.007 | 27.591 / 71.046 |
+| 1,024 × 1 KiB, 4 readers: Metadata scan | 0.668 / 0.597 | 34.780 / 68.449 | 26.988 / 67.302 |
+| 64 × 32 KiB, 1 reader: Point | 2.853 / 6.895 | 21.898 / 25.787 | 21.570 / 21.004 |
+| 64 × 32 KiB, 1 reader: Read-many | 2.928 / 4.353 | 18.876 / 24.063 | 17.933 / 17.535 |
+| 64 × 32 KiB, 1 reader: Body scan | 2.754 / 2.704 | 22.457 / 15.754 | 20.465 / 17.794 |
+| 64 × 32 KiB, 1 reader: Metadata scan | 0.178 / 0.177 | 20.749 / 12.948 | 16.948 / 15.672 |
+
+Live point and read-many medians favor the container in all six corresponding
+profiles. Body and metadata scans are mixed. Bare open-plus-read remains slower
+for the container in eleven of twelve profiles. Including close makes the
+container faster in nine of twelve profiles in this series; the single-reader
+small-body read-many and large-body scan profiles remain slower.
+These lifecycle comparisons vary with close cost and must not be substituted
+for the live-read comparison.
+
+| Four-writer PUT, 1,024 × 1 KiB | Current C (ms) | Prior C (ms) | Current MF (ms) | Prior MF (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 20.734 | 19.612 | 28.713 | 29.526 |
+| Durable commit | 5,293.460 | 5,799.223 | 8,687.485 | 8,295.727 |
+
+Current/prior live-read, PUT and complete close-plus-readiness ranges overlap in
+every matched profile. Multifile close ranges also overlap in every profile.
+The NoSync PUT ranges are 16.863–24.019 / 15.988–32.633 ms for current/prior
+container and 23.304–41.472 / 25.169–75.937 ms for current/prior multifile.
+Durable ranges are 4.647–6.712 / 4.729–6.313 s and
+7.969–8.981 / 7.682–8.810 s respectively. These samples do not isolate a
+regression or improvement caused by the shared writer.
+
+Both container executables write exactly 3,228,404 syscall bytes under either
+policy. NoSync uses four syncs and 3,252,224 kernel-accounted bytes per run.
+Durable container runs make 1,038–1,048 sync calls across the current/prior
+samples; multifile makes 2,048 fdatasync calls plus eight fsync calls.
+Group-commit scheduling affects these counts; no writer queue was added.
+
+Raw logs are `snapshot-codec-paired/`, with Bash runner
+`snapshot-codec-paired.sh`, `snapshot-codec-results.json` and
+`snapshot-codec-benchmark.log`. The `snapshot-codec-artifacts.sha256` manifest
+covers 285 artifacts, including both frozen executables. The current executable,
+`pouch_space_compare-snapshot-codec-current`, has SHA-256
+`a82c2175c391debc6c4987677e0ef6f71a611d9307f96d5b3a3803b4ec8b0ccf`.
+The prior `pouch_space_compare-snapshots-validated` remains
+`067723c41b1a437e54ba8ca26a8d68e8cef589f7a47766fd06cf855f26e18db0`.
+
+Automatic logical projection production, safe reclamation policy and complete
+maintenance admission remain required by the active full-backend goal. A full
+metadata projection and any relocated live bodies must fit the maintenance
+workspace; the existing physical floor alone does not establish that guarantee.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces

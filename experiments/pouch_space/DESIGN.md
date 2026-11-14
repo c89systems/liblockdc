@@ -540,6 +540,16 @@ fields. All of these changes are internal memory ownership or read routing;
 canonical bytes, prototype format and public ABI are unchanged. Full public
 query-client ownership and maintenance publication remain integration work.
 
+Canonical snapshot serialization now also uses borrowed record I/O. Native
+compaction and clean-close projections delegate to the same state codec as
+container snapshots. A resolved entry can retain its old body reference without
+body I/O, or copy an encoded source with caller-owned scratch capped at 128 KiB.
+Copying checks the original stored CRC before completing PENDING, retaining
+crypto descriptors, immutable context, metadata, versions and both sequences.
+Failure after output begins calls the owner's private discard boundary. The
+codec owns no logical selection, history protection or physical publication.
+Native clean-close object references now preserve their OBJECT_LINK flag.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The

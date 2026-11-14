@@ -90,7 +90,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_state_record_test)
-  foreach(mode lifecycle faults concurrency)
+  foreach(mode lifecycle faults concurrency snapshots snapshot-faults)
     add_test(NAME pouch_space_state_records_${mode}
       COMMAND pouch_space_state_record_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_state_records_${mode} PROPERTIES TIMEOUT 120
