@@ -505,6 +505,24 @@ it also checks selected-head/tail preservation. It does not prove full-capacity
 deletion. Guaranteed admission and reclamation
 remain requirements of the full backend.
 
+State read-many, metadata visits and paged scan summaries now use the same
+production projection with typed encoded read pins. A metadata scan opens only
+small captured windows, without body reads or per-row decoder buffers.
+Read-many decodes one captured value at a time immediately before its visitor,
+outside projection coordination. Scan body access clones a captured source
+cursor, sharing an immutable reference-counted namespace window; it does not
+re-resolve the current segment directory. Each cursor retains the root/crypto
+owner and can outlive the scan and Pouch runtime. Window release drops its
+physical read pin only after the last shared cursor closes.
+
+Container reads ignore body-cache optimization hints and never populate that
+cache. Scan body results copy their metadata so result cleanup cannot invalidate
+the visitor's borrowed row; both backends support repeated body reads from the
+same captured row. Read-many also returns its captured has-body and staged-delete
+fields. All of these changes are internal memory ownership or read routing;
+canonical bytes, prototype format and public ABI are unchanged. Full public
+query-client ownership and maintenance publication remain integration work.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The

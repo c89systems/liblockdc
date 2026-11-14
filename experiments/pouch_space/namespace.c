@@ -35,6 +35,7 @@ struct ps_namespace_append {
 struct ps_namespace_window {
   ps_namespace *ns;
   ps_stream_window *reader;
+  unsigned int references;
 };
 typedef struct captured {
   uint64_t id, tail;
@@ -696,6 +697,7 @@ int ps_namespace_read_open(ps_namespace *ns, uint64_t id, uint64_t offset,
     return rc;
   }
   window->ns = ns;
+  window->references = 1;
   ps_namespace_retain(ns);
   *out = window;
   return LC_OK;
@@ -703,8 +705,11 @@ int ps_namespace_read_open(ps_namespace *ns, uint64_t id, uint64_t offset,
 lc_pouch_record_io ps_namespace_read_input(ps_namespace_window *window) {
   return ps_record_window_input(window ? window->reader : NULL);
 }
+void ps_namespace_read_retain(ps_namespace_window *window) {
+  __atomic_add_fetch(&window->references, 1, __ATOMIC_RELAXED);
+}
 void ps_namespace_read_close(ps_namespace_window *window) {
-  if (!window)
+  if (!window || __atomic_sub_fetch(&window->references, 1, __ATOMIC_ACQ_REL))
     return;
   ps_stream_window_close(window->reader);
   ps_namespace_release(window->ns);

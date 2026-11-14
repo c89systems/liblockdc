@@ -1949,6 +1949,160 @@ manifest is checked without replacing either preserved executable.
 Whole-operation maintenance admission, reclamation, remaining public semantics
 and shared-root coordination remain in the active full-backend goal.
 
+## Captured state reads and paged scans
+
+The private production-state integration now supports both read-many entrypoints,
+metadata visits/prefix visits, and paged scan summaries with optional body access.
+Read-many captures encoded read pins while holding projection coordination and
+decodes one value immediately before its visitor, after releasing that guard.
+It does not create a decoder buffer per captured row. Metadata-only summaries
+capture small read windows without reading bodies. Scan body access clones the
+captured window with an independent cursor, without resolving the current
+directory again. Clones share a reference-counted namespace window and retain
+root/crypto ownership through the last source close.
+
+Callback mutation cannot substitute newer body bytes into the captured view.
+A source obtained from a scan can outlive both that scan and Pouch close;
+exclusive root ownership stays held until its last source closes. The container
+does not populate a body cache, including for cached read-many and a scan's
+cache-completed-body hint. This establishes a read-pin boundary for future
+relocation; maintenance publication and reclamation remain unimplemented.
+
+Two shared state-engine behaviors also change. Scan body results copy metadata
+instead of consuming the visitor's borrowed row, so result cleanup leaves row
+fields valid and repeated body opens work in both backends. Read-many results
+now populate their captured has-body and staged-delete fields. No canonical
+bytes, persistent format or public ABI change.
+
+### Verification
+
+The full Debug preset passed 308 checks under ASan/UBSan, including 117 container
+checks. GNU and native musl release each passed 135 affected checks: all 117
+container checks and 18 existing Pouch groups. Twenty-eight affected integration,
+namespace, root and canonical-record groups passed ThreadSanitizer. No Darwin,
+QEMU or large-machine run was added.
+
+New read behavior tests cover both backends, all four codec combinations and
+both sync policies: callback order, duplicates, missing/deleted/metadata-only
+keys, empty bodies, early stop/retry, invalid inputs, pagination, prefix visits,
+mutation inside a callback, repeated independent body opens, and retained
+sources after Pouch close. A warmed container metadata-scan fixture requires
+zero payload I/O and no allocation as large as a 16 KiB decoder buffer.
+
+The read matrices inject failures at 3,640 observed allocation sites and 1,282
+I/O sites across warm and reopened namespaces, plain and combined codecs, both
+read-many variants, metadata/body scans and prefix visits. They require correct
+cleanup, unchanged stored values and successful retry or reopen after poison.
+Held callbacks in another thread permit same-namespace overwrite/delete and
+peer-namespace publication while retaining the original rows and bodies.
+
+Five Memcheck groups passed: 4,162,472 allocations/frees, no remaining blocks,
+errors or suppressions. They cover normal reads, allocation/I/O read matrices,
+read concurrency and held namespace publication. Evidence is
+`reads-verified-{debug,gnu,musl,tsan}-*`, `reads-focused-tests.log`,
+`reads-compare-tests.log` and `reads-*-memcheck.log` under
+`build/pouch-space-integrated/`. The exhaustive allocation group's bounded
+timeout is 600 seconds to cover sanitizer runs over thousands of fresh roots.
+
+### Matched read measurements
+
+The primary series has 120 serial GNU release runs: five alternating-order
+samples × four read methods × three workloads × current container/multifile.
+Both backends use production state APIs from the same executable. Two ordinary
+PUT rounds precede the read phases. The writer-count argument also selects the
+concurrent reader count, with one namespace per writer/reader. Read-many batches
+64 keys; scans use 256-row pages. Points, read-many and body scans verify every
+body byte. Metadata-only scan timings exclude body access; full seed bodies are
+verified afterward, outside both measured read phases.
+
+Inputs use 4 KiB source chunks, NoSync seed writes, a fixed 10 MiB container,
+no transforms, indexing, background maintenance or positive expiry. OS page cache
+is retained. The reopened phase recreates resident projections; these are not
+cold-disk measurements. Read intervals include worker creation, membership and
+version checks, and fixture byte verification for body modes. The current
+multifile owner retains its existing cache/projection optimizations; the
+container uses no body cache or persistent clean projection. Peak RSS covers
+the entire process, including seeding and untimed validation.
+
+Wall-clock median milliseconds; reopened columns include root open and the
+first complete read pass:
+
+| Method / workload | Live container | Live multifile | Reopen + read container | Reopen + read multifile |
+| --- | ---: | ---: | ---: | ---: |
+| Points, 1,024 × 1 KiB, 1 reader | 4.359 | 31.277 | 20.563 | 32.067 |
+| Read-many, 1,024 × 1 KiB, 1 reader | 4.235 | 6.284 | 20.348 | 9.474 |
+| Scan bodies, 1,024 × 1 KiB, 1 reader | 3.620 | 5.222 | 20.900 | 7.344 |
+| Scan metadata, 1,024 × 1 KiB, 1 reader | 1.182 | 1.290 | 18.372 | 3.316 |
+| Points, 1,024 × 1 KiB, 4 readers | 1.975 | 13.036 | 28.100 | 16.929 |
+| Read-many, 1,024 × 1 KiB, 4 readers | 1.469 | 3.160 | 29.660 | 5.508 |
+| Scan bodies, 1,024 × 1 KiB, 4 readers | 1.365 | 1.827 | 25.090 | 4.251 |
+| Scan metadata, 1,024 × 1 KiB, 4 readers | 0.549 | 0.573 | 27.303 | 3.410 |
+| Points, 64 × 32 KiB, 1 reader | 2.594 | 6.365 | 16.931 | 6.884 |
+| Read-many, 64 × 32 KiB, 1 reader | 2.891 | 4.167 | 15.964 | 3.540 |
+| Scan bodies, 64 × 32 KiB, 1 reader | 2.792 | 3.465 | 21.037 | 3.353 |
+| Scan metadata, 64 × 32 KiB, 1 reader | 0.228 | 0.152 | 15.819 | 0.575 |
+
+Live point, read-many and body-scan medians are lower for container in all three
+profiles. Metadata-only scans are near parity in the two 1 KiB profiles and
+slower for container in the 64-key profile; their ranges overlap. Four-reader
+point-read ranges are 1.76–2.74 / 8.45–14.77 ms (container/multifile).
+Body-scan ranges overlap at 0.92–2.01 / 1.31–2.94 ms; metadata-scan ranges are
+0.54–0.93 / 0.45–0.65 ms. Five samples do not establish a complete causal
+breakdown.
+
+Four-reader aggregate CPU medians (container/multifile):
+Points: 7.03 / 39.85 ms;
+Read-many: 5.05 / 10.13 ms;
+Scan bodies: 3.87 / 5.24 ms;
+Scan metadata: 1.78 / 1.63 ms.
+CPU sums across simultaneous readers can exceed wall time.
+
+Bare reopen/read remains a material container limitation. Namespace admission
+still reconstructs the canonical projection and verifies stored payload CRCs;
+multifile can reuse its close-generated clean projection. Those mechanisms do
+not isolate all measured latency components. Preceding close work also matters.
+For four readers, per-sample close + reopen + read sum medians are:
+
+| Method, 1,024 × 1 KiB | Container | Multifile |
+| --- | ---: | ---: |
+| Points | 28.560 | 67.511 |
+| Read-many | 30.006 | 55.958 |
+| Scan bodies | 25.224 | 62.507 |
+| Scan metadata | 27.470 | 57.748 |
+
+That combined interval is still worse for container in the 64 × 32 KiB
+read-many, body-scan and metadata-scan profiles (container/multifile):
+Read-many: 16.033 / 15.682 ms;
+Scan bodies: 21.157 / 18.433 ms;
+Scan metadata: 15.866 / 11.815 ms.
+These regressions remain visible in the full-backend goal.
+
+### Legacy PUT check and retained artifacts
+
+Fifteen additional fresh four-writer PUT runs compare the current container,
+current multifile and the frozen `acd24b1` container, with the original serial
+point-verification phases. Mutation medians are 18.80 / 24.17 / 16.66 ms in that
+order. Current container is higher than prior; ranges overlap at
+15.28–21.46 / 14.27–20.96 ms (current/prior). Aggregate CPU medians are
+47.50 / 42.72 ms and ranges overlap. Both container executables make four syncs,
+write 3,228,404 syscall bytes and account for 3,252,224 kernel write bytes in
+every sample. This series does not isolate a cause for the higher current median.
+
+The 135 runs all verify values after populated-root reopen; all 70 container
+runs audit one file and no sidecars. Legacy `MiB_s`, latency, syscall and sync
+fields still describe the two-round mutation phase, not read throughput.
+`read_cpu_ms` and `reopen_read_cpu_ms` are the new read-phase CPU measurements.
+
+Artifacts under `build/pouch-space-integrated/` are `reads-paired/`,
+`reads-paired.sh`, `reads-results.json`, `pouch_space_compare-reads-current`
+and `reads-artifacts.sha256`. The manifest covers 139 benchmark artifacts:
+both frozen executables, the Bash runner, JSON and all 135 raw logs. The preceding
+275-artifact publication manifest is checked without replacing its executables.
+Normal public open remains multifile. Atomic maintenance admission, snapshot and
+obsolete publication/reclamation, advanced mutation policy, public query-client
+and collection ownership, indexes, queues/XA/outbox and shared-root coordination
+remain part of the active full native implementation goal.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1958,10 +2112,11 @@ above identify their implementation stages, including the current payload
 packing, canonical-stream, lifecycle, typed catalog and production collection
 and ordinary state record follow-ups. Namespace segments now have a real
 container owner. Ordinary production state PUT/projection/point-read, metadata
-update and deletion now join it through the private integration harness. The
+update, deletion, read-many, metadata visits and paged scan/body snapshots now
+join it through the private integration harness. The
 next work must close whole-operation maintenance admission at capacity, address
-remaining NoSync and cold-reopen costs, and connect advanced mutation/scan paths
-and public collection ownership, then
+remaining NoSync and reopened-projection costs, and connect advanced mutations,
+public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader

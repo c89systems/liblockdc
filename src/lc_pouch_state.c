@@ -2003,6 +2003,7 @@ typedef struct lc_pouch_state_read_many_snapshot {
   char *crypto_context;
   char *binding_context;
   lc_source *body;
+  lc_source *encoded;
   lc_pouch_generation index_seq;
   lc_pouch_generation version;
   uint64_t bytes;
@@ -2029,6 +2030,7 @@ typedef struct lc_pouch_state_scan_body_snapshot {
   unsigned char *metadata;
   size_t metadata_length;
   lc_pouch_state_body_cache_entry *body_cache;
+  lc_source *encoded;
   lc_pouch_generation version;
   uint64_t bytes;
   uint64_t cipher_bytes;
@@ -4059,6 +4061,8 @@ static void lc_pouch_state_read_many_snapshot_cleanup(
   if (snapshot->body != NULL) {
     snapshot->body->close(snapshot->body);
   }
+  if (snapshot->encoded != NULL)
+    snapshot->encoded->close(snapshot->encoded);
   lc_free_with_allocator(allocator, snapshot->key);
   lc_free_with_allocator(allocator, snapshot->content_type);
   lc_free_with_allocator(allocator, snapshot->etag);
@@ -4091,6 +4095,8 @@ static void lc_pouch_state_scan_body_snapshot_cleanup(
   if (snapshot == NULL) {
     return;
   }
+  if (snapshot->encoded != NULL)
+    snapshot->encoded->close(snapshot->encoded);
   lc_free_with_allocator(allocator, snapshot->key);
   lc_free_with_allocator(allocator, snapshot->content_type);
   lc_free_with_allocator(allocator, snapshot->etag);
@@ -4121,7 +4127,7 @@ static void lc_pouch_state_scan_body_snapshots_cleanup(
 
 static int lc_pouch_state_scan_body_snapshot_append(
     lc_pouch *pouch, lc_pouch_state_scan_body_snapshot **snapshots,
-    size_t *count, size_t *capacity,
+    size_t *count, size_t *capacity, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest,
     const lc_pouch_state_cache_record *record, lc_error *error) {
   lc_pouch_state_scan_body_snapshot *next;
@@ -4177,9 +4183,10 @@ static int lc_pouch_state_scan_body_snapshot_append(
       record->payload_context != NULL
           ? lc_strdup_with_allocator(&pouch->allocator, record->payload_context)
           : NULL;
-  snapshot->payload_span_path = lc_pouch_state_payload_span_path(
-      &pouch->allocator, manifest->namespace_path, &record->payload_span,
-      error);
+  if (pouch->storage.ops == NULL)
+    snapshot->payload_span_path = lc_pouch_state_payload_span_path(
+        &pouch->allocator, manifest->namespace_path, &record->payload_span,
+        error);
   snapshot->descriptor =
       record->descriptor != NULL
           ? lc_strdup_with_allocator(&pouch->allocator, record->descriptor)
@@ -4195,7 +4202,8 @@ static int lc_pouch_state_scan_body_snapshot_append(
   if (snapshot->key == NULL ||
       (record->content_type != NULL && snapshot->content_type == NULL) ||
       (record->etag != NULL && snapshot->etag == NULL) ||
-      snapshot->payload_span_path == NULL || !snapshot->payload_span.present ||
+      (pouch->storage.ops == NULL && snapshot->payload_span_path == NULL) ||
+      !snapshot->payload_span.present ||
       (record->payload_context != NULL && snapshot->payload_context == NULL) ||
       (record->descriptor != NULL && snapshot->descriptor == NULL) ||
       (record->metadata_length > 0U && snapshot->metadata == NULL)) {
@@ -4226,6 +4234,17 @@ static int lc_pouch_state_scan_body_snapshot_append(
   snapshot->staged_delete_marker = record->staged_delete_marker;
   snapshot->found = 1;
   snapshot->record_type = record->record_type;
+  if (pouch->storage.ops != NULL) {
+    int rc = pouch->storage.ops->source_open(
+        pouch->storage.context, cache->storage_namespace,
+        record->payload_span.container_leaf,
+        record->payload_span.payload_offset,
+        record->payload_span.payload_length, &snapshot->encoded, error);
+    if (rc != LC_OK) {
+      lc_pouch_state_scan_body_snapshot_cleanup(&pouch->allocator, snapshot);
+      return rc;
+    }
+  }
   ++(*count);
   return LC_OK;
 }
@@ -4289,7 +4308,18 @@ static int lc_pouch_state_scan_body_snapshot_open_result(
    * repeated allocation, crypto setup, and eviction. The caller may opt in
    * only when it will consume the complete body, such as an any-text scan. */
   memset(&cache_guard, 0, sizeof(cache_guard));
-  if (rc == LC_OK && out->body == NULL && cache_completed_body &&
+  if (rc == LC_OK && out->body == NULL && pouch->storage.ops != NULL) {
+    lc_source *encoded = NULL;
+    rc = pouch->storage.ops->source_clone(pouch->storage.context,
+                                          snapshot->encoded, &encoded, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_crypto_source_from_source(
+          pouch->crypto, crypto_context, binding_context, encoded,
+          snapshot->payload_span.payload_length, snapshot->descriptor,
+          &out->body, error);
+  }
+  if (rc == LC_OK && out->body == NULL && pouch->storage.ops == NULL &&
+      cache_completed_body &&
       snapshot->bytes <= LC_POUCH_STATE_BODY_CACHE_RECORD_MAX_BYTES) {
     rc = lc_pouch_state_cache_guard_lock(pouch, ns, &cache_guard, error);
     if (rc == LC_OK) {
@@ -4340,10 +4370,34 @@ static int lc_pouch_state_scan_body_snapshot_open_result(
   if (rc != LC_OK) {
     return rc;
   }
-  out->content_type = snapshot->content_type;
-  out->etag = snapshot->etag;
-  out->descriptor = snapshot->descriptor;
-  out->metadata = snapshot->metadata;
+  /* The visitor still owns a borrowed view of this metadata. Body results
+   * must not consume it or invalidate the row when their cleanup runs. */
+  out->content_type =
+      snapshot->content_type != NULL
+          ? lc_strdup_with_allocator(&pouch->allocator, snapshot->content_type)
+          : NULL;
+  out->etag = snapshot->etag != NULL
+                  ? lc_strdup_with_allocator(&pouch->allocator, snapshot->etag)
+                  : NULL;
+  out->descriptor =
+      snapshot->descriptor != NULL
+          ? lc_strdup_with_allocator(&pouch->allocator, snapshot->descriptor)
+          : NULL;
+  if (snapshot->metadata_length) {
+    out->metadata =
+        lc_alloc_with_allocator(&pouch->allocator, snapshot->metadata_length);
+    if (out->metadata != NULL)
+      memcpy(out->metadata, snapshot->metadata, snapshot->metadata_length);
+  }
+  if ((snapshot->content_type != NULL && out->content_type == NULL) ||
+      (snapshot->etag != NULL && out->etag == NULL) ||
+      (snapshot->descriptor != NULL && out->descriptor == NULL) ||
+      (snapshot->metadata_length && out->metadata == NULL)) {
+    lc_pouch_state_read_result_cleanup(&pouch->allocator, out);
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to copy pouch scan body metadata", NULL, NULL,
+                        "pouch");
+  }
   out->metadata_length = snapshot->metadata_length;
   out->version = snapshot->version;
   out->bytes = snapshot->bytes;
@@ -4355,11 +4409,6 @@ static int lc_pouch_state_scan_body_snapshot_open_result(
   out->staged_delete_marker = snapshot->staged_delete_marker;
   out->has_body = snapshot->payload_span.present;
   out->found = 1;
-  snapshot->content_type = NULL;
-  snapshot->etag = NULL;
-  snapshot->descriptor = NULL;
-  snapshot->metadata = NULL;
-  snapshot->metadata_length = 0U;
   return LC_OK;
 }
 
@@ -4562,10 +4611,11 @@ static int lc_pouch_state_read_many_snapshot_from_entry(
                         NULL, NULL);
   }
   if (include_body) {
-    snapshot->payload_span_path = lc_pouch_state_payload_span_path(
-        &pouch->allocator, manifest->namespace_path, &current->payload_span,
-        error);
-    if (snapshot->payload_span_path == NULL) {
+    if (pouch->storage.ops == NULL)
+      snapshot->payload_span_path = lc_pouch_state_payload_span_path(
+          &pouch->allocator, manifest->namespace_path, &current->payload_span,
+          error);
+    if (pouch->storage.ops == NULL && snapshot->payload_span_path == NULL) {
       lc_pouch_state_read_many_snapshot_cleanup(&pouch->allocator, snapshot);
       return lc_error_set(error, LC_ERR_NOMEM, 0L,
                           "failed to allocate pouch read-many payload span",
@@ -4596,7 +4646,15 @@ static int lc_pouch_state_read_many_snapshot_from_entry(
             NULL);
       }
     }
-    if (cache != NULL && record != NULL) {
+    if (pouch->storage.ops != NULL) {
+      /* Capture only an encoded pin here. Decode one body at a time after
+       * releasing projection coordination, immediately before its visitor. */
+      rc = pouch->storage.ops->source_open(
+          pouch->storage.context, cache->storage_namespace,
+          current->payload_span.container_leaf,
+          current->payload_span.payload_offset,
+          current->payload_span.payload_length, &snapshot->encoded, error);
+    } else if (cache != NULL && record != NULL) {
       rc = lc_pouch_state_read_many_snapshot_body_from_cache(
           pouch, cache, record, snapshot->crypto_context,
           snapshot->binding_context, snapshot->payload_span_path,
@@ -17195,6 +17253,17 @@ static int lc_pouch_state_read_many_internal(
       lc_pouch_state_read_result read_result;
 
       memset(&read_result, 0, sizeof(read_result));
+      if (snapshots[index].encoded != NULL) {
+        lc_source *encoded = snapshots[index].encoded;
+        snapshots[index].encoded = NULL;
+        rc = lc_pouch_crypto_source_from_source(
+            pouch->crypto, snapshots[index].crypto_context,
+            snapshots[index].binding_context, encoded,
+            snapshots[index].payload_span.payload_length,
+            snapshots[index].descriptor, &snapshots[index].body, error);
+        if (rc != LC_OK)
+          break;
+      }
       if (snapshots[index].found) {
         if (include_body) {
           read_result.body = snapshots[index].body;
@@ -17213,6 +17282,9 @@ static int lc_pouch_state_read_many_internal(
         read_result.retention = snapshots[index].retention;
         read_result.has_query_hidden = snapshots[index].has_query_hidden;
         read_result.query_hidden = snapshots[index].query_hidden;
+        read_result.has_body = snapshots[index].payload_span.present;
+        read_result.staged_delete_marker =
+            snapshots[index].staged_delete_marker;
         read_result.found = 1;
         snapshots[index].content_type = NULL;
         snapshots[index].etag = NULL;
@@ -17348,8 +17420,8 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
       continue;
     }
     rc = lc_pouch_state_scan_body_snapshot_append(
-        pouch, &snapshots, &snapshot_count, &snapshot_capacity, &manifest,
-        record, error);
+        pouch, &snapshots, &snapshot_count, &snapshot_capacity, cache,
+        &manifest, record, error);
   }
   if (rc == LC_OK && snapshot_count > 0U) {
     next_index = index;

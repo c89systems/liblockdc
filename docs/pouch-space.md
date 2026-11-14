@@ -36,7 +36,10 @@ routing head follows root durability, with a flush before predecessor sealing.
 Recovery discards private successor bytes whose head was not selected, even
 when a peer checkpoint stabilized them. Protected admission for the complete
 maintenance operation remains required.
-Remaining public Pouch semantics, maintenance and shared-root coordination
+State read-many, metadata visits and paged scan/body snapshots now use captured
+container read pins, with lazy bounded decoding and no body cache. Captured
+body access survives callback mutation and Pouch close. Remaining public Pouch
+semantics, maintenance and shared-root coordination
 remain ahead; normal public open behavior has not changed.
 
 ## Intent

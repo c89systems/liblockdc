@@ -160,6 +160,26 @@ static int source_open(void *context, void *ns, const char *leaf,
   *out = &source->pub;
   return LC_OK;
 }
+static int source_clone(void *context, lc_source *input, lc_source **out,
+                        lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_pouch_source *original = input->impl, *source;
+  int rc = check(context, e);
+  *out = NULL;
+  if (rc != LC_OK)
+    return rc;
+  source = lc_alloc_with_allocator(&owner->allocator, sizeof(*source));
+  if (!source)
+    return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot clone container source",
+                        NULL, NULL, "pouch");
+  *source = *original;
+  source->offset = 0;
+  source->pub.impl = source;
+  ps_namespace_read_retain(source->window);
+  __atomic_add_fetch(&owner->references, 1, __ATOMIC_RELAXED);
+  *out = &source->pub;
+  return LC_OK;
+}
 static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_namespace *ns = NULL;
@@ -170,9 +190,9 @@ static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
   return rc;
 }
 static const lc_pouch_storage_ops storage_ops = {
-    check,       namespace_open,        namespace_close, namespace_info,
-    replay,      append_begin,          append_commit,   append_close,
-    source_open, retention_hint_ensure, release};
+    check,       namespace_open, namespace_close,       namespace_info,
+    replay,      append_begin,   append_commit,         append_close,
+    source_open, source_clone,   retention_hint_ensure, release};
 
 int ps_pouch_state_open(const char *path, int create,
                         const lc_allocator *allocator,

@@ -57,10 +57,18 @@ typedef union header {
     size_t size;
   } value;
 } header;
-static size_t live;
+static size_t live, measured_max;
+static int measure;
 static void *allocate(void *context, size_t size) {
   header *h = malloc(sizeof(*h) + size);
   (void)context;
+  if (__atomic_load_n(&measure, __ATOMIC_RELAXED)) {
+    size_t old = __atomic_load_n(&measured_max, __ATOMIC_RELAXED);
+    while (size > old &&
+           !__atomic_compare_exchange_n(&measured_max, &old, size, 0,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+  }
   if (!h)
     return NULL;
   h->value.cookie = (uintptr_t)h ^ UINT64_C(0x721d9629abcd1234);
@@ -1364,6 +1372,529 @@ static void key_bounds(const char *directory) {
   REQUIRE(live == 0);
   lc_error_cleanup(&e);
 }
+static size_t read_length(unsigned index) {
+  return index == 0 ? 0 : index == 1 ? 65569 : 17 + index;
+}
+static void seed_reads(lc_pouch *p, size_t count, lc_error *e) {
+  lc_pouch_state_write_options o = {0};
+  lc_pouch_state_write_result w = {0};
+  char key[16];
+  o.has_metadata = 1;
+  o.metadata = (const unsigned char *)"before";
+  o.metadata_length = 6;
+  o.content_type = "application/test";
+  for (size_t i = 0; i < count; ++i) {
+    input in = source(read_length((unsigned)i), (unsigned char)(10 + i));
+    snprintf(key, sizeof(key), "k%02u", (unsigned)i);
+    ok(put(p, "reads", key, &in, &o, &w, e), e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+  }
+}
+typedef struct read_view {
+  lc_pouch *pouch;
+  const char *const *keys;
+  size_t count, calls;
+  unsigned seen;
+  int bodies, mutate, repeated, stop;
+  lc_source *saved;
+} read_view;
+static unsigned read_index(const char *key) {
+  char *end;
+  unsigned long index;
+  REQUIRE(key[0] == 'k');
+  index = strtoul(key + 1, &end, 10);
+  REQUIRE(!*end && index < 12);
+  return (unsigned)index;
+}
+static void mutate_reads(read_view *view, lc_error *e) {
+  lc_pouch_state_write_result w = {0};
+  input in = source(97, 201);
+  ok(put(view->pouch, "reads", "k05", &in, NULL, &w, e), e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  ok(lc_pouch_state_delete(view->pouch, "reads", "k11", NULL, &w, e), e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  in = source(31, 99);
+  ok(put(view->pouch, "reads", "k12", &in, NULL, &w, e), e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+}
+static int read_many_visit(const char *key, const lc_pouch_state_read_result *r,
+                           void *context, lc_error *e) {
+  read_view *view = context;
+  REQUIRE(view->calls < view->count && !strcmp(key, view->keys[view->calls]));
+  if (!view->calls && view->mutate)
+    mutate_reads(view, e);
+  ++view->calls;
+  if (strcmp(key, "missing") && strcmp(key, "meta") && strcmp(key, "k03")) {
+    unsigned index = read_index(key);
+    REQUIRE(r->found && r->has_body && r->body && r->version == 1 &&
+            r->bytes == read_length(index) && r->metadata_length == 6 &&
+            !memcmp(r->metadata, "before", 6) && r->content_type &&
+            !strcmp(r->content_type, "application/test"));
+    drain(r->body, read_length(index), (unsigned char)(10 + index), e);
+    ok(r->body->reset(r->body, e), e);
+    drain(r->body, read_length(index), (unsigned char)(10 + index), e);
+  } else
+    REQUIRE(!r->found && !r->body && !r->has_body);
+  return view->stop ? LC_POUCH_STATE_READ_MANY_STOP : LC_OK;
+}
+static int read_summary(const lc_pouch_state_scan_summary_entry *entry,
+                        void *context, lc_error *e) {
+  read_view *view = context;
+  unsigned index = read_index(entry->key);
+  REQUIRE(!(view->seen & (1U << index)) && index != 3 && entry->version == 1 &&
+          entry->bytes == read_length(index) && entry->content_type &&
+          !strcmp(entry->content_type, "application/test") && entry->etag);
+  if (view->seen)
+    REQUIRE(view->seen < (1U << index));
+  view->seen |= 1U << index;
+  if (!view->calls && view->mutate)
+    mutate_reads(view, e);
+  ++view->calls;
+  if (view->bodies)
+    for (int repeat = 0; repeat <= view->repeated; ++repeat) {
+      lc_pouch_state_read_result r = {0};
+      ok(lc_pouch_state_scan_summary_read_body(view->pouch, "reads", entry,
+                                               repeat, &r, e),
+         e);
+      REQUIRE(r.found && r.has_body && r.version == 1 &&
+              r.bytes == read_length(index) && r.metadata_length == 6 &&
+              !memcmp(r.metadata, "before", 6));
+      if (index == 11 && !view->saved && view->mutate) {
+        view->saved = r.body;
+        r.body = NULL;
+      } else {
+        drain(r.body, read_length(index), (unsigned char)(10 + index), e);
+        ok(r.body->reset(r.body, e), e);
+        drain(r.body, read_length(index), (unsigned char)(10 + index), e);
+      }
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      /* The row remains borrowed for the complete visitor, including after
+       * body-result cleanup and a second independent body open. */
+      REQUIRE(!strcmp(entry->content_type, "application/test") &&
+              strlen(entry->etag) == 64 &&
+              (entry->descriptor == NULL || entry->descriptor[0]));
+    }
+  return view->stop;
+}
+static int read_metadata_visit(const lc_pouch_state_visit_entry *entry,
+                               void *context, lc_error *e) {
+  read_view *view = context;
+  (void)e;
+  REQUIRE(entry->metadata_length == 6 && !memcmp(entry->metadata, "before", 6));
+  if (!strcmp(entry->key, "meta"))
+    REQUIRE(!entry->has_payload && entry->version == 0);
+  else {
+    unsigned index = read_index(entry->key);
+    REQUIRE(index != 3 && entry->has_payload && entry->version == 1);
+  }
+  ++view->calls;
+  return LC_OK;
+}
+static void reads(const char *path, const char *directory) {
+  static const char *const keys[] = {"k01",  "missing", "k00", "k05", "k03",
+                                     "meta", "k01",     "k11", "k10", "k09",
+                                     "k08",  "k07",     "k06", "k04"};
+  lc_error e;
+  lc_error_init(&e);
+  for (int multifile = 0; multifile < 2; ++multifile)
+    for (int transform = 0; transform < 4; ++transform)
+      for (int sync = 0; sync < 2; ++sync)
+        for (int phase = 0; phase < 3; ++phase) {
+          ps_pouch_state_options o = options(transform, sync);
+          io_fault f = {0};
+          ps_io io = {&f, io_read, io_write, io_sync, io_reserve, NULL};
+          lc_pouch *p = NULL;
+          lc_pouch_state_write_options metadata = {0};
+          lc_pouch_state_write_result w = {0};
+          lc_pouch_state_scan_summaries_result page = {0};
+          lc_pouch_state_scan_summaries_result next_page = {0};
+          read_view view = {0};
+          char native[1400];
+          const char *store = path;
+          o.logical.segment_target_bytes = 1;
+          o.io = &io;
+          if (multifile) {
+            snprintf(native, sizeof(native), "%s/native-%d-%d-%d", directory,
+                     transform, sync, phase);
+            store = native;
+            ok(lc_pouch_open(store, &allocator, &o.logical, &p, &e), &e);
+          } else
+            ok(ps_pouch_state_open(store, 1, &allocator, &o, &p, &e), &e);
+          seed_reads(p, 12, &e);
+          ok(lc_pouch_state_delete(p, "reads", "k03", NULL, &w, &e), &e);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          metadata.has_metadata = 1;
+          metadata.metadata = (const unsigned char *)"before";
+          metadata.metadata_length = 6;
+          ok(lc_pouch_state_update_metadata(p, "reads", "meta", &metadata, &w,
+                                            &e),
+             &e);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          view.pouch = p;
+          view.keys = keys;
+          view.count = sizeof(keys) / sizeof(keys[0]);
+          if (phase == 0) {
+            ok(lc_pouch_state_read_many(p, "reads", keys, view.count,
+                                        read_many_visit, &view, &e),
+               &e);
+            REQUIRE(view.calls == view.count);
+            view.calls = 0;
+            view.stop = 1;
+            ok(lc_pouch_state_read_many_cached(p, "reads", keys, view.count,
+                                               read_many_visit, &view, &e),
+               &e);
+            REQUIRE(view.calls == 1);
+            view.calls = 0;
+            view.stop = 0;
+            view.mutate = 1;
+            ok(lc_pouch_state_read_many_cached(p, "reads", keys, view.count,
+                                               read_many_visit, &view, &e),
+               &e);
+            REQUIRE(view.calls == view.count);
+          } else if (phase == 1) {
+            view.mutate = view.bodies = view.repeated = 1;
+            ok(lc_pouch_state_scan_summaries(p, "reads", NULL, 0, read_summary,
+                                             &view, &page, &e),
+               &e);
+            REQUIRE(view.calls == 11 && view.seen == (4095U ^ 8U) &&
+                    !page.truncated && !page.next_start_after && view.saved);
+          } else {
+            size_t read_bytes = f.read_bytes;
+            __atomic_store_n(&measured_max, 0, __ATOMIC_RELAXED);
+            __atomic_store_n(&measure, 1, __ATOMIC_RELAXED);
+            int rc = lc_pouch_state_scan_summaries(
+                p, "reads", NULL, 4, read_summary, &view, &page, &e);
+            __atomic_store_n(&measure, 0, __ATOMIC_RELAXED);
+            ok(rc, &e);
+            REQUIRE(view.calls == 4 && page.truncated &&
+                    !strcmp(page.next_start_after, "k04"));
+            if (!multifile)
+              REQUIRE(f.read_bytes == read_bytes &&
+                      __atomic_load_n(&measured_max, __ATOMIC_RELAXED) <
+                          PS_CHUNK);
+            view.calls = 0;
+            view.seen = 0;
+            ok(lc_pouch_state_scan_summaries(p, "reads", page.next_start_after,
+                                             4, read_summary, &view, &next_page,
+                                             &e),
+               &e);
+            REQUIRE(view.calls == 4 && view.seen == (32U | 64U | 128U | 256U));
+            REQUIRE(next_page.truncated &&
+                    !strcmp(next_page.next_start_after, "k08"));
+            lc_pouch_state_scan_summaries_result_cleanup(&allocator,
+                                                         &next_page);
+            lc_pouch_state_scan_summaries_result_cleanup(&allocator, &page);
+            view.calls = 0;
+            ok(lc_pouch_state_visit(p, "reads", read_metadata_visit, &view, &e),
+               &e);
+            REQUIRE(view.calls == 12);
+            view.calls = 0;
+            ok(lc_pouch_state_visit_prefix(p, "reads", "k0",
+                                           read_metadata_visit, &view, &e),
+               &e);
+            REQUIRE(view.calls == 9);
+            view.calls = 0;
+            view.seen = 0;
+            view.stop = LC_POUCH_STATE_READ_MANY_STOP;
+            REQUIRE(lc_pouch_state_scan_summaries(
+                        p, "reads", NULL, 4, read_summary, &view, &page, &e) ==
+                    LC_POUCH_STATE_READ_MANY_STOP);
+            REQUIRE(view.calls == 1 && !page.truncated &&
+                    !page.next_start_after);
+            view.calls = 0;
+            view.seen = 0;
+            view.stop = 0;
+            ok(lc_pouch_state_scan_summaries(p, "reads", "k99", 4, read_summary,
+                                             &view, &page, &e),
+               &e);
+            REQUIRE(view.calls == 0 && !page.truncated &&
+                    !page.next_start_after);
+            {
+              const char *bad[] = {"k01", NULL};
+              REQUIRE(lc_pouch_state_read_many(p, "reads", bad, 2,
+                                               read_many_visit, &view,
+                                               &e) == LC_ERR_INVALID);
+              REQUIRE(view.calls == 0);
+              clear(&e);
+            }
+            ok(lc_pouch_state_read_many(p, "reads", NULL, 0, read_many_visit,
+                                        &view, &e),
+               &e);
+            REQUIRE(view.calls == 0);
+          }
+          lc_pouch_state_scan_summaries_result_cleanup(&allocator, &page);
+          if (!multifile)
+            one_file(directory);
+          lc_pouch_close(p);
+          if (view.saved) {
+            drain(view.saved, read_length(11), 21, &e);
+            ok(view.saved->reset(view.saved, &e), &e);
+            drain(view.saved, read_length(11), 21, &e);
+            view.saved->close(view.saved);
+          }
+          REQUIRE(live == 0);
+          if (!multifile)
+            REQUIRE(unlink(store) == 0);
+        }
+  lc_error_cleanup(&e);
+}
+static int consume_read(lc_source *source, unsigned index, lc_error *e) {
+  unsigned char bytes[997];
+  size_t offset = 0, got;
+  while ((got = source->read(source, bytes, sizeof(bytes), e)) != 0) {
+    REQUIRE(got <= read_length(index) - offset);
+    for (size_t i = 0; i < got; ++i)
+      REQUIRE(bytes[i] == byte_at(offset + i, (unsigned char)(10 + index)));
+    offset += got;
+  }
+  if (e->code != LC_OK)
+    return e->code;
+  REQUIRE(offset == read_length(index));
+  return LC_OK;
+}
+static int fault_read_many(const char *key, const lc_pouch_state_read_result *r,
+                           void *context, lc_error *e) {
+  read_view *view = context;
+  unsigned index = read_index(key);
+  ++view->calls;
+  REQUIRE(index < 4 && r->found && r->has_body && r->body && r->version == 1 &&
+          r->metadata_length == 6 && !memcmp(r->metadata, "before", 6));
+  return consume_read(r->body, index, e);
+}
+static int fault_read_summary(const lc_pouch_state_scan_summary_entry *entry,
+                              void *context, lc_error *e) {
+  read_view *view = context;
+  unsigned index = read_index(entry->key);
+  ++view->calls;
+  REQUIRE(index < 4 && entry->version == 1);
+  if (view->bodies)
+    for (int repeat = 0; repeat < 2; ++repeat) {
+      lc_pouch_state_read_result r = {0};
+      int rc = lc_pouch_state_scan_summary_read_body(view->pouch, "reads",
+                                                     entry, repeat, &r, e);
+      if (rc == LC_OK) {
+        REQUIRE(r.found && r.has_body && r.version == 1 &&
+                r.metadata_length == 6 && !memcmp(r.metadata, "before", 6));
+        rc = consume_read(r.body, index, e);
+      }
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      if (rc != LC_OK)
+        return rc;
+      REQUIRE(strlen(entry->etag) == 64 &&
+              !strcmp(entry->content_type, "application/test"));
+    }
+  return LC_OK;
+}
+static int fault_read_metadata(const lc_pouch_state_visit_entry *entry,
+                               void *context, lc_error *e) {
+  read_view *view = context;
+  (void)e;
+  REQUIRE(read_index(entry->key) < 4 && entry->has_payload &&
+          entry->version == 1 && entry->metadata_length == 6 &&
+          !memcmp(entry->metadata, "before", 6));
+  ++view->calls;
+  return LC_OK;
+}
+static int run_read(lc_pouch *p, int phase, size_t *calls, lc_error *e) {
+  static const char *const keys[] = {"k01", "k00", "k02", "k03", "k01",
+                                     "k02", "k00", "k01", "k03", "k02"};
+  read_view view = {0};
+  lc_pouch_state_scan_summaries_result page = {0};
+  int rc;
+  view.pouch = p;
+  if (phase == 0)
+    rc = lc_pouch_state_read_many(p, "reads", keys, 10, fault_read_many, &view,
+                                  e);
+  else if (phase == 1)
+    rc = lc_pouch_state_read_many_cached(p, "reads", keys, 10, fault_read_many,
+                                         &view, e);
+  else if (phase == 4)
+    rc = lc_pouch_state_visit_prefix(p, "reads", "k", fault_read_metadata,
+                                     &view, e);
+  else {
+    view.bodies = phase == 3;
+    rc = lc_pouch_state_scan_summaries(p, "reads", NULL, 0, fault_read_summary,
+                                       &view, &page, e);
+    lc_pouch_state_scan_summaries_result_cleanup(&allocator, &page);
+  }
+  *calls = view.calls;
+  if (rc == LC_OK)
+    REQUIRE(view.calls == (phase < 2 ? 10U : 4U));
+  return rc;
+}
+static ssize_t read_fail(void *context, int fd, void *bytes, size_t n,
+                         off_t at) {
+  io_fault *f = context;
+  if (io_fails(f))
+    return -1;
+  return pread(fd, bytes, n, at);
+}
+static size_t read_failure_case(const char *path, size_t nth, int phase,
+                                int cold, int use_io, int transform) {
+  ps_pouch_state_options o = options(transform, 0);
+  io_fault f = {0};
+  ps_io io = {&f, read_fail, io_write, io_sync, io_reserve, NULL};
+  lc_pouch *p = NULL;
+  lc_error e;
+  size_t count, calls;
+  int rc;
+  lc_error_init(&e);
+  o.io = &io;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  seed_reads(p, 4, &e);
+  if (cold) {
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  }
+  if (use_io) {
+    f.calls = 0;
+    f.fail = nth;
+    f.armed = 1;
+  } else {
+    allocation = 0;
+    fail_at = nth;
+    __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+  }
+  rc = run_read(p, phase, &calls, &e);
+  count = use_io ? f.calls : allocation;
+  __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+  f.armed = 0;
+  REQUIRE(rc == LC_OK || rc == (use_io ? LC_ERR_TRANSPORT : LC_ERR_NOMEM));
+  if (nth == SIZE_MAX)
+    ok(rc, &e);
+  clear(&e);
+  if (use_io && rc != LC_OK) {
+    REQUIRE(p->storage.ops->check(p->storage.context, &e) == LC_ERR_TRANSPORT);
+    clear(&e);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  }
+  ok(run_read(p, phase, &calls, &e), &e);
+  for (unsigned i = 0; i < 4; ++i) {
+    char key[16];
+    snprintf(key, sizeof(key), "k%02u", i);
+    read_value(p, "reads", key, read_length(i), (unsigned char)(10 + i), 1, &e);
+  }
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+  return count;
+}
+static void read_faults(const char *path, int use_io) {
+  size_t total = 0;
+  for (int transform = 0; transform <= 3; transform += 3)
+    for (int cold = 0; cold < 2; ++cold)
+      for (int phase = 0; phase < 5; ++phase) {
+        size_t count =
+            read_failure_case(path, SIZE_MAX, phase, cold, use_io, transform);
+        for (size_t n = 1; n <= count; ++n)
+          (void)read_failure_case(path, n, phase, cold, use_io, transform);
+        total += count;
+      }
+  printf("container read %s failure sites: %lu\n",
+         use_io ? "I/O" : "allocation", (unsigned long)total);
+}
+typedef struct read_job {
+  gate held;
+  read_view view;
+  int phase, rc;
+} read_job;
+static void hold_read(read_job *job) {
+  if (job->view.calls)
+    return;
+  pthread_mutex_lock(&job->held.mutex);
+  job->held.entered = 1;
+  pthread_cond_broadcast(&job->held.changed);
+  while (!job->held.released)
+    pthread_cond_wait(&job->held.changed, &job->held.mutex);
+  pthread_mutex_unlock(&job->held.mutex);
+}
+static int held_read_many(const char *key, const lc_pouch_state_read_result *r,
+                          void *context, lc_error *e) {
+  read_job *job = context;
+  hold_read(job);
+  return fault_read_many(key, r, &job->view, e);
+}
+static int held_read_summary(const lc_pouch_state_scan_summary_entry *entry,
+                             void *context, lc_error *e) {
+  read_job *job = context;
+  hold_read(job);
+  return fault_read_summary(entry, &job->view, e);
+}
+static void *run_read_job(void *context) {
+  read_job *job = context;
+  static const char *const keys[] = {"k01", "k02", "k03", "k00"};
+  lc_pouch_state_scan_summaries_result page = {0};
+  lc_error e;
+  lc_error_init(&e);
+  if (job->phase == 0)
+    job->rc = lc_pouch_state_read_many(job->view.pouch, "reads", keys, 4,
+                                       held_read_many, job, &e);
+  else if (job->phase == 1)
+    job->rc = lc_pouch_state_read_many_cached(job->view.pouch, "reads", keys, 4,
+                                              held_read_many, job, &e);
+  else
+    job->rc = lc_pouch_state_scan_summaries(job->view.pouch, "reads", NULL, 0,
+                                            held_read_summary, job, &page, &e);
+  lc_pouch_state_scan_summaries_result_cleanup(&allocator, &page);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void read_concurrency(const char *path, const char *directory) {
+  for (int transform = 0; transform <= 3; transform += 3)
+    for (int sync = 0; sync < 2; ++sync)
+      for (int phase = 0; phase < 4; ++phase) {
+        ps_pouch_state_options o = options(transform, sync);
+        lc_pouch *p = NULL;
+        lc_pouch_state_write_result w = {0};
+        lc_pouch_state_read_result r = {0};
+        read_job job = {0};
+        pthread_t thread;
+        input in = source(97, 201);
+        lc_error e;
+        lc_error_init(&e);
+        o.logical.segment_target_bytes = 1;
+        ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+        seed_reads(p, 4, &e);
+        REQUIRE(pthread_mutex_init(&job.held.mutex, NULL) == 0);
+        REQUIRE(pthread_cond_init(&job.held.changed, NULL) == 0);
+        job.phase = phase;
+        job.view.pouch = p;
+        job.view.bodies = phase == 2;
+        REQUIRE(pthread_create(&thread, NULL, run_read_job, &job) == 0);
+        pthread_mutex_lock(&job.held.mutex);
+        while (!job.held.entered)
+          pthread_cond_wait(&job.held.changed, &job.held.mutex);
+        pthread_mutex_unlock(&job.held.mutex);
+        ok(put(p, "reads", "k01", &in, NULL, &w, &e), &e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        ok(lc_pouch_state_delete(p, "reads", "k03", NULL, &w, &e), &e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        in = source(31, 99);
+        ok(put(p, "peer", "key", &in, NULL, &w, &e), &e);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        pthread_mutex_lock(&job.held.mutex);
+        job.held.released = 1;
+        pthread_cond_broadcast(&job.held.changed);
+        pthread_mutex_unlock(&job.held.mutex);
+        REQUIRE(pthread_join(thread, NULL) == 0);
+        ok(job.rc, &e);
+        REQUIRE(job.view.calls == 4);
+        read_value(p, "reads", "k01", 97, 201, 2, &e);
+        read_value(p, "peer", "key", 31, 99, 1, &e);
+        ok(lc_pouch_state_read_metadata(p, "reads", "k03", &r, &e), &e);
+        REQUIRE(!r.found);
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        one_file(directory);
+        lc_pouch_close(p);
+        REQUIRE(live == 0 && unlink(path) == 0);
+        REQUIRE(pthread_cond_destroy(&job.held.changed) == 0);
+        REQUIRE(pthread_mutex_destroy(&job.held.mutex) == 0);
+        lc_error_cleanup(&e);
+      }
+}
 static void validation(const char *path) {
   lc_error e;
   lc_error_init(&e);
@@ -1423,6 +1954,14 @@ static void *worker(void *context) {
     mutation_capacity(r->path, r->directory);
   else if (!strcmp(r->mode, "key-bounds"))
     key_bounds(r->directory);
+  else if (!strcmp(r->mode, "reads"))
+    reads(r->path, r->directory);
+  else if (!strcmp(r->mode, "read-faults"))
+    read_faults(r->path, 0);
+  else if (!strcmp(r->mode, "read-io-faults"))
+    read_faults(r->path, 1);
+  else if (!strcmp(r->mode, "read-concurrency"))
+    read_concurrency(r->path, r->directory);
   else
     REQUIRE(0);
   return NULL;

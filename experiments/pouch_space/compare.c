@@ -72,6 +72,8 @@ typedef struct worker {
 } worker;
 struct comparison {
   int container, collection, sync, streams, existing_records, runtime;
+  int read_method; /* 1: read-many; 2: scan bodies; 3: scan metadata; 4: points.
+                    */
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
@@ -633,6 +635,153 @@ static void seed_mutations(comparison *c, lc_error *e) {
     lc_source_close(source);
   }
 }
+typedef struct read_group {
+  worker *owner;
+  unsigned char *seen;
+  size_t count;
+} read_group;
+static size_t verify_read_key(read_group *group, const char *name,
+                              uint64_t version, uint64_t bytes) {
+  comparison *c = group->owner->run;
+  size_t id;
+  require(!strncmp(name, "key-", 4), "read key prefix");
+  id = number(name + 4, 0, c->rows - 1);
+  require(id % c->writers == group->owner->ordinal && !group->seen[id] &&
+              version == c->rounds && bytes == c->bytes,
+          "read group captured metadata and unique membership");
+  group->seen[id] = 1;
+  ++group->count;
+  return id;
+}
+static int verify_read_result(const char *name,
+                              const lc_pouch_state_read_result *result,
+                              void *context, lc_error *e) {
+  read_group *group = context;
+  comparison *c = group->owner->run;
+  unsigned char bytes[4096];
+  size_t id = verify_read_key(group, name, result->version, result->bytes);
+  size_t offset = 0, got;
+  require(result->found && result->has_body && result->body,
+          "read group body present");
+  make_body(group->owner->body, c->bytes, id, c->rounds - 1);
+  while ((got = result->body->read(result->body, bytes, sizeof(bytes), e))) {
+    require(got <= c->bytes - offset &&
+                !memcmp(bytes, group->owner->body + offset, got),
+            "read group captured body bytes");
+    offset += got;
+  }
+  if (e->code != LC_OK)
+    return e->code;
+  require(offset == c->bytes, "read group complete body");
+  return LC_OK;
+}
+static int verify_read_summary(const lc_pouch_state_scan_summary_entry *entry,
+                               void *context, lc_error *e) {
+  read_group *group = context;
+  comparison *c = group->owner->run;
+  lc_pouch_state_read_result result;
+  char ns[64], name[64];
+  int rc;
+  if (c->read_method == 3) {
+    (void)verify_read_key(group, entry->key, entry->version, entry->bytes);
+    return LC_OK;
+  }
+  names(group->owner->ordinal, 0, ns, name);
+  memset(&result, 0, sizeof(result));
+  rc =
+      lc_pouch_state_scan_summary_read_body(c->pouch, ns, entry, 0, &result, e);
+  if (rc == LC_OK)
+    rc = verify_read_result(entry->key, &result, group, e);
+  lc_pouch_state_read_result_cleanup(NULL, &result);
+  return rc;
+}
+static void *read_main(void *context) {
+  worker *w = context;
+  comparison *c = w->run;
+  read_group group;
+  lc_error e;
+  char ns[64], name[64];
+  size_t id = w->ordinal;
+  lc_error_init(&e);
+  memset(&group, 0, sizeof(group));
+  group.owner = w;
+  group.seen = calloc(c->rows, 1);
+  require(group.seen != NULL, "read membership vector");
+  names(w->ordinal, 0, ns, name);
+  pthread_mutex_lock(&c->mutex);
+  while (!c->started)
+    pthread_cond_wait(&c->condition, &c->mutex);
+  pthread_mutex_unlock(&c->mutex);
+  w->rc = LC_OK;
+  if (c->read_method == 1) {
+    const char *keys[64];
+    char (*labels)[64] = malloc(64 * sizeof(*labels));
+    size_t count;
+    require(labels != NULL, "bounded read-many key batch");
+    while (w->rc == LC_OK && id < c->rows) {
+      count = 0;
+      while (count < 64 && id < c->rows) {
+        names(w->ordinal, id, ns, labels[count]);
+        keys[count] = labels[count];
+        ++count;
+        id += c->writers;
+      }
+      w->rc = lc_pouch_state_read_many(c->pouch, ns, keys, count,
+                                       verify_read_result, &group, &e);
+    }
+    free(labels);
+  } else if (c->read_method == 4) {
+    for (; w->rc == LC_OK && id < c->rows; id += c->writers) {
+      lc_pouch_state_read_result result;
+      names(w->ordinal, id, ns, name);
+      memset(&result, 0, sizeof(result));
+      w->rc = lc_pouch_state_read(c->pouch, ns, name, &result, &e);
+      if (w->rc == LC_OK)
+        w->rc = verify_read_result(name, &result, &group, &e);
+      lc_pouch_state_read_result_cleanup(NULL, &result);
+    }
+  } else {
+    char *cursor = NULL;
+    int more;
+    do {
+      lc_pouch_state_scan_summaries_result page;
+      memset(&page, 0, sizeof(page));
+      w->rc = lc_pouch_state_scan_summaries(
+          c->pouch, ns, cursor, 256, verify_read_summary, &group, &page, &e);
+      lc_free_with_allocator(NULL, cursor);
+      cursor = page.next_start_after;
+      page.next_start_after = NULL;
+      more = page.truncated;
+      lc_pouch_state_scan_summaries_result_cleanup(NULL, &page);
+    } while (w->rc == LC_OK && more);
+    lc_free_with_allocator(NULL, cursor);
+  }
+  if (w->rc == LC_OK)
+    require(group.count == (c->rows + c->writers - 1 - w->ordinal) / c->writers,
+            "read group complete membership");
+  else
+    fprintf(stderr, "read group failed (%d): %s\n", w->rc,
+            e.message ? e.message : "no detail");
+  free(group.seen);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void verify_read_groups(comparison *c, lc_error *e) {
+  size_t i;
+  c->started = 0;
+  for (i = 0; i < c->writers; ++i)
+    require(pthread_create(&c->threads[i], NULL, read_main, &c->workers[i]) ==
+                0,
+            "start read worker");
+  pthread_mutex_lock(&c->mutex);
+  c->started = 1;
+  pthread_cond_broadcast(&c->condition);
+  pthread_mutex_unlock(&c->mutex);
+  for (i = 0; i < c->writers; ++i) {
+    require(pthread_join(c->threads[i], NULL) == 0, "join read worker");
+    check(c->workers[i].rc, e);
+  }
+}
 static void verify_states(comparison *c, lc_error *e) {
   ps_reader *reader;
   ps_stream_reader *stream_reader;
@@ -642,6 +791,10 @@ static void verify_states(comparison *c, lc_error *e) {
   unsigned char buffer[4096];
   size_t id, ordinal, offset, got;
   unsigned long crc;
+  if (c->read_method) {
+    verify_read_groups(c, e);
+    return;
+  }
   for (id = 0; id < c->rows; ++id) {
     ordinal = id % c->writers;
     make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
@@ -864,6 +1017,7 @@ int main(int argc, char **argv) {
   double start, cpu, seconds, cpu_seconds, read_seconds, close_seconds,
       open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0,
                                                          seed_seconds = 0;
+  double read_cpu_begin, read_cpu_seconds, reopen_read_cpu_seconds;
   int preopen;
   if (argc != 8 && argc != 9) {
     fprintf(
@@ -871,6 +1025,10 @@ int main(int argc, char **argv) {
         "usage: %s "
         "space-state|stream-state|runtime-state|pouch-state|space-collection|"
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
+        "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
+        "points|"
+        "runtime-scan-bodies|pouch-scan-bodies|"
+        "runtime-scan-metadata|pouch-scan-metadata|"
         "stream-collection|pouch-collection "
         "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
         argv[0]);
@@ -889,14 +1047,28 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-metadata") ||
               !strcmp(argv[1], "runtime-delete") ||
               !strcmp(argv[1], "pouch-delete") ||
+              !strcmp(argv[1], "runtime-read-many") ||
+              !strcmp(argv[1], "pouch-read-many") ||
+              !strcmp(argv[1], "runtime-read-points") ||
+              !strcmp(argv[1], "pouch-read-points") ||
+              !strcmp(argv[1], "runtime-scan-bodies") ||
+              !strcmp(argv[1], "pouch-scan-bodies") ||
+              !strcmp(argv[1], "runtime-scan-metadata") ||
+              !strcmp(argv[1], "pouch-scan-metadata") ||
               !strcmp(argv[1], "stream-collection"),
           "mode");
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
-  c.mutation = strstr(argv[1], "metadata") ? 1
-               : strstr(argv[1], "delete") ? 2
-                                           : 0;
+  c.read_method = strstr(argv[1], "read-many")       ? 1
+                  : strstr(argv[1], "scan-bodies")   ? 2
+                  : strstr(argv[1], "scan-metadata") ? 3
+                  : strstr(argv[1], "read-points")   ? 4
+                                                     : 0;
+  c.mutation = c.read_method                 ? 0
+               : strstr(argv[1], "metadata") ? 1
+               : strstr(argv[1], "delete")   ? 2
+                                             : 0;
   c.collection = strstr(argv[1], "collection") != NULL;
   c.rows = number(argv[3], 1, PS_DEFAULT_CAPACITY / PS_PAGE);
   c.bytes = number(argv[4], 64, 2 * PS_MIB);
@@ -1039,18 +1211,29 @@ int main(int argc, char **argv) {
     }
   }
   qsort(c.latencies, count, sizeof(*c.latencies), compare_double);
+  read_cpu_begin = now(CLOCK_PROCESS_CPUTIME_ID);
   start = now(CLOCK_MONOTONIC);
   verify_all(&c, &e);
   read_seconds = now(CLOCK_MONOTONIC) - start;
+  read_cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - read_cpu_begin;
   start = now(CLOCK_MONOTONIC);
   close_stores(&c, &e);
   close_seconds = now(CLOCK_MONOTONIC) - start;
   start = now(CLOCK_MONOTONIC);
   open_stores(&c, 0, &e);
   open_seconds = now(CLOCK_MONOTONIC) - start;
+  read_cpu_begin = now(CLOCK_PROCESS_CPUTIME_ID);
   start = now(CLOCK_MONOTONIC);
   verify_all(&c, &e);
   reopen_read_seconds = now(CLOCK_MONOTONIC) - start;
+  reopen_read_cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - read_cpu_begin;
+  if (c.read_method == 3) {
+    /* Metadata-only scan timing must stay body-free. Verify its seed bodies
+     * outside both measured read phases before reporting success. */
+    c.read_method = 0;
+    verify_states(&c, &e);
+    c.read_method = 3;
+  }
   count_files(c.store, &artifacts);
   if (c.container || c.runtime) {
     /* The test helper owns one marker in the parent, outside the store. Audit
@@ -1104,12 +1287,14 @@ int main(int argc, char **argv) {
          "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
          "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
          "logical_segments=%lu "
-         "preopened=%d preopen_ms=%.6f seed_ms=%.6f max_us=%.3f verified=1\n",
+         "preopened=%d preopen_ms=%.6f seed_ms=%.6f max_us=%.3f "
+         "read_cpu_ms=%.6f reopen_read_cpu_ms=%.6f verified=1\n",
          checkpoints, directory_writes, descriptor_writes, metadata_pages,
          packed_pages, packed_bytes, payload_allocated, journal_used,
          stream_grants, (unsigned long)logical_segments, preopen,
          preopen_seconds * 1000, seed_seconds * 1000,
-         c.latencies[count - 1] * 1e6);
+         c.latencies[count - 1] * 1e6, read_cpu_seconds * 1000,
+         reopen_read_cpu_seconds * 1000);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

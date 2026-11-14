@@ -49,6 +49,8 @@ int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
 int ps_namespace_read_open(ps_namespace *, uint64_t segment, uint64_t offset,
                            uint64_t bytes, ps_namespace_window **, lc_error *);
 lc_pouch_record_io ps_namespace_read_input(ps_namespace_window *);
+/* Share an immutable captured range, without re-admitting its stream. */
+void ps_namespace_read_retain(ps_namespace_window *);
 void ps_namespace_read_close(ps_namespace_window *);
 /* Captures segment identities/tails once. Callbacks run outside owner locks,
  * may append/rotate, and observe only this fixed prefix. Memory follows segment

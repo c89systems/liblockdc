@@ -10,7 +10,8 @@ typedef struct ps_pouch_state_options {
 } ps_pouch_state_options;
 
 /* Private integration harness, never installed: ordinary state PUT, metadata
- * update, delete, point read/metadata/copy and namespace creation use the
+ * update, delete, point read/metadata/copy, read-many, metadata visits, paged
+ * scan summaries/body reads and namespace creation use the
  * production logical engine. Retention work hints are durable in-file markers;
  * reclamation and guaranteed maintenance admission at capacity remain pending.
  * Rotation can still require foreground capacity before a delete.
