@@ -1925,6 +1925,91 @@ static void validation(const char *path) {
   }
   lc_error_cleanup(&e);
 }
+static void snapshots(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int crypto = 0; crypto < 4; ++crypto)
+    for (int sync = 0; sync < 2; ++sync) {
+      ps_pouch_state_options o = options(crypto, sync);
+      lc_pouch *p = NULL;
+      lc_pouch_state_write_result w = {0};
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      input in = source(65569, 37);
+      ok(put(p, "snapshot", "key", &in, NULL, &w, &e), &e);
+      REQUIRE(w.version == 1 && w.index_seq == 1);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      void *handle = NULL;
+      ok(p->storage.ops->namespace_open(p->storage.context, "snapshot", 0,
+                                        &handle, &e),
+         &e);
+      ps_namespace *ns = handle;
+      ps_namespace_snapshot *b = NULL;
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      lc_pouch_state_entry request = {0}, result = {0};
+      request.key = "key";
+      request.version = request.index_seq = 1;
+      request.record_type = 1;
+      request.payload_context =
+          lc_pouch_state_crypto_context(&allocator, "snapshot", "key", 1, 1);
+      REQUIRE(request.payload_context != NULL);
+      request.content_type = "application/octet-stream";
+      in = source(65569, 37);
+      in.pub.impl = &in;
+      ok(lc_pouch_state_record_append(
+             &allocator, p->crypto, ps_namespace_snapshot_output(b),
+             ps_namespace_snapshot_leaf(b), &request, &in.pub, 0, &result, &e),
+         &e);
+      lc_pouch_state_entry_cleanup(&allocator, &result);
+      lc_free_with_allocator(&allocator, request.payload_context);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      ps_namespace_snapshot_close(b);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      read_value(p, "snapshot", "key", 65569, 37, 1, &e);
+      ok(p->storage.ops->namespace_open(p->storage.context, "snapshot", 0,
+                                        &handle, &e),
+         &e);
+      ns = handle;
+      ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+      lc_pouch_state_write_options meta = {0};
+      meta.has_metadata = 1;
+      meta.metadata = (const unsigned char *)"snapshot metadata";
+      meta.metadata_length = 17;
+      ok(lc_pouch_state_update_metadata(p, "snapshot", "key", &meta, &w, &e),
+         &e);
+      REQUIRE(w.version == 1 && w.index_seq == 2);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      read_value(p, "snapshot", "key", 65569, 37, 1, &e);
+      lc_pouch_state_read_result r = {0};
+      ok(lc_pouch_state_read_metadata(p, "snapshot", "key", &r, &e), &e);
+      REQUIRE(r.metadata_length == 17 &&
+              !memcmp(r.metadata, "snapshot metadata", 17));
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      in = source(31, 71);
+      ok(put(p, "snapshot", "key", &in, NULL, &w, &e), &e);
+      REQUIRE(w.version == 2 && w.index_seq == 3);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      read_value(p, "snapshot", "key", 31, 71, 2, &e);
+      ok(p->storage.ops->namespace_open(p->storage.context, "snapshot", 0,
+                                        &handle, &e),
+         &e);
+      ps_namespace_status status;
+      ok(ps_namespace_status_get(handle, &status, &e), &e);
+      REQUIRE(status.snapshot && status.snapshot_boundary == 1 &&
+              status.segments >= 1);
+      p->storage.ops->namespace_close(p->storage.context, handle);
+      one_file(directory);
+      lc_pouch_close(p);
+      REQUIRE(live == 0 && unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -1962,6 +2047,8 @@ static void *worker(void *context) {
     read_faults(r->path, 1);
   else if (!strcmp(r->mode, "read-concurrency"))
     read_concurrency(r->path, r->directory);
+  else if (!strcmp(r->mode, "snapshots"))
+    snapshots(r->path, r->directory);
   else
     REQUIRE(0);
   return NULL;

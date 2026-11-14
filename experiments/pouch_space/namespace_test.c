@@ -195,7 +195,8 @@ static void lifecycle(const char *path, const char *key) {
     ok(put(root, ns, 1, 0, sizeof(body), NULL, &segment, &result, &e), &e);
     REQUIRE(segment == 1);
     ps_namespace_window *window = NULL;
-    ok(ps_namespace_read_open(ns, segment, result.payload_span.payload_offset,
+    ok(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, segment,
+                              result.payload_span.payload_offset,
                               result.cipher_bytes, &window, &e),
        &e);
     ps_namespace_view *view = NULL;
@@ -281,7 +282,7 @@ static void lifecycle(const char *path, const char *key) {
 }
 typedef struct model {
   unsigned char *live, *stable;
-  size_t calls, fail;
+  size_t calls, fail, reads;
   int torn;
   gate *head_gate;
   int head_fail;
@@ -289,6 +290,7 @@ typedef struct model {
 static int io_fail(model *m) { return ++m->calls == m->fail; }
 static ssize_t rd(void *p, int fd, void *bytes, size_t n, off_t at) {
   model *m = p;
+  ++m->reads;
   if (io_fail(m)) {
     errno = EIO;
     return -1;
@@ -611,14 +613,16 @@ static void validation(const char *path) {
   invalid_namespace(path, &e);
   raw_head(path, key, valid, sizeof(valid), &e);
   /* Missing/interpreted-as-path/stale-owner bindings never become segments. */
-  for (int bad = 0; bad < 3; ++bad) {
+  for (int bad = 0; bad < 5; ++bad) {
     ps_space *space = NULL;
     ps_catalog_info original, inserted;
     ps_catalog_view *view = NULL;
     const char *first = "seg-00000000000000000001.log";
     const char *name = bad == 0   ? ""
                        : bad == 1 ? "active"
-                                  : "seg-00000000000000000002.log";
+                       : bad == 2 ? "seg-00000000000000000002.log"
+                       : bad == 3 ? "seg-1.log"
+                                  : "seg-000000000000000000001.log";
     ok(ps_open(path, 0, NULL, &space, &e), &e);
     ok(ps_catalog_get(space, identity.owner, PS_CATALOG_SEGMENT, first,
                       strlen(first), &view, &e),
@@ -626,6 +630,10 @@ static void validation(const char *path) {
     REQUIRE(view != NULL);
     ok(ps_catalog_view_info(view, &original, &e), &e);
     ps_catalog_view_close(view);
+    if (bad >= 3)
+      ok(ps_catalog_remove(space, identity.owner, PS_CATALOG_SEGMENT, first,
+                           strlen(first), &original.revision, &e),
+         &e);
     ok(ps_catalog_put(space, identity.owner, PS_CATALOG_SEGMENT, name,
                       strlen(name), NULL, original.stream, &original.target,
                       &inserted, &e),
@@ -636,6 +644,11 @@ static void validation(const char *path) {
     ok(ps_catalog_remove(space, identity.owner, PS_CATALOG_SEGMENT, name,
                          strlen(name), &inserted.revision, &e),
        &e);
+    if (bad >= 3)
+      ok(ps_catalog_put(space, identity.owner, PS_CATALOG_SEGMENT, first,
+                        strlen(first), NULL, original.stream, &original.target,
+                        &inserted, &e),
+         &e);
     ok(ps_close(space, &e), &e);
   }
   ok(ps_root_open(path, 0, NULL, &root, &e), &e);
@@ -932,8 +945,8 @@ static void reservation(const char *path) {
     stable = ps_namespace_append_leaf(reserved);
     ok(ps_namespace_status_get(ns, &after, &e), &e);
     REQUIRE(after.active_segment == 1 && after.tail > 0);
-    REQUIRE(ps_namespace_read_open(ns, 2, 0, 1, &rejected, &e) ==
-                LC_ERR_INVALID &&
+    REQUIRE(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 2, 0, 1, &rejected,
+                                   &e) == LC_ERR_INVALID &&
             !rejected);
     clear(&e);
     count(ns, 2, &e);
@@ -1323,6 +1336,518 @@ static void publication(const char *path) {
       lc_error_cleanup(&e);
     }
 }
+static int snapshot_record_gated(ps_root *root, ps_namespace_snapshot *snapshot,
+                                 size_t version, size_t bytes, gate *g,
+                                 lc_error *e) {
+  lc_pouch_state_entry request = {0}, result = {0};
+  input source = {0};
+  source.pub.impl = &source;
+  source.pub.read = pull;
+  source.bytes = bytes;
+  source.gate = g;
+  request.key = "key";
+  request.content_type = "application/test";
+  request.payload_context = "namespace-test";
+  request.version = request.index_seq = version;
+  request.record_type = 1;
+  int rc = lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
+                                        ps_namespace_snapshot_output(snapshot),
+                                        ps_namespace_snapshot_leaf(snapshot),
+                                        &request, &source.pub, 0, &result, e);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
+  return rc;
+}
+static int snapshot_record(ps_root *root, ps_namespace_snapshot *snapshot,
+                           size_t version, size_t bytes, lc_error *e) {
+  return snapshot_record_gated(root, snapshot, version, bytes, NULL, e);
+}
+typedef struct snapshot_job {
+  ps_root *root;
+  ps_namespace_snapshot *snapshot;
+  gate *gate;
+} snapshot_job;
+static void *snapshot_producer(void *context) {
+  snapshot_job *job = context;
+  lc_error e;
+  lc_error_init(&e);
+  ok(snapshot_record_gated(job->root, job->snapshot, 1, sizeof(body), job->gate,
+                           &e),
+     &e);
+  ok(ps_namespace_snapshot_commit(job->snapshot, &e), &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void snapshot_concurrency(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int durable = 0; durable < 2; ++durable) {
+    ps_root_options o = {0};
+    o.storage.durable_sync = durable;
+    ps_root *root = NULL;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "test", 1, &e);
+    ps_namespace *peer = acquire(root, "peer", 1, &e);
+    ok(append(root, ns, 1, 0, sizeof(body), &e), &e);
+    ps_namespace_snapshot *b = NULL;
+    ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+    gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+    snapshot_job job = {root, b, &g};
+    pthread_t thread;
+    REQUIRE(pthread_create(&thread, NULL, snapshot_producer, &job) == 0);
+    pthread_mutex_lock(&g.mutex);
+    while (!g.entered)
+      pthread_cond_wait(&g.changed, &g.mutex);
+    pthread_mutex_unlock(&g.mutex);
+    ok(append(root, ns, 2, 0, 37, &e), &e);
+    ok(append(root, peer, 1, 0, 17, &e), &e);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    count(ns, 2, &e);
+    count(peer, 1, &e);
+    records captured = {0};
+    ok(ps_namespace_view_visit(ps_namespace_snapshot_view(b), 1, visit,
+                               &captured, &e),
+       &e);
+    REQUIRE(captured.count == 1 && captured.version == 1);
+    pthread_mutex_lock(&g.mutex);
+    g.released = 1;
+    pthread_cond_broadcast(&g.changed);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(pthread_join(thread, NULL) == 0);
+    ps_namespace_snapshot_close(b);
+    count(ns, 2, &e);
+    ps_namespace_release(ns);
+    ps_namespace_release(peer);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "test", 0, &e);
+    count(ns, 2, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    pthread_cond_destroy(&g.changed);
+    pthread_mutex_destroy(&g.mutex);
+  }
+  lc_error_cleanup(&e);
+}
+static void snapshots(const char *path, const char *key) {
+  lc_error e;
+  lc_error_init(&e);
+  unsigned int kind;
+  uint64_t id;
+  REQUIRE(ps_namespace_parse_source_leaf("seg-00000000000000000001.log", &kind,
+                                         &id));
+  REQUIRE(kind == PS_CATALOG_SEGMENT && id == 1);
+  REQUIRE(ps_namespace_parse_source_leaf("snapshot-18446744073709551615.log",
+                                         &kind, &id));
+  REQUIRE(kind == PS_CATALOG_SNAPSHOT && id == UINT64_MAX);
+  const char *invalid[] = {NULL,
+                           "",
+                           "seg-1.log",
+                           "seg-000000000000000000001.log",
+                           "snapshot-00000000000000000000.log",
+                           "snapshot-18446744073709551616.log",
+                           "snapshot-0000000000000000000a.log",
+                           "snapshot-1.log",
+                           "snapshot-00000000000000000001.bad"};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i)
+    REQUIRE(!ps_namespace_parse_source_leaf(invalid[i], &kind, &id));
+  for (int mode = 0; mode < 4; ++mode)
+    for (int durable = 0; durable < 2; ++durable) {
+      ps_root_options options = {0};
+      options.storage.durable_sync = durable;
+      options.crypto.key_string = mode & 1 ? key : NULL;
+      options.crypto.compression_enabled = (mode & 2) != 0;
+      ps_root *root = NULL;
+      ok(ps_root_open(path, 1, &options, &root, &e), &e);
+      ps_namespace *ns = acquire(root, "test", 1, &e);
+      ps_namespace_snapshot *b = NULL, *rejected = NULL;
+      REQUIRE(ps_namespace_snapshot_begin(ns, &b, &e) == LC_ERR_INVALID && !b);
+      clear(&e);
+      lc_pouch_state_entry record = {0};
+      ok(put(root, ns, 1, 0, 31, NULL, NULL, &record, &e), &e);
+      ps_namespace_window *pin = NULL;
+      ok(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 1,
+                                record.payload_span.payload_offset,
+                                record.cipher_bytes, &pin, &e),
+         &e);
+      unsigned char before[128], after[128];
+      struct iovec part = {before, (size_t)record.cipher_bytes};
+      REQUIRE(part.iov_len <= sizeof(before));
+      ok(lc_pouch_record_io_read(ps_namespace_read_input(pin),
+                                 record.payload_span.payload_offset, &part, 1,
+                                 &e),
+         &e);
+      ps_namespace_view *old = NULL;
+      ok(ps_namespace_view_open(ns, &old, &e), &e);
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      REQUIRE(ps_namespace_snapshot_boundary(b) == 1);
+      records prefix = {0};
+      ok(ps_namespace_view_visit(ps_namespace_snapshot_view(b), 1, visit,
+                                 &prefix, &e),
+         &e);
+      REQUIRE(prefix.count == 1 && prefix.version == 1);
+      REQUIRE(ps_namespace_snapshot_begin(ns, &rejected, &e) ==
+                  LC_ERR_INVALID &&
+              !rejected);
+      clear(&e);
+      ok(append(root, ns, 2, 1, 17, &e), &e);
+      ok(append(root, ns, 3, 1, 23, &e), &e);
+      ok(snapshot_record(root, b, 1, 31, &e), &e);
+      ps_namespace_append *busy = NULL;
+      ok(ps_namespace_append_begin(ns, 0, 0, &busy, &e), &e);
+      REQUIRE(ps_namespace_snapshot_commit(b, &e) == LC_ERR_INVALID);
+      clear(&e);
+      ps_namespace_append_close(busy);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      const char *stable = ps_namespace_snapshot_leaf(b);
+      REQUIRE(ps_namespace_parse_source_leaf(stable, &kind, &id));
+      uint64_t first = id;
+      /* A valid snapshot from another namespace cannot be rebound here. Its
+       * physical key binds both the globally unique build and namespace. */
+      ps_namespace *foreign = acquire(root, "foreign", 1, &e);
+      ps_namespace_info own_identity, foreign_identity;
+      ok(ps_namespace_identity(ns, &own_identity, &e), &e);
+      ok(ps_namespace_identity(foreign, &foreign_identity, &e), &e);
+      ps_catalog_view *snapshot_binding = NULL;
+      ps_catalog_info own_binding, foreign_binding;
+      ok(ps_catalog_get(ps_root_space(root), own_identity.owner,
+                        PS_CATALOG_SNAPSHOT, stable, strlen(stable),
+                        &snapshot_binding, &e),
+         &e);
+      REQUIRE(snapshot_binding != NULL);
+      ok(ps_catalog_view_info(snapshot_binding, &own_binding, &e), &e);
+      ps_catalog_view_close(snapshot_binding);
+      ok(ps_catalog_put(ps_root_space(root), foreign_identity.owner,
+                        PS_CATALOG_SNAPSHOT, stable, strlen(stable), NULL,
+                        own_binding.stream, &own_binding.target,
+                        &foreign_binding, &e),
+         &e);
+      ps_namespace_status foreign_status;
+      REQUIRE(ps_namespace_status_get(foreign, &foreign_status, &e) ==
+              LC_ERR_PROTOCOL);
+      clear(&e);
+      ok(ps_catalog_remove(ps_root_space(root), foreign_identity.owner,
+                           PS_CATALOG_SNAPSHOT, stable, strlen(stable),
+                           &foreign_binding.revision, &e),
+         &e);
+      ok(ps_namespace_status_get(foreign, &foreign_status, &e), &e);
+      REQUIRE(!foreign_status.active_segment && !foreign_status.snapshot);
+      ps_namespace_release(foreign);
+      ps_namespace_status status;
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(status.snapshot == first && status.snapshot_boundary == 1 &&
+              status.active_segment == 3 && status.segments == 2 &&
+              status.bound_segments == 3 && status.bound_snapshots == 1);
+      REQUIRE(ps_namespace_snapshot_commit(b, &e) == LC_ERR_INVALID);
+      clear(&e);
+      count(ns, 3, &e);
+      records previous = {0};
+      ok(ps_namespace_view_visit(old, 1, visit, &previous, &e), &e);
+      REQUIRE(previous.count == 1);
+      REQUIRE(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 2, &e) ==
+              LC_ERR_INVALID);
+      clear(&e);
+      REQUIRE(ps_namespace_reclaim(ns, PS_CATALOG_SNAPSHOT, first, &e) ==
+              LC_ERR_INVALID);
+      clear(&e);
+      ps_namespace_info identity;
+      ok(ps_namespace_identity(ns, &identity, &e), &e);
+      ps_catalog_view *binding_pin = NULL;
+      const char *segment_leaf = "seg-00000000000000000001.log";
+      ok(ps_catalog_get(ps_root_space(root), identity.owner, PS_CATALOG_SEGMENT,
+                        segment_leaf, strlen(segment_leaf), &binding_pin, &e),
+         &e);
+      REQUIRE(binding_pin != NULL);
+      ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+      ps_namespace_window *missing = NULL;
+      REQUIRE(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 1, 0, 1, &missing,
+                                     &e) == LC_ERR_INVALID &&
+              !missing);
+      clear(&e);
+      ok(ps_checkpoint(ps_root_space(root), &e), &e);
+      part.iov_base = after;
+      ok(lc_pouch_record_io_read(ps_namespace_read_input(pin),
+                                 record.payload_span.payload_offset, &part, 1,
+                                 &e),
+         &e);
+      REQUIRE(!memcmp(before, after, part.iov_len));
+      ps_namespace_snapshot_close(b);
+      b = NULL;
+      ps_namespace_view_close(old);
+      ps_namespace_read_retain(pin);
+      ps_namespace_read_close(pin);
+      uint64_t closed, pending;
+      ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+      REQUIRE(!closed && pending == 1);
+      ps_namespace_read_close(pin);
+      ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+      REQUIRE(!closed && pending == 1);
+      ps_catalog_view_close(binding_pin);
+      ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+      REQUIRE(closed == 1 && !pending);
+      lc_pouch_state_entry_cleanup(&allocator, &record);
+      ps_namespace_window *snapshot_pin = NULL;
+      ok(ps_namespace_read_open(ns, PS_CATALOG_SNAPSHOT, first, 0, 8,
+                                &snapshot_pin, &e),
+         &e);
+      part.iov_base = before;
+      part.iov_len = 8;
+      ok(lc_pouch_record_io_read(ps_namespace_read_input(snapshot_pin), 0,
+                                 &part, 1, &e),
+         &e);
+      ok(append(root, ns, 4, 1, 29, &e), &e);
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      REQUIRE(ps_namespace_snapshot_boundary(b) == 4);
+      ok(snapshot_record(root, b, 4, 29, &e), &e);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      ps_namespace_snapshot_close(b);
+      b = NULL;
+      ps_namespace_window *historical = NULL;
+      ok(ps_namespace_read_open(ns, PS_CATALOG_SNAPSHOT, first, 0, 8,
+                                &historical, &e),
+         &e);
+      ps_namespace_read_close(historical);
+      ok(ps_namespace_reclaim(ns, PS_CATALOG_SNAPSHOT, first, &e), &e);
+      ok(ps_checkpoint(ps_root_space(root), &e), &e);
+      part.iov_base = after;
+      ok(lc_pouch_record_io_read(ps_namespace_read_input(snapshot_pin), 0,
+                                 &part, 1, &e),
+         &e);
+      REQUIRE(!memcmp(before, after, 8));
+      REQUIRE(ps_namespace_parse_source_leaf(stable, &kind, &id) &&
+              id == first);
+      for (uint64_t segment = 2; segment <= 4; ++segment)
+        ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, segment, &e), &e);
+      ps_namespace_read_close(snapshot_pin);
+      ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+      REQUIRE(closed == 1 && !pending);
+      REQUIRE(ps_namespace_parse_source_leaf(stable, &kind, &id) &&
+              id == first);
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(status.active_segment == 5 && status.segments == 1 &&
+              status.snapshot_boundary == 4 && status.bound_segments == 1 &&
+              status.bound_snapshots == 1 && !status.pending_retirements);
+      count(ns, 1, &e);
+      ok(ps_checkpoint(ps_root_space(root), &e), &e);
+      ps_namespace_release(ns);
+      ok(ps_root_close(root, &e), &e);
+      ok(ps_root_open(path, 0, &options, &root, &e), &e);
+      ns = acquire(root, "test", 0, &e);
+      count(ns, 1, &e);
+      ok(append(root, ns, 5, 0, 37, &e), &e);
+      count(ns, 2, &e);
+      /* Closed private builders can be reclaimed without canonical parsing.
+       * Open unbound owners are protected even with no catalog binding. */
+      uint64_t orphan_id;
+      ok(ps_catalog_allocate_id(ps_root_space(root), &orphan_id, &e), &e);
+      ps_key orphan_key = {orphan_id, 1, PS_STREAM};
+      ps_stream *orphan = NULL;
+      ps_stream_writer *writer = NULL;
+      ok(ps_stream_open(ps_root_space(root), orphan_key, 1, NULL, NULL, NULL,
+                        &orphan, &e),
+         &e);
+      ok(ps_stream_begin(orphan, &writer, &e), &e);
+      ok(ps_stream_write(writer, "not a canonical record", 22, &e), &e);
+      ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+      ps_stream_writer_close(writer);
+      ok(ps_root_reclaim_orphans(root, &closed, &pending, &e), &e);
+      REQUIRE(!closed && !pending);
+      ok(ps_stream_close(orphan, &e), &e);
+      ok(ps_root_reclaim_orphans(root, &closed, &pending, &e), &e);
+      REQUIRE(closed == 1 && !pending);
+      ok(ps_root_reclaim_orphans(root, &closed, &pending, &e), &e);
+      REQUIRE(!closed && !pending);
+      ps_namespace_release(ns);
+      ok(ps_root_close(root, &e), &e);
+      REQUIRE(unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
+static void snapshot_churn(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int durable = 0; durable < 2; ++durable) {
+    ps_root_options o = {0};
+    o.storage.initial_capacity = o.storage.maximum_capacity =
+        PS_DEFAULT_CAPACITY;
+    o.storage.durable_sync = durable;
+    ps_root *root = NULL;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "test", 1, &e);
+    uint64_t previous = 0, written = 0;
+    for (size_t version = 1; version <= 192; ++version) {
+      /* Reused grants must not pass CRC validation with an older payload. */
+      body[0] = (unsigned char)version;
+      body[1] = (unsigned char)(version >> 8);
+      ok(append(root, ns, version, 0, sizeof(body), &e), &e);
+      ps_namespace_snapshot *b = NULL;
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      uint64_t covered = ps_namespace_snapshot_boundary(b);
+      ok(snapshot_record(root, b, version, sizeof(body), &e), &e);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      ps_namespace_snapshot_close(b);
+      written += 2 * sizeof(body);
+      if (previous)
+        ok(ps_namespace_reclaim(ns, PS_CATALOG_SNAPSHOT, previous, &e), &e);
+      ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, covered, &e), &e);
+      ok(ps_checkpoint(ps_root_space(root), &e), &e);
+      ps_namespace_status status;
+      ps_stats physical;
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(status.bound_segments == 1 && status.bound_snapshots == 1 &&
+              !status.pending_retirements && status.segments == 1);
+      previous = status.snapshot;
+      ok(ps_status(ps_root_space(root), &physical, &e), &e);
+      REQUIRE(physical.capacity == PS_DEFAULT_CAPACITY &&
+              physical.allocated_bytes < PS_MIB);
+      records current = {0};
+      ok(capture(ns, &current, &e), &e);
+      REQUIRE(current.count == 1 && current.version == version);
+      if (!(version % 16)) {
+        ps_namespace_release(ns);
+        ok(ps_root_close(root, &e), &e);
+        ok(ps_root_open(path, 0, &o, &root, &e), &e);
+        ns = acquire(root, "test", 0, &e);
+        records recovered = {0};
+        ok(capture(ns, &recovered, &e), &e);
+        REQUIRE(recovered.count == 1 && recovered.version == version);
+      }
+    }
+    REQUIRE(written > 2 * PS_DEFAULT_CAPACITY);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+static void snapshot_fault_cases(const char *path, int previous) {
+  model m = {0};
+  m.live = malloc(PS_MIB);
+  m.stable = malloc(PS_MIB);
+  REQUIRE(m.live && m.stable);
+  ps_io io = {&m, rd, wr, sync_file, reserve, NULL};
+  ps_root_options options = {0};
+  options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
+  options.storage.io = &io;
+  lc_error e;
+  lc_error_init(&e);
+  size_t cases = 0;
+  size_t latest = previous ? 2 : 1;
+  for (int durable = 0; durable < 2; ++durable)
+    for (int kind = 0; kind < 4; ++kind)
+      for (int phase = 0; phase < 5; ++phase) {
+        size_t operations = 0;
+        for (size_t at = 0; at <= operations; ++at) {
+          memset(m.live, 0, PS_MIB);
+          memset(m.stable, 0, PS_MIB);
+          m.calls = m.fail = 0;
+          m.torn = kind >= 2 ? kind : 0;
+          options.storage.durable_sync = durable;
+          ps_root *root = NULL;
+          ok(ps_root_open(path, 1, &options, &root, &e), &e);
+          ps_namespace *ns = acquire(root, "test", 1, &e);
+          ok(append(root, ns, 1, 0, 31, &e), &e);
+          ps_namespace_snapshot *b = NULL;
+          if (previous) {
+            ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+            ok(snapshot_record(root, b, 1, 31, &e), &e);
+            ok(ps_namespace_snapshot_commit(b, &e), &e);
+            ps_namespace_snapshot_close(b);
+            b = NULL;
+            ok(append(root, ns, latest, 0, 31, &e), &e);
+          }
+          ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          if (phase && phase < 4) {
+            ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+            if (phase >= 2)
+              ok(snapshot_record(root, b, latest, 31, &e), &e);
+            if (phase == 3) {
+              ok(ps_namespace_snapshot_commit(b, &e), &e);
+              ps_namespace_snapshot_close(b);
+              b = NULL;
+            }
+          }
+          if (phase == 4) {
+            uint64_t id;
+            ok(ps_catalog_allocate_id(ps_root_space(root), &id, &e), &e);
+            ps_key key = {id, 1, PS_STREAM};
+            ps_stream *orphan = NULL;
+            ps_stream_writer *writer = NULL;
+            ok(ps_stream_open(ps_root_space(root), key, 1, NULL, NULL, NULL,
+                              &orphan, &e),
+               &e);
+            ok(ps_stream_begin(orphan, &writer, &e), &e);
+            ok(ps_stream_write(writer, body, 31, &e), &e);
+            ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+            ps_stream_writer_close(writer);
+            ok(ps_stream_close(orphan, &e), &e);
+          }
+          m.calls = allocation = 0;
+          if (kind == 1)
+            fail_allocation = at ? at : SIZE_MAX;
+          else
+            m.fail = at;
+          uint64_t reclaimed, skipped;
+          size_t reads = m.reads;
+          int rc =
+              phase == 0   ? ps_namespace_snapshot_begin(ns, &b, &e)
+              : phase == 1 ? snapshot_record(root, b, latest, 31, &e)
+              : phase == 2 ? ps_namespace_snapshot_commit(b, &e)
+              : phase == 3
+                  ? ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, latest, &e)
+                  : ps_root_reclaim_orphans(root, &reclaimed, &skipped, &e);
+          if (phase == 4)
+            REQUIRE(m.reads == reads);
+          if (!at)
+            operations = kind == 1 ? allocation : m.calls;
+          m.fail = fail_allocation = 0;
+          REQUIRE(at ? rc != LC_OK : rc == LC_OK);
+          ++cases;
+          clear(&e);
+          ps_namespace_snapshot_close(b);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          crash(&m, path);
+          ok(ps_root_open(path, 0, &options, &root, &e), &e);
+          ns = acquire(root, "test", 0, &e);
+          records recovered = {0};
+          ok(capture(ns, &recovered, &e), &e);
+          REQUIRE(recovered.version == latest && recovered.count >= 1 &&
+                  recovered.count <= latest);
+          ps_namespace_status status;
+          ok(ps_namespace_status_get(ns, &status, &e), &e);
+          if (phase == 2 && !at)
+            REQUIRE(status.snapshot && status.snapshot_boundary == latest);
+          if (phase == 3)
+            REQUIRE(status.snapshot && status.snapshot_boundary == latest);
+          uint64_t retained = (previous ? 1U : 0U) +
+                              (status.snapshot_boundary == latest ? 1U : 0U);
+          /* A fresh higher ID must never make a failed staged snapshot live. */
+          ok(append(root, ns, latest + 1, 1, 17, &e), &e);
+          ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+          ok(snapshot_record(root, b, latest + 1, 17, &e), &e);
+          ok(ps_namespace_snapshot_commit(b, &e), &e);
+          ps_namespace_snapshot_close(b);
+          count(ns, 1, &e);
+          ok(ps_namespace_status_get(ns, &status, &e), &e);
+          REQUIRE(status.bound_snapshots == retained + 1);
+          ok(ps_root_reclaim_orphans(root, &reclaimed, &skipped, &e), &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          REQUIRE(unlink(path) == 0);
+        }
+      }
+  printf(
+      "snapshot publication/reclamation fault cases (prior snapshot %d): %lu\n",
+      previous, (unsigned long)cases);
+  free(m.live);
+  free(m.stable);
+  lc_error_cleanup(&e);
+}
+static void snapshot_faults(const char *path) {
+  snapshot_fault_cases(path, 0);
+  snapshot_fault_cases(path, 1);
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -1338,6 +1863,14 @@ static void *worker(void *p) {
     reservation(r->path);
   else if (!strcmp(r->mode, "publication"))
     publication(r->path);
+  else if (!strcmp(r->mode, "snapshots"))
+    snapshots(r->path, r->key);
+  else if (!strcmp(r->mode, "snapshot-faults"))
+    snapshot_faults(r->path);
+  else if (!strcmp(r->mode, "snapshot-concurrency"))
+    snapshot_concurrency(r->path);
+  else if (!strcmp(r->mode, "snapshot-churn"))
+    snapshot_churn(r->path);
   else
     concurrency(r->path);
   return NULL;

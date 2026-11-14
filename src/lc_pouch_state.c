@@ -13185,7 +13185,7 @@ static int lc_pouch_state_storage_append_open(
   manifest->active_segment = leaf ? leaf : (char *)append->leaf;
   manifest->borrowed = leaf == NULL;
   manifest->active_segment_id = manifest->max_segment_id = append->segment;
-  manifest->segment_count = (unsigned long)append->segment;
+  manifest->segment_count = (unsigned long)append->segments;
   manifest->state_max_version = cache->max_version;
   *start = append->start;
   return LC_OK;
@@ -13201,7 +13201,7 @@ static void lc_pouch_state_storage_append_publish(
     manifest->borrowed = 1;
   }
   cache->active_segment_id = cache->max_segment_id = append->segment;
-  cache->segment_count = (unsigned long)append->segment;
+  cache->segment_count = (unsigned long)append->segments;
   cache->active_segment_offset = tail;
 }
 

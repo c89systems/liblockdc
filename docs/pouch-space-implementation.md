@@ -194,7 +194,8 @@ joined to the container before the public Pouch cutover.
 `ps_namespace` now caches its canonical segment owner under the real root.
 The namespace has no segment/head until its first append or explicit rotation.
 A 128-byte `PS_ROUTING` head identifies the namespace owner, active segment,
-rotation epoch and canonical record width, with checked reserved bytes and CRC.
+rotation epoch, canonical record width, selected snapshot and covered segment
+boundary, with checked reserved bytes and CRC.
 Typed segment catalog entries hold the growing segment set and exact stream
 incarnations. Numeric segment labels remain canonical metadata, never files.
 No growing manifest value or per-record head publication is introduced.
@@ -229,9 +230,10 @@ owner. This is span reservation, not an atomic budget for the whole operation.
 
 Logical append manifests remain private until physical publication succeeds.
 Their segment labels remain stable while the namespace capability is held,
-including across segment-array growth and projection invalidation. This direct
-prototype cutover changes the namespace head's typed key from CONTROL to ROUTING;
-its 128-byte payload is unchanged. There is no legacy reader or migration.
+including across source-directory growth, retirement and projection invalidation.
+The prototype uses ROUTING for the namespace head. Its width remains 128 bytes;
+snapshot identity and covered boundary occupy previously reserved fields. There
+is no legacy reader or migration.
 
 One producer/rotation owns a namespace at a time; contention is explicit. Producer
 callbacks hold neither registry nor namespace mutexes. Other namespaces and
@@ -250,10 +252,70 @@ the view reusable. Namespace/window/append pins protect root lifetime. Root clos
 releases cached segment owners without an implicit NoSync barrier; after a raw
 child rejects close, the cached owners can be reconstructed.
 
-This is segment storage and canonical replay, not complete public namespace
-policy. Snapshot installation, obsolete ownership/reclamation, public collection
-ownership and process-shared coordination remain required. Normal
+This is typed source storage and canonical replay, not complete public namespace
+policy. Logical compaction, public collection ownership and process-shared
+coordination remain required. Normal
 `lc_pouch_open` still opens multifile roots; there is no deployment cutover.
+
+## Namespace snapshot and obsolete ownership
+
+The namespace head stores its selected snapshot ID at byte 40 and its covered
+logical segment boundary at byte 48. Both are zero or both positive; a selected
+snapshot must cover a boundary strictly below the active segment. Bytes 56–119
+remain reserved, with the existing CRC at byte 120. Snapshot IDs come from the
+durably reserved global incarnation allocator. Their stream keys bind the build
+ID as owner and namespace ID as key, preventing a foreign namespace from
+adopting an otherwise valid snapshot binding. Canonical
+`snapshot-<20 decimal digits>.log` labels are catalog metadata, never files.
+
+Snapshot begin finishes any pending predecessor seal and rotates a nonempty
+active segment. It captures the selected snapshot plus sealed prefix, including
+an immutable empty window for the new active segment. An already empty active
+segment needs no extra rotation. Empty or unadvanced prefixes are rejected.
+One builder owns this capture; ordinary appends and other namespaces continue
+while its producer writes canonical records directly through bounded record I/O.
+The logical caller supplies a complete projection, high-water marks, tombstones
+and any required history or body references.
+
+Commit reacquires namespace mutation authority, checks the captured base,
+completes and seals the private stream, and publishes its typed catalog binding
+before selecting it in the namespace head. Head selection waits for durability
+under both root policies. Newer appended segments remain the replay tail.
+There is no fallible reclamation after successful selection. Before a higher
+snapshot ID can be selected, any bindings left by earlier unpublished builds
+are durably removed. This ensures that a retained lower ID identifies a
+previously selected snapshot, including after interrupted publication.
+
+Replay reads only the selected snapshot, reported with callback segment zero,
+then the dense segment tail above its covered boundary. A sorted source index
+supports reclaimed gaps without allocating slots for every historical numeric
+ID. Older bound segments and snapshots remain available for body references.
+The internal append result reports live replay-segment count separately from
+active segment identity. Interned labels retain their existing namespace-owner
+lifetime; closing obsolete stream owners does not invalidate a borrowed label.
+Private unbound snapshot labels last only until builder close.
+
+Explicit reclamation accepts only covered segments or older snapshots. The
+logical caller must first prove that current records, links and history no
+longer need the source; a covered boundary alone does not prove that. Catalog
+removal is durable before stream retirement. New namespace read admission then
+fails, while captured windows and their clones retain the old bytes. Reap
+defers retirement for catalog views and closes retired owners only after read
+pins drain. Physical reuse still waits for checkpoint retirement. Source
+objects follow bound or pending resources; the retained label pool is separate.
+
+Root orphan reclamation is also explicit. It captures closed, unbound stream
+incarnations, rechecks ownership before retirement, and skips candidates claimed
+concurrently. It opens no canonical reader and reads no bodies, so incomplete
+private builds left by process death need no application-record recovery.
+No persistent sidecar or second payload log is introduced.
+
+These are physical publication and reclamation capabilities. The production
+state harness can reopen and mutate values stored in a selected snapshot, but
+automatic logical compaction, projection invalidation, history protection,
+retention scheduling and complete maintenance-capacity budgets remain required.
+The fixed-capacity churn proof uses a caller-supplied complete one-key snapshot;
+it does not establish full-store maintenance admission.
 
 ## Production state integration
 
@@ -342,7 +404,7 @@ State staged/lease publication requests and staged decision replay return
 unsupported. Other Pouch APIs are outside this harness's current call contract.
 Prepared/namespace mutation APIs, public query-client ownership, collections,
 queues, XA, indexes,
-snapshot/obsolete ownership, maintenance and shared-root operation remain
+logical snapshot/obsolete policy, maintenance and shared-root operation remain
 integration work. This is a verified ordinary-state slice, not full backend
 acceptance or deployment authorization.
 
@@ -379,7 +441,7 @@ Namespace heads, segment ownership/rotation and bounded canonical replay now use
 this owner too. The private ordinary-state harness now uses the production
 projection, ordinary mutation policy, read-many, visits and paged scan/body
 snapshots. Advanced mutation paths, public query-client ownership,
-snapshot/obsolete sets and public collection ownership still require
+logical snapshot/obsolete policy and public collection ownership still require
 integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
@@ -429,8 +491,8 @@ write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
 This is partial integration, not root-wide adoption. Collection owners, advanced
-namespace mutation policy, public query-client ownership, snapshot/obsolete
-ownership, position/receipt
+namespace mutation policy, public query-client ownership, logical snapshot/obsolete
+policy, position/receipt
 authority and remaining control/projection owners still need conversion to
 container ownership. Normal public Pouch tests continue to
 exercise the segmented backend through the shared record I/O boundary.

@@ -1,6 +1,6 @@
-#include "namespace.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_namespace.h"
+#include "namespace_internal.h"
 #include "record_io.h"
 #include "root_internal.h"
 #include <stdlib.h>
@@ -8,23 +8,7 @@
 #include <zlib.h>
 
 #define NS_HEAD_BYTES 128U
-#define NS_LEAF_BYTES 29U
-typedef struct segment {
-  uint64_t id;
-  char *leaf; /* Interned for the lifetime of this namespace storage owner. */
-  ps_catalog_info binding;
-  ps_stream *stream;
-  int unselected;
-} segment;
-struct ps_namespace_data {
-  ps_namespace *ns;
-  pthread_mutex_t mutex;
-  segment *items;
-  size_t count, capacity, pending_seal;
-  uint64_t active, tail;
-  int busy;
-  int retention_loaded, retention_present;
-};
+typedef ps_ns_resource segment;
 struct ps_namespace_append {
   ps_namespace *ns;
   struct ps_namespace_data *data;
@@ -39,7 +23,7 @@ struct ps_namespace_window {
 };
 typedef struct captured {
   uint64_t id, tail;
-  char leaf[NS_LEAF_BYTES];
+  char leaf[PS_NS_LEAF_BYTES];
   ps_stream_window *reader;
 } captured;
 struct ps_namespace_view {
@@ -96,14 +80,20 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
       get64(bytes + 120) != (uint64_t)crc32(0L, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "namespace head identity or checksum is invalid");
-  for (i = 40; i < 120; ++i)
+  d->snapshot_id = get64(bytes + 40);
+  d->snapshot_boundary = get64(bytes + 48);
+  if ((!d->snapshot_id != !d->snapshot_boundary) ||
+      d->snapshot_boundary >= get64(bytes + 16))
+    return failure(e, LC_ERR_PROTOCOL,
+                   "namespace snapshot boundary is invalid");
+  for (i = 56; i < 120; ++i)
     if (bytes[i])
       return failure(e, LC_ERR_PROTOCOL, "namespace head has unknown fields");
   d->active = get64(bytes + 16);
   return LC_OK;
 }
-static int head_write(struct ps_namespace_data *d, uint64_t active,
-                      lc_error *e) {
+int ps_ns_head_write(struct ps_namespace_data *d, uint64_t active,
+                     uint64_t snapshot, uint64_t boundary, lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_writer *writer = NULL;
   int rc;
@@ -113,6 +103,8 @@ static int head_write(struct ps_namespace_data *d, uint64_t active,
   put64(bytes + 16, active);
   put64(bytes + 24, active);
   put64(bytes + 32, LC_POUCH_RECORD_HEADER_BYTES);
+  put64(bytes + 40, snapshot);
+  put64(bytes + 48, boundary);
   put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
   rc = ps_begin(d->ns->root->space, head_key(d->ns), &writer, e);
   if (rc == LC_OK)
@@ -122,50 +114,54 @@ static int head_write(struct ps_namespace_data *d, uint64_t active,
   ps_writer_close(writer);
   return rc;
 }
-static int room(struct ps_namespace_data *d, lc_error *e) {
-  segment *items;
-  size_t capacity = d->capacity ? d->capacity * 2 : 8;
-  if (d->count < d->capacity)
-    return LC_OK;
-  if (capacity < d->capacity || capacity > SIZE_MAX / sizeof(*items))
-    return failure(e, LC_ERR_NOMEM, "namespace segment directory is too large");
-  items = lc_realloc_with_allocator(NULL, d->items, capacity * sizeof(*items));
-  if (!items)
-    return failure(e, LC_ERR_NOMEM, "cannot grow namespace segment directory");
-  d->items = items;
-  d->capacity = capacity;
-  return LC_OK;
-}
-static int collect(void *context, const void *name, size_t length,
-                   const ps_catalog_info *binding, lc_error *e) {
+static int collect_resource(void *context, const void *name, size_t length,
+                            const ps_catalog_info *binding,
+                            unsigned int expected_kind, lc_error *e) {
   struct ps_namespace_data *d = context;
   segment *s;
   uint64_t id;
-  char leaf[NS_LEAF_BYTES];
+  unsigned int kind;
+  char leaf[PS_NS_LEAF_BYTES];
   int rc;
-  if (length != sizeof(leaf) - 1 || memchr(name, 0, length))
+  if (length >= sizeof(leaf) || memchr(name, 0, length))
     return failure(e, LC_ERR_PROTOCOL, "namespace segment label is invalid");
   memcpy(leaf, name, length);
   leaf[length] = 0;
-  if (!lc_pouch_namespace_parse_segment_leaf(leaf, &id) ||
-      binding->stream.kind != PS_STREAM ||
-      binding->stream.owner != d->ns->identity.owner ||
-      binding->stream.key != id)
+  if (!ps_namespace_parse_source_leaf(leaf, &kind, &id) ||
+      kind != expected_kind || binding->stream.kind != PS_STREAM ||
+      binding->stream.owner !=
+          (kind == PS_CATALOG_SEGMENT ? d->ns->identity.owner : id) ||
+      binding->stream.key !=
+          (kind == PS_CATALOG_SEGMENT ? id : d->ns->identity.owner))
     return failure(e, LC_ERR_PROTOCOL, "namespace segment binding is invalid");
-  rc = room(d, e);
+  rc = ps_ns_index_room(d, e);
   if (rc != LC_OK)
     return rc;
-  s = &d->items[d->count++];
-  memset(s, 0, sizeof(*s));
-  s->id = id;
-  s->leaf = lc_strdup_with_allocator(NULL, leaf);
-  if (!s->leaf)
-    return failure(e, LC_ERR_NOMEM, "cannot retain namespace segment label");
+  s = ps_ns_resource_new(kind, id, e);
+  if (!s)
+    return LC_ERR_NOMEM;
+  d->items[d->count++] = s;
+  s->label->next = d->labels;
+  d->labels = s->label;
+  s->pooled = 1;
   s->binding = *binding;
   return LC_OK;
 }
+static int collect_segment(void *context, const void *name, size_t length,
+                           const ps_catalog_info *binding, lc_error *e) {
+  return collect_resource(context, name, length, binding, PS_CATALOG_SEGMENT,
+                          e);
+}
+static int collect_snapshot(void *context, const void *name, size_t length,
+                            const ps_catalog_info *binding, lc_error *e) {
+  return collect_resource(context, name, length, binding, PS_CATALOG_SNAPSHOT,
+                          e);
+}
 static int compare_segment(const void *a, const void *b) {
-  uint64_t x = ((const segment *)a)->id, y = ((const segment *)b)->id;
+  const segment *left = *(segment *const *)a, *right = *(segment *const *)b;
+  uint64_t x = left->id, y = right->id;
+  if (left->kind != right->kind)
+    return left->kind < right->kind ? -1 : 1;
   return x < y ? -1 : x != y;
 }
 static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
@@ -176,6 +172,8 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   unsigned char *scratch = NULL;
   uint64_t cursor = 0, next;
   int rc = LC_OK, found, truncated;
+  if (s->kind == PS_CATALOG_SNAPSHOT)
+    return failure(e, LC_ERR_PROTOCOL, "namespace snapshot is not sealed");
   if (s->unselected) {
     if (checkpoint)
       return failure(e, LC_ERR_PROTOCOL,
@@ -214,11 +212,19 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
 }
 void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   size_t i;
+  segment *r, *next;
+  ps_ns_label *label, *next_label;
   if (!d)
     return;
-  for (i = 0; i < d->count; ++i) {
-    ps_stream_close(d->items[i].stream, NULL);
-    lc_free_with_allocator(NULL, d->items[i].leaf);
+  for (i = 0; i < d->count; ++i)
+    ps_ns_resource_free(d->items[i]);
+  for (r = d->retired; r; r = next) {
+    next = r->next;
+    ps_ns_resource_free(r);
+  }
+  for (label = d->labels; label; label = next_label) {
+    next_label = label->next;
+    lc_free_with_allocator(NULL, label);
   }
   lc_free_with_allocator(NULL, d->items);
   pthread_mutex_destroy(&d->mutex);
@@ -228,6 +234,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_stream_info info;
   size_t i;
+  uint64_t seen = 0;
   int rc;
   d = lc_calloc_with_allocator(NULL, 1, sizeof(*d));
   if (!d)
@@ -240,23 +247,49 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
   rc = head_read(d, e);
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
-                          PS_CATALOG_SEGMENT, collect, d, e);
+                          PS_CATALOG_SEGMENT, collect_segment, d, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
+                          PS_CATALOG_SNAPSHOT, collect_snapshot, d, e);
   if (rc == LC_OK && d->count)
     qsort(d->items, d->count, sizeof(*d->items), compare_segment);
-  if (rc == LC_OK && (d->active > d->count || d->count - (size_t)d->active > 1))
-    rc = failure(e, LC_ERR_PROTOCOL,
-                 "namespace head has missing or unexpected segments");
+  if (rc == LC_OK && d->snapshot_id &&
+      !ps_ns_find(d, PS_CATALOG_SNAPSHOT, d->snapshot_id))
+    rc = failure(e, LC_ERR_PROTOCOL, "namespace selected snapshot is missing");
   for (i = 0; rc == LC_OK && i < d->count; ++i) {
-    segment *s = &d->items[i];
-    if (s->id != (uint64_t)i + 1) {
-      rc = failure(e, LC_ERR_PROTOCOL, "namespace segment directory has a gap");
+    segment *s = d->items[i];
+    if (i && !compare_segment(d->items + i - 1, d->items + i)) {
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "namespace source directory repeats an ID");
       break;
     }
-    s->unselected = s->id > d->active;
+    if (s->kind == PS_CATALOG_SEGMENT) {
+      if (s->id > d->active &&
+          (d->active == UINT64_MAX || s->id != d->active + 1)) {
+        rc = failure(e, LC_ERR_PROTOCOL,
+                     "namespace has an unexpected successor");
+        break;
+      }
+      if (s->id > d->snapshot_boundary && s->id <= d->active) {
+        ++seen;
+        if (s->id != d->snapshot_boundary + seen) {
+          rc = failure(e, LC_ERR_PROTOCOL,
+                       "namespace segment directory has a gap");
+          break;
+        }
+      }
+    }
+    s->unselected =
+        s->id > (s->kind == PS_CATALOG_SEGMENT ? d->active : d->snapshot_id);
     rc = ps_stream_open(ns->root->space, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(s->stream, &info, e);
+    if (s->kind == PS_CATALOG_SNAPSHOT) {
+      if (rc == LC_OK && !info.sealed)
+        rc = failure(e, LC_ERR_PROTOCOL, "namespace snapshot is not sealed");
+      continue;
+    }
     if (rc == LC_OK && s->id > d->active && (info.tail || info.sealed))
       rc = failure(e, LC_ERR_PROTOCOL,
                    "unpublished namespace segment is not empty");
@@ -265,21 +298,23 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
     if (rc == LC_OK && s->id == d->active)
       d->tail = info.tail;
     if (rc == LC_OK && s->id < d->active && !info.sealed) {
-      if (s->id + 1 != d->active)
+      if (s->id <= d->snapshot_boundary || s->id + 1 != d->active)
         rc = failure(e, LC_ERR_PROTOCOL,
                      "namespace has an unexpected unsealed predecessor");
       else
-        d->pending_seal = i + 1;
+        d->pending_seal = s->id;
     }
   }
+  if (rc == LC_OK && seen != d->active - d->snapshot_boundary)
+    rc = failure(e, LC_ERR_PROTOCOL, "namespace head has missing segments");
   if (rc != LC_OK)
     ps_namespace_data_destroy(d);
   else
     *out = d;
   return rc;
 }
-static int data_get(ps_namespace *ns, struct ps_namespace_data **out,
-                    lc_error *e) {
+int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
+                   lc_error *e) {
   struct ps_namespace_data *fresh = NULL;
   ps_root *root;
   int rc;
@@ -315,7 +350,7 @@ static int data_get(ps_namespace *ns, struct ps_namespace_data **out,
   pthread_mutex_unlock(&root->mutex);
   return rc;
 }
-static int enter(struct ps_namespace_data *d, lc_error *e) {
+int ps_ns_enter(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
   pthread_mutex_lock(&d->mutex);
   if (d->busy)
@@ -326,19 +361,20 @@ static int enter(struct ps_namespace_data *d, lc_error *e) {
   pthread_mutex_unlock(&d->mutex);
   return rc;
 }
-static void leave(struct ps_namespace_data *d) {
+void ps_ns_leave(struct ps_namespace_data *d) {
   pthread_mutex_lock(&d->mutex);
   d->busy = 0;
   pthread_mutex_unlock(&d->mutex);
 }
-static int finish_seal(struct ps_namespace_data *d, lc_error *e) {
+int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
   if (d->pending_seal) {
     /* A durable seal must never outlive the routing decision that made its
      * predecessor inactive. NoSync publication can defer this dependency. */
     rc = ps_flush(d->ns->root->space, e);
     if (rc == LC_OK)
-      rc = ps_stream_seal(d->items[d->pending_seal - 1].stream, e);
+      rc = ps_stream_seal(
+          ps_ns_find(d, PS_CATALOG_SEGMENT, d->pending_seal)->stream, e);
     if (rc == LC_OK)
       d->pending_seal = 0;
   }
@@ -348,27 +384,18 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
   segment *s;
   ps_catalog_view *view = NULL;
   ps_stream_info info;
-  char *leaf;
   int rc;
-  if (d->count >= id)
+  if (ps_ns_find(d, PS_CATALOG_SEGMENT, id))
     return LC_OK;
   pthread_mutex_lock(&d->mutex);
-  rc = room(d, e);
+  rc = ps_ns_index_room(d, e);
   pthread_mutex_unlock(&d->mutex);
   if (rc != LC_OK)
     return rc;
-  s = &d->items[d->count];
-  memset(s, 0, sizeof(*s));
-  s->id = id;
+  s = ps_ns_resource_new(PS_CATALOG_SEGMENT, id, e);
+  if (!s)
+    return LC_ERR_NOMEM;
   s->unselected = 1;
-  leaf = lc_pouch_namespace_segment_leaf(NULL, id);
-  if (!leaf)
-    return failure(e, LC_ERR_NOMEM, "cannot allocate namespace segment label");
-  if (strlen(leaf) != NS_LEAF_BYTES - 1) {
-    lc_free_with_allocator(NULL, leaf);
-    return failure(e, LC_ERR_PROTOCOL, "namespace segment label width changed");
-  }
-  s->leaf = leaf;
   rc = ps_catalog_get(d->ns->root->space, d->ns->identity.owner,
                       PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), &view, e);
   if (rc == LC_OK && view)
@@ -405,12 +432,10 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
   ps_catalog_view_close(view);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
-    ++d->count;
+    ps_ns_insert(d, s);
     pthread_mutex_unlock(&d->mutex);
   } else {
-    ps_stream_close(s->stream, NULL);
-    lc_free_with_allocator(NULL, s->leaf);
-    memset(s, 0, sizeof(*s));
+    ps_ns_resource_free(s);
   }
   return rc;
 }
@@ -421,7 +446,7 @@ static int begin_reserve(ps_stream *stream, uint64_t minimum,
     rc = ps_record_reserve(writer, minimum ? minimum : 1, e);
   return rc;
 }
-static int rotate(struct ps_namespace_data *d, lc_error *e) {
+int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
   uint64_t next;
   int rc;
   if (d->active == UINT64_MAX)
@@ -429,17 +454,17 @@ static int rotate(struct ps_namespace_data *d, lc_error *e) {
   next = d->active + 1;
   rc = prepare(d, next, e);
   if (rc == LC_OK)
-    rc = head_write(d, next, e);
+    rc = ps_ns_head_write(d, next, d->snapshot_id, d->snapshot_boundary, e);
   if (rc == LC_OK)
     rc = ps_flush(d->ns->root->space, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
-    d->pending_seal = (size_t)d->active;
+    d->pending_seal = d->active;
     d->active = next;
     d->tail = 0;
-    d->items[(size_t)next - 1].unselected = 0;
+    ps_ns_find(d, PS_CATALOG_SEGMENT, next)->unselected = 0;
     pthread_mutex_unlock(&d->mutex);
-    rc = finish_seal(d, e);
+    rc = ps_ns_finish_seal(d, e);
   }
   return rc;
 }
@@ -491,7 +516,7 @@ int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
   ps_key key = {0, 2, PS_CONTROL};
   unsigned char bytes[32];
   ps_writer *writer = NULL;
-  int rc = data_get(ns, &d, e);
+  int rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
@@ -528,19 +553,35 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
   int rc;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace status requires output");
-  rc = data_get(ns, &d, e);
+  rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
-  out->active_segment = out->segments = d->active;
+  memset(out, 0, sizeof(*out));
+  out->active_segment = d->active;
+  out->segments = d->active - d->snapshot_boundary;
+  out->snapshot = d->snapshot_id;
+  out->snapshot_boundary = d->snapshot_boundary;
   out->tail = out->runs = 0;
-  for (i = 0; rc == LC_OK && i < (size_t)d->active; ++i) {
-    rc = ps_stream_status(d->items[i].stream, &info, e);
+  for (i = 0; rc == LC_OK && i < d->count; ++i) {
+    segment *s = d->items[i];
+    if (s->kind == PS_CATALOG_SEGMENT)
+      ++out->bound_segments;
+    else
+      ++out->bound_snapshots;
+    if (s->unselected)
+      continue;
+    rc = ps_stream_status(s->stream, &info, e);
     if (rc == LC_OK) {
       out->runs += info.runs;
-      if (i + 1 == (size_t)d->active)
+      if (s->kind == PS_CATALOG_SEGMENT && s->id == d->active)
         out->tail = info.tail;
     }
+  }
+  {
+    segment *s;
+    for (s = d->retired; s; s = s->next)
+      ++out->pending_retirements;
   }
   pthread_mutex_unlock(&d->mutex);
   return rc;
@@ -559,18 +600,18 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   if (minimum > (uint64_t)INT64_MAX)
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
-  rc = data_get(ns, &d, e);
+  rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   append = lc_calloc_with_allocator(NULL, 1, sizeof(*append));
   if (!append)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace append");
-  rc = enter(d, e);
+  rc = ps_ns_enter(d, e);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, append);
     return rc;
   }
-  rc = finish_seal(d, e);
+  rc = ps_ns_finish_seal(d, e);
   selected = d->active;
   if (rc == LC_OK) {
     if (!selected || (target && d->tail >= target)) {
@@ -583,14 +624,14 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     }
   }
   if (rc == LC_OK) {
-    segment *s = &d->items[(size_t)selected - 1];
+    segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
     rc = begin_reserve(s->stream, minimum, &append->writer, e);
     append->segment = s->id;
     append->leaf = s->leaf;
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
-    leave(d);
+    ps_ns_leave(d);
     lc_free_with_allocator(NULL, append);
     return rc;
   }
@@ -609,10 +650,15 @@ const char *ps_namespace_append_leaf(const ps_namespace_append *append) {
 uint64_t ps_namespace_append_segment(const ps_namespace_append *append) {
   return append ? append->segment : 0;
 }
+uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
+  return append ? append->segment - append->data->snapshot_boundary : 0;
+}
 static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
   ps_namespace_append *append = context;
   (void)tail;
-  return head_write(append->data, append->segment, e);
+  return ps_ns_head_write(append->data, append->segment,
+                          append->data->snapshot_id,
+                          append->data->snapshot_boundary, e);
 }
 int ps_namespace_append_commit(ps_namespace_append *append, lc_error *e) {
   uint64_t tail;
@@ -628,9 +674,10 @@ int ps_namespace_append_commit(ps_namespace_append *append, lc_error *e) {
   if (rc == LC_OK) {
     pthread_mutex_lock(&append->data->mutex);
     if (selecting) {
-      append->data->pending_seal = (size_t)append->data->active;
+      append->data->pending_seal = append->data->active;
       append->data->active = append->segment;
-      append->data->items[(size_t)append->segment - 1].unselected = 0;
+      ps_ns_find(append->data, PS_CATALOG_SEGMENT, append->segment)
+          ->unselected = 0;
     }
     append->data->tail = tail;
     pthread_mutex_unlock(&append->data->mutex);
@@ -643,54 +690,56 @@ void ps_namespace_append_close(ps_namespace_append *append) {
   if (!append)
     return;
   ps_record_abort(&append->writer);
-  leave(append->data);
+  ps_ns_leave(append->data);
   ps_namespace_release(append->ns);
   lc_free_with_allocator(NULL, append);
 }
 int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   struct ps_namespace_data *d;
-  int rc = data_get(ns, &d, e);
+  int rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
-  rc = enter(d, e);
+  rc = ps_ns_enter(d, e);
   if (rc != LC_OK)
     return rc;
   if (d->active == expected) {
-    rc = finish_seal(d, e);
+    rc = ps_ns_finish_seal(d, e);
     if (rc == LC_OK)
-      rc = rotate(d, e);
+      rc = ps_ns_rotate(d, e);
   } else if (expected != UINT64_MAX && d->active == expected + 1) {
-    rc = finish_seal(d, e);
+    rc = ps_ns_finish_seal(d, e);
   } else {
     rc = failure(e, LC_ERR_INVALID,
                  "namespace rotation expected segment is stale");
   }
-  leave(d);
+  ps_ns_leave(d);
   return rc;
 }
-int ps_namespace_read_open(ps_namespace *ns, uint64_t id, uint64_t offset,
-                           uint64_t bytes, ps_namespace_window **out,
-                           lc_error *e) {
+int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
+                           uint64_t offset, uint64_t bytes,
+                           ps_namespace_window **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_window *window;
+  segment *s;
   int rc;
   if (out)
     *out = NULL;
-  if (!out || !id)
+  if (!out || !id ||
+      (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_SNAPSHOT))
     return failure(e, LC_ERR_INVALID,
                    "namespace read requires segment and output");
-  rc = data_get(ns, &d, e);
+  rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
   if (!window)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace read window");
   pthread_mutex_lock(&d->mutex);
-  if (id > d->active)
+  s = ps_ns_find(d, kind, id);
+  if (!s || s->unselected)
     rc = failure(e, LC_ERR_INVALID, "namespace segment does not exist");
   else
-    rc = ps_stream_window_open(d->items[(size_t)id - 1].stream, offset, bytes,
-                               &window->reader, e);
+    rc = ps_stream_window_open(s->stream, offset, bytes, &window->reader, e);
   pthread_mutex_unlock(&d->mutex);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, window);
@@ -726,7 +775,7 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace view requires output");
-  rc = data_get(ns, &d, e);
+  rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
@@ -735,16 +784,22 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   view->ns = ns;
   ps_namespace_retain(ns);
   pthread_mutex_lock(&d->mutex);
-  view->count = (size_t)d->active;
+  view->count =
+      (size_t)(d->active - d->snapshot_boundary) + (d->snapshot_id ? 1U : 0U);
   view->items = lc_calloc_with_allocator(NULL, view->count ? view->count : 1,
                                          sizeof(*view->items));
   if (!view->items)
     rc = failure(e, LC_ERR_NOMEM, "cannot capture namespace segments");
   for (i = 0; rc == LC_OK && i < view->count; ++i) {
     captured *c = &view->items[i];
-    segment *s = &d->items[i];
-    c->id = s->id;
-    memcpy(c->leaf, s->leaf, sizeof(c->leaf));
+    segment *s;
+    if (d->snapshot_id && !i)
+      s = ps_ns_find(d, PS_CATALOG_SNAPSHOT, d->snapshot_id);
+    else
+      s = ps_ns_find(d, PS_CATALOG_SEGMENT,
+                     d->snapshot_boundary + i + (d->snapshot_id ? 0U : 1U));
+    c->id = s->kind == PS_CATALOG_SNAPSHOT ? 0 : s->id;
+    strcpy(c->leaf, s->leaf);
     rc = ps_stream_status(s->stream, &info, e);
     if (rc == LC_OK) {
       c->tail = info.tail;

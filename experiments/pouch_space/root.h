@@ -52,5 +52,11 @@ typedef int (*ps_namespace_visit_fn)(const char *, const ps_namespace_info *,
  * namespaces. A callback's namespace pin remains live until it returns. */
 int ps_root_namespace_visit(ps_root *, ps_namespace_visit_fn, void *,
                             lc_error *);
+/* Explicit maintenance only: retire closed streams with no catalog reference
+ * or view, rechecking each captured incarnation before retirement. This never
+ * opens canonical records or reads bodies. Open owners are excluded; candidates
+ * claimed concurrently are counted as skipped. Checkpoint enables reuse. */
+int ps_root_reclaim_orphans(ps_root *, uint64_t *reclaimed, uint64_t *skipped,
+                            lc_error *);
 
 #endif

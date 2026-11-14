@@ -82,6 +82,7 @@ static int append_begin(void *context, void *ns, uint64_t target,
   out->io = ps_namespace_append_output(append);
   out->leaf = ps_namespace_append_leaf(append);
   out->segment = ps_namespace_append_segment(append);
+  out->segments = ps_namespace_append_segments(append);
   rc = lc_pouch_record_io_tail(out->io, &out->start, e);
   if (rc != LC_OK) {
     ps_namespace_append_close(append);
@@ -135,16 +136,18 @@ static int source_open(void *context, void *ns, const char *leaf,
   ps_pouch_owner *owner = context;
   ps_pouch_source *source;
   uint64_t segment;
+  unsigned int kind;
   int rc;
   *out = NULL;
-  if (!leaf || !lc_pouch_namespace_parse_segment_leaf(leaf, &segment))
+  if (!ps_namespace_parse_source_leaf(leaf, &kind, &segment))
     return lc_error_set(e, LC_ERR_PROTOCOL, 0, "invalid container payload leaf",
                         NULL, NULL, "pouch");
   source = lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*source));
   if (!source)
     return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate container source",
                         NULL, NULL, "pouch");
-  rc = ps_namespace_read_open(ns, segment, offset, length, &source->window, e);
+  rc = ps_namespace_read_open(ns, kind, segment, offset, length,
+                              &source->window, e);
   if (rc != LC_OK) {
     lc_free_with_allocator(&owner->allocator, source);
     return rc;

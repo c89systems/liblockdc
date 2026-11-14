@@ -812,8 +812,8 @@ static void verify_states(comparison *c, lc_error *e) {
               e);
       } else {
         check(ps_namespace_read_open(c->workers[ordinal].namespace,
-                                     c->segments[id], c->offsets[id], c->bytes,
-                                     &window, e),
+                                     PS_CATALOG_SEGMENT, c->segments[id],
+                                     c->offsets[id], c->bytes, &window, e),
               e);
         io = ps_namespace_read_input(window);
       }

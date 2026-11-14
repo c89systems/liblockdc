@@ -11,7 +11,7 @@ typedef struct lc_pouch_storage_append {
   void *handle;
   lc_pouch_record_io io;
   const char *leaf; /* Stable while the namespace capability is retained. */
-  uint64_t start, segment;
+  uint64_t start, segment, segments;
 } lc_pouch_storage_append;
 typedef int (*lc_pouch_storage_visit_fn)(void *, uint64_t,
                                          const lc_pouch_state_entry *,

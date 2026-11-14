@@ -39,8 +39,12 @@ maintenance operation remains required.
 State read-many, metadata visits and paged scan/body snapshots now use captured
 container read pins, with lazy bounded decoding and no body cache. Captured
 body access survives callback mutation and Pouch close. Remaining public Pouch
-semantics, maintenance and shared-root coordination
-remain ahead; normal public open behavior has not changed.
+semantics, maintenance and shared-root coordination remain ahead. The namespace
+owner now publishes sealed canonical snapshots, replays their newer log tail,
+and explicitly retires obsolete sources while protecting captured readers.
+Closed unbound private builds can be reclaimed without reading their bodies.
+Logical compaction policy and complete maintenance admission remain required;
+normal public open behavior has not changed.
 
 ## Intent
 

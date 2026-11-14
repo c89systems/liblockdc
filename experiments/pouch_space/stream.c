@@ -241,6 +241,7 @@ int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
     out->tail = s->tail;
     out->capacity = s->capacity;
     out->runs = s->count;
+    out->readers = s->readers;
     out->sealed = s->sealed;
     out->retired = s->retired;
     pthread_mutex_unlock(&s->mutex);

@@ -2103,6 +2103,163 @@ obsolete publication/reclamation, advanced mutation policy, public query-client
 and collection ownership, indexes, queues/XA/outbox and shared-root coordination
 remain part of the active full native implementation goal.
 
+## Namespace snapshots and obsolete-source reclamation
+
+The namespace owner now installs sealed canonical snapshots and explicitly
+retires obsolete sources. Snapshot begin captures a fixed prefix and releases
+mutation authority across producer calls, allowing same-namespace appends,
+peer publication and checkpoints to continue. Commit stabilizes the complete
+stream and catalog binding before durably selecting the snapshot and its covered
+segment boundary in the existing head. Newer segments remain the replay tail.
+This applies under both sync policies; successful selection has no fallible
+reclamation afterward.
+
+Replay visits only the selected snapshot plus newer segments. Older bound
+sources remain addressable for body references, through a sparse sorted index.
+The logical caller must prove that a source has no remaining live references
+before requesting reclamation. Catalog removal precedes stream retirement.
+Captured readers and clones keep their bytes; catalog/read pins defer closing,
+and checkpoint retirement still precedes physical reuse. Explicit root orphan
+reclamation rechecks closed, unbound incarnations without reading canonical
+records or bodies. No additional file or payload log is introduced.
+
+Build IDs and namespace IDs jointly bind snapshot streams. Unpublished snapshot
+bindings are removed before selecting a higher ID, so a failed build cannot
+later masquerade as a historical selected snapshot. The 128-byte routing head
+uses previously reserved fields for snapshot ID and covered boundary. Canonical
+source labels remain metadata. The private state harness can reopen snapshot
+bodies, apply metadata updates referencing those bodies, reopen again and
+continue versions/query sequences.
+
+This is physical snapshot publication and reclamation. The logical owner still
+must supply complete records, high-water marks, tombstones and protected history.
+Automatic compaction, retention scheduling and full maintenance admission remain
+integration work. Source objects follow bound/pending participation, while
+interned labels retain their existing namespace-owner lifetime. This stage does
+not establish bounded metadata memory for an indefinitely lived owner.
+
+### Verification and a validation correction
+
+The full Debug preset executed 313 checks: 312 passed, including all 122
+container checks. The timeout-contract inspector exceeded its unchanged
+ten-second limit; an isolated repeat passed in 9.46 seconds. Extracting each
+test's JSON once, rather than reparsing the full listing for every property,
+reduced the corrected check to 1.91 seconds. A valid fixture passes and a fixture
+without a timeout still fails. The contract and timeout were not relaxed.
+
+GNU and native musl release each passed all 140 affected checks; 33 affected
+Pouch, namespace, root and canonical-record groups passed ThreadSanitizer.
+Review then found a mixed-source validation regression: variable-width segment
+labels could load under a regenerated canonical label, preventing later catalog
+removal. A catalog replacement fixture reproduced the error before correction.
+Restoring the original 28-byte segment-label width rejects both short and
+overpadded names. The final correction passed 14 focused namespace/Pouch groups
+under Debug, GNU, musl and TSAN. Snapshot labels retain their exact 33-byte width.
+
+The new behavior checks cover all four codecs and both durability policies:
+capture boundaries, later appends, busy commit retry, repeat selection,
+historical-source reads, cross-namespace binding rejection, catalog/read pins,
+cloned windows, checkpoint/reopen and metadata references into snapshots.
+A held snapshot producer permits same-namespace and peer writes plus checkpoint.
+
+There are 658 modeled baseline/failure cases: 328 for an initial snapshot and
+330 for replacement of a prior selected snapshot. They inject allocation, I/O,
+torn writes and partial barrier persistence during begin, canonical production,
+selection, source reclamation and orphan cleanup. Recovery retains the latest
+logical value, and a later higher-ID selection removes failed staged bindings.
+The existing read sweeps also pass at 3,670 allocation sites and 1,282 I/O sites.
+
+Fixed-capacity churn completes 192 cycles under each durability policy in
+10 MiB. Each run writes over 24 MiB of canonical bodies and snapshot copies;
+payload reservations remain below 1 MiB after each checkpoint. Periodic reopen
+recovers the latest value. Distinct payload bytes per cycle make stale reused
+grants fail CRC verification; the strengthened fixture also passes focused
+Debug, GNU, musl, TSAN and Memcheck reruns. This one-key workload proves reuse,
+not complete maintenance admission for a store dominated by live metadata.
+
+Six final Memcheck groups pass: 445,559 allocations and frees, zero remaining
+blocks, errors or suppressions. They cover namespace validation, snapshot
+lifecycle, failure cases, held producers, churn and production-state snapshot
+reopen. Evidence under `build/pouch-space-integrated/` includes
+`snapshots-verified-{debug,gnu,musl,tsan}-*`,
+`snapshots-label-{debug,gnu,musl,tsan}-*`,
+`snapshots-replacement-faults-debug.log`, `snapshots-debug-timeout-*`,
+`snapshots-timeout-negative.log` and `snapshots-*-memcheck.log`.
+
+### Matched ordinary-path regression measurements
+
+These measurements do not run compaction or install snapshots. They check the
+ordinary PUT/read paths after the owner changes. Five independent samples use
+the GNU release build, plaintext NoSync roots, 4 KiB source chunks, fixed 10 MiB
+container capacity and two PUT rounds. Engine order alternates. The OS cache is
+retained: reopen rebuilds a cold resident projection, not a cold disk cache.
+
+The primary series has 120 paired read runs plus 15 four-writer PUT runs
+(current container, prior read-stage container and multifile). All values verify
+after populated-root reopen. Medians below are container/multifile milliseconds.
+Close-plus-ready sums the two phases per sample before taking the median.
+
+| Profile / method | Live read C / MF (ms) | Open + read C / MF (ms) | Close + open + read C / MF (ms) |
+| --- | ---: | ---: | ---: |
+| 1,024 × 1 KiB, 1 reader: Point | 6.547 / 39.643 | 27.833 / 36.109 | 28.564 / 54.516 |
+| 1,024 × 1 KiB, 1 reader: Read-many | 4.858 / 7.020 | 20.498 / 10.644 | 20.721 / 28.136 |
+| 1,024 × 1 KiB, 1 reader: Body scan | 4.137 / 4.720 | 20.242 / 7.616 | 20.757 / 23.640 |
+| 1,024 × 1 KiB, 1 reader: Metadata scan | 1.382 / 1.413 | 21.011 / 4.137 | 21.553 / 20.257 |
+| 1,024 × 1 KiB, 4 readers: Point | 3.186 / 13.531 | 30.594 / 17.302 | 30.819 / 85.007 |
+| 1,024 × 1 KiB, 4 readers: Read-many | 1.666 / 3.544 | 25.295 / 7.487 | 25.649 / 77.100 |
+| 1,024 × 1 KiB, 4 readers: Body scan | 1.586 / 2.099 | 29.005 / 5.367 | 29.283 / 61.824 |
+| 1,024 × 1 KiB, 4 readers: Metadata scan | 1.194 / 0.786 | 26.698 / 3.961 | 27.417 / 59.834 |
+| 64 × 32 KiB, 1 reader: Point | 2.908 / 7.672 | 24.964 / 8.309 | 25.058 / 22.147 |
+| 64 × 32 KiB, 1 reader: Read-many | 3.263 / 5.026 | 20.895 / 4.392 | 20.982 / 18.686 |
+| 64 × 32 KiB, 1 reader: Body scan | 3.490 / 3.492 | 23.558 / 3.798 | 23.610 / 19.456 |
+| 64 × 32 KiB, 1 reader: Metadata scan | 0.309 / 0.189 | 17.561 / 0.933 | 17.605 / 14.428 |
+
+Live point and batched reads remain faster in these samples; body scans are
+faster or near equal. Metadata-only scans are mixed. Bare open-plus-read is
+slower in eleven of the twelve primary profiles: the container replays canonical
+history while multifile can reuse a close-generated clean projection. Including
+close changes the comparison:
+the four-reader container profiles are substantially faster overall, while the
+large-body profiles remain slower. The single-reader metadata profile is also
+slightly slower over the complete close/reopen lifecycle.
+
+The primary four-reader metadata median is 1.194 / 0.786 ms. A subsequent
+45-run diagnostic interleaves current container, frozen prior container and
+multifile for the affected metadata profiles and four-reader point reads.
+The primary results remain above; they are not replaced by the diagnostic.
+
+| Diagnostic live read | Current container (ms) | Prior container (ms) | Multifile (ms) |
+| --- | ---: | ---: | ---: |
+| 1,024 × 1 KiB, 4 readers: point | 1.929 | 1.853 | 12.354 |
+| 1,024 × 1 KiB, 4 readers: metadata | 0.724 | 0.675 | 0.705 |
+| 64 × 32 KiB, 1 reader: metadata | 0.182 | 0.194 | 0.165 |
+
+Current/prior ranges overlap: four-reader points 1.655–3.144 / 1.846–2.298 ms,
+four-reader metadata 0.586–0.940 / 0.650–0.785 ms, and large-body metadata
+0.150–0.291 / 0.166–0.285 ms. This does not isolate a new read regression.
+It also does not establish a consistent metadata-scan advantage over multifile.
+
+The primary four-writer PUT medians are 21.919 / 28.756 / 26.255 ms for
+current container / multifile / prior container. Current/prior ranges overlap
+at 18.903–27.992 / 24.700–77.536 ms. Both container executables make four syncs
+and write exactly 3,228,404 syscall bytes and 3,252,224 kernel-accounted bytes in
+every sample. These timings do not isolate a cause for the different medians.
+
+All 180 runs verify values after reopen; all 100 container runs audit one file
+and no sidecars. Raw logs are `snapshots-paired/` and `snapshots-diagnostics/`,
+with corresponding Bash runners and `snapshots-results.json`. The
+`snapshots-artifacts.sha256` manifest covers 185 benchmark artifacts: two frozen
+executables, two runners, JSON and all 180 logs. The prior 139-artifact read
+manifest remains unchanged and verifies.
+
+The measured current executable is `pouch_space_compare-snapshots-validated`,
+SHA-256 `067723c41b1a437e54ba8ca26a8d68e8cef589f7a47766fd06cf855f26e18db0`.
+The prior read-stage executable remains
+`f0fcd389311221cfe6b482bf3313a1bc85119897d7ff93a9dc621da5bf667cda`.
+Actual maintenance performance, complete capacity admission, advanced public
+semantics and shared-root ownership remain in the active full-backend goal.
+Normal public open remains multifile.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -2113,8 +2270,9 @@ packing, canonical-stream, lifecycle, typed catalog and production collection
 and ordinary state record follow-ups. Namespace segments now have a real
 container owner. Ordinary production state PUT/projection/point-read, metadata
 update, deletion, read-many, metadata visits and paged scan/body snapshots now
-join it through the private integration harness. The
-next work must close whole-operation maintenance admission at capacity, address
+join it through the private integration harness. Physical namespace snapshot
+publication and protected obsolete-source reclamation are now available too.
+The next work must close whole-operation maintenance admission at capacity, address
 remaining NoSync and reopened-projection costs, and connect advanced mutations,
 public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still

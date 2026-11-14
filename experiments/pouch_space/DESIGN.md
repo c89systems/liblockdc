@@ -453,7 +453,24 @@ callbacks and replay callbacks hold no namespace/registry mutex. Independent
 namespaces progress during a blocked producer or initialization. Cached storage
 admission checks poison before its atomic pointer lookup. The owner caches its
 committed tail under append authority to avoid a duplicate metadata query per
-record. Snapshot/obsolete transitions remain pending.
+record.
+
+Namespace routing now also selects a sealed canonical snapshot and the logical
+segment boundary it covers. Its private builder captures a fixed prefix and
+releases mutation authority across producer calls. Selection durably binds the
+sealed stream before replacing the head, under either root policy; newer log
+segments remain replayable. A build ID and namespace ID jointly bind its stream.
+Unpublished snapshot bindings are removed before a higher ID can be selected.
+Replay visits the selected snapshot followed by its newer segment tail.
+
+A sparse sorted source index keeps older bound sources addressable for body
+references without making them part of replay. Explicit obsolete-source removal
+requires the logical owner's liveness proof. Catalog removal precedes physical
+retirement; captured windows remain readable, while catalog/read pins defer
+closing and reuse. Closed unbound builders have explicit metadata-only orphan
+reclamation, with incarnation and catalog ownership rechecked before retirement.
+Interned labels retain namespace-owner lifetime even after source objects close.
+Logical compaction policy and complete maintenance admission remain pending.
 
 `ps_stream_reserve` acquires enough zero-owned grants from the append start for
 a caller's known minimum. It changes neither the private record cursor nor the
@@ -526,7 +543,8 @@ query-client ownership and maintenance publication remain integration work.
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The
-foundation implements retirement/reuse without relocation and makes no claim
+foundation implements retirement/reuse and snapshot publication without
+automatic logical relocation, and makes no claim
 that all draft acceptance criteria are already satisfied.
 
 See [measurements and reproduction](../../docs/pouch-space-experiment.md) for

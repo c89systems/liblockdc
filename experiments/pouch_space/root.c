@@ -2,6 +2,7 @@
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
+#include "owned.h"
 #include "root_internal.h"
 #include <pthread.h>
 #include <string.h>
@@ -420,6 +421,49 @@ int ps_root_namespace_visit(ps_root *root, ps_namespace_visit_fn visit,
   pthread_mutex_lock(&root->mutex);
   --root->calls;
   pthread_mutex_unlock(&root->mutex);
+  return rc;
+}
+typedef struct orphan_context {
+  ps_space *space;
+  uint64_t reclaimed, skipped;
+} orphan_context;
+static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
+                          lc_error *error) {
+  orphan_context *c = context;
+  ps_owned_head *head = NULL;
+  ps_owned_status status;
+  int rc = ps_owned_open(c->space, key, 0, ref, &head, &status, error);
+  if (rc == LC_OK)
+    rc = ps_owned_retire(head, error);
+  ps_owned_close(head);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(error);
+    ++c->skipped;
+    return LC_OK;
+  }
+  if (rc == LC_OK)
+    ++c->reclaimed;
+  return rc;
+}
+int ps_root_reclaim_orphans(ps_root *root, uint64_t *reclaimed,
+                            uint64_t *skipped, lc_error *error) {
+  orphan_context c;
+  int rc;
+  if (!root || !reclaimed || !skipped)
+    return failure(error, LC_ERR_INVALID, NULL,
+                   "orphan reclamation requires root and counts");
+  memset(&c, 0, sizeof(c));
+  c.space = root->space;
+  *reclaimed = *skipped = 0;
+  pthread_mutex_lock(&root->mutex);
+  ++root->calls;
+  pthread_mutex_unlock(&root->mutex);
+  rc = ps_catalog_visit_orphans(root->space, reclaim_orphan, &c, error);
+  pthread_mutex_lock(&root->mutex);
+  --root->calls;
+  pthread_mutex_unlock(&root->mutex);
+  *reclaimed = c.reclaimed;
+  *skipped = c.skipped;
   return rc;
 }
 int ps_root_close(ps_root *root, lc_error *error) {
