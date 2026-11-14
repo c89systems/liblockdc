@@ -1,7 +1,112 @@
 #include "lc_api_internal.h"
 #include "namespace_internal.h"
 #include <string.h>
+static int failure(lc_error *, const char *);
 
+struct ps_namespace_body {
+  ps_namespace *ns;
+  struct ps_namespace_data *data;
+  ps_ns_resource *resource;
+  ps_record_writer writer;
+  uint64_t bytes;
+  int attempted;
+};
+int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
+                            ps_namespace_body **out, lc_error *e) {
+  ps_namespace_body *b;
+  struct ps_namespace_data *d;
+  uint64_t id;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!out)
+    return failure(e, "namespace body build requires output");
+  rc = ps_ns_data_get(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  b = lc_calloc_with_allocator(NULL, 1, sizeof(*b));
+  if (!b)
+    return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate body builder",
+                        NULL, NULL, "pouch");
+  b->ns = ns;
+  b->data = d;
+  b->bytes = bytes;
+  ps_namespace_retain(ns);
+  rc = ps_catalog_allocate_id(ns->root->space, &id, e);
+  if (rc == LC_OK) {
+    b->resource = ps_ns_resource_new(PS_CATALOG_BODY, id, e);
+    if (!b->resource)
+      rc = LC_ERR_NOMEM;
+  }
+  if (rc == LC_OK) {
+    ps_ns_resource *r = b->resource;
+    r->binding.stream.owner = id;
+    r->binding.stream.key = ns->identity.owner;
+    r->binding.stream.kind = PS_STREAM;
+    rc = ps_stream_open(ns->root->space, r->binding.stream, 1, NULL, NULL, NULL,
+                        &r->stream, e);
+    if (rc == LC_OK)
+      rc = ps_record_begin(r->stream, &b->writer, e);
+    if (rc == LC_OK)
+      rc = ps_stream_reserve_exact(b->writer.writer, bytes, e);
+  }
+  if (rc == LC_OK)
+    *out = b;
+  else
+    ps_namespace_body_close(b);
+  return rc;
+}
+lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *b) {
+  return ps_record_output(b ? &b->writer : NULL);
+}
+const char *ps_namespace_body_leaf(const ps_namespace_body *b) {
+  return b && b->resource ? b->resource->leaf : NULL;
+}
+int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
+  ps_stream_info info;
+  ps_ns_resource *r;
+  int rc;
+  if (!b || b->attempted || !b->writer.writer || b->writer.tail != b->bytes)
+    return failure(e, "body build is closed or differs from its measured size");
+  rc = ps_ns_enter(b->data, e);
+  if (rc != LC_OK)
+    return rc;
+  b->attempted = 1;
+  r = b->resource;
+  rc = ps_record_commit(&b->writer, NULL, NULL, e);
+  if (rc == LC_OK)
+    rc = ps_stream_seal(r->stream, e);
+  if (rc == LC_OK)
+    rc = ps_stream_status(r->stream, &info, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&b->data->mutex);
+    rc = ps_ns_index_room(b->data, e);
+    pthread_mutex_unlock(&b->data->mutex);
+  }
+  if (rc == LC_OK)
+    rc = ps_catalog_put(b->ns->root->space, b->ns->identity.owner,
+                        PS_CATALOG_BODY, r->leaf, strlen(r->leaf), NULL,
+                        r->binding.stream, &info.ref, &r->binding, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&b->data->mutex);
+    ps_ns_insert(b->data, r);
+    pthread_mutex_unlock(&b->data->mutex);
+  }
+  ps_ns_leave(b->data);
+  return rc;
+}
+void ps_namespace_body_close(ps_namespace_body *b) {
+  if (!b)
+    return;
+  ps_record_abort(&b->writer);
+  if (b->resource && !b->resource->pooled) {
+    if (b->resource->stream && ps_check(b->ns->root->space, NULL) == LC_OK)
+      ps_stream_retire(b->resource->stream, NULL);
+    ps_ns_resource_free(b->resource);
+  }
+  ps_namespace_release(b->ns);
+  lc_free_with_allocator(NULL, b);
+}
 struct ps_namespace_snapshot {
   ps_namespace *ns;
   struct ps_namespace_data *data;
@@ -96,10 +201,11 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
   rc = ps_ns_enter(d, e);
   if (rc != LC_OK)
     return rc;
-  if (!id || !d->snapshot_id ||
-      (kind == PS_CATALOG_SEGMENT    ? id > d->snapshot_boundary
-       : kind == PS_CATALOG_SNAPSHOT ? id >= d->snapshot_id
-                                     : 1))
+  if (!id || (kind != PS_CATALOG_BODY &&
+              (!d->snapshot_id ||
+               (kind == PS_CATALOG_SEGMENT    ? id > d->snapshot_boundary
+                : kind == PS_CATALOG_SNAPSHOT ? id >= d->snapshot_id
+                                              : 1))))
     rc = failure(e, "namespace source is not obsolete");
   else {
     r = ps_ns_find(d, kind, id);
@@ -158,7 +264,7 @@ int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
       rc = failure(e, "namespace has no snapshot prefix");
     if (rc == LC_OK && d->tail)
       rc = ps_ns_rotate(d, e);
-    if (rc == LC_OK && d->active - 1 <= d->snapshot_boundary)
+    if (rc == LC_OK && !d->snapshot_id && d->active - 1 <= d->snapshot_boundary)
       rc = failure(e, "namespace snapshot prefix has not advanced");
     if (rc == LC_OK) {
       b->base = d->snapshot_id;
@@ -202,6 +308,12 @@ const char *ps_namespace_snapshot_leaf(const ps_namespace_snapshot *b) {
 }
 uint64_t ps_namespace_snapshot_boundary(const ps_namespace_snapshot *b) {
   return b ? b->boundary : 0;
+}
+int ps_namespace_snapshot_reserve(ps_namespace_snapshot *b, uint64_t bytes,
+                                  lc_error *e) {
+  if (!b || b->attempted || !b->writer.writer)
+    return failure(e, "namespace snapshot is not open");
+  return ps_stream_reserve_exact(b->writer.writer, bytes, e);
 }
 int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
   struct ps_namespace_data *d;

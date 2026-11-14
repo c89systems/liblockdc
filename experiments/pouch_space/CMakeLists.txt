@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c pouch.c)
+add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c pouch.c maintenance.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -34,7 +34,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection)
+    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection)
       add_test(NAME pouch_space_compare_${mode}
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096)
       set_tests_properties(pouch_space_compare_${mode} PROPERTIES TIMEOUT 60
@@ -63,13 +63,14 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle faults concurrency io-faults validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency)
+  foreach(mode lifecycle faults concurrency io-faults validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency maintenance maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-checksums)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
   # Thousands of independent cold/warm allocation failures also run under TSAN.
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
+  set_tests_properties(pouch_space_pouch_maintenance-faults pouch_space_pouch_maintenance-io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_namespace_test namespace_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_namespace_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_namespace_test PRIVATE pouch_space_experiment)
@@ -77,7 +78,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_namespace_test)
-  foreach(mode lifecycle faults concurrency validation reservation publication snapshots snapshot-faults snapshot-concurrency snapshot-churn)
+  foreach(mode lifecycle faults concurrency validation reservation publication snapshots snapshot-faults snapshot-concurrency snapshot-churn bodies)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120

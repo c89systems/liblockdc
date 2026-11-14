@@ -265,8 +265,9 @@ checkpointing restores capacity without copying payloads.
 
 `catalog.[ch]` maps `(owner, surface, exact name bytes)` to a binding ID, revision
 and live stream reference. Surfaces distinguish namespaces, collections,
-segments, snapshots, projections and control metadata. These are internal typed
-bindings; their public Pouch semantics are not implemented by this layer.
+segments, snapshots, projections, control metadata and sealed body packs.
+These are internal typed bindings; their public Pouch semantics are not
+implemented by this layer.
 Names may be empty or binary, including NUL, and are not filesystem paths.
 The name index grows at 75% occupancy and compares the full byte string after
 hashing. Memory follows metadata participation rather than reserved file size.
@@ -470,7 +471,9 @@ retirement; captured windows remain readable, while catalog/read pins defer
 closing and reuse. Closed unbound builders have explicit metadata-only orphan
 reclamation, with incarnation and catalog ownership rechecked before retirement.
 Interned labels retain namespace-owner lifetime even after source objects close.
-Logical compaction policy and complete maintenance admission remain pending.
+The forced ordinary-state pass described below now supplies logical liveness
+and reclamation. Automatic policy and complete maintenance admission remain
+pending.
 
 `ps_stream_reserve` acquires enough zero-owned grants from the append start for
 a caller's known minimum. It changes neither the private record cursor nor the
@@ -538,7 +541,8 @@ the visitor's borrowed row; both backends support repeated body reads from the
 same captured row. Read-many also returns its captured has-body and staged-delete
 fields. All of these changes are internal memory ownership or read routing;
 canonical bytes, prototype format and public ABI are unchanged. Full public
-query-client ownership and maintenance publication remain integration work.
+query-client ownership remains integration work; forced ordinary-state
+maintenance publication is described below.
 
 Canonical snapshot serialization now also uses borrowed record I/O. Native
 compaction and clean-close projections delegate to the same state codec as
@@ -559,14 +563,37 @@ but borrows the allocator context; physical body pins stay with its caller.
 Ordinary appends can commit during capture and during a held immutable visit.
 Queued metadata-entry copying now also retains its query generation, preventing
 canonical replay from losing a generation which the live cache preserved.
-Automatic publication, history protection, victim selection and complete
-maintenance admission remain pending.
+The private `ps_pouch_state_compact` pass now measures complete metadata output
+and a selected source's canonical body frames before copying. Known spans are
+reserved with page-rounded final grants. The forced victim score uses capacity
+minus current live encoded body bytes. Copying runs outside logical namespace
+authority with bounded heap scratch.
 
-The protected metadata region cannot be consumed by payloads. Relocating
-compaction, metadata repacking, resumable root transform conversion,
+Bodies relocate into a separate sealed stream, bound under `PS_CATALOG_BODY`
+(surface 6). Its global build ID and namespace ID jointly bind stream ownership.
+`body-<20 decimal digits>.log` labels are typed metadata, never files. Packs do
+not participate in replay. Metadata snapshots retain references to untouched
+bodies, so later snapshots need not copy every live value. A selected snapshot
+may be rewritten at its existing covered boundary without another empty log
+rotation.
+
+The pass binds/seals the pack before durable snapshot selection, then captures
+the latest logical tail under publication authority before deciding source
+liveness. It invalidates the resident cache before releasing that authority,
+including on uncertain failure. Covered source retirement, reap, closed-unbound
+orphan collection and checkpoint retain existing read-pin guarantees. Encoded
+sources validate stored CRCs as consumed; reset and clone maintain independent
+cursor/checksum state and can outlive the logical runtime.
+
+This reserves known canonical output spans, not the whole maintenance budget.
+Automatic policy, history protection and complete metadata/rotation/checkpoint
+admission remain pending. The current label pool still follows namespace-owner
+lifetime.
+
+The protected metadata region cannot be consumed by payloads. Complete
+maintenance admission, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The
-foundation implements retirement/reuse and snapshot publication without
-automatic logical relocation, and makes no claim
+foundation now implements forced ordinary-state relocation and makes no claim
 that all draft acceptance criteria are already satisfied.
 
 See [measurements and reproduction](../../docs/pouch-space-experiment.md) for

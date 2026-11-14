@@ -17,10 +17,17 @@ int ps_namespace_parse_source_leaf(const char *leaf, unsigned int *kind,
     *kind = PS_CATALOG_SEGMENT;
     return 1;
   }
-  if (length != 33 || strncmp(leaf, "snapshot-", 9) ||
-      strcmp(leaf + 29, ".log"))
+  if (length == 33 && !strncmp(leaf, "snapshot-", 9) &&
+      !strcmp(leaf + 29, ".log")) {
+    *kind = PS_CATALOG_SNAPSHOT;
+    i = 9;
+  } else if (length == 29 && !strncmp(leaf, "body-", 5) &&
+             !strcmp(leaf + 25, ".log")) {
+    *kind = PS_CATALOG_BODY;
+    i = 5;
+  } else
     return 0;
-  for (i = 9; i < 29; ++i) {
+  for (; i < length - 4; ++i) {
     unsigned int digit = (unsigned int)(unsigned char)leaf[i] - '0';
     if (digit > 9 || value > (UINT64_MAX - digit) / 10)
       return 0;
@@ -28,7 +35,6 @@ int ps_namespace_parse_source_leaf(const char *leaf, unsigned int *kind,
   }
   if (!value)
     return 0;
-  *kind = PS_CATALOG_SNAPSHOT;
   *id = value;
   return 1;
 }
@@ -37,9 +43,24 @@ ps_ns_resource *ps_ns_resource_new(unsigned int kind, uint64_t id,
   ps_ns_resource *r = NULL;
   ps_ns_label *label = NULL;
   char *leaf;
-  leaf = kind == PS_CATALOG_SEGMENT
-             ? lc_pouch_namespace_segment_leaf(NULL, id)
-             : lc_pouch_namespace_snapshot_leaf(NULL, id);
+  char number[32];
+  int digits;
+  leaf = NULL;
+  if (kind == PS_CATALOG_BODY && id) {
+    digits = lc_u64_format_base10(id, number, sizeof(number));
+    if (digits > 0 && digits <= 20) {
+      leaf = lc_alloc_with_allocator(NULL, 30);
+      if (leaf) {
+        memcpy(leaf, "body-", 5);
+        memset(leaf + 5, '0', 20 - (size_t)digits);
+        memcpy(leaf + 25 - digits, number, (size_t)digits);
+        memcpy(leaf + 25, ".log", 5);
+      }
+    }
+  } else if (kind == PS_CATALOG_SEGMENT)
+    leaf = lc_pouch_namespace_segment_leaf(NULL, id);
+  else if (kind == PS_CATALOG_SNAPSHOT)
+    leaf = lc_pouch_namespace_snapshot_leaf(NULL, id);
   if (leaf) {
     r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
     label = lc_calloc_with_allocator(NULL, 1, sizeof(*label));

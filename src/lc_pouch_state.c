@@ -3241,8 +3241,10 @@ lc_pouch_state_lock_namespace_for_mutation(lc_pouch *pouch, const char *ns,
                                            lc_error *error) {
   int rc;
 
-  rc = lc_pouch_namespace_ensure_layout(&pouch->allocator, pouch->root_path, ns,
-                                        error);
+  rc = pouch->storage.ops
+           ? pouch->storage.ops->check(pouch->storage.context, error)
+           : lc_pouch_namespace_ensure_layout(&pouch->allocator,
+                                              pouch->root_path, ns, error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -4241,7 +4243,8 @@ static int lc_pouch_state_scan_body_snapshot_append(
         pouch->storage.context, cache->storage_namespace,
         record->payload_span.container_leaf,
         record->payload_span.payload_offset,
-        record->payload_span.payload_length, &snapshot->encoded, error);
+        record->payload_span.payload_length, record->payload_span.payload_crc,
+        &snapshot->encoded, error);
     if (rc != LC_OK) {
       lc_pouch_state_scan_body_snapshot_cleanup(&pouch->allocator, snapshot);
       return rc;
@@ -4655,7 +4658,8 @@ static int lc_pouch_state_read_many_snapshot_from_entry(
           pouch->storage.context, cache->storage_namespace,
           current->payload_span.container_leaf,
           current->payload_span.payload_offset,
-          current->payload_span.payload_length, &snapshot->encoded, error);
+          current->payload_span.payload_length,
+          current->payload_span.payload_crc, &snapshot->encoded, error);
     } else if (cache != NULL && record != NULL) {
       rc = lc_pouch_state_read_many_snapshot_body_from_cache(
           pouch, cache, record, snapshot->crypto_context,
@@ -9600,6 +9604,35 @@ struct lc_pouch_state_snapshot {
   lc_pouch_generation index_seq, query_index_seq;
 };
 
+typedef struct lc_pouch_snapshot_publication {
+  lc_pouch *pouch;
+  const char *ns;
+  lc_pouch_state_precondition_fn publish;
+  void *context;
+} lc_pouch_snapshot_publication;
+static int lc_pouch_snapshot_publish_locked(void *context, lc_error *error) {
+  lc_pouch_snapshot_publication *p = context;
+  int rc = p->publish(p->context, error);
+  lc_pouch_state_cache_invalidate_namespace(p->pouch, p->ns);
+  return rc;
+}
+int lc_pouch_state_snapshot_publish(lc_pouch *pouch, const char *ns,
+                                    lc_pouch_state_precondition_fn publish,
+                                    void *context, lc_error *error) {
+  lc_pouch_snapshot_publication p;
+  if (!pouch || !pouch->storage.ops || !ns || !ns[0] || !publish)
+    return lc_error_set(
+        error, LC_ERR_INVALID, 0L,
+        "snapshot publication requires typed owner and namespace", NULL, NULL,
+        "pouch");
+  p.pouch = pouch;
+  p.ns = ns;
+  p.publish = publish;
+  p.context = context;
+  return lc_pouch_state_with_namespace_lock(
+      pouch, ns, lc_pouch_snapshot_publish_locked, &p, error);
+}
+
 void lc_pouch_state_snapshot_close(lc_pouch_state_snapshot *snapshot) {
   size_t i;
   lc_allocator allocator;
@@ -10173,7 +10206,8 @@ static int lc_pouch_state_read_result_from_entry(
           pouch->storage.context, cache->storage_namespace,
           current->payload_span.container_leaf,
           current->payload_span.payload_offset,
-          current->payload_span.payload_length, &encoded, error);
+          current->payload_span.payload_length,
+          current->payload_span.payload_crc, &encoded, error);
       if (rc == LC_OK)
         rc = lc_pouch_crypto_source_from_source(
             pouch->crypto, crypto_context, binding_context, encoded,
@@ -10351,6 +10385,85 @@ static int lc_pouch_state_snapshot_encode(
         record->has_query_index_seq ? record->query_index_seq
                                     : record->index_seq,
         error);
+  return rc;
+}
+
+int lc_pouch_state_snapshot_measure(const lc_pouch_state_snapshot *snapshot,
+                                    const char *leaf, const char *copy_leaf,
+                                    uint64_t *bytes, uint64_t *body_bytes,
+                                    lc_error *error) {
+  lc_pouch_state_entry entry;
+  lc_pouch_state_payload_span span;
+  unsigned char *meta = NULL, type;
+  size_t length = 0, i;
+  uint64_t total = 0, bodies = 0, part;
+  int rc, copy;
+  if (bytes)
+    *bytes = 0;
+  if (body_bytes)
+    *body_bytes = 0;
+  if (!snapshot || !bytes || !body_bytes ||
+      !lc_pouch_state_payload_container_is_valid(leaf))
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "snapshot measurement requires capture, leaf and size",
+                        NULL, NULL, "pouch");
+  rc = lc_pouch_state_encode_high_water_meta(
+      &snapshot->allocator, snapshot->index_seq, snapshot->query_index_seq,
+      &meta, &length, error);
+  if (rc == LC_OK)
+    total = LC_POUCH_STATE_RECORD_HEADER_BYTES + length;
+  lc_free_with_allocator(&snapshot->allocator, meta);
+  for (i = 0; rc == LC_OK && i < snapshot->count; ++i) {
+    lc_pouch_state_entry_borrow_cache_record(snapshot->records[i], &entry);
+    copy = entry.found && entry.payload_span.present && copy_leaf &&
+           !strcmp(entry.payload_span.container_leaf, copy_leaf);
+    span = entry.payload_span;
+    if (copy) {
+      span.container_leaf = (char *)leaf;
+      span.record_offset = span.payload_offset = 0;
+    }
+    type = !entry.found
+               ? (entry.record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE
+                      ? LC_POUCH_STATE_RECORD_OBJECT_DELETE
+                      : LC_POUCH_STATE_RECORD_STATE_DELETE)
+           : span.present ? LC_POUCH_STATE_RECORD_STATE_LINK
+                          : LC_POUCH_STATE_RECORD_STATE_META;
+    meta = NULL;
+    rc = lc_pouch_state_snapshot_encode(&snapshot->allocator, &entry, type,
+                                        span.present ? &span : NULL, 0, &meta,
+                                        &length, error);
+    part = LC_POUCH_STATE_RECORD_HEADER_BYTES + strlen(entry.key) + length;
+    if (rc == LC_OK && part > (uint64_t)LC_I64_MAX - total)
+      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "snapshot measurement exceeds local offset limit", NULL,
+                        NULL, "pouch");
+    if (rc == LC_OK)
+      total += part;
+    lc_free_with_allocator(&snapshot->allocator, meta);
+    if (rc == LC_OK && copy) {
+      meta = NULL;
+      type = entry.record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT
+                 ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+                 : LC_POUCH_STATE_RECORD_STATE_PUT;
+      rc = lc_pouch_state_snapshot_encode(
+          &snapshot->allocator, &entry, type, &span,
+          LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, &meta, &length, error);
+      part = LC_POUCH_STATE_RECORD_HEADER_BYTES + strlen(entry.key) + length;
+      if (rc == LC_OK &&
+          (part > (uint64_t)LC_I64_MAX - bodies ||
+           entry.cipher_bytes > (uint64_t)LC_I64_MAX - bodies - part))
+        rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "body pack measurement exceeds local offset limit",
+                          NULL, NULL, "pouch");
+      if (rc == LC_OK)
+        bodies += part + entry.cipher_bytes;
+      lc_free_with_allocator(&snapshot->allocator, meta);
+    }
+  }
+  if (rc == LC_OK) {
+    *bytes = total;
+    *body_bytes = bodies;
+  }
   return rc;
 }
 
@@ -11551,11 +11664,22 @@ static int lc_pouch_state_payload_container_is_valid(const char *leaf) {
   size_t len;
   size_t i;
   uint64_t segment_id;
+  uint64_t body_id = 0;
 
   if (leaf == NULL) {
     return 0;
   }
   len = strlen(leaf);
+  if (len == 29U && !strncmp(leaf, "body-", 5U) &&
+      !strcmp(leaf + 25U, ".log")) {
+    for (i = 5U; i < 25U; ++i) {
+      unsigned int digit = (unsigned int)(unsigned char)leaf[i] - '0';
+      if (digit > 9 || body_id > (LC_U64_MAX - digit) / 10)
+        return 0;
+      body_id = body_id * 10 + digit;
+    }
+    return body_id != 0;
+  }
   if (lc_pouch_namespace_parse_segment_leaf(leaf, &segment_id)) {
     return 1;
   }

@@ -7,11 +7,25 @@ typedef struct ps_namespace_append ps_namespace_append;
 typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_snapshot ps_namespace_snapshot;
+typedef struct ps_namespace_body ps_namespace_body;
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;
   uint64_t snapshot, snapshot_boundary;
-  uint64_t bound_segments, bound_snapshots, pending_retirements;
+  uint64_t bound_segments, bound_snapshots, bound_bodies, pending_retirements;
 } ps_namespace_status;
+typedef struct ps_namespace_source {
+  const char *leaf;
+  unsigned int kind;
+  uint64_t id, tail, capacity;
+  int sealed;
+} ps_namespace_source;
+typedef int (*ps_namespace_source_fn)(void *, const ps_namespace_source *,
+                                      lc_error *);
+/* Captured bound-source metadata, excluding unpublished builds. No canonical
+ * or body reads; callbacks run outside owner locks. Labels are borrowed while
+ * the namespace capability remains retained. */
+int ps_namespace_sources_visit(ps_namespace *, ps_namespace_source_fn, void *,
+                               lc_error *);
 
 /* Namespace-owned canonical segments. Caller retains its namespace pin during
  * synchronous calls. Returned append/view/window handles retain another pin.
@@ -75,20 +89,39 @@ void ps_namespace_view_close(ps_namespace_view *);
  * active segment first. Only one builder per namespace; ordinary appends may
  * proceed while the caller writes complete canonical snapshot records. The
  * caller owns logical completeness, high-water marks and reference protection.
- * An empty/unadvanced prefix is invalid. The view is borrowed until close. */
+ * A selected snapshot can be rewritten without advancing the covered prefix;
+ * a namespace without a snapshot still needs a nonempty sealed prefix.
+ * The view is borrowed until close. */
 int ps_namespace_snapshot_begin(ps_namespace *, ps_namespace_snapshot **,
                                 lc_error *);
 ps_namespace_view *ps_namespace_snapshot_view(ps_namespace_snapshot *);
 lc_pouch_record_io ps_namespace_snapshot_output(ps_namespace_snapshot *);
 const char *ps_namespace_snapshot_leaf(const ps_namespace_snapshot *);
 uint64_t ps_namespace_snapshot_boundary(const ps_namespace_snapshot *);
+/* Reserve the complete known canonical span before copying. This protects
+ * snapshot payload grants, not the remaining rotation/catalog/head budget.
+ * Close the builder after failure; no canonical bytes are consumed here. */
+int ps_namespace_snapshot_reserve(ps_namespace_snapshot *, uint64_t,
+                                  lc_error *);
+/* Sealed relocation packs contain canonical encoded body records, not a replay
+ * prefix. Their bindings are durable before a metadata snapshot can refer to
+ * them. Unreferenced packs require logical reclamation after interrupted work.
+ * Expected bytes are reserved before returning; producers hold no owner lock.
+ */
+int ps_namespace_body_begin(ps_namespace *, uint64_t bytes,
+                            ps_namespace_body **, lc_error *);
+lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *);
+const char *ps_namespace_body_leaf(const ps_namespace_body *);
+int ps_namespace_body_commit(ps_namespace_body *, lc_error *);
+void ps_namespace_body_close(ps_namespace_body *);
 /* Durable selection under either root policy. Busy mutation admission can be
  * retried; after admission this is a single publication attempt. On failure,
  * close and rebuild. No reclamation runs after successful head publication. */
 int ps_namespace_snapshot_commit(ps_namespace_snapshot *, lc_error *);
 void ps_namespace_snapshot_close(ps_namespace_snapshot *);
 /* Caller proves no current logical references need this source. Only segments
- * covered by the selected snapshot or older selected snapshots are eligible.
+ * covered by the selected snapshot, older selected snapshots, and sealed body
+ * packs are eligible.
  * Removal is durable and idempotent. Captured readers remain valid. Reap closes
  * retired owners after catalog/read pins drain; checkpoint makes space
  * reusable. These calls do not invalidate a logical owner's cached projection.

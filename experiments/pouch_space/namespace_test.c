@@ -1848,6 +1848,163 @@ static void snapshot_faults(const char *path) {
   snapshot_fault_cases(path, 0);
   snapshot_fault_cases(path, 1);
 }
+typedef struct body_sources {
+  ps_root *root;
+  ps_namespace *ns;
+  size_t count;
+  int reenter;
+} body_sources;
+static int body_source(void *context, const ps_namespace_source *s,
+                       lc_error *e) {
+  body_sources *c = context;
+  ++c->count;
+  REQUIRE(s->kind == PS_CATALOG_BODY && s->sealed && s->tail == 3 &&
+          s->capacity >= s->tail && s->capacity - s->tail < PS_PAGE);
+  if (c->reenter)
+    return append(c->root, c->ns, 1, 0, 31, e);
+  return LC_OK;
+}
+static void bodies(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  unsigned int kind;
+  uint64_t id;
+  REQUIRE(ps_namespace_parse_source_leaf("body-18446744073709551615.log", &kind,
+                                         &id) &&
+          kind == PS_CATALOG_BODY && id == UINT64_MAX);
+  const char *invalid[] = {
+      "body-00000000000000000000.log", "body-18446744073709551616.log",
+      "body-0000000000000000000x.log", "body-1.log",
+      "body-00000000000000000001.bad", "body-000000000000000000001.log"};
+  for (size_t i = 0; i < sizeof(invalid) / sizeof(*invalid); ++i)
+    REQUIRE(!ps_namespace_parse_source_leaf(invalid[i], &kind, &id));
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "test", 1, &e);
+    ps_namespace_body *b = NULL;
+    REQUIRE(ps_namespace_body_begin(ns, 3, NULL, &e) == LC_ERR_INVALID);
+    clear(&e);
+    REQUIRE(ps_namespace_body_begin(NULL, 3, &b, &e) == LC_ERR_INVALID && !b);
+    clear(&e);
+    REQUIRE(ps_namespace_body_commit(NULL, &e) == LC_ERR_INVALID);
+    clear(&e);
+    REQUIRE(ps_namespace_snapshot_reserve(NULL, 3, &e) == LC_ERR_INVALID);
+    clear(&e);
+    REQUIRE(ps_namespace_sources_visit(ns, NULL, NULL, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ok(ps_namespace_body_begin(ns, 3, &b, &e), &e);
+    char leaf[40];
+    strcpy(leaf, ps_namespace_body_leaf(b));
+    REQUIRE(ps_namespace_parse_source_leaf(leaf, &kind, &id) &&
+            kind == PS_CATALOG_BODY);
+    ps_namespace_window *pin = NULL, *rejected = NULL;
+    REQUIRE(ps_namespace_read_open(ns, kind, id, 0, 3, &pin, &e) ==
+                LC_ERR_INVALID &&
+            !pin);
+    clear(&e);
+    body_sources c = {root, ns, 0, 0};
+    ok(ps_namespace_sources_visit(ns, body_source, &c, &e), &e);
+    REQUIRE(!c.count);
+    REQUIRE(ps_namespace_body_commit(b, &e) == LC_ERR_INVALID);
+    clear(&e);
+    /* The physical pack owner treats bytes as opaque. The logical maintenance
+     * producer supplies complete canonical frames and measured sizes. */
+    struct iovec part = {(void *)"abc", 3};
+    ok(lc_pouch_record_io_append(ps_namespace_body_output(b), &part, 1, &e),
+       &e);
+    ok(ps_namespace_body_commit(b, &e), &e);
+    REQUIRE(ps_namespace_body_commit(b, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ps_namespace_body_close(b);
+    ps_namespace_body_close(NULL);
+    count(ns, 0, &e); /* Body packs never become a canonical replay prefix. */
+    c.reenter = 1;
+    ok(ps_namespace_sources_visit(ns, body_source, &c, &e), &e);
+    REQUIRE(c.count == 1); /* The callback's new segment was not captured. */
+    count(ns, 1, &e);
+    ps_namespace_status status;
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.bound_bodies == 1 && status.bound_segments == 1 &&
+            !status.snapshot && !status.bound_snapshots);
+    /* A valid pack's stream key also binds its owning namespace. */
+    ps_namespace *foreign = acquire(root, "foreign", 1, &e);
+    ps_namespace_info own, other;
+    ok(ps_namespace_identity(ns, &own, &e), &e);
+    ok(ps_namespace_identity(foreign, &other, &e), &e);
+    ps_catalog_view *catalog = NULL;
+    ps_catalog_info binding, inserted;
+    ok(ps_catalog_get(ps_root_space(root), own.owner, kind, leaf, strlen(leaf),
+                      &catalog, &e),
+       &e);
+    REQUIRE(catalog != NULL);
+    ok(ps_catalog_view_info(catalog, &binding, &e), &e);
+    ps_catalog_view_close(catalog);
+    ok(ps_catalog_put(ps_root_space(root), other.owner, kind, leaf,
+                      strlen(leaf), NULL, binding.stream, &binding.target,
+                      &inserted, &e),
+       &e);
+    REQUIRE(ps_namespace_status_get(foreign, &status, &e) == LC_ERR_PROTOCOL);
+    clear(&e);
+    ok(ps_catalog_remove(ps_root_space(root), other.owner, kind, leaf,
+                         strlen(leaf), &inserted.revision, &e),
+       &e);
+    ps_namespace_release(foreign);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "test", 0, &e);
+    count(ns, 1, &e);
+    ok(ps_namespace_read_open(ns, kind, id, 0, 3, &pin, &e), &e);
+    ok(ps_namespace_reclaim(ns, kind, id, &e), &e);
+    REQUIRE(ps_namespace_read_open(ns, kind, id, 0, 3, &rejected, &e) ==
+                LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    uint64_t closed, pending;
+    ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+    REQUIRE(!closed && pending == 1);
+    char bytes[3];
+    part.iov_base = bytes;
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(pin), 0, &part, 1, &e),
+       &e);
+    REQUIRE(!memcmp(bytes, "abc", 3));
+    ps_namespace_read_close(pin);
+    ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+    REQUIRE(closed == 1 && !pending);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+  }
+  /* A body catalog binding never authorizes recovery of an unsealed pack. */
+  ps_root *root = NULL;
+  ok(ps_root_open(path, 1, NULL, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "test", 1, &e);
+  ps_namespace_info identity;
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  ok(ps_catalog_allocate_id(ps_root_space(root), &id, &e), &e);
+  char leaf[40];
+  REQUIRE(snprintf(leaf, sizeof(leaf), "body-%020lu.log", (unsigned long)id) ==
+          29);
+  ps_key key = {id, identity.owner, PS_STREAM};
+  ps_stream *stream = NULL;
+  ps_stream_info info;
+  ps_catalog_info binding;
+  ok(ps_stream_open(ps_root_space(root), key, 1, NULL, NULL, NULL, &stream, &e),
+     &e);
+  ok(ps_stream_status(stream, &info, &e), &e);
+  ok(ps_catalog_put(ps_root_space(root), identity.owner, PS_CATALOG_BODY, leaf,
+                    strlen(leaf), NULL, key, &info.ref, &binding, &e),
+     &e);
+  ok(ps_stream_close(stream, &e), &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  invalid_namespace(path, &e);
+  REQUIRE(unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -1871,6 +2028,8 @@ static void *worker(void *p) {
     snapshot_concurrency(r->path);
   else if (!strcmp(r->mode, "snapshot-churn"))
     snapshot_churn(r->path);
+  else if (!strcmp(r->mode, "bodies"))
+    bodies(r->path);
   else
     concurrency(r->path);
   return NULL;

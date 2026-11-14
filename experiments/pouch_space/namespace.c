@@ -157,6 +157,10 @@ static int collect_snapshot(void *context, const void *name, size_t length,
   return collect_resource(context, name, length, binding, PS_CATALOG_SNAPSHOT,
                           e);
 }
+static int collect_body(void *context, const void *name, size_t length,
+                        const ps_catalog_info *binding, lc_error *e) {
+  return collect_resource(context, name, length, binding, PS_CATALOG_BODY, e);
+}
 static int compare_segment(const void *a, const void *b) {
   const segment *left = *(segment *const *)a, *right = *(segment *const *)b;
   uint64_t x = left->id, y = right->id;
@@ -172,8 +176,9 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   unsigned char *scratch = NULL;
   uint64_t cursor = 0, next;
   int rc = LC_OK, found, truncated;
-  if (s->kind == PS_CATALOG_SNAPSHOT)
-    return failure(e, LC_ERR_PROTOCOL, "namespace snapshot is not sealed");
+  if (s->kind != PS_CATALOG_SEGMENT)
+    return failure(e, LC_ERR_PROTOCOL,
+                   "namespace immutable source is not sealed");
   if (s->unselected) {
     if (checkpoint)
       return failure(e, LC_ERR_PROTOCOL,
@@ -251,6 +256,9 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
                           PS_CATALOG_SNAPSHOT, collect_snapshot, d, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_visit(ns->root->space, ns->identity.owner, PS_CATALOG_BODY,
+                          collect_body, d, e);
   if (rc == LC_OK && d->count)
     qsort(d->items, d->count, sizeof(*d->items), compare_segment);
   if (rc == LC_OK && d->snapshot_id &&
@@ -280,12 +288,13 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
       }
     }
     s->unselected =
+        s->kind != PS_CATALOG_BODY &&
         s->id > (s->kind == PS_CATALOG_SEGMENT ? d->active : d->snapshot_id);
     rc = ps_stream_open(ns->root->space, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(s->stream, &info, e);
-    if (s->kind == PS_CATALOG_SNAPSHOT) {
+    if (s->kind != PS_CATALOG_SEGMENT) {
       if (rc == LC_OK && !info.sealed)
         rc = failure(e, LC_ERR_PROTOCOL, "namespace snapshot is not sealed");
       continue;
@@ -313,6 +322,51 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
     *out = d;
   return rc;
 }
+int ps_namespace_sources_visit(ps_namespace *ns, ps_namespace_source_fn visit,
+                               void *context, lc_error *e) {
+  struct ps_namespace_data *d;
+  ps_namespace_source *sources = NULL;
+  ps_stream_info info;
+  size_t i, count = 0;
+  int rc;
+  if (!visit)
+    return failure(e, LC_ERR_INVALID, "namespace sources need a visitor");
+  rc = ps_ns_data_get(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  ps_namespace_retain(ns);
+  pthread_mutex_lock(&d->mutex);
+  if (d->count > (size_t)-1 / sizeof(*sources))
+    rc = failure(e, LC_ERR_NOMEM,
+                 "namespace source capture exceeds local limit");
+  if (rc == LC_OK && d->count) {
+    sources = lc_calloc_with_allocator(NULL, d->count, sizeof(*sources));
+    if (!sources)
+      rc = failure(e, LC_ERR_NOMEM, "cannot capture namespace sources");
+  }
+  for (i = 0; rc == LC_OK && i < d->count; ++i) {
+    segment *s = d->items[i];
+    if (s->unselected)
+      continue;
+    rc = ps_stream_status(s->stream, &info, e);
+    if (rc == LC_OK) {
+      sources[count].leaf = s->leaf;
+      sources[count].kind = s->kind;
+      sources[count].id = s->id;
+      sources[count].tail = info.tail;
+      sources[count].capacity = info.capacity;
+      sources[count].sealed = info.sealed;
+      ++count;
+    }
+  }
+  pthread_mutex_unlock(&d->mutex);
+  for (i = 0; rc == LC_OK && i < count; ++i)
+    rc = visit(context, &sources[i], e);
+  lc_free_with_allocator(NULL, sources);
+  ps_namespace_release(ns);
+  return rc;
+}
+
 int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
                    lc_error *e) {
   struct ps_namespace_data *fresh = NULL;
@@ -567,8 +621,10 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
     segment *s = d->items[i];
     if (s->kind == PS_CATALOG_SEGMENT)
       ++out->bound_segments;
-    else
+    else if (s->kind == PS_CATALOG_SNAPSHOT)
       ++out->bound_snapshots;
+    else
+      ++out->bound_bodies;
     if (s->unselected)
       continue;
     rc = ps_stream_status(s->stream, &info, e);
@@ -725,7 +781,8 @@ int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
   if (out)
     *out = NULL;
   if (!out || !id ||
-      (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_SNAPSHOT))
+      (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_SNAPSHOT &&
+       kind != PS_CATALOG_BODY))
     return failure(e, LC_ERR_INVALID,
                    "namespace read requires segment and output");
   rc = ps_ns_data_get(ns, &d, e);

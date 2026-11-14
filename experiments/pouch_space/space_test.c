@@ -1969,6 +1969,46 @@ static void stream_expect(ps_stream *s, uint64_t start, const void *bytes,
   ps_stream_reader_close(r);
 }
 
+static void canonical_stream_exact_reservations(void) {
+  const size_t spans[] = {4031,  4032,  4033,  20351, 20352,
+                          20353, 85823, 85824, 85825};
+  unsigned char *body = malloc(spans[8]);
+  size_t i, j;
+  CHECK(body != NULL);
+  for (j = 0; j < spans[8]; ++j)
+    body[j] = (unsigned char)(j * 17 + j / 29);
+  for (i = 0; i < sizeof(spans) / sizeof(*spans); ++i) {
+    ps_space *space;
+    ps_stream *stream;
+    ps_stream_writer *writer = NULL;
+    ps_stream_info before, after;
+    uint64_t offset;
+    clean();
+    space = create(PS_DEFAULT_CAPACITY, 0, NULL);
+    stream = stream_open(space, 1, 1, NULL, NULL);
+    OK(ps_stream_begin(stream, &writer, &error));
+    OK(ps_stream_reserve_exact(writer, spans[i], &error));
+    OK(ps_stream_status(stream, &before, &error));
+    CHECK(!before.tail && before.capacity >= spans[i] &&
+          before.capacity - spans[i] < PS_PAGE);
+    ps_stream_writer_close(writer);
+    OK(canonical_append(stream, body, spans[i] - 43, 7, i, &offset, &error));
+    OK(ps_stream_status(stream, &after, &error));
+    CHECK(offset == 0 && after.tail == spans[i] &&
+          after.capacity == before.capacity && after.runs == before.runs);
+    stream_expect(stream, 0, body, spans[i] - 43, i);
+    OK(ps_checkpoint(space, &error));
+    OK(ps_stream_close(stream, &error));
+    OK(ps_close(space, &error));
+    space = reopen(NULL);
+    stream = stream_open(space, 1, 0, &after.ref, NULL);
+    stream_expect(stream, 0, body, spans[i] - 43, i);
+    OK(ps_stream_close(stream, &error));
+    OK(ps_close(space, &error));
+    clean();
+  }
+  free(body);
+}
 static void canonical_stream_lifecycle(void) {
   ps_space *space;
   ps_stream *stream, *other_stream = NULL;
@@ -4328,7 +4368,7 @@ static void catalog_invalid_records(void) {
     if (phase == 0)
       fixture_put(wire + 64, 99, 4);
     else if (phase == 1)
-      fixture_put(wire + 68, 6, 4);
+      fixture_put(wire + 68, PS_CATALOG_BODY + 1, 4);
     else if (phase == 2)
       fixture_put(wire + 72, PS_STATE, 4);
     else if (phase == 3)
@@ -4527,6 +4567,7 @@ int main(int argc, char **argv) {
       stream_lifecycle_invalid_events();
       stream_lifecycle_rebind_rollover();
     } else if (strcmp(argv[2], "streams") == 0) {
+      canonical_stream_exact_reservations();
       canonical_stream_lifecycle();
       canonical_stream_faults();
       canonical_stream_reused_grants();

@@ -2472,11 +2472,177 @@ SHA-256 `d0a9475454c63fab72dc81230e74a6b6c709fd55320d76c4b216e53152b2a643`.
 The prior `pouch_space_compare-snapshot-codec-current` remains
 `a82c2175c391debc6c4987677e0ef6f71a611d9307f96d5b3a3803b4ec8b0ccf`.
 
-Automatic maintenance publication/invalidation, history protection, victim
-selection and complete capacity admission still require integration. This
-capture supplies the logical metadata needed to calculate workspace; it does
-not establish that the existing physical reserve can fit that workspace.
-Actual end-to-end container maintenance performance remains unmeasured.
+At this checkpoint, the capture supplied logical metadata for calculating
+workspace without establishing that the physical reserve could fit it. These
+measurements did not execute maintenance; end-to-end measurements follow below.
+
+## Forced ordinary-state compaction
+
+The private container harness now exposes `ps_pouch_state_compact`: one forced
+ordinary-state pass that publishes a complete metadata snapshot and relocates
+live bodies from at most one sealed source. It preserves current state/object
+values, metadata, tombstones, placeholders, versions and both sequence high-water
+marks. It is not the public maintenance API or an automatic background policy. History
+consumers, staged/XA records, collections, indexes and retention scheduling
+remain outside this harness's maintenance contract.
+
+The pass captures the selected prefix under logical namespace authority, counts
+live encoded bytes by source, and selects a sealed source using capacity minus
+live body bytes. Shared canonical encoders measure the metadata snapshot and
+selected body's canonical frames without body I/O. Known spans are reserved
+before copying. Full grants retain geometric growth; the final grant is clipped
+to the page-rounded need. New sealed streams leave less than one 4 KiB page of
+logical capacity unused.
+
+Relocated bodies go into a separate sealed pack bound under `PS_CATALOG_BODY`
+(surface 6). Its stream owner is the globally unique build ID; its stream key
+binds the namespace identity. `body-<20 decimal digits>.log` is metadata inside
+the container, never another file. Packs do not participate in logical replay.
+The metadata snapshot contains references, placeholders, tombstones and HIGH_WATER.
+Separating these owners lets later metadata snapshots retain untouched bodies
+without copying every live value again.
+
+Encoded copying runs outside logical namespace authority with at most 128 KiB
+of heap scratch. It retains stored bytes, descriptors and immutable crypto
+contexts without decoding, re-encoding, payload spooling or whole-body buffering.
+Publication durably binds/seals the pack before selecting the metadata snapshot.
+It then captures the latest snapshot plus tail under the same logical authority
+used for publication, protects every current body source, and reclaims only
+eligible unreferenced sources. This protects a newer META that still refers to
+the original copied source. The resident logical projection is invalidated
+before that authority is released, including on an uncertain publication error.
+Old read pins survive retirement. Closed unbound streams from interrupted work
+are reclaimed through the existing root orphan API, followed by checkpoint.
+
+A selected snapshot may be rewritten at the same covered boundary; no artificial
+empty log rotation is needed to relocate a body. Encoded sources now validate
+their stored CRC as bytes are consumed, including covered original segments
+which are no longer replayed. A mismatch withholds the final chunk and remains
+an error until reset. Reset and clone start independent checksum/cursor state;
+pins and their storage owner can outlive Pouch.
+
+This is still **partial admission**: known canonical payload grants are reserved,
+but the complete rotation, catalog, head, checkpoint and concurrent-foreground
+budget is not yet protected. The fixed physical reserve does not establish
+full-store maintenance admission. Label interning still follows namespace-owner
+lifetime. Normal public open remains multifile, with exclusive ownership in the
+experimental harness and no existing-root conversion or production cutover.
+
+### Verification
+
+- All 363 Debug ASan/UBSan tests have passing evidence: 332 standard tests and
+  31 additional example/install checks. The first standard run had one
+  20-second `release_test_selection_test` timeout; its isolated retry took
+  18.82 seconds. The fixture now extracts each test's local JSON object before
+  checking properties, reducing the same check to 3.84 seconds. No production
+  C code changed after the broad run.
+- GNU release and native musl release each passed all 56 selected read,
+  namespace, state-codec, compaction, stream/catalog and native Pouch checks.
+  Debug uses the constrained worker-stack policy; musl uses its default stack.
+- All 19 selected ThreadSanitizer groups passed.
+- Repeated compaction across all four codec combinations and both durability
+  policies preserves tombstones, placeholders, object classification, newer
+  tail changes and both sequences through reopen. Metadata-only and initialized
+  empty namespaces and invalid entry points are covered too.
+- All 744 allocation-failure sites and 552 I/O-failure sites are injected,
+  including failed reads and writes that persist a partial prefix. Every attempt
+  is followed by reopen, value/version checks, retry and another readback.
+  Failure may leave a newer physical topology; logical values remain intact.
+- A deterministic held copy permits same-namespace META, a peer PUT and reads
+  before release. Reclamation retains the original source needed by that META.
+  The next pass copies only its 65,569-byte live body and retains the other pack.
+- Original and relocated sources across all four codecs detect corruption and
+  wrong CRCs, retain a sticky error, reset and clone correctly, and drain after
+  Pouch close. Opening and cloning encoded sources perform no payload I/O.
+- Body-pack tests reject malformed/overflow labels, foreign bindings and
+  unsealed recovery. Packs stay out of replay; source-enumeration callbacks can
+  append without deadlock and see their captured source set. Retirement retains
+  old pins. Exact reservation tests straddle the first three grant boundaries,
+  preserve the published tail during reservation, and reopen correctly.
+- Six Memcheck groups completed 1,716,224 matched allocations/frees with zero
+  errors, leaks or suppressions, including both failure campaigns.
+  Changed-line clang-format verification and `git diff --check` passed.
+
+Evidence uses `build/pouch-space-integrated/maintenance-` prefixes:
+`debug-tests.log`, `debug-selection-fixed.log`,
+`debug-additional-tests.log`, `gnu-tests.log`, `musl-tests.log` and
+`tsan-tests.log`, with matching build logs.
+The five `maintenance*-memcheck.log` groups and
+`maintenance-bodies-memcheck.log` contain memory-check output.
+
+### Matched compaction and read performance
+
+The 300 serial GNU release runs use five alternating-order samples: 60 actual
+compaction runs and 240 ordinary read runs. All container runs audit one fixed
+10 MiB file with no sidecars. Inputs are plaintext, delivered in 4 KiB chunks;
+OS page cache is retained. Every run verifies values after populated-root reopen.
+
+Compaction fixtures perform two PUT rounds into one source per namespace using
+an 8 MiB segment target on both engines. One forced pass per namespace is then
+timed separately from PUTs. Native terminal rotation is explicit, its minimum
+is one byte, and its throttle and obsolete-file grace are disabled for this
+comparison. The four-namespace rows measure four **sequential** compaction
+passes after four writers seeded the fixture, not parallel compaction throughput.
+Values below are medians.
+
+| Fixture | Policy | C (ms) | MF (ms) | C CPU (ms) | MF CPU (ms) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 512 × 1 KiB, 1 namespace | NoSync | 44.887 | 54.603 | 6.156 | 12.704 |
+| 512 × 1 KiB, 1 namespace | Durable | 40.290 | 55.457 | 5.765 | 13.130 |
+| 512 × 1 KiB, 4 namespaces | NoSync | 149.115 | 154.936 | 10.799 | 16.833 |
+| 512 × 1 KiB, 4 namespaces | Durable | 174.966 | 178.854 | 10.996 | 21.806 |
+| 64 × 32 KiB, 1 namespace | NoSync | 57.182 | 54.797 | 6.307 | 13.143 |
+| 64 × 32 KiB, 1 namespace | Durable | 46.592 | 58.735 | 6.666 | 12.691 |
+
+Container CPU medians are lower in all six fixtures. Wall-time ranges overlap
+in five of six; in the large durable fixture, container samples span
+38.564–48.424 ms and multifile samples 52.956–87.741 ms. This is a small-store
+characterization, not a general throughput guarantee.
+
+A container pass performs 15 sync calls under NoSync and 18 under durable
+policy, versus 10 multifile. Four sequential passes perform 60/72 versus 40.
+Structural maintenance remains durable under either policy. For the small
+single-namespace fixture, syscall writes total 990,392 bytes in the container
+versus 1,092,930 multifile; for large bodies, 2,197,174 versus 2,168,658.
+Extra barriers remain a concrete compaction cost despite the lower CPU time.
+
+Ordinary read runs compare current/prior container and current/prior multifile
+executables without invoking maintenance. The prior is the captured-projection
+checkpoint. Warm and reopened columns include each method's complete verification
+phase. Reopened measurements retain the OS cache and include initial logical
+projection loading; they are not cold-device measurements.
+
+| Fixture | Read method | Current C (ms) | Prior C (ms) | Current MF (ms) | Reopened C (ms) | Reopened MF (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1024 × 1 KiB, 1 reader | read-points | 4.448 | 3.792 | 31.353 | 15.749 | 27.716 |
+| 1024 × 1 KiB, 1 reader | read-many | 5.747 | 4.182 | 6.287 | 13.873 | 5.880 |
+| 1024 × 1 KiB, 1 reader | scan-bodies | 4.218 | 4.133 | 4.592 | 13.735 | 3.496 |
+| 1024 × 1 KiB, 1 reader | scan-metadata | 1.367 | 1.314 | 1.135 | 12.180 | 0.933 |
+| 1024 × 1 KiB, 4 readers | read-points | 2.160 | 2.078 | 13.489 | 10.635 | 11.862 |
+| 1024 × 1 KiB, 4 readers | read-many | 1.639 | 1.366 | 2.370 | 10.160 | 2.481 |
+| 1024 × 1 KiB, 4 readers | scan-bodies | 1.593 | 1.389 | 2.473 | 10.064 | 2.225 |
+| 1024 × 1 KiB, 4 readers | scan-metadata | 0.706 | 0.651 | 0.610 | 9.195 | 0.605 |
+| 64 × 32 KiB, 1 reader | read-points | 4.220 | 3.428 | 6.719 | 9.414 | 6.767 |
+| 64 × 32 KiB, 1 reader | read-many | 3.366 | 2.892 | 4.425 | 11.854 | 3.359 |
+| 64 × 32 KiB, 1 reader | scan-bodies | 4.036 | 2.637 | 3.149 | 12.553 | 2.619 |
+| 64 × 32 KiB, 1 reader | scan-metadata | 0.182 | 0.152 | 0.175 | 7.399 | 0.125 |
+
+The new checksum path adds body-read work. Several warm container medians rise,
+including large-body scans from 2.637 to 4.036 ms; current multifile is 3.149 ms.
+Current/prior sample ranges overlap, including 2.963–4.679 versus
+2.428–3.205 ms for that scan, so these samples do not attribute every timing
+change to checksum calculation. Metadata-only visits do not consume body bytes.
+The prior reopened-projection deficit remains visible. Neither it nor the
+previous single-writer NoSync mutation deficit is declared solved here.
+
+Raw logs are `maintenance-paired/`, with runner `maintenance-paired.sh` and
+`maintenance-results.json`. The 305-artifact
+`maintenance-artifacts.sha256` manifest verifies; previous 85-artifact projection
+and 285-artifact snapshot-codec manifests remain intact and verify.
+The measured current executable is `pouch_space_compare-maintenance-current`,
+SHA-256 `d6f686b1a9b0540a20e8f737c9996b6d71d6c66a15eaff2acee422042d6d4eda`.
+The prior `pouch_space_compare-projection-current` remains
+`d0a9475454c63fab72dc81230e74a6b6c709fd55320d76c4b216e53152b2a643`.
 
 ## Next commitments
 
@@ -2490,14 +2656,16 @@ container owner. Ordinary production state PUT/projection/point-read, metadata
 update, deletion, read-many, metadata visits and paged scan/body snapshots now
 join it through the private integration harness. Physical namespace snapshot
 publication and protected obsolete-source reclamation are now available too.
-The next work must close whole-operation maintenance admission at capacity, address
-remaining NoSync and reopened-projection costs, and connect advanced mutations,
-public query-client and collection ownership, then
-complete the public behavior suites. Full native integration still
-requires checkpoint scheduling,
-relocating compaction, metadata repacking, process-shared reader
-ownership, and complete public Pouch semantics. The current foundation permits
-rebinding a deleted physical key; it does not supply permanent collection
+Forced ordinary-state compaction now joins these owners, with separate sealed
+body packs and a current-tail liveness check before reclamation. Its first
+matched performance series and checksum/read tradeoff are recorded above.
+The next work must close whole-operation maintenance admission at capacity,
+address remaining NoSync, checksum/body-read and reopened-projection costs, and
+connect advanced mutations, public query-client and collection ownership, then
+complete the public behavior suites. Full native integration still requires
+checkpoint scheduling, automatic compaction/retention policy, metadata repacking,
+process-shared reader ownership, and complete public Pouch semantics. The current
+foundation permits rebinding a deleted physical key; it does not supply permanent collection
 position or retry authority. Full codec/index/XA/outbox integration remains part
 of the authorized native implementation; existing-root conversion is excluded.
 Production adoption still requires the

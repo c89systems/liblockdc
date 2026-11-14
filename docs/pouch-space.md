@@ -43,8 +43,14 @@ semantics, maintenance and shared-root coordination remain ahead. The namespace
 owner now publishes sealed canonical snapshots, replays their newer log tail,
 and explicitly retires obsolete sources while protecting captured readers.
 Closed unbound private builds can be reclaimed without reading their bodies.
-Logical compaction policy and complete maintenance admission remain required;
-normal public open behavior has not changed.
+The private harness now performs forced ordinary-state compaction: it relocates
+one source into a sealed body pack, publishes a metadata-only snapshot, and
+rechecks current tail references before reclamation. Unrelated live bodies need
+not be copied for each new metadata snapshot. Stored-body CRCs are checked as
+encoded sources are consumed. Automatic policy, history protection and complete
+maintenance admission remain required; normal public open behavior has not
+changed. The experiment records matched compaction measurements and the new
+body-read cost alongside its earlier performance results.
 
 ## Intent
 

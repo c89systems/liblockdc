@@ -75,6 +75,7 @@ struct comparison {
   int read_method; /* 1: read-many; 2: scan bodies; 3: scan metadata; 4: points.
                     */
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
+  int compaction; /* Force one pass per namespace after the two PUT rounds. */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -545,7 +546,9 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     options.durable_sync = c->sync;
     options.query_indexing_enabled_set = 1;
     options.background_compaction_enabled_set = 1;
-    options.segment_target_bytes = PS_MIB;
+    options.segment_target_bytes = c->compaction ? 8 * PS_MIB : PS_MIB;
+    options.terminal_reclaim_min_bytes = c->compaction ? 1 : 0;
+    options.compaction_throttling_disabled = c->compaction;
     options.compression = "none";
     if (c->runtime) {
       ps_pouch_state_options integrated = {0};
@@ -555,6 +558,10 @@ static void open_stores(comparison *c, int create, lc_error *e) {
             e);
     } else
       check(lc_pouch_open(c->store, NULL, &options, &c->pouch, e), e);
+    /* Compare completed reclamation, without the native obsolete-file grace
+     * period or bandwidth throttle. These are private benchmark fixtures. */
+    if (c->compaction)
+      c->pouch->compaction_delete_grace_seconds = 0;
     return;
   }
   lc_client_config_init(&config);
@@ -996,13 +1003,41 @@ static int compare_double(const void *a, const void *b) {
   double x = *(const double *)a, y = *(const double *)b;
   return (x > y) - (x < y);
 }
+static void compact_all(comparison *c, lc_error *e) {
+  size_t i;
+  char ns[64], name[64];
+  for (i = 0; i < c->writers; ++i) {
+    names(i, i, ns, name);
+    if (c->runtime) {
+      ps_pouch_compaction_result result;
+      check(ps_pouch_state_compact(c->pouch, ns, &result, e), e);
+      require(!result.skipped && result.snapshot && result.boundary == 1 &&
+                  result.copied_bytes ==
+                      (c->rows + c->writers - 1 - i) / c->writers * c->bytes,
+              "container compaction copies the current bodies of one prefix");
+    } else {
+      lc_pouch_maintenance_options options = {0};
+      lc_pouch_maintenance_result result = {0};
+      options.ns = ns;
+      options.force = 1;
+      options.terminal_reclaim = 1;
+      check(lc_pouch_maintenance_run(c->pouch, &options, &result, e), e);
+      require(result.compacted && !result.aborted &&
+                  result.candidate_segment_count == 1,
+              "multifile compaction covers the same single prefix");
+      lc_pouch_maintenance_result_cleanup(NULL, &result);
+    }
+  }
+}
 int main(int argc, char **argv) {
   comparison c;
   lc_error e;
   io_counts before, after;
+  io_counts compact_before = {0}, compact_after = {0};
   files artifacts = {0}, audit = {0};
   ps_stats stats, initial_stats = {0};
   uint64_t fd_before, full_before, ns_before, fd_calls, full_calls, sync_ns;
+  uint64_t compact_sync_calls = 0, compact_sync_ns = 0;
   long max_sync_batch = -1;
   long checkpoints = -1, directory_writes = -1, descriptor_writes = -1;
   long metadata_pages = -1;
@@ -1018,6 +1053,7 @@ int main(int argc, char **argv) {
       open_seconds, create_seconds, reopen_read_seconds, preopen_seconds = 0,
                                                          seed_seconds = 0;
   double read_cpu_begin, read_cpu_seconds, reopen_read_cpu_seconds;
+  double compact_seconds = 0, compact_cpu_seconds = 0;
   int preopen;
   if (argc != 8 && argc != 9) {
     fprintf(
@@ -1025,6 +1061,7 @@ int main(int argc, char **argv) {
         "usage: %s "
         "space-state|stream-state|runtime-state|pouch-state|space-collection|"
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
+        "runtime-compact|pouch-compact|"
         "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
         "points|"
         "runtime-scan-bodies|pouch-scan-bodies|"
@@ -1047,6 +1084,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-metadata") ||
               !strcmp(argv[1], "runtime-delete") ||
               !strcmp(argv[1], "pouch-delete") ||
+              !strcmp(argv[1], "runtime-compact") ||
+              !strcmp(argv[1], "pouch-compact") ||
               !strcmp(argv[1], "runtime-read-many") ||
               !strcmp(argv[1], "pouch-read-many") ||
               !strcmp(argv[1], "runtime-read-points") ||
@@ -1060,6 +1099,7 @@ int main(int argc, char **argv) {
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
+  c.compaction = strstr(argv[1], "compact") != NULL;
   c.read_method = strstr(argv[1], "read-many")       ? 1
                   : strstr(argv[1], "scan-bodies")   ? 2
                   : strstr(argv[1], "scan-metadata") ? 3
@@ -1163,6 +1203,23 @@ int main(int argc, char **argv) {
       __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED) - full_before;
   sync_ns = __atomic_load_n(&syscall_sync_ns, __ATOMIC_RELAXED) - ns_before;
   after = io_sample();
+  if (c.compaction) {
+    compact_before = io_sample();
+    compact_sync_calls = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED) +
+                         __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED);
+    compact_sync_ns = __atomic_load_n(&syscall_sync_ns, __ATOMIC_RELAXED);
+    cpu = now(CLOCK_PROCESS_CPUTIME_ID);
+    start = now(CLOCK_MONOTONIC);
+    compact_all(&c, &e);
+    compact_seconds = now(CLOCK_MONOTONIC) - start;
+    compact_cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - cpu;
+    compact_sync_calls = __atomic_load_n(&fd_sync_calls, __ATOMIC_RELAXED) +
+                         __atomic_load_n(&full_sync_calls, __ATOMIC_RELAXED) -
+                         compact_sync_calls;
+    compact_sync_ns =
+        __atomic_load_n(&syscall_sync_ns, __ATOMIC_RELAXED) - compact_sync_ns;
+    compact_after = io_sample();
+  }
   if (c.container) {
     check(ps_status(c.space, &stats, &e), &e);
     max_sync_batch = (long)stats.max_sync_batch;
@@ -1283,18 +1340,26 @@ int main(int argc, char **argv) {
       (unsigned long)artifacts.logical, (unsigned long)artifacts.allocated,
       usage.ru_maxrss, (unsigned long)fd_calls, (unsigned long)full_calls,
       (double)sync_ns / 1e6, max_sync_batch);
-  printf("checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
-         "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
-         "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
-         "logical_segments=%lu "
-         "preopened=%d preopen_ms=%.6f seed_ms=%.6f max_us=%.3f "
-         "read_cpu_ms=%.6f reopen_read_cpu_ms=%.6f verified=1\n",
-         checkpoints, directory_writes, descriptor_writes, metadata_pages,
-         packed_pages, packed_bytes, payload_allocated, journal_used,
-         stream_grants, (unsigned long)logical_segments, preopen,
-         preopen_seconds * 1000, seed_seconds * 1000,
-         c.latencies[count - 1] * 1e6, read_cpu_seconds * 1000,
-         reopen_read_cpu_seconds * 1000);
+  printf(
+      "checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
+      "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
+      "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
+      "logical_segments=%lu "
+      "preopened=%d preopen_ms=%.6f seed_ms=%.6f max_us=%.3f "
+      "read_cpu_ms=%.6f reopen_read_cpu_ms=%.6f "
+      "compact_ms=%.6f compact_cpu_ms=%.6f compact_write_calls=%lu "
+      "compact_read_calls=%lu compact_written=%lu compact_sync_calls=%lu "
+      "compact_sync_ms=%.6f verified=1\n",
+      checkpoints, directory_writes, descriptor_writes, metadata_pages,
+      packed_pages, packed_bytes, payload_allocated, journal_used,
+      stream_grants, (unsigned long)logical_segments, preopen,
+      preopen_seconds * 1000, seed_seconds * 1000, c.latencies[count - 1] * 1e6,
+      read_cpu_seconds * 1000, reopen_read_cpu_seconds * 1000,
+      compact_seconds * 1000, compact_cpu_seconds * 1000,
+      (unsigned long)(compact_after.write_calls - compact_before.write_calls),
+      (unsigned long)(compact_after.read_calls - compact_before.read_calls),
+      (unsigned long)(compact_after.written - compact_before.written),
+      (unsigned long)compact_sync_calls, (double)compact_sync_ns / 1e6);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);

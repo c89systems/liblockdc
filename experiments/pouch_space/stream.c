@@ -348,7 +348,8 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
 uint64_t ps_stream_writer_start(const ps_stream_writer *w) {
   return w ? w->start : 0;
 }
-static int ensure_capacity(ps_stream *s, uint64_t end, lc_error *error) {
+static int ensure_capacity(ps_stream *s, uint64_t end, int exact,
+                           lc_error *error) {
   ps_owned_run *run;
   uint64_t desired;
   int rc = LC_OK, found;
@@ -359,6 +360,10 @@ static int ensure_capacity(ps_stream *s, uint64_t end, lc_error *error) {
                        : PS_PAGE;
     if (desired > PS_MIB)
       desired = PS_MIB;
+    if (exact && end - s->capacity < desired - PS_RUN_HEADER) {
+      desired = end - s->capacity + PS_RUN_HEADER;
+      desired = (desired + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
+    }
     pthread_mutex_unlock(&s->mutex);
     if (rc == LC_OK)
       rc = ps_owned_grant(s->head, s->capacity, desired, &run, &found, error);
@@ -374,21 +379,29 @@ static int ensure_capacity(ps_stream *s, uint64_t end, lc_error *error) {
   }
   return rc;
 }
-int ps_stream_reserve(ps_stream_writer *w, uint64_t bytes, lc_error *error) {
+static int reserve(ps_stream_writer *w, uint64_t bytes, int exact,
+                   lc_error *error) {
   int rc;
   if (!w || w->failed || w->published || bytes > (uint64_t)INT64_MAX - w->start)
     return stream_error(error, LC_ERR_INVALID,
                         "stream reservation arguments invalid");
-  rc = ensure_capacity(w->stream, w->start + bytes, error);
+  rc = ensure_capacity(w->stream, w->start + bytes, exact, error);
   if (rc != LC_OK)
     w->failed = 1;
   return rc;
+}
+int ps_stream_reserve(ps_stream_writer *w, uint64_t bytes, lc_error *error) {
+  return reserve(w, bytes, 0, error);
+}
+int ps_stream_reserve_exact(ps_stream_writer *w, uint64_t bytes,
+                            lc_error *error) {
+  return reserve(w, bytes, 1, error);
 }
 static int stream_flush(ps_stream_writer *w, lc_error *error) {
   int rc;
   if (!w->used)
     return LC_OK;
-  rc = ensure_capacity(w->stream, w->start + w->flushed + w->used, error);
+  rc = ensure_capacity(w->stream, w->start + w->flushed + w->used, 0, error);
   if (rc == LC_OK)
     rc = stream_io(w->stream, w->start + w->flushed, w->buffer, w->used, 1,
                    error);

@@ -32,7 +32,7 @@ static void write32(unsigned char *p, uint32_t n) {
     p[i] = (unsigned char)(n >> (i * 8));
 }
 static int arguments(unsigned int kind, const void *name, size_t length) {
-  return kind <= PS_CATALOG_CONTROL && (name || !length) &&
+  return kind <= PS_CATALOG_BODY && (name || !length) &&
          length <= PS_CATALOG_NAME_MAX;
 }
 static uint64_t name_hash(uint64_t owner, unsigned int kind, const void *name,
@@ -460,7 +460,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   size_t i, count = 0, at = 0;
   uint64_t prefix;
   int rc, collect = 0;
-  if (!s || !callback || kind > PS_CATALOG_CONTROL)
+  if (!s || !callback || kind > PS_CATALOG_BODY)
     return cat_error(e, LC_ERR_INVALID, "catalog visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);

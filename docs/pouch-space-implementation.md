@@ -271,7 +271,8 @@ adopting an otherwise valid snapshot binding. Canonical
 Snapshot begin finishes any pending predecessor seal and rotates a nonempty
 active segment. It captures the selected snapshot plus sealed prefix, including
 an immutable empty window for the new active segment. An already empty active
-segment needs no extra rotation. Empty or unadvanced prefixes are rejected.
+segment needs no extra rotation. A first snapshot requires a nonempty sealed
+prefix; a selected snapshot can be rewritten at the same covered boundary.
 One builder owns this capture; ordinary appends and other namespaces continue
 while its producer writes canonical records directly through bounded record I/O.
 The logical caller supplies a complete projection, high-water marks, tombstones
@@ -295,10 +296,10 @@ active segment identity. Interned labels retain their existing namespace-owner
 lifetime; closing obsolete stream owners does not invalidate a borrowed label.
 Private unbound snapshot labels last only until builder close.
 
-Explicit reclamation accepts only covered segments or older snapshots. The
-logical caller must first prove that current records, links and history no
-longer need the source; a covered boundary alone does not prove that. Catalog
-removal is durable before stream retirement. New namespace read admission then
+Explicit reclamation accepts covered segments, older snapshots and sealed body
+packs. The logical caller must first prove that current records, links and
+history no longer need the source; a covered boundary alone does not prove that.
+Catalog removal is durable before stream retirement. New namespace read admission then
 fails, while captured windows and their clones retain the old bytes. Reap
 defers retirement for catalog views and closes retired owners only after read
 pins drain. Physical reuse still waits for checkpoint retirement. Source
@@ -310,10 +311,11 @@ concurrently. It opens no canonical reader and reads no bodies, so incomplete
 private builds left by process death need no application-record recovery.
 No persistent sidecar or second payload log is introduced.
 
-These are physical publication and reclamation capabilities. The production
-state harness can reopen and mutate values stored in a selected snapshot, but
-automatic logical compaction, projection invalidation, history protection,
-retention scheduling and complete maintenance-capacity budgets remain required.
+These physical publication and reclamation capabilities now join the production
+ordinary-state harness through the forced pass below. It performs logical
+publication, projection invalidation and current-source reclamation. Automatic
+policy, history protection, retention scheduling and complete maintenance-capacity
+budgets remain required.
 The fixed-capacity churn proof uses a caller-supplied complete one-key snapshot;
 it does not establish full-store maintenance admission.
 
@@ -347,8 +349,9 @@ corrects native clean-close projection writing, which previously passed that
 flag as unused descriptor reserve instead of setting the payload flag.
 Native reopen tests now assert that internal objects remain objects.
 
-Safe obsolete-source decisions, history protection and complete
-maintenance-capacity admission remain integration work. These
+The ordinary-state pass below supplies current-source liveness decisions;
+history protection and complete maintenance-capacity admission remain
+integration work. These
 helpers introduce no public ABI or persistent format/version change.
 
 ## Captured logical snapshots
@@ -381,6 +384,53 @@ This work also fixes queued metadata-entry copying to retain the prior query
 sequence and its presence flag. Without that copy, a metadata update could
 persist query generation zero while the live cache retained its prior public
 generation. Captured canonical replay now agrees with the live projection.
+
+## Forced ordinary-state maintenance
+
+`ps_pouch_state_compact` now captures a prefix, measures its canonical metadata
+snapshot and one selected source's body frames without body I/O, reserves those
+known spans, and copies outside logical namespace authority. Its forced victim
+score is source capacity minus current live encoded-body bytes. Complete
+metadata remains in each snapshot; untouched bodies retain their existing
+references. The initial capture is released before the publication-time capture
+so both metadata workspaces need not coexist.
+
+Selected bodies use a separate sealed stream bound under `PS_CATALOG_BODY`
+(surface 6), named `body-<20 decimal digits>.log`. The globally unique build ID
+is its stream owner, and the namespace ID is its stream key. These are typed
+labels inside the container, not files. Packs contain canonical body frames but
+never participate in logical replay. Namespace load rejects foreign ownership,
+invalid labels and unsealed packs. This extends the prototype's catalog kind
+set without an external compatibility/version commitment.
+
+Exact sealed-build reservation retains full geometric grants and clips the last
+grant to the page-rounded remaining span. It advances neither canonical cursor
+nor published tail; completed body/snapshot tails must equal measured sizes.
+This reserves output payload grants only. It does not yet admit the complete
+rotation/catalog/head/checkpoint dependency set or protect that budget from
+concurrent foreground writers.
+
+The pass durably binds its body pack before selecting its metadata snapshot.
+Under the same logical namespace authority, it then captures the latest snapshot
+plus newer tail and protects all current body sources before retirement. A
+newer META can therefore retain the original copied source. Publication
+invalidates the resident cache before releasing authority, including on failure.
+Source removal, reap, closed-unbound orphan collection and checkpoint reuse the
+existing physical owners and retain caller-held read pins. A late failure can
+leave a selected new physical topology; reopen/retry preserves logical values.
+
+Encoded sources check the stored CRC incrementally, including covered original
+segments which metadata-only snapshot replay no longer visits. Mismatch
+withholds the final chunk and stays an error until reset. Reset and clones start
+at zero with independent checksum state; their shared immutable window and
+storage owner can outlive Pouch. Copy scratch stays bounded at 128 KiB, without
+body materialization or payload spooling.
+
+This remains a private forced ordinary-state operation. History consumers,
+staged/XA decisions, collections, indexes, retention scheduling, shared-root
+coordination and complete protected capacity remain integration work. Current
+measurements and their observed read regression are recorded in the
+[experiment results](pouch-space-experiment.md#forced-ordinary-state-compaction).
 
 ## Production state integration
 

@@ -1951,7 +1951,8 @@ static int copy_snapshot_record(void *context,
         copy->pouch->storage.context, copy->ns,
         record->payload_span.container_leaf,
         record->payload_span.payload_offset,
-        record->payload_span.payload_length, &encoded, e);
+        record->payload_span.payload_length, record->payload_span.payload_crc,
+        &encoded, e);
   if (rc == LC_OK)
     rc = lc_pouch_state_record_write_snapshot(
         &allocator, ps_namespace_snapshot_output(copy->builder),
@@ -2739,6 +2740,434 @@ static void projection_concurrency(const char *path, const char *directory) {
   }
   lc_error_cleanup(&e);
 }
+static int maintenance_reserved(void *context, const ps_namespace_source *s,
+                                lc_error *e) {
+  (void)context;
+  (void)e;
+  if (s->kind == PS_CATALOG_SNAPSHOT || s->kind == PS_CATALOG_BODY)
+    REQUIRE(s->sealed && s->tail && s->capacity >= s->tail &&
+            s->capacity - s->tail < PS_PAGE);
+  return LC_OK;
+}
+static void maintenance_empty(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  ps_pouch_compaction_result result;
+  REQUIRE(ps_pouch_state_compact(NULL, "projection", &result, &e) ==
+          LC_ERR_INVALID);
+  REQUIRE(!result.snapshot && !result.records);
+  clear(&e);
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  REQUIRE(ps_pouch_state_compact(p, "", &result, &e) == LC_ERR_INVALID);
+  clear(&e);
+  REQUIRE(ps_pouch_state_compact(p, NULL, &result, &e) == LC_ERR_INVALID);
+  clear(&e);
+  void *ns = NULL;
+  ok(p->storage.ops->namespace_open(p->storage.context, "projection", 1, &ns,
+                                    &e),
+     &e);
+  ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+  REQUIRE(result.skipped && !result.snapshot && !result.records);
+  projection_meta(p, "placeholder", "only", 1, 1, &e);
+  ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+  REQUIRE(!result.skipped && result.snapshot && result.records == 1 &&
+          !result.body_bytes && !result.copied_bytes);
+  ok(ps_namespace_sources_visit(ns, maintenance_reserved, NULL, &e), &e);
+  p->storage.ops->namespace_close(p->storage.context, ns);
+  lc_pouch_close(p);
+  REQUIRE(live == 0);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  lc_pouch_state_read_result r = {0};
+  ok(lc_pouch_state_read_metadata(p, "projection", "placeholder", &r, &e), &e);
+  REQUIRE(r.found && !r.has_body && !r.version && r.query_hidden &&
+          r.metadata_length == 4 && !memcmp(r.metadata, "only", 4));
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+  REQUIRE(result.records == 1 && !result.body_bytes);
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+static void maintenance(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  maintenance_empty(path);
+  for (int crypto = 0; crypto < 4; ++crypto)
+    for (int sync = 0; sync < 2; ++sync) {
+      ps_pouch_state_options o = options(crypto, sync);
+      o.logical.segment_target_bytes = 8 * PS_MIB;
+      lc_pouch *p = NULL;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      projection_fixture(p, &e);
+      lc_pouch_state_read_result pinned = {0};
+      ok(lc_pouch_state_read(p, "projection", "a-state", &pinned, &e), &e);
+      ps_pouch_compaction_result result;
+      ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+      REQUIRE(!result.skipped && result.records == 5 && result.snapshot &&
+              result.boundary == 1 && result.body_bytes &&
+              result.metadata_bytes < 65536 && result.copied_bytes);
+      /* The resident cache must be invalidated before covered sources can be
+       * retired. These reads cannot fall back to their prior segment labels. */
+      read_value(p, "projection", "a-state", 65569, 34, 2, &e);
+      read_value(p, "projection", "z-object", 1048601, 35, 2, &e);
+      drain(pinned.body, 65569, 34, &e);
+      lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+      uint64_t first = result.snapshot;
+      ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+      REQUIRE(result.snapshot > first && result.boundary == 1 &&
+              result.records == 5 && !result.pending_sources);
+      projection_put(p, "a-state", 31, 99, 0, 12, &e);
+      projection_put(p, "tail", 31, 77, 0, 13, &e);
+      projection_meta(p, "z-object", "tail-object", 0, 14, &e);
+      ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+      REQUIRE(result.records == 6 && result.boundary == 2);
+      projection_readback(p, &e);
+      ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+      REQUIRE(result.records == 6 && result.boundary == 2);
+      projection_readback(p, &e);
+      void *ns = NULL;
+      ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
+                                        &ns, &e),
+         &e);
+      ok(ps_namespace_sources_visit(ns, maintenance_reserved, NULL, &e), &e);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      one_file(directory);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      projection_readback(p, &e);
+      lc_pouch_close(p);
+      REQUIRE(live == 0 && unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
+static void maintenance_fixture(lc_pouch *p, lc_error *e) {
+  projection_put(p, "a-state", 65569, 1, 0, 1, e);
+  projection_put(p, "z-object", 65569, 2, 1, 2, e);
+  projection_put(p, "a-state", 65569, 3, 0, 3, e);
+  projection_meta(p, "a-state", "keep", 0, 4, e);
+  projection_meta(p, "l-placeholder", "lease", 1, 5, e);
+  projection_put(p, "m-delete", 31, 4, 0, 6, e);
+  lc_pouch_state_write_result w = {0};
+  ok(lc_pouch_state_delete(p, "projection", "m-delete", NULL, &w, e), e);
+  REQUIRE(w.index_seq == 7);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  projection_put(p, "n-state", 0, 5, 0, 8, e);
+}
+static void maintenance_readback(lc_pouch *p, lc_error *e) {
+  read_value(p, "projection", "a-state", 65569, 3, 2, e);
+  read_value(p, "projection", "z-object", 65569, 2, 1, e);
+  read_value(p, "projection", "n-state", 0, 5, 1, e);
+  lc_pouch_state_read_result r = {0};
+  ok(lc_pouch_state_read_metadata(p, "projection", "m-delete", &r, e), e);
+  REQUIRE(!r.found);
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(lc_pouch_state_read_metadata(p, "projection", "a-state", &r, e), e);
+  REQUIRE(r.index_seq == 4 && r.metadata_length == 4 &&
+          !memcmp(r.metadata, "keep", 4));
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(lc_pouch_state_read_metadata(p, "projection", "l-placeholder", &r, e), e);
+  REQUIRE(r.found && !r.has_body && !r.version && r.metadata_length == 5);
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  lc_pouch_generation seq;
+  ok(lc_pouch_state_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 8);
+  ok(lc_pouch_state_query_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 8);
+}
+static ssize_t maintenance_io_read(void *context, int fd, void *p, size_t n,
+                                   off_t at) {
+  io_fault *f = context;
+  if (io_fails(f))
+    return -1;
+  return io_read(context, fd, p, n, at);
+}
+static size_t maintenance_failure(const char *path, size_t nth, int kind,
+                                  int durable, int partial) {
+  lc_error e;
+  lc_error_init(&e);
+  io_fault f = {0};
+  ps_io io = {&f,         kind == 2 ? maintenance_io_read : io_read,
+              io_write,   io_sync,
+              io_reserve, NULL};
+  ps_pouch_state_options o = options(0, durable);
+  o.logical.segment_target_bytes = 8 * PS_MIB;
+  o.io = &io;
+  lc_pouch *p = NULL;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  maintenance_fixture(p, &e);
+  allocation = 0;
+  fail_at = nth;
+  f.fail = nth;
+  f.partial = partial;
+  if (!kind)
+    __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+  else
+    f.armed = 1;
+  ps_pouch_compaction_result result;
+  int rc = ps_pouch_state_compact(p, "projection", &result, &e);
+  __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+  f.armed = 0;
+  size_t total = kind ? f.calls : allocation;
+  if (nth == SIZE_MAX)
+    ok(rc, &e);
+  else {
+    REQUIRE(total >= nth);
+    REQUIRE(rc == LC_OK || rc == LC_ERR_NOMEM || rc == LC_ERR_TRANSPORT);
+  }
+  if (rc == LC_OK)
+    REQUIRE(result.records == 5 && result.snapshot && !result.skipped);
+  clear(&e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  maintenance_readback(p, &e);
+  /* Retry reconciles either the previous or a newly committed topology. */
+  ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+  maintenance_readback(p, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+  return total;
+}
+static void maintenance_faults(const char *path, int io) {
+  size_t cases = 0;
+  for (int durable = 0; durable < 2; ++durable)
+    for (int kind = io ? 1 : 0; kind <= (io ? 2 : 0); ++kind)
+      for (int partial = 0; partial <= (io ? 1 : 0); ++partial) {
+        size_t count =
+            maintenance_failure(path, SIZE_MAX, kind, durable, partial);
+        for (size_t nth = 1; nth <= count; ++nth)
+          (void)maintenance_failure(path, nth, kind, durable, partial);
+        cases += count;
+      }
+  printf("maintenance %s failure sites: %lu\n", io ? "I/O" : "allocation",
+         (unsigned long)cases);
+}
+typedef struct maintenance_hold {
+  io_fault io;
+  int armed, ready, release, done;
+  lc_pouch *pouch;
+  ps_pouch_compaction_result result;
+} maintenance_hold;
+static ssize_t maintenance_held_read(void *context, int fd, void *p, size_t n,
+                                     off_t at) {
+  maintenance_hold *h = context;
+  ssize_t got = pread(fd, p, n, at);
+  if (got >= 256 && __atomic_load_n(&h->armed, __ATOMIC_ACQUIRE)) {
+    size_t i;
+    for (i = 0; i < 256; ++i)
+      if (((unsigned char *)p)[i] != byte_at(i, 3))
+        break;
+    if (i == 256 && __atomic_exchange_n(&h->armed, 0, __ATOMIC_ACQ_REL)) {
+      __atomic_store_n(&h->ready, 1, __ATOMIC_RELEASE);
+      while (!__atomic_load_n(&h->release, __ATOMIC_ACQUIRE))
+        sched_yield();
+    }
+  }
+  return got;
+}
+static void *maintenance_worker(void *context) {
+  maintenance_hold *h = context;
+  lc_error e;
+  lc_error_init(&e);
+  ok(ps_pouch_state_compact(h->pouch, "projection", &h->result, &e), &e);
+  lc_error_cleanup(&e);
+  __atomic_store_n(&h->done, 1, __ATOMIC_RELEASE);
+  return NULL;
+}
+static void maintenance_tail_readback(lc_pouch *p, lc_error *e) {
+  lc_pouch_state_read_result r = {0};
+  lc_pouch_generation seq;
+  read_value(p, "projection", "a-state", 65569, 3, 2, e);
+  read_value(p, "projection", "z-object", 65569, 2, 1, e);
+  read_value(p, "peer", "live", 31, 9, 1, e);
+  ok(lc_pouch_state_read_metadata(p, "projection", "a-state", &r, e), e);
+  REQUIRE(r.index_seq == 9 && r.metadata_length == 4 &&
+          !memcmp(r.metadata, "tail", 4));
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(lc_pouch_state_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 9);
+  ok(lc_pouch_state_query_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 8);
+}
+static void maintenance_concurrency(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync) {
+    maintenance_hold h = {0};
+    ps_io io = {&h, maintenance_held_read, io_write, io_sync, io_reserve, NULL};
+    ps_pouch_state_options o = options(0, sync);
+    o.logical.segment_target_bytes = 8 * PS_MIB;
+    o.io = &io;
+    lc_pouch *p = NULL;
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    maintenance_fixture(p, &e);
+    h.pouch = p;
+    __atomic_store_n(&h.armed, 1, __ATOMIC_RELEASE);
+    pthread_t thread;
+    REQUIRE(pthread_create(&thread, NULL, maintenance_worker, &h) == 0);
+    while (!__atomic_load_n(&h.ready, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&h.done, __ATOMIC_ACQUIRE))
+      sched_yield();
+    REQUIRE(__atomic_load_n(&h.ready, __ATOMIC_ACQUIRE));
+    /* A tail metadata update still references the captured original segment.
+     * Publication must recheck that tail before retiring the copied source. */
+    projection_meta(p, "a-state", "tail", 0, 9, &e);
+    input in = source(31, 9);
+    lc_pouch_state_write_result w = {0};
+    ok(put(p, "peer", "live", &in, NULL, &w, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    maintenance_tail_readback(p, &e);
+    __atomic_store_n(&h.release, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_join(thread, NULL) == 0);
+    maintenance_tail_readback(p, &e);
+    void *ns = NULL;
+    ps_namespace_status status;
+    ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0, &ns,
+                                      &e),
+       &e);
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.bound_segments == 2 && status.bound_bodies == 1 &&
+            status.bound_snapshots == 1);
+    p->storage.ops->namespace_close(p->storage.context, ns);
+    ps_pouch_compaction_result result;
+    ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+    REQUIRE(result.copied_bytes == 65569 && result.boundary == 2);
+    maintenance_tail_readback(p, &e);
+    one_file(directory);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+    maintenance_tail_readback(p, &e);
+    lc_pouch_close(p);
+    REQUIRE(live == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+typedef struct checksum_span {
+  lc_pouch_state_payload_span span;
+  char leaf[40];
+} checksum_span;
+static int checksum_capture(void *context, const lc_pouch_state_entry *r,
+                            lc_error *e) {
+  checksum_span *s = context;
+  (void)e;
+  if (r->key && !strcmp(r->key, "a-state")) {
+    REQUIRE(r->found && r->payload_span.present &&
+            strlen(r->payload_span.container_leaf) < sizeof(s->leaf));
+    s->span = r->payload_span;
+    strcpy(s->leaf, r->payload_span.container_leaf);
+    s->span.container_leaf = s->leaf;
+  }
+  return LC_OK;
+}
+typedef struct checksum_io {
+  io_fault io;
+  int corrupt;
+} checksum_io;
+static ssize_t checksum_read(void *context, int fd, void *p, size_t n,
+                             off_t at) {
+  checksum_io *f = context;
+  ssize_t got = io_read(&f->io, fd, p, n, at);
+  if (got > 0 && f->corrupt) {
+    ((unsigned char *)p)[0] ^= 1;
+    f->corrupt = 0;
+  }
+  return got;
+}
+static void checksum_drain(lc_source *s, uint64_t length, int mismatch,
+                           lc_error *e) {
+  unsigned char bytes[997];
+  uint64_t count = 0;
+  size_t n;
+  while ((n = s->read(s, bytes, sizeof(bytes), e)) != 0)
+    count += n;
+  if (mismatch) {
+    REQUIRE(e->code == LC_ERR_PROTOCOL && count < length);
+    clear(e);
+    REQUIRE(!s->read(s, bytes, sizeof(bytes), e) && e->code == LC_ERR_PROTOCOL);
+    clear(e);
+  } else {
+    ok(e->code, e);
+    REQUIRE(count == length);
+  }
+}
+static void maintenance_checksums(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int crypto = 0; crypto < 4; ++crypto)
+    for (int relocated = 0; relocated < 2; ++relocated) {
+      checksum_io f = {0};
+      ps_io io = {&f, checksum_read, io_write, io_sync, io_reserve, NULL};
+      ps_pouch_state_options o = options(crypto, 0);
+      o.logical.segment_target_bytes = 8 * PS_MIB;
+      o.io = &io;
+      lc_pouch *p = NULL;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      maintenance_fixture(p, &e);
+      if (relocated)
+        ok(ps_pouch_state_compact(p, "projection", NULL, &e), &e);
+      void *ns = NULL;
+      ps_namespace_view *view = NULL;
+      lc_pouch_state_snapshot *capture = NULL;
+      checksum_span span = {0};
+      ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
+                                        &ns, &e),
+         &e);
+      ok(ps_namespace_view_open(ns, &view, &e), &e);
+      ok(lc_pouch_state_snapshot_capture(p, replay_snapshot, view, &capture,
+                                         &e),
+         &e);
+      ok(lc_pouch_state_snapshot_visit(capture, checksum_capture, &span, &e),
+         &e);
+      lc_pouch_state_snapshot_close(capture);
+      ps_namespace_view_close(view);
+      REQUIRE(
+          span.span.present && span.span.payload_length &&
+          !strncmp(span.leaf, relocated ? "body-" : "seg-", relocated ? 5 : 4));
+      lc_source *encoded = NULL, *clone = NULL, *wrong = NULL;
+      size_t before = f.io.read_bytes;
+      ok(p->storage.ops->source_open(
+             p->storage.context, ns, span.leaf, span.span.payload_offset,
+             span.span.payload_length, span.span.payload_crc, &encoded, &e),
+         &e);
+      REQUIRE(f.io.read_bytes == before);
+      f.corrupt = 1;
+      checksum_drain(encoded, span.span.payload_length, 1, &e);
+      before = f.io.read_bytes;
+      ok(p->storage.ops->source_clone(p->storage.context, encoded, &clone, &e),
+         &e);
+      REQUIRE(f.io.read_bytes == before);
+      checksum_drain(clone, span.span.payload_length, 0, &e);
+      ok(encoded->reset(encoded, &e), &e);
+      checksum_drain(encoded, span.span.payload_length, 0, &e);
+      ok(p->storage.ops->source_open(
+             p->storage.context, ns, span.leaf, span.span.payload_offset,
+             span.span.payload_length, span.span.payload_crc ^ 1, &wrong, &e),
+         &e);
+      checksum_drain(wrong, span.span.payload_length, 1, &e);
+      wrong->close(wrong);
+      wrong = NULL;
+      REQUIRE(p->storage.ops->source_open(p->storage.context, ns, span.leaf,
+                                          span.span.payload_offset, 0, 1,
+                                          &wrong, &e) == LC_ERR_PROTOCOL &&
+              !wrong);
+      clear(&e);
+      ok(encoded->reset(encoded, &e), &e);
+      ok(clone->reset(clone, &e), &e);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      checksum_drain(encoded, span.span.payload_length, 0, &e);
+      checksum_drain(clone, span.span.payload_length, 0, &e);
+      encoded->close(encoded);
+      clone->close(clone);
+      REQUIRE(live == 0 && unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -2784,6 +3213,16 @@ static void *worker(void *context) {
     projection_faults(r->path);
   else if (!strcmp(r->mode, "projection-concurrency"))
     projection_concurrency(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance"))
+    maintenance(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-faults"))
+    maintenance_faults(r->path, 0);
+  else if (!strcmp(r->mode, "maintenance-io-faults"))
+    maintenance_faults(r->path, 1);
+  else if (!strcmp(r->mode, "maintenance-concurrency"))
+    maintenance_concurrency(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-checksums"))
+    maintenance_checksums(r->path);
   else
     REQUIRE(0);
   return NULL;

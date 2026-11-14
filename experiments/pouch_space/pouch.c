@@ -3,8 +3,10 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
+#include "pouch_internal.h"
 #include <string.h>
 #include <sys/stat.h>
+#include <zlib.h>
 
 typedef struct ps_pouch_owner {
   ps_root *root;
@@ -16,6 +18,8 @@ typedef struct ps_pouch_source {
   ps_pouch_owner *owner;
   ps_namespace_window *window;
   uint64_t start, length, offset;
+  unsigned long crc, expected_crc;
+  int verify, failed;
 } ps_pouch_source;
 
 static void release(void *context) {
@@ -104,10 +108,23 @@ static size_t source_read(lc_source *pub, void *bytes, size_t length,
                           lc_error *e) {
   ps_pouch_source *source = pub->impl;
   struct iovec part;
+  size_t at, n;
+  if (source->failed) {
+    lc_error_set(e, LC_ERR_PROTOCOL, 0, "container body checksum mismatch",
+                 NULL, NULL, "pouch");
+    return 0;
+  }
   if ((uint64_t)length > source->length - source->offset)
     length = (size_t)(source->length - source->offset);
-  if (!length)
+  if (!length) {
+    if (source->offset == source->length &&
+        source->crc != source->expected_crc) {
+      source->failed = 1;
+      lc_error_set(e, LC_ERR_PROTOCOL, 0, "container body checksum mismatch",
+                   NULL, NULL, "pouch");
+    }
     return 0;
+  }
   part.iov_base = bytes;
   part.iov_len = length;
   if (lc_pouch_record_io_read(ps_namespace_read_input(source->window),
@@ -115,12 +132,30 @@ static size_t source_read(lc_source *pub, void *bytes, size_t length,
                               e) != LC_OK)
     return 0;
   source->offset += length;
+  if (source->verify) {
+    for (at = 0; at < length; at += n) {
+      n = length - at;
+      if (n > LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES)
+        n = LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES;
+      source->crc = (unsigned long)crc32(
+          (uLong)source->crc, (const unsigned char *)bytes + at, (uInt)n);
+    }
+    if (source->offset == source->length &&
+        source->crc != source->expected_crc) {
+      source->failed = 1;
+      lc_error_set(e, LC_ERR_PROTOCOL, 0, "container body checksum mismatch",
+                   NULL, NULL, "pouch");
+      return 0;
+    }
+  }
   return length;
 }
 static int source_reset(lc_source *pub, lc_error *e) {
   ps_pouch_source *source = pub->impl;
   (void)e;
   source->offset = 0;
+  source->crc = 0;
+  source->failed = 0;
   return LC_OK;
 }
 static void source_close(lc_source *pub) {
@@ -131,8 +166,8 @@ static void source_close(lc_source *pub) {
   release(owner);
 }
 static int source_open(void *context, void *ns, const char *leaf,
-                       uint64_t offset, uint64_t length, lc_source **out,
-                       lc_error *e) {
+                       uint64_t offset, uint64_t length, unsigned long crc,
+                       lc_source **out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_pouch_source *source;
   uint64_t segment;
@@ -142,6 +177,10 @@ static int source_open(void *context, void *ns, const char *leaf,
   if (!ps_namespace_parse_source_leaf(leaf, &kind, &segment))
     return lc_error_set(e, LC_ERR_PROTOCOL, 0, "invalid container payload leaf",
                         NULL, NULL, "pouch");
+  if (!length && crc)
+    return lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                        "empty container body checksum mismatch", NULL, NULL,
+                        "pouch");
   source = lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*source));
   if (!source)
     return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate container source",
@@ -155,6 +194,8 @@ static int source_open(void *context, void *ns, const char *leaf,
   source->owner = owner;
   source->start = offset;
   source->length = length;
+  source->expected_crc = crc;
+  source->verify = 1;
   source->pub.read = source_read;
   source->pub.reset = source_reset;
   source->pub.close = source_close;
@@ -177,6 +218,8 @@ static int source_clone(void *context, lc_source *input, lc_source **out,
                         NULL, NULL, "pouch");
   *source = *original;
   source->offset = 0;
+  source->crc = 0;
+  source->failed = 0;
   source->pub.impl = source;
   ps_namespace_read_retain(source->window);
   __atomic_add_fetch(&owner->references, 1, __ATOMIC_RELAXED);
@@ -196,6 +239,14 @@ static const lc_pouch_storage_ops storage_ops = {
     check,       namespace_open, namespace_close,       namespace_info,
     replay,      append_begin,   append_commit,         append_close,
     source_open, source_clone,   retention_hint_ensure, release};
+
+ps_root *ps_pouch_state_root(lc_pouch *pouch) {
+  ps_pouch_owner *owner;
+  if (!pouch || pouch->storage.ops != &storage_ops)
+    return NULL;
+  owner = pouch->storage.context;
+  return owner->root;
+}
 
 int ps_pouch_state_open(const char *path, int create,
                         const lc_allocator *allocator,

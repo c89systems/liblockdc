@@ -43,6 +43,20 @@ int lc_pouch_state_snapshot_visit(const lc_pouch_state_snapshot *,
                                   lc_pouch_state_snapshot_visit_fn, void *,
                                   lc_error *);
 void lc_pouch_state_snapshot_close(lc_pouch_state_snapshot *);
+/* Exact metadata-snapshot and body-pack sizes without body I/O. NULL copy_leaf
+ * retains every body reference. Otherwise rebind that source's bodies into
+ * leaf, storing their canonical body records separately from snapshot metadata.
+ * This measures bytes, not complete physical maintenance admission. */
+int lc_pouch_state_snapshot_measure(const lc_pouch_state_snapshot *,
+                                    const char *leaf, const char *copy_leaf,
+                                    uint64_t *metadata_bytes,
+                                    uint64_t *body_bytes, lc_error *);
+/* Complete a typed-owner topology publication under namespace authority and
+ * invalidate its resident projection before releasing that authority, even
+ * on an uncertain failure. The callback owns physical durability. */
+int lc_pouch_state_snapshot_publish(lc_pouch *, const char *ns,
+                                    lc_pouch_state_precondition_fn, void *,
+                                    lc_error *);
 
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
@@ -59,7 +73,7 @@ typedef struct lc_pouch_storage_ops {
   /* Encoded, resettable bounded source owns its read pin and storage lifetime.
    * It may outlive the Pouch runtime that opened it. */
   int (*source_open)(void *, void *, const char *, uint64_t, uint64_t,
-                     lc_source **, lc_error *);
+                     unsigned long stored_crc, lc_source **, lc_error *);
   /* Input belongs to this owner. Independent cursor over the same immutable
    * encoded pin, starting at zero.
    * No payload I/O, decoding, or current-directory lookup. */
