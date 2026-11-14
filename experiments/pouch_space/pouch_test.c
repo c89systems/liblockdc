@@ -1932,17 +1932,26 @@ typedef struct snapshot_copy {
   unsigned char *buffer;
   size_t count;
 } snapshot_copy;
-static int copy_snapshot_record(void *context, uint64_t segment,
+static int replay_snapshot(void *context, lc_pouch_storage_visit_fn visit,
+                           void *visitor, lc_error *e) {
+  return ps_namespace_view_visit(context, 0, visit, visitor, e);
+}
+static int copy_snapshot_record(void *context,
                                 const lc_pouch_state_entry *record,
                                 lc_error *e) {
   snapshot_copy *copy = context;
   lc_source *encoded = NULL;
-  (void)segment;
-  REQUIRE(record->found && record->payload_span.present);
-  int rc = copy->pouch->storage.ops->source_open(
-      copy->pouch->storage.context, copy->ns,
-      record->payload_span.container_leaf, record->payload_span.payload_offset,
-      record->payload_span.payload_length, &encoded, e);
+  if (record->control)
+    return lc_pouch_state_record_write_high_water(
+        &allocator, ps_namespace_snapshot_output(copy->builder),
+        record->index_seq, record->query_index_seq, e);
+  int rc = LC_OK;
+  if (record->found && record->payload_span.present)
+    rc = copy->pouch->storage.ops->source_open(
+        copy->pouch->storage.context, copy->ns,
+        record->payload_span.container_leaf,
+        record->payload_span.payload_offset,
+        record->payload_span.payload_length, &encoded, e);
   if (rc == LC_OK)
     rc = lc_pouch_state_record_write_snapshot(
         &allocator, ps_namespace_snapshot_output(copy->builder),
@@ -1989,13 +1998,16 @@ static void snapshots(const char *path, const char *directory) {
       snapshot_copy copy = {p, ns, b,
                             lc_alloc_with_allocator(&allocator, 16384), 0};
       REQUIRE(copy.buffer != NULL);
-      ok(lc_pouch_state_record_write_high_water(
-             &allocator, ps_namespace_snapshot_output(b), 1, 1, &e),
+      lc_pouch_state_snapshot *projection = NULL;
+      ok(lc_pouch_state_snapshot_capture(p, replay_snapshot,
+                                         ps_namespace_snapshot_view(b),
+                                         &projection, &e),
          &e);
-      ok(ps_namespace_view_visit(ps_namespace_snapshot_view(b), 1,
-                                 copy_snapshot_record, &copy, &e),
+      ok(lc_pouch_state_snapshot_visit(projection, copy_snapshot_record, &copy,
+                                       &e),
          &e);
       REQUIRE(copy.count == 1);
+      lc_pouch_state_snapshot_close(projection);
       lc_free_with_allocator(&allocator, copy.buffer);
       ok(ps_namespace_snapshot_commit(b, &e), &e);
       ps_namespace_snapshot_close(b);
@@ -2084,6 +2096,649 @@ static void snapshots(const char *path, const char *directory) {
   }
   lc_error_cleanup(&e);
 }
+typedef struct projected_check {
+  size_t count;
+  int newer;
+  char protected_leaf[64];
+} projected_check;
+static int check_projected(void *context, const lc_pouch_state_entry *r,
+                           lc_error *e) {
+  projected_check *c = context;
+  (void)e;
+  size_t ordinal = c->count++;
+  REQUIRE(r->seen && r->has_query_index_seq);
+  if (!ordinal) {
+    REQUIRE(r->control && r->record_type == 6);
+    REQUIRE(r->version == (c->newer ? 14 : 11) && r->index_seq == r->version &&
+            r->query_index_seq == (c->newer ? 13 : 10));
+    return LC_OK;
+  }
+  REQUIRE(!r->control);
+  if (ordinal == 1) {
+    REQUIRE(!strcmp(r->key, "a-state") && r->found && r->payload_span.present);
+    if (r->version != (c->newer ? 3 : 2) ||
+        r->index_seq != (c->newer ? 12 : 6) ||
+        r->query_index_seq != (c->newer ? 12 : 5))
+      fprintf(
+          stderr,
+          "projection a-state: version=%llu index=%llu query=%llu type=%u\n",
+          (unsigned long long)r->version, (unsigned long long)r->index_seq,
+          (unsigned long long)r->query_index_seq, r->record_type);
+    REQUIRE(r->version == (c->newer ? 3 : 2) &&
+            r->index_seq == (c->newer ? 12 : 6) &&
+            r->query_index_seq == (c->newer ? 12 : 5));
+  } else if (ordinal == 2) {
+    REQUIRE(!strcmp(r->key, "l-placeholder") && r->found &&
+            !r->payload_span.present && !r->version && r->index_seq == 11 &&
+            !r->query_index_seq);
+    REQUIRE(r->has_query_hidden && r->query_hidden && r->metadata_length == 5 &&
+            !memcmp(r->metadata, "lease", 5));
+  } else if (ordinal == 3) {
+    REQUIRE(!strcmp(r->key, "m-delete") && !r->found &&
+            !r->payload_span.present && r->version == 2 && r->index_seq == 8 &&
+            r->query_index_seq == 8);
+  } else if (ordinal == 4) {
+    REQUIRE(!strcmp(r->key, "n-state") && r->found && r->payload_span.present &&
+            !r->bytes && r->version == 1 && r->index_seq == 10 &&
+            r->query_index_seq == 10);
+  } else if (c->newer && ordinal == 5) {
+    REQUIRE(!strcmp(r->key, "tail") && r->found && r->version == 1 &&
+            r->index_seq == 13 && r->query_index_seq == 13);
+  } else {
+    REQUIRE(ordinal == (c->newer ? 6 : 5));
+    REQUIRE(!strcmp(r->key, "z-object") && r->found && r->record_type == 7 &&
+            r->version == 2 && r->index_seq == (c->newer ? 14 : 9) &&
+            !r->query_index_seq && r->bytes == 1048601);
+    REQUIRE(strlen(r->payload_span.container_leaf) < sizeof(c->protected_leaf));
+    strcpy(c->protected_leaf, r->payload_span.container_leaf);
+    if (c->newer)
+      REQUIRE(r->metadata_length == 11 &&
+              !memcmp(r->metadata, "tail-object", 11));
+  }
+  return LC_OK;
+}
+static void projection_put(lc_pouch *p, const char *key, size_t bytes,
+                           unsigned char seed, int object,
+                           lc_pouch_generation sequence, lc_error *e) {
+  lc_pouch_state_write_options o = {0};
+  lc_pouch_state_write_result w = {0};
+  input in = source(bytes, seed);
+  o.object_record = object;
+  ok(put(p, "projection", key, &in, &o, &w, e), e);
+  REQUIRE(w.index_seq == sequence);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+}
+static void projection_meta(lc_pouch *p, const char *key, const char *value,
+                            int hidden, lc_pouch_generation sequence,
+                            lc_error *e) {
+  lc_pouch_state_write_options o = {0};
+  lc_pouch_state_write_result w = {0};
+  o.has_metadata = 1;
+  o.metadata = (const unsigned char *)value;
+  o.metadata_length = strlen(value);
+  o.has_query_hidden = hidden;
+  o.query_hidden = hidden;
+  ok(lc_pouch_state_update_metadata(p, "projection", key, &o, &w, e), e);
+  REQUIRE(w.index_seq == sequence);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+}
+static void projection_fixture(lc_pouch *p, lc_error *e) {
+  projection_put(p, "a-state", 1048601, 30, 0, 1, e);
+  projection_put(p, "z-object", 65569, 32, 1, 2, e);
+  projection_put(p, "m-delete", 31, 33, 0, 3, e);
+  projection_meta(p, "l-placeholder", "lease", 1, 4, e);
+  projection_put(p, "a-state", 65569, 34, 0, 5, e);
+  projection_meta(p, "a-state", "state-meta", 0, 6, e);
+  projection_meta(p, "z-object", "object-meta", 0, 7, e);
+  lc_pouch_state_write_result w = {0};
+  ok(lc_pouch_state_delete(p, "projection", "m-delete", NULL, &w, e), e);
+  REQUIRE(w.index_seq == 8 && w.version == 2);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  projection_put(p, "z-object", 1048601, 35, 1, 9, e);
+  projection_put(p, "n-state", 0, 36, 0, 10, e);
+  projection_meta(p, "l-placeholder", "lease", 1, 11, e);
+}
+static void projection_readback(lc_pouch *p, lc_error *e) {
+  read_value(p, "projection", "a-state", 31, 99, 3, e);
+  read_value(p, "projection", "z-object", 1048601, 35, 2, e);
+  read_value(p, "projection", "n-state", 0, 36, 1, e);
+  read_value(p, "projection", "tail", 31, 77, 1, e);
+  lc_pouch_state_read_result r = {0};
+  ok(lc_pouch_state_read_metadata(p, "projection", "m-delete", &r, e), e);
+  REQUIRE(!r.found);
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(lc_pouch_state_read_metadata(p, "projection", "l-placeholder", &r, e), e);
+  REQUIRE(r.found && !r.has_body && !r.version && r.query_hidden &&
+          r.metadata_length == 5 && !memcmp(r.metadata, "lease", 5));
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  ok(lc_pouch_state_read_metadata(p, "projection", "z-object", &r, e), e);
+  REQUIRE(r.metadata_length == 11 && !memcmp(r.metadata, "tail-object", 11));
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  lc_pouch_generation seq;
+  ok(lc_pouch_state_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 14);
+  ok(lc_pouch_state_query_index_seq(p, "projection", &seq, e), e);
+  REQUIRE(seq == 13);
+}
+static void projection(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int crypto = 0; crypto < 4; ++crypto)
+    for (int sync = 0; sync < 2; ++sync) {
+      io_fault f = {0};
+      ps_io io = {&f, io_read, io_write, io_sync, io_reserve, NULL};
+      ps_pouch_state_options o = options(crypto, sync);
+      o.io = &io;
+      lc_pouch *p = NULL;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      projection_fixture(p, &e);
+      lc_pouch_state_read_result pinned = {0};
+      ok(lc_pouch_state_read(p, "projection", "a-state", &pinned, &e), &e);
+      REQUIRE(pinned.version == 2);
+      void *handle = NULL;
+      ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
+                                        &handle, &e),
+         &e);
+      ps_namespace *ns = handle;
+      ps_namespace_snapshot *b = NULL;
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      uint64_t boundary = ps_namespace_snapshot_boundary(b);
+      lc_pouch_state_snapshot *captured = NULL;
+      size_t before = f.read_bytes;
+      measured_max = 0;
+      __atomic_store_n(&measure, 1, __ATOMIC_RELEASE);
+      int rc = lc_pouch_state_snapshot_capture(
+          p, replay_snapshot, ps_namespace_snapshot_view(b), &captured, &e);
+      __atomic_store_n(&measure, 0, __ATOMIC_RELEASE);
+      ok(rc, &e);
+      REQUIRE(measured_max < 65536);
+      if (!crypto)
+        REQUIRE(f.read_bytes - before < PS_MIB / 2);
+      projected_check c = {0};
+      ok(lc_pouch_state_snapshot_visit(captured, check_projected, &c, &e), &e);
+      REQUIRE(c.count == 6);
+      /* These later records are outside the capture. The newer object META
+       * still refers to an original covered body, which must stay bound. */
+      projection_put(p, "a-state", 31, 99, 0, 12, &e);
+      projection_put(p, "tail", 31, 77, 0, 13, &e);
+      projection_meta(p, "z-object", "tail-object", 0, 14, &e);
+      projected_check unchanged = {0};
+      ok(lc_pouch_state_snapshot_visit(captured, check_projected, &unchanged,
+                                       &e),
+         &e);
+      REQUIRE(unchanged.count == 6);
+      snapshot_copy copy = {p, ns, b,
+                            lc_alloc_with_allocator(&allocator, 16384), 0};
+      REQUIRE(copy.buffer != NULL);
+      ok(lc_pouch_state_snapshot_visit(captured, copy_snapshot_record, &copy,
+                                       &e),
+         &e);
+      REQUIRE(copy.count == 5);
+      lc_free_with_allocator(&allocator, copy.buffer);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      ps_namespace_status first;
+      ok(ps_namespace_status_get(ns, &first, &e), &e);
+      ps_namespace_snapshot_close(b);
+      unsigned int keep_kind;
+      uint64_t keep_id;
+      REQUIRE(ps_namespace_parse_source_leaf(c.protected_leaf, &keep_kind,
+                                             &keep_id));
+      for (uint64_t id = 1; id <= boundary; ++id)
+        if (keep_kind != PS_CATALOG_SEGMENT || id != keep_id)
+          ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, id, &e), &e);
+      drain(pinned.body, 65569, 34, &e);
+      lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+      uint64_t closed, pending;
+      ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+      REQUIRE(!pending);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      /* The immutable metadata capture owns its fields independently. */
+      unchanged.count = 0;
+      ok(lc_pouch_state_snapshot_visit(captured, check_projected, &unchanged,
+                                       &e),
+         &e);
+      REQUIRE(unchanged.count == 6);
+      lc_pouch_state_snapshot_close(captured);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      projection_readback(p, &e);
+      ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
+                                        &handle, &e),
+         &e);
+      ns = handle;
+      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      boundary = ps_namespace_snapshot_boundary(b);
+      ok(lc_pouch_state_snapshot_capture(
+             p, replay_snapshot, ps_namespace_snapshot_view(b), &captured, &e),
+         &e);
+      c.count = 0;
+      c.newer = 1;
+      ok(lc_pouch_state_snapshot_visit(captured, check_projected, &c, &e), &e);
+      REQUIRE(c.count == 7);
+      copy = (snapshot_copy){p, ns, b,
+                             lc_alloc_with_allocator(&allocator, 16384), 0};
+      REQUIRE(copy.buffer != NULL);
+      ok(lc_pouch_state_snapshot_visit(captured, copy_snapshot_record, &copy,
+                                       &e),
+         &e);
+      REQUIRE(copy.count == 6);
+      lc_free_with_allocator(&allocator, copy.buffer);
+      lc_pouch_state_snapshot_close(captured);
+      ok(ps_namespace_snapshot_commit(b, &e), &e);
+      ps_namespace_snapshot_close(b);
+      for (uint64_t id = 1; id <= boundary; ++id)
+        ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, id, &e), &e);
+      ok(ps_namespace_reclaim(ns, PS_CATALOG_SNAPSHOT, first.snapshot, &e), &e);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      projection_readback(p, &e);
+      one_file(directory);
+      lc_pouch_close(p);
+      REQUIRE(live == 0 && unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
+typedef struct capture_fixture {
+  lc_pouch_state_entry *entries;
+  char (*keys)[16];
+  unsigned char (*metadata)[3];
+  size_t count, fail_before;
+} capture_fixture;
+static void capture_fixture_open(capture_fixture *f) {
+  memset(f, 0, sizeof(*f));
+  f->entries = lc_calloc_with_allocator(&allocator, 85, sizeof(*f->entries));
+  f->keys = lc_calloc_with_allocator(&allocator, 80, sizeof(*f->keys));
+  f->metadata = lc_calloc_with_allocator(&allocator, 80, sizeof(*f->metadata));
+  REQUIRE(f->entries && f->keys && f->metadata);
+  f->count = 85;
+  f->fail_before = SIZE_MAX;
+  for (size_t i = 0; i < 80; ++i) {
+    size_t key = 79 - i;
+    REQUIRE(snprintf(f->keys[i], sizeof(f->keys[i]), "k%03u",
+                     (unsigned int)key) > 0);
+    f->metadata[i][0] = (unsigned char)key;
+    f->metadata[i][2] = (unsigned char)(255 - key);
+    lc_pouch_state_entry *r = &f->entries[i];
+    r->key = f->keys[i];
+    r->seen = r->found = 1;
+    r->record_type = 1;
+    r->version = 1;
+    r->index_seq = key + 1;
+    r->has_query_index_seq = !(key % 2);
+    r->query_index_seq = key / 2;
+    r->content_type = "application/x";
+    r->etag = "etag";
+    r->payload_context = "immutable-context";
+    r->descriptor = "borrowed-descriptor";
+    r->metadata = f->metadata[i];
+    r->metadata_length = 3;
+    r->bytes = r->cipher_bytes = 7;
+    r->updated_at_unix = 1234;
+    r->retention = 4321;
+    r->has_query_hidden = 1;
+    r->payload_span.present = r->has_record_ref = 1;
+    r->payload_span.container_leaf = r->record_container_leaf =
+        "seg-00000000000000000001.log";
+    r->record_offset = r->payload_span.record_offset = key * 100;
+    r->payload_span.payload_offset = key * 100 + 70;
+    r->payload_span.payload_length = 7;
+    r->payload_span.payload_crc = 12345;
+  }
+  f->entries[80] = f->entries[79];
+  f->entries[80].version = 3;
+  f->entries[80].index_seq = 100;
+  f->entries[80].query_index_seq = 97;
+  f->entries[81] = f->entries[80];
+  f->entries[81].version = 2;
+  f->entries[81].index_seq = 200;
+  f->entries[81].query_index_seq = 199;
+  f->entries[82] = f->entries[80];
+  f->entries[82].index_seq = 99;
+  f->entries[82].query_index_seq = 98;
+  f->entries[83] = f->entries[80];
+  f->entries[83].record_type = 4;
+  f->entries[83].index_seq = 101;
+  f->entries[83].has_query_index_seq = 0;
+  f->entries[83].query_index_seq = 0;
+  f->entries[84].seen = f->entries[84].control = 1;
+  f->entries[84].key = "water";
+  f->entries[84].record_type = 6;
+  f->entries[84].version = f->entries[84].index_seq = 1000;
+  f->entries[84].query_index_seq = 900;
+}
+static void capture_fixture_close(capture_fixture *f) {
+  lc_free_with_allocator(&allocator, f->entries);
+  lc_free_with_allocator(&allocator, f->keys);
+  lc_free_with_allocator(&allocator, f->metadata);
+}
+static int replay_fixture(void *context, lc_pouch_storage_visit_fn visit,
+                          void *visitor, lc_error *e) {
+  capture_fixture *f = context;
+  for (size_t i = 0; i <= f->count; ++i) {
+    if (i == f->fail_before)
+      return lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected captured replay",
+                          NULL, NULL, "test");
+    if (i < f->count) {
+      int rc = visit(visitor, i + 1, &f->entries[i], e);
+      if (rc != LC_OK)
+        return rc;
+    }
+  }
+  return LC_OK;
+}
+typedef struct capture_observer {
+  size_t count, fail;
+} capture_observer;
+static int inspect_capture(void *context, const lc_pouch_state_entry *r,
+                           lc_error *e) {
+  capture_observer *c = context;
+  size_t ordinal = c->count++;
+  REQUIRE(r->has_query_index_seq && r->seen);
+  if (!ordinal)
+    REQUIRE(r->control && r->version == 1000 && r->index_seq == 1000 &&
+            r->query_index_seq == 900);
+  else {
+    size_t key = ordinal - 1;
+    char expected[16];
+    REQUIRE(snprintf(expected, sizeof(expected), "k%03u", (unsigned int)key) >
+            0);
+    REQUIRE(key < 80 && !strcmp(expected, r->key) && r->found && !r->control);
+    REQUIRE(r->version == (key ? 1 : 3) &&
+            r->index_seq == (key ? key + 1 : 101) &&
+            r->query_index_seq == (key ? key % 2 ? key + 1 : key / 2 : 97));
+    REQUIRE(!strcmp(r->content_type, "application/x") &&
+            !strcmp(r->etag, "etag") &&
+            !strcmp(r->descriptor, "borrowed-descriptor") &&
+            !strcmp(r->payload_context, "immutable-context"));
+    REQUIRE(r->metadata_length == 3 && r->metadata[0] == key &&
+            !r->metadata[1] && r->metadata[2] == 255 - key);
+    REQUIRE(r->bytes == 7 && r->cipher_bytes == 7 &&
+            r->updated_at_unix == 1234 && r->retention == 4321 &&
+            r->has_query_hidden && !r->query_hidden &&
+            r->payload_span.present && r->has_record_ref);
+    REQUIRE(!strcmp(r->payload_span.container_leaf,
+                    "seg-00000000000000000001.log") &&
+            !strcmp(r->record_container_leaf, r->payload_span.container_leaf) &&
+            r->record_offset == key * 100 &&
+            r->payload_span.record_offset == key * 100 &&
+            r->payload_span.payload_offset == key * 100 + 70 &&
+            r->payload_span.payload_length == 7 &&
+            r->payload_span.payload_crc == 12345);
+  }
+  if (c->fail && c->count == c->fail)
+    return lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected snapshot visitor",
+                        NULL, NULL, "test");
+  return LC_OK;
+}
+static int inspect_empty_capture(void *context, const lc_pouch_state_entry *r,
+                                 lc_error *e) {
+  size_t *count = context;
+  (void)e;
+  REQUIRE(!(*count)++ && r->control && !r->version && !r->index_seq &&
+          !r->query_index_seq);
+  return LC_OK;
+}
+static void projection_faults(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  projection_put(p, "outside", 31, 50, 0, 1, &e);
+  capture_fixture f;
+  capture_fixture_open(&f);
+  size_t baseline = live, operations = 0;
+  lc_pouch_state_snapshot *captured = NULL;
+  for (int null_error = 0; null_error < 2; ++null_error)
+    for (size_t nth = 0; nth <= operations; ++nth) {
+      fail_at = nth ? nth : SIZE_MAX;
+      allocation = 0;
+      __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+      int rc = lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured,
+                                               null_error ? NULL : &e);
+      __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+      if (!nth)
+        operations = allocation;
+      if (nth)
+        REQUIRE(rc == LC_ERR_NOMEM && !captured);
+      else {
+        ok(rc, &e);
+        capture_observer c = {0};
+        ok(lc_pouch_state_snapshot_visit(captured, inspect_capture, &c, &e),
+           &e);
+        REQUIRE(c.count == 81);
+        lc_pouch_state_snapshot_close(captured);
+      }
+      captured = NULL;
+      clear(&e);
+      REQUIRE(live == baseline);
+    }
+  for (int null_error = 0; null_error < 2; ++null_error)
+    for (size_t i = 0; i < 3; ++i) {
+      f.fail_before = i == 0 ? 0 : i == 1 ? 42 : f.count;
+      REQUIRE(lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured,
+                                              null_error ? NULL : &e) ==
+              LC_ERR_TRANSPORT);
+      REQUIRE(!captured);
+      clear(&e);
+      REQUIRE(live == baseline);
+    }
+  f.fail_before = SIZE_MAX;
+  lc_pouch_state_entry saved = f.entries[40];
+  for (int bad = 0; bad < 3; ++bad) {
+    if (!bad)
+      f.entries[40].decision = "transaction";
+    else if (bad == 1)
+      f.entries[40].key = ".staging/transaction/key";
+    else
+      f.entries[40].metadata = NULL;
+    REQUIRE(
+        lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured, &e) ==
+        (bad == 2 ? LC_ERR_INVALID : LC_ERR_UNSUPPORTED));
+    REQUIRE(!captured);
+    clear(&e);
+    REQUIRE(live == baseline);
+    f.entries[40] = saved;
+  }
+  ok(lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured, &e), &e);
+  /* Every borrowed source field is copied. Altering the source cannot alter
+   * visits, including a source record which was superseded during replay. */
+  for (size_t i = 0; i < 80; ++i) {
+    f.keys[i][0] = 'X';
+    f.metadata[i][0] = 255;
+  }
+  for (size_t ordinal = 1; ordinal <= 81; ++ordinal) {
+    capture_observer c = {0, ordinal};
+    REQUIRE(lc_pouch_state_snapshot_visit(captured, inspect_capture, &c, &e) ==
+            LC_ERR_TRANSPORT);
+    REQUIRE(c.count == ordinal);
+    clear(&e);
+  }
+  capture_observer c = {0};
+  fail_at = 1;
+  allocation = 0;
+  __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+  int rc = lc_pouch_state_snapshot_visit(captured, inspect_capture, &c, &e);
+  __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+  ok(rc, &e);
+  REQUIRE(!allocation && c.count == 81);
+  REQUIRE(lc_pouch_state_snapshot_visit(captured, NULL, NULL, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  REQUIRE(lc_pouch_state_snapshot_visit(NULL, inspect_capture, &c, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  lc_pouch_state_snapshot_close(captured);
+  captured = (lc_pouch_state_snapshot *)(uintptr_t)1;
+  REQUIRE(lc_pouch_state_snapshot_capture(NULL, replay_fixture, &f, &captured,
+                                          &e) == LC_ERR_INVALID);
+  REQUIRE(!captured);
+  clear(&e);
+  captured = (lc_pouch_state_snapshot *)(uintptr_t)1;
+  REQUIRE(lc_pouch_state_snapshot_capture(p, NULL, &f, &captured, &e) ==
+          LC_ERR_INVALID);
+  REQUIRE(!captured);
+  clear(&e);
+  REQUIRE(lc_pouch_state_snapshot_capture(p, replay_fixture, &f, NULL, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  f.count = 0;
+  ok(lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured, &e), &e);
+  size_t empty = 0;
+  ok(lc_pouch_state_snapshot_visit(captured, inspect_empty_capture, &empty, &e),
+     &e);
+  REQUIRE(empty == 1);
+  lc_pouch_state_snapshot_close(captured);
+  lc_pouch_state_snapshot_close(NULL);
+  REQUIRE(live == baseline);
+  capture_fixture_close(&f);
+  /* The temporary projection never advances or replaces the live namespace. */
+  read_value(p, "projection", "outside", 31, 50, 1, &e);
+  lc_pouch_generation seq;
+  ok(lc_pouch_state_index_seq(p, "projection", &seq, &e), &e);
+  REQUIRE(seq == 1);
+  projection_put(p, "outside", 31, 51, 0, 2, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  printf("logical capture allocation failure sites: %lu (with/without error)\n",
+         (unsigned long)operations);
+  lc_error_cleanup(&e);
+}
+typedef struct capture_visit_job {
+  const lc_pouch_state_snapshot *snapshot;
+  int hold, ready, release;
+  size_t passes;
+} capture_visit_job;
+static int held_capture_visit(void *context, const lc_pouch_state_entry *r,
+                              lc_error *e) {
+  capture_visit_job *job = context;
+  (void)r;
+  (void)e;
+  if (job->hold) {
+    __atomic_store_n(&job->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&job->release, __ATOMIC_ACQUIRE))
+      sched_yield();
+    job->hold = 0;
+  }
+  return LC_OK;
+}
+static void *capture_visit_worker(void *context) {
+  capture_visit_job *job = context;
+  lc_error e;
+  lc_error_init(&e);
+  if (job->hold) {
+    ok(lc_pouch_state_snapshot_visit(job->snapshot, held_capture_visit, job,
+                                     &e),
+       &e);
+    ++job->passes;
+  } else
+    for (size_t n = 0; n < 16; ++n) {
+      projected_check c = {0};
+      ok(lc_pouch_state_snapshot_visit(job->snapshot, check_projected, &c, &e),
+         &e);
+      REQUIRE(c.count == 6);
+      ++job->passes;
+    }
+  lc_error_cleanup(&e);
+  return NULL;
+}
+typedef struct capture_build_job {
+  lc_pouch *pouch;
+  ps_namespace_view *view;
+  lc_pouch_state_snapshot *snapshot;
+  lc_pouch_storage_visit_fn forward;
+  void *visitor;
+  int ready, release, done, rc;
+} capture_build_job;
+static int held_replay_record(void *context, uint64_t segment,
+                              const lc_pouch_state_entry *r, lc_error *e) {
+  capture_build_job *job = context;
+  int rc = job->forward(job->visitor, segment, r, e);
+  if (rc == LC_OK && !__atomic_load_n(&job->ready, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&job->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&job->release, __ATOMIC_ACQUIRE))
+      sched_yield();
+  }
+  return rc;
+}
+static int replay_held(void *context, lc_pouch_storage_visit_fn visit,
+                       void *visitor, lc_error *e) {
+  capture_build_job *job = context;
+  job->forward = visit;
+  job->visitor = visitor;
+  return ps_namespace_view_visit(job->view, 0, held_replay_record, job, e);
+}
+static void *capture_build_worker(void *context) {
+  capture_build_job *job = context;
+  lc_error e;
+  lc_error_init(&e);
+  job->rc = lc_pouch_state_snapshot_capture(job->pouch, replay_held, job,
+                                            &job->snapshot, &e);
+  if (job->rc != LC_OK)
+    fprintf(stderr, "held capture: %d: %s\n", job->rc,
+            e.message ? e.message : "?");
+  lc_error_cleanup(&e);
+  __atomic_store_n(&job->done, 1, __ATOMIC_RELEASE);
+  return NULL;
+}
+static void projection_concurrency(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int mode = 0; mode < 2; ++mode) {
+    ps_pouch_state_options o = options(mode ? 3 : 0, mode);
+    lc_pouch *p = NULL;
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    projection_fixture(p, &e);
+    void *ns = NULL;
+    ps_namespace_view *view = NULL;
+    ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0, &ns,
+                                      &e),
+       &e);
+    ok(ps_namespace_view_open(ns, &view, &e), &e);
+    capture_build_job build = {0};
+    build.pouch = p;
+    build.view = view;
+    pthread_t building;
+    REQUIRE(pthread_create(&building, NULL, capture_build_worker, &build) == 0);
+    while (!__atomic_load_n(&build.ready, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&build.done, __ATOMIC_ACQUIRE))
+      sched_yield();
+    REQUIRE(__atomic_load_n(&build.ready, __ATOMIC_ACQUIRE));
+    projection_put(p, "a-state", 31, 99, 0, 12, &e);
+    __atomic_store_n(&build.release, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_join(building, NULL) == 0 && build.rc == LC_OK);
+    lc_pouch_state_snapshot *captured = build.snapshot;
+    read_value(p, "projection", "a-state", 31, 99, 3, &e);
+    ps_namespace_view_close(view);
+    p->storage.ops->namespace_close(p->storage.context, ns);
+    capture_visit_job held = {captured, 1, 0, 0, 0};
+    capture_visit_job independent = {captured, 0, 0, 0, 0};
+    pthread_t first, second;
+    REQUIRE(pthread_create(&first, NULL, capture_visit_worker, &held) == 0);
+    while (!__atomic_load_n(&held.ready, __ATOMIC_ACQUIRE))
+      sched_yield();
+    REQUIRE(pthread_create(&second, NULL, capture_visit_worker, &independent) ==
+            0);
+    REQUIRE(pthread_join(second, NULL) == 0 && independent.passes == 16);
+    /* The first visitor remains blocked while this same-namespace mutation
+     * commits. Neither immutable visits nor capture hold mutation authority. */
+    projection_put(p, "a-state", 31, 100, 0, 13, &e);
+    read_value(p, "projection", "a-state", 31, 100, 4, &e);
+    __atomic_store_n(&held.release, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_join(first, NULL) == 0 && held.passes == 1);
+    projected_check c = {0};
+    ok(lc_pouch_state_snapshot_visit(captured, check_projected, &c, &e), &e);
+    REQUIRE(c.count == 6);
+    lc_pouch_state_snapshot_close(captured);
+    one_file(directory);
+    lc_pouch_close(p);
+    REQUIRE(live == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -2123,6 +2778,12 @@ static void *worker(void *context) {
     read_concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "snapshots"))
     snapshots(r->path, r->directory);
+  else if (!strcmp(r->mode, "projection"))
+    projection(r->path, r->directory);
+  else if (!strcmp(r->mode, "projection-faults"))
+    projection_faults(r->path);
+  else if (!strcmp(r->mode, "projection-concurrency"))
+    projection_concurrency(r->path, r->directory);
   else
     REQUIRE(0);
   return NULL;

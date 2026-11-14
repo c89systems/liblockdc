@@ -550,6 +550,18 @@ Failure after output begins calls the owner's private discard boundary. The
 codec owns no logical selection, history protection or physical publication.
 Native clean-close object references now preserve their OBJECT_LINK flag.
 
+Logical snapshot capture now reuses production projection semantics over a
+captured canonical prefix. It retains only current key metadata, including
+tombstones and placeholders; hash lookup storage is released after one key sort.
+Immutable visits emit HIGH_WATER first and explicit per-key query sequences.
+They allocate nothing and hold no engine coordination. The capture owns metadata
+but borrows the allocator context; physical body pins stay with its caller.
+Ordinary appends can commit during capture and during a held immutable visit.
+Queued metadata-entry copying now also retains its query generation, preventing
+canonical replay from losing a generation which the live cache preserved.
+Automatic publication, history protection, victim selection and complete
+maintenance admission remain pending.
+
 The protected metadata region cannot be consumed by payloads. Relocating
 compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The

@@ -2376,6 +2376,108 @@ maintenance admission remain required by the active full-backend goal. A full
 metadata projection and any relocated live bodies must fit the maintenance
 workspace; the existing physical floor alone does not establish that guarantee.
 
+## Captured logical snapshots and metadata regression checks
+
+The logical engine now captures an immutable projection from a selected snapshot
+and captured newer log prefix. It reuses production supersession, query-generation
+inheritance and object classification. Capture retains one metadata entry per
+current key, including tombstones and placeholders; a temporary hash index is
+released after sorting. Visits emit HIGH_WATER first and both sequences explicitly,
+allocate nothing, and operate outside engine coordination. Capture does not read
+or retain body values, publish a snapshot, invalidate the live cache or authorize
+reclamation. The caller retains physical source pins and allocator context.
+
+The new replay test found an existing metadata-worker defect: its queued entry
+copy omitted the prior query generation. A canonical META could therefore carry
+zero while the live cache retained the correct prior generation. The copy now
+preserves that generation and presence flag. The integration test failed with
+query generation zero before this fix and passes with generation five afterward.
+
+Verification on native x86_64:
+
+- All 349 standard Debug ASan/UBSan tests passed. A subsequent test-only addition
+  deterministically holds replay while a same-namespace PUT commits; that focused
+  Debug test passed too. No production code changed after the standard run.
+- GNU release and musl release each passed all 24 selected native Pouch,
+  compression/durability/recovery, stack, state-codec and snapshot/projection tests.
+- All 11 selected ThreadSanitizer groups passed with the final concurrency test.
+- The eight codec/durability combinations each install two logical snapshots,
+  preserve tombstones, placeholders, object classification and both watermarks,
+  retain newer tail updates and reopen after explicit obsolete-source removal.
+  A newer object META keeps its original covered source bound until replacement
+  no longer needs it. Captured old readers survive removal.
+- The capture fixture has more than 2 MiB of historical bodies. Its largest
+  capture allocation stays below 64 KiB; plaintext metadata replay reads less
+  than 512 KiB. These are fixture bounds, not fixed limits on key metadata.
+- All 737 capture allocation sites fail cleanly both with and without an error
+  object: 1,474 injected allocation failures. Replay errors at the beginning,
+  middle and end, staged/decision rejection, malformed metadata, invalid arguments,
+  an empty prefix and failure at every visitor position are also checked.
+  Source keys and metadata can change after capture without changing visits.
+  Superseded versions and stale sequences do not replace newer entries.
+- Held replay permits a same-namespace PUT before capture completes while the
+  result retains the old prefix. A held immutable visitor permits another reader
+  to complete 16 visits and another same-namespace PUT to commit. These run under
+  plaintext NoSync and encrypted/compressed durable policy.
+- Three Memcheck groups completed 589,405 matched allocations/frees with zero
+  errors, leaks or suppressions. Changed-line formatting and
+  `git diff --check` passed.
+
+Logs use `build/pouch-space-integrated/projection-` prefixes for Debug, GNU,
+musl and TSAN builds/tests. `projection-debug-latch-tests.log` records the final
+test-only addition. `projection-memcheck.log`,
+`projection-faults-memcheck.log` and `projection-concurrency-memcheck.log`
+contain the three memory checks.
+
+### Matched metadata-update performance
+
+Five alternating samples compare current/prior container and current/prior
+multifile executables. Each run seeds 512 one-KiB bodies outside the timed
+mutation phase, then performs two metadata-update rounds with one or four writers.
+The 80 runs cover NoSync and durable commits, plaintext inputs and 4 KiB producer
+chunks. All verify bodies and metadata after populated-root reopen; all 40
+container runs audit one fixed 10 MiB file with no sidecars. This measures the
+metadata-worker fix; these runs do not execute logical compaction.
+
+| Metadata updates, 512 × 1 KiB | Current C (ms) | Prior C (ms) | Current MF (ms) | Prior MF (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync, 1 writer | 57.349 | 53.378 | 44.191 | 45.770 |
+| NoSync, 4 writers | 13.841 | 16.975 | 14.002 | 13.479 |
+| Durable, 1 writer | 1669.193 | 1583.268 | 4144.871 | 4249.858 |
+| Durable, 4 writers | 1329.259 | 1147.226 | 2452.402 | 2429.410 |
+
+Single-writer NoSync remains slower than multifile in these samples; four-writer
+NoSync is near parity. Durable container medians are lower under both writer
+counts. Current/prior ranges overlap in every profile, so these samples do not
+isolate a performance change caused by preserving the query generation.
+For example, four-writer durable current/prior container ranges are
+1.180–2.301 / 1.031–1.970 s, and multifile ranges are
+2.276–2.517 / 2.320–2.733 s.
+
+Current and prior container syscall byte counts are identical in every profile:
+342,692 bytes for one writer and 341,576 for four writers. NoSync uses three
+sync calls with one writer and zero with four; durable uses 1,027 and 516–527
+respectively across both executables. Durable multifile uses 1,024 fdatasync
+calls, with two additional fsyncs in the one-writer profile. The scalar-copy fix
+adds no allocation, body I/O or durability barrier. These observations do not
+attribute the timing differences to a particular storage or scheduler cost.
+
+Raw logs are `projection-metadata-paired/`, with runner
+`projection-metadata-paired.sh`, `projection-metadata-results.json` and
+`projection-metadata-benchmark.log`. The `projection-artifacts.sha256` manifest
+covers 85 artifacts including both frozen executables; the previous
+285-artifact snapshot-codec manifest remains unchanged and verifies.
+The measured current executable is `pouch_space_compare-projection-current`,
+SHA-256 `d0a9475454c63fab72dc81230e74a6b6c709fd55320d76c4b216e53152b2a643`.
+The prior `pouch_space_compare-snapshot-codec-current` remains
+`a82c2175c391debc6c4987677e0ef6f71a611d9307f96d5b3a3803b4ec8b0ccf`.
+
+Automatic maintenance publication/invalidation, history protection, victim
+selection and complete capacity admission still require integration. This
+capture supplies the logical metadata needed to calculate workspace; it does
+not establish that the existing physical reserve can fit that workspace.
+Actual end-to-end container maintenance performance remains unmeasured.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces

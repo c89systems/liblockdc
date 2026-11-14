@@ -347,9 +347,40 @@ corrects native clean-close projection writing, which previously passed that
 flag as unused descriptor reserve instead of setting the payload flag.
 Native reopen tests now assert that internal objects remain objects.
 
-Logical projection capture, safe obsolete-source decisions, history protection
-and complete maintenance-capacity admission remain integration work. These
+Safe obsolete-source decisions, history protection and complete
+maintenance-capacity admission remain integration work. These
 helpers introduce no public ABI or persistent format/version change.
+
+## Captured logical snapshots
+
+`lc_pouch_state_snapshot_capture` now builds an immutable logical projection
+from a caller-owned captured canonical prefix. It reuses production replay,
+supersession, object classification and query-generation inheritance. It does
+not consult or replace the live namespace cache. Replay uses a temporary hash
+index; capture sorts the surviving keys once and releases the lookup buckets.
+Memory follows current key metadata, including tombstones, without body
+materialization. The Pouch runtime is borrowed only during capture; the capture
+owns its metadata and allocator value. Its allocator context and any physical
+source pins remain caller responsibilities.
+
+`lc_pouch_state_snapshot_visit` emits HIGH_WATER followed by one resolved entry
+per key in byte order, including tombstones and placeholders, with both index
+sequences explicit. Visits allocate nothing, can run concurrently and restart
+from HIGH_WATER after a visitor error. Callbacks retain no engine coordination.
+This separates metadata capture and inspection from output allocation and body
+selection, so maintenance can calculate complete workspace before copying.
+Close releases the owned projection independently of runtime lifetime.
+
+The private Pouch snapshot tests now use this producer for initial and replacement
+snapshots. They keep an old covered body bound when a newer META still refers
+to it. Capture does not itself publish snapshots, invalidate live projections,
+protect history consumers, select victims or admit complete maintenance work.
+Staged records and decisions are explicitly rejected pending their integration.
+
+This work also fixes queued metadata-entry copying to retain the prior query
+sequence and its presence flag. Without that copy, a metadata update could
+persist query generation zero while the live cache retained its prior public
+generation. Captured canonical replay now agrees with the live projection.
 
 ## Production state integration
 

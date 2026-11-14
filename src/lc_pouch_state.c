@@ -3618,6 +3618,8 @@ static int lc_pouch_state_metadata_append_entry_copy(
 #endif
   destination->found = source->found;
   destination->version = source->version;
+  destination->query_index_seq = source->query_index_seq;
+  destination->has_query_index_seq = source->has_query_index_seq;
   destination->bytes = source->bytes;
   destination->cipher_bytes = source->cipher_bytes;
   destination->retention = source->retention;
@@ -9589,6 +9591,94 @@ static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
                         NULL, NULL, "pouch");
   return lc_pouch_state_cache_apply_entry(replay->pouch, replay->cache, entry,
                                           error);
+}
+
+struct lc_pouch_state_snapshot {
+  lc_allocator allocator;
+  lc_pouch_state_cache_record **records;
+  size_t count;
+  lc_pouch_generation index_seq, query_index_seq;
+};
+
+void lc_pouch_state_snapshot_close(lc_pouch_state_snapshot *snapshot) {
+  size_t i;
+  lc_allocator allocator;
+  if (!snapshot)
+    return;
+  allocator = snapshot->allocator;
+  for (i = 0; i < snapshot->count; ++i)
+    lc_pouch_state_cache_record_cleanup(&allocator, snapshot->records[i]);
+  lc_free_with_allocator(&allocator, snapshot->records);
+  lc_free_with_allocator(&allocator, snapshot);
+}
+
+int lc_pouch_state_snapshot_capture(lc_pouch *pouch,
+                                    lc_pouch_storage_replay_fn visit,
+                                    void *context,
+                                    lc_pouch_state_snapshot **out,
+                                    lc_error *error) {
+  lc_pouch_namespace_logstore cache;
+  lc_pouch_storage_replay_context replay;
+  lc_pouch_state_snapshot *snapshot;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!pouch || !visit || !out)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "snapshot capture requires runtime, replay and output",
+                        NULL, NULL, "pouch");
+  snapshot = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*snapshot));
+  if (!snapshot)
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "cannot allocate logical snapshot capture", NULL, NULL,
+                        "pouch");
+  snapshot->allocator = pouch->allocator;
+  memset(&cache, 0, sizeof(cache));
+  replay.pouch = pouch;
+  replay.cache = &cache;
+  rc = visit(context, lc_pouch_state_storage_replay, &replay, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_cache_record_index_build(
+        pouch, &cache, &snapshot->records, &snapshot->count, error);
+  if (rc == LC_OK) {
+    snapshot->index_seq = cache.max_version;
+    snapshot->query_index_seq = cache.max_query_index_seq;
+    /* The sorted vector takes ownership of the records. Replay's hash buckets
+     * are no longer needed; immutable visits allocate nothing. */
+    cache.records = NULL;
+    cache.record_count = 0;
+  }
+  lc_pouch_namespace_logstore_clear_records(&pouch->allocator, &cache);
+  if (rc != LC_OK) {
+    lc_pouch_state_snapshot_close(snapshot);
+    return rc;
+  }
+  *out = snapshot;
+  return LC_OK;
+}
+
+int lc_pouch_state_snapshot_visit(const lc_pouch_state_snapshot *snapshot,
+                                  lc_pouch_state_snapshot_visit_fn visit,
+                                  void *context, lc_error *error) {
+  lc_pouch_state_entry entry;
+  size_t i;
+  int rc;
+  if (!snapshot || !visit)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "logical snapshot visit requires capture and callback",
+                        NULL, NULL, "pouch");
+  memset(&entry, 0, sizeof(entry));
+  entry.key = LC_POUCH_STATE_HIGH_WATER_KEY;
+  entry.control = entry.seen = entry.has_query_index_seq = 1;
+  entry.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
+  entry.version = entry.index_seq = snapshot->index_seq;
+  entry.query_index_seq = snapshot->query_index_seq;
+  rc = visit(context, &entry, error);
+  for (i = 0; rc == LC_OK && i < snapshot->count; ++i) {
+    lc_pouch_state_entry_borrow_cache_record(snapshot->records[i], &entry);
+    rc = visit(context, &entry, error);
+  }
+  return rc;
 }
 
 /* Called under the existing namespace projection authority. Failed replay is
