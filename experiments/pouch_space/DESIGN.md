@@ -158,7 +158,8 @@ supports canonical metadata and PENDING-header finalization, including records
 crossing run boundaries. A second appender on the same owner gets a busy error;
 other streams and readers remain independent.
 
-Only creation and run grants add structural journal events. A complete canonical
+Only creation and run grants add structural journal events during normal active
+stream append. A complete canonical
 append advances an in-memory readiness sequence and tail hint; durable commit
 waits for the root barrier covering that sequence before exposing its new tail
 through the stream owner. Ready sequences are separate from structural journal
@@ -241,8 +242,60 @@ reproduces the stale-pointer failure before its correction. Another full-capacit
 test retires over 100 grants using one 64-byte allocation/event and proves that
 checkpointing restores capacity without copying payloads.
 
-Logical name catalogs, public retry authority and process-shared ownership
-remain unimplemented. The comparison fixture uses the
+## Typed name catalogs
+
+`catalog.[ch]` maps `(owner, surface, exact name bytes)` to a binding ID, revision
+and live stream reference. Surfaces distinguish namespaces, collections,
+segments, snapshots, projections and control metadata. These are internal typed
+bindings; their public Pouch semantics are not implemented by this layer.
+Names may be empty or binary, including NUL, and are not filesystem paths.
+The name index grows at 75% occupancy and compares the full byte string after
+hashing. Memory follows metadata participation rather than reserved file size.
+
+Catalog records use directory kind 5, keyed by owner and stable binding ID.
+They are inline metadata, with no payload extents: the 64-byte common event
+header is followed by surface (32 bits), name length (32), target kind (32),
+reserved zero (32), target owner (64), target key (64), target incarnation (64),
+then the raw name. The existing record CRC covers the entire representation.
+Its size is 104 plus name bytes, at most the 128 KiB journal size. Checkpoint
+packing supports records spanning metadata pages. Normal immutable-value APIs
+reject this kind, preventing bypass of catalog validation and target retention.
+
+Create requires an absent name. Replacement and removal require the current
+revision, including this container's identity. Replacement retains the binding
+ID and allocates a new revision; removed/recreated names get fresh IDs. Explicit
+owner allocation, binding IDs and revisions share the reserved incarnation
+allocator without a per-ID write. Exhaustion fails explicitly. Unused IDs are
+abandoned on reopen, so lost NoSync work cannot alias a later identity.
+
+Targets must be live stream incarnations in the same container. Mutations
+always wait for structural durability, even in NoSync stores. The same name
+cannot have two pending mutations; independent names use the existing grouped
+commit coordinator. Runtime reference counts prevent retiring a bound target.
+Removing or replacing its last binding records the release sequence; retirement
+also waits for that release to be durable. Recovery reconstructs these counts
+from checkpoint bindings and journal deltas, validates targets after loading
+checkpoint heads, and rejects a journal that retires a still-bound head.
+
+Get and enumeration select one completed durable prefix in both sync modes.
+Pending changes preserve the old visible binding. A view pins that metadata and
+its target; close it after admitting the actual stream/read handles. Enumeration
+pins a metadata snapshot and invokes callbacks outside the allocator mutex, so
+callbacks may checkpoint or mutate bindings without deadlock. Both count and
+capture passes use one saved durable watermark: commit completion intentionally
+does not acquire the allocator mutex. Deterministic paused-allocation tests
+reproduce a pre-fix vector overflow from an advancing watermark and prove stable
+binding and orphan snapshots after its correction.
+
+Orphan enumeration captures unbound, closed heads with no catalog views or
+pending catalog release. It reads no payloads and performs no implicit GC.
+Candidates require revalidation before retirement because another thread may
+publish a binding after capture; stream retirement rechecks these guards.
+Recovered staged streams are therefore discoverable without inventing a second
+authoritative manifest or scanning document bodies.
+
+Public retry authority and process-shared ownership remain unimplemented.
+The stream comparison fixture now creates/reopens real catalog bindings. It uses the
 actual Pouch header codec and canonical finalization rules, but minimal metadata;
 it does not establish full public semantics or feature parity.
 

@@ -4,6 +4,9 @@ The [container foundation](../experiments/pouch_space/space.h) implements one
 preallocated file, typed owner/key bindings, bounded streaming, independent
 thread writers, checksummed publication/recovery, reader pins, retirement/reuse
 and explicit growth. Default capacity is 10 MiB; tests grow 1 to 2 to 3 MiB.
+The later stages add canonical append-owned streams, whole-stream lifecycle
+operations and typed name catalogs; their verification and measurements appear
+below in implementation order.
 Its [design and ordering contract](../experiments/pouch_space/DESIGN.md) defines
 the failure model and limits. It is not connected to normal Pouch open behavior.
 
@@ -549,8 +552,8 @@ Pouch backend was changed by this stream stage.
 
 Native x86_64 verification on 2026-11-14 adds immutable sealing and atomic
 whole-stream retirement. These are internal physical ownership operations;
-normal Pouch remains multifile, and typed name catalogs/public integration
-remain outstanding.
+at this stage typed name catalogs and public integration were outstanding.
+Normal Pouch remains multifile.
 
 Seal records the final tail in one 80-byte structural event. It first stabilizes
 unsynced canonical bytes; an already durable tail skips that prerequisite.
@@ -612,6 +615,116 @@ comparison measures ordinary unsealed appends; transition barrier/allocation
 costs above are proven separately by deterministic tests, not presented as a
 public Pouch deletion benchmark.
 
+## Typed catalog follow-up
+
+The 2026-11-14 catalog stage adds exact-byte name bindings to the experimental
+container, including conditional create/replace/remove, stable binding IDs,
+revision/container checks, stream target retention, pinned views and metadata-only
+enumeration. Binding records use 104 bytes plus name bytes in the existing
+journal/checkpoint pages; they add no payload copy or second WAL. Their dynamic
+hash index follows actual metadata participation. Catalog publication waits for
+durability even in NoSync mode. Same-name concurrent mutation returns busy;
+independent names may share a barrier.
+
+Retirement rejects live bindings, held catalog views and releases not yet
+durable. Recovery rebuilds the name index and target counts and rejects stale
+targets, conflicting identities and attempts to retire bound heads. Snapshot
+callbacks run outside the allocator mutex. Orphan enumeration discovers unbound
+closed heads without reading payloads; candidates must be revalidated before
+retirement and are never collected implicitly. These capabilities support the
+pending public adapter; they do not implement public namespace/collection
+behavior by themselves.
+
+All 33 experiment tests pass under Debug ASan/UBSan and native glibc/musl
+Release. Nine storage groups pass under ThreadSanitizer. Catalog Memcheck
+reports 45,171 observable checks, zero errors and all 68,631 heap allocations
+freed. Tests cover 2,000 names across owners, binary and empty names, spanning
+metadata, the maximum 130,968-byte name, full-journal rollover/rebinding, pinned
+old revisions, exact conditional failures, callback mutation/checkpointing,
+orphan rescue, malformed checksummed events and both durability modes. Fault
+injection covers publication/removal/checkpoint writes, syncs, allocations and
+recovery reads, including valid metadata persisted ahead of a failed sync.
+
+One deterministic race test reproduced a heap overflow before its fix: sync
+completion can advance the durable watermark while the allocator mutex is held.
+A two-pass snapshot that reloads that watermark can capture more entries than
+it counted. Both binding and orphan snapshots now save a single prefix for
+both passes. Pausing the vector allocation while an unrelated publication or
+release completes proves that the captured set stays consistent. The pre-fix
+sanitizer trace is retained in `catalog-prefix-repro.log`.
+
+The stream comparison now creates and reopens actual catalog bindings. State
+creates its namespace binding during timed warmup; collection creation and its
+binding precede timed append, matching the existing Pouch fixture. Reopen
+resolves and pins the catalog target before admitting the stream. Recovered
+entry counts include heads, bindings and every owned-run grant. The preserved
+`c659990` executable supplies the catalog-free stream baseline. The normal
+multifile Pouch implementation is unchanged.
+
+Another 90-run paired series rotates those three engines across five samples,
+both workloads and three profiles. Small durable uses one writer and 128 rows
+(state has two rounds); long NoSync uses four writers and 2,048 total operations.
+Values are 1 KiB with 4 KiB producer chunks and a genuinely reserved 10 MiB
+container. The reopened profile closes/opens an empty store before writing,
+exercising uncertified free-space preparation. All 90 runs verify payloads
+before and after reopen, exact physical counts and single-file backing.
+Median write milliseconds are **before / catalog / Pouch**:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-durable-1w | 459.21 / 425.55 / 1061.29 | 239.50 / 250.93 / 629.39 |
+| long-nosync-4w | 3.44 / 8.50 / 19.07 | 3.81 / 3.73 / 62.95 |
+| reopened-long-nosync-4w | 18.53 / 23.65 / 21.35 | 14.24 / 20.57 / 55.19 |
+
+Fresh NoSync state now includes two grouped catalog syncs in timed namespace
+startup, versus zero in the catalog-free fixture: 6.10–9.63 ms afterward versus
+2.92–3.87 ms before. This is a measured startup cost, not a steady-state
+per-record barrier. Its median CPU time is 8.46 ms versus Pouch 26.92 ms; the
+median per-run worst operation rises from 0.35 to 6.07 ms. Do not weaken
+structural durability to remove this cost. A later real adapter may combine
+related ready metadata with its canonical initialization under the same commit
+protocol, but that optimization is not implemented or measured here.
+
+Small durable state uses 258 timed `fdatasync` calls versus 257 before; its
+before/after time ranges overlap (394–485 ms versus 413–466 ms), as do collection
+ranges (222–253 ms versus 213–268 ms). Collection binding setup is outside timed
+append, whose 128 per-record barriers are unchanged. Fresh long NoSync
+collection ranges also overlap. Reopened state still has a worse median than
+Pouch and overlapping ranges: 13.58–27.80 ms with catalogs versus Pouch
+18.44–23.06 ms. Reopened collection ranges overlap before/after (10.89–22.39 ms
+versus 17.59–24.22 ms); preparation used two or three barriers before and three
+afterward. State adds two catalog barriers to its two or three preparations.
+This series establishes no general reopened-state win.
+
+Warm verified read medians, **catalog / Pouch**, are:
+
+| Profile | State, ms | Collection-shaped workload, ms |
+| --- | ---: | ---: |
+| small-durable-1w | 0.21 / 2.10 | 0.23 / 0.65 |
+| long-nosync-4w | 1.52 / 16.62 | 2.94 / 8.40 |
+| reopened-long-nosync-4w | 1.52 / 14.72 | 3.07 / 6.73 |
+
+The long fresh NoSync close/open/first-verified-read cycle is 31.27 ms for state
+and 29.29 ms for collection-shaped streams, versus Pouch 59.60 and 113.44 ms.
+Opening alone remains slower for the container; the cycle includes Pouch's
+deferred recovery and close work. Kernel timed-write accounting for fresh long
+state is 2,224,128 bytes versus 2,215,936 before and Pouch 3,244,032; collection
+is 2,232,320 versus 2,228,224 and Pouch 4,800,512. The container stays one file,
+10 MiB logical, fully allocated; names add 444/464 journal bytes in these
+four-writer fixtures without checkpointing.
+
+The fixtures still omit public SHA-256/UUID identities, leases, receipts,
+permanent positions, retry/XA authority, indexes and codecs. Warm physical reads
+are not cold-cache reads or concurrent public scans. These results are evidence
+for a storage boundary, not full backend performance acceptance.
+
+Raw logs and runner are retained in
+`build/pouch-space-integrated/catalog-paired/` and `catalog-paired.sh`.
+`catalog-results.json` contains every row and median/min/max summaries.
+Final verification logs are `catalog-final-{debug,release,musl,tsan}-tests.log`
+and `catalog-memcheck.log` in the same parent directory. No Darwin, QEMU,
+250 MiB or larger tests were run.
+
 ## Reproduce
 
 ```sh
@@ -651,8 +764,10 @@ The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
-packing, canonical-stream and lifecycle follow-ups. Full native integration still
-requires typed catalogs, checkpoint scheduling,
+packing, canonical-stream, lifecycle and typed catalog follow-ups. The next
+major task is connecting the existing canonical Pouch owners to this boundary
+and proving the actual public behavior suites. Full native integration still
+requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits
 rebinding a deleted physical key; it does not supply permanent collection

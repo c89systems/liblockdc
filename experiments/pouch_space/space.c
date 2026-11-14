@@ -1,9 +1,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
-#include "space.h"
-#include "directory.h"
 #include "lc_api_internal.h"
-#include "owned.h"
+#include "space_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,86 +15,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
-
-#define ROOT_MAGIC UINT64_C(0x31544f4f525350)
-#define EVENT_MAGIC UINT64_C(0x31565350)
-#define BUCKETS 257U
-#define JOURNAL_OFFSET PS_JOURNAL_OFFSET
-#define META_MAGIC UINT32_C(0x3141544d)
-#define META_HEADER 64U
-#define META_PAYLOAD (PS_PAGE - META_HEADER)
-#define TOKEN_RANGE UINT64_C(4294967296)
-enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS, PS_SEAL };
-#define EXTENT_PACKED 1U
-#define EXTENT_OWNED 2U
-#define OWNED_MAGIC UINT64_C(0x314e55524f5350)
-#define CELLS (PS_PAGE / PS_CELL)
-
-typedef struct ps_extent {
-  uint64_t offset, bytes;
-  uint32_t crc, flags;
-} ps_extent;
-typedef struct ps_entry {
-  ps_key key;
-  uint64_t token, bytes;
-  uint64_t publication_sequence;
-  uint64_t stream_capacity, stream_runs, stream_ready;
-  int stream_open, stream_sealed;
-  ps_extent *extents;
-  size_t count, capacity, pins;
-  int state, safe, deleted; /* 0 private, 1 live, 2 retired */
-  struct ps_entry *previous;
-  struct ps_entry *all_next, *hash_next;
-  struct ps_entry **all_link;
-  struct ps_entry *retired_next, **retired_link;
-  struct ps_entry *dirty_next, **dirty_link;
-  ps_directory_value checkpoint_ref, pending_ref;
-  struct ps_entry *stream_next;
-} ps_entry;
-typedef struct ps_run {
-  uint64_t offset, bytes;
-  int clean;
-  struct ps_run *next;
-} ps_run;
-typedef struct ps_payload_page {
-  ps_run run; /* reusable free-interval node; must be first */
-  uint64_t occupied;
-  struct ps_payload_page *next, **link, *hash_next;
-  struct ps_payload_page *available_next, **available_link;
-} ps_payload_page;
-typedef struct ps_meta_page {
-  ps_run run; /* reusable free-interval node; must be first */
-  uint64_t generation, following;
-  size_t used, references;
-  int index;
-  struct ps_meta_page *next, **link, *hash_next;
-} ps_meta_page;
-struct ps_space {
-  int fd, poisoned, durable, root;
-  pthread_mutex_t mutex;
-  pthread_mutex_t sync_io_mutex, commit_mutex;
-  pthread_cond_t commit_cond;
-  int locks_initialized, syncing;
-  ps_io io;
-  unsigned char identity[16];
-  uint64_t capacity, maximum, generation, sequence, syncs, checkpoints;
-  uint64_t token_next, token_limit;
-  uint64_t pending_sequence, durable_sequence;
-  uint64_t sync_requests, sync_batches, max_sync_batch;
-  size_t journal, metadata, readers, writers;
-  uint64_t live_entries, free_bytes, metadata_free_bytes;
-  uint64_t directory_page_writes, descriptor_page_writes;
-  size_t metadata_pages;
-  size_t packed_pages;
-  uint64_t packed_bytes;
-  ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
-  ps_entry *stream_buckets[BUCKETS];
-  ps_directory_root directory;
-  ps_meta_page *pages, *page_buckets[BUCKETS];
-  ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
-  ps_payload_page *available[CELLS + 1];
-  ps_run *free, *metadata_free;
-};
 struct ps_writer {
   ps_space *space;
   ps_entry *entry;
@@ -298,7 +216,7 @@ static uint64_t aligned(uint64_t n) {
   return (n + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
 }
 static int valid_key(ps_key k) {
-  return k.kind >= PS_STATE && k.kind <= PS_OWNED_RUN;
+  return k.kind >= PS_STATE && k.kind <= PS_CATALOG;
 }
 static int immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION;
@@ -320,6 +238,8 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
   return NULL;
 }
 static size_t entry_bytes(const ps_entry *p) {
+  if (p->key.kind == PS_CATALOG)
+    return 104 + p->catalog->length;
   return p->key.kind == PS_STREAM ? 80 : 64 + 24 * p->count;
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
@@ -372,6 +292,8 @@ static void retire(ps_space *s, ps_entry *p) {
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
+  if (p->key.kind == PS_CATALOG)
+    ps_catalog_unlink(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted) {
     stream_unregister(s, p);
   }
@@ -403,6 +325,7 @@ static void install(ps_space *s, ps_entry *p) {
   }
 }
 static void entry_free(ps_entry *p) {
+  ps_catalog_free_record(p);
   lc_free_with_allocator(NULL, p->extents);
   lc_free_with_allocator(NULL, p);
 }
@@ -692,6 +615,8 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       put64(wire + 64, p->stream_capacity);
       put64(wire + 72, p->stream_runs);
     }
+    if (p->key.kind == PS_CATALOG)
+      ps_catalog_encode_record(wire, p);
   }
   put32(wire + 60,
         (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
@@ -706,12 +631,15 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
       get32(wire + 60) !=
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
-  count = get32(wire + 16) == PS_STREAM ? 0 : get32(wire + 56);
+  count = get32(wire + 16) == PS_STREAM || get32(wire + 16) == PS_CATALOG
+              ? 0
+              : get32(wire + 56);
   if (count > (PS_JOURNAL - 64) / 24 ||
-      bytes != (get32(wire + 16) == PS_STREAM && (get32(wire + 20) == PS_PUT ||
-                                                  get32(wire + 20) == PS_SEAL)
-                    ? 80
-                    : 64 + count * 24) ||
+      (get32(wire + 16) != PS_CATALOG &&
+       bytes != (get32(wire + 16) == PS_STREAM && (get32(wire + 20) == PS_PUT ||
+                                                   get32(wire + 20) == PS_SEAL)
+                     ? 80
+                     : 64 + count * 24)) ||
       get32(wire + 20) > PS_SEAL)
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -733,9 +661,23 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
        (count || p->bytes || get32(wire + 56) ||
-        (!immutable_key(p->key) && p->key.kind != PS_STREAM))) ||
+        (!immutable_key(p->key) && p->key.kind != PS_STREAM &&
+         p->key.kind != PS_CATALOG))) ||
       (*event == PS_SEAL && p->key.kind != PS_STREAM))
     goto invalid;
+  if (p->key.kind == PS_CATALOG) {
+    int rc;
+    if (p->bytes || get32(wire + 56) || (*event == PS_REMOVE && bytes != 64))
+      goto invalid;
+    rc = *event == PS_PUT ? ps_catalog_decode_record(p, wire, bytes, error)
+                          : LC_OK;
+    if (rc != LC_OK) {
+      entry_free(p);
+      return rc;
+    }
+    *out = p;
+    return LC_OK;
+  }
   if (p->key.kind == PS_STREAM && (*event == PS_PUT || *event == PS_SEAL)) {
     p->stream_sealed = (int)get32(wire + 56);
     p->stream_capacity = get64(wire + 64);
@@ -1265,6 +1207,7 @@ static void destroy(ps_space *s) {
     s->payload_pages = payload->next;
     lc_free_with_allocator(NULL, payload);
   }
+  lc_free_with_allocator(NULL, s->catalogs.buckets);
   if (s->fd >= 0)
     (void)close(s->fd);
   if (s->locks_initialized >= 4)
@@ -1412,7 +1355,11 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
                       p->token != ref.incarnation ||
                       get64(wire + 8) > s->sequence || lookup(s, key)))
     rc = err(error, LC_ERR_PROTOCOL, "checkpoint descriptor binding mismatch");
+  if (rc == LC_OK && p->key.kind == PS_CATALOG)
+    rc = ps_catalog_prepare_record(s, p, 1, error);
   if (rc == LC_OK) {
+    if (p->key.kind == PS_CATALOG)
+      ps_catalog_apply_record(s, p, 0);
     p->checkpoint_ref = ref;
     register_entry(s, p);
     install(s, p);
@@ -1556,6 +1503,8 @@ static int recover(ps_space *s, lc_error *error) {
   ps_directory_close(directory);
   if (rc == LC_OK)
     rc = validate_owned_directory(s, error);
+  if (rc == LC_OK)
+    rc = ps_catalog_validate_directory(s, error);
   if (rc != LC_OK)
     goto done;
   rc = transfer(s, wire, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
@@ -1595,7 +1544,8 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
       old = lookup(s, p->key);
-      if (p->key.kind != PS_STATE && old && !old->deleted) {
+      if (p->key.kind != PS_STATE && p->key.kind != PS_CATALOG && old &&
+          !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
                  "collection position overwritten in journal");
@@ -1613,6 +1563,14 @@ static int recover(ps_space *s, lc_error *error) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
         goto done;
+      }
+      if (p->key.kind == PS_CATALOG) {
+        rc = ps_catalog_prepare_record(s, p, 0, error);
+        if (rc != LC_OK) {
+          entry_free(p);
+          goto done;
+        }
+        ps_catalog_apply_record(s, p, s->sequence + 1);
       }
       register_entry(s, p);
       dirty_entry(s, p, old);
@@ -1637,8 +1595,14 @@ static int recover(ps_space *s, lc_error *error) {
         if (!old->dirty_link)
           dirty_entry(s, old, NULL);
         entry_free(p);
+      } else if (p->key.kind == PS_CATALOG) {
+        ps_catalog_drop_record(s, old, s->sequence + 1);
+        entry_free(p);
       } else if (p->key.kind == PS_STREAM) {
-        rc = remove_owned(s, old, s->sequence + 1, 0, error);
+        rc = old->catalog_refs
+                 ? err(error, LC_ERR_PROTOCOL,
+                       "journal retires a catalog target")
+                 : remove_owned(s, old, s->sequence + 1, 0, error);
         if (rc == LC_OK)
           rc = remove_owned(s, old, s->sequence + 1, 1, error);
         entry_free(p);
@@ -2723,6 +2687,12 @@ int ps_owned_retire(ps_owned_head *head, lc_error *error) {
   s = head->space;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK && !head->entry->deleted &&
+      (head->entry->catalog_refs || head->entry->catalog_pins ||
+       head->entry->catalog_release >
+           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
+    rc = err(error, LC_ERR_INVALID,
+             "stream is retained by a catalog binding or view");
   if (rc == LC_OK && !head->entry->deleted)
     rc = remove_owned(s, head->entry, 0, 0, error);
   if (rc == LC_OK && !head->entry->deleted) {
@@ -2738,3 +2708,25 @@ int ps_owned_retire(ps_owned_head *head, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
 }
+ps_entry *ps_internal_lookup(ps_space *s, ps_key key) { return lookup(s, key); }
+int ps_internal_healthy(ps_space *s, lc_error *e) { return healthy(s, e); }
+int ps_internal_event(ps_space *s, ps_entry *p, int event, lc_error *e) {
+  return append_event(s, p, event, e);
+}
+int ps_internal_allowance(ps_space *s, uint64_t metadata, uint64_t entries,
+                          lc_error *e) {
+  return checkpoint_allowance(s, metadata, entries, 0, e);
+}
+void ps_internal_install(ps_space *s, ps_entry *p) {
+  ps_entry *old = lookup(s, p->key);
+  register_entry(s, p);
+  dirty_entry(s, p, old);
+  install(s, p);
+}
+void ps_internal_remove(ps_space *s, ps_entry *p, uint64_t sequence) {
+  mark_removed(s, p, sequence);
+}
+int ps_internal_durable(ps_space *s, uint64_t sequence, lc_error *e) {
+  return wait_durable(s, sequence, e);
+}
+void ps_internal_collect(ps_space *s) { collect(s); }

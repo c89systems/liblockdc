@@ -19,7 +19,9 @@ now checkpoints through the growable typed directory and packed descriptor
 pages. Small payload tails also share physical pages through independently owned
 cells. The experimental canonical append-owned stream boundary is implemented
 and fault-tested, including sealing and atomic retirement of complete run sets.
-Typed catalogs and normal Pouch integration remain ahead.
+Typed name catalogs now publish exact-byte names with revision checks, durable
+stream references, pinned views and metadata-only enumeration. Normal Pouch
+integration, maintenance and shared-root coordination remain ahead.
 
 ## Intent
 

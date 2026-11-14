@@ -114,11 +114,44 @@ pins to drain. The same typed key may then bind a fresh incarnation; old refs
 cannot resolve it. Tests cover both durability modes, each transition/checkpoint
 fault, malformed checksummed events, held barriers and full-journal rebinding.
 
-These streams do not yet implement typed name catalogs, public collection
-positions, receipts or shared-root ownership. Metadata
-repacking and production integration also remain to be implemented. See the
+These streams do not yet implement public collection positions, receipts or
+shared-root ownership. Metadata repacking and production integration also remain
+to be implemented. See the
 [stream design](../experiments/pouch_space/stream.h) and
 [measured scope and regressions](pouch-space-experiment.md).
+
+## Typed name catalogs
+
+The internal catalog boundary now maps `(owner, surface, exact name bytes)` to
+a stable binding identity, revision and live stream incarnation. Surfaces cover
+namespaces, collections, segments, snapshots, projections and control metadata;
+their public Pouch behavior still belongs to the pending adapter. Empty and
+binary names are accepted without pathname interpretation. A dynamic hash index
+compares full names; its memory follows metadata participation, not file capacity.
+
+Create is conditional on absence; replacement and removal require the exact
+current revision and container identity. Replacement retains the binding ID;
+recreation after removal allocates a fresh ID. Owners, bindings and revisions
+share the durably reserved incarnation allocator without a per-ID journal write.
+Binding records occupy the existing metadata journal/checkpoint pages, contain
+no payload extents and require no second WAL. They use 104 fixed bytes plus the
+name, bounded by the 128 KiB journal record limit.
+
+Catalog changes always wait for structural durability, including NoSync stores.
+A concurrent change to the same name returns busy; independent names may share
+the existing commit barrier. Get and enumeration capture one completed durable
+prefix. Views pin both the binding and target until actual stream/read handles
+are admitted. Stream retirement rejects live bindings, catalog pins and releases
+whose durability is pending. Recovery rebuilds the name index and live target
+references, rejecting stale targets and conflicting name identities.
+
+Enumeration captures metadata under the allocator mutex and invokes callbacks
+outside it, permitting checkpointing and catalog changes. Unbound closed stream
+enumeration exposes orphan candidates without reading payloads or implicitly
+collecting them. A caller must revalidate each candidate before retirement;
+concurrent publication can bind it after capture. A deterministic test proves
+that commit completion during snapshot allocation cannot change the captured
+prefix or overrun the counted vector.
 
 ## Integration and acceptance
 

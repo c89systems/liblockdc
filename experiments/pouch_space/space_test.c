@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "catalog.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_record.h"
 #include "owned.h"
@@ -24,6 +25,12 @@ static size_t checks;
 static size_t allocation_call, allocation_fail;
 static size_t allocation_max;
 static int measure_allocations;
+typedef struct allocation_pause {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int entered, released;
+} allocation_pause;
+static allocation_pause *paused_allocation;
 
 /* Linker fault seam: exercise real allocation failures without another mode in
  * the storage interface. Disabled during concurrency and error cleanup. */
@@ -40,6 +47,14 @@ void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
 }
 void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
                                       size_t bytes) {
+  if (paused_allocation && n == 1 && bytes == sizeof(void *)) {
+    pthread_mutex_lock(&paused_allocation->mutex);
+    paused_allocation->entered = 1;
+    pthread_cond_broadcast(&paused_allocation->cond);
+    while (!paused_allocation->released)
+      pthread_cond_wait(&paused_allocation->cond, &paused_allocation->mutex);
+    pthread_mutex_unlock(&paused_allocation->mutex);
+  }
   if (measure_allocations && n * bytes > allocation_max)
     allocation_max = n * bytes;
   return allocation_fail && ++allocation_call == allocation_fail
@@ -3561,6 +3576,909 @@ static void stream_lifecycle_rebind_rollover(void) {
        "previous unpinned tombstone safely");
 }
 
+static ps_catalog_info catalog_expect(ps_space *space, uint64_t owner,
+                                      unsigned int kind, const void *name,
+                                      size_t length, uint64_t target) {
+  ps_catalog_view *view = NULL;
+  ps_catalog_info info;
+  OK(ps_catalog_get(space, owner, kind, name, length, &view, &error));
+  CHECK(view != NULL);
+  OK(ps_catalog_view_info(view, &info, &error));
+  CHECK(info.stream.kind == PS_STREAM && info.stream.owner == 10 &&
+        info.stream.key == target);
+  ps_catalog_view_close(view);
+  return info;
+}
+static void catalog_basic(int durable) {
+  ps_space *space;
+  ps_stream *a, *b;
+  ps_stream_info ai, bi;
+  ps_catalog_info first, second, out;
+  ps_catalog_view *held = NULL, *missing = NULL;
+  ps_stats before, after;
+  uint64_t owner, next, offset;
+  ps_ref wrong;
+  unsigned char binary[] = {'a', 0, '/', 0xff};
+  clean();
+  space = create(3 * PS_MIB, durable, NULL);
+  OK(ps_catalog_allocate_id(space, &owner, &error));
+  a = stream_open(space, 1, 1, NULL, NULL);
+  b = stream_open(space, 2, 1, NULL, NULL);
+  OK(canonical_append(a, "old", 3, 1, 1, &offset, &error));
+  OK(canonical_append(b, "new", 3, 1, 2, &offset, &error));
+  OK(ps_stream_status(a, &ai, &error));
+  OK(ps_stream_status(b, &bi, &error));
+  OK(ps_catalog_get(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    &missing, &error));
+  CHECK(!missing);
+  OK(ps_status(space, &before, &error));
+  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    NULL, stream_key(1), &ai.ref, &first, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.journal_bytes == before.journal_bytes + 104 + sizeof(binary) &&
+        after.syncs == before.syncs + 1);
+  catalog_expect(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                 1);
+  BAD(ps_stream_retire(a, &error));
+  BAD(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary,
+                     sizeof(binary), NULL, stream_key(2), &bi.ref, &out,
+                     &error));
+  wrong = first.revision;
+  ++wrong.incarnation;
+  BAD(ps_catalog_remove(space, owner, PS_CATALOG_COLLECTION, binary,
+                        sizeof(binary), &wrong, &error));
+  wrong = ai.ref;
+  wrong.container[0] ^= 1;
+  BAD(ps_catalog_put(space, owner, PS_CATALOG_SEGMENT, binary, sizeof(binary),
+                     NULL, stream_key(1), &wrong, &out, &error));
+  OK(ps_catalog_get(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    &held, &error));
+  BAD(ps_close(space, &error));
+  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    &first.revision, stream_key(2), &bi.ref, &second, &error));
+  CHECK(second.id == first.id &&
+        second.revision.incarnation != first.revision.incarnation);
+  BAD(ps_stream_retire(a, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_catalog_view_info(held, &out, &error));
+  CHECK(out.target.incarnation == ai.ref.incarnation &&
+        out.revision.incarnation == first.revision.incarnation);
+  ps_catalog_view_close(held);
+  OK(ps_stream_retire(a, &error));
+  OK(ps_stream_close(a, &error));
+  catalog_expect(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                 2);
+  OK(ps_catalog_put(space, owner, PS_CATALOG_SEGMENT, NULL, 0, NULL,
+                    stream_key(2), &bi.ref, &out, &error));
+  OK(ps_catalog_remove(space, owner, PS_CATALOG_SEGMENT, NULL, 0, &out.revision,
+                       &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  b = stream_open(space, 2, 0, &bi.ref, NULL);
+  catalog_expect(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                 2);
+  BAD(ps_stream_retire(b, &error));
+  OK(ps_catalog_remove(space, owner, PS_CATALOG_COLLECTION, binary,
+                       sizeof(binary), &second.revision, &error));
+  OK(ps_catalog_get(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    &missing, &error));
+  CHECK(!missing);
+  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
+                    NULL, stream_key(2), &bi.ref, &out, &error));
+  CHECK(out.id != second.id &&
+        out.revision.incarnation != second.revision.incarnation);
+  OK(ps_catalog_remove(space, owner, PS_CATALOG_COLLECTION, binary,
+                       sizeof(binary), &out.revision, &error));
+  OK(ps_stream_retire(b, &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_catalog_allocate_id(space, &next, &error));
+  CHECK(next > owner);
+  OK(ps_status(space, &after, &error));
+  CHECK(!after.entries && !after.live_bytes && !after.allocated_bytes);
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  OK(ps_catalog_allocate_id(space, &owner, &error));
+  CHECK(owner > next);
+  OK(ps_close(space, &error));
+  clean();
+  puts("catalog: typed byte names, exact revisions, durable publication, "
+       "pinned targets, rebinding, recovery and owner IDs");
+}
+static void catalog_scale(void) {
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info target;
+  ps_catalog_info info;
+  char name[80];
+  unsigned char *large = malloc(PS_CHUNK + 17);
+  size_t i;
+  CHECK(large != NULL);
+  memset(large, 0x6a, PS_CHUNK + 17);
+  clean();
+  space = create(PS_DEFAULT_CAPACITY, 0, NULL);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_status(stream, &target, &error));
+  for (i = 0; i < 2000; ++i) {
+    snprintf(name, sizeof(name), "name/%lu", (unsigned long)i);
+    OK(ps_catalog_put(space, i % 7, PS_CATALOG_COLLECTION, name, strlen(name),
+                      NULL, stream_key(1), &target.ref, &info, &error));
+  }
+  OK(ps_catalog_put(space, 99, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, NULL,
+                    stream_key(1), &target.ref, &info, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  stream = stream_open(space, 1, 0, &target.ref, NULL);
+  for (i = 0; i < 2000; ++i) {
+    snprintf(name, sizeof(name), "name/%lu", (unsigned long)i);
+    info = catalog_expect(space, i % 7, PS_CATALOG_COLLECTION, name,
+                          strlen(name), 1);
+    OK(ps_catalog_remove(space, i % 7, PS_CATALOG_COLLECTION, name,
+                         strlen(name), &info.revision, &error));
+  }
+  info = catalog_expect(space, 99, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, 1);
+  OK(ps_catalog_remove(space, 99, PS_CATALOG_CONTROL, large, PS_CHUNK + 17,
+                       &info.revision, &error));
+  OK(ps_stream_retire(stream, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_close(space, &error));
+  free(large);
+  clean();
+  puts("catalog: growing name index, two thousand typed names, spanning "
+       "metadata, journal rollover and complete reclamation");
+}
+
+static void catalog_faults(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *space;
+  ps_stream *a, *b;
+  ps_stream_info ai, bi;
+  ps_catalog_info original, changed, seen;
+  ps_catalog_view *view = NULL;
+  ps_stats stats;
+  unsigned char event[108];
+  char pad[32];
+  uint64_t offset;
+  size_t operation, kind, phase, count, i, bytes;
+  int rc;
+  for (operation = 0; operation < 4; ++operation)
+    for (kind = 0; kind < 2; ++kind) {
+      count = 0;
+      for (phase = 0; phase <= count; ++phase) {
+        clean();
+        m.operations = m.fail_at = 0;
+        space = create(3 * PS_MIB, 1, &io);
+        a = stream_open(space, 1, 1, NULL, NULL);
+        b = stream_open(space, 2, 1, NULL, NULL);
+        OK(canonical_append(a, "old", 3, 1, 1, &offset, &error));
+        OK(canonical_append(b, "new", 3, 1, 2, &offset, &error));
+        OK(ps_stream_status(a, &ai, &error));
+        OK(ps_stream_status(b, &bi, &error));
+        OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                          stream_key(1), &ai.ref, &original, &error));
+        for (i = 0; i < 11; ++i) {
+          snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
+          OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, pad, strlen(pad),
+                            NULL, stream_key(1), &ai.ref, &seen, &error));
+        }
+        OK(ps_checkpoint(space, &error));
+        if (operation == 3)
+          OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                            &original.revision, stream_key(2), &bi.ref,
+                            &changed, &error));
+        OK(ps_status(space, &stats, &error));
+        m.operations = 0;
+        m.fail_at = kind == 0 ? phase : 0;
+        m.tear = m.persist_torn = 1;
+        allocation_call = 0;
+        allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+        if (operation == 0)
+          rc = ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "next", 4, NULL,
+                              stream_key(2), &bi.ref, &changed, &error);
+        else if (operation == 1)
+          rc = ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                              &original.revision, stream_key(2), &bi.ref,
+                              &changed, &error);
+        else if (operation == 2)
+          rc = ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                                 &original.revision, &error);
+        else
+          rc = ps_checkpoint(space, &error);
+        allocation_fail = 0;
+        m.fail_at = 0;
+        if (!phase)
+          count = kind == 0 ? m.operations : allocation_call;
+        if (rc != LC_OK) {
+          CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+          lc_error_cleanup(&error);
+        }
+        if (kind == 0 && phase == count && operation != 3) {
+          int fd = open(path, O_RDONLY);
+          bytes = operation == 2 ? 64 : sizeof(event);
+          CHECK(fd >= 0 && pread(fd, event, bytes,
+                                 PS_JOURNAL_OFFSET + stats.journal_bytes) ==
+                               (ssize_t)bytes);
+          CHECK(close(fd) == 0);
+          memcpy(m.stable + PS_JOURNAL_OFFSET + stats.journal_bytes, event,
+                 bytes);
+        }
+        OK(ps_stream_close(a, &error));
+        OK(ps_stream_close(b, &error));
+        OK(ps_close(space, &error));
+        crash(&m);
+        space = reopen(&io);
+        for (i = 0; i < 11; ++i) {
+          snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
+          catalog_expect(space, 1, PS_CATALOG_COLLECTION, pad, strlen(pad), 1);
+        }
+        OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION,
+                          operation == 0 ? "next" : "slot", 4, &view, &error));
+        if (view) {
+          OK(ps_catalog_view_info(view, &seen, &error));
+          CHECK(seen.stream.key == 1 || seen.stream.key == 2);
+          if (operation == 0 || operation == 3 ||
+              (operation == 1 && rc == LC_OK))
+            CHECK(seen.stream.key == 2);
+          if (operation == 2)
+            CHECK(rc != LC_OK);
+          ps_catalog_view_close(view);
+          view = NULL;
+        } else
+          CHECK(operation == 2 || (operation == 0 && rc != LC_OK));
+        if (operation == 0)
+          catalog_expect(space, 1, PS_CATALOG_COLLECTION, "slot", 4, 1);
+        a = stream_open(space, 1, 0, &ai.ref, NULL);
+        b = stream_open(space, 2, 0, &bi.ref, NULL);
+        stream_expect(a, 0, "old", 3, 1);
+        stream_expect(b, 0, "new", 3, 2);
+        BAD(ps_stream_retire(a, &error));
+        OK(ps_checkpoint(space, &error));
+        OK(ps_stream_close(a, &error));
+        OK(ps_stream_close(b, &error));
+        OK(ps_close(space, &error));
+        space = reopen(&io);
+        catalog_expect(space, 1, PS_CATALOG_COLLECTION, "pad-0", 5, 1);
+        OK(ps_close(space, &error));
+      }
+      CHECK(count >= 1);
+    }
+  free(m.stable);
+  clean();
+  puts("catalog: every create/replace/delete/checkpoint I/O and heap failure, "
+       "growing index, torn records and durable target references");
+}
+typedef struct catalog_actor {
+  ps_space *space;
+  commit_gate *gate;
+  ps_ref expected, target;
+  ps_catalog_info result;
+  const char *name;
+  uint64_t stream;
+  int create, remove, rc;
+} catalog_actor;
+static void *catalog_worker(void *context) {
+  catalog_actor *a = context;
+  lc_error e;
+  lc_error_init(&e);
+  a->rc =
+      a->remove
+          ? ps_catalog_remove(a->space, 1, PS_CATALOG_COLLECTION, a->name,
+                              strlen(a->name), &a->expected, &e)
+          : ps_catalog_put(a->space, 1, PS_CATALOG_COLLECTION, a->name,
+                           strlen(a->name), a->create ? NULL : &a->expected,
+                           stream_key(a->stream), &a->target, &a->result, &e);
+  lc_error_cleanup(&e);
+  pthread_mutex_lock(&a->gate->mutex);
+  ++a->gate->finished;
+  pthread_cond_broadcast(&a->gate->cond);
+  pthread_mutex_unlock(&a->gate->mutex);
+  return NULL;
+}
+static void catalog_concurrency(int operation) {
+  commit_gate gate = {0};
+  ps_io io = {&gate, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_space *space;
+  ps_stream *streams[3];
+  ps_stream_info targets[3];
+  ps_catalog_info initial, result;
+  ps_catalog_view *held = NULL, *view = NULL;
+  ps_stats before;
+  catalog_actor actors[2] = {{0}};
+  pthread_t threads[2];
+  size_t i, syncs;
+  clean();
+  CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+  space = create(PS_MIB, 0, &io);
+  for (i = 0; i < 3; ++i) {
+    streams[i] = stream_open(space, i + 1, 1, NULL, NULL);
+    OK(ps_stream_status(streams[i], &targets[i], &error));
+  }
+  if (operation != 0) {
+    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                      stream_key(1), &targets[0].ref, &initial, &error));
+    OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &held,
+                      &error));
+  }
+  OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &before, &error));
+  actors[0].space = actors[1].space = space;
+  actors[0].gate = actors[1].gate = &gate;
+  actors[0].name = "slot";
+  actors[0].stream = 2;
+  actors[0].target = targets[1].ref;
+  actors[0].create = operation == 0;
+  actors[0].remove = operation == 2;
+  if (operation)
+    actors[0].expected = initial.revision;
+  actors[1].name = "other";
+  actors[1].stream = 3;
+  actors[1].target = targets[2].ref;
+  actors[1].create = 1;
+  syncs = gate.syncs;
+  gate.enabled = gate.hold_second = 1;
+  CHECK(pthread_create(&threads[0], NULL, catalog_worker, &actors[0]) == 0);
+  await_gate(&gate, 0);
+  CHECK(pthread_create(&threads[1], NULL, catalog_worker, &actors[1]) == 0);
+  await_stream_requests(space, before.sync_requests + 2);
+  OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &view, &error));
+  if (operation) {
+    CHECK(view != NULL);
+    OK(ps_catalog_view_info(view, &result, &error));
+    CHECK(result.stream.key == 1);
+    ps_catalog_view_close(view);
+    view = NULL;
+    BAD(ps_stream_retire(streams[0], &error));
+  } else
+    CHECK(view == NULL);
+  BAD(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                     operation ? &initial.revision : NULL, stream_key(3),
+                     &targets[2].ref, &result, &error));
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  await_gate(&gate, 3);
+  await_stream_finished(&gate, 1);
+  OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &view, &error));
+  if (operation == 2)
+    CHECK(!view);
+  else {
+    CHECK(view != NULL);
+    OK(ps_catalog_view_info(view, &result, &error));
+    CHECK(result.stream.key == 2);
+    ps_catalog_view_close(view);
+    view = NULL;
+  }
+  OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "other", 5, &view,
+                    &error));
+  CHECK(!view);
+  if (held) {
+    OK(ps_catalog_view_info(held, &result, &error));
+    CHECK(result.stream.key == 1);
+    BAD(ps_stream_retire(streams[0], &error));
+    ps_catalog_view_close(held);
+  }
+  pthread_mutex_lock(&gate.mutex);
+  gate.second_released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  CHECK(pthread_join(threads[0], NULL) == 0 &&
+        pthread_join(threads[1], NULL) == 0);
+  CHECK(actors[0].rc == LC_OK && actors[1].rc == LC_OK &&
+        gate.syncs == syncs + 2);
+  catalog_expect(space, 1, PS_CATALOG_COLLECTION, "other", 5, 3);
+  if (operation)
+    OK(ps_stream_retire(streams[0], &error));
+  for (i = 0; i < 3; ++i)
+    OK(ps_stream_close(streams[i], &error));
+  OK(ps_close(space, &error));
+  CHECK(pthread_cond_destroy(&gate.cond) == 0 &&
+        pthread_mutex_destroy(&gate.mutex) == 0);
+  clean();
+  puts("catalog: NoSync structural barriers, exact durable-prefix "
+       "create/replace/delete, independent names, one CAS winner and pinned "
+       "targets");
+}
+
+typedef struct catalog_visit_context {
+  ps_space *space;
+  ps_stream *stream;
+  ps_catalog_info rescued;
+  size_t seen;
+  uint64_t candidate;
+  int mode;
+} catalog_visit_context;
+static int catalog_visit_test(void *context, const void *name, size_t length,
+                              const ps_catalog_info *info, lc_error *e) {
+  catalog_visit_context *v = context;
+  ++v->seen;
+  if (v->mode == 1)
+    return lc_error_set(e, LC_ERR_INVALID, 0,
+                        "injected catalog visitor failure", NULL, NULL, "test");
+  CHECK(length == 1 && info->stream.key == 1);
+  OK(ps_catalog_remove(v->space, 1, PS_CATALOG_COLLECTION, name, length,
+                       &info->revision, &error));
+  OK(ps_checkpoint(v->space, &error));
+  BAD(ps_stream_retire(v->stream, &error));
+  return LC_OK;
+}
+static int catalog_orphan_test(void *context, ps_key key, const ps_ref *ref,
+                               lc_error *e) {
+  catalog_visit_context *v = context;
+  ps_owned_head *head;
+  ps_owned_status status;
+  ++v->seen;
+  CHECK(key.key == (v->candidate ? v->candidate : 2));
+  if (v->mode == 3)
+    return LC_OK;
+  if (v->mode == 1)
+    return lc_error_set(e, LC_ERR_INVALID, 0, "injected orphan visitor failure",
+                        NULL, NULL, "test");
+  if (v->mode == 2)
+    OK(ps_catalog_put(v->space, 1, PS_CATALOG_NAMESPACE, "rescued", 7, NULL,
+                      key, ref, &v->rescued, &error));
+  OK(ps_owned_open(v->space, key, 0, ref, &head, &status, &error));
+  if (v->mode == 2)
+    BAD(ps_owned_retire(head, &error));
+  else {
+    OK(ps_owned_retire(head, &error));
+    OK(ps_checkpoint(v->space, &error));
+  }
+  ps_owned_close(head);
+  return LC_OK;
+}
+static void catalog_visitors(void) {
+  ps_space *space;
+  ps_stream *a, *b, *c;
+  ps_stream_info ai;
+  ps_catalog_info info;
+  ps_catalog_view *view = NULL;
+  ps_stats stats;
+  catalog_visit_context context = {0};
+  size_t i;
+  uint64_t offset;
+  unsigned char name;
+  clean();
+  space = create(3 * PS_MIB, 0, NULL);
+  a = stream_open(space, 1, 1, NULL, NULL);
+  b = stream_open(space, 2, 1, NULL, NULL);
+  c = stream_open(space, 3, 1, NULL, NULL);
+  OK(canonical_append(b, "orphan", 6, 1, 1, &offset, &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_stream_status(a, &ai, &error));
+  for (i = 0; i < 3; ++i) {
+    name = (unsigned char)i;
+    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, &name, 1, NULL,
+                      stream_key(1), &ai.ref, &info, &error));
+  }
+  allocation_call = 0;
+  allocation_fail = 1;
+  CHECK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, &name, 1, &view,
+                       &error) == LC_ERR_NOMEM &&
+        !view);
+  allocation_fail = 0;
+  lc_error_cleanup(&error);
+  context.space = space;
+  context.stream = a;
+  allocation_call = 0;
+  allocation_fail = 1;
+  CHECK(ps_catalog_visit(space, 1, PS_CATALOG_COLLECTION, catalog_visit_test,
+                         &context, &error) == LC_ERR_NOMEM);
+  allocation_fail = 0;
+  lc_error_cleanup(&error);
+  context.mode = 1;
+  BAD(ps_catalog_visit(space, 1, PS_CATALOG_COLLECTION, catalog_visit_test,
+                       &context, &error));
+  context.mode = 0;
+  context.seen = 0;
+  OK(ps_catalog_visit(space, 1, PS_CATALOG_COLLECTION, catalog_visit_test,
+                      &context, &error));
+  CHECK(context.seen == 3);
+  OK(ps_stream_retire(a, &error));
+  OK(ps_stream_close(a, &error));
+  context.seen = 0;
+  context.mode = 1;
+  allocation_call = 0;
+  allocation_fail = 1;
+  CHECK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context,
+                                 &error) == LC_ERR_NOMEM);
+  allocation_fail = 0;
+  lc_error_cleanup(&error);
+  BAD(ps_catalog_visit_orphans(space, catalog_orphan_test, &context, &error));
+  context.seen = 0;
+  context.mode = 2;
+  OK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context, &error));
+  CHECK(context.seen == 1);
+  catalog_expect(space, 1, PS_CATALOG_NAMESPACE, "rescued", 7, 2);
+  OK(ps_catalog_remove(space, 1, PS_CATALOG_NAMESPACE, "rescued", 7,
+                       &context.rescued.revision, &error));
+  context.seen = 0;
+  context.mode = 0;
+  OK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context, &error));
+  CHECK(context.seen == 1);
+  OK(ps_status(space, &stats, &error));
+  CHECK(!stats.allocated_bytes);
+  OK(ps_stream_close(c, &error));
+  OK(ps_close(space, &error));
+  clean();
+  puts("catalog: snapshot callbacks outside locks, pinned mutations, "
+       "callback/allocation failure cleanup, orphan candidates and publication "
+       "races");
+}
+static void catalog_reopen_faults(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_options options = {0};
+  ps_space *space;
+  ps_stream *a, *b, *c;
+  ps_stream_info ai, bi;
+  ps_catalog_info info, expected;
+  catalog_visit_context context = {0};
+  unsigned char *saved = malloc((size_t)(3 * PS_MIB));
+  unsigned char *large = malloc(PS_CHUNK + 17);
+  char name[32];
+  size_t kind, phase, count, i;
+  uint64_t offset, reads;
+  int rc;
+  CHECK(saved && large);
+  memset(large, 0x6b, PS_CHUNK + 17);
+  clean();
+  space = create(3 * PS_MIB, 1, &io);
+  a = stream_open(space, 1, 1, NULL, NULL);
+  b = stream_open(space, 2, 1, NULL, NULL);
+  c = stream_open(space, 3, 1, NULL, NULL);
+  OK(canonical_append(c, "staged", 6, 1, 3, &offset, &error));
+  OK(ps_stream_close(c, &error));
+  OK(ps_stream_status(a, &ai, &error));
+  OK(ps_stream_status(b, &bi, &error));
+  for (i = 0; i < 24; ++i) {
+    snprintf(name, sizeof(name), "name-%lu", (unsigned long)i);
+    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name, strlen(name), NULL,
+                      stream_key(1), &ai.ref, &info, &error));
+  }
+  OK(ps_catalog_put(space, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, NULL,
+                    stream_key(2), &bi.ref, &info, &error));
+  OK(ps_checkpoint(space, &error));
+  info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, "name-1", 6, 1);
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "name-1", 6,
+                    &info.revision, stream_key(2), &bi.ref, &expected, &error));
+  info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, "name-2", 6, 1);
+  OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "name-2", 6,
+                       &info.revision, &error));
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "name-2", 6, NULL,
+                    stream_key(2), &bi.ref, &expected, &error));
+  OK(ps_stream_close(a, &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_close(space, &error));
+  memcpy(saved, m.stable, (size_t)(3 * PS_MIB));
+  options.io = &io;
+  options.durable_sync = 1;
+  for (kind = 0; kind < 3; ++kind) {
+    count = 0;
+    for (phase = 0; phase <= count; ++phase) {
+      memcpy(m.stable, saved, (size_t)(3 * PS_MIB));
+      crash(&m);
+      m.operations = 0;
+      m.fail_at = kind == 0 ? phase : 0;
+      m.reads = 0;
+      m.fail_read = kind == 2 ? phase : 0;
+      m.tear = m.persist_torn = 1;
+      allocation_call = 0;
+      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+      rc = ps_open(path, 0, &options, &space, &error);
+      allocation_fail = 0;
+      m.fail_at = m.fail_read = 0;
+      if (!phase)
+        count = kind == 0   ? m.operations
+                : kind == 1 ? allocation_call
+                            : m.reads;
+      if (rc == LC_OK)
+        OK(ps_close(space, &error));
+      else {
+        CHECK(space == NULL && (kind != 1 || rc == LC_ERR_NOMEM));
+        lc_error_cleanup(&error);
+      }
+      crash(&m);
+      space = reopen(&io);
+      context.space = space;
+      context.mode = 3;
+      context.candidate = 3;
+      context.seen = 0;
+      reads = m.read_bytes;
+      OK(ps_catalog_visit_orphans(space, catalog_orphan_test, &context,
+                                  &error));
+      CHECK(context.seen == 1 && m.read_bytes == reads);
+      for (i = 0; i < 24; ++i) {
+        snprintf(name, sizeof(name), "name-%lu", (unsigned long)i);
+        info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, name,
+                              strlen(name), i == 1 || i == 2 ? 2 : 1);
+        if (i == 2)
+          CHECK(info.id == expected.id &&
+                info.revision.incarnation == expected.revision.incarnation);
+      }
+      catalog_expect(space, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, 2);
+      OK(ps_close(space, &error));
+    }
+    CHECK(count > (kind == 1 ? 10 : 1));
+    printf("catalog recovery fault sites: kind=%lu count=%lu\n",
+           (unsigned long)kind, (unsigned long)count);
+  }
+  free(saved);
+  free(large);
+  free(m.stable);
+  clean();
+  puts("catalog: every recovery read/write/sync and heap failure, name-index "
+       "rebuild, spanning descriptors and acknowledged revisions survive");
+}
+
+static void catalog_bounds_rollover(void) {
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info target;
+  ps_catalog_info first, next;
+  ps_catalog_view *view = NULL;
+  ps_stats stats;
+  unsigned char *name = malloc(PS_CATALOG_NAME_MAX + 1);
+  uint64_t checkpoints;
+  CHECK(name != NULL);
+  memset(name, 0x6c, PS_CATALOG_NAME_MAX + 1);
+  clean();
+  space = create(3 * PS_MIB, 0, NULL);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_status(stream, &target, &error));
+  BAD(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name,
+                     PS_CATALOG_NAME_MAX + 1, NULL, stream_key(1), &target.ref,
+                     &first, &error));
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name, PS_CATALOG_NAME_MAX,
+                    NULL, stream_key(1), &target.ref, &first, &error));
+  OK(ps_status(space, &stats, &error));
+  CHECK(stats.journal_bytes == PS_JOURNAL);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  space =
+      reopen(NULL); /* Full accepted journal checkpoints while granting IDs. */
+  stream = stream_open(space, 1, 0, &target.ref, NULL);
+  next = catalog_expect(space, 1, PS_CATALOG_COLLECTION, name,
+                        PS_CATALOG_NAME_MAX, 1);
+  CHECK(next.id == first.id &&
+        next.revision.incarnation == first.revision.incarnation);
+  OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, name,
+                       PS_CATALOG_NAME_MAX, &next.revision, &error));
+  OK(ps_stream_retire(stream, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_close(space, &error));
+  clean();
+  space = create(3 * PS_MIB, 0, NULL);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(ps_stream_status(stream, &target, &error));
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                    stream_key(1), &target.ref, &first, &error));
+  OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                       &first.revision, &error));
+  OK(ps_status(space, &stats, &error));
+  checkpoints = stats.checkpoints;
+  while (PS_JOURNAL - stats.journal_bytes >= 88) {
+    put(space, state(1), "x", 1, 1);
+    OK(ps_status(space, &stats, &error));
+  }
+  CHECK(PS_JOURNAL - stats.journal_bytes < 108 &&
+        stats.checkpoints == checkpoints);
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                    stream_key(1), &target.ref, &next, &error));
+  CHECK(next.id != first.id);
+  OK(ps_status(space, &stats, &error));
+  CHECK(stats.checkpoints == checkpoints + 1);
+  OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &view, &error));
+  CHECK(view != NULL);
+  ps_catalog_view_close(view);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  space = reopen(NULL);
+  catalog_expect(space, 1, PS_CATALOG_COLLECTION, "slot", 4, 1);
+  expect(space, state(1), NULL, "x", 1);
+  OK(ps_close(space, &error));
+  free(name);
+  clean();
+  puts("catalog: maximum inline name, full-journal recovery, byte bounds and "
+       "rebinding after tombstone collection");
+}
+static void catalog_invalid_records(void) {
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info target;
+  ps_catalog_info first, second;
+  ps_catalog_view *view = NULL;
+  ps_stats stats;
+  unsigned char wire[108], zero[8] = {0};
+  size_t phase;
+  off_t offset;
+  int fd;
+  for (phase = 0; phase < 8; ++phase) {
+    clean();
+    space = create(PS_MIB, 0, NULL);
+    stream = stream_open(space, 1, 1, NULL, NULL);
+    OK(ps_stream_status(stream, &target, &error));
+    OK(ps_checkpoint(space, &error));
+    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+                      stream_key(1), &target.ref, &first, &error));
+    offset = PS_JOURNAL_OFFSET;
+    if (phase == 6) {
+      OK(ps_status(space, &stats, &error));
+      offset += (off_t)stats.journal_bytes;
+      OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "next", 4, NULL,
+                        stream_key(1), &target.ref, &second, &error));
+    } else if (phase == 7) {
+      OK(ps_checkpoint(space, &error));
+      OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                           &first.revision, &error));
+      OK(ps_stream_retire(stream, &error));
+    }
+    OK(ps_stream_close(stream, &error));
+    OK(ps_close(space, &error));
+    fd = open(path, O_RDWR);
+    size_t bytes = phase == 7 ? 64 : sizeof(wire);
+    CHECK(fd >= 0 && pread(fd, wire, bytes, offset) == (ssize_t)bytes);
+    if (phase == 0)
+      fixture_put(wire + 64, 99, 4);
+    else if (phase == 1)
+      fixture_put(wire + 68, 6, 4);
+    else if (phase == 2)
+      fixture_put(wire + 72, PS_STATE, 4);
+    else if (phase == 3)
+      fixture_put(wire + 96, target.ref.incarnation + 1, 8);
+    else if (phase == 4)
+      fixture_put(wire + 76, 1, 4);
+    else if (phase == 5)
+      fixture_put(wire + 32, 0, 8);
+    else if (phase == 6)
+      fixture_put(wire + 32, first.id, 8);
+    else {
+      fixture_put(wire + 16, PS_STREAM, 4);
+      fixture_put(wire + 24, 10, 8);
+      fixture_put(wire + 32, 1, 8);
+      fixture_put(wire + 40, target.ref.incarnation, 8);
+      CHECK(pwrite(fd, zero, sizeof(zero), offset + 64) ==
+            (ssize_t)sizeof(zero));
+    }
+    fixture_entry_crc(wire);
+    CHECK(pwrite(fd, wire, bytes, offset) == (ssize_t)bytes);
+    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    if (phase == 3 || phase >= 5) {
+      CHECK(ps_open(path, 0, NULL, &space, &error) == LC_ERR_PROTOCOL &&
+            space == NULL);
+      lc_error_cleanup(&error);
+    } else {
+      space = reopen(NULL);
+      OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &view,
+                        &error));
+      CHECK(view == NULL);
+      OK(ps_close(space, &error));
+    }
+  }
+  clean();
+  puts("catalog: malformed checksummed type/length/reserved fields, stale "
+       "targets, name IDs and referenced-head retirement rejected");
+}
+
+typedef struct catalog_snapshot_actor {
+  ps_space *space;
+  size_t seen;
+  int orphans, rc;
+} catalog_snapshot_actor;
+static int snapshot_name_counter(void *context, const void *name, size_t length,
+                                 const ps_catalog_info *info, lc_error *e) {
+  catalog_snapshot_actor *a = context;
+  (void)e;
+  if (length != 4 || memcmp(name, "base", 4) || info->stream.key != 1)
+    return LC_ERR_PROTOCOL;
+  ++a->seen;
+  return LC_OK;
+}
+static int snapshot_orphan_counter(void *context, ps_key key, const ps_ref *ref,
+                                   lc_error *e) {
+  catalog_snapshot_actor *a = context;
+  (void)ref;
+  (void)e;
+  if (key.key != 1)
+    return LC_ERR_PROTOCOL;
+  ++a->seen;
+  return LC_OK;
+}
+static void *catalog_snapshot_worker(void *context) {
+  catalog_snapshot_actor *a = context;
+  lc_error e;
+  lc_error_init(&e);
+  a->rc = a->orphans ? ps_catalog_visit_orphans(a->space,
+                                                snapshot_orphan_counter, a, &e)
+                     : ps_catalog_visit(a->space, 1, PS_CATALOG_COLLECTION,
+                                        snapshot_name_counter, a, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void catalog_snapshot_prefix(int orphans) {
+  commit_gate gate = {0};
+  allocation_pause pause = {0};
+  ps_io io = {&gate, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_space *space;
+  ps_stream *a, *b;
+  ps_stream_info ai, bi;
+  ps_catalog_info binding;
+  catalog_actor publication = {0};
+  catalog_snapshot_actor snapshot = {0};
+  pthread_t threads[2];
+  struct timespec deadline;
+  int rc = 0, entered;
+  clean();
+  CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0 &&
+        pthread_cond_init(&gate.cond, NULL) == 0);
+  CHECK(pthread_mutex_init(&pause.mutex, NULL) == 0 &&
+        pthread_cond_init(&pause.cond, NULL) == 0);
+  space = create(PS_MIB, 0, &io);
+  a = stream_open(space, 1, 1, NULL, NULL);
+  b = stream_open(space, 2, 1, NULL, NULL);
+  OK(ps_stream_status(a, &ai, &error));
+  OK(ps_stream_status(b, &bi, &error));
+  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, orphans ? "slot" : "base",
+                    4, NULL, stream_key(orphans ? 2 : 1),
+                    orphans ? &bi.ref : &ai.ref, &binding, &error));
+  OK(ps_stream_close(a, &error));
+  OK(ps_stream_close(b, &error));
+  publication.space = space;
+  publication.gate = &gate;
+  publication.name = "slot";
+  publication.create = !orphans;
+  publication.remove = orphans;
+  publication.expected = binding.revision;
+  publication.target = bi.ref;
+  publication.stream = 2;
+  gate.enabled = 1;
+  CHECK(pthread_create(&threads[0], NULL, catalog_worker, &publication) == 0);
+  await_gate(&gate, 0);
+  snapshot.space = space;
+  snapshot.orphans = orphans;
+  paused_allocation = &pause;
+  CHECK(pthread_create(&threads[1], NULL, catalog_snapshot_worker, &snapshot) ==
+        0);
+  CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&pause.mutex);
+  while (!pause.entered && !rc)
+    rc = pthread_cond_timedwait(&pause.cond, &pause.mutex, &deadline);
+  entered = pause.entered;
+  pthread_mutex_unlock(&pause.mutex);
+  CHECK(entered && !rc);
+  /* The snapshot owns the allocator mutex here. Commit completion must still
+   * advance its watermark while vector allocation is held. */
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  await_stream_finished(&gate, 1);
+  CHECK(pthread_join(threads[0], NULL) == 0 && publication.rc == LC_OK);
+  pthread_mutex_lock(&pause.mutex);
+  pause.released = 1;
+  pthread_cond_broadcast(&pause.cond);
+  pthread_mutex_unlock(&pause.mutex);
+  CHECK(pthread_join(threads[1], NULL) == 0);
+  paused_allocation = NULL;
+  CHECK(snapshot.rc == LC_OK && snapshot.seen == 1);
+  OK(ps_close(space, &error));
+  CHECK(pthread_cond_destroy(&pause.cond) == 0 &&
+        pthread_mutex_destroy(&pause.mutex) == 0);
+  CHECK(pthread_cond_destroy(&gate.cond) == 0 &&
+        pthread_mutex_destroy(&gate.mutex) == 0);
+  clean();
+  puts("catalog: fixed snapshot watermark across commit completion during "
+       "vector allocation, no count/capture race");
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -3583,6 +4501,20 @@ int main(int argc, char **argv) {
       packing_faults();
       packing_concurrency();
       packing_invalid_ownership();
+    } else if (strcmp(argv[2], "catalog") == 0) {
+      catalog_basic(0);
+      catalog_basic(1);
+      catalog_faults();
+      catalog_visitors();
+      catalog_reopen_faults();
+      catalog_bounds_rollover();
+      catalog_invalid_records();
+      catalog_concurrency(0);
+      catalog_concurrency(1);
+      catalog_concurrency(2);
+      catalog_snapshot_prefix(0);
+      catalog_snapshot_prefix(1);
+      catalog_scale();
     } else if (strcmp(argv[2], "lifecycle") == 0) {
       stream_lifecycle(0);
       stream_lifecycle(1);

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "catalog.h"
 #include "lc_collection_json.h"
 #include "lc_pouch.h"
 #include "lc_pouch_record.h"
@@ -240,6 +241,47 @@ static int stream_recover(ps_stream *stream, uint64_t checkpoint,
   *accepted = cursor;
   return rc;
 }
+static int stream_named_open(worker *w, int create, lc_error *e) {
+  comparison *c = w->run;
+  ps_catalog_view *view = NULL;
+  ps_catalog_info binding;
+  ps_stream_info info;
+  ps_key key = stream_storage_key(w->ordinal);
+  unsigned int kind =
+      c->collection ? PS_CATALOG_COLLECTION : PS_CATALOG_NAMESPACE;
+  char name[64];
+  int rc;
+  snprintf(name, sizeof(name), c->collection ? "collection-%lu" : "owner-%lu",
+           (unsigned long)w->ordinal);
+  if (create) {
+    rc = ps_stream_open(c->space, key, 1, NULL, stream_recover, w, &w->stream,
+                        e);
+    if (rc == LC_OK)
+      rc = ps_stream_status(w->stream, &info, e);
+    if (rc == LC_OK)
+      rc = ps_catalog_put(c->space, 0, kind, name, strlen(name), NULL, key,
+                          &info.ref, &binding, e);
+  } else {
+    rc = ps_catalog_get(c->space, 0, kind, name, strlen(name), &view, e);
+    if (rc == LC_OK && !view)
+      rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                        "comparison catalog binding missing", NULL, NULL,
+                        "compare");
+    if (rc == LC_OK)
+      rc = ps_catalog_view_info(view, &binding, e);
+    if (rc == LC_OK &&
+        (binding.stream.kind != key.kind || binding.stream.owner != key.owner ||
+         binding.stream.key != key.key))
+      rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                        "comparison catalog target mismatch", NULL, NULL,
+                        "compare");
+    if (rc == LC_OK)
+      rc = ps_stream_open(c->space, binding.stream, 0, &binding.target,
+                          stream_recover, w, &w->stream, e);
+    ps_catalog_view_close(view);
+  }
+  return rc;
+}
 typedef struct stream_output {
   ps_stream_writer *writer;
   uint64_t bytes;
@@ -269,8 +311,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   int rc = LC_OK;
   names(w->ordinal, id, ns, name);
   if (!w->stream)
-    rc = ps_stream_open(c->space, stream_storage_key(w->ordinal), 1, NULL,
-                        stream_recover, w, &w->stream, e);
+    rc = stream_named_open(w, 1, e);
   if (rc == LC_OK)
     rc = ps_stream_begin(w->stream, &destination, e);
   memset(&record, 0, sizeof(record));
@@ -430,10 +471,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
         c->offsets[i] = UINT64_MAX;
       for (i = 0; i < c->writers; ++i)
         if (c->existing_records || c->collection)
-          check(ps_stream_open(c->space, stream_storage_key(i), create, NULL,
-                               stream_recover, &c->workers[i],
-                               &c->workers[i].stream, e),
-                e);
+          check(stream_named_open(&c->workers[i], create, e), e);
     }
     return;
   }
@@ -834,7 +872,7 @@ int main(int argc, char **argv) {
             "exactly one container and no sidecars");
     check(ps_status(c.space, &stats, &e), &e);
     if (c.streams) {
-      require(stats.entries == (uint64_t)stream_grants + c.writers,
+      require(stats.entries == (uint64_t)stream_grants + 2 * c.writers,
               "recovered physical stream/grant count");
       for (i = 0; i < c.writers; ++i)
         require(c.workers[i].records ==
