@@ -2,30 +2,13 @@
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
+#include "root_internal.h"
 #include <pthread.h>
 #include <string.h>
 #include <zlib.h>
 
 #define ROOT_CONFIG_BYTES 128U
 #define ROOT_KEY_ID_BYTES 80U
-struct ps_namespace {
-  ps_root *root;
-  char *name;
-  uint64_t hash;
-  size_t pins, users;
-  int loading, ready;
-  ps_namespace_info identity;
-  struct ps_namespace *next, *hash_next;
-  struct ps_namespace **link;
-};
-struct ps_root {
-  ps_space *space;
-  lc_pouch_crypto *crypto;
-  pthread_mutex_t mutex;
-  pthread_cond_t changed;
-  ps_namespace *namespaces, **buckets;
-  size_t capacity, count, calls, pins;
-};
 static const unsigned char config_magic[8] = {'L', 'C', 'P', 'S',
                                               'R', 'O', 'O', 'T'};
 static int failure(lc_error *error, int code, const char *reason,
@@ -375,6 +358,12 @@ void ps_namespace_release(ps_namespace *ns) {
   --ns->root->pins;
   pthread_mutex_unlock(&ns->root->mutex);
 }
+void ps_namespace_retain(ps_namespace *ns) {
+  pthread_mutex_lock(&ns->root->mutex);
+  ++ns->pins;
+  ++ns->root->pins;
+  pthread_mutex_unlock(&ns->root->mutex);
+}
 typedef struct visit_context {
   ps_root *root;
   ps_namespace_visit_fn visit;
@@ -441,8 +430,12 @@ int ps_root_close(ps_root *root, lc_error *error) {
     return failure(error, LC_ERR_INVALID, "pouch_root_busy",
                    "release pouch namespace owners before root close");
   }
-  rc = ps_close(root->space, error);
   pthread_mutex_unlock(&root->mutex);
+  for (ns = root->namespaces; ns; ns = ns->next) {
+    ps_namespace_data_destroy(ns->data);
+    __atomic_store_n(&ns->data, NULL, __ATOMIC_RELEASE);
+  }
+  rc = ps_close(root->space, error);
   if (rc != LC_OK)
     return rc;
   for (ns = root->namespaces; ns; ns = next) {

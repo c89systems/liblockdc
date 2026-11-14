@@ -18,5 +18,6 @@ void ps_record_abort(ps_record_writer *);
 /* Input borrows one already admitted reader, preserving its captured window.
  * Recovery input is usable only inside the stream's canonical recovery call. */
 lc_pouch_record_io ps_record_input(ps_stream_reader *);
+lc_pouch_record_io ps_record_window_input(ps_stream_window *);
 lc_pouch_record_io ps_record_recovery_input(ps_stream *);
 #endif

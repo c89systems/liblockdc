@@ -1,0 +1,816 @@
+#define _GNU_SOURCE
+#include "../../tests/support/lc_test_tmp.h"
+#include "lc_api_internal.h"
+#include "namespace.h"
+#include "stream.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <zlib.h>
+
+static size_t checks, allocation, fail_allocation;
+static size_t largest;
+static int measuring;
+static void track(size_t n) {
+  if (measuring && n > largest)
+    largest = n;
+}
+#define REQUIRE(x)                                                             \
+  do {                                                                         \
+    __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
+    if (!(x)) {                                                                \
+      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);                  \
+      abort();                                                                 \
+    }                                                                          \
+  } while (0)
+static int fails(void) {
+  return fail_allocation && ++allocation == fail_allocation;
+}
+void *__real_lc_alloc_with_allocator(const lc_allocator *, size_t);
+void *__real_lc_calloc_with_allocator(const lc_allocator *, size_t, size_t);
+void *__real_lc_realloc_with_allocator(const lc_allocator *, void *, size_t);
+char *__real_lc_strdup_with_allocator(const lc_allocator *, const char *);
+void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
+  track(n);
+  return fails() ? NULL : __real_lc_alloc_with_allocator(a, n);
+}
+void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
+                                      size_t b) {
+  track(n * b);
+  return fails() ? NULL : __real_lc_calloc_with_allocator(a, n, b);
+}
+void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
+                                       size_t n) {
+  track(n);
+  return fails() ? NULL : __real_lc_realloc_with_allocator(a, p, n);
+}
+char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *p) {
+  track(p ? strlen(p) + 1 : 0);
+  return fails() ? NULL : __real_lc_strdup_with_allocator(a, p);
+}
+static void ok(int rc, lc_error *e) {
+  if (rc != LC_OK)
+    fprintf(stderr, "%d: %s\n", rc, e->message ? e->message : "?");
+  REQUIRE(rc == LC_OK);
+}
+static void clear(lc_error *e) {
+  lc_error_cleanup(e);
+  lc_error_init(e);
+}
+static lc_allocator allocator;
+static unsigned char body[65537];
+typedef struct gate {
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  int entered, released;
+} gate;
+typedef struct input {
+  lc_source pub;
+  size_t at, bytes;
+  gate *gate;
+} input;
+static size_t pull(lc_source *pub, void *p, size_t n, lc_error *e) {
+  input *s = pub->impl;
+  (void)e;
+  if (s->gate && !s->at) {
+    pthread_mutex_lock(&s->gate->mutex);
+    s->gate->entered = 1;
+    pthread_cond_broadcast(&s->gate->changed);
+    while (!s->gate->released)
+      pthread_cond_wait(&s->gate->changed, &s->gate->mutex);
+    pthread_mutex_unlock(&s->gate->mutex);
+  }
+  if (n > s->bytes - s->at)
+    n = s->bytes - s->at;
+  memcpy(p, body + s->at, n);
+  s->at += n;
+  return n;
+}
+static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
+               size_t bytes, gate *g, uint64_t *segment,
+               lc_pouch_state_entry *result, lc_error *e) {
+  lc_pouch_state_entry request = {0};
+  ps_namespace_append *append = NULL;
+  input source = {0};
+  source.pub.impl = &source;
+  source.pub.read = pull;
+  source.bytes = bytes;
+  source.gate = g;
+  request.key = "key";
+  request.content_type = "application/test";
+  request.payload_context = "namespace-test";
+  request.version = version;
+  request.index_seq = version;
+  request.record_type = 1;
+  int rc = ps_namespace_append_begin(ns, target, &append, e);
+  if (rc == LC_OK) {
+    if (segment)
+      *segment = ps_namespace_append_segment(append);
+    rc = lc_pouch_state_record_append(
+        &allocator, ps_root_crypto(root), ps_namespace_append_output(append),
+        ps_namespace_append_leaf(append), &request, &source.pub, 0, result, e);
+  }
+  if (rc == LC_OK)
+    rc = ps_namespace_append_commit(append, e);
+  ps_namespace_append_close(append);
+  return rc;
+}
+static int append(ps_root *root, ps_namespace *ns, size_t version,
+                  uint64_t target, size_t bytes, lc_error *e) {
+  lc_pouch_state_entry result = {0};
+  int rc = put(root, ns, version, target, bytes, NULL, NULL, &result, e);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
+  return rc;
+}
+typedef struct records {
+  size_t count;
+  uint64_t last_segment, version;
+} records;
+static int visit(void *p, uint64_t segment, const lc_pouch_state_entry *r,
+                 lc_error *e) {
+  records *v = p;
+  (void)e;
+  REQUIRE(segment >= v->last_segment && r->version > v->version);
+  REQUIRE(!strcmp(r->key, "key") && r->found && r->payload_span.present);
+  REQUIRE(r->index_seq == r->version && r->bytes <= sizeof(body));
+  v->last_segment = segment;
+  v->version = r->version;
+  ++v->count;
+  return LC_OK;
+}
+static int capture(ps_namespace *ns, records *records, lc_error *e) {
+  ps_namespace_view *view = NULL;
+  int rc = ps_namespace_view_open(ns, &view, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_view_visit(view, 1, visit, records, e);
+  ps_namespace_view_close(view);
+  return rc;
+}
+static int cancel_visit(void *p, uint64_t segment,
+                        const lc_pouch_state_entry *r, lc_error *e) {
+  (void)segment;
+  (void)r;
+  ++*(size_t *)p;
+  return lc_error_set(e, LC_ERR_INVALID, 0, "observer stopped", NULL, NULL,
+                      "test");
+}
+static void count(ps_namespace *ns, size_t expected, lc_error *e) {
+  records r = {0};
+  ok(capture(ns, &r, e), e);
+  REQUIRE(r.count == expected);
+}
+static ps_namespace *acquire(ps_root *root, const char *name, int create,
+                             lc_error *e) {
+  ps_namespace *ns = NULL;
+  ok(ps_root_namespace_acquire(root, name, create, &ns, e), e);
+  return ns;
+}
+static void lifecycle(const char *path, const char *key) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int mode = 0; mode < 4; ++mode) {
+    ps_root_options options = {0};
+    ps_root *root = NULL;
+    options.crypto.compression_enabled = mode & 1;
+    options.crypto.key_string = mode & 2 ? key : NULL;
+    options.storage.durable_sync = mode % 2;
+    ok(ps_root_open(path, 1, &options, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "a/../namespace\377", 1, &e);
+    ps_namespace_status status;
+    ps_stats physical;
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(!status.active_segment && !status.segments && !status.tail);
+    ok(ps_status(ps_root_space(root), &physical, &e), &e);
+    REQUIRE(physical.entries == 2);
+    count(ns, 0, &e);
+    lc_pouch_state_entry result = {0};
+    uint64_t segment;
+    ok(put(root, ns, 1, 0, sizeof(body), NULL, &segment, &result, &e), &e);
+    REQUIRE(segment == 1);
+    ps_namespace_window *window = NULL;
+    ok(ps_namespace_read_open(ns, segment, result.payload_span.payload_offset,
+                              result.cipher_bytes, &window, &e),
+       &e);
+    ps_namespace_view *view = NULL;
+    ok(ps_namespace_view_open(ns, &view, &e), &e);
+    ok(ps_namespace_rotate(ns, 1, &e), &e);
+    ok(ps_namespace_rotate(ns, 1, &e), &e);
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.active_segment == 2);
+    REQUIRE(ps_namespace_rotate(ns, 0, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ok(append(root, ns, 2, 1, 1, &e), &e);
+    ok(append(root, ns, 3, 1, 0, &e), &e); /* target crossed -> segment 3 */
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.active_segment == 3);
+    size_t stopped = 0;
+    REQUIRE(ps_namespace_view_visit(view, 1, cancel_visit, &stopped, &e) ==
+                LC_ERR_INVALID &&
+            stopped == 1);
+    clear(&e);
+    records old = {0};
+    ok(ps_namespace_view_visit(view, 1, visit, &old, &e), &e);
+    REQUIRE(old.count == 1);
+    count(ns, 3, &e);
+    /* A window pins the root even after the caller releases its namespace. */
+    ps_namespace_release(ns);
+    REQUIRE(ps_root_close(root, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ps_namespace_view_close(view);
+    unsigned char *stored = malloc((size_t)result.cipher_bytes);
+    REQUIRE(stored != NULL);
+    struct iovec part = {stored, (size_t)result.cipher_bytes};
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(window),
+                               result.payload_span.payload_offset, &part, 1,
+                               &e),
+       &e);
+    REQUIRE(crc32(0L, stored, (uInt)part.iov_len) ==
+            result.payload_span.payload_crc);
+    free(stored);
+    ps_namespace_read_close(window);
+    lc_pouch_state_entry_cleanup(&allocator, &result);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &options, &root, &e), &e);
+    ns = acquire(root, "a/../namespace\377", 0, &e);
+    count(ns, 3, &e);
+    ok(ps_namespace_rotate(ns, 2, &e), &e); /* persisted retry stays at 3 */
+    for (size_t i = 4; i < 90; ++i) {
+      ok(ps_namespace_rotate(ns, i - 1, &e), &e);
+      ok(append(root, ns, i, 0, i % 3, &e), &e);
+    }
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    count(ns, 89, &e);
+    largest = 0;
+    measuring = 1;
+    ps_namespace_view *metadata_view = NULL;
+    int capture_rc = ps_namespace_view_open(ns, &metadata_view, &e);
+    measuring = 0;
+    ok(capture_rc, &e);
+    REQUIRE(largest < PS_CHUNK);
+    ps_namespace_view_close(metadata_view);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &options, &root, &e), &e);
+    ns = acquire(root, "a/../namespace\377", 0, &e);
+    count(ns, 89, &e);
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.segments == 89);
+    /* A failed raw-child close leaves cached namespace storage reconstructible.
+     */
+    ps_reader *raw = NULL;
+    ps_key config = {0, 1, PS_CONTROL};
+    ok(ps_read_open(ps_root_space(root), config, NULL, &raw, &e), &e);
+    ps_namespace_release(ns);
+    REQUIRE(ps_root_close(root, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ns = acquire(root, "a/../namespace\377", 0, &e);
+    count(ns, 89, &e);
+    ps_reader_close(raw);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+typedef struct model {
+  unsigned char *live, *stable;
+  size_t calls, fail;
+  int torn;
+} model;
+static int io_fail(model *m) { return ++m->calls == m->fail; }
+static ssize_t rd(void *p, int fd, void *bytes, size_t n, off_t at) {
+  model *m = p;
+  if (io_fail(m)) {
+    errno = EIO;
+    return -1;
+  }
+  return pread(fd, bytes, n, at);
+}
+static ssize_t wr(void *p, int fd, const void *bytes, size_t n, off_t at) {
+  model *m = p;
+  REQUIRE(at >= 0 && (uint64_t)at + n <= PS_MIB);
+  if (io_fail(m)) {
+    if (m->torn && n > 1) {
+      REQUIRE(pwrite(fd, bytes, n / 2, at) == (ssize_t)(n / 2));
+      memcpy(m->live + at, bytes, n / 2);
+      memcpy(m->stable + at, bytes, n / 2);
+    }
+    errno = EIO;
+    return -1;
+  }
+  ssize_t result = pwrite(fd, bytes, n, at);
+  if (result > 0)
+    memcpy(m->live + at, bytes, (size_t)result);
+  return result;
+}
+static int sync_file(void *p, int fd) {
+  model *m = p;
+  (void)fd;
+  if (io_fail(m)) {
+    if (m->torn == 2) {
+      for (size_t at = 0; at < PS_MIB; at += 64)
+        memcpy(m->stable + at, m->live + at, 32);
+    } else if (m->torn == 3) {
+      memcpy(m->stable, m->live, PS_MIB / 2);
+    }
+    errno = EIO;
+    return -1;
+  }
+  memcpy(m->stable, m->live, PS_MIB);
+  return 0;
+}
+static int reserve(void *p, int fd, off_t at, off_t n) {
+  model *m = p;
+  if (io_fail(m)) {
+    errno = ENOSPC;
+    return -1;
+  }
+  int rc = posix_fallocate(fd, at, n);
+  if (rc) {
+    errno = rc;
+    return -1;
+  }
+  return 0;
+}
+static void crash(model *m, const char *path) {
+  int fd = open(path, O_RDWR);
+  REQUIRE(fd >= 0);
+  REQUIRE(pwrite(fd, m->stable, PS_MIB, 0) == PS_MIB);
+  REQUIRE(close(fd) == 0);
+  memcpy(m->live, m->stable, PS_MIB);
+}
+static void faults(const char *path) {
+  model m = {0};
+  m.live = malloc(PS_MIB);
+  m.stable = malloc(PS_MIB);
+  REQUIRE(m.live && m.stable);
+  ps_io io = {&m, rd, wr, sync_file, reserve, NULL};
+  ps_root_options options = {0};
+  options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
+  options.storage.io = &io;
+  lc_error e;
+  lc_error_init(&e);
+  for (int durable = 0; durable < 2; ++durable)
+    for (int kind = 0; kind < 4; ++kind)
+      for (int phase = 0; phase < 3; ++phase) {
+        size_t operations = 0;
+        for (size_t at = 0; at <= operations; ++at) {
+          memset(m.live, 0, PS_MIB);
+          memset(m.stable, 0, PS_MIB);
+          m.calls = m.fail = 0;
+          m.torn = kind >= 2 ? kind : 0;
+          ps_root *root = NULL;
+          options.storage.durable_sync = durable;
+          ok(ps_root_open(path, 1, &options, &root, &e), &e);
+          ps_namespace *ns = acquire(root, "test", 1, &e);
+          if (phase) {
+            ok(append(root, ns, 1, 0, 31, &e), &e);
+            if (phase == 2) {
+              ok(ps_namespace_rotate(ns, 1, &e), &e);
+              ok(append(root, ns, 2, 0, 17, &e), &e);
+            }
+            ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          }
+          if (phase == 2) {
+            ps_namespace_release(ns);
+            ok(ps_root_close(root, &e), &e);
+            ok(ps_root_open(path, 0, &options, &root, &e), &e);
+            ns = acquire(root, "test", 0, &e);
+          }
+          m.calls = allocation = 0;
+          if (kind == 1)
+            fail_allocation = at ? at : SIZE_MAX;
+          else
+            m.fail = at;
+          int rc;
+          records scanned = {0};
+          if (!phase)
+            rc = append(root, ns, 1, 0, 31, &e);
+          else if (phase == 1)
+            rc = ps_namespace_rotate(ns, 1, &e);
+          else
+            rc = capture(ns, &scanned, &e);
+          if (!at)
+            operations = kind == 1 ? allocation : m.calls;
+          m.fail = fail_allocation = 0;
+          REQUIRE(at ? rc != LC_OK : rc == LC_OK);
+          clear(&e);
+          int health = ps_check(ps_root_space(root), &e);
+          if (health != LC_OK) {
+            REQUIRE(health == LC_ERR_TRANSPORT);
+            clear(&e);
+            ps_namespace_status status;
+            ps_namespace_view *rejected = NULL;
+            REQUIRE(ps_namespace_status_get(ns, &status, &e) ==
+                    LC_ERR_TRANSPORT);
+            clear(&e);
+            REQUIRE(ps_namespace_view_open(ns, &rejected, &e) ==
+                        LC_ERR_TRANSPORT &&
+                    !rejected);
+            clear(&e);
+          } else if (phase == 2 && kind == 1 && rc != LC_OK) {
+            records retried = {0};
+            ok(capture(ns, &retried, &e), &e);
+            REQUIRE(retried.count == 2);
+          }
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          crash(&m, path);
+          ok(ps_root_open(path, 0, &options, &root, &e), &e);
+          ns = acquire(root, "test", 0, &e);
+          records recovered = {0};
+          ok(capture(ns, &recovered, &e), &e);
+          if (!phase) {
+            REQUIRE(recovered.count <= 1 &&
+                    (!durable || at || recovered.count == 1));
+            ok(append(root, ns, recovered.count + 1, 0, 7, &e), &e);
+            count(ns, recovered.count + 1, &e);
+          } else
+            REQUIRE(recovered.count == (size_t)phase);
+          if (phase == 1) {
+            ok(ps_namespace_rotate(ns, 1, &e), &e);
+            ps_namespace_status status;
+            ok(ps_namespace_status_get(ns, &status, &e), &e);
+            REQUIRE(status.active_segment == 2);
+            ok(append(root, ns, 2, 0, 13, &e), &e);
+            count(ns, 2, &e);
+          }
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          REQUIRE(unlink(path) == 0);
+        }
+      }
+  free(m.live);
+  free(m.stable);
+  lc_error_cleanup(&e);
+}
+static void raw_head(const char *path, ps_key key, const unsigned char *bytes,
+                     size_t length, lc_error *e) {
+  ps_space *space = NULL;
+  ps_writer *writer = NULL;
+  ok(ps_open(path, 0, NULL, &space, e), e);
+  ok(ps_begin(space, key, &writer, e), e);
+  ok(ps_write(writer, bytes, length, e), e);
+  ok(ps_publish(writer, NULL, e), e);
+  ps_writer_close(writer);
+  ok(ps_close(space, e), e);
+}
+static void invalid_namespace(const char *path, lc_error *e) {
+  ps_root *root = NULL;
+  ok(ps_root_open(path, 0, NULL, &root, e), e);
+  ps_namespace *ns = acquire(root, "test", 0, e);
+  ps_namespace_status status;
+  REQUIRE(ps_namespace_status_get(ns, &status, e) == LC_ERR_PROTOCOL);
+  clear(e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, e), e);
+}
+static void put64(unsigned char *p, uint64_t v) {
+  for (size_t i = 0; i < 8; ++i) {
+    p[i] = (unsigned char)v;
+    v >>= 8;
+  }
+}
+static void windows(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  ps_space *space = NULL;
+  ps_stream *stream = NULL;
+  ps_key key = {1, 1, PS_STREAM};
+  ps_stream_writer *writer = NULL;
+  ok(ps_open(path, 1, NULL, &space, &e), &e);
+  ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+  ok(ps_stream_begin(stream, &writer, &e), &e);
+  ok(ps_stream_write(writer, "abc", 3, &e), &e);
+  ok(ps_stream_commit(writer, &e), &e);
+  ps_stream_writer_close(writer);
+  ps_stream_window *pin = NULL, *rejected = NULL;
+  allocation = 0;
+  fail_allocation = 1;
+  int rc = ps_stream_window_open(stream, 0, 3, &pin, &e);
+  fail_allocation = 0;
+  REQUIRE(rc == LC_ERR_NOMEM && !pin);
+  clear(&e);
+  ok(ps_stream_window_open(stream, 1, 2, &pin, &e), &e);
+  REQUIRE(ps_stream_window_open(stream, 0, 4, &rejected, &e) ==
+              LC_ERR_INVALID &&
+          !rejected);
+  clear(&e);
+  REQUIRE(ps_stream_window_open(stream, UINT64_MAX, 1, &rejected, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  ok(ps_stream_begin(stream, &writer, &e), &e);
+  ok(ps_stream_write(writer, "def", 3, &e), &e);
+  ok(ps_stream_commit(writer, &e), &e);
+  ps_stream_writer_close(writer);
+  char bytes[4] = {0};
+  REQUIRE(ps_stream_window_read(pin, 0, bytes, 1, &e) == LC_ERR_INVALID);
+  clear(&e);
+  REQUIRE(ps_stream_window_read(pin, 2, bytes, 2, &e) == LC_ERR_INVALID);
+  clear(&e);
+  ok(ps_stream_window_read(pin, 3, NULL, 0, &e), &e);
+  ok(ps_stream_window_read(pin, 1, bytes, 2, &e), &e);
+  REQUIRE(!memcmp(bytes, "bc", 2));
+  ok(ps_stream_retire(stream, &e), &e);
+  REQUIRE(ps_stream_window_open(stream, 0, 1, &rejected, &e) == LC_ERR_INVALID);
+  clear(&e);
+  ok(ps_checkpoint(space, &e), &e);
+  REQUIRE(ps_stream_close(stream, &e) == LC_ERR_INVALID);
+  clear(&e);
+  ok(ps_stream_window_read(pin, 1, bytes, 2, &e), &e);
+  REQUIRE(!memcmp(bytes, "bc", 2));
+  ps_stream_window_close(pin);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_checkpoint(space, &e), &e);
+  ok(ps_close(space, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+static void validation(const char *path) {
+  windows(path);
+  lc_error e;
+  lc_error_init(&e);
+  ps_root *root = NULL;
+  ok(ps_root_open(path, 1, NULL, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "test", 1, &e);
+  ps_namespace_info identity;
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  ok(append(root, ns, 1, 0, 31, &e), &e);
+  ok(ps_checkpoint(ps_root_space(root), &e), &e);
+  ps_reader *reader = NULL;
+  ps_key key = {identity.owner, 1, PS_CONTROL};
+  unsigned char valid[128], bytes[128];
+  size_t got;
+  ok(ps_read_open(ps_root_space(root), key, NULL, &reader, &e), &e);
+  ok(ps_read(reader, valid, sizeof(valid), &got, &e), &e);
+  REQUIRE(got == sizeof(valid));
+  ps_reader_close(reader);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  for (size_t i = 0; i < sizeof(valid); ++i) {
+    memcpy(bytes, valid, sizeof(bytes));
+    bytes[i] ^= 1;
+    raw_head(path, key, bytes, sizeof(bytes), &e);
+    invalid_namespace(path, &e);
+  }
+  for (size_t field = 0; field < 5; ++field) {
+    memcpy(bytes, valid, sizeof(bytes));
+    if (field == 0)
+      put64(bytes + 8, identity.owner + 1);
+    if (field == 1)
+      put64(bytes + 16, 0);
+    if (field == 2)
+      put64(bytes + 24, 0);
+    if (field == 3)
+      put64(bytes + 32, 31);
+    if (field == 4)
+      bytes[40] = 1;
+    put64(bytes + 120, crc32(0L, bytes, 120));
+    raw_head(path, key, bytes, sizeof(bytes), &e);
+    invalid_namespace(path, &e);
+  }
+  raw_head(path, key, valid, 127, &e);
+  invalid_namespace(path, &e);
+  raw_head(path, key, valid, sizeof(valid), &e);
+  /* Missing/interpreted-as-path/stale-owner bindings never become segments. */
+  for (int bad = 0; bad < 3; ++bad) {
+    ps_space *space = NULL;
+    ps_catalog_info original, inserted;
+    ps_catalog_view *view = NULL;
+    const char *first = "seg-00000000000000000001.log";
+    const char *name = bad == 0   ? ""
+                       : bad == 1 ? "active"
+                                  : "seg-00000000000000000002.log";
+    ok(ps_open(path, 0, NULL, &space, &e), &e);
+    ok(ps_catalog_get(space, identity.owner, PS_CATALOG_SEGMENT, first,
+                      strlen(first), &view, &e),
+       &e);
+    REQUIRE(view != NULL);
+    ok(ps_catalog_view_info(view, &original, &e), &e);
+    ps_catalog_view_close(view);
+    ok(ps_catalog_put(space, identity.owner, PS_CATALOG_SEGMENT, name,
+                      strlen(name), NULL, original.stream, &original.target,
+                      &inserted, &e),
+       &e);
+    ok(ps_close(space, &e), &e);
+    invalid_namespace(path, &e);
+    ok(ps_open(path, 0, NULL, &space, &e), &e);
+    ok(ps_catalog_remove(space, identity.owner, PS_CATALOG_SEGMENT, name,
+                         strlen(name), &inserted.revision, &e),
+       &e);
+    ok(ps_close(space, &e), &e);
+  }
+  ok(ps_root_open(path, 0, NULL, &root, &e), &e);
+  ns = acquire(root, "test", 0, &e);
+  count(ns, 1, &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+typedef struct job {
+  ps_root *root;
+  ps_namespace *ns;
+  gate *gate;
+  int rc;
+} job;
+static void *produce(void *p) {
+  job *j = p;
+  lc_error e;
+  lc_error_init(&e);
+  lc_pouch_state_entry result = {0};
+  j->rc = put(j->root, j->ns, 2, 0, sizeof(body), j->gate, NULL, &result, &e);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+typedef struct reentrant {
+  ps_root *root;
+  ps_namespace *ns;
+  records records;
+} reentrant;
+static int mutate(void *p, uint64_t segment, const lc_pouch_state_entry *r,
+                  lc_error *e) {
+  reentrant *v = p;
+  int rc = visit(&v->records, segment, r, e);
+  if (rc == LC_OK && v->records.count == 1) {
+    rc = ps_namespace_rotate(v->ns, 1, e);
+    if (rc == LC_OK)
+      rc = append(v->root, v->ns, 3, 0, 3, e);
+  }
+  return rc;
+}
+typedef struct read_hold {
+  gate gate;
+  int enabled;
+} read_hold;
+static ssize_t held_read(void *p, int fd, void *bytes, size_t n, off_t at) {
+  read_hold *h = p;
+  pthread_mutex_lock(&h->gate.mutex);
+  if (h->enabled && !h->gate.entered) {
+    h->gate.entered = 1;
+    pthread_cond_broadcast(&h->gate.changed);
+    while (!h->gate.released)
+      pthread_cond_wait(&h->gate.changed, &h->gate.mutex);
+  }
+  pthread_mutex_unlock(&h->gate.mutex);
+  return pread(fd, bytes, n, at);
+}
+static ssize_t direct_write(void *p, int fd, const void *bytes, size_t n,
+                            off_t at) {
+  (void)p;
+  return pwrite(fd, bytes, n, at);
+}
+static int direct_sync(void *p, int fd) {
+  (void)p;
+  return fdatasync(fd);
+}
+static int direct_reserve(void *p, int fd, off_t at, off_t n) {
+  (void)p;
+  int rc = posix_fallocate(fd, at, n);
+  if (rc)
+    errno = rc;
+  return rc ? -1 : 0;
+}
+typedef struct load_job {
+  ps_namespace *ns;
+  int started, done, rc;
+} load_job;
+static void *load_namespace(void *p) {
+  load_job *j = p;
+  lc_error e;
+  lc_error_init(&e);
+  ps_namespace_status status;
+  __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
+  j->rc = ps_namespace_status_get(j->ns, &status, &e);
+  __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void concurrency(const char *path) {
+  ps_root *root = NULL;
+  lc_error e;
+  lc_error_init(&e);
+  ok(ps_root_open(path, 1, NULL, &root, &e), &e);
+  ps_namespace *a = acquire(root, "a", 1, &e), *b = acquire(root, "b", 1, &e);
+  ok(append(root, a, 1, 0, 31, &e), &e);
+  gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+  job j = {root, a, &g, 0};
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, produce, &j) == 0);
+  pthread_mutex_lock(&g.mutex);
+  while (!g.entered)
+    pthread_cond_wait(&g.changed, &g.mutex);
+  pthread_mutex_unlock(&g.mutex);
+  ps_namespace_append *contended = NULL;
+  REQUIRE(ps_namespace_append_begin(a, 0, &contended, &e) == LC_ERR_INVALID &&
+          !contended);
+  clear(&e);
+  REQUIRE(ps_namespace_rotate(a, 1, &e) == LC_ERR_INVALID);
+  clear(&e);
+  ps_namespace_view *captured = NULL;
+  ok(ps_namespace_view_open(a, &captured, &e), &e);
+  count(a, 1, &e);
+  ok(append(root, b, 1, 0, 31, &e), &e);
+  count(b, 1, &e);
+  pthread_mutex_lock(&g.mutex);
+  g.released = 1;
+  pthread_cond_broadcast(&g.changed);
+  pthread_mutex_unlock(&g.mutex);
+  REQUIRE(pthread_join(thread, NULL) == 0 && j.rc == LC_OK);
+  reentrant v = {root, a, {0}};
+  ok(ps_namespace_view_visit(captured, 1, mutate, &v, &e), &e);
+  REQUIRE(v.records.count == 1);
+  ps_namespace_view_close(captured);
+  count(a, 3, &e);
+  pthread_cond_destroy(&g.changed);
+  pthread_mutex_destroy(&g.mutex);
+  ps_namespace_release(a);
+  ps_namespace_release(b);
+  ok(ps_root_close(root, &e), &e);
+  read_hold held = {{PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0},
+                    0};
+  ps_io io = {&held,       held_read,      direct_write,
+              direct_sync, direct_reserve, NULL};
+  ps_root_options options = {0};
+  options.storage.io = &io;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  a = acquire(root, "a", 0, &e);
+  b = acquire(root, "b", 0, &e);
+  load_job jobs[2] = {{a, 0, 0, 0}, {a, 0, 0, 0}};
+  pthread_t threads[2];
+  pthread_mutex_lock(&held.gate.mutex);
+  held.enabled = 1;
+  pthread_mutex_unlock(&held.gate.mutex);
+  REQUIRE(pthread_create(&threads[0], NULL, load_namespace, &jobs[0]) == 0);
+  pthread_mutex_lock(&held.gate.mutex);
+  while (!held.gate.entered)
+    pthread_cond_wait(&held.gate.changed, &held.gate.mutex);
+  pthread_mutex_unlock(&held.gate.mutex);
+  REQUIRE(pthread_create(&threads[1], NULL, load_namespace, &jobs[1]) == 0);
+  while (!__atomic_load_n(&jobs[1].started, __ATOMIC_ACQUIRE))
+    sched_yield();
+  ok(append(root, b, 2, 0, 17, &e), &e);
+  count(b, 2, &e);
+  REQUIRE(!__atomic_load_n(&jobs[0].done, __ATOMIC_ACQUIRE) &&
+          !__atomic_load_n(&jobs[1].done, __ATOMIC_ACQUIRE));
+  pthread_mutex_lock(&held.gate.mutex);
+  held.gate.released = 1;
+  pthread_cond_broadcast(&held.gate.changed);
+  pthread_mutex_unlock(&held.gate.mutex);
+  for (size_t i = 0; i < 2; ++i)
+    REQUIRE(pthread_join(threads[i], NULL) == 0 && jobs[i].rc == LC_OK);
+  count(a, 3, &e);
+  ps_namespace_release(a);
+  ps_namespace_release(b);
+  ok(ps_root_close(root, &e), &e);
+  pthread_cond_destroy(&held.gate.changed);
+  pthread_mutex_destroy(&held.gate.mutex);
+  REQUIRE(unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+typedef struct run {
+  const char *path, *key, *mode;
+} run;
+static void *worker(void *p) {
+  run *r = p;
+  if (!strcmp(r->mode, "lifecycle"))
+    lifecycle(r->path, r->key);
+  else if (!strcmp(r->mode, "faults"))
+    faults(r->path);
+  else if (!strcmp(r->mode, "validation"))
+    validation(r->path);
+  else
+    concurrency(r->path);
+  return NULL;
+}
+int main(int argc, char **argv) {
+  REQUIRE(argc == 3);
+  char prefix[1024], pattern[1100], root[1024], path[1100];
+  REQUIRE(snprintf(prefix, sizeof(prefix), "%s/namespace-", argv[1]) > 0);
+  REQUIRE(snprintf(pattern, sizeof(pattern), "%sXXXXXX", prefix) > 0);
+  REQUIRE(lc_test_tmp_mkdtemp(pattern, root, sizeof(root), prefix));
+  REQUIRE(snprintf(path, sizeof(path), "%s/container", root) > 0);
+  for (size_t i = 0; i < sizeof(body); ++i)
+    body[i] = (unsigned char)(i * 37 + i / 19);
+  char *key = NULL;
+  lc_error e;
+  lc_error_init(&e);
+  ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
+  run r = {path, key, argv[2]};
+  pthread_t thread;
+  REQUIRE(pthread_create(&thread, NULL, worker, &r) == 0);
+  REQUIRE(pthread_join(thread, NULL) == 0);
+  lc_pouch_crypto_key_string_free(key);
+  lc_error_cleanup(&e);
+  lc_test_tmp_cleanup_path(root, prefix);
+  printf("pouch-space namespaces: %lu observable checks passed\n",
+         (unsigned long)checks);
+  return 0;
+}

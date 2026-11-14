@@ -1199,11 +1199,16 @@ cold-cache test nor writing again to an already populated store.
 The final state stream ranges were 638.46–936.88 ms durable, 14.80–18.25 ms fresh
 NoSync and 33.65–58.46 ms preopened NoSync. Current multifile ranges were
 1,156.05–1,364.85, 29.52–33.04 and 24.01–33.03 ms respectively. The preopened
-NoSync slowdown remains: the stream performs seven synchronization calls at the
-median (range seven to eight), against zero in multifile Pouch. Durable namespace
-metadata and safe preparation of untrusted free extents still have costs. Fresh
-NoSync uses four barriers; durable state uses 259 versus 256 in current
-multifile Pouch. No writer queue or weaker commit guarantee was introduced.
+NoSync slowdown remains. Corrected syscall accounting: the stream performs seven
+`fdatasync` calls at the median (range seven to eight); multifile Pouch performs
+zero `fdatasync` calls **and eight `fsync` calls**. Its structural metadata still
+synchronizes in NoSync mode. Fresh NoSync uses four container `fdatasync` calls
+versus eight multifile `fsync` calls. Durable state uses 259 container
+`fdatasync` calls versus 256 `fdatasync` plus two `fsync` calls in multifile Pouch.
+Different calls cover different files and dependencies; counts alone do not
+explain latency. Durable namespace metadata and safe preparation of untrusted
+free extents still have costs. No writer queue or weaker commit guarantee was
+introduced.
 
 Complete metadata also makes the fresh state kernel-write counts comparable:
 3,248,128 bytes for the stream versus 3,244,032 for current multifile Pouch,
@@ -1236,6 +1241,150 @@ The full implementation goal remains active: namespace mutation/manifests,
 snapshot/obsolete ownership, public collection integration, maintenance and
 shared-root coordination are still required.
 
+## Namespace segment ownership
+
+Ordinary stream runs now use a namespace storage owner instead of the benchmark's
+single `"active"` binding. The owner lazily loads its head and segment catalog,
+recovers canonical records, serializes append/rotation authority within one
+namespace, captures immutable read prefixes and owns its segment handles through
+root close. It creates no segment/head for an untouched empty namespace.
+
+A 128-byte head selects the active segment and rotation epoch. Segment catalog
+entries bind numeric canonical labels to exact stream incarnations. Rotation
+prepares and binds an empty successor, durably commits head cutover, then seals
+its predecessor. An expected-active fence makes retries safe across reopen,
+including a committed cutover whose seal still needs completion. Empty staged
+successors can be reused; inconsistent membership is rejected. Ordinary commits
+only publish their canonical tail, without another namespace head write.
+
+Producer and replay callbacks run without namespace/registry locks. A blocked
+producer leaves captured readers and another namespace able to progress. Lazy
+initialization coalesces same-namespace callers while another namespace proceeds
+through a held read. Cached storage admission checks poison before using its
+atomic pointer. The committed tail is cached under append authority, avoiding
+one duplicate physical metadata/status query per record.
+
+Captured segments now use lightweight stream-window pins. Buffered sequential
+readers share their admission/release implementation. A warm view over 89
+segments makes no allocation as large as the 16 KiB body buffer that each
+captured reader previously inherited. Replay instead shares one bounded
+readahead buffer and optional CRC scratch across segments. Views preserve their
+original prefix across append/rotation; callback cancellation leaves them
+reusable. Windows remain readable after retirement/checkpoint and prevent stream
+close until released. They and append/view handles retain the namespace/root.
+
+All 47 storage checks passed on Debug, GNU Release and native musl Release;
+all 21 storage checks passed under ThreadSanitizer. After final replay/tail-cache
+work, the eight affected namespace/stream-state checks passed on Debug, GNU and
+musl, and the four namespace groups passed again under ThreadSanitizer. Final
+Memcheck runs for lifecycle, faults, concurrency and validation reported zero
+errors, no suppressions and all 238,517 allocations freed. Musl uses the default
+128 KiB worker stacks.
+
+The fault suite fails every observed I/O/allocation point during initialization,
+rotation and load/replay in both durability modes. It restores a simulated
+durable image after failure, including partial writes, partial persistence on
+failed barriers and publications that persisted despite an error. Established
+durable records survive; a first NoSync write is allowed to be lost. Recovered
+owners accept further appends and retry rotations without an extra cutover.
+Validation covers all 128 head bytes, checksummed semantic corruption, wrong
+length/labels/bindings, captured bounds, window allocation failure and retirement.
+Cached owners cannot bypass a poisoned root. Four transform combinations,
+automatic rotation, 89-segment growth/checkpoint/reopen, reentrant callbacks and
+root/child lifetime are exercised.
+
+### Matched measurements
+
+The final series has **210 verified cases**: five samples, seven workloads and
+six executables/modes, with reversed engine order between samples. Values are
+1 KiB, source chunks 4 KiB and container capacity 10 MiB. The codec-only
+predecessor is `375849c`; the same-stage uncached-tail executable isolates that
+implementation choice. The series also retains untouched multifile `02b7fc3`,
+multifile from `375849c`, and current multifile samples. No product source
+changes were made to the multifile backend in this stage.
+
+Write medians are milliseconds:
+
+| Workload | Codec-only stream | Namespace, uncached tail | Namespace, cached tail | Current multifile |
+| --- | ---: | ---: | ---: | ---: |
+| Durable, one writer, state | 635.77 | 881.38 | 621.47 | 1119.68 |
+| Durable, one writer, collection | 368.41 | 337.72 | 351.48 | 596.00 |
+| Fresh NoSync, four writers, state | 14.90 | 17.64 | 20.16 | 28.32 |
+| Fresh NoSync, four writers, collection | 12.29 | 12.52 | 12.27 | 86.61 |
+| Preopened NoSync, four writers, state | 36.62 | 45.46 | 43.08 | 30.63 |
+| Preopened NoSync, four writers, collection | 30.61 | 33.70 | 30.78 | 90.95 |
+| Rotating NoSync, one writer, state | 27.85 | 79.33 | 68.62 | 65.09 |
+
+Durable state runs write 128 records twice; durable collections append 128 once.
+Long state runs write 1,024 records twice and long collection runs append 2,048.
+The extra rotating case uses one state writer and **four actual namespace
+segments**, checked by the executable's `logical_segments` metric. Its
+codec-only predecessor kept one unbounded logical stream; that predecessor
+does not include namespace rotation work. The preopened profile reopens an
+empty root before writing, not a populated store or cold cache.
+
+Final namespace state-write ranges were 564.83–667.67 ms durable, 14.22–21.07 ms
+fresh NoSync, 37.14–46.94 ms preopened NoSync, and 63.05–74.78 ms rotating.
+Current multifile ranges were 1,004.66–1,326.34, 22.98–43.07, 23.84–36.78 and
+62.07–67.42 ms respectively. Preopened NoSync remains slower. Rotating write
+ranges overlap: its median is slightly slower than current multifile. There is
+no claim that the new namespace owner beats its earlier codec-only fixture.
+
+The tail cache removes an unnecessary metadata query by construction. It does
+not establish a uniform measured speedup: multiwriter CPU medians are essentially
+flat, and durable wall-time differences are dominated by sync-time variance.
+The uncached samples remain available rather than attributing the entire
+durable difference to this small cache.
+
+Both synchronization APIs must be counted. State-write median call counts:
+
+| State profile | Codec-only fdatasync / fsync | Namespace fdatasync / fsync | Multifile fdatasync / fsync |
+| --- | ---: | ---: | ---: |
+| Durable, one writer | 259 / 0 | 260 / 0 | 256 / 2 |
+| Fresh NoSync, four writers | 4 / 0 | 6 / 0 | 0 / 8 |
+| Preopened NoSync, four writers | 7 / 0 | 9 / 0 | 0 / 8 |
+| Rotating NoSync, one writer | 2 / 0 | 12 / 0 | 0 / 8 |
+
+The earlier canonical-state paragraph above is corrected accordingly: multifile
+NoSync still synchronizes structural metadata. Calls cover different dependencies
+and, for multifile stores, different inodes/directories; counts are not equivalent
+latency units. Summed syscall time can overlap across writers. Container
+preparation, head publication and sealing retain their durability guarantees;
+no global writer queue or weakened commit was introduced.
+
+Warm state-read and final filled-store reopen + read medians, in milliseconds:
+
+| State profile | Stream warm read | Multifile warm read | Stream reopen + read | Multifile reopen + read |
+| --- | ---: | ---: | ---: | ---: |
+| Durable, one writer | 0.35 | 6.27 | 10.37 | 5.67 |
+| Fresh NoSync, four writers | 2.51 | 31.76 | 41.28 | 33.57 |
+| Preopened NoSync, four writers | 2.50 | 36.91 | 33.89 | 32.03 |
+| Rotating NoSync, one writer | 2.30 | 32.01 | 15.24 | 32.54 |
+
+Rotating/sealing old segments moves durability work into the write interval and
+allows sealed prefixes to skip candidate recovery. Its faster reopen is not
+free end-to-end speed. Read figures still compare warm physical-span reads with
+public Pouch reads, not full public scan/index/policy parity. Startup remains
+variable and has no general container advantage. Current collection warm reads
+are 5.13/4.93 ms for fresh/preopened roots versus 10.11/10.76 ms for multifile.
+
+Local evidence is in `build/pouch-space-integrated/`: pinned
+`pouch_space_compare-namespace-current` and
+`pouch_space_compare-namespace-uncached-tail`, the unchanged state/catalog
+baselines, `namespace-paired.sh`, all 210 `namespace-paired/*.log` files,
+`namespace-results.json` (samples and ranges), and
+`namespace-artifacts.sha256`. The final series log is
+`namespace-final-paired-run.log`; focused final checks use `namespace-tail-*`
+and final memory reports `namespace-final-*-memcheck.log`.
+Exactly one container file and no store directories are verified in every
+stream case. No Darwin, QEMU or 250 MiB-and-larger execution was run.
+
+This completes namespace segment storage and bounded canonical replay in the
+experimental owner. Normal public `lc_pouch_open` remains multifile. Public
+namespace projection/mutation policy, snapshot/obsolete ownership, public
+collections, maintenance and shared-root coordination remain required by the
+active full implementation goal.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -1243,9 +1392,10 @@ the fixed 64 KiB checkpoint banks with growable typed metadata, packed descripto
 pages and protected checkpoint/maintenance capacity. Earlier measurement tables
 above identify their implementation stages, including the current payload
 packing, canonical-stream, lifecycle, typed catalog and production collection
-and ordinary state record follow-ups. The next major task is connecting the
-existing namespace and collection owners to this boundary
-and proving the actual public behavior suites. Full native integration still
+and ordinary state record follow-ups. Namespace segments now have a real
+container owner. The next major task joins resident namespace projections and
+mutation/source paths to it, followed by public collection ownership, and proves
+the actual public behavior suites. Full native integration still
 requires checkpoint scheduling,
 relocating compaction, metadata repacking, process-shared reader
 ownership, and complete public Pouch semantics. The current foundation permits

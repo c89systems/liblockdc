@@ -8,6 +8,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_record.h"
 #include "lc_pouch_state_record.h"
+#include "namespace.h"
 #include "record_io.h"
 #include "root.h"
 #include "space.h"
@@ -79,7 +80,7 @@ struct comparison {
   worker *workers;
   pthread_t *threads;
   double *latencies;
-  uint64_t *offsets;
+  uint64_t *offsets, *segments;
   uint32_t *payload_crcs;
   pthread_mutex_t mutex;
   pthread_cond_t condition;
@@ -224,55 +225,31 @@ static int collection_stream_recover(ps_stream *stream, uint64_t checkpoint,
   *accepted = cursor;
   return LC_OK;
 }
-/* Rebuild the benchmark's derived latest-row offsets from canonical headers
- * and metadata. Verify payload CRCs beyond the trusted checkpoint boundary.
- * This is a storage experiment, not Pouch catalog/receipt/lease semantics. */
+static int namespace_record(void *context, uint64_t segment,
+                            const lc_pouch_state_entry *entry, lc_error *e) {
+  worker *w = context;
+  comparison *c = w->run;
+  unsigned long id;
+  char ns[64], name[64], extra;
+  (void)e;
+  require(sscanf(entry->key, "key-%lu%c", &id, &extra) == 1 && id < c->rows &&
+              id % c->writers == w->ordinal && entry->version >= 1 &&
+              entry->version <= c->rounds && entry->bytes == c->bytes &&
+              entry->record_type == 1,
+          "canonical namespace state identity and metadata");
+  names(w->ordinal, (size_t)id, ns, name);
+  require(!strcmp(entry->key, name), "canonical state key");
+  c->segments[id] = segment;
+  c->offsets[id] = entry->payload_span.payload_offset;
+  c->payload_crcs[id] = (uint32_t)entry->payload_span.payload_crc;
+  ++w->records;
+  return LC_OK;
+}
 static int stream_recover(ps_stream *stream, uint64_t checkpoint,
                           uint64_t capacity, uint64_t *accepted, void *context,
                           lc_error *e) {
-  worker *w = context;
-  comparison *c = w->run;
-  lc_allocator allocator = {0};
-  lc_pouch_state_entry entry = {0};
-  unsigned char *scratch = NULL;
-  uint64_t cursor = 0, next;
-  unsigned long id;
-  int rc = LC_OK, found, truncated;
-  char ns[64], name[64], extra;
-  if (c->collection)
-    return collection_stream_recover(stream, checkpoint, capacity, accepted, w,
-                                     e);
-  w->records = 0;
-  while (cursor < capacity) {
-    rc = lc_pouch_state_record_read(ps_record_recovery_input(stream),
-                                    &allocator, canonical_leaf, cursor,
-                                    capacity, 1, cursor >= checkpoint, &scratch,
-                                    &entry, &next, &found, &truncated, e);
-    if (rc == LC_ERR_PROTOCOL && cursor >= checkpoint) {
-      lc_error_cleanup(e);
-      rc = LC_OK;
-      break;
-    }
-    if (rc != LC_OK || !found)
-      break;
-    require(sscanf(entry.key, "key-%lu%c", &id, &extra) == 1 && id < c->rows &&
-                id % c->writers == w->ordinal && entry.version >= 1 &&
-                entry.version <= c->rounds && entry.bytes == c->bytes &&
-                entry.record_type == 1,
-            "canonical state identity and metadata");
-    names(w->ordinal, (size_t)id, ns, name);
-    require(!strcmp(entry.key, name), "canonical state key");
-    require(cursor >= checkpoint || next <= checkpoint,
-            "checkpoint record boundary");
-    c->offsets[id] = entry.payload_span.payload_offset;
-    c->payload_crcs[id] = (uint32_t)entry.payload_span.payload_crc;
-    cursor = next;
-    ++w->records;
-  }
-  lc_pouch_state_entry_cleanup(&allocator, &entry);
-  lc_free_with_allocator(&allocator, scratch);
-  *accepted = cursor;
-  return rc;
+  return collection_stream_recover(stream, checkpoint, capacity, accepted,
+                                   context, e);
 }
 
 static int stream_named_open(worker *w, int create, lc_error *e) {
@@ -282,23 +259,33 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
   ps_stream_info info;
   ps_key key = {0, 1, PS_STREAM};
   ps_namespace_info identity;
-  unsigned int kind =
-      c->collection ? PS_CATALOG_COLLECTION : PS_CATALOG_SEGMENT;
+  unsigned int kind = PS_CATALOG_COLLECTION;
   char name[64], ns[64];
   int rc;
   snprintf(ns, sizeof(ns), c->collection ? "bench" : "owner-%lu",
            (unsigned long)w->ordinal);
-  snprintf(name, sizeof(name), c->collection ? "collection-%lu" : "active",
-           (unsigned long)w->ordinal);
+  snprintf(name, sizeof(name), "collection-%lu", (unsigned long)w->ordinal);
   rc = ps_root_namespace_acquire(c->owner, ns, create, &w->namespace, e);
+  if (rc == LC_OK && !c->collection) {
+    ps_namespace_view *capture = NULL;
+    w->records = 0;
+    rc = ps_namespace_view_open(w->namespace, &capture, e);
+    if (rc == LC_OK)
+      rc = ps_namespace_view_visit(capture, 0, namespace_record, w, e);
+    ps_namespace_view_close(capture);
+    if (rc != LC_OK) {
+      ps_namespace_release(w->namespace);
+      w->namespace = NULL;
+    }
+    return rc;
+  }
   if (rc == LC_OK)
     rc = ps_namespace_identity(w->namespace, &identity, e);
   if (rc != LC_OK)
     return rc;
   key.owner = identity.owner;
   if (create) {
-    if (c->collection)
-      rc = ps_catalog_allocate_id(c->space, &key.owner, e);
+    rc = ps_catalog_allocate_id(c->space, &key.owner, e);
     if (rc == LC_OK)
       rc = ps_stream_open(c->space, key, 1, NULL, stream_recover, w, &w->stream,
                           e);
@@ -318,8 +305,7 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
       rc = ps_catalog_view_info(view, &binding, e);
     if (rc == LC_OK &&
         (binding.stream.kind != key.kind || !binding.stream.owner ||
-         (!c->collection && binding.stream.owner != identity.owner) ||
-         (c->collection && binding.stream.owner == identity.owner) ||
+         binding.stream.owner == identity.owner ||
          binding.stream.key != key.key))
       rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
                         "comparison catalog target mismatch", NULL, NULL,
@@ -368,7 +354,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   comparison *c = w->run;
   lc_allocator allocator = {0};
   lc_pouch_state_entry request = {0}, result = {0};
-  ps_record_writer output;
+  ps_namespace_append *output = NULL;
   char ns[64], name[64];
   int rc = LC_OK;
   if (c->collection)
@@ -384,25 +370,26 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
       lc_pouch_state_crypto_context(&allocator, ns, name, request.version, 1);
   if (!request.payload_context)
     return LC_ERR_NOMEM;
-  if (!w->stream)
+  if (!w->namespace)
     rc = stream_named_open(w, 1, e);
-  memset(&output, 0, sizeof(output));
   if (rc == LC_OK)
-    rc = ps_record_begin(w->stream, &output, e);
+    rc = ps_namespace_append_begin(w->namespace, PS_MIB, &output, e);
   if (rc == LC_OK)
     rc = lc_pouch_state_record_append(&allocator, ps_root_crypto(c->owner),
-                                      ps_record_output(&output), canonical_leaf,
+                                      ps_namespace_append_output(output),
+                                      ps_namespace_append_leaf(output),
                                       &request, source, 0, &result, e);
   if (rc == LC_OK)
-    rc = ps_record_commit(&output, e);
+    rc = ps_namespace_append_commit(output, e);
   if (rc == LC_OK) {
     require(result.bytes == c->bytes && result.cipher_bytes == c->bytes,
             "canonical state write bytes");
     c->offsets[id] = result.payload_span.payload_offset;
+    c->segments[id] = ps_namespace_append_segment(output);
     c->payload_crcs[id] = (uint32_t)result.payload_span.payload_crc;
     ++w->records;
   }
-  ps_record_abort(&output);
+  ps_namespace_append_close(output);
   lc_pouch_state_entry_cleanup(&allocator, &result);
   lc_free_with_allocator(&allocator, request.payload_context);
   return rc;
@@ -599,6 +586,7 @@ static void close_stores(comparison *c, lc_error *e) {
 static void verify_states(comparison *c, lc_error *e) {
   ps_reader *reader;
   ps_stream_reader *stream_reader;
+  ps_namespace_window *window;
   lc_pouch_state_read_result result;
   char ns[64], name[64];
   unsigned char buffer[4096];
@@ -609,14 +597,37 @@ static void verify_states(comparison *c, lc_error *e) {
     make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
     offset = 0;
     if (c->streams) {
+      lc_pouch_record_io io;
+      struct iovec part;
       crc = 0;
       require(c->offsets[id] != UINT64_MAX, "canonical latest row exists");
-      check(ps_stream_read_open(c->workers[ordinal].stream, c->offsets[id],
-                                c->bytes, &stream_reader, e),
-            e);
-      do {
-        check(ps_stream_read(stream_reader, buffer, sizeof(buffer), &got, e),
+      stream_reader = NULL;
+      window = NULL;
+      if (c->collection) {
+        check(ps_stream_read_open(c->workers[ordinal].stream, c->offsets[id],
+                                  c->bytes, &stream_reader, e),
               e);
+      } else {
+        check(ps_namespace_read_open(c->workers[ordinal].namespace,
+                                     c->segments[id], c->offsets[id], c->bytes,
+                                     &window, e),
+              e);
+        io = ps_namespace_read_input(window);
+      }
+      do {
+        if (c->collection) {
+          check(ps_stream_read(stream_reader, buffer, sizeof(buffer), &got, e),
+                e);
+        } else {
+          got = c->bytes - offset;
+          if (got > sizeof(buffer))
+            got = sizeof(buffer);
+          part.iov_base = buffer;
+          part.iov_len = got;
+          check(
+              lc_pouch_record_io_read(io, c->offsets[id] + offset, &part, 1, e),
+              e);
+        }
         crc = crc32(crc, buffer, (uInt)got);
         require(got <= c->bytes - offset &&
                     !memcmp(buffer, c->workers[ordinal].body + offset, got),
@@ -624,6 +635,7 @@ static void verify_states(comparison *c, lc_error *e) {
         offset += got;
       } while (got);
       ps_stream_reader_close(stream_reader);
+      ps_namespace_read_close(window);
       require(crc == c->payload_crcs[id], "canonical stream payload CRC");
     } else if (c->container) {
       check(
@@ -783,7 +795,9 @@ int main(int argc, char **argv) {
   long metadata_pages = -1;
   long packed_pages = -1, packed_bytes = -1, payload_allocated = -1;
   long journal_used = -1, stream_grants = -1;
+  uint64_t logical_segments = 0;
   ps_stream_info stream_info;
+  ps_namespace_status namespace_info;
   struct rusage usage;
   char prefix[1024], template_path[1100];
   size_t i, count;
@@ -840,8 +854,10 @@ int main(int argc, char **argv) {
   count = c.rows * c.rounds;
   c.latencies = calloc(count, sizeof(*c.latencies));
   c.offsets = calloc(c.rows, sizeof(*c.offsets));
+  c.segments = calloc(c.rows, sizeof(*c.segments));
   c.payload_crcs = calloc(c.rows, sizeof(*c.payload_crcs));
-  require(c.workers && c.threads && c.latencies && c.offsets && c.payload_crcs,
+  require(c.workers && c.threads && c.latencies && c.offsets && c.segments &&
+              c.payload_crcs,
           "benchmark allocations");
   require(pthread_mutex_init(&c.mutex, NULL) == 0, "benchmark mutex");
   require(pthread_cond_init(&c.condition, NULL) == 0, "benchmark condition");
@@ -913,8 +929,17 @@ int main(int argc, char **argv) {
     if (c.streams) {
       stream_grants = 0;
       for (i = 0; i < c.writers; ++i) {
-        check(ps_stream_status(c.workers[i].stream, &stream_info, &e), &e);
-        stream_grants += (long)stream_info.runs;
+        if (c.collection) {
+          check(ps_stream_status(c.workers[i].stream, &stream_info, &e), &e);
+          stream_grants += (long)stream_info.runs;
+          ++logical_segments;
+        } else {
+          check(ps_namespace_status_get(c.workers[i].namespace, &namespace_info,
+                                        &e),
+                &e);
+          stream_grants += (long)namespace_info.runs;
+          logical_segments += namespace_info.segments;
+        }
       }
     }
   }
@@ -941,8 +966,8 @@ int main(int argc, char **argv) {
             "exactly one container and no sidecars");
     check(ps_status(c.space, &stats, &e), &e);
     if (c.streams) {
-      require(stats.entries == (uint64_t)stream_grants + 2 * c.writers + 1 +
-                                   (c.collection ? 1 : c.writers),
+      require(stats.entries == (uint64_t)stream_grants + 2 * logical_segments +
+                                   1 + (c.collection ? 1 : 2 * c.writers),
               "recovered physical stream/grant count");
       for (i = 0; i < c.writers; ++i)
         require(c.workers[i].records ==
@@ -981,16 +1006,18 @@ int main(int argc, char **argv) {
   printf("checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
          "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "
          "payload_allocated=%ld journal_used=%ld stream_grants=%ld "
+         "logical_segments=%lu "
          "preopened=%d preopen_ms=%.6f max_us=%.3f verified=1\n",
          checkpoints, directory_writes, descriptor_writes, metadata_pages,
          packed_pages, packed_bytes, payload_allocated, journal_used,
-         stream_grants, preopen, preopen_seconds * 1000,
-         c.latencies[count - 1] * 1e6);
+         stream_grants, (unsigned long)logical_segments, preopen,
+         preopen_seconds * 1000, c.latencies[count - 1] * 1e6);
   close_stores(&c, &e);
   for (i = 0; i < c.writers; ++i)
     free(c.workers[i].body);
   free(c.latencies);
   free(c.offsets);
+  free(c.segments);
   free(c.payload_crcs);
   free(c.threads);
   free(c.workers);

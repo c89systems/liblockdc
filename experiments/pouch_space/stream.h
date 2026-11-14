@@ -6,6 +6,7 @@
 typedef struct ps_stream ps_stream;
 typedef struct ps_stream_writer ps_stream_writer;
 typedef struct ps_stream_reader ps_stream_reader;
+typedef struct ps_stream_window ps_stream_window;
 typedef struct ps_stream_info {
   ps_ref ref;
   uint64_t tail, capacity, runs;
@@ -61,6 +62,14 @@ void ps_stream_writer_close(ps_stream_writer *);
  */
 int ps_stream_read_open(ps_stream *, uint64_t offset, uint64_t bytes,
                         ps_stream_reader **, lc_error *);
+/* Lightweight captured range: same lifetime/retirement pin as a buffered
+ * reader, with no sequential cursor or body buffer. Metadata views may retain
+ * many windows while sharing bounded scratch across the actual replay. */
+int ps_stream_window_open(ps_stream *, uint64_t offset, uint64_t bytes,
+                          ps_stream_window **, lc_error *);
+int ps_stream_window_read(ps_stream_window *, uint64_t offset, void *, size_t,
+                          lc_error *);
+void ps_stream_window_close(ps_stream_window *);
 int ps_stream_read(ps_stream_reader *, void *, size_t, size_t *, lc_error *);
 /* Exact offset reads inside this reader's captured logical window. Does not
  * change its sequential cursor or buffer; no fresh admission or allocation. */

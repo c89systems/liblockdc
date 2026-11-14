@@ -28,9 +28,13 @@ struct ps_stream_writer {
   int failed, published;
   unsigned char buffer[PS_CHUNK];
 };
-struct ps_stream_reader {
+struct ps_stream_window {
   ps_stream *stream;
-  uint64_t start, offset, end;
+  uint64_t start, end;
+};
+struct ps_stream_reader {
+  ps_stream_window window;
+  uint64_t offset;
   size_t at, used;
   unsigned char buffer[PS_CHUNK];
 };
@@ -472,20 +476,10 @@ void ps_stream_writer_close(ps_stream_writer *w) {
   }
   lc_free_with_allocator(NULL, w);
 }
-int ps_stream_read_open(ps_stream *s, uint64_t offset, uint64_t bytes,
-                        ps_stream_reader **out, lc_error *error) {
-  ps_stream_reader *r;
+static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
+                        ps_stream_window *window, lc_error *error) {
   ps_owned_status status;
   int rc;
-  if (out)
-    *out = NULL;
-  if (!s || !out)
-    return stream_error(error, LC_ERR_INVALID,
-                        "stream reader requires owner and output");
-  r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
-  if (!r)
-    return stream_error(error, LC_ERR_NOMEM,
-                        "cannot allocate bounded stream reader");
   pthread_mutex_lock(&s->mutex);
   rc = ps_owned_status_get(s->head, &status, error);
   if (rc == LC_OK && (s->recovering || s->retired || offset > s->tail ||
@@ -493,16 +487,71 @@ int ps_stream_read_open(ps_stream *s, uint64_t offset, uint64_t bytes,
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream read outside committed prefix");
   if (rc == LC_OK) {
-    r->stream = s;
-    r->start = offset;
-    r->offset = offset;
-    r->end = offset + bytes;
+    window->stream = s;
+    window->start = offset;
+    window->end = offset + bytes;
     ++s->readers;
-    *out = r;
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK)
-    lc_free_with_allocator(NULL, r);
+  return rc;
+}
+static void window_release(ps_stream_window *window) {
+  pthread_mutex_lock(&window->stream->mutex);
+  --window->stream->readers;
+  pthread_mutex_unlock(&window->stream->mutex);
+}
+int ps_stream_window_open(ps_stream *s, uint64_t offset, uint64_t bytes,
+                          ps_stream_window **out, lc_error *error) {
+  ps_stream_window *window;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!s || !out)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream window requires owner and output");
+  window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
+  if (!window)
+    return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream window");
+  rc = window_admit(s, offset, bytes, window, error);
+  if (rc == LC_OK)
+    *out = window;
+  else
+    lc_free_with_allocator(NULL, window);
+  return rc;
+}
+int ps_stream_window_read(ps_stream_window *window, uint64_t offset,
+                          void *bytes, size_t n, lc_error *error) {
+  if (!window || (!bytes && n) || offset < window->start ||
+      offset > window->end || n > window->end - offset)
+    return stream_error(error, LC_ERR_INVALID,
+                        "offset read outside captured stream window");
+  return stream_io(window->stream, offset, bytes, n, 0, error);
+}
+void ps_stream_window_close(ps_stream_window *window) {
+  if (!window)
+    return;
+  window_release(window);
+  lc_free_with_allocator(NULL, window);
+}
+int ps_stream_read_open(ps_stream *s, uint64_t offset, uint64_t bytes,
+                        ps_stream_reader **out, lc_error *error) {
+  ps_stream_reader *reader;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!s || !out)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream reader requires owner and output");
+  reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
+  if (!reader)
+    return stream_error(error, LC_ERR_NOMEM,
+                        "cannot allocate bounded stream reader");
+  rc = window_admit(s, offset, bytes, &reader->window, error);
+  if (rc == LC_OK) {
+    reader->offset = offset;
+    *out = reader;
+  } else
+    lc_free_with_allocator(NULL, reader);
   return rc;
 }
 int ps_stream_read(ps_stream_reader *r, void *bytes, size_t n, size_t *out,
@@ -514,12 +563,12 @@ int ps_stream_read(ps_stream_reader *r, void *bytes, size_t n, size_t *out,
     *out = 0;
   if (!r || (!bytes && n) || !out)
     return stream_error(error, LC_ERR_INVALID, "stream read arguments invalid");
-  while (n && (r->at < r->used || r->offset < r->end)) {
+  while (n && (r->at < r->used || r->offset < r->window.end)) {
     if (r->at == r->used) {
-      take = (size_t)(r->end - r->offset);
+      take = (size_t)(r->window.end - r->offset);
       if (take > PS_CHUNK)
         take = PS_CHUNK;
-      rc = stream_io(r->stream, r->offset, r->buffer, take, 0, error);
+      rc = stream_io(r->window.stream, r->offset, r->buffer, take, 0, error);
       if (rc != LC_OK)
         return rc;
       r->at = 0;
@@ -539,17 +588,11 @@ int ps_stream_read(ps_stream_reader *r, void *bytes, size_t n, size_t *out,
 }
 int ps_stream_read_at(ps_stream_reader *r, uint64_t offset, void *bytes,
                       size_t n, lc_error *error) {
-  if (!r || (!bytes && n) || offset < r->start || offset > r->end ||
-      n > r->end - offset)
-    return stream_error(error, LC_ERR_INVALID,
-                        "offset read outside captured stream window");
-  return stream_io(r->stream, offset, bytes, n, 0, error);
+  return ps_stream_window_read(r ? &r->window : NULL, offset, bytes, n, error);
 }
 void ps_stream_reader_close(ps_stream_reader *r) {
   if (!r)
     return;
-  pthread_mutex_lock(&r->stream->mutex);
-  --r->stream->readers;
-  pthread_mutex_unlock(&r->stream->mutex);
+  window_release(&r->window);
   lc_free_with_allocator(NULL, r);
 }

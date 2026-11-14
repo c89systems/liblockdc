@@ -182,6 +182,47 @@ ownership. Public lease operations still exercise the native owner. Namespace
 data manifests, dependency ordering, guard lifetime and control cleanup must be
 joined to the container before the public Pouch cutover.
 
+## Namespace segment ownership
+
+`ps_namespace` now caches its canonical segment owner under the real root.
+The namespace has no segment/head until its first append or explicit rotation.
+A 128-byte `PS_CONTROL` head identifies the namespace owner, active segment,
+rotation epoch and canonical record width, with checked reserved bytes and CRC.
+Typed segment catalog entries hold the growing segment set and exact stream
+incarnations. Numeric segment labels remain canonical metadata, never files.
+No growing manifest value or per-record head publication is introduced.
+
+Rotation prepares an empty successor and commits its catalog binding, durably
+publishes the head cutover, then seals the predecessor. A caller-supplied
+expected active segment fences retries: an already selected successor succeeds
+without another rotation, including after reopen. Recovery recognizes a staged
+empty successor and a cutover whose predecessor still needs sealing. It completes
+that seal before admitting another producer. A nonempty unpublished successor,
+missing segment, wrong binding or sealed active segment is a protocol error.
+Uncertain physical I/O retains the container's poison/reopen rule.
+
+One producer/rotation owns a namespace at a time; contention is explicit. Producer
+callbacks hold neither registry nor namespace mutexes. Other namespaces and
+captured readers continue independently. The cached committed tail is updated
+only after successful publication under that mutation authority; it avoids a
+duplicate physical status query before each record. Versions, query sequences,
+preconditions and resident projections remain the logical mutation owner's job.
+
+Captured views retain exact segment identities and tails with lightweight stream
+windows. Buffered cursors use the same admission and release code. Windows keep
+old ranges readable across append, seal, retirement and checkpoint without a
+16 KiB buffer per captured segment. Replay shares one bounded readahead buffer
+and optional CRC scratch across segments. Callbacks run outside locks, may
+append/rotate, and cannot extend the captured prefix. Callback failure leaves
+the view reusable. Namespace/window/append pins protect root lifetime. Root close
+releases cached segment owners without an implicit NoSync barrier; after a raw
+child rejects close, the cached owners can be reconstructed.
+
+This is segment storage and canonical replay, not complete public namespace
+policy. Snapshot installation, obsolete ownership/reclamation, public collection
+ownership and process-shared coordination remain required. Normal
+`lc_pouch_open` still opens multifile roots; there is no deployment cutover.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and
@@ -211,11 +252,11 @@ bypassed through a cached namespace.
 
 The stream comparison now opens through this root owner and obtains its actual
 namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
-This is root bootstrap and namespace identity ownership; namespace manifests,
-ordinary namespace mutation/replay ownership, snapshot/obsolete sets and public
+Namespace heads, segment ownership/rotation and bounded canonical replay now use
+this owner too. Public mutation/replay policy, snapshot/obsolete sets and public
 collection ownership still require integration. Normal `lc_pouch_open` uses
-multifile roots. The experimental owner retains exclusive physical open ownership; it
-does not implement shared-root coordination.
+multifile roots. The experimental owner retains exclusive physical open
+ownership; it does not implement shared-root coordination.
 
 The production canonical record I/O boundary is now shared with the container
 experiment. `lc_pouch_record_io` borrows an owner and provides exact vectored

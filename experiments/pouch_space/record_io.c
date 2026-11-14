@@ -104,6 +104,24 @@ lc_pouch_record_io ps_record_input(ps_stream_reader *reader) {
   io.context = reader;
   return io;
 }
+static int window_parts(void *context, uint64_t offset,
+                        const struct iovec *parts, int count, lc_error *e) {
+  int i, rc = LC_OK;
+  for (i = 0; i < count && rc == LC_OK; ++i) {
+    rc = ps_stream_window_read(context, offset, parts[i].iov_base,
+                               parts[i].iov_len, e);
+    offset += parts[i].iov_len;
+  }
+  return rc;
+}
+lc_pouch_record_io ps_record_window_input(ps_stream_window *window) {
+  static const lc_pouch_record_io_ops ops = {window_parts, NULL, NULL, NULL,
+                                             NULL};
+  lc_pouch_record_io io;
+  io.ops = &ops;
+  io.context = window;
+  return io;
+}
 static int recovery_parts(void *context, uint64_t offset,
                           const struct iovec *parts, int count, lc_error *e) {
   int i, rc = LC_OK;

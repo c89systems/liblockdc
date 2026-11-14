@@ -1,7 +1,8 @@
 # Native Pouch container foundation
 
-This is an experimental physical storage boundary, not a Pouch backend or a
-replacement public API. STATE keys replace immutable values; COLLECTION keys
+This is an experimental container foundation, not a complete Pouch backend or a
+replacement public API. Its immutable-value fixtures use STATE keys to replace
+immutable values; COLLECTION keys
 reject overwrite of a live binding. Deleted keys can be rebound: permanent
 position allocation, tombstones and retry authority belong to a future adapter.
 Neither implements public leases, JSON validation, codecs, indexes, XA or
@@ -412,12 +413,32 @@ pins and diagnostic status can still be released/inspected before reopen.
 The comparison's stream modes now use this owner for root creation/reopen,
 namespace identities and the production crypto provider. Child stream catalogs
 use their real namespace scope; the memory-only record context borrows that
-provider. Public collection IDs, positions, receipts, namespace state replay,
+provider. Public collection IDs, positions, receipts, namespace mutation policy,
 maintenance and process-shared ownership remain pending integration. Normal
 public Pouch roots still use files and directories.
 
+Ordinary stream runs now use a cached namespace segment owner. A small durable
+head selects the active numeric segment; typed catalog entries own the segment
+set. Initialization and rotation publish structural metadata, while normal
+record commits only publish the canonical tail. Rotation prepares/binds a new
+empty stream, commits head cutover, then seals its predecessor. Expected-active
+fences make interrupted rotations retryable across reopen. Unpublished empty
+successors are reusable; recovery rejects inconsistent membership. Logical
+mutation authority still owns versions, index sequences and public policy.
+
+Namespace views capture identities/tails using small stream-window pins, with
+one operation-local readahead buffer and optional CRC scratch during replay.
+They retain no per-segment body buffer. Buffered sequential readers share the
+same pin admission/release code. Read windows and views retain their namespace;
+root close releases cached segment owners only after those pins drain. Producer
+callbacks and replay callbacks hold no namespace/registry mutex. Independent
+namespaces progress during a blocked producer or initialization. Cached storage
+admission checks poison before its atomic pointer lookup. The owner caches its
+committed tail under append authority to avoid a duplicate metadata query per
+record. Snapshot/obsolete transitions remain pending.
+
 The protected metadata region cannot be consumed by payloads. Relocating
-compaction, metadata repacking, transforms,
+compaction, metadata repacking, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The
 foundation implements retirement/reuse without relocation and makes no claim
 that all draft acceptance criteria are already satisfied.
