@@ -4057,3 +4057,78 @@ The stage retains `lifetime-paired.sh`, `lifetime-summary.pl`, all 720
 including both executables and all inputs/results. Normal public Pouch remains
 multifile; protected maintenance capacity, remaining owners/shared-root
 integration and broader performance acceptance remain open.
+
+## Staged writes before batch framing
+
+The uncommitted staged-state integration has a confirmed active-segment crash
+failure: process death after its first LINK write exposes the new public value
+while leaving the stage live. The [batch recovery proposal](pouch-space-implementation.md#compound-append-recovery-decision-pending)
+records the reproducer and proposed correction. The measurements here preserve
+the successful unframed path as a cost baseline for that correction; they do not
+accept the staged implementation. The persistence-format decision is pending.
+
+There are **200 verified trials**, in five alternating samples. Each uses 128
+keys, 1 KiB bodies, two rounds and 4 KiB producer chunks, with one or four
+independent namespace writers under both sync policies. The container remains
+one fixed 10 MiB file with no sidecars. The 40 staged trials compare the current
+prototype with current multifile Pouch. Each operation stages its source, then
+publishes the existing LINK/DECISION/tombstone batch. Each staged trial verifies
+the latest public generation and body, absence of the completed stage, and repeated
+readback after close/reopen. Another 160 trials compare ordinary writes and
+point reads in both backends against the frozen `26081fe` lifetime checkpoint.
+Measurements use native GNU release builds, populated OS caches and a device
+that is not isolated from other host work. No timing trial was discarded.
+
+Median staged write-phase milliseconds, including both stage and commit:
+
+| Policy | Writers | Unframed container | Multifile | Container/MF barriers |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 9.488 | 13.771 | 2 / 2 |
+| NoSync | 4 | 7.361 | 14.329 | 4 / 8 |
+| Durable | 1 | 1400.720 | 2524.688 | 515 / 514 |
+| Durable | 4 | 1002.290 | 1641.231 | 264 / 520 |
+
+Barrier counts include namespace admission within the measured phase. Staging
+and commit remain two completed mutations per operation. Four-writer container
+durable trials use 263–267 barriers; their median is 264. These counts preserve
+the existing coordinator's behavior before framing, including its concurrent
+coalescing, rather than establish the cost of the proposed correction.
+Container staged write syscall bytes are exactly 585,707 with one writer and
+588,996 with four. Multifile medians are 736,932/737,328 under NoSync and
+736,972/737,348 under Durable. The new framing's bytes and checksum work are not
+included in these figures.
+
+The ordinary paths provide the following paired medians in milliseconds.
+Write rows use `write_ms`; point-read rows use the separately timed `read_ms`.
+
+| Path | Policy | Writers | Prototype C | Prior C | Prototype MF | Prior MF |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Write | NoSync | 1 | 6.783 | 7.491 | 12.212 | 11.004 |
+| Write | NoSync | 4 | 6.983 | 7.642 | 16.189 | 15.718 |
+| Write | Durable | 1 | 840.704 | 932.313 | 1301.389 | 1421.486 |
+| Write | Durable | 4 | 649.490 | 621.171 | 937.022 | 998.718 |
+| Point read | NoSync | 1 | 0.693 | 0.692 | 5.664 | 3.790 |
+| Point read | NoSync | 4 | 0.555 | 0.475 | 1.727 | 1.811 |
+| Point read | Durable | 1 | 0.839 | 0.827 | 4.270 | 3.964 |
+| Point read | Durable | 4 | 0.526 | 0.436 | 1.753 | 1.929 |
+
+All **16** before/after primary-metric ranges overlap, counting both backends.
+The adverse medians remain visible: four-writer container point reads are
+16.8%/20.5% higher under NoSync/Durable, and durable ordinary writes are 4.6%
+higher with four writers. The single-writer multifile NoSync point-read median
+is also 49.4% higher. This series does not isolate smaller causal performance
+effects. The ranges, CPU times and all trial counters remain in the JSON results
+for the subsequent matched framing comparison.
+
+The unframed ELF is
+`build/pouch-space-staged/pouch_space_compare-unframed`, SHA-256
+`60db2831f34c49d3832b39ad7544417081bb84b699154c2fa9f4977ae993fbb7`.
+It was built from `10c3aff` plus the retained `unframed-source.patch`, SHA-256
+`979dc4807c383bf86fbe7ee26248dc7df0b7adc81b67043852179e51b157cd43`.
+The prior ELF is `build/pouch-space-key-lifetime/pouch_space_compare-current`,
+SHA-256 `43928cf31d5447fe1f4ff76ee49fa58aa7261cdc0aeff5fa41604a7fbf5a29fe`.
+The stage retains `unframed-paired.sh`, `unframed-summary.pl`, all 200
+`unframed-paired/` logs and `unframed-results.json`. Its
+`unframed-artifacts.sha256` manifest verifies **210 artifacts**, including both
+executables, the source patch and all measurements. Full staged crash
+correctness and the framing cost still require implementation and verification.
