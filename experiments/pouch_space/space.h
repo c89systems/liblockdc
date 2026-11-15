@@ -63,6 +63,10 @@ typedef struct ps_stats {
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   uint64_t metadata_pages, directory_page_writes, descriptor_page_writes;
+  /* Free pages protected from payload allocation and the complete current
+   * checkpoint bound. After successful checkpoint, available >= workspace. */
+  uint64_t metadata_available_bytes, metadata_workspace_bytes;
+  uint64_t metadata_fallbacks;
   uint64_t packed_pages, packed_bytes;
 } ps_stats;
 

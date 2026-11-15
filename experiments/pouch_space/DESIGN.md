@@ -47,13 +47,21 @@ descriptor still fits the 128 KiB journal. Canonical streams instead publish
 one fixed-size descriptor per owned run, without a growing single manifest.
 No 250 MiB or 100 GB test is claimed.
 
-Foreground admission preserves 16 KiB of payload capacity for maintenance plus
-a conservative allowance for the next complete live metadata directory and its
-packed records. Actual checkpoints copy only changed descriptors and tree paths.
-The allowance uses the directory's minimum occupancy and current logical
-metadata size; it grows with live metadata rather than preallocated capacity.
-Capacity errors preserve prior publications and leave checkpoint/deletion work
-possible. These constants and the experimental format apply to fresh fixtures.
+Foreground admission preserves 16 KiB of payload capacity for maintenance and
+a separate pool of free pages that only metadata checkpoints can allocate.
+Let F be the conservative complete directory/packed-descriptor bound in bytes,
+and A the bytes of allocated metadata pages. Admission protects at least
+`max(F, 2F - A)` free metadata bytes, including the original fixed region.
+The bound follows logical metadata and the directory's minimum occupancy,
+independently of reserved container capacity. Unused dynamic pages return to
+the common pool; the original 128 KiB metadata region stays protected.
+
+With spare common capacity, checkpoints copy changed descriptors and tree paths.
+Near capacity they can instead rewrite all current metadata densely using the
+protected pool. Old-root retirement restores space for another complete
+checkpoint, including when ordinary payload admission has stopped. No payload
+is copied by this fallback. Capacity failures preserve prior publications.
+Admission for a complete logical delete/rotation operation remains required.
 
 Private payloads flow through a 16 KiB buffer into page-aligned runs. Allocation
 uses 4 KiB physical pages, matching the measurement host's filesystem blocks;
@@ -151,19 +159,24 @@ densely through ordinary checkpoint/root retirement. Dirty replacements and
 tombstones retain their existing ownership transfer; unpublished writers stay
 private. Payloads, stream mappings, binding identities and held readers do not
 change. Tests reduce 185 fragmented metadata pages to 10 at the same 10 MiB
-capacity. Ordinary checkpoints remain incremental, and a clean checkpoint
-allocates no new metadata pages. Healthy repack failure retains its dirty plan
-for a later checkpoint or repack retry.
+capacity. Ordinary checkpoints keep their incremental path away from capacity;
+the protected-pool fallback provides progress near capacity. A clean checkpoint
+allocates no new metadata pages and trims excess workspace left by an aborted
+private writer. Healthy repack failure retains its dirty plan for a later
+checkpoint or repack retry.
 
 Growth reserves backing space first, then privately admits the new range under
 the allocator mutex so it can fund the checkpoint that publishes capacity and
-metadata together. Healthy failure aborts private metadata pages and removes
-that range from allocation before restoring the old capacity. Uncommitted
-trailing space is ignored on open. Any failed structural I/O poisons the handle;
+metadata together. Healthy failure aborts private metadata pages, returns free
+growth intervals from both allocation pools and trims excess old-capacity
+workspace before excluding the new range. Rollback split nodes are allocated
+before growth, so restoring old capacity and payload headroom needs no new
+allocation. Uncommitted trailing space is ignored on open. Any failed structural
+I/O poisons the handle;
 reopen reconciles the selected root. Allocation failure before root publication
-permits retry on the same owner. Journal exhaustion uses an
-incremental metadata checkpoint; no live payload is copied. Checkpoint/growth
-serialize publication and allocation, but never wait on a producer callback or
+permits retry on the same owner. Journal exhaustion uses the same checkpoint
+policy; no live payload is copied. Checkpoint/growth serialize publication and
+allocation, but never wait on a producer callback or
 on readers to finish.
 
 ## Canonical append-owned streams
@@ -595,10 +608,10 @@ orphan collection and checkpoint retain existing read-pin guarantees. Encoded
 sources validate stored CRCs as consumed; reset and clone maintain independent
 cursor/checksum state and can outlive the logical runtime.
 
-This reserves known canonical output spans, not the whole maintenance budget.
-Automatic policy, history protection and complete metadata/rotation/checkpoint
-admission remain pending. The current label pool still follows namespace-owner
-lifetime.
+Known canonical output spans and checkpoint workspace have separate protection.
+Atomic admission for the complete rotation/catalog/head/payload sequence remains
+pending, along with automatic compaction/retention policy and history protection.
+The current label pool still follows namespace-owner lifetime.
 
 The protected metadata region cannot be consumed by payloads. Complete
 maintenance admission, resumable root transform conversion,

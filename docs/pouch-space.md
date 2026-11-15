@@ -55,11 +55,16 @@ body-read cost alongside its earlier performance results.
 
 Explicit physical metadata repacking now rewrites current descriptors and their
 directory references through the existing checkpoint protocol, without copying
-bodies or growing the file. Normal checkpoints remain incremental. Growth now
-lets the new range privately fund the metadata checkpoint that publishes it;
+bodies or growing the file. Checkpoints keep an incremental path with spare
+capacity and a dense metadata fallback near capacity. A separate metadata-only
+free-page pool protects the next checkpoint from payload allocation; unused
+dynamic workspace returns to the common pool. Growth lets the new range
+privately fund the metadata checkpoint that publishes it;
 capacity and metadata become visible together. Tests cover near-full growth,
-healthy rollback/retry and uncertain-I/O recovery. These changes do not yet
-protect the complete maintenance operation from foreground capacity exhaustion.
+healthy rollback/retry, preserved old-capacity payload headroom and uncertain-I/O
+recovery. Prepared grants recheck metadata admission after private I/O, while
+unrelated writers can continue. These changes do not yet protect the complete
+maintenance operation from foreground capacity exhaustion.
 
 ## Intent
 

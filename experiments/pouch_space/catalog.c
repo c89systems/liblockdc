@@ -329,8 +329,9 @@ static int catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
       rc = ps_catalog_prepare_record(s, p, 0, e);
     }
     if (rc == LC_OK)
-      rc = ps_internal_allowance(s, s->metadata + 104 + length,
-                                 s->live_entries + 1, e);
+      rc = ps_internal_allowance(
+          s, s->metadata + (old && !old->deleted ? 0 : 104 + length),
+          s->live_entries + (old && !old->deleted ? 0 : 1), e);
     if (rc == LC_OK)
       rc = ps_internal_event(s, p, PS_PUT, e);
     if (rc == LC_OK) {

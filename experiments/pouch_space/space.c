@@ -333,13 +333,9 @@ static void entry_free(ps_entry *p) {
 }
 /* Sorted free intervals. Their number follows fragmentation, not capacity.
  * Nodes are preallocated before irreversible metadata changes when needed. */
-static void free_insert(ps_space *s, ps_run *node) {
-  ps_run **head = node->offset < PS_DATA ? &s->metadata_free : &s->free;
+static void interval_insert(ps_run **head, uint64_t *available, ps_run *node) {
   ps_run **link = head, *next;
-  if (node->offset < PS_DATA)
-    s->metadata_free_bytes += node->bytes;
-  else
-    s->free_bytes += node->bytes;
+  *available += node->bytes;
   while (*link && (*link)->offset < node->offset)
     link = &(*link)->next;
   node->next = *link;
@@ -355,6 +351,15 @@ static void free_insert(ps_space *s, ps_run *node) {
     } else
       link = &(*link)->next;
   }
+}
+static void free_insert(ps_space *s, ps_run *node) {
+  if (node->offset < PS_DATA)
+    interval_insert(&s->metadata_free, &s->metadata_free_bytes, node);
+  else
+    interval_insert(&s->free, &s->free_bytes, node);
+}
+static void metadata_insert(ps_space *s, ps_run *node) {
+  interval_insert(&s->metadata_free, &s->metadata_free_bytes, node);
 }
 static void take_selected(ps_run **link, uint64_t *available, uint64_t bytes,
                           uint64_t *out, int *clean) {
@@ -771,22 +776,73 @@ static int initial_free(ps_space *s, lc_error *error) {
   s->metadata_free->clean = s->generation == 0;
   return LC_OK;
 }
-static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
-                                      uint64_t entries, uint64_t payload,
-                                      uint64_t floor, lc_error *error) {
+static int metadata_bound(uint64_t bytes, uint64_t entries, uint64_t *bound,
+                          lc_error *error) {
   uint64_t pages;
+  *bound = 0;
   if (bytes > (uint64_t)INT64_MAX / 2 ||
       entries > (uint64_t)INT64_MAX / PS_PAGE)
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   pages = (bytes + META_PAYLOAD - 1) / META_PAYLOAD;
   pages += ps_directory_page_bound(entries);
+  if (pages > UINT64_MAX / (2 * PS_PAGE))
+    return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
+  *bound = pages * PS_PAGE;
+  return LC_OK;
+}
+static uint64_t metadata_target(ps_space *s, uint64_t bound) {
+  uint64_t allocated = (uint64_t)s->metadata_pages * PS_PAGE;
+  /* Enough free pages for one complete rewrite, and two complete images
+   * counting the current checkpoint. A dense rewrite restores this invariant
+   * from its retired image without relying on unprotected payload capacity. */
+  return allocated < bound ? 2 * bound - allocated : bound;
+}
+static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
+                         uint64_t payload, uint64_t floor, lc_error *error) {
+  uint64_t extra, bytes;
+  ps_run *node;
+  int rc;
+  extra = target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
   if (payload > s->free_bytes || s->free_bytes - payload < floor ||
-      pages >
-          (s->free_bytes + s->metadata_free_bytes - payload - floor) / PS_PAGE)
+      extra > s->free_bytes - payload - floor)
     return err(error, LC_ERR_INVALID,
                "container capacity reserved for checkpoint and maintenance; "
                "checkpoint or grow");
+  while (s->metadata_free_bytes < target) {
+    node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
+    if (!node)
+      return err(error, LC_ERR_NOMEM,
+                 "cannot protect checkpoint free interval");
+    bytes = target - s->metadata_free_bytes;
+    rc = take_interval(&s->free, &s->free_bytes, &bytes, &node->offset,
+                       &node->clean, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, node);
+      return rc;
+    }
+    node->bytes = bytes;
+    metadata_insert(s, node);
+  }
+  s->metadata_workspace = bound;
   return LC_OK;
+}
+static int metadata_protect(ps_space *s, uint64_t bound, uint64_t payload,
+                            uint64_t floor, lc_error *error) {
+  return metadata_fill(s, bound, metadata_target(s, bound), payload, floor,
+                       error);
+}
+static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
+                                      uint64_t entries, uint64_t payload,
+                                      uint64_t floor, lc_error *error) {
+  uint64_t bound, current;
+  int rc = metadata_bound(bytes, entries, &bound, error);
+  if (rc == LC_OK)
+    rc = metadata_bound(s->metadata, s->live_entries, &current, error);
+  if (rc != LC_OK)
+    return rc;
+  if (bound < current)
+    bound = current;
+  return metadata_protect(s, bound, payload, floor, error);
 }
 static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
                                 uint64_t payload, lc_error *error) {
@@ -804,6 +860,14 @@ static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
   }
   return checkpoint_allowance_floor(s, bytes, entries, payload, floor, error);
 }
+static int immutable_extent_allowance(ps_space *s, ps_entry *entry,
+                                      uint64_t payload, lc_error *error) {
+  ps_entry *old = lookup(s, entry->key);
+  size_t prior = old && !old->deleted ? entry_bytes(old) : 0;
+  return immutable_allowance(
+      s, entry, s->metadata - prior + entry_bytes(entry) + 24,
+      s->live_entries + (old && !old->deleted ? 0 : 1), payload, error);
+}
 static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
                            size_t bytes, lc_error *error) {
   ps_payload_page *p = NULL;
@@ -815,8 +879,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
       p = s->available[bin];
       break;
     }
-  rc = immutable_allowance(s, entry, s->metadata + entry_bytes(entry) + 24,
-                           s->live_entries + 1, p ? 0 : PS_PAGE, error);
+  rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, error);
   if (rc != LC_OK)
     return rc;
   if (!p) {
@@ -876,7 +939,10 @@ static void metadata_release(ps_space *s, ps_meta_page *p) {
   if (p->next)
     p->next->link = p->link;
   --s->metadata_pages;
-  free_insert(s, &p->run);
+  if (s->metadata_free_bytes < metadata_target(s, s->metadata_workspace))
+    metadata_insert(s, &p->run);
+  else
+    free_insert(s, &p->run);
 }
 static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
                              lc_error *error) {
@@ -885,10 +951,8 @@ static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
   int rc;
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate metadata ownership");
-  rc = s->metadata_free
-           ? take_interval(&s->metadata_free, &s->metadata_free_bytes, &bytes,
-                           &p->run.offset, NULL, error)
-           : take_run(s, &bytes, &p->run.offset, error);
+  rc = take_interval(&s->metadata_free, &s->metadata_free_bytes, &bytes,
+                     &p->run.offset, NULL, error);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, p);
     return rc;
@@ -1036,24 +1100,90 @@ static void metadata_abort(ps_space *s, uint64_t generation) {
     p = next;
   }
 }
+static void metadata_dirty_all(ps_space *s) {
+  ps_entry *p;
+  for (p = s->entries; p; p = p->all_next)
+    if (p->state == 1 && !p->deleted && !p->dirty_link)
+      dirty_entry(s, p, NULL);
+}
+/* Return only excess dynamic workspace; the original fixed metadata region
+ * remains protected. A preallocated node makes post-publication trimming
+ * infallible, including when a final interval needs splitting. */
+static int metadata_trim_needed(ps_space *s) {
+  ps_run *p;
+  if (s->metadata_free_bytes <= metadata_target(s, s->metadata_workspace))
+    return 0;
+  for (p = s->metadata_free; p; p = p->next)
+    if (p->offset >= PS_DATA)
+      return 1;
+  return 0;
+}
+static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
+  uint64_t target = metadata_target(s, s->metadata_workspace), bytes;
+  ps_run **link = &s->metadata_free, *node;
+  while (*link && s->metadata_free_bytes > target) {
+    node = *link;
+    if (node->offset < PS_DATA) {
+      link = &node->next;
+      continue;
+    }
+    bytes = s->metadata_free_bytes - target;
+    if (bytes >= node->bytes) {
+      *link = node->next;
+      s->metadata_free_bytes -= node->bytes;
+      free_insert(s, node);
+    } else {
+      spare->offset = node->offset;
+      spare->bytes = bytes;
+      spare->clean = node->clean;
+      node->offset += bytes;
+      node->bytes -= bytes;
+      s->metadata_free_bytes -= bytes;
+      free_insert(s, spare);
+      return NULL;
+    }
+  }
+  return spare;
+}
 static int checkpoint_locked(ps_space *s, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire = NULL;
   ps_entry *p;
   ps_meta_page *page;
+  ps_run *trim = NULL;
+  uint64_t bound;
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0};
   ps_directory_pages changes;
   metadata_builder builder;
   size_t i;
-  int next = 1 - s->root, rc, removed;
+  int next = 1 - s->root, rc, removed, dense = 0;
   if (s->generation == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
-  rc = s->dirty ? checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0,
-                                             0, error)
-                : LC_OK;
+  rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
+  if (rc == LC_OK)
+    s->metadata_workspace = bound;
+  if (rc == LC_OK && s->dirty)
+    rc = metadata_protect(s, bound, 0, 0, error);
+  /* Keep ordinary checkpoints incremental when spare common capacity exists.
+   * At capacity, a dense rewrite returns every old metadata page and restores
+   * the protected image allowance instead of slowly fragmenting it away. */
+  if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound &&
+      s->free_bytes >= 2 * bound - s->metadata_free_bytes &&
+      s->free_bytes - (2 * bound - s->metadata_free_bytes) >=
+          PS_MAINTENANCE_RESERVE)
+    rc = metadata_fill(s, bound, 2 * bound, 0, PS_MAINTENANCE_RESERVE, error);
+  if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound) {
+    metadata_dirty_all(s);
+    dense = 1;
+  }
+  if (rc == LC_OK && (s->dirty || metadata_trim_needed(s))) {
+    trim = lc_calloc_with_allocator(NULL, 1, sizeof(*trim));
+    if (!trim)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint trim interval");
+  }
   if (rc == LC_OK)
     rc = directory_open(s, &directory, error);
   if (rc == LC_OK && s->dirty) {
@@ -1111,11 +1241,13 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
     if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
       metadata_abort(s, s->generation + 1);
     ps_directory_close(directory);
+    lc_free_with_allocator(NULL, trim);
     return rc;
   }
   s->root = next;
   ++s->generation;
   ++s->checkpoints;
+  s->metadata_fallbacks += dense;
   s->directory = new_root;
   s->journal = 0;
   mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
@@ -1145,8 +1277,12 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   }
   if (rc != LC_OK) {
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    lc_free_with_allocator(NULL, trim);
     return rc;
   }
+  if (trim)
+    trim = metadata_trim(s, trim);
+  lc_free_with_allocator(NULL, trim);
   for (p = s->retired; p; p = p->retired_next) {
     p->previous = NULL;
     p->safe = 1;
@@ -1703,6 +1839,7 @@ int ps_open(const char *path, int create, const ps_options *options,
             ps_space **out, lc_error *error) {
   ps_options defaults = {0};
   ps_space *s;
+  uint64_t bound;
   int rc;
   if (out)
     *out = NULL;
@@ -1796,6 +1933,10 @@ int ps_open(const char *path, int create, const ps_options *options,
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
     rc = err(error, LC_ERR_INVALID,
              "committed capacity exceeds configured maximum");
+  if (rc == LC_OK)
+    rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
+  if (rc == LC_OK)
+    rc = metadata_protect(s, bound, 0, 0, error);
   if (rc != LC_OK) {
     destroy(s);
     return rc;
@@ -1891,8 +2032,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       run_bytes = take;
       rc = payload_reserve(s, p, extent, take, error);
     } else {
-      rc = immutable_allowance(s, p, s->metadata + entry_bytes(p) + 24,
-                               s->live_entries + 1, run_bytes, error);
+      rc = immutable_extent_allowance(s, p, run_bytes, error);
       if (rc == LC_OK)
         rc = take_run(s, &run_bytes, &extent->offset, error);
     }
@@ -2158,7 +2298,6 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
   return rc;
 }
 int ps_metadata_repack(ps_space *s, lc_error *error) {
-  ps_entry *p;
   int rc;
   if (!s)
     return err(error, LC_ERR_INVALID, "metadata repack requires container");
@@ -2169,17 +2308,43 @@ int ps_metadata_repack(ps_space *s, lc_error *error) {
      * replacement/tombstone chains. Promote only current live entries; the
      * normal checkpoint then retires every old descriptor reference exactly
      * once, after the new root and old-root retirement are durable. */
-    for (p = s->entries; p; p = p->all_next)
-      if (p->state == 1 && !p->deleted && !p->dirty_link)
-        dirty_entry(s, p, NULL);
+    metadata_dirty_all(s);
     rc = checkpoint_locked(s, error);
   }
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+/* Healthy checkpoint abort may have returned growth pages to the protected
+ * metadata pool. Move those free pages back before excluding the new range.
+ * Sorted, disjoint intervals permit at most one split at the old boundary. */
+static ps_run *metadata_ungrow(ps_space *s, uint64_t capacity, ps_run *spare) {
+  ps_run **link = &s->metadata_free, *node;
+  while (*link) {
+    node = *link;
+    if (node->offset + node->bytes <= capacity) {
+      link = &node->next;
+      continue;
+    }
+    if (node->offset < capacity) {
+      spare->offset = capacity;
+      spare->bytes = node->offset + node->bytes - capacity;
+      spare->clean = node->clean;
+      node->bytes -= spare->bytes;
+      s->metadata_free_bytes -= spare->bytes;
+      free_insert(s, spare);
+      spare = NULL;
+      link = &node->next;
+    } else {
+      *link = node->next;
+      s->metadata_free_bytes -= node->bytes;
+      free_insert(s, node);
+    }
+  }
+  return spare;
+}
 int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   uint64_t capacity;
-  ps_run *run;
+  ps_run *run, *rollback, *trim;
   int rc;
   if (!s || !bytes || bytes % PS_MIB)
     return err(error, LC_ERR_INVALID,
@@ -2187,6 +2352,18 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   run = lc_calloc_with_allocator(NULL, 1, sizeof(*run));
   if (!run)
     return err(error, LC_ERR_NOMEM, "cannot allocate growth interval");
+  rollback = lc_calloc_with_allocator(NULL, 1, sizeof(*rollback));
+  if (!rollback) {
+    lc_free_with_allocator(NULL, run);
+    return err(error, LC_ERR_NOMEM, "cannot allocate growth rollback interval");
+  }
+  trim = lc_calloc_with_allocator(NULL, 1, sizeof(*trim));
+  if (!trim) {
+    lc_free_with_allocator(NULL, rollback);
+    lc_free_with_allocator(NULL, run);
+    return err(error, LC_ERR_NOMEM,
+               "cannot allocate growth rollback trim interval");
+  }
   pthread_mutex_lock(&s->mutex);
   capacity = s->capacity;
   rc = healthy(s, error);
@@ -2209,20 +2386,25 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
     run = NULL;
     rc = checkpoint_locked(s, error);
     if (rc != LC_OK) {
-      /* Healthy failure aborted all private checkpoint pages. Remove the
-       * entire new range again, without touching old allocator ownership.
+      /* Healthy failure aborted all private checkpoint pages. Return excess
+       * workspace and remove the new range; committed pages stay owned.
        * Uncertain I/O retains both ownership sets until reopen/reconciliation.
        */
-      if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
-          exclude_run(s, capacity, bytes, NULL) != LC_OK) {
-        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-        rc = err(error, LC_ERR_PROTOCOL,
-                 "cannot roll back private growth range");
+      if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+        rollback = metadata_ungrow(s, capacity, rollback);
+        trim = metadata_trim(s, trim);
+        if (exclude_run(s, capacity, bytes, NULL) != LC_OK) {
+          __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+          rc = err(error, LC_ERR_PROTOCOL,
+                   "cannot roll back private growth range");
+        }
       }
       s->capacity = capacity;
     }
   }
   lc_free_with_allocator(NULL, run);
+  lc_free_with_allocator(NULL, rollback);
+  lc_free_with_allocator(NULL, trim);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
@@ -2242,6 +2424,9 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->capacity = s->capacity;
   out->metadata_bytes = s->metadata;
   out->metadata_pages = s->metadata_pages;
+  out->metadata_available_bytes = s->metadata_free_bytes;
+  out->metadata_workspace_bytes = s->metadata_workspace;
+  out->metadata_fallbacks = s->metadata_fallbacks;
   out->directory_page_writes = s->directory_page_writes;
   out->descriptor_page_writes = s->descriptor_page_writes;
   out->packed_pages = s->packed_pages;
@@ -2414,6 +2599,11 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
   if (rc == LC_OK &&
       (base != head->entry->stream_capacity || s->token_next > s->token_limit))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
+  /* Protect metadata before retaining a free-list selection: admission may
+   * transfer common intervals into the checkpoint-only pool. */
+  if (rc == LC_OK)
+    rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, 0,
+                              error);
   if (rc == LC_OK) {
     for (;;) {
       partial = fit = NULL;
@@ -2525,6 +2715,12 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
       spare = NULL;
     }
   }
+  /* Preparation released allocator authority. Recheck against peer metadata
+   * growth before installing this new grant's descriptor. Its payload is
+   * already privately owned, so no second payload charge is required. */
+  if (rc == LC_OK)
+    rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, 0,
+                              error);
   if (rc == LC_OK)
     rc = append_event(s, p, PS_PUT, error);
   if (rc == LC_OK) {

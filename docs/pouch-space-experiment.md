@@ -2750,11 +2750,155 @@ executable is `pouch_space_compare-repack-current`, SHA-256
 `33aa8cf62b7c5d8ec29b9db0e799b56b2ddc16b850cedfa5664b83182876a5c4`;
 the prior is the maintenance executable recorded above.
 
+## Protected checkpoint workspace at capacity
+
+Incremental checkpoints can retain sparse descriptor pages even after their
+logical contents shrink. The previous admission allowance did not guarantee
+another complete metadata rewrite after foreground exhaustion: the original
+`metadata-capacity` regression failed at explicit repack in a fixed 3 MiB store.
+The allocator now keeps a separate free-page pool for checkpoint metadata.
+All stored bytes remain inside the same container file.
+
+Let F be the conservative complete packed-descriptor/directory bound in bytes,
+and A the bytes of allocated metadata pages. Before admitting payload work,
+the pool contains at least `max(F, 2F - A)` free bytes. This protects one complete
+rewrite and two metadata images counting the current allocation. The bound
+follows logical metadata participation, independent of preallocated capacity.
+Free intervals represent the reservation; it creates no capacity-sized bitmap
+or buffer. Recovery reconstructs the pool from unowned intervals. The persisted
+root/directory/record representation and installed public ABI are unchanged.
+
+When spare common capacity can temporarily fund two free metadata images while
+preserving the 16 KiB payload floor, checkpoints use changed records and paths.
+Otherwise they promote current descriptors into a dense rewrite through the
+existing alternate-root and old-root retirement protocol. Retiring the prior
+image restores free workspace for the next checkpoint. Excess dynamic pages
+return to the common pool; the fixed 128 KiB metadata region remains protected.
+`metadata_available_bytes`, `metadata_workspace_bytes` and `metadata_fallbacks`
+expose the free workspace, conservative bound and committed dense fallbacks.
+
+### Capacity and failure evidence
+
+The capacity fixture fragments 180 hot/cold keys, fills unrelated 4 KiB values
+until admission stops, then checkpoints/reclaims and fills again. At the same
+3 MiB capacity it replaces a spanning 16 KiB + 17 byte catalog name while an old
+catalog view remains held, performs 32 appends within an existing stream grant,
+and checkpoints after each append with periodic explicit repack. It requires a
+dense fallback on the first normal checkpoint, verifies the protected free bound
+after every checkpoint, checks held readers and all filled values, and verifies
+the stream contents after populated reopen.
+Both sync policies pass. Replacing a name previously forecast an extra live
+binding; the corresponding red test fails before the accounting correction.
+Immutable replacement forecasts likewise subtract the replaced descriptor.
+
+A separate fixture aborts a 1 MiB private writer over 2,000 live keys. A clean
+checkpoint returns its excess workspace forecast, restores prior payload
+allocation accounting and writes no directory/descriptor page. Another test
+holds private grant I/O while a peer fills a descriptor page with a large inline
+catalog name, checkpoints, and consumes payload headroom through replacements.
+The delayed producer must recheck metadata admission before installing its grant.
+It fails cleanly under that pressure; checkpoint/reclamation then permits a
+successful retry without growth. Latest value refs survive populated reopen.
+Temporarily removing the final recheck makes the test fail at the expected
+producer result; the restored implementation passes.
+
+Growth rollback also returns free growth intervals from the protected pool and
+trims excess old-capacity workspace before excluding the new range. The stronger
+allocation-failure probe first exposed retained old-capacity quota. Two split
+nodes are now allocated before growth for rollback and trimming. Both the
+post-repack and filled-again profiles prove that healthy allocation failure
+preserves old capacity, entries, metadata pages and journal state, permits an
+immediate existing-value replacement, and permits growth retry on the same owner.
+Uncertain I/O still reconciles through reopen; repeated 1 MiB growth and populated
+reopen remain covered. Trailing physical bytes never become admitted capacity
+without root publication.
+
+Failure sweeps cover **800 cuts at capacity** (41 write/sync, 738 allocation,
+21 read), **633 repack cuts** (34 write/sync, 582 allocation, 17 read), and
+**58 growth cuts** (9 write/sync/reserve, 18 allocation and 2 read per profile):
+**1,491 cuts** across these fixtures. Recovery checks cover seeded payloads
+and continued operation. Complete logical deletion at capacity still requires
+atomic reservation of the rotation/catalog/head/payload sequence. Automatic
+logical maintenance and history protection remain pending.
+
+Verification includes a full **369-group Debug ASan/UBSan** pass in 1313.50 s,
+followed by **23 affected Debug groups** on the final helper initialization and
+growth rollback implementation in 206.71 s. Final GNU release **23/23** passes
+in 197.60 s; musl release **23/23** in 194.17 s; ThreadSanitizer **17/17** in
+340.45 s. Nine Memcheck groups pass with **9,521,363 allocations and frees**,
+zero live blocks, errors or suppressions. The final stream checks include the
+held-I/O capacity case and its successful retry.
+
+Logs under `build/pouch-space-integrated/` are `workspace-debug-tests.log`,
+`workspace-debug-affected-tests.log`, `workspace-gnu-final-tests.log`,
+`workspace-musl-tests.log`, `workspace-tsan-tests.log`, their captured `*-details.log`
+files and nine `workspace-*-memcheck.log` files. The original capacity/catalog
+failures are `workspace-red-tests.log` and `workspace-catalog-red-tests.log`;
+`workspace-rollback-red-tests.log` captures the stronger rollback failure.
+`workspace-preparation-negative-tests.log` records the deliberate removal of the
+publication recheck; `workspace-preparation-final-tests.log` records restoration.
+
+### Matched ordinary metadata performance
+
+The 80 serial GNU release runs use five alternating-order samples of
+current/prior container and current/prior multifile. Each seeds 512 plaintext
+1 KiB states, times two metadata-update rounds, and verifies values after
+populated reopen. Four writers use four namespaces. Every container run audits
+one fixed 10 MiB file and no sidecars. OS cache is retained. These ordinary-update
+runs characterize regression behavior; they do not invoke explicit repack or
+measure the emergency dense-rewrite latency. Values below are medians in ms;
+C denotes container and MF denotes multifile.
+
+| Policy | Writers | Current C | Prior C | Current MF | Prior MF | Current C CPU | Current MF CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 47.927 | 52.635 | 42.024 | 42.649 | 23.678 | 22.196 |
+| NoSync | 4 | 12.520 | 12.348 | 12.055 | 11.257 | 34.595 | 32.240 |
+| Durable | 1 | 1412.175 | 1687.246 | 4050.824 | 3988.425 | 106.093 | 160.875 |
+| Durable | 4 | 1405.035 | 1111.451 | 2374.585 | 2599.852 | 143.466 | 161.677 |
+
+Container durable medians remain below current multifile. Single-writer NoSync
+is about 14% slower; its ranges overlap (44.813–59.955 versus 38.206–49.738 ms).
+Current/prior container write-time ranges overlap in every fixture. The
+four-writer durable median rises about 26%, with ranges 1040.453–1538.058 versus
+1042.955–1287.586 ms. Recorded `fdatasync` time accounts for almost all of that
+median difference: 1386.590 versus 1092.795 ms, while CPU is 143.466 versus
+141.966 ms. This series does not isolate the cause of the timing variation.
+
+Current/prior container syscall writes match exactly: 342,692 bytes with one
+writer and 341,576 with four. One writer makes three NoSync syncs and 1027 durable
+syncs versus zero/1024 multifile. Four writers make zero NoSync syncs and median
+518 durable syncs (516–520), versus 1024 multifile; prior container median is 519.
+The single-writer NoSync syncs take median 15.184 ms in this series. The structural
+barriers remain a concrete performance cost.
+
+The reopened ready phase includes root open plus the first value verification
+and logical projection load. These medians retain the OS cache. The container
+phase with four namespaces remains slower than multifile; no reopened-projection fix is
+claimed here.
+
+| Policy | Writers | Current C ready | Prior C ready | Current MF ready | Prior MF ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 16.734 | 16.579 | 16.566 | 15.886 |
+| NoSync | 4 | 37.084 | 34.887 | 14.504 | 14.606 |
+| Durable | 1 | 15.064 | 17.608 | 14.557 | 15.866 |
+| Durable | 4 | 29.729 | 28.028 | 15.375 | 16.052 |
+
+Raw logs are `workspace-metadata-paired/`, with runner
+`workspace-metadata-paired.sh`, `workspace-metadata-results.json` and
+`workspace-metadata-benchmark.log`. The **85-artifact**
+`workspace-metadata-artifacts.sha256` manifest verifies. All four earlier
+repack/maintenance/projection/snapshot-codec manifests remain intact and verify.
+The current executable is `pouch_space_compare-workspace-current`, SHA-256
+`535221931ba552ba92a8e2d9f7518f6439046c4d0360748564283843d1c5af3f`; prior is
+`pouch_space_compare-repack-current`, SHA-256
+`33aa8cf62b7c5d8ec29b9db0e799b56b2ddc16b850cedfa5664b83182876a5c4`.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
-pages, a conservative checkpoint allowance and a fixed maintenance floor. Earlier
+pages, protected checkpoint workspace and a fixed payload reserve for maintenance.
+Earlier
 measurement tables above identify their implementation stages, including the
 current payload packing, canonical-stream, lifecycle, typed catalog and production
 collection and ordinary state record follow-ups. Namespace segments now have a real
@@ -2767,11 +2911,13 @@ body packs and a current-tail liveness check before reclamation. Its first
 matched performance series and checksum/read tradeoff are recorded above.
 Explicit metadata repacking and near-full checkpoint funding during growth now
 join that foundation, with the failure and ordinary-update measurements above.
+The checkpoint-only pool and dense fallback now preserve metadata progress after
+foreground exhaustion, with final capacity/recovery/race/memory checks above.
 The next work must close whole-operation maintenance admission at capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still requires
-checkpoint scheduling, automatic compaction/retention/repack policy,
+checkpoint scheduling, automatic compaction/retention policy,
 process-shared reader ownership, and complete public Pouch semantics. The current
 foundation permits rebinding a deleted physical key; it does not supply permanent collection
 position or retry authority. Full codec/index/XA/outbox integration remains part

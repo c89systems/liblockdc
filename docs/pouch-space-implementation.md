@@ -69,8 +69,16 @@ recovery. Publication never exposes backing capacity before growth commits.
 The experimental container now uses the growable directory and packed immutable
 descriptor pages. Its roots bind directory offset/generation and the reserved
 incarnation limit; retired metadata pages are released after root retirement.
-It reserves 16 KiB of payload capacity and a conservative full-directory allowance
-before foreground admission. Tests cover 12,000 entries in 10 MiB, incremental
+It preserves 16 KiB of payload headroom and a checkpoint-only free-page pool
+before foreground admission. If F is the conservative complete directory and
+packed-descriptor bound, and A is allocated metadata bytes, the pool retains at
+least `max(F, 2F - A)` bytes. Payloads cannot allocate these pages. Recovery
+rebuilds this volatile reservation from the free-space complement inside the
+same file. With spare common capacity, checkpoints stay incremental. Near
+capacity, a dense metadata rewrite and old-root retirement restore enough free
+workspace for the next checkpoint. Excess dynamic workspace returns to common
+allocation; the fixed 128 KiB region remains protected.
+Tests cover 12,000 entries in 10 MiB, incremental
 checkpoint I/O, spanning descriptors, private-build allocation failures and
 torn/missing writes at multi-page checkpoint boundaries. Small payload tails now
 share independently reserved 64-byte cells within 4 KiB pages, with bounded
@@ -83,19 +91,30 @@ Explicit `ps_metadata_repack` promotes current descriptors into the ordinary
 checkpoint's dirty ownership set and rewrites them densely through the same
 directory and root-retirement protocol. It does not copy payloads, relocate
 stream mappings or change binding identities. Existing body, stream and catalog
-pins remain valid. Normal checkpoints still rewrite only changed records and
-paths; a clean checkpoint needs no metadata shadow allocation. A healthy failed
+pins remain valid. Spare-capacity checkpoints still rewrite only changed records
+and paths. A clean checkpoint writes no new directory/descriptor pages and can
+release the excess forecast of an aborted private writer. A healthy failed
 repack retains its dirty plan for a later checkpoint or repack retry.
 
 Growth reserves backing first, then admits the new range privately under the
 allocator mutex so it can fund its own metadata checkpoint. Capacity and new
-directory pages publish in one root. Healthy failure aborts private pages and
-removes the new range from allocation before restoring the old capacity;
+directory pages publish in one root. Healthy failure aborts private pages,
+returns growth intervals from both pools and trims excess old-capacity
+workspace before excluding the new range. Preallocated rollback/trim nodes
+preserve the old capacity and payload headroom without a new allocation;
 uncertain structural I/O still requires reopen/reconciliation. Tests cover
 fragmented near-full metadata, repeated 1 MiB growth, every growth/repack heap
 and I/O failure, held pins and concurrent durable publications. Whole-operation
 maintenance admission remains required; explicit repacking and successful
 growth do not establish that guarantee for a fixed-capacity full store.
+
+Immutable replacement forecasts account for the replaced descriptor, and catalog
+replacement retains its existing name/entry count. A prepared grant rechecks
+descriptor admission after I/O releases allocator authority. Tests hold that I/O
+while a peer grows metadata and exhausts payload admission: the pending grant
+fails before installation, then succeeds after checkpoint/reclamation without
+growth. Removing that final recheck makes the test fail. Existing value refs and
+captured catalog views remain valid throughout.
 
 Canonical append-owned streams are now implemented in the experimental target.
 An immutable identity header binds each whole-page grant to its stream and

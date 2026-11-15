@@ -155,6 +155,8 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
+  add_test(NAME pouch_space_metadata-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity)
+  add_test(NAME pouch_space_metadata-capacity-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity-faults)
   add_test(NAME pouch_space_metadata-repack COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-repack)
   add_test(NAME pouch_space_metadata-repack-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-repack-faults)
   add_test(NAME pouch_space_metadata-growth COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-growth)
@@ -172,6 +174,10 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_packing PROPERTIES TIMEOUT 60
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_metadata PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_metadata-capacity PROPERTIES TIMEOUT 240
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  set_tests_properties(pouch_space_metadata-capacity-faults PROPERTIES TIMEOUT 600
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_metadata-repack pouch_space_metadata-repack-faults pouch_space_metadata-growth PROPERTIES TIMEOUT 240
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
