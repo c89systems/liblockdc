@@ -649,11 +649,19 @@ Known canonical output spans and checkpoint workspace have separate protection.
 Explicit empty rotation now claims successor head, name binding and routing
 replacement before staging or head selection. Seal and rollover use protected
 checkpoint workspace. Canonical grants can now spend explicit claims and known
-body packs reserve their complete publication. Automatic append/delete, snapshot
-builders and the full compaction sequence must still carry a complete budget
-through their remaining dependencies. The fixed 16 KiB floor needs a bounded-work
-policy covering admitted keys up to 1 MiB. Automatic compaction/retention policy
-and history protection remain pending.
+body packs reserve their complete publication. Namespace appends now admit their
+declared span, successor/binding and head selection before staging, retaining
+the claim through producer completion and publication. Metadata batches declare an exact
+span and preserve the standing floor; delete-only batches may use it. Unknown-size
+PUTs declare a header/key prefix and grow through ordinary admission. Existing
+owned capacity avoids a budget handle when no head selection is needed. Ordinary
+grants retain geometric growth with exact fallback near capacity; maintenance
+uses exact grants, and a small clipped grant preserves the larger growth
+preference across reopen. Complete spans are bounded before vectored output and
+checked before commit. Snapshot builders and parent compaction still need a
+joint claim for their full dependency set. The fixed 16 KiB floor needs a
+bounded-work policy covering admitted keys up to 1 MiB. Automatic
+compaction/retention policy and history protection remain pending.
 The current label pool still follows namespace-owner lifetime.
 
 The protected metadata region cannot be consumed by payloads. Complete

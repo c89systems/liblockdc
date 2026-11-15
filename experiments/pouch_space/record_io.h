@@ -10,6 +10,8 @@
 typedef struct ps_record_writer {
   ps_stream_writer *writer;
   uint64_t start, tail;
+  uint64_t limit; /* zero is unbounded; otherwise an absolute exclusive end */
+  int failed;
 } ps_record_writer;
 int ps_record_begin(ps_stream *, ps_record_writer *, lc_error *);
 /* Reserve a known private span without emitting or publishing record bytes. */

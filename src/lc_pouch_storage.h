@@ -58,6 +58,11 @@ int lc_pouch_state_snapshot_publish(lc_pouch *, const char *ns,
                                     lc_pouch_state_precondition_fn, void *,
                                     lc_error *);
 
+enum lc_pouch_storage_append_mode {
+  LC_POUCH_STORAGE_APPEND_PREFIX = 0,
+  LC_POUCH_STORAGE_APPEND_COMPLETE,
+  LC_POUCH_STORAGE_APPEND_MAINTENANCE
+};
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   int (*namespace_open)(void *, const char *, int, void **, lc_error *);
@@ -65,8 +70,12 @@ typedef struct lc_pouch_storage_ops {
   int (*namespace_info)(void *, void *, lc_pouch_storage_namespace_info *,
                         lc_error *);
   int (*replay)(void *, void *, lc_pouch_storage_visit_fn, void *, lc_error *);
-  /* Rotation target and known minimum private span. Reserve before cutover. */
+  /* Rotation target and known span. PREFIX permits an unknown remainder;
+   * COMPLETE requires the declared size, MAINTENANCE additionally permits
+   * spending protected work capacity. Reserve all dependencies before staging.
+   */
   int (*append_begin)(void *, void *, uint64_t, uint64_t,
+                      enum lc_pouch_storage_append_mode,
                       lc_pouch_storage_append *, lc_error *);
   int (*append_commit)(void *, lc_pouch_storage_append *, lc_error *);
   void (*append_close)(void *, lc_pouch_storage_append *);

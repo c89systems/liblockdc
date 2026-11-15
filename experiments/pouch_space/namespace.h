@@ -8,6 +8,11 @@ typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_snapshot ps_namespace_snapshot;
 typedef struct ps_namespace_body ps_namespace_body;
+enum ps_namespace_append_mode {
+  PS_APPEND_PREFIX = 0,
+  PS_APPEND_COMPLETE,
+  PS_APPEND_MAINTENANCE
+};
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;
   uint64_t snapshot, snapshot_boundary;
@@ -41,12 +46,18 @@ int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
 /* One active producer per namespace, explicit BUSY on contention. Unrelated
  * namespaces and captured readers progress independently. target==0 disables
  * automatic rotation; otherwise rotate before the next append when the active
- * committed tail has reached target. Reserve minimum bytes (or one byte when
- * zero) in a private successor. Commit selects its head only after canonical
+ * committed tail has reached target. PREFIX admits a known minimum (or one
+ * byte when zero), with later unknown-size growth using ordinary admission.
+ * COMPLETE requires exactly minimum positive bytes and preserves the standing
+ * floor; MAINTENANCE is complete bounded work permitted to spend that floor.
+ * Plan successor, binding, grants and head selection before staging. Preferred
+ * geometric growth falls back to an exact claim near capacity. Commit selects
+ * its head only after canonical
  * bytes are complete; abort leaves the predecessor selected. No lock spans the
  * producer callback. Routing follows root durability; a predecessor seal waits
  * for durable routing before the next mutation proceeds. */
 int ps_namespace_append_begin(ps_namespace *, uint64_t target, uint64_t minimum,
+                              enum ps_namespace_append_mode,
                               ps_namespace_append **, lc_error *);
 lc_pouch_record_io ps_namespace_append_output(ps_namespace_append *);
 /* Label remains stable after append close while a namespace pin is held. */

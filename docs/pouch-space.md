@@ -27,12 +27,17 @@ record I/O. The experimental root owner now binds codec policy and durable
 namespace identities inside that file. Namespace segment ownership and a private
 integration of production ordinary-state PUT/read, metadata update and deletion
 policy are now implemented. Retention work hints are durable records inside the
-container. Full-capacity deletion is not yet guaranteed: a required rotation can
-still exhaust foreground capacity. The experiment verifies that such failure
-preserves the prior value. Automatic append rotation now reserves its known
-span before selecting the successor, preserving the prior head on reservation
-failure. First-record canonical bytes now complete before head selection; the
-routing head follows root durability, with a flush before predecessor sealing.
+container. Full-capacity deletion is not yet guaranteed for every accepted key
+size. Known-size appends now reserve their span, successor/binding and head
+selection before staging. Complete metadata batches preserve the maintenance
+floor; delete-only batches may spend it. Both deletions in the public small-key
+capacity fixture now rotate, commit and survive reopen after foreground
+exhaustion. The fixed 16 KiB floor does not cover all accepted 1 MiB keys or
+establish whole-operation maintenance admission. Unknown-size PUTs reserve their
+header/key prefix and acquire further grants as input arrives. Failed admission
+preserves the selected head. First-record canonical bytes complete before head
+selection; the routing head follows root durability, with a flush before
+predecessor sealing.
 Recovery discards private successor bytes whose head was not selected, even
 when a peer checkpoint stabilized them. Protected admission for the complete
 maintenance operation remains required. Explicit empty rotation now reserves
@@ -40,9 +45,11 @@ successor head, catalog binding and routing replacement before staging the
 successor. Process-local capacity claims also protect future metadata across
 checkpoints and private writer I/O. Canonical grants can now spend explicit
 claims, and known-size body packs reserve their head, grants and final catalog
-binding before stream creation. Automatic append/delete, snapshot builders and
-the full compaction sequence still need complete-operation admission; the fixed
-maintenance floor does not yet cover every admitted key size.
+binding before stream creation. Namespace append admission now funds its declared
+dependencies through publication, retaining geometric allocation with an exact
+fallback near capacity. Snapshot builders and the full compaction sequence still
+need complete-operation admission; the fixed maintenance floor does not yet cover
+every admitted key size.
 State read-many, metadata visits and paged scan/body snapshots now use captured
 container read pins, with lazy bounded decoding and no body cache. Captured
 body access survives callback mutation and Pouch close. Remaining public Pouch

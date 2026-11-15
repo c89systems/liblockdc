@@ -18,7 +18,7 @@ int ps_record_begin(ps_stream *stream, ps_record_writer *out, lc_error *e) {
 }
 int ps_record_reserve(ps_record_writer *out, ps_budget *budget, uint64_t bytes,
                       lc_error *e) {
-  if (!out || !out->writer)
+  if (!out || !out->writer || out->failed)
     return record_error(e, "canonical append is not open");
   return ps_stream_reserve(out->writer, budget, bytes, e);
 }
@@ -31,7 +31,7 @@ void ps_record_abort(ps_record_writer *out) {
 int ps_record_commit(ps_record_writer *out, ps_commit_publish_fn publish,
                      void *context, lc_error *e) {
   int rc;
-  if (!out || !out->writer)
+  if (!out || !out->writer || out->failed)
     return record_error(e, "canonical append is not open");
   rc = ps_stream_commit(out->writer, publish, context, e);
   ps_record_abort(out);
@@ -41,8 +41,25 @@ static int append(void *context, const struct iovec *parts, int count,
                   lc_error *e) {
   ps_record_writer *out = context;
   int i, rc = LC_OK;
-  if (!out || !out->writer)
+  uint64_t end;
+  if (!out || !out->writer || out->failed)
     return record_error(e, "canonical append is closed");
+  if (out->limit) {
+    end = out->tail;
+    if (end > out->limit) {
+      out->failed = 1;
+      return record_error(
+          e, "canonical append exceeds its declared complete span");
+    }
+    for (i = 0; i < count; ++i) {
+      if (parts[i].iov_len > out->limit - end) {
+        out->failed = 1;
+        return record_error(
+            e, "canonical append exceeds its declared complete span");
+      }
+      end += parts[i].iov_len;
+    }
+  }
   for (i = 0; i < count && rc == LC_OK; ++i) {
     if (parts[i].iov_len > UINT64_MAX - out->tail)
       return record_error(e, "canonical append exceeds logical range");
@@ -57,7 +74,8 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
   ps_record_writer *out = context;
   uint64_t end = offset;
   int i, rc = LC_OK;
-  if (!out || !out->writer || offset < out->start || offset > out->tail)
+  if (!out || !out->writer || out->failed || offset < out->start ||
+      offset > out->tail)
     return record_error(e, "canonical patch outside private append");
   for (i = 0; i < count; ++i) {
     if (parts[i].iov_len > out->tail - end)

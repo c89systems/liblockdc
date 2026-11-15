@@ -15,7 +15,7 @@ struct ps_stream {
   pthread_mutex_t mutex;
   stream_run *runs;
   size_t count, allocated, readers;
-  uint64_t tail, capacity;
+  uint64_t tail, capacity, preferred_grant;
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
@@ -40,6 +40,13 @@ struct ps_stream_reader {
 };
 static int stream_error(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-stream");
+}
+static void note_grant(ps_stream *s, uint64_t capacity) {
+  uint64_t next = (capacity + PS_RUN_HEADER) * 4;
+  if (next > PS_MIB)
+    next = PS_MIB;
+  if (s->preferred_grant < next)
+    s->preferred_grant = next;
 }
 static int stream_grow(ps_stream *s, lc_error *error) {
   size_t n;
@@ -176,6 +183,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
       s->runs[s->count].base = s->capacity;
       s->runs[s->count].capacity = ps_owned_run_capacity(run);
       s->capacity += ps_owned_run_capacity(run);
+      note_grant(s, ps_owned_run_capacity(run));
       ++s->count;
     }
   }
@@ -239,6 +247,8 @@ int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
     pthread_mutex_lock(&s->mutex);
     out->ref = s->ref;
     out->tail = s->tail;
+    out->preferred_grant_bytes =
+        s->preferred_grant ? s->preferred_grant : PS_PAGE;
     out->capacity = s->capacity;
     out->runs = s->count;
     out->readers = s->readers;
@@ -356,10 +366,7 @@ static int ensure_capacity(ps_stream *s, ps_budget *budget, uint64_t end,
   while (s->capacity < end) {
     pthread_mutex_lock(&s->mutex);
     rc = stream_grow(s, error);
-    desired = s->count ? (s->runs[s->count - 1].capacity + PS_RUN_HEADER) * 4
-                       : PS_PAGE;
-    if (desired > PS_MIB)
-      desired = PS_MIB;
+    desired = s->preferred_grant ? s->preferred_grant : PS_PAGE;
     if (exact && end - s->capacity < desired - PS_RUN_HEADER) {
       desired = end - s->capacity + PS_RUN_HEADER;
       desired = (desired + PS_PAGE - 1) / PS_PAGE * PS_PAGE;
@@ -375,6 +382,7 @@ static int ensure_capacity(ps_stream *s, ps_budget *budget, uint64_t end,
     s->runs[s->count].base = s->capacity;
     s->runs[s->count].capacity = ps_owned_run_capacity(run);
     s->capacity += ps_owned_run_capacity(run);
+    note_grant(s, ps_owned_run_capacity(run));
     ++s->count;
     pthread_mutex_unlock(&s->mutex);
   }

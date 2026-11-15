@@ -38,6 +38,29 @@ int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
     return invalid(e, "capacity plan canonical span overflows physical bounds");
   return plan_add(p, pages * PS_PAGE, pages * 88, pages, e);
 }
+int ps_budget_plan_preferred_span(ps_budget_plan *p, uint64_t bytes,
+                                  uint64_t preferred, lc_error *e) {
+  ps_budget_plan next;
+  uint64_t prior, last;
+  int rc;
+  if (!p || preferred < PS_PAGE || preferred > PS_MIB || preferred % PS_PAGE)
+    return invalid(e, "capacity plan requires a page-aligned preferred grant");
+  next = *p;
+  rc = ps_budget_plan_span(&next, bytes, e);
+  if (rc != LC_OK || !bytes)
+    return rc;
+  /* Every non-final grant is needed in full. Its physical size is at most
+   * floor((bytes - 1 + header) / page) pages. Geometric growth is fourfold;
+   * only the final grant can exceed the exact-span bound. */
+  prior = (bytes - 1 + PS_RUN_HEADER) / PS_PAGE * PS_PAGE;
+  last = prior >= PS_MIB / 4 ? PS_MIB : prior * 4;
+  if (last < preferred)
+    last = preferred;
+  rc = plan_add(&next, last - PS_PAGE, 0, 0, e);
+  if (rc == LC_OK)
+    *p = next;
+  return rc;
+}
 int ps_internal_budget_check(ps_space *s, ps_budget *b, uint64_t payload,
                              uint64_t metadata, uint64_t entries, lc_error *e) {
   if (b && (b->space != s || payload > b->remaining.payload_bytes ||

@@ -110,7 +110,8 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
   request.version = version;
   request.index_seq = version;
   request.record_type = 1;
-  int rc = ps_namespace_append_begin(ns, target, 0, &append, e);
+  int rc =
+      ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, &append, e);
   if (rc == LC_OK) {
     if (segment)
       *segment = ps_namespace_append_segment(append);
@@ -418,7 +419,7 @@ static void faults(const char *path) {
           else if (phase == 3) {
             ps_namespace_append *reserved = NULL;
             rc = ps_namespace_append_begin(ns, 1, sizeof(body) + 2048,
-                                           &reserved, &e);
+                                           PS_APPEND_PREFIX, &reserved, &e);
             ps_namespace_append_close(reserved);
           } else
             rc = append(root, ns, 2, 1, sizeof(body), &e);
@@ -755,8 +756,8 @@ static void concurrency(const char *path) {
     pthread_cond_wait(&g.changed, &g.mutex);
   pthread_mutex_unlock(&g.mutex);
   ps_namespace_append *contended = NULL;
-  REQUIRE(ps_namespace_append_begin(a, 0, 0, &contended, &e) ==
-              LC_ERR_INVALID &&
+  REQUIRE(ps_namespace_append_begin(a, 0, 0, PS_APPEND_PREFIX, &contended,
+                                    &e) == LC_ERR_INVALID &&
           !contended);
   clear(&e);
   REQUIRE(ps_namespace_rotate(a, 1, &e) == LC_ERR_INVALID);
@@ -994,8 +995,8 @@ static void reservation(const char *path) {
     ns = acquire(root, "reserve", 1, &e);
     ok(append(root, ns, 1, 0, 31, &e), &e);
     ok(ps_namespace_status_get(ns, &before, &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 1, PS_MIB, &reserved, &e) ==
-                LC_ERR_INVALID &&
+    REQUIRE(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX,
+                                      &reserved, &e) == LC_ERR_INVALID &&
             !reserved && e.message && strstr(e.message, "capacity"));
     clear(&e);
     ok(ps_namespace_status_get(ns, &after, &e), &e);
@@ -1013,13 +1014,15 @@ static void reservation(const char *path) {
     count(ns, 2, &e);
     ok(ps_namespace_view_open(ns, &old, &e), &e);
     ok(ps_grow(ps_root_space(root), PS_MIB, &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 1, UINT64_MAX, &reserved, &e) ==
-                LC_ERR_INVALID &&
+    REQUIRE(ps_namespace_append_begin(ns, 1, UINT64_MAX, PS_APPEND_PREFIX,
+                                      &reserved, &e) == LC_ERR_INVALID &&
             !reserved);
     clear(&e);
     ok(ps_namespace_status_get(ns, &after, &e), &e);
     REQUIRE(after.active_segment == 1);
-    ok(ps_namespace_append_begin(ns, 1, PS_MIB, &reserved, &e), &e);
+    ok(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX, &reserved,
+                                 &e),
+       &e);
     REQUIRE(ps_namespace_append_segment(reserved) == 2);
     stable = ps_namespace_append_leaf(reserved);
     ok(ps_namespace_status_get(ns, &after, &e), &e);
@@ -1197,7 +1200,7 @@ static void reject_published_successor(const char *path) {
   ns = acquire(root, "test", 1, &e);
   ok(append(root, ns, 1, 0, 31, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
-  ok(ps_namespace_append_begin(ns, 1, 1, &staged, &e), &e);
+  ok(ps_namespace_append_begin(ns, 1, 1, PS_APPEND_PREFIX, &staged, &e), &e);
   ps_namespace_append_close(staged);
   ps_namespace_release(ns);
   ok(ps_root_close(root, &e), &e);
@@ -1574,7 +1577,7 @@ static void snapshots(const char *path, const char *key) {
       ok(append(root, ns, 3, 1, 23, &e), &e);
       ok(snapshot_record(root, b, 1, 31, &e), &e);
       ps_namespace_append *busy = NULL;
-      ok(ps_namespace_append_begin(ns, 0, 0, &busy, &e), &e);
+      ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &busy, &e), &e);
       REQUIRE(ps_namespace_snapshot_commit(b, &e) == LC_ERR_INVALID);
       clear(&e);
       ps_namespace_append_close(busy);
@@ -2135,6 +2138,314 @@ static void body_budget_faults(const char *path) {
   free(m.stable);
   lc_error_cleanup(&e);
 }
+static unsigned char *append_frame(ps_root *root, ps_namespace *fixture,
+                                   uint64_t version, size_t *bytes,
+                                   lc_error *e) {
+  ps_namespace_status before, after;
+  ps_namespace_window *window = NULL;
+  ok(ps_namespace_status_get(fixture, &before, e), e);
+  ok(append(root, fixture, version, 0, 31, e), e);
+  ok(ps_namespace_status_get(fixture, &after, e), e);
+  *bytes = (size_t)(after.tail - before.tail);
+  unsigned char *frame = malloc(*bytes);
+  REQUIRE(frame && *bytes > 32 && *bytes < PS_PAGE);
+  ok(ps_namespace_read_open(fixture, PS_CATALOG_SEGMENT, after.active_segment,
+                            before.tail, *bytes, &window, e),
+     e);
+  struct iovec part = {frame, *bytes};
+  ok(lc_pouch_record_io_read(ps_namespace_read_input(window), before.tail,
+                             &part, 1, e),
+     e);
+  ps_namespace_read_close(window);
+  return frame;
+}
+static void append_budget_limits(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    lc_error e;
+    lc_error_init(&e);
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *fixture = acquire(root, "fixture", 1, &e);
+    size_t n, n2;
+    unsigned char *frame = append_frame(root, fixture, 1, &n, &e);
+    unsigned char *frame2 = append_frame(root, fixture, 2, &n2, &e);
+    ps_namespace_release(fixture);
+    ps_namespace *ns = acquire(root, "limits", 1, &e);
+    ps_namespace_append *a = NULL;
+    ps_stats before, after;
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_COMPLETE, &a, &e) ==
+                LC_ERR_INVALID &&
+            !a);
+    clear(&e);
+    REQUIRE(ps_namespace_append_begin(ns, 0, 1,
+                                      (enum ps_namespace_append_mode)3, &a,
+                                      &e) == LC_ERR_INVALID &&
+            !a);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.entries == before.entries &&
+            after.journal_bytes == before.journal_bytes);
+    for (int filled = 0; filled < 2; ++filled) {
+      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &a, &e), &e);
+      lc_pouch_record_io io = ps_namespace_append_output(a);
+      uint64_t start, tail;
+      ok(lc_pouch_record_io_tail(io, &start, &e), &e);
+      if (filled) {
+        struct iovec part = {frame, n};
+        ok(lc_pouch_record_io_append(io, &part, 1, &e), &e);
+      }
+      struct iovec too_much[2] = {{frame, n}, {(void *)"x", 1}};
+      REQUIRE(lc_pouch_record_io_append(io, too_much, filled ? 1 : 2, &e) ==
+              LC_ERR_INVALID);
+      clear(&e);
+      ok(lc_pouch_record_io_tail(io, &tail, &e), &e);
+      REQUIRE(tail == start + (filled ? n : 0));
+      REQUIRE(ps_namespace_append_commit(a, &e) == LC_ERR_INVALID);
+      clear(&e);
+      ps_namespace_append_close(a);
+      ps_namespace_status status;
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(!status.active_segment && !status.tail);
+    }
+    ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &a, &e), &e);
+    lc_pouch_record_io io = ps_namespace_append_output(a);
+    struct iovec first = {frame, n / 2};
+    ok(lc_pouch_record_io_append(io, &first, 1, &e), &e);
+    REQUIRE(ps_namespace_append_commit(a, &e) == LC_ERR_INVALID);
+    clear(&e);
+    struct iovec rest = {frame + n / 2, n - n / 2};
+    ok(lc_pouch_record_io_append(io, &rest, 1, &e), &e);
+    ok(ps_namespace_append_commit(a, &e), &e);
+    ps_namespace_append_close(a);
+    count(ns, 1, &e);
+    ok(ps_namespace_append_begin(ns, 0, n2, PS_APPEND_COMPLETE, &a, &e), &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(!after.budgets); /* Already-owned capacity uses no budget handle. */
+    struct iovec next = {frame2, n2};
+    ok(lc_pouch_record_io_append(ps_namespace_append_output(a), &next, 1, &e),
+       &e);
+    ok(ps_namespace_append_commit(a, &e), &e);
+    ps_namespace_append_close(a);
+    count(ns, 2, &e);
+    ok(ps_flush(ps_root_space(root), &e), &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "limits", 0, &e);
+    count(ns, 2, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    free(frame);
+    free(frame2);
+    lc_error_cleanup(&e);
+  }
+}
+static int append_known_record(ps_root *root, ps_namespace_append *a,
+                               uint64_t version, lc_error *e) {
+  lc_pouch_state_entry request = {0}, result = {0};
+  input source = {0};
+  request.key = "key";
+  request.content_type = "application/test";
+  request.payload_context = "namespace-test";
+  request.version = request.index_seq = version;
+  request.record_type = 1;
+  source.pub.impl = &source;
+  source.pub.read = pull;
+  source.bytes = 31;
+  int rc = lc_pouch_state_record_append(
+      &allocator, ps_root_crypto(root), ps_namespace_append_output(a),
+      ps_namespace_append_leaf(a), &request, &source.pub, 0, &result, e);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
+  return rc;
+}
+static void append_budget_capacity(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    lc_error e;
+    lc_error_init(&e);
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *fixture = acquire(root, "fixture", 1, &e);
+    size_t n, n2;
+    unsigned char *frame = append_frame(root, fixture, 1, &n, &e);
+    unsigned char *frame2 = append_frame(root, fixture, 2, &n2, &e);
+    ps_namespace_release(fixture);
+    ps_namespace *ns = acquire(root, "budget", 1, &e);
+    ps_namespace *other = acquire(root, "reject", 1, &e);
+    ps_namespace_append *a = NULL, *rejected = NULL;
+    ok(ps_namespace_append_begin(ns, 1, n, PS_APPEND_COMPLETE, &a, &e), &e);
+    for (uint64_t i = 0;; ++i) {
+      ps_key k = {99, i, PS_STATE};
+      ps_writer *w = NULL;
+      ok(ps_begin(ps_root_space(root), NULL, k, &w, &e), &e);
+      ok(ps_write(w, body, PS_PAGE, &e), &e);
+      int rc = ps_publish(w, NULL, &e);
+      ps_writer_close(w);
+      if (rc != LC_OK) {
+        REQUIRE(rc == LC_ERR_INVALID);
+        clear(&e);
+        break;
+      }
+      REQUIRE(i < 256);
+    }
+    ps_budget_plan floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+    ps_budget *peer = NULL;
+    ok(ps_budget_open(ps_root_space(root), &floor, &peer, &e), &e);
+    ps_stats before, after;
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(ps_namespace_append_begin(other, 1, n, PS_APPEND_COMPLETE,
+                                      &rejected, &e) == LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.entries == before.entries &&
+            after.journal_bytes == before.journal_bytes);
+    ok(append_known_record(root, a, 1, &e), &e);
+    ok(ps_namespace_append_commit(a, &e), &e);
+    ps_namespace_append_close(a);
+    ok(ps_budget_close(peer, &e), &e);
+    count(ns, 1, &e);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    REQUIRE(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_COMPLETE, &rejected,
+                                      &e) == LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    ok(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_MAINTENANCE, &a, &e), &e);
+    ok(append_known_record(root, a, 2, &e), &e);
+    ok(ps_namespace_append_commit(a, &e), &e);
+    ps_namespace_append_close(a);
+    count(ns, 2, &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(!after.budgets && !after.reserved_payload_bytes &&
+            !after.reserved_metadata_bytes && !after.reserved_entries);
+    ok(ps_flush(ps_root_space(root), &e), &e);
+    ps_namespace_release(other);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "budget", 0, &e);
+    count(ns, 2, &e);
+    other = acquire(root, "reject", 0, &e);
+    ps_namespace_status status;
+    ok(ps_namespace_status_get(other, &status, &e), &e);
+    REQUIRE(!status.active_segment && !status.bound_segments);
+    ps_namespace_release(other);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    free(frame);
+    free(frame2);
+    lc_error_cleanup(&e);
+  }
+}
+static void append_budget_faults(const char *path) {
+  model m = {0};
+  m.live = malloc(PS_MIB);
+  m.stable = malloc(PS_MIB);
+  REQUIRE(m.live && m.stable);
+  ps_io io = {&m, rd, wr, sync_file, reserve, NULL};
+  ps_root_options o = {0};
+  o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+  o.storage.io = &io;
+  lc_error e;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync)
+    for (int rotating = 0; rotating < 2; ++rotating)
+      for (int kind = 0; kind < 2; ++kind) {
+        size_t operations = 0;
+        for (size_t cut = 0; cut <= operations; ++cut) {
+          memset(m.live, 0, PS_MIB);
+          memset(m.stable, 0, PS_MIB);
+          m.calls = m.fail = 0;
+          m.torn = kind ? 0 : 2;
+          o.storage.durable_sync = sync;
+          ps_root *root = NULL;
+          ok(ps_root_open(path, 1, &o, &root, &e), &e);
+          ps_namespace *fixture = acquire(root, "fixture", 1, &e);
+          size_t n;
+          unsigned char *frame = append_frame(root, fixture, 1, &n, &e);
+          free(frame);
+          ps_namespace_release(fixture);
+          ps_namespace *ns = acquire(root, "faults", 1, &e);
+          if (rotating)
+            ok(append(root, ns, 1, 0, 31, &e), &e);
+          ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          ok(ps_root_open(path, 0, &o, &root, &e), &e);
+          ns = acquire(root, "faults", 0, &e);
+          ps_namespace_append *a = NULL;
+          enum ps_namespace_append_mode mode =
+              rotating ? PS_APPEND_MAINTENANCE : PS_APPEND_COMPLETE;
+          m.calls = allocation = 0;
+          if (kind)
+            fail_allocation = cut ? cut : SIZE_MAX;
+          else
+            m.fail = cut;
+          int rc = ps_namespace_append_begin(ns, 1, n, mode, &a, &e);
+          if (rc == LC_OK)
+            rc = append_known_record(root, a, rotating + 1, &e);
+          if (rc == LC_OK)
+            rc = ps_namespace_append_commit(a, &e);
+          if (!cut)
+            operations = kind ? allocation : m.calls;
+          m.fail = fail_allocation = 0;
+          REQUIRE(cut ? rc != LC_OK : rc == LC_OK);
+          if (kind && rc != LC_OK)
+            REQUIRE(rc == LC_ERR_NOMEM);
+          clear(&e);
+          ps_namespace_append_close(a);
+          if (kind && rc != LC_OK) {
+            ok(ps_check(ps_root_space(root), &e), &e);
+            count(ns, rotating, &e);
+            ok(ps_namespace_append_begin(ns, 1, n, mode, &a, &e), &e);
+            ps_namespace_append_close(a);
+          }
+          ps_stats physical;
+          ok(ps_status(ps_root_space(root), &physical, &e), &e);
+          REQUIRE(!physical.budgets && !physical.reserved_payload_bytes &&
+                  !physical.reserved_metadata_bytes &&
+                  !physical.reserved_entries);
+          if (rc == LC_OK)
+            count(ns, rotating + 1, &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          crash(&m, path);
+          ok(ps_root_open(path, 0, &o, &root, &e), &e);
+          ns = acquire(root, "faults", 0, &e);
+          ps_namespace_status status;
+          ok(ps_namespace_status_get(ns, &status, &e), &e);
+          REQUIRE(status.active_segment == (uint64_t)rotating ||
+                  status.active_segment == (uint64_t)rotating + 1);
+          if (rc == LC_OK && sync)
+            REQUIRE(status.active_segment == (uint64_t)rotating + 1);
+          if (kind && rc != LC_OK)
+            REQUIRE(status.active_segment == (uint64_t)rotating);
+          size_t expected =
+              rotating + (status.active_segment > (uint64_t)rotating);
+          count(ns, expected, &e);
+          ok(append(root, ns, expected + 1, 0, 17, &e), &e);
+          count(ns, expected + 1, &e);
+          ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          REQUIRE(unlink(path) == 0);
+        }
+        REQUIRE(operations > 10);
+        printf("complete append cuts (sync=%d rotating=%d %s): %lu\n", sync,
+               rotating, kind ? "allocation" : "write/sync",
+               (unsigned long)operations);
+      }
+  free(m.live);
+  free(m.stable);
+  lc_error_cleanup(&e);
+}
 static void bodies(const char *path) {
   lc_error e;
   lc_error_init(&e);
@@ -2306,6 +2617,11 @@ static void *worker(void *p) {
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))
     body_budget_faults(r->path);
+  else if (!strcmp(r->mode, "append-budget")) {
+    append_budget_limits(r->path);
+    append_budget_capacity(r->path);
+  } else if (!strcmp(r->mode, "append-budget-faults"))
+    append_budget_faults(r->path);
   else
     concurrency(r->path);
   return NULL;

@@ -10,6 +10,7 @@ typedef struct ps_stream_window ps_stream_window;
 typedef struct ps_stream_info {
   ps_ref ref;
   uint64_t tail, capacity, runs, readers;
+  uint64_t preferred_grant_bytes;
   int sealed, retired;
 } ps_stream_info;
 

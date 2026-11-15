@@ -1160,7 +1160,7 @@ static void mutation_capacity(const char *path, const char *directory) {
   lc_error e;
   size_t count;
   char key[32];
-  int rc, removed, peer_removed;
+  int rc;
   lc_pouch_storage_namespace_info full_before, full_after, peer_before,
       peer_after, reopened;
   o.logical.segment_target_bytes = 1;
@@ -1187,31 +1187,21 @@ static void mutation_capacity(const char *path, const char *directory) {
   full_before = storage_info(p, "full", &e);
   peer_before = storage_info(p, "victim", &e);
   read_value(p, "full", "key-0", 65569, 0, 1, &e);
-  rc = lc_pouch_state_delete(p, "full", "key-0", NULL, &w, &e);
-  REQUIRE(rc == LC_OK || rc == LC_ERR_INVALID);
-  if (rc != LC_OK)
-    REQUIRE(e.message && strstr(e.message, "capacity"));
-  removed = rc == LC_OK;
-  clear(&e);
+  /* These small-key tombstones fit the standing bounded-work reserve even
+   * when rotation is required. This does not cover the maximum key size. */
+  ok(lc_pouch_state_delete(p, "full", "key-0", NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
   full_after = storage_info(p, "full", &e);
-  if (!removed)
-    REQUIRE(full_after.active_segment == full_before.active_segment &&
-            full_after.tail == full_before.tail);
+  REQUIRE(full_after.active_segment == full_before.active_segment + 1 &&
+          full_after.tail);
   ok(lc_pouch_state_read_metadata(p, "full", "key-0", &r, &e), &e);
-  REQUIRE(r.found == !removed);
+  REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
-  rc = lc_pouch_state_delete(p, "victim", "key", NULL, &w, &e);
-  REQUIRE(rc == LC_OK || rc == LC_ERR_INVALID);
-  if (rc != LC_OK)
-    REQUIRE(e.message && strstr(e.message, "capacity"));
-  peer_removed = rc == LC_OK;
-  clear(&e);
+  ok(lc_pouch_state_delete(p, "victim", "key", NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
   peer_after = storage_info(p, "victim", &e);
-  if (!peer_removed)
-    REQUIRE(peer_after.active_segment == peer_before.active_segment &&
-            peer_after.tail == peer_before.tail);
+  REQUIRE(peer_after.active_segment == peer_before.active_segment + 1 &&
+          peer_after.tail);
   lc_pouch_close(p);
   REQUIRE(live == 0);
   ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
@@ -1222,24 +1212,17 @@ static void mutation_capacity(const char *path, const char *directory) {
   REQUIRE(reopened.active_segment == peer_after.active_segment &&
           reopened.tail == peer_after.tail);
   ok(lc_pouch_state_read_metadata(p, "full", "key-0", &r, &e), &e);
-  REQUIRE(r.found == !removed);
+  REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
-  if (!removed)
-    read_value(p, "full", "key-0", 65569, 0, 1, &e);
   ok(lc_pouch_state_read_metadata(p, "victim", "key", &r, &e), &e);
-  REQUIRE(r.found == !peer_removed);
+  REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
-  if (!peer_removed)
-    read_value(p, "victim", "key", 65569, 99, 1, &e);
   one_file(directory);
   lc_pouch_close(p);
   REQUIRE(live == 0 && unlink(path) == 0);
-  printf("capacity probe: %lu live keys; deletion %s; peer deletion %s; "
-         "protected maintenance "
-         "admission remains an acceptance requirement\n",
-         (unsigned long)count,
-         removed ? "committed" : "needs maintenance admission",
-         peer_removed ? "committed" : "needs maintenance admission");
+  printf("capacity probe: %lu live keys; bounded-key deletion and peer "
+         "deletion committed and recovered\n",
+         (unsigned long)count);
   lc_error_cleanup(&e);
 }
 

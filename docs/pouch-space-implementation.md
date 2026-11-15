@@ -94,8 +94,12 @@ installation. Extra zero preparation uses only unclaimed headroom; cached stream
 do not retain the reservation's budget. Typed scalar planners compose head,
 binding, routing and worst-fragmentation exact-span costs. Known-size body packs
 admit head, grants and final catalog binding before stream creation, preserving
-the standing floor through an ordinary claim. The complete append/delete,
-snapshot and parent compaction admission remain pending. A bounded-work policy
+the standing floor through an ordinary claim. Namespace appends now plan their
+known span, possible successor/binding and head selection before staging, then
+hold the claim through production and publication. Complete metadata batches
+preserve the floor; complete delete-only batches may spend it. Unknown-size PUTs
+claim their header/key prefix and grow further through ordinary admission.
+Snapshot and parent compaction admission remain pending. A bounded-work policy
 must also cover accepted keys up to 1 MiB;
 the fixed 16 KiB floor alone cannot establish that guarantee.
 Tests cover 12,000 entries in 10 MiB, incremental
@@ -264,12 +268,17 @@ The head follows root durability: durable publication covers the canonical
 bytes in the same barrier; NoSync does not force a whole large value to disk.
 Predecessor sealing is deferred until the next mutation, which first flushes
 the routing decision. No fallible seal follows successful append publication.
-Metadata/delete reserve the complete
-canonical batch; a streaming PUT reserves its known header/key prefix, not the
-unknown body. Zero minimum reserves one byte of logical capacity. Explicit
-empty structural rotation has no append span to reserve and remains durable
-under either root policy. A caller-supplied
-expected active segment fences retries: an already selected successor succeeds
+The private append boundary distinguishes a known prefix, a complete positive
+span and a complete maintenance span. Metadata batches declare their exact
+canonical size; only all-delete batches request maintenance admission. A
+streaming PUT declares its known header/key prefix and acquires further body
+capacity as input arrives. Zero minimum in prefix mode reserves one byte of
+logical capacity. Complete modes reject oversized vectored writes before any
+part is written, reject commit after an overrun attempt and require the declared
+byte count before publication. An underfilled append can be completed and retried.
+Explicit empty structural rotation has no append span to reserve and remains
+durable under either root policy. A caller-supplied expected active segment
+fences retries: an already selected successor succeeds
 without another rotation, including after reopen. Recovery recognizes a staged
 empty successor and a cutover whose predecessor still needs sealing. It completes
 that seal before admitting another producer. A staged successor with checkpoint
@@ -278,12 +287,20 @@ checkpoint. A published tail in an unselected successor, missing segment, wrong
 binding or sealed active segment is a protocol error.
 Uncertain physical I/O retains the container's poison/reopen rule.
 
-`ps_stream_reserve` and its canonical record adapter acquire existing bounded
-zero-owned grants without advancing a tail or emitting canonical bytes. Valid
-allocation/preparation failure fails that writer, which must be closed. It may
-retain reusable zero grants in a staged empty successor. Capacity failure during
-reservation preserves the predecessor; retry after growth reuses the staged
-owner. This is span reservation, not an atomic budget for the whole operation.
+`ps_stream_reserve` and its canonical record adapter acquire bounded zero-owned
+grants without advancing a tail or emitting canonical bytes. Namespace planning
+subtracts capacity already owned by the selected stream; an append needing no new
+grant or head selection allocates no budget handle. Ordinary admission funds a
+conservative geometric-grant envelope and falls back to exact reservation when
+that envelope cannot fit. It does not retry allocation or I/O failures as capacity
+failures. Maintenance uses exact reservation. A clipped grant does not reset the
+stream's growth preference: the largest observed grant determines the next
+preferred size, capped at 1 MiB and reconstructed on open. Scalar planning creates
+no capacity-sized workspace. Valid allocation/preparation failure fails the writer,
+which must be closed; staged zero grants can be reused. Failed capacity admission
+precedes successor staging and preserves the selected head. Admission protects
+the declared dependencies, while unknown-size continuation remains ordinary
+foreground work. Complete parent snapshot/compaction admission is still required.
 
 Logical append manifests remain private until physical publication succeeds.
 Their segment labels remain stable while the namespace capability is held,

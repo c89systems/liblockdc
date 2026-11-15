@@ -5675,7 +5675,7 @@ static void grant_budget_plans(void) {
   OK(ps_budget_plan_span(&p, 0, &error));
   CHECK(!p.payload_bytes && !p.metadata_bytes && !p.entries);
 }
-static void grant_budget_capacity(int durable, int fragmented) {
+static void grant_budget_capacity(int durable, int fragmented, int preferred) {
   ps_space *s;
   ps_budget *budget = NULL, *peer = NULL;
   ps_budget_plan plan = {0}, floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
@@ -5690,7 +5690,7 @@ static void grant_budget_capacity(int durable, int fragmented) {
   CHECK(bytes);
   memset(bytes, 0x7b, 6 * PS_CHUNK + 17);
   clean();
-  s = create(fragmented ? PS_MIB : 3 * PS_MIB, durable, NULL);
+  s = create(fragmented && !preferred ? PS_MIB : 3 * PS_MIB, durable, NULL);
   if (fragmented) {
     budget_fill(s, &next, bytes);
     end = next - 1;
@@ -5700,7 +5700,12 @@ static void grant_budget_capacity(int durable, int fragmented) {
   }
   OK(ps_budget_plan_stream(&plan, &error));
   OK(ps_budget_plan_catalog(&plan, 4, &error));
-  OK(ps_budget_plan_span(&plan, 6 * PS_CHUNK + 17, &error));
+  if (preferred) {
+    OK(ps_budget_plan_preferred_span(&plan, 6 * PS_CHUNK + 17, PS_PAGE,
+                                     &error));
+    OK(ps_budget_plan_routing(&plan, 1, &error));
+  } else
+    OK(ps_budget_plan_span(&plan, 6 * PS_CHUNK + 17, &error));
   OK(ps_budget_open(s, &plan, &budget, &error));
   OK(ps_stream_open(s, budget, stream_key(1), 1, NULL, NULL, NULL, &stream,
                     &error));
@@ -5708,7 +5713,14 @@ static void grant_budget_capacity(int durable, int fragmented) {
   OK(ps_checkpoint(s, &error));
   OK(ps_budget_open(s, &floor, &peer, &error));
   OK(ps_stream_begin(stream, &writer, &error));
-  OK(ps_stream_reserve_exact(writer, budget, 6 * PS_CHUNK + 17, &error));
+  if (preferred) {
+    ps_budget_plan remaining;
+    OK(ps_stream_reserve(writer, budget, 6 * PS_CHUNK + 17, &error));
+    OK(ps_budget_status(budget, &remaining, &error));
+    CHECK(remaining.payload_bytes >= PS_PAGE &&
+          remaining.metadata_bytes >= 88 + 108);
+  } else
+    OK(ps_stream_reserve_exact(writer, budget, 6 * PS_CHUNK + 17, &error));
   OK(ps_stream_status(stream, &info, &error));
   CHECK(info.capacity >= 6 * PS_CHUNK + 17 && !info.tail &&
         (!fragmented || info.runs > 10));
@@ -5722,6 +5734,13 @@ static void grant_budget_capacity(int durable, int fragmented) {
   OK(ps_stream_commit(writer, NULL, NULL, &error));
   ps_stream_writer_close(writer);
   OK(ps_stream_seal(stream, &error));
+  if (preferred) {
+    ps_writer *route = NULL;
+    OK(ps_begin(s, budget, key(PS_ROUTING, 10, 2), &route, &error));
+    OK(ps_write(route, "route", 5, &error));
+    OK(ps_publish(route, NULL, &error));
+    ps_writer_close(route);
+  }
   OK(ps_catalog_put(s, budget, 10, PS_CATALOG_BODY, "pack", 4, NULL,
                     stream_key(1), &info.ref, &binding, &error));
   OK(ps_budget_close(peer, &error));
@@ -5737,6 +5756,8 @@ static void grant_budget_capacity(int durable, int fragmented) {
   OK(ps_stream_close(stream, &error));
   OK(ps_close(s, &error));
   s = reopen(NULL);
+  if (preferred)
+    expect(s, key(PS_ROUTING, 10, 2), NULL, "route", 5);
   OK(ps_stream_open(s, NULL, stream_key(1), 0, &info.ref, NULL, NULL, &stream,
                     &error));
   OK(ps_stream_read_open(stream, 0, 6 * PS_CHUNK + 17, &reader, &error));
@@ -5869,6 +5890,73 @@ static void grant_budget_concurrency(void) {
   free(bytes);
   clean();
 }
+static void append_budget_planning(void) {
+  const uint64_t spans[] = {1, 4032, 4033, 30000, PS_MIB};
+  const uint64_t grants[] = {PS_PAGE, 16 * PS_PAGE, PS_MIB};
+  for (size_t i = 0; i < sizeof(spans) / sizeof(*spans); ++i)
+    for (size_t j = 0; j < sizeof(grants) / sizeof(*grants); ++j) {
+      ps_budget_plan exact = {0}, preferred = {0};
+      OK(ps_budget_plan_span(&exact, spans[i], &error));
+      OK(ps_budget_plan_preferred_span(&preferred, spans[i], grants[j],
+                                       &error));
+      CHECK(preferred.payload_bytes >= exact.payload_bytes &&
+            preferred.payload_bytes - exact.payload_bytes < PS_MIB &&
+            preferred.metadata_bytes == exact.metadata_bytes &&
+            preferred.entries == exact.entries);
+    }
+  ps_budget_plan p = {0}, before;
+  OK(ps_budget_plan_preferred_span(&p, 0, PS_PAGE, &error));
+  CHECK(!p.payload_bytes && !p.entries);
+  BAD(ps_budget_plan_preferred_span(&p, 1, 1, &error));
+  p.payload_bytes = UINT64_MAX - PS_PAGE;
+  before = p;
+  BAD(ps_budget_plan_preferred_span(&p, 1, PS_MIB, &error));
+  CHECK(p.payload_bytes == before.payload_bytes && !p.metadata_bytes &&
+        !p.entries);
+  BAD(ps_budget_plan_preferred_span(&p, UINT64_MAX, PS_PAGE, &error));
+  CHECK(p.payload_bytes == before.payload_bytes && !p.metadata_bytes &&
+        !p.entries);
+}
+static void append_growth_high_water(void) {
+  unsigned char *bytes = malloc((size_t)PS_MIB);
+  ps_stream_info before, clipped, after;
+  ps_stream_writer *w = NULL;
+  uint64_t at, fill;
+  CHECK(bytes);
+  memset(bytes, 0x73, (size_t)PS_MIB);
+  clean();
+  ps_space *s = create(PS_DEFAULT_CAPACITY, 0, NULL);
+  ps_stream *stream = stream_open(s, 1, 1, NULL, NULL);
+  OK(canonical_append(stream, bytes, 400000, 317, 1, &at, &error));
+  OK(ps_stream_status(stream, &before, &error));
+  CHECK(before.preferred_grant_bytes == PS_MIB);
+  OK(ps_stream_begin(stream, &w, &error));
+  OK(ps_stream_reserve_exact(w, NULL, before.capacity - before.tail + 1,
+                             &error));
+  ps_stream_writer_close(w);
+  OK(ps_stream_status(stream, &clipped, &error));
+  CHECK(clipped.capacity - before.capacity == PS_PAGE - PS_RUN_HEADER &&
+        clipped.preferred_grant_bytes == PS_MIB);
+  fill = clipped.capacity - clipped.tail - 43;
+  CHECK(fill <= PS_MIB);
+  OK(canonical_append(stream, bytes, (size_t)fill, 317, 2, &at, &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  stream = stream_open(s, 1, 0, &clipped.ref, NULL);
+  OK(ps_stream_status(stream, &before, &error));
+  CHECK(before.tail == before.capacity &&
+        before.preferred_grant_bytes == PS_MIB);
+  OK(canonical_append(stream, bytes, 31, 7, 3, &at, &error));
+  OK(ps_stream_status(stream, &after, &error));
+  CHECK(after.capacity - before.capacity == PS_MIB - PS_RUN_HEADER);
+  stream_expect(stream, at, bytes, 31, 3);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -5878,12 +5966,18 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "grant-budget") == 0) {
+    if (strcmp(argv[2], "append-budget") == 0) {
+      append_budget_planning();
+      append_growth_high_water();
+      for (int durable = 0; durable < 2; ++durable)
+        for (int fragmented = 0; fragmented < 2; ++fragmented)
+          grant_budget_capacity(durable, fragmented, 1);
+    } else if (strcmp(argv[2], "grant-budget") == 0) {
       grant_budget_plans();
       grant_budget_rejections();
       for (int durable = 0; durable < 2; ++durable)
         for (int fragmented = 0; fragmented < 2; ++fragmented)
-          grant_budget_capacity(durable, fragmented);
+          grant_budget_capacity(durable, fragmented, 0);
       grant_budget_concurrency();
     } else if (strcmp(argv[2], "grant-budget-faults") == 0) {
       for (int zero = 0; zero < 2; ++zero)

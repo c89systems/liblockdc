@@ -368,12 +368,10 @@ static int lc_pouch_state_cache_active_append_fd(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest, int *out, lc_error *error);
 static int lc_pouch_state_storage_prepare(lc_pouch *, const char *, lc_error *);
-static int lc_pouch_state_storage_append_open(lc_pouch *,
-                                              lc_pouch_namespace_logstore *,
-                                              uint64_t,
-                                              lc_pouch_namespace_manifest *,
-                                              lc_pouch_storage_append *,
-                                              uint64_t *, lc_error *);
+static int lc_pouch_state_storage_append_open(
+    lc_pouch *, lc_pouch_namespace_logstore *, uint64_t,
+    enum lc_pouch_storage_append_mode, lc_pouch_namespace_manifest *,
+    lc_pouch_storage_append *, uint64_t *, lc_error *);
 static void lc_pouch_state_storage_append_publish(lc_pouch *,
                                                   lc_pouch_namespace_logstore *,
                                                   lc_pouch_namespace_manifest *,
@@ -6716,6 +6714,7 @@ static int lc_pouch_state_append_binary_records_locked(
   uint64_t appended_end;
   size_t index;
   int query_index_changed;
+  enum lc_pouch_storage_append_mode storage_mode;
   lc_pouch_storage_append storage_append;
   lc_pouch_record_io record_io;
 
@@ -6743,10 +6742,15 @@ static int lc_pouch_state_append_binary_records_locked(
   segment_size = 0U;
   appended_end = 0U;
   query_index_changed = 0;
+  storage_mode = LC_POUCH_STORAGE_APPEND_MAINTENANCE;
   rc = LC_OK;
   for (index = 0U; index < item_count; ++index) {
     size_t trailer_offset;
     int has_query_index_seq;
+
+    if (items[index].record_type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
+        items[index].record_type != LC_POUCH_STATE_RECORD_OBJECT_DELETE)
+      storage_mode = LC_POUCH_STORAGE_APPEND_COMPLETE;
 
     if (pouch->storage.ops != NULL &&
         items[index].record_type != LC_POUCH_STATE_RECORD_STATE_META &&
@@ -6795,9 +6799,9 @@ static int lc_pouch_state_append_binary_records_locked(
     rc = lc_pouch_state_storage_prepare(pouch, ns, error);
     if (rc == LC_OK) {
       cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-      rc = lc_pouch_state_storage_append_open(pouch, cache, record_size,
-                                              manifest, &storage_append,
-                                              &segment_size, error);
+      rc = lc_pouch_state_storage_append_open(
+          pouch, cache, record_size, storage_mode, manifest, &storage_append,
+          &segment_size, error);
     }
     if (rc != LC_OK)
       return rc;
@@ -13356,6 +13360,7 @@ static int lc_pouch_state_mutation_request_check(
 
 static int lc_pouch_state_storage_append_open(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache, uint64_t overhead,
+    enum lc_pouch_storage_append_mode mode,
     lc_pouch_namespace_manifest *manifest, lc_pouch_storage_append *append,
     uint64_t *start, lc_error *error) {
   char *leaf = NULL;
@@ -13364,7 +13369,7 @@ static int lc_pouch_state_storage_append_open(
                         : 1;
   int rc = pouch->storage.ops->append_begin(pouch->storage.context,
                                             cache->storage_namespace, target,
-                                            overhead, append, error);
+                                            overhead, mode, append, error);
   if (rc != LC_OK)
     return rc;
   if (cache->active_segment_leaf == NULL ||
@@ -13744,7 +13749,8 @@ static int lc_pouch_state_write_resolved_locked(
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
     rc = lc_pouch_state_storage_append_open(
         pouch, cache, LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key),
-        &manifest, &storage_append, &segment_size, error);
+        LC_POUCH_STORAGE_APPEND_PREFIX, &manifest, &storage_append,
+        &segment_size, error);
     if (rc != LC_OK) {
       lc_pouch_state_append_lock_release(&append_lock);
       lc_free_with_allocator(&pouch->allocator, etag);

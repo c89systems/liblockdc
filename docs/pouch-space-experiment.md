@@ -3162,6 +3162,136 @@ previous budget-stage metadata manifest. Frozen current executable
 prior is `build/pouch-space-budget/pouch_space_compare-current`, SHA-256
 `e2e306e94836895a95f9166eb2d8e6995b6b765790264fabeffbe1fe4fc211a5`.
 
+## Funded namespace append dependencies
+
+Namespace append admission now plans the known canonical span, a possible new
+successor/head binding, and routing selection before staging that successor.
+The append owns its capacity claim until its private writer closes, including
+through final head publication. Peer payload pressure and future metadata growth
+cannot consume those declared dependencies. Producers continue outside allocator
+and root locks. Neither the persisted format nor installed ABI changes.
+
+The private boundary distinguishes a known prefix, a complete positive span and
+a complete maintenance span. Production metadata batches declare their complete
+size and preserve the standing floor. Only delete-only batches request maintenance
+admission. Streaming PUTs declare their header/key prefix and acquire further
+grants through ordinary admission as input arrives. Complete modes reject an
+oversized vectored call before writing any part, reject commit after an overrun
+attempt and require the exact declared byte count before publication. An
+underfilled append can still be completed and committed.
+
+Planning subtracts capacity already owned by the selected stream. A cached append
+that needs neither a new grant nor head selection allocates no budget handle.
+Ordinary claims fund a conservative geometric-growth envelope, with exact-span
+fallback on insufficient capacity; allocation and I/O errors are not treated as
+capacity retries. Maintenance reserves exact grants. A stream remembers the
+largest grant's growth preference, capped at 1 MiB and reconstructed on open, so
+a small clipped maintenance grant does not reset subsequent ordinary growth.
+Typed planning uses scalar arithmetic and no capacity-sized workspace. Its
+descriptor/entry bound still permits worst-case one-page fragmentation; only the
+payload allowance grows to cover possible geometric overshoot.
+
+### Correctness and failure evidence
+
+The new namespace fixture covers invalid modes and zero complete spans,
+all-or-nothing overrun rejection, an extra write after an exactly filled span,
+underfill/continue/commit, and the zero-budget path for existing owned capacity.
+The existing reservation test admits a 1 MiB prefix after growth to 2 MiB,
+forcing the conservative preferred envelope to fall back to exact admission.
+At fixed 1 MiB capacity under both root policies, peers exhaust foreground space
+and claim the standing floor after an append is admitted. That append must still
+publish its head. A new ordinary append fails before staging; a subsequent
+bounded maintenance rotation succeeds and remains readable after reopen.
+Temporarily removing the head publication's budget makes this pressure test
+fail; restoring it passes.
+
+The public mutation-capacity fixture now requires both small-key tombstones to
+rotate, commit and survive reopen after filling foreground capacity in the
+10 MiB store with **115 pressure-namespace keys and one peer key**. It no longer
+accepts capacity rejection for that bounded profile. This
+does not guarantee deletion for every accepted 1 MiB key, arbitrary future
+metadata thresholds or a complete parent compaction; the standing-work policy
+and joint snapshot/compaction admission remain required.
+
+Failure sweeps cover **356 cuts: 146 write/sync and 210 allocation failures**,
+across both root policies and initial complete/rotating maintenance appends.
+They include uncertified zero preparation, torn writes, producer output and
+tail/head publication. Every cut releases its quotas and recovers a whole prior
+or newly published prefix, then permits another append/checkpoint. Healthy
+allocation failures also preserve the old prefix and admit another attempt on
+the same open owner before close. Raw planner tests cover atomic overflow and
+dense/fragmented funded preferred allocation, while a clipped-grant test fills,
+checkpoints, reopens and verifies the next grant still grows to 1 MiB.
+
+The full native **295-group Debug unit suite** passes in **1261.98 s**, with
+ASan/UBSan and the established constrained worker-stack checks. After tightening
+the public capacity assertion, that group passes again in 1.22 s. The final
+**47 affected GNU release groups** pass in **128.41 s**, **47 musl groups** in
+**129.61 s** and **19 ThreadSanitizer groups** in **104.76 s**. Musl uses its
+native default worker stack. Five Memcheck runs (raw planning, namespace
+admission/faults and public mutation/capacity) complete **206,700 allocations and
+frees**, with zero live blocks, errors or suppressions.
+
+Logs under `build/pouch-space-append-budget/` include `debug-tests.log`,
+`debug-capacity-tests.log`, `gnu-tests.log`, `musl-tests.log`, `tsan-tests.log`,
+their captured `*-output.log` files and five `memcheck-*.log`/output pairs.
+`negative-tests.log` preserves the removed head-budget regression.
+
+### Matched ordinary metadata-update performance
+
+The 80 serial GNU release runs use five alternating-order samples of
+current/prior container and current/prior multifile. Each seeds 512 plaintext
+1 KiB states, measures two metadata-update rounds with one/four writers under
+NoSync/durable roots and verifies values after reopen. Cache is retained. All
+container runs audit one fixed 10 MiB file with no sidecars. This measures
+ordinary updates, not emergency admission latency. Medians are ms; C denotes
+container and MF denotes multifile.
+
+| Root policy | Writers | Current C write | Prior C write | Current MF write | Prior MF write | Current C CPU | Prior C CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 52.846 | 52.082 | 42.283 | 44.254 | 27.141 | 26.712 |
+| NoSync | 4 | 12.723 | 12.337 | 12.147 | 13.233 | 34.294 | 33.554 |
+| Durable | 1 | 1541.543 | 1497.416 | 3913.366 | 4164.097 | 111.939 | 111.985 |
+| Durable | 4 | 1034.767 | 1111.457 | 2115.277 | 2324.844 | 143.197 | 144.947 |
+
+Current/prior container write medians change about +1.5%, +3.1%, +2.9% and
+-6.9%; their wall and CPU ranges overlap in every fixture. The one-writer
+NoSync ranges are 47.573–64.711 versus 50.440–88.273 ms; CPU ranges are
+24.315–32.825 versus 25.147–29.261 ms. These samples do not isolate a new timing
+cost. Current NoSync remains about **25%/5% slower than current MF** with
+one/four writers; durable container medians remain lower than MF.
+
+Current/prior container syscall write volumes match exactly: **342,692 bytes
+and 1040 writes** with one writer; **341,576 bytes and 1024 writes** with four.
+One-writer container retains three NoSync and 1027 durable `fdatasync` calls;
+MF uses two `fsync` calls plus zero/1024 `fdatasync` calls. Four-writer NoSync
+uses no barriers in either backend. Durable container batches median **519**
+barriers (518–521), versus prior 519 (517–520) and MF 1024. Claims add no
+measured write volume or fixed barrier. Structural NoSync costs remain open.
+
+Ready includes root open plus the first verification/projection load. The
+four-namespace container remains slower than MF. One-writer durable ready median
+increases about **31%** versus prior; ranges 14.498–21.623 versus
+13.743–16.975 ms overlap, but this remains an unresolved observation. These
+results do not establish that reopened-projection or body-read costs are solved.
+
+| Root policy | Writers | Current C ready | Prior C ready | Current MF ready | Prior MF ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 16.029 | 14.277 | 15.556 | 15.767 |
+| NoSync | 4 | 33.632 | 38.968 | 16.833 | 15.517 |
+| Durable | 1 | 20.094 | 15.378 | 14.576 | 16.579 |
+| Durable | 4 | 26.956 | 28.739 | 17.454 | 16.483 |
+
+Raw logs are `build/pouch-space-append-budget/metadata-paired/`, with runner
+`metadata-paired.sh`, aggregation script `metadata-summary.pl`,
+`metadata-results.json` and `metadata-benchmark.log`. The **86-artifact**
+`metadata-artifacts.sha256` manifest verifies, as does the prior stage's
+85-artifact compaction manifest. Frozen current executable
+`pouch_space_compare-current` has SHA-256
+`3359eb73cfd6de024ecd98327163fd79853616f123efc6d0d1d7aa7abeaf6dff`;
+prior is `build/pouch-space-grant-budget/pouch_space_compare-current`, SHA-256
+`9681ddeafe57c4dfbeb43cca1cabcb08d1ab581e18e43d825e349bb538a13711`.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -3186,9 +3316,11 @@ Volatile capacity claims and explicit rotation now join that foundation, with
 funded-writer, quota rollback, concurrency and matched performance evidence above.
 Funded canonical grants, typed planning and complete known body-pack admission
 now join those claims, with same-owner retry, capacity, failure and forced-compaction
-comparison evidence above. The next work must carry budgets through complete
-append/delete/snapshot/compaction admission, protect bounded maintenance work for admitted
-key sizes, and close whole-operation maintenance admission at capacity,
+comparison evidence above. Namespace appends now fund their declared spans and
+head selection before staging, with bounded-key full-capacity deletion and
+matched ordinary-update evidence above. The next work must carry joint budgets
+through snapshot and parent compaction admission, protect bounded maintenance
+work for all admitted key sizes, and close whole-operation maintenance admission at capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still requires

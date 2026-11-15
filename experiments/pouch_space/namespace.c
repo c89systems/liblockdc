@@ -13,7 +13,10 @@ struct ps_namespace_append {
   ps_namespace *ns;
   struct ps_namespace_data *data;
   ps_record_writer writer;
+  ps_budget *budget;
   uint64_t segment;
+  uint64_t expected;
+  int complete;
   const char *leaf;
 };
 struct ps_namespace_window {
@@ -495,11 +498,68 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
   }
   return rc;
 }
-static int begin_reserve(ps_stream *stream, uint64_t minimum,
-                         ps_record_writer *writer, lc_error *e) {
+static int begin_reserve(ps_stream *stream, ps_budget *budget, uint64_t minimum,
+                         int exact, ps_record_writer *writer, lc_error *e) {
   int rc = ps_record_begin(stream, writer, e);
   if (rc == LC_OK)
-    rc = ps_record_reserve(writer, NULL, minimum ? minimum : 1, e);
+    rc = exact ? ps_stream_reserve_exact(writer->writer, budget,
+                                         minimum ? minimum : 1, e)
+               : ps_record_reserve(writer, budget, minimum ? minimum : 1, e);
+  return rc;
+}
+static int plan_append(struct ps_namespace_data *d, uint64_t selected,
+                       uint64_t minimum, enum ps_namespace_append_mode mode,
+                       ps_budget **budget, int *exact, lc_error *e) {
+  ps_budget_plan plan = {0}, exact_plan;
+  ps_stream_info info = {0};
+  segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
+  uint64_t start = selected == d->active ? d->tail : 0;
+  uint64_t bytes = minimum ? minimum : 1, need, preferred = PS_PAGE;
+  int rc = LC_OK;
+  *budget = NULL;
+  *exact = mode == PS_APPEND_MAINTENANCE;
+  if (s) {
+    rc = ps_stream_status(s->stream, &info, e);
+    preferred = info.preferred_grant_bytes;
+    if (rc == LC_OK && (info.tail != start || info.sealed))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "namespace append stream disagrees with head");
+  } else if (selected == d->active)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "namespace active append stream is missing");
+  if (rc != LC_OK)
+    return rc;
+  if (start > (uint64_t)INT64_MAX || bytes > (uint64_t)INT64_MAX - start ||
+      info.capacity < start)
+    return failure(e, LC_ERR_INVALID, "namespace append exceeds logical range");
+  need = bytes > info.capacity - start ? bytes - (info.capacity - start) : 0;
+  plan.maintenance = *exact;
+  if (selected != d->active)
+    rc = ps_budget_plan_routing(&plan, !d->active, e);
+  if (rc == LC_OK && !s)
+    rc = ps_budget_plan_stream(&plan, e);
+  if (rc == LC_OK && !s)
+    rc = ps_budget_plan_catalog(&plan, 28, e);
+  if (rc != LC_OK)
+    return rc;
+  exact_plan = plan;
+  rc = ps_budget_plan_span(&exact_plan, need, e);
+  if (rc != LC_OK)
+    return rc;
+  if (*exact)
+    plan = exact_plan;
+  else
+    rc = ps_budget_plan_preferred_span(&plan, need, preferred, e);
+  if (rc != LC_OK ||
+      (!plan.payload_bytes && !plan.metadata_bytes && !plan.entries))
+    return rc;
+  rc = ps_budget_open(d->ns->root->space, &plan, budget, e);
+  if (rc == LC_ERR_INVALID && !*exact &&
+      plan.payload_bytes > exact_plan.payload_bytes) {
+    lc_error_cleanup(e);
+    *exact = 1;
+    rc = ps_budget_open(d->ns->root->space, &exact_plan, budget, e);
+  }
   return rc;
 }
 int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
@@ -665,16 +725,22 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
   return rc;
 }
 int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
-                              uint64_t minimum, ps_namespace_append **out,
-                              lc_error *e) {
+                              uint64_t minimum,
+                              enum ps_namespace_append_mode mode,
+                              ps_namespace_append **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_append *append;
   uint64_t selected;
-  int rc;
+  int rc, exact = 0;
   if (out)
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
+  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_MAINTENANCE ||
+      (mode != PS_APPEND_PREFIX && !minimum))
+    return failure(
+        e, LC_ERR_INVALID,
+        "namespace complete append requires a positive span and valid mode");
   if (minimum > (uint64_t)INT64_MAX)
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
@@ -697,18 +763,27 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
         rc = failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
       else {
         ++selected;
-        rc = prepare(d, NULL, selected, e);
       }
     }
   }
+  if (rc == LC_OK)
+    rc = plan_append(d, selected, minimum, mode, &append->budget, &exact, e);
+  if (rc == LC_OK && selected != d->active)
+    rc = prepare(d, append->budget, selected, e);
   if (rc == LC_OK) {
     segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
-    rc = begin_reserve(s->stream, minimum, &append->writer, e);
+    rc = begin_reserve(s->stream, append->budget, minimum, exact,
+                       &append->writer, e);
     append->segment = s->id;
     append->leaf = s->leaf;
+    append->complete = mode != PS_APPEND_PREFIX;
+    append->expected = minimum;
+    if (rc == LC_OK && append->complete)
+      append->writer.limit = append->writer.start + minimum;
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
+    ps_budget_close(append->budget, NULL);
     ps_ns_leave(d);
     lc_free_with_allocator(NULL, append);
     return rc;
@@ -734,7 +809,7 @@ uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
 static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
   ps_namespace_append *append = context;
   (void)tail;
-  return ps_ns_head_write(append->data, NULL, append->segment,
+  return ps_ns_head_write(append->data, append->budget, append->segment,
                           append->data->snapshot_id,
                           append->data->snapshot_boundary, e);
 }
@@ -744,6 +819,9 @@ int ps_namespace_append_commit(ps_namespace_append *append, lc_error *e) {
   if (!append)
     return failure(e, LC_ERR_INVALID, "namespace append is not open");
   tail = append->writer.tail;
+  if (append->complete && tail - append->writer.start != append->expected)
+    return failure(e, LC_ERR_INVALID,
+                   "canonical append differs from its declared complete span");
   selecting = append->segment != append->data->active;
   rc = ps_record_commit(&append->writer, selecting ? publish_append_head : NULL,
                         append, e);
@@ -768,6 +846,7 @@ void ps_namespace_append_close(ps_namespace_append *append) {
   if (!append)
     return;
   ps_record_abort(&append->writer);
+  ps_budget_close(append->budget, NULL);
   ps_ns_leave(append->data);
   ps_namespace_release(append->ns);
   lc_free_with_allocator(NULL, append);

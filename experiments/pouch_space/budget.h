@@ -32,6 +32,10 @@ int ps_budget_plan_stream(ps_budget_plan *, lc_error *);
 int ps_budget_plan_catalog(ps_budget_plan *, size_t name_bytes, lc_error *);
 int ps_budget_plan_routing(ps_budget_plan *, int create, lc_error *);
 int ps_budget_plan_span(ps_budget_plan *, uint64_t bytes, lc_error *);
+/* Preferred geometric reservation may over-allocate its last grant. Account
+ * for that payload without inventing extra descriptor entries for the spare. */
+int ps_budget_plan_preferred_span(ps_budget_plan *, uint64_t bytes,
+                                  uint64_t preferred_grant, lc_error *);
 int ps_budget_open(ps_space *, const ps_budget_plan *, ps_budget **,
                    lc_error *);
 int ps_budget_status(ps_budget *, ps_budget_plan *, lc_error *);
