@@ -99,8 +99,11 @@ known span, possible successor/binding and head selection before staging, then
 hold the claim through production and publication. Complete metadata batches
 preserve the floor; complete delete-only batches may spend it. Unknown-size PUTs
 claim their header/key prefix and grow further through ordinary admission.
-Snapshot and parent compaction admission remain pending. A bounded-work policy
-must also cover accepted keys up to 1 MiB;
+Snapshot planning now measures both outputs before rotation or stream creation.
+One maintenance claim funds rotation, snapshot/body heads, grants, bindings and
+final head selection. The builder owns both outputs and closes them before
+releasing the claim. Checkpoint workspace funds seal and reclamation progress.
+A bounded-work policy must also cover accepted keys up to 1 MiB;
 the fixed 16 KiB floor alone cannot establish that guarantee.
 Tests cover 12,000 entries in 10 MiB, incremental
 checkpoint I/O, spanning descriptors, private-build allocation failures and
@@ -342,20 +345,27 @@ ID as owner and namespace ID as key, preventing a foreign namespace from
 adopting an otherwise valid snapshot binding. Canonical
 `snapshot-<20 decimal digits>.log` labels are catalog metadata, never files.
 
-Snapshot begin finishes any pending predecessor seal and rotates a nonempty
-active segment. It captures the selected snapshot plus sealed prefix, including
-an immutable empty window for the new active segment. An already empty active
-segment needs no extra rotation. A first snapshot requires a nonempty sealed
-prefix; a selected snapshot can be rewritten at the same covered boundary.
-One builder owns this capture; ordinary appends and other namespaces continue
-while its producer writes canonical records directly through bounded record I/O.
-The logical caller supplies a complete projection, high-water marks, tombstones
-and any required history or body references.
+Snapshot begin captures the selected snapshot plus current tail, then invokes a
+metadata-only planner before rotation, identity allocation or output creation.
+The planner declares exact metadata and optional body-pack sizes. One maintenance
+claim includes any required rotation, both output heads/grants/bindings and final
+routing replacement. Failed capacity admission leaves the topology unchanged.
+After admission, pending seals and abandoned bindings are cleaned up, a nonempty
+active segment rotates, and both outputs receive exact grants. An already empty
+active segment needs no extra rotation. A selected snapshot can be rewritten at
+the same covered boundary. Namespace mutation authority covers planning and
+preparation, then releases before copying. One builder owns the capture and its
+optional body pack; ordinary appends and other namespaces continue during output.
+The caller supplies logical completeness, high-water marks, tombstones and any
+required history or body references.
 
-Commit reacquires namespace mutation authority, checks the captured base,
-completes and seals the private stream, and publishes its typed catalog binding
-before selecting it in the namespace head. Head selection waits for durability
-under both root policies. Newer appended segments remain the replay tail.
+Commit checks both declared byte counts and failed-output flags before publishing
+either output. It reacquires namespace mutation authority and checks the captured
+base. The body pack publishes first, allowing its dependency barrier to stabilize
+deferred routing before predecessor-seal cleanup. Metadata publication then seals
+and binds the snapshot before head selection. All dependent allocations spend
+the same claim. Head selection waits for durability under both root policies.
+Newer appended segments remain the replay tail.
 There is no fallible reclamation after successful selection. Before a higher
 snapshot ID can be selected, any bindings left by earlier unpublished builds
 are durably removed. This ensures that a retained lower ID identifies a
@@ -388,8 +398,8 @@ No persistent sidecar or second payload log is introduced.
 These physical publication and reclamation capabilities now join the production
 ordinary-state harness through the forced pass below. It performs logical
 publication, projection invalidation and current-source reclamation. Automatic
-policy, history protection, retention scheduling and complete maintenance-capacity
-budgets remain required.
+policy, history protection, retention scheduling and standing capacity for all
+admitted maintenance work remain required.
 The fixed-capacity churn proof uses a caller-supplied complete one-key snapshot;
 it does not establish full-store maintenance admission.
 
@@ -402,6 +412,12 @@ The caller supplies resolved logical entries, selection/history policy, physical
 commit and durability. A raw namespace view alone does not resolve inherited
 per-key query generations; the logical producer must do that before writing.
 An absent explicit query sequence defaults to the entry's index sequence.
+`lc_pouch_state_record_measure_snapshot` sizes the same high-water, reference,
+inline encoded-body, placeholder or tombstone records using metadata only.
+Aggregate snapshot/body planning reuses it. It validates input and local offset
+bounds, clears the output size on failure and performs no body I/O. Tests compare
+its sizes with actual decoded boundaries across the existing transform and
+object/state matrix.
 
 With no encoded source, the writer emits a reference, metadata-only placeholder
 or tombstone without reading a body. With an encoded source, it copies exactly
@@ -461,9 +477,11 @@ generation. Captured canonical replay now agrees with the live projection.
 
 ## Forced ordinary-state maintenance
 
-`ps_pouch_state_compact` now captures a prefix, measures its canonical metadata
-snapshot and one selected source's body frames without body I/O, reserves those
-known spans, and copies outside logical namespace authority. Its forced victim
+`ps_pouch_state_compact` now captures a prefix and measures its canonical metadata
+snapshot and one selected source's body frames without body I/O, before rotation
+or output creation. The snapshot planner admits the complete known publication
+dependency set through one claim, then copying runs outside logical namespace
+authority. Its forced victim
 score is source capacity minus current live encoded-body bytes. Complete
 metadata remains in each snapshot; untouched bodies retain their existing
 references. The initial capture is released before the publication-time capture
@@ -480,9 +498,16 @@ set without an external compatibility/version commitment.
 Exact sealed-build reservation retains full geometric grants and clips the last
 grant to the page-rounded remaining span. It advances neither canonical cursor
 nor published tail; completed body/snapshot tails must equal measured sizes.
-This reserves output payload grants only. It does not yet admit the complete
-rotation/catalog/head/checkpoint dependency set or protect that budget from
-concurrent foreground writers.
+The joint claim protects payload and positive descriptor/entry growth through
+body binding, metadata binding and final head selection. Both outputs reject
+oversized vectored writes before any part is written. An incomplete or failed
+producer is rejected before either binding publishes. A later allocation or I/O
+failure can still leave bound, unselected output for recovery or reclamation.
+Reclamation and checkpoint use the separately protected metadata pool.
+Admission guarantees the declared capacity after it is granted; it does not
+guarantee that every compaction fits when the store is
+already full. The fixed 16 KiB floor still needs a standing-work policy covering
+all admitted key sizes and required maintenance progress.
 
 The pass durably binds its body pack before selecting its metadata snapshot.
 Under the same logical namespace authority, it then captures the latest snapshot

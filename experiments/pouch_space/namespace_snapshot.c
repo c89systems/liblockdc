@@ -2,6 +2,15 @@
 #include "namespace_internal.h"
 #include <string.h>
 static int failure(lc_error *, const char *);
+static int plan_output(ps_budget_plan *plan, size_t name_bytes, uint64_t bytes,
+                       lc_error *e) {
+  int rc = ps_budget_plan_stream(plan, e);
+  if (rc == LC_OK)
+    rc = ps_budget_plan_catalog(plan, name_bytes, e);
+  if (rc == LC_OK)
+    rc = ps_budget_plan_span(plan, bytes, e);
+  return rc;
+}
 
 struct ps_namespace_body {
   ps_namespace *ns;
@@ -10,10 +19,10 @@ struct ps_namespace_body {
   ps_record_writer writer;
   ps_budget *budget;
   uint64_t bytes;
-  int attempted;
+  int attempted, owns_budget;
 };
-int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
-                            ps_namespace_body **out, lc_error *e) {
+static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
+                      ps_namespace_body **out, lc_error *e) {
   ps_namespace_body *b;
   ps_budget_plan plan = {0};
   struct ps_namespace_data *d;
@@ -21,8 +30,8 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
   int rc;
   if (out)
     *out = NULL;
-  if (!out)
-    return failure(e, "namespace body build requires output");
+  if (!out || !bytes)
+    return failure(e, "namespace body build requires output and positive span");
   rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
@@ -33,8 +42,16 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
   b->ns = ns;
   b->data = d;
   b->bytes = bytes;
+  b->budget = budget;
+  b->owns_budget = !budget;
   ps_namespace_retain(ns);
-  rc = ps_catalog_allocate_id(ns->root->space, &id, e);
+  if (!budget) {
+    rc = plan_output(&plan, 29, bytes, e);
+    if (rc == LC_OK)
+      rc = ps_budget_open(ns->root->space, &plan, &b->budget, e);
+  }
+  if (rc == LC_OK)
+    rc = ps_catalog_allocate_id(ns->root->space, &id, e);
   if (rc == LC_OK) {
     b->resource = ps_ns_resource_new(PS_CATALOG_BODY, id, e);
     if (!b->resource)
@@ -42,13 +59,6 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
   }
   if (rc == LC_OK) {
     ps_ns_resource *r = b->resource;
-    rc = ps_budget_plan_stream(&plan, e);
-    if (rc == LC_OK)
-      rc = ps_budget_plan_catalog(&plan, strlen(r->leaf), e);
-    if (rc == LC_OK)
-      rc = ps_budget_plan_span(&plan, bytes, e);
-    if (rc == LC_OK)
-      rc = ps_budget_open(ns->root->space, &plan, &b->budget, e);
     r->binding.stream.owner = id;
     r->binding.stream.key = ns->identity.owner;
     r->binding.stream.kind = PS_STREAM;
@@ -59,6 +69,8 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
       rc = ps_record_begin(r->stream, &b->writer, e);
     if (rc == LC_OK)
       rc = ps_stream_reserve_exact(b->writer.writer, b->budget, bytes, e);
+    if (rc == LC_OK)
+      b->writer.limit = bytes;
   }
   if (rc == LC_OK)
     *out = b;
@@ -66,21 +78,22 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
     ps_namespace_body_close(b);
   return rc;
 }
+int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
+                            ps_namespace_body **out, lc_error *e) {
+  return body_begin(ns, NULL, bytes, out, e);
+}
 lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *b) {
   return ps_record_output(b ? &b->writer : NULL);
 }
 const char *ps_namespace_body_leaf(const ps_namespace_body *b) {
   return b && b->resource ? b->resource->leaf : NULL;
 }
-int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
+static int body_commit_locked(ps_namespace_body *b, lc_error *e) {
   ps_stream_info info;
   ps_ns_resource *r;
   int rc;
   if (!b || b->attempted || !b->writer.writer || b->writer.tail != b->bytes)
     return failure(e, "body build is closed or differs from its measured size");
-  rc = ps_ns_enter(b->data, e);
-  if (rc != LC_OK)
-    return rc;
   b->attempted = 1;
   r = b->resource;
   rc = ps_record_commit(&b->writer, NULL, NULL, e);
@@ -102,7 +115,17 @@ int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
     ps_ns_insert(b->data, r);
     pthread_mutex_unlock(&b->data->mutex);
   }
-  ps_ns_leave(b->data);
+  return rc;
+}
+int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
+  int rc;
+  if (!b)
+    return failure(e, "namespace body build is not open");
+  rc = ps_ns_enter(b->data, e);
+  if (rc == LC_OK) {
+    rc = body_commit_locked(b, e);
+    ps_ns_leave(b->data);
+  }
   return rc;
 }
 void ps_namespace_body_close(ps_namespace_body *b) {
@@ -114,7 +137,8 @@ void ps_namespace_body_close(ps_namespace_body *b) {
       ps_stream_retire(b->resource->stream, NULL);
     ps_ns_resource_free(b->resource);
   }
-  ps_budget_close(b->budget, NULL);
+  if (b->owns_budget)
+    ps_budget_close(b->budget, NULL);
   ps_namespace_release(b->ns);
   lc_free_with_allocator(NULL, b);
 }
@@ -124,7 +148,9 @@ struct ps_namespace_snapshot {
   ps_ns_resource *resource;
   ps_namespace_view *view;
   ps_record_writer writer;
-  uint64_t base, boundary;
+  ps_budget *budget;
+  ps_namespace_body *body;
+  uint64_t base, boundary, bytes;
   int building, attempted;
 };
 static int failure(lc_error *e, const char *message) {
@@ -228,17 +254,21 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
   ps_ns_leave(d);
   return rc;
 }
-int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
+int ps_namespace_snapshot_begin(ps_namespace *ns,
+                                ps_namespace_snapshot_plan_fn planner,
+                                void *context, ps_namespace_snapshot **out,
                                 lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_snapshot *b;
+  ps_namespace_snapshot_plan spans = {0};
+  ps_budget_plan plan = {0};
   uint64_t id, closed, pending;
   size_t i;
   int rc;
   if (out)
     *out = NULL;
-  if (!out)
-    return failure(e, "namespace snapshot requires output");
+  if (!out || !planner)
+    return failure(e, "namespace snapshot requires output and planner");
   rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
@@ -257,6 +287,31 @@ int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
     else
       b->building = d->snapshot_building = 1;
     pthread_mutex_unlock(&d->mutex);
+    if (rc == LC_OK && !d->active)
+      rc = failure(e, "namespace has no snapshot prefix");
+    if (rc == LC_OK) {
+      b->base = d->snapshot_id;
+      b->boundary = d->active - (d->tail ? 0 : 1);
+      if (!b->base && b->boundary <= d->snapshot_boundary)
+        rc = failure(e, "namespace snapshot prefix has not advanced");
+    }
+    if (rc == LC_OK)
+      rc = ps_namespace_view_open(ns, &b->view, e);
+    if (rc == LC_OK)
+      rc = planner(context, b->view, b->boundary, &spans, e);
+    if (rc == LC_OK && !spans.metadata_bytes)
+      rc = failure(e, "namespace snapshot requires a positive metadata span");
+    plan.maintenance = 1;
+    if (rc == LC_OK && d->tail)
+      rc = ps_ns_rotation_plan(d, &plan, e);
+    if (rc == LC_OK)
+      rc = ps_budget_plan_routing(&plan, 0, e);
+    if (rc == LC_OK)
+      rc = plan_output(&plan, 33, spans.metadata_bytes, e);
+    if (rc == LC_OK && spans.body_bytes)
+      rc = plan_output(&plan, 29, spans.body_bytes, e);
+    if (rc == LC_OK)
+      rc = ps_budget_open(ns->root->space, &plan, &b->budget, e);
     if (rc == LC_OK)
       rc = ps_ns_finish_seal(d, e);
     /* IDs are globally monotonic. Before selecting a higher ID remove every
@@ -271,17 +326,8 @@ int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
     }
     if (rc == LC_OK)
       rc = reap(d, &closed, &pending, e);
-    if (rc == LC_OK && !d->active)
-      rc = failure(e, "namespace has no snapshot prefix");
     if (rc == LC_OK && d->tail)
-      rc = ps_ns_rotate(d, e);
-    if (rc == LC_OK && !d->snapshot_id && d->active - 1 <= d->snapshot_boundary)
-      rc = failure(e, "namespace snapshot prefix has not advanced");
-    if (rc == LC_OK) {
-      b->base = d->snapshot_id;
-      b->boundary = d->active - 1;
-      rc = ps_namespace_view_open(ns, &b->view, e);
-    }
+      rc = ps_ns_rotate(d, b->budget, e);
     if (rc == LC_OK)
       rc = ps_catalog_allocate_id(ns->root->space, &id, e);
     if (rc == LC_OK) {
@@ -295,11 +341,18 @@ int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
       r->binding.stream.owner = id;
       r->binding.stream.key = ns->identity.owner;
       r->binding.stream.kind = PS_STREAM;
-      rc = ps_stream_open(ns->root->space, NULL, r->binding.stream, 1, NULL,
-                          NULL, NULL, &r->stream, e);
+      rc = ps_stream_open(ns->root->space, b->budget, r->binding.stream, 1,
+                          NULL, NULL, NULL, &r->stream, e);
       if (rc == LC_OK)
         rc = ps_record_begin(r->stream, &b->writer, e);
+      if (rc == LC_OK)
+        rc = ps_stream_reserve_exact(b->writer.writer, b->budget,
+                                     spans.metadata_bytes, e);
+      if (rc == LC_OK)
+        b->writer.limit = b->bytes = spans.metadata_bytes;
     }
+    if (rc == LC_OK && spans.body_bytes)
+      rc = body_begin(ns, b->budget, spans.body_bytes, &b->body, e);
     ps_ns_leave(d);
   }
   if (rc == LC_OK)
@@ -320,19 +373,22 @@ const char *ps_namespace_snapshot_leaf(const ps_namespace_snapshot *b) {
 uint64_t ps_namespace_snapshot_boundary(const ps_namespace_snapshot *b) {
   return b ? b->boundary : 0;
 }
-int ps_namespace_snapshot_reserve(ps_namespace_snapshot *b, uint64_t bytes,
-                                  lc_error *e) {
-  if (!b || b->attempted || !b->writer.writer)
-    return failure(e, "namespace snapshot is not open");
-  return ps_stream_reserve_exact(b->writer.writer, NULL, bytes, e);
+lc_pouch_record_io ps_namespace_snapshot_body_output(ps_namespace_snapshot *b) {
+  return ps_namespace_body_output(b ? b->body : NULL);
+}
+const char *ps_namespace_snapshot_body_leaf(const ps_namespace_snapshot *b) {
+  return ps_namespace_body_leaf(b ? b->body : NULL);
 }
 int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
   struct ps_namespace_data *d;
   ps_ns_resource *r;
   ps_stream_info info;
   int rc;
-  if (!b || b->attempted || !b->writer.writer)
-    return failure(e, "namespace snapshot is not open");
+  if (!b || b->attempted || !b->writer.writer || b->writer.tail != b->bytes ||
+      b->writer.failed ||
+      (b->body && (!b->body->writer.writer || b->body->writer.failed ||
+                   b->body->writer.tail != b->body->bytes)))
+    return failure(e, "namespace snapshot is closed or differs from its plan");
   d = b->data;
   r = b->resource;
   rc = ps_check(b->ns->root->space, e);
@@ -343,6 +399,10 @@ int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
   b->attempted = 1;
   if (d->snapshot_id != b->base || d->active <= b->boundary)
     rc = failure(e, "namespace snapshot base is stale");
+  if (rc == LC_OK && b->body)
+    rc = body_commit_locked(b->body, e);
+  /* Its dependency barrier can also stabilize deferred routing. Preserve that
+   * sharing before sealing a predecessor left by a concurrent appender. */
   if (rc == LC_OK)
     rc = ps_ns_finish_seal(d, e);
   if (rc == LC_OK)
@@ -357,14 +417,14 @@ int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
     pthread_mutex_unlock(&d->mutex);
   }
   if (rc == LC_OK)
-    rc = ps_catalog_put(b->ns->root->space, NULL, b->ns->identity.owner,
+    rc = ps_catalog_put(b->ns->root->space, b->budget, b->ns->identity.owner,
                         PS_CATALOG_SNAPSHOT, r->leaf, strlen(r->leaf), NULL,
                         r->binding.stream, &info.ref, &r->binding, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
     ps_ns_insert(d, r);
     pthread_mutex_unlock(&d->mutex);
-    rc = ps_ns_head_write(d, NULL, d->active, r->id, b->boundary, e);
+    rc = ps_ns_head_write(d, b->budget, d->active, r->id, b->boundary, e);
   }
   if (rc == LC_OK)
     rc = ps_flush(b->ns->root->space, e);
@@ -388,6 +448,8 @@ void ps_namespace_snapshot_close(ps_namespace_snapshot *b) {
       ps_stream_retire(b->resource->stream, NULL);
     ps_ns_resource_free(b->resource);
   }
+  ps_namespace_body_close(b->body);
+  ps_budget_close(b->budget, NULL);
   if (b->building) {
     pthread_mutex_lock(&b->data->mutex);
     b->data->snapshot_building = 0;

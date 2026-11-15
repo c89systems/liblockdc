@@ -562,11 +562,11 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
   }
   return rc;
 }
-int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
-  ps_budget_plan plan = {0};
-  ps_budget *budget = NULL;
+int ps_ns_rotation_plan(struct ps_namespace_data *d, ps_budget_plan *out,
+                        lc_error *e) {
+  ps_budget_plan plan = *out;
   uint64_t next;
-  int rc, closed;
+  int rc;
   if (d->active == UINT64_MAX)
     return failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
   next = d->active + 1;
@@ -574,7 +574,6 @@ int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
    * one stream head and its fixed 28-byte canonical segment label. Existing
    * staged successors need neither. Seal and journal rollover are covered by
    * the checkpoint pool, independently of this payload claim. */
-  plan.maintenance = 1;
   rc = ps_budget_plan_routing(&plan, !d->active, e);
   if (rc == LC_OK && !ps_ns_find(d, PS_CATALOG_SEGMENT, next)) {
     rc = ps_budget_plan_stream(&plan, e);
@@ -582,7 +581,21 @@ int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
       rc = ps_budget_plan_catalog(&plan, 28, e);
   }
   if (rc == LC_OK)
-    rc = ps_budget_open(d->ns->root->space, &plan, &budget, e);
+    *out = plan;
+  return rc;
+}
+int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
+  ps_budget_plan plan = {0};
+  ps_budget *owned = NULL;
+  uint64_t next;
+  int rc, closed;
+  plan.maintenance = 1;
+  rc = ps_ns_rotation_plan(d, &plan, e);
+  if (rc == LC_OK && !budget) {
+    rc = ps_budget_open(d->ns->root->space, &plan, &owned, e);
+    budget = owned;
+  }
+  next = d->active + 1;
   if (rc == LC_OK)
     rc = prepare(d, budget, next, e);
   if (rc == LC_OK)
@@ -599,7 +612,7 @@ int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
     pthread_mutex_unlock(&d->mutex);
     rc = ps_ns_finish_seal(d, e);
   }
-  closed = ps_budget_close(budget, rc == LC_OK ? e : NULL);
+  closed = ps_budget_close(owned, rc == LC_OK ? e : NULL);
   if (rc == LC_OK)
     rc = closed;
   return rc;
@@ -862,7 +875,7 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   if (d->active == expected) {
     rc = ps_ns_finish_seal(d, e);
     if (rc == LC_OK)
-      rc = ps_ns_rotate(d, e);
+      rc = ps_ns_rotate(d, NULL, e);
   } else if (expected != UINT64_MAX && d->active == expected + 1) {
     rc = ps_ns_finish_seal(d, e);
   } else {

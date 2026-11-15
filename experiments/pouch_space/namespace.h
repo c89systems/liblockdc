@@ -96,24 +96,33 @@ typedef int (*ps_namespace_record_fn)(void *, uint64_t segment,
 int ps_namespace_view_visit(ps_namespace_view *, int verify_payload,
                             ps_namespace_record_fn, void *, lc_error *);
 void ps_namespace_view_close(ps_namespace_view *);
-/* Capture the selected snapshot and its sealed log prefix, rotating a nonempty
- * active segment first. Only one builder per namespace; ordinary appends may
- * proceed while the caller writes complete canonical snapshot records. The
- * caller owns logical completeness, high-water marks and reference protection.
- * A selected snapshot can be rewritten without advancing the covered prefix;
- * a namespace without a snapshot still needs a nonempty sealed prefix.
- * The view is borrowed until close. */
-int ps_namespace_snapshot_begin(ps_namespace *, ps_namespace_snapshot **,
-                                lc_error *);
+typedef struct ps_namespace_snapshot_plan {
+  uint64_t metadata_bytes, body_bytes;
+} ps_namespace_snapshot_plan;
+typedef int (*ps_namespace_snapshot_plan_fn)(void *, ps_namespace_view *,
+                                             uint64_t boundary,
+                                             ps_namespace_snapshot_plan *,
+                                             lc_error *);
+/* Capture the current prefix and invoke the metadata-only planner before any
+ * rotation or output creation. Namespace mutation authority covers planning
+ * and preparation, never the subsequent producer. The plan declares exact
+ * metadata and optional body-pack sizes. One maintenance claim funds rotation,
+ * both outputs and final head selection; failed admission stages nothing.
+ * Only one builder per namespace; ordinary appends may proceed during output.
+ * The caller owns logical completeness, high-water marks and reference
+ * protection. A selected snapshot can be rewritten without advancing the
+ * covered prefix; a namespace without a snapshot still needs a nonempty sealed
+ * prefix. The view is borrowed until close. */
+int ps_namespace_snapshot_begin(ps_namespace *, ps_namespace_snapshot_plan_fn,
+                                void *, ps_namespace_snapshot **, lc_error *);
 ps_namespace_view *ps_namespace_snapshot_view(ps_namespace_snapshot *);
 lc_pouch_record_io ps_namespace_snapshot_output(ps_namespace_snapshot *);
 const char *ps_namespace_snapshot_leaf(const ps_namespace_snapshot *);
 uint64_t ps_namespace_snapshot_boundary(const ps_namespace_snapshot *);
-/* Reserve the complete known canonical span before copying. This protects
- * snapshot payload grants, not the remaining rotation/catalog/head budget.
- * Close the builder after failure; no canonical bytes are consumed here. */
-int ps_namespace_snapshot_reserve(ps_namespace_snapshot *, uint64_t,
-                                  lc_error *);
+/* Borrowed output of the optional body pack, owned by the snapshot builder.
+ * Commit stabilizes and binds it before selecting the metadata snapshot. */
+lc_pouch_record_io ps_namespace_snapshot_body_output(ps_namespace_snapshot *);
+const char *ps_namespace_snapshot_body_leaf(const ps_namespace_snapshot *);
 /* Sealed relocation packs contain canonical encoded body records, not a replay
  * prefix. Their bindings are durable before a metadata snapshot can refer to
  * them. Unreferenced packs require logical reclamation after interrupted work.

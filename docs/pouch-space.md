@@ -47,9 +47,13 @@ checkpoints and private writer I/O. Canonical grants can now spend explicit
 claims, and known-size body packs reserve their head, grants and final catalog
 binding before stream creation. Namespace append admission now funds its declared
 dependencies through publication, retaining geometric allocation with an exact
-fallback near capacity. Snapshot builders and the full compaction sequence still
-need complete-operation admission; the fixed maintenance floor does not yet cover
-every admitted key size.
+fallback near capacity. Snapshot builders now measure metadata and body output
+before topology changes and admit their complete publication dependency set
+through one maintenance claim. That claim covers rotation, both streams and
+bindings, and final head selection. Producers copy outside namespace mutation
+authority. The fixed maintenance floor still needs a policy covering all admitted
+key sizes and maintenance progress; successful admission is not a guarantee that
+every compaction can start at full capacity.
 State read-many, metadata visits and paged scan/body snapshots now use captured
 container read pins, with lazy bounded decoding and no body cache. Captured
 body access survives callback mutation and Pouch close. Remaining public Pouch
@@ -62,8 +66,8 @@ The private harness now performs forced ordinary-state compaction: it relocates
 one source into a sealed body pack, publishes a metadata-only snapshot, and
 rechecks current tail references before reclamation. Unrelated live bodies need
 not be copied for each new metadata snapshot. Stored-body CRCs are checked as
-encoded sources are consumed. Automatic policy, history protection and complete
-maintenance admission remain required; normal public open behavior has not
+encoded sources are consumed. Automatic policy, history protection and standing
+maintenance capacity remain required; normal public open behavior has not
 changed. The experiment records matched compaction measurements and the new
 body-read cost alongside its earlier performance results.
 

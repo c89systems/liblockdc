@@ -1419,9 +1419,9 @@ static void publication(const char *path) {
       lc_error_cleanup(&e);
     }
 }
-static int snapshot_record_gated(ps_root *root, ps_namespace_snapshot *snapshot,
-                                 size_t version, size_t bytes, gate *g,
-                                 lc_error *e) {
+static int snapshot_record_to(ps_root *root, lc_pouch_record_io output,
+                              const char *leaf, size_t version, size_t bytes,
+                              gate *g, lc_error *e) {
   lc_pouch_state_entry request = {0}, result = {0};
   input source = {0};
   source.pub.impl = &source;
@@ -1433,12 +1433,78 @@ static int snapshot_record_gated(ps_root *root, ps_namespace_snapshot *snapshot,
   request.payload_context = "namespace-test";
   request.version = request.index_seq = version;
   request.record_type = 1;
-  int rc = lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
-                                        ps_namespace_snapshot_output(snapshot),
-                                        ps_namespace_snapshot_leaf(snapshot),
-                                        &request, &source.pub, 0, &result, e);
+  int rc =
+      lc_pouch_state_record_append(&allocator, ps_root_crypto(root), output,
+                                   leaf, &request, &source.pub, 0, &result, e);
   lc_pouch_state_entry_cleanup(&allocator, &result);
   return rc;
+}
+static int count_snapshot_append(void *context, const struct iovec *parts,
+                                 int count, lc_error *e) {
+  uint64_t *tail = context;
+  (void)e;
+  for (int i = 0; i < count; ++i) {
+    REQUIRE(parts[i].iov_len <= UINT64_MAX - *tail);
+    *tail += parts[i].iov_len;
+  }
+  return LC_OK;
+}
+static int count_snapshot_patch(void *context, uint64_t offset,
+                                const struct iovec *parts, int count,
+                                lc_error *e) {
+  uint64_t tail = *(uint64_t *)context;
+  (void)e;
+  REQUIRE(offset <= tail);
+  for (int i = 0; i < count; ++i) {
+    REQUIRE(parts[i].iov_len <= tail - offset);
+    offset += parts[i].iov_len;
+  }
+  return LC_OK;
+}
+static int count_snapshot_tail(void *context, uint64_t *tail, lc_error *e) {
+  (void)e;
+  *tail = *(uint64_t *)context;
+  return LC_OK;
+}
+static void count_snapshot_discard(void *context, uint64_t start) {
+  *(uint64_t *)context = start;
+}
+typedef struct snapshot_record_plan {
+  ps_root *root;
+  size_t version, bytes;
+} snapshot_record_plan;
+static int plan_snapshot_record(void *context, ps_namespace_view *view,
+                                uint64_t boundary,
+                                ps_namespace_snapshot_plan *plan, lc_error *e) {
+  static const lc_pouch_record_io_ops ops = {
+      NULL, count_snapshot_append, count_snapshot_patch, count_snapshot_tail,
+      count_snapshot_discard};
+  snapshot_record_plan *p = context;
+  uint64_t bytes = 0;
+  lc_pouch_record_io output = {&ops, &bytes};
+  (void)view;
+  (void)boundary;
+  /* Dry-run only the deterministic test producer into a counting sink. No
+   * output is retained; production planning measures resolved metadata. */
+  int rc =
+      snapshot_record_to(p->root, output, "snapshot-00000000000000000001.log",
+                         p->version, p->bytes, NULL, e);
+  if (rc == LC_OK)
+    plan->metadata_bytes = bytes;
+  return rc;
+}
+static int snapshot_begin_record(ps_root *root, ps_namespace *ns,
+                                 size_t version, size_t bytes,
+                                 ps_namespace_snapshot **out, lc_error *e) {
+  snapshot_record_plan plan = {root, version, bytes};
+  return ps_namespace_snapshot_begin(ns, plan_snapshot_record, &plan, out, e);
+}
+static int snapshot_record_gated(ps_root *root, ps_namespace_snapshot *snapshot,
+                                 size_t version, size_t bytes, gate *g,
+                                 lc_error *e) {
+  return snapshot_record_to(root, ps_namespace_snapshot_output(snapshot),
+                            ps_namespace_snapshot_leaf(snapshot), version,
+                            bytes, g, e);
 }
 static int snapshot_record(ps_root *root, ps_namespace_snapshot *snapshot,
                            size_t version, size_t bytes, lc_error *e) {
@@ -1472,7 +1538,7 @@ static void snapshot_concurrency(const char *path) {
     ps_namespace *peer = acquire(root, "peer", 1, &e);
     ok(append(root, ns, 1, 0, sizeof(body), &e), &e);
     ps_namespace_snapshot *b = NULL;
-    ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+    ok(snapshot_begin_record(root, ns, 1, sizeof(body), &b, &e), &e);
     gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
     snapshot_job job = {root, b, &g};
     pthread_t thread;
@@ -1544,7 +1610,9 @@ static void snapshots(const char *path, const char *key) {
       ok(ps_root_open(path, 1, &options, &root, &e), &e);
       ps_namespace *ns = acquire(root, "test", 1, &e);
       ps_namespace_snapshot *b = NULL, *rejected = NULL;
-      REQUIRE(ps_namespace_snapshot_begin(ns, &b, &e) == LC_ERR_INVALID && !b);
+      REQUIRE(snapshot_begin_record(root, ns, 1, 31, &b, &e) ==
+                  LC_ERR_INVALID &&
+              !b);
       clear(&e);
       lc_pouch_state_entry record = {0};
       ok(put(root, ns, 1, 0, 31, NULL, NULL, &record, &e), &e);
@@ -1562,14 +1630,14 @@ static void snapshots(const char *path, const char *key) {
          &e);
       ps_namespace_view *old = NULL;
       ok(ps_namespace_view_open(ns, &old, &e), &e);
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(snapshot_begin_record(root, ns, 1, 31, &b, &e), &e);
       REQUIRE(ps_namespace_snapshot_boundary(b) == 1);
       records prefix = {0};
       ok(ps_namespace_view_visit(ps_namespace_snapshot_view(b), 1, visit,
                                  &prefix, &e),
          &e);
       REQUIRE(prefix.count == 1 && prefix.version == 1);
-      REQUIRE(ps_namespace_snapshot_begin(ns, &rejected, &e) ==
+      REQUIRE(snapshot_begin_record(root, ns, 1, 31, &rejected, &e) ==
                   LC_ERR_INVALID &&
               !rejected);
       clear(&e);
@@ -1679,7 +1747,7 @@ static void snapshots(const char *path, const char *key) {
                                  &part, 1, &e),
          &e);
       ok(append(root, ns, 4, 1, 29, &e), &e);
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(snapshot_begin_record(root, ns, 4, 29, &b, &e), &e);
       REQUIRE(ps_namespace_snapshot_boundary(b) == 4);
       ok(snapshot_record(root, b, 4, 29, &e), &e);
       ok(ps_namespace_snapshot_commit(b, &e), &e);
@@ -1764,7 +1832,7 @@ static void snapshot_churn(const char *path) {
       body[1] = (unsigned char)(version >> 8);
       ok(append(root, ns, version, 0, sizeof(body), &e), &e);
       ps_namespace_snapshot *b = NULL;
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(snapshot_begin_record(root, ns, version, sizeof(body), &b, &e), &e);
       uint64_t covered = ps_namespace_snapshot_boundary(b);
       ok(snapshot_record(root, b, version, sizeof(body), &e), &e);
       ok(ps_namespace_snapshot_commit(b, &e), &e);
@@ -1832,7 +1900,7 @@ static void snapshot_fault_cases(const char *path, int previous) {
           ok(append(root, ns, 1, 0, 31, &e), &e);
           ps_namespace_snapshot *b = NULL;
           if (previous) {
-            ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+            ok(snapshot_begin_record(root, ns, 1, 31, &b, &e), &e);
             ok(snapshot_record(root, b, 1, 31, &e), &e);
             ok(ps_namespace_snapshot_commit(b, &e), &e);
             ps_namespace_snapshot_close(b);
@@ -1841,7 +1909,7 @@ static void snapshot_fault_cases(const char *path, int previous) {
           }
           ok(ps_checkpoint(ps_root_space(root), &e), &e);
           if (phase && phase < 4) {
-            ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+            ok(snapshot_begin_record(root, ns, latest, 31, &b, &e), &e);
             if (phase >= 2)
               ok(snapshot_record(root, b, latest, 31, &e), &e);
             if (phase == 3) {
@@ -1873,7 +1941,7 @@ static void snapshot_fault_cases(const char *path, int previous) {
           uint64_t reclaimed, skipped;
           size_t reads = m.reads;
           int rc =
-              phase == 0   ? ps_namespace_snapshot_begin(ns, &b, &e)
+              phase == 0   ? snapshot_begin_record(root, ns, latest, 31, &b, &e)
               : phase == 1 ? snapshot_record(root, b, latest, 31, &e)
               : phase == 2 ? ps_namespace_snapshot_commit(b, &e)
               : phase == 3
@@ -1907,7 +1975,7 @@ static void snapshot_fault_cases(const char *path, int previous) {
                               (status.snapshot_boundary == latest ? 1U : 0U);
           /* A fresh higher ID must never make a failed staged snapshot live. */
           ok(append(root, ns, latest + 1, 1, 17, &e), &e);
-          ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+          ok(snapshot_begin_record(root, ns, latest + 1, 17, &b, &e), &e);
           ok(snapshot_record(root, b, latest + 1, 17, &e), &e);
           ok(ps_namespace_snapshot_commit(b, &e), &e);
           ps_namespace_snapshot_close(b);
@@ -2134,6 +2202,393 @@ static void body_budget_faults(const char *path) {
       printf("body budget failure cuts (durable=%d %s): %lu\n", durable,
              kind ? "allocation" : "write/sync", (unsigned long)operations);
     }
+  free(m.live);
+  free(m.stable);
+  lc_error_cleanup(&e);
+}
+typedef struct joint_snapshot_plan {
+  snapshot_record_plan record;
+  uint64_t body_bytes;
+} joint_snapshot_plan;
+static int plan_joint_snapshot(void *context, ps_namespace_view *view,
+                               uint64_t boundary,
+                               ps_namespace_snapshot_plan *plan, lc_error *e) {
+  joint_snapshot_plan *p = context;
+  int rc = plan_snapshot_record(&p->record, view, boundary, plan, e);
+  if (rc == LC_OK)
+    plan->body_bytes = p->body_bytes;
+  return rc;
+}
+static int joint_snapshot_begin(ps_root *root, ps_namespace *ns, size_t version,
+                                uint64_t body_bytes,
+                                ps_namespace_snapshot **out, lc_error *e) {
+  joint_snapshot_plan plan = {{root, version, 31}, body_bytes};
+  return ps_namespace_snapshot_begin(ns, plan_joint_snapshot, &plan, out, e);
+}
+static int fixed_snapshot_plan(void *context, ps_namespace_view *view,
+                               uint64_t boundary,
+                               ps_namespace_snapshot_plan *plan, lc_error *e) {
+  (void)view;
+  (void)boundary;
+  (void)e;
+  *plan = *(ps_namespace_snapshot_plan *)context;
+  return LC_OK;
+}
+static void snapshot_budget_limits(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    lc_error e;
+    lc_error_init(&e);
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "snapshot-limits", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    ps_namespace_snapshot *b = NULL;
+    ps_namespace_body *invalid_body = NULL;
+    ps_namespace_snapshot_plan plan = {0};
+    ps_stats before, after;
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(ps_namespace_snapshot_begin(ns, fixed_snapshot_plan, &plan, &b,
+                                        &e) == LC_ERR_INVALID &&
+            !b);
+    clear(&e);
+    plan.metadata_bytes = (uint64_t)INT64_MAX + 1;
+    REQUIRE(ps_namespace_snapshot_begin(ns, fixed_snapshot_plan, &plan, &b,
+                                        &e) == LC_ERR_INVALID &&
+            !b);
+    clear(&e);
+    REQUIRE(ps_namespace_body_begin(ns, 0, &invalid_body, &e) ==
+                LC_ERR_INVALID &&
+            !invalid_body);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(before.entries == after.entries &&
+            before.journal_bytes == after.journal_bytes && !after.budgets);
+    plan.metadata_bytes = 4;
+    plan.body_bytes = 3;
+    for (int which = 0; which < 2; ++which)
+      for (int filled = 0; filled < 2; ++filled) {
+        ok(ps_namespace_snapshot_begin(ns, fixed_snapshot_plan, &plan, &b, &e),
+           &e);
+        lc_pouch_record_io output = which ? ps_namespace_snapshot_body_output(b)
+                                          : ps_namespace_snapshot_output(b);
+        uint64_t start, tail;
+        ok(lc_pouch_record_io_tail(output, &start, &e), &e);
+        size_t size = which ? 3 : 4;
+        if (filled) {
+          struct iovec whole = {(void *)"abcd", size};
+          ok(lc_pouch_record_io_append(output, &whole, 1, &e), &e);
+        }
+        struct iovec excess[2] = {{(void *)"abcd", size}, {(void *)"x", 1}};
+        REQUIRE(lc_pouch_record_io_append(output, excess, filled ? 1 : 2, &e) ==
+                LC_ERR_INVALID);
+        clear(&e);
+        ok(lc_pouch_record_io_tail(output, &tail, &e), &e);
+        REQUIRE(tail == start + (filled ? size : 0));
+        if (filled) {
+          /* Both tails must match, so failure cannot merely be underfill of
+           * the other output. Neither body nor snapshot may be published. */
+          lc_pouch_record_io other = which
+                                         ? ps_namespace_snapshot_output(b)
+                                         : ps_namespace_snapshot_body_output(b);
+          struct iovec complete = {(void *)"abcd", which ? 4 : 3};
+          ok(lc_pouch_record_io_append(other, &complete, 1, &e), &e);
+        }
+        REQUIRE(ps_namespace_snapshot_commit(b, &e) == LC_ERR_INVALID);
+        clear(&e);
+        ps_namespace_snapshot_close(b);
+        count(ns, 1, &e);
+        ps_namespace_status status;
+        ok(ps_namespace_status_get(ns, &status, &e), &e);
+        REQUIRE(!status.snapshot && !status.bound_bodies);
+      }
+    ok(joint_snapshot_begin(root, ns, 1, 3, &b, &e), &e);
+    ok(snapshot_record(root, b, 1, 31, &e), &e);
+    struct iovec first = {(void *)"ab", 2}, last = {(void *)"c", 1};
+    ok(lc_pouch_record_io_append(ps_namespace_snapshot_body_output(b), &first,
+                                 1, &e),
+       &e);
+    REQUIRE(ps_namespace_snapshot_commit(b, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ps_namespace_status status;
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(!status.snapshot && !status.bound_bodies);
+    ok(lc_pouch_record_io_append(ps_namespace_snapshot_body_output(b), &last, 1,
+                                 &e),
+       &e);
+    ok(ps_namespace_snapshot_commit(b, &e), &e);
+    unsigned int kind;
+    uint64_t id;
+    REQUIRE(ps_namespace_parse_source_leaf(ps_namespace_snapshot_body_leaf(b),
+                                           &kind, &id));
+    ps_namespace_snapshot_close(b);
+    count(ns, 1, &e);
+    body_budget_read(ns, id, "abc", 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "snapshot-limits", 0, &e);
+    count(ns, 1, &e);
+    body_budget_read(ns, id, "abc", 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
+static void snapshot_budget_capacity(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    lc_error e;
+    lc_error_init(&e);
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "snapshot-budget", 1, &e);
+    ps_namespace *other = acquire(root, "rejected", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    ok(append(root, other, 1, 0, 31, &e), &e);
+    ps_namespace_snapshot *b = NULL, *rejected = NULL;
+    ps_stats before, after;
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(joint_snapshot_begin(root, other, 1, PS_MIB, &rejected, &e) ==
+                LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(before.entries == after.entries &&
+            before.journal_bytes == after.journal_bytes && !after.budgets);
+    ok(joint_snapshot_begin(root, ns, 1, sizeof(body), &b, &e), &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.budgets == 1 && after.reserved_payload_bytes >= PS_PAGE &&
+            after.reserved_entries >= 2);
+    for (uint64_t i = 0;; ++i) {
+      ps_key key = {99, i, PS_STATE};
+      ps_writer *w = NULL;
+      ok(ps_begin(ps_root_space(root), NULL, key, &w, &e), &e);
+      ok(ps_write(w, body, PS_PAGE, &e), &e);
+      int rc = ps_publish(w, NULL, &e);
+      ps_writer_close(w);
+      if (rc != LC_OK) {
+        REQUIRE(rc == LC_ERR_INVALID);
+        clear(&e);
+        break;
+      }
+      REQUIRE(i < 256);
+    }
+    ps_budget_plan floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+    ps_budget *peer = NULL;
+    ok(ps_budget_open(ps_root_space(root), &floor, &peer, &e), &e);
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(joint_snapshot_begin(root, other, 1, 3, &rejected, &e) ==
+                LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(before.entries == after.entries &&
+            before.journal_bytes == after.journal_bytes && after.budgets == 2);
+    ok(snapshot_record(root, b, 1, 31, &e), &e);
+    struct iovec bytes = {body, sizeof(body)};
+    ok(lc_pouch_record_io_append(ps_namespace_snapshot_body_output(b), &bytes,
+                                 1, &e),
+       &e);
+    unsigned int kind;
+    uint64_t id;
+    REQUIRE(ps_namespace_parse_source_leaf(ps_namespace_snapshot_body_leaf(b),
+                                           &kind, &id));
+    ok(ps_namespace_snapshot_commit(b, &e), &e);
+    ps_namespace_snapshot_close(b);
+    ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    body_budget_read(ns, id, body, sizeof(body), &e);
+    count(ns, 1, &e);
+    ok(ps_budget_close(peer, &e), &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(!after.budgets && !after.reserved_payload_bytes &&
+            !after.reserved_metadata_bytes && !after.reserved_entries);
+    ps_namespace_release(ns);
+    ps_namespace_release(other);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "snapshot-budget", 0, &e);
+    other = acquire(root, "rejected", 0, &e);
+    count(ns, 1, &e);
+    count(other, 1, &e);
+    body_budget_read(ns, id, body, sizeof(body), &e);
+    ps_namespace_status status;
+    ok(ps_namespace_status_get(other, &status, &e), &e);
+    REQUIRE(status.active_segment == 1 && !status.snapshot &&
+            !status.bound_bodies);
+    ps_namespace_release(ns);
+    ps_namespace_release(other);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
+static void snapshot_budget_pending_seal(const char *path) {
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root_options o = {0};
+    o.storage.durable_sync = sync;
+    ps_root *root = NULL;
+    lc_error e;
+    lc_error_init(&e);
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ps_namespace *ns = acquire(root, "pending-seal", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    ps_namespace_snapshot *b = NULL;
+    ok(joint_snapshot_begin(root, ns, 1, 3, &b, &e), &e);
+    ok(snapshot_record(root, b, 1, 31, &e), &e);
+    struct iovec part = {(void *)"abc", 3};
+    ok(lc_pouch_record_io_append(ps_namespace_snapshot_body_output(b), &part, 1,
+                                 &e),
+       &e);
+    /* Leave a deferred seal after another producer rotates the newer tail.
+     * Body publication can stabilize that routing decision in its own barrier.
+     */
+    ok(append(root, ns, 2, 1, 17, &e), &e);
+    ok(append(root, ns, 3, 1, 17, &e), &e);
+    ps_stats before, after;
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    ok(ps_namespace_snapshot_commit(b, &e), &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    uint64_t barriers = after.syncs - before.syncs;
+    printf("joint snapshot with deferred seal (sync=%d): %lu barriers\n", sync,
+           (unsigned long)barriers);
+    fflush(stdout);
+    REQUIRE(barriers > 0 && barriers <= 8);
+    ps_namespace_snapshot_close(b);
+    count(ns, 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "pending-seal", 0, &e);
+    count(ns, 3, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
+static void snapshot_budget_faults(const char *path) {
+  model m = {0};
+  m.live = malloc(PS_MIB);
+  m.stable = malloc(PS_MIB);
+  REQUIRE(m.live && m.stable);
+  ps_io io = {&m, rd, wr, sync_file, reserve, NULL};
+  ps_root_options o = {0};
+  o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+  o.storage.io = &io;
+  lc_error e;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync)
+    for (int previous = 0; previous < 2; ++previous)
+      for (int kind = 0; kind < 2; ++kind) {
+        size_t operations = 0;
+        for (size_t cut = 0; cut <= operations; ++cut) {
+          memset(m.live, 0, PS_MIB);
+          memset(m.stable, 0, PS_MIB);
+          m.calls = m.fail = 0;
+          m.torn = kind ? 0 : 2;
+          o.storage.durable_sync = sync;
+          ps_root *root = NULL;
+          ok(ps_root_open(path, 1, &o, &root, &e), &e);
+          ps_namespace *ns = acquire(root, "joint-faults", 1, &e);
+          ps_namespace_snapshot *b = NULL;
+          ok(append(root, ns, 1, 0, 31, &e), &e);
+          if (previous) {
+            ok(snapshot_begin_record(root, ns, 1, 31, &b, &e), &e);
+            ok(snapshot_record(root, b, 1, 31, &e), &e);
+            ok(ps_namespace_snapshot_commit(b, &e), &e);
+            ps_namespace_snapshot_close(b);
+            b = NULL;
+            ok(append(root, ns, 2, 0, 31, &e), &e);
+          }
+          ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          ok(ps_root_open(path, 0, &o, &root, &e), &e);
+          ns = acquire(root, "joint-faults", 0, &e);
+          ps_namespace_status before;
+          ok(ps_namespace_status_get(ns, &before, &e), &e);
+          size_t latest = previous + 1;
+          uint64_t body_id = 0;
+          unsigned int body_kind;
+          m.calls = allocation = 0;
+          if (kind)
+            fail_allocation = cut ? cut : SIZE_MAX;
+          else
+            m.fail = cut;
+          int rc = joint_snapshot_begin(root, ns, latest, sizeof(body), &b, &e);
+          if (rc == LC_OK) {
+            REQUIRE(ps_namespace_parse_source_leaf(
+                ps_namespace_snapshot_body_leaf(b), &body_kind, &body_id));
+            rc = snapshot_record(root, b, latest, 31, &e);
+          }
+          if (rc == LC_OK) {
+            struct iovec part = {body, sizeof(body)};
+            rc = lc_pouch_record_io_append(ps_namespace_snapshot_body_output(b),
+                                           &part, 1, &e);
+          }
+          if (rc == LC_OK)
+            rc = ps_namespace_snapshot_commit(b, &e);
+          if (!cut)
+            operations = kind ? allocation : m.calls;
+          m.fail = fail_allocation = 0;
+          REQUIRE(cut ? rc != LC_OK : rc == LC_OK);
+          if (kind && rc != LC_OK)
+            REQUIRE(rc == LC_ERR_NOMEM);
+          clear(&e);
+          ps_namespace_snapshot_close(b);
+          b = NULL;
+          if (kind && rc != LC_OK) {
+            ok(ps_check(ps_root_space(root), &e), &e);
+            count(ns, latest, &e);
+            ok(joint_snapshot_begin(root, ns, latest, sizeof(body), &b, &e),
+               &e);
+            ps_namespace_snapshot_close(b);
+            b = NULL;
+          }
+          ps_stats physical;
+          ok(ps_status(ps_root_space(root), &physical, &e), &e);
+          REQUIRE(!physical.budgets && !physical.reserved_payload_bytes &&
+                  !physical.reserved_metadata_bytes &&
+                  !physical.reserved_entries);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          crash(&m, path);
+          ok(ps_root_open(path, 0, &o, &root, &e), &e);
+          ns = acquire(root, "joint-faults", 0, &e);
+          ps_namespace_status recovered;
+          ok(ps_namespace_status_get(ns, &recovered, &e), &e);
+          if (rc == LC_OK)
+            REQUIRE(recovered.snapshot &&
+                    recovered.snapshot != before.snapshot);
+          if (kind && rc != LC_OK)
+            REQUIRE(recovered.snapshot == before.snapshot);
+          records seen = {0};
+          ok(capture(ns, &seen, &e), &e);
+          REQUIRE(seen.version == latest &&
+                  seen.count ==
+                      (recovered.snapshot == before.snapshot ? latest : 1));
+          if (recovered.snapshot != before.snapshot) {
+            REQUIRE(body_id);
+            body_budget_read(ns, body_id, body, sizeof(body), &e);
+          }
+          ok(append(root, ns, latest + 1, 0, 17, &e), &e);
+          count(ns, seen.count + 1, &e);
+          ok(ps_checkpoint(ps_root_space(root), &e), &e);
+          ps_namespace_release(ns);
+          ok(ps_root_close(root, &e), &e);
+          REQUIRE(unlink(path) == 0);
+        }
+        REQUIRE(operations > 10);
+        printf("joint snapshot cuts (sync=%d previous=%d %s): %lu\n", sync,
+               previous, kind ? "allocation" : "write/sync",
+               (unsigned long)operations);
+      }
   free(m.live);
   free(m.stable);
   lc_error_cleanup(&e);
@@ -2473,7 +2928,10 @@ static void bodies(const char *path) {
     clear(&e);
     REQUIRE(ps_namespace_body_commit(NULL, &e) == LC_ERR_INVALID);
     clear(&e);
-    REQUIRE(ps_namespace_snapshot_reserve(NULL, 3, &e) == LC_ERR_INVALID);
+    ps_namespace_snapshot *invalid_snapshot = NULL;
+    REQUIRE(ps_namespace_snapshot_begin(NULL, NULL, NULL, &invalid_snapshot,
+                                        &e) == LC_ERR_INVALID &&
+            !invalid_snapshot);
     clear(&e);
     REQUIRE(ps_namespace_sources_visit(ns, NULL, NULL, &e) == LC_ERR_INVALID);
     clear(&e);
@@ -2617,6 +3075,12 @@ static void *worker(void *p) {
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))
     body_budget_faults(r->path);
+  else if (!strcmp(r->mode, "snapshot-budget")) {
+    snapshot_budget_limits(r->path);
+    snapshot_budget_capacity(r->path);
+    snapshot_budget_pending_seal(r->path);
+  } else if (!strcmp(r->mode, "snapshot-budget-faults"))
+    snapshot_budget_faults(r->path);
   else if (!strcmp(r->mode, "append-budget")) {
     append_budget_limits(r->path);
     append_budget_capacity(r->path);

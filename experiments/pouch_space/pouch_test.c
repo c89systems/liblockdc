@@ -1920,6 +1920,35 @@ static int replay_snapshot(void *context, lc_pouch_storage_visit_fn visit,
                            void *visitor, lc_error *e) {
   return ps_namespace_view_visit(context, 0, visit, visitor, e);
 }
+static int measure_copy_record(void *context,
+                               const lc_pouch_state_entry *record,
+                               lc_error *e) {
+  uint64_t bytes = 0, *total = context;
+  int rc = lc_pouch_state_record_measure_snapshot(
+      &allocator, "snapshot-00000000000000000001.log", record,
+      !record->control && record->found && record->payload_span.present, &bytes,
+      e);
+  if (rc == LC_OK) {
+    REQUIRE(bytes <= (uint64_t)INT64_MAX - *total);
+    *total += bytes;
+  }
+  return rc;
+}
+static int plan_copy_snapshot(void *context, ps_namespace_view *view,
+                              uint64_t boundary,
+                              ps_namespace_snapshot_plan *plan, lc_error *e) {
+  lc_pouch_state_snapshot *capture = NULL;
+  uint64_t bytes = 0;
+  (void)boundary;
+  int rc = lc_pouch_state_snapshot_capture(context, replay_snapshot, view,
+                                           &capture, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_snapshot_visit(capture, measure_copy_record, &bytes, e);
+  lc_pouch_state_snapshot_close(capture);
+  if (rc == LC_OK)
+    plan->metadata_bytes = bytes;
+  return rc;
+}
 static int copy_snapshot_record(void *context,
                                 const lc_pouch_state_entry *record,
                                 lc_error *e) {
@@ -1979,7 +2008,7 @@ static void snapshots(const char *path, const char *directory) {
          &e);
       ps_namespace *ns = handle;
       ps_namespace_snapshot *b = NULL;
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
       snapshot_copy copy = {p, ns, b,
                             lc_alloc_with_allocator(&allocator, 16384), 0};
       REQUIRE(copy.buffer != NULL);
@@ -2226,7 +2255,7 @@ static void projection(const char *path, const char *directory) {
          &e);
       ps_namespace *ns = handle;
       ps_namespace_snapshot *b = NULL;
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
       uint64_t boundary = ps_namespace_snapshot_boundary(b);
       lc_pouch_state_snapshot *captured = NULL;
       size_t before = f.read_bytes;
@@ -2292,7 +2321,7 @@ static void projection(const char *path, const char *directory) {
                                         &handle, &e),
          &e);
       ns = handle;
-      ok(ps_namespace_snapshot_begin(ns, &b, &e), &e);
+      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
       boundary = ps_namespace_snapshot_boundary(b);
       ok(lc_pouch_state_snapshot_capture(
              p, replay_snapshot, ps_namespace_snapshot_view(b), &captured, &e),

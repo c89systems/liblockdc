@@ -10392,13 +10392,92 @@ static int lc_pouch_state_snapshot_encode(
   return rc;
 }
 
+int lc_pouch_state_record_measure_snapshot(const lc_allocator *allocator,
+                                           const char *leaf,
+                                           const lc_pouch_state_entry *record,
+                                           int copy_body, uint64_t *bytes,
+                                           lc_error *error) {
+  lc_pouch_state_payload_span span;
+  const lc_pouch_state_payload_span *ref = NULL;
+  unsigned char *meta = NULL, type;
+  size_t length = 0, key_length = 0;
+  uint64_t total;
+  int rc;
+  if (bytes)
+    *bytes = 0;
+  if (!allocator || !record || !bytes || copy_body < 0 || copy_body > 1 ||
+      record->decision || (record->control && copy_body))
+    return lc_error_set(
+        error, LC_ERR_INVALID, 0L,
+        "snapshot measurement requires resolved record and size", NULL, NULL,
+        "pouch");
+  if (record->control)
+    rc = lc_pouch_state_encode_high_water_meta(allocator, record->index_seq,
+                                               record->query_index_seq, &meta,
+                                               &length, error);
+  else {
+    if (!record->key || !record->key[0] ||
+        record->record_type == LC_POUCH_STATE_RECORD_HIGH_WATER ||
+        record->record_type == LC_POUCH_STATE_RECORD_DECISION ||
+        (record->found && (record->retention == LC_I64_MIN ||
+                           (record->retention < 0 &&
+                            !lc_pouch_state_key_is_staged(record->key)))) ||
+        (record->payload_span.present &&
+         record->payload_span.payload_length != record->cipher_bytes) ||
+        (copy_body &&
+         (!record->found || !record->version || !record->payload_span.present ||
+          !lc_pouch_state_payload_container_is_valid(leaf))))
+      return lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "snapshot measurement has invalid state or body span",
+                          NULL, NULL, "pouch");
+    key_length = strlen(record->key);
+    if (key_length > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES)
+      return lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "snapshot measurement key exceeds local limit", NULL,
+                          NULL, "pouch");
+    if (record->payload_span.present) {
+      span = record->payload_span;
+      if (copy_body) {
+        span.container_leaf = (char *)leaf;
+        span.record_offset = span.payload_offset = 0;
+      }
+      ref = &span;
+    }
+    type = !record->found
+               ? (record->record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE
+                      ? LC_POUCH_STATE_RECORD_OBJECT_DELETE
+                      : LC_POUCH_STATE_RECORD_STATE_DELETE)
+           : copy_body
+               ? (record->record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT ||
+                          record->object_link
+                      ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+                      : LC_POUCH_STATE_RECORD_STATE_PUT)
+           : ref ? LC_POUCH_STATE_RECORD_STATE_LINK
+                 : LC_POUCH_STATE_RECORD_STATE_META;
+    rc = lc_pouch_state_snapshot_encode(
+        allocator, record, type, ref,
+        copy_body ? LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE : 0, &meta,
+        &length, error);
+  }
+  total = LC_POUCH_STATE_RECORD_HEADER_BYTES + key_length;
+  if (rc == LC_OK && (length > (uint64_t)LC_I64_MAX - total ||
+                      (copy_body && record->cipher_bytes >
+                                        (uint64_t)LC_I64_MAX - total - length)))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                      "snapshot measurement exceeds local offset limit", NULL,
+                      NULL, "pouch");
+  if (rc == LC_OK)
+    *bytes = total + length + (copy_body ? record->cipher_bytes : 0);
+  lc_free_with_allocator(allocator, meta);
+  return rc;
+}
+
 int lc_pouch_state_snapshot_measure(const lc_pouch_state_snapshot *snapshot,
                                     const char *leaf, const char *copy_leaf,
                                     uint64_t *bytes, uint64_t *body_bytes,
                                     lc_error *error) {
-  lc_pouch_state_entry entry;
-  lc_pouch_state_payload_span span;
-  unsigned char *meta = NULL, type;
+  lc_pouch_state_entry entry, relocated;
+  unsigned char *meta = NULL;
   size_t length = 0, i;
   uint64_t total = 0, bodies = 0, part;
   int rc, copy;
@@ -10421,47 +10500,29 @@ int lc_pouch_state_snapshot_measure(const lc_pouch_state_snapshot *snapshot,
     lc_pouch_state_entry_borrow_cache_record(snapshot->records[i], &entry);
     copy = entry.found && entry.payload_span.present && copy_leaf &&
            !strcmp(entry.payload_span.container_leaf, copy_leaf);
-    span = entry.payload_span;
+    relocated = entry;
     if (copy) {
-      span.container_leaf = (char *)leaf;
-      span.record_offset = span.payload_offset = 0;
+      relocated.payload_span.container_leaf = (char *)leaf;
+      relocated.payload_span.record_offset =
+          relocated.payload_span.payload_offset = 0;
     }
-    type = !entry.found
-               ? (entry.record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE
-                      ? LC_POUCH_STATE_RECORD_OBJECT_DELETE
-                      : LC_POUCH_STATE_RECORD_STATE_DELETE)
-           : span.present ? LC_POUCH_STATE_RECORD_STATE_LINK
-                          : LC_POUCH_STATE_RECORD_STATE_META;
-    meta = NULL;
-    rc = lc_pouch_state_snapshot_encode(&snapshot->allocator, &entry, type,
-                                        span.present ? &span : NULL, 0, &meta,
-                                        &length, error);
-    part = LC_POUCH_STATE_RECORD_HEADER_BYTES + strlen(entry.key) + length;
+    rc = lc_pouch_state_record_measure_snapshot(&snapshot->allocator, leaf,
+                                                &relocated, 0, &part, error);
     if (rc == LC_OK && part > (uint64_t)LC_I64_MAX - total)
       rc = lc_error_set(error, LC_ERR_INVALID, 0L,
                         "snapshot measurement exceeds local offset limit", NULL,
                         NULL, "pouch");
     if (rc == LC_OK)
       total += part;
-    lc_free_with_allocator(&snapshot->allocator, meta);
     if (rc == LC_OK && copy) {
-      meta = NULL;
-      type = entry.record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT
-                 ? LC_POUCH_STATE_RECORD_OBJECT_PUT
-                 : LC_POUCH_STATE_RECORD_STATE_PUT;
-      rc = lc_pouch_state_snapshot_encode(
-          &snapshot->allocator, &entry, type, &span,
-          LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, &meta, &length, error);
-      part = LC_POUCH_STATE_RECORD_HEADER_BYTES + strlen(entry.key) + length;
-      if (rc == LC_OK &&
-          (part > (uint64_t)LC_I64_MAX - bodies ||
-           entry.cipher_bytes > (uint64_t)LC_I64_MAX - bodies - part))
+      rc = lc_pouch_state_record_measure_snapshot(&snapshot->allocator, leaf,
+                                                  &entry, 1, &part, error);
+      if (rc == LC_OK && part > (uint64_t)LC_I64_MAX - bodies)
         rc = lc_error_set(error, LC_ERR_INVALID, 0L,
                           "body pack measurement exceeds local offset limit",
                           NULL, NULL, "pouch");
       if (rc == LC_OK)
-        bodies += part + entry.cipher_bytes;
-      lc_free_with_allocator(&snapshot->allocator, meta);
+        bodies += part;
     }
   }
   if (rc == LC_OK) {

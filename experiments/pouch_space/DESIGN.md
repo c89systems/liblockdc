@@ -658,14 +658,21 @@ owned capacity avoids a budget handle when no head selection is needed. Ordinary
 grants retain geometric growth with exact fallback near capacity; maintenance
 uses exact grants, and a small clipped grant preserves the larger growth
 preference across reopen. Complete spans are bounded before vectored output and
-checked before commit. Snapshot builders and parent compaction still need a
-joint claim for their full dependency set. The fixed 16 KiB floor needs a
-bounded-work policy covering admitted keys up to 1 MiB. Automatic
+checked before commit. Snapshot begin now captures and measures the current
+prefix before rotation or output creation. One maintenance claim covers that
+rotation, metadata/body streams and bindings, and final head selection. The
+builder owns both outputs, validates both complete spans before any publication
+and retains the claim until their writers close. Body publication precedes
+deferred-seal cleanup so its barrier can stabilize pending routing too. Producers
+hold no allocator/root lock or namespace mutation authority. Reclamation uses
+the protected checkpoint pool. This guarantees admitted work against peer
+pressure, not that every compaction fits at full capacity. The fixed 16 KiB floor
+needs a bounded-work policy covering admitted keys up to 1 MiB. Automatic
 compaction/retention policy and history protection remain pending.
 The current label pool still follows namespace-owner lifetime.
 
-The protected metadata region cannot be consumed by payloads. Complete
-maintenance admission, resumable root transform conversion,
+The protected metadata region cannot be consumed by payloads. Standing
+maintenance capacity, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The
 foundation now implements forced ordinary-state relocation and makes no claim
 that all draft acceptance criteria are already satisfied.

@@ -819,6 +819,11 @@ static void snapshot_records(const char *path, const char *key) {
                                             &found, &truncated, &e),
                  &e);
               REQUIRE(found && !truncated);
+              uint64_t measured = 0;
+              ok(lc_pouch_state_record_measure_snapshot(
+                     &allocator, snapshot_leaf, &r, record == 2, &measured, &e),
+                 &e);
+              REQUIRE(measured == next - at);
               if (!record)
                 REQUIRE(r.control && r.version == 1000 &&
                         r.query_index_seq == 900);
@@ -937,6 +942,34 @@ static void snapshot_faults(const char *path) {
   placeholder.descriptor = NULL;
   placeholder.retention = 0;
   placeholder.staged_delete_marker = 0;
+  lc_pouch_state_entry high_water = {0};
+  high_water.control = 1;
+  high_water.index_seq = 1000;
+  high_water.query_index_seq = 900;
+  size_t measurement_cuts = 0;
+  for (int null_error = 0; null_error < 2; ++null_error)
+    for (int kind = 0; kind < 5; ++kind) {
+      const lc_pouch_state_entry *r = kind < 2    ? &stored
+                                      : kind == 2 ? &deleted
+                                      : kind == 3 ? &placeholder
+                                                  : &high_water;
+      size_t operations = 0;
+      for (size_t cut = 0; cut <= operations; ++cut) {
+        uint64_t bytes = UINT64_MAX;
+        allocation = 0;
+        fail_allocation = cut ? cut : SIZE_MAX;
+        int rc = lc_pouch_state_record_measure_snapshot(
+            &allocator, snapshot_leaf, r, kind == 1, &bytes,
+            null_error ? NULL : &e);
+        if (!cut)
+          operations = allocation;
+        fail_allocation = 0;
+        REQUIRE(cut ? rc == LC_ERR_NOMEM && !bytes : rc == LC_OK && bytes > 0);
+        if (cut)
+          ++measurement_cuts;
+        clear(&e);
+      }
+    }
   char output_path[1200];
   REQUIRE(snprintf(output_path, sizeof(output_path), "%s.snapshot", path) > 0);
   int output_fd = open(output_path, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -1063,8 +1096,32 @@ static void snapshot_faults(const char *path) {
     REQUIRE(!encoded.calls);
     snapshot_prefix_preserved(output_fd);
     clear(&e);
+    if (bad != 3) {
+      uint64_t bytes = UINT64_MAX;
+      REQUIRE(lc_pouch_state_record_measure_snapshot(&allocator, label,
+                                                     &invalid, 1, &bytes,
+                                                     &e) == LC_ERR_INVALID &&
+              !bytes);
+      clear(&e);
+    }
   }
   free(overlong);
+  uint64_t invalid_size = UINT64_MAX;
+  lc_pouch_state_entry enormous = stored;
+  enormous.cipher_bytes = enormous.payload_span.payload_length = INT64_MAX;
+  REQUIRE(lc_pouch_state_record_measure_snapshot(&allocator, snapshot_leaf,
+                                                 &enormous, 1, &invalid_size,
+                                                 &e) == LC_ERR_INVALID &&
+          !invalid_size);
+  clear(&e);
+  REQUIRE(lc_pouch_state_record_measure_snapshot(&allocator, snapshot_leaf,
+                                                 &stored, 2, &invalid_size,
+                                                 NULL) == LC_ERR_INVALID &&
+          !invalid_size);
+  REQUIRE(lc_pouch_state_record_measure_snapshot(&allocator, snapshot_leaf,
+                                                 &stored, 0, NULL,
+                                                 &e) == LC_ERR_INVALID);
+  clear(&e);
   snapshot_reset(output_fd);
   observed o;
   lc_pouch_record_io output = observing(&o, underlying);
@@ -1086,6 +1143,8 @@ static void snapshot_faults(const char *path) {
   clear(&e);
   printf("snapshot codec allocation/I/O failure cases: %lu\n",
          (unsigned long)cases);
+  printf("snapshot measurement allocation cuts: %lu\n",
+         (unsigned long)measurement_cuts);
   lc_pouch_state_entry_cleanup(&allocator, &stored);
   REQUIRE(close(output_fd) == 0 && unlink(output_path) == 0);
   REQUIRE(close(input_fd) == 0 && unlink(path) == 0);

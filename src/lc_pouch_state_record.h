@@ -103,6 +103,14 @@ int lc_pouch_state_record_write_snapshot(const lc_allocator *,
                                          const lc_pouch_state_entry *,
                                          lc_source *encoded, void *scratch,
                                          size_t scratch_bytes, lc_error *);
+/* Exact size of the same canonical snapshot record, without body I/O.
+ * copy_body selects inline encoded bytes; otherwise retain the body reference.
+ * Leaf offsets do not change the fixed-width metadata representation. */
+int lc_pouch_state_record_measure_snapshot(const lc_allocator *,
+                                           const char *leaf,
+                                           const lc_pouch_state_entry *,
+                                           int copy_body, uint64_t *,
+                                           lc_error *);
 int lc_pouch_state_record_write_high_water(const lc_allocator *,
                                            lc_pouch_record_io,
                                            lc_pouch_generation version,

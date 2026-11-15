@@ -15,7 +15,6 @@ typedef struct compact {
   ps_root *root;
   ps_namespace *ns;
   ps_namespace_snapshot *snapshot;
-  ps_namespace_body *body;
   lc_pouch_state_snapshot *capture;
   source_plan *sources;
   size_t count, capacity;
@@ -91,28 +90,15 @@ static int count_live(void *context, const lc_pouch_state_entry *r,
   ++source->references;
   return LC_OK;
 }
-static int begin_locked(void *context, lc_error *e) {
+static int plan_snapshot(void *context, ps_namespace_view *view,
+                         uint64_t boundary, ps_namespace_snapshot_plan *plan,
+                         lc_error *e) {
   compact *w = context;
-  ps_namespace_status status;
   source_plan *best = NULL, *source;
   uint64_t score, best_score = 0, bodies = 0;
   size_t i;
-  int rc = w->pouch->storage.ops->namespace_open(
-      w->pouch->storage.context, w->name, 0, (void **)&w->ns, e);
-  if (rc == LC_OK)
-    rc = ps_namespace_status_get(w->ns, &status, e);
-  if (rc == LC_OK &&
-      (!status.active_segment ||
-       (!status.snapshot && !status.tail && status.active_segment == 1))) {
-    w->result.skipped = 1;
-    return LC_OK;
-  }
-  if (rc == LC_OK)
-    rc = ps_namespace_snapshot_begin(w->ns, &w->snapshot, e);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_snapshot_capture(
-        w->pouch, replay, ps_namespace_snapshot_view(w->snapshot), &w->capture,
-        e);
+  int rc =
+      lc_pouch_state_snapshot_capture(w->pouch, replay, view, &w->capture, e);
   if (rc == LC_OK)
     rc = ps_namespace_sources_visit(w->ns, collect_source, w, e);
   if (rc == LC_OK) {
@@ -124,7 +110,9 @@ static int begin_locked(void *context, lc_error *e) {
     return rc;
   for (i = 0; i < w->count; ++i) {
     source = w->sources + i;
-    if (!source->source.sealed ||
+    if ((source->source.kind == PS_CATALOG_SEGMENT
+             ? source->source.id > boundary
+             : !source->source.sealed) ||
         (source->source.kind == PS_CATALOG_SNAPSHOT && !source->references))
       continue;
     score = source->live < source->source.capacity
@@ -145,11 +133,27 @@ static int begin_locked(void *context, lc_error *e) {
       w->capture, "body-00000000000000000001.log", w->copy_leaf,
       &w->result.metadata_bytes, &bodies, e);
   w->result.body_bytes = bodies;
+  if (rc == LC_OK) {
+    plan->metadata_bytes = w->result.metadata_bytes;
+    plan->body_bytes = bodies;
+  }
+  return rc;
+}
+static int begin_locked(void *context, lc_error *e) {
+  compact *w = context;
+  ps_namespace_status status;
+  int rc = w->pouch->storage.ops->namespace_open(
+      w->pouch->storage.context, w->name, 0, (void **)&w->ns, e);
   if (rc == LC_OK)
-    rc =
-        ps_namespace_snapshot_reserve(w->snapshot, w->result.metadata_bytes, e);
-  if (rc == LC_OK && bodies)
-    rc = ps_namespace_body_begin(w->ns, bodies, &w->body, e);
+    rc = ps_namespace_status_get(w->ns, &status, e);
+  if (rc == LC_OK &&
+      (!status.active_segment ||
+       (!status.snapshot && !status.tail && status.active_segment == 1))) {
+    w->result.skipped = 1;
+    return LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = ps_namespace_snapshot_begin(w->ns, plan_snapshot, w, &w->snapshot, e);
   return rc;
 }
 static int write_record(void *context, const lc_pouch_state_entry *r,
@@ -178,20 +182,21 @@ static int write_record(void *context, const lc_pouch_state_entry *r,
         r->payload_span.payload_offset, r->payload_span.payload_length,
         r->payload_span.payload_crc, &encoded, e);
     if (rc == LC_OK)
-      rc =
-          lc_pouch_record_io_tail(ps_namespace_body_output(w->body), &start, e);
+      rc = lc_pouch_record_io_tail(
+          ps_namespace_snapshot_body_output(w->snapshot), &start, e);
     if (rc == LC_OK)
       rc = lc_pouch_state_record_write_snapshot(
-          &w->pouch->allocator, ps_namespace_body_output(w->body),
-          ps_namespace_body_leaf(w->body), r, encoded, w->scratch,
+          &w->pouch->allocator, ps_namespace_snapshot_body_output(w->snapshot),
+          ps_namespace_snapshot_body_leaf(w->snapshot), r, encoded, w->scratch,
           LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES, e);
     if (encoded)
       encoded->close(encoded);
     if (rc == LC_OK)
-      rc = lc_pouch_record_io_tail(ps_namespace_body_output(w->body), &end, e);
+      rc = lc_pouch_record_io_tail(
+          ps_namespace_snapshot_body_output(w->snapshot), &end, e);
     if (rc == LC_OK) {
       relocated.payload_span.container_leaf =
-          (char *)ps_namespace_body_leaf(w->body);
+          (char *)ps_namespace_snapshot_body_leaf(w->snapshot);
       relocated.payload_span.record_offset = start;
       relocated.payload_span.payload_offset = end - r->cipher_bytes;
     }
@@ -255,8 +260,6 @@ static int publish_locked(void *context, lc_error *e) {
   if (rc == LC_OK && end != w->result.metadata_bytes)
     rc = fail(e, LC_ERR_PROTOCOL,
               "snapshot differs from measured canonical size");
-  if (rc == LC_OK && w->body)
-    rc = ps_namespace_body_commit(w->body, e);
   if (rc == LC_OK)
     rc = ps_namespace_snapshot_commit(w->snapshot, e);
   if (rc != LC_OK)
@@ -270,8 +273,6 @@ static int publish_locked(void *context, lc_error *e) {
    * projection owns metadata independently; caller-owned read pins remain. */
   ps_namespace_snapshot_close(w->snapshot);
   w->snapshot = NULL;
-  ps_namespace_body_close(w->body);
-  w->body = NULL;
   rc = ps_namespace_view_open(w->ns, &view, e);
   if (rc == LC_OK)
     rc = lc_pouch_state_snapshot_capture(w->pouch, replay, view, &current, e);
@@ -316,12 +317,11 @@ int ps_pouch_state_compact(lc_pouch *pouch, const char *name,
   w.capture = NULL;
   if (rc == LC_OK && !w.result.skipped)
     rc = lc_pouch_state_snapshot_publish(pouch, name, publish_locked, &w, e);
-  if (rc != LC_OK && !w.selected && w.body &&
+  if (rc != LC_OK && !w.selected && w.snapshot &&
       ps_check(ps_root_space(w.root), NULL) == LC_OK)
-    (void)ps_namespace_parse_source_leaf(ps_namespace_body_leaf(w.body), &kind,
-                                         &w.abandoned_body);
+    (void)ps_namespace_parse_source_leaf(
+        ps_namespace_snapshot_body_leaf(w.snapshot), &kind, &w.abandoned_body);
   ps_namespace_snapshot_close(w.snapshot);
-  ps_namespace_body_close(w.body);
   if (w.abandoned_body) {
     lc_error_init(&ignored);
     (void)lc_pouch_state_with_namespace_lock(pouch, name, cleanup_body, &w,

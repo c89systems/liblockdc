@@ -48,7 +48,9 @@ int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
 void ps_ns_leave(struct ps_namespace_data *);
 int ps_ns_finish_seal(struct ps_namespace_data *, lc_error *);
-int ps_ns_rotate(struct ps_namespace_data *, lc_error *);
+int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
+                        lc_error *);
+int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);
 int ps_ns_head_write(struct ps_namespace_data *, ps_budget *, uint64_t active,
                      uint64_t snapshot, uint64_t boundary, lc_error *);
 

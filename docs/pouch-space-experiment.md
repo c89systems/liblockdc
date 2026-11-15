@@ -3292,6 +3292,160 @@ Raw logs are `build/pouch-space-append-budget/metadata-paired/`, with runner
 prior is `build/pouch-space-grant-budget/pouch_space_compare-current`, SHA-256
 `9681ddeafe57c4dfbeb43cca1cabcb08d1ab581e18e43d825e349bb538a13711`.
 
+## Joint snapshot and body publication
+
+Snapshot begin now captures the current prefix and runs a metadata-only planning
+callback before rotating or creating outputs. Production maintenance captures
+the resolved projection once, selects a source from the logically covered prefix
+and measures its metadata/body frames without reading bodies. A source about to
+be sealed is eligible without staging the rotation first. One maintenance claim
+then funds any rotation, both stream heads and exact grants, their catalog
+bindings and final routing replacement. Checkpoint workspace protects seals and
+reclamation. Capacity rejection precedes topology changes.
+
+The builder owns its optional body pack and retains the joint claim through
+publication and writer close. It checks both exact byte counts and failed-output
+flags before publishing either binding. Producers continue outside namespace
+mutation authority and allocator/root locks. Encoded bodies still flow through
+bounded scratch without decoding, re-encryption, spooling or materialization.
+The private snapshot API now requires a planner; the former separate span-reserve
+call is removed and all callers migrate together. Standalone body builds remain
+ordinary positive-span claims and now reject oversized output before writing.
+Neither persisted format nor installed ABI changes.
+
+The codec supplies exact per-record snapshot sizing, reused by aggregate
+snapshot/body measurement. It handles high-water records, references, inline
+encoded bodies, objects, placeholders and tombstones using metadata only. It
+validates field/offset bounds and clears its size output on failure. Existing
+codec tests compare measured sizes with actual decoded record boundaries across
+96 transform/durability/file-or-stream/object-or-state/size configurations,
+with six records per configuration.
+
+### Correctness and failure evidence
+
+At fixed 1 MiB capacity under both root policies, a joint metadata/body build is
+admitted before peers fill foreground space and claim the standing 16 KiB floor.
+Its **65,537-byte opaque-body fixture**, both catalog bindings and final head
+selection must still complete. Reclamation/checkpoint and populated reopen
+preserve both outputs. An oversized plan and a subsequent unadmitted build leave
+entry/journal counts and the rejected namespace's topology unchanged.
+
+Boundary tests reject zero/overflow plans and zero standalone body spans. Both
+outputs reject an oversized vectored call atomically and reject an extra write
+after exactly filling the declared span. The other output is completed too, so
+rejection cannot merely be an underfill check; neither body nor snapshot may
+publish. An underfilled joint producer is rejected and can complete successfully.
+Temporarily removing the final head publication's budget makes the pressure
+fixture fail; restoring it passes.
+
+The new joint-operation sweep covers **668 cuts: 262 write/sync and 406 allocation
+failures**, across both root policies and initial/replacement snapshots. It
+reopens before the attempt to exercise uncertified zero preparation, checks
+producer and body/catalog/head publication failures, releases all quotas, and
+recovers a whole old or newly selected prefix. Successful selection is durable
+under both policies. Healthy allocation failures additionally admit another
+attempt on the same open owner before close. Recovered selected bodies remain
+readable, and subsequent append/checkpoint succeeds. Codec sizing adds **18
+allocation cuts**, including null error outputs, plus invalid/overflow checks.
+Existing public maintenance recovery/concurrency tests exercise real canonical
+body references and liveness-based reclamation.
+
+A sync-ordering regression was found before finalizing the stage: finishing a
+deferred predecessor seal before body publication used **nine barriers** for a
+NoSync snapshot with a newer tail rotation. Restoring body publication before
+seal cleanup lets its dependency barrier stabilize pending routing too. The
+regression now measures **eight barriers under both policies** and verifies
+replay after reopen. This retains the previous publication order while using the
+joint claim; it does not remove the underlying structural barriers.
+
+The full native **297-group Debug unit suite** passes in **1039.82 s**, with
+ASan/UBSan and constrained worker-stack checks. After the experimental-only
+barrier-order repair, all **36 affected Debug groups** pass in **215.79 s**;
+the unchanged shared codec/native-library checks retain the full-suite result.
+Both public API/shared-symbol boundary checks pass in **0.09 s**. Final
+**36 GNU release groups** pass in **163.11 s**, **36 musl groups** in
+**162.41 s**, and **19 ThreadSanitizer groups** in **179.30 s**. After strengthening
+the other-output completion assertion, that group passes again in
+Debug/GNU/musl/TSAN in 1.51/1.45/1.45/1.51 s. Musl retains its native default
+worker stack. Five final Memcheck runs complete **409,909 allocations and frees**,
+with zero live blocks, errors or suppressions.
+
+Logs under `build/pouch-space-snapshot-budget/` include `debug-tests.log`,
+`debug-final-tests.log`, `api-tests.log`, `gnu-final-tests.log`,
+`musl-final-tests.log`, `tsan-tests.log`, the four `*-limits-tests.log` runs,
+captured output logs and five `memcheck-*.log`/output pairs.
+`negative-tests.log` records the removed head-budget control;
+`barrier-before-tests.log` records the nine-barrier regression.
+
+### Matched forced-compaction performance
+
+The main 80 serial GNU release runs use five alternating-order samples of
+current/prior container and current/prior multifile. Each writes 512 plaintext
+1 KiB states over two PUT rounds, then forces compaction with an 8 MiB segment
+target, disabled throttling and completed reclamation. One/four writer threads
+prepare one/four namespaces; **compaction visits those namespaces serially after
+the writers join**. Cache is retained. Every run verifies values after compaction
+and reopen; container runs audit one fixed 10 MiB file without sidecars. This
+does not measure emergency admission latency or prove that every compaction fits
+when starting at full capacity. Medians are ms; C denotes container and MF
+denotes multifile.
+
+| Root policy | Namespaces | Current C compact | Prior C compact | Current MF compact | Prior MF compact | Current C CPU | Prior C CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 52.483 | 53.053 | 51.937 | 51.586 | 7.497 | 7.472 |
+| NoSync | 4 | 141.892 | 141.587 | 180.226 | 155.989 | 12.893 | 11.036 |
+| Durable | 1 | 47.753 | 48.685 | 56.259 | 55.162 | 8.386 | 7.387 |
+| Durable | 4 | 166.297 | 159.817 | 174.463 | 173.311 | 13.484 | 13.351 |
+
+The main durable four-namespace container median increases about **4.1%**;
+ranges **162.916–189.445 versus 142.422–161.503 ms** do not overlap. Recorded
+sync medians also rise, from 150.090 to 159.214 ms, while CPU ranges overlap.
+One focused 20-run follow-up repeats only that profile with the same frozen
+executables and all four controls, reversing the starting order of odd samples.
+All 20 runs verify. The wall-time difference does **not** repeat: container
+ranges 141.230–204.200 versus 148.528–177.977 ms overlap. Both series are retained.
+
+| Follow-up engine | Current compact | Prior compact | Current CPU | Prior CPU |
+| --- | ---: | ---: | ---: | ---: |
+| Container | 165.588 | 171.172 | 13.908 | 11.169 |
+| Multifile | 164.577 | 163.983 | 19.933 | 18.850 |
+
+CPU medians are higher in some profiles: about 17% for main NoSync/four
+namespaces, 14% for main durable/one namespace and 25% for follow-up
+durable/four namespaces. Their ranges overlap; these samples do not isolate a
+cause or establish that earlier performance deficits are resolved. Compaction
+wall time remains largely sync time.
+
+Current/prior container compaction I/O matches across both series' **50 container
+runs** within the 100-run comparison:
+**990,392 bytes, 250 writes and 626 reads** with one namespace;
+**1,025,532 bytes, 355 writes and 645 reads** with four. Container retains
+15/60 NoSync and 18/72 durable compaction barriers, versus MF 10/40 under either
+root policy. The joint claim adds no measured I/O or fixed barrier here.
+Current MF writes 1,092,930/1,095,216 bytes in the main series.
+
+Ready includes root open plus the first verification/projection load after
+compaction. Main current/prior ranges overlap; the follow-up four-namespace
+container medians are 7.761/9.881 ms. This fixture benefits from a compacted
+snapshot and does not replace the earlier ordinary-metadata reopen measurements.
+
+| Root policy | Namespaces | Current C ready | Prior C ready | Current MF ready | Prior MF ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 11.514 | 9.715 | 16.328 | 16.204 |
+| NoSync | 4 | 9.291 | 8.446 | 16.102 | 16.178 |
+| Durable | 1 | 10.400 | 8.697 | 25.875 | 16.910 |
+| Durable | 4 | 10.794 | 9.084 | 16.840 | 16.052 |
+
+Raw series are `build/pouch-space-snapshot-budget/compaction-paired/` and
+`compaction-durable4-paired/`, with matching runner, result JSON and benchmark
+logs. `compaction-summary.pl` aggregates either series. The **109-artifact**
+`compaction-artifacts.sha256` manifest verifies, as does the prior stage's
+86-artifact metadata manifest. Frozen current executable
+`pouch_space_compare-current` has SHA-256
+`5df62ab9bf7b7e6261e38b8405a8df23c258643b692c526b79e8bc338d764a90`;
+prior is `build/pouch-space-append-budget/pouch_space_compare-current`, SHA-256
+`3359eb73cfd6de024ecd98327163fd79853616f123efc6d0d1d7aa7abeaf6dff`.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -3318,9 +3472,10 @@ Funded canonical grants, typed planning and complete known body-pack admission
 now join those claims, with same-owner retry, capacity, failure and forced-compaction
 comparison evidence above. Namespace appends now fund their declared spans and
 head selection before staging, with bounded-key full-capacity deletion and
-matched ordinary-update evidence above. The next work must carry joint budgets
-through snapshot and parent compaction admission, protect bounded maintenance
-work for all admitted key sizes, and close whole-operation maintenance admission at capacity,
+matched ordinary-update evidence above. Snapshot and body publication now use a
+joint measured claim before topology changes, with capacity, failure and matched
+compaction evidence above. The next work must protect standing maintenance
+capacity for all admitted key sizes and required progress at full capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still requires
