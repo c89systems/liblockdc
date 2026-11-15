@@ -29,6 +29,16 @@ typedef struct ps_pouch_state_options {
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,
                         const ps_pouch_state_options *, lc_pouch **,
                         lc_error *);
+typedef struct ps_pouch_client_options {
+  uint64_t initial_capacity, maximum_capacity;
+  const ps_io *io;
+} ps_pouch_client_options;
+/* Private SDK integration: common client configuration and receiver lifetime,
+ * admitted through the existing container owner. Logical options come from the
+ * normal config/endpoint. The state harness's operation limits still apply. */
+int ps_pouch_client_open(const lc_client_config *, int create,
+                         const ps_pouch_client_options *, lc_client **,
+                         lc_error *);
 typedef struct ps_pouch_compaction_result {
   uint64_t records, metadata_bytes, body_bytes, copied_bytes;
   uint64_t snapshot, boundary, reclaimed_sources, pending_sources;

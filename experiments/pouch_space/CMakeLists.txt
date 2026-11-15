@@ -34,7 +34,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-scope pouch-scope runtime-staged pouch-staged runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection)
+    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-scope pouch-scope runtime-staged pouch-staged runtime-sdk-read-points pouch-sdk-read-points runtime-sdk-scan-metadata pouch-sdk-scan-metadata runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection)
       add_test(NAME pouch_space_compare_${mode}
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096)
       set_tests_properties(pouch_space_compare_${mode} PROPERTIES TIMEOUT 60
@@ -56,6 +56,18 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_client_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_client_test PRIVATE
+    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  lc_configure_c_test_target(pouch_space_client_test)
+  foreach(mode lifecycle validation faults io-faults)
+    add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
+  set_tests_properties(pouch_space_client_faults pouch_space_client_io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_frame_test frame_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_frame_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_frame_test PRIVATE pouch_space_experiment)

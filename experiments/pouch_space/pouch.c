@@ -23,6 +23,39 @@ typedef struct ps_pouch_source {
   int verify, failed;
 } ps_pouch_source;
 
+typedef struct ps_pouch_client_admission {
+  const ps_pouch_client_options *physical;
+  int create;
+} ps_pouch_client_admission;
+
+static int client_runtime_open(void *context, const char *path,
+                               const lc_allocator *allocator,
+                               const lc_pouch_open_options *logical,
+                               lc_pouch **out, lc_error *e) {
+  ps_pouch_client_admission *admission = context;
+  ps_pouch_state_options options;
+  memset(&options, 0, sizeof(options));
+  options.logical = *logical;
+  if (admission->physical) {
+    options.initial_capacity = admission->physical->initial_capacity;
+    options.maximum_capacity = admission->physical->maximum_capacity;
+    options.io = admission->physical->io;
+  }
+  return ps_pouch_state_open(path, admission->create, allocator, &options, out,
+                             e);
+}
+int ps_pouch_client_open(const lc_client_config *config, int create,
+                         const ps_pouch_client_options *physical,
+                         lc_client **out, lc_error *e) {
+  ps_pouch_client_admission admission;
+  if (out)
+    *out = NULL;
+  admission.physical = physical;
+  admission.create = create;
+  return lc_client_open_with_pouch_factory(config, client_runtime_open,
+                                           &admission, out, e);
+}
+
 static void release(void *context) {
   ps_pouch_owner *owner = context;
   lc_error ignored;

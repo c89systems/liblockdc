@@ -114,4 +114,16 @@ typedef struct lc_pouch_storage {
 int lc_pouch_runtime_open(const char *, const lc_allocator *,
                           const lc_pouch_open_options *, lc_pouch **,
                           lc_error *);
+/* Private admission seam for a physical owner. The constructor resolves the
+ * ordinary SDK options before invoking factory once. It owns any returned
+ * runtime, including during failed initialization, and retains neither factory
+ * nor context. A non-NULL factory requires a Pouch endpoint; NULL preserves the
+ * native owner. This does not add a public backend selector. */
+typedef int (*lc_pouch_runtime_factory_fn)(void *, const char *,
+                                           const lc_allocator *,
+                                           const lc_pouch_open_options *,
+                                           lc_pouch **, lc_error *);
+int lc_client_open_with_pouch_factory(const lc_client_config *,
+                                      lc_pouch_runtime_factory_fn, void *,
+                                      lc_client **, lc_error *);
 #endif

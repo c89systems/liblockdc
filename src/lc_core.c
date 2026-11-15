@@ -9,6 +9,7 @@
 #include "lc_engine_api.h"
 #include "lc_intcompat.h"
 #include "lc_log.h"
+#include "lc_pouch_storage.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -2365,8 +2366,10 @@ lc_pouch_open_options_apply_settings(lc_pouch_open_options *options,
 
 #undef LC_POUCH_SETTINGS_KNOWN_MASK
 
-int lc_client_open(const lc_client_config *config, lc_client **out,
-                   lc_error *error) {
+int lc_client_open_with_pouch_factory(const lc_client_config *config,
+                                      lc_pouch_runtime_factory_fn factory,
+                                      void *factory_context, lc_client **out,
+                                      lc_error *error) {
   lc_engine_client_config engine_config;
   lc_engine_error engine_error;
   lc_bundle_capture_source bundle_capture;
@@ -2413,6 +2416,11 @@ int lc_client_open(const lc_client_config *config, lc_client **out,
                         NULL);
   }
   is_pouch = pouch_endpoint_count == 1U;
+  if (factory != NULL && !is_pouch) {
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch runtime factory requires one pouch endpoint",
+                        NULL, NULL, NULL);
+  }
   rc = lc_pouch_settings_validate(config->pouch_settings, is_pouch, error);
   if (rc != LC_OK) {
     return rc;
@@ -2556,8 +2564,17 @@ int lc_client_open(const lc_client_config *config, lc_client **out,
     lc_pouch_open_options_apply_settings(&pouch_open_options,
                                          config->pouch_settings);
     pouch_open_options.logger = client->base_logger;
-    rc = lc_pouch_open(pouch_endpoint_options.root_path, &config->allocator,
-                       &pouch_open_options, &client->pouch, error);
+    rc = factory != NULL
+             ? factory(factory_context, pouch_endpoint_options.root_path,
+                       &config->allocator, &pouch_open_options, &client->pouch,
+                       error)
+             : lc_pouch_open(pouch_endpoint_options.root_path,
+                             &config->allocator, &pouch_open_options,
+                             &client->pouch, error);
+    if (rc == LC_OK && client->pouch == NULL)
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "pouch runtime factory returned no owner", NULL, NULL,
+                        NULL);
     if (rc != LC_OK) {
       lc_client_close_method(&client->pub);
       lc_engine_error_cleanup(&engine_error);
@@ -2796,6 +2813,11 @@ int lc_client_open(const lc_client_config *config, lc_client **out,
   *out = &client->pub;
   lc_engine_error_cleanup(&engine_error);
   return LC_OK;
+}
+
+int lc_client_open(const lc_client_config *config, lc_client **out,
+                   lc_error *error) {
+  return lc_client_open_with_pouch_factory(config, NULL, NULL, out, error);
 }
 
 int lc_source_from_memory(const void *bytes, size_t length, lc_source **out,

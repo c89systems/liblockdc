@@ -79,6 +79,8 @@ struct comparison {
   int durable_scope; /* Force durability after both PUT rounds per writer. */
   int staged; /* Stage each body and publish its existing canonical LINK batch.
                */
+  int sdk; /* Use the public SDK for measured reads over ordinary seeded PUTs.
+            */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -563,6 +565,29 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     }
     return;
   }
+  if (c->sdk) {
+    lc_client_config_init(&config);
+    lc_pouch_settings_init(&settings);
+    settings.set_mask =
+        LC_POUCH_SETTING_DURABLE_SYNC | LC_POUCH_SETTING_QUERY_INDEXING |
+        LC_POUCH_SETTING_BACKGROUND_COMPACTION | LC_POUCH_SETTING_COMPRESSION |
+        LC_POUCH_SETTING_SEGMENT_TARGET_BYTES | LC_POUCH_SETTING_QUEUE_WATCH |
+        LC_POUCH_SETTING_QUERY_ENGINE;
+    settings.durable_sync = c->sync;
+    settings.segment_target_bytes = PS_MIB;
+    settings.compression = "none";
+    settings.query_engine = "scan";
+    config.endpoints = &endpoint;
+    config.endpoint_count = 1;
+    config.default_namespace = "bench";
+    config.pouch_settings = &settings;
+    check(c->runtime
+              ? ps_pouch_client_open(&config, create, NULL, &c->client, e)
+              : lc_client_open(&config, &c->client, e),
+          e);
+    c->pouch = ((lc_client_handle *)c->client)->pouch;
+    return;
+  }
   if (!c->collection) {
     memset(&options, 0, sizeof(options));
     options.durable_sync = c->sync;
@@ -633,13 +658,15 @@ static void close_stores(comparison *c, lc_error *e) {
     } else
       check(ps_close(c->space, e), e);
     c->space = NULL;
-  } else if (c->collection) {
-    for (i = 0; i < c->writers; ++i) {
-      lc_collection_close(c->workers[i].collection);
-      c->workers[i].collection = NULL;
-    }
+  } else if (c->collection || c->sdk) {
+    if (c->collection)
+      for (i = 0; i < c->writers; ++i) {
+        lc_collection_close(c->workers[i].collection);
+        c->workers[i].collection = NULL;
+      }
     lc_client_close(c->client);
     c->client = NULL;
+    c->pouch = NULL;
   } else {
     lc_pouch_close(c->pouch);
     c->pouch = NULL;
@@ -670,18 +697,65 @@ typedef struct read_group {
   unsigned char *seen;
   size_t count;
 } read_group;
-static size_t verify_read_key(read_group *group, const char *name,
-                              uint64_t version, uint64_t bytes) {
+static size_t verify_read_name(read_group *group, const char *name) {
   comparison *c = group->owner->run;
   size_t id;
   require(!strncmp(name, "key-", 4), "read key prefix");
   id = number(name + 4, 0, c->rows - 1);
-  require(id % c->writers == group->owner->ordinal && !group->seen[id] &&
-              version == c->rounds && bytes == c->bytes,
-          "read group captured metadata and unique membership");
+  require(id % c->writers == group->owner->ordinal && !group->seen[id],
+          "read group namespace and unique membership");
   group->seen[id] = 1;
   ++group->count;
   return id;
+}
+static size_t verify_read_key(read_group *group, const char *name,
+                              uint64_t version, uint64_t bytes) {
+  require(version == group->owner->run->rounds &&
+              bytes == group->owner->run->bytes,
+          "read group captured metadata");
+  return verify_read_name(group, name);
+}
+typedef struct sdk_output {
+  lc_sink pub;
+  read_group *group;
+  size_t bytes;
+} sdk_output;
+static int sdk_write(lc_sink *pub, const void *bytes, size_t n, lc_error *e) {
+  sdk_output *out = pub->impl;
+  comparison *c = out->group->owner->run;
+  (void)e;
+  require(n <= c->bytes - out->bytes &&
+              !memcmp(bytes, out->group->owner->body + out->bytes, n),
+          "SDK streamed body bytes");
+  out->bytes += n;
+  return 1;
+}
+typedef struct sdk_keys {
+  read_group *group;
+  size_t bytes;
+  char key[64];
+} sdk_keys;
+static int sdk_key_begin(void *context, lc_error *e) {
+  sdk_keys *keys = context;
+  (void)e;
+  keys->bytes = 0;
+  return 1;
+}
+static int sdk_key_chunk(void *context, const char *bytes, size_t n,
+                         lc_error *e) {
+  sdk_keys *keys = context;
+  (void)e;
+  require(n < sizeof(keys->key) - keys->bytes, "SDK key chunk bounds");
+  memcpy(keys->key + keys->bytes, bytes, n);
+  keys->bytes += n;
+  keys->key[keys->bytes] = 0;
+  return 1;
+}
+static int sdk_key_end(void *context, lc_error *e) {
+  sdk_keys *keys = context;
+  (void)e;
+  (void)verify_read_name(keys->group, keys->key);
+  return 1;
 }
 static int verify_read_result(const char *name,
                               const lc_pouch_state_read_result *result,
@@ -743,7 +817,53 @@ static void *read_main(void *context) {
     pthread_cond_wait(&c->condition, &c->mutex);
   pthread_mutex_unlock(&c->mutex);
   w->rc = LC_OK;
-  if (c->read_method == 1) {
+  if (c->sdk && c->read_method == 4) {
+    for (; w->rc == LC_OK && id < c->rows; id += c->writers) {
+      sdk_output out;
+      lc_get_res result;
+      memset(&out, 0, sizeof(out));
+      memset(&result, 0, sizeof(result));
+      out.pub.write = sdk_write;
+      out.pub.impl = &out;
+      out.group = &group;
+      names(w->ordinal, id, ns, name);
+      make_body(w->body, c->bytes, id, c->rounds - 1);
+      w->rc = c->client->get_in_namespace(c->client, ns, name, NULL, &out.pub,
+                                          &result, &e);
+      if (w->rc == LC_OK) {
+        require(!result.no_content && result.etag && result.content_type,
+                "SDK state metadata");
+        (void)verify_read_key(&group, name, result.version, out.bytes);
+      }
+      lc_get_res_cleanup(&result);
+    }
+  } else if (c->sdk) {
+    static const lc_query_key_handler handler = {sdk_key_begin, sdk_key_chunk,
+                                                 sdk_key_end};
+    sdk_keys keys;
+    lc_query_req req;
+    char *cursor = NULL;
+    int more;
+    memset(&keys, 0, sizeof(keys));
+    keys.group = &group;
+    memset(&req, 0, sizeof(req));
+    req.ns = ns;
+    req.engine = "scan";
+    req.limit = 256;
+    do {
+      lc_query_res page;
+      memset(&page, 0, sizeof(page));
+      req.cursor = cursor;
+      w->rc =
+          c->client->query_keys(c->client, &req, &handler, &keys, &page, &e);
+      lc_free_with_allocator(NULL, cursor);
+      cursor = page.cursor;
+      page.cursor = NULL;
+      more = cursor != NULL && cursor[0] != 0;
+      lc_query_res_cleanup(&page);
+    } while (w->rc == LC_OK && more);
+    lc_free_with_allocator(NULL, cursor);
+  } else if (c->read_method == 1) {
     const char *keys[64];
     char (*labels)[64] = malloc(64 * sizeof(*labels));
     size_t count;
@@ -1101,14 +1221,17 @@ int main(int argc, char **argv) {
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
         "runtime-compact|pouch-compact|"
         "runtime-scope|pouch-scope|"
-        "runtime-staged|pouch-staged|"
-        "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
-        "points|"
-        "runtime-scan-bodies|pouch-scan-bodies|"
-        "runtime-scan-metadata|pouch-scan-metadata|"
-        "stream-collection|pouch-collection "
-        "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
+        "runtime-staged|pouch-staged|",
         argv[0]);
+    fputs("runtime-sdk-read-points|pouch-sdk-read-points|"
+          "runtime-sdk-scan-metadata|pouch-sdk-scan-metadata|"
+          "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
+          "points|"
+          "runtime-scan-bodies|pouch-scan-bodies|"
+          "runtime-scan-metadata|pouch-scan-metadata|"
+          "stream-collection|pouch-collection "
+          "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
+          stderr);
     return 2;
   }
   memset(&c, 0, sizeof(c));
@@ -1130,6 +1253,10 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-scope") ||
               !strcmp(argv[1], "runtime-staged") ||
               !strcmp(argv[1], "pouch-staged") ||
+              !strcmp(argv[1], "runtime-sdk-read-points") ||
+              !strcmp(argv[1], "pouch-sdk-read-points") ||
+              !strcmp(argv[1], "runtime-sdk-scan-metadata") ||
+              !strcmp(argv[1], "pouch-sdk-scan-metadata") ||
               !strcmp(argv[1], "runtime-read-many") ||
               !strcmp(argv[1], "pouch-read-many") ||
               !strcmp(argv[1], "runtime-read-points") ||
@@ -1143,6 +1270,7 @@ int main(int argc, char **argv) {
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
+  c.sdk = strstr(argv[1], "-sdk-") != NULL;
   c.compaction = strstr(argv[1], "compact") != NULL;
   c.durable_scope = strstr(argv[1], "scope") != NULL;
   c.staged = strstr(argv[1], "staged") != NULL;

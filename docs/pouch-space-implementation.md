@@ -1047,13 +1047,91 @@ maintenance dependency set before cutover remains an acceptance requirement.
 
 This harness explicitly requires disabled query indexing, background maintenance
 and queue watches, exclusive root ownership and no generated external key file.
-State staged/lease publication requests and staged decision replay return
-unsupported. Other Pouch APIs are outside this harness's current call contract.
-Prepared/namespace mutation APIs, public query-client ownership, collections,
-queues, XA, indexes,
-logical snapshot/obsolete policy, maintenance and shared-root operation remain
-integration work. This is a verified ordinary-state slice, not full backend
-acceptance or deployment authorization.
+Staged writes, prepared mutations, promotion/commit/discard and cold decision
+replay are covered by the framing slice above. Requests that mark a query-index
+operation active still return unsupported. Live-stage maintenance, public
+leases/queue/XA ownership, collections, indexes, retention work references and
+shared-root operation remain integration work. Full backend acceptance and
+deployment authorization remain separate.
+
+## SDK client runtime admission
+
+The private `ps_pouch_client_open` harness admits the existing container owner
+through the common SDK client constructor. `lc_client_open` retains its normal
+multifile admission. A private factory receives the resolved endpoint path,
+allocator and effective Pouch options after the normal endpoint/settings
+validation. The constructor invokes it once and owns every returned runtime,
+including during failed initialization. It retains neither the factory nor its
+context. The common constructor still installs the complete production method
+table, copies configuration, initializes logging/lifecycle ownership and enters
+transaction recovery. There is no separate container method table, public
+backend selector, persistent format change or ABI change.
+
+The private wrapper adds only create/open intent, initial/maximum physical
+capacity and the existing I/O fault seam. Logical settings keep their ordinary
+SDK precedence and validation; unsupported indexing/background/watch/shared
+settings are rejected by the existing container owner. Creation requires a new
+file; it cannot adopt or overwrite another store. Native root conversion and
+production cutover remain outside this admission seam.
+
+The implemented SDK call envelope covers streamed get/get-in-namespace, mapped
+load, scan queries and namespace query configuration. It reuses production
+handlers over the typed canonical state boundary. Seeded state tests compare
+native and container owners across all four codecs and both policies, warm and
+after reopen. Generic object records remain query-visible when not hidden;
+attachment visibility follows the SDK's explicit query-hidden flag. Pure scan
+queries retain the existing zero index-freshness sequence. Namespace config
+updates retain etag preconditions, inherited settings and durable readback under
+the root policy. Public leases, attachments, queues, history consumers, XA and
+indexed query ownership still require their remaining integrations.
+
+Receiver tests close the client from a get sink callback while the operation's
+pin protects response cleanup. Query tests cover one-row pagination, callback
+error and retry. The fixture checks custom allocation domains, releases every
+client-owned allocation and enumerates its parent directory for unexpected
+persistent files. Factory validation covers rejection before admission, success
+without a runtime, and failure after a real owner has been returned; the latter
+must release its file lock and permit reopen. Initial fault sweeps pass all 344
+allocation and 176 I/O sites across create/reopen, both policies, plain/combined
+codecs and calls with/without an error object. Positive short reads must complete;
+partial writes followed by EIO retain the normal uncertain-store behavior.
+
+The comparison adds `runtime-sdk-read-points`/`pouch-sdk-read-points` and
+`runtime-sdk-scan-metadata`/`pouch-sdk-scan-metadata`. They seed ordinary committed
+records through the same logical state engine, then time public SDK streamed
+gets or paged key scans. Gets verify bytes and versions; key scans verify exact
+membership, with full canonical readback outside that timed phase. Warm and
+reopened CTest fixtures include 64 KiB bodies.
+
+The SDK slice passes the complete 420-group Debug CTest run (3,503.25 seconds),
+including the existing crash matrix, public method contracts and shared-library
+symbol boundary. Focused native GNU and musl release runs each pass 25 groups
+(45.12 and 43.72 seconds). GNU tests use 128 KiB default worker stacks with the
+glibc stack cache disabled; musl uses its ordinary defaults. Formatting and
+whitespace checks pass. Logs and complete test output are retained under
+`build/pouch-space-client/`: `debug-standard.log`,
+`debug-standard-details.log`, `gnu-tests.log`, `gnu-test-details.log`,
+`musl-tests.log` and `musl-test-details.log`.
+
+Strict ThreadSanitizer passes all four SDK test modes and 40 four-worker SDK
+comparisons across both backends, both sync policies and both read profiles,
+five samples each. The binaries are relinked using the retained fully
+instrumented OpenSSL archives, with no suppressions and `halt_on_error=1`.
+`tsan-build.log`, `tsan-relink.sh`, `tsan-check.sh`, `tsan.log` and the per-case
+`tsan/` logs retain the exact inputs and output. Memcheck passes all four SDK
+modes: 334,619 allocations and matching frees, zero live blocks, zero errors
+and zero suppressions. `memcheck.sh`, `memcheck.log` and `memcheck/` retain its
+commands and detailed reports.
+
+All 80 matched SDK performance trials verify their results and retain exactly
+one 10 MiB container file. Seven of eight warm read/scan range pairs overlap;
+the four-worker Durable get ranges are narrowly separated in the container's
+favor. Reopen plus first read remains clearly slower in every configuration:
+container medians 7.520–10.175 ms versus multifile 1.064–1.799 ms. The
+[SDK performance results](pouch-space-experiment.md#sdk-client-read-and-scan-comparison)
+record every configuration, ranges, CPU, workload limits and frozen input
+identity. These measurements cover SDK reads/scans over canonical seeded data;
+they do not price the remaining public leased-write integration.
 
 ## Integration and acceptance
 
@@ -1087,9 +1165,9 @@ namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
 Namespace heads, segment ownership/rotation and bounded canonical replay now use
 this owner too. The private ordinary-state harness now uses the production
 projection, ordinary mutation policy, read-many, visits and paged scan/body
-snapshots. Advanced mutation paths, public query-client ownership,
-logical snapshot/obsolete policy and public collection ownership still require
-integration. Normal `lc_pouch_open` uses
+snapshots, staged/prepared mutations and the SDK call envelope above. Live-stage
+maintenance, retention/lease/queue/XA ownership, indexed queries and public
+collection ownership still require integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
 
@@ -1137,11 +1215,10 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-This is partial integration, not root-wide adoption. Collection owners, advanced
-namespace mutation policy, public query-client ownership, logical snapshot/obsolete
-policy, position/receipt
-authority and remaining control/projection owners still need conversion to
-container ownership. Normal public Pouch tests continue to
+Public collection owners, live-stage maintenance, retention/lease/queue/XA
+ownership, indexed queries, position/receipt authority and remaining
+control/projection owners still need conversion to container ownership.
+Normal public Pouch tests continue to
 exercise the segmented backend through the shared record I/O boundary.
 
 Complete storage integration covers states, objects, attachments, leases,

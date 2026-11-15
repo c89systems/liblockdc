@@ -4271,3 +4271,93 @@ covers the measurement artifacts and source snapshot. Full correctness evidence
 is linked from the implementation contract. This comparison accepts the
 implemented framing/staged slice; full backend acceptance and deployment
 cutover remain open.
+
+## SDK client read and scan comparison
+
+The private container admission now uses the common production SDK client
+constructor and method table. This slice verifies streamed get/get-in-namespace,
+mapped load, scan queries and namespace query configuration against the native
+multifile owner. Public backend selection, leased writes, queues, collections,
+XA, indexed queries, live-stage maintenance and shared-root coordination remain
+outside this completed slice. The implementation contract records its
+[call envelope and correctness evidence](pouch-space-implementation.md#sdk-client-runtime-admission).
+
+The matched comparison uses native x86_64 GNU release code: 128 keys with
+1 KiB bodies, two ordinary canonical PUT rounds, one or four workers, 4 KiB
+producer chunks, NoSync/Durable roots and five samples per configuration. The
+same frozen executable runs both backends. Backend order and profile order
+alternate between samples. All 80 trials verify bytes/versions or exact key
+membership, followed by complete canonical readback. Every container retains
+one regular file of length 10,485,760 bytes with no store directories or
+persistent sidecars.
+
+The write phase seeds records through the production logical state engine.
+Only the read phase uses the SDK methods: streamed get-in-namespace or paged
+query-keys with the scan engine and no selector. The key scan validates
+membership; the SDK key API does not return the version/body metadata provided
+by the earlier low-level scan-summary comparison. Neither this seed phase nor
+its write timings constitute a public leased-write benchmark.
+
+Warm elapsed milliseconds below are median [minimum–maximum] across five
+samples; CPU columns are median process milliseconds for the complete read
+phase. Worker count applies to both the seed and read phases; the 128 keys
+remain the total workload.
+
+| Policy | Workers | SDK operation | Container read ms | Multifile read ms | Container CPU ms | Multifile CPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | get | 0.790 [0.537–1.841] | 0.574 [0.528–1.112] | 0.808 | 0.582 |
+| NoSync | 1 | key scan | 0.255 [0.208–0.393] | 0.299 [0.193–0.330] | 0.265 | 0.304 |
+| NoSync | 4 | get | 0.513 [0.343–0.612] | 0.654 [0.466–1.820] | 1.354 | 1.493 |
+| NoSync | 4 | key scan | 0.304 [0.246–0.352] | 0.295 [0.279–0.348] | 0.883 | 0.650 |
+| Durable | 1 | get | 0.745 [0.648–1.005] | 0.793 [0.729–1.895] | 0.740 | 0.791 |
+| Durable | 1 | key scan | 0.307 [0.231–0.363] | 0.339 [0.222–0.616] | 0.338 | 0.353 |
+| Durable | 4 | get | 0.502 [0.372–0.542] | 0.662 [0.546–0.876] | 1.387 | 1.599 |
+| Durable | 4 | key scan | 0.301 [0.181–0.461] | 0.276 [0.252–0.547] | 0.855 | 0.820 |
+
+Warm performance is mixed. Seven of eight elapsed-range pairs overlap.
+Four-worker Durable gets favor the container, with a narrow 0.004291 ms gap
+between its slowest and multifile's fastest sample; the median is 0.502 versus
+0.662 ms. NoSync one-worker gets are slower by median (0.790 versus 0.574 ms).
+The sample does not establish a general SDK read/scan speedup. CPU results
+also vary by workload; four-worker key scans use more container CPU.
+
+Reopen readiness is measured separately as constructor reopen plus the first
+complete SDK read phase. These are new logical owners over the same host's
+filesystem cache, without dropping OS caches. They do not measure a cold
+storage device. The first-read and CPU columns are medians; readiness retains
+the full elapsed range.
+
+| Policy | Workers | SDK operation | Container ready ms | Multifile ready ms | Container first read ms | Multifile first read ms | Container read CPU ms | Multifile read CPU ms |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | get | 10.175 [9.601–22.645] | 1.606 [1.451–1.805] | 2.239 | 0.664 | 2.251 | 0.682 |
+| NoSync | 1 | key scan | 9.945 [9.241–10.816] | 1.064 [0.860–2.700] | 1.808 | 0.226 | 1.818 | 0.238 |
+| NoSync | 4 | get | 8.578 [7.374–21.464] | 1.799 [1.527–2.206] | 1.023 | 0.570 | 3.032 | 1.348 |
+| NoSync | 4 | key scan | 8.727 [7.828–11.971] | 1.470 [1.169–1.865] | 0.936 | 0.289 | 2.746 | 0.739 |
+| Durable | 1 | get | 9.224 [7.948–12.073] | 1.526 [1.302–1.833] | 2.369 | 0.615 | 2.380 | 0.631 |
+| Durable | 1 | key scan | 8.457 [6.257–10.785] | 1.274 [1.083–1.422] | 1.896 | 0.253 | 1.914 | 0.267 |
+| Durable | 4 | get | 7.969 [6.847–9.870] | 1.771 [1.552–2.071] | 1.026 | 0.626 | 3.431 | 1.522 |
+| Durable | 4 | key scan | 7.520 [5.932–23.775] | 1.388 [1.208–2.481] | 0.934 | 0.319 | 2.798 | 0.679 |
+
+The container is slower on reopen in all eight configurations, with disjoint
+elapsed ranges. Readiness medians are 4.50–9.34 times multifile in this small
+workload; first-read CPU is higher too. This remains a performance concern for
+the implementation. These results do not isolate the responsible component or
+replace the earlier canonical/staged write and low-level read comparisons.
+
+Filesystem allocation accounting (`stat.st_blocks * 512`) reports 10,485,760
+bytes for the one-worker container fixtures and 10,489,856 for four workers;
+logical file length stays 10 MiB in every trial. The multifile SDK fixtures
+contain 12 files/15 directories for one worker and 24 files/33 directories for
+four workers, with approximately 433–434 KiB of logical file contents.
+Preallocated capacity and occupied logical content are separate quantities.
+
+Evidence is retained under `build/pouch-space-client/`:
+`perf-paired.sh`, all 80 `paired/` logs, `perf-summary.pl` and
+`perf-results.json`. The summary checks exact workload, mode, sample coverage,
+successful verification and one-file length before producing statistics; raw
+logs retain seed timings, all I/O/barrier counts, RSS and storage accounting.
+The executable is `pouch_space_compare-sdk`, SHA-256
+`0e9b5023186afabf06ec99f4be9c1dc9ad2def36b5e9ec6e317ee2678a1b518d`.
+Its source is `548a7fa` plus the retained `sdk-source.patch`, SHA-256
+`33b97f8aee8b90e2db761e1859d52ad79dfbe34861b25f63b0a76005b6d969d8`;
+documentation edits after measurement do not affect these executable inputs.
