@@ -4,6 +4,7 @@
 #include "lc_pouch_internal.h"
 #include "namespace.h"
 #include "pouch.h"
+#include "pouch_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -2808,6 +2809,7 @@ static void maintenance(const char *path, const char *directory) {
       REQUIRE(!result.skipped && result.records == 5 && result.snapshot &&
               result.boundary == 1 && result.body_bytes &&
               result.metadata_bytes < 65536 && result.copied_bytes);
+      ok(ps_metadata_repack(ps_root_space(ps_pouch_state_root(p)), &e), &e);
       /* The resident cache must be invalidated before covered sources can be
        * retired. These reads cannot fall back to their prior segment labels. */
       read_value(p, "projection", "a-state", 65569, 34, 2, &e);

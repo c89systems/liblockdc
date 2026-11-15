@@ -145,13 +145,23 @@ generation headers. A descriptor may span pages; its checked span determines
 ownership. An unused continuation pointer does not retain a page after the
 spanning record is retired. Pages are reclaimed after their last current record
 and old recoverable root are retired. Reader extent vectors retain payload pins
-independently of descriptor-page lifetime. Packing fragmented metadata pages is
-future maintenance work.
+independently of descriptor-page lifetime. Explicit `ps_metadata_repack` promotes
+all current live descriptors into the existing dirty set and rewrites them
+densely through ordinary checkpoint/root retirement. Dirty replacements and
+tombstones retain their existing ownership transfer; unpublished writers stay
+private. Payloads, stream mappings, binding identities and held readers do not
+change. Tests reduce 185 fragmented metadata pages to 10 at the same 10 MiB
+capacity. Ordinary checkpoints remain incremental, and a clean checkpoint
+allocates no new metadata pages. Healthy repack failure retains its dirty plan
+for a later checkpoint or repack retry.
 
-Growth reserves backing space first and publishes capacity through that same
-checkpoint protocol. Uncommitted trailing space is ignored on open. Any failed
-structural I/O poisons the handle. Allocation failure before root publication
-reclaims private metadata pages and permits retry. Journal exhaustion uses an
+Growth reserves backing space first, then privately admits the new range under
+the allocator mutex so it can fund the checkpoint that publishes capacity and
+metadata together. Healthy failure aborts private metadata pages and removes
+that range from allocation before restoring the old capacity. Uncommitted
+trailing space is ignored on open. Any failed structural I/O poisons the handle;
+reopen reconciles the selected root. Allocation failure before root publication
+permits retry on the same owner. Journal exhaustion uses an
 incremental metadata checkpoint; no live payload is copied. Checkpoint/growth
 serialize publication and allocation, but never wait on a producer callback or
 on readers to finish.
@@ -591,7 +601,7 @@ admission remain pending. The current label pool still follows namespace-owner
 lifetime.
 
 The protected metadata region cannot be consumed by payloads. Complete
-maintenance admission, metadata repacking, resumable root transform conversion,
+maintenance admission, resumable root transform conversion,
 multi-process coordination and full Pouch integration remain future work. The
 foundation now implements forced ordinary-state relocation and makes no claim
 that all draft acceptance criteria are already satisfied.

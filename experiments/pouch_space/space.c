@@ -1051,7 +1051,9 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
                "container checkpoint generation exhausted");
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
-  rc = checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0, 0, error);
+  rc = s->dirty ? checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0,
+                                             0, error)
+                : LC_OK;
   if (rc == LC_OK)
     rc = directory_open(s, &directory, error);
   if (rc == LC_OK && s->dirty) {
@@ -2155,6 +2157,26 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+int ps_metadata_repack(ps_space *s, lc_error *error) {
+  ps_entry *p;
+  int rc;
+  if (!s)
+    return err(error, LC_ERR_INVALID, "metadata repack requires container");
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK) {
+    /* Dirty ownership already carries each old checkpoint reference through
+     * replacement/tombstone chains. Promote only current live entries; the
+     * normal checkpoint then retires every old descriptor reference exactly
+     * once, after the new root and old-root retirement are durable. */
+    for (p = s->entries; p; p = p->all_next)
+      if (p->state == 1 && !p->deleted && !p->dirty_link)
+        dirty_entry(s, p, NULL);
+    rc = checkpoint_locked(s, error);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   uint64_t capacity;
   ps_run *run;
@@ -2176,19 +2198,31 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
     rc = reserve_file(s, capacity, bytes, error);
   if (rc == LC_OK) {
     s->capacity += bytes;
-    rc = checkpoint_locked(s, error);
-    if (rc != LC_OK)
-      s->capacity = capacity; /* handle is poisoned for any structural I/O */
-  }
-  if (rc == LC_OK) {
+    /* These pages remain private under the allocator mutex until the new
+     * root commits capacity and metadata together. A full old space must not
+     * prevent growth from funding the checkpoint which publishes that growth.
+     * Trailing bytes are uncertified even when fallocate found an old range. */
     run->offset = capacity;
     run->bytes = bytes;
-    /* An ignored trailing range may already exist. fallocate reserves it but
-     * does not erase its contents; only owned preparation can certify zeros. */
     run->clean = 0;
     free_insert(s, run);
-  } else
-    lc_free_with_allocator(NULL, run);
+    run = NULL;
+    rc = checkpoint_locked(s, error);
+    if (rc != LC_OK) {
+      /* Healthy failure aborted all private checkpoint pages. Remove the
+       * entire new range again, without touching old allocator ownership.
+       * Uncertain I/O retains both ownership sets until reopen/reconciliation.
+       */
+      if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
+          exclude_run(s, capacity, bytes, NULL) != LC_OK) {
+        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "cannot roll back private growth range");
+      }
+      s->capacity = capacity;
+    }
+  }
+  lc_free_with_allocator(NULL, run);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

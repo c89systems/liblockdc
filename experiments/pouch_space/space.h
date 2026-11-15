@@ -121,8 +121,17 @@ int ps_flush(ps_space *, lc_error *);
 /* Durably checkpoint metadata, retire the previous recoverable root, then
  * reclaim unpinned retired runs. No live payload copying or file shrinking. */
 int ps_checkpoint(ps_space *, lc_error *);
-/* Explicit growth only, in whole MiB increments. Never exposes trailing
- * physical capacity until its checkpoint publication has completed. */
+/* Explicit metadata maintenance: rewrite all current descriptors and their
+ * directory references densely through the same durable root-retirement
+ * protocol. Payloads, stream mappings and captured readers are unchanged.
+ * Does not grow the file. A healthy failure leaves the promoted
+ * metadata dirty for a later checkpoint/repack retry; no new root is selected.
+ */
+int ps_metadata_repack(ps_space *, lc_error *);
+/* Explicit growth only, in whole MiB increments. The new range can privately
+ * fund its own metadata checkpoint under allocation authority. Capacity and
+ * metadata become visible together after root publication; healthy failure
+ * retains the old capacity. Uncertain I/O requires reopen/reconciliation. */
 int ps_grow(ps_space *, uint64_t, lc_error *);
 /* Cached logical owners still check admission after uncertain I/O. Success
  * performs no allocation, lock acquisition, I/O or durability barrier. Existing

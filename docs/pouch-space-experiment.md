@@ -2644,14 +2644,120 @@ SHA-256 `d6f686b1a9b0540a20e8f737c9996b6d71d6c66a15eaff2acee422042d6d4eda`.
 The prior `pouch_space_compare-projection-current` remains
 `d0a9475454c63fab72dc81230e74a6b6c709fd55320d76c4b216e53152b2a643`.
 
+## Metadata repacking and near-full growth
+
+Incremental checkpoints leave unchanged descriptors on their original immutable
+pages. Replacing hot entries one at a time can therefore retain many sparsely
+occupied pages, even when current logical metadata is small. The explicit
+`ps_metadata_repack` operation promotes current descriptors into the existing
+dirty ownership set and checkpoints them densely. It reuses the directory,
+alternate-root publication and old-root retirement protocol; no new persisted
+representation, body copy or public ABI is introduced. Ordinary checkpoints
+remain incremental. Clean checkpoints no longer require the full metadata
+shadow allowance when they allocate no new descriptor or directory pages.
+
+The fragmented fixture keeps 180 small keys and checkpoints their hot
+replacements separately. Repack reduces **185 metadata pages to 10**, under both
+sync policies, at the same 10 MiB capacity. It includes pending replacements and
+tombstones, excludes an unpublished writer, and preserves an old captured body.
+A second fixture holds a 3 MiB + 7 byte body, a spanning 16 KiB + 17 byte catalog
+name and a sealed stream. Measured repack writes are exactly the new directory
+and descriptor pages plus two 80-byte root headers. Reads are bounded by the
+directory page allowance; no body is read or copied. Its largest allocation is
+bounded by 16 KiB + 256 bytes. Payload allocation, stream/binding identities and
+held body, stream and catalog pins remain unchanged by repack. Populated reopen
+verifies the same bindings and bytes.
+
+The real Pouch compaction test also repacks its root with captured readers held,
+for all four codecs and both sync policies.
+
+Repack exposed a near-full growth bug: the old implementation published its
+capacity checkpoint before adding the new free range, so growth could fail
+because that checkpoint lacked space. The regression first failed at a 1 MiB
+growth with the checkpoint-capacity error. Growth now reserves backing and
+privately admits the range under allocator authority before checkpointing. New
+metadata may use those pages; the root commits capacity and metadata together.
+A healthy failure aborts private pages and removes the range before restoring
+old capacity. Uncertain I/O retains the poison/reopen rule. The test proves
+metadata writes actually enter the new range; separate checks verify repeated
+3→4→5→6 MiB growth and populated reopen after each step.
+
+A healthy failed repack deliberately retains its promoted dirty plan for a later
+checkpoint or repack retry. The growth fixture exercises precisely that state.
+This is explicit physical maintenance, not automatic scheduling or protected
+admission for an entire compaction/delete operation. The fixed maintenance floor
+and known-span reservations still do not guarantee full-capacity deletion.
+
+### Verification
+
+- Full Debug ASan/UBSan: **367/367** CTest groups passed in 1310.26 seconds.
+- Native GNU release: **19/19** affected groups passed in 173.82 seconds.
+- Native musl release: **19/19** affected groups passed in 177.92 seconds.
+- ThreadSanitizer: **13/13** affected groups passed in 355.78 seconds, including
+  concurrent repack and four ready durable publications.
+- Six Memcheck groups passed with **9,276,522 allocations and frees**, no live
+  blocks, errors or suppressions, including both complete new failure sweeps.
+
+Repack covers 34 write/sync, 580 allocation and 17 read failures (**631 cuts**).
+Growth covers 42 write/sync/reserve, 767 allocation and 21 read failures
+(**830 cuts**). Recovery verifies all seeded values and continued publication;
+allocation failures also prove retry on the same live owner. Intervening replace
+and delete before repack retry exercise dirty-reference ownership. Successful
+clean checkpoints add no directory/descriptor page writes. The growth tests
+accept either old or new committed capacity after uncertain I/O, with all data
+intact. Logs are `repack-debug-tests.log`, `repack-{gnu,musl,tsan}-tests.log` and
+the six `repack-*-memcheck.log` files under `build/pouch-space-integrated/`.
+The original failing growth check is `repack-growth-before.log`; the repaired
+isolated run is `repack-growth-fixed.log`.
+
+### Matched ordinary metadata updates
+
+The 80 serial GNU release runs compare current/prior container and
+current/prior multifile executables with five alternating-order samples. Each
+seeds 512 plaintext 1 KiB states, times two rounds of ordinary metadata updates,
+then verifies values after populated reopen. Four writers use separate namespaces.
+Every container run audits one 10 MiB file and no sidecars. OS cache is retained.
+These are ordinary-update regression measurements; they do not invoke explicit
+repack or measure its latency. Values below are medians in milliseconds.
+
+| Policy | Writers | Current C | Prior C | Current MF | Prior MF | Current C CPU | Current MF CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 63.315 | 65.482 | 50.770 | 54.791 | 26.384 | 29.514 |
+| NoSync | 4 | 12.733 | 12.869 | 14.633 | 13.808 | 33.373 | 36.202 |
+| Durable | 1 | 1869.695 | 1874.288 | 4677.070 | 4931.556 | 121.560 | 196.709 |
+| Durable | 4 | 1501.266 | 1269.218 | 2752.566 | 2852.351 | 173.185 | 217.859 |
+
+Single-writer NoSync remains about 25% slower than current multifile; its sample
+ranges overlap (48.032–71.478 versus 39.106–79.344 ms). Current/prior container
+ranges overlap in all four fixtures. The four-writer durable median rises about
+18%, with broad ranges of 1139.917–1697.949 versus 1086.898–1451.704 ms. These
+samples do not establish a cause or justify declaring the regression solved.
+Container CPU medians are lower than current multifile in all four fixtures.
+
+Current/prior container syscall-write totals match in each fixture: 342,692
+bytes for one writer and 341,576 for four. One writer makes three structural
+sync calls in NoSync and 1027 in durable mode, versus zero/1024 multifile. Four
+writers make zero NoSync syncs and median 518 durable syncs (516–522), versus
+1024 multifile; the prior container median is 519. Extra structural barriers and
+the earlier body-read/reopened-projection costs remain open performance work.
+
+Raw logs are `repack-metadata-paired/`, with runner
+`repack-metadata-paired.sh`, `repack-metadata-results.json` and
+`repack-metadata-benchmark.log`. The 85-artifact
+`repack-metadata-artifacts.sha256` manifest verifies. Previous maintenance,
+projection and snapshot-codec manifests remain intact and verify. The new
+executable is `pouch_space_compare-repack-current`, SHA-256
+`33aa8cf62b7c5d8ec29b9db0e799b56b2ddc16b850cedfa5664b83182876a5c4`;
+the prior is the maintenance executable recorded above.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
-pages and protected checkpoint/maintenance capacity. Earlier measurement tables
-above identify their implementation stages, including the current payload
-packing, canonical-stream, lifecycle, typed catalog and production collection
-and ordinary state record follow-ups. Namespace segments now have a real
+pages, a conservative checkpoint allowance and a fixed maintenance floor. Earlier
+measurement tables above identify their implementation stages, including the
+current payload packing, canonical-stream, lifecycle, typed catalog and production
+collection and ordinary state record follow-ups. Namespace segments now have a real
 container owner. Ordinary production state PUT/projection/point-read, metadata
 update, deletion, read-many, metadata visits and paged scan/body snapshots now
 join it through the private integration harness. Physical namespace snapshot
@@ -2659,11 +2765,13 @@ publication and protected obsolete-source reclamation are now available too.
 Forced ordinary-state compaction now joins these owners, with separate sealed
 body packs and a current-tail liveness check before reclamation. Its first
 matched performance series and checksum/read tradeoff are recorded above.
+Explicit metadata repacking and near-full checkpoint funding during growth now
+join that foundation, with the failure and ordinary-update measurements above.
 The next work must close whole-operation maintenance admission at capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still requires
-checkpoint scheduling, automatic compaction/retention policy, metadata repacking,
+checkpoint scheduling, automatic compaction/retention/repack policy,
 process-shared reader ownership, and complete public Pouch semantics. The current
 foundation permits rebinding a deleted physical key; it does not supply permanent collection
 position or retry authority. Full codec/index/XA/outbox integration remains part

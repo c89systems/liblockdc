@@ -39,9 +39,10 @@ maintenance operation remains required.
 State read-many, metadata visits and paged scan/body snapshots now use captured
 container read pins, with lazy bounded decoding and no body cache. Captured
 body access survives callback mutation and Pouch close. Remaining public Pouch
-semantics, maintenance and shared-root coordination remain ahead. The namespace
-owner now publishes sealed canonical snapshots, replays their newer log tail,
-and explicitly retires obsolete sources while protecting captured readers.
+semantics, automatic maintenance and shared-root coordination remain ahead. The
+namespace owner now publishes sealed canonical snapshots, replays their newer
+log tail, and explicitly retires obsolete sources while protecting captured
+readers.
 Closed unbound private builds can be reclaimed without reading their bodies.
 The private harness now performs forced ordinary-state compaction: it relocates
 one source into a sealed body pack, publishes a metadata-only snapshot, and
@@ -51,6 +52,14 @@ encoded sources are consumed. Automatic policy, history protection and complete
 maintenance admission remain required; normal public open behavior has not
 changed. The experiment records matched compaction measurements and the new
 body-read cost alongside its earlier performance results.
+
+Explicit physical metadata repacking now rewrites current descriptors and their
+directory references through the existing checkpoint protocol, without copying
+bodies or growing the file. Normal checkpoints remain incremental. Growth now
+lets the new range privately fund the metadata checkpoint that publishes it;
+capacity and metadata become visible together. Tests cover near-full growth,
+healthy rollback/retry and uncertain-I/O recovery. These changes do not yet
+protect the complete maintenance operation from foreground capacity exhaustion.
 
 ## Intent
 

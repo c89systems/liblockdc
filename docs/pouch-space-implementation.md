@@ -78,6 +78,25 @@ free-span selection and ownership reconstructed from all replay dependencies.
 Tests cover fragmented spans, every cell boundary, pinned retirement, independent
 publication/checkpoint during a held neighbouring write, malformed ownership,
 and each publication I/O/heap failure, including mixed whole-run/cell cleanup.
+
+Explicit `ps_metadata_repack` promotes current descriptors into the ordinary
+checkpoint's dirty ownership set and rewrites them densely through the same
+directory and root-retirement protocol. It does not copy payloads, relocate
+stream mappings or change binding identities. Existing body, stream and catalog
+pins remain valid. Normal checkpoints still rewrite only changed records and
+paths; a clean checkpoint needs no metadata shadow allocation. A healthy failed
+repack retains its dirty plan for a later checkpoint or repack retry.
+
+Growth reserves backing first, then admits the new range privately under the
+allocator mutex so it can fund its own metadata checkpoint. Capacity and new
+directory pages publish in one root. Healthy failure aborts private pages and
+removes the new range from allocation before restoring the old capacity;
+uncertain structural I/O still requires reopen/reconciliation. Tests cover
+fragmented near-full metadata, repeated 1 MiB growth, every growth/repack heap
+and I/O failure, held pins and concurrent durable publications. Whole-operation
+maintenance admission remains required; explicit repacking and successful
+growth do not establish that guarantee for a fixed-capacity full store.
+
 Canonical append-owned streams are now implemented in the experimental target.
 An immutable identity header binds each whole-page grant to its stream and
 logical base; a typed head checkpoints its tail and grant directory. Appending
@@ -115,8 +134,7 @@ cannot resolve it. Tests cover both durability modes, each transition/checkpoint
 fault, malformed checksummed events, held barriers and full-journal rebinding.
 
 These streams do not yet implement public collection positions, receipts or
-shared-root ownership. Metadata repacking and production integration also remain
-to be implemented. See the
+shared-root ownership. Complete production integration remains ahead. See the
 [stream design](../experiments/pouch_space/stream.h) and
 [measured scope and regressions](pouch-space-experiment.md).
 

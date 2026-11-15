@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "catalog.h"
+#include "directory.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_record.h"
 #include "owned.h"
@@ -1027,7 +1028,7 @@ typedef struct commit_gate {
 typedef struct commit_actor {
   ps_space *space;
   commit_gate *gate;
-  int ordinal, rc, maintenance, remove, same_key;
+  int ordinal, rc, maintenance, remove, same_key, repack;
   ps_ref ref;
 } commit_actor;
 static ssize_t gate_read(void *v, int fd, void *p, size_t n, off_t offset) {
@@ -1126,7 +1127,8 @@ static void *commit_worker(void *context) {
   lc_error_init(&e);
   memset(body, 'A' + actor->ordinal, sizeof(body));
   if (actor->maintenance)
-    actor->rc = ps_checkpoint(actor->space, &e);
+    actor->rc = actor->repack ? ps_metadata_repack(actor->space, &e)
+                              : ps_checkpoint(actor->space, &e);
   else if (actor->remove)
     actor->rc = ps_delete(actor->space, state(actor->ordinal + 1), &e);
   else {
@@ -1163,7 +1165,7 @@ static void commit_coordination(void) {
   saved.stable_bytes = (size_t)PS_MIB;
   saved.stable = malloc(saved.stable_bytes);
   CHECK(saved.stable != NULL);
-  for (mode = 0; mode < 5; ++mode) {
+  for (mode = 0; mode < 6; ++mode) {
     clean();
     memset(&gate, 0, sizeof(gate));
     memset(actors, 0, sizeof(actors));
@@ -1197,6 +1199,7 @@ static void commit_coordination(void) {
       actors[i].gate = &gate;
       actors[i].ordinal = (int)i;
       actors[i].maintenance = i == 4;
+      actors[i].repack = mode == 5;
       actors[i].remove = mode == 3;
       actors[i].same_key = mode == 4;
     }
@@ -1222,7 +1225,7 @@ static void commit_coordination(void) {
     pthread_mutex_lock(&gate.mutex);
     CHECK(gate.finished == 0); /* no durable success before the barrier */
     pthread_mutex_unlock(&gate.mutex);
-    if (mode == 2) {
+    if (mode == 2 || mode == 5) {
       CHECK(pthread_create(&threads[4], NULL, commit_worker, &actors[4]) == 0);
       await_gate(&gate, 2);
     }
@@ -1239,7 +1242,7 @@ static void commit_coordination(void) {
       pthread_cond_broadcast(&gate.cond);
       pthread_mutex_unlock(&gate.mutex);
     }
-    for (i = 0; i < (mode == 2 ? 5U : 4U); ++i) {
+    for (i = 0; i < (mode == 2 || mode == 5 ? 5U : 4U); ++i) {
       CHECK(pthread_join(threads[i], NULL) == 0);
       CHECK(mode == 1 ? actors[i].rc != LC_OK : actors[i].rc == LC_OK);
     }
@@ -1407,19 +1410,20 @@ static void metadata_lifecycle(void) {
   puts("metadata: spanning packed records, shared-page retirement and rollover "
        "rebinding");
 }
-static void metadata_faults(void) {
+static void metadata_faults(int repack) {
   model m;
   ps_io io = model_init(&m);
   ps_space *s;
   ps_reader *r;
   unsigned char actual[16];
   size_t kind, phase, count, i, n;
-  int rc;
-  for (kind = 0; kind < 2; ++kind) {
+  int rc, resumed;
+  for (kind = 0; kind < (repack ? 3U : 2U); ++kind) {
     count = 0;
     for (phase = 0; phase <= count; ++phase) {
       clean();
-      m.operations = m.fail_at = 0;
+      m.operations = m.fail_at = m.fail_read = 0;
+      resumed = 0;
       s = create(3 * PS_MIB, 0, &io);
       for (i = 0; i < 512; ++i)
         put(s, state(i), "A", 1, 1);
@@ -1427,42 +1431,66 @@ static void metadata_faults(void) {
       for (i = 0; i < 16; ++i)
         put(s, state(i * 31), "B", 1, 1);
       m.operations = 0;
+      m.reads = 0;
       m.fail_at = kind == 0 ? phase : 0;
+      m.fail_read = kind == 2 ? phase : 0;
       m.tear = m.persist_torn = 1;
       allocation_call = 0;
       allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
-      rc = ps_checkpoint(s, &error);
+      rc = repack ? ps_metadata_repack(s, &error) : ps_checkpoint(s, &error);
       allocation_fail = 0;
-      m.fail_at = 0;
+      m.fail_at = m.fail_read = 0;
       if (!phase)
-        count = kind == 0 ? m.operations : allocation_call;
+        count = kind == 0   ? m.operations
+                : kind == 1 ? allocation_call
+                            : m.reads;
       if (rc != LC_OK) {
-        CHECK(kind == 0 || rc == LC_ERR_NOMEM);
+        CHECK(kind != 1 || rc == LC_ERR_NOMEM);
         lc_error_cleanup(&error);
-        if (kind == 1)
+        if (kind == 1) {
+          if (repack) {
+            put(s, state(511), "C", 1, 1);
+            OK(ps_delete(s, state(510), &error));
+            resumed = 1;
+          }
           OK(ps_checkpoint(s,
                            &error)); /* failed private builds are retryable */
+        }
       }
       OK(ps_close(s, &error));
       crash(&m);
       s = reopen(&io);
       for (i = 0; i < 512; ++i) {
+        if (resumed && i == 510) {
+          absent(s, state(i));
+          continue;
+        }
         OK(ps_read_open(s, state(i), NULL, &r, &error));
         OK(ps_read(r, actual, sizeof(actual), &n, &error));
-        CHECK(n == 1 && (actual[0] == 'A' ||
-                         (i % 31 == 0 && i / 31 < 16 && actual[0] == 'B')));
+        if (resumed && i == 511)
+          CHECK(n == 1 && actual[0] == 'C');
+        else
+          CHECK(n == 1 && (actual[0] == 'A' ||
+                           (i % 31 == 0 && i / 31 < 16 && actual[0] == 'B')));
         ps_reader_close(r);
       }
       put(s, state(9999), "after", 5, 1);
       OK(ps_checkpoint(s, &error));
       OK(ps_close(s, &error));
     }
-    CHECK(count > 15);
+    CHECK(kind == 2 ? count > 0 : count > 15);
+    if (repack)
+      printf("metadata repack failure sites (%s): %lu\n",
+             kind == 0   ? "write/sync"
+             : kind == 1 ? "allocation"
+                         : "read",
+             (unsigned long)count);
   }
   free(m.stable);
   clean();
-  puts("metadata: every multi-page checkpoint I/O and heap failure, "
-       "abort/retry and reuse");
+  printf("metadata %s: every multi-page I/O and heap failure, "
+         "abort/retry and reuse\n",
+         repack ? "repack" : "checkpoint");
 }
 static void metadata_recovery_allocations(void) {
   model m;
@@ -1513,6 +1541,347 @@ static void metadata_recovery_allocations(void) {
   puts("metadata: every allocation during multi-page descriptor recovery");
 }
 
+static void metadata_repack(void) {
+  const size_t entries = 180;
+  ps_space *s;
+  ps_stats before, after, unchanged;
+  ps_reader *held = NULL;
+  ps_writer *private_writer = NULL;
+  unsigned char *private_bytes = malloc(PS_CHUNK);
+  size_t i;
+  CHECK(private_bytes != NULL);
+  memset(private_bytes, 0x37, PS_CHUNK);
+  BAD(ps_metadata_repack(NULL, &error));
+  for (int sync = 0; sync < 2; ++sync) {
+    clean();
+    s = create(PS_DEFAULT_CAPACITY, sync, NULL);
+    OK(ps_metadata_repack(s, &error));
+    for (i = 0; i < entries; ++i)
+      put(s, state(i), "A", 1, 1);
+    OK(ps_checkpoint(s, &error));
+    OK(ps_read_open(s, state(0), NULL, &held, &error));
+    /* Keep one cold reference per initial descriptor page, then separate hot
+     * descriptors into one-page checkpoints. Logical metadata stays small. */
+    for (i = 0; i < entries; ++i) {
+      if (i % 45 == 44)
+        continue;
+      put(s, state(i), "B", 1, 1);
+      OK(ps_checkpoint(s, &error));
+    }
+    OK(ps_status(s, &before, &error));
+    size_t fragmented = before.metadata_pages;
+    CHECK(fragmented > entries / 2);
+    /* Repack also includes dirty replacement/tombstone ownership and excludes
+     * an unpublished writer, even though its payload pages are already owned.
+     */
+    put(s, state(0), "C", 1, 1);
+    OK(ps_delete(s, state(1), &error));
+    OK(ps_begin(s, state(999), &private_writer, &error));
+    OK(ps_write(private_writer, private_bytes, PS_CHUNK, &error));
+    OK(ps_status(s, &before, &error));
+    OK(ps_metadata_repack(s, &error));
+    OK(ps_status(s, &after, &error));
+    CHECK(after.capacity == before.capacity && after.entries == entries - 1 &&
+          !after.journal_bytes && after.live_bytes == before.live_bytes &&
+          after.private_bytes == before.private_bytes &&
+          after.checkpoints == before.checkpoints + 1 &&
+          after.metadata_pages <= (after.metadata_bytes + 4031) / 4032 +
+                                      ps_directory_page_bound(after.entries));
+    CHECK(after.metadata_pages < before.metadata_pages / 4);
+    read_value(held, "A", 1);
+    ps_reader_close(held);
+    for (i = 0; i < entries; ++i) {
+      if (i == 1)
+        absent(s, state(i));
+      else
+        expect(s, state(i), NULL, i == 0 ? "C" : i % 45 == 44 ? "A" : "B", 1);
+    }
+    OK(ps_publish(private_writer, NULL, &error));
+    ps_writer_close(private_writer);
+    expect(s, state(999), NULL, private_bytes, PS_CHUNK);
+    OK(ps_checkpoint(s, &error));
+    OK(ps_status(s, &unchanged, &error));
+    /* An ordinary clean checkpoint still writes no directory/descriptor page.
+     */
+    OK(ps_checkpoint(s, &error));
+    OK(ps_status(s, &before, &error));
+    CHECK(before.directory_page_writes == unchanged.directory_page_writes &&
+          before.descriptor_page_writes == unchanged.descriptor_page_writes);
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, state(0), NULL, "C", 1);
+    absent(s, state(1));
+    expect(s, state(44), NULL, "A", 1);
+    expect(s, state(2), NULL, "B", 1);
+    expect(s, state(999), NULL, private_bytes, PS_CHUNK);
+    OK(ps_close(s, &error));
+    printf("metadata repack: %lu fragmented pages to %lu dense pages\n",
+           (unsigned long)fragmented, (unsigned long)after.metadata_pages);
+  }
+  free(private_bytes);
+  clean();
+}
+typedef struct repack_audit {
+  model model;
+  uint64_t written;
+  uint64_t growth_base;
+  size_t growth_writes;
+} repack_audit;
+static ssize_t repack_write(void *context, int fd, const void *p, size_t bytes,
+                            off_t offset) {
+  repack_audit *audit = context;
+  ssize_t n = model_write(&audit->model, fd, p, bytes, offset);
+  if (n > 0)
+    audit->written += (uint64_t)n;
+  if (n > 0 && audit->growth_base && (uint64_t)offset >= audit->growth_base)
+    ++audit->growth_writes;
+  return n;
+}
+static void metadata_repack_surfaces(void) {
+  repack_audit audit;
+  ps_io io = model_init(&audit.model);
+  ps_space *s;
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_stream_reader *stream_pin = NULL;
+  ps_reader *body_pin = NULL;
+  ps_stream_info info;
+  ps_catalog_view *view = NULL;
+  ps_catalog_info binding, observed;
+  ps_stats before, after;
+  ps_key stream_key = {77, 1, PS_STREAM};
+  size_t length = 3 * (size_t)PS_MIB + 7, name_bytes = PS_CHUNK + 17, got;
+  unsigned char *body = malloc(length), *name = malloc(name_bytes);
+  char readback[3];
+  CHECK(body && name);
+  memset(body, 0x49, length);
+  memset(name, 0x53, name_bytes);
+  io.context = &audit;
+  io.write = repack_write;
+  audit.written = 0;
+  audit.growth_base = 0;
+  audit.growth_writes = 0;
+  clean();
+  s = create(4 * PS_MIB, 0, &io);
+  put(s, state(1), body, length, 8191);
+  OK(ps_stream_open(s, stream_key, 1, NULL, NULL, NULL, &stream, &error));
+  OK(ps_stream_begin(stream, &writer, &error));
+  OK(ps_stream_write(writer, "abc", 3, &error));
+  OK(ps_stream_commit(writer, NULL, NULL, &error));
+  ps_stream_writer_close(writer);
+  OK(ps_stream_seal(stream, &error));
+  OK(ps_stream_status(stream, &info, &error));
+  OK(ps_catalog_put(s, 99, PS_CATALOG_PROJECTION, name, name_bytes, NULL,
+                    stream_key, &info.ref, &binding, &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_read_open(s, state(1), NULL, &body_pin, &error));
+  OK(ps_stream_read_open(stream, 0, 3, &stream_pin, &error));
+  OK(ps_catalog_get(s, 99, PS_CATALOG_PROJECTION, name, name_bytes, &view,
+                    &error));
+  CHECK(view != NULL);
+  OK(ps_status(s, &before, &error));
+  audit.written = 0;
+  audit.model.read_bytes = 0;
+  allocation_max = 0;
+  measure_allocations = 1;
+  OK(ps_metadata_repack(s, &error));
+  measure_allocations = 0;
+  OK(ps_status(s, &after, &error));
+  CHECK(after.live_bytes == before.live_bytes &&
+        after.allocated_bytes == before.allocated_bytes &&
+        after.entries == before.entries && after.capacity == before.capacity);
+  CHECK(audit.model.read_bytes <=
+        ps_directory_page_bound(before.entries) * PS_PAGE);
+  CHECK(audit.written ==
+        (after.directory_page_writes - before.directory_page_writes +
+         after.descriptor_page_writes - before.descriptor_page_writes) *
+                PS_PAGE +
+            2 * PS_ROOT_BYTES);
+  CHECK(allocation_max <= PS_CHUNK + 256);
+  OK(ps_catalog_view_info(view, &observed, &error));
+  CHECK(observed.id == binding.id &&
+        observed.revision.incarnation == binding.revision.incarnation &&
+        observed.target.incarnation == info.ref.incarnation);
+  ps_catalog_view_close(view);
+  read_value(body_pin, body, length);
+  ps_reader_close(body_pin);
+  OK(ps_stream_read(stream_pin, readback, sizeof(readback), &got, &error));
+  CHECK(got == 3 && !memcmp(readback, "abc", 3));
+  ps_stream_reader_close(stream_pin);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  crash(&audit.model);
+  s = reopen(&io);
+  expect(s, state(1), NULL, body, length);
+  OK(ps_catalog_get(s, 99, PS_CATALOG_PROJECTION, name, name_bytes, &view,
+                    &error));
+  CHECK(view != NULL);
+  OK(ps_catalog_view_info(view, &observed, &error));
+  CHECK(observed.id == binding.id &&
+        observed.revision.incarnation == binding.revision.incarnation);
+  ps_catalog_view_close(view);
+  OK(ps_stream_open(s, stream_key, 0, &info.ref, NULL, NULL, &stream, &error));
+  OK(ps_stream_read_open(stream, 0, 3, &stream_pin, &error));
+  OK(ps_stream_read(stream_pin, readback, sizeof(readback), &got, &error));
+  CHECK(got == 3 && !memcmp(readback, "abc", 3));
+  ps_stream_reader_close(stream_pin);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  free(body);
+  free(name);
+  free(audit.model.stable);
+  clean();
+}
+static size_t metadata_growth_fixture(ps_space *s, const unsigned char *body) {
+  size_t i, count;
+  int rc = LC_OK;
+  for (i = 0; i < 180; ++i)
+    put(s, state(i), "A", 1, 1);
+  OK(ps_checkpoint(s, &error));
+  for (i = 0; i < 180; ++i) {
+    if (i % 45 == 44)
+      continue;
+    put(s, state(i), "B", 1, 1);
+    OK(ps_checkpoint(s, &error));
+  }
+  for (count = 0; count < 1024; ++count) {
+    ps_writer *w = NULL;
+    OK(ps_begin(s, state(1000 + count), &w, &error));
+    rc = ps_write(w, body, PS_PAGE, &error);
+    if (rc == LC_OK)
+      rc = ps_publish(w, NULL, &error);
+    ps_writer_close(w);
+    if (rc != LC_OK)
+      break;
+  }
+  CHECK(count > 100 && count < 1024 && rc == LC_ERR_INVALID && error.message &&
+        strstr(error.message, "capacity"));
+  lc_error_cleanup(&error);
+  OK(ps_checkpoint(s, &error));
+  /* A clean checkpoint needs no new metadata pages at this same capacity. */
+  OK(ps_checkpoint(s, &error));
+  CHECK(ps_metadata_repack(s, &error) == LC_ERR_INVALID && error.message &&
+        strstr(error.message, "capacity"));
+  lc_error_cleanup(&error);
+  return count;
+}
+static void metadata_growth(void) {
+  unsigned char *body = malloc(PS_PAGE);
+  ps_space *s;
+  ps_stats stats;
+  size_t count, step;
+  CHECK(body != NULL);
+  memset(body, 0x51, PS_PAGE);
+  clean();
+  s = create(3 * PS_MIB, 0, NULL);
+  count = metadata_growth_fixture(s, body);
+  for (step = 1; step <= 3; ++step) {
+    OK(ps_grow(s, PS_MIB, &error));
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.capacity == (3 + step) * PS_MIB);
+    expect(s, state(0), NULL, "B", 1);
+    expect(s, state(44), NULL, "A", 1);
+    expect(s, state(1000), NULL, body, PS_PAGE);
+    expect(s, state(999 + count), NULL, body, PS_PAGE);
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.capacity == (3 + step) * PS_MIB);
+  }
+  OK(ps_close(s, &error));
+  free(body);
+  clean();
+}
+static void metadata_growth_faults(void) {
+  repack_audit audit;
+  ps_io io = model_init(&audit.model);
+  unsigned char *body = malloc(PS_PAGE);
+  unsigned char *baseline = malloc(3 * (size_t)PS_MIB);
+  ps_space *s;
+  ps_stats before, after;
+  size_t count, kind, phase, sites = 0, i;
+  int rc;
+  CHECK(body && baseline);
+  memset(body, 0x51, PS_PAGE);
+  io.context = &audit;
+  io.write = repack_write;
+  audit.written = audit.growth_base = audit.growth_writes = 0;
+  clean();
+  s = create(3 * PS_MIB, 0, &io);
+  count = metadata_growth_fixture(s, body);
+  OK(ps_close(s, &error));
+  CHECK(audit.model.stable_bytes == 3 * PS_MIB);
+  memcpy(baseline, audit.model.stable, 3 * (size_t)PS_MIB);
+  for (kind = 0; kind < 3; ++kind) {
+    sites = 0;
+    for (phase = 0; phase <= sites; ++phase) {
+      memcpy(audit.model.stable, baseline, 3 * (size_t)PS_MIB);
+      audit.model.stable_bytes = 3 * PS_MIB;
+      crash(&audit.model);
+      s = reopen(&io);
+      CHECK(ps_metadata_repack(s, &error) == LC_ERR_INVALID);
+      lc_error_cleanup(&error);
+      OK(ps_status(s, &before, &error));
+      audit.model.operations = audit.model.reads = 0;
+      audit.model.tear = audit.model.persist_torn = 1;
+      audit.model.fail_at = kind == 0 ? phase : 0;
+      audit.model.fail_read = kind == 2 ? phase : 0;
+      audit.growth_base = 3 * PS_MIB;
+      audit.growth_writes = 0;
+      allocation_call = 0;
+      allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
+      rc = ps_grow(s, PS_MIB, &error);
+      allocation_fail = 0;
+      audit.model.fail_at = audit.model.fail_read = 0;
+      if (!phase) {
+        OK(rc);
+        CHECK(audit.growth_writes > 0);
+        sites = kind == 0   ? audit.model.operations
+                : kind == 1 ? allocation_call
+                            : audit.model.reads;
+      } else {
+        CHECK(rc == (kind == 1 ? LC_ERR_NOMEM : LC_ERR_TRANSPORT));
+        lc_error_cleanup(&error);
+        if (kind == 1) {
+          OK(ps_status(s, &after, &error));
+          CHECK(after.capacity == before.capacity &&
+                after.metadata_pages == before.metadata_pages &&
+                after.entries == before.entries &&
+                after.journal_bytes == before.journal_bytes &&
+                audit.model.stable_bytes == 3 * PS_MIB);
+          /* Retry on this same live owner proves that private growth pages
+           * returned by checkpoint abort did not leak or remain admitted. */
+          OK(ps_grow(s, PS_MIB, &error));
+        }
+      }
+      OK(ps_close(s, &error));
+      crash(&audit.model);
+      s = reopen(&io);
+      OK(ps_status(s, &after, &error));
+      CHECK(after.capacity == 3 * PS_MIB || after.capacity == 4 * PS_MIB);
+      expect(s, state(0), NULL, "B", 1);
+      expect(s, state(44), NULL, "A", 1);
+      for (i = 0; i < count; ++i)
+        expect(s, state(1000 + i), NULL, body, PS_PAGE);
+      if (after.capacity == 3 * PS_MIB)
+        OK(ps_grow(s, PS_MIB, &error));
+      OK(ps_metadata_repack(s, &error));
+      put(s, state(9999), "after", 5, 1);
+      OK(ps_checkpoint(s, &error));
+      OK(ps_close(s, &error));
+    }
+    CHECK(sites > 0);
+    printf("private growth failure sites (%s): %lu\n",
+           kind == 0   ? "write/sync/reserve"
+           : kind == 1 ? "allocation"
+                       : "read",
+           (unsigned long)sites);
+  }
+  free(body);
+  free(baseline);
+  free(audit.model.stable);
+  clean();
+}
 static void packing_lifecycle(void) {
   ps_space *s;
   ps_reader *held;
@@ -4534,8 +4903,17 @@ int main(int argc, char **argv) {
       reopen_retirement();
     else if (strcmp(argv[2], "metadata") == 0) {
       metadata_lifecycle();
-      metadata_faults();
+      metadata_faults(0);
       metadata_recovery_allocations();
+    } else if (strcmp(argv[2], "metadata-repack") == 0) {
+      metadata_repack();
+      metadata_repack_surfaces();
+    } else if (strcmp(argv[2], "metadata-repack-faults") == 0) {
+      metadata_faults(1);
+    } else if (strcmp(argv[2], "metadata-growth") == 0) {
+      metadata_growth();
+    } else if (strcmp(argv[2], "metadata-growth-faults") == 0) {
+      metadata_growth_faults();
     } else if (strcmp(argv[2], "packing") == 0) {
       packing_lifecycle();
       packing_faults();
