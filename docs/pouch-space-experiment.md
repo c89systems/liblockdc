@@ -3486,3 +3486,139 @@ position or retry authority. Full codec/index/XA/outbox integration remains part
 of the authorized native implementation; existing-root conversion is excluded.
 Production adoption still requires the
 broader [draft acceptance evidence](pouch-space.md).
+
+## Cleanup durability scopes and cold crypto initialization
+
+The private storage boundary now supplies a root flush capability. Explicit
+cleanup barriers and scope completion stabilize the completed container prefix
+under either policy, including mutations completed before the scope began.
+Namespace inclusion checks authority and storage health without opening a
+namespace path. The physical readiness coordinator excludes private producers;
+an already covered prefix needs no further file sync. Scope completion preserves
+an earlier operation error while still attempting durability and releasing its
+thread-local ownership. This supplies cleanup's durability boundary, not complete
+retention/transaction cleanup or deferred durable container commits.
+
+The concurrent benchmark exposed OpenSSL initialization behavior that the
+earlier fixtures, which generated a crypto key before worker startup, did not
+exercise. Prepared uninstrumented OpenSSL reported an RCU hashtable access race.
+Building the checksum-verified pinned 3.6.5 source with ThreadSanitizer separately
+exposed a first-allocation race on `CRYPTO_malloc`'s `allow_customize` flag.
+Pouch runtime admission now calls the normal explicit initialization API before
+admitting record writers, including plaintext roots which still hash bodies.
+Initialization failure returns a null handle before root creation. A diagnostic
+constructor established the candidate repair; the product initializes at runtime
+admission and contains no such constructor.
+
+### Correctness evidence and remaining defects
+
+All **12 focused groups** pass under Debug ASan/UBSan in **4.27 s**, GNU release
+in **3.59 s**, and native musl release in **4.14 s**. Debug uses 128 KiB worker
+stacks with the glibc stack cache disabled; musl uses its default worker stack.
+The fixtures cover all four codec combinations, both policies, pre-scope
+mutations, grouped PUT/META/DELETE, explicit/completion/covered barriers, scope
+allocation failure, allocation-free flush, initialization failure/retry and
+sync-error precedence. An unpublished append in another namespace remains open
+through all barriers without changing its selected tail. Populated reopen
+checks bodies, metadata and the deleted key. The new scope test linked against
+the preceding integration fails at its namespace-file synchronization path.
+
+The complete **308-group Debug unit suite** passes in **1038.71 s**. Nine
+additional public API, shared-symbol, library-unload and worker-stack lifecycle
+checks pass in **7.95 s**. The full-suite log is `debug-full-unit.log`, and
+`api-lifecycle.log` records the boundary/lifecycle checks. The installed API and
+canonical record format are unchanged.
+
+With the actual product initialization change and fully instrumented OpenSSL,
+**40 concurrent comparison runs plus four focused groups** pass without
+suppressions. These use five repetitions of both engines, both policies and
+fresh/reopened roots, with two writers. The strict runner stops on the first
+failure. Four Memcheck runs complete **50,302 allocations and frees** with zero
+live blocks, errors or suppressions. Logs and diagnostic controls remain under
+`build/pouch-space-durable-scope/`, including `debug-init-focused.log`,
+`gnu-init-focused.log`, `musl-init-focused.log`, `tsan-runtime-init.log` and
+`memcheck-*.log`.
+
+A separate probe found an existing shared canonical defect: PUT, DELETE, then
+PUT reports successful recreation at version 1/index sequence 3, but immediate
+and reopened reads remain absent. It reproduces in both backends under both
+policies using the preceding release libraries. The prior recreation fixture
+checked the mutation result without reading that body. The scope fixture keeps
+its deleted key absent and uses another key for later writes. Recreation
+readback, including compaction and objects, remains a required correctness fix;
+the [implementation contract](pouch-space-implementation.md#known-canonical-recreation-defect)
+records the conflict with stale-generation replay protection.
+
+### Matched scope and ordinary-write measurements
+
+The final GNU binary and frozen preceding binary run **120 verified trials**:
+five alternating-order samples, both policies, one/four namespace writers,
+128 one-KiB states and two PUT rounds with 4 KiB producer chunks. Each fixture
+compares current container/multifile scopes and current/prior ordinary writes
+in both engines. A scope encloses both rounds in each writer; total elapsed time
+includes its final barrier, while individual PUT samples exclude that barrier.
+Every container trial retains one 10 MiB file, with no persistent sidecars.
+Caches are retained; these are small native fixtures, not cold-device or large
+machine acceptance measurements.
+
+| Policy | Writers | Container scope ms | Multifile scope ms | Container CPU ms | Multifile CPU ms | Container / multifile syncs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 15.401 | 22.424 | 5.914 | 5.831 | 3 / 3 |
+| NoSync | 4 | 21.889 | 21.781 | 9.590 | 11.004 | 6 / 12 |
+| Durable | 1 | 832.383 | 22.368 | 31.022 | 7.520 | 259 / 3 |
+| Durable | 4 | 606.924 | 31.649 | 47.473 | 11.630 | 137 / 12 |
+
+These expose a required integration gap: the container retains per-mutation
+durable synchronization inside a scope, while native multifile groups defer it
+until scope completion. At one writer, 259 versus three barriers makes the
+container about 37 times slower; at four writers the measured ratio is about
+19. This stage supplies forced NoSync durability but does not satisfy grouped
+durable performance acceptance. Implementing deferred group publication without
+weakening unrelated commits or blocking private producers remains required.
+Four-writer durable container scope barriers range from 135 to 140 as the
+existing coordinator coalesces ready publications.
+
+Ordinary container controls, shown as current / prior medians, retain exactly
+403,803 syscall-written bytes with one namespace and 407,092 with four:
+
+| Policy | Writers | Write ms | CPU ms | Create plus write ms |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 8.521 / 9.592 | 6.131 / 6.025 | 27.137 / 26.794 |
+| NoSync | 4 | 7.140 / 7.086 | 9.478 / 10.051 | 26.572 / 23.944 |
+| Durable | 1 | 806.150 / 716.895 | 32.970 / 33.414 | 833.224 / 731.219 |
+| Durable | 4 | 491.221 / 620.048 | 43.888 / 45.388 | 517.910 / 646.116 |
+
+Current/prior ranges overlap for write time, CPU and create-plus-write time in
+all four container fixtures. Normal NoSync barriers remain two/four; durable
+one-writer remains 259, and four-writer medians are 135/137 with overlapping
+135–137/135–138 ranges. Explicit crypto initialization moves first-use work into
+open, so create-plus-write is included rather than interpreting write time alone
+as a gain. Two scope trials also have large creation stalls: create-plus-write
+maxima reach 669.790/573.475 ms for NoSync one/four writers. These samples do not
+establish an ordinary-write timing regression or improvement.
+
+Ordinary container peak-RSS medians in table order are 8,220 / 9,036 KiB,
+8,588 / 9,440 KiB, 8,244 / 8,784 KiB and 8,404 / 9,308 KiB for current / prior.
+These process measurements include libraries and worker stacks; this small
+fixture does not establish large-store memory scaling.
+
+Reopened ready time includes root open and the first full verification of the
+latest values. Its scope medians still show a container deficit:
+
+| Policy | Writers | Container ready ms | Multifile ready ms |
+| --- | ---: | ---: | ---: |
+| NoSync | 1 | 11.563 | 5.246 |
+| NoSync | 4 | 27.610 | 4.848 |
+| Durable | 1 | 12.434 | 4.305 |
+| Durable | 4 | 24.865 | 4.689 |
+
+The current ELF is `build/pouch-space-durable-scope/pouch_space_compare-current`,
+SHA-256 `d948e25939a9ada5e2ef0ea4847d483fc86a1bd45b0809959f646d91f686a1b0`.
+The prior is the frozen joint-snapshot ELF with SHA-256
+`5df62ab9bf7b7e6261e38b8405a8df23c258643b692c526b79e8bc338d764a90`.
+The stage retains `scope-paired.sh`, `scope-summary.pl`, `results.json`,
+`benchmark.log` and all 120 raw logs under `paired/`. The performance checksum
+manifest covers both ELFs, runner, summarizer, summary, benchmark log and raw
+trials. These results do not close full backend correctness or performance
+acceptance; maintenance capacity architecture, grouped durable commits,
+recreation and the broader integration requirements remain open.

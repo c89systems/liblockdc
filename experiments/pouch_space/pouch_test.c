@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/crypto.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdint.h>
@@ -21,6 +22,7 @@
 static size_t checks, allocation, fail_at;
 static int armed;
 static char *crypto_key;
+static int fail_crypto_init;
 #define REQUIRE(x)                                                             \
   do {                                                                         \
     __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
@@ -50,6 +52,13 @@ void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
 }
 char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *p) {
   return fails() ? NULL : __real_lc_strdup_with_allocator(a, p);
+}
+int __real_OPENSSL_init_crypto(uint64_t, const OPENSSL_INIT_SETTINGS *);
+int __wrap_OPENSSL_init_crypto(uint64_t options,
+                               const OPENSSL_INIT_SETTINGS *settings) {
+  if (__atomic_load_n(&fail_crypto_init, __ATOMIC_ACQUIRE))
+    return 0;
+  return __real_OPENSSL_init_crypto(options, settings);
 }
 typedef union header {
   long double alignment;
@@ -175,6 +184,13 @@ static void read_value(lc_pouch *p, const char *ns, const char *key,
                        lc_error *e) {
   lc_pouch_state_read_result r = {0};
   ok(lc_pouch_state_read(p, ns, key, &r, e), e);
+  if (!r.found || !r.has_body || r.version != version || r.bytes != length)
+    fprintf(stderr,
+            "read %s/%s: found=%d body=%d version=%lu bytes=%lu; "
+            "expected version=%lu bytes=%lu\n",
+            ns, key, r.found, r.has_body, (unsigned long)r.version,
+            (unsigned long)r.bytes, (unsigned long)version,
+            (unsigned long)length);
   REQUIRE(r.found && r.has_body && r.version == version && r.bytes == length);
   drain(r.body, length, seed, e);
   ok(r.body->reset(r.body, e), e);
@@ -463,6 +479,241 @@ static int io_sync(void *context, int fd) {
 }
 static int io_reserve(void *context, int fd, off_t at, off_t n) {
   return io_fails(context) ? -1 : fallocate(fd, 0, at, n);
+}
+
+static uint64_t scope_syncs(lc_pouch *p, lc_error *e) {
+  ps_stats stats;
+  ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &stats, e), e);
+  return stats.syncs;
+}
+static void scope_put(lc_pouch *p, const char *ns, unsigned char seed,
+                      lc_error *e) {
+  input in = source(17, seed);
+  lc_pouch_state_write_result w = {0};
+  ok(put(p, ns, "key", &in, NULL, &w, e), e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+}
+static void crypto_initialization(const char *path) {
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  lc_error e;
+  lc_error_init(&e);
+  for (int container = 0; container < 2; ++container) {
+    int rc;
+    __atomic_store_n(&fail_crypto_init, 1, __ATOMIC_RELEASE);
+    if (container)
+      rc = ps_pouch_state_open(path, 1, &allocator, &o, &p, &e);
+    else
+      rc = lc_pouch_open(path, &allocator, &o.logical, &p, &e);
+    __atomic_store_n(&fail_crypto_init, 0, __ATOMIC_RELEASE);
+    REQUIRE(rc == LC_ERR_TRANSPORT && p == NULL && live == 0);
+    REQUIRE(access(path, F_OK) != 0 && errno == ENOENT);
+    clear(&e);
+  }
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  scope_put(p, "initialized", 1, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  read_value(p, "initialized", "key", 17, 1, 1, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+typedef struct scope_include {
+  lc_pouch *pouch;
+  const char *name;
+} scope_include;
+static int scope_include_locked(void *context, lc_error *e) {
+  scope_include *include = context;
+  return lc_pouch_state_durable_scope_include_namespace_locked(
+      include->pouch, include->name, e);
+}
+static void durable_scope(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int transform = 0; transform < 4; ++transform)
+    for (int durable = 0; durable < 2; ++durable) {
+      ps_pouch_state_options o = options(transform, durable);
+      lc_pouch *p = NULL;
+      lc_pouch_state_commit_group *scope = NULL, *nested = NULL;
+      ps_namespace *held = NULL;
+      ps_namespace_append *private = NULL;
+      ps_namespace_status before, after;
+      lc_pouch_state_write_options metadata = {0};
+      lc_pouch_state_write_result w = {0};
+      lc_pouch_state_read_result r = {0};
+      scope_include include;
+      uint64_t syncs;
+      struct iovec part = {(void *)"unfinished", 10};
+      o.logical.segment_target_bytes = 8 * PS_MIB;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      scope_put(p, "one", 1, &e);
+      scope_put(p, "two", 1, &e);
+      scope_put(p, "three", 1, &e);
+      scope_put(p, "held", 1, &e);
+      ok(ps_root_namespace_acquire(ps_pouch_state_root(p), "held", 0, &held,
+                                   &e),
+         &e);
+      ok(ps_namespace_status_get(held, &before, &e), &e);
+      ok(ps_namespace_append_begin(held, 0, 10, PS_APPEND_PREFIX, &private, &e),
+         &e);
+      ok(lc_pouch_record_io_append(ps_namespace_append_output(private), &part,
+                                   1, &e),
+         &e);
+      ok(ps_flush(ps_root_space(ps_pouch_state_root(p)), &e), &e);
+      syncs = scope_syncs(p, &e);
+      scope_put(p, "one", 2, &e);
+      REQUIRE(durable || scope_syncs(p, &e) == syncs);
+      /* Include a completed mutation from before this scope. The caller's
+       * namespace authority is mandatory, but no pathname is opened. */
+      REQUIRE(lc_pouch_state_durable_scope_include_namespace_locked(
+                  p, "one", &e) == LC_ERR_INVALID);
+      clear(&e);
+      ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+      REQUIRE(lc_pouch_state_durable_scope_begin(p, &nested, &e) ==
+                  LC_ERR_INVALID &&
+              nested == NULL);
+      clear(&e);
+      include = (scope_include){p, "one"};
+      ok(lc_pouch_state_with_namespace_lock(p, "one", scope_include_locked,
+                                            &include, &e),
+         &e);
+      syncs = scope_syncs(p, &e);
+      ok(lc_pouch_state_durable_scope_barrier(scope, &e), &e);
+      REQUIRE(scope_syncs(p, &e) == syncs + !durable);
+      syncs = scope_syncs(p, &e);
+      ok(lc_pouch_state_durable_scope_barrier(scope, &e), &e);
+      ok(lc_pouch_state_durable_scope_end(scope, LC_OK, &e), &e);
+      REQUIRE(scope_syncs(p, &e) == syncs);
+      /* One forced barrier covers complete PUT, META and DELETE records in
+       * different namespaces, while another producer remains unfinished. */
+      ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+      scope_put(p, "one", 3, &e);
+      scope_put(p, "two", 4, &e);
+      metadata.has_metadata = 1;
+      metadata.metadata = (const unsigned char *)"scope";
+      metadata.metadata_length = 5;
+      ok(lc_pouch_state_update_metadata(p, "one", "key", &metadata, &w, &e),
+         &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      ok(lc_pouch_state_delete(p, "two", "key", NULL, &w, &e), &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      REQUIRE(durable || scope_syncs(p, &e) == syncs);
+      syncs = scope_syncs(p, &e);
+      allocation = 0;
+      fail_at = 1;
+      __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+      int rc = lc_pouch_state_durable_scope_barrier(scope, &e);
+      __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+      ok(rc, &e);
+      REQUIRE(allocation == 0 && scope_syncs(p, &e) == syncs + !durable);
+      syncs = scope_syncs(p, &e);
+      ok(lc_pouch_state_durable_scope_end(scope, LC_OK, &e), &e);
+      REQUIRE(scope_syncs(p, &e) == syncs);
+      /* End supplies the barrier even when the caller already has an error.
+       * That error takes precedence over a later cleanup failure. */
+      ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+      scope_put(p, "three", 5, &e);
+      syncs = scope_syncs(p, &e);
+      lc_error_set(&e, LC_ERR_INVALID, 0, "original operation error", NULL,
+                   NULL, "test");
+      REQUIRE(lc_pouch_state_durable_scope_end(scope, LC_ERR_INVALID, &e) ==
+                  LC_ERR_INVALID &&
+              e.code == LC_ERR_INVALID &&
+              !strcmp(e.message, "original operation error"));
+      REQUIRE(scope_syncs(p, NULL) == syncs + !durable);
+      clear(&e);
+      allocation = 0;
+      fail_at = 1;
+      __atomic_store_n(&armed, 1, __ATOMIC_RELEASE);
+      rc = lc_pouch_state_durable_scope_begin(p, &scope, &e);
+      __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+      REQUIRE(rc == LC_ERR_NOMEM && scope == NULL);
+      clear(&e);
+      ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+      scope_put(p, "one", 6, &e);
+      syncs = scope_syncs(p, &e);
+      ok(lc_pouch_state_durable_scope_end(scope, LC_OK, &e), &e);
+      REQUIRE(scope_syncs(p, &e) == syncs + !durable);
+      ok(ps_namespace_status_get(held, &after, &e), &e);
+      REQUIRE(after.tail == before.tail &&
+              after.active_segment == before.active_segment);
+      read_value(p, "held", "key", 17, 1, 1, &e);
+      ps_namespace_append_close(private);
+      ps_namespace_release(held);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      read_value(p, "one", "key", 17, 6, 4, &e);
+      read_value(p, "three", "key", 17, 5, 2, &e);
+      ok(lc_pouch_state_read_metadata(p, "two", "key", &r, &e), &e);
+      REQUIRE(!r.found);
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      read_value(p, "held", "key", 17, 1, 1, &e);
+      ok(lc_pouch_state_read_metadata(p, "one", "key", &r, &e), &e);
+      REQUIRE(r.metadata_length == 5 && !memcmp(r.metadata, "scope", 5));
+      lc_pouch_state_read_result_cleanup(&allocator, &r);
+      one_file(directory);
+      lc_pouch_close(p);
+      REQUIRE(live == 0 && unlink(path) == 0);
+    }
+  lc_error_cleanup(&e);
+}
+static void durable_scope_faults(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int phase = 0; phase < 3; ++phase) {
+    io_fault f = {0};
+    ps_io io = {&f, io_read, io_write, io_sync, io_reserve, NULL};
+    ps_pouch_state_options o = options(0, 0);
+    lc_pouch *p = NULL;
+    lc_pouch_state_commit_group *scope = NULL;
+    lc_pouch_state_read_result r = {0};
+    o.logical.segment_target_bytes = 8 * PS_MIB;
+    o.io = &io;
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    scope_put(p, "one", 1, &e);
+    ok(ps_flush(ps_root_space(ps_pouch_state_root(p)), &e), &e);
+    ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+    scope_put(p, "one", 2, &e);
+    f.armed = 1;
+    f.fail = 1;
+    if (phase == 0) {
+      REQUIRE(lc_pouch_state_durable_scope_barrier(scope, &e) ==
+              LC_ERR_TRANSPORT);
+      REQUIRE(lc_pouch_state_durable_scope_end(scope, LC_ERR_TRANSPORT, &e) ==
+              LC_ERR_TRANSPORT);
+    } else if (phase == 1)
+      REQUIRE(lc_pouch_state_durable_scope_end(scope, LC_OK, &e) ==
+              LC_ERR_TRANSPORT);
+    else {
+      lc_error_set(&e, LC_ERR_PENDING, 0, "original pending operation", NULL,
+                   NULL, "test");
+      REQUIRE(lc_pouch_state_durable_scope_end(scope, LC_ERR_PENDING, &e) ==
+                  LC_ERR_PENDING &&
+              e.code == LC_ERR_PENDING &&
+              !strcmp(e.message, "original pending operation"));
+    }
+    REQUIRE(f.calls == 1);
+    f.armed = 0;
+    clear(&e);
+    REQUIRE(p->storage.ops->check(p->storage.context, &e) != LC_OK);
+    clear(&e);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+    ok(lc_pouch_state_read(p, "one", "key", &r, &e), &e);
+    REQUIRE(r.found && (r.version == 1 || r.version == 2));
+    drain(r.body, 17, r.version == 1 ? 1 : 2, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &r);
+    /* Both an error and an uncertain flush must have released the TLS scope. */
+    ok(lc_pouch_state_durable_scope_begin(p, &scope, &e), &e);
+    ok(lc_pouch_state_durable_scope_end(scope, LC_OK, &e), &e);
+    lc_pouch_close(p);
+    REQUIRE(live == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
 }
 static size_t io_case(const char *path, size_t nth, int sync, int partial) {
   io_fault f = {0};
@@ -3226,6 +3477,12 @@ static void *worker(void *context) {
     concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "io-faults"))
     io_faults(r->path);
+  else if (!strcmp(r->mode, "crypto-init"))
+    crypto_initialization(r->path);
+  else if (!strcmp(r->mode, "durable-scope"))
+    durable_scope(r->path, r->directory);
+  else if (!strcmp(r->mode, "durable-scope-faults"))
+    durable_scope_faults(r->path);
   else if (!strcmp(r->mode, "validation"))
     validation(r->path);
   else if (!strcmp(r->mode, "mutations"))

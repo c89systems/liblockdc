@@ -4948,6 +4948,12 @@ int lc_pouch_runtime_open(const char *root_path, const lc_allocator *allocator,
                         NULL);
   }
   *out = NULL;
+  /* Plaintext roots also hash payloads. Finish library initialization before
+   * independent writers can race libcrypto's first allocation. */
+  if (OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL) != 1)
+    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                        "failed to initialize pouch crypto library", NULL, NULL,
+                        "pouch");
   pouch = (lc_pouch *)lc_calloc_with_allocator(allocator, 1U, sizeof(*pouch));
   if (pouch == NULL) {
     return lc_error_set(error, LC_ERR_NOMEM, 0L,

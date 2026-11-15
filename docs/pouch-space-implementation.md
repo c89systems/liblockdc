@@ -531,6 +531,82 @@ coordination and complete protected capacity remain integration work. Current
 measurements and their observed read regression are recorded in the
 [experiment results](pouch-space-experiment.md#forced-ordinary-state-compaction).
 
+## Crypto initialization before writer admission
+
+Runtime admission explicitly initializes libcrypto through
+`OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL)`. Plaintext roots
+also hash their bodies; they must complete the library's first allocation
+before admitting concurrent record writers. This uses OpenSSL's initialization
+coordination at open. Failed initialization returns a transport error with a
+null handle before physical-root creation; a healthy retry remains possible.
+
+The dependency investigation uses the checksum-verified pinned OpenSSL 3.6.5
+source, built with ThreadSanitizer in
+`build/pouch-space-durable-scope/openssl-tsan/`. The prepared uninstrumented
+library reported an RCU hashtable publication race that requires instrumented
+dependency verification. Full instrumentation separately exposed a first-use
+race on `CRYPTO_malloc`'s `allow_customize` flag. A diagnostic explicit
+initialization before writers passed forty concurrent scope runs and three
+focused groups without suppressions. That diagnostic uses a test constructor;
+the product change initializes during runtime admission. The actual product
+change, linked with the instrumented dependency and without the diagnostic
+constructor, passes all forty concurrent comparisons plus four focused groups,
+including initialization failure and retry. The strict runner stops on any
+failure and uses no suppressions. Its log is
+`build/pouch-space-durable-scope/tsan-runtime-init.log`.
+
+## Cleanup durability scopes
+
+The logical cleanup scope now uses a typed root `flush` capability for container
+storage. An explicit barrier and scope completion force the completed
+publication prefix durable even under NoSync. Namespace inclusion retains its
+authority check and checks storage health without opening namespace paths or
+reading bodies. The existing physical readiness coordinator excludes unfinished
+private producers and avoids another file sync when the prefix is already
+covered. Normal NoSync mutations outside a forced scope retain their policy.
+
+Scope completion still attempts durability after an operation error, preserves
+that original error and releases its thread-local ownership on every path. A
+failed sync retains the physical owner's uncertain-outcome/poison behavior.
+This integrates cleanup's durability boundary; transaction work references,
+retention scheduling and complete cleanup ownership remain separate work. It
+does not defer the container's existing per-mutation durable commits.
+
+The focused fixture exercises all four codec combinations and both root
+policies, a mutation completed before scope creation, grouped PUT/META/DELETE,
+explicit and completion barriers, repeated covered barriers, allocation failure,
+sync failure and error precedence. It holds an unpublished append in another
+namespace across all barriers and checks that its prior published tail remains
+selected. The comparison modes `runtime-scope` and `pouch-scope` put both write
+rounds inside one forced scope per writer. Aggregate elapsed time includes final
+scope completion; individual PUT samples exclude that final group barrier.
+The full 308-group Debug unit gate passes with ASan/UBSan and constrained
+workers in 1038.71 s. Final focused GNU/musl runs pass all twelve groups in
+3.59/4.14 s; instrumented-dependency ThreadSanitizer passes forty concurrent
+comparisons and four groups, and four Memcheck runs have zero leaks/errors.
+The [measured results](pouch-space-experiment.md#cleanup-durability-scopes-and-cold-crypto-initialization)
+also show that deferred durable grouping remains required: this root barrier
+does not remove per-mutation synchronization inside a durable container scope.
+
+## Known canonical recreation defect
+
+A separate probe exposed an existing shared logical defect: PUT, DELETE, then
+PUT of the same key reports successful recreation at public version 1 and index
+sequence 3, while immediate and reopened reads still report absence. This
+reproduces in both the container and multifile implementation under both sync
+policies, using GNU release libraries from before the scope change. The
+reproducer and its four logs are under `build/pouch-space-durable-scope/` as
+`recreation-probe.c` and `recreation-{container,multifile}-{0,1}.log`.
+
+The mutation writer resets the public generation after a tombstone, while
+`lc_pouch_state_entry_supersedes` rejects lower payload generations before
+considering the newer index sequence. The existing recreation fixture checked
+the mutation result but did not read the recreated body. Full acceptance must
+reconcile successful recreation with the documented stale-generation replay
+protection, and prove immediate, reopened and compacted readback for states and
+objects. The scope change does not alter those ordering rules; its deletion
+fixture retains the deleted key and performs later writes on a different key.
+
 ## Standing maintenance capacity: decision pending
 
 The existing joint claim protects a particular admitted operation. A standing
@@ -563,9 +639,13 @@ compression/encryption. It also checks placeholder deletion is a no-op and
 preserves that placeholder and the distinct deleted body key across initial and
 replacement container snapshots and reopen.
 The expanded `pouch_space_pouch_key-bounds` test passes under Debug ASan/UBSan
-with constrained worker stacks in 2.34 s, GNU release in 1.80 s and native musl
-release in 1.79 s. Logs are `build/pouch-space-standing-capacity/` followed by
-`debug-key-bounds.log`, `gnu-key-bounds.log` and `musl-key-bounds.log`.
+with a 128 KiB worker stack in 2.24 s; the log is
+`build/pouch-space-durable-scope/debug-init-focused.log`. Earlier GNU release
+and native musl runs passed in 1.80 s and 1.79 s, recorded under
+`build/pouch-space-standing-capacity/` as `gnu-key-bounds.log` and
+`musl-key-bounds.log`. Debug CTest also applies its worker stack policy through
+the generated `CTestCustom.cmake`; explicit environment settings in later runs
+reinforce the same policy.
 
 Every current snapshot serializes the complete resolved key metadata, including
 keys whose bodies remain elsewhere. Protecting another complete snapshot

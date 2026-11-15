@@ -818,6 +818,9 @@ int lc_pouch_state_durable_scope_barrier(lc_pouch_state_commit_group *scope,
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch cleanup barrier requires its active scope", NULL,
                         NULL, "pouch");
+  if (scope->pouch->storage.ops != NULL)
+    return scope->pouch->storage.ops->flush(scope->pouch->storage.context,
+                                            error);
   while ((item = scope->head) != NULL) {
     rc = lc_pouch_state_commit_group_sync(scope, item->fd, error);
     if (rc != LC_OK)
@@ -846,7 +849,9 @@ static int lc_pouch_state_commit_group_end(lc_pouch_state_commit_group *group,
   }
   lc_pouch_state_commit_group_set(group->parent);
   rc = LC_OK;
-  for (item = group->head; item != NULL; item = item->next) {
+  if (group->force_sync && group->pouch->storage.ops != NULL)
+    rc = group->pouch->storage.ops->flush(group->pouch->storage.context, error);
+  for (item = group->head; rc == LC_OK && item != NULL; item = item->next) {
     if (item->fd >= 0) {
       rc = lc_pouch_state_commit_group_sync(group, item->fd, error);
       if (rc != LC_OK) {
@@ -12485,6 +12490,8 @@ int lc_pouch_state_durable_scope_include_namespace_locked(lc_pouch *pouch,
         error, LC_ERR_INVALID, 0L,
         "cleanup recovery durability requires scope and namespace authority",
         NULL, NULL, "pouch");
+  if (pouch->storage.ops != NULL)
+    return pouch->storage.ops->check(pouch->storage.context, error);
   rc = lc_pouch_namespace_manifest_open(&pouch->allocator, pouch->root_path, ns,
                                         &manifest, NULL, NULL, error);
   if (rc != LC_OK)

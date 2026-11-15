@@ -65,6 +65,10 @@ enum lc_pouch_storage_append_mode {
 };
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
+  /* Force the completed publication prefix durable, including on NoSync
+   * roots. Private producers are excluded. An already covered prefix needs no
+   * new barrier. This is a root capability, never a namespace file handle. */
+  int (*flush)(void *, lc_error *);
   int (*namespace_open)(void *, const char *, int, void **, lc_error *);
   void (*namespace_close)(void *, void *);
   int (*namespace_info)(void *, void *, lc_pouch_storage_namespace_info *,

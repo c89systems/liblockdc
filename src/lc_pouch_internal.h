@@ -50,7 +50,9 @@ int lc_pouch_state_durable_scope_begin(lc_pouch *pouch,
 int lc_pouch_state_durable_scope_barrier(lc_pouch_state_commit_group *scope,
                                          lc_error *error);
 /* Recovery includes containers written before this thread/process's group.
- * Requires namespace mutation authority; never reads application bodies. */
+ * Requires namespace mutation authority; never reads application bodies. A
+ * typed single-file owner covers every completed publication through its root
+ * barrier, without opening namespace paths or waiting for private producers. */
 int lc_pouch_state_durable_scope_include_namespace_locked(lc_pouch *pouch,
                                                           const char *ns,
                                                           lc_error *error);

@@ -36,6 +36,10 @@ static int check(void *context, lc_error *e) {
   ps_pouch_owner *owner = context;
   return ps_check(ps_root_space(owner->root), e);
 }
+static int flush(void *context, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_flush(ps_root_space(owner->root), e);
+}
 static int namespace_open(void *context, const char *name, int create,
                           void **out, lc_error *e) {
   ps_pouch_owner *owner = context;
@@ -252,9 +256,10 @@ static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
   return rc;
 }
 static const lc_pouch_storage_ops storage_ops = {
-    check,       namespace_open, namespace_close,       namespace_info,
-    replay,      append_begin,   append_commit,         append_close,
-    source_open, source_clone,   retention_hint_ensure, release};
+    check,          flush,       namespace_open, namespace_close,
+    namespace_info, replay,      append_begin,   append_commit,
+    append_close,   source_open, source_clone,   retention_hint_ensure,
+    release};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

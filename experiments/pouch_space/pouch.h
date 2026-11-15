@@ -15,6 +15,8 @@ typedef struct ps_pouch_state_options {
  * production logical engine. Retention work hints are durable in-file markers;
  * retention scheduling and guaranteed maintenance admission at capacity remain
  * pending. Forced ordinary-state compaction is available below.
+ * Internal cleanup durability scopes force the completed container prefix
+ * durable under either root policy; unfinished producers remain private.
  * Rotation can still require foreground capacity before a delete.
  * Other Pouch operations are outside this harness's current call contract.
  * Explicitly disable indexing, background maintenance and queue watches; shared

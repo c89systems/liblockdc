@@ -76,6 +76,7 @@ struct comparison {
                     */
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
   int compaction; /* Force one pass per namespace after the two PUT rounds. */
+  int durable_scope; /* Force durability after both PUT rounds per writer. */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -490,6 +491,7 @@ static void *writer_main(void *context) {
   worker *w = context;
   comparison *c = w->run;
   lc_error e;
+  lc_pouch_state_commit_group *scope = NULL;
   size_t id, round;
   double start;
   lc_error_init(&e);
@@ -498,6 +500,8 @@ static void *writer_main(void *context) {
     pthread_cond_wait(&c->condition, &c->mutex);
   pthread_mutex_unlock(&c->mutex);
   w->rc = LC_OK;
+  if (c->durable_scope)
+    w->rc = lc_pouch_state_durable_scope_begin(c->pouch, &scope, &e);
   for (round = 0; round < c->rounds && w->rc == LC_OK; ++round)
     for (id = w->ordinal; id < c->rows; id += c->writers) {
       make_body(w->body, c->bytes, id, round);
@@ -508,6 +512,8 @@ static void *writer_main(void *context) {
       if (w->rc != LC_OK)
         break;
     }
+  if (scope)
+    w->rc = lc_pouch_state_durable_scope_end(scope, w->rc, &e);
   if (w->rc != LC_OK)
     fprintf(stderr, "writer %lu: %s\n", (unsigned long)w->ordinal,
             e.message ? e.message : "failed");
@@ -548,7 +554,8 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     options.durable_sync = c->sync;
     options.query_indexing_enabled_set = 1;
     options.background_compaction_enabled_set = 1;
-    options.segment_target_bytes = c->compaction ? 8 * PS_MIB : PS_MIB;
+    options.segment_target_bytes =
+        c->compaction || c->durable_scope ? 8 * PS_MIB : PS_MIB;
     options.terminal_reclaim_min_bytes = c->compaction ? 1 : 0;
     options.compaction_throttling_disabled = c->compaction;
     options.compression = "none";
@@ -1064,6 +1071,7 @@ int main(int argc, char **argv) {
         "space-state|stream-state|runtime-state|pouch-state|space-collection|"
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
         "runtime-compact|pouch-compact|"
+        "runtime-scope|pouch-scope|"
         "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
         "points|"
         "runtime-scan-bodies|pouch-scan-bodies|"
@@ -1088,6 +1096,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-delete") ||
               !strcmp(argv[1], "runtime-compact") ||
               !strcmp(argv[1], "pouch-compact") ||
+              !strcmp(argv[1], "runtime-scope") ||
+              !strcmp(argv[1], "pouch-scope") ||
               !strcmp(argv[1], "runtime-read-many") ||
               !strcmp(argv[1], "pouch-read-many") ||
               !strcmp(argv[1], "runtime-read-points") ||
@@ -1102,6 +1112,7 @@ int main(int argc, char **argv) {
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
   c.compaction = strstr(argv[1], "compact") != NULL;
+  c.durable_scope = strstr(argv[1], "scope") != NULL;
   c.read_method = strstr(argv[1], "read-many")       ? 1
                   : strstr(argv[1], "scan-bodies")   ? 2
                   : strstr(argv[1], "scan-metadata") ? 3
