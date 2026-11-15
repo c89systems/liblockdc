@@ -3489,6 +3489,9 @@ broader [draft acceptance evidence](pouch-space.md).
 
 ## Cleanup durability scopes and cold crypto initialization
 
+This checkpoint is `92df5ee`. The [following deferral stage](#scoped-canonical-commit-deferral)
+addresses the durable scope slowdown measured here.
+
 The private storage boundary now supplies a root flush capability. Explicit
 cleanup barriers and scope completion stabilize the completed container prefix
 under either policy, including mutations completed before the scope began.
@@ -3622,3 +3625,112 @@ manifest covers both ELFs, runner, summarizer, summary, benchmark log and raw
 trials. These results do not close full backend correctness or performance
 acceptance; maintenance capacity architecture, grouped durable commits,
 recreation and the broader integration requirements remain open.
+
+## Scoped canonical commit deferral
+
+Canonical append acknowledgement now has an explicit per-call deferral mode.
+The logical owner selects it only inside the current thread's forced cleanup
+scope for that Pouch instance. Completed bytes enter the existing readiness
+prefix and become individually visible; the scope's explicit/completion barrier
+forces that prefix durable under either root policy. Ordinary commits retain
+their policy, and structural publication/preparation barriers remain enforced.
+An independent ordinary writer still completes while a scope stays open. Its
+barrier may also cover the scope's completed prefix. There is no new writer
+queue, root-wide policy toggle, persisted record or public API change.
+
+### Verification
+
+The full standard Debug preset passes **361/361 checks** in **1327.32 s**,
+including **309 unit groups**, public API/shared-symbol boundaries and worker
+stack checks. ASan/UBSan workers use 128 KiB stacks with the glibc stack cache
+disabled. The fourteen affected GNU release and native musl groups pass in
+**13.75 s** and **11.78 s**; musl uses its default worker stack.
+
+The scope fixture covers all four codec combinations and both root policies:
+PUT/META/DELETE visibility before a barrier, pre-scope mutations, explicit and
+completion barriers, already covered work, allocation-free flush, invalid commit
+modes, a pinned old body across peer publication and ordinary peer durability
+while the scope stays open. A later producer failure preserves earlier complete
+appends, leaves the failed mutation unapplied and retains its original error at
+scope completion. An unpublished producer keeps its old selected tail through
+all barriers. Sync-failure coverage expands to **24 codec/policy/phase cases**.
+
+Another **24 process-death cases** reopen a separate test image updated only by
+successful root sync callbacks. Before a scope barrier, that image retains the
+prior state; after explicit or completion barriers, it retains completed PUT,
+metadata and deletion state. This models loss of unsynced writes without relying
+on kernel page-cache survival. The image belongs to the test fixture, not the
+store layout; production still writes one container. These deterministic
+recovery checks supplement existing torn-write tests, not hardware power-loss
+certification.
+
+Strict ThreadSanitizer checks with the pinned, instrumented OpenSSL pass **40
+concurrent comparisons plus six focused groups**, including crash recovery,
+publication dependencies, record I/O and lifecycle. Four Memcheck runs complete
+**58,244 allocations and frees**, with zero live blocks, errors or suppressions.
+Logs and reproduction scripts are under `build/pouch-space-deferred-scope/`:
+`debug-full.log`, `gnu-focused.log`, `musl-focused.log`, `tsan-scopes.log` and
+`memcheck-*.log`. Source and configuration remained unchanged throughout checks.
+
+### Matched scope and ordinary-write measurements
+
+The final GNU binary and frozen `92df5ee` binary run **160 verified trials**:
+five alternating-order samples of current/prior scoped and ordinary writes in
+both engines, both policies and one/four namespace writers. Each trial writes
+128 one-KiB states twice with 4 KiB producer chunks. Scoped elapsed time includes
+the final barrier. Every container trial retains exactly one reserved 10 MiB
+file with no persistent sidecars. Caches are retained and device scheduling is
+not isolated; these are small native comparisons.
+
+Median scope elapsed and CPU milliseconds; prior is the preceding container:
+
+| Policy | Writers | Prior container ms | Container ms | Multifile ms | Container / multifile CPU ms | Container / multifile syncs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 16.130 | 17.626 | 19.076 | 5.555 / 6.450 | 3 / 3 |
+| NoSync | 4 | 22.174 | 21.220 | 25.188 | 12.186 / 12.175 | 6 / 12 |
+| Durable | 1 | 827.317 | 22.677 | 20.791 | 5.869 / 6.980 | 5 / 3 |
+| Durable | 4 | 548.815 | 35.644 | 37.183 | 10.635 / 14.067 | 10 / 12 |
+
+Durable container scope time improves **36.5 times** at one writer and **15.4
+times** at four. Barriers fall from 259 to five and median 136 to ten; remaining
+structural and completion barriers are retained. Container/multifile durable
+timing ranges overlap: **21.180–30.750 / 20.103–23.098 ms** at one writer and
+**31.873–42.622 / 30.598–50.205 ms** at four. This removes the measured scope
+gap without establishing a general backend performance win.
+
+Ordinary-write controls retain per-mutation policy. Median milliseconds are
+**current / prior**:
+
+| Policy | Writers | Container ms | Multifile ms |
+| --- | ---: | ---: | ---: |
+| NoSync | 1 | 8.350 / 7.581 | 13.588 / 12.764 |
+| NoSync | 4 | 7.031 / 8.521 | 16.098 / 12.570 |
+| Durable | 1 | 806.567 / 832.852 | 1299.278 / 1434.864 |
+| Durable | 4 | 566.408 / 615.466 | 844.212 / 852.556 |
+
+All ordinary before/after elapsed ranges overlap. Single-writer durable
+container controls retain exactly 259 barriers; four-writer current/prior
+medians are 137/135 with overlapping 134–139/134–138 ranges. Container bytes
+written remain exactly **403,803** at one namespace and **407,092** at four
+for both scoped and ordinary modes, before and after the change.
+
+Populated reopen-to-ready remains slower. Median scoped milliseconds:
+
+| Policy | Writers | Container ready ms | Multifile ready ms |
+| --- | ---: | ---: | ---: |
+| NoSync | 1 | 12.414 | 6.419 |
+| NoSync | 4 | 23.697 | 5.421 |
+| Durable | 1 | 12.358 | 4.114 |
+| Durable | 4 | 21.874 | 6.643 |
+
+The new frozen ELF is
+`build/pouch-space-deferred-scope/pouch_space_compare-current`, SHA-256
+`c49c9759dbf2f22e791dbf81bde2c15e7df4d134ea0da23250b7470ee01c0b6f`.
+The frozen prior ELF remains under `build/pouch-space-durable-scope/`, SHA-256
+`d948e25939a9ada5e2ef0ea4847d483fc86a1bd45b0809959f646d91f686a1b0`.
+The new stage retains `scope-paired.sh`, `scope-summary.pl`, `results.json`,
+`benchmark.log`, all 160 raw trials in `paired/`, and a performance checksum
+manifest covering both ELFs and those inputs/results. This closes the measured
+scoped-sync gap. Maintenance capacity architecture, canonical recreation,
+remaining Pouch integration, shared-root coordination and full performance
+acceptance remain open; normal public Pouch open still uses the multifile backend.

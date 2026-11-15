@@ -2944,13 +2944,15 @@ static void owned_publish_tail(ps_space *s, ps_owned_head *head, uint64_t tail,
   head->entry->stream_ready = sequence;
 }
 int ps_owned_commit(ps_owned_head *head, uint64_t tail,
-                    ps_commit_publish_fn publish, void *context,
-                    lc_error *error) {
+                    enum ps_commit_mode mode, ps_commit_publish_fn publish,
+                    void *context, lc_error *error) {
   ps_space *s;
   uint64_t sequence = 0;
   int rc;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned commit requires head");
+  if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
+    return err(error, LC_ERR_INVALID, "invalid canonical commit mode");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
@@ -2983,7 +2985,7 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail,
     if (rc == LC_OK)
       owned_publish_tail(s, head, tail, sequence);
     pthread_mutex_unlock(&s->mutex);
-  } else if (rc == LC_OK && s->durable)
+  } else if (rc == LC_OK && s->durable && mode == PS_COMMIT_DEFAULT)
     rc = wait_durable(s, sequence, error);
   return rc;
 }

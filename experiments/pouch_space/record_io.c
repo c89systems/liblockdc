@@ -28,12 +28,14 @@ void ps_record_abort(ps_record_writer *out) {
     out->writer = NULL;
   }
 }
-int ps_record_commit(ps_record_writer *out, ps_commit_publish_fn publish,
-                     void *context, lc_error *e) {
+int ps_record_commit(ps_record_writer *out, enum ps_commit_mode mode,
+                     ps_commit_publish_fn publish, void *context, lc_error *e) {
   int rc;
   if (!out || !out->writer || out->failed)
     return record_error(e, "canonical append is not open");
-  rc = ps_stream_commit(out->writer, publish, context, e);
+  if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
+    return record_error(e, "invalid canonical commit mode");
+  rc = ps_stream_commit(out->writer, mode, publish, context, e);
   ps_record_abort(out);
   return rc;
 }

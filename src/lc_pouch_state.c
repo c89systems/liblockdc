@@ -694,6 +694,14 @@ static lc_pouch_state_commit_group *lc_pouch_state_commit_group_current(void) {
       lc_pouch_state_commit_group_key);
 }
 
+static enum lc_pouch_storage_commit_mode
+lc_pouch_state_storage_commit_mode(lc_pouch *pouch) {
+  lc_pouch_state_commit_group *group = lc_pouch_state_commit_group_current();
+  return group != NULL && group->pouch == pouch && group->force_sync
+             ? LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
+             : LC_POUCH_STORAGE_COMMIT_DEFAULT;
+}
+
 static void
 lc_pouch_state_commit_group_set(lc_pouch_state_commit_group *group) {
   pthread_once(&lc_pouch_state_commit_group_key_once,
@@ -6953,8 +6961,9 @@ binary_append_ready:
     if (pouch->storage.ops != NULL) {
       rc = lc_pouch_record_io_tail(record_io, &appended_end, error);
       if (rc == LC_OK)
-        rc = pouch->storage.ops->append_commit(pouch->storage.context,
-                                               &storage_append, error);
+        rc = pouch->storage.ops->append_commit(
+            pouch->storage.context, &storage_append,
+            lc_pouch_state_storage_commit_mode(pouch), error);
       if (rc == LC_OK)
         lc_pouch_state_storage_append_publish(pouch, cache, manifest,
                                               &storage_append, appended_end);
@@ -14229,8 +14238,9 @@ append_finish:
   if (rc == LC_OK && pouch->storage.ops != NULL) {
     if (!namespace_locked)
       lc_pouch_state_projection_mutex_unlock(pouch, ns);
-    rc = pouch->storage.ops->append_commit(pouch->storage.context,
-                                           &storage_append, error);
+    rc = pouch->storage.ops->append_commit(
+        pouch->storage.context, &storage_append,
+        lc_pouch_state_storage_commit_mode(pouch), error);
     if (!namespace_locked) {
       projection_rc = lc_pouch_state_projection_mutex_lock(pouch, ns, error);
       if (rc == LC_OK)

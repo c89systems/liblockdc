@@ -344,7 +344,7 @@ static int collection_stream_write(worker *w, size_t id, lc_source *source,
         w->collection_id, name, position, position, 0, 0, 0, source, &record,
         e);
   if (rc == LC_OK)
-    rc = ps_record_commit(&output, NULL, NULL, e);
+    rc = ps_record_commit(&output, PS_COMMIT_DEFAULT, NULL, NULL, e);
   if (rc == LC_OK) {
     require(record.bytes == c->bytes && record.stored_bytes == c->bytes,
             "canonical collection write bytes");
@@ -387,7 +387,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
                                       ps_namespace_append_leaf(output),
                                       &request, source, 0, &result, e);
   if (rc == LC_OK)
-    rc = ps_namespace_append_commit(output, e);
+    rc = ps_namespace_append_commit(output, PS_COMMIT_DEFAULT, e);
   if (rc == LC_OK) {
     require(result.bytes == c->bytes && result.cipher_bytes == c->bytes,
             "canonical state write bytes");

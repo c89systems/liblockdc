@@ -63,6 +63,10 @@ enum lc_pouch_storage_append_mode {
   LC_POUCH_STORAGE_APPEND_COMPLETE,
   LC_POUCH_STORAGE_APPEND_MAINTENANCE
 };
+enum lc_pouch_storage_commit_mode {
+  LC_POUCH_STORAGE_COMMIT_DEFAULT = 0,
+  LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
+};
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   /* Force the completed publication prefix durable, including on NoSync
@@ -81,7 +85,10 @@ typedef struct lc_pouch_storage_ops {
   int (*append_begin)(void *, void *, uint64_t, uint64_t,
                       enum lc_pouch_storage_append_mode,
                       lc_pouch_storage_append *, lc_error *);
-  int (*append_commit)(void *, lc_pouch_storage_append *, lc_error *);
+  /* DEFER_SYNC belongs to the calling logical cleanup scope. Its completed
+   * prefix must be flushed before that scope acknowledges durability. */
+  int (*append_commit)(void *, lc_pouch_storage_append *,
+                       enum lc_pouch_storage_commit_mode, lc_error *);
   void (*append_close)(void *, lc_pouch_storage_append *);
   /* Encoded, resettable bounded source owns its read pin and storage lifetime.
    * It may outlive the Pouch runtime that opened it. */

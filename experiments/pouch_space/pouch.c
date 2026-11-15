@@ -115,9 +115,21 @@ static int append_begin(void *context, void *ns, uint64_t target,
   return rc;
 }
 static int append_commit(void *context, lc_pouch_storage_append *append,
-                         lc_error *e) {
+                         enum lc_pouch_storage_commit_mode mode, lc_error *e) {
+  enum ps_commit_mode physical;
   (void)context;
-  return ps_namespace_append_commit(append->handle, e);
+  switch (mode) {
+  case LC_POUCH_STORAGE_COMMIT_DEFAULT:
+    physical = PS_COMMIT_DEFAULT;
+    break;
+  case LC_POUCH_STORAGE_COMMIT_DEFER_SYNC:
+    physical = PS_COMMIT_DEFER_SYNC;
+    break;
+  default:
+    return lc_error_set(e, LC_ERR_INVALID, 0, "invalid container commit mode",
+                        NULL, NULL, "pouch");
+  }
+  return ps_namespace_append_commit(append->handle, physical, e);
 }
 static void append_close(void *context, lc_pouch_storage_append *append) {
   (void)context;

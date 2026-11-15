@@ -1663,7 +1663,7 @@ static void metadata_repack_surfaces(void) {
   OK(ps_stream_open(s, NULL, stream_key, 1, NULL, NULL, NULL, &stream, &error));
   OK(ps_stream_begin(stream, &writer, &error));
   OK(ps_stream_write(writer, "abc", 3, &error));
-  OK(ps_stream_commit(writer, NULL, NULL, &error));
+  OK(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   ps_stream_writer_close(writer);
   OK(ps_stream_seal(stream, &error));
   OK(ps_stream_status(stream, &info, &error));
@@ -1851,7 +1851,7 @@ static void metadata_capacity(void) {
     OK(ps_stream_begin(stream, &writer, &error));
     OK(ps_stream_reserve_exact(writer, NULL, sizeof(tail), &error));
     OK(ps_stream_write(writer, "A", 1, &error));
-    OK(ps_stream_commit(writer, NULL, NULL, &error));
+    OK(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &error));
     ps_stream_writer_close(writer);
     OK(ps_stream_status(stream, &info, &error));
     OK(ps_catalog_put(s, NULL, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
@@ -1901,7 +1901,7 @@ static void metadata_capacity(void) {
     for (i = 0; i < sizeof(tail) - 1; ++i) {
       OK(ps_stream_begin(stream, &writer, &error));
       OK(ps_stream_write(writer, "B", 1, &error));
-      OK(ps_stream_commit(writer, NULL, NULL, &error));
+      OK(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &error));
       ps_stream_writer_close(writer);
       if (i % 7 == 6)
         OK(ps_metadata_repack(s, &error));
@@ -2596,7 +2596,7 @@ static int canonical_append(ps_stream *s, const void *bytes, size_t n,
   if (rc == LC_OK)
     rc = ps_stream_write_at(w, 0, header, sizeof(header), e);
   if (rc == LC_OK)
-    rc = ps_stream_commit(w, NULL, NULL, e);
+    rc = ps_stream_commit(w, PS_COMMIT_DEFAULT, NULL, NULL, e);
   ps_stream_writer_close(w);
   return rc;
 }
@@ -4157,6 +4157,7 @@ static void stream_lifecycle_capacity(void) {
   space = create(PS_MIB, 0, NULL);
   OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &status,
                    &error));
+  BAD(ps_owned_commit(head, 0, (enum ps_commit_mode)2, NULL, NULL, &error));
   for (;;) {
     rc = ps_owned_grant(head, NULL, base, PS_PAGE, &run, &found, &error);
     if (rc != LC_OK)
@@ -4170,7 +4171,7 @@ static void stream_lifecycle_capacity(void) {
   lc_error_cleanup(&error);
   OK(ps_owned_seal(head, &error));
   BAD(ps_owned_recovered(head, 0, &error));
-  BAD(ps_owned_commit(head, 0, NULL, NULL, &error));
+  BAD(ps_owned_commit(head, 0, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   OK(ps_status(space, &before, &error));
   allocation_max = allocation_call = 0;
   measure_allocations = 1;
@@ -4180,7 +4181,7 @@ static void stream_lifecycle_capacity(void) {
   measure_allocations = 0;
   CHECK(allocation_call == 1 && allocation_max == 64);
   BAD(ps_owned_recovered(head, 0, &error));
-  BAD(ps_owned_commit(head, 0, NULL, NULL, &error));
+  BAD(ps_owned_commit(head, 0, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   OK(ps_status(space, &after, &error));
   CHECK(after.journal_bytes == before.journal_bytes + 64 && !after.entries &&
         after.retired_bytes == before.allocated_bytes);
@@ -5731,7 +5732,7 @@ static void grant_budget_capacity(int durable, int fragmented, int preferred) {
     OK(ps_stream_write(writer, bytes + at, n, &error));
     at += n;
   }
-  OK(ps_stream_commit(writer, NULL, NULL, &error));
+  OK(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   ps_stream_writer_close(writer);
   OK(ps_stream_seal(stream, &error));
   if (preferred) {

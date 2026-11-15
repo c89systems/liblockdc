@@ -473,15 +473,18 @@ int ps_stream_write_at(ps_stream_writer *w, uint64_t offset, const void *bytes,
     w->failed = 1;
   return rc;
 }
-int ps_stream_commit(ps_stream_writer *w, ps_commit_publish_fn publish,
-                     void *context, lc_error *error) {
+int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
+                     ps_commit_publish_fn publish, void *context,
+                     lc_error *error) {
   int rc;
   if (!w || w->failed || w->published)
     return stream_error(error, LC_ERR_INVALID, "stream appender cannot commit");
+  if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
+    return stream_error(error, LC_ERR_INVALID, "invalid canonical commit mode");
   rc = stream_flush(w, error);
   if (rc == LC_OK)
-    rc = ps_owned_commit(w->stream->head, w->start + w->bytes, publish, context,
-                         error);
+    rc = ps_owned_commit(w->stream->head, w->start + w->bytes, mode, publish,
+                         context, error);
   if (rc == LC_OK) {
     pthread_mutex_lock(&w->stream->mutex);
     w->stream->tail = w->start + w->bytes;

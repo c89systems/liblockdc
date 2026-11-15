@@ -96,7 +96,7 @@ static int body_commit_locked(ps_namespace_body *b, lc_error *e) {
     return failure(e, "body build is closed or differs from its measured size");
   b->attempted = 1;
   r = b->resource;
-  rc = ps_record_commit(&b->writer, NULL, NULL, e);
+  rc = ps_record_commit(&b->writer, PS_COMMIT_DEFAULT, NULL, NULL, e);
   if (rc == LC_OK)
     rc = ps_stream_seal(r->stream, e);
   if (rc == LC_OK)
@@ -406,7 +406,7 @@ int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
   if (rc == LC_OK)
     rc = ps_ns_finish_seal(d, e);
   if (rc == LC_OK)
-    rc = ps_record_commit(&b->writer, NULL, NULL, e);
+    rc = ps_record_commit(&b->writer, PS_COMMIT_DEFAULT, NULL, NULL, e);
   if (rc == LC_OK)
     rc = ps_stream_seal(r->stream, e);
   if (rc == LC_OK)

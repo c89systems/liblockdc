@@ -351,7 +351,7 @@ static void lifecycle(const char *path, const char *key) {
         metadata(&r, &q, sizes[n]);
         REQUIRE(s.at == sizes[n]);
         ends[disable * 3 + n] = writer.tail;
-        ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
+        ok(ps_record_commit(&writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
         ps_record_abort(&writer);
         lc_pouch_state_entry_cleanup(&allocator, &r);
         if (disable == 0 && n == 2 && mode % 2)
@@ -704,7 +704,7 @@ static void snapshot_records(const char *path, const char *key) {
             ok(lc_pouch_state_record_append(&allocator, crypto, original_output,
                                             leaf, &q, &s.pub, 0, &stored, &e),
                &e);
-            ok(ps_record_commit(&first, NULL, NULL, &e), &e);
+            ok(ps_record_commit(&first, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
             stored.has_query_index_seq = 1;
             stored.query_index_seq = 11;
             ps_stream_reader *original_reader = NULL;
@@ -798,7 +798,8 @@ static void snapshot_records(const char *path, const char *key) {
               REQUIRE(fd >= 0);
               input = lc_pouch_record_file_io(fd);
             } else {
-              ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
+              ok(ps_record_commit(&writer, PS_COMMIT_DEFAULT, NULL, NULL, &e),
+                 &e);
               ok(ps_stream_seal(destination, &e), &e);
               ok(ps_stream_close(destination, &e), &e);
               ok(ps_stream_open(space, NULL, b, 0, NULL, NULL, NULL,
@@ -1178,7 +1179,7 @@ static void *parallel_writer(void *p) {
     ok(lc_pouch_state_record_append(&allocator, job->crypto, io, leaf, &q,
                                     &s.pub, (int)(job->ordinal % 2), &r, &e),
        &e);
-    ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
+    ok(ps_record_commit(&writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
     metadata(&r, &q, body_bytes);
     ps_stream_reader *reader = NULL;
     ok(ps_stream_read_open(stream, 0,

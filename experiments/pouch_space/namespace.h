@@ -66,8 +66,11 @@ uint64_t ps_namespace_append_segment(const ps_namespace_append *);
 uint64_t ps_namespace_append_segments(const ps_namespace_append *);
 /* Caller has finalized complete canonical records and retains logical mutation
  * authority. Commit publishes the tail through the existing sync coordinator;
- * it does not allocate versions/index sequences or apply namespace policy. */
-int ps_namespace_append_commit(ps_namespace_append *, lc_error *);
+ * it does not allocate versions/index sequences or apply namespace policy.
+ * DEFER_SYNC leaves canonical acknowledgement to the caller's root barrier;
+ * namespace selection retains its existing dependency barrier. */
+int ps_namespace_append_commit(ps_namespace_append *, enum ps_commit_mode,
+                               lc_error *);
 void ps_namespace_append_close(ps_namespace_append *);
 /* Rotation is durable even for NoSync roots. A staged empty successor can be
  * reused after failure. The head commits cutover before sealing its

@@ -120,7 +120,7 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
         ps_namespace_append_leaf(append), &request, &source.pub, 0, result, e);
   }
   if (rc == LC_OK)
-    rc = ps_namespace_append_commit(append, e);
+    rc = ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, e);
   ps_namespace_append_close(append);
   return rc;
 }
@@ -524,7 +524,7 @@ static void windows(const char *path) {
   ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e), &e);
   ok(ps_stream_begin(stream, &writer, &e), &e);
   ok(ps_stream_write(writer, "abc", 3, &e), &e);
-  ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
   ps_stream_writer_close(writer);
   ps_stream_window *pin = NULL, *rejected = NULL;
   allocation = 0;
@@ -543,7 +543,7 @@ static void windows(const char *path) {
   clear(&e);
   ok(ps_stream_begin(stream, &writer, &e), &e);
   ok(ps_stream_write(writer, "def", 3, &e), &e);
-  ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
   ps_stream_writer_close(writer);
   char bytes[4] = {0};
   REQUIRE(ps_stream_window_read(pin, 0, bytes, 1, &e) == LC_ERR_INVALID);
@@ -859,7 +859,7 @@ static void stream_reservation(const char *path) {
     ok(ps_status(space, &before, &e), &e);
     ok(ps_stream_reserve(writer, NULL, sizeof(body), &e), &e);
     ok(ps_stream_write(writer, body + 17, sizeof(body) - 17, &e), &e);
-    ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+    ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
     REQUIRE(ps_stream_reserve(writer, NULL, 1, &e) == LC_ERR_INVALID);
     clear(&e);
     ps_stream_writer_close(writer);
@@ -1046,7 +1046,7 @@ static void reservation(const char *path) {
                                     ps_namespace_append_leaf(reserved),
                                     &request, &source.pub, 0, &result, &e),
        &e);
-    ok(ps_namespace_append_commit(reserved, &e), &e);
+    ok(ps_namespace_append_commit(reserved, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(reserved);
     lc_pouch_state_entry_cleanup(&allocator, &result);
     ok(ps_status(ps_root_space(root), &committed, &e), &e);
@@ -1107,70 +1107,79 @@ static int publish_control(void *context, uint64_t tail, lc_error *e) {
   return rc;
 }
 static void covered_publication(const char *path) {
-  for (int sync = 0; sync < 2; ++sync)
-    for (int mode = 0; mode < 3; ++mode) {
-      ps_options o = {0};
-      ps_space *space = NULL;
-      ps_stream *stream = NULL;
-      ps_stream_writer *writer = NULL;
-      ps_stream_reader *reader = NULL;
-      ps_stream_info info;
-      ps_stats before, after;
-      ps_key key = {1, 1, PS_STREAM};
-      publisher p = {0};
-      lc_error e;
-      unsigned char bytes[3];
-      size_t got;
-      int rc;
-      lc_error_init(&e);
-      o.durable_sync = sync;
-      ok(ps_open(path, 1, &o, &space, &e), &e);
-      ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e),
-         &e);
-      ok(ps_stream_begin(stream, &writer, &e), &e);
-      ok(ps_stream_reserve(writer, NULL, 3, &e), &e);
-      ok(ps_stream_write(writer, "abc", 3, &e), &e);
-      p.space = space;
-      p.stream = stream;
-      p.mode = mode;
-      ok(ps_status(space, &before, &e), &e);
-      rc = ps_stream_commit(writer, publish_control, &p, &e);
-      REQUIRE(p.calls == 1);
-      if (!mode && sync) {
-        REQUIRE(rc == LC_ERR_PROTOCOL);
-        clear(&e);
-        REQUIRE(ps_check(space, &e) == LC_ERR_TRANSPORT);
-        clear(&e);
-      } else if (mode == 1) {
-        REQUIRE(rc == LC_ERR_NOMEM);
-        clear(&e);
-        ok(ps_stream_status(stream, &info, &e), &e);
-        REQUIRE(info.tail == 0);
-      } else {
-        ok(rc, &e);
-        ok(ps_status(space, &after, &e), &e);
-        REQUIRE(after.syncs == before.syncs + (mode ? 1 : 0));
-      }
-      ps_stream_writer_close(writer);
-      writer = NULL;
-      if (mode == 1) {
-        ok(ps_check(space, &e), &e);
+  for (int commit = PS_COMMIT_DEFAULT; commit <= PS_COMMIT_DEFER_SYNC; ++commit)
+    for (int sync = 0; sync < 2; ++sync)
+      for (int mode = 0; mode < 3; ++mode) {
+        ps_options o = {0};
+        ps_space *space = NULL;
+        ps_stream *stream = NULL;
+        ps_stream_writer *writer = NULL;
+        ps_stream_reader *reader = NULL;
+        ps_stream_info info;
+        ps_stats before, after;
+        ps_key key = {1, 1, PS_STREAM};
+        publisher p = {0};
+        lc_error e;
+        unsigned char bytes[3];
+        size_t got;
+        int rc;
+        lc_error_init(&e);
+        o.durable_sync = sync;
+        ok(ps_open(path, 1, &o, &space, &e), &e);
+        ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e),
+           &e);
         ok(ps_stream_begin(stream, &writer, &e), &e);
-        ok(ps_stream_write(writer, "xyz", 3, &e), &e);
-        ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+        ok(ps_stream_reserve(writer, NULL, 3, &e), &e);
+        ok(ps_stream_write(writer, "abc", 3, &e), &e);
+        p.space = space;
+        p.stream = stream;
+        p.mode = mode;
+        ok(ps_status(space, &before, &e), &e);
+        rc = ps_stream_commit(writer, (enum ps_commit_mode)2, publish_control,
+                              &p, &e);
+        REQUIRE(rc == LC_ERR_INVALID && p.calls == 0);
+        clear(&e);
+        ok(ps_status(space, &after, &e), &e);
+        REQUIRE(after.syncs == before.syncs &&
+                after.journal_bytes == before.journal_bytes);
+        rc = ps_stream_commit(writer, (enum ps_commit_mode)commit,
+                              publish_control, &p, &e);
+        REQUIRE(p.calls == 1);
+        if (!mode && sync) {
+          REQUIRE(rc == LC_ERR_PROTOCOL);
+          clear(&e);
+          REQUIRE(ps_check(space, &e) == LC_ERR_TRANSPORT);
+          clear(&e);
+        } else if (mode == 1) {
+          REQUIRE(rc == LC_ERR_NOMEM);
+          clear(&e);
+          ok(ps_stream_status(stream, &info, &e), &e);
+          REQUIRE(info.tail == 0);
+        } else {
+          ok(rc, &e);
+          ok(ps_status(space, &after, &e), &e);
+          REQUIRE(after.syncs == before.syncs + (mode ? 1 : 0));
+        }
         ps_stream_writer_close(writer);
+        writer = NULL;
+        if (mode == 1) {
+          ok(ps_check(space, &e), &e);
+          ok(ps_stream_begin(stream, &writer, &e), &e);
+          ok(ps_stream_write(writer, "xyz", 3, &e), &e);
+          ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+          ps_stream_writer_close(writer);
+        }
+        if (mode || !sync) {
+          ok(ps_stream_read_open(stream, 0, 3, &reader, &e), &e);
+          ok(ps_stream_read(reader, bytes, sizeof(bytes), &got, &e), &e);
+          REQUIRE(got == 3 && !memcmp(bytes, mode == 1 ? "xyz" : "abc", 3));
+          ps_stream_reader_close(reader);
+        }
+        ok(ps_stream_close(stream, &e), &e);
+        ok(ps_close(space, &e), &e);
+        REQUIRE(unlink(path) == 0);
+        lc_error_cleanup(&e);
       }
-      if (mode || !sync) {
-        ok(ps_stream_read_open(stream, 0, 3, &reader, &e), &e);
-        ok(ps_stream_read(reader, bytes, sizeof(bytes), &got, &e), &e);
-        REQUIRE(got == 3 && !memcmp(bytes, mode == 1 ? "xyz" : "abc", 3));
-        ps_stream_reader_close(reader);
-      }
-      ok(ps_stream_close(stream, &e), &e);
-      ok(ps_close(space, &e), &e);
-      REQUIRE(unlink(path) == 0);
-      lc_error_cleanup(&e);
-    }
 }
 static int recover_empty(ps_stream *stream, uint64_t checkpoint,
                          uint64_t capacity, uint64_t *accepted, void *context,
@@ -1216,7 +1225,7 @@ static void reject_published_successor(const char *path) {
      &e);
   ok(ps_stream_begin(stream, &writer, &e), &e);
   ok(ps_stream_write(writer, "bad", 3, &e), &e);
-  ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
   ps_stream_writer_close(writer);
   /* This forbidden raw publication is now an authoritative checkpoint tail,
    * unlike the private zero-tail bytes in the held-head recovery test. */
@@ -1799,7 +1808,7 @@ static void snapshots(const char *path, const char *key) {
          &e);
       ok(ps_stream_begin(orphan, &writer, &e), &e);
       ok(ps_stream_write(writer, "not a canonical record", 22, &e), &e);
-      ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+      ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
       ps_stream_writer_close(writer);
       ok(ps_root_reclaim_orphans(root, &closed, &pending, &e), &e);
       REQUIRE(!closed && !pending);
@@ -1929,7 +1938,7 @@ static void snapshot_fault_cases(const char *path, int previous) {
                &e);
             ok(ps_stream_begin(orphan, &writer, &e), &e);
             ok(ps_stream_write(writer, body, 31, &e), &e);
-            ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
+            ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
             ps_stream_writer_close(writer);
             ok(ps_stream_close(orphan, &e), &e);
           }
@@ -2658,7 +2667,8 @@ static void append_budget_limits(const char *path) {
       clear(&e);
       ok(lc_pouch_record_io_tail(io, &tail, &e), &e);
       REQUIRE(tail == start + (filled ? n : 0));
-      REQUIRE(ps_namespace_append_commit(a, &e) == LC_ERR_INVALID);
+      REQUIRE(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e) ==
+              LC_ERR_INVALID);
       clear(&e);
       ps_namespace_append_close(a);
       ps_namespace_status status;
@@ -2669,11 +2679,12 @@ static void append_budget_limits(const char *path) {
     lc_pouch_record_io io = ps_namespace_append_output(a);
     struct iovec first = {frame, n / 2};
     ok(lc_pouch_record_io_append(io, &first, 1, &e), &e);
-    REQUIRE(ps_namespace_append_commit(a, &e) == LC_ERR_INVALID);
+    REQUIRE(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e) ==
+            LC_ERR_INVALID);
     clear(&e);
     struct iovec rest = {frame + n / 2, n - n / 2};
     ok(lc_pouch_record_io_append(io, &rest, 1, &e), &e);
-    ok(ps_namespace_append_commit(a, &e), &e);
+    ok(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(a);
     count(ns, 1, &e);
     ok(ps_namespace_append_begin(ns, 0, n2, PS_APPEND_COMPLETE, &a, &e), &e);
@@ -2682,7 +2693,7 @@ static void append_budget_limits(const char *path) {
     struct iovec next = {frame2, n2};
     ok(lc_pouch_record_io_append(ps_namespace_append_output(a), &next, 1, &e),
        &e);
-    ok(ps_namespace_append_commit(a, &e), &e);
+    ok(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(a);
     count(ns, 2, &e);
     ok(ps_flush(ps_root_space(root), &e), &e);
@@ -2762,7 +2773,7 @@ static void append_budget_capacity(const char *path) {
     REQUIRE(after.entries == before.entries &&
             after.journal_bytes == before.journal_bytes);
     ok(append_known_record(root, a, 1, &e), &e);
-    ok(ps_namespace_append_commit(a, &e), &e);
+    ok(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(a);
     ok(ps_budget_close(peer, &e), &e);
     count(ns, 1, &e);
@@ -2773,7 +2784,7 @@ static void append_budget_capacity(const char *path) {
     clear(&e);
     ok(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_MAINTENANCE, &a, &e), &e);
     ok(append_known_record(root, a, 2, &e), &e);
-    ok(ps_namespace_append_commit(a, &e), &e);
+    ok(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(a);
     count(ns, 2, &e);
     ok(ps_status(ps_root_space(root), &after, &e), &e);
@@ -2847,7 +2858,7 @@ static void append_budget_faults(const char *path) {
           if (rc == LC_OK)
             rc = append_known_record(root, a, rotating + 1, &e);
           if (rc == LC_OK)
-            rc = ps_namespace_append_commit(a, &e);
+            rc = ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e);
           if (!cut)
             operations = kind ? allocation : m.calls;
           m.fail = fail_allocation = 0;

@@ -557,36 +557,53 @@ failure and uses no suppressions. Its log is
 
 ## Cleanup durability scopes
 
-The logical cleanup scope now uses a typed root `flush` capability for container
-storage. An explicit barrier and scope completion force the completed
-publication prefix durable even under NoSync. Namespace inclusion retains its
-authority check and checks storage health without opening namespace paths or
-reading bodies. The existing physical readiness coordinator excludes unfinished
-private producers and avoids another file sync when the prefix is already
-covered. Normal NoSync mutations outside a forced scope retain their policy.
+The logical cleanup scope uses a typed root `flush` capability for container
+storage. Scoped canonical commits select an explicit per-call `DEFER_SYNC` mode;
+the mode belongs to the current thread's forced scope for that Pouch owner.
+Ordinary commits retain their root policy, including durable acknowledgement
+outside a scope. This adds no writer queue or global durability toggle.
+
+Completed mutations remain individually visible before the scope barrier. An
+explicit barrier and scope completion force the completed publication prefix
+durable even under NoSync. Namespace inclusion retains its authority check and
+checks storage health without opening namespace paths or reading bodies. The
+physical readiness coordinator excludes unfinished private producers and skips
+a file sync when the prefix is already covered. Structural publication and grant
+preparation retain their barriers; publisher callbacks must still establish
+their existing durability dependency. An ordinary peer writer can complete
+while a scope stays open, and its barrier may cover that scope's completed
+prefix. A scope groups durability without making its mutations atomic.
 
 Scope completion still attempts durability after an operation error, preserves
 that original error and releases its thread-local ownership on every path. A
 failed sync retains the physical owner's uncertain-outcome/poison behavior.
-This integrates cleanup's durability boundary; transaction work references,
-retention scheduling and complete cleanup ownership remain separate work. It
-does not defer the container's existing per-mutation durable commits.
+This integrates cleanup's durability boundary and scoped canonical commit
+deferral; transaction work references, retention scheduling and complete cleanup
+ownership remain separate work.
 
 The focused fixture exercises all four codec combinations and both root
 policies, a mutation completed before scope creation, grouped PUT/META/DELETE,
 explicit and completion barriers, repeated covered barriers, allocation failure,
-sync failure and error precedence. It holds an unpublished append in another
-namespace across all barriers and checks that its prior published tail remains
-selected. The comparison modes `runtime-scope` and `pouch-scope` put both write
-rounds inside one forced scope per writer. Aggregate elapsed time includes final
-scope completion; individual PUT samples exclude that final group barrier.
-The full 308-group Debug unit gate passes with ASan/UBSan and constrained
-workers in 1038.71 s. Final focused GNU/musl runs pass all twelve groups in
-3.59/4.14 s; instrumented-dependency ThreadSanitizer passes forty concurrent
-comparisons and four groups, and four Memcheck runs have zero leaks/errors.
-The [measured results](pouch-space-experiment.md#cleanup-durability-scopes-and-cold-crypto-initialization)
-also show that deferred durable grouping remains required: this root barrier
-does not remove per-mutation synchronization inside a durable container scope.
+sync failure and error precedence. It checks reads before the barrier, a pinned
+old body across peer publication, peer durability while the scope stays open,
+and successful earlier mutations after a later producer failure. An unpublished
+append in another namespace keeps its prior selected tail through all barriers.
+Twenty-four sync-failure cases cover barrier/end/error completion across codecs
+and policies. Another 24 process-death cases reopen images captured only at
+successful syncs, proving prior state before the barrier and completed state
+after explicit/completion barriers without relying on surviving page cache.
+
+The complete standard Debug preset passes **361 checks**, including **309 unit
+groups**, with ASan/UBSan and constrained workers in **1327.32 s**. The fourteen
+affected GNU/musl groups pass in **13.75/11.78 s**. Instrumented-dependency
+ThreadSanitizer passes forty concurrent comparisons and six focused groups;
+four Memcheck runs complete 58,244 allocations/frees with zero leaks/errors.
+The comparison modes `runtime-scope` and `pouch-scope` put both write rounds
+inside one forced scope per writer. Aggregate elapsed time includes scope
+completion; individual PUT samples exclude that final group barrier.
+The [matched measurements](pouch-space-experiment.md#scoped-canonical-commit-deferral)
+remove the prior per-mutation sync slowdown in this small workload. Reopen
+readiness and broader backend acceptance remain open.
 
 ## Known canonical recreation defect
 

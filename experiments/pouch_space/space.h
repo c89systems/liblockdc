@@ -41,6 +41,10 @@ typedef struct ps_space ps_space;
 typedef struct ps_budget ps_budget;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
+/* Canonical append acknowledgement only. Structural publications retain their
+ * existing barriers. DEFER_SYNC requires a caller-owned completion barrier;
+ * it changes neither the root policy nor another writer's acknowledgement. */
+enum ps_commit_mode { PS_COMMIT_DEFAULT = 0, PS_COMMIT_DEFER_SYNC };
 /* Optional logical publication after complete canonical bytes are ready,
  * before their tail becomes visible. On durable roots, success must durably
  * cover those bytes through this same space. NoSync logical publication may

@@ -70,9 +70,11 @@ int ps_stream_write_at(ps_stream_writer *, uint64_t, const void *, size_t,
  * success waits for the root sync covering these bytes; no publication journal
  * entry is emitted when appending inside an already owned run. An optional
  * publisher selects a containing logical head before exposing this tail;
- * durable roots check its success against the shared ready prefix. */
-int ps_stream_commit(ps_stream_writer *, ps_commit_publish_fn, void *,
-                     lc_error *);
+ * durable roots check its success against the shared ready prefix. An explicit
+ * DEFER_SYNC acknowledges completed bytes before the caller's group barrier;
+ * it never relaxes a publisher's dependency coverage requirement. */
+int ps_stream_commit(ps_stream_writer *, enum ps_commit_mode,
+                     ps_commit_publish_fn, void *, lc_error *);
 /* An abandoned written suffix is cleared and synced before the next appender.
  * A failed cleanup poisons storage; close/reopen reconciles uncertain I/O. */
 void ps_stream_writer_close(ps_stream_writer *);

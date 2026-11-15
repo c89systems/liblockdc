@@ -826,18 +826,21 @@ static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
                           append->data->snapshot_id,
                           append->data->snapshot_boundary, e);
 }
-int ps_namespace_append_commit(ps_namespace_append *append, lc_error *e) {
+int ps_namespace_append_commit(ps_namespace_append *append,
+                               enum ps_commit_mode mode, lc_error *e) {
   uint64_t tail;
   int rc, selecting;
   if (!append)
     return failure(e, LC_ERR_INVALID, "namespace append is not open");
+  if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
+    return failure(e, LC_ERR_INVALID, "invalid canonical commit mode");
   tail = append->writer.tail;
   if (append->complete && tail - append->writer.start != append->expected)
     return failure(e, LC_ERR_INVALID,
                    "canonical append differs from its declared complete span");
   selecting = append->segment != append->data->active;
-  rc = ps_record_commit(&append->writer, selecting ? publish_append_head : NULL,
-                        append, e);
+  rc = ps_record_commit(&append->writer, mode,
+                        selecting ? publish_append_head : NULL, append, e);
   /* Mutation authority remains held until append_close. Only that authority
    * reads this cache; captured readers use their independently pinned tails. */
   if (rc == LC_OK) {

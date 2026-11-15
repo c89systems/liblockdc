@@ -446,7 +446,7 @@ static void *container_records(void *context) {
               original.collection_retention == original.updated_at_unix + 120);
       REQUIRE(original.next_offset == output.tail &&
               original.stored_bytes > 65536);
-      check(ps_record_commit(&output, NULL, NULL, &e), &e);
+      check(ps_record_commit(&output, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
       check(ps_stream_read_open(stream, 0, original.next_offset, &reader, &e),
             &e);
       check(lc_pouch_collection_record_read_prefix(
@@ -522,7 +522,11 @@ static void *container_records(void *context) {
                                               leaf, id, "committed", 6, 8, 0, 0,
                                               0, &source.pub, &next, &e),
             &e);
-      check(ps_record_commit(&output, NULL, NULL, &e), &e);
+      REQUIRE(ps_record_commit(&output, (enum ps_commit_mode)2, NULL, NULL,
+                               &e) == LC_ERR_INVALID);
+      clear(&e);
+      REQUIRE(output.writer && !output.failed);
+      check(ps_record_commit(&output, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
       REQUIRE(ps_stream_read_at(reader, original.next_offset, &byte, 1, &e) ==
               LC_ERR_INVALID);
       clear(&e);
