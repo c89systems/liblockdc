@@ -17,9 +17,12 @@ typedef struct ps_stream_info {
 /* The canonical owner validates its existing record format, starting at the
  * trusted checkpoint tail, and returns the last complete record boundary.
  * This callback runs outside the root/allocator mutex. Only it may inspect
- * candidate bytes beyond the published tail through recovery_read(). The
- * stream layer then clears and synchronizes the rejected suffix before write
- * admission. It never interprets application records or adds a per-record WAL.
+ * candidate bytes beyond the published tail through recovery_read().
+ * Readers may use that validated prefix without repairing the unused suffix.
+ * The stream layer clears and synchronizes the rejected suffix before its
+ * first write admission. Newly recovered bytes still participate in root
+ * readiness and checkpoint dependencies. The layer never interprets
+ * application records or adds a per-record WAL.
  */
 typedef int (*ps_stream_recover_fn)(ps_stream *, uint64_t checkpoint_tail,
                                     uint64_t capacity, uint64_t *accepted_tail,
@@ -44,7 +47,9 @@ int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
                             lc_error *);
 /* At most one appender per logical stream; contention is an explicit error.
  * Other streams and readers remain independent. The producer never owns root
- * or allocator locks. Buffers are bounded at PS_CHUNK. */
+ * or allocator locks. Buffers are bounded at PS_CHUNK. A recovered owner
+ * repairs its unused suffix before returning its first writer; failure returns
+ * no writer and retains the existing uncertain-I/O poison semantics. */
 int ps_stream_begin(ps_stream *, ps_stream_writer **, lc_error *);
 uint64_t ps_stream_writer_start(const ps_stream_writer *);
 /* Reserve at least bytes from this append's start without advancing its tail

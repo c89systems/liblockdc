@@ -3628,6 +3628,9 @@ recreation and the broader integration requirements remain open.
 
 ## Scoped canonical commit deferral
 
+This checkpoint is `45da71c`. The [following readiness stage](#deferred-stream-repair-and-reopen-readiness)
+addresses its remaining stream-open repair cost.
+
 Canonical append acknowledgement now has an explicit per-call deferral mode.
 The logical owner selects it only inside the current thread's forced cleanup
 scope for that Pouch instance. Completed bytes enter the existing readiness
@@ -3734,3 +3737,133 @@ manifest covering both ELFs and those inputs/results. This closes the measured
 scoped-sync gap. Maintenance capacity architecture, canonical recreation,
 remaining Pouch integration, shared-root coordination and full performance
 acceptance remain open; normal public Pouch open still uses the multifile backend.
+
+## Deferred stream repair and reopen readiness
+
+Opening an unsealed stream now validates its canonical prefix and admits readers
+without clearing unused suffix capacity. Newly accepted complete bytes enter
+root readiness, so explicit barriers, peer publications and checkpoints still
+cover them. The first append clears the complete rejected suffix and waits for
+its own completed-repair readiness unit before returning a writer. This reuses
+the writer's bounded heap buffer and the existing caller-led sync coordinator.
+There is no batching delay, background worker, new writer queue, record-format
+change or public API change. Failed repair returns no writer and retains the
+existing poisoned-storage behavior. Sealing/retirement keep their dependency
+barriers and can avoid unused-suffix clearing altogether.
+
+Physical root admission still performs journal/incarnation durability work.
+A four-namespace populated-reopen trace has **one sync and no suffix zero calls**,
+versus **five syncs and four zero calls** at the preceding checkpoint. Both have
+three root offset writes. These diagnostic traces are `container-4w.strace` and
+`coordinated-ready-4w.strace` under `build/pouch-space-readiness/`; their timings
+are not used for performance comparisons. Repair work remains required before
+a subsequent append.
+
+### Verification
+
+The complete standard Debug preset passes **362/362 checks** in **1295.17 s**,
+including **310 unit groups**, public API/shared-symbol boundaries and worker
+stack checks. ASan/UBSan workers use 128 KiB stacks with the glibc stack cache
+disabled. GNU release and native musl each pass **73 affected groups**, in
+**64.84 s / 70.24 s**; musl uses its default worker stack.
+
+The new stream-recovery group covers **20 deterministic variants**. Twelve
+volatile/durable-model cases combine both policies, native/fallback zeroing and
+append/seal/retire. A valid stale record beyond a PENDING gap must remain hidden
+after a shorter append and another crash. Readers cause no stream writes/syncs;
+explicit flush, peer publication and checkpoint cover newly accepted bytes;
+allocation failure admits no writer; first-write repair occurs once; held old
+readers remain valid. Four paused-clearing cases prove reader, peer-writer and
+checkpoint progress. Four held-barrier cases force four repairs into exactly
+two readiness groups and prove that subsequent admissions need no repair sync.
+The existing heap/read/repair-I/O sweep now includes first-write admission and
+checks poisoned-state rejection and null writer output after repair failure.
+
+Strict ThreadSanitizer runs with the pinned instrumented OpenSSL pass **80
+concurrent comparisons plus eleven groups**, including reads, recovery, scope
+crashes, publication dependencies and maintenance concurrency. Four Memcheck
+runs complete **52,211 allocations and frees**, with zero live blocks, errors
+or suppressions. Logs are under `build/pouch-space-readiness/` as `debug-full.log`,
+`gnu-coordinated-focused.log`, `musl-coordinated-focused.log`,
+`tsan-readiness.log` and `memcheck-*.log`.
+
+### Matched performance
+
+The final binary and frozen `45da71c` binary run **240 verified trials**: five
+alternating-order samples of current/prior container/multifile engines, both
+policies, one/four namespace writers and three profiles. Each writes 128 one-KiB
+states twice with 4 KiB producer chunks. Profiles are ordinary writes, forced
+durability scopes, and metadata updates after populated reopen. Scope time
+includes completion. Metadata seeding is outside its measured phase; the
+reopen/mutation total includes closing/opening that populated store and both
+metadata rounds. Every container trial retains one reserved 10 MiB file with no
+persistent sidecars. Caches remain populated and device scheduling is not
+isolated; these are small native fixtures.
+
+Median populated reopen-to-ready milliseconds for the scope profile:
+
+| Policy | Writers | Container ms | Prior container ms | Multifile ms |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 6.806 | 12.035 | 4.340 |
+| NoSync | 4 | 7.233 | 22.801 | 5.018 |
+| Durable | 1 | 7.676 | 11.267 | 4.889 |
+| Durable | 4 | 7.468 | 22.817 | 5.463 |
+
+Four-namespace readiness improves about **3.2 times under NoSync** and **3.1
+times under Durable**. Container/multifile readiness is still 7.2–7.5 / 5.0–5.5 ms
+at four namespaces, so this does not close the full read-performance gap.
+Reopen-read CPU, excluding initial root open, has container medians of
+2.18–2.42 ms versus 2.49–3.57 ms before the change.
+
+Fresh-write controls retain ordinary and scoped policy. Median milliseconds
+are **current / prior**; C is container and M is multifile:
+
+| Policy | Writers | Ordinary C ms | Ordinary M ms | Scope C ms | Scope M ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 8.699 / 7.398 | 12.614 / 11.532 | 13.239 / 15.001 | 19.009 / 19.813 |
+| NoSync | 4 | 6.410 / 6.849 | 16.297 / 13.303 | 17.897 / 19.280 | 21.032 / 21.716 |
+| Durable | 1 | 673.996 / 636.677 | 1272.388 / 1286.770 | 20.800 / 21.245 | 18.670 / 20.008 |
+| Durable | 4 | 562.619 / 540.110 | 802.303 / 817.746 | 32.981 / 32.377 | 29.875 / 31.128 |
+
+Median populated reopen plus metadata-update milliseconds; sync counts cover
+the mutation phase and exclude root reopening:
+
+| Policy | Writers | Container ms | Prior container ms | Multifile ms | Container / prior syncs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 21.751 | 21.479 | 30.255 | 1 / 1 |
+| NoSync | 4 | 16.978 | 18.630 | 69.231 | 2 / 4 |
+| Durable | 1 | 380.333 | 468.863 | 1095.234 | 257 / 257 |
+| Durable | 4 | 343.391 | 297.646 | 604.052 | 131 / 135 |
+
+All fresh-write and reopen/mutation control ranges overlap before/after.
+Some current medians are higher: single-writer ordinary NoSync is 8.699 versus
+7.398 ms, and four-writer durable reopen/mutation is 343.391 versus 297.646 ms.
+The latter ranges are **301.153–359.613 / 278.360–387.512 ms**. These samples
+establish the readiness gain, not a general write-performance win or the absence
+of smaller regressions. Write-phase `syscall_written` remains exactly 403,803
+bytes at one namespace and 407,092 at four for ordinary/scoped writes, and
+85,064 bytes for metadata rounds, before/after. This excludes zero-range work.
+
+The initial implementation deferred repair but retained unconditional recovery
+syncs. Its separate 240-run series exposed a four-writer NoSync metadata
+regression: **16.118 versus 9.122 ms**, with non-overlapping **13.369–19.745 /
+8.637–13.004 ms** ranges. Traces showed concurrent clears followed by repeated
+syncs flushing newly appended NoSync metadata. Completed repairs now join the
+existing readiness coordinator. A targeted five-sample, three-engine comparison
+then measures **10.236 ms coordinated / 9.699 ms prior / 17.693 ms unconditional**,
+with two/four/four barriers. The final full series above retains the readiness
+gain with overlapping reopen/mutation ranges. Both initial and final series,
+and all fifteen diagnostic trials, remain available; no trials were discarded.
+
+The final ELF is `build/pouch-space-readiness/pouch_space_compare-coordinated`,
+SHA-256 `437181b4e02373c2760d840392f9095746a3d4fd3d991258654d36ab24064b92`.
+The prior ELF is `build/pouch-space-deferred-scope/pouch_space_compare-current`,
+SHA-256 `c49c9759dbf2f22e791dbf81bde2c15e7df4d134ea0da23250b7470ee01c0b6f`.
+The initial candidate is `pouch_space_compare-current` in the new stage, SHA-256
+`79afb9a950919709648b738e49e7e665f856a14260104d26211dc0cbe3ce60fe`.
+The stage retains both runners, `readiness-summary.pl`, initial `paired/` and
+`results.json`, final `coordinated/paired/` and `coordinated/results.json`, and
+`coordinated-check/`. Each full series has a verified 246-artifact performance
+manifest. Normal public Pouch remains multifile. Full integration, selected
+state/object lifetime repair, maintenance-capacity policy, shared-root operation
+and broader performance acceptance remain open.

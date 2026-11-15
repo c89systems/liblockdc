@@ -163,6 +163,25 @@ persisted grant metadata ahead of body writes, held preparation concurrent with
 unrelated publication/checkpoint, all preparation/recovery I/O and allocation
 failures, and pre-existing bytes beyond the committed capacity during growth.
 
+Unsealed stream open validates the canonical prefix and admits readers without
+clearing unused capacity. Newly recovered complete bytes join root readiness;
+an explicit barrier, peer publication or checkpoint can stabilize them before
+suffix repair. First write admission clears the complete rejected suffix and
+waits for a readiness unit registered after that clearing completes. Independent
+repairs can share the existing coordinator's barrier. The writer's existing
+heap buffer supplies bounded fallback zero writes. Failed repair returns no
+writer and retains uncertain-I/O poison semantics. Sealing and retirement keep
+their existing prefix/dependency barriers without clearing unused capacity.
+Physical root recovery still performs its own journal/incarnation work.
+
+The [reopen measurements](pouch-space-experiment.md#deferred-stream-repair-and-reopen-readiness)
+show approximately three times faster four-namespace readiness in the small
+native fixture. Twenty deterministic recovery/concurrency variants and the
+extended first-write fault sweep prove the admission boundary. The complete
+362-check Debug preset passes, including 310 unit groups; GNU/musl each pass
+73 affected groups, instrumented-dependency ThreadSanitizer passes 80 comparisons
+and eleven groups, and four Memcheck runs have zero live blocks/errors.
+
 Stream sealing and atomic retirement are now implemented. Seal freezes the
 canonical tail in an 80-byte structural event. A prerequisite barrier stabilizes
 unsynced canonical bytes before that event can recover; an already durable tail

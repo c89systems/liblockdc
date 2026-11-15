@@ -19,7 +19,7 @@ struct ps_stream {
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
-  int appending, recovering, sealed, retired;
+  int appending, recovering, repair_pending, sealed, retired;
 };
 struct ps_stream_writer {
   ps_stream *stream;
@@ -110,19 +110,12 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
   }
   return LC_OK;
 }
-static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *buffer,
+static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
                         lc_error *error) {
-  unsigned char *zero = buffer;
   stream_run run;
   uint64_t n;
   int rc = LC_OK;
-  if (!zero)
-    zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
-  else
-    memset(zero, 0, PS_CHUNK);
-  if (!zero)
-    return stream_error(error, LC_ERR_NOMEM,
-                        "cannot allocate stream repair buffer");
+  memset(zero, 0, PS_CHUNK);
   while (offset < s->capacity && rc == LC_OK) {
     rc = stream_mapping(s, offset, &run, error);
     if (rc == LC_OK) {
@@ -131,8 +124,6 @@ static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *buffer,
       offset += n;
     }
   }
-  if (!buffer)
-    lc_free_with_allocator(NULL, zero);
   return rc;
 }
 static void stream_destroy(ps_stream *s) {
@@ -209,12 +200,16 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
       if (rc == LC_OK && (accepted < s->tail || accepted > s->capacity))
         rc = stream_error(error, LC_ERR_PROTOCOL,
                           "canonical recovery returned invalid tail");
-      if (rc == LC_OK)
-        rc = clear_suffix(s, accepted, NULL, error);
-      if (rc == LC_OK)
-        rc = ps_owned_recovered(s->head, accepted, error);
-      if (rc == LC_OK)
+      /* Readers need only the validated prefix. Track newly recovered bytes
+       * in root readiness so a peer barrier or checkpoint still covers them;
+       * the rejected suffix is repaired before the first write admission. */
+      if (rc == LC_OK && accepted > s->tail)
+        rc = ps_owned_commit(s->head, accepted, PS_COMMIT_DEFER_SYNC, NULL,
+                             NULL, error);
+      if (rc == LC_OK) {
         s->tail = accepted;
+        s->repair_pending = 1;
+      }
     }
   }
   if (rc == LC_OK)
@@ -329,7 +324,7 @@ int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
 int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
   ps_stream_writer *w;
   ps_owned_status status;
-  int rc;
+  int rc, repair = 0;
   if (out)
     *out = NULL;
   if (!s || !out)
@@ -348,10 +343,23 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
     s->appending = 1;
     w->stream = s;
     w->start = s->tail;
-    *out = w;
+    repair = s->repair_pending;
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK)
+  if (rc == LC_OK && repair) {
+    rc = clear_suffix(s, w->start, w->buffer, error);
+    if (rc == LC_OK)
+      rc = ps_owned_recovered(s->head, w->start, error);
+    pthread_mutex_lock(&s->mutex);
+    if (rc == LC_OK)
+      s->repair_pending = 0;
+    else
+      s->appending = 0;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  if (rc == LC_OK)
+    *out = w;
+  else
     lc_free_with_allocator(NULL, w);
   return rc;
 }

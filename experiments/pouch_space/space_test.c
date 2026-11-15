@@ -3071,6 +3071,317 @@ static void canonical_stream_concurrency(void) {
   puts("streams: held root barriers, independent ready producers, exact prefix "
        "visibility and mixed immutable/stream commit groups");
 }
+static void canonical_stream_read_recovery(int native_zero, int durable,
+                                           int action) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_options o = {0};
+  ps_space *space;
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_stream_reader *held = NULL, *rejected = NULL;
+  ps_stream_info info;
+  ps_stats before, after;
+  recovery_trace trace = {0};
+  lc_pouch_record_header header = {0};
+  unsigned char body[64], captured[107];
+  unsigned char *private = calloc(1, 2 * PS_CHUNK);
+  unsigned char *image = malloc(PS_MIB);
+  uint64_t first, second, next = 0;
+  size_t operations, zeros, got;
+  CHECK(private && image);
+  if (native_zero)
+    io.zero = model_zero;
+  o.io = &io;
+  o.durable_sync = durable;
+  memset(body, 0x64, sizeof(body));
+  clean();
+  space = create(PS_MIB, durable, &io);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(canonical_append(stream, body, 64, 7, 1, &first, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(canonical_append(stream, body, 31, 7, 2, &second, &error));
+  /* A persisted PENDING gap hides another valid record exactly where a later
+   * shorter append will end. Missing deferred repair would resurrect it. */
+  header.type = 1;
+  header.key_len = 3;
+  header.meta_len = 8;
+  header.payload_len = 64;
+  memset(private + 60 + 43, 0xee, 64);
+  header.payload_crc = crc32(0, private + 60 + 43, 64);
+  lc_pouch_record_header_encode(&header, private + 60);
+  memcpy(private + 60 + 32, "key", 3);
+  fixture_put(private + 60 + 35, 999, 8);
+  header.flags = LC_POUCH_RECORD_FLAG_PENDING;
+  lc_pouch_record_header_encode(&header, private);
+  OK(ps_stream_begin(stream, &writer, &error));
+  OK(ps_stream_write(writer, private, 2 * PS_CHUNK, &error));
+  put(space, key(PS_CONTROL, 20, 1), "peer", 4, 4);
+  memcpy(image, m.stable, PS_MIB);
+  ps_stream_writer_close(writer);
+  writer = NULL;
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  memcpy(m.stable, image, PS_MIB);
+  crash(&m);
+  OK(ps_open(path, 0, &o, &space, &error));
+  operations = m.operations;
+  zeros = m.zero_calls;
+  OK(ps_status(space, &before, &error));
+  stream = stream_open(space, 1, 0, NULL, &trace);
+  CHECK(trace.start == 107 && trace.records == 1);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(info.tail == 181);
+  stream_expect(stream, first, body, 64, 1);
+  stream_expect(stream, second, body, 31, 2);
+  BAD(ps_stream_read_open(stream, info.tail, 1, &rejected, &error));
+  CHECK(!rejected);
+  OK(ps_status(space, &after, &error));
+  CHECK(m.operations == operations && m.zero_calls == zeros &&
+        after.syncs == before.syncs &&
+        after.journal_bytes == before.journal_bytes);
+  /* Newly accepted bytes join explicit, peer and checkpoint durability,
+   * even before suffix repair. Covered barriers must not sync again. */
+  if (!action)
+    OK(ps_flush(space, &error));
+  else if (action == 1)
+    put(space, key(PS_CONTROL, 20, 1), "covered", 7, 7);
+  else
+    OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK((action == 2 ? after.syncs > before.syncs
+                     : after.syncs == before.syncs + 1) &&
+        m.zero_calls == zeros);
+  before = after;
+  OK(ps_flush(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.syncs == before.syncs);
+  if (!action)
+    OK(ps_checkpoint(space, &error));
+  OK(ps_stream_read_open(stream, first, 107, &held, &error));
+  if (!action) {
+    operations = m.operations;
+    allocation_call = 0;
+    allocation_fail = 1;
+    CHECK(ps_stream_begin(stream, &writer, &error) == LC_ERR_NOMEM && !writer);
+    allocation_fail = 0;
+    lc_error_cleanup(&error);
+    CHECK(m.operations == operations && m.zero_calls == zeros);
+    OK(ps_status(space, &before, &error));
+    OK(ps_stream_begin(stream, &writer, &error));
+    OK(ps_status(space, &after, &error));
+    CHECK(after.syncs == before.syncs + 1);
+    ps_stream_writer_close(writer);
+    writer = NULL;
+    before = after;
+    OK(canonical_append(stream, body, 17, 7, 3, &next, &error));
+    CHECK(next == 181);
+    OK(ps_status(space, &after, &error));
+    CHECK(after.syncs == before.syncs + durable);
+    OK(ps_flush(space, &error));
+  } else if (action == 1) {
+    OK(ps_stream_seal(stream, &error));
+    CHECK(m.zero_calls == zeros);
+    BAD(ps_stream_begin(stream, &writer, &error));
+    CHECK(!writer);
+  } else {
+    OK(ps_stream_retire(stream, &error));
+    CHECK(m.zero_calls == zeros);
+    BAD(ps_stream_read_open(stream, 0, 107, &rejected, &error));
+    CHECK(!rejected);
+  }
+  OK(ps_stream_read(held, captured, sizeof(captured), &got, &error));
+  CHECK(got == sizeof(captured) && fixture_get64(captured + 35) == 1 &&
+        !memcmp(captured + 43, body, 64));
+  ps_stream_reader_close(held);
+  if (action == 2)
+    OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  crash(&m);
+  OK(ps_open(path, 0, &o, &space, &error));
+  if (action == 2) {
+    BAD(ps_stream_open(space, NULL, stream_key(1), 0, NULL, canonical_recover,
+                       NULL, &stream, &error));
+    CHECK(!stream);
+  } else {
+    trace = (recovery_trace){0};
+    stream = stream_open(space, 1, 0, NULL, &trace);
+    OK(ps_stream_status(stream, &info, &error));
+    CHECK(info.tail == (action ? 181 : 241));
+    CHECK(!action || (!trace.records && info.sealed));
+    stream_expect(stream, first, body, 64, 1);
+    stream_expect(stream, second, body, 31, 2);
+    if (!action)
+      stream_expect(stream, next, body, 17, 3);
+    OK(ps_stream_close(stream, &error));
+  }
+  OK(ps_close(space, &error));
+  free(private);
+  free(image);
+  free(m.stable);
+  clean();
+}
+static void canonical_stream_repair_concurrency(int native_zero, int durable) {
+  commit_gate gate = {0};
+  ps_io io = {&gate, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_options o = {0};
+  ps_space *space;
+  ps_stream *a, *b;
+  ps_stream_writer *blocked = NULL;
+  ps_stream_reader *held = NULL;
+  ps_stream_info info;
+  stream_actor actor = {0};
+  pthread_t thread;
+  unsigned char old[64], peer[31], body[1024], captured[107];
+  uint64_t start;
+  size_t got;
+  clean();
+  if (native_zero)
+    io.zero = gate_zero;
+  o.io = &io;
+  o.durable_sync = durable;
+  CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+  memset(old, 0x73, sizeof(old));
+  memset(peer, 0x81, sizeof(peer));
+  space = create(PS_MIB, durable, &io);
+  a = stream_open(space, 1, 1, NULL, NULL);
+  b = stream_open(space, 2, 1, NULL, NULL);
+  OK(canonical_append(a, old, sizeof(old), 7, 1, &start, &error));
+  OK(canonical_append(b, old, sizeof(old), 7, 1, &start, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(a, &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_close(space, &error));
+  OK(ps_open(path, 0, &o, &space, &error));
+  a = stream_open(space, 1, 0, NULL, NULL);
+  b = stream_open(space, 2, 0, NULL, NULL);
+  OK(ps_stream_read_open(a, 0, 107, &held, &error));
+  actor.stream = a;
+  actor.gate = &gate;
+  gate.enabled = gate.hold_payload = 1;
+  CHECK(pthread_create(&thread, NULL, stream_commit_worker, &actor) == 0);
+  await_gate(&gate, 0);
+  OK(ps_stream_status(a, &info, &error));
+  CHECK(info.tail == 107);
+  BAD(ps_stream_begin(a, &blocked, &error));
+  CHECK(!blocked);
+  stream_expect(a, 0, old, sizeof(old), 1);
+  OK(canonical_append(b, peer, sizeof(peer), 7, 2, &start, &error));
+  CHECK(start == 107);
+  stream_expect(b, start, peer, sizeof(peer), 2);
+  OK(ps_checkpoint(space, &error));
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  CHECK(pthread_join(thread, NULL) == 0 && actor.rc == LC_OK &&
+        actor.start == 107);
+  memset(body, 'A', sizeof(body));
+  stream_expect(a, actor.start, body, sizeof(body), 2);
+  OK(ps_stream_read(held, captured, sizeof(captured), &got, &error));
+  CHECK(got == sizeof(captured) && !memcmp(captured + 43, old, sizeof(old)));
+  ps_stream_reader_close(held);
+  OK(ps_stream_close(a, &error));
+  OK(ps_stream_close(b, &error));
+  OK(ps_close(space, &error));
+  CHECK(pthread_cond_destroy(&gate.cond) == 0);
+  CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
+  clean();
+}
+typedef struct repair_actor {
+  ps_stream *stream;
+  commit_gate *gate;
+  int rc;
+} repair_actor;
+static void *stream_repair_worker(void *context) {
+  repair_actor *actor = context;
+  ps_stream_writer *writer = NULL;
+  lc_error e;
+  lc_error_init(&e);
+  actor->rc = ps_stream_begin(actor->stream, &writer, &e);
+  ps_stream_writer_close(writer);
+  lc_error_cleanup(&e);
+  pthread_mutex_lock(&actor->gate->mutex);
+  ++actor->gate->finished;
+  pthread_cond_broadcast(&actor->gate->cond);
+  pthread_mutex_unlock(&actor->gate->mutex);
+  return NULL;
+}
+static void canonical_stream_repair_groups(int native_zero, int durable) {
+  commit_gate gate = {0};
+  ps_io io = {&gate, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_options o = {0};
+  ps_space *space;
+  ps_stream *streams[4];
+  repair_actor actors[4] = {{0}};
+  pthread_t threads[4];
+  ps_stats before, after;
+  unsigned char body[64];
+  uint64_t start;
+  size_t syncs;
+  clean();
+  if (native_zero)
+    io.zero = gate_zero;
+  o.io = &io;
+  o.durable_sync = durable;
+  CHECK(pthread_mutex_init(&gate.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&gate.cond, NULL) == 0);
+  memset(body, 0x75, sizeof(body));
+  space = create(PS_MIB, durable, &io);
+  for (size_t i = 0; i < 4; ++i) {
+    streams[i] = stream_open(space, i + 1, 1, NULL, NULL);
+    OK(canonical_append(streams[i], body, sizeof(body), 7, 1, &start, &error));
+  }
+  OK(ps_checkpoint(space, &error));
+  for (size_t i = 0; i < 4; ++i)
+    OK(ps_stream_close(streams[i], &error));
+  OK(ps_close(space, &error));
+  OK(ps_open(path, 0, &o, &space, &error));
+  for (size_t i = 0; i < 4; ++i) {
+    streams[i] = stream_open(space, i + 1, 0, NULL, NULL);
+    actors[i] = (repair_actor){streams[i], &gate, 0};
+  }
+  OK(ps_status(space, &before, &error));
+  syncs = gate.syncs;
+  gate.enabled = gate.hold_second = 1;
+  CHECK(pthread_create(&threads[0], NULL, stream_repair_worker, &actors[0]) ==
+        0);
+  await_gate(&gate, 0);
+  for (size_t i = 1; i < 4; ++i)
+    CHECK(pthread_create(&threads[i], NULL, stream_repair_worker, &actors[i]) ==
+          0);
+  await_stream_requests(space, before.sync_requests + 4);
+  for (size_t i = 0; i < 4; ++i)
+    stream_expect(streams[i], 0, body, sizeof(body), 1);
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  await_gate(&gate, 3);
+  await_stream_finished(&gate, 1);
+  for (size_t i = 0; i < 4; ++i)
+    stream_expect(streams[i], 0, body, sizeof(body), 1);
+  pthread_mutex_lock(&gate.mutex);
+  gate.second_released = 1;
+  pthread_cond_broadcast(&gate.cond);
+  pthread_mutex_unlock(&gate.mutex);
+  for (size_t i = 0; i < 4; ++i) {
+    ps_stream_writer *writer = NULL;
+    CHECK(pthread_join(threads[i], NULL) == 0 && actors[i].rc == LC_OK);
+    OK(ps_stream_begin(streams[i], &writer, &error));
+    ps_stream_writer_close(writer);
+    OK(ps_stream_close(streams[i], &error));
+  }
+  OK(ps_status(space, &after, &error));
+  CHECK(gate.syncs == syncs + 2 &&
+        after.sync_batches == before.sync_batches + 2);
+  OK(ps_close(space, &error));
+  CHECK(pthread_cond_destroy(&gate.cond) == 0);
+  CHECK(pthread_mutex_destroy(&gate.mutex) == 0);
+  clean();
+}
 static void canonical_stream_open_faults(int native_zero) {
   model m;
   ps_io io = model_init(&m);
@@ -3079,6 +3390,7 @@ static void canonical_stream_open_faults(int native_zero) {
   ps_options options = {0};
   ps_space *space = NULL;
   ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
   unsigned char *body = malloc(65537), *baseline = malloc(3 * (size_t)PS_MIB);
   uint64_t first, large, last, next;
   size_t kind, phase, count;
@@ -3100,6 +3412,7 @@ static void canonical_stream_open_faults(int native_zero) {
   for (kind = 0; kind < 3; ++kind) {
     count = 0;
     for (phase = 0; phase <= count; ++phase) {
+      int attempted = 0;
       memcpy(m.stable, baseline, 3 * (size_t)PS_MIB);
       crash(&m);
       m.reads = m.operations = 0;
@@ -3113,6 +3426,12 @@ static void canonical_stream_open_faults(int native_zero) {
       if (rc == LC_OK)
         rc = ps_stream_open(space, NULL, stream_key(1), 0, NULL,
                             canonical_recover, NULL, &stream, &error);
+      if (rc == LC_OK) {
+        attempted = 1;
+        rc = ps_stream_begin(stream, &writer, &error);
+      }
+      ps_stream_writer_close(writer);
+      writer = NULL;
       allocation_fail = 0;
       m.fail_at = m.fail_read = 0;
       if (!phase)
@@ -3121,6 +3440,11 @@ static void canonical_stream_open_faults(int native_zero) {
                             : m.operations;
       if (rc != LC_OK) {
         CHECK(rc == (kind == 0 ? LC_ERR_NOMEM : LC_ERR_TRANSPORT));
+        if (kind == 2 && attempted) {
+          CHECK(!writer && ps_check(space, NULL) == LC_ERR_TRANSPORT);
+          CHECK(ps_stream_begin(stream, &writer, NULL) == LC_ERR_TRANSPORT &&
+                !writer);
+        }
         lc_error_cleanup(&error);
       }
       OK(ps_stream_close(stream, &error));
@@ -6044,6 +6368,14 @@ int main(int argc, char **argv) {
       stream_lifecycle_concurrency(1);
       stream_lifecycle_invalid_events();
       stream_lifecycle_rebind_rollover();
+    } else if (strcmp(argv[2], "stream-recovery") == 0) {
+      for (int zero = 0; zero < 2; ++zero)
+        for (int durable = 0; durable < 2; ++durable) {
+          for (int action = 0; action < 3; ++action)
+            canonical_stream_read_recovery(zero, durable, action);
+          canonical_stream_repair_concurrency(zero, durable);
+          canonical_stream_repair_groups(zero, durable);
+        }
     } else if (strcmp(argv[2], "streams") == 0) {
       canonical_stream_exact_reservations();
       canonical_stream_lifecycle();

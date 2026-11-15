@@ -2995,6 +2995,7 @@ int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
 }
 int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   ps_space *s;
+  uint64_t sequence = 0;
   int rc;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned recovery requires head");
@@ -3005,10 +3006,19 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
       (head->entry->deleted || head->entry->stream_sealed ||
        tail < head->entry->bytes || tail > head->entry->stream_capacity))
     rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
+  if (rc == LC_OK &&
+      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    rc = err(error, LC_ERR_TRANSPORT, "recovery readiness exhausted; reopen");
+  }
+  if (rc == LC_OK)
+    sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
-    rc = sync_file(s, error);
+    rc = wait_durable(s, sequence, error);
   pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK)
+    rc = healthy(s, error);
   if (rc == LC_OK) {
     head->entry->bytes = tail;
     if (!head->entry->dirty_link)

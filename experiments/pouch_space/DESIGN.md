@@ -271,11 +271,19 @@ hole-punching storage policy.
 The canonical owner's recovery callback validates records from the trusted
 checkpoint tail, using bounded read-ahead and its existing record checksums.
 Only this callback may inspect candidate bytes beyond the published tail. The
-stream then clears the entire rejected suffix and synchronizes before write
-admission, preventing later valid-looking debris from resurrecting. An abandoned
-written append is likewise cleared and synced before another appender; its
-existing buffer supplies the bounded fallback. Failed cleanup poisons the space.
-Opening a checkpointed stream does not scan its acknowledged bodies.
+validated prefix becomes readable without clearing unused capacity. Newly
+accepted bytes join root readiness so a peer barrier or checkpoint covers their
+dependencies. The first write admission clears the entire rejected suffix and
+waits for its completed-repair readiness unit before returning a writer. This
+prevents later valid-looking debris from resurrecting after a shorter append.
+Independent completed repairs may share the existing caller-led barrier; a
+repair cannot rely on a barrier whose captured prefix preceded its clearing.
+The writer's existing bounded buffer supplies fallback zero writes. An abandoned
+written append retains its immediate clearing/sync behavior. Failed cleanup
+poisons the space and returns no writer. Opening a checkpointed stream does not
+scan its acknowledged bodies. Physical root recovery still has its own journal
+and incarnation durability work; stream read admission does not make the whole
+root open write-free.
 
 ## Stream lifecycle
 
