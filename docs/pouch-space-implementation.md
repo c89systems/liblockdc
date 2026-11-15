@@ -8,6 +8,66 @@ conversion is outside this implementation; production deployment still requires
 an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
+## Compound append recovery: decision pending
+
+Staged state integration has exposed a recovery gap in the experimental
+container. A deterministic process-death probe writes the first complete LINK
+of a promotion into an existing active segment, then exits before writing its
+DECISION and staged tombstone. Reopen accepts that complete LINK beyond the
+stream's previous published tail. It exposes public generation 2 while the
+generation-2 stage remains live. The retained failing probe is
+`build/pouch-space-staged/active-batch-crash.log`; its diagnostic mode is
+`staging-crash` in the private Pouch test executable. It exits during the write,
+before append cleanup. This is process-death evidence, not a power-loss model.
+
+Known-size reservation and one append commit do not by themselves make a
+compound canonical batch an indivisible recovery unit. Selecting a new segment
+protects an unpublished successor, but recovery of an already selected active
+segment accepts complete individual records in its candidate suffix. Earlier
+allocation/I/O/partial-write sweeps exercised orderly failure cleanup and
+rotation; their passes do not establish crash atomicity for this active case.
+The staged integration is therefore unfinished and uncommitted. Normal public
+Pouch still uses its existing multifile owner.
+
+The proposed correction is **checksummed framing for complete canonical
+batches**. Preserve the existing logical records inside one container-owned
+frame. Its header binds the exact encoded batch length and a CRC32 over every
+inner canonical byte. Recover and validate the complete frame before admitting
+any inner record or advancing the accepted tail. An incomplete or damaged
+candidate frame contributes no records; damage within the selected published
+prefix remains a hard corruption error. A checkpoint must not split a frame.
+Projection replay still receives ordinary canonical entries with their actual
+inner offsets, existing index sequences, lifetimes and body references.
+
+Apply this contract to typed COMPLETE and MAINTENANCE batches. Keep the existing
+bounded streaming PUT path and its payload checks unchanged. Add the framing
+bytes to the complete append's reservation and rotation calculation before any
+write. Finalize indices/lifetimes before computing the checksum. Walk the
+already encoded metadata vectors to compute it: no additional body copy, whole
+batch concatenation, spool, sidecar, writer queue or durable barrier is needed.
+The frame header can reuse the existing fixed-width record-header encoding,
+with a distinct private container frame type; no public Pouch record type or
+SDK backend selector is introduced. The intended overhead is one 32-byte
+header per complete batch plus checksum CPU and recovery validation.
+
+This changes the experimental segment representation. It does not change the
+multifile representation or public API/ABI. It carries no existing-fixture
+compatibility or migration promise; recreate experimental fixtures, retain the
+current independent format marker, and add no legacy parser. This is a proposed
+persistence decision, not an approved or implemented format change. It is
+separate from the standing maintenance-capacity decision below.
+
+Before accepting the correction, prove promotion, discard and staged-delete
+groups on both an active segment and rotation. Cut process execution across
+frame header/body/publication writes, including each inner-record boundary;
+model loss of unsynced writes separately. Recovery may select the old state or
+the complete new group, never an inner prefix. Cover both sync policies, codecs,
+allocation/I/O/torn writes, recovery retry, pinned readers, later ordinary
+appends, snapshots and compaction. Durable acknowledgement must cover the
+complete group. Verify unchanged barrier counts, independent producers, and
+measure framing/checksum cost against both the frozen container checkpoint and
+the current multifile implementation before claiming the staged path complete.
+
 ## Physical ownership and directory
 
 Physical pages are 4 KiB. Logical records may share pages through append-owned
