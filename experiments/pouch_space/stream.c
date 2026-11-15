@@ -4,6 +4,7 @@
 
 #include <pthread.h>
 #include <string.h>
+#include <zlib.h>
 
 typedef struct stream_run {
   ps_owned_run *handle;
@@ -479,6 +480,41 @@ int ps_stream_write_at(ps_stream_writer *w, uint64_t offset, const void *bytes,
     memcpy(w->buffer + (size_t)(offset - w->flushed), p, n);
   if (rc != LC_OK)
     w->failed = 1;
+  return rc;
+}
+int ps_stream_writer_crc(ps_stream_writer *w, uint64_t offset, uint64_t length,
+                         unsigned long *out, lc_error *error) {
+  unsigned char *scratch = NULL;
+  unsigned long crc = 0;
+  size_t n;
+  int rc = LC_OK;
+  if (!w || !out || w->failed || w->published || offset > w->bytes ||
+      length > w->bytes - offset)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream checksum outside private append");
+  if (length && offset < w->flushed) {
+    scratch = lc_alloc_with_allocator(NULL, PS_CHUNK);
+    if (!scratch)
+      return stream_error(error, LC_ERR_NOMEM,
+                          "cannot allocate private stream CRC buffer");
+  }
+  while (length && offset < w->flushed && rc == LC_OK) {
+    uint64_t left = w->flushed - offset;
+    if (left > length)
+      left = length;
+    n = left < PS_CHUNK ? (size_t)left : PS_CHUNK;
+    rc = stream_io(w->stream, w->start + offset, scratch, n, 0, error);
+    if (rc == LC_OK)
+      crc = (unsigned long)crc32((uLong)crc, scratch, (uInt)n);
+    offset += n;
+    length -= n;
+  }
+  if (rc == LC_OK && length)
+    crc = (unsigned long)crc32(
+        (uLong)crc, w->buffer + (size_t)(offset - w->flushed), (uInt)length);
+  lc_free_with_allocator(NULL, scratch);
+  if (rc == LC_OK)
+    *out = crc;
   return rc;
 }
 int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,

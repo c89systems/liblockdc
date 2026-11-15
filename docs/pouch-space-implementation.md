@@ -8,13 +8,13 @@ conversion is outside this implementation; production deployment still requires
 an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
-## Compound append recovery: decision pending
+## Compound append recovery
 
-Staged state integration has exposed a recovery gap in the experimental
-container. A deterministic process-death probe writes the first complete LINK
+Staged state integration exposed a recovery gap in the experimental
+container. A deterministic process-death probe wrote the first complete LINK
 of a promotion into an existing active segment, then exits before writing its
-DECISION and staged tombstone. Reopen accepts that complete LINK beyond the
-stream's previous published tail. It exposes public generation 2 while the
+DECISION and staged tombstone. Unframed recovery accepted that complete LINK beyond the
+stream's previous published tail. It exposed public generation 2 while the
 generation-2 stage remains live. The retained failing probe is
 `build/pouch-space-staged/active-batch-crash.log`; its diagnostic mode is
 `staging-crash` in the private Pouch test executable. It exits during the write,
@@ -26,10 +26,11 @@ protects an unpublished successor, but recovery of an already selected active
 segment accepts complete individual records in its candidate suffix. Earlier
 allocation/I/O/partial-write sweeps exercised orderly failure cleanup and
 rotation; their passes do not establish crash atomicity for this active case.
-The staged integration is therefore unfinished and uncommitted. Normal public
-Pouch still uses its existing multifile owner.
+The checksummed framing implementation below fixes this failure and completes
+the private harness's staged mutation/recovery slice. Normal public Pouch still
+uses its existing multifile owner.
 
-The proposed correction is **checksummed framing for complete canonical
+The approved correction is implemented as **checksummed framing for complete canonical
 batches**. Preserve the existing logical records inside one container-owned
 frame. Its header binds the exact encoded batch length and a CRC32 over every
 inner canonical byte. Recover and validate the complete frame before admitting
@@ -45,19 +46,24 @@ bytes to the complete append's reservation and rotation calculation before any
 write. Finalize indices/lifetimes before computing the checksum. Walk the
 already encoded metadata vectors to compute it: no additional body copy, whole
 batch concatenation, spool, sidecar, writer queue or durable barrier is needed.
-The frame header can reuse the existing fixed-width record-header encoding,
-with a distinct private container frame type; no public Pouch record type or
-SDK backend selector is introduced. The intended overhead is one 32-byte
-header per complete batch plus checksum CPU and recovery validation.
+The frame header reuses the existing fixed-width record-header encoding, with
+private type 9. No public Pouch record type or SDK backend selector is introduced.
+The overhead is one 32-byte header per complete batch plus checksum CPU and
+recovery validation. The normal metadata path accumulates CRC over borrowed
+vectors and finalizes the header in the existing stream buffer. A known-size
+canonical producer that patches private bytes uses a bounded CRC reread instead;
+when the header has already flushed, its final patch is an additional write.
+Ordinary unknown-size streaming PUTs remain unframed.
 
 This changes the experimental segment representation. It does not change the
 multifile representation or public API/ABI. It carries no existing-fixture
 compatibility or migration promise; recreate experimental fixtures, retain the
-current independent format marker, and add no legacy parser. This is a proposed
-persistence decision, not an approved or implemented format change. It is
-separate from the standing maintenance-capacity decision below.
+current independent format marker, and add no legacy parser. This persistence
+change is approved for the experimental implementation and verified below.
+It is separate from the standing
+maintenance-capacity decision below.
 
-Before accepting the correction, prove promotion, discard and staged-delete
+The acceptance checks prove promotion, discard and staged-delete
 groups on both an active segment and rotation. Cut process execution across
 frame header/body/publication writes, including each inner-record boundary;
 model loss of unsynced writes separately. Recovery may select the old state or
@@ -67,6 +73,69 @@ appends, snapshots and compaction. Durable acknowledgement must cover the
 complete group. Verify unchanged barrier counts, independent producers, and
 measure framing/checksum cost against both the frozen container checkpoint and
 the current multifile implementation before claiming the staged path complete.
+
+The framing implementation now passes the focused ASan/UBSan checks with
+128 KiB glibc worker stacks. The frame codec/writer/recovery tests include
+bounded reads, allocation/I/O failures, canonical fixups beyond the stream
+buffer, captured old views, invalid candidate checksums, a malformed final
+inner record with a valid outer CRC, checkpoint splits, and corruption inside
+the committed prefix. Rejected candidate batches admit no inner records and
+can be retried before a successful cold readback.
+
+The staged suite passes 23 groups in 1784.34 s, alongside the separately passed
+plain NoSync active-segment partition. It covers all four codecs, both root
+policies and active/rotated batches, with over 6,000 process-death/lost-write
+cases and 3,992 allocation/I/O/partial-write failure sites. The crash cases cut
+every physical write/sync/reserve operation before/after/partway, and explicitly
+cut each frame header and inner-record boundary. Each case checks the real
+file and an independent successful-sync image, retries old state, compacts and
+reopens. Durable acknowledgement requires the full group in both images.
+The allocation/I/O sweeps use plain and combined encryption/compression;
+functional and crash coverage exercise all four codec combinations.
+The passing logs are `build/pouch-space-batch-frame/debug-partition-probe.log`,
+`debug-staging.log` and `debug-staging-details.log` in that directory. The
+initial aggregate crash run reached its last configuration without an
+assertion failure but exceeded 600 s; the retained `debug-crash-matrix.log`
+records that timeout. Splitting by codec/policy/rotation preserves its coverage
+and extends it to every codec, with a 240 s limit per partition.
+
+All **400 Debug groups**, including **348 unit groups**, pass across the focused
+and remaining standard runs. The remaining 373 groups take 1616.18 s; their
+summary/details are `debug-standard-remaining.log`/`debug-standard-details.log`
+in the same stage. Native GNU/musl each pass 24 affected groups in
+86.86/77.34 s, including two crash partitions and production staged-recovery
+regressions; summaries/details are `gnu.log`/`gnu-details.log` and
+`musl.log`/`musl-details.log`.
+
+ThreadSanitizer with the checked fully instrumented OpenSSL archives passes
+80 four-writer comparisons and 16 focused groups, without suppressions. The
+first run passed the 80 comparisons, then found a race in the new frame test's
+assertion counter. That test-only counter now uses a relaxed atomic, matching
+the other harnesses. The isolated failing test, the remaining focused race
+checks and all three frame groups under Debug/GNU/musl pass after that repair.
+The retained logs are `tsan.log`, `tsan/frame-codec-fixed.log`,
+`tsan-focused.log` and `{debug,gnu,musl}-counter.log`. Five Memcheck runs cover
+frame codec/writer/recovery and staged lifecycle/recovery: 235,145 allocations
+and frees, zero live allocations, errors or suppressions (`memcheck.log` and
+`memcheck/`).
+
+The [600-trial matched comparison](pouch-space-experiment.md#checksummed-batch-framing)
+retains all medians, ranges and counters. Measured small complete batches add
+exactly 32 syscall bytes each, with no extra write calls or single-writer
+barriers. Timing medians are mixed, and all 40 before/after primary ranges
+overlap; this establishes the observed branch comparison rather than an
+isolated checksum latency estimate.
+
+The private harness now supports staged PUT/prepared mutations, commit,
+promotion, discard and cold decision recovery for state/object records. Typed
+decision recovery uses the resident key index and a hash table, allocating
+decision entries only for still-live participants older than the decision.
+Historical completed attempts cannot retire a recreated stage. Ordinary
+compaction resolves the captured prefix and permits settled staged history,
+but rejects any remaining live stage before planning or publication. Live
+staged maintenance, other owners, protected maintenance admission at capacity,
+shared-root integration and production cutover remain outside this completed
+slice.
 
 ## Physical ownership and directory
 
@@ -547,7 +616,9 @@ The private Pouch snapshot tests now use this producer for initial and replaceme
 snapshots. They keep an old covered body bound when a newer META still refers
 to it. Capture does not itself publish snapshots, invalidate live projections,
 protect history consumers, select victims or admit complete maintenance work.
-Staged records and decisions are explicitly rejected pending their integration.
+Capture now resolves staged history and decisions, then rejects remaining live
+staged records until their maintenance policy is integrated. Completed staged
+history can be omitted from a resolved ordinary snapshot.
 
 This work also fixes queued metadata-entry copying to retain the prior query
 sequence and its presence flag. Without that copy, a metadata update could

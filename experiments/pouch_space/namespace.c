@@ -1,3 +1,4 @@
+#include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace_internal.h"
@@ -178,7 +179,8 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   lc_allocator allocator = {0};
   lc_pouch_state_entry record = {0};
   unsigned char *scratch = NULL;
-  uint64_t cursor = 0, next;
+  uint64_t cursor = 0, inner, next;
+  ps_frame frame;
   int rc = LC_OK, found, truncated;
   if (s->kind != PS_CATALOG_SEGMENT)
     return failure(e, LC_ERR_PROTOCOL,
@@ -193,10 +195,25 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
     return LC_OK;
   }
   while (cursor < capacity) {
-    rc = lc_pouch_state_record_read(ps_record_recovery_input(stream),
-                                    &allocator, s->leaf, cursor, capacity, 1,
-                                    cursor >= checkpoint, &scratch, &record,
-                                    &next, &found, &truncated, e);
+    found = 0;
+    rc = ps_frame_read(ps_record_recovery_input(stream), cursor, capacity,
+                       &scratch, &frame, e);
+    inner = frame.start;
+    if (rc == LC_OK && frame.framed && cursor < checkpoint &&
+        frame.end > checkpoint)
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "namespace checkpoint splits a batch frame");
+    while (rc == LC_OK) {
+      rc = lc_pouch_state_record_read(
+          ps_record_recovery_input(stream), &allocator, s->leaf, inner,
+          frame.end, !frame.framed, cursor >= checkpoint, &scratch, &record,
+          &next, &found, &truncated, e);
+      if (rc != LC_OK || !found)
+        break;
+      inner = next;
+      if (!frame.framed || inner == frame.end)
+        break;
+    }
     if (rc == LC_ERR_PROTOCOL && cursor >= checkpoint) {
       lc_error_cleanup(e);
       rc = LC_OK;
@@ -204,12 +221,12 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
     }
     if (rc != LC_OK || !found)
       break;
-    if (cursor < checkpoint && next > checkpoint) {
+    if (cursor < checkpoint && inner > checkpoint) {
       rc = failure(e, LC_ERR_PROTOCOL,
                    "namespace checkpoint splits a canonical record");
       break;
     }
-    cursor = next;
+    cursor = inner;
   }
   if (rc == LC_OK && cursor < checkpoint)
     rc =
@@ -744,6 +761,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   struct ps_namespace_data *d;
   ps_namespace_append *append;
   uint64_t selected;
+  uint64_t span;
   int rc, exact = 0;
   if (out)
     *out = NULL;
@@ -754,9 +772,12 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
-  if (minimum > (uint64_t)INT64_MAX)
+  if (minimum > (uint64_t)INT64_MAX ||
+      (mode != PS_APPEND_PREFIX &&
+       minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
+  span = mode == PS_APPEND_PREFIX ? minimum : minimum + PS_FRAME_BYTES;
   rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
     return rc;
@@ -780,19 +801,21 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     }
   }
   if (rc == LC_OK)
-    rc = plan_append(d, selected, minimum, mode, &append->budget, &exact, e);
+    rc = plan_append(d, selected, span, mode, &append->budget, &exact, e);
   if (rc == LC_OK && selected != d->active)
     rc = prepare(d, append->budget, selected, e);
   if (rc == LC_OK) {
     segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
-    rc = begin_reserve(s->stream, append->budget, minimum, exact,
-                       &append->writer, e);
+    rc = begin_reserve(s->stream, append->budget, span, exact, &append->writer,
+                       e);
     append->segment = s->id;
     append->leaf = s->leaf;
     append->complete = mode != PS_APPEND_PREFIX;
-    append->expected = minimum;
+    append->expected = span;
     if (rc == LC_OK && append->complete)
-      append->writer.limit = append->writer.start + minimum;
+      append->writer.limit = append->writer.start + span;
+    if (rc == LC_OK && append->complete)
+      rc = ps_record_frame_begin(&append->writer, minimum, e);
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
@@ -1038,7 +1061,8 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
   lc_allocator allocator = {0};
   lc_pouch_state_entry record = {0};
   unsigned char *scratch = NULL;
-  uint64_t cursor, next;
+  uint64_t cursor, inner, next;
+  ps_frame frame;
   size_t i;
   int rc = LC_OK, found, truncated;
   static const lc_pouch_record_io_ops ops = {replay_read, NULL, NULL, NULL,
@@ -1058,16 +1082,25 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
     input.used = 0;
     cursor = 0;
     while (rc == LC_OK && cursor < c->tail) {
-      rc = lc_pouch_state_record_read(io, &allocator, c->leaf, cursor, c->tail,
-                                      0, verify, &scratch, &record, &next,
-                                      &found, &truncated, e);
-      if (rc == LC_OK && !found)
-        rc = failure(e, LC_ERR_PROTOCOL,
-                     "namespace canonical prefix is incomplete");
+      rc = ps_frame_read(io, cursor, c->tail, &scratch, &frame, e);
+      inner = frame.start;
+      while (rc == LC_OK) {
+        rc = lc_pouch_state_record_read(io, &allocator, c->leaf, inner,
+                                        frame.end, 0, verify, &scratch, &record,
+                                        &next, &found, &truncated, e);
+        if (rc == LC_OK && !found)
+          rc = failure(e, LC_ERR_PROTOCOL,
+                       "namespace canonical prefix is incomplete");
+        if (rc == LC_OK)
+          rc = visit(context, c->id, &record, e);
+        if (rc != LC_OK)
+          break;
+        inner = next;
+        if (!frame.framed || inner == frame.end)
+          break;
+      }
       if (rc == LC_OK)
-        rc = visit(context, c->id, &record, e);
-      if (rc == LC_OK)
-        cursor = next;
+        cursor = inner;
     }
   }
   lc_pouch_state_entry_cleanup(&allocator, &record);

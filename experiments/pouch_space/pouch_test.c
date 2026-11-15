@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -989,7 +991,7 @@ typedef struct gate {
 typedef struct job {
   lc_pouch *pouch;
   gate *held;
-  int rc, started;
+  int rc, started, staged;
   size_t calls;
 } job;
 static size_t held_read(lc_source *pub, void *bytes, size_t length,
@@ -1020,7 +1022,13 @@ static void *held_writer(void *context) {
   body.impl = j;
   lc_error_init(&e);
   __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
-  if (j->held)
+  if (j->staged) {
+    in.pub.impl = &in;
+    j->rc =
+        lc_pouch_state_stage_write(j->pouch, "held", "key", "attempt",
+                                   j->held ? &body : &in.pub, &options, &w, &e);
+    j->calls = in.calls;
+  } else if (j->held)
     j->rc =
         lc_pouch_state_write(j->pouch, "held", "key", &body, &options, &w, &e);
   else {
@@ -1031,7 +1039,7 @@ static void *held_writer(void *context) {
   lc_error_cleanup(&e);
   return NULL;
 }
-static void concurrency(const char *path, const char *directory) {
+static void concurrency(const char *path, const char *directory, int staged) {
   for (int sync = 0; sync < 2; ++sync) {
     ps_pouch_state_options o = options(3, sync);
     lc_pouch *p = NULL;
@@ -1051,7 +1059,16 @@ static void concurrency(const char *path, const char *directory) {
     in = source(42, 10);
     ok(put(p, "held", "key", &in, NULL, &w, &e), &e);
     lc_pouch_state_write_result_cleanup(&allocator, &w);
+    if (staged) {
+      in = source(42, 10);
+      in.pub.impl = &in;
+      ok(lc_pouch_state_stage_write(p, "held", "key", "attempt", &in.pub, NULL,
+                                    &w, &e),
+         &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+    }
     j.pouch = p;
+    j.staged = staged;
     j.held = &g;
     j.rc = -1;
     REQUIRE(pthread_create(&producer, NULL, held_writer, &j) == 0);
@@ -1060,6 +1077,7 @@ static void concurrency(const char *path, const char *directory) {
       pthread_cond_wait(&g.changed, &g.mutex);
     pthread_mutex_unlock(&g.mutex);
     contender.pouch = p;
+    contender.staged = staged;
     REQUIRE(pthread_create(&competing, NULL, held_writer, &contender) == 0);
     while (!__atomic_load_n(&contender.started, __ATOMIC_ACQUIRE))
       sched_yield();
@@ -1067,7 +1085,17 @@ static void concurrency(const char *path, const char *directory) {
      * held producer can return. No timeout or scheduling sleep proves this. */
     read_value(p, "held", "anchor", 1009, 31, 1, &e);
     in = source(65569, 12);
-    ok(put(p, "independent", "key", &in, NULL, &w, &e), &e);
+    if (staged) {
+      in.pub.impl = &in;
+      ok(lc_pouch_state_stage_write(p, "independent", "key", "attempt", &in.pub,
+                                    NULL, &w, &e),
+         &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      ok(lc_pouch_state_commit_staged(p, "independent", "key", "attempt", &w,
+                                      &e),
+         &e);
+    } else
+      ok(put(p, "independent", "key", &in, NULL, &w, &e), &e);
     lc_pouch_state_write_result_cleanup(&allocator, &w);
     read_value(p, "independent", "key", 65569, 12, 1, &e);
     one_file(directory);
@@ -1079,6 +1107,10 @@ static void concurrency(const char *path, const char *directory) {
     REQUIRE(pthread_join(producer, NULL) == 0 && j.rc == LC_OK);
     REQUIRE(pthread_join(competing, NULL) == 0 &&
             contender.rc == LC_ERR_INVALID && contender.calls == 0);
+    if (staged) {
+      ok(lc_pouch_state_commit_staged(p, "held", "key", "attempt", &w, &e), &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+    }
     read_value(p, "held", "key", 0, 0, 2, &e);
     lc_pouch_close(p);
     REQUIRE(live == 0);
@@ -3054,10 +3086,8 @@ static void projection_faults(const char *path) {
     }
   f.fail_before = SIZE_MAX;
   lc_pouch_state_entry saved = f.entries[40];
-  for (int bad = 0; bad < 3; ++bad) {
-    if (!bad)
-      f.entries[40].decision = "transaction";
-    else if (bad == 1)
+  for (int bad = 1; bad < 3; ++bad) {
+    if (bad == 1)
       f.entries[40].key = ".staging/transaction/key";
     else
       f.entries[40].metadata = NULL;
@@ -4241,6 +4271,878 @@ static void maintenance_checksums(const char *path) {
     }
   lc_error_cleanup(&e);
 }
+static void staged_open(const char *path, int multifile, int create,
+                        ps_pouch_state_options *o, lc_pouch **p, lc_error *e) {
+  if (multifile)
+    ok(lc_pouch_open(path, &allocator, &o->logical, p, e), e);
+  else
+    ok(ps_pouch_state_open(path, create, &allocator, o, p, e), e);
+}
+static int staged_prepare(const lc_pouch_state_metadata_view *committed,
+                          const lc_pouch_state_metadata_view *staged,
+                          const lc_pouch_state_metadata_view *lease,
+                          void *context, lc_pouch_state_write_options *o,
+                          int *apply, lc_error *e) {
+  (void)committed;
+  (void)staged;
+  (void)lease;
+  (void)o;
+  (void)e;
+  *apply = context == NULL;
+  return LC_OK;
+}
+/* Deliberately publish only DECISION, as in an interrupted native batch. The
+ * fixture is closed immediately so no resident projection can mask it. */
+static lc_pouch_generation staged_decision(lc_pouch *p, unsigned char kind,
+                                           lc_error *e) {
+  const char *key = "key/.staging/attempt";
+  unsigned char meta[39] = {0};
+  lc_pouch_record_io io;
+  lc_pouch_storage_append append = {0};
+  lc_pouch_namespace_manifest manifest = {0};
+  void *ns = NULL;
+  lc_pouch_generation index;
+  int fd = -1;
+  ok(lc_pouch_state_index_seq(p, "staged", &index, e), e);
+  ++index;
+  meta[0] = 2;
+  meta[18] = kind;
+  memcpy(meta + 27, "ISCL", 4); /* Little-endian LCSI. */
+  for (size_t i = 0; i < 8; ++i)
+    meta[31 + i] = (unsigned char)(index >> (8 * i));
+  if (p->storage.ops) {
+    ok(p->storage.ops->namespace_open(p->storage.context, "staged", 0, &ns, e),
+       e);
+    ok(p->storage.ops->append_begin(
+           p->storage.context, ns, 1, 32 + strlen(key) + sizeof(meta),
+           LC_POUCH_STORAGE_APPEND_COMPLETE, &append, e),
+       e);
+    io = append.io;
+  } else {
+    char path[1800];
+    ok(lc_pouch_namespace_manifest_open(&allocator, p->root_path, "staged",
+                                        &manifest, NULL, NULL, e),
+       e);
+    REQUIRE(snprintf(path, sizeof(path), "%s/segments/%s",
+                     manifest.namespace_path,
+                     manifest.active_segment) < (int)sizeof(path));
+    fd = open(path, O_WRONLY | O_APPEND);
+    REQUIRE(fd >= 0);
+    io = lc_pouch_record_file_io(fd);
+  }
+  lc_pouch_record_header h = {0};
+  unsigned char header_bytes[32];
+  struct iovec parts[3];
+  h.type = 5;
+  h.key_len = strlen(key);
+  h.meta_len = sizeof(meta);
+  lc_pouch_record_header_encode(&h, header_bytes);
+  parts[0].iov_base = header_bytes;
+  parts[0].iov_len = sizeof(header_bytes);
+  parts[1].iov_base = (void *)key;
+  parts[1].iov_len = strlen(key);
+  parts[2].iov_base = meta;
+  parts[2].iov_len = sizeof(meta);
+  ok(lc_pouch_record_io_append(io, parts, 3, e), e);
+  if (p->storage.ops) {
+    ok(p->storage.ops->append_commit(p->storage.context, &append,
+                                     LC_POUCH_STORAGE_COMMIT_DEFAULT, e),
+       e);
+    p->storage.ops->append_close(p->storage.context, &append);
+    p->storage.ops->namespace_close(p->storage.context, ns);
+  } else {
+    REQUIRE(fdatasync(fd) == 0 && close(fd) == 0);
+    lc_pouch_namespace_manifest_cleanup(&allocator, &manifest);
+  }
+  return index;
+}
+static void staged_put(lc_pouch *p, const char *txn, size_t length,
+                       unsigned char seed, lc_pouch_generation version,
+                       int object, int prepared, int marker, lc_error *e) {
+  input in = source(length, seed);
+  lc_pouch_state_write_options o = {0};
+  lc_pouch_state_write_result w = {0};
+  o.has_logical_version = 1;
+  o.logical_version = version;
+  o.object_record = object;
+  o.staged_delete_marker = marker;
+  o.has_retention = !marker;
+  o.retention = marker ? 0 : -3600;
+  in.pub.impl = &in;
+  if (prepared)
+    ok(lc_pouch_state_stage_write_prepared(p, "staged", "key", txn, "key",
+                                           &in.pub, &o, staged_prepare, NULL,
+                                           NULL, &w, e),
+       e);
+  else
+    ok(lc_pouch_state_stage_write(p, "staged", "key", txn, &in.pub, &o, &w, e),
+       e);
+  REQUIRE(w.version == version && in.offset == length);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+}
+static void staged_absent(lc_pouch *p, const char *key, lc_error *e) {
+  lc_pouch_state_read_result r = {0};
+  ok(lc_pouch_state_read_metadata(p, "staged", key, &r, e), e);
+  REQUIRE(!r.found);
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+}
+static void staging(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int multifile = 0; multifile < 2; ++multifile)
+    for (int crypto = 0; crypto < 4; ++crypto)
+      for (int sync = 0; sync < 2; ++sync)
+        for (int object = 0; object < 2; ++object) {
+          char native[1400];
+          ps_pouch_state_options o = options(crypto, sync);
+          lc_pouch *p = NULL;
+          lc_pouch_state_write_options write = {0};
+          lc_pouch_state_write_result w = {0};
+          lc_pouch_state_read_result r = {0}, held = {0}, stage_held = {0};
+          lc_pouch_generation query, index, next;
+          int discarded;
+          o.logical.segment_target_bytes = 1;
+          REQUIRE(snprintf(native, sizeof(native), "%s/staged-%d-%d-%d",
+                           directory, crypto, sync,
+                           object) < (int)sizeof(native));
+          const char *root = multifile ? native : path;
+          staged_open(root, multifile, 1, &o, &p, &e);
+          write.object_record = object;
+          input in = source(31, 11);
+          ok(put(p, "staged", "key", &in, &write, &w, &e), &e);
+          char *etag = lc_strdup_with_allocator(&allocator, w.etag);
+          REQUIRE(etag);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          ok(lc_pouch_state_query_index_seq(p, "staged", &query, &e), &e);
+          staged_put(p, "attempt", 65569, 12, 2, object, 1, 0, &e);
+          read_value(p, "staged", "key", 31, 11, 1, &e);
+          read_value(p, "staged", "key/.staging/attempt", 65569, 12, 2, &e);
+          ok(lc_pouch_state_query_index_seq(p, "staged", &next, &e), &e);
+          REQUIRE(next == query);
+          if (!multifile) {
+            REQUIRE(ps_pouch_state_compact(p, "staged", NULL, &e) ==
+                    LC_ERR_UNSUPPORTED);
+            clear(&e);
+          }
+          REQUIRE(lc_pouch_state_promote_staged(p, "staged", "key", "attempt",
+                                                "wrong", &w,
+                                                &e) == LC_ERR_INVALID);
+          clear(&e);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          /* A stage with no decision survives repeated cold recovery. */
+          for (int cold = 0; cold < 2; ++cold) {
+            ok(lc_pouch_state_index_seq(p, "staged", &index, &e), &e);
+            lc_pouch_close(p);
+            REQUIRE(live == 1); /* The copied precondition is caller-owned. */
+            staged_open(root, multifile, 0, &o, &p, &e);
+            ok(lc_pouch_state_recover_staged_decisions(p, "staged", &e), &e);
+            ok(lc_pouch_state_index_seq(p, "staged", &next, &e), &e);
+            REQUIRE(next == index);
+            read_value(p, "staged", "key/.staging/attempt", 65569, 12, 2, &e);
+          }
+          ok(lc_pouch_state_read(p, "staged", "key", &held, &e), &e);
+          ok(lc_pouch_state_read(p, "staged", "key/.staging/attempt",
+                                 &stage_held, &e),
+             &e);
+          ok(lc_pouch_state_promote_staged(p, "staged", "key", "attempt", etag,
+                                           &w, &e),
+             &e);
+          REQUIRE(w.version == 2 && w.retention > w.updated_at_unix &&
+                  w.retention <= w.updated_at_unix + 3600);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          lc_free_with_allocator(&allocator, etag);
+          read_value(p, "staged", "key", 65569, 12, 2, &e);
+          staged_absent(p, "key/.staging/attempt", &e);
+          lc_pouch_close(p);
+          drain(held.body, 31, 11, &e);
+          drain(stage_held.body, 65569, 12, &e);
+          lc_pouch_state_read_result_cleanup(&allocator, &held);
+          lc_pouch_state_read_result_cleanup(&allocator, &stage_held);
+          REQUIRE(!live);
+          staged_open(root, multifile, 0, &o, &p, &e);
+          sequence_recovery_compact(p, "staged", multifile, &e);
+          read_value(p, "staged", "key", 65569, 12, 2, &e);
+          /* Decisions from a previous key lifetime cannot retire a new one.
+           * Use another completed attempt without compacting its decision. */
+          staged_put(p, "reuse", 31, 13, 3, object, 0, 0, &e);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "reuse", &w, &e),
+             &e);
+          REQUIRE(w.version == 3);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          staged_put(p, "reuse", 31, 14, 4, object, 0, 0, &e);
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          staged_open(root, multifile, 0, &o, &p, &e);
+          ok(lc_pouch_state_recover_staged_decisions(p, "staged", &e), &e);
+          read_value(p, "staged", "key/.staging/reuse", 31, 14, 4, &e);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "reuse", &w, &e),
+             &e);
+          REQUIRE(w.version == 4);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "reuse", &w, &e),
+             &e);
+          REQUIRE(!w.version && !w.etag);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          staged_put(p, "discard", 31, 15, 5, object, 0, 0, &e);
+          for (int repeat = 0; repeat < 2; ++repeat) {
+            ok(lc_pouch_state_discard_staged(p, "staged", "key", "discard",
+                                             &discarded, &e),
+               &e);
+            REQUIRE(discarded == !repeat);
+          }
+          read_value(p, "staged", "key", 31, 14, 4, &e);
+          staged_put(p, "delete", 0, 0, 5, object, 0, 1, &e);
+          ok(lc_pouch_state_read_metadata(p, "staged", "key/.staging/delete",
+                                          &r, &e),
+             &e);
+          REQUIRE(r.found && r.staged_delete_marker);
+          lc_pouch_state_read_result_cleanup(&allocator, &r);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "delete", &w, &e),
+             &e);
+          REQUIRE(w.version == 5);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          staged_absent(p, "key", &e);
+          ok(lc_pouch_state_query_index_seq(p, "staged", &query, &e), &e);
+          staged_put(p, "delete-absent", 0, 0, 1, object, 0, 1, &e);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "delete-absent",
+                                          &w, &e),
+             &e);
+          REQUIRE(!w.version);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          ok(lc_pouch_state_query_index_seq(p, "staged", &next, &e), &e);
+          REQUIRE(next == query);
+          /* Prepared META must preserve absence instead of inventing a body. */
+          if (!object) {
+            lc_pouch_state_write_options meta = {0};
+            meta.has_metadata = 1;
+            meta.metadata = (const unsigned char *)"lease";
+            meta.metadata_length = 5;
+            ok(lc_pouch_state_stage_metadata_prepared(
+                   p, "staged", "key", "meta", "key", &meta, staged_prepare,
+                   NULL, &w, &e),
+               &e);
+            REQUIRE(!w.version && !w.has_body);
+            lc_pouch_state_write_result_cleanup(&allocator, &w);
+            ok(lc_pouch_state_commit_staged(p, "staged", "key", "meta", &w, &e),
+               &e);
+            REQUIRE(!w.version && !w.has_body);
+            lc_pouch_state_write_result_cleanup(&allocator, &w);
+            ok(lc_pouch_state_read_metadata(p, "staged", "key", &r, &e), &e);
+            REQUIRE(r.found && !r.has_body && r.metadata_length == 5);
+            lc_pouch_state_read_result_cleanup(&allocator, &r);
+          }
+          staged_put(p, "recreate", 31, 16, 1, object, 1, 0, &e);
+          ok(lc_pouch_state_promote_staged(p, "staged", "key", "recreate", NULL,
+                                           &w, &e),
+             &e);
+          REQUIRE(w.version == 1);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          sequence_recovery_compact(p, "staged", multifile, &e);
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          staged_open(root, multifile, 0, &o, &p, &e);
+          read_value(p, "staged", "key", 31, 16, 1, &e);
+          if (object) {
+            ok(lc_pouch_state_query_index_seq(p, "staged", &next, &e), &e);
+            REQUIRE(!next);
+          }
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          if (!multifile)
+            REQUIRE(unlink(path) == 0);
+        }
+  lc_error_cleanup(&e);
+}
+static int
+staged_recovery_prepare(const lc_pouch_state_metadata_view *committed,
+                        const lc_pouch_state_metadata_view *staged,
+                        const lc_pouch_state_metadata_view *lease,
+                        void *context, lc_pouch_state_write_options *o,
+                        int *apply, lc_error *e) {
+  (void)lease;
+  (void)context;
+  (void)o;
+  (void)e;
+  REQUIRE(committed->found && !staged->found);
+  *apply = 0;
+  return LC_OK;
+}
+static void staging_recovery(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int multifile = 0; multifile < 2; ++multifile)
+    for (int crypto = 0; crypto <= 3; crypto += 3)
+      for (int sync = 0; sync < 2; ++sync)
+        for (unsigned char decision = 1; decision <= 2; ++decision) {
+          char native[1400];
+          ps_pouch_state_options o = options(crypto, sync);
+          o.logical.segment_target_bytes = 1;
+          lc_pouch *p = NULL;
+          lc_pouch_state_write_result w = {0};
+          lc_pouch_generation query, next;
+          int discarded;
+          REQUIRE(snprintf(native, sizeof(native), "%s/recover-%d-%d-%d",
+                           directory, crypto, sync,
+                           decision) < (int)sizeof(native));
+          const char *root = multifile ? native : path;
+          staged_open(root, multifile, 1, &o, &p, &e);
+          staged_put(p, "attempt", 31, 11, 99, 0, 0, 0, &e);
+          ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w,
+                                          &e),
+             &e);
+          lc_pouch_state_write_result_cleanup(&allocator, &w);
+          /* This later lifetime has a lower public generation. Its newer
+           * decision must supersede the old generation-100 decision. */
+          staged_put(p, "attempt", 31, 12, 1, 0, 0, 0, &e);
+          staged_put(p, "pending", 31, 13, 1, 0, 0, 0, &e);
+          ok(lc_pouch_state_query_index_seq(p, "staged", &query, &e), &e);
+          lc_pouch_generation index = staged_decision(p, decision, &e);
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          staged_open(root, multifile, 0, &o, &p, &e);
+          /* Both namespace callbacks and normal reads must enter only after
+           * recovery. Alternate the first cold operation across fixtures. */
+          if (decision == 2) {
+            lc_pouch_state_write_options meta = {0};
+            ok(lc_pouch_state_stage_metadata_prepared(
+                   p, "staged", "key", "attempt", "key", &meta,
+                   staged_recovery_prepare, NULL, &w, &e),
+               &e);
+            REQUIRE(!w.version && !w.etag);
+            lc_pouch_state_write_result_cleanup(&allocator, &w);
+          }
+          staged_absent(p, "key/.staging/attempt", &e);
+          read_value(p, "staged", "key/.staging/pending", 31, 13, 1, &e);
+          read_value(p, "staged", "key", 31, 11, 99, &e);
+          for (int repeat = 0; repeat < 2; ++repeat) {
+            ok(lc_pouch_state_recover_staged_decisions(p, "staged", &e), &e);
+            ok(lc_pouch_state_index_seq(p, "staged", &next, &e), &e);
+            REQUIRE(next == index + 1);
+            ok(lc_pouch_state_query_index_seq(p, "staged", &next, &e), &e);
+            REQUIRE(next == query);
+          }
+          ok(lc_pouch_state_discard_staged(p, "staged", "key", "pending",
+                                           &discarded, &e),
+             &e);
+          REQUIRE(discarded);
+          sequence_recovery_compact(p, "staged", multifile, &e);
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          staged_open(root, multifile, 0, &o, &p, &e);
+          staged_absent(p, "key/.staging/attempt", &e);
+          staged_absent(p, "key/.staging/pending", &e);
+          read_value(p, "staged", "key", 31, 11, 99, &e);
+          lc_pouch_close(p);
+          REQUIRE(!live);
+          if (!multifile)
+            REQUIRE(unlink(path) == 0);
+        }
+  lc_error_cleanup(&e);
+}
+static size_t staging_failure(const char *path, size_t nth, int crypto,
+                              int sync, int operation, int kind, int rotating) {
+  io_fault f = {0};
+  ps_io io = {&f, io_read, io_write, io_sync, io_reserve, NULL};
+  ps_pouch_state_options o = options(crypto, sync);
+  lc_pouch *p = NULL;
+  lc_error e;
+  lc_error_init(&e);
+  o.io = &io;
+  o.logical.segment_target_bytes = rotating ? 1 : 8 * PS_MIB;
+  staged_open(path, 0, 1, &o, &p, &e);
+  lc_pouch_state_write_result w = {0};
+  input in = source(31, 11);
+  ok(put(p, "staged", "key", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  staged_put(p, "attempt", operation == 3 ? 0 : 65569, 12, 2, 0, 0,
+             operation == 3, &e);
+  if (operation == 4) {
+    (void)staged_decision(p, 2, &e);
+    lc_pouch_close(p);
+    REQUIRE(!live);
+    staged_open(path, 0, 0, &o, &p, &e);
+  }
+  lc_pouch_state_write_options write = {0};
+  write.has_logical_version = 1;
+  write.logical_version = 3;
+  in = source(65569, 13);
+  in.pub.impl = &in;
+  allocation = f.calls = 0;
+  fail_at = f.fail = nth;
+  f.partial = kind == 2;
+  f.armed = kind != 0;
+  __atomic_store_n(&armed, !kind, __ATOMIC_RELEASE);
+  int discarded = 0, rc;
+  if (!operation)
+    rc = lc_pouch_state_stage_write(p, "staged", "key", "attempt", &in.pub,
+                                    &write, &w, &e);
+  else if (operation == 2)
+    rc = lc_pouch_state_discard_staged(p, "staged", "key", "attempt",
+                                       &discarded, &e);
+  else if (operation == 4)
+    rc = lc_pouch_state_recover_staged_decisions(p, "staged", &e);
+  else
+    rc = lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e);
+  __atomic_store_n(&armed, 0, __ATOMIC_RELEASE);
+  f.armed = 0;
+  size_t count = kind ? f.calls : allocation;
+  if (rc != LC_OK && rc != LC_ERR_NOMEM && !(kind && rc == LC_ERR_TRANSPORT))
+    fprintf(stderr,
+            "staging fault nth=%lu crypto=%d sync=%d op=%d kind=%d "
+            "rc=%d message=%s\n",
+            (unsigned long)nth, crypto, sync, operation, kind, rc,
+            e.message ? e.message : "?");
+  REQUIRE(rc == LC_OK || rc == LC_ERR_NOMEM ||
+          (kind && rc == LC_ERR_TRANSPORT));
+  if (nth == SIZE_MAX)
+    ok(rc, &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  clear(&e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  staged_open(path, 0, 0, &o, &p, &e);
+  lc_pouch_state_read_result committed = {0}, staged = {0};
+  ok(lc_pouch_state_read_metadata(p, "staged", "key", &committed, &e), &e);
+  ok(lc_pouch_state_read_metadata(p, "staged", "key/.staging/attempt", &staged,
+                                  &e),
+     &e);
+  /* Every selected prefix has a coherent participant/decision pair. A failed
+   * acknowledgement may select either complete state, never a half commit. */
+  if (!operation) {
+    REQUIRE(committed.found && committed.version == 1 && staged.found &&
+            (staged.version == 2 || staged.version == 3));
+    if (rc == LC_OK)
+      REQUIRE(staged.version == 3);
+    read_value(p, "staged", "key/.staging/attempt", 65569,
+               staged.version == 3 ? 13 : 12, staged.version, &e);
+  } else if (operation == 1) {
+    REQUIRE(committed.found && ((committed.version == 1 && staged.found) ||
+                                (committed.version == 2 && !staged.found)));
+    if (rc == LC_OK)
+      REQUIRE(committed.version == 2);
+    read_value(p, "staged", "key", committed.version == 1 ? 31 : 65569,
+               committed.version == 1 ? 11 : 12, committed.version, &e);
+  } else if (operation == 2 || operation == 4) {
+    REQUIRE(committed.found && committed.version == 1);
+    REQUIRE(!staged.found || operation == 2);
+    if (rc == LC_OK) {
+      REQUIRE(!staged.found);
+      if (operation == 2)
+        REQUIRE(discarded);
+    }
+  } else {
+    REQUIRE((committed.found && committed.version == 1 && staged.found &&
+             staged.staged_delete_marker) ||
+            (!committed.found && !staged.found));
+    if (rc == LC_OK)
+      REQUIRE(!committed.found);
+  }
+  int pending = staged.found;
+  lc_pouch_generation final_version = !operation ? staged.version
+                                      : operation == 2 || operation == 4 ? 1
+                                                                         : 2;
+  unsigned char final_seed = operation == 2 || operation == 4    ? 11
+                             : !operation && staged.version == 3 ? 13
+                                                                 : 12;
+  lc_pouch_state_read_result_cleanup(&allocator, &committed);
+  lc_pouch_state_read_result_cleanup(&allocator, &staged);
+  if (pending) {
+    if (operation == 2)
+      ok(lc_pouch_state_discard_staged(p, "staged", "key", "attempt",
+                                       &discarded, &e),
+         &e);
+    else
+      ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e),
+         &e);
+  }
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  sequence_recovery_compact(p, "staged", 0, &e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  staged_open(path, 0, 0, &o, &p, &e);
+  staged_absent(p, "key/.staging/attempt", &e);
+  if (operation == 3)
+    staged_absent(p, "key", &e);
+  else
+    read_value(p, "staged", "key",
+               operation == 2 || operation == 4 ? 31 : 65569, final_seed,
+               final_version, &e);
+  lc_pouch_close(p);
+  REQUIRE(!live && unlink(path) == 0);
+  lc_error_cleanup(&e);
+  return count;
+}
+static void staging_faults(const char *path, int recovery, int rotating) {
+  size_t total = 0;
+  for (int crypto = 0; crypto <= 3; crypto += 3)
+    for (int sync = 0; sync < 2; ++sync)
+      for (int operation = recovery ? 4 : 0; operation < (recovery ? 5 : 4);
+           ++operation)
+        for (int kind = 0; kind < 3; ++kind) {
+          size_t count = staging_failure(path, SIZE_MAX, crypto, sync,
+                                         operation, kind, rotating);
+          for (size_t nth = 1; nth <= count; ++nth)
+            (void)staging_failure(path, nth, crypto, sync, operation, kind,
+                                  rotating);
+          total += count;
+        }
+  printf("staged publication failure sites: %lu\n", (unsigned long)total);
+}
+static int staged_crash_armed;
+static ssize_t staged_crash_write(void *context, int fd, const void *bytes,
+                                  size_t length, off_t at) {
+  (void)context;
+  if (staged_crash_armed && length >= 2 * LC_POUCH_RECORD_HEADER_BYTES &&
+      !memcmp(bytes, "LHCP", 4)) {
+    lc_pouch_record_header header;
+    lc_error e;
+    lc_error_init(&e);
+    ok(lc_pouch_record_header_decode(bytes, &header, &e), &e);
+    if (header.type == PS_FRAME_TYPE) {
+      ok(lc_pouch_record_header_decode(
+             (const unsigned char *)bytes + PS_FRAME_BYTES, &header, &e),
+         &e);
+      REQUIRE(header.type == 3);
+      size_t first = PS_FRAME_BYTES + LC_POUCH_RECORD_HEADER_BYTES +
+                     header.key_len + header.meta_len +
+                     (size_t)header.payload_len;
+      REQUIRE(first < length);
+      REQUIRE(pwrite(fd, bytes, first, at) == (ssize_t)first);
+      _exit(77);
+    }
+    lc_error_cleanup(&e);
+  }
+  return pwrite(fd, bytes, length, at);
+}
+/* The frame header and LINK are complete, but DECISION and the staged
+ * tombstone have not been written. No append cleanup gets to run. */
+static void staging_crash(const char *path) {
+  io_fault fault = {0};
+  ps_io io = {&fault, io_read, staged_crash_write, io_sync, io_reserve, NULL};
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  lc_pouch_state_write_result w = {0};
+  lc_pouch_state_read_result current = {0}, staged = {0};
+  lc_error e;
+  lc_error_init(&e);
+  o.io = &io;
+  o.logical.segment_target_bytes = 8 * PS_MIB;
+  staged_open(path, 0, 1, &o, &p, &e);
+  input in = source(31, 11);
+  ok(put(p, "staged", "key", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  staged_put(p, "attempt", 31, 12, 2, 0, 0, 0, &e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    staged_open(path, 0, 0, &o, &p, &e);
+    read_value(p, "staged", "key/.staging/attempt", 31, 12, 2, &e);
+    staged_crash_armed = 1;
+    ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e), &e);
+    _exit(78);
+  }
+  int status;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 77);
+  staged_open(path, 0, 0, &o, &p, &e);
+  ok(lc_pouch_state_read_metadata(p, "staged", "key", &current, &e), &e);
+  ok(lc_pouch_state_read_metadata(p, "staged", "key/.staging/attempt", &staged,
+                                  &e),
+     &e);
+  fprintf(stderr, "interrupted active batch: public=%llu staged=%d\n",
+          (unsigned long long)current.version, staged.found);
+  REQUIRE((current.version == 1 && staged.found) ||
+          (current.version == 2 && !staged.found));
+  REQUIRE(current.version == 1 && staged.found);
+  lc_pouch_state_read_result_cleanup(&allocator, &current);
+  lc_pouch_state_read_result_cleanup(&allocator, &staged);
+  ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e), &e);
+  REQUIRE(w.version == 2);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  staged_absent(p, "key/.staging/attempt", &e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  staged_open(path, 0, 0, &o, &p, &e);
+  read_value(p, "staged", "key", 31, 12, 2, &e);
+  staged_absent(p, "key/.staging/attempt", &e);
+  lc_pouch_close(p);
+  REQUIRE(!live && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
+typedef struct batch_crash_model {
+  unsigned char *stable, *dirty, *scratch;
+  size_t calls, stop;
+  int armed, cut;
+} batch_crash_model;
+static int batch_crash_here(batch_crash_model *m) {
+  return m->armed && ++m->calls == m->stop;
+}
+static ssize_t batch_model_read(void *context, int fd, void *p, size_t n,
+                                off_t at) {
+  (void)context;
+  return pread(fd, p, n, at);
+}
+static ssize_t batch_model_write(void *context, int fd, const void *p, size_t n,
+                                 off_t at) {
+  batch_crash_model *m = context;
+  int cut = batch_crash_here(m);
+  size_t boundary = 0;
+  if (m->armed && m->cut >= 3 && n > PS_FRAME_BYTES && !memcmp(p, "LHCP", 4)) {
+    lc_pouch_record_header h;
+    REQUIRE(lc_pouch_record_header_decode(p, &h, NULL) == LC_OK);
+    if (h.type == PS_FRAME_TYPE) {
+      REQUIRE(h.payload_len == n - PS_FRAME_BYTES);
+      boundary = m->cut == 3 ? PS_FRAME_BYTES / 2 : PS_FRAME_BYTES;
+      for (int record = 0; record < m->cut - 4; ++record) {
+        REQUIRE(boundary + LC_POUCH_RECORD_HEADER_BYTES < n);
+        REQUIRE(lc_pouch_record_header_decode(
+                    (const unsigned char *)p + boundary, &h, NULL) == LC_OK);
+        boundary += LC_POUCH_RECORD_HEADER_BYTES + h.key_len + h.meta_len +
+                    (size_t)h.payload_len;
+      }
+      REQUIRE(boundary < n);
+      cut = 1;
+    }
+  }
+  if (cut && !m->cut)
+    _exit(77);
+  size_t want = boundary ? boundary : cut && m->cut == 2 && n > 1 ? n / 2 : n;
+  ssize_t written = pwrite(fd, p, want, at);
+  REQUIRE(written == (ssize_t)want && at >= 0 &&
+          (uint64_t)at + want <= PS_DEFAULT_CAPACITY);
+  if (written)
+    for (size_t page = (size_t)at / PS_PAGE;
+         page <= ((size_t)at + (size_t)written - 1) / PS_PAGE; ++page)
+      m->dirty[page] = 1;
+  if (cut)
+    _exit(77);
+  return written;
+}
+static int batch_model_sync(void *context, int fd) {
+  batch_crash_model *m = context;
+  int cut = batch_crash_here(m);
+  if (cut && m->cut != 1)
+    _exit(77);
+  if (fdatasync(fd) != 0)
+    return -1;
+  /* Only pages written since the last successful barrier enter the model's
+   * durable image. The test never copies the whole container per barrier. */
+  for (size_t page = 0; page < PS_DEFAULT_CAPACITY / PS_PAGE; ++page)
+    if (m->dirty[page]) {
+      REQUIRE(pread(fd, m->scratch, PS_PAGE, (off_t)(page * PS_PAGE)) ==
+              PS_PAGE);
+      memcpy(m->stable + page * PS_PAGE, m->scratch, PS_PAGE);
+      m->dirty[page] = 0;
+    }
+  if (cut)
+    _exit(77);
+  return 0;
+}
+static int batch_model_reserve(void *context, int fd, off_t at, off_t n) {
+  batch_crash_model *m = context;
+  int cut = batch_crash_here(m);
+  if (cut && m->cut != 1)
+    _exit(77);
+  int rc = fallocate(fd, 0, at, n);
+  if (cut) {
+    REQUIRE(!rc);
+    _exit(77);
+  }
+  return rc;
+}
+static void batch_crash_verify(const char *path, ps_pouch_state_options *o,
+                               int operation, int acknowledged, lc_error *e) {
+  lc_pouch *p = NULL;
+  lc_pouch_state_write_result w = {0};
+  lc_pouch_state_read_result value = {0}, staged = {0};
+  o->io = NULL;
+  staged_open(path, 0, 0, o, &p, e);
+  ok(lc_pouch_state_read_metadata(p, "staged", "key", &value, e), e);
+  ok(lc_pouch_state_read_metadata(p, "staged", "key/.staging/attempt", &staged,
+                                  e),
+     e);
+  int complete = !staged.found;
+  int valid = !operation ? value.found && value.version == (complete ? 2U : 1U)
+              : operation == 1 ? value.found && value.version == 1
+              : complete       ? !value.found
+                               : value.found && value.version == 1;
+  if (!valid || (acknowledged && o->logical.durable_sync && !complete))
+    fprintf(stderr,
+            "batch recovery path=%s op=%d ack=%d sync=%d found=%d version=%llu "
+            "stage=%d\n",
+            path, operation, acknowledged, o->logical.durable_sync, value.found,
+            (unsigned long long)value.version, staged.found);
+  REQUIRE(valid);
+  if (!operation) {
+    REQUIRE(value.found && value.version == (complete ? 2 : 1));
+    read_value(p, "staged", "key", 31, complete ? 12 : 11, complete ? 2 : 1, e);
+  } else if (operation == 1) {
+    REQUIRE(value.found && value.version == 1);
+    read_value(p, "staged", "key", 31, 11, 1, e);
+  } else {
+    REQUIRE(complete ? !value.found : value.found && value.version == 1);
+    if (!complete)
+      read_value(p, "staged", "key", 31, 11, 1, e);
+  }
+  if (!complete) {
+    REQUIRE(staged.version == 2 &&
+            staged.staged_delete_marker == (operation == 2));
+    if (operation != 2)
+      read_value(p, "staged", "key/.staging/attempt", 31, 12, 2, e);
+  }
+  if (acknowledged && o->logical.durable_sync)
+    REQUIRE(complete);
+  lc_pouch_state_read_result_cleanup(&allocator, &value);
+  lc_pouch_state_read_result_cleanup(&allocator, &staged);
+  int discarded;
+  if (!complete) {
+    if (operation == 1)
+      ok(lc_pouch_state_discard_staged(p, "staged", "key", "attempt",
+                                       &discarded, e),
+         e);
+    else
+      ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, e), e);
+  }
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  staged_absent(p, "key/.staging/attempt", e);
+  sequence_recovery_compact(p, "staged", 0, e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  staged_open(path, 0, 0, o, &p, e);
+  staged_absent(p, "key/.staging/attempt", e);
+  if (operation == 2)
+    staged_absent(p, "key", e);
+  else
+    read_value(p, "staged", "key", 31, operation ? 11 : 12, operation ? 1 : 2,
+               e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+}
+static size_t batch_crash_case(const char *path, size_t stop, int cut,
+                               int crypto, int sync, int rotating,
+                               int operation) {
+  if (stop == SIZE_MAX)
+    fprintf(stderr, "batch crash baseline crypto=%d sync=%d rotate=%d op=%d\n",
+            crypto, sync, rotating, operation);
+  char image_path[1500];
+  REQUIRE(snprintf(image_path, sizeof(image_path), "%s-stable", path) <
+          (int)sizeof(image_path));
+  int image = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+  REQUIRE(image >= 0 && ftruncate(image, PS_DEFAULT_CAPACITY) == 0);
+  batch_crash_model m = {0};
+  m.stable = mmap(NULL, PS_DEFAULT_CAPACITY, PROT_READ | PROT_WRITE, MAP_SHARED,
+                  image, 0);
+  m.dirty = calloc(PS_DEFAULT_CAPACITY / PS_PAGE, 1);
+  m.scratch = malloc(PS_PAGE);
+  REQUIRE(m.stable != MAP_FAILED && m.dirty && m.scratch);
+  ps_io io = {&m,
+              batch_model_read,
+              batch_model_write,
+              batch_model_sync,
+              batch_model_reserve,
+              NULL};
+  ps_pouch_state_options o = options(crypto, sync);
+  o.io = &io;
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  o.logical.segment_target_bytes = rotating ? 1 : 8 * PS_MIB;
+  lc_error e;
+  lc_error_init(&e);
+  lc_pouch *p = NULL;
+  staged_open(path, 0, 1, &o, &p, &e);
+  lc_pouch_state_write_result w = {0};
+  input in = source(31, 11);
+  ok(put(p, "staged", "key", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  staged_put(p, "attempt", operation == 2 ? 0 : 31, 12, 2, 0, 0, operation == 2,
+             &e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  int report[2];
+  REQUIRE(pipe(report) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    REQUIRE(close(report[0]) == 0);
+    staged_open(path, 0, 0, &o, &p, &e);
+    lc_pouch_state_read_result r = {0};
+    ok(lc_pouch_state_read_metadata(p, "staged", "key/.staging/attempt", &r,
+                                    &e),
+       &e);
+    REQUIRE(r.found);
+    lc_pouch_state_read_result_cleanup(&allocator, &r);
+    m.calls = 0;
+    m.stop = stop;
+    m.cut = cut;
+    m.armed = 1;
+    int discarded;
+    if (operation == 1) {
+      ok(lc_pouch_state_discard_staged(p, "staged", "key", "attempt",
+                                       &discarded, &e),
+         &e);
+      REQUIRE(discarded);
+    } else {
+      ok(lc_pouch_state_commit_staged(p, "staged", "key", "attempt", &w, &e),
+         &e);
+      REQUIRE(w.version == 2);
+    }
+    REQUIRE(write(report[1], &m.calls, sizeof(m.calls)) == sizeof(m.calls));
+    _exit(0); /* Deliberately skip Pouch close and any cleanup durability. */
+  }
+  REQUIRE(close(report[1]) == 0);
+  int status;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status));
+  int acknowledged = WEXITSTATUS(status) == 0;
+  size_t calls = 0;
+  ssize_t got = read(report[0], &calls, sizeof(calls));
+  REQUIRE(close(report[0]) == 0);
+  if (stop != SIZE_MAX && (acknowledged || WEXITSTATUS(status) != 77 || got))
+    fprintf(stderr,
+            "batch cut not reached stop=%lu cut=%d crypto=%d sync=%d rotate=%d "
+            "op=%d status=%d calls=%lu\n",
+            (unsigned long)stop, cut, crypto, sync, rotating, operation, status,
+            (unsigned long)calls);
+  REQUIRE(stop == SIZE_MAX
+              ? acknowledged && got == sizeof(calls)
+              : !acknowledged && WEXITSTATUS(status) == 77 && !got);
+  REQUIRE(munmap(m.stable, PS_DEFAULT_CAPACITY) == 0 && close(image) == 0);
+  free(m.dirty);
+  free(m.scratch);
+  /* The real file models process death with surviving page cache. The image
+   * independently models loss of every write not covered by a successful sync.
+   */
+  batch_crash_verify(path, &o, operation, acknowledged, &e);
+  batch_crash_verify(image_path, &o, operation, acknowledged, &e);
+  REQUIRE(unlink(path) == 0 && unlink(image_path) == 0);
+  lc_error_cleanup(&e);
+  return calls;
+}
+static void staging_crash_matrix(const char *path, int crypto, int sync,
+                                 int rotating) {
+  size_t cases = 0, sites = 0;
+  for (int operation = 0; operation < 3; ++operation) {
+    size_t calls =
+        batch_crash_case(path, SIZE_MAX, 0, crypto, sync, rotating, operation);
+    REQUIRE(calls > 0);
+    ++cases;
+    sites += calls;
+    for (size_t stop = 1; stop <= calls; ++stop)
+      for (int cut = 0; cut < 3; ++cut) {
+        (void)batch_crash_case(path, stop, cut, crypto, sync, rotating,
+                               operation);
+        ++cases;
+      }
+    /* Also cut the actual frame at its header and each inner boundary.
+     * Discard has two inner records; commit/delete have three. */
+    for (int cut = 3; cut <= (operation == 1 ? 5 : 6); ++cut) {
+      (void)batch_crash_case(path, 0, cut, crypto, sync, rotating, operation);
+      ++cases;
+    }
+  }
+  printf("batch process-death/lost-write cases: %lu; operation sites: %lu\n",
+         (unsigned long)cases, (unsigned long)sites);
+}
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -4251,7 +5153,9 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "faults"))
     faults(r->path);
   else if (!strcmp(r->mode, "concurrency"))
-    concurrency(r->path, r->directory);
+    concurrency(r->path, r->directory, 0);
+  else if (!strcmp(r->mode, "staging-concurrency"))
+    concurrency(r->path, r->directory, 1);
   else if (!strcmp(r->mode, "io-faults"))
     io_faults(r->path);
   else if (!strcmp(r->mode, "crypto-init"))
@@ -4298,6 +5202,18 @@ static void *worker(void *context) {
     lifetimes(r->path, r->directory);
   else if (!strcmp(r->mode, "lifetime-faults"))
     lifetime_faults(r->path);
+  else if (!strcmp(r->mode, "staging"))
+    staging(r->path, r->directory);
+  else if (!strcmp(r->mode, "staging-faults"))
+    staging_faults(r->path, 0, 1);
+  else if (!strcmp(r->mode, "staging-active-faults"))
+    staging_faults(r->path, 0, 0);
+  else if (!strcmp(r->mode, "staging-recovery-faults"))
+    staging_faults(r->path, 1, 1);
+  else if (!strcmp(r->mode, "staging-active-recovery-faults"))
+    staging_faults(r->path, 1, 0);
+  else if (!strcmp(r->mode, "staging-recovery"))
+    staging_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-faults"))
@@ -4317,7 +5233,7 @@ int main(int argc, char **argv) {
   pthread_t thread;
   lc_error e;
   run r;
-  REQUIRE(argc == 3);
+  REQUIRE(argc == 3 || argc == 6);
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-runtime-", argv[1]) <
           (int)sizeof(prefix));
   REQUIRE(snprintf(template_path, sizeof(template_path), "%sXXXXXX", prefix) <
@@ -4336,7 +5252,16 @@ int main(int argc, char **argv) {
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
   if (!strcmp(r.mode, "durable-scope-crash"))
     durable_scope_crash(r.path);
-  else {
+  else if (!strcmp(r.mode, "staging-crash"))
+    staging_crash(r.path);
+  else if (!strcmp(r.mode, "staging-crash-matrix")) {
+    REQUIRE(argc == 6 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
+            argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
+            argv[4][0] <= '1' && strlen(argv[5]) == 1 && argv[5][0] >= '0' &&
+            argv[5][0] <= '1');
+    staging_crash_matrix(r.path, argv[3][0] - '0', argv[4][0] - '0',
+                         argv[5][0] - '0');
+  } else {
     REQUIRE(pthread_create(&thread, NULL, worker, &r) == 0);
     REQUIRE(pthread_join(thread, NULL) == 0);
   }

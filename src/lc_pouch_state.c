@@ -3204,8 +3204,7 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
     lc_pouch_writer_mode_operation_end(pouch);
     return rc;
   }
-  if (pouch->storage.ops == NULL)
-    rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
+  rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
   if (rc == LC_OK)
     rc = callback(context, error);
   rc = lc_pouch_state_finish_commit_group(commit_group, owns_commit_group, rc,
@@ -3273,6 +3272,8 @@ static int lc_pouch_state_ensure_namespace_locked(lc_pouch *pouch,
                                                   lc_error *error) {
   int rc;
 
+  if (pouch->storage.ops != NULL)
+    return lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
   rc =
       lc_pouch_namespace_ensure(&pouch->allocator, pouch->root_path, ns, error);
   if (rc != LC_OK) {
@@ -6793,14 +6794,6 @@ static int lc_pouch_state_append_binary_records_locked(
         items[index].record_type != LC_POUCH_STATE_RECORD_OBJECT_DELETE)
       storage_mode = LC_POUCH_STORAGE_APPEND_COMPLETE;
 
-    if (pouch->storage.ops != NULL &&
-        items[index].record_type != LC_POUCH_STATE_RECORD_STATE_META &&
-        items[index].record_type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
-        items[index].record_type != LC_POUCH_STATE_RECORD_OBJECT_DELETE)
-      return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
-                          "container staged/link batch integration is pending",
-                          NULL, NULL, "pouch");
-
     rc = lc_pouch_state_meta_trailer(items[index].meta, items[index].meta_len,
                                      &trailer_offset, &has_query_index_seq,
                                      error);
@@ -9036,13 +9029,68 @@ static int lc_pouch_state_collect_decisions_file(
   return rc;
 }
 
+typedef struct lc_pouch_state_decision_visit_context {
+  lc_pouch *pouch;
+  lc_pouch_namespace_logstore *cache;
+  lc_pouch_state_decision **buckets;
+  size_t count;
+} lc_pouch_state_decision_visit_context;
+
+static int lc_pouch_state_collect_decision(void *context, uint64_t segment,
+                                           const lc_pouch_state_entry *entry,
+                                           lc_error *error) {
+  lc_pouch_state_decision_visit_context *visit = context;
+  lc_pouch_state_cache_record *record;
+  size_t bucket;
+  (void)segment;
+  if (!entry->control || !entry->decision || !entry->key)
+    return LC_OK;
+  record = lc_pouch_state_cache_record_find(visit->cache, entry->key);
+  if (!record || !record->found || record->index_seq >= entry->index_seq)
+    return LC_OK;
+  bucket = (size_t)(lc_pouch_state_cache_key_hash(entry->key) % visit->count);
+  return lc_pouch_state_decision_apply(visit->pouch, &visit->buckets[bucket],
+                                       entry, error);
+}
+
 static int lc_pouch_state_collect_decisions(
     lc_pouch *pouch, const lc_pouch_namespace_manifest *manifest,
-    lc_pouch_state_decision **decisions, lc_error *error) {
+    lc_pouch_namespace_logstore *cache, lc_pouch_state_decision **decisions,
+    lc_error *error) {
   unsigned long segment_index;
   int rc;
 
   *decisions = NULL;
+  if (pouch->storage.ops != NULL) {
+    lc_pouch_state_decision_visit_context visit;
+    size_t i;
+    visit.pouch = pouch;
+    visit.cache = cache;
+    visit.count = cache->record_bucket_count ? cache->record_bucket_count : 16;
+    visit.buckets = lc_calloc_with_allocator(&pouch->allocator, visit.count,
+                                             sizeof(*visit.buckets));
+    if (!visit.buckets)
+      return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                          "failed to allocate staged recovery index", NULL,
+                          NULL, "pouch");
+    rc = pouch->storage.ops->replay(
+        pouch->storage.context, cache->storage_namespace,
+        lc_pouch_state_collect_decision, &visit, error);
+    /* Flatten even on failure: the caller owns all collected records and
+     * releases them before retrying. Historical settled decisions allocate
+     * nothing; pending lookup shares the resident key index's load bound. */
+    for (i = 0; i < visit.count; ++i) {
+      lc_pouch_state_decision *decision = visit.buckets[i];
+      while (decision) {
+        lc_pouch_state_decision *next = decision->next;
+        decision->next = *decisions;
+        *decisions = decision;
+        decision = next;
+      }
+    }
+    lc_free_with_allocator(&pouch->allocator, visit.buckets);
+    return rc;
+  }
   rc = LC_OK;
   for (segment_index = 0UL; segment_index < manifest->segment_count;
        ++segment_index) {
@@ -9686,10 +9734,6 @@ static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
                                          lc_error *error) {
   lc_pouch_storage_replay_context *replay = context;
   (void)segment;
-  if (entry->decision != NULL || lc_pouch_state_key_is_staged(entry->key))
-    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
-                        "container staged decision integration is pending",
-                        NULL, NULL, "pouch");
   return lc_pouch_state_cache_apply_entry(replay->pouch, replay->cache, entry,
                                           error);
 }
@@ -9767,6 +9811,13 @@ int lc_pouch_state_snapshot_capture(lc_pouch *pouch,
   replay.pouch = pouch;
   replay.cache = &cache;
   rc = visit(context, lc_pouch_state_storage_replay, &replay, error);
+  /* Ordinary compaction may omit completed decisions, but cannot retire a
+   * decision's source while any participant remains live. Resolve the whole
+   * captured prefix before testing: historical staged PUTs are normal. */
+  if (rc == LC_OK && lc_pouch_state_cache_has_live_staged_records(&cache))
+    rc = lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                      "container live staged maintenance is pending", NULL,
+                      NULL, "pouch");
   if (rc == LC_OK)
     rc = lc_pouch_state_cache_record_index_build(
         pouch, &cache, &snapshot->records, &snapshot->count, error);
@@ -9863,7 +9914,8 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   cache->segment_count = (unsigned long)info.segments;
   cache->active_segment_offset = info.tail;
   cache->writer_mode_epoch = pouch->single_writer_epoch;
-  cache->decision_recovery_checked = 1;
+  cache->decision_recovery_checked =
+      !lc_pouch_state_cache_has_live_staged_records(cache);
   cache->initialized = 1;
   return LC_OK;
 }
@@ -13431,6 +13483,11 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
                         "pouch and namespace",
                         NULL, NULL, NULL);
   }
+  if (pouch->storage.ops != NULL) {
+    rc = lc_pouch_state_storage_prepare(pouch, ns, error);
+    if (rc != LC_OK)
+      return rc;
+  }
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 1, error);
   if (cache == NULL) {
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
@@ -13439,14 +13496,19 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
     return LC_OK;
   }
   memset(&manifest, 0, sizeof(manifest));
-  rc = lc_pouch_namespace_manifest_open(&pouch->allocator, pouch->root_path, ns,
-                                        &manifest, NULL, NULL, error);
+  rc =
+      pouch->storage.ops != NULL
+          ? lc_pouch_state_cache_manifest_borrow(pouch, cache, &manifest, error)
+          : lc_pouch_namespace_manifest_open(&pouch->allocator,
+                                             pouch->root_path, ns, &manifest,
+                                             NULL, NULL, error);
   if (rc != LC_OK) {
     return rc;
   }
   decisions = NULL;
   recovered_count = 0UL;
-  rc = lc_pouch_state_collect_decisions(pouch, &manifest, &decisions, error);
+  rc = lc_pouch_state_collect_decisions(pouch, &manifest, cache, &decisions,
+                                        error);
   for (decision = decisions; rc == LC_OK && decision != NULL;
        decision = decision->next) {
     lc_pouch_state_entry staged;
@@ -13515,16 +13577,22 @@ int lc_pouch_state_recover_staged_decisions(lc_pouch *pouch, const char *ns,
     return lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
   }
   if (pouch->storage.ops != NULL) {
+    int checked = 0;
     rc = lc_pouch_state_cache_guard_lock(pouch, ns, &guard, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_storage_prepare(pouch, ns, error);
+      cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
+      checked = rc == LC_OK && cache->decision_recovery_checked;
       lc_pouch_state_cache_guard_unlock(pouch, &guard);
     }
-    return rc;
+    if (rc != LC_OK || checked)
+      return rc;
   }
-  cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-  if (cache != NULL && cache->decision_recovery_checked) {
-    return LC_OK;
+  if (pouch->storage.ops == NULL) {
+    cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
+    if (cache != NULL && cache->decision_recovery_checked) {
+      return LC_OK;
+    }
   }
   rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, &lock, error);
   if (rc != LC_OK) {
@@ -13551,13 +13619,11 @@ static int lc_pouch_state_mutation_request_check(
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state key exceeds local limit", NULL, NULL,
                         "pouch");
-  if (pouch->storage.ops != NULL &&
-      (lc_pouch_state_key_is_staged(key) ||
-       (options != NULL && (options->staged_delete_marker ||
-                            options->query_index_operation_active))))
+  if (pouch->storage.ops != NULL && options != NULL &&
+      options->query_index_operation_active)
     return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
-                        "container staged/lease publication is pending", NULL,
-                        NULL, "pouch");
+                        "container query operation publication is pending",
+                        NULL, NULL, "pouch");
   return LC_OK;
 }
 
@@ -16777,11 +16843,10 @@ static int lc_pouch_state_promote_staged_locked(
                                        error);
   if (rc != LC_OK)
     goto cleanup;
-  if (staged.retention > 0) {
-    rc = lc_pouch_retention_hint_ensure(pouch, ns, error);
-    if (rc != LC_OK)
-      goto cleanup;
-  }
+  rc = lc_pouch_state_retention_publish(pouch, ns, key, staged.retention,
+                                        &staged.retention, error);
+  if (rc != LC_OK)
+    goto cleanup;
   decision_version = staged.version + 1UL;
   discard_version = decision_version + 1UL;
   rc = lc_pouch_state_append_staged_commit_batch(
@@ -17005,11 +17070,10 @@ int lc_pouch_state_commit_staged_locked(lc_pouch *pouch, const char *ns,
                                        &staged.retention, error);
   if (rc != LC_OK)
     goto cleanup;
-  if (staged.retention > 0) {
-    rc = lc_pouch_retention_hint_ensure(pouch, ns, error);
-    if (rc != LC_OK)
-      goto cleanup;
-  }
+  rc = lc_pouch_state_retention_publish(pouch, ns, key, staged.retention,
+                                        &staged.retention, error);
+  if (rc != LC_OK)
+    goto cleanup;
   decision_version = staged.version + 1UL;
   discard_version = decision_version + 1UL;
   rc = lc_pouch_state_append_staged_commit_batch(

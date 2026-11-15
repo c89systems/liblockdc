@@ -1,6 +1,8 @@
 #include "record_io.h"
+#include "frame.h"
 #include "lc_api_internal.h"
 #include <string.h>
+#include <zlib.h>
 
 static int record_error(lc_error *e, const char *message) {
   return lc_error_set(e, LC_ERR_INVALID, 0, message, NULL, NULL,
@@ -28,6 +30,40 @@ void ps_record_abort(ps_record_writer *out) {
     out->writer = NULL;
   }
 }
+int ps_record_frame_begin(ps_record_writer *out, uint64_t length, lc_error *e) {
+  unsigned char bytes[PS_FRAME_BYTES] = {0};
+  int rc;
+  if (!out || !out->writer || out->failed || out->frame_length || !length ||
+      out->tail != out->start ||
+      length > UINT64_MAX - PS_FRAME_BYTES - out->start)
+    return record_error(e, "batch frame requires a new bounded append");
+  rc = ps_stream_write(out->writer, bytes, sizeof(bytes), e);
+  if (rc == LC_OK) {
+    out->tail += sizeof(bytes);
+    out->frame_length = length;
+  }
+  return rc;
+}
+static int frame_finish(ps_record_writer *out, lc_error *e) {
+  lc_pouch_record_header header;
+  unsigned char bytes[PS_FRAME_BYTES];
+  int rc = LC_OK;
+  if (!out->frame_length)
+    return LC_OK;
+  if (out->tail - out->start - PS_FRAME_BYTES != out->frame_length)
+    return record_error(e, "batch frame differs from its declared span");
+  if (out->frame_dirty)
+    rc = ps_stream_writer_crc(out->writer, PS_FRAME_BYTES, out->frame_length,
+                              &out->frame_crc, e);
+  if (rc != LC_OK)
+    return rc;
+  memset(&header, 0, sizeof(header));
+  header.type = PS_FRAME_TYPE;
+  header.payload_len = out->frame_length;
+  header.payload_crc = out->frame_crc;
+  lc_pouch_record_header_encode(&header, bytes);
+  return ps_stream_write_at(out->writer, 0, bytes, sizeof(bytes), e);
+}
 int ps_record_commit(ps_record_writer *out, enum ps_commit_mode mode,
                      ps_commit_publish_fn publish, void *context, lc_error *e) {
   int rc;
@@ -35,7 +71,9 @@ int ps_record_commit(ps_record_writer *out, enum ps_commit_mode mode,
     return record_error(e, "canonical append is not open");
   if (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC)
     return record_error(e, "invalid canonical commit mode");
-  rc = ps_stream_commit(out->writer, mode, publish, context, e);
+  rc = frame_finish(out, e);
+  if (rc == LC_OK)
+    rc = ps_stream_commit(out->writer, mode, publish, context, e);
   ps_record_abort(out);
   return rc;
 }
@@ -44,6 +82,7 @@ static int append(void *context, const struct iovec *parts, int count,
   ps_record_writer *out = context;
   int i, rc = LC_OK;
   uint64_t end;
+  size_t at, n;
   if (!out || !out->writer || out->failed)
     return record_error(e, "canonical append is closed");
   if (out->limit) {
@@ -66,8 +105,18 @@ static int append(void *context, const struct iovec *parts, int count,
     if (parts[i].iov_len > UINT64_MAX - out->tail)
       return record_error(e, "canonical append exceeds logical range");
     rc = ps_stream_write(out->writer, parts[i].iov_base, parts[i].iov_len, e);
-    if (rc == LC_OK)
+    if (rc == LC_OK) {
+      if (out->frame_length && !out->frame_dirty)
+        for (at = 0; at < parts[i].iov_len; at += n) {
+          n = parts[i].iov_len - at;
+          if (n > PS_CHUNK)
+            n = PS_CHUNK;
+          out->frame_crc = (unsigned long)crc32(
+              (uLong)out->frame_crc,
+              (const unsigned char *)parts[i].iov_base + at, (uInt)n);
+        }
       out->tail += parts[i].iov_len;
+    }
   }
   return rc;
 }
@@ -76,7 +125,8 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
   ps_record_writer *out = context;
   uint64_t end = offset;
   int i, rc = LC_OK;
-  if (!out || !out->writer || out->failed || offset < out->start ||
+  if (!out || !out->writer || out->failed ||
+      offset < out->start + (out->frame_length ? PS_FRAME_BYTES : 0) ||
       offset > out->tail)
     return record_error(e, "canonical patch outside private append");
   for (i = 0; i < count; ++i) {
@@ -85,6 +135,8 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
     end += parts[i].iov_len;
   }
   for (i = 0; i < count && rc == LC_OK; ++i) {
+    if (out->frame_length && parts[i].iov_len)
+      out->frame_dirty = 1;
     rc = ps_stream_write_at(out->writer, offset - out->start, parts[i].iov_base,
                             parts[i].iov_len, e);
     offset += parts[i].iov_len;

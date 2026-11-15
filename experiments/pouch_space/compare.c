@@ -77,6 +77,8 @@ struct comparison {
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
   int compaction; /* Force one pass per namespace after the two PUT rounds. */
   int durable_scope; /* Force durability after both PUT rounds per writer. */
+  int staged; /* Stage each body and publish its existing canonical LINK batch.
+               */
   size_t rows, bytes, writers, rounds;
   ps_space *space;
   ps_root *owner;
@@ -480,7 +482,18 @@ static int write_one(worker *w, size_t id, lc_error *e) {
     memset(&options, 0, sizeof(options));
     memset(&result, 0, sizeof(result));
     options.content_type = "application/json";
-    rc = lc_pouch_state_write(c->pouch, ns, name, source, &options, &result, e);
+    if (c->staged) {
+      options.has_logical_version = 1;
+      options.logical_version = w->round + 1;
+      rc = lc_pouch_state_stage_write(c->pouch, ns, name, "benchmark", source,
+                                      &options, &result, e);
+      lc_pouch_state_write_result_cleanup(NULL, &result);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_commit_staged(c->pouch, ns, name, "benchmark",
+                                          &result, e);
+    } else
+      rc = lc_pouch_state_write(c->pouch, ns, name, source, &options, &result,
+                                e);
     if (rc == LC_OK && result.bytes != c->bytes)
       rc = LC_ERR_PROTOCOL;
     lc_pouch_state_write_result_cleanup(NULL, &result);
@@ -804,7 +817,7 @@ static void verify_states(comparison *c, lc_error *e) {
   ps_stream_reader *stream_reader;
   ps_namespace_window *window;
   lc_pouch_state_read_result result;
-  char ns[64], name[64];
+  char ns[64], name[64], staged_name[128];
   unsigned char buffer[4096];
   size_t id, ordinal, offset, got;
   unsigned long crc;
@@ -881,6 +894,8 @@ static void verify_states(comparison *c, lc_error *e) {
       }
       require(result.found && result.body && result.bytes == c->bytes,
               "Pouch state metadata");
+      if (c->staged)
+        require(result.version == c->rounds, "staged committed generation");
       if (c->mutation == 1)
         require(
             result.version == 1 && result.metadata_length == 32 &&
@@ -894,6 +909,19 @@ static void verify_states(comparison *c, lc_error *e) {
         offset += got;
       }
       lc_pouch_state_read_result_cleanup(NULL, &result);
+      if (c->staged) {
+        require(snprintf(staged_name, sizeof(staged_name),
+                         "%s/.staging/benchmark",
+                         name) < (int)sizeof(staged_name),
+                "staged verification key length");
+        memset(&result, 0, sizeof(result));
+        check(
+            lc_pouch_state_read_metadata(c->pouch, ns, staged_name, &result, e),
+            e);
+        require(!result.found && !result.body,
+                "completed stage remains absent");
+        lc_pouch_state_read_result_cleanup(NULL, &result);
+      }
     }
     require(offset == c->bytes, "complete entry read");
   }
@@ -1073,6 +1101,7 @@ int main(int argc, char **argv) {
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
         "runtime-compact|pouch-compact|"
         "runtime-scope|pouch-scope|"
+        "runtime-staged|pouch-staged|"
         "runtime-read-many|pouch-read-many|runtime-read-points|pouch-read-"
         "points|"
         "runtime-scan-bodies|pouch-scan-bodies|"
@@ -1099,6 +1128,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-compact") ||
               !strcmp(argv[1], "runtime-scope") ||
               !strcmp(argv[1], "pouch-scope") ||
+              !strcmp(argv[1], "runtime-staged") ||
+              !strcmp(argv[1], "pouch-staged") ||
               !strcmp(argv[1], "runtime-read-many") ||
               !strcmp(argv[1], "pouch-read-many") ||
               !strcmp(argv[1], "runtime-read-points") ||
@@ -1114,6 +1145,7 @@ int main(int argc, char **argv) {
   c.runtime = !strncmp(argv[1], "runtime-", 8);
   c.compaction = strstr(argv[1], "compact") != NULL;
   c.durable_scope = strstr(argv[1], "scope") != NULL;
+  c.staged = strstr(argv[1], "staged") != NULL;
   c.read_method = strstr(argv[1], "read-many")       ? 1
                   : strstr(argv[1], "scan-bodies")   ? 2
                   : strstr(argv[1], "scan-metadata") ? 3

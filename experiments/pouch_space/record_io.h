@@ -11,12 +11,19 @@ typedef struct ps_record_writer {
   ps_stream_writer *writer;
   uint64_t start, tail;
   uint64_t limit; /* zero is unbounded; otherwise an absolute exclusive end */
+  uint64_t frame_length; /* zero is an ordinary canonical append */
+  unsigned long frame_crc;
+  int frame_dirty;
   int failed;
 } ps_record_writer;
 int ps_record_begin(ps_stream *, ps_record_writer *, lc_error *);
 /* Reserve a known private span without emitting or publishing record bytes. */
 int ps_record_reserve(ps_record_writer *, ps_budget *, uint64_t bytes,
                       lc_error *);
+/* The caller reserves the extra header before beginning this bounded frame.
+ * CRC accumulates over appended bytes. Inner canonical fixups trigger a bounded
+ * checksum of the final private bytes at commit instead. */
+int ps_record_frame_begin(ps_record_writer *, uint64_t length, lc_error *);
 lc_pouch_record_io ps_record_output(ps_record_writer *);
 int ps_record_commit(ps_record_writer *, enum ps_commit_mode,
                      ps_commit_publish_fn, void *, lc_error *);

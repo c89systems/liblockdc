@@ -50,6 +50,10 @@ int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
  * byte when zero), with later unknown-size growth using ordinary admission.
  * COMPLETE requires exactly minimum positive bytes and preserves the standing
  * floor; MAINTENANCE is complete bounded work permitted to spend that floor.
+ * Both are indivisible recovery units. Storage reserves its checksummed frame
+ * in addition to minimum canonical bytes; returned offsets address the actual
+ * inner records. An invalid candidate frame contributes no records, while
+ * corruption inside a checkpoint prefix is an error.
  * Plan successor, binding, grants and head selection before staging. Preferred
  * geometric growth falls back to an exact claim near capacity. Commit selects
  * its head only after canonical

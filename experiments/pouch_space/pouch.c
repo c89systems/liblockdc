@@ -1,4 +1,5 @@
 #include "pouch.h"
+#include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
@@ -99,6 +100,8 @@ static int append_begin(void *context, void *ns, uint64_t target,
     return lc_error_set(e, LC_ERR_INVALID, 0, "invalid container append mode",
                         NULL, NULL, "pouch");
   }
+  if (mode != LC_POUCH_STORAGE_APPEND_PREFIX && target)
+    target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
   rc = ps_namespace_append_begin(ns, target, minimum, physical, &append, e);
   if (rc != LC_OK)
     return rc;

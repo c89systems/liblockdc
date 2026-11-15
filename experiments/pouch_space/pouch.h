@@ -13,6 +13,10 @@ typedef struct ps_pouch_state_options {
  * update, delete, point read/metadata/copy, read-many, metadata visits, paged
  * scan summaries/body reads and namespace creation use the
  * production logical engine. Retention work hints are durable in-file markers;
+ * staged writes, prepared mutations, promotion/commit/discard and cold decision
+ * recovery also use that engine. Complete canonical batches have checksummed
+ * recovery framing. Live staged records prevent ordinary compaction; settled
+ * historical stages and decisions may be omitted by the resolved snapshot.
  * retention scheduling and guaranteed maintenance admission at capacity remain
  * pending. Forced ordinary-state compaction is available below.
  * Internal cleanup durability scopes force the completed container prefix

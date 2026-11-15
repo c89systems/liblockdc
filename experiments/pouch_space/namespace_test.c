@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "budget.h"
+#include "frame.h"
 #include "lc_api_internal.h"
 #include "namespace.h"
 #include "record_io.h"
@@ -2624,6 +2625,16 @@ static unsigned char *append_frame(ps_root *root, ps_namespace *fixture,
                              &part, 1, e),
      e);
   ps_namespace_read_close(window);
+  /* Detached PUT bytes are copied into the first/second framed batches in
+   * limits below. Rebase their inline self-reference for those frame headers;
+   * the production codec independently checks the resulting physical span. */
+  lc_pouch_record_header header;
+  ok(lc_pouch_record_header_decode(frame, &header, e), e);
+  uint64_t record_offset = before.tail + version * PS_FRAME_BYTES;
+  unsigned char *meta = frame + LC_POUCH_RECORD_HEADER_BYTES + header.key_len;
+  put64(meta + 32, record_offset);
+  put64(meta + 40, record_offset + LC_POUCH_RECORD_HEADER_BYTES +
+                       header.key_len + header.meta_len);
   return frame;
 }
 static void append_budget_limits(const char *path) {

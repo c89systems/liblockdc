@@ -4060,12 +4060,13 @@ integration and broader performance acceptance remain open.
 
 ## Staged writes before batch framing
 
-The uncommitted staged-state integration has a confirmed active-segment crash
+Before framing, the uncommitted staged-state integration had an active-segment crash
 failure: process death after its first LINK write exposes the new public value
-while leaving the stage live. The [batch recovery proposal](pouch-space-implementation.md#compound-append-recovery-decision-pending)
-records the reproducer and proposed correction. The measurements here preserve
+while leaving the stage live. The [batch recovery contract](pouch-space-implementation.md#compound-append-recovery)
+records the reproducer and approved correction. The measurements here preserve
 the successful unframed path as a cost baseline for that correction; they do not
-accept the staged implementation. The persistence-format decision is pending.
+accept the staged implementation. These measurements predate approval of batch
+framing.
 
 There are **200 verified trials**, in five alternating samples. Each uses 128
 keys, 1 KiB bodies, two rounds and 4 KiB producer chunks, with one or four
@@ -4130,5 +4131,143 @@ SHA-256 `43928cf31d5447fe1f4ff76ee49fa58aa7261cdc0aeff5fa41604a7fbf5a29fe`.
 The stage retains `unframed-paired.sh`, `unframed-summary.pl`, all 200
 `unframed-paired/` logs and `unframed-results.json`. Its
 `unframed-artifacts.sha256` manifest verifies **210 artifacts**, including both
-executables, the source patch and all measurements. Full staged crash
-correctness and the framing cost still require implementation and verification.
+executables, the source patch and all measurements. These remain the unframed
+baseline; the following series verifies and measures the implemented correction.
+
+## Checksummed batch framing
+
+The approved [compound recovery contract](pouch-space-implementation.md#compound-append-recovery)
+is implemented and verified for the private staged-state harness. COMPLETE and
+MAINTENANCE appends now wrap their canonical bytes in a checksummed 32-byte
+container frame. Recovery admits the complete group or none of it. Streaming
+PUTs retain their existing format and bounded producer flow. Normal public
+Pouch remains multifile, and live-stage maintenance/shared-root integration and
+guaranteed maintenance admission at capacity remain open.
+
+This series retains **600 verified trials** in **120 groups**, with five
+alternating samples of framed container, frozen unframed container and current
+multifile. The profiles cover ordinary/staged writes, metadata updates, deletes,
+scoped PUTs, compaction, point/read-many reads and metadata/body scans. Each uses
+128 keys, 1 KiB bodies and 4 KiB producer chunks, one/four independent namespace
+writers and both sync policies. DELETE runs once; other write profiles run two
+rounds. Metadata/delete timing excludes their initial seed. Each trial verifies
+current state and close/reopen readback. Container trials retain exactly one
+fixed 10 MiB file without sidecars. This is a native GNU release comparison on
+populated OS caches and a host/device shared with other work; no trial was
+discarded.
+
+The table reports median aggregate milliseconds, not per-operation latency.
+Write profiles use `write_ms`, reads/scans use their separate `read_ms`, and
+compaction uses `compact_ms`. “Frozen C” is the earlier known-unsafe unframed
+prototype. It also predates the shared native recovery correction in
+`b5c83a9`, so timing differences include those shared corrections as well as
+the envelope's checksum work.
+
+| Path | Policy | Writers | Framed C | Frozen C | Current MF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Stage + commit | NoSync | 1 | 9.039 | 10.974 | 15.527 |
+| Stage + commit | NoSync | 4 | 9.022 | 9.376 | 15.639 |
+| Stage + commit | Durable | 1 | 1393.760 | 1056.672 | 2394.129 |
+| Stage + commit | Durable | 4 | 1029.056 | 980.287 | 1708.246 |
+| PUT | NoSync | 1 | 10.562 | 7.730 | 12.216 |
+| PUT | NoSync | 4 | 7.762 | 7.898 | 17.982 |
+| PUT | Durable | 1 | 861.454 | 744.030 | 1213.779 |
+| PUT | Durable | 4 | 593.724 | 556.555 | 860.261 |
+| META | NoSync | 1 | 11.374 | 10.339 | 10.170 |
+| META | NoSync | 4 | 4.914 | 4.844 | 3.671 |
+| META | Durable | 1 | 513.637 | 376.710 | 1143.763 |
+| META | Durable | 4 | 290.076 | 375.503 | 588.970 |
+| DELETE | NoSync | 1 | 1.388 | 1.067 | 0.870 |
+| DELETE | NoSync | 4 | 0.678 | 0.767 | 0.840 |
+| DELETE | Durable | 1 | 205.186 | 172.170 | 556.654 |
+| DELETE | Durable | 4 | 133.362 | 144.295 | 275.161 |
+| Scoped PUT | NoSync | 1 | 13.498 | 15.544 | 19.046 |
+| Scoped PUT | NoSync | 4 | 18.406 | 17.429 | 22.874 |
+| Scoped PUT | Durable | 1 | 23.555 | 22.459 | 21.970 |
+| Scoped PUT | Durable | 4 | 33.420 | 28.999 | 38.750 |
+| Compaction | NoSync | 1 | 42.864 | 41.898 | 40.325 |
+| Compaction | NoSync | 4 | 155.233 | 154.197 | 176.882 |
+| Compaction | Durable | 1 | 47.334 | 52.612 | 45.105 |
+| Compaction | Durable | 4 | 164.114 | 149.433 | 163.066 |
+| Point read | NoSync | 1 | 0.881 | 0.673 | 3.840 |
+| Point read | NoSync | 4 | 0.490 | 0.565 | 1.962 |
+| Point read | Durable | 1 | 0.656 | 0.768 | 4.845 |
+| Point read | Durable | 4 | 0.467 | 0.527 | 1.775 |
+| Read many | NoSync | 1 | 0.597 | 0.714 | 0.885 |
+| Read many | NoSync | 4 | 0.398 | 0.345 | 0.594 |
+| Read many | Durable | 1 | 0.755 | 0.641 | 1.000 |
+| Read many | Durable | 4 | 0.493 | 0.399 | 0.612 |
+| Metadata scan | NoSync | 1 | 0.278 | 0.267 | 0.210 |
+| Metadata scan | NoSync | 4 | 0.278 | 0.261 | 0.254 |
+| Metadata scan | Durable | 1 | 0.280 | 0.274 | 0.287 |
+| Metadata scan | Durable | 4 | 0.250 | 0.251 | 0.232 |
+| Body scan | NoSync | 1 | 0.643 | 0.681 | 0.555 |
+| Body scan | NoSync | 4 | 0.329 | 0.348 | 0.530 |
+| Body scan | Durable | 1 | 0.808 | 0.630 | 0.620 |
+| Body scan | Durable | 4 | 0.393 | 0.376 | 0.793 |
+
+All **40** framed/frozen primary timing ranges overlap. Adverse medians are
+retained: single-writer Durable staged commits are **31.9%** higher
+(1393.760 versus 1056.672 ms), with ranges **1079.656–1645.787** and
+**1002.379–1601.691** ms. Their CPU medians are 64.126/63.113 ms, a **1.6%**
+difference. Ordinary single-writer NoSync PUTs, which add no envelope, are also
+**36.6%** higher in this series. NoSync single-writer META/DELETE CPU medians
+are 8.161/7.379 and 1.389/1.063 ms. The ranges and controls do not establish a
+small causal framing latency effect.
+
+Against current multifile, the framed staged-write medians are about
+**1.66–1.73×** faster in this workload; their timing ranges are disjoint in all
+four policy/writer groups. That advantage does not extend to every path:
+single-writer NoSync metadata scans are 0.278/0.210 ms (container/multifile),
+and single-writer Durable body scans are 0.808/0.620 ms. The table retains those
+comparisons rather than claim a universal read/scan improvement.
+
+The structural cost is exact in these small-batch trials. The 256 staged
+commits and 256 metadata updates each add **8192 syscall bytes**; 128 deletes
+add **4096 bytes**. That is **32 bytes per complete batch**. Write-phase
+`write_calls` counts are unchanged in all 40 framed/frozen groups: staged
+commits use 531/576 calls with one/four writers, META uses 256 and DELETE 128.
+The small headers remain inside the existing stream buffer. Larger flushed
+groups may require a separate final header patch; the bounded-fixup tests cover
+that path, and these small-batch measurements do not price it.
+
+Single-writer sync counts are unchanged: staged NoSync/Durable use 2/515
+barriers, META 0/256 and DELETE 0/128. Four-writer Durable coalescing varies
+with scheduling: staged framed/frozen medians are **268/264**, with ranges
+**264–272/263–269**; ordinary PUT medians are 137/135, META 129/131 and
+DELETE 65/66. Framing adds no barrier call or writer queue. The scope profile
+retains its barrier counts in both revisions: NoSync one/four writers 3/6,
+Durable 5/10.
+
+Staged reopen readiness (`reopen_ms + reopen_read_ms`) has these median
+milliseconds; it is separate from warm reads above:
+
+| Policy | Writers | Framed C | Frozen C | Current MF |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 15.883 | 13.876 | 8.261 |
+| NoSync | 4 | 14.899 | 14.327 | 8.595 |
+| Durable | 1 | 12.690 | 10.652 | 8.065 |
+| Durable | 4 | 11.448 | 10.790 | 9.676 |
+
+Container readiness remains slower than multifile in this staged workload.
+Framed/frozen readiness medians rise 14.5%/4.0% under NoSync and 19.1%/6.1%
+under Durable for one/four writers. The full results retain these ranges, cold
+read CPU, peak RSS, syscall counts and compaction costs.
+
+The current frozen ELF is
+`build/pouch-space-batch-frame/pouch_space_compare-framed`, SHA-256
+`d7180abfa1d1ce4379153b035c9d504acfc6556be4d40ff40857764cbdade43e`.
+It uses `b5c83a9` plus the retained `framed-source.patch`; the subsequent
+test-only counter repair and documentation edits do not change this benchmark's
+executable inputs. The frozen unframed ELF and source identity are recorded in
+the preceding section. `perf-inputs.sha256` verifies both binaries before and
+after the comparison.
+
+The stage retains `perf-paired.sh`, all 600 `paired/` logs,
+`perf-summary.pl`, `perf-results.json` and `perf-compact.pl`.
+The summary validates exact workload/rounds, mode, verification, samples and
+one-file properties before emitting statistics. `perf-artifacts.sha256`
+covers the measurement artifacts and source snapshot. Full correctness evidence
+is linked from the implementation contract. This comparison accepts the
+implemented framing/staged slice; full backend acceptance and deployment
+cutover remain open.

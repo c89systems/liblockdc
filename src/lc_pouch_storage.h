@@ -22,8 +22,9 @@ typedef int (*lc_pouch_storage_replay_fn)(void *, lc_pouch_storage_visit_fn,
 /* Immutable logical projection of one captured canonical prefix. Reuses the
  * production supersession, object and query-generation rules without changing
  * the live namespace cache. Replay must visit the selected snapshot followed
- * by its captured newer prefix and stop on callback error. Decisions/staged
- * records are rejected until their logical maintenance policy is integrated.
+ * by its captured newer prefix and stop on callback error. Capture resolves
+ * historical stages/decisions, then rejects any remaining live staged records
+ * until their logical maintenance policy is integrated.
  * Capture copies metadata only, never bodies. The caller retains any physical
  * source pins and the allocator context; the Pouch runtime is borrowed only
  * during capture. No logical publication or reclamation is performed here. */
@@ -81,6 +82,8 @@ typedef struct lc_pouch_storage_ops {
   /* Rotation target and known span. PREFIX permits an unknown remainder;
    * COMPLETE requires the declared size, MAINTENANCE additionally permits
    * spending protected work capacity. Reserve all dependencies before staging.
+   * Both are indivisible recovery units. The declared span contains canonical
+   * bytes only; storage accounts for its envelope in reservation and rotation.
    */
   int (*append_begin)(void *, void *, uint64_t, uint64_t,
                       enum lc_pouch_storage_append_mode,

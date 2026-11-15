@@ -71,6 +71,11 @@ int ps_stream_write(ps_stream_writer *, const void *, size_t, lc_error *);
  * Supports the canonical PENDING-header/metadata fixup before publication. */
 int ps_stream_write_at(ps_stream_writer *, uint64_t, const void *, size_t,
                        lc_error *);
+/* Checksum final private bytes, including canonical fixups. Reads only this
+ * append's written range, using bounded scratch and its existing tail buffer.
+ */
+int ps_stream_writer_crc(ps_stream_writer *, uint64_t offset, uint64_t length,
+                         unsigned long *, lc_error *);
 /* The canonical owner has completed its records before commit. Durable
  * success waits for the root sync covering these bytes; no publication journal
  * entry is emitted when appending inside an already owned run. An optional
