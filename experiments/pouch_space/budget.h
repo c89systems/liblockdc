@@ -22,10 +22,20 @@ typedef struct ps_budget_plan {
   uint64_t payload_bytes, metadata_bytes, entries;
   int maintenance;
 } ps_budget_plan;
+/* Successful composition uses scalar arithmetic without allocation or I/O.
+ * Failure leaves the plan unchanged and uses normal error reporting.
+ * These add one new head/binding, a routing replacement
+ * (or creation), or an exact canonical span with no existing grants. The span
+ * bound permits every grant to fragment down to one page, including its
+ * identity header. Geometric over-reservation needs a separate allowance. */
+int ps_budget_plan_stream(ps_budget_plan *, lc_error *);
+int ps_budget_plan_catalog(ps_budget_plan *, size_t name_bytes, lc_error *);
+int ps_budget_plan_routing(ps_budget_plan *, int create, lc_error *);
+int ps_budget_plan_span(ps_budget_plan *, uint64_t bytes, lc_error *);
 int ps_budget_open(ps_space *, const ps_budget_plan *, ps_budget **,
                    lc_error *);
 int ps_budget_status(ps_budget *, ps_budget_plan *, lc_error *);
-/* Fails without consuming the handle while an immutable writer uses it.
- * Otherwise releases unspent credits, even after uncertain I/O. */
+/* Fails without consuming the handle while a writer or grant preparation uses
+ * it. Otherwise releases unspent credits, even after uncertain I/O. */
 int ps_budget_close(ps_budget *, lc_error *);
 #endif

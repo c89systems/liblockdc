@@ -1849,7 +1849,7 @@ static void metadata_capacity(void) {
     s = create(3 * PS_MIB, sync, NULL);
     OK(ps_stream_open(s, NULL, key, 1, NULL, NULL, NULL, &stream, &error));
     OK(ps_stream_begin(stream, &writer, &error));
-    OK(ps_stream_reserve_exact(writer, sizeof(tail), &error));
+    OK(ps_stream_reserve_exact(writer, NULL, sizeof(tail), &error));
     OK(ps_stream_write(writer, "A", 1, &error));
     OK(ps_stream_commit(writer, NULL, NULL, &error));
     ps_stream_writer_close(writer);
@@ -2644,7 +2644,7 @@ static void canonical_stream_exact_reservations(void) {
     space = create(PS_DEFAULT_CAPACITY, 0, NULL);
     stream = stream_open(space, 1, 1, NULL, NULL);
     OK(ps_stream_begin(stream, &writer, &error));
-    OK(ps_stream_reserve_exact(writer, spans[i], &error));
+    OK(ps_stream_reserve_exact(writer, NULL, spans[i], &error));
     OK(ps_stream_status(stream, &before, &error));
     CHECK(!before.tail && before.capacity >= spans[i] &&
           before.capacity - spans[i] < PS_PAGE);
@@ -3656,7 +3656,7 @@ static void canonical_stream_grown_tail(int native_zero) {
   OK(ps_owned_open(space, NULL, stream_key(1), 0, NULL, &head, &owned, &error));
   OK(ps_grow(space, PS_MIB, &error));
   OK(ps_status(space, &before, &error));
-  OK(ps_owned_grant(head, 0, PS_MIB, &run, &found, &error));
+  OK(ps_owned_grant(head, NULL, 0, PS_MIB, &run, &found, &error));
   CHECK(found && ps_owned_run_capacity(run) == PS_MIB - PS_RUN_HEADER);
   OK(ps_owned_read(run, 0, readback, sizeof(readback), &error));
   for (i = 0; i < sizeof(readback); ++i)
@@ -3745,7 +3745,8 @@ static void canonical_stream_prepared_pool(int zero_mode) {
   puts("streams: one bounded preparation certifies shared spare pages for "
        "multiple grants, zero provenance and constant producer buffers");
 }
-static void canonical_stream_preparation_faults(int native_zero) {
+static void canonical_stream_preparation_faults(int native_zero, int funded,
+                                                int durable) {
   model m;
   ps_io io = model_init(&m);
   if (native_zero)
@@ -3761,13 +3762,13 @@ static void canonical_stream_preparation_faults(int native_zero) {
   CHECK(body != NULL);
   memset(body, 0x79, PS_CHUNK + 333);
   options.io = &io;
-  options.durable_sync = 1;
+  options.durable_sync = durable;
   for (kind = 0; kind < 2; ++kind) {
     count = 0;
     for (phase = 0; phase <= count; ++phase) {
       clean();
       m.fail_at = m.operations = 0;
-      space = create(3 * PS_MIB, 1, &io);
+      space = create(3 * PS_MIB, durable, &io);
       stream = stream_open(space, 1, 1, NULL, NULL);
       OK(canonical_append(stream, body, 64, 1, 1, &first, &error));
       OK(ps_checkpoint(space, &error));
@@ -3781,7 +3782,24 @@ static void canonical_stream_preparation_faults(int native_zero) {
       m.tear = m.persist_torn = 1;
       allocation_call = 0;
       allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
-      rc = canonical_append(stream, body, PS_CHUNK + 333, 31, 2, &next, &error);
+      ps_budget *budget = NULL;
+      ps_stream_writer *reservation = NULL;
+      ps_budget_plan plan = {0};
+      rc = LC_OK;
+      if (funded) {
+        rc = ps_budget_plan_span(&plan, PS_CHUNK + 333 + 43, &error);
+        if (rc == LC_OK)
+          rc = ps_budget_open(space, &plan, &budget, &error);
+        if (rc == LC_OK)
+          rc = ps_stream_begin(stream, &reservation, &error);
+        if (rc == LC_OK)
+          rc = ps_stream_reserve_exact(reservation, budget, PS_CHUNK + 333 + 43,
+                                       &error);
+        ps_stream_writer_close(reservation);
+      }
+      if (rc == LC_OK)
+        rc = canonical_append(stream, body, PS_CHUNK + 333, 31, 2, &next,
+                              &error);
       allocation_fail = 0;
       m.fail_at = 0;
       if (!phase)
@@ -3790,6 +3808,22 @@ static void canonical_stream_preparation_faults(int native_zero) {
         CHECK(kind == 0 || rc == LC_ERR_NOMEM);
         lc_error_cleanup(&error);
       }
+      OK(ps_budget_close(budget, &error));
+      if (funded && kind && rc != LC_OK) {
+        /* Healthy allocation failure must not require reopening the owner to
+         * admit another complete reservation. No new canonical bytes here. */
+        OK(ps_check(space, &error));
+        budget = NULL;
+        reservation = NULL;
+        OK(ps_budget_open(space, &plan, &budget, &error));
+        OK(ps_stream_begin(stream, &reservation, &error));
+        OK(ps_stream_reserve_exact(reservation, budget, PS_CHUNK + 333 + 43,
+                                   &error));
+        ps_stream_writer_close(reservation);
+        OK(ps_budget_close(budget, &error));
+      }
+      if (rc == LC_OK)
+        stream_expect(stream, next, body, PS_CHUNK + 333, 2);
       OK(ps_stream_close(stream, &error));
       OK(ps_close(space, &error));
       crash(&m);
@@ -3798,7 +3832,7 @@ static void canonical_stream_preparation_faults(int native_zero) {
       stream_expect(stream, first, body, 64, 1);
       OK(ps_stream_status(stream, &info, &error));
       CHECK(info.tail == 107 || info.tail == 107 + PS_CHUNK + 333 + 43);
-      if (rc == LC_OK)
+      if (rc == LC_OK && durable)
         CHECK(info.tail != 107);
       if (info.tail != 107)
         stream_expect(stream, next, body, PS_CHUNK + 333, 2);
@@ -3808,6 +3842,10 @@ static void canonical_stream_preparation_faults(int native_zero) {
       OK(ps_close(space, &error));
     }
     CHECK(count > 5);
+    if (funded)
+      printf("funded grant failure cuts (zero=%d durable=%d %s): %lu\n",
+             native_zero, durable, kind ? "allocation" : "write/sync",
+             (unsigned long)count);
   }
   free(body);
   free(m.stable);
@@ -4120,7 +4158,7 @@ static void stream_lifecycle_capacity(void) {
   OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &status,
                    &error));
   for (;;) {
-    rc = ps_owned_grant(head, base, PS_PAGE, &run, &found, &error);
+    rc = ps_owned_grant(head, NULL, base, PS_PAGE, &run, &found, &error);
     if (rc != LC_OK)
       break;
     CHECK(found);
@@ -4156,7 +4194,7 @@ static void stream_lifecycle_capacity(void) {
   CHECK(!after.entries && !after.allocated_bytes);
   OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &status,
                    &error));
-  OK(ps_owned_grant(head, 0, PS_PAGE, &run, &found, &error));
+  OK(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &error));
   CHECK(found);
   ps_owned_run_close(run);
   ps_owned_close(head);
@@ -5600,6 +5638,237 @@ static void budget_allocation_faults(void) {
   free(bytes);
   clean();
 }
+static void grant_budget_plans(void) {
+  ps_budget_plan p = {0}, before;
+  OK(ps_budget_plan_stream(&p, &error));
+  OK(ps_budget_plan_catalog(&p, 7, &error));
+  OK(ps_budget_plan_routing(&p, 1, &error));
+  OK(ps_budget_plan_routing(&p, 0, &error));
+  OK(ps_budget_plan_span(&p, PS_PAGE - PS_RUN_HEADER + 1, &error));
+  CHECK(p.payload_bytes == 4 * PS_PAGE &&
+        p.metadata_bytes == 80 + 111 + 88 + 176 && p.entries == 5 &&
+        !p.maintenance);
+  before = p;
+  BAD(ps_budget_plan_span(&p, UINT64_MAX, &error));
+  BAD(ps_budget_plan_catalog(&p, PS_CATALOG_NAME_MAX + 1, &error));
+  BAD(ps_budget_plan_routing(&p, 2, &error));
+  CHECK(p.payload_bytes == before.payload_bytes &&
+        p.metadata_bytes == before.metadata_bytes &&
+        p.entries == before.entries);
+  BAD(ps_budget_plan_span(NULL, 0, &error));
+  BAD(ps_budget_plan_stream(NULL, &error));
+  for (int kind = 0; kind < 3; ++kind) {
+    memset(&p, 0, sizeof(p));
+    if (kind == 0)
+      p.payload_bytes = UINT64_MAX;
+    if (kind == 1)
+      p.metadata_bytes = UINT64_MAX;
+    if (kind == 2)
+      p.entries = UINT64_MAX;
+    before = p;
+    BAD(ps_budget_plan_span(&p, 1, &error));
+    CHECK(p.payload_bytes == before.payload_bytes &&
+          p.metadata_bytes == before.metadata_bytes &&
+          p.entries == before.entries);
+  }
+  memset(&p, 0, sizeof(p));
+  OK(ps_budget_plan_span(&p, 0, &error));
+  CHECK(!p.payload_bytes && !p.metadata_bytes && !p.entries);
+}
+static void grant_budget_capacity(int durable, int fragmented) {
+  ps_space *s;
+  ps_budget *budget = NULL, *peer = NULL;
+  ps_budget_plan plan = {0}, floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_stream_reader *reader = NULL;
+  ps_stream_info info;
+  ps_catalog_info binding;
+  ps_stats stats;
+  unsigned char *bytes = malloc(6 * PS_CHUNK + 17);
+  uint64_t next = 1, end;
+  CHECK(bytes);
+  memset(bytes, 0x7b, 6 * PS_CHUNK + 17);
+  clean();
+  s = create(fragmented ? PS_MIB : 3 * PS_MIB, durable, NULL);
+  if (fragmented) {
+    budget_fill(s, &next, bytes);
+    end = next - 1;
+    for (uint64_t i = 1; i < end; i += 2)
+      OK(ps_delete(s, state(i), &error));
+    OK(ps_checkpoint(s, &error));
+  }
+  OK(ps_budget_plan_stream(&plan, &error));
+  OK(ps_budget_plan_catalog(&plan, 4, &error));
+  OK(ps_budget_plan_span(&plan, 6 * PS_CHUNK + 17, &error));
+  OK(ps_budget_open(s, &plan, &budget, &error));
+  OK(ps_stream_open(s, budget, stream_key(1), 1, NULL, NULL, NULL, &stream,
+                    &error));
+  budget_fill(s, &next, bytes);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_budget_open(s, &floor, &peer, &error));
+  OK(ps_stream_begin(stream, &writer, &error));
+  OK(ps_stream_reserve_exact(writer, budget, 6 * PS_CHUNK + 17, &error));
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(info.capacity >= 6 * PS_CHUNK + 17 && !info.tail &&
+        (!fragmented || info.runs > 10));
+  for (size_t at = 0; at < 6 * PS_CHUNK + 17;) {
+    size_t n = 6 * PS_CHUNK + 17 - at;
+    if (n > 317)
+      n = 317;
+    OK(ps_stream_write(writer, bytes + at, n, &error));
+    at += n;
+  }
+  OK(ps_stream_commit(writer, NULL, NULL, &error));
+  ps_stream_writer_close(writer);
+  OK(ps_stream_seal(stream, &error));
+  OK(ps_catalog_put(s, budget, 10, PS_CATALOG_BODY, "pack", 4, NULL,
+                    stream_key(1), &info.ref, &binding, &error));
+  OK(ps_budget_close(peer, &error));
+  OK(ps_budget_close(budget, &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(!stats.budgets && !stats.reserved_payload_bytes &&
+        !stats.reserved_metadata_bytes && !stats.reserved_entries &&
+        stats.metadata_available_bytes >= stats.metadata_workspace_bytes);
+  OK(ps_stream_read_open(stream, 0, 6 * PS_CHUNK + 17, &reader, &error));
+  stream_reader_expect(reader, bytes, 6 * PS_CHUNK + 17);
+  ps_stream_reader_close(reader);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  OK(ps_stream_open(s, NULL, stream_key(1), 0, &info.ref, NULL, NULL, &stream,
+                    &error));
+  OK(ps_stream_read_open(stream, 0, 6 * PS_CHUNK + 17, &reader, &error));
+  stream_reader_expect(reader, bytes, 6 * PS_CHUNK + 17);
+  ps_stream_reader_close(reader);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
+static void grant_budget_rejections(void) {
+  ps_space *s, *foreign = NULL;
+  ps_owned_head *head = NULL, *other_head = NULL;
+  ps_owned_status status;
+  ps_owned_run *run = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {PS_PAGE, 88, 1, 0}, remaining;
+  ps_stats before, after;
+  int found;
+  clean();
+  s = create(PS_MIB, 0, NULL);
+  OK(ps_owned_open(s, NULL, stream_key(1), 1, NULL, &head, &status, &error));
+  for (int kind = 0; kind < 3; ++kind) {
+    plan.payload_bytes = kind == 0 ? 0 : PS_PAGE;
+    plan.metadata_bytes = kind == 1 ? 87 : 88;
+    plan.entries = kind == 2 ? 0 : 1;
+    OK(ps_budget_open(s, &plan, &budget, &error));
+    OK(ps_status(s, &before, &error));
+    BAD(ps_owned_grant(head, budget, 0, PS_PAGE, &run, &found, &error));
+    CHECK(!run && !found);
+    OK(ps_status(s, &after, &error));
+    CHECK(after.entries == before.entries &&
+          after.allocated_bytes == before.allocated_bytes &&
+          after.journal_bytes == before.journal_bytes);
+    OK(ps_budget_status(budget, &remaining, &error));
+    CHECK(remaining.payload_bytes == plan.payload_bytes &&
+          remaining.metadata_bytes == plan.metadata_bytes &&
+          remaining.entries == plan.entries);
+    OK(ps_budget_close(budget, &error));
+  }
+  plan.payload_bytes = PS_PAGE;
+  plan.metadata_bytes = 88;
+  plan.entries = 1;
+  OK(ps_budget_open(s, &plan, &budget, &error));
+  BAD(ps_owned_grant(head, budget, 1, PS_PAGE, &run, &found, &error));
+  OK(ps_open(other, 1, NULL, &foreign, &error));
+  OK(ps_owned_open(foreign, NULL, stream_key(1), 1, NULL, &other_head, &status,
+                   &error));
+  BAD(ps_owned_grant(other_head, budget, 0, PS_PAGE, &run, &found, &error));
+  CHECK(!run && !found);
+  ps_owned_close(other_head);
+  OK(ps_close(foreign, &error));
+  OK(ps_budget_close(budget, &error));
+  ps_owned_close(head);
+  OK(ps_close(s, &error));
+  clean();
+}
+typedef struct funded_grant_actor {
+  ps_owned_head *head;
+  ps_budget *budget;
+  ps_owned_run *run;
+  int rc, found;
+} funded_grant_actor;
+static void *funded_grant_produce(void *context) {
+  funded_grant_actor *a = context;
+  lc_error e;
+  lc_error_init(&e);
+  a->rc =
+      ps_owned_grant(a->head, a->budget, 0, PS_PAGE, &a->run, &a->found, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void grant_budget_concurrency(void) {
+  commit_gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&g, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_space *s;
+  ps_owned_head *head = NULL;
+  ps_owned_status status;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {PS_PAGE, 88, 1, 0}, remaining;
+  funded_grant_actor actor = {0};
+  pthread_t thread;
+  unsigned char *bytes = malloc(PS_PAGE);
+  uint64_t next = 600;
+  CHECK(bytes);
+  memset(bytes, 0x5b, PS_PAGE);
+  clean();
+  s = create(2 * PS_MIB, 0, &io);
+  OK(ps_owned_open(s, NULL, stream_key(1), 1, NULL, &head, &status, &error));
+  OK(ps_budget_open(s, &plan, &budget, &error));
+  actor.head = head;
+  actor.budget = budget;
+  g.enabled = g.hold_payload = 1;
+  CHECK(pthread_create(&thread, NULL, funded_grant_produce, &actor) == 0);
+  await_gate(&g, 0);
+  BAD(ps_budget_close(budget, &error));
+  OK(ps_budget_status(budget, &remaining, &error));
+  CHECK(!remaining.payload_bytes && remaining.metadata_bytes == 88 &&
+        remaining.entries == 1);
+  for (uint64_t i = 0; i < 512; ++i)
+    put(s, state(i), NULL, 0, 1);
+  OK(ps_metadata_repack(s, &error));
+  budget_fill(s, &next, bytes);
+  OK(ps_checkpoint(s, &error));
+  pthread_mutex_lock(&g.mutex);
+  g.released = 1;
+  pthread_cond_broadcast(&g.cond);
+  pthread_mutex_unlock(&g.mutex);
+  CHECK(pthread_join(thread, NULL) == 0);
+  CHECK(actor.rc == LC_OK && actor.found && actor.run);
+  OK(ps_budget_status(budget, &remaining, &error));
+  CHECK(!remaining.payload_bytes && !remaining.metadata_bytes &&
+        !remaining.entries);
+  OK(ps_owned_read(actor.run, 0, bytes, PS_PAGE - PS_RUN_HEADER, &error));
+  for (size_t i = 0; i < PS_PAGE - PS_RUN_HEADER; ++i)
+    CHECK(!bytes[i]);
+  ps_owned_run_close(actor.run);
+  OK(ps_budget_close(budget, &error));
+  ps_owned_close(head);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  OK(ps_owned_open(s, NULL, stream_key(1), 0, &status.ref, &head, &status,
+                   &error));
+  CHECK(status.runs == 1 && status.capacity == PS_PAGE - PS_RUN_HEADER);
+  ps_owned_close(head);
+  OK(ps_close(s, &error));
+  CHECK(pthread_cond_destroy(&g.cond) == 0);
+  CHECK(pthread_mutex_destroy(&g.mutex) == 0);
+  free(bytes);
+  clean();
+}
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -5609,7 +5878,18 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "budget") == 0) {
+    if (strcmp(argv[2], "grant-budget") == 0) {
+      grant_budget_plans();
+      grant_budget_rejections();
+      for (int durable = 0; durable < 2; ++durable)
+        for (int fragmented = 0; fragmented < 2; ++fragmented)
+          grant_budget_capacity(durable, fragmented);
+      grant_budget_concurrency();
+    } else if (strcmp(argv[2], "grant-budget-faults") == 0) {
+      for (int zero = 0; zero < 2; ++zero)
+        for (int durable = 0; durable < 2; ++durable)
+          canonical_stream_preparation_faults(zero, 1, durable);
+    } else if (strcmp(argv[2], "budget") == 0) {
       budget_lifecycle(0);
       budget_lifecycle(1);
       budget_concurrency();
@@ -5691,8 +5971,8 @@ int main(int argc, char **argv) {
       canonical_stream_prepared_pool(0);
       canonical_stream_prepared_pool(1);
       canonical_stream_prepared_pool(2);
-      canonical_stream_preparation_faults(0);
-      canonical_stream_preparation_faults(1);
+      canonical_stream_preparation_faults(0, 0, 1);
+      canonical_stream_preparation_faults(1, 0, 1);
     } else
       return 2;
     lc_error_cleanup(&error);

@@ -4,6 +4,40 @@
 static int invalid(lc_error *e, const char *message) {
   return lc_error_set(e, LC_ERR_INVALID, 0, message, NULL, NULL, "pouch-space");
 }
+static int plan_add(ps_budget_plan *p, uint64_t payload, uint64_t metadata,
+                    uint64_t entries, lc_error *e) {
+  if (!p || payload > UINT64_MAX - p->payload_bytes ||
+      metadata > UINT64_MAX - p->metadata_bytes ||
+      entries > UINT64_MAX - p->entries)
+    return invalid(e, "capacity plan totals overflow or plan is missing");
+  p->payload_bytes += payload;
+  p->metadata_bytes += metadata;
+  p->entries += entries;
+  return LC_OK;
+}
+int ps_budget_plan_stream(ps_budget_plan *p, lc_error *e) {
+  return plan_add(p, 0, 80, 1, e);
+}
+int ps_budget_plan_catalog(ps_budget_plan *p, size_t bytes, lc_error *e) {
+  if (bytes > PS_CATALOG_NAME_MAX)
+    return invalid(e, "capacity plan catalog name exceeds format bounds");
+  return plan_add(p, 0, 104 + bytes, 1, e);
+}
+int ps_budget_plan_routing(ps_budget_plan *p, int create, lc_error *e) {
+  if (create != 0 && create != 1)
+    return invalid(e, "capacity plan routing creation must be zero or one");
+  return plan_add(p, PS_PAGE, create ? 88 : 0, create ? 1 : 0, e);
+}
+int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
+  uint64_t pages;
+  if (bytes > (uint64_t)INT64_MAX)
+    return invalid(e, "capacity plan canonical span exceeds local bounds");
+  pages = bytes / (PS_PAGE - PS_RUN_HEADER) +
+          (bytes % (PS_PAGE - PS_RUN_HEADER) != 0);
+  if (pages > UINT64_MAX / PS_PAGE || pages > UINT64_MAX / 88)
+    return invalid(e, "capacity plan canonical span overflows physical bounds");
+  return plan_add(p, pages * PS_PAGE, pages * 88, pages, e);
+}
 int ps_internal_budget_check(ps_space *s, ps_budget *b, uint64_t payload,
                              uint64_t metadata, uint64_t entries, lc_error *e) {
   if (b && (b->space != s || payload > b->remaining.payload_bytes ||

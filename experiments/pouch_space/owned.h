@@ -19,7 +19,7 @@ typedef struct ps_owned_status {
 } ps_owned_status;
 
 /* The optional budget funds creation only; an open cached owner retains no
- * claim. Grant allocation currently uses ordinary admission. */
+ * claim. */
 int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 void ps_owned_close(ps_owned_head *);
@@ -30,8 +30,8 @@ int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
  * New grants contain only zeros after their immutable identity header.
  * Reused/uncertified space is initialized and synced before its grant enters
  * the journal. Already durable zero space needs no preparation barrier. */
-int ps_owned_grant(ps_owned_head *, uint64_t base, uint64_t desired,
-                   ps_owned_run **, int *found, lc_error *);
+int ps_owned_grant(ps_owned_head *, ps_budget *, uint64_t base,
+                   uint64_t desired, ps_owned_run **, int *found, lc_error *);
 uint64_t ps_owned_run_capacity(const ps_owned_run *);
 void ps_owned_run_close(ps_owned_run *);
 int ps_owned_read(ps_owned_run *, uint64_t offset, void *, size_t, lc_error *);

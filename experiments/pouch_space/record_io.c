@@ -16,10 +16,11 @@ int ps_record_begin(ps_stream *stream, ps_record_writer *out, lc_error *e) {
     out->start = out->tail = ps_stream_writer_start(out->writer);
   return rc;
 }
-int ps_record_reserve(ps_record_writer *out, uint64_t bytes, lc_error *e) {
+int ps_record_reserve(ps_record_writer *out, ps_budget *budget, uint64_t bytes,
+                      lc_error *e) {
   if (!out || !out->writer)
     return record_error(e, "canonical append is not open");
-  return ps_stream_reserve(out->writer, bytes, e);
+  return ps_stream_reserve(out->writer, budget, bytes, e);
 }
 void ps_record_abort(ps_record_writer *out) {
   if (out) {

@@ -106,7 +106,10 @@ int ps_namespace_snapshot_reserve(ps_namespace_snapshot *, uint64_t,
 /* Sealed relocation packs contain canonical encoded body records, not a replay
  * prefix. Their bindings are durable before a metadata snapshot can refer to
  * them. Unreferenced packs require logical reclamation after interrupted work.
- * Expected bytes are reserved before returning; producers hold no owner lock.
+ * Exact known-span payload and the metadata needed to publish its head, grants
+ * and catalog binding are admitted before stream creation. This ordinary claim
+ * preserves the maintenance floor. Producers hold no owner lock. The caller
+ * still supplies the measured span; this is not a complete compaction budget.
  */
 int ps_namespace_body_begin(ps_namespace *, uint64_t bytes,
                             ps_namespace_body **, lc_error *);

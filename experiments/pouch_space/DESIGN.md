@@ -78,6 +78,28 @@ unspent credits and excess dynamic metadata workspace using a preallocated split
 node. A budget provides capacity admission, not key isolation, rollback, or
 protection from allocation/I/O errors. Failed attempts do not refund spent credits.
 
+Typed planning helpers now compose costs for new stream heads, name bindings,
+routing replacement/creation and an exact unowned canonical span. Successful
+composition uses scalar arithmetic; overflow leaves the plan unchanged. A span
+uses a conservative one-page-grant bound, including every 64-byte run header,
+without allocating an array per future page.
+
+Canonical grant allocation and explicit stream/record reservation now accept a
+budget. Grant preparation pins that handle, spends physical grant pages when
+taken, and retains its descriptor/entry credits through private I/O and peer
+checkpoints until grant installation. Extra zero preparation retains the existing
+optimization but may borrow only unclaimed common headroom, preserving the
+maintenance floor. Prepared spare pages become reusable only after their sync.
+The reservation call funds grants, not later automatic growth; cached streams
+retain no budget. Geometric over-reservation needs an additional allowance;
+the exact span planner is intended for `ps_stream_reserve_exact`.
+
+A known-size body-pack builder now takes an ordinary budget for its head, exact
+span grants and final catalog binding before stream creation. It holds that
+budget through the producer and publication, then releases it on close. The
+ordinary claim preserves the standing maintenance floor. This completes body-pack
+admission, not admission for the parent compaction sequence.
+
 Private payloads flow through a 16 KiB buffer into page-aligned runs. Allocation
 uses 4 KiB physical pages, matching the measurement host's filesystem blocks;
 its device reports 512-byte sectors. Whole-page portions retain whole runs;
@@ -626,9 +648,10 @@ cursor/checksum state and can outlive the logical runtime.
 Known canonical output spans and checkpoint workspace have separate protection.
 Explicit empty rotation now claims successor head, name binding and routing
 replacement before staging or head selection. Seal and rollover use protected
-checkpoint workspace. Canonical grant allocation still uses ordinary admission;
-automatic append/delete and compaction must carry a complete budget through their
-remaining dependency sequence. The fixed 16 KiB floor also needs a bounded-work
+checkpoint workspace. Canonical grants can now spend explicit claims and known
+body packs reserve their complete publication. Automatic append/delete, snapshot
+builders and the full compaction sequence must still carry a complete budget
+through their remaining dependencies. The fixed 16 KiB floor needs a bounded-work
 policy covering admitted keys up to 1 MiB. Automatic compaction/retention policy
 and history protection remain pending.
 The current label pool still follows namespace-owner lifetime.

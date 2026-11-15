@@ -873,11 +873,6 @@ static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
     bound = current;
   return metadata_protect(s, bound, payload, floor, error);
 }
-static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
-                                uint64_t payload, lc_error *error) {
-  return checkpoint_allowance_floor(s, bytes, entries, payload,
-                                    PS_MAINTENANCE_RESERVE, NULL, error);
-}
 static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
                                uint64_t entries, uint64_t payload,
                                ps_budget *budget, lc_error *error) {
@@ -2638,8 +2633,26 @@ int ps_owned_status_get(ps_owned_head *head, ps_owned_status *out,
   pthread_mutex_unlock(&head->space->mutex);
   return rc;
 }
-static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
-                          ps_owned_run *run, lc_error *error) {
+static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
+                           lc_error *error) {
+  return checkpoint_allowance_floor(s, s->metadata + 88, s->live_entries + 1,
+                                    payload, PS_MAINTENANCE_RESERVE, budget,
+                                    error);
+}
+static int owned_preparation_allowance(ps_space *s, ps_budget *budget,
+                                       uint64_t bytes, uint64_t reserved,
+                                       lc_error *error) {
+  if (!budget)
+    return owned_allowance(s, NULL, reserved, error);
+  /* The grant's pages and descriptor are already included in the claim.
+   * Extra zero preparation may borrow only unclaimed common headroom. */
+  return checkpoint_allowance_floor(s, s->metadata, s->live_entries,
+                                    reserved - bytes, PS_MAINTENANCE_RESERVE,
+                                    NULL, error);
+}
+static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
+                          uint64_t desired, ps_owned_run *run,
+                          lc_error *error) {
   ps_space *s = head->space;
   ps_entry *p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
   unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
@@ -2669,8 +2682,7 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
   /* Protect metadata before retaining a free-list selection: admission may
    * transfer common intervals into the checkpoint-only pool. */
   if (rc == LC_OK)
-    rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, 0,
-                              error);
+    rc = owned_allowance(s, budget, 0, error);
   if (rc == LC_OK) {
     for (;;) {
       partial = fit = NULL;
@@ -2694,8 +2706,7 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
       }
       if (bytes > (*choice)->bytes)
         bytes = (*choice)->bytes;
-      rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, bytes,
-                                error);
+      rc = owned_allowance(s, budget, bytes, error);
       if (rc == LC_OK || bytes == PS_PAGE)
         break;
       lc_error_cleanup(error);
@@ -2710,8 +2721,7 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
     if (!(*choice)->clean && bytes < PS_MIB) {
       reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
       while (reserved > bytes) {
-        rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1,
-                                  reserved, error);
+        rc = owned_preparation_allowance(s, budget, bytes, reserved, error);
         if (rc == LC_OK)
           break;
         lc_error_cleanup(error);
@@ -2728,9 +2738,11 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
       }
     }
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
     take_selected(choice, &s->free_bytes, reserved, &p->extents[0].offset,
                   &clean);
+    ps_internal_budget_spend(budget, bytes, 0, 0);
+  }
   if (rc == LC_OK) {
     p->token = s->token_next++;
     p->bytes = p->extents[0].bytes = reserved; /* entire private preparation */
@@ -2738,6 +2750,8 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
     p->extents[0].flags = EXTENT_OWNED;
     register_entry(s, p);
     ++s->writers;
+    if (budget)
+      ++budget->users;
     registered = 1;
   }
   pthread_mutex_unlock(&s->mutex);
@@ -2786,8 +2800,7 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
    * growth before installing this new grant's descriptor. Its payload is
    * already privately owned, so no second payload charge is required. */
   if (rc == LC_OK)
-    rc = checkpoint_allowance(s, s->metadata + 88, s->live_entries + 1, 0,
-                              error);
+    rc = owned_allowance(s, budget, 0, error);
   if (rc == LC_OK)
     rc = append_event(s, p, PS_PUT, error);
   if (rc == LC_OK) {
@@ -2796,6 +2809,7 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
   }
   if (rc == LC_OK) {
+    ps_internal_budget_spend(budget, 0, 88, 1);
     p->publication_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     dirty_entry(s, p, NULL);
@@ -2813,15 +2827,19 @@ static int owned_allocate(ps_owned_head *head, uint64_t base, uint64_t desired,
     }
     entry_free(p);
   }
-  if (registered)
+  if (registered) {
     --s->writers;
+    if (budget)
+      --budget->users;
+  }
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, zero);
   lc_free_with_allocator(NULL, spare);
   return rc;
 }
-int ps_owned_grant(ps_owned_head *head, uint64_t base, uint64_t desired,
-                   ps_owned_run **out, int *found, lc_error *error) {
+int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
+                   uint64_t desired, ps_owned_run **out, int *found,
+                   lc_error *error) {
   ps_owned_run *run;
   ps_space *s;
   ps_entry *p;
@@ -2840,7 +2858,7 @@ int ps_owned_grant(ps_owned_head *head, uint64_t base, uint64_t desired,
   if (!run)
     return err(error, LC_ERR_NOMEM, "cannot allocate owned run handle");
   if (desired)
-    rc = owned_allocate(head, base, desired, run, error);
+    rc = owned_allocate(head, budget, base, desired, run, error);
   else {
     key.kind = PS_OWNED_RUN;
     key.owner = head->entry->token;

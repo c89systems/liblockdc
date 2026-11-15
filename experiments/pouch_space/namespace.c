@@ -499,7 +499,7 @@ static int begin_reserve(ps_stream *stream, uint64_t minimum,
                          ps_record_writer *writer, lc_error *e) {
   int rc = ps_record_begin(stream, writer, e);
   if (rc == LC_OK)
-    rc = ps_record_reserve(writer, minimum ? minimum : 1, e);
+    rc = ps_record_reserve(writer, NULL, minimum ? minimum : 1, e);
   return rc;
 }
 int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
@@ -514,15 +514,15 @@ int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
    * one stream head and its fixed 28-byte canonical segment label. Existing
    * staged successors need neither. Seal and journal rollover are covered by
    * the checkpoint pool, independently of this payload claim. */
-  plan.payload_bytes = PS_PAGE;
-  plan.metadata_bytes = d->active ? 0 : 88;
-  plan.entries = d->active ? 0 : 1;
   plan.maintenance = 1;
-  if (!ps_ns_find(d, PS_CATALOG_SEGMENT, next)) {
-    plan.metadata_bytes += 80 + 104 + 28;
-    plan.entries += 2;
+  rc = ps_budget_plan_routing(&plan, !d->active, e);
+  if (rc == LC_OK && !ps_ns_find(d, PS_CATALOG_SEGMENT, next)) {
+    rc = ps_budget_plan_stream(&plan, e);
+    if (rc == LC_OK)
+      rc = ps_budget_plan_catalog(&plan, 28, e);
   }
-  rc = ps_budget_open(d->ns->root->space, &plan, &budget, e);
+  if (rc == LC_OK)
+    rc = ps_budget_open(d->ns->root->space, &plan, &budget, e);
   if (rc == LC_OK)
     rc = prepare(d, budget, next, e);
   if (rc == LC_OK)

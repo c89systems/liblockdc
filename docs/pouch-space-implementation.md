@@ -88,8 +88,15 @@ a peer subsequently claims that floor. Handles pin their space and active writer
 pin their budget. Claim/release uses no I/O or persisted format; it neither
 isolates keys nor rolls back publications. Explicit namespace rotation now
 reserves its successor, binding and routing replacement before staging.
-Canonical grant spending and complete append/delete/compaction admission remain
-pending. A bounded-work policy must also cover accepted keys up to 1 MiB;
+Canonical grants and explicit stream/record reservation now spend claims. Grant
+preparation pins the budget and retains future descriptor credits until actual
+installation. Extra zero preparation uses only unclaimed headroom; cached streams
+do not retain the reservation's budget. Typed scalar planners compose head,
+binding, routing and worst-fragmentation exact-span costs. Known-size body packs
+admit head, grants and final catalog binding before stream creation, preserving
+the standing floor through an ordinary claim. The complete append/delete,
+snapshot and parent compaction admission remain pending. A bounded-work policy
+must also cover accepted keys up to 1 MiB;
 the fixed 16 KiB floor alone cannot establish that guarantee.
 Tests cover 12,000 entries in 10 MiB, incremental
 checkpoint I/O, spanning descriptors, private-build allocation failures and

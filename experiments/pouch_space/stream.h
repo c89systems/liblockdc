@@ -51,10 +51,15 @@ uint64_t ps_stream_writer_start(const ps_stream_writer *);
  * Allocation failure may leave reusable zero grants and fails this writer.
  * Caller knows a bounded canonical span, not necessarily the producer's size.
  */
-int ps_stream_reserve(ps_stream_writer *, uint64_t bytes, lc_error *);
+/* A budget funds this reservation call only and is not retained by the cached
+ * stream. Further automatic growth uses ordinary admission. Geometric grants
+ * can exceed bytes; use reserve_exact with the conservative span planner. */
+int ps_stream_reserve(ps_stream_writer *, ps_budget *, uint64_t bytes,
+                      lc_error *);
 /* Known final span: retain geometric growth for full grants, but clip the last
  * grant to the remaining page-rounded need. Intended for sealed builds. */
-int ps_stream_reserve_exact(ps_stream_writer *, uint64_t bytes, lc_error *);
+int ps_stream_reserve_exact(ps_stream_writer *, ps_budget *, uint64_t bytes,
+                            lc_error *);
 int ps_stream_write(ps_stream_writer *, const void *, size_t, lc_error *);
 /* Relative to this private append, never to previously committed bytes.
  * Supports the canonical PENDING-header/metadata fixup before publication. */

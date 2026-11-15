@@ -841,25 +841,25 @@ static void stream_reservation(const char *path) {
     ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e), &e);
     ok(ps_stream_begin(stream, &writer, &e), &e);
     ok(ps_status(space, &before, &e), &e);
-    ok(ps_stream_reserve(writer, 0, &e), &e);
+    ok(ps_stream_reserve(writer, NULL, 0, &e), &e);
     ok(ps_status(space, &after, &e), &e);
     REQUIRE(before.entries == after.entries &&
             before.journal_bytes == after.journal_bytes);
-    ok(ps_stream_reserve(writer, PS_CHUNK + 1, &e), &e);
+    ok(ps_stream_reserve(writer, NULL, PS_CHUNK + 1, &e), &e);
     ok(ps_stream_status(stream, &info, &e), &e);
     REQUIRE(!info.tail && info.capacity >= PS_CHUNK + 1 && info.runs > 1);
     REQUIRE(ps_stream_read_open(stream, 0, 1, &reader, &e) == LC_ERR_INVALID &&
             !reader);
     clear(&e);
     ok(ps_stream_write(writer, body, 17, &e), &e);
-    ok(ps_stream_reserve(writer, sizeof(body), &e), &e);
+    ok(ps_stream_reserve(writer, NULL, sizeof(body), &e), &e);
     ok(ps_stream_status(stream, &info, &e), &e);
     REQUIRE(!info.tail && info.capacity >= sizeof(body));
     ok(ps_status(space, &before, &e), &e);
-    ok(ps_stream_reserve(writer, sizeof(body), &e), &e);
+    ok(ps_stream_reserve(writer, NULL, sizeof(body), &e), &e);
     ok(ps_stream_write(writer, body + 17, sizeof(body) - 17, &e), &e);
     ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
-    REQUIRE(ps_stream_reserve(writer, 1, &e) == LC_ERR_INVALID);
+    REQUIRE(ps_stream_reserve(writer, NULL, 1, &e) == LC_ERR_INVALID);
     clear(&e);
     ps_stream_writer_close(writer);
     writer = NULL;
@@ -876,17 +876,17 @@ static void stream_reservation(const char *path) {
     }
     REQUIRE(e.code == LC_OK && at == sizeof(body));
     ok(ps_stream_begin(stream, &writer, &e), &e);
-    REQUIRE(ps_stream_reserve(writer, (uint64_t)INT64_MAX, &e) ==
+    REQUIRE(ps_stream_reserve(writer, NULL, (uint64_t)INT64_MAX, &e) ==
             LC_ERR_INVALID);
     clear(&e);
-    ok(ps_stream_reserve(writer, 0, &e), &e);
+    ok(ps_stream_reserve(writer, NULL, 0, &e), &e);
     ps_stream_writer_close(writer);
     ps_stream_reader_close(reader);
     ok(ps_stream_close(stream, &e), &e);
     ok(ps_close(space, &e), &e);
-    REQUIRE(ps_stream_reserve(NULL, 1, &e) == LC_ERR_INVALID);
+    REQUIRE(ps_stream_reserve(NULL, NULL, 1, &e) == LC_ERR_INVALID);
     clear(&e);
-    REQUIRE(ps_record_reserve(NULL, 1, &e) == LC_ERR_INVALID);
+    REQUIRE(ps_record_reserve(NULL, NULL, 1, &e) == LC_ERR_INVALID);
     clear(&e);
     REQUIRE(unlink(path) == 0);
     lc_error_cleanup(&e);
@@ -1125,7 +1125,7 @@ static void covered_publication(const char *path) {
       ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e),
          &e);
       ok(ps_stream_begin(stream, &writer, &e), &e);
-      ok(ps_stream_reserve(writer, 3, &e), &e);
+      ok(ps_stream_reserve(writer, NULL, 3, &e), &e);
       ok(ps_stream_write(writer, "abc", 3, &e), &e);
       p.space = space;
       p.stream = stream;
@@ -1944,6 +1944,197 @@ static int body_source(void *context, const ps_namespace_source *s,
     return append(c->root, c->ns, 1, 0, 31, e);
   return LC_OK;
 }
+static void body_budget_read(ps_namespace *ns, uint64_t id,
+                             const void *expected, size_t bytes, lc_error *e) {
+  ps_namespace_window *pin = NULL;
+  unsigned char buffer[317];
+  ok(ps_namespace_read_open(ns, PS_CATALOG_BODY, id, 0, bytes, &pin, e), e);
+  for (size_t at = 0; at < bytes;) {
+    size_t n = bytes - at;
+    if (n > sizeof(buffer))
+      n = sizeof(buffer);
+    struct iovec part = {buffer, n};
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(pin), at, &part, 1, e),
+       e);
+    REQUIRE(!memcmp(buffer, (const unsigned char *)expected + at, n));
+    at += n;
+  }
+  ps_namespace_read_close(pin);
+}
+static void body_budget_capacity(const char *path) {
+  for (int durable = 0; durable < 2; ++durable) {
+    ps_root_options o = {0};
+    ps_root *root = NULL;
+    ps_namespace *ns;
+    ps_namespace_body *b = NULL, *rejected = NULL;
+    ps_budget *peer = NULL;
+    ps_budget_plan floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+    ps_stats before, after;
+    ps_namespace_status status;
+    unsigned int kind;
+    uint64_t id;
+    lc_error e;
+    lc_error_init(&e);
+    o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+    o.storage.durable_sync = durable;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ns = acquire(root, "body-budget", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    ok(ps_namespace_body_begin(ns, sizeof(body), &b, &e), &e);
+    REQUIRE(
+        ps_namespace_parse_source_leaf(ps_namespace_body_leaf(b), &kind, &id));
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(before.budgets == 1 && before.reserved_entries > 0);
+    REQUIRE(ps_namespace_body_begin(ns, PS_MIB, &rejected, &e) ==
+                LC_ERR_INVALID &&
+            !rejected);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.entries == before.entries &&
+            after.journal_bytes == before.journal_bytes && after.budgets == 1);
+    for (uint64_t i = 0;; ++i) {
+      ps_key key = {99, i, PS_STATE};
+      ps_writer *writer = NULL;
+      ok(ps_begin(ps_root_space(root), NULL, key, &writer, &e), &e);
+      ok(ps_write(writer, body, PS_PAGE, &e), &e);
+      int rc = ps_publish(writer, NULL, &e);
+      ps_writer_close(writer);
+      if (rc != LC_OK) {
+        REQUIRE(rc == LC_ERR_INVALID);
+        clear(&e);
+        break;
+      }
+      REQUIRE(i < 256);
+    }
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    ok(ps_budget_open(ps_root_space(root), &floor, &peer, &e), &e);
+    struct iovec part = {body, sizeof(body)};
+    ok(lc_pouch_record_io_append(ps_namespace_body_output(b), &part, 1, &e),
+       &e);
+    ok(ps_namespace_body_commit(b, &e), &e);
+    ps_namespace_body_close(b);
+    ok(ps_budget_close(peer, &e), &e);
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.bound_bodies == 1 && status.active_segment == 1);
+    body_budget_read(ns, id, body, sizeof(body), &e);
+    count(ns, 1, &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(!after.budgets && !after.reserved_payload_bytes &&
+            !after.reserved_metadata_bytes && !after.reserved_entries);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "body-budget", 0, &e);
+    body_budget_read(ns, id, body, sizeof(body), &e);
+    count(ns, 1, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
+static void body_budget_faults(const char *path) {
+  model m = {0};
+  m.live = malloc(PS_MIB);
+  m.stable = malloc(PS_MIB);
+  REQUIRE(m.live && m.stable);
+  ps_io io = {&m, rd, wr, sync_file, reserve, NULL};
+  ps_root_options options = {0};
+  options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
+  options.storage.io = &io;
+  lc_error e;
+  lc_error_init(&e);
+  for (int durable = 0; durable < 2; ++durable)
+    for (int kind = 0; kind < 2; ++kind) {
+      size_t operations = 0;
+      for (size_t cut = 0; cut <= operations; ++cut) {
+        memset(m.live, 0, PS_MIB);
+        memset(m.stable, 0, PS_MIB);
+        m.calls = m.fail = 0;
+        m.torn = kind ? 0 : 2;
+        ps_root *root = NULL;
+        options.storage.durable_sync = durable;
+        ok(ps_root_open(path, 1, &options, &root, &e), &e);
+        ps_namespace *ns = acquire(root, "body-budget", 1, &e);
+        ok(append(root, ns, 1, 0, 31, &e), &e);
+        ok(ps_checkpoint(ps_root_space(root), &e), &e);
+        ps_namespace_release(ns);
+        ok(ps_root_close(root, &e), &e);
+        ok(ps_root_open(path, 0, &options, &root, &e), &e);
+        ns = acquire(root, "body-budget", 0, &e);
+        ps_namespace_body *b = NULL;
+        unsigned int source_kind;
+        uint64_t id = 0;
+        m.calls = allocation = 0;
+        if (kind)
+          fail_allocation = cut ? cut : SIZE_MAX;
+        else
+          m.fail = cut;
+        int rc = ps_namespace_body_begin(ns, PS_CHUNK + 333, &b, &e);
+        if (rc == LC_OK) {
+          REQUIRE(ps_namespace_parse_source_leaf(ps_namespace_body_leaf(b),
+                                                 &source_kind, &id));
+          struct iovec part = {body, PS_CHUNK + 333};
+          rc = lc_pouch_record_io_append(ps_namespace_body_output(b), &part, 1,
+                                         &e);
+        }
+        if (rc == LC_OK)
+          rc = ps_namespace_body_commit(b, &e);
+        if (!cut)
+          operations = kind ? allocation : m.calls;
+        m.fail = fail_allocation = 0;
+        REQUIRE(cut ? rc != LC_OK : rc == LC_OK);
+        if (kind && rc != LC_OK)
+          REQUIRE(rc == LC_ERR_NOMEM);
+        clear(&e);
+        ps_namespace_body_close(b);
+        if (kind && rc != LC_OK) {
+          ok(ps_check(ps_root_space(root), &e), &e);
+          ps_namespace_body *retried = NULL;
+          ok(ps_namespace_body_begin(ns, 3, &retried, &e), &e);
+          ps_namespace_body_close(retried);
+        }
+        ps_stats physical;
+        ok(ps_status(ps_root_space(root), &physical, &e), &e);
+        REQUIRE(!physical.budgets && !physical.reserved_payload_bytes &&
+                !physical.reserved_metadata_bytes &&
+                !physical.reserved_entries);
+        ps_namespace_release(ns);
+        ok(ps_root_close(root, &e), &e);
+        crash(&m, path);
+        ok(ps_root_open(path, 0, &options, &root, &e), &e);
+        ns = acquire(root, "body-budget", 0, &e);
+        count(ns, 1, &e);
+        ps_namespace_status status;
+        ok(ps_namespace_status_get(ns, &status, &e), &e);
+        REQUIRE(status.bound_bodies <= 1);
+        if (rc == LC_OK)
+          REQUIRE(status.bound_bodies == 1);
+        if (kind && rc != LC_OK)
+          REQUIRE(!status.bound_bodies);
+        if (status.bound_bodies)
+          body_budget_read(ns, id, body, PS_CHUNK + 333, &e);
+        ok(ps_namespace_body_begin(ns, 3, &b, &e), &e);
+        struct iovec retry = {(void *)"abc", 3};
+        ok(lc_pouch_record_io_append(ps_namespace_body_output(b), &retry, 1,
+                                     &e),
+           &e);
+        ok(ps_namespace_body_commit(b, &e), &e);
+        ps_namespace_body_close(b);
+        ok(ps_checkpoint(ps_root_space(root), &e), &e);
+        ps_namespace_release(ns);
+        ok(ps_root_close(root, &e), &e);
+        REQUIRE(unlink(path) == 0);
+      }
+      REQUIRE(operations > 10);
+      printf("body budget failure cuts (durable=%d %s): %lu\n", durable,
+             kind ? "allocation" : "write/sync", (unsigned long)operations);
+    }
+  free(m.live);
+  free(m.stable);
+  lc_error_cleanup(&e);
+}
 static void bodies(const char *path) {
   lc_error e;
   lc_error_init(&e);
@@ -2111,6 +2302,10 @@ static void *worker(void *p) {
     snapshot_churn(r->path);
   else if (!strcmp(r->mode, "bodies"))
     bodies(r->path);
+  else if (!strcmp(r->mode, "body-budget"))
+    body_budget_capacity(r->path);
+  else if (!strcmp(r->mode, "body-budget-faults"))
+    body_budget_faults(r->path);
   else
     concurrency(r->path);
   return NULL;

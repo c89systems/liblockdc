@@ -8,12 +8,14 @@ struct ps_namespace_body {
   struct ps_namespace_data *data;
   ps_ns_resource *resource;
   ps_record_writer writer;
+  ps_budget *budget;
   uint64_t bytes;
   int attempted;
 };
 int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
                             ps_namespace_body **out, lc_error *e) {
   ps_namespace_body *b;
+  ps_budget_plan plan = {0};
   struct ps_namespace_data *d;
   uint64_t id;
   int rc;
@@ -40,15 +42,23 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
   }
   if (rc == LC_OK) {
     ps_ns_resource *r = b->resource;
+    rc = ps_budget_plan_stream(&plan, e);
+    if (rc == LC_OK)
+      rc = ps_budget_plan_catalog(&plan, strlen(r->leaf), e);
+    if (rc == LC_OK)
+      rc = ps_budget_plan_span(&plan, bytes, e);
+    if (rc == LC_OK)
+      rc = ps_budget_open(ns->root->space, &plan, &b->budget, e);
     r->binding.stream.owner = id;
     r->binding.stream.key = ns->identity.owner;
     r->binding.stream.kind = PS_STREAM;
-    rc = ps_stream_open(ns->root->space, NULL, r->binding.stream, 1, NULL, NULL,
-                        NULL, &r->stream, e);
+    if (rc == LC_OK)
+      rc = ps_stream_open(ns->root->space, b->budget, r->binding.stream, 1,
+                          NULL, NULL, NULL, &r->stream, e);
     if (rc == LC_OK)
       rc = ps_record_begin(r->stream, &b->writer, e);
     if (rc == LC_OK)
-      rc = ps_stream_reserve_exact(b->writer.writer, bytes, e);
+      rc = ps_stream_reserve_exact(b->writer.writer, b->budget, bytes, e);
   }
   if (rc == LC_OK)
     *out = b;
@@ -84,7 +94,7 @@ int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
     pthread_mutex_unlock(&b->data->mutex);
   }
   if (rc == LC_OK)
-    rc = ps_catalog_put(b->ns->root->space, NULL, b->ns->identity.owner,
+    rc = ps_catalog_put(b->ns->root->space, b->budget, b->ns->identity.owner,
                         PS_CATALOG_BODY, r->leaf, strlen(r->leaf), NULL,
                         r->binding.stream, &info.ref, &r->binding, e);
   if (rc == LC_OK) {
@@ -104,6 +114,7 @@ void ps_namespace_body_close(ps_namespace_body *b) {
       ps_stream_retire(b->resource->stream, NULL);
     ps_ns_resource_free(b->resource);
   }
+  ps_budget_close(b->budget, NULL);
   ps_namespace_release(b->ns);
   lc_free_with_allocator(NULL, b);
 }
@@ -313,7 +324,7 @@ int ps_namespace_snapshot_reserve(ps_namespace_snapshot *b, uint64_t bytes,
                                   lc_error *e) {
   if (!b || b->attempted || !b->writer.writer)
     return failure(e, "namespace snapshot is not open");
-  return ps_stream_reserve_exact(b->writer.writer, bytes, e);
+  return ps_stream_reserve_exact(b->writer.writer, NULL, bytes, e);
 }
 int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
   struct ps_namespace_data *d;

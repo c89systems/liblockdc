@@ -3025,6 +3025,143 @@ prior is the previous stage's frozen `pouch_space_compare-workspace-current`,
 SHA-256 `535221931ba552ba92a8e2d9f7518f6439046c4d0360748564283843d1c5af3f`.
 The previous workspace manifest also verifies unchanged.
 
+## Funded canonical grants and known body packs
+
+Canonical owned grants, explicit stream reservation and record reservation now
+accept the operation budget directly. A grant pins that handle through private
+preparation, charges its physical pages when taken, and retains its 88-byte
+descriptor and live-entry credits until installation. The final admission check
+spends the funded claim instead of trying to admit it again as foreground work.
+Peer checkpoints, repacking and payload pressure cannot remove those future
+credits. No allocator lock spans producer or preparation I/O.
+
+The preparation-pool optimization remains available. Additional zero preparation
+may borrow only unclaimed common space while preserving the maintenance floor;
+it cannot borrow another operation's claim or the original operation's remaining
+credits. Its spare pages enter the reusable clean pool only after synchronization.
+The physical grant charges its own pages, not those temporary spare pages.
+
+Typed helpers now compose new-head, catalog, routing and exact-span costs without
+physical-format arithmetic in the namespace coordinator. Successful composition
+uses scalar arithmetic and no workspace allocation. Failed composition leaves
+the plan unchanged and uses ordinary error reporting. For an exact fresh span,
+the conservative bound allows every grant to fragment down to one 4 KiB page,
+including its 64-byte identity header. It reserves one descriptor/entry per
+possible page without creating a capacity-sized array. Existing grants can reduce
+actual spending. Ordinary geometric over-reservation needs additional allowance;
+the span helper funds `ps_stream_reserve_exact`. A cached stream retains no
+budget: further automatic growth still uses ordinary admission.
+
+A measured body-pack build now admits its complete head, exact payload span,
+future grant descriptors and final catalog binding before creating the stream.
+The builder holds that ordinary claim through production and publication and
+releases it after abort/close. It preserves the standing maintenance floor.
+This completes admission for a known body pack; it does not yet fund its parent
+compaction's earlier rotation, metadata snapshot, head selection or reclamation.
+Automatic append/delete admission and a bounded maintenance-work policy for
+accepted 1 MiB keys remain required. Neither persisted format nor installed ABI
+changes in this stage.
+
+### Correctness and failure evidence
+
+The grant fixtures reject undersized payload, descriptor and entry quotas,
+foreign-container claims and invalid grant bases without allocation/publication.
+Planner tests cover composition, zero spans, bounds and atomic overflow failure.
+At fixed 1/3 MiB capacities, both sync policies complete a 98,321-byte exact span
+and catalog publication after peers exhaust foreground capacity and claim the
+16 KiB floor. The fragmented profile requires more than ten grants and verifies
+all bytes after populated reopen. A held-I/O grant keeps its descriptor/entry
+credits visible while peers publish 512 entries, repack, fill and checkpoint.
+Close rejects that in-flight budget, and the grant then completes successfully.
+
+The body fixture reserves a 65,537-byte pack, rejects a further oversized build
+before creating its stream, then lets peers fill the store and claim the floor.
+The admitted pack must still publish its binding and remain readable after
+reopen, while the namespace's earlier canonical record stays unchanged.
+Temporarily removing the budget from the final catalog call makes publication
+fail under this pressure; restoring it passes.
+
+Failure sweeps cover **204 funded grant cuts** (164 write/sync, 40 allocation)
+across fallback/native zero preparation and both sync policies, plus **187 body
+build cuts** (87 write/sync, 100 allocation): **391 cuts**. They exercise partial
+preparation, header/publication/torn writes, seals and catalog publication,
+old-prefix preservation, uncertain recovery and continued operation. Healthy
+allocation failures additionally admit another reservation/private build on the
+same open owner before close; populated reopen and subsequent publication remain
+checked separately.
+
+The implementation passes **34 affected Debug ASan/UBSan groups** in 247.31 s,
+**34 GNU release groups** in 239.94 s, **34 musl release groups** in 231.34 s and
+**23 ThreadSanitizer groups** in 222.87 s. After adding the same-owner retry
+assertions, the two fault groups pass again in Debug/GNU/musl/TSAN in
+17.77/15.29/15.99/42.16 s. Four final Memcheck groups complete **119,213
+allocations and frees**, with zero live blocks, errors or suppressions. Debug
+retains the established 128 KiB worker policy and musl uses its native default.
+
+Logs under `build/pouch-space-grant-budget/` include `debug-tests.log`,
+`gnu-tests.log`, `musl-tests.log`, `tsan-tests.log`, captured `*-test-output.log`,
+the final `*-retry-tests.log`/`*-retry-output.log` runs and four `memcheck-*.log`
+pairs. `negative-tests.log` preserves the removed catalog-budget regression.
+Changed-line formatting and local documentation links verify.
+
+### Matched forced-compaction performance
+
+The 80 serial GNU release runs use five alternating-order samples of
+current/prior container and current/prior multifile. Each writes 512 plaintext
+1 KiB states over two PUT rounds, then forces one covered prefix per namespace.
+Both backends use an 8 MiB segment target, disabled throttling and completed
+reclamation. One or four writer threads prepare one or four namespaces;
+**the compaction phase visits those namespaces serially**, not as concurrent
+compactors. Cache is retained. Every run verifies values after compaction and
+reopen; container runs audit one fixed 10 MiB file with no sidecars. This does not
+measure emergency admission latency or establish complete-at-capacity compaction.
+Medians are ms; C denotes container and MF denotes multifile.
+
+| Root policy | Namespaces | Current C compact | Prior C compact | Current MF compact | Prior MF compact | Current C CPU | Prior C CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 50.468 | 46.559 | 49.993 | 48.294 | 5.952 | 5.481 |
+| NoSync | 4 | 126.511 | 140.885 | 144.228 | 155.600 | 9.976 | 9.649 |
+| Durable | 1 | 40.216 | 44.518 | 61.672 | 49.080 | 6.236 | 6.551 |
+| Durable | 4 | 154.768 | 151.413 | 162.741 | 185.369 | 12.182 | 10.915 |
+
+Current/prior container compaction ranges overlap in every fixture. NoSync
+one-namespace median rises about 8%, with ranges 43.764–63.766 versus
+38.205–55.398 ms and overlapping CPU ranges. Four-namespace durable median rises
+about 2%; its CPU medians rise about 12%, with ranges 9.576–14.516 versus
+9.287–15.259 ms. Other container wall medians decrease. Multifile durable
+one-namespace time also varies substantially between control builds, with sync
+medians 49.466 versus 34.262 ms. These samples do not isolate a timing cause or
+establish that earlier NoSync, checksum/read or reopened-projection deficits are
+resolved.
+
+Current/prior container compaction I/O matches exactly in every run: **990,392
+bytes and 250 writes/626 reads** for one namespace; **1,025,532 bytes and
+355 writes/645 reads** for four. The container retains 15/60 compaction barriers
+under NoSync and 18/72 under durable roots, versus multifile 10/40 in either
+policy. Claims introduce no additional measured I/O or barriers. Current MF
+compaction writes median 1,092,930/1,095,216 bytes. Container time remains largely
+sync time; root NoSync policy does not remove structural compaction barriers.
+
+Post-compaction ready includes root open plus first verification/projection load.
+The current fixture benefits from its published compacted snapshot; it is distinct
+from the earlier ordinary-metadata reopened-projection measurements.
+
+| Root policy | Namespaces | Current C ready | Prior C ready | Current MF ready | Prior MF ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 9.549 | 7.342 | 14.339 | 14.513 |
+| NoSync | 4 | 8.079 | 8.368 | 14.180 | 14.737 |
+| Durable | 1 | 7.705 | 9.618 | 14.839 | 14.211 |
+| Durable | 4 | 10.739 | 8.796 | 15.354 | 17.529 |
+
+Raw logs are `build/pouch-space-grant-budget/compaction-paired/`, with runner
+`compaction-paired.sh`, `compaction-results.json` and `compaction-benchmark.log`.
+The **85-artifact** `compaction-artifacts.sha256` manifest verifies, as does the
+previous budget-stage metadata manifest. Frozen current executable
+`pouch_space_compare-current` has SHA-256
+`9681ddeafe57c4dfbeb43cca1cabcb08d1ab581e18e43d825e349bb538a13711`;
+prior is `build/pouch-space-budget/pouch_space_compare-current`, SHA-256
+`e2e306e94836895a95f9166eb2d8e6995b6b765790264fabeffbe1fe4fc211a5`.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -3047,8 +3184,10 @@ The checkpoint-only pool and dense fallback now preserve metadata progress after
 foreground exhaustion, with final capacity/recovery/race/memory checks above.
 Volatile capacity claims and explicit rotation now join that foundation, with
 funded-writer, quota rollback, concurrency and matched performance evidence above.
-The next work must carry budgets through canonical grant spending and complete
-append/delete/compaction admission, protect bounded maintenance work for admitted
+Funded canonical grants, typed planning and complete known body-pack admission
+now join those claims, with same-owner retry, capacity, failure and forced-compaction
+comparison evidence above. The next work must carry budgets through complete
+append/delete/snapshot/compaction admission, protect bounded maintenance work for admitted
 key sizes, and close whole-operation maintenance admission at capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
