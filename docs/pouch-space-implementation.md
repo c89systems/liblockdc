@@ -1133,6 +1133,80 @@ record every configuration, ranges, CPU, workload limits and frozen input
 identity. These measurements cover SDK reads/scans over canonical seeded data;
 they do not price the remaining public leased-write integration.
 
+## Recovery cleanup write bounds
+
+Physical reopen now leaves already-zero recovery bytes alone. Recovery already
+holds the complete journal image and both root headers. It finds the first and
+last nonzero byte of the rejected suffix and zeroes that complete span. Zero
+gaps and trailing zero bytes need no write. A nonzero sibling root is still
+retired in full; an already-zero sibling needs no rewrite. Every rejected
+journal byte is therefore zero before sequence reuse, including stale valid
+events beyond an invalid or empty prefix.
+
+Recovery synchronizes rejected-tail and sibling-root retirement **before**
+writing the durable incarnation grant, then synchronizes that grant separately.
+Both barriers are mandatory under both policies, even when cleanup reads only
+zeros: an earlier failed recovery may have left those zeros in the file cache
+without retiring the stable stale events. Accepted-record verification, root
+selection, token fencing, poison/retry behavior and the persistent format are
+unchanged. This is a bounded write reduction with corrected recovery ordering,
+without a deferred recovery policy or storage-format commitment.
+
+The registered `pouch_space_reopen-sanitize` test covers both policies and six
+layouts: a clean journal, one distant dirty byte, a valid stale event after a
+zero gap, that event plus a distant dirty byte, a valid older sibling root and
+a corrupt sibling. Valid stale payloads remain on disk; a second reopen must
+not resurrect their events after the opening grant reuses a sequence. Every
+successful fixture checks the complete rejected suffix and sibling are zero,
+the committed value is intact, capacity is unchanged and returned incarnations
+remain fenced after a simulated loss of later writes. The 46 actual recovery
+write/sync failure sites are swept with lost writes and persisted torn prefixes:
+92 failure cases plus 12 successful baselines. Clean opens issue one 64-byte
+write and two syncs; the distant-byte fixture issues 65 total bytes. Wide dirty
+suffixes still receive their complete required cleanup.
+
+The separate `pouch_space_reopen-ordering` test places a rejected PUT or DELETE
+on the physical page after the next opening grant. Eight cases cover both
+policies and ordinary/cached-zero retries. They persist the grant independently,
+fail its final sync and lose other unsynced writes. Reopen must preserve the
+committed key and must not resurrect a rejected key. Rebuilding physical storage
+from `7ce0381` against this same test loses the committed key, so this ordering
+failure predates the cleanup optimization. Its retained failing log is
+`build/pouch-space-reopen-fenced/prior-ordering.log`.
+
+The cleanup test first failed against the previous implementation's clean-open
+I/O bound. An existing stream fault test initially rejected the lower call count;
+its fixed minimum is replaced with required observed failures in both opening
+and stream repair, retaining all dynamically counted fault sites and existing
+poison/cold-readback/retry assertions. After correcting retirement ordering,
+focused Debug checks pass seven groups (50.32 seconds); native GNU and musl
+each pass 34 affected groups (162.86 and 169.14 seconds). The SDK constructor
+sweeps 344 allocation sites and 168 actual I/O sites. The remaining 415 standard
+Debug groups pass in 3,373.80 seconds, completing the 422-group standard gate
+with the seven focused groups above. The summary and complete output are
+`debug-standard-remaining.log` and `debug-standard-details.log` in the final
+evidence directory below.
+
+Strict TSan passes both recovery tests, all four SDK modes and 40 concurrent
+SDK comparisons using fully instrumented OpenSSL, no suppressions and
+`halt_on_error=1`. Memcheck passes all six modes with 367,397 allocations and
+matching frees, zero live heap, errors or suppressions. Final logs, exact
+scripts and detailed reports are retained under
+`build/pouch-space-reopen-fenced/`, including `debug-focused-details.log`,
+`gnu-test-details.log`, `musl-test-details.log`, `tsan/` and `memcheck/`.
+Earlier cleanup-bound failures and the isolated stream-repair pass remain under
+`build/pouch-space-reopen/`. Formatting and whitespace checks pass.
+
+The [matched recovery comparison](pouch-space-experiment.md#avoiding-clean-recovery-rewrites)
+retains all 240 verified trials of the corrected protocol. Durable readiness
+medians improve 25.6–59.5%; six of eight before/after range pairs are disjoint.
+NoSync results remain mixed with overlapping ranges. All 16 warm-workload
+range pairs overlap. Separate traces verify that clean reopen uses one
+64-byte write and two syncs, compared with three writes/130,168 bytes and
+one sync in the prior implementation.
+Neither this change nor those measurements settle the standing maintenance
+capacity decision or complete the remaining typed public owners.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and

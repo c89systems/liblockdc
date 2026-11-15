@@ -204,6 +204,12 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_budget pouch_space_budget-capacity PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
+  add_test(NAME pouch_space_reopen-sanitize COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-sanitize)
+  set_tests_properties(pouch_space_reopen-sanitize PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  add_test(NAME pouch_space_reopen-ordering COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-ordering)
+  set_tests_properties(pouch_space_reopen-ordering PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
   add_test(NAME pouch_space_metadata-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity)
   add_test(NAME pouch_space_metadata-capacity-faults COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity-faults)

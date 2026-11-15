@@ -1651,7 +1651,7 @@ static int recover(ps_space *s, lc_error *error) {
   metadata_recovery recovery;
   ps_entry *p = NULL, *old;
   struct stat st;
-  size_t cursor = 0, bytes, i;
+  size_t cursor = 0, bytes, i, first, last;
   int a, b, event, rc;
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
@@ -1820,16 +1820,28 @@ static int recover(ps_space *s, lc_error *error) {
   s->journal = cursor;
   /* Clear all of the rejected tail, not only its first record: subsequent
    * equal-sized appends must never resurrect a stale suffix with reused seqs.
+   * The exact journal image is already in memory. Leave known-zero bytes
+   * alone so a clean reopen does not dirty the entire journal for its grant.
    */
-  memset(wire + cursor, 0, PS_JOURNAL - cursor);
-  rc = transfer(s, wire + cursor, PS_JOURNAL - cursor, JOURNAL_OFFSET + cursor,
-                1, error);
-  if (rc != LC_OK)
-    goto done;
-  rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
-                error);
-  if (rc != LC_OK)
-    goto done;
+  first = cursor;
+  last = PS_JOURNAL;
+  while (first < last && !wire[first])
+    ++first;
+  while (last > first && !wire[last - 1])
+    --last;
+  if (first < last) {
+    memset(wire + first, 0, last - first);
+    rc = transfer(s, wire + first, last - first, JOURNAL_OFFSET + first, 1,
+                  error);
+    if (rc != LC_OK)
+      goto done;
+  }
+  if (memcmp(roots + (1 - s->root) * PS_ROOT_BYTES, zero, sizeof(zero))) {
+    rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
+                  error);
+    if (rc != LC_OK)
+      goto done;
+  }
   /* Replay verifies every accepted PUT body, including superseded versions.
    * Reopening must preserve that ownership until a new checkpoint retires the
    * journal; otherwise reuse can make the next replay discard a durable tail.
@@ -1842,6 +1854,13 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
+  /* The grant reuses rejected journal sequences. Stabilize their retirement
+   * before that valid event can reach storage, including an apparently clean
+   * retry whose zeros came from an earlier failed recovery's file cache.
+   * The final barrier below separately fences the new incarnation range. */
+  rc = sync_file(s, error);
+  if (rc != LC_OK)
+    goto done;
   __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
   rc = grant_tokens(s, error);
   if (rc == LC_OK)

@@ -4361,3 +4361,130 @@ The executable is `pouch_space_compare-sdk`, SHA-256
 Its source is `548a7fa` plus the retained `sdk-source.patch`, SHA-256
 `33b97f8aee8b90e2db761e1859d52ad79dfbe34861b25f63b0a76005b6d969d8`;
 documentation edits after measurement do not affect these executable inputs.
+
+## Avoiding clean recovery rewrites
+
+The preceding SDK comparison exposed slow container reopen readiness. A syscall
+trace found that even a clean journal and already retired sibling root were
+rewritten before the incarnation grant and sync. Recovery now scans its
+already-read journal image and writes only the span containing nonzero rejected
+bytes. It still clears every rejected byte before sequence reuse and retires
+any nonzero sibling header.
+
+The final implementation also corrects an ordering failure reproduced against
+the prior physical implementation from `7ce0381`: cleanup retirement must
+synchronize before the opening grant can independently reach storage. A second
+barrier fences the new incarnation range. Both barriers are required even on
+a retry that reads cached zeros from an earlier failed recovery. The
+[recovery contract and failure tests](pouch-space-implementation.md#recovery-cleanup-write-bounds)
+cover page-separated stale PUT/DELETE events, both policies and failed-sync
+retries. The persistent format is unchanged.
+
+Separate syscall traces of the one-worker SDK get fixture observe the following
+reopen work. Each fixture has 128 one-KiB bodies after two PUT rounds. These
+traces establish I/O counts; their timings are excluded from matched measurements.
+
+| Policy | Prior C writes | Prior C bytes | New C writes | New C bytes | Prior C syncs | New C syncs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 3 | 130168 | 1 | 64 | 1 | 2 |
+| Durable | 3 | 130168 | 1 | 64 | 1 | 2 |
+
+The removed writes are 130,024 already-zero journal bytes and an already-zero
+80-byte sibling header. The 64-byte incarnation grant remains. Dirty recovery
+fixtures retain full required cleanup. Skipping only the first invalid record
+would leave later valid stale events eligible for reused sequences.
+
+The final matched experiment runs 240 trials: four workloads, three engines,
+both policies, one/four workers and five samples. Each engine uses the same
+total 128 keys, one-KiB bodies, two seed rounds and 4 KiB producer chunks.
+Engine and workload order alternate between samples. New C and current MF
+use the same frozen GNU release ELF; prior C uses the frozen SDK executable
+from the preceding section. Every trial verifies data, and every container
+remains one 10 MiB file. All samples and outliers are retained.
+
+These results replace the provisional measurements under
+`build/pouch-space-reopen/`, which preceded the corrected retirement barrier.
+Those earlier timing and barrier claims do not describe the final protocol.
+
+Readiness below is reopen plus the first complete read phase, in median
+[minimum–maximum] milliseconds. Reopen creates a new logical owner without
+dropping host OS caches. Canonical state/staged readback and SDK reads/scans
+retain their separate contracts; compare results within each workload.
+
+| Policy | Workers | Workload | New C | Prior C | Current MF |
+| --- | ---: | --- | ---: | ---: | ---: |
+| NoSync | 1 | state PUT | 13.193 [9.900–86.915] | 10.312 [8.638–13.884] | 4.368 [3.763–7.028] |
+| NoSync | 1 | stage/publish | 12.999 [12.178–15.669] | 14.513 [11.718–16.909] | 9.983 [7.047–13.828] |
+| NoSync | 1 | SDK get | 11.285 [10.849–14.287] | 10.165 [8.438–12.950] | 1.423 [1.178–1.440] |
+| NoSync | 1 | SDK key scan | 10.130 [8.975–13.430] | 10.545 [8.799–12.910] | 1.094 [0.837–1.136] |
+| NoSync | 4 | state PUT | 11.283 [9.731–16.559] | 9.460 [8.281–24.232] | 5.430 [4.905–6.364] |
+| NoSync | 4 | stage/publish | 13.815 [13.529–16.240] | 14.544 [12.770–17.408] | 8.841 [8.054–11.985] |
+| NoSync | 4 | SDK get | 8.061 [7.666–16.743] | 7.296 [6.075–8.291] | 1.479 [1.340–2.357] |
+| NoSync | 4 | SDK key scan | 8.361 [7.565–10.317] | 7.288 [6.871–7.799] | 1.129 [0.993–1.885] |
+| Durable | 1 | state PUT | 3.561 [3.347–3.777] | 8.107 [6.457–14.488] | 4.942 [4.521–7.355] |
+| Durable | 1 | stage/publish | 7.808 [5.736–11.732] | 10.489 [9.223–11.248] | 7.807 [6.762–8.479] |
+| Durable | 1 | SDK get | 3.437 [3.360–4.308] | 7.583 [7.049–7.734] | 1.469 [1.198–1.612] |
+| Durable | 1 | SDK key scan | 4.133 [3.237–5.442] | 7.005 [6.348–8.322] | 1.007 [0.960–1.273] |
+| Durable | 4 | state PUT | 3.893 [3.561–5.048] | 7.879 [7.323–13.964] | 5.465 [4.453–6.985] |
+| Durable | 4 | stage/publish | 6.985 [6.053–8.830] | 10.805 [9.488–12.685] | 9.649 [7.021–12.033] |
+| Durable | 4 | SDK get | 2.575 [2.236–7.718] | 6.030 [5.628–7.003] | 1.451 [1.418–1.888] |
+| Durable | 4 | SDK key scan | 2.439 [2.236–2.613] | 6.024 [5.110–7.795] | 1.448 [1.052–1.759] |
+
+All eight Durable readiness medians fall, by 25.6–59.5%; six before/after
+range pairs are disjoint. The one-worker staged and four-worker SDK get ranges
+overlap. NoSync readiness is mixed: medians range from 10.4% lower to 27.9%
+higher, and all eight before/after range pairs overlap. The one-worker state
+case retains an 86.915 ms outlier. NoSync recovery still synchronizes pending
+writes before grant publication; these measurements do not isolate that cost.
+
+Durable SDK readiness remains slower than current multifile storage:
+2.439–4.133 ms versus 1.007–1.469 ms. NoSync SDK readiness also remains slower.
+This optimization reduces avoidable cleanup writes while preserving required
+ordering; it does not settle the remaining readiness gap.
+
+Warm workload elapsed time follows. State/staged rows time their mutation
+phase; SDK rows time the public read phase over canonically seeded records.
+SDK seed timings do not price public leased writes. All entries are median
+[minimum–maximum] milliseconds.
+
+| Policy | Workers | Workload | New C | Prior C | Current MF |
+| --- | ---: | --- | ---: | ---: | ---: |
+| NoSync | 1 | state PUT | 8.209 [6.909–10.201] | 8.796 [7.059–27.642] | 13.680 [11.587–31.932] |
+| NoSync | 1 | stage/publish | 7.990 [7.482–10.962] | 9.482 [7.964–11.494] | 15.875 [12.150–18.502] |
+| NoSync | 1 | SDK get | 0.595 [0.520–0.826] | 0.733 [0.596–1.780] | 0.562 [0.533–0.601] |
+| NoSync | 1 | SDK key scan | 0.289 [0.207–0.310] | 0.319 [0.217–3.178] | 0.256 [0.210–0.317] |
+| NoSync | 4 | state PUT | 7.026 [5.690–7.718] | 6.460 [6.174–7.425] | 15.812 [12.054–25.440] |
+| NoSync | 4 | stage/publish | 7.071 [6.935–7.962] | 7.750 [6.837–9.178] | 13.333 [11.855–16.017] |
+| NoSync | 4 | SDK get | 0.421 [0.345–0.519] | 0.454 [0.397–0.617] | 0.596 [0.533–0.812] |
+| NoSync | 4 | SDK key scan | 0.296 [0.201–0.305] | 0.251 [0.210–0.350] | 0.211 [0.197–0.281] |
+| Durable | 1 | state PUT | 732.747 [476.781–839.608] | 712.926 [574.716–789.483] | 1170.287 [1020.881–1204.301] |
+| Durable | 1 | stage/publish | 978.228 [918.810–1331.156] | 955.144 [866.288–1381.996] | 2145.577 [2041.766–2481.283] |
+| Durable | 1 | SDK get | 0.695 [0.544–0.887] | 0.694 [0.624–0.853] | 0.648 [0.563–0.722] |
+| Durable | 1 | SDK key scan | 0.255 [0.210–0.277] | 0.275 [0.225–0.397] | 0.234 [0.211–0.316] |
+| Durable | 4 | state PUT | 556.426 [376.857–726.204] | 627.315 [573.023–749.122] | 811.711 [742.895–871.401] |
+| Durable | 4 | stage/publish | 876.512 [750.406–1134.530] | 918.325 [774.111–977.882] | 1529.611 [1407.387–1703.929] |
+| Durable | 4 | SDK get | 0.518 [0.414–0.593] | 0.606 [0.485–0.672] | 0.589 [0.535–0.661] |
+| Durable | 4 | SDK key scan | 0.333 [0.251–0.368] | 0.388 [0.318–0.505] | 0.335 [0.228–0.450] |
+
+All 16 new/prior warm elapsed-range pairs overlap. Single-worker write-phase
+I/O is identical between container revisions in every sample: ordinary PUTs
+(and SDK seed PUTs) use 275 writes/405,851 bytes and two NoSync or 259 Durable
+barriers; staged PUT/publication uses 531 writes/593,899 bytes and two NoSync
+or 515 Durable barriers. The additional barrier belongs to reopen, outside
+that mutation phase. Four-worker coalescing remains scheduling-dependent.
+The change introduces no writer queue or lock-policy change.
+
+Evidence is retained under `build/pouch-space-reopen-fenced/`:
+`perf-paired.sh`, all 240 `paired/` logs, `perf-summary.pl` and
+`perf-results.json`. Raw results retain CPU, I/O, sync counts, RSS, storage
+accounting and all warm/cold timings. Four `*.strace` files and
+`trace-summary.pl`/`trace-results.json` validate the separate reopen I/O
+observation.
+
+The current executable is `pouch_space_compare-fenced`, SHA-256
+`4654b477fea909e75d33ce72b04f6011d16cc6ddbde4f9ca67ae7c53d5b000c6`.
+Its source is `7ce0381` plus `fenced-source.patch`, SHA-256
+`a3b18f57f3ed97343798345cc80f261c48e4c5f90ff3d3131050f7a63d67f361`.
+Prior C is the preceding section's `pouch_space_compare-sdk`, SHA-256
+`0e9b5023186afabf06ec99f4be9c1dc9ad2def36b5e9ec6e317ee2678a1b518d`.
+Subsequent documentation edits do not change these executable inputs.
