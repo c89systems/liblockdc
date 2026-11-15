@@ -624,6 +624,49 @@ protection, and prove immediate, reopened and compacted readback for states and
 objects. The scope change does not alter those ordering rules; its deletion
 fixture retains the deleted key and performs later writes on a different key.
 
+### Proposed key lifetime ordering: decision pending
+
+The current `45da71c` GNU libraries reproduce the same failure in both backends
+under both root policies. The unchanged probe is rebuilt and retained under
+`build/pouch-space-key-recreation/`, with `build-probe.sh` and
+`{container,multifile}-{0,1}.log`. Recreation returns version 1/index 3, but both
+immediate and reopened reads report absence. No repair is implemented here.
+
+The recommendation is a durable, internal per-key lifetime identity. Use the
+namespace index sequence of the body creation as a `uint64_t` lifetime value;
+the first body after missing, tombstoned or metadata-only state starts a fresh
+lifetime while retaining the specified public generation behavior. Ordinary
+body updates, metadata overlays and deletion retain that identity. A placeholder
+before the first body has lifetime zero. Metadata after deletion must retain the
+previous lifetime until a new body starts another one.
+
+Replay first compares lifetimes. Within one lifetime, preserve the existing
+payload-generation ordering and equal-generation index tie-breaker; metadata
+overlays remain ordered by index sequence. Carry the lifetime through canonical
+PUT/link/META/delete records, resident and captured projections, clean-close
+projections, snapshots and compaction. A link uses its destination key's lifetime
+while retaining the existing encoded payload context. Snapshotting only the
+current row must preserve its lifetime so an older, higher-generation record
+cannot displace a recreated value after replay. Index allocation and recovery
+must not reuse an identity while a recoverable reference can still retain it.
+
+This proposes another eight-byte scalar per affected canonical record and
+snapshot row, not a payload copy or separate journal. Encoding/decoding, exact
+size planners and corruption checks must change together. It is a persistence
+change affecting both backends, not a change authorized by the current scope
+implementation. It does not authorize existing-root conversion, compatibility
+parsing or a format-version increment. The alternative is a deliberate public
+contract change to keep generations increasing across deletion; that would
+change the documented generation-1 behavior and its dependent CAS semantics.
+
+Acceptance must prove state/object recreation immediately, after reopen, after
+repeated deletion/recreation, and after compaction with the old tombstone gone.
+Include older-lifetime payloads and deletes with higher public generations,
+same-lifetime stale/equal generations, metadata-only lease transitions, staged
+promotion, pinned old readers, both policies/all codecs, and allocation/I/O/torn
+write failures. Existing stale-generation and independent metadata ordering
+tests must remain valid. Select the persistence/behavior policy before coding.
+
 ## Standing maintenance capacity: decision pending
 
 The existing joint claim protects a particular admitted operation. A standing
