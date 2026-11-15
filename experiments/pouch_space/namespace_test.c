@@ -109,6 +109,7 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
   request.payload_context = "namespace-test";
   request.version = version;
   request.index_seq = version;
+  request.lifetime = 1;
   request.record_type = 1;
   int rc =
       ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, &append, e);
@@ -1037,6 +1038,7 @@ static void reservation(const char *path) {
     request.content_type = "application/test";
     request.payload_context = "namespace-test";
     request.version = request.index_seq = 3;
+    request.lifetime = 1;
     request.record_type = 1;
     source.pub.impl = &source;
     source.pub.read = pull;
@@ -1441,6 +1443,7 @@ static int snapshot_record_to(ps_root *root, lc_pouch_record_io output,
   request.content_type = "application/test";
   request.payload_context = "namespace-test";
   request.version = request.index_seq = version;
+  request.lifetime = 1;
   request.record_type = 1;
   int rc =
       lc_pouch_state_record_append(&allocator, ps_root_crypto(root), output,
@@ -2718,6 +2721,7 @@ static int append_known_record(ps_root *root, ps_namespace_append *a,
   request.content_type = "application/test";
   request.payload_context = "namespace-test";
   request.version = request.index_seq = version;
+  request.lifetime = 1;
   request.record_type = 1;
   source.pub.impl = &source;
   source.pub.read = pull;

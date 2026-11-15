@@ -371,6 +371,7 @@ static int stream_write_one(worker *w, size_t id, lc_source *source,
   request.record_type = 1;
   request.version = w->round + 1;
   request.index_seq = (lc_pouch_generation)(w->round * c->rows + id + 1);
+  request.lifetime = id + 1;
   request.updated_at_unix = (lc_pouch_unix_seconds)time(NULL);
   request.payload_context =
       lc_pouch_state_crypto_context(&allocator, ns, name, request.version, 1);

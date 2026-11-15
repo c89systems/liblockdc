@@ -196,6 +196,7 @@ static lc_pouch_state_entry request(void) {
   r.record_type = 1;
   r.version = 17;
   r.index_seq = 31;
+  r.lifetime = 13;
   r.updated_at_unix = 1770000000;
   r.retention = -3600;
   r.has_query_hidden = 1;
@@ -219,6 +220,7 @@ static void metadata(const lc_pouch_state_entry *r,
   REQUIRE(!r->control && r->record_offset == r->payload_span.record_offset);
   REQUIRE(!strcmp(r->key, q->key) && !strcmp(r->content_type, q->content_type));
   REQUIRE(r->version == q->version && r->index_seq == q->index_seq);
+  REQUIRE(r->lifetime == q->lifetime);
   REQUIRE(r->record_type == q->record_type && r->retention == q->retention);
   REQUIRE(r->updated_at_unix == q->updated_at_unix && r->bytes == bytes);
   REQUIRE(r->has_query_hidden && r->query_hidden);
@@ -525,6 +527,74 @@ static void faults(const char *path) {
                                      &truncated, &e) == LC_ERR_PROTOCOL);
   REQUIRE(!found && decoded.key == NULL);
   clear(&e);
+  /* A torn/corrupt lifetime is never an incomplete tail and cannot replace
+   * an already decoded result. Both strict and repairable reads fail closed. */
+  unsigned char saved_lifetime[8], invalid_lifetime[8];
+  uint64_t lifetime_offset = 32 + strlen(q.key) + header.meta_len - 20;
+  REQUIRE(pread(fd, saved_lifetime, 8, (off_t)lifetime_offset) == 8);
+  ok(lc_pouch_state_record_read(underlying, &allocator, leaf, 0, end, 0, 0,
+                                NULL, &decoded, &next, &found, &truncated, &e),
+     &e);
+  char *prior_key = decoded.key;
+  memset(invalid_lifetime, 0xff, 8);
+  REQUIRE(pwrite(fd, invalid_lifetime, 8, (off_t)lifetime_offset) == 8);
+  for (int repair = 0; repair < 2; ++repair) {
+    REQUIRE(lc_pouch_state_record_read(underlying, &allocator, leaf, 0, end,
+                                       repair, 0, NULL, &decoded, &next, &found,
+                                       &truncated, &e) == LC_ERR_PROTOCOL);
+    REQUIRE(!found && !truncated && !next && decoded.key == prior_key);
+    metadata(&decoded, &q, 17);
+    clear(&e);
+  }
+  REQUIRE(pwrite(fd, saved_lifetime, 8, (off_t)lifetime_offset) == 8);
+  lc_pouch_state_entry_cleanup(&allocator, &decoded);
+  /* The terminal marker stays distinct from marker-shaped index/lifetime
+   * values, including when optional snapshot query trailers are appended. */
+  for (int marker = 0; marker < 2; ++marker) {
+    lc_pouch_state_entry shaped = q;
+    shaped.index_seq = UINT64_C(0x4c4353514c435351) + marker;
+    shaped.lifetime = UINT64_C(0x4c4353494c435351) + marker;
+    io = observing(&o, underlying);
+    s = source(0, &o);
+    s.pub.impl = &s;
+    REQUIRE(lseek(fd, (off_t)end, SEEK_SET) == (off_t)end);
+    ok(lc_pouch_state_record_append(&allocator, NULL, io, leaf, &shaped, &s.pub,
+                                    0, &decoded, &e),
+       &e);
+    metadata(&decoded, &shaped, 0);
+    uint64_t snapshot_start, snapshot_end;
+    lc_pouch_state_entry extended = {0};
+    decoded.has_query_index_seq = 1;
+    decoded.query_index_seq = UINT64_C(0x4c43535100000001);
+    ok(lc_pouch_record_io_tail(io, &snapshot_start, &e), &e);
+    ok(lc_pouch_state_record_write_snapshot(&allocator, io, leaf, &decoded,
+                                            NULL, NULL, 0, &e),
+       &e);
+    ok(lc_pouch_record_io_tail(io, &snapshot_end, &e), &e);
+    ok(lc_pouch_state_record_read(underlying, &allocator, leaf, snapshot_start,
+                                  snapshot_end, 0, 0, NULL, &extended, &next,
+                                  &found, &truncated, &e),
+       &e);
+    REQUIRE(found && !truncated && extended.lifetime == shaped.lifetime &&
+            extended.index_seq == shaped.index_seq &&
+            extended.has_query_index_seq &&
+            extended.query_index_seq == decoded.query_index_seq);
+    lc_pouch_state_entry_cleanup(&allocator, &extended);
+    lc_pouch_state_entry_cleanup(&allocator, &decoded);
+    underlying.ops->discard(underlying.context, end);
+  }
+  for (int bad = 0; bad < 2; ++bad) {
+    lc_pouch_state_entry invalid = q;
+    invalid.lifetime = bad ? invalid.index_seq + 1 : 0;
+    io = observing(&o, underlying);
+    s = source(17, &o);
+    s.pub.impl = &s;
+    REQUIRE(lc_pouch_state_record_append(&allocator, NULL, io, leaf, &invalid,
+                                         &s.pub, 0, &decoded,
+                                         &e) == LC_ERR_INVALID);
+    REQUIRE(!s.at && !o.calls && !o.written && !decoded.key);
+    clear(&e);
+  }
   /* Fault every byte-access operation and allocation in a real append. */
   for (int kind = 0; kind < 2; ++kind) {
     size_t calls = 0;
@@ -639,6 +709,7 @@ static void snapshot_fields(const lc_pouch_state_entry *r,
   REQUIRE(!strcmp(r->key, expected->key));
   REQUIRE(r->version == expected->version &&
           r->index_seq == expected->index_seq);
+  REQUIRE(r->lifetime == expected->lifetime);
   REQUIRE(r->has_query_index_seq &&
           r->query_index_seq == (expected->has_query_index_seq
                                      ? expected->query_index_seq
@@ -757,6 +828,7 @@ static void snapshot_records(const char *path, const char *key) {
             deleted.record_type = object ? 8 : 2;
             deleted.version = 22;
             deleted.index_seq = 43;
+            deleted.lifetime = 7;
             deleted.has_query_index_seq = 1;
             deleted.query_index_seq = 29;
             deleted.etag = "deleted-etag";
@@ -770,6 +842,7 @@ static void snapshot_records(const char *path, const char *key) {
             placeholder.control = 0;
             placeholder.version = 0;
             placeholder.index_seq = 45;
+            placeholder.lifetime = 0;
             placeholder.has_query_index_seq = 1;
             placeholder.query_index_seq = 0;
             placeholder.retention = 1770003600;
@@ -928,6 +1001,7 @@ static void snapshot_faults(const char *path) {
   deleted.key = "deleted";
   deleted.version = 22;
   deleted.index_seq = 43;
+  deleted.lifetime = 7;
   deleted.query_index_seq = 29;
   deleted.has_query_index_seq = 1;
   deleted.record_type = 2;
@@ -936,6 +1010,7 @@ static void snapshot_faults(const char *path) {
   placeholder.key = "metadata-only";
   placeholder.version = 0;
   placeholder.index_seq = 45;
+  placeholder.lifetime = 0;
   placeholder.query_index_seq = 0;
   placeholder.record_type = 4;
   placeholder.bytes = placeholder.cipher_bytes = 0;
@@ -1060,7 +1135,7 @@ static void snapshot_faults(const char *path) {
   REQUIRE(overlong != NULL);
   memset(overlong, 'k', 1048577);
   overlong[1048577] = 0;
-  for (int bad = 0; bad < 11; ++bad) {
+  for (int bad = 0; bad < 13; ++bad) {
     snapshot_reset(output_fd);
     observed o;
     lc_pouch_record_io output = observing(&o, underlying);
@@ -1090,6 +1165,10 @@ static void snapshot_faults(const char *path) {
       invalid.metadata = (unsigned char *)overlong;
       invalid.metadata_length = 1048577;
     }
+    if (bad == 11)
+      invalid.lifetime = invalid.index_seq + 1;
+    if (bad == 12)
+      invalid.lifetime = 0;
     REQUIRE(lc_pouch_state_record_write_snapshot(
                 &allocator, output, label, &invalid, &encoded.pub,
                 bad == 3 ? NULL : buffer, sizeof(buffer),

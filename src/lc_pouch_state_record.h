@@ -29,6 +29,9 @@ typedef struct lc_pouch_state_entry {
   size_t metadata_length;
   char *decision;
   lc_pouch_generation index_seq;
+  /* Namespace index of this key's first body in its current lifetime.
+   * Zero belongs to metadata-only placeholders before any body. */
+  uint64_t lifetime;
   /* HIGH_WATER persists public-query freshness independently of state.
    * Snapshots carry per-key query sequences; live records inherit them. */
   lc_pouch_generation query_index_seq;
@@ -75,19 +78,20 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
  * optional compression/encryption. No whole-body staging. Failure asks the
  * owner to discard its private append, possibly containing earlier records in
  * the same batch. This codec never commits or syncs the owner's stream.
- * The request supplies key, type, version, timestamp, retention, content type,
- * payload context, side metadata and query visibility. Other derived fields
- * are ignored. Only index_seq is encoded in a live record; query sequence
- * inheritance belongs to namespace replay. The crypto provider and record
- * owner must use the same allocator, as in normal Pouch ownership. */
+ * The request supplies key, type, version, lifetime, timestamp, retention,
+ * content type, payload context, side metadata and query visibility. Other
+ * derived fields are ignored. Live records encode index_seq and lifetime;
+ * query sequence inheritance belongs to namespace replay. The crypto provider
+ * and record owner must use the same allocator, as in normal Pouch ownership.
+ */
 int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
                                  lc_pouch_record_io, const char *leaf,
                                  const lc_pouch_state_entry *request,
                                  lc_source *, int disable_compression,
                                  lc_pouch_state_entry *result, lc_error *);
 
-/* Canonical snapshot bytes. Preserve resolved versions and both index
- * sequences; the owner supplies selection, history protection, commit and
+/* Canonical snapshot bytes. Preserve resolved versions, lifetimes and both
+ * index sequences; the owner supplies selection, history protection, commit and
  * durability. An absent per-key query sequence defaults to its index sequence.
  * NULL encoded writes a body reference, metadata-only placeholder or tombstone
  * without payload I/O. Otherwise copy exactly cipher_bytes from the borrowed

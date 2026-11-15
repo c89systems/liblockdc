@@ -3740,6 +3740,9 @@ acceptance remain open; normal public Pouch open still uses the multifile backen
 
 ## Deferred stream repair and reopen readiness
 
+This is the `8c7b75c` checkpoint; the later
+[lifetime repair and comparison](#durable-key-lifetimes) follows below.
+
 Opening an unsealed stream now validates its canonical prefix and admits readers
 without clearing unused suffix capacity. Newly accepted complete bytes enter
 root readiness, so explicit barriers, peer publications and checkpoints still
@@ -3867,3 +3870,190 @@ The stage retains both runners, `readiness-summary.pl`, initial `paired/` and
 manifest. Normal public Pouch remains multifile. Full integration, selected
 state/object lifetime repair, maintenance-capacity policy, shared-root operation
 and broader performance acceptance remain open.
+
+
+## Durable key lifetimes
+
+Generation-1 state/object recreation now remains visible immediately, after
+reopen and after compaction. Canonical records and snapshots carry the namespace
+index of the key's first body as a durable lifetime. Replay compares that
+identity before preserving the existing version/index ordering within it.
+Metadata-only state after deletion retains the old identity until another body
+starts a fresh one. Links use their destination key's lifetime and retain the
+encoded payload context. The mandatory common trailer is now
+`[uint64 lifetime][LCSI][uint64 index]` (20 bytes), with the distinct 12-byte
+query-index extension when needed. Controls/collection records use zero in the
+shared slot. Size planning and corruption validation change together. No extra
+payload copy, allocation, journal, writer queue or public ABI change is added.
+Recreate experimental fixtures from the preceding canonical metadata layout;
+existing-root conversion and compatibility parsing remain excluded.
+
+### Verification
+
+The complete Debug preset passes **365/365 checks**, including **313 unit
+groups**, in **1470.75 s**, with ASan/UBSan, 128 KiB glibc workers and the stack
+cache disabled. Native GNU release and musl each pass **20 focused groups** in
+**220.91 / 232.16 s**; musl uses default worker stacks. The 32-fixture lifetime
+matrix covers both backends, all four codecs, both policies and state/object
+classes, four recreations per fixture, metadata-only transitions, pre/post-create
+compaction, repeated reopen, both input paths and pinned old readers. Sixteen
+native fixtures also verify destination lifetime selection during staged commit
+and promotion, plus two compression-policy recodings. Each fixture checks two
+exhausted-index recovery/rejection attempts with query freshness preserved.
+
+Captured-prefix replay covers stale former-lifetime payloads, deletes and
+metadata after both full history and a snapshot containing only the recreated
+value. Same-lifetime stale/equal generations and independent metadata ordering
+remain valid. Codec tests round-trip lifetimes, reject invalid values before
+output, preserve prior decoded output on corrupt reads, and distinguish compact
+and extended trailers with marker-shaped scalar values. The dedicated
+recreation sweep passes **1,272 allocation/I/O/partial-write failure sites**,
+including retry and compaction after recovery. Metadata-only placeholders are
+checked through metadata reads; ordinary body reads retain their existing
+absent-body behavior.
+
+Strict ThreadSanitizer with the pinned instrumented OpenSSL passes **80
+concurrent comparisons plus eleven groups**, including lifetime faults, staging,
+codec concurrency, publication and maintenance. Four Memcheck runs complete
+**858,328 allocations and frees**, with zero live blocks, errors or suppressions.
+Evidence is under `build/pouch-space-key-lifetime/`: `debug-full.log`,
+`gnu-focused.log`, `musl-focused.log`, `tsan-lifetimes.log` and
+`memcheck-*.log`.
+
+### Matched writes, reads and compaction
+
+The final and frozen `8c7b75c` executables complete **720 verified trials**:
+five alternating-order samples, current/prior container/multifile engines,
+both policies, one/four namespace writers and nine profiles. Each uses 128
+one-KiB states and 4 KiB producer chunks. Writes run twice; deletion runs once.
+Metadata/deletion seed before closing/reopening their populated root, outside
+the measured mutation phase. Their reported total includes that reopen and the
+mutation. Read profiles measure their named read separately after writing;
+compaction measures its maintenance phase separately. Every container trial
+retains one reserved **10 MiB** file with zero persistent sidecars. Caches remain
+populated and device scheduling is not isolated. These small native fixtures
+establish comparisons here, not large-store acceptance.
+
+Median fresh-write milliseconds. C is container and M is multifile:
+
+| Policy | Writers | Ordinary C | Prior C | Ordinary M | Scoped C | Prior scoped C | Scoped M |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 6.793 | 6.837 | 10.440 | 14.510 | 13.616 | 17.927 |
+| NoSync | 4 | 7.257 | 7.054 | 15.813 | 16.753 | 20.145 | 21.533 |
+| Durable | 1 | 862.073 | 711.060 | 1230.798 | 22.184 | 19.848 | 22.417 |
+| Durable | 4 | 552.946 | 538.389 | 795.310 | 31.206 | 29.796 | 28.577 |
+
+Median populated reopen plus mutation milliseconds:
+
+| Profile | Policy | Writers | Container | Prior container | Multifile |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Metadata | NoSync | 1 | 22.105 | 21.030 | 25.914 |
+| Metadata | NoSync | 4 | 15.453 | 16.089 | 71.773 |
+| Metadata | Durable | 1 | 432.830 | 378.271 | 1076.657 |
+| Metadata | Durable | 4 | 308.377 | 327.579 | 584.863 |
+| Delete | NoSync | 1 | 11.936 | 11.710 | 21.238 |
+| Delete | NoSync | 4 | 11.543 | 13.194 | 51.195 |
+| Delete | Durable | 1 | 183.538 | 180.384 | 544.096 |
+| Delete | Durable | 4 | 138.573 | 139.619 | 316.812 |
+
+Median read milliseconds for the complete 128-row named access pattern:
+
+| Profile | Policy | Writers | Container | Prior container | Multifile |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Point | NoSync | 1 | 0.969 | 0.710 | 4.361 |
+| Point | NoSync | 4 | 0.605 | 0.487 | 1.451 |
+| Point | Durable | 1 | 0.690 | 0.683 | 3.872 |
+| Point | Durable | 4 | 0.563 | 0.429 | 1.835 |
+| Read-many | NoSync | 1 | 0.556 | 0.557 | 0.896 |
+| Read-many | NoSync | 4 | 0.324 | 0.363 | 0.503 |
+| Read-many | Durable | 1 | 0.635 | 0.650 | 1.157 |
+| Read-many | Durable | 4 | 0.334 | 0.395 | 0.662 |
+| Metadata scan | NoSync | 1 | 0.215 | 0.207 | 0.211 |
+| Metadata scan | NoSync | 4 | 0.215 | 0.198 | 0.205 |
+| Metadata scan | Durable | 1 | 0.230 | 0.204 | 0.200 |
+| Metadata scan | Durable | 4 | 0.272 | 0.294 | 0.192 |
+| Body scan | NoSync | 1 | 0.622 | 0.543 | 0.505 |
+| Body scan | NoSync | 4 | 0.348 | 0.363 | 0.435 |
+| Body scan | Durable | 1 | 0.555 | 0.585 | 0.620 |
+| Body scan | Durable | 4 | 0.480 | 0.390 | 0.663 |
+
+Median compaction milliseconds:
+
+| Policy | Writers | Container | Prior container | Multifile |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 41.025 | 38.026 | 47.702 |
+| NoSync | 4 | 123.728 | 123.388 | 148.593 |
+| Durable | 1 | 40.912 | 39.631 | 40.525 |
+| Durable | 4 | 138.421 | 147.856 | 169.756 |
+
+Median populated reopen-to-ready milliseconds for the scope profile:
+
+| Policy | Writers | Container | Prior container | Multifile |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 9.007 | 7.014 | 4.307 |
+| NoSync | 4 | 7.033 | 8.046 | 4.181 |
+| Durable | 1 | 7.751 | 6.976 | 4.010 |
+| Durable | 4 | 9.672 | 8.033 | 4.371 |
+
+The container remains faster than current multifile for ordinary writes,
+metadata/deletion, point reads and read-many in these medians. Scoped durable
+writes are close at one namespace and 9.2% slower at four. Metadata scans are
+slower in every current pair; the four-writer durable case is 0.272 / 0.192 ms.
+The single-writer NoSync body scan is also slower, 0.622 / 0.505 ms. Single-writer
+durable compaction is about even; other compaction medians favor the container.
+Reopen-to-ready remains slower than multifile. These read/maintenance limits
+leave complete performance acceptance open.
+
+All 36 container before/after ranges overlap for each profile's primary metric.
+Some medians nevertheless rise: ordinary single-writer durable writes are
+**862.073 / 711.060 ms**, with **584.622–1110.388 / 587.872–1280.997 ms** ranges;
+CPU medians are **29.290 / 29.238 ms**. Single-writer durable reopen/metadata is
+**432.830 / 378.271 ms**, with **410.238–455.304 / 340.418–415.808 ms** ranges.
+Four-writer durable point reads are **0.563 / 0.429 ms**, with **0.441–0.608 /
+0.335–0.548 ms** ranges. The samples do not establish a general performance win
+or exclude smaller regressions.
+
+The new field adds eight canonical bytes per record. Observed write-phase
+`syscall_written` for 256 ordinary/scoped writes increases by **2,048 bytes in
+the container** and **4,096 in multifile**: current container totals are
+405,851 / 409,140 bytes at one/four namespaces. Metadata's 256 records add
+2,048 bytes in either engine; 128 deletes add 1,024. No additional per-record
+barrier is introduced. Single-writer sync counts match the checkpoint; timing
+changes the coalescing of some four-writer groups (durable metadata has median
+133 / 131 container barriers). Compaction container barriers remain
+15 / 60 under NoSync and 18 / 72 under Durable at one/four namespaces;
+multifile has 10 / 40 under either policy.
+
+### Focused point-read follow-up
+
+The higher point-read medians prompted a separate **160 verified trials**:
+ten alternating-order samples, 128/1,024 rows, one/four writers, NoSync and all
+four current/prior engines. Each larger workload still fits one reserved
+10 MiB container. Median point-read milliseconds:
+
+| Rows | Writers | Container | Prior container | Multifile |
+| --- | ---: | ---: | ---: | ---: |
+| 128 | 1 | 0.659 | 0.660 | 3.709 |
+| 128 | 4 | 0.466 | 0.416 | 1.598 |
+| 1024 | 1 | 4.015 | 4.226 | 29.242 |
+| 1024 | 4 | 1.758 | 1.947 | 12.275 |
+
+All before/after ranges overlap in this follow-up too. The higher primary
+point-read medians (24–36.5% in three cases) vary across sizes/repeats:
+the 128-row single-writer result is flat; the four-writer median is still 12.2%
+higher. At 1,024 rows both container medians and CPU medians are lower than the
+checkpoint. Some multifile medians also rise. Smaller performance effects remain
+uncertain. Both series retain every trial.
+
+The current frozen ELF is
+`build/pouch-space-key-lifetime/pouch_space_compare-current`, SHA-256
+`43928cf31d5447fe1f4ff76ee49fa58aa7261cdc0aeff5fa41604a7fbf5a29fe`.
+The prior ELF is `build/pouch-space-readiness/pouch_space_compare-coordinated`,
+SHA-256 `437181b4e02373c2760d840392f9095746a3d4fd3d991258654d36ab24064b92`.
+The stage retains `lifetime-paired.sh`, `lifetime-summary.pl`, all 720
+`paired/` logs and `results.json`, plus `read-check.sh`,
+`read-check-summary.pl`, all 160 `read-check/` logs and
+`read-check-results.json`. The performance manifest verifies **888 artifacts**,
+including both executables and all inputs/results. Normal public Pouch remains
+multifile; protected maintenance capacity, remaining owners/shared-root
+integration and broader performance acceptance remain open.

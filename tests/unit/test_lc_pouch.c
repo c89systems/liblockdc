@@ -3926,7 +3926,7 @@ static void append_state_decision_record_with_index(
     lc_pouch_generation index_seq, int include_index_trailer) {
   lc_pouch_record_header record_header;
   unsigned char header[32];
-  unsigned char meta[19 + 128 + 12];
+  unsigned char meta[19 + 128 + 20];
   FILE *fp;
   size_t key_len;
   size_t etag_len;
@@ -3942,7 +3942,7 @@ static void append_state_decision_record_with_index(
     assert_string_equal(decision, "discarded");
     decision_code = 2U;
   }
-  meta_len = 19U + etag_len + (include_index_trailer ? 12U : 0U);
+  meta_len = 19U + etag_len + (include_index_trailer ? 20U : 0U);
   memset(&record_header, 0, sizeof(record_header));
   memset(header, 0, sizeof(header));
   memset(meta, 0, sizeof(meta));
@@ -3958,8 +3958,8 @@ static void append_state_decision_record_with_index(
   meta[18] = decision_code;
   memcpy(meta + 19, etag, etag_len);
   if (include_index_trailer) {
-    pouch_test_put32(meta + 19U + etag_len, 0x4c435349UL);
-    pouch_test_put64(meta + 23U + etag_len, (uint64_t)index_seq);
+    pouch_test_put32(meta + 27U + etag_len, 0x4c435349UL);
+    pouch_test_put64(meta + 31U + etag_len, (uint64_t)index_seq);
   }
   fp = fopen(path, "ab");
   assert_non_null(fp);

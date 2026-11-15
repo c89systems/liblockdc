@@ -626,7 +626,7 @@ readiness and broader backend acceptance remain open.
 
 ## Known canonical recreation defect
 
-A separate probe exposed an existing shared logical defect: PUT, DELETE, then
+A separate probe exposed a shared logical defect before this repair: PUT, DELETE, then
 PUT of the same key reports successful recreation at public version 1 and index
 sequence 3, while immediate and reopened reads still report absence. This
 reproduces in both the container and multifile implementation under both sync
@@ -634,22 +634,21 @@ policies, using GNU release libraries from before the scope change. The
 reproducer and its four logs are under `build/pouch-space-durable-scope/` as
 `recreation-probe.c` and `recreation-{container,multifile}-{0,1}.log`.
 
-The mutation writer resets the public generation after a tombstone, while
-`lc_pouch_state_entry_supersedes` rejects lower payload generations before
-considering the newer index sequence. The existing recreation fixture checked
-the mutation result but did not read the recreated body. Full acceptance must
-reconcile successful recreation with the documented stale-generation replay
-protection, and prove immediate, reopened and compacted readback for states and
-objects. The scope change does not alter those ordering rules; its deletion
-fixture retains the deleted key and performs later writes on a different key.
+The preceding mutation writer reset the public generation after a tombstone,
+while `lc_pouch_state_entry_supersedes` rejected lower payload generations
+before considering the newer index sequence. The earlier recreation fixture
+checked the mutation result but did not read the recreated body. The lifetime
+repair below reconciles generation-1 recreation with stale-generation replay
+protection and proves immediate, reopened and compacted state/object readback.
 
 ### Selected key lifetime ordering
 
-The current `45da71c` GNU libraries reproduce the same failure in both backends
+The `45da71c` GNU libraries reproduced the same failure in both backends
 under both root policies. The unchanged probe is rebuilt and retained under
 `build/pouch-space-key-recreation/`, with `build-probe.sh` and
 `{container,multifile}-{0,1}.log`. Recreation returns version 1/index 3, but both
-immediate and reopened reads report absence. No repair is implemented here.
+immediate and reopened reads report absence. Those logs retain the pre-repair
+counterexample; the selected lifetime implementation is now verified below.
 
 The selected design uses a durable, internal per-key lifetime identity. Use the
 namespace index sequence of the body creation as a `uint64_t` lifetime value;
@@ -673,7 +672,8 @@ The design adds another eight-byte scalar per affected canonical record and
 snapshot row. Encoding/decoding, exact size planners and corruption checks must
 change together. The user delegated the technical choice; preserving existing
 generation-1 and replay semantics through durable lifetimes is now selected and
-authorized for implementation in both backends. Implementation remains pending.
+authorized for implementation in both backends. It is now implemented through
+ordinary writes, metadata/deletes, staging, snapshots and native recoding.
 Existing-root conversion, compatibility parsing and a format-version increment
 remain outside this decision. No payload copy or separate journal is introduced.
 
@@ -708,8 +708,54 @@ Verification under `build/pouch-space-key-sequence/` passes the complete
 363-check Debug preset (311 unit groups), 38 GNU release groups, 14 native musl
 groups, five ThreadSanitizer groups with instrumented OpenSSL and three Memcheck
 runs with zero live blocks/errors/suppressions. The full Debug read sweeps
-exercise 4,228 allocation and 1,298 I/O failure sites. This prerequisite adds
-no record fields; durable key lifetime encoding and propagation remain pending.
+exercise 4,228 allocation and 1,298 I/O failure sites. That prerequisite added
+no record fields.
+
+Canonical metadata now ends with a mandatory 20-byte lifetime/index trailer:
+`[uint64 lifetime][LCSI][uint64 index]`. Snapshots and explicit query overlays
+append the existing distinct 12-byte `[LCSQ][uint64 query-index]` extension,
+giving 32 bytes in total. The terminal marker stays twelve bytes from the end,
+so marker-shaped scalar values cannot masquerade as another trailer form.
+The fixed 74-byte payload prefix and crypto binding/context remain unchanged.
+Controls and collection-owned records carry zero in the shared lifetime slot.
+Exact size planning includes the scalar. Mutable body admission rejects zero
+lifetimes; decoding rejects a lifetime beyond its record index and side fields
+overlapping the trailer. New body identities are assigned from the final
+reserved index before clearing PENDING. No payload copy, extra allocation,
+separate journal, writer queue, public API or shared-library ABI change is added.
+Existing-root conversion and compatibility parsing remain excluded; recreate
+experimental fixtures made with the preceding canonical metadata layout.
+
+The `lifetimes` group covers 32 fixtures across both backends, all four codecs,
+both policies and state/object classes. Each performs four recreations with
+metadata-only transitions, compaction before/after creation, repeated reopen,
+both input paths and pinned old readers. Sixteen native fixtures additionally
+prove staged updates retain the live destination lifetime, promotion into a
+deleted destination starts a fresh one, and two compression-policy recodings
+preserve state. Every fixture checks two exhausted-index recovery/rejection
+attempts without wraparound or query-generation changes. Captured-prefix tests
+apply stale former-lifetime PUT/DELETE/META records after both complete history
+and a snapshot containing only the recreated value. Existing same-lifetime
+version/index and independent metadata ordering remain intact.
+
+Codec tests retain lifetime values in live records and snapshots, distinguish
+zero placeholders from nonzero tombstones, exercise marker-shaped scalar values
+and reject invalid inputs before output. A corrupt lifetime fails both strict
+and repairable reads without replacing a prior decoded result. The dedicated
+`lifetime-faults` group passes 1,272 allocation/I/O/partial-write failure sites
+around recreation after compaction has removed the prior tombstone. Recovery
+retains either the metadata-only placeholder or the new generation-1 body;
+retry and another compaction/reopen must preserve the new value.
+
+The completed repair passes the full 365-check Debug preset (313 unit groups),
+20 GNU release and 20 native musl groups, 80 concurrent comparisons plus eleven
+strict ThreadSanitizer groups with instrumented OpenSSL, and four Memcheck runs
+with 858,328 allocations/frees and zero live blocks/errors/suppressions. Evidence
+is under `build/pouch-space-key-lifetime/`. The
+[720-trial comparison and focused read follow-up](pouch-space-experiment.md#durable-key-lifetimes)
+retain all samples and describe remaining performance limits. Normal public
+Pouch open still selects the multifile backend; full backend integration remains
+open.
 
 ## Standing maintenance capacity: decision pending
 
@@ -725,7 +771,7 @@ the accepted 1 MiB metadata-only keys demonstrate the snapshot obligation. Do
 not infer that deleting a 1 MiB placeholder writes a 1 MiB tombstone.
 
 The canonical record header is 32 bytes. Delete metadata occupies at least
-30 bytes before the etag and any extended query-index trailer. The exact-span
+38 bytes before the etag and any extended query-index trailer. The exact-span
 planner allows 4,032 canonical bytes per 4 KiB page, accounting for the 64-byte
 physical run header, and 88 descriptor bytes per page in its fragmentation
 bound. These give the following lower bounds, excluding routing, stream heads,
@@ -733,7 +779,7 @@ catalog entries and checkpoint workspace:
 
 | Obligation | Canonical bytes | Planned payload bytes | Planned descriptor bytes |
 | --- | ---: | ---: | ---: |
-| One 60 KiB body-key tombstone | at least 61,502 | at least 65,536 | at least 1,408 |
+| One 60 KiB body-key tombstone | at least 61,510 | at least 65,536 | at least 1,408 |
 | One 1 MiB placeholder in a snapshot | more than 1,048,608 | at least 1,069,056 | at least 22,968 |
 
 These are conservative admission bounds from `ps_budget_plan_span`, not measured

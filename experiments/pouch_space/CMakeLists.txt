@@ -64,13 +64,14 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery maintenance maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-checksums)
+  foreach(mode lifecycle faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults maintenance maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-checksums)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
   # Thousands of independent cold/warm allocation failures also run under TSAN.
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
+  set_tests_properties(pouch_space_pouch_lifetime-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_maintenance-faults pouch_space_pouch_maintenance-io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_namespace_test namespace_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_namespace_test PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -467,9 +467,9 @@ test_invalid_retention_metadata_and_payload_references_fail(void **state) {
     assert_false(read.published);
     clear_error(f);
   }
-  /* Retention precedes the common twelve-byte index trailer; STATE_META has
+  /* Retention precedes the common lifetime/index trailer; STATE_META has
    * no descriptor padding. Negative committed retention is invalid. */
-  deadline_offset = metadata.next_offset - 12 - sizeof(saved);
+  deadline_offset = metadata.next_offset - 20 - sizeof(saved);
   assert_int_equal(pread(f->fd, saved, sizeof(saved), (off_t)deadline_offset),
                    sizeof(saved));
   memset(invalid, 0xff, sizeof(invalid));

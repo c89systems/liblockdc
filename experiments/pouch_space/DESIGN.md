@@ -607,8 +607,8 @@ Container reads ignore body-cache optimization hints and never populate that
 cache. Scan body results copy their metadata so result cleanup cannot invalidate
 the visitor's borrowed row; both backends support repeated body reads from the
 same captured row. Read-many also returns its captured has-body and staged-delete
-fields. All of these changes are internal memory ownership or read routing;
-canonical bytes, prototype format and public ABI are unchanged. Full public
+fields. Read routing preserves the public ABI and payload codec. The canonical
+key-lifetime representation is described below. Full public
 query-client ownership remains integration work; forced ordinary-state
 maintenance publication is described below.
 
@@ -621,6 +621,27 @@ crypto descriptors, immutable context, metadata, versions and both sequences.
 Failure after output begins calls the owner's private discard boundary. The
 codec owns no logical selection, history protection or physical publication.
 Native clean-close object references now preserve their OBJECT_LINK flag.
+
+Resolved mutable keys carry the namespace index of their first body as an
+internal lifetime. Missing/tombstoned/metadata-only destinations start a fresh
+lifetime when a body is created; public generations still restart at one.
+Updates, metadata and deletion preserve the identity, including metadata-only
+state after deletion. Replay compares lifetime first, then the existing payload
+version/index or metadata-index ordering. Link publication uses the destination
+identity while preserving the encoded body context. Resident/captured and
+clean-close projections, snapshots, staging and recoding retain it.
+
+The common canonical trailer is `[uint64 lifetime][LCSI][uint64 index]`, twenty
+bytes, with an optional twelve-byte `[LCSQ][uint64 query-index]` extension.
+Controls and collection-owned records use zero in the shared lifetime slot.
+The terminal marker stays twelve bytes from the end, distinct from arbitrary
+scalar bytes. Exact planners include the additional eight bytes. Lifetimes are
+bounded by their record index; mutable body admission requires a nonzero value.
+Final index reservation supplies a new identity before PENDING is cleared.
+This preserves producer-to-consumer body flow and existing append/sync authority.
+It adds no journal or writer queue. Experimental fixtures using the preceding
+canonical metadata layout must be recreated; no compatibility conversion or
+format-version increment is introduced.
 
 Logical snapshot capture now reuses production projection semantics over a
 captured canonical prefix. It retains only current key metadata, including
