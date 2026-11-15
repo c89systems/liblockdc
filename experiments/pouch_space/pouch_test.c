@@ -1349,6 +1349,37 @@ static void key_bounds(const char *directory) {
         REQUIRE(r.found && r.version == 0 && r.index_seq == 1 &&
                 r.metadata_length == 5 && !memcmp(r.metadata, "bound", 5));
         lc_pouch_state_read_result_cleanup(&allocator, &r);
+        /* Deleting a metadata-only placeholder is a no-op even at the key
+         * limit. It must survive maintenance, while the shorter body's
+         * tombstone must continue to hide that distinct key. */
+        ok(lc_pouch_state_delete(p, "bounds", key, NULL, &w, &e), &e);
+        REQUIRE(w.version == 0 && w.index_seq == 4);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        for (int pass = 0; pass < 2; ++pass) {
+          if (container) {
+            ps_pouch_compaction_result result;
+            ok(ps_pouch_state_compact(p, "bounds", &result, &e), &e);
+            REQUIRE(!result.skipped && result.snapshot &&
+                    result.metadata_bytes > PS_MIB && !result.body_bytes &&
+                    !result.copied_bytes && !result.pending_sources);
+          }
+          lc_pouch_close(p);
+          REQUIRE(live == 1);
+          if (container)
+            ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+          else
+            ok(lc_pouch_open(path, &allocator, &o.logical, &p, &e), &e);
+          ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+          REQUIRE(r.found && !r.has_body && r.version == 0 &&
+                  r.index_seq == 1 && r.metadata_length == 5 &&
+                  !memcmp(r.metadata, "bound", 5));
+          lc_pouch_state_read_result_cleanup(&allocator, &r);
+          key[body_key_bytes] = 0;
+          ok(lc_pouch_state_read_metadata(p, "bounds", key, &r, &e), &e);
+          REQUIRE(!r.found);
+          lc_pouch_state_read_result_cleanup(&allocator, &r);
+          key[body_key_bytes] = 'k';
+        }
         lc_pouch_close(p);
         REQUIRE(live == 1);
       }

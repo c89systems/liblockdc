@@ -531,6 +531,78 @@ coordination and complete protected capacity remain integration work. Current
 measurements and their observed read regression are recorded in the
 [experiment results](pouch-space-experiment.md#forced-ordinary-state-compaction).
 
+## Standing maintenance capacity: decision pending
+
+The existing joint claim protects a particular admitted operation. A standing
+reserve must additionally make required work admissible after foreground space
+is exhausted. Raising the fixed floor alone does not establish that property
+with the current logical snapshot layout.
+
+There are two distinct obligations. The production delete path repeats the key
+in its tombstone, but deletion of a metadata-only placeholder is deliberately a
+no-op. The tested 60 KiB body keys therefore demonstrate the deletion obligation;
+the accepted 1 MiB metadata-only keys demonstrate the snapshot obligation. Do
+not infer that deleting a 1 MiB placeholder writes a 1 MiB tombstone.
+
+The canonical record header is 32 bytes. Delete metadata occupies at least
+30 bytes before the etag and any extended query-index trailer. The exact-span
+planner allows 4,032 canonical bytes per 4 KiB page, accounting for the 64-byte
+physical run header, and 88 descriptor bytes per page in its fragmentation
+bound. These give the following lower bounds, excluding routing, stream heads,
+catalog entries and checkpoint workspace:
+
+| Obligation | Canonical bytes | Planned payload bytes | Planned descriptor bytes |
+| --- | ---: | ---: | ---: |
+| One 60 KiB body-key tombstone | at least 61,502 | at least 65,536 | at least 1,408 |
+| One 1 MiB placeholder in a snapshot | more than 1,048,608 | at least 1,069,056 | at least 22,968 |
+
+These are conservative admission bounds from `ps_budget_plan_span`, not measured
+physical consumption or a complete reserve recommendation. The public key-bound
+fixture covers both backends and durability policies, plaintext and combined
+compression/encryption. It also checks placeholder deletion is a no-op and
+preserves that placeholder and the distinct deleted body key across initial and
+replacement container snapshots and reopen.
+The expanded `pouch_space_pouch_key-bounds` test passes under Debug ASan/UBSan
+with constrained worker stacks in 2.34 s, GNU release in 1.80 s and native musl
+release in 1.79 s. Logs are `build/pouch-space-standing-capacity/` followed by
+`debug-key-bounds.log`, `gnu-key-bounds.log` and `musl-key-bounds.log`.
+
+Every current snapshot serializes the complete resolved key metadata, including
+keys whose bodies remain elsewhere. Protecting another complete snapshot
+therefore requires workload-sized spare capacity. In a metadata-dominated
+namespace, old and new metadata must coexist until durable selection and
+retirement; the resulting upper bound on usable capacity can approach one half
+of the container before other overhead. This is a design bound, not a measured
+typical utilization figure. The current source-sized body copy is a separate
+workload-sized obligation.
+
+The recommendation is to design bounded incremental metadata maintenance and
+body relocation before selecting a standing reserve. This is a proposed change
+to logical persistence and maintenance architecture, not an implemented or
+approved format change. The design must define foreground publication as well
+as recovery: splitting only the output of a complete snapshot does not remove
+its bootstrap requirement to retain all prior metadata. It must specify the
+authoritative representation, atomic multi-key/high-water publication, the
+largest indivisible work unit, and progress without a full-namespace rewrite or
+a complete source-body copy. Preserve canonical behavior, true streaming,
+independent producers, pinned readers and the existing durable commit contract.
+
+Before implementing that change, select the architecture explicitly. Retaining
+complete snapshots instead requires accepting and exposing a workload-sized
+reserve and its usable-capacity cost. Neither choice authorizes silent growth,
+external persistent staging, reduced key limits or weaker durability.
+
+Whichever architecture is selected, verification must fill foreground capacity
+at fixed size, then prove deletion and reclaimable maintenance can proceed once
+reader pins drain. An all-live store may remain full. Include maximum accepted
+keys and metadata, multiple namespaces, repeated maintenance/deletion cycles,
+fragmentation and allocation/I/O/torn-write failures. Reserve accounting must
+protect every still-recoverable state under NoSync rollback as well as durable
+publication, and must recover after process death before readmission. Measure
+usable capacity, write amplification, CPU, durable barriers and maintenance
+latency against the frozen multifile reference. No reserve number is selected
+by this analysis.
+
 ## Production state integration
 
 A private `ps_pouch_state_open` harness now connects ordinary production state
