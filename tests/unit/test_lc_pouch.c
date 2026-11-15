@@ -20258,6 +20258,189 @@ static void test_clean_reopen_recovers_live_staged_decision(void **state) {
   lc_error_cleanup(&error);
 }
 
+static int pouch_recovered_stage_prepare(
+    const lc_pouch_state_metadata_view *committed,
+    const lc_pouch_state_metadata_view *staged,
+    const lc_pouch_state_metadata_view *lease, void *context,
+    lc_pouch_state_write_options *options, int *apply, lc_error *error) {
+  int *calls = context;
+  (void)options;
+  (void)error;
+  ++*calls;
+  assert_true(committed->found && committed->version == 99UL);
+  assert_true(lease->found);
+  assert_false(staged->found);
+  *apply = 0;
+  return LC_OK;
+}
+
+static void pouch_recreated_stage_recovery(int scenario) {
+  lc_error error;
+  char *crypto_key = NULL;
+  int crypto, sync, shared;
+
+  lc_error_init(&error);
+  assert_int_equal(lc_pouch_crypto_generate_key_string(&crypto_key, &error),
+                   LC_OK);
+  for (crypto = 0; crypto < 4; ++crypto)
+    for (sync = 0; sync < 2; ++sync)
+      for (shared = 0; shared < 2; ++shared) {
+        lc_pouch *pouch = NULL;
+        lc_source *source = NULL;
+        lc_pouch_open_options open_options;
+        lc_pouch_state_write_options options;
+        lc_pouch_state_write_result staged, result;
+        lc_pouch_state_read_result read_result;
+        lc_pouch_generation index, query, observed;
+        char root[512], segment_path[1024], body[64];
+        const char *key = "state/recover";
+        const char *staged_key = "state/recover/.staging/attempt";
+        int calls = 0, reopened;
+
+        memset(&open_options, 0, sizeof(open_options));
+        memset(&options, 0, sizeof(options));
+        memset(&staged, 0, sizeof(staged));
+        memset(&result, 0, sizeof(result));
+        memset(&read_result, 0, sizeof(read_result));
+        open_options.query_indexing_enabled_set = 1;
+        open_options.background_compaction_enabled_set = 1;
+        open_options.single_writer_set = 1;
+        open_options.single_writer = !shared;
+        open_options.durable_sync = sync;
+        open_options.crypto_key = crypto & 1 ? crypto_key : NULL;
+        open_options.compression = crypto & 2 ? "zlib" : "none";
+        open_options.segment_target_bytes = 8UL * 1024UL * 1024UL;
+        make_root("state-stage-recreation", root, sizeof(root));
+        cleanup_root(root);
+        assert_int_equal(
+            lc_pouch_open(root, NULL, &open_options, &pouch, &error), LC_OK);
+        options.has_logical_version = 1;
+        options.logical_version = 99UL;
+        options.has_retention = 1;
+        options.retention = -3600;
+        assert_int_equal(lc_source_from_memory("old", 3U, &source, &error),
+                         LC_OK);
+        assert_int_equal(lc_pouch_state_stage_write(pouch, "team/alpha", key,
+                                                    "attempt", source, &options,
+                                                    &result, &error),
+                         LC_OK);
+        lc_source_close(source);
+        source = NULL;
+        lc_pouch_state_write_result_cleanup(NULL, &result);
+        assert_int_equal(lc_pouch_state_commit_staged(pouch, "team/alpha", key,
+                                                      "attempt", &result,
+                                                      &error),
+                         LC_OK);
+        assert_int_equal(result.version, 99UL);
+        lc_pouch_state_write_result_cleanup(NULL, &result);
+        /* This stage is a new key lifetime, with an earlier public generation
+         * than the historical decision it follows. */
+        options.logical_version = 1UL;
+        assert_int_equal(lc_source_from_memory("new", 3U, &source, &error),
+                         LC_OK);
+        assert_int_equal(lc_pouch_state_stage_write(pouch, "team/alpha", key,
+                                                    "attempt", source, &options,
+                                                    &staged, &error),
+                         LC_OK);
+        lc_source_close(source);
+        source = NULL;
+        assert_int_equal(lc_source_from_memory("pending", 7U, &source, &error),
+                         LC_OK);
+        assert_int_equal(lc_pouch_state_stage_write(pouch, "team/alpha", key,
+                                                    "pending", source, &options,
+                                                    &result, &error),
+                         LC_OK);
+        lc_source_close(source);
+        source = NULL;
+        index = result.index_seq;
+        lc_pouch_state_write_result_cleanup(NULL, &result);
+        assert_int_equal(
+            lc_pouch_state_query_index_seq(pouch, "team/alpha", &query, &error),
+            LC_OK);
+        lc_pouch_close(pouch);
+        pouch = NULL;
+        if (scenario) {
+          /* The new generation-2 decision must supersede the historical
+           * generation-100 decision. Its tombstone has not been written. */
+          pouch_state_segment_path(root, "team/alpha", 1UL, segment_path,
+                                   sizeof(segment_path));
+          append_state_decision_record(segment_path, staged_key, staged.etag,
+                                       "discarded", 2UL, index + 1UL);
+        }
+        assert_int_equal(
+            lc_pouch_open(root, NULL, &open_options, &pouch, &error), LC_OK);
+        for (reopened = 0; reopened < 2; ++reopened) {
+          if (reopened)
+            assert_int_equal(
+                lc_pouch_open(root, NULL, &open_options, &pouch, &error),
+                LC_OK);
+          if (scenario == 2 && !reopened) {
+            assert_int_equal(lc_pouch_state_stage_metadata_prepared(
+                                 pouch, "team/alpha", key, "attempt", key,
+                                 &options, pouch_recovered_stage_prepare,
+                                 &calls, &result, &error),
+                             LC_OK);
+            assert_int_equal(calls, 1);
+            assert_null(result.etag);
+            lc_pouch_state_write_result_cleanup(NULL, &result);
+          }
+          assert_int_equal(lc_pouch_state_read(pouch, "team/alpha", staged_key,
+                                               &read_result, &error),
+                           LC_OK);
+          assert_int_equal(read_result.found, !scenario);
+          if (!scenario) {
+            assert_int_equal(read_result.version, 1UL);
+            assert_int_equal(read_result.retention, -3600);
+            read_source_to_string(read_result.body, body, sizeof(body));
+            assert_string_equal(body, "new");
+          }
+          lc_pouch_state_read_result_cleanup(NULL, &read_result);
+          assert_int_equal(lc_pouch_state_read(pouch, "team/alpha", key,
+                                               &read_result, &error),
+                           LC_OK);
+          assert_int_equal(read_result.version, 99UL);
+          read_source_to_string(read_result.body, body, sizeof(body));
+          assert_string_equal(body, "old");
+          lc_pouch_state_read_result_cleanup(NULL, &read_result);
+          assert_int_equal(lc_pouch_state_read(pouch, "team/alpha",
+                                               "state/recover/.staging/pending",
+                                               &read_result, &error),
+                           LC_OK);
+          assert_true(read_result.found);
+          read_source_to_string(read_result.body, body, sizeof(body));
+          assert_string_equal(body, "pending");
+          lc_pouch_state_read_result_cleanup(NULL, &read_result);
+          assert_int_equal(lc_pouch_state_query_index_seq(pouch, "team/alpha",
+                                                          &observed, &error),
+                           LC_OK);
+          assert_int_equal(observed, query);
+          assert_int_equal(
+              lc_pouch_state_index_seq(pouch, "team/alpha", &observed, &error),
+              LC_OK);
+          assert_int_equal(observed, index + (scenario ? 2UL : 0UL));
+          lc_pouch_close(pouch);
+          pouch = NULL;
+        }
+        lc_pouch_state_write_result_cleanup(NULL, &staged);
+        cleanup_root(root);
+      }
+  lc_pouch_crypto_key_string_free(crypto_key);
+  lc_error_cleanup(&error);
+}
+
+static void test_staged_recovery_preserves_recreated_attempt(void **state) {
+  (void)state;
+  pouch_recreated_stage_recovery(0);
+}
+static void test_staged_recovery_uses_newest_decision_index(void **state) {
+  (void)state;
+  pouch_recreated_stage_recovery(1);
+}
+static void test_prepared_staging_recovers_before_callback(void **state) {
+  (void)state;
+  pouch_recreated_stage_recovery(2);
+}
+
 static void test_client_update_get_load_roundtrips_state(void **state) {
   lc_client *client;
   lc_client *reader;
@@ -37286,6 +37469,9 @@ int main(int argc, char **argv) {
       cmocka_unit_test(test_staged_state_writes_durable_decision_records),
       cmocka_unit_test(test_state_replay_preserves_all_binary_record_families),
       cmocka_unit_test(test_clean_reopen_recovers_live_staged_decision),
+      cmocka_unit_test(test_staged_recovery_preserves_recreated_attempt),
+      cmocka_unit_test(test_staged_recovery_uses_newest_decision_index),
+      cmocka_unit_test(test_prepared_staging_recovers_before_callback),
       cmocka_unit_test(test_client_update_get_load_roundtrips_state),
       cmocka_unit_test(test_exclusive_indexer_publishes_at_document_threshold),
       cmocka_unit_test(

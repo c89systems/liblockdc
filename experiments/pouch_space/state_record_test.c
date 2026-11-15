@@ -472,32 +472,34 @@ static void faults(const char *path) {
                                 &scratch, &decoded, &next, &found, &truncated,
                                 &e),
      &e);
-  for (int kind = 0; kind < 2; ++kind) {
-    for (size_t nth = 1;; ++nth) {
-      io = observing(&o, underlying);
-      char *prior_key = decoded.key;
-      if (kind) {
-        lc_free_with_allocator(&allocator, scratch);
-        scratch = NULL;
-        allocation = 0;
-        fail_allocation = nth;
-      } else {
-        o.fail = nth;
+  for (int no_error = 0; no_error < 2; ++no_error)
+    for (int kind = 0; kind < 2; ++kind) {
+      for (size_t nth = 1;; ++nth) {
+        io = observing(&o, underlying);
+        char *prior_key = decoded.key;
+        if (kind) {
+          lc_free_with_allocator(&allocator, scratch);
+          scratch = NULL;
+          allocation = 0;
+          fail_allocation = nth;
+        } else {
+          o.fail = nth;
+        }
+        int rc = lc_pouch_state_record_read(io, &allocator, leaf, 0, end, 1, 1,
+                                            &scratch, &decoded, &next, &found,
+                                            &truncated, no_error ? NULL : &e);
+        size_t used = kind ? allocation : o.calls;
+        fail_allocation = 0;
+        if (rc == LC_OK) {
+          REQUIRE(nth == used + 1 && found && !truncated && next == end);
+          break;
+        }
+        REQUIRE(rc == (kind ? LC_ERR_NOMEM : LC_ERR_TRANSPORT));
+        REQUIRE(decoded.key == prior_key && !found && !truncated && next == 0);
+        clear(&e);
+        metadata(&decoded, &q, 17);
       }
-      int rc = lc_pouch_state_record_read(io, &allocator, leaf, 0, end, 1, 1,
-                                          &scratch, &decoded, &next, &found,
-                                          &truncated, &e);
-      size_t used = kind ? allocation : o.calls;
-      fail_allocation = 0;
-      if (rc == LC_OK) {
-        REQUIRE(nth == used + 1 && found && !truncated && next == end);
-        break;
-      }
-      REQUIRE(decoded.key == prior_key && !found && !truncated && next == 0);
-      clear(&e);
-      metadata(&decoded, &q, 17);
     }
-  }
   lc_pouch_state_entry_cleanup(&allocator, &decoded);
   /* Pending records are repairable; unknown flags and wrong span identities
    * are corruption even when the caller permits an incomplete active tail. */

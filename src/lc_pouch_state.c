@@ -3204,7 +3204,10 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
     lc_pouch_writer_mode_operation_end(pouch);
     return rc;
   }
-  rc = callback(context, error);
+  if (pouch->storage.ops == NULL)
+    rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
+  if (rc == LC_OK)
+    rc = callback(context, error);
   rc = lc_pouch_state_finish_commit_group(commit_group, owns_commit_group, rc,
                                           error);
   if (rc != LC_OK) {
@@ -7828,13 +7831,6 @@ payload_ref_decoded:
     cursor += side_metadata_len;
     consumed_len += side_metadata_len;
   }
-  rc = lc_pouch_state_decode_retention_meta(
-      meta, meta_len, consumed_len, lc_pouch_state_key_is_staged(entry->key),
-      &entry->retention, error);
-  if (rc != LC_OK) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return rc;
-  }
   if (entry->key == NULL || entry->content_type == NULL ||
       entry->etag == NULL ||
       (record_type != LC_POUCH_STATE_RECORD_STATE_META &&
@@ -7843,6 +7839,13 @@ payload_ref_decoded:
       (payload_context_len > 0UL && entry->payload_context == NULL)) {
     lc_pouch_state_entry_cleanup(allocator, entry);
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  }
+  rc = lc_pouch_state_decode_retention_meta(
+      meta, meta_len, consumed_len, lc_pouch_state_key_is_staged(entry->key),
+      &entry->retention, error);
+  if (rc != LC_OK) {
+    lc_pouch_state_entry_cleanup(allocator, entry);
+    return rc;
   }
   rc = lc_pouch_state_meta_index_seq(meta, meta_len, &entry->index_seq, error);
   if (rc == LC_OK)
@@ -8918,9 +8921,9 @@ static int lc_pouch_state_decision_apply(lc_pouch *pouch,
     if (strcmp(decision->staged_key, entry->key) != 0) {
       continue;
     }
-    if (entry->version < decision->version ||
-        (entry->version == decision->version &&
-         entry->index_seq <= decision->index_seq)) {
+    /* Decisions order attempts, not public payload generations. A recreated
+     * stage may restart at generation one after an older high generation. */
+    if (entry->index_seq <= decision->index_seq) {
       return LC_OK;
     }
     staged_key = lc_strdup_with_allocator(&pouch->allocator, entry->key);
@@ -13463,7 +13466,9 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
       lc_pouch_state_entry_cleanup(&pouch->allocator, &staged);
       break;
     }
-    if (!staged.found) {
+    /* A recreated stage belongs to a later attempt. Historical decisions
+     * cannot retire it, even when its logical generation starts at one. */
+    if (!staged.found || staged.index_seq >= decision->index_seq) {
       lc_pouch_state_entry_cleanup(&pouch->allocator, &staged);
       continue;
     }
