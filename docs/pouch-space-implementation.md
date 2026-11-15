@@ -624,7 +624,7 @@ protection, and prove immediate, reopened and compacted readback for states and
 objects. The scope change does not alter those ordering rules; its deletion
 fixture retains the deleted key and performs later writes on a different key.
 
-### Proposed key lifetime ordering: decision pending
+### Selected key lifetime ordering
 
 The current `45da71c` GNU libraries reproduce the same failure in both backends
 under both root policies. The unchanged probe is rebuilt and retained under
@@ -632,7 +632,7 @@ under both root policies. The unchanged probe is rebuilt and retained under
 `{container,multifile}-{0,1}.log`. Recreation returns version 1/index 3, but both
 immediate and reopened reads report absence. No repair is implemented here.
 
-The recommendation is a durable, internal per-key lifetime identity. Use the
+The selected design uses a durable, internal per-key lifetime identity. Use the
 namespace index sequence of the body creation as a `uint64_t` lifetime value;
 the first body after missing, tombstoned or metadata-only state starts a fresh
 lifetime while retaining the specified public generation behavior. Ordinary
@@ -650,14 +650,13 @@ current row must preserve its lifetime so an older, higher-generation record
 cannot displace a recreated value after replay. Index allocation and recovery
 must not reuse an identity while a recoverable reference can still retain it.
 
-This proposes another eight-byte scalar per affected canonical record and
-snapshot row, not a payload copy or separate journal. Encoding/decoding, exact
-size planners and corruption checks must change together. It is a persistence
-change affecting both backends, not a change authorized by the current scope
-implementation. It does not authorize existing-root conversion, compatibility
-parsing or a format-version increment. The alternative is a deliberate public
-contract change to keep generations increasing across deletion; that would
-change the documented generation-1 behavior and its dependent CAS semantics.
+The design adds another eight-byte scalar per affected canonical record and
+snapshot row. Encoding/decoding, exact size planners and corruption checks must
+change together. The user delegated the technical choice; preserving existing
+generation-1 and replay semantics through durable lifetimes is now selected and
+authorized for implementation in both backends. Implementation remains pending.
+Existing-root conversion, compatibility parsing and a format-version increment
+remain outside this decision. No payload copy or separate journal is introduced.
 
 Acceptance must prove state/object recreation immediately, after reopen, after
 repeated deletion/recreation, and after compaction with the old tombstone gone.
@@ -665,7 +664,7 @@ Include older-lifetime payloads and deletes with higher public generations,
 same-lifetime stale/equal generations, metadata-only lease transitions, staged
 promotion, pinned old readers, both policies/all codecs, and allocation/I/O/torn
 write failures. Existing stale-generation and independent metadata ordering
-tests must remain valid. Select the persistence/behavior policy before coding.
+tests must remain valid before this correctness repair can be accepted.
 
 ## Standing maintenance capacity: decision pending
 
