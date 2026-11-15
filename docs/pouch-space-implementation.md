@@ -685,6 +685,32 @@ promotion, pinned old readers, both policies/all codecs, and allocation/I/O/torn
 write failures. Existing stale-generation and independent metadata ordering
 tests must remain valid before this correctness repair can be accepted.
 
+The allocation-recovery prerequisite is implemented: every valid canonical
+record advances the namespace index high-water before per-key supersession.
+An ignored older payload generation therefore cannot make its allocated index
+reusable after replay or snapshot replacement. Public-query freshness still
+follows accepted projection changes. Native replay uses this common rule;
+typed container replay and logical capture now retain the same high-water.
+Cold and warm container index/query reads use namespace projection authority,
+storage health checks and typed recovery instead of falling through to native
+filesystem paths.
+
+The `sequence-recovery` test covers 96 state/object cases across both backends,
+all four codec combinations, both policies and compaction before/after reopen
+or without compaction. It checks empty namespaces, either sequence API as the
+first cold operation, repeated reopen, preserved body/version/query freshness
+and the next unique allocated index. Two logical-capture cases prove that an
+ignored record's higher index survives without a HIGH_WATER record or with a
+lower one. The existing cold/warm allocation and I/O sweeps now include both
+sequence APIs, including zero output on error and successful retry.
+
+Verification under `build/pouch-space-key-sequence/` passes the complete
+363-check Debug preset (311 unit groups), 38 GNU release groups, 14 native musl
+groups, five ThreadSanitizer groups with instrumented OpenSSL and three Memcheck
+runs with zero live blocks/errors/suppressions. The full Debug read sweeps
+exercise 4,228 allocation and 1,298 I/O failure sites. This prerequisite adds
+no record fields; durable key lifetime encoding and propagation remain pending.
+
 ## Standing maintenance capacity: decision pending
 
 The existing joint claim protects a particular admitted operation. A standing

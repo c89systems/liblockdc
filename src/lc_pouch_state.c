@@ -5506,10 +5506,13 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
                         "pouch state metadata blob requires bytes", NULL, NULL,
                         "pouch");
   }
+  /* Every valid canonical record consumes its namespace allocation, even
+   * when an older payload generation cannot replace the current key. Query
+   * freshness still follows only the accepted public projection below. */
+  if (entry->index_seq > ns->max_version) {
+    ns->max_version = entry->index_seq;
+  }
   if (entry->control) {
-    if (entry->index_seq > ns->max_version) {
-      ns->max_version = entry->index_seq;
-    }
     if (entry->query_index_seq > ns->max_query_index_seq) {
       ns->max_query_index_seq = entry->query_index_seq;
     }
@@ -5734,9 +5737,6 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
   } else {
     record->record_type = entry->found ? LC_POUCH_STATE_RECORD_STATE_PUT
                                        : LC_POUCH_STATE_RECORD_STATE_DELETE;
-  }
-  if (entry->index_seq > ns->max_version) {
-    ns->max_version = entry->index_seq;
   }
   if (query_index_seq > ns->max_query_index_seq) {
     ns->max_query_index_seq = query_index_seq;
@@ -9066,9 +9066,6 @@ static int lc_pouch_state_cache_replay_file(
     }
     if (!found) {
       break;
-    }
-    if (entry.seen && entry.index_seq > cache->max_version) {
-      cache->max_version = entry.index_seq;
     }
     rc = lc_pouch_state_cache_apply_entry(pouch, cache, &entry, error);
     if (rc != LC_OK) {
@@ -18023,6 +18020,27 @@ cleanup:
   return rc;
 }
 
+static int lc_pouch_state_storage_sequences(lc_pouch *pouch, const char *ns,
+                                            lc_pouch_generation *index,
+                                            lc_pouch_generation *query,
+                                            lc_error *error) {
+  lc_pouch_state_cache_guard guard;
+  lc_pouch_namespace_logstore *cache;
+  int rc = lc_pouch_state_cache_guard_lock(pouch, ns, &guard, error);
+  if (rc != LC_OK)
+    return rc;
+  rc = lc_pouch_state_storage_prepare(pouch, ns, error);
+  if (rc == LC_OK) {
+    cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
+    if (index)
+      *index = cache->max_version;
+    if (query)
+      *query = cache->max_query_index_seq;
+  }
+  lc_pouch_state_cache_guard_unlock(pouch, &guard);
+  return rc;
+}
+
 int lc_pouch_state_index_seq(lc_pouch *pouch, const char *ns,
                              lc_pouch_generation *out, lc_error *error) {
   lc_pouch_namespace_manifest manifest;
@@ -18044,6 +18062,8 @@ int lc_pouch_state_index_seq(lc_pouch *pouch, const char *ns,
                         NULL, NULL, NULL);
   }
   *out = 0UL;
+  if (pouch->storage.ops != NULL)
+    return lc_pouch_state_storage_sequences(pouch, ns, out, NULL, error);
   checkpoint = 0UL;
   checkpoint_query = 0UL;
   checkpoint_identity = 0U;
@@ -18134,6 +18154,8 @@ int lc_pouch_state_query_index_seq(lc_pouch *pouch, const char *ns,
                         NULL, NULL, "pouch");
   }
   *out = 0UL;
+  if (pouch->storage.ops != NULL)
+    return lc_pouch_state_storage_sequences(pouch, ns, NULL, out, error);
   memset(&cache_guard, 0, sizeof(cache_guard));
   single_writer = lc_pouch_single_writer_snapshot(pouch, &writer_mode_epoch);
   /* The exclusive owner updates this projection in the same mutation path

@@ -2157,6 +2157,14 @@ static int run_read(lc_pouch *p, int phase, size_t *calls, lc_error *e) {
   lc_pouch_state_scan_summaries_result page = {0};
   int rc;
   view.pouch = p;
+  if (phase == 5 || phase == 6) {
+    lc_pouch_generation sequence = 99;
+    *calls = 0;
+    rc = phase == 5 ? lc_pouch_state_index_seq(p, "reads", &sequence, e)
+                    : lc_pouch_state_query_index_seq(p, "reads", &sequence, e);
+    REQUIRE(sequence == (rc == LC_OK ? 4 : 0));
+    return rc;
+  }
   if (phase == 0)
     rc = lc_pouch_state_read_many(p, "reads", keys, 10, fault_read_many, &view,
                                   e);
@@ -2241,7 +2249,7 @@ static void read_faults(const char *path, int use_io) {
   size_t total = 0;
   for (int transform = 0; transform <= 3; transform += 3)
     for (int cold = 0; cold < 2; ++cold)
-      for (int phase = 0; phase < 5; ++phase) {
+      for (int phase = 0; phase < 7; ++phase) {
         size_t count =
             read_failure_case(path, SIZE_MAX, phase, cold, use_io, transform);
         for (size_t n = 1; n <= count; ++n)
@@ -2966,6 +2974,17 @@ static int inspect_empty_capture(void *context, const lc_pouch_state_entry *r,
           !r->query_index_seq);
   return LC_OK;
 }
+static int inspect_uncheckpointed_capture(void *context,
+                                          const lc_pouch_state_entry *r,
+                                          lc_error *e) {
+  capture_observer *c = context;
+  if (c->count)
+    return inspect_capture(context, r, e);
+  REQUIRE(r->control && r->version == 200 && r->index_seq == 200 &&
+          r->query_index_seq == 97);
+  ++c->count;
+  return LC_OK;
+}
 static void projection_faults(const char *path) {
   lc_error e;
   lc_error_init(&e);
@@ -2977,6 +2996,26 @@ static void projection_faults(const char *path) {
   capture_fixture_open(&f);
   size_t baseline = live, operations = 0;
   lc_pouch_state_snapshot *captured = NULL;
+  /* Rejected payload generations still consume their namespace index. A
+   * later HIGH_WATER must not mask loss of that allocation during capture. */
+  for (int low_water = 0; low_water < 2; ++low_water) {
+    lc_pouch_state_entry water = f.entries[84];
+    f.count = low_water ? 85 : 84;
+    f.entries[84].version = f.entries[84].index_seq = 50;
+    f.entries[84].query_index_seq = 40;
+    ok(lc_pouch_state_snapshot_capture(p, replay_fixture, &f, &captured, &e),
+       &e);
+    capture_observer c = {0};
+    ok(lc_pouch_state_snapshot_visit(captured, inspect_uncheckpointed_capture,
+                                     &c, &e),
+       &e);
+    REQUIRE(c.count == 81);
+    lc_pouch_state_snapshot_close(captured);
+    captured = NULL;
+    f.entries[84] = water;
+    REQUIRE(live == baseline);
+  }
+  f.count = 85;
   for (int null_error = 0; null_error < 2; ++null_error)
     for (size_t nth = 0; nth <= operations; ++nth) {
       fail_at = nth ? nth : SIZE_MAX;
@@ -3090,6 +3129,115 @@ static void projection_faults(const char *path) {
   REQUIRE(live == 0 && unlink(path) == 0);
   printf("logical capture allocation failure sites: %lu (with/without error)\n",
          (unsigned long)operations);
+  lc_error_cleanup(&e);
+}
+static void sequence_recovery_check(lc_pouch *p, int object, lc_error *e) {
+  lc_pouch_generation seq;
+  lc_pouch_state_read_result r = {0};
+  ok(lc_pouch_state_index_seq(p, "sequence", &seq, e), e);
+  REQUIRE(seq == 2);
+  ok(lc_pouch_state_query_index_seq(p, "sequence", &seq, e), e);
+  REQUIRE(seq == (object ? 0 : 1));
+  ok(lc_pouch_state_read_metadata(p, "sequence", "key", &r, e), e);
+  REQUIRE(r.found && r.has_body && r.version == 3 && r.index_seq == 1);
+  lc_pouch_state_read_result_cleanup(&allocator, &r);
+  read_value(p, "sequence", "key", 31, 61, 3, e);
+}
+static void sequence_recovery_compact(lc_pouch *p, int multifile, lc_error *e) {
+  if (multifile) {
+    lc_pouch_maintenance_options o = {0};
+    lc_pouch_maintenance_result r = {0};
+    o.ns = "sequence";
+    o.force = 1;
+    ok(lc_pouch_maintenance_run(p, &o, &r, e), e);
+    REQUIRE(r.compacted);
+    lc_pouch_maintenance_result_cleanup(&allocator, &r);
+  } else {
+    ps_pouch_compaction_result r = {0};
+    ok(ps_pouch_state_compact(p, "sequence", &r, e), e);
+    REQUIRE(r.snapshot && !r.skipped);
+  }
+}
+static void sequence_recovery(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int multifile = 0; multifile < 2; ++multifile)
+    for (int crypto = 0; crypto < 4; ++crypto)
+      for (int sync = 0; sync < 2; ++sync)
+        for (int object = 0; object < 2; ++object)
+          for (int compact = 0; compact < 3; ++compact) {
+            ps_pouch_state_options o = options(crypto, sync);
+            lc_pouch *p = NULL;
+            char native[1400];
+            o.logical.background_compaction_enabled_set = 1;
+            o.logical.background_compaction_enabled = 0;
+            o.logical.segment_target_bytes = 1;
+            REQUIRE(snprintf(native, sizeof(native), "%s/native-%d-%d-%d-%d",
+                             directory, crypto, sync, object,
+                             compact) < (int)sizeof(native));
+            if (multifile)
+              ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+            else
+              ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+            lc_pouch_generation seq = 99;
+            ok(lc_pouch_state_query_index_seq(p, "empty", &seq, &e), &e);
+            REQUIRE(!seq);
+            seq = 99;
+            ok(lc_pouch_state_index_seq(p, "empty", &seq, &e), &e);
+            REQUIRE(!seq);
+            for (int stale = 0; stale < 2; ++stale) {
+              lc_pouch_state_write_options w = {0};
+              lc_pouch_state_write_result r = {0};
+              input in = source(31, stale ? 62 : 61);
+              w.object_record = object;
+              w.has_logical_version = 1;
+              w.logical_version = stale ? 2 : 3;
+              ok(put(p, "sequence", "key", &in, &w, &r, &e), &e);
+              REQUIRE(r.version == w.logical_version &&
+                      r.index_seq == (lc_pouch_generation)(stale + 1));
+              lc_pouch_state_write_result_cleanup(&allocator, &r);
+            }
+            sequence_recovery_check(p, object, &e);
+            if (compact == 1) {
+              sequence_recovery_compact(p, multifile, &e);
+              sequence_recovery_check(p, object, &e);
+            }
+            lc_pouch_close(p);
+            REQUIRE(live == 0);
+            for (int reopened = 0; reopened < 2; ++reopened) {
+              if (multifile)
+                ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+              else
+                ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+              if (reopened) {
+                /* Independently exercise query as the first cold operation;
+                 * the first reopening above starts with index instead. */
+                seq = 99;
+                ok(lc_pouch_state_query_index_seq(p, "sequence", &seq, &e), &e);
+                REQUIRE(seq == (object ? 0 : 1));
+              }
+              sequence_recovery_check(p, object, &e);
+              if (compact == 2 && !reopened) {
+                sequence_recovery_compact(p, multifile, &e);
+                sequence_recovery_check(p, object, &e);
+              }
+              if (!reopened) {
+                lc_pouch_close(p);
+                REQUIRE(live == 0);
+              }
+            }
+            lc_pouch_state_write_result r = {0};
+            input in = source(17, 63);
+            ok(put(p, "sequence", "next", &in, NULL, &r, &e), &e);
+            REQUIRE(r.version == 1 && r.index_seq == 3);
+            lc_pouch_state_write_result_cleanup(&allocator, &r);
+            read_value(p, "sequence", "key", 31, 61, 3, &e);
+            read_value(p, "sequence", "next", 17, 63, 1, &e);
+            lc_pouch_close(p);
+            REQUIRE(live == 0);
+            if (!multifile)
+              REQUIRE(unlink(path) == 0);
+          }
   lc_error_cleanup(&e);
 }
 typedef struct capture_visit_job {
@@ -3704,6 +3852,8 @@ static void *worker(void *context) {
     projection_faults(r->path);
   else if (!strcmp(r->mode, "projection-concurrency"))
     projection_concurrency(r->path, r->directory);
+  else if (!strcmp(r->mode, "sequence-recovery"))
+    sequence_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-faults"))
