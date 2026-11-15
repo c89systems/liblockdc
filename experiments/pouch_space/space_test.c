@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "budget.h"
 #include "catalog.h"
 #include "directory.h"
 #include "lc_api_internal.h"
@@ -121,7 +122,7 @@ static ps_ref put(ps_space *s, ps_key k, const void *bytes, size_t n,
   ps_writer *w = NULL;
   ps_ref ref;
   size_t offset = 0, step;
-  OK(ps_begin(s, k, &w, &error));
+  OK(ps_begin(s, NULL, k, &w, &error));
   while (offset < n) {
     step = n - offset;
     if (step > chunk)
@@ -188,7 +189,7 @@ static void basic(void) {
   put(s, key(PS_COLLECTION, 1, 1), "collection", 10, 4);
   put(s, key(PS_STATE, 2, 1), "owner-two", 9, 4);
   expect(s, key(PS_COLLECTION, 1, 1), NULL, "collection", 10);
-  OK(ps_begin(s, key(PS_COLLECTION, 1, 1), &w, &error));
+  OK(ps_begin(s, NULL, key(PS_COLLECTION, 1, 1), &w, &error));
   OK(ps_write(w, "overwrite", 9, &error));
   BAD(ps_publish(w, NULL, &error));
   ps_writer_close(w);
@@ -230,7 +231,7 @@ static void streaming_capacity(void) {
     payload[i] = (unsigned char)(i * 37 + i / 19);
   clean();
   s = create(PS_MIB, 0, NULL);
-  OK(ps_begin(s, state(99), &w, &error));
+  OK(ps_begin(s, NULL, state(99), &w, &error));
   BAD(ps_write(w, payload, (size_t)PS_MIB, &error));
   BAD(ps_publish(w, NULL, &error));
   ps_writer_close(w);
@@ -419,7 +420,7 @@ static void fault_boundaries(void) {
       m.tear = 1;
       m.persist_torn = 1;
       if (operation == 0) {
-        OK(ps_begin(s, state(1), &w, &error));
+        OK(ps_begin(s, NULL, state(1), &w, &error));
         rc = ps_write(w, payload, PS_CHUNK + 111, &error);
         if (rc == LC_OK)
           rc = ps_publish(w, NULL, &error);
@@ -586,7 +587,7 @@ static void *concurrent_writer(void *context) {
   memset(bytes, (int)v->ordinal, sizeof(bytes));
   v->rc = LC_OK;
   for (i = 0; i < 40 && v->rc == LC_OK; ++i) {
-    v->rc = ps_begin(v->s, key(PS_COLLECTION, v->ordinal, i), &w, &e);
+    v->rc = ps_begin(v->s, NULL, key(PS_COLLECTION, v->ordinal, i), &w, &e);
     if (v->rc == LC_OK)
       v->rc = ps_write(w, bytes, sizeof(bytes), &e);
     if (v->rc == LC_OK)
@@ -612,7 +613,7 @@ static void concurrency(void) {
   s = create(2 * PS_MIB, 0, NULL);
   /* An unfinished producer owns a private page but no admission/publication
    * lock. Independent writers, growth and checkpoint must all progress. */
-  OK(ps_begin(s, state(7), &slow, &error));
+  OK(ps_begin(s, NULL, state(7), &slow, &error));
   OK(ps_write(slow, slow_bytes, PS_CHUNK + 4, &error));
   OK(ps_status(s, &stats, &error));
   CHECK(stats.private_bytes == PS_CHUNK);
@@ -766,7 +767,7 @@ static void process_death(void) {
   CHECK(child >= 0);
   if (child == 0) {
     s = reopen(NULL);
-    OK(ps_begin(s, state(2), &w, &error));
+    OK(ps_begin(s, NULL, state(2), &w, &error));
     OK(ps_write(w, bytes, PS_CHUNK, &error));
     _exit(0); /* no close: ownership must be recoverable without sidecars */
   }
@@ -807,7 +808,7 @@ static void allocation_failures(void) {
       allocation_fail = nth;
       if (operation == 0) {
         w = NULL;
-        rc = ps_begin(s, state(2), &w, &error);
+        rc = ps_begin(s, NULL, state(2), &w, &error);
         if (rc == LC_OK)
           rc = ps_write(w, bytes, PS_CHUNK, &error);
         if (rc == LC_OK)
@@ -881,7 +882,7 @@ static void model_churn(void) {
       for (i = 0; i < n; ++i)
         body[i] = (unsigned char)(step + i * 17);
       abort_write = step % 11 == 0;
-      OK(ps_begin(s, k, &w, &error));
+      OK(ps_begin(s, NULL, k, &w, &error));
       OK(ps_write(w, body, n, &error));
       if (!abort_write) {
         rc = ps_publish(w, NULL, &error);
@@ -1132,8 +1133,9 @@ static void *commit_worker(void *context) {
   else if (actor->remove)
     actor->rc = ps_delete(actor->space, state(actor->ordinal + 1), &e);
   else {
-    actor->rc = ps_begin(
-        actor->space, state(actor->same_key ? 1 : actor->ordinal + 1), &w, &e);
+    actor->rc =
+        ps_begin(actor->space, NULL,
+                 state(actor->same_key ? 1 : actor->ordinal + 1), &w, &e);
     if (actor->rc == LC_OK)
       actor->rc = ps_write(w, body, sizeof(body), &e);
     if (actor->rc == LC_OK)
@@ -1218,7 +1220,7 @@ static void commit_coordination(void) {
       else
         absent(s, state(i));
     }
-    OK(ps_begin(s, state(99), &private_writer, &error));
+    OK(ps_begin(s, NULL, state(99), &private_writer, &error));
     OK(ps_write(private_writer, body, PS_CHUNK, &error));
     ps_writer_close(private_writer);
     absent(s, state(99));
@@ -1576,7 +1578,7 @@ static void metadata_repack(void) {
      */
     put(s, state(0), "C", 1, 1);
     OK(ps_delete(s, state(1), &error));
-    OK(ps_begin(s, state(999), &private_writer, &error));
+    OK(ps_begin(s, NULL, state(999), &private_writer, &error));
     OK(ps_write(private_writer, private_bytes, PS_CHUNK, &error));
     OK(ps_status(s, &before, &error));
     OK(ps_metadata_repack(s, &error));
@@ -1658,14 +1660,14 @@ static void metadata_repack_surfaces(void) {
   clean();
   s = create(4 * PS_MIB, 0, &io);
   put(s, state(1), body, length, 8191);
-  OK(ps_stream_open(s, stream_key, 1, NULL, NULL, NULL, &stream, &error));
+  OK(ps_stream_open(s, NULL, stream_key, 1, NULL, NULL, NULL, &stream, &error));
   OK(ps_stream_begin(stream, &writer, &error));
   OK(ps_stream_write(writer, "abc", 3, &error));
   OK(ps_stream_commit(writer, NULL, NULL, &error));
   ps_stream_writer_close(writer);
   OK(ps_stream_seal(stream, &error));
   OK(ps_stream_status(stream, &info, &error));
-  OK(ps_catalog_put(s, 99, PS_CATALOG_PROJECTION, name, name_bytes, NULL,
+  OK(ps_catalog_put(s, NULL, 99, PS_CATALOG_PROJECTION, name, name_bytes, NULL,
                     stream_key, &info.ref, &binding, &error));
   OK(ps_checkpoint(s, &error));
   OK(ps_read_open(s, state(1), NULL, &body_pin, &error));
@@ -1714,7 +1716,8 @@ static void metadata_repack_surfaces(void) {
   CHECK(observed.id == binding.id &&
         observed.revision.incarnation == binding.revision.incarnation);
   ps_catalog_view_close(view);
-  OK(ps_stream_open(s, stream_key, 0, &info.ref, NULL, NULL, &stream, &error));
+  OK(ps_stream_open(s, NULL, stream_key, 0, &info.ref, NULL, NULL, &stream,
+                    &error));
   OK(ps_stream_read_open(stream, 0, 3, &stream_pin, &error));
   OK(ps_stream_read(stream_pin, readback, sizeof(readback), &got, &error));
   CHECK(got == 3 && !memcmp(readback, "abc", 3));
@@ -1741,7 +1744,7 @@ static size_t metadata_growth_fixture(ps_space *s, const unsigned char *body,
   }
   for (count = 0; count < 1024; ++count) {
     ps_writer *w = NULL;
-    OK(ps_begin(s, state(1000 + count), &w, &error));
+    OK(ps_begin(s, NULL, state(1000 + count), &w, &error));
     rc = ps_write(w, body, PS_PAGE, &error);
     if (rc == LC_OK)
       rc = ps_publish(w, NULL, &error);
@@ -1763,7 +1766,7 @@ static size_t metadata_growth_fixture(ps_space *s, const unsigned char *body,
    * rollback must preserve that headroom as well as the visible capacity. */
   for (; count < 1024; ++count) {
     ps_writer *w = NULL;
-    OK(ps_begin(s, state(1000 + count), &w, &error));
+    OK(ps_begin(s, NULL, state(1000 + count), &w, &error));
     rc = ps_write(w, body, PS_PAGE, &error);
     if (rc == LC_OK)
       rc = ps_publish(w, NULL, &error);
@@ -1792,7 +1795,7 @@ static void metadata_workspace_abort(void) {
     put(s, state(i), "A", 1, 1);
   OK(ps_checkpoint(s, &error));
   OK(ps_status(s, &before, &error));
-  OK(ps_begin(s, state(9999), &w, &error));
+  OK(ps_begin(s, NULL, state(9999), &w, &error));
   for (i = 0; i < 64; ++i)
     OK(ps_write(w, body, PS_CHUNK, &error));
   OK(ps_status(s, &enlarged, &error));
@@ -1844,15 +1847,15 @@ static void metadata_capacity(void) {
   for (int sync = 0; sync < 2; ++sync) {
     clean();
     s = create(3 * PS_MIB, sync, NULL);
-    OK(ps_stream_open(s, key, 1, NULL, NULL, NULL, &stream, &error));
+    OK(ps_stream_open(s, NULL, key, 1, NULL, NULL, NULL, &stream, &error));
     OK(ps_stream_begin(stream, &writer, &error));
     OK(ps_stream_reserve_exact(writer, sizeof(tail), &error));
     OK(ps_stream_write(writer, "A", 1, &error));
     OK(ps_stream_commit(writer, NULL, NULL, &error));
     ps_stream_writer_close(writer);
     OK(ps_stream_status(stream, &info, &error));
-    OK(ps_catalog_put(s, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17, NULL,
-                      key, &info.ref, &binding, &error));
+    OK(ps_catalog_put(s, NULL, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
+                      NULL, key, &info.ref, &binding, &error));
     original = binding.revision;
     OK(ps_catalog_get(s, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
                       &catalog_pin, &error));
@@ -1870,7 +1873,7 @@ static void metadata_capacity(void) {
     for (pass = 0; pass < 2; ++pass) {
       for (; count < 1024; ++count) {
         ps_writer *value = NULL;
-        OK(ps_begin(s, state(1000 + count), &value, &error));
+        OK(ps_begin(s, NULL, state(1000 + count), &value, &error));
         rc = ps_write(value, body, PS_PAGE, &error);
         if (rc == LC_OK)
           rc = ps_publish(value, NULL, &error);
@@ -1889,7 +1892,7 @@ static void metadata_capacity(void) {
     }
     CHECK(count > filled);
     expected = binding.revision;
-    OK(ps_catalog_put(s, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
+    OK(ps_catalog_put(s, NULL, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
                       &expected, key, &info.ref, &binding, &error));
     OK(ps_status(s, &stats, &error));
     fallbacks = stats.metadata_fallbacks;
@@ -1928,7 +1931,7 @@ static void metadata_capacity(void) {
     s = reopen(NULL);
     OK(ps_status(s, &stats, &error));
     CHECK(stats.metadata_available_bytes >= stats.metadata_workspace_bytes);
-    OK(ps_stream_open(s, key, 0, &info.ref, NULL, NULL, &stream, &error));
+    OK(ps_stream_open(s, NULL, key, 0, &info.ref, NULL, NULL, &stream, &error));
     OK(ps_stream_read_open(stream, 0, sizeof(tail), &reader, &error));
     OK(ps_stream_read(reader, tail, sizeof(tail), &got, &error));
     CHECK(got == sizeof(tail) && tail[0] == 'A');
@@ -1959,7 +1962,7 @@ static void metadata_capacity_faults(void) {
   put(s, control, "A", 1, 1);
   for (count = 0; count < 1024; ++count) {
     ps_writer *w = NULL;
-    OK(ps_begin(s, state(1000 + count), &w, &error));
+    OK(ps_begin(s, NULL, state(1000 + count), &w, &error));
     rc = ps_write(w, body, PS_PAGE, &error);
     if (rc == LC_OK)
       rc = ps_publish(w, NULL, &error);
@@ -2258,7 +2261,7 @@ static void packing_faults(void) {
         allocation_call = 0;
         allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
         w = NULL;
-        rc = ps_begin(s, state(2), &w, &error);
+        rc = ps_begin(s, NULL, state(2), &w, &error);
         if (rc == LC_OK)
           rc = ps_write(w, body, wanted, &error);
         if (rc == LC_OK)
@@ -2308,7 +2311,7 @@ static void packing_faults(void) {
   s = create(PS_MIB, 1, NULL);
   ps_key collection = key(PS_COLLECTION, 9, 1);
   put(s, collection, body, PS_CELL, 1);
-  OK(ps_begin(s, collection, &w, &error));
+  OK(ps_begin(s, NULL, collection, &w, &error));
   OK(ps_write(w, body, PS_CHUNK + 65, &error));
   BAD(ps_publish(w, NULL, &error)); /* existing live collection binding */
   allocation_call = 0;
@@ -2316,7 +2319,7 @@ static void packing_faults(void) {
   ps_writer_close(w);
   allocation_fail = 0;
   CHECK(allocation_call >= 1);
-  BAD(ps_begin(s, state(99), &w, &error));
+  BAD(ps_begin(s, NULL, state(99), &w, &error));
   OK(ps_close(s, &error));
   s = reopen(NULL);
   expect(s, collection, NULL, body, PS_CELL);
@@ -2549,7 +2552,7 @@ static ps_key stream_key(uint64_t id) { return key(PS_STREAM, 10, id); }
 static ps_stream *stream_open(ps_space *space, uint64_t id, int create,
                               const ps_ref *ref, recovery_trace *trace) {
   ps_stream *stream = NULL;
-  OK(ps_stream_open(space, stream_key(id), create, ref, canonical_recover,
+  OK(ps_stream_open(space, NULL, stream_key(id), create, ref, canonical_recover,
                     trace, &stream, &error));
   return stream;
 }
@@ -2688,9 +2691,9 @@ static void canonical_stream_lifecycle(void) {
   ref = info.ref;
   CHECK(!info.tail && !info.runs && !info.capacity);
   BAD(ps_close(space, &error));
-  BAD(ps_stream_open(space, stream_key(1), 0, NULL, canonical_recover, NULL,
-                     &other_stream, &error));
-  BAD(ps_begin(space, stream_key(1), &wrong_kind, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, NULL, canonical_recover,
+                     NULL, &other_stream, &error));
+  BAD(ps_begin(space, NULL, stream_key(1), &wrong_kind, &error));
   BAD(ps_delete(space, stream_key(1), &error));
   BAD(ps_stream_recovery_read(stream, 0, frame, 1, &error));
   for (i = 0; i < 100; ++i) {
@@ -2765,20 +2768,20 @@ static void canonical_stream_lifecycle(void) {
   space = reopen(NULL);
   invalid_ref = ref;
   ++invalid_ref.incarnation;
-  BAD(ps_stream_open(space, stream_key(1), 0, &invalid_ref, canonical_recover,
-                     NULL, &other_stream, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, &invalid_ref,
+                     canonical_recover, NULL, &other_stream, &error));
   CHECK(other_stream == NULL);
   invalid_ref = ref;
   invalid_ref.container[0] ^= 1;
-  BAD(ps_stream_open(space, stream_key(1), 0, &invalid_ref, canonical_recover,
-                     NULL, &other_stream, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, &invalid_ref,
+                     canonical_recover, NULL, &other_stream, &error));
   CHECK(other_stream == NULL);
-  BAD(ps_stream_open(space, stream_key(1), 1, &ref, canonical_recover, NULL,
+  BAD(ps_stream_open(space, NULL, stream_key(1), 1, &ref, canonical_recover,
+                     NULL, &other_stream, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(999), 0, NULL, canonical_recover,
+                     NULL, &other_stream, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, &ref, NULL, NULL,
                      &other_stream, &error));
-  BAD(ps_stream_open(space, stream_key(999), 0, NULL, canonical_recover, NULL,
-                     &other_stream, &error));
-  BAD(ps_stream_open(space, stream_key(1), 0, &ref, NULL, NULL, &other_stream,
-                     &error));
   CHECK(other_stream == NULL);
   stream = stream_open(space, 1, 0, &ref, &trace);
   OK(ps_stream_status(stream, &info, &error));
@@ -3108,8 +3111,8 @@ static void canonical_stream_open_faults(int native_zero) {
       rc = ps_open(path, 0, &options, &space, &error);
       stream = NULL;
       if (rc == LC_OK)
-        rc = ps_stream_open(space, stream_key(1), 0, NULL, canonical_recover,
-                            NULL, &stream, &error);
+        rc = ps_stream_open(space, NULL, stream_key(1), 0, NULL,
+                            canonical_recover, NULL, &stream, &error);
       allocation_fail = 0;
       m.fail_at = m.fail_read = 0;
       if (!phase)
@@ -3338,7 +3341,7 @@ static void canonical_stream_private_capacity(void) {
   for (count = 0; count < 1024; ++count) {
     ps_writer *w = NULL;
     body[0] = (unsigned char)count;
-    OK(ps_begin(space, state(1), &w, &error));
+    OK(ps_begin(space, NULL, state(1), &w, &error));
     rc = ps_write(w, body, PS_PAGE, &error);
     if (rc == LC_OK)
       rc = ps_publish(w, &next, &error);
@@ -3442,8 +3445,9 @@ static void canonical_stream_invalid_metadata(void) {
       CHECK(space == NULL);
     } else {
       space = reopen(NULL);
-      CHECK(ps_stream_open(space, stream_key(1), 0, NULL, canonical_recover,
-                           NULL, &stream, &error) == LC_ERR_PROTOCOL);
+      CHECK(ps_stream_open(space, NULL, stream_key(1), 0, NULL,
+                           canonical_recover, NULL, &stream,
+                           &error) == LC_ERR_PROTOCOL);
       CHECK(stream == NULL);
       OK(ps_close(space, &error));
     }
@@ -3635,7 +3639,7 @@ static void canonical_stream_grown_tail(int native_zero) {
   memcpy(frame + 43, body, sizeof(body));
   clean();
   space = create(PS_MIB, 0, &io);
-  OK(ps_owned_open(space, stream_key(1), 1, NULL, &head, &owned, &error));
+  OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &owned, &error));
   OK(ps_checkpoint(space, &error));
   ps_owned_close(head);
   OK(ps_close(space, &error));
@@ -3649,7 +3653,7 @@ static void canonical_stream_grown_tail(int native_zero) {
   space = reopen(&io);
   OK(ps_status(space, &before, &error));
   CHECK(before.capacity == PS_MIB);
-  OK(ps_owned_open(space, stream_key(1), 0, NULL, &head, &owned, &error));
+  OK(ps_owned_open(space, NULL, stream_key(1), 0, NULL, &head, &owned, &error));
   OK(ps_grow(space, PS_MIB, &error));
   OK(ps_status(space, &before, &error));
   OK(ps_owned_grant(head, 0, PS_MIB, &run, &found, &error));
@@ -3872,7 +3876,8 @@ static void stream_lifecycle(int durable) {
   OK(ps_stream_close(old, &error));
   OK(ps_close(space, &error));
   space = reopen(&io);
-  OK(ps_stream_open(space, stream_key(1), 0, &prior, NULL, NULL, &old, &error));
+  OK(ps_stream_open(space, NULL, stream_key(1), 0, &prior, NULL, NULL, &old,
+                    &error));
   stream_expect(old, offset, body, PS_CHUNK * 4 + 17, 1);
   OK(ps_stream_read_open(old, 43, PS_CHUNK * 4 + 17, &held, &error));
   OK(ps_status(space, &before, &error));
@@ -3887,8 +3892,8 @@ static void stream_lifecycle(int durable) {
   BAD(ps_stream_begin(old, &w, &error));
   ps_stream_reader *rejected = NULL;
   BAD(ps_stream_read_open(old, 0, 1, &rejected, &error));
-  BAD(ps_stream_open(space, stream_key(1), 0, &prior, canonical_recover, NULL,
-                     &missing, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, &prior, canonical_recover,
+                     NULL, &missing, &error));
   fresh = stream_open(space, 1, 1, NULL, NULL);
   OK(ps_stream_status(fresh, &info, &error));
   current = info.ref;
@@ -3906,8 +3911,8 @@ static void stream_lifecycle(int durable) {
   OK(ps_stream_close(fresh, &error));
   OK(ps_close(space, &error));
   space = reopen(&io);
-  BAD(ps_stream_open(space, stream_key(1), 0, &prior, canonical_recover, NULL,
-                     &missing, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 0, &prior, canonical_recover,
+                     NULL, &missing, &error));
   fresh = stream_open(space, 1, 0, &current, NULL);
   stream_expect(fresh, offset, body, 64, 2);
   OK(ps_stream_retire(fresh, &error));
@@ -3918,7 +3923,8 @@ static void stream_lifecycle(int durable) {
   OK(ps_stream_close(fresh, &error));
   OK(ps_close(space, &error));
   space = reopen(&io);
-  OK(ps_stream_open(space, stream_key(2), 0, NULL, NULL, NULL, &fresh, &error));
+  OK(ps_stream_open(space, NULL, stream_key(2), 0, NULL, NULL, NULL, &fresh,
+                    &error));
   OK(ps_stream_status(fresh, &info, &error));
   CHECK(info.sealed && !info.tail && !info.capacity);
   OK(ps_stream_retire(fresh, &error));
@@ -3988,7 +3994,7 @@ static void stream_lifecycle_faults(int durable) {
         OK(ps_close(space, &error));
         crash(&m);
         space = reopen(&io);
-        opened = ps_stream_open(space, stream_key(1), 0, NULL,
+        opened = ps_stream_open(space, NULL, stream_key(1), 0, NULL,
                                 canonical_recover, NULL, &found, &error);
         if (opened == LC_OK) {
           CHECK(!operation || rc != LC_OK);
@@ -4111,7 +4117,8 @@ static void stream_lifecycle_capacity(void) {
   int found, rc;
   clean();
   space = create(PS_MIB, 0, NULL);
-  OK(ps_owned_open(space, stream_key(1), 1, NULL, &head, &status, &error));
+  OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &status,
+                   &error));
   for (;;) {
     rc = ps_owned_grant(head, base, PS_PAGE, &run, &found, &error);
     if (rc != LC_OK)
@@ -4147,7 +4154,8 @@ static void stream_lifecycle_capacity(void) {
   space = reopen(NULL);
   OK(ps_status(space, &after, &error));
   CHECK(!after.entries && !after.allocated_bytes);
-  OK(ps_owned_open(space, stream_key(1), 1, NULL, &head, &status, &error));
+  OK(ps_owned_open(space, NULL, stream_key(1), 1, NULL, &head, &status,
+                   &error));
   OK(ps_owned_grant(head, 0, PS_PAGE, &run, &found, &error));
   CHECK(found);
   ps_owned_run_close(run);
@@ -4219,8 +4227,8 @@ static void stream_lifecycle_concurrency(int retirement) {
   CHECK(!info.sealed && !info.retired);
   stream_expect(stream, 0, body, 64, 1);
   BAD(ps_stream_begin(stream, &busy, &error));
-  BAD(ps_stream_open(space, stream_key(1), 1, NULL, canonical_recover, NULL,
-                     &rejected, &error));
+  BAD(ps_stream_open(space, NULL, stream_key(1), 1, NULL, canonical_recover,
+                     NULL, &rejected, &error));
   pthread_mutex_lock(&gate.mutex);
   gate.released = 1;
   pthread_cond_broadcast(&gate.cond);
@@ -4407,15 +4415,16 @@ static void catalog_basic(int durable) {
                     &missing, &error));
   CHECK(!missing);
   OK(ps_status(space, &before, &error));
-  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
-                    NULL, stream_key(1), &ai.ref, &first, &error));
+  OK(ps_catalog_put(space, NULL, owner, PS_CATALOG_COLLECTION, binary,
+                    sizeof(binary), NULL, stream_key(1), &ai.ref, &first,
+                    &error));
   OK(ps_status(space, &after, &error));
   CHECK(after.journal_bytes == before.journal_bytes + 104 + sizeof(binary) &&
         after.syncs == before.syncs + 1);
   catalog_expect(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
                  1);
   BAD(ps_stream_retire(a, &error));
-  BAD(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary,
+  BAD(ps_catalog_put(space, NULL, owner, PS_CATALOG_COLLECTION, binary,
                      sizeof(binary), NULL, stream_key(2), &bi.ref, &out,
                      &error));
   wrong = first.revision;
@@ -4424,13 +4433,15 @@ static void catalog_basic(int durable) {
                         sizeof(binary), &wrong, &error));
   wrong = ai.ref;
   wrong.container[0] ^= 1;
-  BAD(ps_catalog_put(space, owner, PS_CATALOG_SEGMENT, binary, sizeof(binary),
-                     NULL, stream_key(1), &wrong, &out, &error));
+  BAD(ps_catalog_put(space, NULL, owner, PS_CATALOG_SEGMENT, binary,
+                     sizeof(binary), NULL, stream_key(1), &wrong, &out,
+                     &error));
   OK(ps_catalog_get(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
                     &held, &error));
   BAD(ps_close(space, &error));
-  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
-                    &first.revision, stream_key(2), &bi.ref, &second, &error));
+  OK(ps_catalog_put(space, NULL, owner, PS_CATALOG_COLLECTION, binary,
+                    sizeof(binary), &first.revision, stream_key(2), &bi.ref,
+                    &second, &error));
   CHECK(second.id == first.id &&
         second.revision.incarnation != first.revision.incarnation);
   BAD(ps_stream_retire(a, &error));
@@ -4443,7 +4454,7 @@ static void catalog_basic(int durable) {
   OK(ps_stream_close(a, &error));
   catalog_expect(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
                  2);
-  OK(ps_catalog_put(space, owner, PS_CATALOG_SEGMENT, NULL, 0, NULL,
+  OK(ps_catalog_put(space, NULL, owner, PS_CATALOG_SEGMENT, NULL, 0, NULL,
                     stream_key(2), &bi.ref, &out, &error));
   OK(ps_catalog_remove(space, owner, PS_CATALOG_SEGMENT, NULL, 0, &out.revision,
                        &error));
@@ -4459,8 +4470,9 @@ static void catalog_basic(int durable) {
   OK(ps_catalog_get(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
                     &missing, &error));
   CHECK(!missing);
-  OK(ps_catalog_put(space, owner, PS_CATALOG_COLLECTION, binary, sizeof(binary),
-                    NULL, stream_key(2), &bi.ref, &out, &error));
+  OK(ps_catalog_put(space, NULL, owner, PS_CATALOG_COLLECTION, binary,
+                    sizeof(binary), NULL, stream_key(2), &bi.ref, &out,
+                    &error));
   CHECK(out.id != second.id &&
         out.revision.incarnation != second.revision.incarnation);
   OK(ps_catalog_remove(space, owner, PS_CATALOG_COLLECTION, binary,
@@ -4497,11 +4509,12 @@ static void catalog_scale(void) {
   OK(ps_stream_status(stream, &target, &error));
   for (i = 0; i < 2000; ++i) {
     snprintf(name, sizeof(name), "name/%lu", (unsigned long)i);
-    OK(ps_catalog_put(space, i % 7, PS_CATALOG_COLLECTION, name, strlen(name),
-                      NULL, stream_key(1), &target.ref, &info, &error));
+    OK(ps_catalog_put(space, NULL, i % 7, PS_CATALOG_COLLECTION, name,
+                      strlen(name), NULL, stream_key(1), &target.ref, &info,
+                      &error));
   }
-  OK(ps_catalog_put(space, 99, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, NULL,
-                    stream_key(1), &target.ref, &info, &error));
+  OK(ps_catalog_put(space, NULL, 99, PS_CATALOG_CONTROL, large, PS_CHUNK + 17,
+                    NULL, stream_key(1), &target.ref, &info, &error));
   OK(ps_checkpoint(space, &error));
   OK(ps_stream_close(stream, &error));
   OK(ps_close(space, &error));
@@ -4554,16 +4567,17 @@ static void catalog_faults(void) {
         OK(canonical_append(b, "new", 3, 1, 2, &offset, &error));
         OK(ps_stream_status(a, &ai, &error));
         OK(ps_stream_status(b, &bi, &error));
-        OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
-                          stream_key(1), &ai.ref, &original, &error));
+        OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
+                          NULL, stream_key(1), &ai.ref, &original, &error));
         for (i = 0; i < 11; ++i) {
           snprintf(pad, sizeof(pad), "pad-%lu", (unsigned long)i);
-          OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, pad, strlen(pad),
-                            NULL, stream_key(1), &ai.ref, &seen, &error));
+          OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, pad,
+                            strlen(pad), NULL, stream_key(1), &ai.ref, &seen,
+                            &error));
         }
         OK(ps_checkpoint(space, &error));
         if (operation == 3)
-          OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+          OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
                             &original.revision, stream_key(2), &bi.ref,
                             &changed, &error));
         OK(ps_status(space, &stats, &error));
@@ -4573,10 +4587,10 @@ static void catalog_faults(void) {
         allocation_call = 0;
         allocation_fail = kind == 1 ? (phase ? phase : (size_t)-1) : 0;
         if (operation == 0)
-          rc = ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "next", 4, NULL,
-                              stream_key(2), &bi.ref, &changed, &error);
+          rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "next", 4,
+                              NULL, stream_key(2), &bi.ref, &changed, &error);
         else if (operation == 1)
-          rc = ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+          rc = ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
                               &original.revision, stream_key(2), &bi.ref,
                               &changed, &error);
         else if (operation == 2)
@@ -4664,7 +4678,7 @@ static void *catalog_worker(void *context) {
       a->remove
           ? ps_catalog_remove(a->space, 1, PS_CATALOG_COLLECTION, a->name,
                               strlen(a->name), &a->expected, &e)
-          : ps_catalog_put(a->space, 1, PS_CATALOG_COLLECTION, a->name,
+          : ps_catalog_put(a->space, NULL, 1, PS_CATALOG_COLLECTION, a->name,
                            strlen(a->name), a->create ? NULL : &a->expected,
                            stream_key(a->stream), &a->target, &a->result, &e);
   lc_error_cleanup(&e);
@@ -4695,7 +4709,7 @@ static void catalog_concurrency(int operation) {
     OK(ps_stream_status(streams[i], &targets[i], &error));
   }
   if (operation != 0) {
-    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+    OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
                       stream_key(1), &targets[0].ref, &initial, &error));
     OK(ps_catalog_get(space, 1, PS_CATALOG_COLLECTION, "slot", 4, &held,
                       &error));
@@ -4731,7 +4745,7 @@ static void catalog_concurrency(int operation) {
     BAD(ps_stream_retire(streams[0], &error));
   } else
     CHECK(view == NULL);
-  BAD(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
+  BAD(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4,
                      operation ? &initial.revision : NULL, stream_key(3),
                      &targets[2].ref, &result, &error));
   pthread_mutex_lock(&gate.mutex);
@@ -4816,9 +4830,9 @@ static int catalog_orphan_test(void *context, ps_key key, const ps_ref *ref,
     return lc_error_set(e, LC_ERR_INVALID, 0, "injected orphan visitor failure",
                         NULL, NULL, "test");
   if (v->mode == 2)
-    OK(ps_catalog_put(v->space, 1, PS_CATALOG_NAMESPACE, "rescued", 7, NULL,
-                      key, ref, &v->rescued, &error));
-  OK(ps_owned_open(v->space, key, 0, ref, &head, &status, &error));
+    OK(ps_catalog_put(v->space, NULL, 1, PS_CATALOG_NAMESPACE, "rescued", 7,
+                      NULL, key, ref, &v->rescued, &error));
+  OK(ps_owned_open(v->space, NULL, key, 0, ref, &head, &status, &error));
   if (v->mode == 2)
     BAD(ps_owned_retire(head, &error));
   else {
@@ -4849,7 +4863,7 @@ static void catalog_visitors(void) {
   OK(ps_stream_status(a, &ai, &error));
   for (i = 0; i < 3; ++i) {
     name = (unsigned char)i;
-    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, &name, 1, NULL,
+    OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, &name, 1, NULL,
                       stream_key(1), &ai.ref, &info, &error));
   }
   allocation_call = 0;
@@ -4934,19 +4948,19 @@ static void catalog_reopen_faults(void) {
   OK(ps_stream_status(b, &bi, &error));
   for (i = 0; i < 24; ++i) {
     snprintf(name, sizeof(name), "name-%lu", (unsigned long)i);
-    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name, strlen(name), NULL,
-                      stream_key(1), &ai.ref, &info, &error));
+    OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, name, strlen(name),
+                      NULL, stream_key(1), &ai.ref, &info, &error));
   }
-  OK(ps_catalog_put(space, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17, NULL,
-                    stream_key(2), &bi.ref, &info, &error));
+  OK(ps_catalog_put(space, NULL, 9, PS_CATALOG_CONTROL, large, PS_CHUNK + 17,
+                    NULL, stream_key(2), &bi.ref, &info, &error));
   OK(ps_checkpoint(space, &error));
   info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, "name-1", 6, 1);
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "name-1", 6,
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "name-1", 6,
                     &info.revision, stream_key(2), &bi.ref, &expected, &error));
   info = catalog_expect(space, 1, PS_CATALOG_COLLECTION, "name-2", 6, 1);
   OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "name-2", 6,
                        &info.revision, &error));
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "name-2", 6, NULL,
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "name-2", 6, NULL,
                     stream_key(2), &bi.ref, &expected, &error));
   OK(ps_stream_close(a, &error));
   OK(ps_stream_close(b, &error));
@@ -5027,11 +5041,12 @@ static void catalog_bounds_rollover(void) {
   space = create(3 * PS_MIB, 0, NULL);
   stream = stream_open(space, 1, 1, NULL, NULL);
   OK(ps_stream_status(stream, &target, &error));
-  BAD(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name,
+  BAD(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, name,
                      PS_CATALOG_NAME_MAX + 1, NULL, stream_key(1), &target.ref,
                      &first, &error));
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, name, PS_CATALOG_NAME_MAX,
-                    NULL, stream_key(1), &target.ref, &first, &error));
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, name,
+                    PS_CATALOG_NAME_MAX, NULL, stream_key(1), &target.ref,
+                    &first, &error));
   OK(ps_status(space, &stats, &error));
   CHECK(stats.journal_bytes == PS_JOURNAL);
   OK(ps_stream_close(stream, &error));
@@ -5053,7 +5068,7 @@ static void catalog_bounds_rollover(void) {
   space = create(3 * PS_MIB, 0, NULL);
   stream = stream_open(space, 1, 1, NULL, NULL);
   OK(ps_stream_status(stream, &target, &error));
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
                     stream_key(1), &target.ref, &first, &error));
   OK(ps_catalog_remove(space, 1, PS_CATALOG_COLLECTION, "slot", 4,
                        &first.revision, &error));
@@ -5065,7 +5080,7 @@ static void catalog_bounds_rollover(void) {
   }
   CHECK(PS_JOURNAL - stats.journal_bytes < 108 &&
         stats.checkpoints == checkpoints);
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
                     stream_key(1), &target.ref, &next, &error));
   CHECK(next.id != first.id);
   OK(ps_status(space, &stats, &error));
@@ -5101,13 +5116,13 @@ static void catalog_invalid_records(void) {
     stream = stream_open(space, 1, 1, NULL, NULL);
     OK(ps_stream_status(stream, &target, &error));
     OK(ps_checkpoint(space, &error));
-    OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
+    OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "slot", 4, NULL,
                       stream_key(1), &target.ref, &first, &error));
     offset = PS_JOURNAL_OFFSET;
     if (phase == 6) {
       OK(ps_status(space, &stats, &error));
       offset += (off_t)stats.journal_bytes;
-      OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, "next", 4, NULL,
+      OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION, "next", 4, NULL,
                         stream_key(1), &target.ref, &second, &error));
     } else if (phase == 7) {
       OK(ps_checkpoint(space, &error));
@@ -5220,9 +5235,10 @@ static void catalog_snapshot_prefix(int orphans) {
   b = stream_open(space, 2, 1, NULL, NULL);
   OK(ps_stream_status(a, &ai, &error));
   OK(ps_stream_status(b, &bi, &error));
-  OK(ps_catalog_put(space, 1, PS_CATALOG_COLLECTION, orphans ? "slot" : "base",
-                    4, NULL, stream_key(orphans ? 2 : 1),
-                    orphans ? &bi.ref : &ai.ref, &binding, &error));
+  OK(ps_catalog_put(space, NULL, 1, PS_CATALOG_COLLECTION,
+                    orphans ? "slot" : "base", 4, NULL,
+                    stream_key(orphans ? 2 : 1), orphans ? &bi.ref : &ai.ref,
+                    &binding, &error));
   OK(ps_stream_close(a, &error));
   OK(ps_stream_close(b, &error));
   publication.space = space;
@@ -5274,6 +5290,316 @@ static void catalog_snapshot_prefix(int orphans) {
        "vector allocation, no count/capture race");
 }
 
+static void budget_lifecycle(int durable) {
+  ps_space *s, *foreign = NULL;
+  ps_budget *b = NULL, *rejected = NULL;
+  ps_budget_plan plan = {PS_PAGE, 88, 1, 0}, remaining;
+  ps_writer *w = NULL;
+  ps_stats before, after;
+  unsigned char *bytes = malloc(2 * PS_PAGE);
+  CHECK(bytes);
+  memset(bytes, 0x63, 2 * PS_PAGE);
+  clean();
+  s = create(PS_MIB, durable, NULL);
+  OK(ps_status(s, &before, &error));
+  plan.payload_bytes = 1;
+  BAD(ps_budget_open(s, &plan, &b, &error));
+  CHECK(!b);
+  plan.payload_bytes = PS_PAGE;
+  plan.metadata_bytes = UINT64_MAX;
+  BAD(ps_budget_open(s, &plan, &b, &error));
+  CHECK(!b);
+  plan.metadata_bytes = 88;
+  plan.entries = UINT64_MAX;
+  BAD(ps_budget_open(s, &plan, &b, &error));
+  CHECK(!b);
+  plan.entries = 1;
+  plan.payload_bytes = PS_MIB;
+  BAD(ps_budget_open(s, &plan, &b, &error));
+  CHECK(!b);
+  OK(ps_status(s, &after, &error));
+  CHECK(after.entries == before.entries && after.budgets == 0 &&
+        after.journal_bytes == before.journal_bytes &&
+        after.reserved_payload_bytes == 0 &&
+        after.reserved_metadata_bytes == 0 && after.reserved_entries == 0);
+  plan.payload_bytes = PS_PAGE;
+  OK(ps_budget_open(s, &plan, &b, &error));
+  OK(ps_open(other, 1, NULL, &foreign, &error));
+  BAD(ps_begin(foreign, b, state(1), &w, &error));
+  CHECK(!w);
+  OK(ps_close(foreign, &error));
+  BAD(ps_close(s, &error));
+  OK(ps_begin(s, b, state(1), &w, &error));
+  BAD(ps_budget_close(b, &error));
+  OK(ps_write(w, bytes, PS_PAGE, &error));
+  OK(ps_publish(w, NULL, &error));
+  OK(ps_budget_status(b, &remaining, &error));
+  CHECK(!remaining.payload_bytes && !remaining.metadata_bytes &&
+        !remaining.entries);
+  ps_writer_close(w);
+  OK(ps_budget_close(b, &error));
+  b = NULL;
+  /* Replacing a same-shape value needs no descriptor or entry growth. */
+  plan.metadata_bytes = plan.entries = 0;
+  OK(ps_budget_open(s, &plan, &b, &error));
+  OK(ps_begin(s, b, state(1), &w, &error));
+  OK(ps_write(w, bytes + PS_PAGE, PS_PAGE, &error));
+  OK(ps_publish(w, NULL, &error));
+  ps_writer_close(w);
+  OK(ps_budget_close(b, &error));
+  /* A caller's under-sized plan cannot silently borrow ordinary capacity. */
+  plan.metadata_bytes = 88;
+  plan.entries = 1;
+  for (int kind = 0; kind < 3; ++kind) {
+    plan.payload_bytes = kind == 0 ? 0 : PS_PAGE;
+    plan.metadata_bytes = kind == 1 ? 87 : 88;
+    plan.entries = kind == 2 ? 0 : 1;
+    OK(ps_budget_open(s, &plan, &b, &error));
+    OK(ps_begin(s, b, state(2), &w, &error));
+    OK(ps_write(w, bytes, PS_PAGE, &error));
+    BAD(ps_publish(w, NULL, &error));
+    ps_writer_close(w);
+    absent(s, state(2));
+    OK(ps_budget_close(b, &error));
+  }
+  plan.payload_bytes = PS_PAGE;
+  plan.metadata_bytes = 88;
+  plan.entries = 1;
+  OK(ps_budget_open(s, &plan, &b, &error));
+  OK(ps_status(s, &before, &error));
+  for (int kind = 0; kind < 3; ++kind) {
+    plan.payload_bytes = kind == 0 ? UINT64_MAX / PS_PAGE * PS_PAGE : PS_PAGE;
+    plan.metadata_bytes = kind == 1 ? UINT64_MAX : 88;
+    plan.entries = kind == 2 ? UINT64_MAX : 1;
+    BAD(ps_budget_open(s, &plan, &rejected, &error));
+    CHECK(!rejected);
+    OK(ps_status(s, &after, &error));
+    CHECK(after.reserved_payload_bytes == before.reserved_payload_bytes &&
+          after.reserved_metadata_bytes == before.reserved_metadata_bytes &&
+          after.reserved_entries == before.reserved_entries &&
+          after.budgets == before.budgets);
+  }
+  OK(ps_budget_close(b, &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &after, &error));
+  CHECK(!after.budgets && !after.reserved_payload_bytes &&
+        !after.reserved_metadata_bytes && !after.reserved_entries);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, state(1), NULL, bytes, PS_PAGE);
+  absent(s, state(2));
+  OK(ps_status(s, &after, &error));
+  CHECK(!after.budgets && !after.reserved_entries);
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
+static void budget_fill(ps_space *s, uint64_t *next, const void *bytes) {
+  ps_writer *w = NULL;
+  int rc;
+  for (;;) {
+    OK(ps_begin(s, NULL, state((*next)++), &w, &error));
+    OK(ps_write(w, bytes, PS_PAGE, &error));
+    rc = ps_publish(w, NULL, &error);
+    ps_writer_close(w);
+    if (rc != LC_OK) {
+      CHECK(rc == LC_ERR_INVALID);
+      lc_error_cleanup(&error);
+      break;
+    }
+    CHECK(*next < 2000);
+  }
+}
+static void budget_capacity(int durable) {
+  ps_space *s;
+  ps_budget_plan plan = {8 * PS_PAGE, 256 + 80 + 108 + 512 * 64, 515, 0};
+  ps_budget_plan maintenance = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+  ps_budget *b = NULL, *peer = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_status head_info;
+  ps_catalog_info binding;
+  ps_stats stats;
+  ps_writer *w = NULL;
+  ps_ref ref;
+  unsigned char *bytes = malloc(8 * PS_PAGE);
+  uint64_t next = 1;
+  CHECK(bytes);
+  memset(bytes, 0x79, 8 * PS_PAGE);
+  clean();
+  s = create(3 * PS_MIB, durable, NULL);
+  OK(ps_budget_open(s, &plan, &b, &error));
+  budget_fill(s, &next, bytes);
+  OK(ps_checkpoint(s, &error));
+  budget_fill(s, &next, bytes);
+  OK(ps_metadata_repack(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.reserved_payload_bytes == plan.payload_bytes &&
+        stats.reserved_metadata_bytes == plan.metadata_bytes &&
+        stats.reserved_entries == plan.entries && stats.budgets == 1 &&
+        stats.metadata_available_bytes >= stats.metadata_workspace_bytes);
+  /* Once admitted, the foreground writer owns its claim even when a peer
+   * maintenance operation takes the remaining maintenance floor. */
+  OK(ps_budget_open(s, &maintenance, &peer, &error));
+  OK(ps_owned_open(s, b, key(PS_STREAM, 2, 1), 1, NULL, &head, &head_info,
+                   &error));
+  OK(ps_catalog_put(s, b, 2, PS_CATALOG_SEGMENT, "slot", 4, NULL,
+                    key(PS_STREAM, 2, 1), &head_info.ref, &binding, &error));
+  OK(ps_begin(s, b, key(PS_STATE, 2, 1), &w, &error));
+  OK(ps_write(w, bytes, PS_CHUNK, &error));
+  /* Private payload allocation must not consume future descriptor credits;
+   * a checkpoint must retain them until this writer actually publishes. */
+  OK(ps_checkpoint(s, &error));
+  OK(ps_write(w, bytes + PS_CHUNK, PS_CHUNK, &error));
+  OK(ps_publish(w, &ref, &error));
+  ps_writer_close(w);
+  for (uint64_t i = 0; i < 512; ++i) {
+    OK(ps_begin(s, b, key(PS_STATE, 3, i), &w, &error));
+    OK(ps_publish(w, NULL, &error));
+    ps_writer_close(w);
+    if (i % 128 == 127)
+      OK(ps_checkpoint(s, &error));
+  }
+  OK(ps_budget_close(peer, &error));
+  OK(ps_budget_close(b, &error));
+  ps_owned_close(head);
+  OK(ps_status(s, &stats, &error));
+  CHECK(!stats.budgets && !stats.reserved_payload_bytes &&
+        !stats.reserved_metadata_bytes && !stats.reserved_entries);
+  OK(ps_checkpoint(s, &error));
+  expect(s, key(PS_STATE, 2, 1), &ref, bytes, 8 * PS_PAGE);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, key(PS_STATE, 2, 1), &ref, bytes, 8 * PS_PAGE);
+  for (uint64_t i = 0; i < 512; ++i)
+    expect(s, key(PS_STATE, 3, i), NULL, NULL, 0);
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
+typedef struct budget_actor {
+  ps_space *space;
+  ps_budget *budget;
+  int rc;
+} budget_actor;
+static void *budget_produce(void *context) {
+  budget_actor *a = context;
+  ps_writer *w = NULL;
+  lc_error e;
+  unsigned char *bytes = malloc(PS_CHUNK);
+  if (!bytes)
+    abort();
+  memset(bytes, 0x73, PS_CHUNK);
+  lc_error_init(&e);
+  a->rc = ps_begin(a->space, a->budget, key(PS_STATE, 99, 1), &w, &e);
+  if (a->rc == LC_OK)
+    a->rc = ps_write(w, bytes, PS_CHUNK, &e);
+  if (a->rc == LC_OK)
+    a->rc = ps_publish(w, NULL, &e);
+  ps_writer_close(w);
+  lc_error_cleanup(&e);
+  free(bytes);
+  return NULL;
+}
+static void budget_concurrency(void) {
+  commit_gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&g, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+  ps_space *s;
+  ps_budget *b = NULL, *peer = NULL;
+  ps_budget_plan plan = {PS_CHUNK, 160, 1, 0}, pending;
+  ps_stats stats;
+  budget_actor actor;
+  pthread_t thread;
+  unsigned char *bytes = malloc(PS_CHUNK);
+  CHECK(bytes);
+  memset(bytes, 0x73, PS_CHUNK);
+  clean();
+  s = create(PS_MIB, 0, &io);
+  OK(ps_budget_open(s, &plan, &b, &error));
+  actor.space = s;
+  actor.budget = b;
+  actor.rc = -1;
+  g.enabled = g.hold_payload = 1;
+  CHECK(pthread_create(&thread, NULL, budget_produce, &actor) == 0);
+  await_gate(&g, 0);
+  BAD(ps_budget_close(b, &error));
+  for (uint64_t i = 0; i < 512; ++i)
+    put(s, state(i), NULL, 0, 1);
+  OK(ps_budget_open(s, &plan, &peer, &error));
+  OK(ps_metadata_repack(s, &error));
+  OK(ps_budget_close(peer, &error));
+  OK(ps_grow(s, PS_MIB, &error));
+  OK(ps_budget_status(b, &pending, &error));
+  CHECK(!pending.payload_bytes && pending.metadata_bytes == 160 &&
+        pending.entries == 1);
+  pthread_mutex_lock(&g.mutex);
+  g.released = 1;
+  pthread_cond_broadcast(&g.cond);
+  pthread_mutex_unlock(&g.mutex);
+  CHECK(pthread_join(thread, NULL) == 0);
+  CHECK(actor.rc == LC_OK);
+  OK(ps_budget_close(b, &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_status(s, &stats, &error));
+  CHECK(!stats.budgets && !stats.reserved_entries);
+  expect(s, key(PS_STATE, 99, 1), NULL, bytes, PS_CHUNK);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, key(PS_STATE, 99, 1), NULL, bytes, PS_CHUNK);
+  OK(ps_close(s, &error));
+  CHECK(pthread_cond_destroy(&g.cond) == 0);
+  CHECK(pthread_mutex_destroy(&g.mutex) == 0);
+  free(bytes);
+  clean();
+}
+static void budget_allocation_faults(void) {
+  ps_budget_plan plan = {PS_PAGE, 4000 * 64, 4000, 0};
+  unsigned char *bytes = malloc(PS_CHUNK);
+  size_t count = 0;
+  CHECK(bytes);
+  memset(bytes, 0x29, PS_CHUNK);
+  for (size_t cut = 0; cut <= count; ++cut) {
+    ps_space *s;
+    ps_budget *b = NULL;
+    ps_stats before, after;
+    int rc;
+    clean();
+    s = create(3 * PS_MIB, 0, NULL);
+    for (uint64_t i = 0; i < 128; ++i)
+      put(s, state(i + 10), bytes, PS_CHUNK, PS_CHUNK);
+    for (uint64_t i = 0; i < 128; i += 2)
+      OK(ps_delete(s, state(i + 10), &error));
+    OK(ps_checkpoint(s, &error));
+    OK(ps_status(s, &before, &error));
+    allocation_call = 0;
+    allocation_fail = cut ? cut : (size_t)-1;
+    rc = ps_budget_open(s, &plan, &b, &error);
+    allocation_fail = 0;
+    if (!cut) {
+      count = allocation_call;
+      CHECK(count >= 16);
+      OK(rc);
+      OK(ps_budget_close(b, &error));
+    } else {
+      CHECK(rc == LC_ERR_NOMEM && !b);
+      lc_error_cleanup(&error);
+    }
+    OK(ps_status(s, &after, &error));
+    CHECK(!after.budgets && !after.reserved_payload_bytes &&
+          !after.reserved_metadata_bytes && !after.reserved_entries &&
+          after.entries == before.entries &&
+          after.metadata_available_bytes == before.metadata_available_bytes &&
+          after.metadata_workspace_bytes == before.metadata_workspace_bytes);
+    OK(ps_budget_open(s, &plan, &b, &error));
+    OK(ps_budget_close(b, &error));
+    put(s, state(1), "retry", 5, 1);
+    OK(ps_checkpoint(s, &error));
+    OK(ps_close(s, &error));
+  }
+  printf("capacity budget admission: %lu allocation failure cuts\n",
+         (unsigned long)count);
+  free(bytes);
+  clean();
+}
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -5283,7 +5609,15 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "commit") == 0)
+    if (strcmp(argv[2], "budget") == 0) {
+      budget_lifecycle(0);
+      budget_lifecycle(1);
+      budget_concurrency();
+      budget_allocation_faults();
+    } else if (strcmp(argv[2], "budget-capacity") == 0) {
+      budget_capacity(0);
+      budget_capacity(1);
+    } else if (strcmp(argv[2], "commit") == 0)
       commit_coordination();
     else if (strcmp(argv[2], "reopen") == 0)
       reopen_retirement();

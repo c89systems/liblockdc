@@ -2893,6 +2893,138 @@ The current executable is `pouch_space_compare-workspace-current`, SHA-256
 `pouch_space_compare-repack-current`, SHA-256
 `33aa8cf62b7c5d8ec29b9db0e799b56b2ddc16b850cedfa5664b83182876a5c4`.
 
+## Operation capacity claims and explicit rotation
+
+The private [budget boundary](../experiments/pouch_space/budget.h) now admits
+complete declared capacity before dependent publication. A plan reserves
+page-aligned payload bytes, positive descriptor growth and additional live
+entries. Ordinary claims preserve the maintenance floor; maintenance claims may
+spend it. Let Q be unspent payload claims and D/E be outstanding descriptor/entry
+credits. Ordinary payload admission and checkpoint top-ups exclude Q, while the
+protected checkpoint bound F includes live metadata plus D/E. This keeps future
+metadata protected through peer checkpoints, repack and growth, including while
+a private writer has released allocator authority for payload I/O.
+
+Payload credits are spent when physical pages are taken. Descriptor and entry
+credits remain outstanding until actual publication under allocator authority;
+their removal then offsets the corresponding live metadata increase. Spent
+credits are not automatically refunded after a failed or abandoned attempt.
+Release returns unspent quota and excess dynamic metadata workspace, using a
+preallocated interval split node. Active immutable writers pin their budget;
+space close rejects outstanding handles. Claims are process-local and volatile
+under the current exclusive root owner. Claim/release performs no I/O and changes
+neither the persisted representation nor installed ABI. It provides capacity
+admission, not key isolation, rollback, or immunity to memory/I/O failures.
+Producers continue outside allocator locks.
+
+Explicit empty namespace rotation now claims a possible routing payload page,
+positive routing descriptor growth and the new successor head/name binding
+before staging that successor. Existing staged successors avoid those extra
+descriptor charges. Predecessor sealing and journal rollover use the protected
+checkpoint pool. Failed admission leaves the selected head and successor
+directory unchanged. Canonical run grants still use ordinary admission: this
+stage does not establish complete automatic append/delete or compaction
+admission. The 16 KiB floor also cannot cover every accepted key up to 1 MiB;
+protecting the complete bounded canonical work remains required.
+
+### Capacity, concurrency and failure evidence
+
+The new budget fixtures cover typed quota exhaustion, same-shape replacement
+without metadata growth, cross-container rejection, busy close, aggregate
+overflow and populated reopen with no surviving claims. At 3 MiB, an ordinary
+budget reserves a 32 KiB value, a stream head/catalog binding and 512 empty
+values. Peers fill foreground capacity, checkpoint, fill again and repack. A
+separate maintenance claim then takes the 16 KiB floor. The original owner must
+still complete every funded publication and survive reopen under both sync
+policies. A private write is checkpointed before its descriptor publishes.
+
+A held-I/O producer lets peers create 512 entries, open/release another claim,
+repack and grow by 1 MiB before the original writer completes. Its future
+descriptor credits must remain intact through that interval. A fragmented
+admission fixture covers **49 allocation failure cuts**, including failures
+after partial transfers into the metadata pool, exact quota/workspace cleanup
+and retry on the same owner. The namespace fixture fills a fixed 1 MiB store,
+rotates, claims remaining free pages, requires another rotation to fail before
+staging a successor, releases those claims, retries and verifies populated
+reopen. Both root sync policies pass. Existing namespace rotation and snapshot
+allocation/write/sync/torn-write sweeps remain enabled.
+
+Two falsification checks distinguish these guarantees. Ignoring held payload
+claims makes the capacity fixture fail at the second private 16 KiB write.
+Requiring the maintenance floor again when spending a funded ordinary claim
+fails at successor head creation after the peer takes that floor. The final
+implementation applies the floor only at claim admission and both regressions
+pass.
+
+The full **149-group Debug ASan/UBSan** experimental suite passes in 715.11 s
+before the final funded-floor refinement. On the final executable behavior,
+**27 affected Debug groups** pass in 213.30 s, **27 GNU release groups** in
+201.79 s, **27 musl release groups** in 220.02 s and **17 ThreadSanitizer groups**
+in 177.50 s. Final assertions additionally exercise overflow of each aggregate
+against an existing claim; the budget group passes again in all four
+configurations. Four Memcheck runs (budget, budget-capacity and namespace
+reservation/faults) complete **301,983 allocations and frees**, with zero live
+blocks, errors or suppressions. Debug uses the established 128 KiB worker policy;
+musl uses its native worker default.
+
+Logs are under `build/pouch-space-budget/`: `debug-tests.log`,
+`debug-final-tests.log`, `gnu-tests.log`, `musl-tests.log`, `tsan-tests.log`, final
+`*-test-output.log` captures, and four `memcheck-*.log`/`*-output.log` pairs.
+`negative-capacity-tests.log` and `funded-floor-red-tests.log` retain the
+deliberate removal and the reproduced funded-floor defect. Final tests cover
+the restored protections.
+
+### Matched ordinary metadata performance
+
+The 80 serial release runs repeat five alternating-order samples of current/prior
+container and current/prior multifile, each with 512 seeded 1 KiB states and two
+metadata-update rounds. Writers use independent namespaces. Cache is retained;
+every run verifies values after reopen, and container runs audit one fixed
+10 MiB file with no sidecars. This measures ordinary update regression behavior,
+not emergency rewrite or capacity-claim latency. Medians below are ms.
+
+| Policy | Writers | Current container | Prior container | Current multifile | Prior multifile | Current C CPU | Prior C CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 55.804 | 47.872 | 44.894 | 45.175 | 26.811 | 23.949 |
+| NoSync | 4 | 12.652 | 12.483 | 11.701 | 12.261 | 33.917 | 32.492 |
+| Durable | 1 | 1651.678 | 1341.924 | 4049.839 | 4023.512 | 109.907 | 113.168 |
+| Durable | 4 | 1196.815 | 1097.344 | 2342.664 | 2505.798 | 146.706 | 141.843 |
+
+Container durable medians remain below current multifile. NoSync is about 24%
+slower with one writer and 8% with four. Current/prior container timing ranges
+overlap in every fixture. One-writer NoSync rises about 17% versus prior;
+CPU ranges overlap at 23.241–33.335 versus 23.278–29.245 ms, but the higher
+current median remains an unresolved observation. Durable one-writer time rises
+about 23%, with recorded sync medians 1571.945 versus 1260.620 ms and lower
+current CPU. Durable four-writer time rises about 9%, with sync medians
+1178.093 versus 1078.352 ms. These samples do not isolate a cause or establish
+that the remaining performance deficits are solved.
+
+Current/prior container syscall write volumes match exactly: 342,692 bytes
+with one writer and 341,576 with four. One writer retains three NoSync barriers
+and 1027 durable barriers. Four writers use zero NoSync barriers and median
+520 durable barriers (518–524), versus prior median 519 and current multifile
+1024. The single-writer NoSync structural barriers remain a concrete cost.
+
+The reopened ready phase includes root open plus first verification/projection
+load; four-namespace container medians remain slower than multifile.
+
+| Policy | Writers | Current C ready | Prior C ready | Current MF ready | Prior MF ready |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1 | 17.478 | 16.054 | 16.140 | 14.054 |
+| NoSync | 4 | 36.236 | 33.887 | 16.415 | 15.181 |
+| Durable | 1 | 14.564 | 14.514 | 18.171 | 14.947 |
+| Durable | 4 | 30.130 | 28.590 | 16.691 | 14.947 |
+
+Raw logs are `build/pouch-space-budget/metadata-paired/`, with runner
+`metadata-paired.sh`, `metadata-results.json` and `metadata-benchmark.log`.
+The **85-artifact** `metadata-artifacts.sha256` manifest verifies. The current
+executable `pouch_space_compare-current` has SHA-256
+`e2e306e94836895a95f9166eb2d8e6995b6b765790264fabeffbe1fe4fc211a5`;
+prior is the previous stage's frozen `pouch_space_compare-workspace-current`,
+SHA-256 `535221931ba552ba92a8e2d9f7518f6439046c4d0360748564283843d1c5af3f`.
+The previous workspace manifest also verifies unchanged.
+
 ## Next commitments
 
 The [integrated foundation](../experiments/pouch_space/DESIGN.md) now replaces
@@ -2913,7 +3045,11 @@ Explicit metadata repacking and near-full checkpoint funding during growth now
 join that foundation, with the failure and ordinary-update measurements above.
 The checkpoint-only pool and dense fallback now preserve metadata progress after
 foreground exhaustion, with final capacity/recovery/race/memory checks above.
-The next work must close whole-operation maintenance admission at capacity,
+Volatile capacity claims and explicit rotation now join that foundation, with
+funded-writer, quota rollback, concurrency and matched performance evidence above.
+The next work must carry budgets through canonical grant spending and complete
+append/delete/compaction admission, protect bounded maintenance work for admitted
+key sizes, and close whole-operation maintenance admission at capacity,
 address remaining NoSync, checksum/body-read and reopened-projection costs, and
 connect advanced mutations, public query-client and collection ownership, then
 complete the public behavior suites. Full native integration still requires

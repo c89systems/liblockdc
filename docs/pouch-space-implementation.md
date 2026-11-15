@@ -78,6 +78,19 @@ same file. With spare common capacity, checkpoints stay incremental. Near
 capacity, a dense metadata rewrite and old-root retirement restore enough free
 workspace for the next checkpoint. Excess dynamic workspace returns to common
 allocation; the fixed 128 KiB region remains protected.
+The experimental private budget boundary now claims payload pages, positive
+descriptor growth and additional live entries before dependent publication.
+Checkpoint bounds include outstanding future credits; private writers retain
+descriptor credits until publication, while physical allocation spends payload
+credits. Ordinary admission and checkpoint top-ups cannot consume those claims.
+The maintenance floor applies at admission, so funded work remains possible when
+a peer subsequently claims that floor. Handles pin their space and active writers
+pin their budget. Claim/release uses no I/O or persisted format; it neither
+isolates keys nor rolls back publications. Explicit namespace rotation now
+reserves its successor, binding and routing replacement before staging.
+Canonical grant spending and complete append/delete/compaction admission remain
+pending. A bounded-work policy must also cover accepted keys up to 1 MiB;
+the fixed 16 KiB floor alone cannot establish that guarantee.
 Tests cover 12,000 entries in 10 MiB, incremental
 checkpoint I/O, spanning descriptors, private-build allocation failures and
 torn/missing writes at multi-page checkpoint boundaries. Small payload tails now

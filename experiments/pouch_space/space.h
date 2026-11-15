@@ -38,6 +38,7 @@ enum ps_kind {
   PS_ROUTING = 7
 };
 typedef struct ps_space ps_space;
+typedef struct ps_budget ps_budget;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
 /* Optional logical publication after complete canonical bytes are ready,
@@ -64,9 +65,12 @@ typedef struct ps_stats {
   uint64_t sync_requests, sync_batches, max_sync_batch;
   uint64_t metadata_pages, directory_page_writes, descriptor_page_writes;
   /* Free pages protected from payload allocation and the complete current
-   * checkpoint bound. After successful checkpoint, available >= workspace. */
+   * plus claimed-future checkpoint bound. After successful checkpoint,
+   * available >= workspace. */
   uint64_t metadata_available_bytes, metadata_workspace_bytes;
   uint64_t metadata_fallbacks;
+  uint64_t reserved_payload_bytes, reserved_metadata_bytes, reserved_entries;
+  uint64_t budgets;
   uint64_t packed_pages, packed_bytes;
 } ps_stats;
 
@@ -94,10 +98,13 @@ typedef struct ps_options {
 /* create != 0 requires a new pathname; open never creates or truncates. */
 int ps_open(const char *, int create, const ps_options *, ps_space **,
             lc_error *);
-/* Close requires every writer and reader to be closed. It does not implicitly
- * checkpoint or make NoSync publications durable. Error leaves the handle. */
+/* Close requires every writer, reader and capacity budget to be closed. It
+ * does not implicitly checkpoint or make NoSync publications durable.
+ * Error leaves the handle. */
 int ps_close(ps_space *, lc_error *);
-int ps_begin(ps_space *, ps_key, ps_writer **, lc_error *);
+/* NULL budget uses ordinary admission. Explicit claims cover physical pages
+ * and positive descriptor growth, and remain pinned until writer_close. */
+int ps_begin(ps_space *, ps_budget *, ps_key, ps_writer **, lc_error *);
 int ps_write(ps_writer *, const void *, size_t, lc_error *);
 /* Publication replaces STATE, but rejects a currently bound COLLECTION key.
  * These are physical record keys: permanent collection position allocation and

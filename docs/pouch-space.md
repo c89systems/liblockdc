@@ -35,7 +35,12 @@ failure. First-record canonical bytes now complete before head selection; the
 routing head follows root durability, with a flush before predecessor sealing.
 Recovery discards private successor bytes whose head was not selected, even
 when a peer checkpoint stabilized them. Protected admission for the complete
-maintenance operation remains required.
+maintenance operation remains required. Explicit empty rotation now reserves
+successor head, catalog binding and routing replacement before staging the
+successor. Process-local capacity claims also protect future metadata across
+checkpoints and private writer I/O. Canonical grants, automatic deletion and
+compaction still need complete-operation admission; the fixed maintenance floor
+does not yet cover every admitted key size.
 State read-many, metadata visits and paged scan/body snapshots now use captured
 container read pins, with lazy bounded decoding and no body cache. Captured
 body access survives callback mutation and Pouch close. Remaining public Pouch

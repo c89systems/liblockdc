@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c directory.c stream.c catalog.c record_io.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c pouch.c maintenance.c)
+add_library(pouch_space_experiment STATIC space.c budget.c directory.c stream.c catalog.c record_io.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c pouch.c maintenance.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -153,6 +153,10 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
+  add_test(NAME pouch_space_budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget)
+  add_test(NAME pouch_space_budget-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget-capacity)
+  set_tests_properties(pouch_space_budget pouch_space_budget-capacity PROPERTIES TIMEOUT 120
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
   add_test(NAME pouch_space_metadata COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata)
   add_test(NAME pouch_space_metadata-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} metadata-capacity)

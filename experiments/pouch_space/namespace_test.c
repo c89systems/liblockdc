@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "budget.h"
 #include "lc_api_internal.h"
 #include "namespace.h"
 #include "record_io.h"
@@ -489,7 +490,7 @@ static void raw_head(const char *path, ps_key key, const unsigned char *bytes,
   ps_space *space = NULL;
   ps_writer *writer = NULL;
   ok(ps_open(path, 0, NULL, &space, e), e);
-  ok(ps_begin(space, key, &writer, e), e);
+  ok(ps_begin(space, NULL, key, &writer, e), e);
   ok(ps_write(writer, bytes, length, e), e);
   ok(ps_publish(writer, NULL, e), e);
   ps_writer_close(writer);
@@ -519,7 +520,7 @@ static void windows(const char *path) {
   ps_key key = {1, 1, PS_STREAM};
   ps_stream_writer *writer = NULL;
   ok(ps_open(path, 1, NULL, &space, &e), &e);
-  ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+  ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e), &e);
   ok(ps_stream_begin(stream, &writer, &e), &e);
   ok(ps_stream_write(writer, "abc", 3, &e), &e);
   ok(ps_stream_commit(writer, NULL, NULL, &e), &e);
@@ -634,7 +635,7 @@ static void validation(const char *path) {
       ok(ps_catalog_remove(space, identity.owner, PS_CATALOG_SEGMENT, first,
                            strlen(first), &original.revision, &e),
          &e);
-    ok(ps_catalog_put(space, identity.owner, PS_CATALOG_SEGMENT, name,
+    ok(ps_catalog_put(space, NULL, identity.owner, PS_CATALOG_SEGMENT, name,
                       strlen(name), NULL, original.stream, &original.target,
                       &inserted, &e),
        &e);
@@ -645,7 +646,7 @@ static void validation(const char *path) {
                          strlen(name), &inserted.revision, &e),
        &e);
     if (bad >= 3)
-      ok(ps_catalog_put(space, identity.owner, PS_CATALOG_SEGMENT, first,
+      ok(ps_catalog_put(space, NULL, identity.owner, PS_CATALOG_SEGMENT, first,
                         strlen(first), NULL, original.stream, &original.target,
                         &inserted, &e),
          &e);
@@ -837,7 +838,7 @@ static void stream_reservation(const char *path) {
     o.durable_sync = sync;
     lc_error_init(&e);
     ok(ps_open(path, 1, &o, &space, &e), &e);
-    ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+    ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e), &e);
     ok(ps_stream_begin(stream, &writer, &e), &e);
     ok(ps_status(space, &before, &e), &e);
     ok(ps_stream_reserve(writer, 0, &e), &e);
@@ -891,7 +892,85 @@ static void stream_reservation(const char *path) {
     lc_error_cleanup(&e);
   }
 }
+static void rotation_capacity(const char *path) {
+  for (int durable = 0; durable < 2; ++durable) {
+    ps_root_options o = {0};
+    ps_root *root = NULL;
+    ps_namespace *ns;
+    ps_namespace_status before, after;
+    ps_stats physical, rejected;
+    ps_budget *held[64] = {0};
+    ps_budget_plan page = {PS_PAGE, 0, 0, 1};
+    ps_writer *writer = NULL;
+    size_t claims = 0;
+    lc_error e;
+    lc_error_init(&e);
+    o.storage.initial_capacity = o.storage.maximum_capacity = PS_MIB;
+    o.storage.durable_sync = durable;
+    ok(ps_root_open(path, 1, &o, &root, &e), &e);
+    ns = acquire(root, "rotation-capacity", 1, &e);
+    ok(append(root, ns, 1, 0, 31, &e), &e);
+    for (uint64_t i = 0;; ++i) {
+      ps_key key = {99, i, PS_STATE};
+      ok(ps_begin(ps_root_space(root), NULL, key, &writer, &e), &e);
+      ok(ps_write(writer, body, PS_PAGE, &e), &e);
+      int rc = ps_publish(writer, NULL, &e);
+      ps_writer_close(writer);
+      if (rc != LC_OK) {
+        REQUIRE(rc == LC_ERR_INVALID);
+        clear(&e);
+        break;
+      }
+      REQUIRE(i < 256);
+    }
+    /* Foreground exhaustion leaves enough reserved capacity for a complete
+     * explicit rotation: successor, binding, routing and predecessor seal. */
+    ok(ps_namespace_rotate(ns, 1, &e), &e);
+    ok(ps_namespace_status_get(ns, &before, &e), &e);
+    REQUIRE(before.active_segment == 2 && before.tail == 0);
+    count(ns, 1, &e);
+    for (;;) {
+      REQUIRE(claims < sizeof(held) / sizeof(*held));
+      int rc = ps_budget_open(ps_root_space(root), &page, held + claims, &e);
+      if (rc != LC_OK) {
+        REQUIRE(rc == LC_ERR_INVALID && !held[claims]);
+        clear(&e);
+        break;
+      }
+      ++claims;
+    }
+    ok(ps_status(ps_root_space(root), &physical, &e), &e);
+    REQUIRE(physical.budgets == claims && claims > 0);
+    REQUIRE(ps_namespace_rotate(ns, 2, &e) == LC_ERR_INVALID);
+    clear(&e);
+    ok(ps_status(ps_root_space(root), &rejected, &e), &e);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(rejected.entries == physical.entries &&
+            rejected.journal_bytes == physical.journal_bytes &&
+            rejected.budgets == physical.budgets &&
+            rejected.reserved_payload_bytes ==
+                physical.reserved_payload_bytes &&
+            after.active_segment == before.active_segment &&
+            after.tail == before.tail);
+    for (size_t i = 0; i < claims; ++i)
+      ok(ps_budget_close(held[i], &e), &e);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    ok(ps_namespace_rotate(ns, 2, &e), &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    ok(ps_root_open(path, 0, &o, &root, &e), &e);
+    ns = acquire(root, "rotation-capacity", 0, &e);
+    ok(ps_namespace_status_get(ns, &after, &e), &e);
+    REQUIRE(after.active_segment == 3 && after.tail == 0);
+    count(ns, 1, &e);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    lc_error_cleanup(&e);
+  }
+}
 static void reservation(const char *path) {
+  rotation_capacity(path);
   stream_reservation(path);
   for (int sync = 0; sync < 2; ++sync) {
     ps_root_options o = {0};
@@ -1016,7 +1095,7 @@ static int publish_control(void *context, uint64_t tail, lc_error *e) {
     return lc_error_set(e, LC_ERR_NOMEM, 0, "publication fixture rejected",
                         NULL, NULL, "test");
   put64(bytes, tail);
-  rc = ps_begin(p->space, key, &control, e);
+  rc = ps_begin(p->space, NULL, key, &control, e);
   if (rc == LC_OK)
     rc = ps_write(control, bytes, sizeof(bytes), e);
   if (rc == LC_OK)
@@ -1043,7 +1122,8 @@ static void covered_publication(const char *path) {
       lc_error_init(&e);
       o.durable_sync = sync;
       ok(ps_open(path, 1, &o, &space, &e), &e);
-      ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+      ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e),
+         &e);
       ok(ps_stream_begin(stream, &writer, &e), &e);
       ok(ps_stream_reserve(writer, 3, &e), &e);
       ok(ps_stream_write(writer, "abc", 3, &e), &e);
@@ -1128,8 +1208,8 @@ static void reject_published_successor(const char *path) {
   REQUIRE(view != NULL);
   ok(ps_catalog_view_info(view, &binding, &e), &e);
   ps_catalog_view_close(view);
-  ok(ps_stream_open(space, binding.stream, 0, &binding.target, recover_empty,
-                    NULL, &stream, &e),
+  ok(ps_stream_open(space, NULL, binding.stream, 0, &binding.target,
+                    recover_empty, NULL, &stream, &e),
      &e);
   ok(ps_stream_begin(stream, &writer, &e), &e);
   ok(ps_stream_write(writer, "bad", 3, &e), &e);
@@ -1176,7 +1256,7 @@ static void routing(const char *path) {
       ok(ps_open(path, 1, &o, &space, &e), &e);
       REQUIRE(ps_flush(NULL, &e) == LC_ERR_INVALID);
       clear(&e);
-      ok(ps_begin(space, key, &writer, &e), &e);
+      ok(ps_begin(space, NULL, key, &writer, &e), &e);
       ok(ps_write(writer, &value, 1, &e), &e);
       ok(ps_publish(writer, NULL, &e), &e);
       ps_writer_close(writer);
@@ -1185,7 +1265,7 @@ static void routing(const char *path) {
       ok(ps_status(space, &before, &e), &e);
       if (phase < 2) {
         value = 2;
-        ok(ps_begin(space, key, &writer, &e), &e);
+        ok(ps_begin(space, NULL, key, &writer, &e), &e);
         ok(ps_write(writer, &value, 1, &e), &e);
         ok(ps_publish(writer, NULL, &e), &e);
         ps_writer_close(writer);
@@ -1517,7 +1597,7 @@ static void snapshots(const char *path, const char *key) {
       REQUIRE(snapshot_binding != NULL);
       ok(ps_catalog_view_info(snapshot_binding, &own_binding, &e), &e);
       ps_catalog_view_close(snapshot_binding);
-      ok(ps_catalog_put(ps_root_space(root), foreign_identity.owner,
+      ok(ps_catalog_put(ps_root_space(root), NULL, foreign_identity.owner,
                         PS_CATALOG_SNAPSHOT, stable, strlen(stable), NULL,
                         own_binding.stream, &own_binding.target,
                         &foreign_binding, &e),
@@ -1643,8 +1723,8 @@ static void snapshots(const char *path, const char *key) {
       ps_key orphan_key = {orphan_id, 1, PS_STREAM};
       ps_stream *orphan = NULL;
       ps_stream_writer *writer = NULL;
-      ok(ps_stream_open(ps_root_space(root), orphan_key, 1, NULL, NULL, NULL,
-                        &orphan, &e),
+      ok(ps_stream_open(ps_root_space(root), NULL, orphan_key, 1, NULL, NULL,
+                        NULL, &orphan, &e),
          &e);
       ok(ps_stream_begin(orphan, &writer, &e), &e);
       ok(ps_stream_write(writer, "not a canonical record", 22, &e), &e);
@@ -1773,8 +1853,8 @@ static void snapshot_fault_cases(const char *path, int previous) {
             ps_key key = {id, 1, PS_STREAM};
             ps_stream *orphan = NULL;
             ps_stream_writer *writer = NULL;
-            ok(ps_stream_open(ps_root_space(root), key, 1, NULL, NULL, NULL,
-                              &orphan, &e),
+            ok(ps_stream_open(ps_root_space(root), NULL, key, 1, NULL, NULL,
+                              NULL, &orphan, &e),
                &e);
             ok(ps_stream_begin(orphan, &writer, &e), &e);
             ok(ps_stream_write(writer, body, 31, &e), &e);
@@ -1942,7 +2022,7 @@ static void bodies(const char *path) {
     REQUIRE(catalog != NULL);
     ok(ps_catalog_view_info(catalog, &binding, &e), &e);
     ps_catalog_view_close(catalog);
-    ok(ps_catalog_put(ps_root_space(root), other.owner, kind, leaf,
+    ok(ps_catalog_put(ps_root_space(root), NULL, other.owner, kind, leaf,
                       strlen(leaf), NULL, binding.stream, &binding.target,
                       &inserted, &e),
        &e);
@@ -1992,11 +2072,12 @@ static void bodies(const char *path) {
   ps_stream *stream = NULL;
   ps_stream_info info;
   ps_catalog_info binding;
-  ok(ps_stream_open(ps_root_space(root), key, 1, NULL, NULL, NULL, &stream, &e),
+  ok(ps_stream_open(ps_root_space(root), NULL, key, 1, NULL, NULL, NULL,
+                    &stream, &e),
      &e);
   ok(ps_stream_status(stream, &info, &e), &e);
-  ok(ps_catalog_put(ps_root_space(root), identity.owner, PS_CATALOG_BODY, leaf,
-                    strlen(leaf), NULL, key, &info.ref, &binding, &e),
+  ok(ps_catalog_put(ps_root_space(root), NULL, identity.owner, PS_CATALOG_BODY,
+                    leaf, strlen(leaf), NULL, key, &info.ref, &binding, &e),
      &e);
   ok(ps_stream_close(stream, &e), &e);
   ps_namespace_release(ns);

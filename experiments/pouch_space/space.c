@@ -17,6 +17,7 @@
 #include <zlib.h>
 struct ps_writer {
   ps_space *space;
+  ps_budget *budget;
   ps_entry *entry;
   size_t used;
   int failed, published;
@@ -790,6 +791,14 @@ static int metadata_bound(uint64_t bytes, uint64_t entries, uint64_t *bound,
   *bound = pages * PS_PAGE;
   return LC_OK;
 }
+static int metadata_claimed_bound(ps_space *s, uint64_t bytes, uint64_t entries,
+                                  uint64_t *bound, lc_error *error) {
+  if (bytes > UINT64_MAX - s->reserved_metadata ||
+      entries > UINT64_MAX - s->reserved_entries)
+    return err(error, LC_ERR_INVALID, "container metadata budget overflow");
+  return metadata_bound(bytes + s->reserved_metadata,
+                        entries + s->reserved_entries, bound, error);
+}
 static uint64_t metadata_target(ps_space *s, uint64_t bound) {
   uint64_t allocated = (uint64_t)s->metadata_pages * PS_PAGE;
   /* Enough free pages for one complete rewrite, and two complete images
@@ -803,8 +812,10 @@ static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
   ps_run *node;
   int rc;
   extra = target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
-  if (payload > s->free_bytes || s->free_bytes - payload < floor ||
-      extra > s->free_bytes - payload - floor)
+  if (s->reserved_payload > s->free_bytes ||
+      payload > s->free_bytes - s->reserved_payload ||
+      s->free_bytes - s->reserved_payload - payload < floor ||
+      extra > s->free_bytes - s->reserved_payload - payload - floor)
     return err(error, LC_ERR_INVALID,
                "container capacity reserved for checkpoint and maintenance; "
                "checkpoint or grow");
@@ -833,11 +844,29 @@ static int metadata_protect(ps_space *s, uint64_t bound, uint64_t payload,
 }
 static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
                                       uint64_t entries, uint64_t payload,
-                                      uint64_t floor, lc_error *error) {
+                                      uint64_t floor, ps_budget *budget,
+                                      lc_error *error) {
   uint64_t bound, current;
-  int rc = metadata_bound(bytes, entries, &bound, error);
+  uint64_t growth = bytes > s->metadata ? bytes - s->metadata : 0;
+  uint64_t added = entries > s->live_entries ? entries - s->live_entries : 0;
+  int rc = ps_internal_budget_check(s, budget, payload, growth, added, error);
+  if (rc != LC_OK)
+    return rc;
+  /* The owner's positive growth is already present in aggregate future
+   * credits. Keep that protection until publication, including through peer
+   * checkpoints while a writer performs private payload I/O. */
+  if (budget) {
+    bytes = s->metadata;
+    entries = s->live_entries;
+    payload = 0;
+    /* The floor governed admission. Funded work must remain possible when
+     * another maintenance claimant subsequently uses that unclaimed floor. */
+    floor = 0;
+  }
+  rc = metadata_claimed_bound(s, bytes, entries, &bound, error);
   if (rc == LC_OK)
-    rc = metadata_bound(s->metadata, s->live_entries, &current, error);
+    rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &current,
+                                error);
   if (rc != LC_OK)
     return rc;
   if (bound < current)
@@ -847,29 +876,31 @@ static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
 static int checkpoint_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
                                 uint64_t payload, lc_error *error) {
   return checkpoint_allowance_floor(s, bytes, entries, payload,
-                                    PS_MAINTENANCE_RESERVE, error);
+                                    PS_MAINTENANCE_RESERVE, NULL, error);
 }
 static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
                                uint64_t entries, uint64_t payload,
-                               lc_error *error) {
+                               ps_budget *budget, lc_error *error) {
   uint64_t floor = PS_MAINTENANCE_RESERVE;
   if (entry->key.kind == PS_CONTROL || entry->key.kind == PS_ROUTING) {
     ps_entry *old = lookup(s, entry->key);
     if (old && !old->deleted)
       floor -= PS_PAGE;
   }
-  return checkpoint_allowance_floor(s, bytes, entries, payload, floor, error);
+  return checkpoint_allowance_floor(s, bytes, entries, payload, floor, budget,
+                                    error);
 }
 static int immutable_extent_allowance(ps_space *s, ps_entry *entry,
-                                      uint64_t payload, lc_error *error) {
+                                      uint64_t payload, ps_budget *budget,
+                                      lc_error *error) {
   ps_entry *old = lookup(s, entry->key);
   size_t prior = old && !old->deleted ? entry_bytes(old) : 0;
   return immutable_allowance(
       s, entry, s->metadata - prior + entry_bytes(entry) + 24,
-      s->live_entries + (old && !old->deleted ? 0 : 1), payload, error);
+      s->live_entries + (old && !old->deleted ? 0 : 1), payload, budget, error);
 }
 static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
-                           size_t bytes, lc_error *error) {
+                           size_t bytes, ps_budget *budget, lc_error *error) {
   ps_payload_page *p = NULL;
   size_t count = cell_count(bytes), bin, at;
   uint64_t mask, reserve = PS_PAGE;
@@ -879,7 +910,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
       p = s->available[bin];
       break;
     }
-  rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, error);
+  rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, budget, error);
   if (rc != LC_OK)
     return rc;
   if (!p) {
@@ -892,6 +923,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
       return rc;
     }
     p->run.bytes = PS_PAGE;
+    ps_internal_budget_spend(budget, PS_PAGE, 0, 0);
     payload_register(s, p);
   }
   for (at = 0; at + count <= CELLS; ++at) {
@@ -1145,6 +1177,19 @@ static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
   }
   return spare;
 }
+int ps_internal_budget_admit(ps_space *s, int maintenance, lc_error *e) {
+  return checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0,
+                                    maintenance ? 0 : PS_MAINTENANCE_RESERVE,
+                                    NULL, e);
+}
+void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
+  uint64_t bound;
+  if (metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, NULL) ==
+      LC_OK) {
+    s->metadata_workspace = bound;
+    *spare = metadata_trim(s, *spare);
+  }
+}
 static int checkpoint_locked(ps_space *s, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire = NULL;
   ps_entry *p;
@@ -1162,7 +1207,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
                "container checkpoint generation exhausted");
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
-  rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
+  rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
     s->metadata_workspace = bound;
   if (rc == LC_OK && s->dirty)
@@ -1171,8 +1216,11 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
    * At capacity, a dense rewrite returns every old metadata page and restores
    * the protected image allowance instead of slowly fragmenting it away. */
   if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound &&
-      s->free_bytes >= 2 * bound - s->metadata_free_bytes &&
-      s->free_bytes - (2 * bound - s->metadata_free_bytes) >=
+      s->free_bytes >= s->reserved_payload &&
+      s->free_bytes - s->reserved_payload >=
+          2 * bound - s->metadata_free_bytes &&
+      s->free_bytes - s->reserved_payload -
+              (2 * bound - s->metadata_free_bytes) >=
           PS_MAINTENANCE_RESERVE)
     rc = metadata_fill(s, bound, 2 * bound, 0, PS_MAINTENANCE_RESERVE, error);
   if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound) {
@@ -1949,16 +1997,17 @@ int ps_close(ps_space *s, lc_error *error) {
   if (!s)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  if (s->readers || s->writers) {
+  if (s->readers || s->writers || s->budgets) {
     pthread_mutex_unlock(&s->mutex);
     return err(error, LC_ERR_INVALID,
-               "close container readers and writers first");
+               "close container readers, writers and capacity budgets first");
   }
   pthread_mutex_unlock(&s->mutex);
   destroy(s);
   return LC_OK;
 }
-int ps_begin(ps_space *s, ps_key key, ps_writer **out, lc_error *error) {
+int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
+             lc_error *error) {
   ps_writer *w;
   ps_entry *p;
   int rc;
@@ -1979,6 +2028,8 @@ int ps_begin(ps_space *s, ps_key key, ps_writer **out, lc_error *error) {
   w->space = s;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = ps_internal_budget_check(s, budget, 0, 0, 0, error);
   if (rc == LC_OK && s->token_next > s->token_limit)
     rc = err(error, LC_ERR_INVALID,
              "incarnation grant consumed; close and reopen");
@@ -1986,6 +2037,9 @@ int ps_begin(ps_space *s, ps_key key, ps_writer **out, lc_error *error) {
     p->token = s->token_next++;
     register_entry(s, p);
     ++s->writers;
+    w->budget = budget;
+    if (budget)
+      ++budget->users;
   }
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK) {
@@ -2030,11 +2084,13 @@ static int flush_writer(ps_writer *w, lc_error *error) {
     run_bytes = take / PS_PAGE * PS_PAGE;
     if (!run_bytes) {
       run_bytes = take;
-      rc = payload_reserve(s, p, extent, take, error);
+      rc = payload_reserve(s, p, extent, take, w->budget, error);
     } else {
-      rc = immutable_extent_allowance(s, p, run_bytes, error);
+      rc = immutable_extent_allowance(s, p, run_bytes, w->budget, error);
       if (rc == LC_OK)
         rc = take_run(s, &run_bytes, &extent->offset, error);
+      if (rc == LC_OK)
+        ps_internal_budget_spend(w->budget, run_bytes, 0, 0);
     }
     if (rc == LC_OK) {
       if (run_bytes < take)
@@ -2108,10 +2164,14 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   if (rc == LC_OK)
     rc = immutable_allowance(
         s, w->entry, s->metadata - prior + entry_bytes(w->entry),
-        s->live_entries + (old && !old->deleted ? 0 : 1), 0, error);
+        s->live_entries + (old && !old->deleted ? 0 : 1), 0, w->budget, error);
   if (rc == LC_OK)
     rc = append_event(s, w->entry, PS_PUT, error);
   if (rc == LC_OK) {
+    ps_internal_budget_spend(
+        w->budget, 0,
+        entry_bytes(w->entry) > prior ? entry_bytes(w->entry) - prior : 0,
+        prior ? 0 : 1);
     w->entry->publication_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     old = lookup(s, w->entry->key); /* rollover may have retired a tombstone */
@@ -2139,6 +2199,8 @@ void ps_writer_close(ps_writer *w) {
   s = w->space;
   pthread_mutex_lock(&s->mutex);
   --s->writers;
+  if (w->budget)
+    --w->budget->users;
   if (!w->published) {
     /* Even an uncertain publication is left untouched on disk by a poisoned
      * handle. Its memory can be discarded; no further allocation is allowed. */
@@ -2427,6 +2489,10 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->metadata_available_bytes = s->metadata_free_bytes;
   out->metadata_workspace_bytes = s->metadata_workspace;
   out->metadata_fallbacks = s->metadata_fallbacks;
+  out->reserved_payload_bytes = s->reserved_payload;
+  out->reserved_metadata_bytes = s->reserved_metadata;
+  out->reserved_entries = s->reserved_entries;
+  out->budgets = s->budgets;
   out->directory_page_writes = s->directory_page_writes;
   out->descriptor_page_writes = s->descriptor_page_writes;
   out->packed_pages = s->packed_pages;
@@ -2469,9 +2535,9 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->sealed = head->entry->stream_sealed;
   out->retired = head->entry->deleted;
 }
-int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
-                  ps_owned_head **out, ps_owned_status *status,
-                  lc_error *error) {
+int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
+                  const ps_ref *ref, ps_owned_head **out,
+                  ps_owned_status *status, lc_error *error) {
   ps_owned_head *head;
   ps_entry *p = NULL, *old;
   uint64_t sequence = 0;
@@ -2502,12 +2568,13 @@ int ps_owned_open(ps_space *s, ps_key key, int create, const ps_ref *ref,
   if (rc == LC_OK && create && s->token_next > s->token_limit)
     rc = err(error, LC_ERR_INVALID, "incarnation grant consumed; reopen");
   if (rc == LC_OK && create)
-    rc = checkpoint_allowance(s, s->metadata + 80, s->live_entries + 1, 0,
-                              error);
+    rc = checkpoint_allowance_floor(s, s->metadata + 80, s->live_entries + 1, 0,
+                                    PS_MAINTENANCE_RESERVE, budget, error);
   if (rc == LC_OK && create) {
     p->token = s->token_next++;
     rc = append_event(s, p, PS_PUT, error);
     if (rc == LC_OK) {
+      ps_internal_budget_spend(budget, 0, 80, 1);
       /* Journal rollover may checkpoint and collect the prior tombstone. */
       old = lookup(s, key);
       sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
@@ -3004,9 +3071,10 @@ int ps_internal_healthy(ps_space *s, lc_error *e) { return healthy(s, e); }
 int ps_internal_event(ps_space *s, ps_entry *p, int event, lc_error *e) {
   return append_event(s, p, event, e);
 }
-int ps_internal_allowance(ps_space *s, uint64_t metadata, uint64_t entries,
-                          lc_error *e) {
-  return checkpoint_allowance(s, metadata, entries, 0, e);
+int ps_internal_allowance(ps_space *s, ps_budget *budget, uint64_t metadata,
+                          uint64_t entries, lc_error *e) {
+  return checkpoint_allowance_floor(s, metadata, entries, 0,
+                                    PS_MAINTENANCE_RESERVE, budget, e);
 }
 void ps_internal_install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);

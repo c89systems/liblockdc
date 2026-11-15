@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_INTERNAL_H
 #define POUCH_SPACE_INTERNAL_H
+#include "budget.h"
 #include "catalog.h"
 #include "directory.h"
 #include "owned.h"
@@ -81,6 +82,8 @@ struct ps_space {
   uint64_t live_entries, free_bytes, metadata_free_bytes;
   uint64_t metadata_workspace;
   uint64_t metadata_fallbacks;
+  uint64_t reserved_payload, reserved_metadata, reserved_entries;
+  size_t budgets;
   uint64_t directory_page_writes, descriptor_page_writes;
   size_t metadata_pages;
   size_t packed_pages;
@@ -93,6 +96,12 @@ struct ps_space {
   ps_payload_page *available[CELLS + 1];
   ps_run *free, *metadata_free;
   ps_catalog_index catalogs;
+};
+struct ps_budget {
+  ps_space *space;
+  ps_budget_plan remaining;
+  size_t users;
+  ps_run *trim;
 };
 
 typedef struct ps_catalog_record {
@@ -117,7 +126,13 @@ void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
 int ps_internal_healthy(ps_space *, lc_error *);
 int ps_internal_event(ps_space *, ps_entry *, int, lc_error *);
-int ps_internal_allowance(ps_space *, uint64_t, uint64_t, lc_error *);
+int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
+                          lc_error *);
+int ps_internal_budget_admit(ps_space *, int, lc_error *);
+void ps_internal_budget_trim(ps_space *, ps_run **);
+int ps_internal_budget_check(ps_space *, ps_budget *, uint64_t, uint64_t,
+                             uint64_t, lc_error *);
+void ps_internal_budget_spend(ps_budget *, uint64_t, uint64_t, uint64_t);
 void ps_internal_install(ps_space *, ps_entry *);
 void ps_internal_remove(ps_space *, ps_entry *, uint64_t);
 int ps_internal_durable(ps_space *, uint64_t, lc_error *);

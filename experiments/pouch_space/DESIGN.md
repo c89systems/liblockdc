@@ -61,7 +61,22 @@ Near capacity they can instead rewrite all current metadata densely using the
 protected pool. Old-root retirement restores space for another complete
 checkpoint, including when ordinary payload admission has stopped. No payload
 is copied by this fallback. Capacity failures preserve prior publications.
-Admission for a complete logical delete/rotation operation remains required.
+Explicit namespace rotation now admits an operation budget before staging its
+successor. Complete canonical append/delete/compaction admission remains required.
+
+The private `ps_budget` boundary reserves unspent physical payload pages,
+positive descriptor growth and additional live entries. Ordinary admission and
+checkpoint top-ups exclude claimed payload capacity. The checkpoint bound
+includes current live metadata plus every outstanding descriptor/entry credit;
+private writers retain those credits through payload I/O until publication.
+Payload credits are spent on physical allocation, metadata credits on publication.
+The maintenance floor governs opening a claim, not spending already funded work.
+Claims are volatile under the existing exclusive root owner; claim/release
+performs no I/O, introduces no persisted representation and copies no payload.
+Writers pin their budget; space close rejects outstanding claims. Release returns
+unspent credits and excess dynamic metadata workspace using a preallocated split
+node. A budget provides capacity admission, not key isolation, rollback, or
+protection from allocation/I/O errors. Failed attempts do not refund spent credits.
 
 Private payloads flow through a 16 KiB buffer into page-aligned runs. Allocation
 uses 4 KiB physical pages, matching the measurement host's filesystem blocks;
@@ -609,8 +624,13 @@ sources validate stored CRCs as consumed; reset and clone maintain independent
 cursor/checksum state and can outlive the logical runtime.
 
 Known canonical output spans and checkpoint workspace have separate protection.
-Atomic admission for the complete rotation/catalog/head/payload sequence remains
-pending, along with automatic compaction/retention policy and history protection.
+Explicit empty rotation now claims successor head, name binding and routing
+replacement before staging or head selection. Seal and rollover use protected
+checkpoint workspace. Canonical grant allocation still uses ordinary admission;
+automatic append/delete and compaction must carry a complete budget through their
+remaining dependency sequence. The fixed 16 KiB floor also needs a bounded-work
+policy covering admitted keys up to 1 MiB. Automatic compaction/retention policy
+and history protection remain pending.
 The current label pool still follows namespace-owner lifetime.
 
 The protected metadata region cannot be consumed by payloads. Complete

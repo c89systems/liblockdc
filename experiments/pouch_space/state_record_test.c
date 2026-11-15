@@ -326,7 +326,9 @@ static void lifecycle(const char *path, const char *key) {
     if (mode)
       ok(lc_pouch_crypto_open(&allocator, &options, &crypto, NULL, &e), &e);
     ok(ps_open(path, 1, NULL, &space, &e), &e);
-    ok(ps_stream_open(space, k, 1, NULL, recover, &recovered, &stream, &e), &e);
+    ok(ps_stream_open(space, NULL, k, 1, NULL, recover, &recovered, &stream,
+                      &e),
+       &e);
     size_t sizes[] = {0, 1, 1048601};
     uint64_t starts[6], ends[6];
     for (int disable = 0; disable < 2; ++disable)
@@ -359,7 +361,8 @@ static void lifecycle(const char *path, const char *key) {
     ok(ps_stream_close(stream, &e), &e);
     ok(ps_close(space, &e), &e);
     ok(ps_open(path, 0, NULL, &space, &e), &e);
-    ok(ps_stream_open(space, k, 0, &info.ref, recover, &recovered, &stream, &e),
+    ok(ps_stream_open(space, NULL, k, 0, &info.ref, recover, &recovered,
+                      &stream, &e),
        &e);
     REQUIRE(recovered == 6);
     ps_stream_reader *reader = NULL;
@@ -683,7 +686,8 @@ static void snapshot_records(const char *path, const char *key) {
             ps_stream *original = NULL, *destination = NULL;
             ps_key a = {1, 1, PS_STREAM}, b = {2, 1, PS_STREAM};
             ok(ps_open(path, 1, &options, &space, &e), &e);
-            ok(ps_stream_open(space, a, 1, NULL, NULL, NULL, &original, &e),
+            ok(ps_stream_open(space, NULL, a, 1, NULL, NULL, NULL, &original,
+                              &e),
                &e);
             size_t bytes = size == 0 ? 0 : size == 1 ? 1 : body_bytes;
             lc_pouch_state_entry q = request(), stored = {0};
@@ -720,8 +724,8 @@ static void snapshot_records(const char *path, const char *key) {
               REQUIRE(fd >= 0);
               underlying = lc_pouch_record_file_io(fd);
             } else {
-              ok(ps_stream_open(space, b, 1, NULL, NULL, NULL, &destination,
-                                &e),
+              ok(ps_stream_open(space, NULL, b, 1, NULL, NULL, NULL,
+                                &destination, &e),
                  &e);
               ok(ps_record_begin(destination, &writer, &e), &e);
               underlying = ps_record_output(&writer);
@@ -797,8 +801,8 @@ static void snapshot_records(const char *path, const char *key) {
               ok(ps_record_commit(&writer, NULL, NULL, &e), &e);
               ok(ps_stream_seal(destination, &e), &e);
               ok(ps_stream_close(destination, &e), &e);
-              ok(ps_stream_open(space, b, 0, NULL, NULL, NULL, &destination,
-                                &e),
+              ok(ps_stream_open(space, NULL, b, 0, NULL, NULL, NULL,
+                                &destination, &e),
                  &e);
               ok(ps_stream_read_open(destination, 0, end, &destination_reader,
                                      &e),
@@ -1099,7 +1103,8 @@ static void *parallel_writer(void *p) {
   lc_error e;
   lc_error_init(&e);
   size_t recovered = 0;
-  ok(ps_stream_open(job->space, k, 1, NULL, recover, &recovered, &stream, &e),
+  ok(ps_stream_open(job->space, NULL, k, 1, NULL, recover, &recovered, &stream,
+                    &e),
      &e);
   for (size_t round = 0; round < 4; ++round) {
     lc_pouch_state_entry q = request(), r = {0};
@@ -1157,7 +1162,9 @@ static void concurrency(const char *path, const char *key) {
     size_t recovered = 0;
     ps_stream *stream = NULL;
     ps_key k = {i + 1, 1, PS_STREAM};
-    ok(ps_stream_open(space, k, 0, NULL, recover, &recovered, &stream, &e), &e);
+    ok(ps_stream_open(space, NULL, k, 0, NULL, recover, &recovered, &stream,
+                      &e),
+       &e);
     REQUIRE(recovered == 4);
     ok(ps_stream_close(stream, &e), &e);
   }

@@ -23,7 +23,8 @@ typedef struct ps_stream_info {
 typedef int (*ps_stream_recover_fn)(ps_stream *, uint64_t checkpoint_tail,
                                     uint64_t capacity, uint64_t *accepted_tail,
                                     void *, lc_error *);
-int ps_stream_open(ps_space *, ps_key, int create, const ps_ref *,
+/* The optional budget funds head creation only, never subsequent grants. */
+int ps_stream_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                    ps_stream_recover_fn, void *, ps_stream **, lc_error *);
 /* One cached owner per typed logical stream. Close requires no reader or
  * appender. Stop concurrent API calls before close; readers pin this owner. */

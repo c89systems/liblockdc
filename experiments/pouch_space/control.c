@@ -22,7 +22,7 @@ int ps_collection_head_store(ps_space *space, uint64_t collection,
     return invalid(error);
   rc = lc_collection_head_encode(head, bytes, error);
   if (rc == LC_OK)
-    rc = ps_begin(space, head_key(collection), &writer, error);
+    rc = ps_begin(space, NULL, head_key(collection), &writer, error);
   if (rc == LC_OK)
     rc = ps_write(writer, bytes, sizeof(bytes), error);
   if (rc == LC_OK)

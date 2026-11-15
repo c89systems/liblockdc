@@ -964,7 +964,7 @@ static void hint_store(const char *path, ps_key key, const void *bytes,
   ps_space *space = NULL;
   ps_writer *writer = NULL;
   ok(ps_open(path, 0, NULL, &space, e), e);
-  ok(ps_begin(space, key, &writer, e), e);
+  ok(ps_begin(space, NULL, key, &writer, e), e);
   ok(ps_write(writer, bytes, length, e), e);
   ok(ps_publish(writer, NULL, e), e);
   ps_writer_close(writer);

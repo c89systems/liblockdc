@@ -138,9 +138,9 @@ static void stream_destroy(ps_stream *s) {
   (void)pthread_mutex_destroy(&s->mutex);
   lc_free_with_allocator(NULL, s);
 }
-int ps_stream_open(ps_space *space, ps_key key, int create, const ps_ref *ref,
-                   ps_stream_recover_fn recover, void *context, ps_stream **out,
-                   lc_error *error) {
+int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
+                   const ps_ref *ref, ps_stream_recover_fn recover,
+                   void *context, ps_stream **out, lc_error *error) {
   ps_owned_status status;
   ps_owned_run *run = NULL;
   ps_stream *s;
@@ -158,7 +158,7 @@ int ps_stream_open(ps_space *space, ps_key key, int create, const ps_ref *ref,
     return stream_error(error, LC_ERR_TRANSPORT,
                         "cannot initialize stream mutex");
   }
-  rc = ps_owned_open(space, key, create, ref, &s->head, &status, error);
+  rc = ps_owned_open(space, budget, key, create, ref, &s->head, &status, error);
   if (rc == LC_OK) {
     s->ref = status.ref;
     s->tail = status.tail;

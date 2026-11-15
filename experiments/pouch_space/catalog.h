@@ -34,7 +34,7 @@ int ps_catalog_create_namespace(ps_space *, const void *, size_t,
  * A same-name change in flight returns an error; other names stay independent.
  * The target must be a currently live stream incarnation in this container.
  * This method cannot replace a namespace's self-owned identity record. */
-int ps_catalog_put(ps_space *, uint64_t owner, unsigned int kind,
+int ps_catalog_put(ps_space *, ps_budget *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, const ps_ref *expected,
                    ps_key stream, const ps_ref *target, ps_catalog_info *,
                    lc_error *);

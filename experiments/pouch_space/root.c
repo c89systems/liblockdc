@@ -53,7 +53,7 @@ static int config_write(ps_root *root, lc_error *error) {
   lc_free_with_allocator(NULL, key_id);
   put32(bytes + 124, (uint32_t)crc32(0L, bytes, 124));
   if (rc == LC_OK)
-    rc = ps_begin(root->space, config_key(), &writer, error);
+    rc = ps_begin(root->space, NULL, config_key(), &writer, error);
   if (rc == LC_OK)
     rc = ps_write(writer, bytes, sizeof(bytes), error);
   if (rc == LC_OK)
@@ -432,7 +432,7 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
   orphan_context *c = context;
   ps_owned_head *head = NULL;
   ps_owned_status status;
-  int rc = ps_owned_open(c->space, key, 0, ref, &head, &status, error);
+  int rc = ps_owned_open(c->space, NULL, key, 0, ref, &head, &status, error);
   if (rc == LC_OK)
     rc = ps_owned_retire(head, error);
   ps_owned_close(head);

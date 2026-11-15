@@ -191,7 +191,7 @@ static void codec(void) {
 static void raw_store(ps_space *s, ps_key k, const void *p, size_t n,
                       lc_error *e) {
   ps_writer *w = NULL;
-  ok(ps_begin(s, k, &w, e), e);
+  ok(ps_begin(s, NULL, k, &w, e), e);
   ok(ps_write(w, p, n, e), e);
   ok(ps_publish(w, NULL, e), e);
   ps_writer_close(w);
@@ -500,7 +500,7 @@ static void held_barrier(const char *path, int remove, int durable) {
    * authority waits on disk. No root mutex is held across the barrier. */
   ps_writer *private = NULL;
   ps_key other = {99, 1, PS_STATE};
-  ok(ps_begin(s, other, &private, &e), &e);
+  ok(ps_begin(s, NULL, other, &private, &e), &e);
   ok(ps_write(private, "private", 7, &e), &e);
   if (!durable)
     ok(ps_publish(private, NULL, &e), &e);
@@ -602,7 +602,7 @@ static int bounded_store(ps_space *s, ps_key k,
   ps_writer *w = NULL;
   int rc = lc_collection_head_encode(h, bytes, e);
   if (rc == LC_OK)
-    rc = ps_begin(s, k, &w, e);
+    rc = ps_begin(s, NULL, k, &w, e);
   if (rc == LC_OK)
     rc = ps_write(w, bytes, sizeof(bytes), e);
   if (rc == LC_OK)
@@ -639,7 +639,7 @@ static void capacity(const char *path, unsigned kind) {
   uint64_t count;
   for (count = 2; count < 300; ++count) {
     filler.key = count;
-    ok(ps_begin(s, filler, &w, &e), &e);
+    ok(ps_begin(s, NULL, filler, &w, &e), &e);
     ok(ps_write(w, page, sizeof(page), &e), &e);
     int rc = ps_publish(w, NULL, &e);
     ps_writer_close(w);
@@ -672,7 +672,7 @@ static void capacity(const char *path, unsigned kind) {
   ok(ps_checkpoint(s, &e), &e);
   /* A maximum control is one page, including incremental writes. A rejected
    * oversized write contributes no bytes to the eventual publication. */
-  ok(ps_begin(s, fresh, &w, &e), &e);
+  ok(ps_begin(s, NULL, fresh, &w, &e), &e);
   ok(ps_write(w, page, sizeof(page) - 1, &e), &e);
   REQUIRE(ps_write(w, page, 2, &e) == LC_ERR_INVALID);
   clear(&e);

@@ -18,7 +18,9 @@ typedef struct ps_owned_status {
   int sealed, retired;
 } ps_owned_status;
 
-int ps_owned_open(ps_space *, ps_key, int create, const ps_ref *,
+/* The optional budget funds creation only; an open cached owner retains no
+ * claim. Grant allocation currently uses ordinary admission. */
+int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 void ps_owned_close(ps_owned_head *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);

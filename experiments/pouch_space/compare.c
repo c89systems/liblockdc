@@ -292,13 +292,13 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
   if (create) {
     rc = ps_catalog_allocate_id(c->space, &key.owner, e);
     if (rc == LC_OK)
-      rc = ps_stream_open(c->space, key, 1, NULL, stream_recover, w, &w->stream,
-                          e);
+      rc = ps_stream_open(c->space, NULL, key, 1, NULL, stream_recover, w,
+                          &w->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(w->stream, &info, e);
     if (rc == LC_OK)
-      rc = ps_catalog_put(c->space, identity.owner, kind, name, strlen(name),
-                          NULL, key, &info.ref, &binding, e);
+      rc = ps_catalog_put(c->space, NULL, identity.owner, kind, name,
+                          strlen(name), NULL, key, &info.ref, &binding, e);
   } else {
     rc = ps_catalog_get(c->space, identity.owner, kind, name, strlen(name),
                         &view, e);
@@ -316,7 +316,7 @@ static int stream_named_open(worker *w, int create, lc_error *e) {
                         "comparison catalog target mismatch", NULL, NULL,
                         "compare");
     if (rc == LC_OK)
-      rc = ps_stream_open(c->space, binding.stream, 0, &binding.target,
+      rc = ps_stream_open(c->space, NULL, binding.stream, 0, &binding.target,
                           stream_recover, w, &w->stream, e);
     ps_catalog_view_close(view);
   }
@@ -447,7 +447,8 @@ static int write_one(worker *w, size_t id, lc_error *e) {
   if (c->streams) {
     rc = stream_write_one(w, id, source, e);
   } else if (c->container) {
-    rc = ps_begin(c->space, storage_key(c, w->ordinal, id), &destination, e);
+    rc = ps_begin(c->space, NULL, storage_key(c, w->ordinal, id), &destination,
+                  e);
     if (rc == LC_OK && c->collection) {
       memset(&sink, 0, sizeof(sink));
       sink.impl = destination;

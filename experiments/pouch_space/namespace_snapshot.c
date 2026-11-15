@@ -43,8 +43,8 @@ int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
     r->binding.stream.owner = id;
     r->binding.stream.key = ns->identity.owner;
     r->binding.stream.kind = PS_STREAM;
-    rc = ps_stream_open(ns->root->space, r->binding.stream, 1, NULL, NULL, NULL,
-                        &r->stream, e);
+    rc = ps_stream_open(ns->root->space, NULL, r->binding.stream, 1, NULL, NULL,
+                        NULL, &r->stream, e);
     if (rc == LC_OK)
       rc = ps_record_begin(r->stream, &b->writer, e);
     if (rc == LC_OK)
@@ -84,7 +84,7 @@ int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
     pthread_mutex_unlock(&b->data->mutex);
   }
   if (rc == LC_OK)
-    rc = ps_catalog_put(b->ns->root->space, b->ns->identity.owner,
+    rc = ps_catalog_put(b->ns->root->space, NULL, b->ns->identity.owner,
                         PS_CATALOG_BODY, r->leaf, strlen(r->leaf), NULL,
                         r->binding.stream, &info.ref, &r->binding, e);
   if (rc == LC_OK) {
@@ -284,8 +284,8 @@ int ps_namespace_snapshot_begin(ps_namespace *ns, ps_namespace_snapshot **out,
       r->binding.stream.owner = id;
       r->binding.stream.key = ns->identity.owner;
       r->binding.stream.kind = PS_STREAM;
-      rc = ps_stream_open(ns->root->space, r->binding.stream, 1, NULL, NULL,
-                          NULL, &r->stream, e);
+      rc = ps_stream_open(ns->root->space, NULL, r->binding.stream, 1, NULL,
+                          NULL, NULL, &r->stream, e);
       if (rc == LC_OK)
         rc = ps_record_begin(r->stream, &b->writer, e);
     }
@@ -346,14 +346,14 @@ int ps_namespace_snapshot_commit(ps_namespace_snapshot *b, lc_error *e) {
     pthread_mutex_unlock(&d->mutex);
   }
   if (rc == LC_OK)
-    rc = ps_catalog_put(b->ns->root->space, b->ns->identity.owner,
+    rc = ps_catalog_put(b->ns->root->space, NULL, b->ns->identity.owner,
                         PS_CATALOG_SNAPSHOT, r->leaf, strlen(r->leaf), NULL,
                         r->binding.stream, &info.ref, &r->binding, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
     ps_ns_insert(d, r);
     pthread_mutex_unlock(&d->mutex);
-    rc = ps_ns_head_write(d, d->active, r->id, b->boundary, e);
+    rc = ps_ns_head_write(d, NULL, d->active, r->id, b->boundary, e);
   }
   if (rc == LC_OK)
     rc = ps_flush(b->ns->root->space, e);

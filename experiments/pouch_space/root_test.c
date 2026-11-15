@@ -253,7 +253,7 @@ static void lifecycle(const char *path, const char *key_string,
     REQUIRE(allocation == 0 && again == a);
     ps_namespace_release(again);
     stream_key.owner = first.owner;
-    ok(ps_stream_open(ps_root_space(r), stream_key, 1, NULL, NULL, NULL,
+    ok(ps_stream_open(ps_root_space(r), NULL, stream_key, 1, NULL, NULL, NULL,
                       &stream, &e),
        &e);
     ok(ps_stream_begin(stream, &writer, &e), &e);
@@ -312,8 +312,8 @@ static void lifecycle(const char *path, const char *key_string,
     a = acquire(r, "alpha", 0, &e);
     ok(ps_namespace_identity(a, &latest, &e), &e);
     same(&first, &latest);
-    ok(ps_stream_open(ps_root_space(r), stream_key, 0, &stream_info.ref, NULL,
-                      NULL, &stream, &e),
+    ok(ps_stream_open(ps_root_space(r), NULL, stream_key, 0, &stream_info.ref,
+                      NULL, NULL, &stream, &e),
        &e);
     read_body(r, stream, descriptor, body, 1048601, stored, &e);
     ok(ps_stream_close(stream, &e), &e);
@@ -330,7 +330,7 @@ static void raw_config(ps_space *space, const unsigned char *bytes,
                        size_t count, lc_error *e) {
   ps_key k = {0, 1, PS_CONTROL};
   ps_writer *w = NULL;
-  ok(ps_begin(space, k, &w, e), e);
+  ok(ps_begin(space, NULL, k, &w, e), e);
   ok(ps_write(w, bytes, count, e), e);
   ok(ps_publish(w, NULL, e), e);
   ps_writer_close(w);
@@ -377,9 +377,9 @@ static void namespace_records(const char *path) {
   ps_stream *stream = NULL;
   ps_stream_info info;
   ps_key key = {900, 1, PS_STREAM};
-  ok(ps_stream_open(space, key, 1, NULL, NULL, NULL, &stream, &e), &e);
+  ok(ps_stream_open(space, NULL, key, 1, NULL, NULL, NULL, &stream, &e), &e);
   ok(ps_stream_status(stream, &info, &e), &e);
-  REQUIRE(ps_catalog_put(space, 0, PS_CATALOG_NAMESPACE, "slot", 4,
+  REQUIRE(ps_catalog_put(space, NULL, 0, PS_CATALOG_NAMESPACE, "slot", 4,
                          &next.revision, key, &info.ref, &temporary,
                          &e) == LC_ERR_INVALID);
   clear(&e);
@@ -456,7 +456,8 @@ static void malformed(const char *path) {
     ps_stream_info info;
     ps_key k = {variant == 3 ? 0 : 77, variant == 2 ? 1 : 0, PS_STREAM};
     ps_catalog_info binding;
-    ok(ps_stream_open(ps_root_space(root), k, 1, NULL, NULL, NULL, &anchor, &e),
+    ok(ps_stream_open(ps_root_space(root), NULL, k, 1, NULL, NULL, NULL,
+                      &anchor, &e),
        &e);
     if (variant == 1) {
       ok(ps_stream_begin(anchor, &writer, &e), &e);
@@ -469,7 +470,7 @@ static void malformed(const char *path) {
     ok(ps_stream_status(anchor, &info, &e), &e);
     const char *name = variant == 5 ? "" : "bad\0suffix";
     size_t length = variant == 5 ? 0 : variant == 4 ? 10 : 3;
-    ok(ps_catalog_put(ps_root_space(root), 0, PS_CATALOG_NAMESPACE, name,
+    ok(ps_catalog_put(ps_root_space(root), NULL, 0, PS_CATALOG_NAMESPACE, name,
                       length, NULL, k, &info.ref, &binding, &e),
        &e);
     ok(ps_stream_close(anchor, &e), &e);

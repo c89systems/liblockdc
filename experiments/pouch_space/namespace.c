@@ -92,8 +92,9 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
   d->active = get64(bytes + 16);
   return LC_OK;
 }
-int ps_ns_head_write(struct ps_namespace_data *d, uint64_t active,
-                     uint64_t snapshot, uint64_t boundary, lc_error *e) {
+int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
+                     uint64_t active, uint64_t snapshot, uint64_t boundary,
+                     lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_writer *writer = NULL;
   int rc;
@@ -106,7 +107,7 @@ int ps_ns_head_write(struct ps_namespace_data *d, uint64_t active,
   put64(bytes + 40, snapshot);
   put64(bytes + 48, boundary);
   put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
-  rc = ps_begin(d->ns->root->space, head_key(d->ns), &writer, e);
+  rc = ps_begin(d->ns->root->space, budget, head_key(d->ns), &writer, e);
   if (rc == LC_OK)
     rc = ps_write(writer, bytes, sizeof(bytes), e);
   if (rc == LC_OK)
@@ -290,7 +291,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
     s->unselected =
         s->kind != PS_CATALOG_BODY &&
         s->id > (s->kind == PS_CATALOG_SEGMENT ? d->active : d->snapshot_id);
-    rc = ps_stream_open(ns->root->space, s->binding.stream, 0,
+    rc = ps_stream_open(ns->root->space, NULL, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(s->stream, &info, e);
@@ -434,7 +435,8 @@ int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   }
   return rc;
 }
-static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
+static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
+                   lc_error *e) {
   segment *s;
   ps_catalog_view *view = NULL;
   ps_stream_info info;
@@ -466,13 +468,13 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
     s->binding.stream.kind = PS_STREAM;
   }
   if (rc == LC_OK) {
-    rc = ps_stream_open(d->ns->root->space, s->binding.stream, 0,
+    rc = ps_stream_open(d->ns->root->space, NULL, s->binding.stream, 0,
                         view ? &s->binding.target : NULL, recover, s,
                         &s->stream, e);
     if (rc == LC_ERR_INVALID && !view) {
       lc_error_cleanup(e);
-      rc = ps_stream_open(d->ns->root->space, s->binding.stream, 1, NULL,
-                          recover, s, &s->stream, e);
+      rc = ps_stream_open(d->ns->root->space, budget, s->binding.stream, 1,
+                          NULL, recover, s, &s->stream, e);
     }
   }
   if (rc == LC_OK)
@@ -480,7 +482,7 @@ static int prepare(struct ps_namespace_data *d, uint64_t id, lc_error *e) {
   if (rc == LC_OK && (info.tail || info.sealed))
     rc = failure(e, LC_ERR_PROTOCOL, "staged namespace segment is not empty");
   if (rc == LC_OK && !view)
-    rc = ps_catalog_put(d->ns->root->space, d->ns->identity.owner,
+    rc = ps_catalog_put(d->ns->root->space, budget, d->ns->identity.owner,
                         PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), NULL,
                         s->binding.stream, &info.ref, &s->binding, e);
   ps_catalog_view_close(view);
@@ -501,14 +503,31 @@ static int begin_reserve(ps_stream *stream, uint64_t minimum,
   return rc;
 }
 int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
+  ps_budget_plan plan = {0};
+  ps_budget *budget = NULL;
   uint64_t next;
-  int rc;
+  int rc, closed;
   if (d->active == UINT64_MAX)
     return failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
   next = d->active + 1;
-  rc = prepare(d, next, e);
+  /* The routing record may need a fresh packed page. A new successor needs
+   * one stream head and its fixed 28-byte canonical segment label. Existing
+   * staged successors need neither. Seal and journal rollover are covered by
+   * the checkpoint pool, independently of this payload claim. */
+  plan.payload_bytes = PS_PAGE;
+  plan.metadata_bytes = d->active ? 0 : 88;
+  plan.entries = d->active ? 0 : 1;
+  plan.maintenance = 1;
+  if (!ps_ns_find(d, PS_CATALOG_SEGMENT, next)) {
+    plan.metadata_bytes += 80 + 104 + 28;
+    plan.entries += 2;
+  }
+  rc = ps_budget_open(d->ns->root->space, &plan, &budget, e);
   if (rc == LC_OK)
-    rc = ps_ns_head_write(d, next, d->snapshot_id, d->snapshot_boundary, e);
+    rc = prepare(d, budget, next, e);
+  if (rc == LC_OK)
+    rc = ps_ns_head_write(d, budget, next, d->snapshot_id, d->snapshot_boundary,
+                          e);
   if (rc == LC_OK)
     rc = ps_flush(d->ns->root->space, e);
   if (rc == LC_OK) {
@@ -520,6 +539,9 @@ int ps_ns_rotate(struct ps_namespace_data *d, lc_error *e) {
     pthread_mutex_unlock(&d->mutex);
     rc = ps_ns_finish_seal(d, e);
   }
+  closed = ps_budget_close(budget, rc == LC_OK ? e : NULL);
+  if (rc == LC_OK)
+    rc = closed;
   return rc;
 }
 /* Namespace control slot 2 is its conservative maintenance marker; routing
@@ -586,7 +608,7 @@ int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
     put64(bytes + 8, key.owner);
     bytes[16] = 1;
     put64(bytes + 24, (uint64_t)crc32(0L, bytes, 24));
-    rc = ps_begin(ns->root->space, key, &writer, e);
+    rc = ps_begin(ns->root->space, NULL, key, &writer, e);
     if (rc == LC_OK)
       rc = ps_write(writer, bytes, sizeof(bytes), e);
     if (rc == LC_OK)
@@ -675,7 +697,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
         rc = failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
       else {
         ++selected;
-        rc = prepare(d, selected, e);
+        rc = prepare(d, NULL, selected, e);
       }
     }
   }
@@ -712,7 +734,7 @@ uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
 static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
   ps_namespace_append *append = context;
   (void)tail;
-  return ps_ns_head_write(append->data, append->segment,
+  return ps_ns_head_write(append->data, NULL, append->segment,
                           append->data->snapshot_id,
                           append->data->snapshot_boundary, e);
 }

@@ -425,7 +425,7 @@ static void *container_records(void *context) {
       crypto.compression_enabled = mode & 2;
       check(lc_pouch_crypto_open(NULL, &crypto, &pouch->crypto, NULL, &e), &e);
       check(ps_open(run->path, 1, &opts, &space, &e), &e);
-      check(ps_stream_open(space, key, 1, NULL, recover_records, &found,
+      check(ps_stream_open(space, NULL, key, 1, NULL, recover_records, &found,
                            &stream, &e),
             &e);
       check(ps_record_begin(stream, &output, &e), &e);
@@ -532,7 +532,7 @@ static void *container_records(void *context) {
       check(ps_stream_close(stream, &e), &e);
       check(ps_close(space, &e), &e);
       check(ps_open(run->path, 0, &opts, &space, &e), &e);
-      check(ps_stream_open(space, key, 0, NULL, recover_records, &found,
+      check(ps_stream_open(space, NULL, key, 0, NULL, recover_records, &found,
                            &stream, &e),
             &e);
       REQUIRE(found.records == 2);

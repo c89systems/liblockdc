@@ -281,13 +281,14 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-static int catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
-                       const void *name, size_t length, const ps_ref *expected,
-                       ps_key stream, const ps_ref *target,
-                       ps_catalog_info *out, int identity, lc_error *e) {
+static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
+                       unsigned int kind, const void *name, size_t length,
+                       const ps_ref *expected, ps_key stream,
+                       const ps_ref *target, ps_catalog_info *out, int identity,
+                       lc_error *e) {
   ps_entry *p, *old, *head;
   ps_catalog_info info;
-  uint64_t sequence = 0;
+  uint64_t sequence = 0, growth = 0, added = 0;
   int rc, installed = 0;
   if (out)
     memset(out, 0, sizeof(*out));
@@ -328,13 +329,16 @@ static int catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
       p->key.key = old && !old->deleted ? old->key.key : p->token;
       rc = ps_catalog_prepare_record(s, p, 0, e);
     }
-    if (rc == LC_OK)
-      rc = ps_internal_allowance(
-          s, s->metadata + (old && !old->deleted ? 0 : 104 + length),
-          s->live_entries + (old && !old->deleted ? 0 : 1), e);
+    if (rc == LC_OK) {
+      growth = old && !old->deleted ? 0 : 104 + length;
+      added = old && !old->deleted ? 0 : 1;
+      rc = ps_internal_allowance(s, budget, s->metadata + growth,
+                                 s->live_entries + added, e);
+    }
     if (rc == LC_OK)
       rc = ps_internal_event(s, p, PS_PUT, e);
     if (rc == LC_OK) {
+      ps_internal_budget_spend(budget, 0, growth, added);
       sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
       /* Automatic checkpointing may collect a prior deleted name. Apply
        * resolves the current index again, rather than retaining that pointer.
@@ -357,18 +361,18 @@ static int catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
     *out = info;
   return rc;
 }
-int ps_catalog_put(ps_space *s, uint64_t owner, unsigned int kind,
-                   const void *name, size_t length, const ps_ref *expected,
-                   ps_key stream, const ps_ref *target, ps_catalog_info *out,
-                   lc_error *e) {
-  return catalog_put(s, owner, kind, name, length, expected, stream, target,
-                     out, 0, e);
+int ps_catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
+                   unsigned int kind, const void *name, size_t length,
+                   const ps_ref *expected, ps_key stream, const ps_ref *target,
+                   ps_catalog_info *out, lc_error *e) {
+  return catalog_put(s, budget, owner, kind, name, length, expected, stream,
+                     target, out, 0, e);
 }
 int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
                                 ps_catalog_info *out, lc_error *e) {
   ps_key stream = {0};
-  return catalog_put(s, 0, PS_CATALOG_NAMESPACE, name, length, NULL, stream,
-                     NULL, out, 1, e);
+  return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
+                     stream, NULL, out, 1, e);
 }
 int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
