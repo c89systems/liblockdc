@@ -18286,6 +18286,11 @@ static int lc_pouch_retention_start(lc_pouch_retention_cleanup *ctx,
         error);
   if (rc == LC_OK)
     rc = lc_pouch_retention_note_phase(LC_POUCH_RETENTION_STAGED, error);
+  /* A decision append can survive a failed write or barrier. Its participant
+   * stages must already be durable before any decision bytes reach storage,
+   * including on NoSync roots; a later barrier cannot establish that order. */
+  if (rc == LC_OK)
+    rc = lc_pouch_state_durable_scope_barrier(scope, error);
   if (rc == LC_OK)
     rc = lc_pouch_now_unix(&decided_at, error);
   if (rc == LC_OK) {

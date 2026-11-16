@@ -17,8 +17,12 @@ typedef struct ps_pouch_state_options {
  * recovery also use that engine. Complete canonical batches have checksummed
  * recovery framing. Live staged records prevent ordinary compaction; settled
  * historical stages and decisions may be omitted by the resolved snapshot.
- * retention scheduling and guaranteed maintenance admission at capacity remain
- * pending. Forced ordinary-state compaction is available below.
+ * Public leased state updates/metadata/keepalive/release, transactional
+ * attachments, native participant votes and on-demand expiry cleanup use the
+ * same logical engine. .txns remains the decision authority. Background expiry
+ * scheduling, complete external XA ownership and guaranteed maintenance
+ * admission at capacity remain pending. Forced ordinary-state compaction is
+ * available below.
  * Internal cleanup durability scopes force the completed container prefix
  * durable under either root policy; unfinished producers remain private.
  * Rotation can still require foreground capacity before a delete.
