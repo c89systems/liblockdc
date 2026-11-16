@@ -79,6 +79,7 @@ enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFAULT = 0,
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
 };
+#define LC_POUCH_STORAGE_TXN_GUARD_STRIPES 256U
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   /* Force the completed publication prefix durable, including on NoSync
@@ -129,6 +130,15 @@ typedef struct lc_pouch_storage_ops {
    * Discovery reads only hints, without opening work records or bodies. */
   int (*retention_hint_next)(void *, const char *, char **, char **,
                              lc_error *);
+  /* Volatile transaction authority for stripe < TXN_GUARD_STRIPES. wait=0
+   * returns PENDING on contention without waiting. Successful acquisition
+   * retains the owner and returns a non-NULL opaque handle; failure leaves
+   * NULL. Release on the acquiring thread, after protected work, exactly once.
+   * No pathname, publication or durability operation. The common facade owns
+   * root mutation ordering. Exclusive owners coordinate threads; future shared
+   * owners must additionally coordinate processes inside their root file. */
+  int (*txn_guard_lock)(void *, size_t stripe, int wait, void **, lc_error *);
+  void (*txn_guard_release)(void *, void *);
   void (*close)(void *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {

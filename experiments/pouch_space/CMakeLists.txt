@@ -60,10 +60,11 @@ if(LOCKDC_BUILD_TESTS)
   target_include_directories(pouch_space_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_client_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_client_test PRIVATE
+    "LINKER:--wrap=pthread_mutex_init"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_client_test)
-  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare)
+  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()

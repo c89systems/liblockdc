@@ -4658,3 +4658,57 @@ The executable is `pouch_space_client_test-retention`, SHA-256
 Its source is `bb2a157a` plus `retention-source.patch`, SHA-256
 `f4c086b3e8fefe0a78690b5393a6e0c8c784f9abd9cbb983faa01551400bcdcf`.
 Subsequent documentation edits do not alter these executable inputs.
+
+## Typed transaction guard comparison
+
+The private transaction authority now uses the same production facade for both
+owners. Native ownership retains its 256 process mutexes and root lock files
+with `fcntl`; the exclusive container owner supplies 256 root-local mutexes
+without lock-file operations. This is a measured component comparison, not a
+complete public lease, transaction, retention or shared-root benchmark.
+
+Evidence is `build/pouch-space-txn-guards/`. Five alternating engine/policy-order
+runs retain all **40 unique cases** in `paired/sample-*.log`: both owners,
+both policies and a newly opened/reopened runtime per sample. The same normal
+allocator GNU Release executable runs both owners. Each case measures first
+acquisition separately, then 1,024 verified acquire/cover/release cycles for the
+same xid. Root creation/open/close is excluded. Reopened means a populated native
+lock file and a fresh runtime, with filesystem caches retained. These uncontended
+locks do no publication or durability work under either policy. Both owners pay
+the same verification-counter work. Development container roots stay 10 MiB.
+
+Frozen executable `pouch_space_client_test-guards` SHA-256:
+`9570ebf1d93c4bed44bf851377d85ce577a5938c917d5ba4be05a982d6c0e0bd`.
+The source patch against `845f4a07` (`guards-source.patch`) SHA-256:
+`5d07258d6ae085f38ae6a8a0f3367a5c9df6873f7b641e5aa185d832fca31330`.
+`perf-inputs.sha256` checks both retained inputs. Raw rows and independently
+computed statistics are in `perf-results.json`; `perf-summary.pl` checks all
+40 unique cases and all first/elapsed/CPU min/median/max against the raw logs
+(`perf-independent-check.log`). GNU test workers use 128 KiB stacks with the
+glibc stack cache disabled.
+
+All table values are microseconds: median [minimum–maximum], five samples.
+Elapsed/CPU values cover the complete 1,024-cycle batch, not one acquisition.
+
+| Policy | Runtime | Container elapsed | Multifile elapsed | Container CPU | Multifile CPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NoSync | New | 55.160 [44.780–66.071] | 2400.140 [2111.036–4813.081] | 56.250 [45.930–67.700] | 2362.931 [2112.792–4816.193] |
+| NoSync | Reopened | 63.592 [54.451–70.991] | 2247.998 [2121.646–4983.223] | 65.560 [55.380–72.580] | 2249.882 [2123.091–4943.703] |
+| Durable | New | 54.321 [50.650–56.520] | 2409.250 [2172.888–4408.767] | 55.561 [51.690–57.910] | 2412.662 [2175.111–4412.284] |
+| Durable | Reopened | 54.831 [48.231–84.480] | 3163.842 [2265.788–4235.403] | 55.920 [49.100–86.160] | 3214.823 [2267.482–4237.793] |
+
+| Policy | Runtime | Container first acquisition | Multifile first acquisition |
+| --- | --- | ---: | ---: |
+| NoSync | New | 8.830 [1.829–15.550] | 53.161 [40.001–63.570] |
+| NoSync | Reopened | 1.369 [0.500–1.560] | 4.319 [3.701–9.891] |
+| Durable | New | 2.250 [2.050–3.030] | 39.982 [36.860–119.283] |
+| Durable | Reopened | 1.131 [0.671–1.500] | 7.560 [5.180–8.420] |
+
+Repeated guard elapsed medians improve by 35.4–57.7× in these samples, with
+disjoint ranges in all four cases. CPU medians also fall. This isolates the
+removal of native lock-file acquisition work from the exclusive container path;
+it does not establish a similar end-to-end transaction gain. Each matching
+first-acquisition row also has disjoint observed ranges, but these short
+measurements include initialization, file creation where required, cache effects
+and scheduler noise. No contention, interprocess container coordination, payload,
+root reopen readiness or durable acknowledgement latency is measured.

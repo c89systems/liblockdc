@@ -8,6 +8,7 @@
 #include "lc_pouch_query_index.h"
 #include "lc_pouch_query_plan.h"
 #include "lc_pouch_retention.h"
+#include "lc_pouch_txn_guard.h"
 #include "lc_pouch_xa.h"
 
 #include "lc_internal.h"
@@ -60,23 +61,11 @@
 #define LC_POUCH_CONTROL_STRING_MAX 65535U
 #define LC_POUCH_CONTROL_HEADER_MAX (64U * 1024U)
 #define LC_POUCH_ATTACHMENT_METADATA_BYTES 12U
-#define LC_POUCH_TXN_GUARD_STRIPES 256U
 
 static pthread_mutex_t lc_pouch_queue_message_id_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t lc_pouch_lease_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t lc_pouch_lease_id_counter = 0U;
-static pthread_mutex_t lc_pouch_txn_guard_mutexes[LC_POUCH_TXN_GUARD_STRIPES];
-static pthread_once_t lc_pouch_txn_guard_once = PTHREAD_ONCE_INIT;
-
-static void lc_pouch_txn_guard_mutexes_init(void) {
-  size_t i;
-
-  for (i = 0U; i < LC_POUCH_TXN_GUARD_STRIPES; ++i) {
-    (void)pthread_mutex_init(&lc_pouch_txn_guard_mutexes[i], NULL);
-  }
-}
-
 #ifdef LOCKDC_TEST_BUILD
 int (*lc_pouch_test_queue_clock_gettime)(clockid_t clock_id,
                                          struct timespec *out,
@@ -449,13 +438,6 @@ typedef struct lc_pouch_txn_vote_context {
   lc_pouch_unix_seconds commit_at_unix;
 } lc_pouch_txn_vote_context;
 
-typedef struct lc_pouch_txn_guard {
-  int fd;
-  pthread_mutex_t *mutex;
-  int mutex_locked;
-  lc_pouch_state_shared_mutation_guard *shared_mutation;
-} lc_pouch_txn_guard;
-
 typedef struct lc_pouch_implicit_txn_leader {
   char *ns;
   char *key;
@@ -492,7 +474,6 @@ lc_pouch_retention_stage_begin(lc_client_handle *client,
                                const char *key, const char *txn_id,
                                const lc_pouch_state_write_options *options,
                                lc_pouch_txn_guard *guard, lc_error *error);
-static void lc_pouch_txn_guard_release(lc_pouch_txn_guard *guard);
 
 typedef struct lc_pouch_query_source_reader {
   lc_source *source;
@@ -10872,149 +10853,6 @@ static char *lc_pouch_txn_key(const char *txn_id, lc_error *error) {
   }
 }
 
-/* The endpoint-minted XID is also the implicit transaction admission key.
- * In shared mode the root durable-mutation guard is acquired first, then this
- * root-local transaction lock coordinates joins and terminal releases. The
- * ordering prevents a transaction guard/root cycle across processes. */
-static size_t lc_pouch_txn_guard_stripe(const char *txn_id) {
-  uint64_t hash = ((uint64_t)0xcbf29ce4UL << 32U) | (uint64_t)0x84222325UL;
-  const unsigned char *cursor;
-  for (cursor = (const unsigned char *)txn_id; *cursor != '\0'; ++cursor) {
-    hash ^= (uint64_t)*cursor;
-    hash *= ((uint64_t)0x00000100UL << 32U) | (uint64_t)0x000001b3UL;
-  }
-  return (size_t)(hash % LC_POUCH_TXN_GUARD_STRIPES);
-}
-
-static int lc_pouch_txn_guard_lock(lc_pouch *pouch, const char *txn_id,
-                                   int wait, lc_pouch_txn_guard *guard,
-                                   lc_error *error) {
-  char leaf[sizeof("pouch.implicit-txn-00.lock")];
-  char *path;
-  struct flock lock;
-  size_t stripe;
-  int pthread_rc;
-  int rc;
-
-  if (pouch == NULL || txn_id == NULL || txn_id[0] == '\0' || guard == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch transaction guard requires pouch, xid, and "
-                        "output",
-                        NULL, NULL, "pouch");
-  }
-  guard->fd = -1;
-  guard->mutex = NULL;
-  guard->mutex_locked = 0;
-  guard->shared_mutation = NULL;
-  rc = lc_pouch_state_shared_mutation_enter(pouch, &guard->shared_mutation,
-                                            error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  stripe = lc_pouch_txn_guard_stripe(txn_id);
-  pthread_rc =
-      pthread_once(&lc_pouch_txn_guard_once, lc_pouch_txn_guard_mutexes_init);
-  if (pthread_rc != 0) {
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to initialize pouch transaction guard",
-                        strerror(pthread_rc), NULL, "pouch");
-  }
-  guard->mutex = &lc_pouch_txn_guard_mutexes[stripe];
-  pthread_rc = wait ? pthread_mutex_lock(guard->mutex)
-                    : pthread_mutex_trylock(guard->mutex);
-  if (pthread_rc != 0) {
-    guard->mutex = NULL;
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error,
-                        pthread_rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT,
-                        0L, "failed to lock pouch transaction guard",
-                        strerror(pthread_rc), NULL, "pouch");
-  }
-  guard->mutex_locked = 1;
-  if (snprintf(leaf, sizeof(leaf), "pouch.implicit-txn-%02lx.lock",
-               (unsigned long)stripe) < 0) {
-    (void)pthread_mutex_unlock(guard->mutex);
-    guard->mutex = NULL;
-    guard->mutex_locked = 0;
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "failed to format pouch transaction guard", NULL, NULL,
-                        "pouch");
-  }
-  path = lc_pouch_path_join(&pouch->allocator, pouch->root_path, leaf);
-  if (path == NULL) {
-    (void)pthread_mutex_unlock(guard->mutex);
-    guard->mutex = NULL;
-    guard->mutex_locked = 0;
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch transaction guard path", NULL,
-                        NULL, "pouch");
-  }
-  guard->fd = open(path, O_CREAT | O_RDWR, 0666);
-  lc_free_with_allocator(&pouch->allocator, path);
-  if (guard->fd < 0) {
-    (void)pthread_mutex_unlock(guard->mutex);
-    guard->mutex = NULL;
-    guard->mutex_locked = 0;
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to open pouch transaction guard",
-                        strerror(errno), NULL, "pouch");
-  }
-  memset(&lock, 0, sizeof(lock));
-  lock.l_type = F_WRLCK;
-  lock.l_whence = SEEK_SET;
-  while (fcntl(guard->fd, wait ? F_SETLKW : F_SETLK, &lock) != 0) {
-    int lock_error = errno;
-    if (errno == EINTR) {
-      continue;
-    }
-    (void)close(guard->fd);
-    guard->fd = -1;
-    (void)pthread_mutex_unlock(guard->mutex);
-    guard->mutex = NULL;
-    guard->mutex_locked = 0;
-    lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-    return lc_error_set(error,
-                        !wait && (lock_error == EAGAIN || lock_error == EACCES)
-                            ? LC_ERR_PENDING
-                            : LC_ERR_TRANSPORT,
-                        0L, "failed to lock pouch transaction guard",
-                        strerror(lock_error), NULL, "pouch");
-  }
-  return LC_OK;
-}
-
-static int lc_pouch_txn_guard_acquire(lc_pouch *pouch, const char *txn_id,
-                                      lc_pouch_txn_guard *guard,
-                                      lc_error *error) {
-  return lc_pouch_txn_guard_lock(pouch, txn_id, 1, guard, error);
-}
-
-static void lc_pouch_txn_guard_release(lc_pouch_txn_guard *guard) {
-  struct flock lock;
-
-  if (guard == NULL) {
-    return;
-  }
-  if (guard->fd >= 0) {
-    memset(&lock, 0, sizeof(lock));
-    lock.l_type = F_UNLCK;
-    lock.l_whence = SEEK_SET;
-    (void)fcntl(guard->fd, F_SETLK, &lock);
-    (void)close(guard->fd);
-    guard->fd = -1;
-  }
-  if (guard->mutex_locked && guard->mutex != NULL) {
-    (void)pthread_mutex_unlock(guard->mutex);
-  }
-  guard->mutex = NULL;
-  guard->mutex_locked = 0;
-  lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
-}
-
 /* Selected private retention needs one immutable decision timestamp even for
  * an otherwise single-participant implicit transaction. Enroll only the known
  * lease, under existing xid authority; never search other namespaces. */
@@ -18578,13 +18416,8 @@ int lc_pouch_retention_run(lc_pouch *pouch, const char *ns, size_t max_attempts,
       rc = lc_xid_new(ctx.new_xid, &cause);
     if (rc == LC_OK) {
       const char *txn_id = fresh ? ctx.new_xid : ctx.work.txn_id;
-      /* An abandoned implicit xid can share this root's guard stripe with
-       * the new cleanup xid. Its already-owned mutex and file lock protect
-       * both; trying to reacquire that non-recursive stripe would skip itself.
-       */
-      if (!foreign_guard.mutex_locked ||
-          foreign_guard.mutex !=
-              &lc_pouch_txn_guard_mutexes[lc_pouch_txn_guard_stripe(txn_id)])
+      /* A held foreign guard also covers a cleanup xid on its stripe. */
+      if (!lc_pouch_txn_guard_covers(&foreign_guard, txn_id))
         rc = lc_pouch_txn_guard_lock(pouch, txn_id, 0, &guard, &cause);
     }
     if (rc == LC_OK)

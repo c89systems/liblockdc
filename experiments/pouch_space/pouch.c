@@ -5,6 +5,7 @@
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
 #include "pouch_internal.h"
+#include <errno.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
@@ -13,6 +14,7 @@ typedef struct ps_pouch_owner {
   ps_root *root;
   lc_allocator allocator;
   unsigned int references;
+  pthread_mutex_t txn_guards[LC_POUCH_STORAGE_TXN_GUARD_STRIPES];
 } ps_pouch_owner;
 typedef struct ps_pouch_source {
   lc_source pub;
@@ -61,6 +63,11 @@ static void release(void *context) {
   lc_error ignored;
   if (__atomic_sub_fetch(&owner->references, 1, __ATOMIC_ACQ_REL))
     return;
+  {
+    size_t i;
+    for (i = 0; i < LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++i)
+      pthread_mutex_destroy(&owner->txn_guards[i]);
+  }
   lc_error_init(&ignored);
   (void)ps_root_close(owner->root, &ignored);
   lc_error_cleanup(&ignored);
@@ -453,6 +460,38 @@ static int retention_hint_next(void *context, const char *after, char **name,
   lc_free_with_allocator(&owner->allocator, d.next);
   return rc;
 }
+static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
+                          lc_error *e) {
+  ps_pouch_owner *owner = context;
+  int rc;
+  *out = NULL;
+  if (stripe >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES)
+    return lc_error_set(e, LC_ERR_INVALID, 0,
+                        "invalid container transaction guard stripe", NULL,
+                        NULL, "pouch");
+  rc = check(context, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = wait ? pthread_mutex_lock(&owner->txn_guards[stripe])
+            : pthread_mutex_trylock(&owner->txn_guards[stripe]);
+  if (rc != 0)
+    return lc_error_set(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, 0,
+                        "failed to lock pouch transaction guard", strerror(rc),
+                        NULL, "pouch");
+  /* Storage can become uncertain while a caller waits for this stripe. */
+  rc = check(context, e);
+  if (rc != LC_OK) {
+    pthread_mutex_unlock(&owner->txn_guards[stripe]);
+    return rc;
+  }
+  __atomic_add_fetch(&owner->references, 1, __ATOMIC_RELAXED);
+  *out = &owner->txn_guards[stripe];
+  return LC_OK;
+}
+static void txn_guard_release(void *context, void *handle) {
+  pthread_mutex_unlock(handle);
+  release(context);
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -470,6 +509,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  retention_work_store,
                                                  retention_hint_remove,
                                                  retention_hint_next,
+                                                 txn_guard_lock,
+                                                 txn_guard_release,
                                                  release};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
@@ -533,6 +574,25 @@ int ps_pouch_state_open(const char *path, int create,
     lc_free_with_allocator(&pouch->allocator, owner);
     lc_pouch_close(pouch);
     return rc;
+  }
+  {
+    size_t i;
+    for (i = 0; i < LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++i) {
+      int mutex_rc = pthread_mutex_init(&owner->txn_guards[i], NULL);
+      if (mutex_rc != 0) {
+        lc_error ignored;
+        while (i)
+          pthread_mutex_destroy(&owner->txn_guards[--i]);
+        lc_error_init(&ignored);
+        (void)ps_root_close(owner->root, &ignored);
+        lc_error_cleanup(&ignored);
+        lc_free_with_allocator(&pouch->allocator, owner);
+        lc_pouch_close(pouch);
+        return lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                            "cannot initialize container transaction guards",
+                            strerror(mutex_rc), NULL, "pouch");
+      }
+    }
   }
   pouch->storage.ops = &storage_ops;
   pouch->storage.context = owner;

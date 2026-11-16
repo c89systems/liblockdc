@@ -423,9 +423,9 @@ standing reserve selection or implicit growth. The caller must admit the
 complete replacement while its predecessor and any pinned readers still own
 their capacity. Repeated replacements may require explicit checkpoint/reclaim
 before another claim is admissible. The [typed retention control owner](#typed-retention-control-ownership)
-now uses this support. Public lease/expiry policy still needs transaction guard
-integration, and this does not resolve the pending maintenance architecture
-decision.
+now uses this support. The [typed transaction authority](#typed-transaction-authority)
+is integrated too; complete public lease/expiry acceptance and the pending
+maintenance architecture decision remain required.
 
 Five new test groups cover planning overflow and journal bounds, page/chunk
 boundaries, zero-length values, replacements and pinned readers, underfunded
@@ -1161,14 +1161,15 @@ make progress after obstructing pins drain. No silent growth, lower public key
 limit or external persistent staging is authorized.
 
 Complete the remaining logical control ownership through typed capabilities.
-The inspected public lease path still calls retention-work reservation checks;
-release still uses transaction lock files. The implemented
+The inspected public lease path required retention-work reservation checks and
+transaction guard ownership at this boundary. The implemented
 [namespace enumeration boundary](#typed-namespace-enumeration) now supplies
 names from the existing container catalog to implicit transaction leader
 discovery. That independent integration changes no persistence layout and does
 not approve this maintenance proposal. [Retention control ownership](#typed-retention-control-ownership)
-now uses the same boundary; transaction guard ownership in
-`lc_pouch_client.c` still requires conversion. Keep their policy in the
+now uses the same boundary. [Transaction authority](#typed-transaction-authority)
+now uses typed capabilities too; complete public lease/expiry behavior still
+requires its own acceptance proof. Keep their policy in the
 production engine. Do not treat the
 current exclusive open as proof of the final shared-root contract. Interprocess
 publication and reader-generation recovery remain required within the same file.
@@ -1508,8 +1509,8 @@ The [40-case matched comparison](pouch-space-experiment.md#typed-namespace-enume
 prices the enumeration itself over 64 empty namespaces. Its repeated-walk
 medians favor the container with disjoint ranges; combined reopen-readiness
 ranges overlap. The later [retention control owner](#typed-retention-control-ownership)
-completes journal storage; transaction guards and the complete public leased-write
-path remain unintegrated.
+completes journal storage. Complete public leased-write acceptance remains
+required beyond the [typed transaction authority](#typed-transaction-authority).
 
 ## Typed retention control ownership
 
@@ -1552,9 +1553,9 @@ and wrap fairly. Returned namespace and cursor strings use the logical
 allocator and have separate ownership. No path interpretation or extra files
 are introduced in the container.
 
-Public lease enrollment/release and expiry maintenance still need the typed
-transaction guard owner and their complete integration tests. Root admission
-remains exclusive. Shared-root coordination/recovery, the pending maintenance
+Public lease enrollment/release and expiry maintenance still need complete
+public integration tests beyond the typed transaction guard owner. Root
+admission remains exclusive. Shared-root coordination/recovery, the pending maintenance
 architecture selection, and explicit production cutover remain open requirements.
 
 The first standard run exposed a pre-existing staged-retention test assumption:
@@ -1606,6 +1607,70 @@ reports faster small-control cycles and repeated hint selection, overlapping
 elapsed ranges and higher CPU at the maximum-key stress point, and slower
 combined reopen/discovery readiness. It does not price the complete public
 retention transaction path or authorize production cutover.
+
+## Typed transaction authority
+
+Transaction guard ownership now crosses the typed storage boundary. The private
+`lc_pouch_txn_guard` facade owns xid striping, root mutation ordering and cleanup.
+The production client no longer opens transaction lock files. Native ownership
+retains its existing 256 process mutexes, stripe hash, lock-file names and
+`fcntl` locks. Shared native roots still acquire root durable mutation authority
+before the stripe and release it last. Blocking and nonblocking admission retain
+their prior behavior; nonblocking contention returns `LC_ERR_PENDING`.
+
+The currently exclusive container owner supplies 256 owner-local mutexes. Its
+capability accepts a numeric stripe and returns an opaque handle, retaining the
+physical owner through release. An admitted guard may therefore outlive logical
+runtime close without releasing exclusive file ownership early. Runtime lifetime
+is required throughout acquisition and protected engine work; the acquiring
+thread releases the guard. Separate roots have separate stripes. Acquisition
+checks physical health before and after waiting, performs no allocation or I/O,
+and creates no persistent control or lock file. Root initialization failure
+unwinds only initialized mutexes, closes physical ownership and leaves retry
+possible. The root's heap allocation contains the mutex table.
+
+Retention cleanup now asks whether an acquired guard covers another xid rather
+than inspecting a native mutex address. This preserves the collision case where
+an abandoned foreign xid already protects the new cleanup xid's stripe. It
+avoids reacquiring a nonrecursive mutex through either storage owner.
+
+This boundary adds no public API/ABI or persistence layout. It does not implement
+shared-root container publication or reader generations. Shared-root admission,
+complete public lease/expiry/XA behavior and the pending maintenance-capacity
+decision remain required before full backend acceptance. The private SDK probe
+now covers leased retained save, release/commit, rollback and cold readback
+through both owners and policies; it does not extend the harness's acceptance
+to every public lease operation.
+
+The five new `pouch_space_client_*` groups are `guards`, `guard-concurrency`,
+`guard-faults`, `guard-public` and `guard-compare`. They cover invalid inputs,
+stripe collisions, nonblocking contention, wait/release, independent stripes
+and roots, native process locking, owner lifetime, idempotent release, cold
+retry and strict single-file container artifacts. Fault checks cut all 256
+container mutex initializations under both policies and with/without an error
+object (1,024 failed opens), all four native path-allocation cuts, native file
+open failure and poisoned container admission without I/O. The pure guard
+microcomparison uses the same native/container facade and executable, separates
+first admission from 1,024 repeated acquisitions and excludes root open/close.
+The full Debug build and all **444 standard ASan/UBSan groups** pass in
+3488.42 s, including 392 unit groups and all five new guard groups. Native GNU
+and musl builds each pass 46 selected existing/new groups (380.34/365.66 s),
+including native Pouch/cleanup/retention/XA/compression suites and Lua retention. All five
+new groups pass strict TSan with instrumented OpenSSL and no suppressions. Four
+normal-exit Memcheck groups have zero live heap, errors or owned descriptors at
+exit, covering 331,256 allocations and matching frees. The native fork probe is
+covered by ASan/UBSan and TSan; its intentional child `_exit` inherits the parent
+heap and is outside the normal-exit leak gate. Private guard symbols remain
+hidden in both GNU/musl shared libraries. GNU workers use 128 KiB stacks with the
+glibc stack cache disabled; musl uses its native defaults.
+
+Evidence is in `build/pouch-space-txn-guards/`: `debug-final-build.log`,
+`debug-five-final.log`, `debug-standard.log`/`debug-standard-details.log`,
+`{gnu,musl}-{build,tests}.log`, `tsan/` and `memcheck/`.
+The [40-case comparison](pouch-space-experiment.md#typed-transaction-guard-comparison)
+retains all five samples per case, min/median/max elapsed/CPU/first-admission
+statistics and executable/source hashes. It observes lower uncontended guard
+overhead; complete transaction and shared-root performance remain unmeasured.
 
 ## Integration and acceptance
 

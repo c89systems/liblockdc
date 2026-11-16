@@ -4,6 +4,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention_record.h"
+#include "lc_pouch_txn_guard.h"
 #include "namespace.h"
 #include "pouch.h"
 #include "pouch_internal.h"
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -50,6 +52,17 @@ void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
 }
 char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *p) {
   return fails() ? NULL : __real_lc_strdup_with_allocator(a, p);
+}
+static size_t mutex_init_calls, mutex_init_fail;
+static int mutex_init_armed;
+int __real_pthread_mutex_init(pthread_mutex_t *, const pthread_mutexattr_t *);
+int __wrap_pthread_mutex_init(pthread_mutex_t *mutex,
+                              const pthread_mutexattr_t *attributes) {
+  if (__atomic_load_n(&mutex_init_armed, __ATOMIC_ACQUIRE) &&
+      __atomic_add_fetch(&mutex_init_calls, 1, __ATOMIC_RELAXED) ==
+          mutex_init_fail)
+    return EAGAIN;
+  return __real_pthread_mutex_init(mutex, attributes);
 }
 typedef union header {
   long double alignment;
@@ -2079,6 +2092,474 @@ static void retention_discovery_compare(const char *directory, int reverse) {
   free(key);
   lc_error_cleanup(&e);
 }
+
+/* Exercise transaction authority through the same private facade used by the
+ * public engine. The spelling of an xid is irrelevant to stripe admission. */
+static void guard_unused(const lc_pouch_txn_guard *g) {
+  REQUIRE(g->fd == -1 && !g->mutex_locked && !g->typed_handle &&
+          !g->shared_mutation);
+}
+static void guard_names(lc_pouch_txn_guard *held, char *same, char *other) {
+  same[0] = other[0] = '\0';
+  for (unsigned int i = 1; !same[0] || !other[0]; ++i) {
+    char name[32];
+    REQUIRE(i < 100000 && snprintf(name, sizeof(name), "xid-%u", i) > 0);
+    if (lc_pouch_txn_guard_covers(held, name)) {
+      if (!same[0])
+        strcpy(same, name);
+    } else if (!other[0])
+      strcpy(other, name);
+  }
+}
+static void guard_lifecycle(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      char path[1400];
+      REQUIRE(snprintf(path, sizeof(path), "%s/guard-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      for (int cold = 0; cold < 2; ++cold) {
+        lc_pouch *p =
+            visit_open(path, native, sync, !cold, NULL, &allocator, &e);
+        lc_pouch_txn_guard g, second;
+        for (int no_error = 0; no_error < 2; ++no_error) {
+          lc_error *error = no_error ? NULL : &e;
+          REQUIRE(lc_pouch_txn_guard_lock(NULL, "xid", 0, &g, error) ==
+                  LC_ERR_INVALID);
+          guard_unused(&g);
+          lc_pouch_txn_guard_release(&g);
+          clear(&e);
+          REQUIRE(lc_pouch_txn_guard_lock(p, NULL, 0, &g, error) ==
+                  LC_ERR_INVALID);
+          guard_unused(&g);
+          clear(&e);
+          REQUIRE(lc_pouch_txn_guard_lock(p, "", 0, &g, error) ==
+                  LC_ERR_INVALID);
+          guard_unused(&g);
+          clear(&e);
+          REQUIRE(lc_pouch_txn_guard_lock(p, "xid", 0, NULL, error) ==
+                  LC_ERR_INVALID);
+          clear(&e);
+        }
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+        char same[32], other[32];
+        guard_names(&g, same, other);
+        REQUIRE(lc_pouch_txn_guard_covers(&g, "xid-0") &&
+                lc_pouch_txn_guard_covers(&g, same) &&
+                !lc_pouch_txn_guard_covers(&g, other));
+        for (int no_error = 0; no_error < 2; ++no_error) {
+          REQUIRE(lc_pouch_txn_guard_lock(p, same, 0, &second,
+                                          no_error ? NULL : &e) ==
+                  LC_ERR_PENDING);
+          guard_unused(&second);
+          lc_pouch_txn_guard_release(&second);
+          clear(&e);
+        }
+        ok(lc_pouch_txn_guard_lock(p, other, 0, &second, &e), &e);
+        lc_pouch_txn_guard_release(&second);
+        lc_pouch_txn_guard_release(&g);
+        lc_pouch_txn_guard_release(&g);
+        REQUIRE(!lc_pouch_txn_guard_covers(&g, same));
+        ok(lc_pouch_txn_guard_acquire(p, same, &g, &e), &e);
+        if (!native) {
+          char peer_path[1450];
+          REQUIRE(snprintf(peer_path, sizeof(peer_path), "%s/guard-peer",
+                           directory) < (int)sizeof(peer_path));
+          lc_pouch *peer =
+              visit_open(peer_path, 0, sync, 1, NULL, &allocator, &e);
+          ok(lc_pouch_txn_guard_lock(peer, same, 0, &second, &e), &e);
+          lc_pouch_txn_guard_release(&second);
+          lc_pouch_close(peer);
+          one_file(peer_path);
+          REQUIRE(!unlink(peer_path));
+        }
+        if (!native) {
+          /* The handle, rather than the logical runtime, retains this owner. */
+          lc_pouch_close(p);
+          p = NULL;
+          ps_pouch_state_options o = {0};
+          o.logical.single_writer = o.logical.single_writer_set = 1;
+          o.logical.background_compaction_enabled_set = 1;
+          o.logical.query_indexing_enabled_set = 1;
+          lc_pouch *blocked = NULL;
+          REQUIRE(ps_pouch_state_open(path, 0, &allocator, &o, &blocked, &e) ==
+                  LC_ERR_INVALID);
+          REQUIRE(!blocked && e.message &&
+                  strstr(e.message, "container already open"));
+          clear(&e);
+        }
+        lc_pouch_txn_guard_release(&g);
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        if (!native)
+          one_file(path);
+      }
+    }
+  namespace_artifacts(directory, "guard-");
+  lc_error_cleanup(&e);
+}
+typedef struct guard_actor {
+  lc_pouch *p;
+  const char *xid;
+  int wait, started, complete, rc;
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+} guard_actor;
+static void *guard_act(void *context) {
+  guard_actor *a = context;
+  lc_pouch_txn_guard g;
+  lc_error e;
+  lc_error_init(&e);
+  pthread_mutex_lock(&a->mutex);
+  a->started = 1;
+  pthread_cond_signal(&a->changed);
+  pthread_mutex_unlock(&a->mutex);
+  a->rc = lc_pouch_txn_guard_lock(a->p, a->xid, a->wait, &g, &e);
+  if (a->rc == LC_OK)
+    lc_pouch_txn_guard_release(&g);
+  else
+    guard_unused(&g);
+  pthread_mutex_lock(&a->mutex);
+  a->complete = 1;
+  pthread_cond_signal(&a->changed);
+  pthread_mutex_unlock(&a->mutex);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void guard_concurrency(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      char path[1400];
+      REQUIRE(snprintf(path, sizeof(path), "%s/guard-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      lc_pouch *p = visit_open(path, native, sync, 1, NULL, &allocator, &e);
+      lc_pouch_txn_guard held;
+      ok(lc_pouch_txn_guard_acquire(p, "xid-0", &held, &e), &e);
+      char same[32], other[32];
+      guard_names(&held, same, other);
+      /* Independent authority succeeds while this stripe remains held. */
+      for (int i = 0; i < 3; ++i) {
+        guard_actor a = {0};
+        a.p = p;
+        a.xid = i == 0 ? "xid-0" : i == 1 ? same : other;
+        REQUIRE(!pthread_mutex_init(&a.mutex, NULL));
+        REQUIRE(!pthread_cond_init(&a.changed, NULL));
+        pthread_t thread;
+        REQUIRE(!pthread_create(&thread, NULL, guard_act, &a));
+        REQUIRE(!pthread_join(thread, NULL));
+        REQUIRE(a.complete && a.rc == (i == 2 ? LC_OK : LC_ERR_PENDING));
+        REQUIRE(!pthread_cond_destroy(&a.changed));
+        REQUIRE(!pthread_mutex_destroy(&a.mutex));
+      }
+      guard_actor a = {0};
+      a.p = p;
+      a.xid = same;
+      a.wait = 1;
+      REQUIRE(!pthread_mutex_init(&a.mutex, NULL));
+      REQUIRE(!pthread_cond_init(&a.changed, NULL));
+      pthread_t thread;
+      REQUIRE(!pthread_create(&thread, NULL, guard_act, &a));
+      pthread_mutex_lock(&a.mutex);
+      while (!a.started)
+        pthread_cond_wait(&a.changed, &a.mutex);
+      REQUIRE(!a.complete);
+      pthread_mutex_unlock(&a.mutex);
+      lc_pouch_txn_guard_release(&held);
+      REQUIRE(!pthread_join(thread, NULL));
+      REQUIRE(a.complete && a.rc == LC_OK);
+      REQUIRE(!pthread_cond_destroy(&a.changed));
+      REQUIRE(!pthread_mutex_destroy(&a.mutex));
+      if (native) {
+        /* Fork before acquiring any guard. Child uses async-signal-safe file
+         * operations only; parent must observe the process's native lock. */
+        char leaf[1600];
+        REQUIRE(snprintf(leaf, sizeof(leaf), "%s/pouch.implicit-txn-%02lx.lock",
+                         path, (unsigned long)held.stripe) < (int)sizeof(leaf));
+        int ready[2], resume[2];
+        REQUIRE(!pipe(ready) && !pipe(resume));
+        pid_t child = fork();
+        REQUIRE(child >= 0);
+        if (!child) {
+          int fd = open(leaf, O_RDWR);
+          struct flock lock;
+          memset(&lock, 0, sizeof(lock));
+          lock.l_type = F_WRLCK;
+          lock.l_whence = SEEK_SET;
+          char byte = 'x';
+          if (fd < 0 || fcntl(fd, F_SETLK, &lock) ||
+              write(ready[1], &byte, 1) != 1 || read(resume[0], &byte, 1) != 1)
+            _exit(2);
+          close(fd);
+          _exit(0);
+        }
+        REQUIRE(!close(ready[1]) && !close(resume[0]));
+        char byte;
+        REQUIRE(read(ready[0], &byte, 1) == 1);
+        REQUIRE(lc_pouch_txn_guard_lock(p, "xid-0", 0, &held, &e) ==
+                LC_ERR_PENDING);
+        guard_unused(&held);
+        clear(&e);
+        REQUIRE(write(resume[1], "x", 1) == 1);
+        int status;
+        REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0);
+        REQUIRE(!close(ready[0]) && !close(resume[1]));
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &held, &e), &e);
+        lc_pouch_txn_guard_release(&held);
+      }
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      if (!native)
+        one_file(path);
+    }
+  namespace_artifacts(directory, "guard-");
+  lc_error_cleanup(&e);
+}
+static void guard_faults(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      char path[1400], moved[1450];
+      REQUIRE(snprintf(path, sizeof(path), "%s/guard-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      io_fault f = {0};
+      ps_io io = {&f, disk_read, disk_write, disk_sync, disk_reserve, NULL};
+      lc_pouch *p = visit_open(path, native, sync, 1, &io, &allocator, &e);
+      if (!native) {
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        mutex_init_calls = mutex_init_fail = 0;
+        mutex_init_armed = 1;
+        p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+        size_t count = mutex_init_calls;
+        mutex_init_armed = 0;
+        REQUIRE(count >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES);
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        for (size_t cut = 1; cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++cut)
+          for (int no_error = 0; no_error < 2; ++no_error) {
+            ps_pouch_state_options o = {0};
+            o.logical.single_writer = o.logical.single_writer_set = 1;
+            o.logical.background_compaction_enabled_set = 1;
+            o.logical.query_indexing_enabled_set = 1;
+            o.logical.query_engine = "scan";
+            o.logical.durable_sync = sync;
+            o.io = &io;
+            p = NULL;
+            mutex_init_calls = 0;
+            mutex_init_fail = count - LC_POUCH_STORAGE_TXN_GUARD_STRIPES + cut;
+            mutex_init_armed = 1;
+            int rc = ps_pouch_state_open(path, 0, &allocator, &o, &p,
+                                         no_error ? NULL : &e);
+            mutex_init_armed = 0;
+            REQUIRE(rc == LC_ERR_TRANSPORT && !p && !live);
+            REQUIRE(
+                no_error ||
+                (e.message &&
+                 !strcmp(e.message,
+                         "cannot initialize container transaction guards")));
+            clear(&e);
+            unlocked(path);
+          }
+        p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+      }
+      lc_pouch_txn_guard g;
+      allocation = fail_at = 0;
+      armed = f.armed = 1;
+      ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+      size_t total = allocation;
+      armed = f.armed = 0;
+      REQUIRE(!f.calls);
+      lc_pouch_txn_guard_release(&g);
+      REQUIRE(native ? total == 1 : total == 0);
+      for (size_t nth = 1; nth <= total; ++nth)
+        for (int no_error = 0; no_error < 2; ++no_error) {
+          allocation = 0;
+          fail_at = nth;
+          armed = 1;
+          int rc =
+              lc_pouch_txn_guard_acquire(p, "xid-0", &g, no_error ? NULL : &e);
+          armed = 0;
+          REQUIRE(rc == LC_ERR_NOMEM);
+          guard_unused(&g);
+          lc_pouch_txn_guard_release(&g);
+          clear(&e);
+          ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+          lc_pouch_txn_guard_release(&g);
+        }
+      if (native) {
+        REQUIRE(snprintf(moved, sizeof(moved), "%s-moved", path) <
+                (int)sizeof(moved));
+        REQUIRE(!rename(path, moved));
+        REQUIRE(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e) ==
+                LC_ERR_TRANSPORT);
+        guard_unused(&g);
+        lc_pouch_txn_guard_release(&g);
+        clear(&e);
+        REQUIRE(!rename(moved, path));
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+        lc_pouch_txn_guard_release(&g);
+      }
+      if (!native) {
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+        void *handle = NULL;
+        REQUIRE(p->storage.ops->txn_guard_lock(
+                    p->storage.context, LC_POUCH_STORAGE_TXN_GUARD_STRIPES, 0,
+                    &handle, &e) == LC_ERR_INVALID);
+        REQUIRE(!handle);
+        clear(&e);
+        f.calls = 0;
+        f.fail = f.armed = 1;
+        REQUIRE(ps_checkpoint(ps_root_space(ps_pouch_state_root(p)), &e) ==
+                LC_ERR_TRANSPORT);
+        f.armed = 0;
+        clear(&e);
+        lc_pouch_txn_guard denied;
+        for (int no_error = 0; no_error < 2; ++no_error) {
+          f.calls = 0;
+          f.armed = 1;
+          REQUIRE(lc_pouch_txn_guard_lock(p, "xid-1", 0, &denied,
+                                          no_error ? NULL : &e) ==
+                  LC_ERR_TRANSPORT);
+          f.armed = 0;
+          REQUIRE(!f.calls);
+          guard_unused(&denied);
+          lc_pouch_txn_guard_release(&denied);
+          clear(&e);
+        }
+        lc_pouch_txn_guard_release(&g);
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+        lc_pouch_txn_guard_release(&g);
+      }
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      if (!native)
+        one_file(path);
+    }
+  namespace_artifacts(directory, "guard-");
+  printf("transaction guards: 1024 container mutex initialization cuts, four "
+         "native allocation cuts; both policies and nullable errors; "
+         "uncertain storage admission, retry, no-I/O container acquire\n");
+  lc_error_cleanup(&e);
+}
+static void guard_public(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      char path[1400], endpoint[1600];
+      REQUIRE(snprintf(path, sizeof(path), "%s/guard-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      REQUIRE(
+          snprintf(endpoint, sizeof(endpoint),
+                   "pouch://%s?single_writer=true&background_compaction=false&"
+                   "query_indexing=false&queue_watch=false&query_engine=scan",
+                   path) < (int)sizeof(endpoint));
+      const char *endpoints[] = {endpoint};
+      lc_pouch_settings settings;
+      lc_pouch_settings_init(&settings);
+      settings.set_mask = LC_POUCH_SETTING_DURABLE_SYNC;
+      settings.durable_sync = sync;
+      lc_client_config cfg;
+      lc_client_config_init(&cfg);
+      cfg.endpoints = endpoints;
+      cfg.endpoint_count = 1;
+      cfg.allocator = allocator;
+      cfg.default_namespace = "orders";
+      cfg.pouch_settings = &settings;
+      for (int cold = 0; cold < 2; ++cold) {
+        lc_client *client = NULL;
+        ok(native ? lc_client_open(&cfg, &client, &e)
+                  : ps_pouch_client_open(&cfg, !cold, NULL, &client, &e),
+           &e);
+        if (cold) {
+          read_value(client, NULL, "kept", "{\"value\":7}", &e);
+        } else {
+          lc_lease *lease = NULL;
+          lc_acquire_req acquire;
+          lc_acquire_req_init(&acquire);
+          acquire.key = "kept";
+          acquire.owner = "guard-test";
+          acquire.ttl_seconds = 300;
+          ok(client->acquire(client, &acquire, &lease, &e), &e);
+          value v = {7};
+          lc_update_opts options = {0};
+          options.has_retention_seconds = 1;
+          options.retention_seconds = 3600;
+          ok(lc_lease_save(lease, &value_map, &v, &options, &e), &e);
+          ok(lc_lease_release(lease, NULL, &e), &e);
+          read_value(client, NULL, "kept", "{\"value\":7}", &e);
+          acquire.key = "rolled";
+          ok(client->acquire(client, &acquire, &lease, &e), &e);
+          ok(lc_lease_save(lease, &value_map, &v, &options, &e), &e);
+          lc_release_req release = {1};
+          ok(lc_lease_release(lease, &release, &e), &e);
+        }
+        lc_pouch_state_read_result r = {0};
+        lc_pouch *p = ((lc_client_handle *)client)->pouch;
+        ok(lc_pouch_state_read_metadata(p, "orders", "rolled", &r, &e), &e);
+        REQUIRE(!r.has_body && !r.retention);
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        ok(lc_pouch_state_read_metadata(p, "orders", "kept", &r, &e), &e);
+        lc_pouch_unix_seconds now = 0;
+        ok(lc_pouch_now_unix(&now, &e), &e);
+        REQUIRE(r.has_body && r.retention > now && r.retention <= now + 3600);
+        lc_pouch_state_read_result_cleanup(&allocator, &r);
+        lc_client_close(client);
+        REQUIRE(!live);
+        if (!native)
+          one_file(path);
+      }
+    }
+  namespace_artifacts(directory, "guard-");
+  lc_error_cleanup(&e);
+}
+static void guard_compare(const char *directory, int reverse) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int engine = 0; engine < 2; ++engine)
+    for (int policy = 0; policy < 2; ++policy) {
+      int native = reverse ? 1 - engine : engine;
+      int sync = reverse ? 1 - policy : policy;
+      char path[1400];
+      REQUIRE(snprintf(path, sizeof(path), "%s/guard-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      for (int cold = 0; cold < 2; ++cold) {
+        lc_pouch *p = visit_open(path, native, sync, !cold, NULL, NULL, &e);
+        lc_pouch_txn_guard g;
+        double first = namespace_clock(CLOCK_MONOTONIC);
+        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+        REQUIRE(lc_pouch_txn_guard_covers(&g, "xid-0"));
+        lc_pouch_txn_guard_release(&g);
+        first = 1e6 * (namespace_clock(CLOCK_MONOTONIC) - first);
+        double cpu = namespace_clock(CLOCK_PROCESS_CPUTIME_ID);
+        double start = namespace_clock(CLOCK_MONOTONIC);
+        for (unsigned int i = 0; i < 1024; ++i) {
+          ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
+          REQUIRE(lc_pouch_txn_guard_covers(&g, "xid-0"));
+          lc_pouch_txn_guard_release(&g);
+        }
+        double elapsed = 1e6 * (namespace_clock(CLOCK_MONOTONIC) - start);
+        cpu = 1e6 * (namespace_clock(CLOCK_PROCESS_CPUTIME_ID) - cpu);
+        printf(
+            "guard-compare native=%d sync=%d cold=%d locks=1024 first_us=%.6f "
+            "elapsed_us=%.6f cpu_us=%.6f verified=1\n",
+            native, sync, cold, first, elapsed, cpu);
+        lc_pouch_close(p);
+        if (!native)
+          one_file(path);
+      }
+    }
+  namespace_artifacts(directory, "guard-");
+  lc_error_cleanup(&e);
+}
 static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
@@ -2119,6 +2600,17 @@ static void *worker(void *context) {
            !strcmp(r->mode, "retention-discovery-compare-reverse"))
     retention_discovery_compare(
         r->directory, !strcmp(r->mode, "retention-discovery-compare-reverse"));
+  else if (!strcmp(r->mode, "guards"))
+    guard_lifecycle(r->directory);
+  else if (!strcmp(r->mode, "guard-concurrency"))
+    guard_concurrency(r->directory);
+  else if (!strcmp(r->mode, "guard-faults"))
+    guard_faults(r->directory);
+  else if (!strcmp(r->mode, "guard-public"))
+    guard_public(r->directory);
+  else if (!strcmp(r->mode, "guard-compare") ||
+           !strcmp(r->mode, "guard-compare-reverse"))
+    guard_compare(r->directory, !strcmp(r->mode, "guard-compare-reverse"));
   else
     REQUIRE(0);
   return NULL;
