@@ -9,6 +9,7 @@
 #include "lc/lc.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
+#include "lc_pouch_outbox_store.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -2088,6 +2089,62 @@ test_pouch_outbox_duplicate_rejects_immutable_envelope_conflicts(void **state) {
  * survives a terminal dead-letter/replay cycle, but a completed effect has no
  * future delivery that could consume it and must reclaim it before the parent
  * job is released. */
+static void outbox_assert_marker_presence(lc_client *client, const char *ns,
+                                          int kind, const char *name,
+                                          int present) {
+  lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
+  lc_pouch_outbox_store store = {0};
+  unsigned char *bytes = NULL;
+  size_t length = 0U;
+  lc_error error;
+  int rc;
+  lc_error_init(&error);
+  assert_int_equal(
+      lc_pouch_outbox_store_open(pouch, ns, kind, 0, &store, &error), LC_OK);
+  rc = store.ops->read(store.context, name, &pouch->allocator, 1U,
+                       LC_POUCH_OUTBOX_MARKER_MAX_BYTES, &bytes, &length,
+                       &error);
+  assert_int_equal(rc, present ? LC_OK : LC_POUCH_OUTBOX_MARKER_MISSING);
+  assert_int_equal(bytes != NULL, present);
+  lc_free_with_allocator(&pouch->allocator, bytes);
+  assert_int_equal(lc_pouch_outbox_store_close(&store, LC_OK, &error), LC_OK);
+  lc_error_cleanup(&error);
+}
+static void outbox_assert_stateful_remote_rejected(void) {
+  const char *endpoint = "http://127.0.0.1:1";
+  lc_client_config config;
+  lc_outbox_config outbox_config;
+  lc_client *client = NULL;
+  lc_outbox *outbox = NULL;
+  lc_outbox_dispatcher *dispatcher = NULL;
+  lc_outbox_job *job = (lc_outbox_job *)(uintptr_t)1;
+  lc_error error;
+
+  lc_error_init(&error);
+  lc_client_config_init(&config);
+  config.endpoints = &endpoint;
+  config.endpoint_count = 1U;
+  config.disable_mtls = 1;
+  assert_int_equal(lc_client_open(&config, &client, &error), LC_OK);
+  lc_outbox_config_init(&outbox_config);
+  outbox_config.ns = "stateful-rejection";
+  assert_int_equal(
+      lc_client_new_outbox(client, &outbox_config, &outbox, &error), LC_OK);
+  dispatcher = outbox_test_dispatcher(outbox, &error);
+  assert_non_null(dispatcher);
+  assert_int_equal(
+      lc_outbox_dispatcher_next_with_state(dispatcher, 0L, &job, &error),
+      LC_ERR_INVALID);
+  assert_null(job);
+  assert_non_null(strstr(error.message, "requires Pouch"));
+  lc_error_cleanup(&error);
+  lc_error_init(&error);
+  assert_int_equal(lc_outbox_dispatcher_stop(dispatcher, -1L, &error), LC_OK);
+  lc_outbox_dispatcher_close(dispatcher);
+  lc_outbox_close(outbox);
+  lc_client_close(client);
+  lc_error_cleanup(&error);
+}
 static void test_pouch_outbox_stateful_delivery_lifecycle(void **state) {
   char root[256], template_path[256], endpoint[320], state_key[192],
       retried_state_key[192], deleted_state_key[192], crashed_state_key[192],
@@ -2102,9 +2159,7 @@ static void test_pouch_outbox_stateful_delivery_lifecycle(void **state) {
   lc_outbox_receipt receipt;
   lc_outbox_job *job;
   lc_client *client;
-  lc_client_handle *client_handle;
   lc_outbox *outbox;
-  lc_outbox_dispatcher *dispatcher;
   lc_lease *state_lease;
   lc_source *payload;
   lc_source *checkpoint;
@@ -2159,28 +2214,18 @@ static void test_pouch_outbox_stateful_delivery_lifecycle(void **state) {
       lc_client_new_outbox(client, &outbox_config, &outbox, &error), LC_OK);
   /* Stateful delivery is deliberately Pouch-only. It must reject before any
    * wait or claim, and must never silently produce a stateless job. */
-  dispatcher = outbox_test_dispatcher(outbox, &error);
-  assert_non_null(dispatcher);
-  client_handle = (lc_client_handle *)client;
-  client_handle->is_pouch = 0;
-  job = (lc_outbox_job *)(uintptr_t)1;
-  assert_int_equal(
-      lc_outbox_dispatcher_next_with_state(dispatcher, 0L, &job, &error),
-      LC_ERR_INVALID);
-  assert_null(job);
-  client_handle->is_pouch = 1;
-  lc_outbox_dispatcher_close(dispatcher);
-  lc_error_cleanup(&error);
-  lc_error_init(&error);
+  outbox_assert_stateful_remote_rejected();
   /* A normal non-query probe remains entirely stateless: it must not even
    * create the private crash-reclaim marker directory. */
   assert_int_equal(outbox_test_next(outbox, 0L, &job, &error), LC_OK);
   assert_null(job);
   assert_true(snprintf(reclaim_directory, sizeof(reclaim_directory),
                        "%s/.lockd/outbox-state-reclaim", root) > 0);
-  errno = 0;
-  assert_int_equal(access(reclaim_directory, F_OK), -1);
-  assert_int_equal(errno, ENOENT);
+  if (!((lc_client_handle *)client)->pouch->storage.ops) {
+    errno = 0;
+    assert_int_equal(access(reclaim_directory, F_OK), -1);
+    assert_int_equal(errno, ENOENT);
+  }
   lc_outbox_entry_init(&entry);
   entry.operation_id = "stateful-lifecycle-operation";
   entry.effect_id = "stateful-lifecycle-effect";
@@ -2536,13 +2581,20 @@ static void test_pouch_outbox_stateful_delivery_lifecycle(void **state) {
                        sizeof(deleted_state_marker_path),
                        "%s/.lockd/outbox-state-reclaim/%s/%s", root,
                        outbox_config.ns, deleted_state_marker_id) > 0);
-  assert_int_equal(access(deleted_state_marker_path, F_OK), 0);
+  outbox_assert_marker_presence(client, outbox_config.ns, -1,
+                                deleted_state_marker_id, 1);
+  if (!((lc_client_handle *)client)->pouch->storage.ops)
+    assert_int_equal(access(deleted_state_marker_path, F_OK), 0);
   assert_int_equal(
       outbox_test_delete_dead_letter(outbox, receipt.outbox_key, &error),
       LC_OK);
-  errno = 0;
-  assert_int_equal(access(deleted_state_marker_path, F_OK), -1);
-  assert_int_equal(errno, ENOENT);
+  outbox_assert_marker_presence(client, outbox_config.ns, -1,
+                                deleted_state_marker_id, 0);
+  if (!((lc_client_handle *)client)->pouch->storage.ops) {
+    errno = 0;
+    assert_int_equal(access(deleted_state_marker_path, F_OK), -1);
+    assert_int_equal(errno, ENOENT);
+  }
   lc_acquire_req_init(&inspect_acquire);
   inspect_acquire.ns = outbox_config.ns;
   inspect_acquire.key = deleted_state_key;
@@ -11728,8 +11780,12 @@ test_pouch_dead_letter_retention_is_bounded_and_generation_safe(void **state) {
   assert_true(snprintf(third_marker_path, sizeof(third_marker_path),
                        "%s/.lockd/outbox-dead-letter-reclaim/%s/%s", root,
                        config.ns, third_id) > 0);
-  assert_int_equal(access(third_marker_path, F_OK), -1);
-  assert_int_equal(errno, ENOENT);
+  outbox_assert_marker_presence(client, config.ns,
+                                LC_POUCH_RETENTION_DEAD_LETTER, third_id, 0);
+  if (!client_handle->pouch->storage.ops) {
+    assert_int_equal(access(third_marker_path, F_OK), -1);
+    assert_int_equal(errno, ENOENT);
+  }
   assert_int_equal(lc_lease_release(hold_lease, NULL, &error), LC_OK);
   hold_lease = NULL;
   assert_int_equal(lc_lease_release(second_hold_lease, NULL, &error), LC_OK);

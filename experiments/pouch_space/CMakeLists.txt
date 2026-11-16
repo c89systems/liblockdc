@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -34,6 +34,30 @@ if(LOCKDC_BUILD_BENCHMARKS)
   target_link_options(pouch_space_compare PRIVATE
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
+  add_executable(pouch_space_queue_outbox_compare queue_outbox_compare.c
+    ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_queue_outbox_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_queue_outbox_compare PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_queue_outbox_compare PRIVATE
+    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
+  lc_configure_c_test_target(pouch_space_queue_outbox_compare)
+  if(LOCKDC_BUILD_TESTS)
+    foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox)
+      foreach(sync 0 1)
+        foreach(reopen 0 1)
+          set(reopen_args)
+          if(reopen)
+            set(reopen_args --reopen)
+          endif()
+          add_test(NAME pouch_space_compare_${mode}_${sync}_${reopen}
+            COMMAND pouch_space_queue_outbox_compare ${mode}
+              ${CMAKE_CURRENT_BINARY_DIR} 4 4096 ${sync} 2 ${reopen_args})
+          set_tests_properties(pouch_space_compare_${mode}_${sync}_${reopen}
+            PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        endforeach()
+      endforeach()
+    endforeach()
+  endif()
   if(LOCKDC_BUILD_TESTS)
     foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-scope pouch-scope runtime-staged pouch-staged runtime-sdk-read-points pouch-sdk-read-points runtime-sdk-scan-metadata pouch-sdk-scan-metadata runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection runtime-collection pouch-collection-compact runtime-collection-compact pouch-collection-maintain runtime-collection-maintain)
       add_test(NAME pouch_space_compare_${mode}
@@ -71,6 +95,96 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
   lc_configure_c_target(pouch_space_test_experiment)
+  foreach(surface queue outbox)
+    if(surface STREQUAL "queue")
+      set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
+      set(behavior_cases
+        test_client_queue_enqueue_dequeue_ack_and_nack
+        test_txn_queue_decision_rejects_newer_delivery_lease
+        test_client_queue_dequeue_honors_wait_seconds
+        test_client_queue_redelivers_abandoned_inflight_after_visibility_timeout
+        test_client_queue_large_payload_stats_dequeue_and_ack
+        test_txn_decisions_apply_queue_side_effects
+        test_txn_recovery_applies_queue_side_effects
+        test_client_queue_dequeue_batch_returns_page
+        test_client_queue_dequeue_batch_rolls_back_unreturned_messages
+        test_client_queue_dequeue_batch_preserves_fifo_payload_order
+        test_client_queue_dequeue_cursor_resumes_after_consumed_message
+        test_client_queue_dequeue_with_state_uses_pouch_lease
+        test_client_queue_dequeue_with_state_rolls_back_partial_delivery
+        test_client_queue_state_lease_transaction_update_uses_distinct_lease_key
+        test_client_queue_dequeue_with_state_nack_releases_state_lease
+        test_client_queue_ttl_and_retry_terminal_states
+        test_client_queue_max_durations_obey_timestamp_range
+        test_client_queue_subscribe_polling_paths
+        test_client_queue_watch_polling_detects_change
+        test_client_queue_watch_detects_transaction_ack_commit)
+    else()
+      set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_outbox.c)
+      set(behavior_cases
+        test_pouch_outbox_duplicate_rejects_immutable_envelope_conflicts
+        test_pouch_outbox_stateful_delivery_lifecycle
+        test_pouch_dispatcher_wait_includes_worker_release
+        test_pouch_outbox_stateful_renewal_terminal_versions
+        test_pouch_outbox_transaction_and_duplicate
+        test_pouch_outbox_stateful_handoff_failure_rolls_back
+        test_pouch_duplicate_inbox_handles_json_runtime_failure
+        test_pouch_participant_cleanup_after_transaction_close
+        test_pouch_participant_allocation_failure_rolls_back_enrollment
+        test_pouch_command_receipt_allocation_failure_rolls_back_enrollment
+        test_pouch_command_terminal_load_failure_cleans_record
+        test_pouch_outbox_allocation_failures_roll_back_enrollment
+        test_pouch_command_receipt_commits_with_outbox_and_result
+        test_pouch_generated_command_key_waits_by_id
+        test_pouch_command_attachment_failure_aborts_transaction
+        test_pouch_dead_letter_operations
+        test_pouch_terminal_retention_public_transitions
+        test_pouch_terminal_retention_count_optout_and_time
+        test_pouch_terminal_retention_provisional_inbox
+        test_pouch_terminal_retention_generation_busy_and_failure
+        test_pouch_dead_letter_retention_is_bounded_and_generation_safe
+        test_pouch_dispatcher_scan_recovery_when_indexing_is_disabled)
+    endif()
+    add_executable(pouch_space_${surface}_sdk_test ${behavior_source}
+      queue_outbox_sdk_adapter.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+    target_include_directories(pouch_space_${surface}_sdk_test PRIVATE
+      ${CMAKE_SOURCE_DIR}/src)
+    target_compile_definitions(pouch_space_${surface}_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
+    target_link_libraries(pouch_space_${surface}_sdk_test PRIVATE
+      pouch_space_test_experiment lc::cmocka)
+    target_link_options(pouch_space_${surface}_sdk_test PRIVATE
+      "LINKER:--wrap=lc_client_open" "LINKER:--wrap=lc_pouch_open")
+    if(surface STREQUAL "queue")
+      target_link_options(pouch_space_${surface}_sdk_test PRIVATE "LINKER:--wrap=time")
+    endif()
+    lc_configure_c_test_target(pouch_space_${surface}_sdk_test)
+    if(surface STREQUAL "queue")
+      add_test(NAME pouch_space_native_queue_sdk
+        COMMAND $<TARGET_FILE:lc_unit_pouch> ${behavior_cases})
+      set_tests_properties(pouch_space_native_queue_sdk PROPERTIES TIMEOUT 180
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endif()
+    foreach(codec RANGE 0 3)
+      foreach(sync RANGE 0 1)
+        add_test(NAME pouch_space_${surface}_sdk_${codec}_${sync}
+          COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
+            POUCH_SPACE_TEST_SYNC=${sync} $<TARGET_FILE:pouch_space_${surface}_sdk_test>
+            ${behavior_cases})
+        set_tests_properties(pouch_space_${surface}_sdk_${codec}_${sync}
+          PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        if(surface STREQUAL "queue")
+          add_test(NAME pouch_space_queue_notifications_${codec}_${sync}
+            COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
+              POUCH_SPACE_TEST_SYNC=${sync} POUCH_SPACE_TEST_WATCH=1
+              $<TARGET_FILE:pouch_space_queue_sdk_test>
+              test_client_queue_watch_polling_detects_change
+              test_client_queue_watch_detects_transaction_ack_commit)
+          set_tests_properties(pouch_space_queue_notifications_${codec}_${sync}
+            PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        endif()
+      endforeach()
+    endforeach()
+  endforeach()
   add_executable(pouch_space_collection_sdk_test collection_sdk_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_collection_sdk_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_definitions(pouch_space_collection_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
@@ -146,10 +260,11 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_client_test)
-  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare)
+  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
+  set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   set_tests_properties(pouch_space_client_faults pouch_space_client_io-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_client_retention-faults pouch_space_client_retention-io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_frame_test frame_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

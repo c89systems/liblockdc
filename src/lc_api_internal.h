@@ -818,6 +818,8 @@ size_t lc_lonejson_runtime_limit(size_t configured_limit);
 void lc_lonejson_config_init(lonejson_config *config, size_t limit);
 lonejson *lc_engine_lonejson_runtime(lc_engine_client *client);
 lonejson *lc_thread_lonejson_runtime(void);
+/* Drain a private worker's runtime before it publishes completion. */
+void lc_lonejson_release_thread_runtime(void);
 void lc_lonejson_cleanup_value(lonejson *runtime, const lonejson_map *map,
                                void *value);
 void lc_engine_lonejson_cleanup(lc_engine_client *client,

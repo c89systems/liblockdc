@@ -37,8 +37,13 @@ typedef struct ps_pouch_state_options {
  * live owner have the same epoch. Explicit and background collection
  * maintenance use the common compactor and retention engine. Indexing remains
  * outside this harness.
+ * Public queue delivery, batching, paired state, transaction recovery and
+ * subscription/watch calls use the common engine. In-process advisory queue
+ * notifications use no sidecar. Outbox delivery, stateful checkpoints,
+ * completion/dead-letter/replay, inbox/command receipts and terminal retention
+ * use the same owners, with bounded durable in-file cleanup markers.
  * Other Pouch operations are outside this harness's current call contract.
- * Explicitly disable indexing and queue watches; shared
+ * Explicitly disable indexing; shared
  * root mode and generated external key files are not admitted. No public
  * backend option or native-open cutover is introduced by this harness. */
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,

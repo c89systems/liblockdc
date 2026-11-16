@@ -9835,6 +9835,12 @@ static void lc_pouch_queue_touch_notification(lc_client_handle *client,
   if (!client->pouch->queue_watch_enabled) {
     return;
   }
+  if (client->pouch->storage.ops) {
+    if (client->pouch->storage.ops->queue_notify)
+      client->pouch->storage.ops->queue_notify(client->pouch->storage.context,
+                                               ns, queue);
+    return;
+  }
   lc_error_init(&ignored);
   namespace_path = NULL;
   notify_dir = NULL;

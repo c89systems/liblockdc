@@ -2414,9 +2414,11 @@ static void validation(const char *path) {
       o.logical.compression = "unknown";
       expected = LC_ERR_INVALID;
     }
-    if (bad == 1) {
+    if (bad == 1 || bad == 4) {
       ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
-      REQUIRE(p && p->compaction_thread_started);
+      REQUIRE(p && (bad == 1 ? p->compaction_thread_started
+                             : p->queue_watch_enabled &&
+                                   !strcmp(p->queue_watch_mode, "inprocess")));
       lc_pouch_close(p);
       REQUIRE(!live && !unlink(path));
       continue;

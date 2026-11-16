@@ -5428,6 +5428,9 @@ static void *lc_outbox_dispatcher_main(void *context) {
       continue;
     }
   }
+  /* A detached worker's TLS destructors run after waiters can observe exit.
+   * Drain its JSON runtime first so a completed stop covers this resource. */
+  lc_lonejson_release_thread_runtime();
   /* Retain before publishing worker exit: client close may detach this shell
    * concurrently, while this detached thread still needs its lifecycle state.
    */

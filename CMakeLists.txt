@@ -599,6 +599,8 @@ set(lc_sources
     src/lc_xa_coordinator.c
     src/lc_pouch_history.c
     src/lc_pouch.c
+    src/lc_pouch_outbox_store.c
+    src/lc_pouch_outbox_markers.c
     src/lc_pouch_crypto.c
     src/lc_pouch_index.c
     src/lc_pouch_index_doc.c

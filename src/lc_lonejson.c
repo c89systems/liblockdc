@@ -111,6 +111,19 @@ static void lc_lonejson_thread_runtime_key_init(void) {
 #endif
 }
 
+void lc_lonejson_release_thread_runtime(void) {
+  lc_lonejson_thread_runtime *entry;
+
+  (void)pthread_once(&lc_lonejson_thread_runtime_once,
+                     lc_lonejson_thread_runtime_key_init);
+  if (lc_lonejson_thread_runtime_key_status != 0)
+    return;
+  entry = pthread_getspecific(lc_lonejson_thread_runtime_key);
+  if (entry != NULL &&
+      pthread_setspecific(lc_lonejson_thread_runtime_key, NULL) == 0)
+    lc_lonejson_thread_runtime_destroy(entry);
+}
+
 /* pthread key destructors do not run for the main thread at ordinary exit,
  * nor when a DSO unloads while otherwise idle application threads survive.
  * No thread may execute SDK code during unload. Delete the callback key and

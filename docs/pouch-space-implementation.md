@@ -2044,6 +2044,141 @@ external XA, resumable codec conversion, shared-root coordination/recovery and
 deployment acceptance remain outside this completed maintenance surface. The
 complete backend goal remains active.
 
+## Queue and outbox ownership
+
+The private container SDK now runs public queue enqueue/dequeue, ack/nack,
+visibility and abandoned-delivery recovery, TTL/retry terminals, batch/FIFO and
+cursor behavior, paired state leases, transaction decisions/recovery,
+subscriptions and queue watches through the existing logical engine. Outbox
+integration includes duplicate validation, transactional effects, stateful
+delivery/checkpoints, completion and deferred checkpoint cleanup,
+dead-letter/replay/delete, inbox and command receipts, terminal retention and
+scan-based dispatcher recovery. This surface admits exclusive physical
+ownership and explicitly selected scan queries. It establishes no shared-root
+or indexed-query support, and normal public open still selects multifile Pouch.
+
+`lc_pouch_outbox_store` is the narrow physical boundary for five bounded marker
+families: state reclaim and dead-letter/completed/inbox/command retention.
+Common code retains the existing `LOR1`/`LDR1` codecs, lexical cursor/wrap policy,
+deadline filenames, bounded dead-letter inspection, metadata-only terminal
+inventory and generation checks. State markers are at most 4 KiB; retention
+markers are at most 8 KiB. These values contain cleanup keys and policy metadata,
+never application payloads or transaction decisions. The native adapter retains
+its existing directories, atomic temporary-file publication and family-specific
+sync/absent-directory behavior. The previous filesystem-specific marker block
+has been removed from `lc_pouch.c`.
+
+Container names are namespace-owned `PS_CATALOG_CONTROL` entries: one binary
+kind byte followed by the exact marker filename. Replacement allocates a fresh
+immutable owner and empty sealed stream identity with key `UINT64_MAX`. Its
+bounded body lives in `PS_CONTROL` slot 1. A separate 32-byte owner tag in slot
+`UINT64_MAX` contains `LCPSOBX1`, owner, identity incarnation and CRC32 stored in
+a 64-bit field. Publication orders identity, tag, body and catalog binding;
+replacement checks the prior catalog revision. Marker publication/removal is
+durable under both root policies. Ordinary namespace work is anchored before
+resource creation so cold maintenance can discover interrupted cleanup.
+
+Catalog inventory captures names without admitting logical namespace state or
+reading marker bodies; the common selector controls bounded body admission.
+Reads pin the selected binding. Removed/replaced owners remain available while
+catalog views are pinned, then ordinary orphan cleanup retires body, tag and
+identity. Tags distinguish these children from ordinary canonical stream owners
+whose numeric stream key happens to match. Interrupted construction and cleanup
+remain retryable. Same-name writers use a short registry admission plus a
+per-marker wait; unrelated marker identities and namespaces can publish while a
+same-name writer is blocked. No registry mutex spans physical publication.
+
+Queue watches use per-waiter monotonic conditions scoped to the physical owner,
+namespace and queue. Notifications wake all matching waiters without files or
+unrelated-queue wakes. The common 100 ms canonical rescan fallback covers a
+notification arriving before registration; notifications remain advisory.
+Status reports `inprocess` / `container_notifications` when enabled.
+
+Qualification also corrected two lifecycle issues. An existing test changed
+`client->is_pouch` while its dispatcher read that immutable identity; the
+rejection check now uses a real remote client without requesting network work.
+ThreadSanitizer then exposed a real worker-exit race: dispatcher wait could
+finish before the detached worker's JSON TLS destructor. The worker now drains
+that runtime before publishing exit, so successful wait covers its owned JSON
+resource. The existing worker-release wait regression is included in the
+container behavior matrix.
+
+Evidence is in `build/pouch-space-queue-outbox/`:
+
+- The initial **75-group Debug** affected pass includes native queue/outbox
+  controls, all codec/durability combinations, collection/background and lease
+  regressions, **554 marker I/O cuts, 568 allocation cuts and 538 real process
+  exits**. Failure cases verify cold old/new/absent outcomes, successful durable
+  outcomes, retry and orphan-cleanup convergence. Stable-image tests freeze
+  before close so teardown cannot repair the modeled failed prefix. The TLS
+  repair subsequently passed **19 affected groups**, including the full native
+  outbox suite, eight outbox configurations and lifecycle comparisons. Logs are
+  `surface-debug.log`, `surface-final-debug.log` and their detail logs. Debug
+  used ASan/UBSan, actual 128 KiB workers and disabled glibc stack caching.
+- GNU and musl Release each passed **49 groups**, then **18 affected groups**
+  after the TLS repair, plus two native shutdown cases. The current SDK matrix
+  reuses 20 original queue cases and 22 original outbox cases across eight
+  codec/durability configurations, with two additional notification cases per
+  configuration. GNU uses ordinary platform worker stacks; musl uses its default
+  worker stacks. See `surface-{gnu,musl}.log`, `surface-final-*.log` and
+  `native-shutdown-*.log`.
+- ThreadSanitizer passed three direct marker/notification/concurrency modes and
+  all eight live SDK configurations, including the worker-release regression
+  and notifications: **27 invocations**, with linked instrumented OpenSSL 3.6.5,
+  actual 128 KiB workers and no suppressions. `surface-tsan.log`,
+  `check-tsan.sh` and `relink-tsan-drain.log` retain the final evidence; earlier
+  logs retain the fixture and TLS findings above.
+- Memcheck passed **11 selected live invocations / 605,570 allocations and
+  frees**, with zero remaining blocks, errors or suppressions and only three
+  inherited descriptors. These cover direct marker ownership, notification and
+  writer concurrency, plus representative plain and encrypted/compressed queue
+  and stateful outbox paths under both policies (`surface-memcheck.log`,
+  `memcheck-*.log`, `check-memcheck.sh`). Intentional process-exit cases are
+  separate from live memory/sanitizer checks.
+
+The normal GNU Release comparison records **192 verified rows / 96 matched
+pairs**, three samples over 32 configurations: queue or stateful outbox,
+24 x 4 KiB or 8 x 64 KiB, one/four independent worker namespaces, both root
+policies and new/preopened owners. Both use scan queries, disabled background
+maintenance/watches and 1 MiB segment targets; the container starts at 10 MiB.
+Producers emit bounded 4 KiB chunks and consumers verify every byte. Queue
+workflows enqueue, deliver and ack. Outbox workflows append/commit, dispatch,
+update paired checkpoints and complete. Timing includes joined workers,
+dispatcher stop and matching public cleanup-only namespace passes; container
+passes include the final physical checkpoint. Close is reported separately.
+Reopen verification checks drained queues and duplicate completed effects.
+Creation and reopen verification are outside the completion measurement. The
+middle sample reverses engine order; OS cache is retained. These are development
+observations, not cold-device or production timing claims. Raw results and
+driver are `surface-paired-performance.log` and `paired-performance.sh`.
+
+The primary completion comparison adds reported `lifecycle_ms` and `close_ms`,
+because the owners distribute cleanup costs differently. Per-configuration
+medians of paired native/container ratios are:
+
+| Workflow | Completion including close | CPU of work/cleanup phase | Native persistent files |
+| --- | --- | --- | --- |
+| Queue | 1.23-2.53x, median 1.75x | 1.05-1.78x, median 1.35x | 11-23 |
+| Stateful outbox | 0.66-1.60x, median 1.16x | 1.18-1.66x, median 1.42x | 42-99 |
+
+The container retains one persistent file in every measurement. CPU excludes
+close. Work/cleanup-phase wall ratios alone span 0.34-1.77x for queues and
+0.54-1.55x for outbox; the separate close cost matters, especially for NoSync
+queues. **NoSync outbox completion regresses in seven of eight configurations**:
+the median native/container ratio is 0.82x and the worst is 0.66x, approximately
+52% more container time. Durable-sync outbox completion ratios are 1.12-1.60x
+(median 1.35x). Measured work/cleanup-phase sync calls are container 9-179 versus
+native 2-152 for queues, and 77-915 versus 72-661 for outbox; these counts exclude
+close. The NoSync outbox regression and marker barrier costs remain optimization
+work before deployment acceptance.
+
+This surface does not change the unapproved incremental-checkpoint/protected
+capacity proposal or promise maintenance admission at full capacity. Indexed
+queries, complete external XA, resumable codec conversion, shared-root
+coordination/recovery and deployment acceptance remain unfinished. Existing-root
+conversion remains outside the initial implementation. The backend goal stays
+active.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and
@@ -2079,7 +2214,7 @@ projection, ordinary mutation policy, read-many, visits and paged scan/body
 snapshots, staged/prepared mutations and the SDK call envelope above. Leased
 state, expiry, public collection ownership and explicit/background maintenance
 use the typed owners described above. Live stages defer ordinary compaction;
-indexed queries, queues/outbox and complete external XA still require
+indexed queries and complete external XA still require
 integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
@@ -2128,7 +2263,7 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Remaining integration includes indexed-query owners, queues/outbox, complete
+Remaining integration includes indexed-query owners, complete
 external XA ownership and shared-root coordination. Core collection positions
 and retry receipts now
 run through the container owner above. Normal public Pouch tests continue to

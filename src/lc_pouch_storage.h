@@ -80,6 +80,7 @@ enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
 };
 #define LC_POUCH_STORAGE_TXN_GUARD_STRIPES 256U
+struct lc_pouch_outbox_store;
 enum lc_pouch_storage_work_kind {
   LC_POUCH_STORAGE_WORK_ORDINARY = 0,
   LC_POUCH_STORAGE_WORK_TERMINAL,
@@ -170,6 +171,10 @@ typedef struct lc_pouch_storage_ops {
   int (*collections_visit)(void *, lc_client *, const char *,
                            lc_collection_visit_fn, void *, lc_error *);
   const lc_pouch_storage_maintenance_ops *maintenance;
+  int (*outbox_markers_open)(void *, const char *, int, int,
+                             struct lc_pouch_outbox_store *, lc_error *);
+  void (*queue_notify)(void *, const char *, const char *);
+  int (*queue_wait)(void *, const char *, const char *, uint64_t);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;

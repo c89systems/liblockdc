@@ -1420,7 +1420,7 @@ typedef struct retention_disk {
   io_fault fault;
   unsigned char *stable, *dirty, *scratch;
   uint64_t read_bytes;
-  int persist;
+  int persist, frozen;
 } retention_disk;
 static ssize_t retention_disk_read(void *context, int fd, void *p, size_t n,
                                    off_t at) {
@@ -1439,7 +1439,7 @@ static ssize_t retention_disk_write(void *context, int fd, const void *p,
   int fail = io_fails(&m->fault);
   size_t want = fail ? n / 2 : n;
   REQUIRE(pwrite(fd, p, want, at) == (ssize_t)want);
-  if (want) {
+  if (want && !m->frozen) {
     for (size_t page = (size_t)at / PS_PAGE;
          page <= ((size_t)at + want - 1) / PS_PAGE; ++page)
       m->dirty[page] = 1;
@@ -1457,7 +1457,8 @@ static int retention_disk_sync(void *context, int fd) {
   int fail = io_fails(&m->fault);
   if (!fail || m->persist) {
     REQUIRE(fdatasync(fd) == 0);
-    for (size_t page = 0; page < PS_DEFAULT_CAPACITY / PS_PAGE; ++page)
+    for (size_t page = 0; !m->frozen && page < PS_DEFAULT_CAPACITY / PS_PAGE;
+         ++page)
       if (m->dirty[page]) {
         REQUIRE(pread(fd, m->scratch, PS_PAGE, (off_t)(page * PS_PAGE)) ==
                 PS_PAGE);
@@ -2567,6 +2568,8 @@ static void guard_compare(const char *directory, int reverse) {
   namespace_artifacts(directory, "guard-");
   lc_error_cleanup(&e);
 }
+#include "queue_outbox_concurrency_cases.h"
+#include "queue_outbox_crash_cases.h"
 static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
@@ -2587,6 +2590,18 @@ static void *worker(void *context) {
                       !strcmp(r->mode, "namespace-compare-reverse"));
   else if (!strcmp(r->mode, "retention-codec"))
     retention_codec();
+  else if (!strcmp(r->mode, "outbox-markers"))
+    outbox_markers(r->directory);
+  else if (!strcmp(r->mode, "outbox-notifications"))
+    outbox_notifications(r->directory);
+  else if (!strcmp(r->mode, "outbox-marker-io-faults"))
+    outbox_marker_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "outbox-marker-allocation-faults"))
+    outbox_marker_faults(r->directory, 1);
+  else if (!strcmp(r->mode, "outbox-marker-crash"))
+    outbox_marker_crashes(r->directory);
+  else if (!strcmp(r->mode, "outbox-marker-concurrency"))
+    outbox_marker_concurrency(r->directory);
   else if (!strcmp(r->mode, "retention"))
     retention_lifecycle(r->directory);
   else if (!strcmp(r->mode, "retention-faults"))
@@ -2626,6 +2641,8 @@ int main(int argc, char **argv) {
   char prefix[1100], pattern[1200], directory[1200];
   pthread_t thread;
   REQUIRE(argc == 3);
+  if (!strcmp(argv[2], "outbox-marker-crash-child"))
+    outbox_marker_crash_child();
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-sdk-", argv[1]) <
           (int)sizeof(prefix));
   REQUIRE(snprintf(pattern, sizeof(pattern), "%sXXXXXX", prefix) <

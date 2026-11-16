@@ -6,17 +6,27 @@
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
 #include "namespace_work.h"
+#include "outbox_markers.h"
 #include "pouch_internal.h"
+#include "root_internal.h"
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
 
+typedef struct queue_waiter {
+  const char *ns, *queue;
+  pthread_cond_t changed;
+  int signaled;
+  struct queue_waiter *next;
+} queue_waiter;
 typedef struct ps_pouch_owner {
   ps_root *root;
   lc_allocator allocator;
   unsigned int references;
   pthread_mutex_t txn_guards[LC_POUCH_STORAGE_TXN_GUARD_STRIPES];
+  queue_waiter *waiters;
 } ps_pouch_owner;
 typedef struct ps_pouch_source {
   lc_source pub;
@@ -552,6 +562,70 @@ static int collections_maintain(void *context, lc_pouch *pouch,
 }
 static const lc_pouch_storage_maintenance_ops maintenance_ops = {
     work_ensure, work_remove, work_next, state_maintain, collections_maintain};
+static int outbox_markers_open(void *context, const char *ns, int kind,
+                               int create, lc_pouch_outbox_store *out,
+                               lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_outbox_markers_open(owner->root, ns, kind, create, out, e);
+}
+static void queue_notify(void *context, const char *ns, const char *queue) {
+  ps_pouch_owner *owner = context;
+  queue_waiter *waiter;
+  pthread_mutex_lock(&owner->root->mutex);
+  for (waiter = owner->waiters; waiter; waiter = waiter->next)
+    if (!strcmp(waiter->ns, ns) && !strcmp(waiter->queue, queue)) {
+      waiter->signaled = 1;
+      pthread_cond_signal(&waiter->changed);
+    }
+  pthread_mutex_unlock(&owner->root->mutex);
+}
+static int queue_wait(void *context, const char *ns, const char *queue,
+                      uint64_t timeout_ms) {
+  ps_pouch_owner *owner = context;
+  queue_waiter waiter, **link;
+  pthread_condattr_t attributes;
+  struct timespec deadline;
+  int rc;
+  if (!ns || !ns[0] || !queue || !queue[0] || check(context, NULL) != LC_OK ||
+      clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+    return -1;
+  /* The common watcher waits in 100 ms slices and rescans canonical state.
+   * Notifications are advisory; admission before the next slice has the same
+   * bounded rescan fallback as the native filesystem watcher. */
+  if (timeout_ms > (uint64_t)INT_MAX)
+    timeout_ms = (uint64_t)INT_MAX;
+  deadline.tv_sec += (time_t)(timeout_ms / 1000U);
+  deadline.tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    ++deadline.tv_sec;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  memset(&waiter, 0, sizeof(waiter));
+  waiter.ns = ns;
+  waiter.queue = queue;
+  if (pthread_condattr_init(&attributes) != 0)
+    return -1;
+  rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+  if (rc == 0)
+    rc = pthread_cond_init(&waiter.changed, &attributes);
+  pthread_condattr_destroy(&attributes);
+  if (rc != 0)
+    return -1;
+  pthread_mutex_lock(&owner->root->mutex);
+  waiter.next = owner->waiters;
+  owner->waiters = &waiter;
+  while (!waiter.signaled && rc == 0)
+    rc =
+        pthread_cond_timedwait(&waiter.changed, &owner->root->mutex, &deadline);
+  for (link = &owner->waiters; *link != &waiter; link = &(*link)->next) {
+  }
+  *link = waiter.next;
+  pthread_mutex_unlock(&owner->root->mutex);
+  pthread_cond_destroy(&waiter.changed);
+  if (check(context, NULL) != LC_OK || (rc != 0 && rc != ETIMEDOUT))
+    return -1;
+  return waiter.signaled ? 1 : 0;
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -574,7 +648,10 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  release,
                                                  collection_open,
                                                  collections_visit,
-                                                 &maintenance_ops};
+                                                 &maintenance_ops,
+                                                 outbox_markers_open,
+                                                 queue_notify,
+                                                 queue_wait};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;
@@ -582,6 +659,18 @@ ps_root *ps_pouch_state_root(lc_pouch *pouch) {
     return NULL;
   owner = pouch->storage.context;
   return owner->root;
+}
+size_t ps_pouch_queue_waiter_count(lc_pouch *pouch, const char *ns,
+                                   const char *queue) {
+  ps_pouch_owner *owner = pouch->storage.context;
+  queue_waiter *waiter;
+  size_t count = 0U;
+  pthread_mutex_lock(&owner->root->mutex);
+  for (waiter = owner->waiters; waiter; waiter = waiter->next)
+    if (!strcmp(waiter->ns, ns) && !strcmp(waiter->queue, queue))
+      ++count;
+  pthread_mutex_unlock(&owner->root->mutex);
+  return count;
 }
 
 int ps_pouch_state_open(const char *path, int create,
@@ -603,12 +692,11 @@ int ps_pouch_state_open(const char *path, int create,
   if (rc != LC_OK)
     return rc;
   if (!pouch->single_writer || pouch->query_indexing_enabled ||
-      pouch->queue_watch_enabled ||
       (options && options->logical.crypto_generate_key_file)) {
     lc_pouch_close(pouch);
     return lc_error_set(e, LC_ERR_UNSUPPORTED, 0,
                         "container state harness requires exclusive mode, "
-                        "disabled indexing/watches and no generated key file",
+                        "disabled indexing and no generated key file",
                         NULL, NULL, "pouch");
   }
   owner = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*owner));
@@ -658,6 +746,10 @@ int ps_pouch_state_open(const char *path, int create,
   }
   pouch->storage.ops = &storage_ops;
   pouch->storage.context = owner;
+  if (pouch->queue_watch_enabled) {
+    pouch->queue_watch_mode = "inprocess";
+    pouch->queue_watch_reason = "container_notifications";
+  }
   pouch->crypto = ps_root_crypto(owner->root);
   if (stat(path, &identity) != 0) {
     lc_pouch_close(pouch);
