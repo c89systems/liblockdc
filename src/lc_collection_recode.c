@@ -215,9 +215,11 @@ static int cr_scan(lc_pouch_recode *work, lc_pouch_recode_file *file,
       break;
     if (collect) {
       if (record.kind == LC_POUCH_COLLECTION_STREAM) {
-        rc = lc_collection_chunks_open(&reader, &work->pouch->allocator,
-                                       work->pouch->crypto, file->collection_id,
-                                       file->scope, fd, &record, e);
+        rc = lc_collection_chunks_open(
+            &reader, &work->pouch->allocator, work->pouch->crypto,
+            file->collection_id,
+            lc_collection_chunks_file_access(&reader, file->scope),
+            lc_pouch_record_file_io(fd), &record, e);
         if (rc == LC_OK)
           rc = lc_collection_chunks_visit(&reader, cr_mark, &visit, e);
       } else if (record.metadata_only)
@@ -480,8 +482,8 @@ static int cr_unit(cr_output *out, const lc_pouch_recode_reference *ref,
   lc_u64 plain, stored, decoded = 0;
   unsigned long crc;
   size_t got;
-  int rc = lc_collection_unit_read(out->source_fd, ref->offset, ref->bytes,
-                                   &out->unit, e);
+  int rc = lc_collection_unit_read(lc_collection_unit_file_io(out->source_fd),
+                                   ref->offset, ref->bytes, &out->unit, e);
   if (rc != LC_OK)
     return rc;
   out->input_start = out->input_offset =
@@ -547,7 +549,8 @@ static int cr_unit(cr_output *out, const lc_pouch_recode_reference *ref,
     out->unit.descriptor[0] = 0;
     if (descriptor)
       strcpy(out->unit.descriptor, descriptor);
-    rc = lc_collection_unit_write_meta(out->fd, map->after, &out->unit, e);
+    rc = lc_collection_unit_write_meta(lc_collection_unit_file_io(out->fd),
+                                       map->after, &out->unit, e);
     map->stored = stored;
     map->units = 1;
     map->first_segment = map->segment;
@@ -604,8 +607,9 @@ static int cr_node(cr_output *out, const lc_pouch_recode_reference *ref,
   }
   if (rc == LC_OK)
     rc = lc_collection_chunks_write_index(
-        out->fd, map->segment, (unsigned int)ref->height - 1U, out->buffer,
-        (size_t)ref->bytes, &result, e);
+        lc_collection_unit_file_io(out->fd), map->segment,
+        (unsigned int)ref->height - 1U, out->buffer, (size_t)ref->bytes,
+        &result, e);
   return rc;
 }
 static int cr_extent(cr_output *out, const lc_pouch_recode_reference *ref,

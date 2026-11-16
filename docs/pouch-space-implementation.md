@@ -1661,8 +1661,11 @@ normal-exit Memcheck groups have zero live heap, errors or owned descriptors at
 exit, covering 331,256 allocations and matching frees. The native fork probe is
 covered by ASan/UBSan and TSan; its intentional child `_exit` inherits the parent
 heap and is outside the normal-exit leak gate. Private guard symbols remain
-hidden in both GNU/musl shared libraries. GNU workers use 128 KiB stacks with the
-glibc stack cache disabled; musl uses its native defaults.
+hidden in both GNU/musl shared libraries. GNU Debug and TSan workers use 128 KiB
+stacks with the glibc stack cache disabled; musl uses its native defaults.
+GNU Release omits the test stack initializer, so setting
+`LOCKDC_TEST_STACK_BYTES=131072` alone does not constrain Release workers.
+Those Release checks use ordinary platform worker stacks.
 
 Evidence is in `build/pouch-space-txn-guards/`: `debug-final-build.log`,
 `debug-five-final.log`, `debug-standard.log`/`debug-standard-details.log`,
@@ -1671,6 +1674,186 @@ The [40-case comparison](pouch-space-experiment.md#typed-transaction-guard-compa
 retains all five samples per case, min/median/max elapsed/CPU/first-admission
 statistics and executable/source hashes. It observes lower uncontended guard
 overhead; complete transaction and shared-root performance remain unmeasured.
+
+## Leased state and expiry ordering
+
+The private SDK harness now exercises public leased updates, retention metadata,
+keepalive, release, attachments, explicit participant votes and bounded
+on-demand cleanup through the same logical engine with both storage owners.
+The new `lease_test.c` uses the existing test library's logical expiry clock;
+filesystem heartbeat timers and operational clocks remain real. This adds no
+public backend selector, API/ABI or persistence format change. Background
+scheduling, complete external XA ownership and guaranteed maintenance admission
+at capacity remain outside this stage.
+
+An independent syscall durability model exposed a production cleanup-ordering
+bug. On a NoSync root, a complete commit-decision write could reach storage yet
+report an error while its earlier participant stages remained unsynced. After
+discarding those unsynced stages, recovery selected the commit, treated absent
+stages as already applied, and cleared cleanup work while retaining the expired
+parent and attachment. The retained failing case is plain NoSync, physical cut
+14, lost acknowledgement: `debug-io-repro14.log` and `io-recovery-gdb.log` under
+`build/pouch-space-leased-expiry/`.
+
+Cleanup now forces participant stages durable before writing any terminal
+decision bytes. Both owners and both root policies share this ordering. A later
+decision barrier cannot establish that prerequisite after the fact. The same
+isolated failure passes after this correction (`debug-stage-fence-repro14.log`).
+
+The formatted harness passes all eight physical I/O profiles, totaling 2,304
+cuts across both policies, four codecs and warm/reopened owners. Each profile
+injects hard errors, lost torn writes, persisted torn writes and complete writes
+whose acknowledgement fails. Every trial independently checks its durable seed
+image, freezes persistence before owner close, restores only selected durable
+bytes, and verifies recovery with the logical clock moved backward. Committed
+cleanup must finish; an undecided cleanup must preserve the original parent and
+attachment before their deadline. Later expiry removes both, retires work and
+permits recreation with a larger fence. Poisoned admission performs no I/O.
+All development containers remain exactly 10 MiB.
+
+The concurrency probe passes 32 cases across both owners, policies and codecs,
+pausing cleanup at STAGED or DECIDED. An independent namespace writer commits
+while cleanup is held. A second writer supplies a 512 KiB JSON value from a
+bounded producer and pauses halfway through; cleanup, including the new stage
+barrier, completes before that producer reaches EOF. Physical payload progress
+before the pause proves container streaming. A bounded checking sink verifies
+every decoded byte afterward. The test explicitly excludes documented xid stripe
+collisions and leaves unrelated writer heartbeat clocks real.
+
+The coordinated probe passes 64 cases: two participant commit votes, rollback
+votes, lost decision acknowledgement, and recovery with forward/backward logical
+clocks. It checks staged attachment visibility, immutable commit-derived
+retention deadlines, and expiry's ownership of only its own cleanup journal.
+The existing native-only startup policy applies and retires terminal transaction
+journals; managed external outcomes have separate policy and remain outside
+this probe. The normal-allocator comparison also passes all 160 paired Debug
+cases; Release performance qualification is still pending.
+
+Evidence is `debug-fence-regression.log`, `debug-final-harness.log`,
+`debug-final-io-compare.log`, `debug-concurrency.log` and `debug-coordinated.log`
+in `build/pouch-space-leased-expiry/`. The first comparison attempt exposed a
+fixture allocator mismatch, corrected by cleaning read results with their
+store's actual allocator. The failed log is retained; it is not a passing gate.
+The complete Debug build and all **528 standard ASan/UBSan groups**, including
+476 unit groups and all 84 new lease groups, pass in **8857.58 seconds**.
+The allocation matrix covers 64 profiles and **30,124 injected cuts** across
+both owners, both policies, all four codecs, warm/reopened stores and
+nullable/non-null error output. Every selected cut must fire; each trial verifies
+both warm and cold retry. The full run also passes all 2,304 physical I/O cuts,
+88 process-death cases, 32 concurrency cases and 64 coordinated transaction
+cases. GNU Debug workers use 128 KiB stacks with the glibc stack cache disabled.
+The complete build, summary and detailed output are `debug-standard-build.log`,
+`debug-standard.log` and `debug-standard-details.log` in the same directory.
+Native GNU/musl, TSan, Memcheck and Release comparisons remain required for the
+completed integration batch. GNU Release uses ordinary platform worker stacks; the
+Debug-only initializer does not enforce a Release stack size.
+
+## Public collection owners
+
+The experimental SDK now admits collection create/open/list, heads,
+direct/staged/push append, streaming scan/LQL reads and cursors, deletion,
+retention metadata, atomic edits and retry receipts, leases/takeover/private
+reads, and drop/recreate. Positions, generations, ownership rules and receipts
+remain in the production logical engine. The native file adapter uses the same
+engine. Normal public Pouch still opens the multifile backend; this stage adds
+no public backend selector or deployment cutover.
+
+Catalog names select immutable collection incarnations. Within a root, stream
+key zero holds the shared 320-byte catalog identity; control key one holds the
+shared 384-byte collection head. Segment and snapshot child bindings protect
+their canonical owners. Dependencies and any initial lease precede publication
+of the namespace's collection name. Missing namespaces list as empty, and old
+receivers cannot address a recreated namesake. One cached physical owner admits
+each incarnation; snapshot, publication and upload pins use counted gates.
+A pin can outlive an authority scope and move between threads without retaining
+a thread-owned pthread lock.
+
+The shared engine uses typed canonical bytes for metadata changes, deletion,
+encoded relocation and codec units; body/history/query/retention/edit replay and
+compaction inputs are pinned by segment identity. Native pins retain file
+descriptors without heap allocation during streaming rollover. Disposable memfd
+order/ID projections use the existing index algorithms, including bounded
+entry-at-a-time growth. No application body is buffered or spooled into them.
+Receivers sharing a live physical owner share its projection epoch. Reopening
+the physical owner reconstructs these projections with a new epoch, invalidating
+prior cursors and head preconditions.
+
+Private ranges map directly onto owned runs and survive segment rotation.
+Container reservations are bounded to 1 MiB; values can span multiple ranges.
+Completed-tail readiness is registered under append authority; its later
+durability wait does not sample a subsequent producer's working tail. Final
+private bytes in an older sealed segment are stabilized before publishing their
+reference. Recovery validates the owned checkpoint prefix before clearing
+anything, then applies the existing container policy to an incomplete or invalid
+uncheckpointed suffix. Checkpoint-prefix corruption remains an explicit error.
+
+Dropping or abandoning a closed owner reclaims all child catalog bindings,
+including segments absent from its cache. An orphan claim excludes a new parent
+name binding while reclamation runs. Captured views close before target
+retirement; children precede control and identity retirement. A failed pass
+retains the unbound identity as the retry anchor. All development containers
+remain exactly 10 MiB; growth stays explicit.
+
+Qualification evidence is in `build/pouch-space-collections/`:
+
+- The complete Debug build passes. The retained `surface-debug-gate.log`
+  records 82 passes and two native allocation regressions; it is not a passing
+  gate. Both isolated repairs pass in `surface-native-pin-repair.log`.
+  All 30 affected native/SDK/Lua groups subsequently pass in
+  `surface-debug-affected.log`. The unchanged catalog/root/namespace and lease
+  groups retain their passing results from the broader run.
+- All 18 final container groups pass in `surface-debug-container-final.log`
+  (259.76 seconds). They cover every codec and both policies, generated
+  1.25 MiB values, actual payload output before producer EOF, positions,
+  duplicate/deleted retry identities, edits, recovery descriptors, retention,
+  private leases/takeover, cursors/LQL, abort, drop/recreate and reopen.
+  Eight process-death cases, 48 interrupted-edit cases, independent producers
+  across rotation, and upload handoff across threads are included.
+- The final matrices inject **2,016 physical I/O cuts** and **1,274 allocation
+  cuts**, with every selected cut required to fire. I/O covers create,
+  streamed append/rotation, edit and drop, including hard errors, lost and
+  persisted torn writes, and complete writes with lost acknowledgement.
+  Each trial restores only the modeled durable bytes before reopening through
+  the SDK. Allocation coverage includes create, append, edit, acquire, read,
+  cold owner admission and listing, with warm/cold reconciliation and retry.
+  Detailed output is `surface-debug-container-final-details.log`.
+- GNU and musl each pass 16 selected groups, including the native allocation-free
+  streaming/conversion regressions (`surface-gnu.log`, `surface-musl.log`).
+  After the pin-lifetime correction, both pass the 10 affected container and
+  comparison groups again (`surface-{gnu,musl}-container-final.log`).
+  Debug and TSan GNU workers use 128 KiB stacks with the stack cache disabled;
+  musl uses its default worker stack. GNU Release uses ordinary worker stacks.
+- TSan passes the final SDK probe, the canonical storage probe and 16 matched
+  four-writer comparisons, without suppressions. The binaries use the checked
+  instrumented OpenSSL 3.6.5 archives. Logs are
+  `surface-tsan-complete-sdk.log`, `surface-tsan-pins-storage.log` and
+  `surface-tsan-comparisons.log`.
+- Memcheck passes the complete live SDK surface (excluding intentional process
+  death) and canonical storage probe: **59,447 allocations/frees**, zero live
+  allocations, zero errors/suppressions, and only the three inherited file
+  descriptors at exit. Logs are `surface-memcheck-{sdk,storage}.log`.
+
+The normal-allocator GNU Release comparison has **96 rows / 48 matched pairs**:
+three samples of 24 x 4 KiB or 8 x 64 KiB entries, one/four independent
+collections, both policies, and newly created/reopened owners. OS page cache is
+retained; these are development measurements, not cold-device or production
+performance claims. Raw results are `surface-paired-perf-final.log`.
+Per-configuration medians of paired write speed ratios span **0.66–1.86x**
+native for Durable (median 1.54x); four-writer sync counts fall from 24 to
+12–14, or from 8 to 4–6. Reopened NoSync writes are **3.29–15.06x slower**,
+with one/two syncs versus native's zero. Read speed ratios span 1.02–2.02x
+(median 1.31x); reopen costs vary. Container projections allocate 12 KiB per
+collection / 48 KiB for four in these workloads, reported separately from the
+single persistent file; native stores have 23–61 files. The reopened NoSync and
+projection-rebuild costs remain optimization work.
+
+Collection compaction, indexed queries, background collection retention and
+shared-root operation remain outside this harness's admitted call contract.
+The standing maintenance-capacity proposal still awaits an explicit decision.
+Existing-root conversion, Darwin/QEMU and large-machine qualification remain
+deferred, and production cutover still requires a deployment decision.
+The additional GNU lease sweep was stopped at 31 passing groups when development
+changed to larger integration batches; it is not a completed gate.
 
 ## Integration and acceptance
 
@@ -1754,11 +1937,11 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Public collection owners, live-stage maintenance, retention/lease/queue/XA
-ownership, indexed queries, position/receipt authority and remaining
-control/projection owners still need conversion to container ownership.
-Normal public Pouch tests continue to
-exercise the segmented backend through the shared record I/O boundary.
+Remaining integration includes collection maintenance and indexed-query owners,
+background retention scheduling, queues/outbox, complete external XA ownership
+and shared-root coordination. Core collection positions and retry receipts now
+run through the container owner above. Normal public Pouch tests continue to
+exercise the segmented backend through the shared typed storage boundaries.
 
 Complete storage integration covers states, objects, attachments, leases,
 collections and permanent positions, retry receipts, catalogs, indexes, codecs,

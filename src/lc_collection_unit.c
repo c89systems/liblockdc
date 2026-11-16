@@ -45,45 +45,113 @@ static int lc_cu_corrupt(lc_error *e) {
       e, LC_ERR_PROTOCOL, "collection_corrupt",
       "collection codec unit metadata is inconsistent");
 }
-static int lc_cu_io(int fd, void *bytes, size_t length, lc_u64 offset,
-                    int writing, int finalizing, lc_error *error) {
-  unsigned char *p = bytes;
-  ssize_t n;
-#ifndef LOCKDC_TEST_BUILD
-  (void)finalizing;
-#endif
-  if (offset > (lc_u64)LC_I64_MAX || length > (lc_u64)LC_I64_MAX - offset)
-    return lc_cu_corrupt(error);
-  while (length) {
-    if (writing) {
+/* The native collection owner uses positional private writes: another upload
+ * may append concurrently on the same inode. Keep native fault injection at
+ * this capability boundary, outside the shared unit codec. */
+static int lc_cu_file_read(void *context, uint64_t offset,
+                           const struct iovec *parts, int count,
+                           lc_error *error) {
 #ifdef LOCKDC_TEST_BUILD
-      if (finalizing && lc_collection_chunks_test_pwrite)
-        n = lc_collection_chunks_test_pwrite(fd, p, length, (off_t)offset);
+  struct iovec pending[2];
+  int first = 0;
+  size_t used;
+  ssize_t n;
+  if (count == 2 && lc_collection_unit_test_preadv) {
+    memcpy(pending, parts, sizeof(pending));
+    while (first < count) {
+      if (!pending[first].iov_len) {
+        ++first;
+        continue;
+      }
+      n = lc_collection_unit_test_preadv((int)(intptr_t)context,
+                                         pending + first, count - first,
+                                         (off_t)offset);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return lc_error_set(error, n == 0 ? LC_ERR_PROTOCOL : LC_ERR_TRANSPORT,
+                            0L, "failed to read collection unit prefix",
+                            n < 0 ? strerror(errno) : NULL, NULL, "pouch");
+      offset += (size_t)n;
+      used = (size_t)n;
+      while (first < count && used >= pending[first].iov_len) {
+        used -= pending[first].iov_len;
+        ++first;
+      }
+      if (first < count) {
+        pending[first].iov_base =
+            (unsigned char *)pending[first].iov_base + used;
+        pending[first].iov_len -= used;
+      }
+    }
+    return LC_OK;
+  }
+#endif
+  return lc_pouch_record_io_read(
+      lc_pouch_record_file_io((int)(intptr_t)context), offset, parts, count,
+      error);
+}
+
+static int lc_cu_file_patch(void *context, uint64_t offset,
+                            const struct iovec *parts, int count,
+                            lc_error *error) {
+  int i, fd = (int)(intptr_t)context;
+  for (i = 0; i < count; ++i) {
+    const unsigned char *p = parts[i].iov_base;
+    size_t remaining = parts[i].iov_len;
+    while (remaining) {
+      ssize_t n;
+#ifdef LOCKDC_TEST_BUILD
+      if (count == 1 && parts[0].iov_len == 32U &&
+          lc_collection_chunks_test_pwrite)
+        n = lc_collection_chunks_test_pwrite(fd, p, remaining, (off_t)offset);
       else
 #endif
-        n = pwrite(fd, p, length, (off_t)offset);
-    } else
-      n = pread(fd, p, length, (off_t)offset);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      return lc_error_set(
-          error, !writing && n == 0 ? LC_ERR_PROTOCOL : LC_ERR_TRANSPORT, 0L,
-          "failed to access collection codec unit",
-          n < 0 ? strerror(errno) : NULL, NULL, "pouch");
-    offset += (size_t)n;
-    p += (size_t)n;
-    length -= (size_t)n;
+        n = pwrite(fd, p, remaining, (off_t)offset);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                            "failed to write collection codec unit",
+                            n < 0 ? strerror(errno) : NULL, NULL, "pouch");
+      p += (size_t)n;
+      offset += (size_t)n;
+      remaining -= (size_t)n;
+    }
   }
   return LC_OK;
 }
 
-int lc_collection_unit_write_meta(int fd, lc_u64 offset,
+static int lc_cu_file_append(void *context, const struct iovec *parts,
+                             int count, lc_error *e) {
+  return lc_pouch_record_io_append(
+      lc_pouch_record_file_io((int)(intptr_t)context), parts, count, e);
+}
+static int lc_cu_file_tail(void *context, uint64_t *tail, lc_error *e) {
+  return lc_pouch_record_io_tail(
+      lc_pouch_record_file_io((int)(intptr_t)context), tail, e);
+}
+static void lc_cu_file_discard(void *context, uint64_t at) {
+  lc_pouch_record_io file = lc_pouch_record_file_io((int)(intptr_t)context);
+  file.ops->discard(file.context, at);
+}
+lc_pouch_record_io lc_collection_unit_file_io(int fd) {
+  static const lc_pouch_record_io_ops ops = {lc_cu_file_read, lc_cu_file_append,
+                                             lc_cu_file_patch, lc_cu_file_tail,
+                                             lc_cu_file_discard};
+  lc_pouch_record_io io;
+  io.ops = fd < 0 ? NULL : &ops;
+  io.context = (void *)(intptr_t)fd;
+  return io;
+}
+
+int lc_collection_unit_write_meta(lc_pouch_record_io output, lc_u64 offset,
                                   const lc_collection_unit *unit,
                                   lc_error *error) {
   unsigned char meta[LC_COLLECTION_UNIT_META];
   unsigned char prefix[32];
   lc_pouch_record_header header;
+  struct iovec part;
   size_t desc = strlen(unit->descriptor), context = strlen(unit->context),
          etag = strlen(unit->etag);
   unsigned long crc;
@@ -112,9 +180,17 @@ int lc_collection_unit_write_meta(int fd, lc_u64 offset,
   lc_pouch_record_header_encode(&header, prefix);
   /* The private metadata is complete before its final header is visible. A
    * failure never truncates another writer's shared canonical inode. */
-  rc = lc_cu_io(fd, meta, sizeof(meta), offset + sizeof(prefix), 1, 0, error);
-  if (rc == LC_OK)
-    rc = lc_cu_io(fd, prefix, sizeof(prefix), offset, 1, 1, error);
+  part.iov_base = meta;
+  part.iov_len = sizeof(meta);
+  if (offset > (lc_u64)LC_I64_MAX - sizeof(prefix))
+    return lc_cu_corrupt(error);
+  rc = lc_pouch_record_io_patch(output, offset + sizeof(prefix), &part, 1,
+                                error);
+  if (rc == LC_OK) {
+    part.iov_base = prefix;
+    part.iov_len = sizeof(prefix);
+    rc = lc_pouch_record_io_patch(output, offset, &part, 1, error);
+  }
   return rc;
 }
 
@@ -157,24 +233,28 @@ static int lc_cu_decode(unsigned char *encoded, lc_u64 stored,
   return LC_OK;
 }
 
-int lc_collection_unit_read(int fd, lc_u64 offset, lc_u64 stored,
-                            lc_collection_unit *out, lc_error *error) {
+int lc_collection_unit_read(lc_pouch_record_io input, lc_u64 offset,
+                            lc_u64 stored, lc_collection_unit *out,
+                            lc_error *error) {
   unsigned char encoded[LC_COLLECTION_UNIT_HEADER];
-  int rc = lc_cu_io(fd, encoded, sizeof(encoded), offset, 0, 0, error);
+  struct iovec part;
+  int rc;
+  part.iov_base = encoded;
+  part.iov_len = sizeof(encoded);
+  rc = lc_pouch_record_io_read(input, offset, &part, 1, error);
   return rc == LC_OK ? lc_cu_decode(encoded, stored, out, error) : rc;
 }
 
 /* Scatter the metadata and the consumer's first bounded input chunk in one
  * canonical read. The caller owns the prefix; no payload storage is retained.
  */
-int lc_collection_unit_read_prefix(int fd, lc_u64 offset, lc_u64 stored,
-                                   lc_collection_unit *out, void *prefix,
-                                   size_t length, lc_error *error) {
+int lc_collection_unit_read_prefix(lc_pouch_record_io input, lc_u64 offset,
+                                   lc_u64 stored, lc_collection_unit *out,
+                                   void *prefix, size_t length,
+                                   lc_error *error) {
   unsigned char encoded[LC_COLLECTION_UNIT_HEADER];
   struct iovec parts[2];
-  ssize_t n;
-  size_t consumed;
-  int first = 0;
+  int rc;
   if (length > stored || offset > (lc_u64)LC_I64_MAX ||
       stored > (lc_u64)LC_I64_MAX - offset ||
       LC_COLLECTION_UNIT_HEADER > (lc_u64)LC_I64_MAX - offset - stored)
@@ -183,36 +263,8 @@ int lc_collection_unit_read_prefix(int fd, lc_u64 offset, lc_u64 stored,
   parts[0].iov_len = sizeof(encoded);
   parts[1].iov_base = prefix;
   parts[1].iov_len = length;
-  while (first < 2) {
-    if (!parts[first].iov_len) {
-      ++first;
-      continue;
-    }
-#ifdef LOCKDC_TEST_BUILD
-    if (lc_collection_unit_test_preadv)
-      n = lc_collection_unit_test_preadv(fd, parts + first, 2 - first,
-                                         (off_t)offset);
-    else
-#endif
-      n = preadv(fd, parts + first, 2 - first, (off_t)offset);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      return lc_error_set(error, n == 0 ? LC_ERR_PROTOCOL : LC_ERR_TRANSPORT,
-                          0L, "failed to read collection unit prefix",
-                          n < 0 ? strerror(errno) : NULL, NULL, "pouch");
-    offset += (size_t)n;
-    consumed = (size_t)n;
-    while (first < 2 && consumed >= parts[first].iov_len) {
-      consumed -= parts[first].iov_len;
-      ++first;
-    }
-    if (first < 2) {
-      parts[first].iov_base = (unsigned char *)parts[first].iov_base + consumed;
-      parts[first].iov_len -= consumed;
-    }
-  }
-  return lc_cu_decode(encoded, stored, out, error);
+  rc = lc_pouch_record_io_read(input, offset, parts, 2, error);
+  return rc == LC_OK ? lc_cu_decode(encoded, stored, out, error) : rc;
 }
 
 int lc_collection_unit_context(const char *base, lc_u64 ordinal, char out[256],

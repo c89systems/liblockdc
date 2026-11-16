@@ -41,6 +41,7 @@ typedef struct fixture {
   lc_collection_index query_index;
   lc_error error;
   int owned_fd;
+  lc_collection_lock owned_pin;
   int index_queries;
   int single_writer;
   char *crypto_key;
@@ -83,6 +84,7 @@ static void open_client(fixture *f, const char *key, int compressed,
 }
 
 static void close_handles(fixture *f) {
+  lc_collection_lock_leave(&f->owned_pin);
   lc_collection_close(f->a);
   f->a = NULL;
   lc_collection_close(f->b);
@@ -711,15 +713,15 @@ static void first_body_byte(fixture *f, char byte) {
   lc_collection_handle *handle = f->a->impl;
   lc_collection_order_row row;
   lc_pouch_collection_record record;
-  lc_u64 segment = 0, end = 0;
   char *path = NULL, leaf[64];
-  int fd = -1, found;
+  int found;
   check(f,
         lc_collection_order_find(&handle->order, 1, &row, &found, &f->error));
   assert_true(found);
-  check(f, lc_collection_record_ref(handle, row.segment, row.record_offset, &fd,
-                                    &segment, &end, &record, &f->error));
-  close(fd);
+  lc_collection_input input = {0};
+  check(f, lc_collection_record_ref(handle, row.segment, row.record_offset,
+                                    &input, &record, &f->error));
+  lc_collection_input_close(&input);
   check(f,
         lc_collection_record_path(handle, row.segment, &path, leaf, &f->error));
   f->owned_fd = open(path, O_WRONLY);
@@ -1323,15 +1325,13 @@ static void test_projection_repair_and_body_corruption(void **state) {
   lc_collection_order_row row;
   lc_pouch_collection_record record;
   int found;
-  int record_fd = -1;
-  lc_u64 segment = 0, end = 0;
+  lc_collection_input input = {0};
   check(f,
         lc_collection_order_find(&handle->order, 2U, &row, &found, &f->error));
   assert_true(found);
   check(f, lc_collection_record_ref(handle, row.segment, row.record_offset,
-                                    &record_fd, &segment, &end, &record,
-                                    &f->error));
-  close(record_fd);
+                                    &input, &record, &f->error));
+  lc_collection_input_close(&input);
   assert_int_equal(
       pwrite(handle->active_fd, "9", 1U, (off_t)record.payload_offset + 5), 1);
   assert_int_equal(build_query(f, 0), LC_ERR_PROTOCOL);
@@ -1694,15 +1694,14 @@ test_compaction_pins_old_readers_without_pinning_new_readers(void **state) {
   assert_int_equal(stat(old_path, &st), 0);
   check(f, lc_collection_describe(f->a, &info, &f->error));
   check(f, lc_collection_metadata_enter(handle, 0, &f->error));
-  int rc = lc_collection_read_pin(handle, handle->head.snapshot, &f->owned_fd,
+  int rc = lc_collection_read_pin(handle, handle->head.snapshot, &f->owned_pin,
                                   &f->error);
   lc_collection_metadata_leave(handle);
   check(f, rc);
   check(f, maintain(f, 0, 1, &maintained));
   assert_int_equal(stat(old_path, &st), -1);
   assert_int_equal(errno, ENOENT);
-  close(f->owned_fd);
-  f->owned_fd = -1;
+  lc_collection_lock_leave(&f->owned_pin);
   assert_true(maintained.cleanup_deleted_count > 0U);
   lc_pouch_maintenance_result_cleanup(NULL, &maintained);
 }

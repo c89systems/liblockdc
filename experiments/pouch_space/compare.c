@@ -2,6 +2,7 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "catalog.h"
 #include "lc_api_internal.h"
+#include "lc_collection_internal.h"
 #include "lc_collection_json.h"
 #include "lc_pouch.h"
 #include "lc_pouch_collection_record.h"
@@ -617,15 +618,20 @@ static void open_stores(comparison *c, int create, lc_error *e) {
   settings.set_mask =
       LC_POUCH_SETTING_DURABLE_SYNC | LC_POUCH_SETTING_QUERY_INDEXING |
       LC_POUCH_SETTING_BACKGROUND_COMPACTION | LC_POUCH_SETTING_COMPRESSION |
-      LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
+      LC_POUCH_SETTING_SEGMENT_TARGET_BYTES | LC_POUCH_SETTING_QUEUE_WATCH |
+      LC_POUCH_SETTING_QUERY_ENGINE;
   settings.durable_sync = c->sync;
   settings.segment_target_bytes = PS_MIB;
   settings.compression = "none";
+  settings.query_engine = "scan";
   config.endpoints = &endpoint;
   config.endpoint_count = 1;
   config.default_namespace = "bench";
   config.pouch_settings = &settings;
-  check(lc_client_open(&config, &c->client, e), e);
+  check(c->runtime ? ps_pouch_client_open(&config, create, NULL, &c->client, e)
+                   : lc_client_open(&config, &c->client, e),
+        e);
+  c->pouch = ((lc_client_handle *)c->client)->pouch;
   for (i = 0; i < c->writers; ++i) {
     snprintf(name, sizeof(name), "collection-%lu", (unsigned long)i);
     lc_collection_config_init(&collection);
@@ -1202,6 +1208,7 @@ int main(int argc, char **argv) {
   long packed_pages = -1, packed_bytes = -1, payload_allocated = -1;
   long journal_used = -1, stream_grants = -1;
   uint64_t logical_segments = 0;
+  uint64_t scratch_bytes = 0, scratch_allocated = 0;
   ps_stream_info stream_info;
   ps_namespace_status namespace_info;
   struct rusage usage;
@@ -1229,7 +1236,7 @@ int main(int argc, char **argv) {
           "points|"
           "runtime-scan-bodies|pouch-scan-bodies|"
           "runtime-scan-metadata|pouch-scan-metadata|"
-          "stream-collection|pouch-collection "
+          "stream-collection|pouch-collection|runtime-collection "
           "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
           stderr);
     return 2;
@@ -1241,6 +1248,7 @@ int main(int argc, char **argv) {
   require(!strcmp(argv[1], "space-state") || !strcmp(argv[1], "pouch-state") ||
               !strcmp(argv[1], "space-collection") ||
               !strcmp(argv[1], "pouch-collection") ||
+              !strcmp(argv[1], "runtime-collection") ||
               !strcmp(argv[1], "stream-state") ||
               !strcmp(argv[1], "runtime-state") ||
               !strcmp(argv[1], "runtime-metadata") ||
@@ -1322,8 +1330,8 @@ int main(int argc, char **argv) {
   require(pthread_cond_init(&c.condition, NULL) == 0, "benchmark condition");
   lc_error_init(&e);
   if (c.streams && c.collection) {
-    /* Canonical record codec context only: no second Pouch root or sidecars.
-     * The public namespace/collection owner is still pending integration. */
+    /* Canonical codec comparison only. runtime-collection exercises the
+     * production SDK owner; neither mode creates a second Pouch root. */
     c.record_owner = calloc(1, sizeof(*c.record_owner));
     require(c.record_owner != NULL, "canonical record owner context");
   }
@@ -1424,7 +1432,7 @@ int main(int argc, char **argv) {
       }
     }
   }
-  if (c.runtime) {
+  if (c.runtime && !c.collection) {
     /* Observe the same typed owner once, outside the measured mutation loop. */
     for (i = 0; i < c.writers; ++i) {
       lc_pouch_storage_namespace_info info;
@@ -1466,6 +1474,21 @@ int main(int argc, char **argv) {
     c.read_method = 3;
   }
   count_files(c.store, &artifacts);
+  if (c.runtime && c.collection) {
+    struct stat metadata;
+    lc_collection_handle *receiver;
+    for (i = 0; i < c.writers; ++i) {
+      receiver = c.workers[i].collection->impl;
+      require(fstat(receiver->order.fd, &metadata) == 0,
+              "inspect disposable ordered metadata");
+      scratch_bytes += (uint64_t)metadata.st_size;
+      scratch_allocated += (uint64_t)metadata.st_blocks * 512U;
+      require(fstat(receiver->ids.fd, &metadata) == 0,
+              "inspect disposable identity metadata");
+      scratch_bytes += (uint64_t)metadata.st_size;
+      scratch_allocated += (uint64_t)metadata.st_blocks * 512U;
+    }
+  }
   if (c.container || c.runtime) {
     /* The test helper owns one marker in the parent, outside the store. Audit
      * the whole parent too so an accidental store sidecar cannot hide. */
@@ -1514,6 +1537,8 @@ int main(int argc, char **argv) {
       (unsigned long)artifacts.logical, (unsigned long)artifacts.allocated,
       usage.ru_maxrss, (unsigned long)fd_calls, (unsigned long)full_calls,
       (double)sync_ns / 1e6, max_sync_batch);
+  printf("disposable_metadata_bytes=%lu disposable_metadata_allocated=%lu ",
+         (unsigned long)scratch_bytes, (unsigned long)scratch_allocated);
   printf(
       "checkpoints=%ld directory_page_writes=%ld descriptor_page_writes=%ld "
       "metadata_pages=%ld packed_pages=%ld packed_bytes=%ld "

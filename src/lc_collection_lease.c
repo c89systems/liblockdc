@@ -147,10 +147,7 @@ static int lease_acquire(lc_collection *self,
   /* Allocate the independent receiver before changing ownership. No allocation
    * after a successful ownership write is needed to return its credentials. */
   if (rc == LC_OK)
-    rc = lc_collection_open_bound(
-        collection->client, collection->ns, collection->name, collection->id,
-        collection->catalog_base, collection->catalog_path, 0, 0, 0, &owned,
-        error);
+    rc = collection->owner.ops->clone(collection->owner.context, &owned, error);
   if (rc == LC_OK) {
     rc = lc_collection_control_enter(&call, &guard, error);
     if (rc == LC_OK) {

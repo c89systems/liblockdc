@@ -26,6 +26,15 @@ typedef struct ps_pouch_state_options {
  * Internal cleanup durability scopes force the completed container prefix
  * durable under either root policy; unfinished producers remain private.
  * Rotation can still require foreground capacity before a delete.
+ * Public collection create/open/list, heads, direct/staged/push append,
+ * streamed scan/LQL reads and cursors, deletion, retention metadata, atomic
+ * edits/retry receipts, leases/takeover/private reads and drop/recreate now use
+ * the production collection engine through typed container owners. Catalogs,
+ * control heads and canonical bytes live in the container; order/ID metadata
+ * is disposable memfd scratch. A physical-owner recovery changes the scratch
+ * epoch, invalidating prior cursors/head preconditions; receivers sharing a
+ * live owner have the same epoch. Collection compaction, indexing and
+ * background collection retention remain outside this harness.
  * Other Pouch operations are outside this harness's current call contract.
  * Explicitly disable indexing, background maintenance and queue watches; shared
  * root mode and generated external key files are not admitted. No public

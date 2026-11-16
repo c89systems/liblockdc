@@ -199,6 +199,60 @@ int lc_pouch_record_io_tail(lc_pouch_record_io io, uint64_t *out, lc_error *e) {
     return io_error(e, LC_ERR_INVALID, "invalid pouch record tail");
   return io.ops->tail(io.context, out, e);
 }
+static size_t span_read(lc_source *source, void *bytes, size_t capacity,
+                        lc_error *e) {
+  lc_pouch_record_span *span = source->impl;
+  uint64_t remaining = span->length - (span->offset - span->start);
+  size_t take = span->prefix_size - span->prefix_used;
+  struct iovec part;
+  if (capacity > remaining)
+    capacity = (size_t)remaining;
+  if (take > capacity)
+    take = capacity;
+  if (take) {
+    memmove(bytes, span->prefix + span->prefix_used, take);
+    span->prefix_used += take;
+    span->offset += take;
+    return take;
+  }
+  if (!capacity)
+    return 0U;
+  part.iov_base = bytes;
+  part.iov_len = capacity;
+  if (lc_pouch_record_io_read(span->input, span->offset, &part, 1, e) != LC_OK)
+    return 0U;
+  span->offset += capacity;
+  return capacity;
+}
+static int span_reset(lc_source *source, lc_error *e) {
+  lc_pouch_record_span *span = source->impl;
+  (void)e;
+  if (span->prefix_used) {
+    span->prefix = NULL;
+    span->prefix_size = span->prefix_used = 0U;
+  }
+  span->offset = span->start;
+  return LC_OK;
+}
+int lc_pouch_record_span_bind(lc_pouch_record_span *span,
+                              lc_pouch_record_io input, uint64_t start,
+                              uint64_t length, const void *prefix,
+                              size_t prefix_size, lc_error *e) {
+  if (!span || !input.ops || !input.ops->read || start > (uint64_t)LC_I64_MAX ||
+      length > (uint64_t)LC_I64_MAX - start || prefix_size > length ||
+      (!prefix && prefix_size))
+    return io_error(e, LC_ERR_INVALID, "invalid pouch encoded range");
+  memset(span, 0, sizeof(*span));
+  span->source.impl = span;
+  span->source.read = span_read;
+  span->source.reset = span_reset;
+  span->input = input;
+  span->prefix = prefix;
+  span->prefix_size = prefix_size;
+  span->start = span->offset = start;
+  span->length = length;
+  return LC_OK;
+}
 static int encode(unsigned char type, const void *key, size_t key_bytes,
                   const void *meta, size_t meta_bytes, uint64_t payload,
                   unsigned long crc, unsigned long flags, unsigned char *wire,

@@ -2634,6 +2634,7 @@ void ps_owned_close(ps_owned_head *head) {
   s = head->space;
   pthread_mutex_lock(&s->mutex);
   head->entry->stream_open = 0;
+  head->entry->orphan_claimed = 0;
   --head->entry->pins;
   --s->readers;
   if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
@@ -3085,6 +3086,27 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
   }
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+}
+int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
+  ps_space *s;
+  int rc;
+  if (!head)
+    return err(error, LC_ERR_INVALID,
+               "orphan claim requires an owned identity");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (head->entry->deleted || head->entry->catalog_refs ||
+       head->entry->catalog_pins ||
+       head->entry->catalog_release >
+           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
+    rc = err(error, LC_ERR_INVALID,
+             "owned identity is retained by a catalog binding or view");
+  if (rc == LC_OK)
+    head->entry->orphan_claimed = 1;
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
 }
 int ps_owned_retire(ps_owned_head *head, lc_error *error) {
   ps_space *s;

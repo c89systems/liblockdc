@@ -47,10 +47,10 @@ typedef struct lc_collection_chunks {
   lc_collection_chunk_ref pending, first;
   lc_collection_unit first_unit;
   lc_u64 region_end;
-  int region_fd;
+  lc_collection_segment region;
   /* Pin the first inode through final identity binding, including rollover.
    * Ownership is explicit so a zero-initialized chunks object owns no fd. */
-  int first_fd, first_fd_owned;
+  lc_collection_segment first_storage;
   /* Cross-inode sync is covered: either explicitly sealed, or finalized
    * while active so any later rotation must seal it. Further writes clear it.
    */
@@ -60,9 +60,9 @@ typedef struct lc_collection_chunks {
   lc_collection_index_append_fn append_index;
   void *index_context;
 } lc_collection_chunks;
-int lc_collection_chunks_write_index(int, lc_u64, unsigned int, const void *,
-                                     size_t, lc_collection_chunk_ref *,
-                                     lc_error *);
+int lc_collection_chunks_write_index(lc_pouch_record_io, lc_u64, unsigned int,
+                                     const void *, size_t,
+                                     lc_collection_chunk_ref *, lc_error *);
 /* Links an already copied encoded unit. The fixed carry stack writes only
  * index metadata through append_index when used by snapshot compaction. */
 int lc_collection_chunks_link(lc_collection_handle *, lc_collection_chunks *,
@@ -74,7 +74,7 @@ int lc_collection_chunks_append(lc_collection_handle *, lc_collection_chunks *,
 /* Ends a codec unit/span while retaining exclusive use of its remaining
  * canonical range. Prepare, end_unit, bind and finish require append authority.
  */
-lc_u64 lc_collection_chunks_capacity(const lc_pouch *);
+lc_u64 lc_collection_chunks_capacity(const lc_collection_handle *);
 int lc_collection_chunks_prepare(lc_collection_handle *, lc_collection_chunks *,
                                  lc_u64, lc_u64 *, lc_error *);
 int lc_collection_chunks_end_unit(lc_collection_handle *,
@@ -100,7 +100,8 @@ typedef struct lc_collection_chunk_frame {
 #define LC_COLLECTION_READ_HANDLES 8U
 typedef struct lc_collection_read_handle {
   lc_u64 segment, window, used;
-  int fd;
+  lc_pouch_record_io input;
+  void *pin;
 } lc_collection_read_handle;
 
 typedef struct lc_collection_chunk_reader {
@@ -114,29 +115,40 @@ typedef struct lc_collection_chunk_reader {
   char binding[256];
   lc_u64 plaintext, encoded;
   int unit_active;
-  const char *directory;
+  lc_collection_read_storage storage;
+  lc_collection_file_reads files;
   const lc_allocator *allocator;
   lc_collection_chunk_frame *frames;
   lc_collection_chunk_ref root, current;
   lc_u64 length, extent_count, remaining, extents_remaining, extent_remaining;
-  lc_u64 offset, index_segment, publication_segment, publication_offset;
+  lc_u64 publication_segment, publication_offset;
   /* Handles preserve independent sequential positions, not payload data. */
   lc_collection_read_handle handles[LC_COLLECTION_READ_HANDLES];
+  lc_collection_read_handle index;
+  lc_pouch_record_io publication;
+  lc_pouch_record_span encoded_input;
   lc_u64 handle_clock;
-  int current_fd, index_fd, directory_fd, publication_fd, initialized, started;
+  int initialized, started;
   unsigned int height, depth;
 } lc_collection_chunk_reader;
 int lc_collection_chunks_open(lc_collection_chunk_reader *,
                               const lc_allocator *, lc_pouch_crypto *,
-                              const char *, const char *, int,
+                              const char *, lc_collection_read_storage,
+                              lc_pouch_record_io,
                               const lc_pouch_collection_record *, lc_error *);
-/* A single contiguous extent uses the ordinary descriptor/span decoder. The
- * reader owns the returned fd; callers borrow it until the next bind/close. */
-int lc_collection_chunks_single(lc_collection_chunk_reader *, int *, lc_u64 *,
-                                lc_error *);
+/* Native storage adapter retains a lazy directory descriptor in this reader.
+ * Use the same borrowed directory until cleanup, as with the native owner. */
+lc_collection_read_storage
+lc_collection_chunks_file_access(lc_collection_chunk_reader *, const char *);
+/* A single contiguous extent uses the ordinary span decoder. The reader owns
+ * the returned input pin; callers borrow it until the next bind/close. */
+int lc_collection_chunks_single(lc_collection_chunk_reader *,
+                                lc_pouch_record_io *, lc_u64 *, lc_error *);
 /* Metadata traversal for encoded relocation; never decodes or stages bodies.
- * The borrowed fd remains owned by the reader. Do not mix with source reads. */
-int lc_collection_chunks_next_unit(lc_collection_chunk_reader *, int *, int *,
+ * The borrowed input remains owned by the reader. Do not mix with source reads.
+ */
+int lc_collection_chunks_next_unit(lc_collection_chunk_reader *, int *,
+                                   lc_pouch_record_io *,
                                    lc_collection_chunk_ref *,
                                    lc_collection_unit *, lc_error *);
 typedef int (*lc_collection_chunk_visit_fn)(void *,

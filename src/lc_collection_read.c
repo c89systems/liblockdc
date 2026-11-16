@@ -39,14 +39,12 @@ typedef struct lc_collection_reader {
   size_t prefix_size, chunk_capacity;
   lc_collection_payload payload;
   lc_collection_query_plan plan;
-  int reader_fd;
-  int record_fd;
+  lc_collection_lock view_pin;
+  lc_collection_input input;
 #if defined(__linux__)
   int read_advice;
   int file_changed;
 #endif
-  lc_u64 file_segment;
-  lc_u64 file_end;
   lc_u64 upper;
   lc_u64 instant;
   /* Working live-input budget. The returned resume token records only the
@@ -293,7 +291,6 @@ static int lc_cr_unit_record(lc_collection_reader *reader,
   const char *id, *tail;
   size_t length, prefix_length;
   lc_u64 end;
-  struct stat st;
   int rc, encrypted;
   if (!row->unit_segment || row->unit_segment > row->segment ||
       ((row->unit_segment ^ row->segment) & LC_COLLECTION_SNAPSHOT_BIT) ||
@@ -304,23 +301,21 @@ static int lc_cr_unit_record(lc_collection_reader *reader,
   end = row->unit_offset + LC_COLLECTION_UNIT_HEADER + row->stored_bytes;
   if (row->unit_segment == row->segment && end > row->record_offset)
     goto corrupt;
-  rc = lc_collection_record_file(c, row->unit_segment, &reader->record_fd,
-                                 &reader->file_segment, &reader->file_end,
-                                 reader->error);
+  rc = lc_collection_record_input(c, row->unit_segment, &reader->input,
+                                  reader->error);
   if (rc != LC_OK)
     return rc;
-  if (end > reader->file_end) {
-    if (fstat(reader->record_fd, &st) != 0 || st.st_size < 0)
-      return lc_collection_failure(reader->error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to inspect direct collection unit");
-    reader->file_end = (lc_u64)st.st_size;
-    if (end > reader->file_end)
+  if (end > reader->input.end) {
+    rc = lc_collection_input_refresh(&reader->input, reader->error);
+    if (rc != LC_OK)
+      return rc;
+    if (end > reader->input.end)
       goto corrupt;
   }
   reader->prefix_size = row->stored_bytes < reader->chunk_capacity
                             ? (size_t)row->stored_bytes
                             : reader->chunk_capacity;
-  rc = lc_collection_unit_read_prefix(reader->record_fd, row->unit_offset,
+  rc = lc_collection_unit_read_prefix(reader->input.io, row->unit_offset,
                                       row->stored_bytes, unit, reader->prefix,
                                       reader->prefix_size, reader->error);
   if (rc != LC_OK)
@@ -385,18 +380,18 @@ static int lc_cr_body_open(lc_collection_reader *reader) {
   /* Sparse root metadata must not compete with separate payload descriptors.
    * A direct unit instead reads its complete contiguous body on this fd. */
   if (advice != reader->read_advice || reader->file_changed)
-    (void)posix_fadvise(reader->record_fd, 0, 0, advice);
+    lc_collection_input_advise(&reader->input, advice);
   reader->read_advice = advice;
   reader->file_changed = 0;
 #endif
   if (reader->direct_unit || prefix_size)
     return lc_collection_payload_open_prefix(
-        &reader->payload, reader->call->collection, reader->record_fd,
+        &reader->payload, reader->call->collection, reader->input.io,
         &reader->record, reader->direct_unit ? &reader->unit : NULL,
         reader->direct_unit ? reader->unit_binding : NULL, reader->prefix,
         prefix_size, reader->error);
   return lc_collection_payload_open(&reader->payload, reader->call->collection,
-                                    reader->record_fd, &reader->record,
+                                    reader->input.io, &reader->record,
                                     reader->error);
 }
 
@@ -520,7 +515,8 @@ int lc_collection_read_method(lc_collection *self,
   unsigned int quiet_pages;
   int checkpoint;
   int matched;
-  int rc, commit_pin;
+  int rc;
+  lc_collection_lock commit_pin;
   time_t now;
   if (sink == NULL || sink->write == NULL || out == NULL)
     return lc_collection_failure(
@@ -553,7 +549,7 @@ int lc_collection_read_method(lc_collection *self,
   reader->sink = sink;
   reader->result = out;
   reader->error = error;
-  reader->order.fd = reader->reader_fd = reader->record_fd = -1;
+  reader->order.fd = -1;
   runtime = NULL;
   selector = NULL;
   chunk = NULL;
@@ -618,7 +614,7 @@ int lc_collection_read_method(lc_collection *self,
               "collection checkpoint exceeds retained committed history");
         if (rc == LC_OK) {
           rc = lc_collection_read_pin(collection, collection->head.snapshot,
-                                      &reader->reader_fd, error);
+                                      &reader->view_pin, error);
         }
         if (rc == LC_OK) {
           reader->order = collection->order;
@@ -737,14 +733,13 @@ int lc_collection_read_method(lc_collection *self,
 #if defined(__linux__)
       reader->file_changed =
           (reader->direct_unit ? rows[i].unit_segment : rows[i].segment) !=
-          reader->file_segment;
+          reader->input.segment;
 #endif
       if (rc == LC_OK && reader->direct_unit)
         rc = lc_cr_unit_record(reader, &rows[i]);
       else if (rc == LC_OK)
         rc = lc_collection_record_ref_prefix(
-            collection, rows[i].segment, rows[i].record_offset,
-            &reader->record_fd, &reader->file_segment, &reader->file_end,
+            collection, rows[i].segment, rows[i].record_offset, &reader->input,
             &reader->record, reader->prefix, reader->chunk_capacity,
             &reader->prefix_size, error);
 #if defined(__linux__)
@@ -758,8 +753,7 @@ int lc_collection_read_method(lc_collection *self,
         reader->prefix_size = 0;
       if (rc == LC_OK)
         rc = lc_collection_record_at(collection, reader->iter.generation,
-                                     &reader->record_fd, &reader->file_segment,
-                                     &reader->file_end, &reader->record, error);
+                                     &reader->input, &reader->record, error);
       if (rc == LC_OK && (reader->record.deleted ||
                           reader->record.position != rows[i].position ||
                           reader->record.published_at != rows[i].published_at ||
@@ -853,10 +847,8 @@ int lc_collection_read_method(lc_collection *self,
   }
   lc_collection_payload_cleanup(&reader->payload);
   lc_collection_query_plan_cleanup(&reader->plan);
-  if (reader->reader_fd >= 0)
-    (void)close(reader->reader_fd);
-  if (reader->record_fd >= 0)
-    (void)close(reader->record_fd);
+  lc_collection_lock_leave(&reader->view_pin);
+  lc_collection_input_close(&reader->input);
   lc_collection_order_close(&reader->order);
   lc_free_with_allocator(&collection->allocator, chunk);
   if (selector != NULL)

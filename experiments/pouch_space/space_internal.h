@@ -33,7 +33,7 @@ typedef struct ps_entry {
   uint64_t token, bytes;
   uint64_t publication_sequence;
   uint64_t stream_capacity, stream_runs, stream_ready;
-  int stream_open, stream_sealed;
+  int stream_open, stream_sealed, orphan_claimed;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */

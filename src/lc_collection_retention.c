@@ -1,6 +1,6 @@
 #include "lc_collection_internal.h"
 
-#include <unistd.h>
+#include <string.h>
 
 /* Runs on the root's existing maintenance cadence. Metadata-only batches do
  * not open a body source or hide an expired entry from ordinary reads. Each
@@ -16,9 +16,11 @@ int lc_collection_retention_maintain(lc_collection *self, int *dropped,
   lc_pouch_collection_record record;
   lc_collection_delete_res deleted;
   lc_pouch_unix_seconds now, parent;
-  lc_u64 captured, ordinal, file_segment, file_end, trim_budget;
+  lc_u64 captured, ordinal, trim_budget;
+  lc_collection_input input;
   size_t count, selected, i;
-  int fd, rooted, rc, commit_pin;
+  int rooted, rc;
+  lc_collection_lock commit_pin;
   *dropped = 0;
   rc = lc_collection_call_begin(self, 1, &call, error);
   if (rc != LC_OK)
@@ -30,8 +32,7 @@ int lc_collection_retention_maintain(lc_collection *self, int *dropped,
   captured = 0U;
   trim_budget = 0U;
   parent = 0;
-  fd = -1;
-  file_segment = file_end = 0U;
+  memset(&input, 0, sizeof(input));
   if (rc == LC_OK)
     rc = lc_pouch_now_unix(&now, error);
   if (rc == LC_OK) {
@@ -72,8 +73,8 @@ int lc_collection_retention_maintain(lc_collection *self, int *dropped,
         if (rows[i].deleted_at != 0U)
           continue;
         rc = lc_collection_record_ref(collection, rows[i].segment,
-                                      rows[i].record_offset, &fd, &file_segment,
-                                      &file_end, &record, error);
+                                      rows[i].record_offset, &input, &record,
+                                      error);
         if (rc == LC_OK &&
             (record.deleted || record.position != rows[i].position ||
              record.published_at != rows[i].published_at ||
@@ -99,8 +100,7 @@ int lc_collection_retention_maintain(lc_collection *self, int *dropped,
       }
     }
   }
-  if (fd >= 0)
-    (void)close(fd);
+  lc_collection_input_close(&input);
   /* Age deletion runs first so it can satisfy the cap without unnecessarily
    * deleting an older, unexpired entry. Each trim selects the current oldest
    * and rechecks policy/count under mutation authority, releasing it after

@@ -4684,8 +4684,10 @@ The source patch against `845f4a07` (`guards-source.patch`) SHA-256:
 `perf-inputs.sha256` checks both retained inputs. Raw rows and independently
 computed statistics are in `perf-results.json`; `perf-summary.pl` checks all
 40 unique cases and all first/elapsed/CPU min/median/max against the raw logs
-(`perf-independent-check.log`). GNU test workers use 128 KiB stacks with the
-glibc stack cache disabled.
+(`perf-independent-check.log`). GNU Release uses ordinary platform worker
+stacks, with the glibc stack cache disabled. The Debug-only stack initializer
+is not linked into this Release executable; setting
+`LOCKDC_TEST_STACK_BYTES=131072` alone did not constrain its worker stack.
 
 All table values are microseconds: median [minimum–maximum], five samples.
 Elapsed/CPU values cover the complete 1,024-cycle batch, not one acquisition.

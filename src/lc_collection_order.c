@@ -225,25 +225,21 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
   return LC_OK;
 }
 
-int lc_collection_order_open(const char *path, int create,
-                             lc_collection_order *out, lc_error *error) {
+int lc_collection_order_adopt(int fd, int create, lc_collection_order *out,
+                              lc_error *error) {
   struct stat st;
   int rc;
-  if (out == NULL) {
+  if (!out) {
+    if (fd >= 0)
+      (void)close(fd);
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered index requires output");
   }
   memset(out, 0, sizeof(*out));
-  out->fd = -1;
-  if (path == NULL || path[0] == '\0') {
-    return lc_co_error(error, LC_ERR_INVALID,
-                       "collection ordered index requires path");
-  }
-  out->fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-  if (out->fd < 0) {
+  out->fd = fd;
+  if (fd < 0)
     return lc_co_error(error, LC_ERR_TRANSPORT,
-                       "failed to open collection ordered index");
-  }
+                       "failed to create collection ordered index");
   rc = LC_OK;
   if (fstat(out->fd, &st) != 0) {
     rc = lc_co_error(error, LC_ERR_TRANSPORT,
@@ -260,6 +256,21 @@ int lc_collection_order_open(const char *path, int create,
     lc_collection_order_close(out);
   }
   return rc;
+}
+
+int lc_collection_order_open(const char *path, int create,
+                             lc_collection_order *out, lc_error *error) {
+  int fd;
+  if (!out)
+    return lc_co_error(error, LC_ERR_INVALID,
+                       "collection ordered index requires output");
+  memset(out, 0, sizeof(*out));
+  out->fd = -1;
+  if (!path || !*path)
+    return lc_co_error(error, LC_ERR_INVALID,
+                       "collection ordered index requires path and output");
+  fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
+  return lc_collection_order_adopt(fd, create, out, error);
 }
 
 void lc_collection_order_close(lc_collection_order *order) {

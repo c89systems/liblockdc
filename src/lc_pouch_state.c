@@ -19034,7 +19034,7 @@ int lc_pouch_collection_record_append(
 }
 
 int lc_pouch_collection_record_metadata(
-    lc_pouch *pouch, int fd, const char *container_leaf,
+    lc_pouch *pouch, lc_pouch_record_io output, const char *container_leaf,
     const lc_pouch_collection_record *current, uint64_t previous_segment,
     uint64_t generation, lc_pouch_unix_seconds retention,
     lc_pouch_collection_record *out, lc_error *error) {
@@ -19046,7 +19046,7 @@ int lc_pouch_collection_record_metadata(
   size_t length;
   size_t binding_length;
   int rc, started;
-  if (pouch == NULL || fd < 0 || current == NULL || out == NULL ||
+  if (pouch == NULL || !output.ops || current == NULL || out == NULL ||
       current == out || !current->published || current->deleted ||
       current->position == 0U || previous_segment == 0U ||
       generation <= current->generation || retention == LC_I64_MIN ||
@@ -19089,35 +19089,33 @@ int lc_pouch_collection_record_metadata(
   if (rc == LC_OK)
     rc = lc_pouch_state_meta_set_index_seq(meta, length, generation, error);
   if (rc == LC_OK)
-    rc = lc_pouch_state_fd_end(
-        fd, &start, "failed to seek collection metadata tail", error);
+    rc = lc_pouch_record_io_tail(output, &start, error);
   if (rc == LC_OK) {
     out->record_offset = start;
     out->metadata_length = length;
     out->updated_at_unix = now;
     started = 1;
-    rc = lc_pouch_state_record_write_prefix(
-        fd, LC_POUCH_STATE_RECORD_STATE_META, current->append_id,
+    rc = lc_pouch_record_write_prefix(
+        output, LC_POUCH_STATE_RECORD_STATE_META, current->append_id,
         strlen(current->append_id), meta, length, 0U, 0U,
         LC_POUCH_RECORD_FLAG_PENDING, error);
   }
   if (rc == LC_OK) {
-    rc = lc_pouch_state_record_finalize(
-        fd, start, LC_POUCH_STATE_RECORD_STATE_META, current->append_id,
+    rc = lc_pouch_record_finalize(
+        output, start, LC_POUCH_STATE_RECORD_STATE_META, current->append_id,
         strlen(current->append_id), meta, length, 0U, 0U, error);
     out->published = rc == LC_OK;
   }
   if (rc == LC_OK)
-    rc = lc_pouch_state_fd_end(fd, &out->next_offset,
-                               "failed to restore collection metadata offset",
-                               error);
+    rc = lc_pouch_record_io_tail(output, &out->next_offset, error);
   if (rc != LC_OK && started && !out->published)
-    lc_pouch_state_append_fd_rollback(fd, start, 1);
+    output.ops->discard(output.context, start);
   lc_free_with_allocator(&pouch->allocator, meta);
   return rc;
 }
 
-int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
+int lc_pouch_collection_record_delete(lc_pouch *pouch,
+                                      lc_pouch_record_io output,
                                       const lc_pouch_collection_record *current,
                                       uint64_t generation,
                                       lc_pouch_collection_record *out,
@@ -19131,7 +19129,7 @@ int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
   size_t binding_length;
   int rc;
   int started;
-  if (pouch == NULL || fd < 0 || current == NULL || out == NULL ||
+  if (pouch == NULL || !output.ops || current == NULL || out == NULL ||
       !current->published || current->position == 0U ||
       !lc_pouch_collection_id_valid(current->append_id)) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -19168,8 +19166,7 @@ int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
   start = 0U;
   rc = lc_pouch_now_unix(&now, error);
   if (rc == LC_OK) {
-    rc = lc_pouch_state_fd_end(
-        fd, &start, "failed to seek collection deletion tail", error);
+    rc = lc_pouch_record_io_tail(output, &start, error);
   }
   if (rc == LC_OK) {
     rc = lc_pouch_state_encode_delete_meta(&pouch->allocator, current->position,
@@ -19205,24 +19202,22 @@ int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
     out->record_offset = start;
     out->updated_at_unix = now;
     started = 1;
-    rc = lc_pouch_state_record_write_prefix(
-        fd, LC_POUCH_STATE_RECORD_STATE_DELETE, current->append_id,
+    rc = lc_pouch_record_write_prefix(
+        output, LC_POUCH_STATE_RECORD_STATE_DELETE, current->append_id,
         strlen(current->append_id), meta, length, 0U, 0U,
         LC_POUCH_RECORD_FLAG_PENDING, error);
   }
   if (rc == LC_OK) {
-    rc = lc_pouch_state_record_finalize(
-        fd, start, LC_POUCH_STATE_RECORD_STATE_DELETE, current->append_id,
+    rc = lc_pouch_record_finalize(
+        output, start, LC_POUCH_STATE_RECORD_STATE_DELETE, current->append_id,
         strlen(current->append_id), meta, length, 0U, 0U, error);
     out->published = rc == LC_OK;
   }
   if (rc == LC_OK) {
-    rc = lc_pouch_state_fd_end(fd, &out->next_offset,
-                               "failed to restore collection deletion offset",
-                               error);
+    rc = lc_pouch_record_io_tail(output, &out->next_offset, error);
   }
   if (rc != LC_OK && started && !out->published) {
-    lc_pouch_state_append_fd_rollback(fd, start, 1);
+    output.ops->discard(output.context, start);
   }
   lc_free_with_allocator(&pouch->allocator, meta);
   return rc;
@@ -19669,14 +19664,15 @@ int lc_pouch_collection_record_check_body(
 }
 
 int lc_pouch_collection_record_copy_source(
-    lc_pouch *pouch, int source_fd, int payload_fd,
+    lc_pouch *pouch, lc_pouch_record_io input, lc_pouch_record_io payload,
     const lc_pouch_collection_record *relocated_stream, const char *source_leaf,
-    const lc_pouch_collection_record *current, int destination_fd,
+    const lc_pouch_collection_record *current, lc_pouch_record_io output,
     const char *destination_leaf, unsigned char *buffer, size_t capacity,
     lc_pouch_collection_record *out, lc_error *error) {
   lc_pouch_collection_record source;
   lc_pouch_collection_record body;
-  struct stat body_stat;
+  uint64_t body_end;
+  struct iovec part;
   unsigned char meta[LC_POUCH_COLLECTION_META_BYTES];
   uint64_t start;
   uint64_t metadata_offset;
@@ -19690,20 +19686,23 @@ int lc_pouch_collection_record_copy_source(
   unsigned long crc;
   unsigned char type;
   int rc;
-  if (pouch == NULL || source_fd < 0 || destination_fd < 0 ||
-      source_fd == destination_fd || current == NULL || out == NULL ||
-      current == out || !current->published || buffer == NULL ||
-      capacity == 0U ||
-      (!current->deleted && (payload_fd < 0 || payload_fd == destination_fd)) ||
+  if (pouch == NULL || !input.ops || !output.ops ||
+      (input.ops == output.ops && input.context == output.context) ||
+      current == NULL || out == NULL || current == out || !current->published ||
+      buffer == NULL || capacity == 0U ||
+      (!current->deleted &&
+       (!payload.ops ||
+        (payload.ops == output.ops && payload.context == output.context))) ||
       !lc_pouch_state_payload_container_is_valid(destination_leaf))
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "collection relocation requires distinct files, record "
-                        "and bounded buffer",
-                        NULL, NULL, "pouch");
+    return lc_error_set(
+        error, LC_ERR_INVALID, 0L,
+        "collection relocation requires distinct owners, record "
+        "and bounded buffer",
+        NULL, NULL, "pouch");
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_collection_record_read(
-      lc_pouch_record_file_io(source_fd), current->record_offset,
-      current->next_offset, source_leaf, &source, error);
+  rc = lc_pouch_collection_record_read(input, current->record_offset,
+                                       current->next_offset, source_leaf,
+                                       &source, error);
   if (rc != LC_OK)
     return rc;
   if (source.position != current->position ||
@@ -19718,13 +19717,12 @@ int lc_pouch_collection_record_copy_source(
         "collection relocation source differs from its committed identity",
         NULL, "collection_corrupt", "pouch");
   if (source.metadata_only) {
-    if (fstat(payload_fd, &body_stat) != 0 || body_stat.st_size < 0)
-      return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                          "failed to inspect collection payload reference",
-                          NULL, NULL, "pouch");
-    rc = lc_pouch_collection_record_read(
-        lc_pouch_record_file_io(payload_fd), source.payload_record_offset,
-        (uint64_t)body_stat.st_size, source.payload_container, &body, error);
+    rc = lc_pouch_record_io_tail(payload, &body_end, error);
+    if (rc != LC_OK)
+      return rc;
+    rc = lc_pouch_collection_record_read(payload, source.payload_record_offset,
+                                         body_end, source.payload_container,
+                                         &body, error);
     if (rc != LC_OK)
       return rc;
     rc = lc_pouch_collection_record_check_body(&source, &body, error);
@@ -19755,14 +19753,12 @@ int lc_pouch_collection_record_copy_source(
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "collection relocation metadata exceeds its bound",
                         NULL, "collection_corrupt", "pouch");
-  rc = lc_pouch_collection_record_pread(source_fd, metadata_offset, meta,
-                                        meta_length, error);
+  rc = lc_pouch_collection_record_read_bytes(input, metadata_offset, meta,
+                                             meta_length, error);
   if (rc != LC_OK)
     return rc;
   start = 0U;
-  rc = lc_pouch_state_fd_end(destination_fd, &start,
-                             "failed to seek collection relocation output",
-                             error);
+  rc = lc_pouch_record_io_tail(output, &start, error);
   if (rc != LC_OK)
     return rc;
   out->record_offset = start;
@@ -19815,8 +19811,8 @@ int lc_pouch_collection_record_copy_source(
   }
   out->kind = type;
   out->metadata_length = meta_length;
-  rc = lc_pouch_state_record_write_prefix(
-      destination_fd, type, source.append_id, strlen(source.append_id), meta,
+  rc = lc_pouch_record_write_prefix(
+      output, type, source.append_id, strlen(source.append_id), meta,
       meta_length, source.stream_extents ? 0 : source.stored_bytes,
       source.stored_crc, LC_POUCH_RECORD_FLAG_PENDING, error);
   remaining = source.stream_extents ? 0 : source.stored_bytes;
@@ -19826,11 +19822,13 @@ int lc_pouch_collection_record_copy_source(
     capacity = LC_POUCH_STATE_FILE_CHUNK_BYTES;
   while (rc == LC_OK && remaining != 0U) {
     want = remaining < (uint64_t)capacity ? (size_t)remaining : capacity;
-    rc = lc_pouch_collection_record_pread(payload_fd, offset, buffer, want,
-                                          error);
+    rc = lc_pouch_collection_record_read_bytes(payload, offset, buffer, want,
+                                               error);
     if (rc == LC_OK) {
       crc = (unsigned long)crc32((uLong)crc, buffer, (uInt)want);
-      rc = lc_pouch_state_write_all(destination_fd, buffer, want, error);
+      part.iov_base = buffer;
+      part.iov_len = want;
+      rc = lc_pouch_record_io_append(output, &part, 1, error);
     }
     if (rc == LC_OK)
       rc = lc_pouch_state_compaction_throttle(pouch, want, error);
@@ -19843,28 +19841,27 @@ int lc_pouch_collection_record_copy_source(
                      "collection relocation source payload checksum is invalid",
                      NULL, "collection_corrupt", "pouch");
   if (rc == LC_OK) {
-    rc = lc_pouch_state_record_finalize(
-        destination_fd, start, type, source.append_id, strlen(source.append_id),
-        meta, meta_length, source.stream_extents ? 0 : source.stored_bytes,
+    rc = lc_pouch_record_finalize(
+        output, start, type, source.append_id, strlen(source.append_id), meta,
+        meta_length, source.stream_extents ? 0 : source.stored_bytes,
         source.stored_crc, error);
     out->published = rc == LC_OK;
   }
   if (rc == LC_OK)
-    rc = lc_pouch_state_fd_end(
-        destination_fd, &out->next_offset,
-        "failed to restore collection relocation append offset", error);
+    rc = lc_pouch_record_io_tail(output, &out->next_offset, error);
   if (rc != LC_OK && !out->published)
-    lc_pouch_state_append_fd_rollback(destination_fd, start, 1);
+    output.ops->discard(output.context, start);
   return rc;
 }
 
 int lc_pouch_collection_record_copy(
-    lc_pouch *pouch, int source_fd, int payload_fd, const char *source_leaf,
-    const lc_pouch_collection_record *current, int destination_fd,
-    const char *destination_leaf, unsigned char *buffer, size_t capacity,
-    lc_pouch_collection_record *out, lc_error *error) {
+    lc_pouch *pouch, lc_pouch_record_io input, lc_pouch_record_io payload,
+    const char *source_leaf, const lc_pouch_collection_record *current,
+    lc_pouch_record_io output, const char *destination_leaf,
+    unsigned char *buffer, size_t capacity, lc_pouch_collection_record *out,
+    lc_error *error) {
   return lc_pouch_collection_record_copy_source(
-      pouch, source_fd, payload_fd, NULL, source_leaf, current, destination_fd,
+      pouch, input, payload, NULL, source_leaf, current, output,
       destination_leaf, buffer, capacity, out, error);
 }
 
@@ -20076,8 +20073,10 @@ int lc_pouch_collection_recode_record(lc_pouch_recode *work,
     goto done;
   if (current.deleted) {
     rc = lc_pouch_collection_record_copy(
-        work->pouch, source_fd, source_fd, file->leaf, &current, fd,
-        destination_leaf, scratch, sizeof(scratch), &converted, error);
+        work->pouch, lc_pouch_record_file_io(source_fd),
+        lc_pouch_record_file_io(source_fd), file->leaf, &current,
+        lc_pouch_record_file_io(fd), destination_leaf, scratch, sizeof(scratch),
+        &converted, error);
     goto done;
   }
   parser_fd = dup(source_fd);
@@ -20194,8 +20193,9 @@ int lc_pouch_collection_recode_record(lc_pouch_recode *work,
     if (rc == LC_OK)
       rc = lc_pouch_record_header_decode(prefix, &header, error);
     if (rc == LC_OK)
-      rc = lc_collection_unit_read(body_fd, root->first_offset,
-                                   header.payload_len, &unit, error);
+      rc = lc_collection_unit_read(lc_collection_unit_file_io(body_fd),
+                                   root->first_offset, header.payload_len,
+                                   &unit, error);
     if (rc == LC_OK)
       rc = lc_collection_unit_binding(&current, file->collection_id, NULL,
                                       manifest, error);

@@ -37,10 +37,12 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
   lc_collection_payload payload;
   lc_collection_order_row rows[LC_COLLECTION_ORDER_PAGE_ROWS];
   lc_pouch_collection_record record;
-  lc_u64 generation, file_segment, file_end;
+  lc_u64 generation;
+  lc_collection_input record_input;
   char query_id[LC_XID_STRING_SIZE];
   size_t count, i;
-  int pin_fd, record_fd, rooted, rc, commit_pin;
+  int rooted, rc;
+  lc_collection_lock view_pin, commit_pin;
   if (ordinal % LC_COLLECTION_ORDER_PAGE_ROWS != 0U)
     return lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
@@ -48,8 +50,9 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
   collection = call->collection;
   memset(&index, 0, sizeof(index));
   memset(&payload, 0, sizeof(payload));
-  pin_fd = record_fd = -1;
-  file_segment = file_end = generation = 0U;
+  memset(&view_pin, 0, sizeof(view_pin));
+  memset(&record_input, 0, sizeof(record_input));
+  generation = 0U;
   count = 0U;
   rc = lc_collection_root_begin(collection->pouch, &root_scope, &root_guard,
                                 error);
@@ -68,7 +71,7 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
                                       error);
         if (rc == LC_OK)
           rc = lc_collection_read_pin(collection, collection->head.snapshot,
-                                      &pin_fd, error);
+                                      &view_pin, error);
       }
       lc_collection_capture_leave(collection, &commit_pin);
     }
@@ -83,11 +86,11 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
       continue;
     }
     rc = lc_collection_record_ref(collection, rows[i].segment,
-                                  rows[i].record_offset, &record_fd,
-                                  &file_segment, &file_end, &record, error);
+                                  rows[i].record_offset, &record_input, &record,
+                                  error);
     if (rc == LC_OK)
-      rc = lc_collection_record_at(collection, generation, &record_fd,
-                                   &file_segment, &file_end, &record, error);
+      rc = lc_collection_record_at(collection, generation, &record_input,
+                                   &record, error);
     if (rc == LC_OK && (record.deleted || record.position != rows[i].position ||
                         record.published_at != rows[i].published_at ||
                         record.bytes != rows[i].bytes))
@@ -95,8 +98,8 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
           error, LC_ERR_PROTOCOL, "collection_corrupt",
           "collection query order points to a different canonical entry");
     if (rc == LC_OK)
-      rc = lc_collection_payload_open(&payload, collection, record_fd, &record,
-                                      error);
+      rc = lc_collection_payload_open(&payload, collection, record_input.io,
+                                      &record, error);
     if (rc == LC_OK)
       rc = lc_collection_index_add(&index, &payload.source, error);
     if (rc == LC_OK)
@@ -107,10 +110,8 @@ int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
     rc = lc_collection_query_store(collection, &index, error);
   lc_collection_payload_cleanup(&payload);
   lc_collection_index_cleanup(&index);
-  if (record_fd >= 0)
-    (void)close(record_fd);
-  if (pin_fd >= 0)
-    (void)close(pin_fd);
+  lc_collection_input_close(&record_input);
+  lc_collection_lock_leave(&view_pin);
   if (rooted)
     lc_collection_root_end(&root_scope, &root_guard);
   return rc;

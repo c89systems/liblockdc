@@ -37,23 +37,14 @@ static lc_collection_chunk_ref lc_ck_ref(const unsigned char *p) {
   ref.bytes = lc_ck_get(p + 16);
   return ref;
 }
-static int lc_ck_error(lc_error *e, const char *message) {
-  return lc_error_set(e, LC_ERR_TRANSPORT, 0, message, strerror(errno), NULL,
-                      "pouch");
-}
 static int lc_ck_corrupt(lc_error *e) {
   return lc_collection_failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
                                "collection payload index is inconsistent");
 }
-static int lc_ck_write_failed(int fd, off_t offset, const char *message,
-                              lc_error *e) {
-  int saved = errno;
-  /* Append authority still excludes peers. Even a partly finalized header
-   * belongs solely to this unpublished record and must not poison replay. */
-  if (ftruncate(fd, offset) != 0)
-    return lc_ck_error(e, "failed to repair incomplete collection extent");
-  errno = saved;
-  return lc_ck_error(e, message);
+static int lc_ck_write_failed(lc_collection_segment *segment, lc_u64 offset,
+                              int failed, lc_error *e) {
+  int rc = lc_collection_segment_truncate(segment, offset, e);
+  return rc == LC_OK ? failed : rc;
 }
 int lc_collection_chunks_storage_bytes(lc_u64 bytes, lc_u64 extents,
                                        lc_u64 *total) {
@@ -86,78 +77,51 @@ static int lc_ck_phase(lc_collection_handle *c, int phase, lc_error *e) {
              : LC_OK;
 }
 #endif
-int lc_collection_chunks_write_index(int fd, lc_u64 segment, unsigned int level,
-                                     const void *bytes, size_t count,
-                                     lc_collection_chunk_ref *ref,
+int lc_collection_chunks_write_index(lc_pouch_record_io output, lc_u64 segment,
+                                     unsigned int level, const void *bytes,
+                                     size_t count, lc_collection_chunk_ref *ref,
                                      lc_error *e) {
   unsigned char prefix[40];
   lc_pouch_record_header header;
-  struct iovec io[2];
-  off_t offset;
-  size_t first = 0, amount, prefix_size = 40;
-  ssize_t written;
-  offset = lseek(fd, 0, SEEK_END);
-  if (offset < 0)
-    return lc_ck_error(e, "failed to seek collection extent");
-  if ((lc_u64)offset > (lc_u64)LC_I64_MAX - prefix_size - count)
+  struct iovec parts[2];
+  uint64_t offset;
+  int rc;
+  if (!output.ops || !output.ops->discard || !ref || !bytes || !count ||
+      count > LC_COLLECTION_CHUNK_PAGE || count % LC_COLLECTION_CHUNK_TUPLE ||
+      level >= LC_COLLECTION_CHUNK_LEVELS - 1U)
+    return lc_ck_corrupt(e);
+  rc = lc_pouch_record_io_tail(output, &offset, e);
+  if (rc != LC_OK)
+    return rc;
+  if (offset > (uint64_t)LC_I64_MAX - sizeof(prefix) - count)
     return lc_ck_corrupt(e);
   memset(&header, 0, sizeof(header));
   header.type = LC_POUCH_COLLECTION_NODE;
   header.flags = LC_POUCH_RECORD_FLAG_PENDING;
-  header.meta_len = (unsigned long)(prefix_size - 32);
+  header.meta_len = sizeof(prefix) - 32U;
   header.payload_len = count;
   header.payload_crc = (unsigned long)crc32(0L, bytes, (uInt)count);
   lc_pouch_record_header_encode(&header, prefix);
-  lc_ck_put(prefix + 32, level);
-  io[0].iov_base = prefix;
-  io[0].iov_len = prefix_size;
-  io[1].iov_base = (void *)bytes;
-  io[1].iov_len = count;
-  while (first < 2) {
-    written = writev(fd, io + first, (int)(2 - first));
-    if (written < 0 && errno == EINTR)
-      continue;
-    if (written <= 0) {
-      if (!written)
-        errno = EIO;
-      return lc_ck_write_failed(
-          fd, offset, "failed to write canonical collection extent", e);
-    }
-    amount = (size_t)written;
-    while (first < 2 && amount >= io[first].iov_len) {
-      amount -= io[first].iov_len;
-      ++first;
-    }
-    if (first < 2 && amount) {
-      io[first].iov_base = (unsigned char *)io[first].iov_base + amount;
-      io[first].iov_len -= amount;
-    }
+  lc_ck_put(prefix + 32U, level);
+  parts[0].iov_base = prefix;
+  parts[0].iov_len = sizeof(prefix);
+  parts[1].iov_base = (void *)bytes;
+  parts[1].iov_len = count;
+  rc = lc_pouch_record_io_append(output, parts, 2, e);
+  if (rc == LC_OK) {
+    header.flags = 0;
+    lc_pouch_record_header_encode(&header, prefix);
+    parts[0].iov_len = LC_COLLECTION_CHUNK_HEADER;
+    rc = lc_pouch_record_io_patch(output, offset, parts, 1, e);
   }
-  header.flags = 0;
-  lc_pouch_record_header_encode(&header, prefix);
-  first = 0;
-  while (first < LC_COLLECTION_CHUNK_HEADER) {
-#ifdef LOCKDC_TEST_BUILD
-    if (lc_collection_chunks_test_pwrite)
-      written = lc_collection_chunks_test_pwrite(
-          fd, prefix + first, LC_COLLECTION_CHUNK_HEADER - first,
-          offset + (off_t)first);
-    else
-#endif
-      written = pwrite(fd, prefix + first, LC_COLLECTION_CHUNK_HEADER - first,
-                       offset + (off_t)first);
-    if (written < 0 && errno == EINTR)
-      continue;
-    if (written <= 0) {
-      if (!written)
-        errno = EIO;
-      return lc_ck_write_failed(fd, offset,
-                                "failed to finalize collection extent", e);
-    }
-    first += (size_t)written;
+  if (rc != LC_OK) {
+    /* This metadata append owns its complete unpublished suffix. A failed
+     * container repair poisons its owner before any later write admission. */
+    output.ops->discard(output.context, offset);
+    return rc;
   }
   ref->segment = segment;
-  ref->offset = (lc_u64)offset;
+  ref->offset = offset;
   ref->bytes = count;
   return LC_OK;
 }
@@ -173,8 +137,8 @@ static int lc_ck_append_index(lc_collection_handle *c, lc_collection_chunks *s,
     return lc_ck_corrupt(e);
   /* Allocation owns rotation. This bounded carry stack and its publication
    * follow the reserved bytes without another segment handoff. */
-  rc = lc_collection_chunks_write_index(c->active_fd, c->head.active, level,
-                                        bytes, count, ref, e);
+  rc = lc_collection_chunks_write_index(c->active.unit_io, c->head.active,
+                                        level, bytes, count, ref, e);
   if (rc == LC_OK)
     c->order.reclaimable_bytes =
         amount > LC_U64_MAX - c->order.reclaimable_bytes
@@ -202,74 +166,28 @@ static int lc_ck_push(lc_collection_handle *c, lc_collection_chunks *s,
     ++level;
   }
 }
-static int lc_ck_pwrite(int fd, const void *bytes, size_t length, lc_u64 offset,
-                        int finalizing, lc_error *error) {
-  const unsigned char *p = bytes;
-  ssize_t n;
-#ifndef LOCKDC_TEST_BUILD
-  (void)finalizing;
-#endif
-  while (length) {
-#ifdef LOCKDC_TEST_BUILD
-    if (finalizing && lc_collection_chunks_test_pwrite)
-      n = lc_collection_chunks_test_pwrite(fd, p, length, (off_t)offset);
-    else
-#endif
-      n = pwrite(fd, p, length, (off_t)offset);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0) {
-      if (!n)
-        errno = EIO;
-      return lc_ck_error(error, "failed to write canonical collection range");
-    }
-    p += (size_t)n;
-    length -= (size_t)n;
-    offset += (size_t)n;
-  }
-  return LC_OK;
-}
-
 static void lc_ck_close_region(lc_collection_chunks *s) {
-  if (s->pending.segment && s->region_fd >= 0)
-    (void)close(s->region_fd);
+  lc_collection_segment_close(&s->region);
   memset(&s->pending, 0, sizeof(s->pending));
-  s->region_fd = -1;
   s->region_end = 0;
 }
 
 void lc_collection_chunks_close(lc_collection_chunks *s) {
   lc_ck_close_region(s);
-  if (s->first_fd_owned)
-    (void)close(s->first_fd);
-  s->first_fd_owned = 0;
-  s->first_fd = -1;
+  lc_collection_segment_close(&s->first_storage);
   s->first_sealed = 0;
 }
 
-static int lc_ck_seal_private(int fd) {
-#ifdef LOCKDC_TEST_BUILD
-  if (lc_collection_chunks_test_sync_fd)
-    return lc_collection_chunks_test_sync_fd(fd);
-#endif
-#ifdef __linux__
-  /* Names are already published by segment rotation. Persist private bytes
-   * and the metadata needed to retrieve them, matching commit durability. */
-  return fdatasync(fd);
-#else
-  return fsync(fd);
-#endif
-}
-
 int lc_collection_chunks_seal_first(lc_collection_chunks *s, lc_error *error) {
-  if (!s->first_fd_owned || s->first_fd < 0)
+  int rc = LC_OK;
+  if (!s->first_storage.ops)
     return lc_ck_corrupt(error);
   if (!s->first_sealed) {
-    if (lc_ck_seal_private(s->first_fd) != 0)
-      return lc_ck_error(error, "failed to seal first collection inode");
-    s->first_sealed = 1;
+    rc = lc_collection_segment_sync_private(&s->first_storage, error);
+    if (rc == LC_OK)
+      s->first_sealed = 1;
   }
-  return LC_OK;
+  return rc;
 }
 
 static int lc_ck_region_release(lc_collection_handle *c,
@@ -286,9 +204,8 @@ static int lc_ck_region_release(lc_collection_handle *c,
    * a clean checkpoint subsequently syncs only the current active inode. */
   /* Binding seals the first segment after its final manifest update. */
   if (s->pending.segment != c->head.active &&
-      s->pending.segment != s->first.segment &&
-      lc_ck_seal_private(s->region_fd) != 0)
-    rc = lc_ck_error(error, "failed to seal private collection range");
+      s->pending.segment != s->first.segment)
+    rc = lc_collection_segment_sync_private(&s->region, error);
   if (rc == LC_OK && reuse && s->pending.segment == c->head.active &&
       s->pending.offset < s->region_end &&
       s->region_end - s->pending.offset >= 65536U + LC_COLLECTION_UNIT_HEADER) {
@@ -306,12 +223,19 @@ static int lc_ck_region_release(lc_collection_handle *c,
   return rc;
 }
 
-lc_u64 lc_collection_chunks_capacity(const lc_pouch *pouch) {
-  lc_u64 size = pouch->segment_target_bytes;
+lc_u64 lc_collection_chunks_capacity(const lc_collection_handle *collection) {
+  lc_u64 size = collection->pouch->segment_target_bytes;
+  lc_u64 limit = collection->segments.private_limit;
   if (size > LC_COLLECTION_CHUNK_MAX)
     size = LC_COLLECTION_CHUNK_MAX;
   if (size < 131072U)
     size = 131072U;
+  if (limit && size + 65536U + LC_COLLECTION_CHUNK_HEADER > limit) {
+    if (limit <=
+        65536U + LC_COLLECTION_UNIT_HEADER + LC_COLLECTION_CHUNK_HEADER)
+      return 0U;
+    size = limit - 65536U - LC_COLLECTION_CHUNK_HEADER;
+  }
   return size + 65536U - LC_COLLECTION_UNIT_HEADER;
 }
 
@@ -321,7 +245,8 @@ static int lc_ck_region_reserve(lc_collection_handle *c,
   lc_pouch_record_header header;
   unsigned char prefix[32];
   lc_u64 size, end;
-  off_t offset;
+  uint64_t offset;
+  struct iovec part;
   size_t i;
   int rc;
   rc = lc_collection_rotate_stream(c, error);
@@ -331,9 +256,9 @@ static int lc_ck_region_reserve(lc_collection_handle *c,
     lc_collection_region *idle = &c->stream_regions[i];
     if (idle->segment == c->head.active &&
         idle->end - idle->next >= minimum + LC_COLLECTION_UNIT_HEADER) {
-      s->region_fd = fcntl(c->active_fd, F_DUPFD_CLOEXEC, 0);
-      if (s->region_fd < 0)
-        return lc_ck_error(error, "failed to pin reusable collection range");
+      rc = lc_collection_segment_clone(&c->active, &s->region, error);
+      if (rc != LC_OK)
+        return rc;
       s->pending.segment = idle->segment;
       s->pending.offset = idle->next;
       s->region_end = idle->end;
@@ -341,10 +266,10 @@ static int lc_ck_region_reserve(lc_collection_handle *c,
       return LC_OK;
     }
   }
-  offset = lseek(c->active_fd, 0, SEEK_END);
-  if (offset < 0)
-    return lc_ck_error(error, "failed to seek collection range boundary");
-  size = lc_collection_chunks_capacity(c->pouch) + LC_COLLECTION_UNIT_HEADER;
+  rc = lc_pouch_record_io_tail(c->active.io, &offset, error);
+  if (rc != LC_OK)
+    return rc;
+  size = lc_collection_chunks_capacity(c) + LC_COLLECTION_UNIT_HEADER;
   if ((lc_u64)offset > (lc_u64)LC_I64_MAX - size - 32U)
     return lc_ck_corrupt(error);
   end = (lc_u64)offset + 32U + size;
@@ -352,17 +277,15 @@ static int lc_ck_region_reserve(lc_collection_handle *c,
   header.type = LC_POUCH_COLLECTION_REGION;
   header.payload_len = size;
   lc_pouch_record_header_encode(&header, prefix);
-  rc = lc_ck_pwrite(c->active_fd, prefix, sizeof(prefix), (lc_u64)offset, 0,
-                    error);
-  if (rc == LC_OK && ftruncate(c->active_fd, (off_t)end) != 0)
-    rc = lc_ck_error(error, "failed to reserve canonical collection range");
+  part.iov_base = prefix;
+  part.iov_len = sizeof(prefix);
+  rc = lc_pouch_record_io_append(c->active.io, &part, 1, error);
+  if (rc == LC_OK)
+    rc = lc_collection_segment_reserve(&c->active, end, error);
+  if (rc == LC_OK)
+    rc = lc_collection_segment_clone(&c->active, &s->region, error);
   if (rc != LC_OK)
-    return lc_ck_write_failed(c->active_fd, offset,
-                              "failed to reserve canonical collection range",
-                              error);
-  s->region_fd = fcntl(c->active_fd, F_DUPFD_CLOEXEC, 0);
-  if (s->region_fd < 0)
-    return lc_ck_error(error, "failed to pin canonical collection range");
+    return lc_ck_write_failed(&c->active, offset, rc, error);
   s->pending.segment = c->head.active;
   s->pending.offset = (lc_u64)offset + 32U;
   s->region_end = end;
@@ -404,7 +327,8 @@ int lc_collection_chunks_end_unit(lc_collection_handle *c,
   int rc;
   if (!ref.bytes || unit->stored != ref.bytes || unit->ordinal != s->extents)
     return lc_ck_corrupt(error);
-  rc = lc_collection_unit_write_meta(s->region_fd, ref.offset, unit, error);
+  rc =
+      lc_collection_unit_write_meta(s->region.unit_io, ref.offset, unit, error);
 #ifdef LOCKDC_TEST_BUILD
   if (rc == LC_OK)
     rc = lc_ck_phase(c, LC_COLLECTION_APPEND_CHUNK_WRITTEN, error);
@@ -413,13 +337,12 @@ int lc_collection_chunks_end_unit(lc_collection_handle *c,
     if (!s->extents) {
       s->first = ref;
       s->first_unit = *unit;
-      s->first_fd = fcntl(s->region_fd, F_DUPFD_CLOEXEC, 0);
-      if (s->first_fd < 0)
-        return lc_ck_error(error, "failed to pin first collection inode");
-      s->first_fd_owned = 1;
+      rc = lc_collection_segment_clone(&s->region, &s->first_storage, error);
     }
-    ++s->extents;
-    rc = lc_ck_push(c, s, ref, 0, error);
+    if (rc == LC_OK) {
+      ++s->extents;
+      rc = lc_ck_push(c, s, ref, 0, error);
+    }
   }
   if (rc == LC_OK) {
     s->pending.offset += LC_COLLECTION_UNIT_HEADER + ref.bytes;
@@ -473,17 +396,17 @@ int lc_collection_chunks_append(lc_collection_handle *c,
     header.meta_len = LC_COLLECTION_UNIT_META;
     header.flags = LC_POUCH_RECORD_FLAG_PENDING;
     lc_pouch_record_header_encode(&header, prefix);
-    rc = lc_ck_pwrite(s->region_fd, prefix, sizeof(prefix), s->pending.offset,
-                      0, error);
+    rc = lc_collection_segment_patch(&s->region, s->pending.offset, prefix,
+                                     sizeof(prefix), error);
     if (rc != LC_OK)
       return rc;
   }
   if (s->pending.segment == s->first.segment)
     s->first_sealed = 0;
-  rc = lc_ck_pwrite(s->region_fd, bytes, count,
-                    s->pending.offset + LC_COLLECTION_UNIT_HEADER +
-                        s->pending.bytes,
-                    0, error);
+  rc = lc_collection_segment_patch(
+      &s->region,
+      s->pending.offset + LC_COLLECTION_UNIT_HEADER + s->pending.bytes, bytes,
+      count, error);
   if (rc != LC_OK)
     return rc;
   s->pending.bytes += count;
@@ -499,10 +422,9 @@ int lc_collection_chunks_bind(lc_collection_handle *c, lc_collection_chunks *s,
                               lc_pouch_collection_record *record,
                               lc_error *error) {
   char binding[256], *descriptor = NULL;
-  int fd = s->first_fd;
   int rc = lc_collection_unit_manifest(record, c->id, NULL, binding,
                                        record->manifest, error);
-  if (rc != LC_OK || !s->first.segment || !s->first_fd_owned || fd < 0)
+  if (rc != LC_OK || !s->first.segment || !s->first_storage.ops)
     return rc != LC_OK ? rc : lc_ck_corrupt(error);
   if (s->first_unit.descriptor[0])
     rc = lc_pouch_crypto_rebind_descriptor(
@@ -559,80 +481,74 @@ int lc_collection_chunks_finish(lc_collection_handle *c,
   }
   return lc_ck_corrupt(e);
 }
-static int lc_ck_fd(lc_collection_chunk_reader *r, lc_u64 segment,
-                    lc_u64 offset, int index, int *fd, lc_error *e) {
-  char leaf[64];
+lc_collection_read_storage
+lc_collection_chunks_file_access(lc_collection_chunk_reader *r,
+                                 const char *directory) {
+  if (r->initialized && r->storage.context == &r->files &&
+      strcmp(r->files.directory, directory))
+    lc_collection_chunks_reader_close(r);
+  if (!r->initialized)
+    lc_collection_file_reads_init(&r->files, directory);
+  return lc_collection_file_reads_access(&r->files);
+}
+static void lc_ck_close_input(lc_collection_chunk_reader *r,
+                              lc_collection_read_handle *handle) {
+  if (handle->input.ops)
+    r->storage.close(r->storage.context, handle->pin);
+  memset(handle, 0, sizeof(*handle));
+}
+static int lc_ck_input(lc_collection_chunk_reader *r, lc_u64 segment,
+                       lc_u64 offset, int index, lc_pouch_record_io *input,
+                       lc_error *e) {
   lc_u64 window = offset / LC_COLLECTION_REGION_MAX;
-  lc_collection_read_handle *slot = NULL;
+  lc_collection_read_handle *slot = &r->index;
+  lc_pouch_record_io opened;
+  void *pin = NULL;
   size_t i;
   int rc;
   if (index && segment == r->publication_segment) {
-    *fd = r->publication_fd;
+    *input = r->publication;
     return LC_OK;
   }
-  if (index && r->index_fd >= 0 && r->index_segment == segment) {
-    *fd = r->index_fd;
+  if (index && r->index.input.ops && r->index.segment == segment) {
+    *input = r->index.input;
     return LC_OK;
   }
   if (!index) {
+    slot = NULL;
     ++r->handle_clock;
     for (i = 0; i < LC_COLLECTION_READ_HANDLES; ++i) {
       lc_collection_read_handle *candidate = &r->handles[i];
-      if (candidate->fd >= 0 && candidate->segment == segment &&
+      if (candidate->input.ops && candidate->segment == segment &&
           candidate->window == window) {
         candidate->used = r->handle_clock;
-        *fd = candidate->fd;
+        *input = candidate->input;
         return LC_OK;
       }
-      if (!slot || candidate->fd < 0 ||
-          (slot->fd >= 0 && candidate->used < slot->used))
+      if (!slot || !candidate->input.ops ||
+          (slot->input.ops && candidate->used < slot->used))
         slot = candidate;
     }
   }
-  rc = lc_collection_record_leaf(segment, leaf, e);
+  memset(&opened, 0, sizeof(opened));
+  rc = r->storage.open(r->storage.context, segment, &opened, &pin, e);
   if (rc != LC_OK)
     return rc;
-  if (r->directory_fd < 0) {
-    r->directory_fd = open(r->directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (r->directory_fd < 0)
-      return lc_ck_error(e, "failed to open collection read directory");
-  }
-  if (index) {
-    if (r->index_fd >= 0)
-      (void)close(r->index_fd);
-    r->index_fd = openat(r->directory_fd, leaf, O_RDONLY | O_CLOEXEC);
-    r->index_segment = segment;
-    *fd = r->index_fd;
-  } else {
-    if (slot->fd >= 0)
-      (void)close(slot->fd);
-    slot->fd = openat(r->directory_fd, leaf, O_RDONLY | O_CLOEXEC);
-    slot->segment = segment;
-    slot->window = window;
-    slot->used = r->handle_clock;
-    *fd = slot->fd;
-  }
-  return *fd >= 0 ? LC_OK : lc_ck_error(e, "failed to open collection extent");
-}
-static int lc_ck_read(int fd, void *bytes, size_t count, lc_u64 offset,
-                      lc_error *e) {
-  unsigned char *p = bytes;
-  ssize_t got;
-  if (offset > (lc_u64)LC_I64_MAX || count > (lc_u64)LC_I64_MAX - offset)
-    return lc_ck_corrupt(e);
-  while (count) {
-    got = pread(fd, p, count, (off_t)offset);
-    if (got < 0 && errno == EINTR)
-      continue;
-    if (got < 0)
-      return lc_ck_error(e, "failed to read collection extent");
-    if (!got)
-      return lc_ck_corrupt(e);
-    p += got;
-    count -= (size_t)got;
-    offset += (size_t)got;
-  }
+  lc_ck_close_input(r, slot);
+  slot->input = opened;
+  slot->pin = pin;
+  slot->segment = segment;
+  slot->window = window;
+  slot->used = r->handle_clock;
+  *input = opened;
   return LC_OK;
+}
+static int lc_ck_read(lc_pouch_record_io input, void *bytes, size_t count,
+                      lc_u64 offset, lc_error *e) {
+  struct iovec part;
+  part.iov_base = bytes;
+  part.iov_len = count;
+  return lc_pouch_record_io_read(input, offset, &part, 1, e);
 }
 static int lc_ck_before(const lc_collection_chunk_ref *ref, unsigned int height,
                         lc_u64 segment, lc_u64 offset) {
@@ -656,10 +572,11 @@ static int lc_ck_node(lc_collection_chunk_reader *r,
                       lc_error *e) {
   lc_collection_chunk_frame *frame = &r->frames[r->depth];
   lc_pouch_record_header header;
-  int fd = -1, rc = lc_ck_fd(r, ref->segment, ref->offset, 1, &fd, e);
+  lc_pouch_record_io input;
+  int rc = lc_ck_input(r, ref->segment, ref->offset, 1, &input, e);
   if (rc == LC_OK)
-    rc =
-        lc_ck_read(fd, frame->encoded, (size_t)ref->bytes + 40, ref->offset, e);
+    rc = lc_ck_read(input, frame->encoded, (size_t)ref->bytes + 40, ref->offset,
+                    e);
   if (rc == LC_OK)
     rc = lc_pouch_record_header_decode(frame->encoded, &header, e);
   if (rc != LC_OK)
@@ -725,13 +642,15 @@ static int lc_ck_next(lc_collection_chunk_reader *r, int *found, lc_error *e) {
   return LC_OK;
 }
 static int lc_ck_payload_span(lc_collection_chunk_reader *r,
-                              const lc_collection_chunk_ref *ref, int *fd,
-                              lc_u64 *offset, lc_error *error) {
+                              const lc_collection_chunk_ref *ref,
+                              lc_pouch_record_io *input, lc_u64 *offset,
+                              lc_error *error) {
   char context[256];
   lc_u64 ordinal = r->extent_count - r->extents_remaining;
-  int rc = lc_ck_fd(r, ref->segment, ref->offset, 0, fd, error);
+  int rc = lc_ck_input(r, ref->segment, ref->offset, 0, input, error);
   if (rc == LC_OK)
-    rc = lc_collection_unit_read(*fd, ref->offset, ref->bytes, &r->unit, error);
+    rc = lc_collection_unit_read(*input, ref->offset, ref->bytes, &r->unit,
+                                 error);
   if (rc != LC_OK)
     return rc;
   if (r->unit.ordinal != ordinal || r->unit.plain > r->plaintext ||
@@ -755,7 +674,8 @@ static int lc_ck_payload_span(lc_collection_chunk_reader *r,
 }
 
 int lc_collection_chunks_next_unit(lc_collection_chunk_reader *r, int *found,
-                                   int *fd, lc_collection_chunk_ref *ref,
+                                   lc_pouch_record_io *input,
+                                   lc_collection_chunk_ref *ref,
                                    lc_collection_unit *unit, lc_error *error) {
   lc_u64 offset;
   int rc;
@@ -770,7 +690,7 @@ int lc_collection_chunks_next_unit(lc_collection_chunk_reader *r, int *found,
                : LC_OK;
   if (!r->extents_remaining || r->current.bytes > r->remaining)
     return lc_ck_corrupt(error);
-  rc = lc_ck_payload_span(r, &r->current, fd, &offset, error);
+  rc = lc_ck_payload_span(r, &r->current, input, &offset, error);
   if (rc != LC_OK)
     return rc;
   if (r->unit.descriptor[0] || lc_pouch_crypto_enabled(r->crypto)) {
@@ -798,10 +718,11 @@ int lc_collection_chunks_visit(lc_collection_chunk_reader *r,
   lc_collection_chunk_ref seen[LC_COLLECTION_CHUNK_LEVELS], ref;
   lc_collection_unit unit;
   unsigned int i;
-  int fd, found, rc;
+  lc_pouch_record_io input;
+  int found, rc;
   memset(seen, 0, sizeof(seen));
   for (;;) {
-    rc = lc_collection_chunks_next_unit(r, &found, &fd, &ref, &unit, error);
+    rc = lc_collection_chunks_next_unit(r, &found, &input, &ref, &unit, error);
     if (rc != LC_OK || !found)
       return rc;
     /* The iterator already validated this complete path. Observe a new page
@@ -822,13 +743,14 @@ int lc_collection_chunks_visit(lc_collection_chunk_reader *r,
   }
 }
 
-int lc_collection_chunks_single(lc_collection_chunk_reader *r, int *fd,
-                                lc_u64 *offset, lc_error *error) {
+int lc_collection_chunks_single(lc_collection_chunk_reader *r,
+                                lc_pouch_record_io *input, lc_u64 *offset,
+                                lc_error *error) {
   int rc;
   if (!r->initialized || r->height || r->extent_count != 1)
     return lc_collection_failure(error, LC_ERR_INVALID, NULL,
                                  "collection body is not one contiguous span");
-  rc = lc_ck_payload_span(r, &r->root, fd, offset, error);
+  rc = lc_ck_payload_span(r, &r->root, input, offset, error);
   if (rc == LC_OK && r->unit.plain != r->record->bytes)
     return lc_ck_corrupt(error);
   return rc;
@@ -839,7 +761,8 @@ static size_t lc_ck_reader_read(lc_source *source, void *bytes, size_t capacity,
   lc_collection_chunk_reader *r = source->impl;
   unsigned char *p = bytes;
   size_t take, used = 0;
-  int fd = -1, found, rc;
+  lc_pouch_record_io input;
+  int found, rc;
   lc_u64 offset;
   if (!capacity)
     return 0;
@@ -857,42 +780,33 @@ static size_t lc_ck_reader_read(lc_source *source, void *bytes, size_t capacity,
         lc_ck_corrupt(e);
         return 0;
       }
-      rc = lc_ck_payload_span(r, &r->current, &fd, &offset, e);
+      rc = lc_ck_payload_span(r, &r->current, &input, &offset, e);
       if (rc != LC_OK)
         return 0;
-      r->current_fd = fd;
-      r->offset = offset;
+      rc = lc_pouch_record_span_bind(&r->encoded_input, input, offset,
+                                     r->unit.stored, NULL, 0U, e);
+      if (rc != LC_OK)
+        return 0;
       r->extent_remaining = r->unit.plain;
-      r->decoded = NULL;
+      r->decoded = &r->encoded_input.source;
       if (r->unit.descriptor[0] || lc_pouch_crypto_enabled(r->crypto)) {
         if (!r->decoder) {
           rc = lc_pouch_crypto_reader_open(r->crypto, &r->decoder, e);
           if (rc != LC_OK)
             return 0;
         }
-        rc = lc_pouch_crypto_reader_bind(
-            r->decoder, r->unit.context, r->unit.context, fd, offset,
-            r->unit.stored, r->unit.descriptor, &r->decoded, e);
+        rc = lc_pouch_crypto_reader_bind_source(
+            r->decoder, r->unit.context, r->unit.context,
+            &r->encoded_input.source, r->unit.stored, r->unit.descriptor,
+            &r->decoded, e);
         if (rc != LC_OK)
           return 0;
       }
       r->unit_active = 1;
     }
-    if (r->decoded) {
-      take = r->decoded->read(r->decoded, p, capacity, e);
-      if (e && e->code != LC_OK)
-        return 0;
-    } else {
-      lc_u64 remaining = r->unit.stored - (r->offset - r->current.offset -
-                                           LC_COLLECTION_UNIT_HEADER);
-      take = remaining < capacity ? (size_t)remaining : capacity;
-      if (take) {
-        rc = lc_ck_read(r->current_fd, p, take, r->offset, e);
-        if (rc != LC_OK)
-          return 0;
-        r->offset += take;
-      }
-    }
+    take = r->decoded->read(r->decoded, p, capacity, e);
+    if (e && e->code != LC_OK)
+      return 0;
     if (take > capacity || (lc_u64)take > r->extent_remaining ||
         (lc_u64)take > r->plaintext) {
       lc_ck_corrupt(e);
@@ -928,24 +842,23 @@ static int lc_ck_reset(lc_source *s, lc_error *e) {
   r->remaining = r->length;
   r->extents_remaining = r->extent_count;
   r->extent_remaining = 0;
-  r->current_fd = -1;
   r->started = 0;
   r->depth = 0;
   return LC_OK;
 }
-int lc_collection_chunks_open(lc_collection_chunk_reader *r,
-                              const lc_allocator *allocator,
-                              lc_pouch_crypto *crypto,
-                              const char *collection_id, const char *directory,
-                              int fd, const lc_pouch_collection_record *record,
-                              lc_error *e) {
+int lc_collection_chunks_open(
+    lc_collection_chunk_reader *r, const lc_allocator *allocator,
+    lc_pouch_crypto *crypto, const char *collection_id,
+    lc_collection_read_storage storage, lc_pouch_record_io publication_input,
+    const lc_pouch_collection_record *record, lc_error *e) {
   lc_collection_chunk_ref root;
   lc_u64 publication;
   root.segment = record->stream_segment;
   root.offset = record->stream_offset;
   root.bytes = record->stream_root_bytes;
-  if (fd < 0 || (strncmp(record->payload_container, "seg-", 4) &&
-                 strncmp(record->payload_container, "snapshot-", 9)))
+  if (!publication_input.ops || !storage.open || !storage.close ||
+      (strncmp(record->payload_container, "seg-", 4) &&
+       strncmp(record->payload_container, "snapshot-", 9)))
     return lc_ck_corrupt(e);
   {
     size_t prefix = !strncmp(record->payload_container, "seg-", 4) ? 4U : 9U;
@@ -963,13 +876,16 @@ int lc_collection_chunks_open(lc_collection_chunk_reader *r,
       (!record->stream_height &&
        (record->stream_extents != 1 || root.bytes != record->stored_bytes)))
     return lc_ck_corrupt(e);
+  if (r->initialized && (r->storage.open != storage.open ||
+                         r->storage.context != storage.context))
+    lc_collection_chunks_reader_close(r);
   if (!r->initialized) {
-    size_t i;
-    for (i = 0; i < LC_COLLECTION_READ_HANDLES; ++i)
-      r->handles[i].fd = -1;
-    r->index_fd = r->directory_fd = -1;
+    memset(r->handles, 0, sizeof(r->handles));
+    memset(&r->index, 0, sizeof(r->index));
+    r->files.fd = -1;
     r->initialized = 1;
   }
+  r->storage = storage;
   r->source.read = lc_ck_reader_read;
   r->source.reset = lc_ck_reset;
   r->source.impl = r;
@@ -993,27 +909,24 @@ int lc_collection_chunks_open(lc_collection_chunk_reader *r,
         return rc;
     }
   }
-  r->directory = directory;
   r->allocator = allocator;
   r->root = root;
   r->height = record->stream_height;
   r->length = record->stored_bytes;
   r->extent_count = record->stream_extents;
-  r->publication_fd = fd;
+  r->publication = publication_input;
   r->publication_segment = publication;
   r->publication_offset = record->payload_record_offset;
   return lc_ck_reset(&r->source, e);
 }
 void lc_collection_chunks_reader_close(lc_collection_chunk_reader *r) {
   size_t i;
-  if (r->initialized)
+  if (r->initialized) {
     for (i = 0; i < LC_COLLECTION_READ_HANDLES; ++i)
-      if (r->handles[i].fd >= 0)
-        (void)close(r->handles[i].fd);
-  if (r->initialized && r->index_fd >= 0)
-    (void)close(r->index_fd);
-  if (r->initialized && r->directory_fd >= 0)
-    (void)close(r->directory_fd);
+      lc_ck_close_input(r, &r->handles[i]);
+    lc_ck_close_input(r, &r->index);
+    lc_collection_file_reads_cleanup(&r->files);
+  }
   lc_pouch_crypto_reader_close(r->decoder);
   r->decoder = NULL;
   EVP_MD_CTX_free(r->manifest);

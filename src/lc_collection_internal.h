@@ -7,6 +7,7 @@
 #include "lc_collection_maintenance.h"
 #include "lc_collection_migration.h"
 #include "lc_collection_order.h"
+#include "lc_collection_storage.h"
 #include "lc_pouch_collection_record.h"
 #include "lc_pouch_internal.h"
 
@@ -39,7 +40,17 @@ typedef struct lc_collection_handle {
   int metadata_fd;
   int append_fd;
   int active_fd;
+  lc_collection_segment active;
   int streams_fd;
+  lc_collection_file_reads native_reads;
+  lc_collection_read_storage reads;
+  lc_collection_authority authority;
+  lc_collection_segments segments;
+  lc_collection_control control;
+  lc_collection_projections projections;
+  lc_collection_layout layout;
+  lc_collection_owner owner;
+  lc_collection_lock metadata_pin, streams_pin;
   unsigned long stream_writers;
   lc_collection_region stream_regions[LC_COLLECTION_IDLE_REGIONS];
   /* Keep the immutable cached head inode alive across atomic replacements:
@@ -87,11 +98,16 @@ typedef struct lc_collection_guard {
   lc_collection_call *call;
   int mode;
   int append;
-  int commit_fd;
+  lc_collection_lock commit_pin, append_pin;
 } lc_collection_guard;
 
 int lc_collection_call_begin(lc_collection *self, int mutating,
                              lc_collection_call *call, lc_error *error);
+int lc_collection_owned_open(lc_pouch *, lc_client_handle *, const char *ns,
+                             const char *name, const char *id,
+                             lc_collection_owner, lc_collection **, lc_error *);
+int lc_collection_file_catalog_bound(lc_collection_handle *, lc_error *);
+int lc_collection_file_catalog_remove(lc_collection_handle *, lc_error *);
 void lc_collection_call_end(lc_collection_call *call);
 /* A writer owns this independent reference, including after public close. */
 void lc_collection_handle_hold(lc_collection_handle *collection);
@@ -130,9 +146,10 @@ void lc_collection_metadata_leave(lc_collection_handle *collection);
  * Release before callbacks. Appenders take their shared commit pin only after
  * consuming the source, so callback reads may still capture the previous view.
  */
-int lc_collection_capture_enter(lc_collection_handle *collection, int *pin,
-                                lc_error *error);
-void lc_collection_capture_leave(lc_collection_handle *collection, int *pin);
+int lc_collection_capture_enter(lc_collection_handle *collection,
+                                lc_collection_lock *pin, lc_error *error);
+void lc_collection_capture_leave(lc_collection_handle *collection,
+                                 lc_collection_lock *pin);
 /* Order for mutations: root, catalog, join/session, append, commit, metadata.
  * Snapshot capture prepares before taking commit authority and never waits
  * for append authority behind it. Root-only scopes
@@ -204,30 +221,28 @@ int lc_collection_lookup_id(lc_collection_handle *collection,
 int lc_collection_prepare(lc_collection_handle *collection, lc_error *error);
 /* Called under metadata authority; pins one canonical topology until close. */
 int lc_collection_read_pin(lc_collection_handle *collection, lc_u64 snapshot,
-                           int *fd, lc_error *error);
+                           lc_collection_lock *, lc_error *error);
 int lc_collection_refresh_view(lc_collection_handle *collection,
                                lc_error *error);
-int lc_collection_record_file(lc_collection_handle *, lc_u64, int *, lc_u64 *,
-                              lc_u64 *, lc_error *);
+int lc_collection_record_input(lc_collection_handle *, lc_u64,
+                               lc_collection_input *, lc_error *);
 int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
-                             lc_u64 offset, int *fd, lc_u64 *fd_segment,
-                             lc_u64 *fd_end, lc_pouch_collection_record *out,
-                             lc_error *error);
+                             lc_u64 offset, lc_collection_input *,
+                             lc_pouch_collection_record *out, lc_error *error);
 int lc_collection_record_ref_prefix(lc_collection_handle *, lc_u64, lc_u64,
-                                    int *, lc_u64 *, lc_u64 *,
+                                    lc_collection_input *,
                                     lc_pouch_collection_record *, void *,
                                     size_t, size_t *, lc_error *);
 /* Resolves metadata history for a pinned read generation. The current record
- * must already be loaded, and fd describes it. Only bounded metadata is read.
+ * must already be loaded, and input pins it. Only bounded metadata is read.
  */
 int lc_collection_record_at(lc_collection_handle *collection, lc_u64 generation,
-                            int *fd, lc_u64 *fd_segment, lc_u64 *fd_end,
+                            lc_collection_input *,
                             lc_pouch_collection_record *record,
                             lc_error *error);
 int lc_collection_record_body(lc_collection_handle *collection,
-                              const lc_pouch_collection_record *record, int *fd,
-                              lc_u64 *fd_segment, lc_u64 *fd_end,
-                              lc_error *error);
+                              const lc_pouch_collection_record *record,
+                              lc_collection_input *, lc_error *error);
 int lc_collection_record_path(lc_collection_handle *collection, lc_u64 segment,
                               char **out, char leaf[64], lc_error *error);
 int lc_collection_record_leaf(lc_u64 segment, char leaf[64], lc_error *error);
@@ -244,7 +259,7 @@ int lc_collection_edit_status_method(lc_collection *, const char *,
                                      lc_collection_edit_status_res *,
                                      lc_error *);
 int lc_collection_edit_project(lc_collection_handle *, lc_collection_order *,
-                               lc_collection_ids *, int,
+                               lc_collection_ids *, lc_pouch_record_io,
                                const lc_pouch_collection_record *,
                                const lc_pouch_collection_record *, lc_u64, int,
                                lc_error *);

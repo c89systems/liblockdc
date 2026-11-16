@@ -1,4 +1,5 @@
 #include "pouch.h"
+#include "collections.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
@@ -492,6 +493,20 @@ static void txn_guard_release(void *context, void *handle) {
   pthread_mutex_unlock(handle);
   release(context);
 }
+static int collection_open(void *context, lc_client *client, const char *ns,
+                           const lc_collection_config *config, int create,
+                           lc_collection **out, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_collection_client_open(owner->root, client, ns, config, create, out,
+                                   e);
+}
+static int collections_visit(void *context, lc_client *client, const char *ns,
+                             lc_collection_visit_fn visitor, void *opaque,
+                             lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_collection_client_visit(owner->root, client, ns, visitor, opaque,
+                                    e);
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -511,7 +526,9 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  retention_hint_next,
                                                  txn_guard_lock,
                                                  txn_guard_release,
-                                                 release};
+                                                 release,
+                                                 collection_open,
+                                                 collections_visit};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

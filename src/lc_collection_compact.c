@@ -41,7 +41,7 @@ typedef struct lc_compact {
   char *stable_ids_path;
   unsigned char *buffer;
   int lock_fd;
-  int pin_fd;
+  lc_collection_lock view_pin;
   int snapshot_fd;
   int path_owned;
   int order_owned;
@@ -135,7 +135,7 @@ static int lc_cm_capture(lc_compact *work, int force, int *selected,
                                 "collection snapshot identities are exhausted");
     if (rc == LC_OK)
       rc = lc_collection_read_pin(collection, collection->head.snapshot,
-                                  &work->pin_fd, error);
+                                  &work->view_pin, error);
     if (rc == LC_OK) {
       work->captured = collection->order;
       work->captured.fd = dup(collection->order.fd);
@@ -308,8 +308,9 @@ static int lc_cm_index(void *context, unsigned int level, const void *tuples,
   int rc = lc_cm_roll(work, 40U + count, error);
   if (rc == LC_OK)
     rc = lc_collection_chunks_write_index(
-        work->snapshot_fd, work->part_snapshot | LC_COLLECTION_SNAPSHOT_BIT,
-        level, tuples, count, ref, error);
+        lc_collection_unit_file_io(work->snapshot_fd),
+        work->part_snapshot | LC_COLLECTION_SNAPSHOT_BIT, level, tuples, count,
+        ref, error);
   return rc;
 }
 
@@ -341,15 +342,16 @@ static int lc_cm_stream(lc_compact *work, lc_collection_chunk_reader *reader,
   lc_u64 remaining, offset;
   off_t output;
   unsigned long crc;
-  ssize_t n;
+  lc_pouch_record_io input;
+  struct iovec part;
   size_t want;
-  int found, fd = -1, rc;
+  int found, rc;
   memset(work->chunks, 0, sizeof(*work->chunks));
   work->chunks->append_index = lc_cm_index;
   work->chunks->index_context = work;
   for (;;) {
-    rc =
-        lc_collection_chunks_next_unit(reader, &found, &fd, &ref, &unit, error);
+    rc = lc_collection_chunks_next_unit(reader, &found, &input, &ref, &unit,
+                                        error);
     if (rc != LC_OK || !found)
       break;
     rc = lc_cm_roll(work, LC_COLLECTION_UNIT_HEADER + unit.stored, error);
@@ -379,30 +381,26 @@ static int lc_cm_stream(lc_compact *work, lc_collection_chunk_reader *reader,
     while (rc == LC_OK && remaining) {
       want = remaining < LC_CM_BUFFER_BYTES ? (size_t)remaining
                                             : LC_CM_BUFFER_BYTES;
-      do {
-        n = pread(fd, work->buffer, want, (off_t)offset);
-      } while (n < 0 && errno == EINTR);
-      if (n <= 0) {
-        rc = lc_collection_failure(error,
-                                   n < 0 ? LC_ERR_TRANSPORT : LC_ERR_PROTOCOL,
-                                   n < 0 ? NULL : "collection_corrupt",
-                                   "failed to read collection codec unit");
+      part.iov_base = work->buffer;
+      part.iov_len = want;
+      rc = lc_pouch_record_io_read(input, offset, &part, 1, error);
+      if (rc != LC_OK)
         break;
-      }
-      crc = (unsigned long)crc32((uLong)crc, work->buffer, (uInt)n);
-      rc = lc_cm_write(work->snapshot_fd, work->buffer, (size_t)n, error);
+      crc = (unsigned long)crc32((uLong)crc, work->buffer, (uInt)want);
+      rc = lc_cm_write(work->snapshot_fd, work->buffer, want, error);
       if (rc == LC_OK)
-        rc = lc_pouch_state_compaction_throttle(work->collection->pouch,
-                                                (size_t)n, error);
-      offset += (lc_u64)n;
-      remaining -= (lc_u64)n;
+        rc = lc_pouch_state_compaction_throttle(work->collection->pouch, want,
+                                                error);
+      offset += want;
+      remaining -= want;
     }
     if (rc == LC_OK && crc != unit.crc)
       rc = lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                  "collection codec unit checksum is invalid");
     if (rc == LC_OK)
-      rc = lc_collection_unit_write_meta(work->snapshot_fd, (lc_u64)output,
-                                         &unit, error);
+      rc = lc_collection_unit_write_meta(
+          lc_collection_unit_file_io(work->snapshot_fd), (lc_u64)output, &unit,
+          error);
     if (rc != LC_OK)
       break;
     copied.segment = work->part_snapshot | LC_COLLECTION_SNAPSHOT_BIT;
@@ -432,16 +430,12 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
   lc_pouch_collection_record relocated;
   lc_collection_handle *collection;
   lc_u64 ordinal;
-  lc_u64 file_segment;
-  lc_u64 file_end;
-  lc_u64 body_segment, body_end;
+  lc_collection_input input, body_input;
   lc_u64 segment;
   char source_leaf[64];
   size_t count;
   size_t capacity;
   size_t i;
-  int fd;
-  int body_fd;
   int rc;
   collection = work->collection;
   rows = lc_alloc_with_allocator(&collection->allocator,
@@ -450,10 +444,8 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
     return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
                                  "failed to allocate compaction row page");
   ordinal = 0U;
-  file_segment = file_end = 0U;
-  body_segment = body_end = 0U;
-  fd = -1;
-  body_fd = -1;
+  memset(&input, 0, sizeof(input));
+  memset(&body_input, 0, sizeof(body_input));
   rc = LC_OK;
   while (rc == LC_OK && ordinal < work->count) {
     rc = lc_collection_metadata_enter(collection, 0, error);
@@ -474,12 +466,11 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
     for (i = 0U; rc == LC_OK && i < count; ++i) {
       segment = rows[i].segment;
       rc = lc_collection_record_ref(collection, segment, rows[i].record_offset,
-                                    &fd, &file_segment, &file_end, &source,
-                                    error);
+                                    &input, &source, error);
       if (rc == LC_OK)
-        rc = lc_collection_record_at(collection, work->generation, &fd,
-                                     &file_segment, &file_end, &source, error);
-      segment = file_segment;
+        rc = lc_collection_record_at(collection, work->generation, &input,
+                                     &source, error);
+      segment = input.segment;
       if (rc != LC_OK)
         break;
       if (source.position != rows[i].position ||
@@ -496,8 +487,8 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
         rc = lc_cm_roll(work, 2048U, error);
         if (rc == LC_OK)
           rc = lc_pouch_collection_record_delete(
-              collection->pouch, work->snapshot_fd, &source, rows[i].deleted_at,
-              &copied, error);
+              collection->pouch, lc_pouch_record_file_io(work->snapshot_fd),
+              &source, rows[i].deleted_at, &copied, error);
         if (rc == LC_OK)
           rc = lc_collection_project_record(
               &work->order, &work->ids, &copied,
@@ -512,13 +503,12 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
       if (rc == LC_OK)
         rc = lc_collection_record_leaf(segment, source_leaf, error);
       if (rc == LC_OK && source.metadata_only)
-        rc = lc_collection_record_body(collection, &source, &body_fd,
-                                       &body_segment, &body_end, error);
+        rc = lc_collection_record_body(collection, &source, &body_input, error);
       if (rc == LC_OK && source.stream_extents)
         rc = lc_collection_chunks_open(
             &chunks, &collection->allocator, collection->pouch->crypto,
-            collection->id, collection->directory,
-            source.metadata_only ? body_fd : fd, &source, error);
+            collection->id, collection->reads,
+            source.metadata_only ? body_input.io : input.io, &source, error);
       if (rc == LC_OK && source.stream_extents)
         rc = lc_cm_stream(work, &chunks, &source, &relocated, error);
       if (rc == LC_OK)
@@ -527,10 +517,11 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
             error);
       if (rc == LC_OK)
         rc = lc_pouch_collection_record_copy_source(
-            collection->pouch, fd, source.metadata_only ? body_fd : fd,
+            collection->pouch, input.io,
+            source.metadata_only ? body_input.io : input.io,
             source.stream_extents ? &relocated : NULL, source_leaf, &source,
-            work->snapshot_fd, work->leaf, work->buffer, LC_CM_BUFFER_BYTES,
-            &copied, error);
+            lc_pouch_record_file_io(work->snapshot_fd), work->leaf,
+            work->buffer, LC_CM_BUFFER_BYTES, &copied, error);
       if (rc == LC_OK)
         rc = lc_collection_project_record(
             &work->order, &work->ids, &copied,
@@ -538,10 +529,8 @@ static int lc_cm_copy(lc_compact *work, lc_error *error) {
     }
     ordinal += (lc_u64)count;
   }
-  if (fd >= 0)
-    (void)close(fd);
-  if (body_fd >= 0)
-    (void)close(body_fd);
+  lc_collection_input_close(&input);
+  lc_collection_input_close(&body_input);
   lc_free_with_allocator(&collection->allocator, rows);
   lc_collection_chunks_reader_close(&chunks);
   if (rc == LC_OK && work->captured_ids.count > work->count)
@@ -676,8 +665,7 @@ static void lc_cm_release(lc_compact *work) {
   lc_collection_ids_close(&work->ids);
   if (work->snapshot_fd >= 0)
     (void)close(work->snapshot_fd);
-  if (work->pin_fd >= 0)
-    (void)close(work->pin_fd);
+  lc_collection_lock_leave(&work->view_pin);
   if (work->path_owned && !work->commit_attempted) {
     lc_error_init(&ignored);
     for (part = 0; part < work->parts; ++part) {
@@ -711,7 +699,7 @@ int lc_collection_compact(lc_collection *self, int force, int cleanup_only,
   int selected;
   int rc;
   memset(&work, 0, sizeof(work));
-  work.lock_fd = work.pin_fd = work.snapshot_fd = -1;
+  work.lock_fd = work.snapshot_fd = -1;
   work.captured_ids.fd = -1;
   work.captured.fd = work.order.fd = work.ids.fd = -1;
   rc = lc_collection_call_begin(self, 1, &work.call, error);

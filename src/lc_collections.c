@@ -144,39 +144,21 @@ static char *lc_cc_path(lc_collection_handle *collection, const char *leaf) {
 /* Distinct open descriptions are required: flock on a receiver-owned fd would
  * let concurrent calls on that receiver upgrade each other's shared pins. */
 static int lc_cc_commit_enter(lc_collection_handle *collection, int exclusive,
-                              int *pin, lc_error *error) {
-  char *path;
-  int rc;
-  *pin = -1;
-  path = lc_cc_path(collection, ".commit.lock");
-  if (path == NULL)
-    return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
-                                 "failed to allocate collection commit pin");
-  *pin = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  lc_free_with_allocator(&collection->allocator, path);
-  if (*pin < 0)
-    return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                 "failed to open collection commit pin");
-  rc = lc_cc_lock(*pin, exclusive ? LOCK_EX : LOCK_SH, error);
-  if (rc != LC_OK) {
-    (void)close(*pin);
-    *pin = -1;
-  }
-  return rc;
+                              lc_collection_lock *pin, lc_error *error) {
+  return lc_collection_lock_enter(collection->authority,
+                                  LC_COLLECTION_AUTH_COMMIT, 0U, exclusive, 1,
+                                  pin, error);
 }
-
-static void lc_cc_commit_leave(int *pin) {
-  if (*pin >= 0)
-    (void)close(*pin);
-  *pin = -1;
+static void lc_cc_commit_leave(lc_collection_lock *pin) {
+  lc_collection_lock_leave(pin);
 }
 
 static int lc_cc_order_refresh(lc_collection_handle *, lc_error *);
 
-int lc_collection_capture_enter(lc_collection_handle *collection, int *pin,
-                                lc_error *error) {
+int lc_collection_capture_enter(lc_collection_handle *collection,
+                                lc_collection_lock *pin, lc_error *error) {
   int rc;
-  *pin = -1;
+  memset(pin, 0, sizeof(*pin));
   /* Prepare can need append authority. Never acquire it behind the exclusive
    * commit pin: an appender may already own it and be waiting for a shared pin.
    */
@@ -207,7 +189,8 @@ int lc_collection_capture_enter(lc_collection_handle *collection, int *pin,
   return rc;
 }
 
-void lc_collection_capture_leave(lc_collection_handle *collection, int *pin) {
+void lc_collection_capture_leave(lc_collection_handle *collection,
+                                 lc_collection_lock *pin) {
   lc_collection_metadata_leave(collection);
   lc_cc_commit_leave(pin);
 }
@@ -234,19 +217,10 @@ static int lc_cc_same_collection(lc_collection_handle *a,
 }
 
 int lc_collection_read_pin(lc_collection_handle *collection, lc_u64 snapshot,
-                           int *fd, lc_error *error) {
-  char number[32];
-  char leaf[64];
-  int rc;
-  if (lc_u64_format_base10_padded(snapshot, 20U, number, sizeof(number)) < 0)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, NULL,
-                                 "failed to format collection read generation");
-  snprintf(leaf, sizeof(leaf), ".readers-%s.lock", number);
-  rc = lc_cc_open_file(collection, leaf, O_RDWR | O_CREAT | O_CLOEXEC, fd,
-                       error);
-  if (rc == LC_OK)
-    rc = lc_cc_lock(*fd, LOCK_SH, error);
-  return rc;
+                           lc_collection_lock *pin, lc_error *error) {
+  return lc_collection_lock_enter(collection->authority,
+                                  LC_COLLECTION_AUTH_READERS, snapshot, 0, 1,
+                                  pin, error);
 }
 
 static int lc_cc_call_begin(lc_collection *self, int mutating, int held,
@@ -349,7 +323,6 @@ static int lc_cc_root_enter(lc_pouch *pouch, lc_collection_call *call,
   int borrowed;
   int rc;
   memset(guard, 0, sizeof(*guard));
-  guard->commit_fd = -1;
   guard->pouch = pouch;
   guard->call = call;
   borrowed = 0;
@@ -378,7 +351,7 @@ static int lc_cc_root_enter(lc_pouch *pouch, lc_collection_call *call,
 }
 
 static void lc_cc_root_leave(lc_collection_guard *guard) {
-  lc_cc_commit_leave(&guard->commit_fd);
+  lc_cc_commit_leave(&guard->commit_pin);
   if (guard->mode) {
     if (guard->call != NULL) {
       pthread_mutex_lock(&lc_collection_lifecycle_mutex);
@@ -424,20 +397,21 @@ int lc_collection_metadata_enter(lc_collection_handle *collection,
   if (rc != 0)
     return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                  "failed to lock collection metadata mutex");
-  rc =
-      lc_cc_lock(collection->metadata_fd, exclusive ? LOCK_EX : LOCK_SH, error);
+  rc = lc_collection_lock_enter(collection->authority,
+                                LC_COLLECTION_AUTH_METADATA, 0U, exclusive, 1,
+                                &collection->metadata_pin, error);
   if (rc != LC_OK)
     pthread_mutex_unlock(&collection->metadata_mutex);
   return rc;
 }
 
 void lc_collection_metadata_leave(lc_collection_handle *collection) {
-  (void)flock(collection->metadata_fd, LOCK_UN);
+  lc_collection_lock_leave(&collection->metadata_pin);
   pthread_mutex_unlock(&collection->metadata_mutex);
 }
 
-int lc_collection_head_write(lc_collection_handle *collection,
-                             lc_error *error) {
+static int lc_collection_file_head_write(lc_collection_handle *collection,
+                                         lc_error *error) {
   unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
   struct stat prior;
   size_t done;
@@ -503,7 +477,8 @@ int lc_collection_head_write(lc_collection_handle *collection,
   return rc;
 }
 
-int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
+static int lc_collection_file_head_read(lc_collection_handle *collection,
+                                        lc_error *error) {
   unsigned char bytes[LC_COLLECTION_HEAD_BYTES];
   struct stat identity;
   int rc;
@@ -513,11 +488,7 @@ int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
   if (collection->head_loaded &&
       collection->head_device == (uint64_t)identity.st_dev &&
       collection->head_inode == (uint64_t)identity.st_ino) {
-    return collection->head.dropped
-               ? lc_collection_failure(error, LC_ERR_INVALID,
-                                       "collection_stale",
-                                       "collection has been dropped")
-               : LC_OK;
+    return LC_OK;
   }
   collection->head_loaded = 0;
   rc = lc_cc_read_file(collection->head_path, bytes, sizeof(bytes), 0, NULL,
@@ -530,10 +501,47 @@ int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
   collection->head_device = (uint64_t)identity.st_dev;
   collection->head_inode = (uint64_t)identity.st_ino;
   collection->head_loaded = 1;
-  if (collection->head.dropped)
+  return LC_OK;
+}
+
+static int file_control_load(void *context, lc_collection_disk_head *head,
+                             lc_error *error) {
+  lc_collection_handle *collection = context;
+  int rc = lc_collection_file_head_read(collection, error);
+  if (rc == LC_OK)
+    *head = collection->head;
+  return rc;
+}
+static int file_control_store(void *context,
+                              const lc_collection_disk_head *head,
+                              lc_error *error) {
+  lc_collection_handle *collection = context;
+  collection->head = *head;
+  return lc_collection_file_head_write(collection, error);
+}
+lc_collection_control
+lc_collection_file_control(lc_collection_handle *collection) {
+  lc_collection_control control;
+  control.load = file_control_load;
+  control.store = file_control_store;
+  control.context = collection;
+  return control;
+}
+
+int lc_collection_head_read(lc_collection_handle *collection, lc_error *error) {
+  int rc = collection->control.load(collection->control.context,
+                                    &collection->head, error);
+  if (rc == LC_OK && collection->head.dropped)
     return lc_collection_failure(error, LC_ERR_INVALID, "collection_stale",
                                  "collection has been dropped");
-  return LC_OK;
+  return rc;
+}
+int lc_collection_head_write(lc_collection_handle *collection,
+                             lc_error *error) {
+  int rc = collection->control.store(collection->control.context,
+                                     &collection->head, error);
+  collection->head_loaded = 0;
+  return rc;
 }
 
 int lc_collection_migrate_head(lc_pouch *pouch, const char *directory,
@@ -613,97 +621,66 @@ int lc_collection_record_path(lc_collection_handle *collection, lc_u64 segment,
                             "failed to allocate collection segment path");
 }
 
-int lc_collection_record_file(lc_collection_handle *collection, lc_u64 segment,
-                              int *fd, lc_u64 *fd_segment, lc_u64 *fd_end,
-                              lc_error *error) {
-  char leaf[64];
-  char *path;
-  struct stat st;
-  int rc;
-  path = NULL;
-  rc = lc_collection_record_leaf(segment, leaf, error);
-  if (rc != LC_OK)
-    return rc;
-  if (*fd < 0 || *fd_segment != segment) {
-    path = lc_cc_path(collection, leaf);
-    if (path == NULL)
-      return lc_collection_failure(
-          error, LC_ERR_NOMEM, NULL,
-          "failed to allocate referenced collection segment path");
-    if (*fd >= 0)
-      (void)close(*fd);
-    *fd = open(path, O_RDONLY | O_CLOEXEC);
-    *fd_segment = segment;
-    if (*fd < 0 || fstat(*fd, &st) != 0 || st.st_size < 0) {
-      lc_free_with_allocator(&collection->allocator, path);
-      return lc_collection_failure(
-          error, LC_ERR_TRANSPORT, NULL,
-          "failed to inspect referenced collection segment");
-    }
-    *fd_end = (lc_u64)st.st_size;
-  }
-  lc_free_with_allocator(&collection->allocator, path);
-  return LC_OK;
+int lc_collection_record_input(lc_collection_handle *collection, lc_u64 segment,
+                               lc_collection_input *input, lc_error *error) {
+  return lc_collection_input_open(collection->reads, segment, input, error);
 }
 
 int lc_collection_record_ref_prefix(lc_collection_handle *collection,
-                                    lc_u64 segment, lc_u64 offset, int *fd,
-                                    lc_u64 *fd_segment, lc_u64 *fd_end,
+                                    lc_u64 segment, lc_u64 offset,
+                                    lc_collection_input *input,
                                     lc_pouch_collection_record *out,
                                     void *prefix, size_t capacity, size_t *size,
                                     lc_error *error) {
   char leaf[64];
-  struct stat st;
-  int rc = lc_collection_record_file(collection, segment, fd, fd_segment,
-                                     fd_end, error);
+  lc_u64 previous;
+  int rc = lc_collection_record_input(collection, segment, input, error);
   if (rc == LC_OK)
     rc = lc_collection_record_leaf(segment, leaf, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_pouch_collection_record_read_prefix(lc_pouch_record_file_io(*fd),
-                                              offset, *fd_end, leaf, out,
-                                              prefix, capacity, size, error);
-  /* A metadata projection may advance after the view was captured. Its
-   * backward link is safe, but the shared append file may have grown since
-   * this reader's previous stat. Never treat that stale bound as corruption. */
-  if (rc == LC_ERR_PROTOCOL && fstat(*fd, &st) == 0 && st.st_size >= 0 &&
-      (lc_u64)st.st_size > *fd_end) {
-    *fd_end = (lc_u64)st.st_size;
-    lc_error_cleanup(error);
-    lc_error_init(error);
-    rc = lc_pouch_collection_record_read_prefix(lc_pouch_record_file_io(*fd),
-                                                offset, *fd_end, leaf, out,
-                                                prefix, capacity, size, error);
+  rc = lc_pouch_collection_record_read_prefix(
+      input->io, offset, input->end, leaf, out, prefix, capacity, size, error);
+  /* A later projection can refer beyond this operation's previous capture.
+   * Refresh this input's bound before classifying that reference as corrupt. */
+  if (rc == LC_ERR_PROTOCOL) {
+    previous = input->end;
+    if (lc_collection_input_refresh(input, error) != LC_OK)
+      return error ? error->code : LC_ERR_TRANSPORT;
+    if (input->end > previous) {
+      lc_error_cleanup(error);
+      lc_error_init(error);
+      rc = lc_pouch_collection_record_read_prefix(input->io, offset, input->end,
+                                                  leaf, out, prefix, capacity,
+                                                  size, error);
+    }
   }
   return rc;
 }
 
 int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,
-                             lc_u64 offset, int *fd, lc_u64 *fd_segment,
-                             lc_u64 *fd_end, lc_pouch_collection_record *out,
-                             lc_error *error) {
-  return lc_collection_record_ref_prefix(collection, segment, offset, fd,
-                                         fd_segment, fd_end, out, NULL, 0, NULL,
-                                         error);
+                             lc_u64 offset, lc_collection_input *input,
+                             lc_pouch_collection_record *out, lc_error *error) {
+  return lc_collection_record_ref_prefix(collection, segment, offset, input,
+                                         out, NULL, 0, NULL, error);
 }
 
 int lc_collection_record_at(lc_collection_handle *collection, lc_u64 generation,
-                            int *fd, lc_u64 *fd_segment, lc_u64 *fd_end,
+                            lc_collection_input *input,
                             lc_pouch_collection_record *record,
                             lc_error *error) {
   lc_pouch_collection_record newer;
   int rc;
   while (record->generation > generation) {
     if (!record->metadata_only || record->previous_segment == 0U ||
-        (record->previous_segment == *fd_segment &&
+        (record->previous_segment == input->segment &&
          record->previous_offset >= record->record_offset))
       return lc_collection_failure(
           error, LC_ERR_PROTOCOL, "collection_corrupt",
           "collection metadata history does not precede its captured view");
     newer = *record;
     rc = lc_collection_record_ref(collection, newer.previous_segment,
-                                  newer.previous_offset, fd, fd_segment, fd_end,
-                                  record, error);
+                                  newer.previous_offset, input, record, error);
     if (rc != LC_OK)
       return rc;
     if (record->deleted || record->generation >= newer.generation ||
@@ -720,9 +697,8 @@ int lc_collection_record_at(lc_collection_handle *collection, lc_u64 generation,
 }
 
 int lc_collection_record_body(lc_collection_handle *collection,
-                              const lc_pouch_collection_record *record, int *fd,
-                              lc_u64 *fd_segment, lc_u64 *fd_end,
-                              lc_error *error) {
+                              const lc_pouch_collection_record *record,
+                              lc_collection_input *input, lc_error *error) {
   lc_pouch_collection_record body;
   lc_u64 segment;
   size_t prefix;
@@ -739,9 +715,8 @@ int lc_collection_record_body(lc_collection_handle *collection,
                                  "collection payload container is invalid");
   if (snapshot)
     segment |= LC_COLLECTION_SNAPSHOT_BIT;
-  rc = lc_collection_record_ref(collection, segment,
-                                record->payload_record_offset, fd, fd_segment,
-                                fd_end, &body, error);
+  rc = lc_collection_record_ref(
+      collection, segment, record->payload_record_offset, input, &body, error);
   if (rc == LC_OK &&
       (body.deleted || body.metadata_only ||
        body.position != record->position ||
@@ -764,9 +739,11 @@ int lc_collection_record_body(lc_collection_handle *collection,
   return rc;
 }
 
-static int lc_cc_active(lc_collection_handle *collection, lc_error *error) {
+static int lc_cc_file_active(lc_collection_handle *collection,
+                             lc_error *error) {
   char leaf[64];
   int rc, fd = -1;
+  lc_collection_segment fresh;
   if (collection->active_fd >= 0 &&
       collection->active_fd_segment == collection->head.active)
     return LC_OK;
@@ -775,31 +752,27 @@ static int lc_cc_active(lc_collection_handle *collection, lc_error *error) {
     rc = lc_cc_open_file(collection, leaf, O_RDWR, &fd, error);
   if (rc != LC_OK)
     return rc;
-  if (collection->active_fd >= 0)
+  rc = lc_collection_segment_adopt_file(fd, &fresh, error);
+  if (rc != LC_OK)
+    return rc;
+  if (collection->active.ops)
+    lc_collection_segment_close(&collection->active);
+  else if (collection->active_fd >= 0)
     (void)close(collection->active_fd);
+  collection->active = fresh;
   collection->active_fd = fd;
   collection->active_fd_segment = collection->head.active;
   return LC_OK;
 }
 
+static int lc_cc_active(lc_collection_handle *collection, lc_error *error) {
+  return collection->layout.active(collection->layout.context, error);
+}
+
 static int lc_cc_order_refresh(lc_collection_handle *collection,
                                lc_error *error) {
-  struct stat named;
-  struct stat opened;
-  if (collection->order.fd < 0)
-    return lc_collection_order_open(collection->order_path, 0,
-                                    &collection->order, error);
-  if (stat(collection->order_path, &named) != 0 ||
-      fstat(collection->order.fd, &opened) != 0)
-    return lc_collection_failure(
-        error, LC_ERR_TRANSPORT, NULL,
-        "failed to inspect collection ordered projection");
-  if (named.st_dev != opened.st_dev || named.st_ino != opened.st_ino) {
-    lc_collection_order_close(&collection->order);
-    return lc_collection_order_open(collection->order_path, 0,
-                                    &collection->order, error);
-  }
-  return lc_collection_order_refresh(&collection->order, error);
+  return collection->projections.order_refresh(collection->projections.context,
+                                               &collection->order, error);
 }
 
 int lc_collection_project_record(lc_collection_order *order,
@@ -906,45 +879,41 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   lc_pouch_collection_record record;
   lc_pouch_collection_record prior;
   char leaf[64];
-  char *path;
-  struct stat st;
   lc_u64 limit;
   lc_u64 accounted_segment = order->replay_segment;
   lc_u64 accounted_offset = order->replay_offset;
-  int fd;
+  lc_collection_segment input;
   int rc;
   int changed;
   /* A caught-up projection needs no path allocation, open or replay. The
    * append lock and pinned active inode make this EOF observation
    * authoritative. */
   if (!snapshot && segment == collection->head.active &&
-      collection->active_fd_segment == segment && collection->active_fd >= 0 &&
+      collection->active_fd_segment == segment && collection->active.ops &&
       order->replay_segment == segment && order->replay_offset == offset &&
       ids->replay_segment == segment && ids->replay_offset == offset) {
-    if (fstat(collection->active_fd, &st) != 0 || st.st_size < 0)
-      return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to inspect canonical stream tail");
-    if ((lc_u64)st.st_size == offset)
+    rc = lc_pouch_record_io_tail(collection->active.io, &limit, error);
+    if (rc != LC_OK)
+      return rc;
+    if (limit == offset)
       return LC_OK;
   }
-  rc = lc_collection_record_path(collection, segment, &path, leaf, error);
-  if (rc != LC_OK)
+  rc = lc_collection_record_leaf(segment, leaf, error);
+  memset(&input, 0, sizeof(input));
+  if (rc == LC_OK)
+    rc = collection->segments.open(collection->segments.context, segment, 0,
+                                   &input, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_record_io_tail(input.io, &limit, error);
+  if (rc != LC_OK) {
+    lc_collection_segment_close(&input);
     return rc;
-  fd = open(path, O_RDWR);
-  lc_free_with_allocator(&collection->allocator, path);
-  if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 0) {
-    if (fd >= 0)
-      (void)close(fd);
-    return lc_collection_failure(
-        error, LC_ERR_TRANSPORT, NULL,
-        "failed to open collection canonical replay segment");
   }
-  limit = (lc_u64)st.st_size;
   changed = offset != limit || order->replay_segment != segment ||
             order->replay_offset != limit || ids->replay_segment != segment ||
             ids->replay_offset != limit;
   if (offset > limit) {
-    (void)close(fd);
+    lc_collection_segment_close(&input);
     if (repair && !snapshot && segment == collection->head.active &&
         order == &collection->order && ids == &collection->ids)
       return lc_cc_rebuild(collection, 1, error);
@@ -958,18 +927,14 @@ int lc_collection_replay_into(lc_collection_handle *collection,
      * headers and truncated published bodies remain explicit corruption. */
     rc = limit - offset < LC_POUCH_RECORD_HEADER_BYTES
              ? LC_ERR_PENDING
-             : lc_pouch_collection_record_read(lc_pouch_record_file_io(fd),
-                                               offset, limit, leaf, &record,
-                                               error);
+             : lc_pouch_collection_record_read(input.io, offset, limit, leaf,
+                                               &record, error);
     if (rc == LC_ERR_PENDING && !snapshot &&
         segment == collection->head.active) {
       lc_error_cleanup(error);
       lc_error_init(error);
-      if (repair && ftruncate(fd, (off_t)offset) != 0)
-        rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to repair collection pending tail");
-      else
-        rc = LC_OK;
+      rc = repair ? lc_collection_segment_truncate(&input, offset, error)
+                  : LC_OK;
       limit = offset;
       break;
     }
@@ -995,8 +960,9 @@ int lc_collection_replay_into(lc_collection_handle *collection,
     }
     if (record.kind == LC_POUCH_COLLECTION_EDIT) {
       if (snapshot || record.generation > cutoff)
-        rc = lc_collection_edit_project(collection, order, ids, fd, &record,
-                                        &prior, segment, snapshot, error);
+        rc = lc_collection_edit_project(collection, order, ids, input.io,
+                                        &record, &prior, segment, snapshot,
+                                        error);
     } else if (record.kind != LC_POUCH_COLLECTION_CHUNK &&
                record.kind != LC_POUCH_COLLECTION_NODE &&
                record.kind != LC_POUCH_COLLECTION_REGION &&
@@ -1016,15 +982,14 @@ int lc_collection_replay_into(lc_collection_handle *collection,
      * edit record. A crash can leave exactly this append-authority-owned tail.
      * Never discard a malformed record or a body followed by a committed edit.
      */
-    if (repair && ftruncate(fd, (off_t)prior.record_offset) != 0)
-      rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                 "failed to reclaim unpublished edit tail");
-    else {
+    if (repair)
+      rc = lc_collection_segment_truncate(&input, prior.record_offset, error);
+    if (rc == LC_OK) {
       limit = prior.record_offset;
       changed = 1;
     }
   }
-  (void)close(fd);
+  lc_collection_segment_close(&input);
   if (rc == LC_OK && !snapshot && changed) {
     rc = lc_collection_order_checkpoint(order, segment, limit, error);
     if (rc == LC_OK)
@@ -1037,68 +1002,32 @@ int lc_collection_replay_into(lc_collection_handle *collection,
 
 static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
                          lc_error *error) {
-  lc_collection_order previous_order;
-  lc_collection_ids previous_ids;
-  char id[LC_XID_STRING_SIZE];
-  char *order_temp;
-  char *ids_temp;
-  size_t size;
-  lc_u64 segment;
-  struct stat st;
-  int rc;
-  int order_created;
-  int ids_created;
-  int published = 0, restored = 0;
+  lc_collection_projection_build build;
+  lc_u64 segment, tail;
   int previous_trusted = collection->trusted;
-  rc = lc_xid_new(id, error);
-  if (rc != LC_OK)
-    return rc;
-  size = strlen(collection->directory) + sizeof(id) + 32U;
-  order_temp = (char *)lc_alloc_with_allocator(&collection->allocator, size);
-  ids_temp = (char *)lc_alloc_with_allocator(&collection->allocator, size);
-  if (order_temp == NULL || ids_temp == NULL) {
-    lc_free_with_allocator(&collection->allocator, order_temp);
-    lc_free_with_allocator(&collection->allocator, ids_temp);
-    return lc_collection_failure(
-        error, LC_ERR_NOMEM, NULL,
-        "failed to allocate collection recovery paths");
-  }
-  snprintf(order_temp, size, "%s/order.rebuild-%s", collection->directory, id);
-  snprintf(ids_temp, size, "%s/ids.rebuild-%s", collection->directory, id);
-  previous_order = collection->order;
-  previous_ids = collection->ids;
-  memset(&collection->order, 0, sizeof(collection->order));
-  collection->order.fd = -1;
-  memset(&collection->ids, 0, sizeof(collection->ids));
-  collection->ids.fd = -1;
-  order_created = 0;
-  ids_created = 0;
-  rc = lc_collection_order_open(order_temp, 1, &collection->order, error);
-  order_created = rc == LC_OK;
-  if (rc == LC_OK) {
-    rc = lc_collection_ids_open(ids_temp, 1, &collection->allocator,
-                                &collection->ids, error);
-    ids_created = rc == LC_OK;
-  }
-  collection->order.snapshot = collection->ids.snapshot =
-      collection->head.snapshot;
+  int rc;
+  memset(&build, 0, sizeof(build));
+  build.order.fd = build.ids.fd = -1;
+  rc = collection->projections.begin(collection->projections.context, &build,
+                                     error);
+  build.order.snapshot = build.ids.snapshot = collection->head.snapshot;
   for (segment = collection->head.snapshot;
        rc == LC_OK && segment != 0U &&
        segment <=
            collection->head.snapshot + collection->head.snapshot_extra_parts;
        ++segment)
-    rc = lc_collection_replay_into(
-        collection, &collection->order, &collection->ids,
-        segment | LC_COLLECTION_SNAPSHOT_BIT, 0U, 1,
-        collection->head.snapshot_generation, 0, error);
+    rc = lc_collection_replay_into(collection, &build.order, &build.ids,
+                                   segment | LC_COLLECTION_SNAPSHOT_BIT, 0U, 1,
+                                   collection->head.snapshot_generation, 0,
+                                   error);
   if (rc == LC_OK)
-    rc = lc_collection_order_checkpoint(&collection->order,
+    rc = lc_collection_order_checkpoint(&build.order,
                                         collection->head.tail_segment,
                                         collection->head.tail_offset, error);
   for (segment = collection->head.tail_segment;
        rc == LC_OK && segment <= collection->head.active; ++segment)
     rc = lc_collection_replay_into(
-        collection, &collection->order, &collection->ids, segment,
+        collection, &build.order, &build.ids, segment,
         segment == collection->head.tail_segment ? collection->head.tail_offset
                                                  : 0U,
         0, collection->head.snapshot_generation, 0, error);
@@ -1106,77 +1035,45 @@ static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
    * must not conceal loss of a published record. Check the reconstructed
    * logical history before truncating a tail or replacing either projection. */
   if (rc == LC_OK && verify_previous &&
-      (collection->order.count != previous_order.count ||
-       collection->order.live_count != previous_order.live_count ||
-       collection->order.generation != previous_order.generation ||
-       collection->order.upper_position != previous_order.upper_position ||
-       collection->order.edit_count != previous_order.edit_count ||
-       collection->order.collection_retention_generation !=
-           previous_order.collection_retention_generation ||
-       collection->order.collection_retention !=
-           previous_order.collection_retention ||
-       collection->ids.count != lc_collection_binding_count(&previous_order)))
+      (build.order.count != collection->order.count ||
+       build.order.live_count != collection->order.live_count ||
+       build.order.generation != collection->order.generation ||
+       build.order.upper_position != collection->order.upper_position ||
+       build.order.edit_count != collection->order.edit_count ||
+       build.order.collection_retention_generation !=
+           collection->order.collection_retention_generation ||
+       build.order.collection_retention !=
+           collection->order.collection_retention ||
+       build.ids.count != lc_collection_binding_count(&collection->order)))
     rc = lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                "collection canonical history is incomplete");
   if (rc == LC_OK)
     rc = lc_cc_active(collection, error);
-  if (rc == LC_OK && (fstat(collection->active_fd, &st) != 0 || st.st_size < 0))
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to inspect collection recovery tail");
-  if (rc == LC_OK &&
-      (collection->order.replay_segment != collection->head.active ||
-       collection->order.replay_offset > (lc_u64)st.st_size))
+  if (rc == LC_OK)
+    rc = lc_pouch_record_io_tail(collection->active.io, &tail, error);
+  if (rc == LC_OK && (build.order.replay_segment != collection->head.active ||
+                      build.order.replay_offset > tail))
     rc = lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                "collection recovery tail is inconsistent");
-  if (rc == LC_OK && collection->order.replay_offset < (lc_u64)st.st_size &&
-      ftruncate(collection->active_fd,
-                (off_t)collection->order.replay_offset) != 0)
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to repair collection recovery tail");
-  if (rc == LC_OK &&
-      (fsync(collection->order.fd) != 0 || fsync(collection->ids.fd) != 0))
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to sync rebuilt collection projections");
-  if (rc == LC_OK && rename(order_temp, collection->order_path) != 0)
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to publish rebuilt collection order");
-  else if (rc == LC_OK) {
-    order_created = 0;
-    published = 1;
-  }
-  if (rc == LC_OK && rename(ids_temp, collection->ids_path) != 0)
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to publish rebuilt append identities");
-  else if (rc == LC_OK)
-    ids_created = 0;
-  lc_collection_order_close(&collection->order);
-  lc_collection_ids_close(&collection->ids);
-  if (rc != LC_OK && verify_previous && !published) {
-    /* Keep a failed history check authoritative on the next call too. */
-    collection->order = previous_order;
-    collection->ids = previous_ids;
-    restored = 1;
-  } else {
-    lc_collection_order_close(&previous_order);
-    lc_collection_ids_close(&previous_ids);
-  }
+  if (rc == LC_OK && build.order.replay_offset < tail)
+    rc = lc_collection_segment_truncate(&collection->active,
+                                        build.order.replay_offset, error);
   if (rc == LC_OK)
-    rc = lc_pouch_path_fsync_directory(
-        collection->directory, "failed to sync collection recovery publication",
-        error);
-  if (rc == LC_OK)
-    rc = lc_collection_order_open(collection->order_path, 0, &collection->order,
-                                  error);
-  if (rc == LC_OK)
-    rc = lc_collection_ids_open(collection->ids_path, 0, &collection->allocator,
-                                &collection->ids, error);
-  if (order_created)
-    (void)unlink(order_temp);
-  if (ids_created)
-    (void)unlink(ids_temp);
-  lc_free_with_allocator(&collection->allocator, order_temp);
-  lc_free_with_allocator(&collection->allocator, ids_temp);
-  collection->trusted = restored ? previous_trusted : rc == LC_OK;
+    rc = collection->projections.publish(collection->projections.context,
+                                         &build, error);
+  if (rc == LC_OK) {
+    lc_collection_order_close(&collection->order);
+    lc_collection_ids_close(&collection->ids);
+    collection->order = build.order;
+    collection->ids = build.ids;
+    memset(&build.order, 0, sizeof(build.order));
+    memset(&build.ids, 0, sizeof(build.ids));
+    build.order.fd = build.ids.fd = -1;
+    collection->trusted = 1;
+  } else
+    collection->trusted =
+        verify_previous && !build.published ? previous_trusted : 0;
+  collection->projections.cleanup(collection->projections.context, &build);
   return rc;
 }
 
@@ -1191,14 +1088,9 @@ static int lc_collection_reconcile(lc_collection_handle *collection,
   if (rc != LC_OK)
     return rc;
   rc = lc_cc_order_refresh(collection, error);
-  if (rc == LC_OK) {
-    if (collection->ids.fd < 0)
-      rc = lc_collection_ids_open(collection->ids_path, 0,
-                                  &collection->allocator, &collection->ids,
-                                  error);
-    else
-      rc = lc_collection_ids_refresh(&collection->ids, error);
-  }
+  if (rc == LC_OK)
+    rc = collection->projections.ids_refresh(collection->projections.context,
+                                             &collection->ids, error);
   if (rc != LC_OK || !collection->trusted ||
       collection->order.edit_in_progress ||
       collection->order.snapshot != collection->head.snapshot ||
@@ -1246,39 +1138,41 @@ static int lc_collection_reconcile(lc_collection_handle *collection,
 
 int lc_collection_prepare(lc_collection_handle *collection, lc_error *error) {
   lc_collection_guard guard;
-  int lock_errno;
-  int rc;
-  /* Never wait on a source callback's own append. The metadata lock below
-   * still excludes an in-progress projection publication. */
-  rc = pthread_mutex_trylock(&collection->append_mutex);
+  lc_collection_lock probe;
+  int rc = pthread_mutex_trylock(&collection->append_mutex);
+  /* A callback may read its previous view without waiting on its own upload. */
   if (rc == EBUSY)
     return LC_OK;
   if (rc != 0)
     return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                  "failed to probe collection append mutex");
-  rc = flock(collection->append_fd, LOCK_EX | LOCK_NB);
-  lock_errno = errno;
-  if (rc == 0)
-    (void)flock(collection->append_fd, LOCK_UN);
+  rc =
+      lc_collection_lock_enter(collection->authority, LC_COLLECTION_AUTH_APPEND,
+                               0U, 1, 0, &probe, error);
+  if (rc == LC_OK)
+    lc_collection_lock_leave(&probe);
   pthread_mutex_unlock(&collection->append_mutex);
-  errno = lock_errno;
-  if (rc != 0 && (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN))
+  if (rc == LC_ERR_PENDING) {
+    lc_error_cleanup(error);
+    lc_error_init(error);
     return LC_OK;
-  if (rc != 0)
-    return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                 "failed to probe collection appender");
+  }
+  if (rc != LC_OK)
+    return rc;
   rc = lc_cc_root_enter(collection->pouch, NULL, &guard, error);
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&collection->append_mutex);
-  rc = lc_cc_lock(collection->append_fd, LOCK_EX, error);
+  rc =
+      lc_collection_lock_enter(collection->authority, LC_COLLECTION_AUTH_APPEND,
+                               0U, 1, 1, &guard.append_pin, error);
   if (rc == LC_OK) {
     rc = lc_collection_metadata_enter(collection, 1, error);
     if (rc == LC_OK) {
       rc = lc_collection_reconcile(collection, error);
       lc_collection_metadata_leave(collection);
     }
-    (void)flock(collection->append_fd, LOCK_UN);
+    lc_collection_lock_leave(&guard.append_pin);
   }
   pthread_mutex_unlock(&collection->append_mutex);
   lc_cc_root_leave(&guard);
@@ -1371,13 +1265,66 @@ static int lc_cc_invalidate_clean(lc_collection_handle *collection,
              : LC_OK;
 }
 
+static int file_owner_finish(void *context, lc_error *error) {
+  lc_collection_handle *collection = context;
+  int valid, rc = LC_OK;
+  if (rc == LC_OK && collection->join_fd >= 0)
+    rc = lc_cc_lock(collection->join_fd, LOCK_EX, error);
+  /* Upgrade is nonblocking: other live handles retain the shared session.
+   * Only the last handle can publish a clean-close proof. */
+  if (rc == LC_OK && collection->session_fd >= 0 && collection->trusted &&
+      flock(collection->session_fd, LOCK_EX | LOCK_NB) == 0) {
+    rc = lc_cc_lock(collection->append_fd, LOCK_EX, error);
+    if (rc == LC_OK) {
+      rc = lc_collection_metadata_enter(collection, 1, error);
+      if (rc == LC_OK) {
+        rc = lc_collection_reconcile(collection, error);
+        if (rc == LC_OK)
+          rc = lc_cc_checkpoint(collection, 1, &valid, error);
+        lc_collection_metadata_leave(collection);
+      }
+      (void)flock(collection->append_fd, LOCK_UN);
+    }
+  }
+  return rc;
+}
+static int file_owner_attach(void *context, lc_collection_handle *collection,
+                             lc_error *error) {
+  (void)context;
+  (void)error;
+  lc_collection_file_bind(collection);
+  return LC_OK;
+}
+static int file_owner_clone(void *context, lc_collection **out,
+                            lc_error *error) {
+  lc_collection_handle *c = context;
+  return lc_collection_storage_open(c->pouch, c->client, c->ns, c->name, c->id,
+                                    c->catalog_base, c->catalog_path, 0, 0, 0,
+                                    out, error);
+}
+static int file_owner_bound(void *context, lc_error *error) {
+  return lc_collection_file_catalog_bound(context, error);
+}
+static int file_owner_remove(void *context, lc_error *error) {
+  return lc_collection_file_catalog_remove(context, error);
+}
+static void file_owner_release(void *context) { (void)context; }
+lc_collection_owner lc_collection_file_owner(lc_collection_handle *c) {
+  static const lc_collection_owner_ops ops = {
+      file_owner_attach, file_owner_clone,  file_owner_bound,
+      file_owner_remove, file_owner_finish, file_owner_release};
+  lc_collection_owner owner;
+  owner.ops = &ops;
+  owner.context = c;
+  return owner;
+}
+
 static void lc_collection_destroy(lc_collection_handle *collection) {
   lc_client_handle *client;
   lc_allocator allocator;
   lc_collection_guard guard;
   lc_collection_call scope;
   lc_error error;
-  int valid;
   int rc;
   int entered;
   client = collection->client;
@@ -1385,26 +1332,8 @@ static void lc_collection_destroy(lc_collection_handle *collection) {
   lc_error_init(&error);
   rc = lc_collection_root_begin(collection->pouch, &scope, &guard, &error);
   entered = rc == LC_OK;
-  if (rc == LC_OK && collection->join_fd >= 0)
-    rc = lc_cc_lock(collection->join_fd, LOCK_EX, &error);
-  /* Upgrade is nonblocking: other live handles retain the shared session.
-   * Only the last handle can publish a clean-close proof. */
-  if (rc == LC_OK && collection->session_fd >= 0 && collection->trusted &&
-      flock(collection->session_fd, LOCK_EX | LOCK_NB) == 0) {
-    rc = lc_cc_lock(collection->append_fd, LOCK_EX, &error);
-    if (rc == LC_OK) {
-      rc = lc_collection_metadata_enter(collection, 1, &error);
-      if (rc == LC_OK) {
-        rc = lc_collection_reconcile(collection, &error);
-        if (rc == LC_OK)
-          rc = lc_cc_checkpoint(collection, 1, &valid, &error);
-        lc_collection_metadata_leave(collection);
-      }
-      (void)flock(collection->append_fd, LOCK_UN);
-    }
-  }
-  if (entered)
-    lc_collection_root_end(&scope, &guard);
+  if (rc == LC_OK)
+    rc = collection->owner.ops->finish(collection->owner.context, &error);
   if (rc != LC_OK) {
     pslog_field field;
     field = lc_log_error_field("error", &error);
@@ -1414,12 +1343,15 @@ static void lc_collection_destroy(lc_collection_handle *collection) {
         &field, 1U);
   }
   lc_error_cleanup(&error);
-  if (collection->active_fd >= 0)
+  if (collection->active.ops)
+    lc_collection_segment_close(&collection->active);
+  else if (collection->active_fd >= 0)
     (void)close(collection->active_fd);
   if (collection->head_fd >= 0)
     (void)close(collection->head_fd);
   lc_collection_order_close(&collection->order);
   lc_collection_ids_close(&collection->ids);
+  lc_collection_file_reads_cleanup(&collection->native_reads);
   if (collection->streams_fd >= 0)
     (void)close(collection->streams_fd);
   if (collection->session_fd >= 0)
@@ -1442,6 +1374,9 @@ static void lc_collection_destroy(lc_collection_handle *collection) {
   lc_free_with_allocator(&allocator, collection->catalog_base);
   lc_free_with_allocator(&allocator, collection->order_path);
   lc_free_with_allocator(&allocator, collection->ids_path);
+  collection->owner.ops->release(collection->owner.context);
+  if (entered)
+    lc_collection_root_end(&scope, &guard);
   lc_free_with_allocator(&allocator, collection);
   if (client != NULL)
     lc_client_handle_release(client);
@@ -1466,7 +1401,7 @@ static void lc_cc_close_method(lc_collection *self) {
 }
 
 static int lc_cc_stream_boundary(lc_collection_handle *c, lc_error *error) {
-  struct stat st;
+  uint64_t tail;
   int rc = lc_collection_head_read(c, error);
   if (rc == LC_OK)
     rc = lc_cc_active(c, error);
@@ -1475,10 +1410,10 @@ static int lc_cc_stream_boundary(lc_collection_handle *c, lc_error *error) {
   if (rc == LC_OK && c->trusted && !c->order.edit_in_progress &&
       c->order.snapshot == c->head.snapshot &&
       c->order.replay_segment == c->head.active) {
-    if (fstat(c->active_fd, &st) != 0 || st.st_size < 0)
-      return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to inspect stream append boundary");
-    if ((lc_u64)st.st_size == c->order.replay_offset)
+    rc = lc_pouch_record_io_tail(c->active.io, &tail, error);
+    if (rc != LC_OK)
+      return rc;
+    if (tail == c->order.replay_offset)
       return LC_OK;
   }
   /* A dead producer or interrupted projection may have left an incomplete
@@ -1503,11 +1438,13 @@ static int lc_cc_write_enter(lc_collection_call *call,
   guard->collection = collection;
   rc = pthread_mutex_lock(&collection->append_mutex);
   if (rc == 0) {
-    rc = lc_cc_lock(collection->append_fd, LOCK_EX, error);
+    rc = lc_collection_lock_enter(collection->authority,
+                                  LC_COLLECTION_AUTH_APPEND, 0U, 1, 1,
+                                  &guard->append_pin, error);
     if (rc == LC_OK) {
       guard->append = 1;
       if (!appending)
-        rc = lc_cc_commit_enter(collection, 1, &guard->commit_fd, error);
+        rc = lc_cc_commit_enter(collection, 1, &guard->commit_pin, error);
       if (rc == LC_OK)
         rc = lc_collection_metadata_enter(collection, 1, error);
       if (rc == LC_OK) {
@@ -1518,7 +1455,7 @@ static int lc_cc_write_enter(lc_collection_call *call,
       }
     }
     if (rc != LC_OK) {
-      (void)flock(collection->append_fd, LOCK_UN);
+      lc_collection_lock_leave(&guard->append_pin);
       pthread_mutex_unlock(&collection->append_mutex);
       guard->append = 0;
     }
@@ -1560,7 +1497,7 @@ int lc_collection_stream_enter(lc_collection_call *call,
 }
 
 int lc_collection_edit_barrier(lc_collection_guard *guard, lc_error *error) {
-  return lc_cc_commit_enter(guard->collection, 1, &guard->commit_fd, error);
+  return lc_cc_commit_enter(guard->collection, 1, &guard->commit_pin, error);
 }
 
 int lc_collection_control_enter(lc_collection_call *call,
@@ -1572,7 +1509,7 @@ int lc_collection_control_enter(lc_collection_call *call,
   if (rc != LC_OK)
     return rc;
   guard->collection = call->collection;
-  rc = lc_cc_commit_enter(call->collection, 1, &guard->commit_fd, error);
+  rc = lc_cc_commit_enter(call->collection, 1, &guard->commit_pin, error);
   if (rc == LC_OK) {
     rc = lc_collection_metadata_enter(call->collection, 1, error);
     if (rc == LC_OK) {
@@ -1593,7 +1530,7 @@ void lc_collection_control_leave(lc_collection_guard *guard) {
 
 static void lc_cc_write_unlock(lc_collection_guard *guard) {
   if (guard->append) {
-    (void)flock(guard->collection->append_fd, LOCK_UN);
+    lc_collection_lock_leave(&guard->append_pin);
     pthread_mutex_unlock(&guard->collection->append_mutex);
     guard->append = 0;
   }
@@ -1604,13 +1541,15 @@ void lc_collection_write_leave(lc_collection_guard *guard) {
   lc_cc_root_leave(guard);
 }
 
-static int lc_cc_rotate(lc_collection_handle *collection, int force,
-                        lc_u64 limit, lc_error *error) {
+static int lc_cc_file_rotate(lc_collection_handle *collection, int force,
+                             lc_u64 limit, lc_error *error) {
   char leaf[64];
   struct stat st;
   lc_u64 next;
   int fd = -1, directory = -1;
   int rc;
+  lc_collection_segment fresh;
+  memset(&fresh, 0, sizeof(fresh));
   if (fstat(collection->active_fd, &st) != 0 || st.st_size < 0)
     return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                  "failed to inspect collection segment size");
@@ -1665,13 +1604,24 @@ static int lc_cc_rotate(lc_collection_handle *collection, int force,
     rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
                                "failed to sync new collection segment");
   if (rc == LC_OK) {
+    rc = lc_collection_segment_adopt_file(fd, &fresh, error);
+    if (rc != LC_OK)
+      fd = -1;
+  }
+  if (rc == LC_OK) {
     collection->head.active = next;
     rc = lc_collection_head_write(collection, error);
   }
   if (rc == LC_OK) {
-    (void)close(collection->active_fd);
+    lc_collection_segment_close(&collection->active);
+    collection->active = fresh;
+    memset(&fresh, 0, sizeof(fresh));
     collection->active_fd = fd;
     collection->active_fd_segment = next;
+    fd = -1;
+  }
+  if (fresh.ops) {
+    lc_collection_segment_close(&fresh);
     fd = -1;
   }
   if (fd >= 0)
@@ -1682,13 +1632,31 @@ static int lc_cc_rotate(lc_collection_handle *collection, int force,
   return rc;
 }
 
+static int file_layout_active(void *context, lc_error *error) {
+  return lc_cc_file_active(context, error);
+}
+static int file_layout_rotate(void *context, int force, lc_u64 limit,
+                              lc_error *error) {
+  return lc_cc_file_rotate(context, force, limit, error);
+}
+lc_collection_layout lc_collection_file_layout(lc_collection_handle *c) {
+  lc_collection_layout layout;
+  layout.active = file_layout_active;
+  layout.rotate = file_layout_rotate;
+  layout.context = c;
+  return layout;
+}
+static int lc_cc_rotate(lc_collection_handle *collection, int force,
+                        lc_u64 limit, lc_error *error) {
+  return collection->layout.rotate(collection->layout.context, force, limit,
+                                   error);
+}
+
 typedef struct lc_cc_lookup {
   lc_collection_handle *collection;
   const char *append_id;
   lc_pouch_collection_record record;
-  int fd;
-  lc_u64 segment;
-  lc_u64 end;
+  lc_collection_input input;
 } lc_cc_lookup;
 
 int lc_collection_rotate(lc_collection_handle *collection, int force,
@@ -1710,8 +1678,7 @@ static int lc_cc_match(void *context, const lc_collection_id_ref *ref,
   int rc;
   lookup = (lc_cc_lookup *)context;
   rc = lc_collection_record_ref(lookup->collection, ref->segment, ref->offset,
-                                &lookup->fd, &lookup->segment, &lookup->end,
-                                &lookup->record, error);
+                                &lookup->input, &lookup->record, error);
   if (rc != LC_OK)
     return rc;
   if (lookup->record.kind == LC_POUCH_COLLECTION_EDIT) {
@@ -1738,7 +1705,6 @@ int lc_collection_lookup_id(lc_collection_handle *collection,
   memset(&lookup, 0, sizeof(lookup));
   lookup.collection = collection;
   lookup.append_id = append_id;
-  lookup.fd = -1;
   *found = 0;
   rc = lc_collection_hash(append_id, strlen(append_id), digest, error);
   if (rc == LC_OK)
@@ -1754,9 +1720,8 @@ int lc_collection_lookup_id(lc_collection_handle *collection,
       out->deleted = 1;
   }
   if (rc == LC_OK && *found && segment != NULL)
-    *segment = lookup.segment;
-  if (lookup.fd >= 0)
-    (void)close(lookup.fd);
+    *segment = lookup.input.segment;
+  lc_collection_input_close(&lookup.input);
   return rc;
 }
 
@@ -1822,7 +1787,8 @@ static void lc_cc_describe_result(lc_collection_handle *collection,
 static int lc_cc_describe(lc_collection *self, lc_collection_info *out,
                           lc_error *error) {
   lc_collection_call call;
-  int rc, pin;
+  int rc;
+  lc_collection_lock pin;
   if (out == NULL)
     return lc_collection_failure(error, LC_ERR_INVALID, NULL,
                                  "collection description requires output");
@@ -1877,10 +1843,7 @@ static int lc_cc_metadata(lc_collection *self,
       if (rc == LC_OK) {
         /* The durable override boundary cannot name a generation that a
          * NoSync power loss could discard and then reuse for a new append. */
-        if (fsync(call.collection->active_fd) != 0)
-          rc = lc_collection_failure(
-              error, LC_ERR_TRANSPORT, NULL,
-              "failed to sync collection policy boundary");
+        rc = lc_collection_segment_force(&call.collection->active, error);
       }
       if (rc == LC_OK) {
         call.collection->head.retention = deadline;
@@ -1914,7 +1877,8 @@ static int lc_cc_status(lc_collection *self, const char *append_id,
                         lc_collection_append_status_res *out, lc_error *error) {
   lc_collection_call call;
   lc_pouch_collection_record record;
-  int found, pin;
+  int found;
+  lc_collection_lock pin;
   int rc;
   if (!lc_cc_id_valid(append_id) || out == NULL)
     return lc_collection_failure(
@@ -2024,40 +1988,23 @@ static int lc_cc_verify_retry(lc_collection_handle *collection,
 }
 
 static int lc_cc_pin_segment(lc_collection_handle *collection, lc_u64 segment,
-                             int *fd, lc_error *error) {
-  char *path;
-  char leaf[64];
-  int rc;
-  *fd = -1;
+                             lc_collection_segment *pin, lc_error *error) {
+  if (segment == collection->head.active)
+    return lc_collection_segment_clone(&collection->active, pin, error);
   if (!collection->pouch->durable_sync)
     return LC_OK;
-  rc = LC_OK;
-  /* Another call may rotate this receiver as soon as append authority leaves.
-   * Pin the exact canonical inode, including a duplicate's older binding. */
-  if (segment == collection->active_fd_segment)
-    *fd = fcntl(collection->active_fd, F_DUPFD_CLOEXEC, 0);
-  else {
-    path = NULL;
-    rc = lc_collection_record_path(collection, segment, &path, leaf, error);
-    if (rc == LC_OK)
-      *fd = open(path, O_RDONLY | O_CLOEXEC);
-    lc_free_with_allocator(&collection->allocator, path);
-  }
-  if (rc == LC_OK && *fd < 0)
-    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                               "failed to pin collection commit segment");
-  return rc;
+  return collection->segments.open(collection->segments.context, segment, 0,
+                                   pin, error);
 }
 
 static int lc_cc_commit_pin(lc_collection_handle *collection,
-                            lc_collection_guard *guard, lc_u64 segment, int *fd,
-                            lc_error *error) {
-  int rc;
-  *fd = -1;
-  if (!collection->pouch->durable_sync)
-    return LC_OK;
-  rc = lc_cc_commit_enter(collection, 0, &guard->commit_fd, error);
-  return rc == LC_OK ? lc_cc_pin_segment(collection, segment, fd, error) : rc;
+                            lc_collection_guard *guard, lc_u64 segment,
+                            lc_collection_segment *pin, lc_error *error) {
+  int rc = LC_OK;
+  memset(pin, 0, sizeof(*pin));
+  if (collection->pouch->durable_sync)
+    rc = lc_cc_commit_enter(collection, 0, &guard->commit_pin, error);
+  return rc == LC_OK ? lc_cc_pin_segment(collection, segment, pin, error) : rc;
 }
 
 int lc_collection_append_validate(lc_collection_handle *collection,
@@ -2094,14 +2041,15 @@ static int lc_cc_append(lc_collection *self,
   lc_u64 ownership_generation;
   char leaf[64];
   int found;
-  int rc, sync_fd;
+  int rc;
+  lc_collection_segment commit;
   if (req == NULL || source == NULL || source->read == NULL || out == NULL)
     return lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
         "collection append requires identity, source, and output");
   memset(out, 0, sizeof(*out));
   query_ordinal = LC_U64_MAX;
-  sync_fd = -1;
+  memset(&commit, 0, sizeof(commit));
   rc = lc_collection_call_begin(self, 1, &call, error);
   if (rc != LC_OK)
     return rc;
@@ -2146,8 +2094,8 @@ static int lc_cc_append(lc_collection *self,
     rc = lc_cc_verify_retry(collection, &guarded.pub, &record, error);
   } else if (rc == LC_OK) {
     rc = lc_pouch_collection_writer_open(
-        collection->pouch, lc_pouch_record_file_io(collection->active_fd), leaf,
-        collection->id, req->append_id, position, generation,
+        collection->pouch, collection->active.io, leaf, collection->id,
+        req->append_id, position, generation,
         req->has_retention_seconds
             ? -(lc_pouch_unix_seconds)req->retention_seconds
             : 0,
@@ -2161,7 +2109,7 @@ static int lc_cc_append(lc_collection *self,
                                               &guarded.pub, &record, error);
   }
   if (rc == LC_OK)
-    rc = lc_cc_commit_pin(collection, &guard, segment, &sync_fd, error);
+    rc = lc_cc_commit_pin(collection, &guard, segment, &commit, error);
   if (rc == LC_OK) {
     rc = lc_collection_metadata_enter(collection, 1, error);
     if (rc == LC_OK) {
@@ -2176,6 +2124,8 @@ static int lc_cc_append(lc_collection *self,
       if (rc == LC_OK && !found)
         rc = lc_pouch_collection_writer_publish(writer, leaf, position,
                                                 generation, &record, error);
+      if (rc == LC_OK && !found)
+        rc = lc_collection_segment_ready(&collection->active, error);
       if (record.published || (rc == LC_OK && found))
         lc_cc_append_result(&record, found, out);
       if (rc == LC_OK && !found)
@@ -2194,21 +2144,21 @@ static int lc_cc_append(lc_collection *self,
   lc_pouch_collection_writer_close(writer);
   if (rc != LC_OK && !found && record.published)
     collection->trusted = 0;
-  if (rc == LC_OK && sync_fd >= 0) {
+  if (rc == LC_OK && commit.ops) {
     /* The commit pin keeps capture/compaction behind this group. Appenders may
      * now stage the next complete record while this caller waits for sync. Keep
      * the root mode pin until the durable outcome is known. */
     lc_cc_write_unlock(&guard);
 #ifdef LOCKDC_TEST_BUILD
-    if (lc_collection_commit_wait_test_hook != NULL)
+    if (collection->pouch->durable_sync &&
+        lc_collection_commit_wait_test_hook != NULL)
       rc = lc_collection_commit_wait_test_hook(
           lc_collection_commit_wait_test_context, self, error);
 #endif
     if (rc == LC_OK)
-      rc = lc_pouch_fsync_commit(collection->pouch, sync_fd, error);
+      rc = lc_collection_segment_publish(&commit, collection->pouch, error);
   }
-  if (sync_fd >= 0)
-    (void)close(sync_fd);
+  lc_collection_segment_close(&commit);
   lc_collection_write_leave(&guard);
   if (rc == LC_OK && !found)
     lc_pouch_compaction_note_mutation(collection->pouch, collection->ns, 0);
@@ -2240,7 +2190,9 @@ int lc_collection_publish_stream(
   lc_pouch_collection_record current, proof;
   lc_u64 segment = 0U, query_ordinal = LC_U64_MAX;
   char leaf[64];
-  int found = 0, rc, sync_fd = -1;
+  int found = 0, rc;
+  lc_collection_segment commit;
+  memset(&commit, 0, sizeof(commit));
   memset(&current, 0, sizeof(current));
   memset(out, 0, sizeof(*out));
   rc = lc_collection_lease_check(collection, 1, error);
@@ -2279,7 +2231,7 @@ int lc_collection_publish_stream(
                                         LC_COLLECTION_APPEND_STAGED, error);
 #endif
   if (rc == LC_OK)
-    rc = lc_cc_commit_pin(collection, guard, segment, &sync_fd, error);
+    rc = lc_cc_commit_pin(collection, guard, segment, &commit, error);
   if (rc == LC_OK) {
     rc = lc_collection_metadata_enter(collection, 1, error);
     if (rc == LC_OK) {
@@ -2301,15 +2253,16 @@ int lc_collection_publish_stream(
       }
       if (rc == LC_OK && !found && body->stream_extents)
         rc = lc_pouch_collection_writer_publish_stream(
-            writer, lc_pouch_record_file_io(collection->active_fd), leaf,
-            body->stream_segment, body->stream_offset, body->stream_extents,
-            body->stream_root_bytes, body->stream_height,
-            collection->order.upper_position + 1U,
+            writer, collection->active.io, leaf, body->stream_segment,
+            body->stream_offset, body->stream_extents, body->stream_root_bytes,
+            body->stream_height, collection->order.upper_position + 1U,
             collection->order.generation + 1U, &current, error);
       else if (rc == LC_OK && !found)
         rc = lc_pouch_collection_writer_publish(
             writer, leaf, collection->order.upper_position + 1U,
             collection->order.generation + 1U, &current, error);
+      if (rc == LC_OK && !found)
+        rc = lc_collection_segment_ready(&collection->active, error);
 #ifdef LOCKDC_TEST_BUILD
       if (rc == LC_OK && !found && lc_collection_append_test_hook != NULL)
         rc = lc_collection_append_test_hook(
@@ -2350,18 +2303,18 @@ int lc_collection_publish_stream(
     collection->trusted = 0;
   /* Roll back unpublished bytes while append authority still excludes peers. */
   lc_pouch_collection_writer_close(writer);
-  if (rc == LC_OK && sync_fd >= 0) {
+  if (rc == LC_OK && commit.ops) {
     lc_cc_write_unlock(guard);
 #ifdef LOCKDC_TEST_BUILD
-    if (lc_collection_commit_wait_test_hook != NULL)
+    if (collection->pouch->durable_sync &&
+        lc_collection_commit_wait_test_hook != NULL)
       rc = lc_collection_commit_wait_test_hook(
           lc_collection_commit_wait_test_context, &collection->pub, error);
 #endif
     if (rc == LC_OK)
-      rc = lc_pouch_fsync_commit(collection->pouch, sync_fd, error);
+      rc = lc_collection_segment_publish(&commit, collection->pouch, error);
   }
-  if (sync_fd >= 0)
-    (void)close(sync_fd);
+  lc_collection_segment_close(&commit);
   lc_collection_write_leave(guard);
   if (rc == LC_OK && !found)
     lc_pouch_compaction_note_mutation(collection->pouch, collection->ns, 0);
@@ -2389,9 +2342,10 @@ static int lc_cc_entry_metadata(lc_collection *self, uint64_t position,
   lc_collection_handle *collection;
   lc_collection_order_row row;
   lc_pouch_collection_record current, changed;
-  lc_u64 file_segment, file_end, segment, generation;
+  lc_u64 segment, generation;
+  lc_collection_input input;
   char leaf[64];
-  int fd, found, rc;
+  int found, rc;
   if (position == 0U || req == NULL || out == NULL || req->has_max_entries)
     return lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
@@ -2411,8 +2365,8 @@ static int lc_cc_entry_metadata(lc_collection *self, uint64_t position,
     lc_collection_call_end(&call);
     return rc;
   }
-  fd = -1;
-  file_segment = file_end = segment = generation = 0U;
+  memset(&input, 0, sizeof(input));
+  segment = generation = 0U;
   memset(&changed, 0, sizeof(changed));
   rc = lc_collection_order_find(&collection->order, position, &row, &found,
                                 error);
@@ -2421,8 +2375,7 @@ static int lc_cc_entry_metadata(lc_collection *self, uint64_t position,
                                "entry metadata requires a live state object");
   if (rc == LC_OK)
     rc = lc_collection_record_ref(collection, row.segment, row.record_offset,
-                                  &fd, &file_segment, &file_end, &current,
-                                  error);
+                                  &input, &current, error);
   if (rc == LC_OK &&
       (current.deleted || current.position != position ||
        current.published_at != row.published_at || current.bytes != row.bytes))
@@ -2442,12 +2395,14 @@ static int lc_cc_entry_metadata(lc_collection *self, uint64_t position,
     lc_collection_metadata_leave(collection);
     if (rc == LC_OK)
       rc = lc_pouch_collection_record_metadata(
-          collection->pouch, collection->active_fd, leaf, &current, row.segment,
+          collection->pouch, collection->active.io, leaf, &current, row.segment,
           generation, -(lc_pouch_unix_seconds)req->retention_seconds, &changed,
           error);
     if (rc == LC_OK)
-      rc = lc_pouch_fsync_commit(collection->pouch, collection->active_fd,
-                                 error);
+      rc = lc_collection_segment_ready(&collection->active, error);
+    if (rc == LC_OK)
+      rc = lc_collection_segment_publish(&collection->active, collection->pouch,
+                                         error);
     if (changed.published)
       lc_cc_append_result(&changed, 0, out);
     if (rc == LC_OK) {
@@ -2468,8 +2423,7 @@ static int lc_cc_entry_metadata(lc_collection *self, uint64_t position,
       lc_cc_append_result(&current, 0, out);
     lc_collection_metadata_leave(collection);
   }
-  if (fd >= 0)
-    (void)close(fd);
+  lc_collection_input_close(&input);
   if (rc != LC_OK && changed.published)
     collection->trusted = 0;
   lc_collection_write_leave(&guard);
@@ -2489,11 +2443,9 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
   lc_pouch_collection_record record;
   lc_pouch_collection_record deleted;
   lc_collection_handle *collection;
-  lc_u64 file_segment;
-  lc_u64 file_end;
+  lc_collection_input input;
   lc_u64 segment;
   lc_u64 generation;
-  int fd;
   int found;
   int changed;
   int rc;
@@ -2513,9 +2465,7 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
     lc_collection_call_end(&call);
     return rc;
   }
-  fd = -1;
-  file_segment = 0U;
-  file_end = 0U;
+  memset(&input, 0, sizeof(input));
   changed = 0;
   memset(&deleted, 0, sizeof(deleted));
   if (only_due == 2) {
@@ -2544,9 +2494,8 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
     out->deleted = 1;
     out->already_deleted = 1;
   } else if (rc == LC_OK) {
-    rc =
-        lc_collection_record_ref(collection, row.segment, row.record_offset,
-                                 &fd, &file_segment, &file_end, &record, error);
+    rc = lc_collection_record_ref(collection, row.segment, row.record_offset,
+                                  &input, &record, error);
     if (rc == LC_OK &&
         (record.deleted || record.position != position ||
          record.published_at != row.published_at || record.bytes != row.bytes))
@@ -2568,11 +2517,13 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
     lc_collection_metadata_leave(collection);
     if (rc == LC_OK)
       rc = lc_pouch_collection_record_delete(collection->pouch,
-                                             collection->active_fd, &record,
+                                             collection->active.io, &record,
                                              generation, &deleted, error);
     if (rc == LC_OK)
-      rc = lc_pouch_fsync_commit(collection->pouch, collection->active_fd,
-                                 error);
+      rc = lc_collection_segment_ready(&collection->active, error);
+    if (rc == LC_OK)
+      rc = lc_collection_segment_publish(&collection->active, collection->pouch,
+                                         error);
     if (rc == LC_OK) {
       rc = lc_collection_metadata_enter(collection, 1, error);
       if (rc == LC_OK) {
@@ -2595,8 +2546,7 @@ static int lc_cc_delete_current(lc_collection *self, uint64_t position,
   }
   lc_collection_metadata_leave(collection);
 finish_delete:
-  if (fd >= 0)
-    (void)close(fd);
+  lc_collection_input_close(&input);
   if (rc != LC_OK && deleted.published)
     collection->trusted = 0;
   lc_collection_write_leave(&guard);
@@ -2630,7 +2580,7 @@ static int lc_cc_drop_current(lc_collection *self, int only_due,
   lc_collection_guard guard;
   lc_collection_guard root_guard;
   lc_collection_handle *collection;
-  int catalog_fd;
+  lc_collection_lock catalog_pin;
   int rc;
   *removed = 0;
   rc = lc_collection_call_begin(self, 1, &call, error);
@@ -2639,13 +2589,15 @@ static int lc_cc_drop_current(lc_collection *self, int only_due,
   error = call.error;
   call.maintenance = only_due != 0;
   collection = call.collection;
-  catalog_fd = -1;
+  memset(&catalog_pin, 0, sizeof(catalog_pin));
   rc = lc_collection_root_begin(collection->pouch, &scope, &root_guard, error);
   if (rc != LC_OK) {
     lc_collection_call_end(&call);
     return rc;
   }
-  rc = lc_collection_catalog_lock(collection->catalog_base, &catalog_fd, error);
+  rc = lc_collection_lock_enter(collection->authority,
+                                LC_COLLECTION_AUTH_CATALOG, 0U, 1, 1,
+                                &catalog_pin, error);
   if (rc == LC_OK) {
     rc = lc_collection_write_enter(&call, &guard, error);
     if (rc == LC_OK) {
@@ -2660,30 +2612,15 @@ static int lc_cc_drop_current(lc_collection *self, int only_due,
         /* Logical deletion is the authority even if catalog cleanup fails. */
         collection->trusted = 0;
       }
-      if (rc == LC_OK && unlink(collection->catalog_path) != 0 &&
-          errno != ENOENT)
-        rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to remove collection name");
-      if (rc == LC_OK) {
-        char *names;
-        names = lc_pouch_path_join(&collection->allocator,
-                                   collection->catalog_base, "names");
-        if (names == NULL)
-          rc = lc_collection_failure(
-              error, LC_ERR_NOMEM, NULL,
-              "failed to allocate collection catalog path");
-        else
-          rc = lc_pouch_path_fsync_directory(
-              names, "failed to sync collection drop", error);
-        lc_free_with_allocator(&collection->allocator, names);
-      }
+      if (rc == LC_OK)
+        rc = collection->owner.ops->remove(collection->owner.context, error);
       if (rc == LC_OK)
         *removed = 1;
     leave_drop:
       lc_collection_metadata_leave(collection);
       lc_collection_write_leave(&guard);
     }
-    (void)close(catalog_fd);
+    lc_collection_lock_leave(&catalog_pin);
   }
   lc_collection_root_end(&scope, &root_guard);
   lc_collection_call_end(&call);
@@ -2711,6 +2648,31 @@ int lc_collection_open_bound(lc_client_handle *client, const char *ns,
                                     out, error);
 }
 
+static void lc_cc_bind_methods(lc_collection_handle *collection) {
+  collection->pub.head = lc_collection_head_method;
+  collection->pub.edit = lc_collection_edit_method;
+  collection->pub.edit_status = lc_collection_edit_status_method;
+  collection->pub.describe = lc_cc_describe;
+  collection->pub.acquire = lc_collection_acquire_method;
+  collection->pub.takeover = lc_collection_takeover_method;
+  collection->pub.keepalive = lc_collection_keepalive_method;
+  collection->pub.release = lc_collection_release_method;
+  collection->pub.metadata = lc_cc_metadata;
+  collection->pub.append = lc_cc_append;
+  collection->pub.append_staged = lc_collection_append_staged_method;
+  collection->pub.append_begin = lc_collection_append_begin_method;
+  collection->pub.append_status = lc_cc_status;
+  collection->pub.entry_metadata = lc_cc_entry_metadata;
+  collection->pub.read = lc_collection_read_method;
+  collection->pub.delete_entry = lc_cc_delete;
+  collection->pub.drop = lc_cc_drop;
+  collection->pub.close = lc_cc_close_method;
+  collection->pub.ns = collection->ns;
+  collection->pub.name = collection->name;
+  collection->pub.collection_id = collection->id;
+  collection->pub.impl = collection;
+}
+
 int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
                                const char *ns, const char *name, const char *id,
                                const char *base, const char *catalog,
@@ -2734,6 +2696,7 @@ int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
   if (collection == NULL)
     return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
                                  "failed to allocate collection receiver");
+  lc_collection_file_bind(collection);
   collection->client = client;
   collection->pouch = pouch;
   collection->allocator = *allocator;
@@ -2743,6 +2706,7 @@ int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
       collection->append_fd = collection->active_fd = collection->head_fd =
           collection->streams_fd = -1;
   collection->order.fd = collection->ids.fd = -1;
+  collection->native_reads.fd = -1;
   collection->references = 1UL;
   memcpy(collection->id, id, sizeof(collection->id));
   collection->ns = lc_strdup_with_allocator(allocator, ns);
@@ -2777,6 +2741,18 @@ int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
                                "failed to create collection partition");
   if (rc == LC_OK && create)
     lc_pouch_compaction_note_mutation(pouch, ns, 0);
+  if (rc == LC_OK) {
+    lc_collection_file_reads_init(&collection->native_reads,
+                                  collection->directory);
+    collection->native_reads.fd =
+        open(collection->directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (collection->native_reads.fd < 0)
+      rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
+                                 "failed to pin collection read directory");
+    else
+      collection->reads =
+          lc_collection_file_reads_access(&collection->native_reads);
+  }
   if (rc == LC_OK) {
     if (pthread_mutex_init(&collection->metadata_mutex, NULL) != 0)
       rc = lc_collection_failure(
@@ -2831,6 +2807,12 @@ int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
                                O_RDWR | O_CREAT | O_EXCL,
                                &collection->active_fd, error);
           collection->active_fd_segment = 1U;
+          if (rc == LC_OK) {
+            rc = lc_collection_segment_adopt_file(collection->active_fd,
+                                                  &collection->active, error);
+            if (rc != LC_OK)
+              collection->active_fd = -1;
+          }
           if (rc == LC_OK && fsync(collection->active_fd) != 0)
             rc = lc_collection_failure(
                 error, LC_ERR_TRANSPORT, NULL,
@@ -2931,30 +2913,102 @@ int lc_collection_storage_open(lc_pouch *pouch, lc_client_handle *client,
     lc_collection_destroy(collection);
     return rc;
   }
-  collection->pub.head = lc_collection_head_method;
-  collection->pub.edit = lc_collection_edit_method;
-  collection->pub.edit_status = lc_collection_edit_status_method;
-  collection->pub.describe = lc_cc_describe;
-  collection->pub.acquire = lc_collection_acquire_method;
-  collection->pub.takeover = lc_collection_takeover_method;
-  collection->pub.keepalive = lc_collection_keepalive_method;
-  collection->pub.release = lc_collection_release_method;
-  collection->pub.metadata = lc_cc_metadata;
-  collection->pub.append = lc_cc_append;
-  collection->pub.append_staged = lc_collection_append_staged_method;
-  collection->pub.append_begin = lc_collection_append_begin_method;
-  collection->pub.append_status = lc_cc_status;
-  collection->pub.entry_metadata = lc_cc_entry_metadata;
-  collection->pub.read = lc_collection_read_method;
-  collection->pub.delete_entry = lc_cc_delete;
-  collection->pub.drop = lc_cc_drop;
-  collection->pub.close = lc_cc_close_method;
-  collection->pub.ns = collection->ns;
-  collection->pub.name = collection->name;
-  collection->pub.collection_id = collection->id;
-  collection->pub.impl = collection;
+  lc_cc_bind_methods(collection);
   *out = &collection->pub;
   return LC_OK;
+}
+
+int lc_collection_owned_open(lc_pouch *pouch, lc_client_handle *client,
+                             const char *ns, const char *name, const char *id,
+                             lc_collection_owner owner, lc_collection **out,
+                             lc_error *error) {
+  lc_collection_handle *collection;
+  lc_collection_call scope;
+  lc_collection_guard guard;
+  lc_collection_lock append_pin;
+  int rc = LC_OK, entered = 0, appended = 0;
+  if (out)
+    *out = NULL;
+  if (!pouch || !out || !ns || !name || !id || !lc_xid_is_valid(id) ||
+      !owner.ops || !owner.ops->attach || !owner.ops->release ||
+      !owner.ops->finish || !owner.ops->clone || !owner.ops->bound ||
+      !owner.ops->remove) {
+    if (owner.ops && owner.ops->release)
+      owner.ops->release(owner.context);
+    return lc_collection_failure(error, LC_ERR_INVALID, NULL,
+                                 "collection admission requires a bound owner");
+  }
+  collection =
+      lc_calloc_with_allocator(&pouch->allocator, 1U, sizeof(*collection));
+  if (!collection) {
+    owner.ops->release(owner.context);
+    return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
+                                 "cannot allocate collection receiver");
+  }
+  collection->owner = owner;
+  collection->pouch = pouch;
+  collection->client = client;
+  collection->allocator = pouch->allocator;
+  if (client)
+    lc_client_handle_retain(client);
+  collection->session_fd = collection->join_fd = collection->metadata_fd =
+      collection->append_fd = collection->active_fd = collection->head_fd =
+          collection->streams_fd = -1;
+  collection->native_reads.fd = -1;
+  collection->order.fd = collection->ids.fd = -1;
+  collection->references = 1UL;
+  memcpy(collection->id, id, sizeof(collection->id));
+  collection->ns = lc_strdup_with_allocator(&collection->allocator, ns);
+  collection->name = lc_strdup_with_allocator(&collection->allocator, name);
+  if (!collection->ns || !collection->name)
+    rc = lc_collection_failure(error, LC_ERR_NOMEM, NULL,
+                               "cannot retain collection identity");
+  if (rc == LC_OK) {
+    if (pthread_mutex_init(&collection->metadata_mutex, NULL) != 0)
+      rc = lc_collection_failure(
+          error, LC_ERR_TRANSPORT, NULL,
+          "cannot initialize collection metadata authority");
+    else
+      collection->metadata_mutex_initialized = 1;
+  }
+  if (rc == LC_OK) {
+    if (pthread_mutex_init(&collection->append_mutex, NULL) != 0)
+      rc = lc_collection_failure(
+          error, LC_ERR_TRANSPORT, NULL,
+          "cannot initialize collection append authority");
+    else
+      collection->append_mutex_initialized = 1;
+  }
+  lc_cc_bind_methods(collection);
+  if (rc == LC_OK) {
+    rc = lc_collection_root_begin(pouch, &scope, &guard, error);
+    entered = rc == LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = owner.ops->attach(owner.context, collection, error);
+  if (rc == LC_OK) {
+    rc = lc_collection_lock_enter(collection->authority,
+                                  LC_COLLECTION_AUTH_APPEND, 0U, 1, 1,
+                                  &append_pin, error);
+    appended = rc == LC_OK;
+  }
+  if (rc == LC_OK) {
+    rc = lc_collection_metadata_enter(collection, 1, error);
+    if (rc == LC_OK) {
+      rc = lc_collection_reconcile(collection, error);
+      lc_collection_metadata_leave(collection);
+    }
+  }
+  if (appended)
+    lc_collection_lock_leave(&append_pin);
+  if (entered)
+    lc_collection_root_end(&scope, &guard);
+  if (rc != LC_OK) {
+    collection->trusted = 0;
+    lc_collection_destroy(collection);
+  } else
+    *out = &collection->pub;
+  return rc;
 }
 
 int lc_collection_recode_head(lc_pouch *pouch, const char *directory,
@@ -2962,6 +3016,7 @@ int lc_collection_recode_head(lc_pouch *pouch, const char *directory,
   lc_collection_handle collection;
   int rc;
   memset(&collection, 0, sizeof(collection));
+  lc_collection_file_bind(&collection);
   collection.pouch = pouch;
   collection.allocator = pouch->allocator;
   collection.directory = (char *)directory;
@@ -2996,6 +3051,9 @@ int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
   collection.pouch = work->pouch;
   collection.allocator = work->pouch->allocator;
   collection.directory = (char *)target;
+  lc_collection_file_bind(&collection);
+  lc_collection_file_reads_init(&collection.native_reads, target);
+  collection.reads = lc_collection_file_reads_access(&collection.native_reads);
   collection.active_fd = collection.head_fd = collection.order.fd =
       collection.ids.fd = -1;
   strcpy(collection.id, id);
@@ -3061,10 +3119,13 @@ int lc_collection_recode_finish(lc_pouch_recode *work, const char *source,
     rc = lc_cc_checkpoint(&collection, 1, &valid, error);
   lc_collection_order_close(&collection.order);
   lc_collection_ids_close(&collection.ids);
-  if (collection.active_fd >= 0)
+  if (collection.active.ops)
+    lc_collection_segment_close(&collection.active);
+  else if (collection.active_fd >= 0)
     (void)close(collection.active_fd);
   if (collection.head_fd >= 0)
     (void)close(collection.head_fd);
+  lc_collection_file_reads_cleanup(&collection.native_reads);
   lc_free_with_allocator(&collection.allocator, collection.order_path);
   lc_free_with_allocator(&collection.allocator, collection.ids_path);
   lc_free_with_allocator(&collection.allocator, collection.head_path);

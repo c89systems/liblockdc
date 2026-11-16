@@ -1,7 +1,7 @@
+#include "lc_collection_catalog_record.h"
 #include "lc_collection_internal.h"
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_path.h"
-#include "lc_utf8.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -10,26 +10,10 @@
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
-#include <zlib.h>
 
 /* Catalog metadata is bounded and contains no application document. Hashing
  * the filename permits every supported UTF-8 name within NAME_MAX. The name
  * itself remains authoritative and detects an accidental digest collision. */
-#define LC_CATALOG_BYTES 320U
-static const unsigned char lc_catalog_magic[8] = {'L', 'C', 'C', 'A',
-                                                  'T', 0,   0,   0};
-
-static int lc_catalog_name_valid(const char *name) {
-  lc_utf8_state utf8;
-  size_t size;
-  if (name == NULL)
-    return 0;
-  size = strlen(name);
-  memset(&utf8, 0, sizeof(utf8));
-  return size != 0U && size <= 255U &&
-         lc_utf8_push(&utf8, (const unsigned char *)name, size) &&
-         utf8.remaining == 0;
-}
 
 static int lc_catalog_endpoint(lc_client *self, lc_client_handle **out,
                                lc_error *error) {
@@ -82,7 +66,7 @@ int lc_collection_catalog_paths(lc_client_handle *client, const char *ns,
   int rc;
   *base = *catalog = NULL;
   if (ns == NULL || ns[0] == '\0' ||
-      (name != NULL && !lc_catalog_name_valid(name)))
+      (name != NULL && !lc_collection_catalog_name_valid(name)))
     return lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
         "collection namespace and valid UTF-8 name are required");
@@ -163,11 +147,8 @@ int lc_collection_catalog_lock(const char *base, int *fd, lc_error *error) {
 
 int lc_collection_catalog_read(const char *path, char id[LC_XID_STRING_SIZE],
                                char name[256], lc_error *error) {
-  unsigned char bytes[LC_CATALOG_BYTES + 1U];
-  unsigned long expected;
-  unsigned long actual;
+  unsigned char bytes[LC_COLLECTION_CATALOG_BYTES + 1U];
   size_t total;
-  size_t length;
   ssize_t got;
   int fd;
   fd = open(path, O_RDONLY);
@@ -191,48 +172,23 @@ int lc_collection_catalog_read(const char *path, char id[LC_XID_STRING_SIZE],
     total += (size_t)got;
   }
   (void)close(fd);
-  if (total != LC_CATALOG_BYTES || memcmp(bytes, lc_catalog_magic, 8U) != 0)
+  if (total != LC_COLLECTION_CATALOG_BYTES)
     return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                  "collection catalog metadata is invalid");
-  actual = (unsigned long)bytes[316] | ((unsigned long)bytes[317] << 8U) |
-           ((unsigned long)bytes[318] << 16U) |
-           ((unsigned long)bytes[319] << 24U);
-  expected = (unsigned long)crc32(0L, bytes, 316U);
-  length = (size_t)bytes[32];
-  if (actual != expected || length == 0U || bytes[28] != 0U ||
-      bytes[40U + length] != 0U)
-    return lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
-                                 "collection catalog identity is invalid");
-  memcpy(id, bytes + 8U, LC_XID_STRING_SIZE);
-  memcpy(name, bytes + 40U, length + 1U);
-  if (!lc_catalog_name_valid(name) || strlen(name) != length ||
-      strlen(id) != LC_XID_STRING_SIZE - 1U ||
-      strspn(id, "0123456789abcdefghijklmnopqrstuv") != LC_XID_STRING_SIZE - 1U)
-    return lc_collection_failure(
-        error, LC_ERR_PROTOCOL, "collection_corrupt",
-        "collection catalog contains an invalid name or ID");
-  return LC_OK;
+  return lc_collection_catalog_decode(bytes, id, name, error);
 }
 
 int lc_collection_catalog_write(const char *path, const char *id,
                                 const char *name, lc_error *error) {
-  unsigned char bytes[LC_CATALOG_BYTES];
-  unsigned long crc;
-  memset(bytes, 0, sizeof(bytes));
-  memcpy(bytes, lc_catalog_magic, 8U);
-  memcpy(bytes + 8U, id, LC_XID_STRING_SIZE);
-  bytes[32] = (unsigned char)strlen(name);
-  memcpy(bytes + 40U, name, strlen(name));
-  crc = (unsigned long)crc32(0L, bytes, 316U);
-  bytes[316] = (unsigned char)crc;
-  bytes[317] = (unsigned char)(crc >> 8U);
-  bytes[318] = (unsigned char)(crc >> 16U);
-  bytes[319] = (unsigned char)(crc >> 24U);
-  return lc_pouch_path_write_bytes_file(path, bytes, sizeof(bytes), error);
+  unsigned char bytes[LC_COLLECTION_CATALOG_BYTES];
+  int rc = lc_collection_catalog_encode(id, name, bytes, error);
+  return rc == LC_OK
+             ? lc_pouch_path_write_bytes_file(path, bytes, sizeof(bytes), error)
+             : rc;
 }
 
-int lc_collection_catalog_bound(lc_collection_handle *collection,
-                                lc_error *error) {
+int lc_collection_file_catalog_bound(lc_collection_handle *collection,
+                                     lc_error *error) {
   char id[LC_XID_STRING_SIZE];
   char name[256];
   int rc;
@@ -242,6 +198,28 @@ int lc_collection_catalog_bound(lc_collection_handle *collection,
     rc =
         lc_collection_failure(error, LC_ERR_INVALID, "collection_stale",
                               "collection name belongs to another incarnation");
+  return rc;
+}
+
+int lc_collection_catalog_bound(lc_collection_handle *collection,
+                                lc_error *error) {
+  return collection->owner.ops->bound(collection->owner.context, error);
+}
+int lc_collection_file_catalog_remove(lc_collection_handle *collection,
+                                      lc_error *error) {
+  char *names;
+  int rc;
+  if (unlink(collection->catalog_path) != 0 && errno != ENOENT)
+    return lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
+                                 "failed to remove collection name");
+  names = lc_pouch_path_join(&collection->allocator, collection->catalog_base,
+                             "names");
+  if (!names)
+    return lc_collection_failure(error, LC_ERR_NOMEM, NULL,
+                                 "failed to allocate collection catalog path");
+  rc = lc_pouch_path_fsync_directory(names, "failed to sync collection drop",
+                                     error);
+  lc_free_with_allocator(&collection->allocator, names);
   return rc;
 }
 
@@ -270,7 +248,8 @@ static int lc_catalog_open(lc_client *self, const lc_collection_config *config,
     *out = NULL;
   rc = lc_catalog_endpoint(self, &client, error);
   if (rc == LC_OK &&
-      (config == NULL || !lc_catalog_name_valid(config->name) || out == NULL))
+      (config == NULL || !lc_collection_catalog_name_valid(config->name) ||
+       out == NULL))
     rc = lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
         "collection operation requires a valid name and output");
@@ -298,6 +277,18 @@ static int lc_catalog_open(lc_client *self, const lc_collection_config *config,
   lc_client_handle_retain(client);
   rc = lc_collection_root_begin(client->pouch, &scope, &guard, error);
   entered = rc == LC_OK;
+  if (rc == LC_OK && client->pouch->storage.ops) {
+    if (client->pouch->storage.ops->collection_open)
+      rc = client->pouch->storage.ops->collection_open(
+          client->pouch->storage.context, self, ns, config, create, out, error);
+    else
+      rc = lc_collection_failure(error, LC_ERR_UNSUPPORTED, NULL,
+                                 "storage owner has not admitted collections");
+    lc_collection_root_end(&scope, &guard);
+    lc_client_handle_release(client);
+    lc_error_cleanup(&local);
+    return rc;
+  }
   if (rc == LC_OK)
     rc = lc_collection_catalog_paths(client, ns, config->name, create, &base,
                                      &catalog, error);
@@ -459,6 +450,17 @@ int lc_client_list_collections_method(lc_client *self, const char *ns,
   lc_client_handle_retain(client);
   rc = lc_pouch_client_public_namespace(client, ns, &ns, error);
   if (rc != LC_OK) {
+    lc_client_handle_release(client);
+    lc_error_cleanup(&local);
+    return rc;
+  }
+  if (client->pouch->storage.ops) {
+    if (client->pouch->storage.ops->collections_visit)
+      rc = client->pouch->storage.ops->collections_visit(
+          client->pouch->storage.context, self, ns, visitor, context, error);
+    else
+      rc = lc_collection_failure(error, LC_ERR_UNSUPPORTED, NULL,
+                                 "storage owner has not admitted collections");
     lc_client_handle_release(client);
     lc_error_cleanup(&local);
     return rc;

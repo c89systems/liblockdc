@@ -195,7 +195,7 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
     return cat_error(e, LC_ERR_PROTOCOL, "invalid namespace owner record");
   if (!checkpoint && p->catalog->stream.kind) {
     p->catalog->target = target_entry(s, p->catalog);
-    if (!p->catalog->target)
+    if (!p->catalog->target || p->catalog->target->orphan_claimed)
       return cat_error(e, LC_ERR_PROTOCOL,
                        "catalog target is stale or retired");
   }
@@ -319,7 +319,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
     if (rc == LC_OK && (s->token_next > s->token_limit ||
-                        (!identity && !ref_matches(s, head, target))))
+                        (!identity && (!ref_matches(s, head, target) ||
+                                       head->orphan_claimed))))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog stream reference or identity invalid");
     if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind)

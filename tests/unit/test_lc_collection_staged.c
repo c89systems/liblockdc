@@ -1295,7 +1295,8 @@ test_direct_units_filter_metadata_corruption_and_rebuild(void **state) {
     lc_free_with_allocator(&c->allocator, path);
     assert_true(fd >= 0);
     lc_collection_unit original, altered;
-    check(f, lc_collection_unit_read(fd, row.unit_offset, row.stored_bytes,
+    check(f, lc_collection_unit_read(lc_collection_unit_file_io(fd),
+                                     row.unit_offset, row.stored_bytes,
                                      &original, &f->error));
     for (int corrupt = 0; corrupt < 5; ++corrupt) {
       altered = original;
@@ -1314,12 +1315,14 @@ test_direct_units_filter_metadata_corruption_and_rebuild(void **state) {
         assert_non_null(id);
         id[1] = 'e';
       }
-      check(f, lc_collection_unit_write_meta(fd, row.unit_offset, &altered,
+      check(f, lc_collection_unit_write_meta(lc_collection_unit_file_io(fd),
+                                             row.unit_offset, &altered,
                                              &f->error));
       direct_verify(f, corrupt & 1, LC_ERR_PROTOCOL);
     }
-    check(f, lc_collection_unit_write_meta(fd, row.unit_offset, &original,
-                                           &f->error));
+    check(f,
+          lc_collection_unit_write_meta(lc_collection_unit_file_io(fd),
+                                        row.unit_offset, &original, &f->error));
     assert_int_equal(close(fd), 0);
     metadata.has_retention_seconds = 1;
     metadata.retention_seconds = 3600;

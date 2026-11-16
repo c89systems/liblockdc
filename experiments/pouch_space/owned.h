@@ -58,6 +58,12 @@ int ps_owned_recovered(ps_owned_head *, uint64_t tail, lc_error *);
  * head removal and atomically retires its complete run directory. Held handles
  * retain payload pins through durable root retirement. */
 int ps_owned_seal(ps_owned_head *, lc_error *);
+/* Revalidate absence of durable catalog references/views and exclude new
+ * bindings until this exclusive owner closes. Used before cascading a closed
+ * logical owner's child metadata; failure never authorizes child removal.
+ * This process-local claim leaves the identity present for retry after a
+ * failed cleanup or process death. It writes no format or payload bytes. */
+int ps_owned_claim_orphan(ps_owned_head *, lc_error *);
 int ps_owned_retire(ps_owned_head *, lc_error *);
 
 #endif

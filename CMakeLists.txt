@@ -566,6 +566,7 @@ set(lc_sources
     src/lc_collection_lease.c
     src/lc_collection_migration.c
     src/lc_collection_catalog.c
+    src/lc_collection_catalog_record.c
     src/lc_collection_head.c
     src/lc_collection_read.c
     src/lc_collection_compact.c
@@ -576,6 +577,8 @@ set(lc_sources
     src/lc_collection_writer.c
     src/lc_collection_chunks.c
     src/lc_collection_unit.c
+    src/lc_collection_storage.c
+    src/lc_collection_file_projections.c
     src/lc_collection_recode.c
     src/lc_consumer_service.c
     src/lc_core.c

@@ -55,7 +55,9 @@ int ps_root_namespace_visit(ps_root *, ps_namespace_visit_fn, void *,
 /* Explicit maintenance only: retire closed streams with no catalog reference
  * or view, rechecking each captured incarnation before retirement. This never
  * opens canonical records or reads bodies. Open owners are excluded; candidates
- * claimed concurrently are counted as skipped. Checkpoint enables reuse. */
+ * claimed concurrently are counted as skipped. Root ownership reserves stream
+ * key zero for collection identity: its children/control retire first, and a
+ * failed pass retains that identity for retry. Checkpoint enables reuse. */
 int ps_root_reclaim_orphans(ps_root *, uint64_t *reclaimed, uint64_t *skipped,
                             lc_error *);
 

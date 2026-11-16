@@ -50,7 +50,7 @@ static void lc_cw_discard(lc_collection_writer_handle *writer) {
   lc_collection_chunks_close(&writer->chunks);
   pthread_mutex_lock(&lc_cw_lifecycle);
   if (writer->pinned && --writer->collection->stream_writers == 0)
-    (void)flock(writer->collection->streams_fd, LOCK_UN);
+    lc_collection_lock_leave(&writer->collection->streams_pin);
   writer->pinned = 0;
   pthread_mutex_unlock(&lc_cw_lifecycle);
   if (writer->emitted && writer->state != LC_CW_COMMITTED)
@@ -81,13 +81,12 @@ static int lc_cw_storage_leave(lc_collection_writer_handle *writer, int rc,
                                lc_error *error) {
   if (writer->entered && !writer->committing) {
     if (rc == LC_OK) {
-      off_t end = lseek(writer->collection->active_fd, 0, SEEK_END);
-      rc = end < 0
-               ? lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                       "failed to locate canonical stream tail")
-               : lc_collection_order_checkpoint(&writer->collection->order,
-                                                writer->collection->head.active,
-                                                (lc_u64)end, error);
+      uint64_t end;
+      rc = lc_pouch_record_io_tail(writer->collection->active.io, &end, error);
+      if (rc == LC_OK)
+        rc = lc_collection_order_checkpoint(&writer->collection->order,
+                                            writer->collection->head.active,
+                                            end, error);
     }
     lc_collection_metadata_leave(writer->collection);
     lc_collection_write_leave(writer->guard);
@@ -113,8 +112,7 @@ static int lc_cw_emit(lc_sink *sink, const void *bytes, size_t count,
    * payload is copied or retained after this callback. */
   if (writer->committing && !writer->ordinal && !writer->chunks.extents &&
       !writer->chunks.pending.bytes) {
-    const unsigned char *p = bytes;
-    ssize_t written;
+    struct iovec part;
     int rc;
     char leaf[64];
     if (!writer->direct) {
@@ -124,45 +122,30 @@ static int lc_cw_emit(lc_sink *sink, const void *bytes, size_t count,
                                        error);
       if (rc == LC_OK)
         rc = lc_pouch_collection_writer_attach(
-            writer->encoder,
-            lc_pouch_record_file_io(writer->collection->active_fd), leaf,
-            error);
+            writer->encoder, writer->collection->active.io, leaf, error);
       if (rc != LC_OK)
         return 0;
       writer->direct = 1;
     }
-    while (count) {
-      written = write(writer->collection->active_fd, p, count);
-      if (written < 0 && errno == EINTR)
-        continue;
-      if (written <= 0) {
-        lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                              "failed to write final collection codec chunk");
-        return 0;
-      }
-      p += written;
-      count -= (size_t)written;
-    }
-    return 1;
+    part.iov_base = (void *)bytes;
+    part.iov_len = count;
+    return lc_pouch_record_io_append(writer->collection->active.io, &part, 1,
+                                     error) == LC_OK;
   }
   if (!writer->committing && !writer->pinned) {
-    int rc = 0;
+    int rc = LC_OK;
     pthread_mutex_lock(&lc_cw_lifecycle);
-    if (!writer->collection->stream_writers) {
-      do {
-        rc = flock(writer->collection->streams_fd, LOCK_SH);
-      } while (rc != 0 && errno == EINTR);
-    }
-    if (rc == 0) {
+    if (!writer->collection->stream_writers)
+      rc = lc_collection_lock_enter(writer->collection->authority,
+                                    LC_COLLECTION_AUTH_STREAMS, 0U, 0, 1,
+                                    &writer->collection->streams_pin, error);
+    if (rc == LC_OK) {
       ++writer->collection->stream_writers;
       writer->pinned = 1;
     }
     pthread_mutex_unlock(&lc_cw_lifecycle);
-    if (rc != 0) {
-      lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                            "failed to pin canonical stream");
+    if (rc != LC_OK)
       return 0;
-    }
   }
   writer->emitted = 1;
   if (!writer->chunks.pending.bytes) {
@@ -548,21 +531,6 @@ int lc_collection_append_begin_method(lc_collection *self,
                                  &segment, &found, error);
   if (rc == LC_OK)
     writer->hash_only = found;
-  if (rc == LC_OK && !found && call.collection->streams_fd < 0) {
-    char *path = lc_pouch_path_join(
-        &writer->allocator, call.collection->directory, ".streams.lock");
-    if (!path)
-      rc = lc_collection_failure(error, LC_ERR_NOMEM, NULL,
-                                 "failed to allocate stream gate path");
-    else {
-      call.collection->streams_fd =
-          open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-      lc_free_with_allocator(&writer->allocator, path);
-      if (call.collection->streams_fd < 0)
-        rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to open stream gate");
-    }
-  }
   if (rc == LC_OK)
     rc = lc_xid_new(upload, error);
   if (rc == LC_OK) {
@@ -581,7 +549,7 @@ int lc_collection_append_begin_method(lc_collection *self,
   if (rc == LC_OK && !found) {
     lc_u64 low = 1, high = LC_COLLECTION_UNIT_MAX, middle;
     lc_u64 nominal = call.pouch->segment_target_bytes;
-    lc_u64 capacity = lc_collection_chunks_capacity(call.pouch);
+    lc_u64 capacity = lc_collection_chunks_capacity(call.collection);
     /* Reserve framing overhead separately from the nominal plaintext unit.
      * A target-sized value should not require another codec unit for its tag
      * or metadata. Neither bound describes an in-memory allocation. */

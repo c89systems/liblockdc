@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -35,7 +35,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-scope pouch-scope runtime-staged pouch-staged runtime-sdk-read-points pouch-sdk-read-points runtime-sdk-scan-metadata pouch-sdk-scan-metadata runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection)
+    foreach(mode space-state stream-state runtime-state pouch-state runtime-metadata pouch-metadata runtime-delete pouch-delete runtime-compact pouch-compact runtime-scope pouch-scope runtime-staged pouch-staged runtime-sdk-read-points pouch-sdk-read-points runtime-sdk-scan-metadata pouch-sdk-scan-metadata runtime-read-many pouch-read-many runtime-read-points pouch-read-points runtime-scan-bodies pouch-scan-bodies runtime-scan-metadata pouch-scan-metadata space-collection stream-collection pouch-collection runtime-collection)
       add_test(NAME pouch_space_compare_${mode}
         COMMAND pouch_space_compare ${mode} ${CMAKE_CURRENT_BINARY_DIR} 12 4096 0 2 4096)
       set_tests_properties(pouch_space_compare_${mode} PROPERTIES TIMEOUT 60
@@ -57,6 +57,12 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_collection_test collection_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_collection_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_collection_test PRIVATE pouch_space_experiment)
+  lc_configure_c_test_target(pouch_space_collection_test)
+  add_test(NAME pouch_space_collection_storage COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   # Same owner sources against the existing logical-engine test library, so
   # logical expiry clocks never alter filesystem writer-heartbeat clocks.
   add_library(pouch_space_test_experiment STATIC ${pouch_space_sources})
@@ -65,6 +71,28 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
   lc_configure_c_target(pouch_space_test_experiment)
+  add_executable(pouch_space_collection_sdk_test collection_sdk_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_collection_sdk_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(pouch_space_collection_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
+  target_link_libraries(pouch_space_collection_sdk_test PRIVATE pouch_space_test_experiment)
+  target_link_options(pouch_space_collection_sdk_test PRIVATE
+    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  lc_configure_c_test_target(pouch_space_collection_sdk_test)
+  add_test(NAME pouch_space_collection_sdk COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(pouch_space_collection_sdk PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  foreach(codec RANGE 0 3)
+    foreach(sync RANGE 0 1)
+      add_test(NAME pouch_space_collection_io_${codec}_${sync}
+        COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} io ${codec} ${sync})
+      set_tests_properties(pouch_space_collection_io_${codec}_${sync} PROPERTIES
+        TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      add_test(NAME pouch_space_collection_allocation_${codec}_${sync}
+        COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} allocation ${codec} ${sync})
+      set_tests_properties(pouch_space_collection_allocation_${codec}_${sync} PROPERTIES
+        TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+  endforeach()
   add_executable(pouch_space_lease_test lease_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)

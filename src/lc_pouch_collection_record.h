@@ -129,11 +129,12 @@ int lc_pouch_collection_record_append(
  * the prior metadata record for readers of an earlier mutation generation.
  * No body descriptor is opened or read by this operation. */
 int lc_pouch_collection_record_metadata(
-    lc_pouch *pouch, int fd, const char *container_leaf,
+    lc_pouch *pouch, lc_pouch_record_io output, const char *container_leaf,
     const lc_pouch_collection_record *current, uint64_t previous_segment,
     uint64_t generation, lc_pouch_unix_seconds retention,
     lc_pouch_collection_record *out, lc_error *error);
-int lc_pouch_collection_record_delete(lc_pouch *pouch, int fd,
+int lc_pouch_collection_record_delete(lc_pouch *pouch,
+                                      lc_pouch_record_io output,
                                       const lc_pouch_collection_record *current,
                                       uint64_t generation,
                                       lc_pouch_collection_record *out,
@@ -153,24 +154,25 @@ int lc_pouch_collection_record_read_prefix(lc_pouch_record_io, uint64_t,
                                            lc_pouch_collection_record *, void *,
                                            size_t, size_t *, lc_error *);
 /* Relocates a validated canonical record into a distinct append-only output
- * file. Payload ciphertext/compressed bytes and retry/deletion facts remain
+ * owner. Payload ciphertext/compressed bytes and retry/deletion facts remain
  * unchanged; storage spans are rebased and metadata history is collapsed.
- * Borrows metadata, payload and output descriptors and a reusable bounded
+ * Borrows metadata, payload and output capabilities and a reusable bounded
  * buffer. Indexed streams must already have their encoded units copied;
  * relocated_stream supplies their rebuilt physical index. Their immutable
  * descriptors, contexts and logical identity remain unchanged. out must not
  * alias current. The caller syncs/publishes replacement.
  */
 int lc_pouch_collection_record_copy_source(
-    lc_pouch *pouch, int source_fd, int payload_fd,
+    lc_pouch *pouch, lc_pouch_record_io input, lc_pouch_record_io payload,
     const lc_pouch_collection_record *relocated_stream, const char *source_leaf,
-    const lc_pouch_collection_record *current, int destination_fd,
+    const lc_pouch_collection_record *current, lc_pouch_record_io output,
     const char *destination_leaf, unsigned char *buffer, size_t capacity,
     lc_pouch_collection_record *out, lc_error *error);
 int lc_pouch_collection_record_copy(
-    lc_pouch *pouch, int source_fd, int payload_fd, const char *source_leaf,
-    const lc_pouch_collection_record *current, int destination_fd,
-    const char *destination_leaf, unsigned char *buffer, size_t capacity,
-    lc_pouch_collection_record *out, lc_error *error);
+    lc_pouch *pouch, lc_pouch_record_io input, lc_pouch_record_io payload,
+    const char *source_leaf, const lc_pouch_collection_record *current,
+    lc_pouch_record_io output, const char *destination_leaf,
+    unsigned char *buffer, size_t capacity, lc_pouch_collection_record *out,
+    lc_error *error);
 
 #endif

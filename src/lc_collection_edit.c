@@ -249,7 +249,7 @@ corrupt:
   return ce_error(e, LC_ERR_PROTOCOL, "collection_corrupt",
                   "invalid collection edit receipt");
 }
-static int ce_load(lc_collection_handle *c, int fd,
+static int ce_load(lc_collection_handle *c, lc_pouch_record_io input,
                    const lc_pouch_collection_record *record, ce_work *w,
                    lc_error *e) {
   lonejson_error je;
@@ -259,7 +259,7 @@ static int ce_load(lc_collection_handle *c, int fd,
       record->bytes < 11)
     return ce_error(e, LC_ERR_PROTOCOL, "collection_corrupt",
                     "invalid edit record kind or size");
-  rc = lc_collection_payload_open(&w->payload, c, fd, record, e);
+  rc = lc_collection_payload_open(&w->payload, c, input, record, e);
   while (rc == LC_OK) {
     rc = lc_collection_payload_read(&w->payload, w->json + used,
                                     CE_JSON - 1 - used, &got, e);
@@ -296,11 +296,12 @@ static int ce_match(void *ctx, const lc_collection_id_ref *ref, int *matched,
                     lc_error *e) {
   ce_lookup *look = ctx;
   lc_pouch_collection_record record;
-  lc_u64 segment = 0, end = 0;
-  int fd = -1, rc;
+  lc_collection_input input;
+  int rc;
+  memset(&input, 0, sizeof(input));
   *matched = 0;
-  rc = lc_collection_record_ref(look->c, ref->segment, ref->offset, &fd,
-                                &segment, &end, &record, e);
+  rc = lc_collection_record_ref(look->c, ref->segment, ref->offset, &input,
+                                &record, e);
   if (rc == LC_OK && record.kind == LC_POUCH_COLLECTION_EDIT &&
       (!look->id || strcmp(look->id, record.append_id) == 0)) {
     if (record.generation != ref->generation ||
@@ -308,12 +309,11 @@ static int ce_match(void *ctx, const lc_collection_id_ref *ref, int *matched,
       rc = ce_error(e, LC_ERR_PROTOCOL, "collection_corrupt",
                     "invalid edit index binding");
     else
-      rc = ce_load(look->c, fd, &record, look->work, e);
+      rc = ce_load(look->c, input.io, &record, look->work, e);
     if (rc == LC_OK)
       *matched = 1;
   }
-  if (fd >= 0)
-    close(fd);
+  lc_collection_input_close(&input);
   return rc;
 }
 static int ce_find(lc_collection_handle *c, const char *id, ce_work *w,
@@ -357,7 +357,8 @@ int lc_collection_head_method(lc_collection *self, lc_collection_head_res *out,
   lc_collection_handle *c;
   lc_collection_order_row row;
   ce_work *w;
-  int rc, pin, found;
+  int rc, found;
+  lc_collection_lock pin;
   if (!out)
     return ce_error(error, LC_ERR_INVALID, NULL,
                     "collection head requires output");
@@ -412,7 +413,8 @@ int lc_collection_edit_status_method(lc_collection *self, const char *id,
   lc_collection_call call;
   lc_collection_handle *c;
   ce_work *w;
-  int rc, pin;
+  int rc;
+  lc_collection_lock pin;
   if (!out || !ce_id(id))
     return ce_error(error, LC_ERR_INVALID, NULL,
                     "edit status requires operation ID and output");
@@ -493,13 +495,13 @@ static int ce_project(lc_collection_handle *c, lc_collection_order *order,
 
 int lc_collection_edit_project(lc_collection_handle *c,
                                lc_collection_order *order,
-                               lc_collection_ids *ids, int fd,
+                               lc_collection_ids *ids, lc_pouch_record_io input,
                                const lc_pouch_collection_record *record,
                                const lc_pouch_collection_record *body,
                                lc_u64 segment, int snapshot, lc_error *e) {
   ce_work *w = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*w));
   int rc =
-      w ? ce_load(c, fd, record, w, e)
+      w ? ce_load(c, input, record, w, e)
         : ce_error(e, LC_ERR_NOMEM, NULL, "failed to allocate edit replay");
   if (rc == LC_OK)
     rc = ce_project(c, order, ids, &w->control, record, body, segment, snapshot,
@@ -717,7 +719,7 @@ int lc_collection_edit_method(lc_collection *self,
   if (rc == LC_OK && req->replacement) {
     const lc_collection_append_req *r = req->replacement;
     rc = lc_pouch_collection_writer_open(
-        c->pouch, lc_pouch_record_file_io(found ? -1 : c->active_fd),
+        c->pouch, found ? lc_pouch_record_file_io(-1) : c->active.io,
         found ? NULL : leaf, c->id, r->append_id, 0, 0,
         r->has_retention_seconds ? -(lc_unix_seconds)r->retention_seconds : 0,
         r->has_collection_retention_seconds,
@@ -857,9 +859,8 @@ int lc_collection_edit_method(lc_collection *self,
                                    error);
       if (rc == LC_OK)
         rc = lc_pouch_collection_writer_open(
-            c->pouch, lc_pouch_record_file_io(c->active_fd), leaf, c->id,
-            req->operation_id, c->order.edit_count + 1U, generation, 0, 0, 0,
-            &writer, error);
+            c->pouch, c->active.io, leaf, c->id, req->operation_id,
+            c->order.edit_count + 1U, generation, 0, 0, 0, &writer, error);
       if (rc == LC_OK)
         lc_pouch_collection_writer_kind(writer, LC_POUCH_COLLECTION_EDIT);
       if (rc == LC_OK)
@@ -870,6 +871,8 @@ int lc_collection_edit_method(lc_collection *self,
                                                 c->order.edit_count + 1U,
                                                 generation, &w->receipt, error);
       published = w->receipt.published;
+      if (rc == LC_OK)
+        rc = lc_collection_segment_ready(&c->active, error);
       if (published)
         *out = w->control.result;
       if (rc == LC_OK)
@@ -893,14 +896,15 @@ int lc_collection_edit_method(lc_collection *self,
   /* The body alone has no committed identity. Reclaim the whole failed group
    * while append authority still excludes another producer. */
   if (body_published && !published &&
-      ftruncate(c->active_fd, (off_t)w->body.record_offset) != 0)
+      lc_collection_segment_truncate(&c->active, w->body.record_offset,
+                                     error) != LC_OK)
     c->trusted = 0;
   if (metadata)
     lc_collection_metadata_leave(c);
   if (dirty && rc != LC_OK)
     c->trusted = 0;
   if ((published || found) && rc == LC_OK)
-    rc = lc_pouch_fsync_commit(c->pouch, c->active_fd, error);
+    rc = lc_collection_segment_publish(&c->active, c->pouch, error);
   if (entered)
     lc_collection_write_leave(&guard);
   if (published)
@@ -921,12 +925,14 @@ int lc_collection_edit_compact(lc_collection_handle *c,
                                size_t capacity, lc_error *e) {
   lc_collection_id_ref ref;
   lc_pouch_collection_record record, copied;
-  lc_u64 slot, segment = 0, end = 0, copied_count = 0;
+  lc_u64 slot, copied_count = 0;
+  lc_collection_input input;
   unsigned char digest[32];
   char source_leaf[64];
   const char *leaf = NULL;
   lc_u64 snapshot = 0;
-  int rc = LC_OK, occupied, fd = -1, destination = -1;
+  int rc = LC_OK, occupied, destination = -1;
+  memset(&input, 0, sizeof(input));
   for (slot = 0; rc == LC_OK && slot < captured->capacity; ++slot) {
     rc = lc_collection_metadata_enter(c, 0, e);
     if (rc == LC_OK) {
@@ -935,8 +941,8 @@ int lc_collection_edit_compact(lc_collection_handle *c,
     }
     if (rc != LC_OK || !occupied || ref.generation > generation)
       continue;
-    rc = lc_collection_record_ref(c, ref.segment, ref.offset, &fd, &segment,
-                                  &end, &record, e);
+    rc = lc_collection_record_ref(c, ref.segment, ref.offset, &input, &record,
+                                  e);
     if (rc != LC_OK || record.kind != LC_POUCH_COLLECTION_EDIT)
       continue;
     rc = ce_key(record.append_id, digest, e);
@@ -955,15 +961,16 @@ int lc_collection_edit_compact(lc_collection_handle *c,
                       strlen(record.append_id) + 32U,
                   &destination, &leaf, &snapshot, e);
     if (rc == LC_OK)
-      rc = lc_pouch_collection_record_copy(c->pouch, fd, fd, source_leaf,
-                                           &record, destination, leaf, buffer,
-                                           capacity, &copied, e);
+      rc = lc_pouch_collection_record_copy(c->pouch, input.io, input.io,
+                                           source_leaf, &record,
+                                           lc_pouch_record_file_io(destination),
+                                           leaf, buffer, capacity, &copied, e);
     if (rc == LC_OK)
-      rc = lc_collection_edit_project(c, order, ids, destination, &copied, NULL,
-                                      snapshot, 1, e);
+      rc = lc_collection_edit_project(c, order, ids,
+                                      lc_pouch_record_file_io(destination),
+                                      &copied, NULL, snapshot, 1, e);
   }
-  if (fd >= 0)
-    close(fd);
+  lc_collection_input_close(&input);
   if (rc == LC_OK && order->edit_count != copied_count)
     rc = ce_error(e, LC_ERR_PROTOCOL, "collection_corrupt",
                   "compaction did not retain all edit receipts");

@@ -390,6 +390,7 @@ static int lc_mc_partition(lc_pouch *pouch, const char *ns, const char *base,
       memset(&view, 0, sizeof(view));
       view.head_path = head;
       view.head_fd = -1;
+      view.control = lc_collection_file_control(&view);
       rc = lc_collection_head_read(&view, error);
       if (view.head_fd >= 0)
         (void)close(view.head_fd);

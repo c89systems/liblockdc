@@ -41,6 +41,19 @@ int lc_pouch_record_io_append(lc_pouch_record_io, const struct iovec *, int,
 int lc_pouch_record_io_patch(lc_pouch_record_io, uint64_t, const struct iovec *,
                              int, lc_error *);
 int lc_pouch_record_io_tail(lc_pouch_record_io, uint64_t *, lc_error *);
+/* Resettable borrowed encoded range for codec input. A bounded caller-owned
+ * prefix may alias later output scratch: after consuming it, reset rereads
+ * canonical bytes. Neither a body buffer nor a storage-lifetime owner. */
+typedef struct lc_pouch_record_span {
+  lc_source source;
+  lc_pouch_record_io input;
+  const unsigned char *prefix;
+  size_t prefix_size, prefix_used;
+  uint64_t start, offset, length;
+} lc_pouch_record_span;
+int lc_pouch_record_span_bind(lc_pouch_record_span *, lc_pouch_record_io,
+                              uint64_t, uint64_t, const void *, size_t,
+                              lc_error *);
 int lc_pouch_record_write_prefix(lc_pouch_record_io, unsigned char,
                                  const void *, size_t, const void *, size_t,
                                  uint64_t, unsigned long, unsigned long,

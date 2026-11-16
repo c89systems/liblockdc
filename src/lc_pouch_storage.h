@@ -140,6 +140,13 @@ typedef struct lc_pouch_storage_ops {
   int (*txn_guard_lock)(void *, size_t stripe, int wait, void **, lc_error *);
   void (*txn_guard_release)(void *, void *);
   void (*close)(void *);
+  /* Private SDK admission. The owner supplies catalog identity and binds the
+   * common collection engine; it never implements another set of methods. */
+  int (*collection_open)(void *, lc_client *, const char *,
+                         const lc_collection_config *, int create,
+                         lc_collection **, lc_error *);
+  int (*collections_visit)(void *, lc_client *, const char *,
+                           lc_collection_visit_fn, void *, lc_error *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;

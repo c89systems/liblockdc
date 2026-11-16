@@ -1,4 +1,5 @@
 #include "root.h"
+#include "collections.h"
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
@@ -287,6 +288,10 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
                      "cannot allocate namespace owner");
       if (rc == LC_OK)
         rc = index_room(root, error);
+      if (rc == LC_OK &&
+          pthread_mutex_init(&fresh->collection_catalog, NULL) != 0)
+        rc = failure(error, LC_ERR_TRANSPORT, NULL,
+                     "cannot initialize collection catalog authority");
       if (rc == LC_OK) {
         ns = fresh;
         fresh = NULL;
@@ -341,6 +346,7 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
     lc_free_with_allocator(NULL, fresh);
   }
   if (dead) {
+    pthread_mutex_destroy(&dead->collection_catalog);
     lc_free_with_allocator(NULL, dead->name);
     lc_free_with_allocator(NULL, dead);
   }
@@ -433,6 +439,13 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
   ps_owned_head *head = NULL;
   ps_owned_status status;
   int rc = ps_owned_open(c->space, NULL, key, 0, ref, &head, &status, error);
+  if (rc == LC_OK && key.key == 0U) {
+    /* Collection identity is the last retirement in its owner tree. Claiming
+     * excludes a concurrent name publication before touching any children. */
+    rc = ps_owned_claim_orphan(head, error);
+    if (rc == LC_OK)
+      rc = ps_collection_reclaim_children(c->space, key.owner, error);
+  }
   if (rc == LC_OK)
     rc = ps_owned_retire(head, error);
   ps_owned_close(head);
@@ -479,6 +492,8 @@ int ps_root_close(ps_root *root, lc_error *error) {
   }
   pthread_mutex_unlock(&root->mutex);
   for (ns = root->namespaces; ns; ns = ns->next) {
+    ps_collection_cache_destroy(ns->collections);
+    ns->collections = NULL;
     ps_namespace_data_destroy(ns->data);
     __atomic_store_n(&ns->data, NULL, __ATOMIC_RELEASE);
   }
@@ -487,6 +502,7 @@ int ps_root_close(ps_root *root, lc_error *error) {
     return rc;
   for (ns = root->namespaces; ns; ns = next) {
     next = ns->next;
+    pthread_mutex_destroy(&ns->collection_catalog);
     lc_free_with_allocator(NULL, ns->name);
     lc_free_with_allocator(NULL, ns);
   }

@@ -20,15 +20,19 @@ typedef struct lc_collection_unit {
   char etag[65];
 } lc_collection_unit;
 
-int lc_collection_unit_read(int, lc_u64, lc_u64, lc_collection_unit *,
-                            lc_error *);
+/* Borrowed native private-range access. Positional writes preserve other
+ * producers' append cursors; collection ownership supplies the fd lifetime. */
+lc_pouch_record_io lc_collection_unit_file_io(int);
+int lc_collection_unit_read(lc_pouch_record_io, lc_u64, lc_u64,
+                            lc_collection_unit *, lc_error *);
 /* Reads metadata and a caller-owned first input chunk together. Prefix length
- * must not exceed the stored span. Success leaves the fd position unchanged;
+ * must not exceed the stored span. Reads do not change the owner's append tail;
  * short reads retry, while truncation and transport failures remain errors. */
-int lc_collection_unit_read_prefix(int, lc_u64, lc_u64, lc_collection_unit *,
-                                   void *, size_t, lc_error *);
-int lc_collection_unit_write_meta(int, lc_u64, const lc_collection_unit *,
-                                  lc_error *);
+int lc_collection_unit_read_prefix(lc_pouch_record_io, lc_u64, lc_u64,
+                                   lc_collection_unit *, void *, size_t,
+                                   lc_error *);
+int lc_collection_unit_write_meta(lc_pouch_record_io, lc_u64,
+                                  const lc_collection_unit *, lc_error *);
 /* This evidence describes logical identity, never physical offsets or mutable
  * retention. Publication binds the immutable unit's cipher core to it.
  * Initialize a reusable hash slot to NULL; its caller owns the resulting

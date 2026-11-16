@@ -114,11 +114,11 @@ int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity index is closed");
   }
-  if (stat(ids->path, &named) != 0 || fstat(ids->fd, &st) != 0) {
+  if (fstat(ids->fd, &st) != 0 || (ids->path && stat(ids->path, &named) != 0)) {
     return lc_ci_error(error, LC_ERR_TRANSPORT,
                        "failed to inspect collection identity index identity");
   }
-  if (named.st_dev != st.st_dev || named.st_ino != st.st_ino) {
+  if (ids->path && (named.st_dev != st.st_dev || named.st_ino != st.st_ino)) {
     replacement = open(ids->path, O_RDWR);
     if (replacement < 0) {
       return lc_ci_error(error, LC_ERR_TRANSPORT,
@@ -162,38 +162,10 @@ int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error) {
   return LC_OK;
 }
 
-int lc_collection_ids_open(const char *path, int create,
-                           const lc_allocator *allocator,
-                           lc_collection_ids *out, lc_error *error) {
+static int lc_ci_initialize(int create, lc_collection_ids *out,
+                            lc_error *error) {
   struct stat st;
   int rc;
-  if (out == NULL) {
-    return lc_ci_error(error, LC_ERR_INVALID,
-                       "collection identity index requires output");
-  }
-  memset(out, 0, sizeof(*out));
-  out->fd = -1;
-  if (allocator != NULL) {
-    out->allocator = *allocator;
-  } else {
-    lc_allocator_init(&out->allocator);
-  }
-  if (path == NULL || path[0] == '\0') {
-    return lc_ci_error(error, LC_ERR_INVALID,
-                       "collection identity index requires path");
-  }
-  out->path = lc_strdup_with_allocator(&out->allocator, path);
-  if (out->path == NULL) {
-    return lc_ci_error(error, LC_ERR_NOMEM,
-                       "failed to retain collection identity index path");
-  }
-  out->fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-  if (out->fd < 0) {
-    rc = lc_ci_error(error, LC_ERR_TRANSPORT,
-                     "failed to open collection identity index");
-    lc_collection_ids_close(out);
-    return rc;
-  }
   rc = LC_OK;
   if (fstat(out->fd, &st) != 0) {
     rc = lc_ci_error(error, LC_ERR_TRANSPORT,
@@ -215,6 +187,62 @@ int lc_collection_ids_open(const char *path, int create,
     lc_collection_ids_close(out);
   }
   return rc;
+}
+
+static void lc_ci_initialize_owner(lc_collection_ids *out,
+                                   const lc_allocator *allocator) {
+  memset(out, 0, sizeof(*out));
+  out->fd = -1;
+  if (allocator)
+    out->allocator = *allocator;
+  else
+    lc_allocator_init(&out->allocator);
+}
+
+int lc_collection_ids_open(const char *path, int create,
+                           const lc_allocator *allocator,
+                           lc_collection_ids *out, lc_error *error) {
+  int rc;
+  if (out == NULL) {
+    return lc_ci_error(error, LC_ERR_INVALID,
+                       "collection identity index requires output");
+  }
+  lc_ci_initialize_owner(out, allocator);
+  if (path == NULL || path[0] == '\0') {
+    return lc_ci_error(error, LC_ERR_INVALID,
+                       "collection identity index requires path");
+  }
+  out->path = lc_strdup_with_allocator(&out->allocator, path);
+  if (out->path == NULL) {
+    return lc_ci_error(error, LC_ERR_NOMEM,
+                       "failed to retain collection identity index path");
+  }
+  out->fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
+  if (out->fd < 0) {
+    rc = lc_ci_error(error, LC_ERR_TRANSPORT,
+                     "failed to open collection identity index");
+    lc_collection_ids_close(out);
+    return rc;
+  }
+  return lc_ci_initialize(create, out, error);
+}
+
+int lc_collection_ids_scratch_open(int (*create)(void *, lc_error *),
+                                   void *context, const lc_allocator *allocator,
+                                   lc_collection_ids *out, lc_error *error) {
+  if (!out || !create)
+    return lc_ci_error(error, LC_ERR_INVALID,
+                       "collection identity projection requires a factory");
+  lc_ci_initialize_owner(out, allocator);
+  out->scratch_create = create;
+  out->scratch_context = context;
+  out->fd = create(context, error);
+  if (out->fd < 0)
+    return error && error->code != LC_OK
+               ? error->code
+               : lc_ci_error(error, LC_ERR_TRANSPORT,
+                             "failed to create identity projection scratch");
+  return lc_ci_initialize(1, out, error);
 }
 
 void lc_collection_ids_close(lc_collection_ids *ids) {
@@ -388,40 +416,51 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity index has exhausted file capacity");
   }
-  rc = lc_xid_new(id, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  size = strlen(ids->path) + sizeof(id) + sizeof(".rebuild-");
-  temporary = (char *)lc_alloc_with_allocator(&ids->allocator, size);
-  directory = lc_strdup_with_allocator(&ids->allocator, ids->path);
-  if (temporary == NULL || directory == NULL) {
-    lc_free_with_allocator(&ids->allocator, temporary);
-    lc_free_with_allocator(&ids->allocator, directory);
-    return lc_ci_error(error, LC_ERR_NOMEM,
-                       "failed to allocate collection identity rebuild paths");
-  }
-  snprintf(temporary, size, "%s.rebuild-%s", ids->path, id);
-  slash = strrchr(directory, '/');
-  if (slash == NULL) {
-    strcpy(directory, ".");
-  } else if (slash == directory) {
-    slash[1] = '\0';
-  } else {
-    *slash = '\0';
-  }
+  temporary = directory = NULL;
+  created = 0;
   memset(&grown, 0, sizeof(grown));
-  grown.fd = open(temporary, O_RDWR | O_CREAT | O_EXCL, 0600);
-  created = grown.fd >= 0;
+  grown.fd = -1;
+  if (ids->path) {
+    rc = lc_xid_new(id, error);
+    if (rc != LC_OK) {
+      return rc;
+    }
+    size = strlen(ids->path) + sizeof(id) + sizeof(".rebuild-");
+    temporary = (char *)lc_alloc_with_allocator(&ids->allocator, size);
+    directory = lc_strdup_with_allocator(&ids->allocator, ids->path);
+    if (temporary == NULL || directory == NULL) {
+      lc_free_with_allocator(&ids->allocator, temporary);
+      lc_free_with_allocator(&ids->allocator, directory);
+      return lc_ci_error(
+          error, LC_ERR_NOMEM,
+          "failed to allocate collection identity rebuild paths");
+    }
+    snprintf(temporary, size, "%s.rebuild-%s", ids->path, id);
+    slash = strrchr(directory, '/');
+    if (slash == NULL) {
+      strcpy(directory, ".");
+    } else if (slash == directory) {
+      slash[1] = '\0';
+    } else {
+      *slash = '\0';
+    }
+    grown.fd = open(temporary, O_RDWR | O_CREAT | O_EXCL, 0600);
+    created = grown.fd >= 0;
+  } else if (ids->scratch_create) {
+    grown.fd = ids->scratch_create(ids->scratch_context, error);
+  }
   grown.capacity = ids->capacity * 2U;
   grown.generation = ids->generation;
   grown.replay_segment = ids->replay_segment;
   grown.replay_offset = ids->replay_offset;
   grown.snapshot = ids->snapshot;
   renamed = 0;
-  if (grown.fd < 0 ||
-      ftruncate(grown.fd, (off_t)(LC_CI_HEADER_BYTES +
-                                  grown.capacity * LC_CI_ENTRY_BYTES)) != 0) {
+  if (grown.fd < 0 && ids->scratch_create && error && error->code != LC_OK) {
+    rc = error->code;
+  } else if (grown.fd < 0 ||
+             ftruncate(grown.fd, (off_t)(LC_CI_HEADER_BYTES +
+                                         grown.capacity * LC_CI_ENTRY_BYTES)) !=
+                 0) {
     rc = lc_ci_error(error, LC_ERR_TRANSPORT,
                      "failed to create collection identity rebuild");
   } else {
@@ -436,11 +475,11 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
   if (rc == LC_OK) {
     rc = lc_ci_header_write(&grown, error);
   }
-  if (rc == LC_OK && fsync(grown.fd) != 0) {
+  if (rc == LC_OK && ids->path && fsync(grown.fd) != 0) {
     rc = lc_ci_error(error, LC_ERR_TRANSPORT,
                      "failed to sync collection identity rebuild");
   }
-  if (rc == LC_OK && rename(temporary, ids->path) != 0) {
+  if (rc == LC_OK && ids->path && rename(temporary, ids->path) != 0) {
     rc = lc_ci_error(error, LC_ERR_TRANSPORT,
                      "failed to publish collection identity rebuild");
   } else if (rc == LC_OK) {
@@ -450,8 +489,10 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
     ids->capacity = grown.capacity;
     ids->count = grown.count;
     grown.fd = -1;
-    rc = lc_pouch_path_fsync_directory(
-        directory, "failed to sync collection identity index directory", error);
+    if (ids->path)
+      rc = lc_pouch_path_fsync_directory(
+          directory, "failed to sync collection identity index directory",
+          error);
   }
   if (grown.fd >= 0) {
     (void)close(grown.fd);

@@ -11,7 +11,8 @@ int lc_collection_query_maintain(lc_collection *self, lc_error *error) {
   char query_id[LC_XID_STRING_SIZE];
   lc_u64 captured, ordinal, generation, deleted;
   size_t count, i;
-  int rooted, found, rc, commit_pin;
+  int rooted, found, rc;
+  lc_collection_lock commit_pin;
   rc = lc_collection_call_begin(self, 0, &call, error);
   if (rc != LC_OK)
     return rc;

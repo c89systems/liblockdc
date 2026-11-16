@@ -4,6 +4,7 @@
 #include <pthread.h>
 
 struct ps_namespace_data;
+struct ps_collection_owner;
 struct ps_namespace {
   ps_root *root;
   char *name;
@@ -12,6 +13,8 @@ struct ps_namespace {
   int loading, ready, data_loading;
   ps_namespace_info identity;
   struct ps_namespace_data *data;
+  struct ps_collection_owner *collections;
+  pthread_mutex_t collection_catalog;
   struct ps_namespace *next, *hash_next;
   struct ps_namespace **link;
 };

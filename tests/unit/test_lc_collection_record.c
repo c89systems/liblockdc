@@ -264,8 +264,9 @@ static void test_retention_metadata_references_body_and_compacts(void **state) {
       assert_int_equal(close(f->fd), 0);
       f->fd = -1;
       assert_int_equal(lc_pouch_collection_record_metadata(
-                           f->pouch, f->copy_fd, meta_leaf, &original, 1, 8,
-                           1200, &renewed, &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                           meta_leaf, &original, 1, 8, 1200, &renewed,
+                           &f->error),
                        LC_OK);
       assert_int_equal(pread(f->copy_fd, prefix, sizeof(prefix), 0),
                        sizeof(prefix));
@@ -291,8 +292,8 @@ static void test_retention_metadata_references_body_and_compacts(void **state) {
       assert_int_equal(read.payload_record_offset, original.record_offset);
       assert_string_equal(read.etag, original.etag);
       assert_int_equal(lc_pouch_collection_record_metadata(
-                           f->pouch, f->copy_fd, meta_leaf, &read, 2, 9, 0,
-                           &cleared, &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                           meta_leaf, &read, 2, 9, 0, &cleared, &f->error),
                        LC_OK);
       assert_int_equal(lc_pouch_collection_record_read(
                            lc_pouch_record_file_io(f->copy_fd),
@@ -316,9 +317,10 @@ static void test_retention_metadata_references_body_and_compacts(void **state) {
       for (int step = 0; step < 2; ++step) {
         const lc_pouch_collection_record *current = step ? &cleared : &renewed;
         assert_int_equal(lc_pouch_collection_record_copy(
-                             f->pouch, f->copy_fd, f->fd, meta_leaf, current,
-                             f->relocated_fd, snapshot, scratch,
-                             sizeof(scratch), &copied, &f->error),
+                             f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                             lc_pouch_record_file_io(f->fd), meta_leaf, current,
+                             lc_pouch_record_file_io(f->relocated_fd), snapshot,
+                             scratch, sizeof(scratch), &copied, &f->error),
                          LC_OK);
         assert_int_equal(lc_pouch_collection_record_read(
                              lc_pouch_record_file_io(f->relocated_fd),
@@ -336,9 +338,9 @@ static void test_retention_metadata_references_body_and_compacts(void **state) {
                          read.stored_bytes);
         assert_memory_equal(before, after, read.stored_bytes);
       }
-      assert_int_equal(lc_pouch_collection_record_delete(f->pouch, f->copy_fd,
-                                                         &cleared, 10, &deleted,
-                                                         &f->error),
+      assert_int_equal(lc_pouch_collection_record_delete(
+                           f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                           &cleared, 10, &deleted, &f->error),
                        LC_OK);
       assert_int_equal(lc_pouch_collection_record_read(
                            lc_pouch_record_file_io(f->copy_fd),
@@ -350,8 +352,8 @@ static void test_retention_metadata_references_body_and_compacts(void **state) {
       assert_int_equal(read.retention, 0);
       assert_int_equal(fstat(f->copy_fd, &st), 0);
       assert_int_equal(lc_pouch_collection_record_metadata(
-                           f->pouch, f->copy_fd, meta_leaf, &read, 2, 11, 1500,
-                           &renewed, &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                           meta_leaf, &read, 2, 11, 1500, &renewed, &f->error),
                        LC_ERR_INVALID);
       clear_error(f);
       struct stat after_stat;
@@ -454,9 +456,9 @@ test_invalid_retention_metadata_and_payload_references_fail(void **state) {
   open_case(f, 0, 0);
   assert_int_equal(append_json(f, "original", "{\"x\":1}", 1, 1, &original),
                    LC_OK);
-  assert_int_equal(lc_pouch_collection_record_metadata(f->pouch, f->fd, leaf,
-                                                       &original, 1, 2, 1200,
-                                                       &metadata, &f->error),
+  assert_int_equal(lc_pouch_collection_record_metadata(
+                       f->pouch, lc_pouch_record_file_io(f->fd), leaf,
+                       &original, 1, 2, 1200, &metadata, &f->error),
                    LC_OK);
   end = file_end(f);
   for (uint64_t limit = metadata.record_offset; limit < end; limit += 7) {
@@ -512,8 +514,10 @@ test_invalid_retention_metadata_and_payload_references_fail(void **state) {
                        file_end(f), leaf, &read, &f->error),
                    LC_OK);
   assert_int_equal(lc_pouch_collection_record_copy(
-                       f->pouch, f->fd, f->fd, leaf, &read, f->copy_fd,
-                       snapshot, scratch, sizeof(scratch), &failed, &f->error),
+                       f->pouch, lc_pouch_record_file_io(f->fd),
+                       lc_pouch_record_file_io(f->fd), leaf, &read,
+                       lc_pouch_record_file_io(f->copy_fd), snapshot, scratch,
+                       sizeof(scratch), &failed, &f->error),
                    LC_ERR_PROTOCOL);
   assert_false(failed.published);
   assert_string_equal(f->error.server_code, "collection_corrupt");
@@ -550,7 +554,8 @@ static void test_canonical_roundtrip_delete_and_durability(void **state) {
       assert_string_equal(read.context, original.context);
       assert_body(f, &read, "{\"z\":[1,2],\"s\":\"hello\"}");
       assert_int_equal(lc_pouch_collection_record_delete(
-                           f->pouch, f->fd, &read, 12, &deleted, &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->fd), &read, 12,
+                           &deleted, &f->error),
                        LC_OK);
       assert_true(deleted.published && deleted.deleted);
       assert_int_equal(lc_pouch_fsync_commit(f->pouch, f->fd, &f->error),
@@ -570,7 +575,8 @@ static void test_canonical_roundtrip_delete_and_durability(void **state) {
       assert_true(retry.stored_bytes == 0 && retry.descriptor[0] == 0);
       committed_end = file_end(f);
       assert_int_equal(lc_pouch_collection_record_delete(
-                           f->pouch, f->fd, &retry, 13, &deleted, &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->fd), &retry, 13,
+                           &deleted, &f->error),
                        LC_OK);
       assert_true(file_end(f) == committed_end && deleted.generation == 12);
       /* A pinned reader still references the original immutable body. */
@@ -678,9 +684,10 @@ static void test_relocation_keeps_raw_payload_and_all_bindings(void **state) {
                                    (uint64_t)INT64_MAX + 40U, 7U, &original),
                        LC_OK);
       assert_int_equal(lc_pouch_collection_record_copy(
-                           f->pouch, f->fd, f->fd, leaf, &original, f->copy_fd,
-                           snapshot, buffer, sizeof(buffer), &copied,
-                           &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->fd),
+                           lc_pouch_record_file_io(f->fd), leaf, &original,
+                           lc_pouch_record_file_io(f->copy_fd), snapshot,
+                           buffer, sizeof(buffer), &copied, &f->error),
                        LC_OK);
       assert_true(copied.published && !copied.deleted &&
                   copied.position == original.position &&
@@ -722,9 +729,10 @@ static void test_relocation_keeps_raw_payload_and_all_bindings(void **state) {
       /* Also shrink a snapshot container back to a segment, at a nonzero
        * output offset. Neither direction changes the logical body context. */
       assert_int_equal(lc_pouch_collection_record_copy(
-                           f->pouch, f->copy_fd, f->copy_fd, snapshot, &read,
-                           f->fd, leaf, buffer, sizeof(buffer), &roundtrip,
-                           &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->copy_fd),
+                           lc_pouch_record_file_io(f->copy_fd), snapshot, &read,
+                           lc_pouch_record_file_io(f->fd), leaf, buffer,
+                           sizeof(buffer), &roundtrip, &f->error),
                        LC_OK);
       assert_int_equal(lc_pouch_collection_record_read(
                            lc_pouch_record_file_io(f->fd),
@@ -753,14 +761,15 @@ static void test_relocation_keeps_raw_payload_and_all_bindings(void **state) {
       f->decoded = NULL;
       lc_sink_close(f->sink);
       f->sink = NULL;
-      assert_int_equal(lc_pouch_collection_record_delete(f->pouch, f->fd,
-                                                         &original, 12U,
-                                                         &deleted, &f->error),
+      assert_int_equal(lc_pouch_collection_record_delete(
+                           f->pouch, lc_pouch_record_file_io(f->fd), &original,
+                           12U, &deleted, &f->error),
                        LC_OK);
       assert_int_equal(lc_pouch_collection_record_copy(
-                           f->pouch, f->fd, f->fd, leaf, &deleted, f->copy_fd,
-                           snapshot, buffer, sizeof(buffer), &copied_delete,
-                           &f->error),
+                           f->pouch, lc_pouch_record_file_io(f->fd),
+                           lc_pouch_record_file_io(f->fd), leaf, &deleted,
+                           lc_pouch_record_file_io(f->copy_fd), snapshot,
+                           buffer, sizeof(buffer), &copied_delete, &f->error),
                        LC_OK);
       assert_int_equal(
           lc_pouch_collection_record_read(
@@ -792,8 +801,10 @@ static void test_failed_relocation_preserves_prior_output(void **state) {
       append_json(f, "relocate_1", "{\"v\":123456789}", 1U, 1U, &original),
       LC_OK);
   assert_int_equal(lc_pouch_collection_record_copy(
-                       f->pouch, f->fd, f->fd, leaf, &original, f->copy_fd,
-                       snapshot, buffer, sizeof(buffer), &copied, &f->error),
+                       f->pouch, lc_pouch_record_file_io(f->fd),
+                       lc_pouch_record_file_io(f->fd), leaf, &original,
+                       lc_pouch_record_file_io(f->copy_fd), snapshot, buffer,
+                       sizeof(buffer), &copied, &f->error),
                    LC_OK);
   assert_int_equal(
       pread(f->fd, &original_byte, 1U, (off_t)original.payload_offset), 1);
@@ -801,8 +812,10 @@ static void test_failed_relocation_preserves_prior_output(void **state) {
   assert_int_equal(pwrite(f->fd, &changed, 1U, (off_t)original.payload_offset),
                    1);
   assert_int_equal(lc_pouch_collection_record_copy(
-                       f->pouch, f->fd, f->fd, leaf, &original, f->copy_fd,
-                       snapshot, buffer, sizeof(buffer), &failed, &f->error),
+                       f->pouch, lc_pouch_record_file_io(f->fd),
+                       lc_pouch_record_file_io(f->fd), leaf, &original,
+                       lc_pouch_record_file_io(f->copy_fd), snapshot, buffer,
+                       sizeof(buffer), &failed, &f->error),
                    LC_ERR_PROTOCOL);
   assert_false(failed.published);
   assert_string_equal(f->error.server_code, "collection_corrupt");
@@ -813,8 +826,10 @@ static void test_failed_relocation_preserves_prior_output(void **state) {
       pwrite(f->fd, &original_byte, 1U, (off_t)original.payload_offset), 1);
   assert_int_equal(ftruncate(f->fd, (off_t)(original.next_offset - 1U)), 0);
   assert_int_equal(lc_pouch_collection_record_copy(
-                       f->pouch, f->fd, f->fd, leaf, &original, f->copy_fd,
-                       snapshot, buffer, sizeof(buffer), &failed, &f->error),
+                       f->pouch, lc_pouch_record_file_io(f->fd),
+                       lc_pouch_record_file_io(f->fd), leaf, &original,
+                       lc_pouch_record_file_io(f->copy_fd), snapshot, buffer,
+                       sizeof(buffer), &failed, &f->error),
                    LC_ERR_PROTOCOL);
   assert_false(failed.published);
   assert_int_equal(fstat(f->copy_fd, &st), 0);
@@ -879,8 +894,10 @@ static void test_relocation_crosses_large_buffer_boundaries(void **state) {
   f->copy_fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
   assert_true(f->copy_fd >= 0);
   assert_int_equal(lc_pouch_collection_record_copy(
-                       f->pouch, f->fd, f->fd, leaf, &original, f->copy_fd,
-                       snapshot, buffer, capacity, &copied, &f->error),
+                       f->pouch, lc_pouch_record_file_io(f->fd),
+                       lc_pouch_record_file_io(f->fd), leaf, &original,
+                       lc_pouch_record_file_io(f->copy_fd), snapshot, buffer,
+                       capacity, &copied, &f->error),
                    LC_OK);
   for (size_t i = 0U; i < 64U; ++i)
     assert_int_equal(buffer[capacity + i], 0xa5);
@@ -974,7 +991,8 @@ test_stream_publication_is_metadata_only_and_rolls_back(void **state) {
       assert_int_equal(write(f->fd, prefix, sizeof(prefix)), sizeof(prefix));
       assert_int_equal(write(f->fd, encoded, length), length);
       assert_int_equal(
-          lc_collection_unit_write_meta(f->fd, extent_offset, &unit, &f->error),
+          lc_collection_unit_write_meta(lc_collection_unit_file_io(f->fd),
+                                        extent_offset, &unit, &f->error),
           LC_OK);
       end = file_end(f);
       if (failure) {
@@ -1279,13 +1297,15 @@ static void test_unit_prefix_partial_reads_and_failures(void **state) {
       pwrite(f->fd, body, sizeof(body), start + LC_COLLECTION_UNIT_HEADER),
       sizeof(body));
   assert_int_equal(
-      lc_collection_unit_write_meta(f->fd, start, &unit, &f->error), LC_OK);
+      lc_collection_unit_write_meta(lc_collection_unit_file_io(f->fd), start,
+                                    &unit, &f->error),
+      LC_OK);
   assert_int_equal(lseek(f->fd, 11, SEEK_SET), 11);
   prefix_calls = prefix_fail_at = 0;
   lc_collection_unit_test_preadv = prefix_short_read;
-  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
-                                                  &decoded, prefix,
-                                                  sizeof(prefix), &f->error),
+  assert_int_equal(lc_collection_unit_read_prefix(
+                       lc_collection_unit_file_io(f->fd), start, sizeof(body),
+                       &decoded, prefix, sizeof(prefix), &f->error),
                    LC_OK);
   assert_true(prefix_calls > 2);
   assert_memory_equal(prefix, body, sizeof(prefix));
@@ -1294,9 +1314,9 @@ static void test_unit_prefix_partial_reads_and_failures(void **state) {
   assert_int_equal(lseek(f->fd, 0, SEEK_CUR), 11);
   prefix_calls = 0;
   prefix_fail_at = 7;
-  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
-                                                  &decoded, prefix,
-                                                  sizeof(prefix), &f->error),
+  assert_int_equal(lc_collection_unit_read_prefix(
+                       lc_collection_unit_file_io(f->fd), start, sizeof(body),
+                       &decoded, prefix, sizeof(prefix), &f->error),
                    LC_ERR_TRANSPORT);
   clear_error(f);
   lc_collection_unit_test_preadv = NULL;
@@ -1304,20 +1324,21 @@ static void test_unit_prefix_partial_reads_and_failures(void **state) {
   assert_int_equal(
       ftruncate(f->fd, start + LC_COLLECTION_UNIT_HEADER + sizeof(prefix) - 1),
       0);
-  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
-                                                  &decoded, prefix,
-                                                  sizeof(prefix), &f->error),
-                   LC_ERR_PROTOCOL);
-  clear_error(f);
-  assert_int_equal(lc_collection_unit_read_prefix(f->fd, start, sizeof(body),
-                                                  &decoded, prefix,
-                                                  sizeof(body) + 1U, &f->error),
+  assert_int_equal(lc_collection_unit_read_prefix(
+                       lc_collection_unit_file_io(f->fd), start, sizeof(body),
+                       &decoded, prefix, sizeof(prefix), &f->error),
                    LC_ERR_PROTOCOL);
   clear_error(f);
   assert_int_equal(lc_collection_unit_read_prefix(
-                       f->fd, (lc_u64)LC_I64_MAX, sizeof(body), &decoded,
-                       prefix, sizeof(prefix), &f->error),
+                       lc_collection_unit_file_io(f->fd), start, sizeof(body),
+                       &decoded, prefix, sizeof(body) + 1U, &f->error),
                    LC_ERR_PROTOCOL);
+  clear_error(f);
+  assert_int_equal(
+      lc_collection_unit_read_prefix(lc_collection_unit_file_io(f->fd),
+                                     (lc_u64)LC_I64_MAX, sizeof(body), &decoded,
+                                     prefix, sizeof(prefix), &f->error),
+      LC_ERR_PROTOCOL);
 }
 
 static void test_unit_metadata_lengths_and_maximum_text(void **state) {
@@ -1328,16 +1349,19 @@ static void test_unit_metadata_lengths_and_maximum_text(void **state) {
   memset(unit.descriptor, 'd', sizeof(unit.descriptor) - 1);
   memset(unit.context, 'c', sizeof(unit.context) - 1);
   memset(unit.etag, 'a', sizeof(unit.etag) - 2);
-  assert_int_equal(lc_collection_unit_write_meta(f->fd, 0, &unit, &f->error),
+  assert_int_equal(lc_collection_unit_write_meta(
+                       lc_collection_unit_file_io(f->fd), 0, &unit, &f->error),
                    LC_ERR_PROTOCOL);
   assert_int_equal(file_end(f), 0);
   clear_error(f);
   unit.etag[63] = 'a';
   assert_int_equal(pwrite(f->fd, "x", 1, LC_COLLECTION_UNIT_HEADER), 1);
-  assert_int_equal(lc_collection_unit_write_meta(f->fd, 0, &unit, &f->error),
+  assert_int_equal(lc_collection_unit_write_meta(
+                       lc_collection_unit_file_io(f->fd), 0, &unit, &f->error),
                    LC_OK);
   lc_collection_unit decoded;
-  assert_int_equal(lc_collection_unit_read(f->fd, 0, 1, &decoded, &f->error),
+  assert_int_equal(lc_collection_unit_read(lc_collection_unit_file_io(f->fd), 0,
+                                           1, &decoded, &f->error),
                    LC_OK);
   assert_string_equal(decoded.etag, unit.etag);
   assert_string_equal(decoded.context, unit.context);
@@ -1385,9 +1409,9 @@ test_contiguous_prefix_validates_metadata_and_truncation(void **state) {
     assert_int_equal(size, 0);
     clear_error(f);
     assert_int_equal(pwrite(f->fd, "p", 1, 32), 1);
-    assert_int_equal(lc_pouch_collection_record_metadata(f->pouch, f->fd, leaf,
-                                                         &written, 1, 2, 0,
-                                                         &alias, &f->error),
+    assert_int_equal(lc_pouch_collection_record_metadata(
+                         f->pouch, lc_pouch_record_file_io(f->fd), leaf,
+                         &written, 1, 2, 0, &alias, &f->error),
                      LC_OK);
     size = 99;
     assert_int_equal(lc_pouch_collection_record_read_prefix(
@@ -1421,10 +1445,13 @@ static void test_chunk_cleanup_releases_owned_descriptors_once(void **state) {
   first = dup(f->fd);
   pending = dup(f->fd);
   assert_true(first >= 0 && pending >= 0);
-  chunks->first_fd = first;
-  chunks->first_fd_owned = 1;
+  assert_int_equal(lc_collection_segment_adopt_file(
+                       first, &chunks->first_storage, &f->error),
+                   LC_OK);
   chunks->pending.segment = 2;
-  chunks->region_fd = pending;
+  assert_int_equal(
+      lc_collection_segment_adopt_file(pending, &chunks->region, &f->error),
+      LC_OK);
   lc_collection_chunks_close(chunks);
   assert_int_equal(fcntl(first, F_GETFD), -1);
   assert_int_equal(errno, EBADF);

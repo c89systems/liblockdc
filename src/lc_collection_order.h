@@ -79,6 +79,10 @@ int lc_collection_edit_page_test(lc_error *);
  * A corrupt existing index is reported, never silently replaced. */
 int lc_collection_order_open(const char *path, int create,
                              lc_collection_order *out, lc_error *error);
+/* Adopts disposable derived metadata storage, including on failure. The
+ * canonical owner rebuilds this index; application bodies never enter it. */
+int lc_collection_order_adopt(int fd, int create, lc_collection_order *,
+                              lc_error *);
 void lc_collection_order_close(lc_collection_order *order);
 int lc_collection_order_refresh(lc_collection_order *order, lc_error *error);
 int lc_collection_order_checkpoint(lc_collection_order *order,
