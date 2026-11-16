@@ -2179,6 +2179,121 @@ coordination/recovery and deployment acceptance remain unfinished. Existing-root
 conversion remains outside the initial implementation. The backend goal stays
 active.
 
+## External XA journal and coordinator ownership
+
+The exclusive container SDK now runs resource registration, branch enrollment,
+prepare intent/observation/votes, COMMIT/ABORT resolution, native participant
+application, managed coordinator claims/renewal/sealing/release, fenced takeover,
+snapshots, outbox adoption and history retirement through the common XA engine.
+The existing `.txns` record remains the sole decision authority. Resource,
+branch, owner and completion objects remain in `.xa`, stored through the typed
+state boundary with no persistent sidecars. Public APIs, ABI and canonical
+formats are unchanged. Normal `lc_pouch_open` still opens multifile Pouch.
+
+Critical handoffs force completed dependencies under both durability policies.
+Native staged data precedes vote/terminal-decision bytes, even if a decision
+write survives a failed acknowledgement. Owner and branch changes, resource
+registration and recovery snapshots stabilize their authority before returning;
+applied native data precedes the completion marker. History retirement orders
+owner removal, branch removal, decision removal and completion removal through
+separate barriers. A borrowed mutation group regains its prior durability policy
+after the handoff. Ordinary NoSync writes retain that policy.
+
+The shared namespace helper pins native canonical files under namespace
+authority and waits after releasing newly acquired authority. Container barriers
+use the completed root prefix and exclude unfinished producers. A paused prepare
+sync permits an unrelated ordinary write in the same `.xa` namespace to finish;
+same-xid authority remains excluded while an independent xid remains available.
+Borrowed-scope tests distinguish the required earlier handoff from a later
+ordinary NoSync write. No whole-value payload materialization was added.
+
+Failure qualification exposed two common-engine defects, both repaired here.
+The transaction decoder now retains ownership of participant strings until
+insertion succeeds, eliminating a leak under allocation failure. Native NoSync
+COMMIT/ABORT retries could previously observe an unacknowledged decision and
+advance an external branch without re-syncing `.txns`. Two native regressions
+fail against that ordering and pass with the explicit prerequisite barrier.
+
+Evidence is in `build/pouch-space-xa/`:
+
+- The affected Debug qualification preserves **44 passing groups** from the
+  initial run and completes its **30 remaining groups** after the allocation
+  repair. The final handoff changes pass **39 Debug groups**, including all
+  eight codec/policy SDK configurations, all four live model configurations,
+  lifecycle comparisons, API/symbol boundaries and the **43-case native XA
+  suite**. The container reuses **39 original XA cases**; the two original
+  simultaneous shared-client cases remain native controls. Logs are
+  `surface-debug*.log` and their preserved `*-details.log` files.
+- Plain and encrypted/compressed failure profiles execute **17,184 allocation
+  and I/O cuts** and **5,984 deliberate process exits**, including focused
+  requalification of the changed handoffs and registration. Stable-image I/O
+  models cover lost writes, persisted torn writes and complete writes with lost
+  acknowledgements. Real exec children interrupt recovery and critical journal
+  operations before/after observed I/O boundaries. Allocation-only profiles
+  use immediate successful sync to isolate ownership/retry; persistence is
+  established by the separate stable-image and real-I/O profiles. Logs are
+  `surface-debug-initial-details.log`, `surface-debug-remaining-details.log`
+  and `handoff-delta-debug.log`.
+- Capacity models cover **38 raw/managed handoffs per codec**, preserve root
+  health on denial, retry after releasing peer reservations and verify exactly
+  **10 MiB** without implicit growth. Final denial counts are **14/12/10/12**
+  for plain/encrypted/compressed/combined storage. These prove clean denial and
+  retry, not guaranteed maintenance admission at full capacity.
+- GNU and musl Release each pass **27 affected groups**, with the native suite,
+  eight SDK configurations, eight comparisons and representative live models
+  (`surface-gnu-final.log`, `surface-musl-final.log`). GNU Release uses ordinary
+  worker defaults; musl uses its native defaults. Debug uses actual 128 KiB
+  workers with the glibc stack cache disabled.
+- **18 ThreadSanitizer invocations** pass with instrumented OpenSSL **3.6.5**,
+  128 KiB workers and no suppressions. All eight SDK configurations run the
+  **37 live cases**; two wrong-process fork cases and deliberate process deaths
+  remain outside this live race profile (`surface-tsan-final.log`).
+- **11 Memcheck invocations** pass with **334,625 allocations/frees**, no live
+  allocations at exit, zero errors, no suppressions and only three inherited
+  descriptors. Coverage includes representative coordinator/outbox/retirement
+  cases under both policies, plain/combined journal and concurrency/scope
+  models, and both native decision-retry regressions
+  (`surface-memcheck-final.log`, `memcheck-*.log`).
+
+The GNU Release journal comparison records **96 verified rows / 48 matched
+pairs**, three samples over **16 configurations**: 24 x 4 KiB or 8 x 64 KiB,
+one/four independent writers, both policies and new/preopened roots. It uses a
+bounded 4 KiB producer and verifies every streamed value. Both engines perform
+claim/enroll, native lease staging, seal/prepare/vote, COMMIT, external completion,
+native application, release, history retirement and the same public cleanup
+passes. Container physical checkpoint work is included. Close is separate, and
+cold reopen verifies applied bodies and retired history. Setup is excluded;
+OS cache is retained and the middle sample reverses engine order. This measures
+Pouch journal/control work, not PostgreSQL query, network or server latency.
+Raw rows are in `paired-performance.log`; the shared benchmark target is now
+`pouch_space_lifecycle_compare` and retains the earlier queue/outbox modes.
+
+Ratios below are native/container configuration medians of three paired samples;
+values above one favor the container. Completion includes lifecycle work plus
+close; CPU covers the work/cleanup phase only.
+
+| Policy | Completion time ratio | CPU time ratio |
+| --- | --- | --- |
+| NoSync | 1.23-2.76x, median 2.03x | 1.92-2.95x, median 2.47x |
+| Durable sync | 1.43-2.59x, median 1.70x | 1.94-3.06x, median 2.55x |
+
+All 16 completion medians favor the container; the overall median is **1.84x**.
+Work-phase-only ratios span **0.99-2.65x**: the preopened, large-value,
+four-writer NoSync configuration spends about **1.3% more** before close.
+Measured work-phase sync calls span **147-653 container / 302-1497 native**;
+close calls are excluded. The container uses **one file**, versus **28-56**
+native files. These observations do not establish cold-device or production
+performance.
+
+This surface qualifies exclusive XA journal/coordinator behavior. The optional
+PostgreSQL provider is OFF in these builds; real SQL-driver/server qualification
+remains part of deployment acceptance. Indexed queries, resumable codec
+conversion and shared-root coordination/recovery remain unfinished. The
+incremental-checkpoint/protected-capacity proposal remains unapproved; full
+snapshots can still require foreground free space. Existing-root conversion
+remains outside the initial implementation, and production cutover still
+requires an explicit deployment decision. The complete backend goal stays active.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and
@@ -2214,8 +2329,9 @@ projection, ordinary mutation policy, read-many, visits and paged scan/body
 snapshots, staged/prepared mutations and the SDK call envelope above. Leased
 state, expiry, public collection ownership and explicit/background maintenance
 use the typed owners described above. Live stages defer ordinary compaction;
-indexed queries and complete external XA still require
-integration. Normal `lc_pouch_open` uses
+indexed queries still require integration. Exclusive external XA journal and
+coordinator behavior now use the common engine described above. Normal
+`lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
 
@@ -2263,8 +2379,8 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Remaining integration includes indexed-query owners, complete
-external XA ownership and shared-root coordination. Core collection positions
+Remaining integration includes indexed-query owners and shared-root
+coordination. Core collection positions
 and retry receipts now
 run through the container owner above. Normal public Pouch tests continue to
 exercise the segmented backend through the shared typed storage boundaries.

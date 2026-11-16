@@ -58,6 +58,10 @@ int lc_pouch_state_durable_scope_include_namespace_locked(lc_pouch *pouch,
                                                           lc_error *error);
 int lc_pouch_state_durable_scope_end(lc_pouch_state_commit_group *scope,
                                      int operation_rc, lc_error *error);
+/* Force one completed namespace prefix before a control handoff. May borrow
+ * an active mutation group; its prior durability policy is restored afterward.
+ * Caller retains higher-level decision/key authority across the handoff. */
+int lc_pouch_state_sync_namespace(lc_pouch *, const char *, lc_error *);
 
 /* Exclusive roots have one in-process writer. These bounded stripes retain
  * conflicting-key serialization through durable completion without shared

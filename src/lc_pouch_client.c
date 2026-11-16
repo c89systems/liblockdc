@@ -10778,9 +10778,11 @@ static int lc_pouch_txn_parse_record(const char *bytes, size_t length,
     if (rc == LC_OK) {
       rc = lc_pouch_txn_record_add_participant(record, ns, key, backend_hash,
                                                error);
-      ns = NULL;
-      key = NULL;
-      backend_hash = NULL;
+      if (rc == LC_OK) {
+        ns = NULL;
+        key = NULL;
+        backend_hash = NULL;
+      }
     }
     if (rc == LC_OK) {
       /* External prepare intent seals enrollment but is not a YES vote. The
@@ -12150,6 +12152,42 @@ static int lc_pouch_xa_completed_read(lc_client_handle *client,
   lc_pouch_state_read_result_cleanup(&client->allocator, &result);
   return rc;
 }
+static int lc_pouch_xa_sync_participants(lc_client_handle *client,
+                                         const lc_txn_participant *participants,
+                                         size_t count, lc_error *error) {
+  char local[LC_POUCH_BACKEND_HASH_HEX_BYTES + 1U];
+  size_t i, j;
+  int rc = lc_pouch_backend_hash(client->pouch, local, error);
+  for (i = 0U; rc == LC_OK && i < count; ++i) {
+    const char *backend, *ns = participants[i].ns;
+    size_t length;
+    lc_pouch_txn_trim_bounds(participants[i].backend_hash, &backend, &length);
+    if (length != 0U &&
+        (length != strlen(local) || strncmp(backend, local, length) != 0))
+      continue;
+    if (!lc_pouch_xa_participant(&participants[i]))
+      rc = lc_pouch_client_public_namespace(client, ns, &ns, error);
+    for (j = 0U; rc == LC_OK && j < i; ++j) {
+      const char *prior = participants[j].ns;
+      const char *prior_backend;
+      size_t prior_length;
+      lc_pouch_txn_trim_bounds(participants[j].backend_hash, &prior_backend,
+                               &prior_length);
+      if (prior_length != 0U &&
+          (prior_length != strlen(local) ||
+           strncmp(prior_backend, local, prior_length) != 0))
+        continue;
+      if (!lc_pouch_xa_participant(&participants[j]))
+        rc = lc_pouch_client_public_namespace(client, prior, &prior, error);
+      if (rc == LC_OK && strcmp(ns, prior) == 0)
+        break;
+    }
+    if (rc == LC_OK && j == i)
+      rc = lc_pouch_state_sync_namespace(client->pouch, ns, error);
+  }
+  return rc;
+}
+
 static int lc_pouch_xa_completed_write(lc_client_handle *client,
                                        const char *txn_id, lc_error *error) {
   char key[sizeof("completed/") + LC_XID_STRING_SIZE];
@@ -12187,6 +12225,9 @@ static int lc_pouch_xa_completed_write(lc_client_handle *client,
     lc_source_close(source);
   lc_pouch_txn_buffer_cleanup(&buffer);
   lc_pouch_state_write_result_cleanup(&client->allocator, &result);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                       error);
   return rc;
 }
 
@@ -12379,6 +12420,12 @@ static int lc_pouch_txn_apply_participants(lc_client_handle *client,
         client->pouch, ns, req->participants[i].key, req->txn_id);
     if (strcmp(state, "commit") == 0)
       lc_outbox_pouch_notify(&client->pub, ns, req->participants[i].key);
+  }
+  if (req->tc_term != 0U || lc_pouch_xa_has_participants(req)) {
+    rc = lc_pouch_xa_sync_participants(client, req->participants,
+                                       req->participant_count, error);
+    if (rc != LC_OK)
+      return rc;
   }
   return req->tc_term != 0U
              ? lc_pouch_xa_completed_write(client, req->txn_id, error)
@@ -17597,7 +17644,7 @@ static int lc_pouch_txn_record_vote(lc_client_handle *client,
   lc_pouch_txn_vote_context context;
   lc_pouch_txn_record preview;
   char *record_key;
-  int rc, retire = 0;
+  int rc, retire = 0, xa_durable = 0;
 
   if (decision_ready == NULL) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -17663,11 +17710,22 @@ static int lc_pouch_txn_record_vote(lc_client_handle *client,
       strcmp(preview.participants[0].ns, ns) == 0 &&
       strcmp(preview.participants[0].key, participant_key) == 0)
     retire = 1;
+  if (rc == LC_OK) {
+    xa_durable = lc_pouch_txn_record_has_xa(&preview) || preview.tc_term != 0U;
+    /* The vote append itself can survive a failed acknowledgement. Native
+     * staged values must therefore precede it in the durable prefix. */
+    if (xa_durable)
+      rc = lc_pouch_xa_sync_participants(client, preview.participants,
+                                         preview.participant_count, error);
+  }
   lc_pouch_txn_record_cleanup(&preview);
   if (rc == LC_OK)
     rc = lc_pouch_state_with_key_lock(
         client->pouch, LC_POUCH_TXN_NAMESPACE, record_key,
         lc_pouch_txn_vote_record_locked, &context, error);
+  if (rc == LC_OK && xa_durable)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_TXN_NAMESPACE,
+                                       error);
   if (rc == LC_OK) {
     *decision_ready = context.apply_decision;
     if (native_completion != NULL)
@@ -18644,6 +18702,11 @@ int lc_pouch_client_xa_progress(lc_client *self,
                         "XA transaction expired before prepare", NULL, NULL,
                         "pouch-xa");
   }
+  /* A failed prior decision sync can leave visible but unacknowledged bytes.
+   * Resolve intent must stabilize that authority before an external handoff. */
+  if (rc == LC_OK && branch->phase >= LC_XA_COMMIT_SENT)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_TXN_NAMESPACE,
+                                       error);
   if (rc == LC_OK)
     rc = lc_pouch_xa_branch_write(client->pouch, branch, error);
   if (rc == LC_OK && branch->phase == LC_XA_PREPARED)
@@ -18817,7 +18880,7 @@ static int lc_pouch_client_txn_decision(
   lc_txn_decision_req decision_req;
   lc_txn_decision_req replay_req;
   char *key;
-  int rc;
+  int rc, xa_durable = 0;
 
   if (self == NULL || req == NULL || state == NULL || out == NULL) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -18887,11 +18950,27 @@ static int lc_pouch_client_txn_decision(
     context.request = &replay_req;
   }
   if (rc == LC_OK) {
+    xa_durable = owner_id != NULL || context.owner_sealed ||
+                 lc_pouch_xa_has_participants(req) ||
+                 lc_pouch_txn_record_has_xa(&context.record);
+    if (xa_durable && strcmp(state, "prepare") != 0) {
+      rc = lc_pouch_xa_sync_participants(client, context.record.participants,
+                                         context.record.participant_count,
+                                         error);
+      if (rc == LC_OK)
+        rc = lc_pouch_xa_sync_participants(client, req->participants,
+                                           req->participant_count, error);
+    }
+  }
+  if (rc == LC_OK) {
     lc_pouch_txn_record_cleanup(&context.record);
     rc = lc_pouch_state_with_key_lock(client->pouch, LC_POUCH_TXN_NAMESPACE,
                                       key, lc_pouch_txn_decision_record_locked,
                                       &context, error);
   }
+  if (rc == LC_OK && xa_durable)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_TXN_NAMESPACE,
+                                       error);
 #ifdef LOCKDC_TEST_BUILD
   if (rc == LC_OK && context.apply_decision &&
       lc_pouch_test_after_txn_decision_hook != NULL)
@@ -19373,6 +19452,7 @@ static int lc_pouch_xa_owner_write(lc_client_handle *client, const char *txn_id,
                                    lc_pouch_generation version,
                                    lc_error *error) {
   char key[sizeof("owner/") + LC_XID_STRING_SIZE];
+  int rc;
 #ifdef LOCKDC_TEST_BUILD
   if (lc_pouch_test_before_xa_owner_write_hook != NULL) {
     int rc = lc_pouch_test_before_xa_owner_write_hook(
@@ -19382,9 +19462,13 @@ static int lc_pouch_xa_owner_write(lc_client_handle *client, const char *txn_id,
   }
 #endif
   (void)snprintf(key, sizeof(key), "owner/%s", txn_id);
-  return lc_pouch_tc_write_lease_at(client, LC_POUCH_XA_NAMESPACE, key,
-                                    owner_id, sealed ? "sealed" : "open", term,
-                                    expires, version, error);
+  rc = lc_pouch_tc_write_lease_at(client, LC_POUCH_XA_NAMESPACE, key, owner_id,
+                                  sealed ? "sealed" : "open", term, expires,
+                                  version, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                       error);
+  return rc;
 }
 static int lc_pouch_xa_managed(lc_client_handle *client, const char *txn_id,
                                int *managed, lc_error *error) {
@@ -19559,6 +19643,14 @@ static int lc_pouch_xa_snapshot_locked(lc_client_handle *client,
           ++out->branch_count;
       }
   }
+  /* A retry may observe an unacknowledged in-memory phase. Do not hand that
+   * phase to an external driver before its decision/descriptor are durable. */
+  if (rc == LC_OK && (owner.found || lc_pouch_txn_record_has_xa(&record)))
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                       error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_TXN_NAMESPACE,
+                                       error);
   lc_pouch_tc_lease_record_cleanup(&owner);
   lc_pouch_txn_record_cleanup(&record);
   if (rc != LC_OK)
@@ -19988,6 +20080,9 @@ int lc_pouch_client_xa_retire(lc_client *self, long retention_seconds,
       if (rc == LC_OK)
         rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
                                     error);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                           error);
 #ifdef LOCKDC_TEST_BUILD
       if (rc == LC_OK && owner.found &&
           lc_pouch_test_after_xa_retire_owner_hook != NULL)
@@ -19999,12 +20094,21 @@ int lc_pouch_client_xa_retire(lc_client *self, long retention_seconds,
           rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE,
                                       record.participants[j].key, 0, 0U, error);
       if (rc == LC_OK)
+        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                           error);
+      if (rc == LC_OK)
         rc = lc_pouch_tc_delete_key(client, LC_POUCH_TXN_NAMESPACE,
                                     entries[i].txn_id, 0, 0U, error);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_sync_namespace(client->pouch,
+                                           LC_POUCH_TXN_NAMESPACE, error);
       (void)snprintf(key, sizeof(key), "completed/%s", entries[i].txn_id);
       if (rc == LC_OK)
         rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
                                     error);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
+                                           error);
       if (rc == LC_OK) {
         ++*retired_count;
         --remaining;

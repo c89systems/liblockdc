@@ -19,8 +19,8 @@ typedef struct ps_pouch_state_options {
  * historical stages and decisions may be omitted by the resolved snapshot.
  * Public leased state updates/metadata/keepalive/release, transactional
  * attachments, native participant votes and on-demand expiry cleanup use the
- * same logical engine. .txns remains the decision authority. Complete external
- * XA ownership and guaranteed maintenance admission at capacity remain pending.
+ * same logical engine. .txns remains the decision authority. Guaranteed
+ * maintenance admission at capacity remains pending.
  * Public namespace maintenance and the common background scheduler use durable
  * in-file work hints for ordinary state, terminal cleanup, expiry and
  * collections. Forced ordinary-state compaction is also available below.
@@ -42,6 +42,11 @@ typedef struct ps_pouch_state_options {
  * notifications use no sidecar. Outbox delivery, stateful checkpoints,
  * completion/dead-letter/replay, inbox/command receipts and terminal retention
  * use the same owners, with bounded durable in-file cleanup markers.
+ * Public XA resource registration, external branch progress, managed owner
+ * epochs, recovery snapshots, completion and history retirement use the common
+ * journal/coordinator engine. Journal handoffs force completed dependencies
+ * under either durability policy; external SQL execution is outside this
+ * harness. Exclusive ownership remains required.
  * Other Pouch operations are outside this harness's current call contract.
  * Explicitly disable indexing; shared
  * root mode and generated external key files are not admitted. No public

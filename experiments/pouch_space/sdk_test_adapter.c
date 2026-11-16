@@ -9,7 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-/* Reuse the production SDK behavior cases with an exclusive container owner.
+/* Reuse production SDK behavior suites with an exclusive container owner.
  * Directory fixtures keep one container.pouch inside their existing cleanup
  * envelope. Scan fallback is explicit until indexed-query ownership is added.
  * This adapter establishes no shared-root or indexed-query proof. */

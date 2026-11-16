@@ -3,12 +3,15 @@
 #include <stdarg.h>
 #include <stddef.h>
 
+#include "../support/lc_test_cases.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
+#include "lc_pouch_namespace.h"
 #include "lc_pouch_xa.h"
 #include "lc_xa_internal.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +38,33 @@ typedef struct fixture {
   lc_outbox_participant *participant;
   lc_outbox_commit_result receipts;
 } fixture;
+
+#ifdef LC_XA_NATIVE_SYNC_TEST
+static pthread_mutex_t sync_watch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+  int active, fail;
+  dev_t device;
+  ino_t inode;
+  size_t calls;
+} sync_watch;
+int __real_fsync(int fd);
+int __wrap_fsync(int fd) {
+  struct stat st;
+  int fail = 0;
+  pthread_mutex_lock(&sync_watch_mutex);
+  if (sync_watch.active && !fstat(fd, &st) && st.st_dev == sync_watch.device &&
+      st.st_ino == sync_watch.inode) {
+    ++sync_watch.calls;
+    fail = sync_watch.fail;
+  }
+  pthread_mutex_unlock(&sync_watch_mutex);
+  if (fail) {
+    errno = EIO;
+    return -1;
+  }
+  return __real_fsync(fd);
+}
+#endif
 
 static void remove_tree(const char *path) {
   DIR *directory = opendir(path);
@@ -115,6 +145,11 @@ static int setup(void **state) {
 
 static int teardown(void **state) {
   fixture *f = (fixture *)*state;
+#ifdef LC_XA_NATIVE_SYNC_TEST
+  pthread_mutex_lock(&sync_watch_mutex);
+  sync_watch.active = 0;
+  pthread_mutex_unlock(&sync_watch_mutex);
+#endif
   lc_pouch_test_queue_clock_gettime = NULL;
   lc_pouch_test_queue_time_context = NULL;
   lc_pouch_test_before_txn_decision_hook = NULL;
@@ -2400,8 +2435,79 @@ test_history_interrupted_retirement_resumes_after_reopen(void **state) {
   }
 }
 
-int main(void) {
+#ifdef LC_XA_NATIVE_SYNC_TEST
+static void retry_syncs_decision(fixture *f, int rollback) {
+  lc_pouch_namespace_manifest manifest = {0};
+  struct stat st;
+  char path[1500], key[LC_POUCH_XA_KEY_SIZE];
+  int prepared;
+  size_t calls;
+  lc_client_close(f->client);
+  f->client = NULL;
+  assert_true(snprintf(f->endpoint, sizeof(f->endpoint),
+                       "pouch://%s?single_writer=true&durable_sync=false&"
+                       "background_compaction=false&query_indexing=false&"
+                       "queue_watch=false&query_engine=scan",
+                       f->root) > 0);
+  open_client(f);
+  enroll(f, 0U);
+  stage_native(f);
+  prepare_branch(f, 0U);
+  assert_int_equal(lc_pouch_namespace_manifest_open(NULL, f->root, ".txns",
+                                                    &manifest, NULL, NULL,
+                                                    &f->error),
+                   LC_OK);
+  assert_true(snprintf(path, sizeof(path), "%s/segments/%s",
+                       manifest.namespace_path, manifest.active_segment) > 0);
+  lc_pouch_namespace_manifest_cleanup(NULL, &manifest);
+  assert_int_equal(stat(path, &st), 0);
+  pthread_mutex_lock(&sync_watch_mutex);
+  sync_watch.device = st.st_dev;
+  sync_watch.inode = st.st_ino;
+  sync_watch.active = sync_watch.fail = 1;
+  sync_watch.calls = 0U;
+  pthread_mutex_unlock(&sync_watch_mutex);
+  decision(f, rollback, LC_ERR_TRANSPORT);
+  assert_int_equal(
+      lc_pouch_xa_branch_key(&f->branches[0], key, sizeof(key), &f->error),
+      LC_OK);
+  assert_int_equal(lc_pouch_client_xa_prepared(
+                       f->client, f->branches[0].txn_id, key,
+                       rollback ? LC_XA_ROLLBACK_SENT : LC_XA_COMMIT_SENT,
+                       &prepared, &f->error),
+                   LC_OK);
+  pthread_mutex_lock(&sync_watch_mutex);
+  calls = sync_watch.calls;
+  sync_watch.fail = 0;
+  sync_watch.calls = 0U;
+  pthread_mutex_unlock(&sync_watch_mutex);
+  assert_true(calls > 0U);
+  progress(f, 0U, rollback ? LC_XA_ROLLBACK_SENT : LC_XA_COMMIT_SENT);
+  pthread_mutex_lock(&sync_watch_mutex);
+  calls = sync_watch.calls;
+  sync_watch.active = 0;
+  pthread_mutex_unlock(&sync_watch_mutex);
+  assert_true(calls > 0U);
+  progress(f, 0U, rollback ? LC_XA_ABORTED : LC_XA_COMMITTED);
+  replay(f, rollback ? "rollback" : "commit", LC_OK);
+  visible(f, !rollback);
+}
+static void test_commit_retry_syncs_authoritative_decision(void **state) {
+  retry_syncs_decision((fixture *)*state, 0);
+}
+static void test_rollback_retry_syncs_authoritative_decision(void **state) {
+  retry_syncs_decision((fixture *)*state, 1);
+}
+#endif
+
+int main(int argc, char **argv) {
   const struct CMUnitTest tests[] = {
+#ifdef LC_XA_NATIVE_SYNC_TEST
+      cmocka_unit_test_setup_teardown(
+          test_commit_retry_syncs_authoritative_decision, setup, teardown),
+      cmocka_unit_test_setup_teardown(
+          test_rollback_retry_syncs_authoritative_decision, setup, teardown),
+#endif
       cmocka_unit_test_setup_teardown(
           test_history_default_age_and_idempotent_completion, setup, teardown),
       cmocka_unit_test_setup_teardown(
@@ -2512,5 +2618,6 @@ int main(void) {
       cmocka_unit_test_setup_teardown(
           test_native_lease_vote_waits_for_external_completion, setup,
           teardown)};
-  return cmocka_run_group_tests(tests, NULL, NULL);
+  return lc_test_run_cases(tests, sizeof(tests) / sizeof(tests[0]), argc, argv,
+                           NULL, NULL);
 }

@@ -12674,6 +12674,40 @@ int lc_pouch_state_durable_scope_include_namespace_locked(lc_pouch *pouch,
   return rc;
 }
 
+typedef struct lc_pouch_state_namespace_sync {
+  lc_pouch *pouch;
+  const char *ns;
+} lc_pouch_state_namespace_sync;
+static int lc_pouch_state_sync_namespace_locked(void *context,
+                                                lc_error *error) {
+  lc_pouch_state_namespace_sync *sync = context;
+  return lc_pouch_state_durable_scope_include_namespace_locked(sync->pouch,
+                                                               sync->ns, error);
+}
+int lc_pouch_state_sync_namespace(lc_pouch *pouch, const char *ns,
+                                  lc_error *error) {
+  lc_pouch_state_namespace_sync sync;
+  lc_pouch_state_commit_group *group = NULL;
+  int owned = 0, force_sync;
+  int rc = lc_pouch_state_commit_group_begin(pouch, &group, &owned, error);
+  if (rc != LC_OK)
+    return rc;
+  sync.pouch = pouch;
+  sync.ns = ns;
+  force_sync = group->force_sync;
+  group->force_sync = 1;
+  rc = lc_pouch_state_with_namespace_lock(
+      pouch, ns, lc_pouch_state_sync_namespace_locked, &sync, error);
+  /* Capture pins under namespace authority, then wait outside it. The xid
+   * authority retained by the caller prevents replacement of this handoff. */
+  if (rc == LC_OK)
+    rc = lc_pouch_state_durable_scope_barrier(group, error);
+  if (owned)
+    return lc_pouch_state_finish_commit_group_common(group, 1, rc, error);
+  group->force_sync = force_sync;
+  return rc;
+}
+
 int lc_pouch_state_retention_retire_hint_locked(lc_pouch *pouch, const char *ns,
                                                 lc_error *error) {
   lc_pouch_state_commit_group *scope = lc_pouch_state_commit_group_current();

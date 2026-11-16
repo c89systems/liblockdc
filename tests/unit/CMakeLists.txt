@@ -400,7 +400,8 @@ lc_add_unit_test(lc_unit_state_retention test_lc_state_retention.c
 target_compile_definitions(lc_unit_state_retention PRIVATE LOCKDC_TEST_BUILD=1)
 target_link_options(lc_unit_state_retention PRIVATE "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_pouch_xa test_lc_pouch_xa.c)
-target_compile_definitions(lc_unit_pouch_xa PRIVATE LOCKDC_TEST_BUILD=1)
+target_compile_definitions(lc_unit_pouch_xa PRIVATE LOCKDC_TEST_BUILD=1 LC_XA_NATIVE_SYNC_TEST=1)
+target_link_options(lc_unit_pouch_xa PRIVATE "LINKER:--wrap=fsync")
 lc_add_unit_test(lc_unit_xa_borrow test_lc_xa_borrow.c)
 function(lc_add_tracking_case name target filter)
   # Native cases reuse existing binaries. The production allocator probe

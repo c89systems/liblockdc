@@ -1420,7 +1420,7 @@ typedef struct retention_disk {
   io_fault fault;
   unsigned char *stable, *dirty, *scratch;
   uint64_t read_bytes;
-  int persist, frozen;
+  int persist, frozen, complete_writes;
 } retention_disk;
 static ssize_t retention_disk_read(void *context, int fd, void *p, size_t n,
                                    off_t at) {
@@ -1437,7 +1437,7 @@ static ssize_t retention_disk_write(void *context, int fd, const void *p,
   retention_disk *m = context;
   REQUIRE(at >= 0 && (uint64_t)at + n <= PS_DEFAULT_CAPACITY);
   int fail = io_fails(&m->fault);
-  size_t want = fail ? n / 2 : n;
+  size_t want = fail && !m->complete_writes ? n / 2 : n;
   REQUIRE(pwrite(fd, p, want, at) == (ssize_t)want);
   if (want && !m->frozen) {
     for (size_t page = (size_t)at / PS_PAGE;
@@ -2570,6 +2570,11 @@ static void guard_compare(const char *directory, int reverse) {
 }
 #include "queue_outbox_concurrency_cases.h"
 #include "queue_outbox_crash_cases.h"
+#include "xa_capacity_cases.h"
+#include "xa_cases.h"
+#include "xa_concurrency_cases.h"
+#include "xa_crash_cases.h"
+#include "xa_managed_cases.h"
 static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
@@ -2592,6 +2597,26 @@ static void *worker(void *context) {
     retention_codec();
   else if (!strcmp(r->mode, "outbox-markers"))
     outbox_markers(r->directory);
+  else if (!strcmp(r->mode, "xa-durability"))
+    xa_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "xa-io-faults"))
+    xa_faults(r->directory, 1);
+  else if (!strcmp(r->mode, "xa-allocation-faults"))
+    xa_faults(r->directory, 2);
+  else if (!strcmp(r->mode, "xa-managed-durability"))
+    xa_managed_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "xa-concurrency"))
+    xa_concurrency(r->directory);
+  else if (!strcmp(r->mode, "xa-scope"))
+    xa_scope(r->directory);
+  else if (!strcmp(r->mode, "xa-capacity"))
+    xa_capacity(r->directory);
+  else if (!strcmp(r->mode, "xa-crash"))
+    xa_crashes(r->directory);
+  else if (!strcmp(r->mode, "xa-managed-io-faults"))
+    xa_managed_faults(r->directory, 1);
+  else if (!strcmp(r->mode, "xa-managed-allocation-faults"))
+    xa_managed_faults(r->directory, 2);
   else if (!strcmp(r->mode, "outbox-notifications"))
     outbox_notifications(r->directory);
   else if (!strcmp(r->mode, "outbox-marker-io-faults"))
@@ -2641,6 +2666,8 @@ int main(int argc, char **argv) {
   char prefix[1100], pattern[1200], directory[1200];
   pthread_t thread;
   REQUIRE(argc == 3);
+  if (!strcmp(argv[2], "xa-crash-child"))
+    xa_crash_child();
   if (!strcmp(argv[2], "outbox-marker-crash-child"))
     outbox_marker_crash_child();
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-sdk-", argv[1]) <

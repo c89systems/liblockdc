@@ -1,3 +1,5 @@
+#ifndef POUCH_SPACE_QUEUE_OUTBOX_CRASH_CASES_H
+#define POUCH_SPACE_QUEUE_OUTBOX_CRASH_CASES_H
 /* Real exec'd process death complements the separate lost/torn I/O model. */
 #include "queue_outbox_marker_cases.h"
 typedef struct outbox_crash_io {
@@ -135,3 +137,4 @@ static void outbox_marker_crashes(const char *directory) {
   lc_error_cleanup(&e);
   printf("outbox marker process deaths=%zu passed\n", deaths);
 }
+#endif

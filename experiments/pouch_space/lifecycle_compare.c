@@ -2,6 +2,7 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
+#include "lc_xa_internal.h"
 #include "pouch.h"
 #include <dirent.h>
 #include <errno.h>
@@ -22,11 +23,13 @@ typedef struct worker {
   char ns[64];
   lc_outbox *outbox;
   lc_outbox_dispatcher *dispatcher;
+  lc_xa_store *journal;
+  char owner[LC_XID_STRING_SIZE], resource[LC_XID_STRING_SIZE];
   int result;
 } worker;
 struct comparison {
   size_t rows, bytes, writers;
-  int container, outbox, sync, started;
+  int container, outbox, xa, sync, started;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -73,13 +76,13 @@ int __wrap_fsync(int fd) {
 }
 static void require(int valid, const char *message) {
   if (!valid) {
-    fprintf(stderr, "queue/outbox comparison: %s\n", message);
+    fprintf(stderr, "Pouch lifecycle comparison: %s\n", message);
     exit(1);
   }
 }
 static void check(int rc, lc_error *e) {
   if (rc != LC_OK) {
-    fprintf(stderr, "queue/outbox comparison %d: %s [%s]\n", rc,
+    fprintf(stderr, "Pouch lifecycle comparison %d: %s [%s]\n", rc,
             e->message ? e->message : "", e->server_code ? e->server_code : "");
     exit(1);
   }
@@ -202,6 +205,10 @@ static void open_store(comparison *run, int create, lc_error *e) {
         lc_client_new_outbox(run->client, &outbox, &run->workers[i].outbox, e),
         e);
   }
+  for (size_t i = 0U; run->xa && i < run->writers; ++i)
+    check(lc_xa_store_open_owned(run->client, run->workers[i].owner,
+                                 &run->workers[i].journal, e),
+          e);
 }
 static void close_store(comparison *run) {
   for (size_t i = 0U; i < run->writers; ++i) {
@@ -209,6 +216,8 @@ static void close_store(comparison *run) {
     run->workers[i].dispatcher = NULL;
     lc_outbox_close(run->workers[i].outbox);
     run->workers[i].outbox = NULL;
+    lc_xa_store_close(run->workers[i].journal);
+    run->workers[i].journal = NULL;
   }
   lc_client_close(run->client);
   run->client = NULL;
@@ -293,6 +302,81 @@ static int outbox_one(worker *w, size_t row, producer *source, consumer *sink,
   lc_outbox_job_close(job);
   return rc;
 }
+static void xa_id(size_t value, char id[LC_XID_STRING_SIZE]) {
+  require(snprintf(id, LC_XID_STRING_SIZE, "0000000000%09lx0",
+                   (unsigned long)value) == 20,
+          "benchmark XA identity");
+}
+static int xa_one(worker *w, size_t row, producer *source, consumer *sink,
+                  lc_error *e) {
+  lc_xa_branch_record branch = {0};
+  lc_xa_snapshot snapshot = {0};
+  lc_acquire_req request;
+  lc_lease *lease = NULL;
+  lc_get_res result = {0};
+  int rc;
+  xa_id(1000U + row, branch.txn_id);
+  strcpy(branch.branch_id, branch.txn_id);
+  strcpy(branch.resource_id, w->resource);
+  snprintf(branch.gid, sizeof(branch.gid), "lc-benchmark-%s", branch.txn_id);
+  strcpy(branch.full_xid, "12345");
+  strcpy(branch.system_id, "7695692707854696465");
+  strcpy(branch.database_oid, "16384");
+  strcpy(branch.role_oid, "16385");
+  rc = lc_xa_store_claim_blocking(w->journal, branch.txn_id, 3600L, 0,
+                                  &snapshot, e);
+  lc_xa_snapshot_cleanup(&snapshot);
+  if (rc == LC_OK)
+    rc = lc_xa_store_enroll_blocking(w->journal, &branch, e);
+  lc_acquire_req_init(&request);
+  request.ns = w->ns;
+  request.key = branch.txn_id;
+  request.owner = w->owner;
+  request.txn_id = branch.txn_id;
+  request.ttl_seconds = 3600L;
+  if (rc == LC_OK)
+    rc = lc_acquire(w->run->client, &request, &lease, e);
+  if (rc == LC_OK)
+    rc = lc_lease_update(lease, &source->source, NULL, e);
+  if (rc == LC_OK)
+    rc = lc_xa_store_seal_blocking(w->journal, branch.txn_id, e);
+  branch.phase = LC_XA_PREPARE_SENT;
+  if (rc == LC_OK)
+    rc = lc_xa_store_progress_blocking(w->journal, &branch, e);
+  if (rc == LC_OK)
+    rc = lc_xa_store_prepare_pouch_blocking(w->journal, branch.txn_id, e);
+  branch.phase = LC_XA_PREPARED;
+  branch.prepared_observed = 1U;
+  if (rc == LC_OK)
+    rc = lc_xa_store_progress_blocking(w->journal, &branch, e);
+  if (rc == LC_OK) {
+    rc = lc_xa_store_decide_blocking(w->journal, branch.txn_id, 1, e);
+    require(rc == LC_ERR_PENDING && e->server_code &&
+                !strcmp(e->server_code, "xa_pending"),
+            "XA decision waits for external completion");
+    lc_error_cleanup(e);
+    lc_error_init(e);
+    rc = LC_OK;
+  }
+  branch.phase = LC_XA_COMMIT_SENT;
+  if (rc == LC_OK)
+    rc = lc_xa_store_progress_blocking(w->journal, &branch, e);
+  branch.phase = LC_XA_COMMITTED;
+  branch.evidence = LC_XA_EVIDENCE_NATIVE;
+  branch.completed_at_unix = (lc_unix_seconds)time(NULL);
+  if (rc == LC_OK)
+    rc = lc_xa_store_progress_blocking(w->journal, &branch, e);
+  if (rc == LC_OK)
+    rc = lc_xa_store_decide_blocking(w->journal, branch.txn_id, 1, e);
+  lc_lease_close(lease);
+  if (rc == LC_OK)
+    rc = lc_get_in_namespace(w->run->client, w->ns, branch.txn_id, NULL,
+                             &sink->sink, &result, e);
+  lc_get_res_cleanup(&result);
+  if (rc == LC_OK)
+    rc = lc_xa_store_release_blocking(w->journal, branch.txn_id, e);
+  return rc;
+}
 static void *run_worker(void *context) {
   worker *w = context;
   comparison *run = w->run;
@@ -313,8 +397,9 @@ static void *run_worker(void *context) {
     sink.sink.impl = &sink;
     sink.sink.write = consume;
     double start = now(CLOCK_MONOTONIC);
-    w->result = run->outbox ? outbox_one(w, row, &source, &sink, &e)
-                            : queue_one(w, row, &source, &sink, &e);
+    w->result = run->xa       ? xa_one(w, row, &source, &sink, &e)
+                : run->outbox ? outbox_one(w, row, &source, &sink, &e)
+                              : queue_one(w, row, &source, &sink, &e);
     run->latencies[row] = now(CLOCK_MONOTONIC) - start;
     if (w->result == LC_OK)
       require(source.offset == run->bytes && sink.offset == run->bytes,
@@ -345,7 +430,30 @@ static int cleanup_namespace(void *context, const char *ns, lc_error *e) {
 static void verify_reopen(comparison *run, lc_error *e) {
   for (size_t i = 0U; i < run->writers; ++i) {
     worker *w = &run->workers[i];
-    if (!run->outbox) {
+    if (run->xa) {
+      for (size_t row = i; row < run->rows; row += run->writers) {
+        char id[LC_XID_STRING_SIZE];
+        lc_get_res value = {0};
+        lc_xa_snapshot snapshot = {0};
+        consumer sink = {0};
+        sink.size = run->bytes;
+        sink.sink.impl = &sink;
+        sink.sink.write = consume;
+        xa_id(1000U + row, id);
+        check(lc_get_in_namespace(run->client, w->ns, id, NULL, &sink.sink,
+                                  &value, e),
+              e);
+        lc_get_res_cleanup(&value);
+        require(sink.offset == run->bytes,
+                "XA applied body survives retirement");
+        require(lc_xa_store_snapshot_blocking(w->journal, id, &snapshot, e) ==
+                    LC_ERR_INVALID,
+                "XA history remains retired after reopen");
+        lc_xa_snapshot_cleanup(&snapshot);
+        lc_error_cleanup(e);
+        lc_error_init(e);
+      }
+    } else if (!run->outbox) {
       lc_queue_stats_req request;
       lc_queue_stats_res result = {0};
       lc_queue_stats_req_init(&request);
@@ -416,10 +524,12 @@ int main(int argc, char **argv) {
   require(!strcmp(argv[1], "pouch-queue") ||
               !strcmp(argv[1], "runtime-queue") ||
               !strcmp(argv[1], "pouch-outbox") ||
-              !strcmp(argv[1], "runtime-outbox"),
+              !strcmp(argv[1], "runtime-outbox") ||
+              !strcmp(argv[1], "pouch-xa") || !strcmp(argv[1], "runtime-xa"),
           "mode");
   run.container = !strncmp(argv[1], "runtime-", 8U);
   run.outbox = strstr(argv[1], "outbox") != NULL;
+  run.xa = strstr(argv[1], "-xa") != NULL;
   run.rows = number(argv[3], 1U, 64U);
   run.bytes = number(argv[4], 64U, PS_MIB);
   run.sync = (int)number(argv[5], 0U, 1U);
@@ -448,6 +558,8 @@ int main(int argc, char **argv) {
     run.workers[i].ordinal = i;
     snprintf(run.workers[i].ns, sizeof(run.workers[i].ns), "bench-%lu",
              (unsigned long)i);
+    xa_id(100U + i, run.workers[i].owner);
+    xa_id(200U + i, run.workers[i].resource);
   }
   payload_digest(&run);
   lc_error_init(&e);
@@ -482,6 +594,11 @@ int main(int argc, char **argv) {
   for (size_t i = 0U; run.outbox && i < run.writers; ++i)
     check(lc_outbox_dispatcher_stop(run.workers[i].dispatcher, -1L, &e), &e);
   lc_pouch *pouch = ((lc_client_handle *)run.client)->pouch;
+  if (run.xa) {
+    size_t retired = 0U;
+    check(lc_pouch_client_xa_retire(run.client, 0L, 0U, &retired, &e), &e);
+    require(retired == run.rows, "complete XA history retirement");
+  }
   check(lc_pouch_storage_namespaces_visit(pouch, cleanup_namespace, pouch, &e),
         &e);
   lifecycle_seconds = now(CLOCK_MONOTONIC) - start;

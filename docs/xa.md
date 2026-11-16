@@ -100,6 +100,18 @@ counting as a YES vote. Application waits for every external descriptor to recor
 completion in the decision's direction. `LC_ERR_PENDING` reports that wait and
 preserves the durable decision in TC/replay responses.
 
+XA handoffs force their completed journal prefix under both Pouch durability
+policies. Acknowledged resource registration, owner changes, branch progress,
+votes and decisions survive loss of an ordinary NoSync tail. Native staged
+dependencies precede vote and terminal-decision bytes, including when a write
+survives a failed acknowledgement. A resolution retry re-syncs `.txns` before
+advancing its external branch; a coordinator snapshot stabilizes the observed
+decision and descriptors before handing them to a driver. Applied Pouch data
+precedes the completion marker. Retirement orders the owner tombstone, branch
+removal, decision removal and completion removal through explicit barriers.
+These internal scopes restore a borrowed mutation group's previous policy;
+ordinary NoSync operations retain their configured behavior.
+
 Each PostgreSQL branch records:
 
 - Coordinator, global transaction, resource-manager and branch identities.

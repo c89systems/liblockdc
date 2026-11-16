@@ -316,7 +316,10 @@ int lc_xa_store_register_blocking(lc_xa_store *store,
   memcpy(reg.bytes + 25U, validation.database_oid,
          strlen(validation.database_oid));
   memcpy(reg.bytes + 36U, validation.role_oid, strlen(validation.role_oid));
-  return lc_pouch_state_with_key_lock(store->client->pouch,
-                                      LC_POUCH_XA_NAMESPACE, key,
-                                      register_locked, &reg, error);
+  rc = lc_pouch_state_with_key_lock(store->client->pouch, LC_POUCH_XA_NAMESPACE,
+                                    key, register_locked, &reg, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_sync_namespace(store->client->pouch,
+                                       LC_POUCH_XA_NAMESPACE, error);
+  return rc;
 }

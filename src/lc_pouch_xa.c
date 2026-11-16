@@ -293,8 +293,11 @@ int lc_pouch_xa_branch_write(lc_pouch *pouch, const lc_xa_branch_record *branch,
   context.pouch = pouch;
   context.branch = branch;
   context.key = key;
-  return lc_pouch_state_with_key_lock(pouch, LC_POUCH_XA_NAMESPACE, key,
-                                      write_locked, &context, error);
+  rc = lc_pouch_state_with_key_lock(pouch, LC_POUCH_XA_NAMESPACE, key,
+                                    write_locked, &context, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_sync_namespace(pouch, LC_POUCH_XA_NAMESPACE, error);
+  return rc;
 }
 
 int lc_pouch_xa_participant(const lc_txn_participant *participant) {

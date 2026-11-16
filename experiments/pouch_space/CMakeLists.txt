@@ -34,15 +34,15 @@ if(LOCKDC_BUILD_BENCHMARKS)
   target_link_options(pouch_space_compare PRIVATE
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
-  add_executable(pouch_space_queue_outbox_compare queue_outbox_compare.c
+  add_executable(pouch_space_lifecycle_compare lifecycle_compare.c
     ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-  target_include_directories(pouch_space_queue_outbox_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(pouch_space_queue_outbox_compare PRIVATE pouch_space_experiment)
-  target_link_options(pouch_space_queue_outbox_compare PRIVATE
+  target_include_directories(pouch_space_lifecycle_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_lifecycle_compare PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_lifecycle_compare PRIVATE
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
-  lc_configure_c_test_target(pouch_space_queue_outbox_compare)
+  lc_configure_c_test_target(pouch_space_lifecycle_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox)
+    foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox pouch-xa runtime-xa)
       foreach(sync 0 1)
         foreach(reopen 0 1)
           set(reopen_args)
@@ -50,7 +50,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
             set(reopen_args --reopen)
           endif()
           add_test(NAME pouch_space_compare_${mode}_${sync}_${reopen}
-            COMMAND pouch_space_queue_outbox_compare ${mode}
+            COMMAND pouch_space_lifecycle_compare ${mode}
               ${CMAKE_CURRENT_BINARY_DIR} 4 4096 ${sync} 2 ${reopen_args})
           set_tests_properties(pouch_space_compare_${mode}_${sync}_${reopen}
             PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
@@ -95,7 +95,7 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
   lc_configure_c_target(pouch_space_test_experiment)
-  foreach(surface queue outbox)
+  foreach(surface queue outbox xa)
     if(surface STREQUAL "queue")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
       set(behavior_cases
@@ -119,7 +119,7 @@ if(LOCKDC_BUILD_TESTS)
         test_client_queue_subscribe_polling_paths
         test_client_queue_watch_polling_detects_change
         test_client_queue_watch_detects_transaction_ack_commit)
-    else()
+    elseif(surface STREQUAL "outbox")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_outbox.c)
       set(behavior_cases
         test_pouch_outbox_duplicate_rejects_immutable_envelope_conflicts
@@ -144,9 +144,53 @@ if(LOCKDC_BUILD_TESTS)
         test_pouch_terminal_retention_generation_busy_and_failure
         test_pouch_dead_letter_retention_is_bounded_and_generation_safe
         test_pouch_dispatcher_scan_recovery_when_indexing_is_disabled)
+    else()
+      set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch_xa.c)
+      # Shared-root client cases remain native controls until shared physical
+      # ownership is integrated. Every exclusive journal/coordinator case runs.
+      set(behavior_cases
+        test_history_default_age_and_idempotent_completion
+        test_history_live_owner_and_unfinished_work_are_protected
+        test_history_count_cap_retires_oldest_on_release
+        test_history_invalid_policy_and_corrupt_completion_fail_closed
+        test_history_unfinished_commit_preserves_branch_until_application
+        test_history_interrupted_retirement_resumes_after_reopen
+        test_xa_outbox_detached_owner_closes_application_views
+        test_xa_outbox_sql_first_binding_and_receipts
+        test_xa_outbox_first_adoption_and_rollback
+        test_xa_outbox_close_during_pending_commit_keeps_owner
+        test_coordinator_owner_checks_and_deferred_transaction_close
+        test_coordinator_state_only_commit_and_retained_receivers
+        test_coordinator_cancelled_begin_and_active_owner_recovery
+        test_coordinator_raw_terminal_replay_preserves_owner_epoch
+        test_coordinator_rejected_same_owner_recovery_preserves_live_claim
+        test_coordinator_begin_journal_failure_preserves_id
+        test_managed_pouch_vote_and_independent_transactions
+        test_managed_owner_exclusion_and_commit_takeover
+        test_managed_owner_begin_failure_retains_recoverable_identity
+        test_managed_owner_publication_failure_keeps_terminal_decision
+        test_tc_expired_owner_cannot_reuse_an_old_epoch
+        test_tc_release_preserves_epoch_across_reopen
+        test_driver_contract_pins_closed_owners_and_preallocates_branch
+        test_driver_contract_pins_transferred_branch_until_operation_close
+        test_driver_contract_reclaims_unclaimed_and_cancelled_branches
+        test_native_prepare_observation_is_durable_without_yes
+        test_public_store_rejects_completion_contrary_to_decision
+        test_public_store_pins_client_and_preserves_resource_identity
+        test_pending_commit_survives_reopen
+        test_all_external_branches_complete_before_application
+        test_rollback_waits_for_uncertain_prepare_cleanup
+        test_enrollment_seals_and_opposite_resolution_is_rejected
+        test_branch_identity_is_immutable_and_namespace_private
+        test_missing_descriptor_blocks_entire_application
+        test_invalid_native_identity_and_phase_are_rejected
+        test_prepare_intent_is_not_a_yes_vote_after_reopen
+        test_expired_prepare_preserves_abort_until_external_cleanup
+        test_corrupt_descriptor_never_opens_application_gate
+        test_native_lease_vote_waits_for_external_completion)
     endif()
     add_executable(pouch_space_${surface}_sdk_test ${behavior_source}
-      queue_outbox_sdk_adapter.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+      sdk_test_adapter.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
     target_include_directories(pouch_space_${surface}_sdk_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(pouch_space_${surface}_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
@@ -265,6 +309,24 @@ if(LOCKDC_BUILD_TESTS)
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
+  foreach(codec RANGE 0 3)
+    foreach(mode xa-durability xa-io-faults xa-allocation-faults
+        xa-managed-durability xa-managed-io-faults xa-managed-allocation-faults
+        xa-concurrency xa-scope xa-capacity xa-crash)
+      # The canonical codec owners already have their own four-codec fault
+      # matrices. Exercise this handoff protocol's full failure sweeps on plain
+      # and combined encryption/compression, and its behavior on every codec.
+      if((codec EQUAL 1 OR codec EQUAL 2) AND
+         mode MATCHES "(io-faults|allocation-faults|crash)$")
+        continue()
+      endif()
+      add_test(NAME pouch_space_client_${mode}_${codec}
+        COMMAND ${CMAKE_COMMAND} -E env POUCH_XA_CODEC=${codec}
+          $<TARGET_FILE:pouch_space_client_test> ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
+        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+  endforeach()
   set_tests_properties(pouch_space_client_faults pouch_space_client_io-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_client_retention-faults pouch_space_client_retention-io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_frame_test frame_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
