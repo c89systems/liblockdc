@@ -2,6 +2,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_path.h"
+#include "lc_pouch_retention_record.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -12,9 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define LC_POUCH_RETENTION_CONTROL_MAX (3U * 1024U * 1024U + 128U)
 #define LC_POUCH_RETENTION_WORK_LEAF "work"
-#define LC_POUCH_RETENTION_IDLE_TEXT "LPR1\n0\n"
 
 #ifdef LOCKDC_TEST_BUILD
 lc_pouch_retention_test_hook lc_pouch_test_retention_hook;
@@ -160,7 +159,11 @@ int lc_pouch_retention_hint_ensure(lc_pouch *pouch, const char *ns,
   char *directory = NULL;
   char *path = NULL;
   struct stat st;
-  int rc = retention_paths(pouch, ns, 0, &directory, &path, error);
+  int rc;
+  if (pouch->storage.ops)
+    return pouch->storage.ops->retention_hint_ensure(pouch->storage.context, ns,
+                                                     error);
+  rc = retention_paths(pouch, ns, 0, &directory, &path, error);
   if (rc == LC_OK && stat(path, &st) == 0) {
     if (!S_ISREG(st.st_mode))
       rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
@@ -219,6 +222,14 @@ int lc_pouch_retention_work_read(lc_pouch *pouch, const char *ns,
   int rc;
 
   memset(out, 0, sizeof(*out));
+  if (pouch->storage.ops) {
+    rc = pouch->storage.ops->retention_work_load(pouch->storage.context, ns,
+                                                 &bytes, &length, error);
+    if (rc == LC_OK && bytes)
+      rc = lc_pouch_retention_record_decode(&pouch->allocator, bytes, length,
+                                            ns, out, error);
+    goto done;
+  }
   rc = retention_paths(pouch, ns, 0, &directory, &path, error);
   if (rc != LC_OK)
     goto done;
@@ -260,43 +271,9 @@ int lc_pouch_retention_work_read(lc_pouch *pouch, const char *ns,
     }
     offset += (size_t)count;
   }
-  bytes[length] = '\0';
-  if (memchr(bytes, '\0', length) != NULL)
-    goto invalid;
-  if (strcmp(bytes, LC_POUCH_RETENTION_IDLE_TEXT) == 0) {
-    out->present = 1;
-    goto done;
-  }
-  if (length > 9 && memcmp(bytes, "LPR1\n", 5) == 0 &&
-      (bytes[5] == '1' || bytes[5] == '2') && bytes[6] == '\n' &&
-      bytes[length - 1] == '\n') {
-    char *fields[4];
-    size_t i;
-    fields[0] = bytes + 7;
-    for (i = 0; i < 3; ++i) {
-      char *end = strchr(fields[i], '\n');
-      if (end == NULL || end == fields[i] || end + 1 >= bytes + length - 1)
-        goto invalid;
-      *end = '\0';
-      fields[i + 1] = end + 1;
-    }
-    bytes[length - 1] = '\0';
-    if (!lc_xid_is_valid(fields[0]) || strchr(fields[3], '\n') != NULL ||
-        !lc_u64_parse_base10(fields[1], &out->fencing_token) ||
-        !lc_u64_parse_base10(fields[2], &out->state_version))
-      goto invalid;
-    out->phase = bytes[5] - '0';
-    out->txn_id = lc_strdup_with_allocator(&pouch->allocator, fields[0]);
-    out->key = lc_pouch_path_unescape_name(&pouch->allocator, fields[3]);
-    if (out->txn_id == NULL || out->key == NULL) {
-      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "invalid state retention work identity", NULL, path,
-                        "pouch");
-      goto done;
-    }
-    out->present = 1;
-    goto done;
-  }
+  rc = lc_pouch_retention_record_decode(&pouch->allocator, bytes, length, path,
+                                        out, error);
+  goto done;
 invalid:
   rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                     "invalid state retention work reference", NULL, path,
@@ -321,56 +298,23 @@ int lc_pouch_retention_work_write(lc_pouch *pouch, const char *ns, int phase,
                                   lc_error *error) {
   char *directory = NULL;
   char *path = NULL;
-  char *encoded = NULL;
   char *text = NULL;
   int rc;
   size_t length;
-  char fencing[32];
-  char version[32];
-
-  if (phase < LC_POUCH_RETENTION_IDLE || phase > LC_POUCH_RETENTION_FINISHED ||
-      (phase != LC_POUCH_RETENTION_IDLE &&
-       (!lc_xid_is_valid(txn_id) || key == NULL || key[0] == '\0')))
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "invalid state retention work identity", NULL, NULL,
-                        "pouch");
-  if (lc_u64_format_base10(fencing_token, fencing, sizeof(fencing)) < 0 ||
-      lc_u64_format_base10(state_version, version, sizeof(version)) < 0)
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "invalid state retention claim high-water", NULL, NULL,
-                        "pouch");
-  rc = retention_paths(pouch, ns, 0, &directory, &path, error);
-  if (rc == LC_OK && phase == LC_POUCH_RETENTION_IDLE)
-    rc = lc_pouch_path_write_text_file(path, LC_POUCH_RETENTION_IDLE_TEXT,
-                                       error);
+  rc = lc_pouch_retention_record_encode(&pouch->allocator, phase, txn_id, key,
+                                        fencing_token, state_version, &text,
+                                        &length, error);
+  if (rc == LC_OK && pouch->storage.ops)
+    rc = pouch->storage.ops->retention_work_store(
+        pouch->storage.context, ns,
+        phase == LC_POUCH_RETENTION_IDLE ? NULL : text,
+        phase == LC_POUCH_RETENTION_IDLE ? 0 : length, error);
   else if (rc == LC_OK) {
-    encoded = lc_pouch_path_escape_name(&pouch->allocator, key);
-    if (encoded == NULL)
-      rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to encode state retention target", NULL, NULL,
-                        "pouch");
-    else {
-      length = strlen(encoded) + strlen(txn_id) + strlen(fencing) +
-               strlen(version) + 12;
-      text = length <= LC_POUCH_RETENTION_CONTROL_MAX
-                 ? lc_alloc_with_allocator(&pouch->allocator, length)
-                 : NULL;
-      if (text == NULL)
-        rc = lc_error_set(error,
-                          length > LC_POUCH_RETENTION_CONTROL_MAX
-                              ? LC_ERR_INVALID
-                              : LC_ERR_NOMEM,
-                          0L, "state retention work exceeds local limit", NULL,
-                          NULL, "pouch");
-      else {
-        (void)snprintf(text, length, "LPR1\n%d\n%s\n%s\n%s\n%s\n", phase,
-                       txn_id, fencing, version, encoded);
-        rc = lc_pouch_path_write_text_file(path, text, error);
-      }
-    }
+    rc = retention_paths(pouch, ns, 0, &directory, &path, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_path_write_text_file(path, text, error);
   }
   lc_free_with_allocator(&pouch->allocator, text);
-  lc_free_with_allocator(&pouch->allocator, encoded);
   lc_free_with_allocator(&pouch->allocator, directory);
   lc_free_with_allocator(&pouch->allocator, path);
   return rc;
@@ -383,7 +327,11 @@ int lc_pouch_retention_hint_remove(lc_pouch *pouch, const char *ns,
   char *base = NULL;
   char *unused = NULL;
   struct stat st;
-  int rc = retention_paths(pouch, ns, 0, &directory, &path, error);
+  int rc;
+  if (pouch->storage.ops)
+    return pouch->storage.ops->retention_hint_remove(pouch->storage.context, ns,
+                                                     error);
+  rc = retention_paths(pouch, ns, 0, &directory, &path, error);
   if (rc == LC_OK)
     rc = retention_cleanup_temps(pouch, directory, error);
   if (rc == LC_OK && unlink(path) != 0 && errno != ENOENT)
@@ -417,9 +365,13 @@ int lc_pouch_retention_hint_next(lc_pouch *pouch, const char *after, char **ns,
   char *next = NULL;
   struct dirent *entry;
   DIR *dir = NULL;
-  int rc = retention_paths(pouch, NULL, 0, &directory, &unused, error);
+  int rc;
   *ns = NULL;
   *cursor = NULL;
+  if (pouch->storage.ops)
+    return pouch->storage.ops->retention_hint_next(pouch->storage.context,
+                                                   after, ns, cursor, error);
+  rc = retention_paths(pouch, NULL, 0, &directory, &unused, error);
   if (rc != LC_OK)
     goto done;
   dir = opendir(directory);
@@ -472,11 +424,9 @@ int lc_pouch_retention_hint_next(lc_pouch *pouch, const char *after, char **ns,
   }
   *cursor = next != NULL ? next : first;
   if (*cursor != NULL) {
-    *ns = lc_pouch_path_unescape_name(&pouch->allocator, *cursor);
-    if (*ns == NULL) {
-      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "invalid state retention namespace hint", NULL,
-                        directory, "pouch");
+    rc = lc_pouch_retention_record_unescape(&pouch->allocator, *cursor, ns,
+                                            directory, error);
+    if (rc != LC_OK) {
       *cursor = NULL;
       goto done;
     }

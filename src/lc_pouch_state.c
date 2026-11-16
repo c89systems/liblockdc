@@ -125,11 +125,7 @@ static int lc_pouch_state_retention_publish(lc_pouch *pouch, const char *ns,
                                             lc_error *error) {
   int rc = lc_pouch_state_retention_prepare(key, requested, out, error);
   if (rc == LC_OK && *out > 0 && !lc_pouch_state_key_is_staged(key)) {
-    if (pouch->storage.ops != NULL)
-      rc = pouch->storage.ops->retention_hint_ensure(pouch->storage.context, ns,
-                                                     error);
-    else
-      rc = lc_pouch_retention_hint_ensure(pouch, ns, error);
+    rc = lc_pouch_retention_hint_ensure(pouch, ns, error);
   }
   return rc;
 }

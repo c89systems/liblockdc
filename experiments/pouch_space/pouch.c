@@ -325,6 +325,134 @@ static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
   ps_namespace_release(ns);
   return rc;
 }
+/* Missing controls must not create namespaces. Keep the catalog pin until
+ * admission has resolved this exact binding; do not classify unrelated INVALID
+ * errors as absence, including when the caller supplies no error object. */
+static int retention_namespace(ps_pouch_owner *owner, const char *name,
+                               ps_namespace **out, lc_error *e) {
+  ps_catalog_view *view = NULL;
+  size_t length;
+  int rc;
+  *out = NULL;
+  if (!name || !*name || (length = strlen(name)) > PS_CATALOG_NAME_MAX)
+    return lc_error_set(e, LC_ERR_INVALID, 0,
+                        "retention control requires a valid namespace", NULL,
+                        NULL, "pouch");
+  rc = check(owner, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_get(ps_root_space(owner->root), 0, PS_CATALOG_NAMESPACE,
+                        name, length, &view, e);
+  if (rc == LC_OK && view)
+    rc = ps_root_namespace_acquire(owner->root, name, 0, out, e);
+  ps_catalog_view_close(view);
+  return rc;
+}
+static int retention_work_load(void *context, const char *name, char **out,
+                               size_t *bytes, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc;
+  *out = NULL;
+  *bytes = 0;
+  rc = retention_namespace(owner, name, &ns, e);
+  if (rc == LC_OK && ns)
+    rc = ps_namespace_retention_work_load(ns, &owner->allocator, out, bytes, e);
+  ps_namespace_release(ns);
+  return rc;
+}
+static int retention_work_store(void *context, const char *name,
+                                const char *text, size_t bytes, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = retention_namespace(owner, name, &ns, e);
+  if (rc == LC_OK && !ns)
+    rc =
+        lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                     "state retention work requires an existing discovery hint",
+                     NULL, NULL, "pouch");
+  if (rc == LC_OK)
+    rc = ps_namespace_retention_work_store(ns, text, bytes, e);
+  ps_namespace_release(ns);
+  return rc;
+}
+static int retention_hint_remove(void *context, const char *name, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = retention_namespace(owner, name, &ns, e);
+  if (rc == LC_OK && ns)
+    rc = ps_namespace_retention_hint_remove(ns, e);
+  ps_namespace_release(ns);
+  return rc;
+}
+typedef struct retention_discovery {
+  ps_pouch_owner *owner;
+  const char *after;
+  char *first, *next;
+} retention_discovery;
+static int retention_select(const char *name, const ps_namespace_info *info,
+                            void *context, lc_error *e) {
+  retention_discovery *d = context;
+  ps_namespace *ns = NULL;
+  char *copy;
+  int present = 0;
+  int rc = ps_root_namespace_acquire(d->owner->root, name, 0, &ns, e);
+  (void)info;
+  if (rc == LC_OK)
+    rc = ps_namespace_retention_hint_get(ns, &present, e);
+  ps_namespace_release(ns);
+  if (rc != LC_OK || !present)
+    return rc;
+  if (!d->first || strcmp(name, d->first) < 0) {
+    copy = lc_strdup_with_allocator(&d->owner->allocator, name);
+    if (!copy)
+      goto no_memory;
+    lc_free_with_allocator(&d->owner->allocator, d->first);
+    d->first = copy;
+  }
+  if (d->after && strcmp(name, d->after) > 0 &&
+      (!d->next || strcmp(name, d->next) < 0)) {
+    copy = lc_strdup_with_allocator(&d->owner->allocator, name);
+    if (!copy)
+      goto no_memory;
+    lc_free_with_allocator(&d->owner->allocator, d->next);
+    d->next = copy;
+  }
+  return LC_OK;
+no_memory:
+  return lc_error_set(e, LC_ERR_NOMEM, 0,
+                      "cannot select state retention namespace", NULL, NULL,
+                      "pouch");
+}
+static int retention_hint_next(void *context, const char *after, char **name,
+                               char **cursor, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  retention_discovery d;
+  char *selected;
+  int rc;
+  memset(&d, 0, sizeof(d));
+  d.owner = owner;
+  d.after = after;
+  *name = *cursor = NULL;
+  rc = ps_root_namespace_visit(owner->root, retention_select, &d, e);
+  selected = d.next ? d.next : d.first;
+  if (rc == LC_OK && selected) {
+    *name = lc_strdup_with_allocator(&owner->allocator, selected);
+    if (!*name)
+      rc = lc_error_set(e, LC_ERR_NOMEM, 0,
+                        "cannot copy state retention namespace", NULL, NULL,
+                        "pouch");
+    else {
+      *cursor = selected;
+      if (d.next)
+        d.next = NULL;
+      else
+        d.first = NULL;
+    }
+  }
+  lc_free_with_allocator(&owner->allocator, d.first);
+  lc_free_with_allocator(&owner->allocator, d.next);
+  return rc;
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -338,6 +466,10 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  source_open,
                                                  source_clone,
                                                  retention_hint_ensure,
+                                                 retention_work_load,
+                                                 retention_work_store,
+                                                 retention_hint_remove,
+                                                 retention_hint_next,
                                                  release};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {

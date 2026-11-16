@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-add_library(pouch_space_experiment STATIC space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c pouch.c maintenance.c)
+add_library(pouch_space_experiment STATIC space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c pouch.c maintenance.c)
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
@@ -63,11 +63,12 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_client_test)
-  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare)
+  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
   set_tests_properties(pouch_space_client_faults pouch_space_client_io-faults PROPERTIES TIMEOUT 600)
+  set_tests_properties(pouch_space_client_retention-faults pouch_space_client_retention-io-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_frame_test frame_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_frame_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_frame_test PRIVATE pouch_space_experiment)
@@ -82,6 +83,7 @@ if(LOCKDC_BUILD_TESTS)
   target_link_libraries(pouch_space_pouch_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_pouch_test PRIVATE
     "LINKER:--wrap=OPENSSL_init_crypto"
+    "LINKER:--wrap=clock_gettime"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)

@@ -422,9 +422,10 @@ There is no format-marker change, larger automatic replacement allowance,
 standing reserve selection or implicit growth. The caller must admit the
 complete replacement while its predecessor and any pinned readers still own
 their capacity. Repeated replacements may require explicit checkpoint/reclaim
-before another claim is admissible. Retention's codec, typed journal owner and
-public policy dispatch remain a subsequent integration stage; this physical
-support does not resolve the pending maintenance architecture decision.
+before another claim is admissible. The [typed retention control owner](#typed-retention-control-ownership)
+now uses this support. Public lease/expiry policy still needs transaction guard
+integration, and this does not resolve the pending maintenance architecture
+decision.
 
 Five new test groups cover planning overflow and journal bounds, page/chunk
 boundaries, zero-length values, replacements and pinned readers, underfunded
@@ -1165,9 +1166,10 @@ release still uses transaction lock files. The implemented
 [namespace enumeration boundary](#typed-namespace-enumeration) now supplies
 names from the existing container catalog to implicit transaction leader
 discovery. That independent integration changes no persistence layout and does
-not approve this maintenance proposal. Retention journal and transaction guard
-ownership still require conversion in `lc_pouch_retention.c` and
-`lc_pouch_client.c`. Keep their policy in the production engine. Do not treat the
+not approve this maintenance proposal. [Retention control ownership](#typed-retention-control-ownership)
+now uses the same boundary; transaction guard ownership in
+`lc_pouch_client.c` still requires conversion. Keep their policy in the
+production engine. Do not treat the
 current exclusive open as proof of the final shared-root contract. Interprocess
 publication and reader-generation recovery remain required within the same file.
 
@@ -1505,8 +1507,105 @@ Evidence is under `build/pouch-space-namespace-visit/`: the
 The [40-case matched comparison](pouch-space-experiment.md#typed-namespace-enumeration-comparison)
 prices the enumeration itself over 64 empty namespaces. Its repeated-walk
 medians favor the container with disjoint ranges; combined reopen-readiness
-ranges overlap. Retention journals, transaction guards and the complete public
-leased-write path remain unintegrated.
+ranges overlap. The later [retention control owner](#typed-retention-control-ownership)
+completes journal storage; transaction guards and the complete public leased-write
+path remain unintegrated.
+
+## Typed retention control ownership
+
+The logical retention facade now dispatches discovery, work load/store and hint
+retirement through typed storage capabilities. Native Pouch keeps its existing
+atomic file owner. Both owners share the same LPR1 codec, preserving its idle,
+active and finished representations, transaction ID, fencing token, state
+generation, percent-encoded key and bounded size. This is intentionally
+materialized control metadata, with no application body or transaction outcome.
+Malformed encoding, embedded NUL identities and bad fields return protocol
+errors; allocation failure while decoding an identity or native hint cursor
+returns `NOMEM` and leaves empty outputs. There is no public API/ABI or format
+marker change.
+
+The container retains namespace control slot 2's existing durable 32-byte
+discovery marker and stores non-idle LPR1 work in control slot 3. Reading or
+retiring a missing namespace creates nothing. A store requires an existing
+hint. The marker precedes expiry-bearing canonical publication and remains
+present while work is idle; clear durably removes only work. Retirement durably
+clears work before removing the marker, and updates the resident marker cache.
+A failure between those steps leaves a harmless idle positive hint. Controls
+always use the completed durable prefix, including under NoSync. The logical
+caller retains namespace mutation authority; outcomes remain solely in `.txns`.
+
+Every work replacement admits its complete immutable-value claim before writing
+payload. On capacity exhaustion for this known valid bounded plan, the owner
+checkpoints once and retries admission, allowing superseded journal values to
+be reclaimed. It never grows the file. Reader pins and all-live/claimed capacity
+may still make admission fail. The existing best-effort post-checkpoint collect
+can defer reuse if allocating a free-run node fails; the following admission
+may therefore report capacity rather than `NOMEM`. Tests require the prior
+work to remain selected and retry to reclaim successfully. This selects no
+standing reserve or incremental metadata/body maintenance architecture.
+
+Discovery scans namespace catalog identities and their fixed markers only.
+It does not open canonical streams, work records or bodies. The cursor is
+advisory and its format belongs to the storage owner. Native uses escaped
+filename order; the container uses exact namespace byte order. Both select after the cursor
+and wrap fairly. Returned namespace and cursor strings use the logical
+allocator and have separate ownership. No path interpretation or extra files
+are introduced in the container.
+
+Public lease enrollment/release and expiry maintenance still need the typed
+transaction guard owner and their complete integration tests. Root admission
+remains exclusive. Shared-root coordination/recovery, the pending maintenance
+architecture selection, and explicit production cutover remain open requirements.
+
+The first standard run exposed a pre-existing staged-retention test assumption:
+it bounded a `CLOCK_REALTIME` commit deadline using the independent maintenance
+`time()` timestamp. A test-only clock seam reproduces that mismatch reliably.
+The repaired assertion brackets the requested TTL with commit-clock samples,
+including a deliberately advanced, stepping clock, across both owners and all
+existing transform/durability cases. Production clock and TTL behavior are
+unchanged. The failing assertion and its deterministic reproduction are retained
+in `debug-standard.log` and `debug-staged-clock-negative.log`; the repaired case
+passes in `debug-final-new-tests-and-clock.log` under the evidence directory.
+
+Nine retention test groups cover exact codec bytes and bounds, both owners and
+durability policies, idle/active/finished work, missing-namespace behavior,
+retirement/re-ensure, metadata-only discovery and cursor fairness, malformed
+logical records, completed-prefix visibility and an independent public body
+writer during held journal payload I/O. The maximum-key fixture repeats large
+work replacements in a fixed 10 MiB file. Capacity tests keep a peer claim and
+a historical reader pin: failure preserves the selected work, and releasing
+the pin makes retry succeed without growth.
+
+Fault coverage includes 908 warm/cold allocation cuts across both owners and
+policies, including omitted error objects, plus 120 allocation cuts through the
+capacity/checkpoint retry. Every failed read leaves empty outputs. The
+deterministic 10 MiB dirty-page file-image model covers 108 read, write and
+barrier failures with lost or selected persisted torn writes. It verifies
+complete recovered work and persistent discovery, then retries. Poisoned
+admission cannot be bypassed through cached owners and performs no further I/O.
+
+Verification covers 439 distinct Debug groups: the final 430 existing standard
+checks plus nine new retention groups. GNU and native musl each pass 58 affected
+groups, including native state retention, cleanup, Pouch/XA, compression and
+the repaired staging clock test. Strict TSan passes the nine new groups, SDK
+lifecycle and staging with instrumented OpenSSL, `halt_on_error=1`, no race
+reports and no suppressions. Nine Memcheck groups report 433,574 allocations
+and matching frees, zero live heap, zero errors/suppressions and only three
+inherited descriptors at exit. GNU/Debug checks use 128 KiB default worker
+stacks; musl uses its native defaults. New codec helpers remain hidden in GNU
+and musl shared libraries. Formatting and whitespace checks pass.
+
+Evidence is under `build/pouch-space-retention-journal/`:
+`debug-standard-final.log`/`debug-standard-final-details.log`,
+`debug-final-new-nine-tests.log`, `gnu-tests.log`, `musl-tests.log`, `tsan/`
+(including `lifecycle-final.log` and `staging-clock.log`), the two explicit
+TSan relink scripts and `memcheck/`. The final discovery benchmark addition
+changes only its excluded test family; product inputs are unchanged from the
+430-group standard run. The [160-case matched comparison](pouch-space-experiment.md#typed-retention-control-comparison)
+reports faster small-control cycles and repeated hint selection, overlapping
+elapsed ranges and higher CPU at the maximum-key stress point, and slower
+combined reopen/discovery readiness. It does not price the complete public
+retention transaction path or authorize production cutover.
 
 ## Integration and acceptance
 

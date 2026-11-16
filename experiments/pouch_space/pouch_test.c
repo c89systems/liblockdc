@@ -4386,6 +4386,19 @@ static void staged_absent(lc_pouch *p, const char *key, lc_error *e) {
   REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
 }
+static int staged_clock_enabled;
+static lc_pouch_unix_seconds staged_clock_now;
+int __real_clock_gettime(clockid_t, struct timespec *);
+int __wrap_clock_gettime(clockid_t id, struct timespec *out) {
+  if (id == CLOCK_REALTIME &&
+      __atomic_load_n(&staged_clock_enabled, __ATOMIC_ACQUIRE)) {
+    out->tv_sec =
+        (time_t)__atomic_fetch_add(&staged_clock_now, 1, __ATOMIC_RELAXED);
+    out->tv_nsec = 0;
+    return 0;
+  }
+  return __real_clock_gettime(id, out);
+}
 static void staging(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -4444,11 +4457,29 @@ static void staging(const char *path, const char *directory) {
           ok(lc_pouch_state_read(p, "staged", "key/.staging/attempt",
                                  &stage_held, &e),
              &e);
+          lc_pouch_unix_seconds clock, earliest, latest;
+          ok(lc_pouch_now_unix(&clock, &e), &e);
+          /* Promotion resolves TTL against its commit clock, not the separate
+           * maintenance time() used by updated_at. Deliberately separate and
+           * step that clock, then bracket the selected deadline. */
+          __atomic_store_n(&staged_clock_now, clock + 3600, __ATOMIC_RELAXED);
+          __atomic_store_n(&staged_clock_enabled, 1, __ATOMIC_RELEASE);
+          ok(lc_pouch_now_unix(&earliest, &e), &e);
           ok(lc_pouch_state_promote_staged(p, "staged", "key", "attempt", etag,
                                            &w, &e),
              &e);
-          REQUIRE(w.version == 2 && w.retention > w.updated_at_unix &&
-                  w.retention <= w.updated_at_unix + 3600);
+          ok(lc_pouch_now_unix(&latest, &e), &e);
+          __atomic_store_n(&staged_clock_enabled, 0, __ATOMIC_RELEASE);
+          if (w.version != 2 || w.retention < earliest + 3600 ||
+              w.retention > latest + 3600)
+            fprintf(stderr,
+                    "staged timing: version=%llu retention=%lld updated=%lld "
+                    "commit=[%lld,%lld]\n",
+                    (unsigned long long)w.version, (long long)w.retention,
+                    (long long)w.updated_at_unix, (long long)earliest,
+                    (long long)latest);
+          REQUIRE(w.version == 2 && w.retention >= earliest + 3600 &&
+                  w.retention <= latest + 3600);
           lc_pouch_state_write_result_cleanup(&allocator, &w);
           lc_free_with_allocator(&allocator, etag);
           read_value(p, "staged", "key", 65569, 12, 2, &e);

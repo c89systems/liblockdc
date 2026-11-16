@@ -4557,3 +4557,104 @@ Its verification input is `namespace-final-source.patch`, SHA-256
 `7a7ae7b14750e77c2e9585b6a048dcfb02b6e1c5c50d9d80d4128ef29a6409a5`.
 The production source diff and both library archives are unchanged by that
 supplement. Documentation edits do not alter either executable input.
+
+## Typed retention control comparison
+
+The logical retention facade now uses each storage owner's work and discovery
+capabilities. Native Pouch retains its actual atomic file implementation; the
+container uses its durable marker and budgeted immutable work slot. Both share
+the LPR1 codec. This measures control ownership, without `.txns` decisions,
+public lease enrollment/release, body cleanup or shared-root coordination.
+The [implementation evidence](pouch-space-implementation.md#typed-retention-control-ownership)
+states the remaining integration and maintenance requirements.
+
+Five samples alternate engine and durability-policy order; profile order also
+alternates. Both owners use the same frozen native GNU Release ELF, normal
+allocator and disabled failure seams. All 160 distinct cases are retained:
+120 work-cycle cases and 40 discovery cases. Every timed operation checks its
+observable result. Reopened fixtures retain OS caches; they are not disk-cold.
+Container fixtures verify one 10 MiB file and reject unexpected sibling artifacts.
+
+### Work replacement and idle clear
+
+Each case runs eight cycles of ACTIVE write/read, FINISHED write/read, and IDLE
+clear/read. Keys contain only `%`, exercising threefold percent encoding. The
+32-byte, 8 KiB and 1 MiB keys cover small controls, multiple payload chunks and
+a control-format stress case. The transaction ID, maximum fencing token and
+state generation are identical across owners. Both policies complete durable
+control barriers; NoSync does not relax control durability. Creation, seeding
+and root reopen are outside these timings. A reopened case includes namespace
+owner admission in its first timed cycle. The container's capacity-driven
+checkpoint/reclaim and subsequent publications remain inside the timed cycles.
+
+Elapsed values are median [minimum–maximum] milliseconds per complete cycle;
+CPU columns are median process CPU milliseconds per cycle.
+
+| Key bytes | Policy | Fixture | Container ms/cycle | Multifile ms/cycle | C CPU ms/cycle | MF CPU ms/cycle |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 32 | NoSync | seeded | 4.660 [4.305–4.890] | 19.924 [17.427–20.662] | 0.206 | 0.639 |
+| 32 | NoSync | reopened | 5.499 [4.962–6.412] | 17.400 [15.209–19.923] | 0.199 | 0.589 |
+| 32 | Durable | seeded | 4.426 [4.186–5.524] | 17.773 [16.107–25.107] | 0.185 | 0.677 |
+| 32 | Durable | reopened | 5.614 [4.234–6.582] | 21.444 [17.723–23.337] | 0.213 | 0.623 |
+| 8,192 | NoSync | seeded | 10.048 [9.361–10.775] | 18.244 [17.363–25.562] | 0.520 | 0.818 |
+| 8,192 | NoSync | reopened | 10.180 [9.395–11.370] | 18.461 [17.029–21.716] | 0.472 | 0.749 |
+| 8,192 | Durable | seeded | 11.306 [9.046–14.517] | 20.468 [16.919–22.726] | 0.429 | 0.836 |
+| 8,192 | Durable | reopened | 10.276 [9.185–16.632] | 19.997 [15.949–24.109] | 0.459 | 0.740 |
+| 1,048,576 | NoSync | seeded | 44.526 [40.920–45.806] | 45.890 [39.461–49.261] | 21.157 | 14.705 |
+| 1,048,576 | NoSync | reopened | 42.314 [41.115–45.143] | 45.327 [38.683–140.269] | 20.460 | 15.176 |
+| 1,048,576 | Durable | seeded | 47.241 [43.732–52.719] | 45.002 [39.465–49.980] | 18.984 | 14.863 |
+| 1,048,576 | Durable | reopened | 46.138 [39.958–47.768] | 43.717 [42.222–50.375] | 19.425 | 14.469 |
+
+Small-control medians favor the container by 3.16–4.28 times, with disjoint
+elapsed ranges in all four fixture/policy pairs. The 8 KiB key medians favor it
+by 1.81–1.95 times; the durable reopened pair overlaps. The 1 MiB key cases
+show overlapping elapsed ranges and mixed directions: there is no consistent
+elapsed advantage at that stress point. Container CPU medians are 28–44% higher
+there. The native NoSync reopened 140.269 ms/cycle outlier remains in the table.
+No samples or outliers were removed.
+
+### Root-level hint discovery
+
+The discovery fixture has 64 hinted namespaces, `hint/00` through `hint/63`.
+One namespace holds an active work record for a 1 MiB `%` key, while the other
+hints are idle. After one separately measured first selection, each case runs
+128 selections, verifying exact names and cursor advancement across two complete
+passes, including wraparound.
+Each selection examines the full hinted set to select one namespace. Neither
+owner reads work records during selection; the deterministic I/O fixture
+separately proves the container reads only the 32-byte marker for a hint.
+
+Values below are median [minimum–maximum] microseconds per selection after
+that first selection; CPU columns are median process CPU microseconds.
+
+| Policy | Fixture | Container µs/selection | Multifile µs/selection | C CPU µs | MF CPU µs |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NoSync | seeded + first selection | 47.457 [45.374–54.877] | 68.872 [64.755–77.289] | 47.469 | 68.313 |
+| NoSync | reopened + first selection | 46.212 [45.180–50.789] | 69.665 [64.466–81.001] | 46.222 | 69.688 |
+| Durable | seeded + first selection | 51.481 [47.658–55.358] | 80.228 [66.686–127.494] | 51.501 | 79.823 |
+| Durable | reopened + first selection | 47.153 [45.912–51.258] | 72.394 [65.242–95.436] | 47.165 | 72.409 |
+
+Repeated-selection medians favor the container by 1.45–1.56 times, with
+disjoint elapsed ranges in all four pairs. This does not establish faster
+reopen readiness. Combined root open plus first selection follows, in
+milliseconds; the separately timed first selection is shown in microseconds.
+
+| Policy | Container open + first ms | Multifile open + first ms | C first µs | MF first µs |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 2.806 [2.592–3.071] | 0.343 [0.325–0.396] | 64.448 [62.690–105.841] | 93.920 [88.220–108.082] |
+| Durable | 2.805 [2.291–5.197] | 0.445 [0.342–0.522] | 64.571 [61.880–67.090] | 133.840 [88.952–159.122] |
+
+Container combined readiness is slower, with disjoint ranges in both policies.
+Measured open time dominates that difference. These cached reopen measurements
+include each owner's real recovery/admission work, but do not measure OS-cache
+loss, public retention transactions or large-machine scale.
+
+Evidence is under `build/pouch-space-retention-journal/`: the ten
+`paired/sample-*.log` files, `perf-results.json` and `perf-summary.pl`.
+An independent Perl calculation validates all 160 cases and agrees with every
+elapsed, CPU, first-selection, open and combined-readiness minimum/median/maximum.
+The executable is `pouch_space_client_test-retention`, SHA-256
+`c3c4018bb45190e2de9bb5227f0527d245a2be0778fe53c053876883977a0ece`.
+Its source is `bb2a157a` plus `retention-source.patch`, SHA-256
+`f4c086b3e8fefe0a78690b5393a6e0c8c784f9abd9cbb983faa01551400bcdcf`.
+Subsequent documentation edits do not alter these executable inputs.

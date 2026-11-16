@@ -609,6 +609,7 @@ set(lc_sources
     src/lc_pouch_record_io.c
     src/lc_pouch_state.c
     src/lc_pouch_retention.c
+    src/lc_pouch_retention_record.c
     src/lc_queue_api.c
     src/lc_queue_stream_api.c
     src/lc_outbox.c

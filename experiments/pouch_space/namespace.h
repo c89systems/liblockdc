@@ -43,6 +43,18 @@ int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
 int ps_namespace_retention_hint_ensure(ps_namespace *, lc_error *);
 /* Metadata-only: no segment opening, canonical replay or body reads. */
 int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
+/* Shared logical LPR1 metadata, materialized and bounded. Load allocates with
+ * allocator, returning NULL for an absent hint and idle text for marker-only.
+ * Store requires an existing hint; NULL/zero clears work to idle. Complete
+ * replacements are funded before producing bytes, with at most one explicit
+ * reclaim/checkpoint retry on capacity exhaustion. No implicit growth.
+ * Callers hold logical namespace mutation authority while changing controls. */
+int ps_namespace_retention_work_load(ps_namespace *, const lc_allocator *,
+                                     char **, size_t *, lc_error *);
+int ps_namespace_retention_work_store(ps_namespace *, const char *, size_t,
+                                      lc_error *);
+/* Always durably clears work before retiring its marker. */
+int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
 /* One active producer per namespace, explicit BUSY on contention. Unrelated
  * namespaces and captured readers progress independently. target==0 disables
  * automatic rotation; otherwise rotate before the next append when the active

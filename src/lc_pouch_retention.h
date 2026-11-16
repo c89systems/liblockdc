@@ -62,8 +62,9 @@ void lc_pouch_retention_work_cleanup(lc_pouch *pouch,
                                      lc_pouch_retention_work *work);
 int lc_pouch_retention_hint_remove(lc_pouch *pouch, const char *ns,
                                    lc_error *error);
-/* Scans work hints only, selecting lexically after the advisory filename
- * cursor and wrapping fairly. The caller owns both returned strings. */
+/* Scans work hints only, selecting after an opaque advisory owner cursor and
+ * wrapping fairly. Native cursors retain escaped filename order; typed owners
+ * need no pathname encoding. The caller owns both returned strings. */
 int lc_pouch_retention_hint_next(lc_pouch *pouch, const char *after, char **ns,
                                  char **cursor, lc_error *error);
 
