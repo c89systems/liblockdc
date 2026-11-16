@@ -3,6 +3,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "pouch.h"
+#include "pouch_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static size_t checks, allocation, fail_at, live;
@@ -633,6 +635,370 @@ static void faults(const char *directory, int io) {
   printf("SDK %s failure sites: %lu\n", io ? "I/O" : "allocation",
          (unsigned long)total);
 }
+static lc_pouch *visit_open(const char *path, int native, int sync, int create,
+                            const ps_io *io, const lc_allocator *domain,
+                            lc_error *e) {
+  ps_pouch_state_options o = {0};
+  lc_pouch *pouch = NULL;
+  o.logical.single_writer = o.logical.single_writer_set = 1;
+  o.logical.background_compaction_enabled_set = 1;
+  o.logical.query_indexing_enabled_set = 1;
+  o.logical.query_engine = "scan";
+  o.logical.durable_sync = sync;
+  o.io = io;
+  ok(native ? lc_pouch_open(path, domain, &o.logical, &pouch, e)
+            : ps_pouch_state_open(path, create, domain, &o, &pouch, e),
+     e);
+  return pouch;
+}
+static void namespace_artifacts(const char *directory, const char *prefix) {
+  DIR *dir = opendir(directory);
+  struct dirent *entry;
+  unsigned int mask = 0;
+  char expected[64];
+  REQUIRE(dir);
+  while ((entry = readdir(dir)) != NULL) {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+        !strcmp(entry->d_name, ".liblockdc-test-tmp-owner"))
+      continue;
+    unsigned int bit = 0;
+    for (int native = 0; native < 2; ++native)
+      for (int sync = 0; sync < 2; ++sync) {
+        REQUIRE(snprintf(expected, sizeof(expected), "%s%d-%d", prefix, native,
+                         sync) < (int)sizeof(expected));
+        if (!strcmp(entry->d_name, expected))
+          bit = 1U << (native * 2 + sync);
+      }
+    REQUIRE(bit && !(mask & bit));
+    mask |= bit;
+  }
+  REQUIRE(closedir(dir) == 0 && mask == 15);
+}
+static const char *visit_names[] = {
+    "team/alpha", "%2f", ".", "space name", ".txns", "created/during/visit"};
+typedef struct namespace_walk {
+  lc_pouch *pouch;
+  size_t count;
+  unsigned int mask;
+  int mutate, fail;
+} namespace_walk;
+static int namespace_name(void *context, const char *name, lc_error *e) {
+  namespace_walk *v = context;
+  size_t i;
+  for (i = 0; i < sizeof(visit_names) / sizeof(*visit_names); ++i)
+    if (!strcmp(name, visit_names[i]))
+      break;
+  REQUIRE(i < sizeof(visit_names) / sizeof(*visit_names));
+  REQUIRE(!(v->mask & (1U << i)));
+  v->mask |= 1U << i;
+  ++v->count;
+  if (v->fail)
+    return lc_error_set(e, LC_ERR_PENDING, 0, "namespace callback stopped",
+                        NULL, NULL, "test");
+  if (v->mutate && v->count == 1) {
+    namespace_walk nested = {0};
+    nested.pouch = v->pouch;
+    ok(lc_pouch_ensure_namespace(v->pouch, visit_names[5], e), e);
+    ok(lc_pouch_storage_namespaces_visit(v->pouch, namespace_name, &nested, e),
+       e);
+    REQUIRE(nested.mask == 63 && nested.count == 6);
+  }
+  return LC_OK;
+}
+static void namespace_expect(lc_pouch *pouch, unsigned int mask, lc_error *e) {
+  namespace_walk v = {0};
+  v.pouch = pouch;
+  ok(lc_pouch_storage_namespaces_visit(pouch, namespace_name, &v, e), e);
+  REQUIRE(v.mask == mask);
+}
+static size_t namespace_cold_failures(const char *path, int native, int sync,
+                                      const ps_io *io, lc_pouch **pouch,
+                                      lc_error *e) {
+  lc_pouch_close(*pouch);
+  REQUIRE(!live);
+  *pouch = visit_open(path, native, sync, 0, io, &allocator, e);
+  allocation = 0;
+  fail_at = SIZE_MAX;
+  armed = 1;
+  namespace_expect(*pouch, 31, e);
+  armed = 0;
+  size_t sites = allocation;
+  REQUIRE(sites);
+  for (size_t nth = 1; nth <= sites; ++nth)
+    for (int no_error = 0; no_error < 2; ++no_error) {
+      lc_pouch_close(*pouch);
+      REQUIRE(!live);
+      *pouch = visit_open(path, native, sync, 0, io, &allocator, e);
+      namespace_walk v = {0};
+      allocation = 0;
+      fail_at = nth;
+      armed = 1;
+      int rc = lc_pouch_storage_namespaces_visit(*pouch, namespace_name, &v,
+                                                 no_error ? NULL : e);
+      armed = 0;
+      REQUIRE(rc == LC_ERR_NOMEM);
+      clear(e);
+      if (no_error) {
+        lc_pouch_close(*pouch);
+        REQUIRE(!live);
+        *pouch = visit_open(path, native, sync, 0, io, &allocator, e);
+      }
+      namespace_expect(*pouch, 31, e);
+    }
+  return sites;
+}
+static void namespace_visits(const char *directory) {
+  lc_error e;
+  size_t sites = 0, cold_sites = 0;
+  lc_error_init(&e);
+  REQUIRE(lc_pouch_storage_namespaces_visit(NULL, namespace_name, NULL, &e) ==
+          LC_ERR_INVALID);
+  clear(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      char path[1400], invalid[1500], saved[1500];
+      io_fault f = {0};
+      ps_io io = {&f, disk_read, disk_write, disk_sync, disk_reserve, NULL};
+      REQUIRE(snprintf(path, sizeof(path), "%s/visit-%d-%d", directory, native,
+                       sync) < (int)sizeof(path));
+      lc_pouch *pouch = visit_open(path, native, sync, 1, &io, &allocator, &e);
+      namespace_expect(pouch, 0, &e);
+      REQUIRE(lc_pouch_storage_namespaces_visit(pouch, NULL, NULL, NULL) ==
+              LC_ERR_INVALID);
+      for (size_t i = 0; i < 5; ++i)
+        ok(lc_pouch_ensure_namespace(pouch, visit_names[i], &e), &e);
+      if (native) {
+        const char *bad[] = {"%", "%0", "%zz", "%00", "%00x"};
+        for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); ++i) {
+          REQUIRE(snprintf(invalid, sizeof(invalid), "%s/namespaces/%s", path,
+                           bad[i]) < (int)sizeof(invalid));
+          REQUIRE(mkdir(invalid, 0700) == 0);
+        }
+      }
+      for (int cold = 0; cold < 2; ++cold) {
+        if (cold) {
+          lc_pouch_close(pouch);
+          REQUIRE(!live);
+          pouch = visit_open(path, native, sync, 0, &io, &allocator, &e);
+        }
+        f.calls = 0;
+        f.armed = 1;
+        namespace_expect(pouch, 31, &e);
+        f.armed = 0;
+        if (!native)
+          REQUIRE(!f.calls); /* The resident catalog needs no physical I/O. */
+        namespace_walk stopped = {0};
+        stopped.fail = 1;
+        REQUIRE(lc_pouch_storage_namespaces_visit(
+                    pouch, namespace_name, &stopped, &e) == LC_ERR_PENDING);
+        REQUIRE(stopped.count == 1 && e.message &&
+                !strcmp(e.message, "namespace callback stopped"));
+        clear(&e);
+        allocation = 0;
+        fail_at = SIZE_MAX;
+        armed = 1;
+        namespace_expect(pouch, 31, &e);
+        armed = 0;
+        size_t n = allocation, baseline = live;
+        REQUIRE(n);
+        sites += n;
+        for (size_t nth = 1; nth <= n; ++nth)
+          for (int no_error = 0; no_error < 2; ++no_error) {
+            namespace_walk v = {0};
+            allocation = 0;
+            fail_at = nth;
+            armed = 1;
+            int rc = lc_pouch_storage_namespaces_visit(
+                pouch, namespace_name, &v, no_error ? NULL : &e);
+            armed = 0;
+            REQUIRE(rc == LC_ERR_NOMEM);
+            clear(&e);
+            REQUIRE(live == baseline);
+            namespace_expect(pouch, 31, &e);
+          }
+      }
+      cold_sites +=
+          namespace_cold_failures(path, native, sync, &io, &pouch, &e);
+      namespace_walk v = {0};
+      v.pouch = pouch;
+      v.mutate = 1;
+      ok(lc_pouch_storage_namespaces_visit(pouch, namespace_name, &v, &e), &e);
+      REQUIRE(native ? (v.mask == 31 || v.mask == 63) : v.mask == 31);
+      namespace_expect(pouch, 63, &e);
+      if (!native) {
+        f.calls = 0;
+        f.fail = f.armed = 1;
+        REQUIRE(ps_checkpoint(ps_root_space(ps_pouch_state_root(pouch)), &e) ==
+                LC_ERR_TRANSPORT);
+        f.armed = 0;
+        clear(&e);
+        namespace_walk denied = {0};
+        REQUIRE(lc_pouch_storage_namespaces_visit(
+                    pouch, namespace_name, &denied, &e) == LC_ERR_TRANSPORT);
+        REQUIRE(!denied.count);
+        clear(&e);
+        lc_pouch_close(pouch);
+        REQUIRE(!live);
+        pouch = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+        namespace_expect(pouch, 63, &e);
+      } else {
+        namespace_walk denied = {0};
+        REQUIRE(snprintf(invalid, sizeof(invalid), "%s/namespaces", path) <
+                (int)sizeof(invalid));
+        REQUIRE(snprintf(saved, sizeof(saved), "%s/namespaces-saved", path) <
+                (int)sizeof(saved));
+        REQUIRE(rename(invalid, saved) == 0);
+        int fd = open(invalid, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        REQUIRE(fd >= 0 && close(fd) == 0);
+        REQUIRE(lc_pouch_storage_namespaces_visit(
+                    pouch, namespace_name, &denied, &e) == LC_ERR_TRANSPORT);
+        REQUIRE(!denied.count);
+        clear(&e);
+        REQUIRE(unlink(invalid) == 0 && rename(saved, invalid) == 0);
+        namespace_expect(pouch, 63, &e);
+      }
+      lc_pouch_close(pouch);
+      REQUIRE(!live);
+      if (!native)
+        one_file(path);
+    }
+  printf("namespace visits: %zu warm and %zu cold allocation sites, "
+         "both owners/policies, "
+         "cold/warm, callback retry, nested mutation and poisoned admission\n",
+         sites, cold_sites);
+  namespace_artifacts(directory, "visit-");
+  lc_error_cleanup(&e);
+}
+static double namespace_clock(clockid_t clock) {
+  struct timespec t;
+  REQUIRE(clock_gettime(clock, &t) == 0);
+  return (double)t.tv_sec + (double)t.tv_nsec / 1000000000.0;
+}
+typedef struct visit_measurement {
+  uint64_t mask;
+  size_t count;
+} visit_measurement;
+static int measure_namespace(void *context, const char *name, lc_error *e) {
+  visit_measurement *v = context;
+  size_t id;
+  if (strlen(name) != 7 || strncmp(name, "team/", 5) || name[5] < '0' ||
+      name[5] > '6' || name[6] < '0' || name[6] > '9')
+    return lc_error_set(e, LC_ERR_PROTOCOL, 0, "unexpected benchmark namespace",
+                        NULL, NULL, "test");
+  id = (size_t)(name[5] - '0') * 10 + (size_t)(name[6] - '0');
+  if (id >= 64 || (v->mask & (UINT64_C(1) << id)))
+    return lc_error_set(e, LC_ERR_PROTOCOL, 0, "duplicate benchmark namespace",
+                        NULL, NULL, "test");
+  v->mask |= UINT64_C(1) << id;
+  ++v->count;
+  return LC_OK;
+}
+static void measure_namespace_walk(lc_pouch *pouch, lc_error *e) {
+  visit_measurement v = {0};
+  ok(lc_pouch_storage_namespaces_visit(pouch, measure_namespace, &v, e), e);
+  REQUIRE(v.mask == UINT64_MAX && v.count == 64);
+}
+typedef struct concurrent_visit {
+  lc_pouch *pouch;
+  size_t id;
+} concurrent_visit;
+static void *create_and_visit(void *context) {
+  concurrent_visit *w = context;
+  lc_error e;
+  char name[24];
+  lc_error_init(&e);
+  for (size_t i = 0; i < 16; ++i) {
+    REQUIRE(snprintf(name, sizeof(name), "team/%02zu", w->id * 16 + i) <
+            (int)sizeof(name));
+    ok(lc_pouch_ensure_namespace(w->pouch, name, &e), &e);
+    visit_measurement v = {0};
+    ok(lc_pouch_storage_namespaces_visit(w->pouch, measure_namespace, &v, &e),
+       &e);
+    REQUIRE(v.count > 0 && v.count <= 64);
+  }
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void namespace_concurrency(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int native = 0; native < 2; ++native)
+    for (int sync = 0; sync < 2; ++sync) {
+      pthread_t threads[4];
+      concurrent_visit workers[4];
+      char path[1400];
+      REQUIRE(snprintf(path, sizeof(path), "%s/concurrent-%d-%d", directory,
+                       native, sync) < (int)sizeof(path));
+      lc_pouch *pouch = visit_open(path, native, sync, 1, NULL, &allocator, &e);
+      for (size_t i = 0; i < 4; ++i) {
+        workers[i].pouch = pouch;
+        workers[i].id = i;
+        REQUIRE(
+            !pthread_create(threads + i, NULL, create_and_visit, workers + i));
+      }
+      for (size_t i = 0; i < 4; ++i)
+        REQUIRE(!pthread_join(threads[i], NULL));
+      measure_namespace_walk(pouch, &e);
+      lc_pouch_close(pouch);
+      REQUIRE(!live);
+      pouch = visit_open(path, native, sync, 0, NULL, &allocator, &e);
+      measure_namespace_walk(pouch, &e);
+      lc_pouch_close(pouch);
+      REQUIRE(!live);
+      if (!native)
+        one_file(path);
+    }
+  namespace_artifacts(directory, "concurrent-");
+  lc_error_cleanup(&e);
+}
+static void namespace_compare(const char *directory, int reverse) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int engine = 0; engine < 2; ++engine)
+    for (int policy = 0; policy < 2; ++policy) {
+      int native = reverse ? 1 - engine : engine;
+      int sync = reverse ? 1 - policy : policy;
+      char path[1400], name[64];
+      REQUIRE(snprintf(path, sizeof(path), "%s/compare-%d-%d", directory,
+                       native, sync) < (int)sizeof(path));
+      lc_pouch *pouch = visit_open(path, native, sync, 1, NULL, NULL, &e);
+      for (size_t i = 0; i < 64; ++i) {
+        REQUIRE(snprintf(name, sizeof(name), "team/%02zu", i) <
+                (int)sizeof(name));
+        ok(lc_pouch_ensure_namespace(pouch, name, &e), &e);
+      }
+      for (int cold = 0; cold < 2; ++cold) {
+        double open_ms = 0;
+        if (cold) {
+          lc_pouch_close(pouch);
+          REQUIRE(!live);
+          double start = namespace_clock(CLOCK_MONOTONIC);
+          pouch = visit_open(path, native, sync, 0, NULL, NULL, &e);
+          open_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - start);
+        }
+        double start = namespace_clock(CLOCK_MONOTONIC);
+        measure_namespace_walk(pouch, &e);
+        double first_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - start);
+        double cpu_start = namespace_clock(CLOCK_PROCESS_CPUTIME_ID);
+        start = namespace_clock(CLOCK_MONOTONIC);
+        for (size_t i = 0; i < 128; ++i)
+          measure_namespace_walk(pouch, &e);
+        double elapsed_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - start);
+        double cpu_ms =
+            1000 * (namespace_clock(CLOCK_PROCESS_CPUTIME_ID) - cpu_start);
+        printf("namespace-compare native=%d sync=%d cold=%d names=64 walks=128 "
+               "open_ms=%.6f first_ms=%.6f elapsed_ms=%.6f cpu_ms=%.6f "
+               "verified=1\n",
+               native, sync, cold, open_ms, first_ms, elapsed_ms, cpu_ms);
+      }
+      lc_pouch_close(pouch);
+      REQUIRE(!live);
+      if (!native)
+        one_file(path);
+    }
+  namespace_artifacts(directory, "compare-");
+  lc_error_cleanup(&e);
+}
 static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
@@ -643,6 +1009,14 @@ static void *worker(void *context) {
     faults(r->directory, 0);
   else if (!strcmp(r->mode, "io-faults"))
     faults(r->directory, 1);
+  else if (!strcmp(r->mode, "namespaces"))
+    namespace_visits(r->directory);
+  else if (!strcmp(r->mode, "namespace-concurrency"))
+    namespace_concurrency(r->directory);
+  else if (!strcmp(r->mode, "namespace-compare") ||
+           !strcmp(r->mode, "namespace-compare-reverse"))
+    namespace_compare(r->directory,
+                      !strcmp(r->mode, "namespace-compare-reverse"));
   else
     REQUIRE(0);
   return NULL;

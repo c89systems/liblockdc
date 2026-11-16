@@ -99,6 +99,28 @@ static int namespace_info(void *context, void *ns,
   }
   return rc;
 }
+typedef struct namespace_visit_context {
+  lc_pouch_storage_namespace_visit_fn visit;
+  void *context;
+} namespace_visit_context;
+static int visit_namespace(const char *name, const ps_namespace_info *identity,
+                           void *context, lc_error *e) {
+  namespace_visit_context *v = context;
+  (void)identity;
+  return v->visit(v->context, name, e);
+}
+static int namespaces_visit(void *context,
+                            lc_pouch_storage_namespace_visit_fn visit,
+                            void *opaque, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  namespace_visit_context v;
+  int rc = check(context, e);
+  v.visit = visit;
+  v.context = opaque;
+  if (rc == LC_OK)
+    rc = ps_root_namespace_visit(owner->root, visit_namespace, &v, e);
+  return rc;
+}
 static int replay(void *context, void *ns, lc_pouch_storage_visit_fn visit,
                   void *opaque, lc_error *e) {
   ps_namespace_view *view = NULL;
@@ -303,11 +325,20 @@ static int retention_hint_ensure(void *context, const char *name, lc_error *e) {
   ps_namespace_release(ns);
   return rc;
 }
-static const lc_pouch_storage_ops storage_ops = {
-    check,          flush,       namespace_open, namespace_close,
-    namespace_info, replay,      append_begin,   append_commit,
-    append_close,   source_open, source_clone,   retention_hint_ensure,
-    release};
+static const lc_pouch_storage_ops storage_ops = {check,
+                                                 flush,
+                                                 namespace_open,
+                                                 namespace_close,
+                                                 namespace_info,
+                                                 namespaces_visit,
+                                                 replay,
+                                                 append_begin,
+                                                 append_commit,
+                                                 append_close,
+                                                 source_open,
+                                                 source_clone,
+                                                 retention_hint_ensure,
+                                                 release};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

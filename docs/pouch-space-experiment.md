@@ -4488,3 +4488,72 @@ Its source is `7ce0381` plus `fenced-source.patch`, SHA-256
 Prior C is the preceding section's `pouch_space_compare-sdk`, SHA-256
 `0e9b5023186afabf06ec99f4be9c1dc9ad2def36b5e9ec6e317ee2678a1b518d`.
 Subsequent documentation edits do not change these executable inputs.
+
+## Typed namespace enumeration comparison
+
+The internal namespace visit capability now supplies logical names from each
+storage owner. Native Pouch retains its directory walk and unescaping; the
+container uses its existing durable namespace catalog. Implicit transaction
+leader discovery calls that capability instead of interpreting a container
+pathname as a directory. This adds no persistent format or public API/ABI.
+The [implementation evidence](pouch-space-implementation.md#typed-namespace-enumeration)
+describes its scope and remaining control-owner integration.
+
+This matched fixture creates 64 empty namespaces, `team/00` through `team/63`,
+then verifies exact membership and absence of duplicates on every timed walk.
+Both engines use the same frozen native GNU release ELF and normal allocator.
+Five samples alternate engine and policy order. Each sample measures both owners,
+both policies and warm/reopened fixtures: 40 cases, each with one first walk
+followed by 128 verified repeated walks. All samples and outliers are retained.
+Creation/seeding and prior close are outside these timings. Reopen retains OS
+caches; it is not a disk-cold measurement. Container fixtures assert one 10 MiB
+file and reject unexpected sibling artifacts before cleanup.
+
+Repeated walks below follow that fixture's first complete walk. Elapsed values
+are median [minimum–maximum] microseconds per 64-name walk; CPU columns are
+median process CPU microseconds per walk. Complete CPU ranges remain in the raw
+results. Repeated walks are warm in both fixture rows.
+
+| Policy | Fixture | Container µs/walk | Multifile µs/walk | C CPU µs/walk | MF CPU µs/walk |
+| --- | --- | ---: | ---: | ---: | ---: |
+| NoSync | after seed + first walk | 5.443 [5.319–6.358] | 15.641 [15.069–17.051] | 5.452 | 15.655 |
+| NoSync | after reopen + first walk | 4.301 [4.271–4.985] | 13.940 [13.648–18.468] | 4.310 | 13.950 |
+| Durable | after seed + first walk | 5.731 [5.418–6.386] | 16.830 [14.717–25.258] | 5.744 | 16.852 |
+| Durable | after reopen + first walk | 5.164 [4.386–6.185] | 14.604 [13.647–22.280] | 5.179 | 14.616 |
+
+Container repeated-walk medians are 2.83–3.24 times faster for this fixture;
+all four owner range pairs are disjoint. CPU medians show the same direction.
+The container's resident catalog walk needs no physical storage I/O, as the
+fault-seam test verifies; native enumeration still reads directory metadata.
+These results measure registry enumeration over empty namespaces. Public lease
+enrollment also scans canonical lease metadata and needs the remaining retention
+journal and transaction-guard owners; those costs are not priced here.
+
+The first walk after reopen and combined readiness follow. First-walk columns
+are median [minimum–maximum] microseconds; combined open plus first-walk columns
+are milliseconds. The container constructs namespace owners on that first walk.
+
+| Policy | Container first µs | Multifile first µs | Container open + first ms | Multifile open + first ms |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 15.199 [14.169–16.361] | 17.402 [17.029–18.700] | 1.317 [1.018–4.225] | 2.480 [2.330–3.145] |
+| Durable | 16.551 [15.490–32.339] | 17.569 [16.990–33.782] | 1.196 [1.162–2.366] | 2.442 [2.323–4.014] |
+
+Combined readiness medians favor the container, but both owner
+range pairs overlap. The NoSync container retains its 4.225 ms maximum. Do not
+infer a disjoint readiness improvement from the repeated-walk ranges.
+
+Evidence is retained under `build/pouch-space-namespace-visit/`: `perf.sh`,
+five `paired/sample-*.log` files, `perf-summary.pl` and `perf-results.json`.
+The summary validates all 40 distinct owner/policy/fixture/sample cases and keeps
+first-walk, open, repeated elapsed and CPU measurements. An independent raw-log
+calculation agrees with every reported minimum, median and maximum.
+
+The executable is `pouch_space_client_test-namespaces`, SHA-256
+`14adb90551956d97779469601c15c06825a81b269c2050e1c73f093f0d5da555`.
+Its source is `ad4bbe91` plus `namespace-source.patch`, SHA-256
+`17f0257e7f2f8a21b73812c4eb3fb1fab572e51414e41e05f456b7d2b0ed7a42`.
+After measurement, cold allocation/close coverage was added to the test harness.
+Its verification input is `namespace-final-source.patch`, SHA-256
+`7a7ae7b14750e77c2e9585b6a048dcfb02b6e1c5c50d9d80d4128ef29a6409a5`.
+The production source diff and both library archives are unchanged by that
+supplement. Documentation edits do not alter either executable input.

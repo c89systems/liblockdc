@@ -18,6 +18,17 @@ typedef int (*lc_pouch_storage_visit_fn)(void *, uint64_t,
                                          lc_error *);
 typedef int (*lc_pouch_storage_replay_fn)(void *, lc_pouch_storage_visit_fn,
                                           void *, lc_error *);
+typedef int (*lc_pouch_storage_namespace_visit_fn)(void *, const char *,
+                                                   lc_error *);
+
+/* Enumerate exact logical names through their owning storage. Names are
+ * borrowed for the callback. No body replay, filtering or ordering guarantee.
+ * Callbacks may open namespaces and return an error to stop the walk. Container
+ * owners capture a durable catalog prefix; native owners walk their directory.
+ * The caller retains the runtime throughout the operation. */
+int lc_pouch_storage_namespaces_visit(lc_pouch *,
+                                      lc_pouch_storage_namespace_visit_fn,
+                                      void *, lc_error *);
 
 /* Immutable logical projection of one captured canonical prefix. Reuses the
  * production supersession, object and query-generation rules without changing
@@ -78,6 +89,8 @@ typedef struct lc_pouch_storage_ops {
   void (*namespace_close)(void *, void *);
   int (*namespace_info)(void *, void *, lc_pouch_storage_namespace_info *,
                         lc_error *);
+  int (*namespaces_visit)(void *, lc_pouch_storage_namespace_visit_fn, void *,
+                          lc_error *);
   int (*replay)(void *, void *, lc_pouch_storage_visit_fn, void *, lc_error *);
   /* Rotation target and known span. PREFIX permits an unknown remainder;
    * COMPLETE requires the declared size, MAINTENANCE additionally permits

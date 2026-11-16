@@ -1103,15 +1103,15 @@ limit or external persistent staging is authorized.
 
 Complete the remaining logical control ownership through typed capabilities.
 The inspected public lease path still calls retention-work reservation checks;
-release uses transaction guards, and implicit transaction enrollment scans
-namespaces to locate its leader. Those calls currently reach retention journal
-paths, transaction lock files and directory walks in `lc_pouch_retention.c` and
-`lc_pouch_client.c`. Adapting only state bodies cannot establish public leased
-writes. Keep lease/transaction policy in the production engine, and give its
-retention journal, transaction authority and namespace enumeration explicit
-container owners. Do not treat the current exclusive open as proof of the final
-shared-root contract. Interprocess publication and reader-generation recovery
-remain required within the same file.
+release still uses transaction lock files. The implemented
+[namespace enumeration boundary](#typed-namespace-enumeration) now supplies
+names from the existing container catalog to implicit transaction leader
+discovery. That independent integration changes no persistence layout and does
+not approve this maintenance proposal. Retention journal and transaction guard
+ownership still require conversion in `lc_pouch_retention.c` and
+`lc_pouch_client.c`. Keep their policy in the production engine. Do not treat the
+current exclusive open as proof of the final shared-root contract. Interprocess
+publication and reader-generation recovery remain required within the same file.
 
 #### Acceptance and cutover sequence
 
@@ -1399,6 +1399,56 @@ range pairs overlap. Separate traces verify that clean reopen uses one
 one sync in the prior implementation.
 Neither this change nor those measurements settle the standing maintenance
 capacity decision or complete the remaining typed public owners.
+
+## Typed namespace enumeration
+
+`lc_pouch_storage_namespaces_visit` now supplies exact logical namespace names
+through their owning storage. The native owner retains its directory walk and
+name unescaping. The container adapter uses `ps_root_namespace_visit` over one
+durable catalog prefix and checks poisoned admission before invoking callbacks.
+There is no new public API/ABI, persistent format, backend selector or sidecar.
+
+The implicit-transaction leader lookup now uses this capability; its old
+filesystem loop is removed from the logical client. Callback names are borrowed
+for the call, no ordering/filtering is imposed, and callbacks can open/create
+namespaces or perform nested visits outside owner locks. Native walks retain
+their existing directory semantics; container walks retain the captured prefix.
+Valid native name allocation failure now returns `LC_ERR_NOMEM` rather than
+silently omitting that namespace. Malformed native encodings are still skipped.
+
+The three registered diagnostic modes cover exact names, empty and reopened
+stores, callback error/retry, nested creation, four concurrent create-and-walk
+workers, zero physical I/O for resident container enumeration, poisoned
+admission, native directory errors and one-file/sibling-artifact checks.
+Fault sweeps cover 48 warm and 56 cold allocation sites with non-NULL and NULL
+error pointers: 208 injected failures. Cold cases prove same-owner retry and
+immediate close/reopen after failure. The existing shared-root native
+cross-namespace transaction-enrollment regression also passes in isolation.
+
+All 425 standard Debug groups pass across the three focused groups and the
+remaining 422-group gate (2,940.62 seconds). The additional cold namespace
+supplement passes in Debug/GNU/musl in 2.62/2.40/3.55 seconds. Native GNU and
+musl each pass 13 affected groups, including SDK/root behavior, namespace
+concurrency, native Pouch and header/boundary checks; the updated normal-allocator
+comparison is separately verified in both. The native shared-library exports
+exclude the new internal helper.
+
+Strict TSan passes all three modes and the cold supplement with instrumented
+OpenSSL, no suppressions and `halt_on_error=1`. Four Memcheck runs pass with
+165,767 allocations and matching frees, zero live heap, zero errors/suppressions
+and only three inherited descriptors at exit. The final cold supplement changes
+test coverage only; production source and both GNU library archives remain
+unchanged. Formatting and whitespace checks pass.
+
+Evidence is under `build/pouch-space-namespace-visit/`: the
+`debug-standard-remaining.log`/`debug-standard-details.log` pair,
+`debug-final-details.log`, `debug-native-leader.log`, GNU/musl test logs,
+`*-cold-*-details.log`/`*-cold-details.log`, `tsan-final/` and `memcheck/`.
+The [40-case matched comparison](pouch-space-experiment.md#typed-namespace-enumeration-comparison)
+prices the enumeration itself over 64 empty namespaces. Its repeated-walk
+medians favor the container with disjoint ranges; combined reopen-readiness
+ranges overlap. Retention journals, transaction guards and the complete public
+leased-write path remain unintegrated.
 
 ## Integration and acceptance
 

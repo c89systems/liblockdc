@@ -3,6 +3,7 @@
 #include "lc_api_internal.h"
 #include "lc_intcompat.h"
 #include "lc_pouch_format.h"
+#include "lc_pouch_internal.h"
 #include "lc_pouch_path.h"
 
 #include <dirent.h>
@@ -19,6 +20,80 @@
 #define LC_POUCH_SNAPSHOT_SUFFIX ".log"
 
 typedef lc_pouch_namespace_marker_peer_stat lc_pouch_marker_entry;
+
+/* Preserve the native walk's malformed-name skipping, while distinguishing
+ * decode allocation failure from an invalid directory entry. */
+static int namespace_leaf_decodable(const char *name) {
+  const char *p;
+  if (!*name || strncmp(name, "%00", 3) == 0)
+    return 0;
+  for (p = name; *p; ++p) {
+    if (*p != '%')
+      continue;
+    if (!p[1] || !p[2] || !strchr("0123456789abcdefABCDEF", p[1]) ||
+        !strchr("0123456789abcdefABCDEF", p[2]))
+      return 0;
+    p += 2;
+  }
+  return 1;
+}
+
+int lc_pouch_storage_namespaces_visit(lc_pouch *pouch,
+                                      lc_pouch_storage_namespace_visit_fn visit,
+                                      void *context, lc_error *error) {
+  char *path, *ns;
+  DIR *dir;
+  struct dirent *entry;
+  int rc = LC_OK, open_error;
+  if (!pouch || !visit)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch namespace visit requires runtime and callback",
+                        NULL, NULL, "pouch");
+  if (pouch->storage.ops)
+    return pouch->storage.ops->namespaces_visit(pouch->storage.context, visit,
+                                                context, error);
+  path = lc_pouch_path_join(&pouch->allocator, pouch->root_path, "namespaces");
+  if (!path)
+    return lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to allocate pouch namespaces path", NULL, NULL,
+                        "pouch");
+  dir = opendir(path);
+  open_error = errno;
+  lc_free_with_allocator(&pouch->allocator, path);
+  if (!dir)
+    return open_error == ENOENT
+               ? LC_OK
+               : lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                              "failed to scan pouch namespaces",
+                              strerror(open_error), NULL, "pouch");
+  while (rc == LC_OK) {
+    errno = 0;
+    entry = readdir(dir);
+    if (!entry) {
+      if (errno)
+        rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                          "failed to scan pouch namespaces", strerror(errno),
+                          NULL, "pouch");
+      break;
+    }
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..") ||
+        !namespace_leaf_decodable(entry->d_name))
+      continue;
+    ns = lc_pouch_path_unescape_name(&pouch->allocator, entry->d_name);
+    if (!ns)
+      rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                        "failed to decode pouch namespace name", NULL, NULL,
+                        "pouch");
+    else
+      rc = visit(context, ns, error);
+    lc_free_with_allocator(&pouch->allocator, ns);
+  }
+  if (closedir(dir) != 0 && rc == LC_OK)
+    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                      "failed to close pouch namespaces", strerror(errno), NULL,
+                      "pouch");
+  return rc;
+}
 
 static int lc_pouch_namespace_parse_u64(const char *text, size_t length,
                                         uint64_t *out_value) {

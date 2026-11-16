@@ -11168,13 +11168,18 @@ lc_pouch_implicit_txn_leader_visit(const lc_pouch_state_visit_entry *entry,
   return rc;
 }
 
+static int lc_pouch_implicit_txn_namespace_visit(void *context, const char *ns,
+                                                 lc_error *error) {
+  lc_pouch_implicit_txn_leader *leader = context;
+  return lc_pouch_state_visit(leader->client->pouch, ns,
+                              lc_pouch_implicit_txn_leader_visit, leader,
+                              error);
+}
+
 static int
 lc_pouch_find_implicit_txn_leader(lc_client_handle *client, const char *txn_id,
                                   lc_pouch_implicit_txn_leader *leader,
                                   lc_error *error) {
-  char *namespaces_path;
-  DIR *dir;
-  struct dirent *entry;
   int rc;
 
   if (client == NULL || client->pouch == NULL || txn_id == NULL ||
@@ -11190,51 +11195,8 @@ lc_pouch_find_implicit_txn_leader(lc_client_handle *client, const char *txn_id,
   if (rc != LC_OK) {
     return rc;
   }
-  namespaces_path = lc_pouch_path_join(&client->pouch->allocator,
-                                       client->pouch->root_path, "namespaces");
-  if (namespaces_path == NULL) {
-    return lc_error_set(error, LC_ERR_NOMEM, 0L,
-                        "failed to allocate pouch namespaces path", NULL, NULL,
-                        "pouch");
-  }
-  dir = opendir(namespaces_path);
-  lc_free_with_allocator(&client->pouch->allocator, namespaces_path);
-  if (dir == NULL) {
-    return errno == ENOENT ? LC_OK
-                           : lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                                          "failed to scan pouch namespaces",
-                                          strerror(errno), NULL, "pouch");
-  }
-  rc = LC_OK;
-  while (rc == LC_OK) {
-    char *ns;
-
-    errno = 0;
-    entry = readdir(dir);
-    if (entry == NULL) {
-      if (errno != 0) {
-        rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                          "failed to scan pouch namespaces", strerror(errno),
-                          NULL, "pouch");
-      }
-      break;
-    }
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-      continue;
-    }
-    ns = lc_pouch_path_unescape_name(&client->pouch->allocator, entry->d_name);
-    if (ns == NULL) {
-      continue;
-    }
-    rc = lc_pouch_state_visit(
-        client->pouch, ns, lc_pouch_implicit_txn_leader_visit, leader, error);
-    lc_free_with_allocator(&client->pouch->allocator, ns);
-  }
-  if (closedir(dir) != 0 && rc == LC_OK) {
-    rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                      "failed to close pouch namespaces", strerror(errno), NULL,
-                      "pouch");
-  }
+  rc = lc_pouch_storage_namespaces_visit(
+      client->pouch, lc_pouch_implicit_txn_namespace_visit, leader, error);
   if (rc != LC_OK) {
     lc_pouch_implicit_txn_leader_cleanup(leader);
   }
