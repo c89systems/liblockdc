@@ -194,6 +194,11 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
   add_test(NAME pouch_space_budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget)
   add_test(NAME pouch_space_budget-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget-capacity)
+  foreach(mode value-budget value-budget-capacity value-budget-faults value-budget-concurrency value-budget-process)
+    add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
+      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
   add_test(NAME pouch_space_grant-budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} grant-budget)
   add_test(NAME pouch_space_append-budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} append-budget)
   set_tests_properties(pouch_space_append-budget PROPERTIES TIMEOUT 120

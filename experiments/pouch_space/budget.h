@@ -31,6 +31,11 @@ typedef struct ps_budget_plan {
 int ps_budget_plan_stream(ps_budget_plan *, lc_error *);
 int ps_budget_plan_catalog(ps_budget_plan *, size_t name_bytes, lc_error *);
 int ps_budget_plan_routing(ps_budget_plan *, int create, lc_error *);
+/* One immutable value, including an empty value. Funds a new descriptor and
+ * the worst case of one extent per payload page. Also usable for replacement;
+ * positive growth alone is spent and unused credits return on close. Rejects
+ * values whose worst-case extent list cannot fit one publication event. */
+int ps_budget_plan_value(ps_budget_plan *, uint64_t bytes, lc_error *);
 int ps_budget_plan_span(ps_budget_plan *, uint64_t bytes, lc_error *);
 /* Preferred geometric reservation may over-allocate its last grant. Account
  * for that payload without inventing extra descriptor entries for the spare. */

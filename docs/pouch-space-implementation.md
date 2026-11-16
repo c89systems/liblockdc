@@ -374,7 +374,7 @@ retains segment/snapshot facts, retention, dropped state and lease fencing.
 Decode validates before replacing the caller's value. The adapter stores these
 bytes directly in packed immutable cells; it creates no head file or second log.
 
-The new `PS_CONTROL` kind supports values up to 4 KiB. Publication and deletion
+Unbudgeted `PS_CONTROL` values support up to 4 KiB. Publication and deletion
 always wait for the existing caller-led durability coordinator, including NoSync
 roots; reads select its completed prefix. Independent control writers can publish
 while another waits for sync and share subsequent barriers. Metadata authority
@@ -400,6 +400,64 @@ This completes control encoding and physical persistence, not public collection
 ownership. Public lease operations still exercise the native owner. Namespace
 data manifests, dependency ordering, guard lifetime and control cleanup must be
 joined to the container before the public Pouch cutover.
+
+### Budgeted multi-page controls
+
+Larger controls now use the same immutable value writer when supplied an
+explicit capacity claim. `ps_budget_plan_value` funds one new binding, payload
+rounded up to physical pages, and the worst case of one extent descriptor per
+page. Empty values still need their 64-byte descriptor. The planner rejects
+values whose worst-case extent list cannot fit one journal publication, and
+leaves the plan unchanged on overflow or invalid input. Replacements spend only
+positive descriptor growth; unused credits return when the claim closes.
+
+This supports the existing retention journal's bounded metadata size without
+putting application bodies into controls. The writer still takes producer
+chunks through its fixed 16 KiB buffer. It neither materializes the complete
+value nor introduces a staging file. Explicitly funded controls retain
+always-durable publication, deletion and completed-prefix reads on both root
+policies. Routing values remain limited to one page, including with a claim.
+
+There is no format-marker change, larger automatic replacement allowance,
+standing reserve selection or implicit growth. The caller must admit the
+complete replacement while its predecessor and any pinned readers still own
+their capacity. Repeated replacements may require explicit checkpoint/reclaim
+before another claim is admissible. Retention's codec, typed journal owner and
+public policy dispatch remain a subsequent integration stage; this physical
+support does not resolve the pending maintenance architecture decision.
+
+Five new test groups cover planning overflow and journal bounds, page/chunk
+boundaries, zero-length values, replacements and pinned readers, underfunded
+claims, process exit without root close, and held payload/publication/deletion
+barriers on both durability policies. A 3 MiB + 128-byte fixture stays within
+32 KiB per individual internal allocation during its write. Fixed 10 MiB
+capacity tests admit the claim, exhaust foreground space, take the remaining
+maintenance floor with a peer claim, then publish across a metadata repack.
+The fragmented cases consume the planner's full one-extent-per-page bound.
+
+The existing deterministic file-image model uses reduced 1 MiB fixtures for
+28 write/barrier and 46 allocation fault sites across replacement, checkpoint
+and deletion. It restores stable bytes after lost or persisted torn writes,
+verifies the complete recovered old/new value, and retries on the reopened
+owner. Optional allocation failures may succeed through the existing fallback;
+they must still recover the acknowledged complete value.
+
+Verification covers 430 distinct Debug groups: all 425 existing standard checks
+plus the five new groups. GNU and native musl pass 25 affected groups each.
+Strict TSan passes all five new groups plus existing budget and commit coverage
+with instrumented OpenSSL, `halt_on_error=1` and no suppressions. Four normal-exit
+Memcheck groups report 109,190 allocations and matching frees, zero live heap,
+zero errors/suppressions and only three inherited descriptors at exit. The
+deliberately unclosed process-exit fixture runs separately from Memcheck's
+normal-cleanup checks. GNU/Debug checks use the 128 KiB worker-stack policy;
+musl retains its native defaults. Formatting and whitespace checks pass.
+
+Evidence is under `build/pouch-space-value-budget/`: `debug-standard.log`,
+`debug-final-new-tests.log`, GNU/musl test logs, `tsan/`, `tsan-relink.sh` and
+`memcheck/`. The final test-only split separates deliberate process exit from
+normal lifecycle cleanup; production inputs are unchanged. Existing bounded
+head comparisons also pass. Larger retention records have no matched native
+timing claim yet; that comparison belongs to the typed journal integration.
 
 ## Namespace segment ownership
 

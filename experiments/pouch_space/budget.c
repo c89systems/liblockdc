@@ -28,6 +28,15 @@ int ps_budget_plan_routing(ps_budget_plan *p, int create, lc_error *e) {
     return invalid(e, "capacity plan routing creation must be zero or one");
   return plan_add(p, PS_PAGE, create ? 88 : 0, create ? 1 : 0, e);
 }
+int ps_budget_plan_value(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
+  uint64_t pages;
+  if (bytes > (uint64_t)INT64_MAX)
+    return invalid(e, "capacity plan immutable value exceeds local bounds");
+  pages = bytes / PS_PAGE + (bytes % PS_PAGE != 0);
+  if (pages > (PS_JOURNAL - 64) / 24)
+    return invalid(e, "capacity plan value extents exceed journal capacity");
+  return plan_add(p, pages * PS_PAGE, 64 + pages * 24, 1, e);
+}
 int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   uint64_t pages;
   if (bytes > (uint64_t)INT64_MAX)

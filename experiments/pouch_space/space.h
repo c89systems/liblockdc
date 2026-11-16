@@ -27,10 +27,13 @@ enum ps_kind {
   PS_STATE = 1,
   PS_COLLECTION = 2,
   PS_STREAM = 3,
-  /* Canonical control values, at most one page: replaceable like STATE, but
+  /* Canonical control values: replaceable like STATE, but
    * always publish, read and delete at a completed durable prefix, even in
    * NoSync. Replacements may use 4 KiB of the protected maintenance reserve;
-   * checkpoint releases superseded values before that allowance is reused. */
+   * checkpoint releases superseded values before that allowance is reused.
+   * Unbudgeted controls are at most one page. Larger controls require an
+   * explicit capacity claim covering their complete payload and descriptor;
+   * they acquire no larger automatic replacement allowance. */
   PS_CONTROL = 6,
   /* Bounded logical routing values use the same replacement allowance as
    * CONTROL, but follow root durability. Ownership and allocation authority

@@ -6031,7 +6031,7 @@ static void budget_fill(ps_space *s, uint64_t *next, const void *bytes) {
       lc_error_cleanup(&error);
       break;
     }
-    CHECK(*next < 2000);
+    CHECK(*next < 4096);
   }
 }
 static void budget_capacity(int durable) {
@@ -6221,6 +6221,458 @@ static void budget_allocation_faults(void) {
   }
   printf("capacity budget admission: %lu allocation failure cuts\n",
          (unsigned long)count);
+  free(bytes);
+  clean();
+}
+static int budget_value_write(ps_space *s, ps_key k, const void *bytes,
+                              size_t n, size_t chunk, ps_ref *ref,
+                              lc_error *e) {
+  ps_budget_plan plan = {0};
+  ps_budget *budget = NULL;
+  ps_writer *w = NULL;
+  size_t at = 0, step;
+  int rc = ps_budget_plan_value(&plan, n, e);
+  if (rc == LC_OK)
+    rc = ps_budget_open(s, &plan, &budget, e);
+  if (rc == LC_OK)
+    rc = ps_begin(s, budget, k, &w, e);
+  while (rc == LC_OK && at < n) {
+    step = n - at;
+    if (step > chunk)
+      step = chunk;
+    rc = ps_write(w, (const unsigned char *)bytes + at, step, e);
+    at += step;
+  }
+  if (rc == LC_OK)
+    rc = ps_publish(w, ref, e);
+  ps_writer_close(w);
+  if (ps_budget_close(budget, NULL) != LC_OK)
+    abort();
+  return rc;
+}
+static void value_budget_planning(void) {
+  uint64_t bound = (PS_JOURNAL - 64) / 24 * (uint64_t)PS_PAGE;
+  uint64_t sizes[] = {
+      0, 1, PS_PAGE, PS_PAGE + 1, PS_CHUNK + 1, 3 * PS_MIB + 128, bound};
+  ps_budget_plan p, before;
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
+    p = (ps_budget_plan){PS_PAGE, 88, 1, 1};
+    uint64_t pages = sizes[i] / PS_PAGE + (sizes[i] % PS_PAGE != 0);
+    OK(ps_budget_plan_value(&p, sizes[i], &error));
+    CHECK(p.payload_bytes == PS_PAGE + pages * PS_PAGE &&
+          p.metadata_bytes == 88 + 64 + pages * 24 && p.entries == 2 &&
+          p.maintenance == 1);
+  }
+  for (int kind = 0; kind < 6; ++kind) {
+    p = (ps_budget_plan){PS_PAGE, 88, 1, 0};
+    if (kind == 0)
+      p.payload_bytes = UINT64_MAX;
+    if (kind == 1)
+      p.metadata_bytes = UINT64_MAX;
+    if (kind == 2)
+      p.entries = UINT64_MAX;
+    before = p;
+    CHECK(ps_budget_plan_value(&p,
+                               kind == 3   ? bound + 1
+                               : kind == 4 ? (uint64_t)INT64_MAX
+                               : kind == 5 ? UINT64_MAX
+                                           : 1,
+                               &error) == LC_ERR_INVALID);
+    lc_error_cleanup(&error);
+    CHECK(p.payload_bytes == before.payload_bytes &&
+          p.metadata_bytes == before.metadata_bytes &&
+          p.entries == before.entries && p.maintenance == before.maintenance);
+  }
+  BAD(ps_budget_plan_value(NULL, 0, &error));
+  BAD(ps_budget_plan_value(NULL, 1, NULL));
+}
+static void value_budget_lifecycle(int durable) {
+  size_t sizes[] = {0,
+                    1,
+                    PS_PAGE,
+                    PS_PAGE + 1,
+                    PS_CHUNK - 1,
+                    PS_CHUNK,
+                    PS_CHUNK + 1,
+                    3 * (size_t)PS_MIB + 128};
+  size_t max = sizes[sizeof(sizes) / sizeof(*sizes) - 1];
+  unsigned char *a = malloc(max), *b = malloc(max);
+  ps_key k = key(PS_CONTROL, 101, 1);
+  ps_space *s;
+  ps_reader *held = NULL, *rejected = NULL;
+  ps_ref old, next;
+  ps_stats stats;
+  CHECK(a && b);
+  for (size_t i = 0; i < max; ++i) {
+    a[i] = (unsigned char)(i * 17);
+    b[i] = (unsigned char)~a[i];
+  }
+  clean();
+  s = create(0, durable, NULL);
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
+    size_t n = sizes[i];
+    allocation_max = 0;
+    measure_allocations = n == max;
+    OK(budget_value_write(s, k, a, n, 317, &old, &error));
+    measure_allocations = 0;
+    if (n == max)
+      CHECK(allocation_max <= 2 * PS_CHUNK);
+    OK(ps_read_open(s, k, &old, &held, &error));
+    OK(budget_value_write(s, k, b, n, PS_CHUNK + 1, &next, &error));
+    CHECK(old.incarnation != next.incarnation);
+    BAD(ps_read_open(s, k, &old, &rejected, &error));
+    CHECK(!rejected);
+    expect(s, k, &next, b, n);
+    OK(ps_checkpoint(s, &error));
+    read_value(held, a, n);
+    ps_reader_close(held);
+    OK(ps_status(s, &stats, &error));
+    CHECK(stats.capacity == PS_DEFAULT_CAPACITY && !stats.budgets &&
+          !stats.private_bytes && !stats.retired_bytes &&
+          !stats.reserved_payload_bytes && !stats.reserved_metadata_bytes &&
+          !stats.reserved_entries);
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    expect(s, k, &next, b, n);
+    OK(ps_delete(s, k, &error));
+    OK(ps_close(s, &error));
+    s = reopen(NULL);
+    absent(s, k);
+  }
+  OK(ps_close(s, &error));
+  free(a);
+  free(b);
+  clean();
+}
+static void value_budget_process(void) {
+  size_t size = PS_CHUNK + 17;
+  unsigned char *bytes = malloc(size);
+  ps_key k = key(PS_CONTROL, 101, 1);
+  ps_options options = {0};
+  ps_space *s;
+  pid_t child;
+  int status;
+  CHECK(bytes);
+  memset(bytes, 0x72, size);
+  for (int durable = 0; durable < 2; ++durable) {
+    clean();
+    s = create(0, durable, NULL);
+    OK(ps_close(s, &error));
+    options.durable_sync = durable;
+    for (int remove = 0; remove < 2; ++remove) {
+      child = fork();
+      CHECK(child >= 0);
+      if (!child) {
+        int rc = ps_open(path, 0, &options, &s, &error);
+        if (rc == LC_OK)
+          rc = remove
+                   ? ps_delete(s, k, &error)
+                   : budget_value_write(s, k, bytes, size, 317, NULL, &error);
+        /* Terminate without root close, checkpoint or exit handlers. */
+        _exit(rc == LC_OK ? 0 : 1);
+      }
+      CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0);
+      s = reopen(NULL);
+      if (remove)
+        absent(s, k);
+      else
+        expect(s, k, NULL, bytes, size);
+      OK(ps_close(s, &error));
+    }
+  }
+  free(bytes);
+  clean();
+}
+static void value_budget_rejections(void) {
+  ps_space *s;
+  ps_writer *w = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan;
+  ps_stats stats;
+  unsigned char *bytes = malloc(PS_CHUNK + 17);
+  CHECK(bytes);
+  memset(bytes, 0x37, PS_CHUNK + 17);
+  clean();
+  s = create(0, 0, NULL);
+  for (int kind = PS_CONTROL; kind <= PS_ROUTING; ++kind) {
+    ps_key k = key((unsigned int)kind, 101, 1);
+    for (int funded = 0; funded < 2; ++funded) {
+      if (kind == PS_CONTROL && funded)
+        continue;
+      plan = (ps_budget_plan){0};
+      OK(ps_budget_plan_value(&plan, PS_PAGE + 1, &error));
+      if (funded)
+        OK(ps_budget_open(s, &plan, &budget, &error));
+      OK(ps_begin(s, budget, k, &w, &error));
+      BAD(ps_write(w, bytes, PS_PAGE + 1, &error));
+      OK(ps_write(w, bytes, PS_PAGE, &error));
+      BAD(ps_write(w, bytes, 1, &error));
+      OK(ps_write(w, NULL, 0, &error));
+      OK(ps_publish(w, NULL, &error));
+      ps_writer_close(w);
+      OK(ps_budget_close(budget, &error));
+      budget = NULL;
+      expect(s, k, NULL, bytes, PS_PAGE);
+      OK(ps_delete(s, k, &error));
+    }
+  }
+  ps_key k = key(PS_CONTROL, 101, 1);
+  put(s, k, bytes, PS_PAGE, PS_PAGE);
+  for (int kind = 0; kind < 3; ++kind) {
+    plan = (ps_budget_plan){0};
+    OK(ps_budget_plan_value(&plan, PS_CHUNK + 17, &error));
+    if (kind == 0)
+      plan.payload_bytes = PS_CHUNK;
+    if (kind == 1)
+      plan.metadata_bytes = 0;
+    if (kind == 2)
+      plan.entries = 0;
+    /* Test new binding entry credits, or replacement growth/payload credits. */
+    ps_key target = kind == 2 ? key(PS_CONTROL, 101, 2) : k;
+    OK(ps_budget_open(s, &plan, &budget, &error));
+    OK(ps_begin(s, budget, target, &w, &error));
+    int rc = ps_write(w, bytes, PS_CHUNK + 17, &error);
+    if (rc == LC_OK)
+      rc = ps_publish(w, NULL, &error);
+    CHECK(rc == LC_ERR_INVALID);
+    lc_error_cleanup(&error);
+    ps_writer_close(w);
+    OK(ps_budget_close(budget, &error));
+    expect(s, k, NULL, bytes, PS_PAGE);
+    absent(s, key(PS_CONTROL, 101, 2));
+    OK(ps_checkpoint(s, &error));
+    OK(ps_status(s, &stats, &error));
+    CHECK(!stats.private_bytes && !stats.budgets &&
+          !stats.reserved_payload_bytes && !stats.reserved_metadata_bytes &&
+          !stats.reserved_entries);
+  }
+  OK(budget_value_write(s, k, bytes, PS_CHUNK + 17, 1, NULL, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, k, NULL, bytes, PS_CHUNK + 17);
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
+static void value_budget_capacity(int durable, int fragmented) {
+  ps_space *s;
+  ps_key k = key(PS_CONTROL, 101, 1);
+  ps_budget *budget = NULL, *peer = NULL;
+  ps_budget_plan plan = {0}, floor = {PS_MAINTENANCE_RESERVE, 0, 0, 1};
+  ps_writer *w = NULL;
+  ps_stats before, after;
+  size_t size = 6 * PS_CHUNK + 17;
+  unsigned char *bytes = malloc(size);
+  uint64_t next = 1, end;
+  CHECK(bytes);
+  memset(bytes, 0x7d, size);
+  clean();
+  s = create(0, durable, NULL);
+  if (fragmented) {
+    budget_fill(s, &next, bytes);
+    end = next - 1;
+    for (uint64_t i = 1; i < end; i += 2)
+      OK(ps_delete(s, state(i), &error));
+    OK(ps_checkpoint(s, &error));
+  }
+  OK(ps_budget_plan_value(&plan, size, &error));
+  OK(ps_budget_open(s, &plan, &budget, &error));
+  budget_fill(s, &next, bytes);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_budget_open(s, &floor, &peer, &error));
+  OK(ps_status(s, &before, &error));
+  CHECK(before.reserved_payload_bytes ==
+        plan.payload_bytes + floor.payload_bytes);
+  OK(ps_begin(s, budget, k, &w, &error));
+  OK(ps_write(w, bytes, 3 * PS_CHUNK, &error));
+  OK(ps_metadata_repack(s, &error));
+  OK(ps_write(w, bytes + 3 * PS_CHUNK, size - 3 * PS_CHUNK, &error));
+  OK(ps_publish(w, NULL, &error));
+  ps_writer_close(w);
+  OK(ps_budget_close(peer, &error));
+  OK(ps_budget_close(budget, &error));
+  OK(ps_status(s, &after, &error));
+  CHECK(after.entries == before.entries + 1 &&
+        after.metadata_bytes - before.metadata_bytes <= plan.metadata_bytes &&
+        after.capacity == PS_DEFAULT_CAPACITY && !after.budgets &&
+        !after.reserved_payload_bytes && !after.reserved_metadata_bytes &&
+        !after.reserved_entries);
+  if (fragmented)
+    CHECK(after.metadata_bytes - before.metadata_bytes == plan.metadata_bytes);
+  expect(s, k, NULL, bytes, size);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, k, NULL, bytes, size);
+  OK(ps_close(s, &error));
+  free(bytes);
+  clean();
+}
+static void value_budget_faults(int durable) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *s;
+  ps_key k = key(PS_CONTROL, 101, 1);
+  ps_reader *r = NULL;
+  ps_stats stats;
+  size_t size = PS_CHUNK + PS_PAGE + 37, sites;
+  unsigned char *bytes = malloc(size), *baseline = malloc((size_t)PS_MIB);
+  int rc;
+  CHECK(bytes && baseline);
+  memset(bytes, 0x7d, size);
+  for (int action = 0; action < 3; ++action) {
+    clean();
+    s = create(PS_MIB, durable, &io);
+    if (!action)
+      put(s, k, "prior", 5, 5);
+    else
+      OK(budget_value_write(s, k, bytes, size, 317, NULL, &error));
+    OK(ps_checkpoint(s, &error));
+    /* Dirty a large descriptor again so checkpoint exercises its publication.
+     */
+    if (action == 1)
+      OK(budget_value_write(s, k, bytes, size, 317, NULL, &error));
+    OK(ps_close(s, &error));
+    memcpy(baseline, m.stable, (size_t)PS_MIB);
+    for (int kind = 0; kind < 2; ++kind) {
+      sites = 0;
+      for (size_t cut = 0; cut <= sites; ++cut) {
+        memcpy(m.stable, baseline, (size_t)PS_MIB);
+        m.stable_bytes = PS_MIB;
+        crash(&m);
+        s = reopen(&io);
+        /* Give checkpoint a fresh replacement after every reopen. */
+        if (action == 1)
+          OK(budget_value_write(s, k, bytes, size, 317, NULL, &error));
+        m.operations = 0;
+        m.fail_at = kind == 0 ? cut : 0;
+        m.tear = m.persist_torn = 1;
+        allocation_call = 0;
+        allocation_fail = kind == 1 ? (cut ? cut : (size_t)-1) : 0;
+        rc = action == 0
+                 ? budget_value_write(s, k, bytes, size, 317, NULL, &error)
+             : action == 1 ? ps_checkpoint(s, &error)
+                           : ps_delete(s, k, &error);
+        allocation_fail = m.fail_at = 0;
+        int completed = rc == LC_OK;
+        if (!cut) {
+          OK(rc);
+          sites = kind == 0 ? m.operations : allocation_call;
+          CHECK(sites);
+        } else {
+          CHECK(kind == 0 ? rc == LC_ERR_TRANSPORT
+                          : (rc == LC_ERR_NOMEM || rc == LC_OK));
+          if (kind)
+            CHECK(allocation_call >= cut);
+          lc_error_cleanup(&error);
+        }
+        OK(ps_close(s, &error));
+        crash(&m);
+        s = reopen(&io);
+        rc = ps_read_open(s, k, NULL, &r, &error);
+        if (rc == LC_OK) {
+          size_t n = (size_t)ps_read_size(r);
+          CHECK(n == size || (!action && cut && n == 5));
+          if (!action && (completed || kind == 1))
+            CHECK(n == (completed ? size : 5));
+          if (action == 2)
+            CHECK(!completed);
+          read_value(r, n == 5 ? (const void *)"prior" : bytes, n);
+          ps_reader_close(r);
+        } else {
+          CHECK(action == 2 && (completed || kind == 0));
+          CHECK(rc == LC_ERR_INVALID && !r);
+          lc_error_cleanup(&error);
+        }
+        OK(ps_status(s, &stats, &error));
+        CHECK(!stats.budgets && !stats.reserved_payload_bytes &&
+              !stats.reserved_metadata_bytes && !stats.reserved_entries);
+        OK(budget_value_write(s, k, bytes, size, 317, NULL, &error));
+        expect(s, k, NULL, bytes, size);
+        OK(ps_close(s, &error));
+      }
+      printf("value budget action%d sync%d %s: %lu failure sites\n", action,
+             durable, kind ? "allocation" : "write/sync", (unsigned long)sites);
+    }
+  }
+  free(bytes);
+  free(baseline);
+  free(m.stable);
+  clean();
+}
+typedef struct value_budget_actor {
+  ps_space *space;
+  const unsigned char *bytes;
+  size_t size;
+  int remove, rc;
+} value_budget_actor;
+static void *value_budget_worker(void *context) {
+  value_budget_actor *a = context;
+  lc_error e;
+  lc_error_init(&e);
+  ps_key k = key(PS_CONTROL, 101, 1);
+  a->rc = a->remove ? ps_delete(a->space, k, &e)
+                    : budget_value_write(a->space, k, a->bytes, a->size, 317,
+                                         NULL, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void value_budget_concurrency(void) {
+  size_t size = PS_CHUNK + 17;
+  unsigned char *bytes = malloc(size);
+  ps_key k = key(PS_CONTROL, 101, 1);
+  CHECK(bytes);
+  memset(bytes, 0x59, size);
+  for (int durable = 0; durable < 2; ++durable) {
+    for (int phase = 0; phase < 3; ++phase) {
+      commit_gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+      ps_io io = {&g, gate_read, gate_write, gate_sync, gate_reserve, NULL};
+      value_budget_actor actor = {NULL, bytes, size, phase == 2, -1};
+      pthread_t thread;
+      ps_reader *held = NULL;
+      clean();
+      ps_space *s = create(0, durable, &io);
+      if (phase == 2)
+        OK(budget_value_write(s, k, bytes, size, 317, NULL, &error));
+      else
+        put(s, k, "prior", 5, 5);
+      OK(ps_read_open(s, k, NULL, &held, &error));
+      actor.space = s;
+      g.enabled = 1;
+      g.hold_payload = phase == 0;
+      CHECK(pthread_create(&thread, NULL, value_budget_worker, &actor) == 0);
+      await_gate(&g, 0);
+      expect(s, k, NULL, phase == 2 ? (const void *)bytes : "prior",
+             phase == 2 ? size : 5);
+      if (!phase) {
+        /* This peer must complete while the producer's payload I/O is held. */
+        put(s, key(PS_CONTROL, 102, 1), "peer", 4, 1);
+        OK(ps_metadata_repack(s, &error));
+        expect(s, key(PS_CONTROL, 102, 1), NULL, "peer", 4);
+      }
+      pthread_mutex_lock(&g.mutex);
+      g.released = 1;
+      pthread_cond_broadcast(&g.cond);
+      pthread_mutex_unlock(&g.mutex);
+      CHECK(pthread_join(thread, NULL) == 0 && actor.rc == LC_OK);
+      read_value(held, phase == 2 ? (const void *)bytes : "prior",
+                 phase == 2 ? size : 5);
+      ps_reader_close(held);
+      if (phase == 2)
+        absent(s, k);
+      else
+        expect(s, k, NULL, bytes, size);
+      OK(ps_close(s, &error));
+      s = reopen(NULL);
+      if (phase == 2)
+        absent(s, k);
+      else
+        expect(s, k, NULL, bytes, size);
+      OK(ps_close(s, &error));
+      CHECK(pthread_cond_destroy(&g.cond) == 0 &&
+            pthread_mutex_destroy(&g.mutex) == 0);
+    }
+  }
   free(bytes);
   clean();
 }
@@ -6552,7 +7004,23 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "append-budget") == 0) {
+    if (strcmp(argv[2], "value-budget") == 0) {
+      value_budget_planning();
+      value_budget_rejections();
+      for (int durable = 0; durable < 2; ++durable)
+        value_budget_lifecycle(durable);
+    } else if (strcmp(argv[2], "value-budget-process") == 0) {
+      value_budget_process();
+    } else if (strcmp(argv[2], "value-budget-capacity") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int fragmented = 0; fragmented < 2; ++fragmented)
+          value_budget_capacity(durable, fragmented);
+    } else if (strcmp(argv[2], "value-budget-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        value_budget_faults(durable);
+    } else if (strcmp(argv[2], "value-budget-concurrency") == 0) {
+      value_budget_concurrency();
+    } else if (strcmp(argv[2], "append-budget") == 0) {
       append_budget_planning();
       append_growth_high_water();
       for (int durable = 0; durable < 2; ++durable)

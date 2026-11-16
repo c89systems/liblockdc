@@ -2133,7 +2133,8 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   if (!w || (!bytes && count) || w->failed || w->published)
     return err(error, LC_ERR_INVALID,
                "container writer is invalid, failed or published");
-  if ((w->entry->key.kind == PS_CONTROL || w->entry->key.kind == PS_ROUTING) &&
+  if ((w->entry->key.kind == PS_ROUTING ||
+       (w->entry->key.kind == PS_CONTROL && !w->budget)) &&
       count > PS_PAGE - w->entry->bytes - w->used)
     return err(error, LC_ERR_INVALID,
                "container bounded metadata exceeds one page");
