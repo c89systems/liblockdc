@@ -964,6 +964,199 @@ usable capacity, write amplification, CPU, durable barriers and maintenance
 latency against the frozen multifile reference. No reserve number is selected
 by this analysis.
 
+### Recommended architecture for the pending decision
+
+This is a **proposal**, not approval or an implementation claim. Select the
+direction before changing persistence. Replace complete experimental namespace
+snapshots with incremental canonical metadata checkpoints, and replace
+source-sized body relocation with bounded relocation of encoded ranges. Keep
+one allocator, one physical publication coordinator and the existing typed
+directory. Do not build a pathname layer or a second database inside the file.
+
+The inspected implementation establishes the reasons for both changes:
+`maintenance.c:plan_snapshot` measures a complete resolved namespace and all
+live bodies in one selected source; `namespace_snapshot.c` funds those complete
+outputs before staging. Splitting that output into writes would leave its
+capacity requirement unchanged. The existing directory already supports
+copy-on-write paths over fixed-width typed identities, while the canonical
+snapshot encoder can write one complete metadata entry with a borrowed body
+reference and no body I/O.
+
+#### Canonical authority and incremental checkpoints
+
+Keep canonical metadata records authoritative. A checkpoint selects complete
+canonical entries through the existing typed physical directory; it is not an
+independently writable projection or a duplicate source of logical truth.
+Each namespace selection binds its checkpoint coverage boundary and both state
+and query high-water values. Replay starts with the selected canonical entries
+and applies complete newer canonical groups using the production resolver.
+Derived query indexes remain rebuildable.
+
+Give each retained logical key slot a durable internal numeric identity, scoped
+to its namespace. State/object classification stays in the canonical entry;
+changing that classification must not create a second slot for the same key.
+Store the full exact key in its canonical entry; a hash is never identity.
+Rebuild the resident name-to-slot lookup when
+opening the namespace. This uses the directory's numeric keys without adding
+an on-disk variable-length name tree. Slot identity is distinct from public
+generation, log index and body lifetime: metadata-only placeholders currently
+have lifetime zero, and body recreation must still get a fresh lifetime while
+retaining the existing generation-one semantics. Preserve required tombstones,
+live stages and decisions according to their logical policy; do not discard
+them merely because they have no body.
+
+Foreground mutations keep the bounded canonical append path. Completed frames
+are the indivisible replay units for compound mutations; streaming PUTs retain
+their current completion rules. Track changed slots and their resolved metadata
+under the existing namespace authority. A checkpoint captures a complete prefix
+and writes only its changed canonical metadata entries and changed directory
+paths. Unchanged metadata and body references remain shared. Publication selects
+that changed set, its exact coverage boundary and its high-water values together
+through the physical root protocol. A newer foreground suffix is replayed after
+that boundary; it cannot be accidentally included in an older capture.
+
+Maintain the incremental checkpoint from the first admitted mutation in a new
+experimental store. Bound the outstanding changed set and fund its complete
+checkpoint before admitting work that enlarges it. Finish a funded checkpoint
+before admitting a group that would exceed the current bound. A single compound
+group may exceed the usual target only with its complete capacity claim; never
+split its semantics to satisfy the target. This removes the bootstrap dependency
+on retaining an entire log until a first full namespace snapshot can fit.
+Capturing only changed slots is required; calling the current whole-namespace
+snapshot capture on every incremental checkpoint would preserve its CPU/memory
+cost even if fewer bytes were eventually written.
+
+Old canonical history remains owned until the selected checkpoint covers it,
+the superseded recoverable root is durably retired, and reader pins permit reuse.
+NoSync must protect both selected checkpoint data and the still-recoverable
+newer history. Checkpoint admission may force structural synchronization as it
+does today; measure that frequency and latency instead of assuming NoSync work
+has no barriers.
+
+#### Bounded encoded-range relocation
+
+Separate stable logical source offsets from their current physical ranges.
+Preserve existing payload references and crypto binding contexts while replacing
+only the physical mapping of a bounded range. A read window pins its mapping
+generation; it must not follow a replacement midway through a read. Source names
+remain logical labels, with no external file or persistent sidecar.
+
+Use at most the existing 16 KiB stream chunk as one relocation data unit, with
+page-granular fallback under fragmentation. Persist checksums for independently
+relocatable encoded pieces when foreground bytes become complete. Private
+canonical fixups must finalize the affected piece checksums before publication.
+This gives relocation an integrity check for the bytes it moves without reading
+the rest of a large body. Keep the canonical whole-payload CRC and transform
+validation too; a piece checksum is not a replacement for either.
+
+One relocation step reads and checks one piece, writes its replacement outside
+publication authority, validates the captured mapping, selects the new mapping
+durably and retires the old one through the root protocol. A concurrent change
+invalidates that candidate; it cannot overwrite a newer mapping. Physical piece
+ownership must participate in the same allocator/recovery walk as all other
+typed records. Do not hide pages behind an opaque pointer that recovery cannot
+account for.
+
+After checkpoint coverage makes old log records unnecessary, reclaim ranges
+with no remaining canonical, body, stage, decision or reader dependency. A
+source may become sparse only behind a prefix that replay no longer needs.
+Reading a required unmapped range is corruption, not EOF or zero-filled data.
+Relocate live ranges out of mixed pages so dead bytes can actually return
+capacity. Merely copying each partly live page unchanged would not establish
+reclaimable progress. Never require a replacement copy of the complete source
+or complete body to start this work.
+
+Readers may temporarily retain old pieces and delay progress; their close must
+make those pieces eligible without another namespace-sized rewrite. No producer
+holds namespace, allocator or root publication authority while supplying input
+or copying a body. A maintenance capacity claim does not grant a lock over
+unrelated producers.
+
+#### Standing admission and control owners
+
+The reserve is a computed obligation, not another fixed floor selected by
+guesswork. Conservatively account for the physical checkpoint workspace, the
+funded changed-slot checkpoint, a deletion with the largest retained required
+key/metadata, one relocation piece, and their routing, descriptor, publication
+and retirement dependencies. Count distinct simultaneously required ownership;
+share credits between phases only after the earlier dependency is durably
+retired and unpinned. Existing `ps_budget_plan_*` span and fragmentation bounds
+are inputs, not a proof of the complete new obligation.
+
+Foreground admission must preserve this free/claimed workspace before accepting
+a larger key, larger metadata, larger indivisible group or further private
+payload allocation. Failure preserves the selected logical state. Persist enough
+canonical information to reconstruct the obligation before recovery readmission;
+a lost process-local claim cannot turn protected workspace into foreground
+capacity. Release excess protection only after every state requiring it has
+been durably retired. Reader-held space is still owned and is not available
+reserve.
+
+Large indivisible transactions may still require operation-sized capacity.
+Reserve the completion obligations of admitted live participants; do not claim
+that incremental checkpoints make arbitrary atomic groups constant-sized. The
+design removes mandatory whole-namespace metadata and whole-source body copies
+from ordinary maintenance. It does not remove the storage lower bound of an
+indivisible operation. An all-live store can remain full; reclaimable work must
+make progress after obstructing pins drain. No silent growth, lower public key
+limit or external persistent staging is authorized.
+
+Complete the remaining logical control ownership through typed capabilities.
+The inspected public lease path still calls retention-work reservation checks;
+release uses transaction guards, and implicit transaction enrollment scans
+namespaces to locate its leader. Those calls currently reach retention journal
+paths, transaction lock files and directory walks in `lc_pouch_retention.c` and
+`lc_pouch_client.c`. Adapting only state bodies cannot establish public leased
+writes. Keep lease/transaction policy in the production engine, and give its
+retention journal, transaction authority and namespace enumeration explicit
+container owners. Do not treat the current exclusive open as proof of the final
+shared-root contract. Interprocess publication and reader-generation recovery
+remain required within the same file.
+
+#### Acceptance and cutover sequence
+
+Implementation would first replace experimental metadata checkpoint/replay from
+store creation, then add independently checked encoded mappings and bounded
+reclamation, then complete standing admission and control owners. Each stage
+needs its own failure proof before the next depends on it. Normal multifile
+Pouch remains the semantic and performance reference. Recreate experimental
+fixtures at the private representation change; add no legacy parser, migration,
+parallel experimental snapshot path or automatic format-version increment.
+Production deployment and existing-root conversion remain separate decisions.
+
+Acceptance must establish all of the following, beyond the current tests:
+
+- Atomic key-set, checkpoint-boundary and high-water selection, including
+  tombstones, placeholders, recreation, live stages and decisions. Reject
+  incomplete frames as a group and preserve corruption errors in selected data.
+- Checkpoint cost follows changed entries and paths, including the first
+  checkpoint and repeated one-key churn as total namespace metadata grows.
+  Neither the planning pass nor output can secretly walk/rewrite every key.
+- Bodies larger than the free maintenance workspace remain readable while
+  individual encoded pieces move. Verify piece corruption, private header
+  fixups, all codecs, pinned old mappings and partial-page reclamation.
+- Fill a fixed 10 MiB store through foreground admission, then delete and
+  reclaim across multiple namespaces after pins drain. Include the existing
+  60 KiB body keys and 1 MiB metadata-only keys, mixed live/dead pages, repeated
+  cycles and explicit 1 MiB growth tests. Measure actual recovered free space.
+- Cut allocation, I/O, sync and process execution across preparation, selection,
+  retirement and retry. Model selectively persisted writes separately from
+  process death, under both policies. Recover reserve accounting before allowing
+  any new producer, and keep unrelated dirty writers out of acknowledged work.
+- Reuse existing public behavior suites as each remaining owner is integrated.
+  Assert exactly one persistent file after success, failure and recovery, and
+  verify process-shared publication/reader generations before claiming the
+  shared-root portion of the full-backend goal complete.
+- Compare verified native GNU/musl, sanitizer and concurrency results and matched
+  performance with the frozen container and multifile baselines. Report usable
+  capacity, changed-entry work, mapping/checksum overhead, write amplification,
+  CPU, memory, barriers and worst maintenance latency. The current 240-trial
+  recovery comparison establishes none of these new maintenance claims.
+
+Approving this proposal would select the incremental architecture and authorize
+its experimental persistence changes. It would not select an unmeasured reserve
+number, waive the acceptance gates or authorize production cutover.
+
 ## Production state integration
 
 A private `ps_pouch_state_open` harness now connects ordinary production state
