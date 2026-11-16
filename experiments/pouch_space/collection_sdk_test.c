@@ -56,7 +56,7 @@ char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *s) {
   do {                                                                         \
     __atomic_add_fetch(&checks, 1U, __ATOMIC_RELAXED);                         \
     if (!(x)) {                                                                \
-      fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);                  \
+      fprintf(stderr, "%s:%d: %s [%s]\n", __FILE__, __LINE__, #x, scenario);   \
       abort();                                                                 \
     }                                                                          \
   } while (0)
@@ -80,13 +80,50 @@ typedef struct fixture {
   lc_collection *collection, *peer;
   lc_error error;
   const ps_io *io;
+  int worker_mode;
+  int opening_create;
 } fixture;
+static void background_drop_pending(fixture *);
+static void background_peer_prepare(fixture *, lc_collection_lock *);
+static void background_verify_empty(fixture *);
+static int background_operation(fixture *f, int cleanup, lc_error *e) {
+  lc_pouch_maintenance_options options = {0};
+  options.ns = "journal";
+  options.force = 1;
+  options.cleanup_only = cleanup;
+  return lc_pouch_maintenance_run(((lc_client_handle *)f->client)->pouch,
+                                  &options, NULL, e);
+}
+static int background_factory(void *context, const char *path,
+                              const lc_allocator *allocator,
+                              const lc_pouch_open_options *logical,
+                              lc_pouch **out, lc_error *e) {
+  fixture *f = context;
+  ps_pouch_state_options options = {0};
+  options.logical = *logical;
+  options.logical.compaction_interval_seconds =
+      f->worker_mode == 1 ? 1U : 3600U;
+  options.logical.compaction_min_segment_count = 1UL;
+  options.logical.compaction_min_reclaimable_bytes = 1U;
+  options.logical.compaction_delete_grace_seconds = 1U;
+  options.logical.terminal_reclaim_min_bytes = 1U;
+  options.logical.compaction_throttling_disabled = 1;
+  options.io = f->io;
+  return ps_pouch_state_open(path, f->opening_create, allocator, &options, out,
+                             e);
+}
 static void open_client(fixture *f, int create) {
   ps_pouch_client_options physical = {0};
+  f->opening_create = create;
   physical.io = f->io;
-  ok(ps_pouch_client_open(&f->config, create, f->io ? &physical : NULL,
-                          &f->client, &f->error),
-     &f->error);
+  if (f->worker_mode)
+    ok(lc_client_open_with_pouch_factory(&f->config, background_factory, f,
+                                         &f->client, &f->error),
+       &f->error);
+  else
+    ok(ps_pouch_client_open(&f->config, create, f->io ? &physical : NULL,
+                            &f->client, &f->error),
+       &f->error);
 }
 static void open_collection(fixture *f, int create, lc_collection **out) {
   lc_collection_config config;
@@ -104,17 +141,19 @@ static int unexpected_collection(void *context, const lc_collection_info *info,
                       "a missing namespace must have an empty collection list",
                       NULL, NULL, "test");
 }
-static void setup_io(fixture *f, const char *directory, int codec, int sync,
-                     int rotate, const ps_io *io) {
+static void setup_io_mode(fixture *f, const char *directory, int codec,
+                          int sync, int rotate, const ps_io *io,
+                          int worker_mode) {
   memset(f, 0, sizeof(*f));
   lc_error_init(&f->error);
   f->io = io;
+  f->worker_mode = worker_mode;
   REQUIRE(snprintf(f->path, sizeof(f->path), "%s/root-%zu", directory,
                    roots++) > 0);
   REQUIRE(snprintf(f->endpoint, sizeof(f->endpoint),
-                   "pouch://%s?single_writer=true&background_compaction=false&"
+                   "pouch://%s?single_writer=true&background_compaction=%s&"
                    "query_indexing=false&queue_watch=false&query_engine=scan",
-                   f->path) > 0);
+                   f->path, worker_mode ? "true" : "false") > 0);
   f->endpoints[0] = f->endpoint;
   lc_client_config_init(&f->config);
   lc_pouch_settings_init(&f->settings);
@@ -147,6 +186,10 @@ static void setup_io(fixture *f, const char *directory, int codec, int sync,
      &f->error);
   open_collection(f, 1, &f->collection);
   open_collection(f, 0, &f->peer);
+}
+static void setup_io(fixture *f, const char *directory, int codec, int sync,
+                     int rotate, const ps_io *io) {
+  setup_io_mode(f, directory, codec, sync, rotate, io, 0);
 }
 static void setup(fixture *f, const char *directory, int codec, int sync,
                   int rotate) {
@@ -1033,6 +1076,7 @@ static size_t io_trial(const char *directory, int codec, int sync,
   lc_collection_edit_status_res receipt;
   lc_collection_edit_range range = {0U, 1U};
   lc_collection_head_res head;
+  lc_collection_lock peer_pin = {0};
   producer p;
   int rc;
   snprintf(scenario, sizeof(scenario),
@@ -1064,6 +1108,8 @@ static size_t io_trial(const char *directory, int codec, int sync,
   ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
   lc_collection_config_init(&config);
   config.name = "created";
+  if (operation == 8)
+    config.ns = "new-work";
   lc_collection_append_req_init(&req);
   req.append_id = operation == 1 ? "new-append" : "replacement";
   lc_collection_edit_req_init(&edit);
@@ -1073,20 +1119,29 @@ static size_t io_trial(const char *directory, int codec, int sync,
   edit.range_count = 1U;
   edit.replacement = &req;
   producer_init(&p, operation == 1 ? 73728U : 512U);
+  if (operation == 7)
+    background_drop_pending(&f);
+  if (operation == 9)
+    background_peer_prepare(&f, &peer_pin);
   m.armed = 1;
-  if (operation == 0)
+  if (operation == 0 || operation == 8)
     rc = lc_client_create_collection(f.client, &config, &created, &f.error);
   else if (operation == 1)
     rc = lc_collection_append_staged(f.collection, &req, &p.source, &appended,
                                      &f.error);
   else if (operation == 2)
     rc = lc_collection_edit(f.collection, &edit, &p.source, &edited, &f.error);
+  else if (operation == 9)
+    rc = lc_collection_head(f.peer, &head, &f.error);
+  else if (operation >= 6)
+    rc = background_operation(&f, operation == 7, &f.error);
   else if (operation >= 4)
     rc = ps_pouch_collection_maintain(f.collection, 1, operation == 5, NULL,
                                       &f.error);
   else
     rc = lc_collection_drop(f.collection, &f.error);
   m.armed = 0;
+  lc_collection_lock_leave(&peer_pin);
   size_t calls = m.calls;
   if (cut) {
     if (!m.fired || rc == LC_OK)
@@ -1105,7 +1160,9 @@ static size_t io_trial(const char *directory, int codec, int sync,
   /* Reopen through ordinary I/O: only modeled stable bytes survived. */
   f.io = NULL;
   open_client(&f, 0);
-  if (operation == 0) {
+  if (operation == 7) {
+    background_verify_empty(&f);
+  } else if (operation == 0 || operation == 8) {
     rc = lc_client_open_collection(f.client, &config, &created, &f.error);
     REQUIRE(rc == LC_OK ||
             (rc == LC_ERR_INVALID && f.error.server_code &&
@@ -1118,7 +1175,7 @@ static size_t io_trial(const char *directory, int codec, int sync,
     created = NULL;
     clear(&f.error);
     open_collection(&f, 0, &f.collection);
-    read_entry(f.collection, 1U, 80U, &f.error);
+    read_entry(f.collection, 1U, operation == 8 ? 73728U : 80U, &f.error);
   } else if (operation == 3) {
     lc_collection_config_init(&config);
     config.name = "events/\303\245";
@@ -1201,6 +1258,7 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
   lc_collection_edit_status_res receipt;
   lc_collection_edit_range range = {0U, 1U};
   lc_collection_head_res head;
+  lc_collection_lock peer_pin = {0};
   lc_collection_lease_req lease;
   lc_collection_read_res read;
   consumer output;
@@ -1222,7 +1280,10 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
   }
   ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
   lc_collection_config_init(&config);
-  config.name = operation == 0 ? "created" : "events/\303\245";
+  config.name =
+      operation == 0 || operation == 11 ? "created" : "events/\303\245";
+  if (operation == 11)
+    config.ns = "new-work";
   lc_collection_append_req_init(&req);
   req.append_id = operation == 1 ? "new-append" : "replacement";
   lc_collection_edit_req_init(&edit);
@@ -1243,11 +1304,15 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     close_store(&f);
     open_client(&f, 0);
   }
+  if (operation == 10)
+    background_drop_pending(&f);
+  if (operation == 12)
+    background_peer_prepare(&f, &peer_pin);
   allocation_calls = allocation_fired = 0;
   allocation_fail = cut;
   allocation_thread = pthread_self();
   __atomic_store_n(&allocation_armed, 1, __ATOMIC_RELEASE);
-  if (operation == 0)
+  if (operation == 0 || operation == 11)
     rc = lc_client_create_collection(f.client, &config, &extra, &f.error);
   else if (operation == 1)
     rc = lc_collection_append_staged(f.collection, &req, &p.source, &appended,
@@ -1260,6 +1325,10 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     rc = lc_collection_read(f.collection, NULL, &output.sink, &read, &f.error);
   else if (operation == 5)
     rc = lc_client_open_collection(f.client, &config, &extra, &f.error);
+  else if (operation == 12)
+    rc = lc_collection_head(f.peer, &head, &f.error);
+  else if (operation >= 9)
+    rc = background_operation(&f, operation == 10, &f.error);
   else if (operation >= 7)
     rc = ps_pouch_collection_maintain(f.collection, 1, operation == 8, NULL,
                                       &f.error);
@@ -1267,12 +1336,16 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     rc = lc_client_list_collections(f.client, NULL, listed, &listed_count,
                                     &f.error);
   __atomic_store_n(&allocation_armed, 0, __ATOMIC_RELEASE);
+  lc_collection_lock_leave(&peer_pin);
   size_t calls = allocation_calls;
   if (cut) {
-    if (!allocation_fired || rc == LC_OK)
+    if (!allocation_fired || (rc == LC_OK && operation != 9 && operation != 10))
       fprintf(stderr, "%s fired=%d rc=%d calls=%zu\n", scenario,
               allocation_fired, rc, calls);
-    REQUIRE(allocation_fired && rc != LC_OK);
+    /* Physical collection after a committed checkpoint may defer free-list
+     * allocation without failing the logical pass. Retrying must finish it. */
+    REQUIRE(allocation_fired &&
+            (rc != LC_OK || operation == 9 || operation == 10));
   } else
     ok(rc, &f.error);
   clear(&f.error);
@@ -1282,6 +1355,20 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     extra = NULL;
   }
   lc_collection_close(extra);
+  extra = NULL;
+  if (operation == 11) {
+    int opened = lc_client_open_collection(f.client, &config, &extra, &f.error);
+    REQUIRE(opened == LC_OK ||
+            (opened == LC_ERR_INVALID && f.error.server_code &&
+             !strcmp(f.error.server_code, "collection_not_found")));
+    if (opened == LC_OK) {
+      ok(lc_collection_head(extra, &head, &f.error), &f.error);
+      REQUIRE(!head.upper_position && !head.live_count);
+    }
+    lc_collection_close(extra);
+    extra = NULL;
+    clear(&f.error);
+  }
   if (operation == 5)
     open_collection(&f, 0, &f.collection);
   if (operation == 1) {
@@ -1293,7 +1380,9 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     else
       (void)append(f.collection, "new-append", 73728U, &f.error);
   }
-  if (operation == 2) {
+  if (operation == 10) {
+    background_verify_empty(&f);
+  } else if (operation == 2) {
     ok(lc_collection_edit_status(f.collection, "allocation-edit", &receipt,
                                  &f.error),
        &f.error);
@@ -1301,14 +1390,19 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
                receipt.found ? 512U : 80U, &f.error);
   } else
     read_entry(f.collection, 1U, operation >= 7 ? 73728U : 80U, &f.error);
-  reopen(&f);
+  if (operation == 10) {
+    close_store(&f);
+    open_client(&f, 0);
+    background_verify_empty(&f);
+  } else
+    reopen(&f);
   if (operation == 2) {
     ok(lc_collection_edit_status(f.collection, "allocation-edit", &receipt,
                                  &f.error),
        &f.error);
     read_entry(f.collection, receipt.found ? 2U : 1U,
                receipt.found ? 512U : 80U, &f.error);
-  } else
+  } else if (operation != 10)
     read_entry(f.collection, 1U, operation >= 7 ? 73728U : 80U, &f.error);
   uint64_t reclaimed, skipped;
   ok(ps_root_reclaim_orphans(client_root(&f), &reclaimed, &skipped, &f.error),
@@ -1331,17 +1425,22 @@ static void allocation_failures(const char *directory, int codec, int sync) {
   printf("SDK allocation codec=%d durable=%d cuts=%zu passed\n", codec, sync,
          cuts);
 }
+#include "collection_background_cases.h"
 #include "collection_maintenance_cases.h"
 int main(int argc, char **argv) {
   char path[1024], directory[1024];
   lc_error e;
   REQUIRE(
       argc == 2 || (argc == 3 && !strcmp(argv[2], "live")) ||
-      (argc == 5 && (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
-                     !strcmp(argv[2], "maintenance") ||
-                     !strcmp(argv[2], "maintenance-live") ||
-                     !strcmp(argv[2], "maintenance-io") ||
-                     !strcmp(argv[2], "maintenance-allocation"))) ||
+      (argc == 5 &&
+       (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+        !strcmp(argv[2], "maintenance") ||
+        !strcmp(argv[2], "maintenance-live") ||
+        !strcmp(argv[2], "maintenance-io") ||
+        !strcmp(argv[2], "maintenance-allocation") ||
+        !strcmp(argv[2], "background") || !strcmp(argv[2], "background-live") ||
+        !strcmp(argv[2], "background-io") ||
+        !strcmp(argv[2], "background-allocation"))) ||
       (argc == 8 && !strcmp(argv[2], "io-one")));
   REQUIRE(snprintf(path, sizeof(path), "%s/pouch-collection-sdk-XXXXXX",
                    argv[1]) > 0);
@@ -1355,7 +1454,35 @@ int main(int argc, char **argv) {
   } else if (argc == 5) {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strcmp(argv[2], "maintenance") || !strcmp(argv[2], "maintenance-live"))
+    if (!strcmp(argv[2], "background") || !strcmp(argv[2], "background-live"))
+      background_suite(directory, codec, sync, !strcmp(argv[2], "background"));
+    else if (!strcmp(argv[2], "background-io")) {
+      size_t cuts = 0U;
+      for (int operation = 6; operation < 10; ++operation) {
+        size_t calls = io_trial(directory, codec, sync, operation, 0, 0U);
+        REQUIRE(calls);
+        for (int mode = 0; mode < 4; ++mode)
+          for (size_t cut = 1U; cut <= calls; ++cut) {
+            (void)io_trial(directory, codec, sync, operation, mode, cut);
+            ++cuts;
+          }
+      }
+      printf("background I/O codec=%d durable=%d cuts=%zu passed\n", codec,
+             sync, cuts);
+    } else if (!strcmp(argv[2], "background-allocation")) {
+      size_t cuts = 0U;
+      for (int operation = 9; operation < 13; ++operation) {
+        size_t calls = allocation_trial(directory, codec, sync, operation, 0U);
+        REQUIRE(calls);
+        for (size_t cut = 1U; cut <= calls; ++cut) {
+          (void)allocation_trial(directory, codec, sync, operation, cut);
+          ++cuts;
+        }
+      }
+      printf("background allocation codec=%d durable=%d cuts=%zu passed\n",
+             codec, sync, cuts);
+    } else if (!strcmp(argv[2], "maintenance") ||
+               !strcmp(argv[2], "maintenance-live"))
       maintenance_suite(directory, codec, sync,
                         !strcmp(argv[2], "maintenance"));
     else if (!strcmp(argv[2], "maintenance-io")) {

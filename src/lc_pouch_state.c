@@ -9813,7 +9813,7 @@ int lc_pouch_state_snapshot_capture(lc_pouch *pouch,
   if (rc == LC_OK && lc_pouch_state_cache_has_live_staged_records(&cache))
     rc = lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
                       "container live staged maintenance is pending", NULL,
-                      NULL, "pouch");
+                      "pouch_live_staged", "pouch");
   if (rc == LC_OK)
     rc = lc_pouch_state_cache_record_index_build(
         pouch, &cache, &snapshot->records, &snapshot->count, error);
@@ -12775,6 +12775,76 @@ int lc_pouch_state_retention_has_expiring_locked(lc_pouch *pouch,
   return rc;
 }
 
+typedef struct lc_pouch_storage_age_work {
+  lc_pouch *pouch;
+  const lc_pouch_maintenance_options *options;
+  lc_pouch_maintenance_result *out;
+} lc_pouch_storage_age_work;
+static int lc_pouch_storage_age_sweep(void *context, lc_error *error) {
+  lc_pouch_storage_age_work *work = context;
+  return lc_pouch_state_retention_sweep(
+      work->pouch, work->options->ns,
+      work->options->retention_updated_before_unix, work->out, error);
+}
+/* The common retention engine and worker own logical policy. The storage
+ * owner supplies physical snapshot/cleanup operations, without keeping the
+ * logical namespace lock across a producer-to-consumer copy. */
+static int lc_pouch_storage_maintenance_run(
+    lc_pouch *pouch, const lc_pouch_maintenance_options *options,
+    lc_pouch_maintenance_result *out, lc_error *error) {
+  lc_pouch_maintenance_result local_out = {0}, retention = {0};
+  lc_pouch_storage_age_work age;
+  lc_error local_error;
+  int rc;
+  lc_error_init(&local_error);
+  if (!error)
+    error = &local_error;
+  if (!out)
+    out = &local_out;
+  memset(out, 0, sizeof(*out));
+  if (!pouch->storage.ops->maintenance) {
+    rc = lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                      "storage owner has no maintenance capability", NULL, NULL,
+                      "pouch");
+    goto done;
+  }
+  out->ns = lc_strdup_with_allocator(&pouch->allocator, options->ns);
+  if (!out->ns) {
+    rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
+                      "cannot retain maintenance namespace", NULL, NULL,
+                      "pouch");
+    goto done;
+  }
+  rc = lc_pouch_writer_mode_operation_begin(pouch, error);
+  if (rc != LC_OK)
+    goto done;
+  if (!options->cleanup_only)
+    rc = lc_pouch_retention_run(pouch, options->ns,
+                                LC_POUCH_RETENTION_ATTEMPT_LIMIT, &retention,
+                                error);
+  if (rc == LC_OK)
+    rc = pouch->storage.ops->maintenance->state_run(pouch->storage.context,
+                                                    pouch, options, out, error);
+  if (rc == LC_OK && options->retention_updated_before_unix > 0) {
+    age.pouch = pouch;
+    age.options = options;
+    age.out = out;
+    rc = lc_pouch_state_with_namespace_lock(
+        pouch, options->ns, lc_pouch_storage_age_sweep, &age, error);
+  }
+  if (rc == LC_OK)
+    rc = lc_collection_maintenance_run(pouch, options, out, error);
+  out->retention_scanned_count += retention.retention_scanned_count;
+  out->retention_expired_count += retention.retention_expired_count;
+  out->retention_deleted_state_count += retention.retention_deleted_state_count;
+  out->retention_failed_count += retention.retention_failed_count;
+  lc_pouch_writer_mode_operation_end(pouch);
+done:
+  lc_pouch_maintenance_result_cleanup(&pouch->allocator, &retention);
+  lc_pouch_maintenance_result_cleanup(&pouch->allocator, &local_out);
+  lc_error_cleanup(&local_error);
+  return rc;
+}
 int lc_pouch_maintenance_run(lc_pouch *pouch,
                              const lc_pouch_maintenance_options *options,
                              lc_pouch_maintenance_result *out,
@@ -12792,6 +12862,8 @@ int lc_pouch_maintenance_run(lc_pouch *pouch,
   if (pouch == NULL || ns == NULL || ns[0] == '\0') {
     return lc_pouch_maintenance_run_locked(pouch, options, out, error);
   }
+  if (pouch->storage.ops)
+    return lc_pouch_storage_maintenance_run(pouch, options, out, error);
   rc = lc_pouch_writer_mode_operation_begin(pouch, error);
   if (rc != LC_OK) {
     return rc;

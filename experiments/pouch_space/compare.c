@@ -77,6 +77,7 @@ struct comparison {
                     */
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
   int compaction; /* Force one pass per namespace after the two PUT rounds. */
+  int namespace_maintenance; /* Same public namespace pass for both owners. */
   int durable_scope; /* Force durability after both PUT rounds per writer. */
   int staged; /* Stage each body and publish its existing canonical LINK batch.
                */
@@ -1174,6 +1175,18 @@ static int compare_double(const void *a, const void *b) {
 static void compact_all(comparison *c, lc_error *e) {
   size_t i;
   char ns[64], name[64];
+  if (c->collection && c->namespace_maintenance) {
+    lc_pouch_maintenance_options options = {0};
+    lc_pouch_maintenance_result result = {0};
+    options.ns = "bench";
+    options.force = 1;
+    check(lc_pouch_maintenance_run(c->pouch, &options, &result, e), e);
+    require(result.compacted_collection_count == c->writers &&
+                result.cleanup_deleted_count && !result.cleanup_pending_count,
+            "namespace maintenance covers every independent collection");
+    lc_pouch_maintenance_result_cleanup(NULL, &result);
+    return;
+  }
   for (i = 0; i < c->writers; ++i) {
     if (c->collection) {
       lc_pouch_maintenance_result result = {0};
@@ -1261,7 +1274,8 @@ int main(int argc, char **argv) {
           "runtime-scan-bodies|pouch-scan-bodies|"
           "runtime-scan-metadata|pouch-scan-metadata|"
           "stream-collection|pouch-collection|runtime-collection|"
-          "pouch-collection-compact|runtime-collection-compact "
+          "pouch-collection-compact|runtime-collection-compact|"
+          "pouch-collection-maintain|runtime-collection-maintain "
           "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
           stderr);
     return 2;
@@ -1276,6 +1290,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "runtime-collection") ||
               !strcmp(argv[1], "pouch-collection-compact") ||
               !strcmp(argv[1], "runtime-collection-compact") ||
+              !strcmp(argv[1], "pouch-collection-maintain") ||
+              !strcmp(argv[1], "runtime-collection-maintain") ||
               !strcmp(argv[1], "stream-state") ||
               !strcmp(argv[1], "runtime-state") ||
               !strcmp(argv[1], "runtime-metadata") ||
@@ -1306,7 +1322,8 @@ int main(int argc, char **argv) {
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
   c.sdk = strstr(argv[1], "-sdk-") != NULL;
-  c.compaction = strstr(argv[1], "compact") != NULL;
+  c.namespace_maintenance = strstr(argv[1], "maintain") != NULL;
+  c.compaction = strstr(argv[1], "compact") != NULL || c.namespace_maintenance;
   c.durable_scope = strstr(argv[1], "scope") != NULL;
   c.staged = strstr(argv[1], "staged") != NULL;
   c.read_method = strstr(argv[1], "read-many")       ? 1

@@ -94,6 +94,22 @@ int ps_namespace_retention_hint_get(ps_namespace *ns, int *out, lc_error *e) {
    * poison. */
   return retention_read(ns, out, e);
 }
+int ps_namespace_retention_hint_present(ps_namespace *ns, int *out,
+                                        lc_error *e) {
+  ps_reader *reader = NULL;
+  int rc;
+  if (!ns || !out)
+    return failure(e, LC_ERR_INVALID, "retention discovery requires output");
+  *out = 0;
+  rc = ps_read_open(ns->root->space, control(ns, 2), NULL, &reader, e);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    rc = LC_OK;
+  } else if (rc == LC_OK)
+    *out = 1;
+  ps_reader_close(reader);
+  return rc;
+}
 int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;
   unsigned char bytes[32];

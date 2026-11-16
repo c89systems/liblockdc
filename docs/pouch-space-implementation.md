@@ -1942,10 +1942,107 @@ optimization work despite the favorable timings in this workload.
 This stage preserves the existing full-snapshot compaction algorithm. Copying
 still needs foreground free capacity; there is no implicit growth or guarantee
 of maintenance admission at full capacity. The incremental-checkpoint and
-protected-capacity proposal above still awaits a decision. Background collection
-discovery/retention, indexed queries, shared-root operation and the remaining
-queue/external-XA integration remain unfinished. The complete backend goal is
-not achieved by this maintenance stage.
+protected-capacity proposal above still awaits a decision. Background discovery
+and retention are integrated in the following stage. Indexed queries,
+shared-root operation and the remaining queue/external-XA integration remain
+unfinished. The complete backend goal is not achieved by this maintenance stage.
+
+## Background and namespace maintenance
+
+The experimental owner now admits the common background scheduler and public
+`lc_pouch_maintenance_run` namespace pass. Typed storage callbacks own durable
+work discovery and physical state/collection maintenance. The common engine
+retains retention policy, explicit age sweeping, force/cleanup-only semantics,
+cadence, coalescing, fairness and worker lifetime. Native roots retain their
+four existing work sources; container roots add a separate durable ordinary-state
+source, so continuous volatile queued writes cannot starve cold ordinary work.
+Opening arms existing work without waiting for a new mutation. Close joins the
+worker before releasing physical ownership; maintenance receivers retain their
+physical owner without retaining the SDK client being closed.
+
+Ordinary, terminal and collection hints use `PS_CONTROL` slots 4, 5 and 6 under
+the immutable namespace owner. Each value is exactly 32 bytes: `LCPSWORK`, owner
+identity, work kind and a CRC32 stored in a 64-bit field. Hints precede physical
+work and are durable under both root policies. They are advisory discovery
+metadata, not decision authority or another outcome log. Discovery selects
+metadata presence without reading hint values, ordinary segments, collection
+bodies or resident projections. Consumption validates the selected hint.
+Malformed contents therefore fail their namespace pass while the lexical
+cursor can continue to healthy namespaces. Retention discovery uses the same
+presence-only policy; its existing consuming codec is unchanged.
+
+The namespace pass shares ordinary expiry/age policy with the common engine,
+then applies physical compaction thresholds and common collection retention and
+compaction. Ordinary copying uses bounded buffers outside namespace authority;
+live staged records and unfinished physical producers defer ordinary compaction
+while collection work can progress. Terminal hint retirement rechecks the
+current tail under namespace authority. Collection discovery captures durable
+catalog names and identities, then revalidates revision/target before admitting
+one receiver at a time. Dropped or replaced names cannot redirect captured work.
+An empty namespace retains its hint while an unbound target remains pinned or
+open. Reclamation and the final checkpoint release retired physical capacity.
+
+Two integration defects are corrected in this surface. Orphan cleanup now
+accepts an already absent collection head, allowing retry when head deletion
+succeeds but identity retirement fails. A peer's disposable projection can also
+lag a compactor's selected snapshot, including when an active upload prevents
+ordinary preparation. The container refreshes that receiver's projections from
+the captured canonical topology under metadata authority. This uses the common
+bounded replay engine without acquiring append authority, repairing/truncating
+canonical storage, or changing the producer's private suffix. Deterministic
+tests hold append authority and repeat peer head/body/status reads inside a real
+producer callback; the completed upload and prior body survive reopen.
+
+Qualification artifacts are in `build/pouch-space-background/`:
+
+- The initial 95-group Debug qualification and targeted test-expectation
+  corrections have passing evidence in `surface-debug.log`,
+  `surface-debug-corrections.log`, `surface-debug-retention.log` and their
+  `-details.log` files. The peer refresh repair then passed **55 affected groups**
+  across `surface-peer-focused.log` and `surface-peer-debug.log`, including
+  **3,808 I/O cuts and 1,954 allocation cuts**. Their detail logs retain per-codec
+  counts. This covers namespace passes, first hint publication, interrupted
+  drops, peer refresh failures, native/SDK/Lua collection behavior, cold
+  discovery, malformed hints, expiry during continuous writes and close during
+  active copying. Debug used ASan/UBSan, the actual 128 KiB worker initializer
+  and disabled glibc stack caching.
+- GNU Release and musl Release initially passed 23 groups each; after the peer
+  repair each passed the 20 affected collection/maintenance/comparison groups
+  (`surface-final-gnu.log`, `surface-final-musl.log`). GNU used ordinary platform
+  worker stacks; musl used its default worker stacks.
+- ThreadSanitizer passed all eight live codec/durability configurations after
+  the repair, with linked instrumented OpenSSL 3.6.5, actual 128 KiB workers and
+  no suppressions (`surface-final-tsan.log`, `relink-tsan.sh`). Its earlier run
+  exposed the stale-peer projection defect above; the deterministic regression
+  is now included in every configuration.
+- Memcheck passed the plain and encrypted/compressed live paths under both
+  policies: **81,629 allocations/frees**, zero remaining blocks, errors or
+  suppressions, and only three inherited descriptors (`surface-memcheck.log`,
+  `memcheck-*.log`). Intentional process-death tests are excluded from live
+  sanitizer/memory checks; cold interrupted-drop recovery runs in Debug and
+  release behavior checks.
+
+The normal GNU Release comparison records **96 verified rows / 48 matched
+pairs**, three samples over 16 configurations. Both owners run the same public
+namespace pass over one/four independent collections, with 24 x 4 KiB or
+8 x 64 KiB workloads, both root policies and new/preopened owners. Both use
+64 KiB segment targets, zero deletion grace and no throttle; container timing
+includes the final physical checkpoint. The middle sample reverses engine order
+and OS cache is retained. Raw results and driver are
+`surface-paired-performance.log` and `paired-performance.sh`. Per-configuration
+medians of paired native/container maintenance-time ratios span **1.13-2.68x**
+(median **1.44x**); CPU ratios span 1.00-1.96x (median 1.34x). The container uses
+**20-95 sync calls**, versus native's 17-70, and retains one persistent file
+versus 27-77 native files. These are development observations, not cold-device
+or production timing claims. Higher barrier counts remain optimization work.
+
+This surface does not change full-snapshot capacity requirements: maintenance
+may still need foreground free space, and there is no implicit growth or
+guaranteed admission at full capacity. The incremental-checkpoint/protected
+capacity proposal remains unapproved. Indexed queries, queues/outbox, complete
+external XA, resumable codec conversion, shared-root coordination/recovery and
+deployment acceptance remain outside this completed maintenance surface. The
+complete backend goal remains active.
 
 ## Integration and acceptance
 
@@ -1979,9 +2076,11 @@ namespace IDs and crypto provider. Stream catalogs are scoped to those IDs.
 Namespace heads, segment ownership/rotation and bounded canonical replay now use
 this owner too. The private ordinary-state harness now uses the production
 projection, ordinary mutation policy, read-many, visits and paged scan/body
-snapshots, staged/prepared mutations and the SDK call envelope above. Live-stage
-maintenance, retention/lease/queue/XA ownership, indexed queries and public
-collection ownership still require integration. Normal `lc_pouch_open` uses
+snapshots, staged/prepared mutations and the SDK call envelope above. Leased
+state, expiry, public collection ownership and explicit/background maintenance
+use the typed owners described above. Live stages defer ordinary compaction;
+indexed queries, queues/outbox and complete external XA still require
+integration. Normal `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open
 ownership; it does not implement shared-root coordination.
 
@@ -2029,9 +2128,9 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Remaining integration includes indexed-query owners, background collection
-discovery/retention scheduling, queues/outbox, complete external XA ownership
-and shared-root coordination. Core collection positions and retry receipts now
+Remaining integration includes indexed-query owners, queues/outbox, complete
+external XA ownership and shared-root coordination. Core collection positions
+and retry receipts now
 run through the container owner above. Normal public Pouch tests continue to
 exercise the segmented backend through the shared typed storage boundaries.
 

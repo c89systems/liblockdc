@@ -429,8 +429,9 @@ int ps_ns_enter(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
   pthread_mutex_lock(&d->mutex);
   if (d->busy)
-    rc = failure(e, LC_ERR_INVALID,
-                 "namespace already has an active producer or rotation");
+    rc = lc_error_set(e, LC_ERR_INVALID, 0L,
+                      "namespace already has an active producer or rotation",
+                      NULL, "pouch_namespace_busy", "pouch");
   else
     d->busy = 1;
   pthread_mutex_unlock(&d->mutex);

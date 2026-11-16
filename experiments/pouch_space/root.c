@@ -258,6 +258,17 @@ corrupt:
   return failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
                  "pouch namespace binding is not an immutable metadata owner");
 }
+static int namespace_locks_init(ps_namespace *ns, lc_error *error) {
+  if (pthread_mutex_init(&ns->collection_catalog, NULL) != 0)
+    return failure(error, LC_ERR_TRANSPORT, NULL,
+                   "cannot initialize collection catalog authority");
+  if (pthread_mutex_init(&ns->maintenance, NULL) != 0) {
+    pthread_mutex_destroy(&ns->collection_catalog);
+    return failure(error, LC_ERR_TRANSPORT, NULL,
+                   "cannot initialize namespace work authority");
+  }
+  return LC_OK;
+}
 int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
                               ps_namespace **out, lc_error *error) {
   ps_namespace *ns, *fresh = NULL, *dead = NULL;
@@ -288,10 +299,8 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
                      "cannot allocate namespace owner");
       if (rc == LC_OK)
         rc = index_room(root, error);
-      if (rc == LC_OK &&
-          pthread_mutex_init(&fresh->collection_catalog, NULL) != 0)
-        rc = failure(error, LC_ERR_TRANSPORT, NULL,
-                     "cannot initialize collection catalog authority");
+      if (rc == LC_OK)
+        rc = namespace_locks_init(fresh, error);
       if (rc == LC_OK) {
         ns = fresh;
         fresh = NULL;
@@ -347,6 +356,7 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
   }
   if (dead) {
     pthread_mutex_destroy(&dead->collection_catalog);
+    pthread_mutex_destroy(&dead->maintenance);
     lc_free_with_allocator(NULL, dead->name);
     lc_free_with_allocator(NULL, dead);
   }
@@ -503,6 +513,7 @@ int ps_root_close(ps_root *root, lc_error *error) {
   for (ns = root->namespaces; ns; ns = next) {
     next = ns->next;
     pthread_mutex_destroy(&ns->collection_catalog);
+    pthread_mutex_destroy(&ns->maintenance);
     lc_free_with_allocator(NULL, ns->name);
     lc_free_with_allocator(NULL, ns);
   }

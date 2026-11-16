@@ -1540,8 +1540,7 @@ static void retention_recovered(lc_pouch *p, int action, int completed,
   m->read_bytes = 0;
   ok(lc_pouch_retention_hint_next(p, NULL, &name, &cursor, e), e);
   REQUIRE((name != NULL) == present && (cursor != NULL) == present &&
-          (!present || !strcmp(name, "work/a")) &&
-          m->read_bytes == (present ? 32 : 0));
+          (!present || !strcmp(name, "work/a")) && m->read_bytes == 0);
   lc_free_with_allocator(&p->allocator, name);
   lc_free_with_allocator(&p->allocator, cursor);
 }
@@ -1605,7 +1604,9 @@ static void retention_io_faults(const char *directory) {
           if (!cut) {
             ok(rc, &e);
             sites = m.fault.calls;
-            REQUIRE(sites);
+            /* Discovery uses resident catalog metadata without reading the
+             * hint value. The consuming work operations still perform I/O. */
+            REQUIRE(action == 5 ? sites == 0U : sites > 0U);
             if (action == 6) {
               ok(ps_status(space, &after, &e), &e);
               REQUIRE(after.checkpoints > before.checkpoints &&
@@ -2337,10 +2338,13 @@ static void guard_faults(const char *directory) {
         p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
         size_t count = mutex_init_calls;
         mutex_init_armed = 0;
-        REQUIRE(count >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES);
+        REQUIRE(count >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES + 1U);
         lc_pouch_close(p);
         REQUIRE(!live);
-        for (size_t cut = 1; cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++cut)
+        /* The scheduler mutex follows the transaction stripes. Exercise both
+         * phases, including opening with background work disabled. */
+        for (size_t cut = 1; cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES + 1U;
+             ++cut)
           for (int no_error = 0; no_error < 2; ++no_error) {
             ps_pouch_state_options o = {0};
             o.logical.single_writer = o.logical.single_writer_set = 1;
@@ -2351,7 +2355,8 @@ static void guard_faults(const char *directory) {
             o.io = &io;
             p = NULL;
             mutex_init_calls = 0;
-            mutex_init_fail = count - LC_POUCH_STORAGE_TXN_GUARD_STRIPES + cut;
+            mutex_init_fail =
+                count - LC_POUCH_STORAGE_TXN_GUARD_STRIPES - 1U + cut;
             mutex_init_armed = 1;
             int rc = ps_pouch_state_open(path, 0, &allocator, &o, &p,
                                          no_error ? NULL : &e);
@@ -2361,7 +2366,9 @@ static void guard_faults(const char *directory) {
                 no_error ||
                 (e.message &&
                  !strcmp(e.message,
-                         "cannot initialize container transaction guards")));
+                         cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES
+                             ? "cannot initialize container transaction guards"
+                             : "failed to initialize pouch compaction mutex")));
             clear(&e);
             unlocked(path);
           }

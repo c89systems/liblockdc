@@ -113,6 +113,7 @@ int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
   ps_owned_head *head;
   ps_owned_status status;
   ps_key control;
+  ps_reader *value = NULL;
   size_t i, j;
   int rc = ps_collection_resources_capture(storage, owner, &list, e);
   for (i = 0U; rc == LC_OK && i < list.count; ++i) {
@@ -134,7 +135,16 @@ int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
   control.owner = owner;
   control.key = 1U;
   control.kind = PS_CONTROL;
-  if (rc == LC_OK)
-    rc = ps_delete(storage, control, e);
+  if (rc == LC_OK) {
+    rc = ps_read_open(storage, control, NULL, &value, e);
+    if (rc == LC_ERR_INVALID) {
+      /* A prior pass may have removed the head control before identity
+       * retirement failed. Unpublished construction can also have no head. */
+      lc_error_cleanup(e);
+      rc = LC_OK;
+    } else if (rc == LC_OK)
+      rc = ps_delete(storage, control, e);
+  }
+  ps_reader_close(value);
   return rc;
 }

@@ -529,6 +529,24 @@ static int orphan(ps_entry *p, uint64_t prefix) {
   return !p->catalog_refs && !p->catalog_pins && !p->stream_open &&
          p->catalog_release <= prefix;
 }
+int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
+  ps_entry *p;
+  size_t i;
+  int rc;
+  if (!s || !out)
+    return cat_error(e, LC_ERR_INVALID, "orphan work test requires output");
+  *out = 0;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_healthy(s, e);
+  for (i = 0U; rc == LC_OK && i < BUCKETS && !*out; ++i)
+    for (p = s->stream_buckets[i]; p; p = p->stream_next)
+      if (!p->catalog_refs) {
+        *out = 1;
+        break;
+      }
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
                              void *context, lc_error *e) {
   ps_entry **entries = NULL, *p;

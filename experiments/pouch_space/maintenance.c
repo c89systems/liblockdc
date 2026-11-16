@@ -1,6 +1,7 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "namespace.h"
+#include "namespace_work.h"
 #include "pouch_internal.h"
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +25,10 @@ typedef struct compact {
   int selected;
   uint64_t abandoned_body;
   ps_pouch_compaction_result result;
+  const lc_pouch_maintenance_options *options;
+  lc_pouch_maintenance_result *maintenance;
+  ps_namespace_status status;
+  const char *skip_reason;
 } compact;
 
 static int fail(lc_error *e, int rc, const char *message) {
@@ -139,28 +144,123 @@ static int plan_snapshot(void *context, ps_namespace_view *view,
   }
   return rc;
 }
+static int policy_source(void *context, const ps_namespace_source *source,
+                         lc_error *e) {
+  compact *w = context;
+  int active = w->options->force ||
+               (w->options->terminal_reclaim &&
+                w->status.tail >= w->pouch->terminal_reclaim_min_bytes);
+  int selected =
+      (source->kind == PS_CATALOG_SEGMENT &&
+       source->id > w->status.snapshot_boundary &&
+       (source->id < w->status.active_segment ||
+        (active && source->id == w->status.active_segment))) ||
+      (source->kind == PS_CATALOG_SNAPSHOT && source->id == w->status.snapshot);
+  if (!selected)
+    return LC_OK;
+  if (w->maintenance->candidate_bytes > UINT64_MAX - source->tail)
+    return fail(e, LC_ERR_PROTOCOL, "maintenance candidate size overflow");
+  ++w->maintenance->candidate_segment_count;
+  w->maintenance->candidate_bytes += source->tail;
+  return LC_OK;
+}
 static int begin_locked(void *context, lc_error *e) {
   compact *w = context;
-  ps_namespace_status status;
+  uint64_t closed, pending, minimum_bytes;
+  unsigned long minimum_segments;
+  int present;
   int rc = w->pouch->storage.ops->namespace_open(
       w->pouch->storage.context, w->name, 0, (void **)&w->ns, e);
+  if (rc == LC_OK && w->options)
+    rc = ps_namespace_work_get(w->ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
+                               e);
+  if (rc == LC_OK && w->options && w->options->terminal_reclaim)
+    rc = ps_namespace_work_get(w->ns, LC_POUCH_STORAGE_WORK_TERMINAL, &present,
+                               e);
   if (rc == LC_OK)
-    rc = ps_namespace_status_get(w->ns, &status, e);
+    rc = ps_namespace_status_get(w->ns, &w->status, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_reap(w->ns, &closed, &pending, e);
+  if (rc == LC_OK && w->maintenance) {
+    w->maintenance->cleanup_deleted_count += (unsigned long)closed;
+    w->maintenance->cleanup_pending_count += (unsigned long)pending;
+  }
   if (rc == LC_OK &&
-      (!status.active_segment ||
-       (!status.snapshot && !status.tail && status.active_segment == 1))) {
+      (!w->status.active_segment || (!w->status.snapshot && !w->status.tail &&
+                                     w->status.active_segment == 1))) {
     w->result.skipped = 1;
+    w->skip_reason = "no-candidates";
     return LC_OK;
+  }
+  if (rc == LC_OK && w->options &&
+      (w->options->cleanup_only ||
+       w->options->retention_updated_before_unix > 0)) {
+    w->result.skipped = 1;
+    w->skip_reason = "cleanup-complete";
+    return LC_OK;
+  }
+  if (rc == LC_OK && w->options)
+    rc = ps_namespace_sources_visit(w->ns, policy_source, w, e);
+  if (rc == LC_OK && w->options && !w->options->force) {
+    if (!w->pouch->background_compaction_enabled) {
+      w->result.skipped = 1;
+      w->skip_reason = "disabled";
+      return LC_OK;
+    }
+    minimum_segments = w->options->terminal_reclaim
+                           ? 1UL
+                           : w->pouch->compaction_min_segment_count;
+    minimum_bytes = w->options->terminal_reclaim
+                        ? w->pouch->terminal_reclaim_min_bytes
+                        : w->pouch->compaction_min_reclaimable_bytes;
+    if (rc == LC_OK &&
+        (!w->maintenance->candidate_segment_count ||
+         w->maintenance->candidate_segment_count < minimum_segments ||
+         w->maintenance->candidate_bytes < minimum_bytes)) {
+      w->result.skipped = 1;
+      w->skip_reason =
+          !w->maintenance->candidate_segment_count ? "no-candidates"
+          : w->maintenance->candidate_segment_count < minimum_segments
+              ? "below-segment-threshold"
+              : "below-reclaimable-threshold";
+      return LC_OK;
+    }
   }
   if (rc == LC_OK)
     rc = ps_namespace_snapshot_begin(w->ns, plan_snapshot, w, &w->snapshot, e);
   return rc;
+}
+static int retire_terminal(void *context, lc_error *e) {
+  compact *w = context;
+  ps_namespace_status current;
+  int rc = ps_namespace_status_get(w->ns, &current, e);
+  if (rc == LC_OK && current.tail >= w->pouch->terminal_reclaim_min_bytes) {
+    ++w->maintenance->cleanup_pending_count;
+    return LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = lc_pouch_terminal_reclaim_marker_remove(w->pouch, w->name, e);
+  return rc;
+}
+typedef struct copy_source {
+  lc_source pub;
+  lc_source *input;
+  lc_pouch *pouch;
+} copy_source;
+static size_t copy_read(lc_source *pub, void *bytes, size_t count,
+                        lc_error *e) {
+  copy_source *source = pub->impl;
+  size_t got = source->input->read(source->input, bytes, count, e);
+  if (got && lc_pouch_state_compaction_throttle(source->pouch, got, e) != LC_OK)
+    return 0U;
+  return got;
 }
 static int write_record(void *context, const lc_pouch_state_entry *r,
                         lc_error *e) {
   compact *w = context;
   lc_source *encoded = NULL;
   lc_pouch_state_entry relocated;
+  copy_source source;
   uint64_t start = 0, end = 0;
   int rc = LC_OK;
   if (r->control)
@@ -184,11 +284,16 @@ static int write_record(void *context, const lc_pouch_state_entry *r,
     if (rc == LC_OK)
       rc = lc_pouch_record_io_tail(
           ps_namespace_snapshot_body_output(w->snapshot), &start, e);
+    memset(&source, 0, sizeof(source));
+    source.input = encoded;
+    source.pouch = w->pouch;
+    source.pub.impl = &source;
+    source.pub.read = copy_read;
     if (rc == LC_OK)
       rc = lc_pouch_state_record_write_snapshot(
           &w->pouch->allocator, ps_namespace_snapshot_body_output(w->snapshot),
-          ps_namespace_snapshot_body_leaf(w->snapshot), r, encoded, w->scratch,
-          LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES, e);
+          ps_namespace_snapshot_body_leaf(w->snapshot), r, &source.pub,
+          w->scratch, LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES, e);
     if (encoded)
       encoded->close(encoded);
     if (rc == LC_OK)
@@ -294,8 +399,10 @@ static int cleanup_body(void *context, lc_error *e) {
   compact *w = context;
   return ps_namespace_reclaim(w->ns, PS_CATALOG_BODY, w->abandoned_body, e);
 }
-int ps_pouch_state_compact(lc_pouch *pouch, const char *name,
-                           ps_pouch_compaction_result *out, lc_error *e) {
+static int compact_run(lc_pouch *pouch, const char *name,
+                       const lc_pouch_maintenance_options *options,
+                       lc_pouch_maintenance_result *maintenance,
+                       ps_pouch_compaction_result *out, lc_error *e) {
   compact w;
   lc_error ignored;
   unsigned int kind;
@@ -310,6 +417,8 @@ int ps_pouch_state_compact(lc_pouch *pouch, const char *name,
                 "ordinary container compaction requires owner and namespace");
   w.pouch = pouch;
   w.name = name;
+  w.options = options;
+  w.maintenance = maintenance;
   rc = lc_pouch_state_with_namespace_lock(pouch, name, begin_locked, &w, e);
   if (rc == LC_OK && !w.result.skipped)
     rc = lc_pouch_state_snapshot_visit(w.capture, write_record, &w, e);
@@ -332,13 +441,60 @@ int ps_pouch_state_compact(lc_pouch *pouch, const char *name,
   lc_free_with_allocator(&pouch->allocator, w.scratch);
   lc_free_with_allocator(&pouch->allocator, w.sources);
   lc_free_with_allocator(&pouch->allocator, w.protected);
+  if (rc == LC_OK && maintenance && options->terminal_reclaim &&
+      !maintenance->cleanup_pending_count && !w.result.pending_sources)
+    rc =
+        lc_pouch_state_with_namespace_lock(pouch, name, retire_terminal, &w, e);
   if (w.ns)
     pouch->storage.ops->namespace_close(pouch->storage.context, w.ns);
-  if (rc == LC_OK && !w.result.skipped)
+  if (rc == LC_OK && !w.result.skipped && !maintenance)
     rc = ps_root_reclaim_orphans(w.root, &orphaned, &skipped, e);
-  if (rc == LC_OK && !w.result.skipped)
+  if (rc == LC_OK && !w.result.skipped && !maintenance)
     rc = ps_checkpoint(ps_root_space(w.root), e);
+  if (rc == LC_OK && maintenance) {
+    maintenance->skipped = w.result.skipped;
+    maintenance->compacted = !w.result.skipped;
+    maintenance->compacted_segment_id = w.result.snapshot;
+    maintenance->cleanup_deleted_count +=
+        (unsigned long)w.result.reclaimed_sources;
+    maintenance->cleanup_pending_count +=
+        (unsigned long)w.result.pending_sources;
+    if (w.skip_reason) {
+      lc_free_with_allocator(&pouch->allocator, maintenance->diagnostic);
+      maintenance->diagnostic =
+          lc_strdup_with_allocator(&pouch->allocator, w.skip_reason);
+      if (!maintenance->diagnostic)
+        rc = fail(e, LC_ERR_NOMEM, "cannot retain maintenance diagnostic");
+    }
+  }
   if (rc == LC_OK && out)
     *out = w.result;
+  return rc;
+}
+int ps_pouch_state_compact(lc_pouch *pouch, const char *name,
+                           ps_pouch_compaction_result *out, lc_error *e) {
+  return compact_run(pouch, name, NULL, NULL, out, e);
+}
+int ps_pouch_state_maintain(lc_pouch *pouch,
+                            const lc_pouch_maintenance_options *options,
+                            lc_pouch_maintenance_result *out, lc_error *e) {
+  int rc = compact_run(pouch, options->ns, options, out, NULL, e);
+  if ((rc == LC_ERR_INVALID && e->server_code &&
+       !strcmp(e->server_code, "pouch_namespace_busy")) ||
+      (rc == LC_ERR_UNSUPPORTED && e->server_code &&
+       !strcmp(e->server_code, "pouch_live_staged"))) {
+    lc_error_cleanup(e);
+    lc_error_init(e);
+    out->skipped = 1;
+    ++out->cleanup_pending_count;
+    return LC_OK;
+  }
+  if (rc == LC_ERR_INVALID && e->server_code &&
+      !strcmp(e->server_code, "pouch_namespace_not_found")) {
+    lc_error_cleanup(e);
+    lc_error_init(e);
+    out->skipped = 1;
+    return LC_OK;
+  }
   return rc;
 }

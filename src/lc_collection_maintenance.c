@@ -40,6 +40,9 @@ int lc_collection_maintenance_note(lc_pouch *pouch, const char *ns,
   struct stat st;
   int fd;
   int rc;
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return pouch->storage.ops->maintenance->hint_ensure(
+        pouch->storage.context, ns, LC_POUCH_STORAGE_WORK_COLLECTION, error);
   rc = lc_mc_hint_paths(pouch, ns, &directory, &path, error);
   if (rc != LC_OK)
     return rc;
@@ -490,6 +493,9 @@ int lc_collection_maintenance_run(lc_pouch *pouch,
     return lc_collection_failure(
         error, LC_ERR_INVALID, NULL,
         "collection maintenance requires a root and namespace");
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return pouch->storage.ops->maintenance->collections_run(
+        pouch->storage.context, pouch, options, out, error);
   namespace_path =
       lc_pouch_namespace_path(&pouch->allocator, pouch->root_path, options->ns);
   base =
@@ -598,6 +604,10 @@ int lc_collection_maintenance_next(lc_pouch *pouch, const char *after,
   DIR *dir;
   int rc;
   *ns = *cursor = NULL;
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return pouch->storage.ops->maintenance->hint_next(
+        pouch->storage.context, LC_POUCH_STORAGE_WORK_COLLECTION, after, ns,
+        cursor, error);
   namespaces = lc_pouch_path_join(&pouch->allocator, pouch->root_path,
                                   "collection-work");
   if (namespaces == NULL)

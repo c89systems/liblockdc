@@ -43,6 +43,9 @@ int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
 int ps_namespace_retention_hint_ensure(ps_namespace *, lc_error *);
 /* Metadata-only: no segment opening, canonical replay or body reads. */
 int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
+/* Presence only, without reading the control value. Consumption validates the
+ * selected namespace so one malformed control cannot starve sibling names. */
+int ps_namespace_retention_hint_present(ps_namespace *, int *, lc_error *);
 /* Shared logical LPR1 metadata, materialized and bounded. Load allocates with
  * allocator, returning NULL for an absent hint and idle text for marker-only.
  * Store requires an existing hint; NULL/zero clears work to idle. Complete

@@ -1000,8 +1000,9 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   return rc;
 }
 
-static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
-                         lc_error *error) {
+static int lc_cc_rebuild_mode(lc_collection_handle *collection,
+                              int verify_previous, int read_only,
+                              lc_error *error) {
   lc_collection_projection_build build;
   lc_u64 segment, tail;
   int previous_trusted = collection->trusted;
@@ -1047,15 +1048,16 @@ static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
        build.ids.count != lc_collection_binding_count(&collection->order)))
     rc = lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                "collection canonical history is incomplete");
-  if (rc == LC_OK)
+  if (rc == LC_OK && !read_only)
     rc = lc_cc_active(collection, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK && !read_only)
     rc = lc_pouch_record_io_tail(collection->active.io, &tail, error);
-  if (rc == LC_OK && (build.order.replay_segment != collection->head.active ||
-                      build.order.replay_offset > tail))
+  if (rc == LC_OK && !read_only &&
+      (build.order.replay_segment != collection->head.active ||
+       build.order.replay_offset > tail))
     rc = lc_collection_failure(error, LC_ERR_PROTOCOL, "collection_corrupt",
                                "collection recovery tail is inconsistent");
-  if (rc == LC_OK && build.order.replay_offset < tail)
+  if (rc == LC_OK && !read_only && build.order.replay_offset < tail)
     rc = lc_collection_segment_truncate(&collection->active,
                                         build.order.replay_offset, error);
   if (rc == LC_OK)
@@ -1075,6 +1077,15 @@ static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
         verify_previous && !build.published ? previous_trusted : 0;
   collection->projections.cleanup(collection->projections.context, &build);
   return rc;
+}
+
+static int lc_cc_rebuild(lc_collection_handle *collection, int verify_previous,
+                         lc_error *error) {
+  return lc_cc_rebuild_mode(collection, verify_previous, 0, error);
+}
+int lc_collection_projection_capture(lc_collection_handle *collection,
+                                     lc_error *error) {
+  return lc_cc_rebuild_mode(collection, 0, 1, error);
 }
 
 static int lc_collection_reconcile(lc_collection_handle *collection,

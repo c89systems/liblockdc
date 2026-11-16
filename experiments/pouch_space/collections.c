@@ -6,6 +6,7 @@
 #include "lc_api_internal.h"
 #include "lc_collection_catalog_record.h"
 #include "lc_collection_internal.h"
+#include "namespace_work.h"
 #include "pouch_internal.h"
 #include "root_internal.h"
 #include <errno.h>
@@ -398,12 +399,21 @@ static int scratch(void *context, lc_error *e) {
 }
 static int order_refresh(void *context, lc_collection_order *order,
                          lc_error *e) {
-  return order->fd < 0
-             ? lc_collection_order_adopt(scratch(context, e), 1, order, e)
-             : lc_collection_order_refresh(order, e);
+  collection_receiver *binding = context;
+  int rc = order->fd < 0
+               ? lc_collection_order_adopt(scratch(context, e), 1, order, e)
+               : lc_collection_order_refresh(order, e);
+  /* A peer compactor may publish after prepare, or while a live upload makes
+   * prepare return the previous view. Receiver-local memfds do not follow the
+   * native projection's rename. Rebuild only disposable metadata under the
+   * captured topology's metadata pin; never repair a producer's canonical tail.
+   */
+  if (rc == LC_OK && order->snapshot != binding->receiver->head.snapshot)
+    rc = lc_collection_projection_capture(binding->receiver, e);
+  return rc;
 }
 static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
-  ps_collection_owner *owner = context;
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
   return ids->fd < 0 ? lc_collection_ids_scratch_open(scratch, context,
                                                       &owner->allocator, ids, e)
                      : lc_collection_ids_refresh(ids, e);
@@ -411,8 +421,8 @@ static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
 static int projection_begin(void *context,
                             lc_collection_projection_build *build,
                             lc_error *e) {
-  ps_collection_owner *owner = context;
-  int rc = order_refresh(context, &build->order, e);
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
+  int rc = lc_collection_order_adopt(scratch(context, e), 1, &build->order, e);
   if (rc == LC_OK) {
     /* Disposable receivers share one recovery epoch while this physical
      * owner lives. Reconstructing a receiver is not a history rollback. */
@@ -426,7 +436,7 @@ static int projection_begin(void *context,
 static int projection_publish(void *context,
                               lc_collection_projection_build *build,
                               lc_error *e) {
-  ps_collection_owner *owner = context;
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
   int rc = ps_check(space(owner), e);
   if (rc == LC_OK)
     build->published = 1;
@@ -826,7 +836,7 @@ static int remove_name(void *context, lc_error *e) {
   }
   return rc;
 }
-static int receiver_open(ps_collection_owner *, lc_client_handle *,
+static int receiver_open(ps_collection_owner *, lc_pouch *, lc_client_handle *,
                          lc_collection **, lc_error *);
 static int receiver_clone(void *context, lc_collection **out, lc_error *e) {
   collection_receiver *binding = context;
@@ -834,7 +844,8 @@ static int receiver_clone(void *context, lc_collection **out, lc_error *e) {
   pthread_mutex_lock(&owner->ns->root->mutex);
   pin_locked(owner);
   pthread_mutex_unlock(&owner->ns->root->mutex);
-  return receiver_open(owner, binding->receiver->client, out, e);
+  return receiver_open(owner, binding->receiver->pouch,
+                       binding->receiver->client, out, e);
 }
 static int receiver_finish(void *context, lc_error *e) {
   collection_receiver *binding = context;
@@ -889,7 +900,7 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   c->projections.begin = projection_begin;
   c->projections.publish = projection_publish;
   c->projections.cleanup = projection_cleanup;
-  c->projections.context = owner;
+  c->projections.context = binding;
   c->layout.active = layout_active;
   c->layout.rotate = layout_rotate;
   c->layout.discard = layout_discard;
@@ -898,8 +909,9 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   return ps_check(space(owner), e);
 }
 /* Consumes one owner reference on every result. */
-static int receiver_open(ps_collection_owner *owner, lc_client_handle *client,
-                         lc_collection **out, lc_error *e) {
+static int receiver_open(ps_collection_owner *owner, lc_pouch *pouch,
+                         lc_client_handle *client, lc_collection **out,
+                         lc_error *e) {
   static const lc_collection_owner_ops operations = {
       receiver_attach, receiver_clone,  bound,
       remove_name,     receiver_finish, receiver_release};
@@ -914,8 +926,8 @@ static int receiver_open(ps_collection_owner *owner, lc_client_handle *client,
   binding->owner = owner;
   access.ops = &operations;
   access.context = binding;
-  return lc_collection_owned_open(client->pouch, client, owner->ns->name,
-                                  owner->name, owner->id, access, out, e);
+  return lc_collection_owned_open(pouch, client, owner->ns->name, owner->name,
+                                  owner->id, access, out, e);
 }
 
 static int initialize_locks(ps_collection_owner *owner, lc_error *e) {
@@ -1149,13 +1161,15 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
     rc = failure(e, LC_ERR_INVALID, "collection_not_found",
                  "collection does not exist");
   if (rc == LC_OK && !found)
+    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_COLLECTION, e);
+  if (rc == LC_OK && !found)
     rc = create_owner(ns, config, &logical->allocator, &owner, e);
   if (rc == LC_OK) {
     /* Keep the owner's construction reference through name publication. */
     pthread_mutex_lock(&root->mutex);
     pin_locked(owner);
     pthread_mutex_unlock(&root->mutex);
-    rc = receiver_open(owner, logical, out, e);
+    rc = receiver_open(owner, logical->pouch, logical, out, e);
     if (rc == LC_OK && !found && config->lease)
       rc = lc_collection_lease_initialize((*out)->impl, config->lease, e);
     if (rc == LC_OK && !found)
@@ -1178,6 +1192,8 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
   if (owner)
     owner_release(owner);
   pthread_mutex_unlock(&ns->collection_catalog);
+  if (rc == LC_OK && !found)
+    lc_pouch_compaction_note_mutation(logical->pouch, ns_name, 0);
   ps_namespace_release(ns);
   return rc;
 }
@@ -1257,7 +1273,8 @@ int ps_collection_client_visit(ps_root *root, lc_client *client,
   for (i = 0U; i < list.count; ++i) {
     collection = NULL;
     if (rc == LC_OK) {
-      rc = receiver_open(list.items[i], logical, &collection, e);
+      rc =
+          receiver_open(list.items[i], logical->pouch, logical, &collection, e);
       list.items[i] = NULL;
       if (rc == LC_OK)
         rc = collection->describe(collection, &info, e);
@@ -1274,4 +1291,173 @@ int ps_collection_client_visit(ps_root *root, lc_client *client,
   lc_free_with_allocator(list.allocator, list.items);
   ps_namespace_release(list.ns);
   return rc;
+}
+
+typedef struct maintenance_item {
+  char name[LC_COLLECTION_NAME_BYTES];
+  ps_catalog_info identity;
+} maintenance_item;
+typedef struct maintenance_items {
+  const lc_allocator *allocator;
+  maintenance_item *items;
+  size_t count, capacity;
+} maintenance_items;
+static int capture_maintenance(void *context, const void *name, size_t length,
+                               const ps_catalog_info *info, lc_error *e) {
+  maintenance_items *list = context;
+  maintenance_item *grown, *item;
+  size_t capacity;
+  if (!length || length >= LC_COLLECTION_NAME_BYTES || memchr(name, 0, length))
+    return failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                   "collection work catalog has an invalid name");
+  if (list->count == list->capacity) {
+    capacity = list->capacity ? list->capacity * 2U : 8U;
+    if (capacity < list->capacity || capacity > (size_t)-1 / sizeof(*grown))
+      return failure(e, LC_ERR_NOMEM, NULL,
+                     "collection work list is too large");
+    grown = lc_realloc_with_allocator(list->allocator, list->items,
+                                      capacity * sizeof(*grown));
+    if (!grown)
+      return failure(e, LC_ERR_NOMEM, NULL, "cannot capture collection work");
+    list->items = grown;
+    list->capacity = capacity;
+  }
+  item = &list->items[list->count++];
+  memcpy(item->name, name, length);
+  item->name[length] = 0;
+  item->identity = *info;
+  return LC_OK;
+}
+static int maintenance_admit(ps_namespace *ns, lc_pouch *pouch,
+                             const maintenance_item *item, lc_collection **out,
+                             lc_error *e) {
+  ps_catalog_view *view = NULL;
+  ps_catalog_info current;
+  ps_collection_owner *owner = NULL;
+  int rc;
+  *out = NULL;
+  pthread_mutex_lock(&ns->collection_catalog);
+  rc =
+      ps_catalog_get(ns->root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
+                     item->name, strlen(item->name), &view, e);
+  if (rc == LC_OK && view)
+    rc = ps_catalog_view_info(view, &current, e);
+  if (rc == LC_OK && view &&
+      same_ref(&current.revision, &item->identity.revision) &&
+      same_ref(&current.target, &item->identity.target))
+    rc = load_owner(ns, item->name, &current, &pouch->allocator, &owner, e);
+  ps_catalog_view_close(view);
+  pthread_mutex_unlock(&ns->collection_catalog);
+  if (rc == LC_OK && owner)
+    rc = receiver_open(owner, pouch, NULL, out, e);
+  return rc;
+}
+static int count_binding(void *context, const void *name, size_t length,
+                         const ps_catalog_info *info, lc_error *e) {
+  int *present = context;
+  (void)name;
+  (void)length;
+  (void)info;
+  (void)e;
+  *present = 1;
+  return LC_OK;
+}
+int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
+                                  const lc_pouch_maintenance_options *options,
+                                  lc_pouch_maintenance_result *out,
+                                  lc_error *e) {
+  maintenance_items list;
+  ps_namespace *ns = NULL;
+  lc_collection *collection;
+  lc_error local, first;
+  uint64_t reclaimed, skipped;
+  size_t i;
+  int present = 0, pending = 0, dropped, rc, first_rc;
+  memset(&list, 0, sizeof(list));
+  list.allocator = &pouch->allocator;
+  rc = ps_root_namespace_acquire(root, options->ns, 0, &ns, e);
+  if (rc == LC_ERR_INVALID && e && e->server_code &&
+      !strcmp(e->server_code, "pouch_namespace_not_found")) {
+    clear(e);
+    return LC_OK;
+  }
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_COLLECTION, &present, e);
+  if (rc != LC_OK) {
+    ps_namespace_release(ns);
+    return rc;
+  }
+  present = 0;
+  /* A durable catalog prefix, not the resident receiver cache, selects work.
+   * Capture only names/identities; one corrupt receiver cannot hide its peers.
+   */
+  pthread_mutex_lock(&ns->collection_catalog);
+  rc = ps_catalog_visit(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
+                        capture_maintenance, &list, e);
+  pthread_mutex_unlock(&ns->collection_catalog);
+  lc_error_init(&local);
+  lc_error_init(&first);
+  first_rc = rc;
+  if (rc != LC_OK && e) {
+    first = *e;
+    lc_error_init(e);
+  }
+  for (i = 0U; i < list.count; ++i) {
+    collection = NULL;
+    dropped = 0;
+    rc = maintenance_admit(ns, pouch, &list.items[i], &collection, &local);
+    if (rc == LC_OK && collection && !options->cleanup_only)
+      rc = lc_collection_retention_maintain(collection, &dropped, out, &local);
+    if (rc == LC_OK && collection && !dropped)
+      rc = lc_collection_compact(collection, options->force,
+                                 options->cleanup_only, out, &local);
+    if (stale(rc, &local)) {
+      clear(&local);
+      rc = LC_OK;
+      if (out)
+        ++out->cleanup_pending_count;
+    }
+    lc_collection_close(collection);
+    if (rc != LC_OK && first_rc == LC_OK) {
+      first_rc = rc;
+      first = local;
+      lc_error_init(&local);
+    }
+    clear(&local);
+  }
+  lc_free_with_allocator(list.allocator, list.items);
+  if (first_rc == LC_OK) {
+    rc = ps_root_reclaim_orphans(root, &reclaimed, &skipped, &local);
+    if (rc == LC_OK) {
+      pthread_mutex_lock(&ns->collection_catalog);
+      rc = ps_catalog_visit(root->space, ns->identity.owner,
+                            PS_CATALOG_COLLECTION, count_binding, &present,
+                            &local);
+      if (rc == LC_OK)
+        rc = ps_catalog_orphans_pending(root->space, &pending, &local);
+      if (rc == LC_OK && !present && !pending)
+        rc = ps_namespace_work_remove(ns, LC_POUCH_STORAGE_WORK_COLLECTION,
+                                      &local);
+      pthread_mutex_unlock(&ns->collection_catalog);
+    }
+    if (rc == LC_OK && pending && out)
+      ++out->cleanup_pending_count;
+    if (rc == LC_OK)
+      rc = ps_checkpoint(root->space, &local);
+    if (rc != LC_OK) {
+      first_rc = rc;
+      first = local;
+      lc_error_init(&local);
+    }
+  }
+  ps_namespace_release(ns);
+  if (first_rc != LC_OK && e) {
+    lc_error_cleanup(e);
+    *e = first;
+    lc_error_init(&first);
+  }
+  lc_error_cleanup(&local);
+  lc_error_cleanup(&first);
+  return first_rc;
 }

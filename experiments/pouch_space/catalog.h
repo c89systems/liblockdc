@@ -63,4 +63,8 @@ typedef int (*ps_catalog_orphan_fn)(void *, ps_key, const ps_ref *, lc_error *);
  * concurrent publication can bind a candidate after capture. No implicit GC. */
 int ps_catalog_visit_orphans(ps_space *, ps_catalog_orphan_fn, void *,
                              lc_error *);
+/* Metadata-only conservative work test, including open owners and raw catalog
+ * pins. Unlike the visitor it reports unbound targets that cannot retire yet,
+ * so draining a handle cannot make deferred cleanup undiscoverable. */
+int ps_catalog_orphans_pending(ps_space *, int *, lc_error *);
 #endif

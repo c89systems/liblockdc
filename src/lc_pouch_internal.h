@@ -247,6 +247,7 @@ struct lc_pouch {
    */
   int compaction_source_turn;
   char *collection_namespace_cursor;
+  char *maintenance_namespace_cursor;
   char *state_retention_marker_cursor;
   /* Last terminal-reclaim marker selected by the background worker. The
    * durable marker remains until maintenance completes; this cursor prevents

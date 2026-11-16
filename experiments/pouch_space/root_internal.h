@@ -15,6 +15,8 @@ struct ps_namespace {
   struct ps_namespace_data *data;
   struct ps_collection_owner *collections;
   pthread_mutex_t collection_catalog;
+  pthread_mutex_t maintenance;
+  unsigned int work_loaded, work_present;
   struct ps_namespace *next, *hash_next;
   struct ps_namespace **link;
 };

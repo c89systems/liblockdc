@@ -283,7 +283,9 @@ int ps_namespace_snapshot_begin(ps_namespace *ns,
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
     if (d->snapshot_building)
-      rc = failure(e, "namespace already has a snapshot builder");
+      rc = lc_error_set(e, LC_ERR_INVALID, 0L,
+                        "namespace already has a snapshot builder", NULL,
+                        "pouch_namespace_busy", "pouch");
     else
       b->building = d->snapshot_building = 1;
     pthread_mutex_unlock(&d->mutex);

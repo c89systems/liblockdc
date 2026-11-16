@@ -80,6 +80,28 @@ enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
 };
 #define LC_POUCH_STORAGE_TXN_GUARD_STRIPES 256U
+enum lc_pouch_storage_work_kind {
+  LC_POUCH_STORAGE_WORK_ORDINARY = 0,
+  LC_POUCH_STORAGE_WORK_TERMINAL,
+  LC_POUCH_STORAGE_WORK_COLLECTION
+};
+/* Discovery/control metadata belongs to the physical owner. The existing
+ * scheduler retains cadence, fairness, coalescing and worker lifetime. State
+ * and collection passes retain their common logical policies; physical copies
+ * may release namespace authority between capture and publication. */
+typedef struct lc_pouch_storage_maintenance_ops {
+  int (*hint_ensure)(void *, const char *, enum lc_pouch_storage_work_kind,
+                     lc_error *);
+  int (*hint_remove)(void *, const char *, enum lc_pouch_storage_work_kind,
+                     lc_error *);
+  int (*hint_next)(void *, enum lc_pouch_storage_work_kind, const char *,
+                   char **, char **, lc_error *);
+  int (*state_run)(void *, lc_pouch *, const lc_pouch_maintenance_options *,
+                   lc_pouch_maintenance_result *, lc_error *);
+  int (*collections_run)(void *, lc_pouch *,
+                         const lc_pouch_maintenance_options *,
+                         lc_pouch_maintenance_result *, lc_error *);
+} lc_pouch_storage_maintenance_ops;
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   /* Force the completed publication prefix durable, including on NoSync
@@ -147,6 +169,7 @@ typedef struct lc_pouch_storage_ops {
                          lc_collection **, lc_error *);
   int (*collections_visit)(void *, lc_client *, const char *,
                            lc_collection_visit_fn, void *, lc_error *);
+  const lc_pouch_storage_maintenance_ops *maintenance;
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;
@@ -158,6 +181,9 @@ typedef struct lc_pouch_storage {
 int lc_pouch_runtime_open(const char *, const lc_allocator *,
                           const lc_pouch_open_options *, lc_pouch **,
                           lc_error *);
+/* Call once, after physical ownership and all worker callbacks are installed.
+ * Close joins the existing worker before releasing the physical owner. */
+int lc_pouch_runtime_start_maintenance(lc_pouch *, lc_error *);
 /* Private admission seam for a physical owner. The constructor resolves the
  * ordinary SDK options before invoking factory once. It owns any returned
  * runtime, including during failed initialization, and retains neither factory

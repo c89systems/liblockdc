@@ -2414,6 +2414,13 @@ static void validation(const char *path) {
       o.logical.compression = "unknown";
       expected = LC_ERR_INVALID;
     }
+    if (bad == 1) {
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      REQUIRE(p && p->compaction_thread_started);
+      lc_pouch_close(p);
+      REQUIRE(!live && !unlink(path));
+      continue;
+    }
     REQUIRE(ps_pouch_state_open(path, 1, &allocator, bad ? &o : NULL, &p, &e) ==
             expected);
     REQUIRE(!p && live == 0 && access(path, F_OK) != 0);

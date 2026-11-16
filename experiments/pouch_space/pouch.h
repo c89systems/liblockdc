@@ -19,10 +19,11 @@ typedef struct ps_pouch_state_options {
  * historical stages and decisions may be omitted by the resolved snapshot.
  * Public leased state updates/metadata/keepalive/release, transactional
  * attachments, native participant votes and on-demand expiry cleanup use the
- * same logical engine. .txns remains the decision authority. Background expiry
- * scheduling, complete external XA ownership and guaranteed maintenance
- * admission at capacity remain pending. Forced ordinary-state compaction is
- * available below.
+ * same logical engine. .txns remains the decision authority. Complete external
+ * XA ownership and guaranteed maintenance admission at capacity remain pending.
+ * Public namespace maintenance and the common background scheduler use durable
+ * in-file work hints for ordinary state, terminal cleanup, expiry and
+ * collections. Forced ordinary-state compaction is also available below.
  * Internal cleanup durability scopes force the completed container prefix
  * durable under either root policy; unfinished producers remain private.
  * Rotation can still require foreground capacity before a delete.
@@ -33,11 +34,11 @@ typedef struct ps_pouch_state_options {
  * control heads and canonical bytes live in the container; order/ID metadata
  * is disposable memfd scratch. A physical-owner recovery changes the scratch
  * epoch, invalidating prior cursors/head preconditions; receivers sharing a
- * live owner have the same epoch. Explicit collection maintenance below uses
- * the common compactor and retention engine. Indexing and background
- * collection retention remain outside this harness.
+ * live owner have the same epoch. Explicit and background collection
+ * maintenance use the common compactor and retention engine. Indexing remains
+ * outside this harness.
  * Other Pouch operations are outside this harness's current call contract.
- * Explicitly disable indexing, background maintenance and queue watches; shared
+ * Explicitly disable indexing and queue watches; shared
  * root mode and generated external key files are not admitted. No public
  * backend option or native-open cutover is introduced by this harness. */
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,
@@ -61,7 +62,9 @@ typedef struct ps_pouch_compaction_result {
 /* One forced ordinary-state compaction pass. Relocates one source into a
  * sealed body pack, publishes a metadata-only logical snapshot, then rechecks
  * the current tail before retirement. Copies run outside namespace authority.
- * Staged/history/index/collection maintenance remains outside this harness.
+ * Live staged records defer this pass; resolved historical stages may be
+ * omitted. Collection maintenance uses the separate entry point below or the
+ * public namespace maintenance API. Index maintenance remains outside it.
  * Known canonical spans are reserved before copying; complete protected
  * metadata/rotation admission at full capacity is still pending. */
 int ps_pouch_state_compact(lc_pouch *, const char *ns,

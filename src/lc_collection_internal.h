@@ -224,6 +224,9 @@ int lc_collection_read_pin(lc_collection_handle *collection, lc_u64 snapshot,
                            lc_collection_lock *, lc_error *error);
 int lc_collection_refresh_view(lc_collection_handle *collection,
                                lc_error *error);
+/* Refresh receiver-local disposable metadata under metadata authority only.
+ * Does not repair/truncate canonical storage or wait for append authority. */
+int lc_collection_projection_capture(lc_collection_handle *, lc_error *);
 int lc_collection_record_input(lc_collection_handle *, lc_u64,
                                lc_collection_input *, lc_error *);
 int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,

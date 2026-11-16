@@ -786,6 +786,20 @@ static int lc_pouch_terminal_reclaim_marker_path(lc_pouch *pouch,
   return LC_OK;
 }
 
+static int lc_pouch_storage_work_take(lc_pouch *pouch,
+                                      enum lc_pouch_storage_work_kind kind,
+                                      char **saved_cursor, char **ns,
+                                      lc_error *error) {
+  char *cursor = NULL;
+  int rc = pouch->storage.ops->maintenance->hint_next(
+      pouch->storage.context, kind, *saved_cursor, ns, &cursor, error);
+  if (rc == LC_OK && cursor) {
+    lc_free_with_allocator(&pouch->allocator, *saved_cursor);
+    *saved_cursor = cursor;
+  } else
+    lc_free_with_allocator(&pouch->allocator, cursor);
+  return rc;
+}
 static int lc_pouch_terminal_reclaim_marker_write(lc_pouch *pouch,
                                                   const char *ns,
                                                   lc_error *error) {
@@ -794,6 +808,9 @@ static int lc_pouch_terminal_reclaim_marker_write(lc_pouch *pouch,
   int fd;
   int rc;
 
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return pouch->storage.ops->maintenance->hint_ensure(
+        pouch->storage.context, ns, LC_POUCH_STORAGE_WORK_TERMINAL, error);
   directory = NULL;
   path = NULL;
   rc = lc_pouch_terminal_reclaim_marker_path(pouch, ns, 1, &directory, &path,
@@ -839,6 +856,10 @@ static int lc_pouch_terminal_reclaim_marker_take(lc_pouch *pouch, char **ns,
   int rc;
 
   *ns = NULL;
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return lc_pouch_storage_work_take(pouch, LC_POUCH_STORAGE_WORK_TERMINAL,
+                                      &pouch->terminal_reclaim_marker_cursor,
+                                      ns, error);
   directory = NULL;
   first_leaf = NULL;
   first_namespace = NULL;
@@ -948,6 +969,9 @@ int lc_pouch_terminal_reclaim_marker_remove(lc_pouch *pouch, const char *ns,
   char *path;
   int rc;
 
+  if (pouch->storage.ops && pouch->storage.ops->maintenance)
+    return pouch->storage.ops->maintenance->hint_remove(
+        pouch->storage.context, ns, LC_POUCH_STORAGE_WORK_TERMINAL, error);
   directory = NULL;
   path = NULL;
   rc = lc_pouch_terminal_reclaim_marker_path(pouch, ns, 0, &directory, &path,
@@ -2441,16 +2465,22 @@ enum {
   LC_POUCH_COMPACTION_TERMINAL,
   LC_POUCH_COMPACTION_RETENTION,
   LC_POUCH_COMPACTION_COLLECTION,
+  LC_POUCH_COMPACTION_STORAGE_ORDINARY,
   LC_POUCH_COMPACTION_SOURCE_COUNT
 };
 
+static int lc_pouch_compaction_source_count(lc_pouch *pouch) {
+  return pouch->storage.ops && pouch->storage.ops->maintenance
+             ? LC_POUCH_COMPACTION_SOURCE_COUNT
+             : LC_POUCH_COMPACTION_SOURCE_COUNT - 1;
+}
 static int lc_pouch_compaction_take_source_turn(lc_pouch *pouch) {
   int source;
 
   pthread_mutex_lock(&pouch->compaction_mutex);
   source = pouch->compaction_source_turn;
   pouch->compaction_source_turn =
-      (source + 1) % LC_POUCH_COMPACTION_SOURCE_COUNT;
+      (source + 1) % lc_pouch_compaction_source_count(pouch);
   pthread_mutex_unlock(&pouch->compaction_mutex);
   return source;
 }
@@ -2502,12 +2532,17 @@ static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
   rc = LC_OK;
   /* One fair, work-conserving rotation. Advance before discovery so a failed
    * source cannot keep the next pass; inspect each source at most once. */
-  for (attempt = 0;
-       attempt < LC_POUCH_COMPACTION_SOURCE_COUNT && rc == LC_OK && ns == NULL;
+  for (attempt = 0; attempt < lc_pouch_compaction_source_count(pouch) &&
+                    rc == LC_OK && ns == NULL;
        ++attempt) {
     switch (lc_pouch_compaction_take_source_turn(pouch)) {
     case LC_POUCH_COMPACTION_QUEUED:
       rc = lc_pouch_compaction_take_namespace(pouch, &ns, &terminal_reclaim);
+      break;
+    case LC_POUCH_COMPACTION_STORAGE_ORDINARY:
+      rc = lc_pouch_storage_work_take(pouch, LC_POUCH_STORAGE_WORK_ORDINARY,
+                                      &pouch->maintenance_namespace_cursor, &ns,
+                                      &error);
       break;
     case LC_POUCH_COMPACTION_TERMINAL:
       rc = lc_pouch_terminal_reclaim_marker_take(pouch, &ns, &error);
@@ -2750,6 +2785,23 @@ static int lc_pouch_compaction_worker_init(lc_pouch *pouch, lc_error *error) {
   lc_error_cleanup(&marker_error);
   lc_free_with_allocator(&pouch->allocator, pending_namespace);
   lc_free_with_allocator(&pouch->allocator, retention_cursor);
+  if (pouch->storage.ops && pouch->storage.ops->maintenance) {
+    pending_namespace = retention_cursor = NULL;
+    lc_error_init(&marker_error);
+    rc = pouch->storage.ops->maintenance->hint_next(
+        pouch->storage.context, LC_POUCH_STORAGE_WORK_ORDINARY, NULL,
+        &pending_namespace, &retention_cursor, &marker_error);
+    if (rc != LC_OK || pending_namespace != NULL)
+      pouch->compaction_pending = 1;
+    if (rc != LC_OK) {
+      pslog_field field = lc_log_error_field("error", &marker_error);
+      lc_log_warn(pouch->logger, "compaction.ordinary.discovery.error", &field,
+                  1U);
+    }
+    lc_error_cleanup(&marker_error);
+    lc_free_with_allocator(&pouch->allocator, pending_namespace);
+    lc_free_with_allocator(&pouch->allocator, retention_cursor);
+  }
   pthread_rc = pthread_create(&pouch->compaction_thread, NULL,
                               lc_pouch_compaction_worker, pouch);
   if (pthread_rc != 0) {
@@ -2759,6 +2811,23 @@ static int lc_pouch_compaction_worker_init(lc_pouch *pouch, lc_error *error) {
   }
   pouch->compaction_thread_started = 1;
   return LC_OK;
+}
+
+int lc_pouch_runtime_start_maintenance(lc_pouch *pouch, lc_error *error) {
+  const lc_pouch_storage_maintenance_ops *ops;
+  if (!pouch || pouch->compaction_mutex_initialized)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "maintenance worker requires an initialized runtime "
+                        "without an existing worker",
+                        NULL, NULL, "pouch");
+  ops = pouch->storage.ops ? pouch->storage.ops->maintenance : NULL;
+  if (pouch->storage.ops && pouch->background_compaction_enabled &&
+      (!ops || !ops->hint_ensure || !ops->hint_remove || !ops->hint_next ||
+       !ops->state_run || !ops->collections_run))
+    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                        "storage owner has no complete maintenance capability",
+                        NULL, NULL, "pouch");
+  return lc_pouch_compaction_worker_init(pouch, error);
 }
 
 static void lc_pouch_compaction_worker_close(lc_pouch *pouch) {
@@ -2799,6 +2868,9 @@ static void lc_pouch_compaction_worker_close(lc_pouch *pouch) {
   pouch->state_retention_marker_cursor = NULL;
   lc_free_with_allocator(&pouch->allocator, pouch->collection_namespace_cursor);
   pouch->collection_namespace_cursor = NULL;
+  lc_free_with_allocator(&pouch->allocator,
+                         pouch->maintenance_namespace_cursor);
+  pouch->maintenance_namespace_cursor = NULL;
   pouch->compaction_namespace_count = 0U;
   pouch->compaction_namespace_capacity = 0U;
 }

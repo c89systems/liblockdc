@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_COLLECTIONS_H
 #define POUCH_SPACE_COLLECTIONS_H
+#include "lc_pouch.h"
 #include "root.h"
 struct ps_collection_owner;
 /* Catalog admission binds the existing production collection engine. */
@@ -14,4 +15,7 @@ void ps_collection_cache_destroy(struct ps_collection_owner *);
  * child, including uncached segments, before the control and identity. A
  * failed pass leaves the unbound identity present for recovery/retry. */
 int ps_collection_reclaim_children(ps_space *, uint64_t, lc_error *);
+int ps_collection_maintenance_run(ps_root *, lc_pouch *,
+                                  const lc_pouch_maintenance_options *,
+                                  lc_pouch_maintenance_result *, lc_error *);
 #endif

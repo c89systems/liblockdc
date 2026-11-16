@@ -5,6 +5,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
+#include "namespace_work.h"
 #include "pouch_internal.h"
 #include <errno.h>
 #include <string.h>
@@ -165,6 +166,9 @@ static int append_begin(void *context, void *ns, uint64_t target,
   }
   if (mode != LC_POUCH_STORAGE_APPEND_PREFIX && target)
     target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
+  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+  if (rc != LC_OK)
+    return rc;
   rc = ps_namespace_append_begin(ns, target, minimum, physical, &append, e);
   if (rc != LC_OK)
     return rc;
@@ -406,7 +410,7 @@ static int retention_select(const char *name, const ps_namespace_info *info,
   int rc = ps_root_namespace_acquire(d->owner->root, name, 0, &ns, e);
   (void)info;
   if (rc == LC_OK)
-    rc = ps_namespace_retention_hint_get(ns, &present, e);
+    rc = ps_namespace_retention_hint_present(ns, &present, e);
   ps_namespace_release(ns);
   if (rc != LC_OK || !present)
     return rc;
@@ -507,6 +511,47 @@ static int collections_visit(void *context, lc_client *client, const char *ns,
   return ps_collection_client_visit(owner->root, client, ns, visitor, opaque,
                                     e);
 }
+static int work_ensure(void *context, const char *name,
+                       enum lc_pouch_storage_work_kind kind, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = ps_root_namespace_acquire(owner->root, name, 1, &ns, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_work_ensure(ns, kind, e);
+  ps_namespace_release(ns);
+  return rc;
+}
+static int work_remove(void *context, const char *name,
+                       enum lc_pouch_storage_work_kind kind, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = retention_namespace(owner, name, &ns, e);
+  if (rc == LC_OK && ns)
+    rc = ps_namespace_work_remove(ns, kind, e);
+  ps_namespace_release(ns);
+  return rc;
+}
+static int work_next(void *context, enum lc_pouch_storage_work_kind kind,
+                     const char *after, char **name, char **cursor,
+                     lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_namespace_work_next(owner->root, &owner->allocator, kind, after,
+                                name, cursor, e);
+}
+static int state_maintain(void *context, lc_pouch *pouch,
+                          const lc_pouch_maintenance_options *options,
+                          lc_pouch_maintenance_result *out, lc_error *e) {
+  (void)context;
+  return ps_pouch_state_maintain(pouch, options, out, e);
+}
+static int collections_maintain(void *context, lc_pouch *pouch,
+                                const lc_pouch_maintenance_options *options,
+                                lc_pouch_maintenance_result *out, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_collection_maintenance_run(owner->root, pouch, options, out, e);
+}
+static const lc_pouch_storage_maintenance_ops maintenance_ops = {
+    work_ensure, work_remove, work_next, state_maintain, collections_maintain};
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -528,7 +573,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  txn_guard_release,
                                                  release,
                                                  collection_open,
-                                                 collections_visit};
+                                                 collections_visit,
+                                                 &maintenance_ops};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;
@@ -556,15 +602,14 @@ int ps_pouch_state_open(const char *path, int create,
                              options ? &options->logical : NULL, &pouch, e);
   if (rc != LC_OK)
     return rc;
-  if (!pouch->single_writer || pouch->background_compaction_enabled ||
-      pouch->query_indexing_enabled || pouch->queue_watch_enabled ||
+  if (!pouch->single_writer || pouch->query_indexing_enabled ||
+      pouch->queue_watch_enabled ||
       (options && options->logical.crypto_generate_key_file)) {
     lc_pouch_close(pouch);
-    return lc_error_set(
-        e, LC_ERR_UNSUPPORTED, 0,
-        "container state harness requires exclusive mode, "
-        "disabled indexing/maintenance/watches and no generated key file",
-        NULL, NULL, "pouch");
+    return lc_error_set(e, LC_ERR_UNSUPPORTED, 0,
+                        "container state harness requires exclusive mode, "
+                        "disabled indexing/watches and no generated key file",
+                        NULL, NULL, "pouch");
   }
   owner = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*owner));
   if (!owner) {
@@ -632,6 +677,11 @@ int ps_pouch_state_open(const char *path, int create,
   }
   lc_free_with_allocator(&pouch->allocator, pouch->compression);
   pouch->compression = compression;
+  rc = lc_pouch_runtime_start_maintenance(pouch, e);
+  if (rc != LC_OK) {
+    lc_pouch_close(pouch);
+    return rc;
+  }
   *out = pouch;
   return LC_OK;
 }
