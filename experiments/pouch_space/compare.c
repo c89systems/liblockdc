@@ -621,7 +621,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
       LC_POUCH_SETTING_SEGMENT_TARGET_BYTES | LC_POUCH_SETTING_QUEUE_WATCH |
       LC_POUCH_SETTING_QUERY_ENGINE;
   settings.durable_sync = c->sync;
-  settings.segment_target_bytes = PS_MIB;
+  settings.segment_target_bytes = c->compaction ? 65536U : PS_MIB;
   settings.compression = "none";
   settings.query_engine = "scan";
   config.endpoints = &endpoint;
@@ -632,6 +632,10 @@ static void open_stores(comparison *c, int create, lc_error *e) {
                    : lc_client_open(&config, &c->client, e),
         e);
   c->pouch = ((lc_client_handle *)c->client)->pouch;
+  if (c->compaction) {
+    c->pouch->compaction_delete_grace_seconds = 0U;
+    c->pouch->compaction_max_io_bytes_per_sec = 0U;
+  }
   for (i = 0; i < c->writers; ++i) {
     snprintf(name, sizeof(name), "collection-%lu", (unsigned long)i);
     lc_collection_config_init(&collection);
@@ -1171,6 +1175,26 @@ static void compact_all(comparison *c, lc_error *e) {
   size_t i;
   char ns[64], name[64];
   for (i = 0; i < c->writers; ++i) {
+    if (c->collection) {
+      lc_pouch_maintenance_result result = {0};
+      int dropped = 0;
+      if (c->runtime)
+        check(ps_pouch_collection_maintain(c->workers[i].collection, 1, 0,
+                                           &result, e),
+              e);
+      else {
+        check(lc_collection_retention_maintain(c->workers[i].collection,
+                                               &dropped, &result, e),
+              e);
+        check(lc_collection_compact(c->workers[i].collection, 1, 0, &result, e),
+              e);
+      }
+      require(!dropped && result.compacted_collection_count == 1U &&
+                  result.cleanup_deleted_count && !result.cleanup_pending_count,
+              "collection compaction publishes and reclaims the same prefix");
+      lc_pouch_maintenance_result_cleanup(NULL, &result);
+      continue;
+    }
     names(i, i, ns, name);
     if (c->runtime) {
       ps_pouch_compaction_result result;
@@ -1236,7 +1260,8 @@ int main(int argc, char **argv) {
           "points|"
           "runtime-scan-bodies|pouch-scan-bodies|"
           "runtime-scan-metadata|pouch-scan-metadata|"
-          "stream-collection|pouch-collection|runtime-collection "
+          "stream-collection|pouch-collection|runtime-collection|"
+          "pouch-collection-compact|runtime-collection-compact "
           "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
           stderr);
     return 2;
@@ -1249,6 +1274,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "space-collection") ||
               !strcmp(argv[1], "pouch-collection") ||
               !strcmp(argv[1], "runtime-collection") ||
+              !strcmp(argv[1], "pouch-collection-compact") ||
+              !strcmp(argv[1], "runtime-collection-compact") ||
               !strcmp(argv[1], "stream-state") ||
               !strcmp(argv[1], "runtime-state") ||
               !strcmp(argv[1], "runtime-metadata") ||

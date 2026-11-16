@@ -1051,7 +1051,15 @@ static size_t io_trial(const char *directory, int codec, int sync,
   io.sync = disk_sync;
   io.reserve = disk_reserve;
   setup_io(&f, directory, codec, sync, 1, &io);
-  (void)append(f.collection, "seed", 80U, &f.error);
+  (void)append(f.collection, "seed", operation >= 4 ? 73728U : 80U, &f.error);
+  if (operation >= 4) {
+    lc_collection_handle *c = f.collection->impl;
+    c->pouch->compaction_delete_grace_seconds = operation == 5 ? 1000U : 0U;
+    if (operation == 5)
+      ok(ps_pouch_collection_maintain(f.collection, 1, 0, NULL, &f.error),
+         &f.error);
+    c->pouch->compaction_delete_grace_seconds = 0U;
+  }
   ok(ps_flush(ps_root_space(client_root(&f)), &f.error), &f.error);
   ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
   lc_collection_config_init(&config);
@@ -1073,6 +1081,9 @@ static size_t io_trial(const char *directory, int codec, int sync,
                                      &f.error);
   else if (operation == 2)
     rc = lc_collection_edit(f.collection, &edit, &p.source, &edited, &f.error);
+  else if (operation >= 4)
+    rc = ps_pouch_collection_maintain(f.collection, 1, operation == 5, NULL,
+                                      &f.error);
   else
     rc = lc_collection_drop(f.collection, &f.error);
   m.armed = 0;
@@ -1123,7 +1134,12 @@ static size_t io_trial(const char *directory, int codec, int sync,
       REQUIRE(rc != LC_OK);
   } else {
     open_collection(&f, 0, &f.collection);
-    if (operation == 1) {
+    if (operation >= 4) {
+      read_entry(f.collection, 1U, 73728U, &f.error);
+      ok(ps_pouch_collection_maintain(f.collection, 1, 0, NULL, &f.error),
+         &f.error);
+      read_entry(f.collection, 1U, 73728U, &f.error);
+    } else if (operation == 1) {
       ok(lc_collection_append_status(f.collection, "new-append", &status,
                                      &f.error),
          &f.error);
@@ -1195,7 +1211,15 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
            "cut=%zu",
            codec, sync, operation, cut);
   setup(&f, directory, codec, sync, 1);
-  (void)append(f.collection, "seed", 80U, &f.error);
+  (void)append(f.collection, "seed", operation >= 7 ? 73728U : 80U, &f.error);
+  if (operation >= 7) {
+    lc_collection_handle *c = f.collection->impl;
+    c->pouch->compaction_delete_grace_seconds = operation == 8 ? 1000U : 0U;
+    if (operation == 8)
+      ok(ps_pouch_collection_maintain(f.collection, 1, 0, NULL, &f.error),
+         &f.error);
+    c->pouch->compaction_delete_grace_seconds = 0U;
+  }
   ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
   lc_collection_config_init(&config);
   config.name = operation == 0 ? "created" : "events/\303\245";
@@ -1236,6 +1260,9 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     rc = lc_collection_read(f.collection, NULL, &output.sink, &read, &f.error);
   else if (operation == 5)
     rc = lc_client_open_collection(f.client, &config, &extra, &f.error);
+  else if (operation >= 7)
+    rc = ps_pouch_collection_maintain(f.collection, 1, operation == 8, NULL,
+                                      &f.error);
   else
     rc = lc_client_list_collections(f.client, NULL, listed, &listed_count,
                                     &f.error);
@@ -1273,7 +1300,7 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     read_entry(f.collection, receipt.found ? 2U : 1U,
                receipt.found ? 512U : 80U, &f.error);
   } else
-    read_entry(f.collection, 1U, 80U, &f.error);
+    read_entry(f.collection, 1U, operation >= 7 ? 73728U : 80U, &f.error);
   reopen(&f);
   if (operation == 2) {
     ok(lc_collection_edit_status(f.collection, "allocation-edit", &receipt,
@@ -1282,7 +1309,7 @@ static size_t allocation_trial(const char *directory, int codec, int sync,
     read_entry(f.collection, receipt.found ? 2U : 1U,
                receipt.found ? 512U : 80U, &f.error);
   } else
-    read_entry(f.collection, 1U, 80U, &f.error);
+    read_entry(f.collection, 1U, operation >= 7 ? 73728U : 80U, &f.error);
   uint64_t reclaimed, skipped;
   ok(ps_root_reclaim_orphans(client_root(&f), &reclaimed, &skipped, &f.error),
      &f.error);
@@ -1304,13 +1331,18 @@ static void allocation_failures(const char *directory, int codec, int sync) {
   printf("SDK allocation codec=%d durable=%d cuts=%zu passed\n", codec, sync,
          cuts);
 }
+#include "collection_maintenance_cases.h"
 int main(int argc, char **argv) {
   char path[1024], directory[1024];
   lc_error e;
-  REQUIRE(argc == 2 || (argc == 3 && !strcmp(argv[2], "live")) ||
-          (argc == 5 &&
-           (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation"))) ||
-          (argc == 8 && !strcmp(argv[2], "io-one")));
+  REQUIRE(
+      argc == 2 || (argc == 3 && !strcmp(argv[2], "live")) ||
+      (argc == 5 && (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+                     !strcmp(argv[2], "maintenance") ||
+                     !strcmp(argv[2], "maintenance-live") ||
+                     !strcmp(argv[2], "maintenance-io") ||
+                     !strcmp(argv[2], "maintenance-allocation"))) ||
+      (argc == 8 && !strcmp(argv[2], "io-one")));
   REQUIRE(snprintf(path, sizeof(path), "%s/pouch-collection-sdk-XXXXXX",
                    argv[1]) > 0);
   REQUIRE(lc_test_tmp_mkdtemp(path, directory, sizeof(directory), argv[1]));
@@ -1323,7 +1355,35 @@ int main(int argc, char **argv) {
   } else if (argc == 5) {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strcmp(argv[2], "allocation"))
+    if (!strcmp(argv[2], "maintenance") || !strcmp(argv[2], "maintenance-live"))
+      maintenance_suite(directory, codec, sync,
+                        !strcmp(argv[2], "maintenance"));
+    else if (!strcmp(argv[2], "maintenance-io")) {
+      size_t cuts = 0U;
+      for (int operation = 4; operation < 6; ++operation) {
+        size_t calls = io_trial(directory, codec, sync, operation, 0, 0U);
+        REQUIRE(calls);
+        for (int mode = 0; mode < 4; ++mode)
+          for (size_t cut = 1U; cut <= calls; ++cut) {
+            (void)io_trial(directory, codec, sync, operation, mode, cut);
+            ++cuts;
+          }
+      }
+      printf("maintenance I/O codec=%d durable=%d cuts=%zu passed\n", codec,
+             sync, cuts);
+    } else if (!strcmp(argv[2], "maintenance-allocation")) {
+      size_t cuts = 0U;
+      for (int operation = 7; operation < 9; ++operation) {
+        size_t calls = allocation_trial(directory, codec, sync, operation, 0U);
+        REQUIRE(calls);
+        for (size_t cut = 1U; cut <= calls; ++cut) {
+          (void)allocation_trial(directory, codec, sync, operation, cut);
+          ++cuts;
+        }
+      }
+      printf("maintenance allocation codec=%d durable=%d cuts=%zu passed\n",
+             codec, sync, cuts);
+    } else if (!strcmp(argv[2], "allocation"))
       allocation_failures(directory, codec, sync);
     else
       io_failures(directory, codec, sync);

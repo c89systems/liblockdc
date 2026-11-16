@@ -1847,13 +1847,105 @@ collection / 48 KiB for four in these workloads, reported separately from the
 single persistent file; native stores have 23–61 files. The reopened NoSync and
 projection-rebuild costs remain optimization work.
 
-Collection compaction, indexed queries, background collection retention and
-shared-root operation remain outside this harness's admitted call contract.
+The owner-admission batch above did not yet admit collection maintenance; the
+following stage adds explicit passes. Indexed queries, background collection
+retention and shared-root operation remain outside the admitted call contract.
 The standing maintenance-capacity proposal still awaits an explicit decision.
 Existing-root conversion, Darwin/QEMU and large-machine qualification remain
 deferred, and production cutover still requires a deployment decision.
 The additional GNU lease sweep was stopped at 31 passing groups when development
 changed to larger integration batches; it is not a completed gate.
+
+## Collection maintenance
+
+The private `ps_pouch_collection_maintain` entry now runs the production
+collection retention engine, compactor and obsolete-storage cleanup, followed
+by the existing container metadata checkpoint. It supports forced compaction
+and cleanup-only passes. Normal public Pouch still selects the multifile
+backend. No public selector, application outcome log, persistence-version bump
+or deployment cutover is introduced.
+
+The common compactor now obtains output, sealing, projection publication,
+discard and cleanup through typed storage owners. Encoded bodies and codec
+units are copied with the existing bounded 128 KiB heap buffer; receipt,
+generation, position, query-identity and cardinality rules remain in the common
+engine. Snapshot parts are stabilized before canonical head selection.
+Disposable order/ID projections retain the common recovery algorithm. Native
+compaction retains independent stream-lock descriptions, including when the
+receiver itself has an admitted upload.
+
+The container owner serializes compaction with a lifetime gate. Capture rotates
+the tail and pins its read generation; copying proceeds outside append
+authority. Foreground appends enter the new tail, and publication replays that
+tail before selecting the snapshot. An upload that starts during copying can
+remain unfinished through snapshot publication and the physical checkpoint,
+then commit normally. An upload already holding private storage excludes initial
+capture. Concurrent entry-retention changes defer the attempt for retry.
+
+Obsolete segments retain their original grace timestamp through repeated
+compactions, clock rollback and reopen. A `PS_CATALOG_CONTROL` alias names the
+same canonical stream with 16 bytes: the segment identity and first-obsolete
+Unix timestamp, each little-endian 64-bit. Existing catalog checksums protect
+the metadata. Removal retires the canonical binding, then its alias, then the
+physical stream. A marker-only interrupted removal remains discoverable, without
+an independent marker control that could be stranded. Closed collection-owner
+reclamation captures both regular bindings and aliases, closes catalog views,
+and reclaims their unique targets before the control/identity anchor.
+
+Old captured read generations defer obsolete storage retirement; current
+generation readers do not pin unrelated old storage. Raw catalog views also
+defer retirement. Failed physical retirements retain an owner-cache identity
+for retry after the last name is removed. Uncached obsolete targets admit only
+their physical identity and do not replay bodies. The final metadata checkpoint
+releases extents retained by the previous recoverable root. Repeated compaction
+tests assert actual retired-byte clearance and reuse within the unchanged
+10 MiB container, including private leases and an all-deleted journal.
+
+Qualification artifacts are in `build/pouch-space-collection-maintenance/`:
+
+- The Debug build and 38 affected native/container/SDK/Lua groups passed. The
+  checkpoint-inclusive surface then passed 32 groups: eight native/container
+  comparison cases and 24 maintenance behavior/fault groups. This includes
+  **2,672 I/O cuts and 1,004 allocation cuts**, all four codec combinations,
+  both durability policies, and failure/process-death recovery at all five
+  publication phases. `surface-debug.log`, `surface-final-debug.log` and their
+  `-details.log` files retain the results. An additional eight behavior groups
+  passed after adding the unfinished-upload overlap and competing-compactor
+  checks (`surface-overlap-debug.log`); product sources were unchanged.
+- GNU Release and musl Release each passed 20 affected groups, including the
+  native collection regressions and maintenance/comparison cases
+  (`surface-gnu.log`, `surface-musl.log`). Debug used the actual 128 KiB worker
+  initializer with the glibc stack cache disabled; musl used default worker
+  stacks. GNU Release used ordinary platform worker stacks.
+- ThreadSanitizer passed all eight live maintenance configurations, including
+  peer appends during copying and upload overlap, with linked instrumented
+  OpenSSL 3.6.5 and no suppressions (`surface-tsan.log`, `relink-tsan.sh`).
+  Memcheck passed plain and encrypted/compressed maintenance under both policies:
+  **73,296 allocations/frees**, zero remaining blocks/errors/suppressions, and
+  only three inherited descriptors (`surface-memcheck.log`, `memcheck-*.log`).
+  Intentional process-death cases are excluded from these live memory checks.
+
+The normal GNU Release comparison records 96 verified rows: 48 matched pairs,
+three samples over 16 configurations. Workloads are 24 x 4 KiB or 8 x 64 KiB,
+one/four independent collections, both policies, and new/preopened owners.
+Both engines use 64 KiB segment targets, zero deletion grace and no throttle;
+the container timing includes its final physical checkpoint. Engine order
+alternates in the middle sample. OS cache is retained, so these are development
+observations rather than cold-device or production timing claims. Raw results
+are `surface-paired-performance.log` and the driver is `paired-performance.sh`.
+Per-configuration medians of paired native/container compaction-time ratios
+span **1.15-1.76x** (median **1.44x**); corresponding CPU ratios span 1.07-1.72x.
+The container makes **20-104 sync calls**, versus native's 17-68, and retains
+one persistent store file versus 27-77 native files. Higher barrier counts remain
+optimization work despite the favorable timings in this workload.
+
+This stage preserves the existing full-snapshot compaction algorithm. Copying
+still needs foreground free capacity; there is no implicit growth or guarantee
+of maintenance admission at full capacity. The incremental-checkpoint and
+protected-capacity proposal above still awaits a decision. Background collection
+discovery/retention, indexed queries, shared-root operation and the remaining
+queue/external-XA integration remain unfinished. The complete backend goal is
+not achieved by this maintenance stage.
 
 ## Integration and acceptance
 
@@ -1937,8 +2029,8 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Remaining integration includes collection maintenance and indexed-query owners,
-background retention scheduling, queues/outbox, complete external XA ownership
+Remaining integration includes indexed-query owners, background collection
+discovery/retention scheduling, queues/outbox, complete external XA ownership
 and shared-root coordination. Core collection positions and retry receipts now
 run through the container owner above. Normal public Pouch tests continue to
 exercise the segmented backend through the shared typed storage boundaries.

@@ -931,7 +931,8 @@ int lc_collection_edit_compact(lc_collection_handle *c,
   char source_leaf[64];
   const char *leaf = NULL;
   lc_u64 snapshot = 0;
-  int rc = LC_OK, occupied, destination = -1;
+  int rc = LC_OK, occupied;
+  lc_pouch_record_io destination;
   memset(&input, 0, sizeof(input));
   for (slot = 0; rc == LC_OK && slot < captured->capacity; ++slot) {
     rc = lc_collection_metadata_enter(c, 0, e);
@@ -962,13 +963,11 @@ int lc_collection_edit_compact(lc_collection_handle *c,
                   &destination, &leaf, &snapshot, e);
     if (rc == LC_OK)
       rc = lc_pouch_collection_record_copy(c->pouch, input.io, input.io,
-                                           source_leaf, &record,
-                                           lc_pouch_record_file_io(destination),
+                                           source_leaf, &record, destination,
                                            leaf, buffer, capacity, &copied, e);
     if (rc == LC_OK)
-      rc = lc_collection_edit_project(c, order, ids,
-                                      lc_pouch_record_file_io(destination),
-                                      &copied, NULL, snapshot, 1, e);
+      rc = lc_collection_edit_project(c, order, ids, destination, &copied, NULL,
+                                      snapshot, 1, e);
   }
   lc_collection_input_close(&input);
   if (rc == LC_OK && order->edit_count != copied_count)

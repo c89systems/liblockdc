@@ -80,11 +80,17 @@ static int publish(void *context, lc_collection_projection_build *build,
     files->order_owned = 0;
     build->published = 1;
   }
+  if (rc == LC_OK && build->on_publish)
+    rc = build->on_publish(build->publish_context,
+                           LC_COLLECTION_PROJECTION_ORDER, e);
   if (rc == LC_OK && rename(files->ids, c->ids_path) != 0)
     rc = failure(e, LC_ERR_TRANSPORT,
                  "failed to publish rebuilt append identities");
   else if (rc == LC_OK)
     files->ids_owned = 0;
+  if (rc == LC_OK && build->on_publish)
+    rc = build->on_publish(build->publish_context, LC_COLLECTION_PROJECTION_IDS,
+                           e);
   if (rc == LC_OK)
     rc = lc_pouch_path_fsync_directory(
         c->directory, "failed to sync collection recovery publication", e);

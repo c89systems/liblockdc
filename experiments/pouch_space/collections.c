@@ -1,10 +1,12 @@
 #define _GNU_SOURCE
 #include "collections.h"
+#include "collection_reclaim.h"
 #include "collection_segment.h"
 #include "control.h"
 #include "lc_api_internal.h"
 #include "lc_collection_catalog_record.h"
 #include "lc_collection_internal.h"
+#include "pouch_internal.h"
 #include "root_internal.h"
 #include <errno.h>
 #include <pthread.h>
@@ -17,6 +19,7 @@
 typedef struct collection_segment {
   lc_u64 id;
   ps_collection_segment *segment;
+  ps_owned_head *retiring;
   ps_catalog_info binding;
   int bound;
   struct collection_segment *next;
@@ -48,7 +51,7 @@ struct ps_collection_owner {
   collection_topology *topologies;
   pthread_mutex_t append, cache;
   pthread_rwlock_t metadata;
-  collection_gate commit, streams;
+  collection_gate commit, streams, compaction;
   unsigned int initialized;
   unsigned long references;
   int published, linked;
@@ -264,91 +267,14 @@ static int get_segment(ps_collection_owner *owner, lc_u64 id, int create,
       s = NULL;
     }
   }
+  if (rc == LC_OK && !s->segment)
+    rc = failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                 "collection selected a retiring segment");
   if (rc == LC_OK) {
     ps_collection_segment_retain(s->segment);
     *out = s->segment;
   }
   pthread_mutex_unlock(&owner->cache);
-  return rc;
-}
-typedef struct reclaim_item {
-  unsigned char name[8];
-  ps_catalog_info binding;
-} reclaim_item;
-typedef struct reclaim_list {
-  uint64_t owner;
-  unsigned int kind;
-  reclaim_item *items;
-  size_t count, capacity;
-} reclaim_list;
-static int capture_child(void *context, const void *name, size_t length,
-                         const ps_catalog_info *info, lc_error *e) {
-  reclaim_list *list = context;
-  reclaim_item *grown;
-  const unsigned char *bytes = name;
-  uint64_t id = 0U;
-  size_t i, next;
-  if (length != 8U)
-    return failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
-                   "collection child catalog has an invalid identity");
-  for (i = 0U; i < 8U; ++i)
-    id |= (uint64_t)bytes[i] << (8U * i);
-  if (!id || segment_kind(id) != list->kind ||
-      info->stream.owner != list->owner || info->stream.key != id ||
-      info->stream.kind != PS_STREAM)
-    return failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
-                   "collection child catalog points outside its owner");
-  if (list->count == list->capacity) {
-    next = list->capacity ? list->capacity * 2U : 8U;
-    if (next < list->capacity || next > (size_t)-1 / sizeof(*grown))
-      return failure(e, LC_ERR_NOMEM, NULL,
-                     "collection reclamation metadata is too large");
-    grown = lc_realloc_with_allocator(NULL, list->items, next * sizeof(*grown));
-    if (!grown)
-      return failure(e, LC_ERR_NOMEM, NULL,
-                     "cannot capture collection reclamation metadata");
-    list->items = grown;
-    list->capacity = next;
-  }
-  memcpy(list->items[list->count].name, name, 8U);
-  list->items[list->count++].binding = *info;
-  return LC_OK;
-}
-int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
-                                   lc_error *e) {
-  reclaim_list list;
-  ps_owned_head *head;
-  ps_owned_status status;
-  ps_key control;
-  size_t i;
-  unsigned int kind;
-  int rc = LC_OK;
-  memset(&list, 0, sizeof(list));
-  list.owner = owner;
-  for (kind = PS_CATALOG_SEGMENT; rc == LC_OK && kind <= PS_CATALOG_SNAPSHOT;
-       ++kind) {
-    list.kind = kind;
-    list.count = 0U;
-    rc = ps_catalog_visit(storage, owner, kind, capture_child, &list, e);
-    /* The captured catalog views have closed before any target retirement. */
-    for (i = 0U; rc == LC_OK && i < list.count; ++i) {
-      head = NULL;
-      rc = ps_owned_open(storage, NULL, list.items[i].binding.stream, 0,
-                         &list.items[i].binding.target, &head, &status, e);
-      if (rc == LC_OK)
-        rc = ps_catalog_remove(storage, owner, kind, list.items[i].name, 8U,
-                               &list.items[i].binding.revision, e);
-      if (rc == LC_OK)
-        rc = ps_owned_retire(head, e);
-      ps_owned_close(head);
-    }
-  }
-  lc_free_with_allocator(NULL, list.items);
-  control.owner = owner;
-  control.key = 1U;
-  control.kind = PS_CONTROL;
-  if (rc == LC_OK)
-    rc = ps_delete(storage, control, e);
   return rc;
 }
 static void owner_free(ps_collection_owner *owner, int retire) {
@@ -361,6 +287,7 @@ static void owner_free(ps_collection_owner *owner, int retire) {
   for (s = owner->segments; s; s = next) {
     next = s->next;
     ps_collection_segment_close(s->segment);
+    ps_owned_close(s->retiring);
     lc_free_with_allocator(&owner->allocator, s);
   }
   if (retire && owner->numeric && owner->identity) {
@@ -380,6 +307,8 @@ static void owner_free(ps_collection_owner *owner, int retire) {
   }
   if (owner->initialized & 16U)
     gate_destroy(&owner->streams);
+  if (owner->initialized & 32U)
+    gate_destroy(&owner->compaction);
   if (owner->initialized & 8U)
     gate_destroy(&owner->commit);
   if (owner->initialized & 4U)
@@ -501,6 +430,12 @@ static int projection_publish(void *context,
   int rc = ps_check(space(owner), e);
   if (rc == LC_OK)
     build->published = 1;
+  if (rc == LC_OK && build->on_publish)
+    rc = build->on_publish(build->publish_context,
+                           LC_COLLECTION_PROJECTION_ORDER, e);
+  if (rc == LC_OK && build->on_publish)
+    rc = build->on_publish(build->publish_context, LC_COLLECTION_PROJECTION_IDS,
+                           e);
   return rc;
 }
 static void projection_cleanup(void *context,
@@ -568,6 +503,8 @@ static int lock_enter(void *context, enum lc_collection_authority_kind kind,
     return gate_enter(&owner->commit, exclusive, wait, pin, e);
   case LC_COLLECTION_AUTH_STREAMS:
     return gate_enter(&owner->streams, exclusive, wait, pin, e);
+  case LC_COLLECTION_AUTH_COMPACTION:
+    return gate_enter(&owner->compaction, exclusive, wait, pin, e);
   case LC_COLLECTION_AUTH_READERS:
     pthread_mutex_lock(&owner->cache);
     for (topology = owner->topologies; topology && topology->id != snapshot;
@@ -614,7 +551,8 @@ static void lock_leave(void *context, enum lc_collection_authority_kind kind,
                        void *pin) {
   (void)context;
   if (kind == LC_COLLECTION_AUTH_STREAMS ||
-      kind == LC_COLLECTION_AUTH_READERS || kind == LC_COLLECTION_AUTH_COMMIT)
+      kind == LC_COLLECTION_AUTH_READERS || kind == LC_COLLECTION_AUTH_COMMIT ||
+      kind == LC_COLLECTION_AUTH_COMPACTION)
     gate_leave(pin);
   else if (kind == LC_COLLECTION_AUTH_CATALOG ||
            kind == LC_COLLECTION_AUTH_APPEND)
@@ -672,6 +610,191 @@ static int layout_rotate(void *context, int force, lc_u64 limit, lc_error *e) {
   ps_collection_segment_close(old);
   return rc;
 }
+/* Metadata authority excludes admission of old read generations. Captured
+ * operations release their lifetime pins without taking that authority. */
+static int obsolete_readers(ps_collection_owner *owner, lc_u64 current) {
+  collection_topology *t;
+  int busy = 0;
+  pthread_mutex_lock(&owner->cache);
+  for (t = owner->topologies; t; t = t->next) {
+    if (t->id == current)
+      continue;
+    pthread_mutex_lock(&t->gate.mutex);
+    busy |= t->gate.readers != 0U || t->gate.writer;
+    pthread_mutex_unlock(&t->gate.mutex);
+  }
+  pthread_mutex_unlock(&owner->cache);
+  return busy;
+}
+/* An uncached obsolete child needs only its physical identity, never canonical
+ * replay. Retain failed retirements in the owner cache so a raw catalog view
+ * can drain and a later cleanup can retry even after both names were removed.
+ */
+static int retire_resource(ps_collection_owner *owner,
+                           ps_collection_resources *list, lc_u64 id,
+                           const ps_catalog_info *identity, lc_error *e) {
+  collection_segment *s, **link;
+  ps_owned_status status;
+  int rc = LC_OK;
+  pthread_mutex_lock(&owner->cache);
+  for (s = owner->segments; s && s->id != id; s = s->next) {
+  }
+  if (!s) {
+    s = lc_calloc_with_allocator(&owner->allocator, 1U, sizeof(*s));
+    if (!s)
+      rc = failure(e, LC_ERR_NOMEM, NULL,
+                   "cannot retain collection reclamation identity");
+    if (rc == LC_OK)
+      rc = ps_owned_open(space(owner), NULL, identity->stream, 0,
+                         &identity->target, &s->retiring, &status, e);
+    if (rc == LC_OK) {
+      s->id = id;
+      s->binding = *identity;
+      s->bound = 1;
+      s->next = owner->segments;
+      owner->segments = s;
+    } else {
+      lc_free_with_allocator(&owner->allocator, s);
+      s = NULL;
+    }
+  }
+  if (rc == LC_OK)
+    rc = ps_collection_resources_remove(space(owner), list, id, 0, e);
+  if (rc == LC_OK) {
+    s->bound = 0;
+    rc = s->segment ? ps_collection_segment_retire(s->segment, e)
+                    : ps_owned_retire(s->retiring, e);
+    if (rc == LC_ERR_INVALID)
+      rc = failure(e, LC_ERR_PENDING, NULL,
+                   "obsolete collection storage has a catalog pin");
+  }
+  if (rc == LC_OK) {
+    for (link = &owner->segments; *link != s; link = &(*link)->next) {
+    }
+    *link = s->next;
+    ps_collection_segment_close(s->segment);
+    ps_owned_close(s->retiring);
+    lc_free_with_allocator(&owner->allocator, s);
+  }
+  pthread_mutex_unlock(&owner->cache);
+  return rc;
+}
+static int mark_resource(ps_collection_owner *owner,
+                         const ps_collection_resource *item, lc_u64 now,
+                         lc_error *e) {
+  unsigned char name[16];
+  ps_catalog_info ignored;
+  segment_name(item->id, name);
+  segment_name(now, name + 8U);
+  /* The catalog CRC covers the timestamp. The alias pins the same canonical
+   * stream, so process death cannot strand an independent marker resource. */
+  return ps_catalog_put(space(owner), NULL, owner->numeric, PS_CATALOG_CONTROL,
+                        name, sizeof(name), NULL, item->binding.stream,
+                        &item->binding.target, &ignored, e);
+}
+static int layout_cleanup(void *context, lc_pouch_maintenance_result *out,
+                          lc_error *e) {
+  collection_receiver *receiver = context;
+  ps_collection_owner *owner = receiver->owner;
+  lc_collection_handle *c = receiver->receiver;
+  ps_collection_resources list;
+  ps_collection_resource *item;
+  collection_segment *s, *candidate;
+  ps_catalog_info retry;
+  lc_pouch_unix_seconds instant;
+  lc_u64 marked, grace = c->pouch->compaction_delete_grace_seconds, retry_id;
+  size_t i, j;
+  int busy = obsolete_readers(owner, c->head.snapshot);
+  int pending, rc = lc_pouch_now_unix(&instant, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_collection_resources_capture(space(owner), owner->numeric, &list, e);
+  for (i = 0U; rc == LC_OK && i < list.count; ++i) {
+    item = &list.items[i];
+    for (j = 0U; j < i && list.items[j].id != item->id; ++j) {
+    }
+    if (j != i)
+      continue;
+    if (lc_collection_segment_selected(&c->head, item->id)) {
+      rc = ps_collection_resources_remove(space(owner), &list, item->id, 1, e);
+      continue;
+    }
+    marked = item->marked;
+    for (j = i + 1U; j < list.count; ++j)
+      if (list.items[j].id == item->id && list.items[j].marked)
+        marked = list.items[j].marked;
+    pending = busy;
+    if (grace && !marked && item->kind != PS_CATALOG_CONTROL) {
+      rc = mark_resource(owner, item, (lc_u64)instant, e);
+      pending = 1;
+    } else if (grace && marked &&
+               ((lc_u64)instant < marked || (lc_u64)instant - marked < grace))
+      pending = 1;
+    if (rc == LC_OK && !pending) {
+      rc = retire_resource(owner, &list, item->id, &item->binding, e);
+      if (rc == LC_ERR_PENDING) {
+        pending = 1;
+        clear(e);
+        rc = LC_OK;
+      } else if (rc == LC_OK && out)
+        ++out->cleanup_deleted_count;
+    }
+    if (rc == LC_OK && pending && out)
+      ++out->cleanup_pending_count;
+  }
+  /* Retry targets whose last catalog name was removed by a prior pass. Walk
+   * by identity because successful retirement removes its cache node. */
+  retry_id = 0U;
+  while (rc == LC_OK && !busy) {
+    pthread_mutex_lock(&owner->cache);
+    candidate = NULL;
+    for (s = owner->segments; s; s = s->next) {
+      if (s->bound || s->id <= retry_id ||
+          lc_collection_segment_selected(&c->head, s->id))
+        continue;
+      for (j = 0U; j < list.count && list.items[j].id != s->id; ++j) {
+      }
+      if (j == list.count && (!candidate || s->id < candidate->id))
+        candidate = s;
+    }
+    if (candidate) {
+      retry = candidate->binding;
+      retry_id = candidate->id;
+    }
+    pthread_mutex_unlock(&owner->cache);
+    if (!candidate)
+      break;
+    rc = retire_resource(owner, &list, retry_id, &retry, e);
+    if (rc == LC_ERR_PENDING) {
+      clear(e);
+      rc = LC_OK;
+      if (out)
+        ++out->cleanup_pending_count;
+    } else if (rc == LC_OK && out)
+      ++out->cleanup_deleted_count;
+  }
+  ps_collection_resources_clear(&list);
+  return rc;
+}
+static int layout_discard(void *context, lc_u64 id, lc_error *e) {
+  collection_receiver *receiver = context;
+  ps_collection_resources list;
+  size_t i;
+  int rc;
+  if (lc_collection_segment_selected(&receiver->receiver->head, id))
+    return failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                   "cannot discard selected collection storage");
+  rc = ps_collection_resources_capture(space(receiver->owner),
+                                       receiver->owner->numeric, &list, e);
+  for (i = 0U; rc == LC_OK && i < list.count; ++i)
+    if (list.items[i].id == id) {
+      rc = retire_resource(receiver->owner, &list, id, &list.items[i].binding,
+                           e);
+      break;
+    }
+  ps_collection_resources_clear(&list);
+  return rc;
+}
 static int bound(void *context, lc_error *e) {
   collection_receiver *binding = context;
   ps_collection_owner *owner = binding->owner;
@@ -723,6 +846,27 @@ static void receiver_release(void *context) {
   lc_free_with_allocator(&owner->allocator, binding);
   owner_release(owner);
 }
+int ps_pouch_collection_maintain(lc_collection *self, int force,
+                                 int cleanup_only,
+                                 lc_pouch_maintenance_result *out,
+                                 lc_error *e) {
+  lc_collection_handle *c = self ? self->impl : NULL;
+  int dropped = 0, rc = LC_OK;
+  if (out)
+    memset(out, 0, sizeof(*out));
+  if (!c || !ps_pouch_state_root(c->pouch))
+    return failure(e, LC_ERR_INVALID, NULL,
+                   "collection maintenance requires a container receiver");
+  if (!cleanup_only)
+    rc = lc_collection_retention_maintain(self, &dropped, out, e);
+  if (rc == LC_OK && !dropped)
+    rc = lc_collection_compact(self, force, cleanup_only, out, e);
+  /* Journaled retirement preserves the previous recoverable root's extents.
+   * Publish the existing metadata checkpoint before admitting their reuse. */
+  if (rc == LC_OK)
+    rc = ps_checkpoint(ps_root_space(ps_pouch_state_root(c->pouch)), e);
+  return rc;
+}
 static int receiver_attach(void *context, lc_collection_handle *c,
                            lc_error *e) {
   static const lc_collection_authority_ops locks = {lock_enter, lock_leave};
@@ -748,6 +892,8 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   c->projections.context = owner;
   c->layout.active = layout_active;
   c->layout.rotate = layout_rotate;
+  c->layout.discard = layout_discard;
+  c->layout.cleanup = layout_cleanup;
   c->layout.context = binding;
   return ps_check(space(owner), e);
 }
@@ -788,6 +934,9 @@ static int initialize_locks(ps_collection_owner *owner, lc_error *e) {
   if (gate_init(&owner->streams, e) != LC_OK)
     return e->code;
   owner->initialized |= 16U;
+  if (gate_init(&owner->compaction, e) != LC_OK)
+    return e->code;
+  owner->initialized |= 32U;
   return LC_OK;
 failed:
   return failure(e, LC_ERR_TRANSPORT, NULL,

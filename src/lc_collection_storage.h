@@ -55,6 +55,7 @@ typedef struct lc_collection_segment_ops {
   int (*ready)(void *, lc_error *);
   int (*publish)(void *, lc_pouch *, lc_error *);
   int (*force)(void *, lc_error *);
+  int (*seal)(void *, lc_error *);
 } lc_collection_segment_ops;
 typedef struct lc_collection_segment {
   const lc_collection_segment_ops *ops;
@@ -77,6 +78,7 @@ int lc_collection_segment_patch(lc_collection_segment *, lc_u64, const void *,
 int lc_collection_segment_sync_private(lc_collection_segment *, lc_error *);
 int lc_collection_segment_ready(lc_collection_segment *, lc_error *);
 int lc_collection_segment_force(lc_collection_segment *, lc_error *);
+int lc_collection_segment_seal(lc_collection_segment *, lc_error *);
 int lc_collection_segment_publish(lc_collection_segment *, lc_pouch *,
                                   lc_error *);
 typedef struct lc_collection_segments {
@@ -101,7 +103,10 @@ typedef struct lc_collection_projection_build {
   lc_collection_ids ids;
   void *private_state;
   int published;
+  int (*on_publish)(void *, int, lc_error *);
+  void *publish_context;
 } lc_collection_projection_build;
+enum { LC_COLLECTION_PROJECTION_ORDER = 1, LC_COLLECTION_PROJECTION_IDS };
 /* Disposable metadata construction/publication. Canonical replay, validation,
  * cardinality and generation rules remain in the common collection engine. */
 typedef struct lc_collection_projections {
@@ -121,12 +126,15 @@ lc_collection_file_projections(struct lc_collection_handle *);
 typedef struct lc_collection_layout {
   int (*active)(void *, lc_error *);
   int (*rotate)(void *, int force, lc_u64 limit, lc_error *);
+  int (*discard)(void *, lc_u64, lc_error *);
+  int (*cleanup)(void *, lc_pouch_maintenance_result *, lc_error *);
   void *context;
 } lc_collection_layout;
 lc_collection_layout lc_collection_file_layout(struct lc_collection_handle *);
 /* Bind every native owner component together, including conversion receivers.
  */
 void lc_collection_file_bind(struct lc_collection_handle *);
+int lc_collection_segment_selected(const lc_collection_disk_head *, lc_u64);
 
 enum lc_collection_authority_kind {
   LC_COLLECTION_AUTH_CATALOG,
@@ -134,7 +142,8 @@ enum lc_collection_authority_kind {
   LC_COLLECTION_AUTH_APPEND,
   LC_COLLECTION_AUTH_COMMIT,
   LC_COLLECTION_AUTH_READERS,
-  LC_COLLECTION_AUTH_STREAMS
+  LC_COLLECTION_AUTH_STREAMS,
+  LC_COLLECTION_AUTH_COMPACTION
 };
 /* Collection coordination follows the established append/commit/metadata
  * order. The snapshot number is meaningful only to captured reader topology.

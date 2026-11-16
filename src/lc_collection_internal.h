@@ -263,7 +263,8 @@ int lc_collection_edit_project(lc_collection_handle *, lc_collection_order *,
                                const lc_pouch_collection_record *,
                                const lc_pouch_collection_record *, lc_u64, int,
                                lc_error *);
-typedef int (*lc_collection_compact_output_fn)(void *, lc_u64, int *,
+typedef int (*lc_collection_compact_output_fn)(void *, lc_u64,
+                                               lc_pouch_record_io *,
                                                const char **, lc_u64 *,
                                                lc_error *);
 int lc_collection_edit_compact(lc_collection_handle *, lc_collection_ids *,
@@ -318,6 +319,8 @@ int lc_collection_retention_maintain(lc_collection *collection, int *dropped,
 int lc_collection_cleanup_files(lc_collection_handle *collection,
                                 lc_pouch_maintenance_result *out,
                                 lc_error *error);
+int lc_collection_file_cleanup(lc_collection_handle *,
+                               lc_pouch_maintenance_result *, lc_error *);
 enum {
   LC_COLLECTION_COMPACT_CAPTURED = 1,
   LC_COLLECTION_COMPACT_COPIED,

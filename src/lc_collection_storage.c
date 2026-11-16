@@ -177,9 +177,9 @@ static int segment_force(void *context, lc_error *e) {
              : file_error(e, "failed to sync collection policy boundary");
 }
 static const lc_collection_segment_ops file_segment_ops = {
-    segment_clone,  segment_close,   segment_resize,
-    segment_resize, segment_patch,   segment_sync_private,
-    segment_ready,  segment_publish, segment_force};
+    segment_clone, segment_close,        segment_resize, segment_resize,
+    segment_patch, segment_sync_private, segment_ready,  segment_publish,
+    segment_force, segment_force};
 int lc_collection_segment_adopt_file(int fd, lc_collection_segment *out,
                                      lc_error *e) {
   if (!out || fd < 0) {
@@ -243,6 +243,14 @@ static int segment_open(void *context, lc_u64 segment, int create,
   lc_free_with_allocator(&c->allocator, path);
   if (fd < 0)
     return file_error(e, "failed to open collection canonical segment");
+  if (create) {
+    rc = lc_pouch_path_fsync_directory(
+        c->directory, "failed to sync collection canonical segment name", e);
+    if (rc != LC_OK) {
+      (void)close(fd);
+      return rc;
+    }
+  }
   return lc_collection_segment_adopt_file(fd, out, e);
 }
 lc_collection_segments lc_collection_file_segments(lc_collection_handle *c) {
@@ -285,11 +293,19 @@ static int authority_lock(void *context, enum lc_collection_authority_kind kind,
   else if (kind == LC_COLLECTION_AUTH_APPEND)
     fd = c->append_fd;
   else if (kind == LC_COLLECTION_AUTH_STREAMS) {
-    if (c->streams_fd < 0)
-      c->streams_fd = authority_open(c, ".streams.lock", e);
-    fd = c->streams_fd;
+    if (exclusive) {
+      fd = authority_open(c, ".streams.lock", e);
+      own = 1;
+    } else {
+      if (c->streams_fd < 0)
+        c->streams_fd = authority_open(c, ".streams.lock", e);
+      fd = c->streams_fd;
+    }
   } else if (kind == LC_COLLECTION_AUTH_COMMIT) {
     fd = authority_open(c, ".commit.lock", e);
+    own = 1;
+  } else if (kind == LC_COLLECTION_AUTH_COMPACTION) {
+    fd = authority_open(c, ".compaction.lock", e);
     own = 1;
   } else if (kind == LC_COLLECTION_AUTH_READERS) {
     if (lc_u64_format_base10_padded(snapshot, 20U, number, sizeof(number)) < 0)
@@ -327,8 +343,13 @@ static void authority_unlock(void *context,
                              void *token) {
   int fd = (int)(intptr_t)token;
   (void)context;
-  if (kind == LC_COLLECTION_AUTH_CATALOG || kind == LC_COLLECTION_AUTH_COMMIT ||
-      kind == LC_COLLECTION_AUTH_READERS)
+  if (kind == LC_COLLECTION_AUTH_STREAMS &&
+      fd != ((lc_collection_handle *)context)->streams_fd)
+    (void)close(fd);
+  else if (kind == LC_COLLECTION_AUTH_CATALOG ||
+           kind == LC_COLLECTION_AUTH_COMMIT ||
+           kind == LC_COLLECTION_AUTH_READERS ||
+           kind == LC_COLLECTION_AUTH_COMPACTION)
     (void)close(fd);
   else
     (void)flock(fd, LOCK_UN);
@@ -372,7 +393,19 @@ void lc_collection_file_bind(lc_collection_handle *c) {
   c->authority = lc_collection_file_authority(c);
   c->segments = lc_collection_file_segments(c);
 }
+int lc_collection_segment_selected(const lc_collection_disk_head *head,
+                                   lc_u64 id) {
+  if (id & LC_COLLECTION_SNAPSHOT_BIT) {
+    id &= (lc_u64)LC_I64_MAX;
+    return head->snapshot && id >= head->snapshot &&
+           id - head->snapshot <= head->snapshot_extra_parts;
+  }
+  return id >= head->tail_segment && id <= head->active;
+}
 
 int lc_collection_segment_force(lc_collection_segment *segment, lc_error *e) {
   return segment->ops->force(segment->context, e);
+}
+int lc_collection_segment_seal(lc_collection_segment *segment, lc_error *e) {
+  return segment->ops->seal(segment->context, e);
 }

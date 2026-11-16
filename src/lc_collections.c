@@ -1639,10 +1639,29 @@ static int file_layout_rotate(void *context, int force, lc_u64 limit,
                               lc_error *error) {
   return lc_cc_file_rotate(context, force, limit, error);
 }
+static int file_layout_discard(void *context, lc_u64 id, lc_error *error) {
+  lc_collection_handle *c = context;
+  char *path = NULL, leaf[64];
+  int rc = lc_collection_record_path(c, id, &path, leaf, error);
+  if (rc == LC_OK && unlink(path) != 0 && errno != ENOENT)
+    rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
+                               "failed to discard collection snapshot");
+  lc_free_with_allocator(&c->allocator, path);
+  if (rc == LC_OK)
+    rc = lc_pouch_path_fsync_directory(
+        c->directory, "failed to sync snapshot discard", error);
+  return rc;
+}
+static int file_layout_cleanup(void *context, lc_pouch_maintenance_result *out,
+                               lc_error *error) {
+  return lc_collection_file_cleanup(context, out, error);
+}
 lc_collection_layout lc_collection_file_layout(lc_collection_handle *c) {
   lc_collection_layout layout;
   layout.active = file_layout_active;
   layout.rotate = file_layout_rotate;
+  layout.discard = file_layout_discard;
+  layout.cleanup = file_layout_cleanup;
   layout.context = c;
   return layout;
 }

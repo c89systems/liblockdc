@@ -36,14 +36,11 @@ static int lc_cl_kind(lc_collection_handle *collection, const char *name) {
   }
   if (lc_cl_number(name, "seg-", ".log", &id) && id != 0U &&
       id < LC_COLLECTION_SNAPSHOT_BIT)
-    return id >= collection->head.tail_segment && id <= collection->head.active
-               ? 1
-               : 2;
+    return lc_collection_segment_selected(&collection->head, id) ? 1 : 2;
   if (lc_cl_number(name, "snapshot-", ".log", &id) && id != 0U &&
       id < LC_COLLECTION_SNAPSHOT_BIT)
-    return id >= collection->head.snapshot &&
-                   id - collection->head.snapshot <=
-                       collection->head.snapshot_extra_parts
+    return lc_collection_segment_selected(&collection->head,
+                                          id | LC_COLLECTION_SNAPSHOT_BIT)
                ? 1
                : 2;
   if (strncmp(name, "order.rebuild-", 14U) == 0 ||
@@ -184,9 +181,9 @@ static int lc_cl_obsolete_at(const char *path, lc_u64 now, lc_u64 *marked,
   return LC_OK;
 }
 
-int lc_collection_cleanup_files(lc_collection_handle *collection,
-                                lc_pouch_maintenance_result *out,
-                                lc_error *error) {
+int lc_collection_file_cleanup(lc_collection_handle *collection,
+                               lc_pouch_maintenance_result *out,
+                               lc_error *error) {
   DIR *dir;
   struct dirent *entry;
   struct stat st;
@@ -330,4 +327,10 @@ int lc_collection_cleanup_files(lc_collection_handle *collection,
     rc = lc_pouch_path_fsync_directory(
         collection->directory, "failed to sync collection reclamation", error);
   return rc;
+}
+
+int lc_collection_cleanup_files(lc_collection_handle *collection,
+                                lc_pouch_maintenance_result *out,
+                                lc_error *error) {
+  return collection->layout.cleanup(collection->layout.context, out, error);
 }

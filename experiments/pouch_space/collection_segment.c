@@ -437,12 +437,16 @@ static int cs_owner_publish(void *context, lc_pouch *pouch, lc_error *e) {
 static int cs_owner_ready(void *context, lc_error *e) {
   return ps_collection_segment_publish(context, PS_COMMIT_DEFER_SYNC, e);
 }
+static int cs_owner_seal(void *context, lc_error *e) {
+  int rc = ps_collection_segment_publish(context, PS_COMMIT_DEFAULT, e);
+  return rc == LC_OK ? ps_collection_segment_seal(context, e) : rc;
+}
 void ps_collection_segment_bind(ps_collection_segment *segment,
                                 lc_collection_segment *out) {
   static const lc_collection_segment_ops ops = {
-      cs_owner_clone,    cs_owner_close,   cs_owner_reserve,
-      cs_owner_truncate, cs_owner_patch,   cs_owner_sync,
-      cs_owner_ready,    cs_owner_publish, cs_owner_sync};
+      cs_owner_clone, cs_owner_close, cs_owner_reserve, cs_owner_truncate,
+      cs_owner_patch, cs_owner_sync,  cs_owner_ready,   cs_owner_publish,
+      cs_owner_sync,  cs_owner_seal};
   memset(out, 0, sizeof(*out));
   if (!segment)
     return;

@@ -33,8 +33,9 @@ typedef struct ps_pouch_state_options {
  * control heads and canonical bytes live in the container; order/ID metadata
  * is disposable memfd scratch. A physical-owner recovery changes the scratch
  * epoch, invalidating prior cursors/head preconditions; receivers sharing a
- * live owner have the same epoch. Collection compaction, indexing and
- * background collection retention remain outside this harness.
+ * live owner have the same epoch. Explicit collection maintenance below uses
+ * the common compactor and retention engine. Indexing and background
+ * collection retention remain outside this harness.
  * Other Pouch operations are outside this harness's current call contract.
  * Explicitly disable indexing, background maintenance and queue watches; shared
  * root mode and generated external key files are not admitted. No public
@@ -65,4 +66,11 @@ typedef struct ps_pouch_compaction_result {
  * metadata/rotation admission at full capacity is still pending. */
 int ps_pouch_state_compact(lc_pouch *, const char *ns,
                            ps_pouch_compaction_result *, lc_error *);
+/* Explicit collection retention, compaction and obsolete storage cleanup.
+ * Snapshot copies use bounded buffers and leave foreground appends independent.
+ * Existing grace periods and captured reader generations govern retirement.
+ * This pass may require free capacity; it neither grows the container nor
+ * promises maintenance admission at full capacity. */
+int ps_pouch_collection_maintain(lc_collection *, int force, int cleanup_only,
+                                 lc_pouch_maintenance_result *, lc_error *);
 #endif
