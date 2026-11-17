@@ -6,6 +6,7 @@
 #include "lc_intcompat.h"
 #include "lc_log.h"
 #include "lc_pouch_format.h"
+#include "lc_pouch_index_store.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_path.h"
@@ -1812,6 +1813,31 @@ static int lc_pouch_indexer_worker_init(lc_pouch *pouch, lc_error *error) {
   }
   pouch->indexer_thread_started = 1;
   return LC_OK;
+}
+
+int lc_pouch_runtime_start_indexing(lc_pouch *pouch, lc_error *error) {
+  if (!pouch || pouch->indexer_mutex_initialized)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "index worker requires an initialized runtime without "
+                        "an existing worker",
+                        NULL, NULL, "pouch");
+  if (!pouch->query_indexing_enabled)
+    return LC_OK;
+  if (pouch->storage.ops) {
+    const lc_pouch_index_store_ops *ops;
+    void *context = NULL;
+    ops = pouch->storage.ops->query_indexes
+              ? pouch->storage.ops->query_indexes(pouch->storage.context,
+                                                  &context)
+              : NULL;
+    if (!ops || !context || !ops->open || !ops->close || !ops->replace ||
+        !ops->remove || !ops->signature || !ops->prune)
+      return lc_error_set(
+          error, LC_ERR_UNSUPPORTED, 0L,
+          "storage owner has no complete query-index capability", NULL, NULL,
+          "pouch");
+  }
+  return lc_pouch_indexer_worker_init(pouch, error);
 }
 
 static void lc_pouch_indexer_worker_close(lc_pouch *pouch) {
@@ -3837,12 +3863,10 @@ int lc_pouch_open(const char *root_path, const lc_allocator *allocator,
     lc_pouch_close(pouch);
     return rc;
   }
-  if (pouch->query_indexing_enabled) {
-    rc = lc_pouch_indexer_worker_init(pouch, error);
-    if (rc != LC_OK) {
-      lc_pouch_close(pouch);
-      return rc;
-    }
+  rc = lc_pouch_runtime_start_indexing(pouch, error);
+  if (rc != LC_OK) {
+    lc_pouch_close(pouch);
+    return rc;
   }
   *out = pouch;
   {

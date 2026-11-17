@@ -24,6 +24,13 @@ int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 void ps_owned_close(ps_owned_head *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
+/* Capture head metadata without acquiring its exclusive writer owner, reading
+ * payloads, allocating handles or changing pins. A retained catalog/read pin
+ * protects the caller's subsequent use; this scalar observation alone does not.
+ * Exact references reject stale/foreign incarnations, including during reads.
+ */
+int ps_owned_inspect(ps_space *, ps_key, const ps_ref *, ps_owned_status *,
+                     lc_error *);
 /* desired==0 looks up a grant at the exact logical base (found==0 is EOF).
  * Otherwise allocate a new contiguous grant at the current capacity; desired
  * is a whole-page physical size, at most 1 MiB. Fragmentation may reduce it.

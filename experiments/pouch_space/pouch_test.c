@@ -1272,14 +1272,16 @@ static void mutations(const char *path, const char *directory) {
       REQUIRE(w.version == 1 && !w.query_hidden);
       lc_pouch_state_write_result_cleanup(&allocator, &w);
       metadata_read(p, "empty", "placeholder", 1, 1, &e);
-      /* Unsupported lease/staging options cannot publish partial state. */
+      /* Disabled indexing ignores operation guards, as native Pouch does. */
+      meta.has_expected_version = 0;
       meta.query_index_operation_active = 1;
-      REQUIRE(lc_pouch_state_update_metadata(p, "mutation/ns", "empty", &meta,
-                                             &w, &e) == LC_ERR_UNSUPPORTED);
-      clear(&e);
-      REQUIRE(lc_pouch_state_delete(p, "mutation/ns", "empty", &meta, &w, &e) ==
-              LC_ERR_UNSUPPORTED);
-      clear(&e);
+      ok(lc_pouch_state_update_metadata(p, "mutation/ns", "empty", &meta, &w,
+                                        &e),
+         &e);
+      REQUIRE(!w.query_index_operation_guard_started);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      ok(lc_pouch_state_delete(p, "mutation/ns", "empty", &meta, &w, &e), &e);
+      REQUIRE(!w.query_index_operation_guard_started);
       lc_pouch_state_write_result_cleanup(&allocator, &w);
       one_file(directory);
       lc_pouch_close(p);
@@ -2414,11 +2416,13 @@ static void validation(const char *path) {
       o.logical.compression = "unknown";
       expected = LC_ERR_INVALID;
     }
-    if (bad == 1 || bad == 4) {
-      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    if (bad == 0 || bad == 1 || bad == 2 || bad == 4) {
+      ok(ps_pouch_state_open(path, 1, &allocator, bad ? &o : NULL, &p, &e), &e);
       REQUIRE(p && (bad == 1 ? p->compaction_thread_started
-                             : p->queue_watch_enabled &&
-                                   !strcmp(p->queue_watch_mode, "inprocess")));
+                    : bad == 0 || bad == 2
+                        ? p->indexer_thread_started
+                        : p->queue_watch_enabled &&
+                              !strcmp(p->queue_watch_mode, "inprocess")));
       lc_pouch_close(p);
       REQUIRE(!live && !unlink(path));
       continue;

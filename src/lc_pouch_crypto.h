@@ -97,6 +97,10 @@ int lc_pouch_crypto_writer_restart(lc_pouch_crypto_writer *writer,
 /* Conservative total encoded size for a fresh unit with this writer's codec
  * settings. The bound does not allocate or inspect/retain input bytes. */
 uint64_t lc_pouch_crypto_writer_bound(lc_pouch_crypto_writer *, uint64_t);
+/* Same conservative bound before opening a producer. Descriptor ceiling is
+ * separate from encoded bytes; callers add their own framing/footer. */
+uint64_t lc_pouch_crypto_stream_bound(lc_pouch_crypto *, uint64_t,
+                                      int allow_compression, size_t *);
 void lc_pouch_crypto_writer_close(lc_pouch_crypto_writer *writer);
 int lc_pouch_crypto_produce_to_fd(lc_pouch_crypto *crypto, const char *context,
                                   int fd, lc_pouch_crypto_producer_fn producer,

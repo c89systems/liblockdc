@@ -13714,18 +13714,11 @@ static int lc_pouch_state_storage_sink_write(lc_sink *sink, const void *bytes,
   return lc_pouch_record_io_append(*io, &part, 1, error) == LC_OK;
 }
 
-static int lc_pouch_state_mutation_request_check(
-    lc_pouch *pouch, const char *key,
-    const lc_pouch_state_write_options *options, lc_error *error) {
+static int lc_pouch_state_key_check(const char *key, lc_error *error) {
   if (strlen(key) > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES)
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state key exceeds local limit", NULL, NULL,
                         "pouch");
-  if (pouch->storage.ops != NULL && options != NULL &&
-      options->query_index_operation_active)
-    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
-                        "container query operation publication is pending",
-                        NULL, NULL, "pouch");
   return LC_OK;
 }
 
@@ -13860,7 +13853,7 @@ static int lc_pouch_state_write_resolved_locked(
   }
   memset(out, 0, sizeof(*out));
   memset(&storage_append, 0, sizeof(storage_append));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, options, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   index_seq = 0UL;
@@ -15713,7 +15706,7 @@ static int lc_pouch_state_update_metadata_from_current_locked(
                         NULL, "pouch");
   }
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, options, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   query_index_guard_started = 0;
@@ -15861,7 +15854,7 @@ static int lc_pouch_state_metadata_append_schedule_from_current_locked(
                         NULL, NULL, "pouch");
   }
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, options, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   query_index_guard_started = 0;
@@ -15967,7 +15960,7 @@ int lc_pouch_state_update_metadata_locked(
                         NULL, NULL, NULL);
   }
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, options, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   memset(&current, 0, sizeof(current));
@@ -16023,7 +16016,7 @@ int lc_pouch_state_update_metadata_prepared_locked(
                         NULL, NULL, "pouch");
   }
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, NULL, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   memset(&current, 0, sizeof(current));
@@ -16137,7 +16130,7 @@ lc_pouch_state_delete_locked(lc_pouch *pouch, const char *ns, const char *key,
                         NULL, NULL, NULL);
   }
   memset(out, 0, sizeof(*out));
-  rc = lc_pouch_state_mutation_request_check(pouch, key, options, error);
+  rc = lc_pouch_state_key_check(key, error);
   if (rc != LC_OK)
     return rc;
   index_seq = 0UL;

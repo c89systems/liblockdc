@@ -6,8 +6,10 @@
 #include "lc_api_internal.h"
 #include "lc_collection_catalog_record.h"
 #include "lc_collection_internal.h"
+#include "lc_collection_query.h"
 #include "namespace_work.h"
 #include "pouch_internal.h"
+#include "query_index.h"
 #include "root_internal.h"
 #include <errno.h>
 #include <pthread.h>
@@ -400,6 +402,9 @@ static int scratch(void *context, lc_error *e) {
 static int order_refresh(void *context, lc_collection_order *order,
                          lc_error *e) {
   collection_receiver *binding = context;
+  ps_collection_owner *owner = binding->owner;
+  lc_collection_handle *c = binding->receiver;
+  ps_owned_status active;
   int rc = order->fd < 0
                ? lc_collection_order_adopt(scratch(context, e), 1, order, e)
                : lc_collection_order_refresh(order, e);
@@ -408,8 +413,17 @@ static int order_refresh(void *context, lc_collection_order *order,
    * native projection's rename. Rebuild only disposable metadata under the
    * captured topology's metadata pin; never repair a producer's canonical tail.
    */
-  if (rc == LC_OK && order->snapshot != binding->receiver->head.snapshot)
-    rc = lc_collection_projection_capture(binding->receiver, e);
+  if (rc == LC_OK)
+    rc = ps_owned_inspect(space(owner), key_for(owner, c->head.active), NULL,
+                          &active, e);
+  /* A peer can also complete a page without changing the snapshot. Its
+   * canonical ready tail must be visible before validating a late index
+   * publication against this receiver's disposable order. Private allocation
+   * alone does not advance this watermark or require a replay. */
+  if (rc == LC_OK && (order->snapshot != c->head.snapshot ||
+                      order->replay_segment != c->head.active ||
+                      order->replay_offset < active.tail))
+    rc = lc_collection_projection_capture(c, e);
   return rc;
 }
 static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
@@ -418,6 +432,116 @@ static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
                                                       &owner->allocator, ids, e)
                      : lc_collection_ids_refresh(ids, e);
 }
+#define COLLECTION_QUERY_NAME_BYTES (LC_XID_STRING_SIZE - 1U + 8U)
+static int query_name(const char *epoch, lc_u64 ordinal, unsigned char *name,
+                      lc_error *e) {
+  size_t i;
+  if (!lc_xid_is_valid(epoch))
+    return failure(e, LC_ERR_INVALID, NULL,
+                   "collection query epoch is invalid");
+  memcpy(name, epoch, LC_XID_STRING_SIZE - 1U);
+  for (i = 0U; i < 8U; ++i)
+    name[LC_XID_STRING_SIZE - 1U + i] = (unsigned char)(ordinal >> (8U * i));
+  return LC_OK;
+}
+static int query_open(void *context, const char *epoch, lc_u64 ordinal,
+                      lc_pouch_index_input *out, lc_error *e) {
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
+  unsigned char name[COLLECTION_QUERY_NAME_BYTES];
+  int rc = query_name(epoch, ordinal, name, e);
+  memset(out, 0, sizeof(*out));
+  return rc == LC_OK ? ps_query_artifact_open(owner->ns, owner->numeric, name,
+                                              sizeof(name), out, e)
+                     : rc;
+}
+static void query_close(void *context, lc_pouch_index_input *input) {
+  ps_collection_owner *owner = ((collection_receiver *)context)->owner;
+  ps_query_artifact_close(owner->ns->root, input);
+}
+typedef struct collection_query_producer {
+  collection_receiver *receiver;
+  lc_pouch_index_produce_fn produce;
+  void *context;
+} collection_query_producer;
+static int query_produce(void *context, lc_sink *sink, lc_error *e) {
+  collection_query_producer *p = context;
+#ifdef LOCKDC_TEST_BUILD
+  int rc;
+  if (lc_collection_query_test_hook) {
+    rc = lc_collection_query_test_hook(lc_collection_query_test_context,
+                                       p->receiver->receiver, NULL, e);
+    if (rc != LC_OK)
+      return rc;
+  }
+#endif
+  return p->produce(p->context, sink, e);
+}
+static int query_replace(void *context, const char *epoch, lc_u64 ordinal,
+                         uint64_t bound, lc_pouch_index_produce_fn produce,
+                         void *producer, lc_pouch_index_select_fn select,
+                         void *selector, lc_error *e) {
+  collection_receiver *receiver = context;
+  ps_collection_owner *owner = receiver->owner;
+  collection_query_producer p;
+  unsigned char name[COLLECTION_QUERY_NAME_BYTES];
+  int rc = query_name(epoch, ordinal, name, e);
+  p.receiver = receiver;
+  p.produce = produce;
+  p.context = producer;
+  return rc == LC_OK
+             ? ps_query_artifact_replace(owner->ns, owner->numeric, name,
+                                         sizeof(name), bound, query_produce, &p,
+                                         select, selector, e)
+             : rc;
+}
+typedef struct collection_query_cleanup {
+  collection_receiver *receiver;
+  lc_pouch_maintenance_result *result;
+} collection_query_cleanup;
+static int query_cleanup_one(void *context, const void *name, size_t length,
+                             const ps_catalog_info *info, lc_error *e) {
+  collection_query_cleanup *cleanup = context;
+  collection_receiver *receiver = cleanup->receiver;
+  lc_collection_handle *c = receiver->receiver;
+  const unsigned char *bytes = name;
+  char epoch[LC_XID_STRING_SIZE];
+  int rc;
+  if (length != COLLECTION_QUERY_NAME_BYTES)
+    return failure(e, LC_ERR_PROTOCOL, NULL,
+                   "collection query catalog identity is invalid");
+  memcpy(epoch, bytes, LC_XID_STRING_SIZE - 1U);
+  epoch[LC_XID_STRING_SIZE - 1U] = '\0';
+  if (!lc_xid_is_valid(epoch))
+    return failure(e, LC_ERR_PROTOCOL, NULL,
+                   "collection query catalog epoch is invalid");
+  rc = lc_collection_metadata_enter(c, 1, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = lc_collection_refresh_view(c, e);
+  if (rc == LC_OK && strcmp(epoch, c->order.query_id)) {
+    rc = ps_namespace_work_ensure(receiver->owner->ns,
+                                  LC_POUCH_STORAGE_WORK_ORDINARY, e);
+    if (rc == LC_OK)
+      rc = ps_query_artifact_remove(space(receiver->owner),
+                                    receiver->owner->numeric, name, length,
+                                    &info->revision, e);
+    if (rc == LC_OK && cleanup->result)
+      ++cleanup->result->cleanup_deleted_count;
+  }
+  lc_collection_metadata_leave(c);
+  return rc;
+}
+static int query_cleanup(void *context, lc_pouch_maintenance_result *out,
+                         lc_error *e) {
+  collection_receiver *receiver = context;
+  ps_collection_owner *owner = receiver->owner;
+  collection_query_cleanup cleanup;
+  cleanup.receiver = receiver;
+  cleanup.result = out;
+  return ps_catalog_visit(space(owner), owner->numeric, PS_CATALOG_PROJECTION,
+                          query_cleanup_one, &cleanup, e);
+}
+
 static int projection_begin(void *context,
                             lc_collection_projection_build *build,
                             lc_error *e) {
@@ -872,6 +996,10 @@ int ps_pouch_collection_maintain(lc_collection *self, int force,
     rc = lc_collection_retention_maintain(self, &dropped, out, e);
   if (rc == LC_OK && !dropped)
     rc = lc_collection_compact(self, force, cleanup_only, out, e);
+  if (rc == LC_OK && !dropped)
+    rc = lc_collection_query_cleanup(self, out, e);
+  if (rc == LC_OK && !dropped && !cleanup_only)
+    rc = lc_collection_query_maintain(self, e);
   /* Journaled retirement preserves the previous recoverable root's extents.
    * Publish the existing metadata checkpoint before admitting their reuse. */
   if (rc == LC_OK)
@@ -901,6 +1029,11 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   c->projections.publish = projection_publish;
   c->projections.cleanup = projection_cleanup;
   c->projections.context = binding;
+  c->queries.open = query_open;
+  c->queries.close = query_close;
+  c->queries.replace = query_replace;
+  c->queries.cleanup = query_cleanup;
+  c->queries.context = binding;
   c->layout.active = layout_active;
   c->layout.rotate = layout_rotate;
   c->layout.discard = layout_discard;
@@ -1412,6 +1545,10 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
     if (rc == LC_OK && collection && !dropped)
       rc = lc_collection_compact(collection, options->force,
                                  options->cleanup_only, out, &local);
+    if (rc == LC_OK && collection && !dropped)
+      rc = lc_collection_query_cleanup(collection, out, &local);
+    if (rc == LC_OK && collection && !dropped && !options->cleanup_only)
+      rc = lc_collection_query_maintain(collection, &local);
     if (stale(rc, &local)) {
       clear(&local);
       rc = LC_OK;

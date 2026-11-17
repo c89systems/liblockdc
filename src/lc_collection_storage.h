@@ -4,6 +4,7 @@
 #include "lc_collection_head.h"
 #include "lc_collection_ids.h"
 #include "lc_collection_order.h"
+#include "lc_pouch_index_store.h"
 #include "lc_pouch_record_io.h"
 
 /* Segment identity admits a canonical input pin. The byte capability and pin
@@ -119,6 +120,24 @@ typedef struct lc_collection_projections {
 } lc_collection_projections;
 lc_collection_projections
 lc_collection_file_projections(struct lc_collection_handle *);
+/* Optional immutable query-page artifacts, separate from canonical order and
+ * ID projections. The common engine owns epoch/row binding validation. The
+ * physical owner protects a private build, calls select only after its full
+ * encoded bytes are ready, and closes every unselected build on failure/skip.
+ * Open pins captured bytes until close. No application body is materialized. */
+typedef struct lc_collection_query_storage {
+  int (*open)(void *, const char *, lc_u64, lc_pouch_index_input *, lc_error *);
+  void (*close)(void *, lc_pouch_index_input *);
+  int (*replace)(void *, const char *, lc_u64, uint64_t,
+                 lc_pouch_index_produce_fn, void *, lc_pouch_index_select_fn,
+                 void *, lc_error *);
+  int (*cleanup)(void *, lc_pouch_maintenance_result *, lc_error *);
+  void *context;
+} lc_collection_query_storage;
+lc_collection_query_storage
+lc_collection_file_queries(struct lc_collection_handle *);
+int lc_collection_file_query_cleanup(void *, lc_pouch_maintenance_result *,
+                                     lc_error *);
 /* Structural selection/rotation belongs to the canonical topology owner.
  * The logical engine supplies the byte target; positions and receipts do not
  * cross this boundary. The owner updates the receiver's selected capability

@@ -21,6 +21,7 @@ static size_t checks, roots;
 static char *key;
 static char scenario[192];
 static int diagnostic;
+static int query_mode;
 static int allocation_armed, allocation_fired;
 static size_t allocation_calls, allocation_fail;
 static pthread_t allocation_thread;
@@ -152,8 +153,9 @@ static void setup_io_mode(fixture *f, const char *directory, int codec,
                    roots++) > 0);
   REQUIRE(snprintf(f->endpoint, sizeof(f->endpoint),
                    "pouch://%s?single_writer=true&background_compaction=%s&"
-                   "query_indexing=false&queue_watch=false&query_engine=scan",
-                   f->path, worker_mode ? "true" : "false") > 0);
+                   "query_indexing=%s&queue_watch=false&query_engine=scan",
+                   f->path, worker_mode ? "true" : "false",
+                   query_mode ? "true" : "false") > 0);
   f->endpoints[0] = f->endpoint;
   lc_client_config_init(&f->config);
   lc_pouch_settings_init(&f->settings);
@@ -161,6 +163,12 @@ static void setup_io_mode(fixture *f, const char *directory, int codec,
       LC_POUCH_SETTING_DURABLE_SYNC | LC_POUCH_SETTING_COMPRESSION;
   f->settings.durable_sync = sync;
   f->settings.compression = codec & 2 ? "zlib" : "none";
+  if (query_mode) {
+    f->settings.set_mask |= LC_POUCH_SETTING_INDEXER_FLUSH_DOCS |
+                            LC_POUCH_SETTING_INDEXER_FLUSH_INTERVAL_SECONDS;
+    f->settings.indexer_flush_docs = UINT64_MAX;
+    f->settings.indexer_flush_interval_seconds = 3600U;
+  }
   if (rotate) {
     f->settings.set_mask |= LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
     f->settings.segment_target_bytes = 65536U;
@@ -1427,6 +1435,7 @@ static void allocation_failures(const char *directory, int codec, int sync) {
 }
 #include "collection_background_cases.h"
 #include "collection_maintenance_cases.h"
+#include "collection_query_cases.h"
 int main(int argc, char **argv) {
   char path[1024], directory[1024];
   lc_error e;
@@ -1434,6 +1443,8 @@ int main(int argc, char **argv) {
       argc == 2 || (argc == 3 && !strcmp(argv[2], "live")) ||
       (argc == 5 &&
        (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+        !strcmp(argv[2], "query") || !strcmp(argv[2], "query-io") ||
+        !strcmp(argv[2], "query-allocation") ||
         !strcmp(argv[2], "maintenance") ||
         !strcmp(argv[2], "maintenance-live") ||
         !strcmp(argv[2], "maintenance-io") ||
@@ -1454,7 +1465,15 @@ int main(int argc, char **argv) {
   } else if (argc == 5) {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strcmp(argv[2], "background") || !strcmp(argv[2], "background-live"))
+    if (!strncmp(argv[2], "query", 5U)) {
+      query_mode = 1;
+      if (!strcmp(argv[2], "query"))
+        collection_queries(directory, codec, sync);
+      else
+        collection_query_faults(directory, codec, sync,
+                                !strcmp(argv[2], "query-allocation"));
+    } else if (!strcmp(argv[2], "background") ||
+               !strcmp(argv[2], "background-live"))
       background_suite(directory, codec, sync, !strcmp(argv[2], "background"));
     else if (!strcmp(argv[2], "background-io")) {
       size_t cuts = 0U;

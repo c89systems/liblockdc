@@ -11,8 +11,8 @@
 
 /* Reuse production SDK behavior suites with an exclusive container owner.
  * Directory fixtures keep one container.pouch inside their existing cleanup
- * envelope. Scan fallback is explicit until indexed-query ownership is added.
- * This adapter establishes no shared-root or indexed-query proof. */
+ * envelope. Each suite explicitly selects scan or indexed-query admission.
+ * This adapter establishes no shared-root proof. */
 static pthread_mutex_t key_mutex = PTHREAD_MUTEX_INITIALIZER;
 static char *test_key;
 static void free_key(void) {
@@ -57,6 +57,16 @@ static int factory(void *context, const char *path, const lc_allocator *a,
   options.logical.query_indexing_enabled = 0;
   options.logical.query_indexing_enabled_set = 1;
   options.logical.query_engine = "scan";
+  if (getenv("POUCH_SPACE_TEST_INDEX")) {
+    int indexing = 0;
+    rc = setting("POUCH_SPACE_TEST_INDEX", 1, &indexing, e);
+    if (rc == LC_OK && indexing) {
+      options.logical.query_indexing_enabled = logical->query_indexing_enabled;
+      options.logical.query_indexing_enabled_set =
+          logical->query_indexing_enabled_set;
+      options.logical.query_engine = logical->query_engine;
+    }
+  }
   options.logical.durable_sync = sync;
   if (getenv("POUCH_SPACE_TEST_WATCH")) {
     int watch = 0;

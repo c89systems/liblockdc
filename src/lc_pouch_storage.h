@@ -81,6 +81,7 @@ enum lc_pouch_storage_commit_mode {
 };
 #define LC_POUCH_STORAGE_TXN_GUARD_STRIPES 256U
 struct lc_pouch_outbox_store;
+struct lc_pouch_index_store_ops;
 enum lc_pouch_storage_work_kind {
   LC_POUCH_STORAGE_WORK_ORDINARY = 0,
   LC_POUCH_STORAGE_WORK_TERMINAL,
@@ -175,6 +176,7 @@ typedef struct lc_pouch_storage_ops {
                              struct lc_pouch_outbox_store *, lc_error *);
   void (*queue_notify)(void *, const char *, const char *);
   int (*queue_wait)(void *, const char *, const char *, uint64_t);
+  const struct lc_pouch_index_store_ops *(*query_indexes)(void *, void **);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;
@@ -189,6 +191,7 @@ int lc_pouch_runtime_open(const char *, const lc_allocator *,
 /* Call once, after physical ownership and all worker callbacks are installed.
  * Close joins the existing worker before releasing the physical owner. */
 int lc_pouch_runtime_start_maintenance(lc_pouch *, lc_error *);
+int lc_pouch_runtime_start_indexing(lc_pouch *, lc_error *);
 /* Private admission seam for a physical owner. The constructor resolves the
  * ordinary SDK options before invoking factory once. It owns any returned
  * runtime, including during failed initialization, and retains neither factory

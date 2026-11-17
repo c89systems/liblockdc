@@ -557,6 +557,7 @@ set(lc_sources
     src/lc_collection_index.c
     src/lc_collection_payload.c
     src/lc_collection_query_storage.c
+    src/lc_collection_query_file.c
     src/lc_collection_query_build.c
     src/lc_collection_query_plan.c
     src/lc_collection_query_maintenance.c
@@ -603,6 +604,8 @@ set(lc_sources
     src/lc_pouch_outbox_markers.c
     src/lc_pouch_crypto.c
     src/lc_pouch_index.c
+    src/lc_pouch_index_artifact.c
+    src/lc_pouch_index_file.c
     src/lc_pouch_index_doc.c
     src/lc_pouch_index_posting.c
     src/lc_pouch_index_result.c

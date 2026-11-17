@@ -1,5 +1,6 @@
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
+#include "lc_pouch_query_index.h"
 #include "namespace.h"
 #include "namespace_work.h"
 #include "pouch_internal.h"
@@ -365,6 +366,8 @@ static int publish_locked(void *context, lc_error *e) {
   if (rc == LC_OK && end != w->result.metadata_bytes)
     rc = fail(e, LC_ERR_PROTOCOL,
               "snapshot differs from measured canonical size");
+  if (rc == LC_OK && !w->pouch->query_indexing_enabled)
+    rc = lc_pouch_query_index_invalidate_namespace(w->pouch, w->name, e);
   if (rc == LC_OK)
     rc = ps_namespace_snapshot_commit(w->snapshot, e);
   if (rc != LC_OK)

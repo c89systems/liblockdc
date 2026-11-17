@@ -35,8 +35,9 @@ typedef struct ps_pouch_state_options {
  * is disposable memfd scratch. A physical-owner recovery changes the scratch
  * epoch, invalidating prior cursors/head preconditions; receivers sharing a
  * live owner have the same epoch. Explicit and background collection
- * maintenance use the common compactor and retention engine. Indexing remains
- * outside this harness.
+ * maintenance use the common compactor, retention and query-page engines.
+ * Query pages are bounded derived metadata in the container, bound to the
+ * recovered order epoch and canonical rows. Old epochs remain scan fallbacks.
  * Public queue delivery, batching, paired state, transaction recovery and
  * subscription/watch calls use the common engine. In-process advisory queue
  * notifications use no sidecar. Outbox delivery, stateful checkpoints,
@@ -47,9 +48,13 @@ typedef struct ps_pouch_state_options {
  * journal/coordinator engine. Journal handoffs force completed dependencies
  * under either durability policy; external SQL execution is outside this
  * harness. Exclusive ownership remains required.
+ * Public namespace queries, explicit flush and the existing index worker use
+ * typed immutable artifacts in the container. Captured inputs survive replace,
+ * pruning and checkpoint; encoded bounds are admitted before invoking
+ * producers. Canonical application bodies remain streamed. Namespace index
+ * publication still has a material performance gap against the native owner.
  * Other Pouch operations are outside this harness's current call contract.
- * Explicitly disable indexing; shared
- * root mode and generated external key files are not admitted. No public
+ * Shared root mode and generated external key files are not admitted. No public
  * backend option or native-open cutover is introduced by this harness. */
 int ps_pouch_state_open(const char *, int create, const lc_allocator *,
                         const ps_pouch_state_options *, lc_pouch **,
@@ -74,12 +79,13 @@ typedef struct ps_pouch_compaction_result {
  * the current tail before retirement. Copies run outside namespace authority.
  * Live staged records defer this pass; resolved historical stages may be
  * omitted. Collection maintenance uses the separate entry point below or the
- * public namespace maintenance API. Index maintenance remains outside it.
+ * public namespace maintenance API. Ordinary compaction preserves valid indexes
+ * or durably invalidates them before retirement when indexing is disabled.
  * Known canonical spans are reserved before copying; complete protected
  * metadata/rotation admission at full capacity is still pending. */
 int ps_pouch_state_compact(lc_pouch *, const char *ns,
                            ps_pouch_compaction_result *, lc_error *);
-/* Explicit collection retention, compaction and obsolete storage cleanup.
+/* Explicit collection retention, compaction, query repair and storage cleanup.
  * Snapshot copies use bounded buffers and leave foreground appends independent.
  * Existing grace periods and captured reader generations govern retirement.
  * This pass may require free capacity; it neither grows the container nor

@@ -2654,6 +2654,28 @@ int ps_owned_status_get(ps_owned_head *head, ps_owned_status *out,
   pthread_mutex_unlock(&head->space->mutex);
   return rc;
 }
+int ps_owned_inspect(ps_space *space, ps_key key, const ps_ref *ref,
+                     ps_owned_status *out, lc_error *error) {
+  ps_owned_head head;
+  int rc;
+  if (!space || !out || key.kind != PS_STREAM)
+    return err(error, LC_ERR_INVALID, "owned inspection arguments invalid");
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&space->mutex);
+  rc = healthy(space, error);
+  head.space = space;
+  head.entry = lookup(space, key);
+  if (rc == LC_OK && (!head.entry || head.entry->deleted))
+    rc = err(error, LC_ERR_INVALID, "owned inspection target is missing");
+  if (rc == LC_OK && ref &&
+      (memcmp(ref->container, space->identity, 16) ||
+       ref->incarnation != head.entry->token))
+    rc = err(error, LC_ERR_INVALID, "stale or foreign owned inspection");
+  if (rc == LC_OK)
+    owned_status(&head, out);
+  pthread_mutex_unlock(&space->mutex);
+  return rc;
+}
 static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
                            lc_error *error) {
   return checkpoint_allowance_floor(s, s->metadata + 88, s->live_entries + 1,

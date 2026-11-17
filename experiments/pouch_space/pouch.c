@@ -8,6 +8,7 @@
 #include "namespace_work.h"
 #include "outbox_markers.h"
 #include "pouch_internal.h"
+#include "query_index.h"
 #include "root_internal.h"
 #include <errno.h>
 #include <limits.h>
@@ -626,6 +627,12 @@ static int queue_wait(void *context, const char *ns, const char *queue,
     return -1;
   return waiter.signaled ? 1 : 0;
 }
+static const lc_pouch_index_store_ops *query_indexes(void *context,
+                                                     void **out) {
+  ps_pouch_owner *owner = context;
+  *out = owner->root;
+  return &ps_query_index_store_ops;
+}
 static const lc_pouch_storage_ops storage_ops = {check,
                                                  flush,
                                                  namespace_open,
@@ -651,7 +658,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  &maintenance_ops,
                                                  outbox_markers_open,
                                                  queue_notify,
-                                                 queue_wait};
+                                                 queue_wait,
+                                                 query_indexes};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;
@@ -691,12 +699,12 @@ int ps_pouch_state_open(const char *path, int create,
                              options ? &options->logical : NULL, &pouch, e);
   if (rc != LC_OK)
     return rc;
-  if (!pouch->single_writer || pouch->query_indexing_enabled ||
+  if (!pouch->single_writer ||
       (options && options->logical.crypto_generate_key_file)) {
     lc_pouch_close(pouch);
     return lc_error_set(e, LC_ERR_UNSUPPORTED, 0,
-                        "container state harness requires exclusive mode, "
-                        "disabled indexing and no generated key file",
+                        "container state harness requires exclusive mode "
+                        "and no generated key file",
                         NULL, NULL, "pouch");
   }
   owner = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*owner));
@@ -770,6 +778,8 @@ int ps_pouch_state_open(const char *path, int create,
   lc_free_with_allocator(&pouch->allocator, pouch->compression);
   pouch->compression = compression;
   rc = lc_pouch_runtime_start_maintenance(pouch, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_runtime_start_indexing(pouch, e);
   if (rc != LC_OK) {
     lc_pouch_close(pouch);
     return rc;

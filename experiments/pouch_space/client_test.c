@@ -2568,6 +2568,11 @@ static void guard_compare(const char *directory, int reverse) {
   namespace_artifacts(directory, "guard-");
   lc_error_cleanup(&e);
 }
+#include "index_capacity_cases.h"
+#include "index_cases.h"
+#include "index_concurrency_cases.h"
+#include "index_crash_cases.h"
+#include "index_open_cases.h"
 #include "queue_outbox_concurrency_cases.h"
 #include "queue_outbox_crash_cases.h"
 #include "xa_capacity_cases.h"
@@ -2599,6 +2604,22 @@ static void *worker(void *context) {
     outbox_markers(r->directory);
   else if (!strcmp(r->mode, "xa-durability"))
     xa_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "index-artifacts"))
+    index_artifacts(r->directory);
+  else if (!strcmp(r->mode, "index-open-faults"))
+    index_open_faults(r->directory);
+  else if (!strcmp(r->mode, "index-durability"))
+    index_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "index-io-faults"))
+    index_faults(r->directory, 1);
+  else if (!strcmp(r->mode, "index-allocation-faults"))
+    index_faults(r->directory, 2);
+  else if (!strcmp(r->mode, "index-capacity"))
+    index_capacity(r->directory);
+  else if (!strcmp(r->mode, "index-concurrency"))
+    index_concurrency(r->directory);
+  else if (!strcmp(r->mode, "index-crash"))
+    index_crashes(r->directory);
   else if (!strcmp(r->mode, "xa-io-faults"))
     xa_faults(r->directory, 1);
   else if (!strcmp(r->mode, "xa-allocation-faults"))
@@ -2668,6 +2689,8 @@ int main(int argc, char **argv) {
   REQUIRE(argc == 3);
   if (!strcmp(argv[2], "xa-crash-child"))
     xa_crash_child();
+  if (!strcmp(argv[2], "index-crash-child"))
+    index_crash_child();
   if (!strcmp(argv[2], "outbox-marker-crash-child"))
     outbox_marker_crash_child();
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-sdk-", argv[1]) <

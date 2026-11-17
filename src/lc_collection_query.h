@@ -40,9 +40,10 @@ unsigned long lc_collection_query_row_hash(const lc_collection_order_row *rows,
 int lc_collection_query_build(lc_collection_call *call, lc_u64 ordinal,
                               lc_error *error);
 int lc_collection_query_maintain(lc_collection *collection, lc_error *error);
-/* Reclaims optional index epochs and abandoned temporaries. Current publishers
- * hold a file lock; metadata authority protects their create/lock window.
- * Missing artifacts remain ordinary state-scan fallbacks for readers. */
+/* Reclaims optional index epochs and abandoned builds through their physical
+ * owner. Native publishers retain temporary-file locks; sealed container
+ * builders retain owned-stream pins. Missing artifacts remain state-scan
+ * fallbacks for readers. */
 int lc_collection_query_cleanup(lc_collection *collection,
                                 lc_pouch_maintenance_result *out,
                                 lc_error *error);

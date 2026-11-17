@@ -164,32 +164,21 @@ static int lc_qgc_epoch(lc_collection_handle *collection, const char *base,
   return rc;
 }
 
-int lc_collection_query_cleanup(lc_collection *self,
-                                lc_pouch_maintenance_result *out,
-                                lc_error *error) {
-  lc_collection_call call, scope;
-  lc_collection_guard guard;
-  lc_collection_handle *collection;
+int lc_collection_file_query_cleanup(void *context,
+                                     lc_pouch_maintenance_result *out,
+                                     lc_error *error) {
+  lc_collection_handle *collection = context;
   struct dirent *entry;
   DIR *dir;
   char *base;
-  int rooted, changed, rc;
-  rc = lc_collection_call_begin(self, 0, &call, error);
-  if (rc != LC_OK)
-    return rc;
-  collection = call.collection;
-  error = call.error;
+  int changed, rc = LC_OK;
   base = lc_pouch_path_join(&collection->allocator, collection->directory,
                             "query");
   dir = NULL;
-  changed = rooted = 0;
+  changed = 0;
   if (base == NULL)
     rc = lc_collection_failure(error, LC_ERR_NOMEM, NULL,
                                "failed to allocate collection query directory");
-  if (rc == LC_OK) {
-    rc = lc_collection_root_begin(collection->pouch, &scope, &guard, error);
-    rooted = rc == LC_OK;
-  }
   if (rc == LC_OK) {
     dir = opendir(base);
     if (dir == NULL && errno != ENOENT)
@@ -215,9 +204,25 @@ int lc_collection_query_cleanup(lc_collection *self,
                                  "failed to sync collection query epochs");
     (void)closedir(dir);
   }
-  if (rooted)
-    lc_collection_root_end(&scope, &guard);
   lc_free_with_allocator(&collection->allocator, base);
+  return rc;
+}
+
+int lc_collection_query_cleanup(lc_collection *self,
+                                lc_pouch_maintenance_result *out,
+                                lc_error *error) {
+  lc_collection_call call, scope;
+  lc_collection_guard guard;
+  lc_collection_handle *c;
+  int rc = lc_collection_call_begin(self, 0, &call, error);
+  if (rc != LC_OK)
+    return rc;
+  c = call.collection;
+  rc = lc_collection_root_begin(c->pouch, &scope, &guard, call.error);
+  if (rc == LC_OK) {
+    rc = c->queries.cleanup(c->queries.context, out, call.error);
+    lc_collection_root_end(&scope, &guard);
+  }
   lc_collection_call_end(&call);
   return rc;
 }

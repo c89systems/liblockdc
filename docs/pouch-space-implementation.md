@@ -2294,6 +2294,135 @@ snapshots can still require foreground free space. Existing-root conversion
 remains outside the initial implementation, and production cutover still
 requires an explicit deployment decision. The complete backend goal stays active.
 
+## Namespace and collection query-index owners
+
+The exclusive container SDK now accepts normal indexing defaults and runs the
+existing query engines, explicit flush, worker thresholds/deadlines, operation
+guards, freshness and caches through typed immutable artifact owners. The
+namespace query algorithms and generation/manifest formats are unchanged.
+Native files have their own adapter; the common engine no longer interprets
+artifact paths or filesystem timestamps. Container signatures use immutable
+stream identity/incarnation facts in the existing manifest witness fields.
+Bindings use binary domain identities under the actual namespace or collection
+owner, with no synthetic namespaces or persistent sidecars.
+
+Namespace generations and collection pages share the existing metadata crypto
+codec, AAD and footer. Derived metadata retains its existing materialization
+policy; collection pages retain their explicit size ceiling and 38-slot bound.
+Application bodies still flow through bounded producer/consumer buffers. An
+owner admits the complete encoded bound before invoking its producer and never
+selects a partial artifact or grows the container implicitly. Captured inputs
+remain readable across replacement, pruning and checkpoint and retain their
+namespace/root until close. A publisher shares its sealed stream owner before
+catalog visibility, so an immediate reader can open it before publication
+returns. A reader racing removal rechecks the catalog revision and falls back
+to canonical evaluation; an unchanged invalid target, allocation failure or
+transport failure remains an error.
+
+Collection publication rechecks the recovered epoch and canonical page rows
+under metadata authority. Receiver refresh observes a peer's committed tail,
+preventing an older partial page from replacing a completed page. Explicit and
+background maintenance clean obsolete epochs and repair/prune pages through
+the same common engine. Physical-owner recovery still changes the accepted
+disposable order epoch: prior query pages become scan fallbacks until repaired.
+Collection retirement removes its query bindings before its identity. Failure
+of optional indexing preserves a committed append and its retry receipt.
+
+Allocation qualification also found a common manifest-copy leak: cleanup could
+not see already copied segment IDs if a later copy failed. Ownership now
+advances after each successful copy. Deterministic regressions separately fail
+before and pass after the publication-owner and retirement-admission fixes.
+
+Evidence is in `build/pouch-space-index/`:
+
+- The initial **60 Debug groups** include **356 native Pouch cases**, **104
+  native collection cases**, all **50 namespace SDK cases x eight codec/policy
+  configurations**, and **16 collection SDK cases x eight configurations**.
+  The final ownership changes pass **42 affected Debug groups**, including all
+  SDK configurations, capacity/lifetime/concurrency models and both complete
+  allocation profiles (`surface-debug*.log`, `ownership-final-debug*.log`).
+  Three native-only namespace controls retain simultaneous shared-client,
+  shared-compaction flag and transformed-body-cache assumptions; they remain
+  in the native suite. Physical path corruption/cleanup controls remain native
+  collection tests rather than fabricated container paths.
+- Namespace publisher models pass **2,784 I/O cuts** and **3,712 allocation
+  cuts**. Collection publisher models pass **944 I/O cuts** and **1,388
+  allocation cuts**, including bootstrap, pruning and epoch cleanup. Another
+  **204 startup allocation/mutex cuts** prove failed index-worker admission
+  releases ownership. Collection trials use fresh workers so the JSON parser's
+  first-use cache allocation is included consistently. Stable-image models
+  cover lost/torn writes and complete writes with lost acknowledgements.
+  Namespace allocation-only profiles use immediate successful sync to isolate
+  ownership/retry; separate I/O and real-process profiles establish durability.
+- Real exec children pass **2,664 process exits**, before/after observed I/O
+  boundaries in bootstrap, incremental publication and index invalidation
+  before compaction. Rebuild also has complete I/O/allocation profiles. Logs
+  are `faults-debug*-details.log` and
+  `collection-allocation-workers-details.log`. Final publication changes add
+  volatile ownership/admission only; the durable byte sequence is unchanged.
+- Capacity models record **32 namespace denials** across all four codecs and
+  both policies; collection models also deny and retry after releasing peer
+  reservations. They check root health and exactly **10 MiB** without implicit
+  growth. This proves denial/retry, not guaranteed maintenance admission at
+  full capacity. Producer and durability gates prove unrelated writes progress;
+  paused post-selection and retirement admission tests prove reader behavior.
+- Full GNU and musl Release builds each pass **40 selected runtime groups**,
+  including all SDK configurations and native controls
+  (`surface-gnu-release*.log`, `surface-musl-release*.log`). GNU Release uses
+  ordinary defaults; musl uses its native defaults. Debug and race profiles
+  use 128 KiB workers with the glibc stack cache disabled. API/symbol, storage,
+  allocator and editor boundary checks also pass (`contracts-debug.log`).
+- **28 ThreadSanitizer invocations** pass with instrumented OpenSSL **3.6.5**
+  and no suppressions: all SDK configurations, all eight collection ownership
+  profiles, and plain/combined artifact and concurrency models
+  (`surface-tsan.log`). Intentional process deaths remain separate.
+- **11 Memcheck invocations** pass with **210,185 allocations/frees**, zero
+  errors, no live allocations, no suppressions and only three inherited
+  descriptors. Coverage includes selected SDK/cache/guard cases, producer and
+  reader lifetime models, collection append failure/repair, and native footer,
+  binding, streaming and cleanup controls (`surface-memcheck.log`,
+  `memcheck-*.log`).
+
+The plaintext GNU Release comparison records **96 verified rows / 48 matched
+pairs**, three samples over **16 configurations**: 24 x 4 KiB or 8 x 64 KiB,
+one/four independent writers, both policies and new/preopened roots. Each row
+uses public lease acquire/update/release and a streamed point read; each writer
+then flushes and verifies six indexed queries. Work includes the common cleanup and
+the container checkpoint. Close is separate; cold reopen verifies the persisted
+manifest sequence before any flush, queries it and verifies streamed bodies.
+The p50/p95 fields cover those per-row operations; `index_worker_max_ms` covers
+the largest writer flush-plus-six-query phase. Setup is excluded, OS cache is
+retained and the middle sample reverses engine order. Raw rows and derived
+configuration medians are `paired-performance.log`
+and `paired-summary.json`; the shared lifecycle benchmark retains earlier
+queue/outbox/XA modes.
+
+Ratios are native/container medians of three paired samples; values above one
+favor the container. Completion includes work plus close; CPU covers work only.
+
+| Policy | Completion ratio | Work-only ratio | CPU ratio |
+| --- | --- | --- | --- |
+| NoSync | 0.69-1.32x, median 0.89x | 0.15-0.51x, median 0.25x | 0.77-1.22x, median 0.98x |
+| Durable sync | 1.00-1.63x, median 1.20x | 0.63-1.44x, median 1.07x | 0.92-1.46x, median 1.19x |
+
+These measurements expose an unresolved performance gap. **Five completion
+medians and twelve work-only medians regress**. The flush-plus-six-query phase
+is **9.62-66.75x slower** for the container, median **23.28x**; cold-reopen
+verification is **1.66-4.21x slower**, median **2.44x**. Faster close masks some
+of the work cost. Work-phase sync calls span **15-139 container / 2-104 native**,
+excluding close; storage remains **one file versus 19-55**. Publication batching
+is the next measured optimization target, with completed-prefix durability,
+immutable inputs and publication visibility preserved. The results do not
+establish cold-device or production performance or satisfy deployment acceptance.
+
+This is an exclusive indexing integration surface. Resumable codec conversion,
+protected maintenance admission, shared-root coordination/recovery and deployment
+acceptance remain required. The incremental-checkpoint/protected-capacity proposal
+is still unapproved and unimplemented; full snapshots can require foreground
+free space. Existing-root conversion remains outside the initial implementation,
+and production cutover still requires an explicit deployment decision. The
+complete backend goal stays active.
+
 ## Integration and acceptance
 
 The experimental root owner now owns the physical container, crypto provider and
@@ -2379,8 +2508,8 @@ metadata; no file is created for a label. Native Pouch's mutation authority and
 write sequencing are unchanged. The shared hash source rejects oversized
 producer returns before hashing.
 
-Remaining integration includes indexed-query owners and shared-root
-coordination. Core collection positions
+Remaining integration includes resumable codec conversion, protected maintenance
+admission and shared-root coordination/recovery. Core collection positions
 and retry receipts now
 run through the container owner above. Normal public Pouch tests continue to
 exercise the segmented backend through the shared typed storage boundaries.

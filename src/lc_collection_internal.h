@@ -48,6 +48,7 @@ typedef struct lc_collection_handle {
   lc_collection_segments segments;
   lc_collection_control control;
   lc_collection_projections projections;
+  lc_collection_query_storage queries;
   lc_collection_layout layout;
   lc_collection_owner owner;
   lc_collection_lock metadata_pin, streams_pin;

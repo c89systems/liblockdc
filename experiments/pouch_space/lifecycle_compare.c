@@ -2,6 +2,7 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
+#include "lc_pouch_query_index.h"
 #include "lc_xa_internal.h"
 #include "pouch.h"
 #include <dirent.h>
@@ -25,11 +26,12 @@ typedef struct worker {
   lc_outbox_dispatcher *dispatcher;
   lc_xa_store *journal;
   char owner[LC_XID_STRING_SIZE], resource[LC_XID_STRING_SIZE];
+  double index_seconds;
   int result;
 } worker;
 struct comparison {
   size_t rows, bytes, writers;
-  int container, outbox, xa, sync, started;
+  int container, outbox, xa, index, sync, started;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -186,7 +188,14 @@ static void open_store(comparison *run, int create, lc_error *e) {
   settings.single_writer = 1;
   settings.durable_sync = run->sync;
   settings.compression = "none";
-  settings.query_engine = "scan";
+  settings.query_engine = run->index ? "index" : "scan";
+  settings.query_indexing_enabled = run->index;
+  if (run->index) {
+    settings.set_mask |= LC_POUCH_SETTING_INDEXER_FLUSH_DOCS |
+                         LC_POUCH_SETTING_INDEXER_FLUSH_INTERVAL_SECONDS;
+    settings.indexer_flush_docs = UINT64_MAX;
+    settings.indexer_flush_interval_seconds = 3600U;
+  }
   settings.segment_target_bytes = PS_MIB;
   config.endpoints = &endpoint;
   config.endpoint_count = 1U;
@@ -377,6 +386,7 @@ static int xa_one(worker *w, size_t row, producer *source, consumer *sink,
     rc = lc_xa_store_release_blocking(w->journal, branch.txn_id, e);
   return rc;
 }
+#include "index_compare.h"
 static void *run_worker(void *context) {
   worker *w = context;
   comparison *run = w->run;
@@ -397,13 +407,19 @@ static void *run_worker(void *context) {
     sink.sink.impl = &sink;
     sink.sink.write = consume;
     double start = now(CLOCK_MONOTONIC);
-    w->result = run->xa       ? xa_one(w, row, &source, &sink, &e)
+    w->result = run->index    ? index_one(w, row, &source, &sink, &e)
+                : run->xa     ? xa_one(w, row, &source, &sink, &e)
                 : run->outbox ? outbox_one(w, row, &source, &sink, &e)
                               : queue_one(w, row, &source, &sink, &e);
     run->latencies[row] = now(CLOCK_MONOTONIC) - start;
     if (w->result == LC_OK)
       require(source.offset == run->bytes && sink.offset == run->bytes,
               "streamed payload coverage");
+  }
+  if (w->result == LC_OK && run->index) {
+    double start = now(CLOCK_MONOTONIC);
+    w->result = index_queries(w, 1, &e);
+    w->index_seconds = now(CLOCK_MONOTONIC) - start;
   }
   if (w->result == LC_OK && run->outbox) {
     lc_outbox_job *job = NULL;
@@ -430,7 +446,9 @@ static int cleanup_namespace(void *context, const char *ns, lc_error *e) {
 static void verify_reopen(comparison *run, lc_error *e) {
   for (size_t i = 0U; i < run->writers; ++i) {
     worker *w = &run->workers[i];
-    if (run->xa) {
+    if (run->index) {
+      index_verify_reopen(w, e);
+    } else if (run->xa) {
       for (size_t row = i; row < run->rows; row += run->writers) {
         char id[LC_XID_STRING_SIZE];
         lc_get_res value = {0};
@@ -521,15 +539,17 @@ int main(int argc, char **argv) {
   struct rusage usage;
   require(argc == 7 || (argc == 8 && !strcmp(argv[7], "--reopen")),
           "MODE DIRECTORY ROWS BYTES SYNC WRITERS [--reopen]");
-  require(!strcmp(argv[1], "pouch-queue") ||
-              !strcmp(argv[1], "runtime-queue") ||
-              !strcmp(argv[1], "pouch-outbox") ||
-              !strcmp(argv[1], "runtime-outbox") ||
-              !strcmp(argv[1], "pouch-xa") || !strcmp(argv[1], "runtime-xa"),
-          "mode");
+  require(
+      !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
+          !strcmp(argv[1], "pouch-outbox") ||
+          !strcmp(argv[1], "runtime-outbox") || !strcmp(argv[1], "pouch-xa") ||
+          !strcmp(argv[1], "runtime-xa") || !strcmp(argv[1], "pouch-index") ||
+          !strcmp(argv[1], "runtime-index"),
+      "mode");
   run.container = !strncmp(argv[1], "runtime-", 8U);
   run.outbox = strstr(argv[1], "outbox") != NULL;
   run.xa = strstr(argv[1], "-xa") != NULL;
+  run.index = strstr(argv[1], "-index") != NULL;
   run.rows = number(argv[3], 1U, 64U);
   run.bytes = number(argv[4], 64U, PS_MIB);
   run.sync = (int)number(argv[5], 0U, 1U);
@@ -620,18 +640,24 @@ int main(int argc, char **argv) {
   close_store(&run);
   qsort(run.latencies, run.rows, sizeof(*run.latencies), compare_double);
   require(!getrusage(RUSAGE_SELF, &usage), "memory observation");
+  double max_index_seconds = 0.0;
+  for (size_t i = 0U; i < run.writers; ++i)
+    if (run.workers[i].index_seconds > max_index_seconds)
+      max_index_seconds = run.workers[i].index_seconds;
   printf(
       "mode=%s rows=%zu bytes=%zu writers=%zu sync=%d preopened=%d chunk=4096 "
       "lifecycle_ms=%.6f cpu_ms=%.6f p50_ms=%.6f p95_ms=%.6f "
       "sync_calls=%llu sync_ms=%.6f files=%llu create_ms=%.6f close_ms=%.6f "
-      "reopen_verify_ms=%.6f peak_RSS_KiB=%ld verified=1\n",
+      "reopen_verify_ms=%.6f peak_RSS_KiB=%ld index_worker_max_ms=%.6f "
+      "indexed_queries=%zu verified=1\n",
       argv[1], run.rows, run.bytes, run.writers, run.sync, argc == 8,
       lifecycle_seconds * 1e3, cpu_seconds * 1e3,
       run.latencies[(run.rows - 1U) / 2U] * 1e3,
       run.latencies[(run.rows - 1U) * 95U / 100U] * 1e3,
       (unsigned long long)measured_syncs, measured_sync_seconds * 1e3,
       (unsigned long long)files, create_seconds * 1e3, close_seconds * 1e3,
-      reopen_seconds * 1e3, usage.ru_maxrss);
+      reopen_seconds * 1e3, usage.ru_maxrss, max_index_seconds * 1e3,
+      run.index ? run.writers * 6U : 0U);
   lc_error_cleanup(&e);
   require(!pthread_mutex_destroy(&run.mutex) &&
               !pthread_cond_destroy(&run.condition),

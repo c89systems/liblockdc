@@ -389,6 +389,7 @@ void lc_collection_file_bind(lc_collection_handle *c) {
   c->owner = lc_collection_file_owner(c);
   c->layout = lc_collection_file_layout(c);
   c->projections = lc_collection_file_projections(c);
+  c->queries = lc_collection_file_queries(c);
   c->control = lc_collection_file_control(c);
   c->authority = lc_collection_file_authority(c);
   c->segments = lc_collection_file_segments(c);

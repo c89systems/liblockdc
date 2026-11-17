@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -42,7 +42,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_lifecycle_compare)
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox pouch-xa runtime-xa)
+    foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox pouch-xa runtime-xa pouch-index runtime-index)
       foreach(sync 0 1)
         foreach(reopen 0 1)
           set(reopen_args)
@@ -95,7 +95,7 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
   lc_configure_c_target(pouch_space_test_experiment)
-  foreach(surface queue outbox xa)
+  foreach(surface queue outbox xa query collection-query)
     if(surface STREQUAL "queue")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
       set(behavior_cases
@@ -144,7 +144,7 @@ if(LOCKDC_BUILD_TESTS)
         test_pouch_terminal_retention_generation_busy_and_failure
         test_pouch_dead_letter_retention_is_bounded_and_generation_safe
         test_pouch_dispatcher_scan_recovery_when_indexing_is_disabled)
-    else()
+    elseif(surface STREQUAL "xa")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch_xa.c)
       # Shared-root client cases remain native controls until shared physical
       # ownership is integrated. Every exclusive journal/coordinator case runs.
@@ -188,17 +188,97 @@ if(LOCKDC_BUILD_TESTS)
         test_expired_prepare_preserves_abort_until_external_cleanup
         test_corrupt_descriptor_never_opens_application_gate
         test_native_lease_vote_waits_for_external_completion)
+    elseif(surface STREQUAL "collection-query")
+      set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_collections.c)
+      # Physical path corruption/cleanup controls stay in the native suite.
+      # These existing cases specify public selection and page semantics.
+      set(behavior_cases
+        test_query_build_consumes_large_states_incrementally
+        test_indexed_filters_agree_with_scan_and_cover_unindexed_tail
+        test_query_index_does_not_retry_valid_out_of_range_numbers
+        test_query_pruning_preserves_an_active_visibility_view
+        test_indexed_resume_retains_horizon_and_accepted_nonmatches
+        test_late_partial_query_page_cannot_replace_a_complete_page
+        test_selection_first_n_complete_windows_and_checkpoints
+        test_selection_first_n_resume_budget_binding_and_accepted_cursor
+        test_selection_first_n_cancellation_preserves_unconsumed_budget
+        test_selection_index_scan_parity_across_pages
+        test_selection_survives_transforms_compaction_and_restart
+        test_selection_first_n_lf_failure_preserves_entry_budget
+        test_selection_captures_scalar_options_before_callbacks
+        test_selection_filters_after_input_count
+        test_selection_filtered_progress_rejection_preserves_input_budget
+        test_selection_coalesced_nonmatches_preserve_input_budget)
+    else()
+      set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
+      # Keep shared-client/shared-compaction and native transformed-body-cache
+      # allocation controls in the native suite. These are exclusive API cases.
+      set(behavior_cases
+        test_query_doc_table_cache_borrow_survives_publication
+        test_query_doc_table_cache_rows_survive_concurrent_eviction
+        test_query_doc_table_cache_serializes_decoded_key_population
+        test_parallel_state_writes_keep_query_projection_consistent
+        test_parallel_query_flush_preserves_later_write
+        test_query_index_staleness_is_namespace_scoped
+        test_pouch_indexer_deadline_clamps_u64_interval
+        test_exclusive_indexer_publishes_at_document_threshold
+        test_exclusive_indexer_publishes_delete_batch_at_document_threshold
+        test_exclusive_indexer_waits_for_all_active_operations
+        test_exclusive_indexer_operation_guards_are_lease_scoped
+        test_exclusive_indexer_retires_expired_operation_guard
+        test_exclusive_indexer_cancels_guard_after_metadata_copy_failure
+        test_exclusive_indexer_idle_flush_waits_for_active_operation
+        test_exclusive_indexer_idle_flushes_direct_state_mutations
+        test_exclusive_indexer_idle_flush_waits_for_incomplete_active_operation
+        test_exclusive_indexer_publishes_transaction_decision_at_threshold
+        test_exclusive_indexer_clears_guards_after_failed_transaction_decision
+        test_exclusive_indexer_defers_lease_metadata_until_release
+        test_query_index_sequence_ignores_lease_metadata
+        test_incremental_query_index_ignores_lease_only_key
+        test_query_index_ignores_internal_objects
+        test_staged_object_delete_does_not_queue_query_index
+        test_query_index_threshold_handles_repeated_lease_updates
+        test_query_index_threshold_handles_deferred_first_lease_update
+        test_pouch_endpoint_query_engine_routes_implicit_queries
+        test_query_indexing_opt_out_invalidates_before_compaction
+        test_query_watermark_waits_for_exclusive_namespace_mutation
+        test_transaction_bound_lease_commit_makes_first_body_queryable
+        test_lease_metadata_persists_query_hidden
+        test_query_keys_scan_uses_liblql_and_query_hidden
+        test_query_keys_callback_can_reenter_pouch_public_api
+        test_query_keys_enforces_lockd_limit_contract
+        test_query_index_sync_flush_uses_durable_state
+        test_query_keys_index_summary_preserves_callback_failure
+        test_query_keys_index_all_text_preserves_complete_matches
+        test_query_keys_index_all_text_compacts_candidate_matches
+        test_query_keys_index_all_text_token_postings_preserve_substrings
+        test_query_keys_index_preserves_strict_json_pointer_paths
+        test_query_keys_index_root_or_uses_scalar_union
+        test_query_keys_index_long_strings_use_validated_candidates
+        test_query_keys_index_large_strings_use_fallback_candidates
+        test_query_keys_index_date_lql_filters_temporal_candidates
+        test_query_keys_index_recursive_exists_uses_container_presence
+        test_query_keys_index_rejects_wildcard_exists_selectors
+        test_query_documents_scan_matches_escaped_pointer_paths
+        test_query_documents_scan_streams_rows
+        test_query_documents_index_uses_scalar_postings
+        test_exclusive_indexer_retires_expired_acquire_for_update_guard
+        test_acquire_for_update_first_body_is_queryable)
     endif()
     add_executable(pouch_space_${surface}_sdk_test ${behavior_source}
       sdk_test_adapter.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
     target_include_directories(pouch_space_${surface}_sdk_test PRIVATE
       ${CMAKE_SOURCE_DIR}/src)
     target_compile_definitions(pouch_space_${surface}_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
+    if(surface STREQUAL "collection-query")
+      target_compile_definitions(pouch_space_${surface}_sdk_test PRIVATE
+        LC_COLLECTION_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
     target_link_libraries(pouch_space_${surface}_sdk_test PRIVATE
       pouch_space_test_experiment lc::cmocka)
     target_link_options(pouch_space_${surface}_sdk_test PRIVATE
       "LINKER:--wrap=lc_client_open" "LINKER:--wrap=lc_pouch_open")
-    if(surface STREQUAL "queue")
+    if(surface STREQUAL "queue" OR surface STREQUAL "query")
       target_link_options(pouch_space_${surface}_sdk_test PRIVATE "LINKER:--wrap=time")
     endif()
     lc_configure_c_test_target(pouch_space_${surface}_sdk_test)
@@ -210,9 +290,13 @@ if(LOCKDC_BUILD_TESTS)
     endif()
     foreach(codec RANGE 0 3)
       foreach(sync RANGE 0 1)
+        set(index_environment)
+        if(surface STREQUAL "query" OR surface STREQUAL "collection-query")
+          set(index_environment POUCH_SPACE_TEST_INDEX=1)
+        endif()
         add_test(NAME pouch_space_${surface}_sdk_${codec}_${sync}
           COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
-            POUCH_SPACE_TEST_SYNC=${sync} $<TARGET_FILE:pouch_space_${surface}_sdk_test>
+            POUCH_SPACE_TEST_SYNC=${sync} ${index_environment} $<TARGET_FILE:pouch_space_${surface}_sdk_test>
             ${behavior_cases})
         set_tests_properties(pouch_space_${surface}_sdk_${codec}_${sync}
           PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
@@ -246,6 +330,16 @@ if(LOCKDC_BUILD_TESTS)
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${codec} ${sync})
         set_tests_properties(pouch_space_collection_${mode}_${codec}_${sync} PROPERTIES
           TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endforeach()
+      foreach(mode query query-io query-allocation)
+        if((codec EQUAL 1 OR codec EQUAL 2) AND NOT mode STREQUAL "query")
+          continue()
+        endif()
+        add_test(NAME pouch_space_collection_${mode}_${codec}_${sync}
+          COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR}
+            ${mode} ${codec} ${sync})
+        set_tests_properties(pouch_space_collection_${mode}_${codec}_${sync}
+          PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       endforeach()
       add_test(NAME pouch_space_collection_io_${codec}_${sync}
         COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} io ${codec} ${sync})
@@ -310,6 +404,16 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(codec RANGE 0 3)
+    foreach(mode index-artifacts index-open-faults index-durability index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
+      if((codec EQUAL 1 OR codec EQUAL 2) AND mode MATCHES "(faults|crash)$")
+        continue()
+      endif()
+      add_test(NAME pouch_space_client_${mode}_${codec}
+        COMMAND ${CMAKE_COMMAND} -E env POUCH_INDEX_CODEC=${codec}
+          $<TARGET_FILE:pouch_space_client_test> ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
+        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
     foreach(mode xa-durability xa-io-faults xa-allocation-faults
         xa-managed-durability xa-managed-io-faults xa-managed-allocation-faults
         xa-concurrency xa-scope xa-capacity xa-crash)

@@ -3,6 +3,7 @@
 #include "lc_api_internal.h"
 #include "lc_collection_storage.h"
 #include "owned.h"
+#include "query_index.h"
 #include <string.h>
 
 static int corrupt(lc_error *e) {
@@ -132,6 +133,8 @@ int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
     ps_owned_close(head);
   }
   ps_collection_resources_clear(&list);
+  if (rc == LC_OK)
+    rc = ps_query_artifacts_reclaim(storage, owner, e);
   control.owner = owner;
   control.key = 1U;
   control.kind = PS_CONTROL;

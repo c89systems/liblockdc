@@ -2760,14 +2760,13 @@ int lc_pouch_crypto_writer_finish(lc_pouch_crypto_writer *out,
   return rc;
 }
 
-uint64_t lc_pouch_crypto_writer_bound(lc_pouch_crypto_writer *out,
-                                      uint64_t plain) {
+static uint64_t lc_pouch_crypto_encoded_bound(uint64_t plain, int encrypted,
+                                              int compressed) {
   uint64_t encoded, frames;
-  if (!out || plain > ((uint64_t)ULONG_MAX - 64U) / 2U)
+  if (plain > ((uint64_t)ULONG_MAX - 64U) / 2U)
     return LC_U64_MAX;
-  encoded =
-      out->desc.compressed ? (uint64_t)compressBound((uLong)plain) : plain;
-  if (out->desc.encrypted) {
+  encoded = compressed ? (uint64_t)compressBound((uLong)plain) : plain;
+  if (encrypted) {
     frames = encoded <= LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES
                  ? 1U
                  : 1U + (encoded - LC_POUCH_FIRST_FRAME_PLAINTEXT_BYTES +
@@ -2778,6 +2777,21 @@ uint64_t lc_pouch_crypto_writer_bound(lc_pouch_crypto_writer *out,
     encoded += (frames + 1U) * (8U + LC_POUCH_GCM_TAG_BYTES);
   }
   return encoded;
+}
+uint64_t lc_pouch_crypto_writer_bound(lc_pouch_crypto_writer *out,
+                                      uint64_t plain) {
+  return out ? lc_pouch_crypto_encoded_bound(plain, out->desc.encrypted,
+                                             out->desc.compressed)
+             : LC_U64_MAX;
+}
+uint64_t lc_pouch_crypto_stream_bound(lc_pouch_crypto *crypto, uint64_t plain,
+                                      int allow_compression,
+                                      size_t *descriptor_bytes) {
+  if (descriptor_bytes)
+    *descriptor_bytes = LC_POUCH_DESC_TEXT_BYTES;
+  return lc_pouch_crypto_encoded_bound(
+      plain, lc_pouch_crypto_enabled(crypto),
+      allow_compression && lc_pouch_crypto_compression_enabled(crypto));
 }
 
 int lc_pouch_crypto_writer_restart(lc_pouch_crypto_writer *out,
