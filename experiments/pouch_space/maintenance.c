@@ -23,15 +23,16 @@ static int candidate(void *context, const ps_namespace_source *source,
   compact *w = context;
   int active = !w->options || w->options->force ||
                (w->options->terminal_reclaim &&
-                w->before.tail >= w->pouch->terminal_reclaim_min_bytes);
-  if (source->kind != PS_CATALOG_SEGMENT ||
-      source->id < w->before.covered_segment ||
-      (source->id == w->before.active_segment && !active))
+                source->stored_bytes >= w->pouch->terminal_reclaim_min_bytes);
+  if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
+      !source->stored_bytes ||
+      (source->kind == PS_CATALOG_SEGMENT &&
+       source->id == w->before.active_segment && !active))
     return LC_OK;
-  if (source->tail > UINT64_MAX - w->bytes)
+  if (source->stored_bytes > UINT64_MAX - w->bytes)
     return fail(e, LC_ERR_PROTOCOL, "maintenance candidate size overflow");
   ++w->candidates;
-  w->bytes += source->tail;
+  w->bytes += source->stored_bytes;
   return LC_OK;
 }
 static int select_logical(void *context, ps_piece_publish_fn publish,
@@ -79,6 +80,14 @@ static int retire_source(void *context, const ps_namespace_source *source,
       w->result.copied_bytes += repack.mapping_bytes;
       if (repack.pending)
         ++w->result.pending_sources;
+      else if ((source->sealed || repack.finished_tail) &&
+               !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
+        task.work = w;
+        task.kind = source->kind;
+        task.id = source->id;
+        rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name,
+                                                retire_locked, &task, e);
+      }
     }
   } else {
     task.work = w;

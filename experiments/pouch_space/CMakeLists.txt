@@ -463,7 +463,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-checksums)
+  foreach(mode lifecycle faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-tail maintenance-checksums)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
@@ -570,7 +570,7 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-churn standing-prefix standing-owners standing-capacity standing-concurrency standing-deletion root-obligations root-obligation-faults owned-repack-faults)
+  foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-churn namespace-tail namespace-tail-faults namespace-tail-concurrency standing-prefix standing-owners standing-capacity standing-concurrency standing-deletion root-obligations root-obligation-faults owned-repack-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

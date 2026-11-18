@@ -3368,6 +3368,130 @@ shared-root coordination/recovery and the full public lease/queue capacity matri
 remain required. The full goal remains active, the multifile default is retained,
 and production cutover still requires an explicit decision.
 
+### Covered partial tails and physical maintenance scheduling
+
+Native maintenance now completes a profitable, fully covered partial tail rather
+than waiting indefinitely for another producer to fill its raw grant. It reserves
+successor routing and bounded piece replacement together, validates captured
+coverage and the body-source epoch under namespace mutation authority, durably
+selects an empty successor and seals the predecessor. Copying the retained encoded
+ranges then runs outside logical publication authority. Selection still rejects
+changed ownership or a newly admitted metadata view. A rejected candidate keeps
+the piece cursor at that generation for retry instead of skipping it.
+
+The structural transition uses the existing successor/select/seal protocol. If a
+failed attempt already selected its successor, retry finishes the pending seal
+without creating another successor. A nearly full, live tail whose replacement
+would not reduce rounded ownership stays active. An empty active head does not
+rotate. Uncovered bytes, zero-completed abandoned grants and inherited checksum
+obligations continue to defer reclamation. No whole body is materialized, and no
+new on-disk representation or public ABI is introduced.
+
+Each physical stream head now maintains the selected payload ownership of its
+present mappings, including page/cell rounding. This derived counter is rebuilt
+during recovery and checked against the existing child-directory walk. Namespace
+source capture exposes that value and the present mapping count. Old reader pins
+remain separately owned by the physical retirement protocol; they are excluded
+from the current-source metric and never treated as free space.
+
+Maintenance candidates and terminal thresholds use selected physical ownership,
+including sources older than canonical checkpoint coverage. Historical logical
+offsets no longer inflate the candidate byte estimate. This estimate describes
+stored candidates, not guaranteed reclaimable bytes. After a completed repack,
+a sealed predecessor with no canonical body references can retire in the same
+pass. Admitted readers retain its exact old incarnations until they close. Key
+coverage may still name the retired predecessor; the existing successor recovery
+contract handles that state without an extra empty checkpoint publication.
+
+The public full-capacity fixture streams a 1 MiB + 37 byte body under a 60 KiB
+key, pins a real body reader, fills ordinary capacity with unrelated ownership,
+then deletes the key and runs bounded maintenance. Plaintext and combined-codec
+configurations, each with both durability policies, complete the old tail and
+retire its source at 10 MiB without growth. The pinned body still streams with
+valid bytes and CRC. Closing it releases 1,064,960 physical payload bytes in each
+case. Maintenance drains pending work, a new foreground write succeeds, and
+reopen preserves both the tombstone and the new value. A separate metadata-only
+fixture leaves over 1 MiB of logical history with one small physical grant:
+nonforced terminal maintenance respects the physical threshold, while forced
+maintenance completes the tail and reports its actual selected ownership.
+
+Lower cases cover metadata-view exclusion, a live body pin across raw-to-map
+replacement, append and reopen through the successor, repeated empty-head sweeps,
+and an almost entirely live tail that must not rotate. The combined rotation/map
+fault sweep exercises 95 allocation, write/sync and read sites across both
+policies, including torn writes and same-process allocation retry. Every cut
+reopens with the accepted bodies intact and converges on exactly one successor.
+A concurrency case pauses an actual replacement-map write after sealing: a
+same-namespace replacement, sibling publication and admitted old reader finish
+before the copy resumes. The stale map is rejected and a fresh checkpoint/retry
+completes without another rotation.
+
+The ASan/UBSan Debug gate passes eighteen groups covering standard Pouch/header/
+source boundaries, compaction comparisons, checksum validation, lower physical
+replacement and the new tail cases. Its public maintenance sweeps cover 354
+allocation and 420 I/O cuts. Additional affected public key-bound, maintenance,
+concurrency, full-capacity and namespace churn gates pass. GNU and native musl
+Release each pass seventeen affected groups with default workers. Four
+ThreadSanitizer invocations pass with instrumented OpenSSL 3.6.5, 128 KiB workers
+and no suppressions. Four strict Memcheck invocations cover lower tail faults,
+copy concurrency, churn and public full-capacity tails: 196,516 matched
+allocations/frees, zero live heap, errors, suppressions or owned descriptors.
+Evidence is retained under `build/pouch-space-tails/`: `final-debug.log`,
+`expectations-debug.log`, `public-debug.log`, `threshold-debug.log`,
+`qualification-gnu.log`, `qualification-musl.log`, `qualification-tsan.log` and
+`memcheck-*.log`.
+
+The matched GNU comparison verifies 48 indexed runs against the frozen computed
+reserve build (`a151b354`): eight configurations, three samples per engine,
+24 x 4 KiB or 8 x 64 KiB bodies, one/four writers, both policies, preopened
+namespaces and four rounds. Ratios below are medians across per-configuration
+median-of-three ratios; lower is faster. Work, indexed readiness, reopen and close
+remain separately measured.
+
+| Measurement / prior container | NoSync | Durable |
+| --- | ---: | ---: |
+| Measured work | 0.92x | 0.94x |
+| Work CPU | 1.06x | 1.01x |
+| p50 write | 1.03x | 1.05x |
+| Indexed worker | 0.84x | 1.08x |
+| Reopen and verify | 1.08x | 1.07x |
+| Close | 0.99x | 1.04x |
+
+Per-configuration work ratios range from 0.88-1.02x for NoSync and 0.85-1.11x for
+durable work. Median reopen/verify is about 7.1/6.2 ms, close about 0.48/0.46 ms
+and indexed worker about 40.6/37.8 ms (NoSync/durable). Another 24 queue/outbox/XA
+probes verify both policies and one/four writers with one sample per engine and
+configuration. All single-writer workflow sync counts match; concurrent batching
+varies. These small host samples support comparable foreground cost, not a
+statistical speedup or a production latency commitment. They do not resolve the
+earlier indexed-readiness and NoSync work gap against multifile. Raw results and
+per-configuration medians are `paired-performance.log`, `workflow-performance.log`
+and `paired-summary.json` in the same directory.
+
+The matched churn probe keeps the stable 1 MiB body pin and replaces its 192 KiB
+neighbor 52 times with no growth. The new namespace sweep visits present sources
+and retires dead predecessors rather than assuming one forever-active source.
+Both policies finish at 1,282,048 payload bytes and 81 present mappings, versus
+1,290,240 and 79 previously. Completing tails increases selected map bytes over
+the run from 447,166 to 891,128. Logical history is 11,299,172 encoded bytes; for
+this implementation that is aggregate emitted history across source generations,
+whereas the frozen fixture reports one source's tail. Independent lower tests
+still cover sparse single-source offsets beyond physical capacity. Three
+alternating-order samples have median combined-policy fixture wall time
+3.37 seconds versus 3.48 seconds, including byte/CRC assertions and reopen.
+This is a bounded ownership and cleanup result with a measured copy cost, not
+a per-operation latency claim. See `churn-performance.log` and `churn-times.log`.
+
+Covered profitable partial-tail completion is now integrated. Retention control
+phases and transaction participants still need complete mandatory-work plans and
+public capacity proof. Inherited checksum validation, abandoned private-grant
+cleanup, collection REGION relocation, codec conversion and shared-root
+coordination/recovery remain required. Source labels also retain their existing
+namespace-lifetime intern contract; this batch does not prove a bound on all
+resident metadata over indefinite rotation history. The full goal remains active,
+the multifile default is retained and production cutover requires an explicit
+deployment decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

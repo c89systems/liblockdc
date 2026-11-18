@@ -7322,6 +7322,7 @@ static void bounded_pieces(int durable, int checkpointed) {
 #include "checkpoint_cases.h"
 #include "reclaim_cases.h"
 #include "revision_cases.h"
+#include "tail_cases.h"
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -7331,7 +7332,18 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "standing-prefix") == 0) {
+    if (strcmp(argv[2], "namespace-tail") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_tail(durable);
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_tail_dense(durable);
+    } else if (strcmp(argv[2], "namespace-tail-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_tail_faults(durable);
+    } else if (strcmp(argv[2], "namespace-tail-concurrency") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_tail_concurrency(durable);
+    } else if (strcmp(argv[2], "standing-prefix") == 0) {
       standing_bound();
       for (int durable = 0; durable < 2; ++durable)
         standing_prefix(durable);

@@ -37,6 +37,8 @@ typedef struct ps_entry {
   uint64_t token, bytes;
   uint64_t publication_sequence;
   uint64_t stream_capacity, stream_runs, stream_ready;
+  uint64_t
+      stream_storage; /* derived selected mappings, not pinned old values */
   int owned_mapped;
   ps_mapped_range *ranges;
   unsigned char *range_bitmap;

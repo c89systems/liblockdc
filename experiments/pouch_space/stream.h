@@ -11,6 +11,8 @@ typedef struct ps_stream_info {
   ps_ref ref;
   uint64_t tail, capacity, runs, readers;
   uint64_t preferred_grant_bytes;
+  uint64_t
+      stored_bytes; /* selected physical bytes/cells, not logical capacity */
   int sealed, retired;
 } ps_stream_info;
 typedef struct ps_stream_piece_info {

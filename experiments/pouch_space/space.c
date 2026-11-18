@@ -307,11 +307,13 @@ static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
     p->dirty_next->dirty_link = &p->dirty_next;
   s->dirty = p;
 }
+static uint64_t entry_storage(const ps_entry *);
 static void owned_unlink(ps_space *s, ps_entry *p) {
   ps_entry *head;
   if (!p->owned_linked)
     return;
   head = stream_lookup(s, p->key.owner);
+  head->stream_storage -= entry_storage(p);
   if (p->owned_prev)
     p->owned_prev->owned_next = p->owned_next;
   else
@@ -327,6 +329,7 @@ static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   if (!head)
     return; /* recovery validation reports an orphan */
   if (old && old->owned_linked) {
+    head->stream_storage -= entry_storage(old);
     p->owned_prev = old->owned_prev;
     p->owned_next = old->owned_next;
     old->owned_linked = 0;
@@ -343,6 +346,7 @@ static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   else
     head->owned_last = p;
   p->owned_linked = 1;
+  head->stream_storage += entry_storage(p);
 }
 static void retire(ps_space *s, ps_entry *p) {
   ps_entry **link = &s->buckets[bucket(p->key)];
@@ -507,6 +511,13 @@ static uint64_t extent_mask(const ps_extent *extent) {
 static uint64_t extent_allocation(const ps_extent *extent) {
   return extent->flags & EXTENT_PACKED ? cell_count(extent->bytes) * PS_CELL
                                        : aligned(extent->bytes);
+}
+static uint64_t entry_storage(const ps_entry *p) {
+  uint64_t bytes = 0;
+  size_t i;
+  for (i = 0; i < p->count; ++i)
+    bytes += extent_allocation(&p->extents[i]);
+  return bytes;
 }
 static ps_payload_page *payload_find(ps_space *s, uint64_t offset) {
   ps_payload_page *p;
@@ -1925,7 +1936,7 @@ static int recover_revision(ps_space *s, const unsigned char *wire,
 }
 static int validate_owned_directory(ps_space *s, lc_error *error) {
   ps_entry *p, *run;
-  uint64_t count, end, expected = 0, actual = 0;
+  uint64_t count, end, stored, expected = 0, actual = 0;
   for (p = s->entries; p; p = p->all_next) {
     if (p->key.kind == PS_OWNED_RUN) {
       ++actual;
@@ -1934,16 +1945,17 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
     }
     if (p->key.kind != PS_STREAM)
       continue;
-    end = count = 0;
+    end = count = stored = 0;
     for (run = p->owned_first; run; run = run->owned_next) {
       if (run->deleted || run->key.key < end ||
           run->key.key > p->stream_capacity ||
           run->stream_capacity > p->stream_capacity - run->key.key)
         return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
       end = run->key.key + run->stream_capacity;
+      stored += entry_storage(run);
       ++count;
     }
-    if (count != p->stream_runs)
+    if (count != p->stream_runs || stored != p->stream_storage)
       return err(error, LC_ERR_PROTOCOL, "owned stream capacity mismatch");
     expected += p->stream_runs;
   }
@@ -3370,6 +3382,7 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->tail = head->entry->bytes;
   out->capacity = head->entry->stream_capacity;
   out->runs = head->entry->stream_runs;
+  out->stored_bytes = head->entry->stream_storage;
   out->sealed = head->entry->stream_sealed;
   out->retired = head->entry->deleted;
 }
@@ -4019,11 +4032,7 @@ typedef struct piece_selection {
   int published;
 } piece_selection;
 uint64_t ps_owned_run_storage(const ps_owned_run *run) {
-  uint64_t bytes = 0;
-  size_t i;
-  for (i = 0; i < run->entry->count; ++i)
-    bytes += extent_allocation(&run->entry->extents[i]);
-  return bytes;
+  return entry_storage(run->entry);
 }
 int ps_owned_run_matches(const ps_owned_run *run, const ps_owned_range *ranges,
                          size_t count) {

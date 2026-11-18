@@ -17,6 +17,7 @@ typedef struct ps_owned_run ps_owned_run;
 typedef struct ps_owned_status {
   ps_ref ref;
   uint64_t tail, capacity, runs;
+  uint64_t stored_bytes; /* selected payload ownership, excluding old pins */
   int sealed, retired;
 } ps_owned_status;
 

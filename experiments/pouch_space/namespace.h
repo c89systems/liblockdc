@@ -22,7 +22,7 @@ typedef struct ps_namespace_status {
 typedef struct ps_namespace_source {
   const char *leaf;
   unsigned int kind;
-  uint64_t id, tail, capacity;
+  uint64_t id, tail, capacity, stored_bytes, runs;
   int sealed;
 } ps_namespace_source;
 typedef int (*ps_namespace_source_fn)(void *, const ps_namespace_source *,
@@ -159,7 +159,7 @@ int ps_namespace_reclaim(ps_namespace *, unsigned int kind, uint64_t id,
 typedef struct ps_namespace_repack_result {
   uint64_t visited, replaced;
   uint64_t body_bytes, mapping_bytes; /* retained encoded bytes selected */
-  int pending;
+  int pending, finished_tail;
 } ps_namespace_repack_result;
 /* Reclaims at most limit completed pieces behind selected coverage, including
  * covered pieces of the active source. Captures scalar liveness, copies at
@@ -169,8 +169,13 @@ typedef struct ps_namespace_repack_result {
  * authority for selection after the copy; NULL requires caller exclusion. A
  * cached cursor makes successive bounded calls progress through present
  * mappings. Flush key metadata before starting; newly accepted dirty keys defer
- * the next capture until the next flush. A sweep revisits earlier pieces after
- * reaching the unfinished tail, including bodies superseded between sweeps. */
+ * the next capture until the next flush. A profitable covered partial tail
+ * reserves rotation and replacement together, durably selects an empty
+ * successor and seals the old source before copying. The gate also serializes
+ * this bounded structural transition. An already selected successor retries
+ * its pending seal without another rotation. Empty active heads do not rotate.
+ * A sweep revisits earlier pieces after reaching the tail, including bodies
+ * superseded between sweeps. */
 int ps_namespace_repack(ps_namespace *, unsigned int, uint64_t, size_t limit,
                         ps_piece_select_fn gate, void *,
                         ps_namespace_repack_result *, lc_error *);

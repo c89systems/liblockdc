@@ -384,6 +384,8 @@ int ps_namespace_sources_visit(ps_namespace *ns, ps_namespace_source_fn visit,
       sources[count].id = s->id;
       sources[count].tail = info.tail;
       sources[count].capacity = info.capacity;
+      sources[count].stored_bytes = info.stored_bytes;
+      sources[count].runs = info.runs;
       sources[count].sealed = info.sealed;
       ++count;
     }

@@ -157,7 +157,7 @@ static void namespace_repack(int durable) {
   ps_namespace_status info;
   ps_stats before, pinned, after;
   namespace_repack_pin pin = {0};
-  uint64_t replaced = 0, tail;
+  uint64_t replaced = 0;
   char name[32];
   unsigned char bytes[4];
   struct iovec part = {bytes, sizeof(bytes)};
@@ -190,7 +190,6 @@ static void namespace_repack(int durable) {
   OK(ps_namespace_status_get(ns, &info, &error));
   CHECK(info.active_segment == 1 && info.covered_segment == 1 &&
         info.covered_offset == info.tail);
-  tail = info.tail;
   OK(ps_status(ps_root_space(root), &before, &error));
   for (unsigned int step = 0; step < 200; ++step) {
     OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 2, NULL, NULL, &result,
@@ -220,10 +219,11 @@ static void namespace_repack(int durable) {
   ps_namespace_view_close(view);
   ps_namespace_read_close(pin.body);
   pin.body = NULL;
-  /* Append to this sparse active source; no logical offsets are translated. */
+  /* The completed tail selected an empty successor. Body offsets in the
+   * predecessor remain stable while new appends use the successor. */
   checkpoint_put(root, ns, "lease/0", 240, 2, 1, 1, 0);
   OK(ps_namespace_status_get(ns, &info, &error));
-  CHECK(info.tail > tail && info.active_segment == 1);
+  CHECK(info.tail && info.active_segment == 2);
   OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 2, NULL, NULL, &result,
                          &error));
   CHECK(!result.replaced &&
@@ -267,14 +267,15 @@ typedef struct repack_actor {
   ps_namespace_repack_result result;
   int rc;
 } repack_actor;
-static void namespace_churn_put(ps_root *root, ps_namespace *ns,
-                                const char *key_name, uint64_t index,
-                                uint64_t version, uint64_t lifetime,
-                                size_t bytes) {
+static uint64_t namespace_churn_put(ps_root *root, ps_namespace *ns,
+                                    const char *key_name, uint64_t index,
+                                    uint64_t version, uint64_t lifetime,
+                                    size_t bytes) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry request = {0}, result = {0};
   ps_namespace_append *append = NULL;
   checkpoint_history_input input = {0};
+  uint64_t start, end;
   input.source.impl = &input;
   input.source.read = checkpoint_history_read;
   input.remaining = bytes;
@@ -286,14 +287,18 @@ static void namespace_churn_put(ps_root *root, ps_namespace *ns,
   request.version = version;
   request.lifetime = lifetime;
   OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &error));
+  OK(lc_pouch_record_io_tail(ps_namespace_append_output(append), &start,
+                             &error));
   OK(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
                                   ps_namespace_append_output(append),
                                   ps_namespace_append_leaf(append), &request,
                                   &input.source, 0, &result, &error));
   CHECK(!input.remaining && input.calls > 1 && result.bytes == bytes);
+  OK(lc_pouch_record_io_tail(ps_namespace_append_output(append), &end, &error));
   OK(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &error));
   ps_namespace_append_close(append);
   lc_pouch_state_entry_cleanup(&allocator, &result);
+  return end - start;
 }
 typedef struct churn_pin {
   ps_namespace *ns;
@@ -349,22 +354,59 @@ static int namespace_churn_visit(void *context, uint64_t segment,
   ++pin->count;
   return LC_OK;
 }
+typedef struct churn_sweep {
+  ps_namespace *ns;
+  uint64_t copied, mappings, stored;
+} churn_sweep;
+static int churn_sources(void *context, const ps_namespace_source *source,
+                         lc_error *e) {
+  churn_sweep *s = context;
+  ps_namespace_repack_result result = {0};
+  if (source->kind != PS_CATALOG_SEGMENT)
+    return LC_OK;
+  if (source->sealed &&
+      !ps_namespace_source_refs(s->ns, source->kind, source->id))
+    return ps_namespace_reclaim(s->ns, source->kind, source->id, e);
+  for (unsigned int step = 0; step < 16; ++step) {
+    OK(ps_namespace_repack(s->ns, source->kind, source->id, 16, NULL, NULL,
+                           &result, e));
+    CHECK(result.visited <= 16 && result.body_bytes <= result.mapping_bytes &&
+          result.mapping_bytes <= 16 * PS_CHUNK);
+    s->copied += result.mapping_bytes;
+    if (!result.pending)
+      break;
+    CHECK(step < 15);
+  }
+  if ((source->sealed || result.finished_tail) &&
+      !ps_namespace_source_refs(s->ns, source->kind, source->id))
+    OK(ps_namespace_reclaim(s->ns, source->kind, source->id, e));
+  return LC_OK;
+}
+static int churn_storage(void *context, const ps_namespace_source *source,
+                         lc_error *e) {
+  churn_sweep *s = context;
+  (void)e;
+  s->mappings += source->runs;
+  s->stored += source->stored_bytes;
+  return LC_OK;
+}
 static void namespace_repack_churn(int durable) {
   ps_root_options options = {0};
   ps_root *root = NULL;
   ps_namespace *ns = NULL;
   ps_namespace_view *view = NULL;
-  ps_namespace_repack_result result;
   ps_namespace_status info;
   ps_stats stats;
-  uint64_t copied = 0;
+  uint64_t history;
+  churn_sweep sweep = {0};
   churn_pin pin = {0};
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
   OK(ps_root_open(path, 1, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "churn", 1, &ns, &error));
-  namespace_churn_put(root, ns, "stable", 1, 1, 1, (size_t)PS_MIB);
+  history = namespace_churn_put(root, ns, "stable", 1, 1, 1, (size_t)PS_MIB);
+  sweep.ns = ns;
   OK(ps_namespace_checkpoint_flush(ns, &error));
   pin.ns = ns;
   OK(ps_namespace_view_open(ns, &view, &error));
@@ -375,38 +417,30 @@ static void namespace_repack_churn(int durable) {
    * replacing its neighbor. Logical history passes physical capacity, but
    * actual live mappings and physical ownership stay bounded. */
   for (unsigned int cycle = 0; cycle < 52; ++cycle) {
-    namespace_churn_put(root, ns, "hot", cycle + 2, cycle + 1, 2,
-                        12 * PS_CHUNK);
+    history += namespace_churn_put(root, ns, "hot", cycle + 2, cycle + 1, 2,
+                                   12 * PS_CHUNK);
     OK(ps_namespace_checkpoint_flush(ns, &error));
-    for (unsigned int step = 0; step < 16; ++step) {
-      OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 16, NULL, NULL, &result,
-                             &error));
-      CHECK(result.visited <= 16);
-      CHECK(result.body_bytes <= result.mapping_bytes &&
-            result.mapping_bytes <= 16 * PS_CHUNK);
-      copied += result.mapping_bytes;
-      if (result.visited < 16)
-        break;
-      CHECK(step < 15);
-    }
+    OK(ps_namespace_sources_visit(ns, churn_sources, &sweep, &error));
     OK(ps_checkpoint(ps_root_space(root), &error));
     OK(ps_status(ps_root_space(root), &stats, &error));
     CHECK(stats.capacity == PS_DEFAULT_CAPACITY &&
           stats.allocated_bytes < 2 * PS_MIB);
   }
   OK(ps_namespace_status_get(ns, &info, &error));
-  CHECK(info.active_segment == 1 && info.tail > PS_DEFAULT_CAPACITY &&
-        info.runs < 100);
-  CHECK(copied && copied < 52 * 12 * PS_CHUNK);
+  OK(ps_namespace_sources_visit(ns, churn_storage, &sweep, &error));
+  CHECK(info.active_segment > 1 && !info.tail &&
+        history > PS_DEFAULT_CAPACITY && sweep.mappings < 100 &&
+        sweep.stored <= stats.allocated_bytes);
+  CHECK(sweep.copied && sweep.copied < 52 * 12 * PS_CHUNK);
   churn_read(pin.body, pin.offset, pin.bytes, pin.crc, &error);
   ps_namespace_read_close(pin.body);
   pin.body = NULL;
   printf("namespace churn sync%d: logical=%llu physical_capacity=%llu "
          "allocated=%llu present_mappings=%llu selected_map_bytes=%llu\n",
-         durable, (unsigned long long)info.tail,
+         durable, (unsigned long long)history,
          (unsigned long long)stats.capacity,
          (unsigned long long)stats.allocated_bytes,
-         (unsigned long long)info.runs, (unsigned long long)copied);
+         (unsigned long long)sweep.mappings, (unsigned long long)sweep.copied);
   ps_namespace_release(ns);
   OK(ps_root_close(root, &error));
   root = NULL;

@@ -340,6 +340,7 @@ int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
         s->preferred_grant ? s->preferred_grant : PS_PAGE;
     out->capacity = s->capacity;
     out->runs = s->count;
+    out->stored_bytes = status.stored_bytes;
     out->readers = s->readers;
     out->sealed = s->sealed;
     out->retired = s->retired;

@@ -1836,7 +1836,7 @@ static void key_bounds(const char *directory) {
             ok(ps_pouch_state_compact(p, "bounds", &result, &e), &e);
             REQUIRE(!result.skipped && result.snapshot && result.records == 2 &&
                     (!pass || !result.metadata_bytes) && !result.body_bytes &&
-                    !result.copied_bytes && result.pending_sources);
+                    !result.copied_bytes && !result.pending_sources);
           }
           lc_pouch_close(p);
           REQUIRE(live == 1);
@@ -3844,6 +3844,209 @@ static void maintenance_empty(const char *path) {
   REQUIRE(live == 0 && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static void maintenance_fill(lc_pouch *p, lc_error *e) {
+  ps_space *s = ps_root_space(ps_pouch_state_root(p));
+  ps_key key = {UINT64_MAX - 1, 1, PS_STATE};
+  unsigned char bytes[PS_PAGE] = {0};
+  for (; key.key < 4096; ++key.key) {
+    ps_writer *writer = NULL;
+    int rc = ps_begin(s, NULL, key, &writer, e);
+    if (rc == LC_OK)
+      rc = ps_write(writer, bytes, sizeof(bytes), e);
+    if (rc == LC_OK)
+      rc = ps_publish(writer, NULL, e);
+    ps_writer_close(writer);
+    if (rc == LC_ERR_INVALID) {
+      clear(e);
+      return;
+    }
+    ok(rc, e);
+  }
+  REQUIRE(0);
+}
+typedef struct maintenance_strip {
+  void *ns;
+  size_t pieces;
+  ps_namespace_repack_result result;
+} maintenance_strip;
+static int maintenance_strip_locked(void *context, lc_error *e) {
+  maintenance_strip *s = context;
+  return ps_namespace_repack(s->ns, PS_CATALOG_SEGMENT, 1, s->pieces, NULL,
+                             NULL, &s->result, e);
+}
+static int maintenance_source_info(void *context, const ps_namespace_source *s,
+                                   lc_error *e) {
+  (void)e;
+  if (s->kind == PS_CATALOG_SEGMENT && s->id == 1)
+    *(ps_namespace_source *)context = *s;
+  return LC_OK;
+}
+static void maintenance_physical_threshold(const char *path, int sync) {
+  ps_pouch_state_options o = options(0, sync);
+  lc_pouch *p = NULL;
+  lc_error e;
+  lc_pouch_state_write_options change = {0};
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_state_read_result metadata = {0};
+  ps_namespace_source source_info = {0};
+  ps_namespace_status status;
+  maintenance_strip strip = {0};
+  lc_pouch_maintenance_options opts = {0};
+  lc_pouch_maintenance_result result = {0};
+  char *key = lc_alloc_with_allocator(&allocator, (size_t)PS_MIB + 1);
+  REQUIRE(key);
+  memset(key, 'k', (size_t)PS_MIB);
+  key[PS_MIB] = 0;
+  lc_error_init(&e);
+  o.logical.segment_target_bytes = 8 * PS_MIB;
+  o.logical.background_compaction_enabled = 1;
+  o.logical.compaction_interval_seconds = 3600;
+  o.logical.terminal_reclaim_min_bytes = 2 * PS_CHUNK;
+  o.logical.compaction_min_segment_count = 1;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  change.has_metadata = 1;
+  change.metadata = (const unsigned char *)"lease";
+  change.metadata_length = 5;
+  ok(lc_pouch_state_update_metadata(p, "threshold", key, &change, &written, &e),
+     &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(p->storage.ops->namespace_open(p->storage.context, "threshold", 0,
+                                    &strip.ns, &e),
+     &e);
+  ok(lc_pouch_state_with_namespace_lock(p, "threshold", checkpoint_locked,
+                                        strip.ns, &e),
+     &e);
+  ok(ps_namespace_sources_visit(strip.ns, maintenance_source_info, &source_info,
+                                &e),
+     &e);
+  REQUIRE(source_info.runs > 1 && source_info.tail > PS_MIB);
+  strip.pieces = (size_t)source_info.runs - 1;
+  ok(lc_pouch_state_with_namespace_lock(p, "threshold",
+                                        maintenance_strip_locked, &strip, &e),
+     &e);
+  REQUIRE(strip.result.replaced == strip.pieces && !strip.result.finished_tail);
+  ok(ps_namespace_sources_visit(strip.ns, maintenance_source_info, &source_info,
+                                &e),
+     &e);
+  REQUIRE(source_info.runs == 1 && source_info.stored_bytes <= PS_CHUNK);
+  opts.ns = "threshold";
+  opts.terminal_reclaim = 1;
+  ok(lc_pouch_maintenance_run(p, &opts, &result, &e), &e);
+  REQUIRE(!result.candidate_bytes);
+  ok(ps_namespace_status_get(strip.ns, &status, &e), &e);
+  REQUIRE(status.active_segment == 1 && status.tail > PS_MIB);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  opts.force = 1;
+  ok(lc_pouch_maintenance_run(p, &opts, &result, &e), &e);
+  REQUIRE(result.candidate_bytes == source_info.stored_bytes &&
+          !result.cleanup_pending_count);
+  ok(ps_namespace_status_get(strip.ns, &status, &e), &e);
+  REQUIRE(status.active_segment == 2 && !status.tail);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  ok(lc_pouch_state_read_metadata(p, "threshold", key, &metadata, &e), &e);
+  REQUIRE(metadata.found && !metadata.has_body &&
+          metadata.metadata_length == 5);
+  lc_pouch_state_read_result_cleanup(&allocator, &metadata);
+  p->storage.ops->namespace_close(p->storage.context, strip.ns);
+  lc_pouch_close(p);
+  lc_free_with_allocator(&allocator, key);
+  REQUIRE(!live && !unlink(path));
+  lc_error_cleanup(&e);
+}
+static void maintenance_partial_tail(const char *path, const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  const size_t key_bytes = 60 * 1024, body_bytes = (size_t)PS_MIB + 37;
+  char *key = lc_alloc_with_allocator(&allocator, key_bytes + 1);
+  REQUIRE(key);
+  memset(key, 'k', key_bytes);
+  key[key_bytes] = 0;
+  for (int crypto = 0; crypto <= 3; crypto += 3)
+    for (int sync = 0; sync < 2; ++sync) {
+      ps_pouch_state_options o = options(crypto, sync);
+      o.logical.segment_target_bytes = 8 * PS_MIB;
+      lc_pouch *p = NULL;
+      lc_pouch_state_write_options write_options = {0};
+      lc_pouch_state_write_result written = {0};
+      lc_pouch_state_read_result pinned = {0}, metadata = {0};
+      ps_pouch_compaction_result result = {0};
+      ps_namespace_status status;
+      ps_stats held, released;
+      void *ns = NULL;
+      input in = source(body_bytes, 41);
+      write_options.disable_compression = 1;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      ok(put(p, "tail", key, &in, &write_options, &written, &e), &e);
+      REQUIRE(in.offset == body_bytes && in.calls > 1);
+      lc_pouch_state_write_result_cleanup(&allocator, &written);
+      ok(p->storage.ops->namespace_open(p->storage.context, "tail", 0, &ns, &e),
+         &e);
+      ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns,
+                                            &e),
+         &e);
+      ok(lc_pouch_state_read(p, "tail", key, &pinned, &e), &e);
+      maintenance_fill(p, &e);
+      ok(lc_pouch_state_delete(p, "tail", key, NULL, &written, &e), &e);
+      REQUIRE(written.version == 2);
+      lc_pouch_state_write_result_cleanup(&allocator, &written);
+      for (unsigned int pass = 0; pass < 32; ++pass) {
+        ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
+        REQUIRE(!result.skipped && !result.copied_bytes);
+        if (result.reclaimed_sources)
+          break;
+        REQUIRE(pass < 31);
+      }
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(status.active_segment == 2 && !status.tail &&
+              status.bound_segments == 1 && status.pending_retirements);
+      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &held, &e), &e);
+      REQUIRE(held.capacity == PS_DEFAULT_CAPACITY &&
+              held.retired_bytes >= PS_MIB);
+      drain(pinned.body, body_bytes, 41, &e);
+      lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+      ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
+      REQUIRE(!result.pending_sources && !result.reclaimed_sources &&
+              !result.copied_bytes);
+      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &released, &e), &e);
+      REQUIRE(released.allocated_bytes + PS_MIB <= held.allocated_bytes &&
+              released.capacity == PS_DEFAULT_CAPACITY);
+      lc_pouch_maintenance_options maintenance_options = {0};
+      lc_pouch_maintenance_result maintenance_result = {0};
+      maintenance_options.ns = "tail";
+      maintenance_options.force = maintenance_options.terminal_reclaim = 1;
+      ok(lc_pouch_maintenance_run(p, &maintenance_options, &maintenance_result,
+                                  &e),
+         &e);
+      REQUIRE(!maintenance_result.cleanup_pending_count);
+      lc_pouch_maintenance_result_cleanup(&allocator, &maintenance_result);
+      in = source(17, 57);
+      ok(put(p, "tail", "after", &in, NULL, &written, &e), &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &written);
+      ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns,
+                                            &e),
+         &e);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      one_file(directory);
+      lc_pouch_close(p);
+      REQUIRE(live == 1);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      ok(lc_pouch_state_read_metadata(p, "tail", key, &metadata, &e), &e);
+      REQUIRE(!metadata.found);
+      lc_pouch_state_read_result_cleanup(&allocator, &metadata);
+      read_value(p, "tail", "after", 17, 57, 1, &e);
+      lc_pouch_close(p);
+      REQUIRE(live == 1 && !unlink(path));
+      printf("partial tail codec%d sync%d: %llu physical bytes released\n",
+             crypto, sync,
+             (unsigned long long)(held.allocated_bytes -
+                                  released.allocated_bytes));
+    }
+  lc_free_with_allocator(&allocator, key);
+  REQUIRE(!live);
+  lc_error_cleanup(&e);
+  for (int sync = 0; sync < 2; ++sync)
+    maintenance_physical_threshold(path, sync);
+}
 static void maintenance(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -3863,7 +4066,7 @@ static void maintenance(const char *path, const char *directory) {
               result.boundary == 1 &&
               result.body_bytes <= result.copied_bytes &&
               result.metadata_bytes < 65536 &&
-              result.copied_bytes <= 16 * PS_CHUNK && result.pending_sources);
+              result.copied_bytes <= 16 * PS_CHUNK);
       ok(ps_metadata_repack(ps_root_space(ps_pouch_state_root(p)), &e), &e);
       /* The bounded pass preserves the resident projection and logical body
        * positions while publishing smaller physical mappings. */
@@ -3874,18 +4077,25 @@ static void maintenance(const char *path, const char *directory) {
       uint64_t first = result.snapshot;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(result.snapshot == first && result.boundary == 1 &&
-              result.records == 5 && result.pending_sources &&
-              !result.metadata_bytes && result.copied_bytes <= 16 * PS_CHUNK);
+              result.records == 5 && !result.metadata_bytes &&
+              result.copied_bytes <= 16 * PS_CHUNK);
+      uint64_t boundary = storage_info(p, "projection", &e).active_segment;
       projection_put(p, "a-state", 31, 99, 0, 12, &e);
       projection_put(p, "tail", 31, 77, 0, 13, &e);
       projection_meta(p, "z-object", "tail-object", 0, 14, &e);
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.records == 6 && result.boundary == 1);
+      REQUIRE(result.records == 6 && result.boundary == boundary);
       projection_readback(p, &e);
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.records == 6 && result.boundary == 1 &&
+      REQUIRE(result.records == 6 && result.boundary == boundary &&
               !result.metadata_bytes && result.copied_bytes <= 16 * PS_CHUNK);
       projection_readback(p, &e);
+      for (unsigned int pass = 0; result.pending_sources && pass < 64; ++pass) {
+        ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+        REQUIRE(result.copied_bytes <= 16 * PS_CHUNK);
+        projection_readback(p, &e);
+      }
+      REQUIRE(!result.pending_sources);
       void *ns = NULL;
       ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
                                         &ns, &e),
@@ -4108,13 +4318,13 @@ static void maintenance_concurrency(const char *path, const char *directory) {
                                       &e),
        &e);
     ok(ps_namespace_status_get(ns, &status, &e), &e);
-    REQUIRE(status.bound_segments == 1 && !status.bound_bodies &&
-            status.checkpoint_keys == 5);
+    REQUIRE(status.bound_segments == 2 && !status.tail &&
+            !status.bound_bodies && status.checkpoint_keys == 5);
     p->storage.ops->namespace_close(p->storage.context, ns);
     ps_pouch_compaction_result result;
     ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
     REQUIRE(result.copied_bytes <= 16 * PS_CHUNK && !result.metadata_bytes &&
-            result.boundary == 1 && result.pending_sources);
+            result.boundary == 1 && !result.pending_sources);
     maintenance_tail_readback(p, &e);
     one_file(directory);
     lc_pouch_close(p);
@@ -5276,6 +5486,8 @@ static void *worker(void *context) {
     staging_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-tail"))
+    maintenance_partial_tail(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-faults"))
     maintenance_faults(r->path, 0);
   else if (!strcmp(r->mode, "maintenance-io-faults"))
