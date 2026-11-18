@@ -4433,6 +4433,91 @@ relink and qualification commands. `baseline-body-tests.log` records the two
 pre-existing namespace assertion failures; the initial failing conversion logs
 are retained separately from the repaired proof.
 
+### Durable selection of converted native namespace bodies
+
+`ps_namespace_body_select` now makes a verified converted pack authoritative for
+an existing namespace key. It compares the converted pack's sealed record with
+the supplied result, then compares the complete selected canonical metadata with
+the expected source. Only the descriptor, encoded length and body span may
+change. Canonical normalization permits a physical PUT/OBJECT_PUT to replace a
+resolved LINK/META without changing logical identity. Changed versions,
+lifetimes, either index sequence, timestamps, retention, query visibility,
+metadata, content types or keys are rejected. The in-memory key summary retains
+its original object/state classification, so later lease metadata updates keep
+their established query and object semantics.
+
+Selection reuses the native metadata publisher. The replacement key value and
+checkpoint coverage are members of one physical revision, forced durable even
+under NoSync. Physical checkpoint epochs advance; logical versions, watermarks
+and canonical suffix coverage do not. Source ownership and interval indexes move
+only after publication succeeds. Fault recovery must select the complete old or
+new key/coverage pair. A stale expected source is rejected rather than silently
+rewiring a newer value; a coordinator must inspect the selected record after an
+uncertain outcome before retrying.
+
+This operation is offline. An attached logical checkpoint observer rejects it,
+preventing stale logical-client record references. Body production remains the
+separate streaming preparation stage. Selection reads canonical metadata without
+another full encoded-body integrity pass; preparation already verified CRC,
+plaintext length and etag. Namespace mutation exclusion spans the handoff, with
+no root publication lock or namespace mutex held over those metadata reads.
+The blocked-I/O test proves that a sibling namespace can commit and readers can
+still capture the old value while selection is paused; competing mutation in the
+same namespace receives BUSY.
+
+Existing metadata views remain valid across replacement and defer reclamation.
+After views close, catalog removal can retire an unreferenced old pack while an
+already captured body reader retains its bytes. Closing the last reader permits
+reaping; a subsequent checkpoint makes released space reusable. Root compression
+policy is unchanged throughout both
+directions of conversion.
+
+The dedicated suite covers all four codec modes, both durability policies,
+ordinary and linked objects, stale sources, foreign namespaces, observer
+exclusion and eleven changes to logical fields. All 416 allocation, I/O and
+torn-publication cuts pass, including lost-write reopen, complete old/new
+key-and-coverage correlation and retry. Allocation cuts also exercise omitted
+error objects. A subsequent ordinary metadata mutation verifies object
+classification before reopening. A 2 MiB incompressible body with 32,769 bytes
+of metadata selects and reopens within the fixed 10 MiB container in each
+encryption/durability combination. Its largest single Pouch allocator request
+during selection is 33,276 bytes; this is not a peak aggregate-memory measure.
+
+A second suite starts with values written by the production Pouch engine,
+including state, internal objects, an empty body, a tombstone and a metadata-only
+placeholder. It performs 64 body handoffs across both compression directions,
+encryption modes and durability policies, reopening the production engine after
+each direction. Body bytes, versions, metadata, object classification, state
+watermarks and query freshness survive. Later object metadata updates preserve
+the body version and public query sequence. Each fixture still contains only
+the native container file.
+
+The affected Debug batch passes 38 cases covering native metadata/checkpoints,
+canonical snapshots, staging, maintenance, publication, body budgets and
+concurrency. Four additional lease lifecycle, protection, coordinated transaction
+and attachment-window checks pass. GNU and musl release each pass seven selected
+checks, including the complete new fault suite. Three TSan checks pass with
+instrumented OpenSSL and no suppressions. Strict Memcheck passes both namespace
+and production-engine selection suites with zero remaining allocations, zero
+errors and only three inherited file descriptors. Formatting, source-manifest
+and stack-allocation checks pass.
+
+Preparation and selection still have separate capacity claims. The integrated
+root converter must fund both stages before production, support bounded progress
+and reclaim obsolete sources between batches. Collection-unit conversion,
+derived-index invalidation, a durable conversion intent and resumable root policy
+cutover remain required. Explicit root compression changes therefore continue to
+return unsupported. Full conversion performance is not qualified by these
+metadata handoff tests; the previously measured readiness latency gap also
+remains. Multifile remains the default/reference and deployment remains a
+separate decision. This milestone changes no format marker or public ABI.
+
+Evidence is in ignored `build/pouch-space-body-selection/`:
+`qualified-selection.log`, `qualified-debug.log`, `client-selection.log`,
+`qualified-leases.log`, `qualified-*-release*`, `qualified-tsan.log`, `tsan-*`,
+`qualified-memcheck.log` and `memcheck-*`, with exact native build, instrumented
+relink and memory-check commands.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

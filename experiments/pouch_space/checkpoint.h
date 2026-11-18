@@ -68,6 +68,15 @@ int ps_key_metadata_begin(ps_key_checkpoint *, int maintenance,
 int ps_key_metadata_commit(ps_checkpoint_delta *,
                            const lc_pouch_storage_batch *, enum ps_commit_mode,
                            lc_error *);
+/* Offline physical conversion handoff. Caller excludes mutation and completes
+ * stream debt first. Compare the entire selected canonical metadata with the
+ * expected record, preserve its logical fields, and durably select only the
+ * replacement descriptor and span. Reject attached logical checkpoint owners.
+ * Replacement must be a verified, committed body in this namespace. */
+int ps_key_checkpoint_replace_body(ps_key_checkpoint *,
+                                   const lc_pouch_state_entry *expected,
+                                   const lc_pouch_state_entry *replacement,
+                                   lc_error *);
 /* Capture slots and coverage at one completed visibility prefix, including
  * when the owner has a newer deferred metadata revision. */
 int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,

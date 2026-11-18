@@ -86,6 +86,7 @@ struct ps_checkpoint_delta {
   ps_budget_plan claim;
   int prepared, accepted, maintenance, planning, planned;
   int metadata_only;
+  int body_replacement;
   size_t metadata_count;
   uint64_t metadata_bytes;
 };
@@ -1218,7 +1219,18 @@ static int prepare_entry(ps_checkpoint_delta *d,
                change->prepared ? &change->summary : &change->slot->summary,
                &prior);
   prior.seen = change->prepared || !change->created;
-  if (kind == PS_KEY_DECISION) {
+  if (d->body_replacement) {
+    if (kind != PS_KEY_METADATA || change->created || change->prepared ||
+        !entry->found || !entry->payload_span.present ||
+        entry->version != prior.version ||
+        entry->index_seq != prior.index_seq ||
+        entry->lifetime != prior.lifetime)
+      return failure(e, LC_ERR_INVALID,
+                     "physical replacement changed logical key identity");
+    accepted = 1;
+    projected = *entry;
+    projected.record_type = prior.record_type;
+  } else if (kind == PS_KEY_DECISION) {
     accepted = lc_pouch_state_decision_entry_accepts(prior.seen,
                                                      prior.index_seq, entry);
     projected = *entry;
@@ -1750,7 +1762,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
       ++count;
   }
   if (rc == LC_OK)
-    rc = ps_revision_publish(writers, count, 0, mode, NULL, &prefix, e);
+    rc = ps_revision_publish(writers, count, d->body_replacement, mode, NULL,
+                             &prefix, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&c->mutex);
     for (change = d->changes; change; change = change->next) {
@@ -1777,6 +1790,122 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   for (i = 0; i < count; ++i)
     ps_writer_close(writers[i]);
   lc_free_with_allocator(&c->allocator, writers);
+  return rc;
+}
+typedef struct body_replacement_prefix {
+  const ps_checkpoint_record *record;
+} body_replacement_prefix;
+static int replacement_prefix(void *context, size_t index,
+                              lc_pouch_record_header *header, const void **key,
+                              const void **metadata, lc_error *e) {
+  body_replacement_prefix *input = context;
+  const ps_checkpoint_record *record = input->record;
+  int rc;
+  if (index)
+    return failure(e, LC_ERR_INVALID, "physical replacement has one key");
+  rc = lc_pouch_record_header_decode(record->bytes, header, e);
+  if (rc == LC_OK) {
+    *key = record->bytes + LC_POUCH_RECORD_HEADER_BYTES;
+    *metadata = (const unsigned char *)*key + header->key_len;
+  }
+  return rc;
+}
+static int replacement_expected(ps_key_checkpoint *c,
+                                const lc_pouch_state_entry *expected,
+                                const ps_checkpoint_record *record,
+                                lc_error *e) {
+  ps_reader *reader = NULL;
+  key_slot *slot;
+  uint64_t id = 0;
+  size_t at = 0, got;
+  unsigned char bytes[1024];
+  int rc;
+  pthread_mutex_lock(&c->mutex);
+  slot = find_key(c, expected->key, PS_KEY_METADATA);
+  if (slot)
+    id = slot->id;
+  rc = !slot || c->changed || c->dirty || c->observer.prepare
+           ? failure(e, LC_ERR_INVALID,
+                     "physical replacement requires offline selected metadata")
+           : LC_OK;
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK)
+    rc = ps_key_checkpoint_read(c, id, &reader, e);
+  if (rc == LC_OK && ps_read_size(reader) != record->length)
+    rc = failure(e, LC_ERR_INVALID, "physical replacement source changed");
+  while (rc == LC_OK && at < record->length) {
+    size_t take = record->length - at;
+    if (take > sizeof(bytes))
+      take = sizeof(bytes);
+    got = 0;
+    rc = ps_read(reader, bytes, take, &got, e);
+    if (rc == LC_OK && (got != take || memcmp(bytes, record->bytes + at, take)))
+      rc = failure(e, LC_ERR_INVALID, "physical replacement source changed");
+    at += got;
+  }
+  ps_reader_close(reader);
+  return rc;
+}
+int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
+                                   const lc_pouch_state_entry *expected,
+                                   const lc_pouch_state_entry *replacement,
+                                   lc_error *e) {
+  ps_checkpoint_record original = {0}, identity = {0}, converted = {0};
+  lc_pouch_state_entry entry;
+  ps_checkpoint_delta *delta = NULL;
+  lc_pouch_storage_batch batch;
+  body_replacement_prefix input;
+  int rc;
+  if (!c || !expected || !replacement || !expected->found ||
+      !expected->payload_span.present || expected->control ||
+      !replacement->found || replacement->control ||
+      !replacement->payload_span.present ||
+      replacement->payload_span.payload_length != replacement->cipher_bytes ||
+      replacement->record_type !=
+          (expected->record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT ||
+                   expected->object_link
+               ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+               : LC_POUCH_STATE_RECORD_STATE_PUT))
+    return failure(e, LC_ERR_INVALID,
+                   "physical replacement requires a resolved converted body");
+  rc = ps_checkpoint_record_encode(&c->allocator, expected, &original, e);
+  /* Normalize only representation fields: all logical facts, including a
+   * linked object's class, must encode identically to the expected key. */
+  entry = *replacement;
+  entry.payload_span = expected->payload_span;
+  entry.cipher_bytes = expected->cipher_bytes;
+  entry.descriptor = expected->descriptor;
+  entry.record_type = expected->record_type;
+  entry.object_link = expected->object_link;
+  if (rc == LC_OK)
+    rc = ps_checkpoint_record_encode(&c->allocator, &entry, &identity, e);
+  if (rc == LC_OK && (identity.length != original.length ||
+                      memcmp(identity.bytes, original.bytes, original.length)))
+    rc = failure(e, LC_ERR_INVALID,
+                 "physical replacement changed logical record facts");
+  if (rc == LC_OK)
+    rc = replacement_expected(c, expected, &original, e);
+  entry = *expected;
+  entry.payload_span = replacement->payload_span;
+  entry.cipher_bytes = replacement->cipher_bytes;
+  entry.descriptor = replacement->descriptor;
+  if (rc == LC_OK)
+    rc = ps_checkpoint_record_encode(&c->allocator, &entry, &converted, e);
+  input.record = &converted;
+  memset(&batch, 0, sizeof(batch));
+  batch.context = &input;
+  batch.count = 1;
+  batch.prefix = replacement_prefix;
+  if (rc == LC_OK)
+    rc = ps_key_metadata_begin(c, 1, &batch, converted.length, &delta, e);
+  if (rc == LC_OK) {
+    delta->body_replacement = 1;
+    rc = ps_key_metadata_commit(delta, &batch, PS_COMMIT_DEFAULT, e);
+  }
+  ps_checkpoint_delta_close(delta);
+  ps_checkpoint_record_close(&converted);
+  ps_checkpoint_record_close(&identity);
+  ps_checkpoint_record_close(&original);
   return rc;
 }
 static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,

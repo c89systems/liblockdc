@@ -2177,6 +2177,7 @@ static void bodies(const char *path) {
   REQUIRE(unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+#include "body_select_cases.h"
 #include "recode_cases.h"
 typedef struct run {
   const char *path, *key, *mode;
@@ -2199,6 +2200,11 @@ static void *worker(void *p) {
     record_recode(r->path, r->key, !strcmp(r->mode, "recode-faults"));
   else if (!strcmp(r->mode, "recode-capacity"))
     recode_capacity(r->path, r->key);
+  else if (!strcmp(r->mode, "body-select") ||
+           !strcmp(r->mode, "body-select-faults"))
+    body_select(r->path, r->key, !strcmp(r->mode, "body-select-faults"));
+  else if (!strcmp(r->mode, "body-select-concurrency"))
+    body_select_concurrency(r->path, r->key);
   else if (!strcmp(r->mode, "body-budget"))
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))

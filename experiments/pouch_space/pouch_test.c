@@ -5596,6 +5596,7 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
          (unsigned long)cases, (unsigned long)sites);
 }
 #include "abandoned_pouch_cases.h"
+#include "body_select_client_cases.h"
 #include "ordered_read_cases.h"
 typedef struct run {
   const char *path, *directory, *mode;
@@ -5604,6 +5605,8 @@ static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->directory);
+  else if (!strcmp(r->mode, "body-select"))
+    body_select_client(r->path, r->directory);
   else if (!strcmp(r->mode, "faults"))
     faults(r->path);
   else if (!strcmp(r->mode, "concurrency"))

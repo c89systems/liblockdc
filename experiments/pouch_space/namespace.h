@@ -170,6 +170,14 @@ void ps_namespace_body_close(ps_namespace_body *);
 int ps_namespace_body_recode(ps_namespace *, lc_pouch_crypto *,
                              const lc_pouch_state_entry *, const char *binding,
                              lc_pouch_state_entry *, lc_error *);
+/* Offline handoff of a verified body_recode result. Match the entire expected
+ * selected record, retain its logical identity, and durably replace its body
+ * reference and checkpoint coverage together, including on NoSync roots.
+ * Old metadata views/readers remain valid; reclamation is a separate step.
+ * An attached logical checkpoint owner rejects this offline operation. */
+int ps_namespace_body_select(ps_namespace *,
+                             const lc_pouch_state_entry *expected,
+                             const lc_pouch_state_entry *converted, lc_error *);
 /* Only fully covered sealed segments and unreferenced sealed body packs are
  * eligible. Captured metadata views defer source retirement with BUSY until
  * their callbacks can no longer open a historical body reference.
