@@ -4331,6 +4331,108 @@ capacity qualification, larger control records, native readiness and reopen,
 codec conversion and shared-root coordination/recovery; existing-root conversion
 and the deployment decision remain outside this cutover.
 
+### Streaming codec conversion into bounded native body packs
+
+Canonical body conversion now runs through `lc_pouch_record_io`, shared by the
+existing multifile root converter and native pack preparation. The old
+file-specific body codec loop is removed. Input stays a borrowed immutable span;
+the decoder feeds the hash and output codec directly into final private canonical
+storage. There is no whole-body buffer, spool, or second encoded-body copy.
+Encoded CRC, plaintext byte count and SHA-256 etag must agree before the output
+writer clears PENDING. Versions, lifetime, update time, retention, side metadata,
+query visibility and both index sequences survive. Descriptor binding follows
+the original body context and the current logical binding, including linked
+objects. A resolved META/LINK body becomes a physical PUT/OBJECT_PUT; reference
+selection remains the logical owner's responsibility.
+
+The shared writer reserves the explicit query-sequence extension before emitting
+the body. It also preserves a zero lifetime on existing collection-owned
+snapshots; ordinary namespace append still requires a positive lifetime. Failure
+discards private output and leaves the caller's result unchanged. The multifile
+converter therefore may leave an empty private payload file after a short write;
+its recovery test now accepts either empty or partial private output and still
+requires successful resume and complete data verification.
+
+Native `ps_namespace_body_begin_bound` admits the entire conservative encoded
+record, stream, catalog and checkpoint claim before reading the source. It then
+funds actual physical grants from that claim as bytes arrive. Commit permits a
+shorter nonempty output; close releases unused admission. Exact-size body
+construction retains its existing measured-size contract. A peer can claim the
+remaining free capacity after bounded admission without preventing the admitted
+writer from completing. Rejection of an unfunded conversion happens before any
+source read and leaves no converted result.
+
+`ps_namespace_body_recode` prepares and durably binds one sealed final body pack.
+It preserves the root's encoding policy and does not select a key reference.
+Callers must exclude namespace mutation and reclamation throughout preparation
+and handoff. Interrupted handoff leaves an unreferenced pack eligible for normal
+maintenance. This is an internal conversion stage: native root policy changes
+remain unsupported until physical reference replacement, collection-unit
+relocation, derived-index invalidation and resumable root orchestration are
+implemented and proven together.
+
+Qualification covers 48 native round trips across empty, one-byte and 65,537-byte
+bodies, both compression directions, plaintext/encrypted descriptors, ordinary
+and linked bodies, and both durability policies. All 446 injected allocation,
+read/write/sync and torn-publication cuts pass crash/reopen and retry checks.
+CRC and etag mismatches reject output, including calls without an error object.
+The 54 multifile compression, durability and recovery cases pass after the
+short-write assertion adjustment. Affected native canonical writes, staging,
+snapshots, capacity, publication and concurrency checks pass as well. Two older
+namespace assertions were repaired after reproducing their failures with the
+previous binary: corrupt namespaces now fail during eager root admission, and
+body-builder cleanup must restore the initial checkpoint claims rather than
+assert that the entire root has no claims.
+
+Generated 2 MiB inputs exercise complete streaming and reopen in a fixed 10 MiB
+container, with no growth. The measured maximum single Pouch allocator request
+is 65,536 bytes for plaintext or 131,400 bytes for encryption's fixed decryptor;
+these are not peak aggregate-memory measurements. Physical allocation follows
+actual output, not the conservative admission bound:
+
+| Generated 2 MiB input | Encoded body bytes | New physical bytes |
+| --- | ---: | ---: |
+| Repeating, plaintext | 5,126 | 8,192 |
+| Repeating, encrypted | 5,198 | 8,192 |
+| Incompressible, plaintext | 2,097,798 | 2,113,536 |
+| Incompressible, encrypted | 2,098,614 | 2,113,536 |
+
+GNU and musl release checks pass, including the expanded streaming cases and
+partial-write resume. Three TSan checks pass with instrumented OpenSSL and no
+suppressions. Strict Memcheck passes both native conversion modes with zero
+remaining allocations, zero errors and only three inherited file descriptors.
+Debug and TSan use 128 KiB workers; musl also exercises its native worker-stack
+contract. Source-manifest and stack-allocation policy checks pass.
+
+Three alternating matched indexed-workload pairs compare the preceding binary
+with this implementation: 16 rows, 1 KiB bodies, two writers and two rounds, with
+reopen enabled. Native work CPU is essentially unchanged; this is a normal-write
+regression check, not full native root-conversion performance qualification.
+Median milliseconds are separated below; multifile columns show current values.
+
+| Phase | Native NoSync, before → after | Native durable, before → after | Multifile NoSync / durable |
+| --- | ---: | ---: | ---: |
+| Work including readiness | 50.11 → 53.33 | 460.92 → 403.05 | 17.62 / 358.06 |
+| Work CPU | 13.04 → 13.09 | 36.23 → 35.82 | 14.21 / 33.20 |
+| Maximum index flush | 18.27 → 18.97 | 13.03 → 12.56 | 1.07 / 1.05 |
+| Close | 0.27 → 0.31 | 0.35 → 0.34 | 35.18 / 30.36 |
+| Reopen plus verification | 3.42 → 3.04 | 3.27 → 3.30 | 0.92 / 1.05 |
+
+The native index still performs four forced readiness syncs under both policies;
+the multifile index-flush phase performs zero. That latency gap, full native
+codec conversion, broader bounded-maintenance qualification and shared-root
+coordination/recovery remain required work. Multifile stays the default and
+measured reference; no format marker or public ABI changes here, and no
+production cutover is authorized by this milestone.
+
+Evidence is in ignored `build/pouch-space-record-recode/`: `native-recode-all.log`,
+`native-empty.log`, `repaired-expectations.log`, `qualified-debug*`,
+`qualified-*-release*`, `partial-write-*`, `tsan-*`, `memcheck-*`,
+`paired-performance.log` and `performance-summary.tsv`, with the exact build,
+relink and qualification commands. `baseline-body-tests.log` records the two
+pre-existing namespace assertion failures; the initial failing conversion logs
+are retained separately from the repaired proof.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

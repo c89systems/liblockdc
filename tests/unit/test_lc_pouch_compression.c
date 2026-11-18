@@ -1886,7 +1886,9 @@ static void test_partial_output_write_failure_resumes(void **state) {
     assert_true(WIFEXITED(status) && WEXITSTATUS(status) == 41);
     privacy_path(path, sizeof(path), p.stage, "payload");
     assert_int_equal(stat(path, &st), 0);
-    assert_true(st.st_size > 0 && st.st_size <= 16384);
+    /* The canonical writer may discard an incomplete private record entirely;
+     * either empty or partial output must resume correctly. */
+    assert_true(st.st_size <= 16384);
     check(f, open_client(f, NULL, &f->client));
     verify_conversion(f, &p, modes[1 - direction]);
     close_client(f);

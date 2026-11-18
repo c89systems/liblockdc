@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_recode.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -494,7 +494,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_namespace_test)
-  foreach(mode lifecycle faults concurrency validation reservation publication bodies body-budget body-budget-faults append-budget append-budget-faults batch-admission batch-faults budget-transfer)
+  foreach(mode lifecycle faults concurrency validation reservation publication bodies recode recode-faults recode-capacity body-budget body-budget-faults append-budget append-budget-faults batch-admission batch-faults budget-transfer)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120

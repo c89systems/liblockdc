@@ -8362,13 +8362,13 @@ static int lc_pouch_state_record_sink_write(lc_sink *sink, const void *bytes,
   return lc_pouch_record_io_append(*io, &part, 1, error) == LC_OK;
 }
 
-int lc_pouch_state_record_append(const lc_allocator *allocator,
-                                 lc_pouch_crypto *crypto, lc_pouch_record_io io,
-                                 const char *leaf,
-                                 const lc_pouch_state_entry *request,
-                                 lc_source *source, int disable_compression,
-                                 lc_pouch_state_entry *result,
-                                 lc_error *error) {
+static int lc_pouch_state_record_append_inner(
+    const lc_allocator *allocator, lc_pouch_crypto *crypto,
+    lc_pouch_record_io io, const char *leaf,
+    const lc_pouch_state_entry *request, lc_source *source,
+    int disable_compression, lc_pouch_state_entry *result,
+    const lc_pouch_state_entry *expected, const char *binding,
+    lc_error *error) {
   static const char placeholder[] =
       "0000000000000000000000000000000000000000000000000000000000000000";
   lc_pouch_state_entry record;
@@ -8376,15 +8376,20 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
   EVP_MD_CTX *hash = NULL;
   unsigned char *meta = NULL;
   char *etag = NULL, *descriptor = NULL;
+  char *rebound = NULL;
+  const char *context = request ? request->payload_context : NULL;
   lc_sink sink;
   lc_pouch_record_header header;
-  size_t meta_length = 0, key_length;
+  size_t meta_length = 0, key_length, reserved_metadata = 0, base_metadata = 0;
   uint64_t start = 0;
   int rc, started = 0;
+  if (expected && (!context || !*context))
+    context = binding;
   if (!allocator || !leaf || !request || !result || request == result ||
       !request->key || !request->key[0] || !request->content_type || !source ||
       !source->read || !io.ops || !io.ops->append || !io.ops->patch ||
-      !io.ops->discard || request->version == 0 || !request->lifetime ||
+      !io.ops->discard || request->version == 0 ||
+      (!request->lifetime && !expected) ||
       request->lifetime > request->index_seq ||
       (request->record_type != LC_POUCH_STATE_RECORD_STATE_PUT &&
        request->record_type != LC_POUCH_STATE_RECORD_OBJECT_PUT))
@@ -8410,6 +8415,12 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
       LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, request->has_query_hidden,
       request->query_hidden, request->staged_delete_marker, request->retention,
       &meta, &meta_length, error);
+  base_metadata = meta_length;
+  if (rc == LC_OK && expected && expected->has_query_index_seq)
+    rc = lc_pouch_state_meta_set_index_sequences(
+        allocator, &meta, &meta_length, request->index_seq,
+        expected->query_index_seq, error);
+  reserved_metadata = meta_length;
   if (rc == LC_OK &&
       (start >
            (uint64_t)LC_I64_MAX - LC_POUCH_RECORD_HEADER_BYTES - key_length ||
@@ -8438,7 +8449,7 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
   sink.write = lc_pouch_state_record_sink_write;
   if (rc == LC_OK)
     rc = lc_pouch_crypto_stream_to_sink(
-        crypto, request->payload_context, &sink, &hashed.pub, &record.bytes,
+        crypto, context, &sink, &hashed.pub, &record.bytes,
         &record.cipher_bytes, &record.payload_span.payload_crc, &descriptor,
         !disable_compression, error);
   if (rc == LC_OK && hashed.failed)
@@ -8447,6 +8458,21 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
     etag = lc_pouch_state_hash_final(allocator, hash, error);
     if (!etag)
       rc = error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  }
+  if (rc == LC_OK && expected &&
+      (record.bytes != expected->bytes || !expected->etag ||
+       strcmp(etag, expected->etag)))
+    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                      "conversion payload integrity check failed", request->key,
+                      NULL, "pouch");
+  if (rc == LC_OK && expected && descriptor && strcmp(context, binding)) {
+    rc = lc_pouch_crypto_rebind_descriptor(crypto, descriptor, context, binding,
+                                           &rebound, error);
+    if (rc == LC_OK) {
+      lc_free_with_allocator(allocator, descriptor);
+      descriptor = rebound;
+      rebound = NULL;
+    }
   }
   record.payload_span.payload_offset =
       start + LC_POUCH_RECORD_HEADER_BYTES + key_length + meta_length;
@@ -8458,14 +8484,24 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
         &record.payload_span, request->payload_context, request->metadata,
         request->metadata_length, LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE,
         request->has_query_hidden, request->query_hidden,
-        request->staged_delete_marker, request->retention, meta, meta_length,
+        request->staged_delete_marker, request->retention, meta, base_metadata,
         &meta, &meta_length, error);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_meta_set_index_seq(meta, meta_length,
-                                           request->index_seq, error);
+  if (rc == LC_OK) {
+    if (expected && expected->has_query_index_seq)
+      rc = lc_pouch_state_meta_set_index_sequences(
+          allocator, &meta, &meta_length, request->index_seq,
+          expected->query_index_seq, error);
+    else
+      rc = lc_pouch_state_meta_set_index_seq(meta, meta_length,
+                                             request->index_seq, error);
+  }
   if (rc == LC_OK)
     rc = lc_pouch_state_meta_set_lifetime(meta, meta_length, request->lifetime,
                                           error);
+  if (rc == LC_OK && meta_length != reserved_metadata)
+    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                      "converted metadata changed reservation size", NULL, NULL,
+                      "pouch");
   memset(&header, 0, sizeof(header));
   header.type = request->record_type;
   header.key_len = (unsigned long)key_length;
@@ -8502,6 +8538,193 @@ int lc_pouch_state_record_append(const lc_allocator *allocator,
   /* Descriptors use the crypto provider's allocator, which must match the
    * record owner's allocator, as in the ordinary Pouch write path. */
   lc_free_with_allocator(allocator, descriptor);
+  lc_free_with_allocator(allocator, rebound);
+  return rc;
+}
+
+int lc_pouch_state_record_append(const lc_allocator *allocator,
+                                 lc_pouch_crypto *crypto, lc_pouch_record_io io,
+                                 const char *leaf,
+                                 const lc_pouch_state_entry *request,
+                                 lc_source *source, int disable_compression,
+                                 lc_pouch_state_entry *result,
+                                 lc_error *error) {
+  return lc_pouch_state_record_append_inner(
+      allocator, crypto, io, leaf, request, source, disable_compression, result,
+      NULL, NULL, error);
+}
+
+typedef struct lc_pouch_state_recode_input {
+  lc_source source, plain;
+  lc_source *decoded;
+  lc_pouch_record_span span;
+  unsigned long crc, expected;
+} lc_pouch_state_recode_input;
+static size_t lc_pouch_state_recode_read(lc_source *source, void *bytes,
+                                         size_t length, lc_error *error) {
+  lc_pouch_state_recode_input *input = source->impl;
+  size_t got;
+  if (length > 16384U)
+    length = 16384U;
+  got = input->span.source.read(&input->span.source, bytes, length, error);
+  if (error && error->code != LC_OK)
+    return 0;
+  if (got)
+    input->crc = (unsigned long)crc32((uLong)input->crc, bytes, (uInt)got);
+  if (input->span.offset - input->span.start == input->span.length &&
+      input->crc != input->expected) {
+    lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                 "conversion encoded payload CRC mismatch", NULL, NULL,
+                 "pouch");
+    return 0;
+  }
+  return got;
+}
+static int lc_pouch_state_recode_reset(lc_source *source, lc_error *error) {
+  lc_pouch_state_recode_input *input = source->impl;
+  input->crc = (unsigned long)crc32(0L, Z_NULL, 0);
+  return input->span.source.reset(&input->span.source, error);
+}
+static size_t lc_pouch_state_recode_plain(lc_source *source, void *bytes,
+                                          size_t length, lc_error *error) {
+  lc_pouch_state_recode_input *input = source->impl;
+  size_t got = input->decoded->read(input->decoded, bytes, length, error);
+  if (!got && error->code == LC_OK &&
+      (input->span.offset - input->span.start != input->span.length ||
+       input->crc != input->expected))
+    lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                 "conversion did not consume a complete encoded payload", NULL,
+                 NULL, "pouch");
+  return got;
+}
+static int lc_pouch_state_recode_valid(const lc_pouch_state_entry *entry,
+                                       lc_error *error) {
+  if (!entry || !entry->found || !entry->payload_span.present ||
+      entry->control || !entry->key || !*entry->key || !entry->content_type ||
+      !entry->etag || strlen(entry->etag) != 64 || !entry->version ||
+      entry->lifetime > entry->index_seq ||
+      entry->cipher_bytes != entry->payload_span.payload_length ||
+      (entry->record_type != LC_POUCH_STATE_RECORD_STATE_PUT &&
+       entry->record_type != LC_POUCH_STATE_RECORD_OBJECT_PUT &&
+       entry->record_type != LC_POUCH_STATE_RECORD_STATE_META &&
+       entry->record_type != LC_POUCH_STATE_RECORD_STATE_LINK))
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "conversion requires a resolved canonical body", NULL,
+                        NULL, "pouch");
+  return LC_OK;
+}
+int lc_pouch_state_record_recode_bound(const lc_allocator *allocator,
+                                       lc_pouch_crypto *crypto,
+                                       const char *leaf,
+                                       const lc_pouch_state_entry *entry,
+                                       uint64_t *bytes, lc_error *error) {
+  lc_pouch_state_payload_span span;
+  unsigned char *metadata = NULL;
+  uint64_t encoded;
+  size_t descriptor = 0, length = 0, key_bytes;
+  int rc;
+  if (bytes)
+    *bytes = 0;
+  rc = lc_pouch_state_recode_valid(entry, error);
+  if (rc != LC_OK || !allocator || !leaf || !bytes)
+    return rc != LC_OK
+               ? rc
+               : lc_error_set(
+                     error, LC_ERR_INVALID, 0,
+                     "conversion bound requires allocator, leaf and output",
+                     NULL, NULL, "pouch");
+  encoded = lc_pouch_crypto_stream_bound(crypto, entry->bytes, 1, &descriptor);
+  if (encoded > LC_I64_MAX ||
+      descriptor > LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "conversion encoding exceeds local bounds", NULL, NULL,
+                        "pouch");
+  span = entry->payload_span;
+  span.container_leaf = (char *)leaf;
+  span.payload_length = encoded;
+  key_bytes = strlen(entry->key);
+  rc = lc_pouch_state_encode_payload_meta(
+      allocator, entry->version, entry->updated_at_unix, entry->bytes, encoded,
+      entry->content_type, entry->etag, NULL, &span, entry->payload_context,
+      entry->metadata, entry->metadata_length,
+      LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, entry->has_query_hidden,
+      entry->query_hidden, entry->staged_delete_marker, entry->retention,
+      &metadata, &length, error);
+  if (rc == LC_OK && entry->has_query_index_seq)
+    rc = lc_pouch_state_meta_set_index_sequences(allocator, &metadata, &length,
+                                                 entry->index_seq,
+                                                 entry->query_index_seq, error);
+  if (rc == LC_OK &&
+      (key_bytes > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
+       length > LC_POUCH_STATE_RECORD_META_MAX_BYTES ||
+       encoded > (uint64_t)LC_I64_MAX - LC_POUCH_RECORD_HEADER_BYTES -
+                     key_bytes - length))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0,
+                      "conversion canonical record exceeds local bounds", NULL,
+                      NULL, "pouch");
+  if (rc == LC_OK)
+    *bytes = LC_POUCH_RECORD_HEADER_BYTES + key_bytes + length + encoded;
+  lc_free_with_allocator(allocator, metadata);
+  return rc;
+}
+int lc_pouch_state_record_recode(
+    const lc_allocator *allocator, lc_pouch_crypto *crypto,
+    lc_pouch_record_io input_io, lc_pouch_record_io output, const char *leaf,
+    const lc_pouch_state_entry *entry, const char *binding,
+    lc_pouch_state_entry *result, lc_error *error) {
+  lc_pouch_state_recode_input input;
+  lc_pouch_crypto_reader *reader = NULL;
+  lc_source *decoded = NULL;
+  lc_pouch_state_entry request;
+  lc_error local;
+  const char *context;
+  int rc;
+  lc_error_init(&local);
+  if (!error)
+    error = &local;
+  rc = lc_pouch_state_recode_valid(entry, error);
+  if (rc != LC_OK)
+    goto done;
+  if (!allocator || !binding || !*binding || !result || entry == result) {
+    rc = lc_error_set(error, LC_ERR_INVALID, 0,
+                      "conversion requires distinct result and binding", NULL,
+                      NULL, "pouch");
+    goto done;
+  }
+  memset(&input, 0, sizeof(input));
+  input.source.impl = &input;
+  input.source.read = lc_pouch_state_recode_read;
+  input.source.reset = lc_pouch_state_recode_reset;
+  input.plain.impl = &input;
+  input.plain.read = lc_pouch_state_recode_plain;
+  input.crc = (unsigned long)crc32(0L, Z_NULL, 0);
+  input.expected = entry->payload_span.payload_crc;
+  context = entry->payload_context && *entry->payload_context
+                ? entry->payload_context
+                : binding;
+  rc = lc_pouch_record_span_bind(
+      &input.span, input_io, entry->payload_span.payload_offset,
+      entry->payload_span.payload_length, NULL, 0, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_crypto_reader_open(crypto, &reader, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_crypto_reader_bind_source(reader, context, binding,
+                                            &input.source, entry->cipher_bytes,
+                                            entry->descriptor, &decoded, error);
+  input.decoded = decoded;
+  request = *entry;
+  request.record_type =
+      lc_pouch_state_record_type_is_object(entry->record_type) ||
+              entry->object_link
+          ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+          : LC_POUCH_STATE_RECORD_STATE_PUT;
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_append_inner(allocator, crypto, output, leaf,
+                                            &request, &input.plain, 0, result,
+                                            entry, binding, error);
+done:
+  lc_pouch_crypto_reader_close(reader);
+  lc_error_cleanup(&local);
   return rc;
 }
 
@@ -20543,120 +20766,27 @@ static int lc_ps_recode_meta(lc_pouch_recode *work,
 static int lc_ps_recode_body(lc_pouch_recode *work, lc_pouch_recode_file *file,
                              const lc_pouch_state_entry *entry, int fd,
                              const char *destination_leaf, lc_error *error) {
-  lc_pouch_state_payload_span span = entry->payload_span;
-  lc_pouch_collection_body body;
-  unsigned char output_type = entry->record_type;
-  lc_pouch_crypto_writer *codec = NULL;
-  lc_source *source = NULL;
-  char *binding = NULL, *descriptor = NULL, *rebound = NULL, *etag = NULL;
-  const char *context;
-  unsigned char *meta = NULL, *chunk = NULL;
-  size_t length = 0, reserved = 0, got;
-  lc_u64 start = 0, plain = 0, stored = 0;
-  unsigned long crc = 0;
-  int rc;
-  memset(&body, 0, sizeof(body));
-  binding = lc_ps_recode_binding(work, file, entry);
+  lc_pouch_state_entry result = {0};
+  char *binding = lc_ps_recode_binding(work, file, entry);
+  int input = -1, rc;
   if (!binding)
-    return LC_ERR_NOMEM;
-  context = entry->payload_context && *entry->payload_context
-                ? entry->payload_context
-                : binding;
-  rc = lc_pouch_state_fd_end(fd, &start, "failed to locate converted payload",
-                             error);
-  span.container_leaf = (char *)destination_leaf;
-  span.record_offset = start;
-  span.payload_offset = 0;
-  span.payload_length = 0;
-  span.payload_crc = 0;
-  if (rc == LC_OK)
-    rc = lc_ps_recode_meta(work, entry, &span, NULL, &meta, &reserved, error);
-  if (rc == LC_OK) {
-    span.payload_offset =
-        start + LC_POUCH_RECORD_HEADER_BYTES + strlen(entry->key) + reserved;
-    rc = lc_pouch_state_record_write_prefix(
-        fd, output_type, entry->key, strlen(entry->key), meta, reserved, 0, 0,
-        LC_POUCH_RECORD_FLAG_PENDING, error);
-  }
-  lc_free_with_allocator(&work->pouch->allocator, meta);
-  meta = NULL;
-  if (rc == LC_OK)
-    rc = lc_pouch_crypto_source_from_file_span(
-        work->pouch->crypto, context, binding, file->source,
-        entry->payload_span.payload_offset, entry->payload_span.payload_length,
-        entry->descriptor, &source, error);
-  if (rc == LC_OK)
-    rc = lc_pouch_crypto_writer_open(work->pouch->crypto, context, fd, 1,
-                                     &codec, error);
-  body.hash = EVP_MD_CTX_new();
-  body.hash_sink.write = lc_pouch_collection_hash_write;
-  body.encoded = lc_pouch_crypto_writer_sink(codec);
-  if (rc == LC_OK &&
-      (!body.hash || EVP_DigestInit_ex(body.hash, EVP_sha256(), NULL) != 1))
-    rc = lc_error_set(error, LC_ERR_NOMEM, 0,
-                      "failed to initialize conversion hash", NULL, NULL,
-                      "pouch");
-  if (rc == LC_OK) {
-    chunk = lc_alloc_with_allocator(&work->pouch->allocator, 65536);
-    if (!chunk)
-      rc = lc_error_set(error, LC_ERR_NOMEM, 0,
-                        "failed to allocate conversion input chunk", NULL, NULL,
+    return lc_error_set(error, LC_ERR_NOMEM, 0,
+                        "failed to allocate conversion binding", NULL, NULL,
                         "pouch");
-  }
-  while (rc == LC_OK) {
-    got = source->read(source, chunk, 65536, error);
-    if (error && error->code != LC_OK) {
-      rc = error->code;
-      break;
-    }
-    if (got == 0)
-      break;
-    if (!body.hash_sink.write(&body.hash_sink, chunk, got, error))
-      rc = error && error->code != LC_OK ? error->code : LC_ERR_TRANSPORT;
-  }
+  input = open(file->source, O_RDONLY);
+  rc = input < 0 ? lc_error_set(error, LC_ERR_TRANSPORT, 0,
+                                "failed to open conversion payload",
+                                strerror(errno), NULL, "pouch")
+                 : LC_OK;
   if (rc == LC_OK)
-    rc = lc_pouch_crypto_writer_finish(codec, &plain, &stored, &crc,
-                                       &descriptor, error);
-  if (rc == LC_OK) {
-    etag = lc_pouch_state_hash_final(&work->pouch->allocator, body.hash, error);
-    if (!etag)
-      rc = LC_ERR_NOMEM;
-    else if (plain != entry->bytes || strcmp(etag, entry->etag))
-      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
-                        "conversion payload integrity check failed", entry->key,
-                        NULL, "pouch");
-  }
-  if (rc == LC_OK && descriptor && strcmp(context, binding)) {
-    rc = lc_pouch_crypto_rebind_descriptor(work->pouch->crypto, descriptor,
-                                           context, binding, &rebound, error);
-    if (rc == LC_OK) {
-      lc_free_with_allocator(&work->pouch->allocator, descriptor);
-      descriptor = rebound;
-      rebound = NULL;
-    }
-  }
-  span.payload_length = stored;
-  span.payload_crc = crc;
-  if (rc == LC_OK)
-    rc = lc_ps_recode_meta(work, entry, &span, descriptor, &meta, &length,
-                           error);
-  if (rc == LC_OK && length != reserved)
-    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
-                      "converted metadata changed reservation size", NULL, NULL,
-                      "pouch");
-  if (rc == LC_OK)
-    rc = lc_pouch_state_record_finalize(fd, start, output_type, entry->key,
-                                        strlen(entry->key), meta, length,
-                                        stored, crc, error);
-  lc_source_close(source);
-  lc_pouch_crypto_writer_close(codec);
-  EVP_MD_CTX_free(body.hash);
+    rc = lc_pouch_state_record_recode(
+        &work->pouch->allocator, work->pouch->crypto,
+        lc_pouch_record_file_io(input), lc_pouch_record_file_io(fd),
+        destination_leaf, entry, binding, &result, error);
+  if (input >= 0)
+    (void)close(input);
+  lc_pouch_state_entry_cleanup(&work->pouch->allocator, &result);
   lc_free_with_allocator(&work->pouch->allocator, binding);
-  lc_free_with_allocator(&work->pouch->allocator, descriptor);
-  lc_free_with_allocator(&work->pouch->allocator, rebound);
-  lc_free_with_allocator(&work->pouch->allocator, etag);
-  lc_free_with_allocator(&work->pouch->allocator, meta);
-  lc_free_with_allocator(&work->pouch->allocator, chunk);
   return rc;
 }
 

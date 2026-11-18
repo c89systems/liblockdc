@@ -504,13 +504,9 @@ static void raw_head(const char *path, ps_key key, const unsigned char *bytes,
 }
 static void invalid_namespace(const char *path, lc_error *e) {
   ps_root *root = NULL;
-  ok(ps_root_open(path, 0, NULL, &root, e), e);
-  ps_namespace *ns = acquire(root, "test", 0, e);
-  ps_namespace_status status;
-  REQUIRE(ps_namespace_status_get(ns, &status, e) == LC_ERR_PROTOCOL);
+  /* Root admission now recovers namespace checkpoints eagerly. */
+  REQUIRE(ps_root_open(path, 0, NULL, &root, e) == LC_ERR_PROTOCOL && !root);
   clear(e);
-  ps_namespace_release(ns);
-  ok(ps_root_close(root, e), e);
 }
 static void put64(unsigned char *p, uint64_t v) {
   for (size_t i = 0; i < 8; ++i) {
@@ -1584,6 +1580,8 @@ static void body_budget_faults(const char *path) {
         ok(ps_root_close(root, &e), &e);
         ok(ps_root_open(path, 0, &options, &root, &e), &e);
         ns = acquire(root, "body-budget", 0, &e);
+        ps_stats initial;
+        ok(ps_status(ps_root_space(root), &initial, &e), &e);
         ps_namespace_body *b = NULL;
         unsigned int source_kind;
         uint64_t id = 0;
@@ -1618,9 +1616,12 @@ static void body_budget_faults(const char *path) {
         }
         ps_stats physical;
         ok(ps_status(ps_root_space(root), &physical, &e), &e);
-        REQUIRE(!physical.budgets && !physical.reserved_payload_bytes &&
-                !physical.reserved_metadata_bytes &&
-                !physical.reserved_entries);
+        REQUIRE(physical.budgets == initial.budgets &&
+                physical.reserved_payload_bytes ==
+                    initial.reserved_payload_bytes &&
+                physical.reserved_metadata_bytes ==
+                    initial.reserved_metadata_bytes &&
+                physical.reserved_entries == initial.reserved_entries);
         ps_namespace_release(ns);
         ok(ps_root_close(root, &e), &e);
         crash(&m, path);
@@ -2176,6 +2177,7 @@ static void bodies(const char *path) {
   REQUIRE(unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+#include "recode_cases.h"
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -2193,6 +2195,10 @@ static void *worker(void *p) {
     publication(r->path);
   else if (!strcmp(r->mode, "bodies"))
     bodies(r->path);
+  else if (!strcmp(r->mode, "recode") || !strcmp(r->mode, "recode-faults"))
+    record_recode(r->path, r->key, !strcmp(r->mode, "recode-faults"));
+  else if (!strcmp(r->mode, "recode-capacity"))
+    recode_capacity(r->path, r->key);
   else if (!strcmp(r->mode, "body-budget"))
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))

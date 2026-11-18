@@ -114,6 +114,26 @@ int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
                                  lc_source *, int disable_compression,
                                  lc_pouch_state_entry *result, lc_error *);
 
+/* Re-encode an immutable body into private canonical output, without changing
+ * logical identity. The target provider keeps the input encryption identity;
+ * its compression policy may differ. Input and binding are borrowed and must
+ * remain valid through the call. No path, spool or whole-body buffer is used.
+ * Verify encoded CRC, plaintext byte count and etag before clearing PENDING;
+ * preserve versions, lifetime, both index sequences and side metadata. A
+ * projected META/LINK body becomes a physical PUT (OBJECT_PUT when applicable).
+ * The owner still selects metadata references and supplies durability. */
+int lc_pouch_state_record_recode_bound(const lc_allocator *, lc_pouch_crypto *,
+                                       const char *output_leaf,
+                                       const lc_pouch_state_entry *, uint64_t *,
+                                       lc_error *);
+int lc_pouch_state_record_recode(const lc_allocator *, lc_pouch_crypto *,
+                                 lc_pouch_record_io input,
+                                 lc_pouch_record_io output,
+                                 const char *output_leaf,
+                                 const lc_pouch_state_entry *,
+                                 const char *binding_context,
+                                 lc_pouch_state_entry *result, lc_error *);
+
 /* Canonical checkpoint bytes, including HIGH_WATER and retained decisions.
  * Control records require NULL encoded input. Preserve resolved versions,
  * lifetimes and both

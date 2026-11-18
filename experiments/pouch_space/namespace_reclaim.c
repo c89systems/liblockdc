@@ -20,9 +20,10 @@ struct ps_namespace_body {
   ps_budget *budget;
   uint64_t bytes;
   int attempted, owns_budget;
+  int bounded;
 };
 static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
-                      ps_namespace_body **out, lc_error *e) {
+                      int bounded, ps_namespace_body **out, lc_error *e) {
   ps_namespace_body *b;
   ps_budget_plan plan = {0};
   struct ps_namespace_data *d;
@@ -44,6 +45,7 @@ static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
   b->bytes = bytes;
   b->budget = budget;
   b->owns_budget = !budget;
+  b->bounded = bounded;
   ps_namespace_retain(ns);
   if (!budget) {
     rc = plan_output(&plan, 29, bytes, e);
@@ -67,7 +69,7 @@ static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
                           NULL, NULL, NULL, &r->stream, e);
     if (rc == LC_OK)
       rc = ps_record_begin(r->stream, &b->writer, e);
-    if (rc == LC_OK)
+    if (rc == LC_OK && !bounded)
       rc = ps_stream_reserve_exact(b->writer.writer, b->budget, bytes, e);
     if (rc == LC_OK)
       b->writer.limit = bytes;
@@ -80,9 +82,55 @@ static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
 }
 int ps_namespace_body_begin(ps_namespace *ns, uint64_t bytes,
                             ps_namespace_body **out, lc_error *e) {
-  return body_begin(ns, NULL, bytes, out, e);
+  return body_begin(ns, NULL, bytes, 0, out, e);
+}
+int ps_namespace_body_begin_bound(ps_namespace *ns, uint64_t maximum,
+                                  ps_namespace_body **out, lc_error *e) {
+  return body_begin(ns, NULL, maximum, 1, out, e);
+}
+static int bounded_append(void *context, const struct iovec *parts, int count,
+                          lc_error *e) {
+  ps_namespace_body *b = context;
+  uint64_t end = b->writer.tail;
+  int i, rc;
+  if (b->attempted || !b->writer.writer || count < 0 || (count && !parts) ||
+      end > b->bytes)
+    return failure(e, "bounded body output is closed or invalid");
+  for (i = 0; i < count; ++i) {
+    if (parts[i].iov_len > b->bytes - end)
+      return failure(e, "bounded body output exceeds admitted span");
+    end += parts[i].iov_len;
+  }
+  rc = ps_stream_reserve_exact(b->writer.writer, b->budget, end, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_record_io_append(ps_record_output(&b->writer), parts, count,
+                                   e);
+  return rc;
+}
+static int bounded_patch(void *context, uint64_t offset,
+                         const struct iovec *parts, int count, lc_error *e) {
+  ps_namespace_body *b = context;
+  return lc_pouch_record_io_patch(ps_record_output(&b->writer), offset, parts,
+                                  count, e);
+}
+static int bounded_tail(void *context, uint64_t *out, lc_error *e) {
+  ps_namespace_body *b = context;
+  return lc_pouch_record_io_tail(ps_record_output(&b->writer), out, e);
+}
+static void bounded_discard(void *context, uint64_t offset) {
+  ps_namespace_body *b = context;
+  lc_pouch_record_io io = ps_record_output(&b->writer);
+  io.ops->discard(io.context, offset);
 }
 lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *b) {
+  static const lc_pouch_record_io_ops ops = {
+      NULL, bounded_append, bounded_patch, bounded_tail, bounded_discard};
+  lc_pouch_record_io output;
+  if (b && b->bounded) {
+    output.ops = &ops;
+    output.context = b;
+    return output;
+  }
   return ps_record_output(b ? &b->writer : NULL);
 }
 const char *ps_namespace_body_leaf(const ps_namespace_body *b) {
@@ -92,7 +140,8 @@ static int body_commit_locked(ps_namespace_body *b, lc_error *e) {
   ps_stream_info info;
   ps_ns_resource *r;
   int rc;
-  if (!b || b->attempted || !b->writer.writer || b->writer.tail != b->bytes)
+  if (!b || b->attempted || !b->writer.writer || !b->writer.tail ||
+      b->writer.tail > b->bytes || (!b->bounded && b->writer.tail != b->bytes))
     return failure(e, "body build is closed or differs from its measured size");
   b->attempted = 1;
   r = b->resource;

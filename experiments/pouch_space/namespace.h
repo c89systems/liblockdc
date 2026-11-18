@@ -152,10 +152,24 @@ void ps_namespace_view_close(ps_namespace_view *);
  */
 int ps_namespace_body_begin(ps_namespace *, uint64_t bytes,
                             ps_namespace_body **, lc_error *);
+/* Admit a complete conservative span before production, then allocate only
+ * the bytes actually emitted. Commit permits a shorter nonempty result;
+ * close releases unused admission. No output-sized buffer is retained. */
+int ps_namespace_body_begin_bound(ps_namespace *, uint64_t maximum,
+                                  ps_namespace_body **, lc_error *);
 lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *);
 const char *ps_namespace_body_leaf(const ps_namespace_body *);
 int ps_namespace_body_commit(ps_namespace_body *, lc_error *);
 void ps_namespace_body_close(ps_namespace_body *);
+/* Offline conversion preparation, not logical reference selection. The caller
+ * excludes namespace mutation/reclamation throughout preparation and handoff.
+ * Produce a sealed final body pack from one immutable source, retaining all
+ * logical facts and verifying integrity. A successful unselected pack is
+ * reclaimed through normal namespace maintenance after interrupted handoff.
+ * Result owns its decoded fields in the root crypto allocator. */
+int ps_namespace_body_recode(ps_namespace *, lc_pouch_crypto *,
+                             const lc_pouch_state_entry *, const char *binding,
+                             lc_pouch_state_entry *, lc_error *);
 /* Only fully covered sealed segments and unreferenced sealed body packs are
  * eligible. Captured metadata views defer source retirement with BUSY until
  * their callbacks can no longer open a historical body reference.
