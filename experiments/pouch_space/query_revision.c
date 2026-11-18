@@ -192,7 +192,7 @@ static int query_replace(void *context, const char *name,
   if (rc == LC_OK)
     rc = namespace_get(root, name, 1, &ns, e);
   if (rc == LC_OK)
-    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
   if (rc == LC_OK)
     rc = ps_budget_plan_value(&plan, bound, e);
   if (rc == LC_OK)
@@ -219,7 +219,7 @@ static int query_remove(void *context, const char *name,
   if (rc == LC_OK)
     rc = namespace_get(root, name, 0, &ns, e);
   if (rc == LC_OK && ns)
-    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
   if (rc == LC_OK && ns) {
     key.owner = ns->identity.owner;
     rc = ps_value_remove(root->space, key, NULL, e);
@@ -314,7 +314,7 @@ static int query_prepare(void *context, const char *name,
     ns = NULL;
     key.owner = revision->ns->identity.owner;
     rc = ps_namespace_work_ensure(revision->ns, LC_POUCH_STORAGE_WORK_ORDINARY,
-                                  e);
+                                  0, e);
   }
   if (rc == LC_OK)
     rc = ps_budget_plan_value(&plan, bound, e);

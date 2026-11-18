@@ -3237,15 +3237,136 @@ the preceding multifile baseline or resolve its NoSync indexed-readiness gap.
 Raw data and per-configuration medians are `paired-performance.log` and
 `paired-summary.json` in the same stage directory.
 
-This restores existing checkpoint debt before admission. The fixed 16 KiB floor
-still needs replacement by a computed compound obligation for future deletion,
+This recovery milestone restores existing checkpoint debt before admission.
+The fixed 16 KiB floor still needed a computed compound obligation for deletion,
 retention control phases, bounded relocation and their metadata/publication
 dependencies. Retention work can exceed a tombstone's size, and replacing an
 active control may require both predecessor and successor ownership until
 durable retirement. Those credits cannot be assumed to be interchangeable.
 Active partial tails, inherited checksum proof, collection REGION relocation,
 codec conversion, shared-root coordination/recovery and the broader capacity
-progress proof remain required. No production cutover is implied.
+progress proof remain required. The following surface adds canonical deletion
+protection; it does not complete expiry or the full capacity proof.
+
+### Computed canonical deletion reserve
+
+Ordinary allocation now protects a computed future maintenance plan in addition
+to summed credits for admitted work. Each live canonical key owns an unclaimed
+deletion requirement. An augmented AVL tree caches the component maxima of owner
+payload, descriptor and entry plans. Reading the aggregate is constant time;
+changing or removing one owner is logarithmic. Equal requirements need no tree
+update. This reserves one bounded future operation rather than one deletion
+copy per live key. Already admitted independent participants still retain their
+separate summed completion claims.
+
+The space-owned base plan covers a bounded encoded piece, optional successor
+head/catalog/routing and one work hint. A key's compound plan adds its framed
+canonical deletion, changed-key checkpoint value and coverage control. Plans
+include page fragmentation and positive descriptor/entry growth. Ordinary
+admission also preserves the incremental root checkpoint workspace required by
+those future descriptors and entries. Optional checkpoint cache expansion honors
+that same floor. Mandatory checkpoints continue using actual funded workspace
+without requiring another hypothetical future unit. The lower physical owner's
+existing 16 KiB control allowance remains an additional foundation; it is no
+longer the whole native namespace maintenance reserve.
+
+The common canonical codec measures future tombstones from key and retained etag
+sizes without allocation or body reads. Prefix admission protects a larger
+requirement before application input. Side metadata and body length do not
+inflate a future tombstone. Decoded projections use the same codec calculation,
+so storage policy does not duplicate canonical field offsets. Reopen reconstructs
+requirements from selected slots and accepted suffix records before exposing
+writers. Recovery can register a requirement while its future floor is occupied;
+ordinary admission then waits for capacity while mandatory completion remains
+possible. No second persistent ledger or per-producer durability barrier is added.
+
+Requirements retain the largest accepted or prepared state until its replacement
+slot is durably selected. Shrinking then visits only those changed slots, using
+the same forward-slot supersession rule as recovery. Old pinned storage stays
+physically owned and is never counted as free reserve. Aborting a private append
+clears its physical suffix before releasing grown requirements. Checkpoint
+budgets are mandatory completion claims; an ordinary prefix separately verifies
+that its newly funded claim still leaves the computed future floor intact.
+
+Exact-length value plans and upper-bound value plans are now distinct. A shorter
+value under an aligned byte limit can fill an old packed tail and use another
+extent in a new page. Upper-bound plans fund that extra extent even when their
+limit is page aligned. Checkpoint claims and future checkpoint plans use those
+monotonic bounds, including when a key's requirement shrinks.
+
+Work-hint identity is preserved. Native deletion appends ensure the existing
+ordinary hint using explicit maintenance admission when it needs creation.
+Ordinary producers preserve the floor, and terminal maintenance callbacks may
+spend it. All internal callers now pass their admission class explicitly. This
+avoids introducing a separate first-deletion terminal publication/barrier merely
+to make capacity available.
+
+The fixed 10 MiB deletion fixture covers 3,491-byte, 60 KiB and 1 MiB metadata-only
+keys under both policies. The smallest case aligns the checkpoint admission
+bound to a page. Each fixture reopens before a peer fills ordinary capacity,
+creates its required hint, appends a deletion and publishes its checkpoint while
+an old view remains readable. After the view drains, bounded reclamation frees
+4,096, 118,784 and 2,101,248 bytes of canonical history respectively. Capacity
+stays 10 MiB. These are metadata-key/history tests, not a complete public expiry
+or large-body-key capacity qualification. Active incomplete tail grants may
+still remain pending.
+
+Other new cases cover 127 owners with independent maxima, failed growth without
+state change, allocation-free shrink/removal, an aligned value limit using two
+packed extents, four independent writers changing requirements, and producer
+rejection without input consumption. A successful private body is also discarded
+to prove requirement rollback after suffix invalidation. At full capacity, a
+funded synthetic operation publishes 1,024 empty values and 12 KiB of payload
+while peer checkpoints repeatedly rewrite the growing metadata. This exercises
+future descriptor/entry workspace rather than just payload protection.
+
+Debug gates pass the new cases plus public mutation/capacity/key bounds,
+concurrent projection and relocation, staging recovery faults, large groups,
+checkpoint/history faults, churn and the standard Pouch/source/header boundaries.
+The checkpoint sweep covers 203 allocation and 70 write/sync cuts per policy;
+bootstrap recovery covers 181 allocation, 4 write/sync and 16 read cuts per policy.
+GNU and native musl each pass the twelve-group gate and subsequent affected
+hint-admission checks with default workers. Three affected concurrency modes pass
+ThreadSanitizer with instrumented OpenSSL 3.6.5, 128 KiB workers and no
+suppressions. Four strict Memcheck cases finish with 171,459 matched
+allocations/frees, zero live heap, errors, suppressions or owned descriptors.
+Evidence is under `build/pouch-space-standing/`: `final-debug.log`,
+`qualification-debug.log`, `admission-debug.log`, `qualification-gnu.log`,
+`qualification-musl.log`, `admission-gnu.log`, `admission-musl.log`,
+`qualification-tsan.log`, `admission-tsan.log` and `memcheck-1.log` through
+`memcheck-4.log`.
+
+The final paired GNU indexed comparison verifies 48 runs: eight configurations
+and three samples per engine against the frozen root-admission build. Ratios are
+medians of per-configuration median-of-three ratios; lower is faster.
+
+| Measurement / prior container | NoSync | Durable |
+| --- | ---: | ---: |
+| Measured work | 1.04x | 0.99x |
+| Work CPU | 1.00x | 0.99x |
+| p50 write | 1.00x | 1.05x |
+| Indexed worker | 0.98x | 1.17x |
+| Reopen and verify | 1.00x | 1.13x |
+| Close | 1.36x | 1.01x |
+
+Work ratios range from 0.98-1.06x for NoSync and 0.90-1.20x for durable work.
+Median close across configurations remains below 0.7 ms; median reopen/verify
+is about 6.9/7.2 ms (NoSync/durable). The additional 24 queue/outbox/XA probes
+verify both policies and one/four writers, with one sample per engine and
+configuration.
+All single-writer workflow sync counts match the frozen build; four-writer
+counts vary with batching. These are small host probes, not statistical speedup
+or production latency commitments. They do not resolve the earlier multifile
+NoSync indexed-readiness gap. Raw results are `paired-performance.log`,
+`workflow-performance.log` and `paired-summary.json` in the same directory.
+
+Canonical deletion protection is now integrated. Retention's two control phases
+and transaction participants still need their complete mandatory-work plan and
+capacity proof. Automatic completion/reclamation of active partial tails,
+inherited checksum validation, collection REGION relocation, codec conversion,
+shared-root coordination/recovery and the full public lease/queue capacity matrix
+remain required. The full goal remains active, the multifile default is retained,
+and production cutover still requires an explicit decision.
 
 ### Root and namespace ownership
 

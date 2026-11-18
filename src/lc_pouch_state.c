@@ -7504,6 +7504,54 @@ static int lc_pouch_state_encode_payload_meta(
       staged_delete_marker, retention, NULL, 0, out, out_length, error);
 }
 
+static uint64_t lc_pouch_state_delete_bytes(uint64_t key, uint64_t etag) {
+  return LC_POUCH_RECORD_HEADER_BYTES + key + 18 + etag +
+         LC_POUCH_STATE_INDEX_TRAILER_BYTES +
+         LC_POUCH_STATE_QUERY_EXTENSION_BYTES;
+}
+uint64_t lc_pouch_state_entry_delete_bytes(const lc_pouch_state_entry *entry) {
+  return entry && entry->key && entry->found && !entry->control
+             ? lc_pouch_state_delete_bytes(
+                   strlen(entry->key), entry->etag ? strlen(entry->etag) : 0)
+             : 0;
+}
+int lc_pouch_state_record_delete_bound(unsigned char type, uint64_t key_bytes,
+                                       const void *metadata, size_t meta_bytes,
+                                       uint64_t *out, lc_error *error) {
+  const unsigned char *meta = metadata;
+  uint64_t fields;
+  if (!out || key_bytes > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
+      meta_bytes > LC_POUCH_STATE_RECORD_META_MAX_BYTES)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "canonical deletion bound requires a bounded prefix",
+                        NULL, NULL, "pouch");
+  *out = 0;
+  if (type == LC_POUCH_STATE_RECORD_STATE_DELETE ||
+      type == LC_POUCH_STATE_RECORD_OBJECT_DELETE ||
+      type == LC_POUCH_STATE_RECORD_DECISION ||
+      type == LC_POUCH_STATE_RECORD_HIGH_WATER)
+    return LC_OK;
+  if ((type != LC_POUCH_STATE_RECORD_STATE_PUT &&
+       type != LC_POUCH_STATE_RECORD_OBJECT_PUT &&
+       type != LC_POUCH_STATE_RECORD_STATE_LINK &&
+       type != LC_POUCH_STATE_RECORD_STATE_META) ||
+      !key_bytes || !meta ||
+      meta_bytes < LC_POUCH_STATE_PAYLOAD_META_FIXED_BYTES)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "canonical deletion bound has invalid payload metadata",
+                        NULL, NULL, "pouch");
+  fields = (uint64_t)LC_POUCH_STATE_PAYLOAD_META_FIXED_BYTES +
+           lc_pouch_state_get16(meta + 62) + lc_pouch_state_get16(meta + 64) +
+           lc_pouch_state_get32(meta + 66) + lc_pouch_state_get16(meta + 70) +
+           lc_pouch_state_get16(meta + 72);
+  if (fields > meta_bytes)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "canonical deletion bound metadata is truncated", NULL,
+                        NULL, "pouch");
+  *out =
+      lc_pouch_state_delete_bytes(key_bytes, lc_pouch_state_get16(meta + 64));
+  return LC_OK;
+}
 static int lc_pouch_state_encode_delete_meta(
     const lc_allocator *allocator, lc_pouch_generation version,
     lc_pouch_unix_seconds updated_at_unix, const char *etag,

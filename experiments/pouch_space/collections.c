@@ -520,7 +520,7 @@ static int query_cleanup_one(void *context, const void *name, size_t length,
   rc = lc_collection_refresh_view(c, e);
   if (rc == LC_OK && strcmp(epoch, c->order.query_id)) {
     rc = ps_namespace_work_ensure(receiver->owner->ns,
-                                  LC_POUCH_STORAGE_WORK_ORDINARY, e);
+                                  LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
     if (rc == LC_OK)
       rc = ps_query_artifact_remove(space(receiver->owner),
                                     receiver->owner->numeric, name, length,
@@ -1294,7 +1294,7 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
     rc = failure(e, LC_ERR_INVALID, "collection_not_found",
                  "collection does not exist");
   if (rc == LC_OK && !found)
-    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_COLLECTION, e);
+    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_COLLECTION, 0, e);
   if (rc == LC_OK && !found)
     rc = create_owner(ns, config, &logical->allocator, &owner, e);
   if (rc == LC_OK) {

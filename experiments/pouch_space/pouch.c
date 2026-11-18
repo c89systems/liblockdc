@@ -199,7 +199,8 @@ static int append_begin(void *context, void *ns, uint64_t target,
   }
   if (mode != LC_POUCH_STORAGE_APPEND_PREFIX && target)
     target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
-  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY,
+                                mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_namespace_append_begin(ns, target, minimum, physical, &append, e);
@@ -554,7 +555,8 @@ static int work_ensure(void *context, const char *name,
   ps_namespace *ns = NULL;
   int rc = ps_root_namespace_acquire(owner->root, name, 1, &ns, e);
   if (rc == LC_OK)
-    rc = ps_namespace_work_ensure(ns, kind, e);
+    rc = ps_namespace_work_ensure(ns, kind,
+                                  kind == LC_POUCH_STORAGE_WORK_TERMINAL, e);
   ps_namespace_release(ns);
   return rc;
 }

@@ -7331,7 +7331,28 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "root-obligations") == 0) {
+    if (strcmp(argv[2], "standing-prefix") == 0) {
+      standing_bound();
+      for (int durable = 0; durable < 2; ++durable)
+        standing_prefix(durable);
+    } else if (strcmp(argv[2], "standing-owners") == 0) {
+      standing_value_bound();
+      standing_owners();
+    } else if (strcmp(argv[2], "standing-capacity") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        standing_capacity(durable);
+    } else if (strcmp(argv[2], "standing-concurrency") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        standing_concurrency(durable);
+    } else if (strcmp(argv[2], "standing-deletion") == 0) {
+      for (int durable = 0; durable < 2; ++durable) {
+        /* The first case aligns the admitted checkpoint byte bound to a page.
+         */
+        standing_deletion(durable, 3491);
+        standing_deletion(durable, 60 * 1024);
+        standing_deletion(durable, (size_t)PS_MIB);
+      }
+    } else if (strcmp(argv[2], "root-obligations") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int partial = 0; partial < 2; ++partial)
           for (int full = 0; full < 2; ++full)

@@ -10,6 +10,14 @@
 #define LC_POUCH_STATE_RECORD_KEY_MAX_BYTES (1024U * 1024U)
 #define LC_POUCH_STATE_HIGH_WATER_KEY ".lockd/high-water"
 
+/* Allocation-free future tombstone bound from a structured canonical prefix.
+ * Live payload/link/placeholder metadata retains only its etag in a deletion;
+ * decisions, high waters and existing tombstones need no future deletion.
+ * This measures no body and does not replace full canonical validation. */
+int lc_pouch_state_record_delete_bound(unsigned char type, uint64_t key_bytes,
+                                       const void *metadata, size_t meta_bytes,
+                                       uint64_t *out, lc_error *);
+
 typedef enum lc_pouch_state_record_type {
   LC_POUCH_STATE_RECORD_STATE_PUT = 1,
   LC_POUCH_STATE_RECORD_STATE_DELETE = 2,
@@ -67,6 +75,8 @@ typedef struct lc_pouch_state_entry {
   int has_record_ref;
   unsigned char record_type;
 } lc_pouch_state_entry;
+/* Same future tombstone size for an already decoded canonical projection. */
+uint64_t lc_pouch_state_entry_delete_bytes(const lc_pouch_state_entry *);
 
 /* Internal canonical bytes, not a namespace mutation API. The caller owns
  * versions, index sequences, append exclusion, publication and durability.

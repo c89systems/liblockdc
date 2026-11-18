@@ -98,6 +98,9 @@ struct ps_space {
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload, reserved_metadata, reserved_entries;
   size_t budgets;
+  ps_budget_plan reserve_base;
+  struct ps_reserve *reserves;
+  uint64_t reserve_next, reserve_count;
   uint64_t directory_page_writes, descriptor_page_writes;
   size_t metadata_pages;
   size_t packed_pages;
@@ -116,6 +119,13 @@ struct ps_budget {
   ps_budget_plan remaining;
   size_t users;
   ps_run *trim;
+};
+struct ps_reserve {
+  ps_space *space;
+  uint64_t id;
+  unsigned int height;
+  ps_budget_plan plan, maximum;
+  struct ps_reserve *left, *right;
 };
 
 typedef struct ps_catalog_record {
@@ -143,6 +153,7 @@ int ps_internal_event(ps_space *, ps_entry *, int, lc_error *);
 int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
                           lc_error *);
 int ps_internal_budget_admit(ps_space *, int, lc_error *);
+void ps_internal_reserve_plan(ps_space *, ps_budget_plan *);
 void ps_internal_budget_trim(ps_space *, ps_run **);
 int ps_internal_budget_check(ps_space *, ps_budget *, uint64_t, uint64_t,
                              uint64_t, lc_error *);

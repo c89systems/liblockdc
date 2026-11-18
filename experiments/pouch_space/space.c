@@ -1083,6 +1083,34 @@ static int metadata_protect(ps_space *s, uint64_t bound, uint64_t payload,
   return metadata_fill(s, bound, metadata_target(s, bound), payload, floor,
                        error);
 }
+static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
+                         uint64_t bound, uint64_t *floor, lc_error *e) {
+  ps_budget_plan plan;
+  uint64_t future, target, extra;
+  int rc;
+  ps_internal_reserve_plan(s, &plan);
+  if (bytes < s->metadata)
+    bytes = s->metadata;
+  if (entries < s->live_entries)
+    entries = s->live_entries;
+  if (plan.metadata_bytes > UINT64_MAX - bytes ||
+      plan.entries > UINT64_MAX - entries)
+    return err(e, LC_ERR_INVALID, "maintenance reserve metadata overflows");
+  rc = metadata_claimed_bound(s, bytes + plan.metadata_bytes,
+                              entries + plan.entries, &future, e);
+  if (rc != LC_OK)
+    return rc;
+  if (future < bound)
+    future = bound;
+  target = metadata_target(s, bound);
+  future = metadata_target(s, future);
+  extra = future > target ? future - target : 0;
+  if (plan.payload_bytes > UINT64_MAX - extra ||
+      *floor > UINT64_MAX - extra - plan.payload_bytes)
+    return err(e, LC_ERR_INVALID, "maintenance reserve payload overflows");
+  *floor += extra + plan.payload_bytes;
+  return LC_OK;
+}
 static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
                                       uint64_t entries, uint64_t payload,
                                       uint64_t floor, ps_budget *budget,
@@ -1112,6 +1140,11 @@ static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
     return rc;
   if (bound < current)
     bound = current;
+  if (floor) {
+    rc = reserve_floor(s, bytes, entries, bound, &floor, error);
+    if (rc != LC_OK)
+      return rc;
+  }
   return metadata_protect(s, bound, payload, floor, error);
 }
 static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
@@ -1444,7 +1477,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   ps_entry *p;
   ps_meta_page *page;
   ps_run *trim = NULL;
-  uint64_t bound;
+  uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0};
   ps_directory_pages changes;
@@ -1465,13 +1498,15 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
    * At capacity, a dense rewrite returns every old metadata page and restores
    * the protected image allowance instead of slowly fragmenting it away. */
   if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound &&
+      reserve_floor(s, s->metadata, s->live_entries, bound, &floor, NULL) ==
+          LC_OK &&
       s->free_bytes >= s->reserved_payload &&
       s->free_bytes - s->reserved_payload >=
           2 * bound - s->metadata_free_bytes &&
       s->free_bytes - s->reserved_payload -
               (2 * bound - s->metadata_free_bytes) >=
-          PS_MAINTENANCE_RESERVE)
-    rc = metadata_fill(s, bound, 2 * bound, 0, PS_MAINTENANCE_RESERVE, error);
+          floor)
+    rc = metadata_fill(s, bound, 2 * bound, 0, floor, error);
   if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound) {
     metadata_dirty_all(s);
     dense = 1;
@@ -2365,10 +2400,10 @@ int ps_close(ps_space *s, lc_error *error) {
   if (!s)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  if (s->readers || s->writers || s->budgets) {
+  if (s->readers || s->writers || s->budgets || s->reserve_count) {
     pthread_mutex_unlock(&s->mutex);
     return err(error, LC_ERR_INVALID,
-               "close container readers, writers and capacity budgets first");
+               "close container readers, writers, budgets and reserves first");
   }
   pthread_mutex_unlock(&s->mutex);
   destroy(s);
@@ -3274,6 +3309,7 @@ int ps_check(ps_space *s, lc_error *error) {
 }
 int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   ps_entry *p;
+  ps_budget_plan reserve;
   uint64_t n;
   size_t i;
   if (!s || !out)
@@ -3290,6 +3326,11 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->reserved_metadata_bytes = s->reserved_metadata;
   out->reserved_entries = s->reserved_entries;
   out->budgets = s->budgets;
+  ps_internal_reserve_plan(s, &reserve);
+  out->reserve_payload_bytes = reserve.payload_bytes;
+  out->reserve_metadata_bytes = reserve.metadata_bytes;
+  out->reserve_entries = reserve.entries;
+  out->reserve_owners = s->reserve_count;
   out->directory_page_writes = s->directory_page_writes;
   out->descriptor_page_writes = s->descriptor_page_writes;
   out->packed_pages = s->packed_pages;

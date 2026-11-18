@@ -1,4 +1,5 @@
 #include "namespace_work.h"
+#include "budget.h"
 #include "lc_api_internal.h"
 #include "root_internal.h"
 #include <string.h>
@@ -67,13 +68,18 @@ int ps_namespace_work_get(ps_namespace *ns,
 }
 int ps_namespace_work_ensure(ps_namespace *ns,
                              enum lc_pouch_storage_work_kind kind,
-                             lc_error *e) {
+                             int maintenance, lc_error *e) {
   unsigned char bytes[32];
   ps_writer *writer = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {0};
   unsigned int bit;
   int present = 0, rc = valid(ns, kind, e);
   if (rc != LC_OK)
     return rc;
+  if (maintenance < 0 || maintenance > 1)
+    return failure(e, LC_ERR_INVALID,
+                   "invalid maintenance hint admission class");
   bit = 1U << (unsigned int)kind;
   pthread_mutex_lock(&ns->maintenance);
   if (!(ns->work_loaded & bit)) {
@@ -90,12 +96,20 @@ int ps_namespace_work_ensure(ps_namespace *ns,
     put64(bytes + 8U, ns->identity.owner);
     put64(bytes + 16U, (uint64_t)kind);
     put64(bytes + 24U, (uint64_t)crc32(0L, bytes, 24U));
-    rc = ps_begin(ns->root->space, NULL, key_for(ns, kind), &writer, e);
+    if (maintenance) {
+      plan.maintenance = 1;
+      rc = ps_budget_plan_value(&plan, sizeof(bytes), e);
+      if (rc == LC_OK)
+        rc = ps_budget_open(ns->root->space, &plan, &budget, e);
+    }
+    if (rc == LC_OK)
+      rc = ps_begin(ns->root->space, budget, key_for(ns, kind), &writer, e);
     if (rc == LC_OK)
       rc = ps_write(writer, bytes, sizeof(bytes), e);
     if (rc == LC_OK)
       rc = ps_publish(writer, NULL, e);
     ps_writer_close(writer);
+    (void)ps_budget_close(budget, NULL);
     if (rc == LC_OK)
       ns->work_present |= bit;
   }

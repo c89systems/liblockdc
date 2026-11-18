@@ -327,7 +327,7 @@ static void background_hints(const char *directory, int codec, int sync) {
      &f.error);
   for (int kind = LC_POUCH_STORAGE_WORK_ORDINARY;
        kind <= LC_POUCH_STORAGE_WORK_COLLECTION; ++kind) {
-    ok(ps_namespace_work_ensure(ns, (enum lc_pouch_storage_work_kind)kind,
+    ok(ps_namespace_work_ensure(ns, (enum lc_pouch_storage_work_kind)kind, 0,
                                 &f.error),
        &f.error);
     ok(ps_namespace_work_get(ns, (enum lc_pouch_storage_work_kind)kind,

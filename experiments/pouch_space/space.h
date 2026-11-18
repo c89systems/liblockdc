@@ -92,6 +92,11 @@ typedef struct ps_stats {
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload_bytes, reserved_metadata_bytes, reserved_entries;
   uint64_t budgets;
+  /* Component maxima of unclaimed future maintenance, not summed owner
+   * credits. Allocator admission also protects their incremental checkpoint
+   * workspace. reserve_owners excludes the space-owned base plan. */
+  uint64_t reserve_payload_bytes, reserve_metadata_bytes, reserve_entries;
+  uint64_t reserve_owners;
   uint64_t packed_pages, packed_bytes;
 } ps_stats;
 

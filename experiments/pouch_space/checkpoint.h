@@ -26,11 +26,15 @@ void ps_key_checkpoint_close(ps_key_checkpoint *);
 int ps_key_checkpoint_observe(ps_key_checkpoint *,
                               const ps_checkpoint_observer *, lc_error *);
 void ps_key_checkpoint_info(ps_key_checkpoint *, ps_checkpoint_info *);
-/* Installs prefix admission before the producer. Preparation decodes only
- * completed private metadata. Accept is infallible after canonical commit. */
+/* Installs checkpoint and future-deletion admission before the producer.
+ * maintenance permits mandatory completion while the standing floor is in use;
+ * ordinary prefixes must preserve that floor after funding their claims.
+ * Preparation decodes only completed private metadata. Accept is infallible
+ * after canonical commit. */
 int ps_checkpoint_delta_begin(ps_key_checkpoint *, ps_record_writer *,
                               uint64_t segment, const char *leaf,
-                              ps_checkpoint_delta **, lc_error *);
+                              int maintenance, ps_checkpoint_delta **,
+                              lc_error *);
 int ps_checkpoint_delta_prepare(ps_checkpoint_delta *, lc_error *);
 void ps_checkpoint_delta_accept(ps_checkpoint_delta *);
 void ps_checkpoint_delta_close(ps_checkpoint_delta *);

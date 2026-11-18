@@ -349,7 +349,8 @@ static int write_marker(void *context, const char *name,
   int rc, created = 0, published = 0;
   if (!store->ns || size > LC_POUCH_OUTBOX_MARKER_MAX_BYTES)
     return failure(e, LC_ERR_INVALID, "invalid outbox marker write");
-  rc = ps_namespace_work_ensure(store->ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+  rc =
+      ps_namespace_work_ensure(store->ns, LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
   if (rc != LC_OK)
     return rc;
   rc = catalog_name(store, name, &encoded, &length, e);

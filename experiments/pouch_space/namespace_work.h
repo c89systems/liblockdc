@@ -4,9 +4,11 @@
 #include "root.h"
 /* Slots 4..6 are durable metadata hints, independent of canonical outcomes.
  * Ensure precedes the operation that can create maintenance work. Discovery
- * never admits segment owners or reads application bodies. */
+ * never admits segment owners or reads application bodies. maintenance permits
+ * mandatory bounded creation to spend the computed floor; ordinary creation
+ * preserves it. The admission class does not change the hint identity. */
 int ps_namespace_work_ensure(ps_namespace *, enum lc_pouch_storage_work_kind,
-                             lc_error *);
+                             int maintenance, lc_error *);
 int ps_namespace_work_get(ps_namespace *, enum lc_pouch_storage_work_kind,
                           int *, lc_error *);
 int ps_namespace_work_remove(ps_namespace *, enum lc_pouch_storage_work_kind,

@@ -1,4 +1,5 @@
 #include "root.h"
+#include "budget.h"
 #include "collections.h"
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
@@ -15,6 +16,17 @@
 #define ROOT_KEY_ID_BYTES 80U
 static const unsigned char config_magic[8] = {'L', 'C', 'P', 'S',
                                               'R', 'O', 'O', 'T'};
+static int reserve_base(ps_root *root, int recover, lc_error *e) {
+  ps_budget_plan plan = {0};
+  int rc;
+  /* One bounded replacement, an optional successor and its routing, plus a
+   * newly required maintenance hint. Key deletion adds owner plans, rather
+   * than guessing a fixed largest key size. Retention phases remain pending. */
+  rc = ps_budget_plan_maintenance(&plan, 0, e);
+  if (rc == LC_OK)
+    rc = ps_reserve_base(root->space, &plan, recover, e);
+  return rc;
+}
 static int recover_namespace(const char *name,
                              const ps_namespace_info *identity, void *context,
                              lc_error *error) {
@@ -185,6 +197,8 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   if (rc == LC_OK)
     rc = create ? config_write(root, error)
                 : config_read(root, options->compression_explicit, error);
+  if (rc == LC_OK)
+    rc = reserve_base(root, !create, error);
   if (rc == LC_OK && !create)
     rc = ps_root_namespace_visit(root, recover_namespace, root, error);
   if (rc != LC_OK) {

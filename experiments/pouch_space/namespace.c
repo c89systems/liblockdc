@@ -760,11 +760,12 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
       rc = ps_record_frame_begin(&append->writer, minimum, e);
     if (rc == LC_OK)
       rc = ps_checkpoint_delta_begin(d->checkpoint, &append->writer, s->id,
-                                     s->leaf, &append->delta, e);
+                                     s->leaf, mode == PS_APPEND_MAINTENANCE,
+                                     &append->delta, e);
   }
   if (rc != LC_OK) {
-    ps_checkpoint_delta_close(append->delta);
     ps_record_abort(&append->writer);
+    ps_checkpoint_delta_close(append->delta);
     ps_budget_close(append->budget, NULL);
     ps_ns_leave(d);
     lc_free_with_allocator(NULL, append);
@@ -835,8 +836,8 @@ int ps_namespace_append_commit(ps_namespace_append *append,
 void ps_namespace_append_close(ps_namespace_append *append) {
   if (!append)
     return;
-  ps_checkpoint_delta_close(append->delta);
   ps_record_abort(&append->writer);
+  ps_checkpoint_delta_close(append->delta);
   ps_budget_close(append->budget, NULL);
   ps_ns_leave(append->data);
   ps_namespace_release(append->ns);

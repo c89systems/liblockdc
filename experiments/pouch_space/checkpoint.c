@@ -22,6 +22,7 @@ typedef struct slot_change slot_change;
 typedef struct key_summary {
   uint64_t index, query, version, lifetime;
   uint64_t body_start, body_end;
+  uint64_t deletion_bytes;
   unsigned char type;
   int found, body, has_hidden, hidden;
 } key_summary;
@@ -35,6 +36,8 @@ struct key_slot {
   char *key, *leaf;
   uint64_t id, bound;
   unsigned int kind;
+  ps_reserve *reserve;
+  uint64_t required_deletion;
   key_summary summary;
   ps_checkpoint_record pending;
   source_count *body;
@@ -47,6 +50,7 @@ struct key_slot {
 struct slot_change {
   key_slot *slot;
   uint64_t bound;
+  uint64_t prior_deletion;
   int created, prepared;
   key_summary summary;
   source_count *body;
@@ -78,7 +82,7 @@ struct ps_checkpoint_delta {
   slot_change **buckets;
   size_t capacity, count, created;
   ps_budget_plan claim;
-  int prepared, accepted;
+  int prepared, accepted, maintenance;
 };
 
 static int failure(lc_error *e, int code, const char *message) {
@@ -243,6 +247,7 @@ static void insert_slot(ps_key_checkpoint *c, key_slot *s) {
   ++c->count;
 }
 static void close_slot(ps_key_checkpoint *c, key_slot *s) {
+  ps_reserve_close(s->reserve);
   ps_checkpoint_record_close(&s->pending);
   lc_free_with_allocator(&c->allocator, s->key);
   lc_free_with_allocator(&c->allocator, s->leaf);
@@ -279,6 +284,28 @@ static void summarize(key_summary *s, const lc_pouch_state_entry *r) {
   s->body_end = s->body_start + r->payload_span.payload_length;
   s->has_hidden = r->has_query_hidden;
   s->hidden = r->query_hidden;
+  s->deletion_bytes = lc_pouch_state_entry_delete_bytes(r);
+}
+static int reserve_slot(ps_key_checkpoint *c, key_slot *s, uint64_t bytes,
+                        int recover, lc_error *e) {
+  ps_budget_plan plan = {0};
+  int rc;
+  if (bytes == s->required_deletion)
+    return LC_OK;
+  if (!bytes) {
+    ps_reserve_close(s->reserve);
+    s->reserve = NULL;
+    s->required_deletion = 0;
+    return LC_OK;
+  }
+  rc = ps_budget_plan_maintenance(&plan, bytes, e);
+  if (rc == LC_OK)
+    rc = s->reserve ? ps_reserve_resize(s->reserve, &plan, recover, e)
+                    : ps_reserve_open(c->ns->root->space, &plan, recover,
+                                      &s->reserve, e);
+  if (rc == LC_OK)
+    s->required_deletion = bytes;
+  return rc;
 }
 static void summary_view(key_slot *slot, const key_summary *s,
                          lc_pouch_state_entry *r) {
@@ -512,6 +539,8 @@ static int load_slots(ps_key_checkpoint *c, lc_error *e) {
       entry.key = NULL;
       summarize(&slot->summary, &projected);
       slot->body = source_get(c, &entry, &rc, e);
+      if (rc == LC_OK)
+        rc = reserve_slot(c, slot, slot->summary.deletion_bytes, 1, e);
     }
     if (rc == LC_OK) {
       if (slot->body) {
@@ -758,9 +787,11 @@ static void subtract_plan(ps_budget_plan *p, const ps_budget_plan *cost) {
   p->entries -= cost->entries;
 }
 static int fund(ps_key_checkpoint *c, const ps_budget_plan *plan, lc_error *e) {
+  ps_budget_plan completion = *plan;
+  completion.maintenance = 1;
   if (c->budget)
-    return ps_budget_resize(c->budget, plan, e);
-  return ps_budget_open(c->ns->root->space, plan, &c->budget, e);
+    return ps_budget_resize(c->budget, &completion, e);
+  return ps_budget_open(c->ns->root->space, &completion, &c->budget, e);
 }
 static void settle(ps_key_checkpoint *c) {
   if (!c->changed && !c->dirty) {
@@ -770,7 +801,7 @@ static void settle(ps_key_checkpoint *c) {
     /* Admission/flush funds the exact outstanding plan again before work.
      * A failed shrink retains excess credit; failed I/O may have spent credit
      * and poisoned the root, whose health check rejects further admission. */
-    (void)ps_budget_resize(c->budget, &c->claim, NULL);
+    (void)fund(c, &c->claim, NULL);
   }
 }
 static int delta_room(ps_checkpoint_delta *d, lc_error *e) {
@@ -863,6 +894,7 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
       ++d->created;
     }
     change->slot = slot;
+    change->prior_deletion = slot->required_deletion;
     change->bound = slot->pending.bytes ? slot->bound : 0;
     change->next = d->changes;
     d->changes = change;
@@ -873,11 +905,11 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
   }
   if (bound > change->bound) {
     if (change->bound) {
-      rc = ps_budget_plan_value(&before, change->bound, e);
+      rc = ps_budget_plan_value_bound(&before, change->bound, e);
       if (rc != LC_OK)
         return rc;
     }
-    rc = ps_budget_plan_value(&after, bound, e);
+    rc = ps_budget_plan_value_bound(&after, bound, e);
     if (rc != LC_OK)
       return rc;
     subtract_plan(&plan, &before);
@@ -898,8 +930,8 @@ static int admission(void *context, const lc_pouch_record_header *h,
   ps_checkpoint_delta *d = context;
   ps_key_checkpoint *c = d->checkpoint;
   unsigned int kind;
+  uint64_t deletion;
   int rc;
-  (void)metadata;
   if (h->type == LC_POUCH_STATE_RECORD_HIGH_WATER) {
     if (h->key_len || h->payload_len)
       return failure(e, LC_ERR_PROTOCOL, "invalid canonical high-water prefix");
@@ -916,16 +948,28 @@ static int admission(void *context, const lc_pouch_record_header *h,
                    "canonical checkpoint metadata exceeds bounds");
   kind = h->type == LC_POUCH_STATE_RECORD_DECISION ? PS_KEY_DECISION
                                                    : PS_KEY_METADATA;
+  rc = lc_pouch_state_record_delete_bound(h->type, h->key_len, metadata,
+                                          (size_t)h->meta_len, &deletion, e);
+  if (rc != LC_OK)
+    return rc;
   pthread_mutex_lock(&c->mutex);
   rc = admit_key(d, key, (size_t)h->key_len, kind,
                  LC_POUCH_RECORD_HEADER_BYTES + h->key_len + h->meta_len + 512,
                  e);
+  if (rc == LC_OK && deletion) {
+    slot_change *change = delta_find(d, key, (size_t)h->key_len, kind);
+    if (deletion > change->slot->required_deletion)
+      rc = reserve_slot(c, change->slot, deletion, 0, e);
+  }
+  if (rc == LC_OK && !d->maintenance)
+    rc = ps_budget_foreground_check(c->ns->root->space, e);
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
 int ps_checkpoint_delta_begin(ps_key_checkpoint *c, ps_record_writer *writer,
                               uint64_t segment, const char *leaf,
-                              ps_checkpoint_delta **out, lc_error *e) {
+                              int maintenance, ps_checkpoint_delta **out,
+                              lc_error *e) {
   ps_checkpoint_delta *d;
   int rc;
   if (out)
@@ -937,6 +981,7 @@ int ps_checkpoint_delta_begin(ps_key_checkpoint *c, ps_record_writer *writer,
   if (!d)
     return failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint append");
   d->checkpoint = c;
+  d->maintenance = maintenance;
   d->writer = writer;
   d->segment = segment;
   d->leaf = leaf;
@@ -987,6 +1032,13 @@ static int prepare_entry(ps_checkpoint_delta *d,
   }
   if (!accepted)
     return LC_OK;
+  {
+    uint64_t deletion = lc_pouch_state_entry_delete_bytes(&projected);
+    if (deletion > change->slot->required_deletion)
+      rc = reserve_slot(c, change->slot, deletion, !d->writer, e);
+  }
+  if (rc != LC_OK)
+    return rc;
   rc = ps_checkpoint_record_encode(&c->allocator, &projected, &record, e);
   if (rc == LC_OK && record.length > change->bound)
     rc = failure(e, LC_ERR_PROTOCOL,
@@ -1083,7 +1135,7 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
     }
     if (s->pending.bytes) {
       memset(&cost, 0, sizeof(cost));
-      (void)ps_budget_plan_value(&cost, s->bound, NULL);
+      (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
       subtract_plan(&c->claim, &cost);
       c->dirty_bytes -= s->pending.length;
     }
@@ -1097,7 +1149,7 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
     dirty_add(c, s);
     c->dirty_bytes += s->pending.length;
     memset(&cost, 0, sizeof(cost));
-    (void)ps_budget_plan_value(&cost, s->bound, NULL);
+    (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
     (void)add_plan(&c->claim, &cost, NULL);
   }
   if (d->state_index > c->state_index)
@@ -1127,6 +1179,8 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   pthread_mutex_lock(&c->mutex);
   for (change = d->changes; change; change = next) {
     next = change->next;
+    if (!d->accepted && !change->created)
+      (void)reserve_slot(c, change->slot, change->prior_deletion, 0, NULL);
     release_prepared_source(c, change->body);
     ps_checkpoint_record_close(&change->record);
     if (change->created)
@@ -1325,12 +1379,16 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
       for (i = 0; i < count; ++i) {
         s = slots[i];
         memset(&cost, 0, sizeof(cost));
-        (void)ps_budget_plan_value(&cost, s->bound, NULL);
+        (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
         subtract_plan(&c->claim, &cost);
         c->dirty_bytes -= s->pending.length;
         dirty_remove(c, s);
         ps_checkpoint_record_close(&s->pending);
         s->bound = 0;
+        /* The selected forward slot is now durable and canonical replay
+         * rejects superseded prefixes. Old reader-held storage stays owned;
+         * it is never counted as newly available reserve. */
+        (void)reserve_slot(c, s, s->summary.deletion_bytes, 0, NULL);
       }
       if (final) {
         c->selected.epoch = epoch;

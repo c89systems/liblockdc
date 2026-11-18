@@ -272,7 +272,7 @@ int ps_query_artifact_replace(ps_namespace *ns, uint64_t owner,
   selection.owner = owner;
   selection.name = name;
   selection.length = length;
-  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, 0, e);
   if (rc == LC_OK)
     rc = ps_budget_plan_stream(&plan, e);
   if (rc == LC_OK && bound)
