@@ -66,6 +66,17 @@ static int indexed_end(void *context, lc_error *e) {
   keys->seen |= UINT64_C(1) << row;
   return 1;
 }
+static void index_phase_begin(index_phase *phase) {
+  require(!pthread_getspecific(sync_phase_key), "index phases do not overlap");
+  require(!pthread_setspecific(sync_phase_key, phase), "start index phase");
+  phase->cpu_seconds = now(CLOCK_THREAD_CPUTIME_ID);
+  phase->seconds = now(CLOCK_MONOTONIC);
+}
+static void index_phase_end(index_phase *phase) {
+  phase->seconds = now(CLOCK_MONOTONIC) - phase->seconds;
+  phase->cpu_seconds = now(CLOCK_THREAD_CPUTIME_ID) - phase->cpu_seconds;
+  require(!pthread_setspecific(sync_phase_key, NULL), "finish index phase");
+}
 static int index_queries(worker *w, int flush, lc_error *e) {
   static const char *const selectors[] = {
       "{\"exists\":\"/v\"}",
@@ -79,14 +90,19 @@ static int index_queries(worker *w, int flush, lc_error *e) {
   request.mode = "sync";
   int rc = LC_OK;
   if (flush) {
+    index_phase_begin(&w->index_phases[0]);
     rc = lc_flush_index(w->run->client, &request, &result, e);
     if (rc == LC_OK)
       require(result.flushed && !result.pending, "completed index flush");
     lc_index_flush_res_cleanup(&result);
+    index_phase_end(&w->index_phases[0]);
   }
   for (size_t row = w->ordinal; row < w->run->rows; row += w->run->writers)
     expected |= UINT64_C(1) << row;
-  for (int pass = 0; rc == LC_OK && pass < 2; ++pass)
+  for (int pass = 0; rc == LC_OK && pass < 2; ++pass) {
+    index_phase *phase =
+        flush ? &w->index_phases[1 + pass] : &w->reopen_phases[pass];
+    index_phase_begin(phase);
     for (size_t i = 0U;
          rc == LC_OK && i < sizeof(selectors) / sizeof(selectors[0]); ++i) {
       lc_query_req query;
@@ -104,8 +120,12 @@ static int index_queries(worker *w, int flush, lc_error *e) {
         require(keys.seen == expected && queried.metadata_json &&
                     strstr(queried.metadata_json, "\"engine\":\"index\""),
                 "indexed query covers every streamed record");
+      if (rc == LC_OK)
+        ++phase->queries;
       lc_query_res_cleanup(&queried);
     }
+    index_phase_end(phase);
+  }
   return rc;
 }
 static void index_verify_reopen(worker *w, lc_error *e) {

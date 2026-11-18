@@ -18,6 +18,11 @@
 #include <unistd.h>
 
 typedef struct comparison comparison;
+typedef struct index_phase {
+  double seconds, cpu_seconds, sync_seconds;
+  uint64_t sync_calls;
+  size_t queries;
+} index_phase;
 typedef struct worker {
   comparison *run;
   size_t ordinal;
@@ -27,6 +32,7 @@ typedef struct worker {
   lc_xa_store *journal;
   char owner[LC_XID_STRING_SIZE], resource[LC_XID_STRING_SIZE];
   double index_seconds;
+  index_phase index_phases[3], reopen_phases[2];
   int result;
 } worker;
 struct comparison {
@@ -50,6 +56,10 @@ typedef struct consumer {
 static uint64_t data_syncs, full_syncs;
 static double sync_seconds;
 static pthread_mutex_t sync_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Attribute synchronous calls only to the thread executing a measured phase.
+ * Process-wide snapshots around overlapping writers would count peer work. */
+static pthread_key_t sync_phase_key;
+static int sync_phase_key_initialized;
 static double now(clockid_t clock) {
   struct timespec time;
   if (clock_gettime(clock, &time) != 0)
@@ -61,18 +71,32 @@ int __real_fsync(int);
 int __wrap_fdatasync(int fd) {
   double start = now(CLOCK_MONOTONIC);
   int rc = __real_fdatasync(fd);
+  double elapsed = now(CLOCK_MONOTONIC) - start;
+  index_phase *phase =
+      sync_phase_key_initialized ? pthread_getspecific(sync_phase_key) : NULL;
+  if (phase) {
+    ++phase->sync_calls;
+    phase->sync_seconds += elapsed;
+  }
   pthread_mutex_lock(&sync_mutex);
   ++data_syncs;
-  sync_seconds += now(CLOCK_MONOTONIC) - start;
+  sync_seconds += elapsed;
   pthread_mutex_unlock(&sync_mutex);
   return rc;
 }
 int __wrap_fsync(int fd) {
   double start = now(CLOCK_MONOTONIC);
   int rc = __real_fsync(fd);
+  double elapsed = now(CLOCK_MONOTONIC) - start;
+  index_phase *phase =
+      sync_phase_key_initialized ? pthread_getspecific(sync_phase_key) : NULL;
+  if (phase) {
+    ++phase->sync_calls;
+    phase->sync_seconds += elapsed;
+  }
   pthread_mutex_lock(&sync_mutex);
   ++full_syncs;
-  sync_seconds += now(CLOCK_MONOTONIC) - start;
+  sync_seconds += elapsed;
   pthread_mutex_unlock(&sync_mutex);
   return rc;
 }
@@ -573,6 +597,8 @@ int main(int argc, char **argv) {
   require(!pthread_mutex_init(&run.mutex, NULL) &&
               !pthread_cond_init(&run.condition, NULL),
           "worker gate");
+  require(!pthread_key_create(&sync_phase_key, NULL), "sync attribution key");
+  sync_phase_key_initialized = 1;
   for (size_t i = 0U; i < run.writers; ++i) {
     run.workers[i].run = &run;
     run.workers[i].ordinal = i;
@@ -641,14 +667,50 @@ int main(int argc, char **argv) {
   qsort(run.latencies, run.rows, sizeof(*run.latencies), compare_double);
   require(!getrusage(RUSAGE_SELF, &usage), "memory observation");
   double max_index_seconds = 0.0;
+  double max_phase_seconds[3] = {0}, phase_cpu_seconds[3] = {0},
+         phase_sync_seconds[3] = {0}, reopen_phase_seconds[2] = {0};
+  uint64_t phase_sync_calls[3] = {0};
   for (size_t i = 0U; i < run.writers; ++i)
     if (run.workers[i].index_seconds > max_index_seconds)
       max_index_seconds = run.workers[i].index_seconds;
+  for (size_t i = 0U; i < run.writers; ++i) {
+    worker *w = &run.workers[i];
+    double phase_seconds = 0.0;
+    for (size_t j = 0U; j < 3U; ++j) {
+      index_phase *phase = &w->index_phases[j];
+      phase_seconds += phase->seconds;
+      if (phase->seconds > max_phase_seconds[j])
+        max_phase_seconds[j] = phase->seconds;
+      phase_cpu_seconds[j] += phase->cpu_seconds;
+      phase_sync_seconds[j] += phase->sync_seconds;
+      phase_sync_calls[j] += phase->sync_calls;
+      require(phase->queries == (run.index && j ? 3U : 0U),
+              "measured query pass coverage");
+    }
+    require(phase_seconds <= w->index_seconds,
+            "phase timers are inside the worker interval");
+    for (size_t j = 0U; j < 2U; ++j) {
+      require(w->reopen_phases[j].queries == (run.index ? 3U : 0U),
+              "reopened query pass coverage");
+      reopen_phase_seconds[j] += w->reopen_phases[j].seconds;
+    }
+  }
+  require(phase_sync_calls[0] + phase_sync_calls[1] + phase_sync_calls[2] <=
+              measured_syncs,
+          "attributed sync calls belong to the work interval");
   printf(
       "mode=%s rows=%zu bytes=%zu writers=%zu sync=%d preopened=%d chunk=4096 "
       "lifecycle_ms=%.6f cpu_ms=%.6f p50_ms=%.6f p95_ms=%.6f "
       "sync_calls=%llu sync_ms=%.6f files=%llu create_ms=%.6f close_ms=%.6f "
       "reopen_verify_ms=%.6f peak_RSS_KiB=%ld index_worker_max_ms=%.6f "
+      "index_flush_max_ms=%.6f index_first_pass_max_ms=%.6f "
+      "index_repeat_pass_max_ms=%.6f index_flush_thread_cpu_ms=%.6f "
+      "index_first_pass_thread_cpu_ms=%.6f "
+      "index_repeat_pass_thread_cpu_ms=%.6f "
+      "index_flush_sync_calls=%llu index_first_pass_sync_calls=%llu "
+      "index_repeat_pass_sync_calls=%llu index_flush_sync_ms=%.6f "
+      "index_first_pass_sync_ms=%.6f index_repeat_pass_sync_ms=%.6f "
+      "reopen_first_pass_ms=%.6f reopen_repeat_pass_ms=%.6f "
       "indexed_queries=%zu verified=1\n",
       argv[1], run.rows, run.bytes, run.writers, run.sync, argc == 8,
       lifecycle_seconds * 1e3, cpu_seconds * 1e3,
@@ -657,8 +719,18 @@ int main(int argc, char **argv) {
       (unsigned long long)measured_syncs, measured_sync_seconds * 1e3,
       (unsigned long long)files, create_seconds * 1e3, close_seconds * 1e3,
       reopen_seconds * 1e3, usage.ru_maxrss, max_index_seconds * 1e3,
+      max_phase_seconds[0] * 1e3, max_phase_seconds[1] * 1e3,
+      max_phase_seconds[2] * 1e3, phase_cpu_seconds[0] * 1e3,
+      phase_cpu_seconds[1] * 1e3, phase_cpu_seconds[2] * 1e3,
+      (unsigned long long)phase_sync_calls[0],
+      (unsigned long long)phase_sync_calls[1],
+      (unsigned long long)phase_sync_calls[2], phase_sync_seconds[0] * 1e3,
+      phase_sync_seconds[1] * 1e3, phase_sync_seconds[2] * 1e3,
+      reopen_phase_seconds[0] * 1e3, reopen_phase_seconds[1] * 1e3,
       run.index ? run.writers * 6U : 0U);
   lc_error_cleanup(&e);
+  sync_phase_key_initialized = 0;
+  require(!pthread_key_delete(sync_phase_key), "close sync attribution key");
   require(!pthread_mutex_destroy(&run.mutex) &&
               !pthread_cond_destroy(&run.condition),
           "close worker gate");

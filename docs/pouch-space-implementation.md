@@ -8,6 +8,115 @@ conversion is outside this implementation; production deployment still requires
 an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
+## Single-file architecture direction
+
+The renewed implementation mandate authorizes redesigning all experimental
+internals to fit one physical container. The priorities are Pouch and lockd's
+lease-and-lock, coordination and transactional-messaging workloads, with
+correctness, bounded resource use and measured performance governing the
+design. The multifile implementation remains a behavioral and performance
+reference; its file organization, indexing algorithms and maintenance schedule
+are not requirements for the new backend. Production cutover still requires
+an explicit deployment decision.
+
+The selected maintenance direction is incremental canonical metadata
+checkpoints, bounded relocation of encoded body ranges and a computed standing
+capacity obligation, as specified in
+[the maintenance architecture](#selected-maintenance-architecture). The earlier
+request for separate architecture approval is superseded by this mandate.
+This authorizes experimental persistence changes; it does not claim that these
+mechanisms are implemented or their capacity proof is complete.
+
+### Preserved behavior and permissible tradeoffs
+
+Preserve lease ownership and expiry, fencing/preconditions, transaction and
+staged-decision atomicity, retry/idempotency receipts, queue ordering and
+acknowledgement rules, outbox/inbox and XA recovery. Preserve public generation,
+key identity, visibility, cursor and query-result semantics unless a specific
+observable change has been explained and accepted. A durable acknowledgement
+must survive recovery; NoSync cannot expose an invalid partial canonical group.
+Pinned reads retain their captured bytes through replacement and reclamation.
+Application values remain genuinely streamed, including codec and relocation
+paths. Producers do not run under root or allocator publication authority.
+
+Derived query state is rebuildable, but this does not permit a stale explicit
+indexed query, silently replacing its engine with a scan, or indexing an
+intermediate version inside an active public lease/transaction. The existing
+state-index sequence and public completion boundaries remain the initial
+correctness contract. Optional indexing failure cannot revoke an already
+committed canonical mutation. Any proposed change to freshness, flush modes,
+index scheduling promises, cursor lifetime or failure behavior must identify
+the affected use case and its measured benefit before adoption.
+
+Internal structures, layout, algorithms, batching, cache ownership and work
+scheduling can change directly within those invariants. Recreate private
+experimental fixtures when necessary; do not add compatibility layers or bump
+an independent format marker merely because internals change. No implicit
+growth, external persistent staging, reduced accepted key limits or production
+backend selector is introduced by this direction.
+
+### Publication and indexing
+
+Use the container's physical publication domain to select a complete logical
+revision. Canonical authority and rebuildable query state must remain distinct;
+derived indexing must not become a second transactional database or force a
+canonical operation through a simulated filesystem. Prepare private outputs
+outside publication authority, validate their captured canonical boundary, then
+select the complete revision. Independent namespaces must be able to prepare
+work concurrently and share durability work without waiting for unrelated
+producers or acknowledging incomplete prefixes.
+
+The current namespace writer already packs document/posting components into
+one generation artifact. It then publishes that artifact and its manifest
+separately through stream sealing and catalog selection. The container adapter
+ignores the logical writer's `unpublished` hint, and each structural selection
+waits for durability even under NoSync. The common flush mutex additionally
+serializes namespace flushes across a root. These are concrete architectural
+constraints, not proof that inverted indexes or immutable generations are
+incompatible with one file.
+
+The next indexing surface should replace independent artifact publication with
+container revision publication, including recovery, immutable reader capture,
+failed-build cleanup, pruning and capacity admission. Do not merely remove the
+current seal/catalog barriers: recovery currently relies on their ordering.
+Choose generation bundling, incremental postings and cache reuse according to
+measured build, selection and read costs; retaining current artifact interfaces
+is not an acceptance condition. Isolate flush, first query pass and repeated
+query pass before choosing that layout. Preserve an equivalent matched baseline
+so changing the algorithm cannot hide work in close, reopen or deferred rebuild.
+
+### Implementation and acceptance order
+
+1. Separate the existing performance evidence into flush/publication and query
+   read phases. Establish which costs follow barriers, root serialization,
+   encoding or loading before attributing the full gap to one algorithm.
+2. Land one complete indexing publication/reader/recovery surface, qualifying
+   its observable behavior and comparing the same verified workloads. Include
+   steady repeated updates and multiple namespaces, not just initial builds.
+3. Replace full namespace snapshots with incremental canonical checkpoints,
+   then add bounded encoded-range relocation and standing admission. Admission
+   must fund outstanding work from store creation; it cannot depend on finding
+   room for a first full snapshot after the store fills.
+4. Complete resumable codec conversion and process-shared publication,
+   ownership and reader recovery against the same canonical/physical authority.
+   Exercise actual lease, coordination and messaging workflows across processes.
+5. Qualify the resulting backend as a whole and present the deployment decision.
+
+Use coherent implementation batches and run the applicable qualification once
+per completed surface. After failures, prove the repair narrowly before the
+affected broader rerun; retain unrelated valid evidence. Existing correctness
+suites constrain behavior, not the internal layout they originally exercised.
+
+Performance acceptance must report foreground latency/throughput, explicit index
+readiness, first and repeated query costs, CPU, write and sync amplification,
+usable capacity and worst maintenance pauses. Report close and reopen separately.
+The working target is comparable performance on the core coordination workloads
+with no unexplained order-of-magnitude indexing penalty. No numerical production
+SLO or blanket permission to trade away behavior is implied. A measured remaining
+regression needs an explicit use-case tradeoff before deployment acceptance;
+faster close cannot compensate for slow foreground work. Include failure/retry,
+fixed-capacity churn and shared-root operation before calling the backend ready.
+
 ## Compound append recovery
 
 Staged state integration exposed a recovery gap in the experimental
@@ -947,7 +1056,7 @@ retain all samples and describe remaining performance limits. Normal public
 Pouch open still selects the multifile backend; full backend integration remains
 open.
 
-## Standing maintenance capacity: decision pending
+## Standing maintenance capacity: selected direction, implementation pending
 
 The existing joint claim protects a particular admitted operation. A standing
 reserve must additionally make required work admissible after foreground space
@@ -996,23 +1105,23 @@ of the container before other overhead. This is a design bound, not a measured
 typical utilization figure. The current source-sized body copy is a separate
 workload-sized obligation.
 
-The recommendation is to design bounded incremental metadata maintenance and
-body relocation before selecting a standing reserve. This is a proposed change
-to logical persistence and maintenance architecture, not an implemented or
-approved format change. The design must define foreground publication as well
-as recovery: splitting only the output of a complete snapshot does not remove
+The selected direction is bounded incremental metadata maintenance and body
+relocation before selecting a standing reserve. The renewed single-file mandate
+authorizes this internal persistence redesign; it remains unimplemented.
+The design must define foreground publication as well as recovery: splitting
+only the output of a complete snapshot does not remove
 its bootstrap requirement to retain all prior metadata. It must specify the
 authoritative representation, atomic multi-key/high-water publication, the
 largest indivisible work unit, and progress without a full-namespace rewrite or
 a complete source-body copy. Preserve canonical behavior, true streaming,
 independent producers, pinned readers and the existing durable commit contract.
 
-Before implementing that change, select the architecture explicitly. Retaining
-complete snapshots instead requires accepting and exposing a workload-sized
-reserve and its usable-capacity cost. Neither choice authorizes silent growth,
-external persistent staging, reduced key limits or weaker durability.
+Retaining complete snapshots would instead require accepting and exposing a
+workload-sized reserve and its usable-capacity cost. That is not the selected
+direction. No silent growth, external persistent staging, reduced key limits or
+weaker durability is authorized.
 
-Whichever architecture is selected, verification must fill foreground capacity
+Verification must fill foreground capacity
 at fixed size, then prove deletion and reclaimable maintenance can proceed once
 reader pins drain. An all-live store may remain full. Include maximum accepted
 keys and metadata, multiple namespaces, repeated maintenance/deletion cycles,
@@ -1023,11 +1132,11 @@ usable capacity, write amplification, CPU, durable barriers and maintenance
 latency against the frozen multifile reference. No reserve number is selected
 by this analysis.
 
-### Recommended architecture for the pending decision
+### Selected maintenance architecture
 
-This is a **proposal**, not approval or an implementation claim. Select the
-direction before changing persistence. Replace complete experimental namespace
-snapshots with incremental canonical metadata checkpoints, and replace
+This is the selected internal architecture, not an implementation claim.
+Replace complete experimental namespace snapshots with incremental canonical
+metadata checkpoints, and replace
 source-sized body relocation with bounded relocation of encoded ranges. Keep
 one allocator, one physical publication coordinator and the existing typed
 directory. Do not build a pathname layer or a second database inside the file.
@@ -1165,8 +1274,8 @@ The inspected public lease path required retention-work reservation checks and
 transaction guard ownership at this boundary. The implemented
 [namespace enumeration boundary](#typed-namespace-enumeration) now supplies
 names from the existing container catalog to implicit transaction leader
-discovery. That independent integration changes no persistence layout and does
-not approve this maintenance proposal. [Retention control ownership](#typed-retention-control-ownership)
+discovery. That independent integration changes no persistence layout.
+[Retention control ownership](#typed-retention-control-ownership)
 now uses the same boundary. [Transaction authority](#typed-transaction-authority)
 now uses typed capabilities too; complete public lease/expiry behavior still
 requires its own acceptance proof. Keep their policy in the
@@ -1214,8 +1323,8 @@ Acceptance must establish all of the following, beyond the current tests:
   CPU, memory, barriers and worst maintenance latency. The current 240-trial
   recovery comparison establishes none of these new maintenance claims.
 
-Approving this proposal would select the incremental architecture and authorize
-its experimental persistence changes. It would not select an unmeasured reserve
+The renewed mandate selects this incremental architecture and authorizes its
+experimental persistence changes. It does not select an unmeasured reserve
 number, waive the acceptance gates or authorize production cutover.
 
 ## Production state integration
@@ -2039,7 +2148,8 @@ or production timing claims. Higher barrier counts remain optimization work.
 This surface does not change full-snapshot capacity requirements: maintenance
 may still need foreground free space, and there is no implicit growth or
 guaranteed admission at full capacity. The incremental-checkpoint/protected
-capacity proposal remains unapproved. Indexed queries, queues/outbox, complete
+capacity redesign was not part of this maintenance surface. Indexed queries,
+queues/outbox, complete
 external XA, resumable codec conversion, shared-root coordination/recovery and
 deployment acceptance remain outside this completed maintenance surface. The
 complete backend goal remains active.
@@ -2172,8 +2282,8 @@ native 2-152 for queues, and 77-915 versus 72-661 for outbox; these counts exclu
 close. The NoSync outbox regression and marker barrier costs remain optimization
 work before deployment acceptance.
 
-This surface does not change the unapproved incremental-checkpoint/protected
-capacity proposal or promise maintenance admission at full capacity. Indexed
+This surface does not implement the incremental-checkpoint/protected-capacity
+architecture or promise maintenance admission at full capacity. Indexed
 queries, complete external XA, resumable codec conversion, shared-root
 coordination/recovery and deployment acceptance remain unfinished. Existing-root
 conversion remains outside the initial implementation. The backend goal stays
@@ -2289,7 +2399,7 @@ This surface qualifies exclusive XA journal/coordinator behavior. The optional
 PostgreSQL provider is OFF in these builds; real SQL-driver/server qualification
 remains part of deployment acceptance. Indexed queries, resumable codec
 conversion and shared-root coordination/recovery remain unfinished. The
-incremental-checkpoint/protected-capacity proposal remains unapproved; full
+incremental-checkpoint/protected-capacity architecture remains unimplemented; full
 snapshots can still require foreground free space. Existing-root conversion
 remains outside the initial implementation, and production cutover still
 requires an explicit deployment decision. The complete backend goal stays active.
@@ -2417,11 +2527,60 @@ establish cold-device or production performance or satisfy deployment acceptance
 
 This is an exclusive indexing integration surface. Resumable codec conversion,
 protected maintenance admission, shared-root coordination/recovery and deployment
-acceptance remain required. The incremental-checkpoint/protected-capacity proposal
-is still unapproved and unimplemented; full snapshots can require foreground
+acceptance remain required. The selected incremental-checkpoint/protected-capacity
+architecture is still unimplemented; full snapshots can require foreground
 free space. Existing-root conversion remains outside the initial implementation,
 and production cutover still requires an explicit deployment decision. The
 complete backend goal stays active.
+
+### Publication and query cost baseline
+
+The renewed architecture work separates the previously combined index phase
+without changing product code. The comparison now times explicit validating
+flush, the first three indexed selectors and their repeated pass separately.
+It records CPU on the executing thread and attributes actual sync calls through
+a thread-specific phase pointer, avoiding peer-writer calls in overlapping
+measurements. Worker phase wall times are reported as separate maxima; CPU,
+sync count and sync duration are sums across workers. Separate maxima need not
+belong to the same worker and must not be added as a lifecycle duration.
+Reopen pass durations are sums of the sequential namespace verifications and
+remain inside the existing open-plus-query-plus-body verification interval.
+CPU and sync attribution exclude helper/background threads; whole-process
+work CPU and sync counters remain available separately.
+
+The same three-sample plaintext GNU Release matrix produces **96 verified rows
+/ 48 matched pairs**, with identical payloads, lease/update/read operations,
+explicit flush and six indexed queries. Ratios below are **container/native**,
+using each configuration's median of three timings; values above one are slower.
+
+| Phase | Ratio range | Median across 16 configurations |
+| --- | ---: | ---: |
+| Validating flush wall time | 10.79-62.80x | 22.68x |
+| First three-query pass | 0.74-1.35x | 1.05x |
+| Repeated three-query pass | 0.29-1.49x | 0.84x |
+| Flush CPU on executing threads | 1.06-2.06x | 1.54x |
+
+The container spends **98.92-99.86%** of its combined worker index interval in
+flush (range of configuration medians). In single-writer configurations,
+**91.98-96.67%** of flush wall time is measured inside sync syscalls. Container
+flushes execute 6-9 sync calls per writer in these samples; four-writer durable
+samples occasionally share one call. Neither query pass executes a sync call.
+This isolates the large observed gap to flush/publication for this workload;
+it does not establish that all query algorithms, workloads or devices perform
+equally. Root-wide flush serialization remains a separate inspected constraint.
+These results support container revision publication as the next implementation
+surface, rather than replacing the selector algorithms without evidence.
+
+Evidence is `build/pouch-space-architecture/paired-performance.log` and
+`paired-summary.json`. All 32 existing lifecycle comparison groups pass in
+Debug, GNU Release and native musl Release (`tests-debug.log`, `tests-gnu.log`,
+`tests-musl.log`), including queue, outbox and XA controls as well as indexes,
+both policies and reopen modes. Release runs use ordinary platform stacks.
+The benchmark checks phase/query coverage, phase timer containment, attributed
+sync totals, exact streamed bodies, persistent index freshness, actual indexed
+execution and the one-file container invariant. Debug uses 128 KiB workers and
+the disabled glibc stack cache. These are benchmark/contract changes; no product
+persistence or public behavior has changed yet.
 
 ## Integration and acceptance
 
