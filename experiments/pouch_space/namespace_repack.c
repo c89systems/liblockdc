@@ -11,6 +11,7 @@ typedef struct repack_selection {
   ps_piece_select_fn gate;
   void *context, *publication;
   ps_piece_publish_fn publish;
+  int unused;
 } repack_selection;
 static int unchanged(void *context, lc_error *e) {
   (void)context;
@@ -55,9 +56,11 @@ static int finish_tail(void *context, lc_error *e) {
     return rc;
   pthread_mutex_lock(&d->mutex);
   ps_key_checkpoint_info(d->checkpoint, &coverage);
-  rc = d->views || ps_ns_find(d, r->kind, r->id) != r || coverage.pending ||
-               !coverage.epoch || r->id > coverage.segment ||
-               (r->id == coverage.segment && coverage.offset != s->tail)
+  rc = d->views || ps_ns_find(d, r->kind, r->id) != r ||
+               (!s->unused &&
+                (coverage.pending || !coverage.epoch ||
+                 r->id > coverage.segment ||
+                 (r->id == coverage.segment && coverage.offset != s->tail)))
            ? busy(e)
            : ps_stream_status(r->stream, &info, e);
   if (rc == LC_OK && info.tail != s->tail)
@@ -125,7 +128,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   ps_budget *budget = NULL;
   repack_selection selection;
   uint64_t cursor = 0, cover = 0, encoded, table, footprint;
-  int rc, found = 0, matches = 0, partial;
+  int rc, found = 0, matches = 0, partial, unused;
   if (!out || !limit || !id ||
       (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_BODY))
     return lc_error_set(e, LC_ERR_INVALID, 0,
@@ -163,21 +166,25 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   selection.context = context;
   selection.tail = info.tail;
   selection.budget = NULL;
+  selection.unused = 0;
   while (rc == LC_OK && out->visited < limit) {
     rc = ps_stream_piece_next(r->stream, cursor, &piece, &found, e);
     if (rc != LC_OK || !found) {
       cursor = 0;
       break;
     }
-    if (!piece.completed_bytes || piece.base > cover ||
-        piece.completed_bytes > cover - piece.base) {
+    unused = kind == PS_CATALOG_SEGMENT && !piece.completed_bytes &&
+             piece.base >= info.tail;
+    if (!unused && (!piece.completed_bytes || piece.base > cover ||
+                    piece.completed_bytes > cover - piece.base)) {
       out->pending = 1;
       cursor = 0; /* revisit older bodies after the next bounded sweep */
       break;
     }
-    partial = !info.sealed && piece.completed_bytes < piece.bytes;
-    if (partial && (kind != PS_CATALOG_SEGMENT ||
-                    piece.base + piece.completed_bytes != info.tail)) {
+    partial = !info.sealed && (unused || piece.completed_bytes < piece.bytes);
+    if (partial && !unused &&
+        (kind != PS_CATALOG_SEGMENT ||
+         piece.base + piece.completed_bytes != info.tail)) {
       out->pending = 1;
       cursor = 0;
       break;
@@ -190,13 +197,21 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
      * are instead rejected by the source epoch at selection. */
     pthread_mutex_lock(&d->mutex);
     ps_key_checkpoint_info(d->checkpoint, &coverage);
-    rc = coverage.pending
+    rc = coverage.pending && !unused
              ? busy(e)
-             : ps_key_checkpoint_ranges(d->checkpoint, kind, id, piece.base,
-                                        piece.completed_bytes, &live, e);
+             : ps_key_checkpoint_ranges(
+                   d->checkpoint, kind, id, piece.base,
+                   unused ? piece.bytes : piece.completed_bytes, &live, e);
     pthread_mutex_unlock(&d->mutex);
     if (rc != LC_OK)
       break;
+    if (unused && live.count) {
+      rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                        "canonical body extends beyond committed source tail",
+                        NULL, NULL, "pouch");
+      break;
+    }
+    selection.unused = unused;
     selection.epoch = live.epoch;
     if (piece.mapped)
       rc = ps_stream_piece_matches(r->stream, piece.base, live.ranges,
@@ -259,8 +274,14 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
       cursor = piece.base + piece.bytes;
   }
   lc_free_with_allocator(NULL, live.ranges);
-  if (out->visited == limit && cursor && !out->finished_tail)
-    out->pending = 1;
+  if (rc == LC_OK && out->visited == limit && cursor) {
+    rc = ps_stream_piece_next(r->stream, cursor, &piece, &found, e);
+    if (rc == LC_OK) {
+      out->pending = found;
+      if (!found)
+        cursor = 0;
+    }
+  }
   if (deferred(rc, e)) {
     out->pending = 1;
     rc = LC_OK;

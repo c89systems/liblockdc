@@ -128,7 +128,7 @@ static int compact_locked(void *context, lc_error *e) {
     w->maintenance->cleanup_pending_count += (unsigned long)pending;
   }
   if (!w->before.active_segment ||
-      (!w->before.checkpoint_epoch && !w->before.tail &&
+      (!w->before.checkpoint_epoch && !w->before.tail && !w->before.runs &&
        w->before.active_segment == 1)) {
     w->result.skipped = 1;
     w->reason = "no-candidates";

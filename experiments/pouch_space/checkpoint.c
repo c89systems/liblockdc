@@ -1359,6 +1359,36 @@ void ps_key_checkpoint_replayed(ps_key_checkpoint *c, uint64_t segment,
   c->latest_offset = offset;
   pthread_mutex_unlock(&c->mutex);
 }
+int ps_key_checkpoint_cover_empty(ps_key_checkpoint *c, uint64_t segment,
+                                  lc_error *e) {
+  ps_budget_plan plan;
+  int rc = LC_OK;
+  if (!c || !segment)
+    return failure(e, LC_ERR_INVALID,
+                   "empty coverage requires a selected head");
+  pthread_mutex_lock(&c->mutex);
+  if (c->selected.segment == segment && !c->selected.offset) {
+    pthread_mutex_unlock(&c->mutex);
+    return LC_OK;
+  }
+  if (segment < c->latest_segment ||
+      (segment == c->latest_segment && c->latest_offset))
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "empty coverage contradicts the canonical source tail");
+  plan = c->claim;
+  if (rc == LC_OK && !plan.entries)
+    rc = ps_budget_plan_value(&plan, CHECKPOINT_CONTROL_BYTES, e);
+  if (rc == LC_OK)
+    rc = fund(c, &plan, e);
+  if (rc == LC_OK) {
+    c->claim = plan;
+    c->latest_segment = segment;
+    c->latest_offset = 0;
+    c->changed = 1;
+  }
+  pthread_mutex_unlock(&c->mutex);
+  return rc;
+}
 int ps_key_checkpoint_due(ps_key_checkpoint *c) {
   int due;
   pthread_mutex_lock(&c->mutex);

@@ -170,8 +170,9 @@ typedef struct ps_namespace_repack_result {
   uint64_t body_bytes, mapping_bytes; /* retained encoded bytes selected */
   int pending, finished_tail;
 } ps_namespace_repack_result;
-/* Reclaims at most limit completed pieces behind selected coverage, including
- * covered pieces of the active source. Captures scalar liveness, copies at
+/* Reclaims at most limit pieces: completed pieces behind selected coverage and
+ * wholly unused canonical grants beyond the committed tail. Includes covered
+ * pieces of the active source. Captures scalar liveness, copies at
  * most one bounded piece without owner locks, then revalidates before durable
  * selection. Existing body readers retain their exact mapping; metadata views
  * defer selection. The optional gate reacquires logical namespace mutation
@@ -182,12 +183,19 @@ typedef struct ps_namespace_repack_result {
  * reserves rotation and replacement together, durably selects an empty
  * successor and seals the old source before copying. The gate also serializes
  * this bounded structural transition. An already selected successor retries
- * its pending seal without another rotation. Empty active heads do not rotate.
- * A sweep revisits earlier pieces after reaching the tail, including bodies
- * superseded between sweeps. */
+ * its pending seal without another rotation. Wholly unused grants require no
+ * checkpoint coverage or body copy; rotation durably fixes their predecessor's
+ * tail before deletion. An empty selected head rotates only when retiring its
+ * allocated unused grants. Pending references and changed tails defer
+ * selection. A sweep revisits earlier pieces after reaching the tail, including
+ * bodies superseded between sweeps. */
 int ps_namespace_repack(ps_namespace *, unsigned int, uint64_t, size_t limit,
                         ps_piece_select_fn gate, void *,
                         ps_namespace_repack_result *, lc_error *);
+/* Drop an abandoned unselected successor before draining retired sources.
+ * Mutation exclusion protects live producers; catalog/read pins may defer
+ * physical retirement. A failed first append needs no canonical checkpoint
+ * before its zero-tail unselected binding can be discarded. */
 int ps_namespace_reap(ps_namespace *, uint64_t *closed, uint64_t *pending,
                       lc_error *);
 #endif

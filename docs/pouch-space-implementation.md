@@ -3766,6 +3766,104 @@ relocation, codec conversion and shared-root coordination/recovery also remain.
 The full goal stays active. Multifile remains the default/reference, and
 production cutover requires an explicit deployment decision.
 
+### Abandoned canonical capacity recovery
+
+Bounded maintenance now retires wholly unused grants beyond a canonical source's
+committed tail. Previously, a zero-completed grant stopped the sweep; failed or
+over-reserved appends could retain physical capacity indefinitely. The owner now
+durably rotates and seals a selected source before discarding its unused suffix.
+These deletions need neither checkpoint coverage of uncommitted bytes nor
+payload/footer reads or body copies. Completed pieces retain their existing
+coverage and checksum requirements. Logical offsets and the source's capacity
+high-water mark remain stable; admitted readers retain their physical mapping
+until release.
+
+Captured source epochs, committed tails, metadata views and mutation exclusion
+protect selection. A writer changing the old tail defers the stale operation;
+after rotation, successor writers, old-body readers and unrelated writers can
+progress. A sweep reports pending grants even when the same bounded pass finishes
+the tail, so the scheduler continues beyond its piece limit. Reaching the actual
+end resets the cursor for the next liveness sweep.
+
+An empty selected head can publish coverage without manufacturing a state/query
+record. Existing keys and watermarks are preserved and obsolete empty predecessors
+can retire. The computed maintenance plan includes both coverage publications,
+rather than increasing a guessed fixed reserve. A failed first append's
+unselected zero-tail binding is removed under producer exclusion; catalog removal
+precedes physical retirement. Root orphan recovery completes interrupted
+retirement, and the existing final physical checkpoint makes the pages reusable.
+Persistence representations, public C APIs and ABI are unchanged.
+
+Evidence is in ignored `build/pouch-space-abandoned/`:
+
+- 32 selected Debug ASan/UBSan groups are covered by passing runs
+  (`qualified-debug.log` plus the two repaired fixture checks in
+  `fixtures-debug.log`). GNU Release passes 17 groups and musl Release 13.
+  Existing fixtures now observe empty-head coverage advancement and drive
+  advertised pending work through bounded passes instead of assuming a single
+  pass completes every grant.
+- Twenty selected-source cases cover both policies, reserve-only and flushed
+  abandoned bytes, warm/reopened owners, full 10 MiB stores and a pinned 1 MiB
+  live body. Cleanup issues zero body reads/copies; a later ordinary write and
+  reopen verify reusable capacity and preserved data. Another 24 full-store
+  empty-head cycles per policy keep the entry count stable and state/query
+  watermarks zero, with periodic reopen. The initial abandoned half-MiB reservation
+  supplies the fragmentation margin for subsequent quarter-MiB admissions;
+  other capacity stays live and the file never grows.
+- Deterministic faults cover 84 allocation, 49 write/sync and two read cuts
+  across both policies and selected/unselected sources, followed by retry,
+  crash/reopen and a successful ordinary write. Two best-effort allocation cuts
+  complete successfully; the rest return the injected error. Counts and raw
+  results are in `qualified-debug-details.log`.
+- Public maintenance covers failed streaming producers and repeated cleanup of
+  selected/unselected sources under all four codecs and both policies. A live
+  producer defers cleanup; after close, bounded passes drain the work, retain
+  one physical file and permit new writes. Two TSan scenarios pass with
+  instrumented OpenSSL 3.6.5 and no suppressions. Two strict Memcheck probes
+  account for 43,281 allocations/frees, zero errors, no retained heap and only
+  the three inherited descriptors.
+
+The cleanup comparison relinks the same current fixture against the frozen
+`9c01fe6d` backend and alternates old/new order over three samples, two body sizes
+and both policies (24 verified observations). Each current case reclaims 17
+unused grants, or 278,528 bytes, with zero retained unused bytes. The frozen
+backend retains all 278,528 bytes; its no-op timing is not useful reclamation
+performance. Current medians keep cleanup and the final physical checkpoint
+separate:
+
+| Policy / retained body | Cleanup | CPU | Syncs | Physical checkpoint |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync / 19,775 bytes | 23.17 ms | 1.21 ms | 20 | 7.56 ms |
+| NoSync / 1,062,207 bytes | 20.83 ms | 1.51 ms | 20 | 6.81 ms |
+| Durable / 19,775 bytes | 26.00 ms | 1.42 ms | 21 | 7.14 ms |
+| Durable / 1,062,207 bytes | 26.15 ms | 1.51 ms | 21 | 7.13 ms |
+
+All four cases write 1,596 bytes in 22 calls during cleanup. It still selects
+each deletion durably, exposing a per-grant barrier cost that future batching
+can reduce. The three-sample checkpoint ranges extend to 84.62 ms; these cached,
+small-host observations are not production latency guarantees. Exact counts,
+ranges and calculations are in `paired-performance.log`, `cleanup-summary.tsv`
+and `summarize-cleanup.awk`.
+
+A separate matched indexed workload runs the same eight configurations and
+three samples per backend as the preceding milestone (48 verified runs). After
+taking each configuration's sample median, the median current/prior ratio is
+1.05x/0.89x for measured work, 1.02x/0.92x for CPU, 0.91x/0.94x for indexed worker,
+1.05x/1.10x for reopen plus verification and 1.04x/1.14x for close
+(NoSync/durable). Work ratios range 0.93-1.07x and 0.84-0.99x respectively.
+This does not establish a universal no-regression result. Work, readiness,
+reopen and close remain separate in `performance-summary.tsv`; the earlier
+NoSync and reopen gaps against multifile remain unresolved.
+
+Abandoned canonical grant and first-append binding cleanup are now implemented.
+Full public expiry and transactional messaging at capacity still need admission
+and recovery of the journal/participant/lease/attachment operation as a whole.
+Inherited checksum proof, collection REGION relocation, codec conversion and
+shared-root coordination/recovery remain. Interned source labels still live for
+the namespace lifetime; stable live entry counts do not prove bounded resident
+label history. The full goal stays active, multifile remains the default/reference,
+and production cutover requires an explicit deployment decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

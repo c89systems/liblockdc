@@ -1277,7 +1277,10 @@ int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
       rc = ps_ns_finish_seal(d, e);
     if (rc == LC_OK) {
       pthread_mutex_lock(&d->mutex);
-      rc = ps_key_checkpoint_flush(d->checkpoint, e);
+      if (d->active && !d->tail)
+        rc = ps_key_checkpoint_cover_empty(d->checkpoint, d->active, e);
+      if (rc == LC_OK)
+        rc = ps_key_checkpoint_flush(d->checkpoint, e);
       pthread_mutex_unlock(&d->mutex);
     }
     ps_ns_leave(d);

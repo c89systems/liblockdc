@@ -4076,10 +4076,16 @@ static void maintenance(const char *path, const char *directory) {
       drain(pinned.body, 65569, 34, &e);
       lc_pouch_state_read_result_cleanup(&allocator, &pinned);
       uint64_t first = result.snapshot;
+      uint64_t empty = storage_info(p, "projection", &e).active_segment;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.snapshot == first && result.boundary == 1 &&
-              result.records == 5 && !result.metadata_bytes &&
-              result.copied_bytes <= 16 * PS_CHUNK);
+      /* If the bounded sweep rotated, cover its empty successor without a
+       * manufactured state/query record. Otherwise preserve the checkpoint.
+       */
+      REQUIRE(
+          result.boundary == empty &&
+          (empty == 1 ? result.snapshot == first : result.snapshot > first) &&
+          result.records == 5 && !result.metadata_bytes &&
+          result.copied_bytes <= 16 * PS_CHUNK);
       uint64_t boundary = storage_info(p, "projection", &e).active_segment;
       projection_put(p, "a-state", 31, 99, 0, 12, &e);
       projection_put(p, "tail", 31, 77, 0, 13, &e);
@@ -4087,8 +4093,9 @@ static void maintenance(const char *path, const char *directory) {
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(result.records == 6 && result.boundary == boundary);
       projection_readback(p, &e);
+      empty = storage_info(p, "projection", &e).active_segment;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.records == 6 && result.boundary == boundary &&
+      REQUIRE(result.records == 6 && result.boundary == empty &&
               !result.metadata_bytes && result.copied_bytes <= 16 * PS_CHUNK);
       projection_readback(p, &e);
       for (unsigned int pass = 0; result.pending_sources && pass < 64; ++pass) {
@@ -4325,7 +4332,16 @@ static void maintenance_concurrency(const char *path, const char *directory) {
     ps_pouch_compaction_result result;
     ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
     REQUIRE(result.copied_bytes <= 16 * PS_CHUNK && !result.metadata_bytes &&
-            result.boundary == 1 && !result.pending_sources);
+            result.boundary == status.active_segment);
+    /* A bounded piece sweep reports remaining grants after rotation. Keep
+     * driving the public operation until that advertised debt is discharged.
+     */
+    for (unsigned int pass = 0; result.pending_sources && pass < 64; ++pass) {
+      ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+      REQUIRE(result.copied_bytes <= 16 * PS_CHUNK && !result.metadata_bytes);
+      maintenance_tail_readback(p, &e);
+    }
+    REQUIRE(!result.pending_sources);
     maintenance_tail_readback(p, &e);
     one_file(directory);
     lc_pouch_close(p);
@@ -5414,6 +5430,7 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
   printf("batch process-death/lost-write cases: %lu; operation sites: %lu\n",
          (unsigned long)cases, (unsigned long)sites);
 }
+#include "abandoned_pouch_cases.h"
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -5489,6 +5506,8 @@ static void *worker(void *context) {
     maintenance(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-tail"))
     maintenance_partial_tail(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-abandoned"))
+    maintenance_abandoned(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-faults"))
     maintenance_faults(r->path, 0);
   else if (!strcmp(r->mode, "maintenance-io-faults"))

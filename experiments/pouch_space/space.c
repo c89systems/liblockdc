@@ -4140,13 +4140,18 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   rc = healthy(s, error);
   if (rc == LC_OK &&
       (head->entry->deleted || old->deleted || lookup(s, old->key) != old ||
-       old->key.key >= head->entry->bytes ||
+       (old->key.key >= head->entry->bytes &&
+        (!head->entry->stream_sealed || count)) ||
        (!head->entry->stream_sealed &&
         old->stream_capacity > head->entry->bytes - old->key.key)))
     rc = err(error, LC_ERR_INVALID,
              "piece is changing, incomplete or no longer selected");
   if (rc == LC_OK) {
-    valid = head->entry->bytes - old->key.key;
+    /* Sealing fixes the committed tail. An entirely unused grant beyond it
+     * has no canonical payload/footer to verify and can only be discarded. */
+    valid = old->key.key < head->entry->bytes
+                ? head->entry->bytes - old->key.key
+                : 0;
     if (valid > old->stream_capacity)
       valid = old->stream_capacity;
   }

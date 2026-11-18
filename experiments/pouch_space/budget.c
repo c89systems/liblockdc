@@ -345,7 +345,12 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
     rc = ps_budget_plan_span(&next, deletion + PS_FRAME_BYTES, e);
   if (rc == LC_OK && deletion)
     rc = ps_budget_plan_value_bound(&next, deletion + 512, e);
-  if (rc == LC_OK && deletion)
+  /* Empty selected heads also need coverage before their obsolete catalog
+   * bindings can retire. Cover the predecessor, then the empty successor at
+   * retirement. Neither publication needs a logical tombstone. */
+  if (rc == LC_OK)
+    rc = ps_budget_plan_value(&next, 128, e);
+  if (rc == LC_OK)
     rc = ps_budget_plan_value(&next, 128, e);
   /* A future retention reference owns one raw key, not its escaped filename
    * spelling. Claim facts and finish use bounded progress publications. The

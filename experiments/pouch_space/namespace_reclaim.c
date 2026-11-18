@@ -210,7 +210,24 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
   if (rc == LC_OK) {
     rc = ps_ns_enter(d, e);
     if (rc == LC_OK) {
-      rc = reap(d, closed, pending, e);
+      ps_ns_resource *unused =
+          d->active == UINT64_MAX
+              ? NULL
+              : ps_ns_find(d, PS_CATALOG_SEGMENT, d->active + 1);
+      if (unused && unused->unselected) {
+        ps_stream_info info;
+        rc = ps_stream_status(unused->stream, &info, e);
+        if (rc == LC_OK && (info.tail || info.sealed ||
+                            ps_key_checkpoint_source_refs(
+                                d->checkpoint, unused->kind, unused->id)))
+          rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                            "unselected namespace source has canonical state",
+                            NULL, NULL, "pouch");
+        if (rc == LC_OK)
+          rc = drop(d, unused, e);
+      }
+      if (rc == LC_OK)
+        rc = reap(d, closed, pending, e);
       ps_ns_leave(d);
     }
   }

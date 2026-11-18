@@ -65,10 +65,13 @@ typedef int (*ps_piece_publish_fn)(void *, lc_error *);
 typedef int (*ps_piece_select_fn)(void *, ps_piece_publish_fn, void *,
                                   lc_error *);
 /* Replace one completed bounded piece with its sorted coalesced live ranges.
- * Empty ranges remove its ownership entirely. Source checks and copying happen
- * outside publication authority; selection revalidates the captured mapping.
- * Always durable. Existing handles retain old bytes. Caller owns canonical
- * liveness authority and excludes new references to discarded ranges. */
+ * Empty ranges remove its ownership entirely, including unused grants at or
+ * beyond a sealed head's committed tail. Those grants need no payload/footer
+ * read and cannot be replaced with live ranges. Source checks and copying
+ * happen outside publication authority; selection revalidates the captured
+ * mapping. Always durable. Existing handles retain old bytes. Caller owns
+ * canonical liveness authority and excludes new references to discarded ranges.
+ */
 int ps_owned_run_repack(ps_owned_head *, ps_owned_run *, ps_budget *,
                         const ps_owned_range *, size_t, ps_piece_select_fn,
                         void *, ps_owned_run **, lc_error *);

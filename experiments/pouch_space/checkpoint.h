@@ -49,6 +49,10 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *);
 int ps_key_checkpoint_replay(ps_key_checkpoint *, const lc_pouch_state_entry *,
                              lc_error *);
 void ps_key_checkpoint_replayed(ps_key_checkpoint *, uint64_t, uint64_t);
+/* Caller excludes canonical mutation and has observed an empty selected head.
+ * Preserve all prior key changes and watermarks while covering that zero-byte
+ * source, so sealed empty predecessors can retire without invented records. */
+int ps_key_checkpoint_cover_empty(ps_key_checkpoint *, uint64_t, lc_error *);
 int ps_key_checkpoint_due(ps_key_checkpoint *);
 int ps_key_checkpoint_flush(ps_key_checkpoint *, lc_error *);
 int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,

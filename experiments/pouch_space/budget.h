@@ -65,7 +65,8 @@ int ps_budget_plan_piece(ps_budget_plan *, uint64_t logical_bytes,
                          size_t ranges, uint64_t live_bytes, lc_error *);
 /* Compound namespace workspace: one bounded piece, optional successor and
  * routing, one maintenance hint, and (when nonzero) a canonical deletion with
- * its bounded frame, changed-key checkpoint and coverage control, plus a
+ * its bounded frame and changed-key checkpoint. Both empty-source coverage
+ * publications are included, along with a
  * raw-key retention identity and its bounded claim/finish publications. */
 int ps_budget_plan_maintenance(ps_budget_plan *, uint64_t deletion_bytes,
                                lc_error *);

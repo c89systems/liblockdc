@@ -7354,6 +7354,7 @@ static void bounded_pieces(int durable, int checkpointed) {
   free(m.stable);
   clean();
 }
+#include "abandoned_cases.h"
 #include "capacity_cases.h"
 #include "checkpoint_cases.h"
 #include "reclaim_cases.h"
@@ -7368,7 +7369,24 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "namespace-tail") == 0) {
+    if (strcmp(argv[2], "namespace-abandoned-compare") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int large = 0; large < 2; ++large)
+          namespace_abandoned_case(durable, 0, 1, 1, 0, large, 1);
+    } else if (strcmp(argv[2], "namespace-abandoned") == 0) {
+      namespace_abandoned();
+      for (int durable = 0; durable < 2; ++durable)
+        abandoned_owned(durable);
+    } else if (strcmp(argv[2], "namespace-abandoned-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int unselected = 0; unselected < 2; ++unselected)
+          namespace_abandoned_faults(durable, unselected);
+    } else if (strcmp(argv[2], "namespace-abandoned-empty") == 0) {
+      namespace_abandoned_empty();
+    } else if (strcmp(argv[2], "namespace-abandoned-concurrency") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_abandoned_concurrency(durable);
+    } else if (strcmp(argv[2], "namespace-tail") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         namespace_tail(durable);
       for (int durable = 0; durable < 2; ++durable)
