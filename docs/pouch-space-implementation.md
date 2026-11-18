@@ -4229,6 +4229,108 @@ codec conversion and shared-root coordination/recovery. Multifile remains the
 default/reference; production cutover still requires an explicit deployment
 decision.
 
+### Resident key order and bounded ordered reads
+
+The logical projection now maintains an intrusive AVL index over the same cache
+records and owned keys used by its hash index. Exact-key reads and mutations
+retain hash lookup. Ordered pages, prefix visits and attachment key windows seek
+directly to their lower bound and traverse successors. A window no longer scans
+every namespace record to select its next 16 keys. Across contiguous windows,
+work follows the matching range plus a logarithmic seek per window, including
+matching tombstones that must be skipped. One maintenance attempt still processes
+the entire parent; this does not introduce a per-parent time quota.
+
+Record insertion is the single update point for both indexes. Replacements,
+tombstones and resurrection keep their key position; cache invalidation clears
+both indexes and replay reconstructs them. Rotations and traversal are iterative,
+with no new node allocation, key copy or recursive worker-stack use. Existing
+projection authority protects the topology. Visitors still receive owned
+snapshots after that authority is released, including readers retained across
+mutations and close. The additional struct storage is 32 bytes per cached key
+and one root pointer per namespace on native x86_64. Total projection memory
+still scales with namespace size.
+
+Read-many now uses the existing hash index for every requested key, removing its
+whole-namespace sort for requests above eight keys. Compaction capture, snapshot
+writing and captured-reference validation also use resident order or direct
+lookup. The temporary sorted-pointer/binary-search helpers are removed. A vector
+remains only where an immutable replay capture explicitly transfers ownership of
+all captured records; it is filled in key order without sorting. Small scan pages
+also cap snapshot-array growth at the requested limit instead of initially
+allocating 64 entries. Application body transport and persistent formats are
+unchanged.
+
+The new `ordered-reads` gate seeds 1,024 body keys in ascending, descending,
+alternating-extreme and permuted order. It exercises tombstones, resurrection,
+metadata-only keys, seven-row pagination, exact membership and order, prefix
+boundaries, reopen, and deletion through 16-key windows while another key is
+inserted. Plaintext and combined codecs run on both backends. A warmed seven-row
+page must avoid a namespace-wide allocation; its largest allocation through the
+Pouch allocator is **1,344 bytes**, against **12,288 bytes** in the prior fixture.
+The inherited readers also cover all four codecs and both durability policies.
+
+Qualification comprises 52 Debug checks, 9 GNU release checks and 9 musl release
+checks. The broader batch includes query, queue, outbox, leases, pressure,
+attachment windows, reads, immutable snapshots, projection, lifetimes, staging,
+compaction and source/API boundaries. Reported deterministic fault sites include
+3,598 read allocations, 1,281 read I/O operations, 737 logical-capture allocations,
+1,388 lifetime allocation/I/O/torn operations, 324 maintenance allocations and
+396 maintenance I/O operations. All passed. Three ThreadSanitizer scenarios use
+instrumented OpenSSL with no suppressions: read concurrency, maintenance
+concurrency and ordered reads. Strict Memcheck for ordered reads and projection
+faults reports 1,093,469 matched allocations/frees, zero remaining heap, zero
+errors and zero owned descriptors. Constrained glibc workers and musl workers
+retain the 128 KiB stack qualification.
+
+The page comparison uses the same GNU driver against frozen `f30a4a19` and current
+test libraries, with matching build flags and three alternating samples. It
+measures 128 seven-row reads from a preloaded projection of the 1,025-key fixture.
+Reopen CPU is measured separately through the first verified body read, excluding
+the preceding close. Median before / after thread CPU milliseconds are:
+
+| Backend | Codec | Repeated pages, warm | Repeated pages after reopen | Reopen plus first read |
+| --- | ---: | ---: | ---: | ---: |
+| Single-file | 0 | 9.650 / 0.658 | 10.400 / 0.565 | 14.296 / 11.421 |
+| Single-file | 3 | 8.903 / 0.689 | 10.476 / 0.616 | 11.053 / 11.834 |
+| Multifile | 0 | 8.306 / 0.495 | 6.831 / 0.501 | 2.695 / 3.200 |
+| Multifile | 3 | 9.269 / 0.638 | 8.412 / 0.608 | 2.752 / 3.090 |
+
+Repeated-page CPU falls 13–18 times. Reopen CPU is mixed: combined-codec
+single-file rises 7%, and multifile rises 12–19%, reflecting a cost that must not
+be hidden by the repeated-read result. These samples do not establish a general
+cold-start or point-mutation performance acceptance.
+
+A separate production-binary comparison retains the 16-record, 1 KiB,
+two-independent-writer, two-round indexed workload and verifies 24 indexed
+queries per run. Three alternating samples compare the prior and current
+binaries and both backends. Current single-file / multifile median milliseconds
+keep work, indexed readiness, close and reopen separate:
+
+| Phase | NoSync | Durable |
+| --- | ---: | ---: |
+| Lifecycle work including readiness | 62.13 / 20.62 | 596.79 / 495.60 |
+| Work CPU | 16.99 / 13.58 | 45.92 / 46.39 |
+| Maximum worker index flush | 18.02 / 0.87 | 13.98 / 1.15 |
+| Sum of index-flush thread CPU | 2.32 / 1.52 | 2.20 / 2.23 |
+| Close | 0.35 / 36.57 | 0.35 / 33.98 |
+| Reopen plus verification | 3.25 / 1.53 | 3.93 / 1.25 |
+
+The native index still performs four forced readiness syncs under either policy;
+the multifile index-flush phase reports zero. Native index-flush CPU decreases
+modestly, while lifecycle wall time changes in both directions. The ordered-read
+improvement does not resolve that durability/readiness gap or the prior durable
+plaintext expiry wall-time regression.
+
+Evidence is in ignored `build/pouch-space-ordered-keys/`: `qualified-debug*`,
+`qualified-*-release*`, `qualified-tsan.log`, `qualified-memcheck.log`,
+`memcheck-*`, `ordered-*.log`, `paired-performance.log`, `performance-summary.tsv`,
+`lifecycle-performance.log` and `lifecycle-summary.tsv`, alongside the frozen
+libraries/binaries, exact relink commands and summary scripts. Multifile remains
+the default/reference. The full goal stays active for general maintenance and
+capacity qualification, larger control records, native readiness and reopen,
+codec conversion and shared-root coordination/recovery; existing-root conversion
+and the deployment decision remain outside this cutover.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

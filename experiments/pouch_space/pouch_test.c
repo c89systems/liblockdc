@@ -5596,6 +5596,7 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
          (unsigned long)cases, (unsigned long)sites);
 }
 #include "abandoned_pouch_cases.h"
+#include "ordered_read_cases.h"
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -5635,6 +5636,9 @@ static void *worker(void *context) {
     key_bounds(r->directory);
   else if (!strcmp(r->mode, "reads"))
     reads(r->path, r->directory);
+  else if (!strcmp(r->mode, "ordered-reads") ||
+           !strcmp(r->mode, "ordered-compare"))
+    ordered_reads(r->path, r->directory, !strcmp(r->mode, "ordered-compare"));
   else if (!strcmp(r->mode, "read-faults"))
     read_faults(r->path, 0);
   else if (!strcmp(r->mode, "read-io-faults"))

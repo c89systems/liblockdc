@@ -1932,6 +1932,11 @@ typedef struct lc_pouch_state_cache_record {
   unsigned char record_type;
   struct lc_pouch_state_cache_record *next;
   struct lc_pouch_state_cache_record *bucket_next;
+  /* Intrusive key order shares record/key ownership with the point index.
+   * Tombstones keep their position until the projection is rebuilt. */
+  struct lc_pouch_state_cache_record *ordered_left, *ordered_right;
+  struct lc_pouch_state_cache_record *ordered_parent;
+  unsigned int ordered_height;
 } lc_pouch_state_cache_record;
 
 static lc_pouch_namespace_logstore *
@@ -3507,6 +3512,7 @@ struct lc_pouch_namespace_logstore {
   int clean_query_checkpoint_invalidated;
   int decision_recovery_checked;
   lc_pouch_state_cache_record *records;
+  lc_pouch_state_cache_record *ordered_root;
   lc_pouch_state_cache_record **record_buckets;
   size_t record_bucket_count;
   size_t record_count;
@@ -3929,6 +3935,7 @@ lc_pouch_namespace_logstore_clear_records(const lc_allocator *allocator,
   lc_pouch_state_cache_records_cleanup(allocator, ns->records);
   lc_free_with_allocator(allocator, ns->record_buckets);
   ns->records = NULL;
+  ns->ordered_root = NULL;
   ns->record_buckets = NULL;
   ns->record_bucket_count = 0U;
   ns->record_count = 0U;
@@ -4141,7 +4148,8 @@ static void lc_pouch_state_scan_body_snapshots_cleanup(
 
 static int lc_pouch_state_scan_body_snapshot_append(
     lc_pouch *pouch, lc_pouch_state_scan_body_snapshot **snapshots,
-    size_t *count, size_t *capacity, lc_pouch_namespace_logstore *cache,
+    size_t *count, size_t *capacity, size_t limit,
+    lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest,
     const lc_pouch_state_cache_record *record, lc_error *error) {
   lc_pouch_state_scan_body_snapshot *next;
@@ -4162,7 +4170,10 @@ static int lc_pouch_state_scan_body_snapshot_append(
     return LC_OK;
   }
   if (*count == *capacity) {
-    next_capacity = *capacity == 0U ? 64U : *capacity * 2U;
+    next_capacity =
+        *capacity == 0U
+            ? (limit < 64U ? limit : 64U)
+            : (*capacity > limit - *capacity ? limit : *capacity * 2U);
     next = (lc_pouch_state_scan_body_snapshot *)lc_calloc_with_allocator(
         &pouch->allocator, next_capacity, sizeof(**snapshots));
     if (next == NULL) {
@@ -5326,45 +5337,128 @@ lc_pouch_state_cache_record_find(lc_pouch_namespace_logstore *ns,
   return NULL;
 }
 
-static int lc_pouch_state_cache_record_ptr_compare(const void *left,
-                                                   const void *right) {
-  const lc_pouch_state_cache_record *a;
-  const lc_pouch_state_cache_record *b;
-
-  a = *(const lc_pouch_state_cache_record *const *)left;
-  b = *(const lc_pouch_state_cache_record *const *)right;
-  if (a == NULL && b == NULL) {
-    return 0;
+static unsigned int
+lc_pouch_state_order_height(const lc_pouch_state_cache_record *record) {
+  return record ? record->ordered_height : 0;
+}
+static void lc_pouch_state_order_update(lc_pouch_state_cache_record *record) {
+  unsigned int left = lc_pouch_state_order_height(record->ordered_left);
+  unsigned int right = lc_pouch_state_order_height(record->ordered_right);
+  record->ordered_height = 1 + (left > right ? left : right);
+}
+static void lc_pouch_state_order_attach(lc_pouch_namespace_logstore *ns,
+                                        lc_pouch_state_cache_record *before,
+                                        lc_pouch_state_cache_record *after) {
+  lc_pouch_state_cache_record *parent = before->ordered_parent;
+  if (!parent)
+    ns->ordered_root = after;
+  else if (parent->ordered_left == before)
+    parent->ordered_left = after;
+  else
+    parent->ordered_right = after;
+  after->ordered_parent = parent;
+}
+static lc_pouch_state_cache_record *
+lc_pouch_state_order_left(lc_pouch_namespace_logstore *ns,
+                          lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record *next = record->ordered_right;
+  record->ordered_right = next->ordered_left;
+  if (record->ordered_right)
+    record->ordered_right->ordered_parent = record;
+  lc_pouch_state_order_attach(ns, record, next);
+  next->ordered_left = record;
+  record->ordered_parent = next;
+  lc_pouch_state_order_update(record);
+  lc_pouch_state_order_update(next);
+  return next;
+}
+static lc_pouch_state_cache_record *
+lc_pouch_state_order_right(lc_pouch_namespace_logstore *ns,
+                           lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record *next = record->ordered_left;
+  record->ordered_left = next->ordered_right;
+  if (record->ordered_left)
+    record->ordered_left->ordered_parent = record;
+  lc_pouch_state_order_attach(ns, record, next);
+  next->ordered_right = record;
+  record->ordered_parent = next;
+  lc_pouch_state_order_update(record);
+  lc_pouch_state_order_update(next);
+  return next;
+}
+/* The projection has one insertion point and never removes individual nodes.
+ * Iterative AVL maintenance adds no allocation or recursive worker-stack use.
+ * The existing hash index continues to serve exact-key mutations. */
+static void lc_pouch_state_order_insert(lc_pouch_namespace_logstore *ns,
+                                        lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record **link = &ns->ordered_root, *parent = NULL;
+  while (*link) {
+    parent = *link;
+    link = strcmp(record->key, parent->key) < 0 ? &parent->ordered_left
+                                                : &parent->ordered_right;
   }
-  if (a == NULL) {
-    return -1;
+  *link = record;
+  record->ordered_parent = parent;
+  record->ordered_height = 1;
+  while (parent) {
+    unsigned int left, right;
+    lc_pouch_state_order_update(parent);
+    left = lc_pouch_state_order_height(parent->ordered_left);
+    right = lc_pouch_state_order_height(parent->ordered_right);
+    if (left > right + 1) {
+      record = parent->ordered_left;
+      if (lc_pouch_state_order_height(record->ordered_right) >
+          lc_pouch_state_order_height(record->ordered_left))
+        (void)lc_pouch_state_order_left(ns, record);
+      parent = lc_pouch_state_order_right(ns, parent);
+    } else if (right > left + 1) {
+      record = parent->ordered_right;
+      if (lc_pouch_state_order_height(record->ordered_left) >
+          lc_pouch_state_order_height(record->ordered_right))
+        (void)lc_pouch_state_order_right(ns, record);
+      parent = lc_pouch_state_order_left(ns, parent);
+    }
+    parent = parent->ordered_parent;
   }
-  if (b == NULL) {
-    return 1;
+}
+static lc_pouch_state_cache_record *
+lc_pouch_state_order_bound(const lc_pouch_namespace_logstore *ns,
+                           const char *key, int strict) {
+  lc_pouch_state_cache_record *record = ns->ordered_root, *best = NULL;
+  while (record) {
+    int cmp = key && *key ? strcmp(record->key, key) : 1;
+    if (cmp > 0 || (!strict && cmp == 0)) {
+      best = record;
+      record = record->ordered_left;
+    } else
+      record = record->ordered_right;
   }
-  return strcmp(a->key, b->key);
+  return best;
+}
+static lc_pouch_state_cache_record *
+lc_pouch_state_order_next(lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record *parent;
+  if (record->ordered_right) {
+    record = record->ordered_right;
+    while (record->ordered_left)
+      record = record->ordered_left;
+    return record;
+  }
+  parent = record->ordered_parent;
+  while (parent && parent->ordered_right == record) {
+    record = parent;
+    parent = parent->ordered_parent;
+  }
+  return parent;
 }
 
-static int lc_pouch_state_cache_record_key_compare(const void *left,
-                                                   const void *right) {
-  const char *key;
-  const lc_pouch_state_cache_record *record;
-
-  key = (const char *)left;
-  record = *(const lc_pouch_state_cache_record *const *)right;
-  if (record == NULL) {
-    return key == NULL ? 0 : 1;
-  }
-  if (key == NULL) {
-    return -1;
-  }
-  return strcmp(key, record->key);
-}
-
-static int lc_pouch_state_cache_record_index_build(
-    lc_pouch *pouch, lc_pouch_namespace_logstore *ns,
-    lc_pouch_state_cache_record ***records_out, size_t *count_out,
-    lc_error *error) {
+/* An immutable replay capture transfers record ownership to this vector.
+ * Ordinary reads and maintenance iterate the resident order directly. */
+static int
+lc_pouch_state_cache_record_capture(lc_pouch *pouch,
+                                    lc_pouch_namespace_logstore *ns,
+                                    lc_pouch_state_cache_record ***records_out,
+                                    size_t *count_out, lc_error *error) {
   lc_pouch_state_cache_record **records;
   lc_pouch_state_cache_record *record;
   size_t count;
@@ -5383,10 +5477,7 @@ static int lc_pouch_state_cache_record_index_build(
                         "namespace cache",
                         NULL, NULL, NULL);
   }
-  count = 0U;
-  for (record = ns->records; record != NULL; record = record->next) {
-    ++count;
-  }
+  count = ns->record_count;
   if (count == 0U) {
     return LC_OK;
   }
@@ -5398,57 +5489,13 @@ static int lc_pouch_state_cache_record_index_build(
                         NULL, NULL, NULL);
   }
   index = 0U;
-  for (record = ns->records; record != NULL; record = record->next) {
+  for (record = lc_pouch_state_order_bound(ns, NULL, 0); record;
+       record = lc_pouch_state_order_next(record)) {
     records[index++] = record;
   }
-  qsort(records, count, sizeof(*records),
-        lc_pouch_state_cache_record_ptr_compare);
   *records_out = records;
   *count_out = count;
   return LC_OK;
-}
-
-static lc_pouch_state_cache_record *
-lc_pouch_state_cache_record_index_find(lc_pouch_state_cache_record **records,
-                                       size_t count, const char *key) {
-  lc_pouch_state_cache_record **found;
-
-  if (records == NULL || count == 0U || key == NULL) {
-    return NULL;
-  }
-  found = (lc_pouch_state_cache_record **)bsearch(
-      key, records, count, sizeof(*records),
-      lc_pouch_state_cache_record_key_compare);
-  return found != NULL ? *found : NULL;
-}
-
-static size_t lc_pouch_state_cache_record_index_start_after(
-    lc_pouch_state_cache_record **records, size_t count,
-    const char *start_after) {
-  size_t low;
-  size_t high;
-
-  if (records == NULL || count == 0U || start_after == NULL ||
-      start_after[0] == '\0') {
-    return 0U;
-  }
-  low = 0U;
-  high = count;
-  while (low < high) {
-    size_t mid;
-    int cmp;
-
-    mid = low + (high - low) / 2U;
-    cmp = records[mid] != NULL && records[mid]->key != NULL
-              ? strcmp(records[mid]->key, start_after)
-              : -1;
-    if (cmp <= 0) {
-      low = mid + 1U;
-    } else {
-      high = mid;
-    }
-  }
-  return low;
 }
 
 static int
@@ -5620,6 +5667,7 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
     }
     record->next = ns->records;
     ns->records = record;
+    lc_pouch_state_order_insert(ns, record);
     ++ns->record_count;
     if (ns->record_buckets != NULL && ns->record_bucket_count > 0U) {
       size_t bucket;
@@ -9982,8 +10030,8 @@ int lc_pouch_state_snapshot_capture(lc_pouch *pouch,
                       "container live staged maintenance is pending", NULL,
                       "pouch_live_staged", "pouch");
   if (rc == LC_OK)
-    rc = lc_pouch_state_cache_record_index_build(
-        pouch, &cache, &snapshot->records, &snapshot->count, error);
+    rc = lc_pouch_state_cache_record_capture(pouch, &cache, &snapshot->records,
+                                             &snapshot->count, error);
   if (rc == LC_OK) {
     snapshot->index_seq = cache.max_version;
     snapshot->query_index_seq = cache.max_query_index_seq;
@@ -11134,11 +11182,10 @@ static int lc_pouch_state_write_snapshot(
     lc_pouch *pouch, const lc_pouch_namespace_manifest *manifest,
     const char *snapshot_leaf, lc_pouch_namespace_logstore *cache,
     const lc_pouch_state_compaction_capture *capture, lc_error *error) {
-  lc_pouch_state_cache_record **records;
+  lc_pouch_state_cache_record *ordered;
   char tmp_leaf[128];
   char *snapshot_path;
   char *tmp_path;
-  size_t record_count;
   size_t index;
   int fd;
   int rc;
@@ -11173,29 +11220,19 @@ static int lc_pouch_state_write_snapshot(
                         strerror(errno), NULL, NULL);
   }
   rc = LC_OK;
-  records = NULL;
-  record_count = 0U;
-  rc = lc_pouch_state_cache_record_index_build(pouch, cache, &records,
-                                               &record_count, error);
-  if (rc != LC_OK) {
-    (void)close(fd);
-    unlink(tmp_path);
-    lc_free_with_allocator(&pouch->allocator, snapshot_path);
-    lc_free_with_allocator(&pouch->allocator, tmp_path);
-    return rc;
-  }
+  ordered = lc_pouch_state_order_bound(cache, NULL, 0);
   rc = lc_pouch_state_record_write_high_water(
       &pouch->allocator, lc_pouch_record_file_io(fd), cache->max_version,
       cache->max_query_index_seq, error);
   for (index = 0U;
        rc == LC_OK &&
-       index < (capture != NULL ? capture->captured_count : record_count);
+       (capture != NULL ? index < capture->captured_count : ordered != NULL);
        ++index) {
     lc_pouch_state_cache_record *record;
 
     if (capture != NULL) {
-      record = lc_pouch_state_cache_record_index_find(
-          records, record_count, capture->captured_keys[index]);
+      record = lc_pouch_state_cache_record_find(cache,
+                                                capture->captured_keys[index]);
       if (!lc_pouch_state_compaction_record_ref_matches(
               record, capture->captured_record_containers[index],
               capture->captured_record_offsets[index])) {
@@ -11205,7 +11242,8 @@ static int lc_pouch_state_write_snapshot(
         break;
       }
     } else {
-      record = records[index];
+      record = ordered;
+      ordered = lc_pouch_state_order_next(ordered);
     }
     if (rc != LC_OK) {
       break;
@@ -11217,7 +11255,6 @@ static int lc_pouch_state_write_snapshot(
              : lc_pouch_state_clean_projection_write_record(pouch, record, fd,
                                                             error);
   }
-  lc_free_with_allocator(&pouch->allocator, records);
   if (rc == LC_OK && fsync(fd) != 0) {
     rc = lc_error_set(error, LC_ERR_TRANSPORT, 0L,
                       "failed to fsync pouch state snapshot", strerror(errno),
@@ -11695,19 +11732,10 @@ static int lc_pouch_state_compaction_capture_record_add(
 static int lc_pouch_state_compaction_capture_records(
     lc_pouch *pouch, lc_pouch_state_compaction_capture *capture,
     lc_pouch_namespace_logstore *cache, lc_error *error) {
-  lc_pouch_state_cache_record **records;
-  size_t record_count;
-  size_t index;
-  int rc;
-
-  records = NULL;
-  record_count = 0U;
-  rc = lc_pouch_state_cache_record_index_build(pouch, cache, &records,
-                                               &record_count, error);
-  for (index = 0U; rc == LC_OK && index < record_count; ++index) {
-    lc_pouch_state_cache_record *record;
-
-    record = records[index];
+  lc_pouch_state_cache_record *record;
+  int rc = LC_OK;
+  for (record = lc_pouch_state_order_bound(cache, NULL, 0);
+       rc == LC_OK && record; record = lc_pouch_state_order_next(record)) {
     if (!record->found || !record->has_record_ref) {
       continue;
     }
@@ -11718,7 +11746,6 @@ static int lc_pouch_state_compaction_capture_records(
     rc = lc_pouch_state_compaction_capture_record_add(pouch, capture, record,
                                                       error);
   }
-  lc_free_with_allocator(&pouch->allocator, records);
   return rc;
 }
 
@@ -11813,15 +11840,11 @@ static int lc_pouch_state_compaction_validate_capture(
     lc_pouch *pouch, const lc_pouch_namespace_manifest *manifest,
     const lc_pouch_state_compaction_capture *before,
     lc_pouch_namespace_logstore *cache, lc_error *error) {
-  lc_pouch_state_cache_record **records;
   char *manifest_path;
   char *manifest_text;
-  size_t record_count;
   size_t index;
   int rc;
 
-  records = NULL;
-  record_count = 0U;
   manifest_text = NULL;
   manifest_path = lc_pouch_path_join(&pouch->allocator,
                                      manifest->namespace_path, "manifest");
@@ -11849,26 +11872,19 @@ static int lc_pouch_state_compaction_validate_capture(
   if (rc != LC_OK) {
     return rc;
   }
-  rc = lc_pouch_state_cache_record_index_build(pouch, cache, &records,
-                                               &record_count, error);
-  if (rc != LC_OK) {
-    return rc;
-  }
   for (index = 0U; index < before->captured_count; ++index) {
     lc_pouch_state_cache_record *record;
 
-    record = lc_pouch_state_cache_record_index_find(
-        records, record_count, before->captured_keys[index]);
+    record =
+        lc_pouch_state_cache_record_find(cache, before->captured_keys[index]);
     if (!lc_pouch_state_compaction_record_ref_matches(
             record, before->captured_record_containers[index],
             before->captured_record_offsets[index])) {
-      lc_free_with_allocator(&pouch->allocator, records);
       return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                           "pouch compaction validation drift", NULL, NULL,
                           "pouch");
     }
   }
-  lc_free_with_allocator(&pouch->allocator, records);
   return LC_OK;
 }
 
@@ -18247,9 +18263,7 @@ static int lc_pouch_state_read_many_internal(
     int copy_cached_body, lc_error *error) {
   lc_pouch_namespace_manifest manifest;
   lc_pouch_namespace_logstore *cache;
-  lc_pouch_state_cache_record **record_index;
   lc_pouch_state_read_many_snapshot *snapshots;
-  size_t record_index_count;
   size_t index;
   size_t snapshot_count;
   lc_pouch_state_cache_guard cache_guard;
@@ -18264,8 +18278,6 @@ static int lc_pouch_state_read_many_internal(
   }
   snapshots = NULL;
   snapshot_count = 0U;
-  record_index = NULL;
-  record_index_count = 0U;
   if (key_count > 0U) {
     snapshots = (lc_pouch_state_read_many_snapshot *)lc_calloc_with_allocator(
         &pouch->allocator, key_count, sizeof(*snapshots));
@@ -18289,10 +18301,6 @@ static int lc_pouch_state_read_many_internal(
     return rc;
   }
   rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
-  if (rc == LC_OK && key_count > 8U) {
-    rc = lc_pouch_state_cache_record_index_build(pouch, cache, &record_index,
-                                                 &record_index_count, error);
-  }
   for (index = 0U; rc == LC_OK && index < key_count; ++index) {
     lc_pouch_state_entry current;
     lc_pouch_state_cache_record *record;
@@ -18304,10 +18312,7 @@ static int lc_pouch_state_read_many_internal(
       break;
     }
     memset(&current, 0, sizeof(current));
-    record = record_index != NULL
-                 ? lc_pouch_state_cache_record_index_find(
-                       record_index, record_index_count, keys[index])
-                 : lc_pouch_state_cache_record_find(cache, keys[index]);
+    record = lc_pouch_state_cache_record_find(cache, keys[index]);
     rc = lc_pouch_state_entry_from_cache_record(pouch, record, &current, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_read_many_snapshot_from_entry(
@@ -18319,7 +18324,6 @@ static int lc_pouch_state_read_many_internal(
     }
     lc_pouch_state_entry_cleanup(&pouch->allocator, &current);
   }
-  lc_free_with_allocator(&pouch->allocator, record_index);
   lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
   lc_pouch_state_cache_guard_unlock(pouch, &cache_guard);
   if (rc == LC_OK) {
@@ -18446,13 +18450,11 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
                                   lc_error *error) {
   lc_pouch_namespace_manifest manifest;
   lc_pouch_namespace_logstore *cache;
-  lc_pouch_state_cache_record **record_index;
+  lc_pouch_state_cache_record *record;
   lc_pouch_state_scan_body_snapshot *snapshots;
-  size_t record_index_count;
   size_t snapshot_count;
   size_t snapshot_capacity;
   size_t index;
-  size_t next_index;
   lc_pouch_state_cache_guard cache_guard;
   int rc;
 
@@ -18467,8 +18469,6 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
   if (limit == 0U) {
     limit = 2048U;
   }
-  record_index = NULL;
-  record_index_count = 0U;
   snapshots = NULL;
   snapshot_count = 0U;
   snapshot_capacity = 0U;
@@ -18478,33 +18478,21 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
     return rc;
   }
   rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
-  if (rc == LC_OK) {
-    rc = lc_pouch_state_cache_record_index_build(pouch, cache, &record_index,
-                                                 &record_index_count, error);
-  }
-  index = rc == LC_OK ? lc_pouch_state_cache_record_index_start_after(
-                            record_index, record_index_count, start_after)
-                      : 0U;
-  for (; rc == LC_OK && index < record_index_count && snapshot_count < limit;
-       ++index) {
-    lc_pouch_state_cache_record *record;
-
-    record = record_index[index];
-    if (record == NULL || !record->found) {
+  record =
+      rc == LC_OK ? lc_pouch_state_order_bound(cache, start_after, 1) : NULL;
+  for (; rc == LC_OK && record && snapshot_count < limit;
+       record = lc_pouch_state_order_next(record)) {
+    if (!record->found) {
       continue;
     }
     rc = lc_pouch_state_scan_body_snapshot_append(
-        pouch, &snapshots, &snapshot_count, &snapshot_capacity, cache,
+        pouch, &snapshots, &snapshot_count, &snapshot_capacity, limit, cache,
         &manifest, record, error);
   }
   if (rc == LC_OK && snapshot_count > 0U) {
-    next_index = index;
-    while (next_index < record_index_count &&
-           (record_index[next_index] == NULL ||
-            !record_index[next_index]->found)) {
-      ++next_index;
-    }
-    if (next_index < record_index_count) {
+    while (record && !record->found)
+      record = lc_pouch_state_order_next(record);
+    if (record) {
       out->truncated = 1;
       out->next_start_after = lc_strdup_with_allocator(
           &pouch->allocator, snapshots[snapshot_count - 1U].key);
@@ -18515,7 +18503,6 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
       }
     }
   }
-  lc_free_with_allocator(&pouch->allocator, record_index);
   lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
   lc_pouch_state_cache_guard_unlock(pouch, &cache_guard);
   for (index = 0U; rc == LC_OK && index < snapshot_count; ++index) {
@@ -18609,10 +18596,15 @@ static int lc_pouch_state_visit_internal(lc_pouch *pouch, const char *ns,
   snapshot_capacity = 0U;
   prefix_length = prefix != NULL ? strlen(prefix) : 0U;
   rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
-  for (record = rc == LC_OK ? cache->records : NULL; record != NULL;
-       record = record->next) {
-    if (!record->found ||
-        (prefix != NULL && strncmp(record->key, prefix, prefix_length) != 0)) {
+  for (record = rc == LC_OK
+                    ? (prefix ? lc_pouch_state_order_bound(cache, prefix, 0)
+                              : cache->records)
+                    : NULL;
+       record != NULL;
+       record = prefix ? lc_pouch_state_order_next(record) : record->next) {
+    if (prefix && strncmp(record->key, prefix, prefix_length))
+      break;
+    if (!record->found) {
       continue;
     }
     rc = lc_pouch_state_visit_snapshot_append(
@@ -18698,8 +18690,8 @@ int lc_pouch_state_payload_keys_locked(lc_pouch *pouch, const char *ns,
                                        lc_error *error) {
   lc_pouch_namespace_manifest manifest;
   lc_pouch_namespace_logstore *cache;
-  lc_pouch_state_cache_record *selected[LC_POUCH_STATE_KEY_WINDOW], *record;
-  size_t length, found = 0, i, at;
+  lc_pouch_state_cache_record *record;
+  size_t length, found = 0, i;
   int rc;
   if (!pouch || !ns || !prefix || !*prefix || !keys || !count || !limit ||
       limit > LC_POUCH_STATE_KEY_WINDOW ||
@@ -18711,28 +18703,24 @@ int lc_pouch_state_payload_keys_locked(lc_pouch *pouch, const char *ns,
   memset(keys, 0, limit * sizeof(*keys));
   length = strlen(prefix);
   rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
-  for (record = rc == LC_OK ? cache->records : NULL; record;
-       record = record->next) {
-    if (!record->found || !record->payload_span.present ||
-        strncmp(record->key, prefix, length) ||
-        (after && strcmp(record->key, after) <= 0))
+  record =
+      rc == LC_OK
+          ? lc_pouch_state_order_bound(
+                cache, after && strcmp(after, prefix) >= 0 ? after : prefix,
+                after && strcmp(after, prefix) >= 0)
+          : NULL;
+  for (; rc == LC_OK && record && found < limit;
+       record = lc_pouch_state_order_next(record)) {
+    if (strncmp(record->key, prefix, length))
+      break;
+    if (!record->found || !record->payload_span.present)
       continue;
-    if (found == limit && strcmp(record->key, selected[found - 1]->key) >= 0)
-      continue;
-    if (found < limit)
-      ++found;
-    at = found - 1;
-    while (at && strcmp(record->key, selected[at - 1]->key) < 0) {
-      selected[at] = selected[at - 1];
-      --at;
-    }
-    selected[at] = record;
-  }
-  for (i = 0; rc == LC_OK && i < found; ++i) {
-    keys[i] = lc_strdup_with_allocator(&pouch->allocator, selected[i]->key);
-    if (!keys[i])
+    keys[found] = lc_strdup_with_allocator(&pouch->allocator, record->key);
+    if (!keys[found])
       rc = lc_error_set(error, LC_ERR_NOMEM, 0,
                         "cannot copy payload key window", NULL, NULL, "pouch");
+    else
+      ++found;
   }
   lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
   if (rc == LC_OK)
