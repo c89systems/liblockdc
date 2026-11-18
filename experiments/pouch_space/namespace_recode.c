@@ -2,6 +2,146 @@
 #include "namespace_internal.h"
 #include <string.h>
 
+struct ps_namespace_recode {
+  ps_namespace *ns;
+  struct ps_namespace_data *data;
+  lc_pouch_crypto *crypto;
+  ps_checkpoint_body *metadata;
+  ps_budget *budget;
+  ps_namespace_body *body;
+  char *binding;
+  int entered, attempted;
+};
+void ps_namespace_recode_close(ps_namespace_recode *work) {
+  ps_namespace *ns;
+  if (!work)
+    return;
+  ns = work->ns;
+  ps_namespace_body_close(work->body);
+  ps_key_body_close(work->metadata);
+  (void)ps_budget_close(work->budget, NULL);
+  if (work->entered)
+    ps_ns_leave(work->data);
+  lc_free_with_allocator(&ns->root->crypto_allocator, work->binding);
+  lc_free_with_allocator(&ns->root->crypto_allocator, work);
+  ps_namespace_release(ns);
+}
+int ps_namespace_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
+                              const lc_pouch_state_entry *expected,
+                              const char *binding, ps_namespace_recode **out,
+                              lc_error *e) {
+  ps_namespace_recode *work = NULL;
+  lc_pouch_state_recode_bounds bounds;
+  ps_budget_plan plan = {0}, metadata;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!ns || !expected || !binding || !*binding || !out)
+    return lc_error_set(
+        e, LC_ERR_INVALID, 0,
+        "conversion admission requires source, binding and output", NULL, NULL,
+        "pouch");
+  work =
+      lc_calloc_with_allocator(&ns->root->crypto_allocator, 1, sizeof(*work));
+  if (!work)
+    return lc_error_set(e, LC_ERR_NOMEM, 0,
+                        "cannot allocate namespace conversion", NULL, NULL,
+                        "pouch");
+  work->ns = ns;
+  work->crypto = crypto;
+  ps_namespace_retain(ns);
+  work->binding =
+      lc_strdup_with_allocator(&ns->root->crypto_allocator, binding);
+  rc = work->binding ? LC_OK
+                     : lc_error_set(e, LC_ERR_NOMEM, 0,
+                                    "cannot retain conversion binding", NULL,
+                                    NULL, "pouch");
+  if (rc == LC_OK)
+    rc = ps_namespace_checkpoint_recover(ns, e);
+  if (rc == LC_OK)
+    rc = ps_ns_data_get(ns, &work->data, e);
+  if (rc == LC_OK) {
+    rc = ps_ns_enter(work->data, e);
+    work->entered = rc == LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = ps_ns_finish_seal(work->data, e);
+  if (rc == LC_OK)
+    rc = ps_key_checkpoint_flush(work->data->checkpoint, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_recode_bound(&ns->root->crypto_allocator, crypto,
+                                            "body-00000000000000000001.log",
+                                            expected, &bounds, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_plan(work->data->checkpoint, expected,
+                          bounds.metadata_bytes, &work->metadata, &metadata, e);
+  if (rc == LC_OK)
+    rc = ps_ns_body_plan(&plan, bounds.record_bytes, e);
+  if (rc == LC_OK)
+    rc = ps_budget_plan_add(&plan, &metadata, e);
+  if (rc == LC_OK)
+    rc = ps_budget_open(ns->root->space, &plan, &work->budget, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_fund(work->metadata, work->budget, e);
+  if (rc == LC_OK)
+    rc =
+        ps_ns_body_begin(ns, work->budget, bounds.record_bytes, &work->body, e);
+  if (rc == LC_OK)
+    *out = work;
+  else
+    ps_namespace_recode_close(work);
+  return rc;
+}
+int ps_namespace_recode_run(ps_namespace_recode *work,
+                            lc_pouch_state_entry *result, lc_error *e) {
+  ps_namespace_window *input = NULL;
+  lc_pouch_state_entry converted = {0};
+  const lc_pouch_state_entry *source;
+  ps_namespace *ns;
+  unsigned int kind;
+  uint64_t id;
+  lc_error local;
+  int rc;
+  if (!work || work->attempted || !result)
+    return lc_error_set(e, LC_ERR_INVALID, 0,
+                        "namespace conversion is not open", NULL, NULL,
+                        "pouch");
+  lc_error_init(&local);
+  if (!e)
+    e = &local;
+  work->attempted = 1;
+  ns = work->ns;
+  source = ps_key_body_source(work->metadata);
+  rc = ps_namespace_parse_source_leaf(source->payload_span.container_leaf,
+                                      &kind, &id)
+           ? LC_OK
+           : lc_error_set(e, LC_ERR_INVALID, 0,
+                          "conversion source has no canonical owner", NULL,
+                          NULL, "pouch");
+  if (rc == LC_OK)
+    rc = ps_namespace_read_open(ns, kind, id,
+                                source->payload_span.payload_offset,
+                                source->cipher_bytes, &input, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_recode(&ns->root->crypto_allocator, work->crypto,
+                                      ps_namespace_read_input(input),
+                                      ps_namespace_body_output(work->body),
+                                      ps_namespace_body_leaf(work->body),
+                                      source, work->binding, &converted, e);
+  if (rc == LC_OK)
+    rc = ps_ns_body_commit(work->body, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_commit(work->metadata, &converted, e);
+  if (rc == LC_OK) {
+    lc_pouch_state_entry_cleanup(&ns->root->crypto_allocator, result);
+    *result = converted;
+  } else
+    lc_pouch_state_entry_cleanup(&ns->root->crypto_allocator, &converted);
+  ps_namespace_read_close(input);
+  lc_error_cleanup(&local);
+  return rc;
+}
+
 int ps_namespace_body_recode(ps_namespace *ns, lc_pouch_crypto *crypto,
                              const lc_pouch_state_entry *entry,
                              const char *binding, lc_pouch_state_entry *result,
@@ -10,7 +150,8 @@ int ps_namespace_body_recode(ps_namespace *ns, lc_pouch_crypto *crypto,
   ps_namespace_body *output = NULL;
   lc_pouch_state_entry converted = {0};
   unsigned int kind;
-  uint64_t id, bound;
+  uint64_t id;
+  lc_pouch_state_recode_bounds bounds;
   int rc;
   if (!ns || !entry || !result || entry == result || !binding || !*binding ||
       !ps_namespace_parse_source_leaf(entry->payload_span.container_leaf, &kind,
@@ -22,9 +163,9 @@ int ps_namespace_body_recode(ps_namespace *ns, lc_pouch_crypto *crypto,
    * allocation or body read. Actual output metadata uses the allocated ID. */
   rc = lc_pouch_state_record_recode_bound(&ns->root->crypto_allocator, crypto,
                                           "body-00000000000000000001.log",
-                                          entry, &bound, e);
+                                          entry, &bounds, e);
   if (rc == LC_OK)
-    rc = ps_namespace_body_begin_bound(ns, bound, &output, e);
+    rc = ps_namespace_body_begin_bound(ns, bounds.record_bytes, &output, e);
   if (rc == LC_OK)
     rc =
         ps_namespace_read_open(ns, kind, id, entry->payload_span.payload_offset,

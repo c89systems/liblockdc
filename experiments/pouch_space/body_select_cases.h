@@ -518,18 +518,28 @@ static void body_select_large(const char *path, const char *key) {
       lc_pouch_crypto *target = NULL;
       ok(lc_pouch_crypto_open(&allocator, &target_options, &target, NULL, &e),
          &e);
-      ok(ps_namespace_body_recode(ns, target, &entry, "namespace-test",
-                                  &converted, &e),
-         &e);
+      ps_namespace_recode *work = NULL;
       largest = 0;
       measuring = 1;
-      int rc = ps_namespace_body_select(ns, &entry, &converted, &e);
+      int rc = ps_namespace_recode_begin(ns, target, &entry, "namespace-test",
+                                         &work, &e);
       measuring = 0;
       ok(rc, &e);
-      REQUIRE(largest < 128 * 1024);
-      printf("body selection 2 MiB encrypted=%d sync=%d metadata=%zu "
-             "largest=%zu\n",
-             encrypted, sync, entry.metadata_length, largest);
+      size_t admission_largest = largest;
+      REQUIRE(admission_largest < 128 * 1024);
+      ps_budget *pressure = capacity_peer(ps_root_space(root), 1, &e);
+      largest = 0;
+      measuring = 1;
+      rc = ps_namespace_recode_run(work, &converted, &e);
+      measuring = 0;
+      ok(rc, &e);
+      REQUIRE(largest < 256 * 1024);
+      ps_namespace_recode_close(work);
+      ok(ps_budget_close(pressure, &e), &e);
+      printf("compound 2 MiB encrypted=%d sync=%d metadata=%zu "
+             "admission_largest=%zu run_largest=%zu\n",
+             encrypted, sync, entry.metadata_length, admission_largest,
+             largest);
       lc_pouch_state_entry selected = select_projection(&entry, &converted);
       (void)select_check(ns, NULL, &selected, NULL, &e);
       recode_check(root, ns, &converted, "namespace-test", &e);

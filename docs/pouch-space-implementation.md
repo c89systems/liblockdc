@@ -4518,6 +4518,85 @@ Evidence is in ignored `build/pouch-space-body-selection/`:
 `qualified-memcheck.log` and `memcheck-*`, with exact native build, instrumented
 relink and memory-check commands.
 
+### Compound admission for native body conversion
+
+Native conversion now has one operation owner:
+`ps_namespace_recode_begin/run/close`. Begin validates the selected source,
+captures its canonical metadata and binding, and admits the complete body pack,
+replacement key value and checkpoint coverage before body input. The target
+crypto provider is borrowed until close; the caller can release the original
+entry after begin. Run is single-use and returns an owned result only after the
+new reference is durably authoritative. Close releases namespace mutation
+exclusion and unused credits. A sealed unselected pack after an interrupted
+handoff remains normal maintenance work.
+
+The plan separates conservative canonical body and key-metadata bounds. Both
+include a complete explicit query trailer, including when the input used the
+implicit live-record form. The body still allocates physical grants only as the
+codec emits bytes. The compound ordinary claim preserves the maintenance floor;
+before creating its body writer, the owner transfers the metadata share to the
+checkpoint completion budget without another admission. Publication consumes
+that funded share instead of asking for space after the body has been read.
+Budget planning and the existing handoff primitive use the same replacement
+owner and publisher; logical mutation paths retain their existing semantics.
+
+The owner holds namespace mutation/reclamation exclusion through preparation and
+publication, with no mutex over producer I/O. A paused-input test proves sibling
+namespace commits and reads of the old value continue, while mutation in the
+same namespace receives BUSY. The peer-capacity test admits conversion, lets a
+maintenance peer claim the remaining available space, and then completes both
+body construction and durable reference replacement. Cancellation before input
+returns the original claims, and the caller's result remains unchanged after
+failure. Invalid result arguments do not consume the operation; a completed run
+cannot be repeated.
+
+All 784 integrated allocation, I/O and torn-publication cuts pass, including
+omitted error objects, lost-write reopen, old/new key-and-coverage correlation
+and retry. Their source fixture explicitly stabilizes NoSync metadata before
+injecting conversion faults. Without that barrier, the first read failure can
+legitimately lose the preceding unsynced seed at simulated power loss; that was
+a fixture precondition error, not a conversion rollback guarantee. The reused
+handoff suite also passes its expanded 502 fault sites after the admission
+refactor.
+
+Generated 2 MiB incompressible bodies with 32,769-byte metadata complete under
+the peer claim in a fixed 10 MiB container, in each encryption/durability
+combination. The maximum single Pouch allocator request during admission is
+33,276 bytes; during production it is 65,536 bytes for plaintext or 131,400 bytes
+for the fixed decryptor. These are not aggregate peak-memory measurements.
+The production-engine suite now routes all 64 body handoffs through the compound
+operation and still verifies state, objects, empty bodies, tombstones,
+placeholders, metadata updates, versions and query freshness after reopen. It
+continues to leave only the native container file.
+
+The affected Debug batch passes 37 checks covering both conversion primitives,
+native metadata, snapshots, staging, checkpoint faults/ranges, body and append
+budgets, budget transfer and four multifile conversion cases. GNU and musl
+release each pass nine selected checks, including the complete integrated fault
+suite. Four TSan checks pass with instrumented OpenSSL and no suppressions.
+Strict Memcheck passes compound conversion, the handoff/large-body suite and the
+production-engine suite with zero remaining allocations, zero errors and only
+three inherited file descriptors. Debug/TSan use 128 KiB workers; musl exercises
+its native stack contract. Source-manifest, stack-allocation and formatting
+checks pass.
+
+This closes compound admission for one native namespace body, not the full root
+codec feature. The coordinator still needs bounded key traversal that releases
+historical view ownership between batches, allowing obsolete sources to be
+reclaimed during conversion. Collection-unit conversion, derived-index
+invalidation, durable conversion intent and resumable root policy cutover remain
+required. Explicit root compression changes remain unsupported. Full codec
+performance qualification and the existing indexed-readiness latency gap also
+remain open. Multifile stays the default/reference; this adds no format-marker
+or public ABI change and authorizes no deployment.
+
+Evidence is in ignored `build/pouch-space-compound-recode/`:
+`compound-recovery.log`, `client.log`, `qualified-debug*`,
+`qualified-*-release*`, `qualified-tsan.log`, `tsan-*`,
+`qualified-memcheck.log` and `memcheck-*`, with exact build, instrumented relink
+and memory-check commands. The initial fixture failure and its isolated fault
+location are retained separately in `compound-faults.log` and `fault-abort.log`.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

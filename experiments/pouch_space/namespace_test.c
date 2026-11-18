@@ -2178,6 +2178,7 @@ static void bodies(const char *path) {
   lc_error_cleanup(&e);
 }
 #include "body_select_cases.h"
+#include "compound_recode_cases.h"
 #include "recode_cases.h"
 typedef struct run {
   const char *path, *key, *mode;
@@ -2205,6 +2206,12 @@ static void *worker(void *p) {
     body_select(r->path, r->key, !strcmp(r->mode, "body-select-faults"));
   else if (!strcmp(r->mode, "body-select-concurrency"))
     body_select_concurrency(r->path, r->key);
+  else if (!strcmp(r->mode, "compound-recode") ||
+           !strcmp(r->mode, "compound-recode-faults"))
+    compound_recode(r->path, r->key,
+                    !strcmp(r->mode, "compound-recode-faults"));
+  else if (!strcmp(r->mode, "compound-recode-concurrency"))
+    compound_concurrency(r->path, r->key);
   else if (!strcmp(r->mode, "body-budget"))
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))

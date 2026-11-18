@@ -8617,16 +8617,17 @@ int lc_pouch_state_record_recode_bound(const lc_allocator *allocator,
                                        lc_pouch_crypto *crypto,
                                        const char *leaf,
                                        const lc_pouch_state_entry *entry,
-                                       uint64_t *bytes, lc_error *error) {
+                                       lc_pouch_state_recode_bounds *bounds,
+                                       lc_error *error) {
   lc_pouch_state_payload_span span;
   unsigned char *metadata = NULL;
   uint64_t encoded;
   size_t descriptor = 0, length = 0, key_bytes;
   int rc;
-  if (bytes)
-    *bytes = 0;
+  if (bounds)
+    memset(bounds, 0, sizeof(*bounds));
   rc = lc_pouch_state_recode_valid(entry, error);
-  if (rc != LC_OK || !allocator || !leaf || !bytes)
+  if (rc != LC_OK || !allocator || !leaf || !bounds)
     return rc != LC_OK
                ? rc
                : lc_error_set(
@@ -8650,10 +8651,11 @@ int lc_pouch_state_record_recode_bound(const lc_allocator *allocator,
       LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, entry->has_query_hidden,
       entry->query_hidden, entry->staged_delete_marker, entry->retention,
       &metadata, &length, error);
-  if (rc == LC_OK && entry->has_query_index_seq)
-    rc = lc_pouch_state_meta_set_index_sequences(allocator, &metadata, &length,
-                                                 entry->index_seq,
-                                                 entry->query_index_seq, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_meta_set_index_sequences(
+        allocator, &metadata, &length, entry->index_seq,
+        entry->has_query_index_seq ? entry->query_index_seq : entry->index_seq,
+        error);
   if (rc == LC_OK &&
       (key_bytes > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
        length > LC_POUCH_STATE_RECORD_META_MAX_BYTES ||
@@ -8662,8 +8664,10 @@ int lc_pouch_state_record_recode_bound(const lc_allocator *allocator,
     rc = lc_error_set(error, LC_ERR_INVALID, 0,
                       "conversion canonical record exceeds local bounds", NULL,
                       NULL, "pouch");
-  if (rc == LC_OK)
-    *bytes = LC_POUCH_RECORD_HEADER_BYTES + key_bytes + length + encoded;
+  if (rc == LC_OK) {
+    bounds->metadata_bytes = LC_POUCH_RECORD_HEADER_BYTES + key_bytes + length;
+    bounds->record_bytes = bounds->metadata_bytes + encoded;
+  }
   lc_free_with_allocator(allocator, metadata);
   return rc;
 }

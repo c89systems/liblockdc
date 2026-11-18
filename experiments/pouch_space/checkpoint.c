@@ -1109,12 +1109,38 @@ int ps_checkpoint_delta_open(ps_key_checkpoint *c, int maintenance,
   *out = d;
   return LC_OK;
 }
+static int delta_plan_cost(ps_checkpoint_delta *d, ps_budget_plan *extra,
+                           lc_error *e) {
+  ps_key_checkpoint *c = d->checkpoint;
+  ps_budget_plan empty = {0}, current;
+  int rc = LC_OK;
+  memset(extra, 0, sizeof(*extra));
+  pthread_mutex_lock(&c->mutex);
+  empty.maintenance = 1;
+  if (!c->budget)
+    rc = ps_budget_open(c->ns->root->space, &empty, &c->budget, e);
+  if (rc == LC_OK)
+    rc = ps_budget_status(c->budget, &current, e);
+  if (rc == LC_OK) {
+    extra->payload_bytes = d->claim.payload_bytes > current.payload_bytes
+                               ? d->claim.payload_bytes - current.payload_bytes
+                               : 0;
+    extra->metadata_bytes =
+        d->claim.metadata_bytes > current.metadata_bytes
+            ? d->claim.metadata_bytes - current.metadata_bytes
+            : 0;
+    extra->entries = d->claim.entries > current.entries
+                         ? d->claim.entries - current.entries
+                         : 0;
+    d->planned = 1;
+  }
+  pthread_mutex_unlock(&c->mutex);
+  return rc;
+}
 int ps_checkpoint_delta_plan(ps_checkpoint_delta *d,
                              const lc_pouch_storage_batch *batch,
                              uint64_t minimum, ps_budget_plan *extra,
                              lc_error *e) {
-  ps_key_checkpoint *c = d->checkpoint;
-  ps_budget_plan empty = {0}, current;
   lc_pouch_record_header h;
   const void *key, *metadata;
   uint64_t total = 0, fields[4];
@@ -1151,27 +1177,7 @@ int ps_checkpoint_delta_plan(ps_checkpoint_delta *d,
   if (rc == LC_OK && total != minimum)
     rc = failure(e, LC_ERR_INVALID,
                  "batch prefixes differ from declared canonical span");
-  pthread_mutex_lock(&c->mutex);
-  empty.maintenance = 1;
-  if (rc == LC_OK && !c->budget)
-    rc = ps_budget_open(c->ns->root->space, &empty, &c->budget, e);
-  if (rc == LC_OK)
-    rc = ps_budget_status(c->budget, &current, e);
-  if (rc == LC_OK) {
-    extra->payload_bytes = d->claim.payload_bytes > current.payload_bytes
-                               ? d->claim.payload_bytes - current.payload_bytes
-                               : 0;
-    extra->metadata_bytes =
-        d->claim.metadata_bytes > current.metadata_bytes
-            ? d->claim.metadata_bytes - current.metadata_bytes
-            : 0;
-    extra->entries = d->claim.entries > current.entries
-                         ? d->claim.entries - current.entries
-                         : 0;
-    d->planned = 1;
-  }
-  pthread_mutex_unlock(&c->mutex);
-  return rc;
+  return rc == LC_OK ? delta_plan_cost(d, extra, e) : rc;
 }
 int ps_checkpoint_delta_fund(ps_checkpoint_delta *d, ps_budget *source,
                              const ps_budget_plan *extra, lc_error *e) {
@@ -1846,19 +1852,117 @@ static int replacement_expected(ps_key_checkpoint *c,
   ps_reader_close(reader);
   return rc;
 }
-int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
-                                   const lc_pouch_state_entry *expected,
-                                   const lc_pouch_state_entry *replacement,
-                                   lc_error *e) {
-  ps_checkpoint_record original = {0}, identity = {0}, converted = {0};
+struct ps_checkpoint_body {
+  ps_key_checkpoint *checkpoint;
+  ps_checkpoint_delta *delta;
+  ps_checkpoint_record original;
+  lc_pouch_state_entry source;
+  ps_budget_plan cost;
+  uint64_t maximum;
+  int funded;
+};
+void ps_key_body_close(ps_checkpoint_body *body) {
+  ps_key_checkpoint *c;
+  if (!body)
+    return;
+  c = body->checkpoint;
+  ps_checkpoint_delta_close(body->delta);
+  ps_checkpoint_record_close(&body->original);
+  lc_pouch_state_entry_cleanup(&c->allocator, &body->source);
+  lc_free_with_allocator(&c->allocator, body);
+}
+int ps_key_body_plan(ps_key_checkpoint *c, const lc_pouch_state_entry *expected,
+                     uint64_t maximum, ps_checkpoint_body **out,
+                     ps_budget_plan *cost, lc_error *e) {
+  static const lc_pouch_record_io_ops ops = {metadata_read, NULL, NULL, NULL,
+                                             NULL};
+  ps_checkpoint_body *body = NULL;
+  metadata_input input;
+  lc_pouch_record_io io;
+  uint64_t next = 0;
+  int rc, found = 0, truncated = 0;
+  if (out)
+    *out = NULL;
+  if (!c || !expected || !expected->found || expected->control ||
+      !expected->payload_span.present || !out || !cost || !maximum ||
+      maximum > LC_POUCH_STATE_RECORD_META_MAX_BYTES +
+                    LC_POUCH_STATE_RECORD_KEY_MAX_BYTES +
+                    LC_POUCH_RECORD_HEADER_BYTES)
+    return failure(
+        e, LC_ERR_INVALID,
+        "body replacement planning requires resolved bounded metadata");
+  memset(cost, 0, sizeof(*cost));
+  body = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*body));
+  if (!body)
+    return failure(e, LC_ERR_NOMEM, "cannot allocate body replacement plan");
+  body->checkpoint = c;
+  body->maximum = maximum;
+  rc = ps_checkpoint_record_encode(&c->allocator, expected, &body->original, e);
+  if (rc == LC_OK)
+    rc = replacement_expected(c, expected, &body->original, e);
+  memset(&input, 0, sizeof(input));
+  input.parts[0].iov_base = body->original.bytes;
+  input.parts[0].iov_len = body->original.length;
+  input.bytes = body->original.length;
+  io.ops = &ops;
+  io.context = &input;
+  if (rc == LC_OK)
+    rc = lc_pouch_state_record_read(
+        io, &c->allocator, "snapshot-00000000000000000001.log", 0, input.bytes,
+        0, 0, NULL, &body->source, &next, &found, &truncated, e);
+  if (rc == LC_OK && (!found || truncated || next != input.bytes))
+    rc = failure(e, LC_ERR_PROTOCOL, "body replacement source is incomplete");
+  if (rc == LC_OK)
+    rc = ps_checkpoint_delta_open(c, 0, &body->delta, e);
+  if (rc == LC_OK) {
+    ps_checkpoint_delta *d = body->delta;
+    d->planning = 1;
+    pthread_mutex_lock(&c->mutex);
+    rc = admit_key(d, body->source.key, strlen(body->source.key),
+                   PS_KEY_METADATA, maximum + 512, e);
+    pthread_mutex_unlock(&c->mutex);
+    d->planning = 0;
+    if (rc == LC_OK)
+      rc = delta_plan_cost(d, &body->cost, e);
+    if (rc == LC_OK && body->cost.metadata_bytes > PS_JOURNAL - 64)
+      rc = failure(e, LC_ERR_INVALID,
+                   "body replacement exceeds one revision descriptor window");
+    d->metadata_only = d->body_replacement = 1;
+    d->metadata_count = 1;
+  }
+  if (rc == LC_OK) {
+    *out = body;
+    *cost = body->cost;
+  } else
+    ps_key_body_close(body);
+  return rc;
+}
+int ps_key_body_fund(ps_checkpoint_body *body, ps_budget *parent, lc_error *e) {
+  int rc;
+  if (!body || body->funded || !parent)
+    return failure(e, LC_ERR_INVALID, "body replacement plan is not open");
+  rc = ps_checkpoint_delta_fund(body->delta, parent, &body->cost, e);
+  if (rc == LC_OK)
+    body->funded = 1;
+  return rc;
+}
+const lc_pouch_state_entry *ps_key_body_source(const ps_checkpoint_body *body) {
+  return body ? &body->source : NULL;
+}
+int ps_key_body_commit(ps_checkpoint_body *body,
+                       const lc_pouch_state_entry *replacement, lc_error *e) {
+  ps_checkpoint_record identity = {0}, converted = {0};
   lc_pouch_state_entry entry;
-  ps_checkpoint_delta *delta = NULL;
   lc_pouch_storage_batch batch;
   body_replacement_prefix input;
+  ps_key_checkpoint *c;
+  const lc_pouch_state_entry *expected;
   int rc;
-  if (!c || !expected || !replacement || !expected->found ||
-      !expected->payload_span.present || expected->control ||
-      !replacement->found || replacement->control ||
+  if (!body || !body->funded || !replacement)
+    return failure(e, LC_ERR_INVALID, "body replacement plan is not funded");
+  c = body->checkpoint;
+  expected = &body->source;
+  if (!replacement->found || replacement->control ||
       !replacement->payload_span.present ||
       replacement->payload_span.payload_length != replacement->cipher_bytes ||
       replacement->record_type !=
@@ -1868,7 +1972,6 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
                : LC_POUCH_STATE_RECORD_STATE_PUT))
     return failure(e, LC_ERR_INVALID,
                    "physical replacement requires a resolved converted body");
-  rc = ps_checkpoint_record_encode(&c->allocator, expected, &original, e);
   /* Normalize only representation fields: all logical facts, including a
    * linked object's class, must encode identically to the expected key. */
   entry = *replacement;
@@ -1877,14 +1980,14 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
   entry.descriptor = expected->descriptor;
   entry.record_type = expected->record_type;
   entry.object_link = expected->object_link;
-  if (rc == LC_OK)
-    rc = ps_checkpoint_record_encode(&c->allocator, &entry, &identity, e);
-  if (rc == LC_OK && (identity.length != original.length ||
-                      memcmp(identity.bytes, original.bytes, original.length)))
+  rc = ps_checkpoint_record_encode(&c->allocator, &entry, &identity, e);
+  if (rc == LC_OK &&
+      (identity.length != body->original.length ||
+       memcmp(identity.bytes, body->original.bytes, body->original.length)))
     rc = failure(e, LC_ERR_INVALID,
                  "physical replacement changed logical record facts");
   if (rc == LC_OK)
-    rc = replacement_expected(c, expected, &original, e);
+    rc = replacement_expected(c, expected, &body->original, e);
   entry = *expected;
   entry.payload_span = replacement->payload_span;
   entry.cipher_bytes = replacement->cipher_bytes;
@@ -1896,16 +1999,41 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
   batch.context = &input;
   batch.count = 1;
   batch.prefix = replacement_prefix;
-  if (rc == LC_OK)
-    rc = ps_key_metadata_begin(c, 1, &batch, converted.length, &delta, e);
+  if (rc == LC_OK && converted.length > body->maximum)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "body replacement metadata exceeds its admitted bound");
   if (rc == LC_OK) {
-    delta->body_replacement = 1;
-    rc = ps_key_metadata_commit(delta, &batch, PS_COMMIT_DEFAULT, e);
+    body->delta->metadata_bytes = converted.length;
+    rc = ps_key_metadata_commit(body->delta, &batch, PS_COMMIT_DEFAULT, e);
   }
-  ps_checkpoint_delta_close(delta);
   ps_checkpoint_record_close(&converted);
   ps_checkpoint_record_close(&identity);
-  ps_checkpoint_record_close(&original);
+  return rc;
+}
+int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
+                                   const lc_pouch_state_entry *expected,
+                                   const lc_pouch_state_entry *replacement,
+                                   lc_error *e) {
+  ps_checkpoint_body *body = NULL;
+  ps_checkpoint_record converted = {0};
+  ps_budget *parent = NULL;
+  ps_budget_plan cost;
+  int rc;
+  if (!c || !expected || !replacement)
+    return failure(e, LC_ERR_INVALID,
+                   "physical replacement requires source and result");
+  rc = ps_checkpoint_record_encode(&c->allocator, replacement, &converted, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_plan(c, expected, converted.length, &body, &cost, e);
+  if (rc == LC_OK)
+    rc = ps_budget_open(c->ns->root->space, &cost, &parent, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_fund(body, parent, e);
+  if (rc == LC_OK)
+    rc = ps_key_body_commit(body, replacement, e);
+  ps_key_body_close(body);
+  (void)ps_budget_close(parent, NULL);
+  ps_checkpoint_record_close(&converted);
   return rc;
 }
 static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,

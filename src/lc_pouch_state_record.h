@@ -122,9 +122,13 @@ int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
  * preserve versions, lifetime, both index sequences and side metadata. A
  * projected META/LINK body becomes a physical PUT (OBJECT_PUT when applicable).
  * The owner still selects metadata references and supplies durability. */
+typedef struct lc_pouch_state_recode_bounds {
+  uint64_t record_bytes, metadata_bytes;
+} lc_pouch_state_recode_bounds;
 int lc_pouch_state_record_recode_bound(const lc_allocator *, lc_pouch_crypto *,
                                        const char *output_leaf,
-                                       const lc_pouch_state_entry *, uint64_t *,
+                                       const lc_pouch_state_entry *,
+                                       lc_pouch_state_recode_bounds *,
                                        lc_error *);
 int lc_pouch_state_record_recode(const lc_allocator *, lc_pouch_crypto *,
                                  lc_pouch_record_io input,

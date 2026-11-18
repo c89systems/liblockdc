@@ -21,10 +21,12 @@ static int client_recode_record(void *context, uint64_t segment,
       &allocator, "projection", entry->key, entry->version, body_class);
   REQUIRE(binding);
   lc_pouch_state_entry converted = {0};
-  int rc = ps_namespace_body_recode(work->ns, work->target, entry, binding,
-                                    &converted, e);
+  ps_namespace_recode *conversion = NULL;
+  int rc = ps_namespace_recode_begin(work->ns, work->target, entry, binding,
+                                     &conversion, e);
   if (rc == LC_OK)
-    rc = ps_namespace_body_select(work->ns, entry, &converted, e);
+    rc = ps_namespace_recode_run(conversion, &converted, e);
+  ps_namespace_recode_close(conversion);
   if (rc == LC_OK)
     ++work->converted;
   lc_pouch_state_entry_cleanup(&allocator, &converted);

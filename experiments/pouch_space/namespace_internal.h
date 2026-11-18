@@ -58,5 +58,11 @@ int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
 int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);
 int ps_ns_head_write(struct ps_namespace_data *, ps_budget *, uint64_t active,
                      lc_error *);
+/* Funded body construction while the conversion owner holds mutation
+ * exclusion. The borrowed budget outlives the body builder. */
+int ps_ns_body_plan(ps_budget_plan *, uint64_t, lc_error *);
+int ps_ns_body_begin(ps_namespace *, ps_budget *, uint64_t,
+                     ps_namespace_body **, lc_error *);
+int ps_ns_body_commit(ps_namespace_body *, lc_error *);
 
 #endif

@@ -8,6 +8,7 @@
 
 typedef struct ps_key_checkpoint ps_key_checkpoint;
 typedef struct ps_checkpoint_delta ps_checkpoint_delta;
+typedef struct ps_checkpoint_body ps_checkpoint_body;
 typedef struct ps_checkpoint_info {
   uint64_t epoch, segment, offset, state_index, query_index;
   uint64_t slots, pending, pending_bytes;
@@ -77,6 +78,18 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *,
                                    const lc_pouch_state_entry *expected,
                                    const lc_pouch_state_entry *replacement,
                                    lc_error *);
+/* Conversion admission owns a canonical metadata snapshot, a bounded future
+ * key replacement and its coverage. Plan before body input, fund from the
+ * compound parent before it has writers, then commit actual converted metadata
+ * within that bound. Caller holds namespace mutation exclusion throughout. */
+int ps_key_body_plan(ps_key_checkpoint *, const lc_pouch_state_entry *,
+                     uint64_t, ps_checkpoint_body **, ps_budget_plan *,
+                     lc_error *);
+int ps_key_body_fund(ps_checkpoint_body *, ps_budget *, lc_error *);
+const lc_pouch_state_entry *ps_key_body_source(const ps_checkpoint_body *);
+int ps_key_body_commit(ps_checkpoint_body *, const lc_pouch_state_entry *,
+                       lc_error *);
+void ps_key_body_close(ps_checkpoint_body *);
 /* Capture slots and coverage at one completed visibility prefix, including
  * when the owner has a newer deferred metadata revision. */
 int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,

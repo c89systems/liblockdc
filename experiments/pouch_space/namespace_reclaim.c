@@ -22,6 +22,9 @@ struct ps_namespace_body {
   int attempted, owns_budget;
   int bounded;
 };
+int ps_ns_body_plan(ps_budget_plan *plan, uint64_t bytes, lc_error *e) {
+  return plan_output(plan, 29, bytes, e);
+}
 static int body_begin(ps_namespace *ns, ps_budget *budget, uint64_t bytes,
                       int bounded, ps_namespace_body **out, lc_error *e) {
   ps_namespace_body *b;
@@ -88,6 +91,12 @@ int ps_namespace_body_begin_bound(ps_namespace *ns, uint64_t maximum,
                                   ps_namespace_body **out, lc_error *e) {
   return body_begin(ns, NULL, maximum, 1, out, e);
 }
+int ps_ns_body_begin(ps_namespace *ns, ps_budget *budget, uint64_t maximum,
+                     ps_namespace_body **out, lc_error *e) {
+  if (!budget)
+    return failure(e, "funded body construction requires a budget");
+  return body_begin(ns, budget, maximum, 1, out, e);
+}
 static int bounded_append(void *context, const struct iovec *parts, int count,
                           lc_error *e) {
   ps_namespace_body *b = context;
@@ -136,7 +145,7 @@ lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *b) {
 const char *ps_namespace_body_leaf(const ps_namespace_body *b) {
   return b && b->resource ? b->resource->leaf : NULL;
 }
-static int body_commit_locked(ps_namespace_body *b, lc_error *e) {
+int ps_ns_body_commit(ps_namespace_body *b, lc_error *e) {
   ps_stream_info info;
   ps_ns_resource *r;
   int rc;
@@ -172,7 +181,7 @@ int ps_namespace_body_commit(ps_namespace_body *b, lc_error *e) {
     return failure(e, "namespace body build is not open");
   rc = ps_ns_enter(b->data, e);
   if (rc == LC_OK) {
-    rc = body_commit_locked(b, e);
+    rc = ps_ns_body_commit(b, e);
     ps_ns_leave(b->data);
   }
   return rc;

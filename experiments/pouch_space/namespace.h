@@ -9,6 +9,7 @@ typedef struct ps_namespace_append ps_namespace_append;
 typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_body ps_namespace_body;
+typedef struct ps_namespace_recode ps_namespace_recode;
 struct lc_pouch_storage_batch;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
@@ -178,6 +179,19 @@ int ps_namespace_body_recode(ps_namespace *, lc_pouch_crypto *,
 int ps_namespace_body_select(ps_namespace *,
                              const lc_pouch_state_entry *expected,
                              const lc_pouch_state_entry *converted, lc_error *);
+/* Complete offline conversion: begin captures the selected source metadata and
+ * admits body construction plus durable key/coverage replacement before body
+ * input. Namespace mutation/reclamation exclusion survives until close, with
+ * no mutex held over production. Crypto is borrowed until close. Run is single
+ * use and replaces the caller's result only after durable publication. Close
+ * refunds unused credits; a sealed unselected pack from an interrupted handoff
+ * remains eligible for ordinary maintenance. No implicit container growth. */
+int ps_namespace_recode_begin(ps_namespace *, lc_pouch_crypto *,
+                              const lc_pouch_state_entry *, const char *binding,
+                              ps_namespace_recode **, lc_error *);
+int ps_namespace_recode_run(ps_namespace_recode *, lc_pouch_state_entry *,
+                            lc_error *);
+void ps_namespace_recode_close(ps_namespace_recode *);
 /* Only fully covered sealed segments and unreferenced sealed body packs are
  * eligible. Captured metadata views defer source retirement with BUSY until
  * their callbacks can no longer open a historical body reference.
