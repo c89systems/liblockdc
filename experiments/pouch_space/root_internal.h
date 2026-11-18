@@ -18,6 +18,7 @@ struct ps_namespace {
   struct ps_collection_owner *collections;
   pthread_mutex_t collection_catalog;
   pthread_mutex_t maintenance;
+  pthread_mutex_t query;
   pthread_mutex_t outbox;
   pthread_cond_t outbox_changed;
   struct ps_outbox_marker_gate *outbox_writers;

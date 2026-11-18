@@ -23,7 +23,7 @@ static int revision_write(ps_space *s, int control, const void *first,
   if (rc == LC_OK)
     rc = ps_write(writers[1], second, second_bytes, e);
   if (rc == LC_OK)
-    rc = ps_revision_publish(writers, 2, NULL, e);
+    rc = ps_revision_publish(writers, 2, 0, NULL, e);
   ps_writer_close(writers[0]);
   ps_writer_close(writers[1]);
   CHECK(ps_budget_close(budget, NULL) == LC_OK);
@@ -78,7 +78,7 @@ static void revision_lifecycle(int durable, int control) {
   expect(s, state(1), NULL, "old", 3);
   expect(s, key(control ? PS_CONTROL : PS_STATE, 1, 2), NULL, "initial", 7);
   OK(ps_status(s, &before, &error));
-  OK(ps_revision_publish(writers, 2, published, &error));
+  OK(ps_revision_publish(writers, 2, 0, published, &error));
   OK(ps_status(s, &after, &error));
   CHECK(after.syncs - before.syncs == (uint64_t)(durable || control));
   CHECK(!memcmp(prepared, published, sizeof(prepared)));
@@ -136,7 +136,7 @@ static void revision_admission(void) {
       lc_error_cleanup(&error);
     }
     OK(ps_status(s, &before, &error));
-    int rc = ps_revision_publish(writers, 2, NULL, &error);
+    int rc = ps_revision_publish(writers, 2, 0, NULL, &error);
     if (kind < 2) {
       CHECK(rc == LC_ERR_INVALID);
       lc_error_cleanup(&error);
@@ -165,7 +165,7 @@ static void revision_admission(void) {
   s = create(PS_MIB, 0, NULL);
   OK(ps_begin(s, NULL, state(1), &writers[0], &error));
   OK(ps_begin(s, NULL, state(1), &writers[1], &error));
-  BAD(ps_revision_publish(writers, 2, NULL, &error));
+  BAD(ps_revision_publish(writers, 2, 0, NULL, &error));
   /* Invalid invocation did not consume otherwise valid private owners. */
   OK(ps_write(writers[0], "retry", 5, &error));
   OK(ps_publish(writers[0], NULL, &error));
@@ -395,7 +395,7 @@ static void *revision_worker(void *context) {
   revision_actor *actor = context;
   lc_error e;
   lc_error_init(&e);
-  actor->rc = ps_revision_publish(actor->writers, 2, NULL, &e);
+  actor->rc = ps_revision_publish(actor->writers, 2, 0, NULL, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -603,6 +603,158 @@ static void revision_processes(const char *directory) {
         !unsetenv("PS_REVISION_DEATH_SYNC"));
   printf("revision: %zu exec process exits across publication I/O\n", deaths);
   free(bytes);
+  clean();
+}
+typedef struct revision_visit_context {
+  ps_space *space;
+  ps_key key;
+  ps_ref original;
+  size_t seen;
+} revision_visit_context;
+static int revision_visit_replace(void *context, ps_key k, const ps_ref *ref,
+                                  uint64_t bytes, lc_error *e) {
+  revision_visit_context *c = context;
+  (void)e;
+  CHECK(k.owner == c->key.owner && k.key == c->key.key &&
+        k.kind == c->key.kind && bytes == PS_CHUNK + 177);
+  CHECK(!memcmp(ref, &c->original, sizeof(*ref)));
+  ++c->seen;
+  /* Re-entry is outside publication authority. An old captured incarnation
+   * must never let cleanup remove this newly selected replacement. */
+  put(c->space, k, "replacement", 11, 2);
+  OK(ps_value_remove(c->space, k, ref, &error));
+  expect(c->space, k, NULL, "replacement", 11);
+  return LC_OK;
+}
+static void revision_values(void) {
+  ps_space *s;
+  ps_reader *r = NULL;
+  ps_ref observed, held;
+  uint64_t length;
+  size_t got;
+  int present;
+  unsigned char scratch[64];
+  size_t size = PS_CHUNK + 177;
+  unsigned char *bytes = malloc(size);
+  CHECK(bytes);
+  for (size_t i = 0; i < size; ++i)
+    bytes[i] = (unsigned char)(i * 17 + 3);
+  clean();
+  s = create(PS_MIB, 0, NULL);
+  ps_key k = key(PS_QUERY_FIRST + 5, 81, 9);
+  OK(ps_value_info(s, k, &observed, &length, &present, &error));
+  CHECK(!present && !length && !observed.incarnation);
+  put(s, k, bytes, size, 317);
+  put(s, key(PS_QUERY_FIRST + 4, 81, 9), "other kind", 10, 3);
+  put(s, key(k.kind, 82, 9), "other owner", 11, 3);
+  OK(ps_value_info(s, k, &observed, &length, &present, &error));
+  CHECK(present && length == size);
+  OK(ps_read_open(s, k, &observed, &r, &error));
+  ps_read_reference(r, &held);
+  CHECK(!memcmp(&held, &observed, sizeof(held)));
+  size_t offsets[] = {size - 4, 0, PS_CHUNK - 13, 1, PS_CHUNK + 4};
+  for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+    size_t count = size - offsets[i];
+    if (count > sizeof(scratch))
+      count = sizeof(scratch);
+    OK(ps_read_at(r, offsets[i], scratch, count, &error));
+    CHECK(!memcmp(scratch, bytes + offsets[i], count));
+  }
+  BAD(ps_read_at(r, size, scratch, 1, &error));
+  OK(ps_read(r, scratch, 17, &got, &error));
+  CHECK(got == 17 && !memcmp(scratch, bytes, got));
+  OK(ps_read_at(r, PS_CHUNK + 11, scratch, sizeof(scratch), &error));
+  OK(ps_read(r, scratch, 7, &got, &error));
+  CHECK(got == 7 && !memcmp(scratch, bytes + 17, got));
+  revision_visit_context context = {s, k, held, 0};
+  OK(ps_values_visit(s, k.owner, k.kind, k.kind, revision_visit_replace,
+                     &context, &error));
+  CHECK(context.seen == 1);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_read_at(r, 0, scratch, sizeof(scratch), &error));
+  CHECK(!memcmp(scratch, bytes, sizeof(scratch)));
+  ps_reader_close(r);
+  OK(ps_value_remove(s, key(k.kind, 999, 1), NULL, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  expect(s, k, NULL, "replacement", 11);
+  expect(s, key(PS_QUERY_FIRST + 4, 81, 9), NULL, "other kind", 10);
+  expect(s, key(k.kind, 82, 9), NULL, "other owner", 11);
+  OK(ps_close(s, &error));
+  clean();
+  free(bytes);
+}
+static void revision_derived_recovery(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_space *s;
+  for (int damaged = 0; damaged < 2; ++damaged) {
+    clean();
+    s = create(PS_MIB, 0, &io);
+    revision_seed(s, 0);
+    ps_writer *writers[2] = {NULL, NULL};
+    ps_key keys[2] = {key(PS_QUERY_FIRST + 5, 1, 7), key(PS_QUERY_FIRST, 1, 0)};
+    ps_stats before;
+    OK(ps_status(s, &before, &error));
+    for (size_t i = 0; i < 2; ++i) {
+      OK(ps_begin(s, NULL, keys[i], &writers[i], &error));
+      OK(ps_write(writers[i], i ? "manifest" : "query", i ? 8 : 5, &error));
+    }
+    OK(ps_revision_publish(writers, 2, 0, NULL, &error));
+    ps_writer_close(writers[0]);
+    ps_writer_close(writers[1]);
+    /* This canonical publication is acknowledged after the query revision. */
+    put(s, state(99), "after", 5, 2);
+    OK(ps_flush(s, &error));
+    OK(ps_close(s, &error));
+    uint64_t member = PS_JOURNAL_OFFSET + before.journal_bytes + 64;
+    if (damaged)
+      member += (uint32_t)fixture_get64(m.stable + member + 4);
+    uint64_t payload = fixture_get64(m.stable + member + 64);
+    CHECK(payload >= PS_DATA && payload < PS_MIB);
+    m.stable[payload] ^= 1;
+    crash(&m);
+    s = reopen(&io);
+    expect(s, state(99), NULL, "after", 5);
+    ps_ref ref;
+    uint64_t value_bytes;
+    int present, valid = 1;
+    OK(ps_value_info(s, keys[damaged], &ref, &value_bytes, &present, &error));
+    CHECK(present);
+    size_t reads = m.reads;
+    OK(ps_value_validate(s, keys[damaged], &ref, &valid, &error));
+    CHECK(!valid && m.reads > reads);
+    reads = m.reads;
+    OK(ps_value_validate(s, keys[damaged], &ref, &valid, &error));
+    CHECK(!valid && m.reads == reads);
+    OK(ps_value_info(s, keys[!damaged], &ref, &value_bytes, &present, &error));
+    CHECK(present);
+    allocation_call = 0;
+    allocation_fail = 1;
+    int validation = ps_value_validate(s, keys[!damaged], &ref, &valid, &error);
+    allocation_fail = 0;
+    CHECK(validation == LC_ERR_NOMEM);
+    lc_error_cleanup(&error);
+    OK(ps_value_validate(s, keys[!damaged], &ref, &valid, &error));
+    CHECK(valid);
+    reads = m.reads;
+    OK(ps_value_validate(s, keys[!damaged], &ref, &valid, &error));
+    CHECK(valid && m.reads == reads);
+    ps_reader *r = NULL;
+    unsigned char scratch[16];
+    OK(ps_read_open(s, keys[damaged], NULL, &r, &error));
+    CHECK(ps_read_at(r, 0, scratch, 1, &error) == LC_ERR_PROTOCOL);
+    lc_error_cleanup(&error);
+    ps_reader_close(r);
+    OK(ps_check(s, &error));
+    OK(ps_value_remove(s, keys[damaged], NULL, &error));
+    OK(ps_checkpoint(s, &error));
+    OK(ps_close(s, &error));
+    s = reopen(&io);
+    expect(s, state(99), NULL, "after", 5);
+    OK(ps_close(s, &error));
+  }
+  free(m.stable);
   clean();
 }
 #endif

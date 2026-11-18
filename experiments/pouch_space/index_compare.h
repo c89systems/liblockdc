@@ -69,12 +69,12 @@ static int indexed_end(void *context, lc_error *e) {
 static void index_phase_begin(index_phase *phase) {
   require(!pthread_getspecific(sync_phase_key), "index phases do not overlap");
   require(!pthread_setspecific(sync_phase_key, phase), "start index phase");
-  phase->cpu_seconds = now(CLOCK_THREAD_CPUTIME_ID);
-  phase->seconds = now(CLOCK_MONOTONIC);
+  phase->started_cpu = now(CLOCK_THREAD_CPUTIME_ID);
+  phase->started_seconds = now(CLOCK_MONOTONIC);
 }
 static void index_phase_end(index_phase *phase) {
-  phase->seconds = now(CLOCK_MONOTONIC) - phase->seconds;
-  phase->cpu_seconds = now(CLOCK_THREAD_CPUTIME_ID) - phase->cpu_seconds;
+  phase->seconds += now(CLOCK_MONOTONIC) - phase->started_seconds;
+  phase->cpu_seconds += now(CLOCK_THREAD_CPUTIME_ID) - phase->started_cpu;
   require(!pthread_setspecific(sync_phase_key, NULL), "finish index phase");
 }
 static int index_queries(worker *w, int flush, lc_error *e) {
@@ -94,6 +94,11 @@ static int index_queries(worker *w, int flush, lc_error *e) {
     rc = lc_flush_index(w->run->client, &request, &result, e);
     if (rc == LC_OK)
       require(result.flushed && !result.pending, "completed index flush");
+    if (rc == LC_OK) {
+      require(result.index_seq > w->index_seq,
+              "each update round advances the published index");
+      w->index_seq = result.index_seq;
+    }
     lc_index_flush_res_cleanup(&result);
     index_phase_end(&w->index_phases[0]);
   }

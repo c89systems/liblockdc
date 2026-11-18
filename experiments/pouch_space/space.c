@@ -28,6 +28,9 @@ struct ps_reader {
   ps_space *space;
   ps_entry *entry;
   size_t extent, offset, loaded;
+  size_t random_extent;
+  uint64_t random_base;
+  int random_loaded;
   unsigned char buffer[PS_CHUNK];
 };
 struct ps_owned_head {
@@ -219,11 +222,13 @@ static uint64_t aligned(uint64_t n) {
 }
 static int valid_key(ps_key k) {
   return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL ||
-         k.kind == PS_ROUTING;
+         k.kind == PS_ROUTING ||
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST);
 }
 static int immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION ||
-         k.kind == PS_CONTROL || k.kind == PS_ROUTING;
+         k.kind == PS_CONTROL || k.kind == PS_ROUTING ||
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST);
 }
 static size_t bucket(ps_key k) {
   uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^ k.kind;
@@ -748,8 +753,8 @@ static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
     rc = err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
   return rc;
 }
-static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
-                        lc_error *error) {
+static int verify_value_payloads(ps_space *s, ps_entry *p,
+                                 unsigned char *buffer, lc_error *error) {
   size_t i;
   int rc;
   if (p->key.kind == PS_OWNED_RUN)
@@ -763,6 +768,16 @@ static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
       return err(error, LC_ERR_PROTOCOL, "container payload checksum mismatch");
   }
   return LC_OK;
+}
+static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
+                        lc_error *error) {
+  /* Derived bytes never determine how far canonical authority can recover.
+   * Their descriptors still own exact, checked ranges; readers validate their
+   * payload CRC and the query owner rebuilds invalid data. Lost/corrupt query
+   * payload must not truncate later acknowledged canonical publications. */
+  if (p->key.kind >= PS_QUERY_FIRST && p->key.kind <= PS_QUERY_LAST)
+    return LC_OK;
+  return verify_value_payloads(s, p, buffer, error);
 }
 static int initial_free(ps_space *s, lc_error *error) {
   s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
@@ -1821,8 +1836,8 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
       old = lookup(s, p->key);
-      if (p->key.kind != PS_STATE && p->key.kind != PS_CONTROL &&
-          p->key.kind != PS_ROUTING && p->key.kind != PS_CATALOG && old &&
+      if (p->key.kind != PS_CATALOG &&
+          (!immutable_key(p->key) || p->key.kind == PS_COLLECTION) && old &&
           !old->deleted) {
         entry_free(p);
         rc = err(error, LC_ERR_PROTOCOL,
@@ -2268,6 +2283,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
         prior ? 0 : 1);
     w->entry->publication_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+    w->entry->value_checked = 1;
     old = lookup(s, w->entry->key); /* rollover may have retired a tombstone */
     dirty_entry(s, w->entry, old);
     install(s, w->entry);
@@ -2296,8 +2312,8 @@ int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
   *bytes = w->entry->bytes + w->used;
   return LC_OK;
 }
-int ps_revision_publish(ps_writer *const *writers, size_t count, ps_ref *refs,
-                        lc_error *error) {
+int ps_revision_publish(ps_writer *const *writers, size_t count,
+                        int force_durable, ps_ref *refs, lc_error *error) {
   ps_space *s;
   ps_budget *budget;
   ps_entry *p, *old;
@@ -2305,7 +2321,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, ps_ref *refs,
   size_t i, j, bytes = 64, cursor, prior, descriptor;
   uint64_t metadata, entries, growth = 0, added = 0, sequence = 0;
   int rc = LC_OK, durable;
-  if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0])
+  if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0] ||
+      (force_durable != 0 && force_durable != 1))
     return err(error, LC_ERR_INVALID, "revision requires immutable writers");
   s = writers[0]->space;
   budget = writers[0]->budget;
@@ -2343,7 +2360,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, ps_ref *refs,
     rc = checkpoint_locked(s, error);
   metadata = s->metadata;
   entries = s->live_entries;
-  durable = s->durable;
+  durable = s->durable || force_durable;
   for (i = 0; rc == LC_OK && i < count; ++i) {
     p = writers[i]->entry;
     old = lookup(s, p->key);
@@ -2394,6 +2411,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, ps_ref *refs,
       old = lookup(s, p->key);
       p->publication_sequence = ++sequence;
       p->durable_visibility = durable;
+      p->value_checked = 1;
       dirty_entry(s, p, old);
       install(s, p);
       writers[i]->published = 1;
@@ -2474,6 +2492,11 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
     lc_free_with_allocator(NULL, r);
   return rc;
 }
+static void reader_payload_invalid(ps_reader *r) {
+  pthread_mutex_lock(&r->space->mutex);
+  r->entry->value_checked = -1;
+  pthread_mutex_unlock(&r->space->mutex);
+}
 int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
             lc_error *error) {
   unsigned char *p = buffer;
@@ -2485,6 +2508,10 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   if (!r || (!buffer && count) || !out)
     return err(error, LC_ERR_INVALID,
                "container read requires reader, buffer and byte count");
+  if (r->random_loaded) {
+    r->random_loaded = 0;
+    r->loaded = 0;
+  }
   while (count && r->extent < r->entry->count) {
     extent = &r->entry->extents[r->extent];
     if (!r->loaded) {
@@ -2492,9 +2519,11 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
                     0, error);
       if (rc != LC_OK)
         return rc;
-      if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc)
+      if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
+        reader_payload_invalid(r);
         return err(error, LC_ERR_PROTOCOL,
                    "container read payload checksum mismatch");
+      }
       r->loaded = (size_t)extent->bytes;
     }
     n = r->loaded - r->offset;
@@ -2512,6 +2541,188 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   }
   return LC_OK;
 }
+int ps_read_at(ps_reader *r, uint64_t offset, void *buffer, size_t count,
+               lc_error *error) {
+  unsigned char *p = buffer;
+  const ps_extent *extent;
+  size_t within, take;
+  int rc;
+  if (!r || (!buffer && count) || offset > r->entry->bytes ||
+      count > r->entry->bytes - offset)
+    return err(error, LC_ERR_INVALID, "captured value read exceeds its range");
+  if (offset < r->random_base) {
+    r->random_extent = 0;
+    r->random_base = 0;
+    r->random_loaded = 0;
+  }
+  while (count) {
+    extent = &r->entry->extents[r->random_extent];
+    if (offset >= r->random_base + extent->bytes) {
+      r->random_base += extent->bytes;
+      ++r->random_extent;
+      r->random_loaded = 0;
+      continue;
+    }
+    if (!r->random_loaded) {
+      r->loaded = 0;
+      rc = transfer(r->space, r->buffer, (size_t)extent->bytes, extent->offset,
+                    0, error);
+      if (rc != LC_OK)
+        return rc;
+      if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
+        reader_payload_invalid(r);
+        return err(error, LC_ERR_PROTOCOL,
+                   "captured value payload checksum mismatch");
+      }
+      r->random_loaded = 1;
+    }
+    within = (size_t)(offset - r->random_base);
+    take = (size_t)extent->bytes - within;
+    if (take > count)
+      take = count;
+    memcpy(p, r->buffer + within, take);
+    offset += take;
+    p += take;
+    count -= take;
+  }
+  return LC_OK;
+}
+void ps_read_reference(const ps_reader *r, ps_ref *out) {
+  memcpy(out->container, r->space->identity, sizeof(out->container));
+  out->incarnation = r->entry->token;
+}
+static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
+  if (s->durable || (p && (p->key.kind == PS_CONTROL || p->durable_visibility)))
+    while (p && p->publication_sequence > prefix)
+      p = p->previous;
+  return p && !p->deleted ? p : NULL;
+}
+int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
+                  int *present, lc_error *error) {
+  ps_entry *p;
+  int rc;
+  if (!s || !ref || !bytes || !present || !immutable_key(key))
+    return err(error, LC_ERR_INVALID,
+               "value observation requires typed output");
+  memset(ref, 0, sizeof(*ref));
+  *bytes = 0;
+  *present = 0;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  p = selected_value(s, lookup(s, key),
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
+  if (rc == LC_OK && p) {
+    memcpy(ref->container, s->identity, sizeof(ref->container));
+    ref->incarnation = p->token;
+    *bytes = p->bytes;
+    *present = 1;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
+                      int *valid, lc_error *error) {
+  ps_entry *p;
+  unsigned char *buffer = NULL;
+  int rc, checked = 0;
+  if (!s || !valid || !immutable_key(key))
+    return err(error, LC_ERR_INVALID, "value validation requires typed output");
+  *valid = 0;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  p = selected_value(s, lookup(s, key),
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
+  if (rc != LC_OK || !p ||
+      (expected && (memcmp(expected->container, s->identity, 16) ||
+                    expected->incarnation != p->token)))
+    p = NULL;
+  if (p && p->value_checked) {
+    *valid = p->value_checked > 0;
+    p = NULL;
+  }
+  if (p) {
+    ++p->pins;
+    ++s->readers;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  if (!p)
+    return rc;
+  buffer = lc_alloc_with_allocator(NULL, PS_CHUNK);
+  if (!buffer)
+    rc = err(error, LC_ERR_NOMEM,
+             "cannot allocate immutable validation scratch");
+  else
+    rc = verify_value_payloads(s, p, buffer, error);
+  if (rc == LC_ERR_PROTOCOL) {
+    lc_error_cleanup(error);
+    checked = -1;
+    rc = LC_OK;
+  } else if (rc == LC_OK)
+    checked = 1;
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK) {
+    if (checked < 0 || !p->value_checked)
+      p->value_checked = checked;
+    *valid = p->value_checked > 0;
+  }
+  --p->pins;
+  --s->readers;
+  if (p->state == 2 && p->safe && !p->pins)
+    collect(s);
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, buffer);
+  return rc;
+}
+int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
+                    unsigned int last, ps_value_visit_fn visit, void *context,
+                    lc_error *error) {
+  ps_entry **captured = NULL, *p, *selected;
+  ps_ref ref;
+  uint64_t prefix;
+  size_t i, n = 0, at = 0;
+  int rc;
+  if (!s || !visit || first > last)
+    return err(error, LC_ERR_INVALID, "value visit requires owner and kinds");
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
+    for (p = s->buckets[i]; p; p = p->hash_next)
+      if (p->key.owner == owner && p->key.kind >= first &&
+          p->key.kind <= last && immutable_key(p->key) &&
+          selected_value(s, p, prefix))
+        ++n;
+  if (rc == LC_OK && n) {
+    if (n <= (size_t)-1 / sizeof(*captured))
+      captured = lc_calloc_with_allocator(NULL, n, sizeof(*captured));
+    if (!captured)
+      rc = err(error, LC_ERR_NOMEM, "cannot capture selected value metadata");
+  }
+  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
+    for (p = s->buckets[i]; p; p = p->hash_next)
+      if (p->key.owner == owner && p->key.kind >= first &&
+          p->key.kind <= last && immutable_key(p->key) &&
+          (selected = selected_value(s, p, prefix)) != NULL) {
+        captured[at++] = selected;
+        ++selected->pins;
+        ++s->readers;
+      }
+  pthread_mutex_unlock(&s->mutex);
+  for (i = 0; rc == LC_OK && i < at; ++i) {
+    memcpy(ref.container, s->identity, sizeof(ref.container));
+    ref.incarnation = captured[i]->token;
+    rc = visit(context, captured[i]->key, &ref, captured[i]->bytes, error);
+  }
+  pthread_mutex_lock(&s->mutex);
+  for (i = 0; i < at; ++i) {
+    --captured[i]->pins;
+    --s->readers;
+  }
+  collect(s);
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, captured);
+  return rc;
+}
 uint64_t ps_read_size(const ps_reader *r) { return r ? r->entry->bytes : 0; }
 void ps_reader_close(ps_reader *r) {
   ps_space *s;
@@ -2526,9 +2737,10 @@ void ps_reader_close(ps_reader *r) {
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, r);
 }
-int ps_delete(ps_space *s, ps_key key, lc_error *error) {
+static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
+                        int missing_ok, lc_error *error) {
   ps_entry *p, *tombstone;
-  int rc;
+  int rc, matched;
   uint64_t sequence = 0;
   if (!s || !immutable_key(key))
     return err(error, LC_ERR_INVALID, "container delete requires typed key");
@@ -2538,11 +2750,14 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   p = lookup(s, key);
-  if (rc == LC_OK && (!p || p->deleted))
+  matched = p && !p->deleted &&
+            (!expected || (!memcmp(expected->container, s->identity, 16) &&
+                           expected->incarnation == p->token));
+  if (rc == LC_OK && !matched && !missing_ok)
     rc = err(error, LC_ERR_INVALID, "container key not found");
-  if (rc == LC_OK)
+  if (rc == LC_OK && matched)
     rc = append_event(s, p, PS_REMOVE, error);
-  if (rc == LC_OK) {
+  if (rc == LC_OK && matched) {
     tombstone->key = key;
     tombstone->token = p->token;
     tombstone->deleted = 1;
@@ -2555,9 +2770,16 @@ int ps_delete(ps_space *s, ps_key key, lc_error *error) {
   } else
     entry_free(tombstone);
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && (s->durable || key.kind == PS_CONTROL))
+  if (rc == LC_OK && matched && (s->durable || key.kind == PS_CONTROL))
     rc = wait_durable(s, sequence, error);
   return rc;
+}
+int ps_delete(ps_space *s, ps_key key, lc_error *error) {
+  return delete_value(s, key, NULL, 0, error);
+}
+int ps_value_remove(ps_space *s, ps_key key, const ps_ref *expected,
+                    lc_error *error) {
+  return delete_value(s, key, expected, 1, error);
 }
 int ps_flush(ps_space *s, lc_error *error) {
   int rc;

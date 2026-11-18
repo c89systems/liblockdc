@@ -6856,6 +6856,136 @@ static void *pouch_doc_table_cache_rows_query(void *context) {
   return NULL;
 }
 
+typedef struct pouch_generation_cache_query {
+  lc_pouch *pouch;
+  const char *ns;
+  size_t iterations, rows;
+  int rc;
+} pouch_generation_cache_query;
+
+static int
+pouch_generation_cache_count_key(const lc_pouch_query_index_key_view *key,
+                                 void *context, lc_error *error) {
+  size_t *rows = context;
+  (void)error;
+  if (strcmp(key->key, "doc/initial"))
+    return LC_ERR_INVALID;
+  ++*rows;
+  return LC_OK;
+}
+
+static void *pouch_generation_cache_query_run(void *context) {
+  pouch_generation_cache_query *query = context;
+  lc_error error;
+  lc_pouch_generation sequence;
+  size_t i;
+  lc_error_init(&error);
+  query->rc = LC_OK;
+  for (i = 0U; i < query->iterations && query->rc == LC_OK; ++i) {
+    sequence = 0;
+    query->rows = 0;
+    query->rc = lc_pouch_query_index_visit_exists(
+        query->pouch, query->ns, "/kind", pouch_generation_cache_count_key,
+        &query->rows, &sequence, &error);
+    if (query->rc == LC_OK && (query->rows != 1U || !sequence))
+      query->rc = LC_ERR_INVALID;
+  }
+  lc_error_cleanup(&error);
+  return NULL;
+}
+
+static int pouch_generation_cache_hold_first(void *context, lc_error *error) {
+  pouch_doc_table_cache_borrow_overlap *overlap = context;
+  (void)error;
+  pthread_mutex_lock(&overlap->mutex);
+  if (!overlap->borrowed) {
+    overlap->borrowed = 1;
+    pthread_cond_broadcast(&overlap->cond);
+    while (!overlap->release_borrow)
+      pthread_cond_wait(&overlap->cond, &overlap->mutex);
+  }
+  pthread_mutex_unlock(&overlap->mutex);
+  return LC_OK;
+}
+
+static void
+test_query_generation_cache_survives_parallel_eviction(void **state) {
+  const char *names[] = {"default", "peer-a", "peer-b", "peer-c"};
+  pouch_generation_cache_query queries[4];
+  pouch_doc_table_cache_borrow_overlap overlap;
+  lc_pouch_query_index_flush_result flushed;
+  pthread_t threads[4];
+  lc_pouch_generation sequence;
+  lc_pouch *pouch = NULL;
+  lc_error error;
+  char root[512];
+  size_t i;
+  (void)state;
+  lc_error_init(&error);
+  memset(&overlap, 0, sizeof(overlap));
+  memset(&flushed, 0, sizeof(flushed));
+  memset(queries, 0, sizeof(queries));
+  make_root("query-generation-cache-eviction", root, sizeof(root));
+  cleanup_root(root);
+  assert_int_equal(lc_pouch_open(root, NULL, NULL, &pouch, &error), LC_OK);
+  for (i = 0U; i < 4U; ++i) {
+    pouch_write_json_state(pouch, names[i], "doc/initial", "{\"kind\":\"old\"}",
+                           NULL, &error);
+    sequence = 0;
+    assert_int_equal(
+        lc_pouch_state_index_seq(pouch, names[i], &sequence, &error), LC_OK);
+    assert_int_equal(
+        lc_pouch_query_index_flush(pouch, names[i], sequence, &flushed, &error),
+        LC_OK);
+    queries[i].pouch = pouch;
+    queries[i].ns = names[i];
+    queries[i].iterations = 1U;
+  }
+  lc_pouch_test_generation_cache_capacity = 2U;
+  assert_int_equal(pthread_mutex_init(&overlap.mutex, NULL), 0);
+  assert_int_equal(pthread_cond_init(&overlap.cond, NULL), 0);
+  lc_pouch_test_after_generation_cache_borrow_context = &overlap;
+  lc_pouch_test_after_generation_cache_borrow_hook =
+      pouch_generation_cache_hold_first;
+  assert_int_equal(pthread_create(&threads[0], NULL,
+                                  pouch_generation_cache_query_run,
+                                  &queries[0]),
+                   0);
+  assert_true(pouch_doc_table_cache_borrow_wait(&overlap));
+  /* Peer lookups exceed capacity and finish while the first query retains
+   * its generation. Its posting bytes must survive until that query resumes. */
+  for (i = 1U; i < 4U; ++i) {
+    pouch_generation_cache_query_run(&queries[i]);
+    assert_int_equal(queries[i].rc, LC_OK);
+  }
+  pthread_mutex_lock(&overlap.mutex);
+  overlap.release_borrow = 1;
+  pthread_cond_broadcast(&overlap.cond);
+  pthread_mutex_unlock(&overlap.mutex);
+  assert_int_equal(pthread_join(threads[0], NULL), 0);
+  assert_int_equal(queries[0].rc, LC_OK);
+  lc_pouch_test_after_generation_cache_borrow_hook = NULL;
+  lc_pouch_test_after_generation_cache_borrow_context = NULL;
+  /* Concurrent cold misses, resident promotions and evictions share a root. */
+  for (i = 0U; i < 4U; ++i) {
+    queries[i].iterations = 32U;
+    assert_int_equal(pthread_create(&threads[i], NULL,
+                                    pouch_generation_cache_query_run,
+                                    &queries[i]),
+                     0);
+  }
+  for (i = 0U; i < 4U; ++i) {
+    assert_int_equal(pthread_join(threads[i], NULL), 0);
+    assert_int_equal(queries[i].rc, LC_OK);
+  }
+  lc_pouch_test_generation_cache_capacity = 0U;
+  assert_int_equal(pthread_cond_destroy(&overlap.cond), 0);
+  assert_int_equal(pthread_mutex_destroy(&overlap.mutex), 0);
+  lc_pouch_close(pouch);
+  cleanup_root(root);
+  lc_error_cleanup(&error);
+}
+
 static void
 test_query_doc_table_cache_borrow_survives_publication(void **state) {
   lc_pouch *pouch;
@@ -37623,6 +37753,7 @@ int main(int argc, char **argv) {
       cmocka_unit_test(
           test_parallel_state_writes_keep_query_projection_consistent),
       cmocka_unit_test(test_query_doc_table_cache_borrow_survives_publication),
+      cmocka_unit_test(test_query_generation_cache_survives_parallel_eviction),
       cmocka_unit_test(
           test_query_doc_table_cache_rows_survive_concurrent_eviction),
       cmocka_unit_test(

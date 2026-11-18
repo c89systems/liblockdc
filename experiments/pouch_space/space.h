@@ -38,7 +38,14 @@ enum ps_kind {
   /* Bounded logical routing values use the same replacement allowance as
    * CONTROL, but follow root durability. Ownership and allocation authority
    * must remain in always-durable controls/catalogs/grants. */
-  PS_ROUTING = 7
+  PS_ROUTING = 7,
+  /* Immutable derived query values. Domain kind and segmented identity occupy
+   * separate physical kinds; owner is the real namespace, key is generation.
+   * They share value allocation, publication and recovery, never stream seals
+   * or catalog aliases. Keep the domain range independent of logical formats.
+   */
+  PS_QUERY_FIRST = 16,
+  PS_QUERY_LAST = 37
 };
 typedef struct ps_space ps_space;
 typedef struct ps_budget ps_budget;
@@ -129,9 +136,29 @@ void ps_writer_close(ps_writer *);
  * latest complete publication. */
 int ps_read_open(ps_space *, ps_key, const ps_ref *, ps_reader **, lc_error *);
 int ps_read(ps_reader *, void *, size_t, size_t *, lc_error *);
+/* Exact bounded reads on an already captured incarnation. Its sequential
+ * cursor is unchanged; payload checksums are validated with bounded scratch.
+ * One caller owns a reader. Repeated forward ranges amortize extent lookup. */
+int ps_read_at(ps_reader *, uint64_t, void *, size_t, lc_error *);
+void ps_read_reference(const ps_reader *, ps_ref *);
+/* Scalar observation of selected immutable metadata, with no pin, allocation
+ * or payload I/O. Missing is success with present=0. */
+int ps_value_info(ps_space *, ps_key, ps_ref *, uint64_t *, int *, lc_error *);
+/* Verify a selected immutable incarnation once, outside publication authority.
+ * The result is memoized per incarnation; missing/changed/invalid is valid=0.
+ * Allocation and transport failures remain errors. Uses bounded scratch. */
+int ps_value_validate(ps_space *, ps_key, const ps_ref *, int *, lc_error *);
+typedef int (*ps_value_visit_fn)(void *, ps_key, const ps_ref *, uint64_t,
+                                 lc_error *);
+/* Capture one selected prefix for this owner/kind range. Metadata stays pinned
+ * while callbacks run outside publication authority; no bodies are read. */
+int ps_values_visit(ps_space *, uint64_t, unsigned int, unsigned int,
+                    ps_value_visit_fn, void *, lc_error *);
 uint64_t ps_read_size(const ps_reader *);
 void ps_reader_close(ps_reader *);
 int ps_delete(ps_space *, ps_key, lc_error *);
+/* Missing or a changed expected incarnation is a successful no-op. */
+int ps_value_remove(ps_space *, ps_key, const ps_ref *, lc_error *);
 /* Complete the ready publication prefix, including on NoSync roots. Does not
  * checkpoint or publish private/unready bytes. Already covered prefixes avoid
  * another file sync. */

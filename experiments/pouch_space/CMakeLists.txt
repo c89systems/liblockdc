@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -41,6 +41,17 @@ if(LOCKDC_BUILD_BENCHMARKS)
   target_link_options(pouch_space_lifecycle_compare PRIVATE
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_lifecycle_compare)
+  if(LOCKDC_BUILD_TESTS)
+    foreach(mode pouch-index runtime-index)
+      foreach(sync 0 1)
+        add_test(NAME pouch_space_compare_${mode}_churn_${sync}
+          COMMAND pouch_space_lifecycle_compare ${mode}
+            ${CMAKE_CURRENT_BINARY_DIR} 8 65536 ${sync} 4 --reopen --rounds 4)
+        set_tests_properties(pouch_space_compare_${mode}_churn_${sync}
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endforeach()
+    endforeach()
+  endif()
   if(LOCKDC_BUILD_TESTS)
     foreach(mode pouch-queue runtime-queue pouch-outbox runtime-outbox pouch-xa runtime-xa pouch-index runtime-index)
       foreach(sync 0 1)
@@ -215,6 +226,7 @@ if(LOCKDC_BUILD_TESTS)
       # allocation controls in the native suite. These are exclusive API cases.
       set(behavior_cases
         test_query_doc_table_cache_borrow_survives_publication
+        test_query_generation_cache_survives_parallel_eviction
         test_query_doc_table_cache_rows_survive_concurrent_eviction
         test_query_doc_table_cache_serializes_decoded_key_population
         test_parallel_state_writes_keep_query_projection_consistent
@@ -404,7 +416,7 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(codec RANGE 0 3)
-    foreach(mode index-artifacts index-open-faults index-durability index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
+    foreach(mode index-artifacts index-open-faults index-durability index-recovery index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
       if((codec EQUAL 1 OR codec EQUAL 2) AND mode MATCHES "(faults|crash)$")
         continue()
       endif()
@@ -558,7 +570,7 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode revision revision-faults revision-concurrency revision-process)
+  foreach(mode revision revision-faults revision-concurrency revision-process revision-values)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

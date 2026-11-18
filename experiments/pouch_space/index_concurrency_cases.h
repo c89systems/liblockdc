@@ -16,7 +16,7 @@ static int index_capture_binding(void *context, const void *name, size_t length,
 typedef struct index_gate {
   pthread_mutex_t mutex;
   pthread_cond_t changed;
-  int entered, release, sibling_done, armed;
+  int entered, release, sibling_done, armed, peer_payload;
 } index_gate;
 static void index_gate_init(index_gate *gate) {
   memset(gate, 0, sizeof(*gate));
@@ -128,8 +128,16 @@ static ssize_t index_gate_read(void *context, int fd, void *bytes, size_t size,
 }
 static ssize_t index_gate_write(void *context, int fd, const void *bytes,
                                 size_t size, off_t offset) {
-  (void)context;
-  return pwrite(fd, bytes, size, offset);
+  index_gate *gate = context;
+  ssize_t result = pwrite(fd, bytes, size, offset);
+  pthread_mutex_lock(&gate->mutex);
+  if (gate->armed && gate->entered && !gate->release && offset >= PS_DATA &&
+      result == (ssize_t)size) {
+    gate->peer_payload = 1;
+    pthread_cond_broadcast(&gate->changed);
+  }
+  pthread_mutex_unlock(&gate->mutex);
+  return result;
 }
 static int index_gate_reserve(void *context, int fd, off_t offset, off_t size) {
   (void)context;
@@ -184,7 +192,7 @@ static void index_visibility(const char *directory) {
   ps_root_options options = {0};
   ps_namespace_info identity;
   index_visibility_actor actor = {0};
-  lc_pouch_index_artifact_id id = {1U, LC_POUCH_INDEX_PACKED, 1};
+  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 1U};
   lc_pouch_index_input input = {0};
   pthread_t thread;
   lc_error e;
@@ -198,8 +206,8 @@ static void index_visibility(const char *directory) {
   index_gate_init(&actor.gate);
   REQUIRE(!pthread_create(&thread, NULL, index_visibility_publish, &actor));
   index_gate_wait(&actor.gate);
-  int opened =
-      ps_query_index_store_ops.open(root, "query/visible", &id, &input, &e);
+  int opened = ps_query_artifact_open(actor.ns, actor.owner, name, sizeof(name),
+                                      &input, &e);
   pthread_mutex_lock(&actor.gate.mutex);
   actor.gate.release = 1;
   pthread_cond_broadcast(&actor.gate.changed);
@@ -213,7 +221,7 @@ static void index_visibility(const char *directory) {
   REQUIRE(index_input_crc(&input, &e) == crc);
   ok(ps_checkpoint(ps_root_space(root), &e), &e);
   REQUIRE(index_input_crc(&input, &e) == crc);
-  ps_query_index_store_ops.close(root, &input);
+  ps_query_artifact_close(root, &input);
   ps_namespace_release(actor.ns);
   ok(ps_root_close(root, &e), &e);
   index_gate_clear(&actor.gate);
@@ -242,6 +250,8 @@ static void *index_gate_allocate(void *context, size_t bytes) {
 }
 typedef struct index_input_actor {
   ps_root *root;
+  ps_namespace *ns;
+  uint64_t owner;
   index_input_gate *gate;
   lc_pouch_index_artifact_id id;
   lc_pouch_index_input input;
@@ -253,8 +263,9 @@ static void *index_captured_open(void *context) {
   lc_error_init(&e);
   actor->gate->reader = pthread_self();
   __atomic_store_n(&actor->gate->armed, 1, __ATOMIC_RELEASE);
-  actor->result = ps_query_index_store_ops.open(actor->root, "query/retirement",
-                                                &actor->id, &actor->input, &e);
+  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 7U};
+  actor->result = ps_query_artifact_open(actor->ns, actor->owner, name,
+                                         sizeof(name), &actor->input, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -283,30 +294,33 @@ static void index_retirement_admission(const char *directory) {
   actor.id.kind = LC_POUCH_INDEX_PACKED;
   actor.id.segmented = 1;
   actor.id.generation = 7U;
-  ok(ps_query_index_store_ops.replace(root, "query/retirement", &actor.id, 3U,
-                                      index_small_producer, (void *)"old", 0, 0,
-                                      &e),
-     &e);
-  ok(ps_root_namespace_acquire(root, "query/retirement", 0, &ns, &e), &e);
+  const unsigned char name[10] = {1U, LC_POUCH_INDEX_PACKED, 7U};
+  ok(ps_root_namespace_acquire(root, "query/retirement", 1, &ns, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
+  actor.ns = ns;
+  actor.owner = identity.owner;
+  ok(ps_query_artifact_replace(ns, identity.owner, name, sizeof(name), 3U,
+                               index_small_producer, (void *)"old", NULL, NULL,
+                               &e),
+     &e);
   ok(ps_catalog_visit(ps_root_space(root), identity.owner,
                       PS_CATALOG_PROJECTION, index_capture_binding, &binding,
                       &e),
      &e);
-  ps_namespace_release(ns);
   ok(ps_owned_open(ps_root_space(root), NULL, binding.stream, 0,
                    &binding.target, &retiring, &status, &e),
      &e);
   lc_pouch_index_input unavailable = {0};
-  REQUIRE(ps_query_index_store_ops.open(root, "query/retirement", &actor.id,
-                                        &unavailable, &e) == LC_ERR_INVALID);
+  REQUIRE(ps_query_artifact_open(ns, identity.owner, name, sizeof(name),
+                                 &unavailable, &e) == LC_ERR_INVALID);
   REQUIRE(!unavailable.signature.present);
   clear(&e);
   ps_owned_close(retiring);
   retiring = NULL;
   REQUIRE(!pthread_create(&thread, NULL, index_captured_open, &actor));
   index_gate_wait(&gate.gate);
-  ok(ps_query_index_store_ops.remove(root, "query/retirement", &actor.id, &e),
+  ok(ps_query_artifact_remove(ps_root_space(root), identity.owner, name,
+                              sizeof(name), NULL, &e),
      &e);
   /* Hold the now-unbound physical head exactly as a concurrent retirement
    * admission may do. The earlier catalog view still protects its bytes. */
@@ -320,13 +334,231 @@ static void index_retirement_admission(const char *directory) {
   REQUIRE(!pthread_join(thread, NULL));
   ps_owned_close(retiring);
   REQUIRE(actor.result == LC_OK && !actor.input.signature.present);
-  ps_query_index_store_ops.close(root, &actor.input);
+  ps_query_artifact_close(root, &actor.input);
+  ps_namespace_release(ns);
   ok(ps_root_close(root, &e), &e);
   REQUIRE(!live && !unlink(path));
   index_gate_clear(&gate.gate);
   lc_error_cleanup(&e);
 }
+typedef struct index_revision_actor {
+  ps_root *root;
+  index_gate *gate;
+  lc_pouch_index_artifact_id generation, manifest;
+  lc_pouch_index_signature signature;
+  void *build;
+  int publishing, result;
+} index_revision_actor;
+static void *index_revision_run(void *context) {
+  index_revision_actor *actor = context;
+  lc_error e;
+  lc_error_init(&e);
+  if (!actor->publishing)
+    actor->result = ps_query_index_store_ops.prepare(
+        actor->root, "query/concurrent", &actor->generation, 8U,
+        index_paused_producer, actor->gate, 0, 16U, &actor->build,
+        &actor->signature, &e);
+  else
+    actor->result = ps_query_index_store_ops.publish(
+        actor->root, actor->build, "query/concurrent", &actor->manifest, 8U,
+        index_paused_producer, actor->gate, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void index_revision_selection(const char *directory) {
+  char path[1400];
+  lc_error e;
+  lc_error_init(&e);
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-revision", directory) <
+          (int)sizeof(path));
+  for (int sync = 0; sync < 2; ++sync) {
+    ps_root *root = NULL;
+    ps_root_options options = {0};
+    options.storage.durable_sync = sync;
+    ok(ps_root_open(path, 1, &options, &root, &e), &e);
+    index_gate gate;
+    index_gate_init(&gate);
+    index_revision_actor actor = {0};
+    actor.root = root;
+    actor.gate = &gate;
+    actor.generation.kind = LC_POUCH_INDEX_PACKED;
+    actor.generation.segmented = 1;
+    actor.generation.generation = 7U;
+    actor.manifest.kind = LC_POUCH_INDEX_MANIFEST;
+    ok(ps_query_index_store_ops.replace(
+           root, "query/concurrent", &actor.generation, 3U,
+           index_small_producer, (void *)"old", 0, 0, &e),
+       &e);
+    ok(ps_query_index_store_ops.replace(
+           root, "query/concurrent", &actor.manifest, 5U, index_small_producer,
+           (void *)"prior", 0, 0, &e),
+       &e);
+    lc_pouch_index_input old_generation = {0}, old_manifest = {0};
+    ok(ps_query_index_store_ops.open(root, "query/concurrent",
+                                     &actor.generation, &old_generation, &e),
+       &e);
+    ok(ps_query_index_store_ops.open(root, "query/concurrent", &actor.manifest,
+                                     &old_manifest, &e),
+       &e);
+    unsigned long generation_crc = index_input_crc(&old_generation, &e);
+    unsigned long manifest_crc = index_input_crc(&old_manifest, &e);
+    pthread_t builder, peer;
+    REQUIRE(!pthread_create(&builder, NULL, index_revision_run, &actor));
+    index_gate_wait(&gate);
+    index_raw_expect(root, &actor.generation, "old", &e);
+    index_raw_expect(root, &actor.manifest, "prior", &e);
+    index_actor sibling = {0};
+    sibling.root = root;
+    sibling.gate = &gate;
+    sibling.sibling = 1;
+    sibling.id = actor.generation;
+    ++sibling.id.generation;
+    REQUIRE(!pthread_create(&peer, NULL, index_actor_run, &sibling));
+    int independent = index_gate_release(&gate);
+    REQUIRE(!pthread_join(builder, NULL) && !pthread_join(peer, NULL));
+    REQUIRE(independent && actor.result == LC_OK && sibling.result == LC_OK);
+    REQUIRE(actor.signature.present && actor.signature.size == 8U &&
+            actor.signature.mtime != old_generation.signature.mtime);
+    /* A prepared identity can bind the manifest without selecting or reading
+     * the new generation. Even a peer checkpoint retains both old selections.
+     */
+    index_raw_expect(root, &actor.generation, "old", &e);
+    index_raw_expect(root, &actor.manifest, "prior", &e);
+    pthread_mutex_lock(&gate.mutex);
+    gate.entered = gate.release = gate.sibling_done = 0;
+    pthread_mutex_unlock(&gate.mutex);
+    actor.publishing = 1;
+    REQUIRE(!pthread_create(&builder, NULL, index_revision_run, &actor));
+    index_gate_wait(&gate);
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    index_raw_expect(root, &actor.generation, "old", &e);
+    index_raw_expect(root, &actor.manifest, "prior", &e);
+    ps_stats before = {0}, after = {0};
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    pthread_mutex_lock(&gate.mutex);
+    gate.release = 1;
+    pthread_cond_broadcast(&gate.changed);
+    pthread_mutex_unlock(&gate.mutex);
+    REQUIRE(!pthread_join(builder, NULL) && actor.result == LC_OK);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.syncs - before.syncs == 1U);
+    index_raw_expect(root, &actor.generation, "new tail", &e);
+    index_raw_expect(root, &actor.manifest, "new tail", &e);
+    ps_query_index_store_ops.dispose(root, actor.build);
+    actor.build = NULL;
+    ok(ps_checkpoint(ps_root_space(root), &e), &e);
+    REQUIRE(index_input_crc(&old_generation, &e) == generation_crc &&
+            index_input_crc(&old_manifest, &e) == manifest_crc);
+    ps_query_index_store_ops.close(root, &old_generation);
+    ps_query_index_store_ops.close(root, &old_manifest);
+    ok(ps_query_index_store_ops.prepare(
+           root, "query/concurrent", &actor.generation, 7U,
+           index_small_producer, (void *)"aborted", 0, 4U, &actor.build,
+           &actor.signature, &e),
+       &e);
+    REQUIRE(ps_query_index_store_ops.publish(
+                root, actor.build, "query/concurrent", &actor.manifest, 8U,
+                index_small_producer, (void *)"too long",
+                &e) == LC_ERR_INVALID);
+    clear(&e);
+    ps_query_index_store_ops.dispose(root, actor.build);
+    index_raw_expect(root, &actor.generation, "new tail", &e);
+    index_raw_expect(root, &actor.manifest, "new tail", &e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(!after.budgets && !after.private_bytes &&
+            !after.reserved_payload_bytes && !after.reserved_metadata_bytes &&
+            !after.reserved_entries);
+    ok(ps_root_close(root, &e), &e);
+    index_gate_clear(&gate);
+    REQUIRE(!live && !unlink(path));
+  }
+  lc_error_cleanup(&e);
+}
+typedef struct index_parallel_actor {
+  lc_client *client;
+  const char *ns;
+  int result;
+} index_parallel_actor;
+static void *index_parallel_flush(void *context) {
+  index_parallel_actor *actor = context;
+  lc_error e;
+  lc_pouch_generation sequence = 0;
+  lc_pouch_query_index_flush_result flushed = {0};
+  lc_error_init(&e);
+  actor->result = lc_pouch_state_query_index_seq(index_pouch(actor->client),
+                                                 actor->ns, &sequence, &e);
+  if (actor->result == LC_OK)
+    actor->result = lc_pouch_query_index_flush(
+        index_pouch(actor->client), actor->ns, sequence, &flushed, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void index_parallel_namespaces(const char *directory) {
+  char path[1400];
+  lc_error e;
+  lc_error_init(&e);
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-parallel", directory) <
+          (int)sizeof(path));
+  index_gate gate;
+  index_gate_init(&gate);
+  ps_io io = {&gate,
+              index_gate_read,
+              index_gate_write,
+              index_gated_sync,
+              index_gate_reserve,
+              NULL};
+  lc_client *client = index_client(path, 0, 1, 1, &io, &e);
+  const char *names[] = {"query/parallel-a", "query/parallel-b"};
+  index_parallel_actor actors[2] = {{client, names[0], -1},
+                                    {client, names[1], -1}};
+  for (size_t i = 0; i < 2; ++i)
+    index_put_in(client, names[i], "one", "{\"v\":1}", &e);
+  pthread_mutex_lock(&gate.mutex);
+  gate.armed = 1;
+  pthread_mutex_unlock(&gate.mutex);
+  pthread_t threads[2];
+  REQUIRE(!pthread_create(&threads[0], NULL, index_parallel_flush, &actors[0]));
+  index_gate_wait(&gate);
+  REQUIRE(!pthread_create(&threads[1], NULL, index_parallel_flush, &actors[1]));
+  struct timespec deadline;
+  REQUIRE(!clock_gettime(CLOCK_REALTIME, &deadline));
+  deadline.tv_sec += 5;
+  pthread_mutex_lock(&gate.mutex);
+  int waited = 0;
+  while (!gate.peer_payload && !waited)
+    waited = pthread_cond_timedwait(&gate.changed, &gate.mutex, &deadline);
+  int progressed = gate.peer_payload;
+  gate.release = 1;
+  pthread_cond_broadcast(&gate.changed);
+  pthread_mutex_unlock(&gate.mutex);
+  REQUIRE(!pthread_join(threads[0], NULL) && !pthread_join(threads[1], NULL));
+  REQUIRE(progressed && actors[0].result == LC_OK && actors[1].result == LC_OK);
+  for (size_t i = 0; i < 2; ++i)
+    REQUIRE(index_query_in(client, names[i], "index", "{\"exists\":\"/v\"}",
+                           &e) == 1U);
+  lc_client_close(client);
+  REQUIRE(!live);
+  client = index_client(path, 0, 0, 1, NULL, &e);
+  for (size_t i = 0; i < 2; ++i) {
+    lc_pouch_generation state = 0, indexed = 0;
+    ok(lc_pouch_state_query_index_seq(index_pouch(client), names[i], &state,
+                                      &e),
+       &e);
+    ok(lc_pouch_query_index_manifest_seq(index_pouch(client), names[i],
+                                         &indexed, &e),
+       &e);
+    REQUIRE(state && state == indexed);
+    REQUIRE(index_query_in(client, names[i], "index", "{\"exists\":\"/v\"}",
+                           &e) == 1U);
+  }
+  lc_client_close(client);
+  REQUIRE(!live && !unlink(path));
+  index_gate_clear(&gate);
+  lc_error_cleanup(&e);
+}
 static void index_concurrency(const char *directory) {
+  index_parallel_namespaces(directory);
+  index_revision_selection(directory);
   index_visibility(directory);
   index_retirement_admission(directory);
   char path[1400];
@@ -359,28 +591,30 @@ static void index_concurrency(const char *directory) {
   unsigned long crc = index_input_crc(&pinned, &e);
   ps_namespace *ns = NULL;
   ps_namespace_info identity;
-  ps_catalog_info binding = {0};
-  ps_owned_status inspected;
+  ps_ref target;
+  uint64_t observed_bytes;
+  int present;
   ok(ps_root_namespace_acquire(root, "query/concurrent", 0, &ns, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
-  ok(ps_catalog_visit(ps_root_space(root), identity.owner,
-                      PS_CATALOG_PROJECTION, index_capture_binding, &binding,
-                      &e),
+  ps_key physical = {identity.owner, 1U,
+                     PS_QUERY_FIRST + 2U * LC_POUCH_INDEX_PACKED + 1U};
+  ok(ps_value_info(ps_root_space(root), physical, &target, &observed_bytes,
+                   &present, &e),
      &e);
   ps_namespace_release(ns);
-  ok(ps_owned_inspect(ps_root_space(root), binding.stream, &binding.target,
-                      &inspected, &e),
-     &e);
-  REQUIRE(inspected.sealed && inspected.tail == 3U);
-  ps_ref stale = binding.target;
+  REQUIRE(present && observed_bytes == 3U);
+  ps_reader *rejected = NULL;
+  ps_ref stale = target;
   ++stale.incarnation;
-  REQUIRE(ps_owned_inspect(ps_root_space(root), binding.stream, &stale,
-                           &inspected, &e) == LC_ERR_INVALID);
+  REQUIRE(ps_read_open(ps_root_space(root), physical, &stale, &rejected, &e) ==
+              LC_ERR_INVALID &&
+          !rejected);
   clear(&e);
-  stale = binding.target;
+  stale = target;
   stale.container[0] ^= 1U;
-  REQUIRE(ps_owned_inspect(ps_root_space(root), binding.stream, &stale,
-                           &inspected, &e) == LC_ERR_INVALID);
+  REQUIRE(ps_read_open(ps_root_space(root), physical, &stale, &rejected, &e) ==
+              LC_ERR_INVALID &&
+          !rejected);
   clear(&e);
   pthread_t threads[2];
   REQUIRE(!pthread_create(&threads[0], NULL, index_actor_run, &actors[0]));
@@ -390,6 +624,9 @@ static void index_concurrency(const char *directory) {
   int independent = index_gate_release(&gate);
   REQUIRE(!pthread_join(threads[0], NULL));
   REQUIRE(!pthread_join(threads[1], NULL));
+  if (!independent || actors[0].result != LC_OK || actors[1].result != LC_OK)
+    fprintf(stderr, "index sync gate independent=%d publisher=%d sibling=%d\n",
+            independent, actors[0].result, actors[1].result);
   REQUIRE(independent && actors[0].result == LC_OK &&
           actors[1].result == LC_OK);
   index_raw_expect(root, &actors[0].id, "new tail", &e);
@@ -398,16 +635,18 @@ static void index_concurrency(const char *directory) {
      &e);
   ok(ps_checkpoint(ps_root_space(root), &e), &e);
   REQUIRE(crc == index_input_crc(&pinned, &e));
+  ps_stats held = {0}, released = {0};
+  ok(ps_status(ps_root_space(root), &held, &e), &e);
   REQUIRE(ps_root_close(root, &e) == LC_ERR_INVALID);
   clear(&e);
   REQUIRE(crc == index_input_crc(&pinned, &e));
   ps_query_index_store_ops.close(root, &pinned);
-  uint64_t reclaimed = 0U, skipped = 0U;
-  ok(ps_root_reclaim_orphans(root, &reclaimed, &skipped, &e), &e);
-  REQUIRE(reclaimed > 0U);
-  REQUIRE(ps_owned_inspect(ps_root_space(root), binding.stream, &binding.target,
-                           &inspected, &e) == LC_ERR_INVALID);
-  clear(&e);
+  ok(ps_status(ps_root_space(root), &released, &e), &e);
+  REQUIRE(released.retired_bytes < held.retired_bytes);
+  ok(ps_value_info(ps_root_space(root), physical, &target, &observed_bytes,
+                   &present, &e),
+     &e);
+  REQUIRE(!present);
   ok(ps_root_close(root, &e), &e);
   REQUIRE(!unlink(path));
   index_gate_clear(&gate);

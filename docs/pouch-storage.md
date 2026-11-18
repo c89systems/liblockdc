@@ -1665,8 +1665,11 @@ reopened handles, shared roots, and cache-allocation failure use the normal
 validated packed-artifact decoder. No cache retains source JSON or full
 document bodies.
 
-Exclusive roots serialize derived artifact publication with a root-local flush
-mutex. Shared roots instead hold the root durable-mutation guard from the
+Native multifile exclusive roots serialize derived artifact publication with a
+root-local flush mutex. The experimental single-file owner uses per-namespace
+publication authority and selects generation plus manifest in one immutable
+revision. Its shared-root coordination remains unfinished. Native shared roots
+hold the root durable-mutation guard from the
 high-water sequence sample through artifact and manifest
 publication. This serializes competing Pouch handles and processes, so their
 read-modify-write manifest updates and derived artifact writes cannot race.

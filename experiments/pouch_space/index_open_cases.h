@@ -2,6 +2,45 @@
 #define POUCH_SPACE_INDEX_OPEN_CASES_H
 #include "index_cases.h"
 
+static size_t index_namespace_mutex_faults(const char *directory) {
+  char path[1400];
+  lc_error e;
+  lc_error_init(&e);
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-namespace-mutex", directory) <
+          (int)sizeof(path));
+  size_t cuts = 0;
+  for (int sync = 0; sync < 2; ++sync) {
+    size_t sites = 0;
+    for (size_t cut = 0; cut <= sites; ++cut)
+      for (int no_error = 0; no_error < (cut ? 2 : 1); ++no_error) {
+        lc_client *client = index_client(path, sync, 1, 1, NULL, &e);
+        lc_pouch_index_artifact *artifact = index_artifact(
+            client, "query/admission", LC_POUCH_INDEX_PACKED, 1, &e);
+        mutex_init_calls = 0;
+        mutex_init_fail = cut;
+        mutex_init_armed = 1;
+        int rc = lc_pouch_index_artifact_write(artifact, "one", 3, 1, 0,
+                                               no_error ? NULL : &e);
+        mutex_init_armed = 0;
+        if (!cut) {
+          ok(rc, &e);
+          sites = mutex_init_calls;
+          REQUIRE(sites);
+        } else {
+          REQUIRE(mutex_init_calls >= cut && rc == LC_ERR_TRANSPORT);
+          clear(&e);
+          ++cuts;
+        }
+        ok(lc_pouch_index_artifact_write(artifact, "retry", 5, 0, 0, &e), &e);
+        index_artifact_expect(artifact, "retry", 5, &e);
+        lc_free_with_allocator(&allocator, artifact);
+        lc_client_close(client);
+        REQUIRE(!live && !unlink(path));
+      }
+  }
+  lc_error_cleanup(&e);
+  return cuts;
+}
 static void index_open_faults(const char *directory) {
   char path[1400];
   lc_error e;
@@ -77,7 +116,9 @@ static void index_open_faults(const char *directory) {
     REQUIRE(!live);
     REQUIRE(!unlink(path));
   }
-  printf("index startup allocation/mutex cuts=%zu passed\n", cuts);
+  cuts += index_namespace_mutex_faults(directory);
+  printf("index startup and namespace allocation/mutex cuts=%zu passed\n",
+         cuts);
   lc_error_cleanup(&e);
 }
 #endif

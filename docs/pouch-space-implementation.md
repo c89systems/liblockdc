@@ -66,24 +66,20 @@ select the complete revision. Independent namespaces must be able to prepare
 work concurrently and share durability work without waiting for unrelated
 producers or acknowledging incomplete prefixes.
 
-The current namespace writer already packs document/posting components into
-one generation artifact. It then publishes that artifact and its manifest
-separately through stream sealing and catalog selection. The container adapter
-ignores the logical writer's `unpublished` hint, and each structural selection
-waits for durability even under NoSync. The common flush mutex additionally
-serializes namespace flushes across a root. These are concrete architectural
-constraints, not proof that inverted indexes or immutable generations are
-incompatible with one file.
+The namespace writer packs document/posting components into one generation.
+The original container adapter selected that generation and its manifest
+separately through stream sealing and catalog selection, with 6-9 measured
+barriers per writer and root-wide flush serialization. The implemented
+[namespace revision owner](#namespace-index-revision-owner) now prepares both
+values privately and selects them together. The measurements isolated this
+publication cost; they did not establish that inverted indexes are incompatible
+with one file.
 
-The next indexing surface should replace independent artifact publication with
-container revision publication, including recovery, immutable reader capture,
-failed-build cleanup, pruning and capacity admission. Do not merely remove the
-current seal/catalog barriers: recovery currently relies on their ordering.
-Choose generation bundling, incremental postings and cache reuse according to
-measured build, selection and read costs; retaining current artifact interfaces
-is not an acceptance condition. Isolate flush, first query pass and repeated
-query pass before choosing that layout. Preserve an equivalent matched baseline
-so changing the algorithm cannot hide work in close, reopen or deferred rebuild.
+Choose further generation bundling, incremental postings and cache reuse from
+measured build, selection and read costs. Retaining current artifact interfaces
+is not an acceptance condition. Preserve the matched baseline and separate
+flush, first query pass, repeated query pass, close and cold reopen so that
+changing the algorithm cannot hide deferred work.
 
 ### Implementation and acceptance order
 
@@ -2397,8 +2393,8 @@ performance.
 
 This surface qualifies exclusive XA journal/coordinator behavior. The optional
 PostgreSQL provider is OFF in these builds; real SQL-driver/server qualification
-remains part of deployment acceptance. Indexed queries, resumable codec
-conversion and shared-root coordination/recovery remain unfinished. The
+remains part of deployment acceptance. Indexed queries are integrated below;
+resumable codec conversion and shared-root coordination/recovery remain unfinished. The
 incremental-checkpoint/protected-capacity architecture remains unimplemented; full
 snapshots can still require foreground free space. Existing-root conversion
 remains outside the initial implementation, and production cutover still
@@ -2412,7 +2408,7 @@ guards, freshness and caches through typed immutable artifact owners. The
 namespace query algorithms and generation/manifest formats are unchanged.
 Native files have their own adapter; the common engine no longer interprets
 artifact paths or filesystem timestamps. Container signatures use immutable
-stream identity/incarnation facts in the existing manifest witness fields.
+value or stream identity/incarnation facts in the existing manifest witness fields.
 Bindings use binary domain identities under the actual namespace or collection
 owner, with no synthetic namespaces or persistent sidecars.
 
@@ -2423,11 +2419,12 @@ Application bodies still flow through bounded producer/consumer buffers. An
 owner admits the complete encoded bound before invoking its producer and never
 selects a partial artifact or grows the container implicitly. Captured inputs
 remain readable across replacement, pruning and checkpoint and retain their
-namespace/root until close. A publisher shares its sealed stream owner before
-catalog visibility, so an immediate reader can open it before publication
-returns. A reader racing removal rechecks the catalog revision and falls back
-to canonical evaluation; an unchanged invalid target, allocation failure or
-transport failure remains an error.
+namespace/root until close. Namespace indexes now use the typed value owner
+described below. Collection pages retain their sealed-stream owner: a publisher
+shares it before catalog visibility so an immediate reader can open it before
+publication returns. A collection reader racing removal rechecks its catalog
+revision and falls back to canonical evaluation. Allocation and transport
+failures remain errors.
 
 Collection publication rechecks the recovered epoch and canonical page rows
 under metadata authority. Receiver refresh observes a peer's committed tail,
@@ -2603,15 +2600,17 @@ PUT descriptors and their consecutive journal sequences. It contains metadata,
 never concatenated application values. The complete descriptor frame must fit
 the existing 128 KiB journal; this is an internal publication-primitive bound,
 not a new public transaction limit. Existing canonical compound-stream framing
-remains in use. Recovery validates every member descriptor and every referenced
-payload before admitting any member. An incomplete or invalid candidate admits
+remains in use. Recovery validates every member descriptor and every canonical
+payload before admitting any member. Derived query payloads use the separate
+validation/rebuild boundary described below. An incomplete or invalid candidate admits
 none, even when its first inner PUT is complete and valid. Checkpointing selects
 the resulting entries through the existing directory/root protocol; there is
 no second log, allocator, decision authority or pathname layer.
 
 Runtime selection installs the whole revision under metadata authority and
-advances readiness once. Durable roots, and revisions containing an always-durable
-CONTROL member, expose and acknowledge only the completed shared prefix. This
+advances readiness once. Durable roots, explicitly durable revisions and
+revisions containing an always-durable CONTROL member expose and acknowledge
+only the completed shared prefix. This
 also covers non-CONTROL members on a NoSync root: their volatile visibility
 obligation prevents a partially visible revision while the barrier is pending.
 Plain NoSync revisions expose complete selection without an added sync. A
@@ -2649,15 +2648,124 @@ The scoped qualification is in `build/pouch-space-revision/`:
   suppressions or owned descriptors (`qualification-memcheck.log`,
   `memcheck-*.log`). Intentional process deaths remain separate.
 
-This completes the physical publication primitive. Namespace and collection
-index owners still use their prior sealed-stream/catalog path, so the measured
-index performance gap has not changed yet. The next integration must fund and
-prepare generation plus manifest together, capture the private signature, select
-them through this revision protocol, and adapt reader/pruning/recovery ownership
-as one coherent surface. Incremental canonical checkpoints, bounded relocation,
+This completes the physical publication primitive. The namespace integration
+below now funds generation plus manifest together and selects them through this
+protocol. Collection pages retain their sealed-stream/catalog owner.
+Incremental canonical checkpoints, bounded relocation,
 standing maintenance admission, codec conversion, shared-root coordination and
 deployment acceptance remain unfinished. No public API/ABI or production-open
 selection changes; the experimental format marker is unchanged.
+
+### Namespace index revision owner
+
+Namespace generations and manifests now occupy typed immutable values scoped to
+the actual namespace owner. Preparing a generation reserves its complete encoded
+bound plus a conservative manifest bound before running its producer. Its exact
+private signature enters the manifest without selecting either value. One
+`ps_revision_publish` selects both. Failed preparation disposes private writers
+and their budget; pruning removes exact captured incarnations and cannot delete
+a replacement selected during traversal. Captured range readers retain their
+old immutable bytes across replacement, pruning and checkpoint.
+
+Publication authority is per namespace for the container; native multifile
+publication retains its root-local mutex. Independent namespaces can prepare
+and issue payload I/O while another namespace waits at its durability barrier.
+Successful index flush still stabilizes its captured canonical state on NoSync
+roots. The revision therefore explicitly requests durability under both policies;
+removing that barrier lost acknowledged state in the deterministic lost-payload
+model. Ordinary canonical NoSync mutations keep their existing policy.
+
+Derived payload corruption must not invalidate later canonical journal records.
+Recovery checks query descriptors and frame integrity and claims their physical
+ownership, but defers their payload CRCs to the query-value validation/reader
+boundary. The first recovered signature check validates immutable payloads and
+memoizes the result. Bad derived bytes appear absent to manifest validation and
+are rebuilt from canonical state, including when the manifest and watermark
+themselves are unchanged. Canonical payload verification is unchanged. Scratch
+allocation failure remains retryable; transport failure retains ordinary poison
+semantics. Repeated warm signatures do not reread the entire generation.
+
+Concurrent qualification exposed an unsynchronized shared generation-cache LRU:
+four query workers could create a cycle during resident promotion. Packed cache
+access now has an ownership mutex and copies components before releasing that
+ownership. Parsed generation misses load privately, recheck admission under the
+mutex, and retain a borrow until posting evaluation finishes. Eviction skips
+borrowed generations. A deterministic regression pauses one query, completes
+peer queries beyond cache capacity, resumes the pinned query and then exercises
+parallel misses/promotions/evictions. It runs against both backends. Namespace
+build/publication and posting evaluation remain outside this cache mutex.
+
+The matched plaintext GNU Release initial-build matrix completes **96 verified
+rows / 48 pairs**. Ratios are **container/native**, using the median of three
+samples for each configuration, then the median across configurations:
+
+| Phase | Ratio range | Median |
+| --- | ---: | ---: |
+| Validating flush wall time | 1.77-12.32x | 5.49x |
+| First three-query pass | 0.67-2.05x | 1.17x |
+| Repeated three-query pass | 0.50-3.05x | 0.95x |
+| Flush CPU on executing threads | 0.75-1.07x | 0.94x |
+| Whole work, NoSync | 1.65-3.29x | 2.53x |
+| Whole work, durable | 0.64-1.28x | 0.78x |
+| Cold reopen and verification | 1.53-3.44x | 2.48x |
+
+Median flush barrier counts are one for one writer and two across four writers,
+with neither query pass issuing a barrier. This substantially reduces the prior
+22.68x median flush ratio while leaving a real NoSync and reopen gap. Work includes
+the existing common cleanup and container checkpoint; close remains separate.
+The result does not establish large-store scaling or production acceptance.
+Raw evidence is `build/pouch-space-index-revision/paired-performance.log` and
+`paired-summary.json`; the interrupted pre-repair run and parent-debugger stacks
+are retained there too. The reference workload, selectors and streaming body
+checks are unchanged.
+
+The separate repeated-update matrix also completes **96 verified rows / 48
+pairs**, with four lease/update/read and validating-flush rounds on the same
+keys. Every round must advance the published index sequence and return exact
+indexed results; final cold reopen verifies that selected sequence and every
+streamed body. Phase times accumulate across the four rounds before taking
+worker maxima. Both engines use the same loop and fixed 10 MiB capacity bound.
+Whole-work container/native ratios are **1.51-3.78x, median 2.50x** under NoSync
+and **0.74-0.97x, median 0.83x** under durable policy. Flush ratios are
+**2.51-19.14x, median 7.47x**; first/repeated query pass medians are **1.13x /
+1.04x**. This is repeated small-store replacement, not long-duration or
+large-store qualification. Evidence is `paired-churn-performance.log` and
+`paired-churn-summary.json` in the same stage. All 12 initial/churn Debug
+comparison groups pass (`churn-debug.log`).
+
+The complete pre-cache-repair Debug gate passed **70 groups**, including **1,770
+I/O cuts**, **3,060 allocation cuts**, **1,276 exec process deaths**, all codec/
+policy SDK combinations and the physical revision models
+(`qualification-debug.log`, `qualification-debug-test.log`). The affected
+post-repair gate passed **28 groups**, including **357 native Pouch cases**, all
+**51 namespace SDK cases x eight configurations**, startup failure/retry,
+allocation and publication concurrency controls, comparisons and five boundary/
+API/editor checks (`cache-repair-debug.log`, `cache-repair-debug-test.log`).
+Unchanged physical/recovery and process-death proof is retained from the first
+gate. Debug uses 128 KiB workers with the glibc stack cache disabled.
+
+GNU and native musl Release each pass **53 selected groups**, including all
+eight namespace and collection SDK configurations, initial/churn comparisons,
+typed-owner capacity/concurrency/recovery cases, five revision groups and native
+portability controls (`qualification-{gnu,musl}.log` and their `-test.log`
+readbacks). Release uses ordinary platform worker stacks. Seven targeted
+ThreadSanitizer invocations pass with instrumented OpenSSL **3.6.5**, 128 KiB
+workers and no suppressions (`qualification-tsan.log`). Nine Memcheck invocations
+pass with **166,235 allocations/frees**, zero live heap, errors, suppressions or
+owned descriptors (`qualification-memcheck.log`, `memcheck-[1-9].log`). These
+checks cover the new generation-cache borrow/eviction regression, parallel
+canonical writes/queries/publication, invalidation, operation watermarks and
+lost/corrupt derived generations.
+
+This is the namespace-index publication/reader/recovery cutover. It adds no
+public API or production backend selector, changes no independently versioned
+format marker and supplies no migration; recreate private experimental fixtures.
+Collection pages still require their sealed owner. Typed-value traversal still
+scans the resident physical bucket table, and the revision descriptor has its
+existing bounded size; this evidence does not qualify unbounded generations.
+Incremental canonical checkpoints, bounded relocation, standing maintenance
+admission, codec conversion and process-shared roots remain unfinished. The
+complete backend goal remains active.
 
 ### Root and namespace ownership
 
@@ -2694,7 +2802,7 @@ projection, ordinary mutation policy, read-many, visits and paged scan/body
 snapshots, staged/prepared mutations and the SDK call envelope above. Leased
 state, expiry, public collection ownership and explicit/background maintenance
 use the typed owners described above. Live stages defer ordinary compaction;
-indexed queries still require integration. Exclusive external XA journal and
+indexed queries use the owners described above too. Exclusive external XA journal and
 coordinator behavior now use the common engine described above. Normal
 `lc_pouch_open` uses
 multifile roots. The experimental owner retains exclusive physical open

@@ -64,7 +64,8 @@ int lc_pouch_index_metadata_decode(lc_pouch *, const lc_pouch_index_input *,
  * unpublished permits a native direct build only when no manifest names it.
  * durable forces invalidation before canonical topology retirement. Prune
  * preserves the manifest and named generations; interrupted unbound builds
- * remain the physical owner's responsibility. No callback holds root locks. */
+ * remain the physical owner's responsibility. Root/allocator metadata locks
+ * never span producers. Publication authority belongs to the owner's domain. */
 typedef struct lc_pouch_index_store_ops {
   int (*open)(void *, const char *, const lc_pouch_index_artifact_id *,
               lc_pouch_index_input *, lc_error *);
@@ -77,6 +78,21 @@ typedef struct lc_pouch_index_store_ops {
   int (*signature)(void *, const char *, const lc_pouch_index_artifact_id *,
                    lc_pouch_index_signature *, lc_error *);
   int (*prune)(void *, const char *, const uint64_t *, size_t, lc_error *);
+  /* Prepare private generation bytes and their stable signature, admitting
+   * both the generation and a conservative manifest bound before production.
+   * Publish selects them as one logical revision; dispose always releases the
+   * build, after success or failure. The native reference retains its normal
+   * temporary-file/manifest protocol through these same capabilities. */
+  int (*prepare)(void *, const char *, const lc_pouch_index_artifact_id *,
+                 uint64_t, lc_pouch_index_produce_fn, void *, int,
+                 uint64_t manifest_bound, void **, lc_pouch_index_signature *,
+                 lc_error *);
+  int (*publish)(void *, void *, const char *,
+                 const lc_pouch_index_artifact_id *, uint64_t,
+                 lc_pouch_index_produce_fn, void *, lc_error *);
+  void (*dispose)(void *, void *);
+  int (*acquire)(void *, const char *, void **, lc_error *);
+  void (*release)(void *, void *);
 } lc_pouch_index_store_ops;
 
 /* One owned logical reference, allocated in the Pouch allocator. Free with
@@ -110,5 +126,18 @@ int lc_pouch_index_artifact_write(const lc_pouch_index_artifact *, const char *,
 int lc_pouch_index_artifact_remove(const lc_pouch_index_artifact *, lc_error *);
 int lc_pouch_index_artifacts_prune(lc_pouch *, const char *, const uint64_t *,
                                    size_t, lc_error *);
+typedef struct lc_pouch_index_revision lc_pouch_index_revision;
+int lc_pouch_index_revision_prepare(const lc_pouch_index_artifact *,
+                                    const char *, size_t, int unpublished,
+                                    uint64_t manifest_bound,
+                                    lc_pouch_index_revision **,
+                                    lc_pouch_index_signature *, lc_error *);
+int lc_pouch_index_revision_publish(lc_pouch_index_revision *,
+                                    const lc_pouch_index_artifact *,
+                                    const char *, size_t, lc_error *);
+void lc_pouch_index_revision_dispose(lc_pouch_index_revision *);
+int lc_pouch_index_publication_acquire(lc_pouch *, const char *, void **,
+                                       lc_error *);
+void lc_pouch_index_publication_release(lc_pouch *, void *);
 extern const lc_pouch_index_store_ops lc_pouch_index_file_ops;
 #endif

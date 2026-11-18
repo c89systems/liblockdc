@@ -29,6 +29,28 @@ static const lc_pouch_index_store_ops *store(lc_pouch *pouch, void **context) {
                                                  context)
              : NULL;
 }
+int lc_pouch_index_publication_acquire(lc_pouch *pouch, const char *ns,
+                                       void **guard, lc_error *e) {
+  const lc_pouch_index_store_ops *ops;
+  void *context;
+  if (guard)
+    *guard = NULL;
+  if (!pouch || !ns || !guard)
+    return failure(e, LC_ERR_INVALID, "query publication requires namespace");
+  ops = store(pouch, &context);
+  if (!ops || !ops->acquire || !ops->release)
+    return failure(e, LC_ERR_UNSUPPORTED,
+                   "query publication owner unavailable");
+  return ops->acquire(context, ns, guard, e);
+}
+void lc_pouch_index_publication_release(lc_pouch *pouch, void *guard) {
+  const lc_pouch_index_store_ops *ops;
+  void *context;
+  if (!pouch || !guard)
+    return;
+  ops = store(pouch, &context);
+  ops->release(context, guard);
+}
 int lc_pouch_index_artifact_kind(const char *leaf, unsigned int *kind) {
   unsigned int i;
   if (!leaf || !kind)
@@ -395,6 +417,29 @@ static int produce(void *context, lc_sink *sink, lc_error *e) {
                                         p->bytes, p->length, p->encrypted, sink,
                                         e);
 }
+static int producer_init(const lc_pouch_index_artifact *artifact,
+                         const char *bytes, size_t length, artifact_producer *p,
+                         char **binding, uint64_t *bound, lc_error *e) {
+  int rc;
+  *binding = NULL;
+  if (!artifact || (!bytes && length))
+    return failure(e, LC_ERR_INVALID, "query-index replacement requires bytes");
+  memset(p, 0, sizeof(*p));
+  p->artifact = artifact;
+  p->bytes = bytes ? bytes : "";
+  p->length = length;
+  p->encrypted = artifact->id.kind != LC_POUCH_INDEX_MANIFEST &&
+                 lc_pouch_crypto_enabled(artifact->pouch->crypto);
+  rc = lc_pouch_index_metadata_bound(artifact->pouch, length, p->encrypted,
+                                     bound, e);
+  if (rc == LC_OK && p->encrypted) {
+    *binding = binding_context(artifact, e);
+    if (!*binding)
+      return LC_ERR_NOMEM;
+    p->binding = *binding;
+  }
+  return rc;
+}
 int lc_pouch_index_artifact_write(const lc_pouch_index_artifact *artifact,
                                   const char *bytes, size_t length,
                                   int unpublished, int durable, lc_error *e) {
@@ -409,25 +454,87 @@ int lc_pouch_index_artifact_write(const lc_pouch_index_artifact *artifact,
   ops = store(artifact->pouch, &context);
   if (!ops)
     return failure(e, LC_ERR_UNSUPPORTED, "query-index owner is unavailable");
-  memset(&p, 0, sizeof(p));
-  p.artifact = artifact;
-  p.bytes = bytes ? bytes : "";
-  p.length = length;
-  p.encrypted = artifact->id.kind != LC_POUCH_INDEX_MANIFEST &&
-                lc_pouch_crypto_enabled(artifact->pouch->crypto);
-  rc = lc_pouch_index_metadata_bound(artifact->pouch, length, p.encrypted,
-                                     &bound, e);
-  if (rc != LC_OK)
-    return rc;
-  if (p.encrypted) {
-    binding = binding_context(artifact, e);
-    if (!binding)
-      return LC_ERR_NOMEM;
-    p.binding = binding;
-  }
-  rc = ops->replace(context, artifact->ns, &artifact->id, bound, produce, &p,
-                    unpublished, durable, e);
+  rc = producer_init(artifact, bytes, length, &p, &binding, &bound, e);
+  if (rc == LC_OK)
+    rc = ops->replace(context, artifact->ns, &artifact->id, bound, produce, &p,
+                      unpublished, durable, e);
   lc_free_with_allocator(&artifact->pouch->allocator, binding);
+  return rc;
+}
+struct lc_pouch_index_revision {
+  const lc_pouch_index_artifact *generation;
+  const lc_pouch_index_store_ops *ops;
+  void *context, *build;
+  int finished;
+};
+void lc_pouch_index_revision_dispose(lc_pouch_index_revision *revision) {
+  if (!revision)
+    return;
+  revision->ops->dispose(revision->context, revision->build);
+  lc_free_with_allocator(&revision->generation->pouch->allocator, revision);
+}
+int lc_pouch_index_revision_prepare(const lc_pouch_index_artifact *generation,
+                                    const char *bytes, size_t length,
+                                    int unpublished, uint64_t manifest_bound,
+                                    lc_pouch_index_revision **out,
+                                    lc_pouch_index_signature *signature,
+                                    lc_error *e) {
+  lc_pouch_index_revision *revision;
+  const lc_pouch_index_store_ops *ops;
+  artifact_producer p;
+  void *context;
+  char *binding = NULL;
+  uint64_t bound = 0;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!out || !signature || !generation ||
+      generation->id.kind != LC_POUCH_INDEX_PACKED)
+    return failure(e, LC_ERR_INVALID, "revision requires a packed generation");
+  memset(signature, 0, sizeof(*signature));
+  ops = store(generation->pouch, &context);
+  if (!ops || !ops->prepare || !ops->publish || !ops->dispose)
+    return failure(e, LC_ERR_UNSUPPORTED, "query revision owner unavailable");
+  revision = lc_calloc_with_allocator(&generation->pouch->allocator, 1,
+                                      sizeof(*revision));
+  if (!revision)
+    return failure(e, LC_ERR_NOMEM, "cannot allocate query-index revision");
+  revision->generation = generation;
+  revision->ops = ops;
+  revision->context = context;
+  rc = producer_init(generation, bytes, length, &p, &binding, &bound, e);
+  if (rc == LC_OK)
+    rc = ops->prepare(context, generation->ns, &generation->id, bound, produce,
+                      &p, unpublished, manifest_bound, &revision->build,
+                      signature, e);
+  lc_free_with_allocator(&generation->pouch->allocator, binding);
+  if (rc == LC_OK)
+    *out = revision;
+  else
+    lc_pouch_index_revision_dispose(revision);
+  return rc;
+}
+int lc_pouch_index_revision_publish(lc_pouch_index_revision *revision,
+                                    const lc_pouch_index_artifact *manifest,
+                                    const char *bytes, size_t length,
+                                    lc_error *e) {
+  artifact_producer p;
+  char *binding = NULL;
+  uint64_t bound = 0;
+  int rc;
+  if (!revision || revision->finished || !manifest ||
+      manifest->pouch != revision->generation->pouch ||
+      strcmp(manifest->ns, revision->generation->ns) ||
+      manifest->id.kind != LC_POUCH_INDEX_MANIFEST)
+    return failure(e, LC_ERR_INVALID,
+                   "revision requires its namespace manifest");
+  revision->finished = 1;
+  rc = producer_init(manifest, bytes, length, &p, &binding, &bound, e);
+  if (rc == LC_OK)
+    rc =
+        revision->ops->publish(revision->context, revision->build, manifest->ns,
+                               &manifest->id, bound, produce, &p, e);
+  lc_free_with_allocator(&manifest->pouch->allocator, binding);
   return rc;
 }
 int lc_pouch_index_artifact_remove(const lc_pouch_index_artifact *artifact,

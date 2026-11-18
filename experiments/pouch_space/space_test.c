@@ -7014,6 +7014,9 @@ int main(int argc, char **argv) {
       revision_rollover();
     } else if (strcmp(argv[2], "revision-concurrency") == 0) {
       revision_concurrency();
+    } else if (strcmp(argv[2], "revision-values") == 0) {
+      revision_values();
+      revision_derived_recovery();
     } else if (strcmp(argv[2], "revision-process") == 0) {
       revision_processes(argv[1]);
     } else if (strcmp(argv[2], "revision-crash-child") == 0) {

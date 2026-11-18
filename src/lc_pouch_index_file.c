@@ -280,6 +280,53 @@ static int file_prune(void *context, const char *ns, const uint64_t *keep,
   lc_free_with_allocator(&pouch->allocator, path);
   return rc;
 }
+static int file_prepare(void *context, const char *ns,
+                        const lc_pouch_index_artifact_id *id, uint64_t bound,
+                        lc_pouch_index_produce_fn produce, void *producer,
+                        int unpublished, uint64_t manifest_bound, void **build,
+                        lc_pouch_index_signature *signature, lc_error *e) {
+  int rc;
+  *build = NULL;
+  (void)manifest_bound;
+  rc = file_replace(context, ns, id, bound, produce, producer, unpublished, 0,
+                    e);
+  return rc == LC_OK ? file_signature(context, ns, id, signature, e) : rc;
+}
+static int file_publish(void *context, void *build, const char *ns,
+                        const lc_pouch_index_artifact_id *id, uint64_t bound,
+                        lc_pouch_index_produce_fn produce, void *producer,
+                        lc_error *e) {
+  (void)build;
+  return file_replace(context, ns, id, bound, produce, producer, 0, 0, e);
+}
+static void file_dispose(void *context, void *build) {
+  (void)context;
+  (void)build;
+}
+static int file_acquire(void *context, const char *ns, void **out,
+                        lc_error *e) {
+  lc_pouch *pouch = context;
+  int rc;
+  (void)ns;
+  *out = NULL;
+  if (!pouch->query_flush_mutex_initialized)
+    return lc_error_set(e, LC_ERR_INVALID, 0L,
+                        "pouch query flush requires an open pouch", NULL, NULL,
+                        "pouch");
+  rc = pthread_mutex_lock(&pouch->query_flush_mutex);
+  if (rc)
+    return lc_error_set(e, LC_ERR_TRANSPORT, 0L,
+                        "failed to lock pouch query flush", strerror(rc), NULL,
+                        "pouch");
+  *out = pouch;
+  return LC_OK;
+}
+static void file_release(void *context, void *guard) {
+  lc_pouch *pouch = context;
+  (void)guard;
+  (void)pthread_mutex_unlock(&pouch->query_flush_mutex);
+}
 const lc_pouch_index_store_ops lc_pouch_index_file_ops = {
-    file_open,   file_close,     file_replace,
-    file_remove, file_signature, file_prune};
+    file_open,      file_close,   file_replace, file_remove,
+    file_signature, file_prune,   file_prepare, file_publish,
+    file_dispose,   file_acquire, file_release};

@@ -188,7 +188,7 @@ static void index_artifacts(const char *directory) {
                                      &e),
        &e);
     ok(lc_pouch_index_artifact_signature(artifact, &after, &e), &e);
-    REQUIRE(before.inode != after.inode && before.mtime != after.mtime);
+    REQUIRE(before.mtime != after.mtime);
     index_artifact_expect(artifact, bytes, size, &e);
     REQUIRE(original == index_input_crc(&first, &e));
     ok(lc_pouch_index_artifact_write(other, "sibling", 7U, 1, 0, &e), &e);
@@ -200,14 +200,14 @@ static void index_artifacts(const char *directory) {
     ok(ps_checkpoint(ps_root_space(root), &e), &e);
     REQUIRE(original == index_input_crc(&first, &e) &&
             original == index_input_crc(&second, &e));
-    int pending = 0;
-    ok(ps_catalog_orphans_pending(ps_root_space(root), &pending, &e), &e);
-    REQUIRE(pending);
+    ps_stats held = {0}, released = {0};
+    ok(ps_status(ps_root_space(root), &held, &e), &e);
+    REQUIRE(held.retired_bytes);
     ops->close(context, &first);
     ops->close(context, &second);
-    uint64_t reclaimed = 0U, skipped = 0U;
-    ok(ps_root_reclaim_orphans(root, &reclaimed, &skipped, &e), &e);
-    REQUIRE(reclaimed > 0U);
+    ok(ps_status(ps_root_space(root), &released, &e), &e);
+    REQUIRE(released.retired_bytes < held.retired_bytes &&
+            released.allocated_bytes < held.allocated_bytes);
     lc_free_with_allocator(&allocator, artifact);
     lc_free_with_allocator(&allocator, other);
     lc_client_close(client);
@@ -227,16 +227,20 @@ static void index_artifacts(const char *directory) {
 }
 
 static const char index_namespace[] = "query/model";
-static void index_put(lc_client *client, const char *key, const char *json,
-                      lc_error *e) {
+static void index_put_in(lc_client *client, const char *ns, const char *key,
+                         const char *json, lc_error *e) {
   lc_source *source = NULL;
   lc_pouch_state_write_result result = {0};
   ok(lc_source_from_memory(json, strlen(json), &source, e), e);
-  ok(lc_pouch_state_write(index_pouch(client), index_namespace, key, source,
-                          NULL, &result, e),
+  ok(lc_pouch_state_write(index_pouch(client), ns, key, source, NULL, &result,
+                          e),
      e);
   source->close(source);
   lc_pouch_state_write_result_cleanup(&allocator, &result);
+}
+static void index_put(lc_client *client, const char *key, const char *json,
+                      lc_error *e) {
+  index_put_in(client, index_namespace, key, json, e);
 }
 static int index_flush(lc_client *client, lc_error *e) {
   lc_index_flush_req request;
@@ -339,15 +343,16 @@ static const char *const index_selectors[] = {
     "{\"in\":{\"field\":\"/tags[]\",\"any\":[\"base\"]}}",
     "{\"exists\":\"/when\"}",
     "date{field=/when,after=2026-11-16}"};
-static unsigned int index_query(lc_client *client, const char *engine,
-                                const char *selector, lc_error *e) {
+static unsigned int index_query_in(lc_client *client, const char *ns,
+                                   const char *engine, const char *selector,
+                                   lc_error *e) {
   lc_query_req request;
   lc_query_res result = {0};
   lc_query_key_handler handler = {index_key_begin, index_key_chunk,
                                   index_key_end};
   index_keys keys = {0};
   lc_query_req_init(&request);
-  request.ns = index_namespace;
+  request.ns = ns;
   request.engine = engine;
   if (selector[0] == '{')
     request.selector_json = selector;
@@ -363,6 +368,10 @@ static unsigned int index_query(lc_client *client, const char *engine,
   lc_query_res_cleanup(&result);
   return keys.mask;
 }
+static unsigned int index_query(lc_client *client, const char *engine,
+                                const char *selector, lc_error *e) {
+  return index_query_in(client, index_namespace, engine, selector, e);
+}
 static void index_verify(lc_client *client, int action, int completed,
                          lc_error *e) {
   static const unsigned int expected[2][7] = {{1U, 2U, 1U, 1U, 1U, 1U, 0U},
@@ -373,6 +382,10 @@ static void index_verify(lc_client *client, int action, int completed,
     unsigned int scan = index_query(client, "scan", index_selectors[i], e);
     unsigned int indexed = index_query(client, "index", index_selectors[i], e);
     REQUIRE(scan == indexed);
+    if (completed && indexed != expected[action != 0][i])
+      fprintf(stderr,
+              "index recovery action=%d selector=%zu actual=%u expected=%u\n",
+              action, i, indexed, expected[action != 0][i]);
     if (completed)
       REQUIRE(indexed == expected[action != 0][i]);
   }
@@ -483,5 +496,119 @@ static void index_faults(const char *directory, int kind) {
          : kind    ? "I/O"
                    : "durability",
          cuts);
+}
+static uint64_t index_fixture_u64(const unsigned char *p) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < 8; ++i)
+    value |= (uint64_t)p[i] << (8 * i);
+  return value;
+}
+static void index_corrupt_generation(const char *directory) {
+  char path[1400];
+  lc_error e;
+  lc_error_init(&e);
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-corrupt-generation",
+                   directory) < (int)sizeof(path));
+  for (int sync = 0; sync < 2; ++sync) {
+    retention_disk disk = {0};
+    disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+    disk.dirty = calloc((size_t)(PS_DEFAULT_CAPACITY / PS_PAGE), 1);
+    disk.scratch = malloc(PS_PAGE);
+    REQUIRE(disk.stable && disk.dirty && disk.scratch);
+    ps_io io = {&disk,
+                retention_disk_read,
+                retention_disk_write,
+                retention_disk_sync,
+                retention_disk_reserve,
+                NULL};
+    lc_client *client = index_client(path, sync, 1, 1, &io, &e);
+    index_seed(client, 0, &e);
+    ok(index_flush(client, &e), &e);
+    ps_root *root = ps_pouch_state_root(index_pouch(client));
+    ps_namespace *ns = NULL;
+    ps_namespace_info identity;
+    lc_pouch_generation sequence = 0;
+    ok(ps_root_namespace_acquire(root, index_namespace, 0, &ns, &e), &e);
+    ok(ps_namespace_identity(ns, &identity, &e), &e);
+    ps_namespace_release(ns);
+    ok(lc_pouch_state_query_index_seq(index_pouch(client), index_namespace,
+                                      &sequence, &e),
+       &e);
+    lc_pouch_index_artifact *packed = index_artifact(
+        client, index_namespace, LC_POUCH_INDEX_PACKED, sequence, &e);
+    lc_pouch_index_signature original = {0};
+    ok(lc_pouch_index_artifact_signature(packed, &original, &e), &e);
+    REQUIRE(original.present);
+    lc_free_with_allocator(&allocator, packed);
+    /* A later acknowledged canonical owner must survive derived corruption.
+     * Its different namespace leaves the indexed watermark unchanged. */
+    index_put_in(client, "query/neighbor", "one", "{\"title\":\"neighbor\"}",
+                 &e);
+    ok(ps_flush(ps_root_space(root), &e), &e);
+    ps_stats stats = {0};
+    ok(ps_status(ps_root_space(root), &stats, &e), &e);
+    uint64_t payload = 0;
+    size_t at = 0;
+    while (at < stats.journal_bytes) {
+      const unsigned char *frame = disk.stable + PS_JOURNAL_OFFSET + at;
+      size_t bytes = (uint32_t)index_fixture_u64(frame + 4);
+      REQUIRE(bytes >= 64 && bytes <= stats.journal_bytes - at);
+      if (!memcmp(frame, "PSR1", 4)) {
+        size_t member = 64;
+        while (member < bytes) {
+          const unsigned char *record = frame + member;
+          size_t span = (uint32_t)index_fixture_u64(record + 4);
+          REQUIRE(span >= 64 && span <= bytes - member);
+          if ((uint32_t)index_fixture_u64(record + 16) ==
+                  PS_QUERY_FIRST + 2 * LC_POUCH_INDEX_PACKED + 1 &&
+              index_fixture_u64(record + 24) == identity.owner &&
+              index_fixture_u64(record + 32) == sequence) {
+            REQUIRE(span >= 88);
+            payload = index_fixture_u64(record + 64);
+          }
+          member += span;
+        }
+      }
+      at += bytes;
+    }
+    REQUIRE(payload >= PS_DATA && payload < PS_DEFAULT_CAPACITY);
+    disk.frozen = 1;
+    lc_client_close(client);
+    REQUIRE(!live);
+    disk.stable[payload] ^= 1U;
+    retention_disk_restore(&disk, path);
+    client = index_client(path, sync, 0, 1, NULL, &e);
+    /* Query before explicit repair: a valid manifest cannot make the damaged
+     * generation authoritative or let it discard the later canonical owner. */
+    REQUIRE(index_query(client, "index", index_selectors[0], &e) == 1U);
+    REQUIRE(index_query_in(client, "query/neighbor", "scan",
+                           "prefix{field=/title,value=neighbor}", &e) == 1U);
+    index_verify(client, 0, 1, &e);
+    packed = index_artifact(client, index_namespace, LC_POUCH_INDEX_PACKED,
+                            sequence, &e);
+    lc_pouch_index_signature repaired = {0};
+    ok(lc_pouch_index_artifact_signature(packed, &repaired, &e), &e);
+    REQUIRE(repaired.present && repaired.mtime != original.mtime);
+    lc_free_with_allocator(&allocator, packed);
+    lc_client_close(client);
+    REQUIRE(!live);
+    one_file(path);
+    REQUIRE(!unlink(path));
+    free(disk.stable);
+    free(disk.dirty);
+    free(disk.scratch);
+  }
+  lc_error_cleanup(&e);
+}
+static void index_lost_revision(const char *directory) {
+  /* Persist complete descriptor writes even when their acknowledgement is
+   * lost, while earlier query payload writes may disappear. Canonical state
+   * remains authoritative and the first validating flush must rebuild. */
+  size_t sites = index_trial(directory, 0, 0, 1, 2, 0);
+  for (size_t cut = 1; cut <= sites; ++cut) {
+    fprintf(stderr, "lost query revision cut=%zu/%zu\n", cut, sites);
+    (void)index_trial(directory, 0, 0, 1, 2, cut);
+  }
+  index_corrupt_generation(directory);
 }
 #endif

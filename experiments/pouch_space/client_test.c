@@ -2612,6 +2612,8 @@ static void *worker(void *context) {
     index_faults(r->directory, 0);
   else if (!strcmp(r->mode, "index-io-faults"))
     index_faults(r->directory, 1);
+  else if (!strcmp(r->mode, "index-recovery"))
+    index_lost_revision(r->directory);
   else if (!strcmp(r->mode, "index-allocation-faults"))
     index_faults(r->directory, 2);
   else if (!strcmp(r->mode, "index-capacity"))

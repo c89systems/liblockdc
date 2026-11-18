@@ -8,7 +8,6 @@
 #include <string.h>
 
 #define QUERY_STREAM_KEY 1U
-#define QUERY_ID_BYTES 10U
 typedef struct ps_query_index_generation {
   ps_stream *stream;
   ps_catalog_info binding;
@@ -22,35 +21,6 @@ typedef struct query_input {
 } query_input;
 static int failure(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0L, message, NULL, NULL, "pouch");
-}
-static int namespace_get(ps_root *root, const char *name, int create,
-                         ps_namespace **out, lc_error *e) {
-  lc_error local;
-  int rc;
-  *out = NULL;
-  lc_error_init(&local);
-  rc = ps_root_namespace_acquire(root, name, create, out, &local);
-  if (!create && rc == LC_ERR_INVALID && local.server_code &&
-      !strcmp(local.server_code, "pouch_namespace_not_found"))
-    rc = LC_OK;
-  else if (rc != LC_OK)
-    rc = lc_error_set(e, local.code, local.http_status, local.message,
-                      local.detail, local.server_code, local.correlation_id);
-  lc_error_cleanup(&local);
-  return rc;
-}
-static int encode_id(const lc_pouch_index_artifact_id *id,
-                     unsigned char bytes[QUERY_ID_BYTES], lc_error *e) {
-  size_t i;
-  if (!id || id->kind >= LC_POUCH_INDEX_ARTIFACT_KINDS ||
-      (id->segmented && id->kind == LC_POUCH_INDEX_MANIFEST) ||
-      (!id->segmented && id->generation))
-    return failure(e, LC_ERR_INVALID, "invalid query-index catalog identity");
-  bytes[0] = id->segmented ? 1U : 0U;
-  bytes[1] = (unsigned char)id->kind;
-  for (i = 0U; i < 8U; ++i)
-    bytes[2U + i] = (unsigned char)(id->generation >> (8U * i));
-  return LC_OK;
 }
 static int scoped_binding(ps_space *space, uint64_t owner, const void *name,
                           size_t length, ps_catalog_view **out,
@@ -67,15 +37,6 @@ static int scoped_binding(ps_space *space, uint64_t owner, const void *name,
     rc = failure(e, LC_ERR_PROTOCOL, "query-index stream binding is invalid");
   return rc;
 }
-static int binding(ps_namespace *ns, const lc_pouch_index_artifact_id *id,
-                   ps_catalog_view **out, ps_catalog_info *info, lc_error *e) {
-  unsigned char name[QUERY_ID_BYTES];
-  int rc = encode_id(id, name, e);
-  *out = NULL;
-  return rc == LC_OK ? scoped_binding(ns->root->space, ns->identity.owner, name,
-                                      sizeof(name), out, info, e)
-                     : rc;
-}
 static int inspect(ps_root *root, const ps_catalog_info *info,
                    lc_pouch_index_signature *signature, lc_error *e) {
   ps_owned_status status;
@@ -90,24 +51,6 @@ static int inspect(ps_root *root, const ps_catalog_info *info,
     signature->mtime = (unsigned long)status.ref.incarnation;
     signature->present = 1;
   }
-  return rc;
-}
-static int query_signature(void *context, const char *name,
-                           const lc_pouch_index_artifact_id *id,
-                           lc_pouch_index_signature *out, lc_error *e) {
-  ps_root *root = context;
-  ps_namespace *ns = NULL;
-  ps_catalog_view *view = NULL;
-  ps_catalog_info info;
-  int rc;
-  memset(out, 0, sizeof(*out));
-  rc = namespace_get(root, name, 0, &ns, e);
-  if (rc == LC_OK && ns)
-    rc = binding(ns, id, &view, &info, e);
-  if (rc == LC_OK && view)
-    rc = inspect(root, &info, out, e);
-  ps_catalog_view_close(view);
-  ps_namespace_release(ns);
   return rc;
 }
 /* Root registry authority spans only sealed-head/run metadata, never payload
@@ -239,21 +182,6 @@ int ps_query_artifact_open(ps_namespace *ns, uint64_t owner, const void *name,
     memset(out, 0, sizeof(*out));
   return rc;
 }
-static int query_open(void *context, const char *name,
-                      const lc_pouch_index_artifact_id *id,
-                      lc_pouch_index_input *out, lc_error *e) {
-  ps_namespace *ns = NULL;
-  unsigned char encoded[QUERY_ID_BYTES];
-  int rc = encode_id(id, encoded, e);
-  memset(out, 0, sizeof(*out));
-  if (rc == LC_OK)
-    rc = namespace_get(context, name, 0, &ns, e);
-  if (rc == LC_OK && ns)
-    rc = ps_query_artifact_open(ns, ns->identity.owner, encoded,
-                                sizeof(encoded), out, e);
-  ps_namespace_release(ns);
-  return rc;
-}
 void ps_query_artifact_close(ps_root *root, lc_pouch_index_input *captured) {
   query_input *input = captured->handle;
   if (!input)
@@ -265,9 +193,6 @@ void ps_query_artifact_close(ps_root *root, lc_pouch_index_input *captured) {
   ps_namespace_release(input->ns);
   lc_free_with_allocator(&root->crypto_allocator, input);
   memset(captured, 0, sizeof(*captured));
-}
-static void query_close(void *context, lc_pouch_index_input *captured) {
-  ps_query_artifact_close(context, captured);
 }
 static void retire_unbound(ps_space *space, ps_key key, const ps_ref *ref) {
   ps_owned_head *head = NULL;
@@ -426,24 +351,6 @@ int ps_query_artifact_replace(ps_namespace *ns, uint64_t owner,
                    &selection.prior.target);
   return rc;
 }
-static int query_replace(void *context, const char *name,
-                         const lc_pouch_index_artifact_id *id, uint64_t bound,
-                         lc_pouch_index_produce_fn produce, void *producer,
-                         int unpublished, int durable, lc_error *e) {
-  ps_namespace *ns = NULL;
-  unsigned char encoded[QUERY_ID_BYTES];
-  int rc = encode_id(id, encoded, e);
-  (void)unpublished;
-  (void)durable; /* Structural selection always waits for durability. */
-  if (rc == LC_OK)
-    rc = namespace_get(context, name, 1, &ns, e);
-  if (rc == LC_OK)
-    rc = ps_query_artifact_replace(ns, ns->identity.owner, encoded,
-                                   sizeof(encoded), bound, produce, producer,
-                                   NULL, NULL, e);
-  ps_namespace_release(ns);
-  return rc;
-}
 int ps_query_artifact_remove(ps_space *space, uint64_t owner, const void *name,
                              size_t length, const ps_ref *revision,
                              lc_error *e) {
@@ -466,72 +373,6 @@ int ps_query_artifact_remove(ps_space *space, uint64_t owner, const void *name,
     retire_unbound(space, info.stream, &info.target);
   return rc;
 }
-static int query_remove(void *context, const char *name,
-                        const lc_pouch_index_artifact_id *id, lc_error *e) {
-  ps_namespace *ns = NULL;
-  unsigned char encoded[QUERY_ID_BYTES];
-  int rc = encode_id(id, encoded, e);
-  if (rc == LC_OK)
-    rc = namespace_get(context, name, 0, &ns, e);
-  if (rc == LC_OK && ns)
-    rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
-  if (rc == LC_OK && ns)
-    rc = ps_query_artifact_remove(ns->root->space, ns->identity.owner, encoded,
-                                  sizeof(encoded), NULL, e);
-  ps_namespace_release(ns);
-  return rc;
-}
-typedef struct prune_context {
-  ps_root *root;
-  const char *ns;
-  const uint64_t *keep;
-  size_t count;
-} prune_context;
-static int prune_artifact(void *context, const void *name, size_t length,
-                          const ps_catalog_info *info, lc_error *e) {
-  prune_context *p = context;
-  const unsigned char *bytes = name;
-  lc_pouch_index_artifact_id id;
-  size_t i;
-  (void)info;
-  if (length != QUERY_ID_BYTES || bytes[0] > 1U ||
-      bytes[1] >= LC_POUCH_INDEX_ARTIFACT_KINDS)
-    return failure(e, LC_ERR_PROTOCOL,
-                   "query-index catalog identity is invalid");
-  memset(&id, 0, sizeof(id));
-  id.segmented = bytes[0];
-  id.kind = bytes[1];
-  for (i = 0U; i < 8U; ++i)
-    id.generation |= (uint64_t)bytes[2U + i] << (8U * i);
-  if (id.kind == LC_POUCH_INDEX_MANIFEST && !id.segmented && !id.generation)
-    return LC_OK;
-  if (id.segmented)
-    for (i = 0U; i < p->count; ++i)
-      if (p->keep[i] == id.generation)
-        return LC_OK;
-  return query_remove(p->root, p->ns, &id, e);
-}
-static int query_prune(void *context, const char *name, const uint64_t *keep,
-                       size_t count, lc_error *e) {
-  ps_root *root = context;
-  ps_namespace *ns = NULL;
-  prune_context p;
-  int rc = namespace_get(root, name, 0, &ns, e);
-  if (rc == LC_OK && ns) {
-    p.root = root;
-    p.ns = name;
-    p.keep = keep;
-    p.count = count;
-    rc = ps_catalog_visit(root->space, ns->identity.owner,
-                          PS_CATALOG_PROJECTION, prune_artifact, &p, e);
-  }
-  ps_namespace_release(ns);
-  return rc;
-}
-const lc_pouch_index_store_ops ps_query_index_store_ops = {
-    query_open,   query_close,     query_replace,
-    query_remove, query_signature, query_prune};
-
 typedef struct query_reclamation {
   ps_space *space;
   uint64_t owner;
@@ -544,8 +385,10 @@ static int reclaim_artifact(void *context, const void *name, size_t length,
 }
 int ps_query_artifacts_reclaim(ps_space *space, uint64_t owner, lc_error *e) {
   query_reclamation p;
+  int rc;
   p.space = space;
   p.owner = owner;
-  return ps_catalog_visit(space, owner, PS_CATALOG_PROJECTION, reclaim_artifact,
-                          &p, e);
+  rc = ps_catalog_visit(space, owner, PS_CATALOG_PROJECTION, reclaim_artifact,
+                        &p, e);
+  return rc == LC_OK ? ps_query_values_reclaim(space, owner, e) : rc;
 }

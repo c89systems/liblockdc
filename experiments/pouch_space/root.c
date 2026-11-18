@@ -281,6 +281,14 @@ static int namespace_locks_init(ps_namespace *ns, lc_error *error) {
     return failure(error, LC_ERR_TRANSPORT, NULL,
                    "cannot initialize outbox marker admission");
   }
+  if (pthread_mutex_init(&ns->query, NULL) != 0) {
+    pthread_cond_destroy(&ns->outbox_changed);
+    pthread_mutex_destroy(&ns->outbox);
+    pthread_mutex_destroy(&ns->maintenance);
+    pthread_mutex_destroy(&ns->collection_catalog);
+    return failure(error, LC_ERR_TRANSPORT, NULL,
+                   "cannot initialize namespace query authority");
+  }
   return LC_OK;
 }
 int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
@@ -371,6 +379,7 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
   if (dead) {
     pthread_mutex_destroy(&dead->collection_catalog);
     pthread_mutex_destroy(&dead->maintenance);
+    pthread_mutex_destroy(&dead->query);
     pthread_mutex_destroy(&dead->outbox);
     pthread_cond_destroy(&dead->outbox_changed);
     lc_free_with_allocator(NULL, dead->name);
@@ -535,6 +544,7 @@ int ps_root_close(ps_root *root, lc_error *error) {
     next = ns->next;
     pthread_mutex_destroy(&ns->collection_catalog);
     pthread_mutex_destroy(&ns->maintenance);
+    pthread_mutex_destroy(&ns->query);
     pthread_mutex_destroy(&ns->outbox);
     pthread_cond_destroy(&ns->outbox_changed);
     lc_free_with_allocator(NULL, ns->name);

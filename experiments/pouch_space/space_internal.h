@@ -36,6 +36,7 @@ typedef struct ps_entry {
   uint64_t stream_capacity, stream_runs, stream_ready;
   int stream_open, stream_sealed, orphan_claimed;
   int durable_visibility; /* pending revision uses completed prefix */
+  int value_checked; /* transient immutable-payload validation: 0 unknown */
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */

@@ -2,8 +2,8 @@
 #define POUCH_SPACE_QUERY_INDEX_H
 #include "lc_pouch_index_store.h"
 #include "root.h"
-/* Borrowed ps_root context. Artifacts are sealed, immutable streams selected
- * by typed namespace projection bindings; no pathname or payload spool. */
+/* Borrowed ps_root context. Namespace revisions use immutable typed values;
+ * generation and manifest are prepared privately and selected together. */
 extern const lc_pouch_index_store_ops ps_query_index_store_ops;
 /* Shared sealed-artifact owner. Catalog scope is the actual namespace or
  * collection owner; the binary domain identity is never a synthetic namespace.
@@ -17,4 +17,5 @@ int ps_query_artifact_replace(ps_namespace *, uint64_t, const void *, size_t,
 int ps_query_artifact_remove(ps_space *, uint64_t, const void *, size_t,
                              const ps_ref *, lc_error *);
 int ps_query_artifacts_reclaim(ps_space *, uint64_t, lc_error *);
+int ps_query_values_reclaim(ps_space *, uint64_t, lc_error *);
 #endif

@@ -1831,7 +1831,8 @@ int lc_pouch_runtime_start_indexing(lc_pouch *pouch, lc_error *error) {
                                                   &context)
               : NULL;
     if (!ops || !context || !ops->open || !ops->close || !ops->replace ||
-        !ops->remove || !ops->signature || !ops->prune)
+        !ops->remove || !ops->signature || !ops->prune || !ops->prepare ||
+        !ops->publish || !ops->dispose || !ops->acquire || !ops->release)
       return lc_error_set(
           error, LC_ERR_UNSUPPORTED, 0L,
           "storage owner has no complete query-index capability", NULL, NULL,
@@ -3692,6 +3693,14 @@ int lc_pouch_runtime_open(const char *root_path, const lc_allocator *allocator,
                         strerror(pthread_rc), NULL, "pouch");
   }
   pouch->query_doc_table_cache_mutex_initialized = 1;
+  pthread_rc = pthread_mutex_init(&pouch->query_artifact_cache_mutex, NULL);
+  if (pthread_rc != 0) {
+    lc_pouch_close(pouch);
+    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
+                        "failed to initialize pouch artifact cache mutex",
+                        strerror(pthread_rc), NULL, "pouch");
+  }
+  pouch->query_artifact_cache_mutex_initialized = 1;
   pthread_rc = pthread_mutex_init(&pouch->source_cache_mutex, NULL);
   if (pthread_rc != 0) {
     lc_pouch_close(pouch);
@@ -3959,6 +3968,9 @@ void lc_pouch_close(lc_pouch *pouch) {
   }
   if (pouch->query_doc_table_cache_mutex_initialized) {
     pthread_mutex_destroy(&pouch->query_doc_table_cache_mutex);
+  }
+  if (pouch->query_artifact_cache_mutex_initialized) {
+    pthread_mutex_destroy(&pouch->query_artifact_cache_mutex);
   }
   if (pouch->source_cache_mutex_initialized) {
     pthread_mutex_destroy(&pouch->source_cache_mutex);

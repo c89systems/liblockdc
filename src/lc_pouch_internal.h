@@ -235,6 +235,9 @@ struct lc_pouch {
   /* Owns doc-table cache lookup, publication, eviction, and query borrows. */
   pthread_mutex_t query_doc_table_cache_mutex;
   int query_doc_table_cache_mutex_initialized;
+  /* Owns packed-cache access and immutable generation-cache borrows. */
+  pthread_mutex_t query_artifact_cache_mutex;
+  int query_artifact_cache_mutex_initialized;
   pthread_mutex_t exclusive_key_mutexes[LC_POUCH_EXCLUSIVE_KEY_STRIPE_COUNT];
   size_t exclusive_key_mutex_count;
   lc_pouch_fsync_batcher *fsync_batcher;
@@ -319,6 +322,9 @@ extern void *lc_pouch_test_after_doc_table_cache_rows_attached_context;
 /* A nonzero test override shortens the resident doc-table cache for eviction
  * interleavings. Production always uses its fixed cache capacity. */
 extern size_t lc_pouch_test_doc_table_cache_capacity;
+extern lc_pouch_test_hook lc_pouch_test_after_generation_cache_borrow_hook;
+extern void *lc_pouch_test_after_generation_cache_borrow_context;
+extern size_t lc_pouch_test_generation_cache_capacity;
 /* Invoked while holding the doc-table cache mutex immediately before a
  * borrowed entry lazily initializes one decoded key. */
 extern lc_pouch_test_hook

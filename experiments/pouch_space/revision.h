@@ -17,12 +17,14 @@ int ps_revision_writer_info(const ps_writer *, ps_ref *, uint64_t *,
  * individual entries have valid checksums. A durable root (or any CONTROL
  * member) exposes and acknowledges only a completed shared durability prefix
  * covering the whole revision, including non-CONTROL members on NoSync roots.
- * NoSync follows ordinary value publication policy. Automatic journal rollover
+ * force_durable=1 requires that same barrier on any root; zero follows root
+ * policy. NoSync otherwise follows ordinary value publication. Journal rollover
  * can additionally checkpoint before selection. Existing captured readers pin
  * their old incarnations. Invalid invocations leave private writers untouched.
  * Once preparation starts, failure makes participating writers unusable; close
  * them and rebuild. Uncertain I/O poisons the space as for ps_publish.
  * Outputs, when supplied, are valid only on success. One caller owns each
  * writer throughout the operation; stop concurrent use before publishing. */
-int ps_revision_publish(ps_writer *const *, size_t, ps_ref *, lc_error *);
+int ps_revision_publish(ps_writer *const *, size_t, int force_durable, ps_ref *,
+                        lc_error *);
 #endif
