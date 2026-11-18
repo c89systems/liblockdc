@@ -410,7 +410,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_client_test)
-  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
+  foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-progress retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()

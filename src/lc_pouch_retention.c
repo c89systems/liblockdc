@@ -222,14 +222,9 @@ int lc_pouch_retention_work_read(lc_pouch *pouch, const char *ns,
   int rc;
 
   memset(out, 0, sizeof(*out));
-  if (pouch->storage.ops) {
-    rc = pouch->storage.ops->retention_work_load(pouch->storage.context, ns,
-                                                 &bytes, &length, error);
-    if (rc == LC_OK && bytes)
-      rc = lc_pouch_retention_record_decode(&pouch->allocator, bytes, length,
-                                            ns, out, error);
-    goto done;
-  }
+  if (pouch->storage.ops)
+    return pouch->storage.ops->retention_work_load(pouch->storage.context, ns,
+                                                   out, error);
   rc = retention_paths(pouch, ns, 0, &directory, &path, error);
   if (rc != LC_OK)
     goto done;
@@ -301,15 +296,22 @@ int lc_pouch_retention_work_write(lc_pouch *pouch, const char *ns, int phase,
   char *text = NULL;
   int rc;
   size_t length;
+  if (pouch->storage.ops) {
+    lc_pouch_retention_work work;
+    memset(&work, 0, sizeof(work));
+    work.present = 1;
+    work.phase = phase;
+    work.txn_id = (char *)txn_id;
+    work.key = (char *)key;
+    work.fencing_token = fencing_token;
+    work.state_version = state_version;
+    return pouch->storage.ops->retention_work_store(pouch->storage.context, ns,
+                                                    &work, error);
+  }
   rc = lc_pouch_retention_record_encode(&pouch->allocator, phase, txn_id, key,
                                         fencing_token, state_version, &text,
                                         &length, error);
-  if (rc == LC_OK && pouch->storage.ops)
-    rc = pouch->storage.ops->retention_work_store(
-        pouch->storage.context, ns,
-        phase == LC_POUCH_RETENTION_IDLE ? NULL : text,
-        phase == LC_POUCH_RETENTION_IDLE ? 0 : length, error);
-  else if (rc == LC_OK) {
+  if (rc == LC_OK) {
     rc = retention_paths(pouch, ns, 0, &directory, &path, error);
     if (rc == LC_OK)
       rc = lc_pouch_path_write_text_file(path, text, error);

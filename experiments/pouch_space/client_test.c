@@ -1234,7 +1234,16 @@ static void retention_lifecycle(const char *directory) {
         ok(ps_root_namespace_acquire(ps_pouch_state_root(p), names[0], 0, &ns,
                                      &e),
            &e);
-        ok(ps_namespace_retention_work_store(ns, "LPR1\nbad\n", 9, &e), &e);
+        ps_namespace_info identity;
+        ps_writer *corrupt = NULL;
+        ok(ps_namespace_identity(ns, &identity, &e), &e);
+        ps_key bad_key = {identity.owner, 3, PS_CONTROL};
+        ok(ps_begin(ps_root_space(ps_pouch_state_root(p)), NULL, bad_key,
+                    &corrupt, &e),
+           &e);
+        ok(ps_write(corrupt, "bad", 3, &e), &e);
+        ok(ps_publish(corrupt, NULL, &e), &e);
+        ps_writer_close(corrupt);
         lc_pouch_retention_work bad = {0};
         REQUIRE(lc_pouch_retention_work_read(p, names[0], &bad, &e) ==
                 LC_ERR_PROTOCOL);
@@ -1246,6 +1255,19 @@ static void retention_lifecycle(const char *directory) {
         REQUIRE(found && advisory);
         lc_free_with_allocator(&allocator, found);
         lc_free_with_allocator(&allocator, advisory);
+        ps_namespace_release(ns);
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        p = visit_open(path, native, sync, 0, NULL, &allocator, &e);
+        REQUIRE(lc_pouch_retention_work_read(p, names[0], &bad, &e) ==
+                LC_ERR_PROTOCOL);
+        REQUIRE(!bad.present && !bad.txn_id && !bad.key);
+        clear(&e);
+        ok(ps_root_namespace_acquire(ps_pouch_state_root(p), names[0], 0, &ns,
+                                     &e),
+           &e);
+        lc_pouch_retention_work idle = {0};
+        ok(ps_namespace_retention_work_store(ns, &idle, &e), &e);
         ps_namespace_release(ns);
       }
       retention_store(p, names[0], 2, long_key, &e);
@@ -1303,6 +1325,12 @@ static int retention_action(lc_pouch *p, int action, retention_result *r,
     return lc_pouch_retention_work_write(p, "work/a", 0, NULL, NULL, 0, 0, e);
   case 4:
     return lc_pouch_retention_hint_remove(p, "work/a", e);
+  case 7:
+    return lc_pouch_retention_work_write(p, "work/a", 2, retention_xid, "old",
+                                         1, 2, e);
+  case 8:
+    return lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, "old",
+                                         3, 4, e);
   default:
     return lc_pouch_retention_hint_next(p, NULL, &r->name, &r->cursor, e);
   }
@@ -1327,18 +1355,13 @@ static void retention_result_check(int action, int rc, retention_result *r) {
             (!strcmp(r->name, "work/a") || !strcmp(r->name, "work/b")));
 }
 static void retention_action_expect(lc_pouch *p, int action, lc_error *e) {
-  retention_expect(p, "work/a", action != 4,
-                   action == 2                  ? 2
-                   : action == 1 || action == 5 ? 1
-                                                : 0,
-                   action == 2 ? "new/\n%" : "old",
-                   action == 2                  ? 3
-                   : action == 1 || action == 5 ? 1
-                                                : 0,
-                   action == 2                  ? 4
-                   : action == 1 || action == 5 ? 2
-                                                : 0,
-                   e);
+  int phase = action == 2 || action == 7                  ? 2
+              : action == 1 || action == 5 || action == 8 ? 1
+                                                          : 0;
+  uint64_t fencing = action == 2 || action == 8 ? 3 : phase ? 1 : 0;
+  uint64_t version = action == 2 || action == 8 ? 4 : phase ? 2 : 0;
+  retention_expect(p, "work/a", action != 4, phase,
+                   action == 2 ? "new/\n%" : "old", fencing, version, e);
 }
 static void retention_allocation_faults(const char *directory) {
   char prefix[1400], pattern[1500], trial[1500], path[1600];
@@ -1350,8 +1373,10 @@ static void retention_allocation_faults(const char *directory) {
   for (int native = 0; native < 2; ++native)
     for (int sync = 0; sync < 2; ++sync)
       for (int cold = 0; cold < 2; ++cold)
-        for (int action = 0; action < 6; ++action)
+        for (int action = 0; action < 9; ++action)
           for (int no_error = 0; no_error < 2; ++no_error) {
+            if (action == 6)
+              continue; /* larger replacement has its separate capacity sweep */
             size_t sites = 0;
             for (size_t cut = 0; cut <= sites; ++cut) {
               retention_result r;
@@ -1367,7 +1392,8 @@ static void retention_allocation_faults(const char *directory) {
               if (action) {
                 ok(lc_pouch_retention_hint_ensure(p, "work/a", &e), &e);
                 ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid,
-                                                 "old", 1, 2, &e),
+                                                 "old", action == 8 ? 0 : 1,
+                                                 action == 8 ? 0 : 2, &e),
                    &e);
               }
               if (action == 5)
@@ -1516,21 +1542,33 @@ static void retention_recovered(lc_pouch *p, int action, int completed,
   char *name = NULL, *cursor = NULL;
   ok(lc_pouch_retention_work_read(p, "work/a", &w, e), e);
   if (completed) {
-    int phase = action == 0 || action == 3 || action == 4 ? 0
-                : action == 2 || action == 6              ? 2
-                                                          : 1;
+    int phase = action == 0 || action == 3 || action == 4   ? 0
+                : action == 2 || action == 6 || action == 7 ? 2
+                                                            : 1;
     REQUIRE(w.present == (action != 4) && w.phase == phase);
   }
   if (w.present && w.phase) {
     REQUIRE(!strcmp(w.txn_id, retention_xid));
-    if (w.phase == 1)
-      REQUIRE(strcmp(w.key, "old") == 0 && w.fencing_token == 1 &&
-              w.state_version == 2 &&
+    if (w.phase == 1 && action == 8)
+      REQUIRE(!strcmp(w.key, "old") &&
+              ((!completed && !w.fencing_token && !w.state_version) ||
+               (w.fencing_token == 3 && w.state_version == 4)));
+    else if (w.phase == 1)
+      REQUIRE(action != 3 && action != 4 && strcmp(w.key, "old") == 0 &&
+              w.fencing_token == 1 && w.state_version == 2 &&
               (!completed || (action != 2 && action != 6)));
     else
-      REQUIRE(w.phase == 2 && (action == 2 || action == 6) &&
-              !strcmp(w.key, action == 6 ? large : "new/\n%") &&
-              w.fencing_token == 3 && w.state_version == 4);
+      REQUIRE(w.phase == 2 &&
+              (action == 2 || action == 6 || action == 7 ||
+               (!completed && (action == 3 || action == 4))) &&
+              !strcmp(w.key, action == 6 ? large
+                             : action == 7 || action == 3 || action == 4
+                                 ? "old"
+                                 : "new/\n%") &&
+              w.fencing_token ==
+                  (action == 7 || action == 3 || action == 4 ? 1 : 3) &&
+              w.state_version ==
+                  (action == 7 || action == 3 || action == 4 ? 2 : 4));
   } else {
     REQUIRE(action == 0 || action == 3 || action == 4);
     if (action == 3)
@@ -1560,7 +1598,7 @@ static void retention_io_faults(const char *directory) {
           (int)sizeof(path));
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < 2; ++persist)
-      for (int action = 0; action < 7; ++action) {
+      for (int action = 0; action < 9; ++action) {
         size_t sites = 0;
         for (size_t cut = 0; cut <= sites; ++cut) {
           retention_disk m = {0};
@@ -1585,10 +1623,15 @@ static void retention_io_faults(const char *directory) {
                                                retired, 1, 2, &e),
                  &e);
             ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid,
-                                             "old", 1, 2, &e),
+                                             "old", action == 8 ? 0 : 1,
+                                             action == 8 ? 0 : 2, &e),
                &e);
           }
           ps_space *space = ps_root_space(ps_pouch_state_root(p));
+          if (action == 3 || action == 4)
+            ok(lc_pouch_retention_work_write(p, "work/a", 2, retention_xid,
+                                             "old", 1, 2, &e),
+               &e);
           if (action == 6)
             peer = retention_peer(space, &e);
           ps_stats before, after;
@@ -1696,20 +1739,18 @@ static void retention_capacity(const char *directory) {
                                           &e) == LC_ERR_INVALID);
     clear(&e);
     retention_expect(p, "work/a", 1, 1, "old", 1, 2, &e);
-    char *expected = NULL;
-    size_t length = 0, at = 0, got;
+    size_t length = 32768, at = 0, got;
+    unsigned char header[80];
     unsigned char buffer[317];
-    ok(lc_pouch_retention_record_encode(NULL, 1, retention_xid, old_key, 1, 2,
-                                        &expected, &length, &e),
-       &e);
-    REQUIRE(ps_read_size(pin) == length);
+    REQUIRE(ps_read_size(pin) == sizeof(header) + length);
+    ok(ps_read(pin, header, sizeof(header), &got, &e), &e);
+    REQUIRE(got == sizeof(header) && !memcmp(header, "LCPSRTWK", 8));
     do {
       ok(ps_read(pin, buffer, sizeof(buffer), &got, &e), &e);
-      REQUIRE(got <= length - at && !memcmp(buffer, expected + at, got));
+      REQUIRE(got <= length - at && !memcmp(buffer, old_key + at, got));
       at += got;
     } while (got);
     REQUIRE(at == length);
-    lc_free_with_allocator(NULL, expected);
     ps_reader_close(pin);
     /* The peer still owns all of its claim. Only releasing this historical
      * reader makes the superseded control's payload available. */
@@ -1825,7 +1866,9 @@ static void retention_capacity_faults(const char *directory) {
 typedef struct retention_gate {
   pthread_mutex_t mutex;
   pthread_cond_t changed;
-  int enabled, payload, entered, released;
+  int enabled, payload, entered, released, captured_read;
+  uint64_t written_bytes;
+  uint64_t sync_calls;
 } retention_gate;
 static void retention_gate_wait(retention_gate *g) {
   g->entered = 1;
@@ -1835,8 +1878,14 @@ static void retention_gate_wait(retention_gate *g) {
 }
 static ssize_t retention_gate_read(void *context, int fd, void *p, size_t n,
                                    off_t at) {
-  (void)context;
-  return pread(fd, p, n, at);
+  retention_gate *g = context;
+  ssize_t got = pread(fd, p, n, at);
+  pthread_mutex_lock(&g->mutex);
+  if (g->enabled && g->captured_read && !g->entered && got >= 8 &&
+      !memcmp(p, "LCPSRTWK", 8))
+    retention_gate_wait(g);
+  pthread_mutex_unlock(&g->mutex);
+  return got;
 }
 static ssize_t retention_gate_write(void *context, int fd, const void *p,
                                     size_t n, off_t at) {
@@ -1844,12 +1893,14 @@ static ssize_t retention_gate_write(void *context, int fd, const void *p,
   pthread_mutex_lock(&g->mutex);
   if (g->enabled && g->payload && !g->entered && at >= PS_DATA)
     retention_gate_wait(g);
+  g->written_bytes += n;
   pthread_mutex_unlock(&g->mutex);
   return pwrite(fd, p, n, at);
 }
 static int retention_gate_sync(void *context, int fd) {
   retention_gate *g = context;
   pthread_mutex_lock(&g->mutex);
+  ++g->sync_calls;
   if (g->enabled && !g->payload && !g->entered)
     retention_gate_wait(g);
   pthread_mutex_unlock(&g->mutex);
@@ -1859,20 +1910,335 @@ static int retention_gate_reserve(void *context, int fd, off_t at, off_t n) {
   (void)context;
   return fallocate(fd, 0, at, n);
 }
+static void retention_bootstrap_cuts(const char *path, int sync,
+                                     const ps_io *io, lc_error *e) {
+  ps_pouch_state_options o = {0};
+  size_t sites = 0;
+  o.logical.single_writer = o.logical.single_writer_set = 1;
+  o.logical.background_compaction_enabled_set = 1;
+  o.logical.query_indexing_enabled_set = 1;
+  o.logical.query_engine = "scan";
+  o.logical.durable_sync = sync;
+  o.io = io;
+  for (size_t cut = 0; cut <= sites; ++cut) {
+    lc_pouch *p = NULL;
+    allocation = 0;
+    fail_at = cut ? cut : SIZE_MAX;
+    armed = 1;
+    int rc = ps_pouch_state_open(path, 0, &allocator, &o, &p, e);
+    armed = 0;
+    if (!cut) {
+      sites = allocation;
+      REQUIRE(sites && rc == LC_OK);
+    } else
+      REQUIRE(rc == LC_ERR_NOMEM || rc == LC_OK);
+    if (rc == LC_OK) {
+      ps_stats stats;
+      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &stats, e), e);
+      REQUIRE(stats.budgets == 1 &&
+              stats.reserved_payload_bytes == 2 * PS_PAGE);
+    } else
+      REQUIRE(!p);
+    lc_pouch_close(p);
+    clear(e);
+    REQUIRE(!live);
+  }
+  printf("retention completion bootstrap sync%d: %zu allocation cuts\n", sync,
+         sites);
+}
+static uint64_t retention_fill_ordinary(ps_space *space, uint64_t start,
+                                        lc_error *e) {
+  ps_key key = {UINT64_MAX - 2, start, PS_STATE};
+  unsigned char *bytes = calloc(1, PS_CHUNK);
+  REQUIRE(bytes);
+  for (size_t length = PS_CHUNK; length >= PS_PAGE; length /= 4) {
+    for (; key.key < 4096; ++key.key) {
+      ps_writer *writer = NULL;
+      int rc = ps_begin(space, NULL, key, &writer, e);
+      if (rc == LC_OK)
+        rc = ps_write(writer, bytes, length, e);
+      if (rc == LC_OK)
+        rc = ps_publish(writer, NULL, e);
+      ps_writer_close(writer);
+      if (rc == LC_ERR_INVALID) {
+        clear(e);
+        break;
+      }
+      ok(rc, e);
+    }
+    REQUIRE(key.key < 4096);
+  }
+  free(bytes);
+  return key.key;
+}
+static void retention_many_progress(const char *directory) {
+  char path[1400], name[32], key[257];
+  lc_error e;
+  memset(key, '%', sizeof(key) - 1);
+  key[sizeof(key) - 1] = 0;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync) {
+    REQUIRE(snprintf(path, sizeof(path), "%s/retention-many-%d", directory,
+                     sync) < (int)sizeof(path));
+    lc_pouch *p = visit_open(path, 0, sync, 1, NULL, &allocator, &e);
+    for (int owner = 0; owner < 24; ++owner) {
+      snprintf(name, sizeof(name), "work/%d", owner);
+      ok(lc_pouch_retention_hint_ensure(p, name, &e), &e);
+      ok(lc_pouch_retention_work_write(p, name, 1, retention_xid, key, 0, 0,
+                                       &e),
+         &e);
+    }
+    uint64_t fill =
+        retention_fill_ordinary(ps_root_space(ps_pouch_state_root(p)), 1, &e);
+    lc_pouch_close(p);
+    REQUIRE(!live);
+    p = visit_open(path, 0, sync, 0, NULL, &allocator, &e);
+    ps_space *space = ps_root_space(ps_pouch_state_root(p));
+    ps_stats stats;
+    ps_budget_plan peer_plan;
+    ok(ps_status(space, &stats, &e), &e);
+    REQUIRE(stats.budgets == 24 &&
+            stats.reserved_payload_bytes == 48 * PS_PAGE);
+    ps_budget *peer = retention_peer(space, &e);
+    for (int owner = 0; owner < 24; ++owner) {
+      snprintf(name, sizeof(name), "work/%d", owner);
+      ok(lc_pouch_retention_work_write(p, name, 1, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+    }
+    ok(ps_status(space, &stats, &e), &e);
+    ok(ps_budget_status(peer, &peer_plan, &e), &e);
+    REQUIRE(stats.budgets == 25 && stats.reserved_payload_bytes ==
+                                       peer_plan.payload_bytes + 24 * PS_PAGE);
+    /* Producers may use released claim slack, but cannot spend any owner's
+     * admitted terminal publication. */
+    fill = retention_fill_ordinary(space, fill, &e);
+    for (int owner = 0; owner < 24; ++owner) {
+      snprintf(name, sizeof(name), "work/%d", owner);
+      ok(lc_pouch_retention_work_write(p, name, 2, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+    }
+    ok(ps_status(space, &stats, &e), &e);
+    REQUIRE(stats.budgets == 1);
+    ok(ps_budget_close(peer, &e), &e);
+    (void)retention_fill_ordinary(space, fill, &e);
+    lc_pouch_close(p);
+    REQUIRE(!live);
+    p = visit_open(path, 0, sync, 0, NULL, &allocator, &e);
+    ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &stats, &e), &e);
+    REQUIRE(!stats.budgets && !stats.reserved_payload_bytes &&
+            stats.capacity == PS_DEFAULT_CAPACITY);
+    for (int owner = 0; owner < 24; ++owner) {
+      snprintf(name, sizeof(name), "work/%d", owner);
+      retention_expect(p, name, 1, 2, key, 1, 2, &e);
+    }
+    lc_pouch_close(p);
+    REQUIRE(!live);
+    one_file(path);
+  }
+  lc_error_cleanup(&e);
+}
+static void retention_progress_capacity(const char *directory) {
+  char path[1400];
+  char *key = malloc((size_t)PS_MIB + 1);
+  lc_error e;
+  REQUIRE(key);
+  memset(key, '%', (size_t)PS_MIB);
+  key[PS_MIB] = 0;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync)
+    for (int cold = 0; cold < 2; ++cold) {
+      retention_gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+      ps_io io = {&g,
+                  retention_gate_read,
+                  retention_gate_write,
+                  retention_gate_sync,
+                  retention_gate_reserve,
+                  NULL};
+      REQUIRE(snprintf(path, sizeof(path), "%s/retention-progress-%d-%d",
+                       directory, sync, cold) < (int)sizeof(path));
+      lc_pouch *p = visit_open(path, 0, sync, 1, &io, &allocator, &e);
+      ok(lc_pouch_retention_hint_ensure(p, "work/a", &e), &e);
+      ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key, 0, 0,
+                                       &e),
+         &e);
+      if (cold) {
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        retention_bootstrap_cuts(path, sync, &io, &e);
+        p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+      }
+      ps_root *root = ps_pouch_state_root(p);
+      ps_space *space = ps_root_space(root);
+      ps_namespace *ns = NULL;
+      ps_namespace_info owner;
+      ps_reader *pin = NULL, *selected = NULL;
+      ps_ref before_ref, after_ref;
+      ps_stats before, after;
+      ok(ps_root_namespace_acquire(root, "work/a", 0, &ns, &e), &e);
+      ok(ps_namespace_identity(ns, &owner, &e), &e);
+      ps_key identity = {owner.owner, 3, PS_CONTROL};
+      ok(ps_read_open(space, identity, NULL, &pin, &e), &e);
+      REQUIRE(ps_read_size(pin) == PS_MIB + 80);
+      ps_read_reference(pin, &before_ref);
+      ok(ps_status(space, &before, &e), &e);
+      REQUIRE(before.budgets == 1 &&
+              before.reserved_payload_bytes == 2 * PS_PAGE);
+      ps_budget *peer = retention_peer(space, &e);
+      g.written_bytes = 0;
+      ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+      uint64_t claim_bytes = g.written_bytes;
+      REQUIRE(claim_bytes && claim_bytes < PS_CHUNK);
+      retention_expect(p, "work/a", 1, 1, key, 1, 2, &e);
+      ps_budget *second_peer = retention_peer(space, &e);
+      REQUIRE(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key,
+                                            3, 4, &e) == LC_ERR_INVALID);
+      clear(&e);
+      retention_expect(p, "work/a", 1, 1, key, 1, 2, &e);
+      g.written_bytes = 0;
+      ok(lc_pouch_retention_work_write(p, "work/a", 2, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+      uint64_t finish_bytes = g.written_bytes;
+      REQUIRE(finish_bytes && finish_bytes < PS_CHUNK);
+      ok(ps_read_open(space, identity, NULL, &selected, &e), &e);
+      ps_read_reference(selected, &after_ref);
+      REQUIRE(before_ref.incarnation == after_ref.incarnation &&
+              !memcmp(before_ref.container, after_ref.container, 16));
+      ps_reader_close(selected);
+      selected = NULL;
+      retention_expect(p, "work/a", 1, 2, key, 1, 2, &e);
+      ok(ps_budget_close(second_peer, &e), &e);
+      unsigned char original[80], retained[4096];
+      size_t got, at = 0;
+      ok(ps_read(pin, original, sizeof(original), &got, &e), &e);
+      REQUIRE(got == sizeof(original) && !memcmp(original, "LCPSRTWK", 8));
+      for (size_t byte = 16; byte < 32; ++byte)
+        REQUIRE(!original[byte]);
+      while (at < PS_MIB) {
+        size_t take = (size_t)PS_MIB - at;
+        if (take > sizeof(retained))
+          take = sizeof(retained);
+        ok(ps_read(pin, retained, take, &got, &e), &e);
+        REQUIRE(got == take && !memcmp(retained, key + at, got));
+        at += got;
+      }
+      ok(ps_status(space, &after, &e), &e);
+      REQUIRE(after.allocated_bytes <= before.allocated_bytes + 2 * PS_PAGE &&
+              after.capacity == PS_DEFAULT_CAPACITY && after.budgets == 1);
+      ok(ps_budget_close(peer, &e), &e);
+      /* Reusing every logical fact still requires a new work incarnation.
+       * The old selected progress cannot complete this new active work. */
+      ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+      retention_expect(p, "work/a", 1, 1, key, 1, 2, &e);
+      ok(ps_read_open(space, identity, NULL, &selected, &e), &e);
+      ps_read_reference(selected, &after_ref);
+      REQUIRE(after_ref.incarnation != before_ref.incarnation);
+      ps_reader_close(selected);
+      ps_reader_close(pin);
+      ps_namespace_release(ns);
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
+      retention_expect(p, "work/a", 1, 1, key, 1, 2, &e);
+      ok(lc_pouch_retention_work_write(p, "work/a", 2, retention_xid, key, 1, 2,
+                                       &e),
+         &e);
+      g.sync_calls = 0;
+      retention_store(p, "work/a", 0, NULL, &e);
+      REQUIRE(g.sync_calls == 1);
+      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &after, &e), &e);
+      REQUIRE(!after.budgets && !after.reserved_payload_bytes);
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      one_file(path);
+      printf("retention progress sync%d cold%d key_bytes=%llu "
+             "claim_written=%llu finish_written=%llu\n",
+             sync, cold, (unsigned long long)PS_MIB,
+             (unsigned long long)claim_bytes, (unsigned long long)finish_bytes);
+      REQUIRE(!pthread_cond_destroy(&g.changed) &&
+              !pthread_mutex_destroy(&g.mutex));
+    }
+  free(key);
+  lc_error_cleanup(&e);
+  retention_many_progress(directory);
+}
 typedef struct retention_actor {
   lc_pouch *p;
   const char *key;
   int remove, rc;
+  int read;
+  lc_pouch_retention_work work;
 } retention_actor;
 static void *retention_actor_run(void *context) {
   retention_actor *a = context;
   lc_error e;
   lc_error_init(&e);
-  a->rc = a->remove ? lc_pouch_retention_hint_remove(a->p, "work/a", &e)
-                    : lc_pouch_retention_work_write(
-                          a->p, "work/a", 2, retention_xid, a->key, 3, 4, &e);
+  a->rc = a->read ? lc_pouch_retention_work_read(a->p, "work/a", &a->work, &e)
+          : a->remove ? lc_pouch_retention_hint_remove(a->p, "work/a", &e)
+                      : lc_pouch_retention_work_write(
+                            a->p, "work/a", 2, retention_xid, a->key, 3, 4, &e);
   lc_error_cleanup(&e);
   return NULL;
+}
+static void retention_captured_completion(const char *directory) {
+  lc_error e;
+  char path[1400];
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync) {
+    retention_gate g = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+    ps_io io = {&g,
+                retention_gate_read,
+                retention_gate_write,
+                retention_gate_sync,
+                retention_gate_reserve,
+                NULL};
+    REQUIRE(snprintf(path, sizeof(path), "%s/retention-captured-%d", directory,
+                     sync) < (int)sizeof(path));
+    lc_pouch *p = visit_open(path, 0, sync, 1, &io, &allocator, &e);
+    ok(lc_pouch_retention_hint_ensure(p, "work/a", &e), &e);
+    retention_store(p, "work/a", 1, "old", &e);
+    retention_store(p, "work/a", 2, "old", &e);
+    retention_actor actor = {0};
+    actor.p = p;
+    actor.read = 1;
+    pthread_t thread;
+    g.enabled = g.captured_read = 1;
+    REQUIRE(!pthread_create(&thread, NULL, retention_actor_run, &actor));
+    struct timespec deadline;
+    REQUIRE(!clock_gettime(CLOCK_REALTIME, &deadline));
+    deadline.tv_sec += 10;
+    pthread_mutex_lock(&g.mutex);
+    int rc = 0;
+    while (!g.entered && !rc)
+      rc = pthread_cond_timedwait(&g.changed, &g.mutex, &deadline);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(!rc && g.entered);
+    /* The captured A identity and A completion stay coherent even after both
+     * selected controls advance to B. Payload reads hold no writer authority.
+     */
+    retention_store(p, "work/a", 1, "new", &e);
+    retention_store(p, "work/a", 2, "new", &e);
+    pthread_mutex_lock(&g.mutex);
+    g.released = 1;
+    pthread_cond_broadcast(&g.changed);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(!pthread_join(thread, NULL) && actor.rc == LC_OK);
+    REQUIRE(actor.work.phase == 2 && !strcmp(actor.work.key, "old"));
+    lc_pouch_retention_work_cleanup(p, &actor.work);
+    retention_expect(p, "work/a", 1, 2, "new", UINT64_MAX, UINT64_MAX, &e);
+    lc_pouch_close(p);
+    REQUIRE(!live);
+    one_file(path);
+    REQUIRE(!pthread_cond_destroy(&g.changed) &&
+            !pthread_mutex_destroy(&g.mutex));
+  }
+  lc_error_cleanup(&e);
 }
 static void retention_concurrency(const char *directory) {
   lc_error e;
@@ -1949,6 +2315,7 @@ static void retention_concurrency(const char *directory) {
     }
   free(key);
   lc_error_cleanup(&e);
+  retention_captured_completion(directory);
 }
 static void retention_compare(const char *directory, int reverse) {
   lc_error e;
@@ -1972,27 +2339,44 @@ static void retention_compare(const char *directory, int reverse) {
         lc_pouch *p = visit_open(path, native, sync, 1, NULL, NULL, &e);
         ok(lc_pouch_retention_hint_ensure(p, "work/a", &e), &e);
         for (int cold = 0; cold < 2; ++cold) {
-          retention_store(p, "work/a", 1, key, &e);
+          ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key,
+                                           0, 0, &e),
+             &e);
+          double close_ms = 0, reopen_ms = 0;
           if (cold) {
+            double boundary = namespace_clock(CLOCK_MONOTONIC);
             lc_pouch_close(p);
+            close_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - boundary);
+            boundary = namespace_clock(CLOCK_MONOTONIC);
             p = visit_open(path, native, sync, 0, NULL, NULL, &e);
+            reopen_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - boundary);
           }
+          retention_expect(p, "work/a", 1, 1, key, 0, 0, &e);
+          retention_store(p, "work/a", 0, NULL, &e);
           double cpu_start = namespace_clock(CLOCK_PROCESS_CPUTIME_ID);
           double start = namespace_clock(CLOCK_MONOTONIC);
-          for (int cycle = 0; cycle < 8; ++cycle)
-            for (int phase = 1; phase <= 3; ++phase) {
-              int state = phase % 3;
-              retention_store(p, "work/a", state, state ? key : NULL, &e);
-              retention_expect(p, "work/a", 1, state, state ? key : NULL,
-                               state ? UINT64_MAX : 0, state ? UINT64_MAX : 0,
-                               &e);
-            }
+          for (int cycle = 0; cycle < 8; ++cycle) {
+            ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, key,
+                                             0, 0, &e),
+               &e);
+            retention_expect(p, "work/a", 1, 1, key, 0, 0, &e);
+            retention_store(p, "work/a", 1, key, &e);
+            retention_expect(p, "work/a", 1, 1, key, UINT64_MAX, UINT64_MAX,
+                             &e);
+            retention_store(p, "work/a", 2, key, &e);
+            retention_expect(p, "work/a", 1, 2, key, UINT64_MAX, UINT64_MAX,
+                             &e);
+            retention_store(p, "work/a", 0, NULL, &e);
+            retention_expect(p, "work/a", 1, 0, NULL, 0, 0, &e);
+          }
           double elapsed_ms = 1000 * (namespace_clock(CLOCK_MONOTONIC) - start);
           double cpu_ms =
               1000 * (namespace_clock(CLOCK_PROCESS_CPUTIME_ID) - cpu_start);
           printf("retention-compare native=%d sync=%d cold=%d key_bytes=%lu "
-                 "cycles=8 elapsed_ms=%.6f cpu_ms=%.6f verified=1\n",
-                 native, sync, cold, (unsigned long)size, elapsed_ms, cpu_ms);
+                 "cycles=8 steps=4 elapsed_ms=%.6f cpu_ms=%.6f close_ms=%.6f "
+                 "reopen_ms=%.6f verified=1\n",
+                 native, sync, cold, (unsigned long)size, elapsed_ms, cpu_ms,
+                 close_ms, reopen_ms);
         }
         lc_pouch_close(p);
         REQUIRE(!live);
@@ -2658,6 +3042,8 @@ static void *worker(void *context) {
     retention_io_faults(r->directory);
   else if (!strcmp(r->mode, "retention-capacity"))
     retention_capacity(r->directory);
+  else if (!strcmp(r->mode, "retention-progress"))
+    retention_progress_capacity(r->directory);
   else if (!strcmp(r->mode, "retention-capacity-faults"))
     retention_capacity_faults(r->directory);
   else if (!strcmp(r->mode, "retention-concurrency"))

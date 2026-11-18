@@ -22,6 +22,7 @@ static void put64(unsigned char *p, uint64_t n) {
 }
 static ps_key key_for(ps_namespace *ns, enum lc_pouch_storage_work_kind kind) {
   ps_key key;
+  /* Namespace control slots 4..6; retention's progress owns slot 7. */
   key.owner = ns->identity.owner;
   key.key = 4U + (unsigned int)kind;
   key.kind = PS_CONTROL;

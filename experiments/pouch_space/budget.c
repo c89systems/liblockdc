@@ -338,6 +338,17 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
     rc = ps_budget_plan_value_bound(&next, deletion + 512, e);
   if (rc == LC_OK && deletion)
     rc = ps_budget_plan_value(&next, 128, e);
+  /* A future retention reference owns one raw key, not its escaped filename
+   * spelling. Claim facts and finish use bounded progress publications. The
+   * deletion bound includes the key and therefore conservatively bounds this
+   * identity.
+   */
+  if (rc == LC_OK && deletion)
+    rc = ps_budget_plan_value_bound(&next, deletion + 80, e);
+  if (rc == LC_OK && deletion)
+    rc = ps_budget_plan_value(&next, 80, e);
+  if (rc == LC_OK && deletion)
+    rc = ps_budget_plan_value(&next, 80, e);
   if (rc == LC_OK)
     *p = next;
   return rc;

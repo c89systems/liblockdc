@@ -242,6 +242,7 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   if (!d)
     return;
   ps_key_checkpoint_close(d->checkpoint);
+  (void)ps_budget_close(d->retention_budget, NULL);
   for (i = 0; i < d->count; ++i)
     ps_ns_resource_free(d->items[i]);
   for (r = d->retired; r; r = next) {
@@ -272,6 +273,8 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
     return failure(e, LC_ERR_TRANSPORT, "cannot initialize namespace mutex");
   }
   rc = head_read(d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_retention_restore(d, e);
   if (rc == LC_OK)
     rc = ps_key_checkpoint_open(ns, &d->checkpoint, e);
   if (rc == LC_OK)

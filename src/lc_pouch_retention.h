@@ -12,7 +12,7 @@ enum {
 };
 
 /* One coalesced namespace work reference. Outcomes live only in .txns.
- * Callers hold namespace mutation authority while changing this file. */
+ * Callers hold namespace mutation authority while changing its storage. */
 typedef struct lc_pouch_retention_work {
   int present;
   int phase;

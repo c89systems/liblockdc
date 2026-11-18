@@ -1716,6 +1716,11 @@ required beyond the [typed transaction authority](#typed-transaction-authority).
 
 ## Typed retention control ownership
 
+This section records the initial shared text representation. The later
+[native retention identity and progress owner](#native-retention-identity-and-progress-capacity)
+supersedes its container representation and capacity policy. The multifile owner
+continues using LPR1.
+
 The logical retention facade now dispatches discovery, work load/store and hint
 retirement through typed storage capabilities. Native Pouch keeps its existing
 atomic file owner. Both owners share the same LPR1 codec, preserving its idle,
@@ -3491,6 +3496,155 @@ namespace-lifetime intern contract; this batch does not prove a bound on all
 resident metadata over indefinite rotation history. The full goal remains active,
 the multifile default is retained and production cutover requires an explicit
 deployment decision.
+
+### Native retention identity and progress capacity
+
+The storage boundary now exchanges structured retention facts rather than LPR1
+text. The multifile owner retains its existing codec and atomic file protocol.
+The container stores key bytes directly, so percent encoding and filename
+conventions no longer determine its work representation. This remains bounded,
+intentionally materialized control metadata; no application body or transaction
+outcome is copied into it. Public C APIs and their ABI are unchanged.
+
+Control slot 2 remains the durable discovery marker. Slot 3 owns one immutable
+identity: an 80-byte header containing the XID and initial facts, followed by the
+raw key. The complete value is exactly 80 bytes plus key length. Slot 7 owns
+an 80-byte progress record naming that identity's exact container/incarnation,
+with active/finished phase, fencing token and state version. Slots 4 through 6
+remain the ordinary, terminal and collection maintenance hints. Both the first
+claim and the finish now replace only progress, without rewriting a large key.
+Checksums and owner/length/field validation cover both representations. Exact
+key comparison uses bounded read buffers rather than treating a key CRC as
+identity authority.
+
+Reads capture identity and progress from one completed physical prefix before
+reading payloads outside publication authority. A completion for an older
+incarnation cannot finish a later work item, even when every logical fact and
+the XID/key are reused. Returning from finished to active creates a new identity.
+Idle durably removes the identity and releases its credits. Its obsolete small
+progress value can remain until hint retirement; absence of identity means idle,
+and the old incarnation cannot affect a later identity. This avoids a second
+idle durability barrier on every work cycle. Hint retirement clears progress
+before removing discovery. Controls remain durable on NoSync roots too.
+
+An initial zero-fenced reference admits its identity and two progress publications
+together: one for claim facts and one for finish. After claim publication, it
+retains exactly the final publication's capacity. Already claimed work needs
+only that final credit. Unused identity allocation slack returns after durable
+selection. A further active fact change must admit its replacement while keeping
+the remaining mandatory credits; rejection leaves accepted facts intact. Finished
+or idle work retains no completion claim. These are capacity claims under the
+existing allocator contract, not guarantees against memory or I/O failure;
+spent credits and failed private attempts retain the existing retry rules.
+
+Root admission reconstructs these summed claims before exposing ordinary
+writers. A scalar absence check avoids work payload I/O for namespaces without
+an identity. Existing work needs only a bounded header/progress read, without
+materializing its key or reading application bodies. Selected progress resolves
+whether to restore two publications, one or none. Malformed work remains a
+namespace-local consumption error with discovery intact; it does not prevent
+opening unrelated namespaces. The standing key maintenance plan also includes
+a bounded raw-key identity and both progress publications, in addition to its
+existing deletion, key-checkpoint, coverage, routing and relocation allowances.
+
+The 1 MiB percent-heavy key fixture holds a raw identity reader and lets peers
+claim all remaining capacity. Both warm and reopened owners publish claim and
+finish with 168 bytes of actual payload/journal writes each, under both policies.
+The identity's incarnation and original bytes remain unchanged. A further fact
+change rejected for capacity leaves the funded finish available. Reusing the
+facts after finish creates a different identity; stale progress cannot complete
+it. Idle uses one durability barrier. Bootstrap exercises 56 allocation cuts per
+policy, including partial-owner cleanup and subsequent successful admission.
+
+Another fixture starts 24 independent zero-fenced work references, fills ordinary
+capacity at 10 MiB, reopens and observes all 48 progress-page credits restored.
+While a maintenance peer holds the remaining capacity, every reference publishes
+its claim. Ordinary writers then consume released slack. All 24 finishes still
+succeed. After ordinary writers fill again, reopen restores no claims for finished
+work and all accepted facts survive. No file growth is performed. A paused-read
+case also advances both selected controls while an old captured read is suspended:
+the old complete tuple and the new complete tuple each remain coherent.
+
+The final ASan/UBSan Debug gate passes seventeen groups: public header/Pouch/source
+boundaries, all seven lease/expiry groups, retention fault sweeps, staging recovery,
+full-capacity tail reclamation, large-key deletion and root obligation admission.
+The control gate and subsequent raw-identity pin readback also pass. Allocation
+sweeps exercise 1,072 warm/cold cuts across both owners/policies, including NULL
+error outputs; physical fault sweeps exercise 148 lost/torn write, barrier and
+read cuts; full-capacity retry exercises another 108 allocation cuts. Those
+sweeps include active claim-fact updates as well as completion and hint retirement.
+GNU and native musl Release each pass all seventeen final affected groups with
+normal workers. Two ThreadSanitizer invocations pass the control concurrency and
+capacity/recovery fixtures using instrumented OpenSSL 3.6.5, 128 KiB workers and
+no suppressions. Three strict Memcheck invocations cover progress/capacity,
+concurrency and capacity faults: 53,533 matched allocations/frees, zero live heap,
+errors, suppressions or owned descriptors.
+
+Evidence is under `build/pouch-space-retention/`: `complete-debug.log`,
+`complete-debug-details.log`, `complete-controls-debug.log`, `proof-debug.log`,
+`qualified-gnu.log`, `qualified-musl.log`, `qualified-tsan.log` and
+`memcheck-*.log`. Earlier prototype/iteration logs in that directory are not the
+final qualification results. The private control representation changes without
+a format-marker bump or automatic existing-root conversion; these fixtures use
+fresh experimental roots.
+
+The matched GNU control comparison records 72 measurements: three samples of
+both current owners, both policies, warm/reopened ownership and 32-byte, 8 KiB or
+1 MiB percent-heavy keys. Each measurement verifies eight four-step sequences:
+initial zero-fenced reference, claim facts, finished and idle. Engine/policy order
+reverses for the middle sample. The following ratios are medians across
+per-configuration median-of-three ratios; lower is faster.
+
+| Key bytes | Control work / multifile | Control CPU / multifile |
+| --- | ---: | ---: |
+| 32 | 0.20x | 0.29x |
+| 8,192 | 0.31x | 0.34x |
+| 1,048,576 | 0.25x | 0.23x |
+
+Median container/file elapsed measurements are about 58.6/287.8, 93.7/289.1 and
+185.0/736.4 ms respectively. These cover all eight control sequences and their
+readback assertions, not one full expiry transaction. Transaction journals,
+leases, parent deletion and attachments are outside this timing. Active 1 MiB
+work has median owner-reopen time 3.92 ms versus 0.43 ms for multifile, and close
+0.04 ms versus 0.23 ms. Reopen measures admission before subsequent work validation;
+the container restores mandatory credits there. These are reopened owners with
+ordinary OS caching, not cold-disk measurements.
+
+A separate 48-run indexed comparison uses the frozen covered-tail build
+(`b692b873`) with the unchanged eight configurations and three samples per engine:
+24 x 4 KiB or 8 x 64 KiB bodies, one/four writers, both policies, preopened
+namespaces and four rounds. Work, readiness, reopen and close stay separate.
+
+| Measurement / prior container | NoSync | Durable |
+| --- | ---: | ---: |
+| Measured work | 0.97x | 1.03x |
+| Work CPU | 0.99x | 1.10x |
+| p50 write | 0.99x | 1.01x |
+| Indexed worker | 1.02x | 0.99x |
+| Reopen and verify | 0.99x | 0.92x |
+| Close | 1.09x | 1.09x |
+
+Per-configuration work ratios range from 0.81-1.12x for NoSync and 1.00-1.06x for
+durable work. Median current indexed-worker time is about 47.5/38.9 ms,
+reopen/verify 8.6/7.9 ms and close 0.93/0.82 ms (NoSync/durable). All single-writer
+sync-call medians match the frozen build; concurrent batching varies. The durable
+CPU increase is recorded rather than treated as a demonstrated no-regression
+result. These small host samples establish measured component costs, not
+production latency commitments. The earlier NoSync work/indexed-readiness gap
+against multifile remains unresolved. Raw measurements and complete medians are
+`retention-performance.log`, `paired-index-performance.log` and
+`performance-summary.json` in the same directory. The earlier three-step prototype
+probe is not used in these final comparisons.
+
+This completes the native retention reference and protected claim/finish control
+sequence. It does not fund the transaction journal and participant mutations
+started after reference admission. Complete public expiry and transactional
+messaging at capacity still require admission and recovery of those compound
+operations, including their staging, lease and attachment dependencies. Inherited
+checksum proof, abandoned private-grant cleanup, collection REGION relocation,
+codec conversion and shared-root coordination/recovery also remain. The full goal
+is active, multifile remains the default/reference, and production cutover still
+requires an explicit deployment decision.
 
 ### Root and namespace ownership
 

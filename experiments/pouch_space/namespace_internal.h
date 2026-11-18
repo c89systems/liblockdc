@@ -32,6 +32,7 @@ struct ps_namespace_data {
   ps_checkpoint_observer checkpoint_observer;
   int busy, checkpoint_ready;
   int retention_loaded, retention_present;
+  ps_budget *retention_budget;
 };
 
 /* Index helpers run under the namespace mutex (or before owner publication).
@@ -48,6 +49,7 @@ void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 /* Mutation authority never spans an application producer while holding a mutex.
  */
 int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
+int ps_ns_retention_restore(struct ps_namespace_data *, lc_error *);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
 void ps_ns_leave(struct ps_namespace_data *);
 int ps_ns_finish_seal(struct ps_namespace_data *, lc_error *);

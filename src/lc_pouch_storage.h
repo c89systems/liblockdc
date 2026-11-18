@@ -1,5 +1,6 @@
 #ifndef LC_POUCH_STORAGE_H
 #define LC_POUCH_STORAGE_H
+#include "lc_pouch_retention.h"
 #include "lc_pouch_state_record.h"
 
 /* Internal typed storage capabilities. The logical Pouch engine retains key
@@ -167,15 +168,15 @@ typedef struct lc_pouch_storage_ops {
    * No payload I/O, decoding, or current-directory lookup. */
   int (*source_clone)(void *, lc_source *, lc_source **, lc_error *);
   int (*retention_hint_ensure)(void *, const char *, lc_error *);
-  /* Bounded, materialized retention control metadata. Load returns owned
-   * length+1 writable bytes using the logical allocator, or NULL if absent.
-   * Store receives the shared LPR1 bytes; NULL/zero clears work to idle while
-   * retaining discovery. A hint must already exist. All changes are durable
-   * even on NoSync roots. Caller retains namespace mutation authority. */
-  int (*retention_work_load)(void *, const char *, char **, size_t *,
+  /* Bounded control metadata. Load returns owned fields using the logical
+   * allocator. Store borrows structured facts; idle clears work but retains
+   * discovery. Owners choose their representation and must already have a
+   * hint. Changes are durable even on NoSync roots. The caller retains
+   * namespace mutation authority. */
+  int (*retention_work_load)(void *, const char *, lc_pouch_retention_work *,
                              lc_error *);
-  int (*retention_work_store)(void *, const char *, const char *, size_t,
-                              lc_error *);
+  int (*retention_work_store)(void *, const char *,
+                              const lc_pouch_retention_work *, lc_error *);
   int (*retention_hint_remove)(void *, const char *, lc_error *);
   /* Advisory, opaque owner cursor; allocated name/cursor use logical allocator.
    * Discovery reads only hints, without opening work records or bodies. */

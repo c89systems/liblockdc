@@ -397,21 +397,21 @@ static int retention_namespace(ps_pouch_owner *owner, const char *name,
   ps_catalog_view_close(view);
   return rc;
 }
-static int retention_work_load(void *context, const char *name, char **out,
-                               size_t *bytes, lc_error *e) {
+static int retention_work_load(void *context, const char *name,
+                               lc_pouch_retention_work *out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_namespace *ns = NULL;
   int rc;
-  *out = NULL;
-  *bytes = 0;
+  memset(out, 0, sizeof(*out));
   rc = retention_namespace(owner, name, &ns, e);
   if (rc == LC_OK && ns)
-    rc = ps_namespace_retention_work_load(ns, &owner->allocator, out, bytes, e);
+    rc = ps_namespace_retention_work_load(ns, &owner->allocator, out, e);
   ps_namespace_release(ns);
   return rc;
 }
 static int retention_work_store(void *context, const char *name,
-                                const char *text, size_t bytes, lc_error *e) {
+                                const lc_pouch_retention_work *work,
+                                lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_namespace *ns = NULL;
   int rc = retention_namespace(owner, name, &ns, e);
@@ -421,7 +421,7 @@ static int retention_work_store(void *context, const char *name,
                      "state retention work requires an existing discovery hint",
                      NULL, NULL, "pouch");
   if (rc == LC_OK)
-    rc = ps_namespace_retention_work_store(ns, text, bytes, e);
+    rc = ps_namespace_retention_work_store(ns, work, e);
   ps_namespace_release(ns);
   return rc;
 }

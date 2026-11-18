@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_NAMESPACE_H
 #define POUCH_SPACE_NAMESPACE_H
+#include "lc_pouch_retention.h"
 #include "lc_pouch_state_record.h"
 #include "owned.h"
 #include "root.h"
@@ -59,15 +60,16 @@ int ps_namespace_retention_hint_get(ps_namespace *, int *, lc_error *);
 /* Presence only, without reading the control value. Consumption validates the
  * selected namespace so one malformed control cannot starve sibling names. */
 int ps_namespace_retention_hint_present(ps_namespace *, int *, lc_error *);
-/* Shared logical LPR1 metadata, materialized and bounded. Load allocates with
- * allocator, returning NULL for an absent hint and idle text for marker-only.
- * Store requires an existing hint; NULL/zero clears work to idle. Complete
- * replacements are funded before producing bytes, with at most one explicit
- * reclaim/checkpoint retry on capacity exhaustion. No implicit growth.
- * Callers hold logical namespace mutation authority while changing controls. */
+/* Native immutable work identity plus a small incarnation-bound progress
+ * record. Load allocates structured fields; a marker alone is idle. Store
+ * borrows its input and requires an existing hint. Active identity admission
+ * protects its claim and finish publications until finished/idle, including
+ * across root reopen. Callers hold logical namespace mutation authority while
+ * changing controls. */
 int ps_namespace_retention_work_load(ps_namespace *, const lc_allocator *,
-                                     char **, size_t *, lc_error *);
-int ps_namespace_retention_work_store(ps_namespace *, const char *, size_t,
+                                     lc_pouch_retention_work *, lc_error *);
+int ps_namespace_retention_work_store(ps_namespace *,
+                                      const lc_pouch_retention_work *,
                                       lc_error *);
 /* Always durably clears work before retiring its marker. */
 int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
