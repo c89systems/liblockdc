@@ -22,7 +22,7 @@ struct ps_stream {
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
-  int appending, recovering, repair_pending, sealed, retired;
+  int appending, recovering, repair_pending, sealed, retired, remapping;
 };
 struct ps_stream_writer {
   ps_stream *stream;
@@ -35,6 +35,8 @@ struct ps_stream_writer {
 struct ps_stream_window {
   ps_stream *stream;
   uint64_t start, end;
+  stream_run *runs;
+  size_t count;
 };
 struct ps_stream_reader {
   ps_stream_window window;
@@ -71,23 +73,42 @@ static int stream_grow(ps_stream *s, lc_error *error) {
 }
 /* Mapping is immutable after insertion. Capture by value under the stream
  * mutex so the pointer array may grow while readers perform physical I/O. */
-static int stream_mapping(ps_stream *s, uint64_t offset, stream_run *out,
-                          lc_error *error) {
-  size_t lo = 0, hi, mid;
-  pthread_mutex_lock(&s->mutex);
-  hi = s->count;
+static size_t mapping_lower(const stream_run *runs, size_t count,
+                            uint64_t offset) {
+  size_t lo = 0, hi = count, mid;
   while (lo < hi) {
     mid = lo + (hi - lo) / 2;
-    if (s->runs[mid].base + s->runs[mid].capacity <= offset)
+    if (runs[mid].base + runs[mid].capacity <= offset)
       lo = mid + 1;
     else
       hi = mid;
   }
+  return lo;
+}
+static int stream_mapping_next(ps_stream *s, uint64_t offset, stream_run *out,
+                               int *found) {
+  size_t at;
+  pthread_mutex_lock(&s->mutex);
+  at = mapping_lower(s->runs, s->count, offset);
+  *found = at < s->count;
+  if (*found) {
+    *out = s->runs[at];
+    ps_owned_run_retain(out->handle);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return LC_OK;
+}
+static int stream_mapping(ps_stream *s, uint64_t offset, stream_run *out,
+                          lc_error *error) {
+  size_t lo;
+  pthread_mutex_lock(&s->mutex);
+  lo = mapping_lower(s->runs, s->count, offset);
   if (lo == s->count || offset < s->runs[lo].base) {
     pthread_mutex_unlock(&s->mutex);
     return stream_error(error, LC_ERR_PROTOCOL, "stream range has no grant");
   }
   *out = s->runs[lo];
+  ps_owned_run_retain(out->handle);
   pthread_mutex_unlock(&s->mutex);
   return LC_OK;
 }
@@ -106,6 +127,7 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
       take = n;
     rc = writing ? ps_owned_write(run.handle, offset - run.base, p, take, error)
                  : ps_owned_read(run.handle, offset - run.base, p, take, error);
+    ps_owned_run_close(run.handle);
     if (rc != LC_OK)
       return rc;
     n -= take;
@@ -120,17 +142,28 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
  */
 static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
                          void *scratch, int *repaired, lc_error *error) {
-  stream_run run;
+  stream_run run = {0};
   uint64_t bytes, end, prior;
   ps_piece_checksum checksum, rebuilt = {0};
-  int rc;
+  int rc, found;
   while (s->checked < tail) {
-    rc = stream_mapping(s, s->checked, &run, error);
-    if (rc != LC_OK)
-      return rc;
-    end = run.base + run.capacity;
-    if (end > tail && !partial)
+    (void)stream_mapping_next(s, s->checked, &run, &found);
+    if (!found || run.base >= tail) {
+      if (found)
+        ps_owned_run_close(run.handle);
+      s->checked = tail;
+      memset(&s->checksum, 0, sizeof(s->checksum));
       break;
+    }
+    if (s->checked < run.base) {
+      s->checked = run.base;
+      memset(&s->checksum, 0, sizeof(s->checksum));
+    }
+    end = run.base + run.capacity;
+    if (end > tail && !partial) {
+      ps_owned_run_close(run.handle);
+      break;
+    }
     bytes = end > tail ? tail - run.base : run.capacity;
     prior = s->checked - run.base;
     rc = inspect ? ps_owned_piece_inspect(run.handle, bytes, &checksum, error)
@@ -148,6 +181,7 @@ static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
       if (rc == LC_OK && repaired)
         *repaired = 1;
     }
+    ps_owned_run_close(run.handle);
     if (rc != LC_OK)
       return rc;
     s->checked = run.base + bytes;
@@ -174,6 +208,7 @@ static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
     if (rc == LC_OK) {
       n = run.base + run.capacity - offset;
       rc = ps_owned_clear(run.handle, offset - run.base, n, zero, error);
+      ps_owned_run_close(run.handle);
       offset += n;
     }
   }
@@ -193,10 +228,11 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
                    const ps_ref *ref, ps_stream_recover_fn recover,
                    void *context, ps_stream **out, lc_error *error) {
   ps_owned_status status;
-  ps_owned_run *run = NULL;
+  ps_owned_run **captured = NULL;
   ps_stream *s;
   uint64_t i, accepted;
-  int rc, found, repaired = 0;
+  size_t count = 0;
+  int rc, repaired = 0;
   if (out)
     *out = NULL;
   if (!out)
@@ -216,25 +252,24 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     s->recovery_floor = status.tail;
     s->sealed = status.sealed;
   }
-  for (i = 0; rc == LC_OK && i < status.runs; ++i) {
+  if (rc == LC_OK)
+    rc = ps_owned_runs_capture(s->head, &captured, &count, error);
+  for (i = 0; rc == LC_OK && i < count; ++i) {
     rc = stream_grow(s, error);
-    if (rc == LC_OK)
-      rc = ps_owned_grant(s->head, NULL, s->capacity, 0, &run, &found, error);
-    if (rc == LC_OK && !found)
-      rc = stream_error(error, LC_ERR_PROTOCOL,
-                        "stream directory missing grant");
     if (rc == LC_OK) {
-      s->runs[s->count].handle = run;
-      s->runs[s->count].base = s->capacity;
-      s->runs[s->count].capacity = ps_owned_run_capacity(run);
-      s->capacity += ps_owned_run_capacity(run);
-      note_grant(s, ps_owned_run_capacity(run));
+      s->runs[s->count].handle = captured[i];
+      s->runs[s->count].base = ps_owned_run_base(captured[i]);
+      s->runs[s->count].capacity = ps_owned_run_capacity(captured[i]);
+      note_grant(s, ps_owned_run_capacity(captured[i]));
+      captured[i] = NULL;
       ++s->count;
     }
   }
-  if (rc == LC_OK && s->capacity != status.capacity)
-    rc = stream_error(error, LC_ERR_PROTOCOL,
-                      "stream directory capacity mismatch");
+  for (i = 0; i < count; ++i)
+    ps_owned_run_close(captured[i]);
+  lc_free_with_allocator(NULL, captured);
+  if (rc == LC_OK)
+    s->capacity = status.capacity;
   if (rc == LC_OK)
     rc = stream_pieces(s, s->tail, 1, s->sealed, NULL, NULL, error);
   if (rc == LC_OK && s->capacity && !s->sealed) {
@@ -281,7 +316,7 @@ int ps_stream_close(ps_stream *s, lc_error *error) {
   if (!s)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  if (s->appending || s->readers) {
+  if (s->appending || s->readers || s->remapping) {
     pthread_mutex_unlock(&s->mutex);
     return stream_error(error, LC_ERR_INVALID,
                         "close stream appenders and readers first");
@@ -312,6 +347,95 @@ int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
   }
   return rc;
 }
+int ps_stream_piece_next(ps_stream *s, uint64_t cursor,
+                         ps_stream_piece_info *out, int *found,
+                         lc_error *error) {
+  size_t at;
+  ps_owned_status status;
+  int rc;
+  if (found)
+    *found = 0;
+  if (!s || !out || !found)
+    return stream_error(error, LC_ERR_INVALID,
+                        "piece observation requires owner and outputs");
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_owned_status_get(s->head, &status, error);
+  at = mapping_lower(s->runs, s->count, cursor);
+  if (rc == LC_OK && at < s->count) {
+    out->base = s->runs[at].base;
+    out->bytes = s->runs[at].capacity;
+    out->completed_bytes = s->tail > out->base ? s->tail - out->base : 0;
+    if (out->completed_bytes > out->bytes)
+      out->completed_bytes = out->bytes;
+    out->mapped = ps_owned_run_mapped(s->runs[at].handle);
+    out->stored_bytes = ps_owned_run_storage(s->runs[at].handle);
+    *found = 1;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+int ps_stream_piece_matches(ps_stream *s, uint64_t base,
+                            const ps_owned_range *ranges, size_t count,
+                            int *matches, lc_error *error) {
+  size_t at;
+  int rc = LC_OK;
+  if (!s || !matches || (count && !ranges))
+    return stream_error(error, LC_ERR_INVALID,
+                        "piece comparison requires owner, ranges and output");
+  *matches = 0;
+  pthread_mutex_lock(&s->mutex);
+  at = mapping_lower(s->runs, s->count, base);
+  if (at == s->count || s->runs[at].base != base)
+    rc = stream_error(error, LC_ERR_INVALID, "piece is no longer selected");
+  else
+    *matches = ps_owned_run_matches(s->runs[at].handle, ranges, count);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
+                           const ps_owned_range *ranges, size_t count,
+                           ps_piece_select_fn select, void *context,
+                           lc_error *error) {
+  ps_owned_run *old = NULL, *replacement = NULL;
+  size_t at;
+  int rc;
+  if (!s)
+    return stream_error(error, LC_ERR_INVALID,
+                        "piece replacement requires owner");
+  pthread_mutex_lock(&s->mutex);
+  at = mapping_lower(s->runs, s->count, base);
+  rc = s->remapping || s->recovering || s->retired || at == s->count ||
+               s->runs[at].base != base
+           ? stream_error(error, LC_ERR_INVALID,
+                          "piece replacement is busy or unavailable")
+           : LC_OK;
+  if (rc == LC_OK) {
+    s->remapping = 1;
+    old = s->runs[at].handle;
+    ps_owned_run_retain(old);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_owned_run_repack(s->head, old, budget, ranges, count, select, context,
+                           &replacement, error);
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK) {
+    if (replacement)
+      s->runs[at].handle = replacement;
+    else {
+      memmove(s->runs + at, s->runs + at + 1,
+              (s->count - at - 1) * sizeof(*s->runs));
+      --s->count;
+    }
+  }
+  s->remapping = 0;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK)
+    ps_owned_run_close(old); /* replaced directory ownership */
+  ps_owned_run_close(old);   /* preparation capture */
+  return rc;
+}
 static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   ps_owned_status status;
   int rc;
@@ -320,8 +444,8 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
                         "stream transition requires owner");
   pthread_mutex_lock(&s->mutex);
   rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK &&
-      (s->appending || s->recovering || (!retirement && s->retired)))
+  if (rc == LC_OK && (s->appending || s->recovering || s->remapping ||
+                      (!retirement && s->retired)))
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream transition is busy or retired");
   if (rc == LC_OK)
@@ -652,6 +776,8 @@ void ps_stream_writer_close(ps_stream_writer *w) {
 static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
                         ps_stream_window *window, lc_error *error) {
   ps_owned_status status;
+  size_t first, last, i;
+  uint64_t cursor;
   int rc;
   pthread_mutex_lock(&s->mutex);
   rc = ps_owned_status_get(s->head, &status, error);
@@ -659,6 +785,34 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
                       bytes > s->tail - offset))
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream read outside committed prefix");
+  if (rc == LC_OK) {
+    first = mapping_lower(s->runs, s->count, offset);
+    last = first;
+    cursor = offset;
+    while (bytes && cursor < offset + bytes && last < s->count) {
+      if (s->runs[last].base > cursor)
+        break;
+      cursor = s->runs[last].base + s->runs[last].capacity;
+      ++last;
+    }
+    if (bytes && cursor < offset + bytes)
+      rc = stream_error(error, LC_ERR_PROTOCOL,
+                        "captured stream range is unmapped");
+    if (rc == LC_OK && last > first) {
+      window->runs =
+          lc_calloc_with_allocator(NULL, last - first, sizeof(*window->runs));
+      if (!window->runs)
+        rc =
+            stream_error(error, LC_ERR_NOMEM, "cannot capture stream mappings");
+    }
+    if (rc == LC_OK) {
+      window->count = last - first;
+      for (i = 0; i < window->count; ++i) {
+        window->runs[i] = s->runs[first + i];
+        ps_owned_run_retain(window->runs[i].handle);
+      }
+    }
+  }
   if (rc == LC_OK) {
     window->stream = s;
     window->start = offset;
@@ -669,6 +823,10 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
   return rc;
 }
 static void window_release(ps_stream_window *window) {
+  size_t i;
+  for (i = 0; i < window->count; ++i)
+    ps_owned_run_close(window->runs[i].handle);
+  lc_free_with_allocator(NULL, window->runs);
   pthread_mutex_lock(&window->stream->mutex);
   --window->stream->readers;
   pthread_mutex_unlock(&window->stream->mutex);
@@ -694,11 +852,32 @@ int ps_stream_window_open(ps_stream *s, uint64_t offset, uint64_t bytes,
 }
 int ps_stream_window_read(ps_stream_window *window, uint64_t offset,
                           void *bytes, size_t n, lc_error *error) {
+  unsigned char *out = bytes;
+  size_t at, take;
+  int rc;
   if (!window || (!bytes && n) || offset < window->start ||
       offset > window->end || n > window->end - offset)
     return stream_error(error, LC_ERR_INVALID,
                         "offset read outside captured stream window");
-  return stream_io(window->stream, offset, bytes, n, 0, error);
+  at = mapping_lower(window->runs, window->count, offset);
+  while (n) {
+    stream_run *run;
+    if (at == window->count || offset < window->runs[at].base)
+      return stream_error(error, LC_ERR_PROTOCOL,
+                          "captured stream range is unmapped");
+    run = &window->runs[at];
+    take = (size_t)(run->base + run->capacity - offset);
+    if (take > n)
+      take = n;
+    rc = ps_owned_read(run->handle, offset - run->base, out, take, error);
+    if (rc != LC_OK)
+      return rc;
+    offset += take;
+    out += take;
+    n -= take;
+    ++at;
+  }
+  return LC_OK;
 }
 void ps_stream_window_close(ps_stream_window *window) {
   if (!window)
@@ -741,7 +920,7 @@ int ps_stream_read(ps_stream_reader *r, void *bytes, size_t n, size_t *out,
       take = (size_t)(r->window.end - r->offset);
       if (take > PS_CHUNK)
         take = PS_CHUNK;
-      rc = stream_io(r->window.stream, r->offset, r->buffer, take, 0, error);
+      rc = ps_stream_window_read(&r->window, r->offset, r->buffer, take, error);
       if (rc != LC_OK)
         return rc;
       r->at = 0;

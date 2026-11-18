@@ -244,6 +244,7 @@ static size_t source_read(lc_source *pub, void *bytes, size_t length,
   ps_pouch_source *source = pub->impl;
   struct iovec part;
   size_t at, n;
+  int rc;
   if (source->failed) {
     lc_error_set(e, LC_ERR_PROTOCOL, 0, "container body checksum mismatch",
                  NULL, NULL, "pouch");
@@ -262,10 +263,13 @@ static size_t source_read(lc_source *pub, void *bytes, size_t length,
   }
   part.iov_base = bytes;
   part.iov_len = length;
-  if (lc_pouch_record_io_read(ps_namespace_read_input(source->window),
-                              source->start + source->offset, &part, 1,
-                              e) != LC_OK)
+  rc = lc_pouch_record_io_read(ps_namespace_read_input(source->window),
+                               source->start + source->offset, &part, 1, e);
+  if (rc != LC_OK) {
+    if (rc == LC_ERR_PROTOCOL)
+      source->failed = 1;
     return 0;
+  }
   source->offset += length;
   if (source->verify) {
     for (at = 0; at < length; at += n) {

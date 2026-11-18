@@ -3019,13 +3019,147 @@ cost remains optimization work; the earlier multifile comparison is still a
 separate checkpoint-stage baseline. Raw rows and the complete summaries are
 `paired-performance.log` and `paired-summary.json` in the same stage directory.
 
-This is the independently checked namespace piece foundation. It does not yet
-replace mappings, discard dead ranges, relocate mixed pieces or establish
-standing-capacity progress. Collection REGION owners permit independent uploads
-inside allocated ranges and still require their own completed-unit integration;
-they are not forced through the namespace stream's single-appender policy.
-Sparse mapping/pin generations, bounded reclamation, computed standing admission
-and recovery of all outstanding root obligations remain required next work.
+This milestone established independently checked namespace pieces. The following
+stage adds sparse mappings, reader generations and bounded range reclamation.
+Collection REGION owners permit independent uploads inside allocated ranges and
+still require their own completed-unit integration; they are not forced through
+the namespace stream's single-appender policy. Computed standing admission and
+recovery of all outstanding root obligations remain required work.
+
+### Sparse mappings and bounded namespace reclamation
+
+Completed namespace pieces can now become immutable packed values containing
+only their live encoded body ranges, or disappear when no live ranges remain.
+The same typed owned-run capability describes raw append grants and immutable
+replacement maps. Its descriptor explicitly records logical span and mapping
+form; a raw grant descriptor is now 104 bytes. Old private fixtures must be
+recreated. There is no migration, alternate legacy reader, public ABI change or
+change to the default multifile backend.
+
+Logical source offsets and high waters no longer depend on physical container
+capacity. Heads index only present mappings, including during checkpoint
+recovery and source retirement. A captured read window retains the exact mapping
+handles it admitted. Replacing the current map cannot redirect an existing
+reader. Durable selection and the root checkpoint retirement protocol govern
+reuse; closing the final old reader releases protected pages without another
+body rewrite. Required holes produce protocol errors. Body labels, offsets,
+encoded bytes, canonical CRCs and crypto binding contexts remain stable.
+
+The checkpoint owner maintains an intrusive augmented AVL interval index for
+each referenced source. Accepted scalar key summaries update it without
+allocation. Piece capture visits overlapping body references and returns their
+coalesced union, including live stage aliases. Metadata-only lease changes with
+the same body do not change the source's body generation. Prepared ownership and
+generation checks reject stale selection. A new capture defers while dirty key
+metadata could still supersede bodies in the selected checkpoint.
+
+One candidate verifies and copies at most one existing bounded piece, then
+reacquires logical namespace authority and checks its captured liveness before
+durable publication. The production maintenance path releases its outer logical
+lock during copying. Tests hold an actual encoded-map write while a metadata
+update in the same namespace, a sibling publication and an admitted body reader
+finish. A separate test changes body ownership during copying, checkpoints a
+peer and rejects the stale candidate. Metadata views continue to defer
+reclamation until they can no longer admit historical body references.
+
+Maps choose the smaller of a compact range table and a byte bitmap. Fragmented
+maps retain the bitmap with a small rank directory in memory, rather than
+expanding every live byte into a range object. Header/table checksums protect
+metadata admission; immutable extent CRCs protect the encoded replacement.
+Recovery rejects a candidate whose complete descriptor persisted without its
+payload and retains the raw predecessor. Reconstructed raw checksums still
+require canonical body validation; they remain deferred rather than becoming
+independent evidence for a replacement.
+
+The cell allocator can split its final subpage tail once to use existing slack,
+then fit the remainder in another interval or one new page. This adds at most one
+extent to the immutable-value budget bound. Three 4 KiB raw pages with 2,000 live
+bytes each now pack into two physical payload pages. The alternating-byte case
+retains thousands of disjoint ranges with a bitmap under 2 KiB and no individual
+replacement allocation larger than the existing 16 KiB chunk plus its control
+structure. Several bounded buffers may coexist; no complete body or source is
+materialized.
+
+A forced namespace pass visits at most sixteen present pieces per source. Its
+cached cursor advances successive passes and restarts after the unfinished tail,
+so later body replacement can make earlier maps reclaimable. Unchanged ranges
+and replacements that would not reduce owned allocation are skipped. Whole
+unreferenced sealed sources still retire through their existing owner. Private
+maintenance results now report selected retained encoded-body bytes and complete
+map-value bytes; rejected candidates are excluded, while I/O probes account for
+attempted work. The comparison harness verifies the checkpoint's key set and
+bounded relocation instead of requiring a complete source copy.
+
+The fixed-capacity namespace fixture streams a 1 MiB stable body and replaces a
+192 KiB neighbor 52 times while retaining the original stable reader. Both sync
+policies finish with logical tail 11,299,172, physical capacity 10,485,760,
+1,290,240 bytes of physical payload reservation and 79 present mappings. Across
+the complete run, selected replacement map values total 447,166 bytes. Payload
+reservation excludes root/metadata workspace and includes old payload held by
+the reader at that observation. No growth is performed. Both bodies pass byte
+and canonical CRC validation after reopen. The lower owner also passes 660
+append/remove cycles at 10 MiB with logical offsets beyond physical capacity.
+
+The final ASan/UBSan Debug gate passes 25 groups, including 292 maintenance
+allocation cuts, 336 maintenance I/O cuts, actual-copy concurrency, large keys,
+compaction comparisons, queue/outbox/XA controls and standard API/editor/boundary
+checks. Additional gates cover the complete eight-configuration query SDK matrix,
+public lease lifecycle/protection/concurrency, canonical checkpoint fault cuts,
+large atomic groups and stream lifecycle/recovery. Replacement fixtures exercise
+all 70 write/sync, allocation and read failure sites across both map encodings
+and both durability policies, plus selectively persisted candidate payload loss.
+GNU and native musl Release each pass fifteen core groups and eleven final
+publication/compaction groups with normal worker defaults. Six ThreadSanitizer
+invocations pass using instrumented OpenSSL 3.6.5, 128 KiB workers and no
+suppressions. Four strict Memcheck invocations finish with 69,562 matched
+allocations/frees, zero live heap, errors, suppressions or owned descriptors.
+Evidence is retained under `build/pouch-space-reclaim/`: `final-debug.log`,
+`final-debug-details.log`, `qualification-gnu.log`, `final-gnu.log`,
+`qualification-musl.log`, `final-musl.log`, `qualification-tsan.log`,
+`qualification-memcheck.log` and `memcheck-*.log`.
+
+The matched GNU Release comparison verifies all 72 runs: eight configurations,
+three samples each of the frozen piece-integrity build, this implementation and
+the current multifile reference. It uses 24 x 4 KiB or 8 x 64 KiB bodies, one/four
+writers, both policies, preopened namespaces and four rounds over the same keys.
+The following are median-of-three ratios per configuration, then medians across
+configurations; lower is faster. Work, readiness, reopen and close are separate
+measurements.
+
+| Measurement | NoSync | Durable |
+| --- | ---: | ---: |
+| Measured work / frozen container | 0.96x | 0.95x |
+| Work CPU / frozen container | 0.96x | 1.07x |
+| p50 write / frozen container | 0.91x | 0.98x |
+| Reopen and verify / frozen container | 0.92x | 0.99x |
+| Measured work / multifile | 2.81x | 0.92x |
+| Work CPU / multifile | 1.00x | 0.97x |
+| p50 write / multifile | 0.94x | 0.79x |
+| Indexed worker / multifile | 11.13x | 5.87x |
+| Reopen and verify / multifile | 2.10x | 2.62x |
+| Close / multifile | 0.012x | 0.011x |
+
+The new/frozen work ratios range from 0.84-1.23x for NoSync and 0.89-1.17x for
+durable work. These small host samples support comparable container cost, not a
+statistical speedup or production latency commitment. Against multifile, the
+remaining NoSync workflow cost is visible despite comparable write latency and
+CPU. Median indexed-worker measurements across the configurations are about
+61.2/35.7 ms for this backend versus 4.9/6.0 ms for multifile (NoSync/durable).
+Median close is about 0.5 ms versus 39.4/47.6 ms; reopen/verify is about 5.5 ms
+versus 2.3-2.6 ms. Indexed publication/readiness and cold admission remain
+optimization work. Raw measurements and complete per-configuration medians are
+`paired-performance.log` and `paired-summary.json` in the same stage directory.
+
+This completes bounded namespace range replacement, not the full backend or its
+standing-capacity proof. Unfinished active tails, captured metadata views,
+changing body ownership and inherited checksum obligations can retain pending
+work. Threshold/completion scheduling still needs to follow physical and deferred
+obligations as logical high waters grow. Computed standing reserve and root-wide
+reconstruction of every outstanding capacity obligation before any producer are
+still required; the current fixed floor and lazy namespace recovery do not prove
+that property. Collection REGION relocation, codec conversion and shared-root
+coordination/recovery remain separate required surfaces. Production cutover
+still requires an explicit deployment decision. The full goal remains active.
 
 ### Root and namespace ownership
 

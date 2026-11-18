@@ -70,19 +70,21 @@ int ps_pouch_client_open(const lc_client_config *, int create,
                          const ps_pouch_client_options *, lc_client **,
                          lc_error *);
 typedef struct ps_pouch_compaction_result {
+  /* Selected retained encoded body bytes and map-value bytes, respectively.
+   * Rejected candidates are excluded; I/O probes measure attempted work. */
   uint64_t records, metadata_bytes, body_bytes, copied_bytes;
   uint64_t snapshot, boundary, reclaimed_sources, pending_sources;
   int skipped;
 } ps_pouch_compaction_result;
-/* One forced ordinary-state compaction pass. Relocates one source into a
- * sealed body pack, publishes a metadata-only logical snapshot, then rechecks
- * the current tail before retirement. Copies run outside namespace authority.
- * Live staged records defer this pass; resolved historical stages may be
- * omitted. Collection maintenance uses the separate entry point below or the
- * public namespace maintenance API. Ordinary compaction preserves valid indexes
- * or durably invalidates them before retirement when indexing is disabled.
- * Known canonical spans are reserved before copying; complete protected
- * metadata/rotation admission at full capacity is still pending. */
+/* Checkpoints changed key metadata, retires unreferenced sealed sources, and
+ * reclaims at most sixteen completed pieces per live/active source. A cached
+ * cursor advances later passes. Encoded copying runs outside namespace
+ * authority; selection reacquires it and revalidates body ownership. Live
+ * stages retain their ranges and captured readers retain old mappings. Logical
+ * body references and query indexes remain stable. Collection maintenance uses
+ * its separate owner below. One candidate is funded before copying; computed
+ * standing capacity and reconstruction of all root obligations remain pending.
+ */
 int ps_pouch_state_compact(lc_pouch *, const char *ns,
                            ps_pouch_compaction_result *, lc_error *);
 /* Explicit collection retention, compaction, query repair and storage cleanup.

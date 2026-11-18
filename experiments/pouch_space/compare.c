@@ -1213,9 +1213,12 @@ static void compact_all(comparison *c, lc_error *e) {
       ps_pouch_compaction_result result;
       check(ps_pouch_state_compact(c->pouch, ns, &result, e), e);
       require(!result.skipped && result.snapshot && result.boundary == 1 &&
-                  result.copied_bytes ==
-                      (c->rows + c->writers - 1 - i) / c->writers * c->bytes,
-              "container compaction copies the current bodies of one prefix");
+                  result.records ==
+                      (c->rows + c->writers - 1 - i) / c->writers &&
+                  result.body_bytes <= result.copied_bytes &&
+                  result.copied_bytes <= 16 * PS_CHUNK,
+              "container compaction checkpoints the keys and bounds encoded "
+              "relocation");
     } else {
       lc_pouch_maintenance_options options = {0};
       lc_pouch_maintenance_result result = {0};

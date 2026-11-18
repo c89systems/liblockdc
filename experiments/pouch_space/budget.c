@@ -29,13 +29,14 @@ int ps_budget_plan_routing(ps_budget_plan *p, int create, lc_error *e) {
   return plan_add(p, PS_PAGE, create ? 88 : 0, create ? 1 : 0, e);
 }
 int ps_budget_plan_value(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
-  uint64_t pages;
+  uint64_t pages, extents;
   if (bytes > (uint64_t)INT64_MAX)
     return invalid(e, "capacity plan immutable value exceeds local bounds");
   pages = bytes / PS_PAGE + (bytes % PS_PAGE != 0);
-  if (pages > (PS_JOURNAL - 64) / 24)
+  extents = pages + (bytes % PS_PAGE != 0);
+  if (extents > (PS_JOURNAL - 64) / 24)
     return invalid(e, "capacity plan value extents exceed journal capacity");
-  return plan_add(p, pages * PS_PAGE, 64 + pages * 24, 1, e);
+  return plan_add(p, pages * PS_PAGE, 64 + extents * 24, 1, e);
 }
 int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   uint64_t pages;
@@ -43,9 +44,32 @@ int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
     return invalid(e, "capacity plan canonical span exceeds local bounds");
   pages = bytes / (PS_PAGE - PS_RUN_HEADER) +
           (bytes % (PS_PAGE - PS_RUN_HEADER) != 0);
-  if (pages > UINT64_MAX / PS_PAGE || pages > UINT64_MAX / 88)
+  if (pages > UINT64_MAX / PS_PAGE ||
+      pages > UINT64_MAX / PS_OWNED_DESCRIPTOR_BYTES)
     return invalid(e, "capacity plan canonical span overflows physical bounds");
-  return plan_add(p, pages * PS_PAGE, pages * 88, pages, e);
+  return plan_add(p, pages * PS_PAGE, pages * PS_OWNED_DESCRIPTOR_BYTES, pages,
+                  e);
+}
+int ps_budget_plan_piece(ps_budget_plan *p, uint64_t logical, size_t ranges,
+                         uint64_t live, lc_error *e) {
+  ps_budget_plan next;
+  uint64_t table;
+  int rc;
+  if (!p || !logical || logical > PS_CHUNK || ranges > logical ||
+      live > logical || (!!ranges != !!live))
+    return invalid(e, "piece capacity plan requires bounded live ranges");
+  if (!ranges)
+    return LC_OK;
+  next = *p;
+  table = (uint64_t)ranges * 8;
+  if (table > (logical + 7) / 8)
+    table = (logical + 7) / 8;
+  rc = ps_budget_plan_value(&next, 64 + table + live, e);
+  if (rc == LC_OK)
+    rc = plan_add(&next, 0, 16, 0, e);
+  if (rc == LC_OK)
+    *p = next;
+  return rc;
 }
 int ps_budget_plan_preferred_span(ps_budget_plan *p, uint64_t bytes,
                                   uint64_t preferred, lc_error *e) {

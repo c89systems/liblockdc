@@ -307,7 +307,8 @@ static int checkpoint_visit(void *context, uint64_t segment,
 }
 static void checkpoint_put(ps_root *root, ps_namespace *ns,
                            const char *key_name, uint64_t index,
-                           uint64_t version, int commit, uint64_t target) {
+                           uint64_t version, uint64_t lifetime, int commit,
+                           uint64_t target) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry request = {0}, result = {0};
   ps_namespace_append *append = NULL;
@@ -317,7 +318,7 @@ static void checkpoint_put(ps_root *root, ps_namespace *ns,
   request.payload_context = "checkpoint";
   request.index_seq = index;
   request.version = version;
-  request.lifetime = version == 1 ? index : 1;
+  request.lifetime = lifetime;
   request.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
   OK(lc_source_from_memory("data", 4, &source, &error));
   OK(ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, &append,
@@ -347,7 +348,7 @@ static void checkpoint_namespace(int durable) {
   OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
   for (i = 0; i < 70; ++i) {
     CHECK(snprintf(name, sizeof(name), "lease/%u", (unsigned int)i) > 0);
-    checkpoint_put(root, ns, name, i + 1, 1, 1, 0);
+    checkpoint_put(root, ns, name, i + 1, 1, i + 1, 1, 0);
   }
   OK(ps_namespace_status_get(ns, &status, &error));
   CHECK(status.checkpoint_epoch && status.checkpoint_keys == 70 &&
@@ -355,10 +356,10 @@ static void checkpoint_namespace(int durable) {
   OK(ps_namespace_view_open(ns, &view, &error));
   OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
   CHECK(seen.count == 70 && seen.maximum == 70 && seen.first_version == 1);
-  checkpoint_put(root, ns, "aborted", 71, 1, 0, 0);
+  checkpoint_put(root, ns, "aborted", 71, 1, 71, 0, 0);
   OK(ps_namespace_status_get(ns, &status, &error));
   CHECK(status.checkpoint_keys == 70 && status.pending_keys == 6);
-  checkpoint_put(root, ns, "lease/0", 71, 2, 1, 1);
+  checkpoint_put(root, ns, "lease/0", 71, 2, 1, 1, 1);
   OK(ps_namespace_checkpoint_flush(ns, &error));
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1) == 69);
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 2) == 1);
@@ -683,12 +684,12 @@ static void checkpoint_retirement(int durable) {
   options.storage.durable_sync = durable;
   OK(ps_root_open(path, 1, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
-  checkpoint_put(root, ns, "lease/0", 1, 1, 1, 0);
+  checkpoint_put(root, ns, "lease/0", 1, 1, 1, 1, 0);
   OK(ps_namespace_checkpoint_flush(ns, &error));
   pin.ns = ns;
   OK(ps_namespace_view_open(ns, &view, &error));
   OK(ps_namespace_view_visit(view, 1, checkpoint_pin_visit, &pin, &error));
-  checkpoint_put(root, ns, "lease/0", 2, 2, 1, 1);
+  checkpoint_put(root, ns, "lease/0", 2, 2, 1, 1, 1);
   OK(ps_namespace_checkpoint_flush(ns, &error));
   CHECK(!ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1));
   CHECK(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &error) ==

@@ -21,12 +21,14 @@ typedef struct source_count source_count;
 typedef struct slot_change slot_change;
 typedef struct key_summary {
   uint64_t index, query, version, lifetime;
+  uint64_t body_start, body_end;
   unsigned char type;
   int found, body, has_hidden, hidden;
 } key_summary;
 struct source_count {
   unsigned int kind;
-  uint64_t id, references, prepared;
+  uint64_t id, references, prepared, epoch;
+  key_slot *ranges;
   source_count *next;
 };
 struct key_slot {
@@ -38,6 +40,9 @@ struct key_slot {
   source_count *body;
   key_slot *next, *hash_next, *id_next;
   key_slot *dirty_next, **dirty_link;
+  key_slot *left, *right;
+  uint64_t range_end;
+  unsigned int height;
 };
 struct slot_change {
   key_slot *slot;
@@ -57,6 +62,7 @@ struct ps_key_checkpoint {
   size_t capacity, count, source_capacity, source_count;
   uint64_t dirty_count, dirty_bytes, uncovered_bytes;
   uint64_t latest_segment, latest_offset, state_index, query_index;
+  uint64_t body_epoch;
   ps_checkpoint_info selected;
   ps_budget *budget;
   ps_budget_plan claim;
@@ -77,6 +83,92 @@ struct ps_checkpoint_delta {
 
 static int failure(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
+}
+/* One intrusive AVL interval index per logical source. Metadata-only lease
+ * updates leave it alone; selecting a piece visits only overlapping bodies.
+ * Nodes are already funded key slots, so canonical accept cannot allocate. */
+static unsigned int range_height(key_slot *s) { return s ? s->height : 0; }
+static void range_update(key_slot *s) {
+  unsigned int a = range_height(s->left), b = range_height(s->right);
+  s->height = 1 + (a > b ? a : b);
+  s->range_end = s->summary.body_end;
+  if (s->left && s->left->range_end > s->range_end)
+    s->range_end = s->left->range_end;
+  if (s->right && s->right->range_end > s->range_end)
+    s->range_end = s->right->range_end;
+}
+static key_slot *range_left(key_slot *s) {
+  key_slot *r = s->right;
+  s->right = r->left;
+  r->left = s;
+  range_update(s);
+  range_update(r);
+  return r;
+}
+static key_slot *range_right(key_slot *s) {
+  key_slot *l = s->left;
+  s->left = l->right;
+  l->right = s;
+  range_update(s);
+  range_update(l);
+  return l;
+}
+static key_slot *range_balance(key_slot *s) {
+  if (!s)
+    return NULL;
+  range_update(s);
+  if (range_height(s->left) > range_height(s->right) + 1) {
+    if (range_height(s->left->right) > range_height(s->left->left))
+      s->left = range_left(s->left);
+    return range_right(s);
+  }
+  if (range_height(s->right) > range_height(s->left) + 1) {
+    if (range_height(s->right->left) > range_height(s->right->right))
+      s->right = range_right(s->right);
+    return range_left(s);
+  }
+  return s;
+}
+static int range_before(key_slot *a, key_slot *b) {
+  return a->summary.body_start < b->summary.body_start ||
+         (a->summary.body_start == b->summary.body_start && a->id < b->id);
+}
+static key_slot *range_insert(key_slot *root, key_slot *s) {
+  if (!root) {
+    s->left = s->right = NULL;
+    range_update(s);
+    return s;
+  }
+  if (range_before(s, root))
+    root->left = range_insert(root->left, s);
+  else
+    root->right = range_insert(root->right, s);
+  return range_balance(root);
+}
+static key_slot *range_detach_first(key_slot *root, key_slot **first) {
+  if (!root->left) {
+    *first = root;
+    return root->right;
+  }
+  root->left = range_detach_first(root->left, first);
+  return range_balance(root);
+}
+static key_slot *range_remove(key_slot *root, key_slot *s) {
+  key_slot *next;
+  if (root == s) {
+    if (!root->right)
+      return root->left;
+    next = NULL;
+    root->right = range_detach_first(root->right, &next);
+    next->left = root->left;
+    next->right = root->right;
+    return range_balance(next);
+  }
+  if (range_before(s, root))
+    root->left = range_remove(root->left, s);
+  else
+    root->right = range_remove(root->right, s);
+  return range_balance(root);
 }
 static uint64_t hash_key(const void *key, size_t n, unsigned int kind) {
   const unsigned char *p = key;
@@ -183,6 +275,8 @@ static void summarize(key_summary *s, const lc_pouch_state_entry *r) {
   s->type = r->record_type;
   s->found = r->found;
   s->body = r->payload_span.present;
+  s->body_start = r->payload_span.payload_offset;
+  s->body_end = s->body_start + r->payload_span.payload_length;
   s->has_hidden = r->has_query_hidden;
   s->hidden = r->query_hidden;
 }
@@ -211,6 +305,12 @@ static source_count *source_get(ps_key_checkpoint *c,
   size_t bucket, i, capacity;
   if (!r->found || !r->payload_span.present)
     return NULL;
+  if (r->payload_span.payload_offset > (uint64_t)INT64_MAX ||
+      r->payload_span.payload_length >
+          (uint64_t)INT64_MAX - r->payload_span.payload_offset) {
+    *rc = failure(e, LC_ERR_PROTOCOL, "checkpoint body range exceeds bounds");
+    return NULL;
+  }
   if (!ps_namespace_parse_source_leaf(r->payload_span.container_leaf, &kind,
                                       &id)) {
     *rc = failure(e, LC_ERR_PROTOCOL,
@@ -269,14 +369,29 @@ static void release_source(ps_key_checkpoint *c, source_count *source) {
   --c->source_count;
   lc_free_with_allocator(&c->allocator, source);
 }
-static void bind_source(ps_key_checkpoint *c, key_slot *s,
-                        source_count *source) {
+static void bind_source(ps_key_checkpoint *c, key_slot *s, source_count *source,
+                        const key_summary *summary) {
   source_count *prior = s->body;
-  if (prior)
+  if (prior == source && s->summary.body_start == summary->body_start &&
+      s->summary.body_end == summary->body_end) {
+    s->summary = *summary;
+    return;
+  }
+  ++c->body_epoch; /* preflighted before the infallible canonical accept */
+  if (prior) {
+    if (s->summary.body_end > s->summary.body_start)
+      prior->ranges = range_remove(prior->ranges, s);
     --prior->references;
+    prior->epoch = c->body_epoch;
+  }
+  s->summary = *summary;
   s->body = source;
-  if (source)
+  if (source) {
     ++source->references;
+    source->epoch = c->body_epoch;
+    if (s->summary.body_end > s->summary.body_start)
+      source->ranges = range_insert(source->ranges, s);
+  }
   release_source(c, prior);
 }
 static void release_prepared_source(ps_key_checkpoint *c,
@@ -399,8 +514,12 @@ static int load_slots(ps_key_checkpoint *c, lc_error *e) {
       slot->body = source_get(c, &entry, &rc, e);
     }
     if (rc == LC_OK) {
-      if (slot->body)
+      if (slot->body) {
         ++slot->body->references;
+        slot->body->epoch = ++c->body_epoch;
+        if (slot->summary.body_end > slot->summary.body_start)
+          slot->body->ranges = range_insert(slot->body->ranges, slot);
+      }
       insert_slot(c, slot);
       if (entry.index_seq > c->state_index)
         c->state_index = entry.index_seq;
@@ -495,8 +614,9 @@ uint64_t ps_key_checkpoint_source_refs(ps_key_checkpoint *c, unsigned int kind,
                                        uint64_t id) {
   source_count *source;
   uint64_t count = 0;
-  size_t bucket = (size_t)((id ^ kind) & (c->source_capacity - 1));
+  size_t bucket;
   pthread_mutex_lock(&c->mutex);
+  bucket = (size_t)((id ^ kind) & (c->source_capacity - 1));
   for (source = c->sources[bucket]; source; source = source->next)
     if (source->kind == kind && source->id == id) {
       count = source->references;
@@ -504,6 +624,98 @@ uint64_t ps_key_checkpoint_source_refs(ps_key_checkpoint *c, unsigned int kind,
     }
   pthread_mutex_unlock(&c->mutex);
   return count;
+}
+static source_count *source_find(ps_key_checkpoint *c, unsigned int kind,
+                                 uint64_t id) {
+  source_count *s;
+  for (s = c->sources[(id ^ kind) & (c->source_capacity - 1)]; s; s = s->next)
+    if (s->kind == kind && s->id == id)
+      return s;
+  return NULL;
+}
+static int range_busy(lc_error *e) {
+  return lc_error_set(e, LC_ERR_INVALID, 0,
+                      "captured body ownership is changing or stale", NULL,
+                      "pouch_namespace_busy", "pouch");
+}
+static int range_collect(key_slot *s, uint64_t base, uint64_t end,
+                         ps_checkpoint_ranges *out, size_t *capacity,
+                         lc_error *e) {
+  ps_owned_range *last, *grown;
+  uint64_t a, b;
+  size_t n;
+  int rc;
+  if (!s || s->range_end <= base)
+    return LC_OK;
+  rc = range_collect(s->left, base, end, out, capacity, e);
+  if (rc != LC_OK || s->summary.body_start >= end)
+    return rc;
+  a = s->summary.body_start > base ? s->summary.body_start : base;
+  b = s->summary.body_end < end ? s->summary.body_end : end;
+  if (b > a) {
+    a -= base;
+    b -= base;
+    last = out->count ? &out->ranges[out->count - 1] : NULL;
+    if (last && a <= last->offset + last->bytes) {
+      if (b > last->offset + last->bytes) {
+        out->bytes += b - last->offset - last->bytes;
+        last->bytes = b - last->offset;
+      }
+    } else {
+      if (out->count == *capacity) {
+        n = *capacity ? *capacity * 2 : 8;
+        grown =
+            lc_realloc_with_allocator(NULL, out->ranges, n * sizeof(*grown));
+        if (!grown)
+          return failure(e, LC_ERR_NOMEM,
+                         "cannot capture bounded body intervals");
+        out->ranges = grown;
+        *capacity = n;
+      }
+      out->ranges[out->count].offset = a;
+      out->ranges[out->count++].bytes = b - a;
+      out->bytes += b - a;
+    }
+  }
+  return range_collect(s->right, base, end, out, capacity, e);
+}
+int ps_key_checkpoint_ranges(ps_key_checkpoint *c, unsigned int kind,
+                             uint64_t id, uint64_t base, uint64_t bytes,
+                             ps_checkpoint_ranges *out, lc_error *e) {
+  source_count *s;
+  size_t capacity = 0;
+  int rc = LC_OK;
+  if (!c || !out || !bytes || bytes > PS_CHUNK ||
+      base > (uint64_t)INT64_MAX - bytes)
+    return failure(e, LC_ERR_INVALID, "body capture requires a bounded piece");
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&c->mutex);
+  s = source_find(c, kind, id);
+  if (s && s->prepared)
+    rc = range_busy(e);
+  if (rc == LC_OK && s) {
+    out->epoch = s->epoch;
+    rc = range_collect(s->ranges, base, base + bytes, out, &capacity, e);
+  }
+  pthread_mutex_unlock(&c->mutex);
+  if (rc != LC_OK) {
+    lc_free_with_allocator(NULL, out->ranges);
+    memset(out, 0, sizeof(*out));
+  }
+  return rc;
+}
+int ps_key_checkpoint_ranges_select(ps_key_checkpoint *c, unsigned int kind,
+                                    uint64_t id, uint64_t epoch,
+                                    ps_piece_publish_fn publish, void *ctx,
+                                    lc_error *e) {
+  source_count *s;
+  int rc;
+  pthread_mutex_lock(&c->mutex);
+  s = source_find(c, kind, id);
+  rc = (s && s->prepared) || (s ? s->epoch : 0) != epoch ? range_busy(e)
+                                                         : publish(ctx, e);
+  pthread_mutex_unlock(&c->mutex);
+  return rc;
 }
 int ps_key_checkpoint_read(ps_key_checkpoint *c, uint64_t id, ps_reader **out,
                            lc_error *e) {
@@ -829,6 +1041,9 @@ int ps_checkpoint_delta_prepare(ps_checkpoint_delta *d, lc_error *e) {
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
   if (rc == LC_OK)
+    if (d->count > UINT64_MAX - c->body_epoch)
+      rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
+  if (rc == LC_OK)
     d->prepared = 1;
   pthread_mutex_unlock(&c->mutex);
   return rc;
@@ -876,8 +1091,7 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
     s->pending = change->record;
     memset(&change->record, 0, sizeof(change->record));
     s->bound = change->bound;
-    s->summary = change->summary;
-    bind_source(c, s, change->body);
+    bind_source(c, s, change->body, &change->summary);
     release_prepared_source(c, change->body);
     change->body = NULL;
     dirty_add(c, s);
@@ -946,6 +1160,8 @@ int ps_key_checkpoint_replay(ps_key_checkpoint *c,
                   entry->control ? PS_KEY_DECISION : PS_KEY_METADATA, bytes, e);
   if (rc == LC_OK)
     rc = prepare_entry(&d, entry, e);
+  if (rc == LC_OK && d.count > UINT64_MAX - c->body_epoch)
+    rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
   pthread_mutex_unlock(&c->mutex);
   if (rc == LC_OK) {
     d.prepared = 1;

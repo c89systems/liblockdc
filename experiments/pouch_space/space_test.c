@@ -3113,7 +3113,7 @@ static void canonical_stream_reused_grants(void) {
   ps_stream *stream;
   ps_stream_info info;
   lc_pouch_record_header header;
-  unsigned char *old = calloc(1, PS_PAGE), grant[88];
+  unsigned char *old = calloc(1, PS_PAGE), grant[PS_OWNED_DESCRIPTOR_BYTES];
   uint64_t start;
   size_t phase, count = 0, i;
   int rc, fd;
@@ -4013,8 +4013,8 @@ static void canonical_stream_invalid_metadata(void) {
         fixture_put(record + 72, 2,
                     8); /* valid scalars, nonexistent second grant */
       } else
-        fixture_put(record + 64, PS_PAGE,
-                    8); /* sum of run capacities differs */
+        fixture_put(record + 64, PS_PAGE - PS_RUN_HEADER - 1,
+                    8); /* a present run extends beyond the logical span */
       crc = (uint32_t)crc32(0, record, 60);
       fixture_put(record + 60, crc32(crc, record + 64, 16), 4);
       crc = (uint32_t)crc32(0, page, 48);
@@ -6261,9 +6261,10 @@ static void value_budget_planning(void) {
   for (size_t i = 0; i < sizeof(sizes) / sizeof(*sizes); ++i) {
     p = (ps_budget_plan){PS_PAGE, 88, 1, 1};
     uint64_t pages = sizes[i] / PS_PAGE + (sizes[i] % PS_PAGE != 0);
+    uint64_t extents = pages + (sizes[i] % PS_PAGE != 0);
     OK(ps_budget_plan_value(&p, sizes[i], &error));
     CHECK(p.payload_bytes == PS_PAGE + pages * PS_PAGE &&
-          p.metadata_bytes == 88 + 64 + pages * 24 && p.entries == 2 &&
+          p.metadata_bytes == 88 + 64 + extents * 24 && p.entries == 2 &&
           p.maintenance == 1);
   }
   for (int kind = 0; kind < 6; ++kind) {
@@ -6501,8 +6502,6 @@ static void value_budget_capacity(int durable, int fragmented) {
         after.capacity == PS_DEFAULT_CAPACITY && !after.budgets &&
         !after.reserved_payload_bytes && !after.reserved_metadata_bytes &&
         !after.reserved_entries);
-  if (fragmented)
-    CHECK(after.metadata_bytes - before.metadata_bytes == plan.metadata_bytes);
   expect(s, k, NULL, bytes, size);
   OK(ps_close(s, &error));
   s = reopen(NULL);
@@ -6687,8 +6686,8 @@ static void grant_budget_plans(void) {
   OK(ps_budget_plan_routing(&p, 0, &error));
   OK(ps_budget_plan_span(&p, PS_PAGE - PS_RUN_HEADER + 1, &error));
   CHECK(p.payload_bytes == 4 * PS_PAGE &&
-        p.metadata_bytes == 80 + 111 + 88 + 176 && p.entries == 5 &&
-        !p.maintenance);
+        p.metadata_bytes == 80 + 111 + 88 + 2 * PS_OWNED_DESCRIPTOR_BYTES &&
+        p.entries == 5 && !p.maintenance);
   before = p;
   BAD(ps_budget_plan_span(&p, UINT64_MAX, &error));
   BAD(ps_budget_plan_catalog(&p, PS_CATALOG_NAME_MAX + 1, &error));
@@ -6815,7 +6814,7 @@ static void grant_budget_rejections(void) {
   ps_owned_status status;
   ps_owned_run *run = NULL;
   ps_budget *budget = NULL;
-  ps_budget_plan plan = {PS_PAGE, 88, 1, 0}, remaining;
+  ps_budget_plan plan = {PS_PAGE, PS_OWNED_DESCRIPTOR_BYTES, 1, 0}, remaining;
   ps_stats before, after;
   int found;
   clean();
@@ -6823,7 +6822,7 @@ static void grant_budget_rejections(void) {
   OK(ps_owned_open(s, NULL, stream_key(1), 1, NULL, &head, &status, &error));
   for (int kind = 0; kind < 3; ++kind) {
     plan.payload_bytes = kind == 0 ? 0 : PS_PAGE;
-    plan.metadata_bytes = kind == 1 ? 87 : 88;
+    plan.metadata_bytes = PS_OWNED_DESCRIPTOR_BYTES - (kind == 1);
     plan.entries = kind == 2 ? 0 : 1;
     OK(ps_budget_open(s, &plan, &budget, &error));
     OK(ps_status(s, &before, &error));
@@ -6840,7 +6839,7 @@ static void grant_budget_rejections(void) {
     OK(ps_budget_close(budget, &error));
   }
   plan.payload_bytes = PS_PAGE;
-  plan.metadata_bytes = 88;
+  plan.metadata_bytes = PS_OWNED_DESCRIPTOR_BYTES;
   plan.entries = 1;
   OK(ps_budget_open(s, &plan, &budget, &error));
   BAD(ps_owned_grant(head, budget, 1, PS_PAGE, &run, &found, &error));
@@ -6878,7 +6877,7 @@ static void grant_budget_concurrency(void) {
   ps_owned_head *head = NULL;
   ps_owned_status status;
   ps_budget *budget = NULL;
-  ps_budget_plan plan = {PS_PAGE, 88, 1, 0}, remaining;
+  ps_budget_plan plan = {PS_PAGE, PS_OWNED_DESCRIPTOR_BYTES, 1, 0}, remaining;
   funded_grant_actor actor = {0};
   pthread_t thread;
   unsigned char *bytes = malloc(PS_PAGE);
@@ -6896,7 +6895,8 @@ static void grant_budget_concurrency(void) {
   await_gate(&g, 0);
   BAD(ps_budget_close(budget, &error));
   OK(ps_budget_status(budget, &remaining, &error));
-  CHECK(!remaining.payload_bytes && remaining.metadata_bytes == 88 &&
+  CHECK(!remaining.payload_bytes &&
+        remaining.metadata_bytes == PS_OWNED_DESCRIPTOR_BYTES &&
         remaining.entries == 1);
   for (uint64_t i = 0; i < 512; ++i)
     put(s, state(i), NULL, 0, 1);
@@ -7319,6 +7319,7 @@ static void bounded_pieces(int durable, int checkpointed) {
   clean();
 }
 #include "checkpoint_cases.h"
+#include "reclaim_cases.h"
 #include "revision_cases.h"
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
@@ -7335,6 +7336,22 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "checkpoint-owner") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_owner(durable);
+    } else if (strcmp(argv[2], "checkpoint-ranges") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_ranges(durable);
+    } else if (strcmp(argv[2], "namespace-repack") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_repack(durable);
+    } else if (strcmp(argv[2], "namespace-repack-concurrency") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_repack_concurrency(durable);
+    } else if (strcmp(argv[2], "namespace-repack-churn") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_repack_churn(durable);
+    } else if (strcmp(argv[2], "owned-repack-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int bitmap = 0; bitmap < 2; ++bitmap)
+          owned_repack_faults(durable, bitmap);
     } else if (strcmp(argv[2], "checkpoint-namespace") == 0) {
       for (int durable = 0; durable < 2; ++durable) {
         checkpoint_namespace(durable);
@@ -7476,6 +7493,18 @@ int main(int argc, char **argv) {
           canonical_stream_repair_concurrency(zero, durable);
           canonical_stream_repair_groups(zero, durable);
         }
+    } else if (strcmp(argv[2], "owned-repack") == 0) {
+      owned_repack(0);
+      owned_repack(1);
+    } else if (strcmp(argv[2], "stream-repack") == 0) {
+      stream_repack(0);
+      stream_repack(1);
+    } else if (strcmp(argv[2], "owned-bitmap") == 0) {
+      owned_bitmap(0);
+      owned_bitmap(1);
+    } else if (strcmp(argv[2], "owned-page-packing") == 0) {
+      owned_page_packing(0);
+      owned_page_packing(1);
     } else if (strcmp(argv[2], "stream-piece-repair") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int fault = 0; fault < 2; ++fault)

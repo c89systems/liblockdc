@@ -11,6 +11,7 @@
 #define PS_OWNED_RUN 4U
 #define PS_RUN_IDENTITY_BYTES 64U
 #define PS_RUN_HEADER 96U
+#define PS_OWNED_DESCRIPTOR_BYTES 104U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;
 typedef struct ps_owned_status {
@@ -41,6 +42,35 @@ int ps_owned_inspect(ps_space *, ps_key, const ps_ref *, ps_owned_status *,
 int ps_owned_grant(ps_owned_head *, ps_budget *, uint64_t base,
                    uint64_t desired, ps_owned_run **, int *found, lc_error *);
 uint64_t ps_owned_run_capacity(const ps_owned_run *);
+uint64_t ps_owned_run_base(const ps_owned_run *);
+int ps_owned_run_mapped(const ps_owned_run *);
+void ps_owned_run_retain(ps_owned_run *);
+/* Capture only present mappings in logical order. Each handle pins that exact
+ * incarnation; caller closes handles and frees the array with the default
+ * allocator. Caller excludes mapping mutations until capture returns (stream
+ * initialization owns that exclusion). Logical holes do not consume array
+ * entries or read buffers. */
+int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
+                          lc_error *);
+typedef struct ps_owned_range {
+  uint64_t offset, bytes;
+} ps_owned_range;
+uint64_t ps_owned_run_storage(const ps_owned_run *);
+int ps_owned_run_matches(const ps_owned_run *, const ps_owned_range *, size_t);
+typedef int (*ps_piece_publish_fn)(void *, lc_error *);
+/* Runs the supplied publication exactly once while holding canonical liveness
+ * authority, after copying has finished. Reject stale captured liveness before
+ * invoking it; return its result unchanged. NULL selects directly. */
+typedef int (*ps_piece_select_fn)(void *, ps_piece_publish_fn, void *,
+                                  lc_error *);
+/* Replace one completed bounded piece with its sorted coalesced live ranges.
+ * Empty ranges remove its ownership entirely. Source checks and copying happen
+ * outside publication authority; selection revalidates the captured mapping.
+ * Always durable. Existing handles retain old bytes. Caller owns canonical
+ * liveness authority and excludes new references to discarded ranges. */
+int ps_owned_run_repack(ps_owned_head *, ps_owned_run *, ps_budget *,
+                        const ps_owned_range *, size_t, ps_piece_select_fn,
+                        void *, ps_owned_run **, lc_error *);
 void ps_owned_run_close(ps_owned_run *);
 int ps_owned_read(ps_owned_run *, uint64_t offset, void *, size_t, lc_error *);
 int ps_owned_write(ps_owned_run *, uint64_t offset, const void *, size_t,

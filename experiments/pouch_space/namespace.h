@@ -1,6 +1,7 @@
 #ifndef POUCH_SPACE_NAMESPACE_H
 #define POUCH_SPACE_NAMESPACE_H
 #include "lc_pouch_state_record.h"
+#include "owned.h"
 #include "root.h"
 
 typedef struct ps_namespace_append ps_namespace_append;
@@ -151,6 +152,24 @@ void ps_namespace_body_close(ps_namespace_body *);
  */
 int ps_namespace_reclaim(ps_namespace *, unsigned int kind, uint64_t id,
                          lc_error *);
+typedef struct ps_namespace_repack_result {
+  uint64_t visited, replaced;
+  uint64_t body_bytes, mapping_bytes; /* retained encoded bytes selected */
+  int pending;
+} ps_namespace_repack_result;
+/* Reclaims at most limit completed pieces behind selected coverage, including
+ * covered pieces of the active source. Captures scalar liveness, copies at
+ * most one bounded piece without owner locks, then revalidates before durable
+ * selection. Existing body readers retain their exact mapping; metadata views
+ * defer selection. The optional gate reacquires logical namespace mutation
+ * authority for selection after the copy; NULL requires caller exclusion. A
+ * cached cursor makes successive bounded calls progress through present
+ * mappings. Flush key metadata before starting; newly accepted dirty keys defer
+ * the next capture until the next flush. A sweep revisits earlier pieces after
+ * reaching the unfinished tail, including bodies superseded between sweeps. */
+int ps_namespace_repack(ps_namespace *, unsigned int, uint64_t, size_t limit,
+                        ps_piece_select_fn gate, void *,
+                        ps_namespace_repack_result *, lc_error *);
 int ps_namespace_reap(ps_namespace *, uint64_t *closed, uint64_t *pending,
                       lc_error *);
 #endif

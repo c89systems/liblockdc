@@ -29,11 +29,22 @@ typedef struct ps_extent {
   uint64_t offset, bytes;
   uint32_t crc, flags;
 } ps_extent;
+typedef struct ps_mapped_range {
+  uint64_t offset, bytes, data;
+} ps_mapped_range;
 typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
   uint64_t publication_sequence;
   uint64_t stream_capacity, stream_runs, stream_ready;
+  int owned_mapped;
+  ps_mapped_range *ranges;
+  unsigned char *range_bitmap;
+  uint16_t *range_rank;
+  uint64_t mapped_end;
+  size_t range_count;
+  struct ps_entry *owned_first, *owned_last, *owned_prev, *owned_next;
+  int owned_linked;
   int stream_open, stream_sealed, orphan_claimed;
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */

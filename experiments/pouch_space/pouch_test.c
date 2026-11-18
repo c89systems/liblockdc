@@ -3860,12 +3860,13 @@ static void maintenance(const char *path, const char *directory) {
       ps_pouch_compaction_result result;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(!result.skipped && result.records == 5 && result.snapshot &&
-              result.boundary == 1 && !result.body_bytes &&
-              result.metadata_bytes < 65536 && !result.copied_bytes &&
-              result.pending_sources);
+              result.boundary == 1 &&
+              result.body_bytes <= result.copied_bytes &&
+              result.metadata_bytes < 65536 &&
+              result.copied_bytes <= 16 * PS_CHUNK && result.pending_sources);
       ok(ps_metadata_repack(ps_root_space(ps_pouch_state_root(p)), &e), &e);
-      /* Checkpointing preserves the resident projection and encoded body
-       * positions; the pending mixed source belongs to range relocation. */
+      /* The bounded pass preserves the resident projection and logical body
+       * positions while publishing smaller physical mappings. */
       read_value(p, "projection", "a-state", 65569, 34, 2, &e);
       read_value(p, "projection", "z-object", 1048601, 35, 2, &e);
       drain(pinned.body, 65569, 34, &e);
@@ -3874,7 +3875,7 @@ static void maintenance(const char *path, const char *directory) {
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(result.snapshot == first && result.boundary == 1 &&
               result.records == 5 && result.pending_sources &&
-              !result.metadata_bytes && !result.copied_bytes);
+              !result.metadata_bytes && result.copied_bytes <= 16 * PS_CHUNK);
       projection_put(p, "a-state", 31, 99, 0, 12, &e);
       projection_put(p, "tail", 31, 77, 0, 13, &e);
       projection_meta(p, "z-object", "tail-object", 0, 14, &e);
@@ -3883,7 +3884,7 @@ static void maintenance(const char *path, const char *directory) {
       projection_readback(p, &e);
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(result.records == 6 && result.boundary == 1 &&
-              !result.metadata_bytes && !result.copied_bytes);
+              !result.metadata_bytes && result.copied_bytes <= 16 * PS_CHUNK);
       projection_readback(p, &e);
       void *ns = NULL;
       ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
@@ -4006,7 +4007,7 @@ static void maintenance_faults(const char *path, int io) {
 }
 typedef struct maintenance_hold {
   io_fault io;
-  int armed, ready, release, done;
+  int armed, ready, release, done, piece;
   lc_pouch *pouch;
   ps_pouch_compaction_result result;
 } maintenance_hold;
@@ -4016,7 +4017,13 @@ static ssize_t maintenance_held_write(void *context, int fd, const void *p,
   uint32_t magic = 0;
   if (n >= LC_POUCH_RECORD_HEADER_BYTES)
     memcpy(&magic, p, sizeof(magic));
-  if (magic == LC_POUCH_RECORD_MAGIC &&
+  if (h->piece && n >= 8 && !memcmp(p, "LCPSMAPR", 8) &&
+      __atomic_exchange_n(&h->armed, 0, __ATOMIC_ACQ_REL)) {
+    __atomic_store_n(&h->ready, 1, __ATOMIC_RELEASE);
+    while (!__atomic_load_n(&h->release, __ATOMIC_ACQUIRE))
+      sched_yield();
+  }
+  if (!h->piece && magic == LC_POUCH_RECORD_MAGIC &&
       __atomic_load_n(&h->armed, __ATOMIC_ACQUIRE)) {
     lc_pouch_record_header header;
     lc_error error;
@@ -4106,8 +4113,63 @@ static void maintenance_concurrency(const char *path, const char *directory) {
     p->storage.ops->namespace_close(p->storage.context, ns);
     ps_pouch_compaction_result result;
     ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-    REQUIRE(!result.copied_bytes && !result.metadata_bytes &&
+    REQUIRE(result.copied_bytes <= 16 * PS_CHUNK && !result.metadata_bytes &&
             result.boundary == 1 && result.pending_sources);
+    maintenance_tail_readback(p, &e);
+    one_file(directory);
+    lc_pouch_close(p);
+    REQUIRE(live == 0);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+    maintenance_tail_readback(p, &e);
+    lc_pouch_close(p);
+    REQUIRE(live == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+static void maintenance_piece_concurrency(const char *path,
+                                          const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  for (int sync = 0; sync < 2; ++sync) {
+    maintenance_hold h = {0};
+    ps_io io = {&h, io_read, maintenance_held_write, io_sync, io_reserve, NULL};
+    ps_pouch_state_options o = options(0, sync);
+    lc_pouch *p = NULL;
+    lc_pouch_state_read_result pinned = {0};
+    lc_pouch_state_write_result written = {0};
+    ps_pouch_compaction_result result;
+    pthread_t thread;
+    o.logical.segment_target_bytes = 8 * PS_MIB;
+    o.io = &io;
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    maintenance_fixture(p, &e);
+    ok(lc_pouch_state_read(p, "projection", "a-state", &pinned, &e), &e);
+    h.pouch = p;
+    h.piece = 1;
+    __atomic_store_n(&h.armed, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_create(&thread, NULL, maintenance_worker, &h) == 0);
+    while (!__atomic_load_n(&h.ready, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&h.done, __ATOMIC_ACQUIRE))
+      sched_yield();
+    REQUIRE(__atomic_load_n(&h.ready, __ATOMIC_ACQUIRE));
+    /* An actual encoded map copy is held outside logical mutation authority.
+     * A lease metadata update in this namespace, a sibling write and an
+     * already admitted body must all finish before releasing the copy. */
+    projection_meta(p, "a-state", "tail", 0, 9, &e);
+    input in = source(31, 9);
+    ok(put(p, "peer", "live", &in, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+    drain(pinned.body, 65569, 3, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+    REQUIRE(!__atomic_load_n(&h.done, __ATOMIC_ACQUIRE));
+    __atomic_store_n(&h.release, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_join(thread, NULL) == 0);
+    REQUIRE(h.result.copied_bytes && h.result.body_bytes &&
+            h.result.body_bytes <= h.result.copied_bytes &&
+            h.result.copied_bytes <= 16 * PS_CHUNK);
+    maintenance_tail_readback(p, &e);
+    ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
+    REQUIRE(result.records == 5 && result.boundary == 1);
     maintenance_tail_readback(p, &e);
     one_file(directory);
     lc_pouch_close(p);
@@ -5220,6 +5282,8 @@ static void *worker(void *context) {
     maintenance_faults(r->path, 1);
   else if (!strcmp(r->mode, "maintenance-concurrency"))
     maintenance_concurrency(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-piece-concurrency"))
+    maintenance_piece_concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-checksums"))
     maintenance_checksums(r->path);
   else

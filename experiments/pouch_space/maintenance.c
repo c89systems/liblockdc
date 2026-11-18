@@ -34,39 +34,65 @@ static int candidate(void *context, const ps_namespace_source *source,
   w->bytes += source->tail;
   return LC_OK;
 }
+static int select_logical(void *context, ps_piece_publish_fn publish,
+                          void *publication, lc_error *e) {
+  compact *w = context;
+  return lc_pouch_state_with_namespace_lock(w->pouch, w->name, publish,
+                                            publication, e);
+}
+typedef struct retire_task {
+  compact *work;
+  unsigned int kind;
+  uint64_t id;
+} retire_task;
+static int retire_locked(void *context, lc_error *e) {
+  retire_task *task = context;
+  compact *w = task->work;
+  int rc;
+  if (ps_namespace_source_refs(w->ns, task->kind, task->id)) {
+    ++w->result.pending_sources;
+    return LC_OK;
+  }
+  rc = ps_namespace_reclaim(w->ns, task->kind, task->id, e);
+  if (rc == LC_OK)
+    ++w->result.reclaimed_sources;
+  return rc;
+}
 static int retire_source(void *context, const ps_namespace_source *source,
                          lc_error *e) {
   compact *w = context;
+  ps_namespace_repack_result repack;
+  retire_task task;
   int rc;
-  if (source->kind == PS_CATALOG_SEGMENT &&
-      source->id == w->after.active_segment && source->tail &&
-      source->id == w->after.covered_segment &&
-      source->tail == w->after.covered_offset) {
-    ++w->result.pending_sources;
+  if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
+      (source->kind == PS_CATALOG_SEGMENT &&
+       source->id > w->after.covered_segment))
     return LC_OK;
+  if (!source->sealed ||
+      (source->kind == PS_CATALOG_SEGMENT &&
+       source->id == w->after.active_segment) ||
+      ps_namespace_source_refs(w->ns, source->kind, source->id)) {
+    rc = ps_namespace_repack(w->ns, source->kind, source->id, 16,
+                             select_logical, w, &repack, e);
+    if (rc == LC_OK) {
+      w->result.body_bytes += repack.body_bytes;
+      w->result.copied_bytes += repack.mapping_bytes;
+      if (repack.pending)
+        ++w->result.pending_sources;
+    }
+  } else {
+    task.work = w;
+    task.kind = source->kind;
+    task.id = source->id;
+    rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
+                                            &task, e);
   }
-  if (!source->sealed || (source->kind == PS_CATALOG_SEGMENT &&
-                          (source->id == w->after.active_segment ||
-                           source->id > w->after.covered_segment ||
-                           (source->id == w->after.covered_segment &&
-                            source->tail > w->after.covered_offset))))
-    return LC_OK;
-  if (ps_namespace_source_refs(w->ns, source->kind, source->id)) {
-    /* Mixed live sources require the bounded encoded-range relocation stage.
-     * Preserve ownership and its work marker until that stage can reclaim it.
-     */
-    ++w->result.pending_sources;
-    return LC_OK;
-  }
-  rc = ps_namespace_reclaim(w->ns, source->kind, source->id, e);
   if (rc == LC_ERR_INVALID && e && e->server_code &&
       !strcmp(e->server_code, "pouch_namespace_busy")) {
     lc_error_cleanup(e);
     ++w->result.pending_sources;
     return LC_OK;
   }
-  if (rc == LC_OK)
-    ++w->result.reclaimed_sources;
   return rc;
 }
 static int compact_locked(void *context, lc_error *e) {
@@ -138,8 +164,13 @@ static int compact_locked(void *context, lc_error *e) {
     w->result.boundary = w->after.covered_segment;
     w->result.records = w->after.checkpoint_keys;
     w->result.metadata_bytes = w->before.pending_metadata_bytes;
-    rc = ps_namespace_sources_visit(w->ns, retire_source, w, e);
   }
+  return rc;
+}
+static int finish_locked(void *context, lc_error *e) {
+  compact *w = context;
+  uint64_t closed, pending;
+  int rc = ps_namespace_status_get(w->ns, &w->after, e);
   if (rc == LC_OK)
     rc = ps_namespace_reap(w->ns, &closed, &pending, e);
   if (rc == LC_OK) {
@@ -149,6 +180,7 @@ static int compact_locked(void *context, lc_error *e) {
   }
   if (rc == LC_OK && w->options && w->options->terminal_reclaim &&
       !w->result.pending_sources && !w->maintenance->cleanup_pending_count &&
+      !w->after.pending_keys &&
       w->after.tail < w->pouch->terminal_reclaim_min_bytes)
     rc = lc_pouch_terminal_reclaim_marker_remove(w->pouch, w->name, e);
   return rc;
@@ -172,6 +204,14 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.options = options;
   w.maintenance = maintenance;
   rc = lc_pouch_state_with_namespace_lock(pouch, name, compact_locked, &w, e);
+  /* Private encoded copying owns no logical or physical publication gate.
+   * Every durable map selection reacquires logical authority and rechecks its
+   * captured body generation. Whole-source retirement and final work-marker
+   * decisions are likewise serialized with canonical mutations. */
+  if (rc == LC_OK && !w.result.skipped)
+    rc = ps_namespace_sources_visit(w.ns, retire_source, &w, e);
+  if (rc == LC_OK && !w.result.skipped)
+    rc = lc_pouch_state_with_namespace_lock(pouch, name, finish_locked, &w, e);
   if (w.ns)
     pouch->storage.ops->namespace_close(pouch->storage.context, w.ns);
   if (rc == LC_OK && !w.result.skipped && !maintenance)

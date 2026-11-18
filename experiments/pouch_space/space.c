@@ -20,6 +20,7 @@ struct ps_writer {
   ps_space *space;
   ps_budget *budget;
   ps_entry *entry;
+  ps_entry *expected_owned;
   size_t used;
   int failed, published;
   unsigned char buffer[PS_CHUNK];
@@ -45,6 +46,7 @@ struct ps_owned_head {
 struct ps_owned_run {
   ps_space *space;
   ps_entry *entry;
+  size_t references;
 };
 
 static void put64(unsigned char *p, uint64_t n) {
@@ -256,7 +258,9 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
 static size_t entry_bytes(const ps_entry *p) {
   if (p->key.kind == PS_CATALOG)
     return 104 + p->catalog->length;
-  return p->key.kind == PS_STREAM ? 80 : 64 + 24 * p->count;
+  return p->key.kind == PS_STREAM      ? 80
+         : p->key.kind == PS_OWNED_RUN ? 80 + 24 * p->count
+                                       : 64 + 24 * p->count;
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
   ps_entry *p;
@@ -303,6 +307,43 @@ static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
     p->dirty_next->dirty_link = &p->dirty_next;
   s->dirty = p;
 }
+static void owned_unlink(ps_space *s, ps_entry *p) {
+  ps_entry *head;
+  if (!p->owned_linked)
+    return;
+  head = stream_lookup(s, p->key.owner);
+  if (p->owned_prev)
+    p->owned_prev->owned_next = p->owned_next;
+  else
+    head->owned_first = p->owned_next;
+  if (p->owned_next)
+    p->owned_next->owned_prev = p->owned_prev;
+  else
+    head->owned_last = p->owned_prev;
+  p->owned_linked = 0;
+}
+static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
+  ps_entry *head = stream_lookup(s, p->key.owner);
+  if (!head)
+    return; /* recovery validation reports an orphan */
+  if (old && old->owned_linked) {
+    p->owned_prev = old->owned_prev;
+    p->owned_next = old->owned_next;
+    old->owned_linked = 0;
+  } else {
+    p->owned_prev = head->owned_last;
+    p->owned_next = NULL;
+  }
+  if (p->owned_prev)
+    p->owned_prev->owned_next = p;
+  else
+    head->owned_first = p;
+  if (p->owned_next)
+    p->owned_next->owned_prev = p;
+  else
+    head->owned_last = p;
+  p->owned_linked = 1;
+}
 static void retire(ps_space *s, ps_entry *p) {
   ps_entry **link = &s->buckets[bucket(p->key)];
   while (*link != p)
@@ -310,6 +351,8 @@ static void retire(ps_space *s, ps_entry *p) {
   *link = p->hash_next;
   if (p->key.kind == PS_CATALOG)
     ps_catalog_unlink(s, p);
+  if (p->key.kind == PS_OWNED_RUN)
+    owned_unlink(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted) {
     stream_unregister(s, p);
   }
@@ -328,6 +371,8 @@ static void retire(ps_space *s, ps_entry *p) {
 static void install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);
   p->previous = old;
+  if (p->key.kind == PS_OWNED_RUN && !p->deleted)
+    owned_link(s, p, old);
   if (old)
     retire(s, old);
   p->state = 1;
@@ -342,6 +387,9 @@ static void install(ps_space *s, ps_entry *p) {
 }
 static void entry_free(ps_entry *p) {
   ps_catalog_free_record(p);
+  lc_free_with_allocator(NULL, p->ranges);
+  lc_free_with_allocator(NULL, p->range_bitmap);
+  lc_free_with_allocator(NULL, p->range_rank);
   lc_free_with_allocator(NULL, p->extents);
   lc_free_with_allocator(NULL, p);
 }
@@ -612,7 +660,7 @@ static size_t event_bytes(const ps_entry *p, int event) {
 }
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
-  size_t i, bytes = event_bytes(p, event);
+  size_t i, bytes = event_bytes(p, event), first;
   memset(wire, 0, bytes);
   put32(wire, (uint32_t)EVENT_MAGIC);
   put32(wire + 4, (uint32_t)bytes);
@@ -625,11 +673,16 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
   if (event == PS_PUT || event == PS_SEAL) {
     put64(wire + 48, p->bytes);
     put32(wire + 56, (uint32_t)p->count);
+    first = p->key.kind == PS_OWNED_RUN ? 80 : 64;
+    if (p->key.kind == PS_OWNED_RUN) {
+      put64(wire + 64, p->stream_capacity);
+      put32(wire + 72, (uint32_t)p->owned_mapped);
+    }
     for (i = 0; i < p->count; ++i) {
-      put64(wire + 64 + 24 * i, p->extents[i].offset);
-      put64(wire + 72 + 24 * i, p->extents[i].bytes);
-      put32(wire + 80 + 24 * i, p->extents[i].crc);
-      put32(wire + 84 + 24 * i, p->extents[i].flags);
+      put64(wire + first + 24 * i, p->extents[i].offset);
+      put64(wire + first + 8 + 24 * i, p->extents[i].bytes);
+      put32(wire + first + 16 + 24 * i, p->extents[i].crc);
+      put32(wire + first + 20 + 24 * i, p->extents[i].flags);
     }
     if (p->key.kind == PS_STREAM) {
       put32(wire + 56, (uint32_t)p->stream_sealed);
@@ -644,7 +697,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
 }
 static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
                         ps_entry **out, int *event, lc_error *error) {
-  size_t count, i;
+  size_t count, i, first;
   uint64_t sum = 0, offset, n;
   ps_entry *p;
   *out = NULL;
@@ -655,12 +708,14 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   count = get32(wire + 16) == PS_STREAM || get32(wire + 16) == PS_CATALOG
               ? 0
               : get32(wire + 56);
+  first =
+      get32(wire + 16) == PS_OWNED_RUN && get32(wire + 20) == PS_PUT ? 80 : 64;
   if (count > (PS_JOURNAL - 64) / 24 ||
       (get32(wire + 16) != PS_CATALOG &&
        bytes != (get32(wire + 16) == PS_STREAM && (get32(wire + 20) == PS_PUT ||
                                                    get32(wire + 20) == PS_SEAL)
                      ? 80
-                     : 64 + count * 24)) ||
+                     : first + count * 24)) ||
       get32(wire + 20) > PS_SEAL)
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -682,8 +737,8 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
        (count || p->bytes || get32(wire + 56) ||
-        (!immutable_key(p->key) && p->key.kind != PS_STREAM &&
-         p->key.kind != PS_CATALOG))) ||
+        (!immutable_key(p->key) && p->key.kind != PS_OWNED_RUN &&
+         p->key.kind != PS_STREAM && p->key.kind != PS_CATALOG))) ||
       (*event == PS_SEAL && p->key.kind != PS_STREAM))
     goto invalid;
   if (p->key.kind == PS_CATALOG) {
@@ -704,12 +759,26 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     p->stream_capacity = get64(wire + 64);
     p->stream_runs = get64(wire + 72);
     if (get32(wire + 56) > 1 || (*event == PS_SEAL && !p->stream_sealed) ||
-        p->bytes > p->stream_capacity || p->stream_capacity > s->capacity ||
-        (p->stream_runs == 0) != (p->stream_capacity == 0) ||
+        p->bytes > p->stream_capacity || p->stream_capacity > INT64_MAX ||
+        (!p->stream_capacity && p->stream_runs) ||
         p->stream_runs > p->stream_capacity / (PS_PAGE - PS_RUN_HEADER))
       goto invalid;
     *out = p;
     return LC_OK;
+  }
+  if (p->key.kind == PS_OWNED_RUN && *event == PS_PUT) {
+    p->stream_capacity = get64(wire + 64);
+    p->owned_mapped = (int)get32(wire + 72);
+    if (!p->stream_capacity || p->stream_capacity > PS_MIB - PS_RUN_HEADER ||
+        p->key.key > (uint64_t)INT64_MAX - p->stream_capacity ||
+        get32(wire + 72) > 1 || get32(wire + 76) ||
+        (!p->owned_mapped &&
+         (p->bytes < PS_RUN_HEADER ||
+          p->stream_capacity != p->bytes - PS_RUN_HEADER)) ||
+        (p->owned_mapped &&
+         (p->stream_capacity > PS_CHUNK || !count || p->bytes < 64 ||
+          p->bytes > 64 + 9 * p->stream_capacity)))
+      goto invalid;
   }
   if (count) {
     p->extents = lc_calloc_with_allocator(NULL, count, sizeof(*p->extents));
@@ -721,12 +790,14 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   p->count = p->capacity = count;
   for (i = 0; i < count; ++i) {
-    offset = get64(wire + 64 + 24 * i);
-    n = get64(wire + 72 + 24 * i);
-    p->extents[i].flags = get32(wire + 84 + 24 * i);
-    if (!n || n > (p->key.kind == PS_OWNED_RUN ? PS_MIB : PS_CHUNK) ||
+    offset = get64(wire + first + 24 * i);
+    n = get64(wire + first + 8 + 24 * i);
+    p->extents[i].flags = get32(wire + first + 20 + 24 * i);
+    if (!n ||
+        n > (p->key.kind == PS_OWNED_RUN && !p->owned_mapped ? PS_MIB
+                                                             : PS_CHUNK) ||
         offset < PS_DATA || offset > s->capacity || n > s->capacity - offset ||
-        (p->key.kind == PS_OWNED_RUN
+        (p->key.kind == PS_OWNED_RUN && !p->owned_mapped
              ? (count != 1 || p->extents[i].flags != EXTENT_OWNED ||
                 offset % PS_PAGE || n % PS_PAGE)
          : p->extents[i].flags == EXTENT_PACKED
@@ -737,7 +808,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
       goto invalid;
     p->extents[i].offset = offset;
     p->extents[i].bytes = n;
-    p->extents[i].crc = get32(wire + 80 + 24 * i);
+    p->extents[i].crc = get32(wire + first + 16 + 24 * i);
     sum += n;
   }
   if (sum != p->bytes)
@@ -748,10 +819,156 @@ invalid:
   entry_free(p);
   return err(error, LC_ERR_PROTOCOL, "invalid container ownership descriptor");
 }
+static int owned_encoded_read(ps_space *s, ps_entry *p, uint64_t at,
+                              void *bytes, size_t n, lc_error *e) {
+  unsigned char *out = bytes;
+  size_t i, take;
+  uint64_t base = 0;
+  int rc;
+  if (at > p->bytes || n > p->bytes - at)
+    return err(e, LC_ERR_PROTOCOL, "mapped piece metadata is truncated");
+  for (i = 0; n && i < p->count; ++i) {
+    if (at >= base + p->extents[i].bytes) {
+      base += p->extents[i].bytes;
+      continue;
+    }
+    take = (size_t)(base + p->extents[i].bytes - at);
+    if (take > n)
+      take = n;
+    rc = transfer(s, out, take, p->extents[i].offset + at - base, 0, e);
+    if (rc != LC_OK)
+      return rc;
+    out += take;
+    n -= take;
+    at += take;
+    base += p->extents[i].bytes;
+  }
+  return n ? err(e, LC_ERR_PROTOCOL, "mapped piece extent is missing") : LC_OK;
+}
+static int mapped_range_add(ps_entry *p, ps_mapped_range *range, uint64_t start,
+                            uint64_t bytes, uint64_t *data, uint64_t *end,
+                            lc_error *e) {
+  if (!bytes || start < *end || start > p->stream_capacity ||
+      bytes > p->stream_capacity - start || bytes > p->bytes - *data)
+    return err(e, LC_ERR_PROTOCOL, "invalid mapped piece range");
+  range->offset = start;
+  range->bytes = bytes;
+  range->data = *data;
+  *data += bytes;
+  *end = start + bytes;
+  return LC_OK;
+}
+static unsigned int bitmap_count(unsigned int value) {
+  value = value - ((value >> 1) & 0x55U);
+  value = (value & 0x33U) + ((value >> 2) & 0x33U);
+  return (value + (value >> 4)) & 0x0fU;
+}
+static uint64_t bitmap_rank(const ps_entry *p, uint64_t offset) {
+  size_t at = (size_t)(offset / 64 * 8), end = (size_t)(offset / 8);
+  uint64_t count = p->range_rank[offset / 64];
+  for (; at < end; ++at)
+    count += bitmap_count(p->range_bitmap[at]);
+  if (offset % 8)
+    count += bitmap_count(p->range_bitmap[at] & ((1U << (offset % 8)) - 1));
+  return count;
+}
+static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
+  unsigned char header[64], *table = NULL;
+  ps_mapped_range *ranges = NULL;
+  ps_mapped_range checked;
+  uint16_t *rank = NULL;
+  uint64_t count, i, data, end = 0, start, bytes, table_bytes, pos;
+  int rc, bitmap;
+  if (p->ranges || p->range_bitmap)
+    return LC_OK;
+  rc = owned_encoded_read(s, p, 0, header, sizeof(header), e);
+  if (rc != LC_OK)
+    return rc;
+  count = get32(header + 32);
+  bitmap = (int)get32(header + 60);
+  table_bytes = bitmap ? (p->stream_capacity + 7) / 8 : count * 8;
+  if (memcmp(header, "LCPSMAPR", 8) || get64(header + 8) != p->key.owner ||
+      get64(header + 16) != p->key.key ||
+      get64(header + 24) != p->stream_capacity || !count ||
+      count > p->stream_capacity || get64(header + 40) != p->bytes ||
+      get64(header + 48) != p->token || get32(header + 60) > 1 ||
+      get32(header + 56) !=
+          (uint32_t)crc32(checksum(header, 56), header + 60, 4) ||
+      64 + table_bytes > p->bytes)
+    return err(e, LC_ERR_PROTOCOL, "invalid mapped piece header");
+  table = lc_alloc_with_allocator(NULL, (size_t)table_bytes);
+  if (bitmap)
+    rank = lc_calloc_with_allocator(
+        NULL, (size_t)((p->stream_capacity + 63) / 64 + 1), sizeof(*rank));
+  else
+    ranges = lc_calloc_with_allocator(NULL, (size_t)count, sizeof(*ranges));
+  if (!table || (bitmap ? !rank : !ranges))
+    rc = err(e, LC_ERR_NOMEM, "cannot allocate mapped piece ranges");
+  if (rc == LC_OK)
+    rc = owned_encoded_read(s, p, 64, table, (size_t)table_bytes, e);
+  if (rc == LC_OK && checksum(table, (size_t)table_bytes) != get32(header + 36))
+    rc = err(e, LC_ERR_PROTOCOL, "mapped piece range checksum mismatch");
+  data = 64 + table_bytes;
+  for (i = 0; !bitmap && rc == LC_OK && i < count; ++i) {
+    start = get32(table + i * 8);
+    bytes = get32(table + i * 8 + 4);
+    rc = mapped_range_add(p, ranges + i, start, bytes, &data, &end, e);
+  }
+  if (bitmap && rc == LC_OK) {
+    i = pos = 0;
+    while (pos < p->stream_capacity && rc == LC_OK) {
+      if (!(table[pos / 8] & (1U << (pos % 8)))) {
+        ++pos;
+        continue;
+      }
+      start = pos++;
+      while (pos < p->stream_capacity && (table[pos / 8] & (1U << (pos % 8))))
+        ++pos;
+      if (i == count)
+        rc = err(e, LC_ERR_PROTOCOL, "mapped bitmap range count overflow");
+      else
+        rc = mapped_range_add(p, &checked, start, pos - start, &data, &end, e);
+      ++i;
+    }
+    if (rc == LC_OK &&
+        (i != count || (p->stream_capacity % 8 &&
+                        table[table_bytes - 1] >> (p->stream_capacity % 8))))
+      rc = err(e, LC_ERR_PROTOCOL, "mapped bitmap count or padding is invalid");
+  }
+  if (rc == LC_OK && data != p->bytes)
+    rc = err(e, LC_ERR_PROTOCOL, "mapped piece has trailing bytes");
+  if (rc == LC_OK) {
+    p->ranges = ranges;
+    p->range_count = (size_t)count;
+    p->mapped_end = end;
+    if (bitmap) {
+      pos = 0;
+      for (i = 0; i < table_bytes; ++i) {
+        if (!(i % 8))
+          rank[i / 8] = (uint16_t)pos;
+        pos += bitmap_count(table[i]);
+      }
+      if (!(table_bytes % 8))
+        rank[table_bytes / 8] = (uint16_t)pos;
+      p->range_bitmap = table;
+      p->range_rank = rank;
+      table = NULL;
+      rank = NULL;
+    }
+    ranges = NULL;
+  }
+  lc_free_with_allocator(NULL, ranges);
+  lc_free_with_allocator(NULL, rank);
+  lc_free_with_allocator(NULL, table);
+  return rc;
+}
 static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
                         lc_error *error) {
-  int rc = transfer(s, header, PS_RUN_IDENTITY_BYTES, p->extents[0].offset, 0,
-                    error);
+  int rc;
+  if (p->owned_mapped)
+    return owned_map_load(s, p, error);
+  rc = transfer(s, header, PS_RUN_IDENTITY_BYTES, p->extents[0].offset, 0,
+                error);
   if (rc == LC_OK &&
       (checksum(header, PS_RUN_IDENTITY_BYTES) != p->extents[0].crc ||
        get64(header) != OWNED_MAGIC || get64(header + 8) != p->token ||
@@ -765,7 +982,7 @@ static int verify_value_payloads(ps_space *s, ps_entry *p,
                                  unsigned char *buffer, lc_error *error) {
   size_t i;
   int rc;
-  if (p->key.kind == PS_OWNED_RUN)
+  if (p->key.kind == PS_OWNED_RUN && !p->owned_mapped)
     return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
     rc = transfer(s, buffer, (size_t)p->extents[i].bytes, p->extents[i].offset,
@@ -775,7 +992,7 @@ static int verify_value_payloads(ps_space *s, ps_entry *p,
     if (checksum(buffer, (size_t)p->extents[i].bytes) != p->extents[i].crc)
       return err(error, LC_ERR_PROTOCOL, "container payload checksum mismatch");
   }
-  return LC_OK;
+  return p->key.kind == PS_OWNED_RUN ? owned_map_load(s, p, error) : LC_OK;
 }
 static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
                         lc_error *error) {
@@ -919,9 +1136,10 @@ static int immutable_extent_allowance(ps_space *s, ps_entry *entry,
       s->live_entries + (old && !old->deleted ? 0 : 1), payload, budget, error);
 }
 static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
-                           size_t bytes, ps_budget *budget, lc_error *error) {
+                           size_t *bytes, int split, ps_budget *budget,
+                           lc_error *error) {
   ps_payload_page *p = NULL;
-  size_t count = cell_count(bytes), bin, at;
+  size_t count = cell_count(*bytes), bin, at;
   uint64_t mask, reserve = PS_PAGE;
   int rc;
   for (bin = count; bin <= CELLS; ++bin)
@@ -929,6 +1147,18 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
       p = s->available[bin];
       break;
     }
+  /* Use existing slack before buying another page. Only the final subpage
+   * tail may split, and only once: its remainder can always fit a fresh page.
+   * Thus the physical page bound is unchanged and at most one descriptor is
+   * added, even with adversarial cell fragmentation. */
+  if (!p && split)
+    for (bin = count - 1; bin; --bin)
+      if (s->available[bin]) {
+        p = s->available[bin];
+        count = bin;
+        *bytes = count * PS_CELL;
+        break;
+      }
   rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, budget, error);
   if (rc != LC_OK)
     return rc;
@@ -1580,6 +1810,8 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
     rc = err(error, LC_ERR_PROTOCOL, "checkpoint descriptor binding mismatch");
   if (rc == LC_OK && p->key.kind == PS_CATALOG)
     rc = ps_catalog_prepare_record(s, p, 1, error);
+  if (rc == LC_OK && p->key.kind == PS_OWNED_RUN && p->owned_mapped)
+    rc = owned_map_load(s, p, error);
   if (rc == LC_OK) {
     if (p->key.kind == PS_CATALOG)
       ps_catalog_apply_record(s, p, 0);
@@ -1658,9 +1890,7 @@ static int recover_revision(ps_space *s, const unsigned char *wire,
 }
 static int validate_owned_directory(ps_space *s, lc_error *error) {
   ps_entry *p, *run;
-  uint64_t i, base, expected = 0, actual = 0;
-  ps_key key;
-  key.kind = PS_OWNED_RUN;
+  uint64_t count, end, expected = 0, actual = 0;
   for (p = s->entries; p; p = p->all_next) {
     if (p->key.kind == PS_OWNED_RUN) {
       ++actual;
@@ -1669,17 +1899,16 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
     }
     if (p->key.kind != PS_STREAM)
       continue;
-    key.owner = p->token;
-    base = 0;
-    for (i = 0; i < p->stream_runs; ++i) {
-      key.key = base;
-      run = lookup(s, key);
-      if (!run || run->deleted ||
-          run->bytes - PS_RUN_HEADER > s->capacity - base)
+    end = count = 0;
+    for (run = p->owned_first; run; run = run->owned_next) {
+      if (run->deleted || run->key.key < end ||
+          run->key.key > p->stream_capacity ||
+          run->stream_capacity > p->stream_capacity - run->key.key)
         return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
-      base += run->bytes - PS_RUN_HEADER;
+      end = run->key.key + run->stream_capacity;
+      ++count;
     }
-    if (base != p->stream_capacity)
+    if (count != p->stream_runs)
       return err(error, LC_ERR_PROTOCOL, "owned stream capacity mismatch");
     expected += p->stream_runs;
   }
@@ -1690,15 +1919,18 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
   ps_entry *head = stream_lookup(s, p->key.owner);
   if (!head || head->stream_sealed || p->key.key != head->stream_capacity ||
-      p->bytes - PS_RUN_HEADER > s->capacity - head->stream_capacity)
+      p->owned_mapped ||
+      p->stream_capacity > (uint64_t)INT64_MAX - head->stream_capacity)
     return err(error, LC_ERR_PROTOCOL, "owned run grant is not contiguous");
-  head->stream_capacity += p->bytes - PS_RUN_HEADER;
+  head->stream_capacity += p->stream_capacity;
   ++head->stream_runs;
   if (!head->dirty_link)
     dirty_entry(s, head, NULL);
   return LC_OK;
 }
 static void mark_removed(ps_space *s, ps_entry *p, uint64_t sequence) {
+  if (p->key.kind == PS_OWNED_RUN)
+    owned_unlink(s, p);
   if (p->key.kind == PS_STREAM)
     stream_unregister(s, p);
   s->metadata -= entry_bytes(p);
@@ -1713,22 +1945,20 @@ static void mark_removed(ps_space *s, ps_entry *p, uint64_t sequence) {
  * and checkpoint references until the usual root-retirement protocol. */
 static int remove_owned(ps_space *s, ps_entry *head, uint64_t sequence,
                         int apply, lc_error *error) {
-  ps_key key;
-  ps_entry *run;
-  uint64_t i, base = 0;
-  key.kind = PS_OWNED_RUN;
-  key.owner = head->token;
-  for (i = 0; i < head->stream_runs; ++i) {
-    key.key = base;
-    run = lookup(s, key);
-    if (!run || run->deleted ||
-        run->bytes - PS_RUN_HEADER > head->stream_capacity - base)
+  ps_entry *run, *next;
+  uint64_t count = 0, end = 0;
+  for (run = head->owned_first; run; run = next) {
+    next = run->owned_next;
+    if (run->deleted || run->key.key < end ||
+        run->key.key > head->stream_capacity ||
+        run->stream_capacity > head->stream_capacity - run->key.key)
       return err(error, LC_ERR_PROTOCOL, "retired stream grant mismatch");
-    base += run->bytes - PS_RUN_HEADER;
+    end = run->key.key + run->stream_capacity;
+    ++count;
     if (apply)
       mark_removed(s, run, sequence);
   }
-  if (base != head->stream_capacity)
+  if (count != head->stream_runs)
     return err(error, LC_ERR_PROTOCOL, "retired stream capacity mismatch");
   if (apply)
     mark_removed(s, head, sequence);
@@ -1845,7 +2075,7 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
       old = lookup(s, p->key);
-      if (p->key.kind != PS_CATALOG &&
+      if (p->key.kind != PS_CATALOG && p->key.kind != PS_OWNED_RUN &&
           (!immutable_key(p->key) || p->key.kind == PS_COLLECTION) && old &&
           !old->deleted) {
         entry_free(p);
@@ -1854,7 +2084,17 @@ static int recover(ps_space *s, lc_error *error) {
         goto done;
       }
       if (p->key.kind == PS_OWNED_RUN) {
-        rc = install_owned_grant(s, p, error);
+        if (p->owned_mapped) {
+          ps_entry *head = stream_lookup(s, p->key.owner);
+          rc = !old || old->deleted || !head ||
+                       p->stream_capacity != old->stream_capacity
+                   ? err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch")
+                   : LC_OK;
+        } else if (old && !old->deleted)
+          rc =
+              err(error, LC_ERR_PROTOCOL, "owned grant overwritten in journal");
+        else
+          rc = install_owned_grant(s, p, error);
         if (rc != LC_OK) {
           entry_free(p);
           goto done;
@@ -1911,6 +2151,17 @@ static int recover(ps_space *s, lc_error *error) {
         if (rc != LC_OK)
           goto done;
       } else {
+        if (p->key.kind == PS_OWNED_RUN) {
+          ps_entry *head = stream_lookup(s, p->key.owner);
+          if (!head || !head->stream_runs) {
+            entry_free(p);
+            rc = err(error, LC_ERR_PROTOCOL, "piece removal has no head");
+            goto done;
+          }
+          --head->stream_runs;
+          if (!head->dirty_link)
+            dirty_entry(s, head, NULL);
+        }
         p->deleted = 1;
         register_entry(s, p);
         dirty_entry(s, p, old);
@@ -2123,14 +2374,15 @@ int ps_close(ps_space *s, lc_error *error) {
   destroy(s);
   return LC_OK;
 }
-int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
-             lc_error *error) {
+static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
+                       ps_writer **out, lc_error *error) {
   ps_writer *w;
   ps_entry *p;
   int rc;
   if (out)
     *out = NULL;
-  if (!s || !out || !immutable_key(key))
+  if (!s || !out ||
+      (!immutable_key(key) && !(owned && key.kind == PS_OWNED_RUN)))
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
   w = lc_calloc_with_allocator(NULL, 1, sizeof(*w));
@@ -2166,13 +2418,17 @@ int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
     *out = w;
   return rc;
 }
+int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
+             lc_error *error) {
+  return begin_value(s, budget, key, 0, out, error);
+}
 static int flush_writer(ps_writer *w, lc_error *error) {
   ps_space *s = w->space;
   ps_entry *p = w->entry;
   ps_extent *extent, *grown;
   size_t n, done = 0, take;
   uint64_t run_bytes;
-  int rc;
+  int rc, split = 0;
   if (!w->used)
     return LC_OK;
   while (done < w->used) {
@@ -2200,8 +2456,11 @@ static int flush_writer(ps_writer *w, lc_error *error) {
     take = w->used - done;
     run_bytes = take / PS_PAGE * PS_PAGE;
     if (!run_bytes) {
+      n = take;
+      rc = payload_reserve(s, p, extent, &take, !split, w->budget, error);
+      if (take < n)
+        split = 1;
       run_bytes = take;
-      rc = payload_reserve(s, p, extent, take, w->budget, error);
     } else {
       rc = immutable_extent_allowance(s, p, run_bytes, w->budget, error);
       if (rc == LC_OK)
@@ -2271,11 +2530,17 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     return rc;
   }
   s = w->space;
-  durable = s->durable || w->entry->key.kind == PS_CONTROL;
+  durable = s->durable || w->entry->key.kind == PS_CONTROL ||
+            w->entry->key.kind == PS_OWNED_RUN;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   old = lookup(s, w->entry->key);
   prior = old && !old->deleted ? entry_bytes(old) : 0;
+  if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN &&
+      (!w->expected_owned || old != w->expected_owned || old->deleted ||
+       !stream_lookup(s, old->key.owner) || !w->entry->owned_mapped ||
+       w->entry->stream_capacity != old->stream_capacity))
+    rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
   if (rc == LC_OK && old && !old->deleted &&
       w->entry->key.kind == PS_COLLECTION)
     rc = err(error, LC_ERR_INVALID, "collection position already published");
@@ -3195,9 +3460,9 @@ int ps_owned_inspect(ps_space *space, ps_key key, const ps_ref *ref,
 }
 static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
                            lc_error *error) {
-  return checkpoint_allowance_floor(s, s->metadata + 88, s->live_entries + 1,
-                                    payload, PS_MAINTENANCE_RESERVE, budget,
-                                    error);
+  return checkpoint_allowance_floor(s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES,
+                                    s->live_entries + 1, payload,
+                                    PS_MAINTENANCE_RESERVE, budget, error);
 }
 static int owned_preparation_allowance(ps_space *s, ps_budget *budget,
                                        uint64_t bytes, uint64_t reserved,
@@ -3237,7 +3502,8 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
-      (base != head->entry->stream_capacity || s->token_next > s->token_limit))
+      (base != head->entry->stream_capacity || s->token_next > s->token_limit ||
+       base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
   /* Protect metadata before retaining a free-list selection: admission may
    * transfer common intervals into the checkpoint-only pool. */
@@ -3349,6 +3615,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     rc = healthy(s, error);
   if (rc == LC_OK) {
     p->bytes = p->extents[0].bytes = bytes;
+    p->stream_capacity = bytes - PS_RUN_HEADER;
     if (spare) {
       spare->offset = p->extents[0].offset + bytes;
       spare->bytes = reserved - bytes;
@@ -3370,7 +3637,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
   }
   if (rc == LC_OK) {
-    ps_internal_budget_spend(budget, 0, 88, 1);
+    ps_internal_budget_spend(budget, 0, PS_OWNED_DESCRIPTOR_BYTES, 1);
     p->publication_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     dirty_entry(s, p, NULL);
@@ -3379,6 +3646,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     ++s->readers;
     run->space = s;
     run->entry = p;
+    run->references = 1;
   } else {
     if (registered) {
       if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
@@ -3432,6 +3700,7 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
       ++s->readers;
       run->space = s;
       run->entry = p;
+      run->references = 1;
     }
     pthread_mutex_unlock(&s->mutex);
     if (rc == LC_OK && run->entry)
@@ -3447,11 +3716,85 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
   return rc;
 }
 uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
-  return run ? run->entry->bytes - PS_RUN_HEADER : 0;
+  return run ? run->entry->stream_capacity : 0;
+}
+uint64_t ps_owned_run_base(const ps_owned_run *run) {
+  return run ? run->entry->key.key : 0;
+}
+int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
+                          size_t *count, lc_error *error) {
+  ps_space *s;
+  ps_entry *p;
+  ps_owned_run **items = NULL;
+  size_t n = 0, capacity, i;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (count)
+    *count = 0;
+  if (!head || !out || !count)
+    return err(error, LC_ERR_INVALID,
+               "mapping capture requires head and outputs");
+  s = head->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  capacity = (size_t)head->entry->stream_runs;
+  if (rc == LC_OK &&
+      (head->entry->deleted ||
+       head->entry->stream_runs > (uint64_t)((size_t)-1 / sizeof(*items))))
+    rc = err(error, LC_ERR_INVALID,
+             "mapping capture is unavailable or too large");
+  if (rc == LC_OK && capacity) {
+    items = lc_calloc_with_allocator(NULL, capacity, sizeof(*items));
+    if (!items)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
+  }
+  for (p = head->entry->owned_first; rc == LC_OK && p; p = p->owned_next) {
+    if (n == capacity) {
+      rc = err(error, LC_ERR_PROTOCOL, "mapping count exceeds its head");
+      break;
+    }
+    items[n] = lc_calloc_with_allocator(NULL, 1, sizeof(**items));
+    if (!items[n]) {
+      rc = err(error, LC_ERR_NOMEM, "cannot capture mapping handle");
+      break;
+    }
+    items[n]->space = s;
+    items[n]->entry = p;
+    items[n]->references = 1;
+    ++p->pins;
+    ++s->readers;
+    ++n;
+  }
+  if (rc == LC_OK && n != capacity)
+    rc = err(error, LC_ERR_PROTOCOL, "mapping count differs from its head");
+  pthread_mutex_unlock(&s->mutex);
+  for (i = 0; rc == LC_OK && i < n; ++i) {
+    unsigned char header[PS_RUN_IDENTITY_BYTES];
+    rc = verify_owned(s, items[i]->entry, header, error);
+  }
+  if (rc == LC_OK) {
+    *out = items;
+    *count = n;
+  } else {
+    for (i = 0; i < n; ++i)
+      ps_owned_run_close(items[i]);
+    lc_free_with_allocator(NULL, items);
+  }
+  return rc;
+}
+int ps_owned_run_mapped(const ps_owned_run *run) {
+  return run && run->entry->owned_mapped;
+}
+void ps_owned_run_retain(ps_owned_run *run) {
+  if (run)
+    (void)__atomic_add_fetch(&run->references, 1, __ATOMIC_RELAXED);
 }
 void ps_owned_run_close(ps_owned_run *run) {
   ps_space *s;
   if (!run)
+    return;
+  if (__atomic_sub_fetch(&run->references, 1, __ATOMIC_ACQ_REL))
     return;
   s = run->space;
   pthread_mutex_lock(&s->mutex);
@@ -3469,6 +3812,57 @@ static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
       n > ps_owned_run_capacity(run) - offset)
     return err(error, LC_ERR_INVALID, "owned run I/O outside granted range");
   rc = healthy(run->space, error);
+  if (rc == LC_OK && run->entry->owned_mapped) {
+    ps_entry *p = run->entry;
+    ps_reader *reader;
+    unsigned char *out = bytes;
+    size_t lo = 0, hi = p->range_count, mid, take;
+    if (writing)
+      return err(error, LC_ERR_INVALID, "mapped pieces are immutable");
+    if (!n)
+      return LC_OK;
+    while (!p->range_bitmap && lo < hi) {
+      mid = lo + (hi - lo) / 2;
+      if (p->ranges[mid].offset + p->ranges[mid].bytes <= offset)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
+    if (!reader)
+      return err(error, LC_ERR_NOMEM, "cannot allocate mapped read scratch");
+    reader->space = run->space;
+    reader->entry = p; /* run already pins this exact incarnation */
+    while (n && rc == LC_OK) {
+      uint64_t data;
+      if (p->range_bitmap) {
+        take = 0;
+        while (take < n && (p->range_bitmap[(offset + take) / 8] &
+                            (1U << ((offset + take) % 8))))
+          ++take;
+        data = 64 + (p->stream_capacity + 7) / 8 + bitmap_rank(p, offset);
+      } else if (lo < p->range_count && offset >= p->ranges[lo].offset) {
+        take = (size_t)(p->ranges[lo].offset + p->ranges[lo].bytes - offset);
+        if (take > n)
+          take = n;
+        data = p->ranges[lo].data + offset - p->ranges[lo].offset;
+      } else {
+        take = 0;
+        data = 0;
+      }
+      if (!take) {
+        rc = err(error, LC_ERR_PROTOCOL, "required stream range is unmapped");
+        break;
+      }
+      rc = ps_read_at(reader, data, out, take, error);
+      offset += take;
+      out += take;
+      n -= take;
+      ++lo;
+    }
+    lc_free_with_allocator(NULL, reader);
+    return rc;
+  }
   return rc == LC_OK
              ? transfer(run->space, bytes, n,
                         run->entry->extents[0].offset + PS_RUN_HEADER + offset,
@@ -3501,6 +3895,18 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     return err(error, LC_ERR_INVALID,
                "piece completion requires bounded finalized bytes");
   s = run->space;
+  if (run->entry->owned_mapped) {
+    if (operation == 2)
+      return err(error, LC_ERR_INVALID, "mapped pieces cannot be extended");
+    if (run->entry->mapped_end > bytes)
+      return err(error, LC_ERR_PROTOCOL,
+                 "mapped piece exceeds its completed prefix");
+    rc = operation ? verify_value_payloads(s, run->entry, scratch, error)
+                   : healthy(s, error);
+    if (rc == LC_OK && out)
+      memset(out, 0, sizeof(*out));
+    return rc;
+  }
   offset = run->entry->extents[0].offset;
   rc = healthy(s, error);
   if (rc == LC_OK && operation == 2) {
@@ -3565,10 +3971,241 @@ int ps_owned_piece_verify(ps_owned_run *run, uint64_t bytes, void *scratch,
                           lc_error *error) {
   return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, error);
 }
+typedef struct piece_selection {
+  ps_owned_head *head;
+  ps_entry *old, *tombstone;
+  ps_writer *writer;
+  int published;
+} piece_selection;
+uint64_t ps_owned_run_storage(const ps_owned_run *run) {
+  uint64_t bytes = 0;
+  size_t i;
+  for (i = 0; i < run->entry->count; ++i)
+    bytes += extent_allocation(&run->entry->extents[i]);
+  return bytes;
+}
+int ps_owned_run_matches(const ps_owned_run *run, const ps_owned_range *ranges,
+                         size_t count) {
+  ps_entry *p = run->entry;
+  uint64_t live = 0, end = 0;
+  size_t i;
+  if (!p->owned_mapped || count != p->range_count)
+    return 0;
+  if (p->range_bitmap) {
+    for (i = 0; i < count; ++i) {
+      if (!ranges[i].bytes || (i && ranges[i].offset <= end) ||
+          ranges[i].offset > p->stream_capacity ||
+          ranges[i].bytes > p->stream_capacity - ranges[i].offset)
+        return 0;
+      end = ranges[i].offset + ranges[i].bytes;
+      if (bitmap_rank(p, end) - bitmap_rank(p, ranges[i].offset) !=
+          ranges[i].bytes)
+        return 0;
+      live += ranges[i].bytes;
+    }
+    return live == p->bytes - 64 - (p->stream_capacity + 7) / 8;
+  }
+  for (i = 0; i < count; ++i)
+    if (ranges[i].offset != run->entry->ranges[i].offset ||
+        ranges[i].bytes != run->entry->ranges[i].bytes)
+      return 0;
+  return 1;
+}
+static int piece_publish(void *context, lc_error *error) {
+  piece_selection *selection = context;
+  ps_space *s = selection->head->space;
+  ps_entry *old = selection->old, *tombstone = selection->tombstone;
+  uint64_t sequence = 0;
+  int rc;
+  if (selection->published)
+    return err(error, LC_ERR_INVALID, "piece publication already selected");
+  if (selection->writer) {
+    rc = ps_publish(selection->writer, NULL, error);
+    selection->published = selection->writer->published;
+    return rc;
+  }
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (lookup(s, old->key) != old || old->deleted ||
+       selection->head->entry->deleted || !selection->head->entry->stream_runs))
+    rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
+  if (rc == LC_OK)
+    rc = append_event(s, old, PS_REMOVE, error);
+  if (rc == LC_OK) {
+    sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+    --selection->head->entry->stream_runs;
+    if (!selection->head->entry->dirty_link)
+      dirty_entry(s, selection->head->entry, NULL);
+    tombstone->key = old->key;
+    tombstone->token = old->token;
+    tombstone->deleted = 1;
+    tombstone->publication_sequence = sequence;
+    register_entry(s, tombstone);
+    dirty_entry(s, tombstone, old);
+    install(s, tombstone);
+    selection->tombstone = NULL;
+    selection->published = 1;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+}
+static int piece_select(piece_selection *selection, ps_piece_select_fn select,
+                        void *context, lc_error *error) {
+  int rc = select ? select(context, piece_publish, selection, error)
+                  : piece_publish(selection, error);
+  if (rc == LC_OK && !selection->published)
+    rc = err(error, LC_ERR_PROTOCOL, "piece selector omitted publication");
+  if (rc != LC_OK && selection->published)
+    __atomic_store_n(&selection->head->space->poisoned, 1, __ATOMIC_RELAXED);
+  return rc;
+}
+int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
+                        ps_budget *budget, const ps_owned_range *ranges,
+                        size_t count, ps_piece_select_fn select, void *context,
+                        ps_owned_run **out, lc_error *error) {
+  ps_space *s;
+  ps_entry *old;
+  piece_selection selection = {0};
+  ps_writer *writer = NULL;
+  ps_owned_run *result = NULL;
+  unsigned char header[64] = {0}, *table = NULL, *scratch = NULL;
+  uint64_t valid = 0, end = 0, live = 0, table_bytes, pos;
+  size_t i;
+  int rc, bitmap;
+  if (out)
+    *out = NULL;
+  if (!head || !source || !out || (count && !ranges) ||
+      source->space != head->space ||
+      source->entry->key.owner != head->entry->token ||
+      ps_owned_run_capacity(source) > PS_CHUNK ||
+      count > ps_owned_run_capacity(source))
+    return err(error, LC_ERR_INVALID,
+               "piece replacement requires matching bounded owners");
+  s = head->space;
+  old = source->entry;
+  selection.head = head;
+  selection.old = old;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK &&
+      (head->entry->deleted || old->deleted || lookup(s, old->key) != old ||
+       old->key.key >= head->entry->bytes ||
+       (!head->entry->stream_sealed &&
+        old->stream_capacity > head->entry->bytes - old->key.key)))
+    rc = err(error, LC_ERR_INVALID,
+             "piece is changing, incomplete or no longer selected");
+  if (rc == LC_OK) {
+    valid = head->entry->bytes - old->key.key;
+    if (valid > old->stream_capacity)
+      valid = old->stream_capacity;
+  }
+  pthread_mutex_unlock(&s->mutex);
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    if (!ranges[i].bytes || (i && ranges[i].offset <= end) ||
+        ranges[i].offset > valid || ranges[i].bytes > valid - ranges[i].offset)
+      rc = err(error, LC_ERR_INVALID,
+               "piece live ranges overlap or exceed completion");
+    else {
+      end = ranges[i].offset + ranges[i].bytes;
+      live += ranges[i].bytes;
+    }
+  }
+  if (rc != LC_OK)
+    return rc;
+  if (!count) {
+    selection.tombstone =
+        lc_calloc_with_allocator(NULL, 1, sizeof(*selection.tombstone));
+    if (!selection.tombstone)
+      return err(error, LC_ERR_NOMEM, "cannot allocate piece retirement");
+    rc = piece_select(&selection, select, context, error);
+    lc_free_with_allocator(NULL, selection.tombstone);
+    return rc;
+  }
+  table_bytes = (uint64_t)count * 8;
+  bitmap = table_bytes > (old->stream_capacity + 7) / 8;
+  if (bitmap)
+    table_bytes = (old->stream_capacity + 7) / 8;
+  scratch = lc_alloc_with_allocator(NULL, PS_CHUNK);
+  table = lc_calloc_with_allocator(NULL, 1, (size_t)table_bytes);
+  result = lc_calloc_with_allocator(NULL, 1, sizeof(*result));
+  if (!scratch || !table || !result)
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate bounded piece replacement");
+  if (rc == LC_OK)
+    rc = ps_owned_piece_verify(source, valid, scratch, error);
+  if (rc == LC_OK)
+    rc = begin_value(s, budget, old->key, 1, &writer, error);
+  if (rc == LC_OK) {
+    writer->expected_owned = old;
+    writer->entry->owned_mapped = 1;
+    writer->entry->stream_capacity = old->stream_capacity;
+    for (i = 0; i < count; ++i) {
+      if (bitmap) {
+        for (pos = ranges[i].offset; pos < ranges[i].offset + ranges[i].bytes;
+             ++pos)
+          table[pos / 8] |= (unsigned char)(1U << (pos % 8));
+      } else {
+        put32(table + i * 8, (uint32_t)ranges[i].offset);
+        put32(table + i * 8 + 4, (uint32_t)ranges[i].bytes);
+      }
+    }
+    memcpy(header, "LCPSMAPR", 8);
+    put64(header + 8, old->key.owner);
+    put64(header + 16, old->key.key);
+    put64(header + 24, old->stream_capacity);
+    put32(header + 32, (uint32_t)count);
+    put32(header + 36, checksum(table, (size_t)table_bytes));
+    put64(header + 40, 64 + table_bytes + live);
+    put64(header + 48, writer->entry->token);
+    put32(header + 60, (uint32_t)bitmap);
+    put32(header + 56, (uint32_t)crc32(checksum(header, 56), header + 60, 4));
+    rc = ps_write(writer, header, sizeof(header), error);
+    if (rc == LC_OK)
+      rc = ps_write(writer, table, (size_t)table_bytes, error);
+  }
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    if (old->owned_mapped) {
+      rc = ps_owned_read(source, ranges[i].offset, scratch,
+                         (size_t)ranges[i].bytes, error);
+      if (rc == LC_OK)
+        rc = ps_write(writer, scratch, (size_t)ranges[i].bytes, error);
+    } else
+      rc = ps_write(writer, scratch + ranges[i].offset, (size_t)ranges[i].bytes,
+                    error);
+  }
+  if (rc == LC_OK)
+    rc = flush_writer(writer, error);
+  if (rc == LC_OK)
+    rc = owned_map_load(s, writer->entry, error);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    result->space = s;
+    result->entry = writer->entry;
+    result->references = 1;
+    ++result->entry->pins;
+    ++s->readers;
+    pthread_mutex_unlock(&s->mutex);
+    selection.writer = writer;
+    rc = piece_select(&selection, select, context, error);
+  }
+  if (rc == LC_OK) {
+    *out = result;
+    result = NULL;
+  }
+  if (result && result->entry)
+    ps_owned_run_close(result);
+  else
+    lc_free_with_allocator(NULL, result);
+  ps_writer_close(writer);
+  lc_free_with_allocator(NULL, scratch);
+  lc_free_with_allocator(NULL, table);
+  return rc;
+}
 int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
                    void *scratch, lc_error *error) {
   int rc;
-  if (!run || !scratch || offset > ps_owned_run_capacity(run) ||
+  if (!run || !scratch || run->entry->owned_mapped ||
+      offset > ps_owned_run_capacity(run) ||
       bytes > ps_owned_run_capacity(run) - offset)
     return err(error, LC_ERR_INVALID, "owned clear outside granted range");
   rc = healthy(run->space, error);

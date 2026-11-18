@@ -12,13 +12,13 @@ typedef struct ps_ns_label {
   char value[PS_NS_LEAF_BYTES];
 } ps_ns_label;
 typedef struct ps_ns_resource {
-  uint64_t id, covered;
+  uint64_t id, covered, reclaim_cursor;
   unsigned int kind;
   const char *leaf;
   ps_ns_label *label;
   ps_catalog_info binding;
   ps_stream *stream;
-  int unselected, pooled;
+  int unselected, pooled, repacking;
   struct ps_ns_resource *next;
 } ps_ns_resource;
 struct ps_namespace_data {

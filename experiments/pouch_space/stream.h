@@ -1,7 +1,7 @@
 #ifndef POUCH_SPACE_STREAM_H
 #define POUCH_SPACE_STREAM_H
 
-#include "space.h"
+#include "owned.h"
 
 typedef struct ps_stream ps_stream;
 typedef struct ps_stream_writer ps_stream_writer;
@@ -13,6 +13,22 @@ typedef struct ps_stream_info {
   uint64_t preferred_grant_bytes;
   int sealed, retired;
 } ps_stream_info;
+typedef struct ps_stream_piece_info {
+  uint64_t base, bytes, completed_bytes, stored_bytes;
+  int mapped;
+} ps_stream_piece_info;
+/* Present pieces only, in logical order. cursor may address a historical hole.
+ * Remapping excludes another remapper/structural transition but not an append
+ * into a later unfinished piece. The selector reacquires canonical liveness
+ * authority after copying and validates its capture before publication.
+ * Ranges are relative to the piece. */
+int ps_stream_piece_next(ps_stream *, uint64_t cursor, ps_stream_piece_info *,
+                         int *found, lc_error *);
+int ps_stream_piece_matches(ps_stream *, uint64_t base, const ps_owned_range *,
+                            size_t, int *, lc_error *);
+int ps_stream_piece_repack(ps_stream *, uint64_t base, ps_budget *,
+                           const ps_owned_range *, size_t, ps_piece_select_fn,
+                           void *, lc_error *);
 
 /* The canonical owner validates its existing record format, starting at the
  * trusted checkpoint tail, and returns the last complete record boundary.

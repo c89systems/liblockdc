@@ -46,4 +46,19 @@ int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,
 /* Constant-time source ownership observation for ordinary reclamation. */
 uint64_t ps_key_checkpoint_source_refs(ps_key_checkpoint *, unsigned int,
                                        uint64_t);
+/* Bounded coalesced body ranges relative to one logical piece. Uses only the
+ * live interval index, not canonical history or body bytes. Free ranges with
+ * the default allocator. Epoch selection rejects changed or prepared body
+ * ownership; unchanged lease metadata does not invalidate a capture. */
+typedef struct ps_checkpoint_ranges {
+  ps_owned_range *ranges;
+  size_t count;
+  uint64_t bytes, epoch;
+} ps_checkpoint_ranges;
+int ps_key_checkpoint_ranges(ps_key_checkpoint *, unsigned int, uint64_t,
+                             uint64_t base, uint64_t bytes,
+                             ps_checkpoint_ranges *, lc_error *);
+int ps_key_checkpoint_ranges_select(ps_key_checkpoint *, unsigned int, uint64_t,
+                                    uint64_t epoch, ps_piece_publish_fn, void *,
+                                    lc_error *);
 #endif
