@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "budget.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention.h"
@@ -1549,6 +1550,7 @@ static void artifacts(const char *directory) {
   REQUIRE(count == roots && !closedir(dir));
   free(seen);
 }
+#include "lease_capacity_cases.h"
 typedef struct run {
   const char *directory, *mode;
   int native, sync, cold, no_error;
@@ -1574,6 +1576,20 @@ static void *worker(void *context) {
     coordinated(r->directory);
   else if (!strcmp(r->mode, "compare"))
     compare(r->directory);
+  else if (!strcmp(r->mode, "capacity-probe"))
+    lease_capacity_case(r->directory, 0, 0, 0, 0, 0, 0);
+  else if (!strcmp(r->mode, "capacity-tail-probe"))
+    lease_capacity_case(r->directory, 0, 0, 1, 16, LC_POUCH_RETENTION_STAGED,
+                        1);
+  else if (!strcmp(r->mode, "capacity-completion"))
+    lease_capacity_completion(r->directory);
+  else if (!strcmp(r->mode, "capacity-uncontended")) {
+    for (int sync = 0; sync < 2; ++sync)
+      for (int crypto = 0; crypto <= 3; crypto += 3)
+        lease_capacity_case(r->directory, sync, crypto, 0, 1, -1, 1);
+  } else if (!strcmp(r->mode, "capacity-profile") ||
+             !strcmp(r->mode, "capacity-required"))
+    lease_capacity_profile(r->directory, !strcmp(r->mode, "capacity-required"));
   else if (!strncmp(r->mode, "allocation-", 11) && strlen(r->mode) == 12 &&
            r->mode[11] >= '0' && r->mode[11] <= '3')
     allocation_failures(r->directory, r->mode[11] - '0', r->native, r->sync,

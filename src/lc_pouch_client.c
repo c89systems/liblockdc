@@ -11896,6 +11896,7 @@ static int lc_pouch_txn_clear_lease_locked(
     options.has_metadata = 1;
     options.metadata = (const unsigned char *)buffer.bytes;
     options.metadata_length = buffer.length;
+    options.maintenance_completion = 1;
     rc = lc_pouch_state_update_metadata_locked(pouch, ns, key, &options,
                                                &result, error);
   }
@@ -18170,6 +18171,7 @@ static int lc_pouch_retention_apply_locked(void *context, lc_error *error) {
         options.has_metadata = 1;
         options.metadata = (const unsigned char *)metadata.bytes;
         options.metadata_length = metadata.length;
+        options.maintenance_completion = 1;
         rc = lc_pouch_state_update_metadata_locked(
             ctx->pouch, ctx->ns, ctx->work.key, &options, &written, error);
       }

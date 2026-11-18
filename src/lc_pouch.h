@@ -247,6 +247,11 @@ typedef struct lc_pouch_state_write_options {
    * Public content types remain ordinary content types unless this field is
    * set by the delete path. */
   int staged_delete_marker;
+  /* Internal lease/transaction completion: a bodyless metadata update can
+   * spend protected maintenance capacity. This grants neither mutation nor
+   * durability authority; the caller validates the completed reservation.
+   * Ordinary metadata changes leave this clear. */
+  int maintenance_completion;
 } lc_pouch_state_write_options;
 
 typedef struct lc_pouch_state_write_result {

@@ -3864,6 +3864,120 @@ the namespace lifetime; stable live entry counts do not prove bounded resident
 label history. The full goal stays active, multifile remains the default/reference,
 and production cutover requires an explicit deployment decision.
 
+### Protected terminal transaction application
+
+Terminal staged-decision records now share maintenance admission with their
+tombstones. Previously, adding a terminal decision to an otherwise deleting
+batch changed its admission class to ordinary, so a durable cleanup decision
+could stop at its first participant despite protected capacity being available.
+Payload links and ordinary metadata still retain ordinary admission. The common
+binary batch path continues to admit the complete frame and its checkpoint
+dependencies before selecting any record.
+
+Validated lease clearing and restoration of a committed cleanup's fenced lease
+now explicitly classify their bodyless metadata updates as maintenance
+completion. The private write-options field defaults to false. It conveys
+capacity class only: the existing namespace/transaction authority, fencing,
+preconditions, canonical validation and durability barriers still apply. Such
+updates stay on their caller instead of entering the ordinary metadata batcher.
+The restored lease retains the work reference's original fencing/state facts
+after a parent tombstone has removed the prior metadata. Public APIs, shared
+library ABI and persistence representations are unchanged.
+
+The new `pouch_space_lease_capacity-completion` group proves 56 workflows across
+all four codecs and both policies: 24 successful expiry workflows and 32 injected
+failures from decision through data durability. Half of those failure cases
+reopen before retry, reacquire an ordinary peer claim and observe the still-ACTIVE
+reservation. Every retry preserves the committed outcome with the peer
+held even after the wall clock retreats. A reader admitted before expiry still
+reads the original body; later reads and reopen see the deleted parent and
+attachments. Each fixture retains a fixed 10 MiB file.
+
+The peer holds a large ordinary page claim near the admission boundary and
+preserves the computed maintenance floor. This is a capacity-pressure probe,
+not proof that every usable cell or all-live physical capacity is exhausted.
+Its binary search does not forbid subsequent small ordinary work from fitting
+in existing grants or released checkpoint credits.
+
+The broader manual `capacity-profile` mode runs 96 public workflows: two policies,
+four codecs, 5-byte/8 KiB parent keys, zero/16 attachments, and peer admission
+before cleanup or after staging, plus a no-peer control. It records live and
+allocated bytes, metadata, credits, standing floor, checkpoint workspace,
+entries and barriers at each observed phase. Both versions verify every final
+parent/attachment outcome after releasing the peer and reopening.
+
+| Workflow / eight codec-policy combinations | Prior algorithms | Current |
+| --- | ---: | ---: |
+| No peer, all four key/attachment profiles | 32/32 | 32/32 |
+| Peer before cleanup, short key without attachments | 0/8 | 8/8 |
+| Peer before cleanup, other three profiles | 0/24 | 0/24 |
+| Peer after staging, short key or no attachments | 0/24 | 24/24 |
+| Peer after staging, 8 KiB key with 16 attachments | 0/8 | 0/8 |
+
+The current operation therefore completes 64/96 cases while the peer is held,
+versus 32/96 previously. This is not complete compound admission. The 24 early
+failures stop at journal preparation and unwind their reference; the remaining
+eight reach parent application but cannot finish attachment application until
+capacity returns. In the plaintext/NoSync large-key example, live bytes grow
+from 1,246,066 after claiming to 1,662,334 after staging, while the standing
+payload floor is 81,920 bytes. The per-key maximum does not represent that
+operation's cumulative dependencies. Completing a funded checkpoint and retrying
+the next append did not repair this case; that attempted retry was removed.
+
+`capacity-required` runs the same matrix with a strict completion requirement
+and currently fails. `capacity-tail-probe` isolates the remaining post-staging
+case. These intentional manual acceptance gates are not registered as green
+CTest groups. Their remaining obligation is to admit the journal, lease,
+participant, attachment and checkpoint work together, with recovery reconstructing
+unfinished obligations before foreground readmission. A volatile live-call
+budget alone, or charging the entire original plan again after partial completion,
+would not establish that property. No second outcome journal or fixed-floor
+increase was introduced by this change.
+
+Evidence is in ignored `build/pouch-space-transaction-capacity/`. Twelve selected
+Debug ASan/UBSan groups pass, including lease phase failures, concurrency,
+coordinated transactions, combined-codec process cuts, stage recovery and four
+standard source/API boundary checks. GNU Release passes six groups, including
+plaintext and combined-codec XA capacity/retry, and musl Release passes four.
+Two TSan scenarios pass with instrumented OpenSSL 3.6.5 and no suppressions.
+Strict Memcheck covers the 56 new workflows with 418,008 allocations/frees, zero
+errors, no retained heap and only the three inherited descriptors.
+
+The comparison control recompiles the `927688d4` state/client algorithms against
+the current private layouts and dependencies, then relinks the same current
+fixture and physical backend (`build-baseline.sh`). The old algorithms fail the
+new strict completion fixture; the whole-operation gate still fails currently.
+`profile-before.log`, `profile-gnu.log`, `baseline-required.log`,
+`acceptance-required.log` and `required-status.log` retain those results.
+
+The separate uncontended comparison alternates algorithms over three samples,
+plaintext/combined codecs and both policies (24 verified runs), using a preopened
+root, a short parent key and one attachment. The median of the two configuration
+ratios after taking each configuration's three-sample median is:
+
+| Current / prior algorithms | NoSync | Durable |
+| --- | ---: | ---: |
+| Expiry work | 1.08x | 0.99x |
+| Work CPU | 0.95x | 0.95x |
+| Close | 0.84x | 1.08x |
+| Reopen | 1.03x | 1.14x |
+| Reopen plus verification | 1.02x | 1.15x |
+
+Current work medians are 22.92/21.16 ms, CPU 1.32/1.48 ms, close 0.044/0.076 ms,
+reopen 1.53/1.70 ms and reopen plus verification 1.59/1.79 ms (NoSync/durable).
+The 32 no-peer profiles also retain identical per-operation barrier counts in
+the broader comparison. These cached small-host samples do not establish a
+universal no-regression result or production latency guarantee. Query indexing
+is disabled in this expiry probe; it does not measure indexed readiness. The
+earlier indexing and multifile gaps remain open. Raw measurements and derivation
+are `paired-performance.log`, `paired-performance.sh`, `performance-summary.tsv`
+and `summarize-performance.awk`.
+
+The full backend goal remains active, including compound admission/recovery,
+inherited checksum proof, collection REGION relocation, codec conversion and
+shared-root coordination/recovery. Multifile remains the default/reference;
+production cutover still needs an explicit deployment decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

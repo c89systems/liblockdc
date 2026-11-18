@@ -1808,6 +1808,7 @@ typedef struct lc_pouch_state_binary_append_item {
   lc_pouch_generation query_index_seq;
   int query_index_from_index;
   int lifetime_from_index;
+  int maintenance_completion;
 } lc_pouch_state_binary_append_item;
 
 typedef struct lc_pouch_state_metadata_append_request {
@@ -6789,13 +6790,20 @@ static int lc_pouch_state_append_binary_records_locked(
   appended_end = 0U;
   query_index_changed = 0;
   storage_mode = LC_POUCH_STORAGE_APPEND_MAINTENANCE;
+  /* A terminal staged decision and its tombstones discharge owned work.
+   * Lease clearing is explicitly classified by its validated logical caller.
+   * Payload links and ordinary metadata still preserve the foreground floor.
+   */
   rc = LC_OK;
   for (index = 0U; index < item_count; ++index) {
     size_t trailer_offset;
     int has_query_index_seq;
 
     if (items[index].record_type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
-        items[index].record_type != LC_POUCH_STATE_RECORD_OBJECT_DELETE)
+        items[index].record_type != LC_POUCH_STATE_RECORD_OBJECT_DELETE &&
+        items[index].record_type != LC_POUCH_STATE_RECORD_DECISION &&
+        !(items[index].maintenance_completion &&
+          items[index].record_type == LC_POUCH_STATE_RECORD_STATE_META))
       storage_mode = LC_POUCH_STORAGE_APPEND_COMPLETE;
 
     rc = lc_pouch_state_meta_trailer(items[index].meta, items[index].meta_len,
@@ -7080,7 +7088,8 @@ static int lc_pouch_state_append_binary_record(
     lc_pouch *pouch, const char *ns, lc_pouch_namespace_manifest *manifest,
     unsigned char record_type, const void *key, size_t key_len,
     unsigned char *meta, size_t meta_len, lc_pouch_generation query_index_seq,
-    int query_index_from_index, int lifetime_from_index, lc_error *error) {
+    int query_index_from_index, int lifetime_from_index,
+    int maintenance_completion, lc_error *error) {
   lc_pouch_state_binary_append_item item;
 
   memset(&item, 0, sizeof(item));
@@ -7092,6 +7101,7 @@ static int lc_pouch_state_append_binary_record(
   item.query_index_seq = query_index_seq;
   item.query_index_from_index = query_index_from_index;
   item.lifetime_from_index = lifetime_from_index;
+  item.maintenance_completion = maintenance_completion;
   return lc_pouch_state_append_binary_records(pouch, ns, manifest, &item, 1U,
                                               error);
 }
@@ -13311,7 +13321,7 @@ static int lc_pouch_state_append_tombstone(
   }
   rc = lc_pouch_state_append_binary_record(
       pouch, ns, manifest, delete_record_type, key, strlen(key), meta, meta_len,
-      0UL, query_index_from_index, 0, error);
+      0UL, query_index_from_index, 0, 0, error);
   if (rc == LC_OK) {
     rc = lc_pouch_state_meta_index_seq(meta, meta_len, &index_seq, error);
   }
@@ -13340,7 +13350,7 @@ static int lc_pouch_state_append_record(
     lc_pouch_unix_seconds updated_at_unix, int has_query_hidden,
     int query_hidden, int staged_delete_marker, lc_pouch_unix_seconds retention,
     lc_pouch_generation query_index_seq, const lc_pouch_state_entry *prior,
-    lc_error *error) {
+    int maintenance_completion, lc_error *error) {
   unsigned char *meta;
   size_t meta_len;
   int rc;
@@ -13373,7 +13383,7 @@ static int lc_pouch_state_append_record(
         pouch, ns, manifest, record_type, key, strlen(key), meta, meta_len,
         query_index_seq, 0,
         payload_span->present && !(prior->found && prior->payload_span.present),
-        error);
+        maintenance_completion, error);
   }
   lc_free_with_allocator(&pouch->allocator, meta);
   return rc;
@@ -16013,7 +16023,8 @@ static int lc_pouch_state_update_metadata_from_current_locked(
       updated_at_unix, has_query_hidden, query_hidden,
       current->staged_delete_marker,
       options->has_retention ? options->retention : current->retention,
-      current->query_index_seq, current, error);
+      current->query_index_seq, current, options->maintenance_completion,
+      error);
   if (rc == LC_OK) {
     rc = lc_pouch_state_metadata_write_result_build(
         pouch, manifest, current, options, version, updated_at_unix,
@@ -16196,7 +16207,8 @@ int lc_pouch_state_update_metadata_locked(
   /* A shared-root key mutation retains root-wide durable authority, so only
    * the exclusive fast path may transfer metadata publication to its
    * namespace-local worker. */
-  use_metadata_batcher = lc_pouch_state_metadata_batching_allowed(pouch, ns);
+  use_metadata_batcher = !options->maintenance_completion &&
+                         lc_pouch_state_metadata_batching_allowed(pouch, ns);
   if (use_metadata_batcher &&
       lc_pouch_state_cache_borrow_exclusive_record(pouch, ns, key, &current)) {
     current_is_borrowed = 1;
@@ -16957,7 +16969,7 @@ static int lc_pouch_state_stage_metadata_prepared_locked(void *context,
         current->staged_delete_marker,
         stage->options->has_retention ? stage->options->retention
                                       : current->retention,
-        0UL, &staged, error);
+        0UL, &staged, 0, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_metadata_write_result_build(
           stage->pouch, &manifest, current, stage->options, logical_version,
