@@ -3154,12 +3154,98 @@ This completes bounded namespace range replacement, not the full backend or its
 standing-capacity proof. Unfinished active tails, captured metadata views,
 changing body ownership and inherited checksum obligations can retain pending
 work. Threshold/completion scheduling still needs to follow physical and deferred
-obligations as logical high waters grow. Computed standing reserve and root-wide
-reconstruction of every outstanding capacity obligation before any producer are
-still required; the current fixed floor and lazy namespace recovery do not prove
-that property. Collection REGION relocation, codec conversion and shared-root
-coordination/recovery remain separate required surfaces. Production cutover
-still requires an explicit deployment decision. The full goal remains active.
+obligations as logical high waters grow. At this milestone, computed standing
+reserve and root-wide reconstruction of outstanding capacity obligations before
+any producer remained required. The following recovery change restores
+outstanding canonical checkpoint claims; the fixed floor still does not prove
+the complete standing-capacity property. Collection REGION relocation, codec
+conversion and shared-root coordination/recovery remain separate required
+surfaces. Production cutover still requires an explicit deployment decision.
+The full goal remains active.
+
+### Root admission restores outstanding checkpoint claims
+
+Reopening the exclusive container now recovers every catalogued namespace before
+returning a writable root capability. Each namespace loads its selected key
+summaries, recovers its canonical source prefix and replays the uncovered suffix
+to restore its outstanding checkpoint budget. Cached namespace ownership retains
+those volatile claims for the root lifetime. A producer cannot consume a cold
+sibling's completion workspace simply because nobody has acquired that sibling
+since reopening. Creation of an empty root needs no census.
+
+The census uses existing canonical authority and adds no durable debt ledger or
+producer durability barrier. Namespace checkpoint publication remains explicit.
+This deliberately moves recovery into root readiness: startup retains storage
+owners for all namespaces and pays their metadata/suffix recovery cost. Errors
+in a cold namespace now reject root open; no writer capability is exposed with
+partially restored claims. Failed initialization destroys partial namespace
+owners, budgets, crypto and physical ownership through the normal root close
+path. A same-path retry needs no intervening process exit or extra capacity.
+
+An interrupted bounded checkpoint may have already selected a large key value
+while its coverage control still names an older prefix. Replay now applies the
+existing canonical supersession rules before funding an entry. Superseded
+records need coverage-control credit, not a second copy of an already-selected
+value. This is necessary at full capacity: refunding a temporary large claim
+after projection is too late. The suffix replay also skips decoding selected
+metadata values that the fresh checkpoint owner already loaded. Public view
+visits still include selected metadata and high waters.
+
+The fixed 10 MiB fixture covers both sync policies, complete/interrupted key
+checkpoints and spare/full foreground capacity: eight combinations. The
+interrupted case selects 64 of 65 keys, including a 1 MiB metadata-only key,
+before rejecting the next batch. After root return, before acquiring that cold
+namespace, its outstanding payload credits exactly match the pre-close claim.
+A peer then exhausts ordinary capacity and the cold checkpoint still completes
+without growth. A separate two-namespace model cuts all 179 allocation,
+4 write/sync and 16 read failure sites per policy, then retries the same path and
+checks both canonical values and both restored claims. That model uses an
+explicit 1 MiB fixture; the product default remains 10 MiB.
+
+The final ASan/UBSan Debug gate passes 15 groups, including the new capacity and
+cleanup cases, checkpoint publication fault cuts, root/namespace lifecycle and
+concurrency, public snapshots/sequence recovery, source-manifest and Pouch
+boundary checks. GNU and native musl Release each pass twelve affected groups
+with normal worker defaults. Strict Memcheck passes the complete bootstrap fault sweep with
+132,600 matched allocations/frees, zero live heap, errors, suppressions or owned
+descriptors. Logs are in `build/pouch-space-obligations/`: `final-debug.log`,
+`qualification-gnu.log`, `qualification-musl.log`, `qualification-memcheck.log`
+and `memcheck-bootstrap.log`.
+
+The paired GNU Release comparison verifies 48 runs: eight configurations,
+three samples each of the frozen sparse-reclamation build and this change,
+using the same preopened four-round indexed workloads as the preceding stage.
+Ratios below are medians of each configuration's median-of-three ratio to that
+frozen container; lower is faster. Readiness and reopen are reported separately.
+
+| Measurement / prior container | NoSync | Durable |
+| --- | ---: | ---: |
+| Measured work | 1.13x | 0.97x |
+| Work CPU | 0.98x | 0.97x |
+| p50 write | 0.98x | 0.96x |
+| Indexed worker | 1.11x | 1.16x |
+| Reopen and verify | 1.23x | 1.21x |
+| Close | 1.09x | 0.97x |
+
+Median reopen/verify across configurations is about 8.0/6.8 ms versus the
+prior 6.1/6.0 ms (NoSync/durable). NoSync work ratios range from 1.02-1.27x;
+durable ratios range from 0.78-1.10x. NoSync sync-call medians are unchanged in
+all four configurations. These small host samples do not establish a speedup,
+a cause for the measured work variation or a production latency commitment.
+They expose the added cold admission cost. This comparison does not replace
+the preceding multifile baseline or resolve its NoSync indexed-readiness gap.
+Raw data and per-configuration medians are `paired-performance.log` and
+`paired-summary.json` in the same stage directory.
+
+This restores existing checkpoint debt before admission. The fixed 16 KiB floor
+still needs replacement by a computed compound obligation for future deletion,
+retention control phases, bounded relocation and their metadata/publication
+dependencies. Retention work can exceed a tombstone's size, and replacing an
+active control may require both predecessor and successor ownership until
+durable retirement. Those credits cannot be assumed to be interchangeable.
+Active partial tails, inherited checksum proof, collection REGION relocation,
+codec conversion, shared-root coordination/recovery and the broader capacity
+progress proof remain required. No production cutover is implied.
 
 ### Root and namespace ownership
 

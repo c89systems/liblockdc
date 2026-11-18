@@ -7318,6 +7318,7 @@ static void bounded_pieces(int durable, int checkpointed) {
   free(m.stable);
   clean();
 }
+#include "capacity_cases.h"
 #include "checkpoint_cases.h"
 #include "reclaim_cases.h"
 #include "revision_cases.h"
@@ -7330,7 +7331,15 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "checkpoint-records") == 0) {
+    if (strcmp(argv[2], "root-obligations") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int partial = 0; partial < 2; ++partial)
+          for (int full = 0; full < 2; ++full)
+            root_obligations(durable, partial, full);
+    } else if (strcmp(argv[2], "root-obligation-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        root_obligation_faults(durable);
+    } else if (strcmp(argv[2], "checkpoint-records") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_records(durable);
     } else if (strcmp(argv[2], "checkpoint-owner") == 0) {

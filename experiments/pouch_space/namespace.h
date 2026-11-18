@@ -45,6 +45,10 @@ int ps_namespace_checkpoint_observe(ps_namespace *,
 /* Flushes only changed canonical metadata, retaining uncovered history until
  * every bounded batch is selected. Caller holds logical namespace authority. */
 int ps_namespace_checkpoint_flush(ps_namespace *, lc_error *);
+/* Root bootstrap only, before exposing any producer. Replays the canonical
+ * suffix and reinstalls its outstanding checkpoint capacity claim without
+ * publishing a new key checkpoint. Cached ownership retains the claim. */
+int ps_namespace_checkpoint_recover(ps_namespace *, lc_error *);
 uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);
 /* Conservative durable work marker, independent of the segment head/tail.
  * Ensure precedes expiry-bearing publication, including for NoSync roots. A

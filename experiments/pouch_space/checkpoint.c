@@ -1138,21 +1138,41 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   pthread_mutex_unlock(&c->mutex);
   lc_free_with_allocator(&c->allocator, d);
 }
+static int replay_superseded(ps_key_checkpoint *c,
+                             const lc_pouch_state_entry *entry) {
+  key_slot *slot;
+  lc_pouch_state_entry prior, projected;
+  unsigned int kind = entry->control ? PS_KEY_DECISION : PS_KEY_METADATA;
+  if (!entry->key || (entry->control && !entry->decision))
+    return 0;
+  slot = find_key(c, entry->key, kind);
+  if (!slot)
+    return 0;
+  summary_view(slot, &slot->summary, &prior);
+  return kind == PS_KEY_DECISION
+             ? !lc_pouch_state_decision_entry_accepts(prior.seen,
+                                                      prior.index_seq, entry)
+             : !lc_pouch_state_entry_project(&prior, entry, &projected);
+}
 int ps_key_checkpoint_replay(ps_key_checkpoint *c,
                              const lc_pouch_state_entry *entry, lc_error *e) {
   ps_checkpoint_delta d;
-  uint64_t bytes;
-  int rc;
+  uint64_t bytes = 0;
+  int rc = LC_OK;
   if (!c || !entry || !entry->seen)
     return failure(e, LC_ERR_INVALID,
                    "checkpoint replay requires a complete record");
   memset(&d, 0, sizeof(d));
   d.checkpoint = c;
   d.claim = c->claim;
-  /* Use the same exact metadata encoder for admission, never body bytes. */
-  rc = lc_pouch_state_record_measure_snapshot(&c->allocator, NULL, entry, 0,
-                                              &bytes, e);
   pthread_mutex_lock(&c->mutex);
+  /* Forward slots from an interrupted checkpoint may already supersede this
+   * canonical prefix. They need only the coverage control, not another value
+   * reservation. Refunding a temporary large claim after projection is too
+   * late when the root has exhausted ordinary capacity. */
+  if (!replay_superseded(c, entry))
+    rc = lc_pouch_state_record_measure_snapshot(&c->allocator, NULL, entry, 0,
+                                                &bytes, e);
   if (rc == LC_OK)
     rc =
         admit_key(&d, entry->control && !entry->decision ? NULL : entry->key,

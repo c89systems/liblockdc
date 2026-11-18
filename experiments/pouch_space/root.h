@@ -25,6 +25,10 @@ typedef struct ps_namespace_info {
 /* One native container owner, with the physical layer's exclusive lifetime
  * lock. Creation requires a new file. Reopen requires committed root metadata;
  * failed initialization is never silently adopted as another crypto policy.
+ * Before returning, reopen recovers every catalogued namespace's canonical
+ * suffix and reinstates its checkpoint capacity claims. An unused namespace
+ * cannot lose completion capacity to a producer in another namespace. Recovery
+ * errors reject open, with no writable capability or retained partial owners.
  * Shared-process ownership is a separate pending integration step. */
 int ps_root_open(const char *, int create, const ps_root_options *, ps_root **,
                  lc_error *);

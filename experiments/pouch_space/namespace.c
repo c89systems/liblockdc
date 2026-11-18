@@ -1062,9 +1062,9 @@ static int replay_read(void *context, uint64_t offset,
   }
   return LC_OK;
 }
-int ps_namespace_view_visit(ps_namespace_view *view, int verify,
-                            ps_namespace_record_fn visit, void *context,
-                            lc_error *e) {
+static int view_visit(ps_namespace_view *view, int verify, int selected,
+                      ps_namespace_record_fn visit, void *context,
+                      lc_error *e) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry record = {0};
   unsigned char *scratch = NULL;
@@ -1087,7 +1087,7 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
   memset(&input, 0, sizeof(input));
   io.ops = &ops;
   io.context = &input;
-  if (view->coverage.epoch) {
+  if (selected && view->coverage.epoch) {
     record.key = LC_POUCH_STATE_HIGH_WATER_KEY;
     record.control = record.seen = record.has_query_index_seq = 1;
     record.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
@@ -1096,7 +1096,8 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
     rc = visit(context, 0, &record, e);
     memset(&record, 0, sizeof(record));
   }
-  for (i = 0; rc == LC_OK && i < ps_values_count(view->metadata); ++i) {
+  for (i = 0; selected && rc == LC_OK && i < ps_values_count(view->metadata);
+       ++i) {
     rc = ps_values_info(view->metadata, i, &metadata_key, &metadata_ref,
                         &metadata_bytes, e);
     if (rc == LC_OK) {
@@ -1150,6 +1151,11 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
   lc_free_with_allocator(NULL, input.buffer);
   return rc;
 }
+int ps_namespace_view_visit(ps_namespace_view *view, int verify,
+                            ps_namespace_record_fn visit, void *context,
+                            lc_error *e) {
+  return view_visit(view, verify, 1, visit, context, e);
+}
 void ps_namespace_view_close(ps_namespace_view *view) {
   size_t i;
   if (!view)
@@ -1183,7 +1189,10 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   if (rc == LC_OK)
     rc = ps_namespace_view_open(d->ns, &view, e);
   if (rc == LC_OK)
-    rc = ps_namespace_view_visit(view, 0, checkpoint_replay, fresh, e);
+    /* The fresh owner already loaded selected slots and their high waters.
+     * Replay only the uncovered suffix; decoding those slots again merely to
+     * discard them adds needless cold-open I/O and transient allocations. */
+    rc = view_visit(view, 0, 0, checkpoint_replay, fresh, e);
   if (rc == LC_OK) {
     for (i = 0; i < view->count; ++i)
       ps_key_checkpoint_replayed(fresh, view->items[i].id, view->items[i].tail);
@@ -1217,6 +1226,17 @@ int ps_namespace_checkpoint_observe(ps_namespace *ns,
     rc = ps_key_checkpoint_observe(d->checkpoint, observer, e);
     pthread_mutex_unlock(&d->mutex);
   }
+  return rc;
+}
+int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
+  struct ps_namespace_data *d;
+  int rc = ps_ns_data_get(ns, &d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_enter(d, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = checkpoint_ready(d, e);
+  ps_ns_leave(d);
   return rc;
 }
 int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {

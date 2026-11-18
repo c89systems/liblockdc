@@ -570,7 +570,7 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-churn owned-repack-faults)
+  foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-churn root-obligations root-obligation-faults owned-repack-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

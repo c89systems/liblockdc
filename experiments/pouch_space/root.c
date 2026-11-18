@@ -3,6 +3,7 @@
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
+#include "namespace.h"
 #include "outbox_markers.h"
 #include "owned.h"
 #include "root_internal.h"
@@ -14,6 +15,19 @@
 #define ROOT_KEY_ID_BYTES 80U
 static const unsigned char config_magic[8] = {'L', 'C', 'P', 'S',
                                               'R', 'O', 'O', 'T'};
+static int recover_namespace(const char *name,
+                             const ps_namespace_info *identity, void *context,
+                             lc_error *error) {
+  ps_root *root = context;
+  ps_namespace *ns = NULL;
+  int rc;
+  (void)identity; /* The catalog visitor has already checked the incarnation. */
+  rc = ps_root_namespace_acquire(root, name, 0, &ns, error);
+  if (rc == LC_OK)
+    rc = ps_namespace_checkpoint_recover(ns, error);
+  ps_namespace_release(ns);
+  return rc;
+}
 static int failure(lc_error *error, int code, const char *reason,
                    const char *message) {
   return lc_error_set(error, code, 0L, message, NULL, reason, "pouch");
@@ -171,12 +185,10 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   if (rc == LC_OK)
     rc = create ? config_write(root, error)
                 : config_read(root, options->compression_explicit, error);
+  if (rc == LC_OK && !create)
+    rc = ps_root_namespace_visit(root, recover_namespace, root, error);
   if (rc != LC_OK) {
-    ps_close(root->space, NULL);
-    lc_pouch_crypto_close(root->crypto);
-    pthread_cond_destroy(&root->changed);
-    pthread_mutex_destroy(&root->mutex);
-    lc_free_with_allocator(NULL, root);
+    (void)ps_root_close(root, NULL);
     return rc;
   }
   *out = root;
