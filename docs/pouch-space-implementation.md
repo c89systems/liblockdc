@@ -2584,6 +2584,83 @@ persistence or public behavior has changed yet.
 
 ## Integration and acceptance
 
+### Atomic immutable revision publication
+
+The physical container now provides `ps_revision_writer_info` and
+`ps_revision_publish` through the private `revision.h` capability. The first
+captures an unpublished writer's immutable identity and exact encoded length,
+including its bounded pending tail, without publishing or flushing it. A logical
+revision can embed that identity in another member before either becomes visible.
+The second publishes distinct immutable keys in one physical revision. Members
+share a space and capacity budget; NULL retains ordinary admission. A supplied
+joint budget protects the complete payload/descriptor obligation while unrelated
+producers consume unclaimed capacity. Selection checks aggregate descriptor
+growth and entry credits, so separately affordable members cannot overdraw one
+claim. Private producers and payload I/O run outside publication authority.
+
+One checksummed `PSR1` frame in the existing physical journal binds all ordinary
+PUT descriptors and their consecutive journal sequences. It contains metadata,
+never concatenated application values. The complete descriptor frame must fit
+the existing 128 KiB journal; this is an internal publication-primitive bound,
+not a new public transaction limit. Existing canonical compound-stream framing
+remains in use. Recovery validates every member descriptor and every referenced
+payload before admitting any member. An incomplete or invalid candidate admits
+none, even when its first inner PUT is complete and valid. Checkpointing selects
+the resulting entries through the existing directory/root protocol; there is
+no second log, allocator, decision authority or pathname layer.
+
+Runtime selection installs the whole revision under metadata authority and
+advances readiness once. Durable roots, and revisions containing an always-durable
+CONTROL member, expose and acknowledge only the completed shared prefix. This
+also covers non-CONTROL members on a NoSync root: their volatile visibility
+obligation prevents a partially visible revision while the barrier is pending.
+Plain NoSync revisions expose complete selection without an added sync. A
+non-rollover revision uses exactly one shared durability barrier when required;
+journal rollover may additionally checkpoint first. Captured old readers retain
+their bytes through replacement and checkpoint retirement. Invalid invocations
+leave private writers usable; failures after preparation starts require closing
+and rebuilding them, with ordinary uncertain-I/O poison/recovery semantics.
+
+The scoped qualification is in `build/pouch-space-revision/`:
+
+- All **31 affected Debug storage groups** pass, including existing allocator,
+  capacity, checkpoint/repack, stream, catalog, recovery and commit controls
+  (`qualification-debug.log`, `qualification-debug-details.log`).
+- GNU and native musl Release each pass **10 groups**, comprising the four new
+  revision groups and six portability controls (`qualification-{gnu,musl}*.log`).
+  Debug uses actual 128 KiB workers with the glibc stack cache disabled; Release
+  uses ordinary platform defaults.
+- New models check **265 byte prefixes**, **eight invalid complete candidates**,
+  **19 publication I/O cuts**, **36 publication allocation cuts**, **eight
+  recovery read cuts**, **24 recovery allocation cuts**, and **18 exec process
+  exits**. Lost/torn persistence and process exit are separate models. Complete
+  frames with lost acknowledgements may recover; complete inner prefixes may
+  not. Every recovered pair is checked against exact old/new bodies and an
+  unaffected neighboring value, then retried and checkpointed.
+- Capacity checks reject insufficient joint entry/descriptor claims without
+  selecting either member, then publish funded work after a peer exhausts
+  ordinary capacity. Lifetime and concurrency cases retain old readers, cross
+  journal rollover, and perform independent payload I/O while revision payload
+  I/O or sync is paused. Mixed CONTROL/STATE revisions on NoSync roots are
+  checked before and after their held barrier.
+- Three ThreadSanitizer invocations pass with instrumented OpenSSL **3.6.5**,
+  128 KiB workers and no suppressions (`qualification-tsan.log`). Three Memcheck
+  invocations pass with **26,747 allocations/frees**, no live heap, errors,
+  suppressions or owned descriptors (`qualification-memcheck.log`,
+  `memcheck-*.log`). Intentional process deaths remain separate.
+
+This completes the physical publication primitive. Namespace and collection
+index owners still use their prior sealed-stream/catalog path, so the measured
+index performance gap has not changed yet. The next integration must fund and
+prepare generation plus manifest together, capture the private signature, select
+them through this revision protocol, and adapt reader/pruning/recovery ownership
+as one coherent surface. Incremental canonical checkpoints, bounded relocation,
+standing maintenance admission, codec conversion, shared-root coordination and
+deployment acceptance remain unfinished. No public API/ABI or production-open
+selection changes; the experimental format marker is unchanged.
+
+### Root and namespace ownership
+
 The experimental root owner now owns the physical container, crypto provider and
 namespace registry. A 128-byte `PS_CONTROL` value binds encryption mode, root key
 identity, compression policy and canonical record/head widths. Creation commits

@@ -12,6 +12,7 @@ typedef struct ps_catalog_index {
 } ps_catalog_index;
 #define ROOT_MAGIC UINT64_C(0x31544f4f525350)
 #define EVENT_MAGIC UINT64_C(0x31565350)
+#define REVISION_MAGIC UINT32_C(0x31525350)
 #define BUCKETS 257U
 #define JOURNAL_OFFSET PS_JOURNAL_OFFSET
 #define META_MAGIC UINT32_C(0x3141544d)
@@ -34,6 +35,7 @@ typedef struct ps_entry {
   uint64_t publication_sequence;
   uint64_t stream_capacity, stream_runs, stream_ready;
   int stream_open, stream_sealed, orphan_claimed;
+  int durable_visibility; /* pending revision uses completed prefix */
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */

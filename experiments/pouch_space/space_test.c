@@ -6995,6 +6995,7 @@ static void append_growth_high_water(void) {
   free(bytes);
   clean();
 }
+#include "revision_cases.h"
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -7004,7 +7005,25 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "value-budget") == 0) {
+    if (strcmp(argv[2], "revision") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int control = 0; control < 2; ++control)
+          revision_lifecycle(durable, control);
+      revision_admission();
+      revision_candidate_images();
+      revision_rollover();
+    } else if (strcmp(argv[2], "revision-concurrency") == 0) {
+      revision_concurrency();
+    } else if (strcmp(argv[2], "revision-process") == 0) {
+      revision_processes(argv[1]);
+    } else if (strcmp(argv[2], "revision-crash-child") == 0) {
+      revision_death_child();
+    } else if (strcmp(argv[2], "revision-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int control = 0; control < 2; ++control)
+          revision_faults(durable, control);
+      revision_recovery_failures();
+    } else if (strcmp(argv[2], "value-budget") == 0) {
       value_budget_planning();
       value_budget_rejections();
       for (int durable = 0; durable < 2; ++durable)

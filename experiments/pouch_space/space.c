@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include "lc_api_internal.h"
+#include "revision.h"
 #include "space_internal.h"
 
 #include <errno.h>
@@ -1565,6 +1566,72 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
     entry_free(p);
   return rc;
 }
+/* Validate the entire candidate before changing any selected ownership. A
+ * complete inner record is not independently recoverable inside a revision. */
+static int recover_revision(ps_space *s, const unsigned char *wire,
+                            size_t bytes, unsigned char *buffer,
+                            lc_error *error) {
+  ps_entry **entries = NULL, *old;
+  size_t count, i, j, cursor = 64, member_bytes;
+  int event, rc = LC_OK;
+  count = get32(wire + 16);
+  if (bytes < 64 || get32(wire) != REVISION_MAGIC || get32(wire + 4) != bytes ||
+      !count || count > (bytes - 64) / 64 || count > UINT64_MAX - s->sequence ||
+      get64(wire + 8) != s->sequence + 1 || get32(wire + 20) ||
+      get64(wire + 24) || get64(wire + 32) || get64(wire + 40) ||
+      get64(wire + 48) || get32(wire + 56) ||
+      get32(wire + 60) !=
+          (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
+    return err(error, LC_ERR_PROTOCOL, "invalid container revision frame");
+  entries = lc_calloc_with_allocator(NULL, count, sizeof(*entries));
+  if (!entries)
+    return err(error, LC_ERR_NOMEM, "cannot allocate revision recovery owners");
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    if (bytes - cursor < 64) {
+      rc = err(error, LC_ERR_PROTOCOL, "truncated revision member");
+      break;
+    }
+    member_bytes = get32(wire + cursor + 4);
+    if (member_bytes < 64 || member_bytes > bytes - cursor ||
+        get64(wire + cursor + 8) != s->sequence + 1 + i) {
+      rc = err(error, LC_ERR_PROTOCOL, "invalid revision member boundary");
+      break;
+    }
+    rc = decode_entry(s, wire + cursor, member_bytes, &entries[i], &event,
+                      error);
+    if (rc == LC_OK && (event != PS_PUT || !immutable_key(entries[i]->key)))
+      rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
+    for (j = 0; rc == LC_OK && j < i; ++j)
+      if (same_key(entries[j]->key, entries[i]->key))
+        rc = err(error, LC_ERR_PROTOCOL, "duplicate revision member key");
+    if (rc == LC_OK) {
+      old = lookup(s, entries[i]->key);
+      if (old && !old->deleted && entries[i]->key.kind == PS_COLLECTION)
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "revision overwrites collection position");
+    }
+    if (rc == LC_OK)
+      rc = verify_entry(s, entries[i], buffer, error);
+    cursor += member_bytes;
+  }
+  if (rc == LC_OK && cursor != bytes)
+    rc = err(error, LC_ERR_PROTOCOL, "revision has trailing members");
+  if (rc == LC_OK) {
+    for (i = 0; i < count; ++i) {
+      old = lookup(s, entries[i]->key);
+      register_entry(s, entries[i]);
+      dirty_entry(s, entries[i], old);
+      install(s, entries[i]);
+      entries[i] = NULL;
+    }
+    s->sequence += count;
+  }
+  for (i = 0; i < count; ++i)
+    if (entries[i])
+      entry_free(entries[i]);
+  lc_free_with_allocator(NULL, entries);
+  return rc;
+}
 static int validate_owned_directory(ps_space *s, lc_error *error) {
   ps_entry *p, *run;
   uint64_t i, base, expected = 0, actual = 0;
@@ -1710,11 +1777,23 @@ static int recover(ps_space *s, lc_error *error) {
     goto done;
   cursor = 0;
   while (PS_JOURNAL - cursor >= 64 && s->sequence != UINT64_MAX &&
-         get32(wire + cursor) == EVENT_MAGIC &&
+         (get32(wire + cursor) == EVENT_MAGIC ||
+          get32(wire + cursor) == REVISION_MAGIC) &&
          get64(wire + cursor + 8) == s->sequence + 1) {
     bytes = get32(wire + cursor + 4);
     if (bytes < 64 || bytes > PS_JOURNAL - cursor)
       break;
+    if (get32(wire + cursor) == REVISION_MAGIC) {
+      rc = recover_revision(s, wire + cursor, bytes, buffer, error);
+      if (rc == LC_ERR_NOMEM || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+        goto done;
+      if (rc != LC_OK) {
+        lc_error_cleanup(error);
+        break;
+      }
+      cursor += bytes;
+      continue;
+    }
     rc = decode_entry(s, wire + cursor, bytes, &p, &event, error);
     if (rc == LC_ERR_NOMEM)
       goto done;
@@ -2207,6 +2286,134 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     w->failed = 1;
   return rc;
 }
+int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
+                            lc_error *error) {
+  if (!w || !ref || !bytes || w->failed || w->published)
+    return err(error, LC_ERR_INVALID,
+               "revision identity requires an unpublished writer");
+  memcpy(ref->container, w->space->identity, sizeof(ref->container));
+  ref->incarnation = w->entry->token;
+  *bytes = w->entry->bytes + w->used;
+  return LC_OK;
+}
+int ps_revision_publish(ps_writer *const *writers, size_t count, ps_ref *refs,
+                        lc_error *error) {
+  ps_space *s;
+  ps_budget *budget;
+  ps_entry *p, *old;
+  unsigned char *wire = NULL;
+  size_t i, j, bytes = 64, cursor, prior, descriptor;
+  uint64_t metadata, entries, growth = 0, added = 0, sequence = 0;
+  int rc = LC_OK, durable;
+  if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0])
+    return err(error, LC_ERR_INVALID, "revision requires immutable writers");
+  s = writers[0]->space;
+  budget = writers[0]->budget;
+  for (i = 0; i < count; ++i) {
+    if (!writers[i] || writers[i]->space != s || writers[i]->budget != budget ||
+        writers[i]->failed || writers[i]->published)
+      return err(error, LC_ERR_INVALID,
+                 "revision writers must share space and budget");
+    for (j = 0; j < i; ++j)
+      if (same_key(writers[j]->entry->key, writers[i]->entry->key))
+        return err(error, LC_ERR_INVALID, "revision keys must be distinct");
+  }
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    rc = flush_writer(writers[i], error);
+    descriptor = entry_bytes(writers[i]->entry);
+    if (rc == LC_OK && descriptor > PS_JOURNAL - bytes)
+      rc = err(error, LC_ERR_INVALID, "revision metadata exceeds journal");
+    if (rc == LC_OK)
+      bytes += descriptor;
+  }
+  if (rc == LC_OK) {
+    wire = lc_alloc_with_allocator(NULL, bytes);
+    if (!wire)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate revision publication");
+  }
+  if (rc != LC_OK)
+    goto done;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
+                      count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
+                                                           __ATOMIC_RELAXED)))
+    rc = err(error, LC_ERR_INVALID, "revision publication sequence exhausted");
+  if (rc == LC_OK && bytes > PS_JOURNAL - s->journal)
+    rc = checkpoint_locked(s, error);
+  metadata = s->metadata;
+  entries = s->live_entries;
+  durable = s->durable;
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    p = writers[i]->entry;
+    old = lookup(s, p->key);
+    prior = old && !old->deleted ? entry_bytes(old) : 0;
+    descriptor = entry_bytes(p);
+    if (old && !old->deleted && p->key.kind == PS_COLLECTION) {
+      rc = err(error, LC_ERR_INVALID, "collection position already published");
+      break;
+    }
+    metadata = metadata - prior + descriptor;
+    if (descriptor > prior)
+      growth += descriptor - prior;
+    if (!prior) {
+      ++entries;
+      ++added;
+    }
+    if (p->key.kind == PS_CONTROL)
+      durable = 1;
+  }
+  if (rc == LC_OK)
+    rc = ps_internal_budget_check(s, budget, 0, growth, added, error);
+  if (rc == LC_OK)
+    rc = checkpoint_allowance_floor(s, metadata, entries, 0,
+                                    PS_MAINTENANCE_RESERVE, budget, error);
+  if (rc == LC_OK) {
+    memset(wire, 0, 64);
+    put32(wire, REVISION_MAGIC);
+    put32(wire + 4, (uint32_t)bytes);
+    put64(wire + 8, s->sequence + 1);
+    put32(wire + 16, (uint32_t)count);
+    cursor = 64;
+    for (i = 0; i < count; ++i) {
+      encode_entry(wire + cursor, writers[i]->entry, s->sequence + 1 + i,
+                   PS_PUT);
+      cursor += entry_bytes(writers[i]->entry);
+    }
+    put32(wire + 60,
+          (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
+    rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
+  }
+  if (rc == LC_OK) {
+    s->sequence += count;
+    s->journal += bytes;
+    sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+    ps_internal_budget_spend(budget, 0, growth, added);
+    for (i = 0; i < count; ++i) {
+      p = writers[i]->entry;
+      old = lookup(s, p->key);
+      p->publication_sequence = ++sequence;
+      p->durable_visibility = durable;
+      dirty_entry(s, p, old);
+      install(s, p);
+      writers[i]->published = 1;
+      if (refs) {
+        memcpy(refs[i].container, s->identity, sizeof(refs[i].container));
+        refs[i].incarnation = p->token;
+      }
+    }
+    __atomic_store_n(&s->pending_sequence, sequence, __ATOMIC_RELEASE);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && durable)
+    rc = wait_durable(s, sequence, error);
+done:
+  if (rc != LC_OK)
+    for (i = 0; i < count; ++i)
+      writers[i]->failed = 1;
+  lc_free_with_allocator(NULL, wire);
+  return rc;
+}
 void ps_writer_close(ps_writer *w) {
   ps_space *s;
   if (!w)
@@ -2245,7 +2452,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   p = lookup(s, key);
-  visible = s->durable || key.kind == PS_CONTROL
+  visible = s->durable || key.kind == PS_CONTROL || (p && p->durable_visibility)
                 ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
                 : UINT64_MAX;
   while (p && p->publication_sequence > visible)
