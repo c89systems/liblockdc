@@ -6,7 +6,6 @@
 typedef struct ps_namespace_append ps_namespace_append;
 typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
-typedef struct ps_namespace_snapshot ps_namespace_snapshot;
 typedef struct ps_namespace_body ps_namespace_body;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
@@ -15,8 +14,9 @@ enum ps_namespace_append_mode {
 };
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;
-  uint64_t snapshot, snapshot_boundary;
-  uint64_t bound_segments, bound_snapshots, bound_bodies, pending_retirements;
+  uint64_t checkpoint_epoch, covered_segment, covered_offset;
+  uint64_t checkpoint_keys, pending_keys, pending_metadata_bytes;
+  uint64_t bound_segments, bound_bodies, pending_retirements;
 } ps_namespace_status;
 typedef struct ps_namespace_source {
   const char *leaf;
@@ -37,6 +37,14 @@ int ps_namespace_sources_visit(ps_namespace *, ps_namespace_source_fn, void *,
  * One cached storage owner per namespace, never a pathname/virtual filesystem.
  * An empty namespace has no head/segment until its first append or rotation. */
 int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
+struct ps_checkpoint_observer;
+int ps_namespace_checkpoint_observe(ps_namespace *,
+                                    const struct ps_checkpoint_observer *,
+                                    lc_error *);
+/* Flushes only changed canonical metadata, retaining uncovered history until
+ * every bounded batch is selected. Caller holds logical namespace authority. */
+int ps_namespace_checkpoint_flush(ps_namespace *, lc_error *);
+uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);
 /* Conservative durable work marker, independent of the segment head/tail.
  * Ensure precedes expiry-bearing publication, including for NoSync roots. A
  * failed mutation may leave a harmless positive hint. */
@@ -68,7 +76,9 @@ int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
  * Both are indivisible recovery units. Storage reserves its checksummed frame
  * in addition to minimum canonical bytes; returned offsets address the actual
  * inner records. An invalid candidate frame contributes no records, while
- * corruption inside a checkpoint prefix is an error.
+ * corruption in required checkpoint metadata or an uncovered trusted prefix
+ * is an error. Covered history is not replayed; referenced bodies are checked
+ * when consumed.
  * Plan successor, binding, grants and head selection before staging. Preferred
  * geometric growth falls back to an exact claim near capacity. Commit selects
  * its head only after canonical
@@ -108,45 +118,18 @@ void ps_namespace_read_close(ps_namespace_window *);
 /* Captures segment identities/tails once. Callbacks run outside owner locks,
  * may append/rotate, and observe only this fixed prefix. Memory follows segment
  * participation. Point reads resolve one cached segment directly. Record
- * entries and their fields are borrowed for each callback. A selected snapshot
- * precedes its newer segments and is reported with segment zero. A callback
- * error stops a visit without consuming the view; the next visit starts at the
- * captured beginning again. */
+ * entries and their fields are borrowed for each callback. Captured typed key
+ * metadata precedes uncovered canonical suffixes and uses segment zero. A
+ * callback error stops a visit without consuming the view; the next visit
+ * starts at the captured beginning again. */
 int ps_namespace_view_open(ps_namespace *, ps_namespace_view **, lc_error *);
 typedef int (*ps_namespace_record_fn)(void *, uint64_t segment,
                                       const lc_pouch_state_entry *, lc_error *);
 int ps_namespace_view_visit(ps_namespace_view *, int verify_payload,
                             ps_namespace_record_fn, void *, lc_error *);
 void ps_namespace_view_close(ps_namespace_view *);
-typedef struct ps_namespace_snapshot_plan {
-  uint64_t metadata_bytes, body_bytes;
-} ps_namespace_snapshot_plan;
-typedef int (*ps_namespace_snapshot_plan_fn)(void *, ps_namespace_view *,
-                                             uint64_t boundary,
-                                             ps_namespace_snapshot_plan *,
-                                             lc_error *);
-/* Capture the current prefix and invoke the metadata-only planner before any
- * rotation or output creation. Namespace mutation authority covers planning
- * and preparation, never the subsequent producer. The plan declares exact
- * metadata and optional body-pack sizes. One maintenance claim funds rotation,
- * both outputs and final head selection; failed admission stages nothing.
- * Only one builder per namespace; ordinary appends may proceed during output.
- * The caller owns logical completeness, high-water marks and reference
- * protection. A selected snapshot can be rewritten without advancing the
- * covered prefix; a namespace without a snapshot still needs a nonempty sealed
- * prefix. The view is borrowed until close. */
-int ps_namespace_snapshot_begin(ps_namespace *, ps_namespace_snapshot_plan_fn,
-                                void *, ps_namespace_snapshot **, lc_error *);
-ps_namespace_view *ps_namespace_snapshot_view(ps_namespace_snapshot *);
-lc_pouch_record_io ps_namespace_snapshot_output(ps_namespace_snapshot *);
-const char *ps_namespace_snapshot_leaf(const ps_namespace_snapshot *);
-uint64_t ps_namespace_snapshot_boundary(const ps_namespace_snapshot *);
-/* Borrowed output of the optional body pack, owned by the snapshot builder.
- * Commit stabilizes and binds it before selecting the metadata snapshot. */
-lc_pouch_record_io ps_namespace_snapshot_body_output(ps_namespace_snapshot *);
-const char *ps_namespace_snapshot_body_leaf(const ps_namespace_snapshot *);
 /* Sealed relocation packs contain canonical encoded body records, not a replay
- * prefix. Their bindings are durable before a metadata snapshot can refer to
+ * prefix. Their bindings are durable before a key checkpoint can refer to
  * them. Unreferenced packs require logical reclamation after interrupted work.
  * Exact known-span payload and the metadata needed to publish its head, grants
  * and catalog binding are admitted before stream creation. This ordinary claim
@@ -159,14 +142,9 @@ lc_pouch_record_io ps_namespace_body_output(ps_namespace_body *);
 const char *ps_namespace_body_leaf(const ps_namespace_body *);
 int ps_namespace_body_commit(ps_namespace_body *, lc_error *);
 void ps_namespace_body_close(ps_namespace_body *);
-/* Durable selection under either root policy. Busy mutation admission can be
- * retried; after admission this is a single publication attempt. On failure,
- * close and rebuild. No reclamation runs after successful head publication. */
-int ps_namespace_snapshot_commit(ps_namespace_snapshot *, lc_error *);
-void ps_namespace_snapshot_close(ps_namespace_snapshot *);
-/* Caller proves no current logical references need this source. Only segments
- * covered by the selected snapshot, older selected snapshots, and sealed body
- * packs are eligible.
+/* Only fully covered sealed segments and unreferenced sealed body packs are
+ * eligible. Captured metadata views defer source retirement with BUSY until
+ * their callbacks can no longer open a historical body reference.
  * Removal is durable and idempotent. Captured readers remain valid. Reap closes
  * retired owners after catalog/read pins drain; checkpoint makes space
  * reusable. These calls do not invalidate a logical owner's cached projection.

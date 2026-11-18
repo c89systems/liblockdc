@@ -71,6 +71,11 @@ int ps_stream_write(ps_stream_writer *, const void *, size_t, lc_error *);
  * Supports the canonical PENDING-header/metadata fixup before publication. */
 int ps_stream_write_at(ps_stream_writer *, uint64_t, const void *, size_t,
                        lc_error *);
+/* Exact reads of this writer's completed private bytes, relative to its start.
+ * Includes the pending bounded tail and canonical fixups, without publishing
+ * or flushing. One caller owns the writer throughout reads and writes. */
+int ps_stream_writer_read(ps_stream_writer *, uint64_t, void *, size_t,
+                          lc_error *);
 /* Checksum final private bytes, including canonical fixups. Reads only this
  * append's written range, using bounded scratch and its existing tail buffer.
  */

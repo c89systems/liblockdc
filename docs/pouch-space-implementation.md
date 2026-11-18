@@ -1197,6 +1197,86 @@ newer history. Checkpoint admission may force structural synchronization as it
 does today; measure that frequency and latency instead of assuming NoSync work
 has no barriers.
 
+##### Checkpoint representation and publication
+
+The implementation cutover uses `PS_KEY_METADATA` values for resolved ordinary
+and staged key metadata, `PS_KEY_DECISION` values for retained decisions and a
+`PS_NAMESPACE_CHECKPOINT` coverage/high-water control. Slot IDs come from the
+existing root ID allocator and remain distinct from public generations and body
+lifetimes. Exact key lookup is resident; checkpoint values retain complete keys.
+Small values already share the physical allocator's 64-byte cells, so this uses
+the existing typed directory and packed allocator rather than another page tree.
+Metadata encoding may materialize its bounded canonical fields; application
+bodies remain references to their streamed encoded spans.
+
+Use bounded publication batches of changed slots. Intermediate batches retain
+the previous coverage boundary and all uncovered canonical history. Replay seeds
+those advanced per-key entries and still replays complete uncovered groups using
+the production supersession and query-generation rules. Only the final batch
+advances coverage and both high waters after every changed slot in that capture
+is durable. This avoids imposing the physical revision frame's descriptor limit
+as a new public transaction limit. Large indivisible groups still require their
+complete funded metadata obligation. No history may be reclaimed merely because
+one intermediate batch selected some of its keys.
+
+Namespace views capture immutable checkpoint incarnations and canonical tails
+coherently: no checkpoint entry may seed a view whose captured canonical prefix
+precedes that entry. A metadata-only value capture pins entry descriptors without
+allocating a 16 KiB payload buffer for every key. Replay opens one captured value
+reader at a time, decodes its canonical metadata and releases that reader; the
+capture continues to retain the old incarnation through replacement/removal.
+Stable `snapshot-<slot ID>.log` labels address these typed metadata capabilities,
+not files or catalog aliases. The namespace read boundary supplies their captured
+value input. Canonical body source labels and crypto contexts retain their
+existing meaning until the separate bounded mapping cutover.
+
+Fund a delta before its body producer runs. The canonical prefix writer already
+supplies header, key and metadata together. Its private append admission hook
+uses that structured prefix to reserve the checkpoint bound, deduplicating keys
+within a group. PENDING finalization determines the next record boundary;
+application body chunks are never interpreted as records. Before canonical
+commit, decode the completed private metadata, resolve it with the same pure
+production projection used by the resident cache and prepare the dirty update.
+Accepting the canonical append must not introduce a new allocation failure that
+revokes an already committed mutation.
+
+A namespace budget retains the unspent checkpoint obligation. Atomic resize
+preserves existing claims on failed growth, permits growth alongside funded
+writers and forbids shrinking their live claim. After a batch, settle the claim
+to remaining changed work so replacement churn cannot accumulate unused credits.
+Recovery reconstructs the outstanding delta and its capacity claim before write
+readmission. This is separate from the still-required standing deletion and
+relocation reserve; the existing fixed floor is not its proof.
+
+Publishing a checkpoint updates only matching changed keys' resident metadata
+references, using plans allocated before physical selection. A newer canonical
+suffix must retain its own reference. Do not invalidate/replay the complete
+resident namespace after every checkpoint. Retained stages and decisions remain
+recoverable through the same common resolver, rather than globally deferring
+checkpoints while a transaction is live.
+
+The namespace owner now implements these mechanics, including bounded batches,
+private preflight, per-key cache-reference updates and recovery from coverage.
+Automatic preparation flushes after 64 dirty keys, 256 KiB of pending metadata
+or 1 MiB of uncovered canonical history. The experimental maintenance path uses
+these key checkpoints and retires fully covered, unreferenced sealed sources.
+Active and mixed sources remain pending for bounded range reclamation; no
+whole-source body copy or whole-namespace snapshot planner remains in that path.
+
+Covered historical records are not parsed again during stream recovery. Required
+checkpoint metadata retains strict physical CRC validation, uncovered canonical
+records retain their normal validation, and referenced bodies are checked when
+consumed. A captured namespace metadata view defers source retirement until its
+callbacks finish admitting historical body reads. Already admitted metadata and
+body windows continue to pin their immutable bytes across replacement and root
+checkpointing.
+
+Per-namespace write admission reconstructs its outstanding checkpoint claim.
+Root-wide reconstruction before any other owner can consume capacity remains
+part of the standing-reserve gate, together with future deletion/relocation
+obligations. These local claims and the fixed floor
+do not establish full-store maintenance progress.
+
 #### Bounded encoded-range relocation
 
 Separate stable logical source offsets from their current physical ranges.
@@ -2763,9 +2843,89 @@ format marker and supplies no migration; recreate private experimental fixtures.
 Collection pages still require their sealed owner. Typed-value traversal still
 scans the resident physical bucket table, and the revision descriptor has its
 existing bounded size; this evidence does not qualify unbounded generations.
-Incremental canonical checkpoints, bounded relocation, standing maintenance
-admission, codec conversion and process-shared roots remain unfinished. The
-complete backend goal remains active.
+At this index-publication milestone, incremental canonical checkpoints, bounded
+relocation, standing maintenance admission, codec conversion and process-shared
+roots remained unfinished. The complete backend goal remains active.
+
+### Incremental canonical key checkpoint cutover
+
+The namespace append path now funds and prepares changed canonical key metadata
+before acknowledging its original append. Pure common projection rules drive
+both resident state and checkpoint summaries, including cold object body links,
+metadata-only lease placeholders, query sequences, lifetimes, stages and retained
+decisions. Small memory bodies and metadata batches retain structured prefix
+admission. Budget reuse allocates nothing; shrinking a funded claim requires no
+new capacity even while a maintenance peer holds the remaining floor.
+
+The old namespace snapshot builder and source-sized body-copy maintenance path
+are removed. Typed metadata slots and one coverage/high-water value replace
+their replay role. Matching resident references update through a preallocated
+plan; checkpoint publication preserves the resident logical projection. An
+unchanged repeat checkpoint selects no new generation and copies no body bytes.
+Active or mixed sources are reported as pending work for range reclamation.
+
+Debug qualification uses ASan/UBSan and 128 KiB workers. The queue, outbox, XA
+and namespace-query SDK suites passed all eight codec/durability configurations,
+alongside all 357 native Pouch cases. Mutation allocation/I/O gates and staged
+recovery passed. The checkpoint atomic-group fixture passed all 140 write/sync
+cuts and 406 allocation cuts across both root policies, including interrupted
+partial selection and loss of unsynchronized writes. Maintenance passed 112
+allocation and 120 I/O cuts. The 1,500-key/3,000-record group exceeds one physical
+revision's descriptor capacity and recovers through bounded batches at 10 MiB.
+The final Debug gate passed 14 groups, including the checkpoint fault fixture,
+projection, staged recovery, concurrent maintenance and five API/boundary/editor
+checks (`qualification-final-debug.log`).
+
+Focused regressions cover cold object metadata updates, captured metadata and
+body windows, retirement deferred by metadata views, sibling-writer progress
+during held checkpoint I/O and cold namespace admission reading less than
+512 KiB for a fixture with multiple MiB of referenced bodies. A generated 1 MiB
+body proves that the history trigger selects its funded metadata before the
+next body producer, under both root policies.
+
+GNU Release passed 57 selected groups; native musl Release passed 58, including
+the final history policy fixture. Both cover the complete queue, outbox, XA and
+namespace-query SDK matrix and selected native portability cases. The GNU matrix
+preceded the history-threshold tuning; eight focused GNU groups passed afterward.
+Release retains ordinary platform worker stacks. Ten ThreadSanitizer invocations
+passed with instrumented OpenSSL 3.6.5 and 128 KiB workers, without suppressions.
+Eleven Memcheck invocations passed, including captured windows, the 1,500-key
+group, cold object projection and concurrent maintenance; each finished with
+zero live heap, errors, suppressions or owned descriptors. Together they account
+for 514,892 matched allocations/frees.
+
+Matched GNU Release comparisons verified all 96 runs: 16 configurations, three
+samples per engine, four rounds over the same keys, 4 KiB/64 KiB bodies, one/four
+writers, both durability policies and cold/preopened namespace ownership.
+These are process-reopen/cache-warm host measurements, not cold-device or
+large-store qualification. Ratios below are container/native medians of the three
+samples per configuration, then medians across configurations:
+
+| Measurement | NoSync | Durable |
+| --- | ---: | ---: |
+| Whole measured work | 2.57x | 0.84x |
+| Work CPU | 0.90x | 0.88x |
+| p50 write latency | 0.81x | 0.75x |
+| Index flush wall time | 9.44x | 7.47x |
+| Index flush thread CPU | 0.92x | 0.91x |
+| First indexed query pass | 1.55x | 1.08x |
+| Repeated indexed query pass | 1.18x | 0.97x |
+| Close | 0.011x | 0.010x |
+| Reopen and verify | 3.14x | 2.88x |
+
+The initial 256 KiB history cadence produced a 3.46x NoSync work ratio. Selecting
+1 MiB reduced absolute NoSync work time by a median 18% across those
+configurations; durable work time changed by about +1.5%. Metadata obligations
+remain funded and checkpoint selection remains durable under both policies. Structural barriers
+and reopen overhead remain material performance work. This establishes the
+incremental checkpoint architecture; it does not establish performance parity.
+Create, close and reopen are recorded separately from measured work. Evidence
+is under `build/pouch-space-checkpoint/`: `qualification-{gnu,musl}.log`,
+`qualification-final-gnu.log`, `qualification-{tsan,memcheck}.log`,
+`memcheck-*.log`, `paired-performance.log` and `paired-summary.json`.
+
+Bounded range relocation, a computed standing reserve with root-wide recovery,
+codec conversion and process-shared roots remain separate unfinished gates.
 
 ### Root and namespace ownership
 

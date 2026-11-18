@@ -6995,6 +6995,7 @@ static void append_growth_high_water(void) {
   free(bytes);
   clean();
 }
+#include "checkpoint_cases.h"
 #include "revision_cases.h"
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
@@ -7005,7 +7006,28 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "revision") == 0) {
+    if (strcmp(argv[2], "checkpoint-records") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_records(durable);
+    } else if (strcmp(argv[2], "checkpoint-owner") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_owner(durable);
+    } else if (strcmp(argv[2], "checkpoint-namespace") == 0) {
+      for (int durable = 0; durable < 2; ++durable) {
+        checkpoint_namespace(durable);
+        checkpoint_retirement(durable);
+      }
+    } else if (strcmp(argv[2], "checkpoint-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int heap = 0; heap < 2; ++heap)
+          checkpoint_faults(durable, heap);
+    } else if (strcmp(argv[2], "checkpoint-large-group") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_large_group(durable);
+    } else if (strcmp(argv[2], "checkpoint-history") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_history(durable);
+    } else if (strcmp(argv[2], "revision") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int control = 0; control < 2; ++control)
           revision_lifecycle(durable, control);

@@ -1834,9 +1834,9 @@ static void key_bounds(const char *directory) {
           if (container) {
             ps_pouch_compaction_result result;
             ok(ps_pouch_state_compact(p, "bounds", &result, &e), &e);
-            REQUIRE(!result.skipped && result.snapshot &&
-                    result.metadata_bytes > PS_MIB && !result.body_bytes &&
-                    !result.copied_bytes && !result.pending_sources);
+            REQUIRE(!result.skipped && result.snapshot && result.records == 2 &&
+                    (!pass || !result.metadata_bytes) && !result.body_bytes &&
+                    !result.copied_bytes && result.pending_sources);
           }
           lc_pouch_close(p);
           REQUIRE(live == 1);
@@ -2434,72 +2434,12 @@ static void validation(const char *path) {
   }
   lc_error_cleanup(&e);
 }
-typedef struct snapshot_copy {
-  lc_pouch *pouch;
-  ps_namespace *ns;
-  ps_namespace_snapshot *builder;
-  unsigned char *buffer;
-  size_t count;
-} snapshot_copy;
+static int checkpoint_locked(void *context, lc_error *e) {
+  return ps_namespace_checkpoint_flush(context, e);
+}
 static int replay_snapshot(void *context, lc_pouch_storage_visit_fn visit,
                            void *visitor, lc_error *e) {
   return ps_namespace_view_visit(context, 0, visit, visitor, e);
-}
-static int measure_copy_record(void *context,
-                               const lc_pouch_state_entry *record,
-                               lc_error *e) {
-  uint64_t bytes = 0, *total = context;
-  int rc = lc_pouch_state_record_measure_snapshot(
-      &allocator, "snapshot-00000000000000000001.log", record,
-      !record->control && record->found && record->payload_span.present, &bytes,
-      e);
-  if (rc == LC_OK) {
-    REQUIRE(bytes <= (uint64_t)INT64_MAX - *total);
-    *total += bytes;
-  }
-  return rc;
-}
-static int plan_copy_snapshot(void *context, ps_namespace_view *view,
-                              uint64_t boundary,
-                              ps_namespace_snapshot_plan *plan, lc_error *e) {
-  lc_pouch_state_snapshot *capture = NULL;
-  uint64_t bytes = 0;
-  (void)boundary;
-  int rc = lc_pouch_state_snapshot_capture(context, replay_snapshot, view,
-                                           &capture, e);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_snapshot_visit(capture, measure_copy_record, &bytes, e);
-  lc_pouch_state_snapshot_close(capture);
-  if (rc == LC_OK)
-    plan->metadata_bytes = bytes;
-  return rc;
-}
-static int copy_snapshot_record(void *context,
-                                const lc_pouch_state_entry *record,
-                                lc_error *e) {
-  snapshot_copy *copy = context;
-  lc_source *encoded = NULL;
-  if (record->control)
-    return lc_pouch_state_record_write_high_water(
-        &allocator, ps_namespace_snapshot_output(copy->builder),
-        record->index_seq, record->query_index_seq, e);
-  int rc = LC_OK;
-  if (record->found && record->payload_span.present)
-    rc = copy->pouch->storage.ops->source_open(
-        copy->pouch->storage.context, copy->ns,
-        record->payload_span.container_leaf,
-        record->payload_span.payload_offset,
-        record->payload_span.payload_length, record->payload_span.payload_crc,
-        &encoded, e);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_record_write_snapshot(
-        &allocator, ps_namespace_snapshot_output(copy->builder),
-        ps_namespace_snapshot_leaf(copy->builder), record, encoded,
-        copy->buffer, 16384, e);
-  if (encoded)
-    encoded->close(encoded);
-  ++copy->count;
-  return rc;
 }
 static int projection_object(const lc_pouch_state_visit_entry *entry,
                              void *context, lc_error *e) {
@@ -2532,24 +2472,9 @@ static void snapshots(const char *path, const char *directory) {
                                         &handle, &e),
          &e);
       ps_namespace *ns = handle;
-      ps_namespace_snapshot *b = NULL;
-      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
-      snapshot_copy copy = {p, ns, b,
-                            lc_alloc_with_allocator(&allocator, 16384), 0};
-      REQUIRE(copy.buffer != NULL);
-      lc_pouch_state_snapshot *projection = NULL;
-      ok(lc_pouch_state_snapshot_capture(p, replay_snapshot,
-                                         ps_namespace_snapshot_view(b),
-                                         &projection, &e),
+      ok(lc_pouch_state_with_namespace_lock(p, "snapshot", checkpoint_locked,
+                                            ns, &e),
          &e);
-      ok(lc_pouch_state_snapshot_visit(projection, copy_snapshot_record, &copy,
-                                       &e),
-         &e);
-      REQUIRE(copy.count == 1);
-      lc_pouch_state_snapshot_close(projection);
-      lc_free_with_allocator(&allocator, copy.buffer);
-      ok(ps_namespace_snapshot_commit(b, &e), &e);
-      ps_namespace_snapshot_close(b);
       p->storage.ops->namespace_close(p->storage.context, ns);
       lc_pouch_close(p);
       REQUIRE(live == 0);
@@ -2559,7 +2484,9 @@ static void snapshots(const char *path, const char *directory) {
                                         &handle, &e),
          &e);
       ns = handle;
-      ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+      REQUIRE(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e) ==
+              LC_ERR_INVALID);
+      clear(&e);
       lc_pouch_state_write_options meta = {0};
       meta.has_metadata = 1;
       meta.metadata = (const unsigned char *)"snapshot metadata";
@@ -2588,7 +2515,7 @@ static void snapshots(const char *path, const char *directory) {
          &e);
       ps_namespace_status status;
       ok(ps_namespace_status_get(handle, &status, &e), &e);
-      REQUIRE(status.snapshot && status.snapshot_boundary == 1 &&
+      REQUIRE(status.checkpoint_epoch && status.covered_segment == 1 &&
               status.segments >= 1);
       p->storage.ops->namespace_close(p->storage.context, handle);
       one_file(directory);
@@ -2759,6 +2686,15 @@ static void projection_readback(lc_pouch *p, lc_error *e) {
   ok(lc_pouch_state_query_index_seq(p, "projection", &seq, e), e);
   REQUIRE(seq == 13);
 }
+static int projection_cold_object(const lc_pouch_state_visit_entry *entry,
+                                  void *context, lc_error *e) {
+  (void)e;
+  if (!strcmp(entry->key, "z-object")) {
+    REQUIRE(entry->object_record && entry->has_payload);
+    ++*(unsigned int *)context;
+  }
+  return LC_OK;
+}
 static void projection(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -2779,15 +2715,14 @@ static void projection(const char *path, const char *directory) {
                                         &handle, &e),
          &e);
       ps_namespace *ns = handle;
-      ps_namespace_snapshot *b = NULL;
-      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
-      uint64_t boundary = ps_namespace_snapshot_boundary(b);
+      ps_namespace_view *view = NULL;
+      ok(ps_namespace_view_open(ns, &view, &e), &e);
       lc_pouch_state_snapshot *captured = NULL;
       size_t before = f.read_bytes;
       measured_max = 0;
       __atomic_store_n(&measure, 1, __ATOMIC_RELEASE);
-      int rc = lc_pouch_state_snapshot_capture(
-          p, replay_snapshot, ps_namespace_snapshot_view(b), &captured, &e);
+      int rc = lc_pouch_state_snapshot_capture(p, replay_snapshot, view,
+                                               &captured, &e);
       __atomic_store_n(&measure, 0, __ATOMIC_RELEASE);
       ok(rc, &e);
       REQUIRE(measured_max < 65536);
@@ -2806,25 +2741,11 @@ static void projection(const char *path, const char *directory) {
                                        &e),
          &e);
       REQUIRE(unchanged.count == 6);
-      snapshot_copy copy = {p, ns, b,
-                            lc_alloc_with_allocator(&allocator, 16384), 0};
-      REQUIRE(copy.buffer != NULL);
-      ok(lc_pouch_state_snapshot_visit(captured, copy_snapshot_record, &copy,
-                                       &e),
+      ok(lc_pouch_state_with_namespace_lock(p, "projection", checkpoint_locked,
+                                            ns, &e),
          &e);
-      REQUIRE(copy.count == 5);
-      lc_free_with_allocator(&allocator, copy.buffer);
-      ok(ps_namespace_snapshot_commit(b, &e), &e);
-      ps_namespace_status first;
-      ok(ps_namespace_status_get(ns, &first, &e), &e);
-      ps_namespace_snapshot_close(b);
-      unsigned int keep_kind;
-      uint64_t keep_id;
-      REQUIRE(ps_namespace_parse_source_leaf(c.protected_leaf, &keep_kind,
-                                             &keep_id));
-      for (uint64_t id = 1; id <= boundary; ++id)
-        if (keep_kind != PS_CATALOG_SEGMENT || id != keep_id)
-          ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, id, &e), &e);
+      ps_namespace_view_close(view);
+
       drain(pinned.body, 65569, 34, &e);
       lc_pouch_state_read_result_cleanup(&allocator, &pinned);
       uint64_t closed, pending;
@@ -2841,39 +2762,57 @@ static void projection(const char *path, const char *directory) {
       lc_pouch_state_snapshot_close(captured);
       REQUIRE(live == 0);
       ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
-      projection_readback(p, &e);
+      before = f.read_bytes;
       ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
                                         &handle, &e),
          &e);
+      /* Durable key coverage replaces canonical replay of the old multi-MiB
+       * prefix. Required bodies retain their checksums and are read on demand.
+       */
+      REQUIRE(f.read_bytes - before < PS_MIB / 2);
+      projection_readback(p, &e);
       ns = handle;
-      ok(ps_namespace_snapshot_begin(ns, plan_copy_snapshot, p, &b, &e), &e);
-      boundary = ps_namespace_snapshot_boundary(b);
-      ok(lc_pouch_state_snapshot_capture(
-             p, replay_snapshot, ps_namespace_snapshot_view(b), &captured, &e),
+      ok(ps_namespace_view_open(ns, &view, &e), &e);
+      ok(lc_pouch_state_snapshot_capture(p, replay_snapshot, view, &captured,
+                                         &e),
          &e);
       c.count = 0;
       c.newer = 1;
       ok(lc_pouch_state_snapshot_visit(captured, check_projected, &c, &e), &e);
       REQUIRE(c.count == 7);
-      copy = (snapshot_copy){p, ns, b,
-                             lc_alloc_with_allocator(&allocator, 16384), 0};
-      REQUIRE(copy.buffer != NULL);
-      ok(lc_pouch_state_snapshot_visit(captured, copy_snapshot_record, &copy,
-                                       &e),
-         &e);
-      REQUIRE(copy.count == 6);
-      lc_free_with_allocator(&allocator, copy.buffer);
       lc_pouch_state_snapshot_close(captured);
-      ok(ps_namespace_snapshot_commit(b, &e), &e);
-      ps_namespace_snapshot_close(b);
-      for (uint64_t id = 1; id <= boundary; ++id)
-        ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, id, &e), &e);
-      ok(ps_namespace_reclaim(ns, PS_CATALOG_SNAPSHOT, first.snapshot, &e), &e);
+      ps_namespace_view_close(view);
+      ok(lc_pouch_state_with_namespace_lock(p, "projection", checkpoint_locked,
+                                            ns, &e),
+         &e);
       p->storage.ops->namespace_close(p->storage.context, ns);
       lc_pouch_close(p);
       REQUIRE(live == 0);
       ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
       projection_readback(p, &e);
+      /* A cold object's checkpoint contains a body link. Later lease metadata
+       * must inherit its object class without making the body publicly indexed.
+       */
+      projection_meta(p, "z-object", "cold-object", 0, 15, &e);
+      ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
+                                        &handle, &e),
+         &e);
+      ok(lc_pouch_state_with_namespace_lock(p, "projection", checkpoint_locked,
+                                            handle, &e),
+         &e);
+      p->storage.ops->namespace_close(p->storage.context, handle);
+      lc_pouch_close(p);
+      REQUIRE(live == 0);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      unsigned int objects = 0;
+      ok(lc_pouch_state_visit(p, "projection", projection_cold_object, &objects,
+                              &e),
+         &e);
+      REQUIRE(objects == 1);
+      lc_pouch_generation query;
+      ok(lc_pouch_state_query_index_seq(p, "projection", &query, &e), &e);
+      REQUIRE(query == 13);
+      read_value(p, "projection", "z-object", 1048601, 35, 2, &e);
       one_file(directory);
       lc_pouch_close(p);
       REQUIRE(live == 0 && unlink(path) == 0);
@@ -3921,27 +3860,30 @@ static void maintenance(const char *path, const char *directory) {
       ps_pouch_compaction_result result;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
       REQUIRE(!result.skipped && result.records == 5 && result.snapshot &&
-              result.boundary == 1 && result.body_bytes &&
-              result.metadata_bytes < 65536 && result.copied_bytes);
+              result.boundary == 1 && !result.body_bytes &&
+              result.metadata_bytes < 65536 && !result.copied_bytes &&
+              result.pending_sources);
       ok(ps_metadata_repack(ps_root_space(ps_pouch_state_root(p)), &e), &e);
-      /* The resident cache must be invalidated before covered sources can be
-       * retired. These reads cannot fall back to their prior segment labels. */
+      /* Checkpointing preserves the resident projection and encoded body
+       * positions; the pending mixed source belongs to range relocation. */
       read_value(p, "projection", "a-state", 65569, 34, 2, &e);
       read_value(p, "projection", "z-object", 1048601, 35, 2, &e);
       drain(pinned.body, 65569, 34, &e);
       lc_pouch_state_read_result_cleanup(&allocator, &pinned);
       uint64_t first = result.snapshot;
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.snapshot > first && result.boundary == 1 &&
-              result.records == 5 && !result.pending_sources);
+      REQUIRE(result.snapshot == first && result.boundary == 1 &&
+              result.records == 5 && result.pending_sources &&
+              !result.metadata_bytes && !result.copied_bytes);
       projection_put(p, "a-state", 31, 99, 0, 12, &e);
       projection_put(p, "tail", 31, 77, 0, 13, &e);
       projection_meta(p, "z-object", "tail-object", 0, 14, &e);
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.records == 6 && result.boundary == 2);
+      REQUIRE(result.records == 6 && result.boundary == 1);
       projection_readback(p, &e);
       ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-      REQUIRE(result.records == 6 && result.boundary == 2);
+      REQUIRE(result.records == 6 && result.boundary == 1 &&
+              !result.metadata_bytes && !result.copied_bytes);
       projection_readback(p, &e);
       void *ns = NULL;
       ok(p->storage.ops->namespace_open(p->storage.context, "projection", 0,
@@ -4068,22 +4010,30 @@ typedef struct maintenance_hold {
   lc_pouch *pouch;
   ps_pouch_compaction_result result;
 } maintenance_hold;
-static ssize_t maintenance_held_read(void *context, int fd, void *p, size_t n,
-                                     off_t at) {
+static ssize_t maintenance_held_write(void *context, int fd, const void *p,
+                                      size_t n, off_t at) {
   maintenance_hold *h = context;
-  ssize_t got = pread(fd, p, n, at);
-  if (got >= 256 && __atomic_load_n(&h->armed, __ATOMIC_ACQUIRE)) {
-    size_t i;
-    for (i = 0; i < 256; ++i)
-      if (((unsigned char *)p)[i] != byte_at(i, 3))
-        break;
-    if (i == 256 && __atomic_exchange_n(&h->armed, 0, __ATOMIC_ACQ_REL)) {
+  uint32_t magic = 0;
+  if (n >= LC_POUCH_RECORD_HEADER_BYTES)
+    memcpy(&magic, p, sizeof(magic));
+  if (magic == LC_POUCH_RECORD_MAGIC &&
+      __atomic_load_n(&h->armed, __ATOMIC_ACQUIRE)) {
+    lc_pouch_record_header header;
+    lc_error error;
+    lc_error_init(&error);
+    int rc = lc_pouch_record_header_decode(p, &header, &error);
+    if (rc == LC_OK && header.type == LC_POUCH_STATE_RECORD_STATE_LINK &&
+        header.key_len == 7 && n >= LC_POUCH_RECORD_HEADER_BYTES + 7 &&
+        !memcmp((const unsigned char *)p + LC_POUCH_RECORD_HEADER_BYTES,
+                "a-state", 7) &&
+        __atomic_exchange_n(&h->armed, 0, __ATOMIC_ACQ_REL)) {
       __atomic_store_n(&h->ready, 1, __ATOMIC_RELEASE);
       while (!__atomic_load_n(&h->release, __ATOMIC_ACQUIRE))
         sched_yield();
     }
+    lc_error_cleanup(&error);
   }
-  return got;
+  return io_write(&h->io, fd, p, n, at);
 }
 static void *maintenance_worker(void *context) {
   maintenance_hold *h = context;
@@ -4114,13 +4064,16 @@ static void maintenance_concurrency(const char *path, const char *directory) {
   lc_error_init(&e);
   for (int sync = 0; sync < 2; ++sync) {
     maintenance_hold h = {0};
-    ps_io io = {&h, maintenance_held_read, io_write, io_sync, io_reserve, NULL};
+    ps_io io = {&h, io_read, maintenance_held_write, io_sync, io_reserve, NULL};
     ps_pouch_state_options o = options(0, sync);
     o.logical.segment_target_bytes = 8 * PS_MIB;
     o.io = &io;
     lc_pouch *p = NULL;
     ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
     maintenance_fixture(p, &e);
+    lc_pouch_state_read_result pinned = {0};
+    ok(lc_pouch_state_read(p, "projection", "a-state", &pinned, &e), &e);
+    projection_meta(p, "a-state", "tail", 0, 9, &e);
     h.pouch = p;
     __atomic_store_n(&h.armed, 1, __ATOMIC_RELEASE);
     pthread_t thread;
@@ -4129,14 +4082,16 @@ static void maintenance_concurrency(const char *path, const char *directory) {
            !__atomic_load_n(&h.done, __ATOMIC_ACQUIRE))
       sched_yield();
     REQUIRE(__atomic_load_n(&h.ready, __ATOMIC_ACQUIRE));
-    /* A tail metadata update still references the captured original segment.
-     * Publication must recheck that tail before retiring the copied source. */
-    projection_meta(p, "a-state", "tail", 0, 9, &e);
+    /* A held metadata write retains no root publication authority. A sibling
+     * commits and an already admitted body read completes before release. */
     input in = source(31, 9);
     lc_pouch_state_write_result w = {0};
     ok(put(p, "peer", "live", &in, NULL, &w, &e), &e);
     lc_pouch_state_write_result_cleanup(&allocator, &w);
-    maintenance_tail_readback(p, &e);
+    read_value(p, "peer", "live", 31, 9, 1, &e);
+    drain(pinned.body, 65569, 3, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+    REQUIRE(!__atomic_load_n(&h.done, __ATOMIC_ACQUIRE));
     __atomic_store_n(&h.release, 1, __ATOMIC_RELEASE);
     REQUIRE(pthread_join(thread, NULL) == 0);
     maintenance_tail_readback(p, &e);
@@ -4146,12 +4101,13 @@ static void maintenance_concurrency(const char *path, const char *directory) {
                                       &e),
        &e);
     ok(ps_namespace_status_get(ns, &status, &e), &e);
-    REQUIRE(status.bound_segments == 2 && status.bound_bodies == 1 &&
-            status.bound_snapshots == 1);
+    REQUIRE(status.bound_segments == 1 && !status.bound_bodies &&
+            status.checkpoint_keys == 5);
     p->storage.ops->namespace_close(p->storage.context, ns);
     ps_pouch_compaction_result result;
     ok(ps_pouch_state_compact(p, "projection", &result, &e), &e);
-    REQUIRE(result.copied_bytes == 65569 && result.boundary == 2);
+    REQUIRE(!result.copied_bytes && !result.metadata_bytes &&
+            result.boundary == 1 && result.pending_sources);
     maintenance_tail_readback(p, &e);
     one_file(directory);
     lc_pouch_close(p);
@@ -4215,7 +4171,7 @@ static void maintenance_checksums(const char *path) {
   lc_error e;
   lc_error_init(&e);
   for (int crypto = 0; crypto < 4; ++crypto)
-    for (int relocated = 0; relocated < 2; ++relocated) {
+    for (int checkpointed = 0; checkpointed < 2; ++checkpointed) {
       checksum_io f = {0};
       ps_io io = {&f, checksum_read, io_write, io_sync, io_reserve, NULL};
       ps_pouch_state_options o = options(crypto, 0);
@@ -4224,7 +4180,7 @@ static void maintenance_checksums(const char *path) {
       lc_pouch *p = NULL;
       ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
       maintenance_fixture(p, &e);
-      if (relocated)
+      if (checkpointed)
         ok(ps_pouch_state_compact(p, "projection", NULL, &e), &e);
       void *ns = NULL;
       ps_namespace_view *view = NULL;
@@ -4241,9 +4197,8 @@ static void maintenance_checksums(const char *path) {
          &e);
       lc_pouch_state_snapshot_close(capture);
       ps_namespace_view_close(view);
-      REQUIRE(
-          span.span.present && span.span.payload_length &&
-          !strncmp(span.leaf, relocated ? "body-" : "seg-", relocated ? 5 : 4));
+      REQUIRE(span.span.present && span.span.payload_length &&
+              !strncmp(span.leaf, "seg-", 4));
       lc_source *encoded = NULL, *clone = NULL, *wrong = NULL;
       size_t before = f.io.read_bytes;
       ok(p->storage.ops->source_open(
@@ -4446,9 +4401,8 @@ static void staging(const char *path, const char *directory) {
           ok(lc_pouch_state_query_index_seq(p, "staged", &next, &e), &e);
           REQUIRE(next == query);
           if (!multifile) {
-            REQUIRE(ps_pouch_state_compact(p, "staged", NULL, &e) ==
-                    LC_ERR_UNSUPPORTED);
-            clear(&e);
+            ok(ps_pouch_state_compact(p, "staged", NULL, &e), &e);
+            read_value(p, "staged", "key/.staging/attempt", 65569, 12, 2, &e);
           }
           REQUIRE(lc_pouch_state_promote_staged(p, "staged", "key", "attempt",
                                                 "wrong", &w,

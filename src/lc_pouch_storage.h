@@ -40,6 +40,33 @@ int lc_pouch_storage_namespaces_visit(lc_pouch *,
  * source pins and the allocator context; the Pouch runtime is borrowed only
  * during capture. No logical publication or reclamation is performed here. */
 typedef struct lc_pouch_state_snapshot lc_pouch_state_snapshot;
+/* Resolve one complete, non-control canonical change against the prior entry
+ * for that exact key. Pure metadata projection: no allocation, body I/O or
+ * publication. Returns one for an accepted change and writes a borrowed view
+ * with explicit query sequence and state/object classification; zero leaves
+ * output untouched. Inputs have already passed canonical decoding/validation.
+ * The same policy drives the live projection and typed key checkpoints. Prior
+ * may be a scalar summary: key, seen, index/version/lifetime, record_type,
+ * query sequence, found, payload-span presence and query-hidden flags suffice;
+ * no other prior fields are inspected. */
+int lc_pouch_state_entry_project(const lc_pouch_state_entry *prior,
+                                 const lc_pouch_state_entry *change,
+                                 lc_pouch_state_entry *out);
+/* Decisions order canonical attempts, independently of payload generations. */
+int lc_pouch_state_decision_entry_accepts(int prior_present,
+                                          uint64_t prior_index,
+                                          const lc_pouch_state_entry *);
+typedef struct lc_pouch_storage_checkpoint_ref {
+  const char *key, *leaf;
+  uint64_t index, lifetime;
+} lc_pouch_storage_checkpoint_ref;
+/* Caller holds logical namespace authority across prepare, physical selection
+ * and finish. Preparation allocates all replacement metadata references; finish
+ * only swaps matching cached revisions, without invalidating the projection. */
+int lc_pouch_state_checkpoint_prepare(lc_pouch *, const char *,
+                                      const lc_pouch_storage_checkpoint_ref *,
+                                      size_t, void **, lc_error *);
+void lc_pouch_state_checkpoint_finish(lc_pouch *, void *, int published);
 typedef int (*lc_pouch_state_snapshot_visit_fn)(void *,
                                                 const lc_pouch_state_entry *,
                                                 lc_error *);

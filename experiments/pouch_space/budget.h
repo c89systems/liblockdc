@@ -44,6 +44,13 @@ int ps_budget_plan_preferred_span(ps_budget_plan *, uint64_t bytes,
 int ps_budget_open(ps_space *, const ps_budget_plan *, ps_budget **,
                    lc_error *);
 int ps_budget_status(ps_budget *, ps_budget_plan *, lc_error *);
+/* Replace the unspent claim atomically, preserving the handle's admission
+ * class. Growth is permitted while writers use the budget; shrinking requires
+ * all such writers to close. Reusing an unchanged healthy claim allocates
+ * nothing; shrinking needs no new capacity, including while a maintenance
+ * peer holds the remaining reserve. Failure retains the previous claim. Spent
+ * space remains ordinary owned storage and is never refunded by resizing. */
+int ps_budget_resize(ps_budget *, const ps_budget_plan *, lc_error *);
 /* Fails without consuming the handle while a writer or grant preparation uses
  * it. Otherwise releases unspent credits, even after uncertain I/O. */
 int ps_budget_close(ps_budget *, lc_error *);

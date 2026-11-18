@@ -45,12 +45,19 @@ enum ps_kind {
    * or catalog aliases. Keep the domain range independent of logical formats.
    */
   PS_QUERY_FIRST = 16,
-  PS_QUERY_LAST = 37
+  PS_QUERY_LAST = 37,
+  /* Canonical per-key metadata and retained transaction decisions. Numeric
+   * slot identities belong to the actual namespace. Checkpoint selection
+   * binds their coverage/high-water control through the same directory. */
+  PS_KEY_METADATA = 40,
+  PS_KEY_DECISION = 41,
+  PS_NAMESPACE_CHECKPOINT = 42
 };
 typedef struct ps_space ps_space;
 typedef struct ps_budget ps_budget;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;
+typedef struct ps_values ps_values;
 /* Canonical append acknowledgement only. Structural publications retain their
  * existing barriers. DEFER_SYNC requires a caller-owned completion barrier;
  * it changes neither the root policy nor another writer's acknowledgement. */
@@ -154,6 +161,16 @@ typedef int (*ps_value_visit_fn)(void *, ps_key, const ps_ref *, uint64_t,
  * while callbacks run outside publication authority; no bodies are read. */
 int ps_values_visit(ps_space *, uint64_t, unsigned int, unsigned int,
                     ps_value_visit_fn, void *, lc_error *);
+/* A metadata-only capture of the same prefix. Pins immutable incarnations
+ * without allocating one payload buffer per value. Readers opened from it
+ * address that captured incarnation even after replacement or removal. */
+int ps_values_capture(ps_space *, uint64_t, unsigned int, unsigned int,
+                      ps_values **, lc_error *);
+size_t ps_values_count(const ps_values *);
+int ps_values_info(const ps_values *, size_t, ps_key *, ps_ref *, uint64_t *,
+                   lc_error *);
+int ps_values_read_open(const ps_values *, size_t, ps_reader **, lc_error *);
+void ps_values_close(ps_values *);
 uint64_t ps_read_size(const ps_reader *);
 void ps_reader_close(ps_reader *);
 int ps_delete(ps_space *, ps_key, lc_error *);

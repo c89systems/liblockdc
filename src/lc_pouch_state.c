@@ -48,8 +48,6 @@
 #define LC_POUCH_STATE_PAYLOAD_FLAG_STAGED_DELETE 4U
 #define LC_POUCH_STATE_PAYLOAD_FLAG_OBJECT_LINK 8U
 #define LC_POUCH_STATE_PAYLOAD_FLAG_RETENTION 16U
-#define LC_POUCH_STATE_RECORD_META_MAX_BYTES (1024U * 1024U)
-#define LC_POUCH_STATE_RECORD_KEY_MAX_BYTES (1024U * 1024U)
 #define LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE 256U
 #define LC_POUCH_STATE_SHARED_FORCE_AFTER_SKIPS 64UL
 #define LC_POUCH_STATE_BODY_CACHE_MAX_BYTES (16U * 1024U * 1024U)
@@ -62,7 +60,6 @@
 #define LC_POUCH_STATE_BODY_APPEND_BATCH_MAX 16U
 #define LC_POUCH_STATE_DECISION_COMMITTED "committed"
 #define LC_POUCH_STATE_DECISION_DISCARDED "discarded"
-#define LC_POUCH_STATE_HIGH_WATER_KEY ".lockd/high-water"
 #define LC_POUCH_STATE_INDEX_TRAILER_BYTES 20U
 #define LC_POUCH_STATE_INDEX_TRAILER_MAGIC 0x4c435349UL
 /* A capture owns one heap buffer for candidate checksums and payload copying.
@@ -1782,17 +1779,6 @@ lc_pouch_state_metadata_view_from_entry(const lc_pouch_state_entry *entry,
   out->is_delete_marker = entry->staged_delete_marker;
 }
 
-typedef enum lc_pouch_state_record_type {
-  LC_POUCH_STATE_RECORD_STATE_PUT = 1,
-  LC_POUCH_STATE_RECORD_STATE_DELETE = 2,
-  LC_POUCH_STATE_RECORD_STATE_LINK = 3,
-  LC_POUCH_STATE_RECORD_STATE_META = 4,
-  LC_POUCH_STATE_RECORD_DECISION = 5,
-  LC_POUCH_STATE_RECORD_HIGH_WATER = 6,
-  LC_POUCH_STATE_RECORD_OBJECT_PUT = 7,
-  LC_POUCH_STATE_RECORD_OBJECT_DELETE = 8
-} lc_pouch_state_record_type;
-
 static int lc_pouch_state_record_type_is_object(unsigned char record_type) {
   return record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT ||
          record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE;
@@ -1948,6 +1934,9 @@ lc_pouch_namespace_logstore_find(lc_pouch *pouch, const char *ns, int create,
 static lc_pouch_state_cache_record *
 lc_pouch_state_cache_record_find(lc_pouch_namespace_logstore *ns,
                                  const char *key);
+static void
+lc_pouch_state_entry_borrow_cache_record(const lc_pouch_state_cache_record *,
+                                         lc_pouch_state_entry *);
 static int lc_pouch_state_compaction_record_ref_matches(
     const lc_pouch_state_cache_record *record, const char *container,
     uint64_t offset);
@@ -5482,11 +5471,75 @@ static uint64_t lc_pouch_state_body_lifetime(const lc_pouch_state_entry *prior,
   return prior->found && prior->payload_span.present ? prior->lifetime : index;
 }
 
+int lc_pouch_state_entry_project(const lc_pouch_state_entry *prior,
+                                 const lc_pouch_state_entry *change,
+                                 lc_pouch_state_entry *out) {
+  lc_pouch_state_entry projected;
+  lc_pouch_generation query_index_seq;
+  int object_record, prior_object;
+  if (!change || !change->seen || !change->key || change->control || !out)
+    return 0;
+  if (prior && !prior->seen)
+    prior = NULL;
+  if (prior && (!prior->key || strcmp(prior->key, change->key)))
+    return 0;
+  if (!lc_pouch_state_entry_supersedes(change, prior))
+    return 0;
+  projected = *change;
+  object_record = lc_pouch_state_record_type_is_object(change->record_type) ||
+                  change->object_link;
+  prior_object =
+      prior && lc_pouch_state_record_type_is_object(prior->record_type);
+  /* A lease-only placeholder is query-neutral; metadata on an existing body
+   * inherits its public sequence. Internal objects and stages stay neutral. */
+  if (lc_pouch_state_key_is_staged(change->key)) {
+    query_index_seq = 0;
+  } else if (change->has_query_index_seq) {
+    query_index_seq = change->query_index_seq;
+  } else {
+    query_index_seq = change->index_seq;
+    if (object_record) {
+      query_index_seq = prior ? prior->query_index_seq : 0;
+    } else if ((change->record_type == LC_POUCH_STATE_RECORD_STATE_META ||
+                change->record_type == LC_POUCH_STATE_RECORD_STATE_DELETE) &&
+               prior_object) {
+      query_index_seq = prior->query_index_seq;
+    } else if (change->record_type == LC_POUCH_STATE_RECORD_STATE_META &&
+               !change->payload_span.present &&
+               (!prior || !prior->payload_span.present)) {
+      query_index_seq = prior ? prior->query_index_seq : 0;
+    } else if (change->record_type == LC_POUCH_STATE_RECORD_STATE_META &&
+               prior && prior->found == change->found &&
+               prior->has_query_hidden == change->has_query_hidden &&
+               prior->query_hidden == change->query_hidden &&
+               prior->query_index_seq) {
+      query_index_seq = prior->query_index_seq;
+    }
+  }
+  projected.query_index_seq = query_index_seq;
+  projected.has_query_index_seq = 1;
+  if (object_record ||
+      ((change->record_type == LC_POUCH_STATE_RECORD_STATE_META ||
+        change->record_type == LC_POUCH_STATE_RECORD_STATE_DELETE) &&
+       prior_object)) {
+    projected.record_type = change->found ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+                                          : LC_POUCH_STATE_RECORD_OBJECT_DELETE;
+  } else if (change->record_type == LC_POUCH_STATE_RECORD_STATE_META) {
+    projected.record_type = LC_POUCH_STATE_RECORD_STATE_META;
+  } else {
+    projected.record_type = change->found ? LC_POUCH_STATE_RECORD_STATE_PUT
+                                          : LC_POUCH_STATE_RECORD_STATE_DELETE;
+  }
+  *out = projected;
+  return 1;
+}
+
 static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
                                             lc_pouch_namespace_logstore *ns,
                                             const lc_pouch_state_entry *entry,
                                             lc_error *error) {
   lc_pouch_state_cache_record *record;
+  lc_pouch_state_entry current, projected;
   char *key;
   char *content_type;
   char *etag;
@@ -5498,8 +5551,6 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
   char *descriptor;
   unsigned char *metadata;
   lc_pouch_generation query_index_seq;
-  int entry_object_record;
-  int prior_object_record;
   int rc;
 
   memset(&payload_span, 0, sizeof(payload_span));
@@ -5508,8 +5559,6 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
   has_record_ref = 0;
   metadata = NULL;
   query_index_seq = 0UL;
-  entry_object_record = 0;
-  prior_object_record = 0;
   if (entry == NULL || !entry->seen || entry->key == NULL) {
     return LC_OK;
   }
@@ -5538,55 +5587,11 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "pouch body has no key lifetime", NULL, NULL, "pouch");
   record = lc_pouch_state_cache_record_find(ns, entry->key);
-  entry_object_record =
-      lc_pouch_state_record_type_is_object(entry->record_type) ||
-      entry->object_link;
-  prior_object_record = record != NULL && lc_pouch_state_record_type_is_object(
-                                              record->record_type);
-  if (record != NULL) {
-    lc_pouch_state_entry current;
-
-    memset(&current, 0, sizeof(current));
-    current.seen = 1;
-    current.version = record->version;
-    current.lifetime = record->lifetime;
-    current.index_seq = record->index_seq;
-    current.record_type = record->record_type;
-    if (!lc_pouch_state_entry_supersedes(entry, &current)) {
-      return LC_OK;
-    }
-  }
-  /* Internal objects never become public query state. STATE_META only changes
-   * lease/application metadata. A metadata-only record is the durable
-   * placeholder for a newly acquired lease, not a document: it remains
-   * query-neutral until a later state put supplies a body. Once a body exists,
-   * retain the prior public generation across lease metadata changes. */
-  if (lc_pouch_state_key_is_staged(entry->key)) {
-    query_index_seq = 0UL;
-  } else if (entry->has_query_index_seq) {
-    query_index_seq = entry->query_index_seq;
-  } else {
-    query_index_seq = entry->index_seq;
-    if (entry_object_record && record != NULL) {
-      query_index_seq = record->query_index_seq;
-    } else if (entry_object_record) {
-      query_index_seq = 0UL;
-    } else if ((entry->record_type == LC_POUCH_STATE_RECORD_STATE_META ||
-                entry->record_type == LC_POUCH_STATE_RECORD_STATE_DELETE) &&
-               prior_object_record) {
-      query_index_seq = record->query_index_seq;
-    } else if (entry->record_type == LC_POUCH_STATE_RECORD_STATE_META &&
-               !entry->payload_span.present &&
-               (record == NULL || !record->payload_span.present)) {
-      query_index_seq = record != NULL ? record->query_index_seq : 0UL;
-    } else if (entry->record_type == LC_POUCH_STATE_RECORD_STATE_META &&
-               record != NULL && record->found == entry->found &&
-               record->has_query_hidden == entry->has_query_hidden &&
-               record->query_hidden == entry->query_hidden &&
-               record->query_index_seq != 0UL) {
-      query_index_seq = record->query_index_seq;
-    }
-  }
+  lc_pouch_state_entry_borrow_cache_record(record, &current);
+  if (!lc_pouch_state_entry_project(&current, entry, &projected))
+    return LC_OK;
+  entry = &projected;
+  query_index_seq = entry->query_index_seq;
   if (record == NULL) {
     rc = lc_pouch_state_cache_record_index_ensure(pouch, ns,
                                                   ns->record_count + 1U, error);
@@ -5745,20 +5750,7 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
   record->query_hidden = entry->query_hidden;
   record->staged_delete_marker = entry->staged_delete_marker;
   record->found = entry->found;
-  if (entry_object_record) {
-    record->record_type = entry->found ? LC_POUCH_STATE_RECORD_OBJECT_PUT
-                                       : LC_POUCH_STATE_RECORD_OBJECT_DELETE;
-  } else if ((entry->record_type == LC_POUCH_STATE_RECORD_STATE_META ||
-              entry->record_type == LC_POUCH_STATE_RECORD_STATE_DELETE) &&
-             prior_object_record) {
-    record->record_type = entry->found ? LC_POUCH_STATE_RECORD_OBJECT_PUT
-                                       : LC_POUCH_STATE_RECORD_OBJECT_DELETE;
-  } else if (entry->record_type == LC_POUCH_STATE_RECORD_STATE_META) {
-    record->record_type = LC_POUCH_STATE_RECORD_STATE_META;
-  } else {
-    record->record_type = entry->found ? LC_POUCH_STATE_RECORD_STATE_PUT
-                                       : LC_POUCH_STATE_RECORD_STATE_DELETE;
-  }
+  record->record_type = entry->record_type;
   if (query_index_seq > ns->max_query_index_seq) {
     ns->max_query_index_seq = query_index_seq;
   }
@@ -6968,8 +6960,20 @@ static int lc_pouch_state_append_binary_records_locked(
 binary_append_ready:
   if (rc == LC_OK) {
     append_started = 1;
-    rc = lc_pouch_state_record_write_prefix_batch(record_io, items, item_count,
-                                                  error);
+    if (pouch->storage.ops != NULL) {
+      /* Preserve structured record boundaries for typed-owner preflight. The
+       * private stream already packs these appends into its bounded buffer. */
+      size_t item_index;
+      for (item_index = 0; rc == LC_OK && item_index < item_count;
+           ++item_index) {
+        const lc_pouch_state_binary_append_item *item = &items[item_index];
+        rc = lc_pouch_record_write_prefix(record_io, item->record_type,
+                                          item->key, item->key_len, item->meta,
+                                          item->meta_len, 0, 0, 0, error);
+      }
+    } else
+      rc = lc_pouch_state_record_write_prefix_batch(record_io, items,
+                                                    item_count, error);
   }
 #ifdef LOCKDC_TEST_BUILD
   if (rc == LC_OK && lc_pouch_test_after_metadata_batch_append_hook != NULL) {
@@ -8893,6 +8897,13 @@ static int lc_pouch_state_scan(lc_pouch *pouch,
   return rc;
 }
 
+int lc_pouch_state_decision_entry_accepts(int prior_present,
+                                          uint64_t prior_index,
+                                          const lc_pouch_state_entry *entry) {
+  return entry && entry->control && entry->key && entry->etag &&
+         entry->decision && (!prior_present || entry->index_seq > prior_index);
+}
+
 static int lc_pouch_state_decision_apply(lc_pouch *pouch,
                                          lc_pouch_state_decision **decisions,
                                          const lc_pouch_state_entry *entry,
@@ -8902,8 +8913,7 @@ static int lc_pouch_state_decision_apply(lc_pouch *pouch,
   char *etag;
   char *decision_value;
 
-  if (entry == NULL || !entry->control || entry->key == NULL ||
-      entry->etag == NULL || entry->decision == NULL) {
+  if (!lc_pouch_state_decision_entry_accepts(0, 0, entry)) {
     return LC_OK;
   }
   for (decision = *decisions; decision != NULL; decision = decision->next) {
@@ -8912,7 +8922,7 @@ static int lc_pouch_state_decision_apply(lc_pouch *pouch,
     }
     /* Decisions order attempts, not public payload generations. A recreated
      * stage may restart at generation one after an older high generation. */
-    if (entry->index_seq <= decision->index_seq) {
+    if (!lc_pouch_state_decision_entry_accepts(1, decision->index_seq, entry)) {
       return LC_OK;
     }
     staged_key = lc_strdup_with_allocator(&pouch->allocator, entry->key);
@@ -9747,6 +9757,87 @@ typedef struct lc_pouch_snapshot_publication {
   lc_pouch_state_precondition_fn publish;
   void *context;
 } lc_pouch_snapshot_publication;
+
+typedef struct lc_pouch_checkpoint_swap {
+  lc_pouch_state_cache_record *record;
+  char *leaf;
+  uint64_t index, lifetime;
+} lc_pouch_checkpoint_swap;
+typedef struct lc_pouch_checkpoint_plan {
+  size_t count;
+  lc_pouch_checkpoint_swap *swaps;
+} lc_pouch_checkpoint_plan;
+void lc_pouch_state_checkpoint_finish(lc_pouch *pouch, void *context,
+                                      int published) {
+  lc_pouch_checkpoint_plan *plan = context;
+  size_t i;
+  if (!plan)
+    return;
+  for (i = 0; i < plan->count; ++i) {
+    lc_pouch_checkpoint_swap *swap = &plan->swaps[i];
+    lc_pouch_state_cache_record *record = swap->record;
+    if (published && record->index_seq == swap->index &&
+        record->lifetime == swap->lifetime) {
+      char *old = record->record_container_leaf;
+      record->record_container_leaf = swap->leaf;
+      swap->leaf = old;
+      record->record_offset = 0;
+      record->has_record_ref = 1;
+    }
+    lc_free_with_allocator(&pouch->allocator, swap->leaf);
+  }
+  lc_free_with_allocator(&pouch->allocator, plan->swaps);
+  lc_free_with_allocator(&pouch->allocator, plan);
+}
+int lc_pouch_state_checkpoint_prepare(
+    lc_pouch *pouch, const char *name,
+    const lc_pouch_storage_checkpoint_ref *refs, size_t count, void **out,
+    lc_error *error) {
+  lc_pouch_namespace_logstore *cache;
+  lc_pouch_state_cache_record *record;
+  lc_pouch_checkpoint_plan *plan;
+  size_t i;
+  if (out)
+    *out = NULL;
+  if (!pouch || !name || !out || (count && !refs) ||
+      count > (size_t)-1 / sizeof(lc_pouch_checkpoint_swap))
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "checkpoint reference update requires bounded inputs",
+                        NULL, NULL, "pouch");
+  cache = lc_pouch_namespace_logstore_find(pouch, name, 0, error);
+  if (!cache || !cache->initialized || !count)
+    return LC_OK;
+  plan = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*plan));
+  if (plan)
+    plan->swaps = lc_calloc_with_allocator(&pouch->allocator, count,
+                                           sizeof(*plan->swaps));
+  if (!plan || !plan->swaps) {
+    lc_pouch_state_checkpoint_finish(pouch, plan, 0);
+    return lc_error_set(error, LC_ERR_NOMEM, 0,
+                        "cannot prepare checkpoint reference update", NULL,
+                        NULL, "pouch");
+  }
+  for (i = 0; i < count; ++i) {
+    lc_pouch_checkpoint_swap *swap;
+    record = lc_pouch_state_cache_record_find(cache, refs[i].key);
+    if (!record || record->index_seq != refs[i].index ||
+        record->lifetime != refs[i].lifetime)
+      continue;
+    swap = &plan->swaps[plan->count++];
+    swap->record = record;
+    swap->index = refs[i].index;
+    swap->lifetime = refs[i].lifetime;
+    swap->leaf = lc_strdup_with_allocator(&pouch->allocator, refs[i].leaf);
+    if (!swap->leaf) {
+      lc_pouch_state_checkpoint_finish(pouch, plan, 0);
+      return lc_error_set(error, LC_ERR_NOMEM, 0,
+                          "cannot retain checkpoint metadata reference", NULL,
+                          NULL, "pouch");
+    }
+  }
+  *out = plan;
+  return LC_OK;
+}
 static int lc_pouch_snapshot_publish_locked(void *context, lc_error *error) {
   lc_pouch_snapshot_publication *p = context;
   int rc = p->publish(p->context, error);
@@ -10536,6 +10627,34 @@ static int lc_pouch_state_snapshot_encode(
   return rc;
 }
 
+static int lc_pouch_state_snapshot_control_encode(
+    const lc_allocator *allocator, const lc_pouch_state_entry *record,
+    unsigned char **meta, size_t *length, size_t *key_length, lc_error *error) {
+  int rc;
+  *key_length = 0;
+  if (record->lifetime > record->index_seq || record->payload_span.present)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "checkpoint control has an invalid body or lifetime",
+                        NULL, NULL, "pouch");
+  if (!record->decision)
+    return lc_pouch_state_encode_high_water_meta(allocator, record->index_seq,
+                                                 record->query_index_seq, meta,
+                                                 length, error);
+  if (!record->key || !record->key[0] || !record->etag ||
+      strlen(record->key) > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "checkpoint decision requires key and identity", NULL,
+                        NULL, "pouch");
+  *key_length = strlen(record->key);
+  rc = lc_pouch_state_encode_decision_meta(allocator, record->version,
+                                           record->etag, record->decision, meta,
+                                           length, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_meta_set_index_sequences(allocator, meta, length,
+                                                 record->index_seq, 0, error);
+  return rc;
+}
+
 int lc_pouch_state_record_measure_snapshot(const lc_allocator *allocator,
                                            const char *leaf,
                                            const lc_pouch_state_entry *record,
@@ -10550,7 +10669,8 @@ int lc_pouch_state_record_measure_snapshot(const lc_allocator *allocator,
   if (bytes)
     *bytes = 0;
   if (!allocator || !record || !bytes || copy_body < 0 || copy_body > 1 ||
-      record->decision || record->lifetime > record->index_seq ||
+      (record->decision && !record->control) ||
+      record->lifetime > record->index_seq ||
       (record->payload_span.present && !record->lifetime) ||
       (record->control && copy_body))
     return lc_error_set(
@@ -10558,9 +10678,8 @@ int lc_pouch_state_record_measure_snapshot(const lc_allocator *allocator,
         "snapshot measurement requires resolved record and size", NULL, NULL,
         "pouch");
   if (record->control)
-    rc = lc_pouch_state_encode_high_water_meta(allocator, record->index_seq,
-                                               record->query_index_seq, &meta,
-                                               &length, error);
+    rc = lc_pouch_state_snapshot_control_encode(allocator, record, &meta,
+                                                &length, &key_length, error);
   else {
     if (!record->key || !record->key[0] ||
         record->record_type == LC_POUCH_STATE_RECORD_HIGH_WATER ||
@@ -10713,6 +10832,44 @@ int lc_pouch_state_record_write_high_water(const lc_allocator *allocator,
   return rc;
 }
 
+static int lc_pouch_state_record_write_control_snapshot(
+    const lc_allocator *allocator, lc_pouch_record_io output,
+    const lc_pouch_state_entry *record, lc_error *error) {
+  unsigned char *meta = NULL;
+  size_t length = 0, key_length = 0;
+  uint64_t start = 0;
+  int rc;
+  if (!allocator || !output.ops || !output.ops->append || !output.ops->tail ||
+      !output.ops->discard)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "checkpoint control requires private output", NULL,
+                        NULL, "pouch");
+  rc = lc_pouch_state_snapshot_control_encode(allocator, record, &meta, &length,
+                                              &key_length, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_record_io_tail(output, &start, error);
+  if (rc == LC_OK &&
+      (start > (uint64_t)LC_I64_MAX - LC_POUCH_STATE_RECORD_HEADER_BYTES -
+                   key_length ||
+       length > (uint64_t)LC_I64_MAX - start -
+                    LC_POUCH_STATE_RECORD_HEADER_BYTES - key_length))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                      "checkpoint control exceeds local offset limit", NULL,
+                      NULL, "pouch");
+  if (rc == LC_OK) {
+    rc = lc_pouch_record_write_prefix(output,
+                                      record->decision
+                                          ? LC_POUCH_STATE_RECORD_DECISION
+                                          : LC_POUCH_STATE_RECORD_HIGH_WATER,
+                                      key_length ? record->key : NULL,
+                                      key_length, meta, length, 0, 0, 0, error);
+    if (rc != LC_OK)
+      output.ops->discard(output.context, start);
+  }
+  lc_free_with_allocator(allocator, meta);
+  return rc;
+}
+
 int lc_pouch_state_record_write_snapshot(
     const lc_allocator *allocator, lc_pouch_record_io output, const char *leaf,
     const lc_pouch_state_entry *record, lc_source *encoded, void *scratch,
@@ -10724,6 +10881,9 @@ int lc_pouch_state_record_write_snapshot(
   uint64_t start = 0;
   unsigned char type;
   int rc, started = 0;
+  if (record && record->control && !encoded)
+    return lc_pouch_state_record_write_control_snapshot(allocator, output,
+                                                        record, error);
   if (!allocator || !record || !record->key || !record->key[0] ||
       record->control || record->decision ||
       record->record_type == LC_POUCH_STATE_RECORD_HIGH_WATER ||

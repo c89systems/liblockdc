@@ -59,8 +59,6 @@ ps_ns_resource *ps_ns_resource_new(unsigned int kind, uint64_t id,
     }
   } else if (kind == PS_CATALOG_SEGMENT)
     leaf = lc_pouch_namespace_segment_leaf(NULL, id);
-  else if (kind == PS_CATALOG_SNAPSHOT)
-    leaf = lc_pouch_namespace_snapshot_leaf(NULL, id);
   if (leaf) {
     r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
     label = lc_calloc_with_allocator(NULL, 1, sizeof(*label));

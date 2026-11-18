@@ -33,6 +33,11 @@ struct ps_reader {
   int random_loaded;
   unsigned char buffer[PS_CHUNK];
 };
+struct ps_values {
+  ps_space *space;
+  ps_entry **items;
+  size_t count;
+};
 struct ps_owned_head {
   ps_space *space;
   ps_entry *entry;
@@ -223,12 +228,14 @@ static uint64_t aligned(uint64_t n) {
 static int valid_key(ps_key k) {
   return (k.kind >= PS_STATE && k.kind <= PS_CATALOG) || k.kind == PS_CONTROL ||
          k.kind == PS_ROUTING ||
-         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST);
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
+         (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
 static int immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION ||
          k.kind == PS_CONTROL || k.kind == PS_ROUTING ||
-         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST);
+         (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
+         (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
 static size_t bucket(ps_key k) {
   uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^ k.kind;
@@ -2673,16 +2680,20 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   lc_free_with_allocator(NULL, buffer);
   return rc;
 }
-int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
-                    unsigned int last, ps_value_visit_fn visit, void *context,
-                    lc_error *error) {
-  ps_entry **captured = NULL, *p, *selected;
-  ps_ref ref;
+int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
+                      unsigned int last, ps_values **out, lc_error *error) {
+  ps_values *view;
+  ps_entry *p, *selected;
   uint64_t prefix;
   size_t i, n = 0, at = 0;
   int rc;
-  if (!s || !visit || first > last)
+  if (out)
+    *out = NULL;
+  if (!s || !out || first > last)
     return err(error, LC_ERR_INVALID, "value visit requires owner and kinds");
+  view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
+  if (!view)
+    return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
@@ -2693,9 +2704,9 @@ int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
           selected_value(s, p, prefix))
         ++n;
   if (rc == LC_OK && n) {
-    if (n <= (size_t)-1 / sizeof(*captured))
-      captured = lc_calloc_with_allocator(NULL, n, sizeof(*captured));
-    if (!captured)
+    if (n <= (size_t)-1 / sizeof(*view->items))
+      view->items = lc_calloc_with_allocator(NULL, n, sizeof(*view->items));
+    if (!view->items)
       rc = err(error, LC_ERR_NOMEM, "cannot capture selected value metadata");
   }
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
@@ -2703,24 +2714,99 @@ int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
       if (p->key.owner == owner && p->key.kind >= first &&
           p->key.kind <= last && immutable_key(p->key) &&
           (selected = selected_value(s, p, prefix)) != NULL) {
-        captured[at++] = selected;
+        view->items[at++] = selected;
         ++selected->pins;
-        ++s->readers;
       }
+  if (rc == LC_OK) {
+    view->space = s;
+    view->count = at;
+    ++s->readers;
+  }
   pthread_mutex_unlock(&s->mutex);
-  for (i = 0; rc == LC_OK && i < at; ++i) {
-    memcpy(ref.container, s->identity, sizeof(ref.container));
-    ref.incarnation = captured[i]->token;
-    rc = visit(context, captured[i]->key, &ref, captured[i]->bytes, error);
+  if (rc == LC_OK)
+    *out = view;
+  else {
+    lc_free_with_allocator(NULL, view->items);
+    lc_free_with_allocator(NULL, view);
   }
+  return rc;
+}
+size_t ps_values_count(const ps_values *view) { return view ? view->count : 0; }
+int ps_values_info(const ps_values *view, size_t at, ps_key *key, ps_ref *ref,
+                   uint64_t *bytes, lc_error *error) {
+  ps_entry *p;
+  if (!view || at >= view->count || !key || !ref || !bytes)
+    return err(error, LC_ERR_INVALID,
+               "captured value requires index and output");
+  p = view->items[at];
+  *key = p->key;
+  memcpy(ref->container, view->space->identity, sizeof(ref->container));
+  ref->incarnation = p->token;
+  *bytes = p->bytes;
+  return LC_OK;
+}
+int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
+                        lc_error *error) {
+  ps_reader *reader;
+  ps_space *s;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!view || at >= view->count || !out)
+    return err(error, LC_ERR_INVALID,
+               "captured reader requires index and output");
+  reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
+  if (!reader)
+    return err(error, LC_ERR_NOMEM, "cannot allocate captured value reader");
+  s = view->space;
   pthread_mutex_lock(&s->mutex);
-  for (i = 0; i < at; ++i) {
-    --captured[i]->pins;
-    --s->readers;
+  rc = healthy(s, error);
+  if (rc == LC_OK) {
+    reader->space = s;
+    reader->entry = view->items[at];
+    ++reader->entry->pins;
+    ++s->readers;
   }
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK)
+    *out = reader;
+  else
+    lc_free_with_allocator(NULL, reader);
+  return rc;
+}
+void ps_values_close(ps_values *view) {
+  ps_space *s;
+  size_t i;
+  if (!view)
+    return;
+  s = view->space;
+  pthread_mutex_lock(&s->mutex);
+  for (i = 0; i < view->count; ++i)
+    --view->items[i]->pins;
+  --s->readers;
   collect(s);
   pthread_mutex_unlock(&s->mutex);
-  lc_free_with_allocator(NULL, captured);
+  lc_free_with_allocator(NULL, view->items);
+  lc_free_with_allocator(NULL, view);
+}
+int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
+                    unsigned int last, ps_value_visit_fn visit, void *context,
+                    lc_error *error) {
+  ps_values *view = NULL;
+  ps_ref ref;
+  ps_key key;
+  uint64_t bytes;
+  size_t i;
+  int rc;
+  if (!visit)
+    return err(error, LC_ERR_INVALID, "value visit requires callback");
+  rc = ps_values_capture(s, owner, first, last, &view, error);
+  for (i = 0; rc == LC_OK && i < ps_values_count(view); ++i) {
+    rc = ps_values_info(view, i, &key, &ref, &bytes, error);
+    if (rc == LC_OK)
+      rc = visit(context, key, &ref, bytes, error);
+  }
+  ps_values_close(view);
   return rc;
 }
 uint64_t ps_read_size(const ps_reader *r) { return r ? r->entry->bytes : 0; }

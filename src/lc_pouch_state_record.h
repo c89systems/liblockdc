@@ -6,6 +6,20 @@
 #include "lc_pouch_record_io.h"
 
 #define LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES (128U * 1024U)
+#define LC_POUCH_STATE_RECORD_META_MAX_BYTES (1024U * 1024U)
+#define LC_POUCH_STATE_RECORD_KEY_MAX_BYTES (1024U * 1024U)
+#define LC_POUCH_STATE_HIGH_WATER_KEY ".lockd/high-water"
+
+typedef enum lc_pouch_state_record_type {
+  LC_POUCH_STATE_RECORD_STATE_PUT = 1,
+  LC_POUCH_STATE_RECORD_STATE_DELETE = 2,
+  LC_POUCH_STATE_RECORD_STATE_LINK = 3,
+  LC_POUCH_STATE_RECORD_STATE_META = 4,
+  LC_POUCH_STATE_RECORD_DECISION = 5,
+  LC_POUCH_STATE_RECORD_HIGH_WATER = 6,
+  LC_POUCH_STATE_RECORD_OBJECT_PUT = 7,
+  LC_POUCH_STATE_RECORD_OBJECT_DELETE = 8
+} lc_pouch_state_record_type;
 
 typedef struct lc_pouch_state_payload_span {
   char *container_leaf;
@@ -90,7 +104,9 @@ int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
                                  lc_source *, int disable_compression,
                                  lc_pouch_state_entry *result, lc_error *);
 
-/* Canonical snapshot bytes. Preserve resolved versions, lifetimes and both
+/* Canonical checkpoint bytes, including HIGH_WATER and retained decisions.
+ * Control records require NULL encoded input. Preserve resolved versions,
+ * lifetimes and both
  * index sequences; the owner supplies selection, history protection, commit and
  * durability. An absent per-key query sequence defaults to its index sequence.
  * NULL encoded writes a body reference, metadata-only placeholder or tombstone

@@ -482,6 +482,30 @@ int ps_stream_write_at(ps_stream_writer *w, uint64_t offset, const void *bytes,
     w->failed = 1;
   return rc;
 }
+int ps_stream_writer_read(ps_stream_writer *w, uint64_t offset, void *bytes,
+                          size_t n, lc_error *error) {
+  unsigned char *p = bytes;
+  size_t take;
+  int rc = LC_OK;
+  if (!w || (!bytes && n) || w->failed || w->published || offset > w->bytes ||
+      n > w->bytes - offset)
+    return stream_error(error, LC_ERR_INVALID,
+                        "stream read outside private append");
+  if (n && offset < w->flushed) {
+    take = (size_t)(w->flushed - offset);
+    if (take > n)
+      take = n;
+    rc = stream_io(w->stream, w->start + offset, p, take, 0, error);
+    offset += take;
+    p += take;
+    n -= take;
+  }
+  if (rc == LC_OK && n)
+    memcpy(p, w->buffer + (size_t)(offset - w->flushed), n);
+  if (rc != LC_OK)
+    w->failed = 1;
+  return rc;
+}
 int ps_stream_writer_crc(ps_stream_writer *w, uint64_t offset, uint64_t length,
                          unsigned long *out, lc_error *error) {
   unsigned char *scratch = NULL;

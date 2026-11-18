@@ -145,6 +145,68 @@ int ps_budget_status(ps_budget *b, ps_budget_plan *out, lc_error *e) {
   pthread_mutex_unlock(&b->space->mutex);
   return LC_OK;
 }
+int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
+  ps_space *s;
+  ps_budget_plan prior;
+  ps_run *trim = NULL;
+  uint64_t payload, metadata, entries;
+  int rc, grows;
+  if (!b || !plan || plan->payload_bytes % PS_PAGE || plan->maintenance < 0 ||
+      plan->maintenance > 1)
+    return invalid(e, "capacity resize requires an aligned matching plan");
+  s = b->space;
+  pthread_mutex_lock(&s->mutex);
+  prior = b->remaining;
+  rc = ps_internal_healthy(s, e);
+  if (rc == LC_OK && plan->maintenance != prior.maintenance)
+    rc = invalid(e, "capacity resize cannot change admission class");
+  if (rc == LC_OK && b->users &&
+      (plan->payload_bytes < prior.payload_bytes ||
+       plan->metadata_bytes < prior.metadata_bytes ||
+       plan->entries < prior.entries))
+    rc = invalid(e, "close capacity writers before shrinking their claim");
+  if (rc == LC_OK && plan->payload_bytes == prior.payload_bytes &&
+      plan->metadata_bytes == prior.metadata_bytes &&
+      plan->entries == prior.entries) {
+    pthread_mutex_unlock(&s->mutex);
+    return LC_OK;
+  }
+  if (rc == LC_OK) {
+    trim = lc_calloc_with_allocator(NULL, 1, sizeof(*trim));
+    if (!trim)
+      rc = lc_error_set(e, LC_ERR_NOMEM, 0,
+                        "cannot allocate capacity resize workspace", NULL, NULL,
+                        "pouch-space");
+  }
+  grows = plan->payload_bytes > prior.payload_bytes ||
+          plan->metadata_bytes > prior.metadata_bytes ||
+          plan->entries > prior.entries;
+  payload = s->reserved_payload - prior.payload_bytes;
+  metadata = s->reserved_metadata - prior.metadata_bytes;
+  entries = s->reserved_entries - prior.entries;
+  if (rc == LC_OK && (plan->payload_bytes > UINT64_MAX - payload ||
+                      plan->metadata_bytes > UINT64_MAX - metadata ||
+                      plan->entries > UINT64_MAX - entries))
+    rc = invalid(e, "capacity resize totals overflow");
+  if (rc == LC_OK) {
+    s->reserved_payload = payload + plan->payload_bytes;
+    s->reserved_metadata = metadata + plan->metadata_bytes;
+    s->reserved_entries = entries + plan->entries;
+    b->remaining = *plan;
+    if (grows)
+      rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    if (rc != LC_OK) {
+      s->reserved_payload = payload + prior.payload_bytes;
+      s->reserved_metadata = metadata + prior.metadata_bytes;
+      s->reserved_entries = entries + prior.entries;
+      b->remaining = prior;
+    }
+    ps_internal_budget_trim(s, &trim);
+  }
+  pthread_mutex_unlock(&s->mutex);
+  lc_free_with_allocator(NULL, trim);
+  return rc;
+}
 int ps_budget_close(ps_budget *b, lc_error *e) {
   ps_space *s;
   if (!b)

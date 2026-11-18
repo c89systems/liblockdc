@@ -101,6 +101,38 @@ static int append(void *context, const struct iovec *parts, int count,
       end += parts[i].iov_len;
     }
   }
+  if (out->admit && out->tail == out->record_end) {
+    lc_pouch_record_header header;
+    if (count < 3 || parts[0].iov_len != LC_POUCH_RECORD_HEADER_BYTES)
+      return record_error(e, "canonical admission requires a complete prefix");
+    rc = lc_pouch_record_header_decode(parts[0].iov_base, &header, e);
+    if (rc == LC_OK &&
+        ((header.flags & ~LC_POUCH_RECORD_FLAG_PENDING) ||
+         header.key_len != parts[1].iov_len ||
+         header.meta_len != parts[2].iov_len ||
+         out->tail > (uint64_t)INT64_MAX - LC_POUCH_RECORD_HEADER_BYTES ||
+         header.key_len >
+             (uint64_t)INT64_MAX - out->tail - LC_POUCH_RECORD_HEADER_BYTES ||
+         header.meta_len > (uint64_t)INT64_MAX - out->tail -
+                               LC_POUCH_RECORD_HEADER_BYTES - header.key_len ||
+         header.payload_len > (uint64_t)INT64_MAX - out->tail -
+                                  LC_POUCH_RECORD_HEADER_BYTES -
+                                  header.key_len - header.meta_len))
+      rc = record_error(e, "canonical admission prefix exceeds its bounds");
+    if (rc == LC_OK)
+      rc = out->admit(out->admission_context, &header, parts[1].iov_base,
+                      parts[2].iov_base, e);
+    if (rc != LC_OK) {
+      out->failed = 1;
+      return rc;
+    }
+    out->record_start = out->tail;
+    out->record_end = header.flags & LC_POUCH_RECORD_FLAG_PENDING
+                          ? UINT64_MAX
+                          : out->tail + LC_POUCH_RECORD_HEADER_BYTES +
+                                header.key_len + header.meta_len +
+                                header.payload_len;
+  }
   for (i = 0; i < count && rc == LC_OK; ++i) {
     if (parts[i].iov_len > UINT64_MAX - out->tail)
       return record_error(e, "canonical append exceeds logical range");
@@ -123,7 +155,7 @@ static int append(void *context, const struct iovec *parts, int count,
 static int patch(void *context, uint64_t offset, const struct iovec *parts,
                  int count, lc_error *e) {
   ps_record_writer *out = context;
-  uint64_t end = offset;
+  uint64_t end = offset, record_end = 0;
   int i, rc = LC_OK;
   if (!out || !out->writer || out->failed ||
       offset < out->start + (out->frame_length ? PS_FRAME_BYTES : 0) ||
@@ -134,6 +166,27 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
       return record_error(e, "canonical patch exceeds private append");
     end += parts[i].iov_len;
   }
+  if (out->admit && offset == out->record_start && count == 1 &&
+      parts[0].iov_len == LC_POUCH_RECORD_HEADER_BYTES) {
+    lc_pouch_record_header header;
+    rc = lc_pouch_record_header_decode(parts[0].iov_base, &header, e);
+    if (rc == LC_OK &&
+        ((header.flags & ~LC_POUCH_RECORD_FLAG_PENDING) ||
+         LC_POUCH_RECORD_HEADER_BYTES > out->tail - offset ||
+         header.key_len > out->tail - offset - LC_POUCH_RECORD_HEADER_BYTES ||
+         header.meta_len > out->tail - offset - LC_POUCH_RECORD_HEADER_BYTES -
+                               header.key_len ||
+         header.payload_len > out->tail - offset -
+                                  LC_POUCH_RECORD_HEADER_BYTES -
+                                  header.key_len - header.meta_len))
+      rc = record_error(e, "canonical fixup exceeds its private record");
+    if (rc != LC_OK)
+      return rc;
+    record_end = header.flags & LC_POUCH_RECORD_FLAG_PENDING
+                     ? UINT64_MAX
+                     : offset + LC_POUCH_RECORD_HEADER_BYTES + header.key_len +
+                           header.meta_len + header.payload_len;
+  }
   for (i = 0; i < count && rc == LC_OK; ++i) {
     if (out->frame_length && parts[i].iov_len)
       out->frame_dirty = 1;
@@ -141,7 +194,19 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
                             parts[i].iov_len, e);
     offset += parts[i].iov_len;
   }
+  if (rc == LC_OK && record_end)
+    out->record_end = record_end;
   return rc;
+}
+int ps_record_admission_set(ps_record_writer *out, ps_record_admit_fn admit,
+                            void *context, lc_error *e) {
+  if (!out || !out->writer || out->failed || !admit || out->admit ||
+      out->tail != out->start + (out->frame_length ? PS_FRAME_BYTES : 0))
+    return record_error(e, "canonical admission requires a new private append");
+  out->admit = admit;
+  out->admission_context = context;
+  out->record_start = out->record_end = out->tail;
+  return LC_OK;
 }
 static int tail(void *context, uint64_t *value, lc_error *e) {
   ps_record_writer *out = context;
@@ -157,8 +222,28 @@ static void discard(void *context, uint64_t offset) {
    * several canonical records. Existing committed bytes are never truncated. */
   ps_record_abort(out);
 }
+static int private_read(void *context, uint64_t offset,
+                        const struct iovec *parts, int count, lc_error *e) {
+  ps_record_writer *out = context;
+  uint64_t end = offset;
+  int i, rc = LC_OK;
+  if (!out || !out->writer || out->failed || offset < out->start ||
+      offset > out->tail)
+    return record_error(e, "canonical read outside private append");
+  for (i = 0; i < count; ++i) {
+    if (parts[i].iov_len > out->tail - end)
+      return record_error(e, "canonical read exceeds private append");
+    end += parts[i].iov_len;
+  }
+  for (i = 0; i < count && rc == LC_OK; ++i) {
+    rc = ps_stream_writer_read(out->writer, offset - out->start,
+                               parts[i].iov_base, parts[i].iov_len, e);
+    offset += parts[i].iov_len;
+  }
+  return rc;
+}
 lc_pouch_record_io ps_record_output(ps_record_writer *out) {
-  static const lc_pouch_record_io_ops ops = {NULL, append, patch, tail,
+  static const lc_pouch_record_io_ops ops = {private_read, append, patch, tail,
                                              discard};
   lc_pouch_record_io io;
   io.ops = &ops;
@@ -192,6 +277,23 @@ static int window_parts(void *context, uint64_t offset,
     offset += parts[i].iov_len;
   }
   return rc;
+}
+static int value_parts(void *context, uint64_t offset,
+                       const struct iovec *parts, int count, lc_error *e) {
+  int i, rc = LC_OK;
+  for (i = 0; i < count && rc == LC_OK; ++i) {
+    rc = ps_read_at(context, offset, parts[i].iov_base, parts[i].iov_len, e);
+    offset += parts[i].iov_len;
+  }
+  return rc;
+}
+lc_pouch_record_io ps_record_value_input(ps_reader *reader) {
+  static const lc_pouch_record_io_ops ops = {value_parts, NULL, NULL, NULL,
+                                             NULL};
+  lc_pouch_record_io io;
+  io.ops = reader ? &ops : NULL;
+  io.context = reader;
+  return io;
 }
 lc_pouch_record_io ps_record_window_input(ps_stream_window *window) {
   static const lc_pouch_record_io_ops ops = {window_parts, NULL, NULL, NULL,

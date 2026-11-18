@@ -1,4 +1,5 @@
 #include "pouch.h"
+#include "checkpoint.h"
 #include "collections.h"
 #include "frame.h"
 #include "lc_api_internal.h"
@@ -25,6 +26,7 @@ typedef struct queue_waiter {
 typedef struct ps_pouch_owner {
   ps_root *root;
   lc_allocator allocator;
+  lc_pouch *runtime; /* Borrowed while logical append/maintenance is active. */
   unsigned int references;
   pthread_mutex_t txn_guards[LC_POUCH_STORAGE_TXN_GUARD_STRIPES];
   queue_waiter *waiters;
@@ -94,11 +96,31 @@ static int flush(void *context, lc_error *e) {
   ps_pouch_owner *owner = context;
   return ps_flush(ps_root_space(owner->root), e);
 }
+static int checkpoint_prepare(void *context, const char *name,
+                              const ps_checkpoint_ref *refs, size_t count,
+                              void **plan, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return lc_pouch_state_checkpoint_prepare(owner->runtime, name, refs, count,
+                                           plan, e);
+}
+static void checkpoint_finish(void *context, void *plan, int published) {
+  ps_pouch_owner *owner = context;
+  lc_pouch_state_checkpoint_finish(owner->runtime, plan, published);
+}
 static int namespace_open(void *context, const char *name, int create,
                           void **out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_namespace *ns = NULL;
+  ps_checkpoint_observer observer = {checkpoint_prepare, checkpoint_finish,
+                                     NULL};
   int rc = ps_root_namespace_acquire(owner->root, name, create, &ns, e);
+  observer.context = context;
+  if (rc == LC_OK)
+    rc = ps_namespace_checkpoint_observe(ns, &observer, e);
+  if (rc != LC_OK) {
+    ps_namespace_release(ns);
+    ns = NULL;
+  }
   *out = ns;
   return rc;
 }
@@ -714,6 +736,7 @@ int ps_pouch_state_open(const char *path, int create,
                         NULL, NULL, "pouch");
   }
   owner->allocator = pouch->allocator;
+  owner->runtime = pouch;
   owner->references = 1;
   memset(&root_options, 0, sizeof(root_options));
   root_options.storage.durable_sync = pouch->durable_sync;

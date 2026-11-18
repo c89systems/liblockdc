@@ -15,6 +15,7 @@ struct ps_namespace_append {
   struct ps_namespace_data *data;
   ps_record_writer writer;
   ps_budget *budget;
+  ps_checkpoint_delta *delta;
   uint64_t segment;
   uint64_t expected;
   int complete;
@@ -23,10 +24,12 @@ struct ps_namespace_append {
 struct ps_namespace_window {
   ps_namespace *ns;
   ps_stream_window *reader;
+  ps_reader *value;
+  uint64_t start, end;
   unsigned int references;
 };
 typedef struct captured {
-  uint64_t id, tail;
+  uint64_t id, start, tail;
   char leaf[PS_NS_LEAF_BYTES];
   ps_stream_window *reader;
 } captured;
@@ -34,12 +37,16 @@ struct ps_namespace_view {
   ps_namespace *ns;
   size_t count;
   captured *items;
+  ps_values *metadata;
+  ps_checkpoint_info coverage;
+  uint64_t active, tail;
 };
 static int failure(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL,
                       rc == LC_ERR_PROTOCOL ? "pouch_namespace_corrupt" : NULL,
                       "pouch");
 }
+static int checkpoint_ready(struct ps_namespace_data *, lc_error *);
 static void put64(unsigned char *p, uint64_t value) {
   size_t i;
   for (i = 0; i < 8; ++i) {
@@ -84,21 +91,14 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
       get64(bytes + 120) != (uint64_t)crc32(0L, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "namespace head identity or checksum is invalid");
-  d->snapshot_id = get64(bytes + 40);
-  d->snapshot_boundary = get64(bytes + 48);
-  if ((!d->snapshot_id != !d->snapshot_boundary) ||
-      d->snapshot_boundary >= get64(bytes + 16))
-    return failure(e, LC_ERR_PROTOCOL,
-                   "namespace snapshot boundary is invalid");
-  for (i = 56; i < 120; ++i)
+  for (i = 40; i < 120; ++i)
     if (bytes[i])
       return failure(e, LC_ERR_PROTOCOL, "namespace head has unknown fields");
   d->active = get64(bytes + 16);
   return LC_OK;
 }
 int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
-                     uint64_t active, uint64_t snapshot, uint64_t boundary,
-                     lc_error *e) {
+                     uint64_t active, lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_writer *writer = NULL;
   int rc;
@@ -108,8 +108,6 @@ int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
   put64(bytes + 16, active);
   put64(bytes + 24, active);
   put64(bytes + 32, LC_POUCH_RECORD_HEADER_BYTES);
-  put64(bytes + 40, snapshot);
-  put64(bytes + 48, boundary);
   put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
   rc = ps_begin(d->ns->root->space, budget, head_key(d->ns), &writer, e);
   if (rc == LC_OK)
@@ -157,11 +155,6 @@ static int collect_segment(void *context, const void *name, size_t length,
   return collect_resource(context, name, length, binding, PS_CATALOG_SEGMENT,
                           e);
 }
-static int collect_snapshot(void *context, const void *name, size_t length,
-                            const ps_catalog_info *binding, lc_error *e) {
-  return collect_resource(context, name, length, binding, PS_CATALOG_SNAPSHOT,
-                          e);
-}
 static int collect_body(void *context, const void *name, size_t length,
                         const ps_catalog_info *binding, lc_error *e) {
   return collect_resource(context, name, length, binding, PS_CATALOG_BODY, e);
@@ -179,7 +172,7 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   lc_allocator allocator = {0};
   lc_pouch_state_entry record = {0};
   unsigned char *scratch = NULL;
-  uint64_t cursor = 0, inner, next;
+  uint64_t cursor = s->covered, inner, next;
   ps_frame frame;
   int rc = LC_OK, found, truncated;
   if (s->kind != PS_CATALOG_SEGMENT)
@@ -194,6 +187,9 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
     *accepted = 0;
     return LC_OK;
   }
+  if (cursor > capacity)
+    return failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint coverage exceeds source capacity");
   while (cursor < capacity) {
     found = 0;
     rc = ps_frame_read(ps_record_recovery_input(stream), cursor, capacity,
@@ -242,6 +238,7 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   ps_ns_label *label, *next_label;
   if (!d)
     return;
+  ps_key_checkpoint_close(d->checkpoint);
   for (i = 0; i < d->count; ++i)
     ps_ns_resource_free(d->items[i]);
   for (r = d->retired; r; r = next) {
@@ -259,6 +256,7 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
 static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_stream_info info;
+  ps_checkpoint_info coverage = {0};
   size_t i;
   uint64_t seen = 0;
   int rc;
@@ -272,19 +270,20 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
   }
   rc = head_read(d, e);
   if (rc == LC_OK)
-    rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
-                          PS_CATALOG_SEGMENT, collect_segment, d, e);
+    rc = ps_key_checkpoint_open(ns, &d->checkpoint, e);
+  if (rc == LC_OK)
+    ps_key_checkpoint_info(d->checkpoint, &coverage);
+  if (rc == LC_OK && coverage.segment > d->active)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "checkpoint coverage exceeds namespace head");
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
-                          PS_CATALOG_SNAPSHOT, collect_snapshot, d, e);
+                          PS_CATALOG_SEGMENT, collect_segment, d, e);
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner, PS_CATALOG_BODY,
                           collect_body, d, e);
   if (rc == LC_OK && d->count)
     qsort(d->items, d->count, sizeof(*d->items), compare_segment);
-  if (rc == LC_OK && d->snapshot_id &&
-      !ps_ns_find(d, PS_CATALOG_SNAPSHOT, d->snapshot_id))
-    rc = failure(e, LC_ERR_PROTOCOL, "namespace selected snapshot is missing");
   for (i = 0; rc == LC_OK && i < d->count; ++i) {
     segment *s = d->items[i];
     if (i && !compare_segment(d->items + i - 1, d->items + i)) {
@@ -299,18 +298,19 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
                      "namespace has an unexpected successor");
         break;
       }
-      if (s->id > d->snapshot_boundary && s->id <= d->active) {
+      if (s->id > coverage.segment && s->id <= d->active) {
         ++seen;
-        if (s->id != d->snapshot_boundary + seen) {
+        if (s->id != coverage.segment + seen) {
           rc = failure(e, LC_ERR_PROTOCOL,
                        "namespace segment directory has a gap");
           break;
         }
       }
     }
-    s->unselected =
-        s->kind != PS_CATALOG_BODY &&
-        s->id > (s->kind == PS_CATALOG_SEGMENT ? d->active : d->snapshot_id);
+    s->unselected = s->kind == PS_CATALOG_SEGMENT && s->id > d->active;
+    s->covered = s->kind == PS_CATALOG_SEGMENT && s->id == coverage.segment
+                     ? coverage.offset
+                     : 0;
     rc = ps_stream_open(ns->root->space, NULL, s->binding.stream, 0,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
@@ -327,15 +327,20 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
       rc = failure(e, LC_ERR_PROTOCOL, "namespace active segment is sealed");
     if (rc == LC_OK && s->id == d->active)
       d->tail = info.tail;
+    if (rc == LC_OK && s->id == coverage.segment && coverage.offset > info.tail)
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint coverage exceeds canonical tail");
     if (rc == LC_OK && s->id < d->active && !info.sealed) {
-      if (s->id <= d->snapshot_boundary || s->id + 1 != d->active)
+      if (s->id + 1 != d->active)
         rc = failure(e, LC_ERR_PROTOCOL,
                      "namespace has an unexpected unsealed predecessor");
       else
         d->pending_seal = s->id;
     }
   }
-  if (rc == LC_OK && seen != d->active - d->snapshot_boundary)
+  if (rc == LC_OK &&
+      (seen != d->active - coverage.segment ||
+       (d->active && !ps_ns_find(d, PS_CATALOG_SEGMENT, d->active))))
     rc = failure(e, LC_ERR_PROTOCOL, "namespace head has missing segments");
   if (rc != LC_OK)
     ps_namespace_data_destroy(d);
@@ -617,8 +622,7 @@ int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
   if (rc == LC_OK)
     rc = prepare(d, budget, next, e);
   if (rc == LC_OK)
-    rc = ps_ns_head_write(d, budget, next, d->snapshot_id, d->snapshot_boundary,
-                          e);
+    rc = ps_ns_head_write(d, budget, next, e);
   if (rc == LC_OK)
     rc = ps_flush(d->ns->root->space, e);
   if (rc == LC_OK) {
@@ -639,6 +643,7 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
                             lc_error *e) {
   struct ps_namespace_data *d;
   ps_stream_info info;
+  ps_checkpoint_info coverage;
   size_t i;
   int rc;
   if (!out)
@@ -648,17 +653,20 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
     return rc;
   pthread_mutex_lock(&d->mutex);
   memset(out, 0, sizeof(*out));
+  ps_key_checkpoint_info(d->checkpoint, &coverage);
   out->active_segment = d->active;
-  out->segments = d->active - d->snapshot_boundary;
-  out->snapshot = d->snapshot_id;
-  out->snapshot_boundary = d->snapshot_boundary;
+  out->segments = d->active - coverage.segment + (coverage.segment != 0);
+  out->checkpoint_epoch = coverage.epoch;
+  out->covered_segment = coverage.segment;
+  out->covered_offset = coverage.offset;
+  out->checkpoint_keys = coverage.slots;
+  out->pending_keys = coverage.pending;
+  out->pending_metadata_bytes = coverage.pending_bytes;
   out->tail = out->runs = 0;
   for (i = 0; rc == LC_OK && i < d->count; ++i) {
     segment *s = d->items[i];
     if (s->kind == PS_CATALOG_SEGMENT)
       ++out->bound_segments;
-    else if (s->kind == PS_CATALOG_SNAPSHOT)
-      ++out->bound_snapshots;
     else
       ++out->bound_bodies;
     if (s->unselected)
@@ -713,7 +721,14 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     lc_free_with_allocator(NULL, append);
     return rc;
   }
-  rc = ps_ns_finish_seal(d, e);
+  rc = checkpoint_ready(d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_finish_seal(d, e);
+  if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint)) {
+    pthread_mutex_lock(&d->mutex);
+    rc = ps_key_checkpoint_flush(d->checkpoint, e);
+    pthread_mutex_unlock(&d->mutex);
+  }
   selected = d->active;
   if (rc == LC_OK) {
     if (!selected || (target && d->tail >= target)) {
@@ -740,8 +755,12 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
       append->writer.limit = append->writer.start + span;
     if (rc == LC_OK && append->complete)
       rc = ps_record_frame_begin(&append->writer, minimum, e);
+    if (rc == LC_OK)
+      rc = ps_checkpoint_delta_begin(d->checkpoint, &append->writer, s->id,
+                                     s->leaf, &append->delta, e);
   }
   if (rc != LC_OK) {
+    ps_checkpoint_delta_close(append->delta);
     ps_record_abort(&append->writer);
     ps_budget_close(append->budget, NULL);
     ps_ns_leave(d);
@@ -764,14 +783,16 @@ uint64_t ps_namespace_append_segment(const ps_namespace_append *append) {
   return append ? append->segment : 0;
 }
 uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
-  return append ? append->segment - append->data->snapshot_boundary : 0;
+  ps_checkpoint_info coverage;
+  if (!append)
+    return 0;
+  ps_key_checkpoint_info(append->data->checkpoint, &coverage);
+  return append->segment - coverage.segment + (coverage.segment != 0);
 }
 static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
   ps_namespace_append *append = context;
   (void)tail;
-  return ps_ns_head_write(append->data, append->budget, append->segment,
-                          append->data->snapshot_id,
-                          append->data->snapshot_boundary, e);
+  return ps_ns_head_write(append->data, append->budget, append->segment, e);
 }
 int ps_namespace_append_commit(ps_namespace_append *append,
                                enum ps_commit_mode mode, lc_error *e) {
@@ -786,12 +807,15 @@ int ps_namespace_append_commit(ps_namespace_append *append,
     return failure(e, LC_ERR_INVALID,
                    "canonical append differs from its declared complete span");
   selecting = append->segment != append->data->active;
-  rc = ps_record_commit(&append->writer, mode,
-                        selecting ? publish_append_head : NULL, append, e);
+  rc = ps_checkpoint_delta_prepare(append->delta, e);
+  if (rc == LC_OK)
+    rc = ps_record_commit(&append->writer, mode,
+                          selecting ? publish_append_head : NULL, append, e);
   /* Mutation authority remains held until append_close. Only that authority
    * reads this cache; captured readers use their independently pinned tails. */
   if (rc == LC_OK) {
     pthread_mutex_lock(&append->data->mutex);
+    ps_checkpoint_delta_accept(append->delta);
     if (selecting) {
       append->data->pending_seal = append->data->active;
       append->data->active = append->segment;
@@ -808,6 +832,7 @@ int ps_namespace_append_commit(ps_namespace_append *append,
 void ps_namespace_append_close(ps_namespace_append *append) {
   if (!append)
     return;
+  ps_checkpoint_delta_close(append->delta);
   ps_record_abort(&append->writer);
   ps_budget_close(append->budget, NULL);
   ps_ns_leave(append->data);
@@ -856,24 +881,58 @@ int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
   if (!window)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace read window");
   pthread_mutex_lock(&d->mutex);
-  s = ps_ns_find(d, kind, id);
-  if (!s || s->unselected)
-    rc = failure(e, LC_ERR_INVALID, "namespace segment does not exist");
-  else
-    rc = ps_stream_window_open(s->stream, offset, bytes, &window->reader, e);
+  if (kind == PS_CATALOG_SNAPSHOT) {
+    rc = ps_key_checkpoint_read(d->checkpoint, id, &window->value, e);
+    if (rc == LC_OK && (offset > ps_read_size(window->value) ||
+                        bytes > ps_read_size(window->value) - offset))
+      rc = failure(e, LC_ERR_INVALID, "checkpoint read exceeds metadata value");
+  } else {
+    s = ps_ns_find(d, kind, id);
+    if (!s || s->unselected)
+      rc = failure(e, LC_ERR_INVALID, "namespace segment does not exist");
+    else
+      rc = ps_stream_window_open(s->stream, offset, bytes, &window->reader, e);
+  }
   pthread_mutex_unlock(&d->mutex);
   if (rc != LC_OK) {
+    ps_reader_close(window->value);
     lc_free_with_allocator(NULL, window);
     return rc;
   }
   window->ns = ns;
+  window->start = offset;
+  window->end = offset + bytes;
   window->references = 1;
   ps_namespace_retain(ns);
   *out = window;
   return LC_OK;
 }
+static int window_read(void *context, uint64_t offset,
+                       const struct iovec *parts, int count, lc_error *e) {
+  ps_namespace_window *window = context;
+  lc_pouch_record_io io;
+  uint64_t end = offset;
+  int i;
+  if (!window || count < 0 || (count && !parts) || offset < window->start ||
+      offset > window->end)
+    return failure(e, LC_ERR_INVALID, "namespace read exceeds captured window");
+  for (i = 0; i < count; ++i) {
+    if (parts[i].iov_len > window->end - end)
+      return failure(e, LC_ERR_INVALID,
+                     "namespace read exceeds captured window");
+    end += parts[i].iov_len;
+  }
+  io = window->value ? ps_record_value_input(window->value)
+                     : ps_record_window_input(window->reader);
+  return lc_pouch_record_io_read(io, offset, parts, count, e);
+}
 lc_pouch_record_io ps_namespace_read_input(ps_namespace_window *window) {
-  return ps_record_window_input(window ? window->reader : NULL);
+  static const lc_pouch_record_io_ops ops = {window_read, NULL, NULL, NULL,
+                                             NULL};
+  lc_pouch_record_io io;
+  io.ops = &ops;
+  io.context = window;
+  return io;
 }
 void ps_namespace_read_retain(ps_namespace_window *window) {
   __atomic_add_fetch(&window->references, 1, __ATOMIC_RELAXED);
@@ -882,6 +941,7 @@ void ps_namespace_read_close(ps_namespace_window *window) {
   if (!window || __atomic_sub_fetch(&window->references, 1, __ATOMIC_ACQ_REL))
     return;
   ps_stream_window_close(window->reader);
+  ps_reader_close(window->value);
   ps_namespace_release(window->ns);
   lc_free_with_allocator(NULL, window);
 }
@@ -891,6 +951,7 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   ps_namespace_view *view;
   ps_stream_info info;
   size_t i;
+  uint64_t first, count;
   int rc;
   if (out)
     *out = NULL;
@@ -905,26 +966,45 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   view->ns = ns;
   ps_namespace_retain(ns);
   pthread_mutex_lock(&d->mutex);
-  view->count =
-      (size_t)(d->active - d->snapshot_boundary) + (d->snapshot_id ? 1U : 0U);
-  view->items = lc_calloc_with_allocator(NULL, view->count ? view->count : 1,
-                                         sizeof(*view->items));
-  if (!view->items)
+  ++d->views;
+  ps_key_checkpoint_info(d->checkpoint, &view->coverage);
+  rc = ps_values_capture(ns->root->space, ns->identity.owner, PS_KEY_METADATA,
+                         PS_KEY_DECISION, &view->metadata, e);
+  view->active = d->active;
+  view->tail = d->tail;
+  first = view->coverage.segment;
+  if (!first || !ps_ns_find(d, PS_CATALOG_SEGMENT, first))
+    ++first;
+  count = d->active >= first ? d->active - first + 1 : 0;
+  if (rc == LC_OK && count > (uint64_t)((size_t)-1 / sizeof(*view->items)))
+    rc = failure(e, LC_ERR_NOMEM, "namespace capture exceeds local bounds");
+  if (rc == LC_OK)
+    view->count = (size_t)count;
+  if (rc == LC_OK)
+    view->items = lc_calloc_with_allocator(NULL, view->count ? view->count : 1,
+                                           sizeof(*view->items));
+  if (rc == LC_OK && !view->items)
     rc = failure(e, LC_ERR_NOMEM, "cannot capture namespace segments");
   for (i = 0; rc == LC_OK && i < view->count; ++i) {
     captured *c = &view->items[i];
     segment *s;
-    if (d->snapshot_id && !i)
-      s = ps_ns_find(d, PS_CATALOG_SNAPSHOT, d->snapshot_id);
-    else
-      s = ps_ns_find(d, PS_CATALOG_SEGMENT,
-                     d->snapshot_boundary + i + (d->snapshot_id ? 0U : 1U));
-    c->id = s->kind == PS_CATALOG_SNAPSHOT ? 0 : s->id;
+    s = ps_ns_find(d, PS_CATALOG_SEGMENT, first + i);
+    if (!s) {
+      rc = failure(e, LC_ERR_PROTOCOL, "namespace capture has a canonical gap");
+      break;
+    }
+    c->id = s->id;
+    c->start = s->id == view->coverage.segment ? view->coverage.offset : 0;
     strcpy(c->leaf, s->leaf);
     rc = ps_stream_status(s->stream, &info, e);
     if (rc == LC_OK) {
       c->tail = info.tail;
-      rc = ps_stream_window_open(s->stream, 0, c->tail, &c->reader, e);
+      if (c->start > c->tail)
+        rc = failure(e, LC_ERR_PROTOCOL,
+                     "checkpoint coverage exceeds captured tail");
+      else
+        rc = ps_stream_window_open(s->stream, c->start, c->tail - c->start,
+                                   &c->reader, e);
     }
   }
   pthread_mutex_unlock(&d->mutex);
@@ -993,18 +1073,53 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
                                              NULL};
   replay_input input;
   lc_pouch_record_io io;
+  ps_reader *metadata_reader = NULL;
+  ps_key metadata_key;
+  ps_ref metadata_ref;
+  uint64_t metadata_bytes;
+  char *leaf = NULL;
   if (!view || !visit)
     return failure(e, LC_ERR_INVALID,
                    "namespace replay requires view and callback");
   memset(&input, 0, sizeof(input));
   io.ops = &ops;
   io.context = &input;
+  if (view->coverage.epoch) {
+    record.key = LC_POUCH_STATE_HIGH_WATER_KEY;
+    record.control = record.seen = record.has_query_index_seq = 1;
+    record.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
+    record.index_seq = record.version = view->coverage.state_index;
+    record.query_index_seq = view->coverage.query_index;
+    rc = visit(context, 0, &record, e);
+    memset(&record, 0, sizeof(record));
+  }
+  for (i = 0; rc == LC_OK && i < ps_values_count(view->metadata); ++i) {
+    rc = ps_values_info(view->metadata, i, &metadata_key, &metadata_ref,
+                        &metadata_bytes, e);
+    if (rc == LC_OK) {
+      leaf = lc_pouch_namespace_snapshot_leaf(&allocator, metadata_key.key);
+      if (!leaf)
+        rc = failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint slot label");
+    }
+    if (rc == LC_OK)
+      rc = ps_values_read_open(view->metadata, i, &metadata_reader, e);
+    if (rc == LC_OK)
+      rc = ps_checkpoint_record_read(metadata_reader, &allocator, leaf, &record,
+                                     e);
+    if (rc == LC_OK)
+      rc = visit(context, 0, &record, e);
+    ps_reader_close(metadata_reader);
+    metadata_reader = NULL;
+    lc_free_with_allocator(&allocator, leaf);
+    leaf = NULL;
+    lc_pouch_state_entry_cleanup(&allocator, &record);
+  }
   for (i = 0; rc == LC_OK && i < view->count; ++i) {
     captured *c = &view->items[i];
     input.window = c->reader;
     input.end = c->tail;
     input.used = 0;
-    cursor = 0;
+    cursor = c->start;
     while (rc == LC_OK && cursor < c->tail) {
       rc = ps_frame_read(io, cursor, c->tail, &scratch, &frame, e);
       inner = frame.start;
@@ -1040,6 +1155,95 @@ void ps_namespace_view_close(ps_namespace_view *view) {
     for (i = 0; i < view->count; ++i)
       ps_stream_window_close(view->items[i].reader);
   lc_free_with_allocator(NULL, view->items);
+  ps_values_close(view->metadata);
+  pthread_mutex_lock(&view->ns->data->mutex);
+  --view->ns->data->views;
+  pthread_mutex_unlock(&view->ns->data->mutex);
   ps_namespace_release(view->ns);
   lc_free_with_allocator(NULL, view);
+}
+
+static int checkpoint_replay(void *context, uint64_t segment,
+                             const lc_pouch_state_entry *entry, lc_error *e) {
+  if (!segment)
+    return LC_OK; /* Selected slots were loaded by the checkpoint owner. */
+  return ps_key_checkpoint_replay(context, entry, e);
+}
+static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
+  ps_key_checkpoint *fresh = NULL, *old;
+  ps_namespace_view *view = NULL;
+  size_t i;
+  int rc;
+  if (d->checkpoint_ready)
+    return LC_OK;
+  rc = ps_key_checkpoint_open(d->ns, &fresh, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_view_open(d->ns, &view, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_view_visit(view, 0, checkpoint_replay, fresh, e);
+  if (rc == LC_OK) {
+    for (i = 0; i < view->count; ++i)
+      ps_key_checkpoint_replayed(fresh, view->items[i].id, view->items[i].tail);
+  }
+  ps_namespace_view_close(view);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&d->mutex);
+    if (d->checkpoint_observer.prepare)
+      (void)ps_key_checkpoint_observe(fresh, &d->checkpoint_observer, NULL);
+    old = d->checkpoint;
+    d->checkpoint = fresh;
+    d->checkpoint_ready = 1;
+    pthread_mutex_unlock(&d->mutex);
+    ps_key_checkpoint_close(old);
+  } else
+    ps_key_checkpoint_close(fresh);
+  return rc;
+}
+int ps_namespace_checkpoint_observe(ps_namespace *ns,
+                                    const ps_checkpoint_observer *observer,
+                                    lc_error *e) {
+  struct ps_namespace_data *d;
+  int rc;
+  if (!observer || !observer->prepare || !observer->finish)
+    return failure(e, LC_ERR_INVALID,
+                   "checkpoint observation needs complete callbacks");
+  rc = ps_ns_data_get(ns, &d, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&d->mutex);
+    d->checkpoint_observer = *observer;
+    rc = ps_key_checkpoint_observe(d->checkpoint, observer, e);
+    pthread_mutex_unlock(&d->mutex);
+  }
+  return rc;
+}
+int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
+  struct ps_namespace_data *d;
+  int rc = ps_ns_data_get(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_ns_enter(d, e);
+  if (rc == LC_OK) {
+    rc = checkpoint_ready(d, e);
+    if (rc == LC_OK)
+      rc = ps_ns_finish_seal(d, e);
+    if (rc == LC_OK) {
+      pthread_mutex_lock(&d->mutex);
+      rc = ps_key_checkpoint_flush(d->checkpoint, e);
+      pthread_mutex_unlock(&d->mutex);
+    }
+    ps_ns_leave(d);
+  }
+  return rc;
+}
+uint64_t ps_namespace_source_refs(ps_namespace *ns, unsigned int kind,
+                                  uint64_t id) {
+  struct ps_namespace_data *d;
+  uint64_t refs = UINT64_MAX;
+  if (ps_ns_data_get(ns, &d, NULL) != LC_OK)
+    return refs;
+  pthread_mutex_lock(&d->mutex);
+  if (d->checkpoint_ready)
+    refs = ps_key_checkpoint_source_refs(d->checkpoint, kind, id);
+  pthread_mutex_unlock(&d->mutex);
+  return refs;
 }

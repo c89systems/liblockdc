@@ -1,6 +1,7 @@
 #ifndef POUCH_SPACE_NAMESPACE_INTERNAL_H
 #define POUCH_SPACE_NAMESPACE_INTERNAL_H
 #include "budget.h"
+#include "checkpoint.h"
 #include "namespace.h"
 #include "record_io.h"
 #include "root_internal.h"
@@ -11,7 +12,7 @@ typedef struct ps_ns_label {
   char value[PS_NS_LEAF_BYTES];
 } ps_ns_label;
 typedef struct ps_ns_resource {
-  uint64_t id;
+  uint64_t id, covered;
   unsigned int kind;
   const char *leaf;
   ps_ns_label *label;
@@ -25,10 +26,11 @@ struct ps_namespace_data {
   pthread_mutex_t mutex;
   ps_ns_resource **items, *retired;
   ps_ns_label *labels;
-  size_t count, capacity;
+  size_t count, capacity, views;
   uint64_t active, tail, pending_seal;
-  uint64_t snapshot_id, snapshot_boundary;
-  int busy, snapshot_building;
+  ps_key_checkpoint *checkpoint;
+  ps_checkpoint_observer checkpoint_observer;
+  int busy, checkpoint_ready;
   int retention_loaded, retention_present;
 };
 
@@ -43,7 +45,8 @@ ps_ns_resource *ps_ns_find(struct ps_namespace_data *, unsigned int, uint64_t);
 void ps_ns_insert(struct ps_namespace_data *, ps_ns_resource *);
 void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 
-/* Mutation authority is brief and never spans a snapshot's producer. */
+/* Mutation authority never spans an application producer while holding a mutex.
+ */
 int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
 void ps_ns_leave(struct ps_namespace_data *);
@@ -52,6 +55,6 @@ int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
                         lc_error *);
 int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);
 int ps_ns_head_write(struct ps_namespace_data *, ps_budget *, uint64_t active,
-                     uint64_t snapshot, uint64_t boundary, lc_error *);
+                     lc_error *);
 
 #endif

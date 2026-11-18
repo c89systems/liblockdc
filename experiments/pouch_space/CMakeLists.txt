@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_snapshot.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_reclaim.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -494,13 +494,13 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_namespace_test)
-  foreach(mode lifecycle faults concurrency validation reservation publication snapshots snapshot-faults snapshot-concurrency snapshot-churn bodies body-budget body-budget-faults append-budget append-budget-faults snapshot-budget snapshot-budget-faults)
+  foreach(mode lifecycle faults concurrency validation reservation publication bodies body-budget body-budget-faults append-budget append-budget-faults)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
-  set_tests_properties(pouch_space_namespace_body-budget-faults pouch_space_namespace_append-budget-faults pouch_space_namespace_snapshot-budget-faults PROPERTIES TIMEOUT 600)
+  set_tests_properties(pouch_space_namespace_body-budget-faults pouch_space_namespace_append-budget-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_state_record_test state_record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_state_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_state_record_test PRIVATE pouch_space_experiment)
@@ -570,11 +570,12 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode revision revision-faults revision-concurrency revision-process revision-values)
+  foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
+  set_tests_properties(pouch_space_checkpoint-faults PROPERTIES TIMEOUT 600)
   add_test(NAME pouch_space_budget COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget)
   add_test(NAME pouch_space_budget-capacity COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} budget-capacity)
   foreach(mode value-budget value-budget-capacity value-budget-faults value-budget-concurrency value-budget-process)
