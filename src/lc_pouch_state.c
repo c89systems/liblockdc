@@ -364,8 +364,9 @@ static int lc_pouch_state_cache_active_append_fd(
 static int lc_pouch_state_storage_prepare(lc_pouch *, const char *, lc_error *);
 static int lc_pouch_state_storage_append_open(
     lc_pouch *, lc_pouch_namespace_logstore *, uint64_t,
-    enum lc_pouch_storage_append_mode, lc_pouch_namespace_manifest *,
-    lc_pouch_storage_append *, uint64_t *, lc_error *);
+    enum lc_pouch_storage_append_mode, const lc_pouch_storage_batch *,
+    lc_pouch_namespace_manifest *, lc_pouch_storage_append *, uint64_t *,
+    lc_error *);
 static void lc_pouch_state_storage_append_publish(lc_pouch *,
                                                   lc_pouch_namespace_logstore *,
                                                   lc_pouch_namespace_manifest *,
@@ -6725,6 +6726,20 @@ cleanup:
   return rc;
 }
 
+static int lc_pouch_state_batch_prefix(void *context, size_t index,
+                                       lc_pouch_record_header *header,
+                                       const void **key, const void **metadata,
+                                       lc_error *error) {
+  const lc_pouch_state_binary_append_item *items = context;
+  (void)error;
+  memset(header, 0, sizeof(*header));
+  header->type = items[index].record_type;
+  header->key_len = items[index].key_len;
+  header->meta_len = items[index].meta_len;
+  *key = items[index].key;
+  *metadata = items[index].meta;
+  return LC_OK;
+}
 static int lc_pouch_state_append_binary_records_locked(
     lc_pouch *pouch, const char *ns, lc_pouch_namespace_manifest *manifest,
     lc_pouch_state_binary_append_item *items, size_t item_count,
@@ -6745,6 +6760,7 @@ static int lc_pouch_state_append_binary_records_locked(
   size_t index;
   int query_index_changed;
   enum lc_pouch_storage_append_mode storage_mode;
+  lc_pouch_storage_batch storage_batch;
   lc_pouch_storage_append storage_append;
   lc_pouch_record_io record_io;
 
@@ -6818,12 +6834,15 @@ static int lc_pouch_state_append_binary_records_locked(
   if (pouch->storage.ops != NULL) {
     /* Never inspect a borrowed manifest captured before the append gate:
      * another completed writer may have rotated or invalidated its owner. */
+    storage_batch.count = item_count;
+    storage_batch.prefix = lc_pouch_state_batch_prefix;
+    storage_batch.context = items;
     rc = lc_pouch_state_storage_prepare(pouch, ns, error);
     if (rc == LC_OK) {
       cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
       rc = lc_pouch_state_storage_append_open(
-          pouch, cache, record_size, storage_mode, manifest, &storage_append,
-          &segment_size, error);
+          pouch, cache, record_size, storage_mode, &storage_batch, manifest,
+          &storage_append, &segment_size, error);
     }
     if (rc != LC_OK)
       return rc;
@@ -13932,16 +13951,16 @@ static int lc_pouch_state_key_check(const char *key, lc_error *error) {
 
 static int lc_pouch_state_storage_append_open(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache, uint64_t overhead,
-    enum lc_pouch_storage_append_mode mode,
+    enum lc_pouch_storage_append_mode mode, const lc_pouch_storage_batch *batch,
     lc_pouch_namespace_manifest *manifest, lc_pouch_storage_append *append,
     uint64_t *start, lc_error *error) {
   char *leaf = NULL;
   uint64_t target = pouch->segment_target_bytes > overhead
                         ? pouch->segment_target_bytes - overhead + 1
                         : 1;
-  int rc = pouch->storage.ops->append_begin(pouch->storage.context,
-                                            cache->storage_namespace, target,
-                                            overhead, mode, append, error);
+  int rc = pouch->storage.ops->append_begin(
+      pouch->storage.context, cache->storage_namespace, target, overhead, mode,
+      batch, append, error);
   if (rc != LC_OK)
     return rc;
   if (cache->active_segment_leaf == NULL ||
@@ -14321,7 +14340,7 @@ static int lc_pouch_state_write_resolved_locked(
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
     rc = lc_pouch_state_storage_append_open(
         pouch, cache, LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key),
-        LC_POUCH_STORAGE_APPEND_PREFIX, &manifest, &storage_append,
+        LC_POUCH_STORAGE_APPEND_PREFIX, NULL, &manifest, &storage_append,
         &segment_size, error);
     if (rc != LC_OK) {
       lc_pouch_state_append_lock_release(&append_lock);

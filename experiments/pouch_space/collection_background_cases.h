@@ -224,19 +224,21 @@ static void background_discovery(const char *directory, int codec, int sync) {
   ps_root *root = client_root(&f);
   ok(ps_root_namespace_acquire(root, "cold/\303\245", 0, &ns, &f.error),
      &f.error);
-  REQUIRE(!ns->data && !ns->collections);
+  struct ps_namespace_data *recovered = ns->data;
+  REQUIRE(recovered && !ns->collections);
   ok(lc_collection_maintenance_next(fixture_pouch(&f), NULL, &name, &cursor,
                                     &f.error),
      &f.error);
-  REQUIRE(name && !strcmp(name, "cold/\303\245") && cursor && !ns->data &&
-          !ns->collections);
+  REQUIRE(name && !strcmp(name, "cold/\303\245") && cursor &&
+          ns->data == recovered && !ns->collections);
   lc_free_with_allocator(NULL, name);
   lc_free_with_allocator(NULL, cursor);
   name = cursor = NULL;
   ok(ps_namespace_work_next(root, NULL, LC_POUCH_STORAGE_WORK_ORDINARY, NULL,
                             &name, &cursor, &f.error),
      &f.error);
-  REQUIRE(name && !strcmp(name, "ordinary") && !ns->data && !ns->collections);
+  REQUIRE(name && !strcmp(name, "ordinary") && ns->data == recovered &&
+          !ns->collections);
   lc_free_with_allocator(NULL, name);
   lc_free_with_allocator(NULL, cursor);
   ps_namespace_release(ns);
@@ -257,7 +259,7 @@ static void background_discovery(const char *directory, int codec, int sync) {
   ok(ps_root_namespace_acquire(root, "ordinary", 0, &ns, &f.error), &f.error);
   ps_namespace_status status;
   ok(ps_namespace_status_get(ns, &status, &f.error), &f.error);
-  REQUIRE(status.snapshot);
+  REQUIRE(status.checkpoint_epoch);
   ps_namespace_release(ns);
   lc_collection_close(cold);
   lc_collection_close(hot);
@@ -441,13 +443,17 @@ static void background_protected(const char *directory, int codec, int sync) {
   ok(ps_root_namespace_acquire(client_root(&f), "journal", 0, &ns, &f.error),
      &f.error);
   ok(ps_namespace_status_get(ns, &status, &f.error), &f.error);
-  REQUIRE(!status.snapshot);
+  REQUIRE(status.active_segment &&
+          (status.checkpoint_keys || status.pending_keys));
+  /* Key checkpoints can represent live stages. Maintenance must preserve the
+   * staged value itself, rather than avoid every metadata checkpoint. */
+  state_body(&f, "journal", "state/.staging/live-transaction", 512U);
   int discarded = 0;
   ok(lc_pouch_state_discard_staged(fixture_pouch(&f), "journal", "state",
                                    "live-transaction", &discarded, &f.error),
      &f.error);
   REQUIRE(discarded);
-  ok(ps_namespace_append_begin(ns, 0U, 4096U, PS_APPEND_PREFIX, &upload,
+  ok(ps_namespace_append_begin(ns, 0U, 4096U, PS_APPEND_PREFIX, NULL, &upload,
                                &f.error),
      &f.error);
   (void)append(f.collection, "during-upload", 80U, &f.error);

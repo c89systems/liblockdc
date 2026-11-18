@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_CHECKPOINT_H
 #define POUCH_SPACE_CHECKPOINT_H
+#include "budget.h"
 #include "checkpoint_record.h"
 #include "lc_pouch_storage.h"
 #include "namespace.h"
@@ -31,10 +32,15 @@ void ps_key_checkpoint_info(ps_key_checkpoint *, ps_checkpoint_info *);
  * ordinary prefixes must preserve that floor after funding their claims.
  * Preparation decodes only completed private metadata. Accept is infallible
  * after canonical commit. */
-int ps_checkpoint_delta_begin(ps_key_checkpoint *, ps_record_writer *,
-                              uint64_t segment, const char *leaf,
-                              int maintenance, ps_checkpoint_delta **,
-                              lc_error *);
+int ps_checkpoint_delta_open(ps_key_checkpoint *, int maintenance,
+                             ps_checkpoint_delta **, lc_error *);
+int ps_checkpoint_delta_plan(ps_checkpoint_delta *,
+                             const lc_pouch_storage_batch *, uint64_t,
+                             ps_budget_plan *, lc_error *);
+int ps_checkpoint_delta_fund(ps_checkpoint_delta *, ps_budget *,
+                             const ps_budget_plan *, lc_error *);
+int ps_checkpoint_delta_bind(ps_checkpoint_delta *, ps_record_writer *,
+                             uint64_t segment, const char *leaf, lc_error *);
 int ps_checkpoint_delta_prepare(ps_checkpoint_delta *, lc_error *);
 void ps_checkpoint_delta_accept(ps_checkpoint_delta *);
 void ps_checkpoint_delta_close(ps_checkpoint_delta *);

@@ -275,14 +275,16 @@ static void writer(const char *path) {
       ps_namespace_status status;
       ok(ps_root_open(path, 1, &o, &root, &e), &e);
       ok(ps_root_namespace_acquire(root, "frame", 1, &ns, &e), &e);
-      ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &e),
+      ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                                   &e),
          &e);
       ok(append_body(root, append, sizes[which], 1, &e), &e);
       ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
       ps_namespace_append_close(append);
       ok(ps_namespace_status_get(ns, &status, &e), &e);
       uint64_t n = status.tail;
-      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &append, &e),
+      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL, &append,
+                                   &e),
          &e);
       ok(append_body(root, append, sizes[which], 2, &e), &e);
       if (failure == 1) {
@@ -316,7 +318,8 @@ static void writer(const char *path) {
       } else
         ok(ps_check(ps_root_space(root), &e), &e);
       if (failure) {
-        ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &append, &e),
+        ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL,
+                                     &append, &e),
            &e);
         ok(append_body(root, append, sizes[which], 2, &e), &e);
         ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
@@ -358,7 +361,8 @@ static void recovery(const char *path) {
       ok(ps_root_open(path, 1, &o, &root, &e), &e);
       ok(ps_root_namespace_acquire(root, "frame", 1, &ns, &e), &e);
       ok(ps_namespace_identity(ns, &identity, &e), &e);
-      ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &e),
+      ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                                   &e),
          &e);
       ok(append_body(root, append, 0, 1, &e), &e);
       ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
@@ -368,8 +372,8 @@ static void recovery(const char *path) {
       ok(ps_checkpoint(ps_root_space(root), &e), &e);
       ps_namespace_view *pin = NULL;
       ok(ps_namespace_view_open(ns, &pin, &e), &e);
-      ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE, &append,
-                                   &e),
+      ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE, NULL,
+                                   &append, &e),
          &e);
       ok(append_body(root, append, 0, 2, &e), &e);
       ok(append_body(root, append, 0, 3, &e), &e);
@@ -434,31 +438,34 @@ static void recovery(const char *path) {
       ps_owned_close(head);
       ok(ps_close(space, &e), &e);
 
-      ok(ps_root_open(path, 0, &o, &root, &e), &e);
-      ok(ps_root_namespace_acquire(root, "frame", 0, &ns, &e), &e);
-      int rc = ps_namespace_status_get(ns, &status, &e);
+      int rc = ps_root_open(path, 0, &o, &root, &e);
       if (damage >= 3 && damage <= 5) {
-        REQUIRE(rc == LC_ERR_PROTOCOL);
+        /* The root restores every namespace's checkpoint debt before opening
+         * ordinary admission, so trusted-prefix damage fails at root open. */
+        REQUIRE(rc == LC_ERR_PROTOCOL && !root);
         clear(&e);
-      } else {
-        ok(rc, &e);
-        REQUIRE(status.tail == (damage == 1 || damage == 2 ? n : n + bytes));
-        ps_namespace_view *view = NULL;
-        v.count = 0;
-        v.ns = ns;
-        ok(ps_namespace_view_open(ns, &view, &e), &e);
-        ok(ps_namespace_view_visit(view, 1, inspect, &v, &e), &e);
-        REQUIRE(v.count == (damage == 1 || damage == 2 ? 1 : 3));
-        ps_namespace_view_close(view);
-        if (damage == 1 || damage == 2) {
-          ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE,
-                                       &append, &e),
-             &e);
-          ok(append_body(root, append, 0, 2, &e), &e);
-          ok(append_body(root, append, 0, 3, &e), &e);
-          ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
-          ps_namespace_append_close(append);
-        }
+        REQUIRE(unlink(path) == 0);
+        continue;
+      }
+      ok(rc, &e);
+      ok(ps_root_namespace_acquire(root, "frame", 0, &ns, &e), &e);
+      ok(ps_namespace_status_get(ns, &status, &e), &e);
+      REQUIRE(status.tail == (damage == 1 || damage == 2 ? n : n + bytes));
+      ps_namespace_view *view = NULL;
+      v.count = 0;
+      v.ns = ns;
+      ok(ps_namespace_view_open(ns, &view, &e), &e);
+      ok(ps_namespace_view_visit(view, 1, inspect, &v, &e), &e);
+      REQUIRE(v.count == (damage == 1 || damage == 2 ? 1 : 3));
+      ps_namespace_view_close(view);
+      if (damage == 1 || damage == 2) {
+        ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE, NULL,
+                                     &append, &e),
+           &e);
+        ok(append_body(root, append, 0, 2, &e), &e);
+        ok(append_body(root, append, 0, 3, &e), &e);
+        ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
+        ps_namespace_append_close(append);
       }
       ps_namespace_release(ns);
       ok(ps_root_close(root, &e), &e);

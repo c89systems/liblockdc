@@ -579,7 +579,8 @@ static void durable_scope(const char *path, const char *directory) {
                                    &e),
          &e);
       ok(ps_namespace_status_get(held, &before, &e), &e);
-      ok(ps_namespace_append_begin(held, 0, 10, PS_APPEND_PREFIX, &private, &e),
+      ok(ps_namespace_append_begin(held, 0, 10, PS_APPEND_PREFIX, NULL,
+                                   &private, &e),
          &e);
       REQUIRE(ps_namespace_append_commit(private, (enum ps_commit_mode)2, &e) ==
               LC_ERR_INVALID);
@@ -3414,8 +3415,8 @@ static void lifetime_exhaustion(const char *path, int multifile,
                                       e),
        e);
     ok(p->storage.ops->append_begin(p->storage.context, ns, 0, 48,
-                                    LC_POUCH_STORAGE_APPEND_COMPLETE, &append,
-                                    e),
+                                    LC_POUCH_STORAGE_APPEND_COMPLETE, NULL,
+                                    &append, e),
        e);
     ok(lc_pouch_state_record_write_high_water(&allocator, append.io, UINT64_MAX,
                                               0, e),
@@ -4555,7 +4556,7 @@ static lc_pouch_generation staged_decision(lc_pouch *p, unsigned char kind,
        e);
     ok(p->storage.ops->append_begin(
            p->storage.context, ns, 1, 32 + strlen(key) + sizeof(meta),
-           LC_POUCH_STORAGE_APPEND_COMPLETE, &append, e),
+           LC_POUCH_STORAGE_APPEND_COMPLETE, NULL, &append, e),
        e);
     io = append.io;
   } else {

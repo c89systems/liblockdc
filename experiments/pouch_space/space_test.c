@@ -6686,7 +6686,8 @@ static void grant_budget_plans(void) {
   OK(ps_budget_plan_routing(&p, 0, &error));
   OK(ps_budget_plan_span(&p, PS_PAGE - PS_RUN_HEADER + 1, &error));
   CHECK(p.payload_bytes == 4 * PS_PAGE &&
-        p.metadata_bytes == 80 + 111 + 88 + 2 * PS_OWNED_DESCRIPTOR_BYTES &&
+        p.metadata_bytes ==
+            80 + 111 + 112 + 24 + 2 * PS_OWNED_DESCRIPTOR_BYTES &&
         p.entries == 5 && !p.maintenance);
   before = p;
   BAD(ps_budget_plan_span(&p, UINT64_MAX, &error));
@@ -6714,6 +6715,41 @@ static void grant_budget_plans(void) {
   memset(&p, 0, sizeof(p));
   OK(ps_budget_plan_span(&p, 0, &error));
   CHECK(!p.payload_bytes && !p.metadata_bytes && !p.entries);
+}
+static void routing_budget_packing(void) {
+  unsigned char bytes[PS_PAGE];
+  memset(bytes, 0x6b, sizeof(bytes));
+  for (int durable = 0; durable < 2; ++durable)
+    for (int replace = 0; replace < 2; ++replace) {
+      clean();
+      ps_space *s = create(PS_DEFAULT_CAPACITY, durable, NULL);
+      ps_key route = key(PS_ROUTING, 10, 2);
+      if (replace)
+        (void)put(s, route, bytes, 128, 128);
+      /* Leave exactly one cell; the new 128-byte head must split over two
+       * extents, including when replacing a one-extent head. */
+      size_t fill = PS_PAGE - (replace ? 3 : 1) * PS_CELL;
+      (void)put(s, state(1), bytes, fill, fill);
+      ps_budget_plan plan = {0}, remaining;
+      ps_budget *budget = NULL;
+      ps_writer *writer = NULL;
+      OK(ps_budget_plan_routing(&plan, !replace, &error));
+      OK(ps_budget_open(s, &plan, &budget, &error));
+      OK(ps_begin(s, budget, route, &writer, &error));
+      OK(ps_write(writer, bytes, 128, &error));
+      OK(ps_publish(writer, NULL, &error));
+      ps_writer_close(writer);
+      OK(ps_budget_status(budget, &remaining, &error));
+      CHECK(!remaining.metadata_bytes);
+      OK(ps_budget_close(budget, &error));
+      expect(s, route, NULL, bytes, 128);
+      OK(ps_flush(s, &error));
+      OK(ps_close(s, &error));
+      s = reopen(NULL);
+      expect(s, route, NULL, bytes, 128);
+      OK(ps_close(s, &error));
+    }
+  clean();
 }
 static void grant_budget_capacity(int durable, int fragmented, int preferred) {
   ps_space *s;
@@ -7454,6 +7490,7 @@ int main(int argc, char **argv) {
           grant_budget_capacity(durable, fragmented, 1);
     } else if (strcmp(argv[2], "grant-budget") == 0) {
       grant_budget_plans();
+      routing_budget_packing();
       grant_budget_rejections();
       for (int durable = 0; durable < 2; ++durable)
         for (int fragmented = 0; fragmented < 2; ++fragmented)

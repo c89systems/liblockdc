@@ -9,6 +9,7 @@ typedef struct ps_namespace_append ps_namespace_append;
 typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_body ps_namespace_body;
+struct lc_pouch_storage_batch;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
   PS_APPEND_COMPLETE,
@@ -86,6 +87,11 @@ int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
  * corruption in required checkpoint metadata or an uncovered trusted prefix
  * is an error. Covered history is not replayed; referenced bodies are checked
  * when consumed.
+ * A non-NULL batch enumerates known key/metadata ceilings during admission;
+ * checkpoint debt and the canonical span share one compound capacity claim.
+ * Actual prefixes must stay within those ceilings. The callback is borrowed
+ * only until this call returns. NULL retains incremental prefix admission for
+ * producers whose prefixes are not known ahead of time.
  * Plan successor, binding, grants and head selection before staging. Preferred
  * geometric growth falls back to an exact claim near capacity. Commit selects
  * its head only after canonical
@@ -94,6 +100,7 @@ int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
  * for durable routing before the next mutation proceeds. */
 int ps_namespace_append_begin(ps_namespace *, uint64_t target, uint64_t minimum,
                               enum ps_namespace_append_mode,
+                              const struct lc_pouch_storage_batch *,
                               ps_namespace_append **, lc_error *);
 lc_pouch_record_io ps_namespace_append_output(ps_namespace_append *);
 /* Label remains stable after append close while a namespace pin is held. */

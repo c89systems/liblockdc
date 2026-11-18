@@ -494,13 +494,13 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_namespace_test)
-  foreach(mode lifecycle faults concurrency validation reservation publication bodies body-budget body-budget-faults append-budget append-budget-faults)
+  foreach(mode lifecycle faults concurrency validation reservation publication bodies body-budget body-budget-faults append-budget append-budget-faults batch-admission batch-faults budget-transfer)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
-  set_tests_properties(pouch_space_namespace_body-budget-faults pouch_space_namespace_append-budget-faults PROPERTIES TIMEOUT 600)
+  set_tests_properties(pouch_space_namespace_body-budget-faults pouch_space_namespace_append-budget-faults pouch_space_namespace_batch-faults PROPERTIES TIMEOUT 600)
   add_executable(pouch_space_state_record_test state_record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_state_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_state_record_test PRIVATE pouch_space_experiment)

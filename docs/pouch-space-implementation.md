@@ -3646,6 +3646,126 @@ codec conversion and shared-root coordination/recovery also remain. The full goa
 is active, multifile remains the default/reference, and production cutover still
 requires an explicit deployment decision.
 
+### Compound canonical batch admission
+
+The production binary-record path now supplies its known key and metadata
+prefixes through the typed storage boundary. The container plans all changed-key
+checkpoint and coverage costs before creating the private source/frame, and
+combines the additional credits with its source, grant, binding and routing
+plan. One parent budget admits those costs together. Future deletion requirements
+are raised during planning and unused or rejected changes restore their previous
+requirements. Planning visits the declared prefixes and their key slots, without
+walking unrelated keys or reading application bodies.
+
+The space owner can transfer unspent credits from that parent into the existing
+checkpoint completion owner. This transfer changes no aggregate root claim or
+checkpoint workspace, allocates nothing and performs no I/O, trimming or second
+capacity admission. The source cannot have active writers; the destination may.
+Ordinary credits can fund completion, while maintenance credits cannot become
+ordinary credits. Handle lifetime and failed-attempt accounting retain the
+existing budget contract.
+
+Actual prefixes must belong to the admitted key set and stay inside its metadata
+and future-deletion ceilings. They cannot introduce additional checkpoint debt
+after peers consume the remaining ordinary capacity. A declared span mismatch,
+provider error or later undeclared key fails without selecting a partial frame.
+The prefix provider is borrowed only until admission returns. Query/index facts
+can still change during ordinary generation assignment within the admitted
+bounds. Even when existing grants and funded key debt make the additional plan
+empty, a new ordinary frame checks the foreground floor. Already admitted work
+does not pay that floor again.
+
+The common path borrows its existing binary item array; this adds no body buffer,
+spool or application serialization pass. Unknown prefixes, including the normal
+body-producing streaming path, retain incremental prefix admission through the
+same append owner. Public C APIs, ABI and persistence representations are
+unchanged. This completes admission for a known canonical participant frame;
+it does not yet admit an entire transaction journal and all participants as one
+compound operation.
+
+Qualification also found a routing capacity omission: a 128-byte replacement
+head can split across two packed tails even when its predecessor has one extent.
+Routing plans now allow 112 metadata bytes for creation and 24 positive-growth
+bytes for replacement. The regression fixture leaves exactly one cell in a packed
+page, then creates or replaces the head through its budget and checks readback
+after reopen, under both policies.
+
+Evidence is in ignored `build/pouch-space-batches/`:
+
+- 28 targeted Debug ASan/UBSan groups pass, including public staging, metadata
+  mutation/capacity, lease phases and coordinated expiry, checkpoint/deletion
+  ownership, frame recovery, budget primitives and four standard source/API
+  boundary checks. Two fixtures still assumed lazy namespace recovery; their
+  focused rerun passes after asserting trusted-prefix rejection at root open and
+  independent readers/writers while a source read is blocked. See
+  `qualified-debug.log` and `fixtures-debug.log`. Two collection background
+  groups additionally pass under both policies (`collection-debug.log`), with
+  discovery preserving the recovered owner and live staged bodies surviving
+  maintenance through the current key-checkpoint representation.
+- GNU Release passes 15 selected groups, including durable outbox and
+  cross-namespace transaction workflows; musl Release passes 13. These are
+  `qualified-gnu.log` and `qualified-musl.log`.
+- The new planned-batch fault mode covers 246 allocation and 144 write/sync cuts
+  across both policies and initial/rotating sources. Each path checks retry and
+  reopen authority. The incremental mode independently covers the same cut
+  counts. The default-capacity batch fixture holds remaining capacity in a peer,
+  checkpoints while the frame is private, finishes two keys and their checkpoint
+  under that peer, and verifies bodies before and after reopen. It also checks
+  a blocked prefix provider, independent writer/reader progress, undeclared-key
+  rejection before prefix advancement, and retry. Cut counts are retained in
+  `fault-cuts.log`.
+- Three TSan scenarios pass with instrumented OpenSSL 3.6.5 and no suppressions:
+  batch preflight concurrency, blocked-reader concurrency and public staging
+  concurrency. Two strict Memcheck probes cover batch admission and credit
+  transfer: 15,105 allocations and frees, zero errors, zero heap at exit and only
+  the three inherited file descriptors.
+
+The matched performance probe alternates the frozen retention build (`ed37a4e3`)
+and this batch across eight configurations, with three samples each: 24 x 4 KiB
+or 8 x 64 KiB bodies, one/four writers and both policies, using preopened owners.
+The indexed workload has four rounds (48 runs). The staged workload has two
+rounds and also measures the current multifile owner (72 runs). Every run checks
+readback and reopen. The table reports the median of the four per-configuration
+ratios for each policy, after taking each configuration's three-sample median.
+Values below one mean less elapsed time or CPU. Work excludes close and reopen.
+
+| Measurement / frozen container | NoSync | Durable |
+| --- | ---: | ---: |
+| Staged work | 1.04x | 1.02x |
+| Staged work CPU | 1.02x | 1.07x |
+| Staged reopen | 1.02x | 1.11x |
+| Staged reopen plus readback | 1.02x | 1.02x |
+| Staged close | 0.93x | 1.07x |
+| Indexed work | 0.92x | 0.96x |
+| Indexed work CPU | 1.00x | 0.96x |
+| Indexed worker | 0.76x | 0.95x |
+| Indexed reopen plus verification | 0.97x | 1.00x |
+| Indexed close | 0.94x | 0.94x |
+
+Staged work ratios range from 0.74-1.11x for NoSync and 0.88-1.09x for durable
+work against the frozen container. Its durable CPU ratios range from
+0.87-1.37x; this is not proof of no regression. Current median staged work is
+35.0/263.5 ms, reopen is 9.35/3.16 ms, reopen plus readback is 10.03/3.74 ms,
+and close is 0.071/0.072 ms (NoSync/durable). Indexed-worker medians are
+42.9/41.3 ms, reopen plus verification 7.31/6.92 ms and close 0.52/0.61 ms.
+These are small-host observations with ordinary OS caching, not cold-disk or
+production latency commitments.
+
+Against multifile, current staged work is 2.06x/0.70x and CPU 1.43x/1.01x;
+reopen is 14.15x/3.69x and reopen plus readback 4.13x/1.43x. Container close is
+much shorter, with ratios 0.002x/0.004x, and is kept separate rather than used to
+hide work or readiness cost. The NoSync work and reopen gaps remain unresolved.
+The complete measurements and calculation are `paired-performance.log`,
+`paired-performance.sh`, `performance-summary.tsv` and
+`summarize-performance.awk` in the same evidence directory.
+
+Full public expiry and transactional messaging at capacity still need admission
+and recovery of the journal/participant/lease/attachment operation as a whole.
+Inherited checksum proof, abandoned private-grant cleanup, collection REGION
+relocation, codec conversion and shared-root coordination/recovery also remain.
+The full goal stays active. Multifile remains the default/reference, and
+production cutover requires an explicit deployment decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

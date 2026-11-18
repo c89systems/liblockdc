@@ -1,5 +1,6 @@
 #ifndef LC_POUCH_STORAGE_H
 #define LC_POUCH_STORAGE_H
+#include "lc_pouch_record.h"
 #include "lc_pouch_retention.h"
 #include "lc_pouch_state_record.h"
 
@@ -103,6 +104,18 @@ enum lc_pouch_storage_append_mode {
   LC_POUCH_STORAGE_APPEND_COMPLETE,
   LC_POUCH_STORAGE_APPEND_MAINTENANCE
 };
+/* Known canonical prefixes, borrowed only during append admission. No producer
+ * or payload I/O runs in this callback. Query/index values may change later;
+ * the owner admits metadata/deletion ceilings for the declared key set. */
+typedef int (*lc_pouch_storage_prefix_fn)(void *, size_t,
+                                          lc_pouch_record_header *,
+                                          const void **, const void **,
+                                          lc_error *);
+typedef struct lc_pouch_storage_batch {
+  size_t count;
+  lc_pouch_storage_prefix_fn prefix;
+  void *context;
+} lc_pouch_storage_batch;
 enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFAULT = 0,
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
@@ -153,7 +166,8 @@ typedef struct lc_pouch_storage_ops {
    */
   int (*append_begin)(void *, void *, uint64_t, uint64_t,
                       enum lc_pouch_storage_append_mode,
-                      lc_pouch_storage_append *, lc_error *);
+                      const lc_pouch_storage_batch *, lc_pouch_storage_append *,
+                      lc_error *);
   /* DEFER_SYNC belongs to the calling logical cleanup scope. Its completed
    * prefix must be flushed before that scope acknowledges durability. */
   int (*append_commit)(void *, lc_pouch_storage_append *,

@@ -67,6 +67,7 @@ static void clear(lc_error *e) {
   lc_error_init(e);
 }
 static lc_allocator allocator;
+static ps_budget *capacity_peer(ps_space *, int, lc_error *);
 static unsigned char body[65537];
 typedef struct gate {
   pthread_mutex_t mutex;
@@ -112,8 +113,8 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
   request.index_seq = version;
   request.lifetime = 1;
   request.record_type = 1;
-  int rc =
-      ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, &append, e);
+  int rc = ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, NULL,
+                                     &append, e);
   if (rc == LC_OK) {
     if (segment)
       *segment = ps_namespace_append_segment(append);
@@ -421,7 +422,8 @@ static void faults(const char *path) {
           else if (phase == 3) {
             ps_namespace_append *reserved = NULL;
             rc = ps_namespace_append_begin(ns, 1, sizeof(body) + 2048,
-                                           PS_APPEND_PREFIX, &reserved, &e);
+                                           PS_APPEND_PREFIX, NULL, &reserved,
+                                           &e);
             ps_namespace_append_close(reserved);
           } else
             rc = append(root, ns, 2, 1, sizeof(body), &e);
@@ -728,17 +730,19 @@ static int direct_reserve(void *p, int fd, off_t at, off_t n) {
     errno = rc;
   return rc ? -1 : 0;
 }
-typedef struct load_job {
+typedef struct read_job {
   ps_namespace *ns;
   int started, done, rc;
-} load_job;
-static void *load_namespace(void *p) {
-  load_job *j = p;
+} read_job;
+static void *read_namespace(void *p) {
+  read_job *j = p;
   lc_error e;
   lc_error_init(&e);
-  ps_namespace_status status;
+  records found = {0};
   __atomic_store_n(&j->started, 1, __ATOMIC_RELEASE);
-  j->rc = ps_namespace_status_get(j->ns, &status, &e);
+  j->rc = capture(j->ns, &found, &e);
+  if (j->rc == LC_OK)
+    REQUIRE(found.count == 3);
   __atomic_store_n(&j->done, 1, __ATOMIC_RELEASE);
   lc_error_cleanup(&e);
   return NULL;
@@ -759,7 +763,7 @@ static void concurrency(const char *path) {
     pthread_cond_wait(&g.changed, &g.mutex);
   pthread_mutex_unlock(&g.mutex);
   ps_namespace_append *contended = NULL;
-  REQUIRE(ps_namespace_append_begin(a, 0, 0, PS_APPEND_PREFIX, &contended,
+  REQUIRE(ps_namespace_append_begin(a, 0, 0, PS_APPEND_PREFIX, NULL, &contended,
                                     &e) == LC_ERR_INVALID &&
           !contended);
   clear(&e);
@@ -794,29 +798,31 @@ static void concurrency(const char *path) {
   ok(ps_root_open(path, 0, &options, &root, &e), &e);
   a = acquire(root, "a", 0, &e);
   b = acquire(root, "b", 0, &e);
-  load_job jobs[2] = {{a, 0, 0, 0}, {a, 0, 0, 0}};
+  read_job jobs[2] = {{a, 0, 0, 0}, {a, 0, 0, 0}};
   pthread_t threads[2];
   pthread_mutex_lock(&held.gate.mutex);
   held.enabled = 1;
   pthread_mutex_unlock(&held.gate.mutex);
-  REQUIRE(pthread_create(&threads[0], NULL, load_namespace, &jobs[0]) == 0);
+  REQUIRE(pthread_create(&threads[0], NULL, read_namespace, &jobs[0]) == 0);
   pthread_mutex_lock(&held.gate.mutex);
   while (!held.gate.entered)
     pthread_cond_wait(&held.gate.changed, &held.gate.mutex);
   pthread_mutex_unlock(&held.gate.mutex);
-  REQUIRE(pthread_create(&threads[1], NULL, load_namespace, &jobs[1]) == 0);
-  while (!__atomic_load_n(&jobs[1].started, __ATOMIC_ACQUIRE))
-    sched_yield();
+  /* Root admission already recovered both namespaces. A blocked source read
+   * must leave status, another captured reader and unrelated mutation free. */
+  ps_namespace_status status;
+  ok(ps_namespace_status_get(a, &status, &e), &e);
+  REQUIRE(pthread_create(&threads[1], NULL, read_namespace, &jobs[1]) == 0);
+  REQUIRE(pthread_join(threads[1], NULL) == 0 && jobs[1].rc == LC_OK);
   ok(append(root, b, 2, 0, 17, &e), &e);
   count(b, 2, &e);
   REQUIRE(!__atomic_load_n(&jobs[0].done, __ATOMIC_ACQUIRE) &&
-          !__atomic_load_n(&jobs[1].done, __ATOMIC_ACQUIRE));
+          __atomic_load_n(&jobs[1].done, __ATOMIC_ACQUIRE));
   pthread_mutex_lock(&held.gate.mutex);
   held.gate.released = 1;
   pthread_cond_broadcast(&held.gate.changed);
   pthread_mutex_unlock(&held.gate.mutex);
-  for (size_t i = 0; i < 2; ++i)
-    REQUIRE(pthread_join(threads[i], NULL) == 0 && jobs[i].rc == LC_OK);
+  REQUIRE(pthread_join(threads[0], NULL) == 0 && jobs[0].rc == LC_OK);
   count(a, 3, &e);
   ps_namespace_release(a);
   ps_namespace_release(b);
@@ -1000,7 +1006,7 @@ static void reservation(const char *path) {
     ns = acquire(root, "reserve", 1, &e);
     ok(append(root, ns, 1, 0, 31, &e), &e);
     ok(ps_namespace_status_get(ns, &before, &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX,
+    REQUIRE(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX, NULL,
                                       &reserved, &e) == LC_ERR_INVALID &&
             !reserved && e.message && strstr(e.message, "capacity"));
     clear(&e);
@@ -1019,14 +1025,14 @@ static void reservation(const char *path) {
     count(ns, 2, &e);
     ok(ps_namespace_view_open(ns, &old, &e), &e);
     ok(ps_grow(ps_root_space(root), PS_MIB, &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 1, UINT64_MAX, PS_APPEND_PREFIX,
+    REQUIRE(ps_namespace_append_begin(ns, 1, UINT64_MAX, PS_APPEND_PREFIX, NULL,
                                       &reserved, &e) == LC_ERR_INVALID &&
             !reserved);
     clear(&e);
     ok(ps_namespace_status_get(ns, &after, &e), &e);
     REQUIRE(after.active_segment == 1);
-    ok(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX, &reserved,
-                                 &e),
+    ok(ps_namespace_append_begin(ns, 1, PS_MIB, PS_APPEND_PREFIX, NULL,
+                                 &reserved, &e),
        &e);
     REQUIRE(ps_namespace_append_segment(reserved) == 2);
     stable = ps_namespace_append_leaf(reserved);
@@ -1215,7 +1221,8 @@ static void reject_published_successor(const char *path) {
   ns = acquire(root, "test", 1, &e);
   ok(append(root, ns, 1, 0, 31, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
-  ok(ps_namespace_append_begin(ns, 1, 1, PS_APPEND_PREFIX, &staged, &e), &e);
+  ok(ps_namespace_append_begin(ns, 1, 1, PS_APPEND_PREFIX, NULL, &staged, &e),
+     &e);
   ps_namespace_append_close(staged);
   ps_namespace_release(ns);
   ok(ps_root_close(root, &e), &e);
@@ -1721,20 +1728,21 @@ static void append_budget_limits(const char *path) {
     ps_namespace_append *a = NULL;
     ps_stats before, after;
     ok(ps_status(ps_root_space(root), &before, &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_COMPLETE, &a, &e) ==
-                LC_ERR_INVALID &&
+    REQUIRE(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_COMPLETE, NULL, &a,
+                                      &e) == LC_ERR_INVALID &&
             !a);
     clear(&e);
     REQUIRE(ps_namespace_append_begin(ns, 0, 1,
-                                      (enum ps_namespace_append_mode)3, &a,
-                                      &e) == LC_ERR_INVALID &&
+                                      (enum ps_namespace_append_mode)3, NULL,
+                                      &a, &e) == LC_ERR_INVALID &&
             !a);
     clear(&e);
     ok(ps_status(ps_root_space(root), &after, &e), &e);
     REQUIRE(after.entries == before.entries &&
             after.journal_bytes == before.journal_bytes);
     for (int filled = 0; filled < 2; ++filled) {
-      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &a, &e), &e);
+      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL, &a, &e),
+         &e);
       lc_pouch_record_io io = ps_namespace_append_output(a);
       uint64_t start, tail;
       ok(lc_pouch_record_io_tail(io, &start, &e), &e);
@@ -1756,7 +1764,8 @@ static void append_budget_limits(const char *path) {
       ok(ps_namespace_status_get(ns, &status, &e), &e);
       REQUIRE(!status.active_segment && !status.tail);
     }
-    ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, &a, &e), &e);
+    ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL, &a, &e),
+       &e);
     lc_pouch_record_io io = ps_namespace_append_output(a);
     size_t payload = append_fixture_prefix(io, frame, n, &e);
     size_t middle = payload + (n - payload) / 2;
@@ -1769,7 +1778,8 @@ static void append_budget_limits(const char *path) {
     ps_namespace_append_close(a);
     count(ns, 1, &e);
     ok(ps_status(ps_root_space(root), &before, &e), &e);
-    ok(ps_namespace_append_begin(ns, 0, n2, PS_APPEND_COMPLETE, &a, &e), &e);
+    ok(ps_namespace_append_begin(ns, 0, n2, PS_APPEND_COMPLETE, NULL, &a, &e),
+       &e);
     ok(ps_status(ps_root_space(root), &after, &e), &e);
     REQUIRE(after.budgets == before.budgets); /* Existing metadata claims. */
     payload =
@@ -1828,7 +1838,8 @@ static void append_budget_capacity(const char *path) {
     ps_namespace *ns = acquire(root, "budget", 1, &e);
     ps_namespace *other = acquire(root, "reject", 1, &e);
     ps_namespace_append *a = NULL, *rejected = NULL;
-    ok(ps_namespace_append_begin(ns, 1, n, PS_APPEND_COMPLETE, &a, &e), &e);
+    ok(ps_namespace_append_begin(ns, 1, n, PS_APPEND_COMPLETE, NULL, &a, &e),
+       &e);
     size_t payload =
         append_fixture_prefix(ps_namespace_append_output(a), frame, n, &e);
     for (uint64_t i = 0;; ++i) {
@@ -1850,7 +1861,7 @@ static void append_budget_capacity(const char *path) {
     ok(ps_budget_open(ps_root_space(root), &floor, &peer, &e), &e);
     ps_stats before, after;
     ok(ps_status(ps_root_space(root), &before, &e), &e);
-    REQUIRE(ps_namespace_append_begin(other, 1, n, PS_APPEND_COMPLETE,
+    REQUIRE(ps_namespace_append_begin(other, 1, n, PS_APPEND_COMPLETE, NULL,
                                       &rejected, &e) == LC_ERR_INVALID &&
             !rejected);
     clear(&e);
@@ -1863,11 +1874,18 @@ static void append_budget_capacity(const char *path) {
     ok(ps_budget_close(peer, &e), &e);
     count(ns, 1, &e);
     ok(ps_checkpoint(ps_root_space(root), &e), &e);
-    REQUIRE(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_COMPLETE, &rejected,
-                                      &e) == LC_ERR_INVALID &&
+    /* A checkpoint can return pages. Hold the remaining physical capacity;
+     * exhausting a payload-only ordinary plan is insufficient when another
+     * plan can use already protected metadata workspace. */
+    peer = capacity_peer(ps_root_space(root), 1, &e);
+    REQUIRE(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_COMPLETE, NULL,
+                                      &rejected, &e) == LC_ERR_INVALID &&
             !rejected);
     clear(&e);
-    ok(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_MAINTENANCE, &a, &e), &e);
+    ok(ps_budget_close(peer, &e), &e);
+    ok(ps_namespace_append_begin(ns, 1, n2, PS_APPEND_MAINTENANCE, NULL, &a,
+                                 &e),
+       &e);
     ok(append_known_record(root, a, 2, &e), &e);
     ok(ps_namespace_append_commit(a, PS_COMMIT_DEFAULT, &e), &e);
     ps_namespace_append_close(a);
@@ -1895,7 +1913,8 @@ static void append_budget_capacity(const char *path) {
     lc_error_cleanup(&e);
   }
 }
-static void append_budget_faults(const char *path) {
+#include "batch_cases.h"
+static void append_budget_faults(const char *path, int planned) {
   model m = {0};
   m.live = malloc(PS_MIB);
   m.stable = malloc(PS_MIB);
@@ -1921,7 +1940,7 @@ static void append_budget_faults(const char *path) {
           ps_namespace *fixture = acquire(root, "fixture", 1, &e);
           size_t n;
           unsigned char *frame = append_frame(root, fixture, 1, &n, &e);
-          free(frame);
+          ok(ps_namespace_checkpoint_flush(fixture, &e), &e);
           ps_namespace_release(fixture);
           ps_namespace *ns = acquire(root, "faults", 1, &e);
           if (rotating)
@@ -1932,6 +1951,8 @@ static void append_budget_faults(const char *path) {
           ok(ps_root_open(path, 0, &o, &root, &e), &e);
           ns = acquire(root, "faults", 0, &e);
           ps_namespace_append *a = NULL;
+          batch_view prefixes = {{frame, NULL}, {n, 0}, 1, 0, 0};
+          lc_pouch_storage_batch batch = {1, batch_prefix, &prefixes};
           enum ps_namespace_append_mode mode =
               rotating ? PS_APPEND_MAINTENANCE : PS_APPEND_COMPLETE;
           m.calls = allocation = 0;
@@ -1939,7 +1960,9 @@ static void append_budget_faults(const char *path) {
             fail_allocation = cut ? cut : SIZE_MAX;
           else
             m.fail = cut;
-          int rc = ps_namespace_append_begin(ns, 1, n, mode, &a, &e);
+          int rc = ps_namespace_append_begin(ns, 1, n, mode,
+                                             planned ? &batch : NULL, &a, &e);
+          free(frame);
           if (rc == LC_OK)
             rc = append_known_record(root, a, rotating + 1, &e);
           if (rc == LC_OK)
@@ -1956,7 +1979,7 @@ static void append_budget_faults(const char *path) {
           if (kind && rc != LC_OK) {
             ok(ps_check(ps_root_space(root), &e), &e);
             count(ns, rotating, &e);
-            ok(ps_namespace_append_begin(ns, 1, n, mode, &a, &e), &e);
+            ok(ps_namespace_append_begin(ns, 1, n, mode, NULL, &a, &e), &e);
             ps_namespace_append_close(a);
           }
           ps_stats physical;
@@ -2003,8 +2026,8 @@ static void append_budget_faults(const char *path) {
           REQUIRE(unlink(path) == 0);
         }
         REQUIRE(operations > 10);
-        printf("complete append cuts (sync=%d rotating=%d %s): %lu\n", sync,
-               rotating, kind ? "allocation" : "write/sync",
+        printf("complete append planned%d cuts (sync=%d rotating=%d %s): %lu\n",
+               planned, sync, rotating, kind ? "allocation" : "write/sync",
                (unsigned long)operations);
       }
   free(m.live);
@@ -2178,7 +2201,13 @@ static void *worker(void *p) {
     append_budget_limits(r->path);
     append_budget_capacity(r->path);
   } else if (!strcmp(r->mode, "append-budget-faults"))
-    append_budget_faults(r->path);
+    append_budget_faults(r->path, 0);
+  else if (!strcmp(r->mode, "batch-admission"))
+    batch_admission(r->path);
+  else if (!strcmp(r->mode, "batch-faults"))
+    append_budget_faults(r->path, 1);
+  else if (!strcmp(r->mode, "budget-transfer"))
+    budget_transfer(r->path);
   else
     concurrency(r->path);
   return NULL;

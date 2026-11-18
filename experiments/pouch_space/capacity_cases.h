@@ -103,7 +103,8 @@ static void standing_prefix(int durable) {
     if (full)
       budget_fill(ps_root_space(root), &next, filler);
     input.calls = 0;
-    OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &error));
+    OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                                 &error));
     int rc = lc_pouch_state_record_append(
         &allocator, NULL, ps_namespace_append_output(append),
         ps_namespace_append_leaf(append), &request, &source, 0, &result,
@@ -442,7 +443,7 @@ static void obligation_group(ps_namespace *ns, char *large, size_t keys) {
                                               &bytes, &error));
     total += bytes;
   }
-  OK(ps_namespace_append_begin(ns, 0, total, PS_APPEND_COMPLETE, &append,
+  OK(ps_namespace_append_begin(ns, 0, total, PS_APPEND_COMPLETE, NULL, &append,
                                &error));
   for (size_t i = 0; i < keys; ++i) {
     obligation_entry(&entry, name, large, (unsigned int)i);
@@ -521,8 +522,8 @@ static void standing_deletion(int durable, size_t key_bytes) {
   deletion.version = 1;
   OK(lc_pouch_state_record_measure_snapshot(&allocator, NULL, &deletion, 0,
                                             &bytes, &error));
-  OK(ps_namespace_append_begin(ns, 0, bytes, PS_APPEND_MAINTENANCE, &append,
-                               &error));
+  OK(ps_namespace_append_begin(ns, 0, bytes, PS_APPEND_MAINTENANCE, NULL,
+                               &append, &error));
   OK(lc_pouch_state_record_write_snapshot(
       &allocator, ps_namespace_append_output(append),
       ps_namespace_append_leaf(append), &deletion, NULL, NULL, 0, &error));

@@ -82,7 +82,7 @@ struct ps_checkpoint_delta {
   slot_change **buckets;
   size_t capacity, count, created;
   ps_budget_plan claim;
-  int prepared, accepted, maintenance;
+  int prepared, accepted, maintenance, planning, planned;
 };
 
 static int failure(lc_error *e, int code, const char *message) {
@@ -859,7 +859,7 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
       return rc;
   }
   if (!key) {
-    rc = fund(c, &plan, e);
+    rc = d->planning ? LC_OK : fund(c, &plan, e);
     if (rc == LC_OK)
       d->claim = plan;
     return rc;
@@ -917,7 +917,7 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
     if (rc != LC_OK)
       return rc;
   }
-  rc = fund(c, &plan, e);
+  rc = d->planning ? LC_OK : fund(c, &plan, e);
   if (rc == LC_OK) {
     d->claim = plan;
     if (bound > change->bound)
@@ -953,6 +953,19 @@ static int admission(void *context, const lc_pouch_record_header *h,
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&c->mutex);
+  if (d->planned) {
+    slot_change *change =
+        key ? delta_find(d, key, (size_t)h->key_len, kind) : NULL;
+    rc = key && (!change ||
+                 LC_POUCH_RECORD_HEADER_BYTES + h->key_len + h->meta_len + 512 >
+                     change->bound ||
+                 deletion > change->slot->required_deletion)
+             ? failure(e, LC_ERR_PROTOCOL,
+                       "canonical prefix exceeds its admitted batch plan")
+             : LC_OK;
+    pthread_mutex_unlock(&c->mutex);
+    return rc;
+  }
   rc = admit_key(d, key, (size_t)h->key_len, kind,
                  LC_POUCH_RECORD_HEADER_BYTES + h->key_len + h->meta_len + 512,
                  e);
@@ -961,38 +974,108 @@ static int admission(void *context, const lc_pouch_record_header *h,
     if (deletion > change->slot->required_deletion)
       rc = reserve_slot(c, change->slot, deletion, 0, e);
   }
-  if (rc == LC_OK && !d->maintenance)
+  if (rc == LC_OK && !d->maintenance && !d->planning)
     rc = ps_budget_foreground_check(c->ns->root->space, e);
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
-int ps_checkpoint_delta_begin(ps_key_checkpoint *c, ps_record_writer *writer,
-                              uint64_t segment, const char *leaf,
-                              int maintenance, ps_checkpoint_delta **out,
-                              lc_error *e) {
+int ps_checkpoint_delta_open(ps_key_checkpoint *c, int maintenance,
+                             ps_checkpoint_delta **out, lc_error *e) {
   ps_checkpoint_delta *d;
-  int rc;
   if (out)
     *out = NULL;
-  if (!c || !writer || !writer->writer || !segment || !leaf || !out)
+  if (!c || !out)
     return failure(e, LC_ERR_INVALID,
-                   "checkpoint delta requires a private append");
+                   "checkpoint delta requires an owner and output");
   d = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*d));
   if (!d)
     return failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint append");
   d->checkpoint = c;
   d->maintenance = maintenance;
+  d->claim = c->claim;
+  *out = d;
+  return LC_OK;
+}
+int ps_checkpoint_delta_plan(ps_checkpoint_delta *d,
+                             const lc_pouch_storage_batch *batch,
+                             uint64_t minimum, ps_budget_plan *extra,
+                             lc_error *e) {
+  ps_key_checkpoint *c = d->checkpoint;
+  ps_budget_plan empty = {0}, current;
+  lc_pouch_record_header h;
+  const void *key, *metadata;
+  uint64_t total = 0, fields[4];
+  size_t i, j;
+  int rc = LC_OK;
+  if (!batch || !batch->prefix || !batch->count || !extra || d->writer ||
+      batch->count > minimum / LC_POUCH_RECORD_HEADER_BYTES)
+    return failure(e, LC_ERR_INVALID,
+                   "batch admission requires bounded prefixes");
+  memset(extra, 0, sizeof(*extra));
+  d->planning = 1;
+  for (i = 0; rc == LC_OK && i < batch->count; ++i) {
+    memset(&h, 0, sizeof(h));
+    key = metadata = NULL;
+    rc = batch->prefix(batch->context, i, &h, &key, &metadata, e);
+    if (rc == LC_OK && (h.flags || (h.meta_len && !metadata)))
+      rc = failure(e, LC_ERR_INVALID,
+                   "batch prefix must be complete and bounded");
+    fields[0] = LC_POUCH_RECORD_HEADER_BYTES;
+    fields[1] = h.key_len;
+    fields[2] = h.meta_len;
+    fields[3] = h.payload_len;
+    for (j = 0; rc == LC_OK && j < 4; ++j) {
+      if (fields[j] > minimum - total)
+        rc = failure(e, LC_ERR_INVALID,
+                     "batch prefixes exceed declared canonical span");
+      else
+        total += fields[j];
+    }
+    if (rc == LC_OK)
+      rc = admission(d, &h, key, metadata, e);
+  }
+  d->planning = 0;
+  if (rc == LC_OK && total != minimum)
+    rc = failure(e, LC_ERR_INVALID,
+                 "batch prefixes differ from declared canonical span");
+  pthread_mutex_lock(&c->mutex);
+  empty.maintenance = 1;
+  if (rc == LC_OK && !c->budget)
+    rc = ps_budget_open(c->ns->root->space, &empty, &c->budget, e);
+  if (rc == LC_OK)
+    rc = ps_budget_status(c->budget, &current, e);
+  if (rc == LC_OK) {
+    extra->payload_bytes = d->claim.payload_bytes > current.payload_bytes
+                               ? d->claim.payload_bytes - current.payload_bytes
+                               : 0;
+    extra->metadata_bytes =
+        d->claim.metadata_bytes > current.metadata_bytes
+            ? d->claim.metadata_bytes - current.metadata_bytes
+            : 0;
+    extra->entries = d->claim.entries > current.entries
+                         ? d->claim.entries - current.entries
+                         : 0;
+    d->planned = 1;
+  }
+  pthread_mutex_unlock(&c->mutex);
+  return rc;
+}
+int ps_checkpoint_delta_fund(ps_checkpoint_delta *d, ps_budget *source,
+                             const ps_budget_plan *extra, lc_error *e) {
+  if (!extra->payload_bytes && !extra->metadata_bytes && !extra->entries)
+    return LC_OK;
+  return ps_budget_transfer(source, d->checkpoint->budget, extra, e);
+}
+int ps_checkpoint_delta_bind(ps_checkpoint_delta *d, ps_record_writer *writer,
+                             uint64_t segment, const char *leaf, lc_error *e) {
+  if (!d || !writer || !writer->writer || !segment || !leaf || d->writer)
+    return failure(e, LC_ERR_INVALID,
+                   "checkpoint binding requires a private append");
   d->writer = writer;
   d->segment = segment;
   d->leaf = leaf;
   d->start = writer->tail;
-  d->claim = c->claim;
-  rc = ps_record_admission_set(writer, admission, d, e);
-  if (rc == LC_OK)
-    *out = d;
-  else
-    ps_checkpoint_delta_close(d);
-  return rc;
+  return ps_record_admission_set(writer, admission, d, e);
 }
 static int prepare_entry(ps_checkpoint_delta *d,
                          const lc_pouch_state_entry *entry, lc_error *e) {
@@ -1179,7 +1262,7 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   pthread_mutex_lock(&c->mutex);
   for (change = d->changes; change; change = next) {
     next = change->next;
-    if (!d->accepted && !change->created)
+    if ((!d->accepted || !change->prepared) && !change->created)
       (void)reserve_slot(c, change->slot, change->prior_deletion, 0, NULL);
     release_prepared_source(c, change->body);
     ps_checkpoint_record_close(&change->record);

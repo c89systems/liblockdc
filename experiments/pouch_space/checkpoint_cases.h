@@ -321,7 +321,7 @@ static void checkpoint_put(ps_root *root, ps_namespace *ns,
   request.lifetime = lifetime;
   request.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
   OK(lc_source_from_memory("data", 4, &source, &error));
-  OK(ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, &append,
+  OK(ps_namespace_append_begin(ns, target, 0, PS_APPEND_PREFIX, NULL, &append,
                                &error));
   OK(lc_pouch_state_record_append(
       &allocator, ps_root_crypto(root), ps_namespace_append_output(append),
@@ -410,7 +410,7 @@ static void checkpoint_group(ps_namespace *ns, size_t keys) {
                                               &bytes, &error));
     total += bytes;
   }
-  OK(ps_namespace_append_begin(ns, 0, total, PS_APPEND_COMPLETE, &append,
+  OK(ps_namespace_append_begin(ns, 0, total, PS_APPEND_COMPLETE, NULL, &append,
                                &error));
   for (i = 0; i < 2 * keys; ++i) {
     checkpoint_group_entry(&entry, name, i, keys);
@@ -759,7 +759,8 @@ static void checkpoint_history(int durable) {
   request.payload_context = "checkpoint-history";
   request.version = request.index_seq = request.lifetime = 1;
   request.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
-  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &error));
+  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                               &error));
   OK(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
                                   ps_namespace_append_output(append),
                                   ps_namespace_append_leaf(append), &request,
@@ -774,7 +775,8 @@ static void checkpoint_history(int durable) {
         before.pending_metadata_bytes < PS_PAGE && before.tail > PS_MIB);
   /* Repeated writes to one key never meet the distinct-key trigger. The
    * history trigger must checkpoint before admitting the next body producer. */
-  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &error));
+  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                               &error));
   OK(ps_namespace_status_get(ns, &after, &error));
   CHECK(after.checkpoint_epoch && !after.pending_keys &&
         after.checkpoint_keys == 1 && after.covered_offset == before.tail);

@@ -23,6 +23,8 @@ typedef struct ps_budget_plan {
   int maintenance;
 } ps_budget_plan;
 typedef struct ps_reserve ps_reserve;
+/* Compose scalar costs without changing the destination admission class. */
+int ps_budget_plan_add(ps_budget_plan *, const ps_budget_plan *, lc_error *);
 /* Unclaimed future maintenance requirements. The space protects the component
  * maxima of the base plan and live owners, in addition to all admitted budgets
  * and their checkpoint workspace. Owners do not reserve one copy per key.
@@ -79,6 +81,13 @@ int ps_budget_open(ps_space *, const ps_budget_plan *, ps_budget **,
  * restore/spend completion credits while the standing floor is in use. */
 int ps_budget_foreground_check(ps_space *, lc_error *);
 int ps_budget_status(ps_budget *, ps_budget_plan *, lc_error *);
+/* Move unspent credits between handles in the same space, atomically and
+ * without allocation, I/O, trimming or another capacity admission. The source
+ * must have no writers; the destination may have users. Ordinary credits may
+ * become completion credits, but maintenance cannot fund an ordinary handle.
+ * Aggregate root claims and checkpoint workspace remain unchanged. */
+int ps_budget_transfer(ps_budget *, ps_budget *, const ps_budget_plan *,
+                       lc_error *);
 /* Replace the unspent claim atomically, preserving the handle's admission
  * class. Growth is permitted while writers use the budget; shrinking requires
  * all such writers to close. Reusing an unchanged healthy claim allocates

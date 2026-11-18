@@ -224,6 +224,13 @@ static int plan_add(ps_budget_plan *p, uint64_t payload, uint64_t metadata,
 int ps_budget_plan_stream(ps_budget_plan *p, lc_error *e) {
   return plan_add(p, 0, 80, 1, e);
 }
+int ps_budget_plan_add(ps_budget_plan *p, const ps_budget_plan *extra,
+                       lc_error *e) {
+  if (!extra)
+    return invalid(e, "capacity composition requires additional costs");
+  return plan_add(p, extra->payload_bytes, extra->metadata_bytes,
+                  extra->entries, e);
+}
 int ps_budget_plan_catalog(ps_budget_plan *p, size_t bytes, lc_error *e) {
   if (bytes > PS_CATALOG_NAME_MAX)
     return invalid(e, "capacity plan catalog name exceeds format bounds");
@@ -232,7 +239,9 @@ int ps_budget_plan_catalog(ps_budget_plan *p, size_t bytes, lc_error *e) {
 int ps_budget_plan_routing(ps_budget_plan *p, int create, lc_error *e) {
   if (create != 0 && create != 1)
     return invalid(e, "capacity plan routing creation must be zero or one");
-  return plan_add(p, PS_PAGE, create ? 88 : 0, create ? 1 : 0, e);
+  /* The short routing value may split across two packed tails. A valid old
+   * head has at least one extent, so replacement can still grow by one. */
+  return plan_add(p, PS_PAGE, create ? 112 : 24, create ? 1 : 0, e);
 }
 int ps_budget_plan_value(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   uint64_t pages, extents;
@@ -436,6 +445,41 @@ int ps_budget_foreground_check(ps_space *s, lc_error *e) {
   rc = ps_internal_healthy(s, e);
   if (rc == LC_OK)
     rc = ps_internal_budget_admit(s, 0, e);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+int ps_budget_transfer(ps_budget *from, ps_budget *to,
+                       const ps_budget_plan *amount, lc_error *e) {
+  ps_space *s;
+  int rc;
+  if (!from || !to || from == to || from->space != to->space || !amount ||
+      amount->payload_bytes % PS_PAGE)
+    return invalid(e, "capacity transfer requires distinct same-space handles "
+                      "and aligned costs");
+  s = from->space;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_healthy(s, e);
+  if (rc == LC_OK && from->users)
+    rc = invalid(e, "close source capacity writers before transfer");
+  if (rc == LC_OK && from->remaining.maintenance && !to->remaining.maintenance)
+    rc = invalid(e, "maintenance credits cannot fund an ordinary handle");
+  if (rc == LC_OK && (amount->payload_bytes > from->remaining.payload_bytes ||
+                      amount->metadata_bytes > from->remaining.metadata_bytes ||
+                      amount->entries > from->remaining.entries))
+    rc = invalid(e, "capacity transfer exceeds unspent source credits");
+  if (rc == LC_OK &&
+      (amount->payload_bytes > UINT64_MAX - to->remaining.payload_bytes ||
+       amount->metadata_bytes > UINT64_MAX - to->remaining.metadata_bytes ||
+       amount->entries > UINT64_MAX - to->remaining.entries))
+    rc = invalid(e, "capacity transfer totals overflow");
+  if (rc == LC_OK) {
+    from->remaining.payload_bytes -= amount->payload_bytes;
+    from->remaining.metadata_bytes -= amount->metadata_bytes;
+    from->remaining.entries -= amount->entries;
+    to->remaining.payload_bytes += amount->payload_bytes;
+    to->remaining.metadata_bytes += amount->metadata_bytes;
+    to->remaining.entries += amount->entries;
+  }
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

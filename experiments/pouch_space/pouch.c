@@ -177,6 +177,7 @@ static int replay(void *context, void *ns, lc_pouch_storage_visit_fn visit,
 static int append_begin(void *context, void *ns, uint64_t target,
                         uint64_t minimum,
                         enum lc_pouch_storage_append_mode mode,
+                        const lc_pouch_storage_batch *batch,
                         lc_pouch_storage_append *out, lc_error *e) {
   ps_namespace_append *append = NULL;
   enum ps_namespace_append_mode physical;
@@ -203,7 +204,8 @@ static int append_begin(void *context, void *ns, uint64_t target,
                                 mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE, e);
   if (rc != LC_OK)
     return rc;
-  rc = ps_namespace_append_begin(ns, target, minimum, physical, &append, e);
+  rc = ps_namespace_append_begin(ns, target, minimum, physical, batch, &append,
+                                 e);
   if (rc != LC_OK)
     return rc;
   out->handle = append;

@@ -286,7 +286,8 @@ static uint64_t namespace_churn_put(ps_root *root, ps_namespace *ns,
   request.index_seq = index;
   request.version = version;
   request.lifetime = lifetime;
-  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, &append, &error));
+  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                               &error));
   OK(lc_pouch_record_io_tail(ps_namespace_append_output(append), &start,
                              &error));
   OK(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),

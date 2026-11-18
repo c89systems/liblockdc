@@ -540,7 +540,8 @@ static int begin_reserve(ps_stream *stream, ps_budget *budget, uint64_t minimum,
 }
 static int plan_append(struct ps_namespace_data *d, uint64_t selected,
                        uint64_t minimum, enum ps_namespace_append_mode mode,
-                       ps_budget **budget, int *exact, lc_error *e) {
+                       const ps_budget_plan *checkpoint, ps_budget **budget,
+                       int *exact, lc_error *e) {
   ps_budget_plan plan = {0}, exact_plan;
   ps_stream_info info = {0};
   segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
@@ -581,9 +582,16 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
     plan = exact_plan;
   else
     rc = ps_budget_plan_preferred_span(&plan, need, preferred, e);
-  if (rc != LC_OK ||
-      (!plan.payload_bytes && !plan.metadata_bytes && !plan.entries))
+  if (rc == LC_OK)
+    rc = ps_budget_plan_add(&plan, checkpoint, e);
+  if (rc == LC_OK)
+    rc = ps_budget_plan_add(&exact_plan, checkpoint, e);
+  if (rc != LC_OK)
     return rc;
+  if (!plan.payload_bytes && !plan.metadata_bytes && !plan.entries)
+    return mode == PS_APPEND_MAINTENANCE
+               ? LC_OK
+               : ps_budget_foreground_check(d->ns->root->space, e);
   rc = ps_budget_open(d->ns->root->space, &plan, budget, e);
   if (rc == LC_ERR_INVALID && !*exact &&
       plan.payload_bytes > exact_plan.payload_bytes) {
@@ -697,18 +705,21 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
 int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
                               uint64_t minimum,
                               enum ps_namespace_append_mode mode,
+                              const lc_pouch_storage_batch *batch,
                               ps_namespace_append **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_append *append;
   uint64_t selected;
   uint64_t span;
+  ps_budget_plan checkpoint = {0};
   int rc, exact = 0;
   if (out)
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
   if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_MAINTENANCE ||
-      (mode != PS_APPEND_PREFIX && !minimum))
+      (mode != PS_APPEND_PREFIX && !minimum) ||
+      (batch && mode == PS_APPEND_PREFIX))
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
@@ -748,7 +759,17 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     }
   }
   if (rc == LC_OK)
-    rc = plan_append(d, selected, span, mode, &append->budget, &exact, e);
+    rc = ps_checkpoint_delta_open(d->checkpoint, mode == PS_APPEND_MAINTENANCE,
+                                  &append->delta, e);
+  if (rc == LC_OK && batch)
+    rc =
+        ps_checkpoint_delta_plan(append->delta, batch, minimum, &checkpoint, e);
+  if (rc == LC_OK)
+    rc = plan_append(d, selected, span, mode, &checkpoint, &append->budget,
+                     &exact, e);
+  if (rc == LC_OK && batch)
+    rc =
+        ps_checkpoint_delta_fund(append->delta, append->budget, &checkpoint, e);
   if (rc == LC_OK && selected != d->active)
     rc = prepare(d, append->budget, selected, e);
   if (rc == LC_OK) {
@@ -764,9 +785,8 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     if (rc == LC_OK && append->complete)
       rc = ps_record_frame_begin(&append->writer, minimum, e);
     if (rc == LC_OK)
-      rc = ps_checkpoint_delta_begin(d->checkpoint, &append->writer, s->id,
-                                     s->leaf, mode == PS_APPEND_MAINTENANCE,
-                                     &append->delta, e);
+      rc = ps_checkpoint_delta_bind(append->delta, &append->writer, s->id,
+                                    s->leaf, e);
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
