@@ -750,9 +750,10 @@ invalid:
 }
 static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
                         lc_error *error) {
-  int rc = transfer(s, header, PS_RUN_HEADER, p->extents[0].offset, 0, error);
+  int rc = transfer(s, header, PS_RUN_IDENTITY_BYTES, p->extents[0].offset, 0,
+                    error);
   if (rc == LC_OK &&
-      (checksum(header, PS_RUN_HEADER) != p->extents[0].crc ||
+      (checksum(header, PS_RUN_IDENTITY_BYTES) != p->extents[0].crc ||
        get64(header) != OWNED_MAGIC || get64(header + 8) != p->token ||
        get64(header + 16) != p->key.owner || get64(header + 24) != p->key.key ||
        get64(header + 32) != p->extents[0].offset ||
@@ -1291,6 +1292,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   put64(root + 40, new_root.generation);
   put64(root + 48, s->token_limit);
   memcpy(root + 56, s->identity, 16);
+  put32(root + 72, PS_RUN_HEADER);
   put32(root + 76, checksum(root, 76));
   if (rc == LC_OK)
     rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
@@ -1466,8 +1468,8 @@ static int root_valid(const unsigned char *p) {
            offset <= capacity - PS_PAGE &&
            (offset < JOURNAL_OFFSET || offset >= PS_DATA) && generation &&
            generation <= get64(p + 8))) &&
-         get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 && !get32(p + 72) &&
-         checksum(p, 76) == get32(p + 76);
+         get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 &&
+         get32(p + 72) == PS_RUN_HEADER && checksum(p, 76) == get32(p + 76);
 }
 typedef struct metadata_recovery {
   ps_space *space;
@@ -3316,6 +3318,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   if (rc == LC_OK && !clean)
     rc = initialize_range(s, p->extents[0].offset, reserved, zero, error);
   if (rc == LC_OK) {
+    memset(header, 0, sizeof(header));
     put64(header, OWNED_MAGIC);
     put64(header + 8, p->token);
     put64(header + 16, p->key.owner);
@@ -3323,7 +3326,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     put64(header + 32, p->extents[0].offset);
     put64(header + 40, bytes);
     memcpy(header + 48, s->identity, 16);
-    p->extents[0].crc = checksum(header, sizeof(header));
+    p->extents[0].crc = checksum(header, PS_RUN_IDENTITY_BYTES);
     rc = transfer(s, header, sizeof(header), p->extents[0].offset, 1, error);
   }
   if (rc == LC_OK && !clean) {
@@ -3479,6 +3482,88 @@ int ps_owned_read(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
 int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
                    size_t n, lc_error *error) {
   return owned_io(run, offset, (void *)bytes, n, 1, error);
+}
+static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
+                       int operation, uint64_t prior,
+                       const ps_piece_checksum *prefix, ps_piece_checksum *out,
+                       lc_error *error) {
+  unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
+  ps_space *s;
+  uint64_t offset;
+  uint32_t crc;
+  uint64_t reconstructed = UINT64_C(1) << 63;
+  int rc;
+  if (!run || !bytes || bytes > ps_owned_run_capacity(run) ||
+      ps_owned_run_capacity(run) > PS_CHUNK || (operation && !scratch) ||
+      prior > bytes || (prior && !prefix) ||
+      (prefix && (prefix->reconstructed < 0 || prefix->reconstructed > 1 ||
+                  (!prior && prefix->crc))))
+    return err(error, LC_ERR_INVALID,
+               "piece completion requires bounded finalized bytes");
+  s = run->space;
+  offset = run->entry->extents[0].offset;
+  rc = healthy(s, error);
+  if (rc == LC_OK && operation == 2) {
+    rc = transfer(s, scratch, (size_t)(bytes - prior),
+                  offset + PS_RUN_HEADER + prior, 0, error);
+    if (rc == LC_OK) {
+      crc = checksum(scratch, (size_t)(bytes - prior));
+      if (prior)
+        crc =
+            (uint32_t)crc32_combine(prefix->crc, crc, (z_off_t)(bytes - prior));
+      memcpy(footer, "LCPSPIEC", 8);
+      put64(footer + 8,
+            bytes | (prefix && prefix->reconstructed ? reconstructed : 0));
+      put32(footer + 16, crc);
+      put64(footer + 20, run->entry->token);
+      put32(footer + 28, checksum(footer, 28));
+      rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES,
+                    1, error);
+      if (rc == LC_OK && out) {
+        out->crc = crc;
+        out->reconstructed = prefix && prefix->reconstructed;
+      }
+    }
+    return rc;
+  }
+  if (rc == LC_OK)
+    rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES, 0,
+                  error);
+  if (rc == LC_OK && (memcmp(footer, "LCPSPIEC", 8) ||
+                      (get64(footer + 8) & ~reconstructed) != bytes ||
+                      get64(footer + 20) != run->entry->token ||
+                      get32(footer + 28) != checksum(footer, 28)))
+    rc = err(error, LC_ERR_PROTOCOL, "invalid finalized piece checksum footer");
+  if (rc == LC_OK && operation && (get64(footer + 8) & reconstructed))
+    rc = lc_error_set(error, LC_ERR_INVALID, 0,
+                      "reconstructed piece needs canonical body validation",
+                      NULL, "pouch_piece_needs_validation", "pouch-space");
+  if (rc == LC_OK && operation) {
+    rc = transfer(s, scratch, (size_t)bytes, offset + PS_RUN_HEADER, 0, error);
+    if (rc == LC_OK && checksum(scratch, (size_t)bytes) != get32(footer + 16))
+      rc = err(error, LC_ERR_PROTOCOL, "finalized piece checksum mismatch");
+  }
+  if (rc == LC_OK && out) {
+    out->crc = get32(footer + 16);
+    out->reconstructed = (get64(footer + 8) & reconstructed) != 0;
+  }
+  return rc;
+}
+int ps_owned_piece_extend(ps_owned_run *run, uint64_t prior,
+                          const ps_piece_checksum *prefix, uint64_t bytes,
+                          void *scratch, ps_piece_checksum *out,
+                          lc_error *error) {
+  if (!out)
+    return err(error, LC_ERR_INVALID, "piece extension requires CRC output");
+  return owned_piece(run, bytes, scratch, 2, prior, prefix, out, error);
+}
+int ps_owned_piece_inspect(ps_owned_run *run, uint64_t bytes,
+                           ps_piece_checksum *out, lc_error *error) {
+  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, error);
+}
+int ps_owned_piece_verify(ps_owned_run *run, uint64_t bytes, void *scratch,
+                          lc_error *error) {
+  return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, error);
 }
 int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
                    void *scratch, lc_error *error) {

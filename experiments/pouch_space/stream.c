@@ -16,7 +16,9 @@ struct ps_stream {
   pthread_mutex_t mutex;
   stream_run *runs;
   size_t count, allocated, readers;
-  uint64_t tail, capacity, preferred_grant;
+  uint64_t tail, capacity, preferred_grant, checked;
+  ps_piece_checksum checksum;
+  uint64_t recovery_floor;
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
@@ -24,7 +26,8 @@ struct ps_stream {
 };
 struct ps_stream_writer {
   ps_stream *stream;
-  uint64_t start, bytes, flushed;
+  uint64_t start, bytes, flushed, prior_checked;
+  ps_piece_checksum prior_checksum;
   size_t used;
   int failed, published;
   unsigned char buffer[PS_CHUNK];
@@ -44,8 +47,8 @@ static int stream_error(lc_error *e, int rc, const char *message) {
 }
 static void note_grant(ps_stream *s, uint64_t capacity) {
   uint64_t next = (capacity + PS_RUN_HEADER) * 4;
-  if (next > PS_MIB)
-    next = PS_MIB;
+  if (next > PS_CHUNK)
+    next = PS_CHUNK;
   if (s->preferred_grant < next)
     s->preferred_grant = next;
 }
@@ -111,6 +114,55 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
   }
   return LC_OK;
 }
+/* Only one appender/recovery owns completion. A partial piece's footer advances
+ * with its canonical append; complete pieces never need another checksum write
+ * or a whole-source scan. The scratch buffer is reused after body input.
+ */
+static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
+                         void *scratch, int *repaired, lc_error *error) {
+  stream_run run;
+  uint64_t bytes, end, prior;
+  ps_piece_checksum checksum, rebuilt = {0};
+  int rc;
+  while (s->checked < tail) {
+    rc = stream_mapping(s, s->checked, &run, error);
+    if (rc != LC_OK)
+      return rc;
+    end = run.base + run.capacity;
+    if (end > tail && !partial)
+      break;
+    bytes = end > tail ? tail - run.base : run.capacity;
+    prior = s->checked - run.base;
+    rc = inspect ? ps_owned_piece_inspect(run.handle, bytes, &checksum, error)
+                 : ps_owned_piece_extend(run.handle, prior,
+                                         prior ? &s->checksum : NULL, bytes,
+                                         scratch, &checksum, error);
+    if (inspect == 2 && rc == LC_ERR_PROTOCOL) {
+      /* Only the canonical recovery callback can authorize this repair.
+       * Fully covered pieces were already inspected in strict mode. A valid
+       * existing footer needs no writes during ordinary read admission. */
+      lc_error_cleanup(error);
+      rebuilt.reconstructed = run.base < s->recovery_floor;
+      rc = ps_owned_piece_extend(run.handle, 0, &rebuilt, bytes, scratch,
+                                 &checksum, error);
+      if (rc == LC_OK && repaired)
+        *repaired = 1;
+    }
+    if (rc != LC_OK)
+      return rc;
+    s->checked = run.base + bytes;
+    s->checksum = checksum;
+  }
+  return LC_OK;
+}
+int ps_stream_recovery_cover(ps_stream *s, uint64_t covered, lc_error *error) {
+  if (!s || !s->recovering || covered > s->capacity)
+    return stream_error(error, LC_ERR_INVALID,
+                        "piece coverage requires canonical recovery");
+  if (s->recovery_floor < covered)
+    s->recovery_floor = covered;
+  return stream_pieces(s, covered, 1, 0, NULL, NULL, error);
+}
 static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
                         lc_error *error) {
   stream_run run;
@@ -144,7 +196,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
   ps_owned_run *run = NULL;
   ps_stream *s;
   uint64_t i, accepted;
-  int rc, found;
+  int rc, found, repaired = 0;
   if (out)
     *out = NULL;
   if (!out)
@@ -161,6 +213,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK) {
     s->ref = status.ref;
     s->tail = status.tail;
+    s->recovery_floor = status.tail;
     s->sealed = status.sealed;
   }
   for (i = 0; rc == LC_OK && i < status.runs; ++i) {
@@ -182,6 +235,8 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK && s->capacity != status.capacity)
     rc = stream_error(error, LC_ERR_PROTOCOL,
                       "stream directory capacity mismatch");
+  if (rc == LC_OK)
+    rc = stream_pieces(s, s->tail, 1, s->sealed, NULL, NULL, error);
   if (rc == LC_OK && s->capacity && !s->sealed) {
     if (!recover)
       rc = stream_error(error, LC_ERR_INVALID,
@@ -196,21 +251,24 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
       if (rc == LC_OK)
         rc = recover(s, s->tail, s->capacity, &accepted, context, error);
       s->recovering = 0;
-      lc_free_with_allocator(NULL, s->recovery_buffer);
-      s->recovery_buffer = NULL;
       if (rc == LC_OK && (accepted < s->tail || accepted > s->capacity))
         rc = stream_error(error, LC_ERR_PROTOCOL,
                           "canonical recovery returned invalid tail");
-      /* Readers need only the validated prefix. Track newly recovered bytes
-       * in root readiness so a peer barrier or checkpoint still covers them;
-       * the rejected suffix is repaired before the first write admission. */
-      if (rc == LC_OK && accepted > s->tail)
+      if (rc == LC_OK)
+        rc = stream_pieces(s, accepted, 2, 1, s->recovery_buffer, &repaired,
+                           error);
+      /* Readers need only the validated prefix. Newly accepted bytes and
+       * repaired footers join readiness, even if the canonical tail stayed
+       * put. Rejected suffix repair waits for the first write admission. */
+      if (rc == LC_OK && (accepted > s->tail || repaired))
         rc = ps_owned_commit(s->head, accepted, PS_COMMIT_DEFER_SYNC, NULL,
                              NULL, error);
       if (rc == LC_OK) {
         s->tail = accepted;
         s->repair_pending = 1;
       }
+      lc_free_with_allocator(NULL, s->recovery_buffer);
+      s->recovery_buffer = NULL;
     }
   }
   if (rc == LC_OK)
@@ -344,6 +402,8 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
     s->appending = 1;
     w->stream = s;
     w->start = s->tail;
+    w->prior_checked = s->checked;
+    w->prior_checksum = s->checksum;
     repair = s->repair_pending;
   }
   pthread_mutex_unlock(&s->mutex);
@@ -551,6 +611,9 @@ int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
     return stream_error(error, LC_ERR_INVALID, "invalid canonical commit mode");
   rc = stream_flush(w, error);
   if (rc == LC_OK)
+    rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, w->buffer, NULL,
+                       error);
+  if (rc == LC_OK)
     rc = ps_owned_commit(w->stream->head, w->start + w->bytes, mode, publish,
                          context, error);
   if (rc == LC_OK) {
@@ -580,6 +643,8 @@ void ps_stream_writer_close(ps_stream_writer *w) {
     lc_error_cleanup(&error);
     pthread_mutex_lock(&w->stream->mutex);
     w->stream->appending = 0;
+    w->stream->checked = w->prior_checked;
+    w->stream->checksum = w->prior_checksum;
     pthread_mutex_unlock(&w->stream->mutex);
   }
   lc_free_with_allocator(NULL, w);

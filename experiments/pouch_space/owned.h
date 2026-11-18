@@ -9,7 +9,8 @@
  * The owner serializes its appenders and writes only unpublished byte ranges.
  * Logical record validation/publication belongs to the canonical layer. */
 #define PS_OWNED_RUN 4U
-#define PS_RUN_HEADER 64U
+#define PS_RUN_IDENTITY_BYTES 64U
+#define PS_RUN_HEADER 96U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;
 typedef struct ps_owned_status {
@@ -44,6 +45,32 @@ void ps_owned_run_close(ps_owned_run *);
 int ps_owned_read(ps_owned_run *, uint64_t offset, void *, size_t, lc_error *);
 int ps_owned_write(ps_owned_run *, uint64_t offset, const void *, size_t,
                    lc_error *);
+/* Independently checked finalized bytes for bounded relocation. The identity
+ * header is immutable; its separate completion footer joins canonical byte
+ * readiness, without a per-record ownership journal event. Caller excludes
+ * writes to [0, bytes) while completing/checking it. scratch has PS_CHUNK
+ * bytes. A full grant is at most PS_CHUNK physical bytes in the canonical
+ * stream. Other owned users may retain larger grants and do not use this
+ * capability. Inspect validates the footer only; verify also reads and checks
+ * those bytes. Uncovered recovery may rebuild a footer after canonical
+ * validation. A reconstructed inherited prefix requires canonical body proof
+ * before relocation; inspection exposes that persistent obligation, and verify
+ * returns pouch_piece_needs_validation rather than blessing those bytes. */
+typedef struct ps_piece_checksum {
+  uint32_t crc;
+  int reconstructed;
+} ps_piece_checksum;
+/* Extend an unchanged checked prefix after private fixups. Only new bytes are
+ * read; CRC combination retains detection of damage to the previous prefix.
+ * Caller owns the prior CRC and supplies PS_CHUNK scratch. */
+int ps_owned_piece_extend(ps_owned_run *, uint64_t prior_bytes,
+                          const ps_piece_checksum *prior, uint64_t bytes,
+                          void *scratch, ps_piece_checksum *, lc_error *);
+/* Checksum state output is optional. */
+int ps_owned_piece_inspect(ps_owned_run *, uint64_t bytes, ps_piece_checksum *,
+                           lc_error *);
+int ps_owned_piece_verify(ps_owned_run *, uint64_t bytes, void *scratch,
+                          lc_error *);
 /* Clear an owned unpublished suffix, preserving reservation and bytes outside
  * the range. scratch points to PS_CHUNK bytes for the bounded fallback. */
 int ps_owned_clear(ps_owned_run *, uint64_t offset, uint64_t bytes,

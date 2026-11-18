@@ -8,6 +8,12 @@ conversion is outside this implementation; production deployment still requires
 an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
+Current milestones are the [incremental canonical key checkpoint cutover](#incremental-canonical-key-checkpoint-cutover)
+and [bounded namespace piece integrity](#bounded-namespace-piece-integrity).
+Sparse mapping/reclamation, standing admission with root-wide reconstruction,
+codec conversion and process-shared roots remain unfinished. Earlier snapshot
+sections below retain the evidence and constraints of their implementation stages.
+
 ## Single-file architecture direction
 
 The renewed implementation mandate authorizes redesigning all experimental
@@ -1067,9 +1073,10 @@ not infer that deleting a 1 MiB placeholder writes a 1 MiB tombstone.
 
 The canonical record header is 32 bytes. Delete metadata occupies at least
 38 bytes before the etag and any extended query-index trailer. The exact-span
-planner allows 4,032 canonical bytes per 4 KiB page, accounting for the 64-byte
-physical run header, and 88 descriptor bytes per page in its fragmentation
-bound. These give the following lower bounds, excluding routing, stream heads,
+planner at the whole-snapshot milestone allowed 4,032 canonical bytes per 4 KiB
+page, accounting for the then-64-byte physical run header, and 88 descriptor
+bytes per page in its fragmentation bound. These gave the following historical
+lower bounds, excluding routing, stream heads,
 catalog entries and checkpoint workspace:
 
 | Obligation | Canonical bytes | Planned payload bytes | Planned descriptor bytes |
@@ -1077,8 +1084,11 @@ catalog entries and checkpoint workspace:
 | One 60 KiB body-key tombstone | at least 61,510 | at least 65,536 | at least 1,408 |
 | One 1 MiB placeholder in a snapshot | more than 1,048,608 | at least 1,069,056 | at least 22,968 |
 
-These are conservative admission bounds from `ps_budget_plan_span`, not measured
-physical consumption or a complete reserve recommendation. The public key-bound
+These were conservative admission bounds from `ps_budget_plan_span`, not measured
+physical consumption or a complete reserve recommendation. The current 96-byte
+prologue permits 4,000 canonical bytes per page. Typed checkpoint metadata now
+uses `ps_budget_plan_value`; these historical snapshot figures are not the
+current standing-reserve proof. The public key-bound
 fixture covers both backends and durability policies, plaintext and combined
 compression/encryption. It also checks placeholder deletion is a no-op and
 preserves that placeholder and the distinct deleted body key across initial and
@@ -1092,18 +1102,19 @@ and native musl runs passed in 1.80 s and 1.79 s, recorded under
 the generated `CTestCustom.cmake`; explicit environment settings in later runs
 reinforce the same policy.
 
-Every current snapshot serializes the complete resolved key metadata, including
-keys whose bodies remain elsewhere. Protecting another complete snapshot
-therefore requires workload-sized spare capacity. In a metadata-dominated
+At that milestone, every snapshot serialized the complete resolved key metadata,
+including keys whose bodies remained elsewhere. Protecting another complete
+snapshot therefore required workload-sized spare capacity. In a metadata-dominated
 namespace, old and new metadata must coexist until durable selection and
 retirement; the resulting upper bound on usable capacity can approach one half
 of the container before other overhead. This is a design bound, not a measured
-typical utilization figure. The current source-sized body copy is a separate
+typical utilization figure. The source-sized body copy was a separate
 workload-sized obligation.
 
 The selected direction is bounded incremental metadata maintenance and body
 relocation before selecting a standing reserve. The renewed single-file mandate
-authorizes this internal persistence redesign; it remains unimplemented.
+authorizes this internal persistence redesign. Incremental checkpoints are now
+implemented below; bounded relocation and standing admission remain unfinished.
 The design must define foreground publication as well as recovery: splitting
 only the output of a complete snapshot does not remove
 its bootstrap requirement to retain all prior metadata. It must specify the
@@ -1284,6 +1295,12 @@ Preserve existing payload references and crypto binding contexts while replacing
 only the physical mapping of a bounded range. A read window pins its mapping
 generation; it must not follow a replacement midway through a read. Source names
 remain logical labels, with no external file or persistent sidecar.
+
+Logical source high waters must be independent of physical file capacity after
+old ranges retire. Validate logical offsets against their 64-bit offset bound
+and actual owned mappings. Enumerate present mappings by typed owner/key order;
+do not walk every historical hole or allocate tables sized by logical address.
+This is required for repeated fixed-capacity churn, not only the first reclaim.
 
 Use at most the existing 16 KiB stream chunk as one relocation data unit, with
 page-granular fallback under fragmentation. Persist checksums for independently
@@ -2916,7 +2933,8 @@ samples per configuration, then medians across configurations:
 The initial 256 KiB history cadence produced a 3.46x NoSync work ratio. Selecting
 1 MiB reduced absolute NoSync work time by a median 18% across those
 configurations; durable work time changed by about +1.5%. Metadata obligations
-remain funded and checkpoint selection remains durable under both policies. Structural barriers
+remain funded and checkpoint selection remains durable under both policies.
+Structural barriers
 and reopen overhead remain material performance work. This establishes the
 incremental checkpoint architecture; it does not establish performance parity.
 Create, close and reopen are recorded separately from measured work. Evidence
@@ -2926,6 +2944,88 @@ is under `build/pouch-space-checkpoint/`: `qualification-{gnu,musl}.log`,
 
 Bounded range relocation, a computed standing reserve with root-wide recovery,
 codec conversion and process-shared roots remain separate unfinished gates.
+
+### Bounded namespace piece integrity
+
+The canonical namespace stream now caps each physical grant at 16 KiB, retaining
+page-granular fallback and geometric growth from 4 KiB. Its prologue contains
+the original 64-byte immutable identity and a separate 32-byte completion
+footer. The footer binds the grant incarnation, completed prefix length and
+encoded-byte CRC, with its own metadata CRC. The physical root binds the
+96-byte prologue width at byte 72; incompatible private fixtures are rejected.
+There is no independent format-marker increment or legacy parser.
+
+After private canonical header/metadata fixups, completion checksums join the
+same readiness prefix as the canonical append. There is no extra ownership
+journal event or durability barrier per record. CRC combination extends a
+previously checked partial piece using only newly appended bytes. The writer's
+existing bounded buffer supplies scratch; failure restores its prior checksum
+state before retry. A regression changes older bytes before a later append and
+proves that extension cannot silently certify that damage. The canonical body
+CRC and codec validation remain authoritative.
+
+Recovery inspects completion metadata for full pieces within its protected
+prefix and for a sealed final partial piece. Covered bodies are not read merely
+to open the namespace. A valid footer is reused without repair writes. Missing
+uncovered completion metadata may be rebuilt after canonical recovery accepts
+the prefix. Rebuilt metadata registers fresh readiness even when the accepted
+tail does not advance; a peer barrier covers it exactly once. The retained
+`repair-red-debug.log` reproduces that missing-readiness error, and the final
+`stream-piece-repair` fixture proves its correction, including torn repair I/O.
+
+If reconstruction includes an inherited prefix that recovery did not revisit,
+the footer retains a reconstruction bit. Appending and reopening preserve that
+obligation. Independent piece verification returns
+`pouch_piece_needs_validation`; a relocation owner must validate the inherited
+live bodies against their canonical CRCs before using those bytes. Rehashing an
+inherited prefix is not itself proof of its original contents. A fresh piece
+fully validated by canonical replay does not acquire this obligation.
+
+Debug qualification passed 27 groups: the complete eight-configuration query
+SDK matrix, plaintext/NoSync and combined-codec/durable queue/outbox/XA controls,
+projection, stages, namespace admission, checkpoint fault cuts, large groups,
+stream lifecycle and recovery. Ten focused groups passed after the final
+reconstruction/readiness changes. GNU and native musl Release each passed twelve
+final groups, including large keys and concurrent maintenance. Five targeted
+ThreadSanitizer invocations passed with instrumented OpenSSL 3.6.5, 128 KiB
+workers and no suppressions. Four Memcheck invocations finished with no live
+heap, errors, suppressions or owned descriptors, with 48,714 matched
+allocations/frees. Logs are under
+`build/pouch-space-pieces/` as `qualification-debug.log`, `proof-debug.log`,
+`qualification-final-gnu.log`, `qualification-musl.log`,
+`qualification-tsan.log`, `qualification-memcheck.log` and `memcheck-*.log`.
+Seven final Debug groups covering large keys, checksum readers and the standard
+API/boundary/editor checks passed (`final-gates-debug.log`). Changed C/headers
+pass `clang-format --dry-run --Werror`; `git diff --check` is clean.
+
+The final matched GNU Release comparison verified all 48 runs: eight
+configurations, three samples per build, 4 KiB/64 KiB bodies, one/four writers,
+both durability policies, preopened namespaces and four rounds over the same
+keys. This compares the new pieces with the frozen checkpoint implementation,
+not directly with multifile. Median-of-three ratios per configuration, then
+medians across configurations, are:
+
+| Measurement, pieces/checkpoint build | NoSync | Durable |
+| --- | ---: | ---: |
+| Whole measured work | 1.04x | 1.01x |
+| Work CPU | 1.09x | 1.02x |
+| p50 write latency | 1.16x | 1.00x |
+| Reopen and verify | 1.01x | 1.10x |
+
+Whole-work ratios range from 0.83-1.21x for NoSync and 0.90-1.13x for durable
+work. These small cache-warm host fixtures establish neither cold-device
+performance nor a production latency commitment. The NoSync write-latency/CPU
+cost remains optimization work; the earlier multifile comparison is still a
+separate checkpoint-stage baseline. Raw rows and the complete summaries are
+`paired-performance.log` and `paired-summary.json` in the same stage directory.
+
+This is the independently checked namespace piece foundation. It does not yet
+replace mappings, discard dead ranges, relocate mixed pieces or establish
+standing-capacity progress. Collection REGION owners permit independent uploads
+inside allocated ranges and still require their own completed-unit integration;
+they are not forced through the namespace stream's single-appender policy.
+Sparse mapping/pin generations, bounded reclamation, computed standing admission
+and recovery of all outstanding root obligations remain required next work.
 
 ### Root and namespace ownership
 

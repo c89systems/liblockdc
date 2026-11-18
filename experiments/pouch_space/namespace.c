@@ -190,6 +190,9 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   if (cursor > capacity)
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage exceeds source capacity");
+  rc = ps_stream_recovery_cover(stream, cursor, e);
+  if (rc != LC_OK)
+    return rc;
   while (cursor < capacity) {
     found = 0;
     rc = ps_frame_read(ps_record_recovery_input(stream), cursor, capacity,

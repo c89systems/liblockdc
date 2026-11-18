@@ -62,7 +62,7 @@ int ps_budget_plan_preferred_span(ps_budget_plan *p, uint64_t bytes,
    * floor((bytes - 1 + header) / page) pages. Geometric growth is fourfold;
    * only the final grant can exceed the exact-span bound. */
   prior = (bytes - 1 + PS_RUN_HEADER) / PS_PAGE * PS_PAGE;
-  last = prior >= PS_MIB / 4 ? PS_MIB : prior * 4;
+  last = prior >= PS_CHUNK / 4 ? PS_CHUNK : prior * 4;
   if (last < preferred)
     last = preferred;
   rc = plan_add(&next, last - PS_PAGE, 0, 0, e);
