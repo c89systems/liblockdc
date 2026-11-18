@@ -259,8 +259,31 @@ static void metadata_close(void *context, void *handle) {
   (void)context;
   ps_namespace_metadata_close(handle);
 }
+static int metadata_reclaim(void *context, uint64_t bytes, lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_space *space = ps_root_space(owner->root);
+  ps_budget_plan plan = {0};
+  ps_budget *probe = NULL;
+  int rc = ps_budget_plan_value_bound(&plan, bytes, e);
+  if (rc == LC_OK)
+    rc = ps_budget_plan_value(&plan, 128, e);
+  if (rc != LC_OK)
+    return rc;
+  plan.maintenance = 1;
+  rc = ps_budget_open(space, &plan, &probe, e);
+  if (rc == LC_OK)
+    return ps_budget_close(probe, e);
+  if (rc != LC_ERR_INVALID)
+    return rc;
+  lc_error_cleanup(e);
+  /* Only a completed physical prefix is selected. Private producers and
+   * reader-held old incarnations retain their storage through this checkpoint.
+   */
+  return ps_checkpoint(space, e);
+}
 static const lc_pouch_storage_metadata_ops metadata_ops = {
-    metadata_begin, metadata_commit, metadata_close, 8 * PS_MIB};
+    metadata_begin, metadata_commit, metadata_close, metadata_reclaim,
+    8 * PS_MIB};
 static int append_commit(void *context, lc_pouch_storage_append *append,
                          enum lc_pouch_storage_commit_mode mode, lc_error *e) {
   enum ps_commit_mode physical;

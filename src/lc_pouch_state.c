@@ -13998,6 +13998,26 @@ static int lc_pouch_state_storage_append_open(
   *start = append->start;
   return LC_OK;
 }
+typedef struct lc_pouch_state_control_admission {
+  lc_pouch_record_header header;
+  const char *key;
+  unsigned char *metadata;
+} lc_pouch_state_control_admission;
+static int lc_pouch_state_control_prefix(void *context, size_t index,
+                                         lc_pouch_record_header *header,
+                                         const void **key,
+                                         const void **metadata,
+                                         lc_error *error) {
+  lc_pouch_state_control_admission *admission = context;
+  if (index)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "control admission contains one record", NULL, NULL,
+                        "pouch");
+  *header = admission->header;
+  *key = admission->key;
+  *metadata = admission->metadata;
+  return LC_OK;
+}
 static void lc_pouch_state_storage_append_publish(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     lc_pouch_namespace_manifest *manifest, lc_pouch_storage_append *append,
@@ -14186,6 +14206,7 @@ static int lc_pouch_state_write_resolved_locked(
   int single_writer;
   int use_materialized_record;
   int materialized_transform_ready;
+  int control_admission;
   int namespace_locked;
   int streaming_projection_mutex_released;
   int projection_rc;
@@ -14383,6 +14404,9 @@ static int lc_pouch_state_write_resolved_locked(
                             &materialized_plain_len) &&
       materialized_plain_len <= LC_POUCH_CRYPTO_MEMORY_TRANSFORM_MAX_BYTES;
   materialized_transform_ready = 0;
+  control_admission = pouch->storage.ops && options &&
+                      options->maintenance_completion &&
+                      use_materialized_record;
   streaming_projection_mutex_released = 0;
   content_type = options != NULL && options->content_type != NULL
                      ? options->content_type
@@ -14429,11 +14453,13 @@ static int lc_pouch_state_write_resolved_locked(
    * resident projection, so exclusive exact-key mutations perform it before
    * claiming the physical appender. Streaming sources deliberately stay out of
    * this path and retain direct source-to-segment flow below. */
-  if (use_materialized_record && single_writer && !namespace_locked) {
+  if (use_materialized_record &&
+      ((single_writer && !namespace_locked) || control_admission)) {
     bytes = (uint64_t)materialized_plain_len;
     cipher_bytes = 0UL;
     stored_crc = (unsigned long)crc32(0L, Z_NULL, 0);
-    lc_pouch_state_projection_mutex_unlock(pouch, ns);
+    if (!namespace_locked)
+      lc_pouch_state_projection_mutex_unlock(pouch, ns);
     rc = lc_pouch_crypto_transform_memory(
         &pouch->allocator, pouch->crypto, payload_context, materialized_plain,
         materialized_plain_len,
@@ -14447,7 +14473,9 @@ static int lc_pouch_state_write_resolved_locked(
         rc = error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
       }
     }
-    projection_rc = lc_pouch_state_projection_mutex_lock(pouch, ns, error);
+    projection_rc = !namespace_locked
+                        ? lc_pouch_state_projection_mutex_lock(pouch, ns, error)
+                        : LC_OK;
     if (projection_rc != LC_OK && rc == LC_OK) {
       rc = projection_rc;
     }
@@ -14475,11 +14503,63 @@ static int lc_pouch_state_write_resolved_locked(
   }
   fd = -1;
   if (pouch->storage.ops != NULL) {
+    lc_pouch_state_control_admission admission;
+    lc_pouch_storage_batch batch;
+    lc_pouch_state_entry preview = {0};
+    uint64_t required = LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key);
+    size_t length = 0;
+    memset(&admission, 0, sizeof(admission));
+    if (control_admission) {
+      /* The caller supplied a bounded memory source. Its actual encoded body
+       * is ready, so admit the complete frame and changed-key checkpoint before
+       * writing any canonical bytes. A provisional fixed-width source label
+       * changes neither the final metadata width nor its deletion bound. */
+      preview.key = (char *)key;
+      preview.found = preview.seen = 1;
+      preview.record_type = put_record_type;
+      preview.version = version;
+      preview.updated_at_unix = updated_at_unix;
+      preview.bytes = bytes;
+      preview.cipher_bytes = cipher_bytes;
+      preview.content_type = (char *)content_type;
+      preview.etag = etag;
+      preview.descriptor = descriptor;
+      preview.payload_context = payload_context;
+      preview.metadata = (unsigned char *)metadata;
+      preview.metadata_length = metadata_length;
+      preview.has_query_hidden = has_query_hidden;
+      preview.query_hidden = query_hidden;
+      preview.retention = retention;
+      preview.has_query_index_seq = 1;
+      preview.query_index_seq = query_index_seq;
+      preview.payload_span.present = 1;
+      preview.payload_span.container_leaf = "seg-00000000000000000001.log";
+      preview.payload_span.payload_length = cipher_bytes;
+      preview.payload_span.payload_crc = stored_crc;
+      rc = lc_pouch_state_snapshot_encode(
+          &pouch->allocator, &preview, put_record_type, &preview.payload_span,
+          LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, &admission.metadata,
+          &length, error);
+      admission.key = key;
+      admission.header.type = put_record_type;
+      admission.header.key_len = (unsigned long)strlen(key);
+      admission.header.meta_len = (unsigned long)length;
+      admission.header.payload_len = cipher_bytes;
+      admission.header.payload_crc = stored_crc;
+      required += length + cipher_bytes;
+      batch.count = 1;
+      batch.prefix = lc_pouch_state_control_prefix;
+      batch.context = &admission;
+    }
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-    rc = lc_pouch_state_storage_append_open(
-        pouch, cache, LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key),
-        LC_POUCH_STORAGE_APPEND_PREFIX, NULL, &manifest, &storage_append,
-        &segment_size, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_storage_append_open(
+          pouch, cache, required,
+          control_admission ? LC_POUCH_STORAGE_APPEND_MAINTENANCE
+                            : LC_POUCH_STORAGE_APPEND_PREFIX,
+          control_admission ? &batch : NULL, &manifest, &storage_append,
+          &segment_size, error);
+    lc_free_with_allocator(&pouch->allocator, admission.metadata);
     if (rc != LC_OK) {
       lc_pouch_state_append_lock_release(&append_lock);
       lc_free_with_allocator(&pouch->allocator, etag);
@@ -18610,6 +18690,59 @@ int lc_pouch_state_visit_prefix(lc_pouch *pouch, const char *ns,
   }
   return lc_pouch_state_visit_internal(pouch, ns, prefix, visitor, context, 0,
                                        error);
+}
+
+int lc_pouch_state_payload_keys_locked(lc_pouch *pouch, const char *ns,
+                                       const char *prefix, const char *after,
+                                       char **keys, size_t limit, size_t *count,
+                                       lc_error *error) {
+  lc_pouch_namespace_manifest manifest;
+  lc_pouch_namespace_logstore *cache;
+  lc_pouch_state_cache_record *selected[LC_POUCH_STATE_KEY_WINDOW], *record;
+  size_t length, found = 0, i, at;
+  int rc;
+  if (!pouch || !ns || !prefix || !*prefix || !keys || !count || !limit ||
+      limit > LC_POUCH_STATE_KEY_WINDOW ||
+      !lc_pouch_state_namespace_lock_is_held(pouch, ns))
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "payload key window requires namespace authority", NULL,
+                        NULL, "pouch");
+  *count = 0;
+  memset(keys, 0, limit * sizeof(*keys));
+  length = strlen(prefix);
+  rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
+  for (record = rc == LC_OK ? cache->records : NULL; record;
+       record = record->next) {
+    if (!record->found || !record->payload_span.present ||
+        strncmp(record->key, prefix, length) ||
+        (after && strcmp(record->key, after) <= 0))
+      continue;
+    if (found == limit && strcmp(record->key, selected[found - 1]->key) >= 0)
+      continue;
+    if (found < limit)
+      ++found;
+    at = found - 1;
+    while (at && strcmp(record->key, selected[at - 1]->key) < 0) {
+      selected[at] = selected[at - 1];
+      --at;
+    }
+    selected[at] = record;
+  }
+  for (i = 0; rc == LC_OK && i < found; ++i) {
+    keys[i] = lc_strdup_with_allocator(&pouch->allocator, selected[i]->key);
+    if (!keys[i])
+      rc = lc_error_set(error, LC_ERR_NOMEM, 0,
+                        "cannot copy payload key window", NULL, NULL, "pouch");
+  }
+  lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
+  if (rc == LC_OK)
+    *count = found;
+  else
+    for (i = 0; i < found; ++i) {
+      lc_free_with_allocator(&pouch->allocator, keys[i]);
+      keys[i] = NULL;
+    }
+  return rc;
 }
 
 int lc_pouch_state_visible_count(lc_pouch *pouch, const char *ns, size_t *count,

@@ -1070,7 +1070,11 @@ static int admission(void *context, const lc_pouch_record_header *h,
   if (rc == LC_OK && deletion) {
     slot_change *change = delta_find(d, key, (size_t)h->key_len, kind);
     if (deletion > change->slot->required_deletion)
-      rc = reserve_slot(c, change->slot, deletion, 0, e);
+      /* Completion records can introduce bounded control slots after spending
+       * the standing floor. They retain their future obligation, while their
+       * complete frame/checkpoint plan owns immediate admission. Ordinary
+       * writes must still preserve the unspent maintenance floor. */
+      rc = reserve_slot(c, change->slot, deletion, d->maintenance, e);
   }
   if (rc == LC_OK && !d->maintenance && !d->planning)
     rc = ps_budget_foreground_check(c->ns->root->space, e);
@@ -1227,7 +1231,7 @@ static int prepare_entry(ps_checkpoint_delta *d,
     uint64_t deletion = lc_pouch_state_entry_delete_bytes(&projected);
     if (deletion > change->slot->required_deletion)
       rc = reserve_slot(c, change->slot, deletion,
-                        !d->writer && !d->metadata_only, e);
+                        d->maintenance || (!d->writer && !d->metadata_only), e);
   }
   if (rc != LC_OK)
     return rc;

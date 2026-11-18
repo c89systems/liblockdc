@@ -130,6 +130,11 @@ typedef struct lc_pouch_storage_metadata_ops {
   int (*commit)(void *, void *, const lc_pouch_storage_batch *,
                 enum lc_pouch_storage_commit_mode, lc_error *);
   void (*close)(void *, void *);
+  /* At a committed maintenance boundary, make superseded metadata reusable
+   * if the next bounded record would otherwise exhaust completion capacity.
+   * This is a hint; the next actual begin still owns authoritative admission.
+   */
+  int (*reclaim)(void *, uint64_t, lc_error *);
   uint64_t batch_bytes; /* Independent metadata requests may be coalesced up to
                            this bound. */
 } lc_pouch_storage_metadata_ops;

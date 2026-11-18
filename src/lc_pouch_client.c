@@ -11914,6 +11914,22 @@ static int lc_pouch_txn_clear_lease_locked(
   return rc;
 }
 
+static int lc_pouch_retention_delete_attachments_locked(lc_pouch *,
+                                                        const char *,
+                                                        const char *,
+                                                        lc_error *);
+static int lc_pouch_retention_reclaim(lc_pouch *pouch, uint64_t bytes,
+                                      lc_error *error) {
+  if (!pouch->storage.ops)
+    return LC_OK;
+  if (!pouch->storage.ops->metadata || !pouch->storage.ops->metadata->reclaim)
+    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0,
+                        "typed metadata cannot reclaim completion space", NULL,
+                        NULL, "pouch");
+  return pouch->storage.ops->metadata->reclaim(pouch->storage.context, bytes,
+                                               error);
+}
+
 static int lc_pouch_txn_apply_state_participant_locked(void *context,
                                                        lc_error *error) {
   lc_pouch_txn_state_participant_context *ctx;
@@ -12004,6 +12020,15 @@ static int lc_pouch_txn_apply_state_participant_locked(void *context,
              ctx->txn_id) != 0) {
     goto cleanup;
   }
+  if (rc == LC_OK && ctx->retention_cleanup &&
+      strcmp(ctx->state, "commit") == 0) {
+    /* Probe enough space for the parent decision and both tombstones before
+     * applying them. Completed prepare/decision revisions can now be reclaimed.
+     * The actual atomic batch still performs authoritative complete admission.
+     */
+    rc = lc_pouch_retention_reclaim(
+        ctx->pouch, 3 * ((uint64_t)strlen(ctx->key) + 4096), error);
+  }
   if (rc == LC_OK && strcmp(ctx->state, "commit") == 0) {
     rc = lc_pouch_state_commit_staged_locked(ctx->pouch, ctx->ns, ctx->key,
                                              ctx->txn_id, &write_result, 1,
@@ -12019,7 +12044,11 @@ static int lc_pouch_txn_apply_state_participant_locked(void *context,
   if (rc == LC_OK && ctx->retention_cleanup)
     rc =
         lc_pouch_retention_note_phase(LC_POUCH_RETENTION_PARENT_APPLIED, error);
-  if (rc == LC_OK) {
+  if (rc == LC_OK && ctx->retention_cleanup) {
+    if (strcmp(ctx->state, "commit") == 0)
+      rc = lc_pouch_retention_delete_attachments_locked(ctx->pouch, ctx->ns,
+                                                        ctx->key, error);
+  } else if (rc == LC_OK) {
     rc = lc_pouch_txn_apply_attachment_participant(
         ctx->pouch, ctx->ns, ctx->key, ctx->txn_id, ctx->state, error);
   }
@@ -17932,6 +17961,7 @@ static int lc_pouch_retention_journal_locked(void *context, lc_error *error) {
   if (rc == LC_OK && !ctx->retire_journal) {
     options.content_type = "application/x-lockdc-pouch-txn";
     options.create_if_absent = ctx->prepare_journal;
+    options.maintenance_completion = 1;
     rc = lc_pouch_state_write_locked(ctx->pouch, LC_POUCH_TXN_NAMESPACE,
                                      ctx->work.txn_id, source, &options,
                                      &written, error);
@@ -17953,54 +17983,52 @@ static int lc_pouch_retention_write_journal(lc_pouch_retention_cleanup *ctx,
                                             ctx, error);
 }
 
-static int
-lc_pouch_retention_collect_attachment(const lc_pouch_state_visit_entry *entry,
-                                      void *context, lc_error *error) {
-  lc_pouch_txn_key_list *keys = context;
-  if (!entry->has_payload ||
-      lc_pouch_storage_key_has_staging_suffix(entry->key))
-    return LC_OK;
-  return lc_pouch_txn_key_list_append(keys, entry->key, error);
-}
-
-static int lc_pouch_retention_stage_attachments(lc_pouch_retention_cleanup *ctx,
-                                                lc_error *error) {
-  lc_pouch_txn_key_list keys = {0};
+/* The ACTIVE work reference fences this parent's namespace prefix throughout
+ * commit/recovery. Its journal and single parent intent therefore identify the
+ * child deletion set without creating a second intent for every attachment.
+ * Keep only one bounded key window, and rediscover remaining live children
+ * after a crash. Never retain cache record pointers across a mutation. */
+static int lc_pouch_retention_delete_attachments_locked(lc_pouch *pouch,
+                                                        const char *ns,
+                                                        const char *parent,
+                                                        lc_error *error) {
   lc_pouch_state_write_options options = {0};
   lc_pouch_state_write_result written = {0};
-  lc_source *empty = NULL;
-  char *prefix = lc_pouch_attachment_prefix(ctx->ns, ctx->work.key, error);
-  size_t i;
-  int rc;
+  char *keys[LC_POUCH_STATE_KEY_WINDOW];
+  char *cursor = NULL;
+  char *prefix = lc_pouch_attachment_prefix(ns, parent, error);
+  size_t count = 0, i;
+  int rc = LC_OK;
   if (prefix == NULL)
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
-  rc = lc_pouch_state_visit_prefix(ctx->pouch, ctx->ns, prefix,
-                                   lc_pouch_retention_collect_attachment, &keys,
-                                   error);
-  options.content_type = LC_POUCH_ATTACHMENT_DELETE_CONTENT_TYPE;
   options.object_record = 1;
-  options.staged_delete_marker = 1;
-  options.maintenance_completion = 1;
-  options.has_query_hidden = 1;
-  options.query_hidden = 1;
-  for (i = 0; rc == LC_OK && i < keys.count; ++i) {
-    char *key = lc_pouch_staged_attachment_key_from_committed(
-        keys.keys[i], ctx->work.txn_id, error);
-    if (key == NULL) {
-      rc = error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  while (rc == LC_OK) {
+    rc = lc_pouch_state_payload_keys_locked(pouch, ns, prefix, cursor, keys,
+                                            LC_POUCH_STATE_KEY_WINDOW, &count,
+                                            error);
+    if (rc != LC_OK || !count)
       break;
+    for (i = 0; rc == LC_OK && i < count; ++i) {
+      if (lc_pouch_storage_key_has_staging_suffix(keys[i]))
+        continue;
+      rc = lc_pouch_retention_reclaim(pouch, (uint64_t)strlen(keys[i]) + 1024,
+                                      error);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_delete(pouch, ns, keys[i], &options, &written,
+                                   error);
+      lc_pouch_state_write_result_cleanup(&pouch->allocator, &written);
+      if (rc == LC_OK)
+        rc = lc_pouch_retention_note_phase(
+            LC_POUCH_RETENTION_ATTACHMENT_APPLIED, error);
     }
-    rc = lc_source_from_memory("", 0, &empty, error);
-    if (rc == LC_OK)
-      rc = lc_pouch_state_write(ctx->pouch, ctx->ns, key, empty, &options,
-                                &written, error);
-    lc_source_close(empty);
-    empty = NULL;
-    lc_pouch_state_write_result_cleanup(&ctx->pouch->allocator, &written);
-    lc_free_with_allocator(NULL, key);
+    lc_free_with_allocator(&pouch->allocator, cursor);
+    cursor = keys[count - 1];
+    keys[count - 1] = NULL;
+    for (i = 0; i < count; ++i)
+      lc_free_with_allocator(&pouch->allocator, keys[i]);
   }
+  lc_free_with_allocator(&pouch->allocator, cursor);
   lc_free_with_allocator(NULL, prefix);
-  lc_pouch_txn_key_list_cleanup(&keys);
   return rc;
 }
 
@@ -18075,8 +18103,6 @@ static int lc_pouch_retention_claim_and_stage_locked(void *context,
   }
   if (rc == LC_OK && !ctx->skip)
     rc = lc_pouch_retention_note_phase(LC_POUCH_RETENTION_CLAIMED, error);
-  if (rc == LC_OK && !ctx->skip)
-    rc = lc_pouch_retention_stage_attachments(ctx, error);
   if (rc == LC_OK && !ctx->skip) {
     memset(&options, 0, sizeof(options));
     options.staged_delete_marker = 1;
@@ -18105,7 +18131,6 @@ static int lc_pouch_retention_no_owned_work_locked(void *context,
   lc_pouch_state_read_result parent = {0};
   lc_pouch_state_read_result staged = {0};
   lc_pouch_lease_record lease = {0};
-  lc_pouch_txn_key_list attachments = {0};
   char *key =
       lc_pouch_staged_storage_key(ctx->work.key, ctx->work.txn_id, error);
   int owned = 0;
@@ -18120,13 +18145,9 @@ static int lc_pouch_retention_no_owned_work_locked(void *context,
   if (rc == LC_OK)
     rc = lc_pouch_state_read_metadata_locked(ctx->pouch, ctx->ns, key, &staged,
                                              error);
-  if (rc == LC_OK)
-    rc = lc_pouch_collect_staged_attachment_bases(
-        ctx->pouch, ctx->ns, ctx->work.key, ctx->work.txn_id, &attachments,
-        error);
   if (rc == LC_OK) {
     owned = (ctx->journal.state == NULL && ctx->work.fencing_token != 0) ||
-            staged.found || attachments.count != 0 ||
+            staged.found ||
             (lease.found && strcmp(lease.txn_id, ctx->work.txn_id) == 0);
     if (owned)
       rc = lc_error_set(
@@ -18134,7 +18155,6 @@ static int lc_pouch_retention_no_owned_work_locked(void *context,
           "state cleanup has owned work but no transaction journal",
           ctx->work.txn_id, NULL, "pouch");
   }
-  lc_pouch_txn_key_list_cleanup(&attachments);
   lc_free_with_allocator(NULL, key);
   lc_pouch_lease_record_cleanup(&lease);
   lc_pouch_state_read_result_cleanup(&ctx->pouch->allocator, &parent);

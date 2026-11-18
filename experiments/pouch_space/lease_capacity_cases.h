@@ -7,9 +7,10 @@
 typedef struct lease_capacity_trace {
   ps_space *space;
   ps_budget *peer;
-  ps_stats phases[LC_POUCH_RETENTION_DISCOVERED + 1];
+  ps_stats phases[LC_POUCH_RETENTION_PHASE_COUNT];
   unsigned long seen;
   int fill_phase;
+  size_t children_applied;
 } lease_capacity_trace;
 
 static ps_budget *lease_capacity_peer(ps_space *space, lc_error *e) {
@@ -37,6 +38,8 @@ static ps_budget *lease_capacity_peer(ps_space *space, lc_error *e) {
 }
 static int lease_capacity_note(int phase, void *context, lc_error *e) {
   lease_capacity_trace *profile = context;
+  if (phase == LC_POUCH_RETENTION_ATTACHMENT_APPLIED)
+    ++profile->children_applied;
   int rc = note_phase(phase, NULL, e);
   if (rc == LC_OK && phase == profile->fill_phase && !profile->peer) {
     profile->peer = lease_capacity_peer(profile->space, e);
@@ -103,6 +106,8 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   now(1000);
   setup(f, directory, 0, sync, crypto, &e);
   lease_capacity_seed(f, key, attached, &e);
+  if (attached > LC_POUCH_STATE_KEY_WINDOW)
+    write_parent(f, "other", 0, 1, &e);
   /* Recovery establishes a reproducible canonical prefix and all outstanding
    * checkpoint debt before either the peer or the expiry operation starts. */
   close_store(f);
@@ -147,7 +152,7 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
       "work_ms=%.6f reason=%s\n",
       sync, crypto, key_bytes, attached, fill_phase, fault_phase, completed, rc,
       profile.seen, elapsed * 1e3, e.message ? e.message : "complete");
-  for (int phase = 0; phase <= LC_POUCH_RETENTION_DISCOVERED; ++phase)
+  for (int phase = 0; phase < LC_POUCH_RETENTION_PHASE_COUNT; ++phase)
     if (profile.seen & (1UL << phase))
       lease_capacity_snapshot(&profile, phase, sync, crypto, key_bytes,
                               attached);
@@ -165,8 +170,14 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   ok(e.code, &e);
   lc_pouch_state_read_result_cleanup(&store(f)->allocator, &pinned);
   if (fault_phase) {
+    if (fault_phase == LC_POUCH_RETENTION_ATTACHMENT_APPLIED) {
+      REQUIRE(profile.children_applied && profile.children_applied <= attached);
+      parent(f, key, 0, 0, &e);
+      attachments(f, key, attached - profile.children_applied, &e);
+    }
     lc_pouch_maintenance_result_cleanup(&store(f)->allocator, &result);
-    if (!(fault_phase % 2)) {
+    if (!(fault_phase % 2) ||
+        fault_phase == LC_POUCH_RETENTION_ATTACHMENT_APPLIED) {
       ok(ps_budget_close(profile.peer, &e), &e);
       profile.peer = NULL;
       close_store(f);
@@ -179,6 +190,16 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
     REQUIRE(work.present && work.phase == LC_POUCH_RETENTION_ACTIVE &&
             !strcmp(work.key, key));
     lc_pouch_retention_work_cleanup(store(f), &work);
+    lc_acquire_req request;
+    lc_lease *blocked = NULL;
+    lc_acquire_req_init(&request);
+    request.key = key;
+    request.owner = "replacement";
+    request.ttl_seconds = 300;
+    REQUIRE(f->client->acquire(f->client, &request, &blocked, &e) ==
+            LC_ERR_PENDING);
+    REQUIRE(!blocked);
+    clear(&e);
     /* A committed outcome remains binding even when the wall clock retreats.
      * Retry its unfinished application with the ordinary peer still held. */
     now(900);
@@ -204,6 +225,10 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   open_store(f, 0, &e);
   parent(f, key, 0, 0, &e);
   attachments(f, key, 0, &e);
+  if (attached > LC_POUCH_STATE_KEY_WINDOW) {
+    parent(f, "other", 1, 0, &e);
+    attachments(f, "other", 1, &e);
+  }
   close_store(f);
   retire(f);
   printf("expiry_capacity_observation sync=%d crypto=%d key_bytes=%zu "
@@ -249,5 +274,56 @@ static void lease_capacity_profile(const char *directory, int required) {
           }
   printf("expiry_capacity complete=%zu cases=%zu recovery_verified=1\n",
          completed, total);
+}
+/* Exercise more than two key windows, with cuts immediately after the first
+ * child and after entering the second window. Native cases hold an ordinary
+ * peer throughout application/recovery; multifile remains a semantic reference.
+ */
+static void lease_attachment_windows(const char *directory) {
+  lc_error e;
+  lc_error_init(&e);
+  fixture *f = calloc(1, sizeof(*f));
+  REQUIRE(f);
+  for (int sync = 0; sync < 2; ++sync)
+    for (int crypto = 0; crypto < 4; ++crypto)
+      for (int cut = 0; cut < 3; ++cut) {
+        phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
+        attachment_cut_skip = cut == 2 ? 16 : 0;
+        lease_capacity_case(directory, sync, crypto, 1, 33,
+                            LC_POUCH_RETENTION_STAGED, !cut);
+        REQUIRE(!attachment_cut_skip);
+        now(1000);
+        setup(f, directory, 1, sync, crypto, &e);
+        lease_capacity_seed(f, "order", 33, &e);
+        write_parent(f, "other", 0, 1, &e);
+        now(1050);
+        phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
+        attachment_cut_skip = cut == 2 ? 16 : 0;
+        phase_hits = 0;
+        lc_pouch_maintenance_result result = {0};
+        int rc = lc_pouch_retention_run(store(f), "orders", 1, &result, &e);
+        if (cut) {
+          REQUIRE(rc == LC_ERR_TRANSPORT && phase_hits == 1 && !phase_fail &&
+                  !attachment_cut_skip);
+          clear(&e);
+          parent(f, "order", 0, 0, &e);
+          attachments(f, "order", cut == 1 ? 32 : 16, &e);
+        } else {
+          ok(rc, &e);
+          REQUIRE(result.retention_deleted_state_count == 1);
+        }
+        lc_pouch_maintenance_result_cleanup(&store(f)->allocator, &result);
+        close_store(f);
+        open_store(f, 0, &e);
+        now(900);
+        (void)clean(f, 1, &e);
+        settled(f, &e);
+        parent(f, "other", 1, 0, &e);
+        attachments(f, "other", 1, &e);
+        close_store(f);
+        retire(f);
+      }
+  free(f);
+  lc_error_cleanup(&e);
 }
 #endif

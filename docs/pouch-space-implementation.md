@@ -4122,6 +4122,113 @@ conversion, shared-root coordination/recovery, and performance qualification.
 Multifile remains the default/reference; production cutover still requires an
 explicit deployment decision.
 
+### Parent-owned attachment cleanup and complete control admission
+
+Retention cleanup now treats the fenced parent as the owner of its committed
+attachment set. The existing `.txns` journal remains the sole outcome authority;
+cleanup stages one parent delete intent, without creating a separate intent for
+every attachment. After a durable commit it applies the parent, deletes the live
+attachment prefix, clears the lease, forces application durability, records
+FINISHED, retires the journal and finally releases the work reference. Rollback
+discards the parent intent and leaves committed attachments alone. Ordinary user
+transactions and abandoned-holder attachment rollback retain their own staging
+protocol. No second outcome ledger or plaintext journal representation is added.
+
+Application copies at most 16 payload keys per window, retaining a cursor and
+prefix alongside them. It holds namespace mutation authority, retains no cache
+record pointers across mutations, and rediscovers remaining live children after
+interruption. ACTIVE work continues to block a replacement lease even after the
+parent tombstone is visible. This bounds temporary key copies, not total scan
+work: each window scans the resident namespace metadata, and one attempt still
+processes the entire parent. Large-fan-out scan complexity remains a target.
+
+The private maintenance-completion classification now admits the complete frame
+and changed-key checkpoint for a control body that its caller already holds in
+memory, within the existing 64 KiB memory-transform limit. The actual compressed
+or encrypted representation, CRC, descriptor and body length are known before
+admission. Arbitrary producers and larger memory sources retain their streaming
+append path; no application body is newly materialized or spooled. Journal JSON,
+crypto contexts and forced decision ordering remain unchanged.
+
+Completion can introduce bounded control slots after spending the standing
+floor. Those slots still retain future-deletion obligations, while the complete
+frame/checkpoint plan owns immediate admission. Ordinary writes continue to
+preserve the floor. Before parent application and each child deletion, the typed
+owner probes a conservative completion-space hint and checkpoints a completed
+physical prefix only when that hint cannot fit. Actual begin remains the
+authoritative admission boundary. Private producers and readers retaining old
+body incarnations preserve their claims through reclamation.
+
+The previous 64/96 public pressure result is now **96/96**, without container
+growth. `capacity-required` is registered as an acceptance check. Its matrix
+covers both durability policies, all four codecs, 5-byte and 8 KiB parent keys,
+zero or 16 attachments, and ordinary peer claims established before preparation
+or after staging, alongside uncontended cases. Each case checks a previously
+opened body reader, fixed 10 MiB size, physical consistency and repeated reopen.
+This is a workload-specific proof: it does not qualify every legal key size,
+control body above 64 KiB, or every possible collection of concurrent claims.
+
+`attachment-windows` adds 48 workflows across both backends, both policies and
+all four codecs, with 33 attachments. Cuts after child 1 and child 17 prove
+partial deletion, reopen, clock retreat, fencing and completion; native cases
+retain an ordinary peer during application and retry. An unrelated parent and
+its attachment must survive. Child application is also a deterministic failure
+and abrupt-process cut in the existing phase suites.
+
+Qualification for this surface:
+
+- 46 Debug checks, including query, queue, outbox, leases, transaction recovery,
+  native metadata, ordinary capacity, root obligations and API/source boundaries;
+  glibc workers use 128 KiB stacks with the stack cache disabled.
+- 11 GNU release and 11 musl release checks, including both new acceptance modes,
+  phase/process recovery and complete batch admission.
+- One combined-codec NoSync allocation sweep: 523 injected failures with both
+  retry paths. One combined-codec durable I/O sweep: 480 cuts across warm/cold
+  roots, including torn writes and lost acknowledgements.
+- Three ThreadSanitizer scenarios with instrumented OpenSSL and no suppressions:
+  native metadata concurrency, lease concurrency and attachment windows.
+- Strict Memcheck for attachment windows and metadata faults: 1,127,918 matched
+  allocations/frees, zero remaining heap, zero errors and zero owned descriptors.
+
+Matched performance uses the frozen `014f350a` GNU lease binary and this surface,
+three alternating samples, fixed 10 MiB roots and preopened workloads. Plaintext
+is codec 0; combined encryption/compression is codec 3. For an 8 KiB parent with
+16 attachments, before / after median milliseconds are:
+
+| Policy | Codec | Cleanup work | Work CPU | Close | Reopen | Reopen plus verification |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 0 | 54.34 / 48.59 | 9.81 / 4.85 | 0.192 / 0.113 | 6.55 / 5.84 | 8.02 / 6.96 |
+| NoSync | 3 | 51.60 / 42.71 | 9.49 / 4.88 | 0.160 / 0.133 | 6.70 / 6.24 | 8.25 / 7.31 |
+| Durable | 0 | 50.71 / 64.33 | 10.08 / 5.42 | 0.224 / 0.132 | 7.35 / 5.73 | 8.79 / 6.73 |
+| Durable | 3 | 47.56 / 38.18 | 9.61 / 5.47 | 0.170 / 0.188 | 7.02 / 6.15 | 8.53 / 7.17 |
+
+Cleanup CPU falls 43–51%, but durable plaintext wall time rises 27%. Both variants
+report 15 physical syncs through completion in that workload; the wall-time cause
+is unresolved. In the smaller 5-byte-parent/one-attachment probe, wall time falls
+1–15%, while combined-codec NoSync CPU rises 13% and reopen plus verification
+rises from 1.53 to 2.73 ms. These mixed, small-host samples do not establish a
+general latency acceptance. Query indexing is disabled in these expiry probes;
+the prior indexed-readiness comparison remains a separate open target.
+
+For the plaintext 8 KiB/16-attachment case, staging now selects 99 entries instead
+of 115, with live bytes 1,052,912 instead of 1,189,036. At completion, allocation
+is 1,638,400 instead of 1,912,832 bytes and live bytes are 919,453 instead of
+1,053,881. This reduces retained metadata without copying application bodies.
+
+Evidence is retained in ignored `build/pouch-space-prefix-cleanup/`:
+`qualified-debug.log`, `allocation-debug.log`, `io-debug.log`,
+`qualified-*-release.log`, `qualified-tsan.log`, `qualified-memcheck.log`,
+`memcheck-*`, `paired-performance.log`, `performance-summary.tsv`,
+`fanout-performance.log`, `fanout-summary.tsv` and the raw `fanout-*.log` runs.
+Qualification and benchmark scripts, summary derivation and the frozen baseline
+are retained there. Format markers and the public ABI are unchanged. Existing
+in-flight experimental roots are not qualified for cross-build recovery; existing
+root conversion remains deferred. The full backend goal remains active for
+general capacity progress, scan complexity, latency and indexed readiness,
+codec conversion and shared-root coordination/recovery. Multifile remains the
+default/reference; production cutover still requires an explicit deployment
+decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

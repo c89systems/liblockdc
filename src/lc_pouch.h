@@ -247,10 +247,11 @@ typedef struct lc_pouch_state_write_options {
    * Public content types remain ordinary content types unless this field is
    * set by the delete path. */
   int staged_delete_marker;
-  /* Internal lease/transaction completion: a bodyless metadata update can
-   * spend protected maintenance capacity. This grants neither mutation nor
-   * durability authority; the caller validates the completed reservation.
-   * Ordinary metadata changes leave this clear. */
+  /* Validated maintenance completion can spend protected capacity for metadata
+   * or a bounded already-materialized control body and its checkpoint plan.
+   * This grants neither mutation nor durability authority. Ordinary mutations
+   * leave this clear; arbitrary application producers keep streaming admission.
+   */
   int maintenance_completion;
 } lc_pouch_state_write_options;
 
@@ -457,6 +458,13 @@ int lc_pouch_state_visit_prefix(lc_pouch *pouch, const char *ns,
                                 const char *prefix,
                                 lc_pouch_state_visit_fn visitor, void *context,
                                 lc_error *error);
+/* Caller holds namespace mutation authority. Copy at most limit live payload
+ * keys into the caller's array, in lexical order after the cursor. No body or
+ * metadata field is copied. Output keys use pouch's allocator. */
+#define LC_POUCH_STATE_KEY_WINDOW 16U
+int lc_pouch_state_payload_keys_locked(lc_pouch *, const char *, const char *,
+                                       const char *, char **, size_t, size_t *,
+                                       lc_error *);
 int lc_pouch_state_index_seq(lc_pouch *pouch, const char *ns,
                              lc_pouch_generation *out, lc_error *error);
 /* Returns the durable sequence that can change indexed query candidates.

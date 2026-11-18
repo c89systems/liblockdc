@@ -159,6 +159,7 @@ static int phase_fail;
 static int phase_crash;
 static unsigned long phase_mask;
 static size_t phase_hits;
+static size_t attachment_cut_skip;
 typedef struct rendezvous {
   pthread_mutex_t mutex;
   pthread_cond_t condition;
@@ -196,7 +197,7 @@ static void gate_destroy(rendezvous *g) {
 static int note_phase(int phase, void *context, lc_error *e) {
   (void)context;
   REQUIRE(phase >= LC_POUCH_RETENTION_REF_CREATED &&
-          phase <= LC_POUCH_RETENTION_DISCOVERED);
+          phase < LC_POUCH_RETENTION_PHASE_COUNT);
   __atomic_fetch_or(&phase_mask, 1UL << phase, __ATOMIC_RELAXED);
   if (__atomic_load_n(&measure_enabled, __ATOMIC_ACQUIRE)) {
     if (phase == LC_POUCH_RETENTION_STAGED)
@@ -210,6 +211,12 @@ static int note_phase(int phase, void *context, lc_error *e) {
   }
   if (phase == __atomic_load_n(&phase_crash, __ATOMIC_ACQUIRE))
     _exit(70 + phase);
+  if (phase == LC_POUCH_RETENTION_ATTACHMENT_APPLIED &&
+      phase == __atomic_load_n(&phase_fail, __ATOMIC_ACQUIRE) &&
+      attachment_cut_skip) {
+    --attachment_cut_skip;
+    return LC_OK;
+  }
   if (phase == __atomic_load_n(&phase_fail, __ATOMIC_ACQUIRE) &&
       __atomic_exchange_n(&phase_fail, 0, __ATOMIC_ACQ_REL)) {
     __atomic_add_fetch(&phase_hits, 1, __ATOMIC_RELAXED);
@@ -481,8 +488,11 @@ static void phase_failures(const char *directory) {
   for (int native = 0; native < 2; ++native)
     for (int sync = 0; sync < 2; ++sync)
       for (int crypto = 0; crypto < 4; ++crypto)
-        for (int phase = LC_POUCH_RETENTION_REF_CREATED;
-             phase <= LC_POUCH_RETENTION_REF_CLEARED; ++phase) {
+        for (int step = LC_POUCH_RETENTION_REF_CREATED;
+             step <= LC_POUCH_RETENTION_REF_CLEARED + 1; ++step) {
+          int phase = step <= LC_POUCH_RETENTION_REF_CLEARED
+                          ? step
+                          : LC_POUCH_RETENTION_ATTACHMENT_APPLIED;
           now(1000);
           setup(f, directory, native, sync, crypto, &e);
           write_parent(f, "order", 50, 1, &e);
@@ -1230,8 +1240,11 @@ static void process_cuts(const char *directory, int crypto) {
    * this probe establishes the admitted exclusive container's process recovery.
    */
   for (int sync = 0; sync < 2; ++sync)
-    for (int phase = LC_POUCH_RETENTION_REF_CREATED;
-         phase <= LC_POUCH_RETENTION_REF_CLEARED; ++phase) {
+    for (int step = LC_POUCH_RETENTION_REF_CREATED;
+         step <= LC_POUCH_RETENTION_REF_CLEARED + 1; ++step) {
+      int phase = step <= LC_POUCH_RETENTION_REF_CLEARED
+                      ? step
+                      : LC_POUCH_RETENTION_ATTACHMENT_APPLIED;
       now(1000);
       setup(f, directory, 0, sync, crypto, &e);
       write_parent(f, "order", 50, 1, &e);
@@ -1583,6 +1596,8 @@ static void *worker(void *context) {
                         1);
   else if (!strcmp(r->mode, "capacity-completion"))
     lease_capacity_completion(r->directory);
+  else if (!strcmp(r->mode, "attachment-windows"))
+    lease_attachment_windows(r->directory);
   else if (!strcmp(r->mode, "capacity-uncontended")) {
     for (int sync = 0; sync < 2; ++sync)
       for (int crypto = 0; crypto <= 3; crypto += 3)
