@@ -120,6 +120,19 @@ enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFAULT = 0,
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
 };
+/* Atomic canonical metadata, with no application producer or byte-stream
+ * append. Prefixes are borrowed separately during begin and commit. Begin
+ * admits key/metadata ceilings; commit receives their finalized generations.
+ * Caller holds namespace mutation authority until close. */
+typedef struct lc_pouch_storage_metadata_ops {
+  int (*begin)(void *, void *, enum lc_pouch_storage_append_mode,
+               const lc_pouch_storage_batch *, uint64_t, void **, lc_error *);
+  int (*commit)(void *, void *, const lc_pouch_storage_batch *,
+                enum lc_pouch_storage_commit_mode, lc_error *);
+  void (*close)(void *, void *);
+  uint64_t batch_bytes; /* Independent metadata requests may be coalesced up to
+                           this bound. */
+} lc_pouch_storage_metadata_ops;
 #define LC_POUCH_STORAGE_TXN_GUARD_STRIPES 256U
 struct lc_pouch_outbox_store;
 struct lc_pouch_index_store_ops;
@@ -219,6 +232,7 @@ typedef struct lc_pouch_storage_ops {
   void (*queue_notify)(void *, const char *, const char *);
   int (*queue_wait)(void *, const char *, const char *, uint64_t);
   const struct lc_pouch_index_store_ops *(*query_indexes)(void *, void **);
+  const lc_pouch_storage_metadata_ops *metadata;
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;

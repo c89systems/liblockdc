@@ -43,6 +43,8 @@ struct key_slot {
   source_count *body;
   key_slot *next, *hash_next, *id_next;
   key_slot *dirty_next, **dirty_link;
+  key_slot *retire_next, **retire_link;
+  uint64_t retire_sequence;
   key_slot *left, *right;
   uint64_t range_end;
   unsigned int height;
@@ -61,7 +63,7 @@ struct ps_key_checkpoint {
   ps_namespace *ns;
   lc_allocator allocator;
   pthread_mutex_t mutex;
-  key_slot **keys, **ids, *slots, *dirty;
+  key_slot **keys, **ids, *slots, *dirty, *retiring;
   source_count **sources;
   size_t capacity, count, source_capacity, source_count;
   uint64_t dirty_count, dirty_bytes, uncovered_bytes;
@@ -83,6 +85,9 @@ struct ps_checkpoint_delta {
   size_t capacity, count, created;
   ps_budget_plan claim;
   int prepared, accepted, maintenance, planning, planned;
+  int metadata_only;
+  size_t metadata_count;
+  uint64_t metadata_bytes;
 };
 
 static int failure(lc_error *e, int code, const char *message) {
@@ -307,6 +312,47 @@ static int reserve_slot(ps_key_checkpoint *c, key_slot *s, uint64_t bytes,
     s->required_deletion = bytes;
   return rc;
 }
+static void retire_remove(key_slot *s) {
+  if (!s->retire_link)
+    return;
+  *s->retire_link = s->retire_next;
+  if (s->retire_next)
+    s->retire_next->retire_link = s->retire_link;
+  s->retire_link = NULL;
+  s->retire_next = NULL;
+  s->retire_sequence = 0;
+}
+static void retire_note(ps_key_checkpoint *c, key_slot *s, uint64_t sequence) {
+  if (s->required_deletion == s->summary.deletion_bytes) {
+    retire_remove(s);
+    return;
+  }
+  if (!s->retire_link) {
+    s->retire_next = c->retiring;
+    if (c->retiring)
+      c->retiring->retire_link = &s->retire_next;
+    c->retiring = s;
+    s->retire_link = &c->retiring;
+  }
+  s->retire_sequence = sequence;
+}
+static int settle_retired(ps_key_checkpoint *c, lc_error *e) {
+  key_slot *s, *next;
+  uint64_t selected, durable;
+  int rc = LC_OK;
+  if (!c->retiring)
+    return LC_OK;
+  rc = ps_publication_prefix(c->ns->root->space, &selected, &durable, e);
+  for (s = c->retiring; rc == LC_OK && s; s = next) {
+    next = s->retire_next;
+    if (s->retire_sequence <= durable) {
+      rc = reserve_slot(c, s, s->summary.deletion_bytes, 0, e);
+      if (rc == LC_OK)
+        retire_remove(s);
+    }
+  }
+  return rc;
+}
 static void summary_view(key_slot *slot, const key_summary *s,
                          lc_pouch_state_entry *r) {
   memset(r, 0, sizeof(*r));
@@ -444,25 +490,21 @@ static ps_key control_key(ps_key_checkpoint *c) {
   key.owner = c->ns->identity.owner;
   return key;
 }
-static int read_control(ps_key_checkpoint *c, lc_error *e) {
-  ps_reader *reader = NULL;
+static int decode_control(ps_key_checkpoint *c, ps_reader *reader,
+                          ps_checkpoint_info *out, lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
+  ps_ref ref;
   size_t got = 0, i;
-  int rc = ps_read_open(c->ns->root->space, control_key(c), NULL, &reader, e);
-  if (rc == LC_ERR_INVALID) {
-    lc_error_cleanup(e);
-    return LC_OK;
-  }
-  if (rc == LC_OK && ps_read_size(reader) != sizeof(bytes))
-    rc = failure(e, LC_ERR_PROTOCOL, "checkpoint coverage has an invalid size");
-  if (rc == LC_OK)
-    rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
-  ps_reader_close(reader);
+  int rc;
+  if (ps_read_size(reader) != sizeof(bytes))
+    return failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint coverage has an invalid size");
+  rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
   if (rc != LC_OK)
     return rc;
   if (got != sizeof(bytes) || memcmp(bytes, "LCPSCKPT", 8) ||
       get64(bytes + 8) != c->ns->identity.owner || !get64(bytes + 16) ||
-      !get64(bytes + 24) ||
+      (!get64(bytes + 24) && get64(bytes + 32)) ||
       get64(bytes + 120) != (uint64_t)crc32(0, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage identity is invalid");
@@ -470,19 +512,75 @@ static int read_control(ps_key_checkpoint *c, lc_error *e) {
     if (bytes[i])
       return failure(e, LC_ERR_PROTOCOL,
                      "checkpoint coverage has unknown fields");
-  c->selected.epoch = get64(bytes + 16);
-  c->selected.segment = get64(bytes + 24);
-  c->selected.offset = get64(bytes + 32);
-  c->selected.state_index = get64(bytes + 40);
-  c->selected.query_index = get64(bytes + 48);
-  if (c->selected.query_index > c->selected.state_index)
+  memset(out, 0, sizeof(*out));
+  ps_read_reference(reader, &ref);
+  out->control = ref.incarnation;
+  out->epoch = get64(bytes + 16);
+  out->segment = get64(bytes + 24);
+  out->offset = get64(bytes + 32);
+  out->state_index = get64(bytes + 40);
+  out->query_index = get64(bytes + 48);
+  if (out->query_index > out->state_index)
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint query boundary exceeds state");
+  return LC_OK;
+}
+static int read_control(ps_key_checkpoint *c, lc_error *e) {
+  ps_reader *reader = NULL;
+  int rc = ps_read_open(c->ns->root->space, control_key(c), NULL, &reader, e);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    return LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = decode_control(c, reader, &c->selected, e);
+  ps_reader_close(reader);
+  if (rc != LC_OK)
+    return rc;
   c->state_index = c->selected.state_index;
   c->query_index = c->selected.query_index;
   c->latest_segment = c->selected.segment;
   c->latest_offset = c->selected.offset;
   return LC_OK;
+}
+int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
+                              ps_checkpoint_info *coverage, lc_error *e) {
+  ps_values *values = NULL;
+  ps_reader *reader = NULL;
+  ps_key key;
+  ps_ref ref;
+  uint64_t bytes;
+  size_t i;
+  int rc;
+  if (!c || !out || !coverage)
+    return failure(e, LC_ERR_INVALID, "metadata capture requires output");
+  *out = NULL;
+  memset(coverage, 0, sizeof(*coverage));
+  pthread_mutex_lock(&c->mutex);
+  rc = ps_values_capture(c->ns->root->space, c->ns->identity.owner,
+                         PS_KEY_METADATA, PS_NAMESPACE_CHECKPOINT, &values, e);
+  for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
+    rc = ps_values_info(values, i, &key, &ref, &bytes, e);
+    if (rc != LC_OK || key.kind != PS_NAMESPACE_CHECKPOINT)
+      continue;
+    if (key.key != 1)
+      rc = failure(e, LC_ERR_PROTOCOL, "unknown namespace coverage slot");
+    else if (ref.incarnation == c->selected.control)
+      *coverage = c->selected;
+    else {
+      rc = ps_values_read_open(values, i, &reader, e);
+      if (rc == LC_OK)
+        rc = decode_control(c, reader, coverage, e);
+      ps_reader_close(reader);
+      reader = NULL;
+    }
+  }
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK)
+    *out = values;
+  else
+    ps_values_close(values);
+  return rc;
 }
 static int load_slots(ps_key_checkpoint *c, lc_error *e) {
   ps_values *values = NULL;
@@ -990,9 +1088,19 @@ int ps_checkpoint_delta_open(ps_key_checkpoint *c, int maintenance,
   d = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*d));
   if (!d)
     return failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint append");
+  pthread_mutex_lock(&c->mutex);
+  {
+    int rc = settle_retired(c, e);
+    if (rc != LC_OK) {
+      pthread_mutex_unlock(&c->mutex);
+      lc_free_with_allocator(&c->allocator, d);
+      return rc;
+    }
+  }
   d->checkpoint = c;
   d->maintenance = maintenance;
   d->claim = c->claim;
+  pthread_mutex_unlock(&c->mutex);
   *out = d;
   return LC_OK;
 }
@@ -1118,7 +1226,8 @@ static int prepare_entry(ps_checkpoint_delta *d,
   {
     uint64_t deletion = lc_pouch_state_entry_delete_bytes(&projected);
     if (deletion > change->slot->required_deletion)
-      rc = reserve_slot(c, change->slot, deletion, !d->writer, e);
+      rc = reserve_slot(c, change->slot, deletion,
+                        !d->writer && !d->metadata_only, e);
   }
   if (rc != LC_OK)
     return rc;
@@ -1226,6 +1335,8 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
     s->pending = change->record;
     memset(&change->record, 0, sizeof(change->record));
     s->bound = change->bound;
+    /* The newer stream owns retirement until its funded slot is durable. */
+    retire_remove(s);
     bind_source(c, s, change->body, &change->summary);
     release_prepared_source(c, change->body);
     change->body = NULL;
@@ -1399,37 +1510,293 @@ int ps_key_checkpoint_due(ps_key_checkpoint *c) {
   return due;
 }
 
-static int write_control(ps_key_checkpoint *c, uint64_t epoch, ps_writer **out,
-                         lc_error *e) {
+static int write_control_values(ps_key_checkpoint *c, ps_budget *budget,
+                                const ps_checkpoint_info *info, ps_writer **out,
+                                lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES] = {0};
   int rc;
   memcpy(bytes, "LCPSCKPT", 8);
   put64(bytes + 8, c->ns->identity.owner);
-  put64(bytes + 16, epoch);
-  put64(bytes + 24, c->latest_segment);
-  put64(bytes + 32, c->latest_offset);
-  put64(bytes + 40, c->state_index);
-  put64(bytes + 48, c->query_index);
+  put64(bytes + 16, info->epoch);
+  put64(bytes + 24, info->segment);
+  put64(bytes + 32, info->offset);
+  put64(bytes + 40, info->state_index);
+  put64(bytes + 48, info->query_index);
   put64(bytes + 120, (uint64_t)crc32(0, bytes, 120));
-  rc = ps_begin(c->ns->root->space, c->budget, control_key(c), out, e);
+  rc = ps_begin(c->ns->root->space, budget, control_key(c), out, e);
   if (rc == LC_OK)
     rc = ps_write(*out, bytes, sizeof(bytes), e);
   return rc;
 }
-int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
+static int write_control(ps_key_checkpoint *c, uint64_t epoch, ps_writer **out,
+                         lc_error *e) {
+  ps_checkpoint_info info = {0};
+  info.epoch = epoch;
+  info.segment = c->latest_segment;
+  info.offset = c->latest_offset;
+  info.state_index = c->state_index;
+  info.query_index = c->query_index;
+  return write_control_values(c, c->budget, &info, out, e);
+}
+int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
+                          const lc_pouch_storage_batch *batch, uint64_t bytes,
+                          ps_checkpoint_delta **out, lc_error *e) {
+  ps_checkpoint_delta *d = NULL;
+  ps_budget *parent = NULL;
+  ps_budget_plan cost;
+  lc_pouch_record_header h;
+  const void *key, *meta;
+  size_t i;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!c || !out || !batch || !batch->prefix || !batch->count)
+    return failure(e, LC_ERR_INVALID,
+                   "native metadata requires prefixes and output");
+  pthread_mutex_lock(&c->mutex);
+  rc = c->changed || c->dirty
+           ? failure(e, LC_ERR_INVALID,
+                     "native metadata requires completed stream debt")
+           : LC_OK;
+  pthread_mutex_unlock(&c->mutex);
+  for (i = 0; rc == LC_OK && i < batch->count; ++i) {
+    memset(&h, 0, sizeof(h));
+    key = meta = NULL;
+    rc = batch->prefix(batch->context, i, &h, &key, &meta, e);
+    if (rc == LC_OK && (h.payload_len || h.flags || h.payload_crc))
+      rc = failure(e, LC_ERR_INVALID,
+                   "native metadata cannot contain producer bytes");
+  }
+  if (rc == LC_OK)
+    rc = ps_checkpoint_delta_open(c, maintenance, &d, e);
+  if (rc == LC_OK)
+    rc = ps_checkpoint_delta_plan(d, batch, bytes, &cost, e);
+  if (rc == LC_OK && cost.metadata_bytes > PS_JOURNAL - 64)
+    rc = failure(e, LC_ERR_INVALID,
+                 "native metadata exceeds one revision descriptor window");
+  if (rc == LC_OK) {
+    cost.maintenance = maintenance;
+    rc = ps_budget_open(c->ns->root->space, &cost, &parent, e);
+  }
+  if (rc == LC_OK)
+    rc = ps_checkpoint_delta_fund(d, parent, &cost, e);
+  (void)ps_budget_close(parent, NULL);
+  if (rc == LC_OK) {
+    d->metadata_only = 1;
+    d->metadata_count = batch->count;
+    d->metadata_bytes = bytes;
+    *out = d;
+  } else
+    ps_checkpoint_delta_close(d);
+  return rc;
+}
+typedef struct metadata_input {
+  struct iovec parts[3];
+  uint64_t bytes;
+} metadata_input;
+static int metadata_read(void *context, uint64_t offset,
+                         const struct iovec *parts, int count, lc_error *e) {
+  metadata_input *input = context;
+  int i, j;
+  for (i = 0; i < count; ++i) {
+    unsigned char *to = parts[i].iov_base;
+    size_t left = parts[i].iov_len;
+    if (offset > input->bytes || left > input->bytes - offset)
+      return failure(e, LC_ERR_PROTOCOL,
+                     "native metadata prefix read exceeds its span");
+    while (left) {
+      uint64_t base = 0;
+      for (j = 0; j < 3; ++j) {
+        if (offset - base < input->parts[j].iov_len) {
+          size_t at = (size_t)(offset - base);
+          size_t take = input->parts[j].iov_len - at;
+          if (take > left)
+            take = left;
+          memcpy(to, (const unsigned char *)input->parts[j].iov_base + at,
+                 take);
+          to += take;
+          offset += take;
+          left -= take;
+          break;
+        }
+        base += input->parts[j].iov_len;
+      }
+      if (j == 3)
+        return failure(e, LC_ERR_PROTOCOL,
+                       "native metadata prefix is incomplete");
+    }
+  }
+  return LC_OK;
+}
+int ps_key_metadata_commit(ps_checkpoint_delta *d,
+                           const lc_pouch_storage_batch *batch,
+                           enum ps_commit_mode mode, lc_error *e) {
+  static const lc_pouch_record_io_ops ops = {metadata_read, NULL, NULL, NULL,
+                                             NULL};
+  ps_key_checkpoint *c;
+  ps_writer **writers = NULL;
+  slot_change *change;
+  ps_checkpoint_info selected = {0};
+  lc_pouch_state_entry entry = {0};
+  lc_pouch_record_header h;
+  unsigned char header[LC_POUCH_RECORD_HEADER_BYTES];
+  metadata_input input;
+  lc_pouch_record_io io;
+  const void *key, *meta;
+  ps_ref control_ref;
+  uint64_t next, bytes, total = 0, prefix = 0;
+  size_t i, count = 0;
+  int rc = LC_OK, found, truncated;
+  if (!d || !d->metadata_only || d->accepted || d->prepared || !batch ||
+      !batch->prefix || batch->count != d->metadata_count ||
+      (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
+    return failure(e, LC_ERR_INVALID, "native metadata plan is not open");
+  c = d->checkpoint;
+  io.ops = &ops;
+  io.context = &input;
+  pthread_mutex_lock(&c->mutex);
+  for (i = 0; rc == LC_OK && i < batch->count; ++i) {
+    memset(&h, 0, sizeof(h));
+    key = meta = NULL;
+    pthread_mutex_unlock(&c->mutex);
+    rc = batch->prefix(batch->context, i, &h, &key, &meta, e);
+    if (rc == LC_OK && (h.payload_len || h.flags || h.payload_crc))
+      rc = failure(e, LC_ERR_PROTOCOL, "native metadata gained producer bytes");
+    /* Borrowed providers and admission run outside the owner mutex. */
+    if (rc == LC_OK)
+      rc = admission(d, &h, key, meta, e);
+    pthread_mutex_lock(&c->mutex);
+    if (rc != LC_OK)
+      break;
+    bytes = LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)h.key_len + h.meta_len;
+    if (bytes > d->metadata_bytes - total) {
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "native metadata differs from its admitted span");
+      break;
+    }
+    total += bytes;
+    lc_pouch_record_header_encode(&h, header);
+    input.parts[0].iov_base = header;
+    input.parts[0].iov_len = sizeof(header);
+    input.parts[1].iov_base = (void *)key;
+    input.parts[1].iov_len = (size_t)h.key_len;
+    input.parts[2].iov_base = (void *)meta;
+    input.parts[2].iov_len = (size_t)h.meta_len;
+    input.bytes = bytes;
+    change = key ? delta_find(d, key, (size_t)h.key_len,
+                              h.type == LC_POUCH_STATE_RECORD_DECISION
+                                  ? PS_KEY_DECISION
+                                  : PS_KEY_METADATA)
+                 : NULL;
+    found = truncated = 0;
+    next = 0;
+    rc = lc_pouch_state_record_read(
+        io, &c->allocator,
+        change ? change->slot->leaf : "snapshot-00000000000000000001.log", 0,
+        bytes, 0, 0, NULL, &entry, &next, &found, &truncated, e);
+    if (rc == LC_OK && (!found || truncated || next != bytes))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "native metadata has an incomplete record");
+    if (rc == LC_OK)
+      rc = prepare_entry(d, &entry, e);
+    lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+  }
+  if (rc == LC_OK &&
+      (total != d->metadata_bytes || d->count > UINT64_MAX - c->body_epoch))
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "native metadata preparation exceeds its plan");
+  if (rc == LC_OK) {
+    selected.segment = c->latest_segment;
+    selected.offset = c->latest_offset;
+    selected.state_index =
+        d->state_index > c->state_index ? d->state_index : c->state_index;
+    selected.query_index =
+        d->query_index > c->query_index ? d->query_index : c->query_index;
+    d->prepared = 1;
+  }
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK)
+    rc = ps_catalog_allocate_id(c->ns->root->space, &selected.epoch, e);
+  if (rc == LC_OK && d->count >= (size_t)-1 / sizeof(*writers))
+    rc = failure(e, LC_ERR_NOMEM,
+                 "native metadata writer list exceeds local bounds");
+  if (rc == LC_OK) {
+    writers =
+        lc_calloc_with_allocator(&c->allocator, d->count + 1, sizeof(*writers));
+    if (!writers)
+      rc = failure(e, LC_ERR_NOMEM, "cannot allocate native metadata writers");
+  }
+  for (change = d->changes; rc == LC_OK && change; change = change->next) {
+    ps_key physical;
+    if (!change->prepared)
+      continue;
+    physical.owner = c->ns->identity.owner;
+    physical.key = change->slot->id;
+    physical.kind = change->slot->kind;
+    rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, physical,
+                                    &change->record, &writers[count], e);
+    if (rc == LC_OK)
+      ++count;
+  }
+  if (rc == LC_OK) {
+    rc = write_control_values(c, c->budget, &selected, &writers[count], e);
+    if (rc == LC_OK)
+      rc = ps_revision_writer_info(writers[count], &control_ref, &bytes, e);
+    if (writers[count])
+      ++count;
+  }
+  if (rc == LC_OK)
+    rc = ps_revision_publish(writers, count, 0, mode, NULL, &prefix, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&c->mutex);
+    for (change = d->changes; change; change = change->next) {
+      key_slot *s = change->slot;
+      if (!change->prepared)
+        continue;
+      if (change->created) {
+        insert_slot(c, s);
+        change->created = 0;
+      }
+      bind_source(c, s, change->body, &change->summary);
+      release_prepared_source(c, change->body);
+      change->body = NULL;
+      retire_note(c, s, prefix);
+    }
+    selected.control = control_ref.incarnation;
+    c->selected = selected;
+    c->state_index = selected.state_index;
+    c->query_index = selected.query_index;
+    d->accepted = 1;
+    (void)settle_retired(c, NULL);
+    pthread_mutex_unlock(&c->mutex);
+  }
+  for (i = 0; i < count; ++i)
+    ps_writer_close(writers[i]);
+  lc_free_with_allocator(&c->allocator, writers);
+  return rc;
+}
+static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
+                            lc_error *e) {
   ps_writer *writers[CHECKPOINT_BATCH + 1];
   key_slot *slots[CHECKPOINT_BATCH], *s;
   ps_checkpoint_ref refs[CHECKPOINT_BATCH];
   ps_checkpoint_observer observer;
   ps_budget_plan cost;
   void *plan;
-  uint64_t descriptors, epoch = 0;
+  uint64_t descriptors, epoch = 0, control_bytes;
+  ps_ref control_ref;
+  uint64_t prefix;
   size_t count, ordinary, i, outputs;
   int rc = LC_OK, final;
   if (!c)
     return failure(e, LC_ERR_INVALID,
                    "checkpoint flush requires namespace owner");
   pthread_mutex_lock(&c->mutex);
+  rc = settle_retired(c, e);
+  if (rc != LC_OK) {
+    pthread_mutex_unlock(&c->mutex);
+    return rc;
+  }
   if (!c->changed) {
     pthread_mutex_unlock(&c->mutex);
     return LC_OK;
@@ -1474,6 +1841,9 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
     }
     if (rc == LC_OK && final) {
       rc = write_control(c, epoch, &writers[outputs], e);
+      if (rc == LC_OK)
+        rc = ps_revision_writer_info(writers[outputs], &control_ref,
+                                     &control_bytes, e);
       /* Include failed private control writer in cleanup too. */
       if (writers[outputs])
         ++outputs;
@@ -1482,7 +1852,10 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
       rc = observer.prepare(observer.context, c->ns->name, refs, ordinary,
                             &plan, e);
     if (rc == LC_OK)
-      rc = ps_revision_publish(writers, outputs, 1, NULL, e);
+      rc = ps_revision_publish(writers, outputs, force_durable,
+                               force_durable ? PS_COMMIT_DEFAULT
+                                             : PS_COMMIT_DEFER_SYNC,
+                               NULL, &prefix, e);
     if (observer.finish && plan)
       observer.finish(observer.context, plan, rc == LC_OK);
     for (i = 0; i < outputs; ++i)
@@ -1498,10 +1871,10 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
         dirty_remove(c, s);
         ps_checkpoint_record_close(&s->pending);
         s->bound = 0;
-        /* The selected forward slot is now durable and canonical replay
-         * rejects superseded prefixes. Old reader-held storage stays owned;
-         * it is never counted as newly available reserve. */
-        (void)reserve_slot(c, s, s->summary.deletion_bytes, 0, NULL);
+        /* Retain the old obligation until the entire replacement prefix is
+         * durable, including when this flush is folded into a caller's scope.
+         */
+        retire_note(c, s, prefix);
       }
       if (final) {
         c->selected.epoch = epoch;
@@ -1509,6 +1882,7 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
         c->selected.offset = c->latest_offset;
         c->selected.state_index = c->state_index;
         c->selected.query_index = c->query_index;
+        c->selected.control = control_ref.incarnation;
         memset(&c->claim, 0, sizeof(c->claim));
         c->changed = 0;
         c->uncovered_bytes = 0;
@@ -1518,8 +1892,16 @@ int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
       if (c->changed)
         rc = fund(c, &c->claim, e);
     }
+    if (rc == LC_OK)
+      (void)settle_retired(c, NULL);
     settle(c);
     pthread_mutex_unlock(&c->mutex);
   }
   return rc;
+}
+int ps_key_checkpoint_flush(ps_key_checkpoint *c, lc_error *e) {
+  return checkpoint_flush(c, 1, e);
+}
+int ps_key_checkpoint_flush_deferred(ps_key_checkpoint *c, lc_error *e) {
+  return checkpoint_flush(c, 0, e);
 }

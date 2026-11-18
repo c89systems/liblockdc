@@ -54,6 +54,9 @@ enum ps_kind {
   PS_NAMESPACE_CHECKPOINT = 42
 };
 typedef struct ps_space ps_space;
+/* Completed journal publication and durable acknowledgement prefixes. Scalar
+ * observation only; no I/O, allocation, waiting or publication authority. */
+int ps_publication_prefix(ps_space *, uint64_t *, uint64_t *, lc_error *);
 typedef struct ps_budget ps_budget;
 typedef struct ps_writer ps_writer;
 typedef struct ps_reader ps_reader;

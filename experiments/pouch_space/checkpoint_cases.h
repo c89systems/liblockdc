@@ -109,7 +109,7 @@ static void checkpoint_records(int durable) {
                                 &error));
   OK(ps_checkpoint_record_write(s, budget, control, &decision, &writers[1],
                                 &error));
-  OK(ps_revision_publish(writers, 2, 1, NULL, &error));
+  OK(ps_revision_publish(writers, 2, 1, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   for (at = 0; at < 2; ++at) {
     ps_writer_close(writers[at]);
     writers[at] = NULL;

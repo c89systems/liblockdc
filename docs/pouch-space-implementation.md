@@ -3978,6 +3978,150 @@ inherited checksum proof, collection REGION relocation, codec conversion and
 shared-root coordination/recovery. Multifile remains the default/reference;
 production cutover still needs an explicit deployment decision.
 
+### Native canonical metadata publication
+
+The typed owner now publishes bodyless mutations directly into canonical key
+values. One physical revision selects every changed key, retained decision and
+namespace coverage/high-water value together. Common Pouch uses a required
+`begin`/`commit`/`close` metadata capability; its typed bodyless path no longer
+appends a canonical byte stream and then creates another key checkpoint.
+Application bodies retain their existing producer-to-stream path and encoded
+span references. Independent metadata requests coalesce within an 8 MiB window
+and the existing request-count bound; individual key/metadata limits remain.
+
+Begin admits the complete borrowed-prefix plan before generation finalization.
+Commit rejects undeclared keys, producer bytes and prefixes exceeding the plan,
+prepares immutable metadata values, then publishes their ownership descriptors
+atomically. It does not concatenate application bodies or invoke a producer
+under physical publication authority. Metadata-only namespaces can have selected
+coverage with segment and offset both zero, without manufacturing a log source.
+
+Before a metadata mutation, already-funded stream checkpoint debt is selected
+in deferred mode. The following commit or caller's durability scope supplies the
+required completed prefix. This preserves folding PUT, META and DELETE work into
+one explicit barrier. CONTROL members and explicitly forced revisions still
+wait on NoSync roots. Future-deletion credits remain at their older bound until
+the replacement prefix is durable; an intrusive per-key retirement list observes
+the root's scalar publication/durability prefixes. A newer streaming mutation
+takes over that obligation until its checkpoint completes. There is no second
+persistent outcome ledger.
+
+Metadata captures now select key values and coverage at one visibility prefix.
+They use the captured control's physical incarnation to distinguish an older
+durable view from the owner's newer deferred revision. Captured readers retain
+their original values through replacement and physical checkpoints. Borrowed
+prefix providers run outside the metadata owner's mutex, so a paused provider
+allows readers and another namespace's writer to finish.
+
+Staged delete intents now contain metadata and a lifetime without an encoded
+empty application body. They validate an empty producer before selection,
+including propagating producer errors when the caller omits its error object.
+Attachment application reads metadata first and opens a body only for a real
+staged PUT. Explicit intents can be retired; deleting an ordinary lease-only
+placeholder retains its existing no-state behavior. Object classification is
+preserved on bodyless META records through the existing canonical object flag.
+This is an internal representation cutover with no public API/ABI change or
+independent format-marker increment. Existing-root conversion remains deferred.
+
+Maintenance now recognizes canonical metadata even when no log source exists.
+A forced public pass checkpoints the physical prefix and makes superseded
+metadata reusable. The new maintenance fixture replaces 16 MiB of metadata in
+a fixed 10 MiB container, periodically drives public maintenance, observes
+physical allocation fall, and verifies the final value after reopen. Plain and
+combined codecs run under both policies. No source or capacity growth is needed.
+Source-tail threshold tests now use actual streamed records; their physical
+reclamation and pinned-body checks remain.
+
+The three new native metadata groups prove source-less reopen, multi-key and
+decision atomicity, finalized-plan rejection, deferred visibility, old captured
+values, future-deletion credit retirement, and paused-provider concurrency.
+They exercise 129 allocation/write/sync/captured-read failure points across both
+policies. The main Debug ASan/UBSan qualification passes 59 selected groups,
+including all eight query SDK configurations, queue/outbox SDK controls,
+lease policy/phase/concurrency/coordinated workflows, 1,878 staging failure
+sites, and 324 allocation plus 396 I/O maintenance failure sites. Supplementary
+staging/crash checks pass 208 process-death/lost-write scenarios, targeting the
+native revision header and incomplete member prefixes. Their durable seed is
+explicit, including for NoSync bodyless intents. Focused final checks also prove
+the metadata-only maintenance repair and captured values across root checkpoint.
+
+GNU Release passes ten selected groups, including shared public-symbol and API
+boundaries; musl Release passes six. Both additionally pass the final canonical
+metadata/maintenance checks. Five TSan scenarios pass with instrumented OpenSSL
+and no suppressions. Strict Memcheck passes native metadata failure injection,
+the 56-workflow capacity-completion fixture and maintenance: 409,622 allocations
+and matching frees, zero errors, no retained heap, and only three inherited
+descriptors in each process.
+
+The broader pressure matrix remains **64/96** completed with the ordinary peer
+claim held. All 96 still recover after release. The standing floor is unchanged;
+this is not complete compound admission. In the plaintext/NoSync 8 KiB-key,
+16-attachment case, live bytes after staging fall from 1,662,334 to 1,189,036 and
+allocated bytes from 1,994,752 to 1,597,440, while the payload floor remains
+81,920 bytes. The operation still cannot finish attachment application with that
+peer held. The earlier 24 journal-prepare failures also remain. The strict manual
+`capacity-required` gate still fails and is not registered as a green test.
+
+The matched uncontended expiry comparison uses the frozen `aa60a5c6` GNU fixture,
+the same one-parent/one-attachment workflow, plaintext/combined codecs and both
+policies. Three alternating samples per configuration produce 24 verified runs.
+Taking each configuration's median, then the median of its two codec ratios:
+
+| Native metadata / prior single-file algorithms | NoSync | Durable |
+| --- | ---: | ---: |
+| Expiry work | 1.29x | 1.14x |
+| Work CPU | 1.27x | 1.17x |
+| Close | 1.15x | 1.01x |
+| Reopen | 0.97x | 1.08x |
+| Reopen plus verification | 0.95x | 1.05x |
+
+Current work medians are 32.74/30.00 ms and CPU 2.04/1.89 ms
+(NoSync/durable). This is a measured regression in that small workflow. Eager
+canonical key publication replaces pending log updates; the zero-attachment
+NoSync phase probe actually uses two fewer barriers, so extra forced barriers
+do not explain its cost. These expiry probes disable query indexing.
+
+Separate current single-file/multifile comparisons use three alternating
+samples, plaintext/no compression, preopened roots and two independent writers.
+The metadata probe seeds 48 bodies of 4 KiB before measuring two update rounds.
+The table gives single-file / multifile median times in milliseconds:
+
+| Metadata phase | NoSync | Durable |
+| --- | ---: | ---: |
+| Update work | 4.82 / 15.34 | 314.73 / 321.61 |
+| Work CPU | 7.33 / 4.84 | 23.44 / 22.04 |
+| Close | 0.15 / 26.49 | 0.22 / 24.85 |
+| Reopen | 8.62 / 0.73 | 2.01 / 0.59 |
+| Reopen plus read verification | 9.25 / 2.79 | 2.49 / 2.15 |
+
+The indexed lifecycle probe uses 16 records of 1 KiB, two rounds, 24 verified
+indexed queries per run, and explicit flush/first/repeat query phases:
+
+| Indexed phase, single-file / multifile milliseconds | NoSync | Durable |
+| --- | ---: | ---: |
+| Lifecycle work including indexed readiness | 58.47 / 22.78 | 637.47 / 440.69 |
+| Work CPU | 15.20 / 15.57 | 48.35 / 49.83 |
+| Maximum worker index flush | 18.74 / 1.47 | 19.66 / 1.49 |
+| Close | 0.43 / 34.72 | 0.43 / 38.76 |
+| Reopen plus verification | 4.08 / 1.12 | 4.24 / 1.44 |
+
+The smaller footprint and faster NoSync metadata wall time do not establish a
+general performance acceptance. Indexed readiness and reopen remain substantial
+targets, and the small expiry regression remains open. These are cached
+small-host samples; work, readiness, close and reopen are kept separate.
+
+Evidence is in ignored `build/pouch-space-native-metadata/`: `qualified-debug*`,
+`crash-debug*`, `metadata-maintenance-debug*`, `qualified-gnu*`, `qualified-musl*`,
+`final-*`, `qualified-tsan.log`, `qualified-memcheck.log`, `memcheck-*`,
+`profile-gnu.log`, `acceptance-required.log`, `acceptance-status.log`,
+`paired-performance.log`, `performance-summary.tsv`, `reference-performance.log`
+and `reference-summary.tsv`. The paired/reference scripts and summary derivations
+are retained there. The full backend goal remains active: compound admission
+and recovery, inherited checksum proof, collection REGION relocation, codec
+conversion, shared-root coordination/recovery, and performance qualification.
+Multifile remains the default/reference; production cutover still requires an
+explicit deployment decision.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

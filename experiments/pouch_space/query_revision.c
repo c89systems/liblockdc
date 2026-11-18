@@ -204,7 +204,8 @@ static int query_replace(void *context, const char *name,
   if (rc == LC_OK)
     rc = produce_value(writer, bound, produce, producer, e);
   if (rc == LC_OK)
-    rc = ps_revision_publish(&writer, 1, durable, NULL, e);
+    rc = ps_revision_publish(&writer, 1, durable, PS_COMMIT_DEFAULT, NULL, NULL,
+                             e);
   ps_writer_close(writer);
   (void)ps_budget_close(budget, NULL);
   ps_namespace_release(ns);
@@ -353,7 +354,8 @@ static int query_publish(void *context, void *build, const char *name,
     /* A completed index flush has always stabilized its canonical snapshot,
      * including on NoSync roots. Preserve that boundary with one shared
      * barrier for generation, manifest and the completed readiness prefix. */
-    rc = ps_revision_publish(revision->writers, 2, 1, NULL, e);
+    rc = ps_revision_publish(revision->writers, 2, 1, PS_COMMIT_DEFAULT, NULL,
+                             NULL, e);
   return rc;
 }
 static int query_acquire(void *context, const char *name, void **out,

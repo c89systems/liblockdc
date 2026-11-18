@@ -11,6 +11,8 @@ typedef struct ps_checkpoint_delta ps_checkpoint_delta;
 typedef struct ps_checkpoint_info {
   uint64_t epoch, segment, offset, state_index, query_index;
   uint64_t slots, pending, pending_bytes;
+  uint64_t
+      control; /* Captured physical incarnation, never a logical generation. */
 } ps_checkpoint_info;
 typedef lc_pouch_storage_checkpoint_ref ps_checkpoint_ref;
 typedef struct ps_checkpoint_observer {
@@ -55,6 +57,21 @@ void ps_key_checkpoint_replayed(ps_key_checkpoint *, uint64_t, uint64_t);
 int ps_key_checkpoint_cover_empty(ps_key_checkpoint *, uint64_t, lc_error *);
 int ps_key_checkpoint_due(ps_key_checkpoint *);
 int ps_key_checkpoint_flush(ps_key_checkpoint *, lc_error *);
+/* Complete funded stream debt before a native metadata batch without forcing
+ * an extra barrier. Its replacement obligations remain until prefix durability.
+ */
+int ps_key_checkpoint_flush_deferred(ps_key_checkpoint *, lc_error *);
+/* Caller excludes canonical mutation and has completed prior stream debt. */
+int ps_key_metadata_begin(ps_key_checkpoint *, int maintenance,
+                          const lc_pouch_storage_batch *, uint64_t,
+                          ps_checkpoint_delta **, lc_error *);
+int ps_key_metadata_commit(ps_checkpoint_delta *,
+                           const lc_pouch_storage_batch *, enum ps_commit_mode,
+                           lc_error *);
+/* Capture slots and coverage at one completed visibility prefix, including
+ * when the owner has a newer deferred metadata revision. */
+int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,
+                              ps_checkpoint_info *, lc_error *);
 int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,
                            lc_error *);
 /* Constant-time source ownership observation for ordinary reclamation. */

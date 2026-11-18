@@ -304,7 +304,8 @@ static void standing_capacity(int durable) {
     for (size_t i = 0; i < BATCH; ++i)
       OK(ps_begin(s, budget, key(PS_STATE, 77, first + i), &writers[i],
                   &error));
-    OK(ps_revision_publish(writers, BATCH, 1, NULL, &error));
+    OK(ps_revision_publish(writers, BATCH, 1, PS_COMMIT_DEFAULT, NULL, NULL,
+                           &error));
     for (size_t i = 0; i < BATCH; ++i) {
       ps_writer_close(writers[i]);
       writers[i] = NULL;

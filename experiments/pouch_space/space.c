@@ -2634,16 +2634,20 @@ int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
   return LC_OK;
 }
 int ps_revision_publish(ps_writer *const *writers, size_t count,
-                        int force_durable, ps_ref *refs, lc_error *error) {
+                        int force_durable, enum ps_commit_mode mode,
+                        ps_ref *refs, uint64_t *prefix, lc_error *error) {
   ps_space *s;
   ps_budget *budget;
   ps_entry *p, *old;
   unsigned char *wire = NULL;
   size_t i, j, bytes = 64, cursor, prior, descriptor;
   uint64_t metadata, entries, growth = 0, added = 0, sequence = 0;
-  int rc = LC_OK, durable;
+  int rc = LC_OK, durable, forced;
+  if (prefix)
+    *prefix = 0;
   if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0] ||
-      (force_durable != 0 && force_durable != 1))
+      (force_durable != 0 && force_durable != 1) ||
+      (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
     return err(error, LC_ERR_INVALID, "revision requires immutable writers");
   s = writers[0]->space;
   budget = writers[0]->budget;
@@ -2682,6 +2686,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
   metadata = s->metadata;
   entries = s->live_entries;
   durable = s->durable || force_durable;
+  forced = force_durable;
   for (i = 0; rc == LC_OK && i < count; ++i) {
     p = writers[i]->entry;
     old = lookup(s, p->key);
@@ -2699,7 +2704,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
       ++added;
     }
     if (p->key.kind == PS_CONTROL)
-      durable = 1;
+      durable = forced = 1;
   }
   if (rc == LC_OK)
     rc = ps_internal_budget_check(s, budget, 0, growth, added, error);
@@ -2744,13 +2749,30 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     __atomic_store_n(&s->pending_sequence, sequence, __ATOMIC_RELEASE);
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && durable)
+  if (rc == LC_OK && durable && (forced || mode == PS_COMMIT_DEFAULT))
     rc = wait_durable(s, sequence, error);
+  if (rc == LC_OK && prefix)
+    *prefix = sequence;
 done:
   if (rc != LC_OK)
     for (i = 0; i < count; ++i)
       writers[i]->failed = 1;
   lc_free_with_allocator(NULL, wire);
+  return rc;
+}
+int ps_publication_prefix(ps_space *s, uint64_t *selected, uint64_t *durable,
+                          lc_error *error) {
+  int rc;
+  if (!s || !selected || !durable)
+    return err(error, LC_ERR_INVALID,
+               "publication observation requires output");
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK) {
+    *selected = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+    *durable = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  }
+  pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 void ps_writer_close(ps_writer *w) {

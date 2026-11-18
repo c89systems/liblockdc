@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_reclaim.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collections.c root.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -570,6 +570,10 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
+  foreach(mode native-metadata native-metadata-faults native-metadata-concurrency)
+    add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
   foreach(mode revision revision-faults revision-concurrency revision-process revision-values checkpoint-records checkpoint-owner checkpoint-ranges checkpoint-namespace checkpoint-faults checkpoint-large-group checkpoint-history stream-pieces stream-piece-repair owned-repack stream-repack owned-bitmap owned-page-packing namespace-repack namespace-repack-concurrency namespace-repack-churn namespace-tail namespace-tail-faults namespace-tail-concurrency namespace-abandoned namespace-abandoned-empty namespace-abandoned-faults namespace-abandoned-concurrency standing-prefix standing-owners standing-capacity standing-concurrency standing-deletion root-obligations root-obligation-faults owned-repack-faults)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240

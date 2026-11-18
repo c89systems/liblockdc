@@ -996,9 +996,8 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   ps_namespace_retain(ns);
   pthread_mutex_lock(&d->mutex);
   ++d->views;
-  ps_key_checkpoint_info(d->checkpoint, &view->coverage);
-  rc = ps_values_capture(ns->root->space, ns->identity.owner, PS_KEY_METADATA,
-                         PS_KEY_DECISION, &view->metadata, e);
+  rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
+                                 &view->coverage, e);
   view->active = d->active;
   view->tail = d->tail;
   first = view->coverage.segment;
@@ -1126,6 +1125,8 @@ static int view_visit(ps_namespace_view *view, int verify, int selected,
        ++i) {
     rc = ps_values_info(view->metadata, i, &metadata_key, &metadata_ref,
                         &metadata_bytes, e);
+    if (rc == LC_OK && metadata_key.kind == PS_NAMESPACE_CHECKPOINT)
+      continue;
     if (rc == LC_OK) {
       leaf = lc_pouch_namespace_snapshot_leaf(&allocator, metadata_key.key);
       if (!leaf)

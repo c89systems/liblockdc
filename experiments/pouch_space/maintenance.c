@@ -127,7 +127,7 @@ static int compact_locked(void *context, lc_error *e) {
     w->maintenance->cleanup_deleted_count += (unsigned long)closed;
     w->maintenance->cleanup_pending_count += (unsigned long)pending;
   }
-  if (!w->before.active_segment ||
+  if ((!w->before.active_segment && !w->before.checkpoint_keys) ||
       (!w->before.checkpoint_epoch && !w->before.tail && !w->before.runs &&
        w->before.active_segment == 1)) {
     w->result.skipped = 1;
@@ -225,7 +225,8 @@ static int compact_run(lc_pouch *pouch, const char *name,
     pouch->storage.ops->namespace_close(pouch->storage.context, w.ns);
   if (rc == LC_OK && !w.result.skipped && !maintenance)
     rc = ps_root_reclaim_orphans(root, &orphaned, &skipped, e);
-  if (rc == LC_OK && !w.result.skipped && !maintenance)
+  if (rc == LC_OK && !w.result.skipped &&
+      (!maintenance || !w.before.active_segment))
     rc = ps_checkpoint(ps_root_space(root), e);
   if (rc == LC_OK && maintenance) {
     maintenance->skipped = w.result.skipped;

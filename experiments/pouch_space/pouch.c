@@ -6,6 +6,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
+#include "namespace_metadata.h"
 #include "namespace_work.h"
 #include "outbox_markers.h"
 #include "pouch_internal.h"
@@ -220,6 +221,46 @@ static int append_begin(void *context, void *ns, uint64_t target,
   }
   return rc;
 }
+static int metadata_begin(void *context, void *ns,
+                          enum lc_pouch_storage_append_mode mode,
+                          const lc_pouch_storage_batch *batch, uint64_t bytes,
+                          void **out, lc_error *e) {
+  int rc;
+  (void)context;
+  if (mode != LC_POUCH_STORAGE_APPEND_COMPLETE &&
+      mode != LC_POUCH_STORAGE_APPEND_MAINTENANCE)
+    return lc_error_set(e, LC_ERR_INVALID, 0,
+                        "invalid native metadata admission", NULL, NULL,
+                        "pouch");
+  rc = ps_namespace_work_ensure(ns, LC_POUCH_STORAGE_WORK_ORDINARY,
+                                mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_metadata_begin(
+        ns, mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE, batch, bytes,
+        (ps_namespace_metadata **)out, e);
+  return rc;
+}
+static int metadata_commit(void *context, void *handle,
+                           const lc_pouch_storage_batch *batch,
+                           enum lc_pouch_storage_commit_mode mode,
+                           lc_error *e) {
+  (void)context;
+  if (mode != LC_POUCH_STORAGE_COMMIT_DEFAULT &&
+      mode != LC_POUCH_STORAGE_COMMIT_DEFER_SYNC)
+    return lc_error_set(e, LC_ERR_INVALID, 0, "invalid native metadata commit",
+                        NULL, NULL, "pouch");
+  return ps_namespace_metadata_commit(handle, batch,
+                                      mode == LC_POUCH_STORAGE_COMMIT_DEFAULT
+                                          ? PS_COMMIT_DEFAULT
+                                          : PS_COMMIT_DEFER_SYNC,
+                                      e);
+}
+static void metadata_close(void *context, void *handle) {
+  (void)context;
+  ps_namespace_metadata_close(handle);
+}
+static const lc_pouch_storage_metadata_ops metadata_ops = {
+    metadata_begin, metadata_commit, metadata_close, 8 * PS_MIB};
 static int append_commit(void *context, lc_pouch_storage_append *append,
                          enum lc_pouch_storage_commit_mode mode, lc_error *e) {
   enum ps_commit_mode physical;
@@ -689,7 +730,8 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  outbox_markers_open,
                                                  queue_notify,
                                                  queue_wait,
-                                                 query_indexes};
+                                                 query_indexes,
+                                                 &metadata_ops};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;

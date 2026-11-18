@@ -362,6 +362,10 @@ static int lc_pouch_state_cache_active_append_fd(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest, int *out, lc_error *error);
 static int lc_pouch_state_storage_prepare(lc_pouch *, const char *, lc_error *);
+static int
+lc_pouch_state_cache_manifest_borrow(lc_pouch *,
+                                     const lc_pouch_namespace_logstore *,
+                                     lc_pouch_namespace_manifest *, lc_error *);
 static int lc_pouch_state_storage_append_open(
     lc_pouch *, lc_pouch_namespace_logstore *, uint64_t,
     enum lc_pouch_storage_append_mode, const lc_pouch_storage_batch *,
@@ -6762,7 +6766,7 @@ static int lc_pouch_state_append_binary_records_locked(
   int query_index_changed;
   enum lc_pouch_storage_append_mode storage_mode;
   lc_pouch_storage_batch storage_batch;
-  lc_pouch_storage_append storage_append;
+  void *metadata_plan;
   lc_pouch_record_io record_io;
 
   if (pouch == NULL || ns == NULL || manifest == NULL || items == NULL ||
@@ -6772,7 +6776,7 @@ static int lc_pouch_state_append_binary_records_locked(
                         NULL, NULL, "pouch");
   }
   segment_path = NULL;
-  memset(&storage_append, 0, sizeof(storage_append));
+  metadata_plan = NULL;
   fd = -1;
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
   single_writer = lc_pouch_single_writer_enabled(pouch);
@@ -6846,15 +6850,29 @@ static int lc_pouch_state_append_binary_records_locked(
     storage_batch.prefix = lc_pouch_state_batch_prefix;
     storage_batch.context = items;
     rc = lc_pouch_state_storage_prepare(pouch, ns, error);
+    if (rc == LC_OK && (!pouch->storage.ops->metadata ||
+                        !pouch->storage.ops->metadata->begin ||
+                        !pouch->storage.ops->metadata->commit ||
+                        !pouch->storage.ops->metadata->close))
+      rc = lc_error_set(error, LC_ERR_UNSUPPORTED, 0,
+                        "typed owner has no atomic metadata capability", NULL,
+                        NULL, "pouch");
     if (rc == LC_OK) {
       cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
-      rc = lc_pouch_state_storage_append_open(
-          pouch, cache, record_size, storage_mode, &storage_batch, manifest,
-          &storage_append, &segment_size, error);
+      rc = pouch->storage.ops->metadata->begin(
+          pouch->storage.context, cache->storage_namespace, storage_mode,
+          &storage_batch, record_size, &metadata_plan, error);
     }
-    if (rc != LC_OK)
+    if (rc == LC_OK) {
+      lc_pouch_namespace_manifest_cleanup(&pouch->allocator, manifest);
+      rc = lc_pouch_state_cache_manifest_borrow(pouch, cache, manifest, error);
+    }
+    if (rc != LC_OK) {
+      if (metadata_plan)
+        pouch->storage.ops->metadata->close(pouch->storage.context,
+                                            metadata_plan);
       return rc;
-    record_io = storage_append.io;
+    }
   } else {
     if (rc == LC_OK && !manifest_from_cache) {
       lc_pouch_namespace_manifest_cleanup(&pouch->allocator, manifest);
@@ -6987,18 +7005,7 @@ static int lc_pouch_state_append_binary_records_locked(
 binary_append_ready:
   if (rc == LC_OK) {
     append_started = 1;
-    if (pouch->storage.ops != NULL) {
-      /* Preserve structured record boundaries for typed-owner preflight. The
-       * private stream already packs these appends into its bounded buffer. */
-      size_t item_index;
-      for (item_index = 0; rc == LC_OK && item_index < item_count;
-           ++item_index) {
-        const lc_pouch_state_binary_append_item *item = &items[item_index];
-        rc = lc_pouch_record_write_prefix(record_io, item->record_type,
-                                          item->key, item->key_len, item->meta,
-                                          item->meta_len, 0, 0, 0, error);
-      }
-    } else
+    if (pouch->storage.ops == NULL)
       rc = lc_pouch_state_record_write_prefix_batch(record_io, items,
                                                     item_count, error);
   }
@@ -7010,35 +7017,26 @@ binary_append_ready:
 #endif
   if (rc == LC_OK) {
     if (pouch->storage.ops != NULL) {
-      rc = lc_pouch_record_io_tail(record_io, &appended_end, error);
-      if (rc == LC_OK)
-        rc = pouch->storage.ops->append_commit(
-            pouch->storage.context, &storage_append,
-            lc_pouch_state_storage_commit_mode(pouch), error);
-      if (rc == LC_OK)
-        lc_pouch_state_storage_append_publish(pouch, cache, manifest,
-                                              &storage_append, appended_end);
+      rc = pouch->storage.ops->metadata->commit(
+          pouch->storage.context, metadata_plan, &storage_batch,
+          lc_pouch_state_storage_commit_mode(pouch), error);
     } else
       rc = lc_pouch_state_defer_fsync(pouch, fd, error);
   }
-  if (rc == LC_OK && cache != NULL && cache->initialized &&
-      cache->active_segment_leaf != NULL &&
+  if (pouch->storage.ops == NULL && rc == LC_OK && cache != NULL &&
+      cache->initialized && cache->active_segment_leaf != NULL &&
       strcmp(cache->active_segment_leaf, manifest->active_segment) == 0) {
-    if (pouch->storage.ops != NULL)
-      cache->active_segment_offset = appended_end;
-    else {
-      lc_error cache_error;
+    lc_error cache_error;
 
-      lc_error_init(&cache_error);
-      if (lc_pouch_state_fd_end(fd, &appended_end,
-                                "failed to read pouch state segment append end",
-                                &cache_error) == LC_OK) {
-        cache->active_segment_offset = appended_end;
-      } else {
-        lc_pouch_state_cache_invalidate_namespace(pouch, ns);
-      }
-      lc_error_cleanup(&cache_error);
+    lc_error_init(&cache_error);
+    if (lc_pouch_state_fd_end(fd, &appended_end,
+                              "failed to read pouch state segment append end",
+                              &cache_error) == LC_OK) {
+      cache->active_segment_offset = appended_end;
+    } else {
+      lc_pouch_state_cache_invalidate_namespace(pouch, ns);
     }
+    lc_error_cleanup(&cache_error);
   }
   if (pouch->storage.ops == NULL && !retain_active_append_fd && fd >= 0 &&
       close(fd) != 0 && rc == LC_OK) {
@@ -7053,8 +7051,8 @@ binary_append_ready:
       lc_pouch_state_truncate_path_best_effort(segment_path, segment_size);
     }
   }
-  if (pouch->storage.ops != NULL)
-    pouch->storage.ops->append_close(pouch->storage.context, &storage_append);
+  if (metadata_plan)
+    pouch->storage.ops->metadata->close(pouch->storage.context, metadata_plan);
   lc_free_with_allocator(&pouch->allocator, segment_path);
   return rc;
 }
@@ -7945,7 +7943,8 @@ payload_ref_decoded:
       (meta[60] & LC_POUCH_STATE_PAYLOAD_FLAG_STAGED_DELETE) != 0U;
   entry->object_link =
       (meta[60] & LC_POUCH_STATE_PAYLOAD_FLAG_OBJECT_LINK) != 0U;
-  if (entry->object_link && record_type != LC_POUCH_STATE_RECORD_STATE_LINK) {
+  if (entry->object_link && record_type != LC_POUCH_STATE_RECORD_STATE_LINK &&
+      record_type != LC_POUCH_STATE_RECORD_STATE_META) {
     lc_pouch_state_entry_cleanup(allocator, entry);
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "pouch object-link metadata has invalid record type",
@@ -10683,7 +10682,9 @@ static int lc_pouch_state_snapshot_encode(
         record->metadata_length, reserve, record->has_query_hidden,
         record->query_hidden, record->staged_delete_marker, record->retention,
         meta, length, error);
-    if (rc == LC_OK && type == LC_POUCH_STATE_RECORD_STATE_LINK &&
+    if (rc == LC_OK &&
+        (type == LC_POUCH_STATE_RECORD_STATE_LINK ||
+         type == LC_POUCH_STATE_RECORD_STATE_META) &&
         (record->record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT ||
          record->object_link))
       (*meta)[60] |= LC_POUCH_STATE_PAYLOAD_FLAG_OBJECT_LINK;
@@ -14012,6 +14013,125 @@ static void lc_pouch_state_storage_append_publish(
   cache->active_segment_offset = tail;
 }
 
+/* Delete intents have metadata and a lifetime, but no application body. */
+static int lc_pouch_state_write_delete_intent(
+    lc_pouch *pouch, const char *ns, const char *key, lc_source *body,
+    const lc_pouch_state_write_options *options,
+    const lc_pouch_state_entry *current, lc_pouch_namespace_manifest *manifest,
+    lc_pouch_generation version, lc_pouch_unix_seconds updated,
+    lc_pouch_unix_seconds retention, lc_pouch_state_write_result *out,
+    lc_error *error) {
+  unsigned char *meta = NULL, byte;
+  size_t length = 0, got;
+  char *etag = NULL;
+  const char *content_type;
+  const unsigned char *metadata;
+  unsigned char *metadata_copy = NULL;
+  size_t metadata_length;
+  uint64_t lifetime;
+  lc_pouch_generation index = 0;
+  lc_error input_error;
+  lc_error *read_error = error;
+  int hidden, has_hidden, guard = 0, rc = LC_OK;
+  if (!body->read)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "delete intent requires a readable producer", NULL,
+                        NULL, "pouch");
+  if (!read_error) {
+    lc_error_init(&input_error);
+    read_error = &input_error;
+  }
+  got = body->read(body, &byte, 1, read_error);
+  rc = read_error->code;
+  if (!error)
+    lc_error_cleanup(&input_error);
+  if (rc != LC_OK)
+    return rc;
+  if (got)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "staged delete intent must have an empty body", NULL,
+                        NULL, "pouch");
+  content_type = options->content_type   ? options->content_type
+                 : current->content_type ? current->content_type
+                                         : "application/octet-stream";
+  metadata = options->has_metadata ? options->metadata : current->metadata;
+  metadata_length = options->has_metadata ? options->metadata_length
+                                          : current->metadata_length;
+  has_hidden = options->has_query_hidden || current->has_query_hidden;
+  hidden =
+      options->has_query_hidden ? options->query_hidden : current->query_hidden;
+  lifetime = current->found && (current->payload_span.present ||
+                                current->staged_delete_marker)
+                 ? current->lifetime
+                 : 0;
+  etag = lc_pouch_state_empty_etag(&pouch->allocator, error);
+  if (!etag)
+    return error && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  if (metadata_length) {
+    metadata_copy = lc_alloc_with_allocator(&pouch->allocator, metadata_length);
+    if (!metadata_copy) {
+      lc_free_with_allocator(&pouch->allocator, etag);
+      return lc_error_set(error, LC_ERR_NOMEM, 0,
+                          "cannot copy delete intent metadata", NULL, NULL,
+                          "pouch");
+    }
+    memcpy(metadata_copy, metadata, metadata_length);
+  }
+  rc = lc_pouch_state_encode_payload_meta(
+      &pouch->allocator, version, updated, 0, 0, content_type, etag, NULL, NULL,
+      NULL, metadata, metadata_length, 0, has_hidden, hidden, 1, retention,
+      &meta, &length, error);
+  if (rc == LC_OK && options->object_record)
+    meta[60] |= LC_POUCH_STATE_PAYLOAD_FLAG_OBJECT_LINK;
+  if (rc == LC_OK)
+    rc = lc_pouch_state_meta_set_index_sequences(&pouch->allocator, &meta,
+                                                 &length, 0, 0, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_meta_set_lifetime(meta, length, lifetime, error);
+  if (rc == LC_OK && options->query_index_operation_active &&
+      !options->object_record)
+    rc = lc_pouch_query_index_operation_begin(
+        pouch, ns, key, options->query_index_operation_id,
+        options->query_index_operation_expires_at_unix
+            ? *options->query_index_operation_expires_at_unix
+            : 0,
+        &guard, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_append_binary_record(
+        pouch, ns, manifest, LC_POUCH_STATE_RECORD_STATE_META, key, strlen(key),
+        meta, length, 0, 0, !lifetime, options->maintenance_completion, error);
+  if (rc == LC_OK) {
+    rc = lc_pouch_state_meta_index_seq(meta, length, &index, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_meta_lifetime(meta, length, index, &lifetime, error);
+  }
+  if (rc == LC_OK) {
+    (void)lc_pouch_state_cache_apply_write(
+        pouch, ns, manifest, key, content_type, etag, NULL, NULL, metadata,
+        metadata_length, version, 0, 0, NULL, updated, has_hidden, hidden, 1, 1,
+        options->object_record ? LC_POUCH_STATE_RECORD_OBJECT_PUT
+                               : LC_POUCH_STATE_RECORD_STATE_META,
+        retention, lifetime);
+    out->etag = etag;
+    etag = NULL;
+    out->index_seq = index;
+    out->version = version;
+    out->updated_at_unix = updated;
+    out->retention = retention;
+    out->metadata = metadata_copy;
+    out->metadata_length = metadata_length;
+    metadata_copy = NULL;
+    out->has_query_hidden = has_hidden;
+    out->query_hidden = hidden;
+    out->query_index_operation_guard_started = guard;
+  } else if (guard)
+    lc_pouch_query_index_operation_cancel(pouch, ns, key,
+                                          options->query_index_operation_id);
+  lc_free_with_allocator(&pouch->allocator, etag);
+  lc_free_with_allocator(&pouch->allocator, metadata_copy);
+  lc_free_with_allocator(&pouch->allocator, meta);
+  return rc;
+}
 static int lc_pouch_state_write_resolved_locked(
     lc_pouch *pouch, const char *ns, const char *key, lc_source *body,
     const lc_pouch_state_write_options *options,
@@ -14044,7 +14164,7 @@ static int lc_pouch_state_write_resolved_locked(
   uint64_t bytes;
   uint64_t cipher_bytes;
   unsigned long stored_crc;
-  uint64_t segment_size;
+  uint64_t segment_size = 0U;
   uint64_t payload_offset;
   uint64_t record_end;
   size_t meta_len;
@@ -14238,6 +14358,14 @@ static int lc_pouch_state_write_resolved_locked(
   }
   descriptor = NULL;
   segment_path = NULL;
+  if (options && options->staged_delete_marker) {
+    rc = lc_pouch_state_write_delete_intent(
+        pouch, ns, key, body, options, &current, &manifest, version,
+        updated_at_unix, retention, out, error);
+    lc_pouch_state_entry_cleanup(&pouch->allocator, &current);
+    lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
+    return rc;
+  }
   append_lock.fd = -1;
   append_lock.process_mutex = NULL;
   append_lock.exclusive_gate = NULL;
@@ -15353,11 +15481,35 @@ cleanup:
   lc_error_cleanup(&batch_error);
 }
 
+static uint64_t lc_pouch_state_metadata_request_bytes(
+    const lc_pouch_state_metadata_append_request *request) {
+  const lc_pouch_state_entry *current = request->current;
+  const char *strings[7];
+  uint64_t bytes = 512, amount;
+  size_t i;
+  strings[0] = request->key;
+  strings[1] = current->content_type;
+  strings[2] = current->etag;
+  strings[3] = current->descriptor;
+  strings[4] = current->payload_context;
+  strings[5] = current->payload_span.container_leaf;
+  strings[6] = NULL;
+  for (i = 0; i < 6; ++i) {
+    amount = strings[i] ? strlen(strings[i]) : 0;
+    if (amount > UINT64_MAX - bytes)
+      return UINT64_MAX;
+    bytes += amount;
+  }
+  amount = request->options.has_metadata ? request->options.metadata_length
+                                         : current->metadata_length;
+  return amount > UINT64_MAX - bytes ? UINT64_MAX : bytes + amount;
+}
 static void *lc_pouch_state_metadata_append_worker(void *context) {
   lc_pouch_state_metadata_append_batcher *batcher;
   lc_pouch_state_metadata_append_request
       *requests[LC_POUCH_STATE_METADATA_APPEND_BATCH_MAX];
   size_t count;
+  uint64_t bytes, limit, next;
 
   batcher = (lc_pouch_state_metadata_append_batcher *)context;
   pthread_mutex_lock(&batcher->mutex);
@@ -15370,8 +15522,16 @@ static void *lc_pouch_state_metadata_append_worker(void *context) {
       return NULL;
     }
     count = 0U;
+    bytes = 0;
+    limit = batcher->pouch->storage.ops && batcher->pouch->storage.ops->metadata
+                ? batcher->pouch->storage.ops->metadata->batch_bytes
+                : 0;
     while (batcher->head != NULL &&
            count < LC_POUCH_STATE_METADATA_APPEND_BATCH_MAX) {
+      next = limit ? lc_pouch_state_metadata_request_bytes(batcher->head) : 0;
+      if (count && limit && (next > limit || bytes > limit - next))
+        break;
+      bytes = next > UINT64_MAX - bytes ? UINT64_MAX : bytes + next;
       requests[count] = batcher->head;
       batcher->head = batcher->head->next;
       requests[count]->next = NULL;
@@ -16423,7 +16583,7 @@ lc_pouch_state_delete_locked(lc_pouch *pouch, const char *ns, const char *key,
   /* A successful acquire creates a lease-only metadata projection. Removing
    * that projection is a no-op: it must preserve the active lease and report
    * the same no-state result as lockd disk. */
-  if (!current.payload_span.present) {
+  if (!current.payload_span.present && !current.staged_delete_marker) {
     out->index_seq = manifest.state_max_version;
     out->version = current.version;
     out->updated_at_unix = current.updated_at_unix;

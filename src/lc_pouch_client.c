@@ -6243,6 +6243,7 @@ static int lc_pouch_attachment_stage_delete(lc_client_handle *client,
     options.has_query_hidden = 1;
     options.query_hidden = 1;
     options.object_record = 1;
+    options.staged_delete_marker = 1;
     rc = lc_pouch_state_write(client->pouch, ns, staged_attachment_key, source,
                               &options, &result, error);
   }
@@ -11405,7 +11406,7 @@ static int lc_pouch_txn_commit_attachment_stage(lc_pouch *pouch, const char *ns,
   if (staged_key == NULL) {
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
   }
-  rc = lc_pouch_state_read(pouch, ns, staged_key, &staged, error);
+  rc = lc_pouch_state_read_metadata(pouch, ns, staged_key, &staged, error);
   if (rc == LC_OK && staged.found &&
       lc_pouch_attachment_is_delete_marker(staged.content_type)) {
     options.object_record = 1;
@@ -11416,16 +11417,24 @@ static int lc_pouch_txn_commit_attachment_stage(lc_pouch *pouch, const char *ns,
                                  error);
       lc_pouch_state_write_result_cleanup(&pouch->allocator, &result);
     }
-  } else if (rc == LC_OK) {
-    options.content_type = staged.content_type;
-    options.metadata = staged.metadata;
-    options.metadata_length = staged.metadata_length;
-    options.has_metadata = staged.metadata_length > 0U;
-    options.has_query_hidden = 1;
-    options.query_hidden = 1;
-    options.object_record = 1;
-    rc = lc_pouch_state_write(pouch, ns, base_key, staged.body, &options,
-                              &result, error);
+  } else if (rc == LC_OK && staged.found) {
+    lc_pouch_state_read_result_cleanup(&pouch->allocator, &staged);
+    rc = lc_pouch_state_read(pouch, ns, staged_key, &staged, error);
+    if (rc == LC_OK && (!staged.found || !staged.body))
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0,
+                        "staged attachment has no committed payload", NULL,
+                        NULL, "pouch");
+    if (rc == LC_OK) {
+      options.content_type = staged.content_type;
+      options.metadata = staged.metadata;
+      options.metadata_length = staged.metadata_length;
+      options.has_metadata = staged.metadata_length > 0U;
+      options.has_query_hidden = 1;
+      options.query_hidden = 1;
+      options.object_record = 1;
+      rc = lc_pouch_state_write(pouch, ns, base_key, staged.body, &options,
+                                &result, error);
+    }
     if (rc == LC_OK) {
       lc_pouch_state_write_result_cleanup(&pouch->allocator, &result);
       rc = lc_pouch_state_delete(pouch, ns, staged_key, &options, &result,
@@ -17970,6 +17979,8 @@ static int lc_pouch_retention_stage_attachments(lc_pouch_retention_cleanup *ctx,
                                    error);
   options.content_type = LC_POUCH_ATTACHMENT_DELETE_CONTENT_TYPE;
   options.object_record = 1;
+  options.staged_delete_marker = 1;
+  options.maintenance_completion = 1;
   options.has_query_hidden = 1;
   options.query_hidden = 1;
   for (i = 0; rc == LC_OK && i < keys.count; ++i) {
@@ -18057,6 +18068,7 @@ static int lc_pouch_retention_claim_and_stage_locked(void *context,
     options.metadata_length = metadata.length;
     options.has_expected_version = 1;
     options.expected_version = current.version;
+    options.maintenance_completion = 1;
     rc = lc_pouch_state_update_metadata_locked(
         ctx->pouch, ctx->ns, ctx->work.key, &options, &written, error);
     lc_pouch_state_write_result_cleanup(&ctx->pouch->allocator, &written);
@@ -18068,6 +18080,7 @@ static int lc_pouch_retention_claim_and_stage_locked(void *context,
   if (rc == LC_OK && !ctx->skip) {
     memset(&options, 0, sizeof(options));
     options.staged_delete_marker = 1;
+    options.maintenance_completion = 1;
     options.has_query_hidden = 1;
     options.query_hidden = 1;
     options.has_logical_version = 1;

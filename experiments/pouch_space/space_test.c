@@ -7357,6 +7357,7 @@ static void bounded_pieces(int durable, int checkpointed) {
 #include "abandoned_cases.h"
 #include "capacity_cases.h"
 #include "checkpoint_cases.h"
+#include "native_metadata_cases.h"
 #include "reclaim_cases.h"
 #include "revision_cases.h"
 #include "tail_cases.h"
@@ -7369,7 +7370,19 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "namespace-abandoned-compare") == 0) {
+    if (strcmp(argv[2], "native-metadata") == 0) {
+      for (int durable = 0; durable < 2; ++durable) {
+        native_metadata_lifecycle(durable);
+        native_metadata_retirement(durable);
+      }
+    } else if (strcmp(argv[2], "native-metadata-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int kind = 0; kind < 3; ++kind)
+          native_metadata_faults(durable, kind);
+    } else if (strcmp(argv[2], "native-metadata-concurrency") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        native_metadata_concurrency(durable);
+    } else if (strcmp(argv[2], "namespace-abandoned-compare") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int large = 0; large < 2; ++large)
           namespace_abandoned_case(durable, 0, 1, 1, 0, large, 1);

@@ -23,7 +23,7 @@ static int revision_write(ps_space *s, int control, const void *first,
   if (rc == LC_OK)
     rc = ps_write(writers[1], second, second_bytes, e);
   if (rc == LC_OK)
-    rc = ps_revision_publish(writers, 2, 0, NULL, e);
+    rc = ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, e);
   ps_writer_close(writers[0]);
   ps_writer_close(writers[1]);
   CHECK(ps_budget_close(budget, NULL) == LC_OK);
@@ -78,7 +78,8 @@ static void revision_lifecycle(int durable, int control) {
   expect(s, state(1), NULL, "old", 3);
   expect(s, key(control ? PS_CONTROL : PS_STATE, 1, 2), NULL, "initial", 7);
   OK(ps_status(s, &before, &error));
-  OK(ps_revision_publish(writers, 2, 0, published, &error));
+  OK(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, published, NULL,
+                         &error));
   OK(ps_status(s, &after, &error));
   CHECK(after.syncs - before.syncs == (uint64_t)(durable || control));
   CHECK(!memcmp(prepared, published, sizeof(prepared)));
@@ -136,7 +137,8 @@ static void revision_admission(void) {
       lc_error_cleanup(&error);
     }
     OK(ps_status(s, &before, &error));
-    int rc = ps_revision_publish(writers, 2, 0, NULL, &error);
+    int rc = ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                                 &error);
     if (kind < 2) {
       CHECK(rc == LC_ERR_INVALID);
       lc_error_cleanup(&error);
@@ -165,7 +167,8 @@ static void revision_admission(void) {
   s = create(PS_MIB, 0, NULL);
   OK(ps_begin(s, NULL, state(1), &writers[0], &error));
   OK(ps_begin(s, NULL, state(1), &writers[1], &error));
-  BAD(ps_revision_publish(writers, 2, 0, NULL, &error));
+  BAD(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                          &error));
   /* Invalid invocation did not consume otherwise valid private owners. */
   OK(ps_write(writers[0], "retry", 5, &error));
   OK(ps_publish(writers[0], NULL, &error));
@@ -395,7 +398,8 @@ static void *revision_worker(void *context) {
   revision_actor *actor = context;
   lc_error e;
   lc_error_init(&e);
-  actor->rc = ps_revision_publish(actor->writers, 2, 0, NULL, &e);
+  actor->rc = ps_revision_publish(actor->writers, 2, 0, PS_COMMIT_DEFAULT, NULL,
+                                  NULL, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -700,7 +704,8 @@ static void revision_derived_recovery(void) {
       OK(ps_begin(s, NULL, keys[i], &writers[i], &error));
       OK(ps_write(writers[i], i ? "manifest" : "query", i ? 8 : 5, &error));
     }
-    OK(ps_revision_publish(writers, 2, 0, NULL, &error));
+    OK(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                           &error));
     ps_writer_close(writers[0]);
     ps_writer_close(writers[1]);
     /* This canonical publication is acknowledged after the query revision. */
