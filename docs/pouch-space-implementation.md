@@ -4753,6 +4753,94 @@ Evidence is in ignored `build/pouch-space-collection-codec/`: `qualified-debug.l
 native build, instrumented relink and memory-check commands. The interrupted
 Debug invocation is retained separately from its successful resumed checks.
 
+### Canonical collection record and index conversion
+
+`lc_pouch_collection_record_recode` now encodes collection publications through
+retained byte capabilities. The storage owner supplies resolved target body,
+index and previous-metadata references. The codec validates their logical
+identity and target representation, rebuilds the collection binding and
+preserves positions, publication/mutation generations, timestamps, etags,
+retention and metadata history. STREAM records authenticate their converted
+first unit against the unchanged logical manifest. META records adopt the
+converted body's physical facts and translated history link, including a
+rebuilt index with a different height. Tombstones retain their canonical facts.
+
+The multifile adapter now resolves its relocation maps and opens referenced
+metadata within its own controller. Its record encoder uses the same byte API
+as native ranges. File descriptors, paths and offset tables no longer enter
+the shared collection publication encoder. Inline bodies pass through the
+existing streaming CRC/length/SHA-256 verifier; a separate preliminary whole-body
+CRC scan is unnecessary. Failed encoding preserves the caller's result and
+discards only the private suffix. Durability and reference selection remain
+storage-owner responsibilities.
+
+Private body conversion now preserves collection EDIT_BODY and EDIT record
+kinds. These canonical roles previously failed the ordinary-PUT-only conversion
+validation. Ordinary append retains its existing declared input types. A new
+public API regression creates a replacement edit, updates its retention,
+performs a delete-only edit and appends another entry. Across plaintext/encrypted
+roots and both conversion directions, head tokens, permanent positions,
+replacement outcomes, delete receipts and identical retries remain unchanged.
+
+`lc_collection_stream_recode_open/step/close` supplies bounded index construction
+for native placement. Each step visits at most its requested number of complete
+units. It reuses unit-codec scratch, emits index pages through the fixed carry
+stack, and returns resolved stream facts only after all unit counts and
+plaintext totals validate. The callback receives a complete unit/index size
+bound and returns the appropriate byte capability and logical segment identity.
+Placement, packing, funding and protection of completed candidates belong to
+that owner. The codec retains no namespace-wide or collection-wide historical
+view and introduces no payload spool or whole-value buffer.
+
+Completion is idempotent. A failed stream build preserves progress outputs and
+becomes terminal; retry binds a fresh source iterator. Close releases scratch,
+while the owner reclaims unselected candidates and protects referenced input.
+Cancellation after one unit is covered by explicit orphan reclamation,
+checkpoint and successful restart. A paused source read also permits a peer
+writer to seal its data before conversion resumes.
+
+Native fixtures cover 1, 3 and 66 units across all four codec combinations and
+both durability policies in fixed 10 MiB containers. Generated 1 MiB values
+cross output-part boundaries, rebuild padded tree heights from 2 to 1 and 3 to
+2, and retain both old metadata generations and their translated previous
+links. Inline bodies, provisional edit bodies, receipts and tombstones retain
+their canonical fields. The fixtures seal candidate parts, exercise native head
+store/load and reopen to read the converted streams and metadata references.
+Root compression policy remains unchanged during these component tests.
+
+Malformed relocation facts reject before output changes: wrong unit counts,
+contexts, declared etags, heights, codec profiles, body identity and history
+links are covered. The existing unit format permits an omitted first-unit etag;
+the encoder accepts omission and checks consistency when present. Both forms
+are tested. The native failure matrix passes 1,580 allocation, I/O and
+partial-write points across stream construction and all record roles, with
+failed candidates reclaimed and the original source successfully retried.
+
+Seventeen selected Debug checks pass, including the full failure matrix,
+namespace/Pouch conversion regressions, streamed collection conversion,
+output-sync/power-loss recovery, edit receipts, source-manifest and stack checks.
+GNU and musl release each pass eleven selected checks, including the complete
+new failure matrix. Two TSan scenarios pass with instrumented OpenSSL and no
+suppressions. Two strict Memcheck scenarios pass with zero remaining
+allocations, zero errors and only three inherited file descriptors. Product
+sources compile under strict C89 and formatting checks pass.
+
+Native collection catalog coordination, durable relocation maps and capacity
+progress/reclamation across complete collections still require integration.
+Durable root conversion intent, derived-index invalidation, resumable root
+policy publication, shared-root qualification and matched full conversion
+performance remain open. Explicit native root compression changes remain
+unsupported. Multifile stays the default/reference, and production cutover
+requires a separate decision. This adds no format-marker or public ABI change.
+
+Evidence is in ignored `build/pouch-space-collection-record/`:
+`qualified-debug*`, `qualified-*-release*`, `qualified-native.log`,
+`qualified-tsan.log`, `tsan-*`, `qualified-memcheck.log`, `memcheck-*` and the
+exact build, test-selection, instrumented relink and memory-check scripts.
+`optional-etag.log` records the isolated format-validation repair before final
+qualification. Test selection follows registered case names in CTest metadata,
+including configurations with different portability partitions.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

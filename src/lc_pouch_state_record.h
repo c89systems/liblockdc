@@ -121,6 +121,7 @@ int lc_pouch_state_record_append(const lc_allocator *, lc_pouch_crypto *,
  * Verify encoded CRC, plaintext byte count and etag before clearing PENDING;
  * preserve versions, lifetime, both index sequences and side metadata. A
  * projected META/LINK body becomes a physical PUT (OBJECT_PUT when applicable).
+ * Collection edit-body and edit-receipt kinds retain their canonical roles.
  * The owner still selects metadata references and supplies durability. */
 typedef struct lc_pouch_state_recode_bounds {
   uint64_t record_bytes, metadata_bytes;

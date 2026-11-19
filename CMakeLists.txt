@@ -579,6 +579,7 @@ set(lc_sources
     src/lc_collection_chunks.c
     src/lc_collection_unit.c
     src/lc_collection_unit_recode.c
+    src/lc_collection_stream_recode.c
     src/lc_collection_storage.c
     src/lc_collection_file_projections.c
     src/lc_collection_recode.c

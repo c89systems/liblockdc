@@ -101,7 +101,7 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_collection_test)
   add_test(NAME pouch_space_collection_storage COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
-  foreach(mode units unit-faults unit-concurrency)
+  foreach(mode units unit-faults unit-concurrency records record-faults)
     add_test(NAME pouch_space_collection_${mode}
       COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT 600

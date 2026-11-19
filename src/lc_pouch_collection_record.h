@@ -162,6 +162,10 @@ int lc_pouch_collection_record_read_prefix(lc_pouch_record_io, uint64_t,
  * descriptors, contexts and logical identity remain unchanged. out must not
  * alias current. The caller syncs/publishes replacement.
  */
+/* Validate the immutable body selected by a canonical metadata reference. */
+int lc_pouch_collection_record_check_body(const lc_pouch_collection_record *,
+                                          const lc_pouch_collection_record *,
+                                          lc_error *);
 int lc_pouch_collection_record_copy_source(
     lc_pouch *pouch, lc_pouch_record_io input, lc_pouch_record_io payload,
     const lc_pouch_collection_record *relocated_stream, const char *source_leaf,

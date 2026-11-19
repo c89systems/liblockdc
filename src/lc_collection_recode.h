@@ -11,13 +11,4 @@ int lc_collection_recode_references(lc_pouch_recode *, const char *,
 int lc_collection_recode_segment(lc_pouch_recode *, size_t, const char *,
                                  lc_error *);
 
-/* Canonical metadata and ordinary payload conversion share the existing state
- * encoder. Independently encoded units and index relocation live separately. */
-int lc_pouch_collection_recode_record(lc_pouch_recode *, lc_pouch_recode_file *,
-                                      int, lc_u64, lc_u64, int, const char *,
-                                      lc_error *);
-int lc_pouch_collection_record_check_body(const lc_pouch_collection_record *,
-                                          const lc_pouch_collection_record *,
-                                          lc_error *);
-
 #endif

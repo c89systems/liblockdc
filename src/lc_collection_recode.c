@@ -1,5 +1,6 @@
 #include "lc_collection_recode.h"
 #include "lc_collection_chunks.h"
+#include "lc_collection_record_recode.h"
 #include "lc_collection_unit_recode.h"
 #include "lc_pouch_path.h"
 #include "lc_pouch_record.h"
@@ -526,6 +527,112 @@ static int cr_extent(cr_output *out, const lc_pouch_recode_reference *ref,
   return ref->height ? cr_node(out, ref, map, e) : cr_unit(out, ref, map, e);
 }
 
+static int cr_record(lc_pouch_recode *work, lc_pouch_recode_file *file,
+                     int source_fd, lc_u64 offset, lc_u64 limit, int fd,
+                     const char *destination_leaf, lc_error *error) {
+  lc_pouch_collection_record current, body, converted;
+  lc_collection_recode_stream stream;
+  lc_collection_recode_links links;
+  lc_pouch_recode_file *owner;
+  lc_pouch_recode_offset *location, *root;
+  lc_pouch_record_header header;
+  unsigned char prefix[32];
+  struct iovec part;
+  struct stat st;
+  char leaf[64], previous_leaf[64], *path = NULL;
+  int body_fd = -1, rc;
+  memset(&stream, 0, sizeof(stream));
+  memset(&links, 0, sizeof(links));
+  rc = lc_pouch_collection_record_read(lc_pouch_record_file_io(source_fd),
+                                       offset, limit, file->leaf, &current,
+                                       error);
+  if (rc != LC_OK)
+    return rc;
+  if (current.metadata_only) {
+    rc = lc_pouch_recode_lookup(work, file->scope, current.payload_container,
+                                current.payload_record_offset, &owner,
+                                &location, error);
+    if (rc == LC_OK)
+      path =
+          lc_pouch_recode_location(work, owner, location->segment, leaf, error);
+    if (rc == LC_OK && !path)
+      rc = LC_ERR_NOMEM;
+    if (rc == LC_OK) {
+      body_fd = open(path, O_RDONLY | O_CLOEXEC);
+      if (body_fd < 0 || fstat(body_fd, &st) != 0 || st.st_size < 0)
+        rc = cr_error(error, "failed to inspect converted collection body");
+    }
+    if (rc == LC_OK)
+      rc = lc_pouch_collection_record_read(lc_pouch_record_file_io(body_fd),
+                                           location->after, (lc_u64)st.st_size,
+                                           leaf, &body, error);
+    if (rc == LC_OK)
+      links.body = &body;
+    if (rc == LC_OK && current.previous_segment) {
+      rc = lc_collection_record_leaf(current.previous_segment, previous_leaf,
+                                     error);
+      if (rc == LC_OK)
+        rc = lc_pouch_recode_lookup(work, file->scope, previous_leaf,
+                                    current.previous_offset, &owner, &location,
+                                    error);
+      if (rc == LC_OK) {
+        links.previous_segment = location->segment;
+        links.previous_offset = location->after;
+      }
+    }
+  } else if (current.stream_extents) {
+    rc = lc_collection_record_leaf(current.stream_segment, leaf, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_recode_lookup(work, file->scope, leaf,
+                                  current.stream_offset, &owner, &root, error);
+    if (rc == LC_OK && (root->units != current.stream_extents ||
+                        !root->first_segment || !root->stored))
+      rc = cr_corrupt(error,
+                      "converted collection index changed its unit count");
+    if (rc == LC_OK)
+      path = lc_pouch_recode_location(work, owner, root->first_segment, leaf,
+                                      error);
+    if (rc == LC_OK && !path)
+      rc = LC_ERR_NOMEM;
+    if (rc == LC_OK) {
+      body_fd = open(path, O_RDONLY | O_CLOEXEC);
+      if (body_fd < 0)
+        rc = cr_error(error,
+                      "failed to open converted collection manifest unit");
+    }
+    part.iov_base = prefix;
+    part.iov_len = sizeof(prefix);
+    if (rc == LC_OK)
+      rc = lc_pouch_record_io_read(lc_collection_unit_file_io(body_fd),
+                                   root->first_offset, &part, 1, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_record_header_decode(prefix, &header, error);
+    if (rc == LC_OK)
+      rc = lc_collection_unit_read(lc_collection_unit_file_io(body_fd),
+                                   root->first_offset, header.payload_len,
+                                   &stream.first, error);
+    if (rc == LC_OK) {
+      stream.root.segment = root->segment;
+      stream.root.offset = root->after;
+      stream.root.bytes =
+          current.stream_height ? current.stream_root_bytes : root->stored;
+      stream.units = root->units;
+      stream.stored = root->stored;
+      stream.height = current.stream_height;
+      links.stream = &stream;
+    }
+  }
+  if (rc == LC_OK)
+    rc = lc_pouch_collection_record_recode(
+        work->pouch, work->pouch->crypto, file->collection_id,
+        lc_pouch_record_file_io(source_fd), file->leaf, offset, limit, &links,
+        lc_pouch_record_file_io(fd), destination_leaf, &converted, error);
+  if (body_fd >= 0)
+    (void)close(body_fd);
+  lc_free_with_allocator(&work->pouch->allocator, path);
+  return rc;
+}
+
 static int cr_convert(cr_output *out, lc_error *e) {
   lc_pouch_collection_record record;
   struct stat st;
@@ -571,9 +678,8 @@ static int cr_convert(cr_output *out, lc_error *e) {
           rc = cr_extent(out, &out->file->references[next++], e);
       } else if (rc == LC_OK && record.kind != LC_POUCH_COLLECTION_CHUNK &&
                  record.kind != LC_POUCH_COLLECTION_NODE) {
-        rc = lc_pouch_collection_recode_record(out->work, out->file,
-                                               out->source_fd, at, limit,
-                                               out->fd, out->leaf, e);
+        rc = cr_record(out->work, out->file, out->source_fd, at, limit, out->fd,
+                       out->leaf, e);
         /* A provisional edit body and its control are one publication. Keep
          * them adjacent even when this source pair crosses the soft target. */
         out->hold = record.kind == LC_POUCH_COLLECTION_EDIT_BODY;

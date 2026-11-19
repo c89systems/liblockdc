@@ -570,13 +570,18 @@ static void projections(void) {
   lc_error_cleanup(&e);
 }
 #include "collection_codec_cases.h"
+#include "collection_record_codec_cases.h"
 typedef struct unit_run {
   const char *directory, *key;
   int faults;
 } unit_run;
 static void *unit_worker(void *context) {
   unit_run *run = context;
-  if (run->faults == 2)
+  if (run->faults == 4)
+    record_faults(run->directory, run->key);
+  else if (run->faults == 3)
+    record_lifecycle(run->directory, run->key);
+  else if (run->faults == 2)
     unit_concurrency(run->directory, run->key);
   else
     unit_cases(run->directory, run->key, run->faults);
@@ -594,9 +599,12 @@ int main(int argc, char **argv) {
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
   if (argc == 3) {
     REQUIRE(!strcmp(argv[2], "units") || !strcmp(argv[2], "unit-faults") ||
-            !strcmp(argv[2], "unit-concurrency"));
+            !strcmp(argv[2], "unit-concurrency") ||
+            !strcmp(argv[2], "records") || !strcmp(argv[2], "record-faults"));
     unit_run run = {directory, key,
-                    !strcmp(argv[2], "unit-concurrency")
+                    !strcmp(argv[2], "record-faults") ? 4
+                    : !strcmp(argv[2], "records")     ? 3
+                    : !strcmp(argv[2], "unit-concurrency")
                         ? 2
                         : !strcmp(argv[2], "unit-faults")};
     pthread_t worker;

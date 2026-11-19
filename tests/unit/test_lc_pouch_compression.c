@@ -456,6 +456,119 @@ static int fail_before_publication(void *context, int phase, lc_error *error) {
                         "injected conversion I/O failure", NULL, NULL, "pouch");
   return LC_OK;
 }
+static void test_conversion_preserves_edit_body_and_receipt(void **state) {
+  fixture *f = *state;
+  const char *modes[] = {"none", "zlib"};
+  for (int encrypted = 0; encrypted < 2; ++encrypted) {
+    if (encrypted)
+      check(f, lc_pouch_crypto_generate_key_string(&f->key, &f->error));
+    for (int initial = 0; initial < 2; ++initial) {
+      snprintf(f->endpoint, sizeof(f->endpoint), "pouch://%s/edit-%d-%d",
+               f->root, encrypted, initial);
+      check(f, open_client(f, modes[initial], &f->client));
+      lc_collection_config config = {0};
+      config.name = "edits";
+      lc_collection *collection = NULL;
+      check(f, lc_client_create_collection(f->client, &config, &collection,
+                                           &f->error));
+      lc_collection_append_req request = {"original"},
+                               replacement = {"replacement"};
+      lc_collection_append_res appended;
+      lc_source *source = NULL;
+      check(f, lc_source_from_memory("{\"v\":1}", 7, &source, &f->error));
+      check(f, lc_collection_append(collection, &request, source, &appended,
+                                    &f->error));
+      lc_source_close(source);
+      lc_collection_head_res before, expected;
+      check(f, lc_collection_head(collection, &before, &f->error));
+      lc_collection_edit_range range = {0, 1};
+      lc_collection_edit_req edit = {0};
+      edit.operation_id = "edit-once";
+      edit.expected_head = before.etag;
+      edit.ranges = &range;
+      edit.range_count = 1;
+      edit.replacement = &replacement;
+      lc_collection_edit_res outcome, retried;
+      check(f, lc_source_from_memory("{\"v\":2}", 7, &source, &f->error));
+      check(f,
+            lc_collection_edit(collection, &edit, source, &outcome, &f->error));
+      lc_source_close(source);
+      assert_true(outcome.published && outcome.has_replacement);
+      assert_int_equal(outcome.deleted_count, 1);
+      assert_int_equal(outcome.replacement.position, 2);
+      lc_collection_metadata_req metadata = {0};
+      metadata.has_retention_seconds = 1;
+      metadata.retention_seconds = 7776000;
+      check(f, lc_collection_entry_metadata(collection, 2, &metadata, &appended,
+                                            &f->error));
+      lc_collection_head_res delete_before;
+      check(f, lc_collection_head(collection, &delete_before, &f->error));
+      lc_collection_edit_range delete_range = {1, 2};
+      lc_collection_edit_req remove = {0};
+      remove.operation_id = "delete-once";
+      remove.expected_head = delete_before.etag;
+      remove.ranges = &delete_range;
+      remove.range_count = 1;
+      lc_collection_edit_res removed;
+      check(f,
+            lc_collection_edit(collection, &remove, NULL, &removed, &f->error));
+      assert_true(removed.published && !removed.has_replacement);
+      assert_int_equal(removed.deleted_count, 1);
+      request.append_id = "tail";
+      check(f, lc_source_from_memory("{\"v\":3}", 7, &source, &f->error));
+      check(f, lc_collection_append(collection, &request, source, &appended,
+                                    &f->error));
+      lc_source_close(source);
+      check(f, lc_collection_head(collection, &expected, &f->error));
+      lc_collection_close(collection);
+      close_client(f);
+      for (int direction = 0; direction < 2; ++direction) {
+        check(f, open_client(f, modes[initial ^ 1 ^ direction], &f->client));
+        check(f, lc_client_open_collection(f->client, &config, &collection,
+                                           &f->error));
+        lc_collection_head_res observed;
+        check(f, lc_collection_head(collection, &observed, &f->error));
+        assert_string_equal(observed.etag, expected.etag);
+        assert_int_equal(observed.upper_position, 3);
+        assert_int_equal(observed.live_count, 1);
+        lc_collection_edit_status_res receipt;
+        check(f, lc_collection_edit_status(collection, edit.operation_id,
+                                           &receipt, &f->error));
+        assert_true(receipt.found && receipt.result.has_replacement);
+        assert_string_equal(receipt.result.head_etag, outcome.head_etag);
+        assert_string_equal(receipt.result.replacement.etag,
+                            outcome.replacement.etag);
+        assert_int_equal(receipt.result.replacement.position, 2);
+        assert_int_equal(receipt.result.deleted_count, 1);
+        check(f, lc_source_from_memory("{\"v\":2}", 7, &source, &f->error));
+        check(f, lc_collection_edit(collection, &edit, source, &retried,
+                                    &f->error));
+        lc_source_close(source);
+        assert_true(retried.duplicate && retried.published);
+        assert_string_equal(retried.head_etag, outcome.head_etag);
+        assert_int_equal(retried.replacement.position, 2);
+        check(f, lc_collection_edit_status(collection, remove.operation_id,
+                                           &receipt, &f->error));
+        assert_true(receipt.found && !receipt.result.has_replacement);
+        assert_string_equal(receipt.result.head_etag, removed.head_etag);
+        assert_int_equal(receipt.result.deleted_count, 1);
+        check(f, lc_collection_edit(collection, &remove, NULL, &retried,
+                                    &f->error));
+        assert_true(retried.duplicate && retried.published &&
+                    !retried.has_replacement);
+        assert_string_equal(retried.head_etag, removed.head_etag);
+        expect_json(f, collection, NULL, "{\"v\":3}\n", NULL);
+        lc_collection_close(collection);
+        close_client(f);
+      }
+    }
+    if (encrypted) {
+      lc_pouch_crypto_key_string_free(f->key);
+      f->key = NULL;
+    }
+  }
+}
+
 static void test_failed_build_keeps_source_and_retry_succeeds(void **state) {
   fixture *f = *state;
   char etag[65] = {0};
@@ -2633,6 +2746,12 @@ static void test_stream_unit_output_sync_and_power_loss(void **state) {
           unit_sync_watch = watch;
           rc = open_client(f, modes[1 - direction], &f->client);
           unit_sync_watch = NULL;
+          if (rc != LC_ERR_TRANSPORT)
+            print_error("unit conversion encrypted=%d direction=%d "
+                        "sync_calls=%d rc=%d: %s [%s]\n",
+                        encrypted, direction, watch->calls, rc,
+                        f->error.message ? f->error.message : "?",
+                        f->error.detail ? f->error.detail : "");
           assert_int_equal(rc, LC_ERR_TRANSPORT);
           assert_null(f->client);
           assert_int_equal(watch->calls, 1);
@@ -2717,6 +2836,8 @@ int main(int argc, char **argv) {
       cmocka_unit_test_setup_teardown(
           test_collections_cursors_compaction_and_retry_bindings, setup,
           teardown),
+      cmocka_unit_test_setup_teardown(
+          test_conversion_preserves_edit_body_and_receipt, setup, teardown),
       cmocka_unit_test_setup_teardown(
           test_failed_build_keeps_source_and_retry_succeeds, setup, teardown),
       cmocka_unit_test_setup_teardown(
