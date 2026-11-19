@@ -15,7 +15,8 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime) | Shared allocator admission, projection refresh, reader generations and abandoned-claim recovery |
+| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime) | Shared allocator admission, projection refresh, owned-stream reader generations and abandoned-claim recovery |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
 Native Pouch currently admits one process at a time. Shared coordination
@@ -5541,3 +5542,144 @@ prefix, retain captured reader generations through reclamation, and reconstruct
 abandoned work before readmission. File authority alone does not establish these
 properties. They remain required in the full active goal, together with general
 capacity and performance acceptance. Multifile remains the default/reference.
+
+## Captured immutable values across process lifetimes
+
+The physical owner now supports a private metadata-ticket handoff of a captured
+immutable `ps_reader`. Import opens a fresh read-only file description of the
+same inode, acquires OFD read locks on the captured physical extents, and uses
+the existing bounded reader and checksum path. The ticket binds file identity,
+container identity, incarnation, length and checked extent metadata. It contains
+no application body. Export needs caller-provided metadata space, performs no
+allocation or payload I/O, and adds no durability barrier. Import reads no
+payload until consumption begins; its body scratch is the existing 16 KiB
+buffer. Ticket metadata follows the existing immutable descriptor limit.
+
+The issuer must retain its reader until import succeeds, including remote
+acknowledgement of success. An imported reader may issue another ticket under
+the same rule. A ticket alone pins nothing and cannot be saved as a later
+reopening reference. Source loss during an unfinished handoff invalidates that
+transfer; the higher-level protocol must discard it rather than admit a logical
+snapshot from it. The private importer does not detect source-process liveness.
+Writer/reader death tests below occur after acknowledged import. Each reader
+has one caller; child participants exec before
+importing. This is a private matching-build capability, outside the public ABI.
+It captures one immutable value, without implicitly retaining the values or
+owned stream ranges that its contents might reference.
+
+Each imported OFD holds presence byte 2 continuously from before its extent
+locks until last close. Normal root admission probes this byte once, before
+recovery can reuse physical pages. Exclusive lifetime authority excludes a still
+live local issuer from an earlier writer generation; an earlier foreign issuer
+already holds presence. Thus every valid late handoff is covered either by a
+local pin in this owner or by foreign presence observed at admission. A new
+local ticket enables collection probes under allocator authority before it can
+escape. That observation remains enabled until root close, even if foreign
+presence temporarily drains: an outstanding local ticket may still be imported.
+Reopen can reset it after observing no foreign presence.
+
+No participant table, PID polling, persistent pin hint, sidecar or second
+recovery log is needed. No file-format marker changes. Ordinary roots with no
+exports retain their existing reclamation path after the one admission probe;
+there is no extra syscall on payload reads. Used roots probe presence during
+collection and inspect retired extents only while foreign readers exist. An
+uncertain ownership query poisons admission and prevents reuse; it never means
+that an owner is dead. Last OFD close, ordinary process exit and SIGKILL release
+the actual ownership without another participant cleaning a record.
+
+Recovery first reconstructs canonical ownership, then quarantines foreign
+ranges that have disappeared from the selected directory before granting new
+writer identities. Unbound free pages become transient retained intervals.
+Recovered packed pages keep their real selected-cell masks and leave free-cell
+admission while foreign bytes occupy them. They remain allocated if their last
+selected cell is subsequently deleted. Another reopen reconstructs that now
+unbound page from kernel ownership. Drained intervals/pages return through
+ordinary reclamation; explicit 1 MiB growth remains the only growth mechanism.
+Status includes quarantined whole pages in allocated/retired bytes and keeps
+packed-cell attribution limited to known local owners.
+
+Coordination bytes now stay inside the root pages: publication 0, recovery 1,
+reader presence 2, transaction stripes 256..511 and hashed namespace stripes
+512..8191. Namespace collisions retain both local and kernel serialization.
+This prevents a large accepted container's payload ranges from overlapping the
+former virtual namespace-lock range without reducing accepted capacity. Shared
+coordination participants must use matching builds. Native Pouch admission
+continues to be exclusive.
+
+Free-range recovery walks residual intervals once, including when GETLK
+returns an arbitrary overlapping owner. Each conflict splits its current
+interval directly; retained intervals need no sorted insertion. Both traversal
+and lock queries follow actual fragmentation, rather than repeatedly walking
+the pool head. A 64-pin fixture with an unretained page between each retained
+page fails the initial traversal's 131-probe bound at 2,083 probes. The final
+implementation uses 130, both with native conflict order and an upper-first
+test seam. A separate negative control disables recovery quarantine while
+retaining the rest of this implementation: fixed-capacity reuse then fails
+at the foreign reader's captured payload checksum. The normal fixture retains
+the exact bytes and regains capacity after the reader exits.
+
+Eight component groups cover empty/packed/multiple-extent values, imported
+clones, two independent exec'd readers, independent writer progress, repeated
+writer generations, fixed-capacity exhaustion, 1 MiB growth, and reader/writer
+SIGKILL. Writer death is tested before and after checkpoint under both root
+policies. Faults cover every measured import/recovery allocation site, invalid
+ticket metadata, partial pin acquisition, interruption, contention, and query
+failure before or after admission. Ticket export succeeds while storage writes,
+syncs and allocation are unavailable, without changing the sync count.
+
+Qualification comprises 48 distinct Debug checks across the integration and
+affected final passes, including source/stack gates, existing metadata fault
+suites, the strict 96-case pressure gate and 48 attachment workflows. There are
+36 distinct GNU and 36 musl release checks across the completed passes, including
+public guard behavior, owned-run packing, encrypted durable/NoSync
+queue/outbox/XA conversion and lifecycle recovery. The final traversal passes
+all eight component groups and affected physical-store checks on both releases.
+Three final TSan scenarios pass with instrumented OpenSSL 3.6.5 and no
+suppressions. Strict Memcheck covers malformed tickets, recovery/import faults
+and fragmented retention: 2,357 matching allocations/frees, zero remaining heap,
+zero errors/suppressions, and only the three inherited descriptors. Debug/TSan
+workers use 128 KiB stacks with the glibc stack cache disabled.
+
+Three final cached 2,097,225-byte probes use 3,208-byte tickets. Median export
+is 2.19 microseconds, import/close 37.31 microseconds, local consumption 0.913 ms
+and imported consumption 0.758 ms. These are small exploratory cached samples,
+not a throughput acceptance claim. A contiguous retained value needs four lock
+queries per reopen; after drainage the reopened root needs one. Reopen timings
+are noisy: retained samples span 1.285..1.400 ms and drained samples span
+1.112..8.030 ms. No faster-reopen claim follows from these samples.
+
+The final matched indexed comparison uses frozen `28f2e021` binaries and the
+multifile reference, three alternating samples and 10 MiB roots, with normal
+release stack settings. Native before/after medians in milliseconds:
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 51.80 / 55.18 | 634.93 / 612.94 | 85.92 / 81.52 | 1250.01 / 1314.51 |
+| Work CPU | 14.00 / 15.44 | 46.35 / 53.10 | 47.60 / 47.05 | 130.64 / 131.55 |
+| Maximum worker index flush | 18.27 / 16.87 | 19.28 / 15.92 | 32.50 / 23.80 | 19.06 / 15.81 |
+| Close | 0.345 / 0.328 | 0.314 / 0.300 | 0.620 / 0.663 | 0.745 / 0.630 |
+| Reopen alone | 3.31 / 3.15 | 3.48 / 4.04 | 5.26 / 4.03 | 4.54 / 5.81 |
+
+Maintenance still uses three barriers and export/import adds none. Mixed work,
+CPU and reopen changes do not establish general nonregression or acceptance.
+Native NoSync indexed work remains materially slower than multifile in these
+profiles; broader indexing performance still needs resolution.
+
+Evidence is in ignored `build/pouch-space-reader-pins/`: `qualified-debug.log`,
+`final-debug.log`, `final-fragmented-debug.log`, `qualified-*-release.log`,
+`final-qualified-*-release.log`, `fragmented-before.log`, `recovery-negative.log`,
+`final-tsan-*.log`, `memcheck-malformed.log`, `final-memcheck-*.log`,
+`final-performance.log`, `final-performance-summary.tsv` and
+`final-pin-measurements.log`, with qualification/negative-control scripts and
+the frozen baseline alongside them. Earlier intermediate measurements remain
+separate.
+
+This completes cross-process immutable-value retention and recovery, not shared
+Pouch admission or owned-stream/logical snapshot capture. Next integration must
+coordinate actual private allocator claims and completion capacity across
+participants, refresh canonical/projection state at publication, and rebuild
+abandoned work. It must reuse the physical ownership boundary without treating
+file authority or these immutable tickets as proof that shared messaging and
+lease operations are ready. Those surfaces and general performance/capacity
+acceptance remain required in the active goal. Multifile stays the default and
+production cutover requires its explicit deployment decision.

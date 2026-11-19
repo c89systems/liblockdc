@@ -11,8 +11,8 @@
 #define FIXED (PS_COORDINATION_TXN_STRIPES + 2U)
 #define BUCKETS 67U
 #define TXN_BASE UINT64_C(256)
-#define NS_BASE UINT64_C(4096)
-#define NS_MASK ((UINT64_C(1) << 61) - 1)
+#define NS_BASE UINT64_C(512)
+#define NS_SLOTS (2U * PS_PAGE - NS_BASE)
 struct ps_coordination_guard {
   ps_coordination *owner;
   pthread_mutex_t mutex;
@@ -50,6 +50,46 @@ int ps_coordination_check(ps_coordination *owner, lc_error *e) {
 }
 size_t ps_coordination_users(ps_coordination *owner) {
   return owner ? __atomic_load_n(&owner->users, __ATOMIC_ACQUIRE) : 0;
+}
+int ps_coordination_conflict(ps_coordination *owner, uint64_t offset,
+                             uint64_t bytes, uint64_t *first, uint64_t *last,
+                             lc_error *e) {
+  struct flock lock;
+  uint64_t end;
+  int rc;
+  if (!first || !last || !bytes || offset > INT64_MAX ||
+      bytes > (uint64_t)INT64_MAX - offset)
+    return fail(e, LC_ERR_INVALID, 0, "invalid physical pin query");
+  *first = *last = 0;
+  rc = ps_coordination_check(owner, e);
+  if (rc != LC_OK)
+    return rc;
+  memset(&lock, 0, sizeof(lock));
+  lock.l_type = F_WRLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = (off_t)offset;
+  lock.l_len = (off_t)bytes;
+  do {
+    rc = owner->io.lock(owner->io.context, owner->fd, F_OFD_GETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+  if (rc == 0 && lock.l_type == F_UNLCK)
+    return LC_OK;
+  if (rc == 0 && lock.l_whence == SEEK_SET && lock.l_start >= 0 &&
+      lock.l_len >= 0 && (lock.l_type == F_RDLCK || lock.l_type == F_WRLCK)) {
+    end = !lock.l_len || (uint64_t)lock.l_len >
+                             (uint64_t)INT64_MAX - (uint64_t)lock.l_start
+              ? (uint64_t)INT64_MAX
+              : (uint64_t)lock.l_start + (uint64_t)lock.l_len;
+    *first = (uint64_t)lock.l_start < offset ? offset : (uint64_t)lock.l_start;
+    *last = end > offset + bytes ? offset + bytes : end;
+    if (*first < *last)
+      return LC_OK;
+  }
+  if (owner->failure_flag)
+    __atomic_store_n(owner->failure_flag, 1, __ATOMIC_RELEASE);
+  __atomic_store_n(&owner->poisoned, 1, __ATOMIC_RELEASE);
+  return fail(e, LC_ERR_TRANSPORT, rc < 0 ? errno : 0,
+              "cannot establish physical pin ownership; close and reopen");
 }
 int ps_coordination_open(int fd, const ps_coordination_options *options,
                          ps_coordination **out, lc_error *e) {
@@ -156,7 +196,7 @@ static int namespace_guard(ps_coordination *owner, uint64_t identity,
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
-  offset = NS_BASE + (identity & NS_MASK);
+  offset = NS_BASE + identity % NS_SLOTS;
   bucket = (size_t)(offset % BUCKETS);
   pthread_mutex_lock(&owner->registry);
   for (guard = owner->buckets[bucket]; guard; guard = guard->next)

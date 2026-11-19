@@ -73,6 +73,8 @@ typedef struct ps_run {
 typedef struct ps_payload_page {
   ps_run run; /* reusable free-interval node; must be first */
   uint64_t occupied;
+  int external_pins;
+  struct ps_payload_page *pinned_next;
   struct ps_payload_page *next, **link, *hash_next;
   struct ps_payload_page *available_next, **available_link;
 } ps_payload_page;
@@ -86,6 +88,7 @@ typedef struct ps_meta_page {
 struct ps_space {
   /* fd is borrowed from coordination after successful lifetime admission. */
   int fd, poisoned, durable, root;
+  int range_pins;
   ps_coordination *coordination;
   pthread_mutex_t mutex;
   pthread_mutex_t sync_io_mutex, commit_mutex;
@@ -115,8 +118,10 @@ struct ps_space {
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];
   ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
+  ps_payload_page *pinned_pages;
   ps_payload_page *available[CELLS + 1];
-  ps_run *free, *metadata_free;
+  ps_run *free, *metadata_free, *pinned_free;
+  uint64_t pinned_free_bytes;
   ps_catalog_index catalogs;
 };
 struct ps_budget {

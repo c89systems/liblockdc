@@ -83,7 +83,11 @@ typedef struct ps_ref {
 typedef struct ps_stats {
   /* allocated_bytes counts physical payload reservations once per page.
    * Retired/private bytes attribute whole runs or rounded cells to owners;
-   * packed_bytes includes those owners and excludes unused page slack. */
+   * packed_bytes includes those owners and excludes unused page slack.
+   * Recovered unbound foreign pins count whole quarantined pages as retired.
+   * A recovered packed page held by foreign pins remains allocated, with only
+   * its known local cells attributed in packed_bytes; no old bitmap is guessed.
+   */
   uint64_t capacity, live_bytes, allocated_bytes, retired_bytes, private_bytes;
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
   uint64_t sync_requests, sync_batches, max_sync_batch;
@@ -117,11 +121,15 @@ typedef struct ps_io {
    */
   int (*zero)(void *, int, off_t, off_t);
 } ps_io;
+struct ps_coordination_io;
 typedef struct ps_options {
   uint64_t initial_capacity; /* zero selects 10 MiB; creation only */
   uint64_t maximum_capacity; /* zero means no configured maximum */
   int durable_sync;          /* zero is NoSync */
   const ps_io *io;
+  /* Optional native OFD query/guard seam, including admission before recovery.
+   */
+  const struct ps_coordination_io *coordination_io;
 } ps_options;
 
 /* create != 0 requires a new pathname; open never creates or truncates. */
@@ -181,6 +189,23 @@ int ps_values_read_open(const ps_values *, size_t, ps_reader **, lc_error *);
 void ps_values_close(ps_values *);
 uint64_t ps_read_size(const ps_reader *);
 void ps_reader_close(ps_reader *);
+/* Private cross-process captured-value handoff. Only immutable ps_reader
+ * values are supported (not mutable owned stream heads). Tickets contain
+ * extent metadata, never payload bytes. The issuer must keep its reader alive
+ * until import succeeds; an imported reader can issue another ticket under
+ * the same rule. The caller coordinates issuer lifetime; source loss during
+ * an unfinished handoff invalidates that transfer. Tickets alone pin nothing
+ * and cannot be persisted for later reopening. One caller owns each reader;
+ * exec before using a child.
+ * Export performs no payload I/O, allocation or durability barrier.
+ * Import opens a fresh read-only OFD, independently pins the captured extents,
+ * and returns an ordinary bounded streaming reader. It survives writer close,
+ * checkpoint and reopen. Process exit/last close releases its kernel pins.
+ * No allocator, recovery or logical publication capability is granted. */
+size_t ps_reader_ticket_bytes(const ps_reader *);
+int ps_reader_ticket(ps_reader *, void *, size_t, lc_error *);
+int ps_reader_import(const char *, const void *, size_t, ps_reader **,
+                     lc_error *);
 int ps_delete(ps_space *, ps_key, lc_error *);
 /* Missing or a changed expected incarnation is a successful no-op. */
 int ps_value_remove(ps_space *, ps_key, const ps_ref *, lc_error *);

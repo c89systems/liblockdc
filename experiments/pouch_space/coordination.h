@@ -46,7 +46,7 @@ int ps_coordination_close(ps_coordination *, lc_error *);
 int ps_coordination_check(ps_coordination *, lc_error *);
 size_t ps_coordination_users(ps_coordination *);
 /* Publication/recovery use identity zero; transaction uses stripe < 256.
- * Namespace keys map deterministically into a separate 61-bit lock range;
+ * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. One thread owns a guard through release; guards are
@@ -59,6 +59,12 @@ int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
 /* Release on the acquiring thread. An uncertain kernel unlock poisons the
  * owner; further acquisition fails until close/reopen. Cleanup remains legal. */
 void ps_coordination_unlock(ps_coordination_guard *);
+
+/* Query foreign OFD ownership without acquiring authority. A conflict is a
+ * half-open range; no conflict is first=last=0. Query failure poisons the owner
+ * because callers use this result to decide whether physical reuse is safe. */
+int ps_coordination_conflict(ps_coordination *, uint64_t, uint64_t, uint64_t *,
+                             uint64_t *, lc_error *);
 
 /* Borrowed while the space is alive; never independently closed. Native spaces
  * still acquire exclusive lifetime authority; shared allocator admission is

@@ -31,8 +31,18 @@ struct ps_reader {
   size_t random_extent;
   uint64_t random_base;
   int random_loaded;
+  int imported;
   unsigned char buffer[PS_CHUNK];
 };
+/* Every imported reader holds presence continuously from before acquiring its
+ * extents until last close. A handoff retains its source until import succeeds.
+ * Exclusive lifetime admission excludes an old local issuer; a foreign issuer
+ * already holds presence. Thus one probe before recovery detects every pin
+ * that can legitimately arrive from a previous owner, without a persisted hint.
+ * A new local export enables collection probes before its ticket escapes. */
+#define PIN_PRESENCE_OFFSET 2U
+#define TICKET_MAGIC UINT64_C(0x3154454b435450)
+#define TICKET_HEADER 112U
 struct ps_values {
   ps_space *space;
   ps_entry **items;
@@ -462,14 +472,9 @@ static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
 }
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
-static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
-                       lc_error *error) {
-  ps_run **link = offset < PS_DATA ? &s->metadata_free : &s->free, *node, *tail;
-  uint64_t *available =
-      offset < PS_DATA ? &s->metadata_free_bytes : &s->free_bytes;
-  while (*link && (*link)->offset + (*link)->bytes <= offset)
-    link = &(*link)->next;
-  node = *link;
+static int exclude_selected(ps_run **link, uint64_t *available, uint64_t offset,
+                            uint64_t bytes, lc_error *error) {
+  ps_run *node = *link, *tail;
   if (!node || node->offset > offset || bytes > node->bytes ||
       offset - node->offset > node->bytes - bytes)
     return err(error, LC_ERR_PROTOCOL, "overlapping container ownership");
@@ -496,6 +501,15 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
   *available -= bytes;
   node->bytes = offset - node->offset;
   return LC_OK;
+}
+static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
+                       lc_error *error) {
+  ps_run **link = offset < PS_DATA ? &s->metadata_free : &s->free;
+  uint64_t *available =
+      offset < PS_DATA ? &s->metadata_free_bytes : &s->free_bytes;
+  while (*link && (*link)->offset + (*link)->bytes <= offset)
+    link = &(*link)->next;
+  return exclude_selected(link, available, offset, bytes, error);
 }
 static size_t cell_count(uint64_t bytes) {
   return (size_t)((bytes + PS_CELL - 1) / PS_CELL);
@@ -540,6 +554,8 @@ static void payload_unavailable(ps_payload_page *p) {
 static void payload_available(ps_space *s, ps_payload_page *p) {
   size_t i, span = 0, largest = 0;
   payload_unavailable(p);
+  if (p->external_pins)
+    return;
   for (i = 0; i < CELLS; ++i) {
     span = p->occupied & (UINT64_C(1) << i) ? 0 : span + 1;
     if (span > largest)
@@ -564,12 +580,10 @@ static void payload_register(ps_space *s, ps_payload_page *p) {
   s->payload_buckets[hash] = p;
   ++s->packed_pages;
 }
-static void payload_release(ps_space *s, ps_extent *extent) {
-  ps_payload_page *p = payload_find(s, extent->offset), **link;
-  p->occupied &= ~extent_mask(extent);
-  s->packed_bytes -= extent_allocation(extent);
+static void payload_reconsider(ps_space *s, ps_payload_page *p) {
+  ps_payload_page **link;
   payload_unavailable(p);
-  if (p->occupied) {
+  if (p->occupied || p->external_pins) {
     payload_available(s, p);
     return;
   }
@@ -582,6 +596,12 @@ static void payload_release(ps_space *s, ps_extent *extent) {
     p->next->link = p->link;
   --s->packed_pages;
   free_insert(s, &p->run);
+}
+static void payload_release(ps_space *s, ps_extent *extent) {
+  ps_payload_page *p = payload_find(s, extent->offset);
+  p->occupied &= ~extent_mask(extent);
+  s->packed_bytes -= extent_allocation(extent);
+  payload_reconsider(s, p);
 }
 static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
   ps_payload_page *p;
@@ -650,11 +670,123 @@ static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
         payload_release(s, &p->extents[i]);
   return rc;
 }
+static int pin_conflict(ps_space *s, uint64_t offset, uint64_t bytes,
+                        int *present, lc_error *error) {
+  uint64_t first, last;
+  int rc = ps_coordination_conflict(s->coordination, offset, bytes, &first,
+                                    &last, error);
+  *present = rc != LC_OK || first != last;
+  return rc;
+}
+static int entry_foreign_pinned(ps_space *s, ps_entry *p) {
+  size_t i;
+  int present;
+  for (i = 0; i < p->count; ++i)
+    if (pin_conflict(s, p->extents[i].offset, p->extents[i].bytes, &present,
+                     NULL) != LC_OK ||
+        present)
+      return 1;
+  return 0;
+}
+/* Rebuild ownership that is intentionally absent from the current directory:
+ * an imported reader may outlive the writer that retired its incarnation.
+ * Whole free pages are quarantined; recovered packed pages retain their real
+ * occupancy and temporarily leave the admission bins. No payload is copied.
+ * GETLK may return ANY conflict. Split that interval, requery its residuals,
+ * and visit each clear residual once. Both traversal and queries follow actual
+ * free intervals plus pin fragments, without restarting from the pool head. */
+static int pins_recover(ps_space *s, lc_error *error) {
+  ps_payload_page *page;
+  ps_run *run, *held, **link = &s->free;
+  uint64_t first, last;
+  int rc, present;
+  if (!s->range_pins)
+    return LC_OK;
+  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  if (rc != LC_OK || !present)
+    return rc;
+  for (page = s->payload_pages; page; page = page->next) {
+    rc = pin_conflict(s, page->run.offset, PS_PAGE, &present, error);
+    if (rc != LC_OK)
+      return rc;
+    if (present) {
+      page->external_pins = 1;
+      page->pinned_next = s->pinned_pages;
+      s->pinned_pages = page;
+      payload_unavailable(page);
+    }
+  }
+  while (*link) {
+    run = *link;
+    rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
+                                  &first, &last, error);
+    if (rc != LC_OK)
+      return rc;
+    if (first == last) {
+      link = &run->next;
+      continue;
+    }
+    first = first / PS_PAGE * PS_PAGE;
+    last = aligned(last);
+    held = lc_calloc_with_allocator(NULL, 1, sizeof(*held));
+    if (!held)
+      return err(error, LC_ERR_NOMEM, "cannot retain foreign reader pages");
+    held->offset = first;
+    held->bytes = last - first;
+    rc = exclude_selected(link, &s->free_bytes, held->offset, held->bytes,
+                          error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, held);
+      return rc;
+    }
+    held->next = s->pinned_free;
+    s->pinned_free = held;
+    s->pinned_free_bytes += held->bytes;
+  }
+  return LC_OK;
+}
+static void pins_collect(ps_space *s, int present) {
+  ps_run **link = &s->pinned_free, *run;
+  ps_payload_page *page, **pages = &s->pinned_pages;
+  int held;
+  while (*link) {
+    run = *link;
+    if (present &&
+        (pin_conflict(s, run->offset, run->bytes, &held, NULL) != LC_OK ||
+         held)) {
+      link = &run->next;
+      continue;
+    }
+    *link = run->next;
+    s->pinned_free_bytes -= run->bytes;
+    free_insert(s, run);
+  }
+  while (*pages) {
+    page = *pages;
+    if (!present ||
+        (pin_conflict(s, page->run.offset, PS_PAGE, &held, NULL) == LC_OK &&
+         !held)) {
+      *pages = page->pinned_next;
+      page->external_pins = 0;
+      payload_reconsider(s, page);
+    } else
+      pages = &page->pinned_next;
+  }
+}
 static void collect(ps_space *s) {
   ps_entry **link = &s->retired, *p;
+  int present = 0;
+  if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+    return;
+  if (s->range_pins) {
+    if (pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL) != LC_OK)
+      return;
+    pins_collect(s, present);
+  }
   while (*link) {
     p = *link;
     if (p->state == 2 && p->safe && !p->pins &&
+        (!present || !entry_foreign_pinned(s, p)) &&
         release_entry_runs(s, p, NULL) == LC_OK) {
       *link = p->retired_next;
       if (*link)
@@ -1631,7 +1763,7 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
     p->safe = 1;
   }
   collect(s);
-  return LC_OK;
+  return healthy(s, error);
 }
 static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   size_t bytes = event_bytes(p, event);
@@ -1693,6 +1825,11 @@ static void destroy(ps_space *s) {
   while (s->metadata_free) {
     r = s->metadata_free;
     s->metadata_free = r->next;
+    lc_free_with_allocator(NULL, r);
+  }
+  while (s->pinned_free) {
+    r = s->pinned_free;
+    s->pinned_free = r->next;
     lc_free_with_allocator(NULL, r);
   }
   while (s->pages) {
@@ -2257,6 +2394,9 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
+  rc = pins_recover(s, error);
+  if (rc != LC_OK)
+    goto done;
   /* The grant reuses rejected journal sequences. Stabilize their retirement
    * before that valid event can reach storage, including an apparently clean
    * retry whose zeros came from an earlier failed recovery's file cache.
@@ -2377,11 +2517,17 @@ int ps_open(const char *path, int create, const ps_options *options,
     return rc;
   }
   coordination.failure_flag = &s->poisoned;
+  coordination.io = options->coordination_io;
   rc = ps_coordination_open(s->fd, &coordination, &s->coordination, error);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PENDING)
       rc = err(error, LC_ERR_INVALID,
                "container already open; another owner is active");
+    destroy(s);
+    return rc;
+  }
+  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &s->range_pins, error);
+  if (rc != LC_OK) {
     destroy(s);
     return rc;
   }
@@ -2847,6 +2993,10 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   return rc;
 }
 static void reader_payload_invalid(ps_reader *r) {
+  if (r->imported) {
+    r->entry->value_checked = -1;
+    return;
+  }
   pthread_mutex_lock(&r->space->mutex);
   r->entry->value_checked = -1;
   pthread_mutex_unlock(&r->space->mutex);
@@ -3162,6 +3312,12 @@ void ps_reader_close(ps_reader *r) {
   if (!r)
     return;
   s = r->space;
+  if (r->imported) {
+    entry_free(r->entry);
+    destroy(s);
+    lc_free_with_allocator(NULL, r);
+    return;
+  }
   pthread_mutex_lock(&s->mutex);
   --r->entry->pins;
   --s->readers;
@@ -3169,6 +3325,187 @@ void ps_reader_close(ps_reader *r) {
     collect(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, r);
+}
+size_t ps_reader_ticket_bytes(const ps_reader *r) {
+  if (!r || r->entry->count > (PS_JOURNAL - 64U) / 24U)
+    return 0;
+  return TICKET_HEADER + r->entry->count * 24U;
+}
+static uint32_t ticket_checksum(const unsigned char *wire, size_t bytes) {
+  static const unsigned char zero[4] = {0};
+  uLong crc = crc32(0, wire, 96);
+  crc = crc32(crc, zero, sizeof(zero));
+  return (uint32_t)crc32(crc, wire + 100, (uInt)(bytes - 100));
+}
+int ps_reader_ticket(ps_reader *r, void *buffer, size_t bytes,
+                     lc_error *error) {
+  unsigned char *wire = buffer;
+  ps_space *s;
+  ps_entry *p;
+  struct stat st;
+  uint64_t capacity;
+  size_t i, at;
+  int rc;
+  if (!r || !buffer || bytes != ps_reader_ticket_bytes(r) ||
+      bytes < TICKET_HEADER)
+    return err(error, LC_ERR_INVALID, "captured reader ticket size mismatch");
+  s = r->space;
+  p = r->entry;
+  if (fstat(s->fd, &st) != 0)
+    return err(error, LC_ERR_TRANSPORT, "cannot identify captured reader file");
+  if (!r->imported)
+    pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc == LC_OK)
+    s->range_pins = 1;
+  capacity = s->capacity;
+  if (!r->imported)
+    pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    return rc;
+  memset(wire, 0, bytes);
+  put64(wire, TICKET_MAGIC);
+  put64(wire + 8, (uint64_t)st.st_dev);
+  put64(wire + 16, (uint64_t)st.st_ino);
+  put64(wire + 24, capacity);
+  memcpy(wire + 32, s->identity, 16);
+  put64(wire + 48, p->token);
+  put64(wire + 56, p->bytes);
+  put64(wire + 64, p->count);
+  put32(wire + 72, p->key.kind);
+  put64(wire + 80, p->key.owner);
+  put64(wire + 88, p->key.key);
+  for (i = 0, at = TICKET_HEADER; i < p->count; ++i, at += 24) {
+    put64(wire + at, p->extents[i].offset);
+    put64(wire + at + 8, p->extents[i].bytes);
+    put32(wire + at + 16, p->extents[i].crc);
+    put32(wire + at + 20, p->extents[i].flags);
+  }
+  put32(wire + 96, ticket_checksum(wire, bytes));
+  return LC_OK;
+}
+static int import_pin(int fd, uint64_t offset, uint64_t bytes,
+                      lc_error *error) {
+  struct flock lock;
+  int rc;
+  memset(&lock, 0, sizeof(lock));
+  lock.l_type = F_RDLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = (off_t)offset;
+  lock.l_len = (off_t)bytes;
+  do {
+    rc = fcntl(fd, F_OFD_SETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+  return rc == 0 ? LC_OK
+                 : err(error,
+                       errno == EACCES || errno == EAGAIN ? LC_ERR_PENDING
+                                                          : LC_ERR_TRANSPORT,
+                       "cannot pin captured reader range");
+}
+int ps_reader_import(const char *path, const void *buffer, size_t bytes,
+                     ps_reader **out, lc_error *error) {
+  const unsigned char *wire = buffer;
+  ps_space *s = NULL;
+  ps_entry *p = NULL;
+  ps_reader *r = NULL;
+  struct stat st;
+  uint64_t count, total = 0;
+  size_t i, at;
+  int rc = LC_OK;
+  if (out)
+    *out = NULL;
+  if (!path || !*path || !out || !wire || bytes < TICKET_HEADER ||
+      bytes > TICKET_HEADER + PS_JOURNAL || get64(wire) != TICKET_MAGIC ||
+      get32(wire + 96) != ticket_checksum(wire, bytes))
+    return err(error, LC_ERR_INVALID, "invalid captured reader ticket");
+  count = get64(wire + 64);
+  if (count > (PS_JOURNAL - 64U) / 24U ||
+      bytes != TICKET_HEADER + count * 24U || !get64(wire + 48) ||
+      get64(wire + 24) < PS_MIB || get64(wire + 24) > INT64_MAX ||
+      get64(wire + 24) % PS_MIB || get32(wire + 76) || get32(wire + 100) ||
+      get64(wire + 104))
+    return err(error, LC_ERR_INVALID, "invalid captured reader metadata");
+  s = lc_calloc_with_allocator(NULL, 1, sizeof(*s));
+  if (s)
+    s->fd = -1;
+  p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
+  if (!s || !p || !r) {
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate imported captured reader");
+    goto done;
+  }
+  s->io.read = native_read;
+  s->capacity = get64(wire + 24);
+  s->range_pins = 1;
+  memcpy(s->identity, wire + 32, 16);
+  p->key.owner = get64(wire + 80);
+  p->key.key = get64(wire + 88);
+  p->key.kind = get32(wire + 72);
+  p->token = get64(wire + 48);
+  p->bytes = get64(wire + 56);
+  if (!immutable_key(p->key)) {
+    rc = err(error, LC_ERR_INVALID, "captured ticket requires immutable value");
+    goto done;
+  }
+  if (count) {
+    p->extents =
+        lc_calloc_with_allocator(NULL, (size_t)count, sizeof(*p->extents));
+    if (!p->extents) {
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate captured reader extents");
+      goto done;
+    }
+  }
+  p->count = p->capacity = (size_t)count;
+  for (i = 0, at = TICKET_HEADER; i < p->count; ++i, at += 24) {
+    ps_extent *x = &p->extents[i];
+    x->offset = get64(wire + at);
+    x->bytes = get64(wire + at + 8);
+    x->crc = get32(wire + at + 16);
+    x->flags = get32(wire + at + 20);
+    if (!x->bytes || x->bytes > PS_CHUNK || x->offset < PS_DATA ||
+        x->offset > s->capacity || x->bytes > s->capacity - x->offset ||
+        (x->flags != 0 && x->flags != EXTENT_PACKED) ||
+        (x->flags
+             ? x->offset % PS_CELL || x->bytes > PS_PAGE - x->offset % PS_PAGE
+             : x->offset % PS_PAGE) ||
+        total > UINT64_MAX - x->bytes) {
+      rc = err(error, LC_ERR_INVALID, "captured ticket extent exceeds bounds");
+      goto done;
+    }
+    total += x->bytes;
+  }
+  if (total != p->bytes) {
+    rc = err(error, LC_ERR_INVALID, "captured ticket byte count mismatch");
+    goto done;
+  }
+  s->fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (s->fd < 0 || fstat(s->fd, &st) != 0) {
+    rc = err(error, LC_ERR_TRANSPORT, "cannot open captured reader file");
+    goto done;
+  }
+  if (!S_ISREG(st.st_mode) || st.st_size < (off_t)s->capacity ||
+      (uint64_t)st.st_dev != get64(wire + 8) ||
+      (uint64_t)st.st_ino != get64(wire + 16)) {
+    rc = err(error, LC_ERR_INVALID, "captured ticket belongs to another file");
+    goto done;
+  }
+  rc = import_pin(s->fd, PIN_PRESENCE_OFFSET, 1, error);
+  for (i = 0; rc == LC_OK && i < p->count; ++i)
+    rc = import_pin(s->fd, p->extents[i].offset, p->extents[i].bytes, error);
+  if (rc == LC_OK) {
+    r->space = s;
+    r->entry = p;
+    r->imported = 1;
+    *out = r;
+    return LC_OK;
+  }
+done:
+  if (s)
+    destroy(s);
+  if (p)
+    entry_free(p);
+  lc_free_with_allocator(NULL, r);
+  return rc;
 }
 static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
                         int missing_ok, lc_error *error) {
@@ -3252,6 +3589,8 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
     else
       collect(s);
   }
+  if (rc == LC_OK)
+    rc = healthy(s, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
@@ -3399,7 +3738,9 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->descriptor_page_writes = s->descriptor_page_writes;
   out->packed_pages = s->packed_pages;
   out->packed_bytes = s->packed_bytes;
-  out->allocated_bytes = s->packed_pages * (uint64_t)PS_PAGE;
+  out->allocated_bytes =
+      s->packed_pages * (uint64_t)PS_PAGE + s->pinned_free_bytes;
+  out->retired_bytes = s->pinned_free_bytes;
   out->journal_bytes = s->journal;
   out->syncs = __atomic_load_n(&s->syncs, __ATOMIC_RELAXED);
   out->checkpoints = s->checkpoints;

@@ -41,7 +41,15 @@ one process at a time. Independent threads
 reserve private extents under a short mutex; producer callbacks run outside it.
 A second open, including another process, fails. After the exclusive owner
 exits, another process can recover and open normally. Shared allocator/projection
-recovery and process-shared reader generations remain unfinished. Fork before
+recovery and owned-stream reader generations remain unfinished. Captured
+immutable values can now be handed to an independently opened, read-only
+process capability. Its OFD range pins survive writer replacement, checkpoint,
+close/reopen and process death. Tickets require the issuer to retain its reader
+until import succeeds; they are not persistent reopening references. Kernel
+ownership is reconstructed before allocator admission, including unbound old
+values and packed pages. This does not admit another Pouch writer. See the
+[reader retention contract](../../docs/pouch-space-implementation.md#captured-immutable-values-across-process-lifetimes).
+Fork before
 open or exec before using the library in a child. Stop concurrent calls and close all readers
 and writers before closing their space.
 

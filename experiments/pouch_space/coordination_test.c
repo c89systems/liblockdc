@@ -188,9 +188,9 @@ static void lifecycle(void) {
   /* Deliberately colliding namespace identities must share the local gate as
    * well as the kernel byte; one must never release the other's OFD lock. */
   ok(ps_coordination_lock(a, PS_COORDINATION_NAMESPACE, 0, 0, &guard, &e), &e);
-  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_NAMESPACE,
-                                UINT64_C(7073558525344295424), 0, &busy, &e) ==
-              LC_ERR_PENDING && !busy);
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_NAMESPACE, UINT64_C(9169), 0,
+                               &busy, &e) == LC_ERR_PENDING &&
+          !busy);
   lc_error_cleanup(&e);
   REQUIRE(ps_coordination_lock(b, PS_COORDINATION_NAMESPACE, 0, 0, &busy, &e) ==
               LC_ERR_PENDING && !busy);
