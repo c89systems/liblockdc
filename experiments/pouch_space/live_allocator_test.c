@@ -15,6 +15,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 static size_t checks, allocations, allocation_fail;
 static int measuring;
@@ -474,8 +475,14 @@ static void fence(void) {
   memset(rejected, 0xa5, sizeof(rejected));
   /* Simulate an interrupted foreign control write. An unknown changed prefix
    * cannot become a new allocation's baseline merely because it is invalid. */
+  ps_coordination_guard *guard = NULL;
+  ok(ps_coordination_lock(a->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &guard, &e),
+     &e);
+  ps_readiness_begin(a, PS_READINESS_JOURNAL);
   REQUIRE(pwrite(a->fd, rejected, sizeof(rejected), PS_JOURNAL_OFFSET) ==
           (ssize_t)sizeof(rejected));
+  ps_coordination_unlock(guard);
   REQUIRE(ps_budget_open(a, &plan, &budget, &e) == LC_ERR_PENDING && !budget);
   lc_error_cleanup(&e);
   ok(ps_check(a, &e), &e);
@@ -1516,7 +1523,8 @@ static void capture_race(void) {
 }
 typedef struct projection_io {
   size_t operations, fail, syncs, payload_reads;
-  int armed, phase, ready;
+  size_t root_reads, journal_reads;
+  int armed, phase, ready, pause_journal;
   span forbidden[16];
   size_t ranges;
 } projection_io;
@@ -1524,6 +1532,10 @@ static ssize_t projection_read(void *context, int fd, void *bytes, size_t n,
                                off_t offset) {
   projection_io *m = context;
   if (m->armed) {
+    if (offset < 2 * PS_PAGE)
+      ++m->root_reads;
+    if (offset >= PS_JOURNAL_OFFSET && offset < PS_DATA)
+      ++m->journal_reads;
     for (size_t i = 0; i < m->ranges; ++i)
       if ((uint64_t)offset < m->forbidden[i].last &&
           (uint64_t)offset + n > m->forbidden[i].first)
@@ -1554,6 +1566,12 @@ static int projection_sync(void *context, int fd) {
 static ssize_t projection_write(void *context, int fd, const void *bytes,
                                 size_t n, off_t offset) {
   projection_io *m = context;
+  if (m->pause_journal && offset >= PS_JOURNAL_OFFSET && offset < PS_DATA) {
+    REQUIRE(n >= 64 && pwrite(fd, bytes, 32, offset) == 32);
+    REQUIRE(write(m->ready, "J", 1) == 1);
+    for (;;)
+      pause();
+  }
   if (m->armed && ++m->operations == m->fail) {
     errno = EIO;
     return -1;
@@ -1850,10 +1868,9 @@ static void projection_recovery(void) {
             WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGKILL);
     REQUIRE(close(ready[0]) == 0);
     ps_stats before = status(s);
-    ok(ps_refresh(s, &e), &e);
+    ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
     REQUIRE(status(s).syncs == before.syncs + 1);
     captured_expect(old, 1, 65);
-    ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
     captured_expect(current, 1, 1000);
     ps_reader_close(old);
     ps_reader_close(current);
@@ -2355,6 +2372,14 @@ static void readiness_cohort(void) {
   lc_error_cleanup(&e);
   REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
   lc_error_cleanup(&e);
+  /* A checksum-valid record from the previous live protocol also fences
+   * admission. The disk format can still reopen after the cohort drains. */
+  records[selected + 1] = UINT64_C(0x3159444145525350);
+  records[crc] = crc32(0, (const unsigned char *)(records + selected),
+                       (uInt)((PS_READINESS_WORDS - 1) * sizeof(zero)));
+  REQUIRE(pwrite(b->fd, records + selected, PS_READINESS_WORDS * sizeof(zero),
+                 PS_READINESS_OFFSET + selected * sizeof(zero)) ==
+          PS_READINESS_WORDS * sizeof(zero));
   ok(ps_close(a, &e), &e);
   REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
   lc_error_cleanup(&e);
@@ -2487,6 +2512,130 @@ static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
   ok(rc, &e);
   captured_expect(r, (unsigned char)byte, bytes);
   ps_reader_close(r);
+}
+static void certified_prefix_reads(void) {
+  lc_error e = {0};
+  projection_io disk = {0};
+  ps_io io = {&disk,           projection_read, projection_write,
+              projection_sync, reserve_io,      NULL};
+  ps_options observer = {0}, publisher = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_budget_plan plan = {0};
+  ps_budget *budget = NULL;
+  uint64_t prefix;
+  observer.io = &io;
+  publisher.durable_sync = 1;
+  ok(ps_open(path, 1, &observer, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_open(path, 0, &publisher, &b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(!readiness(a).pending);
+
+  disk.armed = 1;
+  expect_value(a, key(1), 65, 1);
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(!disk.root_reads && !disk.journal_reads);
+
+  ps_writer *w = replay_value(b, key(1), 42, 65, &e);
+  ok(ps_revision_publish(&w, 1, 0, PS_COMMIT_DEFER_SYNC, NULL, &prefix, &e),
+     &e);
+  ps_writer_close(w);
+  expect_value(a, key(1), 65, 1);
+  REQUIRE(!disk.root_reads && disk.journal_reads == 2);
+  ok(ps_flush(b, &e), &e);
+  expect_value(a, key(1), 65, 42);
+  REQUIRE(!disk.root_reads && disk.journal_reads == 2);
+
+  ok(ps_checkpoint(b, &e), &e);
+  expect_value(a, key(1), 65, 42);
+  REQUIRE(disk.root_reads == 2 && disk.journal_reads == 3);
+  expect_value(a, key(1), 65, 42);
+  REQUIRE(disk.root_reads == 2 && disk.journal_reads == 3);
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 4);
+  /* A writer can exit just before issuing its first write. Confirm the old
+   * end marker once, then return to reads using the live certificate. */
+  ps_coordination_guard *guard = NULL;
+  ok(ps_coordination_lock(b->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &guard, &e),
+     &e);
+  ps_readiness_begin(b, PS_READINESS_JOURNAL);
+  ps_coordination_unlock(guard);
+  expect_value(a, key(1), 65, 42);
+  REQUIRE(!readiness(a).pending && disk.root_reads == 4 &&
+          disk.journal_reads == 5);
+  expect_value(a, key(1), 65, 42);
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 5);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void certified_prefix_child(int notify, int proceed) {
+  lc_error e = {0};
+  projection_io disk = {0};
+  ps_io io = {&disk,           projection_read, projection_write,
+              projection_sync, reserve_io,      NULL};
+  ps_options options = {0};
+  ps_space *s = NULL;
+  char message;
+  options.io = &io;
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  REQUIRE(write(notify, "O", 1) == 1);
+  REQUIRE(read(proceed, &message, 1) == 1 && message == 'W');
+  disk.ready = notify;
+  disk.pause_journal = 1;
+  capture_put(s, 2, 65);
+  REQUIRE(0);
+}
+static void certified_prefix_interruption(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *held = NULL, *reader = NULL;
+  int notify[2], proceed[2], exited;
+  char message;
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
+  REQUIRE(pipe(notify) == 0 && pipe(proceed) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    char output[16], input[16];
+    REQUIRE(!close(notify[0]) && !close(proceed[1]));
+    snprintf(output, sizeof(output), "%d", notify[1]);
+    snprintf(input, sizeof(input), "%d", proceed[0]);
+    execl(executable, executable, "--prefix-child", path, output, input,
+          (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(!close(notify[1]) && !close(proceed[0]));
+  REQUIRE(read(notify[0], &message, 1) == 1 && message == 'O');
+  expect_value(a, key(1), 65, 1);
+  ps_readiness_certificate before = readiness(a);
+  REQUIRE(!before.pending && before.ready == a->sequence);
+  REQUIRE(write(proceed[1], "W", 1) == 1);
+  REQUIRE(read(notify[0], &message, 1) == 1 && message == 'J');
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(!close(notify[0]) && !close(proceed[1]));
+  ps_readiness_certificate after = readiness(a);
+  REQUIRE(after.ready == before.ready && after.root == before.root &&
+          after.pending == PS_READINESS_JOURNAL);
+  REQUIRE(ps_read_open(a, key(1), NULL, &reader, &e) == LC_ERR_PENDING &&
+          !reader);
+  lc_error_cleanup(&e);
+  captured_expect(held, 1, 65);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  REQUIRE(!readiness(a).pending);
+  expect_value(a, key(1), 65, 1);
+  expect_value(a, key(2), 0, 0);
+  capture_put(a, 2, 65);
+  expect_value(b, key(2), 65, 2);
+  ps_reader_close(held);
+  ok(ps_close(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static void journal_replay(void) {
   lc_error e = {0};
@@ -3668,6 +3817,11 @@ int main(int argc, char **argv) {
     journal_replay_child(atoi(argv[3]), atoi(argv[4]));
     return 0;
   }
+  if (argc == 5 && !strcmp(argv[1], "--prefix-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    certified_prefix_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--projection-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     projection_child(atoi(argv[3]), atoi(argv[4]));
@@ -3735,7 +3889,10 @@ int main(int argc, char **argv) {
     readiness_cohort();
   else if (!strcmp(argv[2], "readiness-faults"))
     readiness_faults();
-  else if (!strcmp(argv[2], "journal-replay"))
+  else if (!strcmp(argv[2], "certified-prefix")) {
+    certified_prefix_reads();
+    certified_prefix_interruption();
+  } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
   else if (!strcmp(argv[2], "journal-replay-faults"))
     journal_replay_faults();

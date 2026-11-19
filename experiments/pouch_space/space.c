@@ -46,13 +46,14 @@ struct ps_reader {
 static int allocation_refresh(ps_space *, lc_error *);
 static int allocation_ranges_refresh(ps_space *, lc_error *);
 static int canonical_observe(ps_space *, lc_error *);
-static int canonical_journal(ps_space *, int replay, lc_error *);
+static int canonical_journal(ps_space *, const ps_readiness_certificate *,
+                             int replay, int verify_end, lc_error *);
 static int replay_frame(ps_space *, const unsigned char *, uint64_t,
                         lc_error *);
 static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t,
                                lc_error *);
 static ps_entry *selected_value(ps_space *, ps_entry *, uint64_t);
-static int canonical_refresh(ps_space *, lc_error *);
+static int canonical_refresh(ps_space *, int verify_disk, lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 struct ps_values {
@@ -499,15 +500,19 @@ static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
   }
   return rc;
 }
-int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
-                              lc_error *error) {
+static int capture_begin(ps_space *s, ps_coordination_guard **guard,
+                         int verify_disk, lc_error *error) {
   int rc = healthy(s, error);
   *guard = NULL;
   if (rc == LC_OK)
     rc = allocation_begin(s, guard, error);
   if (rc == LC_OK && *guard)
-    rc = canonical_refresh(s, error);
+    rc = canonical_refresh(s, verify_disk, error);
   return rc;
+}
+int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
+                              lc_error *error) {
+  return capture_begin(s, guard, 0, error);
 }
 int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
                             lc_error *error) {
@@ -2412,8 +2417,10 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
   memcpy(root + 56, s->identity, 16);
   put32(root + 72, PS_ROOT_LAYOUT);
   put32(root + 76, checksum(root, 76));
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    ps_readiness_begin(s, PS_READINESS_ROOT);
     rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
+  }
   if (rc == LC_OK)
     rc = sync_file(s, error);
   if (rc == LC_OK)
@@ -2528,6 +2535,7 @@ static int write_journal_frame(ps_space *s, unsigned char *wire, size_t bytes,
     memset(wire + bytes, 0, marker);
     length += marker;
   }
+  ps_readiness_begin(s, PS_READINESS_JOURNAL);
   rc = transfer(s, wire, length, JOURNAL_OFFSET + s->journal, 1, error);
   if (rc == LC_OK && s->journal_image)
     memcpy(s->journal_image + s->journal, wire, length);
@@ -2684,9 +2692,18 @@ static int root_valid(const unsigned char *p) {
 static int canonical_observe(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES];
   const unsigned char *root;
+  ps_readiness_certificate certificate;
   int rc, a, b;
   if (!s->journal_image)
     return err(error, LC_ERR_PENDING, "container canonical view needs refresh");
+  rc = ps_readiness_read(s, &certificate, error);
+  if (rc != LC_OK)
+    return rc;
+  if (certificate.root == s->generation &&
+      !(certificate.pending & PS_READINESS_ROOT))
+    return canonical_journal(s, &certificate, 0,
+                             (certificate.pending & PS_READINESS_JOURNAL) != 0,
+                             error);
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -2698,38 +2715,43 @@ static int canonical_observe(ps_space *s, lc_error *error) {
              ? roots + PS_ROOT_BYTES
              : roots;
   if ((!a && !b) || get64(root + 8) != s->generation ||
-      memcmp(root + 56, s->identity, 16))
+      memcmp(root + 56, s->identity, 16)) {
+    if (certificate.root == s->generation)
+      ps_readiness_begin(s, PS_READINESS_ROOT);
     return err(error, LC_ERR_PENDING,
                "container checkpoint view needs refresh");
-  return canonical_journal(s, 0, error);
+  }
+  return canonical_journal(s, &certificate, 0, 1, error);
 }
-static int canonical_journal(ps_space *s, int replay, lc_error *error) {
+static int canonical_journal(ps_space *s,
+                             const ps_readiness_certificate *certificate,
+                             int replay, int verify_end, lc_error *error) {
   unsigned char next[64];
-  ps_readiness_certificate certificate;
-  int rc = ps_readiness_read(s, &certificate, error);
-  if (rc != LC_OK)
-    return rc;
-  if (s->generation < certificate.root)
+  int rc;
+  if (s->generation < certificate->root)
     return err(error, LC_ERR_PENDING,
                "certified checkpoint view needs refresh");
-  s->peer_durable = certificate.durable;
-  if (s->readiness && certificate.durable >= s->own_ready_wire &&
+  s->peer_durable = certificate->durable;
+  if (s->readiness && certificate->durable >= s->own_ready_wire &&
       __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
           s->own_ready_sequence)
     mark_durable(s, s->own_ready_sequence);
-  while (s->journal <= PS_JOURNAL - sizeof(next)) {
+  while ((verify_end || s->sequence < certificate->ready) &&
+         s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
     if (rc != LC_OK)
       return rc;
     if (!memcmp(next, s->journal_image + s->journal, sizeof(next)))
       break;
-    if (s->readiness && s->sequence >= certificate.ready)
+    if (s->readiness && s->sequence >= certificate->ready) {
+      ps_readiness_begin(s, PS_READINESS_JOURNAL);
       return err(error, LC_ERR_PENDING,
                  "journal boundary is not yet certified");
+    }
     if (replay &&
         (get32(next) == REVISION_MAGIC ||
          (get32(next) == EVENT_MAGIC && get32(next + 20) != PS_RESERVE_IDS))) {
-      rc = replay_frame(s, next, certificate.ready, error);
+      rc = replay_frame(s, next, certificate->ready, error);
       if (rc != LC_OK)
         return rc;
       continue;
@@ -2756,8 +2778,10 @@ static int canonical_journal(ps_space *s, int replay, lc_error *error) {
     memset(s->journal_image + s->journal, 0, PS_JOURNAL - s->journal);
     __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
   }
-  if (s->readiness && s->sequence < certificate.ready)
+  if (s->readiness && s->sequence < certificate->ready)
     return err(error, LC_ERR_PENDING, "certified journal view needs refresh");
+  if (verify_end && (certificate->pending & PS_READINESS_JOURNAL))
+    ps_readiness_finish(s, PS_READINESS_JOURNAL);
   return LC_OK;
 }
 typedef struct metadata_read_page {
@@ -3617,12 +3641,14 @@ static int recover(ps_space *s, lc_error *error) {
     --last;
   if (first < last) {
     memset(wire + first, 0, last - first);
+    ps_readiness_begin(s, PS_READINESS_JOURNAL);
     rc = transfer(s, wire + first, last - first, JOURNAL_OFFSET + first, 1,
                   error);
     if (rc != LC_OK)
       goto done;
   }
   if (memcmp(roots + (1 - s->root) * PS_ROOT_BYTES, zero, sizeof(zero))) {
+    ps_readiness_begin(s, PS_READINESS_ROOT);
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
                   error);
     if (rc != LC_OK)
@@ -3987,7 +4013,7 @@ static void projection_install(ps_space *s, ps_space *v) {
   if (s->peer_durable >= s->own_ready_wire)
     mark_durable(s, s->own_ready_sequence);
 }
-static int canonical_refresh(ps_space *s, lc_error *error) {
+static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0},
                                           *buffer = NULL;
   const unsigned char *root;
@@ -4004,6 +4030,14 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   rc = ps_readiness_read(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
+  /* A writer announces every root or journal change before touching disk.
+   * Under allocation authority the checked certificate can therefore select
+   * the resident root and bound journal import without probing either end. */
+  if (!verify_disk && certificate.root == s->generation &&
+      !(certificate.pending & PS_READINESS_ROOT))
+    return canonical_journal(s, &certificate, 1,
+                             (certificate.pending & PS_READINESS_JOURNAL) != 0,
+                             error);
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -4016,11 +4050,15 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   if ((!a && !b) || memcmp(root + 56, s->identity, 16) ||
       (a && b &&
        (get64(roots + 8) == get64(roots + PS_ROOT_BYTES + 8) ||
-        memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16))))
+        memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16)))) {
+    ps_readiness_begin(s, PS_READINESS_ROOT);
     return err(error, LC_ERR_PROTOCOL,
                "conflicting checkpoint projection roots");
+  }
+  if (get64(root + 8) != certificate.root)
+    ps_readiness_begin(s, PS_READINESS_ROOT);
   if (get64(root + 8) == s->generation)
-    return canonical_journal(s, 1, error);
+    return canonical_journal(s, &certificate, 1, 1, error);
   if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
       get64(root + 16) < s->capacity || get64(root + 48) < s->token_limit)
     return err(error, LC_ERR_PENDING,
@@ -4121,6 +4159,8 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   if (rc == LC_OK && v->sequence < certificate.ready)
     rc = err(error, LC_ERR_PENDING,
              "checkpoint is behind the certified journal prefix");
+  if (rc == LC_ERR_PENDING || rc == LC_ERR_PROTOCOL)
+    ps_readiness_begin(s, PS_READINESS_JOURNAL);
   if (rc != LC_OK)
     goto done;
   /* Include every superseded frame still needed by readers or cold replay.
@@ -4155,9 +4195,11 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
    * it.
    */
   if (rc == LC_OK &&
-      memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))
+      memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero))) {
+    ps_readiness_begin(s, PS_READINESS_ROOT);
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
                   error);
+  }
   if (rc == LC_OK &&
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
@@ -4171,6 +4213,8 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   if (rc == LC_OK) {
     projection_entries(s, v, items, count);
     projection_install(s, v);
+    if (certificate.pending & PS_READINESS_JOURNAL)
+      ps_readiness_finish(s, PS_READINESS_JOURNAL);
   } else {
   done:
     if (v)
@@ -4196,7 +4240,7 @@ int ps_refresh(ps_space *s, lc_error *error) {
   if (!s)
     return err(error, LC_ERR_INVALID, "checkpoint refresh requires a space");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = capture_begin(s, &guard, 1, error);
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;

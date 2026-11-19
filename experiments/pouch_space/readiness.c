@@ -6,10 +6,13 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-#define READY_MAGIC UINT64_C(0x3159444145525350)
+/* Live participants must all announce disk changes before writing. The
+ * previous volatile protocol is safe to discard only on cold admission. */
+#define READY_MAGIC UINT64_C(0x3259444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
-#define ZERO_WORDS (PS_PAGE / sizeof(uint64_t) - 2 * WORDS)
+#define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
+#define ZERO_WORDS (PENDING_WORD - 2 * WORDS)
 #define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
 enum readiness_word {
   GENERATION,
@@ -157,6 +160,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
     for (i = 0; i < ZERO_WORDS; ++i)
       __atomic_store_n(s->readiness->page + 2 * WORDS + i, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(s->readiness->page + PENDING_WORD, 0, __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
   }
   record[MAGIC] = READY_MAGIC;
@@ -169,6 +173,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     s->own_ready_wire = s->sequence;
     s->own_ready_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+    ps_readiness_finish(s, PS_READINESS_ROOT | PS_READINESS_JOURNAL);
   }
   return rc;
 }
@@ -188,8 +193,22 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->durable = record[DURABLE];
     out->root = record[ROOT];
     out->origin = record[ORIGIN];
+    out->pending =
+        __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE);
+    if (out->pending & ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL))
+      rc = failed(s, e, "shared readiness has unknown pending changes");
   }
   return rc;
+}
+void ps_readiness_begin(ps_space *s, unsigned int changes) {
+  if (s->readiness)
+    (void)__atomic_fetch_or(s->readiness->page + PENDING_WORD, changes,
+                            __ATOMIC_SEQ_CST);
+}
+void ps_readiness_finish(ps_space *s, unsigned int changes) {
+  if (s->readiness)
+    (void)__atomic_fetch_and(s->readiness->page + PENDING_WORD,
+                             ~(uint64_t)changes, __ATOMIC_RELEASE);
 }
 int ps_readiness_publish(ps_space *s, lc_error *e) {
   uint64_t record[WORDS];
@@ -209,6 +228,7 @@ int ps_readiness_publish(ps_space *s, lc_error *e) {
     s->own_ready_wire = s->sequence;
     s->own_ready_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+    ps_readiness_finish(s, PS_READINESS_JOURNAL);
   }
   return rc;
 }
@@ -228,13 +248,16 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   if (wire > record[READY])
     record[READY] =
         wire; /* A newly stabilized selected root proves this prefix. */
-  if (wire <= record[DURABLE] && root <= record[ROOT])
-    return LC_OK;
-  if (wire > record[DURABLE])
-    record[DURABLE] = wire;
-  if (root > record[ROOT])
-    record[ROOT] = root;
-  return select_record(s, record, selected, e);
+  if (wire > record[DURABLE] || root > record[ROOT]) {
+    if (wire > record[DURABLE])
+      record[DURABLE] = wire;
+    if (root > record[ROOT])
+      record[ROOT] = root;
+    rc = select_record(s, record, selected, e);
+  }
+  if (rc == LC_OK && root)
+    ps_readiness_finish(s, PS_READINESS_ROOT);
+  return rc;
 }
 
 /* Bitmap operations need allocation authority, like the readiness slots.

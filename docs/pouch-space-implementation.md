@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), and [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), and [certified allocator refresh](#certified-allocator-refresh) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7256,4 +7256,101 @@ frozen native build, with 261 sync calls in both native runs.
 The recovery logs, matched traces, and measurements are in
 `build/pouch-space-writer-adoption/`. Shared outbox and collection
 authority, capacity under destructive shared maintenance, and broader
+performance acceptance remain open.
+
+## Certified allocator refresh
+
+Every canonical root or journal writer marks its transition on the live
+readiness page before the first disk write. Journal publication clears its
+marker after selecting the completed ready prefix. Root publication clears
+its marker after stabilizing the selected root and retiring its sibling.
+An interrupted publication leaves its marker visible to the next holder of
+the allocation lock.
+
+A clean root marker lets an allocator use the checked live root generation.
+It reuses a resident generation and imports only frames covered by the
+ready prefix. An unsettled journal marker requires a physical end check.
+A newer root or unsettled root marker uses the existing disk adoption path.
+Explicit refresh checks the disk boundaries and retains an uncertainty marker
+when it finds an unexpected boundary. A durability-only change can
+advance visibility while reusing the already imported journal.
+
+Mixed readiness protocols are rejected while a cohort is active. After the
+cohort drains, cold admission verifies the existing file and establishes a
+new live certificate. A pending word uses the final word of the volatile
+page. Prepared-page coverage extends through the first 123.25 MiB of the
+payload region.
+
+The fixture checks zero root and journal reads on stable capture and budget
+admission, journal-only import, and delayed publication becoming visible
+after sync. Ordinary capture adopts a peer checkpoint and then reuses it.
+It also simulates interruption after announcement and before the first
+write. A separate process fixture kills a publisher
+during a partial journal write. The surviving participant rejects new
+capture, preserves an already captured value, and resumes after checked
+reopen. Root process-death cases use ordinary capture to verify recovery at
+the root selection and retirement barriers.
+
+The matched wider NoSync syscall trace includes startup, 32 deliveries
+with four writers, maintenance, and reopen verification.
+
+| Read calls | `9080dc2f` | Current |
+| --- | ---: | ---: |
+| Root headers | 7,540 | 28 |
+| Journal | 7,012 | 3,256 |
+| Total offset reads | 19,338 | 8,046 |
+
+A separate paired trace counted 44,480 and 45,755 OFD lock queries in
+the parent and current builds. Of the current queries, 43,603 addressed
+physical ranges. The trace also counted 20,646 and 20,680 OFD lock operations.
+Range ownership observation remains substantial work per delivery.
+
+All 65 allocator and SDK groups passed on Debug, GNU release, and musl
+release. Three ThreadSanitizer and three strict Memcheck profiles passed.
+The synthetic interrupted-write fixture now announces its write under
+allocation authority before changing the journal. The process-death fixture
+exercises the production announcement path.
+
+All 48 matched GNU queue runs verified delivered payloads and reopened
+state. The profiles use 16 deliveries of 1 KiB with two writers or 32
+deliveries of 4 KiB with four writers, starting native roots at 10 MiB.
+Times are median milliseconds for `9080dc2f` shared / current shared /
+native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 30.38 / 21.13 / 3.92 / 3.85 | 615.13 / 533.77 / 555.77 / 397.70 | 80.15 / 68.00 / 7.06 / 4.92 | 690.63 / 595.47 / 520.76 / 524.29 |
+| Maintenance | 28.13 / 24.58 / 21.53 / 0.18 | 20.86 / 32.13 / 6.67 / 0.42 | 36.40 / 40.90 / 17.31 / 0.24 | 40.56 / 33.54 / 8.18 / 0.51 |
+| Close | 0.34 / 0.28 / 0.22 / 37.15 | 0.32 / 0.38 / 0.21 / 53.18 | 0.69 / 0.98 / 0.46 / 66.08 | 0.75 / 0.64 / 0.45 / 70.46 |
+| Reopen | 13.57 / 12.22 / 5.32 / 0.52 | 13.88 / 18.22 / 4.00 / 0.60 | 30.66 / 36.28 / 3.49 / 0.87 | 30.79 / 29.79 / 4.03 / 0.75 |
+
+In seven separate alternating wider pairs per policy, NoSync work moved
+from 71.23 to 66.78 ms and was faster in 5 pairs. Worker CPU medians
+were 86.56 and 79.36 ms. Durable work moved from 565.11 to 624.18 ms
+and was faster in 3 pairs. The durable recheck used 112 foreground syncs
+in both builds, with median sync time rising from 548.29 to
+609.81 ms. The wider durable sample in the four-way comparison moved
+in the opposite direction. Wider shared NoSync work still took about
+14 times as long as multifile in the four-way comparison, and reopen
+took about 41 times as long.
+
+All 36 separate exclusive GNU index runs verified reopened query
+results. Times are median milliseconds for `9080dc2f` native / current
+native / multifile. The wider NoSync maximum worker index flush took
+35.20 ms for current native and 2.20 ms for multifile. Exclusive
+measurement controls exercise the same indexed workloads without
+shared allocator admission.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 58.09 / 57.50 / 32.84 | 642.09 / 639.71 / 425.62 | 78.17 / 80.99 / 31.08 | 1228.96 / 1237.86 / 1265.72 |
+| Maximum worker index flush | 25.23 / 25.55 / 1.05 | 17.24 / 18.29 / 1.07 | 29.19 / 35.20 / 2.20 | 16.45 / 22.75 / 3.68 |
+| First query pass | 0.19 / 0.21 / 0.17 | 0.21 / 0.25 / 0.19 | 0.31 / 0.34 / 0.22 | 0.32 / 0.40 / 0.26 |
+| Repeated query pass | 0.04 / 0.07 / 0.05 | 0.05 / 0.06 / 0.06 | 0.16 / 0.14 / 0.10 | 0.10 / 0.13 / 0.08 |
+| Close | 0.38 / 0.28 / 41.38 | 0.31 / 0.33 / 33.95 | 0.61 / 0.60 / 55.71 | 0.51 / 0.55 / 63.46 |
+| Reopen | 2.97 / 3.21 / 1.18 | 2.64 / 4.09 / 0.91 | 3.54 / 3.81 / 1.29 | 4.33 / 4.02 / 1.17 |
+
+The traces, tests, and comparison data are in
+`build/pouch-space-certified-prefix/`. Shared range observation, outbox
+and collection authority, destructive shared capacity, and broader
 performance acceptance remain open.

@@ -116,7 +116,7 @@ if(LOCKDC_BUILD_TESTS)
       captures capture-faults capture-owned capture-race
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail
-      shared-durable readiness-cohort
+      shared-durable readiness-cohort certified-prefix
       readiness-faults journal-replay journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants
