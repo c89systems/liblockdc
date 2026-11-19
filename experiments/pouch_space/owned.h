@@ -36,8 +36,8 @@ int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
                           lc_error *);
 void ps_owned_close(ps_owned_head *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
-/* Check a head's current selection when admitting a new read window. A
- * previously captured reader reads its own pinned mappings directly. */
+/* Check durable retirement when admitting a new read window. A previously
+ * captured reader reads its pinned mappings directly. */
 int ps_owned_status_capture(ps_owned_head *, ps_owned_status *, lc_error *);
 /* Acquire shared edit authority and refresh the selected head. The continued
  * flag covers the current checkpoint generation and previous owner; the

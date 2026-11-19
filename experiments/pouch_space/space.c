@@ -5770,12 +5770,17 @@ int ps_owned_status_capture(ps_owned_head *head, ps_owned_status *out,
   ps_space *s = head->space;
   ps_coordination_guard *guard;
   int rc;
-  if (!s->readiness)
-    return ps_owned_status_get(head, out, error);
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
     owned_status(head, out);
+    /* Local removal already fences mutations and name reuse. Read windows
+     * can still retain this handle's mappings until retirement is durable. */
+    if (out->retired &&
+        head->entry->publication_sequence >
+            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))
+      out->retired = 0;
+  }
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
