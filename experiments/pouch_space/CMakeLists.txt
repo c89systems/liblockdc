@@ -95,9 +95,18 @@ if(LOCKDC_BUILD_TESTS)
   add_executable(pouch_space_collection_test collection_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_collection_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_collection_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_collection_test PRIVATE
+    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_collection_test)
   add_test(NAME pouch_space_collection_storage COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_collection_storage PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  foreach(mode units unit-faults unit-concurrency)
+    add_test(NAME pouch_space_collection_${mode}
+      COMMAND pouch_space_collection_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_collection_${mode} PROPERTIES TIMEOUT 600
+      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
   # Same owner sources against the existing logical-engine test library, so
   # logical expiry clocks never alter filesystem writer-heartbeat clocks.
   add_library(pouch_space_test_experiment STATIC ${pouch_space_sources})

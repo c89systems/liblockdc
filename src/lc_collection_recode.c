@@ -1,5 +1,6 @@
 #include "lc_collection_recode.h"
 #include "lc_collection_chunks.h"
+#include "lc_collection_unit_recode.h"
 #include "lc_pouch_path.h"
 #include "lc_pouch_record.h"
 
@@ -12,8 +13,6 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#define CR_CHUNK 65536U
-
 typedef struct cr_visit {
   lc_pouch_recode *work;
   const char *scope;
@@ -22,15 +21,9 @@ typedef struct cr_visit {
 typedef struct cr_output {
   lc_pouch_recode *work;
   lc_pouch_recode_file *file;
-  lc_pouch_crypto_reader *reader;
-  lc_pouch_crypto_writer *writer;
-  lc_collection_unit unit;
-  lc_source input;
-  lc_sink sink;
+  lc_collection_unit_recode *codec;
   unsigned char *buffer;
-  lc_u64 first, current, parts, bytes, input_start, input_offset,
-      input_remaining;
-  unsigned long input_crc;
+  lc_u64 first, current, parts, bytes;
   unsigned int mode;
   int source_fd, fd, hold;
   char leaf[64];
@@ -68,20 +61,6 @@ static int cr_read(int fd, void *bytes, size_t count, lc_u64 offset,
                    : cr_corrupt(e, "collection conversion source is truncated");
     p += (size_t)n;
     offset += (size_t)n;
-    count -= (size_t)n;
-  }
-  return LC_OK;
-}
-static int cr_write(int fd, const void *bytes, size_t count, lc_error *e) {
-  const unsigned char *p = bytes;
-  ssize_t n;
-  while (count) {
-    n = write(fd, p, count);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      return cr_error(e, "failed to write converted collection part");
-    p += (size_t)n;
     count -= (size_t)n;
   }
   return LC_OK;
@@ -445,120 +424,29 @@ static int cr_place(cr_output *out, lc_u64 *offset, lc_error *e) {
   *offset = (lc_u64)end;
   return rc;
 }
-static size_t cr_input(lc_source *source, void *bytes, size_t capacity,
-                       lc_error *e) {
-  cr_output *out = source->impl;
-  size_t take =
-      out->input_remaining < capacity ? (size_t)out->input_remaining : capacity;
-  if (take &&
-      cr_read(out->source_fd, bytes, take, out->input_offset, e) != LC_OK)
-    return 0;
-  out->input_crc =
-      (unsigned long)crc32((uLong)out->input_crc, bytes, (uInt)take);
-  out->input_offset += take;
-  out->input_remaining -= take;
-  return take;
-}
-static int cr_input_reset(lc_source *source, lc_error *e) {
-  cr_output *out = source->impl;
-  (void)e;
-  out->input_offset = out->input_start;
-  out->input_remaining = out->unit.stored;
-  out->input_crc = (unsigned long)crc32(0L, Z_NULL, 0);
-  return LC_OK;
-}
-static int cr_encoded(lc_sink *sink, const void *bytes, size_t count,
-                      lc_error *e) {
-  cr_output *out = sink->impl;
-  return cr_write(out->fd, bytes, count, e) == LC_OK;
-}
 static int cr_unit(cr_output *out, const lc_pouch_recode_reference *ref,
                    lc_pouch_recode_offset *map, lc_error *e) {
-  lc_source *source = NULL;
-  lc_sink *sink;
-  lc_pouch_record_header header;
-  unsigned char prefix[LC_COLLECTION_UNIT_HEADER];
-  const char *descriptor = NULL;
-  lc_u64 plain, stored, decoded = 0;
-  unsigned long crc;
-  size_t got;
-  int rc = lc_collection_unit_read(lc_collection_unit_file_io(out->source_fd),
-                                   ref->offset, ref->bytes, &out->unit, e);
-  if (rc != LC_OK)
-    return rc;
-  out->input_start = out->input_offset =
-      ref->offset + LC_COLLECTION_UNIT_HEADER;
-  out->input_remaining = out->unit.stored;
-  out->input_crc = (unsigned long)crc32(0L, Z_NULL, 0);
-  out->input.read = cr_input;
-  out->input.reset = cr_input_reset;
-  out->input.impl = out;
-  out->sink.write = cr_encoded;
-  out->sink.impl = out;
-  if (!out->reader)
-    rc = lc_pouch_crypto_reader_open(out->work->pouch->crypto, &out->reader, e);
+  lc_collection_unit unit;
+  lc_u64 offset;
+  int rc = LC_OK;
+  if (!out->codec)
+    rc = lc_collection_unit_recode_open(
+        &out->work->pouch->allocator, out->work->pouch->crypto, &out->codec, e);
   if (rc == LC_OK)
-    rc = lc_pouch_crypto_reader_bind_source(
-        out->reader, out->unit.context, out->unit.context, &out->input,
-        out->unit.stored, out->unit.descriptor, &source, e);
+    rc = lc_collection_unit_recode_run(
+        out->codec, lc_collection_unit_file_io(out->source_fd), ref->offset,
+        ref->bytes, lc_collection_unit_file_io(out->fd), &offset, &unit, e);
+  if (rc == LC_OK && offset != map->after)
+    rc = cr_corrupt(e, "converted collection unit moved outside its placement");
   if (rc == LC_OK) {
-    if (!out->writer)
-      rc = lc_pouch_crypto_writer_open_sink(out->work->pouch->crypto,
-                                            out->unit.context, &out->sink,
-                                            &out->writer, e);
-    else
-      rc = lc_pouch_crypto_writer_restart(out->writer, out->unit.context, e);
-  }
-  memset(&header, 0, sizeof(header));
-  memset(prefix, 0, sizeof(prefix));
-  header.type = LC_POUCH_COLLECTION_CHUNK;
-  header.meta_len = LC_COLLECTION_UNIT_META;
-  header.flags = LC_POUCH_RECORD_FLAG_PENDING;
-  lc_pouch_record_header_encode(&header, prefix);
-  if (rc == LC_OK)
-    rc = cr_write(out->fd, prefix, sizeof(prefix), e);
-  sink = lc_pouch_crypto_writer_sink(out->writer);
-  while (rc == LC_OK) {
-    got = source->read(source, out->buffer, CR_CHUNK, e);
-    if (e && e->code != LC_OK) {
-      rc = e->code;
-      break;
-    }
-    if (!got)
-      break;
-    if (got > CR_CHUNK || got > out->unit.plain - decoded) {
-      rc = cr_corrupt(e,
-                      "converted collection unit exceeds its published length");
-      break;
-    }
-    decoded += got;
-    if (!sink->write(sink, out->buffer, got, e))
-      rc = e && e->code != LC_OK ? e->code : LC_ERR_TRANSPORT;
-  }
-  if (rc == LC_OK && (decoded != out->unit.plain || out->input_remaining ||
-                      out->input_crc != out->unit.crc))
-    rc = cr_corrupt(e, "collection conversion unit integrity check failed");
-  if (rc == LC_OK)
-    rc = lc_pouch_crypto_writer_finish_borrowed(out->writer, &plain, &stored,
-                                                &crc, &descriptor, e);
-  if (rc == LC_OK && plain != out->unit.plain)
-    rc = cr_corrupt(e, "converted collection unit length changed");
-  if (rc == LC_OK) {
-    out->unit.stored = stored;
-    out->unit.crc = crc;
-    out->unit.descriptor[0] = 0;
-    if (descriptor)
-      strcpy(out->unit.descriptor, descriptor);
-    rc = lc_collection_unit_write_meta(lc_collection_unit_file_io(out->fd),
-                                       map->after, &out->unit, e);
-    map->stored = stored;
+    map->stored = unit.stored;
     map->units = 1;
     map->first_segment = map->segment;
     map->first_offset = map->after;
   }
-  lc_pouch_crypto_reader_clear(out->reader);
   return rc;
 }
+
 static int cr_node(cr_output *out, const lc_pouch_recode_reference *ref,
                    lc_pouch_recode_offset *map, lc_error *e) {
   lc_collection_chunk_ref result;
@@ -568,7 +456,18 @@ static int cr_node(cr_output *out, const lc_pouch_recode_reference *ref,
   lc_pouch_recode_file *owner;
   size_t at;
   char leaf[64];
-  int rc = cr_read(out->source_fd, prefix, sizeof(prefix), ref->offset, e);
+  int rc;
+  if (!ref->bytes || ref->bytes > LC_COLLECTION_CHUNK_PAGE ||
+      ref->bytes % LC_COLLECTION_CHUNK_TUPLE)
+    return cr_corrupt(e,
+                      "collection conversion index exceeds its bounded page");
+  if (!out->buffer)
+    out->buffer = lc_alloc_with_allocator(&out->work->pouch->allocator,
+                                          LC_COLLECTION_CHUNK_PAGE);
+  if (!out->buffer)
+    return lc_collection_failure(e, LC_ERR_NOMEM, NULL,
+                                 "cannot allocate collection index scratch");
+  rc = cr_read(out->source_fd, prefix, sizeof(prefix), ref->offset, e);
   if (rc == LC_OK)
     rc = lc_pouch_record_header_decode(prefix, &header, e);
   if (rc == LC_OK)
@@ -898,9 +797,6 @@ int lc_collection_recode_segment(lc_pouch_recode *work, size_t index,
     out.work = work;
     out.file = file;
     out.current = out.first = first;
-    out.buffer = lc_alloc_with_allocator(&work->pouch->allocator, CR_CHUNK);
-    if (rc == LC_OK && !out.buffer)
-      rc = LC_ERR_NOMEM;
     if (rc == LC_OK)
       rc = cr_convert(&out, e);
     if (rc == LC_OK) {
@@ -931,8 +827,7 @@ done:
     (void)close(out.fd);
   if (out.source_fd >= 0)
     (void)close(out.source_fd);
-  lc_pouch_crypto_reader_close(out.reader);
-  lc_pouch_crypto_writer_close(out.writer);
+  lc_collection_unit_recode_close(out.codec);
   lc_free_with_allocator(&work->pouch->allocator, out.buffer);
   lc_free_with_allocator(&work->pouch->allocator, map_path);
   return rc;

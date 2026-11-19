@@ -569,22 +569,47 @@ static void projections(void) {
   lc_collection_order_close(&order);
   lc_error_cleanup(&e);
 }
+#include "collection_codec_cases.h"
+typedef struct unit_run {
+  const char *directory, *key;
+  int faults;
+} unit_run;
+static void *unit_worker(void *context) {
+  unit_run *run = context;
+  if (run->faults == 2)
+    unit_concurrency(run->directory, run->key);
+  else
+    unit_cases(run->directory, run->key, run->faults);
+  return NULL;
+}
 int main(int argc, char **argv) {
   char path[1024], directory[1024];
   char *key = NULL;
   lc_error e;
-  REQUIRE(argc == 2);
+  REQUIRE(argc == 2 || argc == 3);
   REQUIRE(snprintf(path, sizeof(path), "%s/pouch-collections-XXXXXX", argv[1]) >
           0);
   REQUIRE(lc_test_tmp_mkdtemp(path, directory, sizeof(directory), argv[1]));
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
-  projections();
-  for (int durable = 0; durable < 2; ++durable)
-    indexed(directory, durable);
-  for (int codec = 0; codec < 4; ++codec)
+  if (argc == 3) {
+    REQUIRE(!strcmp(argv[2], "units") || !strcmp(argv[2], "unit-faults") ||
+            !strcmp(argv[2], "unit-concurrency"));
+    unit_run run = {directory, key,
+                    !strcmp(argv[2], "unit-concurrency")
+                        ? 2
+                        : !strcmp(argv[2], "unit-faults")};
+    pthread_t worker;
+    REQUIRE(!pthread_create(&worker, NULL, unit_worker, &run));
+    REQUIRE(!pthread_join(worker, NULL));
+  } else {
+    projections();
     for (int durable = 0; durable < 2; ++durable)
-      canonical(directory, key, codec, durable);
+      indexed(directory, durable);
+    for (int codec = 0; codec < 4; ++codec)
+      for (int durable = 0; durable < 2; ++durable)
+        canonical(directory, key, codec, durable);
+  }
   lc_pouch_crypto_key_string_free(key);
   lc_error_cleanup(&e);
   lc_test_tmp_cleanup_path(directory, argv[1]);

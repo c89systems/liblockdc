@@ -4679,6 +4679,80 @@ Evidence is in ignored `build/pouch-space-namespace-conversion/`: `pressure.log`
 `qualified-memcheck.log` and `memcheck-*`, together with exact build, instrumented
 relink and memory-check commands.
 
+### Shared streaming conversion for collection codec units
+
+Collection codec units now convert through borrowed `lc_pouch_record_io`
+capabilities using `lc_collection_unit_recode_open/run/close`. The same owner
+serves native collection ranges and the existing multifile converter. The old
+file-specific unit codec loop has been removed. Multifile index relocation now
+allocates its bounded 1,536-byte node page lazily, separately from codec scratch.
+This keeps storage ownership and publication outside the codec.
+
+The owner reuses a 64 KiB plaintext buffer and codec scratch across completed
+units. Input descriptors select decoding; the borrowed crypto provider selects
+the target representation using the same encryption identity. Decoded bytes
+flow directly into the encoder. The helper verifies the complete encoded CRC,
+codec authentication and published plaintext length before installing final
+unit metadata and clearing PENDING. Context, ordinal and logical etag survive
+conversion. The size planner bounds the complete private output, including its
+fixed canonical prefix, without allocation or source I/O.
+
+Run preserves caller outputs on failure and discards only its private output
+suffix. A failed encoder is released so the owner can be reused after allocation,
+input or output failure. Read and output capabilities are borrowed only for the
+call. Funding, append exclusion, durability, index/manifest rebuilding and
+canonical reference publication remain the caller's authority. Successful unit
+encoding alone publishes no collection outcome, changes no root policy and
+performs no implicit container growth.
+
+Native fixtures cover all four codec combinations and both durability policies
+inside a fixed 10 MiB container. They convert 1-byte, 65,537-byte and generated
+2 MiB units, plus compressible units at the 8 MiB maximum in both directions.
+The maximum-size source/replacement pair fits because one representation is
+compressed. The largest measured project allocation request is 131,400 bytes.
+The 2 MiB fixtures observe output advancing before source EOF. Each result
+preserves unit identity and decoded bytes, supports reader reset, and survives
+reopening after the caller seals its output. NoSync retains its existing
+requirement for explicit canonical recovery/publication authority.
+
+The native failure suite verifies 242 points: an exhaustive small-unit
+allocation/I/O/partial-write matrix and selected midpoint/final-fixup failures
+after substantial 2 MiB output has streamed. Failed candidates leave the source,
+previously published output prefix, caller result and private append boundary
+intact. The same conversion owner subsequently succeeds. Corrupt framing,
+encoded data and validly checksummed false plaintext lengths are rejected.
+Invalid size plans and obvious source/output owner aliasing reject without
+changing the caller's result.
+
+Across all eight codec/durability combinations, a paused-read test observes the
+candidate's PENDING header and unchanged committed output tail. A peer collection
+writer seals its data and the old source remains readable before conversion
+resumes. Completing encoding still leaves reference publication to its caller.
+
+Fourteen selected Debug checks and focused native reruns pass, including
+existing streamed collection conversion, collection metadata/compaction/retry
+bindings, partial-output retry, unit output-sync/power-loss recovery,
+source-manifest and stack-allocation checks. GNU and musl release each pass seven
+applicable checks. Two TSan scenarios
+pass with instrumented OpenSSL and no suppressions. Three strict Memcheck suites,
+including the full native failure matrix, pass with zero remaining allocations,
+zero errors and only three inherited file descriptors. Product sources compile
+under strict C89 and formatting checks pass.
+
+Native collection publication still needs to rebuild chunk indexes, manifests,
+canonical metadata and receipt links under its topology owner, with bounded
+workspace and reclamation. Durable root conversion intent, derived-index
+invalidation, resumable policy publication, shared-root qualification and full
+conversion performance remain open. Explicit root compression changes remain
+unsupported. Multifile remains the default/reference; production deployment
+requires a separate decision. No format marker or public ABI changes here.
+
+Evidence is in ignored `build/pouch-space-collection-codec/`: `qualified-debug.log`,
+`qualified-initialization*`, `qualified-*-release*`, `qualified-native.log`,
+`qualified-tsan.log`, `tsan-*`, `qualified-memcheck.log` and `memcheck-*`, with exact
+native build, instrumented relink and memory-check commands. The interrupted
+Debug invocation is retained separately from its successful resumed checks.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and
