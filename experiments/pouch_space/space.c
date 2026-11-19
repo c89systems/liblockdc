@@ -1312,7 +1312,8 @@ static size_t event_bytes(const ps_entry *p, int event) {
 }
 static int live_hint(uint32_t event) {
   return event == PS_STREAM_TAIL || event == PS_STREAM_OWNER ||
-         event == PS_NAMESPACE_OWNER;
+         event == PS_NAMESPACE_OWNER || event == PS_STREAM_EDIT ||
+         event == PS_STREAM_COMPLETE;
 }
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
@@ -3160,8 +3161,8 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
   }
   return LC_OK;
 }
-/* Neither a ready tail nor its writer stamp grants cold recovery authority.
- * Canonical recovery still validates any suffix beyond its checkpoint. */
+/* Stream completion is live-only. A replacement checkpoint supplies the
+ * accepted boundary, with no claim about edits beyond it. */
 static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                            int select, lc_error *error) {
   ps_key key;
@@ -3180,18 +3181,24 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                  head->catalog->kind != PS_CATALOG_NAMESPACE
            : key.kind != PS_STREAM || head->stream_sealed))
     return err(error, LC_ERR_PROTOCOL, "live owner hint does not match head");
-  if (event != PS_STREAM_TAIL) {
+  if (event != PS_STREAM_TAIL && event != PS_STREAM_COMPLETE) {
     if (!value || value > s->token_limit || value % TOKEN_RANGE)
       return err(error, LC_ERR_PROTOCOL, "invalid owned stream writer stamp");
     if (select) {
       head->writer_stamp = value;
       head->writer_generation = s->generation;
+      if (event == PS_STREAM_EDIT) {
+        head->stream_edit_wire = get64(wire + 8);
+        head->stream_complete_generation = 0;
+      }
     }
   } else if (value < head->bytes || value > head->stream_capacity)
     return err(error, LC_ERR_PROTOCOL, "owned tail outside granted range");
   else if (select) {
     head->bytes = value;
     head->stream_wire = get64(wire + 8);
+    head->stream_complete_generation =
+        event == PS_STREAM_COMPLETE ? s->generation : 0;
     if (!head->dirty_link)
       dirty_entry(s, head, NULL);
   }
@@ -3867,6 +3874,8 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->stream_storage = q->stream_storage;
         dest->stream_sealed = q->stream_sealed;
         dest->stream_wire = q->stream_wire;
+        dest->stream_edit_wire = q->stream_edit_wire;
+        dest->stream_complete_generation = q->stream_complete_generation;
         dest->bytes = q->bytes;
       }
     }
@@ -5630,8 +5639,12 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->capacity = head->entry->stream_capacity;
   out->runs = head->entry->stream_runs;
   out->stored_bytes = head->entry->stream_storage;
+  out->edit_wire = head->entry->stream_edit_wire;
   out->sealed = head->entry->stream_sealed;
   out->retired = head->entry->deleted;
+  out->complete =
+      head->entry->stream_complete_generation &&
+      head->entry->stream_complete_generation == head->space->generation;
 }
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                       const ps_ref *ref, int guarded, ps_owned_head **out,
@@ -5784,7 +5797,7 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
   int rc;
   *continued =
       p->writer_generation == s->generation && p->writer_stamp == s->token_end;
-  if (*continued)
+  if (*continued && event != PS_STREAM_EDIT)
     return LC_OK;
   memset(&stamp, 0, sizeof(stamp));
   stamp.key = p->key;
@@ -5794,6 +5807,10 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
   if (rc == LC_OK) {
     p->writer_stamp = s->token_end;
     p->writer_generation = s->generation;
+    if (event == PS_STREAM_EDIT) {
+      p->stream_edit_wire = s->sequence;
+      p->stream_complete_generation = 0;
+    }
   }
   return rc;
 }
@@ -5818,9 +5835,9 @@ int ps_internal_namespace_stamp(ps_space *s, uint64_t identity, int *continued,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-int ps_owned_edit_begin(ps_owned_head *head, ps_coordination_guard **edit,
-                        ps_owned_status *status, int *continued,
-                        lc_error *error) {
+int ps_owned_edit_begin(ps_owned_head *head, int append,
+                        ps_coordination_guard **edit, ps_owned_status *status,
+                        int *continued, lc_error *error) {
   ps_space *s = head->space;
   ps_entry *p = head->entry;
   ps_coordination_guard *allocator = NULL;
@@ -5836,12 +5853,12 @@ int ps_owned_edit_begin(ps_owned_head *head, ps_coordination_guard **edit,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &allocator, error);
   if (rc == LC_OK) {
+    owned_status(head, status);
     if (!p->deleted && !p->stream_sealed)
-      rc = claim_writer_stamp(s, p, PS_STREAM_OWNER, continued, error);
+      rc = claim_writer_stamp(s, p, append ? PS_STREAM_EDIT : PS_STREAM_OWNER,
+                              continued, error);
     else
       *continued = 0;
-    if (rc == LC_OK)
-      owned_status(head, status);
   }
   rc = allocation_end(s, allocator, rc, error);
   pthread_mutex_unlock(&s->mutex);
@@ -6683,15 +6700,17 @@ static int owned_ready_sequence(ps_space *s, uint64_t *sequence,
 /* Payload writes and any logical selection have already finished. Only the
  * ready boundary joins the shared journal, under allocation authority. */
 static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
-                              uint64_t *sequence, lc_error *error) {
+                              int complete, uint64_t *sequence,
+                              lc_error *error) {
   int rc = LC_OK;
-  if (s->readiness && tail > head->bytes) {
+  if (s->readiness && (tail > head->bytes || complete)) {
     ps_entry hint;
     memset(&hint, 0, sizeof(hint));
     hint.key = head->key;
     hint.token = head->token;
     hint.bytes = tail;
-    rc = append_event_locked(s, &hint, PS_STREAM_TAIL, error);
+    rc = append_event_locked(
+        s, &hint, complete ? PS_STREAM_COMPLETE : PS_STREAM_TAIL, error);
     if (rc == LC_OK) {
       *sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
       head->stream_wire = s->sequence;
@@ -6700,15 +6719,17 @@ static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
     rc = owned_ready_sequence(s, sequence, error);
   if (rc == LC_OK) {
     head->bytes = tail;
+    head->stream_complete_generation =
+        complete && s->readiness ? s->generation : 0;
     if (!head->dirty_link)
       dirty_entry(s, head, NULL);
     head->stream_ready = *sequence;
   }
   return rc;
 }
-int ps_owned_commit(ps_owned_head *head, uint64_t tail,
-                    enum ps_commit_mode mode, ps_commit_publish_fn publish,
-                    void *context, lc_error *error) {
+static int owned_commit(ps_owned_head *head, uint64_t tail, int complete,
+                        enum ps_commit_mode mode, ps_commit_publish_fn publish,
+                        void *context, lc_error *error) {
   ps_space *s;
   ps_coordination_guard *guard;
   uint64_t sequence = 0, previous;
@@ -6725,7 +6746,8 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail,
     rc = err(error, LC_ERR_INVALID, "owned commit tail outside append range");
   if (rc == LC_OK)
     rc = publish ? owned_ready_sequence(s, &sequence, error)
-                 : owned_publish_tail(s, head->entry, tail, &sequence, error);
+                 : owned_publish_tail(s, head->entry, tail, complete, &sequence,
+                                      error);
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && publish) {
@@ -6742,7 +6764,8 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail,
         rc = err(error, LC_ERR_PROTOCOL,
                  "owned tail changed during logical publication");
       if (rc == LC_OK)
-        rc = owned_publish_tail(s, head->entry, tail, &sequence, error);
+        rc = owned_publish_tail(s, head->entry, tail, complete, &sequence,
+                                error);
       rc = allocation_end(s, guard, rc, error);
       /* The logical selection already succeeded. Abort cleanup must never
        * clear its bytes, even if publishing the live hint failed. */
@@ -6759,6 +6782,17 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail,
   } else if (rc == LC_OK && s->durable && mode == PS_COMMIT_DEFAULT)
     rc = wait_durable(s, sequence, error);
   return rc;
+}
+int ps_owned_commit(ps_owned_head *head, uint64_t tail,
+                    enum ps_commit_mode mode, ps_commit_publish_fn publish,
+                    void *context, lc_error *error) {
+  return owned_commit(head, tail, 0, mode, publish, context, error);
+}
+int ps_owned_commit_canonical(ps_owned_head *head, uint64_t tail,
+                              enum ps_commit_mode mode,
+                              ps_commit_publish_fn publish, void *context,
+                              lc_error *error) {
+  return owned_commit(head, tail, 1, mode, publish, context, error);
 }
 int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
   return head ? sync_file(head->space, error)
@@ -6790,7 +6824,7 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
                         head->entry->bytes != previous))
       rc = err(error, LC_ERR_PENDING, "owned stream changed during recovery");
     if (rc == LC_OK)
-      rc = owned_publish_tail(s, head->entry, tail, &sequence, error);
+      rc = owned_publish_tail(s, head->entry, tail, 0, &sequence, error);
     rc = allocation_end(s, guard, rc, error);
     pthread_mutex_unlock(&s->mutex);
   }

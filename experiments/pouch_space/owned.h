@@ -21,7 +21,8 @@ typedef struct ps_owned_status {
   ps_ref ref;
   uint64_t tail, capacity, runs;
   uint64_t stored_bytes; /* selected payload ownership, excluding old pins */
-  int sealed, retired;
+  uint64_t edit_wire;
+  int sealed, retired, complete;
 } ps_owned_status;
 
 /* The optional budget funds creation only; an open cached owner retains no
@@ -41,8 +42,10 @@ int ps_owned_status_capture(ps_owned_head *, ps_owned_status *, lc_error *);
 /* Acquire shared edit authority and refresh the selected head. The continued
  * flag covers the current checkpoint generation and previous owner; the
  * caller must also have a previously validated local view. Exclusive mode
- * returns a NULL guard. The guard spans recovery, producer I/O and cleanup. */
-int ps_owned_edit_begin(ps_owned_head *, ps_coordination_guard **,
+ * returns a NULL guard. The guard spans recovery, producer I/O and cleanup.
+ * Append admission reports the prior state and revokes its completion before
+ * returning write authority. */
+int ps_owned_edit_begin(ps_owned_head *, int append, ps_coordination_guard **,
                         ps_owned_status *, int *continued, lc_error *);
 int ps_owned_edit_end(ps_owned_head *, ps_coordination_guard *, int,
                       lc_error *);
@@ -137,6 +140,11 @@ int ps_owned_clear(ps_owned_run *, uint64_t offset, uint64_t bytes,
  * establish durable dependency coverage before the shared hint is exposed. */
 int ps_owned_commit(ps_owned_head *, uint64_t tail, enum ps_commit_mode,
                     ps_commit_publish_fn, void *, lc_error *);
+/* A canonical appender holding its edit guard has finalized the piece
+ * footers and has no rejected suffix. Publish both facts with the tail. */
+int ps_owned_commit_canonical(ps_owned_head *, uint64_t tail,
+                              enum ps_commit_mode, ps_commit_publish_fn, void *,
+                              lc_error *);
 int ps_owned_barrier(ps_owned_head *, lc_error *);
 /* Canonical recovery has validated [checkpoint tail, tail) and cleared the
  * rejected suffix. Stabilize it before accepting the recovered tail hint.

@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), and [SDK namespace authority](#shared-sdk-namespace-authority) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), and [shared stream completion](#shared-stream-completion) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6818,3 +6818,57 @@ The test logs, sync trace, and matched-run data are in
 shared capacity under destructive maintenance, queue handoff performance,
 and readiness acceptance remain open. Normal shared admission remains
 gated.
+
+## Shared stream completion
+
+Append admission revokes the prior completion in the live journal under the
+stream edit guard, before it can write payload or footers. The next completion
+publishes the tail after writing both and completing any logical selection.
+A peer takes the same guard, captures the selected mappings and checks their
+completion footers. An intact completion lets the peer append at that boundary
+without a recovery scan, suffix clearing, or a repair sync. Recovery and
+collection tails continue to use ordinary tail publication.
+
+The completion proof belongs to one checkpoint generation and the live
+readiness cohort. A cold owner, a replacement checkpoint, or an edit without
+completion falls back to canonical recovery. An invalid partial footer also
+falls back to canonical validation before repair. A failed or interrupted
+append can leave recoverable records or a rejected suffix. The canonical owner
+decides the accepted boundary, and the next appender clears and synchronizes
+the rejected suffix before writing. Append durability and logical publication
+use their existing readiness and synchronization rules.
+
+The 88-group affected matrix passed on Debug, GNU release, and musl release.
+Twenty focused groups passed on each configuration after adding the partial
+footer fallback. The cases check zero syncs at clean append admission, old
+reader windows, a rejected logical publication, partial footer repair, cold
+recovery, and killed writers with complete or incomplete candidate records,
+including a checkpoint while a writer is active. Five ThreadSanitizer profiles
+and two strict Memcheck profiles passed.
+
+All 48 matched GNU queue runs verified deliveries and reopened state, using
+the same warm profiles as the preceding stage. The columns show median
+milliseconds for `3f6c2e1a` shared / current shared / current exclusive /
+multifile. Foreground syncs are reported for the shared implementations.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 241.58 / 38.19 / 3.78 / 4.36 | 702.60 / 566.01 / 439.01 / 337.61 | 405.47 / 111.23 / 7.70 / 5.04 | 872.62 / 613.17 / 643.99 / 499.11 |
+| Foreground syncs, previous / current shared | 36 / 4 | 146 / 115 | 59 / 10 | 162 / 123 |
+| Maintenance | 21.46 / 25.44 / 9.29 / 0.22 | 18.95 / 20.28 / 7.13 / 0.26 | 32.86 / 27.59 / 11.56 / 0.28 | 27.25 / 24.73 / 9.61 / 0.51 |
+| Close | 0.31 / 0.40 / 0.18 / 34.49 | 0.33 / 0.28 / 0.20 / 45.45 | 0.91 / 0.82 / 0.40 / 63.24 | 0.84 / 0.71 / 0.43 / 61.26 |
+| Reopen | 12.55 / 14.41 / 3.26 / 0.57 | 13.13 / 12.62 / 3.23 / 0.63 | 27.78 / 27.12 / 3.21 / 0.96 | 31.01 / 28.04 / 4.03 / 0.87 |
+
+The four-delivery shared NoSync trace went from ten handoff recovery syncs
+to zero. Its two remaining foreground syncs were new stream grants during
+delivery. Maintenance drove nine checkpoint syncs, and reopening drove six
+syncs from opening shared participants. The wider profile also spent 93.38 ms
+of worker CPU in shared NoSync work, versus 14.90 ms native exclusive. Grant
+publication and repeated work during shared admission and projection refresh
+are the next costs to isolate. Shared NoSync foreground remains about 9 to 22
+times multifile across the two profiles. These are queue measurements. Index
+readiness retains the separate matched evidence from the preceding stage.
+
+The verification, trace and run data are in
+`build/pouch-space-clean-handoff/`. Shared outbox and collection authority,
+capacity under destructive maintenance, and performance acceptance remain open.

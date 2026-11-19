@@ -28,7 +28,9 @@ enum ps_event {
   PS_SEAL,
   PS_STREAM_TAIL,
   PS_STREAM_OWNER,
-  PS_NAMESPACE_OWNER
+  PS_NAMESPACE_OWNER,
+  PS_STREAM_EDIT,
+  PS_STREAM_COMPLETE
 };
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
@@ -49,6 +51,7 @@ typedef struct ps_entry {
   uint64_t
       peer_sequence; /* imported visibility uses the certified wire clock */
   uint64_t stream_capacity, stream_runs, stream_ready, stream_wire;
+  uint64_t stream_edit_wire, stream_complete_generation;
   uint64_t writer_stamp, writer_generation;
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */

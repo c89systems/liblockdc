@@ -3133,12 +3133,13 @@ static int recover_stream(ps_stream *stream, uint64_t checkpoint,
   if (state->reject)
     return LC_ERR_NOMEM;
   *accepted = checkpoint;
-  /* The test format recognizes R as a complete record in the candidate
-   * suffix. Its following bytes are a deliberately incomplete record. */
-  if (checkpoint < capacity) {
-    rc = ps_stream_recovery_read(stream, checkpoint, &marker, 1, e);
-    if (rc == LC_OK && marker == 'R')
-      ++*accepted;
+  /* These bytes stand for complete test records. The killed appender follows
+   * its candidate record with bytes the reader must reject. */
+  while (*accepted < capacity) {
+    rc = ps_stream_recovery_read(stream, *accepted, &marker, 1, e);
+    if (rc != LC_OK || (marker != 'a' && marker != 'b' && marker != 'R'))
+      break;
+    ++*accepted;
   }
   return rc;
 }
@@ -3167,6 +3168,7 @@ static void stream_handoff(int durable) {
   ps_stream_window *old = NULL, *view = NULL;
   stream_recovery rx = {0}, ry = {0};
   ps_stream_info info;
+  ps_stats before, after;
   const ps_key unrelated = {88, 111, PS_STREAM};
   pthread_t producer;
   char byte;
@@ -3183,7 +3185,7 @@ static void stream_handoff(int durable) {
   ok(ps_stream_open(b, NULL, unrelated, 1, NULL, NULL, NULL, &other, &e), &e);
   ok(ps_stream_window_open(y, 0, 1, &old, &e), &e);
   ok(ps_stream_begin(x, &writer, &e), &e);
-  REQUIRE(ps_stream_writer_start(writer) == 1 && rx.calls == 1);
+  REQUIRE(ps_stream_writer_start(writer) == 1 && !rx.calls && !ry.calls);
   ok(ps_stream_status(x, &info, &e), &e);
   ps_key grant = {info.ref.incarnation, info.capacity, PS_OWNED_RUN};
   ok(ps_stream_reserve(writer, NULL, PS_CHUNK, &e), &e);
@@ -3218,16 +3220,25 @@ static void stream_handoff(int durable) {
   REQUIRE(pthread_create(&producer, NULL, finish_stream_append, writer) == 0);
   REQUIRE(pthread_join(producer, NULL) == 0);
   ry.reject = 1;
-  REQUIRE(ps_stream_begin(y, &blocked, &e) == LC_ERR_NOMEM && !blocked);
-  ok(ps_stream_status(y, &info, &e), &e);
-  REQUIRE(info.tail == 1);
+  ok(ps_status(b, &before, &e), &e);
+  ok(ps_stream_begin(y, &writer, &e), &e);
+  REQUIRE(ps_stream_writer_start(writer) == 2);
+  ok(ps_status(b, &after, &e), &e);
+  REQUIRE(after.syncs == before.syncs && !ry.calls);
+  ok(ps_stream_write(writer, "c", 1, &e), &e);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_stream_writer_close(writer);
   ry.reject = 0;
-  append_byte(y, 2, "c", &e);
   ok(ps_stream_status(y, &info, &e), &e);
-  REQUIRE(ry.calls == 3 && info.tail == 3 && info.runs > 1);
+  REQUIRE(!ry.calls && info.tail == 3 && info.runs > 1);
   append_byte(y, 3, "d", &e);
-  REQUIRE(ry.calls == 3); /* A continued owner keeps its validated view. */
+  REQUIRE(!ry.calls);
   ok(ps_checkpoint(b, &e), &e);
+  rx.reject = 1;
+  REQUIRE(ps_stream_begin(x, &blocked, &e) == LC_ERR_NOMEM && !blocked);
+  ok(ps_stream_status(x, &info, &e), &e);
+  REQUIRE(info.tail == 2);
+  rx.reject = 0;
   append_byte(x, 4, "e", &e);
   REQUIRE(rx.calls == 2);
   ok(ps_stream_seal(x, &e), &e);
@@ -3266,7 +3277,73 @@ static void stream_handoff(int durable) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
-static void stream_handoff_child(int ready, int complete) {
+static int reject_stream_publish(void *context, uint64_t tail, lc_error *e) {
+  ps_stream *peer = context;
+  ps_stream_writer *blocked = NULL;
+  REQUIRE(tail == 2);
+  REQUIRE(ps_stream_begin(peer, &blocked, e) == LC_ERR_PENDING && !blocked);
+  return LC_ERR_PENDING;
+}
+static void stream_abort_and_cold_open(void) {
+  lc_error e = {0};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_stream *x = NULL, *y = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_stream_window *view = NULL;
+  stream_recovery rx = {0}, ry = {0};
+  ps_stream_info info;
+  char body[3];
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 1, NULL, recover_stream, &rx, &x,
+                    &e),
+     &e);
+  append_byte(x, 0, "a", &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  ok(ps_stream_open(b, NULL, tail_stream(), 0, NULL, recover_stream, &ry, &y,
+                    &e),
+     &e);
+  REQUIRE(!ry.calls);
+  ok(ps_stream_begin(x, &writer, &e), &e);
+  ok(ps_stream_write(writer, "R", 1, &e), &e);
+  REQUIRE(ps_stream_commit(writer, PS_COMMIT_DEFAULT, reject_stream_publish, y,
+                           &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  ps_stream_writer_close(writer);
+  append_byte(y, 1, "b", &e);
+  REQUIRE(ry.calls == 1);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_stream_status(y, &info, &e), &e);
+  const ps_key first_key = {info.ref.incarnation, 0, PS_OWNED_RUN};
+  ps_entry *first_run = ps_internal_lookup(b, first_key);
+  REQUIRE(first_run && first_run->count == 1);
+  unsigned char invalid_footer = 0;
+  off_t footer = (off_t)first_run->extents[0].offset + PS_RUN_IDENTITY_BYTES;
+  REQUIRE(pwrite(b->fd, &invalid_footer, 1, footer) == 1);
+  ok(ps_stream_open(a, NULL, tail_stream(), 0, NULL, recover_stream, &rx, &x,
+                    &e),
+     &e);
+  ok(ps_stream_status(x, &info, &e), &e);
+  REQUIRE(rx.calls == 1 && info.tail == 2);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_stream_close(y, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 0, NULL, recover_stream, &rx, &x,
+                    &e),
+     &e);
+  REQUIRE(rx.calls == 2);
+  append_byte(x, 2, "c", &e);
+  ok(ps_stream_window_open(x, 0, sizeof(body), &view, &e), &e);
+  ok(ps_stream_window_read(view, 0, body, sizeof(body), &e), &e);
+  REQUIRE(!memcmp(body, "abc", sizeof(body)));
+  ps_stream_window_close(view);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void stream_handoff_child(int ready, int scenario) {
   lc_error e = {0};
   ps_options options = {0};
   ps_space *s = NULL;
@@ -3283,16 +3360,20 @@ static void stream_handoff_child(int ready, int complete) {
   ok(ps_stream_begin(stream, &writer, &e), &e);
   REQUIRE(ps_stream_writer_start(writer) == 1);
   memset(body, '!', PS_CHUNK);
-  if (complete)
+  if (scenario != 0)
     body[0] = 'R';
   ok(ps_stream_write(writer, body, PS_CHUNK, &e), &e);
-  ok(ps_flush(s, &e), &e);
+  if (scenario == 2)
+    ok(ps_checkpoint(s, &e), &e);
+  else
+    ok(ps_flush(s, &e), &e);
   REQUIRE(write(ready, "R", 1) == 1);
   for (;;)
     pause();
 }
 static void stream_takeover(void) {
-  for (int complete = 0; complete <= 1; ++complete) {
+  for (int scenario = 0; scenario < 3; ++scenario) {
+    int complete = scenario != 0;
     lc_error e = {0};
     ps_options options = {0};
     ps_space *s = NULL;
@@ -3316,7 +3397,7 @@ static void stream_takeover(void) {
       char fd[16], valid[16];
       REQUIRE(close(ready[0]) == 0);
       snprintf(fd, sizeof(fd), "%d", ready[1]);
-      snprintf(valid, sizeof(valid), "%d", complete);
+      snprintf(valid, sizeof(valid), "%d", scenario);
       execl(executable, executable, "--stream-child", path, fd, valid,
             (char *)NULL);
       _exit(127);
@@ -3502,6 +3583,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "stream-handoff")) {
     stream_handoff(0);
     stream_handoff(1);
+    stream_abort_and_cold_open();
   } else if (!strcmp(argv[2], "stream-handoff-faults"))
     stream_handoff_faults();
   else if (!strcmp(argv[2], "stream-takeover"))

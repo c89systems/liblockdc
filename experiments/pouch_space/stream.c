@@ -16,7 +16,7 @@ struct ps_stream {
   pthread_mutex_t mutex;
   stream_run *runs;
   size_t count, allocated, readers;
-  uint64_t tail, capacity, preferred_grant, checked;
+  uint64_t tail, capacity, preferred_grant, checked, edit_wire;
   ps_piece_checksum checksum;
   uint64_t recovery_floor;
   unsigned char *recovery_buffer;
@@ -34,7 +34,7 @@ struct ps_stream_writer {
   uint64_t start, bytes, flushed, prior_checked;
   ps_piece_checksum prior_checksum;
   size_t used;
-  int failed, published;
+  int failed, published, wrote;
   unsigned char buffer[PS_CHUNK];
 };
 struct ps_stream_window {
@@ -243,6 +243,7 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
   s->ref = status->ref;
   s->tail = s->recovery_floor = status->tail;
   s->sealed = status->sealed;
+  s->edit_wire = status->edit_wire;
   rc = ps_owned_runs_capture(s->head, &captured, &count, error);
   for (i = 0; rc == LC_OK && i < count; ++i) {
     rc = stream_grow(s, error);
@@ -262,40 +263,43 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     s->capacity = status->capacity;
   if (rc == LC_OK)
     rc = stream_pieces(s, s->tail, 1, s->sealed, NULL, NULL, error);
-  if (rc == LC_OK && s->capacity && !s->sealed) {
-    if (!recover)
-      rc = stream_error(error, LC_ERR_INVALID,
+  if (rc != LC_OK || !s->capacity || s->sealed)
+    return rc;
+  if (!recover)
+    return stream_error(error, LC_ERR_INVALID,
                         "existing stream requires canonical recovery");
-    else {
-      s->recovery_buffer = lc_alloc_with_allocator(NULL, PS_CHUNK);
-      if (!s->recovery_buffer)
-        rc = stream_error(error, LC_ERR_NOMEM,
-                          "cannot allocate recovery read-ahead");
-      s->recovering = 1;
-      accepted = s->tail;
-      if (rc == LC_OK)
-        rc = recover(s, s->tail, s->capacity, &accepted, context, error);
-      s->recovering = 0;
-      if (rc == LC_OK && (accepted < s->tail || accepted > s->capacity))
-        rc = stream_error(error, LC_ERR_PROTOCOL,
-                          "canonical recovery returned invalid tail");
-      if (rc == LC_OK)
-        rc = stream_pieces(s, accepted, 2, 1, s->recovery_buffer, &repaired,
-                           error);
-      /* Readers need only the validated prefix. Newly accepted bytes and
-       * repaired footers join readiness, even if the canonical tail stayed
-       * put. Rejected suffix repair waits for the first write admission. */
-      if (rc == LC_OK && (accepted > s->tail || repaired))
-        rc = ps_owned_commit(s->head, accepted, PS_COMMIT_DEFER_SYNC, NULL,
-                             NULL, error);
-      if (rc == LC_OK) {
-        s->tail = accepted;
-        s->repair_pending = 1;
-      }
-      lc_free_with_allocator(NULL, s->recovery_buffer);
-      s->recovery_buffer = NULL;
-    }
+  if (status->complete) {
+    rc = stream_pieces(s, s->tail, 1, 1, NULL, NULL, error);
+    if (rc != LC_ERR_PROTOCOL)
+      return rc;
+    /* Canonical validation can still rebuild an uncovered partial footer. */
+    lc_error_cleanup(error);
   }
+  s->recovery_buffer = lc_alloc_with_allocator(NULL, PS_CHUNK);
+  if (!s->recovery_buffer)
+    return stream_error(error, LC_ERR_NOMEM,
+                        "cannot allocate recovery read-ahead");
+  s->recovering = 1;
+  accepted = s->tail;
+  rc = recover(s, s->tail, s->capacity, &accepted, context, error);
+  s->recovering = 0;
+  if (rc == LC_OK && (accepted < s->tail || accepted > s->capacity))
+    rc = stream_error(error, LC_ERR_PROTOCOL,
+                      "canonical recovery returned invalid tail");
+  if (rc == LC_OK)
+    rc = stream_pieces(s, accepted, 2, 1, s->recovery_buffer, &repaired, error);
+  /* Readers need only the validated prefix. Newly accepted bytes and repaired
+   * footers join readiness, even if the canonical tail stayed put. Rejected
+   * suffix repair waits for the first write admission. */
+  if (rc == LC_OK && (accepted > s->tail || repaired))
+    rc = ps_owned_commit(s->head, accepted, PS_COMMIT_DEFER_SYNC, NULL, NULL,
+                         error);
+  if (rc == LC_OK) {
+    s->tail = accepted;
+    s->repair_pending = 1;
+  }
+  lc_free_with_allocator(NULL, s->recovery_buffer);
+  s->recovery_buffer = NULL;
   return rc;
 }
 int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
@@ -325,7 +329,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     if (create)
       rc = ps_flush(space, error);
     if (rc == LC_OK)
-      rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+      rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
   }
   if (rc == LC_OK)
     rc = stream_load(s, &status, recover, context, error);
@@ -358,7 +362,9 @@ static int stream_refresh_edit(ps_stream *s, const ps_owned_status *status,
   }
   if (continued && s->edit_valid && s->tail == status->tail &&
       s->capacity == status->capacity && s->count == status->runs &&
-      s->sealed == status->sealed) {
+      s->sealed == status->sealed &&
+      ((status->complete && !s->repair_pending) ||
+       s->edit_wire == status->edit_wire)) {
     pthread_mutex_unlock(&s->mutex);
     return LC_OK;
   }
@@ -380,6 +386,7 @@ static int stream_refresh_edit(ps_stream *s, const ps_owned_status *status,
     s->capacity = staged.capacity;
     s->preferred_grant = staged.preferred_grant;
     s->checked = staged.checked;
+    s->edit_wire = staged.edit_wire;
     s->checksum = staged.checksum;
     s->sealed = staged.sealed;
     s->repair_pending = staged.repair_pending;
@@ -505,7 +512,7 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     return rc;
-  rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+  rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
   if (rc == LC_OK && edit)
     rc = stream_refresh_edit(s, &status, continued, error);
   pthread_mutex_lock(&s->mutex);
@@ -557,7 +564,7 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     return rc;
-  rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+  rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
   if (rc == LC_OK && edit && !retirement)
     rc = stream_refresh_edit(s, &status, continued, error);
   if (rc == LC_OK)
@@ -637,7 +644,7 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
     lc_free_with_allocator(NULL, w);
     return rc;
   }
-  rc = ps_owned_edit_begin(s->head, &w->edit, &status, &continued, error);
+  rc = ps_owned_edit_begin(s->head, 1, &w->edit, &status, &continued, error);
   if (rc == LC_OK && w->edit)
     rc = stream_refresh_edit(s, &status, continued, error);
   pthread_mutex_lock(&s->mutex);
@@ -729,9 +736,11 @@ static int stream_flush(ps_stream_writer *w, lc_error *error) {
     return LC_OK;
   rc = ensure_capacity(w->stream, NULL, w->start + w->flushed + w->used, 0,
                        error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    w->wrote = 1;
     rc = stream_io(w->stream, w->start + w->flushed, w->buffer, w->used, 1,
                    error);
+  }
   if (rc == LC_OK) {
     w->flushed += w->used;
     w->used = 0;
@@ -861,8 +870,8 @@ int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
     rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, w->buffer, NULL,
                        error);
   if (rc == LC_OK)
-    rc = ps_owned_commit(w->stream->head, w->start + w->bytes, mode, publish,
-                         context, error);
+    rc = ps_owned_commit_canonical(w->stream->head, w->start + w->bytes, mode,
+                                   publish, context, error);
   if (rc == LC_OK) {
     rc = ps_owned_edit_end(w->stream->head, w->edit, rc, error);
     w->edit = NULL;
@@ -884,7 +893,7 @@ void ps_stream_writer_close(ps_stream_writer *w) {
   if (!w->published) {
     lc_error_init(&error);
     rc = ps_owned_status_get(w->stream->head, &status, &error);
-    if (rc == LC_OK && w->flushed) {
+    if (rc == LC_OK && w->wrote) {
       rc = clear_suffix(w->stream, w->start, w->buffer, &error);
       if (rc == LC_OK)
         (void)ps_owned_barrier(w->stream->head, &error);
@@ -893,6 +902,7 @@ void ps_stream_writer_close(ps_stream_writer *w) {
     lc_error_cleanup(&error);
     pthread_mutex_lock(&w->stream->mutex);
     w->stream->appending = 0;
+    w->stream->edit_valid = 0;
     w->stream->checked = w->prior_checked;
     w->stream->checksum = w->prior_checksum;
     pthread_mutex_unlock(&w->stream->mutex);
