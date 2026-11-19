@@ -5,6 +5,158 @@
 #include "lc_pouch_storage.h"
 #include "revision.h"
 
+typedef struct checkpoint_probe {
+  size_t calls;
+  int reject;
+} checkpoint_probe;
+static int checkpoint_probe_call(checkpoint_probe *probe) {
+  ++probe->calls;
+  if (probe->reject)
+    errno = EIO;
+  return probe->reject;
+}
+static ssize_t checkpoint_probe_read(void *context, int fd, void *bytes,
+                                     size_t length, off_t offset) {
+  return checkpoint_probe_call(context) ? -1
+                                        : pread(fd, bytes, length, offset);
+}
+static ssize_t checkpoint_probe_write(void *context, int fd, const void *bytes,
+                                      size_t length, off_t offset) {
+  return checkpoint_probe_call(context) ? -1
+                                        : pwrite(fd, bytes, length, offset);
+}
+static int checkpoint_probe_sync(void *context, int fd) {
+  return checkpoint_probe_call(context) ? -1 : fdatasync(fd);
+}
+static int checkpoint_probe_reserve(void *context, int fd, off_t offset,
+                                     off_t length) {
+  return checkpoint_probe_call(context) ? -1 : fallocate(fd, 0, offset, length);
+}
+static void checkpoint_unchanged(ps_space *space, checkpoint_probe *probe) {
+  ps_stats before, after;
+  uint64_t selected, durable, selected_after, durable_after;
+  OK(ps_status(space, &before, &error));
+  OK(ps_publication_prefix(space, &selected, &durable, &error));
+  CHECK(selected == durable && !before.journal_bytes);
+  size_t calls = probe->calls;
+  for (size_t i = 0; i < 4; ++i) {
+    /* An unchanged pass must succeed even when every allocation and I/O is
+     * unavailable. In particular it must not poison an otherwise healthy root.
+     */
+    probe->reject = 1;
+    allocation_call = 0;
+    allocation_fail = 1;
+    int rc = ps_checkpoint(space, &error);
+    allocation_fail = 0;
+    probe->reject = 0;
+    OK(rc);
+    CHECK(!allocation_call && probe->calls == calls);
+    OK(ps_check(space, &error));
+  }
+  OK(ps_status(space, &after, &error));
+  OK(ps_publication_prefix(space, &selected_after, &durable_after, &error));
+  CHECK(after.checkpoints == before.checkpoints &&
+        after.syncs == before.syncs && after.capacity == before.capacity &&
+        after.metadata_pages == before.metadata_pages &&
+        after.directory_page_writes == before.directory_page_writes &&
+        after.descriptor_page_writes == before.descriptor_page_writes &&
+        after.private_bytes == before.private_bytes &&
+        after.reserved_payload_bytes == before.reserved_payload_bytes &&
+        selected_after == selected && durable_after == durable);
+}
+static void checkpoint_idempotence(int durable) {
+  checkpoint_probe probe = {0};
+  ps_io io = {&probe, checkpoint_probe_read, checkpoint_probe_write,
+              checkpoint_probe_sync, checkpoint_probe_reserve, NULL};
+  ps_budget_plan plan = {0};
+  ps_budget *budget = NULL;
+  ps_writer *private = NULL;
+  ps_reader *held = NULL;
+  ps_stats before, after;
+  unsigned char chunk[2048];
+  uint64_t selected, completed;
+  clean();
+  ps_space *space = create(PS_DEFAULT_CAPACITY, durable, &io);
+  checkpoint_unchanged(space, &probe);
+  ps_ref prior = put(space, state(1), "prior", 5, 1);
+  OK(ps_checkpoint(space, &error));
+  checkpoint_unchanged(space, &probe);
+  OK(ps_read_open(space, state(1), &prior, &held, &error));
+  ps_ref current = put(space, state(1), "current", 7, 1);
+  OK(ps_publication_prefix(space, &selected, &completed, &error));
+  CHECK(durable ? selected == completed : selected > completed);
+
+  /* A bounded private producer and its future capacity claim survive both a
+   * real checkpoint and repeated unchanged passes without becoming selected. */
+  OK(ps_budget_plan_value(&plan, 3 * PS_CHUNK, &error));
+  OK(ps_budget_open(space, &plan, &budget, &error));
+  OK(ps_begin(space, budget, state(2), &private, &error));
+  memset(chunk, 0x6d, sizeof(chunk));
+  for (size_t i = 0; i < 2 * PS_CHUNK / sizeof(chunk); ++i)
+    OK(ps_write(private, chunk, sizeof(chunk), &error));
+  OK(ps_status(space, &before, &error));
+  CHECK(before.private_bytes && before.reserved_payload_bytes);
+  OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.checkpoints == before.checkpoints + 1 &&
+        after.syncs >= before.syncs + 3 && !after.journal_bytes &&
+        after.private_bytes == before.private_bytes && after.retired_bytes);
+  checkpoint_unchanged(space, &probe);
+  read_value(held, "prior", 5);
+  ps_reader_close(held);
+  expect(space, state(1), &current, "current", 7);
+  absent(space, state(2));
+  ps_writer_close(private);
+  OK(ps_budget_close(budget, &error));
+  checkpoint_unchanged(space, &probe);
+
+  OK(ps_status(space, &before, &error));
+  OK(ps_grow(space, PS_MIB, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.capacity == PS_DEFAULT_CAPACITY + PS_MIB &&
+        after.checkpoints == before.checkpoints + 1);
+  checkpoint_unchanged(space, &probe);
+  before = after;
+  OK(ps_metadata_repack(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.checkpoints == before.checkpoints + 1 &&
+        after.descriptor_page_writes > before.descriptor_page_writes);
+  checkpoint_unchanged(space, &probe);
+  OK(ps_close(space, &error));
+  ps_options options = {0};
+  options.io = &io;
+  options.durable_sync = durable;
+  OK(ps_open(path, 0, &options, &space, &error));
+  OK(ps_status(space, &before, &error));
+  CHECK(before.capacity == PS_DEFAULT_CAPACITY + PS_MIB &&
+        before.journal_bytes);
+  expect(space, state(1), &current, "current", 7);
+  absent(space, state(2));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_status(space, &after, &error));
+  CHECK(after.checkpoints == before.checkpoints + 1);
+  checkpoint_unchanged(space, &probe);
+
+  /* New metadata still requires actual durable publication. Failure poisons
+   * the root; a subsequent checkpoint must not hide that uncertain outcome. */
+  put(space, state(3), "changed", 7, 1);
+  probe.reject = 1;
+  CHECK(ps_checkpoint(space, &error) == LC_ERR_TRANSPORT);
+  lc_error_cleanup(&error);
+  size_t calls = probe.calls;
+  CHECK(ps_checkpoint(space, &error) == LC_ERR_TRANSPORT);
+  CHECK(probe.calls == calls);
+  lc_error_cleanup(&error);
+  probe.reject = 0;
+  OK(ps_close(space, &error));
+  OK(ps_open(path, 0, &options, &space, &error));
+  expect(space, state(1), &current, "current", 7);
+  expect(space, state(3), NULL, "changed", 7);
+  absent(space, state(2));
+  OK(ps_close(space, &error));
+  clean();
+}
+
 static void checkpoint_records(int durable) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry prior = {0}, changed = {0}, projected = {0},

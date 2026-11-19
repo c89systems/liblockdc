@@ -7439,6 +7439,9 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "root-obligation-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         root_obligation_faults(durable);
+    } else if (strcmp(argv[2], "checkpoint-idempotence") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        checkpoint_idempotence(durable);
     } else if (strcmp(argv[2], "checkpoint-records") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_records(durable);

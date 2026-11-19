@@ -189,7 +189,11 @@ int ps_value_remove(ps_space *, ps_key, const ps_ref *, lc_error *);
  * another file sync. */
 int ps_flush(ps_space *, lc_error *);
 /* Durably checkpoint metadata, retire the previous recoverable root, then
- * reclaim unpinned retired runs. No live payload copying or file shrinking. */
+ * reclaim unpinned retired runs. Reuses a completed checkpoint when no journal,
+ * metadata, readiness or metadata-trimming work remains, without another root
+ * publication. Private/unready producers need not finish. No live payload
+ * copying or file shrinking. Growth and explicit repacking retain their own
+ * mandatory checkpoint publication. */
 int ps_checkpoint(ps_space *, lc_error *);
 /* Explicit metadata maintenance: rewrite all current descriptors and their
  * directory references densely through the same durable root-retirement

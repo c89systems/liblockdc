@@ -5345,3 +5345,88 @@ Evidence is in ignored `build/pouch-space-index-native-fit/`:
 `performance-summary.tsv`, and `benchmark-{debug,gnu,musl}.log`. The full goal
 remains active, including shared-root coordination/recovery, compound capacity,
 and performance qualification. Multifile remains the default/reference.
+
+### Reusing completed container checkpoints during maintenance
+
+Physical checkpointing now reuses a completed root across namespace maintenance
+visits. A namespace pass still performs its discovery, reclamation and hint
+handling. The following root checkpoint publishes again only when journal
+records, dirty metadata, an unfinished durability prefix or excess dynamic
+metadata workspace require work. The decision uses root allocation authority;
+a peer publication between visits creates new work and cannot be skipped.
+
+The checkpoint refreshes its metadata bound before checking for trimming.
+An aborted unbudgeted producer can leave excess workspace without publishing
+any journal record. Those pages still return through the existing checkpoint
+and trimming protocol. Funded private producers retain their future claims;
+captured readers retain their old bytes. Completed retired owners can still be
+collected during an otherwise unchanged pass. Application bodies are neither
+copied nor awaited by this decision.
+
+New publications retain the complete durable root-selection/old-root-retirement
+protocol. Journal rollover, explicit growth and explicit metadata repacking
+still call that protocol directly. Reopen's incarnation grant also requires a
+real subsequent checkpoint. Poisoned handles still reject checkpointing. NoSync
+index-flush durability, persistence representations, public ABI and backend
+selection are unchanged.
+
+The new `checkpoint-idempotence` test passes 524 checks across both policies,
+using a 10 MiB root and explicit growth by exactly 1 MiB. Repeated unchanged
+passes succeed with every allocation and I/O configured to fail, without
+changing root/page-write counters or publication prefixes. The fixture retains
+an old reader, a private streamed writer and unused admitted capacity, then
+checks new publication, abort, growth, forced repacking, reopen, uncertain-I/O
+poisoning and recovery. Linked against the frozen `1a464518` physical owner,
+this same regression fails at the first unchanged pass. The existing metadata
+capacity fixture separately verifies workspace reclamation after a large
+unbudgeted producer is abandoned.
+
+Thirty-one affected Debug checks pass on the final implementation, including
+the new case, metadata capacity/growth and fault injection, checkpoint and
+stream recovery, concurrency, protected capacity, and source/stack gates.
+Twenty-six checks each pass on GNU and musl release, including all four codecs'
+index durability, root conversion/growth, representative collection maintenance
+and the strict lease pressure gates. The strict 96-case capacity matrix and
+48 attachment-window workflows pass on all three configurations. This retains
+the earlier workload-specific capacity result; it does not establish a general
+capacity proof for every legal operation or combination of claims.
+
+Two TSan scenarios pass with instrumented OpenSSL 3.6.5 and 128 KiB workers:
+the new regression and maintenance with a paused copy of encoded body ranges
+and a peer writer. Strict Memcheck passes the new regression with 287 matched
+allocations and frees, zero remaining heap/errors/suppressions and only the
+three inherited descriptors. Debug tests also use 128 KiB worker stacks with
+the glibc stack cache disabled.
+
+Matched GNU Release measurements retain 36 verified runs: frozen/current native
+and the multifile reference, three alternating samples, both policies, and the
+same two preopened indexed workloads as the preceding milestone. Worker stack
+overrides and glibc tunables are unset. Native before/after retains the same
+durability guarantee; the ordinary multifile NoSync flush boundary still differs
+as described above. Three-sample native medians in milliseconds:
+
+| Workload / policy | Maintenance before / after | Maintenance barriers before / after | Lifecycle before / after |
+| --- | ---: | ---: | ---: |
+| 16 records, two writers / NoSync | 14.09 / 7.02 | 9 / 3 | 76.33 / 70.00 |
+| 16 records, two writers / durable | 11.99 / 6.34 | 9 / 3 | 736.78 / 668.33 |
+| 48 records, four writers / NoSync | 17.35 / 7.04 | 15 / 3 | 97.00 / 83.95 |
+| 48 records, four writers / durable | 24.90 / 9.99 | 15 / 3 | 1589.20 / 1334.37 |
+
+Terminal maintenance drops 47–60% in this sample, with deterministic removal of
+six/twelve redundant barriers. Other phase timings vary with the host; these
+results do not establish a steady-state CPU improvement. Native indexed flush
+still takes roughly 18–28 ms in this batch. Reopen remains slower than multifile,
+and the current wider durable lifecycle is 1334 ms versus multifile's 1206 ms.
+The earlier batch favored native in that workload, so a general performance
+acceptance remains unproven. Work, readiness, maintenance, close, reopen and
+reopened verification remain separately recorded.
+
+Evidence is in ignored `build/pouch-space-maintenance-fit/`:
+`repair-debug.log`, `qualified-repair-debug.log`, `capacity-debug.log`,
+`qualified-*-release.log`, `negative-control.log`, `trace.log`,
+`paired-performance.sh`, `paired-performance.log`, `summarize-performance.awk`,
+`performance-summary.tsv`, `tsan-*.log` and `memcheck-idempotence*.log`.
+Qualification scripts and the frozen comparison owner are retained there.
+Shared-root coordination/recovery, general bounded-capacity acceptance and
+performance qualification remain in the full active goal. Multifile remains
+the default/reference; production cutover still requires an explicit decision.

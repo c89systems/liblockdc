@@ -620,6 +620,10 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
+  add_test(NAME pouch_space_checkpoint-idempotence
+    COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} checkpoint-idempotence)
+  set_tests_properties(pouch_space_checkpoint-idempotence PROPERTIES TIMEOUT 60
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   foreach(mode native-metadata native-metadata-faults native-metadata-concurrency)
     add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

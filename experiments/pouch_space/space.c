@@ -3215,13 +3215,32 @@ int ps_flush(ps_space *s, lc_error *error) {
   return wait_durable(s, sequence, error);
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
+  uint64_t bound;
   int rc;
   if (!s)
     return err(error, LC_ERR_INVALID, "checkpoint requires container");
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK)
-    rc = checkpoint_locked(s, error);
+    rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
+  if (rc == LC_OK)
+    s->metadata_workspace = bound;
+  if (rc == LC_OK) {
+    /* Namespace maintenance shares one physical checkpoint. A completed root
+     * needs no new root selection merely because another namespace visits it.
+     * Keep unpublished preparation outside this boundary; completed readiness
+     * debt and dynamic metadata trimming still require the normal protocol.
+     * Refresh the bound first: an aborted private producer can leave excess
+     * workspace even though it never published a journal record.
+     * Growth and explicit repacking call checkpoint_locked directly. */
+    if (s->journal || s->dirty ||
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
+            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) ||
+        metadata_trim_needed(s))
+      rc = checkpoint_locked(s, error);
+    else
+      collect(s);
+  }
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
