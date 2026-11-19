@@ -65,6 +65,14 @@ void ps_coordination_unlock(ps_coordination_guard *);
  * because callers use this result to decide whether physical reuse is safe. */
 int ps_coordination_conflict(ps_coordination *, uint64_t, uint64_t, uint64_t *,
                              uint64_t *, lc_error *);
+/* Physical ownership, called under the allocator's authority. Read locks are
+ * ownership witnesses for GETLK-based allocators; they permit captured readers.
+ * Exclusive lifetime authority covers ranges without extra lock syscalls;
+ * shared participants install the per-range witnesses. Acquisition failure is
+ * clean; an uncertain shared release poisons the owner.
+ * The caller retains the owner until every range is released or owner close. */
+int ps_coordination_range(ps_coordination *, uint64_t, uint64_t, int acquire,
+                          lc_error *);
 
 /* Borrowed while the space is alive; never independently closed. Native spaces
  * still acquire exclusive lifetime authority; shared allocator admission is

@@ -51,6 +51,7 @@ typedef struct ps_entry {
   int stream_open, stream_sealed, orphan_claimed;
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
+  int payload_claimed;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
@@ -68,6 +69,7 @@ typedef struct ps_entry {
 typedef struct ps_run {
   uint64_t offset, bytes;
   int clean;
+  int claimed; /* 0 common, 1 process budget pool, 2 admission preparation */
   struct ps_run *next;
 } ps_run;
 typedef struct ps_payload_page {
@@ -105,6 +107,8 @@ struct ps_space {
   uint64_t metadata_workspace;
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload, reserved_metadata, reserved_entries;
+  uint64_t physical_claim_bytes;
+  uint64_t claimed_free_bytes;
   size_t budgets;
   ps_budget_plan reserve_base;
   struct ps_reserve *reserves;
@@ -128,7 +132,7 @@ struct ps_budget {
   ps_space *space;
   ps_budget_plan remaining;
   size_t users;
-  ps_run *trim;
+  ps_run *trim, *payload_trim;
 };
 struct ps_reserve {
   ps_space *space;
@@ -172,4 +176,6 @@ void ps_internal_install(ps_space *, ps_entry *);
 void ps_internal_remove(ps_space *, ps_entry *, uint64_t);
 int ps_internal_durable(ps_space *, uint64_t, lc_error *);
 void ps_internal_collect(ps_space *);
+int ps_internal_budget_ranges(ps_space *, uint64_t, ps_run **, lc_error *);
+void ps_internal_free_coalesce(ps_space *);
 #endif

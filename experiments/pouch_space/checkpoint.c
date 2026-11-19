@@ -695,6 +695,9 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
     ps_key_checkpoint_close(c);
   return rc;
 }
+size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *c) {
+  return c && c->budget ? 1 : 0;
+}
 void ps_key_checkpoint_close(ps_key_checkpoint *c) {
   key_slot *slot, *next;
   size_t i;

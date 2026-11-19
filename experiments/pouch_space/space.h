@@ -98,6 +98,9 @@ typedef struct ps_stats {
   uint64_t metadata_available_bytes, metadata_workspace_bytes;
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload_bytes, reserved_metadata_bytes, reserved_entries;
+  /* Unspent claims plus unpublished payload allocations, covered by lifetime
+   * file authority or shared range witnesses. No second allocation charge. */
+  uint64_t claimed_payload_bytes;
   uint64_t budgets;
   /* Component maxima of unclaimed future maintenance, not summed owner
    * credits. Allocator admission also protects their incremental checkpoint
@@ -139,6 +142,10 @@ int ps_open(const char *, int create, const ps_options *, ps_space **,
  * does not implicitly checkpoint or make NoSync publications durable.
  * Error leaves the handle. */
 int ps_close(ps_space *, lc_error *);
+/* Pre-close check for live private producers or externally retained budgets.
+ * The caller supplies its cache-owned budget count, which close will release.
+ * Cached immutable readers are excluded; root caches release those on close. */
+int ps_space_private_active(ps_space *, size_t cached_budgets);
 /* NULL budget uses ordinary admission. Explicit claims cover physical pages
  * and positive descriptor growth, and remain pinned until writer_close. */
 int ps_begin(ps_space *, ps_budget *, ps_key, ps_writer **, lc_error *);

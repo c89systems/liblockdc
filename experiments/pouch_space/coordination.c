@@ -91,6 +91,42 @@ int ps_coordination_conflict(ps_coordination *owner, uint64_t offset,
   return fail(e, LC_ERR_TRANSPORT, rc < 0 ? errno : 0,
               "cannot establish physical pin ownership; close and reopen");
 }
+int ps_coordination_range(ps_coordination *owner, uint64_t offset,
+                          uint64_t bytes, int acquire, lc_error *e) {
+  struct flock lock;
+  int rc;
+  if (!owner || !bytes || offset > INT64_MAX ||
+      bytes > (uint64_t)INT64_MAX - offset || (acquire != 0 && acquire != 1))
+    return fail(e, LC_ERR_INVALID, 0, "invalid physical ownership range");
+  if (acquire && (rc = ps_coordination_check(owner, e)) != LC_OK)
+    return rc;
+  /* Exclusive lifetime authority already covers the whole container. Only
+   * shared participants need separately observable range witnesses. */
+  if (!owner->shared)
+    return LC_OK;
+  memset(&lock, 0, sizeof(lock));
+  lock.l_type = acquire ? F_RDLCK : F_UNLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = (off_t)offset;
+  lock.l_len = (off_t)bytes;
+  do {
+    rc = owner->io.lock(owner->io.context, owner->fd, F_OFD_SETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+  if (rc == 0)
+    return LC_OK;
+  if (!acquire) {
+    if (owner->failure_flag)
+      __atomic_store_n(owner->failure_flag, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&owner->poisoned, 1, __ATOMIC_RELEASE);
+  }
+  return fail(e,
+              acquire && (errno == EACCES || errno == EAGAIN)
+                  ? LC_ERR_PENDING
+                  : LC_ERR_TRANSPORT,
+              errno,
+              acquire ? "cannot claim physical ownership"
+                      : "physical release uncertain; close and reopen");
+}
 int ps_coordination_open(int fd, const ps_coordination_options *options,
                          ps_coordination **out, lc_error *e) {
   ps_coordination_options defaults = {0};

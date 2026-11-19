@@ -399,7 +399,12 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
   b = lc_calloc_with_allocator(NULL, 1, sizeof(*b));
   if (b)
     b->trim = lc_calloc_with_allocator(NULL, 1, sizeof(*b->trim));
-  if (!b || !b->trim) {
+  if (b && b->trim)
+    b->payload_trim =
+        lc_calloc_with_allocator(NULL, 1, sizeof(*b->payload_trim));
+  if (!b || !b->trim || !b->payload_trim) {
+    if (b)
+      lc_free_with_allocator(NULL, b->trim);
     lc_free_with_allocator(NULL, b);
     return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate capacity budget",
                         NULL, NULL, "pouch-space");
@@ -418,6 +423,8 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     s->reserved_metadata += plan->metadata_bytes;
     s->reserved_entries += plan->entries;
     rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    if (rc == LC_OK)
+      rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
     if (rc != LC_OK) {
       ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
                                plan->entries);
@@ -429,6 +436,7 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
   if (rc == LC_OK)
     *out = b;
   else {
+    lc_free_with_allocator(NULL, b->payload_trim);
     lc_free_with_allocator(NULL, b->trim);
     lc_free_with_allocator(NULL, b);
   }
@@ -538,6 +546,8 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
     b->remaining = *plan;
     if (grows)
       rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    if (rc == LC_OK)
+      rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
     if (rc != LC_OK) {
       s->reserved_payload = payload + prior.payload_bytes;
       s->reserved_metadata = metadata + prior.metadata_bytes;
@@ -560,12 +570,21 @@ int ps_budget_close(ps_budget *b, lc_error *e) {
     pthread_mutex_unlock(&s->mutex);
     return invalid(e, "close writers using the capacity budget first");
   }
+  if (ps_internal_budget_ranges(
+          s, s->reserved_payload - b->remaining.payload_bytes, &b->payload_trim,
+          NULL) != LC_OK) {
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    (void)ps_internal_budget_ranges(
+        s, s->reserved_payload - b->remaining.payload_bytes, &b->payload_trim,
+        NULL);
+  }
   ps_internal_budget_spend(b, b->remaining.payload_bytes,
                            b->remaining.metadata_bytes, b->remaining.entries);
   --s->budgets;
   ps_internal_budget_trim(s, &b->trim);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, b->trim);
+  lc_free_with_allocator(NULL, b->payload_trim);
   lc_free_with_allocator(NULL, b);
   return LC_OK;
 }

@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime) | Shared allocator admission, projection refresh, owned-stream reader generations and abandoned-claim recovery |
+| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership) and process-death release | Shared metadata forecast protection, canonical/projection refresh, owned-stream reader generations and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -5683,3 +5683,144 @@ file authority or these immutable tickets as proof that shared messaging and
 lease operations are ready. Those surfaces and general performance/capacity
 acceptance remain required in the active goal. Multifile stays the default and
 production cutover requires its explicit deployment decision.
+
+## Concrete private payload ownership
+
+Payload budgets now protect actual free ranges in a process-owned pool, rather
+than only subtracting scalar credits from admission. Free intervals distinguish
+common space, the admitted pool and temporary admission preparation. Ordinary
+payload and checkpoint allocation exclude protected ranges; splitting/merging
+preserves that classification. Claim storage follows actual fragmentation,
+without a capacity-sized bitmap, another file or a persistent claim ledger.
+
+Budget handles retain individual spending/admission authority while sharing the
+process's physical pool. This keeps credit transfer between handles atomic,
+allocation-free and free of file-lock calls, including transfers into an active
+destination. It also avoids an FD per budget. A funded writer can consume the
+pool directly or use a prepared common run while releasing an equal amount of
+unspent protection. Existing zero-preparation amortization remains available.
+The fixed maintenance floor and computed descriptor/checkpoint obligations
+continue to govern admission; physical assignment does not pay those costs twice.
+
+Unpublished immutable extents and newly prepared owned-run grants retain their
+physical ownership while payload I/O and producers run outside allocator
+authority. Complete canonical selection transfers that ownership to the selected
+metadata. Abort returns it through normal reclamation. Writes to unpublished
+suffixes inside an already selected owned run still rely on its canonical
+physical ownership and logical writer exclusion; they do not reserve that run
+a second time. No application body is materialized by claiming capacity.
+
+Coverage uses the existing coordination mode. Exclusive native admission already
+holds file-wide lifetime authority and therefore needs no per-range lock calls.
+Shared coordination uses OFD read-lock witnesses plus presence byte 2, acquiring
+presence before the first range and releasing it after the last. A future shared
+allocator must query foreign ownership while its publication authority excludes
+competing selection. Compatible read locks are witnesses, not an exclusive
+allocation primitive by themselves. Normal shared Pouch admission stays closed.
+
+Packed private extents claim rounded 64-byte cell ranges. Publishing one cell
+must not release a neighboring producer's ownership, even when the kernel has
+merged adjacent locks on the same OFD. Whole-run publication coalesces adjacent
+extent releases. Borrowed zero-preparation space remains privately covered until
+the preparation barrier completes; only then can its synchronized unused suffix
+return to common space. The producer fixture observes a full 1 MiB preparation
+range while an unrelated publisher commits, then observes its release after
+grant selection.
+
+Clean acquisition or allocation failure rolls back the new claim without
+changing a prior healthy budget. Resize preserves its previous credits on a
+healthy failure. Close has preallocated split workspace and can release unused
+credits while allocation is unavailable. Uncertain range release poisons
+admission; cleanup still consumes handles, conservatively retaining any
+uncertain kernel ownership until FD close. Process exit or SIGKILL releases
+unspent/private witnesses without another process cleaning a table. Committed
+outcomes continue to recover from the existing canonical directory/journal.
+
+`claimed_payload_bytes` reports unspent ranges and unpublished physical
+allocations covered by the current authority, without adding a second allocation
+charge. Failed-owner accounting may conservatively retain uncertain claims
+until close. No persistent representation or public ABI changes.
+
+Root close now checks external budgets and private writers before destroying
+namespace caches. Its close-time ownership observations include the checkpoint
+and retention budgets that those caches themselves will release. Counting all
+budgets as external incorrectly refused normal lease-store close; the production
+lease concurrency fixture caught that mistake. The final check permits cached
+completion ownership, refuses external children, and preserves namespace reserve
+owners/bounds on refusal. Linking the prior `486333b9` root-close implementation
+against the current fixture fails at reserve retention.
+
+Four new ownership groups exercise budget admission/spending/resize/transfer,
+private abort, publication, packed concurrent publishers, owned-grant preparation
+and process death. Their linker factory chooses existing shared coordination
+for one controlled canonical allocator, so they observe real kernel witnesses
+without exposing a product selector or claiming concurrent canonical refresh.
+Independent fresh FDs query the actual held ranges. Making shared acquisitions
+silently unlock instead makes the lifecycle test fail at its first physical
+ownership observation, rather than letting a scalar counter masquerade as proof.
+
+Fault coverage includes every measured admission allocation site, including
+failure after sixteen fragmented ranges have already been claimed, all measured
+fragmented acquisition sites, EINTR, contention, acquisition failure, failed
+rollback, uncertain release and atomic revision recovery after release failure.
+The packed-producer fixture permits a peer commit and checkpoint while the
+first producer is paused. A separately exec'd writer dies with 1 MiB split
+between unspent budget and unpublished bytes; all witnesses disappear, its
+acknowledged peer value survives, and its unpublished key is absent on recovery.
+
+Qualification comprises 50 distinct Debug checks across the affected passes,
+including the final 20 coverage checks, existing allocation/I/O failure suites,
+public lease concurrency, namespace credit transfer and source/stack gates.
+Final GNU and musl release each pass 39 integration checks plus the two explicit
+pressure gates: the strict 96-case capacity matrix and all 48 attachment-window
+workflows. Both coverage forms are exercised: ordinary Pouch keeps exclusive
+file authority, while the controlled ownership fixture uses shared OFD ranges.
+Three final TSan scenarios pass with instrumented OpenSSL 3.6.5, constrained
+128 KiB workers and no suppressions. Four strict Memcheck scenarios pass with
+999 matching allocations/frees, zero remaining heap/errors/suppressions and
+only the three inherited descriptors in each process.
+
+The first range-everywhere implementation added 4,026 `fcntl` calls to the wider
+NoSync indexed sample. Reusing exclusive lifetime coverage reduces that to three
+in the final implementation. The ownership fixture retains actual shared range
+calls. The traces establish operation counts; traced wall time is not used as
+native performance evidence.
+
+Final matched GNU measurements use frozen `486333b9` and multifile references,
+10 MiB roots, normal release stacks and three alternating samples per profile.
+Native before/after medians, milliseconds:
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 69.87 / 62.54 | 570.46 / 615.14 | 88.72 / 95.62 | 1194.53 / 1274.03 |
+| Work | 61.76 / 52.91 | 561.26 / 604.70 | 82.97 / 85.93 | 1187.56 / 1263.71 |
+| Work CPU | 19.68 / 16.51 | 48.36 / 50.32 | 42.63 / 48.29 | 137.00 / 140.04 |
+| Maximum worker index flush | 34.91 / 21.77 | 13.82 / 17.45 | 27.54 / 31.89 | 16.85 / 17.92 |
+| Close | 0.430 / 0.373 | 0.358 / 0.405 | 0.565 / 0.537 | 0.688 / 0.731 |
+| Reopen alone | 4.71 / 3.84 | 3.56 / 3.74 | 3.96 / 4.62 | 5.32 / 5.58 |
+
+Claims add no durability barrier; index maintenance still uses three. The wider
+NoSync CPU median is about 13% above baseline, and durable work is about 6–8%
+higher in this run. Other phases move in both directions. Removing redundant
+range calls does not establish general nonregression or acceptance. Native
+NoSync indexed work also remains substantially slower than multifile. Full
+shared-mode performance is not qualified by a controlled single allocator.
+
+Evidence is in ignored `build/pouch-space-physical-claims/`:
+`qualified-debug.log`, `cached-repair-debug.log`, `qualified-tail-debug.log`,
+`coverage-debug.log`, `final-qualified-*-release.log`, `final-pressure-*.log`,
+`final-tsan-*.log`, `final-memcheck-*.log`, `witness-negative.log`,
+`close-negative.log`, `range-syscalls-before.log`, `range-syscalls-after.log`,
+`final-performance.log` and `final-performance-summary.tsv`, with native
+qualification scripts, generated negative controls and frozen binaries alongside
+them. Earlier range-everywhere measurements remain separate.
+
+This completes concrete payload claims and their private-publication lifecycle.
+It does not admit multiple canonical writers. Shared metadata forecast credits,
+canonical/projection refresh, owned-stream/logical reader integration and
+coordinated abandoned-work recovery still need implementation before shared
+Pouch admission. Shared participants must always inspect foreign claims; the
+exclusive owner's late-reader optimization cannot be reused for arbitrary late
+shared writers. The full goal and performance/capacity acceptance remain active;
+multifile remains the default/reference and production cutover still requires
+its explicit deployment decision.

@@ -88,8 +88,13 @@ includes current live metadata plus every outstanding descriptor/entry credit;
 private writers retain those credits through payload I/O until publication.
 Payload credits are spent on physical allocation, metadata credits on publication.
 The maintenance floor governs opening a claim, not spending already funded work.
-Claims are volatile under the existing exclusive root owner; claim/release
-performs no I/O, introduces no persisted representation and copies no payload.
+Claims are volatile and now protect concrete free intervals in one process
+pool. Ordinary payload and metadata allocation exclude that pool; funded
+writers consume it or return equal protected capacity when using prepared
+common runs. Same-process credit transfers remain allocation-free and make no
+lock calls. Exclusive file authority covers these ranges; shared coordination
+uses OFD witnesses, without a persisted ledger or payload copying. See
+[private payload ownership](../../docs/pouch-space-implementation.md#concrete-private-payload-ownership).
 Writers pin their budget; space close rejects outstanding claims. Release returns
 unspent credits and excess dynamic metadata workspace using a preallocated split
 node. A budget provides capacity admission, not key isolation, rollback, or

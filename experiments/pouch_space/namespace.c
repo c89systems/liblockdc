@@ -235,6 +235,11 @@ static int recover(ps_stream *stream, uint64_t checkpoint, uint64_t capacity,
   lc_free_with_allocator(NULL, scratch);
   return rc;
 }
+size_t ps_namespace_data_budgets(const struct ps_namespace_data *d) {
+  return d ? (d->retention_budget ? 1 : 0) +
+                 ps_key_checkpoint_budgets(d->checkpoint)
+           : 0;
+}
 void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   size_t i;
   segment *r, *next;

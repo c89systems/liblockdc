@@ -565,6 +565,7 @@ int ps_root_reclaim_orphans(ps_root *root, uint64_t *reclaimed,
 }
 int ps_root_close(ps_root *root, lc_error *error) {
   ps_namespace *ns, *next;
+  size_t cached_budgets = 0;
   int rc;
   if (!root)
     return LC_OK;
@@ -578,6 +579,14 @@ int ps_root_close(ps_root *root, lc_error *error) {
     pthread_mutex_unlock(&root->mutex);
     return failure(error, LC_ERR_INVALID, "pouch_root_busy",
                    "release container coordination guards before root close");
+  }
+  for (ns = root->namespaces; ns; ns = ns->next)
+    cached_budgets += ps_namespace_data_budgets(ns->data);
+  if (ps_space_private_active(root->space, cached_budgets)) {
+    pthread_mutex_unlock(&root->mutex);
+    return failure(
+        error, LC_ERR_INVALID, "pouch_root_busy",
+        "release container private writers and budgets before root close");
   }
   pthread_mutex_unlock(&root->mutex);
   for (ns = root->namespaces; ns; ns = ns->next) {

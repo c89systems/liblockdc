@@ -38,6 +38,8 @@ struct ps_root {
 };
 /* Root close has already excluded namespace pins/calls. No payload I/O. */
 void ps_namespace_data_destroy(struct ps_namespace_data *);
+/* No calls/pins remain; close can count the budgets its caches will release. */
+size_t ps_namespace_data_budgets(const struct ps_namespace_data *);
 void ps_namespace_retain(ps_namespace *);
 /* Exclusive open-time conversion, before exposing any root capability. */
 int ps_root_config_write(ps_root *, lc_pouch_crypto *, lc_error *);

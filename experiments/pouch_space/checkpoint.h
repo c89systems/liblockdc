@@ -28,6 +28,8 @@ typedef struct ps_checkpoint_observer {
  * captures/read admission may run concurrently. No mutex spans body input. */
 int ps_key_checkpoint_open(ps_namespace *, ps_key_checkpoint **, lc_error *);
 void ps_key_checkpoint_close(ps_key_checkpoint *);
+/* Close-time ownership observation, after namespace calls/pins are excluded. */
+size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *);
 int ps_key_checkpoint_observe(ps_key_checkpoint *,
                               const ps_checkpoint_observer *, lc_error *);
 void ps_key_checkpoint_info(ps_key_checkpoint *, ps_checkpoint_info *);

@@ -406,6 +406,42 @@ static void entry_free(ps_entry *p) {
   lc_free_with_allocator(NULL, p->extents);
   lc_free_with_allocator(NULL, p);
 }
+static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
+                          lc_error *error) {
+  int first = s->physical_claim_bytes == 0, rc;
+  if (first) {
+    rc = ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 1,
+                               error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  rc = ps_coordination_range(s->coordination, offset, bytes, 1, error);
+  if (rc == LC_OK)
+    s->physical_claim_bytes += bytes;
+  else if (first && ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET,
+                                          1, 0, NULL) != LC_OK) {
+    lc_error_cleanup(error);
+    rc = healthy(s, error);
+  }
+  return rc;
+}
+static int physical_release(ps_space *s, uint64_t offset, uint64_t bytes,
+                            lc_error *error) {
+  int rc;
+  /* Failed owners retain uncertain kernel ownership until FD close. Cleanup
+   * may discard local handles, but can never readmit an allocator on this FD.
+   */
+  if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+    return LC_OK;
+  rc = ps_coordination_range(s->coordination, offset, bytes, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  s->physical_claim_bytes -= bytes;
+  return s->physical_claim_bytes
+             ? LC_OK
+             : ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 0,
+                                     error);
+}
 /* Sorted free intervals. Their number follows fragmentation, not capacity.
  * Nodes are preallocated before irreversible metadata changes when needed. */
 static void interval_insert(ps_run **head, uint64_t *available, ps_run *node) {
@@ -419,13 +455,133 @@ static void interval_insert(ps_run **head, uint64_t *available, ps_run *node) {
   while (*link && (*link)->next) {
     next = (*link)->next;
     if ((*link)->offset + (*link)->bytes == next->offset &&
-        (*link)->clean == next->clean) {
+        (*link)->clean == next->clean && (*link)->claimed == next->claimed) {
       (*link)->bytes += next->bytes;
       (*link)->next = next->next;
       lc_free_with_allocator(NULL, next);
     } else
       link = &(*link)->next;
   }
+}
+void ps_internal_free_coalesce(ps_space *s) {
+  ps_run *run = s->free, *next;
+  while (run && run->next) {
+    next = run->next;
+    if (run->offset + run->bytes == next->offset && run->clean == next->clean &&
+        run->claimed == next->claimed) {
+      run->bytes += next->bytes;
+      run->next = next->next;
+      lc_free_with_allocator(NULL, next);
+    } else
+      run = next;
+  }
+}
+/* Physical claims belong to this process's OFD, with per-handle spending
+ * authority in budget.c. Keeping one fungible pool preserves allocation-free,
+ * syscall-free credit transfers and lets producers use prepared common runs
+ * while returning an equal amount of their protected pool. */
+static int budget_drop_ranges(ps_space *s, uint64_t bytes, ps_run **workspace,
+                              lc_error *error) {
+  ps_run *run, *tail = NULL;
+  uint64_t n;
+  int rc;
+  if (bytes > s->claimed_free_bytes)
+    return err(error, LC_ERR_PROTOCOL, "concrete payload claim mismatch");
+  if (bytes && bytes < s->claimed_free_bytes) {
+    if (workspace) {
+      tail = *workspace;
+      *workspace = NULL;
+    } else
+      tail = lc_calloc_with_allocator(NULL, 1, sizeof(*tail));
+    if (!tail)
+      return err(error, LC_ERR_NOMEM, "cannot split concrete payload claim");
+  }
+  for (run = s->free; bytes && run; run = run->next) {
+    if (run->claimed != 1)
+      continue;
+    n = bytes < run->bytes ? bytes : run->bytes;
+    rc = physical_release(s, run->offset, n, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, tail);
+      return rc;
+    }
+    if (n < run->bytes) {
+      *tail = *run;
+      tail->offset += n;
+      tail->bytes -= n;
+      run->bytes = n;
+      run->next = tail;
+      tail = NULL;
+    }
+    run->claimed = 0;
+    s->claimed_free_bytes -= n;
+    bytes -= n;
+  }
+  lc_free_with_allocator(NULL, tail);
+  return bytes ? err(error, LC_ERR_PROTOCOL, "concrete payload ranges lost")
+               : LC_OK;
+}
+int ps_internal_budget_ranges(ps_space *s, uint64_t target, ps_run **workspace,
+                              lc_error *error) {
+  ps_run *run, *tail;
+  uint64_t bytes, n;
+  int rc = LC_OK;
+  if (target == s->claimed_free_bytes)
+    return LC_OK;
+  if (target <= s->claimed_free_bytes) {
+    rc =
+        budget_drop_ranges(s, s->claimed_free_bytes - target, workspace, error);
+    ps_internal_free_coalesce(s);
+    return rc;
+  }
+  bytes = target - s->claimed_free_bytes;
+  for (run = s->free; bytes && run; run = run->next) {
+    if (run->claimed)
+      continue;
+    n = bytes < run->bytes ? bytes : run->bytes;
+    tail = NULL;
+    if (n < run->bytes) {
+      tail = lc_calloc_with_allocator(NULL, 1, sizeof(*tail));
+      if (!tail) {
+        rc = err(error, LC_ERR_NOMEM, "cannot assign concrete payload claim");
+        break;
+      }
+      *tail = *run;
+      tail->offset += n;
+      tail->bytes -= n;
+    }
+    rc = physical_claim(s, run->offset, n, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, tail);
+      break;
+    }
+    if (tail) {
+      run->next = tail;
+      run->bytes = n;
+    }
+    run->claimed = 2;
+    bytes -= n;
+  }
+  if (rc == LC_OK && bytes)
+    rc = err(error, LC_ERR_INVALID, "concrete payload capacity exhausted");
+  if (rc != LC_OK) {
+    for (run = s->free; run; run = run->next)
+      if (run->claimed == 2) {
+        (void)physical_release(s, run->offset, run->bytes, NULL);
+        run->claimed = 0;
+      }
+    if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+      lc_error_cleanup(error);
+      rc = healthy(s, error);
+    }
+  } else {
+    for (run = s->free; run; run = run->next)
+      if (run->claimed == 2)
+        run->claimed = 1;
+    s->claimed_free_bytes = target;
+  }
+  ps_internal_free_coalesce(s);
+  return rc;
 }
 static void free_insert(ps_space *s, ps_run *node) {
   if (node->offset < PS_DATA)
@@ -452,12 +608,18 @@ static void take_selected(ps_run **link, uint64_t *available, uint64_t bytes,
 }
 static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
                          uint64_t *out, int *clean, lc_error *error) {
-  ps_run **link = head;
-  while (*link && (*link)->bytes < *bytes)
-    link = &(*link)->next;
+  ps_run **link, **first = NULL;
+  for (link = head; *link; link = &(*link)->next) {
+    if ((*link)->claimed)
+      continue;
+    if (!first)
+      first = link;
+    if ((*link)->bytes >= *bytes)
+      break;
+  }
   /* Fragmentation must not strand usable pages behind a preferred run size. */
-  if (!*link && *head) {
-    link = head;
+  if (!*link && first) {
+    link = first;
     *bytes = (*link)->bytes;
   }
   if (!*link)
@@ -466,9 +628,56 @@ static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
   take_selected(link, available, *bytes, out, clean);
   return LC_OK;
 }
-static int take_run(ps_space *s, uint64_t *bytes, uint64_t *out,
-                    lc_error *error) {
-  return take_interval(&s->free, &s->free_bytes, bytes, out, NULL, error);
+static int take_payload_selected(ps_space *s, ps_budget *budget,
+                                 ps_run **choice, uint64_t reserved,
+                                 uint64_t funded, uint64_t *out, int *clean,
+                                 lc_error *error) {
+  uint64_t offset = (*choice)->offset;
+  int rc;
+  if ((*choice)->claimed == 1 && budget) {
+    if (reserved != funded || reserved > s->claimed_free_bytes)
+      return err(error, LC_ERR_PROTOCOL, "invalid concrete payload spend");
+    s->claimed_free_bytes -= funded; /* ownership moves to the writer */
+  } else {
+    rc = physical_claim(s, offset, reserved, error);
+    if (rc != LC_OK)
+      return rc;
+    if (budget) {
+      rc = budget_drop_ranges(s, funded, NULL, error);
+      if (rc != LC_OK) {
+        (void)physical_release(s, offset, reserved, NULL);
+        return rc;
+      }
+      /* Dropping an earlier claim may have split the predecessor link. */
+      for (choice = &s->free; *choice && (*choice)->offset != offset;
+           choice = &(*choice)->next) {
+      }
+      if (!*choice)
+        return err(error, LC_ERR_PROTOCOL, "payload selection changed");
+    }
+  }
+  take_selected(choice, &s->free_bytes, reserved, out, clean);
+  return LC_OK;
+}
+static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
+                        uint64_t *out, lc_error *error) {
+  ps_run **link, **first = NULL;
+  for (link = &s->free; *link; link = &(*link)->next) {
+    if ((*link)->claimed && !budget)
+      continue;
+    if (!first)
+      first = link;
+    if ((*link)->bytes >= *bytes)
+      break;
+  }
+  if (!*link && first) {
+    link = first;
+    *bytes = (*link)->bytes;
+  }
+  if (!*link)
+    return err(error, LC_ERR_INVALID, "payload capacity exhausted; grow");
+  return take_payload_selected(s, budget, link, *bytes, *bytes, out, NULL,
+                               error);
 }
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
@@ -496,6 +705,7 @@ static int exclude_selected(ps_run **link, uint64_t *available, uint64_t offset,
     tail->bytes = node->offset + node->bytes - tail->offset;
     tail->next = node->next;
     tail->clean = node->clean;
+    tail->claimed = node->claimed;
     node->next = tail;
   }
   *available -= bytes;
@@ -524,6 +734,29 @@ static uint64_t extent_mask(const ps_extent *extent) {
 static uint64_t extent_allocation(const ps_extent *extent) {
   return extent->flags & EXTENT_PACKED ? cell_count(extent->bytes) * PS_CELL
                                        : aligned(extent->bytes);
+}
+static int entry_release_claims(ps_space *s, ps_entry *p, lc_error *error) {
+  uint64_t offset = 0, bytes = 0, n;
+  size_t i;
+  int rc;
+  if (!p->payload_claimed)
+    return LC_OK;
+  for (i = 0; i < p->count; ++i) {
+    n = extent_allocation(&p->extents[i]);
+    if (bytes && offset + bytes != p->extents[i].offset) {
+      rc = physical_release(s, offset, bytes, error);
+      if (rc != LC_OK)
+        return rc;
+      bytes = 0;
+    }
+    if (!bytes)
+      offset = p->extents[i].offset;
+    bytes += n;
+  }
+  rc = bytes ? physical_release(s, offset, bytes, error) : LC_OK;
+  if (rc == LC_OK)
+    p->payload_claimed = 0;
+  return rc;
 }
 static uint64_t entry_storage(const ps_entry *p) {
   uint64_t bytes = 0;
@@ -656,6 +889,8 @@ static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
     node->next = list;
     list = node;
   }
+  if (rc == LC_OK)
+    rc = entry_release_claims(s, p, error);
   while (list) {
     node = list;
     list = node->next;
@@ -1316,7 +1551,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
   ps_payload_page *p = NULL;
   size_t count = cell_count(*bytes), bin, at;
   uint64_t mask, reserve = PS_PAGE;
-  int rc;
+  int rc, fresh = 0;
   for (bin = count; bin <= CELLS; ++bin)
     if (s->available[bin]) {
       p = s->available[bin];
@@ -1341,7 +1576,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
     p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
     if (!p)
       return err(error, LC_ERR_NOMEM, "cannot allocate packed payload page");
-    rc = take_run(s, &reserve, &p->run.offset, error);
+    rc = take_payload(s, budget, &reserve, &p->run.offset, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, p);
       return rc;
@@ -1349,15 +1584,32 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
     p->run.bytes = PS_PAGE;
     ps_internal_budget_spend(budget, PS_PAGE, 0, 0);
     payload_register(s, p);
+    fresh = 1;
   }
   for (at = 0; at + count <= CELLS; ++at) {
     mask = cell_mask(at, count);
     if (!(p->occupied & mask)) {
+      if (!fresh) {
+        rc = physical_claim(s, p->run.offset + at * PS_CELL, count * PS_CELL,
+                            error);
+        if (rc != LC_OK)
+          return rc;
+      }
       p->occupied |= mask;
       s->packed_bytes += count * PS_CELL;
       payload_available(s, p);
       extent->offset = p->run.offset + at * PS_CELL;
       extent->flags = EXTENT_PACKED;
+      if (fresh) {
+        if (at && (rc = physical_release(s, p->run.offset, at * PS_CELL,
+                                         error)) != LC_OK)
+          return rc;
+        if (at + count < CELLS &&
+            (rc = physical_release(s, p->run.offset + (at + count) * PS_CELL,
+                                   (CELLS - at - count) * PS_CELL, error)) !=
+                LC_OK)
+          return rc;
+      }
       return LC_OK;
     }
   }
@@ -2578,6 +2830,15 @@ int ps_close(ps_space *s, lc_error *error) {
 ps_coordination *ps_space_coordination(ps_space *s) {
   return s ? s->coordination : NULL;
 }
+int ps_space_private_active(ps_space *s, size_t cached_budgets) {
+  int active;
+  if (!s)
+    return 0;
+  pthread_mutex_lock(&s->mutex);
+  active = s->writers != 0 || s->budgets > cached_budgets;
+  pthread_mutex_unlock(&s->mutex);
+  return active;
+}
 static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
                        ps_writer **out, lc_error *error) {
   ps_writer *w;
@@ -2668,7 +2929,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
     } else {
       rc = immutable_extent_allowance(s, p, run_bytes, w->budget, error);
       if (rc == LC_OK)
-        rc = take_run(s, &run_bytes, &extent->offset, error);
+        rc = take_payload(s, w->budget, &run_bytes, &extent->offset, error);
       if (rc == LC_OK)
         ps_internal_budget_spend(w->budget, run_bytes, 0, 0);
     }
@@ -2678,6 +2939,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       extent->bytes = take;
       extent->crc = checksum(w->buffer + done, take);
       ++p->count;
+      p->payload_claimed = 1;
       p->bytes += take;
     }
     pthread_mutex_unlock(&s->mutex);
@@ -2766,6 +3028,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     dirty_entry(s, w->entry, old);
     install(s, w->entry);
     w->published = 1;
+    rc = entry_release_claims(s, w->entry, error);
     sequence = w->entry->publication_sequence;
     memcpy(published_ref.container, s->identity, 16);
     published_ref.incarnation = w->entry->token;
@@ -2904,6 +3167,11 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
       }
     }
     __atomic_store_n(&s->pending_sequence, sequence, __ATOMIC_RELEASE);
+    for (i = 0; i < count; ++i)
+      if (entry_release_claims(s, writers[i]->entry, error) != LC_OK) {
+        rc = healthy(s, error);
+        break;
+      }
   }
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && durable && (forced || mode == PS_COMMIT_DEFAULT))
@@ -3726,6 +3994,7 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->metadata_workspace_bytes = s->metadata_workspace;
   out->metadata_fallbacks = s->metadata_fallbacks;
   out->reserved_payload_bytes = s->reserved_payload;
+  out->claimed_payload_bytes = s->physical_claim_bytes;
   out->reserved_metadata_bytes = s->reserved_metadata;
   out->reserved_entries = s->reserved_entries;
   out->budgets = s->budgets;
@@ -3961,18 +4230,27 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
       partial = fit = NULL;
       choice = NULL;
       for (link = &s->free; *link; link = &(*link)->next) {
+        if ((*link)->claimed && !budget)
+          continue;
         if ((*link)->clean && (*link)->bytes >= bytes) {
           choice = link;
           break;
         }
         if ((*link)->clean && !partial)
           partial = link;
-        if ((*link)->bytes >= bytes && !fit)
+        if ((*link)->bytes >= bytes &&
+            (!fit || ((*fit)->claimed && !(*link)->claimed)))
           fit = link;
       }
       if (!choice)
-        choice = partial ? partial : fit ? fit : &s->free;
-      if (!*choice) {
+        choice = partial ? partial : fit;
+      if (!choice)
+        for (link = &s->free; *link; link = &(*link)->next)
+          if (!(*link)->claimed || budget) {
+            choice = link;
+            break;
+          }
+      if (!choice) {
         rc = err(error, LC_ERR_INVALID,
                  "owned payload capacity exhausted; grow");
         break;
@@ -3991,7 +4269,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   }
   if (rc == LC_OK) {
     reserved = bytes;
-    if (!(*choice)->clean && bytes < PS_MIB) {
+    if (!(*choice)->claimed && !(*choice)->clean && bytes < PS_MIB) {
       reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
       while (reserved > bytes) {
         rc = owned_preparation_allowance(s, budget, bytes, reserved, error);
@@ -4012,14 +4290,16 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     }
   }
   if (rc == LC_OK) {
-    take_selected(choice, &s->free_bytes, reserved, &p->extents[0].offset,
-                  &clean);
-    ps_internal_budget_spend(budget, bytes, 0, 0);
+    rc = take_payload_selected(s, budget, choice, reserved, bytes,
+                               &p->extents[0].offset, &clean, error);
+    if (rc == LC_OK)
+      ps_internal_budget_spend(budget, bytes, 0, 0);
   }
   if (rc == LC_OK) {
     p->token = s->token_next++;
     p->bytes = p->extents[0].bytes = reserved; /* entire private preparation */
     p->count = p->capacity = 1;
+    p->payload_claimed = 1;
     p->extents[0].flags = EXTENT_OWNED;
     register_entry(s, p);
     ++s->writers;
@@ -4060,6 +4340,9 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
     rc = healthy(s, error);
+  if (rc == LC_OK && spare)
+    rc = physical_release(s, p->extents[0].offset + bytes, reserved - bytes,
+                          error);
   if (rc == LC_OK) {
     p->bytes = p->extents[0].bytes = bytes;
     p->stream_capacity = bytes - PS_RUN_HEADER;
@@ -4089,11 +4372,14 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     dirty_entry(s, p, NULL);
     install(s, p);
-    ++p->pins;
-    ++s->readers;
-    run->space = s;
-    run->entry = p;
-    run->references = 1;
+    rc = entry_release_claims(s, p, error);
+    if (rc == LC_OK) {
+      ++p->pins;
+      ++s->readers;
+      run->space = s;
+      run->entry = p;
+      run->references = 1;
+    }
   } else {
     if (registered) {
       if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&

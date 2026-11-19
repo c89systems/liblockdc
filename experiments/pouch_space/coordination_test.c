@@ -1,10 +1,11 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+#include "budget.h"
 #include "coordination.h"
 #include "lc_api_internal.h"
 #include "namespace_metadata.h"
-#include <errno.h>
 #include <dirent.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -148,6 +149,14 @@ static void lifecycle(void) {
   ps_coordination_unlock(guard);
   ok(ps_close(space, &e), &e);
   space = NULL;
+
+  syscall_fault exclusive_calls = {0};
+  ps_coordination_io exclusive_io = {&exclusive_calls, guarded_fcntl};
+  ps_coordination *exclusive = owner_open(0, &exclusive_io, &e);
+  ok(ps_coordination_range(exclusive, PS_DATA, PS_PAGE, 1, &e), &e);
+  ok(ps_coordination_range(exclusive, PS_DATA, PS_PAGE, 0, &e), &e);
+  REQUIRE(exclusive_calls.calls == 0);
+  ok(ps_coordination_close(exclusive, &e), &e);
 
   int invalid_fd = file_open();
   ps_coordination_options invalid = {0};
@@ -310,6 +319,27 @@ static void root_lifetime(void) {
   REQUIRE(status.checkpoint_keys == 1);
   ps_namespace_release(ns);
   ps_coordination_unlock(guard);
+  for (int kind = 0; kind < 2; ++kind) {
+    ps_budget *budget = NULL;
+    ps_writer *writer = NULL;
+    if (!kind) {
+      ps_budget_plan plan = {PS_PAGE, 1024, 1, 0};
+      ok(ps_budget_open(ps_root_space(root), &plan, &budget, &e), &e);
+    } else {
+      ps_key private_key = {UINT64_MAX, 1, PS_STATE};
+      ok(ps_begin(ps_root_space(root), NULL, private_key, &writer, &e), &e);
+    }
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    REQUIRE(ps_root_close(root, &e) == LC_ERR_INVALID);
+    lc_error_cleanup(&e);
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.reserve_owners == before.reserve_owners &&
+            after.reserve_entries == before.reserve_entries &&
+            after.reserve_payload_bytes == before.reserve_payload_bytes &&
+            after.reserve_metadata_bytes == before.reserve_metadata_bytes);
+    ok(ps_budget_close(budget, &e), &e);
+    ps_writer_close(writer);
+  }
   ok(ps_root_close(root, &e), &e);
   ok(ps_root_open(path, 0, NULL, &root, &e), &e);
   ok(ps_root_namespace_acquire(root, "lease-owner", 0, &ns, &e), &e);

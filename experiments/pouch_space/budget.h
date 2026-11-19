@@ -2,7 +2,12 @@
 #define POUCH_SPACE_BUDGET_H
 #include "space.h"
 
-/* Volatile capacity claims, never a second journal or an ownership record.
+/* Volatile capacity claims, never a second journal or a persistent ledger.
+ * Payload credits protect concrete free ranges in the process-owned OFD pool.
+ * Spending transfers physical ownership to unpublished extents; publication
+ * or abort releases their kernel witnesses. No producer holds allocator
+ * authority while providing bytes. Same-process transfers move credit without
+ * changing this pool or making file-lock calls.
  * Plan the sum of physical page allocations and positive descriptor growth
  * across the complete operation. Replacements only charge positive growth.
  * Payload bytes must be page aligned. maintenance permits spending the
@@ -97,6 +102,8 @@ int ps_budget_transfer(ps_budget *, ps_budget *, const ps_budget_plan *,
  * space remains ordinary owned storage and is never refunded by resizing. */
 int ps_budget_resize(ps_budget *, const ps_budget_plan *, lc_error *);
 /* Fails without consuming the handle while a writer or grant preparation uses
- * it. Otherwise releases unspent credits, even after uncertain I/O. */
+ * it. Otherwise consumes the budget and releases unspent credits, even after
+ * uncertain I/O. Uncertain kernel release poisons space admission; cleanup can
+ * still finish, with remaining kernel ownership released at space close. */
 int ps_budget_close(ps_budget *, lc_error *);
 #endif
