@@ -1333,6 +1333,8 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
   put64(wire + 24, p->key.owner);
   put64(wire + 32, p->key.key);
   put64(wire + 40, p->token);
+  if (event == PS_STREAM_TAIL)
+    put64(wire + 48, p->bytes);
   if (event == PS_PUT || event == PS_SEAL) {
     put64(wire + 48, p->bytes);
     put32(wire + 56, (uint32_t)p->count);
@@ -2540,13 +2542,17 @@ static int write_journal_frame(ps_space *s, unsigned char *wire, size_t bytes,
 static int append_event_locked(ps_space *s, ps_entry *p, int event,
                                lc_error *error) {
   size_t bytes = event_bytes(p, event);
+  unsigned char tail_frame[128];
   unsigned char *wire;
   int rc;
   if (s->sequence == UINT64_MAX ||
       __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container publication sequence exhausted");
-  wire = lc_alloc_with_allocator(NULL, bytes + (s->journal_image ? 64 : 0));
+  wire =
+      event == PS_STREAM_TAIL
+          ? tail_frame
+          : lc_alloc_with_allocator(NULL, bytes + (s->journal_image ? 64 : 0));
   if (!wire)
     return err(error, LC_ERR_NOMEM, "cannot allocate publication metadata");
   rc = LC_OK;
@@ -2555,7 +2561,8 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
   encode_entry(wire, p, s->sequence + 1, event);
   if (rc == LC_OK)
     rc = write_journal_frame(s, wire, bytes, error);
-  lc_free_with_allocator(NULL, wire);
+  if (wire != tail_frame)
+    lc_free_with_allocator(NULL, wire);
   if (rc == LC_OK) {
     ++s->sequence;
     s->journal += bytes;
@@ -3160,6 +3167,33 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
   }
   return LC_OK;
 }
+/* A tail frame certifies a live append without turning a surviving hint
+ * into cold recovery authority. The canonical layer still checks bodies
+ * beyond the last checkpoint after the cohort ends. */
+static int apply_stream_tail(ps_space *s, const unsigned char *wire,
+                             size_t bytes, int select, lc_error *error) {
+  ps_key key;
+  ps_entry *head;
+  uint64_t tail = get64(wire + 48);
+  key.kind = get32(wire + 16);
+  key.owner = get64(wire + 24);
+  key.key = get64(wire + 32);
+  if (bytes != 64 || key.kind != PS_STREAM || get32(wire + 56) ||
+      get32(wire + 60) != checksum(wire, 60))
+    return err(error, LC_ERR_PROTOCOL, "invalid owned tail frame");
+  head = lookup(s, key);
+  if (!head || head->deleted || head->stream_sealed ||
+      head->token != get64(wire + 40) || tail < head->bytes ||
+      tail > head->stream_capacity)
+    return err(error, LC_ERR_PROTOCOL, "owned tail frame does not match head");
+  if (select) {
+    head->bytes = tail;
+    head->stream_wire = get64(wire + 8);
+    if (!head->dirty_link)
+      dirty_entry(s, head, NULL);
+  }
+  return LC_OK;
+}
 static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             size_t bytes, uint64_t certified, int staged,
                             lc_error *error) {
@@ -3173,6 +3207,12 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   if (certified <= s->sequence || !count || count > certified - s->sequence ||
       get64(wire + 8) != s->sequence + 1)
     return err(error, LC_ERR_PROTOCOL, "invalid certified journal framing");
+  if (!group && get32(wire + 20) == PS_STREAM_TAIL) {
+    rc = apply_stream_tail(s, wire, bytes, 1, error);
+    if (rc == LC_OK)
+      ++s->sequence;
+    return rc;
+  }
   key.kind = get32(wire + 16);
   key.owner = get64(wire + 24);
   key.key = get64(wire + 32);
@@ -3222,17 +3262,20 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
 static int replay_frame(ps_space *s, const unsigned char *prefix,
                         uint64_t certified, lc_error *error) {
   size_t bytes = get32(prefix + 4);
-  unsigned char *wire;
-  int rc;
+  unsigned char *body = NULL;
+  const unsigned char *wire = prefix;
+  int rc = LC_OK;
   if (bytes < 64 || bytes > PS_JOURNAL - s->journal)
     return err(error, LC_ERR_PROTOCOL, "invalid certified journal length");
-  wire = lc_alloc_with_allocator(NULL, bytes);
-  if (!wire)
-    return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
-  memcpy(wire, prefix, 64);
-  rc = bytes == 64 ? LC_OK
-                   : transfer(s, wire + 64, bytes - 64,
-                              JOURNAL_OFFSET + s->journal + 64, 0, error);
+  if (bytes > 64) {
+    body = lc_alloc_with_allocator(NULL, bytes);
+    if (!body)
+      return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
+    memcpy(body, prefix, 64);
+    rc = transfer(s, body + 64, bytes - 64, JOURNAL_OFFSET + s->journal + 64, 0,
+                  error);
+    wire = body;
+  }
   if (rc == LC_OK)
     rc = apply_peer_frame(s, wire, bytes, certified, 0, error);
   if (rc == LC_OK) {
@@ -3240,7 +3283,7 @@ static int replay_frame(ps_space *s, const unsigned char *prefix,
     s->journal += bytes;
     memset(s->journal_image + s->journal, 0, journal_end_marker(s->journal));
   }
-  lc_free_with_allocator(NULL, wire);
+  lc_free_with_allocator(NULL, body);
   return rc;
 }
 static int validate_owned_directory(ps_space *s, lc_error *error) {
@@ -3413,6 +3456,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
 static int recover(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire,
                                           *buffer;
+  ps_readiness_certificate certificate;
   const unsigned char *root;
   ps_directory *directory = NULL;
   metadata_recovery recovery;
@@ -3443,7 +3487,7 @@ static int recover(ps_space *s, lc_error *error) {
   s->directory.generation = get64(root + 40);
   s->token_limit = get64(root + 48);
   memcpy(s->identity, root + 56, 16);
-  rc = ps_readiness_validate(s, 0, error);
+  rc = ps_readiness_read(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
   if (s->maximum && s->capacity > s->maximum)
@@ -3497,6 +3541,20 @@ static int recover(ps_space *s, lc_error *error) {
       cursor += bytes;
       continue;
     }
+    if (get32(wire + cursor + 20) == PS_STREAM_TAIL) {
+      if (certificate.root && s->sequence >= certificate.ready)
+        break; /* An abandoned live hint must not become certified on open. */
+      rc = apply_stream_tail(
+          s, wire + cursor, bytes,
+          certificate.root && s->sequence >= certificate.origin, error);
+      if (rc != LC_OK) {
+        lc_error_cleanup(error);
+        break;
+      }
+      cursor += bytes;
+      ++s->sequence;
+      continue;
+    }
     rc = decode_entry(s, wire + cursor, bytes, &p, &event, error);
     if (rc == LC_ERR_NOMEM)
       goto done;
@@ -3523,7 +3581,7 @@ static int recover(ps_space *s, lc_error *error) {
     ++s->sequence;
   }
   s->journal = cursor;
-  rc = ps_readiness_validate(s, 1, error);
+  rc = ps_readiness_validate(s, error);
   if (rc != LC_OK)
     goto done;
   /* Clear all of the rejected tail, not only its first record: subsequent
@@ -3793,6 +3851,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->stream_runs = q->stream_runs;
         dest->stream_storage = q->stream_storage;
         dest->stream_sealed = q->stream_sealed;
+        dest->stream_wire = q->stream_wire;
         dest->bytes = q->bytes;
       }
     }
@@ -5728,11 +5787,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   p->key.owner = head->entry->token;
   p->key.key = base;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
-  if (rc == LC_OK)
-    rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK && guard)
-    rc = allocation_refresh(s, error);
+  rc = revision_begin(s, &guard, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
@@ -5826,6 +5881,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     registered = 1;
   }
   rc = allocation_end(s, guard, rc, error);
+  guard = NULL;
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && !clean)
     rc = initialize_range(s, p->extents[0].offset, reserved, zero, error);
@@ -5858,7 +5914,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   }
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
-    rc = healthy(s, error);
+    rc = revision_begin(s, &guard, error);
   if (rc == LC_OK && spare)
     rc = physical_release(s, p->extents[0].offset + bytes, reserved - bytes,
                           error);
@@ -5918,6 +5974,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     if (budget)
       --budget->users;
   }
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, zero);
   lc_free_with_allocator(NULL, spare);
@@ -6483,18 +6540,51 @@ int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
       run->space, run->entry->extents[0].offset + PS_RUN_HEADER + offset, bytes,
       scratch, error);
 }
-static void owned_publish_tail(ps_space *s, ps_owned_head *head, uint64_t tail,
-                               uint64_t sequence) {
-  head->entry->bytes = tail;
-  if (!head->entry->dirty_link)
-    dirty_entry(s, head->entry, NULL);
-  head->entry->stream_ready = sequence;
+static int owned_tail_allowed(ps_entry *p, uint64_t tail) {
+  return !p->deleted && !p->stream_sealed && tail >= p->bytes &&
+         tail <= p->stream_capacity;
+}
+static int owned_ready_sequence(ps_space *s, uint64_t *sequence,
+                                lc_error *error) {
+  if (__atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    return err(error, LC_ERR_TRANSPORT, "owned readiness exhausted; reopen");
+  }
+  *sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+  return LC_OK;
+}
+/* Payload writes and any logical selection have already finished. Only the
+ * ready boundary joins the shared journal, under allocation authority. */
+static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
+                              uint64_t *sequence, lc_error *error) {
+  int rc = LC_OK;
+  if (s->readiness && tail > head->bytes) {
+    ps_entry hint;
+    memset(&hint, 0, sizeof(hint));
+    hint.key = head->key;
+    hint.token = head->token;
+    hint.bytes = tail;
+    rc = append_event_locked(s, &hint, PS_STREAM_TAIL, error);
+    if (rc == LC_OK) {
+      *sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+      head->stream_wire = s->sequence;
+    }
+  } else if (!*sequence)
+    rc = owned_ready_sequence(s, sequence, error);
+  if (rc == LC_OK) {
+    head->bytes = tail;
+    if (!head->dirty_link)
+      dirty_entry(s, head, NULL);
+    head->stream_ready = *sequence;
+  }
+  return rc;
 }
 int ps_owned_commit(ps_owned_head *head, uint64_t tail,
                     enum ps_commit_mode mode, ps_commit_publish_fn publish,
                     void *context, lc_error *error) {
   ps_space *s;
-  uint64_t sequence = 0;
+  ps_coordination_guard *guard;
+  uint64_t sequence = 0, previous;
   int rc;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned commit requires head");
@@ -6502,36 +6592,43 @@ int ps_owned_commit(ps_owned_head *head, uint64_t tail,
     return err(error, LC_ERR_INVALID, "invalid canonical commit mode");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
-  if (rc == LC_OK &&
-      (head->entry->deleted || head->entry->stream_sealed ||
-       tail < head->entry->bytes || tail > head->entry->stream_capacity))
+  rc = ps_internal_capture_begin(s, &guard, error);
+  previous = head->entry->bytes;
+  if (rc == LC_OK && !owned_tail_allowed(head->entry, tail))
     rc = err(error, LC_ERR_INVALID, "owned commit tail outside append range");
-  if (rc == LC_OK &&
-      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
-    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-    rc = err(error, LC_ERR_TRANSPORT, "owned readiness exhausted; reopen");
-  }
-  if (rc == LC_OK) {
-    sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
-    if (!publish)
-      owned_publish_tail(s, head, tail, sequence);
-  }
+  if (rc == LC_OK)
+    rc = publish ? owned_ready_sequence(s, &sequence, error)
+                 : owned_publish_tail(s, head->entry, tail, &sequence, error);
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && publish) {
     rc = publish(context, tail, error);
-    pthread_mutex_lock(&s->mutex);
-    if (rc == LC_OK)
-      rc = healthy(s, error);
-    if (rc == LC_OK && s->durable &&
-        __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) < sequence) {
-      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-      rc = err(error, LC_ERR_PROTOCOL,
-               "logical publication did not cover prepared canonical bytes");
+    if (rc == LC_OK) {
+      pthread_mutex_lock(&s->mutex);
+      rc = ps_internal_capture_begin(s, &guard, error);
+      if (rc == LC_OK && s->durable &&
+          __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) < sequence)
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "logical publication did not cover prepared canonical bytes");
+      if (rc == LC_OK && (!owned_tail_allowed(head->entry, tail) ||
+                          head->entry->bytes != previous))
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "owned tail changed during logical publication");
+      if (rc == LC_OK)
+        rc = owned_publish_tail(s, head->entry, tail, &sequence, error);
+      rc = allocation_end(s, guard, rc, error);
+      /* The logical selection already succeeded. Abort cleanup must never
+       * clear its bytes, even if publishing the live hint failed. */
+      if (rc != LC_OK) {
+        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+        if (rc == LC_ERR_PENDING || rc == LC_ERR_NOMEM) {
+          lc_error_cleanup(error);
+          rc = err(error, LC_ERR_TRANSPORT,
+                   "logical selection completed; reopen to recover its tail");
+        }
+      }
+      pthread_mutex_unlock(&s->mutex);
     }
-    if (rc == LC_OK)
-      owned_publish_tail(s, head, tail, sequence);
-    pthread_mutex_unlock(&s->mutex);
   } else if (rc == LC_OK && s->durable && mode == PS_COMMIT_DEFAULT)
     rc = wait_durable(s, sequence, error);
   return rc;
@@ -6542,53 +6639,55 @@ int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
 }
 int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   ps_space *s;
-  uint64_t sequence = 0;
+  ps_coordination_guard *guard;
+  uint64_t sequence = 0, previous;
   int rc;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned recovery requires head");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
-  if (rc == LC_OK &&
-      (head->entry->deleted || head->entry->stream_sealed ||
-       tail < head->entry->bytes || tail > head->entry->stream_capacity))
+  rc = ps_internal_capture_begin(s, &guard, error);
+  previous = head->entry->bytes;
+  if (rc == LC_OK && !owned_tail_allowed(head->entry, tail))
     rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
-  if (rc == LC_OK &&
-      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
-    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-    rc = err(error, LC_ERR_TRANSPORT, "recovery readiness exhausted; reopen");
-  }
   if (rc == LC_OK)
-    sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+    rc = owned_ready_sequence(s, &sequence, error);
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
     rc = wait_durable(s, sequence, error);
-  pthread_mutex_lock(&s->mutex);
-  if (rc == LC_OK)
-    rc = healthy(s, error);
   if (rc == LC_OK) {
-    head->entry->bytes = tail;
-    if (!head->entry->dirty_link)
-      dirty_entry(s, head->entry, NULL);
+    pthread_mutex_lock(&s->mutex);
+    rc = ps_internal_capture_begin(s, &guard, error);
+    if (rc == LC_OK && (!owned_tail_allowed(head->entry, tail) ||
+                        head->entry->bytes != previous))
+      rc = err(error, LC_ERR_PENDING, "owned stream changed during recovery");
+    if (rc == LC_OK)
+      rc = owned_publish_tail(s, head->entry, tail, &sequence, error);
+    rc = allocation_end(s, guard, rc, error);
+    pthread_mutex_unlock(&s->mutex);
   }
-  pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 int ps_owned_seal(ps_owned_head *head, lc_error *error) {
   ps_space *s;
   ps_entry snapshot;
-  uint64_t sequence = 0;
+  ps_coordination_guard *guard;
+  uint64_t sequence = 0, tail;
   int rc, sealed, needs_sync;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned seal requires head");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   sealed = head->entry->stream_sealed;
+  tail = head->entry->bytes;
   needs_sync = head->entry->stream_ready >
-               __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+                   __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) ||
+               head->entry->stream_wire > s->peer_durable;
   if (rc == LC_OK && head->entry->deleted)
     rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK || sealed)
     return rc;
@@ -6596,22 +6695,29 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
    * canonical tail must already be durable, even if journal bytes reorder. */
   if (needs_sync)
     rc = sync_file(s, error);
+  if (rc != LC_OK)
+    return rc;
   pthread_mutex_lock(&s->mutex);
-  if (rc == LC_OK)
-    rc = healthy(s, error);
-  if (rc == LC_OK) {
+  rc = ps_internal_capture_begin(s, &guard, error);
+  if (rc == LC_OK && head->entry->deleted)
+    rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
+  if (rc == LC_OK && head->entry->bytes != tail)
+    rc = err(error, LC_ERR_PENDING, "owned stream advanced during seal");
+  sealed = head->entry->stream_sealed;
+  if (rc == LC_OK && !sealed) {
     snapshot = *head->entry;
     snapshot.stream_sealed = 1;
-    rc = append_event(s, &snapshot, PS_SEAL, error);
+    rc = append_event_locked(s, &snapshot, PS_SEAL, error);
   }
-  if (rc == LC_OK) {
+  if (rc == LC_OK && !sealed) {
     head->entry->stream_sealed = 1;
     if (!head->entry->dirty_link)
       dirty_entry(s, head->entry, NULL);
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
   }
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+  return rc == LC_OK && sequence ? wait_durable(s, sequence, error) : rc;
 }
 int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
   ps_space *s;

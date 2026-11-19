@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, shared journal durability certificates, and [live checkpoint and tail adoption](#live-checkpoint-and-tail-adoption) | Shared capacity forecasts, owned-stream readiness, logical ownership and cache coherence, and normal shared admission |
+| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, live checkpoint and journal adoption, and [shared owned-stream readiness](#live-owned-stream-readiness) | Shared capacity forecasts, canonical append and recovery authority, logical cache coherence, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6444,3 +6444,68 @@ Logs and the frozen `a2637878` benchmark are in
 `build/pouch-space-tail-adoption/`. Shared owned-stream readiness and
 namespace authority still gate a shared Pouch open. The measured indexed
 workloads remain outside performance acceptance.
+
+## Live owned-stream readiness
+
+A shared owner publishes an advancing completed stream tail in a 64-byte
+frame in the bounded physical journal. The frame names the head incarnation,
+and replay checks it against the current grants. Publication follows payload
+completion and any logical selection callback. Same-generation replay needs
+no heap allocation or payload read for the frame. A peer can also carry the
+tail into a new checkpoint with its ordinary durability barriers.
+
+The tail frame participates in the shared ready and durable prefixes. Its
+readiness permits a live peer to observe completed bytes. Default durable
+commit waits for the covering barrier, and sealing an imported tail
+stabilizes any outstanding bytes before writing the seal. Readers with
+existing handles observe the reconciled tail after refresh. Exclusive
+owners retain the local tail and their original journal traffic.
+
+Cold physical recovery treats live tail frames as hints and retains the
+checkpoint boundary for canonical validation. The certificate records the
+wire sequence at which the current cohort started. This keeps old hints
+visible to the journal parser while excluding them from selection by warm
+joiners. A warm reopen can adopt hints certified by its cohort and truncates
+an abandoned hint at the end of its ready prefix. Use matching builds for
+live participants.
+
+When logical selection succeeds and the tail write subsequently fails, the
+owner stops serving new calls. Writer cleanup preserves the selected bytes,
+and canonical recovery can reconstruct the tail. Stream grant completion
+reconciles peers before rechecking the privately prepared grant against the
+selected head and base. Payload preparation and logical callbacks remain
+outside allocation authority.
+
+All 70 affected groups passed on Debug, GNU release and musl release. Six
+ThreadSanitizer profiles and six strict Memcheck profiles passed. The process
+round trip holds the reader at the old tail while the writer has already
+written the next byte, verifies the new tail after publication, and repeats
+with a killed publisher. The other fixtures cover both durability policies,
+callback rejection, checkpoint rollover, preserved earlier pointers, peer
+seal ordering, partial and complete failed writes, and cold and warm reopen
+with a shorter canonically accepted tail. The callback fault test verifies
+the selected value and the associated stream bytes after writer cleanup.
+
+All 36 ordinary GNU lifecycle runs verified their reopened results. The
+figures are median milliseconds for `fee2bc71` native / current native /
+multifile. The two profiles use 10 MiB initial capacity and two rounds of
+streamed mutations, with 16 one-KiB records and two writers or 48 four-KiB
+records and four writers.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 60.85 / 48.12 / 19.76 | 577.54 / 574.88 / 460.07 | 77.60 / 75.33 / 30.89 | 1359.00 / 1378.19 / 1412.26 |
+| Maximum worker index flush | 22.33 / 18.41 / 0.85 | 15.38 / 15.60 / 1.31 | 28.63 / 29.88 / 2.70 | 17.09 / 17.99 / 3.60 |
+| Maintenance | 7.21 / 8.71 / 0.24 | 6.62 / 6.42 / 0.23 | 6.71 / 10.08 / 0.41 | 6.57 / 7.37 / 0.37 |
+| Close | 0.35 / 0.40 / 32.98 | 0.32 / 0.30 / 34.44 | 1.04 / 1.00 / 61.60 | 0.79 / 0.75 / 78.64 |
+| Reopen | 3.44 / 3.47 / 0.73 | 2.97 / 3.97 / 1.07 | 4.54 / 5.84 / 2.02 | 4.83 / 4.26 / 1.91 |
+
+These SDK timings use exclusive admission. Ordinary NoSync index flushes
+retain their different canonical durability boundaries. Native NoSync work
+remains about 2.4 times multifile in these runs. Logs and the frozen baseline
+are in `build/pouch-space-stream-readiness/`.
+
+Shared physical stream readiness is available under caller-supplied
+same-stream exclusion. Shared SDK admission still requires canonical append
+and recovery authority, including refresh and revalidation of namespace
+state before a peer makes a lease, lock or transactional messaging decision.

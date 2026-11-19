@@ -8,7 +8,7 @@
 
 #define READY_MAGIC UINT64_C(0x3159444145525350)
 #define MEMBER_OFFSET 3U
-#define WORDS 8U
+#define WORDS PS_READINESS_WORDS
 enum readiness_word {
   GENERATION,
   MAGIC,
@@ -16,6 +16,7 @@ enum readiness_word {
   READY = IDENTITY + 2,
   DURABLE,
   ROOT,
+  ORIGIN,
   CRC
 };
 /* Each slot has an atomic commit generation followed by a checked record.
@@ -45,7 +46,7 @@ static int slot_read(const uint64_t *source, uint64_t *record) {
     record[i] = __atomic_load_n(source + i, __ATOMIC_RELAXED);
   if (__atomic_load_n(source, __ATOMIC_ACQUIRE) != generation ||
       record[MAGIC] != READY_MAGIC || record[DURABLE] > record[READY] ||
-      record[CRC] != record_crc(record))
+      record[ORIGIN] > record[DURABLE] || record[CRC] != record_crc(record))
     return -1;
   return 1;
 }
@@ -121,7 +122,7 @@ void ps_readiness_close(ps_space *s) {
     lc_free_with_allocator(NULL, s->readiness);
   }
 }
-int ps_readiness_validate(ps_space *s, int prefix, lc_error *e) {
+int ps_readiness_validate(ps_space *s, lc_error *e) {
   uint64_t record[WORDS];
   int selected, rc;
   if (!s->readiness || !s->readiness->existing)
@@ -129,7 +130,7 @@ int ps_readiness_validate(ps_space *s, int prefix, lc_error *e) {
   rc = current(s, record, &selected, e);
   if (rc == LC_OK)
     rc = identity(s, record, e);
-  if (rc == LC_OK && prefix &&
+  if (rc == LC_OK &&
       (record[READY] > s->sequence || record[ROOT] > s->generation))
     rc = failed(s, e, "recovery would discard a live certified prefix");
   return rc;
@@ -151,6 +152,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   } else {
     __atomic_store_n(s->readiness->page, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
+    record[ORIGIN] = s->sequence;
   }
   record[MAGIC] = READY_MAGIC;
   memcpy(record + IDENTITY, s->identity, 16);
@@ -169,17 +171,18 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
   uint64_t record[WORDS];
   int selected, rc;
   memset(out, 0, sizeof(*out));
-  if (!s->readiness || !s->readiness->active)
+  if (!s->readiness || (!s->readiness->active && !s->readiness->existing))
     return LC_OK;
   rc = current(s, record, &selected, e);
   if (rc == LC_OK)
     rc = identity(s, record, e);
-  if (rc == LC_OK && record[READY] < s->sequence)
+  if (rc == LC_OK && s->readiness->active && record[READY] < s->sequence)
     rc = failed(s, e, "shared ready journal prefix regressed");
   if (rc == LC_OK) {
     out->ready = record[READY];
     out->durable = record[DURABLE];
     out->root = record[ROOT];
+    out->origin = record[ORIGIN];
   }
   return rc;
 }

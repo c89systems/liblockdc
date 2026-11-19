@@ -113,11 +113,12 @@ int ps_owned_piece_verify(ps_owned_run *, uint64_t bytes, void *scratch,
  * the range. scratch points to PS_CHUNK bytes for the bounded fallback. */
 int ps_owned_clear(ps_owned_run *, uint64_t offset, uint64_t bytes,
                    void *scratch, lc_error *);
-/* Complete canonical bytes precede this call. Head tail checkpoints are
- * structural hints, not a second per-record commit journal. Default durable
- * success waits for the shared root readiness prefix, independently of journal
- * seq. DEFER_SYNC requires the caller's later flush; publisher callbacks still
- * have to establish the durable dependency coverage on durable roots. */
+/* Complete canonical bytes precede this call. Shared participants certify a
+ * tail by incarnation for live peers. Cold owners still validate the suffix
+ * through canonical recovery. The caller excludes competing writes to the same
+ * stream for the whole append. Default durable success waits for publication
+ * coverage. DEFER_SYNC requires the caller's later flush. Publisher callbacks
+ * establish durable dependency coverage before the shared hint is exposed. */
 int ps_owned_commit(ps_owned_head *, uint64_t tail, enum ps_commit_mode,
                     ps_commit_publish_fn, void *, lc_error *);
 int ps_owned_barrier(ps_owned_head *, lc_error *);

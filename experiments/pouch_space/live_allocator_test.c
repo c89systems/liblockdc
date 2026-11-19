@@ -3,6 +3,7 @@
 #include "lc_api_internal.h"
 #include "revision.h"
 #include "space_internal.h"
+#include "stream.h"
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2162,21 +2163,25 @@ static void readiness_cohort(void) {
   ok(ps_reader_import(path, ticket, ticket_bytes, &imported, &e), &e);
   ps_reader_close(source);
   free(ticket);
-  uint64_t records[16], zero = 0;
+  uint64_t records[2 * PS_READINESS_WORDS], zero = 0;
   REQUIRE(pread(a->fd, records, sizeof(records), PS_READINESS_OFFSET) ==
           sizeof(records));
-  size_t selected = records[0] > records[8] ? 0 : 8;
+  size_t selected =
+      records[0] > records[PS_READINESS_WORDS] ? 0 : PS_READINESS_WORDS;
+  size_t older = PS_READINESS_WORDS - selected;
   /* Interrupted overwrite of the older slot leaves the selected record. */
   REQUIRE(pwrite(a->fd, &zero, sizeof(zero),
-                 PS_READINESS_OFFSET + (8 - selected) * 8) == sizeof(zero));
+                 PS_READINESS_OFFSET + older * sizeof(zero)) == sizeof(zero));
   REQUIRE(readiness(a).ready == certificate.ready);
   /* A committed slot with a bad checksum cannot fall back to an older slot. */
-  size_t older = 8 - selected;
-  REQUIRE(pwrite(a->fd, records + older, 8 * sizeof(zero),
-                 PS_READINESS_OFFSET + older * 8) == 8 * sizeof(zero));
-  uint64_t damaged = records[selected + 7] ^ 1;
+  REQUIRE(pwrite(a->fd, records + older, PS_READINESS_WORDS * sizeof(zero),
+                 PS_READINESS_OFFSET + older * sizeof(zero)) ==
+          PS_READINESS_WORDS * sizeof(zero));
+  size_t crc = selected + PS_READINESS_WORDS - 1;
+  uint64_t damaged = records[crc] ^ 1;
   REQUIRE(pwrite(a->fd, &damaged, sizeof(damaged),
-                 PS_READINESS_OFFSET + (selected + 7) * 8) == sizeof(damaged));
+                 PS_READINESS_OFFSET + crc * sizeof(damaged)) ==
+          sizeof(damaged));
   REQUIRE(ps_refresh(a, &e) == LC_ERR_TRANSPORT);
   lc_error_cleanup(&e);
   REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
@@ -2570,12 +2575,35 @@ static void journal_replay_faults(void) {
   }
   fprintf(stderr, "journal replay allocated at %zu fault sites\n", sites);
 }
+static ps_key tail_stream(void) {
+  ps_key result = {88, 110, PS_STREAM};
+  return result;
+}
+static void expect_tail(ps_owned_head *head, uint64_t bytes, int sealed) {
+  lc_error e = {0};
+  ps_owned_status info;
+  ok(ps_owned_status_get(head, &info, &e), &e);
+  REQUIRE(info.tail == bytes && info.sealed == sealed && !info.retired);
+}
 static void journal_replay_child(int notify, int proceed) {
   lc_error e = {0};
   ps_space *b = NULL;
   ps_writer *writers[2];
+  ps_owned_head *head = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status info;
   char message;
+  int found;
   ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_owned_open(b, NULL, tail_stream(), 0, NULL, &head, &info, &e), &e);
+  ok(ps_owned_grant(head, NULL, 0, 0, &run, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_owned_write(run, 0, "x", 1, &e), &e);
+  REQUIRE(write(notify, "W", 1) == 1 && read(proceed, &message, 1) == 1);
+  REQUIRE(message == 'C');
+  ok(ps_owned_commit(head, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_owned_run_close(run);
+  ps_owned_close(head);
   writers[0] = replay_value(b, key(1), 31, PS_CHUNK, &e);
   writers[1] = replay_value(b, key(2), 32, 65, &e);
   ok(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
@@ -2592,7 +2620,16 @@ static void journal_replay_process(void) {
   ps_space *a = NULL;
   for (int killed = 0; killed < 2; ++killed) {
     int notify[2], proceed[2], exited;
+    ps_owned_head *observer = NULL;
+    ps_owned_run *run = NULL;
+    ps_owned_status info;
+    int found;
     ok(ps_open(path, 1, NULL, &a, &e), &e);
+    ok(ps_owned_open(a, NULL, tail_stream(), 1, NULL, &observer, &info, &e),
+       &e);
+    ok(ps_owned_grant(observer, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+    REQUIRE(found);
+    ok(ps_checkpoint(a, &e), &e);
     REQUIRE(pipe(notify) == 0 && pipe(proceed) == 0);
     pid_t child = fork();
     REQUIRE(child >= 0);
@@ -2607,12 +2644,19 @@ static void journal_replay_process(void) {
     }
     REQUIRE(!close(notify[1]) && !close(proceed[0]));
     char message;
+    REQUIRE(read(notify[0], &message, 1) == 1 && message == 'W');
+    ok(ps_refresh(a, &e), &e);
+    expect_tail(observer, 0, 0);
+    REQUIRE(write(proceed[1], "C", 1) == 1);
     REQUIRE(read(notify[0], &message, 1) == 1 && message == 'R');
     if (killed)
       REQUIRE(kill(child, SIGKILL) == 0);
     uint64_t generation = a->generation;
     expect_value(a, key(1), PS_CHUNK, 31);
     expect_value(a, key(2), 65, 32);
+    expect_tail(observer, 1, 0);
+    ok(ps_owned_read(run, 0, &message, 1, &e), &e);
+    REQUIRE(message == 'x');
     capture_put(a, 3, 65);
     REQUIRE(a->generation == generation);
     if (!killed)
@@ -2621,6 +2665,8 @@ static void journal_replay_process(void) {
     REQUIRE(killed ? WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL
                    : WIFEXITED(exited) && WEXITSTATUS(exited) == 0);
     REQUIRE(!close(notify[0]) && !close(proceed[1]));
+    ps_owned_run_close(run);
+    ps_owned_close(observer);
     ok(ps_flush(a, &e), &e);
     ok(ps_close(a, &e), &e);
     ok(ps_open(path, 0, NULL, &a, &e), &e);
@@ -2713,6 +2759,255 @@ static void journal_replay_structural(void) {
   replay_structural(0);
   replay_structural(1);
 }
+typedef struct tail_callback {
+  ps_space *owner, *peer;
+  ps_owned_head *observer;
+  size_t calls;
+  int reject;
+} tail_callback;
+static int tail_publish(void *context, uint64_t tail, lc_error *e) {
+  tail_callback *state = context;
+  ++state->calls;
+  REQUIRE(tail == 3);
+  ok(ps_refresh(state->peer, e), e);
+  expect_tail(state->observer, 2, 0);
+  if (state->reject)
+    return LC_ERR_PENDING;
+  capture_put(state->peer, 11, 65);
+  return ps_flush(state->owner, e);
+}
+static void owned_stream_readiness(void) {
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_options options = {0};
+    ps_space *a = NULL, *b = NULL;
+    ps_owned_head *owner = NULL, *observer = NULL;
+    ps_owned_run *run = NULL, *captured = NULL;
+    ps_owned_status info;
+    unsigned char observed[4] = {0};
+    int found;
+    options.durable_sync = durable;
+    ok(ps_open(path, 1, &options, &a, &e), &e);
+    ok(ps_owned_open(a, NULL, tail_stream(), 1, NULL, &owner, &info, &e), &e);
+    ok(ps_owned_grant(owner, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+    REQUIRE(found);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_owned_write(run, 0, "ab", 2, &e), &e);
+    ok(ps_owned_commit(owner, 2, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    ok(ps_owned_open(b, NULL, tail_stream(), 0, &info.ref, &observer, &info,
+                     &e),
+       &e);
+    expect_tail(observer, 2, 0);
+    ok(ps_owned_grant(observer, NULL, 0, 0, &captured, &found, &e), &e);
+    REQUIRE(found);
+    uint64_t selected, stable;
+    ok(ps_publication_prefix(b, &selected, &stable, &e), &e);
+    uint64_t wire = readiness(a).ready;
+    ok(ps_owned_write(run, 2, "c", 1, &e), &e);
+    tail_callback callback = {a, b, observer, 0, 1};
+    REQUIRE(ps_owned_commit(owner, 3, PS_COMMIT_DEFAULT, tail_publish,
+                            &callback, &e) == LC_ERR_PENDING);
+    REQUIRE(callback.calls == 1 && readiness(a).ready == wire);
+    expect_tail(owner, 2, 0);
+    callback.reject = 0;
+    ok(ps_owned_commit(owner, 3, PS_COMMIT_DEFAULT, tail_publish, &callback,
+                       &e),
+       &e);
+    REQUIRE(callback.calls == 2);
+    allocations = 0;
+    measuring = 1;
+    int rc = ps_refresh(b, &e);
+    measuring = 0;
+    ok(rc, &e);
+    REQUIRE(!allocations);
+    expect_tail(observer, 3, 0);
+    uint64_t peer_selected, peer_stable;
+    ok(ps_publication_prefix(b, &peer_selected, &peer_stable, &e), &e);
+    REQUIRE(peer_selected == selected + 1 && peer_stable >= stable);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_owned_write(run, 3, "d", 1, &e), &e);
+    ok(ps_owned_commit(owner, 4, PS_COMMIT_DEFER_SYNC, NULL, NULL, &e), &e);
+    ok(ps_refresh(b, &e), &e);
+    expect_tail(observer, 4, 0);
+    ok(ps_owned_read(captured, 0, observed, sizeof(observed), &e), &e);
+    REQUIRE(!memcmp(observed, "abcd", sizeof(observed)));
+    REQUIRE(readiness(b).durable < readiness(b).ready);
+    uint64_t syncs = status(b).syncs;
+    ok(ps_owned_seal(observer, &e), &e);
+    REQUIRE(status(b).syncs == syncs + 2);
+    ok(ps_refresh(a, &e), &e);
+    expect_tail(owner, 4, 1);
+    ps_owned_run_close(captured);
+    ps_owned_run_close(run);
+    ps_owned_close(observer);
+    ps_owned_close(owner);
+    ok(ps_close(b, &e), &e);
+    ok(ps_close(a, &e), &e);
+    ok(ps_open(path, 0, NULL, &a, &e), &e);
+    ok(ps_owned_open(a, NULL, tail_stream(), 0, NULL, &owner, &info, &e), &e);
+    expect_tail(owner, 4, 1);
+    expect_value(a, key(11), 65, 11);
+    ps_owned_close(owner);
+    ok(ps_close(a, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
+static void owned_stream_cold(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *owner = NULL, *observer = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status info;
+  int found;
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  ok(ps_owned_open(a, NULL, tail_stream(), 1, NULL, &owner, &info, &e), &e);
+  ok(ps_owned_grant(owner, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_owned_write(run, 0, "abc", 3, &e), &e);
+  ok(ps_owned_commit(owner, 3, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  capture_put(a, 11, 65);
+  ok(ps_flush(a, &e), &e);
+  ps_owned_run_close(run);
+  ps_owned_close(owner);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ok(ps_owned_open(a, NULL, tail_stream(), 0, NULL, &owner, &info, &e), &e);
+  expect_tail(owner, 0, 0);
+  expect_value(a, key(11), 65, 11);
+  ok(ps_owned_grant(owner, NULL, 0, 0, &run, &found, &e), &e);
+  REQUIRE(found);
+  /* A complete old hint survived. Canonical recovery accepts a shorter
+   * prefix and publishes its result to the new cohort. */
+  ok(ps_owned_recovered(owner, 1, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_owned_open(b, NULL, tail_stream(), 0, NULL, &observer, &info, &e), &e);
+  expect_tail(observer, 1, 0);
+  expect_value(b, key(11), 65, 11);
+  ps_owned_run_close(run);
+  ps_owned_close(owner);
+  ps_owned_close(observer);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+typedef struct tail_write_fault {
+  size_t persist, fired;
+} tail_write_fault;
+static ssize_t tail_partial_write(void *context, int fd, const void *p,
+                                  size_t n, off_t offset) {
+  tail_write_fault *fault = context;
+  if (fault->persist && n == 128 && offset >= PS_JOURNAL_OFFSET &&
+      offset < PS_JOURNAL_OFFSET + PS_JOURNAL) {
+    REQUIRE(pwrite(fd, p, fault->persist, offset) == (ssize_t)fault->persist);
+    ++fault->fired;
+    errno = EIO;
+    return -1;
+  }
+  return pwrite(fd, p, n, offset);
+}
+typedef struct tail_selection {
+  ps_space *space;
+  tail_write_fault *fault;
+} tail_selection;
+static int tail_select(void *context, uint64_t tail, lc_error *e) {
+  tail_selection *selection = context;
+  REQUIRE(tail == 3);
+  capture_put(selection->space, 11, 65);
+  ok(ps_flush(selection->space, e), e);
+  selection->fault->persist = 128;
+  return LC_OK;
+}
+static void owned_stream_selected_fault(void) {
+  lc_error e = {0};
+  tail_write_fault failure = {0};
+  ps_io io = {&failure, read_io, tail_partial_write, sync_io, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  ps_owned_head *observer = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status info;
+  unsigned char body[3];
+  int found;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 1, NULL, NULL, NULL, &stream, &e),
+     &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_stream_begin(stream, &writer, &e), &e);
+  ok(ps_stream_write(writer, "abc", 3, &e), &e);
+  tail_selection selection = {a, &failure};
+  REQUIRE(ps_stream_commit(writer, PS_COMMIT_DEFAULT, tail_select, &selection,
+                           &e) == LC_ERR_TRANSPORT);
+  lc_error_cleanup(&e);
+  REQUIRE(failure.fired == 1);
+  ps_stream_writer_close(writer);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  expect_value(b, key(11), 65, 11);
+  ok(ps_owned_open(b, NULL, tail_stream(), 0, NULL, &observer, &info, &e), &e);
+  expect_tail(observer, 0, 0);
+  ok(ps_owned_grant(observer, NULL, 0, 0, &run, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_owned_read(run, 0, body, sizeof(body), &e), &e);
+  REQUIRE(!memcmp(body, "abc", sizeof(body)));
+  ps_owned_run_close(run);
+  ps_owned_close(observer);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void owned_stream_faults(void) {
+  for (size_t bytes = 32; bytes <= 128; bytes *= 2) {
+    lc_error e = {0};
+    tail_write_fault failure = {0};
+    ps_io io = {&failure, read_io,    tail_partial_write,
+                sync_io,  reserve_io, NULL};
+    ps_options options = {0};
+    ps_space *a = NULL, *b = NULL;
+    ps_owned_head *owner = NULL, *observer = NULL;
+    ps_owned_run *run = NULL;
+    ps_owned_status info;
+    int found;
+    options.io = &io;
+    ok(ps_open(path, 1, &options, &a, &e), &e);
+    ok(ps_owned_open(a, NULL, tail_stream(), 1, NULL, &owner, &info, &e), &e);
+    ok(ps_owned_grant(owner, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+    REQUIRE(found);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    ok(ps_owned_open(b, NULL, tail_stream(), 0, NULL, &observer, &info, &e),
+       &e);
+    ok(ps_owned_write(run, 0, "x", 1, &e), &e);
+    failure.persist = bytes;
+    REQUIRE(ps_owned_commit(owner, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e) ==
+            LC_ERR_TRANSPORT);
+    lc_error_cleanup(&e);
+    REQUIRE(failure.fired == 1);
+    REQUIRE(ps_refresh(b, &e) == LC_ERR_PENDING);
+    lc_error_cleanup(&e);
+    expect_tail(observer, 0, 0);
+    ps_owned_run_close(run);
+    ps_owned_close(owner);
+    ok(ps_close(a, &e), &e);
+    ok(ps_open(path, 0, NULL, &a, &e), &e);
+    ok(ps_refresh(b, &e), &e);
+    expect_tail(observer, 0, 0);
+    ok(ps_owned_open(a, NULL, tail_stream(), 0, NULL, &owner, &info, &e), &e);
+    expect_tail(owner, 0, 0);
+    ps_owned_close(owner);
+    ps_owned_close(observer);
+    ok(ps_close(b, &e), &e);
+    ok(ps_close(a, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+  owned_stream_selected_fault();
+}
 int main(int argc, char **argv) {
   if (argc == 5 && !strcmp(argv[1], "--journal-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
@@ -2794,6 +3089,12 @@ int main(int argc, char **argv) {
     journal_replay_structural();
   else if (!strcmp(argv[2], "journal-replay-process"))
     journal_replay_process();
+  else if (!strcmp(argv[2], "owned-stream-readiness"))
+    owned_stream_readiness();
+  else if (!strcmp(argv[2], "owned-stream-cold"))
+    owned_stream_cold();
+  else if (!strcmp(argv[2], "owned-stream-faults"))
+    owned_stream_faults();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();
