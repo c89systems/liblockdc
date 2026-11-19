@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), and [append suffix replay](#append-suffix-replay-for-shared-state) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), and [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7018,3 +7018,75 @@ The verification logs, traces, and timing data are in
 `build/pouch-space-delta-replay/`. Physical namespace handoff, shared outbox
 and collection authority, shared capacity under destructive maintenance,
 and production acceptance remain open.
+
+## Checkpoint recovery on handoff
+
+A namespace owner loads checkpoint coverage and selected typed values from
+one pinned capture. Before replaying the uncovered stream range, it checks
+the captured coverage token and each selected value's identity. Interrupted
+checkpoint publication can advance individual slots before it advances the
+coverage control, so both checks are required.
+
+Recovery applies the uncovered records to a staged checkpoint delta and
+funds the resulting maintenance obligations once. Failed funding releases
+provisional claims and leaves the seeded checkpoint available for retry.
+Replay uses the bounded record decoder and retains references to streamed
+bodies. Metadata mutation enters recovery and uses the recovered checkpoint
+within the same namespace guard.
+
+The matched 32-delivery, four-writer NoSync trace counted 235 checkpoint
+opens in `aa3da3a4` and 129 with this change, including verification and
+reopen. The baseline opened 129 checkpoints when entering namespace
+ownership and another 106 while preparing a mutation or recovering a
+checkpoint. The remaining opens come from namespace owner reloads.
+
+All 75 recovery and SDK groups passed on Debug, GNU release, and musl
+release. Three ThreadSanitizer and three strict Memcheck profiles passed.
+The checkpoint fixture rejects seed reuse after slots advance at a fixed
+coverage token, preserves the latest sequence during repeated-key replay,
+and verifies unchanged slot and budget counts after a failed funding
+attempt followed by a successful retry. The matrix includes shared queue
+transactions and root obligation recovery under capacity pressure.
+
+All 48 matched GNU queue runs verified delivered payloads and reopened
+state. Native runs start at 10 MiB. The profiles use 16 deliveries of
+1 KiB with two writers or 32 deliveries of 4 KiB with four writers.
+Times are median milliseconds for `aa3da3a4` shared / current shared /
+native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 31.19 / 28.56 / 4.46 / 4.16 | 457.90 / 463.98 / 361.23 / 367.47 | 97.54 / 82.01 / 7.33 / 5.18 | 511.67 / 748.76 / 447.53 / 542.92 |
+| Maintenance | 18.59 / 26.99 / 8.77 / 0.17 | 21.16 / 18.53 / 6.78 / 0.38 | 36.60 / 37.62 / 10.10 / 0.29 | 28.13 / 28.77 / 7.67 / 0.50 |
+| Close | 0.37 / 0.34 / 0.25 / 34.78 | 0.37 / 0.45 / 0.25 / 43.15 | 0.81 / 0.83 / 0.41 / 68.58 | 0.74 / 0.85 / 0.51 / 59.26 |
+| Reopen | 12.13 / 11.65 / 3.40 / 0.72 | 11.87 / 12.83 / 2.82 / 0.80 | 29.34 / 25.95 / 3.37 / 1.06 | 26.85 / 28.61 / 3.08 / 0.88 |
+
+A repeat with seven alternating pairs per policy favored the current
+implementation in five pairs under each policy. NoSync work medians
+moved from 86.82 to 79.47 ms and worker CPU from 116.43 to 100.52 ms.
+Durable work medians moved from 661.74 to 604.31 ms and worker CPU from
+159.69 to 136.33 ms, with 112 foreground syncs in both builds. The
+three-sample durable comparison above ran slower with this change.
+Wider shared NoSync foreground work remains about 16 times multifile in
+the matched four-way comparison, and reopen takes about 25 times as long.
+
+All 36 separate exclusive GNU index controls verified reopened query
+results. Times are median milliseconds for `aa3da3a4` native / current
+native / multifile. These runs report index readiness independently of
+foreground work, reopen, and close. Wider NoSync foreground work and
+maximum worker flush were slower than the frozen native build in this
+sample. Wider durable foreground work was close to multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 60.56 / 59.74 / 20.32 | 648.21 / 512.74 / 428.24 | 79.43 / 81.72 / 24.32 | 1261.21 / 1359.19 / 1359.23 |
+| Maximum worker index flush | 22.44 / 16.74 / 1.03 | 24.31 / 17.10 / 1.10 | 26.26 / 27.48 / 1.53 | 19.61 / 18.57 / 8.73 |
+| First query pass | 0.21 / 0.24 / 0.18 | 0.23 / 0.25 / 0.22 | 0.61 / 0.46 / 0.24 | 0.23 / 0.23 / 0.26 |
+| Repeated query pass | 0.06 / 0.05 / 0.08 | 0.05 / 0.06 / 0.07 | 0.13 / 0.10 / 0.09 | 0.09 / 0.07 / 0.09 |
+| Close | 0.46 / 0.30 / 44.29 | 0.28 / 0.30 / 35.30 | 0.76 / 0.74 / 57.02 | 0.71 / 0.79 / 58.84 |
+| Reopen | 4.00 / 2.94 / 1.10 | 3.68 / 3.31 / 1.14 | 5.57 / 4.22 / 1.72 | 4.87 / 4.78 / 1.42 |
+
+Verification logs, the trace, and matched measurements are in
+`build/pouch-space-physical-handoff/`. Shared namespace cache refresh, outbox
+and collection authority, capacity under destructive shared maintenance,
+and performance acceptance remain open.

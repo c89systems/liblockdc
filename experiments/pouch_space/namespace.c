@@ -1468,39 +1468,47 @@ static int checkpoint_replay(void *context, uint64_t segment,
                              const lc_pouch_state_entry *entry, lc_error *e) {
   if (!segment)
     return LC_OK; /* Selected slots were loaded by the checkpoint owner. */
-  return ps_key_checkpoint_replay(context, entry, e);
+  return ps_checkpoint_delta_replay(context, entry, e);
 }
 static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
-  ps_key_checkpoint *fresh = NULL, *old;
+  ps_checkpoint_delta *replay = NULL;
   ps_namespace_view *view = NULL;
+  uint64_t segment, end, bytes = 0, span;
   size_t i;
   int rc;
   if (d->checkpoint_ready)
     return LC_OK;
-  rc = ps_key_checkpoint_open(d->ns, &fresh, e);
-  if (rc == LC_OK)
-    rc = ps_namespace_view_open(d->ns, &view, e);
-  if (rc == LC_OK)
-    /* The fresh owner already loaded selected slots and their high waters.
-     * Replay only the uncovered suffix; decoding those slots again merely to
-     * discard them adds needless cold-open I/O and transient allocations. */
-    rc = view_visit(view, 0, 0, checkpoint_replay, fresh, e);
+  rc = ps_namespace_view_open(d->ns, &view, e);
   if (rc == LC_OK) {
-    for (i = 0; i < view->count; ++i)
-      ps_key_checkpoint_replayed(fresh, view->items[i].id, view->items[i].tail);
+    rc = ps_key_checkpoint_confirm_seed(d->checkpoint, view->metadata,
+                                        &view->coverage, e);
+    if (rc == LC_ERR_PENDING) {
+      pthread_mutex_lock(&d->mutex);
+      d->shared_valid = 0;
+      pthread_mutex_unlock(&d->mutex);
+    }
   }
-  ps_namespace_view_close(view);
+  if (rc == LC_OK)
+    rc = ps_checkpoint_delta_open(d->checkpoint, 0, &replay, e);
+  if (rc == LC_OK)
+    rc = view_visit(view, 0, 0, checkpoint_replay, replay, e);
   if (rc == LC_OK) {
+    segment = view->coverage.segment;
+    end = view->coverage.offset;
+    for (i = 0; i < view->count; ++i) {
+      segment = view->items[i].id;
+      end = view->items[i].tail;
+      span = end - view->items[i].start;
+      bytes = span > UINT64_MAX - bytes ? UINT64_MAX : bytes + span;
+    }
     pthread_mutex_lock(&d->mutex);
-    if (d->checkpoint_observer.prepare)
-      (void)ps_key_checkpoint_observe(fresh, &d->checkpoint_observer, NULL);
-    old = d->checkpoint;
-    d->checkpoint = fresh;
-    d->checkpoint_ready = 1;
+    rc = ps_checkpoint_delta_replay_commit(replay, segment, end, bytes, e);
+    if (rc == LC_OK)
+      d->checkpoint_ready = 1;
     pthread_mutex_unlock(&d->mutex);
-    ps_key_checkpoint_close(old);
-  } else
-    ps_key_checkpoint_close(fresh);
+  }
+  ps_checkpoint_delta_close(replay);
+  ps_namespace_view_close(view);
   return rc;
 }
 int ps_namespace_checkpoint_observe(ps_namespace *ns,
@@ -1520,15 +1528,27 @@ int ps_namespace_checkpoint_observe(ps_namespace *ns,
   }
   return rc;
 }
-int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
+int ps_ns_enter_checkpoint(ps_namespace *ns, struct ps_namespace_data **out,
+                           lc_error *e) {
   struct ps_namespace_data *d;
   int rc = data_get(ns, &d, 0, e);
+  *out = NULL;
   if (rc == LC_OK)
     rc = ps_ns_enter(d, e);
   if (rc != LC_OK)
     return rc;
   rc = checkpoint_ready(d, e);
-  ps_ns_leave(d);
+  if (rc == LC_OK)
+    *out = d;
+  else
+    ps_ns_leave(d);
+  return rc;
+}
+int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
+  struct ps_namespace_data *d;
+  int rc = ps_ns_enter_checkpoint(ns, &d, e);
+  if (rc == LC_OK)
+    ps_ns_leave(d);
   return rc;
 }
 int ps_namespace_recover_on_open(ps_namespace *ns, lc_error *e) {

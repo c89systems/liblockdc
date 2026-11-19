@@ -50,11 +50,13 @@ int ps_checkpoint_delta_bind(ps_checkpoint_delta *, ps_record_writer *,
 int ps_checkpoint_delta_prepare(ps_checkpoint_delta *, lc_error *);
 void ps_checkpoint_delta_accept(ps_checkpoint_delta *);
 void ps_checkpoint_delta_close(ps_checkpoint_delta *);
-/* Recovery uses complete decoded canonical records, then records the exact
- * accepted suffix end. Admission must finish before another body producer. */
-int ps_key_checkpoint_replay(ps_key_checkpoint *, const lc_pouch_state_entry *,
-                             lc_error *);
-void ps_key_checkpoint_replayed(ps_key_checkpoint *, uint64_t, uint64_t);
+/* Stage complete canonical records against a seeded owner. Commit only after
+ * the complete captured suffix and its capacity are accounted for. Close the
+ * delta after any error to return its provisional claims. */
+int ps_checkpoint_delta_replay(ps_checkpoint_delta *,
+                               const lc_pouch_state_entry *, lc_error *);
+int ps_checkpoint_delta_replay_commit(ps_checkpoint_delta *, uint64_t segment,
+                                      uint64_t end, uint64_t bytes, lc_error *);
 /* Caller excludes canonical mutation and has observed an empty selected head.
  * Preserve all prior key changes and watermarks while covering that zero-byte
  * source, so sealed empty predecessors can retire without invented records. */
@@ -107,6 +109,9 @@ void ps_key_cursor_close(ps_key_cursor *);
  * when the owner has a newer deferred metadata revision. */
 int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,
                               ps_checkpoint_info *, lc_error *);
+/* A coverage token can stay fixed while forward checkpoint slots publish. */
+int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
+                                   const ps_checkpoint_info *, lc_error *);
 int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,
                            lc_error *);
 /* Constant-time source ownership observation for ordinary reclamation. */

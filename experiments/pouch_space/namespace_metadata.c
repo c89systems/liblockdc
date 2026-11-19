@@ -18,17 +18,12 @@ int ps_namespace_metadata_begin(ps_namespace *ns, int maintenance,
     return lc_error_set(e, LC_ERR_INVALID, 0, "native metadata requires output",
                         NULL, NULL, "pouch");
   *out = NULL;
-  rc = ps_namespace_checkpoint_recover(ns, e);
-  if (rc == LC_OK)
-    rc = ps_ns_data_get(ns, &d, e);
-  if (rc != LC_OK)
-    return rc;
   metadata = lc_calloc_with_allocator(NULL, 1, sizeof(*metadata));
   if (!metadata)
     return lc_error_set(e, LC_ERR_NOMEM, 0,
                         "cannot allocate native metadata owner", NULL, NULL,
                         "pouch");
-  rc = ps_ns_enter(d, e);
+  rc = ps_ns_enter_checkpoint(ns, &d, e);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, metadata);
     return rc;

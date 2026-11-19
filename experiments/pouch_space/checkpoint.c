@@ -34,7 +34,7 @@ struct source_count {
 };
 struct key_slot {
   char *key, *leaf;
-  uint64_t id, bound;
+  uint64_t id, bound, selected_incarnation;
   unsigned int kind;
   ps_reserve *reserve;
   uint64_t required_deletion;
@@ -527,24 +527,6 @@ static int decode_control(ps_key_checkpoint *c, ps_reader *reader,
                    "checkpoint query boundary exceeds state");
   return LC_OK;
 }
-static int read_control(ps_key_checkpoint *c, lc_error *e) {
-  ps_reader *reader = NULL;
-  int rc = ps_read_open(c->ns->root->space, control_key(c), NULL, &reader, e);
-  if (rc == LC_ERR_INVALID) {
-    lc_error_cleanup(e);
-    return LC_OK;
-  }
-  if (rc == LC_OK)
-    rc = decode_control(c, reader, &c->selected, e);
-  ps_reader_close(reader);
-  if (rc != LC_OK)
-    return rc;
-  c->state_index = c->selected.state_index;
-  c->query_index = c->selected.query_index;
-  c->latest_segment = c->selected.segment;
-  c->latest_offset = c->selected.offset;
-  return LC_OK;
-}
 int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
                               ps_checkpoint_info *coverage, lc_error *e) {
   ps_values *values = NULL;
@@ -584,21 +566,21 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
     ps_values_close(values);
   return rc;
 }
-static int load_slots(ps_key_checkpoint *c, lc_error *e) {
-  ps_values *values = NULL;
+static int load_slots(ps_key_checkpoint *c, const ps_values *values,
+                      lc_error *e) {
   ps_reader *reader = NULL;
   lc_pouch_state_entry entry, projected;
   ps_ref ref;
   ps_key key;
   uint64_t bytes;
   size_t i;
-  int rc;
+  int rc = LC_OK;
   memset(&entry, 0, sizeof(entry));
-  rc = ps_values_capture(c->ns->root->space, c->ns->identity.owner,
-                         PS_KEY_METADATA, PS_KEY_DECISION, &values, e);
   for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
     key_slot *slot = NULL;
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
+    if (rc == LC_OK && key.kind == PS_NAMESPACE_CHECKPOINT)
+      continue;
     if (rc == LC_OK)
       rc = room(c, c->count + 1, e);
     if (rc == LC_OK) {
@@ -637,6 +619,7 @@ static int load_slots(ps_key_checkpoint *c, lc_error *e) {
       lc_free_with_allocator(&c->allocator, slot->key);
       slot->key = entry.key;
       entry.key = NULL;
+      slot->selected_incarnation = ref.incarnation;
       summarize(&slot->summary, &projected);
       slot->body = source_get(c, &entry, &rc, e);
       if (rc == LC_OK)
@@ -658,12 +641,13 @@ static int load_slots(ps_key_checkpoint *c, lc_error *e) {
       close_slot(c, slot);
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
-  ps_values_close(values);
   return rc;
 }
 int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
                            lc_error *e) {
   ps_key_checkpoint *c;
+  ps_values *values = NULL;
+  ps_checkpoint_info selected;
   int rc;
   if (out)
     *out = NULL;
@@ -686,13 +670,48 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
            ? room(c, 1, e)
            : failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint sources");
   if (rc == LC_OK)
-    rc = read_control(c, e);
-  if (rc == LC_OK)
-    rc = load_slots(c, e);
+    rc = ps_key_checkpoint_capture(c, &values, &selected, e);
+  if (rc == LC_OK) {
+    c->selected = selected;
+    c->state_index = selected.state_index;
+    c->query_index = selected.query_index;
+    c->latest_segment = selected.segment;
+    c->latest_offset = selected.offset;
+    rc = load_slots(c, values, e);
+  }
+  ps_values_close(values);
   if (rc == LC_OK)
     *out = c;
   else
     ps_key_checkpoint_close(c);
+  return rc;
+}
+int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
+                                   const ps_values *values,
+                                   const ps_checkpoint_info *coverage,
+                                   lc_error *e) {
+  ps_key key;
+  ps_ref ref;
+  key_slot *slot;
+  uint64_t bytes;
+  size_t i, count = 0;
+  int rc = LC_OK, same;
+  pthread_mutex_lock(&c->mutex);
+  same = c->selected.control == coverage->control;
+  for (i = 0; same && rc == LC_OK && i < ps_values_count(values); ++i) {
+    rc = ps_values_info(values, i, &key, &ref, &bytes, e);
+    if (rc != LC_OK || key.kind == PS_NAMESPACE_CHECKPOINT)
+      continue;
+    slot = find_id(c, key.key);
+    same = slot && slot->kind == key.kind &&
+           slot->selected_incarnation == ref.incarnation;
+    ++count;
+  }
+  same = same && count == c->count;
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK && !same)
+    rc = failure(e, LC_ERR_PENDING,
+                 "selected checkpoint changed during recovery");
   return rc;
 }
 size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *c) {
@@ -1336,7 +1355,7 @@ static void dirty_remove(ps_key_checkpoint *c, key_slot *s) {
   s->dirty_next = NULL;
   --c->dirty_count;
 }
-void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
+static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
   ps_key_checkpoint *c = d->checkpoint;
   slot_change *change;
   ps_budget_plan cost = {0};
@@ -1378,15 +1397,18 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
     c->query_index = d->query_index;
   c->latest_segment = d->segment;
   c->latest_offset = d->end;
-  if (d->end - d->start > UINT64_MAX - c->uncovered_bytes)
+  if (bytes > UINT64_MAX - c->uncovered_bytes)
     c->uncovered_bytes = UINT64_MAX;
   else
-    c->uncovered_bytes += d->end - d->start;
+    c->uncovered_bytes += bytes;
   c->changed = 1;
   if (c->logical_epoch != UINT64_MAX)
     ++c->logical_epoch;
   d->accepted = 1;
   pthread_mutex_unlock(&c->mutex);
+}
+void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
+  accept_delta(d, d->end - d->start);
 }
 void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   ps_key_checkpoint *c;
@@ -1414,89 +1436,92 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   pthread_mutex_unlock(&c->mutex);
   lc_free_with_allocator(&c->allocator, d);
 }
-static int replay_superseded(ps_key_checkpoint *c,
+static int replay_superseded(ps_checkpoint_delta *d,
                              const lc_pouch_state_entry *entry) {
+  slot_change *change;
   key_slot *slot;
   lc_pouch_state_entry prior, projected;
   unsigned int kind = entry->control ? PS_KEY_DECISION : PS_KEY_METADATA;
   if (!entry->key || (entry->control && !entry->decision))
     return 0;
-  slot = find_key(c, entry->key, kind);
-  if (!slot)
+  change = delta_find(d, entry->key, strlen(entry->key), kind);
+  slot = change ? change->slot : find_key(d->checkpoint, entry->key, kind);
+  if (!slot || (change && change->created && !change->prepared))
     return 0;
-  summary_view(slot, &slot->summary, &prior);
+  summary_view(slot,
+               change && change->prepared ? &change->summary : &slot->summary,
+               &prior);
   return kind == PS_KEY_DECISION
              ? !lc_pouch_state_decision_entry_accepts(prior.seen,
                                                       prior.index_seq, entry)
              : !lc_pouch_state_entry_project(&prior, entry, &projected);
 }
-int ps_key_checkpoint_replay(ps_key_checkpoint *c,
-                             const lc_pouch_state_entry *entry, lc_error *e) {
-  ps_checkpoint_delta d;
+int ps_checkpoint_delta_replay(ps_checkpoint_delta *d,
+                               const lc_pouch_state_entry *entry, lc_error *e) {
+  ps_key_checkpoint *c;
+  const char *key;
   uint64_t bytes = 0;
-  int rc = LC_OK;
-  if (!c || !entry || !entry->seen)
+  int rc = LC_OK, superseded;
+  if (!d || d->writer || d->metadata_only || d->accepted || !entry ||
+      !entry->seen)
     return failure(e, LC_ERR_INVALID,
                    "checkpoint replay requires a complete record");
-  memset(&d, 0, sizeof(d));
-  d.checkpoint = c;
-  d.claim = c->claim;
+  c = d->checkpoint;
   pthread_mutex_lock(&c->mutex);
-  /* Forward slots from an interrupted checkpoint may already supersede this
-   * canonical prefix. They need only the coverage control, not another value
-   * reservation. Refunding a temporary large claim after projection is too
-   * late when the root has exhausted ordinary capacity. */
-  if (!replay_superseded(c, entry))
+  /* Forward slots and earlier records in this delta can supersede a replayed
+   * value. Still account for its state high water and coverage. */
+  superseded = replay_superseded(d, entry);
+  if (!superseded)
     rc = lc_pouch_state_record_measure_snapshot(&c->allocator, NULL, entry, 0,
                                                 &bytes, e);
-  if (rc == LC_OK)
-    rc =
-        admit_key(&d, entry->control && !entry->decision ? NULL : entry->key,
-                  entry->key ? strlen(entry->key) : 0,
-                  entry->control ? PS_KEY_DECISION : PS_KEY_METADATA, bytes, e);
-  if (rc == LC_OK)
-    rc = prepare_entry(&d, entry, e);
-  if (rc == LC_OK && d.count > UINT64_MAX - c->body_epoch)
-    rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
-  pthread_mutex_unlock(&c->mutex);
   if (rc == LC_OK) {
-    d.prepared = 1;
-    d.segment = c->latest_segment;
-    d.start = d.end = c->latest_offset;
-    ps_checkpoint_delta_accept(&d);
+    key =
+        superseded || (entry->control && !entry->decision) ? NULL : entry->key;
+    d->planning = 1;
+    rc =
+        admit_key(d, key, key ? strlen(key) : 0,
+                  entry->control ? PS_KEY_DECISION : PS_KEY_METADATA, bytes, e);
+    d->planning = 0;
   }
-  /* Stack delta uses the identical ownership cleanup without freeing itself. */
-  pthread_mutex_lock(&c->mutex);
-  {
-    slot_change *change, *next;
-    for (change = d.changes; change; change = next) {
-      next = change->next;
-      release_prepared_source(c, change->body);
-      ps_checkpoint_record_close(&change->record);
-      if (change->created)
-        close_slot(c, change->slot);
-      lc_free_with_allocator(&c->allocator, change);
-    }
-    lc_free_with_allocator(&c->allocator, d.buckets);
+  if (rc == LC_OK) {
+    if (!superseded)
+      rc = prepare_entry(d, entry, e);
+    else if (entry->index_seq > d->state_index)
+      d->state_index = entry->index_seq;
   }
-  settle(c);
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
-void ps_key_checkpoint_replayed(ps_key_checkpoint *c, uint64_t segment,
-                                uint64_t offset) {
-  uint64_t bytes;
+int ps_checkpoint_delta_replay_commit(ps_checkpoint_delta *d, uint64_t segment,
+                                      uint64_t end, uint64_t bytes,
+                                      lc_error *e) {
+  ps_key_checkpoint *c;
+  int rc = LC_OK;
+  if (!d || d->writer || d->metadata_only || d->accepted)
+    return failure(e, LC_ERR_INVALID, "checkpoint replay is not open");
+  c = d->checkpoint;
   pthread_mutex_lock(&c->mutex);
-  bytes = segment == c->latest_segment && offset >= c->latest_offset
-              ? offset - c->latest_offset
-              : offset;
-  if (bytes > UINT64_MAX - c->uncovered_bytes)
-    c->uncovered_bytes = UINT64_MAX;
-  else
-    c->uncovered_bytes += bytes;
-  c->latest_segment = segment;
-  c->latest_offset = offset;
+  if (!d->claim.entries && bytes)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "checkpoint replay has bytes without records");
+  else if (d->count > UINT64_MAX - c->body_epoch)
+    rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
+  if (rc == LC_OK && d->claim.entries)
+    rc = fund(c, &d->claim, e);
+  if (rc == LC_OK) {
+    d->segment = segment;
+    d->end = end;
+    if (!d->claim.entries) {
+      /* Empty selected successors advance the cursor without funding debt. */
+      c->latest_segment = segment;
+      c->latest_offset = end;
+      d->accepted = 1;
+    }
+  }
   pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK && !d->accepted)
+    accept_delta(d, bytes);
+  return rc;
 }
 int ps_key_checkpoint_cover_empty(ps_key_checkpoint *c, uint64_t segment,
                                   lc_error *e) {

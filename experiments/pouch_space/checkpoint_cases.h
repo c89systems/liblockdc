@@ -343,11 +343,37 @@ static void checkpoint_fixture(lc_pouch_state_entry *entry, char *name,
   entry->seen = entry->found = 1;
   entry->index_seq = i + 1;
 }
+static ps_checkpoint_delta *checkpoint_stage_fixture(ps_key_checkpoint *c) {
+  ps_checkpoint_delta *replay = NULL;
+  lc_pouch_state_entry entry;
+  char name[32];
+  OK(ps_checkpoint_delta_open(c, 0, &replay, &error));
+  for (unsigned int i = 0; i < 130; ++i) {
+    checkpoint_fixture(&entry, name, i);
+    OK(ps_checkpoint_delta_replay(replay, &entry, &error));
+  }
+  checkpoint_fixture(&entry, name, 129);
+  entry.index_seq = 1;
+  OK(ps_checkpoint_delta_replay(replay, &entry, &error));
+  return replay;
+}
+static void checkpoint_replay_one(ps_key_checkpoint *c,
+                                  const lc_pouch_state_entry *entry,
+                                  uint64_t segment, uint64_t end) {
+  ps_checkpoint_delta *replay = NULL;
+  OK(ps_checkpoint_delta_open(c, 0, &replay, &error));
+  if (entry)
+    OK(ps_checkpoint_delta_replay(replay, entry, &error));
+  OK(ps_checkpoint_delta_replay_commit(replay, segment, end, end, &error));
+  ps_checkpoint_delta_close(replay);
+}
 static void checkpoint_owner(int durable) {
   ps_root_options options = {0};
   ps_root *root = NULL;
   ps_namespace *ns = NULL;
-  ps_key_checkpoint *checkpoint = NULL;
+  ps_key_checkpoint *checkpoint = NULL, *seed = NULL;
+  ps_checkpoint_delta *replay;
+  ps_stats before, after;
   ps_checkpoint_info info;
   checkpoint_observation observation = {0};
   ps_checkpoint_observer observer = {checkpoint_prepare, checkpoint_finish,
@@ -366,14 +392,30 @@ static void checkpoint_owner(int durable) {
   OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
   OK(ps_namespace_identity(ns, &identity, &error));
   OK(ps_key_checkpoint_open(ns, &checkpoint, &error));
+  OK(ps_key_checkpoint_open(ns, &seed, &error));
   OK(ps_key_checkpoint_observe(checkpoint, &observer, &error));
   /* More than one revision of independent logical keys. Metadata-only lease
    * placeholders must remain query-neutral, including after partial restart. */
-  for (i = 0; i < 130; ++i) {
-    checkpoint_fixture(&entry, name, (unsigned int)i);
-    OK(ps_key_checkpoint_replay(checkpoint, &entry, &error));
-  }
-  ps_key_checkpoint_replayed(checkpoint, 1, 9000);
+  OK(ps_status(ps_root_space(root), &before, &error));
+  replay = checkpoint_stage_fixture(checkpoint);
+  ps_key_checkpoint_info(checkpoint, &info);
+  CHECK(!info.slots && !info.pending && !info.epoch);
+  allocation_call = 0;
+  allocation_fail = 1;
+  CHECK(ps_checkpoint_delta_replay_commit(replay, 1, 9000, 9000, &error) ==
+        LC_ERR_NOMEM);
+  allocation_fail = 0;
+  lc_error_cleanup(&error);
+  ps_checkpoint_delta_close(replay);
+  ps_key_checkpoint_info(checkpoint, &info);
+  CHECK(!info.slots && !info.pending && !info.epoch);
+  OK(ps_status(ps_root_space(root), &after, &error));
+  CHECK(after.reserved_payload_bytes == before.reserved_payload_bytes &&
+        after.reserved_metadata_bytes == before.reserved_metadata_bytes &&
+        after.reserved_entries == before.reserved_entries);
+  replay = checkpoint_stage_fixture(checkpoint);
+  OK(ps_checkpoint_delta_replay_commit(replay, 1, 9000, 9000, &error));
+  ps_checkpoint_delta_close(replay);
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(info.slots == 130 && info.pending == 130 && !info.epoch);
   CHECK(ps_key_checkpoint_due(checkpoint));
@@ -383,6 +425,14 @@ static void checkpoint_owner(int durable) {
   CHECK(observation.published == 1);
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(!info.epoch && info.pending && info.pending < 130);
+  OK(ps_key_checkpoint_capture(seed, &values, &info, &error));
+  CHECK(!info.control && ps_values_count(values));
+  CHECK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error) ==
+        LC_ERR_PENDING);
+  lc_error_cleanup(&error);
+  ps_values_close(values);
+  values = NULL;
+  ps_key_checkpoint_close(seed);
   ps_key_checkpoint_close(checkpoint);
   checkpoint = NULL;
   ps_namespace_release(ns);
@@ -396,11 +446,9 @@ static void checkpoint_owner(int durable) {
   CHECK(!info.epoch && info.slots && info.slots < 130);
   /* The unchanged coverage requires all original canonical records to replay.
    * Already selected forward metadata must not change supersession outcomes. */
-  for (i = 0; i < 130; ++i) {
-    checkpoint_fixture(&entry, name, (unsigned int)i);
-    OK(ps_key_checkpoint_replay(checkpoint, &entry, &error));
-  }
-  ps_key_checkpoint_replayed(checkpoint, 1, 9000);
+  replay = checkpoint_stage_fixture(checkpoint);
+  OK(ps_checkpoint_delta_replay_commit(replay, 1, 9000, 9000, &error));
+  ps_checkpoint_delta_close(replay);
   OK(ps_key_checkpoint_flush(checkpoint, &error));
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(info.epoch && info.segment == 1 && info.offset == 9000 &&
@@ -417,6 +465,8 @@ static void checkpoint_owner(int durable) {
     CHECK(decoded.seen && decoded.found && !decoded.payload_span.present &&
           !decoded.lifetime && !decoded.query_index_seq &&
           decoded.index_seq >= 1 && decoded.index_seq <= 130);
+    if (!strcmp(decoded.key, "lease/129"))
+      CHECK(decoded.index_seq == 130);
     ps_reader_close(reader);
     reader = NULL;
     lc_pouch_state_entry_cleanup(&allocator, &decoded);
@@ -426,8 +476,7 @@ static void checkpoint_owner(int durable) {
   /* A rejected/stale replay must not resurrect an old payload generation. */
   checkpoint_fixture(&entry, name, 129);
   entry.index_seq = 1;
-  OK(ps_key_checkpoint_replay(checkpoint, &entry, &error));
-  ps_key_checkpoint_replayed(checkpoint, 2, 100);
+  checkpoint_replay_one(checkpoint, &entry, 2, 100);
   OK(ps_key_checkpoint_flush(checkpoint, &error));
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(info.state_index == 130 && info.segment == 2 && info.offset == 100 &&

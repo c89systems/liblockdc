@@ -50,7 +50,7 @@ static void checkpoint_ranges(int durable) {
     model[slot].start = entry.payload_span.payload_offset;
     model[slot].bytes = entry.payload_span.payload_length;
     model[slot].source = entry.found ? (i % 3 ? 1 : 2) : 0;
-    OK(ps_key_checkpoint_replay(c, &entry, &error));
+    checkpoint_replay_one(c, &entry, 0, 0);
     if (i % 17 != 0 && i != 699)
       continue;
     for (unsigned int source = 1; source <= 2; ++source) {
@@ -89,17 +89,17 @@ static void checkpoint_ranges(int durable) {
   lc_free_with_allocator(NULL, captured.ranges);
   entry.index_seq = 701;
   entry.record_type = LC_POUCH_STATE_RECORD_STATE_META;
-  OK(ps_key_checkpoint_replay(c, &entry, &error));
+  checkpoint_replay_one(c, &entry, 0, 0);
   OK(ps_key_checkpoint_ranges_select(c, PS_CATALOG_BODY, 2, epoch,
                                      count_selection, &selected, &error));
   entry.index_seq = 702;
   entry.payload_span.payload_offset += 1;
-  OK(ps_key_checkpoint_replay(c, &entry, &error));
+  checkpoint_replay_one(c, &entry, 0, 0);
   CHECK(ps_key_checkpoint_ranges_select(c, PS_CATALOG_BODY, 2, epoch,
                                         count_selection, &selected,
                                         &error) == LC_ERR_INVALID);
   lc_error_cleanup(&error);
-  ps_key_checkpoint_replayed(c, 1, 9999);
+  checkpoint_replay_one(c, NULL, 1, 9999);
   OK(ps_key_checkpoint_flush(c, &error));
   ps_key_checkpoint_close(c);
   OK(ps_key_checkpoint_open(ns, &c, &error));

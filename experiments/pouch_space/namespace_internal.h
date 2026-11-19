@@ -56,6 +56,8 @@ void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_retention_restore(struct ps_namespace_data *, lc_error *);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
+int ps_ns_enter_checkpoint(ps_namespace *, struct ps_namespace_data **,
+                           lc_error *);
 void ps_ns_leave(struct ps_namespace_data *);
 /* A final source retirement or mapping selection holds both namespace
  * mutation authority and the data mutex across this check and publication. */
