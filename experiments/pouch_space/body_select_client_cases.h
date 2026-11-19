@@ -1,37 +1,26 @@
 #ifndef POUCH_SPACE_BODY_SELECT_CLIENT_CASES_H
 #define POUCH_SPACE_BODY_SELECT_CLIENT_CASES_H
-typedef struct client_recode {
-  ps_namespace *ns;
-  lc_pouch_crypto *target;
-  size_t converted;
-} client_recode;
-static int client_recode_record(void *context, uint64_t segment,
-                                const lc_pouch_state_entry *entry,
-                                lc_error *e) {
-  client_recode *work = context;
-  REQUIRE(!segment);
-  if (entry->control || !entry->found || !entry->payload_span.present)
-    return LC_OK;
-  unsigned char body_class =
-      entry->record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT ||
-              entry->object_link
-          ? 2
-          : 1;
-  char *binding = lc_pouch_state_crypto_context(
-      &allocator, "projection", entry->key, entry->version, body_class);
-  REQUIRE(binding);
-  lc_pouch_state_entry converted = {0};
-  ps_namespace_recode *conversion = NULL;
-  int rc = ps_namespace_recode_begin(work->ns, work->target, entry, binding,
-                                     &conversion, e);
-  if (rc == LC_OK)
-    rc = ps_namespace_recode_run(conversion, &converted, e);
-  ps_namespace_recode_close(conversion);
-  if (rc == LC_OK)
-    ++work->converted;
-  lc_pouch_state_entry_cleanup(&allocator, &converted);
-  lc_free_with_allocator(&allocator, binding);
-  return rc;
+static void client_conversion(ps_namespace *ns, lc_pouch_crypto *target,
+                              int already, lc_error *e) {
+  ps_namespace_conversion *work = NULL, *other = NULL;
+  ok(ps_namespace_conversion_open(ns, target, &work, e), e);
+  REQUIRE(ps_namespace_conversion_open(ns, target, &other, e) ==
+              LC_ERR_INVALID &&
+          !other);
+  clear(e);
+  size_t visited = 0, converted = 0, matching = 0, calls = 0;
+  ps_namespace_conversion_result result = {0};
+  do {
+    ok(ps_namespace_conversion_step(work, 1, 3, &result, e), e);
+    REQUIRE(result.visited <= 1 && result.maintenance <= 3 && !result.waiting);
+    visited += result.visited;
+    converted += result.converted;
+    matching += result.matching;
+    REQUIRE(++calls < 2048);
+  } while (!result.finished);
+  REQUIRE(visited == 6 && converted == (already ? 0 : 4) &&
+          matching == (already ? 4 : 0));
+  ps_namespace_conversion_close(work);
 }
 static void body_select_client(const char *path, const char *directory) {
   lc_error e;
@@ -64,13 +53,13 @@ static void body_select_client(const char *path, const char *directory) {
         lc_pouch_crypto *target = NULL;
         ok(lc_pouch_crypto_open(&allocator, &target_options, &target, NULL, &e),
            &e);
-        ps_namespace_view *view = NULL;
-        ok(ps_namespace_view_open(ns, &view, &e), &e);
-        client_recode work = {ns, target, 0};
-        ok(ps_namespace_view_visit(view, 1, client_recode_record, &work, &e),
-           &e);
-        REQUIRE(work.converted == 4);
-        ps_namespace_view_close(view);
+        client_conversion(ns, target, 0, &e);
+        ps_stats before, after;
+        ok(ps_status(ps_root_space(root), &before, &e), &e);
+        client_conversion(ns, target, 1, &e);
+        ok(ps_status(ps_root_space(root), &after, &e), &e);
+        REQUIRE(after.syncs == before.syncs &&
+                after.allocated_bytes == before.allocated_bytes);
         ps_namespace_release(ns);
         ok(ps_root_close(root, &e), &e);
         lc_pouch_crypto_close(target);

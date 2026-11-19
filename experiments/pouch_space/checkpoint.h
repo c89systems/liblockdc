@@ -9,6 +9,7 @@
 typedef struct ps_key_checkpoint ps_key_checkpoint;
 typedef struct ps_checkpoint_delta ps_checkpoint_delta;
 typedef struct ps_checkpoint_body ps_checkpoint_body;
+typedef struct ps_key_cursor ps_key_cursor;
 typedef struct ps_checkpoint_info {
   uint64_t epoch, segment, offset, state_index, query_index;
   uint64_t slots, pending, pending_bytes;
@@ -90,6 +91,16 @@ const lc_pouch_state_entry *ps_key_body_source(const ps_checkpoint_body *);
 int ps_key_body_commit(ps_checkpoint_body *, const lc_pouch_state_entry *,
                        lc_error *);
 void ps_key_body_close(ps_checkpoint_body *);
+/* Offline one-slot traversal. Physical body replacement and source cleanup
+ * preserve the cursor; logical publication or an attached logical owner
+ * invalidates it. No namespace-wide value/body capture is retained. Output
+ * entries are owned in the root crypto allocator; failure preserves output
+ * and cursor position. Each next call visits at most one slot. */
+int ps_key_cursor_open(ps_key_checkpoint *, ps_key_cursor **, lc_error *);
+int ps_key_cursor_check(ps_key_cursor *, lc_error *);
+int ps_key_cursor_next(ps_key_cursor *, lc_pouch_state_entry *, int *,
+                       lc_error *);
+void ps_key_cursor_close(ps_key_cursor *);
 /* Capture slots and coverage at one completed visibility prefix, including
  * when the owner has a newer deferred metadata revision. */
 int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,

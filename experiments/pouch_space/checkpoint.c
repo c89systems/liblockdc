@@ -69,6 +69,7 @@ struct ps_key_checkpoint {
   uint64_t dirty_count, dirty_bytes, uncovered_bytes;
   uint64_t latest_segment, latest_offset, state_index, query_index;
   uint64_t body_epoch;
+  uint64_t logical_epoch;
   ps_checkpoint_info selected;
   ps_budget *budget;
   ps_budget_plan claim;
@@ -1379,6 +1380,8 @@ void ps_checkpoint_delta_accept(ps_checkpoint_delta *d) {
   else
     c->uncovered_bytes += d->end - d->start;
   c->changed = 1;
+  if (c->logical_epoch != UINT64_MAX)
+    ++c->logical_epoch;
   d->accepted = 1;
   pthread_mutex_unlock(&c->mutex);
 }
@@ -1789,6 +1792,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     c->selected = selected;
     c->state_index = selected.state_index;
     c->query_index = selected.query_index;
+    if (!d->body_replacement && c->logical_epoch != UINT64_MAX)
+      ++c->logical_epoch;
     d->accepted = 1;
     (void)settle_retired(c, NULL);
     pthread_mutex_unlock(&c->mutex);
@@ -2035,6 +2040,101 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
   (void)ps_budget_close(parent, NULL);
   ps_checkpoint_record_close(&converted);
   return rc;
+}
+struct ps_key_cursor {
+  ps_key_checkpoint *checkpoint;
+  key_slot *next;
+  uint64_t epoch;
+};
+static int cursor_valid(ps_key_cursor *cursor, lc_error *e) {
+  ps_key_checkpoint *c = cursor->checkpoint;
+  return c->observer.prepare || c->dirty || c->changed ||
+                 c->logical_epoch == UINT64_MAX ||
+                 c->logical_epoch != cursor->epoch
+             ? failure(e, LC_ERR_INVALID,
+                       "offline key cursor invalidated by logical mutation")
+             : LC_OK;
+}
+int ps_key_cursor_check(ps_key_cursor *cursor, lc_error *e) {
+  int rc;
+  if (!cursor)
+    return failure(e, LC_ERR_INVALID, "key cursor is not open");
+  pthread_mutex_lock(&cursor->checkpoint->mutex);
+  rc = cursor_valid(cursor, e);
+  pthread_mutex_unlock(&cursor->checkpoint->mutex);
+  return rc;
+}
+int ps_key_cursor_open(ps_key_checkpoint *c, ps_key_cursor **out, lc_error *e) {
+  ps_key_cursor *cursor;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!c || !out)
+    return failure(e, LC_ERR_INVALID, "key cursor requires owner and output");
+  cursor = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*cursor));
+  if (!cursor)
+    return failure(e, LC_ERR_NOMEM, "cannot allocate key cursor");
+  cursor->checkpoint = c;
+  pthread_mutex_lock(&c->mutex);
+  cursor->epoch = c->logical_epoch;
+  cursor->next = c->slots;
+  rc = cursor_valid(cursor, e);
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK) {
+    ps_namespace_retain(c->ns);
+    *out = cursor;
+  } else
+    lc_free_with_allocator(&c->allocator, cursor);
+  return rc;
+}
+int ps_key_cursor_next(ps_key_cursor *cursor, lc_pouch_state_entry *out,
+                       int *found, lc_error *e) {
+  ps_key_checkpoint *c;
+  ps_reader *reader = NULL;
+  key_slot *slot;
+  lc_pouch_state_entry entry = {0};
+  ps_key key;
+  int rc;
+  if (found)
+    *found = 0;
+  if (!cursor || !out || !found)
+    return failure(e, LC_ERR_INVALID, "key cursor requires record and output");
+  c = cursor->checkpoint;
+  pthread_mutex_lock(&c->mutex);
+  rc = cursor_valid(cursor, e);
+  slot = cursor->next;
+  if (rc == LC_OK && slot) {
+    key.owner = c->ns->identity.owner;
+    key.key = slot->id;
+    key.kind = slot->kind;
+    rc = ps_read_open(c->ns->root->space, key, NULL, &reader, e);
+  }
+  pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK && slot)
+    rc =
+        ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
+  ps_reader_close(reader);
+  pthread_mutex_lock(&c->mutex);
+  if (rc == LC_OK)
+    rc = cursor_valid(cursor, e);
+  if (rc == LC_OK && slot) {
+    lc_pouch_state_entry_cleanup(&c->allocator, out);
+    *out = entry;
+    memset(&entry, 0, sizeof(entry));
+    cursor->next = slot->next;
+    *found = 1;
+  }
+  pthread_mutex_unlock(&c->mutex);
+  lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+  return rc;
+}
+void ps_key_cursor_close(ps_key_cursor *cursor) {
+  ps_namespace *ns;
+  if (!cursor)
+    return;
+  ns = cursor->checkpoint->ns;
+  lc_free_with_allocator(&cursor->checkpoint->allocator, cursor);
+  ps_namespace_release(ns);
 }
 static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
                             lc_error *e) {

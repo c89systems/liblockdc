@@ -12,6 +12,19 @@ struct ps_namespace_recode {
   char *binding;
   int entered, attempted;
 };
+static int recode_enter(struct ps_namespace_data *data, const void *owner,
+                        lc_error *e) {
+  int rc = LC_OK;
+  pthread_mutex_lock(&data->mutex);
+  if (data->busy || (data->conversion && data->conversion != owner))
+    rc = lc_error_set(e, LC_ERR_INVALID, 0,
+                      "namespace conversion already has an owner or producer",
+                      NULL, "pouch_namespace_busy", "pouch");
+  else
+    data->busy = 1;
+  pthread_mutex_unlock(&data->mutex);
+  return rc;
+}
 void ps_namespace_recode_close(ps_namespace_recode *work) {
   ps_namespace *ns;
   if (!work)
@@ -26,10 +39,13 @@ void ps_namespace_recode_close(ps_namespace_recode *work) {
   lc_free_with_allocator(&ns->root->crypto_allocator, work);
   ps_namespace_release(ns);
 }
-int ps_namespace_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
-                              const lc_pouch_state_entry *expected,
-                              const char *binding, ps_namespace_recode **out,
-                              lc_error *e) {
+const char *ps_ns_recode_leaf(const ps_namespace_recode *work) {
+  return work ? ps_namespace_body_leaf(work->body) : NULL;
+}
+int ps_ns_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
+                       const lc_pouch_state_entry *expected,
+                       const char *binding, const void *owner,
+                       ps_namespace_recode **out, lc_error *e) {
   ps_namespace_recode *work = NULL;
   lc_pouch_state_recode_bounds bounds;
   ps_budget_plan plan = {0}, metadata;
@@ -61,7 +77,7 @@ int ps_namespace_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
   if (rc == LC_OK)
     rc = ps_ns_data_get(ns, &work->data, e);
   if (rc == LC_OK) {
-    rc = ps_ns_enter(work->data, e);
+    rc = recode_enter(work->data, owner, e);
     work->entered = rc == LC_OK;
   }
   if (rc == LC_OK)
@@ -91,6 +107,12 @@ int ps_namespace_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
   else
     ps_namespace_recode_close(work);
   return rc;
+}
+int ps_namespace_recode_begin(ps_namespace *ns, lc_pouch_crypto *crypto,
+                              const lc_pouch_state_entry *expected,
+                              const char *binding, ps_namespace_recode **out,
+                              lc_error *e) {
+  return ps_ns_recode_begin(ns, crypto, expected, binding, NULL, out, e);
 }
 int ps_namespace_recode_run(ps_namespace_recode *work,
                             lc_pouch_state_entry *result, lc_error *e) {
@@ -254,7 +276,7 @@ int ps_namespace_body_select(ps_namespace *ns,
   if (rc == LC_OK)
     rc = ps_ns_data_get(ns, &data, e);
   if (rc == LC_OK) {
-    rc = ps_ns_enter(data, e);
+    rc = recode_enter(data, NULL, e);
     entered = rc == LC_OK;
   }
   if (rc == LC_OK)

@@ -33,6 +33,7 @@ struct ps_namespace_data {
   int busy, checkpoint_ready;
   int retention_loaded, retention_present;
   ps_budget *retention_budget;
+  const void *conversion;
 };
 
 /* Index helpers run under the namespace mutex (or before owner publication).
@@ -43,6 +44,8 @@ ps_ns_resource *ps_ns_resource_new(unsigned int, uint64_t, lc_error *);
 void ps_ns_resource_free(ps_ns_resource *);
 int ps_ns_index_room(struct ps_namespace_data *, lc_error *);
 ps_ns_resource *ps_ns_find(struct ps_namespace_data *, unsigned int, uint64_t);
+int ps_ns_source(struct ps_namespace_data *, unsigned int, uint64_t, int after,
+                 ps_namespace_source *, int *, lc_error *);
 void ps_ns_insert(struct ps_namespace_data *, ps_ns_resource *);
 void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 
@@ -64,5 +67,10 @@ int ps_ns_body_plan(ps_budget_plan *, uint64_t, lc_error *);
 int ps_ns_body_begin(ps_namespace *, ps_budget *, uint64_t,
                      ps_namespace_body **, lc_error *);
 int ps_ns_body_commit(ps_namespace_body *, lc_error *);
+/* Borrowed output identity for cleanup after a failed conversion handoff. */
+const char *ps_ns_recode_leaf(const ps_namespace_recode *);
+int ps_ns_recode_begin(ps_namespace *, lc_pouch_crypto *,
+                       const lc_pouch_state_entry *, const char *, const void *,
+                       ps_namespace_recode **, lc_error *);
 
 #endif

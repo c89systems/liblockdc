@@ -4597,6 +4597,88 @@ Evidence is in ignored `build/pouch-space-compound-recode/`:
 and memory-check commands. The initial fixture failure and its isolated fault
 location are retained separately in `compound-faults.log` and `fault-abort.log`.
 
+### Bounded namespace conversion with reclamation
+
+Native namespace conversion now owns the complete bounded pass through
+`ps_namespace_conversion_open/step/close`. A step limits both key visits and
+source/piece maintenance. Initial cleanup recovers source workspace, each
+successful body handoff schedules cleanup of its old source, and final cleanup
+finishes the remaining physical work. The namespace owner prevents overlapping
+conversion owners and independent raw body handoffs. The target provider is
+borrowed until close. Root policy and collection conversion remain separate
+coordinator responsibilities.
+
+Traversal uses the checkpoint owner's stable key slots directly. Opening a
+cursor takes constant workspace; each next call pins and decodes one metadata
+value, releasing that reader before conversion. It retains no historical
+namespace-wide value/body view. A volatile logical epoch invalidates traversal
+after ordinary canonical publication or metadata mutation, including a mutation
+during an unlocked metadata read. Physical body replacement, piece repacking and
+coverage flush preserve traversal. Failed next calls leave the caller's owned
+metadata and cursor position unchanged. Epoch saturation rejects traversal until
+the owner is reopened, without wrapping. This adds no persistent-format field.
+
+Source scans use the existing ordered resource index and a scalar kind/id token;
+removing the last visited source does not lose the next position. Cleanup
+returns a waiting result when retained views defer reclamation. It holds no
+mutex over producer input. Sibling namespace commits continue during conversion
+and during a paused metadata read. Logical publication between steps invalidates
+the pass; restarting observes the newly committed state.
+
+Each key retains the funded body-plus-metadata handoff from the preceding
+milestone. Conversion derives its binding from the real namespace, key, version
+and body class. Already matching representations verify encrypted binding
+identity and skip rewriting. A descriptor bound to another key is rejected even
+when its codec flags match. Closing and reopening a pass resumes from durable
+selected references. Failed candidate packs become cleanup work; recovery after
+an uncertain I/O outcome still requires reopening the root and running root-wide
+orphan reclamation before resuming. Completed retired physical space is
+checkpointed on an admission retry when needed for capacity progress.
+
+The capacity fixture converts three distinct incompressible 2 MiB values inside
+a fixed 10 MiB container, closing/reopening after the first conversion. Across
+all four codec combinations and both durability policies, it converts exactly
+three bodies, verifies every decoded byte and logical metadata, and finishes
+with 6,340,608--6,447,104 allocated bytes. Each step admits one key and at most
+three maintenance units. The largest measured allocation request is 131,400
+bytes. A completed authenticated repeat pass reports three matches, zero
+conversions, zero additional container allocation and zero additional syncs.
+These results establish bounded progress without holding a duplicate of the
+whole namespace; the source and replacement for an individual body still need
+temporary space together.
+
+The production Pouch fixture now uses this pass for its 64 state/object handoffs
+across codec/durability combinations and both conversion directions. Its
+metadata, empty-body, tombstone, placeholder and later metadata-update checks
+continue to pass, including a second matching pass. The full namespace failure
+matrix recovers across 2,630 allocation, I/O and torn-write sites, with acknowledged
+results surviving simulated power loss under both durability policies. Ownership
+and mutation tests cover deferred views, sibling progress, competing owners,
+failed cursor reads, publication during a paused metadata read and binding
+verification on the matching path.
+
+Qualification passes 33 selected Debug checks, including maintenance and
+checkpoint fault/concurrency regressions, source-manifest and stack-allocation
+checks. GNU and musl release each pass nine selected checks, including the full
+new failure matrix. Four TSan scenarios pass with instrumented OpenSSL and no
+suppressions. Three strict Memcheck scenarios pass with zero remaining
+allocations, zero errors and only three inherited file descriptors. Product
+sources compile under the existing strict C89 policy and formatting checks pass.
+
+Durable root conversion intent, collection-unit conversion, derived-index
+invalidation and resumable root policy publication remain required. Explicit
+root compression changes still return unsupported. Full conversion performance,
+shared-root qualification and the indexed-readiness latency gap remain open.
+Multifile remains the default/reference and production cutover still requires an
+explicit deployment decision. This milestone changes no format marker or public
+ABI.
+
+Evidence is in ignored `build/pouch-space-namespace-conversion/`: `pressure.log`,
+`faults.log`, `guards.log`, `qualified-debug*`, `qualified-*-release*`,
+`qualified-native.log`, `qualified-tsan.log`, `tsan-*`,
+`qualified-memcheck.log` and `memcheck-*`, together with exact build, instrumented
+relink and memory-check commands.
+
 ### Root and namespace ownership
 
 The experimental root owner now owns the physical container, crypto provider and

@@ -10,6 +10,7 @@ typedef struct ps_namespace_window ps_namespace_window;
 typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_body ps_namespace_body;
 typedef struct ps_namespace_recode ps_namespace_recode;
+typedef struct ps_namespace_conversion ps_namespace_conversion;
 struct lc_pouch_storage_batch;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
@@ -192,6 +193,23 @@ int ps_namespace_recode_begin(ps_namespace *, lc_pouch_crypto *,
 int ps_namespace_recode_run(ps_namespace_recode *, lc_pouch_state_entry *,
                             lc_error *);
 void ps_namespace_recode_close(ps_namespace_recode *);
+typedef struct ps_namespace_conversion_result {
+  uint64_t visited, converted, matching, maintenance, reclaimed;
+  int finished, waiting;
+} ps_namespace_conversion_result;
+/* Offline bounded namespace conversion, including initial/final source cleanup
+ * and reclamation between bodies. Each step visits at most records key slots
+ * and maintenance source/piece units. It retains one owned metadata record,
+ * never a namespace-wide historical view. Matching descriptors are binding-
+ * verified and skipped, so reopening/restarting resumes durable work. Logical
+ * mutation invalidates traversal; crypto is borrowed until close. Root policy,
+ * collections and root-wide orphan cleanup remain the coordinator's concern. */
+int ps_namespace_conversion_open(ps_namespace *, lc_pouch_crypto *,
+                                 ps_namespace_conversion **, lc_error *);
+int ps_namespace_conversion_step(ps_namespace_conversion *, size_t records,
+                                 size_t maintenance,
+                                 ps_namespace_conversion_result *, lc_error *);
+void ps_namespace_conversion_close(ps_namespace_conversion *);
 /* Only fully covered sealed segments and unreferenced sealed body packs are
  * eligible. Captured metadata views defer source retirement with BUSY until
  * their callbacks can no longer open a historical body reference.

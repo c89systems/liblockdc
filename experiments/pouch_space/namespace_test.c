@@ -2179,6 +2179,7 @@ static void bodies(const char *path) {
 }
 #include "body_select_cases.h"
 #include "compound_recode_cases.h"
+#include "namespace_conversion_cases.h"
 #include "recode_cases.h"
 typedef struct run {
   const char *path, *key, *mode;
@@ -2212,6 +2213,12 @@ static void *worker(void *p) {
                     !strcmp(r->mode, "compound-recode-faults"));
   else if (!strcmp(r->mode, "compound-recode-concurrency"))
     compound_concurrency(r->path, r->key);
+  else if (!strcmp(r->mode, "conversion"))
+    sweep_pressure(r->path, r->key);
+  else if (!strcmp(r->mode, "conversion-faults"))
+    sweep_faults(r->path, r->key);
+  else if (!strcmp(r->mode, "conversion-guards"))
+    sweep_guards(r->path, r->key);
   else if (!strcmp(r->mode, "body-budget"))
     body_budget_capacity(r->path);
   else if (!strcmp(r->mode, "body-budget-faults"))

@@ -3729,6 +3729,22 @@ static int lc_pouch_crypto_reader_keys_open(lc_pouch_crypto_reader *reader,
   return LC_OK;
 }
 
+int lc_pouch_crypto_descriptor_matches(lc_pouch_crypto *crypto,
+                                       const char *descriptor, int *matches,
+                                       lc_error *error) {
+  lc_pouch_crypto_desc desc;
+  int rc;
+  if (!matches)
+    return lc_error_set(error, LC_ERR_INVALID, 0,
+                        "codec policy comparison requires output", NULL, NULL,
+                        "pouch");
+  *matches = 0;
+  rc = lc_pouch_crypto_optional_descriptor(descriptor, &desc, error);
+  if (rc == LC_OK)
+    *matches = desc.encrypted == lc_pouch_crypto_enabled(crypto) &&
+               desc.compressed == lc_pouch_crypto_compression_enabled(crypto);
+  return rc;
+}
 int lc_pouch_crypto_reader_verify(lc_pouch_crypto_reader *reader,
                                   const char *descriptor, const char *binding,
                                   lc_error *error) {

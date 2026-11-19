@@ -127,6 +127,10 @@ int lc_pouch_crypto_rebind_descriptor(lc_pouch_crypto *crypto,
  * must be followed by verifying its binding against the expected context. */
 int lc_pouch_crypto_descriptor_same_payload(const char *, const char *,
                                             lc_error *);
+/* Compare representation flags with the requested write policy. This parses
+ * metadata only; the caller separately verifies encrypted binding identity. */
+int lc_pouch_crypto_descriptor_matches(lc_pouch_crypto *, const char *, int *,
+                                       lc_error *);
 int lc_pouch_crypto_descriptor_proof(const char *, unsigned char[32], int *,
                                      lc_error *);
 int lc_pouch_crypto_descriptor_restore(const char *, const unsigned char[32],

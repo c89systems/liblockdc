@@ -121,6 +121,37 @@ ps_ns_resource *ps_ns_find(struct ps_namespace_data *d, unsigned int kind,
              ? d->items[at]
              : NULL;
 }
+int ps_ns_source(struct ps_namespace_data *d, unsigned int kind, uint64_t id,
+                 int after, ps_namespace_source *out, int *found, lc_error *e) {
+  ps_ns_resource *r;
+  ps_stream_info info;
+  size_t at;
+  int rc = LC_OK;
+  *found = 0;
+  memset(out, 0, sizeof(*out));
+  pthread_mutex_lock(&d->mutex);
+  at = position(d, kind, id);
+  if (after && at < d->count && d->items[at]->kind == kind &&
+      d->items[at]->id == id)
+    ++at;
+  r = at < d->count ? d->items[at] : NULL;
+  if (r && (after || (r->kind == kind && r->id == id))) {
+    rc = ps_stream_status(r->stream, &info, e);
+    if (rc == LC_OK) {
+      out->leaf = r->leaf;
+      out->kind = r->kind;
+      out->id = r->id;
+      out->tail = info.tail;
+      out->capacity = info.capacity;
+      out->stored_bytes = info.stored_bytes;
+      out->runs = info.runs;
+      out->sealed = info.sealed;
+      *found = 1;
+    }
+  }
+  pthread_mutex_unlock(&d->mutex);
+  return rc;
+}
 void ps_ns_insert(struct ps_namespace_data *d, ps_ns_resource *r) {
   size_t at = position(d, r->kind, r->id);
   memmove(d->items + at + 1, d->items + at,
