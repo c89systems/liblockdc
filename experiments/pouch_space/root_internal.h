@@ -42,6 +42,7 @@ void ps_namespace_data_destroy(struct ps_namespace_data *);
 /* No calls/pins remain; close can count the budgets its caches will release. */
 size_t ps_namespace_data_budgets(const struct ps_namespace_data *);
 void ps_namespace_retain(ps_namespace *);
+uint64_t ps_namespace_name_hash(const char *);
 int ps_namespace_guard(ps_namespace *, ps_coordination_guard **, lc_error *);
 int ps_namespace_unguard(ps_namespace *, ps_coordination_guard *, int,
                          lc_error *);

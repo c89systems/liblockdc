@@ -8,6 +8,7 @@
  * policy, generations, projections and codecs. No pathname operations. */
 typedef struct lc_pouch_storage_namespace_info {
   uint64_t active_segment, segments, tail;
+  uint64_t checkpoint_epoch;
 } lc_pouch_storage_namespace_info;
 typedef struct lc_pouch_storage_append {
   void *handle;
@@ -128,7 +129,8 @@ typedef struct lc_pouch_storage_metadata_ops {
   int (*begin)(void *, void *, enum lc_pouch_storage_append_mode,
                const lc_pouch_storage_batch *, uint64_t, void **, lc_error *);
   int (*commit)(void *, void *, const lc_pouch_storage_batch *,
-                enum lc_pouch_storage_commit_mode, lc_error *);
+                enum lc_pouch_storage_commit_mode, uint64_t *checkpoint_epoch,
+                lc_error *);
   void (*close)(void *, void *);
   /* At a committed maintenance boundary, make superseded metadata reusable
    * if the next bounded record would otherwise exhaust completion capacity.
@@ -238,10 +240,15 @@ typedef struct lc_pouch_storage_ops {
   int (*queue_wait)(void *, const char *, const char *, uint64_t);
   const struct lc_pouch_index_store_ops *(*query_indexes)(void *, void **);
   const lc_pouch_storage_metadata_ops *metadata;
+  /* Coordinated typed owners serialize state projections and decisions per
+   * logical namespace. Acquire before any source or publication authority. */
+  int (*namespace_state_lock)(void *, const char *, void **, lc_error *);
+  void (*namespace_state_unlock)(void *, void *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
   const lc_pouch_storage_ops *ops;
   void *context;
+  int coordinated_namespaces;
 } lc_pouch_storage;
 
 /* Common logical runtime initialization, without opening a physical root.

@@ -493,11 +493,12 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_lease_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_lease_test PRIVATE
+    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_lease_test)
-  foreach(mode lifecycle phases policy protection fairness concurrency coordinated capacity-completion capacity-required attachment-windows)
+  foreach(mode lifecycle phases policy protection fairness concurrency coordinated capacity-completion capacity-required attachment-windows shared-authority)
     add_test(NAME pouch_space_lease_${mode} COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_lease_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
@@ -583,12 +584,13 @@ if(LOCKDC_BUILD_TESTS)
   target_include_directories(pouch_space_pouch_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_pouch_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_pouch_test PRIVATE
+    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=OPENSSL_init_crypto"
     "LINKER:--wrap=clock_gettime"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-tail maintenance-checksums)
+  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-tail maintenance-checksums shared-state)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
@@ -597,7 +599,7 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_lifetime-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_staging-faults PROPERTIES TIMEOUT 600)
-  foreach(mode staging-active-faults staging-active-recovery-faults)
+  foreach(mode staging-active-faults staging-active-recovery-faults shared-state-crash)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()

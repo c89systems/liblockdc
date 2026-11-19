@@ -8,5 +8,8 @@ int ps_namespace_metadata_begin(ps_namespace *, int,
 int ps_namespace_metadata_commit(ps_namespace_metadata *,
                                  const lc_pouch_storage_batch *,
                                  enum ps_commit_mode, lc_error *);
+/* Selected epoch while the completed metadata operation still owns its scope.
+ */
+uint64_t ps_namespace_metadata_epoch(ps_namespace_metadata *);
 void ps_namespace_metadata_close(ps_namespace_metadata *);
 #endif

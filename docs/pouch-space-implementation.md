@@ -15,8 +15,8 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, guarded stream takeover, and [container namespace handoff](#container-namespace-ownership-handoff) | Shared capacity forecasts, SDK logical projection and collection authority, and normal shared admission |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) and [namespace body source liveness](#cross-process-namespace-source-liveness) | Logical SDK snapshot integration |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), and [SDK namespace authority](#shared-sdk-namespace-authority) | Public queue and transaction coordination, collection authority, shared capacity, and normal shared admission |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
 Native Pouch currently admits one process at a time. Shared coordination
@@ -6688,3 +6688,56 @@ the frozen baseline are in `build/pouch-space-namespace-liveness/`.
 Shared SDK admission still requires logical projection revalidation across
 lease, lock, queue, and transaction decisions, plus collection authority.
 Shared throughput and capacity under peer pressure remain to be measured.
+
+## Shared SDK namespace authority
+
+The typed state engine takes a container-backed namespace guard before
+recovering decisions, validating preconditions, capturing results, or
+publishing changes. A nested call to the same namespace borrows its scope.
+The scope stays with streamed writes through publication and their completion
+barrier. Readers open body windows under that authority and can stream them
+after leaving it. Namespace state guards have 1,792 stripes in the lower half
+of the readiness page. In the shared fixture, a busy stripe yields
+`LC_ERR_PENDING`. Independent stripes continue through a stalled producer.
+
+The logical cache compares the active segment, committed tail, and selected
+checkpoint epoch once per protected scope. A changed tuple causes replay
+before the cache can serve decisions. Native metadata publication can change
+the epoch at a fixed tail, so it returns the selected epoch to the publishing
+handle's coherent cache. A failed replay returns an error and the next scope
+retries revalidation. Root open still validates recovery and restores capacity
+claims. It releases empty namespace caches so marker-only namespaces retain
+their catalog-only behavior.
+
+All 39 affected cases passed on Debug, GNU release, and musl release.
+The three shared SDK cases also passed ThreadSanitizer and strict Memcheck.
+They exercise a blocked and independent writer, a stale precondition rejected
+before input, checkpoint-only peer changes, an injected snapshot fault and
+retry, a retained body stream, a staged write committed by another handle,
+public lease expiry and fencing, and process exit during a streamed write.
+The surviving handle and a later reopen both verify the expected state.
+
+All 36 matched GNU lifecycle runs verified reopened results. Values are median
+milliseconds for `7940f2b6` native / current native / multifile. Both
+10 MiB profiles use exclusive SDK admission and two rounds of streamed
+mutations.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 50.45 / 52.66 / 18.79 | 574.72 / 653.82 / 425.42 | 90.27 / 88.43 / 25.30 | 1204.47 / 1276.11 / 1249.72 |
+| Maximum worker index flush | 20.98 / 21.82 / 0.95 | 18.83 / 17.16 / 1.10 | 30.25 / 38.95 / 2.27 | 19.07 / 18.19 / 4.17 |
+| Maintenance | 6.81 / 6.53 / 0.22 | 6.35 / 7.09 / 0.19 | 6.30 / 7.95 / 0.40 | 11.56 / 7.95 / 0.34 |
+| Close | 0.40 / 0.40 / 36.34 | 0.30 / 0.33 / 35.81 | 0.83 / 0.74 / 58.85 | 0.73 / 0.70 / 60.14 |
+| Reopen | 4.19 / 3.40 / 0.75 | 3.13 / 3.31 / 0.84 | 6.07 / 5.13 / 1.78 | 5.08 / 5.23 / 1.78 |
+
+Native NoSync work took 2.8 to 3.5 times multifile in these samples. The
+small durable native median rose 14 percent against the frozen native
+executable in the initial matrix. A follow-up alternating executable order
+verified all 16 reopens and put current work about 5 percent higher by
+median, with four of eight pairs slower. All logs and the frozen executable
+are in `build/pouch-space-sdk-authority/`.
+
+Normal shared admission remains gated. The next validation needs public
+queue and transaction workflows, collection authority, and shared capacity
+and throughput under contention. Changed peer state can still require a
+full namespace replay, and physical read handoff costs need measurement.

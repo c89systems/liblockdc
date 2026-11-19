@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "budget.h"
+#include "coordination.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention.h"
@@ -30,6 +31,16 @@ static char scenario[192];
 static int benchmark_normal, measure_enabled;
 static size_t measured_syncs;
 static double phase_started, phase_elapsed;
+static int shared_lease_fixture;
+int __real_ps_coordination_open(int, const ps_coordination_options *,
+                                ps_coordination **, lc_error *);
+int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
+                                ps_coordination **out, lc_error *e) {
+  ps_coordination_options selected = *options;
+  if (shared_lease_fixture)
+    selected.shared = 1;
+  return __real_ps_coordination_open(fd, &selected, out, e);
+}
 #define REQUIRE(x)                                                             \
   do {                                                                         \
     __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
@@ -609,6 +620,57 @@ static void lease_policy(const char *directory) {
       }
   free(f);
   lc_error_cleanup(&e);
+}
+static void shared_lease(const char *directory) {
+  fixture *a = calloc(1, sizeof(*a)), *b = calloc(1, sizeof(*b));
+  REQUIRE(a && b);
+  shared_lease_fixture = 1;
+  for (int sync = 0; sync <= 1; ++sync) {
+    lc_error e = {0};
+    lc_acquire_req req;
+    lc_lease *owner = NULL, *successor = NULL;
+    now(1000);
+    setup(a, directory, 0, sync, sync ? 3 : 0, &e);
+    strcpy(b->path, a->path);
+    configure(b, 0, a->sync, a->crypto);
+    open_store(b, 0, &e);
+    /* Warm the peer before the first owner publishes a lock record. */
+    parent(b, "order", 0, 0, &e);
+    owner = acquire(a, "order", NULL, &e);
+    payload(owner, NULL, &e);
+    const long fence = owner->fencing_token;
+    lc_acquire_req_init(&req);
+    req.key = "order";
+    req.owner = "peer";
+    req.ttl_seconds = 300;
+    REQUIRE(b->client->acquire(b->client, &req, &successor, &e) ==
+                LC_ERR_INVALID &&
+            !successor && e.message &&
+            !strcmp(e.message, "pouch lease already held"));
+    clear(&e);
+    now(1310);
+    ok(b->client->acquire(b->client, &req, &successor, &e), &e);
+    REQUIRE(successor && successor->fencing_token > fence);
+    producer stale = source("stale lease cannot publish");
+    stale.pub.impl = &stale;
+    REQUIRE(owner->update(owner, &stale.pub, NULL, &e) == LC_ERR_INVALID);
+    REQUIRE(stale.calls == 0);
+    clear(&e);
+    owner->close(owner);
+    payload(successor, NULL, &e);
+    ok(successor->release(successor, NULL, &e), &e);
+    parent(a, "order", 1, 0, &e);
+    lc_client_close(b->client);
+    b->client = NULL;
+    close_store(a);
+    open_store(a, 0, &e);
+    parent(a, "order", 1, 0, &e);
+    close_store(a);
+    clear(&e);
+  }
+  shared_lease_fixture = 0;
+  free(b);
+  free(a);
 }
 static void protection(const char *directory) {
   lc_error e;
@@ -1579,6 +1641,8 @@ static void *worker(void *context) {
     phase_failures(r->directory);
   else if (!strcmp(r->mode, "policy"))
     lease_policy(r->directory);
+  else if (!strcmp(r->mode, "shared-authority"))
+    shared_lease(r->directory);
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))

@@ -61,6 +61,11 @@ int ps_namespace_metadata_commit(ps_namespace_metadata *metadata,
                         NULL, NULL, "pouch");
   return ps_key_metadata_commit(metadata->delta, batch, mode, e);
 }
+uint64_t ps_namespace_metadata_epoch(ps_namespace_metadata *metadata) {
+  ps_checkpoint_info info;
+  ps_key_checkpoint_info(metadata->data->checkpoint, &info);
+  return info.epoch;
+}
 void ps_namespace_metadata_close(ps_namespace_metadata *metadata) {
   if (!metadata)
     return;

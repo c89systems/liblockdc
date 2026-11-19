@@ -1,7 +1,7 @@
 #include "pouch.h"
 #include "checkpoint.h"
-#include "coordination.h"
 #include "collections.h"
+#include "coordination.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
@@ -130,16 +130,24 @@ static void namespace_close(void *context, void *ns) {
 }
 static int namespace_info(void *context, void *ns,
                           lc_pouch_storage_namespace_info *out, lc_error *e) {
-  ps_namespace_status status;
-  int rc;
   (void)context;
-  rc = ps_namespace_status_get(ns, &status, e);
-  if (rc == LC_OK) {
-    out->active_segment = status.active_segment;
-    out->segments = status.segments;
-    out->tail = status.tail;
-  }
+  return ps_namespace_projection(ns, &out->active_segment, &out->segments,
+                                 &out->tail, &out->checkpoint_epoch, e);
+}
+static int namespace_state_lock(void *context, const char *name, void **out,
+                                lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_coordination_guard *guard = NULL;
+  int rc =
+      ps_coordination_lock(ps_space_coordination(ps_root_space(owner->root)),
+                           PS_COORDINATION_NAMESPACE_STATE,
+                           ps_namespace_name_hash(name), 0, &guard, e);
+  *out = guard;
   return rc;
+}
+static void namespace_state_unlock(void *context, void *guard) {
+  (void)context;
+  ps_coordination_unlock(guard);
 }
 typedef struct namespace_visit_context {
   lc_pouch_storage_namespace_visit_fn visit;
@@ -242,17 +250,21 @@ static int metadata_begin(void *context, void *ns,
 static int metadata_commit(void *context, void *handle,
                            const lc_pouch_storage_batch *batch,
                            enum lc_pouch_storage_commit_mode mode,
-                           lc_error *e) {
+                           uint64_t *checkpoint_epoch, lc_error *e) {
+  int rc;
   (void)context;
   if (mode != LC_POUCH_STORAGE_COMMIT_DEFAULT &&
       mode != LC_POUCH_STORAGE_COMMIT_DEFER_SYNC)
     return lc_error_set(e, LC_ERR_INVALID, 0, "invalid native metadata commit",
                         NULL, NULL, "pouch");
-  return ps_namespace_metadata_commit(handle, batch,
-                                      mode == LC_POUCH_STORAGE_COMMIT_DEFAULT
-                                          ? PS_COMMIT_DEFAULT
-                                          : PS_COMMIT_DEFER_SYNC,
-                                      e);
+  rc = ps_namespace_metadata_commit(handle, batch,
+                                    mode == LC_POUCH_STORAGE_COMMIT_DEFAULT
+                                        ? PS_COMMIT_DEFAULT
+                                        : PS_COMMIT_DEFER_SYNC,
+                                    e);
+  if (rc == LC_OK && checkpoint_epoch)
+    *checkpoint_epoch = ps_namespace_metadata_epoch(handle);
+  return rc;
 }
 static void metadata_close(void *context, void *handle) {
   (void)context;
@@ -582,8 +594,8 @@ static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
   if (rc != LC_OK)
     return rc;
   rc = ps_coordination_lock(ps_space_coordination(ps_root_space(owner->root)),
-                             PS_COORDINATION_TRANSACTION, stripe, wait, &guard,
-                             e);
+                            PS_COORDINATION_TRANSACTION, stripe, wait, &guard,
+                            e);
   if (rc != LC_OK)
     return rc;
   /* Storage can become uncertain while a caller waits for this stripe. */
@@ -753,7 +765,9 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  queue_notify,
                                                  queue_wait,
                                                  query_indexes,
-                                                 &metadata_ops};
+                                                 &metadata_ops,
+                                                 namespace_state_lock,
+                                                 namespace_state_unlock};
 
 ps_root *ps_pouch_state_root(lc_pouch *pouch) {
   ps_pouch_owner *owner;
@@ -830,6 +844,8 @@ int ps_pouch_state_open(const char *path, int create,
   }
   pouch->storage.ops = &storage_ops;
   pouch->storage.context = owner;
+  pouch->storage.coordinated_namespaces =
+      ps_coordination_shared(ps_space_coordination(ps_root_space(owner->root)));
   if (pouch->queue_watch_enabled) {
     pouch->queue_watch_mode = "inprocess";
     pouch->queue_watch_reason = "container_notifications";

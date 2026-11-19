@@ -14,7 +14,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_TRANSACTION,
   PS_COORDINATION_NAMESPACE,
   PS_COORDINATION_STREAM,
-  PS_COORDINATION_NAMESPACE_VIEW
+  PS_COORDINATION_NAMESPACE_VIEW,
+  PS_COORDINATION_NAMESPACE_STATE
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -63,6 +64,8 @@ int ps_coordination_shared(const ps_coordination *);
  * Namespace views take compatible read witnesses with wait=0. Acquire
  * while holding the corresponding namespace guard, and release after the
  * last use of captured metadata. Witnesses may be released across threads.
+ * Namespace state guards serialize SDK decisions and publications outside
+ * the physical namespace scope. Acquire state before physical authority.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
  * finish while another guard waits.

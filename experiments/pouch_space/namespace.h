@@ -42,6 +42,10 @@ int ps_namespace_sources_visit(ps_namespace *, ps_namespace_source_fn, void *,
  * One cached storage owner per namespace, never a pathname/virtual filesystem.
  * An empty namespace has no head/segment until its first append or rotation. */
 int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
+/* Current route and selected checkpoint, with no per-source enumeration. */
+int ps_namespace_projection(ps_namespace *, uint64_t *segment,
+                            uint64_t *segments, uint64_t *tail,
+                            uint64_t *checkpoint_epoch, lc_error *);
 struct ps_checkpoint_observer;
 int ps_namespace_checkpoint_observe(ps_namespace *,
                                     const struct ps_checkpoint_observer *,
@@ -49,10 +53,11 @@ int ps_namespace_checkpoint_observe(ps_namespace *,
 /* Flushes only changed canonical metadata, retaining uncovered history until
  * every bounded batch is selected. Caller holds logical namespace authority. */
 int ps_namespace_checkpoint_flush(ps_namespace *, lc_error *);
-/* Root bootstrap only, before exposing any producer. Replays the canonical
- * suffix and reinstalls its outstanding checkpoint capacity claim without
- * publishing a new key checkpoint. Cached ownership retains the claim. */
+/* Replays the canonical suffix and reinstalls its outstanding checkpoint
+ * capacity claim without publishing a new key checkpoint. */
 int ps_namespace_checkpoint_recover(ps_namespace *, lc_error *);
+/* Before exposing the root, recover state claims and release empty caches. */
+int ps_namespace_recover_on_open(ps_namespace *, lc_error *);
 uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);
 /* Conservative durable work marker, independent of the segment head/tail.
  * Ensure precedes expiry-bearing publication, including for NoSync roots. A

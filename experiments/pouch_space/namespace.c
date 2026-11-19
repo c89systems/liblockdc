@@ -823,6 +823,24 @@ int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
     rc = closed;
   return rc;
 }
+int ps_namespace_projection(ps_namespace *ns, uint64_t *segment,
+                            uint64_t *segments, uint64_t *tail,
+                            uint64_t *checkpoint_epoch, lc_error *e) {
+  struct ps_namespace_data *d;
+  ps_checkpoint_info coverage;
+  int entered, rc = data_get(ns, &d, 0, e);
+  if (rc == LC_OK)
+    rc = lock_current(d, &entered, e);
+  if (rc == LC_OK) {
+    ps_key_checkpoint_info(d->checkpoint, &coverage);
+    *segment = d->active;
+    *segments = d->active - coverage.segment + (coverage.segment != 0);
+    *tail = d->tail;
+    *checkpoint_epoch = coverage.epoch;
+    unlock_current(d, entered);
+  }
+  return rc;
+}
 int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
                             lc_error *e) {
   struct ps_namespace_data *d;
@@ -1451,6 +1469,23 @@ int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
   rc = checkpoint_ready(d, e);
   ps_ns_leave(d);
   return rc;
+}
+int ps_namespace_recover_on_open(ps_namespace *ns, lc_error *e) {
+  ps_checkpoint_info coverage;
+  struct ps_namespace_data *d;
+  int rc = ps_namespace_checkpoint_recover(ns, e);
+  if (rc != LC_OK)
+    return rc;
+  /* The opening root has no local callers. Retain any state sources or
+   * capacity obligations that recovery just validated. */
+  d = ns->data;
+  ps_key_checkpoint_info(d->checkpoint, &coverage);
+  if (!d->active && !d->count && !coverage.epoch &&
+      !ps_namespace_data_budgets(d)) {
+    __atomic_store_n(&ns->data, NULL, __ATOMIC_RELEASE);
+    ps_namespace_data_destroy(d);
+  }
+  return LC_OK;
 }
 int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;

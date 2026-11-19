@@ -37,7 +37,7 @@ static int recover_namespace(const char *name,
   (void)identity; /* The catalog visitor has already checked the incarnation. */
   rc = ps_root_namespace_acquire(root, name, 0, &ns, error);
   if (rc == LC_OK)
-    rc = ps_namespace_checkpoint_recover(ns, error);
+    rc = ps_namespace_recover_on_open(ns, error);
   ps_namespace_release(ns);
   return rc;
 }
@@ -234,7 +234,7 @@ int ps_root_crypto_matches(ps_root *root, lc_pouch_crypto *crypto,
   lc_free_with_allocator(NULL, b);
   return rc;
 }
-static uint64_t name_hash(const char *name) {
+uint64_t ps_namespace_name_hash(const char *name) {
   uint64_t hash = UINT64_C(14695981039346656037);
   const unsigned char *p = (const unsigned char *)name;
   while (*p) {
@@ -372,7 +372,7 @@ int ps_root_namespace_acquire(ps_root *root, const char *name, int create,
   rc = ps_check(root->space, error);
   if (rc != LC_OK)
     return rc;
-  hash = name_hash(name);
+  hash = ps_namespace_name_hash(name);
   pthread_mutex_lock(&root->mutex);
   ++root->calls;
   ns = find(root, name, hash);

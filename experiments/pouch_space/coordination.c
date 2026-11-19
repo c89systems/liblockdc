@@ -16,6 +16,8 @@
 #define NS_SLOTS (2U * PS_PAGE - NS_BASE)
 #define VIEW_SLOTS (PS_PAGE / 2U)
 #define VIEW_BASE (PS_METADATA_START - VIEW_SLOTS)
+#define STATE_BASE (PS_READINESS_OFFSET + 256U)
+#define STATE_SLOTS (VIEW_BASE - STATE_BASE)
 struct ps_coordination_guard {
   ps_coordination *owner;
   pthread_mutex_t mutex;
@@ -244,6 +246,8 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
     return STREAM_BASE + identity % (TXN_BASE - STREAM_BASE);
   if (domain == PS_COORDINATION_NAMESPACE_VIEW)
     return VIEW_BASE + identity % VIEW_SLOTS;
+  if (domain == PS_COORDINATION_NAMESPACE_STATE)
+    return STATE_BASE + identity % STATE_SLOTS;
   return NS_BASE + identity % NS_SLOTS;
 }
 int ps_coordination_namespace_view_conflict(ps_coordination *owner,
@@ -384,7 +388,7 @@ int ps_coordination_lock(ps_coordination *owner,
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_NAMESPACE_VIEW ||
+      domain > PS_COORDINATION_NAMESPACE_STATE ||
       (domain >= PS_COORDINATION_STREAM && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&

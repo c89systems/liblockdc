@@ -166,6 +166,8 @@ void *lc_pouch_test_cleanup_fsync_context = NULL;
 
 typedef struct lc_pouch_state_namespace_lock {
   int fd;
+  void *storage_guard;
+  int projection_current;
   struct lc_pouch_state_process_namespace_mutex *process_mutex;
   struct lc_pouch_state_process_namespace_guard *maintenance_guard;
   struct lc_pouch_state_shared_mutation_guard *shared_mutation;
@@ -178,6 +180,7 @@ typedef struct lc_pouch_state_namespace_lock {
 } lc_pouch_state_namespace_lock;
 
 typedef struct lc_pouch_state_key_lock {
+  lc_pouch_state_namespace_lock storage_scope;
   int fd;
   int maintenance_fd;
   struct lc_pouch_state_process_namespace_mutex *process_mutex;
@@ -362,6 +365,11 @@ static int lc_pouch_state_cache_active_append_fd(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest, int *out, lc_error *error);
 static int lc_pouch_state_storage_prepare(lc_pouch *, const char *, lc_error *);
+static int lc_pouch_state_namespace_lock_acquire(
+    lc_pouch *, const char *, lc_pouch_state_namespace_lock *, lc_error *);
+static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *,
+                                                          const char *,
+                                                          lc_error *);
 static int
 lc_pouch_state_cache_manifest_borrow(lc_pouch *,
                                      const lc_pouch_namespace_logstore *,
@@ -539,23 +547,29 @@ lc_pouch_state_projection_lock_current(lc_pouch *pouch, const char *ns) {
   return lock;
 }
 
-static int lc_pouch_state_namespace_lock_is_held(lc_pouch *pouch,
-                                                 const char *ns) {
+static lc_pouch_state_namespace_lock *
+lc_pouch_state_namespace_lock_current(lc_pouch *pouch, const char *ns) {
   lc_pouch_state_namespace_lock *lock;
 
   pthread_once(&lc_pouch_state_namespace_lock_key_once,
                lc_pouch_state_namespace_lock_key_init);
   if (lc_pouch_state_namespace_lock_key_status != 0) {
-    return 0;
+    return NULL;
   }
   for (lock = (lc_pouch_state_namespace_lock *)pthread_getspecific(
            lc_pouch_state_namespace_lock_key);
        lock != NULL; lock = lock->previous_namespace_lock) {
-    if (lock->pouch == pouch && lock->ns != NULL && strcmp(lock->ns, ns) == 0) {
-      return 1;
+    if (!lock->borrowed && lock->pouch == pouch && lock->ns != NULL &&
+        strcmp(lock->ns, ns) == 0) {
+      return lock;
     }
   }
-  return 0;
+  return NULL;
+}
+
+static int lc_pouch_state_namespace_lock_is_held(lc_pouch *pouch,
+                                                 const char *ns) {
+  return lc_pouch_state_namespace_lock_current(pouch, ns) != NULL;
 }
 
 /* Closing a client from an application source or visitor callback is valid.
@@ -1300,6 +1314,7 @@ static int lc_pouch_state_projection_mutex_lock(lc_pouch *pouch, const char *ns,
 }
 
 typedef struct lc_pouch_state_cache_guard {
+  lc_pouch_state_namespace_lock storage_scope;
   lc_pouch_state_process_namespace_mutex *namespace_mutex;
   lc_pouch_state_shared_mutation_guard *shared_mutation;
   int shared_projection_locked;
@@ -1334,6 +1349,16 @@ static int lc_pouch_state_cache_guard_lock(lc_pouch *pouch, const char *ns,
       lc_pouch_state_projection_lock_current(pouch, ns) != NULL) {
     return LC_OK;
   }
+  if (pouch->storage.coordinated_namespaces) {
+    int rc = lc_pouch_state_namespace_lock_acquire(
+        pouch, ns, &guard->storage_scope, error);
+    if (rc == LC_OK) {
+      rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
+      if (rc != LC_OK)
+        lc_pouch_state_namespace_lock_release(&guard->storage_scope);
+    }
+    return rc;
+  }
   if (lc_pouch_single_writer_enabled(pouch)) {
     return lc_pouch_state_process_namespace_mutex_lock(
         pouch, ns, &guard->namespace_mutex, error);
@@ -1363,6 +1388,8 @@ lc_pouch_state_cache_guard_unlock(lc_pouch *pouch,
   if (guard == NULL) {
     return;
   }
+  if (guard->storage_scope.storage_guard)
+    lc_pouch_state_namespace_lock_release(&guard->storage_scope);
   if (guard->shared_projection_locked) {
     guard->shared_projection_locked = 0;
     (void)pthread_mutex_unlock(&pouch->state_mutation_mutex);
@@ -2101,9 +2128,6 @@ lc_pouch_state_body_cache_entry_retire(const lc_allocator *allocator,
 static void
 lc_pouch_state_body_cache_entry_destroy(const lc_allocator *allocator,
                                         lc_pouch_state_body_cache_entry *entry);
-static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
-                                                          const char *ns,
-                                                          lc_error *error);
 static int
 lc_pouch_state_delete_locked(lc_pouch *pouch, const char *ns, const char *key,
                              const lc_pouch_state_write_options *options,
@@ -2592,6 +2616,8 @@ lc_pouch_state_namespace_lock_acquire(lc_pouch *pouch, const char *ns,
                         NULL, NULL, NULL);
   }
   lock->fd = -1;
+  lock->storage_guard = NULL;
+  lock->projection_current = 0;
   lock->process_mutex = NULL;
   lock->maintenance_guard = NULL;
   lock->shared_mutation = NULL;
@@ -2613,6 +2639,19 @@ lc_pouch_state_namespace_lock_acquire(lc_pouch *pouch, const char *ns,
                                                    : LC_ERR_TRANSPORT;
     }
     return LC_OK;
+  }
+  if (pouch->storage.coordinated_namespaces) {
+    int rc = pouch->storage.ops->namespace_state_lock(
+        pouch->storage.context, ns, &lock->storage_guard, error);
+    if (rc == LC_OK) {
+      rc = lc_pouch_state_namespace_lock_track(lock, pouch, ns, error);
+      if (rc != LC_OK) {
+        pouch->storage.ops->namespace_state_unlock(pouch->storage.context,
+                                                   lock->storage_guard);
+        lock->storage_guard = NULL;
+      }
+    }
+    return rc;
   }
   if (!single_writer && lc_pouch_state_shared_mutation_acquire(
                             pouch, &lock->shared_mutation, error) != LC_OK) {
@@ -2760,6 +2799,14 @@ lc_pouch_state_namespace_lock_release(lc_pouch_state_namespace_lock *lock) {
     lc_pouch_state_namespace_lock_untrack(lock);
     return;
   }
+  if (lock->storage_guard) {
+    lc_pouch *pouch = lock->pouch;
+    lc_pouch_state_namespace_lock_untrack(lock);
+    pouch->storage.ops->namespace_state_unlock(pouch->storage.context,
+                                               lock->storage_guard);
+    lock->storage_guard = NULL;
+    return;
+  }
   if (lock->shared_projection_locked && lock->pouch != NULL) {
     lock->shared_projection_locked = 0;
     (void)pthread_mutex_unlock(&lock->pouch->state_mutation_mutex);
@@ -2806,7 +2853,9 @@ static int lc_pouch_state_append_lock_acquire(lc_pouch *pouch, const char *ns,
   lock->previous_append_lock = NULL;
   lock->borrowed = 0;
   single_writer = lc_pouch_single_writer_enabled(pouch);
-  if (lc_pouch_state_append_lock_current(pouch, ns) != NULL) {
+  if ((pouch->storage.coordinated_namespaces &&
+       lc_pouch_state_namespace_lock_is_held(pouch, ns)) ||
+      lc_pouch_state_append_lock_current(pouch, ns) != NULL) {
     lock->borrowed = 1;
     return LC_OK;
   }
@@ -2909,6 +2958,7 @@ static int lc_pouch_state_key_lock_acquire(lc_pouch *pouch, const char *ns,
                         "pouch");
   }
   lock->fd = -1;
+  lock->storage_scope.storage_guard = NULL;
   lock->maintenance_fd = -1;
   lock->process_mutex = NULL;
   lock->maintenance_guard = NULL;
@@ -2927,6 +2977,13 @@ static int lc_pouch_state_key_lock_acquire(lc_pouch *pouch, const char *ns,
      * outer projection authority. */
     lock->projection_uses_namespace_mutex = 1;
     return LC_OK;
+  }
+  if (pouch->storage.coordinated_namespaces) {
+    rc = lc_pouch_state_namespace_lock_acquire(pouch, ns, &lock->storage_scope,
+                                               error);
+    if (rc == LC_OK)
+      lock->projection_uses_namespace_mutex = 1;
+    return rc;
   }
   canonical_key = strstr(key, "/.staging/");
   key_len = canonical_key != NULL ? (size_t)(canonical_key - key) : strlen(key);
@@ -3030,6 +3087,8 @@ static void lc_pouch_state_key_lock_release(lc_pouch_state_key_lock *lock) {
     (void)pthread_mutex_unlock(lock->exclusive_key_mutex);
     lock->exclusive_key_mutex = NULL;
   }
+  if (lock->storage_scope.storage_guard)
+    lc_pouch_state_namespace_lock_release(&lock->storage_scope);
   lock->pouch = NULL;
   lock->ns = NULL;
   lock->projection_uses_namespace_mutex = 0;
@@ -3052,7 +3111,7 @@ static int lc_pouch_state_key_mutation_begin(lc_pouch *pouch, const char *ns,
   /* Recovery has its own mutation authority. Complete it first so this
    * operation can pin one writer mode through append and durable completion. */
   namespace_locked = lc_pouch_state_namespace_lock_is_held(pouch, ns);
-  rc = namespace_locked
+  rc = namespace_locked || pouch->storage.coordinated_namespaces
            ? LC_OK
            : lc_pouch_state_recover_staged_decisions(pouch, ns, error);
   if (rc != LC_OK) {
@@ -3078,6 +3137,11 @@ static int lc_pouch_state_key_mutation_begin(lc_pouch *pouch, const char *ns,
   }
   lock->writer_mode_operation_active = writer_mode_operation_active;
   rc = lc_pouch_state_projection_lock_track(lock, error);
+  if (rc == LC_OK && lock->storage_scope.storage_guard) {
+    rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
+    if (rc != LC_OK)
+      lc_pouch_state_projection_lock_untrack(lock);
+  }
   if (rc != LC_OK) {
     lc_pouch_state_key_lock_release(lock);
     if (writer_mode_operation_active) {
@@ -3502,6 +3566,7 @@ struct lc_pouch_namespace_logstore {
   int active_append_fd_owned;
   uint64_t active_segment_offset;
   uint64_t active_segment_id;
+  uint64_t storage_checkpoint_epoch;
   uint64_t max_segment_id;
   unsigned long segment_count;
   lc_pouch_generation max_version;
@@ -7067,7 +7132,11 @@ binary_append_ready:
     if (pouch->storage.ops != NULL) {
       rc = pouch->storage.ops->metadata->commit(
           pouch->storage.context, metadata_plan, &storage_batch,
-          lc_pouch_state_storage_commit_mode(pouch), error);
+          lc_pouch_state_storage_commit_mode(pouch),
+          pouch->storage.coordinated_namespaces
+              ? &cache->storage_checkpoint_epoch
+              : NULL,
+          error);
     } else
       rc = lc_pouch_state_defer_fsync(pouch, fd, error);
   }
@@ -10313,6 +10382,7 @@ int lc_pouch_state_snapshot_visit(const lc_pouch_state_snapshot *snapshot,
  * manufactured for a typed storage namespace. */
 static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
                                           lc_error *error) {
+  lc_pouch_state_namespace_lock *scope = NULL;
   lc_pouch_namespace_logstore *cache;
   lc_pouch_storage_namespace_info info;
   lc_pouch_storage_replay_context replay;
@@ -10320,26 +10390,48 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   int rc = pouch->storage.ops->check(pouch->storage.context, error);
   if (rc != LC_OK)
     return rc;
+  if (pouch->storage.coordinated_namespaces) {
+    scope = lc_pouch_state_namespace_lock_current(pouch, ns);
+    if (scope == NULL || scope->storage_guard == NULL)
+      return lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "container projection requires namespace authority",
+                          NULL, NULL, "pouch");
+  }
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 1, error);
   if (cache == NULL)
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
-  if (cache->initialized)
+  if (cache->initialized && (scope == NULL || scope->projection_current))
     return LC_OK;
-  lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
-  cache->max_version = cache->max_query_index_seq = 0;
-  cache->max_segment_id = cache->segment_count = 0;
   if (cache->storage_namespace == NULL) {
     rc = pouch->storage.ops->namespace_open(pouch->storage.context, ns, 1,
                                             &cache->storage_namespace, error);
     if (rc != LC_OK)
       return rc;
   }
+  if (scope != NULL) {
+    /* Native metadata can select a new checkpoint without advancing the
+     * append tail. Its epoch and the physical route jointly certify reuse. */
+    rc = pouch->storage.ops->namespace_info(
+        pouch->storage.context, cache->storage_namespace, &info, error);
+    if (rc != LC_OK)
+      return rc;
+    if (cache->initialized && cache->active_segment_id == info.active_segment &&
+        cache->active_segment_offset == info.tail &&
+        cache->storage_checkpoint_epoch == info.checkpoint_epoch) {
+      scope->projection_current = 1;
+      return LC_OK;
+    }
+  }
+  cache->initialized = 0;
+  lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
+  cache->max_version = cache->max_query_index_seq = 0;
+  cache->max_segment_id = cache->segment_count = 0;
   replay.pouch = pouch;
   replay.cache = cache;
   rc = pouch->storage.ops->replay(
       pouch->storage.context, cache->storage_namespace,
       lc_pouch_state_storage_replay, &replay, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK && scope == NULL)
     rc = pouch->storage.ops->namespace_info(
         pouch->storage.context, cache->storage_namespace, &info, error);
   if (rc == LC_OK && info.active_segment != 0) {
@@ -10359,10 +10451,14 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   cache->active_segment_id = cache->max_segment_id = info.active_segment;
   cache->segment_count = (unsigned long)info.segments;
   cache->active_segment_offset = info.tail;
+  cache->storage_checkpoint_epoch = info.checkpoint_epoch;
   cache->writer_mode_epoch = pouch->single_writer_epoch;
   cache->decision_recovery_checked =
       !lc_pouch_state_cache_has_live_staged_records(cache);
   cache->initialized = 1;
+  /* A borrowed record remains valid until its logical scope ends. */
+  if (scope != NULL)
+    scope->projection_current = 1;
   return LC_OK;
 }
 
@@ -14167,7 +14263,7 @@ int lc_pouch_state_recover_staged_decisions(lc_pouch *pouch, const char *ns,
   if (pouch == NULL || ns == NULL || ns[0] == '\0') {
     return lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
   }
-  if (pouch->storage.ops != NULL) {
+  if (pouch->storage.ops != NULL && !pouch->storage.coordinated_namespaces) {
     int checked = 0;
     rc = lc_pouch_state_cache_guard_lock(pouch, ns, &guard, error);
     if (rc == LC_OK) {
@@ -18144,7 +18240,9 @@ static int lc_pouch_state_read_internal(lc_pouch *pouch, const char *ns,
   /* Decision records are durable transaction state. Recover them before the
    * read mutex so a direct read observes the same committed view as scans and
    * mutations, without recursively acquiring the read coordination. */
-  rc = lc_pouch_ensure_namespace(pouch, ns, error);
+  rc = pouch->storage.coordinated_namespaces
+           ? LC_OK
+           : lc_pouch_ensure_namespace(pouch, ns, error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -18523,7 +18621,9 @@ static int lc_pouch_state_read_many_internal(
     }
   }
   memset(&cache_guard, 0, sizeof(cache_guard));
-  rc = lc_pouch_ensure_namespace(pouch, ns, error);
+  rc = pouch->storage.coordinated_namespaces
+           ? LC_OK
+           : lc_pouch_ensure_namespace(pouch, ns, error);
   if (rc != LC_OK) {
     lc_pouch_state_read_many_snapshots_cleanup(&pouch->allocator, snapshots,
                                                snapshot_count);
@@ -18817,7 +18917,9 @@ static int lc_pouch_state_visit_internal(lc_pouch *pouch, const char *ns,
       return rc;
     }
   } else {
-    rc = lc_pouch_ensure_namespace(pouch, ns, error);
+    rc = pouch->storage.coordinated_namespaces
+             ? LC_OK
+             : lc_pouch_ensure_namespace(pouch, ns, error);
     if (rc != LC_OK) {
       return rc;
     }
@@ -19032,7 +19134,9 @@ int lc_pouch_state_visit_since(lc_pouch *pouch, const char *ns,
   snapshots = NULL;
   snapshot_count = 0U;
   snapshot_capacity = 0U;
-  rc = lc_pouch_ensure_namespace(pouch, ns, error);
+  rc = pouch->storage.coordinated_namespaces
+           ? LC_OK
+           : lc_pouch_ensure_namespace(pouch, ns, error);
   if (rc != LC_OK) {
     goto cleanup;
   }

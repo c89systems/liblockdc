@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "checkpoint_record.h"
+#include "coordination.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
@@ -14,6 +15,7 @@
 #include <openssl/crypto.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +30,33 @@ static size_t checks, allocation, fail_at;
 static int armed;
 static char *crypto_key;
 static int fail_crypto_init;
+static int shared_state_fixture;
+static const char *executable_path;
+static int fail_shared_view;
+static int shared_state_fcntl(void *context, int fd, int cmd,
+                              struct flock *lock) {
+  (void)context;
+  if (fail_shared_view && cmd == F_OFD_SETLK && lock->l_type == F_RDLCK &&
+      lock->l_start >= (off_t)(PS_METADATA_START - PS_PAGE / 2) &&
+      lock->l_start < (off_t)PS_METADATA_START) {
+    fail_shared_view = 0;
+    errno = EIO;
+    return -1;
+  }
+  return fcntl(fd, cmd, lock);
+}
+int __real_ps_coordination_open(int, const ps_coordination_options *,
+                                ps_coordination **, lc_error *);
+int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
+                                ps_coordination **out, lc_error *e) {
+  ps_coordination_options selected = *options;
+  static const ps_coordination_io io = {NULL, shared_state_fcntl};
+  if (shared_state_fixture) {
+    selected.shared = 1;
+    selected.io = &io;
+  }
+  return __real_ps_coordination_open(fd, &selected, out, e);
+}
 #define REQUIRE(x)                                                             \
   do {                                                                         \
     __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
@@ -5598,6 +5627,188 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
 #include "abandoned_pouch_cases.h"
 #include "body_select_client_cases.h"
 #include "ordered_read_cases.h"
+static void shared_state(const char *path, const char *directory) {
+  shared_state_fixture = 1;
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_pouch_state_options o = options(durable ? 3 : 0, durable);
+    lc_pouch *a = NULL, *b = NULL;
+    lc_pouch_state_write_result w = {0};
+    lc_pouch_state_read_result old = {0}, current = {0};
+    lc_pouch_state_write_options expected = {0}, metadata = {0};
+    input in = source(41, 1);
+    gate held = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+    pthread_t thread;
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &a, &e), &e);
+    ok(put(a, "held", "key", &in, NULL, &w, &e), &e);
+    REQUIRE(w.version == 1 && w.index_seq == 1);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &b, &e), &e);
+    ok(lc_pouch_state_read(b, "held", "key", &old, &e), &e);
+    REQUIRE(old.found && old.version == 1 && old.bytes == 41);
+    job writer = {a, &held, 0, 0, 0, 0};
+    REQUIRE(pthread_create(&thread, NULL, held_writer, &writer) == 0);
+    pthread_mutex_lock(&held.mutex);
+    while (!held.entered)
+      pthread_cond_wait(&held.changed, &held.mutex);
+    pthread_mutex_unlock(&held.mutex);
+    in = source(43, 3);
+    expected.has_expected_version = 1;
+    expected.expected_version = 1;
+    REQUIRE(put(b, "held", "key", &in, &expected, &w, &e) == LC_ERR_PENDING);
+    REQUIRE(in.calls == 0);
+    clear(&e);
+    REQUIRE(lc_pouch_state_read_metadata(b, "held", "key", &current, &e) ==
+            LC_ERR_PENDING);
+    clear(&e);
+    ok(put(b, "independent", "key", &in, NULL, &w, &e), &e);
+    REQUIRE(w.version == 1 && w.index_seq == 1);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    pthread_mutex_lock(&held.mutex);
+    held.released = 1;
+    pthread_cond_broadcast(&held.changed);
+    pthread_mutex_unlock(&held.mutex);
+    REQUIRE(pthread_join(thread, NULL) == 0);
+    REQUIRE(writer.rc == LC_OK);
+    pthread_mutex_destroy(&held.mutex);
+    pthread_cond_destroy(&held.changed);
+
+    in = source(45, 5);
+    REQUIRE(put(b, "held", "key", &in, &expected, &w, &e) == LC_ERR_INVALID);
+    REQUIRE(in.calls == 0);
+    clear(&e);
+    ok(lc_pouch_state_read_metadata(b, "held", "key", &current, &e), &e);
+    REQUIRE(current.found && current.version == 2 && current.index_seq == 2);
+    lc_pouch_state_read_result_cleanup(&allocator, &current);
+    metadata.has_expected_version = 1;
+    metadata.expected_version = 2;
+    metadata.has_metadata = 1;
+    metadata.metadata = (const unsigned char *)"peer";
+    metadata.metadata_length = 4;
+    ok(lc_pouch_state_update_metadata(b, "held", "key", &metadata, &w, &e), &e);
+    REQUIRE(w.version == 2 && w.index_seq == 3);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    /* The publishing handle retains its initialized projection. The peer
+     * must rebuild from the selected checkpoint even though the tail agrees. */
+    fail_shared_view = 1;
+    ok(lc_pouch_state_read_metadata(b, "held", "key", &current, &e), &e);
+    REQUIRE(current.index_seq == 3 && fail_shared_view);
+    lc_pouch_state_read_result_cleanup(&allocator, &current);
+    REQUIRE(lc_pouch_state_read_metadata(a, "held", "key", &current, &e) ==
+            LC_ERR_TRANSPORT);
+    REQUIRE(!current.found && !fail_shared_view);
+    clear(&e);
+    ok(lc_pouch_state_read_metadata(a, "held", "key", &current, &e), &e);
+    REQUIRE(current.found && current.version == 2 && current.index_seq == 3 &&
+            current.metadata_length == 4 &&
+            !memcmp(current.metadata, "peer", 4));
+    lc_pouch_state_read_result_cleanup(&allocator, &current);
+    drain(old.body, 41, 1, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &old);
+
+    in.pub.impl = &in;
+    ok(lc_pouch_state_stage_write(b, "held", "transactional", "attempt",
+                                  &in.pub, NULL, &w, &e),
+       &e);
+    REQUIRE(w.index_seq == 4);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    ok(lc_pouch_state_commit_staged(a, "held", "transactional", "attempt", &w,
+                                    &e),
+       &e);
+    REQUIRE(w.version == 1 && w.index_seq > 4);
+    lc_pouch_state_write_result_cleanup(&allocator, &w);
+    read_value(b, "held", "transactional", 45, 5, 1, &e);
+    lc_pouch_close(b);
+    lc_pouch_close(a);
+    REQUIRE(live == 0);
+    one_file(directory);
+    a = NULL;
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &a, &e), &e);
+    read_value(a, "held", "transactional", 45, 5, 1, &e);
+    read_value(a, "independent", "key", 43, 3, 1, &e);
+    lc_pouch_close(a);
+    REQUIRE(live == 0 && unlink(path) == 0);
+    clear(&e);
+  }
+  shared_state_fixture = 0;
+}
+typedef struct abandoned_producer {
+  int notify, started;
+} abandoned_producer;
+static size_t append_then_wait(lc_source *source, void *buffer, size_t bytes,
+                               lc_error *e) {
+  abandoned_producer *producer = source->impl;
+  (void)e;
+  if (!producer->started) {
+    producer->started = 1;
+    memset(buffer, 'X', bytes);
+    return bytes;
+  }
+  REQUIRE(write(producer->notify, "W", 1) == 1);
+  for (;;)
+    pause();
+}
+static void shared_state_child(const char *path, int notify) {
+  ps_pouch_state_options o = options(0, 1);
+  lc_pouch *p = NULL;
+  lc_error e = {0};
+  lc_pouch_state_write_result result = {0};
+  abandoned_producer producer = {notify, 0};
+  lc_source source = {0};
+  shared_state_fixture = 1;
+  source.impl = &producer;
+  source.read = append_then_wait;
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  (void)lc_pouch_state_write(p, "shared", "key", &source, NULL, &result, &e);
+  fprintf(stderr, "abandoned writer returned: %s\n",
+          e.message ? e.message : "?");
+  _exit(1);
+}
+static void shared_state_crash(const char *path) {
+  lc_error e = {0};
+  ps_pouch_state_options o = options(0, 1);
+  lc_pouch *p = NULL;
+  lc_pouch_state_read_result current = {0};
+  lc_pouch_state_write_result w = {0};
+  input in = source(41, 1);
+  int notify[2], status;
+  char byte;
+  shared_state_fixture = 1;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  ok(put(p, "shared", "key", &in, NULL, &w, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  REQUIRE(pipe(notify) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    char fd[24];
+    REQUIRE(close(notify[0]) == 0);
+    snprintf(fd, sizeof(fd), "%d", notify[1]);
+    execlp(executable_path, executable_path, "--shared-state-child", path, fd,
+           (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(close(notify[1]) == 0);
+  REQUIRE(read(notify[0], &byte, 1) == 1 && byte == 'W');
+  REQUIRE(lc_pouch_state_read_metadata(p, "shared", "key", &current, &e) ==
+          LC_ERR_PENDING);
+  clear(&e);
+  REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &status, 0) == child &&
+          WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  REQUIRE(close(notify[0]) == 0);
+  read_value(p, "shared", "key", 41, 1, 1, &e);
+  in = source(43, 2);
+  ok(put(p, "shared", "key", &in, NULL, &w, &e), &e);
+  REQUIRE(w.version == 2 && w.index_seq == 2);
+  lc_pouch_state_write_result_cleanup(&allocator, &w);
+  lc_pouch_close(p);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  read_value(p, "shared", "key", 43, 2, 2, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  clear(&e);
+  shared_state_fixture = 0;
+}
 typedef struct run {
   const char *path, *directory, *mode;
 } run;
@@ -5605,6 +5816,10 @@ static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->directory);
+  else if (!strcmp(r->mode, "shared-state"))
+    shared_state(r->path, r->directory);
+  else if (!strcmp(r->mode, "shared-state-crash"))
+    shared_state_crash(r->path);
   else if (!strcmp(r->mode, "body-select"))
     body_select_client(r->path, r->directory);
   else if (!strcmp(r->mode, "faults"))
@@ -5699,7 +5914,10 @@ int main(int argc, char **argv) {
   pthread_t thread;
   lc_error e;
   run r;
+  if (argc == 4 && !strcmp(argv[1], "--shared-state-child"))
+    shared_state_child(argv[2], atoi(argv[3]));
   REQUIRE(argc == 3 || argc == 6);
+  executable_path = argv[0];
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-runtime-", argv[1]) <
           (int)sizeof(prefix));
   REQUIRE(snprintf(template_path, sizeof(template_path), "%sXXXXXX", prefix) <
