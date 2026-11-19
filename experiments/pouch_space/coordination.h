@@ -12,7 +12,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_ALLOCATION,
   PS_COORDINATION_SYNC,
   PS_COORDINATION_TRANSACTION,
-  PS_COORDINATION_NAMESPACE
+  PS_COORDINATION_NAMESPACE,
+  PS_COORDINATION_STREAM
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -56,16 +57,19 @@ int ps_coordination_shared(const ps_coordination *);
  * Sync leadership uses byte 5; never wait for it while holding allocation.
  * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
+ * Stream incarnations use a disjoint set of stripes. Stream guards are
+ * nonblocking (wait=0) and may be released by a different thread.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
- * mutex spans waiting. One thread owns a guard through release; guards are
- * nonrecursive. Independent identities may finish while another guard waits.
+ * mutex spans waiting. Guards are nonrecursive. Independent identities may
+ * finish while another guard waits.
  * Exclusive transaction guards use resident mutexes without allocation or
  * file-lock syscalls; exclusive lifetime authority excludes other processes. */
 int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
-/* Release on the acquiring thread. An uncertain kernel unlock poisons the
- * owner; further acquisition fails until close/reopen. Cleanup remains legal.
+/* Except for stream guards, release on the acquiring thread. An uncertain
+ * kernel unlock poisons the owner; further acquisition fails until
+ * close/reopen. Cleanup remains legal.
  */
 void ps_coordination_unlock(ps_coordination_guard *);
 

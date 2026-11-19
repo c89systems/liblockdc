@@ -10,6 +10,7 @@
 
 #define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
 #define BUCKETS 67U
+#define STREAM_BASE UINT64_C(8)
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
 #define NS_SLOTS (2U * PS_PAGE - NS_BASE)
@@ -18,7 +19,7 @@ struct ps_coordination_guard {
   pthread_mutex_t mutex;
   uint64_t offset;
   size_t users;
-  int fixed;
+  int fixed, stream, held;
   struct ps_coordination_guard *next;
 };
 struct ps_coordination {
@@ -226,8 +227,8 @@ static void drop(ps_coordination_guard *guard) {
   }
   __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
 }
-static int namespace_guard(ps_coordination *owner, uint64_t identity,
-                           ps_coordination_guard **out, lc_error *e) {
+static int dynamic_guard(ps_coordination *owner, uint64_t identity, int stream,
+                         ps_coordination_guard **out, lc_error *e) {
   ps_coordination_guard *guard, *candidate;
   uint64_t offset;
   size_t bucket;
@@ -236,7 +237,8 @@ static int namespace_guard(ps_coordination *owner, uint64_t identity,
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
-  offset = NS_BASE + identity % NS_SLOTS;
+  offset = stream ? STREAM_BASE + identity % (TXN_BASE - STREAM_BASE)
+                  : NS_BASE + identity % NS_SLOTS;
   bucket = (size_t)(offset % BUCKETS);
   pthread_mutex_lock(&owner->registry);
   for (guard = owner->buckets[bucket]; guard; guard = guard->next)
@@ -250,17 +252,17 @@ static int namespace_guard(ps_coordination *owner, uint64_t identity,
   candidate =
       lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*candidate));
   if (!candidate) {
-    return fail(e, LC_ERR_NOMEM, 0,
-                "cannot allocate namespace coordination guard");
+    return fail(e, LC_ERR_NOMEM, 0, "cannot allocate keyed coordination guard");
   }
   candidate->owner = owner;
   candidate->offset = offset;
   candidate->users = 1;
+  candidate->stream = stream;
   rc = pthread_mutex_init(&candidate->mutex, NULL);
   if (rc) {
     lc_free_with_allocator(&owner->allocator, candidate);
     return fail(e, LC_ERR_TRANSPORT, rc,
-                "cannot initialize namespace coordination");
+                "cannot initialize keyed coordination");
   }
   pthread_mutex_lock(&owner->registry);
   for (guard = owner->buckets[bucket]; guard; guard = guard->next)
@@ -297,6 +299,25 @@ static int kernel_lock(ps_coordination_guard *guard, int acquire, int wait) {
   } while (rc < 0 && errno == EINTR);
   return rc;
 }
+static int local_lock(ps_coordination_guard *guard, int wait) {
+  int rc = wait ? pthread_mutex_lock(&guard->mutex)
+                : pthread_mutex_trylock(&guard->mutex);
+  if (!rc && guard->stream) {
+    if (guard->held)
+      rc = EBUSY;
+    else
+      guard->held = 1;
+    pthread_mutex_unlock(&guard->mutex);
+  }
+  return rc;
+}
+static void local_unlock(ps_coordination_guard *guard) {
+  if (guard->stream) {
+    pthread_mutex_lock(&guard->mutex);
+    guard->held = 0;
+  }
+  pthread_mutex_unlock(&guard->mutex);
+}
 int ps_coordination_lock(ps_coordination *owner,
                          enum ps_coordination_domain domain, uint64_t identity,
                          int wait, ps_coordination_guard **out, lc_error *e) {
@@ -305,8 +326,8 @@ int ps_coordination_lock(ps_coordination *owner,
   if (out)
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
-      domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_NAMESPACE ||
+      domain < PS_COORDINATION_PUBLICATION || domain > PS_COORDINATION_STREAM ||
+      (domain == PS_COORDINATION_STREAM && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES))
@@ -315,8 +336,9 @@ int ps_coordination_lock(ps_coordination *owner,
   if (rc != LC_OK)
     return rc;
   __atomic_add_fetch(&owner->users, 1, __ATOMIC_ACQ_REL);
-  if (domain == PS_COORDINATION_NAMESPACE)
-    rc = namespace_guard(owner, identity, &guard, e);
+  if (domain >= PS_COORDINATION_NAMESPACE)
+    rc = dynamic_guard(owner, identity, domain == PS_COORDINATION_STREAM,
+                       &guard, e);
   else
     guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
                               ? (size_t)identity + 4
@@ -325,8 +347,7 @@ int ps_coordination_lock(ps_coordination *owner,
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
     return rc;
   }
-  rc = wait ? pthread_mutex_lock(&guard->mutex)
-            : pthread_mutex_trylock(&guard->mutex);
+  rc = local_lock(guard, wait);
   if (rc) {
     drop(guard);
     return fail(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, rc,
@@ -341,7 +362,7 @@ int ps_coordination_lock(ps_coordination *owner,
               reason, "cannot acquire container file authority");
   }
   if (rc != LC_OK) {
-    pthread_mutex_unlock(&guard->mutex);
+    local_unlock(guard);
     drop(guard);
     return rc;
   }
@@ -358,6 +379,6 @@ void ps_coordination_unlock(ps_coordination_guard *guard) {
       __atomic_store_n(owner->failure_flag, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&owner->poisoned, 1, __ATOMIC_RELEASE);
   }
-  pthread_mutex_unlock(&guard->mutex);
+  local_unlock(guard);
   drop(guard);
 }

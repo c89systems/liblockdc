@@ -3008,7 +3008,300 @@ static void owned_stream_faults(void) {
   }
   owned_stream_selected_fault();
 }
+typedef struct stream_recovery {
+  size_t calls;
+  int reject;
+} stream_recovery;
+static int recover_stream(ps_stream *stream, uint64_t checkpoint,
+                          uint64_t capacity, uint64_t *accepted, void *context,
+                          lc_error *e) {
+  stream_recovery *state = context;
+  unsigned char marker;
+  int rc = LC_OK;
+  ++state->calls;
+  if (state->reject)
+    return LC_ERR_NOMEM;
+  *accepted = checkpoint;
+  /* The test format recognizes R as a complete record in the candidate
+   * suffix. Its following bytes are a deliberately incomplete record. */
+  if (checkpoint < capacity) {
+    rc = ps_stream_recovery_read(stream, checkpoint, &marker, 1, e);
+    if (rc == LC_OK && marker == 'R')
+      ++*accepted;
+  }
+  return rc;
+}
+static void append_byte(ps_stream *s, uint64_t start, const char *body,
+                        lc_error *e) {
+  ps_stream_writer *writer = NULL;
+  ok(ps_stream_begin(s, &writer, e), e);
+  REQUIRE(ps_stream_writer_start(writer) == start);
+  ok(ps_stream_write(writer, body, 1, e), e);
+  ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, e), e);
+  ps_stream_writer_close(writer);
+}
+static void *finish_stream_append(void *context) {
+  lc_error e = {0};
+  ps_stream_writer *w = context;
+  ok(ps_stream_commit(w, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_stream_writer_close(w);
+  return NULL;
+}
+static void stream_handoff(int durable) {
+  lc_error e = {0};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_stream *x = NULL, *y = NULL, *other = NULL;
+  ps_stream_writer *writer = NULL, *blocked = NULL;
+  ps_stream_window *old = NULL, *view = NULL;
+  stream_recovery rx = {0}, ry = {0};
+  ps_stream_info info;
+  const ps_key unrelated = {88, 111, PS_STREAM};
+  pthread_t producer;
+  char byte;
+  options.durable_sync = durable;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 1, NULL, recover_stream, &rx, &x,
+                    &e),
+     &e);
+  append_byte(x, 0, "a", &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  ok(ps_stream_open(b, NULL, tail_stream(), 0, NULL, recover_stream, &ry, &y,
+                    &e),
+     &e);
+  ok(ps_stream_open(b, NULL, unrelated, 1, NULL, NULL, NULL, &other, &e), &e);
+  ok(ps_stream_window_open(y, 0, 1, &old, &e), &e);
+  ok(ps_stream_begin(x, &writer, &e), &e);
+  REQUIRE(ps_stream_writer_start(writer) == 1 && rx.calls == 1);
+  ok(ps_stream_status(x, &info, &e), &e);
+  ps_key grant = {info.ref.incarnation, info.capacity, PS_OWNED_RUN};
+  ok(ps_stream_reserve(writer, NULL, PS_CHUNK, &e), &e);
+  ps_entry *prepared = ps_internal_lookup(a, grant);
+  REQUIRE(prepared && prepared->count == 1);
+  off_t offset = (off_t)prepared->extents[0].offset;
+  unsigned char first, damaged;
+  REQUIRE(pread(a->fd, &first, 1, offset) == 1);
+  damaged = first ^ 1;
+  REQUIRE(pwrite(a->fd, &damaged, 1, offset) == 1);
+  uint64_t free_bytes = b->free_bytes;
+  REQUIRE(ps_refresh(b, &e) == LC_ERR_PROTOCOL);
+  lc_error_cleanup(&e);
+  REQUIRE(!ps_internal_lookup(b, grant) && b->free_bytes == free_bytes);
+  REQUIRE(pwrite(a->fd, &first, 1, offset) == 1);
+  REQUIRE(ps_stream_begin(y, &blocked, &e) == LC_ERR_PENDING && !blocked);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_stream_seal(y, &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_stream_retire(y, &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  ps_owned_range retained = {0, 5};
+  REQUIRE(ps_stream_piece_repack(y, 0, NULL, &retained, 1, NULL, NULL, &e) ==
+          LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  ok(ps_stream_window_read(old, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == 'a');
+  ok(ps_stream_window_open(y, 0, 1, &view, &e), &e);
+  ps_stream_window_close(view);
+  append_byte(other, 0, "x", &e);
+  ok(ps_stream_write(writer, "b", 1, &e), &e);
+  REQUIRE(pthread_create(&producer, NULL, finish_stream_append, writer) == 0);
+  REQUIRE(pthread_join(producer, NULL) == 0);
+  ry.reject = 1;
+  REQUIRE(ps_stream_begin(y, &blocked, &e) == LC_ERR_NOMEM && !blocked);
+  ok(ps_stream_status(y, &info, &e), &e);
+  REQUIRE(info.tail == 1);
+  ry.reject = 0;
+  append_byte(y, 2, "c", &e);
+  ok(ps_stream_status(y, &info, &e), &e);
+  REQUIRE(ry.calls == 3 && info.tail == 3 && info.runs > 1);
+  append_byte(y, 3, "d", &e);
+  REQUIRE(ry.calls == 3); /* A continued owner keeps its validated view. */
+  ok(ps_checkpoint(b, &e), &e);
+  append_byte(x, 4, "e", &e);
+  REQUIRE(rx.calls == 2);
+  ok(ps_stream_seal(x, &e), &e);
+  ok(ps_stream_window_read(old, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == 'a');
+  REQUIRE(ps_stream_begin(y, &blocked, &e) == LC_ERR_INVALID && !blocked);
+  lc_error_cleanup(&e);
+  ok(ps_stream_status(y, &info, &e), &e);
+  REQUIRE(info.sealed && info.tail == 5);
+  ok(ps_stream_piece_repack(y, 0, NULL, &retained, 1, NULL, NULL, &e), &e);
+  ok(ps_stream_window_read(old, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == 'a');
+  ps_stream_window_close(old);
+  ok(ps_stream_close(other, &e), &e);
+  ok(ps_stream_close(y, &e), &e);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 0, NULL, NULL, NULL, &x, &e), &e);
+  ok(ps_stream_window_open(x, 0, 5, &old, &e), &e);
+  char body[5];
+  ok(ps_stream_window_read(old, 0, body, sizeof(body), &e), &e);
+  REQUIRE(!memcmp(body, "abcde", sizeof(body)));
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_stream_open(b, NULL, tail_stream(), 0, NULL, NULL, NULL, &y, &e), &e);
+  ok(ps_stream_retire(y, &e), &e);
+  REQUIRE(ps_stream_window_open(x, 0, 1, &view, &e) == LC_ERR_INVALID && !view);
+  lc_error_cleanup(&e);
+  ok(ps_stream_window_read(old, 0, body, sizeof(body), &e), &e);
+  REQUIRE(!memcmp(body, "abcde", sizeof(body)));
+  ok(ps_stream_close(y, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ps_stream_window_close(old);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void stream_handoff_child(int ready, int complete) {
+  lc_error e = {0};
+  ps_options options = {0};
+  ps_space *s = NULL;
+  ps_stream *stream = NULL;
+  ps_stream_writer *writer = NULL;
+  stream_recovery recovery = {0};
+  unsigned char *body = malloc(PS_CHUNK);
+  REQUIRE(body);
+  options.durable_sync = 1;
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  ok(ps_stream_open(s, NULL, tail_stream(), 0, NULL, recover_stream, &recovery,
+                    &stream, &e),
+     &e);
+  ok(ps_stream_begin(stream, &writer, &e), &e);
+  REQUIRE(ps_stream_writer_start(writer) == 1);
+  memset(body, '!', PS_CHUNK);
+  if (complete)
+    body[0] = 'R';
+  ok(ps_stream_write(writer, body, PS_CHUNK, &e), &e);
+  ok(ps_flush(s, &e), &e);
+  REQUIRE(write(ready, "R", 1) == 1);
+  for (;;)
+    pause();
+}
+static void stream_takeover(void) {
+  for (int complete = 0; complete <= 1; ++complete) {
+    lc_error e = {0};
+    ps_options options = {0};
+    ps_space *s = NULL;
+    ps_stream *stream = NULL;
+    ps_stream_writer *blocked = NULL;
+    ps_stream_window *window = NULL;
+    stream_recovery recovery = {0};
+    int ready[2], exited;
+    char body[3] = {0};
+    options.durable_sync = 1;
+    ok(ps_open(path, 1, &options, &s, &e), &e);
+    ok(ps_stream_open(s, NULL, tail_stream(), 1, NULL, recover_stream,
+                      &recovery, &stream, &e),
+       &e);
+    append_byte(stream, 0, "a", &e);
+    ok(ps_stream_window_open(stream, 0, 1, &window, &e), &e);
+    REQUIRE(pipe(ready) == 0);
+    pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (!child) {
+      char fd[16], valid[16];
+      REQUIRE(close(ready[0]) == 0);
+      snprintf(fd, sizeof(fd), "%d", ready[1]);
+      snprintf(valid, sizeof(valid), "%d", complete);
+      execl(executable, executable, "--stream-child", path, fd, valid,
+            (char *)NULL);
+      _exit(127);
+    }
+    REQUIRE(close(ready[1]) == 0);
+    REQUIRE(read(ready[0], body, 1) == 1 && body[0] == 'R');
+    REQUIRE(ps_stream_begin(stream, &blocked, &e) == LC_ERR_PENDING &&
+            !blocked);
+    lc_error_cleanup(&e);
+    REQUIRE(!recovery.calls);
+    ok(ps_stream_window_read(window, 0, body, 1, &e), &e);
+    REQUIRE(body[0] == 'a');
+    REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &exited, 0) == child &&
+            WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+    REQUIRE(close(ready[0]) == 0);
+    append_byte(stream, 1 + (uint64_t)complete, "y", &e);
+    REQUIRE(recovery.calls == 1);
+    ok(ps_stream_seal(stream, &e), &e);
+    ok(ps_stream_window_read(window, 0, body, 1, &e), &e);
+    REQUIRE(body[0] == 'a');
+    ps_stream_window_close(window);
+    ok(ps_stream_close(stream, &e), &e);
+    ok(ps_close(s, &e), &e);
+    ok(ps_open(path, 0, NULL, &s, &e), &e);
+    ok(ps_stream_open(s, NULL, tail_stream(), 0, NULL, NULL, NULL, &stream, &e),
+       &e);
+    ok(ps_stream_window_open(stream, 0, 2 + (uint64_t)complete, &window, &e),
+       &e);
+    ok(ps_stream_window_read(window, 0, body, 2 + (size_t)complete, &e), &e);
+    REQUIRE(!memcmp(body, complete ? "aRy" : "ay", 2 + (size_t)complete));
+    ps_stream_window_close(window);
+    ok(ps_stream_close(stream, &e), &e);
+    ok(ps_close(s, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
+static int stream_unlock_fault(void *context, int fd, int command,
+                               struct flock *lock) {
+  int *fail = context;
+  if (*fail == 1 && command == F_OFD_SETLK && lock->l_type == F_UNLCK &&
+      lock->l_start >= 8 && lock->l_start < 256) {
+    ++*fail;
+    errno = EIO;
+    return -1;
+  }
+  return fcntl(fd, command, lock);
+}
+static void stream_handoff_faults(void) {
+  lc_error e = {0};
+  int fail = 0;
+  ps_coordination_io coordination = {&fail, stream_unlock_fault};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_stream *x = NULL, *y = NULL;
+  ps_stream_writer *writer = NULL, *blocked = NULL;
+  ps_stream_window *window = NULL;
+  stream_recovery rx = {0}, ry = {0};
+  char body[3];
+  options.coordination_io = &coordination;
+  options.durable_sync = 1;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 1, NULL, recover_stream, &rx, &x,
+                    &e),
+     &e);
+  append_byte(x, 0, "a", &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_stream_open(b, NULL, tail_stream(), 0, NULL, recover_stream, &ry, &y,
+                    &e),
+     &e);
+  ok(ps_stream_begin(x, &writer, &e), &e);
+  ok(ps_stream_write(writer, "b", 1, &e), &e);
+  fail = 1;
+  REQUIRE(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, &e) ==
+          LC_ERR_TRANSPORT);
+  REQUIRE(fail == 2);
+  lc_error_cleanup(&e);
+  ps_stream_writer_close(writer);
+  REQUIRE(ps_stream_begin(y, &blocked, &e) == LC_ERR_PENDING && !blocked);
+  lc_error_cleanup(&e);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(a, &e), &e);
+  append_byte(y, 2, "c", &e);
+  ok(ps_stream_window_open(y, 0, 3, &window, &e), &e);
+  ok(ps_stream_window_read(window, 0, body, sizeof(body), &e), &e);
+  REQUIRE(!memcmp(body, "abc", sizeof(body)));
+  ps_stream_window_close(window);
+  ok(ps_stream_close(y, &e), &e);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 int main(int argc, char **argv) {
+  if (argc == 5 && !strcmp(argv[1], "--stream-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    stream_handoff_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--journal-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     journal_replay_child(atoi(argv[3]), atoi(argv[4]));
@@ -3095,6 +3388,13 @@ int main(int argc, char **argv) {
     owned_stream_cold();
   else if (!strcmp(argv[2], "owned-stream-faults"))
     owned_stream_faults();
+  else if (!strcmp(argv[2], "stream-handoff")) {
+    stream_handoff(0);
+    stream_handoff(1);
+  } else if (!strcmp(argv[2], "stream-handoff-faults"))
+    stream_handoff_faults();
+  else if (!strcmp(argv[2], "stream-takeover"))
+    stream_takeover();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();

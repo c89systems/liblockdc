@@ -1,7 +1,7 @@
 #ifndef POUCH_SPACE_OWNED_H
 #define POUCH_SPACE_OWNED_H
 
-#include "space.h"
+#include "coordination.h"
 
 /* Private bridge for the canonical stream owner, not a pathname/fd API.
  * One head owner may be open per typed stream in a process. Run handles pin
@@ -30,6 +30,17 @@ int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 void ps_owned_close(ps_owned_head *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
+/* Check a head's current selection when admitting a new read window. A
+ * previously captured reader reads its own pinned mappings directly. */
+int ps_owned_status_capture(ps_owned_head *, ps_owned_status *, lc_error *);
+/* Acquire shared edit authority and refresh the selected head. The continued
+ * flag covers the current checkpoint generation and previous owner; the
+ * caller must also have a previously validated local view. Exclusive mode
+ * returns a NULL guard. The guard spans recovery, producer I/O and cleanup. */
+int ps_owned_edit_begin(ps_owned_head *, ps_coordination_guard **,
+                        ps_owned_status *, int *continued, lc_error *);
+int ps_owned_edit_end(ps_owned_head *, ps_coordination_guard *, int,
+                      lc_error *);
 /* Capture head metadata without acquiring its exclusive writer owner, reading
  * payloads, allocating handles or changing pins. A retained catalog/read pin
  * protects the caller's subsequent use; this scalar observation alone does not.

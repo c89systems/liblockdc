@@ -22,10 +22,14 @@ struct ps_stream {
   unsigned char *recovery_buffer;
   uint64_t recovery_offset;
   size_t recovery_bytes;
+  ps_stream_recover_fn recover;
+  void *recovery_context;
+  int edit_valid;
   int appending, recovering, repair_pending, sealed, retired, remapping;
 };
 struct ps_stream_writer {
   ps_stream *stream;
+  ps_coordination_guard *edit;
   uint64_t start, bytes, flushed, prior_checked;
   ps_piece_checksum prior_checksum;
   size_t used;
@@ -214,46 +218,31 @@ static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
   }
   return rc;
 }
-static void stream_destroy(ps_stream *s) {
+static void release_runs(stream_run *runs, size_t count) {
   size_t i;
-  for (i = 0; i < s->count; ++i)
-    ps_owned_run_close(s->runs[i].handle);
+  for (i = 0; i < count; ++i)
+    ps_owned_run_close(runs[i].handle);
+  lc_free_with_allocator(NULL, runs);
+}
+static void stream_destroy(ps_stream *s) {
+  release_runs(s->runs, s->count);
   ps_owned_close(s->head);
-  lc_free_with_allocator(NULL, s->recovery_buffer);
-  lc_free_with_allocator(NULL, s->runs);
   (void)pthread_mutex_destroy(&s->mutex);
   lc_free_with_allocator(NULL, s);
 }
-int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
-                   const ps_ref *ref, ps_stream_recover_fn recover,
-                   void *context, ps_stream **out, lc_error *error) {
-  ps_owned_status status;
+/* Load under the stream's edit guard for a shared space. The target either
+ * has no callers yet or is a private view staged for a handoff. */
+static int stream_load(ps_stream *s, const ps_owned_status *status,
+                       ps_stream_recover_fn recover, void *context,
+                       lc_error *error) {
   ps_owned_run **captured = NULL;
-  ps_stream *s;
   uint64_t i, accepted;
   size_t count = 0;
   int rc, repaired = 0;
-  if (out)
-    *out = NULL;
-  if (!out)
-    return stream_error(error, LC_ERR_INVALID, "stream open requires output");
-  s = lc_calloc_with_allocator(NULL, 1, sizeof(*s));
-  if (!s)
-    return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream owner");
-  if (pthread_mutex_init(&s->mutex, NULL)) {
-    lc_free_with_allocator(NULL, s);
-    return stream_error(error, LC_ERR_TRANSPORT,
-                        "cannot initialize stream mutex");
-  }
-  rc = ps_owned_open(space, budget, key, create, ref, &s->head, &status, error);
-  if (rc == LC_OK) {
-    s->ref = status.ref;
-    s->tail = status.tail;
-    s->recovery_floor = status.tail;
-    s->sealed = status.sealed;
-  }
-  if (rc == LC_OK)
-    rc = ps_owned_runs_capture(s->head, &captured, &count, error);
+  s->ref = status->ref;
+  s->tail = s->recovery_floor = status->tail;
+  s->sealed = status->sealed;
+  rc = ps_owned_runs_capture(s->head, &captured, &count, error);
   for (i = 0; rc == LC_OK && i < count; ++i) {
     rc = stream_grow(s, error);
     if (rc == LC_OK) {
@@ -269,7 +258,7 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     ps_owned_run_close(captured[i]);
   lc_free_with_allocator(NULL, captured);
   if (rc == LC_OK)
-    s->capacity = status.capacity;
+    s->capacity = status->capacity;
   if (rc == LC_OK)
     rc = stream_pieces(s, s->tail, 1, s->sealed, NULL, NULL, error);
   if (rc == LC_OK && s->capacity && !s->sealed) {
@@ -306,10 +295,98 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
       s->recovery_buffer = NULL;
     }
   }
+  return rc;
+}
+int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
+                   const ps_ref *ref, ps_stream_recover_fn recover,
+                   void *context, ps_stream **out, lc_error *error) {
+  ps_owned_status status;
+  ps_coordination_guard *edit = NULL;
+  ps_stream *s;
+  int rc, continued;
+  if (out)
+    *out = NULL;
+  if (!out)
+    return stream_error(error, LC_ERR_INVALID, "stream open requires output");
+  s = lc_calloc_with_allocator(NULL, 1, sizeof(*s));
+  if (!s)
+    return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream owner");
+  if (pthread_mutex_init(&s->mutex, NULL)) {
+    lc_free_with_allocator(NULL, s);
+    return stream_error(error, LC_ERR_TRANSPORT,
+                        "cannot initialize stream mutex");
+  }
+  rc = ps_owned_open(space, budget, key, create, ref, &s->head, &status, error);
+  if (rc == LC_OK && ps_coordination_shared(ps_space_coordination(space))) {
+    /* Head creation is structural. Independent peers must be able to pass it
+     * while this newly created stream has a long-running producer. */
+    if (create)
+      rc = ps_flush(space, error);
+    if (rc == LC_OK)
+      rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+  }
+  if (rc == LC_OK)
+    rc = stream_load(s, &status, recover, context, error);
+  if (edit) {
+    s->recover = recover;
+    s->recovery_context = context;
+    s->edit_valid = rc == LC_OK;
+    rc = ps_owned_edit_end(s->head, edit, rc, error);
+  }
   if (rc == LC_OK)
     *out = s;
   else
     stream_destroy(s);
+  return rc;
+}
+/* Capture and verify a foreign mapping before replacing the resident one.
+ * Existing windows retain their exact runs and read without edit authority.
+ * Allocation or recovery failures leave the resident view intact. */
+static int stream_refresh_edit(ps_stream *s, const ps_owned_status *status,
+                               int continued, lc_error *error) {
+  ps_stream staged = {0};
+  stream_run *old;
+  size_t count;
+  int rc;
+  pthread_mutex_lock(&s->mutex);
+  if (status->retired) {
+    s->retired = 1;
+    pthread_mutex_unlock(&s->mutex);
+    return stream_error(error, LC_ERR_INVALID, "stream is retired");
+  }
+  if (continued && s->edit_valid && s->tail == status->tail &&
+      s->capacity == status->capacity && s->count == status->runs &&
+      s->sealed == status->sealed) {
+    pthread_mutex_unlock(&s->mutex);
+    return LC_OK;
+  }
+  s->edit_valid = 0;
+  pthread_mutex_unlock(&s->mutex);
+  if (pthread_mutex_init(&staged.mutex, NULL))
+    return stream_error(error, LC_ERR_TRANSPORT,
+                        "cannot initialize refreshed stream view");
+  staged.head = s->head;
+  rc = stream_load(&staged, status, s->recover, s->recovery_context, error);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    old = s->runs;
+    count = s->count;
+    s->runs = staged.runs;
+    s->count = staged.count;
+    s->allocated = staged.allocated;
+    s->tail = staged.tail;
+    s->capacity = staged.capacity;
+    s->preferred_grant = staged.preferred_grant;
+    s->checked = staged.checked;
+    s->checksum = staged.checksum;
+    s->sealed = staged.sealed;
+    s->repair_pending = staged.repair_pending;
+    s->edit_valid = 1;
+    pthread_mutex_unlock(&s->mutex);
+    release_runs(old, count);
+  } else
+    release_runs(staged.runs, staged.count);
+  pthread_mutex_destroy(&staged.mutex);
   return rc;
 }
 int ps_stream_close(ps_stream *s, lc_error *error) {
@@ -398,28 +475,39 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
                            ps_piece_select_fn select, void *context,
                            lc_error *error) {
   ps_owned_run *old = NULL, *replacement = NULL;
+  ps_coordination_guard *edit = NULL;
+  ps_owned_status status;
   size_t at;
-  int rc;
+  int rc, continued, installed = 0;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
                         "piece replacement requires owner");
   pthread_mutex_lock(&s->mutex);
-  at = mapping_lower(s->runs, s->count, base);
-  rc = s->remapping || s->recovering || s->retired || at == s->count ||
-               s->runs[at].base != base
+  rc = s->remapping || s->recovering || s->retired
            ? stream_error(error, LC_ERR_INVALID,
                           "piece replacement is busy or unavailable")
            : LC_OK;
-  if (rc == LC_OK) {
+  if (rc == LC_OK)
     s->remapping = 1;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+  if (rc == LC_OK && edit)
+    rc = stream_refresh_edit(s, &status, continued, error);
+  pthread_mutex_lock(&s->mutex);
+  at = mapping_lower(s->runs, s->count, base);
+  if (rc == LC_OK && (at == s->count || s->runs[at].base != base))
+    rc = stream_error(error, LC_ERR_INVALID,
+                      "piece replacement is no longer selected");
+  if (rc == LC_OK) {
     old = s->runs[at].handle;
     ps_owned_run_retain(old);
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK)
-    return rc;
-  rc = ps_owned_run_repack(s->head, old, budget, ranges, count, select, context,
-                           &replacement, error);
+  if (rc == LC_OK)
+    rc = ps_owned_run_repack(s->head, old, budget, ranges, count, select,
+                             context, &replacement, error);
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK) {
     if (replacement)
@@ -429,24 +517,26 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
               (s->count - at - 1) * sizeof(*s->runs));
       --s->count;
     }
+    installed = 1;
   }
+  rc = ps_owned_edit_end(s->head, edit, rc, error);
   s->remapping = 0;
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK)
+  if (installed)
     ps_owned_run_close(old); /* replaced directory ownership */
   ps_owned_run_close(old);   /* preparation capture */
   return rc;
 }
 static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   ps_owned_status status;
-  int rc;
+  ps_coordination_guard *edit = NULL;
+  int rc = LC_OK, continued;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
                         "stream transition requires owner");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK && (s->appending || s->recovering || s->remapping ||
-                      (!retirement && s->retired)))
+  if (s->appending || s->recovering || s->remapping ||
+      (!retirement && s->retired))
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream transition is busy or retired");
   if (rc == LC_OK)
@@ -454,8 +544,12 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     return rc;
-  rc = retirement ? ps_owned_retire(s->head, error)
-                  : ps_owned_seal(s->head, error);
+  rc = ps_owned_edit_begin(s->head, &edit, &status, &continued, error);
+  if (rc == LC_OK && edit && !retirement)
+    rc = stream_refresh_edit(s, &status, continued, error);
+  if (rc == LC_OK)
+    rc = retirement ? ps_owned_retire(s->head, error)
+                    : ps_owned_seal(s->head, error);
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK) {
     if (retirement)
@@ -463,6 +557,7 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
     else
       s->sealed = 1;
   }
+  rc = ps_owned_edit_end(s->head, edit, rc, error);
   s->appending = 0;
   pthread_mutex_unlock(&s->mutex);
   return rc;
@@ -508,7 +603,7 @@ int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
 int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
   ps_stream_writer *w;
   ps_owned_status status;
-  int rc, repair = 0;
+  int rc = LC_OK, continued, repair;
   if (out)
     *out = NULL;
   if (!s || !out)
@@ -519,18 +614,29 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
     return stream_error(error, LC_ERR_NOMEM,
                         "cannot allocate bounded stream appender");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK && (s->appending || s->recovering || s->sealed || s->retired))
+  if (s->appending || s->recovering || s->sealed || s->retired)
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream is busy, sealed or retired");
-  if (rc == LC_OK) {
+  if (rc == LC_OK)
     s->appending = 1;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK) {
+    lc_free_with_allocator(NULL, w);
+    return rc;
+  }
+  rc = ps_owned_edit_begin(s->head, &w->edit, &status, &continued, error);
+  if (rc == LC_OK && w->edit)
+    rc = stream_refresh_edit(s, &status, continued, error);
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK && s->sealed)
+    rc = stream_error(error, LC_ERR_INVALID, "stream is sealed");
+  if (rc == LC_OK) {
     w->stream = s;
     w->start = s->tail;
     w->prior_checked = s->checked;
     w->prior_checksum = s->checksum;
-    repair = s->repair_pending;
   }
+  repair = s->repair_pending;
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && repair) {
     rc = clear_suffix(s, w->start, w->buffer, error);
@@ -539,14 +645,17 @@ int ps_stream_begin(ps_stream *s, ps_stream_writer **out, lc_error *error) {
     pthread_mutex_lock(&s->mutex);
     if (rc == LC_OK)
       s->repair_pending = 0;
-    else
-      s->appending = 0;
     pthread_mutex_unlock(&s->mutex);
   }
   if (rc == LC_OK)
     *out = w;
-  else
+  else {
+    rc = ps_owned_edit_end(s->head, w->edit, rc, error);
+    pthread_mutex_lock(&s->mutex);
+    s->appending = 0;
+    pthread_mutex_unlock(&s->mutex);
     lc_free_with_allocator(NULL, w);
+  }
   return rc;
 }
 uint64_t ps_stream_writer_start(const ps_stream_writer *w) {
@@ -742,6 +851,8 @@ int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
     rc = ps_owned_commit(w->stream->head, w->start + w->bytes, mode, publish,
                          context, error);
   if (rc == LC_OK) {
+    rc = ps_owned_edit_end(w->stream->head, w->edit, rc, error);
+    w->edit = NULL;
     pthread_mutex_lock(&w->stream->mutex);
     w->stream->tail = w->start + w->bytes;
     w->stream->appending = 0;
@@ -765,6 +876,7 @@ void ps_stream_writer_close(ps_stream_writer *w) {
       if (rc == LC_OK)
         (void)ps_owned_barrier(w->stream->head, &error);
     }
+    (void)ps_owned_edit_end(w->stream->head, w->edit, rc, &error);
     lc_error_cleanup(&error);
     pthread_mutex_lock(&w->stream->mutex);
     w->stream->appending = 0;
@@ -781,9 +893,9 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
   uint64_t cursor;
   int rc;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_owned_status_get(s->head, &status, error);
-  if (rc == LC_OK && (s->recovering || s->retired || offset > s->tail ||
-                      bytes > s->tail - offset))
+  rc = ps_owned_status_capture(s->head, &status, error);
+  if (rc == LC_OK && (s->recovering || s->retired || status.retired ||
+                      offset > s->tail || bytes > s->tail - offset))
     rc = stream_error(error, LC_ERR_INVALID,
                       "stream read outside committed prefix");
   if (rc == LC_OK) {

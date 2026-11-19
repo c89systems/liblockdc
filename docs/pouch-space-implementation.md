@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, live checkpoint and journal adoption, and [shared owned-stream readiness](#live-owned-stream-readiness) | Shared capacity forecasts, canonical append and recovery authority, logical cache coherence, and normal shared admission |
+| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, live checkpoint and journal adoption, and [guarded stream handoff](#shared-stream-edit-and-recovery-handoff) | Shared capacity forecasts, namespace and collection authority and cache coherence, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6509,3 +6509,70 @@ Shared physical stream readiness is available under caller-supplied
 same-stream exclusion. Shared SDK admission still requires canonical append
 and recovery authority, including refresh and revalidation of namespace
 state before a peer makes a lease, lock or transactional messaging decision.
+
+## Shared stream edit and recovery handoff
+
+The canonical stream layer uses an OFD guard keyed by the stream incarnation.
+It holds the guard through recovery, private streaming writes, publication,
+and abort cleanup. Sealing, retirement, and piece replacement use the same
+authority. The stream guard permits cross-thread completion. It occupies a
+lock stripe disjoint from other authority domains. A busy stripe returns
+`LC_ERR_PENDING`, including when two incarnations hash to the same stripe.
+Independent streams can finish while an appender holds private reservations.
+
+A 64-byte journal hint records the writer's incarnation grant before it
+edits an unsealed stream. The guarded owner reuses its validated view while
+the stamp and checkpoint generation agree. After a peer handoff or a
+checkpoint generation change, admission captures the selected run mappings
+and invokes canonical recovery before making a new append available.
+Recovery prepares a replacement metadata view within the existing bounded
+buffers. Existing read windows retain their original mappings. A new window
+checks the selected head for retirement without taking the edit guard.
+
+Shared mutable streams with granted capacity need a recovery callback for
+revalidation. Its context stays alive through stream close. The writer stamp
+is scoped to a checkpoint generation and is advisory after cold reopen.
+The stream layer reconstructs accepted prefixes through the caller's record
+validation, including after a peer dies without completing its append.
+Abort and takeover clear rejected suffix bytes before reuse.
+
+Shared stream creation stabilizes its head before starting input. A certified
+append grant can be imported before the durability barrier once its identity
+header is checked. Its extent is included in allocator ownership while the
+application tail stays fixed. This lets unrelated streams move through an
+outstanding reservation. Replacement and retirement retain their durable
+publication rules. Exclusive stream I/O retains its current format.
+
+The 78 affected groups passed on Debug, GNU release and musl release. Six
+ThreadSanitizer and six strict Memcheck profiles passed. On the final
+reader-retirement change, 11 focused groups passed again on each build, with
+two rerun profiles each under ThreadSanitizer and Memcheck. The fixtures
+exercise handoff in both durability modes, cross-thread completion, an
+independent writer during a held reservation, recovery rejection and retry,
+a damaged grant with no allocator drift, rollover, remapping, and an
+uncertain unlock after commit. A process test kills an appender after its
+private bytes reach the file and verifies takeover with both a valid and a
+rejected candidate. Readers held before remapping or retirement keep their
+original bytes. A new window after retirement is rejected.
+
+All 36 matched GNU lifecycle runs verified reopened results. Figures are
+median milliseconds for `dda2dfb2` native / current native / multifile,
+using the same two 10 MiB profiles and two rounds per run.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 48.78 / 55.89 / 27.04 | 661.03 / 681.25 / 607.91 | 87.98 / 85.09 / 27.94 | 1366.26 / 1329.92 / 1379.39 |
+| Maximum worker index flush | 21.11 / 19.31 / 1.13 | 21.32 / 21.79 / 1.47 | 31.19 / 30.38 / 1.71 | 18.73 / 16.14 / 2.93 |
+| Maintenance | 7.40 / 6.94 / 0.27 | 10.72 / 12.55 / 0.33 | 8.88 / 7.14 / 0.28 | 6.57 / 7.18 / 0.41 |
+| Close | 0.36 / 0.41 / 39.66 | 0.62 / 0.37 / 52.63 | 0.70 / 0.71 / 63.51 | 0.63 / 0.68 / 58.75 |
+| Reopen | 3.63 / 3.78 / 0.97 | 4.31 / 3.76 / 0.88 | 5.82 / 5.18 / 1.72 | 4.33 / 4.81 / 1.45 |
+
+The SDK samples use exclusive admission. Native ordinary NoSync work remains
+2.1 to 3.0 times multifile. The ordinary index-flush policies acknowledge
+different canonical durability boundaries. Shared throughput and performance
+acceptance remain open. The frozen baseline and results are in
+`build/pouch-space-stream-handoff/`.
+
+Namespace and collection owners still need cross-process logical authority
+and cache revalidation before shared SDK admission. Stream edit authority
+protects the boundaries used by that integration.

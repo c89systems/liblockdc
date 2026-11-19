@@ -21,7 +21,14 @@ typedef struct ps_catalog_index {
 #define META_HEADER 64U
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
 #define TOKEN_RANGE UINT64_C(4294967296)
-enum ps_event { PS_PUT, PS_REMOVE, PS_RESERVE_IDS, PS_SEAL, PS_STREAM_TAIL };
+enum ps_event {
+  PS_PUT,
+  PS_REMOVE,
+  PS_RESERVE_IDS,
+  PS_SEAL,
+  PS_STREAM_TAIL,
+  PS_STREAM_OWNER
+};
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
 #define OWNED_MAGIC UINT64_C(0x314e55524f5350)
@@ -41,6 +48,7 @@ typedef struct ps_entry {
   uint64_t
       peer_sequence; /* imported visibility uses the certified wire clock */
   uint64_t stream_capacity, stream_runs, stream_ready, stream_wire;
+  uint64_t stream_owner, stream_owner_generation;
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */
   int owned_mapped;

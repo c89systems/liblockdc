@@ -40,12 +40,14 @@ int ps_stream_piece_repack(ps_stream *, uint64_t base, ps_budget *,
  * The stream layer clears and synchronizes the rejected suffix before its
  * first write admission. Newly recovered bytes still participate in root
  * readiness and checkpoint dependencies. The layer never interprets
- * application records or adds a per-record WAL.
+ * application records.
  */
 typedef int (*ps_stream_recover_fn)(ps_stream *, uint64_t checkpoint_tail,
                                     uint64_t capacity, uint64_t *accepted_tail,
                                     void *, lc_error *);
-/* The optional budget funds head creation only, never subsequent grants. */
+/* The optional budget funds head creation only, never subsequent grants.
+ * Shared streams retain the recovery function and its context until close
+ * because a later edit can inherit a peer's unfinished suffix. */
 int ps_stream_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                    ps_stream_recover_fn, void *, ps_stream **, lc_error *);
 /* One cached owner per typed logical stream. Close requires no reader or
@@ -72,7 +74,8 @@ int ps_stream_recovery_cover(ps_stream *, uint64_t, lc_error *);
  * Other streams and readers remain independent. The producer never owns root
  * or allocator locks. Buffers are bounded at PS_CHUNK. A recovered owner
  * repairs its unused suffix before returning its first writer; failure returns
- * no writer and retains the existing uncertain-I/O poison semantics. */
+ * no writer and retains the existing uncertain-I/O poison semantics. Shared
+ * append admission returns PENDING while a peer owns the stream edit guard. */
 int ps_stream_begin(ps_stream *, ps_stream_writer **, lc_error *);
 uint64_t ps_stream_writer_start(const ps_stream_writer *);
 /* Reserve at least bytes from this append's start without advancing its tail
@@ -105,8 +108,8 @@ int ps_stream_writer_read(ps_stream_writer *, uint64_t, void *, size_t,
 int ps_stream_writer_crc(ps_stream_writer *, uint64_t offset, uint64_t length,
                          unsigned long *, lc_error *);
 /* The canonical owner has completed its records before commit. Durable
- * success waits for the root sync covering these bytes; no publication journal
- * entry is emitted when appending inside an already owned run. An optional
+ * success waits for the root sync covering these bytes. Shared streams
+ * publish a journaled tail under the edit guard. An optional
  * publisher selects a containing logical head before exposing this tail;
  * durable roots check its success against the shared ready prefix. An explicit
  * DEFER_SYNC acknowledges completed bytes before the caller's group barrier;
