@@ -91,7 +91,16 @@ static int index_queries(worker *w, int flush, lc_error *e) {
   int rc = LC_OK;
   if (flush) {
     index_phase_begin(&w->index_phases[0]);
-    rc = lc_flush_index(w->run->client, &request, &result, e);
+    /* Compare the same canonical recovery boundary when requested. Native
+     * revision publication already stabilizes the completed prefix even on
+     * NoSync roots. Multifile flush publishes derived files without forcing
+     * canonical records; its explicit namespace handoff supplies that boundary.
+     * Durable mutations have already supplied it in either owner. */
+    if (w->run->stable_index && !w->run->container && !w->run->sync)
+      rc = lc_pouch_state_sync_namespace(
+          ((lc_client_handle *)w->run->client)->pouch, w->ns, e);
+    if (rc == LC_OK)
+      rc = lc_flush_index(w->run->client, &request, &result, e);
     if (rc == LC_OK)
       require(result.flushed && !result.pending, "completed index flush");
     if (rc == LC_OK) {

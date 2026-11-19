@@ -5268,3 +5268,80 @@ steady-state/readiness/reopen/close performance remain in the full active goal.
 Existing-root format migration remains deferred. The multifile backend remains
 the default/reference, and production cutover requires an explicit deployment
 decision.
+
+### Indexed readiness and canonical durability comparison
+
+The lifecycle comparison now separates worker work from terminal maintenance,
+and reopen from reopened query/body verification. It also reports the maximum
+worker mutation interval, summed mutation thread CPU, and thread-attributed
+barriers for mutation, maintenance, close and reopen. Worker mutation intervals
+sum their rounds and may overlap peer indexing; they are not a separate global
+throughput interval. Process-wide lifecycle barrier totals still include
+background workers. Close/reopen attribution counts only the calling thread.
+Timing and attribution containment are checked in every workload, including
+queue, outbox and XA modes. Application bodies still pass through bounded
+producers and consumers.
+
+The existing owners have different index-flush recovery boundaries. Native
+generation/manifest publication forces a completed physical prefix on NoSync
+roots, including canonical records. Multifile generation/manifest publication
+does not force canonical records; durable roots already stabilize their mutations
+before acknowledgment. The new comparison-only `--stable-index` option requires
+canonical records to be durable when indexing completes. It adds the existing
+namespace durability handoff before multifile NoSync flush. Native flush already
+supplies that boundary. This option does not require derived multifile index
+files themselves to survive power loss; they remain rebuildable.
+
+No product durability behavior changes here. Whether native NoSync flush should
+instead follow the root policy remains an explicit behavior decision. The
+native lost-write tests currently require its stronger acknowledgment guarantee;
+removing that barrier solely to improve the comparison would change that tested
+behavior.
+
+The GNU Release comparison retains 72 verified runs: three alternating samples,
+two policies, two workloads, and six variants (frozen `fec21d6f` and current
+multifile/native plus both owners with the matched canonical boundary). Both
+workloads use preopened roots, two update rounds and streamed JSON bodies. The
+small workload has 16 records of 1 KiB and two writers; the wider workload has
+48 records of 4 KiB and four writers. Current and frozen binaries share the same
+product algorithms; this is measurement qualification, not a performance fix.
+
+Three-sample medians, **native / multifile**, in milliseconds:
+
+| Current ordinary lifecycle phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle including readiness and maintenance | 57.53 / 17.08 | 535.71 / 437.79 | 111.65 / 27.30 | 1033.92 / 1173.13 |
+| Maximum worker index flush | 17.45 / 0.83 | 15.49 / 0.99 | 43.49 / 2.19 | 15.06 / 2.38 |
+| Terminal maintenance | 12.80 / 0.21 | 10.65 / 0.19 | 18.55 / 0.27 | 13.60 / 0.37 |
+| Close | 0.33 / 26.47 | 0.26 / 34.60 | 0.72 / 57.22 | 0.63 / 68.19 |
+| Reopen alone | 2.93 / 0.68 | 3.43 / 0.72 | 3.95 / 1.15 | 3.91 / 1.38 |
+| Reopened verification alone | 0.42 / 0.27 | 0.48 / 0.25 | 1.41 / 1.14 | 1.48 / 0.89 |
+
+With the matched canonical boundary, small NoSync maximum worker flush is
+19.96 / 11.50 ms, and wider NoSync flush is 25.74 / 15.88 ms. Multifile adds
+four/eight calling-thread barriers respectively. Native already groups its
+required barriers and does not add another handoff. The ordinary and matched
+native variants execute identical product work; their sample differences show
+the variability of these short host measurements.
+
+The boundary mismatch explains a material part of the readiness comparison, but
+not the remaining native cost. Native terminal maintenance and reopen still
+have distinct costs to address. Native's wider durable lifecycle is faster in
+this fixture, using a median 274 barriers versus 392 for multifile, while the
+small durable fixture remains slower. This supports continued native work; it
+does not establish general performance acceptance or a production latency bound.
+
+Forty affected lifecycle checks pass on GNU Release and forty on musl Release.
+The same forty pass under Debug ASan/UBSan with 128 KiB worker stacks, together
+with the source-manifest and stack-allocation gates. New checks exercise both
+owners and policies with the matched boundary, four writers, four rounds,
+64 KiB records, repeated indexed selectors and reopen/body verification. Product
+code is unchanged, so product fault/concurrency suites are not rerun for this
+measurement-only change.
+
+Evidence is in ignored `build/pouch-space-index-native-fit/`:
+`baseline-paired.log`, `trace-runtime.log`, `trace-runtime-output.log`,
+`paired-performance.sh`, `paired-performance.log`, `summarize-performance.awk`,
+`performance-summary.tsv`, and `benchmark-{debug,gnu,musl}.log`. The full goal
+remains active, including shared-root coordination/recovery, compound capacity,
+and performance qualification. Multifile remains the default/reference.

@@ -49,6 +49,12 @@ if(LOCKDC_BUILD_BENCHMARKS)
             ${CMAKE_CURRENT_BINARY_DIR} 8 65536 ${sync} 4 --reopen --rounds 4)
         set_tests_properties(pouch_space_compare_${mode}_churn_${sync}
           PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        add_test(NAME pouch_space_compare_${mode}_stable_${sync}
+          COMMAND pouch_space_lifecycle_compare ${mode}
+            ${CMAKE_CURRENT_BINARY_DIR} 8 65536 ${sync} 4 --reopen --rounds 4
+            --stable-index)
+        set_tests_properties(pouch_space_compare_${mode}_stable_${sync}
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       endforeach()
     endforeach()
   endif()

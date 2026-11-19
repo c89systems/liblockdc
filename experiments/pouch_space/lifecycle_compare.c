@@ -33,13 +33,14 @@ typedef struct worker {
   lc_xa_store *journal;
   char owner[LC_XID_STRING_SIZE], resource[LC_XID_STRING_SIZE];
   double index_seconds;
+  index_phase mutations;
   lc_index_seq index_seq;
   index_phase index_phases[3], reopen_phases[2];
   int result;
 } worker;
 struct comparison {
   size_t rows, bytes, writers, rounds;
-  int container, outbox, xa, index, sync, started, preopened;
+  int container, outbox, xa, index, sync, started, preopened, stable_index;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -424,6 +425,7 @@ static void *run_worker(void *context) {
   pthread_mutex_unlock(&run->mutex);
   w->result = LC_OK;
   for (size_t round = 0U; round < run->rounds && w->result == LC_OK; ++round) {
+    index_phase_begin(&w->mutations);
     for (size_t row = w->ordinal; row < run->rows && w->result == LC_OK;
          row += run->writers) {
       producer source;
@@ -443,6 +445,7 @@ static void *run_worker(void *context) {
         require(source.offset == run->bytes && sink.offset == run->bytes,
                 "streamed payload coverage");
     }
+    index_phase_end(&w->mutations);
     if (w->result == LC_OK && run->index) {
       double start = now(CLOCK_MONOTONIC);
       w->result = index_queries(w, 1, &e);
@@ -561,12 +564,15 @@ int main(int argc, char **argv) {
   pthread_t *threads;
   char pattern[1200], directory[1200], store[1300];
   double create_seconds, start, cpu, lifecycle_seconds, cpu_seconds,
-      close_seconds, reopen_seconds;
+      work_seconds, maintenance_started, preopen_seconds = 0.0;
+  index_phase maintenance = {0}, closing = {0}, reopening = {0},
+              verification = {0};
   uint64_t measured_syncs, files;
   double measured_sync_seconds;
   struct rusage usage;
   require(argc >= 7,
-          "MODE DIRECTORY ROWS BYTES SYNC WRITERS [--reopen] [--rounds N]");
+          "MODE DIRECTORY ROWS BYTES SYNC WRITERS [--reopen] [--rounds N] "
+          "[--stable-index]");
   require(
       !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
           !strcmp(argv[1], "pouch-outbox") ||
@@ -584,10 +590,14 @@ int main(int argc, char **argv) {
       run.preopened = 1;
     else if (!strcmp(argv[i], "--rounds") && i + 1 < argc)
       run.rounds = number(argv[++i], 1U, 16U);
+    else if (!strcmp(argv[i], "--stable-index") && !run.stable_index)
+      run.stable_index = 1;
     else
       require(0, "unknown or incomplete comparison option");
   }
   require(run.index || run.rounds == 1U, "rounds require an index workload");
+  require(run.index || !run.stable_index,
+          "stable-index requires an index workload");
   run.rows = number(argv[3], 1U, 64U);
   run.bytes = number(argv[4], 64U, PS_MIB);
   run.sync = (int)number(argv[5], 0U, 1U);
@@ -629,7 +639,9 @@ int main(int argc, char **argv) {
   create_seconds = now(CLOCK_MONOTONIC) - start;
   if (run.preopened) {
     close_store(&run);
+    start = now(CLOCK_MONOTONIC);
     open_store(&run, 0, &e);
+    preopen_seconds = now(CLOCK_MONOTONIC) - start;
   }
   for (size_t i = 0U; run.outbox && i < run.writers; ++i)
     check(lc_outbox_dispatcher_get_or_start(run.workers[i].outbox,
@@ -654,6 +666,9 @@ int main(int argc, char **argv) {
   }
   for (size_t i = 0U; run.outbox && i < run.writers; ++i)
     check(lc_outbox_dispatcher_stop(run.workers[i].dispatcher, -1L, &e), &e);
+  work_seconds = now(CLOCK_MONOTONIC) - start;
+  maintenance_started = now(CLOCK_MONOTONIC);
+  index_phase_begin(&maintenance);
   lc_pouch *pouch = ((lc_client_handle *)run.client)->pouch;
   if (run.xa) {
     size_t retired = 0U;
@@ -662,27 +677,38 @@ int main(int argc, char **argv) {
   }
   check(lc_pouch_storage_namespaces_visit(pouch, cleanup_namespace, pouch, &e),
         &e);
+  index_phase_end(&maintenance);
   lifecycle_seconds = now(CLOCK_MONOTONIC) - start;
+  require(work_seconds <= maintenance_started - start &&
+              maintenance.seconds <= lifecycle_seconds - work_seconds,
+          "work and maintenance timers belong to the lifecycle interval");
   cpu_seconds = now(CLOCK_PROCESS_CPUTIME_ID) - cpu;
   pthread_mutex_lock(&sync_mutex);
   measured_syncs = data_syncs + full_syncs;
   measured_sync_seconds = sync_seconds;
   pthread_mutex_unlock(&sync_mutex);
-  start = now(CLOCK_MONOTONIC);
+  index_phase_begin(&closing);
   close_store(&run);
-  close_seconds = now(CLOCK_MONOTONIC) - start;
+  index_phase_end(&closing);
   files = count_files(store);
   if (run.container)
     require(files == 1U, "one persistent container file");
-  start = now(CLOCK_MONOTONIC);
+  index_phase_begin(&reopening);
   open_store(&run, 0, &e);
+  index_phase_end(&reopening);
+  /* Reopened query passes have their own thread attribution. Their parent
+   * interval deliberately uses wall time only so those phases do not nest. */
+  start = now(CLOCK_MONOTONIC);
   verify_reopen(&run, &e);
-  reopen_seconds = now(CLOCK_MONOTONIC) - start;
+  verification.seconds = now(CLOCK_MONOTONIC) - start;
   close_store(&run);
   qsort(run.latencies, run.rows * run.rounds, sizeof(*run.latencies),
         compare_double);
   require(!getrusage(RUSAGE_SELF, &usage), "memory observation");
   double max_index_seconds = 0.0;
+  double max_mutation_seconds = 0.0, mutation_cpu_seconds = 0.0;
+  uint64_t mutation_sync_calls = 0U;
+  double mutation_sync_seconds = 0.0;
   double max_phase_seconds[3] = {0}, phase_cpu_seconds[3] = {0},
          phase_sync_seconds[3] = {0}, reopen_phase_seconds[2] = {0};
   uint64_t phase_sync_calls[3] = {0};
@@ -691,6 +717,13 @@ int main(int argc, char **argv) {
       max_index_seconds = run.workers[i].index_seconds;
   for (size_t i = 0U; i < run.writers; ++i) {
     worker *w = &run.workers[i];
+    if (w->mutations.seconds > max_mutation_seconds)
+      max_mutation_seconds = w->mutations.seconds;
+    mutation_cpu_seconds += w->mutations.cpu_seconds;
+    mutation_sync_calls += w->mutations.sync_calls;
+    mutation_sync_seconds += w->mutations.sync_seconds;
+    require(w->mutations.seconds + w->index_seconds <= work_seconds,
+            "worker phases belong to the work interval");
     double phase_seconds = 0.0;
     for (size_t j = 0U; j < 3U; ++j) {
       index_phase *phase = &w->index_phases[j];
@@ -711,14 +744,21 @@ int main(int argc, char **argv) {
       reopen_phase_seconds[j] += w->reopen_phases[j].seconds;
     }
   }
-  require(phase_sync_calls[0] + phase_sync_calls[1] + phase_sync_calls[2] <=
+  require(mutation_sync_calls + maintenance.sync_calls + phase_sync_calls[0] +
+                  phase_sync_calls[1] + phase_sync_calls[2] <=
               measured_syncs,
           "attributed sync calls belong to the work interval");
   printf("mode=%s rows=%zu bytes=%zu writers=%zu sync=%d preopened=%d "
-         "rounds=%zu chunk=4096 "
+         "rounds=%zu stable_index=%d chunk=4096 "
          "lifecycle_ms=%.6f cpu_ms=%.6f p50_ms=%.6f p95_ms=%.6f "
          "sync_calls=%llu sync_ms=%.6f files=%llu create_ms=%.6f close_ms=%.6f "
-         "reopen_verify_ms=%.6f peak_RSS_KiB=%ld index_worker_max_ms=%.6f "
+         "reopen_verify_ms=%.6f preopen_ms=%.6f work_ms=%.6f "
+         "maintenance_ms=%.6f reopen_ms=%.6f verify_ms=%.6f "
+         "mutation_worker_max_ms=%.6f mutation_thread_cpu_ms=%.6f "
+         "mutation_sync_calls=%llu mutation_sync_ms=%.6f "
+         "maintenance_sync_calls=%llu close_sync_calls=%llu "
+         "reopen_sync_calls=%llu "
+         "peak_RSS_KiB=%ld index_worker_max_ms=%.6f "
          "index_flush_max_ms=%.6f index_first_pass_max_ms=%.6f "
          "index_repeat_pass_max_ms=%.6f index_flush_thread_cpu_ms=%.6f "
          "index_first_pass_thread_cpu_ms=%.6f "
@@ -729,12 +769,20 @@ int main(int argc, char **argv) {
          "reopen_first_pass_ms=%.6f reopen_repeat_pass_ms=%.6f "
          "indexed_queries=%zu verified=1\n",
          argv[1], run.rows, run.bytes, run.writers, run.sync, run.preopened,
-         run.rounds, lifecycle_seconds * 1e3, cpu_seconds * 1e3,
+         run.rounds, run.stable_index, lifecycle_seconds * 1e3, cpu_seconds * 1e3,
          run.latencies[(run.rows * run.rounds - 1U) / 2U] * 1e3,
          run.latencies[(run.rows * run.rounds - 1U) * 95U / 100U] * 1e3,
          (unsigned long long)measured_syncs, measured_sync_seconds * 1e3,
-         (unsigned long long)files, create_seconds * 1e3, close_seconds * 1e3,
-         reopen_seconds * 1e3, usage.ru_maxrss, max_index_seconds * 1e3,
+         (unsigned long long)files, create_seconds * 1e3, closing.seconds * 1e3,
+         (reopening.seconds + verification.seconds) * 1e3,
+         preopen_seconds * 1e3, work_seconds * 1e3, maintenance.seconds * 1e3,
+         reopening.seconds * 1e3, verification.seconds * 1e3,
+         max_mutation_seconds * 1e3, mutation_cpu_seconds * 1e3,
+         (unsigned long long)mutation_sync_calls, mutation_sync_seconds * 1e3,
+         (unsigned long long)maintenance.sync_calls,
+         (unsigned long long)closing.sync_calls,
+         (unsigned long long)reopening.sync_calls,
+         usage.ru_maxrss, max_index_seconds * 1e3,
          max_phase_seconds[0] * 1e3, max_phase_seconds[1] * 1e3,
          max_phase_seconds[2] * 1e3, phase_cpu_seconds[0] * 1e3,
          phase_cpu_seconds[1] * 1e3, phase_cpu_seconds[2] * 1e3,
