@@ -28,6 +28,7 @@ struct ps_namespace_data {
   ps_ns_label *labels;
   size_t count, capacity, views;
   uint64_t active, tail, pending_seal;
+  uint64_t replay_segment, replay_offset;
   /* Decoded fixed controls, keyed by selected immutable incarnations. */
   uint64_t observed_head, observed_active;
   ps_checkpoint_info observed_coverage;

@@ -311,6 +311,8 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
   source_load sources;
   ps_stream_info info;
   ps_checkpoint_info coverage = {0};
+  ps_values *values = NULL;
+  ps_key_checkpoint *resident = previous ? previous->checkpoint : NULL;
   size_t i;
   uint64_t seen = 0;
   int rc = allocate_data(ns, &d, e);
@@ -321,10 +323,15 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
   rc = head_read(d, e);
   if (rc == LC_OK)
     rc = ps_ns_retention_restore(d, e);
-  if (rc == LC_OK)
-    rc = ps_key_checkpoint_open(ns, &d->checkpoint, e);
-  if (rc == LC_OK)
-    ps_key_checkpoint_info(d->checkpoint, &coverage);
+  if (rc == LC_OK) {
+    if (resident)
+      rc = ps_key_checkpoint_capture(resident, &values, &coverage, e);
+    else {
+      rc = ps_key_checkpoint_open(ns, &d->checkpoint, e);
+      if (rc == LC_OK)
+        ps_key_checkpoint_info(d->checkpoint, &coverage);
+    }
+  }
   if (rc == LC_OK && coverage.segment > d->active)
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint coverage exceeds namespace head");
@@ -394,6 +401,27 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
       (seen != d->active - coverage.segment ||
        (d->active && !ps_ns_find(d, PS_CATALOG_SEGMENT, d->active))))
     rc = failure(e, LC_ERR_PROTOCOL, "namespace head has missing segments");
+  if (rc == LC_OK && resident) {
+    uint64_t active = 0;
+    int resumed;
+    if (d->active && d->active == previous->active &&
+        d->tail >= previous->tail) {
+      segment *old = ps_ns_find(previous, PS_CATALOG_SEGMENT, d->active);
+      segment *fresh = ps_ns_find(d, PS_CATALOG_SEGMENT, d->active);
+      if (old &&
+          old->binding.target.incarnation == fresh->binding.target.incarnation)
+        active = d->active;
+    }
+    rc =
+        ps_key_checkpoint_adopt(resident, values, &coverage, active,
+                                previous->tail, &resumed, &d->replay_offset, e);
+    if (rc == LC_OK) {
+      d->checkpoint = resident;
+      if (resumed)
+        d->replay_segment = active;
+    }
+  }
+  ps_values_close(values);
   if (rc != LC_OK)
     ps_namespace_data_destroy(d);
   else
@@ -462,7 +490,8 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
     if (d->items[i]->repacking)
       return failure(e, LC_ERR_PENDING, "namespace mapping is being replaced");
   rc = load(d->ns, d, &fresh, e);
-  if (rc == LC_OK && d->checkpoint_observer.prepare)
+  if (rc == LC_OK && fresh->checkpoint != d->checkpoint &&
+      d->checkpoint_observer.prepare)
     rc = ps_key_checkpoint_observe(fresh->checkpoint, &d->checkpoint_observer,
                                    e);
   if (rc != LC_OK) {
@@ -479,6 +508,8 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   d->active = fresh->active;
   d->tail = fresh->tail;
   d->pending_seal = fresh->pending_seal;
+  d->replay_segment = fresh->replay_segment;
+  d->replay_offset = fresh->replay_offset;
   d->checkpoint = fresh->checkpoint;
   d->checkpoint_ready = 0;
   d->retention_loaded = fresh->retention_loaded;
@@ -491,7 +522,7 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   fresh->labels = NULL;
   fresh->items = items;
   fresh->count = count;
-  fresh->checkpoint = checkpoint;
+  fresh->checkpoint = checkpoint == d->checkpoint ? NULL : checkpoint;
   fresh->retention_budget = retention_budget;
   for (i = 0; i < count; ++i) {
     ps_stream_drop_view(items[i]->stream);
@@ -1374,7 +1405,8 @@ void ps_namespace_read_close(ps_namespace_window *window) {
 }
 static int view_open(ps_namespace *ns,
                      const lc_pouch_storage_namespace_info *expected,
-                     uint64_t start, ps_namespace_view **out, lc_error *e) {
+                     uint64_t resume_segment, uint64_t start,
+                     ps_namespace_view **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_view *view;
   namespace_observation observed = {0};
@@ -1399,7 +1431,7 @@ static int view_open(ps_namespace *ns,
   observed.view = view;
   observed.expected = expected;
   observed.start = start;
-  rc = lock_current_scope(d, &entered, &observed, e);
+  rc = lock_current_scope(d, &entered, resume_segment ? NULL : &observed, e);
   if (rc != LC_OK) {
     ps_namespace_view_close(view);
     return rc;
@@ -1433,6 +1465,11 @@ static int view_open(ps_namespace *ns,
                    "namespace replay suffix is out of range");
     first = d->active;
     count = 1;
+  } else if (resume_segment) {
+    first = resume_segment;
+    if (rc == LC_OK && first > d->active)
+      rc = failure(e, LC_ERR_PROTOCOL, "retained replay cursor exceeds head");
+    count = first <= d->active ? d->active - first + 1 : 0;
   } else {
     first = view->coverage.segment;
     if (!first || !ps_ns_find(d, PS_CATALOG_SEGMENT, first))
@@ -1457,9 +1494,9 @@ static int view_open(ps_namespace *ns,
       break;
     }
     c->id = s->id;
-    c->start = expected                          ? start
-               : s->id == view->coverage.segment ? view->coverage.offset
-                                                 : 0;
+    c->start = expected || s->id == resume_segment ? start
+               : s->id == view->coverage.segment   ? view->coverage.offset
+                                                   : 0;
     strcpy(c->leaf, s->leaf);
     rc = ps_stream_status(s->stream, &info, e);
     if (rc == LC_OK) {
@@ -1482,7 +1519,7 @@ static int view_open(ps_namespace *ns,
 }
 int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
                            lc_error *e) {
-  return view_open(ns, NULL, 0, out, e);
+  return view_open(ns, NULL, 0, 0, out, e);
 }
 int ps_namespace_view_suffix_open(ps_namespace *ns,
                                   const lc_pouch_storage_namespace_info *info,
@@ -1493,7 +1530,7 @@ int ps_namespace_view_suffix_open(ps_namespace *ns,
       *out = NULL;
     return failure(e, LC_ERR_INVALID, "namespace suffix requires a boundary");
   }
-  return view_open(ns, info, start, out, e);
+  return view_open(ns, info, 0, start, out, e);
 }
 void ps_namespace_view_projection(const ps_namespace_view *view,
                                   lc_pouch_storage_namespace_info *out) {
@@ -1669,12 +1706,12 @@ static int checkpoint_replay(void *context, uint64_t segment,
 static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   ps_checkpoint_delta *replay = NULL;
   ps_namespace_view *view = NULL;
-  uint64_t segment, end, bytes = 0, span;
+  uint64_t segment = 0, end = 0, bytes = 0, span;
   size_t i;
-  int rc;
+  int rc, unchanged = 0;
   if (d->checkpoint_ready)
     return LC_OK;
-  rc = ps_namespace_view_open(d->ns, &view, e);
+  rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, &view, e);
   if (rc == LC_OK) {
     rc = ps_key_checkpoint_confirm_seed(d->checkpoint, view->metadata,
                                         &view->coverage, e);
@@ -1684,11 +1721,13 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
       pthread_mutex_unlock(&d->mutex);
     }
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && d->replay_segment && view->count == 1)
+    unchanged = view->items[0].start == view->items[0].tail;
+  if (rc == LC_OK && !unchanged)
     rc = ps_checkpoint_delta_open(d->checkpoint, 0, &replay, e);
-  if (rc == LC_OK)
+  if (rc == LC_OK && !unchanged)
     rc = view_visit(view, 0, 0, checkpoint_replay, replay, e);
-  if (rc == LC_OK) {
+  if (rc == LC_OK && !unchanged) {
     segment = view->coverage.segment;
     end = view->coverage.offset;
     for (i = 0; i < view->count; ++i) {
@@ -1697,10 +1736,15 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
       span = end - view->items[i].start;
       bytes = span > UINT64_MAX - bytes ? UINT64_MAX : bytes + span;
     }
+  }
+  if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
-    rc = ps_checkpoint_delta_replay_commit(replay, segment, end, bytes, e);
-    if (rc == LC_OK)
+    if (!unchanged)
+      rc = ps_checkpoint_delta_replay_commit(replay, segment, end, bytes, e);
+    if (rc == LC_OK) {
       d->checkpoint_ready = 1;
+      d->replay_segment = d->replay_offset = 0;
+    }
     pthread_mutex_unlock(&d->mutex);
   }
   ps_checkpoint_delta_close(replay);

@@ -118,6 +118,13 @@ int ps_key_checkpoint_point(ps_namespace *, uint64_t prefix,
 /* A coverage token can stay fixed while forward checkpoint slots publish. */
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
                                    const ps_checkpoint_info *, lc_error *);
+/* Adopt the pinned selection under namespace mutation authority. A nonzero
+ * active segment certifies the same stream incarnation and a nonregressing
+ * tail. The retained replay cursor is at or below the prior accepted tail. */
+int ps_key_checkpoint_adopt(ps_key_checkpoint *, const ps_values *,
+                            const ps_checkpoint_info *, uint64_t active,
+                            uint64_t prior_tail, int *resumed,
+                            uint64_t *resume_offset, lc_error *);
 int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,
                            lc_error *);
 /* Constant-time source ownership observation for ordinary reclamation. */

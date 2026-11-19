@@ -49,10 +49,11 @@ struct key_slot {
   key_slot *left, *right;
   uint64_t range_end;
   unsigned int height;
+  int retained;
 };
 struct slot_change {
   key_slot *slot;
-  uint64_t bound;
+  uint64_t bound, selected_incarnation;
   uint64_t prior_deletion;
   int created, prepared;
   key_summary summary;
@@ -66,7 +67,7 @@ struct ps_key_checkpoint {
   pthread_mutex_t mutex;
   key_slot **keys, **ids, *slots, *dirty, *retiring;
   source_count **sources;
-  size_t capacity, count, source_capacity, source_count;
+  size_t capacity, count, selected_count, source_capacity, source_count;
   uint64_t dirty_count, dirty_bytes, uncovered_bytes;
   uint64_t latest_segment, latest_offset, state_index, query_index;
   uint64_t body_epoch;
@@ -96,6 +97,7 @@ struct ps_checkpoint_delta {
 static int failure(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
 }
+static void dirty_remove(ps_key_checkpoint *, key_slot *);
 /* One intrusive AVL interval index per logical source. Metadata-only lease
  * updates leave it alone; selecting a piece visits only overlapping bodies.
  * Nodes are already funded key slots, so canonical accept cannot allocate. */
@@ -600,16 +602,94 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
-static int load_slots(ps_key_checkpoint *c, const ps_values *values,
-                      lc_error *e) {
+static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
+                              size_t i, ps_key key, ps_ref ref, key_slot **out,
+                              lc_error *e) {
   ps_reader *reader = NULL;
   lc_pouch_state_entry entry, projected;
+  key_slot *slot;
+  int rc;
+  *out = NULL;
+  memset(&entry, 0, sizeof(entry));
+  slot = new_slot(c, "", 0, key.kind, key.key, e);
+  if (!slot)
+    return LC_ERR_NOMEM;
+  rc = ps_values_read_open(values, i, &reader, e);
+  if (rc == LC_OK)
+    rc =
+        ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
+  ps_reader_close(reader);
+  if (rc == LC_OK &&
+      ((!entry.key || !entry.seen) ||
+       (key.kind == PS_KEY_DECISION ? !entry.control || !entry.decision
+                                    : entry.control || entry.decision)))
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "checkpoint slot has the wrong canonical domain");
+  if (rc == LC_OK) {
+    projected = entry;
+    /* Normalize the class of snapshot body links for subsequent META rows. */
+    if (!entry.control &&
+        !lc_pouch_state_entry_project(NULL, &entry, &projected))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint has no canonical key projection");
+  }
+  if (rc == LC_OK) {
+    lc_free_with_allocator(&c->allocator, slot->key);
+    slot->key = entry.key;
+    entry.key = NULL;
+    slot->selected_incarnation = ref.incarnation;
+    summarize(&slot->summary, &projected);
+    slot->body = source_get(c, &entry, &rc, e);
+    if (slot->body)
+      ++slot->body->prepared;
+    if (rc == LC_OK)
+      rc = reserve_slot(c, slot, slot->summary.deletion_bytes, 1, e);
+  }
+  if (rc == LC_OK)
+    *out = slot;
+  else {
+    release_prepared_source(c, slot->body);
+    close_slot(c, slot);
+  }
+  lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+  return rc;
+}
+static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {
+  if (slot->summary.index > c->state_index)
+    c->state_index = slot->summary.index;
+  if (slot->summary.query > c->query_index)
+    c->query_index = slot->summary.query;
+}
+static void select_incarnation(ps_key_checkpoint *c, key_slot *slot,
+                               uint64_t incarnation) {
+  if (!slot->selected_incarnation)
+    ++c->selected_count;
+  slot->selected_incarnation = incarnation;
+}
+static void install_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
+  source_count *source = slot->body;
+  slot->body = NULL;
+  bind_source(c, slot, source, &slot->summary);
+  release_prepared_source(c, source);
+  insert_slot(c, slot);
+  ++c->selected_count;
+  select_watermarks(c, slot);
+}
+static void select_checkpoint(ps_key_checkpoint *c,
+                              const ps_checkpoint_info *selected) {
+  c->selected = *selected;
+  c->state_index = selected->state_index;
+  c->query_index = selected->query_index;
+  c->latest_segment = selected->segment;
+  c->latest_offset = selected->offset;
+}
+static int load_slots(ps_key_checkpoint *c, const ps_values *values,
+                      lc_error *e) {
   ps_ref ref;
   ps_key key;
   uint64_t bytes;
   size_t i;
   int rc = LC_OK;
-  memset(&entry, 0, sizeof(entry));
   for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
     key_slot *slot = NULL;
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
@@ -617,63 +697,18 @@ static int load_slots(ps_key_checkpoint *c, const ps_values *values,
       continue;
     if (rc == LC_OK)
       rc = room(c, c->count + 1, e);
-    if (rc == LC_OK) {
-      slot = new_slot(c, "", 0, key.kind, key.key, e);
-      if (!slot)
-        rc = LC_ERR_NOMEM;
-    }
     if (rc == LC_OK)
-      rc = ps_values_read_open(values, i, &reader, e);
-    if (rc == LC_OK)
-      rc = ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry,
-                                     e);
-    ps_reader_close(reader);
-    reader = NULL;
+      rc = read_selected_slot(c, values, i, key, ref, &slot, e);
     if (rc == LC_OK &&
-        ((!entry.key || !entry.seen) ||
-         (key.kind == PS_KEY_DECISION ? !entry.control || !entry.decision
-                                      : entry.control || entry.decision)))
-      rc = failure(e, LC_ERR_PROTOCOL,
-                   "checkpoint slot has the wrong canonical domain");
-    if (rc == LC_OK &&
-        (find_key(c, entry.key, key.kind) || find_id(c, key.key)))
+        (find_key(c, slot->key, key.kind) || find_id(c, key.key)))
       rc = failure(e, LC_ERR_PROTOCOL,
                    "checkpoint repeats a canonical key slot");
-    if (rc == LC_OK) {
-      projected = entry;
-      /* Snapshot body links carry their object class in the canonical flag.
-       * Summaries must use the same normalized type as the live projection;
-       * later META records intentionally rely on that prior classification. */
-      if (!entry.control &&
-          !lc_pouch_state_entry_project(NULL, &entry, &projected))
-        rc = failure(e, LC_ERR_PROTOCOL,
-                     "checkpoint has no canonical key projection");
-    }
-    if (rc == LC_OK) {
-      lc_free_with_allocator(&c->allocator, slot->key);
-      slot->key = entry.key;
-      entry.key = NULL;
-      slot->selected_incarnation = ref.incarnation;
-      summarize(&slot->summary, &projected);
-      slot->body = source_get(c, &entry, &rc, e);
-      if (rc == LC_OK)
-        rc = reserve_slot(c, slot, slot->summary.deletion_bytes, 1, e);
-    }
-    if (rc == LC_OK) {
-      if (slot->body) {
-        ++slot->body->references;
-        slot->body->epoch = ++c->body_epoch;
-        if (slot->summary.body_end > slot->summary.body_start)
-          slot->body->ranges = range_insert(slot->body->ranges, slot);
-      }
-      insert_slot(c, slot);
-      if (entry.index_seq > c->state_index)
-        c->state_index = entry.index_seq;
-      if (projected.query_index_seq > c->query_index)
-        c->query_index = projected.query_index_seq;
-    } else if (slot)
+    if (rc == LC_OK)
+      install_selected_slot(c, slot);
+    else if (slot) {
+      release_prepared_source(c, slot->body);
       close_slot(c, slot);
-    lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+    }
   }
   return rc;
 }
@@ -706,11 +741,7 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
   if (rc == LC_OK)
     rc = ps_key_checkpoint_capture(c, &values, &selected, e);
   if (rc == LC_OK) {
-    c->selected = selected;
-    c->state_index = selected.state_index;
-    c->query_index = selected.query_index;
-    c->latest_segment = selected.segment;
-    c->latest_offset = selected.offset;
+    select_checkpoint(c, &selected);
     rc = load_slots(c, values, e);
   }
   ps_values_close(values);
@@ -720,17 +751,15 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
     ps_key_checkpoint_close(c);
   return rc;
 }
-int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
-                                   const ps_values *values,
-                                   const ps_checkpoint_info *coverage,
-                                   lc_error *e) {
+static int seed_matches(ps_key_checkpoint *c, const ps_values *values,
+                        const ps_checkpoint_info *coverage, int *matches,
+                        lc_error *e) {
   ps_key key;
   ps_ref ref;
   key_slot *slot;
   uint64_t bytes;
   size_t i, count = 0;
   int rc = LC_OK, same;
-  pthread_mutex_lock(&c->mutex);
   same = c->selected.control == coverage->control;
   for (i = 0; same && rc == LC_OK && i < ps_values_count(values); ++i) {
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
@@ -741,11 +770,145 @@ int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
            slot->selected_incarnation == ref.incarnation;
     ++count;
   }
-  same = same && count == c->count;
+  *matches = same && count == c->selected_count;
+  return rc;
+}
+int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
+                                   const ps_values *values,
+                                   const ps_checkpoint_info *coverage,
+                                   lc_error *e) {
+  int rc, same;
+  pthread_mutex_lock(&c->mutex);
+  rc = seed_matches(c, values, coverage, &same, e);
   pthread_mutex_unlock(&c->mutex);
   if (rc == LC_OK && !same)
     rc = failure(e, LC_ERR_PENDING,
                  "selected checkpoint changed during recovery");
+  return rc;
+}
+static void drop_selected_slot(ps_key_checkpoint *c, key_slot **link) {
+  key_slot *slot = *link;
+  key_slot **at;
+  key_summary empty = {0};
+  size_t bucket = (size_t)(hash_key(slot->key, strlen(slot->key), slot->kind) &
+                           (c->capacity - 1));
+  *link = slot->next;
+  for (at = &c->keys[bucket]; *at != slot; at = &(*at)->hash_next) {
+  }
+  *at = slot->hash_next;
+  for (at = &c->ids[slot->id & (c->capacity - 1)]; *at != slot;
+       at = &(*at)->id_next) {
+  }
+  *at = slot->id_next;
+  if (slot->dirty_link)
+    dirty_remove(c, slot);
+  retire_remove(slot);
+  bind_source(c, slot, NULL, &empty);
+  --c->count;
+  close_slot(c, slot);
+}
+/* Prepare all changed rows and their deletion obligations before consuming the
+ * old ledger. The temporary slot indexes contain only rows needing decoding. */
+static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
+                           const ps_checkpoint_info *coverage, lc_error *e) {
+  ps_key_checkpoint staged = {0};
+  key_slot **link, *s, *next, *old;
+  ps_key key;
+  ps_ref ref;
+  uint64_t bytes;
+  size_t i, kept = 0;
+  int rc = LC_OK;
+  staged.allocator = c->allocator;
+  for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
+    rc = ps_values_info(values, i, &key, &ref, &bytes, e);
+    if (rc != LC_OK || key.kind == PS_NAMESPACE_CHECKPOINT)
+      continue;
+    old = find_id(c, key.key);
+    if (old && old->kind == key.kind && !old->dirty_link &&
+        old->selected_incarnation == ref.incarnation) {
+      if (old->retained) {
+        rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a retained slot");
+        break;
+      }
+      old->retained = 1;
+      ++kept;
+      continue;
+    }
+    rc = room(&staged, staged.count + 1, e);
+    if (rc == LC_OK)
+      rc = read_selected_slot(c, values, i, key, ref, &s, e);
+    if (rc == LC_OK) {
+      if (find_key(&staged, s->key, s->kind) || find_id(&staged, s->id)) {
+        release_prepared_source(c, s->body);
+        close_slot(c, s);
+        rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a staged slot");
+      } else
+        insert_slot(&staged, s);
+    }
+  }
+  for (s = staged.slots; rc == LC_OK && s; s = s->next) {
+    old = find_id(c, s->id);
+    if (!old || !old->retained)
+      old = find_key(c, s->key, s->kind);
+    if (old && old->retained)
+      rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a retained slot");
+  }
+  if (rc == LC_OK &&
+      (c->count - kept > UINT64_MAX - c->body_epoch ||
+       staged.count > UINT64_MAX - c->body_epoch - (c->count - kept)))
+    rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
+  if (rc == LC_OK)
+    rc = room(c, kept + staged.count, e);
+  if (rc == LC_OK) {
+    select_checkpoint(c, coverage);
+    c->selected_count = kept;
+    c->changed = 0;
+    c->dirty_bytes = c->uncovered_bytes = 0;
+    memset(&c->claim, 0, sizeof(c->claim));
+    (void)ps_budget_close(c->budget, NULL);
+    c->budget = NULL;
+    if (c->logical_epoch != UINT64_MAX)
+      ++c->logical_epoch;
+  }
+  for (link = &c->slots; (s = *link) != NULL;) {
+    if (rc == LC_OK && !s->retained)
+      drop_selected_slot(c, link);
+    else {
+      s->retained = 0;
+      if (rc == LC_OK)
+        select_watermarks(c, s);
+      link = &s->next;
+    }
+  }
+  for (s = staged.slots; s; s = next) {
+    next = s->next;
+    if (rc == LC_OK)
+      install_selected_slot(c, s);
+    else {
+      release_prepared_source(c, s->body);
+      close_slot(c, s);
+    }
+  }
+  lc_free_with_allocator(&c->allocator, staged.keys);
+  lc_free_with_allocator(&c->allocator, staged.ids);
+  return rc;
+}
+int ps_key_checkpoint_adopt(ps_key_checkpoint *c, const ps_values *values,
+                            const ps_checkpoint_info *coverage, uint64_t active,
+                            uint64_t prior_tail, int *resumed,
+                            uint64_t *resume_offset, lc_error *e) {
+  int rc, same;
+  *resumed = 0;
+  *resume_offset = 0;
+  pthread_mutex_lock(&c->mutex);
+  rc = seed_matches(c, values, coverage, &same, e);
+  if (rc == LC_OK && same && active && c->latest_segment == active &&
+      c->latest_offset <= prior_tail) {
+    *resumed = 1;
+    *resume_offset = c->latest_offset;
+  } else if (rc == LC_OK)
+    rc = rebase_selected(c, values, coverage, e);
+  pthread_mutex_unlock(&c->mutex);
   return rc;
 }
 size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *c) {
@@ -1730,7 +1893,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   metadata_input input;
   lc_pouch_record_io io;
   const void *key, *meta;
-  ps_ref control_ref;
+  ps_ref control_ref, slot_ref;
   uint64_t next, bytes, total = 0, prefix = 0;
   size_t i, count = 0;
   int rc = LC_OK, found, truncated;
@@ -1822,8 +1985,12 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     physical.kind = change->slot->kind;
     rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, physical,
                                     &change->record, &writers[count], e);
-    if (rc == LC_OK)
+    if (rc == LC_OK) {
+      rc = ps_revision_writer_info(writers[count], &slot_ref, &bytes, e);
       ++count;
+      if (rc == LC_OK)
+        change->selected_incarnation = slot_ref.incarnation;
+    }
   }
   if (rc == LC_OK) {
     rc = write_control_values(c, c->budget, &selected, &writers[count], e);
@@ -1845,6 +2012,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
         insert_slot(c, s);
         change->created = 0;
       }
+      select_incarnation(c, s, change->selected_incarnation);
       bind_source(c, s, change->body, &change->summary);
       release_prepared_source(c, change->body);
       change->body = NULL;
@@ -2202,12 +2370,13 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
                             lc_error *e) {
   ps_writer *writers[CHECKPOINT_BATCH + 1];
   key_slot *slots[CHECKPOINT_BATCH], *s;
+  uint64_t incarnations[CHECKPOINT_BATCH];
   ps_checkpoint_ref refs[CHECKPOINT_BATCH];
   ps_checkpoint_observer observer;
   ps_budget_plan cost;
   void *plan;
   uint64_t descriptors, epoch = 0, control_bytes;
-  ps_ref control_ref;
+  ps_ref control_ref, slot_ref;
   uint64_t prefix;
   size_t count, ordinary, i, outputs;
   int rc = LC_OK, final;
@@ -2259,8 +2428,13 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
       key.kind = slots[i]->kind;
       rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, key,
                                       &slots[i]->pending, &writers[outputs], e);
-      if (rc == LC_OK)
+      if (rc == LC_OK) {
+        rc = ps_revision_writer_info(writers[outputs], &slot_ref,
+                                     &control_bytes, e);
         ++outputs;
+        if (rc == LC_OK)
+          incarnations[i] = slot_ref.incarnation;
+      }
     }
     if (rc == LC_OK && final) {
       rc = write_control(c, epoch, &writers[outputs], e);
@@ -2287,6 +2461,7 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     if (rc == LC_OK) {
       for (i = 0; i < count; ++i) {
         s = slots[i];
+        select_incarnation(c, s, incarnations[i]);
         memset(&cost, 0, sizeof(cost));
         (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
         subtract_plan(&c->claim, &cost);

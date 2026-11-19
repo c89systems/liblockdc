@@ -385,6 +385,8 @@ static void checkpoint_owner(int durable) {
   ps_namespace_info identity;
   char name[32];
   size_t i;
+  uint64_t offset;
+  int resumed;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
@@ -413,6 +415,8 @@ static void checkpoint_owner(int durable) {
   CHECK(after.reserved_payload_bytes == before.reserved_payload_bytes &&
         after.reserved_metadata_bytes == before.reserved_metadata_bytes &&
         after.reserved_entries == before.reserved_entries);
+  checkpoint_fixture(&entry, name, 129);
+  checkpoint_replay_one(seed, &entry, 1, 100);
   replay = checkpoint_stage_fixture(checkpoint);
   OK(ps_checkpoint_delta_replay_commit(replay, 1, 9000, 9000, &error));
   ps_checkpoint_delta_close(replay);
@@ -430,6 +434,26 @@ static void checkpoint_owner(int durable) {
   CHECK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error) ==
         LC_ERR_PENDING);
   lc_error_cleanup(&error);
+  OK(ps_status(ps_root_space(root), &before, &error));
+  allocation_call = 0;
+  allocation_fail = 23;
+  CHECK(ps_key_checkpoint_adopt(seed, values, &info, 1, 9000, &resumed, &offset,
+                                &error) == LC_ERR_NOMEM);
+  allocation_fail = 0;
+  lc_error_cleanup(&error);
+  ps_key_checkpoint_info(seed, &info);
+  CHECK(!info.control && info.slots == 1 && info.pending == 1 && !resumed);
+  OK(ps_status(ps_root_space(root), &after, &error));
+  CHECK(after.reserved_payload_bytes == before.reserved_payload_bytes &&
+        after.reserved_metadata_bytes == before.reserved_metadata_bytes &&
+        after.reserved_entries == before.reserved_entries);
+  OK(ps_key_checkpoint_adopt(seed, values, &info, 1, 9000, &resumed, &offset,
+                             &error));
+  CHECK(!resumed);
+  OK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error));
+  ps_key_checkpoint_info(seed, &info);
+  CHECK(info.slots == ps_values_count(values) && !info.control &&
+        !info.pending);
   ps_values_close(values);
   values = NULL;
   ps_key_checkpoint_close(seed);
@@ -474,6 +498,7 @@ static void checkpoint_owner(int durable) {
   ps_values_close(values);
   values = NULL;
   /* A rejected/stale replay must not resurrect an old payload generation. */
+  OK(ps_key_checkpoint_open(ns, &seed, &error));
   checkpoint_fixture(&entry, name, 129);
   entry.index_seq = 1;
   checkpoint_replay_one(checkpoint, &entry, 2, 100);
@@ -481,6 +506,21 @@ static void checkpoint_owner(int durable) {
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(info.state_index == 130 && info.segment == 2 && info.offset == 100 &&
         info.slots == 130 && !info.pending);
+  /* Coverage advances without changing any slot. Their existing ledger and
+   * reservations already suffice, even if no allocations are available. */
+  OK(ps_key_checkpoint_capture(seed, &values, &info, &error));
+  allocation_call = 0;
+  allocation_fail = 1;
+  OK(ps_key_checkpoint_adopt(seed, values, &info, 0, 0, &resumed, &offset,
+                             &error));
+  allocation_fail = 0;
+  CHECK(!allocation_call && !resumed);
+  OK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error));
+  ps_key_checkpoint_info(seed, &info);
+  CHECK(info.slots == 130 && info.segment == 2 && info.offset == 100 &&
+        info.state_index == 130 && !info.pending);
+  ps_values_close(values);
+  ps_key_checkpoint_close(seed);
   ps_key_checkpoint_close(checkpoint);
   ps_namespace_release(ns);
   OK(ps_root_close(root, &error));

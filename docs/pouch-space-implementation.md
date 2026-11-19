@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), and [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), and [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7178,3 +7178,82 @@ Verification, traces, and matched measurements are in
 `build/pouch-space-projection-frontier/`. Writable namespace adoption,
 shared outbox and collection authority, capacity under destructive shared
 maintenance, and performance acceptance remain open.
+
+## Resident writer checkpoint adoption
+
+A handoff validates the selected namespace directory and stream tails before
+the incoming owner reconciles the typed values against its resident
+checkpoint. Exact physical
+slot identities retain their decoded summaries, logical body ranges, and
+deletion reservations. Changed values and their capacity obligations are
+prepared before any old slots or funded replay work are released. A failed
+preparation leaves the previous ledger available for retry.
+
+The entire selected slot set and the coverage identity must match to reuse a
+replayed prefix. The active stream must also have the same incarnation and a
+nonregressing accepted tail. In that case the ledger retains its funded
+changes and reads only the remaining append range. Changed slots at fixed
+coverage require rebasing before replay. A second pinned capture checks
+selection at mutation admission, including after a peer advances durability.
+
+The forward-publication fixture forces an allocation failure while adopting
+new slots at a fixed coverage token. It checks that the old dirty slot and
+its capacity survive, and that retry selects the newly published slots.
+A later coverage-only change adopts 130 unchanged slots with the first
+attempted allocation armed to fail. The shared namespace fixture verifies
+restart at the prior accepted tail after a foreign append, with the previously
+captured body retaining its bytes through rotation and checkpointing.
+
+The matched 32-delivery, four-writer NoSync trace counted 129 full
+checkpoint opens in `296c9e70` and 57 after adoption. Writer-ledger slot
+decodes fell from 1,593 to 636. SDK replay decoded 540 selected slot records
+in both runs. Cold ledger opens accounted for 540 of the remaining writer
+slot decodes, and adoption decoded 96 changed slots. A separate matched
+trace recorded 103 stream opens, 72 writer replay records and 3,751 allocator
+refreshes in each build.
+
+All 75 recovery and SDK groups passed on Debug, GNU release, and musl
+release, including root obligations and destructive maintenance at
+capacity. Three ThreadSanitizer and three strict Memcheck runs passed.
+
+All 48 matched GNU queue runs verified delivered payloads and reopened
+state. The native profiles start at 10 MiB. The profiles use 16 deliveries
+of 1 KiB with two writers or 32 deliveries of 4 KiB with four writers.
+Times are median milliseconds for `296c9e70` shared / current shared /
+native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 27.76 / 23.91 / 3.82 / 3.52 | 544.00 / 469.15 / 425.35 / 370.59 | 80.75 / 82.41 / 8.12 / 5.32 | 635.83 / 535.03 / 546.18 / 529.94 |
+| Maintenance | 29.07 / 20.36 / 10.58 / 0.18 | 18.95 / 17.46 / 9.87 / 0.31 | 33.32 / 35.00 / 11.43 / 0.28 | 30.47 / 26.64 / 8.20 / 0.34 |
+| Close | 0.30 / 0.31 / 0.22 / 33.95 | 0.33 / 0.26 / 0.20 / 48.01 | 0.71 / 0.84 / 0.37 / 60.48 | 0.76 / 0.70 / 0.43 / 60.60 |
+| Reopen | 11.12 / 12.65 / 2.36 / 0.56 | 15.40 / 11.12 / 2.99 / 0.81 | 26.21 / 23.21 / 3.39 / 0.93 | 27.44 / 24.01 / 4.19 / 1.02 |
+
+Seven alternating wider pairs under each sync policy also verified output.
+The NoSync work median moved from 79.83 to 76.26 ms, with current faster in
+3 pairs. Durable work moved from 635.49 to 582.05 ms, with current faster in
+4 pairs. The four-way comparison measured wider durable foreground work
+within about one percent of multifile. Wider NoSync work and reopen took
+about 15 and 25 times as long as multifile in that comparison. Shared
+physical capture and visibility refresh remain material costs.
+
+All 36 separate exclusive GNU index controls verified reopened query
+results. Times are median milliseconds for `296c9e70` native / current
+native / multifile. Wider NoSync maximum worker index flush improved
+against the frozen native build and still took more than 11 times the
+multifile flush. Wider durable foreground time increased against the
+frozen native build, with 261 sync calls in both native runs.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 52.65 / 48.18 / 18.19 | 740.26 / 594.80 / 480.60 | 84.33 / 76.94 / 26.60 | 1031.90 / 1223.45 / 1337.97 |
+| Maximum worker index flush | 22.59 / 20.06 / 1.02 | 21.50 / 31.10 / 1.09 | 33.78 / 27.89 / 2.48 | 14.09 / 17.64 / 3.87 |
+| First query pass | 0.22 / 0.17 / 0.17 | 0.25 / 0.22 / 0.17 | 0.37 / 0.46 / 0.23 | 0.25 / 0.31 / 0.25 |
+| Repeated query pass | 0.06 / 0.06 / 0.07 | 0.06 / 0.05 / 0.09 | 0.11 / 0.19 / 0.08 | 0.09 / 0.09 / 0.09 |
+| Close | 0.32 / 0.27 / 40.98 | 0.24 / 0.27 / 57.41 | 0.78 / 0.95 / 84.46 | 0.81 / 0.72 / 85.08 |
+| Reopen | 3.00 / 2.98 / 0.72 | 2.97 / 2.64 / 1.13 | 4.06 / 4.04 / 1.25 | 4.42 / 3.67 / 1.28 |
+
+The recovery logs, matched traces, and measurements are in
+`build/pouch-space-writer-adoption/`. Shared outbox and collection
+authority, capacity under destructive shared maintenance, and broader
+performance acceptance remain open.

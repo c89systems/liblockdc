@@ -2288,6 +2288,11 @@ static void shared_handoff(const char *path) {
     REQUIRE(fail_namespace_load == 2);
     fail_namespace_load = 0;
     clear(&e);
+    ok(ps_ns_data_get(x, &owner, &e), &e);
+    REQUIRE(owner->replay_segment == 1 && owner->replay_offset == old_tail);
+    ok(ps_namespace_checkpoint_recover(x, &e), &e);
+    REQUIRE(owner->checkpoint_ready && !owner->replay_segment &&
+            ps_namespace_source_refs(x, PS_CATALOG_SEGMENT, 1) == 1);
     ok(ps_namespace_view_visit(old, 1, visit, &original, &e), &e);
     REQUIRE(original.count == 1 && original.version == 1);
     ok(ps_ns_enter_checkpoint(y, &owner, &e), &e);
