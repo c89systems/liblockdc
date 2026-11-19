@@ -1,6 +1,7 @@
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_namespace.h"
+#include "lc_pouch_storage.h"
 #include "namespace_internal.h"
 #include "record_io.h"
 #include "root_internal.h"
@@ -17,7 +18,7 @@ struct ps_namespace_append {
   ps_record_writer writer;
   ps_budget *budget;
   ps_checkpoint_delta *delta;
-  uint64_t segment;
+  uint64_t segment, incarnation;
   uint64_t expected;
   int complete;
   const char *leaf;
@@ -41,7 +42,8 @@ struct ps_namespace_view {
   captured *items;
   ps_values *metadata;
   ps_checkpoint_info coverage;
-  uint64_t active, tail;
+  lc_pouch_storage_namespace_info projection;
+  int suffix;
 };
 static int failure(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL,
@@ -823,9 +825,23 @@ int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
     rc = closed;
   return rc;
 }
-int ps_namespace_projection(ps_namespace *ns, uint64_t *segment,
-                            uint64_t *segments, uint64_t *tail,
-                            uint64_t *checkpoint_epoch, lc_error *e) {
+static int projection(struct ps_namespace_data *d,
+                      const ps_checkpoint_info *coverage,
+                      lc_pouch_storage_namespace_info *out, lc_error *e) {
+  segment *active = ps_ns_find(d, PS_CATALOG_SEGMENT, d->active);
+  if (coverage->segment > d->active)
+    return failure(e, LC_ERR_PROTOCOL, "checkpoint exceeds namespace head");
+  if (d->active && !active)
+    return failure(e, LC_ERR_PROTOCOL, "namespace active stream is missing");
+  out->active_segment = d->active;
+  out->segments = d->active - coverage->segment + (coverage->segment != 0);
+  out->tail = d->tail;
+  out->active_incarnation = active ? active->binding.target.incarnation : 0;
+  out->checkpoint_epoch = coverage->epoch;
+  return LC_OK;
+}
+int ps_namespace_projection(ps_namespace *ns,
+                            lc_pouch_storage_namespace_info *out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_checkpoint_info coverage;
   int entered, rc = data_get(ns, &d, 0, e);
@@ -833,10 +849,7 @@ int ps_namespace_projection(ps_namespace *ns, uint64_t *segment,
     rc = lock_current(d, &entered, e);
   if (rc == LC_OK) {
     ps_key_checkpoint_info(d->checkpoint, &coverage);
-    *segment = d->active;
-    *segments = d->active - coverage.segment + (coverage.segment != 0);
-    *tail = d->tail;
-    *checkpoint_epoch = coverage.epoch;
+    rc = projection(d, &coverage, out, e);
     unlock_current(d, entered);
   }
   return rc;
@@ -965,6 +978,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     rc = begin_reserve(s->stream, append->budget, span, exact, &append->writer,
                        e);
     append->segment = s->id;
+    append->incarnation = s->binding.target.incarnation;
     append->leaf = s->leaf;
     append->complete = mode != PS_APPEND_PREFIX;
     append->expected = span;
@@ -998,6 +1012,9 @@ const char *ps_namespace_append_leaf(const ps_namespace_append *append) {
 }
 uint64_t ps_namespace_append_segment(const ps_namespace_append *append) {
   return append ? append->segment : 0;
+}
+uint64_t ps_namespace_append_incarnation(const ps_namespace_append *append) {
+  return append ? append->incarnation : 0;
 }
 uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
   ps_checkpoint_info coverage;
@@ -1166,8 +1183,9 @@ void ps_namespace_read_close(ps_namespace_window *window) {
   ps_namespace_release(window->ns);
   lc_free_with_allocator(NULL, window);
 }
-int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
-                           lc_error *e) {
+static int view_open(ps_namespace *ns,
+                     const lc_pouch_storage_namespace_info *expected,
+                     uint64_t start, ps_namespace_view **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_view *view;
   ps_coordination *coordination;
@@ -1194,19 +1212,40 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
     return rc;
   }
   ++d->views;
+  view->suffix = expected != NULL;
   coordination = ps_space_coordination(ns->root->space);
   if (ps_coordination_shared(coordination))
     rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_VIEW,
                               ns->hash, 0, &view->witness, e);
+  if (rc == LC_OK) {
+    if (expected)
+      ps_key_checkpoint_info(d->checkpoint, &view->coverage);
+    else
+      rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
+                                     &view->coverage, e);
+  }
   if (rc == LC_OK)
-    rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
-                                   &view->coverage, e);
-  view->active = d->active;
-  view->tail = d->tail;
-  first = view->coverage.segment;
-  if (!first || !ps_ns_find(d, PS_CATALOG_SEGMENT, first))
-    ++first;
-  count = d->active >= first ? d->active - first + 1 : 0;
+    rc = projection(d, &view->coverage, &view->projection, e);
+  if (expected) {
+    if (rc == LC_OK &&
+        (expected->active_segment != view->projection.active_segment ||
+         expected->active_incarnation != view->projection.active_incarnation ||
+         expected->checkpoint_epoch != view->projection.checkpoint_epoch ||
+         expected->tail != view->projection.tail))
+      rc = failure(e, LC_ERR_PENDING, "namespace replay boundary changed");
+    if (rc == LC_OK && (!d->active || start >= d->tail ||
+                        (d->active == view->coverage.segment &&
+                         start < view->coverage.offset)))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "namespace replay suffix is out of range");
+    first = d->active;
+    count = 1;
+  } else {
+    first = view->coverage.segment;
+    if (!first || !ps_ns_find(d, PS_CATALOG_SEGMENT, first))
+      ++first;
+    count = d->active >= first ? d->active - first + 1 : 0;
+  }
   if (rc == LC_OK && count > (uint64_t)((size_t)-1 / sizeof(*view->items)))
     rc = failure(e, LC_ERR_NOMEM, "namespace capture exceeds local bounds");
   if (rc == LC_OK)
@@ -1225,14 +1264,17 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
       break;
     }
     c->id = s->id;
-    c->start = s->id == view->coverage.segment ? view->coverage.offset : 0;
+    c->start = expected                          ? start
+               : s->id == view->coverage.segment ? view->coverage.offset
+                                                 : 0;
     strcpy(c->leaf, s->leaf);
     rc = ps_stream_status(s->stream, &info, e);
     if (rc == LC_OK) {
-      c->tail = info.tail;
-      if (c->start > c->tail)
+      c->tail = c->id == view->projection.active_segment ? view->projection.tail
+                                                         : info.tail;
+      if (c->tail > info.tail || c->start > c->tail)
         rc = failure(e, LC_ERR_PROTOCOL,
-                     "checkpoint coverage exceeds captured tail");
+                     "namespace capture exceeds selected stream range");
       else
         rc = ps_stream_window_open(s->stream, c->start, c->tail - c->start,
                                    &c->reader, e);
@@ -1244,6 +1286,25 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   else
     *out = view;
   return rc;
+}
+int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
+                           lc_error *e) {
+  return view_open(ns, NULL, 0, out, e);
+}
+int ps_namespace_view_suffix_open(ps_namespace *ns,
+                                  const lc_pouch_storage_namespace_info *info,
+                                  uint64_t start, ps_namespace_view **out,
+                                  lc_error *e) {
+  if (!info) {
+    if (out)
+      *out = NULL;
+    return failure(e, LC_ERR_INVALID, "namespace suffix requires a boundary");
+  }
+  return view_open(ns, info, start, out, e);
+}
+void ps_namespace_view_projection(const ps_namespace_view *view,
+                                  lc_pouch_storage_namespace_info *out) {
+  *out = view->projection;
 }
 typedef struct replay_input {
   ps_stream_window *window;
@@ -1384,7 +1445,7 @@ static int view_visit(ps_namespace_view *view, int verify, int selected,
 int ps_namespace_view_visit(ps_namespace_view *view, int verify,
                             ps_namespace_record_fn visit, void *context,
                             lc_error *e) {
-  return view_visit(view, verify, 1, visit, context, e);
+  return view_visit(view, verify, view && !view->suffix, visit, context, e);
 }
 void ps_namespace_view_close(ps_namespace_view *view) {
   size_t i;

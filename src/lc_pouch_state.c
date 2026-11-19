@@ -3566,6 +3566,7 @@ struct lc_pouch_namespace_logstore {
   int active_append_fd_owned;
   uint64_t active_segment_offset;
   uint64_t active_segment_id;
+  uint64_t storage_incarnation;
   uint64_t storage_checkpoint_epoch;
   uint64_t max_segment_id;
   unsigned long segment_count;
@@ -9508,7 +9509,7 @@ static int lc_pouch_state_collect_decisions(
                           "failed to allocate staged recovery index", NULL,
                           NULL, "pouch");
     rc = pouch->storage.ops->replay(
-        pouch->storage.context, cache->storage_namespace,
+        pouch->storage.context, cache->storage_namespace, NULL,
         lc_pouch_state_collect_decision, &visit, error);
     /* Flatten even on failure: the caller owns all collected records and
      * releases them before retrying. Historical settled decisions allocate
@@ -10161,6 +10162,7 @@ static int lc_pouch_state_cache_active_append_fd(
 typedef struct lc_pouch_storage_replay_context {
   lc_pouch *pouch;
   lc_pouch_namespace_logstore *cache;
+  int staging_changed;
 } lc_pouch_storage_replay_context;
 
 static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
@@ -10168,6 +10170,9 @@ static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
                                          lc_error *error) {
   lc_pouch_storage_replay_context *replay = context;
   (void)segment;
+  if (entry->decision ||
+      (entry->key && lc_pouch_state_key_is_staged(entry->key)))
+    replay->staging_changed = 1;
   return lc_pouch_state_cache_apply_entry(replay->pouch, replay->cache, entry,
                                           error);
 }
@@ -10325,6 +10330,7 @@ int lc_pouch_state_snapshot_capture(lc_pouch *pouch,
   memset(&cache, 0, sizeof(cache));
   replay.pouch = pouch;
   replay.cache = &cache;
+  replay.staging_changed = 0;
   rc = visit(context, lc_pouch_state_storage_replay, &replay, error);
   /* Ordinary compaction may omit completed decisions, but cannot retire a
    * decision's source while any participant remains live. Resolve the whole
@@ -10387,6 +10393,7 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   lc_pouch_storage_namespace_info info;
   lc_pouch_storage_replay_context replay;
   char *leaf = NULL;
+  int extend = 0;
   int rc = pouch->storage.ops->check(pouch->storage.context, error);
   if (rc != LC_OK)
     return rc;
@@ -10416,25 +10423,35 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
     if (rc != LC_OK)
       return rc;
     if (cache->initialized && cache->active_segment_id == info.active_segment &&
-        cache->active_segment_offset == info.tail &&
+        cache->storage_incarnation == info.active_incarnation &&
         cache->storage_checkpoint_epoch == info.checkpoint_epoch) {
-      scope->projection_current = 1;
-      return LC_OK;
+      if (cache->active_segment_offset == info.tail) {
+        scope->projection_current = 1;
+        return LC_OK;
+      }
+      extend = info.active_incarnation &&
+               cache->active_segment_offset < info.tail &&
+               pouch->storage.ops->replay_suffix;
     }
   }
-  cache->initialized = 0;
-  lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
-  cache->max_version = cache->max_query_index_seq = 0;
-  cache->max_segment_id = cache->segment_count = 0;
   replay.pouch = pouch;
   replay.cache = cache;
-  rc = pouch->storage.ops->replay(
-      pouch->storage.context, cache->storage_namespace,
-      lc_pouch_state_storage_replay, &replay, error);
-  if (rc == LC_OK && scope == NULL)
-    rc = pouch->storage.ops->namespace_info(
-        pouch->storage.context, cache->storage_namespace, &info, error);
-  if (rc == LC_OK && info.active_segment != 0) {
+  replay.staging_changed = 0;
+  if (extend) {
+    rc = pouch->storage.ops->replay_suffix(
+        pouch->storage.context, cache->storage_namespace, &info,
+        cache->active_segment_offset, lc_pouch_state_storage_replay, &replay,
+        error);
+  } else {
+    cache->initialized = 0;
+    lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
+    cache->max_version = cache->max_query_index_seq = 0;
+    cache->max_segment_id = cache->segment_count = 0;
+    rc = pouch->storage.ops->replay(
+        pouch->storage.context, cache->storage_namespace, &info,
+        lc_pouch_state_storage_replay, &replay, error);
+  }
+  if (rc == LC_OK && !extend && info.active_segment != 0) {
     leaf =
         lc_pouch_namespace_segment_leaf(&pouch->allocator, info.active_segment);
     if (leaf == NULL)
@@ -10443,18 +10460,20 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
                         "pouch");
   }
   if (rc != LC_OK) {
-    lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
-    cache->max_version = cache->max_query_index_seq = 0;
+    lc_pouch_state_cache_invalidate_namespace(pouch, ns);
     return rc;
   }
-  cache->active_segment_leaf = leaf;
+  if (!extend)
+    cache->active_segment_leaf = leaf;
   cache->active_segment_id = cache->max_segment_id = info.active_segment;
   cache->segment_count = (unsigned long)info.segments;
   cache->active_segment_offset = info.tail;
+  cache->storage_incarnation = info.active_incarnation;
   cache->storage_checkpoint_epoch = info.checkpoint_epoch;
   cache->writer_mode_epoch = pouch->single_writer_epoch;
-  cache->decision_recovery_checked =
-      !lc_pouch_state_cache_has_live_staged_records(cache);
+  if (!extend || replay.staging_changed)
+    cache->decision_recovery_checked =
+        !lc_pouch_state_cache_has_live_staged_records(cache);
   cache->initialized = 1;
   /* A borrowed record remains valid until its logical scope ends. */
   if (scope != NULL)
@@ -14376,6 +14395,7 @@ static void lc_pouch_state_storage_append_publish(
     manifest->borrowed = 1;
   }
   cache->active_segment_id = cache->max_segment_id = append->segment;
+  cache->storage_incarnation = append->incarnation;
   cache->segment_count = (unsigned long)append->segments;
   cache->active_segment_offset = tail;
 }
@@ -15347,6 +15367,10 @@ append_finish:
     rc = lc_pouch_query_index_operation_begin(
         pouch, ns, key, options->query_index_operation_id, expires_at_unix,
         &query_index_guard_started, error);
+    /* The typed append has already advanced the cache cursor. If index
+     * admission fails, the committed record still needs to enter the cache. */
+    if (rc != LC_OK && pouch->storage.ops != NULL)
+      cache->initialized = 0;
   }
   if (pouch->storage.ops == NULL && !retain_active_append_fd &&
       close(fd) != 0 && rc == LC_OK) {

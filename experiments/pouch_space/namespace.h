@@ -12,6 +12,7 @@ typedef struct ps_namespace_body ps_namespace_body;
 typedef struct ps_namespace_recode ps_namespace_recode;
 typedef struct ps_namespace_conversion ps_namespace_conversion;
 struct lc_pouch_storage_batch;
+struct lc_pouch_storage_namespace_info;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
   PS_APPEND_COMPLETE,
@@ -43,9 +44,9 @@ int ps_namespace_sources_visit(ps_namespace *, ps_namespace_source_fn, void *,
  * An empty namespace has no head/segment until its first append or rotation. */
 int ps_namespace_status_get(ps_namespace *, ps_namespace_status *, lc_error *);
 /* Current route and selected checkpoint, with no per-source enumeration. */
-int ps_namespace_projection(ps_namespace *, uint64_t *segment,
-                            uint64_t *segments, uint64_t *tail,
-                            uint64_t *checkpoint_epoch, lc_error *);
+int ps_namespace_projection(ps_namespace *,
+                            struct lc_pouch_storage_namespace_info *,
+                            lc_error *);
 struct ps_checkpoint_observer;
 int ps_namespace_checkpoint_observe(ps_namespace *,
                                     const struct ps_checkpoint_observer *,
@@ -114,6 +115,7 @@ lc_pouch_record_io ps_namespace_append_output(ps_namespace_append *);
 const char *ps_namespace_append_leaf(const ps_namespace_append *);
 uint64_t ps_namespace_append_segment(const ps_namespace_append *);
 uint64_t ps_namespace_append_segments(const ps_namespace_append *);
+uint64_t ps_namespace_append_incarnation(const ps_namespace_append *);
 /* Caller has finalized complete canonical records and retains logical mutation
  * authority. Commit publishes the tail through the existing sync coordinator;
  * it does not allocate versions/index sequences or apply namespace policy.
@@ -144,6 +146,12 @@ void ps_namespace_read_close(ps_namespace_window *);
  * callback error stops a visit without consuming the view; the next visit
  * starts at the captured beginning again. */
 int ps_namespace_view_open(ps_namespace *, ps_namespace_view **, lc_error *);
+/* Admit only the selected active range after matching the expected boundary. */
+int ps_namespace_view_suffix_open(
+    ps_namespace *, const struct lc_pouch_storage_namespace_info *,
+    uint64_t start, ps_namespace_view **, lc_error *);
+void ps_namespace_view_projection(const ps_namespace_view *,
+                                  struct lc_pouch_storage_namespace_info *);
 typedef int (*ps_namespace_record_fn)(void *, uint64_t segment,
                                       const lc_pouch_state_entry *, lc_error *);
 int ps_namespace_view_visit(ps_namespace_view *, int verify_payload,

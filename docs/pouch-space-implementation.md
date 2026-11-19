@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), and [shared grant preparation](#shared-grant-preparation) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), and [append suffix replay](#append-suffix-replay-for-shared-state) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6945,3 +6945,76 @@ native run even with a similar sync count of 261 versus 263.
 
 Verification logs, the queue and index runs, and the sync trace are in
 `build/pouch-space-prepared-grants/`.
+
+## Append suffix replay for shared state
+
+The SDK projection retains its applied cursor together with the active stream
+incarnation and selected key-checkpoint epoch. Matching identities and an
+advanced tail let a peer replay the appended range directly into its resident
+projection. The storage owner rechecks the requested boundary as it captures
+that range, pins its source, and verifies the new frames through the existing
+bounded record reader. A full replay reports the boundary of the same view it
+visited. A changed incarnation, changed epoch, or regressed tail requires a
+full replay. An interrupted replay invalidates the projection so the next
+read rebuilds before serving a result.
+
+Staging and decision records still update the need for decision recovery.
+Ordinary appended records reuse that check. A failed index-operation
+registration after a canonical body commit also invalidates the local
+projection, so the committed record remains discoverable on the next read.
+
+All 66 projection and SDK groups passed on Debug, GNU release, and musl
+release. Four ThreadSanitizer and four strict Memcheck profiles passed. The
+shared suffix fixture checks two appended records applied exactly once, an
+existing body reader retained across refresh, failure after partial replay,
+a clean retry, a metadata epoch change at a fixed tail, and a rotation that
+rejects the stale suffix request. Shared queue transaction replay and process
+exit during a streamed append also passed.
+
+The two matched NoSync traces count SDK replay callbacks and physical
+checkpoint opens across the whole run, including verification. Full capture
+counts include callers besides SDK projection replay.
+
+| Trace | Baseline / current replayed records | Baseline / current full captures | Current suffix captures | Physical checkpoint opens in each run |
+| --- | ---: | ---: | ---: | ---: |
+| Eight deliveries, two writers | 188 / 120 | 65 / 57 | 8 | 82 |
+| 32 deliveries, four writers | 1112 / 648 | 197 / 165 | 32 | 235 |
+
+All 48 matched GNU queue runs verified delivered payloads and reopened
+state. The native profiles start at 10 MiB. The profiles use 16 deliveries
+of 1 KiB with two writers or 32 deliveries of 4 KiB with four writers. Times
+are median milliseconds for `5ffd54bc` shared / current shared / native
+exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 38.60 / 32.54 / 4.63 / 4.64 | 433.89 / 482.90 / 352.00 / 345.49 | 85.73 / 103.19 / 8.59 / 7.25 | 604.97 / 661.01 / 502.59 / 555.08 |
+| Maintenance | 23.10 / 24.51 / 8.00 / 0.24 | 22.00 / 18.75 / 7.20 / 0.33 | 38.39 / 37.44 / 11.15 / 0.49 | 32.26 / 31.15 / 8.34 / 0.46 |
+| Close | 0.40 / 0.37 / 0.26 / 45.00 | 0.47 / 0.38 / 0.23 / 39.43 | 1.10 / 1.00 / 0.50 / 63.76 | 0.86 / 0.93 / 0.36 / 58.36 |
+| Reopen | 14.24 / 13.29 / 3.49 / 0.70 | 14.66 / 15.45 / 2.90 / 0.82 | 31.52 / 30.44 / 3.89 / 0.88 | 37.20 / 28.98 / 3.86 / 1.31 |
+
+In seven additional alternating wider NoSync pairs, current work was faster
+in six pairs. Work medians moved from 100.62 to 94.92 ms and worker CPU from
+133.84 to 128.68 ms. The initial wider sample was slower. Queue work and
+reopen still need acceptance against multifile, and the traces show that
+physical checkpoint opens remain frequent after the logical replay change.
+
+All 36 separate exclusive GNU index controls verified reopened query results.
+Times are median milliseconds for `5ffd54bc` native / current native /
+multifile. Wider work and maximum worker flush were slower than the frozen
+native build in this sample. Shared projection timing acceptance remains
+separate from these exclusive index controls.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 43.64 / 48.68 / 18.77 | 492.11 / 493.61 / 393.77 | 83.42 / 103.92 / 27.95 | 1058.30 / 1190.88 / 1109.74 |
+| Maximum worker index flush | 16.84 / 16.24 / 0.90 | 15.69 / 13.60 / 1.05 | 28.82 / 33.77 / 2.19 | 15.44 / 19.41 / 3.81 |
+| First query pass | 0.22 / 0.15 / 0.18 | 0.24 / 0.21 / 0.22 | 0.53 / 0.45 / 0.25 | 0.40 / 0.30 / 0.24 |
+| Repeated query pass | 0.05 / 0.05 / 0.09 | 0.05 / 0.05 / 0.06 | 0.21 / 0.13 / 0.09 | 0.09 / 0.09 / 0.08 |
+| Close | 0.34 / 0.20 / 28.96 | 0.31 / 0.39 / 40.59 | 0.69 / 0.75 / 60.43 | 0.75 / 0.66 / 49.83 |
+| Reopen | 2.99 / 2.93 / 0.71 | 2.88 / 3.27 / 0.90 | 4.72 / 4.84 / 1.33 | 4.66 / 4.48 / 1.36 |
+
+The verification logs, traces, and timing data are in
+`build/pouch-space-delta-replay/`. Physical namespace handoff, shared outbox
+and collection authority, shared capacity under destructive maintenance,
+and production acceptance remain open.

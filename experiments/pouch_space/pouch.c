@@ -131,8 +131,7 @@ static void namespace_close(void *context, void *ns) {
 static int namespace_info(void *context, void *ns,
                           lc_pouch_storage_namespace_info *out, lc_error *e) {
   (void)context;
-  return ps_namespace_projection(ns, &out->active_segment, &out->segments,
-                                 &out->tail, &out->checkpoint_epoch, e);
+  return ps_namespace_projection(ns, out, e);
 }
 static int namespace_state_lock(void *context, const char *name, void **out,
                                 lc_error *e) {
@@ -171,12 +170,28 @@ static int namespaces_visit(void *context,
     rc = ps_root_namespace_visit(owner->root, visit_namespace, &v, e);
   return rc;
 }
-static int replay(void *context, void *ns, lc_pouch_storage_visit_fn visit,
-                  void *opaque, lc_error *e) {
+static int replay(void *context, void *ns,
+                  lc_pouch_storage_namespace_info *info,
+                  lc_pouch_storage_visit_fn visit, void *opaque, lc_error *e) {
   ps_namespace_view *view = NULL;
   int rc;
   (void)context;
   rc = ps_namespace_view_open(ns, &view, e);
+  if (rc == LC_OK && info)
+    ps_namespace_view_projection(view, info);
+  if (rc == LC_OK)
+    rc = ps_namespace_view_visit(view, 1, visit, opaque, e);
+  ps_namespace_view_close(view);
+  return rc;
+}
+static int replay_suffix(void *context, void *ns,
+                         const lc_pouch_storage_namespace_info *info,
+                         uint64_t start, lc_pouch_storage_visit_fn visit,
+                         void *opaque, lc_error *e) {
+  ps_namespace_view *view = NULL;
+  int rc;
+  (void)context;
+  rc = ps_namespace_view_suffix_open(ns, info, start, &view, e);
   if (rc == LC_OK)
     rc = ps_namespace_view_visit(view, 1, visit, opaque, e);
   ps_namespace_view_close(view);
@@ -221,6 +236,7 @@ static int append_begin(void *context, void *ns, uint64_t target,
   out->leaf = ps_namespace_append_leaf(append);
   out->segment = ps_namespace_append_segment(append);
   out->segments = ps_namespace_append_segments(append);
+  out->incarnation = ps_namespace_append_incarnation(append);
   rc = lc_pouch_record_io_tail(out->io, &out->start, e);
   if (rc != LC_OK) {
     ps_namespace_append_close(append);
@@ -745,6 +761,7 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  namespace_info,
                                                  namespaces_visit,
                                                  replay,
+                                                 replay_suffix,
                                                  append_begin,
                                                  append_commit,
                                                  append_close,

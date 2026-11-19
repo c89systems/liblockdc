@@ -5732,6 +5732,166 @@ static void shared_state(const char *path, const char *directory) {
   }
   shared_state_fixture = 0;
 }
+typedef struct replay_probe {
+  const lc_pouch_storage_ops *storage;
+  size_t full, suffix, applied, fail_at;
+} replay_probe;
+typedef struct replay_probe_visit {
+  lc_pouch_storage_visit_fn visit;
+  void *context;
+  size_t seen;
+} replay_probe_visit;
+static replay_probe *active_replay_probe;
+static int count_full_replay(void *context, void *ns,
+                             lc_pouch_storage_namespace_info *info,
+                             lc_pouch_storage_visit_fn visit, void *opaque,
+                             lc_error *e) {
+  ++active_replay_probe->full;
+  return active_replay_probe->storage->replay(context, ns, info, visit, opaque,
+                                              e);
+}
+static int count_suffix_record(void *context, uint64_t segment,
+                               const lc_pouch_state_entry *record,
+                               lc_error *e) {
+  replay_probe_visit *probe = context;
+  int rc;
+  if (++probe->seen == active_replay_probe->fail_at)
+    return lc_error_set(e, LC_ERR_NOMEM, 0, "injected suffix replay failure",
+                        NULL, NULL, "test");
+  rc = probe->visit(probe->context, segment, record, e);
+  if (rc == LC_OK)
+    ++active_replay_probe->applied;
+  return rc;
+}
+static int count_suffix_replay(void *context, void *ns,
+                               const lc_pouch_storage_namespace_info *info,
+                               uint64_t start, lc_pouch_storage_visit_fn visit,
+                               void *opaque, lc_error *e) {
+  replay_probe_visit probe = {visit, opaque, 0};
+  ++active_replay_probe->suffix;
+  return active_replay_probe->storage->replay_suffix(
+      context, ns, info, start, count_suffix_record, &probe, e);
+}
+static void delta_put(lc_pouch *pouch, const char *key, unsigned char seed,
+                      lc_error *e) {
+  lc_pouch_state_write_result result = {0};
+  input in = source(59, seed);
+  ok(put(pouch, "delta", key, &in, NULL, &result, e), e);
+  lc_pouch_state_write_result_cleanup(&allocator, &result);
+}
+static void shared_state_delta(const char *path) {
+  shared_state_fixture = 1;
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_pouch_state_options o = options(durable ? 3 : 0, durable);
+    lc_pouch *a = NULL, *b = NULL;
+    lc_pouch_state_read_result held = {0}, read = {0};
+    lc_pouch_storage_ops storage;
+    replay_probe probe = {0};
+    ps_namespace *ns = NULL;
+    ps_namespace_view *stale = NULL;
+    lc_pouch_storage_namespace_info original, changed;
+    lc_pouch_state_write_options metadata = {0};
+    lc_pouch_state_write_result write = {0};
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &a, &e), &e);
+    for (unsigned int i = 0; i < 6; ++i) {
+      char key[16];
+      snprintf(key, sizeof(key), "base-%u", i);
+      delta_put(a, key, (unsigned char)i, &e);
+    }
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &b, &e), &e);
+    probe.storage = b->storage.ops;
+    storage = *probe.storage;
+    storage.replay = count_full_replay;
+    storage.replay_suffix = count_suffix_replay;
+    active_replay_probe = &probe;
+    b->storage.ops = &storage;
+    ok(lc_pouch_state_read(b, "delta", "base-0", &held, &e), &e);
+    REQUIRE(held.found && held.version == 1 && probe.full == 1 &&
+            !probe.suffix);
+    delta_put(a, "new", 6, &e);
+    delta_put(a, "base-0", 7, &e);
+    ok(lc_pouch_state_read_metadata(b, "delta", "base-0", &read, &e), &e);
+    REQUIRE(read.found && read.version == 2 && read.index_seq == 8 &&
+            probe.full == 1 && probe.suffix == 1 && probe.applied == 2);
+    lc_pouch_state_read_result_cleanup(&allocator, &read);
+    read_value(b, "delta", "base-5", 59, 5, 1, &e);
+    read_value(b, "delta", "new", 59, 6, 1, &e);
+    drain(held.body, 59, 0, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &held);
+
+    delta_put(a, "base-1", 8, &e);
+    delta_put(a, "base-2", 9, &e);
+    probe.fail_at = 2;
+    REQUIRE(lc_pouch_state_read_metadata(b, "delta", "base-2", &read, &e) ==
+            LC_ERR_NOMEM);
+    REQUIRE(!read.found && probe.full == 1 && probe.suffix == 2 &&
+            probe.applied == 3);
+    clear(&e);
+    probe.fail_at = 0;
+    read_value(b, "delta", "base-1", 59, 8, 2, &e);
+    read_value(b, "delta", "base-2", 59, 9, 2, &e);
+    REQUIRE(probe.full == 2 && probe.suffix == 2);
+
+    ok(ps_root_namespace_acquire(ps_pouch_state_root(a), "delta", 0, &ns, &e),
+       &e);
+    ok(ps_namespace_projection(ns, &original, &e), &e);
+    metadata.has_metadata = 1;
+    metadata.metadata = (const unsigned char *)"at fixed tail";
+    metadata.metadata_length = 13;
+    ok(lc_pouch_state_update_metadata(a, "delta", "base-0", &metadata, &write,
+                                      &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &write);
+    ok(ps_namespace_projection(ns, &changed, &e), &e);
+    REQUIRE(changed.tail == original.tail &&
+            changed.checkpoint_epoch > original.checkpoint_epoch);
+    ok(lc_pouch_state_read_metadata(b, "delta", "base-0", &read, &e), &e);
+    REQUIRE(read.found && read.version == 2 && read.index_seq == 11 &&
+            read.metadata_length == 13 &&
+            !memcmp(read.metadata, "at fixed tail", 13) && probe.full == 3 &&
+            probe.suffix == 2);
+    lc_pouch_state_read_result_cleanup(&allocator, &read);
+    ok(ps_namespace_rotate(ns, changed.active_segment, &e), &e);
+    REQUIRE(ps_namespace_view_suffix_open(ns, &changed, 0, &stale, &e) ==
+                LC_ERR_PENDING &&
+            !stale);
+    clear(&e);
+    ps_namespace_release(ns);
+    delta_put(a, "rotated", 10, &e);
+    read_value(b, "delta", "rotated", 59, 10, 1, &e);
+    REQUIRE(probe.full == 4 && probe.suffix == 2);
+    b->storage.ops = probe.storage;
+    active_replay_probe = NULL;
+    lc_pouch_close(b);
+    lc_pouch_close(a);
+    REQUIRE(live == 0 && unlink(path) == 0);
+  }
+  shared_state_fixture = 0;
+}
+static void shared_state_committed_index_failure(const char *path) {
+  lc_error e = {0};
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *pouch = NULL;
+  lc_pouch_state_write_options write = {0};
+  lc_pouch_state_write_result result = {0};
+  input body = source(59, 17);
+  shared_state_fixture = 1;
+  o.logical.query_indexing_enabled = 1;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &pouch, &e), &e);
+  delta_put(pouch, "before", 16, &e);
+  write.query_index_operation_active = 1;
+  REQUIRE(put(pouch, "delta", "committed", &body, &write, &result, &e) ==
+          LC_ERR_INVALID);
+  REQUIRE(body.calls && e.message && strstr(e.message, "requires an id"));
+  clear(&e);
+  lc_pouch_state_write_result_cleanup(&allocator, &result);
+  read_value(pouch, "delta", "committed", 59, 17, 1, &e);
+  read_value(pouch, "delta", "before", 59, 16, 1, &e);
+  lc_pouch_close(pouch);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  shared_state_fixture = 0;
+}
 typedef struct abandoned_producer {
   int notify, started;
 } abandoned_producer;
@@ -5818,7 +5978,10 @@ static void *worker(void *context) {
     lifecycle(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-state"))
     shared_state(r->path, r->directory);
-  else if (!strcmp(r->mode, "shared-state-crash"))
+  else if (!strcmp(r->mode, "shared-state-delta")) {
+    shared_state_delta(r->path);
+    shared_state_committed_index_failure(r->path);
+  } else if (!strcmp(r->mode, "shared-state-crash"))
     shared_state_crash(r->path);
   else if (!strcmp(r->mode, "body-select"))
     body_select_client(r->path, r->directory);

@@ -8,13 +8,13 @@
  * policy, generations, projections and codecs. No pathname operations. */
 typedef struct lc_pouch_storage_namespace_info {
   uint64_t active_segment, segments, tail;
-  uint64_t checkpoint_epoch;
+  uint64_t active_incarnation, checkpoint_epoch;
 } lc_pouch_storage_namespace_info;
 typedef struct lc_pouch_storage_append {
   void *handle;
   lc_pouch_record_io io;
   const char *leaf; /* Stable while the namespace capability is retained. */
-  uint64_t start, segment, segments;
+  uint64_t start, segment, segments, incarnation;
 } lc_pouch_storage_append;
 typedef int (*lc_pouch_storage_visit_fn)(void *, uint64_t,
                                          const lc_pouch_state_entry *,
@@ -177,7 +177,14 @@ typedef struct lc_pouch_storage_ops {
                         lc_error *);
   int (*namespaces_visit)(void *, lc_pouch_storage_namespace_visit_fn, void *,
                           lc_error *);
-  int (*replay)(void *, void *, lc_pouch_storage_visit_fn, void *, lc_error *);
+  /* Report the same captured boundary visited by the full replay. */
+  int (*replay)(void *, void *, lc_pouch_storage_namespace_info *,
+                lc_pouch_storage_visit_fn, void *, lc_error *);
+  /* Visit an append suffix only after checking the selected incarnation,
+   * checkpoint epoch and end against the expected namespace boundary. */
+  int (*replay_suffix)(void *, void *, const lc_pouch_storage_namespace_info *,
+                       uint64_t start, lc_pouch_storage_visit_fn, void *,
+                       lc_error *);
   /* Rotation target and known span. PREFIX permits an unknown remainder;
    * COMPLETE requires the declared size, MAINTENANCE additionally permits
    * spending protected work capacity. Reserve all dependencies before staging.
