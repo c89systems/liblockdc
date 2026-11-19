@@ -4,15 +4,24 @@ The full native x86_64 backend is authorized for staged implementation on
 `experiment/pouch-space`. Normal Pouch still uses the multifile backend until
 integration and acceptance are complete. The measured foundation remains the
 comparison reference, not a second permanent production backend. Existing-root
-conversion is outside this implementation; production deployment still requires
-an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
+format migration is outside this implementation; production deployment still
+requires an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
-Current milestones are the [incremental canonical key checkpoint cutover](#incremental-canonical-key-checkpoint-cutover)
-and [bounded namespace piece integrity](#bounded-namespace-piece-integrity).
-Sparse mapping/reclamation, standing admission with root-wide reconstruction,
-codec conversion and process-shared roots remain unfinished. Earlier snapshot
-sections below retain the evidence and constraints of their implementation stages.
+Current implementation and acceptance status:
+
+| Surface | Implemented evidence | Acceptance status |
+| --- | --- | --- |
+| Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
+| Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
+| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime) | Shared allocator admission, projection refresh, reader generations and abandoned-claim recovery |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
+
+Native Pouch currently admits one process at a time. Shared coordination
+participants are supported at the file authority layer.
+Earlier sections below retain the evidence and constraints of their individual
+implementation stages; their unfinished-work lists are historical snapshots.
 
 ## Single-file architecture direction
 
@@ -5430,3 +5439,105 @@ Qualification scripts and the frozen comparison owner are retained there.
 Shared-root coordination/recovery, general bounded-capacity acceptance and
 performance qualification remain in the full active goal. Multifile remains
 the default/reference; production cutover still requires an explicit decision.
+
+### Container file authority and guard lifetime
+
+The physical owner now owns one coordination capability and its adopted file
+descriptor. Lifetime compatibility retains Linux `flock`. Shared coordination
+participants use OFD byte locks for publication, recovery, transaction stripes
+and namespace identities, without lock files or PID ownership guesses. Kernel
+authority remains until the last reference to its open file description closes.
+Participants must open fresh descriptions; inherited handles require exec before
+use. Shared data-allocator admission remains closed.
+
+Namespace guards share their local mutex by actual lock byte, including hash
+collisions. Registry ownership ends before allocation or waiting; unrelated
+domains can make progress while another participant is blocked. Guard holders
+and waiters both retain the coordination owner. Closing an unrelated descriptor
+cannot release another description's OFD authority. An uncertain unlock poisons
+the owner until close/reopen. Storage and coordination share one atomic failure
+word, so either failure blocks guard admission while physical reads retain
+their existing single-word health check.
+
+Native transaction guards now use this owner. The old Pouch-owned mutex array
+and its independent initialization/destruction path are removed. Exclusive
+transaction stripes retain resident mutexes, without allocation or file-lock
+syscalls during acquisition/release. The existing facade still owns logical
+ordering, same-stripe contention and the owner reference held across Pouch
+runtime close. Native lifetime contention preserves its established diagnostic
+prefix. No application producer, canonical publication or durability operation
+runs in the guard implementation.
+
+Root close checks guard/waiter ownership before destroying namespace caches.
+A refused close must preserve every namespace completion reservation. The new
+root-lifetime fixture installs a live canonical key, retains a guard, rejects
+close, checks unchanged reserve ownership/bounds, and reads the namespace before
+successful release and reopen. Linking the old `803d4c76` root-close function
+against the new physical owner makes this same fixture fail at reserve retention;
+the current early check preserves it.
+
+Five component groups cover lifetime compatibility, root reservation retention,
+threads, failures and independent processes. They verify deliberate namespace
+hash collisions, close refusal during a wait, cross-owner updates to a shared
+counter, interrupted lock calls, clean acquisition failure, sticky unlock
+failure, storage failure propagation, and all measured allocation/mutex-init
+sites with and without error outputs. The public guard initialization test now
+discovers initialization sites instead of assuming the mutex array's former
+position. Failed admissions check released lifetime authority; subsequent opens
+and guard retries remain usable.
+
+Actual process checks exec fresh participants. All four domains contend and
+recover after ordinary release and SIGKILL, while another domain can progress.
+Four processes serialize 800 counter updates. These test file authority, not
+canonical Pouch publication or shared reader-generation recovery. Every component
+fixture finishes with one 10 MiB file; high lock offsets never grow it.
+
+Debug qualification comprises 52 distinct affected checks across the completed
+passes and targeted reruns, retaining successful unrelated coverage. The final
+failure-domain run passes 18 checks. Thirty-one checks each pass on final GNU
+and musl release, including the five component groups, existing public guard
+behavior, lease concurrency/coordinated recovery, the strict 96-case capacity
+gate, attachment windows and encrypted durable/NoSync queue/outbox/XA recovery.
+Source/stack gates pass; Debug workers use 128 KiB stacks with the glibc stack
+cache disabled. Four TSan scenarios pass with instrumented OpenSSL 3.6.5 and
+no suppressions. Three strict Memcheck scenarios pass with 2,680 matching
+allocations/frees, zero remaining heap/errors/suppressions and only the three
+inherited descriptors in each invocation.
+
+Matched GNU measurements retain 36 indexed lifecycle runs and 24 expiry runs,
+using the frozen `803d4c76` binaries, three alternating samples, fixed 10 MiB
+roots and normal release stack settings. Indexed native before/after medians:
+
+| Phase, milliseconds | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 55.51 / 55.35 | 561.12 / 616.80 | 84.72 / 94.74 | 1066.56 / 1162.30 |
+| Work CPU | 17.50 / 15.01 | 45.86 / 51.72 | 45.26 / 44.67 | 126.15 / 140.34 |
+| Maximum worker index flush | 20.53 / 16.44 | 18.44 / 24.50 | 29.69 / 37.07 | 15.90 / 20.71 |
+| Close | 0.334 / 0.439 | 0.306 / 0.392 | 0.611 / 0.713 | 0.637 / 0.681 |
+| Reopen alone | 3.19 / 2.87 | 3.12 / 3.66 | 4.44 / 4.97 | 4.81 / 6.10 |
+
+The expiry probe uses one short parent key and one attachment with indexing
+disabled. Before/after work medians are 25.71/28.32 ms (plaintext NoSync),
+28.31/26.83 ms (combined-codec NoSync), 29.96/30.43 ms (plaintext durable), and
+28.44/28.26 ms (combined-codec durable). Durable expiry CPU rises about 17–18%
+in these sub-2-ms CPU samples while NoSync CPU decreases. Native index
+maintenance still uses three barriers; this component adds no canonical
+durability barrier. The mixed timings and durable CPU/lifecycle regressions
+remain unresolved performance evidence, not acceptance. The multifile reference
+and separate phase/CPU data remain in the raw comparison results.
+
+Evidence is in ignored `build/pouch-space-coordination/`: `qualified-debug.log`,
+`qualified-final-tail-debug.log`, `failure-domain-debug.log`, `final-debug.log`,
+`final-qualified-*-release.log`, `root-before-negative.log`, `final-tsan-*.log`,
+`final-memcheck-*.log`, `performance.log`, `performance-summary.tsv`,
+`lease-performance.log` and `lease-summary.tsv`, with qualification/derivation
+scripts and frozen binaries alongside them. Earlier measurement iterations are
+retained separately. Persistence markers, public ABI and production selection
+are unchanged.
+
+The next shared-root integration must preserve private allocator claims across
+participants, refresh canonical/projection state at a coordinated publication
+prefix, retain captured reader generations through reclamation, and reconstruct
+abandoned work before readmission. File authority alone does not establish these
+properties. They remain required in the full active goal, together with general
+capacity and performance acceptance. Multifile remains the default/reference.

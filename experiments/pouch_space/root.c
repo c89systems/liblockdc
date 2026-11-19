@@ -1,6 +1,7 @@
 #include "root.h"
 #include "budget.h"
 #include "collections.h"
+#include "coordination.h"
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
@@ -572,6 +573,11 @@ int ps_root_close(ps_root *root, lc_error *error) {
     pthread_mutex_unlock(&root->mutex);
     return failure(error, LC_ERR_INVALID, "pouch_root_busy",
                    "release pouch namespace owners before root close");
+  }
+  if (ps_coordination_users(ps_space_coordination(root->space))) {
+    pthread_mutex_unlock(&root->mutex);
+    return failure(error, LC_ERR_INVALID, "pouch_root_busy",
+                   "release container coordination guards before root close");
   }
   pthread_mutex_unlock(&root->mutex);
   for (ns = root->namespaces; ns; ns = ns->next) {

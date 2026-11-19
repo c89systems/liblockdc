@@ -1,5 +1,10 @@
 # Native Pouch container foundation
 
+The current integration contract and milestone status are in
+[the native implementation contract](../../docs/pouch-space-implementation.md).
+The fixture restrictions below describe the original physical foundation;
+later native integration supersedes its initial method restrictions.
+
 This is an experimental container foundation, not a complete Pouch backend or a
 replacement public API. Its immutable-value fixtures use STATE keys to replace
 immutable values; COLLECTION keys
@@ -18,22 +23,26 @@ metadata before clearing PENDING and never commits or syncs its owner's stream.
 The caller retains namespace policy and append/publication authority. No payload
 spool is introduced. Normal public Pouch still opens multifile roots.
 
-The private `ps_pouch_state_open` harness now runs ordinary production state PUT,
+The original `ps_pouch_state_open` harness ran ordinary production state PUT,
 point read, metadata read, copy and namespace creation through typed storage
 capabilities. It reuses the real projection and mutation policy, with no fake
 filesystem paths or container body cache. Read sources retain their original
-body/crypto binding across replacement, rotation and Pouch close. Indexing,
-background maintenance and watches must be explicitly disabled; other APIs are
-outside this harness's current call contract. The `runtime-state` comparison
+body/crypto binding across replacement, rotation and Pouch close. That initial
+admission required indexing, background maintenance and watches to be disabled.
+The `runtime-state` comparison
 mode uses these production calls for both writes and reads, separately from the
-older codec-only stream fixtures. Full public backend integration remains ahead.
+older codec-only stream fixtures. Current production-engine method coverage is
+recorded in the implementation contract.
 
-One exclusive Linux `flock` protects the container lifetime. Independent threads
+The coordination owner retains an exclusive Linux `flock` for native container
+lifetime. It also supplies OFD byte authority to shared coordination participants
+and owns the transaction guard stripes. Native allocator admission still permits
+one process at a time. Independent threads
 reserve private extents under a short mutex; producer callbacks run outside it.
 A second open, including another process, fails. After the exclusive owner
-exits, another process can recover and open normally. Shared-root coordination
-and process-shared reader pins are not implemented. Fork before open or exec
-before using the library in a child. Stop concurrent calls and close all readers
+exits, another process can recover and open normally. Shared allocator/projection
+recovery and process-shared reader generations remain unfinished. Fork before
+open or exec before using the library in a child. Stop concurrent calls and close all readers
 and writers before closing their space.
 
 The initial capacity defaults to 10 MiB with real Linux `fallocate`. Growth is

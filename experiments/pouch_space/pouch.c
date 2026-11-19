@@ -1,5 +1,6 @@
 #include "pouch.h"
 #include "checkpoint.h"
+#include "coordination.h"
 #include "collections.h"
 #include "frame.h"
 #include "lc_api_internal.h"
@@ -18,6 +19,10 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
+#if LC_POUCH_STORAGE_TXN_GUARD_STRIPES != PS_COORDINATION_TXN_STRIPES
+#error Container transaction authority must match the logical stripe count
+#endif
+
 typedef struct queue_waiter {
   const char *ns, *queue;
   pthread_cond_t changed;
@@ -29,7 +34,6 @@ typedef struct ps_pouch_owner {
   lc_allocator allocator;
   lc_pouch *runtime; /* Borrowed while logical append/maintenance is active. */
   unsigned int references;
-  pthread_mutex_t txn_guards[LC_POUCH_STORAGE_TXN_GUARD_STRIPES];
   queue_waiter *waiters;
 } ps_pouch_owner;
 typedef struct ps_pouch_source {
@@ -79,11 +83,6 @@ static void release(void *context) {
   lc_error ignored;
   if (__atomic_sub_fetch(&owner->references, 1, __ATOMIC_ACQ_REL))
     return;
-  {
-    size_t i;
-    for (i = 0; i < LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++i)
-      pthread_mutex_destroy(&owner->txn_guards[i]);
-  }
   lc_error_init(&ignored);
   (void)ps_root_close(owner->root, &ignored);
   lc_error_cleanup(&ignored);
@@ -572,6 +571,7 @@ static int retention_hint_next(void *context, const char *after, char **name,
 static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
                           lc_error *e) {
   ps_pouch_owner *owner = context;
+  ps_coordination_guard *guard = NULL;
   int rc;
   *out = NULL;
   if (stripe >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES)
@@ -581,24 +581,23 @@ static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
   rc = check(context, e);
   if (rc != LC_OK)
     return rc;
-  rc = wait ? pthread_mutex_lock(&owner->txn_guards[stripe])
-            : pthread_mutex_trylock(&owner->txn_guards[stripe]);
-  if (rc != 0)
-    return lc_error_set(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, 0,
-                        "failed to lock pouch transaction guard", strerror(rc),
-                        NULL, "pouch");
+  rc = ps_coordination_lock(ps_space_coordination(ps_root_space(owner->root)),
+                             PS_COORDINATION_TRANSACTION, stripe, wait, &guard,
+                             e);
+  if (rc != LC_OK)
+    return rc;
   /* Storage can become uncertain while a caller waits for this stripe. */
   rc = check(context, e);
   if (rc != LC_OK) {
-    pthread_mutex_unlock(&owner->txn_guards[stripe]);
+    ps_coordination_unlock(guard);
     return rc;
   }
   __atomic_add_fetch(&owner->references, 1, __ATOMIC_RELAXED);
-  *out = &owner->txn_guards[stripe];
+  *out = guard;
   return LC_OK;
 }
 static void txn_guard_release(void *context, void *handle) {
-  pthread_mutex_unlock(handle);
+  ps_coordination_unlock(handle);
   release(context);
 }
 static int collection_open(void *context, lc_client *client, const char *ns,
@@ -828,25 +827,6 @@ int ps_pouch_state_open(const char *path, int create,
     lc_free_with_allocator(&pouch->allocator, owner);
     lc_pouch_close(pouch);
     return rc;
-  }
-  {
-    size_t i;
-    for (i = 0; i < LC_POUCH_STORAGE_TXN_GUARD_STRIPES; ++i) {
-      int mutex_rc = pthread_mutex_init(&owner->txn_guards[i], NULL);
-      if (mutex_rc != 0) {
-        lc_error ignored;
-        while (i)
-          pthread_mutex_destroy(&owner->txn_guards[--i]);
-        lc_error_init(&ignored);
-        (void)ps_root_close(owner->root, &ignored);
-        lc_error_cleanup(&ignored);
-        lc_free_with_allocator(&pouch->allocator, owner);
-        lc_pouch_close(pouch);
-        return lc_error_set(e, LC_ERR_TRANSPORT, 0,
-                            "cannot initialize container transaction guards",
-                            strerror(mutex_rc), NULL, "pouch");
-      }
-    }
   }
   pouch->storage.ops = &storage_ops;
   pouch->storage.context = owner;

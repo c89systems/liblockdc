@@ -11,7 +11,6 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -1707,7 +1706,10 @@ static void destroy(ps_space *s) {
     lc_free_with_allocator(NULL, payload);
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
-  if (s->fd >= 0)
+  if (s->coordination) {
+    (void)ps_coordination_close(s->coordination, NULL);
+    s->fd = -1;
+  } else if (s->fd >= 0)
     (void)close(s->fd);
   if (s->locks_initialized >= 4)
     (void)pthread_cond_destroy(&s->commit_cond);
@@ -2301,6 +2303,7 @@ static int sync_parent(const char *path, lc_error *error) {
 int ps_open(const char *path, int create, const ps_options *options,
             ps_space **out, lc_error *error) {
   ps_options defaults = {0};
+  ps_coordination_options coordination = {0};
   ps_space *s;
   uint64_t bound;
   int rc;
@@ -2373,9 +2376,12 @@ int ps_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
-  if (flock(s->fd, LOCK_EX | LOCK_NB) != 0) {
-    rc = err(error, LC_ERR_INVALID,
-             "container already open; shared-process mode unsupported");
+  coordination.failure_flag = &s->poisoned;
+  rc = ps_coordination_open(s->fd, &coordination, &s->coordination, error);
+  if (rc != LC_OK) {
+    if (rc == LC_ERR_PENDING)
+      rc = err(error, LC_ERR_INVALID,
+               "container already open; another owner is active");
     destroy(s);
     return rc;
   }
@@ -2412,14 +2418,19 @@ int ps_close(ps_space *s, lc_error *error) {
   if (!s)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  if (s->readers || s->writers || s->budgets || s->reserve_count) {
+  if (s->readers || s->writers || s->budgets || s->reserve_count ||
+      ps_coordination_users(s->coordination)) {
     pthread_mutex_unlock(&s->mutex);
     return err(error, LC_ERR_INVALID,
-               "close container readers, writers, budgets and reserves first");
+               "close container readers, writers, budgets, reserves and "
+               "coordination guards first");
   }
   pthread_mutex_unlock(&s->mutex);
   destroy(s);
   return LC_OK;
+}
+ps_coordination *ps_space_coordination(ps_space *s) {
+  return s ? s->coordination : NULL;
 }
 static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
                        ps_writer **out, lc_error *error) {

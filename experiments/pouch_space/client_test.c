@@ -2726,10 +2726,11 @@ static void guard_faults(const char *directory) {
         REQUIRE(count >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES + 1U);
         lc_pouch_close(p);
         REQUIRE(!live);
-        /* The scheduler mutex follows the transaction stripes. Exercise both
-         * phases, including opening with background work disabled. */
-        for (size_t cut = 1; cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES + 1U;
-             ++cut)
+        /* Discover the actual initialization sites. File coordination now
+         * precedes recovery; mutex ordering is not an interface contract.
+         * Every required initializer must reject admission without leaking
+         * lifetime authority, including with no error-output object. */
+        for (size_t cut = 1; cut <= count; ++cut)
           for (int no_error = 0; no_error < 2; ++no_error) {
             ps_pouch_state_options o = {0};
             o.logical.single_writer = o.logical.single_writer_set = 1;
@@ -2740,20 +2741,14 @@ static void guard_faults(const char *directory) {
             o.io = &io;
             p = NULL;
             mutex_init_calls = 0;
-            mutex_init_fail =
-                count - LC_POUCH_STORAGE_TXN_GUARD_STRIPES - 1U + cut;
+            mutex_init_fail = cut;
             mutex_init_armed = 1;
             int rc = ps_pouch_state_open(path, 0, &allocator, &o, &p,
                                          no_error ? NULL : &e);
             mutex_init_armed = 0;
+            REQUIRE(mutex_init_calls >= cut);
             REQUIRE(rc == LC_ERR_TRANSPORT && !p && !live);
-            REQUIRE(
-                no_error ||
-                (e.message &&
-                 !strcmp(e.message,
-                         cut <= LC_POUCH_STORAGE_TXN_GUARD_STRIPES
-                             ? "cannot initialize container transaction guards"
-                             : "failed to initialize pouch compaction mutex")));
+            REQUIRE(no_error || (e.code == rc && e.message && *e.message));
             clear(&e);
             unlocked(path);
           }

@@ -3,6 +3,7 @@
 #include "budget.h"
 #include "catalog.h"
 #include "directory.h"
+#include "coordination.h"
 #include "owned.h"
 #include "space.h"
 #include <pthread.h>
@@ -83,7 +84,9 @@ typedef struct ps_meta_page {
   struct ps_meta_page *next, **link, *hash_next;
 } ps_meta_page;
 struct ps_space {
+  /* fd is borrowed from coordination after successful lifetime admission. */
   int fd, poisoned, durable, root;
+  ps_coordination *coordination;
   pthread_mutex_t mutex;
   pthread_mutex_t sync_io_mutex, commit_mutex;
   pthread_cond_t commit_cond;

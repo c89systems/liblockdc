@@ -1,0 +1,281 @@
+#define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
+#include "coordination.h"
+#include "lc_api_internal.h"
+#include <errno.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#define FIXED (PS_COORDINATION_TXN_STRIPES + 2U)
+#define BUCKETS 67U
+#define TXN_BASE UINT64_C(256)
+#define NS_BASE UINT64_C(4096)
+#define NS_MASK ((UINT64_C(1) << 61) - 1)
+struct ps_coordination_guard {
+  ps_coordination *owner;
+  pthread_mutex_t mutex;
+  uint64_t offset;
+  size_t users;
+  int fixed;
+  struct ps_coordination_guard *next;
+};
+struct ps_coordination {
+  int fd, shared, poisoned;
+  int *failure_flag;
+  size_t users;
+  lc_allocator allocator;
+  ps_coordination_io io;
+  pthread_mutex_t registry;
+  ps_coordination_guard fixed[FIXED], *buckets[BUCKETS];
+};
+static int fail(lc_error *e, int code, int reason, const char *message) {
+  return lc_error_set(e, code, 0, message,
+                      reason ? strerror(reason) : NULL, NULL, "pouch");
+}
+static int native_lock(void *context, int fd, int command, struct flock *lock) {
+  (void)context;
+  return fcntl(fd, command, lock);
+}
+int ps_coordination_check(ps_coordination *owner, lc_error *e) {
+  if (!owner)
+    return fail(e, LC_ERR_INVALID, 0, "coordination requires an owner");
+  return (__atomic_load_n(&owner->poisoned, __ATOMIC_ACQUIRE) ||
+          (owner->failure_flag &&
+           __atomic_load_n(owner->failure_flag, __ATOMIC_ACQUIRE)))
+             ? fail(e, LC_ERR_TRANSPORT, 0,
+                    "container coordination uncertain; close and reopen")
+             : LC_OK;
+}
+size_t ps_coordination_users(ps_coordination *owner) {
+  return owner ? __atomic_load_n(&owner->users, __ATOMIC_ACQUIRE) : 0;
+}
+int ps_coordination_open(int fd, const ps_coordination_options *options,
+                         ps_coordination **out, lc_error *e) {
+  ps_coordination_options defaults = {0};
+  ps_coordination *owner;
+  size_t i;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!options)
+    options = &defaults;
+  if (fd < 0 || !out || (options->shared != 0 && options->shared != 1) ||
+      (options->io && !options->io->lock))
+    return fail(e, LC_ERR_INVALID, 0, "invalid container coordination open");
+  owner = lc_calloc_with_allocator(options->allocator, 1, sizeof(*owner));
+  if (!owner)
+    return fail(e, LC_ERR_NOMEM, 0, "cannot allocate container coordination");
+  if (options->allocator)
+    owner->allocator = *options->allocator;
+  owner->fd = fd;
+  owner->shared = options->shared;
+  owner->failure_flag = options->failure_flag;
+  owner->io.lock = native_lock;
+  if (options->io)
+    owner->io = *options->io;
+  rc = pthread_mutex_init(&owner->registry, NULL);
+  if (rc) {
+    lc_free_with_allocator(&owner->allocator, owner);
+    return fail(e, LC_ERR_TRANSPORT, rc,
+                "cannot initialize coordination registry");
+  }
+  for (i = 0; i < FIXED; ++i) {
+    owner->fixed[i].owner = owner;
+    owner->fixed[i].fixed = 1;
+    owner->fixed[i].offset = i < 2 ? i : TXN_BASE + i - 2;
+    rc = pthread_mutex_init(&owner->fixed[i].mutex, NULL);
+    if (rc)
+      break;
+  }
+  if (!rc) {
+    do {
+      rc = flock(fd, (owner->shared ? LOCK_SH : LOCK_EX) | LOCK_NB);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0)
+      rc = fail(e, errno == EAGAIN || errno == EWOULDBLOCK ? LC_ERR_PENDING
+                                                          : LC_ERR_TRANSPORT,
+                 errno, "container already open; another owner is active");
+  } else
+    rc = fail(e, LC_ERR_TRANSPORT, rc,
+              "cannot initialize container coordination guard");
+  if (rc != LC_OK) {
+    while (i)
+      pthread_mutex_destroy(&owner->fixed[--i].mutex);
+    pthread_mutex_destroy(&owner->registry);
+    lc_free_with_allocator(&owner->allocator, owner);
+    return rc;
+  }
+  *out = owner;
+  return LC_OK;
+}
+int ps_coordination_close(ps_coordination *owner, lc_error *e) {
+  size_t i;
+  int rc;
+  if (!owner)
+    return LC_OK;
+  if (ps_coordination_users(owner))
+    return fail(e, LC_ERR_INVALID, 0,
+                "release coordination guards and waiters before close");
+  /* No new calls may enter after the zero-user observation. */
+  rc = close(owner->fd);
+  if (rc)
+    rc = fail(e, LC_ERR_TRANSPORT, errno, "cannot close coordination owner");
+  for (i = 0; i < FIXED; ++i)
+    pthread_mutex_destroy(&owner->fixed[i].mutex);
+  pthread_mutex_destroy(&owner->registry);
+  lc_free_with_allocator(&owner->allocator, owner);
+  return rc;
+}
+static void drop(ps_coordination_guard *guard) {
+  ps_coordination *owner = guard->owner;
+  ps_coordination_guard **link;
+  if (!guard->fixed) {
+    pthread_mutex_lock(&owner->registry);
+    if (!--guard->users) {
+      link = &owner->buckets[guard->offset % BUCKETS];
+      while (*link != guard)
+        link = &(*link)->next;
+      *link = guard->next;
+      pthread_mutex_unlock(&owner->registry);
+      pthread_mutex_destroy(&guard->mutex);
+      lc_free_with_allocator(&owner->allocator, guard);
+    } else
+      pthread_mutex_unlock(&owner->registry);
+  }
+  __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
+}
+static int namespace_guard(ps_coordination *owner, uint64_t identity,
+                            ps_coordination_guard **out, lc_error *e) {
+  ps_coordination_guard *guard, *candidate;
+  uint64_t offset;
+  size_t bucket;
+  int rc;
+  /* The registry is keyed by the actual lock byte, including collisions. */
+  identity ^= identity >> 33;
+  identity *= UINT64_C(0xff51afd7ed558ccd);
+  identity ^= identity >> 33;
+  offset = NS_BASE + (identity & NS_MASK);
+  bucket = (size_t)(offset % BUCKETS);
+  pthread_mutex_lock(&owner->registry);
+  for (guard = owner->buckets[bucket]; guard; guard = guard->next)
+    if (guard->offset == offset) {
+      ++guard->users;
+      pthread_mutex_unlock(&owner->registry);
+      *out = guard;
+      return LC_OK;
+    }
+  pthread_mutex_unlock(&owner->registry);
+  candidate = lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*candidate));
+  if (!candidate) {
+    return fail(e, LC_ERR_NOMEM, 0,
+                "cannot allocate namespace coordination guard");
+  }
+  candidate->owner = owner;
+  candidate->offset = offset;
+  candidate->users = 1;
+  rc = pthread_mutex_init(&candidate->mutex, NULL);
+  if (rc) {
+    lc_free_with_allocator(&owner->allocator, candidate);
+    return fail(e, LC_ERR_TRANSPORT, rc,
+                "cannot initialize namespace coordination");
+  }
+  pthread_mutex_lock(&owner->registry);
+  for (guard = owner->buckets[bucket]; guard; guard = guard->next)
+    if (guard->offset == offset)
+      break;
+  if (guard)
+    ++guard->users;
+  else {
+    candidate->next = owner->buckets[bucket];
+    owner->buckets[bucket] = candidate;
+    guard = candidate;
+    candidate = NULL;
+  }
+  pthread_mutex_unlock(&owner->registry);
+  if (candidate) {
+    pthread_mutex_destroy(&candidate->mutex);
+    lc_free_with_allocator(&owner->allocator, candidate);
+  }
+  *out = guard;
+  return LC_OK;
+}
+static int kernel_lock(ps_coordination_guard *guard, int acquire, int wait) {
+  ps_coordination *owner = guard->owner;
+  struct flock lock;
+  int rc;
+  memset(&lock, 0, sizeof(lock));
+  lock.l_type = acquire ? F_WRLCK : F_UNLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = (off_t)guard->offset;
+  lock.l_len = 1;
+  do {
+    rc = owner->io.lock(owner->io.context, owner->fd,
+                        wait ? F_OFD_SETLKW : F_OFD_SETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+  return rc;
+}
+int ps_coordination_lock(ps_coordination *owner,
+                         enum ps_coordination_domain domain, uint64_t identity,
+                         int wait, ps_coordination_guard **out, lc_error *e) {
+  ps_coordination_guard *guard = NULL;
+  int rc, reason;
+  if (out)
+    *out = NULL;
+  if (!owner || !out || (wait != 0 && wait != 1) ||
+      domain < PS_COORDINATION_PUBLICATION ||
+      domain > PS_COORDINATION_NAMESPACE ||
+      (domain <= PS_COORDINATION_RECOVERY && identity) ||
+      (domain == PS_COORDINATION_TRANSACTION &&
+       identity >= PS_COORDINATION_TXN_STRIPES))
+    return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");
+  rc = ps_coordination_check(owner, e);
+  if (rc != LC_OK)
+    return rc;
+  __atomic_add_fetch(&owner->users, 1, __ATOMIC_ACQ_REL);
+  if (domain == PS_COORDINATION_NAMESPACE)
+    rc = namespace_guard(owner, identity, &guard, e);
+  else
+    guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
+                              ? (size_t)identity + 2
+                              : (size_t)domain];
+  if (rc != LC_OK) {
+    __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
+    return rc;
+  }
+  rc = wait ? pthread_mutex_lock(&guard->mutex)
+            : pthread_mutex_trylock(&guard->mutex);
+  if (rc) {
+    drop(guard);
+    return fail(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, rc,
+                "cannot acquire local container authority");
+  }
+  rc = ps_coordination_check(owner, e);
+  if (rc == LC_OK && owner->shared && kernel_lock(guard, 1, wait)) {
+    reason = errno;
+    rc = fail(e, reason == EAGAIN || reason == EACCES ? LC_ERR_PENDING
+                                                    : LC_ERR_TRANSPORT,
+              reason, "cannot acquire container file authority");
+  }
+  if (rc != LC_OK) {
+    pthread_mutex_unlock(&guard->mutex);
+    drop(guard);
+    return rc;
+  }
+  *out = guard;
+  return LC_OK;
+}
+void ps_coordination_unlock(ps_coordination_guard *guard) {
+  ps_coordination *owner;
+  if (!guard)
+    return;
+  owner = guard->owner;
+  if (owner->shared && kernel_lock(guard, 0, 0)) {
+    if (owner->failure_flag)
+      __atomic_store_n(owner->failure_flag, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&owner->poisoned, 1, __ATOMIC_RELEASE);
+  }
+  pthread_mutex_unlock(&guard->mutex);
+  drop(guard);
+}
