@@ -1581,17 +1581,18 @@ static void projection_faults(void) {
       options.io = &io;
       ps_space *a = NULL, *b = NULL;
       ps_reader *held = NULL;
-      ps_writer *private = NULL;
+      ps_writer *producer = NULL;
       ok(ps_open(path, 1, &options, &a, &e), &e);
       for (uint64_t id = 1; id <= 6; ++id)
         capture_put(a, id, 65);
       ok(ps_checkpoint(a, &e), &e);
       ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
       ok(ps_open(path, 0, NULL, &b, &e), &e);
-    private
-      = private_value(a, NULL, 9000);
-      capture_put(b, 1, 129);
+      producer = private_value(a, NULL, 9000);
+      capture_put(b, 7, 129);
       ok(ps_checkpoint(b, &e), &e);
+      capture_put(b, 1, 129);
+      capture_put(b, 8, PS_CHUNK);
       uint64_t generation = a->generation, physical = coverage(NULL, 0);
       allocations = 0;
       allocation_fail = kind ? 0 : phase;
@@ -1621,7 +1622,7 @@ static void projection_faults(void) {
       }
       captured_expect(held, 1, 65);
       ps_reader_close(held);
-      ps_writer_close(private);
+      ps_writer_close(producer);
       ok(ps_close(a, &e), &e);
       ok(ps_close(b, &e), &e);
       REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
@@ -1870,8 +1871,7 @@ static void projection_boundaries(void) {
       ok(ps_close(a, &e), &e);
       REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
     }
-  /* Journal-only application changes remain fenced. Neither a complete later
-   * frame nor a damaged prefix may be silently absorbed into the baseline. */
+  /* A missing certified tail fences adoption until the actual bytes return. */
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
   ok(ps_open(path, 1, NULL, &a, &e), &e);
@@ -1882,9 +1882,6 @@ static void projection_boundaries(void) {
   ok(ps_checkpoint(b, &e), &e);
   capture_put(b, 3, 65);
   uint64_t generation = a->generation, claims = coverage(NULL, 0);
-  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
-  lc_error_cleanup(&e);
-  REQUIRE(coverage(NULL, 0) == claims);
   unsigned char pending[64], erased[64] = {0};
   REQUIRE(pread(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
           sizeof(pending));
@@ -1892,10 +1889,11 @@ static void projection_boundaries(void) {
           sizeof(erased));
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
   lc_error_cleanup(&e);
+  REQUIRE(coverage(NULL, 0) == claims);
   REQUIRE(pwrite(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
           sizeof(pending));
-  ok(ps_checkpoint(b, &e), &e);
   ok(ps_refresh(a, &e), &e);
+  REQUIRE(a->generation == b->generation && a->sequence == b->sequence);
   unsigned char prefix[64], damaged[64];
   REQUIRE(pread(b->fd, prefix, sizeof(prefix), PS_JOURNAL_OFFSET) ==
           sizeof(prefix));
@@ -1907,7 +1905,7 @@ static void projection_boundaries(void) {
   generation = a->generation;
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
   lc_error_cleanup(&e);
-  /* Cold recovery retires the unknown tail and issues a checked grant. */
+  /* Reopening retires the unknown tail and issues a checked grant. */
   ok(ps_close(b, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
   ok(ps_refresh(a, &e), &e);
@@ -2399,6 +2397,114 @@ static void journal_replay(void) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void projection_tail(void) {
+  lc_error e = {0};
+  projection_io m = {0};
+  ps_io io = {0};
+  ps_options observer = {0}, publisher = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *old = NULL, *prior = NULL;
+  ps_writer *writers[3], *producer = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {PS_CHUNK * 2, 4096, 32, 0};
+  unsigned char residue[64], zero[64] = {0};
+  uint64_t prefix;
+  io.context = &m;
+  io.read = projection_read;
+  io.write = projection_write;
+  io.reserve = reserve_io;
+  io.sync = projection_sync;
+  observer.io = &io;
+  publisher.durable_sync = 1;
+  ok(ps_open(path, 1, &observer, &a, &e), &e);
+  capture_put(a, 1, 65);
+  capture_put(a, 2, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_read_open(a, key(1), NULL, &old, &e), &e);
+  ps_entry *original = ps_internal_lookup(a, key(1));
+  ok(ps_open(path, 0, &publisher, &b, &e), &e);
+  REQUIRE(b->journal == sizeof(residue));
+  REQUIRE(pread(b->fd, residue, sizeof(residue), PS_JOURNAL_OFFSET) ==
+          sizeof(residue));
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  producer = private_value(a, budget, 9000);
+  capture_put(b, 6, 65);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_delete(b, key(2), &e), &e);
+  writers[0] = replay_value(b, key(1), 31, PS_CHUNK, &e);
+  writers[1] = replay_value(b, key(3), 32, 65, &e);
+  writers[2] = replay_value(b, key(4), 33, 64, &e);
+  ok(ps_revision_publish(writers, 3, 0, PS_COMMIT_DEFER_SYNC, NULL, &prefix,
+                         &e),
+     &e);
+  for (size_t i = 0; i < 3; ++i)
+    ps_writer_close(writers[i]);
+  ps_entry *published = ps_internal_lookup(b, key(1));
+  REQUIRE(published && published->count == 1);
+  m.ranges = 1;
+  m.forbidden[0].first = published->extents[0].offset;
+  m.forbidden[0].last = m.forbidden[0].first + PS_CHUNK;
+  /* The first tail operation is valid. Damage the following atomic group
+   * and verify even the valid deletion stays outside our live projection. */
+  unsigned char last, damaged;
+  off_t end = (off_t)(PS_JOURNAL_OFFSET + b->journal - 1);
+  REQUIRE(pread(b->fd, &last, 1, end) == 1);
+  damaged = last ^ 1;
+  REQUIRE(pwrite(b->fd, &damaged, 1, end) == 1);
+  uint64_t generation = a->generation, sequence = a->sequence;
+  uint64_t physical = coverage(NULL, 0);
+  size_t journal = a->journal;
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PROTOCOL);
+  lc_error_cleanup(&e);
+  REQUIRE(a->generation == generation && a->sequence == sequence &&
+          a->journal == journal && coverage(NULL, 0) == physical);
+  REQUIRE(ps_internal_lookup(a, key(1)) == original &&
+          !ps_internal_lookup(a, key(2))->deleted);
+  REQUIRE(pwrite(b->fd, &last, 1, end) == 1);
+  /* A valid previous-generation grant can only appear at the journal start.
+   * It must never be accepted as the end of an adopted tail. */
+  REQUIRE(pwrite(b->fd, residue, sizeof(residue), end + 1) == sizeof(residue));
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  REQUIRE(a->generation == generation && a->sequence == sequence &&
+          a->journal == journal && coverage(NULL, 0) == physical);
+  REQUIRE(pwrite(b->fd, zero, sizeof(zero), end + 1) == sizeof(zero));
+  m.armed = 1;
+  ok(ps_refresh(a, &e), &e);
+  m.armed = 0;
+  REQUIRE(a->generation > generation && a->generation == b->generation &&
+          a->sequence == b->sequence && a->journal == b->journal);
+  REQUIRE(!m.syncs && !m.payload_reads);
+  REQUIRE(ps_internal_lookup(a, key(1))->previous == original);
+  ok(ps_read_open(a, key(1), NULL, &prior, &e), &e);
+  expect_value(a, key(2), 0, 0);
+  expect_value(a, key(3), 0, 0);
+  expect_value(a, key(4), 0, 0);
+  expect_value(a, key(6), 65, 6);
+  ok(ps_flush(b, &e), &e);
+  expect_value(a, key(1), PS_CHUNK, 31);
+  expect_value(a, key(3), 65, 32);
+  expect_value(a, key(4), 64, 33);
+  captured_expect(old, 1, 65);
+  ok(ps_publish(producer, NULL, &e), &e);
+  ps_writer_close(producer);
+  ok(ps_flush(a, &e), &e);
+  expect_value(b, key(9000), PS_CHUNK, 9000 % 251);
+  ok(ps_budget_close(budget, &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  captured_expect(prior, 1, 65);
+  ps_reader_close(prior);
+  ps_reader_close(old);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  expect_value(a, key(1), PS_CHUNK, 31);
+  expect_value(a, key(2), 0, 0);
+  expect_value(a, key(4), 64, 33);
+  expect_value(a, key(9000), PS_CHUNK, 9000 % 251);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void journal_replay_faults(void) {
   size_t sites = 0;
   for (size_t failure = 0; failure <= sites; ++failure) {
@@ -2525,7 +2631,7 @@ static void journal_replay_process(void) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
-static void journal_replay_structural(void) {
+static void replay_structural(int rollover) {
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
   ps_key stream = {88, 101, PS_STREAM};
@@ -2561,11 +2667,15 @@ static void journal_replay_structural(void) {
   ok(ps_owned_grant(observed, NULL, 0, 0, &retained, &found, &e), &e);
   REQUIRE(found && !ps_owned_run_mapped(retained));
   ps_owned_range range = {100, 100};
+  if (rollover)
+    ok(ps_checkpoint(b, &e), &e);
   ok(ps_owned_run_repack(head, original, NULL, &range, 1, NULL, NULL, &mapped,
                          &e),
      &e);
   ok(ps_owned_grant(observed, NULL, 0, 0, &current, &found, &e), &e);
   REQUIRE(found && ps_owned_run_mapped(current));
+  if (rollover)
+    ok(ps_checkpoint(b, &e), &e);
   ok(ps_catalog_remove(b, 88, PS_CATALOG_BODY, "stream", 6, &binding.revision,
                        &e),
      &e);
@@ -2598,6 +2708,10 @@ static void journal_replay_structural(void) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   free(bytes);
+}
+static void journal_replay_structural(void) {
+  replay_structural(0);
+  replay_structural(1);
 }
 int main(int argc, char **argv) {
   if (argc == 5 && !strcmp(argv[1], "--journal-child")) {
@@ -2664,6 +2778,8 @@ int main(int argc, char **argv) {
     projection_boundaries();
   else if (!strcmp(argv[2], "projection-pressure"))
     projection_pressure();
+  else if (!strcmp(argv[2], "projection-tail"))
+    projection_tail();
   else if (!strcmp(argv[2], "shared-durable"))
     shared_durability();
   else if (!strcmp(argv[2], "readiness-cohort"))

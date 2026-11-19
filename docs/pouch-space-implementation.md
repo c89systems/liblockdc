@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership), [private checkpoint workspace](#private-checkpoint-workspace-and-ownership-handoff), [live allocator authority](#live-allocator-authority-and-canonical-observation) and process-death release | Application/canonical projection replay, shared capacity economy, owned-stream reader generations, shared readiness and normal shared admission |
+| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, shared journal durability certificates, and [live checkpoint and tail adoption](#live-checkpoint-and-tail-adoption) | Shared capacity forecasts, owned-stream readiness, logical ownership and cache coherence, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6380,3 +6380,67 @@ A checkpoint with a following application tail still needs coordinated
 adoption of both the directory and the tail before publishing reconstructed
 free space. Shared owned-stream readiness, logical ownership and cache
 coherence, and normal shared admission remain open.
+
+## Live checkpoint and tail adoption
+
+A participant that encounters a newer checkpoint stages the checkpoint directory
+and the certified journal tail in one allocator view. It overlays its retained
+payloads and private reservations before claiming tail extents. The common
+application frame decoder handles individual publications, transaction groups,
+and durable stream and catalog transitions. The staged view keeps prior
+incarnations for durable readers and preserves the identity of entries already
+held by a reader or stream handle.
+
+The participant installs the staged view only after verifying the certified
+prefix and protecting its workspace. A failure before installation retains the
+previous view and releases staged claims. A certification gap returns
+`LC_ERR_PENDING`.
+An unfinished root retirement still requires stabilization. A completed peer
+checkpoint with a verified tail needs no extra barrier, and adoption resolves
+metadata and extent maps without reading immutable value bodies. Foreign wire
+sequences remain separate from the owner's completed local publication prefix.
+
+Shared publishers clear the next journal header in the same write as the frame,
+before publishing readiness. This prevents a shorter frame from leaving an
+ambiguous suffix from the previous generation. A verified old frame can remain
+at the start of an untouched journal after a checkpoint. Once replay has begun,
+the next complete header must be another certified frame or the end marker.
+The exclusive owner writes the original frame length. Use matching builds for
+shared participants.
+
+Debug, GNU release and musl release each passed 55 affected groups. Six
+ThreadSanitizer and six strict Memcheck profiles passed. The adoption fault
+fixture exercises 41 allocation and six I/O failure points. The transaction
+case damages a certified group after an otherwise valid deletion, then tests
+an obsolete frame at the end of the tail. Both failures leave the prior view
+and claims intact. The valid tail adopts without a sync or a read from the
+monitored payload. The test holds readers from before the replacement, completes
+a previously funded producer, and verifies the resulting values after reopen.
+Structural replay also crosses checkpoint generations during mapped-run
+replacement and catalog and stream retirement.
+
+All 36 ordinary GNU lifecycle samples verified reopened results. The two
+workloads use 10 MiB containers, two update rounds, 16 one-KiB records with two
+writers or 48 four-KiB records with four writers. The median milliseconds are
+pre-change native / current native / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 48.96 / 49.46 / 18.40 | 611.49 / 582.41 / 415.10 | 91.41 / 102.94 / 25.63 | 1330.65 / 1429.84 / 1257.65 |
+| Maximum worker index flush | 19.20 / 15.97 / 1.51 | 14.69 / 20.52 / 1.22 | 25.29 / 32.66 / 2.30 | 16.11 / 19.13 / 2.22 |
+| Maintenance | 6.92 / 6.92 / 0.20 | 7.58 / 7.54 / 0.25 | 6.26 / 7.77 / 0.28 | 7.11 / 7.29 / 0.43 |
+| Close | 0.33 / 0.29 / 42.34 | 0.38 / 0.42 / 38.86 | 0.81 / 0.86 / 61.38 | 0.69 / 0.72 / 52.64 |
+| Reopen | 3.32 / 3.58 / 0.82 | 3.50 / 5.62 / 1.01 | 4.70 / 4.53 / 1.66 | 4.65 / 4.82 / 1.29 |
+
+Another 12 verified NoSync samples require [canonical durability at index
+readiness](#indexed-readiness-and-canonical-durability-comparison). Small/wider
+native work takes 50.60/80.80 ms versus multifile's 35.28/38.84 ms. Maximum
+worker flush takes 20.00/33.90 ms versus 15.44/16.04 ms. Median first indexed
+query passes are below 0.5 ms on both owners. Sync and publication remain a
+larger part of the measured readiness gap than query evaluation. The comparison
+uses exclusive SDK admission and leaves shared throughput unmeasured.
+
+Logs and the frozen `a2637878` benchmark are in
+`build/pouch-space-tail-adoption/`. Shared owned-stream readiness and
+namespace authority still gate a shared Pouch open. The measured indexed
+workloads remain outside performance acceptance.

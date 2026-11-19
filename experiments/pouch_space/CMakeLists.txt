@@ -111,7 +111,8 @@ if(LOCKDC_BUILD_TESTS)
   foreach(mode threads faults fence processes serialized packed history
       captures capture-faults capture-owned capture-race
       projection projection-faults projection-recovery projection-threads
-      projection-boundaries projection-pressure shared-durable readiness-cohort
+      projection-boundaries projection-pressure projection-tail
+      shared-durable readiness-cohort
       readiness-faults journal-replay journal-replay-faults
       journal-replay-structural journal-replay-process)
     add_test(NAME pouch_space_live-allocator_${mode}

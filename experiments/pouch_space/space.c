@@ -887,6 +887,8 @@ static int exclude_run(ps_space *s, uint64_t offset, uint64_t bytes,
       offset < PS_DATA ? &s->metadata_free_bytes : &s->free_bytes;
   while (*link && (*link)->offset + (*link)->bytes <= offset)
     link = &(*link)->next;
+  if (*link && (*link)->claimed)
+    return err(error, LC_ERR_PROTOCOL, "range overlaps private workspace");
   return exclude_selected(link, available, offset, bytes, error);
 }
 static size_t cell_count(uint64_t bytes) {
@@ -2514,6 +2516,27 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
     rc = checkpoint_body(s, error);
   return allocation_end(s, guard, rc, error);
 }
+/* A shared publisher terminates a complete frame with a clear next header.
+ * An adopter can distinguish obsolete bytes from an abandoned append even
+ * when a shorter frame has overwritten only part of the previous generation. */
+static size_t journal_end_marker(size_t offset) {
+  size_t remaining = PS_JOURNAL - offset;
+  return remaining < 64 ? remaining : 64;
+}
+static int write_journal_frame(ps_space *s, unsigned char *wire, size_t bytes,
+                               lc_error *error) {
+  size_t length = bytes;
+  int rc;
+  if (s->journal_image) {
+    size_t marker = journal_end_marker(s->journal + bytes);
+    memset(wire + bytes, 0, marker);
+    length += marker;
+  }
+  rc = transfer(s, wire, length, JOURNAL_OFFSET + s->journal, 1, error);
+  if (rc == LC_OK && s->journal_image)
+    memcpy(s->journal_image + s->journal, wire, length);
+  return rc;
+}
 static int append_event_locked(ps_space *s, ps_entry *p, int event,
                                lc_error *error) {
   size_t bytes = event_bytes(p, event);
@@ -2523,7 +2546,7 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
       __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container publication sequence exhausted");
-  wire = lc_alloc_with_allocator(NULL, bytes);
+  wire = lc_alloc_with_allocator(NULL, bytes + (s->journal_image ? 64 : 0));
   if (!wire)
     return err(error, LC_ERR_NOMEM, "cannot allocate publication metadata");
   rc = LC_OK;
@@ -2531,9 +2554,7 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
     rc = checkpoint_locked(s, error);
   encode_entry(wire, p, s->sequence + 1, event);
   if (rc == LC_OK)
-    rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
-  if (rc == LC_OK && s->journal_image)
-    memcpy(s->journal_image + s->journal, wire, bytes);
+    rc = write_journal_frame(s, wire, bytes, error);
   lc_free_with_allocator(NULL, wire);
   if (rc == LC_OK) {
     ++s->sequence;
@@ -3139,43 +3160,42 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
   }
   return LC_OK;
 }
-static int replay_frame(ps_space *s, const unsigned char *prefix,
-                        uint64_t certified, lc_error *error) {
-  unsigned char *wire;
+static int apply_peer_frame(ps_space *s, const unsigned char *wire,
+                            size_t bytes, uint64_t certified, int staged,
+                            lc_error *error) {
   ps_entry **entries = NULL, *single = NULL;
   ps_key key;
   replay_change *changes = NULL;
-  size_t i, bytes = get32(prefix + 4), count = 1;
-  int group = get32(prefix) == REVISION_MAGIC, event = PS_PUT, structural, rc;
+  size_t i, j, count = 1;
+  int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, structural, rc;
   if (group)
-    count = get32(prefix + 16);
-  if (bytes < 64 || bytes > PS_JOURNAL - s->journal || !count ||
-      count > certified - s->sequence || get64(prefix + 8) != s->sequence + 1)
+    count = get32(wire + 16);
+  if (certified <= s->sequence || !count || count > certified - s->sequence ||
+      get64(wire + 8) != s->sequence + 1)
     return err(error, LC_ERR_PROTOCOL, "invalid certified journal framing");
-  key.kind = get32(prefix + 16);
-  key.owner = get64(prefix + 24);
-  key.key = get64(prefix + 32);
+  key.kind = get32(wire + 16);
+  key.owner = get64(wire + 24);
+  key.key = get64(wire + 32);
   structural = !group && !immutable_key(key);
   /* Structural consumers use completed heads and catalog bindings. */
   if (structural && s->sequence >= s->peer_durable)
     return err(error, LC_ERR_PENDING,
                "peer structural frame awaits durability");
-  wire = lc_alloc_with_allocator(NULL, bytes);
-  if (!wire)
-    return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
-  memcpy(wire, prefix, 64);
-  rc = bytes == 64 ? LC_OK
-                   : transfer(s, wire + 64, bytes - 64,
-                              JOURNAL_OFFSET + s->journal + 64, 0, error);
-  if (rc == LC_OK && group)
+  if (group)
     rc = decode_revision(s, wire, bytes, NULL, &entries, error);
-  else if (rc == LC_OK) {
+  else {
     rc = decode_entry(s, wire, bytes, &single, &event, error);
     if (rc == LC_OK)
       entries = &single;
   }
-  for (i = 0; rc == LC_OK && i < count; ++i)
-    rc = replay_payload(s, entries[i], &changes, error);
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    if (staged) {
+      /* The complete staged projection can be discarded on error. */
+      for (j = 0; rc == LC_OK && j < entries[i]->count; ++j)
+        rc = payload_claim(s, &entries[i]->extents[j], error);
+    } else
+      rc = replay_payload(s, entries[i], &changes, error);
+  }
   if (rc == LC_OK && !group) {
     if (event == PS_PUT && single->key.kind == PS_OWNED_RUN &&
         single->owned_mapped)
@@ -3192,13 +3212,34 @@ static int replay_frame(ps_space *s, const unsigned char *prefix,
       install_revision(s, entries, count, 1, get32(wire + 20));
     else
       ++s->sequence;
-    memcpy(s->journal_image + s->journal, wire, bytes);
-    s->journal += bytes;
   } else if (entries)
     for (i = 0; i < count; ++i)
       entry_free(entries[i]);
   if (group)
     lc_free_with_allocator(NULL, entries);
+  return rc;
+}
+static int replay_frame(ps_space *s, const unsigned char *prefix,
+                        uint64_t certified, lc_error *error) {
+  size_t bytes = get32(prefix + 4);
+  unsigned char *wire;
+  int rc;
+  if (bytes < 64 || bytes > PS_JOURNAL - s->journal)
+    return err(error, LC_ERR_PROTOCOL, "invalid certified journal length");
+  wire = lc_alloc_with_allocator(NULL, bytes);
+  if (!wire)
+    return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
+  memcpy(wire, prefix, 64);
+  rc = bytes == 64 ? LC_OK
+                   : transfer(s, wire + 64, bytes - 64,
+                              JOURNAL_OFFSET + s->journal + 64, 0, error);
+  if (rc == LC_OK)
+    rc = apply_peer_frame(s, wire, bytes, certified, 0, error);
+  if (rc == LC_OK) {
+    memcpy(s->journal_image + s->journal, wire, bytes);
+    s->journal += bytes;
+    memset(s->journal_image + s->journal, 0, journal_end_marker(s->journal));
+  }
   lc_free_with_allocator(NULL, wire);
   return rc;
 }
@@ -3589,28 +3630,23 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
     if (!memcmp(p, zero, sizeof(zero)))
       return LC_OK;
     if ((magic == (uint32_t)EVENT_MAGIC || magic == REVISION_MAGIC) &&
-        bytes >= 64 && bytes <= PS_JOURNAL - v->journal &&
-        get32(p + 60) ==
-            (uint32_t)crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64))) {
-      /* Checkpoints leave their obsolete journal image in place. Only a
-       * complete checked frame covered by this root can be that baseline. */
-      if (get64(p + 8) <= checkpoint)
+        bytes >= 64 && bytes <= PS_JOURNAL - v->journal) {
+      /* An untouched journal may still start with a checked frame from the
+       * previous generation. Once replay starts, require its end marker. */
+      if (!v->journal && get64(p + 8) <= checkpoint &&
+          get32(p + 60) ==
+              (uint32_t)crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64)))
         return LC_OK;
-      if (magic == (uint32_t)EVENT_MAGIC && bytes == 64 &&
-          v->sequence != UINT64_MAX && get64(p + 8) == v->sequence + 1 &&
-          get64(p + 8) <= certified && !get32(p + 16) &&
-          get32(p + 20) == PS_RESERVE_IDS && !get64(p + 24) && !get64(p + 32) &&
-          !get64(p + 48) && !get32(p + 56) &&
-          v->token_limit <= UINT64_MAX - TOKEN_RANGE &&
-          get64(p + 40) == v->token_limit + TOKEN_RANGE) {
-        v->token_limit += TOKEN_RANGE;
-        ++v->sequence;
-        v->journal += 64;
+      if (get64(p + 8) > checkpoint && get64(p + 8) <= certified) {
+        rc = apply_peer_frame(v, p, bytes, certified, 1, error);
+        if (rc != LC_OK)
+          return rc;
+        v->journal += bytes;
         continue;
       }
     }
     return err(error, LC_ERR_PENDING,
-               "checkpoint has unapplied journal changes");
+               "checkpoint journal boundary is uncertain");
   }
   return LC_OK;
 }
@@ -3690,19 +3726,26 @@ static int projection_workspace(ps_space *s, ps_space *v, lc_error *error) {
   v->metadata_workspace = bound;
   return LC_OK;
 }
-static ps_entry *projected(ps_entry *p) { return p ? p->projection : NULL; }
+static ps_entry *projected(ps_entry *p) {
+  return p && p->projection ? p->projection : p;
+}
 static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
                                size_t count) {
   ps_entry *p, *next, *q, *keep = NULL, *dest;
   ps_catalog_record *record;
-  uint64_t checkpoint_tail;
   size_t i;
   /* Preparation is finished. Nothing below allocates or performs file I/O. */
+  for (i = 0; i < count; ++i) {
+    q = items[i];
+    if (q->projection)
+      q->projection->projection = q;
+  }
   for (p = s->entries; p; p = next) {
     next = p->all_next;
-    q = lookup(v, p->key);
-    if (q && q->projection == p)
+    if (p->projection) {
+      p->projection = NULL;
       continue;
+    }
     if (p->state != 0 && !p->pins && !p->catalog_pins) {
       entry_free(p); /* Drop stale resident metadata, never free its ranges. */
       continue;
@@ -3725,25 +3768,23 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     p->all_next = keep;
     keep = p;
   }
-  s->retired = s->dirty = NULL;
+  s->retired = projected(v->retired);
+  s->dirty = projected(v->dirty);
   for (i = 0; i < count; ++i) {
     q = items[i];
-    checkpoint_tail = q->bytes;
-    dest = q->projection;
+    dest = projected(q);
     if (dest != q) {
       /* Captured readers access immutable fields without the allocator
        * mutex. Even assigning the same bytes/pointers would race them. Only
        * replace canonical links and mutex-protected projection metadata. */
-      dest->publication_sequence = 0;
-      dest->peer_sequence = 0;
-      dest->durable_visibility = 0;
-      dest->state = 1;
-      dest->safe = dest->deleted = 0;
-      dest->previous = NULL;
+      dest->publication_sequence = q->publication_sequence;
+      dest->peer_sequence = q->peer_sequence;
+      dest->durable_visibility = q->durable_visibility;
+      dest->state = q->state;
+      dest->safe = q->safe;
+      dest->deleted = q->deleted;
       dest->checkpoint_ref = q->checkpoint_ref;
       dest->pending_ref = q->pending_ref;
-      dest->retired_next = dest->dirty_next = NULL;
-      dest->retired_link = dest->dirty_link = NULL;
       dest->catalog_refs = q->catalog_refs;
       dest->catalog_release = 0;
       dest->owned_linked = q->owned_linked;
@@ -3752,13 +3793,16 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->stream_runs = q->stream_runs;
         dest->stream_storage = q->stream_storage;
         dest->stream_sealed = q->stream_sealed;
-        if (dest->bytes < q->bytes)
-          dest->bytes = q->bytes;
+        dest->bytes = q->bytes;
       }
     }
     dest->all_next = projected(q->all_next);
     dest->hash_next = projected(q->hash_next);
     dest->stream_next = projected(q->stream_next);
+    dest->previous = projected(q->previous);
+    dest->retired_next = projected(q->retired_next);
+    dest->dirty_next = projected(q->dirty_next);
+    dest->retired_link = dest->dirty_link = NULL;
     dest->owned_first = projected(q->owned_first);
     dest->owned_last = projected(q->owned_last);
     dest->owned_prev = projected(q->owned_prev);
@@ -3767,8 +3811,6 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       record->target = projected(q->catalog->target);
       record->next = projected(q->catalog->next);
     }
-    if (dest->key.kind == PS_STREAM && dest->bytes > checkpoint_tail)
-      dirty_entry(s, dest, NULL);
   }
   s->entries = projected(v->entries);
   for (i = 0; i < BUCKETS; ++i) {
@@ -3781,6 +3823,13 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     p->all_link = p == s->entries ? &s->entries : p->all_link;
     if (p->all_next)
       p->all_next->all_link = &p->all_next;
+  }
+  {
+    ps_entry **link;
+    for (link = &s->retired; *link; link = &(*link)->retired_next)
+      (*link)->retired_link = link;
+    for (link = &s->dirty; *link; link = &(*link)->dirty_next)
+      (*link)->dirty_link = link;
   }
   while (keep) {
     p = keep;
@@ -3795,7 +3844,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     }
   }
   for (i = 0; i < count; ++i)
-    if (items[i]->projection != items[i])
+    if (items[i]->projection)
       entry_free(items[i]);
   v->entries = NULL;
 }
@@ -3851,8 +3900,9 @@ static void projection_install(ps_space *s, ps_space *v) {
   s->packed_pages = v->packed_pages;
   s->packed_bytes = v->packed_bytes;
   s->pinned_free_bytes = v->pinned_free_bytes;
-  if (__atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) < s->sequence)
-    __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
+  s->peer_durable = v->peer_durable;
+  if (s->peer_durable >= s->own_ready_wire)
+    mark_durable(s, s->own_ready_sequence);
 }
 static int canonical_refresh(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0},
@@ -3911,6 +3961,7 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   v->generation = get64(root + 8);
   v->capacity = get64(root + 16);
   v->sequence = get64(root + 24);
+  v->peer_durable = certificate.durable;
   v->directory.offset = get64(root + 32);
   v->directory.generation = get64(root + 40);
   v->token_limit = get64(root + 48);
@@ -3941,34 +3992,24 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
     rc = validate_owned_directory(v, error);
   if (rc == LC_OK)
     rc = ps_catalog_validate_directory(v, error);
-  if (rc == LC_OK)
-    rc = projection_journal(v, get64(root + 24),
-                            s->readiness ? certificate.ready : UINT64_MAX,
-                            error);
-  if (rc == LC_OK && v->sequence < certificate.ready)
-    rc = err(error, LC_ERR_PENDING,
-             "checkpoint is behind the certified journal prefix");
   if (rc != LC_OK)
     goto done;
-  if (v->live_entries > (uint64_t)((size_t)-1 / sizeof(*items))) {
-    rc = err(error, LC_ERR_NOMEM, "checkpoint projection is too large");
-    goto done;
-  }
-  if (v->live_entries)
-    items =
-        lc_calloc_with_allocator(NULL, (size_t)v->live_entries, sizeof(*items));
-  if (v->live_entries && !items) {
-    rc = err(error, LC_ERR_NOMEM, "cannot bind checkpoint projection entries");
-    goto done;
-  }
+  /* The checkpoint prefix covers the resident journal. Consequently only
+   * checkpoint entries, including those superseded by the following tail,
+   * can match an existing incarnation. Bind them before decoding that tail. */
   for (p = v->entries; p; p = p->all_next) {
-    items[count++] = p;
     old = lookup(s, p->key);
-    p->projection = old && old->token == p->token ? old : p;
-    if (p->projection != p && !projection_same(old, p)) {
-      rc = err(error, LC_ERR_PROTOCOL,
-               "checkpoint changes an existing incarnation");
-      goto done;
+    if (old && old->token == p->token) {
+      if (!projection_same(old, p)) {
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "checkpoint changes an existing incarnation");
+        goto done;
+      }
+      p->projection = old;
+      if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
+        p->bytes = old->bytes;
+        dirty_entry(v, p, NULL);
+      }
     }
     for (i = 0; i < p->count; ++i) {
       rc = payload_claim(v, &p->extents[i], error);
@@ -3992,6 +4033,33 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   rc = projection_pool(v, s->metadata_free, 1, error);
   if (rc == LC_OK)
     rc = projection_pool(v, s->free, 0, error);
+  if (rc == LC_OK)
+    rc = projection_journal(v, get64(root + 24), certificate.ready, error);
+  if (rc == LC_OK && v->sequence < certificate.ready)
+    rc = err(error, LC_ERR_PENDING,
+             "checkpoint is behind the certified journal prefix");
+  if (rc != LC_OK)
+    goto done;
+  /* Include every superseded frame still needed by readers or cold replay.
+   * The vector lets installation rewire links without walking a live list
+   * whose nodes are moving in place. */
+  for (p = v->entries; p; p = p->all_next) {
+    if (count == (size_t)-1 / sizeof(*items)) {
+      rc = err(error, LC_ERR_NOMEM, "checkpoint projection is too large");
+      goto done;
+    }
+    ++count;
+  }
+  if (count) {
+    items = lc_calloc_with_allocator(NULL, count, sizeof(*items));
+    if (!items) {
+      rc =
+          err(error, LC_ERR_NOMEM, "cannot bind checkpoint projection entries");
+      goto done;
+    }
+    for (i = 0, p = v->entries; p; p = p->all_next)
+      items[i++] = p;
+  }
   v->range_pins = 1;
   if (rc == LC_OK)
     rc = pins_recover(v, error);
@@ -4011,10 +4079,11 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
     rc = sync_file(s, error);
-    if (rc == LC_OK)
-      rc = ps_readiness_stabilize(
-          s, certificate.ready > v->sequence ? certificate.ready : v->sequence,
-          v->generation, error);
+    if (rc == LC_OK) {
+      rc = ps_readiness_stabilize(s, v->sequence, v->generation, error);
+      if (rc == LC_OK)
+        v->peer_durable = v->sequence;
+    }
   }
   if (rc == LC_OK) {
     projection_entries(s, v, items, count);
@@ -4504,7 +4573,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
       bytes += descriptor;
   }
   if (rc == LC_OK) {
-    wire = lc_alloc_with_allocator(NULL, bytes);
+    wire = lc_alloc_with_allocator(NULL, bytes + (s->readiness ? 64 : 0));
     if (!wire)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate revision publication");
   }
@@ -4561,9 +4630,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     }
     put32(wire + 60,
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
-    rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
-    if (rc == LC_OK && s->journal_image)
-      memcpy(s->journal_image + s->journal, wire, bytes);
+    rc = write_journal_frame(s, wire, bytes, error);
   }
   if (rc == LC_OK) {
     s->sequence += count;
