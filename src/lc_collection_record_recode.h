@@ -17,6 +17,22 @@ typedef struct lc_collection_recode_links {
   const lc_collection_recode_stream *stream;
   lc_u64 previous_segment, previous_offset;
 } lc_collection_recode_links;
+typedef struct lc_collection_recode_tree {
+  lc_collection_chunk_ref root, first;
+  lc_u64 stored, units;
+} lc_collection_recode_tree;
+typedef int (*lc_collection_recode_resolve_fn)(void *,
+                                               const lc_collection_chunk_ref *,
+                                               unsigned int,
+                                               lc_collection_recode_tree *,
+                                               lc_error *);
+/* Rewrite one bounded index page from already converted child facts. Validate
+ * its framing/CRC and child aggregates before appending. No publication or
+ * source ownership belongs here. Failure preserves result and private tail. */
+int lc_collection_index_recode(lc_pouch_record_io, lc_u64, lc_u64, unsigned int,
+                               lc_collection_recode_resolve_fn, void *,
+                               lc_pouch_record_io, lc_u64,
+                               lc_collection_recode_tree *, lc_error *);
 
 /* Offline canonical record conversion through retained byte capabilities.
  * Keep the encryption identity; the target compression policy may differ.

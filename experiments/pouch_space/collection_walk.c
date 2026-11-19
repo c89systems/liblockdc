@@ -125,24 +125,6 @@ static int mark(void *context, const lc_collection_chunk_ref *ref,
   }
   return add(&b->refs, &item, e);
 }
-static int segment_from_leaf(const char *leaf, lc_u64 *id, lc_error *e) {
-  size_t prefix;
-  lc_u64 n;
-  char canonical[64];
-  prefix = !strncmp(leaf, "snapshot-", 9U) ? 9U : 4U;
-  if (strlen(leaf) != prefix + 24U ||
-      (prefix == 4U && strncmp(leaf, "seg-", 4U)) ||
-      !lc_parse_u64_base10_range_checked(leaf + prefix, 20U, &n) || !n ||
-      n >= LC_COLLECTION_SNAPSHOT_BIT)
-    return fail(e, LC_ERR_PROTOCOL,
-                "collection metadata body has invalid leaf");
-  *id = n | (prefix == 9U ? LC_COLLECTION_SNAPSHOT_BIT : 0U);
-  if (lc_collection_record_leaf(*id, canonical, e) != LC_OK ||
-      strcmp(canonical, leaf))
-    return fail(e, LC_ERR_PROTOCOL,
-                "collection metadata body leaf is not canonical");
-  return LC_OK;
-}
 static int alias(walk_build *b, const lc_pouch_collection_record *r,
                  lc_u64 segment, lc_error *e) {
   lc_pouch_collection_record body;
@@ -154,7 +136,7 @@ static int alias(walk_build *b, const lc_pouch_collection_record *r,
   lc_u64 id = 0U;
   void *pin = NULL;
   char previous_leaf[64];
-  int rc = segment_from_leaf(r->payload_container, &id, e);
+  int rc = lc_collection_record_segment(r->payload_container, &id, e);
   if (rc == LC_OK && (coordinate(id, r->payload_record_offset, segment,
                                  r->record_offset) >= 0 ||
                       (r->previous_segment &&

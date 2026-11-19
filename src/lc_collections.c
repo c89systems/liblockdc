@@ -607,6 +607,28 @@ int lc_collection_record_leaf(lc_u64 segment, char leaf[64], lc_error *error) {
                                      "collection segment leaf is invalid");
 }
 
+int lc_collection_record_segment(const char *leaf, lc_u64 *out, lc_error *e) {
+  lc_u64 id;
+  size_t prefix;
+  char canonical[64];
+  if (!leaf || !out)
+    return lc_collection_failure(e, LC_ERR_INVALID, NULL,
+                                 "collection leaf requires output");
+  prefix = !strncmp(leaf, "snapshot-", 9U) ? 9U : 4U;
+  if (strlen(leaf) != prefix + 24U ||
+      (prefix == 4U && strncmp(leaf, "seg-", 4U)) ||
+      !lc_parse_u64_base10_range_checked(leaf + prefix, 20U, &id) || !id ||
+      id >= LC_COLLECTION_SNAPSHOT_BIT)
+    return lc_collection_failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                                 "collection leaf is invalid");
+  id |= prefix == 9U ? LC_COLLECTION_SNAPSHOT_BIT : 0U;
+  if (lc_collection_record_leaf(id, canonical, e) != LC_OK ||
+      strcmp(canonical, leaf))
+    return lc_collection_failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                                 "collection leaf is not canonical");
+  *out = id;
+  return LC_OK;
+}
 int lc_collection_record_path(lc_collection_handle *collection, lc_u64 segment,
                               char **out, char leaf[64], lc_error *error) {
   int rc;

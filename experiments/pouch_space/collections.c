@@ -112,9 +112,10 @@ static void segment_name(lc_u64 id, unsigned char name[8]) {
   for (i = 0U; i < 8U; ++i)
     name[i] = (unsigned char)(id >> (8U * i));
 }
-static int recover(lc_pouch_record_io input, uint64_t checkpoint,
-                   uint64_t capacity, uint64_t *accepted, void *context,
-                   lc_error *e) {
+int ps_collection_canonical_recover(lc_pouch_record_io input,
+                                    uint64_t checkpoint, uint64_t capacity,
+                                    uint64_t *accepted, void *context,
+                                    lc_error *e) {
   const char *leaf = context;
   unsigned char prefix[LC_POUCH_RECORD_HEADER_BYTES], zeros[32] = {0};
   struct iovec part;
@@ -176,10 +177,9 @@ static int protect_segment(ps_collection_owner *owner, collection_segment *s,
                         sizeof(name), &view, e);
   if (rc == LC_OK && view) {
     rc = ps_catalog_view_info(view, &current, e);
-    if (rc == LC_OK &&
-        (current.stream.owner != owner->numeric ||
-         current.stream.key != s->id || current.stream.kind != PS_STREAM ||
-         !same_ref(&current.target, &status.ref)))
+    if (rc == LC_OK && (!current.stream.owner || !current.stream.key ||
+                        current.stream.kind != PS_STREAM ||
+                        !same_ref(&current.target, &status.ref)))
       rc = failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
                    "collection segment binding has a different incarnation");
     if (rc == LC_OK)
@@ -223,9 +223,8 @@ static int get_segment(ps_collection_owner *owner, lc_u64 id, int create,
                           sizeof(name), &prior, e);
       if (rc == LC_OK && prior) {
         rc = ps_catalog_view_info(prior, &identity, e);
-        if (rc == LC_OK &&
-            (identity.stream.owner != owner->numeric ||
-             identity.stream.key != id || identity.stream.kind != PS_STREAM))
+        if (rc == LC_OK && (!identity.stream.owner || !identity.stream.key ||
+                            identity.stream.kind != PS_STREAM))
           rc = failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
                        "collection segment catalog points outside its owner");
       } else if (rc == LC_OK && !create)
@@ -235,14 +234,16 @@ static int get_segment(ps_collection_owner *owner, lc_u64 id, int create,
         /* Match the catalog incarnation before recovery may clear private
          * bytes. An unbound successor can survive allocation failure before
          * its catalog publication; admit only its empty unpublished head. */
-        rc = ps_collection_segment_open(space(owner), key_for(owner, id), 0,
-                                        prior ? &identity.target : NULL,
-                                        prior ? recover : NULL, leaf,
-                                        &s->segment, e);
+        rc = ps_collection_segment_open(
+            space(owner), prior ? identity.stream : key_for(owner, id), 0,
+            prior ? &identity.target : NULL,
+            prior ? ps_collection_canonical_recover : NULL, leaf, &s->segment,
+            e);
         if (!prior && create && rc == LC_ERR_INVALID) {
           clear(e);
           rc = ps_collection_segment_open(space(owner), key_for(owner, id), 1,
-                                          NULL, recover, leaf, &s->segment, e);
+                                          NULL, ps_collection_canonical_recover,
+                                          leaf, &s->segment, e);
         }
         if (rc == LC_OK && create) {
           rc = ps_collection_segment_status(s->segment, &status, NULL, e);
@@ -332,6 +333,33 @@ void ps_collection_cache_destroy(ps_collection_owner *owner) {
     owner = next;
   }
 }
+int ps_collection_conversion_release_cache(ps_root *root, uint64_t numeric,
+                                           lc_error *e) {
+  ps_namespace *ns;
+  ps_collection_owner *owner = NULL;
+  collection_segment *s, *next;
+  int rc = LC_OK;
+  pthread_mutex_lock(&root->mutex);
+  for (ns = root->namespaces; ns && !owner; ns = ns->next)
+    for (owner = ns->collections; owner && owner->numeric != numeric;
+         owner = owner->next) {
+    }
+  if (owner && owner->references)
+    rc = failure(e, LC_ERR_PENDING, "collection_conversion_busy",
+                 "release collection receivers before conversion");
+  s = rc == LC_OK && owner ? owner->segments : NULL;
+  if (rc == LC_OK && owner)
+    owner->segments = NULL;
+  pthread_mutex_unlock(&root->mutex);
+  while (s) {
+    next = s->next;
+    ps_collection_segment_close(s->segment);
+    ps_owned_close(s->retiring);
+    lc_free_with_allocator(&owner->allocator, s);
+    s = next;
+  }
+  return rc;
+}
 static void pin_locked(ps_collection_owner *owner) {
   ++owner->references;
   ++owner->ns->pins;
@@ -405,6 +433,7 @@ static int order_refresh(void *context, lc_collection_order *order,
   ps_collection_owner *owner = binding->owner;
   lc_collection_handle *c = binding->receiver;
   ps_owned_status active;
+  ps_collection_segment *segment = NULL;
   int rc = order->fd < 0
                ? lc_collection_order_adopt(scratch(context, e), 1, order, e)
                : lc_collection_order_refresh(order, e);
@@ -414,8 +443,10 @@ static int order_refresh(void *context, lc_collection_order *order,
    * captured topology's metadata pin; never repair a producer's canonical tail.
    */
   if (rc == LC_OK)
-    rc = ps_owned_inspect(space(owner), key_for(owner, c->head.active), NULL,
-                          &active, e);
+    rc = get_segment(owner, c->head.active, 0, &segment, e);
+  if (rc == LC_OK)
+    rc = ps_collection_segment_status(segment, &active, NULL, e);
+  ps_collection_segment_close(segment);
   /* A peer can also complete a page without changing the snapshot. Its
    * canonical ready tail must be visible before validating a late index
    * publication against this receiver's disposable order. Private allocation

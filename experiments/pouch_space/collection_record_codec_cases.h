@@ -184,10 +184,11 @@ static void record_inline(record_fixture *f, const char *key, lc_u64 position,
      e);
   lc_pouch_collection_writer_close(writer);
 }
-static record_fixture *record_fixture_open(const char *directory,
-                                           const char *key, int codec, int sync,
-                                           size_t units, lc_u64 bytes,
-                                           lc_error *e) {
+static record_fixture *record_fixture_open_io(const char *directory,
+                                              const char *key, int codec,
+                                              int sync, size_t units,
+                                              lc_u64 bytes, const ps_io *io,
+                                              int sealed, lc_error *e) {
   record_fixture *f = calloc(1, sizeof(*f));
   REQUIRE(f);
   f->next_id = 1000;
@@ -198,6 +199,7 @@ static record_fixture *record_fixture_open(const char *directory,
   options.crypto.key_string = codec & 1 ? key : NULL;
   options.crypto.compression_enabled = !!(codec & 2);
   options.storage.durable_sync = sync;
+  options.storage.io = io;
   options.storage.initial_capacity = options.storage.maximum_capacity =
       10 * PS_MIB;
   f->options = options;
@@ -294,7 +296,9 @@ static record_fixture *record_fixture_open(const char *directory,
   ok(lc_pouch_collection_record_metadata(f->pouch, f->input.io, leaf, &f->small,
                                          1, 9, 45678, &f->small_meta, e),
      e);
-  ok(ps_collection_segment_seal(f->source, e), e);
+  ok(sealed ? ps_collection_segment_seal(f->source, e)
+            : ps_collection_segment_publish(f->source, PS_COMMIT_DEFAULT, e),
+     e);
   lc_pouch_collection_record *records[] = {
       &f->stream,     &f->meta[0],   &f->meta[1], &f->small,
       &f->small_meta, &f->edit_body, &f->receipt, &f->deleted};
@@ -312,6 +316,13 @@ static record_fixture *record_fixture_open(const char *directory,
                                record_source_io(f), &f->stream, e),
      e);
   return f;
+}
+static record_fixture *record_fixture_open(const char *directory,
+                                           const char *key, int codec, int sync,
+                                           size_t units, lc_u64 bytes,
+                                           lc_error *e) {
+  return record_fixture_open_io(directory, key, codec, sync, units, bytes, NULL,
+                                1, e);
 }
 static void record_fixture_close(record_fixture *f, lc_error *e) {
   lc_collection_chunks_reader_close(&f->reader);

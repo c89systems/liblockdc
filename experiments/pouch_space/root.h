@@ -41,6 +41,8 @@ int ps_root_close(ps_root *, lc_error *);
  * retain their root/namespace pin while using either capability. */
 ps_space *ps_root_space(ps_root *);
 lc_pouch_crypto *ps_root_crypto(ps_root *);
+/* Compression may differ; offline conversion retains encryption identity. */
+int ps_root_crypto_matches(ps_root *, lc_pouch_crypto *, lc_error *);
 
 /* Nonempty C-string names are exact bytes, without pathname interpretation.
  * One cached owner per name. A same-name initialization waits for that owner;

@@ -2,8 +2,10 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "collection_reclaim.h"
 #include "collection_segment.h"
+#include "collection_transform.h"
 #include "collection_walk.h"
 #include "lc_collection_internal.h"
+#include "lc_collection_query.h"
 #include "owned.h"
 #include "pouch.h"
 #include "pouch_internal.h"
@@ -86,6 +88,9 @@ typedef struct fixture {
   int worker_mode;
   int opening_create;
 } fixture;
+static int cq_build(fixture *, lc_u64);
+static int cq_load(fixture *, lc_collection_index *, int *);
+static size_t cq_artifacts(fixture *, uint64_t);
 static void background_drop_pending(fixture *);
 static void background_peer_prepare(fixture *, lc_collection_lock *);
 static void background_verify_empty(fixture *);
@@ -875,6 +880,127 @@ static void conversion_plan(const char *directory, int codec, int sync) {
   }
   printf("SDK conversion planning codec=%d sync=%d passed\n", codec, sync);
 }
+static void conversion_roundtrip(const char *directory, int codec, int sync) {
+  int saved_query_mode = query_mode;
+  query_mode = 1;
+  for (int compact = 0; compact < 2; ++compact) {
+    fixture f;
+    setup(&f, directory, codec, sync, 1);
+    (void)append(f.collection, "conversion-seed", 8193, &f.error);
+    lc_collection_head_res head;
+    ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
+    char original_head[65], stable_head[65], id[LC_XID_STRING_SIZE];
+    memcpy(original_head, head.etag, sizeof(original_head));
+    lc_collection_append_req replacement;
+    lc_collection_append_req_init(&replacement);
+    replacement.append_id = "conversion-replacement";
+    lc_collection_edit_range range = {0, 1};
+    lc_collection_edit_req edit;
+    lc_collection_edit_req_init(&edit);
+    edit.operation_id = "conversion-edit";
+    edit.expected_head = original_head;
+    edit.ranges = &range;
+    edit.range_count = 1;
+    edit.replacement = &replacement;
+    producer p;
+    producer_init(&p, 8193);
+    lc_collection_edit_res edited;
+    ok(lc_collection_edit(f.collection, &edit, &p.source, &edited, &f.error),
+       &f.error);
+    REQUIRE(edited.replacement.position == 2);
+    (void)append(f.collection, "conversion-stream", 262161, &f.error);
+    if (compact)
+      ok(lc_collection_compact(f.collection, 1, 0, NULL, &f.error), &f.error);
+    ok(cq_build(&f, 0), &f.error);
+    ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
+    memcpy(stable_head, head.etag, sizeof(stable_head));
+    lc_collection_handle *c = f.collection->impl;
+    memcpy(id, c->id, sizeof(id));
+    ps_root *root = client_root(&f);
+    ps_namespace *ns = NULL;
+    ps_catalog_view *view = NULL;
+    ps_catalog_info info;
+    ok(ps_root_namespace_acquire(root, "journal", 0, &ns, &f.error), &f.error);
+    ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
+                      c->name, strlen(c->name), &view, &f.error),
+       &f.error);
+    REQUIRE(view);
+    ok(ps_catalog_view_info(view, &info, &f.error), &f.error);
+    ps_catalog_view_close(view);
+    ps_namespace_release(ns);
+    REQUIRE(cq_artifacts(&f, info.stream.owner) > 0);
+    lc_pouch_crypto_open_options crypto = {0};
+    crypto.key_string = codec & 1 ? key : NULL;
+    crypto.compression_enabled = !(codec & 2);
+    lc_pouch_crypto *target = NULL;
+    ok(lc_pouch_crypto_open(NULL, &crypto, &target, NULL, &f.error), &f.error);
+    ps_collection_conversion *work = NULL;
+    ok(ps_collection_conversion_open(root->space, info.stream.owner, target, 1,
+                                     &work, &f.error),
+       &f.error);
+    ps_collection_transform *transform = NULL;
+    lc_pouch *pouch = ((lc_client_handle *)f.client)->pouch;
+    REQUIRE(ps_collection_transform_open(root, pouch, target, work, id, 65536,
+                                         &transform,
+                                         &f.error) == LC_ERR_PENDING &&
+            !transform);
+    clear(&f.error);
+    lc_collection_close(f.collection);
+    lc_collection_close(f.peer);
+    f.collection = f.peer = NULL;
+    ok(ps_collection_transform_open(root, pouch, target, work, id, 65536,
+                                    &transform, &f.error),
+       &f.error);
+    REQUIRE(ps_collection_conversion_discard(work, &f.error) == LC_ERR_INVALID);
+    clear(&f.error);
+    int done = 0;
+    ps_collection_transform_result result;
+    while (!done)
+      ok(ps_collection_transform_step(transform, 32, &done, &result, &f.error),
+         &f.error);
+    ps_collection_transform_close(transform);
+    ps_collection_conversion_close(work);
+    lc_pouch_crypto_close(target);
+    REQUIRE(cq_artifacts(&f, info.stream.owner) == 0);
+    open_collection(&f, 0, &f.collection);
+    open_collection(&f, 0, &f.peer);
+    ok(lc_collection_head(f.collection, &head, &f.error), &f.error);
+    REQUIRE(!strcmp(stable_head, head.etag) && head.upper_position == 3);
+    lc_collection_index index = {0};
+    int found;
+    ok(cq_load(&f, &index, &found), &f.error);
+    REQUIRE(!found);
+    ok(cq_build(&f, 0), &f.error);
+    ok(cq_load(&f, &index, &found), &f.error);
+    REQUIRE(found && index.rows == 3);
+    lc_collection_index_cleanup(&index);
+    read_entry(f.collection, 2, 8193, &f.error);
+    read_entry(f.collection, 3, 262161, &f.error);
+    producer_init(&p, 8193);
+    ok(lc_collection_edit(f.peer, &edit, &p.source, &edited, &f.error),
+       &f.error);
+    REQUIRE(edited.duplicate && edited.published && edited.deleted_count == 1 &&
+            edited.replacement.position == 2);
+    lc_collection_append_res appended =
+        append(f.collection, "after-conversion", 4097, &f.error);
+    REQUIRE(appended.position == 4);
+    read_entry(f.peer, 4, 4097, &f.error);
+    reopen(&f);
+    read_entry(f.collection, 2, 8193, &f.error);
+    read_entry(f.collection, 3, 262161, &f.error);
+    read_entry(f.collection, 4, 4097, &f.error);
+    producer_init(&p, 8193);
+    ok(lc_collection_edit(f.peer, &edit, &p.source, &edited, &f.error),
+       &f.error);
+    REQUIRE(edited.duplicate && edited.published && edited.deleted_count == 1 &&
+            edited.replacement.position == 2);
+    close_store(&f);
+    lc_error_cleanup(&f.error);
+  }
+  query_mode = saved_query_mode;
+  printf("SDK complete collection conversion codec=%d sync=%d passed\n", codec,
+         sync);
+}
 static void reclamation(const char *directory) {
   fixture f;
   ps_root *root;
@@ -1656,6 +1782,7 @@ int main(int argc, char **argv) {
           process_recovery(directory, codec, sync);
         edit_recovery(directory, codec, sync);
         conversion_plan(directory, codec, sync);
+        conversion_roundtrip(directory, codec, sync);
       }
     for (int sync = 0; sync < 2; ++sync) {
       concurrency(directory, sync);

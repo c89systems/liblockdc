@@ -227,21 +227,23 @@ static void workspace_records(const char *directory, const char *key) {
       record_stream_check(f, &f->stream, 1, &e);
       /* Several pages, gaps, snapshots-before-normal traversal and an empty
        * cursor-only publication exercise lookup without a whole-history map. */
-      ps_collection_relocation rows[PS_COLLECTION_CONVERSION_BATCH];
+      ps_collection_relocation rows[PS_COLLECTION_CONVERSION_MAP_ROWS];
       for (size_t page = 0; page < 5; ++page) {
-        for (size_t i = 0; i < PS_COLLECTION_CONVERSION_BATCH; ++i)
+        for (size_t i = 0; i < PS_COLLECTION_CONVERSION_MAP_ROWS; ++i)
           rows[i] = (ps_collection_relocation){2 + page, 2 * i, 1000,
                                                converted.record_offset};
         ok(ps_collection_conversion_checkpoint(
-               w, 2 + page, 128, rows, PS_COLLECTION_CONVERSION_BATCH, &e),
+               w, 2 + page, 2 * PS_COLLECTION_CONVERSION_MAP_ROWS, rows,
+               PS_COLLECTION_CONVERSION_MAP_ROWS, &e),
            &e);
       }
       for (lc_u64 segment = 2; segment < 7; ++segment)
-        for (lc_u64 at = 0; at < 129; ++at) {
+        for (lc_u64 at = 0; at <= 2 * PS_COLLECTION_CONVERSION_MAP_ROWS; ++at) {
           ok(ps_collection_conversion_lookup(w, segment, at, &resolved,
                                              &present, &e),
              &e);
-          REQUIRE(present == (at < 128 && !(at & 1)));
+          REQUIRE(present ==
+                  (at < 2 * PS_COLLECTION_CONVERSION_MAP_ROWS && !(at & 1)));
           if (present)
             REQUIRE(resolved.source_segment == segment &&
                     resolved.source_offset == at &&
@@ -320,8 +322,8 @@ static void workspace_records(const char *directory, const char *key) {
         REQUIRE(ps_collection_head_load(s, 73, NULL, &captured_head, NULL) ==
                 LC_ERR_INVALID);
       }
-      printf("native workspace codec=%d sync=%d records=321 pages=6\n", codec,
-             sync);
+      printf("native workspace codec=%d sync=%d records=%u pages=6\n", codec,
+             sync, 1U + 5U * PS_COLLECTION_CONVERSION_MAP_ROWS);
       record_fixture_close(f, &e);
       lc_error_cleanup(&e);
     }

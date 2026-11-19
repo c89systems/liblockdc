@@ -250,6 +250,7 @@ int lc_collection_record_body(lc_collection_handle *collection,
 int lc_collection_record_path(lc_collection_handle *collection, lc_u64 segment,
                               char **out, char leaf[64], lc_error *error);
 int lc_collection_record_leaf(lc_u64 segment, char leaf[64], lc_error *error);
+int lc_collection_record_segment(const char *, lc_u64 *, lc_error *);
 int lc_collection_hash(const void *bytes, size_t length, unsigned char out[32],
                        lc_error *error);
 int lc_collection_head_token(lc_collection_handle *, char[65], lc_error *);

@@ -5106,3 +5106,85 @@ publication, derived-index invalidation, shared-root coordination/recovery and
 matched end-to-end performance qualification remain required. The multifile
 backend remains the default/reference; production cutover still requires an
 explicit deployment decision.
+
+### Complete native collection conversion and final selection
+
+`ps_collection_transform_open/step/close` now drives the complete per-collection
+conversion through native byte capabilities. It consumes the durable dependency
+plan, re-encodes units, rewrites index nodes and canonical publications, translates
+metadata-body/history links and retains adjacent EDIT_BODY/EDIT receipt pairs.
+The controller borrows its root, logical codec context, target and workspace.
+Existing receivers must drain before preparation; the workspace blocks new
+receiver admission. Sibling collections and other physical owners remain usable.
+Encryption mode/key identity must match the root and the workspace intent.
+
+The index-node encoder is shared with multifile conversion. It checks bounded
+source framing, CRC, child coordinates and subtree aggregates before appending.
+Relocation pages now carry converted stored-byte/unit counts and first-unit
+coordinates, allowing parents and STREAM publications to rebuild without loading
+whole trees. Each immutable page holds at most 48 mappings in one control page;
+the durable progress record also selects normal/snapshot output high-water IDs.
+There is no second native index format or payload staging path.
+
+A fixed 16-entry retained-handle cache serves source and converted segments;
+pinned handles cannot be evicted. Body conversion uses bounded codec buffers.
+Output packing has a persisted soft target, defaulting to 64 KiB. A unit or
+indivisible edit pair can exceed that target. The controller seals and checkpoints
+output at unit handoffs, bounded metadata batches and source ends, then discards
+completed source grants. Caller step limits count plan tokens rather than body
+bytes. Resume honors the stored packing target and retries pending disposal.
+
+Before sealing any previously appendable source, preparation durably requires
+completion. Source disposal has the same requirement. Cancellation cannot expose
+a sealed old append head or remove the only replacement data. A failed controller
+call is terminal for that handle: close the controller/workspace and reopen to
+resume; uncertain I/O requires root reopen as well.
+
+Final selection first persists the exact replacement head in a ready control.
+It installs canonical aliases for all converted segments, creates a fresh empty
+unsealed append head, removes derived query artifacts and publishes the canonical
+collection head after its dependencies. Logical segment IDs are independent of
+physical workspace-owned stream keys; ordinary reads, maintenance and cascading
+reclamation now follow the catalog's actual stream identity and incarnation.
+The collection's logical head fields and cached head-token epoch are retained.
+
+After head selection, obsolete canonical bindings and workspace aliases are
+removed. All plan/progress/ready controls remain until the workspace anchor is
+detached last. Interrupted cleanup can therefore finish without old source
+prefixes. Byte handles close before admission reopens, and ordinary orphan
+reclamation disposes of unreferenced workspace resources. A completed step is
+idempotent and performs no additional synchronization.
+
+Native fixtures cover 66-unit trees and generated streams just over 6 MiB,
+including all canonical publication roles, every codec combination and both
+durability policies. Each larger case completes in a fixed 10 MiB container,
+reopens after two controller calls and verifies every retained body and link
+after final selection. Public SDK fixtures cover normal history and compacted
+snapshots, unchanged positions/head tokens, actual edit receipts and duplicate
+retries before and after root reopen, subsequent appends, and disposal/rebuilding
+of populated query artifacts. A deterministic body-I/O pause proves a sibling
+owner can publish and seal 128 KiB before conversion resumes, in all eight
+codec/durability profiles.
+
+The controller recovery matrix passes 5,771 allocation/I/O/partial/torn-write
+failure points. Its original 600-second CTest run completed the unencrypted
+profiles before timing out; only the unfinished encrypted profiles were resumed.
+The registered controller fault deadline is now 1,800 seconds. Preparation over
+an unsealed append source passes another 1,464 failure points, including the
+completion marker and sealing boundary. Existing workspace and plan/disposal
+matrices also pass their 454 and 411 points respectively. Twenty-seven affected
+Debug checks and eighteen checks each on GNU and musl release pass, including
+shared multifile conversion coverage and the Debug source/stack gates. The
+controller concurrency and SDK scenarios pass TSan with instrumented OpenSSL and
+strict Memcheck: no suppressions, remaining allocations, errors or extra handles.
+
+This completes the per-collection controller, not root-wide codec conversion or
+production qualification. It does not select root compression policy; an
+explicit native root-policy change still rejects pending the root coordinator.
+Whole-operation capacity admission/progress, root conversion intent and final
+policy selection, shared-root coordination/recovery and matched performance
+qualification remain in the active goal. Capacity failures retain resumable
+work and require explicit growth when necessary; conversion never grows the
+container implicitly. Existing-root format migration remains deferred. The
+multifile backend remains the default/reference, and production cutover still
+requires an explicit deployment decision.

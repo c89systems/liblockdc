@@ -186,7 +186,7 @@ static void walk_cases(const char *directory, const char *key) {
           ok(ps_catalog_view_info(view, &info, &e), &e);
           ps_catalog_view_close(view);
           ps_key progress_key = {info.stream.owner, 1, PS_CONTROL};
-          unsigned char wire[96] = {0};
+          unsigned char wire[112] = {0};
           memcpy(wire, "LCPSCCPR", 8);
           lc_u64 fields[] = {info.stream.owner,
                              LC_COLLECTION_SNAPSHOT_BIT - 1,

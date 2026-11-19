@@ -23,48 +23,18 @@ typedef struct cr_output {
   lc_pouch_recode *work;
   lc_pouch_recode_file *file;
   lc_collection_unit_recode *codec;
-  unsigned char *buffer;
   lc_u64 first, current, parts, bytes;
   unsigned int mode;
   int source_fd, fd, hold;
   char leaf[64];
 } cr_output;
 
-static lc_u64 cr_get(const unsigned char *p) {
-  lc_u64 n = 0;
-  size_t i;
-  for (i = 0; i < 8U; ++i)
-    n |= (lc_u64)p[i] << (8U * i);
-  return n;
-}
-static void cr_put(unsigned char *p, lc_u64 n) {
-  size_t i;
-  for (i = 0; i < 8U; ++i)
-    p[i] = (unsigned char)(n >> (8U * i));
-}
 static int cr_error(lc_error *e, const char *message) {
   return lc_collection_failure(e, LC_ERR_TRANSPORT, NULL, message);
 }
 static int cr_corrupt(lc_error *e, const char *message) {
   return lc_collection_failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
                                message);
-}
-static int cr_read(int fd, void *bytes, size_t count, lc_u64 offset,
-                   lc_error *e) {
-  unsigned char *p = bytes;
-  ssize_t n;
-  while (count) {
-    n = pread(fd, p, count, (off_t)offset);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      return n < 0 ? cr_error(e, "failed to read collection conversion source")
-                   : cr_corrupt(e, "collection conversion source is truncated");
-    p += (size_t)n;
-    offset += (size_t)n;
-    count -= (size_t)n;
-  }
-  return LC_OK;
 }
 static lc_pouch_recode_file *cr_file(lc_pouch_recode *work, const char *scope,
                                      lc_u64 segment, lc_error *e) {
@@ -448,68 +418,42 @@ static int cr_unit(cr_output *out, const lc_pouch_recode_reference *ref,
   return rc;
 }
 
-static int cr_node(cr_output *out, const lc_pouch_recode_reference *ref,
-                   lc_pouch_recode_offset *map, lc_error *e) {
-  lc_collection_chunk_ref result;
-  lc_pouch_record_header header;
-  unsigned char prefix[40];
+static int cr_resolve(void *context, const lc_collection_chunk_ref *ref,
+                      unsigned int height, lc_collection_recode_tree *result,
+                      lc_error *e) {
+  cr_output *out = context;
   lc_pouch_recode_offset *child;
   lc_pouch_recode_file *owner;
-  size_t at;
   char leaf[64];
-  int rc;
-  if (!ref->bytes || ref->bytes > LC_COLLECTION_CHUNK_PAGE ||
-      ref->bytes % LC_COLLECTION_CHUNK_TUPLE)
-    return cr_corrupt(e,
-                      "collection conversion index exceeds its bounded page");
-  if (!out->buffer)
-    out->buffer = lc_alloc_with_allocator(&out->work->pouch->allocator,
-                                          LC_COLLECTION_CHUNK_PAGE);
-  if (!out->buffer)
-    return lc_collection_failure(e, LC_ERR_NOMEM, NULL,
-                                 "cannot allocate collection index scratch");
-  rc = cr_read(out->source_fd, prefix, sizeof(prefix), ref->offset, e);
+  int rc = lc_collection_record_leaf(ref->segment, leaf, e);
   if (rc == LC_OK)
-    rc = lc_pouch_record_header_decode(prefix, &header, e);
-  if (rc == LC_OK)
-    rc = cr_read(out->source_fd, out->buffer, (size_t)ref->bytes,
-                 ref->offset + 40U, e);
-  if (rc == LC_OK &&
-      (header.type != LC_POUCH_COLLECTION_NODE || header.flags ||
-       header.key_len || header.meta_len != 8U ||
-       header.payload_len != ref->bytes ||
-       cr_get(prefix + 32U) != ref->height - 1U ||
-       header.payload_crc !=
-           (unsigned long)crc32(0L, out->buffer, (uInt)ref->bytes)))
-    rc = cr_corrupt(e, "collection conversion index checksum is invalid");
-  for (at = 0; rc == LC_OK && at < ref->bytes; at += 24U) {
-    unsigned char *tuple = out->buffer + at;
-    rc = lc_collection_record_leaf(cr_get(tuple), leaf, e);
-    if (rc == LC_OK)
-      rc = lc_pouch_recode_lookup(out->work, out->file->scope, leaf,
-                                  cr_get(tuple + 8U), &owner, &child, e);
-    if (rc != LC_OK)
-      break;
-    if (!child->segment || !child->units || !child->first_segment ||
-        child->stored > LC_U64_MAX - map->stored ||
-        child->units > LC_U64_MAX - map->units)
-      return cr_corrupt(e, "converted collection node has an invalid child");
-    if (!at) {
-      map->first_segment = child->first_segment;
-      map->first_offset = child->first_offset;
-    }
-    map->stored += child->stored;
-    map->units += child->units;
-    cr_put(tuple, child->segment);
-    cr_put(tuple + 8U, child->after);
-    cr_put(tuple + 16U,
-           ref->height == 1U ? child->stored : cr_get(tuple + 16U));
+    rc = lc_pouch_recode_lookup(out->work, out->file->scope, leaf, ref->offset,
+                                &owner, &child, e);
+  if (rc == LC_OK) {
+    memset(result, 0, sizeof(*result));
+    result->root.segment = child->segment;
+    result->root.offset = child->after;
+    result->root.bytes = height ? ref->bytes : child->stored;
+    result->stored = child->stored;
+    result->units = child->units;
+    result->first.segment = child->first_segment;
+    result->first.offset = child->first_offset;
   }
-  if (rc == LC_OK)
-    rc = lc_collection_chunks_write_index(
-        lc_collection_unit_file_io(out->fd), map->segment,
-        (unsigned int)ref->height - 1U, out->buffer, (size_t)ref->bytes,
-        &result, e);
+  return rc;
+}
+static int cr_node(cr_output *out, const lc_pouch_recode_reference *ref,
+                   lc_pouch_recode_offset *map, lc_error *e) {
+  lc_collection_recode_tree result;
+  int rc = lc_collection_index_recode(
+      lc_collection_unit_file_io(out->source_fd), ref->offset, ref->bytes,
+      (unsigned int)ref->height, cr_resolve, out,
+      lc_collection_unit_file_io(out->fd), map->segment, &result, e);
+  if (rc == LC_OK) {
+    map->stored = result.stored;
+    map->units = result.units;
+    map->first_segment = result.first.segment;
+    map->first_offset = result.first.offset;
+  }
   return rc;
 }
 static int cr_extent(cr_output *out, const lc_pouch_recode_reference *ref,
@@ -934,7 +878,6 @@ done:
   if (out.source_fd >= 0)
     (void)close(out.source_fd);
   lc_collection_unit_recode_close(out.codec);
-  lc_free_with_allocator(&work->pouch->allocator, out.buffer);
   lc_free_with_allocator(&work->pouch->allocator, map_path);
   return rc;
 }

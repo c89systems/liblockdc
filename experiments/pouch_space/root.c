@@ -216,6 +216,26 @@ ps_space *ps_root_space(ps_root *root) { return root ? root->space : NULL; }
 lc_pouch_crypto *ps_root_crypto(ps_root *root) {
   return root ? root->crypto : NULL;
 }
+int ps_root_crypto_matches(ps_root *root, lc_pouch_crypto *crypto,
+                           lc_error *e) {
+  char *a = NULL, *b = NULL;
+  int rc = LC_OK;
+  if (!root ||
+      lc_pouch_crypto_enabled(root->crypto) != lc_pouch_crypto_enabled(crypto))
+    return failure(e, LC_ERR_INVALID, "pouch_root_crypto_mismatch",
+                   "conversion keeps root encryption mode");
+  if (lc_pouch_crypto_enabled(crypto)) {
+    rc = lc_pouch_crypto_key_id(root->crypto, &a, e);
+    if (rc == LC_OK)
+      rc = lc_pouch_crypto_key_id(crypto, &b, e);
+    if (rc == LC_OK && strcmp(a, b))
+      rc = failure(e, LC_ERR_INVALID, "pouch_root_crypto_mismatch",
+                   "conversion keeps root encryption key");
+  }
+  lc_free_with_allocator(NULL, a);
+  lc_free_with_allocator(NULL, b);
+  return rc;
+}
 static uint64_t name_hash(const char *name) {
   uint64_t hash = UINT64_C(14695981039346656037);
   const unsigned char *p = (const unsigned char *)name;

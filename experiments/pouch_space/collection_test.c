@@ -571,15 +571,24 @@ static void projections(void) {
 }
 #include "collection_codec_cases.h"
 #include "collection_record_codec_cases.h"
+#include "collection_transform_cases.h"
 #include "collection_walk_cases.h"
 #include "collection_workspace_cases.h"
 typedef struct unit_run {
   const char *directory, *key;
   int faults;
+  unsigned int first, last;
 } unit_run;
 static void *unit_worker(void *context) {
   unit_run *run = context;
-  if (run->faults == 8)
+  if (run->faults == 12 || run->faults == 10)
+    transform_faults(run->directory, run->key, run->first, run->last,
+                     run->faults == 12);
+  else if (run->faults == 11)
+    transform_concurrency(run->directory, run->key);
+  else if (run->faults == 9)
+    transform_cases(run->directory, run->key);
+  else if (run->faults == 8)
     walk_faults(run->directory, run->key);
   else if (run->faults == 7)
     walk_cases(run->directory, run->key);
@@ -601,29 +610,47 @@ int main(int argc, char **argv) {
   char path[1024], directory[1024];
   char *key = NULL;
   lc_error e;
-  REQUIRE(argc == 2 || argc == 3);
+  REQUIRE(argc == 2 || argc == 3 || argc == 5);
   REQUIRE(snprintf(path, sizeof(path), "%s/pouch-collections-XXXXXX", argv[1]) >
           0);
   REQUIRE(lc_test_tmp_mkdtemp(path, directory, sizeof(directory), argv[1]));
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
-  if (argc == 3) {
+  if (argc >= 3) {
     REQUIRE(!strcmp(argv[2], "units") || !strcmp(argv[2], "unit-faults") ||
             !strcmp(argv[2], "unit-concurrency") ||
             !strcmp(argv[2], "records") || !strcmp(argv[2], "record-faults") ||
             !strcmp(argv[2], "workspace") ||
             !strcmp(argv[2], "workspace-faults") || !strcmp(argv[2], "walk") ||
-            !strcmp(argv[2], "walk-faults"));
+            !strcmp(argv[2], "walk-faults") || !strcmp(argv[2], "transform") ||
+            !strcmp(argv[2], "transform-faults") ||
+            !strcmp(argv[2], "transform-concurrency") ||
+            !strcmp(argv[2], "transform-prepare-faults"));
     unit_run run = {directory, key,
-                    !strcmp(argv[2], "walk-faults")        ? 8
-                    : !strcmp(argv[2], "walk")             ? 7
-                    : !strcmp(argv[2], "workspace-faults") ? 6
-                    : !strcmp(argv[2], "workspace")        ? 5
-                    : !strcmp(argv[2], "record-faults")    ? 4
-                    : !strcmp(argv[2], "records")          ? 3
+                    !strcmp(argv[2], "transform-prepare-faults") ? 12
+                    : !strcmp(argv[2], "transform-concurrency")  ? 11
+                    : !strcmp(argv[2], "transform-faults")       ? 10
+                    : !strcmp(argv[2], "transform")              ? 9
+                    : !strcmp(argv[2], "walk-faults")            ? 8
+                    : !strcmp(argv[2], "walk")                   ? 7
+                    : !strcmp(argv[2], "workspace-faults")       ? 6
+                    : !strcmp(argv[2], "workspace")              ? 5
+                    : !strcmp(argv[2], "record-faults")          ? 4
+                    : !strcmp(argv[2], "records")                ? 3
                     : !strcmp(argv[2], "unit-concurrency")
                         ? 2
-                        : !strcmp(argv[2], "unit-faults")};
+                        : !strcmp(argv[2], "unit-faults"),
+                    0, 16};
+    if (argc == 5) {
+      char *end = NULL;
+      REQUIRE(run.faults == 10 || run.faults == 12);
+      unsigned long first = strtoul(argv[3], &end, 10);
+      REQUIRE(end && !*end && first < 16);
+      unsigned long last = strtoul(argv[4], &end, 10);
+      REQUIRE(end && !*end && last > first && last <= 16);
+      run.first = (unsigned int)first;
+      run.last = (unsigned int)last;
+    }
     pthread_t worker;
     REQUIRE(!pthread_create(&worker, NULL, unit_worker, &run));
     REQUIRE(!pthread_join(worker, NULL));

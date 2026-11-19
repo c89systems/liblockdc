@@ -17,23 +17,7 @@ static int failure(lc_error *e, int code, const char *text) {
   return lc_error_set(e, code, 0, text, NULL, NULL, "pouch");
 }
 static int same_key(ps_namespace *ns, lc_pouch_crypto *crypto, lc_error *e) {
-  char *a = NULL, *b = NULL;
-  int rc = LC_OK;
-  if (lc_pouch_crypto_enabled(crypto) !=
-      lc_pouch_crypto_enabled(ns->root->crypto))
-    return failure(e, LC_ERR_INVALID,
-                   "namespace conversion keeps encryption mode");
-  if (lc_pouch_crypto_enabled(crypto)) {
-    rc = lc_pouch_crypto_key_id(ns->root->crypto, &a, e);
-    if (rc == LC_OK)
-      rc = lc_pouch_crypto_key_id(crypto, &b, e);
-    if (rc == LC_OK && strcmp(a, b))
-      rc = failure(e, LC_ERR_INVALID,
-                   "namespace conversion keeps root key identity");
-  }
-  lc_free_with_allocator(NULL, a);
-  lc_free_with_allocator(NULL, b);
-  return rc;
+  return ps_root_crypto_matches(ns->root, crypto, e);
 }
 void ps_namespace_conversion_close(ps_namespace_conversion *work) {
   ps_namespace *ns;

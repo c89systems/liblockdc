@@ -35,7 +35,7 @@ static int capture(void *context, const void *name, size_t length,
        list->kind != (id & LC_COLLECTION_SNAPSHOT_BIT ? PS_CATALOG_SNAPSHOT
                                                       : PS_CATALOG_SEGMENT)) ||
       (length == 16U && (!marked || marked > UINT64_C(0x7fffffffffffffff))) ||
-      info->stream.owner != list->owner || info->stream.key != id ||
+      !info->stream.owner || !info->stream.key ||
       info->stream.kind != PS_STREAM)
     return corrupt(e);
   for (i = 0U; i < list->count; ++i)

@@ -6,13 +6,17 @@
 #include "lc_pouch_crypto.h"
 
 #define PS_COLLECTION_CONVERSION_BATCH 64U
+#define PS_COLLECTION_CONVERSION_MAP_ROWS 48U
 typedef struct ps_collection_conversion ps_collection_conversion;
 typedef struct ps_collection_relocation {
   lc_u64 source_segment, source_offset, target_segment, target_offset;
+  /* Unit/index subtree facts. Zero for ordinary publication records. */
+  lc_u64 stored, units, first_segment, first_offset;
 } ps_collection_relocation;
 typedef struct ps_collection_conversion_progress {
   lc_u64 pages, records, candidates;
   lc_u64 source_segment, source_offset;
+  lc_u64 normal, snapshot;
 } ps_collection_conversion_progress;
 
 /* Offline collection coordination. The caller excludes logical mutation of
@@ -63,7 +67,7 @@ int ps_collection_conversion_candidate_create(ps_collection_conversion *,
 int ps_collection_conversion_candidate_open(ps_collection_conversion *, lc_u64,
                                             ps_collection_segment **,
                                             lc_error *);
-/* At most BATCH strictly ordered record mappings per page. Snapshot source
+/* At most MAP_ROWS strictly ordered mappings per page. Snapshot source
  * IDs precede normal segment IDs, matching canonical history traversal. The
  * cursor follows every entry and never moves backward. Bytes and the immutable
  * page precede an always-durable progress replacement, even on NoSync roots.
@@ -89,6 +93,14 @@ int ps_collection_conversion_lookup(ps_collection_conversion *, lc_u64, lc_u64,
  * handle after successful discard.
  */
 int ps_collection_conversion_discard(ps_collection_conversion *, lc_error *);
+/* Final cleanup after the exact new canonical head and every candidate's
+ * canonical catalog binding are durable. It never selects a head. Retain all
+ * controls until the workspace anchor is detached, so interruption can resume
+ * final selection/cleanup without old source bytes or relocation pages.
+ */
+int ps_collection_conversion_finish(ps_collection_conversion *,
+                                    const lc_collection_disk_head *,
+                                    lc_error *);
 /* Collection/orphan cleanup hook. Active anchors exclude cascading cleanup. */
 int ps_collection_conversion_reclaim(ps_space *, uint64_t, lc_error *);
 #endif

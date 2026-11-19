@@ -1,7 +1,9 @@
 #include "lc_api_internal.h"
 #include "lc_collection_record_recode.h"
 #include "lc_collection_unit_recode.h"
+#include "lc_pouch_record.h"
 #include <string.h>
+#include <zlib.h>
 
 struct lc_collection_stream_recode {
   lc_allocator allocator;
@@ -151,5 +153,94 @@ int lc_collection_stream_recode_step(lc_collection_stream_recode *work,
   } else
     work->failed = 1;
   lc_error_cleanup(&local);
+  return rc;
+}
+
+static lc_u64 index_number(const unsigned char *p) {
+  lc_u64 n = 0U;
+  size_t i;
+  for (i = 0U; i < 8U; ++i)
+    n |= (lc_u64)p[i] << (8U * i);
+  return n;
+}
+static void index_encode(unsigned char *p, lc_u64 n) {
+  size_t i;
+  for (i = 0U; i < 8U; ++i)
+    p[i] = (unsigned char)(n >> (8U * i));
+}
+int lc_collection_index_recode(lc_pouch_record_io input, lc_u64 offset,
+                               lc_u64 bytes, unsigned int height,
+                               lc_collection_recode_resolve_fn resolve,
+                               void *context, lc_pouch_record_io output,
+                               lc_u64 segment, lc_collection_recode_tree *out,
+                               lc_error *e) {
+  unsigned char prefix[40], tuples[LC_COLLECTION_CHUNK_PAGE];
+  lc_pouch_record_header header;
+  lc_collection_recode_tree result, child;
+  lc_collection_chunk_ref source;
+  struct iovec part;
+  lc_u64 tail;
+  size_t at;
+  int rc;
+  if (!resolve || !out || !segment || !height ||
+      height >= LC_COLLECTION_CHUNK_LEVELS || !bytes ||
+      bytes > sizeof(tuples) || bytes % LC_COLLECTION_CHUNK_TUPLE ||
+      !output.ops || !output.ops->discard)
+    return lc_collection_failure(e, LC_ERR_INVALID, NULL,
+                                 "index conversion requires bounded placement");
+  memset(&result, 0, sizeof(result));
+  part.iov_base = prefix;
+  part.iov_len = sizeof(prefix);
+  rc = lc_pouch_record_io_read(input, offset, &part, 1, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_record_header_decode(prefix, &header, e);
+  part.iov_base = tuples;
+  part.iov_len = (size_t)bytes;
+  if (rc == LC_OK)
+    rc = lc_pouch_record_io_read(input, offset + 40U, &part, 1, e);
+  if (rc == LC_OK &&
+      (header.type != LC_POUCH_COLLECTION_NODE || header.flags ||
+       header.key_len || header.meta_len != 8U || header.payload_len != bytes ||
+       index_number(prefix + 32U) != height - 1U ||
+       header.payload_crc != (unsigned long)crc32(0L, tuples, (uInt)bytes)))
+    rc = lc_collection_failure(
+        e, LC_ERR_PROTOCOL, "collection_corrupt",
+        "converted index source framing or CRC is invalid");
+  for (at = 0U; rc == LC_OK && at < bytes; at += LC_COLLECTION_CHUNK_TUPLE) {
+    source.segment = index_number(tuples + at);
+    source.offset = index_number(tuples + at + 8U);
+    source.bytes = index_number(tuples + at + 16U);
+    memset(&child, 0, sizeof(child));
+    rc = resolve(context, &source, height - 1U, &child, e);
+    if (rc != LC_OK)
+      break;
+    if (!child.root.segment || !child.root.bytes || !child.first.segment ||
+        !child.stored || !child.units ||
+        (height == 1U &&
+         (child.units != 1U || child.root.bytes != child.stored)) ||
+        (height > 1U && child.root.bytes != source.bytes) ||
+        child.stored > LC_U64_MAX - result.stored ||
+        child.units > LC_U64_MAX - result.units)
+      return lc_collection_failure(e, LC_ERR_PROTOCOL, "collection_corrupt",
+                                   "converted index child facts are invalid");
+    if (!at)
+      result.first = child.first;
+    result.stored += child.stored;
+    result.units += child.units;
+    index_encode(tuples + at, child.root.segment);
+    index_encode(tuples + at + 8U, child.root.offset);
+    index_encode(tuples + at + 16U, child.root.bytes);
+  }
+  if (rc != LC_OK)
+    return rc;
+  rc = lc_pouch_record_io_tail(output, &tail, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = lc_collection_chunks_write_index(output, segment, height - 1U, tuples,
+                                        (size_t)bytes, &result.root, e);
+  if (rc == LC_OK)
+    *out = result;
+  else
+    output.ops->discard(output.context, tail);
   return rc;
 }
