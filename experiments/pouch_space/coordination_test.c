@@ -205,7 +205,20 @@ static void lifecycle(void) {
               LC_ERR_PENDING && !busy);
   lc_error_cleanup(&e);
   ps_coordination_unlock(guard);
+  ok(ps_coordination_lock(a, PS_COORDINATION_CONTROL_STATE, 0, 0, &guard, &e),
+     &e);
+  ok(ps_coordination_lock(b, PS_COORDINATION_CONTROL_STATE, 1, 0, &busy, &e),
+     &e);
+  ps_coordination_unlock(busy);
+  ok(ps_coordination_lock(b, PS_COORDINATION_NAMESPACE_STATE, 0, 0, &busy, &e),
+     &e);
+  ps_coordination_unlock(busy);
+  ps_coordination_unlock(guard);
   guard = (ps_coordination_guard *)1;
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_CONTROL_STATE, 2, 0, &guard,
+                               &e) == LC_ERR_INVALID &&
+          !guard);
+  lc_error_cleanup(&e);
   REQUIRE(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 256, 0, &guard,
                                 &e) == LC_ERR_INVALID && !guard);
   lc_error_cleanup(&e);
@@ -628,10 +641,15 @@ static pid_t spawn(const char *self, const char *mode, int ready[2], int command
 static void processes(const char *self) {
   file_create();
   lc_error e;
+  const enum ps_coordination_domain domains[] = {
+      PS_COORDINATION_PUBLICATION,  PS_COORDINATION_RECOVERY,
+      PS_COORDINATION_ALLOCATION,   PS_COORDINATION_SYNC,
+      PS_COORDINATION_TRANSACTION,  PS_COORDINATION_NAMESPACE,
+      PS_COORDINATION_CONTROL_STATE};
   lc_error_init(&e);
-  for (int domain = PS_COORDINATION_PUBLICATION;
-       domain <= PS_COORDINATION_NAMESPACE; ++domain)
+  for (size_t i = 0; i < sizeof(domains) / sizeof(*domains); ++i)
     for (int abrupt = 0; abrupt < 2; ++abrupt) {
+      enum ps_coordination_domain domain = domains[i];
       ps_coordination *owner = owner_open(1, NULL, &e);
       ps_coordination_guard *guard = NULL, *busy = NULL;
       uint64_t identity = domain == PS_COORDINATION_NAMESPACE ? UINT64_MAX : 0;

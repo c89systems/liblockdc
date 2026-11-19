@@ -239,6 +239,8 @@ static void drop(ps_coordination_guard *guard) {
 }
 static uint64_t keyed_offset(enum ps_coordination_domain domain,
                              uint64_t identity) {
+  if (domain == PS_COORDINATION_CONTROL_STATE)
+    return STATE_BASE - 2 + identity;
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
@@ -388,11 +390,13 @@ int ps_coordination_lock(ps_coordination *owner,
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_NAMESPACE_STATE ||
-      (domain >= PS_COORDINATION_STREAM && wait) ||
+      domain > PS_COORDINATION_CONTROL_STATE ||
+      (domain >= PS_COORDINATION_STREAM &&
+       domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
-       identity >= PS_COORDINATION_TXN_STRIPES))
+       identity >= PS_COORDINATION_TXN_STRIPES) ||
+      (domain == PS_COORDINATION_CONTROL_STATE && identity >= 2))
     return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");
   rc = ps_coordination_check(owner, e);
   if (rc != LC_OK)

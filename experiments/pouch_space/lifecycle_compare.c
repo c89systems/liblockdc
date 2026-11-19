@@ -30,7 +30,7 @@ typedef struct worker {
   size_t ordinal;
   char ns[64];
   lc_client *producer_client;
-  lc_outbox *outbox;
+  lc_outbox *outbox, *producer_outbox;
   lc_outbox_dispatcher *dispatcher;
   lc_xa_store *journal;
   char owner[LC_XID_STRING_SIZE], resource[LC_XID_STRING_SIZE];
@@ -43,7 +43,7 @@ typedef struct worker {
 struct comparison {
   size_t rows, bytes, writers, rounds;
   int container, outbox, xa, index, sync, started, preopened, stable_index;
-  int shared_queue, warm_queues;
+  int shared, warm_queues;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -66,13 +66,13 @@ static pthread_mutex_t sync_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Process-wide snapshots around overlapping writers would count peer work. */
 static pthread_key_t sync_phase_key;
 static int sync_phase_key_initialized;
-static int shared_queue_fixture;
+static int shared_fixture;
 int __real_ps_coordination_open(int, const ps_coordination_options *,
                                 ps_coordination **, lc_error *);
 int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
                                 ps_coordination **out, lc_error *e) {
   ps_coordination_options selected = *options;
-  if (shared_queue_fixture)
+  if (shared_fixture)
     selected.shared = 1;
   return __real_ps_coordination_open(fd, &selected, out, e);
 }
@@ -245,7 +245,7 @@ static void open_store(comparison *run, int create, lc_error *e) {
             ? ps_pouch_client_open(&config, create, NULL, &run->client, e)
             : lc_client_open(&config, &run->client, e),
         e);
-  for (size_t i = 0U; run->shared_queue && i < run->writers; ++i)
+  for (size_t i = 0U; run->shared && i < run->writers; ++i)
     check(ps_pouch_client_open(&config, 0, NULL,
                                &run->workers[i].producer_client, e),
           e);
@@ -257,6 +257,10 @@ static void open_store(comparison *run, int create, lc_error *e) {
     check(
         lc_client_new_outbox(run->client, &outbox, &run->workers[i].outbox, e),
         e);
+    if (run->shared)
+      check(lc_client_new_outbox(run->workers[i].producer_client, &outbox,
+                                 &run->workers[i].producer_outbox, e),
+            e);
   }
   for (size_t i = 0U; run->xa && i < run->writers; ++i)
     check(lc_xa_store_open_owned(run->client, run->workers[i].owner,
@@ -265,6 +269,8 @@ static void open_store(comparison *run, int create, lc_error *e) {
 }
 static void close_store(comparison *run) {
   for (size_t i = 0U; i < run->writers; ++i) {
+    lc_outbox_close(run->workers[i].producer_outbox);
+    run->workers[i].producer_outbox = NULL;
     lc_client_close(run->workers[i].producer_client);
     run->workers[i].producer_client = NULL;
     lc_outbox_dispatcher_close(run->workers[i].dispatcher);
@@ -342,8 +348,8 @@ static int outbox_one(worker *w, size_t row, producer *source, consumer *sink,
   entry_init(w, row, &entry, id);
   lc_outbox_receipt_init(&receipt);
   lc_outbox_commit_result_init(&committed);
-  rc = lc_outbox_append(w->outbox, &entry, &source->source, &transaction,
-                        &receipt, e);
+  rc = lc_outbox_append(w->producer_outbox ? w->producer_outbox : w->outbox,
+                        &entry, &source->source, &transaction, &receipt, e);
   if (rc == LC_OK) {
     require(transaction && !receipt.duplicate, "new outbox effect");
     rc = lc_outbox_transaction_commit(transaction, &committed, e);
@@ -614,13 +620,13 @@ int main(int argc, char **argv) {
       !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
           !strcmp(argv[1], "runtime-shared-queue") ||
           !strcmp(argv[1], "pouch-outbox") ||
+          !strcmp(argv[1], "runtime-shared-outbox") ||
           !strcmp(argv[1], "runtime-outbox") || !strcmp(argv[1], "pouch-xa") ||
           !strcmp(argv[1], "runtime-xa") || !strcmp(argv[1], "pouch-index") ||
           !strcmp(argv[1], "runtime-index"),
       "mode");
   run.container = !strncmp(argv[1], "runtime-", 8U);
-  run.shared_queue = shared_queue_fixture =
-      !strcmp(argv[1], "runtime-shared-queue");
+  run.shared = shared_fixture = !strncmp(argv[1], "runtime-shared-", 15U);
   run.outbox = strstr(argv[1], "outbox") != NULL;
   run.xa = strstr(argv[1], "-xa") != NULL;
   run.index = strstr(argv[1], "-index") != NULL;

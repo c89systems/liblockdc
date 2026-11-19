@@ -882,6 +882,20 @@ static int lc_outbox_claim_failure_is_retryable(const lc_error *error) {
          error->http_status != 409L;
 }
 
+static int lc_outbox_coordinated(lc_client_handle *client) {
+  return client->is_pouch && client->pouch->storage.coordinated_namespaces;
+}
+
+static int lc_outbox_acquire_transaction(lc_client_handle *client,
+                                         const lc_acquire_req *acquire,
+                                         int generated, lc_lease **lease,
+                                         lc_error *error) {
+  if (generated && lc_outbox_coordinated(client))
+    return lc_pouch_client_acquire_generated_transaction(&client->pub, acquire,
+                                                         lease, error);
+  return lc_acquire(&client->pub, acquire, lease, error);
+}
+
 #ifdef LOCKDC_TEST_BUILD
 int lc_outbox_test_claim_failure_is_retryable(const lc_error *error) {
   return lc_outbox_claim_failure_is_retryable(error);
@@ -1699,6 +1713,15 @@ static int lc_outbox_note_checkpoint_present(lc_outbox_job_handle *job,
   return rc;
 }
 
+static int lc_outbox_save_envelope(lc_client_handle *client, lc_lease *lease,
+                                   const lc_outbox_record *record,
+                                   lc_error *error) {
+  int rc = lc_lease_save(lease, &lc_outbox_record_map, record, NULL, error);
+  if (rc == LC_OK && lc_outbox_coordinated(client))
+    rc = lc_pouch_state_sync_namespace(client->pouch, lease->ns, error);
+  return rc;
+}
+
 static int lc_outbox_save_completed_parent(lc_outbox_job_handle *job,
                                            const lc_outbox_record *record,
                                            lc_error *error) {
@@ -1714,7 +1737,7 @@ static int lc_outbox_save_completed_parent(lc_outbox_job_handle *job,
     ((lc_lease_handle *)job->lease)->pouch_commit_immediately =
         LC_POUCH_COMMIT_PARENT_IMMEDIATELY;
   }
-  return lc_lease_save(job->lease, &lc_outbox_record_map, record, NULL, error);
+  return lc_outbox_save_envelope(job->client, job->lease, record, error);
 }
 
 /* The completed parent is already durable and its exact-key marker was
@@ -3962,11 +3985,11 @@ static int lc_outbox_job_renew_method(lc_outbox_job *self, long ttl_seconds,
   return rc;
 }
 
-static int lc_outbox_job_terminal(lc_outbox_job *self, const char *state,
-                                  lc_unix_seconds not_before_unix,
-                                  const char *diagnostic,
-                                  const lc_outbox_completion *completion,
-                                  lc_error *error) {
+static int lc_outbox_job_terminal_impl(lc_outbox_job *self, const char *state,
+                                       lc_unix_seconds not_before_unix,
+                                       const char *diagnostic,
+                                       const lc_outbox_completion *completion,
+                                       lc_error *error) {
   lc_outbox_job_handle *job = (lc_outbox_job_handle *)self;
   lc_outbox_record record;
   lc_release_req release;
@@ -4058,8 +4081,7 @@ static int lc_outbox_job_terminal(lc_outbox_job *self, const char *state,
       if (rc == LC_OK)
         completed_parent_durable = 1;
     } else {
-      rc = lc_lease_save(job->lease, &lc_outbox_record_map, &record, NULL,
-                         error);
+      rc = lc_outbox_save_envelope(job->client, job->lease, &record, error);
     }
     if (rc != LC_OK)
       return rc;
@@ -4134,6 +4156,50 @@ static int lc_outbox_job_terminal(lc_outbox_job *self, const char *state,
    * now; the public contract deliberately makes a terminal method consuming. */
   lc_outbox_job_close_method(&job->pub);
   return LC_OK;
+}
+
+typedef struct lc_outbox_terminal_scope {
+  lc_outbox_job *job;
+  const char *state;
+  lc_unix_seconds not_before_unix;
+  const char *diagnostic;
+  const lc_outbox_completion *completion;
+} lc_outbox_terminal_scope;
+
+static int lc_outbox_job_terminal_locked(void *context, lc_error *error) {
+  lc_outbox_terminal_scope *scope = context;
+  return lc_outbox_job_terminal_impl(scope->job, scope->state,
+                                     scope->not_before_unix, scope->diagnostic,
+                                     scope->completion, error);
+}
+
+static int lc_outbox_job_terminal(lc_outbox_job *self, const char *state,
+                                  lc_unix_seconds not_before_unix,
+                                  const char *diagnostic,
+                                  const lc_outbox_completion *completion,
+                                  lc_error *error) {
+  lc_outbox_job_handle *job = (lc_outbox_job_handle *)self;
+  lc_outbox_terminal_scope scope;
+  lc_outbox_handle *outbox;
+  int rc;
+  if (job == NULL || job->terminal || job->lease == NULL ||
+      !lc_outbox_coordinated(job->client))
+    return lc_outbox_job_terminal_impl(self, state, not_before_unix, diagnostic,
+                                       completion, error);
+  scope.job = self;
+  scope.state = state;
+  scope.not_before_unix = not_before_unix;
+  scope.diagnostic = diagnostic;
+  scope.completion = completion;
+  /* Completion can consume the last host reference while namespace
+   * authority still needs the dispatcher client and its namespace name. */
+  outbox = job->outbox;
+  lc_outbox_retain(outbox);
+  rc = lc_pouch_state_with_namespace_lock(job->client->pouch, outbox->ns,
+                                          lc_outbox_job_terminal_locked, &scope,
+                                          error);
+  lc_outbox_release(outbox);
+  return rc;
 }
 
 static int lc_outbox_job_complete_method(lc_outbox_job *self,
@@ -4435,6 +4501,9 @@ static int lc_outbox_attach_job_state(lc_outbox_job_handle *job,
   }
   if (rc == LC_OK) {
     lc_metadata_req_init(&metadata);
+    if (lc_outbox_coordinated(job->client))
+      ((lc_lease_handle *)lease)->pouch_commit_immediately =
+          LC_POUCH_COMMIT_STATE_IMMEDIATELY;
     metadata.has_query_hidden = 1;
     metadata.query_hidden = 1;
     rc = lc_lease_metadata(lease, &metadata, error);
@@ -4475,8 +4544,8 @@ lc_outbox_restore_unhanded_stateful_claim(lc_outbox_job_handle *job) {
   record.claim_expires_at_unix = 0;
   if (record.attempt_count > 0)
     --record.attempt_count;
-  if (lc_lease_save(job->lease, &lc_outbox_record_map, &record, NULL,
-                    &ignored) == LC_OK) {
+  if (lc_outbox_save_envelope(job->client, job->lease, &record, &ignored) ==
+      LC_OK) {
     lc_release_req_init(&release);
     if (lc_lease_release(job->lease, &release, &ignored) == LC_OK) {
       job->lease = NULL;
@@ -4486,9 +4555,9 @@ lc_outbox_restore_unhanded_stateful_claim(lc_outbox_job_handle *job) {
   lc_error_cleanup(&ignored);
 }
 
-static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
-                                  int with_state, lc_outbox_job **out,
-                                  lc_error *error) {
+static int lc_outbox_claim_outbox_impl(lc_outbox_handle *outbox,
+                                       const char *key, int with_state,
+                                       lc_outbox_job **out, lc_error *error) {
   lc_client_handle *client = outbox->dispatcher_client;
   lc_acquire_req acquire;
   lc_lease *lease;
@@ -4511,6 +4580,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
   lonejson_int64 original_claim_expires_at_unix;
   int dead_letter_scheduled;
   int recovered_to_pending;
+  int coordinated = lc_outbox_coordinated(client);
   int rc;
 
   *out = NULL;
@@ -4554,6 +4624,9 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
     lc_outbox_schedule_conflicted_claim_recovery(outbox, key, error);
     return rc;
   }
+  if (coordinated)
+    ((lc_lease_handle *)lease)->pouch_commit_immediately =
+        LC_POUCH_COMMIT_PARENT_IMMEDIATELY;
   memset(&record, 0, sizeof(record));
   memset(&verified, 0, sizeof(verified));
   memset(&result, 0, sizeof(result));
@@ -4612,7 +4685,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
           dead_letter_marker_id, &dead_letter_due_at_unix,
           &dead_letter_scheduled, error);
       if (rc == LC_OK)
-        rc = lc_lease_save(lease, &lc_outbox_record_map, &record, NULL, error);
+        rc = lc_outbox_save_envelope(client, lease, &record, error);
       if (rc == LC_OK && dead_letter_scheduled) {
         lc_outbox_schedule_retention(outbox, dead_letter_due_at_unix,
                                      (lc_unix_seconds)now, 1);
@@ -4677,7 +4750,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
             &dead_letter_scheduled, error);
       }
       if (rc == LC_OK)
-        rc = lc_lease_save(lease, &lc_outbox_record_map, &record, NULL, error);
+        rc = lc_outbox_save_envelope(client, lease, &record, error);
       if (rc == LC_OK && dead_letter_scheduled) {
         lc_outbox_schedule_retention(outbox, dead_letter_due_at_unix,
                                      (lc_unix_seconds)now, 1);
@@ -4736,8 +4809,8 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
       }
     }
     if (rc == LC_OK)
-      rc = lc_lease_save(lease, &lc_outbox_record_map, &record, NULL, error);
-    if (rc == LC_OK) {
+      rc = lc_outbox_save_envelope(client, lease, &record, error);
+    if (rc == LC_OK && !coordinated) {
       lc_release_req release;
       lc_release_req_init(&release);
       rc = lc_lease_release(lease, &release, error);
@@ -4760,15 +4833,17 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
     return rc;
   }
 
-  /* The durable claim is now visible and has spent its attempt. A fresh lease
-   * fences the host's terminal action; a crash in this hand-off recovers at
-   * the durable claim deadline. */
+  /* The durable claim has spent its attempt. Coordinated Pouch retains the
+   * existing fence. Other dispatchers reacquire a lease for the host. A
+   * crash in either hand-off recovers at the durable claim deadline. */
 #ifdef LOCKDC_TEST_BUILD
   if (lc_outbox_test_before_outbox_handoff_reacquire_hook != NULL) {
     rc = lc_outbox_test_before_outbox_handoff_reacquire_hook(
         lc_outbox_test_before_outbox_handoff_reacquire_context, error);
     if (rc != LC_OK) {
       lc_outbox_schedule_claim_recovery(outbox, key, claim_expires_at_unix);
+      if (lease != NULL)
+        lease->close(lease);
       lc_outbox_record_clear(client, &job->record);
       lc_client_free(client, job->outbox_key);
       lc_client_free(client, job);
@@ -4791,7 +4866,7 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
     if (rc == LC_OK)
       job_client = (lc_client_handle *)job_client_public;
   }
-  if (rc == LC_OK) {
+  if (rc == LC_OK && !coordinated) {
     rc = lc_outbox_reacquire_durable_claim(job_client, &acquire, &lease, error);
   }
   if (rc != LC_OK) {
@@ -4803,14 +4878,15 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
     lc_client_free(client, job);
     return rc;
   }
-  rc = lc_lease_load(lease, &lc_outbox_record_map, &verified, NULL,
-                     &verify_result, error);
-  if (rc == LC_OK && verify_result.no_content) {
+  if (!coordinated)
+    rc = lc_lease_load(lease, &lc_outbox_record_map, &verified, NULL,
+                       &verify_result, error);
+  if (!coordinated && rc == LC_OK && verify_result.no_content) {
     rc = lc_error_set(error, LC_ERR_INVALID, 0L,
                       "durable outbox candidate disappeared before hand-off",
                       NULL, NULL, NULL);
   }
-  if (rc == LC_OK &&
+  if (!coordinated && rc == LC_OK &&
       (verified.record_type == NULL || verified.dispatch_state == NULL ||
        strcmp(verified.record_type, "lockdc.outbox.v1") != 0 ||
        strcmp(verified.dispatch_state, "claimed") != 0 ||
@@ -4838,6 +4914,8 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
   job->lease = lease;
   if (with_state) {
     rc = lc_outbox_attach_job_state(job, error);
+    if (rc == LC_OK && coordinated)
+      rc = lc_pouch_state_sync_namespace(client->pouch, outbox->ns, error);
     if (rc != LC_OK) {
       lc_outbox_restore_unhanded_stateful_claim(job);
       lc_outbox_job_close_method(&job->pub);
@@ -4871,6 +4949,35 @@ static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
   }
   *out = &job->pub;
   return LC_OK;
+}
+
+typedef struct lc_outbox_claim_scope {
+  lc_outbox_handle *outbox;
+  const char *key;
+  int with_state;
+  lc_outbox_job **out;
+} lc_outbox_claim_scope;
+
+static int lc_outbox_claim_locked(void *context, lc_error *error) {
+  lc_outbox_claim_scope *scope = context;
+  return lc_outbox_claim_outbox_impl(scope->outbox, scope->key,
+                                     scope->with_state, scope->out, error);
+}
+
+static int lc_outbox_claim_outbox(lc_outbox_handle *outbox, const char *key,
+                                  int with_state, lc_outbox_job **out,
+                                  lc_error *error) {
+  lc_outbox_claim_scope scope;
+  lc_client_handle *client = outbox->dispatcher_client;
+  if (!lc_outbox_coordinated(client))
+    return lc_outbox_claim_outbox_impl(outbox, key, with_state, out, error);
+  scope.outbox = outbox;
+  scope.key = key;
+  scope.with_state = with_state;
+  scope.out = out;
+  *out = NULL;
+  return lc_pouch_state_with_namespace_lock(
+      client->pouch, outbox->ns, lc_outbox_claim_locked, &scope, error);
 }
 
 typedef struct lc_outbox_recovery_capture {
@@ -5996,7 +6103,8 @@ static int lc_outbox_transaction_acquire_method(
   if (acquire.ttl_seconds == 0L)
     acquire.ttl_seconds = transaction->outbox->transaction_ttl_seconds;
   lease = NULL;
-  rc = lc_acquire(&transaction->outbox->client->pub, &acquire, &lease, error);
+  rc = lc_outbox_acquire_transaction(transaction->outbox->client, &acquire,
+                                     !transaction->xa_bound, &lease, error);
   if (rc != LC_OK)
     return rc;
   rc = lc_outbox_transaction_add_lease(transaction, lease, error);
@@ -6101,7 +6209,8 @@ static int lc_outbox_transaction_accept_command_method(
     return rc;
   }
   lease = NULL;
-  rc = lc_acquire(&transaction->outbox->client->pub, &acquire, &lease, error);
+  rc = lc_outbox_acquire_transaction(transaction->outbox->client, &acquire,
+                                     !transaction->xa_bound, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -6198,7 +6307,8 @@ static int lc_outbox_transaction_accept_inbox_method(
     return rc;
   }
   lease = NULL;
-  rc = lc_acquire(&transaction->outbox->client->pub, &acquire, &lease, error);
+  rc = lc_outbox_acquire_transaction(transaction->outbox->client, &acquire,
+                                     !transaction->xa_bound, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -6319,7 +6429,8 @@ static int lc_outbox_transaction_append_impl(lc_outbox_transaction *self,
     return rc;
   }
   lease = NULL;
-  rc = lc_acquire(&transaction->outbox->client->pub, &acquire, &lease, error);
+  rc = lc_outbox_acquire_transaction(transaction->outbox->client, &acquire,
+                                     !transaction->xa_bound, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -7006,7 +7117,8 @@ static int lc_outbox_append_impl(lc_outbox *self, const lc_outbox_entry *entry,
   }
   acquire.txn_id = minted_txn_id;
   lease = NULL;
-  rc = lc_acquire(&outbox->client->pub, &acquire, &lease, error);
+  rc =
+      lc_outbox_acquire_transaction(outbox->client, &acquire, 1, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -7109,7 +7221,8 @@ static int lc_outbox_accept_inbox_method(lc_outbox *self,
   }
   acquire.txn_id = minted_txn_id;
   lease = NULL;
-  rc = lc_acquire(&outbox->client->pub, &acquire, &lease, error);
+  rc =
+      lc_outbox_acquire_transaction(outbox->client, &acquire, 1, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -7200,7 +7313,8 @@ static int lc_outbox_accept_command_method(lc_outbox *self,
   }
   acquire.txn_id = minted_txn_id;
   lease = NULL;
-  rc = lc_acquire(&outbox->client->pub, &acquire, &lease, error);
+  rc =
+      lc_outbox_acquire_transaction(outbox->client, &acquire, 1, &lease, error);
   if (rc != LC_OK) {
     lc_lease *duplicate_lease;
 
@@ -7567,7 +7681,8 @@ static int lc_outbox_resume_command_method(lc_outbox *self,
   }
   acquire.txn_id = minted_txn_id;
   lease = NULL;
-  rc = lc_acquire(&outbox->client->pub, &acquire, &lease, error);
+  rc =
+      lc_outbox_acquire_transaction(outbox->client, &acquire, 1, &lease, error);
   if (rc != LC_OK) {
     free(key);
     return rc;

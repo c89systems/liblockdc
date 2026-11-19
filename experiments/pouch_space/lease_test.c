@@ -1626,6 +1626,7 @@ static void artifacts(const char *directory) {
   free(seen);
 }
 #include "lease_capacity_cases.h"
+#include "shared_outbox_cases.h"
 #include "shared_queue_cases.h"
 typedef struct run {
   const char *directory, *mode;
@@ -1648,6 +1649,10 @@ static void *worker(void *context) {
     shared_queue_delivery(r->directory);
   else if (!strcmp(r->mode, "shared-queue-transaction"))
     shared_queue_transaction(r->directory);
+  else if (!strcmp(r->mode, "shared-outbox-handoff"))
+    shared_outbox_handoff(r->directory);
+  else if (!strcmp(r->mode, "shared-outbox-recovery"))
+    shared_outbox_recovery(r->directory);
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))
@@ -1711,6 +1716,11 @@ int main(int argc, char **argv) {
   executable_path = argv[0];
   lc_pouch_test_queue_clock_gettime = logical_clock;
   lc_pouch_test_retention_hook = note_phase;
+  if (argc == 7 && !strcmp(argv[1], "--shared-outbox-crash-child")) {
+    crypto_key = argv[6];
+    shared_outbox_crash_child(argv[2], atoi(argv[3]), atoi(argv[4]), argv[5]);
+    return 3;
+  }
   if (argc == 7 && !strcmp(argv[1], "--phase-child")) {
     fixture *f = calloc(1, sizeof(*f));
     REQUIRE(f);

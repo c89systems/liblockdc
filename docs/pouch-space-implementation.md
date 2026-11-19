@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), and [shared outbox claim handoff](#shared-outbox-claim-handoff) | Shared queue performance, concurrent outbox workflows, and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), and [bounded quarantine rechecks](#bounded-quarantine-rechecks) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
@@ -7429,3 +7429,63 @@ Raw measurements and test logs are in `build/pouch-space-range-observation/`.
 
 Shared outbox and collection authority, destructive shared capacity, and
 performance acceptance remain open.
+
+## Shared outbox claim handoff
+
+A generated outbox transaction ID can enroll directly in its authoritative
+transaction record. The XID guard still protects participant enrollment and
+terminal replay. Caller-supplied and managed XA identities retain their
+existing discovery and validation, including implicit lease leaders. The
+failed two-producer trace showed the prior generated-ID lookup entering an
+unrelated application's namespace before the first participant finished
+enrollment. Local retention validation also reads the backend hash only
+when a participant names a backend.
+
+The transaction and XA ledger namespaces now use two dedicated OFD bytes.
+Peers can wait for these bounded control operations without colliding with
+a hashed application namespace. XID authority precedes ledger access, and
+ledger callbacks finish before participant application. Application namespace
+contention continues to return pending.
+
+Shared dispatchers keep the original fenced lease through the durable outbox
+claim and acquisition of the optional checkpoint lease. One namespace scope
+covers claim admission and unwinding through the returned job. Host payload
+streaming runs outside that scope. Terminal operations take the same
+namespace authority and stabilize the parent outcome before releasing its
+claim or deleting a completed checkpoint. Multifile and remote dispatchers
+continue to use their established handoff.
+
+The fault case cuts dispatch after the durable parent claim and before the
+checkpoint lease is attached. A peer observes same-namespace contention and
+commits an outbox effect in an independent namespace during the cut. The
+original effect is subsequently handed off on attempt one, with its full
+payload and one successful completion. Reopen returns the same idempotent
+receipt. A separate exec'd consumer exits after writing its checkpoint
+without releasing either lease. A replacement opens the root, observes
+attempt two with the same payload and checkpoint, and completes. Both cases
+run plaintext NoSync and encrypted, compressed durable profiles.
+
+All 47 selected groups passed on Debug, GNU release, and musl release.
+This includes queue, outbox, XA, lifetime coordination, and shared replay.
+The handoff case also passed ThreadSanitizer and strict Memcheck.
+All 36 matched GNU outbox runs verified streamed payloads and duplicate
+receipts after reopen. There is one producer per run. The shared mode
+dispatches through an independently opened handle. Small and wider runs
+deliver four 1 KiB effects and eight 4 KiB effects, respectively, with scan
+queries and 10 MiB native roots. The times below are median milliseconds
+for native shared / native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 279.79 / 177.66 / 121.13 | 557.57 / 550.98 / 628.47 | 466.75 / 301.87 / 229.68 | 960.71 / 942.10 / 900.32 |
+| Maintenance | 23.87 / 6.22 / 0.22 | 23.42 / 7.41 / 0.23 | 21.75 / 6.43 / 0.28 | 20.07 / 5.79 / 0.27 |
+| Close | 0.17 / 0.15 / 26.79 | 0.18 / 0.16 / 25.72 | 0.35 / 0.25 / 25.38 | 0.33 / 0.20 / 28.80 |
+| Reopen | 10.96 / 3.33 / 9.01 | 17.27 / 10.39 / 22.07 | 12.18 / 3.75 / 8.72 | 29.99 / 21.03 / 36.33 |
+
+All six overlapping two-producer probes with 16 effects returned
+`LC_ERR_PENDING` while importing a peer structural frame. The captured
+stack identifies retirement of an outbox marker's private empty stream
+blocking a peer's attachment open before the retirement became durable.
+The current marker representation and concurrent outbox qualification
+remain open. Raw runs, test logs, and comparisons are in
+`build/pouch-space-outbox-shared/`.

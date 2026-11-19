@@ -137,10 +137,18 @@ static int namespace_state_lock(void *context, const char *name, void **out,
                                 lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_coordination_guard *guard = NULL;
-  int rc =
-      ps_coordination_lock(ps_space_coordination(ps_root_space(owner->root)),
-                           PS_COORDINATION_NAMESPACE_STATE,
-                           ps_namespace_name_hash(name), 0, &guard, e);
+  ps_coordination *coordination =
+      ps_space_coordination(ps_root_space(owner->root));
+  int rc;
+  if (!strcmp(name, ".txns"))
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 0, 1,
+                              &guard, e);
+  else if (!strcmp(name, ".xa"))
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 1, 1,
+                              &guard, e);
+  else
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_STATE,
+                              ps_namespace_name_hash(name), 0, &guard, e);
   *out = guard;
   return rc;
 }

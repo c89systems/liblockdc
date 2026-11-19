@@ -405,6 +405,10 @@ int lc_client_acquire_method(lc_client *self, const lc_acquire_req *req,
                              lc_lease **out, lc_error *error);
 int lc_pouch_client_acquire_method(lc_client *self, const lc_acquire_req *req,
                                    lc_lease **out, lc_error *error);
+int lc_pouch_client_acquire_generated_transaction(lc_client *self,
+                                                  const lc_acquire_req *req,
+                                                  lc_lease **out,
+                                                  lc_error *error);
 int lc_pouch_client_acquire_for_update_method(
     lc_client *self, const lc_acquire_req *req,
     lc_acquire_for_update_handler_fn handler, void *handler_context,

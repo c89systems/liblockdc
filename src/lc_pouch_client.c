@@ -11095,7 +11095,8 @@ static int lc_pouch_validate_implicit_txn_leader(
 static int lc_pouch_prepare_implicit_transaction(
     lc_client *self, lc_client_handle *client, const char *txn_id,
     const char *ns, const char *key,
-    lc_pouch_unix_seconds lease_expires_at_unix, lc_error *error) {
+    lc_pouch_unix_seconds lease_expires_at_unix, int discover_leader,
+    lc_error *error) {
   lc_pouch_implicit_txn_leader leader;
   lc_txn_participant participants[2];
   lc_txn_decision_req request;
@@ -11114,9 +11115,12 @@ static int lc_pouch_prepare_implicit_transaction(
   lc_txn_decision_req_init(&request);
   memset(&result, 0, sizeof(result));
   record_exists = 0;
-  rc = lc_pouch_txn_record_exists(client, txn_id, &record_exists, error);
-  if (rc == LC_OK && !record_exists) {
-    rc = lc_pouch_find_implicit_txn_leader(client, txn_id, &leader, error);
+  rc = LC_OK;
+  if (discover_leader) {
+    rc = lc_pouch_txn_record_exists(client, txn_id, &record_exists, error);
+    if (rc == LC_OK && !record_exists) {
+      rc = lc_pouch_find_implicit_txn_leader(client, txn_id, &leader, error);
+    }
   }
   if (rc == LC_OK && leader.count == 1U) {
     rc = lc_pouch_validate_implicit_txn_leader(client, &leader, error);
@@ -12901,8 +12905,9 @@ static int lc_pouch_acquire_locked(void *context, lc_error *error) {
   return rc;
 }
 
-int lc_pouch_client_acquire_method(lc_client *self, const lc_acquire_req *req,
-                                   lc_lease **out, lc_error *error) {
+static int lc_pouch_client_acquire(lc_client *self, const lc_acquire_req *req,
+                                   int discover_leader, lc_lease **out,
+                                   lc_error *error) {
   lc_client_handle *client;
   lc_pouch_acquire_context acquire_context;
   lc_acquire_req effective_request;
@@ -13042,7 +13047,7 @@ int lc_pouch_client_acquire_method(lc_client *self, const lc_acquire_req *req,
   if (txn_explicit) {
     rc = lc_pouch_prepare_implicit_transaction(
         self, client, effective_request.txn_id, ns, effective_request.key,
-        acquire_context.lease_expires_at_unix, error);
+        acquire_context.lease_expires_at_unix, discover_leader, error);
     if (rc != LC_OK) {
       int rollback_rc;
 
@@ -13092,6 +13097,21 @@ int lc_pouch_client_acquire_method(lc_client *self, const lc_acquire_req *req,
   lc_pouch_patch_lease_methods(lease);
   *out = lease;
   return LC_OK;
+}
+
+int lc_pouch_client_acquire_method(lc_client *self, const lc_acquire_req *req,
+                                   lc_lease **out, lc_error *error) {
+  return lc_pouch_client_acquire(self, req, 1, out, error);
+}
+
+/* The outbox generates this XID for a transaction before acquiring any
+ * participant. Its leases enroll directly in the transaction record under
+ * the XID guard. No implicit leader can own that generated identity. */
+int lc_pouch_client_acquire_generated_transaction(lc_client *self,
+                                                  const lc_acquire_req *req,
+                                                  lc_lease **out,
+                                                  lc_error *error) {
+  return lc_pouch_client_acquire(self, req, 0, out, error);
 }
 
 int lc_pouch_client_acquire_for_update_method(
@@ -17499,10 +17519,9 @@ lc_pouch_txn_validate_retention(lc_client_handle *client, const char *txn_id,
                                 size_t count, lc_pouch_unix_seconds commit_at,
                                 lc_error *error) {
   size_t i;
-  int rc = LC_OK;
+  int rc = LC_OK, have_local_hash = 0;
   char local_hash[LC_POUCH_BACKEND_HASH_HEX_BYTES + 1U];
 
-  rc = lc_pouch_backend_hash(client->pouch, local_hash, error);
   for (i = 0; rc == LC_OK && i < count; ++i) {
     lc_pouch_state_read_result staged = {0};
     lc_pouch_unix_seconds deadline;
@@ -17513,6 +17532,12 @@ lc_pouch_txn_validate_retention(lc_client_handle *client, const char *txn_id,
 
     lc_pouch_txn_trim_bounds(participants[i].backend_hash, &backend,
                              &backend_length);
+    if (backend_length && !have_local_hash) {
+      rc = lc_pouch_backend_hash(client->pouch, local_hash, error);
+      if (rc != LC_OK)
+        break;
+      have_local_hash = 1;
+    }
     if ((backend_length != 0 &&
          (backend_length != strlen(local_hash) ||
           strncmp(backend, local_hash, backend_length) != 0)) ||
