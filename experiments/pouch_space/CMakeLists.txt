@@ -108,7 +108,9 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_live_allocator_test)
   foreach(mode threads faults fence processes serialized packed history
-      captures capture-faults capture-owned capture-race)
+      captures capture-faults capture-owned capture-race
+      projection projection-faults projection-recovery projection-threads
+      projection-boundaries projection-pressure)
     add_test(NAME pouch_space_live-allocator_${mode}
       COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120

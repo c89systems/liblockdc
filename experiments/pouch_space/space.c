@@ -45,6 +45,8 @@ struct ps_reader {
 #define TICKET_HEADER 112U
 static int allocation_refresh(ps_space *, lc_error *);
 static int canonical_observe(ps_space *, lc_error *);
+static int canonical_journal(ps_space *, lc_error *);
+static int canonical_refresh(ps_space *, lc_error *);
 struct ps_values {
   ps_space *space;
   ps_entry **items;
@@ -450,7 +452,7 @@ int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
   if (rc == LC_OK)
     rc = allocation_begin(s, guard, error);
   if (rc == LC_OK && *guard)
-    rc = canonical_observe(s, error);
+    rc = canonical_refresh(s, error);
   return rc;
 }
 int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
@@ -2571,7 +2573,7 @@ static int root_valid(const unsigned char *p) {
          get32(p + 72) == PS_RUN_HEADER && checksum(p, 76) == get32(p + 76);
 }
 static int canonical_observe(ps_space *s, lc_error *error) {
-  unsigned char roots[2 * PS_ROOT_BYTES], next[64];
+  unsigned char roots[2 * PS_ROOT_BYTES];
   const unsigned char *root;
   int rc, a, b;
   if (!s->journal_image)
@@ -2590,6 +2592,11 @@ static int canonical_observe(ps_space *s, lc_error *error) {
       memcmp(root + 56, s->identity, 16))
     return err(error, LC_ERR_PENDING,
                "container checkpoint view needs refresh");
+  return canonical_journal(s, error);
+}
+static int canonical_journal(ps_space *s, lc_error *error) {
+  unsigned char next[64];
+  int rc;
   while (s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
     if (rc != LC_OK)
@@ -2621,11 +2628,31 @@ static int canonical_observe(ps_space *s, lc_error *error) {
   }
   return LC_OK;
 }
+typedef struct metadata_read_page {
+  uint64_t offset;
+  struct metadata_read_page *next;
+  unsigned char bytes[PS_PAGE];
+} metadata_read_page;
 typedef struct metadata_recovery {
   ps_space *space;
   unsigned char *wire, *buffer;
   uint64_t loaded;
+  /* Warm directory order need not match packed descriptor order. Cache each
+   * checked metadata page once for this adoption, never application values. */
+  metadata_read_page **cache;
 } metadata_recovery;
+static void metadata_read_cache_close(metadata_recovery *r) {
+  metadata_read_page *p, *next;
+  size_t i;
+  if (!r->cache)
+    return;
+  for (i = 0; i < BUCKETS; ++i)
+    for (p = r->cache[i]; p; p = next) {
+      next = p->next;
+      lc_free_with_allocator(NULL, p);
+    }
+  lc_free_with_allocator(NULL, r->cache);
+}
 static int recover_directory_page(void *v, ps_directory_root ref,
                                   lc_error *error) {
   ps_space *s = ((metadata_recovery *)v)->space;
@@ -2656,11 +2683,20 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0, next;
   size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take, used;
   ps_meta_page *p;
+  metadata_read_page *cached;
   int rc, fresh;
   while (done < ref.bytes) {
     if (!metadata_offset(s, offset))
       return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
     fresh = recovery->loaded != offset;
+    if (fresh && recovery->cache)
+      for (cached = recovery->cache[(offset / PS_PAGE) % BUCKETS]; cached;
+           cached = cached->next)
+        if (cached->offset == offset) {
+          memcpy(buffer, cached->bytes, PS_PAGE);
+          fresh = 0; /* This immutable page has already passed its CRC. */
+          break;
+        }
     if (fresh) {
       rc = transfer(s, buffer, PS_PAGE, offset, 0, error);
       if (rc != LC_OK)
@@ -2677,6 +2713,16 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
         (next && !metadata_offset(s, next)) || at < META_HEADER ||
         at >= META_HEADER + used)
       return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
+    if (fresh && recovery->cache) {
+      cached = lc_alloc_with_allocator(NULL, sizeof(*cached));
+      if (!cached)
+        return err(error, LC_ERR_NOMEM,
+                   "cannot cache checkpoint descriptor page");
+      cached->offset = offset;
+      memcpy(cached->bytes, buffer, PS_PAGE);
+      cached->next = recovery->cache[(offset / PS_PAGE) % BUCKETS];
+      recovery->cache[(offset / PS_PAGE) % BUCKETS] = cached;
+    }
     recovery->loaded = offset;
     generation = get64(buffer + 16);
     p = metadata_find(s, offset);
@@ -3150,6 +3196,490 @@ static int recover(ps_space *s, lc_error *error) {
 done:
   lc_free_with_allocator(NULL, buffer);
   lc_free_with_allocator(NULL, wire);
+  return rc;
+}
+/* A warm projection owns only resident metadata until installation. Existing
+ * private witnesses stay on s; newly staged workspace is tagged 2 so every
+ * fallible preparation path can relinquish precisely its own additions. */
+static int projection_same(const ps_entry *a, const ps_entry *b) {
+  size_t i;
+  if (a->deleted || a->count != b->count ||
+      a->owned_mapped != b->owned_mapped ||
+      (a->key.kind != PS_STREAM && a->bytes != b->bytes) ||
+      (a->key.kind == PS_OWNED_RUN && a->stream_capacity != b->stream_capacity))
+    return 0;
+  for (i = 0; i < a->count; ++i)
+    if (a->extents[i].offset != b->extents[i].offset ||
+        a->extents[i].bytes != b->extents[i].bytes ||
+        a->extents[i].crc != b->extents[i].crc ||
+        a->extents[i].flags != b->extents[i].flags)
+      return 0;
+  if (a->catalog &&
+      (a->catalog->kind != b->catalog->kind ||
+       a->catalog->length != b->catalog->length ||
+       !same_key(a->catalog->stream, b->catalog->stream) ||
+       a->catalog->token != b->catalog->token ||
+       memcmp(a->catalog->name, b->catalog->name, a->catalog->length)))
+    return 0;
+  return a->key.kind != PS_STREAM ||
+         (a->stream_capacity <= b->stream_capacity &&
+          (!a->stream_sealed || b->stream_sealed) &&
+          a->bytes <= b->stream_capacity &&
+          (!b->stream_sealed || a->bytes <= b->bytes));
+}
+static int projection_journal(ps_space *v, uint64_t checkpoint,
+                              lc_error *error) {
+  static const unsigned char zero[64] = {0};
+  const unsigned char *p;
+  size_t bytes;
+  uint32_t magic;
+  int rc = transfer(v, v->journal_image, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  while (v->journal <= PS_JOURNAL - 64) {
+    p = v->journal_image + v->journal;
+    magic = get32(p);
+    bytes = get32(p + 4);
+    if (!memcmp(p, zero, sizeof(zero)))
+      return LC_OK;
+    if ((magic == (uint32_t)EVENT_MAGIC || magic == REVISION_MAGIC) &&
+        bytes >= 64 && bytes <= PS_JOURNAL - v->journal &&
+        get32(p + 60) ==
+            (uint32_t)crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64))) {
+      /* Checkpoints leave their obsolete journal image in place. Only a
+       * complete checked frame covered by this root can be that baseline. */
+      if (get64(p + 8) <= checkpoint)
+        return LC_OK;
+      if (magic == (uint32_t)EVENT_MAGIC && bytes == 64 &&
+          v->sequence != UINT64_MAX && get64(p + 8) == v->sequence + 1 &&
+          !get32(p + 16) && get32(p + 20) == PS_RESERVE_IDS && !get64(p + 24) &&
+          !get64(p + 32) && !get64(p + 48) && !get32(p + 56) &&
+          v->token_limit <= UINT64_MAX - TOKEN_RANGE &&
+          get64(p + 40) == v->token_limit + TOKEN_RANGE) {
+        v->token_limit += TOKEN_RANGE;
+        ++v->sequence;
+        v->journal += 64;
+        continue;
+      }
+    }
+    return err(error, LC_ERR_PENDING,
+               "checkpoint has unapplied journal changes");
+  }
+  return LC_OK;
+}
+static int projection_pool(ps_space *v, const ps_run *source, int metadata,
+                           lc_error *error) {
+  ps_run *copy;
+  int rc;
+  for (; source; source = source->next) {
+    if (!metadata && source->claimed != 1)
+      continue;
+    copy = lc_calloc_with_allocator(NULL, 1, sizeof(*copy));
+    if (!copy)
+      return err(error, LC_ERR_NOMEM, "cannot preserve private workspace");
+    *copy = *source;
+    copy->next = NULL;
+    copy->claimed = 1;
+    rc = exclude_run(v, source->offset, source->bytes, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, copy);
+      return rc;
+    }
+    if (metadata)
+      metadata_insert(v, copy);
+    else
+      free_insert(v, copy);
+  }
+  return LC_OK;
+}
+static int projection_workspace(ps_space *s, ps_space *v, lc_error *error) {
+  ps_run *run, *node;
+  uint64_t bound, target, bytes, floor = PS_MAINTENANCE_RESERVE;
+  int rc;
+  /* Initial fixed workspace and overflow additions are claimed only after
+   * foreign ranges and this OFD's continuously private ranges are excluded. */
+  for (run = v->metadata_free; run; run = run->next) {
+    if (run->claimed)
+      continue;
+    rc = metadata_claim_range(s, run->offset, run->bytes, error);
+    if (rc != LC_OK)
+      return rc;
+    run->claimed = 2;
+  }
+  v->reserved_payload = s->reserved_payload;
+  v->reserved_metadata = s->reserved_metadata;
+  v->reserved_entries = s->reserved_entries;
+  v->reserve_base = s->reserve_base;
+  v->reserves = s->reserves;
+  rc = metadata_claimed_bound(v, v->metadata, v->live_entries, &bound, error);
+  if (rc == LC_OK)
+    rc = reserve_floor(v, v->metadata, v->live_entries, bound, &floor, error);
+  if (rc != LC_OK)
+    return rc;
+  target = metadata_target(v, bound);
+  bytes = target > v->metadata_free_bytes ? target - v->metadata_free_bytes : 0;
+  if (v->reserved_payload > v->free_bytes ||
+      floor > v->free_bytes - v->reserved_payload ||
+      bytes > v->free_bytes - v->reserved_payload - floor)
+    return err(error, LC_ERR_PENDING,
+               "checkpoint needs more protected workspace");
+  while (v->metadata_free_bytes < target) {
+    node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
+    if (!node)
+      return err(error, LC_ERR_NOMEM, "cannot stage checkpoint workspace");
+    bytes = target - v->metadata_free_bytes;
+    rc = take_interval(&v->free, &v->free_bytes, &bytes, &node->offset,
+                       &node->clean, error);
+    if (rc == LC_OK)
+      rc = metadata_claim_range(s, node->offset, bytes, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, node);
+      return rc;
+    }
+    node->bytes = bytes;
+    node->claimed = 2;
+    metadata_insert(v, node);
+  }
+  v->metadata_workspace = bound;
+  return LC_OK;
+}
+static ps_entry *projected(ps_entry *p) { return p ? p->projection : NULL; }
+static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
+                               size_t count) {
+  ps_entry *p, *next, *q, *keep = NULL, *dest;
+  ps_catalog_record *record;
+  uint64_t checkpoint_tail;
+  size_t i;
+  /* Preparation is finished. Nothing below allocates or performs file I/O. */
+  for (p = s->entries; p; p = next) {
+    next = p->all_next;
+    q = lookup(v, p->key);
+    if (q && q->projection == p)
+      continue;
+    if (p->state != 0 && !p->pins && !p->catalog_pins) {
+      entry_free(p); /* Drop stale resident metadata, never free its ranges. */
+      continue;
+    }
+    p->previous = p->hash_next = p->stream_next = NULL;
+    p->retired_next = p->dirty_next = NULL;
+    p->retired_link = p->dirty_link = NULL;
+    p->checkpoint_ref.offset = p->checkpoint_ref.bytes = 0;
+    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
+    p->owned_first = p->owned_last = p->owned_prev = p->owned_next = NULL;
+    p->owned_linked = 0;
+    if (p->catalog)
+      p->catalog->link = NULL;
+    if (p->state != 0) {
+      p->state = 2;
+      p->safe = 1;
+      if (p->key.kind == PS_STREAM || p->key.kind == PS_OWNED_RUN)
+        p->deleted = 1;
+    }
+    p->all_next = keep;
+    keep = p;
+  }
+  s->retired = s->dirty = NULL;
+  for (i = 0; i < count; ++i) {
+    q = items[i];
+    checkpoint_tail = q->bytes;
+    dest = q->projection;
+    if (dest != q) {
+      /* Captured readers access immutable fields without the allocator
+       * mutex. Even assigning the same bytes/pointers would race them. Only
+       * replace canonical links and mutex-protected projection metadata. */
+      dest->publication_sequence = 0;
+      dest->durable_visibility = 0;
+      dest->state = 1;
+      dest->safe = dest->deleted = 0;
+      dest->previous = NULL;
+      dest->checkpoint_ref = q->checkpoint_ref;
+      dest->pending_ref = q->pending_ref;
+      dest->retired_next = dest->dirty_next = NULL;
+      dest->retired_link = dest->dirty_link = NULL;
+      dest->catalog_refs = q->catalog_refs;
+      dest->catalog_release = 0;
+      dest->owned_linked = q->owned_linked;
+      if (dest->key.kind == PS_STREAM) {
+        dest->stream_capacity = q->stream_capacity;
+        dest->stream_runs = q->stream_runs;
+        dest->stream_storage = q->stream_storage;
+        dest->stream_sealed = q->stream_sealed;
+        if (dest->bytes < q->bytes)
+          dest->bytes = q->bytes;
+      }
+    }
+    dest->all_next = projected(q->all_next);
+    dest->hash_next = projected(q->hash_next);
+    dest->stream_next = projected(q->stream_next);
+    dest->owned_first = projected(q->owned_first);
+    dest->owned_last = projected(q->owned_last);
+    dest->owned_prev = projected(q->owned_prev);
+    dest->owned_next = projected(q->owned_next);
+    if ((record = dest->catalog) != NULL) {
+      record->target = projected(q->catalog->target);
+      record->next = projected(q->catalog->next);
+    }
+    if (dest->key.kind == PS_STREAM && dest->bytes > checkpoint_tail)
+      dirty_entry(s, dest, NULL);
+  }
+  s->entries = projected(v->entries);
+  for (i = 0; i < BUCKETS; ++i) {
+    s->buckets[i] = projected(v->buckets[i]);
+    s->stream_buckets[i] = projected(v->stream_buckets[i]);
+  }
+  for (i = 0; i < v->catalogs.capacity; ++i)
+    v->catalogs.buckets[i] = projected(v->catalogs.buckets[i]);
+  for (p = s->entries; p; p = p->all_next) {
+    p->all_link = p == s->entries ? &s->entries : p->all_link;
+    if (p->all_next)
+      p->all_next->all_link = &p->all_next;
+  }
+  while (keep) {
+    p = keep;
+    keep = p->all_next;
+    register_entry(s, p);
+    if (p->state == 2) {
+      p->retired_link = &s->retired;
+      p->retired_next = s->retired;
+      if (p->retired_next)
+        p->retired_next->retired_link = &p->retired_next;
+      s->retired = p;
+    }
+  }
+  for (i = 0; i < count; ++i)
+    if (items[i]->projection != items[i])
+      entry_free(items[i]);
+  v->entries = NULL;
+}
+static void projection_install(ps_space *s, ps_space *v) {
+  ps_entry *p, **link;
+  ps_payload_page *page;
+  ps_run *run;
+  size_t i;
+#define PROJECTION_SWAP(field, type)                                           \
+  do {                                                                         \
+    type previous = s->field;                                                  \
+    s->field = v->field;                                                       \
+    v->field = previous;                                                       \
+  } while (0)
+  PROJECTION_SWAP(free, ps_run *);
+  PROJECTION_SWAP(metadata_free, ps_run *);
+  PROJECTION_SWAP(pinned_free, ps_run *);
+  PROJECTION_SWAP(pages, ps_meta_page *);
+  PROJECTION_SWAP(payload_pages, ps_payload_page *);
+  PROJECTION_SWAP(catalogs, ps_catalog_index);
+  PROJECTION_SWAP(journal_image, unsigned char *);
+#undef PROJECTION_SWAP
+  memcpy(s->page_buckets, v->page_buckets, sizeof(s->page_buckets));
+  memcpy(s->payload_buckets, v->payload_buckets, sizeof(s->payload_buckets));
+  memcpy(s->available, v->available, sizeof(s->available));
+  s->pinned_pages = v->pinned_pages;
+  if (s->pages)
+    s->pages->link = &s->pages;
+  if (s->payload_pages)
+    s->payload_pages->link = &s->payload_pages;
+  for (i = 0; i <= CELLS; ++i)
+    if ((page = s->available[i]) != NULL)
+      page->available_link = &s->available[i];
+  for (i = 0; i < s->catalogs.capacity; ++i)
+    for (link = &s->catalogs.buckets[i]; (p = *link) != NULL;
+         link = &p->catalog->next)
+      p->catalog->link = link;
+  for (run = s->metadata_free; run; run = run->next)
+    run->claimed = 0;
+  s->root = v->root;
+  s->capacity = v->capacity;
+  s->generation = v->generation;
+  s->sequence = v->sequence;
+  s->token_limit = v->token_limit;
+  s->journal = v->journal;
+  s->directory = v->directory;
+  s->metadata = v->metadata;
+  s->live_entries = v->live_entries;
+  s->metadata_pages = v->metadata_pages;
+  s->metadata_workspace = v->metadata_workspace;
+  s->metadata_free_bytes = v->metadata_free_bytes;
+  s->free_bytes = v->free_bytes;
+  s->packed_pages = v->packed_pages;
+  s->packed_bytes = v->packed_bytes;
+  s->pinned_free_bytes = v->pinned_free_bytes;
+  if (__atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) < s->sequence)
+    __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
+}
+static int canonical_refresh(ps_space *s, lc_error *error) {
+  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0},
+                                          *buffer = NULL;
+  const unsigned char *root;
+  ps_space *v = NULL;
+  ps_directory *directory = NULL;
+  metadata_recovery recovery;
+  ps_entry *p, *old, **items = NULL;
+  ps_run *run;
+  struct stat st;
+  size_t count = 0, i;
+  int a, b, selected, rc;
+  memset(&recovery, 0, sizeof(recovery));
+  rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
+  if (rc == LC_OK)
+    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  a = root_valid(roots);
+  b = root_valid(roots + PS_ROOT_BYTES);
+  selected = b && (!a || get64(roots + PS_ROOT_BYTES + 8) > get64(roots + 8));
+  root = roots + selected * PS_ROOT_BYTES;
+  if ((!a && !b) || memcmp(root + 56, s->identity, 16) ||
+      (a && b &&
+       (get64(roots + 8) == get64(roots + PS_ROOT_BYTES + 8) ||
+        memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16))))
+    return err(error, LC_ERR_PROTOCOL,
+               "conflicting checkpoint projection roots");
+  if (get64(root + 8) == s->generation)
+    return canonical_journal(s, error);
+  if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
+      get64(root + 16) < s->capacity || get64(root + 48) < s->token_limit)
+    return err(error, LC_ERR_PENDING,
+               "checkpoint would regress a live projection");
+  if ((s->maximum && get64(root + 16) > s->maximum) || fstat(s->fd, &st) ||
+      st.st_size < (off_t)get64(root + 16))
+    return err(error, LC_ERR_INVALID, "checkpoint capacity unavailable");
+  v = lc_calloc_with_allocator(NULL, 1, sizeof(*v));
+  buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
+  if (!v || !buffer) {
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint projection");
+    goto done;
+  }
+  v->fd = s->fd;
+  v->coordination = s->coordination;
+  v->io = s->io;
+  v->root = selected;
+  v->generation = get64(root + 8);
+  v->capacity = get64(root + 16);
+  v->sequence = get64(root + 24);
+  v->directory.offset = get64(root + 32);
+  v->directory.generation = get64(root + 40);
+  v->token_limit = get64(root + 48);
+  memcpy(v->identity, s->identity, 16);
+  v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
+  if (!v->journal_image) {
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate projection control buffer");
+    goto done;
+  }
+  recovery.space = v;
+  recovery.wire = v->journal_image;
+  recovery.buffer = buffer;
+  recovery.cache =
+      lc_calloc_with_allocator(NULL, BUCKETS, sizeof(*recovery.cache));
+  if (!recovery.cache) {
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate projection page cache");
+    goto done;
+  }
+  rc = initial_free(v, error);
+  if (rc == LC_OK)
+    rc = directory_open(v, &directory, error);
+  if (rc == LC_OK)
+    rc = ps_directory_visit(directory, recover_directory_entry,
+                            recover_directory_page, &recovery, error);
+  ps_directory_close(directory);
+  directory = NULL;
+  if (rc == LC_OK)
+    rc = validate_owned_directory(v, error);
+  if (rc == LC_OK)
+    rc = ps_catalog_validate_directory(v, error);
+  if (rc == LC_OK)
+    rc = projection_journal(v, get64(root + 24), error);
+  if (rc != LC_OK)
+    goto done;
+  if (v->live_entries > (uint64_t)((size_t)-1 / sizeof(*items))) {
+    rc = err(error, LC_ERR_NOMEM, "checkpoint projection is too large");
+    goto done;
+  }
+  if (v->live_entries)
+    items =
+        lc_calloc_with_allocator(NULL, (size_t)v->live_entries, sizeof(*items));
+  if (v->live_entries && !items) {
+    rc = err(error, LC_ERR_NOMEM, "cannot bind checkpoint projection entries");
+    goto done;
+  }
+  for (p = v->entries; p; p = p->all_next) {
+    items[count++] = p;
+    old = lookup(s, p->key);
+    p->projection = old && old->token == p->token ? old : p;
+    if (p->projection != p && !projection_same(old, p)) {
+      rc = err(error, LC_ERR_PROTOCOL,
+               "checkpoint changes an existing incarnation");
+      goto done;
+    }
+    for (i = 0; i < p->count; ++i) {
+      rc = payload_claim(v, &p->extents[i], error);
+      if (rc != LC_OK)
+        goto done;
+    }
+  }
+  /* Overlay only continuously retained ownership. Unpinned old canonical
+   * ranges may already have been reused by peers; never retire them here. */
+  for (p = s->entries; p; p = p->all_next) {
+    old = lookup(v, p->key);
+    if ((old && old->projection == p) ||
+        (p->state != 0 && !p->pins && !p->catalog_pins))
+      continue;
+    for (i = 0; i < p->count; ++i) {
+      rc = payload_claim(v, &p->extents[i], error);
+      if (rc != LC_OK)
+        goto done;
+    }
+  }
+  rc = projection_pool(v, s->metadata_free, 1, error);
+  if (rc == LC_OK)
+    rc = projection_pool(v, s->free, 0, error);
+  v->range_pins = 1;
+  if (rc == LC_OK)
+    rc = pins_recover(v, error);
+  if (rc == LC_OK)
+    rc = projection_workspace(s, v, error);
+  /* Even apparently zero sibling bytes can be an abandoned cached retirement
+   * whose barrier never completed. Stabilize that retirement before admitting
+   * any of its ranges. This is a structural adoption barrier, not a journal
+   * refresh or per-record commit barrier. Shared readiness may later certify
+   * it.
+   */
+  if (rc == LC_OK &&
+      memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))
+    rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
+                  error);
+  if (rc == LC_OK)
+    rc = sync_file(s, error);
+  if (rc == LC_OK) {
+    projection_entries(s, v, items, count);
+    projection_install(s, v);
+  } else {
+  done:
+    if (v)
+      for (run = v->metadata_free; run; run = run->next)
+        if (run->claimed == 2)
+          (void)metadata_release_range(s, run->offset, run->bytes, NULL);
+  }
+  if (v) {
+    if (v->poisoned)
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    v->fd = -1;
+    v->coordination = NULL;
+    destroy(v);
+  }
+  lc_free_with_allocator(NULL, items);
+  lc_free_with_allocator(NULL, buffer);
+  metadata_read_cache_close(&recovery);
+  return rc;
+}
+int ps_refresh(ps_space *s, lc_error *error) {
+  ps_coordination_guard *guard;
+  int rc;
+  if (!s)
+    return err(error, LC_ERR_INVALID, "checkpoint refresh requires a space");
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 static int sync_parent(const char *path, lc_error *error) {
@@ -4907,6 +5437,10 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   /* Preparation released allocator authority. Recheck against peer metadata
    * growth before installing this new grant's descriptor. Its payload is
    * already privately owned, so no second payload charge is required. */
+  if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed ||
+                      stream_lookup(s, head->entry->token) != head->entry ||
+                      base != head->entry->stream_capacity))
+    rc = err(error, LC_ERR_INVALID, "owned stream changed during preparation");
   if (rc == LC_OK)
     rc = owned_allowance(s, budget, 0, error);
   if (rc == LC_OK)

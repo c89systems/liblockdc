@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -131,11 +132,15 @@ static uint64_t coverage(ps_space *ignore, int capture) {
   span *pending = calloc(4096, sizeof(*pending));
   int fd = open(path, O_RDWR | O_CLOEXEC);
   REQUIRE(pending && fd >= 0);
+  struct stat st;
+  REQUIRE(fstat(fd, &st) == 0 && st.st_size >= 0);
   size_t count = 2;
   pending[0].first = 2 * PS_PAGE;
   pending[0].last = PS_JOURNAL_OFFSET;
   pending[1].first = PS_DATA;
-  pending[1].last = PS_DEFAULT_CAPACITY;
+  pending[1].last = (uint64_t)st.st_size > PS_DEFAULT_CAPACITY
+                        ? (uint64_t)st.st_size
+                        : PS_DEFAULT_CAPACITY;
   uint64_t total = 0;
   while (count) {
     span current = pending[--count];
@@ -965,9 +970,9 @@ static void captures(void) {
     for (uint64_t id = 2; id < 34; ++id)
       capture_put(b, id, PS_CHUNK + 1);
     ok(ps_checkpoint(b, &e), &e);
-    /* Captures are usable after their owner's projection goes stale. A new
-     * selection is fenced before it can pin an already retired incarnation. */
-    REQUIRE(ps_read_open(a, key(1), NULL, &fresh, &e) == LC_ERR_PENDING &&
+    /* Existing captures survive automatic adoption of the peer checkpoint.
+     * A new selection observes the removed key without pinning old bytes. */
+    REQUIRE(ps_read_open(a, key(1), NULL, &fresh, &e) == LC_ERR_INVALID &&
             !fresh);
     lc_error_cleanup(&e);
     ok(ps_check(a, &e), &e);
@@ -1005,10 +1010,15 @@ static int capture_lock(void *context, int fd, int command,
   int match = f->kind == 1   ? payload && lock->l_type == F_RDLCK
               : f->kind == 2 ? payload && lock->l_type == F_UNLCK
               : f->kind == 3 ? command == F_OFD_SETLKW && lock->l_start == 4
-                             : command == F_OFD_SETLK && lock->l_start == 4 &&
-                                   lock->l_type == F_UNLCK;
+              : f->kind == 4 ? command == F_OFD_SETLK && lock->l_start == 4 &&
+                                   lock->l_type == F_UNLCK
+              : f->kind == 5
+                  ? command == F_OFD_GETLK
+                  : command == F_OFD_SETLK && lock->l_start >= 2 * PS_PAGE &&
+                        lock->l_type == F_RDLCK;
   if (f->armed && ((match && ++f->calls == f->nth) ||
-                   (f->rollback && payload && lock->l_type == F_UNLCK))) {
+                   (f->rollback && command == F_OFD_SETLK &&
+                    lock->l_start >= 2 * PS_PAGE && lock->l_type == F_UNLCK))) {
     errno = f->reason;
     return -1;
   }
@@ -1315,7 +1325,629 @@ static void capture_race(void) {
             pthread_mutex_destroy(&g.mutex) == 0);
   }
 }
+typedef struct projection_io {
+  size_t operations, fail, syncs, payload_reads;
+  int armed, phase, ready;
+  span forbidden[16];
+  size_t ranges;
+} projection_io;
+static ssize_t projection_read(void *context, int fd, void *bytes, size_t n,
+                               off_t offset) {
+  projection_io *m = context;
+  if (m->armed) {
+    for (size_t i = 0; i < m->ranges; ++i)
+      if ((uint64_t)offset < m->forbidden[i].last &&
+          (uint64_t)offset + n > m->forbidden[i].first)
+        ++m->payload_reads;
+    if (++m->operations == m->fail) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return pread(fd, bytes, n, offset);
+}
+static int projection_sync(void *context, int fd) {
+  projection_io *m = context;
+  if (m->armed) {
+    ++m->syncs;
+    if (m->phase && m->syncs == (size_t)m->phase) {
+      REQUIRE(write(m->ready, "R", 1) == 1);
+      for (;;)
+        pause();
+    }
+    if (++m->operations == m->fail) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return fdatasync(fd);
+}
+static ssize_t projection_write(void *context, int fd, const void *bytes,
+                                size_t n, off_t offset) {
+  projection_io *m = context;
+  if (m->armed && ++m->operations == m->fail) {
+    errno = EIO;
+    return -1;
+  }
+  return pwrite(fd, bytes, n, offset);
+}
+static ps_stats projection_coverage(ps_space *a, ps_space *b) {
+  ps_stats x = status(a), y = status(b);
+  REQUIRE(coverage(NULL, 0) ==
+          x.claimed_payload_bytes + x.claimed_metadata_bytes +
+              x.retained_payload_bytes + y.claimed_payload_bytes +
+              y.claimed_metadata_bytes + y.retained_payload_bytes);
+  return x;
+}
+static double projection_milliseconds(void) {
+  struct timespec now;
+  REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+  return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
+}
+static void projection_lifecycle(void) {
+  lc_error e = {0};
+  projection_io m = {0};
+  ps_io io = {0};
+  ps_options options = {0};
+  io.context = &m;
+  io.read = projection_read;
+  io.write = projection_write;
+  io.reserve = reserve_io;
+  io.sync = projection_sync;
+  options.io = &io;
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *old = NULL, *replaced = NULL, *current = NULL;
+  ps_values *values = NULL;
+  ps_catalog_view *binding = NULL;
+  ps_catalog_info catalog, observed;
+  ps_owned_head *head = NULL, *peer = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status owned;
+  ps_key stream = {88, 900, PS_STREAM}, snapshot = {777, 1, PS_STATE};
+  int found;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  for (uint64_t id = 1; id <= 350; ++id)
+    capture_put(a, id, id == 3 ? 3 * PS_CHUNK : 65);
+  capture_put_key(a, snapshot, 65);
+  ok(ps_owned_open(a, NULL, stream, 1, NULL, &head, &owned, &e), &e);
+  ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+  REQUIRE(found);
+  unsigned char body[100];
+  memset(body, 0x33, sizeof(body));
+  ok(ps_owned_write(run, 0, body, sizeof(body), &e), &e);
+  ok(ps_catalog_put(a, NULL, 88, PS_CATALOG_BODY, "retained", 8, NULL, stream,
+                    &owned.ref, &catalog, &e),
+     &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_read_open(a, key(1), NULL, &old, &e), &e);
+  ok(ps_read_open(a, key(2), NULL, &replaced, &e), &e);
+  ok(ps_values_capture(a, 777, PS_STATE, PS_STATE, &values, &e), &e);
+  ok(ps_catalog_get(a, 88, PS_CATALOG_BODY, "retained", 8, &binding, &e), &e);
+  REQUIRE(binding && ps_values_count(values) == 1);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ps_budget_plan plan = {PS_CHUNK + 2 * PS_PAGE, 4096, 8, 0}, before, after;
+  ps_budget *budget = NULL;
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  ps_writer *producer = private_value(a, budget, 9000);
+  ok(ps_budget_status(budget, &before, &e), &e);
+  uint64_t endpoint = a->token_end, next_token = a->token_next;
+  ok(ps_owned_commit(head, sizeof(body), PS_COMMIT_DEFAULT, NULL, NULL, &e),
+     &e);
+  /* Its structural tail hint is deliberately absent from the peer's view. */
+  ok(ps_delete(b, key(1), &e), &e);
+  ok(ps_delete(b, snapshot, &e), &e);
+  capture_put(b, 2, 1000);
+  for (size_t round = 0; round < 3; ++round) {
+    for (uint64_t id = 10; id <= 350; id += 3)
+      capture_put(b, id, 65 + round);
+    uint64_t protected_bytes = coverage(b, 1);
+    REQUIRE(protected_bytes > PS_CHUNK);
+    ok(ps_checkpoint(b, &e), &e);
+    unchanged();
+    ps_entry *large = ps_internal_lookup(b, key(3));
+    REQUIRE(large && large->count <= 16);
+    m.ranges = large->count;
+    for (size_t i = 0; i < m.ranges; ++i) {
+      m.forbidden[i].first = large->extents[i].offset;
+      m.forbidden[i].last = large->extents[i].offset + large->extents[i].bytes;
+    }
+    m.syncs = m.operations = m.payload_reads = 0;
+    m.armed = 1;
+    uint64_t generation = a->generation;
+    double started = projection_milliseconds();
+    ok(ps_refresh(a, &e), &e);
+    double elapsed = projection_milliseconds() - started;
+    fprintf(stderr,
+            "projection_measure entries=%llu refresh_ms=%.3f operations=%zu "
+            "syncs=%zu payload_reads=%zu\n",
+            (unsigned long long)a->live_entries, elapsed, m.operations, m.syncs,
+            m.payload_reads);
+    REQUIRE(a->generation > generation && a->generation == b->generation &&
+            m.syncs == 1 && !m.payload_reads && m.operations < 100);
+    ok(ps_refresh(a, &e), &e);
+    REQUIRE(m.syncs == 1 && !m.payload_reads);
+    m.armed = 0;
+    REQUIRE(a->token_next == next_token + round && a->token_end == endpoint);
+    ok(ps_budget_status(budget, &after, &e), &e);
+    REQUIRE(after.payload_bytes == before.payload_bytes &&
+            after.metadata_bytes == before.metadata_bytes &&
+            after.entries == before.entries);
+    REQUIRE(projection_coverage(a, b).private_bytes == PS_CHUNK);
+    ps_writer *scratch = private_value(a, NULL, 9500 + round);
+    ps_writer_close(scratch);
+    for (uint64_t id = 1; id <= 350; ++id) {
+      ps_ref ref;
+      uint64_t bytes;
+      int present;
+      ok(ps_value_info(a, key(id), &ref, &bytes, &present, &e), &e);
+      REQUIRE(present == (id != 1));
+      if (present)
+        REQUIRE(bytes == (id == 2                          ? 1000U
+                          : id == 3                        ? 3U * PS_CHUNK
+                          : id >= 10 && (id - 10) % 3 == 0 ? 65U + round
+                                                           : 65U));
+    }
+    ok(ps_owned_status_get(head, &owned, &e), &e);
+    REQUIRE(owned.tail == sizeof(body));
+    ok(ps_read_open(a, key(350), NULL, &current, &e), &e);
+    captured_expect(current, 350 % 251, 65);
+    ps_reader_close(current);
+  }
+  ok(ps_grow(b, PS_MIB, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(status(a).capacity == PS_DEFAULT_CAPACITY + PS_MIB);
+  (void)projection_coverage(a, b);
+  /* Canonical buckets and backlinks must survive reuse, including collisions.
+   * The unjournaled local tail remains dirty and reaches the next checkpoint.
+   */
+  captured_expect(old, 1, 65);
+  captured_expect(replaced, 2, 65);
+  ok(ps_values_read_open(values, 0, &current, &e), &e);
+  captured_expect(current, 1, 65);
+  ps_reader_close(current);
+  ok(ps_publish(producer, NULL, &e), &e);
+  ps_writer_close(producer);
+  ok(ps_budget_close(budget, &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_refresh(b, &e), &e);
+  ok(ps_read_open(b, key(9000), NULL, &current, &e), &e);
+  captured_expect(current, 9000 % 251, PS_CHUNK);
+  ps_reader_close(current);
+  ok(ps_owned_open(b, NULL, stream, 0, &owned.ref, &peer, &owned, &e), &e);
+  REQUIRE(owned.tail == sizeof(body));
+  ok(ps_catalog_remove(b, 88, PS_CATALOG_BODY, "retained", 8, &catalog.revision,
+                       &e),
+     &e);
+  ok(ps_owned_retire(peer, &e), &e);
+  ps_owned_close(peer);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  ok(ps_catalog_view_info(binding, &observed, &e), &e);
+  REQUIRE(observed.revision.incarnation == catalog.revision.incarnation);
+  ok(ps_owned_status_get(head, &owned, &e), &e);
+  REQUIRE(owned.retired);
+  ok(ps_owned_read(run, 0, body, sizeof(body), &e), &e);
+  for (size_t i = 0; i < sizeof(body); ++i)
+    REQUIRE(body[i] == 0x33);
+  ps_reader_close(old);
+  ps_reader_close(replaced);
+  ps_values_close(values);
+  ps_catalog_view_close(binding);
+  ps_owned_run_close(run);
+  ps_owned_close(head);
+  ok(ps_close(a, &e), &e);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0));
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ok(ps_read_open(a, key(9000), NULL, &current, &e), &e);
+  captured_expect(current, 9000 % 251, PS_CHUNK);
+  ps_reader_close(current);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(unlink(path) == 0);
+}
+static void projection_faults(void) {
+  size_t sites = 0, operations = 0;
+  for (int kind = 0; kind < 2; ++kind)
+    for (size_t phase = 0; phase <= (kind ? operations : sites); ++phase) {
+      lc_error e = {0};
+      projection_io m = {0};
+      ps_io io = {0};
+      ps_options options = {0};
+      io.context = &m;
+      io.read = projection_read;
+      io.write = projection_write;
+      io.reserve = reserve_io;
+      io.sync = projection_sync;
+      options.io = &io;
+      ps_space *a = NULL, *b = NULL;
+      ps_reader *held = NULL;
+      ps_writer *private = NULL;
+      ok(ps_open(path, 1, &options, &a, &e), &e);
+      for (uint64_t id = 1; id <= 6; ++id)
+        capture_put(a, id, 65);
+      ok(ps_checkpoint(a, &e), &e);
+      ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
+      ok(ps_open(path, 0, NULL, &b, &e), &e);
+    private
+      = private_value(a, NULL, 9000);
+      capture_put(b, 1, 129);
+      ok(ps_checkpoint(b, &e), &e);
+      uint64_t generation = a->generation, physical = coverage(NULL, 0);
+      allocations = 0;
+      allocation_fail = kind ? 0 : phase;
+      measuring = !kind;
+      m.fail = kind ? phase : 0;
+      m.armed = 1;
+      int rc = ps_refresh(a, &e);
+      m.armed = measuring = 0;
+      if (!phase) {
+        ok(rc, &e);
+        if (kind)
+          operations = m.operations;
+        else
+          sites = allocations;
+      } else {
+        REQUIRE(rc == (kind ? LC_ERR_TRANSPORT : LC_ERR_NOMEM));
+        lc_error_cleanup(&e);
+        REQUIRE(a->generation == generation);
+        if (!kind) {
+          ok(ps_check(a, &e), &e);
+          REQUIRE(coverage(NULL, 0) == physical);
+          ok(ps_refresh(a, &e), &e);
+        } else {
+          REQUIRE(ps_check(a, &e) == LC_ERR_TRANSPORT);
+          lc_error_cleanup(&e);
+        }
+      }
+      captured_expect(held, 1, 65);
+      ps_reader_close(held);
+      ps_writer_close(private);
+      ok(ps_close(a, &e), &e);
+      ok(ps_close(b, &e), &e);
+      REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+    }
+  REQUIRE(sites > 10 && operations > 4);
+  fprintf(stderr, "projection faults: %zu allocation sites, %zu I/O sites\n",
+          sites, operations);
+}
+static void projection_child(int ready, int phase) {
+  lc_error e = {0};
+  projection_io m = {0};
+  ps_io io = {0};
+  ps_options options = {0};
+  io.context = &m;
+  io.read = projection_read;
+  io.write = projection_write;
+  io.reserve = reserve_io;
+  io.sync = projection_sync;
+  options.io = &io;
+  ps_space *s = NULL;
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  capture_put(s, 1, 1000);
+  m.ready = ready;
+  m.phase = phase;
+  m.armed = 1;
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(0);
+}
+static void projection_recovery(void) {
+  for (int phase = 2; phase <= 3; ++phase) {
+    lc_error e = {0};
+    ps_space *s = NULL;
+    ps_reader *old = NULL, *current = NULL;
+    ok(ps_open(path, 1, NULL, &s, &e), &e);
+    capture_put(s, 1, 65);
+    ok(ps_checkpoint(s, &e), &e);
+    ok(ps_read_open(s, key(1), NULL, &old, &e), &e);
+    int ready[2], child_status;
+    REQUIRE(pipe(ready) == 0);
+    pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (!pid) {
+      char a[24], b[24];
+      close(ready[0]);
+      snprintf(a, sizeof(a), "%d", ready[1]);
+      snprintf(b, sizeof(b), "%d", phase);
+      execl(executable, executable, "--projection-child", path, a, b,
+            (char *)NULL);
+      _exit(127);
+    }
+    REQUIRE(close(ready[1]) == 0);
+    char signal;
+    REQUIRE(read(ready[0], &signal, 1) == 1 && signal == 'R');
+    REQUIRE(kill(pid, SIGKILL) == 0 && waitpid(pid, &child_status, 0) == pid &&
+            WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGKILL);
+    REQUIRE(close(ready[0]) == 0);
+    ps_stats before = status(s);
+    ok(ps_refresh(s, &e), &e);
+    REQUIRE(status(s).syncs == before.syncs + 1);
+    captured_expect(old, 1, 65);
+    ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
+    captured_expect(current, 1, 1000);
+    ps_reader_close(old);
+    ps_reader_close(current);
+    ok(ps_checkpoint(s, &e), &e);
+    ok(ps_close(s, &e), &e);
+    ok(ps_open(path, 0, NULL, &s, &e), &e);
+    ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
+    captured_expect(current, 1, 1000);
+    ps_reader_close(current);
+    ok(ps_close(s, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  }
+}
+typedef struct projection_reader_work {
+  ps_reader *reader;
+  int stop;
+  size_t reads;
+} projection_reader_work;
+static void *projection_reader_worker(void *context) {
+  projection_reader_work *w = context;
+  lc_error e = {0};
+  unsigned char bytes[65];
+  while (!__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
+    ok(ps_read_at(w->reader, 0, bytes, sizeof(bytes), &e), &e);
+    REQUIRE(ps_read_size(w->reader) == sizeof(bytes));
+    for (size_t i = 0; i < sizeof(bytes); ++i)
+      REQUIRE(bytes[i] == 1);
+    __atomic_add_fetch(&w->reads, 1, __ATOMIC_RELEASE);
+    struct timespec yield = {0, 100000};
+    (void)nanosleep(&yield, NULL);
+  }
+  return NULL;
+}
+typedef struct projection_grant_work {
+  ps_owned_head *head;
+  ps_owned_run *run;
+  int rc, found;
+} projection_grant_work;
+static void *projection_grant_worker(void *context) {
+  projection_grant_work *w = context;
+  lc_error e = {0};
+  w->rc = ps_owned_grant(w->head, NULL, 0, PS_PAGE, &w->run, &w->found, &e);
+  REQUIRE(w->rc == LC_OK || w->rc == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void projection_threads(void) {
+  for (int retired = 0; retired < 2; ++retired) {
+    lc_error e = {0};
+    body_gate g = {0};
+    REQUIRE(pthread_mutex_init(&g.mutex, NULL) == 0 &&
+            pthread_cond_init(&g.cond, NULL) == 0);
+    g.bytes = PS_RUN_HEADER;
+    ps_io io = {&g, read_io, body_write, sync_io, reserve_io, NULL};
+    ps_options options = {0};
+    options.io = &io;
+    ps_space *a = NULL, *b = NULL;
+    ps_owned_head *head = NULL, *peer = NULL;
+    ps_owned_status owned;
+    ps_key stream = {88, 1, PS_STREAM};
+    ok(ps_open(path, 1, &options, &a, &e), &e);
+    capture_put(a, 1, 65);
+    ok(ps_owned_open(a, NULL, stream, 1, NULL, &head, &owned, &e), &e);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    projection_reader_work reader = {0};
+    ok(ps_read_open(a, key(1), NULL, &reader.reader, &e), &e);
+    pthread_t reading, producing;
+    REQUIRE(pthread_create(&reading, NULL, projection_reader_worker, &reader) ==
+            0);
+    g.paused = 1;
+    projection_grant_work producer = {head, NULL, 0, 0};
+    REQUIRE(pthread_create(&producing, NULL, projection_grant_worker,
+                           &producer) == 0);
+    pthread_mutex_lock(&g.mutex);
+    while (!g.entered)
+      pthread_cond_wait(&g.cond, &g.mutex);
+    pthread_mutex_unlock(&g.mutex);
+    for (size_t round = 0; round < 16; ++round) {
+      capture_put(b, 2, 65 + round);
+      if (retired && round == 15) {
+        ok(ps_owned_open(b, NULL, stream, 0, &owned.ref, &peer, &owned, &e),
+           &e);
+        ok(ps_owned_retire(peer, &e), &e);
+        ps_owned_close(peer);
+      }
+      ok(ps_checkpoint(b, &e), &e);
+      ok(ps_refresh(a, &e), &e);
+      REQUIRE(status(a).private_bytes >= PS_PAGE);
+    }
+    pthread_mutex_lock(&g.mutex);
+    g.released = 1;
+    pthread_cond_broadcast(&g.cond);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(pthread_join(producing, NULL) == 0);
+    REQUIRE(producer.rc == (retired ? LC_ERR_INVALID : LC_OK) &&
+            producer.found == !retired);
+    __atomic_store_n(&reader.stop, 1, __ATOMIC_RELEASE);
+    REQUIRE(pthread_join(reading, NULL) == 0 && reader.reads);
+    ps_reader_close(reader.reader);
+    ps_owned_run_close(producer.run);
+    ps_owned_close(head);
+    ok(ps_check(a, &e), &e);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_close(a, &e), &e);
+    ok(ps_close(b, &e), &e);
+    REQUIRE(!coverage(NULL, 0));
+    ok(ps_open(path, 0, NULL, &a, &e), &e);
+    int rc = ps_owned_open(a, NULL, stream, 0, &owned.ref, &head, &owned, &e);
+    REQUIRE(rc == (retired ? LC_ERR_INVALID : LC_OK));
+    if (retired)
+      lc_error_cleanup(&e);
+    else {
+      REQUIRE(owned.runs == 1);
+      ps_owned_close(head);
+    }
+    ok(ps_close(a, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    REQUIRE(pthread_cond_destroy(&g.cond) == 0 &&
+            pthread_mutex_destroy(&g.mutex) == 0);
+  }
+}
+static void projection_boundaries(void) {
+  /* Admission and physical staging are one revision scope. Exercise partial
+   * workspace acquisition/rollback as well as uncertain final guard release. */
+  for (int kind = 3; kind <= 6; ++kind)
+    for (int reason = 0; reason < 4; ++reason) {
+      if (reason == 3 && kind != 6)
+        continue;
+      lc_error e = {0};
+      capture_fault f = {kind,
+                         reason == 0                  ? EINTR
+                         : reason == 1 || reason == 3 ? EAGAIN
+                                                      : EIO,
+                         0,
+                         reason == 3,
+                         kind == 6 ? 2U : 1U,
+                         0};
+      ps_coordination_io io = {&f, capture_lock};
+      ps_options options = {0};
+      options.coordination_io = &io;
+      ps_space *a = NULL, *b = NULL;
+      ps_reader *reader = NULL;
+      ps_budget *budget = NULL;
+      ps_budget_plan plan = {2 * PS_PAGE, 512 * 1024, 4096, 0};
+      ok(ps_open(path, 1, &options, &a, &e), &e);
+      capture_put(a, 1, 65);
+      ok(ps_checkpoint(a, &e), &e);
+      ok(ps_read_open(a, key(1), NULL, &reader, &e), &e);
+      ok(ps_budget_open(a, &plan, &budget, &e), &e);
+      ok(ps_open(path, 0, NULL, &b, &e), &e);
+      for (uint64_t id = 2; id <= 258; ++id)
+        capture_put(b, id, 65);
+      ok(ps_checkpoint(b, &e), &e);
+      ok(ps_close(b, &e), &e);
+      uint64_t generation = a->generation, bytes = coverage(NULL, 0);
+      f.armed = 1;
+      int rc = ps_refresh(a, &e);
+      f.armed = 0;
+      REQUIRE(f.calls >= f.nth);
+      int poisoned = ((kind == 4 || kind == 5) && reason) || reason == 3;
+      if (!reason) {
+        ok(rc, &e);
+        REQUIRE(a->generation > generation);
+      } else {
+        REQUIRE(rc == ((kind == 3 || kind == 6) && reason == 1
+                           ? LC_ERR_PENDING
+                           : LC_ERR_TRANSPORT));
+        lc_error_cleanup(&e);
+        REQUIRE((a->generation > generation) == (kind == 4));
+        if (!poisoned) {
+          REQUIRE(coverage(NULL, 0) == bytes);
+          ok(ps_refresh(a, &e), &e);
+        }
+      }
+      REQUIRE(ps_check(a, &e) == (poisoned ? LC_ERR_TRANSPORT : LC_OK));
+      lc_error_cleanup(&e);
+      ps_stats st = status(a);
+      REQUIRE(coverage(NULL, 0) == st.claimed_payload_bytes +
+                                       st.claimed_metadata_bytes +
+                                       st.retained_payload_bytes);
+      captured_expect(reader, 1, 65);
+      ps_reader_close(reader);
+      ok(ps_budget_close(budget, &e), &e);
+      ok(ps_close(a, &e), &e);
+      REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+    }
+  /* Journal-only application changes remain fenced. Neither a complete later
+   * frame nor a damaged prefix may be silently absorbed into the baseline. */
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  capture_put(b, 2, 65);
+  ok(ps_checkpoint(b, &e), &e);
+  capture_put(b, 3, 65);
+  uint64_t generation = a->generation, claims = coverage(NULL, 0);
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
+  lc_error_cleanup(&e);
+  REQUIRE(coverage(NULL, 0) == claims);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  unsigned char prefix[64], damaged[64];
+  REQUIRE(pread(b->fd, prefix, sizeof(prefix), PS_JOURNAL_OFFSET) ==
+          sizeof(prefix));
+  memset(damaged, 0xa5, sizeof(damaged));
+  capture_put(b, 4, 65);
+  ok(ps_checkpoint(b, &e), &e);
+  REQUIRE(pwrite(b->fd, damaged, sizeof(damaged), PS_JOURNAL_OFFSET) ==
+          sizeof(damaged));
+  generation = a->generation;
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
+  lc_error_cleanup(&e);
+  /* Cold recovery retires the unknown tail and issues a checked grant. */
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(a->token_end < a->token_limit);
+  ok(ps_close(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+}
+static void projection_pressure(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_budget *funded = NULL, *padding = NULL;
+  ps_budget_plan plan = {PS_CHUNK, 4096, 8, 0}, occupied = {0};
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_budget_open(a, &plan, &funded, &e), &e);
+  ps_writer *private = private_value(a, funded, 9000);
+  ok(ps_budget_open(b, &occupied, &padding, &e), &e);
+  for (uint64_t step = 4 * PS_MIB; step >= PS_PAGE;) {
+    ps_budget_plan attempt = occupied;
+    attempt.payload_bytes += step;
+    int rc = ps_budget_resize(padding, &attempt, &e);
+    if (rc == LC_OK)
+      occupied = attempt;
+    else {
+      REQUIRE(rc == LC_ERR_INVALID);
+      lc_error_cleanup(&e);
+      step /= 2;
+    }
+  }
+  REQUIRE(occupied.payload_bytes > 8 * PS_MIB);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  ps_writer *probe = NULL;
+  unsigned char *bytes = malloc(PS_CHUNK);
+  REQUIRE(bytes);
+  memset(bytes, 0x7b, PS_CHUNK);
+  ok(ps_begin(a, NULL, key(9500), &probe, &e), &e);
+  /* Only maintenance capacity is unclaimed. The unfinished funded producer
+   * must not appear as an extra ordinary allocation after view replacement. */
+  REQUIRE(ps_write(probe, bytes, PS_CHUNK, &e) == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  ps_writer_close(probe);
+  (void)projection_coverage(a, b);
+  ok(ps_publish(private, NULL, &e), &e);
+  ps_writer_close(private);
+  ok(ps_budget_close(funded, &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_budget_close(padding, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ps_reader *reader = NULL;
+  ok(ps_read_open(a, key(9000), NULL, &reader, &e), &e);
+  captured_expect(reader, 9000 % 251, PS_CHUNK);
+  ps_reader_close(reader);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  free(bytes);
+}
 int main(int argc, char **argv) {
+  if (argc == 5 && !strcmp(argv[1], "--projection-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    projection_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     child(atoi(argv[3]), atoi(argv[4]));
@@ -1357,6 +1989,18 @@ int main(int argc, char **argv) {
     capture_owned();
   else if (!strcmp(argv[2], "capture-race"))
     capture_race();
+  else if (!strcmp(argv[2], "projection"))
+    projection_lifecycle();
+  else if (!strcmp(argv[2], "projection-faults"))
+    projection_faults();
+  else if (!strcmp(argv[2], "projection-recovery"))
+    projection_recovery();
+  else if (!strcmp(argv[2], "projection-threads"))
+    projection_threads();
+  else if (!strcmp(argv[2], "projection-boundaries"))
+    projection_boundaries();
+  else if (!strcmp(argv[2], "projection-pressure"))
+    projection_pressure();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();

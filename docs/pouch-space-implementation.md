@@ -6140,3 +6140,116 @@ it must not import application changes from inside an allowance helper after
 its caller has captured lookup/capacity inputs. Checkpoint adoption, application
 journal replay and shared readiness/durability remain unfinished, together with
 the shared qualification requirements listed above. The full goal stays active.
+
+## Live checkpoint projection adoption
+
+`ps_refresh` now adopts a peer's selected checkpoint under the local allocator
+mutex and container allocation authority. New shared captures perform the same
+reconciliation before selecting their handles. Unchanged checkpoints retain the
+small root/journal observation path, and identity-only grants advance the
+observed frontier without widening the participant's private token range.
+Journal-only application changes and unknown/incomplete changed prefixes still
+return `PENDING`; adoption does not silently incorporate an unapplied frame.
+The allocator's late allowance helpers remain observers, so they cannot change
+an application projection after their caller captured lookup/capacity inputs.
+
+Adoption constructs and validates a replacement directory, descriptor graph,
+owned mapping metadata, catalog index and physical free projection before
+installation. Metadata allocation follows actual selected records/pages. A
+temporary cache reads each checked descriptor page once despite directory and
+descriptor ordering differences; it contains no application values and is
+discarded after adoption. The 350-key fixture drops from roughly 256 I/O
+operations without that cache to 27--28, including its retirement barrier, with
+zero reads of its monitored large value. No warm value CRC scan or full-message
+buffer is introduced. Mapping tables retain their existing bounded codec reads.
+
+Continuously private producer ranges, unspent payload pools, protected metadata
+workspace and retained payload witnesses overlay that projection before it can
+allocate. Unpinned old canonical ranges are never blindly freed: a peer may
+already have repurposed them. Captured incarnations that remain selected reuse
+their original entry objects and immutable arrays/names. Only canonical links
+and mutex-protected fields change; even a same-value assignment to a reader's
+immutable fields would be a race. Captured removed/replaced entries remain
+retired and witnessed until last close. Local unjournaled head tails survive a
+peer's older structural hint and remain dirty for a later checkpoint. Budget
+handles, spending counters and local incarnation endpoints survive adoption.
+
+New workspace is staged separately and relinquished after healthy preparation
+failure. Uncertain releases poison admission and retain residual authority until
+FD close. Installation itself neither allocates nor performs file I/O. It does
+not manufacture a shared durable-completion watermark. A paused grant producer
+continues after unrelated checkpoint adoption; if its head was retired during
+preparation, it fails cleanly before journaling an invalid grant.
+
+A changed checkpoint has one structural adoption barrier. A peer may die after
+writing the new root, or after zeroing the obsolete sibling without completing
+its final barrier. Even apparently zero sibling bytes therefore need
+stabilization before their ranges become reusable. Nonzero obsolete headers are
+retired first. Same-generation and identity-only refreshes add no barrier.
+Avoiding the normal completed-peer checkpoint's duplicate barrier requires a
+proven shared completion certificate, which remains part of shared readiness
+work rather than an assumption made by this observer.
+
+Six new groups cover 350-key bucket collisions and complete metadata lookup
+checks, retained readers/vectors/catalogs/owned runs, repeated peer checkpoints,
+private allocation after adoption, bidirectional publication, local tail hints,
+and a 1 MiB peer growth step. They fault all 35 allocation and seven I/O sites
+measured by the adoption fixture, plus authority acquisition/release, foreign
+queries, partial workspace acquisition and failed rollback. Two exec/SIGKILL
+cases abandon checkpoint publication before its second or third barrier. A
+threaded case reads captured bytes while repeatedly adopting and while a grant
+producer is paused outside allocator authority. Its retirement variant proves
+clean cancellation of that producer. The pressure case leaves only maintenance
+capacity unclaimed and rejects ordinary reuse of an unfinished funded producer.
+
+Qualification passes 64 broader Debug/GNU/musl groups, plus the added pressure
+regression on each configuration. GNU and musl also pass the strict 96-case
+lease-capacity matrix and 48 attachment windows: 65 affected groups on Debug and
+67 each on release. Seven raw TSan profiles pass with instrumented OpenSSL 3.6.5
+and constrained workers. Seven raw strict Memcheck profiles pass with 47,192
+matching allocations/frees, zero remaining heap/errors/suppressions, and three
+inherited descriptors each. Three native negative controls detect removal of
+retirement stabilization, private-range overlays or descriptor caching. A
+fourth control restores the rejected whole-entry copy and produces the expected
+TSan race against `ps_read_at`. The broad fixture initially did not force the
+omitted-range allocation; the dedicated pressure case closes that test gap.
+
+Matched GNU measurements use frozen `7a73f043`, current native and multifile,
+10 MiB roots, normal release stacks and three alternating samples. All 36 runs
+verify reopened results. Native before/after medians, milliseconds (each phase
+is independently summarized):
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 61.18 / 87.49 | 663.99 / 622.16 | 80.95 / 79.32 | 1265.06 / 1161.13 |
+| Work | 54.17 / 59.29 | 654.96 / 615.96 | 72.41 / 69.60 | 1257.95 / 1154.49 |
+| Work CPU | 15.53 / 15.67 | 45.36 / 45.09 | 46.68 / 43.14 | 119.56 / 127.80 |
+| Maximum mutation worker | 27.81 / 37.66 | 632.00 / 598.44 | 49.33 / 45.83 | 1242.62 / 1137.47 |
+| Maximum worker index flush | 25.67 / 21.21 | 20.15 / 17.21 | 29.12 / 23.48 | 19.14 / 17.05 |
+| Maintenance | 7.15 / 7.81 | 6.94 / 7.92 | 6.83 / 7.00 | 7.10 / 6.63 |
+| Close | 0.316 / 0.311 | 0.236 / 0.434 | 0.629 / 0.740 | 0.607 / 0.819 |
+| Reopen alone | 3.84 / 3.98 | 4.66 / 3.66 | 4.48 / 4.42 | 4.99 / 4.41 |
+
+Exclusive wider NoSync traces retain three `fcntl` calls before/after;
+maintenance retains three barriers. Small NoSync work rises about 9%, wider
+NoSync work falls about 4%, and durable work falls about 6%/8% in these samples.
+These mixed measurements prove neither general nonregression nor complete
+shared-mode performance. Native NoSync indexed work remains 2.4--2.8 times
+multifile's 21.17/29.05 ms. Reference close is 44.13/57.74 ms versus native
+0.311/0.740 ms; it cannot compensate for the foreground/readiness gap. Shared
+adoption measurements cover only this bounded metadata fixture.
+
+Evidence is in ignored `build/pouch-space-projection/`: `qualified-*.log`,
+`pressure-*.log`, `projection-pressure-*.log`, `projection-debug.log`,
+`tsan-*.log`, `memcheck-*.log`, `negative-controls.log`, `no-*.log`,
+`unsafe-full-copy-tsan.log`, `performance.log`, `performance-summary.tsv` and
+`fcntl-{baseline,current}.log`. Native runners, the rejected control sources,
+the weak-control observation, and the frozen baseline/checksum remain alongside
+them.
+
+This lands live physical checkpoint reconciliation. Application journal replay,
+revision-entry integration for mutations, shared readiness/durability, logical
+cache/owner coordination and global forecast-capacity qualification remain
+before normal shared admission. The full goal remains active. Multifile remains
+the default/reference, and performance acceptance and deployment cutover remain
+explicit unfinished decisions.
