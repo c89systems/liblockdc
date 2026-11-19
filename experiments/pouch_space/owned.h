@@ -28,6 +28,11 @@ typedef struct ps_owned_status {
  * claim. */
 int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
+/* Shared canonical stream views can overlap during staged cache replacement.
+ * All their byte and mapping mutations use the same edit guard. */
+int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
+                          const ps_ref *, ps_owned_head **, ps_owned_status *,
+                          lc_error *);
 void ps_owned_close(ps_owned_head *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
 /* Check a head's current selection when admitting a new read window. A

@@ -57,8 +57,8 @@ int ps_coordination_shared(const ps_coordination *);
  * Sync leadership uses byte 5; never wait for it while holding allocation.
  * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
- * Stream incarnations use a disjoint set of stripes. Stream guards are
- * nonblocking (wait=0) and may be released by a different thread.
+ * Stream incarnations use disjoint stripes and require wait=0. Namespace
+ * and stream guards may be released by a different thread.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
  * finish while another guard waits.
@@ -67,7 +67,7 @@ int ps_coordination_shared(const ps_coordination *);
 int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
-/* Except for stream guards, release on the acquiring thread. An uncertain
+/* Release fixed guards on the acquiring thread. An uncertain
  * kernel unlock poisons the owner; further acquisition fails until
  * close/reopen. Cleanup remains legal.
  */

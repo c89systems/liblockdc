@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, private payload and checkpoint workspace claims, live checkpoint and journal adoption, and [guarded stream handoff](#shared-stream-edit-and-recovery-handoff) | Shared capacity forecasts, namespace and collection authority and cache coherence, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, guarded stream takeover, and [container namespace handoff](#container-namespace-ownership-handoff) | Shared capacity forecasts, SDK logical projection and collection authority, cross-peer source liveness, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6576,3 +6576,62 @@ acceptance remain open. The frozen baseline and results are in
 Namespace and collection owners still need cross-process logical authority
 and cache revalidation before shared SDK admission. Stream edit authority
 protects the boundaries used by that integration.
+
+## Container namespace ownership handoff
+
+The shared container namespace holds a name-keyed OFD guard through canonical
+admission, append and metadata selection, and cleanup. The same guard protects
+namespace identity creation, snapshot selection, retention updates, and the
+final liveness check for a piece replacement. Namespace guards permit
+cross-thread release, with their wait state allocated only for keyed guards.
+A held namespace can defer another participant's fresh admission to that name
+while work in a different namespace proceeds.
+
+A checked live journal record stamps the writer's incarnation grant on the
+immutable namespace catalog entry. A participant can reuse its validated
+cache while the writer stamp and checkpoint generation agree. Handoff stages
+the selected routing, source bindings, stream tails, and key checkpoint
+together. The replacement installs after validation, including canonical
+recovery of the active stream. A failed stage leaves existing captures usable
+and forces revalidation on retry. Interned labels and the namespace handle
+retain their lifetime through replacement. Guarded stream views can overlap
+locally while old captured windows retain their exact mappings.
+
+The shared cache rebuilds on handoff and after a checkpoint generation change.
+Fresh namespace snapshot capture holds the name guard through selection and
+pin acquisition. Physical catalog mutation also reconciles the selected
+projection before testing expected references and publishing changes.
+
+All 84 affected groups passed on Debug, GNU release, and musl release. Both
+shared namespace cases passed on each final build. Three ThreadSanitizer and
+three strict Memcheck profiles passed. The handoff fixture covers both
+durability policies, contention, independent namespace progress, an injected
+reload allocation failure, same-segment updates, rotation, checkpoint slot
+selection, and a pinned value across replacement. The process-death fixture
+leaves a complete candidate record in an unpublished successor, then verifies
+that the surviving owner keeps the old route and can reuse the abandoned
+successor. That fixture reexecs the test binary through its invocation path so
+it also works under Memcheck.
+
+All 36 matched GNU lifecycle runs verified reopened results. The figures are
+median milliseconds for `99509965` native / current native / multifile.
+The two 10 MiB profiles use two rounds of streamed mutations.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 42.69 / 42.13 / 15.30 | 494.25 / 461.89 / 391.42 | 66.52 / 66.81 / 26.81 | 992.43 / 978.15 / 1245.66 |
+| Maximum worker index flush | 16.52 / 16.15 / 1.03 | 14.67 / 12.10 / 0.94 | 22.43 / 25.19 / 2.13 | 18.73 / 16.48 / 3.25 |
+| Maintenance | 5.92 / 5.65 / 0.25 | 6.09 / 9.55 / 0.19 | 5.95 / 6.21 / 0.35 | 6.19 / 6.64 / 0.58 |
+| Close | 0.28 / 0.28 / 29.25 | 0.27 / 0.26 / 27.14 | 0.55 / 0.64 / 59.73 | 0.58 / 0.68 / 56.28 |
+| Reopen | 2.93 / 3.09 / 0.93 | 3.21 / 4.67 / 0.74 | 4.26 / 4.89 / 1.70 | 5.36 / 5.12 / 1.44 |
+
+The SDK timings use exclusive admission. Native ordinary NoSync work is
+about 2.5 to 2.8 times multifile in these samples. Ordinary index flushes
+have different canonical durability boundaries. Logs and the frozen baseline
+are in `build/pouch-space-namespace-handoff/`.
+
+Normal shared SDK admission still requires the logical per-key projection to
+revalidate under namespace authority across decisions and publication,
+including lease, queue, and transaction checks. Peer liveness of body sources
+referenced by older metadata views, collection authority, capacity under
+shared pressure, and shared throughput remain open.

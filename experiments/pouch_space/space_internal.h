@@ -27,7 +27,8 @@ enum ps_event {
   PS_RESERVE_IDS,
   PS_SEAL,
   PS_STREAM_TAIL,
-  PS_STREAM_OWNER
+  PS_STREAM_OWNER,
+  PS_NAMESPACE_OWNER
 };
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
@@ -48,7 +49,7 @@ typedef struct ps_entry {
   uint64_t
       peer_sequence; /* imported visibility uses the certified wire clock */
   uint64_t stream_capacity, stream_runs, stream_ready, stream_wire;
-  uint64_t stream_owner, stream_owner_generation;
+  uint64_t writer_stamp, writer_generation;
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */
   int owned_mapped;
@@ -59,7 +60,8 @@ typedef struct ps_entry {
   size_t range_count;
   struct ps_entry *owned_first, *owned_last, *owned_prev, *owned_next;
   int owned_linked;
-  int stream_open, stream_sealed, orphan_claimed;
+  size_t stream_handles;
+  int stream_guarded, stream_sealed, orphan_claimed;
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
   int payload_claimed;
@@ -201,6 +203,9 @@ int ps_internal_healthy(ps_space *, lc_error *);
 int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
 int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
                             lc_error *);
+/* Caller holds the namespace-name guard while checking and claiming its
+ * immutable catalog owner's writer stamp. */
+int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);
 int ps_internal_entry_pin(ps_space *, ps_entry *, lc_error *);
 void ps_internal_entry_unpin(ps_space *, ps_entry *);
 int ps_internal_allocation_begin(ps_space *, ps_coordination_guard **,

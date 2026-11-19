@@ -27,7 +27,11 @@ static int select_guarded(void *context, lc_error *e) {
   repack_selection *s = context;
   struct ps_namespace_data *d = s->data;
   ps_ns_resource *r = s->source;
-  int rc;
+  int shared =
+      ps_coordination_shared(ps_space_coordination(d->ns->root->space));
+  int rc = shared ? ps_ns_enter(d, e) : LC_OK;
+  if (rc != LC_OK)
+    return rc;
   pthread_mutex_lock(&d->mutex);
   rc = d->views || ps_ns_find(d, r->kind, r->id) != r
            ? busy(e)
@@ -35,6 +39,8 @@ static int select_guarded(void *context, lc_error *e) {
                                              s->epoch, s->publish,
                                              s->publication, e);
   pthread_mutex_unlock(&d->mutex);
+  if (shared)
+    ps_ns_leave(d);
   return rc;
 }
 static int select_piece(void *context, ps_piece_publish_fn publish,

@@ -30,7 +30,9 @@ struct ps_namespace_data {
   uint64_t active, tail, pending_seal;
   ps_key_checkpoint *checkpoint;
   ps_checkpoint_observer checkpoint_observer;
+  ps_coordination_guard *edit;
   int busy, checkpoint_ready;
+  int shared_valid;
   int retention_loaded, retention_present;
   ps_budget *retention_budget;
   const void *conversion;

@@ -1321,8 +1321,9 @@ static void collect(ps_space *s) {
 static size_t event_bytes(const ps_entry *p, int event) {
   return event == PS_PUT || event == PS_SEAL ? entry_bytes(p) : 64;
 }
-static int stream_hint(uint32_t event) {
-  return event == PS_STREAM_TAIL || event == PS_STREAM_OWNER;
+static int live_hint(uint32_t event) {
+  return event == PS_STREAM_TAIL || event == PS_STREAM_OWNER ||
+         event == PS_NAMESPACE_OWNER;
 }
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
@@ -1336,7 +1337,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
   put64(wire + 24, p->key.owner);
   put64(wire + 32, p->key.key);
   put64(wire + 40, p->token);
-  if (stream_hint((uint32_t)event))
+  if (live_hint((uint32_t)event))
     put64(wire + 48, p->bytes);
   if (event == PS_PUT || event == PS_SEAL) {
     put64(wire + 48, p->bytes);
@@ -2553,7 +2554,7 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
     return err(error, LC_ERR_INVALID,
                "container publication sequence exhausted");
   wire =
-      stream_hint((uint32_t)event)
+      live_hint((uint32_t)event)
           ? hint_frame
           : lc_alloc_with_allocator(NULL, bytes + (s->journal_image ? 64 : 0));
   if (!wire)
@@ -3172,28 +3173,30 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
 }
 /* Neither a ready tail nor its writer stamp grants cold recovery authority.
  * Canonical recovery still validates any suffix beyond its checkpoint. */
-static int apply_stream_hint(ps_space *s, const unsigned char *wire,
-                             size_t bytes, int select, lc_error *error) {
+static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
+                           int select, lc_error *error) {
   ps_key key;
   ps_entry *head;
   uint64_t value = get64(wire + 48);
-  int owner = get32(wire + 20) == PS_STREAM_OWNER;
+  uint32_t event = get32(wire + 20);
   key.kind = get32(wire + 16);
   key.owner = get64(wire + 24);
   key.key = get64(wire + 32);
-  if (bytes != 64 || key.kind != PS_STREAM || get32(wire + 56) ||
-      get32(wire + 60) != checksum(wire, 60))
-    return err(error, LC_ERR_PROTOCOL, "invalid owned stream hint");
+  if (bytes != 64 || get32(wire + 56) || get32(wire + 60) != checksum(wire, 60))
+    return err(error, LC_ERR_PROTOCOL, "invalid live owner hint");
   head = lookup(s, key);
-  if (!head || head->deleted || head->stream_sealed ||
-      head->token != get64(wire + 40))
-    return err(error, LC_ERR_PROTOCOL, "owned stream hint does not match head");
-  if (owner) {
+  if (!head || head->deleted || head->token != get64(wire + 40) ||
+      (event == PS_NAMESPACE_OWNER
+           ? key.kind != PS_CATALOG || key.owner || !head->catalog ||
+                 head->catalog->kind != PS_CATALOG_NAMESPACE
+           : key.kind != PS_STREAM || head->stream_sealed))
+    return err(error, LC_ERR_PROTOCOL, "live owner hint does not match head");
+  if (event != PS_STREAM_TAIL) {
     if (!value || value > s->token_limit || value % TOKEN_RANGE)
       return err(error, LC_ERR_PROTOCOL, "invalid owned stream writer stamp");
     if (select) {
-      head->stream_owner = value;
-      head->stream_owner_generation = s->generation;
+      head->writer_stamp = value;
+      head->writer_generation = s->generation;
     }
   } else if (value < head->bytes || value > head->stream_capacity)
     return err(error, LC_ERR_PROTOCOL, "owned tail outside granted range");
@@ -3219,8 +3222,8 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   if (certified <= s->sequence || !count || count > certified - s->sequence ||
       get64(wire + 8) != s->sequence + 1)
     return err(error, LC_ERR_PROTOCOL, "invalid certified journal framing");
-  if (!group && stream_hint(get32(wire + 20))) {
-    rc = apply_stream_hint(s, wire, bytes, 1, error);
+  if (!group && live_hint(get32(wire + 20))) {
+    rc = apply_live_hint(s, wire, bytes, 1, error);
     if (rc == LC_OK)
       ++s->sequence;
     return rc;
@@ -3558,10 +3561,10 @@ static int recover(ps_space *s, lc_error *error) {
       cursor += bytes;
       continue;
     }
-    if (stream_hint(get32(wire + cursor + 20))) {
+    if (live_hint(get32(wire + cursor + 20))) {
       if (certificate.root && s->sequence >= certificate.ready)
         break; /* An abandoned live hint must not become certified on open. */
-      rc = apply_stream_hint(
+      rc = apply_live_hint(
           s, wire + cursor, bytes,
           certificate.root && s->sequence >= certificate.origin, error);
       if (rc != LC_OK) {
@@ -3863,14 +3866,14 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       dest->catalog_refs = q->catalog_refs;
       dest->catalog_release = 0;
       dest->owned_linked = q->owned_linked;
+      dest->writer_stamp = q->writer_stamp;
+      dest->writer_generation = q->writer_generation;
       if (dest->key.kind == PS_STREAM) {
         dest->stream_capacity = q->stream_capacity;
         dest->stream_runs = q->stream_runs;
         dest->stream_storage = q->stream_storage;
         dest->stream_sealed = q->stream_sealed;
         dest->stream_wire = q->stream_wire;
-        dest->stream_owner = q->stream_owner;
-        dest->stream_owner_generation = q->stream_owner_generation;
         dest->bytes = q->bytes;
       }
     }
@@ -5637,9 +5640,9 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->sealed = head->entry->stream_sealed;
   out->retired = head->entry->deleted;
 }
-int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
-                  const ps_ref *ref, ps_owned_head **out,
-                  ps_owned_status *status, lc_error *error) {
+static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
+                      const ps_ref *ref, int guarded, ps_owned_head **out,
+                      ps_owned_status *status, lc_error *error) {
   ps_owned_head *head;
   ps_coordination_guard *guard;
   ps_entry *p = NULL, *old;
@@ -5649,6 +5652,7 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     *out = NULL;
   if (!s || !out || !status || key.kind != PS_STREAM || (create && ref))
     return err(error, LC_ERR_INVALID, "owned stream open arguments invalid");
+  guarded = guarded && s->readiness;
   head = lc_calloc_with_allocator(NULL, 1, sizeof(*head));
   if (!head)
     return err(error, LC_ERR_NOMEM, "cannot allocate owned stream handle");
@@ -5689,7 +5693,8 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   }
   if (!create)
     p = lookup(s, key);
-  if (rc == LC_OK && (!p || p->deleted || p->stream_open))
+  if (rc == LC_OK && (!p || p->deleted ||
+                      (p->stream_handles && (!guarded || !p->stream_guarded))))
     rc = err(error, LC_ERR_INVALID,
              "owned stream missing or already has an open owner");
   if (rc == LC_OK && ref &&
@@ -5698,7 +5703,8 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK) {
     head->space = s;
     head->entry = p;
-    p->stream_open = 1;
+    p->stream_guarded = guarded;
+    ++p->stream_handles;
     ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
@@ -5716,14 +5722,24 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     lc_free_with_allocator(NULL, head);
   return rc;
 }
+int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
+                  const ps_ref *ref, ps_owned_head **out,
+                  ps_owned_status *status, lc_error *error) {
+  return owned_open(s, budget, key, create, ref, 0, out, status, error);
+}
+int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
+                          int create, const ps_ref *ref, ps_owned_head **out,
+                          ps_owned_status *status, lc_error *error) {
+  return owned_open(s, budget, key, create, ref, 1, out, status, error);
+}
 void ps_owned_close(ps_owned_head *head) {
   ps_space *s;
   if (!head)
     return;
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  head->entry->stream_open = 0;
-  head->entry->orphan_claimed = 0;
+  if (!--head->entry->stream_handles)
+    head->entry->orphan_claimed = 0;
   ps_internal_entry_unpin(s, head->entry);
   --s->readers;
   if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
@@ -5769,6 +5785,46 @@ int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
   }
   return rc;
 }
+static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
+                              int *continued, lc_error *error) {
+  ps_entry stamp;
+  int rc;
+  *continued =
+      p->writer_generation == s->generation && p->writer_stamp == s->token_end;
+  if (*continued)
+    return LC_OK;
+  memset(&stamp, 0, sizeof(stamp));
+  stamp.key = p->key;
+  stamp.token = p->token;
+  stamp.bytes = s->token_end;
+  rc = append_event_locked(s, &stamp, event, error);
+  if (rc == LC_OK) {
+    p->writer_stamp = s->token_end;
+    p->writer_generation = s->generation;
+  }
+  return rc;
+}
+int ps_internal_namespace_stamp(ps_space *s, uint64_t identity, int *continued,
+                                lc_error *error) {
+  ps_key key = {0, 0, PS_CATALOG};
+  ps_entry *p;
+  ps_coordination_guard *allocator;
+  int rc;
+  key.key = identity;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &allocator, error);
+  if (rc == LC_OK) {
+    p = lookup(s, key);
+    if (!p || p->deleted || !p->catalog ||
+        p->catalog->kind != PS_CATALOG_NAMESPACE)
+      rc = err(error, LC_ERR_PROTOCOL, "namespace writer has no catalog owner");
+    else
+      rc = claim_writer_stamp(s, p, PS_NAMESPACE_OWNER, continued, error);
+  }
+  rc = allocation_end(s, allocator, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_owned_edit_begin(ps_owned_head *head, ps_coordination_guard **edit,
                         ps_owned_status *status, int *continued,
                         lc_error *error) {
@@ -5787,20 +5843,10 @@ int ps_owned_edit_begin(ps_owned_head *head, ps_coordination_guard **edit,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &allocator, error);
   if (rc == LC_OK) {
-    *continued = p->stream_owner_generation == s->generation &&
-                 p->stream_owner == s->token_end;
-    if (!*continued && !p->deleted && !p->stream_sealed) {
-      ps_entry stamp;
-      memset(&stamp, 0, sizeof(stamp));
-      stamp.key = p->key;
-      stamp.token = p->token;
-      stamp.bytes = s->token_end;
-      rc = append_event_locked(s, &stamp, PS_STREAM_OWNER, error);
-      if (rc == LC_OK) {
-        p->stream_owner = s->token_end;
-        p->stream_owner_generation = s->generation;
-      }
-    }
+    if (!p->deleted && !p->stream_sealed)
+      rc = claim_writer_stamp(s, p, PS_STREAM_OWNER, continued, error);
+    else
+      *continued = 0;
     if (rc == LC_OK)
       owned_status(head, status);
   }

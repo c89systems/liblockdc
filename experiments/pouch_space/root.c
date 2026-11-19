@@ -272,12 +272,35 @@ static int index_room(ps_root *root, lc_error *error) {
   root->capacity = capacity;
   return LC_OK;
 }
+int ps_namespace_guard(ps_namespace *ns, ps_coordination_guard **guard,
+                       lc_error *error) {
+  ps_coordination *coordination = ps_space_coordination(ns->root->space);
+  *guard = NULL;
+  return ps_coordination_shared(coordination)
+             ? ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE,
+                                    ns->hash, 0, guard, error)
+             : LC_OK;
+}
+int ps_namespace_unguard(ps_namespace *ns, ps_coordination_guard *guard, int rc,
+                         lc_error *error) {
+  if (guard) {
+    ps_coordination_unlock(guard);
+    if (ps_check(ns->root->space, NULL) != LC_OK) {
+      lc_error_cleanup(error);
+      return ps_check(ns->root->space, error);
+    }
+  }
+  return rc;
+}
 static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
   ps_catalog_view *view = NULL;
   ps_catalog_info binding;
+  ps_coordination_guard *guard;
   size_t i;
-  int rc = ps_catalog_get(ns->root->space, 0, PS_CATALOG_NAMESPACE, ns->name,
-                          strlen(ns->name), &view, error);
+  int rc = ps_namespace_guard(ns, &guard, error);
+  if (rc == LC_OK)
+    rc = ps_catalog_get(ns->root->space, 0, PS_CATALOG_NAMESPACE, ns->name,
+                        strlen(ns->name), &view, error);
   if (rc == LC_OK && view)
     rc = ps_catalog_view_info(view, &binding, error);
   else if (rc == LC_OK && !create)
@@ -287,6 +310,7 @@ static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
     rc = ps_catalog_create_namespace(ns->root->space, ns->name,
                                      strlen(ns->name), &binding, error);
   ps_catalog_view_close(view);
+  rc = ps_namespace_unguard(ns, guard, rc, error);
   if (rc != LC_OK)
     return rc;
   if (!binding.id || binding.revision.incarnation != binding.id ||

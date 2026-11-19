@@ -19,9 +19,13 @@ struct ps_coordination_guard {
   pthread_mutex_t mutex;
   uint64_t offset;
   size_t users;
-  int fixed, stream, held;
+  int fixed, held;
   struct ps_coordination_guard *next;
 };
+typedef struct ps_keyed_guard {
+  ps_coordination_guard guard;
+  pthread_cond_t available;
+} ps_keyed_guard;
 struct ps_coordination {
   int fd, shared, poisoned;
   int *failure_flag;
@@ -220,6 +224,7 @@ static void drop(ps_coordination_guard *guard) {
         link = &(*link)->next;
       *link = guard->next;
       pthread_mutex_unlock(&owner->registry);
+      pthread_cond_destroy(&((ps_keyed_guard *)guard)->available);
       pthread_mutex_destroy(&guard->mutex);
       lc_free_with_allocator(&owner->allocator, guard);
     } else
@@ -230,6 +235,7 @@ static void drop(ps_coordination_guard *guard) {
 static int dynamic_guard(ps_coordination *owner, uint64_t identity, int stream,
                          ps_coordination_guard **out, lc_error *e) {
   ps_coordination_guard *guard, *candidate;
+  ps_keyed_guard *keyed;
   uint64_t offset;
   size_t bucket;
   int rc;
@@ -249,20 +255,26 @@ static int dynamic_guard(ps_coordination *owner, uint64_t identity, int stream,
       return LC_OK;
     }
   pthread_mutex_unlock(&owner->registry);
-  candidate =
-      lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*candidate));
-  if (!candidate) {
+  keyed = lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*keyed));
+  if (!keyed) {
     return fail(e, LC_ERR_NOMEM, 0, "cannot allocate keyed coordination guard");
   }
+  candidate = &keyed->guard;
   candidate->owner = owner;
   candidate->offset = offset;
   candidate->users = 1;
-  candidate->stream = stream;
   rc = pthread_mutex_init(&candidate->mutex, NULL);
   if (rc) {
     lc_free_with_allocator(&owner->allocator, candidate);
     return fail(e, LC_ERR_TRANSPORT, rc,
                 "cannot initialize keyed coordination");
+  }
+  rc = pthread_cond_init(&keyed->available, NULL);
+  if (rc) {
+    pthread_mutex_destroy(&candidate->mutex);
+    lc_free_with_allocator(&owner->allocator, candidate);
+    return fail(e, LC_ERR_TRANSPORT, rc,
+                "cannot initialize keyed coordination waiters");
   }
   pthread_mutex_lock(&owner->registry);
   for (guard = owner->buckets[bucket]; guard; guard = guard->next)
@@ -278,6 +290,7 @@ static int dynamic_guard(ps_coordination *owner, uint64_t identity, int stream,
   }
   pthread_mutex_unlock(&owner->registry);
   if (candidate) {
+    pthread_cond_destroy(&keyed->available);
     pthread_mutex_destroy(&candidate->mutex);
     lc_free_with_allocator(&owner->allocator, candidate);
   }
@@ -302,19 +315,21 @@ static int kernel_lock(ps_coordination_guard *guard, int acquire, int wait) {
 static int local_lock(ps_coordination_guard *guard, int wait) {
   int rc = wait ? pthread_mutex_lock(&guard->mutex)
                 : pthread_mutex_trylock(&guard->mutex);
-  if (!rc && guard->stream) {
-    if (guard->held)
-      rc = EBUSY;
-    else
+  if (!rc && !guard->fixed) {
+    ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
+    while (!rc && guard->held)
+      rc = wait ? pthread_cond_wait(&keyed->available, &guard->mutex) : EBUSY;
+    if (!rc)
       guard->held = 1;
     pthread_mutex_unlock(&guard->mutex);
   }
   return rc;
 }
 static void local_unlock(ps_coordination_guard *guard) {
-  if (guard->stream) {
+  if (!guard->fixed) {
     pthread_mutex_lock(&guard->mutex);
     guard->held = 0;
+    pthread_cond_signal(&((ps_keyed_guard *)guard)->available);
   }
   pthread_mutex_unlock(&guard->mutex);
 }

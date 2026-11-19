@@ -115,8 +115,11 @@ int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;
   unsigned char bytes[32];
   ps_writer *writer = NULL;
-  int rc = ps_ns_data_get(ns, &d, e);
+  int shared, rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
+    return rc;
+  shared = ps_coordination_shared(ps_space_coordination(ns->root->space));
+  if (shared && (rc = ps_ns_enter(d, e)) != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
   rc = retention_cached(d, e);
@@ -136,6 +139,8 @@ int ps_namespace_retention_hint_ensure(ps_namespace *ns, lc_error *e) {
       d->retention_present = 1;
   }
   pthread_mutex_unlock(&d->mutex);
+  if (shared)
+    ps_ns_leave(d);
   return rc;
 }
 #define WORK_HEADER 80U
@@ -407,7 +412,7 @@ int ps_namespace_retention_work_store(ps_namespace *ns,
   unsigned char *header = captured.header;
   size_t length = 0;
   unsigned int future;
-  int same = 0, rc;
+  int same = 0, shared, rc;
   if (!work || work->phase < LC_POUCH_RETENTION_IDLE ||
       work->phase > LC_POUCH_RETENTION_FINISHED)
     return failure(e, LC_ERR_INVALID, "invalid retention work phase");
@@ -418,6 +423,9 @@ int ps_namespace_retention_work_store(ps_namespace *ns,
   }
   rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
+    return rc;
+  shared = ps_coordination_shared(ps_space_coordination(ns->root->space));
+  if (shared && (rc = ps_ns_enter(d, e)) != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
   rc = retention_cached(d, e);
@@ -495,12 +503,17 @@ int ps_namespace_retention_work_store(ps_namespace *ns,
     }
   }
   pthread_mutex_unlock(&d->mutex);
+  if (shared)
+    ps_ns_leave(d);
   return rc;
 }
 int ps_namespace_retention_hint_remove(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;
-  int rc = ps_ns_data_get(ns, &d, e);
+  int shared, rc = ps_ns_data_get(ns, &d, e);
   if (rc != LC_OK)
+    return rc;
+  shared = ps_coordination_shared(ps_space_coordination(ns->root->space));
+  if (shared && (rc = ps_ns_enter(d, e)) != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
   /* Retire identity before discovery. Stale progress only names its old
@@ -515,5 +528,7 @@ int ps_namespace_retention_hint_remove(ps_namespace *ns, lc_error *e) {
     d->retention_present = 0;
   }
   pthread_mutex_unlock(&d->mutex);
+  if (shared)
+    ps_ns_leave(d);
   return rc;
 }

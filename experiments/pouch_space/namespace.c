@@ -4,6 +4,7 @@
 #include "namespace_internal.h"
 #include "record_io.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
@@ -117,11 +118,15 @@ int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
   ps_writer_close(writer);
   return rc;
 }
+typedef struct source_load {
+  struct ps_namespace_data *candidate, *previous;
+} source_load;
 static int collect_resource(void *context, const void *name, size_t length,
                             const ps_catalog_info *binding,
                             unsigned int expected_kind, lc_error *e) {
-  struct ps_namespace_data *d = context;
-  segment *s;
+  source_load *load = context;
+  struct ps_namespace_data *d = load->candidate;
+  segment *s, *old;
   uint64_t id;
   unsigned int kind;
   char leaf[PS_NS_LEAF_BYTES];
@@ -144,8 +149,15 @@ static int collect_resource(void *context, const void *name, size_t length,
   if (!s)
     return LC_ERR_NOMEM;
   d->items[d->count++] = s;
-  s->label->next = d->labels;
-  d->labels = s->label;
+  old = load->previous ? ps_ns_find(load->previous, kind, id) : NULL;
+  if (old) {
+    lc_free_with_allocator(NULL, s->label);
+    s->label = old->label;
+    s->leaf = old->leaf;
+  } else {
+    s->label->next = d->labels;
+    d->labels = s->label;
+  }
   s->pooled = 1;
   s->binding = *binding;
   return LC_OK;
@@ -262,13 +274,9 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   pthread_mutex_destroy(&d->mutex);
   lc_free_with_allocator(NULL, d);
 }
-static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
+static int allocate_data(ps_namespace *ns, struct ps_namespace_data **out,
+                         lc_error *e) {
   struct ps_namespace_data *d;
-  ps_stream_info info;
-  ps_checkpoint_info coverage = {0};
-  size_t i;
-  uint64_t seen = 0;
-  int rc;
   d = lc_calloc_with_allocator(NULL, 1, sizeof(*d));
   if (!d)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace storage owner");
@@ -277,6 +285,22 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
     lc_free_with_allocator(NULL, d);
     return failure(e, LC_ERR_TRANSPORT, "cannot initialize namespace mutex");
   }
+  *out = d;
+  return LC_OK;
+}
+static int load(ps_namespace *ns, struct ps_namespace_data *previous,
+                struct ps_namespace_data **out, lc_error *e) {
+  struct ps_namespace_data *d;
+  source_load sources;
+  ps_stream_info info;
+  ps_checkpoint_info coverage = {0};
+  size_t i;
+  uint64_t seen = 0;
+  int rc = allocate_data(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  sources.candidate = d;
+  sources.previous = previous;
   rc = head_read(d, e);
   if (rc == LC_OK)
     rc = ps_ns_retention_restore(d, e);
@@ -289,10 +313,10 @@ static int load(ps_namespace *ns, struct ps_namespace_data **out, lc_error *e) {
                  "checkpoint coverage exceeds namespace head");
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
-                          PS_CATALOG_SEGMENT, collect_segment, d, e);
+                          PS_CATALOG_SEGMENT, collect_segment, &sources, e);
   if (rc == LC_OK)
     rc = ps_catalog_visit(ns->root->space, ns->identity.owner, PS_CATALOG_BODY,
-                          collect_body, d, e);
+                          collect_body, &sources, e);
   if (rc == LC_OK && d->count)
     qsort(d->items, d->count, sizeof(*d->items), compare_segment);
   for (i = 0; rc == LC_OK && i < d->count; ++i) {
@@ -406,8 +430,79 @@ int ps_namespace_sources_visit(ps_namespace *ns, ps_namespace_source_fn visit,
   return rc;
 }
 
-int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
-                   lc_error *e) {
+/* A namespace's address, labels, and captured views survive a handoff.
+ * Replace only the canonical owner cache after validation succeeds. */
+static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
+  struct ps_namespace_data *fresh = NULL;
+  ps_ns_label **labels;
+  ps_ns_resource **items;
+  ps_key_checkpoint *checkpoint;
+  ps_budget *retention_budget;
+  size_t i, count;
+  int rc;
+  d->shared_valid = 0;
+  for (i = 0; i < d->count; ++i)
+    if (d->items[i]->repacking)
+      return failure(e, LC_ERR_PENDING, "namespace mapping is being replaced");
+  rc = load(d->ns, d, &fresh, e);
+  if (rc == LC_OK && d->checkpoint_observer.prepare)
+    rc = ps_key_checkpoint_observe(fresh->checkpoint, &d->checkpoint_observer,
+                                   e);
+  if (rc != LC_OK) {
+    ps_namespace_data_destroy(fresh);
+    return rc;
+  }
+  items = d->items;
+  count = d->count;
+  checkpoint = d->checkpoint;
+  retention_budget = d->retention_budget;
+  d->items = fresh->items;
+  d->count = fresh->count;
+  d->capacity = fresh->capacity;
+  d->active = fresh->active;
+  d->tail = fresh->tail;
+  d->pending_seal = fresh->pending_seal;
+  d->checkpoint = fresh->checkpoint;
+  d->checkpoint_ready = 0;
+  d->retention_loaded = fresh->retention_loaded;
+  d->retention_present = fresh->retention_present;
+  d->retention_budget = fresh->retention_budget;
+  for (labels = &fresh->labels; *labels; labels = &(*labels)->next) {
+  }
+  *labels = d->labels;
+  d->labels = fresh->labels;
+  fresh->labels = NULL;
+  fresh->items = items;
+  fresh->count = count;
+  fresh->checkpoint = checkpoint;
+  fresh->retention_budget = retention_budget;
+  for (i = 0; i < count; ++i) {
+    ps_stream_drop_view(items[i]->stream);
+    items[i]->stream = NULL;
+  }
+  ps_namespace_data_destroy(fresh);
+  d->shared_valid = 1;
+  return LC_OK;
+}
+static int namespace_current(struct ps_namespace_data *d, lc_error *e) {
+  int rc = LC_OK;
+  if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
+    return LC_OK;
+  pthread_mutex_lock(&d->mutex);
+  if (d->busy) {
+    if (!d->shared_valid || !d->edit)
+      rc = failure(e, LC_ERR_PENDING, "namespace is being reconciled");
+    pthread_mutex_unlock(&d->mutex);
+    return rc;
+  }
+  pthread_mutex_unlock(&d->mutex);
+  rc = ps_ns_enter(d, e);
+  if (rc == LC_OK)
+    ps_ns_leave(d);
+  return rc;
+}
+static int data_get(ps_namespace *ns, struct ps_namespace_data **out,
+                    int reconcile, lc_error *e) {
   struct ps_namespace_data *fresh = NULL;
   ps_root *root;
   int rc;
@@ -422,8 +517,11 @@ int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
     return rc;
   fresh = __atomic_load_n(&ns->data, __ATOMIC_ACQUIRE);
   if (fresh) {
-    *out = fresh;
-    return LC_OK;
+    if (reconcile)
+      rc = namespace_current(fresh, e);
+    if (rc == LC_OK)
+      *out = fresh;
+    return rc;
   }
   pthread_mutex_lock(&root->mutex);
   while (ns->data_loading)
@@ -431,20 +529,30 @@ int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
   if (!ns->data) {
     ns->data_loading = 1;
     pthread_mutex_unlock(&root->mutex);
-    rc = load(ns, &fresh, e);
+    rc = ps_coordination_shared(ps_space_coordination(root->space))
+             ? allocate_data(ns, &fresh, e)
+             : load(ns, NULL, &fresh, e);
     pthread_mutex_lock(&root->mutex);
     if (rc == LC_OK)
       __atomic_store_n(&ns->data, fresh, __ATOMIC_RELEASE);
     ns->data_loading = 0;
     pthread_cond_broadcast(&root->changed);
   }
-  if (rc == LC_OK)
-    *out = ns->data;
+  fresh = ns->data;
   pthread_mutex_unlock(&root->mutex);
+  if (rc == LC_OK && reconcile)
+    rc = namespace_current(fresh, e);
+  if (rc == LC_OK)
+    *out = fresh;
   return rc;
 }
+int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
+                   lc_error *e) {
+  return data_get(ns, out, 1, e);
+}
 int ps_ns_enter(struct ps_namespace_data *d, lc_error *e) {
-  int rc = LC_OK;
+  ps_coordination_guard *guard = NULL;
+  int rc = LC_OK, continued = 0;
   pthread_mutex_lock(&d->mutex);
   if (d->busy)
     rc = lc_error_set(e, LC_ERR_INVALID, 0L,
@@ -453,12 +561,54 @@ int ps_ns_enter(struct ps_namespace_data *d, lc_error *e) {
   else
     d->busy = 1;
   pthread_mutex_unlock(&d->mutex);
+  if (rc != LC_OK ||
+      !ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
+    return rc;
+  rc = ps_namespace_guard(d->ns, &guard, e);
+  if (rc == LC_OK && guard)
+    rc = ps_internal_namespace_stamp(d->ns->root->space, d->ns->identity.owner,
+                                     &continued, e);
+  pthread_mutex_lock(&d->mutex);
+  if (rc == LC_OK && guard && (!d->shared_valid || !continued))
+    rc = reload_shared(d, e);
+  if (rc == LC_OK)
+    d->edit = guard;
+  else {
+    rc = ps_namespace_unguard(d->ns, guard, rc, e);
+    d->busy = 0;
+  }
+  pthread_mutex_unlock(&d->mutex);
   return rc;
 }
 void ps_ns_leave(struct ps_namespace_data *d) {
   pthread_mutex_lock(&d->mutex);
+  (void)ps_namespace_unguard(d->ns, d->edit, LC_OK, NULL);
+  d->edit = NULL;
   d->busy = 0;
   pthread_mutex_unlock(&d->mutex);
+}
+/* Hold the shared name guard through selection and pin acquisition. An
+ * existing local writer keeps it while the data mutex protects our capture. */
+static int lock_current(struct ps_namespace_data *d, int *entered,
+                        lc_error *e) {
+  int rc;
+  *entered = 0;
+  pthread_mutex_lock(&d->mutex);
+  if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)) ||
+      (d->busy && d->edit && d->shared_valid))
+    return LC_OK;
+  pthread_mutex_unlock(&d->mutex);
+  rc = ps_ns_enter(d, e);
+  if (rc == LC_OK) {
+    *entered = 1;
+    pthread_mutex_lock(&d->mutex);
+  }
+  return rc;
+}
+static void unlock_current(struct ps_namespace_data *d, int entered) {
+  pthread_mutex_unlock(&d->mutex);
+  if (entered)
+    ps_ns_leave(d);
 }
 int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
@@ -666,13 +816,15 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
   ps_stream_info info;
   ps_checkpoint_info coverage;
   size_t i;
-  int rc;
+  int rc, entered;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace status requires output");
-  rc = ps_ns_data_get(ns, &d, e);
+  rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
-  pthread_mutex_lock(&d->mutex);
+  rc = lock_current(d, &entered, e);
+  if (rc != LC_OK)
+    return rc;
   memset(out, 0, sizeof(*out));
   ps_key_checkpoint_info(d->checkpoint, &coverage);
   out->active_segment = d->active;
@@ -704,7 +856,7 @@ int ps_namespace_status_get(ps_namespace *ns, ps_namespace_status *out,
     for (s = d->retired; s; s = s->next)
       ++out->pending_retirements;
   }
-  pthread_mutex_unlock(&d->mutex);
+  unlock_current(d, entered);
   return rc;
 }
 int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
@@ -734,7 +886,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
   span = mode == PS_APPEND_PREFIX ? minimum : minimum + PS_FRAME_BYTES;
-  rc = ps_ns_data_get(ns, &d, e);
+  rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
   append = lc_calloc_with_allocator(NULL, 1, sizeof(*append));
@@ -875,7 +1027,7 @@ void ps_namespace_append_close(ps_namespace_append *append) {
 }
 int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   struct ps_namespace_data *d;
-  int rc = ps_ns_data_get(ns, &d, e);
+  int rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_ns_enter(d, e);
@@ -900,7 +1052,7 @@ int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
   struct ps_namespace_data *d;
   ps_namespace_window *window;
   segment *s;
-  int rc;
+  int rc, entered;
   if (out)
     *out = NULL;
   if (!out || !id ||
@@ -908,13 +1060,17 @@ int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
        kind != PS_CATALOG_BODY))
     return failure(e, LC_ERR_INVALID,
                    "namespace read requires segment and output");
-  rc = ps_ns_data_get(ns, &d, e);
+  rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
   window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
   if (!window)
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace read window");
-  pthread_mutex_lock(&d->mutex);
+  rc = lock_current(d, &entered, e);
+  if (rc != LC_OK) {
+    lc_free_with_allocator(NULL, window);
+    return rc;
+  }
   if (kind == PS_CATALOG_SNAPSHOT) {
     rc = ps_key_checkpoint_read(d->checkpoint, id, &window->value, e);
     if (rc == LC_OK && (offset > ps_read_size(window->value) ||
@@ -927,7 +1083,7 @@ int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
     else
       rc = ps_stream_window_open(s->stream, offset, bytes, &window->reader, e);
   }
-  pthread_mutex_unlock(&d->mutex);
+  unlock_current(d, entered);
   if (rc != LC_OK) {
     ps_reader_close(window->value);
     lc_free_with_allocator(NULL, window);
@@ -986,12 +1142,12 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
   ps_stream_info info;
   size_t i;
   uint64_t first, count;
-  int rc;
+  int rc, entered;
   if (out)
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace view requires output");
-  rc = ps_ns_data_get(ns, &d, e);
+  rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
   view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
@@ -999,7 +1155,12 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace view");
   view->ns = ns;
   ps_namespace_retain(ns);
-  pthread_mutex_lock(&d->mutex);
+  rc = lock_current(d, &entered, e);
+  if (rc != LC_OK) {
+    ps_namespace_release(ns);
+    lc_free_with_allocator(NULL, view);
+    return rc;
+  }
   ++d->views;
   rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
                                  &view->coverage, e);
@@ -1040,7 +1201,7 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
                                    &c->reader, e);
     }
   }
-  pthread_mutex_unlock(&d->mutex);
+  unlock_current(d, entered);
   if (rc != LC_OK)
     ps_namespace_view_close(view);
   else
@@ -1262,7 +1423,7 @@ int ps_namespace_checkpoint_observe(ps_namespace *ns,
 }
 int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;
-  int rc = ps_ns_data_get(ns, &d, e);
+  int rc = data_get(ns, &d, 0, e);
   if (rc == LC_OK)
     rc = ps_ns_enter(d, e);
   if (rc != LC_OK)
@@ -1273,7 +1434,7 @@ int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
 }
 int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;
-  int rc = ps_ns_data_get(ns, &d, e);
+  int rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_ns_enter(d, e);

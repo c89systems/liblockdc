@@ -26,6 +26,7 @@ struct ps_stream {
   void *recovery_context;
   int edit_valid;
   int appending, recovering, repair_pending, sealed, retired, remapping;
+  int detached;
 };
 struct ps_stream_writer {
   ps_stream *stream;
@@ -316,7 +317,8 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     return stream_error(error, LC_ERR_TRANSPORT,
                         "cannot initialize stream mutex");
   }
-  rc = ps_owned_open(space, budget, key, create, ref, &s->head, &status, error);
+  rc = ps_owned_open_guarded(space, budget, key, create, ref, &s->head, &status,
+                             error);
   if (rc == LC_OK && ps_coordination_shared(ps_space_coordination(space))) {
     /* Head creation is structural. Independent peers must be able to pass it
      * while this newly created stream has a long-running producer. */
@@ -401,6 +403,17 @@ int ps_stream_close(ps_stream *s, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   stream_destroy(s);
   return LC_OK;
+}
+void ps_stream_drop_view(ps_stream *s) {
+  int destroy;
+  if (!s)
+    return;
+  pthread_mutex_lock(&s->mutex);
+  s->detached = 1;
+  destroy = !s->readers;
+  pthread_mutex_unlock(&s->mutex);
+  if (destroy)
+    stream_destroy(s);
 }
 int ps_stream_status(ps_stream *s, ps_stream_info *out, lc_error *error) {
   ps_owned_status status;
@@ -937,12 +950,15 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
 }
 static void window_release(ps_stream_window *window) {
   size_t i;
+  int destroy;
   for (i = 0; i < window->count; ++i)
     ps_owned_run_close(window->runs[i].handle);
   lc_free_with_allocator(NULL, window->runs);
   pthread_mutex_lock(&window->stream->mutex);
-  --window->stream->readers;
+  destroy = !--window->stream->readers && window->stream->detached;
   pthread_mutex_unlock(&window->stream->mutex);
+  if (destroy)
+    stream_destroy(window->stream);
 }
 int ps_stream_window_open(ps_stream *s, uint64_t offset, uint64_t bytes,
                           ps_stream_window **out, lc_error *error) {

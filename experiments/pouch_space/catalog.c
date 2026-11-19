@@ -287,6 +287,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                        const ps_ref *target, ps_catalog_info *out, int identity,
                        lc_error *e) {
   ps_entry *p, *old, *head;
+  ps_coordination_guard *guard;
   ps_catalog_info info;
   uint64_t sequence = 0, growth = 0, added = 0;
   int rc, installed = 0;
@@ -309,7 +310,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
     p->catalog->stream = stream;
     p->catalog->token = target ? target->incarnation : 0;
     pthread_mutex_lock(&s->mutex);
-    rc = ps_internal_healthy(s, e);
+    rc = ps_internal_capture_begin(s, &guard, e);
     old = named(s, owner, kind, name, length);
     head = identity ? NULL : ps_internal_lookup(s, stream);
     if (rc == LC_OK && pending(s, old))
@@ -350,6 +351,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       installed = 1;
       information(s, p, &info);
     }
+    rc = ps_internal_capture_end(s, guard, rc, e);
     pthread_mutex_unlock(&s->mutex);
   }
   if (!installed) {
@@ -379,12 +381,13 @@ int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
                       lc_error *e) {
   ps_entry *p;
+  ps_coordination_guard *guard;
   uint64_t sequence = 0;
   int rc;
   if (!s || !expected || !arguments(kind, name, length))
     return cat_error(e, LC_ERR_INVALID, "catalog removal arguments invalid");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_capture_begin(s, &guard, e);
   p = named(s, owner, kind, name, length);
   if (rc == LC_OK && (pending(s, p) || !ref_matches(s, p, expected)))
     rc = cat_error(e, LC_ERR_INVALID,
@@ -395,6 +398,7 @@ int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     ps_catalog_drop_record(s, p, sequence);
   }
+  rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK ? ps_internal_durable(s, sequence, e) : rc;
 }
@@ -539,7 +543,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   return rc;
 }
 static int orphan(ps_entry *p, uint64_t prefix) {
-  return !p->catalog_refs && !p->catalog_pins && !p->stream_open &&
+  return !p->catalog_refs && !p->catalog_pins && !p->stream_handles &&
          p->catalog_release <= prefix;
 }
 int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {

@@ -4,22 +4,36 @@
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "namespace.h"
+#include "namespace_internal.h"
 #include "record_io.h"
 #include "stream.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <zlib.h>
 
 static size_t checks, allocation, fail_allocation;
 static size_t largest;
 static int measuring;
+static int shared_namespace, fail_namespace_load;
+static const char *program;
+int __real_ps_coordination_open(int, const ps_coordination_options *,
+                                ps_coordination **, lc_error *);
+int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
+                                ps_coordination **out, lc_error *e) {
+  ps_coordination_options selected = *options;
+  if (shared_namespace)
+    selected.shared = 1;
+  return __real_ps_coordination_open(fd, &selected, out, e);
+}
 static void track(size_t n) {
   if (measuring && n > largest)
     largest = n;
@@ -46,6 +60,10 @@ void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
 void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
                                       size_t b) {
   track(n * b);
+  if (fail_namespace_load && n == 1 && b == sizeof(struct ps_namespace_data)) {
+    ++fail_namespace_load;
+    return NULL;
+  }
   return fails() ? NULL : __real_lc_calloc_with_allocator(a, n, b);
 }
 void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
@@ -2181,6 +2199,184 @@ static void bodies(const char *path) {
 #include "compound_recode_cases.h"
 #include "namespace_conversion_cases.h"
 #include "recode_cases.h"
+typedef struct shared_records {
+  uint64_t index, version;
+  size_t keys;
+} shared_records;
+static int visit_shared(void *context, uint64_t segment,
+                        const lc_pouch_state_entry *record, lc_error *e) {
+  shared_records *r = context;
+  (void)segment;
+  (void)e;
+  if (record->control)
+    r->index = record->index_seq;
+  else {
+    REQUIRE(!strcmp(record->key, "key") && record->found);
+    r->version = record->version;
+    ++r->keys;
+  }
+  return LC_OK;
+}
+static void shared_handoff(const char *path) {
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_root_options options = {0};
+    ps_root *a = NULL, *b = NULL;
+    ps_namespace *x, *y, *other;
+    ps_namespace_view *old = NULL, *view = NULL;
+    ps_namespace_window *window = NULL;
+    ps_namespace_append *held = NULL;
+    ps_namespace_status status;
+    lc_pouch_state_entry written = {0};
+    uint64_t segment = 0;
+    unsigned char bytes[64];
+    struct iovec part = {bytes, sizeof(bytes)};
+    records original = {0}, fresh = {0};
+    shared_records checkpoint = {0};
+    shared_namespace = 1;
+    options.storage.durable_sync = durable;
+    ok(ps_root_open(path, 1, &options, &a, &e), &e);
+    x = acquire(a, "shared", 1, &e);
+    other = acquire(a, "independent", 1, &e);
+    ok(put(a, x, 1, 0, sizeof(bytes), NULL, &segment, &written, &e), &e);
+    REQUIRE(segment == 1 && written.cipher_bytes == sizeof(bytes));
+    ok(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                              written.payload_span.payload_offset,
+                              sizeof(bytes), &window, &e),
+       &e);
+    ok(ps_namespace_view_open(x, &old, &e), &e);
+    ok(ps_root_open(path, 0, &options, &b, &e), &e);
+    y = acquire(b, "shared", 0, &e);
+    ok(ps_namespace_append_begin(y, 0, 0, PS_APPEND_PREFIX, NULL, &held, &e),
+       &e);
+    REQUIRE(append(a, x, 2, 0, 65, &e) == LC_ERR_PENDING);
+    clear(&e);
+    REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_PENDING && !view);
+    clear(&e);
+    ok(append(a, other, 1, 0, 65, &e), &e);
+    ps_namespace_append_close(held);
+    ok(append(b, y, 2, 0, 65, &e), &e);
+    fail_namespace_load = 1;
+    REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_NOMEM && !view);
+    REQUIRE(fail_namespace_load == 2);
+    fail_namespace_load = 0;
+    clear(&e);
+    ok(ps_namespace_view_visit(old, 1, visit, &original, &e), &e);
+    REQUIRE(original.count == 1 && original.version == 1);
+    ok(capture(x, &fresh, &e), &e);
+    REQUIRE(fresh.count == 2 && fresh.version == 2 && fresh.last_segment == 1);
+    ok(append(b, y, 3, 1, 65, &e), &e);
+    ok(ps_namespace_checkpoint_flush(y, &e), &e);
+    ok(ps_checkpoint(ps_root_space(b), &e), &e);
+    ok(ps_namespace_status_get(x, &status, &e), &e);
+    REQUIRE(status.active_segment == 2 && status.checkpoint_keys == 1 &&
+            status.covered_segment == 2);
+    ok(ps_namespace_view_open(x, &view, &e), &e);
+    ok(ps_namespace_view_visit(view, 1, visit_shared, &checkpoint, &e), &e);
+    REQUIRE(checkpoint.index == 3 && checkpoint.version == 3 &&
+            checkpoint.keys == 1);
+    ps_namespace_view_close(view);
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(window),
+                               written.payload_span.payload_offset, &part, 1,
+                               &e),
+       &e);
+    REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+    lc_pouch_state_entry_cleanup(&allocator, &written);
+    ps_namespace_read_close(window);
+    ps_namespace_view_close(old);
+    ps_namespace_release(y);
+    ps_namespace_release(x);
+    ps_namespace_release(other);
+    ok(ps_root_close(b, &e), &e);
+    ok(ps_root_close(a, &e), &e);
+    REQUIRE(unlink(path) == 0);
+  }
+  shared_namespace = 0;
+}
+static void namespace_abandoned_child(const char *path, int notify) {
+  lc_error e = {0};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace_append *append = NULL;
+  lc_pouch_state_entry request = {0}, discarded = {0};
+  input source = {0};
+  memset(body, '!', sizeof(body));
+  source.pub.impl = &source;
+  source.pub.read = pull;
+  source.bytes = sizeof(body);
+  request.key = "key";
+  request.content_type = "application/test";
+  request.payload_context = "namespace-test";
+  request.version = request.index_seq = 2;
+  request.lifetime = 1;
+  request.record_type = 1;
+  shared_namespace = 1;
+  options.storage.durable_sync = 1;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "shared", 0, &e);
+  ok(ps_namespace_append_begin(ns, 1, 0, PS_APPEND_PREFIX, NULL, &append, &e),
+     &e);
+  REQUIRE(ps_namespace_append_segment(append) == 2);
+  ok(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
+                                  ps_namespace_append_output(append),
+                                  ps_namespace_append_leaf(append), &request,
+                                  &source.pub, 0, &discarded, &e),
+     &e);
+  ok(ps_flush(ps_root_space(root), &e), &e);
+  REQUIRE(write(notify, "W", 1) == 1);
+  for (;;)
+    pause();
+}
+static void shared_abandoned(const char *path) {
+  lc_error e = {0};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace_view *old = NULL;
+  ps_namespace_status current;
+  records before = {0}, after = {0};
+  int notify[2], exited;
+  char byte;
+  shared_namespace = 1;
+  options.storage.durable_sync = 1;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "shared", 1, &e);
+  ok(append(root, ns, 1, 0, 128, &e), &e);
+  ok(ps_namespace_view_open(ns, &old, &e), &e);
+  REQUIRE(pipe(notify) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    char fd[24];
+    REQUIRE(close(notify[0]) == 0);
+    snprintf(fd, sizeof(fd), "%d", notify[1]);
+    execlp(program, program, "--shared-child", path, fd, (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(close(notify[1]) == 0);
+  REQUIRE(read(notify[0], &byte, 1) == 1 && byte == 'W');
+  REQUIRE(ps_namespace_status_get(ns, &current, &e) == LC_ERR_PENDING);
+  clear(&e);
+  REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(close(notify[0]) == 0);
+  ok(ps_namespace_view_visit(old, 1, visit, &before, &e), &e);
+  REQUIRE(before.count == 1 && before.version == 1);
+  ok(ps_namespace_status_get(ns, &current, &e), &e);
+  REQUIRE(current.active_segment == 1 && current.bound_segments == 2);
+  ok(append(root, ns, 2, 1, 128, &e), &e);
+  ok(capture(ns, &after, &e), &e);
+  REQUIRE(after.count == 2 && after.version == 2 && after.last_segment == 2);
+  ps_namespace_view_close(old);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ns = acquire(root, "shared", 0, &e);
+  count(ns, 2, &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  shared_namespace = 0;
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -2234,12 +2430,21 @@ static void *worker(void *p) {
     append_budget_faults(r->path, 1);
   else if (!strcmp(r->mode, "budget-transfer"))
     budget_transfer(r->path);
+  else if (!strcmp(r->mode, "shared-handoff"))
+    shared_handoff(r->path);
+  else if (!strcmp(r->mode, "shared-abandoned"))
+    shared_abandoned(r->path);
   else
     concurrency(r->path);
   return NULL;
 }
 int main(int argc, char **argv) {
+  if (argc == 4 && !strcmp(argv[1], "--shared-child")) {
+    namespace_abandoned_child(argv[2], atoi(argv[3]));
+    return 0;
+  }
   REQUIRE(argc == 3);
+  program = argv[0];
   char prefix[1024], pattern[1100], root[1024], path[1100];
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/namespace-", argv[1]) > 0);
   REQUIRE(snprintf(pattern, sizeof(pattern), "%sXXXXXX", prefix) > 0);

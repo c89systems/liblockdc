@@ -1,5 +1,6 @@
 #ifndef POUCH_SPACE_ROOT_INTERNAL_H
 #define POUCH_SPACE_ROOT_INTERNAL_H
+#include "coordination.h"
 #include "root.h"
 #include <pthread.h>
 
@@ -41,6 +42,9 @@ void ps_namespace_data_destroy(struct ps_namespace_data *);
 /* No calls/pins remain; close can count the budgets its caches will release. */
 size_t ps_namespace_data_budgets(const struct ps_namespace_data *);
 void ps_namespace_retain(ps_namespace *);
+int ps_namespace_guard(ps_namespace *, ps_coordination_guard **, lc_error *);
+int ps_namespace_unguard(ps_namespace *, ps_coordination_guard *, int,
+                         lc_error *);
 /* Exclusive open-time conversion, before exposing any root capability. */
 int ps_root_config_write(ps_root *, lc_pouch_crypto *, lc_error *);
 int ps_root_conversion_run(ps_root *, const char *, const ps_root_options *,
