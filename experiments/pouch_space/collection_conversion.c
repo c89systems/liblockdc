@@ -1,10 +1,11 @@
 #include "collection_conversion.h"
+#include "collection_conversion_internal.h"
 #include "lc_api_internal.h"
 #include <string.h>
 
 #define INTENT_BYTES (144U + LC_COLLECTION_HEAD_BYTES)
 #define PAGE_BYTES (40U + PS_COLLECTION_CONVERSION_BATCH * 32U)
-#define PROGRESS_BYTES 88U
+#define PROGRESS_BYTES 96U
 
 typedef struct conversion_candidate {
   lc_u64 id;
@@ -21,7 +22,7 @@ struct ps_collection_conversion {
   lc_u64 watermark, last_segment, last_offset;
   conversion_candidate pending[PS_COLLECTION_CONVERSION_BATCH];
   size_t count;
-  int discarded, aborting;
+  int discarded, aborting, irreversible;
   unsigned char scratch[PAGE_BYTES];
 };
 static int failure(lc_error *e, int code, const char *message) {
@@ -143,7 +144,11 @@ static int progress_load(ps_collection_conversion *w, lc_error *e) {
   w->last_segment = get(p + 64U);
   w->last_offset = get(p + 72U);
   w->aborting = get(p + 80U) != 0U;
-  if (get(p + 80U) > 1U || w->progress.pages > w->progress.records ||
+  w->irreversible = get(p + 88U) != 0U;
+  if (get(p + 80U) > 1U || get(p + 88U) > 1U ||
+      w->progress.pages >= LC_COLLECTION_SNAPSHOT_BIT - 1U ||
+      (w->aborting && w->irreversible) ||
+      w->progress.pages > w->progress.records ||
       (w->progress.records &&
        (w->progress.records - 1U) / PS_COLLECTION_CONVERSION_BATCH >=
            w->progress.pages) ||
@@ -168,6 +173,8 @@ static int remove_value(void *context, ps_key k, const ps_ref *ref,
   cleanup *c = context;
   (void)bytes;
   if (c->keep_progress && k.key == 1U)
+    return LC_OK;
+  if (c->speculative && (k.key & LC_COLLECTION_SNAPSHOT_BIT))
     return LC_OK;
   if (c->speculative && k.key <= c->pages + 1U)
     return LC_OK;
@@ -250,6 +257,30 @@ static int recover_prefix(ps_collection_conversion *w, lc_error *e) {
     rc = ps_values_visit(w->space, w->owner, PS_CONTROL, PS_CONTROL,
                          remove_value, &c, e);
   return rc;
+}
+void ps_collection_conversion_context(ps_collection_conversion *w, ps_space **s,
+                                      uint64_t *collection) {
+  *s = w->space;
+  *collection = w->collection;
+}
+int ps_collection_conversion_meta_read(ps_collection_conversion *w, lc_u64 slot,
+                                       void *bytes, size_t size, int *found,
+                                       lc_error *e) {
+  if (!w || w->discarded || w->aborting || slot >= LC_COLLECTION_SNAPSHOT_BIT ||
+      !bytes || !size || size > PS_PAGE || !found)
+    return failure(e, LC_ERR_INVALID,
+                   "conversion metadata requires a bounded slot");
+  return load_value(w, slot | LC_COLLECTION_SNAPSHOT_BIT, bytes, size, 1, found,
+                    e);
+}
+int ps_collection_conversion_meta_write(ps_collection_conversion *w,
+                                        lc_u64 slot, const void *bytes,
+                                        size_t size, lc_error *e) {
+  if (!w || w->discarded || w->aborting || slot >= LC_COLLECTION_SNAPSHOT_BIT ||
+      !bytes || !size || size > PS_PAGE)
+    return failure(e, LC_ERR_INVALID,
+                   "conversion metadata requires a bounded slot");
+  return store_value(w, slot | LC_COLLECTION_SNAPSHOT_BIT, bytes, size, e);
 }
 int ps_collection_conversion_open(ps_space *s, uint64_t collection,
                                   lc_pouch_crypto *target, int create,
@@ -441,6 +472,65 @@ int ps_collection_conversion_source_get(ps_collection_conversion *w, lc_u64 id,
     *out = info;
   return rc;
 }
+static int prune_select(void *context, ps_piece_publish_fn publish,
+                        void *publication, lc_error *e) {
+  ps_collection_conversion *w = context;
+  int rc = ps_check(w->space, e);
+  if (rc == LC_OK && (w->discarded || w->aborting))
+    rc = failure(e, LC_ERR_INVALID,
+                 "conversion prefix no longer selects source disposal");
+  return rc == LC_OK ? publish(publication, e) : rc;
+}
+static int mark_irreversible(ps_collection_conversion *w, lc_error *e) {
+  unsigned char *p = w->scratch;
+  int rc;
+  if (w->irreversible)
+    return LC_OK;
+  memset(p, 0, PROGRESS_BYTES);
+  memcpy(p, "LCPSCCPR", 8U);
+  put(p + 8U, w->owner);
+  put(p + 16U, w->progress.pages);
+  put(p + 24U, w->progress.records);
+  put(p + 32U, w->progress.candidates);
+  put(p + 40U, w->progress.source_segment);
+  put(p + 48U, w->progress.source_offset);
+  put(p + 56U, w->watermark);
+  put(p + 64U, w->last_segment);
+  put(p + 72U, w->last_offset);
+  put(p + 88U, 1U);
+  rc = store_value(w, 1U, p, PROGRESS_BYTES, e);
+  if (rc == LC_OK)
+    w->irreversible = 1;
+  return rc;
+}
+int ps_collection_conversion_source_prune(ps_collection_conversion *w,
+                                          lc_u64 id,
+                                          ps_collection_segment *source,
+                                          uint64_t *removed, lc_error *e) {
+  ps_catalog_info info;
+  ps_owned_status status;
+  uint64_t through;
+  int order, rc;
+  if (!w || !source || !removed)
+    return failure(e, LC_ERR_INVALID, "source disposal requires an owner");
+  rc = ps_collection_conversion_source_get(w, id, &info, e);
+  if (rc == LC_OK)
+    rc = ps_collection_segment_status(source, &status, NULL, e);
+  if (rc != LC_OK)
+    return rc;
+  order = compare(id, 0U, w->progress.source_segment, 0U);
+  if (!same_ref(&info.target, &status.ref) || !status.sealed || order > 0)
+    return failure(e, LC_ERR_INVALID,
+                   "source disposal is outside durable conversion progress");
+  through = order < 0 || w->progress.source_offset >= status.tail
+                ? status.tail
+                : w->progress.source_offset;
+  rc = mark_irreversible(w, e);
+  if (rc != LC_OK)
+    return rc;
+  return ps_collection_segment_discard_prefix(source, through, prune_select, w,
+                                              removed, e);
+}
 int ps_collection_conversion_candidate_create(ps_collection_conversion *w,
                                               lc_u64 id,
                                               ps_collection_segment **out,
@@ -553,7 +643,7 @@ int ps_collection_conversion_checkpoint(ps_collection_conversion *w,
   if (compare(segment, offset, next.source_segment, next.source_offset) < 0 ||
       next.records > LC_U64_MAX - count ||
       next.candidates > LC_U64_MAX - w->count ||
-      (count && next.pages >= LC_U64_MAX - 1U))
+      (count && next.pages >= LC_COLLECTION_SNAPSHOT_BIT - 2U))
     return failure(e, LC_ERR_INVALID,
                    "collection conversion checkpoint does not advance");
   watermark = w->watermark;
@@ -625,6 +715,7 @@ int ps_collection_conversion_checkpoint(ps_collection_conversion *w,
   put(p + 56U, watermark);
   put(p + 64U, last_segment);
   put(p + 72U, last_offset);
+  put(p + 88U, w->irreversible ? 1U : 0U);
   rc = store_value(w, 1U, p, PROGRESS_BYTES, e);
   if (rc == LC_OK) {
     w->progress = next;
@@ -686,9 +777,10 @@ int ps_collection_conversion_lookup(ps_collection_conversion *w, lc_u64 segment,
 int ps_collection_conversion_discard(ps_collection_conversion *w, lc_error *e) {
   cleanup c;
   int rc;
-  if (!w || w->discarded)
+  if (!w || w->discarded || w->irreversible)
     return failure(e, LC_ERR_INVALID,
-                   "collection conversion workspace is closed");
+                   "collection conversion is closed or requires completion "
+                   "after source disposal");
   memset(&c, 0, sizeof(c));
   c.space = w->space;
   c.owner = w->owner;

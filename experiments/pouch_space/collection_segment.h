@@ -51,5 +51,16 @@ int ps_collection_segment_sync(ps_collection_segment *, lc_error *);
 int ps_collection_segment_seal(ps_collection_segment *, lc_error *);
 int ps_collection_segment_claim_orphan(ps_collection_segment *, lc_error *);
 int ps_collection_segment_retire(ps_collection_segment *, lc_error *);
+/* Offline completed-prefix disposal. Caller excludes byte I/O and holds
+ * canonical liveness authority through select. Only sealed sources qualify.
+ * Drop whole grants before through; the crossing grant stays unchanged. When
+ * through reaches the final tail, unused capacity can go too. No retained
+ * bytes are copied or newly checksummed. Captured physical run pins survive;
+ * a later open reconstructs the sparse directory. Error can leave an already
+ * completed prefix disposed; retry is idempotent. removed changes on success.
+ */
+int ps_collection_segment_discard_prefix(ps_collection_segment *, uint64_t,
+                                         ps_piece_select_fn, void *,
+                                         uint64_t *removed, lc_error *);
 
 #endif

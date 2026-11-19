@@ -4150,7 +4150,7 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   if (!head || !source || !out || (count && !ranges) ||
       source->space != head->space ||
       source->entry->key.owner != head->entry->token ||
-      ps_owned_run_capacity(source) > PS_CHUNK ||
+      (count && ps_owned_run_capacity(source) > PS_CHUNK) ||
       count > ps_owned_run_capacity(source))
     return err(error, LC_ERR_INVALID,
                "piece replacement requires matching bounded owners");

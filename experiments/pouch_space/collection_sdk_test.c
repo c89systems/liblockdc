@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "collection_reclaim.h"
 #include "collection_segment.h"
+#include "collection_walk.h"
 #include "lc_collection_internal.h"
 #include "owned.h"
 #include "pouch.h"
@@ -759,6 +761,119 @@ static int count_child(void *context, const void *name, size_t length,
 }
 static ps_root *client_root(fixture *f) {
   return ps_pouch_state_root(((lc_client_handle *)f->client)->pouch);
+}
+static void conversion_plan(const char *directory, int codec, int sync) {
+  for (int compact = 0; compact < 2; ++compact) {
+    fixture f;
+    setup(&f, directory, codec, sync, 1);
+    lc_collection_append_req request;
+    lc_collection_append_res result;
+    lc_collection_writer *writer = NULL;
+    producer input;
+    producer_init(&input, 262161);
+    lc_collection_append_req_init(&request);
+    request.append_id = "planned-push";
+    ok(lc_collection_append_begin(f.collection, &request, &writer, &f.error),
+       &f.error);
+    unsigned char bytes[2048];
+    size_t n;
+    while ((n = produce(&input.source, bytes, sizeof(bytes), &f.error)))
+      ok(lc_collection_writer_write(writer, bytes, n, &f.error), &f.error);
+    ok(lc_collection_writer_commit(writer, &result, &f.error), &f.error);
+    lc_collection_writer_close(writer);
+    request.append_id = "planned-private";
+    ok(lc_collection_append_begin(f.collection, &request, &writer, &f.error),
+       &f.error);
+    ok(lc_collection_writer_write(writer, "{\"blob\":\"private", 16, &f.error),
+       &f.error);
+    ok(lc_collection_writer_abort(writer, &f.error), &f.error);
+    lc_collection_writer_close(writer);
+    (void)append(f.collection, "after-private", 8193, &f.error);
+    if (compact)
+      ok(lc_collection_compact(f.collection, 1, 0, NULL, &f.error), &f.error);
+    lc_collection_handle *c = f.collection->impl;
+    lc_collection_disk_head head;
+    ok(c->control.load(c->control.context, &head, &f.error), &f.error);
+    ps_root *root = client_root(&f);
+    ps_namespace *ns = NULL;
+    ps_catalog_view *view = NULL;
+    ps_catalog_info info;
+    ok(ps_root_namespace_acquire(root, "journal", 0, &ns, &f.error), &f.error);
+    ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
+                      c->name, strlen(c->name), &view, &f.error),
+       &f.error);
+    REQUIRE(view);
+    ok(ps_catalog_view_info(view, &info, &f.error), &f.error);
+    ps_catalog_view_close(view);
+    ps_namespace_release(ns);
+    ps_collection_resources resources;
+    ok(ps_collection_resources_capture(root->space, info.stream.owner,
+                                       &resources, &f.error),
+       &f.error);
+    for (size_t i = 0; i < resources.count; ++i) {
+      lc_collection_segment segment = {0};
+      if (resources.items[i].kind == PS_CATALOG_CONTROL ||
+          !lc_collection_segment_selected(&head, resources.items[i].id))
+        continue;
+      ps_owned_status status;
+      ok(ps_owned_inspect(root->space, resources.items[i].binding.stream,
+                          &resources.items[i].binding.target, &status,
+                          &f.error),
+         &f.error);
+      if (status.sealed)
+        continue;
+      ok(c->segments.open(c->segments.context, resources.items[i].id, 0,
+                          &segment, &f.error),
+         &f.error);
+      ok(lc_collection_segment_seal(&segment, &f.error), &f.error);
+      lc_collection_segment_close(&segment);
+    }
+    ps_collection_resources_clear(&resources);
+    ps_collection_conversion *work = NULL;
+    ok(ps_collection_conversion_open(root->space, info.stream.owner,
+                                     root->crypto, 1, &work, &f.error),
+       &f.error);
+    lc_collection_config config;
+    lc_collection_config_init(&config);
+    config.name = c->name;
+    lc_collection *blocked = NULL;
+    REQUIRE(lc_client_open_collection(f.client, &config, &blocked, &f.error) ==
+                LC_ERR_PENDING &&
+            !blocked);
+    REQUIRE(f.error.server_code &&
+            !strcmp(f.error.server_code, "collection_conversion_in_progress"));
+    clear(&f.error);
+    ok(ps_collection_walk_prepare(work, c->id, root->crypto, c->reads,
+                                  &f.error),
+       &f.error);
+    ps_collection_walk *walk = NULL;
+    ok(ps_collection_walk_open(work, c->id, &walk, &f.error), &f.error);
+    ps_collection_walk_item item;
+    lc_u64 sid = 0, at = 0, next_sid, next_at;
+    size_t chunks = 0, snapshots = 0, ends = 0;
+    int found;
+    for (;;) {
+      ok(ps_collection_walk_next(walk, sid, at, &item, &next_sid, &next_at,
+                                 &found, &f.error),
+         &f.error);
+      if (!found)
+        break;
+      chunks += item.kind == LC_POUCH_COLLECTION_CHUNK;
+      snapshots += !!(item.segment & LC_COLLECTION_SNAPSHOT_BIT);
+      ends += item.kind == 0;
+      sid = next_sid;
+      at = next_at;
+    }
+    REQUIRE(chunks && ends && (compact ? snapshots > 0 : !snapshots));
+    ps_collection_walk_close(walk);
+    ok(ps_collection_conversion_discard(work, &f.error), &f.error);
+    ps_collection_conversion_close(work);
+    open_collection(&f, 0, &blocked);
+    lc_collection_close(blocked);
+    close_store(&f);
+    lc_error_cleanup(&f.error);
+  }
+  printf("SDK conversion planning codec=%d sync=%d passed\n", codec, sync);
 }
 static void reclamation(const char *directory) {
   fixture f;
@@ -1540,6 +1655,7 @@ int main(int argc, char **argv) {
         if (argc != 3)
           process_recovery(directory, codec, sync);
         edit_recovery(directory, codec, sync);
+        conversion_plan(directory, codec, sync);
       }
     for (int sync = 0; sync < 2; ++sync) {
       concurrency(directory, sync);

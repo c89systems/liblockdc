@@ -571,6 +571,7 @@ static void projections(void) {
 }
 #include "collection_codec_cases.h"
 #include "collection_record_codec_cases.h"
+#include "collection_walk_cases.h"
 #include "collection_workspace_cases.h"
 typedef struct unit_run {
   const char *directory, *key;
@@ -578,7 +579,11 @@ typedef struct unit_run {
 } unit_run;
 static void *unit_worker(void *context) {
   unit_run *run = context;
-  if (run->faults == 6)
+  if (run->faults == 8)
+    walk_faults(run->directory, run->key);
+  else if (run->faults == 7)
+    walk_cases(run->directory, run->key);
+  else if (run->faults == 6)
     workspace_faults(run->directory, run->key);
   else if (run->faults == 5)
     workspace_records(run->directory, run->key);
@@ -607,12 +612,15 @@ int main(int argc, char **argv) {
             !strcmp(argv[2], "unit-concurrency") ||
             !strcmp(argv[2], "records") || !strcmp(argv[2], "record-faults") ||
             !strcmp(argv[2], "workspace") ||
-            !strcmp(argv[2], "workspace-faults"));
+            !strcmp(argv[2], "workspace-faults") || !strcmp(argv[2], "walk") ||
+            !strcmp(argv[2], "walk-faults"));
     unit_run run = {directory, key,
-                    !strcmp(argv[2], "workspace-faults") ? 6
-                    : !strcmp(argv[2], "workspace")      ? 5
-                    : !strcmp(argv[2], "record-faults")  ? 4
-                    : !strcmp(argv[2], "records")        ? 3
+                    !strcmp(argv[2], "walk-faults")        ? 8
+                    : !strcmp(argv[2], "walk")             ? 7
+                    : !strcmp(argv[2], "workspace-faults") ? 6
+                    : !strcmp(argv[2], "workspace")        ? 5
+                    : !strcmp(argv[2], "record-faults")    ? 4
+                    : !strcmp(argv[2], "records")          ? 3
                     : !strcmp(argv[2], "unit-concurrency")
                         ? 2
                         : !strcmp(argv[2], "unit-faults")};

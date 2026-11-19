@@ -65,7 +65,8 @@ typedef int (*ps_piece_publish_fn)(void *, lc_error *);
 typedef int (*ps_piece_select_fn)(void *, ps_piece_publish_fn, void *,
                                   lc_error *);
 /* Replace one completed bounded piece with its sorted coalesced live ranges.
- * Empty ranges remove its ownership entirely, including unused grants at or
+ * Empty ranges remove its ownership entirely, including larger grants and
+ * unused grants at or
  * beyond a sealed head's committed tail. Those grants need no payload/footer
  * read and cannot be replaced with live ranges. Source checks and copying
  * happen outside publication authority; selection revalidates the captured

@@ -38,6 +38,18 @@ int ps_collection_conversion_source_bind(ps_collection_conversion *, lc_u64,
                                          const ps_catalog_info *, lc_error *);
 int ps_collection_conversion_source_get(ps_collection_conversion *, lc_u64,
                                         ps_catalog_info *, lc_error *);
+/* Dispose whole sealed source grants covered by the durable conversion cursor.
+ * Caller excludes source I/O and proves every discarded reference has a durable
+ * replacement. An exact source alias is required. Actual capacity becomes
+ * reusable after normal checkpoint retirement. Partial errors retry safely.
+ * A durable irreversible marker precedes disposal; cancellation then rejects
+ * until the collection coordinator has completed selection. Existing receiver
+ * admission rejects a workspace, including after process reopen. The offline
+ * caller must already have excluded previously admitted receivers/writers.
+ */
+int ps_collection_conversion_source_prune(ps_collection_conversion *, lc_u64,
+                                          ps_collection_segment *, uint64_t *,
+                                          lc_error *);
 /* Logical IDs belong to the collection plan; physical keys use fresh reserved
  * identities, so speculative rollback/retry cannot collide with old owners.
  * At most BATCH new candidates may precede a checkpoint. The caller owns and

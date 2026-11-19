@@ -5019,3 +5019,90 @@ Root conversion intent, final policy publication, shared-root ownership and
 matched end-to-end qualification remain outstanding. The native root continues
 to reject an explicit compression-policy change; the multifile backend remains
 the default/reference and production cutover still requires an explicit decision.
+
+### Native dependency plans and completed-source grant disposal
+
+`ps_collection_walk_prepare` now captures selected collection history through
+native byte capabilities and persists its conversion dependency plan. It binds
+and checks every selected source, requires sealed input, validates canonical
+framing, follows stream indexes and checks metadata-body/history references.
+Reachable units and nodes must precede their referring nodes/publications in
+snapshot-before-normal order. Conflicting, overlapping or out-of-allocation
+references reject before plan completion. Unreferenced private allocation bytes
+are skipped. Canonical publications and history remain in the plan.
+
+EDIT_BODY and its adjacent EDIT receipt form one token with a boundary after
+both records. A converter must encode and checkpoint the pair together. Source
+end tokens retain exact final boundaries, including empty segments. Planning
+reads bounded metadata rather than decoding or staging encoded bodies. Fixtures
+explicitly reject any attempted read of stream-unit payload bytes during this
+pass. Preparation RAM follows captured framing, catalog and reachable-reference
+metadata; it does not follow payload lengths or reserved container capacity.
+
+Planning pages occupy a disjoint typed-control range within the workspace.
+Completion selects them only after every page is durable. Incomplete planning
+can restart; source disposal cannot precede a completed dependency handoff.
+Reopen preserves planning metadata independently of speculative output rollback.
+Malformed relocation counts cannot enter the reserved planning key range.
+
+`ps_collection_walk_open/next` reads that durable plan without the old source
+prefix. An initial/random lookup uses binary search, while sequential progress
+reuses its ordinal and one cached page. Full fixture traversal, including a
+66-unit tree spanning pages, uses fewer than 32 project allocations. Lookup
+failures preserve result and cursor outputs and can retry on the same reader.
+
+Collection byte owners now capture selected run mappings by their actual logical
+bases. Sealed sources can reopen with holes; appendable sources still require
+a dense directory. `ps_collection_conversion_source_prune` checks an exact source
+alias and the completed durable cursor before dropping whole grants. The grant
+crossing that cursor remains unchanged. Reaching the final tail also permits
+unused capacity to go. Entire larger grants can be removed through the existing
+owned-map publication path without copying or checksumming retained bytes; the
+bounded-copy requirement for nonempty piece replacement is unchanged. Ordinary
+checkpoint retirement makes the released physical ownership reusable.
+
+An irreversible progress marker precedes source disposal and survives subsequent
+checkpoints/reopen. Cancellation then rejects, preserving the replacement data
+and the plan needed to finish. New receiver admission reports
+`collection_conversion_in_progress` while a workspace remains, including after
+reopen. This is an offline coordination contract: its caller must already have
+excluded previously admitted receivers and writers, and must complete selection
+before reopening the collection for ordinary work.
+
+Native fixtures cover 1, 3 and 66 units under all codec combinations and both
+durability policies. They convert a unit, publish its mapping, reclaim completed
+grants, reopen the sparse source and continue reading its remaining metadata.
+Converted bytes remain readable through the durable map, and cancellation stays
+blocked. Public SDK fixtures additionally prepare plans over REGION allocations,
+aborted uploads, rotation and compacted snapshots; receiver admission rejects
+during planning and recovers after a nondestructive workspace cancellation.
+
+One durable, unencrypted case converts a generated stream just over 6 MiB from
+`none` to `zlib` in a fixed 10 MiB container, publishing each unit handoff and
+reclaiming old grants between units. It releases 5,591,040 bytes of source grants
+and ends with 7,774,208 allocated bytes.
+After root reopen, all three mappings resolve and the complete converted body
+matches the generated source. Original index/publication metadata remains for
+the next conversion stage. No growth or whole-value temporary buffer is used.
+
+The new matrix passes 411 planning, plan-reader and prefix-disposal fault points;
+the existing workspace matrix passes 454 points. These include allocation/read
+failures and modeled durable-image restoration around disposal writes/syncs,
+including partial and persisted torn writes. Incomplete planning reopens and
+successfully retries. Disposal either retains source ownership or leaves durable
+replacement/progress evidence; retry completes and unsafe cancellation rejects.
+Eleven selected Debug checks and nine checks each on GNU and musl release pass,
+including collection/root/catalog/owned-map regressions and source/stack gates.
+Final walk checks, including the 6 MiB case, pass on all three configurations.
+Walk and SDK scenarios also pass TSan with instrumented OpenSSL and strict
+Memcheck, with no suppressions, remaining allocations, errors or extra file
+handles.
+
+This completes dependency planning and the source-grant disposal boundary, not
+automatic native collection conversion. The controller still must encode every
+planned node/publication, translate all links, select new collection bindings and
+head, and finish irreversible workspace cleanup. Root conversion intent/policy
+publication, derived-index invalidation, shared-root coordination/recovery and
+matched end-to-end performance qualification remain required. The multifile
+backend remains the default/reference; production cutover still requires an
+explicit deployment decision.

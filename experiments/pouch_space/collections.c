@@ -1136,6 +1136,18 @@ static int load_owner(ps_namespace *ns, const char *name,
   struct iovec part;
   int rc;
   *out = NULL;
+  {
+    ps_catalog_view *conversion = NULL;
+    rc = ps_catalog_get(ns->root->space, info->stream.owner,
+                        PS_CATALOG_CONVERSION, NULL, 0U, &conversion, e);
+    if (rc == LC_OK && conversion)
+      rc = failure(
+          e, LC_ERR_PENDING, "collection_conversion_in_progress",
+          "collection conversion must complete before receiver admission");
+    ps_catalog_view_close(conversion);
+    if (rc != LC_OK)
+      return rc;
+  }
   pthread_mutex_lock(&ns->root->mutex);
   for (owner = ns->collections; owner && owner->numeric != info->stream.owner;
        owner = owner->next) {

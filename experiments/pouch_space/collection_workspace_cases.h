@@ -423,6 +423,10 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
   ok(ps_collection_segment_open(s, source_key, 1, NULL, NULL, NULL, &source,
                                 &e),
      &e);
+  if (stage == 7) {
+    ok(ps_collection_segment_reserve(source, 2 * PS_MIB, &e), &e);
+    ok(ps_collection_segment_truncate(source, 0, &e), &e);
+  }
   workspace_fill(source, &e);
   ps_catalog_info info = workspace_source(source, source_key, &e), binding;
   unsigned char name[8] = {1};
@@ -468,6 +472,7 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
   model.calls = 0;
   model.fail = mode ? cut : 0;
   int rc;
+  uint64_t removed = 999;
   switch (stage) {
   case 0:
     rc = ps_collection_conversion_open(s, collection, target, 1, &w, &e);
@@ -486,6 +491,10 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
     break;
   case 5:
     rc = ps_collection_conversion_discard(w, &e);
+    break;
+  case 7:
+    rc = ps_collection_conversion_source_prune(w, 1, source, &removed, &e);
+    REQUIRE(rc == LC_OK || removed == 999);
     break;
   default:
     rc = ps_collection_conversion_reclaim(s, collection, &e);
@@ -532,6 +541,28 @@ static size_t workspace_fault_trial(const char *directory, const char *key_text,
   for (size_t i = 0; i < sizeof(bytes); ++i)
     REQUIRE(bytes[i] == 0x5a);
   ps_collection_segment_close(candidate);
+  if (stage == 7) {
+    ok(ps_collection_segment_open(s, source_key, 0, &info.target, NULL, NULL,
+                                  &source, &e),
+       &e);
+    ok(ps_collection_conversion_source_prune(w, 1, source, &removed, &e), &e);
+    ok(ps_collection_conversion_source_prune(w, 1, source, &removed, &e), &e);
+    REQUIRE(!removed &&
+            ps_collection_conversion_discard(w, NULL) == LC_ERR_INVALID);
+    REQUIRE(lc_pouch_record_io_read(ps_collection_segment_io(source), 0, &part,
+                                    1, NULL) == LC_ERR_PROTOCOL);
+    ps_collection_segment_close(source);
+    ps_collection_conversion_close(w);
+    ok(ps_collection_conversion_reclaim(s, collection, &e), &e);
+    workspace_gc(root, &e);
+    lc_pouch_crypto_close(target);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(!unlink(path));
+    free(model.stable);
+    free(model.dirty);
+    lc_error_cleanup(&e);
+    return calls;
+  }
   ok(ps_collection_conversion_discard(w, &e), &e);
   ps_collection_conversion_close(w);
   workspace_gc(root, &e);

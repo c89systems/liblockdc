@@ -47,9 +47,10 @@ static int cs_room(ps_collection_segment *s, lc_error *e) {
 static void cs_add(ps_collection_segment *s, ps_owned_run *run) {
   uint64_t bytes = ps_owned_run_capacity(run);
   s->runs[s->count].run = run;
-  s->runs[s->count].base = s->capacity;
+  s->runs[s->count].base = ps_owned_run_base(run);
   s->runs[s->count].bytes = bytes;
-  s->capacity += bytes;
+  if (s->capacity < s->runs[s->count].base + bytes)
+    s->capacity = s->runs[s->count].base + bytes;
   ++s->count;
   bytes = (bytes + PS_RUN_HEADER) * 4U;
   if (bytes > PS_MIB)
@@ -243,9 +244,10 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
                                lc_error *e) {
   ps_collection_segment *s;
   ps_owned_status status;
-  ps_owned_run *run;
+  ps_owned_run **captured = NULL;
+  size_t count = 0U, i;
   uint64_t accepted;
-  int found, rc;
+  int rc;
   if (out)
     *out = NULL;
   if (!space || !out)
@@ -271,22 +273,32 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
   s->space = space;
   s->references = 1UL;
   rc = ps_owned_open(space, NULL, key, create, expected, &s->head, &status, e);
-  while (rc == LC_OK && s->capacity < status.capacity) {
+  if (rc == LC_OK)
+    rc = ps_owned_runs_capture(s->head, &captured, &count, e);
+  for (i = 0U; rc == LC_OK && i < count; ++i) {
     rc = cs_room(s, e);
-    run = NULL;
-    if (rc == LC_OK)
-      rc = ps_owned_grant(s->head, NULL, s->capacity, 0U, &run, &found, e);
-    if (rc == LC_OK && (!found || !run))
+    if (rc == LC_OK &&
+        ((!status.sealed && ps_owned_run_base(captured[i]) != s->capacity) ||
+         ps_owned_run_base(captured[i]) < s->capacity ||
+         ps_owned_run_base(captured[i]) > status.capacity ||
+         ps_owned_run_capacity(captured[i]) >
+             status.capacity - ps_owned_run_base(captured[i])))
       rc = cs_error(e, LC_ERR_PROTOCOL,
-                    "collection segment is missing an owned range");
-    if (rc == LC_OK)
-      cs_add(s, run);
+                    "collection segment has an invalid owned range");
+    if (rc == LC_OK) {
+      cs_add(s, captured[i]);
+      captured[i] = NULL;
+    }
   }
-  if (rc == LC_OK &&
-      (s->capacity != status.capacity || s->count != status.runs))
+  for (i = 0U; i < count; ++i)
+    ps_owned_run_close(captured[i]);
+  lc_free_with_allocator(NULL, captured);
+  if (rc == LC_OK && ((!status.sealed && s->capacity != status.capacity) ||
+                      s->count != status.runs))
     rc = cs_error(e, LC_ERR_PROTOCOL,
                   "collection owned range directory is inconsistent");
   if (rc == LC_OK) {
+    s->capacity = status.capacity;
     s->tail = status.tail;
     s->sealed = status.sealed;
     accepted = s->tail;
@@ -402,6 +414,36 @@ int ps_collection_segment_claim_orphan(ps_collection_segment *s, lc_error *e) {
 }
 int ps_collection_segment_retire(ps_collection_segment *s, lc_error *e) {
   return ps_owned_retire(s->head, e);
+}
+
+int ps_collection_segment_discard_prefix(ps_collection_segment *s,
+                                         uint64_t through,
+                                         ps_piece_select_fn select,
+                                         void *context, uint64_t *removed,
+                                         lc_error *e) {
+  ps_owned_run *replacement = NULL;
+  ps_collection_run *r;
+  uint64_t bytes = 0U;
+  size_t i = 0U;
+  int rc;
+  if (!s || !removed || !select || !s->sealed || through > s->tail)
+    return cs_error(e, LC_ERR_INVALID,
+                    "collection prefix disposal requires sealed liveness");
+  while (i < s->count) {
+    r = &s->runs[i];
+    if (through < s->tail && r->base + r->bytes > through)
+      break;
+    rc = ps_owned_run_repack(s->head, r->run, NULL, NULL, 0U, select, context,
+                             &replacement, e);
+    if (rc != LC_OK)
+      return rc;
+    bytes += ps_owned_run_storage(r->run);
+    ps_owned_run_close(r->run);
+    memmove(r, r + 1U, (s->count - i - 1U) * sizeof(*r));
+    --s->count;
+  }
+  *removed = bytes;
+  return LC_OK;
 }
 
 static int cs_owner_clone(void *context, lc_collection_segment *out,
