@@ -1677,13 +1677,20 @@ static void allocation_failures(const char *directory, int codec, int sync) {
 #include "collection_background_cases.h"
 #include "collection_maintenance_cases.h"
 #include "collection_query_cases.h"
+#include "root_conversion_cases.h"
 int main(int argc, char **argv) {
   char path[1024], directory[1024];
   lc_error e;
   REQUIRE(
-      argc == 2 || (argc == 3 && !strcmp(argv[2], "live")) ||
+      argc == 2 ||
+      (argc == 3 &&
+       (!strcmp(argv[2], "live") || !strcmp(argv[2], "root-conversion"))) ||
+      (argc == 3 && !strcmp(argv[2], "root-conversion-growth")) ||
       (argc == 5 &&
        (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+        !strcmp(argv[2], "root-conversion-faults") ||
+        !strcmp(argv[2], "root-conversion-controls") ||
+        !strcmp(argv[2], "root-conversion-crash") ||
         !strcmp(argv[2], "query") || !strcmp(argv[2], "query-io") ||
         !strcmp(argv[2], "query-allocation") ||
         !strcmp(argv[2], "maintenance") ||
@@ -1699,14 +1706,24 @@ int main(int argc, char **argv) {
   REQUIRE(lc_test_tmp_mkdtemp(path, directory, sizeof(directory), argv[1]));
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
-  if (argc == 8) {
+  if (argc == 3 && !strcmp(argv[2], "root-conversion")) {
+    root_conversion_cases(directory);
+  } else if (argc == 3 && !strcmp(argv[2], "root-conversion-growth")) {
+    root_conversion_growth(directory);
+  } else if (argc == 8) {
     diagnostic = 1;
     (void)io_trial(directory, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),
                    atoi(argv[6]), (size_t)strtoul(argv[7], NULL, 10));
   } else if (argc == 5) {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strncmp(argv[2], "query", 5U)) {
+    if (!strcmp(argv[2], "root-conversion-faults")) {
+      root_conversion_faults(directory, codec, sync);
+    } else if (!strcmp(argv[2], "root-conversion-controls")) {
+      root_conversion_controls(directory, codec, sync);
+    } else if (!strcmp(argv[2], "root-conversion-crash")) {
+      root_conversion_crashes(directory, codec, sync);
+    } else if (!strncmp(argv[2], "query", 5U)) {
       query_mode = 1;
       if (!strcmp(argv[2], "query"))
         collection_queries(directory, codec, sync);

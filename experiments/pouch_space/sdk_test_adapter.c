@@ -35,11 +35,13 @@ static int factory(void *context, const char *path, const lc_allocator *a,
   struct stat status;
   char *physical;
   size_t length = strlen(path);
-  int codec = 0, sync = 0, rc, create;
+  int codec = 0, sync = 0, convert = 0, rc, create;
   (void)context;
   rc = setting("POUCH_SPACE_TEST_CODEC", 3, &codec, e);
   if (rc == LC_OK)
     rc = setting("POUCH_SPACE_TEST_SYNC", 1, &sync, e);
+  if (rc == LC_OK && getenv("POUCH_SPACE_TEST_CONVERT"))
+    rc = setting("POUCH_SPACE_TEST_CONVERT", 1, &convert, e);
   if (rc != LC_OK)
     return rc;
   physical = lc_alloc_with_allocator(a, length + sizeof("/container.pouch"));
@@ -73,7 +75,11 @@ static int factory(void *context, const char *path, const lc_allocator *a,
     rc = setting("POUCH_SPACE_TEST_WATCH", 1, &watch, e);
     options.logical.queue_watch = watch;
   }
-  options.logical.compression = codec & 2 ? "zlib" : "none";
+  /* Recovery suites can change policy on their first reopen, with real staged
+   * queue/outbox/transaction data still present. Later opens retain that
+   * target. */
+  options.logical.compression =
+      ((codec & 2) != 0) ^ (!create && convert) ? "zlib" : "none";
   if ((codec & 1) && !logical->crypto_key && !logical->crypto_key_file) {
     pthread_mutex_lock(&key_mutex);
     if (!test_key) {

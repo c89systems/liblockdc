@@ -59,19 +59,20 @@ static ps_key config_key(void) {
   ps_key key = {0, 1, PS_CONTROL};
   return key;
 }
-static int config_write(ps_root *root, lc_error *error) {
+int ps_root_config_write(ps_root *root, lc_pouch_crypto *crypto,
+                         lc_error *error) {
   unsigned char bytes[ROOT_CONFIG_BYTES];
   char *key_id = NULL;
   ps_writer *writer = NULL;
   int rc = LC_OK;
   memset(bytes, 0, sizeof(bytes));
   memcpy(bytes, config_magic, sizeof(config_magic));
-  bytes[8] = (unsigned char)lc_pouch_crypto_enabled(root->crypto);
-  bytes[9] = (unsigned char)lc_pouch_crypto_compression_enabled(root->crypto);
+  bytes[8] = (unsigned char)lc_pouch_crypto_enabled(crypto);
+  bytes[9] = (unsigned char)lc_pouch_crypto_compression_enabled(crypto);
   put32(bytes + 96, LC_COLLECTION_HEAD_BYTES);
   put32(bytes + 100, LC_POUCH_RECORD_HEADER_BYTES);
   if (bytes[8]) {
-    rc = lc_pouch_crypto_key_id(root->crypto, &key_id, error);
+    rc = lc_pouch_crypto_key_id(crypto, &key_id, error);
     if (rc == LC_OK && strlen(key_id) >= ROOT_KEY_ID_BYTES)
       rc = failure(error, LC_ERR_PROTOCOL, "pouch_root_corrupt",
                    "pouch root key identity exceeds its control field");
@@ -89,8 +90,7 @@ static int config_write(ps_root *root, lc_error *error) {
   ps_writer_close(writer);
   return rc;
 }
-static int config_read(ps_root *root, int compression_explicit,
-                       lc_error *error) {
+static int config_read(ps_root *root, lc_error *error) {
   unsigned char bytes[ROOT_CONFIG_BYTES];
   ps_reader *reader = NULL;
   char *key_id = NULL;
@@ -144,11 +144,6 @@ static int config_read(ps_root *root, int compression_explicit,
           error, LC_ERR_INVALID, "pouch_root_crypto_mismatch",
           "pouch root key does not match initialized encrypted root");
   }
-  if (compression_explicit &&
-      bytes[9] != lc_pouch_crypto_compression_enabled(root->crypto))
-    return failure(
-        error, LC_ERR_UNSUPPORTED, "pouch_root_conversion_required",
-        "pouch root compression change requires container conversion");
   if (bytes[9] && !root->crypto) {
     lc_pouch_crypto_open_options options = {0};
     options.compression_enabled = 1;
@@ -195,12 +190,14 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   if (rc == LC_OK)
     rc = ps_open(path, create, &options->storage, &root->space, error);
   if (rc == LC_OK)
-    rc = create ? config_write(root, error)
-                : config_read(root, options->compression_explicit, error);
+    rc = create ? ps_root_config_write(root, root->crypto, error)
+                : config_read(root, error);
   if (rc == LC_OK)
     rc = reserve_base(root, !create, error);
   if (rc == LC_OK && !create)
     rc = ps_root_namespace_visit(root, recover_namespace, root, error);
+  if (rc == LC_OK && !create)
+    rc = ps_root_conversion_run(root, path, options, error);
   if (rc != LC_OK) {
     (void)ps_root_close(root, NULL);
     return rc;

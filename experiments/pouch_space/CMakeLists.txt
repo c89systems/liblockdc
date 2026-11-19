@@ -6,7 +6,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
   return()
 endif()
 
-set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collection_conversion.c collection_walk.c collection_transform.c collections.c root.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_recode.c namespace_conversion.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
+set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collection_conversion.c collection_walk.c collection_transform.c collections.c root.c root_conversion.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_recode.c namespace_conversion.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -323,6 +323,24 @@ if(LOCKDC_BUILD_TESTS)
             ${behavior_cases})
         set_tests_properties(pouch_space_${surface}_sdk_${codec}_${sync}
           PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        set(conversion_cases)
+        if(surface STREQUAL "queue")
+          set(conversion_cases test_txn_recovery_applies_queue_side_effects
+            test_txn_queue_decision_rejects_newer_delivery_lease)
+        elseif(surface STREQUAL "outbox")
+          set(conversion_cases test_pouch_dispatcher_scan_recovery_when_indexing_is_disabled)
+        elseif(surface STREQUAL "xa")
+          set(conversion_cases test_pending_commit_survives_reopen
+            test_history_unfinished_commit_preserves_branch_until_application)
+        endif()
+        if(conversion_cases)
+          add_test(NAME pouch_space_root_conversion_${surface}_${codec}_${sync}
+            COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
+              POUCH_SPACE_TEST_SYNC=${sync} POUCH_SPACE_TEST_CONVERT=1
+              $<TARGET_FILE:pouch_space_${surface}_sdk_test> ${conversion_cases})
+          set_tests_properties(pouch_space_root_conversion_${surface}_${codec}_${sync}
+            PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        endif()
         if(surface STREQUAL "queue")
           add_test(NAME pouch_space_queue_notifications_${codec}_${sync}
             COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
@@ -346,8 +364,23 @@ if(LOCKDC_BUILD_TESTS)
   lc_configure_c_test_target(pouch_space_collection_sdk_test)
   add_test(NAME pouch_space_collection_sdk COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(pouch_space_collection_sdk PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  add_test(NAME pouch_space_root_conversion COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion)
+  set_tests_properties(pouch_space_root_conversion PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  add_test(NAME pouch_space_root_conversion-growth COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-growth)
+  set_tests_properties(pouch_space_root_conversion-growth PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   foreach(codec RANGE 0 3)
     foreach(sync RANGE 0 1)
+      add_test(NAME pouch_space_root_conversion-faults_${codec}_${sync}
+        COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-faults ${codec} ${sync})
+      set_tests_properties(pouch_space_root_conversion-faults_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      if(codec EQUAL 0 OR codec EQUAL 3)
+        add_test(NAME pouch_space_root_conversion-crash_${codec}_${sync}
+          COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-crash ${codec} ${sync})
+        set_tests_properties(pouch_space_root_conversion-crash_${codec}_${sync} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        add_test(NAME pouch_space_root_conversion-controls_${codec}_${sync}
+          COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-controls ${codec} ${sync})
+        set_tests_properties(pouch_space_root_conversion-controls_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endif()
       foreach(mode maintenance maintenance-io maintenance-allocation background background-io background-allocation)
         add_test(NAME pouch_space_collection_${mode}_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${codec} ${sync})

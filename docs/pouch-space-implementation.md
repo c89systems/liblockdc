@@ -5188,3 +5188,83 @@ work and require explicit growth when necessary; conversion never grows the
 container implicitly. Existing-root format migration remains deferred. The
 multifile backend remains the default/reference, and production cutover still
 requires an explicit deployment decision.
+
+### Resumable root codec conversion before admission
+
+Explicit compression-policy changes now convert the complete native root during
+`ps_root_open`, under its exclusive physical lifetime lock and before returning
+any writable capability. Normal opens inherit the stored policy. An interrupted
+conversion always finishes its durable target first: an implicit reopen inherits
+that completed target, while an opposite explicit request then starts a separate
+conversion. Encryption mode and key identity remain fixed.
+
+The coordinator publishes a 192-byte always-durable root intent before rewriting
+data. It binds source/target policy, encryption identity, namespace progress,
+completed collection progress and the active collection's original head
+incarnation. Catalog metadata is captured and ordered by permanent IDs; payloads
+are never captured in these arrays. Namespace conversion restarts through its
+existing descriptor-aware cursor. Completed namespaces and collections are
+skipped. Component conversion remains bounded and streams through native byte
+capabilities, without payload files or a whole-value staging buffer.
+
+The collection cursor handles the selection/cleanup crash window explicitly.
+If the component workspace has detached and the canonical head incarnation has
+changed within the same container, final selection already completed; recovery
+records completion without converting that collection again. A remaining
+workspace resumes its own durable plan and progress. Missing or inconsistent
+namespace/collection identities reject rather than advancing the cursor.
+
+Before final selection, the coordinator persists its ready phase, reclaims
+unreferenced workspace resources and checkpoints physical ownership. Namespace
+and collection derived indexes are disposed of along the way. The root policy
+publishes only after all dependencies, and intent removal follows that policy
+publication. Recovery can finish ready-phase cleanup with either the old or the
+already selected target policy. The root-owned crypto context changes only
+after successful completion, before SDK workers or receivers start. Failure
+returns no root and preserves durable work for reopen.
+
+Sixteen integration profiles cover normal and compacted collection history,
+multiple namespaces/collections, streamed state and collection bodies, internal
+objects, unchanged document versions/ETags/metadata, permanent positions and
+duplicate append retries. They convert in both directions, reopen with inherited
+policy, append after conversion and dispose/rebuild populated namespace and
+collection indexes, all at fixed 10 MiB capacity.
+
+Twenty-four additional checks reuse the common queue, outbox and XA suites with
+a policy change on their first reopen, across all codec/durability combinations.
+They preserve pending queue acknowledgments, newer-delivery fencing, dispatcher
+recovery, pending native XA commits and unfinished application history. This
+exercises actual staged messaging/coordinator data before application recovery.
+
+The root coordinator passes 1,296 interruption cases at every boundary with
+same-target, implicit and opposite-target reopen requests. Its initialization,
+catalog capture, intent creation/replacement, orphan cleanup, checkpoint, policy
+publication and intent removal pass another 914 allocation/I/O failure points,
+including partial writes, persisted torn writes and full persisted writes that
+report failure. These checks require the selected injection to fire, restore the
+modeled durable image and verify every retained body and retry identity.
+Post-checkpoint reclamation may remain pending after allocation failure without
+failing the committed checkpoint; those successful outcomes are verified too.
+Sixteen actual process deaths cover intent publication, collection selection,
+policy publication and intent removal. Another 206 malformed-intent cases reject
+before admission.
+
+Capacity is never grown implicitly. Four pressure profiles leave a pending
+conversion in a 10 MiB container, grow it explicitly by exactly 1 MiB through an
+offline physical owner, and complete conversion on an inherited reopen. This
+proves the capacity-failure recovery path; it does not replace the remaining
+broader maintenance/lease/messaging capacity qualification.
+
+Fifty-four affected Debug checks pass, retaining completed matching checks when
+resuming the matrix. Thirty-nine checks each pass on GNU and musl release.
+Source/stack gates pass. Root lifecycle, conversion, growth and representative
+encrypted durable messaging recovery also pass TSan with instrumented OpenSSL.
+Strict Memcheck passes conversion, growth and queue/outbox/XA recovery with no
+suppressions, remaining allocations, errors or extra handles.
+
+This closes the root codec orchestration and policy-selection gap. Shared-root
+ownership/coordination, broader bounded-capacity qualification, and matched
+steady-state/readiness/reopen/close performance remain in the full active goal.
+Existing-root format migration remains deferred. The multifile backend remains
+the default/reference, and production cutover requires an explicit deployment
+decision.

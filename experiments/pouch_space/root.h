@@ -12,8 +12,9 @@ typedef struct ps_root_options {
   /* Codec outputs share the logical Pouch owner's allocation domain. */
   const lc_allocator *crypto_allocator;
   /* Creation uses crypto.compression_enabled. Reopen inherits the stored
-   * policy unless explicit; a different explicit policy requires conversion,
-   * which is not yet implemented by this owner. No implicit reinterpretation.
+   * policy unless explicit. A different explicit policy converts the complete
+   * root before admission. Interrupted conversion finishes its durable target
+   * first, including when the next request is implicit or opposite.
    */
   int compression_explicit;
 } ps_root_options;
@@ -30,7 +31,10 @@ typedef struct ps_namespace_info {
  * cannot lose completion capacity to a producer in another namespace. Recovery
  * also registers unclaimed key-deletion requirements before ordinary admission.
  * Recovery errors reject open, with no writable capability or partial owners.
- * Shared-process ownership is a separate pending integration step. */
+ * Open also completes durable codec-conversion intent before admission. A
+ * failed conversion leaves recoverable work and returns no writable root.
+ * Capacity never grows implicitly; an offline physical owner may explicitly
+ * grow the container before retrying. Shared-process ownership is pending. */
 int ps_root_open(const char *, int create, const ps_root_options *, ps_root **,
                  lc_error *);
 /* Stop calls before close. Outstanding namespace pins or physical child

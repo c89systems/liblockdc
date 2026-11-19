@@ -39,4 +39,12 @@ struct ps_root {
 /* Root close has already excluded namespace pins/calls. No payload I/O. */
 void ps_namespace_data_destroy(struct ps_namespace_data *);
 void ps_namespace_retain(ps_namespace *);
+/* Exclusive open-time conversion, before exposing any root capability. */
+int ps_root_config_write(ps_root *, lc_pouch_crypto *, lc_error *);
+int ps_root_conversion_run(ps_root *, const char *, const ps_root_options *,
+                           lc_error *);
+#ifdef LOCKDC_TEST_BUILD
+extern int (*ps_root_conversion_test_hook)(void *, const char *, lc_error *);
+extern void *ps_root_conversion_test_context;
+#endif
 #endif

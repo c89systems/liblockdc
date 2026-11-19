@@ -299,11 +299,6 @@ static void lifecycle(const char *path, const char *key_string,
     REQUIRE(ps_root_open(path, 0, &mismatch, &r, &e) == LC_ERR_INVALID &&
             r == NULL);
     clear(&e);
-    mismatch = options;
-    mismatch.crypto.compression_enabled = !(transform & 1);
-    REQUIRE(ps_root_open(path, 0, &mismatch, &r, &e) == LC_ERR_UNSUPPORTED &&
-            r == NULL);
-    clear(&e);
     options.compression_explicit = 0;
     options.crypto.compression_enabled = !(transform & 1);
     ok(ps_root_open(path, 0, &options, &r, &e), &e);
@@ -319,6 +314,13 @@ static void lifecycle(const char *path, const char *key_string,
     ok(ps_stream_close(stream, &e), &e);
     ps_namespace_release(a);
     count(r, 2, &e);
+    ok(ps_root_close(r, &e), &e);
+    mismatch = options;
+    mismatch.compression_explicit = 1;
+    mismatch.crypto.compression_enabled = !(transform & 1);
+    ok(ps_root_open(path, 0, &mismatch, &r, &e), &e);
+    REQUIRE(lc_pouch_crypto_compression_enabled(ps_root_crypto(r)) ==
+            !(transform & 1));
     ok(ps_root_close(r, &e), &e);
     REQUIRE(unlink(path) == 0);
     lc_free_with_allocator(NULL, descriptor);
@@ -514,6 +516,60 @@ static int reentrant(const char *name, const ps_namespace_info *identity,
   return state->fail ? lc_error_set(e, LC_ERR_INVALID, 0, "stop visit", NULL,
                                     NULL, NULL)
                      : LC_OK;
+}
+static void conversion_intent(const char *path) {
+  lc_error e;
+  lc_error_init(&e);
+  ps_root *root = NULL;
+  ps_space *space = NULL;
+  ps_key key = {0, 2, PS_CONTROL};
+  unsigned char valid[192] = {0}, bad[193];
+  memcpy(valid, "LCPSRCVT", 8);
+  valid[8] = 1;
+  uint64_t crc = crc32(0L, valid, 184);
+  for (size_t i = 0; i < 8; ++i)
+    valid[184 + i] = (unsigned char)(crc >> (8 * i));
+  ok(ps_root_open(path, 1, NULL, &root, &e), &e);
+  ok(ps_root_close(root, &e), &e);
+  const unsigned offsets[] = {8, 16, 24, 32, 40, 48, 56, 64, 80, 88, 96, 176};
+  for (size_t mutation = 0; mutation < 194 + sizeof(offsets) / sizeof(*offsets);
+       ++mutation) {
+    memcpy(bad, valid, sizeof(valid));
+    bad[192] = 0;
+    size_t bytes = 192;
+    if (mutation < 192)
+      bad[mutation] ^= 1;
+    else if (mutation < 194)
+      bytes = mutation == 192 ? 191 : 193;
+    else {
+      unsigned at = offsets[mutation - 194];
+      bad[at] = at == 8 ? 2 : at == 24 ? 3 : 1;
+      crc = crc32(0L, bad, 184);
+      for (size_t i = 0; i < 8; ++i)
+        bad[184 + i] = (unsigned char)(crc >> (8 * i));
+    }
+    ps_writer *writer = NULL;
+    ok(ps_open(path, 0, NULL, &space, &e), &e);
+    ok(ps_begin(space, NULL, key, &writer, &e), &e);
+    ok(ps_write(writer, bad, bytes, &e), &e);
+    ok(ps_publish(writer, NULL, &e), &e);
+    ps_writer_close(writer);
+    ok(ps_close(space, &e), &e);
+    REQUIRE(ps_root_open(path, 0, NULL, &root, &e) == LC_ERR_PROTOCOL && !root);
+    clear(&e);
+  }
+  ps_writer *writer = NULL;
+  ok(ps_open(path, 0, NULL, &space, &e), &e);
+  ok(ps_begin(space, NULL, key, &writer, &e), &e);
+  ok(ps_write(writer, valid, sizeof(valid), &e), &e);
+  ok(ps_publish(writer, NULL, &e), &e);
+  ps_writer_close(writer);
+  ok(ps_close(space, &e), &e);
+  ok(ps_root_open(path, 0, NULL, &root, &e), &e);
+  REQUIRE(lc_pouch_crypto_compression_enabled(ps_root_crypto(root)));
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
 }
 static void catalog(const char *path) {
   ps_root *root;
@@ -1049,6 +1105,7 @@ static void *run_tests(void *v) {
     lifecycle(r->path, r->key, r->wrong_key);
     namespace_records(r->path);
     malformed(r->path);
+    conversion_intent(r->path);
     catalog(r->path);
   } else if (!strcmp(r->mode, "faults")) {
     io_faults(r->path);
