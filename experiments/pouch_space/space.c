@@ -44,8 +44,14 @@ struct ps_reader {
 #define TICKET_MAGIC UINT64_C(0x3154454b435450)
 #define TICKET_HEADER 112U
 static int allocation_refresh(ps_space *, lc_error *);
+static int allocation_ranges_refresh(ps_space *, lc_error *);
 static int canonical_observe(ps_space *, lc_error *);
-static int canonical_journal(ps_space *, lc_error *);
+static int canonical_journal(ps_space *, int replay, lc_error *);
+static int replay_frame(ps_space *, const unsigned char *, uint64_t,
+                        lc_error *);
+static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t,
+                               lc_error *);
+static ps_entry *selected_value(ps_space *, ps_entry *, uint64_t);
 static int canonical_refresh(ps_space *, lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
@@ -214,6 +220,7 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
   if (rc == LC_OK)
     rc = ps_readiness_read(s, &certificate, error);
   if (rc == LC_OK) {
+    s->peer_durable = certificate.durable;
     covered = requested <= s->own_ready_sequence &&
               certificate.durable >= s->own_ready_wire;
     target = covered ? s->own_ready_sequence
@@ -231,6 +238,8 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
       rc = allocation_begin(s, &guard, error);
       if (rc == LC_OK)
         rc = ps_readiness_stabilize(s, wire, 0, error);
+      if (rc == LC_OK && s->peer_durable < wire)
+        s->peer_durable = wire;
       rc = allocation_end(s, guard, rc, error);
       pthread_mutex_unlock(&s->mutex);
     }
@@ -514,6 +523,14 @@ int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
 int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
                             lc_error *error) {
   return allocation_end(s, guard, rc, error);
+}
+/* Mutations and reservation plans select against the imported prefix before
+ * looking at keys or spending workspace. Nested allocation stays observe-only.
+ */
+static int revision_begin(ps_space *s, ps_coordination_guard **guard,
+                          lc_error *error) {
+  int rc = ps_internal_capture_begin(s, guard, error);
+  return rc == LC_OK && *guard ? allocation_ranges_refresh(s, error) : rc;
 }
 static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
                           lc_error *error) {
@@ -1028,13 +1045,9 @@ static void payload_register(ps_space *s, ps_payload_page *p) {
   s->payload_buckets[hash] = p;
   ++s->packed_pages;
 }
-static void payload_reconsider(ps_space *s, ps_payload_page *p) {
+static void payload_unregister(ps_space *s, ps_payload_page *p) {
   ps_payload_page **link;
   payload_unavailable(p);
-  if (p->occupied || p->external_pins) {
-    payload_available(s, p);
-    return;
-  }
   link = &s->payload_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
   while (*link != p)
     link = &(*link)->hash_next;
@@ -1043,6 +1056,13 @@ static void payload_reconsider(ps_space *s, ps_payload_page *p) {
   if (p->next)
     p->next->link = p->link;
   --s->packed_pages;
+}
+static void payload_reconsider(ps_space *s, ps_payload_page *p) {
+  if (p->occupied || p->external_pins) {
+    payload_available(s, p);
+    return;
+  }
+  payload_unregister(s, p);
   free_insert(s, &p->run);
 }
 static void payload_release(ps_space *s, ps_extent *extent) {
@@ -1251,10 +1271,12 @@ static void pins_collect(ps_space *s, int present) {
   (void)allocation_end(s, guard, rc, NULL);
 }
 static int allocation_refresh(ps_space *s, lc_error *error) {
+  int rc = canonical_observe(s, error);
+  return rc == LC_OK ? allocation_ranges_refresh(s, error) : rc;
+}
+static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   ps_run *run;
-  int present, rc = canonical_observe(s, error);
-  if (rc == LC_OK)
-    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  int present, rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
   if (rc != LC_OK)
     return rc;
   pins_collect_locked(s, present);
@@ -2426,6 +2448,7 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
     lc_free_with_allocator(NULL, trim);
     return rc;
   }
+  s->peer_durable = s->sequence;
   mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
   if (s->metadata_claims_active) {
     /* New pages are the prefix inserted by this checkpoint. Selected pages
@@ -2656,9 +2679,9 @@ static int canonical_observe(ps_space *s, lc_error *error) {
       memcmp(root + 56, s->identity, 16))
     return err(error, LC_ERR_PENDING,
                "container checkpoint view needs refresh");
-  return canonical_journal(s, error);
+  return canonical_journal(s, 0, error);
 }
-static int canonical_journal(ps_space *s, lc_error *error) {
+static int canonical_journal(ps_space *s, int replay, lc_error *error) {
   unsigned char next[64];
   ps_readiness_certificate certificate;
   int rc = ps_readiness_read(s, &certificate, error);
@@ -2667,6 +2690,11 @@ static int canonical_journal(ps_space *s, lc_error *error) {
   if (s->generation < certificate.root)
     return err(error, LC_ERR_PENDING,
                "certified checkpoint view needs refresh");
+  s->peer_durable = certificate.durable;
+  if (s->readiness && certificate.durable >= s->own_ready_wire &&
+      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
+          s->own_ready_sequence)
+    mark_durable(s, s->own_ready_sequence);
   while (s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
     if (rc != LC_OK)
@@ -2676,10 +2704,17 @@ static int canonical_journal(ps_space *s, lc_error *error) {
     if (s->readiness && s->sequence >= certificate.ready)
       return err(error, LC_ERR_PENDING,
                  "journal boundary is not yet certified");
-    /* Identity-only grants do not change the application projection. Their
-     * global frontier is distinct from this participant's spending endpoint.
-     * Every other changed prefix, including incomplete/invalid data, fences
-     * allocation until canonical refresh/recovery can reconcile it. */
+    if (replay &&
+        (get32(next) == REVISION_MAGIC ||
+         (get32(next) == EVENT_MAGIC && get32(next + 20) != PS_RESERVE_IDS))) {
+      rc = replay_frame(s, next, certificate.ready, error);
+      if (rc != LC_OK)
+        return rc;
+      continue;
+    }
+    /* Allocation helpers may already hold state derived from the old view.
+     * Only a grant can advance their observation without revising that state.
+     * Its global frontier is distinct from our private spending endpoint. */
     if (get32(next) != (uint32_t)EVENT_MAGIC || get32(next + 4) != 64 ||
         s->sequence == UINT64_MAX || get64(next + 8) != s->sequence + 1 ||
         get32(next + 16) || get32(next + 20) != PS_RESERVE_IDS ||
@@ -2701,10 +2736,6 @@ static int canonical_journal(ps_space *s, lc_error *error) {
   }
   if (s->readiness && s->sequence < certificate.ready)
     return err(error, LC_ERR_PENDING, "certified journal view needs refresh");
-  if (s->readiness && certificate.durable >= s->own_ready_wire &&
-      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
-          s->own_ready_sequence)
-    mark_durable(s, s->own_ready_sequence);
   return LC_OK;
 }
 typedef struct metadata_read_page {
@@ -2869,16 +2900,16 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
 }
 /* Validate the entire candidate before changing any selected ownership. A
  * complete inner record is not independently recoverable inside a revision. */
-static int recover_revision(ps_space *s, const unsigned char *wire,
-                            size_t bytes, unsigned char *buffer,
-                            lc_error *error) {
+static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
+                           unsigned char *buffer, ps_entry ***out,
+                           lc_error *error) {
   ps_entry **entries = NULL, *old;
   size_t count, i, j, cursor = 64, member_bytes;
   int event, rc = LC_OK;
   count = get32(wire + 16);
   if (bytes < 64 || get32(wire) != REVISION_MAGIC || get32(wire + 4) != bytes ||
       !count || count > (bytes - 64) / 64 || count > UINT64_MAX - s->sequence ||
-      get64(wire + 8) != s->sequence + 1 || get32(wire + 20) ||
+      get64(wire + 8) != s->sequence + 1 || get32(wire + 20) > 1 ||
       get64(wire + 24) || get64(wire + 32) || get64(wire + 40) ||
       get64(wire + 48) || get32(wire + 56) ||
       get32(wire + 60) !=
@@ -2911,26 +2942,264 @@ static int recover_revision(ps_space *s, const unsigned char *wire,
         rc = err(error, LC_ERR_PROTOCOL,
                  "revision overwrites collection position");
     }
-    if (rc == LC_OK)
+    if (rc == LC_OK && buffer)
       rc = verify_entry(s, entries[i], buffer, error);
     cursor += member_bytes;
   }
   if (rc == LC_OK && cursor != bytes)
     rc = err(error, LC_ERR_PROTOCOL, "revision has trailing members");
   if (rc == LC_OK) {
-    for (i = 0; i < count; ++i) {
-      old = lookup(s, entries[i]->key);
-      register_entry(s, entries[i]);
-      dirty_entry(s, entries[i], old);
-      install(s, entries[i]);
-      entries[i] = NULL;
-    }
-    s->sequence += count;
+    *out = entries;
+    return LC_OK;
   }
   for (i = 0; i < count; ++i)
     if (entries[i])
       entry_free(entries[i]);
   lc_free_with_allocator(NULL, entries);
+  return rc;
+}
+static void install_revision(ps_space *s, ps_entry **entries, size_t count,
+                             int peer, int durable) {
+  size_t i;
+  for (i = 0; i < count; ++i) {
+    ps_entry *p = entries[i], *old = lookup(s, p->key);
+    if (peer) {
+      p->peer_sequence = s->sequence + i + 1;
+      p->durable_visibility = durable;
+    }
+    register_entry(s, p);
+    dirty_entry(s, p, old);
+    install(s, p);
+  }
+  s->sequence += count;
+}
+static int recover_revision(ps_space *s, const unsigned char *wire,
+                            size_t bytes, unsigned char *buffer,
+                            lc_error *error) {
+  ps_entry **entries;
+  int rc = decode_revision(s, wire, bytes, buffer, &entries, error);
+  if (rc == LC_OK) {
+    install_revision(s, entries, get32(wire + 16), 0, 0);
+    lc_free_with_allocator(NULL, entries);
+  }
+  return rc;
+}
+
+/* Record only affected intervals and packed pages. Keep removed nodes alive
+ * until commit so rollback can restore links even across adjacent cuts. */
+typedef struct replay_change {
+  struct replay_change *next;
+  ps_run **link, *run, *split;
+  ps_run before;
+  uint64_t *available, bytes;
+  ps_payload_page *page;
+  uint64_t occupied;
+  int removed, new_page;
+} replay_change;
+static replay_change *replay_record(replay_change **changes, lc_error *error) {
+  replay_change *c = lc_calloc_with_allocator(NULL, 1, sizeof(*c));
+  if (c) {
+    c->next = *changes;
+    *changes = c;
+  } else
+    err(error, LC_ERR_NOMEM, "cannot stage journal payload ownership");
+  return c;
+}
+static void replay_finish(ps_space *s, replay_change *change, int commit) {
+  while (change) {
+    replay_change *c = change;
+    change = c->next;
+    if (c->page) {
+      if (commit)
+        payload_available(s, c->page);
+      else {
+        c->page->occupied = c->occupied;
+        s->packed_bytes -= c->bytes;
+        if (c->new_page) {
+          payload_unregister(s, c->page);
+          lc_free_with_allocator(NULL, c->page);
+        }
+      }
+    } else if (c->run) {
+      if (commit) {
+        if (c->removed)
+          lc_free_with_allocator(NULL, c->run);
+      } else {
+        *c->run = c->before;
+        *c->link = c->run;
+        *c->available += c->bytes;
+        lc_free_with_allocator(NULL, c->split);
+      }
+    }
+    lc_free_with_allocator(NULL, c);
+  }
+}
+static ps_run **replay_find(ps_run **link, uint64_t offset) {
+  for (; *link; link = &(*link)->next)
+    if ((*link)->offset <= offset && offset - (*link)->offset < (*link)->bytes)
+      return link;
+  return NULL;
+}
+static int replay_range(ps_space *s, uint64_t offset, uint64_t bytes,
+                        replay_change **changes, lc_error *error) {
+  while (bytes) {
+    uint64_t *available = &s->free_bytes, left, right, take;
+    ps_run **link = replay_find(&s->free, offset), *run, *split = NULL;
+    replay_change *c;
+    if (!link) {
+      link = replay_find(&s->pinned_free, offset);
+      available = &s->pinned_free_bytes;
+    }
+    if (!link || (*link)->claimed)
+      return err(error, LC_ERR_PROTOCOL,
+                 "peer journal overlaps local ownership");
+    run = *link;
+    left = offset - run->offset;
+    take = run->bytes - left;
+    if (take > bytes)
+      take = bytes;
+    right = run->bytes - left - take;
+    c = replay_record(changes, error);
+    if (!c)
+      return LC_ERR_NOMEM;
+    if (left && right) {
+      split = lc_calloc_with_allocator(NULL, 1, sizeof(*split));
+      if (!split)
+        return err(error, LC_ERR_NOMEM, "cannot split peer journal interval");
+      *split = *run;
+      split->offset = offset + take;
+      split->bytes = right;
+    }
+    c->link = link;
+    c->run = run;
+    c->before = *run;
+    c->split = split;
+    c->available = available;
+    c->bytes = take;
+    if (left) {
+      run->bytes = left;
+      if (split)
+        run->next = split;
+    } else if (right) {
+      run->offset += take;
+      run->bytes = right;
+    } else {
+      *link = run->next;
+      c->removed = 1;
+    }
+    *available -= take;
+    offset += take;
+    bytes -= take;
+  }
+  return LC_OK;
+}
+static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
+                          lc_error *error) {
+  size_t i;
+  int rc;
+  for (i = 0; i < p->count; ++i) {
+    ps_extent *x = &p->extents[i];
+    uint64_t bytes = extent_allocation(x), mask, base;
+    ps_payload_page *page;
+    replay_change *c;
+    if (!(x->flags & EXTENT_PACKED)) {
+      rc = replay_range(s, x->offset, bytes, changes, error);
+      if (rc != LC_OK)
+        return rc;
+      continue;
+    }
+    base = x->offset / PS_PAGE * PS_PAGE;
+    page = payload_find(s, base);
+    mask = extent_mask(x);
+    if (page && (page->occupied & mask))
+      return err(error, LC_ERR_PROTOCOL, "peer journal overlaps packed cells");
+    /* A new page needs a free-interval edit before its page undo record. */
+    if (!page) {
+      rc = replay_range(s, base, PS_PAGE, changes, error);
+      if (rc != LC_OK)
+        return rc;
+    }
+    c = replay_record(changes, error);
+    if (!c)
+      return LC_ERR_NOMEM;
+    if (!page) {
+      page = lc_calloc_with_allocator(NULL, 1, sizeof(*page));
+      if (!page)
+        return err(error, LC_ERR_NOMEM, "cannot import packed journal page");
+      page->run.offset = base;
+      page->run.bytes = PS_PAGE;
+      payload_register(s, page);
+      c->new_page = 1;
+    }
+    c->page = page;
+    c->occupied = page->occupied;
+    c->bytes = bytes;
+    page->occupied |= mask;
+    s->packed_bytes += bytes;
+  }
+  return LC_OK;
+}
+static int replay_frame(ps_space *s, const unsigned char *prefix,
+                        uint64_t certified, lc_error *error) {
+  unsigned char *wire;
+  ps_entry **entries = NULL, *single = NULL;
+  ps_key key;
+  replay_change *changes = NULL;
+  size_t i, bytes = get32(prefix + 4), count = 1;
+  int group = get32(prefix) == REVISION_MAGIC, event = PS_PUT, structural, rc;
+  if (group)
+    count = get32(prefix + 16);
+  if (bytes < 64 || bytes > PS_JOURNAL - s->journal || !count ||
+      count > certified - s->sequence || get64(prefix + 8) != s->sequence + 1)
+    return err(error, LC_ERR_PROTOCOL, "invalid certified journal framing");
+  key.kind = get32(prefix + 16);
+  key.owner = get64(prefix + 24);
+  key.key = get64(prefix + 32);
+  structural = !group && !immutable_key(key);
+  /* Structural consumers use completed heads and catalog bindings. */
+  if (structural && s->sequence >= s->peer_durable)
+    return err(error, LC_ERR_PENDING,
+               "peer structural frame awaits durability");
+  wire = lc_alloc_with_allocator(NULL, bytes);
+  if (!wire)
+    return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
+  memcpy(wire, prefix, 64);
+  rc = bytes == 64 ? LC_OK
+                   : transfer(s, wire + 64, bytes - 64,
+                              JOURNAL_OFFSET + s->journal + 64, 0, error);
+  if (rc == LC_OK && group)
+    rc = decode_revision(s, wire, bytes, NULL, &entries, error);
+  else if (rc == LC_OK) {
+    rc = decode_entry(s, wire, bytes, &single, &event, error);
+    if (rc == LC_OK)
+      entries = &single;
+  }
+  for (i = 0; rc == LC_OK && i < count; ++i)
+    rc = replay_payload(s, entries[i], &changes, error);
+  if (rc == LC_OK && !group) {
+    if (event == PS_PUT && single->key.kind == PS_OWNED_RUN &&
+        single->owned_mapped)
+      rc = owned_map_load(s, single, error);
+    if (rc == LC_OK) {
+      if (!structural)
+        single->peer_sequence = s->sequence + 1;
+      rc = apply_journal_event(s, single, event, 0, error);
+    }
+  }
+  replay_finish(s, changes, rc == LC_OK);
+  if (rc == LC_OK) {
+    if (group)
+      install_revision(s, entries, count, 1, get32(wire + 20));
+    else
+      ++s->sequence;
+    memcpy(s->journal_image + s->journal, wire, bytes);
+    s->journal += bytes;
+  } else if (entries)
+    for (i = 0; i < count; ++i)
+      entry_free(entries[i]);
+  if (group)
+    lc_free_with_allocator(NULL, entries);
+  lc_free_with_allocator(NULL, wire);
   return rc;
 }
 static int validate_owned_directory(ps_space *s, lc_error *error) {
@@ -3010,13 +3279,103 @@ static int remove_owned(ps_space *s, ps_entry *head, uint64_t sequence,
     mark_removed(s, head, sequence);
   return LC_OK;
 }
+/* Common transition checks for cold recovery and certified live replay.
+ * Success consumes the decoded entry. Errors leave it with the caller. */
+static int apply_journal_event(ps_space *s, ps_entry *p, int event,
+                               uint64_t release, lc_error *error) {
+  ps_entry *old, *head;
+  int rc;
+  if (event == PS_RESERVE_IDS) {
+    if (s->token_limit > UINT64_MAX - TOKEN_RANGE ||
+        p->token != s->token_limit + TOKEN_RANGE)
+      return err(error, LC_ERR_PROTOCOL,
+                 "invalid incarnation range progression");
+    s->token_limit = p->token;
+    entry_free(p);
+    return LC_OK;
+  }
+  old = lookup(s, p->key);
+  if (event == PS_PUT) {
+    if (p->key.kind == PS_OWNED_RUN) {
+      if (p->owned_mapped) {
+        head = stream_lookup(s, p->key.owner);
+        if (!old || old->deleted || !head ||
+            p->stream_capacity != old->stream_capacity)
+          return err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch");
+      } else {
+        if (old && !old->deleted)
+          return err(error, LC_ERR_PROTOCOL,
+                     "owned grant overwritten in journal");
+        rc = install_owned_grant(s, p, error);
+        if (rc != LC_OK)
+          return rc;
+      }
+    } else if (p->key.kind == PS_CATALOG) {
+      rc = ps_catalog_prepare_record(s, p, 0, error);
+      if (rc != LC_OK)
+        return rc;
+      ps_catalog_apply_record(s, p, release);
+    } else {
+      if ((!immutable_key(p->key) || p->key.kind == PS_COLLECTION) && old &&
+          !old->deleted)
+        return err(error, LC_ERR_PROTOCOL,
+                   "journal overwrites typed ownership");
+      if (p->key.kind == PS_STREAM && (p->bytes || p->stream_capacity ||
+                                       p->stream_runs || p->stream_sealed))
+        return err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
+    }
+  } else {
+    if (!old || old->deleted || old->token != p->token)
+      return err(error, LC_ERR_PROTOCOL, "journal retirement owner mismatch");
+    if (event == PS_SEAL) {
+      if (old->stream_sealed || p->bytes < old->bytes ||
+          p->stream_capacity != old->stream_capacity ||
+          p->stream_runs != old->stream_runs)
+        return err(error, LC_ERR_PROTOCOL, "journal stream seal mismatch");
+      old->bytes = p->bytes;
+      old->stream_sealed = 1;
+      if (!old->dirty_link)
+        dirty_entry(s, old, NULL);
+      entry_free(p);
+      return LC_OK;
+    }
+    if (p->key.kind == PS_CATALOG) {
+      ps_catalog_drop_record(s, old, release);
+      entry_free(p);
+      return LC_OK;
+    }
+    if (p->key.kind == PS_STREAM) {
+      if (old->catalog_refs)
+        return err(error, LC_ERR_PROTOCOL, "journal retires a catalog target");
+      rc = remove_owned(s, old, release, 0, error);
+      if (rc == LC_OK)
+        rc = remove_owned(s, old, release, 1, error);
+      if (rc == LC_OK)
+        entry_free(p);
+      return rc;
+    }
+    if (p->key.kind == PS_OWNED_RUN) {
+      head = stream_lookup(s, p->key.owner);
+      if (!head || !head->stream_runs)
+        return err(error, LC_ERR_PROTOCOL, "piece removal has no head");
+      --head->stream_runs;
+      if (!head->dirty_link)
+        dirty_entry(s, head, NULL);
+    }
+    p->deleted = 1;
+  }
+  register_entry(s, p);
+  dirty_entry(s, p, old);
+  install(s, p);
+  return LC_OK;
+}
 static int recover(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire,
                                           *buffer;
   const unsigned char *root;
   ps_directory *directory = NULL;
   metadata_recovery recovery;
-  ps_entry *p = NULL, *old;
+  ps_entry *p = NULL;
   struct stat st;
   size_t cursor = 0, bytes, i, first, last;
   int a, b, event, rc;
@@ -3104,17 +3463,7 @@ static int recover(ps_space *s, lc_error *error) {
       lc_error_cleanup(error);
       break;
     }
-    if (event == PS_RESERVE_IDS) {
-      if (s->token_limit > UINT64_MAX - TOKEN_RANGE ||
-          p->token != s->token_limit + TOKEN_RANGE) {
-        entry_free(p);
-        rc = err(error, LC_ERR_PROTOCOL,
-                 "invalid incarnation range progression");
-        goto done;
-      }
-      s->token_limit = p->token;
-      entry_free(p);
-    } else if (event == PS_PUT) {
+    if (event == PS_PUT) {
       rc = verify_entry(s, p, buffer, error);
       if (rc != LC_OK) {
         entry_free(p);
@@ -3123,99 +3472,11 @@ static int recover(ps_space *s, lc_error *error) {
         lc_error_cleanup(error);
         break;
       }
-      old = lookup(s, p->key);
-      if (p->key.kind != PS_CATALOG && p->key.kind != PS_OWNED_RUN &&
-          (!immutable_key(p->key) || p->key.kind == PS_COLLECTION) && old &&
-          !old->deleted) {
-        entry_free(p);
-        rc = err(error, LC_ERR_PROTOCOL,
-                 "collection position overwritten in journal");
-        goto done;
-      }
-      if (p->key.kind == PS_OWNED_RUN) {
-        if (p->owned_mapped) {
-          ps_entry *head = stream_lookup(s, p->key.owner);
-          rc = !old || old->deleted || !head ||
-                       p->stream_capacity != old->stream_capacity
-                   ? err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch")
-                   : LC_OK;
-        } else if (old && !old->deleted)
-          rc =
-              err(error, LC_ERR_PROTOCOL, "owned grant overwritten in journal");
-        else
-          rc = install_owned_grant(s, p, error);
-        if (rc != LC_OK) {
-          entry_free(p);
-          goto done;
-        }
-      } else if (p->key.kind == PS_STREAM &&
-                 (p->bytes || p->stream_capacity || p->stream_runs ||
-                  p->stream_sealed)) {
-        entry_free(p);
-        rc = err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
-        goto done;
-      }
-      if (p->key.kind == PS_CATALOG) {
-        rc = ps_catalog_prepare_record(s, p, 0, error);
-        if (rc != LC_OK) {
-          entry_free(p);
-          goto done;
-        }
-        ps_catalog_apply_record(s, p, s->sequence + 1);
-      }
-      register_entry(s, p);
-      dirty_entry(s, p, old);
-      install(s, p);
-    } else {
-      old = lookup(s, p->key);
-      if (!old || old->deleted || old->token != p->token) {
-        entry_free(p);
-        rc = err(error, LC_ERR_PROTOCOL, "journal retirement owner mismatch");
-        goto done;
-      }
-      if (event == PS_SEAL) {
-        if (old->stream_sealed || p->bytes < old->bytes ||
-            p->stream_capacity != old->stream_capacity ||
-            p->stream_runs != old->stream_runs) {
-          entry_free(p);
-          rc = err(error, LC_ERR_PROTOCOL, "journal stream seal mismatch");
-          goto done;
-        }
-        old->bytes = p->bytes;
-        old->stream_sealed = 1;
-        if (!old->dirty_link)
-          dirty_entry(s, old, NULL);
-        entry_free(p);
-      } else if (p->key.kind == PS_CATALOG) {
-        ps_catalog_drop_record(s, old, s->sequence + 1);
-        entry_free(p);
-      } else if (p->key.kind == PS_STREAM) {
-        rc = old->catalog_refs
-                 ? err(error, LC_ERR_PROTOCOL,
-                       "journal retires a catalog target")
-                 : remove_owned(s, old, s->sequence + 1, 0, error);
-        if (rc == LC_OK)
-          rc = remove_owned(s, old, s->sequence + 1, 1, error);
-        entry_free(p);
-        if (rc != LC_OK)
-          goto done;
-      } else {
-        if (p->key.kind == PS_OWNED_RUN) {
-          ps_entry *head = stream_lookup(s, p->key.owner);
-          if (!head || !head->stream_runs) {
-            entry_free(p);
-            rc = err(error, LC_ERR_PROTOCOL, "piece removal has no head");
-            goto done;
-          }
-          --head->stream_runs;
-          if (!head->dirty_link)
-            dirty_entry(s, head, NULL);
-        }
-        p->deleted = 1;
-        register_entry(s, p);
-        dirty_entry(s, p, old);
-        install(s, p);
-      }
+    }
+    rc = apply_journal_event(s, p, event, s->sequence + 1, error);
+    if (rc != LC_OK) {
+      entry_free(p);
+      goto done;
     }
     cursor += bytes;
     ++s->sequence;
@@ -3474,6 +3735,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
        * mutex. Even assigning the same bytes/pointers would race them. Only
        * replace canonical links and mutex-protected projection metadata. */
       dest->publication_sequence = 0;
+      dest->peer_sequence = 0;
       dest->durable_visibility = 0;
       dest->state = 1;
       dest->safe = dest->deleted = 0;
@@ -3625,7 +3887,7 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
     return err(error, LC_ERR_PROTOCOL,
                "conflicting checkpoint projection roots");
   if (get64(root + 8) == s->generation)
-    return canonical_journal(s, error);
+    return canonical_journal(s, 1, error);
   if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
       get64(root + 16) < s->capacity || get64(root + 48) < s->token_limit)
     return err(error, LC_ERR_PENDING,
@@ -4059,7 +4321,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       p->extents = grown;
       p->capacity = n;
     }
-    rc = ps_internal_allocation_begin(s, &guard, error);
+    rc = revision_begin(s, &guard, error);
     if (rc != LC_OK) {
       rc = allocation_end(s, guard, rc, error);
       pthread_mutex_unlock(&s->mutex);
@@ -4137,6 +4399,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   size_t prior;
   uint64_t sequence = 0;
   ps_ref published_ref;
+  ps_coordination_guard *guard;
   int rc, durable;
   if (!w || w->failed || w->published)
     return err(error, LC_ERR_INVALID, "container writer cannot publish");
@@ -4149,7 +4412,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   durable = s->durable || w->entry->key.kind == PS_CONTROL ||
             w->entry->key.kind == PS_OWNED_RUN;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = revision_begin(s, &guard, error);
   old = lookup(s, w->entry->key);
   prior = old && !old->deleted ? entry_bytes(old) : 0;
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN &&
@@ -4184,6 +4447,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     published_ref.incarnation = w->entry->token;
   } else
     w->failed = 1;
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && durable)
     rc = wait_durable(s, sequence, error);
@@ -4247,11 +4511,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
   if (rc != LC_OK)
     goto done;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
-  if (rc == LC_OK)
-    rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK && guard)
-    rc = allocation_refresh(s, error);
+  rc = revision_begin(s, &guard, error);
   if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
                       count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
@@ -4292,6 +4552,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     put32(wire + 4, (uint32_t)bytes);
     put64(wire + 8, s->sequence + 1);
     put32(wire + 16, (uint32_t)count);
+    put32(wire + 20, (uint32_t)durable);
     cursor = 64;
     for (i = 0; i < count; ++i) {
       encode_entry(wire + cursor, writers[i]->entry, s->sequence + 1 + i,
@@ -4385,7 +4646,6 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   ps_reader *r;
   ps_coordination_guard *guard;
   ps_entry *p;
-  uint64_t visible;
   int rc;
   if (out)
     *out = NULL;
@@ -4397,12 +4657,8 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
     return err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
-  p = lookup(s, key);
-  visible = s->durable || key.kind == PS_CONTROL || (p && p->durable_visibility)
-                ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
-                : UINT64_MAX;
-  while (p && p->publication_sequence > visible)
-    p = p->previous;
+  p = selected_value(s, lookup(s, key),
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
   if (rc == LC_OK && (!p || p->deleted))
     rc = err(error, LC_ERR_INVALID, "container key not found");
   if (rc == LC_OK && ref &&
@@ -4530,7 +4786,8 @@ void ps_read_reference(const ps_reader *r, ps_ref *out) {
 }
 static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
   if (s->durable || (p && (p->key.kind == PS_CONTROL || p->durable_visibility)))
-    while (p && p->publication_sequence > prefix)
+    while (p && (p->peer_sequence ? p->peer_sequence > s->peer_durable
+                                  : p->publication_sequence > prefix))
       p = p->previous;
   return p && !p->deleted ? p : NULL;
 }
@@ -4960,6 +5217,7 @@ done:
 static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
                         int missing_ok, lc_error *error) {
   ps_entry *p, *tombstone;
+  ps_coordination_guard *guard;
   int rc, matched;
   uint64_t sequence = 0;
   if (!s || !immutable_key(key))
@@ -4968,7 +5226,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
   if (!tombstone)
     return err(error, LC_ERR_NOMEM, "cannot allocate pending retirement");
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = revision_begin(s, &guard, error);
   p = lookup(s, key);
   matched = p && !p->deleted &&
             (!expected || (!memcmp(expected->container, s->identity, 16) &&
@@ -4989,6 +5247,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
     sequence = tombstone->publication_sequence;
   } else
     entry_free(tombstone);
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && matched && (s->durable || key.kind == PS_CONTROL))
     rc = wait_durable(s, sequence, error);

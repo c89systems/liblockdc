@@ -38,6 +38,8 @@ typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
   uint64_t publication_sequence;
+  uint64_t
+      peer_sequence; /* imported visibility uses the certified wire clock */
   uint64_t stream_capacity, stream_runs, stream_ready;
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */
@@ -105,6 +107,7 @@ struct ps_space {
   ps_readiness *readiness;
   /* Local completed-byte prefix certified by this owner's journal framing. */
   uint64_t own_ready_sequence, own_ready_wire;
+  uint64_t peer_durable;
   pthread_mutex_t mutex;
   pthread_mutex_t sync_io_mutex, commit_mutex;
   pthread_cond_t commit_cond;

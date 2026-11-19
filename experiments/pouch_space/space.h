@@ -154,10 +154,10 @@ int ps_open(const char *, int create, const ps_options *, ps_space **,
  * does not implicitly checkpoint or make NoSync publications durable.
  * Error leaves the handle. */
 int ps_close(ps_space *, lc_error *);
-/* Reconcile a peer's selected checkpoint while retaining captures, private
- * producers and admitted budgets. Identity-only journal grants also refresh.
- * Application journal replay still returns PENDING. A changed checkpoint
- * stabilizes obsolete-root retirement before its free space becomes reusable.
+/* Reconcile certified journal frames in the current generation, or adopt a
+ * newer checkpoint while retaining captures, private producers and budgets.
+ * A newer checkpoint followed by application frames still returns PENDING.
+ * Adoption stabilizes obsolete-root retirement before reusing its space.
  * Shared capture entry points also reconcile before selecting a new handle;
  * existing captures and I/O-free scalar observations do not trigger adoption.
  * Exclusive spaces require no observation I/O. */

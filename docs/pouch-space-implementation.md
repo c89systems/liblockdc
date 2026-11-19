@@ -6323,3 +6323,60 @@ Native durable work increased in both profiles. NoSync work was 2.5 to 3.2 times
 the multifile reference. These are exclusive-backend lifecycle measurements.
 Performance acceptance remains open. Logs and the frozen native baseline are
 in `build/pouch-space-shared-durability/`.
+
+## Live application journal replay
+
+Participants can adopt certified application frames in the currently selected
+checkpoint generation. Refresh and new reader captures reconcile the journal.
+Immutable prepare, publish and remove refresh ahead of ownership decisions, so
+a peer can finish a private producer after an intervening publication. Late
+allocation helpers still fence a changed projection. They may already hold
+lookup results that replay would invalidate.
+
+A frame imports all of its metadata and claims together. An undo log covers
+only the affected free intervals, quarantined ranges and packed cells. A failed
+frame leaves its predecessor available and the failed frame eligible for retry.
+The live reader reads journal descriptors and any required mapped-run tables.
+Immutable value bodies remain on disk and keep their ordinary read-time
+checksum checks. Cold recovery shares the frame decoder and event transitions
+and retains its full recovery validation.
+
+Imported immutable versions use the certified wire watermark and keep their
+prior incarnations available to durable readers. Group frames carry their
+durable visibility rule, including for a NoSync peer. Structural events
+advance once their frames are durable. The same-generation path applies
+catalog binding, stream creation, grants, seals, map replacements and
+retirement. A participant that completes a checkpoint advances its cached
+peer watermark before returning. The journal flag is part of the experimental
+format and shared participants must use matching builds.
+
+The Debug, GNU and musl affected suites each passed 53 groups. After adding
+the process round trip and the local checkpoint visibility check, the final
+eight focused groups passed on all three builds. Five TSan and five strict
+Memcheck profiles passed. The replay tests cover all 14 measured allocation
+fault sites, a damaged atomic group, mixed full-run and packed ownership,
+captured runs and catalog views, and both directions of publication between
+two live processes. They also exercise a publisher killed after framing.
+The packed-producer fixture now completes both publications. Memcheck uses
+the fixture's cooperative wait around real OFD locks for that case.
+
+All 36 matched GNU lifecycle runs verified reopened results. The table reports
+median milliseconds as pre-change native / current native / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 40.07 / 48.88 / 19.05 | 534.43 / 540.93 / 474.08 | 130.15 / 83.78 / 34.86 | 1424.05 / 1561.52 / 1460.71 |
+| Maximum worker index flush | 17.39 / 18.68 / 0.98 | 15.31 / 15.94 / 1.17 | 45.41 / 31.94 / 1.53 | 20.00 / 22.37 / 3.89 |
+| Maintenance | 7.36 / 6.03 / 0.20 | 6.21 / 6.73 / 0.24 | 6.96 / 6.65 / 0.31 | 9.69 / 8.71 / 0.56 |
+| Close | 0.26 / 0.28 / 40.29 | 0.36 / 0.34 / 35.17 | 0.69 / 0.74 / 85.66 | 0.81 / 0.68 / 94.48 |
+| Reopen | 2.96 / 3.58 / 0.98 | 3.01 / 3.51 / 0.94 | 5.71 / 7.60 / 1.69 | 7.13 / 5.37 / 1.73 |
+
+Native NoSync work was 2.4 to 2.6 times the multifile reference. The exclusive
+lifecycle samples were mixed against the previous native build. Shared
+throughput and performance acceptance remain open. Logs and the frozen
+baseline are in `build/pouch-space-journal-replay/`.
+
+A checkpoint with a following application tail still needs coordinated
+adoption of both the directory and the tail before publishing reconstructed
+free space. Shared owned-stream readiness, logical ownership and cache
+coherence, and normal shared admission remain open.

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 #include "lc_api_internal.h"
+#include "revision.h"
 #include "space_internal.h"
 #include <errno.h>
 #include <pthread.h>
@@ -777,7 +778,7 @@ static void *packed_producer(void *context) {
   body_gate *g = context;
   lc_error e = {0};
   g->rc = small_publish(g->s, NULL, 64, 1, &e);
-  REQUIRE(g->rc == LC_ERR_PENDING);
+  ok(g->rc, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
@@ -822,6 +823,7 @@ static void packed(void) {
   REQUIRE(pthread_join(job, NULL) == 0);
   ok(ps_budget_close(budget, &e), &e);
   ok(ps_close(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_close(a, &e), &e);
   ok(ps_open(path, 0, NULL, &a, &e), &e);
@@ -830,11 +832,6 @@ static void packed(void) {
       continue;
     ps_reader *r = NULL;
     int rc = ps_read_open(a, key(id), NULL, &r, &e);
-    if (id == 64) {
-      REQUIRE(rc == LC_ERR_INVALID && !r);
-      lc_error_cleanup(&e);
-      continue;
-    }
     ok(rc, &e);
     unsigned char bytes[65];
     size_t got = 0;
@@ -2296,7 +2293,318 @@ static void readiness_faults(void) {
         REQUIRE(!coverage(NULL, 0) && !unlink(path));
       }
 }
+static ps_writer *replay_value(ps_space *s, ps_key name, int byte, size_t n,
+                               lc_error *e) {
+  ps_writer *w = NULL;
+  unsigned char body[PS_CHUNK];
+  REQUIRE(n <= sizeof(body));
+  memset(body, byte, n);
+  ok(ps_begin(s, NULL, name, &w, e), e);
+  ok(ps_write(w, body, n, e), e);
+  return w;
+}
+static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
+  lc_error e = {0};
+  ps_reader *r = NULL;
+  int rc = ps_read_open(s, name, NULL, &r, &e);
+  if (!bytes) {
+    REQUIRE(rc == LC_ERR_INVALID && !r);
+    lc_error_cleanup(&e);
+    return;
+  }
+  ok(rc, &e);
+  captured_expect(r, (unsigned char)byte, bytes);
+  ps_reader_close(r);
+}
+static void journal_replay(void) {
+  lc_error e = {0};
+  projection_io m = {0};
+  ps_io io = {0};
+  ps_options observer = {0}, publisher = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *held = NULL;
+  ps_writer *writers[3];
+  ps_ref reference[3];
+  uint64_t prefix;
+  io.context = &m;
+  io.read = projection_read;
+  io.write = projection_write;
+  io.reserve = reserve_io;
+  io.sync = projection_sync;
+  observer.io = &io;
+  publisher.durable_sync = 1;
+  ok(ps_open(path, 1, &observer, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
+  ok(ps_open(path, 0, &publisher, &b, &e), &e);
+  writers[0] = replay_value(b, key(1), 23, PS_CHUNK, &e);
+  writers[1] = replay_value(b, key(2), 24, 63, &e);
+  writers[2] = replay_value(b, key(3), 25, 64, &e);
+  /* Quarantine the foreign writer's full run before the group owns it. */
+  ps_budget *watch = NULL;
+  ps_budget_plan plan = {PS_PAGE, 0, 0, 0};
+  ok(ps_budget_open(a, &plan, &watch, &e), &e);
+  REQUIRE(a->pinned_free_bytes >= PS_CHUNK);
+  ok(ps_revision_publish(writers, 3, 0, PS_COMMIT_DEFER_SYNC, reference,
+                         &prefix, &e),
+     &e);
+  for (size_t i = 0; i < 3; ++i)
+    ps_writer_close(writers[i]);
+  ps_entry *published = ps_internal_lookup(b, key(1));
+  REQUIRE(published && published->count == 1);
+  m.ranges = 1;
+  m.forbidden[0].first = published->extents[0].offset;
+  m.forbidden[0].last = m.forbidden[0].first + PS_CHUNK;
+  m.armed = 1;
+  uint64_t generation = a->generation;
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(a->generation == generation && a->sequence == b->sequence);
+  REQUIRE(!m.syncs && !m.payload_reads);
+  m.armed = 0;
+  expect_value(a, key(1), 65, 1);
+  expect_value(a, key(2), 0, 0);
+  expect_value(a, key(3), 0, 0);
+  ok(ps_flush(b, &e), &e);
+  expect_value(a, key(1), PS_CHUNK, 23);
+  expect_value(a, key(2), 63, 24);
+  expect_value(a, key(3), 64, 25);
+  captured_expect(held, 1, 65);
+  ok(ps_value_remove(a, key(2), &reference[1], &e), &e);
+  expect_value(a, key(2), 0, 0);
+  expect_value(b, key(2), 63, 24);
+  ok(ps_flush(a, &e), &e);
+  expect_value(b, key(2), 0, 0);
+  capture_put(b, 4, 65);
+  expect_value(a, key(4), 65, 4);
+  writers[0] = replay_value(b, key(5), 26, 65, &e);
+  ok(ps_revision_publish(writers, 1, 0, PS_COMMIT_DEFER_SYNC, NULL, &prefix,
+                         &e),
+     &e);
+  ps_writer_close(writers[0]);
+  expect_value(a, key(5), 0, 0);
+  ok(ps_budget_close(watch, &e), &e);
+  ps_reader_close(held);
+  ok(ps_checkpoint(a, &e), &e);
+  int present;
+  uint64_t bytes;
+  ok(ps_value_info(a, key(5), &reference[0], &bytes, &present, &e), &e);
+  REQUIRE(present && bytes == 65);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  expect_value(a, key(1), PS_CHUNK, 23);
+  expect_value(a, key(2), 0, 0);
+  expect_value(a, key(4), 65, 4);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void journal_replay_faults(void) {
+  size_t sites = 0;
+  for (size_t failure = 0; failure <= sites; ++failure) {
+    lc_error e = {0};
+    ps_space *a = NULL, *b = NULL;
+    ps_writer *writers[4];
+    ok(ps_open(path, 1, NULL, &a, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    ok(ps_refresh(a, &e), &e);
+    capture_put(b, 21, 65);
+    ok(ps_refresh(a, &e), &e);
+    writers[0] = replay_value(b, key(1), 23, 65, &e);
+    writers[1] = replay_value(b, key(2), 24, PS_CHUNK, &e);
+    writers[2] = replay_value(b, key(3), 25, 66, &e);
+    writers[3] = replay_value(b, key(4), 26, PS_CHUNK, &e);
+    ok(ps_revision_publish(writers, 4, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e),
+       &e);
+    for (size_t i = 0; i < 4; ++i)
+      ps_writer_close(writers[i]);
+    uint64_t latest = a->sequence, free_before = a->free_bytes;
+    uint64_t packed = a->packed_bytes, pages = a->packed_pages;
+    size_t cursor = a->journal;
+    if (!failure) {
+      unsigned char original, damaged;
+      off_t last = (off_t)(PS_JOURNAL_OFFSET + b->journal - 1);
+      REQUIRE(pread(b->fd, &original, 1, last) == 1);
+      damaged = original ^ 1;
+      REQUIRE(pwrite(b->fd, &damaged, 1, last) == 1);
+      REQUIRE(ps_refresh(a, &e) == LC_ERR_PROTOCOL);
+      lc_error_cleanup(&e);
+      REQUIRE(a->sequence == latest && a->journal == cursor &&
+              a->free_bytes == free_before && a->packed_bytes == packed);
+      for (size_t i = 1; i <= 4; ++i)
+        REQUIRE(!ps_internal_lookup(a, key(i)));
+      REQUIRE(pwrite(b->fd, &original, 1, last) == 1);
+    }
+    allocations = 0;
+    allocation_fail = failure;
+    measuring = 1;
+    int rc = ps_refresh(a, &e);
+    measuring = 0;
+    if (!failure) {
+      ok(rc, &e);
+      sites = allocations;
+      REQUIRE(sites > 8);
+    } else {
+      REQUIRE(rc == LC_ERR_NOMEM && a->sequence == latest &&
+              a->journal == cursor && a->free_bytes == free_before &&
+              a->packed_bytes == packed && a->packed_pages == pages);
+      lc_error_cleanup(&e);
+      for (size_t i = 1; i <= 4; ++i)
+        REQUIRE(!ps_internal_lookup(a, key(i)));
+      ok(ps_refresh(a, &e), &e);
+    }
+    expect_value(a, key(1), 65, 23);
+    expect_value(a, key(2), PS_CHUNK, 24);
+    expect_value(a, key(3), 66, 25);
+    expect_value(a, key(4), PS_CHUNK, 26);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_close(a, &e), &e);
+    ok(ps_close(b, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+  fprintf(stderr, "journal replay allocated at %zu fault sites\n", sites);
+}
+static void journal_replay_child(int notify, int proceed) {
+  lc_error e = {0};
+  ps_space *b = NULL;
+  ps_writer *writers[2];
+  char message;
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  writers[0] = replay_value(b, key(1), 31, PS_CHUNK, &e);
+  writers[1] = replay_value(b, key(2), 32, 65, &e);
+  ok(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_writer_close(writers[0]);
+  ps_writer_close(writers[1]);
+  REQUIRE(write(notify, "R", 1) == 1 && read(proceed, &message, 1) == 1);
+  REQUIRE(message == 'P');
+  expect_value(b, key(3), 65, 3);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(close(notify) == 0 && close(proceed) == 0);
+}
+static void journal_replay_process(void) {
+  lc_error e = {0};
+  ps_space *a = NULL;
+  for (int killed = 0; killed < 2; ++killed) {
+    int notify[2], proceed[2], exited;
+    ok(ps_open(path, 1, NULL, &a, &e), &e);
+    REQUIRE(pipe(notify) == 0 && pipe(proceed) == 0);
+    pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (!child) {
+      char output[16], input[16];
+      REQUIRE(!close(notify[0]) && !close(proceed[1]));
+      snprintf(output, sizeof(output), "%d", notify[1]);
+      snprintf(input, sizeof(input), "%d", proceed[0]);
+      execl(executable, executable, "--journal-child", path, output, input,
+            (char *)NULL);
+      _exit(127);
+    }
+    REQUIRE(!close(notify[1]) && !close(proceed[0]));
+    char message;
+    REQUIRE(read(notify[0], &message, 1) == 1 && message == 'R');
+    if (killed)
+      REQUIRE(kill(child, SIGKILL) == 0);
+    uint64_t generation = a->generation;
+    expect_value(a, key(1), PS_CHUNK, 31);
+    expect_value(a, key(2), 65, 32);
+    capture_put(a, 3, 65);
+    REQUIRE(a->generation == generation);
+    if (!killed)
+      REQUIRE(write(proceed[1], "P", 1) == 1);
+    REQUIRE(waitpid(child, &exited, 0) == child);
+    REQUIRE(killed ? WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL
+                   : WIFEXITED(exited) && WEXITSTATUS(exited) == 0);
+    REQUIRE(!close(notify[0]) && !close(proceed[1]));
+    ok(ps_flush(a, &e), &e);
+    ok(ps_close(a, &e), &e);
+    ok(ps_open(path, 0, NULL, &a, &e), &e);
+    expect_value(a, key(1), PS_CHUNK, 31);
+    expect_value(a, key(2), 65, 32);
+    expect_value(a, key(3), 65, 3);
+    ok(ps_close(a, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
+static void journal_replay_structural(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_key stream = {88, 101, PS_STREAM};
+  ps_owned_head *head = NULL, *observed = NULL;
+  ps_owned_status info, peer;
+  ps_owned_run *original = NULL, *retained = NULL, *mapped = NULL,
+               *current = NULL;
+  ps_catalog_info binding, captured;
+  ps_catalog_view *view = NULL, *missing = NULL;
+  unsigned char *bytes = malloc(PS_CHUNK);
+  int found;
+  REQUIRE(bytes);
+  memset(bytes, 0x51, PS_CHUNK);
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_owned_open(b, NULL, stream, 1, NULL, &head, &info, &e), &e);
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &original, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_owned_write(original, 0, bytes, 1000, &e), &e);
+  ps_piece_checksum crc;
+  ok(ps_owned_piece_extend(original, 0, NULL, 1000, bytes, &crc, &e), &e);
+  ok(ps_owned_commit(head, 1000, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ok(ps_owned_seal(head, &e), &e);
+  ok(ps_catalog_put(b, NULL, 88, PS_CATALOG_BODY, "stream", 6, NULL, stream,
+                    &info.ref, &binding, &e),
+     &e);
+  ok(ps_catalog_get(a, 88, PS_CATALOG_BODY, "stream", 6, &view, &e), &e);
+  REQUIRE(view);
+  ok(ps_owned_open(a, NULL, stream, 0, &info.ref, &observed, &peer, &e), &e);
+  REQUIRE(peer.sealed && peer.tail == 1000 && peer.runs == 1);
+  ok(ps_owned_grant(observed, NULL, 0, 0, &retained, &found, &e), &e);
+  REQUIRE(found && !ps_owned_run_mapped(retained));
+  ps_owned_range range = {100, 100};
+  ok(ps_owned_run_repack(head, original, NULL, &range, 1, NULL, NULL, &mapped,
+                         &e),
+     &e);
+  ok(ps_owned_grant(observed, NULL, 0, 0, &current, &found, &e), &e);
+  REQUIRE(found && ps_owned_run_mapped(current));
+  ok(ps_catalog_remove(b, 88, PS_CATALOG_BODY, "stream", 6, &binding.revision,
+                       &e),
+     &e);
+  ok(ps_owned_retire(head, &e), &e);
+  ok(ps_catalog_get(a, 88, PS_CATALOG_BODY, "stream", 6, &missing, &e), &e);
+  REQUIRE(!missing);
+  ok(ps_catalog_view_info(view, &captured, &e), &e);
+  REQUIRE(captured.target.incarnation == info.ref.incarnation);
+  ok(ps_owned_status_get(observed, &peer, &e), &e);
+  REQUIRE(peer.retired);
+  ok(ps_owned_read(retained, 0, bytes, 1000, &e), &e);
+  for (size_t i = 0; i < 1000; ++i)
+    REQUIRE(bytes[i] == 0x51);
+  ok(ps_owned_read(current, 100, bytes, 100, &e), &e);
+  for (size_t i = 0; i < 100; ++i)
+    REQUIRE(bytes[i] == 0x51);
+  ps_catalog_view_close(view);
+  ps_owned_run_close(current);
+  ps_owned_run_close(retained);
+  ps_owned_run_close(mapped);
+  ps_owned_run_close(original);
+  ps_owned_close(observed);
+  ps_owned_close(head);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ok(ps_catalog_get(a, 88, PS_CATALOG_BODY, "stream", 6, &missing, &e), &e);
+  REQUIRE(!missing);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  free(bytes);
+}
 int main(int argc, char **argv) {
+  if (argc == 5 && !strcmp(argv[1], "--journal-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    journal_replay_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--projection-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     projection_child(atoi(argv[3]), atoi(argv[4]));
@@ -2362,6 +2670,14 @@ int main(int argc, char **argv) {
     readiness_cohort();
   else if (!strcmp(argv[2], "readiness-faults"))
     readiness_faults();
+  else if (!strcmp(argv[2], "journal-replay"))
+    journal_replay();
+  else if (!strcmp(argv[2], "journal-replay-faults"))
+    journal_replay_faults();
+  else if (!strcmp(argv[2], "journal-replay-structural"))
+    journal_replay_structural();
+  else if (!strcmp(argv[2], "journal-replay-process"))
+    journal_replay_process();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();

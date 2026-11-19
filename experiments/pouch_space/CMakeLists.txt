@@ -112,7 +112,8 @@ if(LOCKDC_BUILD_TESTS)
       captures capture-faults capture-owned capture-race
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure shared-durable readiness-cohort
-      readiness-faults)
+      readiness-faults journal-replay journal-replay-faults
+      journal-replay-structural journal-replay-process)
     add_test(NAME pouch_space_live-allocator_${mode}
       COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120
