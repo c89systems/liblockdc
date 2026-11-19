@@ -6075,3 +6075,68 @@ durability, owned-stream/logical reader integration, multi-participant forecast
 capacity and coordinated abandoned-work recovery still precede normal shared
 admission. The full goal remains active. Multifile remains the default/reference,
 and production cutover still requires its explicit deployment decision.
+
+## Captured payload ownership in shared spaces
+
+Local captures now witness their physical extents on shared spaces. The first
+capture of an incarnation acquires its rounded cells or full runs; additional
+readers and captured views share that witness. Last close releases it. Capture
+selection and initial witnessing hold the same allocator authority as peer
+retirement, so a peer cannot reclaim the selected bytes between lookup and pin
+acquisition. This covers ordinary readers, validation, value vectors, owned-run
+lookup and mapping vectors. Catalog/head captures also fence their selection;
+their metadata objects contain no payload extents. Existing captures remain
+usable when the owner's canonical projection becomes stale. Opening another
+reader from an already captured value vector needs no new canonical selection.
+
+A shared participant whose selected checkpoint or application journal changed
+still returns `PENDING` for a new capture. This extends the previous mutation
+fence to selection of physical ownership. It does not implement projection
+replay. Scalar observations retain their local, I/O-free contract. The normal
+Pouch path continues to reject shared admission.
+
+Returned owned grants and mapped replacements transfer their private witnesses
+directly to captured ownership at publication. There is no physical unlock or
+overlapping second acquisition: OFD locks are not reference counted. Stats
+separate `retained_payload_bytes` from unpublished/unspent
+`claimed_payload_bytes` and private `claimed_metadata_bytes`. Extent operations
+coalesce adjacent physical ranges without allocating a range vector or reading
+application bodies. A contiguous multi-chunk capture requires one payload
+witness acquisition; repeated captures require none. Exclusive lifetime
+authority bypasses these range operations.
+
+Four additional allocator groups exercise packed tails, fragmented multi-chunk
+values, peer deletion and reuse, peer close/reopen, vector retention, owned-run
+repacking and direct kernel coverage. The race pauses capture before its first
+range claim and proves, through both a fresh FD and the retiring peer's OFD,
+that capture owns allocator authority while retirement waits. Fault coverage
+includes every range of fragmented ordinary/vector captures, authority
+acquisition/release, heap failures and failed rollback. Clean failures release
+partial captures; uncertain releases poison admission and retain residual
+authority until FD close. Older producer/checkpoint fixtures now separately
+account for captured bodies rather than expecting their witnesses to disappear.
+
+Qualification passes 59 Debug groups and 61 each on GNU/musl release, including
+the 96-case lease-capacity matrix and 48 attachment windows. Four raw TSan
+profiles pass with instrumented OpenSSL 3.6.5 and constrained workers. Four
+strict Memcheck profiles pass with 6,878 matching allocations/frees, zero
+remaining heap, errors or suppressions, and three inherited descriptors each.
+Only the contended Memcheck race uses the existing test-only cooperative OFD
+wait adapter; native and TSan tests retain raw blocking waits. Three negative
+controls fail at their kernel observations when payload witnessing, continuous
+handoff or capture authority is removed. A GNU exclusive indexed lifecycle
+trace still performs three `fcntl` calls and verifies reopened results. This
+is a syscall check, not a new performance acceptance claim.
+
+Evidence is in ignored `build/pouch-space-local-captures/`:
+`qualified-*.log`, `pressure-*.log`, focused repair logs, `tsan-*.log`,
+`memcheck-*.log`, `negative-controls.log`, `no-*.log` and
+`exclusive-{fcntl,traced}.log`, with the native runners alongside them.
+
+This completes captured-payload isolation as a prerequisite for live checkpoint
+adoption. Adoption must preserve stable captured entry handles, unfinished
+producers and admitted workspace while rebuilding the canonical projection;
+it must not import application changes from inside an allowance helper after
+its caller has captured lookup/capacity inputs. Checkpoint adoption, application
+journal replay and shared readiness/durability remain unfinished, together with
+the shared qualification requirements listed above. The full goal stays active.

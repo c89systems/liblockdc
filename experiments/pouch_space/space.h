@@ -106,6 +106,9 @@ typedef struct ps_stats {
    * shared participant. Canonically selected pages belong to the root.
    * Exclusive lifetime authority needs no separate witnesses. */
   uint64_t claimed_metadata_bytes;
+  /* Local captured payload witnesses on shared roots, excluding unspent and
+   * unpublished producer ownership. Counted once per retained incarnation. */
+  uint64_t retained_payload_bytes;
   uint64_t budgets;
   /* Component maxima of unclaimed future maintenance, not summed owner
    * credits. Allocator admission also protects their incremental checkpoint

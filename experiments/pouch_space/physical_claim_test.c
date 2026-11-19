@@ -755,10 +755,11 @@ static void metadata_checkpoint_faults(void) {
       lc_error_cleanup(&e);
       if (!f.failed_release) {
         ps_stats st = status(s, &e);
-        /* A failed checkpoint may retain its optional incremental spare;
-         * every witness must still belong to free workspace, and the full
-         * admitted forecast remains protected. */
-        REQUIRE(kernel_metadata() == st.claimed_metadata_bytes &&
+        /* A failed checkpoint may retain its optional incremental spare.
+         * Separate the captured old body from protected free workspace. */
+        REQUIRE(kernel_metadata() ==
+                    st.claimed_metadata_bytes + st.retained_payload_bytes &&
+                st.retained_payload_bytes == 4 * PS_MIB &&
                 st.claimed_metadata_bytes == st.metadata_available_bytes &&
                 st.metadata_available_bytes >= st.metadata_workspace_bytes);
         ok(ps_checkpoint(s, &e), &e);
@@ -966,9 +967,12 @@ static void owned_producers(void) {
   pthread_cond_broadcast(&g.cond);
   pthread_mutex_unlock(&g.mutex);
   REQUIRE(pthread_join(thread, NULL) == 0);
-  REQUIRE(kernel_bytes() == 0 && status(s, &e).claimed_payload_bytes == 0);
+  REQUIRE(kernel_bytes() == PS_PAGE &&
+          status(s, &e).claimed_payload_bytes == 0 &&
+          status(s, &e).retained_payload_bytes == PS_PAGE);
   ok(ps_budget_close(work.budget, &e), &e);
   ps_owned_run_close(work.run);
+  REQUIRE(!kernel_bytes() && !status(s, &e).retained_payload_bytes);
   ps_owned_close(work.head);
   ok(ps_checkpoint(s, &e), &e);
   ok(ps_close(s, &e), &e);

@@ -888,6 +888,433 @@ static void history(void) {
   ok(ps_close(s, &e), &e);
   REQUIRE(coverage(NULL, 0) == 0 && unlink(path) == 0);
 }
+static void captured_expect(ps_reader *r, unsigned char value, size_t bytes) {
+  lc_error e = {0};
+  unsigned char buffer[997];
+  size_t done = 0, n;
+  while (done < bytes) {
+    ok(ps_read(r, buffer, sizeof(buffer), &n, &e), &e);
+    REQUIRE(n && n <= bytes - done);
+    for (size_t i = 0; i < n; ++i)
+      REQUIRE(buffer[i] == value);
+    done += n;
+  }
+  ok(ps_read(r, buffer, sizeof(buffer), &n, &e), &e);
+  REQUIRE(!n);
+}
+static void capture_put_key(ps_space *s, ps_key k, size_t bytes) {
+  lc_error e = {0};
+  unsigned char buffer[997];
+  ps_writer *w = NULL;
+  memset(buffer, (int)(k.key % 251), sizeof(buffer));
+  ok(ps_begin(s, NULL, k, &w, &e), &e);
+  while (bytes) {
+    size_t n = bytes < sizeof(buffer) ? bytes : sizeof(buffer);
+    ok(ps_write(w, buffer, n, &e), &e);
+    bytes -= n;
+  }
+  ok(ps_publish(w, NULL, &e), &e);
+  ps_writer_close(w);
+}
+static void capture_put(ps_space *s, uint64_t id, size_t bytes) {
+  capture_put_key(s, key(id), bytes);
+}
+static void capture_fragmented(ps_space *s, uint64_t id) {
+  lc_error e = {0};
+  unsigned char *buffer = malloc(PS_CHUNK);
+  REQUIRE(buffer);
+  memset(buffer, (int)(id % 251), PS_CHUNK);
+  ps_writer *w = NULL;
+  ok(ps_begin(s, NULL, key(id), &w, &e), &e);
+  for (size_t part = 0; part < 3; ++part) {
+    ok(ps_write(w, buffer, PS_CHUNK, &e), &e);
+    ps_key separator = {89, id * 4 + part, PS_STATE};
+    capture_put_key(s, separator, PS_CHUNK);
+  }
+  ok(ps_write(w, buffer, 65, &e), &e);
+  ok(ps_publish(w, NULL, &e), &e);
+  ps_writer_close(w);
+  free(buffer);
+}
+static void captures(void) {
+  const size_t sizes[] = {1, 65, 3 * PS_CHUNK + 65};
+  for (size_t test = 0; test < sizeof(sizes) / sizeof(*sizes); ++test) {
+    lc_error e = {0};
+    ps_space *a = NULL, *b = NULL;
+    ps_reader *first = NULL, *second = NULL, *snapshot = NULL, *fresh = NULL;
+    ps_values *view = NULL;
+    ok(ps_open(path, 1, NULL, &a, &e), &e);
+    capture_put(a, 1, sizes[test]);
+    ok(ps_checkpoint(a, &e), &e);
+    uint64_t baseline = coverage(NULL, 0);
+    ok(ps_read_open(a, key(1), NULL, &first, &e), &e);
+    uint64_t held = status(a).retained_payload_bytes;
+    REQUIRE(held == (sizes[test] + PS_CELL - 1) / PS_CELL * PS_CELL);
+    REQUIRE(coverage(NULL, 0) == baseline + held);
+    ok(ps_read_open(a, key(1), NULL, &second, &e), &e);
+    ok(ps_values_capture(a, 88, PS_STATE, PS_STATE, &view, &e), &e);
+    REQUIRE(ps_values_count(view) == 1 &&
+            status(a).retained_payload_bytes == held &&
+            coverage(NULL, 0) == baseline + held);
+    ps_reader_close(first);
+    REQUIRE(coverage(NULL, 0) == baseline + held);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    ok(ps_delete(b, key(1), &e), &e);
+    ok(ps_checkpoint(b, &e), &e);
+    REQUIRE(status(b).retired_bytes >= held);
+    for (uint64_t id = 2; id < 34; ++id)
+      capture_put(b, id, PS_CHUNK + 1);
+    ok(ps_checkpoint(b, &e), &e);
+    /* Captures are usable after their owner's projection goes stale. A new
+     * selection is fenced before it can pin an already retired incarnation. */
+    REQUIRE(ps_read_open(a, key(1), NULL, &fresh, &e) == LC_ERR_PENDING &&
+            !fresh);
+    lc_error_cleanup(&e);
+    ok(ps_check(a, &e), &e);
+    ok(ps_values_read_open(view, 0, &snapshot, &e), &e);
+    ps_values_close(view);
+    captured_expect(second, 1, sizes[test]);
+    captured_expect(snapshot, 1, sizes[test]);
+    ps_reader_close(second);
+    REQUIRE(status(a).retained_payload_bytes == held);
+    /* Cold recovery must reconstruct the witnesses even after the peer
+     * discards its retired metadata. No retained application body is copied. */
+    ok(ps_close(b, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    REQUIRE(status(b).retired_bytes >= held);
+    unsigned char byte;
+    ok(ps_read_at(snapshot, 0, &byte, 1, &e), &e);
+    REQUIRE(byte == 1);
+    ps_reader_close(snapshot);
+    REQUIRE(!status(a).retained_payload_bytes);
+    ok(ps_close(a, &e), &e);
+    ok(ps_checkpoint(b, &e), &e);
+    REQUIRE(!status(b).retired_bytes);
+    ok(ps_close(b, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  }
+}
+typedef struct capture_fault {
+  int kind, reason, armed, rollback;
+  size_t nth, calls;
+} capture_fault;
+static int capture_lock(void *context, int fd, int command,
+                        struct flock *lock) {
+  capture_fault *f = context;
+  int payload = command == F_OFD_SETLK && lock->l_start >= PS_DATA;
+  int match = f->kind == 1   ? payload && lock->l_type == F_RDLCK
+              : f->kind == 2 ? payload && lock->l_type == F_UNLCK
+              : f->kind == 3 ? command == F_OFD_SETLKW && lock->l_start == 4
+                             : command == F_OFD_SETLK && lock->l_start == 4 &&
+                                   lock->l_type == F_UNLCK;
+  if (f->armed && ((match && ++f->calls == f->nth) ||
+                   (f->rollback && payload && lock->l_type == F_UNLCK))) {
+    errno = f->reason;
+    return -1;
+  }
+  return fcntl(fd, command, lock);
+}
+static void capture_faults(void) {
+  /* Each extent acquisition, guard admission and guard release, both ordinary
+   * readers and vector captures. Clean acquisition failures are retryable;
+   * uncertain releases fail stop and retain residual authority until close. */
+  for (int vector = 0; vector < 2; ++vector)
+    for (int kind = 1; kind <= 4; ++kind)
+      for (int reason = 0; reason < 3; ++reason)
+        for (size_t nth = 1; nth <= (kind <= 2 ? (vector ? 8U : 4U) : 1U);
+             ++nth) {
+          lc_error e = {0};
+          capture_fault f = {
+              kind, reason == 0 ? EINTR : reason == 1 ? EAGAIN : EIO, 0, 0, nth,
+              0};
+          ps_coordination_io io = {&f, capture_lock};
+          ps_options options = {0};
+          options.coordination_io = &io;
+          ps_space *s = NULL;
+          ps_reader *r = NULL;
+          ps_values *view = NULL;
+          ok(ps_open(path, 1, &options, &s, &e), &e);
+          capture_fragmented(s, 1);
+          if (vector)
+            capture_fragmented(s, 2);
+          ok(ps_checkpoint(s, &e), &e);
+          uint64_t before = coverage(NULL, 0);
+          f.armed = kind != 2;
+          int rc = vector
+                       ? ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e)
+                       : ps_read_open(s, key(1), NULL, &r, &e);
+          if (kind == 2 || !reason) {
+            ok(rc, &e);
+            REQUIRE(status(s).retained_payload_bytes ==
+                    (vector ? 2U : 1U) * (3 * PS_CHUNK + 128));
+            if (kind == 2)
+              f.armed = 1;
+            ps_values_close(view);
+            ps_reader_close(r);
+          } else {
+            REQUIRE(rc == ((kind == 1 || kind == 3) && reason == 1
+                               ? LC_ERR_PENDING
+                               : LC_ERR_TRANSPORT));
+            REQUIRE(!r && !view && !s->readers);
+            lc_error_cleanup(&e);
+          }
+          REQUIRE(f.calls >= nth);
+          f.armed = 0;
+          if ((kind == 2 || kind == 4) && reason) {
+            REQUIRE(ps_check(s, &e) == LC_ERR_TRANSPORT);
+            lc_error_cleanup(&e);
+            REQUIRE(status(s).retained_payload_bytes > 0);
+          } else {
+            ok(ps_check(s, &e), &e);
+            REQUIRE(!status(s).retained_payload_bytes &&
+                    coverage(NULL, 0) == before);
+            ok(ps_read_open(s, key(1), NULL, &r, &e), &e);
+            captured_expect(r, 1, 3 * PS_CHUNK + 65);
+            ps_reader_close(r);
+          }
+          ok(ps_close(s, &e), &e);
+          REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+        }
+  /* A failed acquisition followed by an uncertain rollback must not escape
+   * as a clean Pending result or expose a partially captured vector. */
+  for (int vector = 0; vector < 2; ++vector) {
+    lc_error e = {0};
+    capture_fault f = {1, EAGAIN, 0, 1, 3, 0};
+    ps_coordination_io io = {&f, capture_lock};
+    ps_options options = {0};
+    options.coordination_io = &io;
+    ps_space *s = NULL;
+    ps_reader *r = NULL;
+    ps_values *view = NULL;
+    ok(ps_open(path, 1, &options, &s, &e), &e);
+    capture_fragmented(s, 1);
+    ok(ps_checkpoint(s, &e), &e);
+    f.armed = 1;
+    int rc = vector ? ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e)
+                    : ps_read_open(s, key(1), NULL, &r, &e);
+    REQUIRE(rc == LC_ERR_TRANSPORT && !r && !view && !s->readers);
+    lc_error_cleanup(&e);
+    REQUIRE(status(s).retained_payload_bytes == 2 * PS_CHUNK);
+    f.armed = 0;
+    ok(ps_close(s, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  }
+  for (size_t nth = 0; nth <= 2; ++nth) {
+    lc_error e = {0};
+    ps_space *s = NULL;
+    ps_values *view = NULL;
+    capture_fault f = {1, EIO, 0, 0, (size_t)-1, 0};
+    ps_coordination_io io = {&f, capture_lock};
+    ps_options options = {0};
+    options.coordination_io = &io;
+    ok(ps_open(path, 1, &options, &s, &e), &e);
+    capture_put(s, 1, 3 * PS_CHUNK + 65);
+    ok(ps_checkpoint(s, &e), &e);
+    uint64_t before = coverage(NULL, 0);
+    allocations = 0;
+    allocation_fail = nth;
+    measuring = 1;
+    f.armed = 1;
+    int rc = ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e);
+    measuring = 0;
+    REQUIRE(allocations == (nth ? nth : 2));
+    /* Contiguous multi-chunk values need one physical witness operation;
+     * body size does not multiply the capture's range syscalls. */
+    REQUIRE(f.calls == (nth ? 0U : 1U));
+    if (nth) {
+      REQUIRE(rc == LC_ERR_NOMEM && !view && !s->readers);
+      lc_error_cleanup(&e);
+    } else {
+      ok(rc, &e);
+      ps_values_close(view);
+    }
+    REQUIRE(coverage(NULL, 0) == before);
+    ok(ps_close(s, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  }
+}
+static void capture_owned(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_run *original = NULL, *mapped = NULL, *again = NULL, **list = NULL;
+  ps_key stream = {88, 1, PS_STREAM};
+  ps_owned_status info;
+  capture_fault f = {1, EAGAIN, 0, 0, 1, 0};
+  ps_coordination_io io = {&f, capture_lock};
+  ps_options options = {0};
+  options.coordination_io = &io;
+  unsigned char *scratch = malloc(PS_CHUNK);
+  REQUIRE(scratch);
+  memset(scratch, 0x51, PS_CHUNK);
+  int found;
+  size_t count;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_owned_open(a, NULL, stream, 1, NULL, &head, &info, &e), &e);
+  ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &original, &found, &e), &e);
+  REQUIRE(found && status(a).retained_payload_bytes == PS_PAGE &&
+          !status(a).claimed_payload_bytes);
+  ok(ps_owned_write(original, 0, scratch, 1000, &e), &e);
+  ps_piece_checksum crc;
+  ok(ps_owned_piece_extend(original, 0, NULL, 1000, scratch, &crc, &e), &e);
+  ok(ps_owned_commit(head, 1000, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ok(ps_owned_seal(head, &e), &e);
+  ps_owned_run_close(original);
+  original = NULL;
+  REQUIRE(!status(a).retained_payload_bytes);
+  f.armed = 1;
+  REQUIRE(ps_owned_grant(head, NULL, 0, 0, &original, &found, &e) ==
+              LC_ERR_PENDING &&
+          !original && !found);
+  lc_error_cleanup(&e);
+  f.calls = 0;
+  REQUIRE(ps_owned_runs_capture(head, &list, &count, &e) == LC_ERR_PENDING &&
+          !list && !count && !status(a).retained_payload_bytes);
+  lc_error_cleanup(&e);
+  f.armed = 0;
+  ok(ps_owned_grant(head, NULL, 0, 0, &original, &found, &e), &e);
+  REQUIRE(found && status(a).retained_payload_bytes == PS_PAGE);
+  ps_owned_range range = {100, 100};
+  ok(ps_owned_run_repack(head, original, NULL, &range, 1, NULL, NULL, &mapped,
+                         &e),
+     &e);
+  uint64_t held = PS_PAGE + ps_owned_run_storage(mapped);
+  REQUIRE(status(a).retained_payload_bytes == held &&
+          !status(a).claimed_payload_bytes);
+  /* The packed result was pinned while private. Publication must transfer
+   * its exact witness, rather than release the producer's overlapping lock. */
+  REQUIRE(coverage(NULL, 0) == status(a).claimed_metadata_bytes + held);
+  ok(ps_owned_grant(head, NULL, 0, 0, &again, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_owned_runs_capture(head, &list, &count, &e), &e);
+  REQUIRE(count == 1 && status(a).retained_payload_bytes == held);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ps_owned_head *peer = NULL;
+  ok(ps_owned_open(b, NULL, stream, 0, &info.ref, &peer, &info, &e), &e);
+  ok(ps_owned_retire(peer, &e), &e);
+  ps_owned_close(peer);
+  ok(ps_checkpoint(b, &e), &e);
+  for (uint64_t id = 2; id < 34; ++id)
+    capture_put(b, id, PS_CHUNK + 65);
+  ok(ps_owned_read(original, 100, scratch, 100, &e), &e);
+  for (size_t i = 0; i < 100; ++i)
+    REQUIRE(scratch[i] == 0x51);
+  ok(ps_owned_read(mapped, 100, scratch, 100, &e), &e);
+  for (size_t i = 0; i < 100; ++i)
+    REQUIRE(scratch[i] == 0x51);
+  ps_owned_run_close(mapped);
+  ps_owned_run_close(again);
+  REQUIRE(status(a).retained_payload_bytes == held);
+  ps_owned_run_close(list[0]);
+  lc_free_with_allocator(NULL, list);
+  REQUIRE(status(a).retained_payload_bytes == PS_PAGE);
+  ps_owned_run_close(original);
+  ps_owned_close(head);
+  REQUIRE(!status(a).retained_payload_bytes);
+  ok(ps_close(a, &e), &e);
+  ok(ps_checkpoint(b, &e), &e);
+  REQUIRE(!status(b).retired_bytes);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  free(scratch);
+}
+static int pause_capture(void *context, int fd, int command,
+                         struct flock *lock) {
+  query_gate *g = context;
+  if (command == F_OFD_SETLK && lock->l_start >= PS_DATA &&
+      lock->l_type == F_RDLCK) {
+    pthread_mutex_lock(&g->mutex);
+    if (g->armed) {
+      g->armed = 0;
+      g->entered = 1;
+      pthread_cond_broadcast(&g->cond);
+      while (!g->released)
+        pthread_cond_wait(&g->cond, &g->mutex);
+    }
+    pthread_mutex_unlock(&g->mutex);
+  }
+  return fcntl(fd, command, lock);
+}
+typedef struct capture_worker {
+  ps_space *space;
+  ps_reader *reader;
+  query_gate *gate;
+  int retire;
+} capture_worker;
+static void *one_capture(void *context) {
+  capture_worker *w = context;
+  lc_error e = {0};
+  if (w->retire) {
+    ok(ps_delete(w->space, key(1), &e), &e);
+    ok(ps_checkpoint(w->space, &e), &e);
+    pthread_mutex_lock(&w->gate->mutex);
+    w->gate->finished = 1;
+    pthread_cond_broadcast(&w->gate->cond);
+    pthread_mutex_unlock(&w->gate->mutex);
+  } else
+    ok(ps_read_open(w->space, key(1), NULL, &w->reader, &e), &e);
+  return NULL;
+}
+static void capture_race(void) {
+  for (size_t round = 0; round < 8; ++round) {
+    lc_error e = {0};
+    ps_space *a = NULL, *b = NULL;
+    query_gate g = {0};
+    REQUIRE(pthread_mutex_init(&g.mutex, NULL) == 0 &&
+            pthread_cond_init(&g.cond, NULL) == 0);
+    ps_coordination_io ai = {&g, pause_capture}, bi = {&g, trace_attempt};
+    ps_options ao = {0}, bo = {0};
+    ao.coordination_io = &ai;
+    bo.coordination_io = &bi;
+    ok(ps_open(path, 1, &ao, &a, &e), &e);
+    capture_put(a, 1, PS_CHUNK + 65);
+    ok(ps_checkpoint(a, &e), &e);
+    ok(ps_open(path, 0, &bo, &b, &e), &e);
+    capture_worker first = {a, NULL, &g, 0}, second = {b, NULL, &g, 1};
+    pthread_t x, y;
+    g.attempted = 0;
+    g.armed = 1;
+    REQUIRE(pthread_create(&x, NULL, one_capture, &first) == 0);
+    pthread_mutex_lock(&g.mutex);
+    while (!g.entered)
+      pthread_cond_wait(&g.cond, &g.mutex);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(pthread_create(&y, NULL, one_capture, &second) == 0);
+    pthread_mutex_lock(&g.mutex);
+    while (!g.attempted)
+      pthread_cond_wait(&g.cond, &g.mutex);
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    REQUIRE(fd >= 0);
+    struct flock lock = {0};
+    lock.l_type = F_WRLCK;
+    lock.l_whence = SEEK_SET;
+    lock.l_start = 4;
+    lock.l_len = 1;
+    REQUIRE(fcntl(fd, F_OFD_GETLK, &lock) == 0 && lock.l_type == F_WRLCK);
+    /* Query through the retiring OFD too: it ignores its own locks. This
+     * proves the paused capture, rather than the peer, owns the authority. */
+    lock.l_type = F_WRLCK;
+    lock.l_pid = 0;
+    REQUIRE(fcntl(b->fd, F_OFD_GETLK, &lock) == 0 && lock.l_type == F_WRLCK);
+    REQUIRE(!g.finished && close(fd) == 0);
+    g.released = 1;
+    pthread_cond_broadcast(&g.cond);
+    pthread_mutex_unlock(&g.mutex);
+    REQUIRE(pthread_join(x, NULL) == 0 && pthread_join(y, NULL) == 0);
+    captured_expect(first.reader, 1, PS_CHUNK + 65);
+    REQUIRE(status(a).retained_payload_bytes == PS_CHUNK + 128);
+    REQUIRE(status(b).retired_bytes >= PS_CHUNK + 128);
+    ps_reader_close(first.reader);
+    ok(ps_close(a, &e), &e);
+    ok(ps_checkpoint(b, &e), &e);
+    REQUIRE(!status(b).retired_bytes);
+    ok(ps_close(b, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+    REQUIRE(pthread_cond_destroy(&g.cond) == 0 &&
+            pthread_mutex_destroy(&g.mutex) == 0);
+  }
+}
 int main(int argc, char **argv) {
   if (argc == 5 && !strcmp(argv[1], "--child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
@@ -898,7 +1325,7 @@ int main(int argc, char **argv) {
   cooperative_wait = argc == 4;
   if (cooperative_wait) {
     REQUIRE(!strcmp(argv[2], "threads") || !strcmp(argv[2], "serialized") ||
-            !strcmp(argv[2], "packed"));
+            !strcmp(argv[2], "packed") || !strcmp(argv[2], "capture-race"));
     fprintf(stderr,
             "test-only cooperative OFD waits; real kernel locks retained\n");
   }
@@ -922,6 +1349,14 @@ int main(int argc, char **argv) {
     packed();
   else if (!strcmp(argv[2], "history"))
     history();
+  else if (!strcmp(argv[2], "captures"))
+    captures();
+  else if (!strcmp(argv[2], "capture-faults"))
+    capture_faults();
+  else if (!strcmp(argv[2], "capture-owned"))
+    capture_owned();
+  else if (!strcmp(argv[2], "capture-race"))
+    capture_race();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();

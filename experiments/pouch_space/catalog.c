@@ -402,6 +402,7 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, ps_catalog_view **out,
                    lc_error *e) {
   ps_catalog_view *view;
+  ps_coordination_guard *guard;
   ps_entry *p;
   uint64_t prefix;
   int rc;
@@ -413,7 +414,7 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   if (!view)
     return cat_error(e, LC_ERR_NOMEM, "cannot allocate catalog view");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_capture_begin(s, &guard, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   p = named(s, owner, kind, name, length);
   p = visible(p, prefix);
@@ -428,6 +429,16 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
     view->entry = p;
     view->target = p->catalog->target;
     *out = view;
+  }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (rc != LC_OK && view->entry) {
+    if (view->target) {
+      --view->target->pins;
+      --view->target->catalog_pins;
+    }
+    --view->entry->pins;
+    --s->readers;
+    *out = NULL;
   }
   pthread_mutex_unlock(&s->mutex);
   if (!*out)
@@ -462,6 +473,7 @@ void ps_catalog_view_close(ps_catalog_view *view) {
 int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
                      ps_catalog_visit_fn callback, void *context, lc_error *e) {
   ps_entry **entries = NULL, *p, *v;
+  ps_coordination_guard *guard;
   ps_catalog_info info;
   size_t i, count = 0, at = 0;
   uint64_t prefix;
@@ -469,7 +481,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   if (!s || !callback || kind > PS_CATALOG_CONVERSION)
     return cat_error(e, LC_ERR_INVALID, "catalog visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_capture_begin(s, &guard, e);
   /* Sync completion does not need the allocator mutex. Both passes must use
    * one watermark, or a newly visible name can exceed the counted vector. */
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
@@ -499,6 +511,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
         }
         ++s->readers;
       }
+  rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   for (i = 0; i < at && rc == LC_OK; ++i) {
     information(s, entries[i], &info);

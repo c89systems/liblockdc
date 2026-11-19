@@ -52,6 +52,7 @@ typedef struct ps_entry {
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
   int payload_claimed;
+  int reader_claimed;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
@@ -119,6 +120,7 @@ struct ps_space {
   /* Shared participants witness private checkpoint workspace. Selected pages
    * belong to canonical authority; retirement claims precede root selection. */
   uint64_t metadata_claim_bytes;
+  uint64_t reader_claim_bytes;
   int metadata_claims_active;
   uint64_t claimed_free_bytes;
   size_t budgets;
@@ -176,6 +178,14 @@ int ps_catalog_validate_directory(ps_space *, lc_error *);
 void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
 int ps_internal_healthy(ps_space *, lc_error *);
+/* Capture selection and its first physical witness under the same canonical
+ * authority. Captured handles subsequently retain their incarnation directly.
+ */
+int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
+int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
+                            lc_error *);
+int ps_internal_entry_pin(ps_space *, ps_entry *, lc_error *);
+void ps_internal_entry_unpin(ps_space *, ps_entry *);
 int ps_internal_allocation_begin(ps_space *, ps_coordination_guard **,
                                  lc_error *);
 int ps_internal_allocation_end(ps_space *, ps_coordination_guard *, int,

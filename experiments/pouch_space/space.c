@@ -443,6 +443,20 @@ int ps_internal_allocation_end(ps_space *s, ps_coordination_guard *guard,
                                int rc, lc_error *error) {
   return allocation_end(s, guard, rc, error);
 }
+int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
+                              lc_error *error) {
+  int rc = healthy(s, error);
+  *guard = NULL;
+  if (rc == LC_OK)
+    rc = allocation_begin(s, guard, error);
+  if (rc == LC_OK && *guard)
+    rc = canonical_observe(s, error);
+  return rc;
+}
+int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
+                            lc_error *error) {
+  return allocation_end(s, guard, rc, error);
+}
 static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
                           lc_error *error) {
   int first = s->physical_claim_bytes == 0, rc;
@@ -814,12 +828,76 @@ static uint64_t extent_allocation(const ps_extent *extent) {
   return extent->flags & EXTENT_PACKED ? cell_count(extent->bytes) * PS_CELL
                                        : aligned(extent->bytes);
 }
+static size_t entry_range(const ps_entry *p, size_t at, size_t end,
+                          uint64_t *offset, uint64_t *bytes) {
+  *offset = p->extents[at].offset;
+  *bytes = extent_allocation(&p->extents[at++]);
+  while (at < end && *offset + *bytes == p->extents[at].offset)
+    *bytes += extent_allocation(&p->extents[at++]);
+  return at;
+}
+static int reader_release_range(ps_space *s, uint64_t offset, uint64_t bytes,
+                                lc_error *error) {
+  uint64_t before = s->physical_claim_bytes;
+  int rc = physical_release(s, offset, bytes, error);
+  s->reader_claim_bytes -= before - s->physical_claim_bytes;
+  return rc;
+}
+int ps_internal_entry_pin(ps_space *s, ps_entry *p, lc_error *error) {
+  size_t i, next, undo;
+  uint64_t offset, bytes;
+  int rc;
+  /* Private producers already hold these exact witnesses. Publication hands
+   * them to the captured incarnation without an OFD unlock/relock gap. OFD
+   * locks are not reference counted, so overlapping claims are never added. */
+  if (!p->pins && !p->payload_claimed &&
+      ps_coordination_shared(s->coordination)) {
+    for (i = 0; i < p->count; i = next) {
+      next = entry_range(p, i, p->count, &offset, &bytes);
+      rc = physical_claim(s, offset, bytes, error);
+      if (rc != LC_OK) {
+        for (undo = 0; undo < i;) {
+          undo = entry_range(p, undo, i, &offset, &bytes);
+          (void)reader_release_range(s, offset, bytes, NULL);
+        }
+        if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+          lc_error_cleanup(error);
+          return healthy(s, error);
+        }
+        return rc;
+      }
+      s->reader_claim_bytes += bytes;
+    }
+    p->reader_claimed = p->count != 0;
+  }
+  ++p->pins;
+  return LC_OK;
+}
+void ps_internal_entry_unpin(ps_space *s, ps_entry *p) {
+  size_t i;
+  uint64_t offset, bytes;
+  if (--p->pins || !p->reader_claimed)
+    return;
+  for (i = 0; i < p->count;) {
+    i = entry_range(p, i, p->count, &offset, &bytes);
+    if (reader_release_range(s, offset, bytes, NULL) != LC_OK)
+      return; /* Uncertain authority stays on this poisoned OFD until close. */
+  }
+  p->reader_claimed = 0;
+}
 static int entry_release_claims(ps_space *s, ps_entry *p, lc_error *error) {
   uint64_t offset = 0, bytes = 0, n;
   size_t i;
   int rc;
   if (!p->payload_claimed)
     return LC_OK;
+  if (p->pins && p->state == 1 && ps_coordination_shared(s->coordination)) {
+    for (i = 0; i < p->count; ++i)
+      s->reader_claim_bytes += extent_allocation(&p->extents[i]);
+    p->reader_claimed = p->count != 0;
+    p->payload_claimed = 0;
+    return LC_OK;
+  }
   for (i = 0; i < p->count; ++i) {
     n = extent_allocation(&p->extents[i]);
     if (bytes && offset + bytes != p->extents[i].offset) {
@@ -3662,6 +3740,7 @@ void ps_writer_close(ps_writer *w) {
 int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
                  lc_error *error) {
   ps_reader *r;
+  ps_coordination_guard *guard;
   ps_entry *p;
   uint64_t visible;
   int rc;
@@ -3674,7 +3753,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   if (!r)
     return err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   p = lookup(s, key);
   visible = s->durable || key.kind == PS_CONTROL || (p && p->durable_visibility)
                 ? __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)
@@ -3686,13 +3765,18 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   if (rc == LC_OK && ref &&
       (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
     rc = err(error, LC_ERR_INVALID, "stale or foreign container reference");
+  if (rc == LC_OK)
+    rc = ps_internal_entry_pin(s, p, error);
+  if (rc == LC_OK)
+    r->entry = p;
+  rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc == LC_OK) {
-    ++p->pins;
     ++s->readers;
     r->space = s;
     r->entry = p;
     *out = r;
-  }
+  } else if (r->entry)
+    ps_internal_entry_unpin(s, r->entry);
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     lc_free_with_allocator(NULL, r);
@@ -3833,13 +3917,14 @@ int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
 int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
                       int *valid, lc_error *error) {
   ps_entry *p;
+  ps_coordination_guard *guard;
   unsigned char *buffer = NULL;
   int rc, checked = 0;
   if (!s || !valid || !immutable_key(key))
     return err(error, LC_ERR_INVALID, "value validation requires typed output");
   *valid = 0;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   p = selected_value(s, lookup(s, key),
                      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
   if (rc != LC_OK || !p ||
@@ -3851,8 +3936,17 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
     p = NULL;
   }
   if (p) {
-    ++p->pins;
-    ++s->readers;
+    rc = ps_internal_entry_pin(s, p, error);
+    if (rc == LC_OK)
+      ++s->readers;
+    else
+      p = NULL;
+  }
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  if (rc != LC_OK && p) {
+    ps_internal_entry_unpin(s, p);
+    --s->readers;
+    p = NULL;
   }
   pthread_mutex_unlock(&s->mutex);
   if (!p)
@@ -3875,7 +3969,7 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
       p->value_checked = checked;
     *valid = p->value_checked > 0;
   }
-  --p->pins;
+  ps_internal_entry_unpin(s, p);
   --s->readers;
   if (p->state == 2 && p->safe && !p->pins)
     collect(s);
@@ -3886,6 +3980,7 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
 int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
                       unsigned int last, ps_values **out, lc_error *error) {
   ps_values *view;
+  ps_coordination_guard *guard;
   ps_entry *p, *selected;
   uint64_t prefix;
   size_t i, n = 0, at = 0;
@@ -3898,7 +3993,7 @@ int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
   if (!view)
     return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
     for (p = s->buckets[i]; p; p = p->hash_next)
@@ -3917,14 +4012,20 @@ int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
       if (p->key.owner == owner && p->key.kind >= first &&
           p->key.kind <= last && immutable_key(p->key) &&
           (selected = selected_value(s, p, prefix)) != NULL) {
-        view->items[at++] = selected;
-        ++selected->pins;
+        rc = ps_internal_entry_pin(s, selected, error);
+        if (rc == LC_OK)
+          view->items[at++] = selected;
+        else
+          break;
       }
+  rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc == LC_OK) {
     view->space = s;
     view->count = at;
     ++s->readers;
-  }
+  } else
+    while (at)
+      ps_internal_entry_unpin(s, view->items[--at]);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
     *out = view;
@@ -3985,7 +4086,7 @@ void ps_values_close(ps_values *view) {
   s = view->space;
   pthread_mutex_lock(&s->mutex);
   for (i = 0; i < view->count; ++i)
-    --view->items[i]->pins;
+    ps_internal_entry_unpin(s, view->items[i]);
   --s->readers;
   collect(s);
   pthread_mutex_unlock(&s->mutex);
@@ -4025,7 +4126,7 @@ void ps_reader_close(ps_reader *r) {
     return;
   }
   pthread_mutex_lock(&s->mutex);
-  --r->entry->pins;
+  ps_internal_entry_unpin(s, r->entry);
   --s->readers;
   if (r->entry->state == 2 && r->entry->safe && !r->entry->pins)
     collect(s);
@@ -4433,8 +4534,9 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->metadata_fallbacks = s->metadata_fallbacks;
   out->reserved_payload_bytes = s->reserved_payload;
   out->claimed_payload_bytes =
-      s->physical_claim_bytes - s->metadata_claim_bytes;
+      s->physical_claim_bytes - s->metadata_claim_bytes - s->reader_claim_bytes;
   out->claimed_metadata_bytes = s->metadata_claim_bytes;
+  out->retained_payload_bytes = s->reader_claim_bytes;
   out->reserved_metadata_bytes = s->reserved_metadata;
   out->reserved_entries = s->reserved_entries;
   out->budgets = s->budgets;
@@ -4492,6 +4594,7 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                   const ps_ref *ref, ps_owned_head **out,
                   ps_owned_status *status, lc_error *error) {
   ps_owned_head *head;
+  ps_coordination_guard *guard;
   ps_entry *p = NULL, *old;
   uint64_t sequence = 0;
   int rc;
@@ -4511,7 +4614,7 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     p->key = key;
   }
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   old = lookup(s, key);
   if (rc == LC_OK && create && old &&
       (!old->deleted ||
@@ -4549,11 +4652,12 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     head->space = s;
     head->entry = p;
     p->stream_open = 1;
-    ++p->pins;
+    ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
   } else if (create && p->state == 0)
     entry_free(p);
+  rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && create && s->durable)
     rc = wait_durable(s, sequence, error);
@@ -4573,7 +4677,7 @@ void ps_owned_close(ps_owned_head *head) {
   pthread_mutex_lock(&s->mutex);
   head->entry->stream_open = 0;
   head->entry->orphan_claimed = 0;
-  --head->entry->pins;
+  ps_internal_entry_unpin(s, head->entry);
   --s->readers;
   if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
     collect(s);
@@ -4818,9 +4922,10 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     dirty_entry(s, p, NULL);
     install(s, p);
+    /* Transfer private range witnesses directly to the returned run. */
+    (void)ps_internal_entry_pin(s, p, NULL);
     rc = entry_release_claims(s, p, error);
     if (rc == LC_OK) {
-      ++p->pins;
       ++s->readers;
       run->space = s;
       run->entry = p;
@@ -4849,6 +4954,7 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
                    uint64_t desired, ps_owned_run **out, int *found,
                    lc_error *error) {
   ps_owned_run *run;
+  ps_coordination_guard *guard;
   ps_space *s;
   ps_entry *p;
   ps_key key;
@@ -4872,15 +4978,17 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
     key.owner = head->entry->token;
     key.key = base;
     pthread_mutex_lock(&s->mutex);
-    rc = healthy(s, error);
+    rc = ps_internal_capture_begin(s, &guard, error);
     p = lookup(s, key);
+    if (rc == LC_OK && p && !p->deleted)
+      rc = ps_internal_entry_pin(s, p, error);
     if (rc == LC_OK && p && !p->deleted) {
-      ++p->pins;
       ++s->readers;
       run->space = s;
       run->entry = p;
       run->references = 1;
     }
+    rc = ps_internal_capture_end(s, guard, rc, error);
     pthread_mutex_unlock(&s->mutex);
     if (rc == LC_OK && run->entry)
       rc = verify_owned(s, p, header, error);
@@ -4903,6 +5011,7 @@ uint64_t ps_owned_run_base(const ps_owned_run *run) {
 int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
                           size_t *count, lc_error *error) {
   ps_space *s;
+  ps_coordination_guard *guard;
   ps_entry *p;
   ps_owned_run **items = NULL;
   size_t n = 0, capacity, i;
@@ -4916,7 +5025,7 @@ int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
                "mapping capture requires head and outputs");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   capacity = (size_t)head->entry->stream_runs;
   if (rc == LC_OK &&
       (head->entry->deleted ||
@@ -4938,15 +5047,20 @@ int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
       rc = err(error, LC_ERR_NOMEM, "cannot capture mapping handle");
       break;
     }
+    rc = ps_internal_entry_pin(s, p, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, items[n]);
+      break;
+    }
     items[n]->space = s;
     items[n]->entry = p;
     items[n]->references = 1;
-    ++p->pins;
     ++s->readers;
     ++n;
   }
   if (rc == LC_OK && n != capacity)
     rc = err(error, LC_ERR_PROTOCOL, "mapping count differs from its head");
+  rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   for (i = 0; rc == LC_OK && i < n; ++i) {
     unsigned char header[PS_RUN_IDENTITY_BYTES];
@@ -4977,7 +5091,7 @@ void ps_owned_run_close(ps_owned_run *run) {
     return;
   s = run->space;
   pthread_mutex_lock(&s->mutex);
-  --run->entry->pins;
+  ps_internal_entry_unpin(s, run->entry);
   --s->readers;
   if (run->entry->state == 2 && run->entry->safe && !run->entry->pins)
     collect(s);
