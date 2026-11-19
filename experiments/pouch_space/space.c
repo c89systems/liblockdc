@@ -4941,6 +4941,42 @@ static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
       p = p->previous;
   return p && !p->deleted ? p : NULL;
 }
+int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
+                            void *buffer, size_t bytes, uint64_t known,
+                            uint64_t *incarnation, int *current,
+                            lc_error *error) {
+  ps_entry *latest = lookup(s, key);
+  ps_entry *p = selected_value(s, latest, prefix);
+  unsigned char *dest = buffer;
+  size_t i, left = bytes;
+  int rc;
+  *incarnation = 0;
+  *current = p == latest;
+  if (!p || !*current)
+    return LC_OK;
+  if (p->bytes != bytes)
+    return err(error, LC_ERR_PROTOCOL, "invalid fixed control size");
+  if (p->token == known) {
+    *incarnation = known;
+    return LC_OK;
+  }
+  for (i = 0; i < p->count; ++i) {
+    const ps_extent *extent = p->extents + i;
+    if (extent->bytes > left)
+      return err(error, LC_ERR_PROTOCOL, "invalid fixed control extent");
+    rc = transfer(s, dest, (size_t)extent->bytes, extent->offset, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    if (checksum(dest, (size_t)extent->bytes) != extent->crc)
+      return err(error, LC_ERR_PROTOCOL, "fixed control checksum mismatch");
+    dest += (size_t)extent->bytes;
+    left -= (size_t)extent->bytes;
+  }
+  if (left)
+    return err(error, LC_ERR_PROTOCOL, "incomplete fixed control");
+  *incarnation = p->token;
+  return LC_OK;
+}
 int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
                   int *present, lc_error *error) {
   ps_entry *p;
@@ -5646,6 +5682,22 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
       head->entry->stream_complete_generation &&
       head->entry->stream_complete_generation == head->space->generation;
 }
+int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
+                              uint64_t *tail) {
+  ps_owned_head head;
+  ps_owned_status status;
+  head.space = s;
+  head.entry = lookup(s, key);
+  if (!head.entry || head.entry->token != ref->incarnation ||
+      memcmp(s->identity, ref->container, 16))
+    return 0;
+  owned_status(&head, &status);
+  if (status.retired || status.sealed ||
+      (!status.complete && (status.capacity || status.tail)))
+    return 0;
+  *tail = status.tail;
+  return 1;
+}
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                       const ps_ref *ref, int guarded, ps_owned_head **out,
                       ps_owned_status *status, lc_error *error) {
@@ -6204,36 +6256,53 @@ uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
 uint64_t ps_owned_run_base(const ps_owned_run *run) {
   return run ? run->entry->key.key : 0;
 }
-int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
-                          size_t *count, lc_error *error) {
-  ps_space *s;
+static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
+                        const ps_ref *ref, uint64_t start, uint64_t end,
+                        ps_owned_run ***out, size_t *count, lc_error *error) {
   ps_coordination_guard *guard;
-  ps_entry *p;
+  ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_run **items = NULL;
-  size_t n = 0, capacity, i;
+  size_t n = 0, capacity = 0, i;
   int rc;
   if (out)
     *out = NULL;
   if (count)
     *count = 0;
-  if (!head || !out || !count)
+  if (!s || !out || !count ||
+      (!head && (!ref || key.kind != PS_STREAM || start >= end)))
     return err(error, LC_ERR_INVALID,
                "mapping capture requires head and outputs");
-  s = head->space;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
-  capacity = (size_t)head->entry->stream_runs;
+  if (rc == LC_OK && !head) {
+    head = lookup(s, key);
+    if (!head || head->token != ref->incarnation ||
+        memcmp(ref->container, s->identity, 16) || end > head->bytes)
+      rc = err(error, LC_ERR_PROTOCOL, "certified stream prefix changed");
+  }
   if (rc == LC_OK &&
-      (head->entry->deleted ||
-       head->entry->stream_runs > (uint64_t)((size_t)-1 / sizeof(*items))))
+      (head->deleted ||
+       head->stream_runs > (uint64_t)((size_t)-1 / sizeof(*items))))
     rc = err(error, LC_ERR_INVALID,
              "mapping capture is unavailable or too large");
+  if (rc == LC_OK) {
+    first = head->owned_first;
+    capacity = (size_t)head->stream_runs;
+  }
+  if (rc == LC_OK && ref) {
+    while (first && first->key.key + first->stream_capacity <= start)
+      first = first->owned_next;
+    capacity = 0;
+    for (limit = first; limit && limit->key.key < end;
+         limit = limit->owned_next)
+      ++capacity;
+  }
   if (rc == LC_OK && capacity) {
     items = lc_calloc_with_allocator(NULL, capacity, sizeof(*items));
     if (!items)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
   }
-  for (p = head->entry->owned_first; rc == LC_OK && p; p = p->owned_next) {
+  for (p = first; rc == LC_OK && p != limit; p = p->owned_next) {
     if (n == capacity) {
       rc = err(error, LC_ERR_PROTOCOL, "mapping count exceeds its head");
       break;
@@ -6271,6 +6340,17 @@ int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
     lc_free_with_allocator(NULL, items);
   }
   return rc;
+}
+int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
+                          size_t *count, lc_error *error) {
+  const ps_key none = {0};
+  return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
+                      none, NULL, 0, 0, out, count, error);
+}
+int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
+                        uint64_t start, uint64_t end, ps_owned_run ***out,
+                        size_t *count, lc_error *error) {
+  return capture_runs(s, NULL, key, ref, start, end, out, count, error);
 }
 int ps_owned_run_mapped(const ps_owned_run *run) {
   return run && run->entry->owned_mapped;

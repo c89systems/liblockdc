@@ -2224,14 +2224,17 @@ static void shared_handoff(const char *path) {
     ps_root *a = NULL, *b = NULL;
     ps_namespace *x, *y, *other;
     ps_namespace_view *old = NULL, *view = NULL;
-    ps_namespace_window *window = NULL;
+    ps_namespace_window *window = NULL, *peer_window = NULL;
     ps_namespace_append *held = NULL;
     ps_namespace_status status;
+    lc_pouch_storage_namespace_info point;
+    ps_checkpoint_info deferred;
+    struct ps_namespace_data *owner;
     lc_pouch_state_entry written = {0};
-    uint64_t segment = 0;
+    uint64_t segment = 0, old_tail;
     unsigned char bytes[64];
     struct iovec part = {bytes, sizeof(bytes)};
-    records original = {0}, fresh = {0};
+    records original = {0}, fresh = {0}, suffix = {0};
     shared_records checkpoint = {0};
     shared_namespace = 1;
     options.storage.durable_sync = durable;
@@ -2245,6 +2248,8 @@ static void shared_handoff(const char *path) {
                               sizeof(bytes), &window, &e),
        &e);
     ok(ps_namespace_view_open(x, &old, &e), &e);
+    ps_namespace_view_projection(old, &point);
+    old_tail = point.tail;
     ok(ps_root_open(path, 0, &options, &b, &e), &e);
     y = acquire(b, "shared", 0, &e);
     ok(ps_namespace_append_begin(y, 0, 0, PS_APPEND_PREFIX, NULL, &held, &e),
@@ -2253,24 +2258,66 @@ static void shared_handoff(const char *path) {
     clear(&e);
     REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_PENDING && !view);
     clear(&e);
+    REQUIRE(ps_namespace_projection(x, &point, &e) == LC_ERR_PENDING);
+    clear(&e);
     ok(append(a, other, 1, 0, 65, &e), &e);
     ps_namespace_append_close(held);
     ok(append(b, y, 2, 0, 65, &e), &e);
     fail_namespace_load = 1;
-    REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_NOMEM && !view);
+    ok(ps_namespace_projection(x, &point, &e), &e);
+    REQUIRE(fail_namespace_load == 1);
+    ok(ps_namespace_status_get(y, &status, &e), &e);
+    REQUIRE(fail_namespace_load == 1 && point.active_segment == 1 &&
+            point.active_incarnation && point.tail == status.tail &&
+            point.tail > written.payload_span.payload_offset &&
+            point.checkpoint_epoch == status.checkpoint_epoch);
+    ok(ps_namespace_view_suffix_open(x, &point, old_tail, &view, &e), &e);
+    ok(ps_namespace_view_visit(view, 1, visit, &suffix, &e), &e);
+    ps_namespace_view_close(view);
+    view = NULL;
+    REQUIRE(suffix.count == 1 && suffix.version == 2);
+    ok(capture(x, &fresh, &e), &e);
+    REQUIRE(fail_namespace_load == 1 && fresh.count == 2 &&
+            fresh.version == 2 && fresh.last_segment == 1);
+    ok(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                              written.payload_span.payload_offset,
+                              sizeof(bytes), &peer_window, &e),
+       &e);
+    REQUIRE(fail_namespace_load == 1);
+    REQUIRE(ps_namespace_status_get(x, &status, &e) == LC_ERR_NOMEM);
     REQUIRE(fail_namespace_load == 2);
     fail_namespace_load = 0;
     clear(&e);
     ok(ps_namespace_view_visit(old, 1, visit, &original, &e), &e);
     REQUIRE(original.count == 1 && original.version == 1);
-    ok(capture(x, &fresh, &e), &e);
-    REQUIRE(fresh.count == 2 && fresh.version == 2 && fresh.last_segment == 1);
+    ok(ps_ns_enter_checkpoint(y, &owner, &e), &e);
+    pthread_mutex_lock(&owner->mutex);
+    ok(ps_key_checkpoint_flush_deferred(owner->checkpoint, &e), &e);
+    ps_key_checkpoint_info(owner->checkpoint, &deferred);
+    pthread_mutex_unlock(&owner->mutex);
+    ps_ns_leave(owner);
+    REQUIRE(deferred.epoch && deferred.segment == 1);
+    ok(ps_namespace_projection(y, &point, &e), &e);
+    REQUIRE(point.checkpoint_epoch == deferred.epoch);
+    ok(ps_namespace_projection(x, &point, &e), &e);
+    REQUIRE(point.checkpoint_epoch == (durable ? 0 : deferred.epoch));
+    ok(ps_flush(ps_root_space(b), &e), &e);
+    ok(ps_namespace_projection(x, &point, &e), &e);
+    REQUIRE(point.checkpoint_epoch == deferred.epoch);
     ok(append(b, y, 3, 1, 65, &e), &e);
     ok(ps_namespace_checkpoint_flush(y, &e), &e);
     ok(ps_checkpoint(ps_root_space(b), &e), &e);
+    fail_namespace_load = 1;
+    REQUIRE(ps_namespace_projection(x, &point, &e) == LC_ERR_NOMEM);
+    REQUIRE(fail_namespace_load == 2);
+    fail_namespace_load = 0;
+    clear(&e);
+    ok(ps_namespace_projection(x, &point, &e), &e);
     ok(ps_namespace_status_get(x, &status, &e), &e);
     REQUIRE(status.active_segment == 2 && status.checkpoint_keys == 1 &&
-            status.covered_segment == 2);
+            status.covered_segment == 2 && point.active_segment == 2 &&
+            point.tail == status.tail && point.checkpoint_epoch &&
+            point.checkpoint_epoch == status.checkpoint_epoch);
     ok(ps_namespace_view_open(x, &view, &e), &e);
     ok(ps_namespace_view_visit(view, 1, visit_shared, &checkpoint, &e), &e);
     REQUIRE(checkpoint.index == 3 && checkpoint.version == 3 &&
@@ -2281,6 +2328,13 @@ static void shared_handoff(const char *path) {
                                &e),
        &e);
     REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+    memset(bytes, 0, sizeof(bytes));
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(peer_window),
+                               written.payload_span.payload_offset, &part, 1,
+                               &e),
+       &e);
+    REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+    ps_namespace_read_close(peer_window);
     lc_pouch_state_entry_cleanup(&allocator, &written);
     ps_namespace_read_close(window);
     ps_namespace_view_close(old);

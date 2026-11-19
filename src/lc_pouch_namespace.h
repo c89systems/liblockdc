@@ -65,6 +65,8 @@ typedef struct lc_pouch_namespace_marker_refresh_state {
 
 char *lc_pouch_namespace_segment_leaf(const lc_allocator *allocator,
                                       uint64_t segment_id);
+int lc_pouch_namespace_format_segment_leaf(uint64_t segment_id, char *buffer,
+                                           size_t capacity);
 char *lc_pouch_namespace_snapshot_leaf(const lc_allocator *allocator,
                                        uint64_t segment_id);
 /** Validates the sole numeric Pouch segment leaf format and returns its ID. */

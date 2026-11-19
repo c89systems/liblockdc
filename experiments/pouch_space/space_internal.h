@@ -206,6 +206,19 @@ int ps_internal_healthy(ps_space *, lc_error *);
 int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
 int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
                             lc_error *);
+/* Caller holds a canonical capture and samples one local visibility prefix
+ * for all values. Fixed controls have no application body or reader lifetime.
+ * A deferred replacement requires the namespace owner to resolve visibility.
+ * An exact match to a previously decoded incarnation leaves the buffer alone.
+ */
+int ps_internal_fixed_value(ps_space *, ps_key, uint64_t prefix, void *, size_t,
+                            uint64_t known, uint64_t *incarnation, int *current,
+                            lc_error *);
+/* Scalar catalog and stream observations share the caller's capture. */
+int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
+                             const void *, size_t, uint64_t prefix,
+                             ps_catalog_info *);
+int ps_internal_complete_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
 /* Caller holds the namespace-name guard while checking and claiming its
  * immutable catalog owner's writer stamp. */
 int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);

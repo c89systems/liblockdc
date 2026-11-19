@@ -270,6 +270,16 @@ static void information(ps_space *s, const ps_entry *p, ps_catalog_info *out) {
   }
   out->stream = p->catalog->stream;
 }
+int ps_internal_catalog_find(ps_space *s, uint64_t owner, unsigned int kind,
+                             const void *name, size_t length, uint64_t prefix,
+                             ps_catalog_info *out) {
+  ps_entry *p =
+      visible(named(s, owner, kind, name, length), prefix, s->peer_durable);
+  if (!p)
+    return 0;
+  information(s, p, out);
+  return 1;
+}
 int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   int rc;
   if (out)

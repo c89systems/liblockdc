@@ -7,6 +7,7 @@
 #include "lc_pouch_storage.h"
 #include "revision.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <pthread.h>
 #include <string.h>
 #include <zlib.h>
@@ -487,26 +488,17 @@ static uint64_t get64(const unsigned char *p) {
     value |= (uint64_t)p[i] << (i * 8);
   return value;
 }
-static ps_key control_key(ps_key_checkpoint *c) {
+static ps_key control_key(ps_namespace *ns) {
   ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
-  key.owner = c->ns->identity.owner;
+  key.owner = ns->identity.owner;
   return key;
 }
-static int decode_control(ps_key_checkpoint *c, ps_reader *reader,
-                          ps_checkpoint_info *out, lc_error *e) {
-  unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
-  ps_ref ref;
-  size_t got = 0, i;
-  int rc;
-  if (ps_read_size(reader) != sizeof(bytes))
-    return failure(e, LC_ERR_PROTOCOL,
-                   "checkpoint coverage has an invalid size");
-  rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
-  if (rc != LC_OK)
-    return rc;
-  if (got != sizeof(bytes) || memcmp(bytes, "LCPSCKPT", 8) ||
-      get64(bytes + 8) != c->ns->identity.owner || !get64(bytes + 16) ||
-      (!get64(bytes + 24) && get64(bytes + 32)) ||
+static int decode_control(ps_namespace *ns, const unsigned char *bytes,
+                          uint64_t token, ps_checkpoint_info *out,
+                          lc_error *e) {
+  size_t i;
+  if (memcmp(bytes, "LCPSCKPT", 8) || get64(bytes + 8) != ns->identity.owner ||
+      !get64(bytes + 16) || (!get64(bytes + 24) && get64(bytes + 32)) ||
       get64(bytes + 120) != (uint64_t)crc32(0, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage identity is invalid");
@@ -515,8 +507,7 @@ static int decode_control(ps_key_checkpoint *c, ps_reader *reader,
       return failure(e, LC_ERR_PROTOCOL,
                      "checkpoint coverage has unknown fields");
   memset(out, 0, sizeof(*out));
-  ps_read_reference(reader, &ref);
-  out->control = ref.incarnation;
+  out->control = token;
   out->epoch = get64(bytes + 16);
   out->segment = get64(bytes + 24);
   out->offset = get64(bytes + 32);
@@ -527,8 +518,45 @@ static int decode_control(ps_key_checkpoint *c, ps_reader *reader,
                    "checkpoint query boundary exceeds state");
   return LC_OK;
 }
-int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
-                              ps_checkpoint_info *coverage, lc_error *e) {
+static int read_control(ps_namespace *ns, ps_reader *reader,
+                        ps_checkpoint_info *out, lc_error *e) {
+  unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
+  ps_ref ref;
+  size_t got;
+  int rc;
+  if (ps_read_size(reader) != sizeof(bytes))
+    return failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint coverage has an invalid size");
+  rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
+  if (rc != LC_OK)
+    return rc;
+  if (got != sizeof(bytes))
+    return failure(e, LC_ERR_PROTOCOL, "checkpoint coverage is incomplete");
+  ps_read_reference(reader, &ref);
+  return decode_control(ns, bytes, ref.incarnation, out, e);
+}
+int ps_key_checkpoint_point(ps_namespace *ns, uint64_t prefix,
+                            ps_checkpoint_info *out, int *current,
+                            lc_error *e) {
+  unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
+  uint64_t token;
+  ps_checkpoint_info decoded;
+  int rc =
+      ps_internal_fixed_value(ns->root->space, control_key(ns), prefix, bytes,
+                              sizeof(bytes), out->control, &token, current, e);
+  if (rc == LC_OK && *current && token != out->control) {
+    memset(&decoded, 0, sizeof(decoded));
+    if (token)
+      rc = decode_control(ns, bytes, token, &decoded, e);
+    if (rc == LC_OK)
+      *out = decoded;
+  }
+  return rc;
+}
+int ps_checkpoint_capture_values(ps_namespace *ns,
+                                 const ps_checkpoint_info *known,
+                                 ps_values **out, ps_checkpoint_info *coverage,
+                                 lc_error *e) {
   ps_values *values = NULL;
   ps_reader *reader = NULL;
   ps_key key;
@@ -536,34 +564,40 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
   uint64_t bytes;
   size_t i;
   int rc;
-  if (!c || !out || !coverage)
-    return failure(e, LC_ERR_INVALID, "metadata capture requires output");
   *out = NULL;
   memset(coverage, 0, sizeof(*coverage));
-  pthread_mutex_lock(&c->mutex);
-  rc = ps_values_capture(c->ns->root->space, c->ns->identity.owner,
-                         PS_KEY_METADATA, PS_NAMESPACE_CHECKPOINT, &values, e);
+  rc = ps_values_capture(ns->root->space, ns->identity.owner, PS_KEY_METADATA,
+                         PS_NAMESPACE_CHECKPOINT, &values, e);
   for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
     if (rc != LC_OK || key.kind != PS_NAMESPACE_CHECKPOINT)
       continue;
     if (key.key != 1)
       rc = failure(e, LC_ERR_PROTOCOL, "unknown namespace coverage slot");
-    else if (ref.incarnation == c->selected.control)
-      *coverage = c->selected;
+    else if (ref.incarnation == known->control)
+      *coverage = *known;
     else {
       rc = ps_values_read_open(values, i, &reader, e);
       if (rc == LC_OK)
-        rc = decode_control(c, reader, coverage, e);
+        rc = read_control(ns, reader, coverage, e);
       ps_reader_close(reader);
       reader = NULL;
     }
   }
-  pthread_mutex_unlock(&c->mutex);
   if (rc == LC_OK)
     *out = values;
   else
     ps_values_close(values);
+  return rc;
+}
+int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
+                              ps_checkpoint_info *coverage, lc_error *e) {
+  int rc;
+  if (!c || !out || !coverage)
+    return failure(e, LC_ERR_INVALID, "metadata capture requires output");
+  pthread_mutex_lock(&c->mutex);
+  rc = ps_checkpoint_capture_values(c->ns, &c->selected, out, coverage, e);
+  pthread_mutex_unlock(&c->mutex);
   return rc;
 }
 static int load_slots(ps_key_checkpoint *c, const ps_values *values,
@@ -1576,7 +1610,7 @@ static int write_control_values(ps_key_checkpoint *c, ps_budget *budget,
   put64(bytes + 40, info->state_index);
   put64(bytes + 48, info->query_index);
   put64(bytes + 120, (uint64_t)crc32(0, bytes, 120));
-  rc = ps_begin(c->ns->root->space, budget, control_key(c), out, e);
+  rc = ps_begin(c->ns->root->space, budget, control_key(c->ns), out, e);
   if (rc == LC_OK)
     rc = ps_write(*out, bytes, sizeof(bytes), e);
   return rc;

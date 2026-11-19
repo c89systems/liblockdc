@@ -75,6 +75,8 @@ void ps_owned_run_retain(ps_owned_run *);
  * entries or read buffers. */
 int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
                           lc_error *);
+int ps_owned_runs_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
+                        uint64_t end, ps_owned_run ***, size_t *, lc_error *);
 typedef struct ps_owned_range {
   uint64_t offset, bytes;
 } ps_owned_range;

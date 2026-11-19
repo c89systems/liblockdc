@@ -16,7 +16,7 @@ Current implementation and acceptance status:
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), and [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff) | Collection authority, shared capacity and throughput, and normal shared admission |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
 Native Pouch currently admits one process at a time. Shared coordination
@@ -7090,3 +7090,91 @@ Verification logs, the trace, and matched measurements are in
 `build/pouch-space-physical-handoff/`. Shared namespace cache refresh, outbox
 and collection authority, capacity under destructive shared maintenance,
 and performance acceptance remain open.
+
+## Shared projection and stream captures
+
+The SDK can observe an active namespace boundary under its name guard
+by reading the fixed routing and coverage controls and matching the
+selected catalog binding to the stream's live completion record. The
+observation takes a single allocator capture and uses the same visibility
+prefix for both controls. Decoded controls are reused only when their
+selected immutable incarnations match. A deferred control, an uncertified stream, or
+a missing route leaves boundary selection to the namespace owner.
+Registering a checkpoint observer can wait for that owner to load.
+
+A suffix replay pins only the requested mappings of the completed active
+stream. A full replay can take the same path when all uncovered records
+belong to that stream. It pins selected typed metadata and checks that
+its coverage still matches the boundary before admitting the view.
+An active-segment body read can retain its exact run range directly.
+These reads do not claim the namespace writer stamp. The existing
+namespace view witness still protects a replay's source directory, and
+each body window owns its physical pins through close. Replay and body
+I/O keep the existing bounded streaming readers.
+
+The shared handoff fixture checks deferred coverage visibility, contention
+with a held producer, cold recovery after a root checkpoint, allocation
+failure during owner reload, and direct replay and body capture while
+that allocation is forced to fail. It retains the captured body through
+a peer rotation and checkpoint. The shared source fixtures also cover
+witness acquisition and release faults and process exit.
+
+In the matched 32-delivery, four-writer NoSync trace, `226deb37` and
+this change both opened 129 checkpoints. With this change, 32 opens
+occurred at append admission and 36 at native metadata mutation.
+Root recovery accounted for 34 and projection fallback for 27.
+The eligible projection, replay, and body opens leave ownership with
+the current writer. The queue trace still needs a physical writer
+handoff when the consumer changes state after reading a delivery.
+
+The integrated capture changes passed 55 groups each on Debug, GNU
+release, and musl release. After adding control incarnation reuse, the
+20 affected groups passed on all three builds. Three ThreadSanitizer
+and three strict Memcheck runs passed against the final code.
+
+All 48 matched GNU queue runs verified delivered payloads and reopened
+state. Native profiles start at 10 MiB. The profiles use 16 deliveries
+of 1 KiB with two writers or 32 deliveries of 4 KiB with four writers.
+Times are median milliseconds for `226deb37` shared / current shared /
+native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 26.20 / 28.81 / 3.85 / 4.16 | 510.46 / 524.53 / 548.89 / 330.87 | 83.03 / 76.34 / 6.84 / 4.56 | 834.36 / 559.00 / 746.47 / 520.30 |
+| Maintenance | 26.51 / 22.63 / 10.72 / 0.20 | 21.93 / 19.17 / 9.02 / 0.25 | 36.72 / 38.45 / 17.29 / 0.29 | 51.01 / 28.00 / 14.98 / 0.34 |
+| Close | 0.35 / 0.37 / 0.18 / 37.49 | 0.29 / 0.23 / 0.19 / 38.28 | 0.81 / 0.73 / 0.41 / 84.09 | 0.92 / 0.78 / 0.37 / 57.82 |
+| Reopen | 12.73 / 11.42 / 4.28 / 0.57 | 15.10 / 10.80 / 3.59 / 0.52 | 35.90 / 25.90 / 4.96 / 0.78 | 30.21 / 24.21 / 4.68 / 1.00 |
+
+Separate alternating pairs gave the following baseline and current work
+medians. Foreground sync medians were equal within each profile.
+
+| Profile | Baseline work (ms) | Current work (ms) | Pairs with faster current work |
+| --- | ---: | ---: | ---: |
+| Small NoSync | 23.39 | 25.91 | 2 of 7 |
+| Wider NoSync | 77.81 | 82.77 | 1 of 7 |
+| Wider durable | 637.68 | 659.61 | 2 of 7 |
+
+The small and wider NoSync rechecks were slower despite the wider
+improvement in the three-sample comparison. Wider durable timing also
+changed direction in the recheck. The mixed workload still needs
+writer ledger reuse and performance qualification.
+
+All 36 separate exclusive GNU index controls verified reopened query
+results. Times are median milliseconds for `226deb37` native / current
+native / multifile. The wider NoSync index flush remained about 35 ms
+across the native builds and was under 2 ms in multifile. Wider durable
+work fell against the frozen native build and remained above multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 46.57 / 64.25 / 20.80 | 640.47 / 534.24 / 455.92 | 88.39 / 72.79 / 30.89 | 1563.55 / 1485.50 / 1247.19 |
+| Maximum worker index flush | 20.64 / 29.20 / 1.06 | 19.84 / 22.70 / 1.21 | 34.73 / 34.86 / 1.79 | 27.56 / 19.88 / 2.02 |
+| First query pass | 0.21 / 0.21 / 0.19 | 0.21 / 0.23 / 0.20 | 0.44 / 0.38 / 0.18 | 0.36 / 0.29 / 0.23 |
+| Repeated query pass | 0.06 / 0.06 / 0.07 | 0.06 / 0.04 / 0.07 | 0.16 / 0.16 / 0.08 | 0.10 / 0.07 / 0.09 |
+| Close | 0.30 / 0.32 / 31.50 | 0.30 / 0.29 / 43.03 | 0.71 / 0.56 / 61.86 | 0.60 / 0.72 / 61.29 |
+| Reopen | 3.13 / 3.44 / 0.86 | 3.58 / 3.21 / 0.92 | 3.78 / 3.36 / 1.36 | 4.70 / 4.22 / 1.58 |
+
+Verification, traces, and matched measurements are in
+`build/pouch-space-projection-frontier/`. Writable namespace adoption,
+shared outbox and collection authority, capacity under destructive shared
+maintenance, and performance acceptance remain open.

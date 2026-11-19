@@ -964,6 +964,8 @@ static void window_release(ps_stream_window *window) {
   for (i = 0; i < window->count; ++i)
     ps_owned_run_close(window->runs[i].handle);
   lc_free_with_allocator(NULL, window->runs);
+  if (!window->stream)
+    return;
   pthread_mutex_lock(&window->stream->mutex);
   destroy = !--window->stream->readers && window->stream->detached;
   pthread_mutex_unlock(&window->stream->mutex);
@@ -987,6 +989,52 @@ int ps_stream_window_open(ps_stream *s, uint64_t offset, uint64_t bytes,
     *out = window;
   else
     lc_free_with_allocator(NULL, window);
+  return rc;
+}
+int ps_stream_window_capture(ps_space *space, ps_key key, const ps_ref *ref,
+                             uint64_t start, uint64_t end,
+                             ps_stream_window **out, lc_error *error) {
+  ps_owned_run **runs = NULL;
+  ps_stream_window *window;
+  uint64_t cursor = start;
+  size_t count = 0, i;
+  int rc;
+  *out = NULL;
+  window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
+  if (!window)
+    return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream window");
+  rc = ps_owned_runs_range(space, key, ref, start, end, &runs, &count, error);
+  if (rc == LC_OK && count) {
+    window->runs = lc_calloc_with_allocator(NULL, count, sizeof(*window->runs));
+    if (!window->runs)
+      rc = stream_error(error, LC_ERR_NOMEM, "cannot capture stream mappings");
+  }
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    stream_run *run = &window->runs[i];
+    run->base = ps_owned_run_base(runs[i]);
+    run->capacity = ps_owned_run_capacity(runs[i]);
+    if (run->base > cursor || run->base + run->capacity <= cursor)
+      rc = stream_error(error, LC_ERR_PROTOCOL,
+                        "certified stream range is unmapped");
+    else {
+      cursor = run->base + run->capacity;
+      run->handle = runs[i];
+      runs[i] = NULL;
+      ++window->count;
+    }
+  }
+  if (rc == LC_OK && cursor < end)
+    rc = stream_error(error, LC_ERR_PROTOCOL,
+                      "certified stream range is incomplete");
+  for (i = 0; i < count; ++i)
+    ps_owned_run_close(runs[i]);
+  lc_free_with_allocator(NULL, runs);
+  if (rc == LC_OK) {
+    window->start = start;
+    window->end = end;
+    *out = window;
+  } else
+    ps_stream_window_close(window);
   return rc;
 }
 int ps_stream_window_read(ps_stream_window *window, uint64_t offset,

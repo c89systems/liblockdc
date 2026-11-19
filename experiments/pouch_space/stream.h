@@ -132,6 +132,10 @@ int ps_stream_read_open(ps_stream *, uint64_t offset, uint64_t bytes,
  * many windows while sharing bounded scratch across the actual replay. */
 int ps_stream_window_open(ps_stream *, uint64_t offset, uint64_t bytes,
                           ps_stream_window **, lc_error *);
+/* Capture an already certified prefix under its enclosing namespace guard.
+ * The resulting window owns its mappings directly. */
+int ps_stream_window_capture(ps_space *, ps_key, const ps_ref *, uint64_t start,
+                             uint64_t end, ps_stream_window **, lc_error *);
 int ps_stream_window_read(ps_stream_window *, uint64_t offset, void *, size_t,
                           lc_error *);
 void ps_stream_window_close(ps_stream_window *);
