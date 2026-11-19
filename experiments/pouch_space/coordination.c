@@ -8,7 +8,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
-#define FIXED (PS_COORDINATION_TXN_STRIPES + 2U)
+#define FIXED (PS_COORDINATION_TXN_STRIPES + 3U)
 #define BUCKETS 67U
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
@@ -163,7 +163,7 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
   for (i = 0; i < FIXED; ++i) {
     owner->fixed[i].owner = owner;
     owner->fixed[i].fixed = 1;
-    owner->fixed[i].offset = i < 2 ? i : TXN_BASE + i - 2;
+    owner->fixed[i].offset = i < 2 ? i : i == 2 ? 4 : TXN_BASE + i - 3;
     rc = pthread_mutex_init(&owner->fixed[i].mutex, NULL);
     if (rc)
       break;
@@ -305,7 +305,7 @@ int ps_coordination_lock(ps_coordination *owner,
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
       domain > PS_COORDINATION_NAMESPACE ||
-      (domain <= PS_COORDINATION_RECOVERY && identity) ||
+      (domain <= PS_COORDINATION_ALLOCATION && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES))
     return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");
@@ -317,7 +317,7 @@ int ps_coordination_lock(ps_coordination *owner,
     rc = namespace_guard(owner, identity, &guard, e);
   else
     guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
-                              ? (size_t)identity + 2
+                              ? (size_t)identity + 3
                               : (size_t)domain];
   if (rc != LC_OK) {
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);

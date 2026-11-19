@@ -99,6 +99,20 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
+  add_executable(pouch_space_live_allocator_test live_allocator_test.c)
+  target_include_directories(pouch_space_live_allocator_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_live_allocator_test PRIVATE pouch_space_experiment)
+  target_link_options(pouch_space_live_allocator_test PRIVATE
+    "LINKER:--wrap=ps_coordination_open"
+    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  lc_configure_c_test_target(pouch_space_live_allocator_test)
+  foreach(mode threads faults fence processes serialized packed history)
+    add_test(NAME pouch_space_live-allocator_${mode}
+      COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+    set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120
+      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endforeach()
   add_executable(pouch_space_physical_claim_test physical_claim_test.c)
   target_include_directories(pouch_space_physical_claim_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_physical_claim_test PRIVATE pouch_space_experiment)

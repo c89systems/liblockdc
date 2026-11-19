@@ -195,7 +195,9 @@ typedef struct lock_fault {
 } lock_fault;
 static int lock_call(void *context, int fd, int command, struct flock *lock) {
   lock_fault *f = context;
-  if (command == F_OFD_SETLK) {
+  /* This seam targets extent/presence ownership. Allocator authority has its
+   * own acquisition/release faults in live_allocator_test.c. */
+  if (command == F_OFD_SETLK && !(lock->l_start == 4 && lock->l_len == 1)) {
     ++f->calls;
     if (f->calls == f->fail || f->calls == f->fail2) {
       f->failed_release = lock->l_type == F_UNLCK;

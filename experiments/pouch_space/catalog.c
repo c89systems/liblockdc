@@ -274,7 +274,7 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
                      "catalog identity requires space and output");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
-  if (rc == LC_OK && s->token_next > s->token_limit)
+  if (rc == LC_OK && s->token_next > s->token_end)
     rc = cat_error(e, LC_ERR_INVALID, "identity grant consumed; reopen");
   if (rc == LC_OK)
     *out = s->token_next++;
@@ -318,7 +318,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
         (expected ? !ref_matches(s, old, expected) : old && !old->deleted))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
-    if (rc == LC_OK && (s->token_next > s->token_limit ||
+    if (rc == LC_OK && (s->token_next > s->token_end ||
                         (!identity && (!ref_matches(s, head, target) ||
                                        head->orphan_claimed))))
       rc = cat_error(e, LC_ERR_INVALID,

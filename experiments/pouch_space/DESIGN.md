@@ -102,6 +102,14 @@ returns retired pages to the private pool and releases new canonical pages.
 Selected metadata belongs to root authority, rather than the process. Recovery
 excludes foreign workspace in both the fixed and dynamic regions. See
 [checkpoint workspace ownership](../../docs/pouch-space-implementation.md#private-checkpoint-workspace-and-ownership-handoff).
+Shared allocator experiments serialize observation and assignment under a
+resident OFD guard, discover late foreign claims and probe packed candidates.
+Common shared pages are uncertified even after a foreign witness disappears.
+Root/journal observation fences application-changing stale views; identity-only
+grants refresh the global frontier while keeping the local spending endpoint.
+The bounded control-journal observation is resident metadata. Application replay
+and shared readiness still precede normal shared admission. See
+[live allocator authority](../../docs/pouch-space-implementation.md#live-allocator-authority-and-canonical-observation).
 Writers pin their budget; space close rejects outstanding claims. Release returns
 unspent credits and excess dynamic metadata workspace using a preallocated split
 node. A budget provides capacity admission, not key isolation, rollback, or

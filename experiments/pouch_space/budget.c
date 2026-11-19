@@ -389,6 +389,7 @@ void ps_internal_budget_spend(ps_budget *b, uint64_t payload, uint64_t metadata,
 int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
                    lc_error *e) {
   ps_budget *b;
+  ps_coordination_guard *guard = NULL;
   int rc;
   if (out)
     *out = NULL;
@@ -422,9 +423,12 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     s->reserved_payload += plan->payload_bytes;
     s->reserved_metadata += plan->metadata_bytes;
     s->reserved_entries += plan->entries;
-    rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    rc = ps_internal_allocation_begin(s, &guard, e);
+    if (rc == LC_OK)
+      rc = ps_internal_budget_admit(s, plan->maintenance, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
+    rc = ps_internal_allocation_end(s, guard, rc, e);
     if (rc != LC_OK) {
       ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
                                plan->entries);
@@ -500,6 +504,7 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
   ps_space *s;
   ps_budget_plan prior;
   ps_run *trim = NULL;
+  ps_coordination_guard *guard = NULL;
   uint64_t payload, metadata, entries;
   int rc, grows;
   if (!b || !plan || plan->payload_bytes % PS_PAGE || plan->maintenance < 0 ||
@@ -545,9 +550,12 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
     s->reserved_entries = entries + plan->entries;
     b->remaining = *plan;
     if (grows)
+      rc = ps_internal_allocation_begin(s, &guard, e);
+    if (rc == LC_OK && grows)
       rc = ps_internal_budget_admit(s, plan->maintenance, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
+    rc = ps_internal_allocation_end(s, guard, rc, e);
     if (rc != LC_OK) {
       s->reserved_payload = payload + prior.payload_bytes;
       s->reserved_metadata = metadata + prior.metadata_bytes;

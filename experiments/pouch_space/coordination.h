@@ -9,6 +9,7 @@ typedef struct ps_coordination_guard ps_coordination_guard;
 enum ps_coordination_domain {
   PS_COORDINATION_PUBLICATION = 0,
   PS_COORDINATION_RECOVERY,
+  PS_COORDINATION_ALLOCATION,
   PS_COORDINATION_TRANSACTION,
   PS_COORDINATION_NAMESPACE
 };
@@ -47,7 +48,9 @@ int ps_coordination_check(ps_coordination *, lc_error *);
 size_t ps_coordination_users(ps_coordination *);
 /* Immutable lifetime admission mode; does not acquire a guard. */
 int ps_coordination_shared(const ps_coordination *);
-/* Publication/recovery use identity zero; transaction uses stripe < 256.
+/* Publication/recovery/allocation use identity zero.
+ * Transaction uses stripe < 256.
+ * Allocation uses byte 4, separate from publication and reader presence.
  * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry

@@ -43,6 +43,8 @@ struct ps_reader {
 #define PIN_PRESENCE_OFFSET 2U
 #define TICKET_MAGIC UINT64_C(0x3154454b435450)
 #define TICKET_HEADER 112U
+static int allocation_refresh(ps_space *, lc_error *);
+static int canonical_observe(ps_space *, lc_error *);
 struct ps_values {
   ps_space *space;
   ps_entry **items;
@@ -406,6 +408,41 @@ static void entry_free(ps_entry *p) {
   lc_free_with_allocator(NULL, p->extents);
   lc_free_with_allocator(NULL, p);
 }
+static int allocation_begin(ps_space *s, ps_coordination_guard **guard,
+                            lc_error *error) {
+  int rc;
+  *guard = NULL;
+  if (!ps_coordination_shared(s->coordination) || s->allocation_guard)
+    return LC_OK;
+  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                            guard, error);
+  if (rc == LC_OK)
+    s->allocation_guard = *guard;
+  return rc;
+}
+static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
+                          lc_error *error) {
+  if (guard) {
+    s->allocation_guard = NULL;
+    ps_coordination_unlock(guard);
+    if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+      lc_error_cleanup(error);
+      return healthy(s, error);
+    }
+  }
+  return rc;
+}
+int ps_internal_allocation_begin(ps_space *s, ps_coordination_guard **guard,
+                                 lc_error *error) {
+  int rc = allocation_begin(s, guard, error);
+  if (rc == LC_OK && *guard)
+    rc = allocation_refresh(s, error);
+  return rc;
+}
+int ps_internal_allocation_end(ps_space *s, ps_coordination_guard *guard,
+                               int rc, lc_error *error) {
+  return allocation_end(s, guard, rc, error);
+}
 static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
                           lc_error *error) {
   int first = s->physical_claim_bytes == 0, rc;
@@ -538,8 +575,8 @@ static int budget_drop_ranges(ps_space *s, uint64_t bytes, ps_run **workspace,
   return bytes ? err(error, LC_ERR_PROTOCOL, "concrete payload ranges lost")
                : LC_OK;
 }
-int ps_internal_budget_ranges(ps_space *s, uint64_t target, ps_run **workspace,
-                              lc_error *error) {
+static int budget_ranges_locked(ps_space *s, uint64_t target,
+                                ps_run **workspace, lc_error *error) {
   ps_run *run, *tail;
   uint64_t bytes, n;
   int rc = LC_OK;
@@ -599,6 +636,21 @@ int ps_internal_budget_ranges(ps_space *s, uint64_t target, ps_run **workspace,
   }
   ps_internal_free_coalesce(s);
   return rc;
+}
+int ps_internal_budget_ranges(ps_space *s, uint64_t target, ps_run **workspace,
+                              lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc;
+  if (target == s->claimed_free_bytes)
+    return LC_OK;
+  if (target < s->claimed_free_bytes)
+    return budget_ranges_locked(s, target, workspace, error);
+  rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard && target > s->claimed_free_bytes)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = budget_ranges_locked(s, target, workspace, error);
+  return allocation_end(s, guard, rc, error);
 }
 static void free_insert(ps_space *s, ps_run *node) {
   if (node->offset < PS_DATA)
@@ -676,8 +728,8 @@ static int take_payload_selected(ps_space *s, ps_budget *budget,
   take_selected(choice, &s->free_bytes, reserved, out, clean);
   return LC_OK;
 }
-static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
-                        uint64_t *out, lc_error *error) {
+static int take_payload_locked(ps_space *s, ps_budget *budget, uint64_t *bytes,
+                               uint64_t *out, lc_error *error) {
   ps_run **link, **first = NULL;
   for (link = &s->free; *link; link = &(*link)->next) {
     if ((*link)->claimed && !budget)
@@ -695,6 +747,16 @@ static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
     return err(error, LC_ERR_INVALID, "payload capacity exhausted; grow");
   return take_payload_selected(s, budget, link, *bytes, *bytes, out, NULL,
                                error);
+}
+static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
+                        uint64_t *out, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = take_payload_locked(s, budget, bytes, out, error);
+  return allocation_end(s, guard, rc, error);
 }
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
@@ -947,12 +1009,48 @@ static int entry_foreign_pinned(ps_space *s, ps_entry *p) {
  * GETLK may return ANY conflict. Split that interval, requery its residuals,
  * and visit each clear residual once. Both traversal and queries follow actual
  * free intervals plus pin fragments, without restarting from the pool head. */
+static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
+                        lc_error *error) {
+  ps_run *run, *held, **link = head;
+  uint64_t first, last;
+  int rc;
+  while (*link) {
+    run = *link;
+    if (run->claimed) {
+      link = &run->next;
+      continue;
+    }
+    rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
+                                  &first, &last, error);
+    if (rc != LC_OK)
+      return rc;
+    if (first == last) {
+      link = &run->next;
+      continue;
+    }
+    first = first / PS_PAGE * PS_PAGE;
+    last = aligned(last);
+    held = lc_calloc_with_allocator(NULL, 1, sizeof(*held));
+    if (!held)
+      return err(error, LC_ERR_NOMEM, "cannot retain foreign ownership pages");
+    held->offset = first;
+    held->bytes = last - first;
+    /* Foreign preparation may have dirtied formerly clean pages. Reclaimed
+     * nodes deliberately retain clean=0, rather than the old local hint. */
+    rc = exclude_selected(link, available, held->offset, held->bytes, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, held);
+      return rc;
+    }
+    held->next = s->pinned_free;
+    s->pinned_free = held;
+    s->pinned_free_bytes += held->bytes;
+  }
+  return LC_OK;
+}
 static int pins_recover(ps_space *s, lc_error *error) {
   ps_payload_page *page;
-  ps_run *run, *held, **link;
-  uint64_t *available;
-  uint64_t first, last;
-  int rc, present, pool;
+  int rc, present;
   if (!s->range_pins)
     return LC_OK;
   rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
@@ -969,42 +1067,12 @@ static int pins_recover(ps_space *s, lc_error *error) {
       payload_unavailable(page);
     }
   }
-  /* Foreign metadata workspace can occupy the fixed region as well as
-   * dynamic pages. Both pools must be subtracted before this participant
-   * claims its own workspace or writes an incarnation grant. */
-  for (pool = 0; pool < 2; ++pool) {
-    link = pool ? &s->metadata_free : &s->free;
-    available = pool ? &s->metadata_free_bytes : &s->free_bytes;
-    while (*link) {
-      run = *link;
-      rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
-                                    &first, &last, error);
-      if (rc != LC_OK)
-        return rc;
-      if (first == last) {
-        link = &run->next;
-        continue;
-      }
-      first = first / PS_PAGE * PS_PAGE;
-      last = aligned(last);
-      held = lc_calloc_with_allocator(NULL, 1, sizeof(*held));
-      if (!held)
-        return err(error, LC_ERR_NOMEM, "cannot retain foreign reader pages");
-      held->offset = first;
-      held->bytes = last - first;
-      rc = exclude_selected(link, available, held->offset, held->bytes, error);
-      if (rc != LC_OK) {
-        lc_free_with_allocator(NULL, held);
-        return rc;
-      }
-      held->next = s->pinned_free;
-      s->pinned_free = held;
-      s->pinned_free_bytes += held->bytes;
-    }
-  }
-  return LC_OK;
+  rc = foreign_pool(s, &s->free, &s->free_bytes, error);
+  return rc == LC_OK ? foreign_pool(s, &s->metadata_free,
+                                    &s->metadata_free_bytes, error)
+                     : rc;
 }
-static void pins_collect(ps_space *s, int present) {
+static void pins_collect_locked(ps_space *s, int present) {
   ps_run **link = &s->pinned_free, *run;
   ps_payload_page *page, **pages = &s->pinned_pages;
   int held;
@@ -1036,6 +1104,35 @@ static void pins_collect(ps_space *s, int present) {
     } else
       pages = &page->pinned_next;
   }
+}
+static void pins_collect(ps_space *s, int present) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, NULL);
+  if (rc == LC_OK && guard)
+    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL);
+  if (rc == LC_OK)
+    pins_collect_locked(s, present);
+  (void)allocation_end(s, guard, rc, NULL);
+}
+static int allocation_refresh(ps_space *s, lc_error *error) {
+  ps_run *run;
+  int present, rc = canonical_observe(s, error);
+  if (rc == LC_OK)
+    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  if (rc != LC_OK)
+    return rc;
+  pins_collect_locked(s, present);
+  /* A foreign producer may claim, dirty and release common pages entirely
+   * between observations. Only continuously private ownership can preserve a
+   * clean hint in shared mode; a current GETLK result cannot prove history. */
+  for (run = s->free; run; run = run->next)
+    if (!run->claimed)
+      run->clean = 0;
+  ps_internal_free_coalesce(s);
+  rc = healthy(s, error);
+  return rc == LC_OK && present
+             ? foreign_pool(s, &s->free, &s->free_bytes, error)
+             : rc;
 }
 static void collect(ps_space *s) {
   ps_entry **link = &s->retired, *p;
@@ -1449,7 +1546,7 @@ static int metadata_claimed_bound(ps_space *s, uint64_t bytes, uint64_t entries,
 /* Metadata is one private physical pool. Preparation consumes witnessed free
  * pages; root selection exchanges their witnesses for the pages it retires.
  * Initial recovery subtracts foreign claims before acquiring this pool. */
-static int metadata_claim_initial(ps_space *s, lc_error *error) {
+static int metadata_claim_initial_locked(ps_space *s, lc_error *error) {
   ps_run *run;
   int rc;
   if (!ps_coordination_shared(s->coordination))
@@ -1462,6 +1559,15 @@ static int metadata_claim_initial(ps_space *s, lc_error *error) {
   s->metadata_claims_active = 1;
   return LC_OK;
 }
+static int metadata_claim_initial(ps_space *s, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = pins_recover(s, error);
+  if (rc == LC_OK)
+    rc = metadata_claim_initial_locked(s, error);
+  return allocation_end(s, guard, rc, error);
+}
 static uint64_t metadata_target(ps_space *s, uint64_t bound) {
   uint64_t allocated = (uint64_t)s->metadata_pages * PS_PAGE;
   /* Enough free pages for one complete rewrite, and two complete images
@@ -1469,8 +1575,9 @@ static uint64_t metadata_target(ps_space *s, uint64_t bound) {
    * from its retired image without relying on unprotected payload capacity. */
   return allocated < bound ? 2 * bound - allocated : bound;
 }
-static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
-                         uint64_t payload, uint64_t floor, lc_error *error) {
+static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
+                                uint64_t payload, uint64_t floor,
+                                lc_error *error) {
   uint64_t extra, bytes;
   ps_run *node;
   int rc;
@@ -1506,6 +1613,16 @@ static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
   }
   s->metadata_workspace = bound;
   return LC_OK;
+}
+static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
+                         uint64_t payload, uint64_t floor, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = metadata_fill_locked(s, bound, target, payload, floor, error);
+  return allocation_end(s, guard, rc, error);
 }
 static int metadata_protect(ps_space *s, uint64_t bound, uint64_t payload,
                             uint64_t floor, lc_error *error) {
@@ -1597,13 +1714,18 @@ static int immutable_extent_allowance(ps_space *s, ps_entry *entry,
       s, entry, s->metadata - prior + entry_bytes(entry) + 24,
       s->live_entries + (old && !old->deleted ? 0 : 1), payload, budget, error);
 }
-static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
-                           size_t *bytes, int split, ps_budget *budget,
-                           lc_error *error) {
+static int payload_reserve_locked(ps_space *s, ps_entry *entry,
+                                  ps_extent *extent, size_t *bytes, int split,
+                                  ps_budget *budget, lc_error *error) {
   ps_payload_page *p = NULL;
+  size_t requested = *bytes;
   size_t count = cell_count(*bytes), bin, at;
   uint64_t mask, reserve = PS_PAGE;
-  int rc, fresh = 0;
+  int rc, fresh = 0, present;
+again:
+  p = NULL;
+  *bytes = requested;
+  count = cell_count(requested);
   for (bin = count; bin <= CELLS; ++bin)
     if (s->available[bin]) {
       p = s->available[bin];
@@ -1621,6 +1743,18 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
         *bytes = count * PS_CELL;
         break;
       }
+  if (p && s->allocation_guard) {
+    rc = pin_conflict(s, p->run.offset, PS_PAGE, &present, error);
+    if (rc != LC_OK)
+      return rc;
+    if (present) {
+      p->external_pins = 1;
+      p->pinned_next = s->pinned_pages;
+      s->pinned_pages = p;
+      payload_unavailable(p);
+      goto again;
+    }
+  }
   rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, budget, error);
   if (rc != LC_OK)
     return rc;
@@ -1666,6 +1800,17 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
     }
   }
   return err(error, LC_ERR_PROTOCOL, "packed payload free-span mismatch");
+}
+static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
+                           size_t *bytes, int split, ps_budget *budget,
+                           lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = payload_reserve_locked(s, entry, extent, bytes, split, budget, error);
+  return allocation_end(s, guard, rc, error);
 }
 static int metadata_offset(ps_space *s, uint64_t offset) {
   return offset % PS_PAGE == 0 && offset >= 2 * PS_PAGE &&
@@ -2020,7 +2165,7 @@ void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
     *spare = metadata_trim(s, *spare);
   }
 }
-static int checkpoint_locked(ps_space *s, lc_error *error) {
+static int checkpoint_body(ps_space *s, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire = NULL;
   ps_entry *p;
   ps_meta_page *page;
@@ -2195,7 +2340,17 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   collect(s);
   return healthy(s, error);
 }
-static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
+static int checkpoint_locked(ps_space *s, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = checkpoint_body(s, error);
+  return allocation_end(s, guard, rc, error);
+}
+static int append_event_locked(ps_space *s, ps_entry *p, int event,
+                               lc_error *error) {
   size_t bytes = event_bytes(p, event);
   unsigned char *wire;
   int rc;
@@ -2212,6 +2367,8 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   encode_entry(wire, p, s->sequence + 1, event);
   if (rc == LC_OK)
     rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
+  if (rc == LC_OK && s->journal_image)
+    memcpy(s->journal_image + s->journal, wire, bytes);
   lc_free_with_allocator(NULL, wire);
   if (rc == LC_OK) {
     ++s->sequence;
@@ -2220,22 +2377,40 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   }
   return rc;
 }
+static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc == LC_OK)
+    rc = append_event_locked(s, p, event, error);
+  return allocation_end(s, guard, rc, error);
+}
 /* Reserve incarnation numbers once per open. Returned NoSync references must
  * never alias a later value even if every write since this grant is lost. */
 static int grant_tokens(ps_space *s, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
   ps_entry grant;
-  uint64_t limit = s->token_limit;
-  int rc;
-  if (limit > UINT64_MAX - TOKEN_RANGE)
-    return err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
+  uint64_t limit;
+  int rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
+  if (rc != LC_OK)
+    return allocation_end(s, guard, rc, error);
+  limit = s->token_limit;
+  if (limit > UINT64_MAX - TOKEN_RANGE) {
+    rc = err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
+    return allocation_end(s, guard, rc, error);
+  }
   memset(&grant, 0, sizeof(grant));
   grant.token = limit + TOKEN_RANGE;
   rc = append_event(s, &grant, PS_RESERVE_IDS, error);
   if (rc == LC_OK) {
     s->token_next = limit + 1;
     s->token_limit = grant.token;
+    s->token_end = grant.token;
   }
-  return rc;
+  return allocation_end(s, guard, rc, error);
 }
 static void destroy(ps_space *s) {
   ps_entry *p;
@@ -2273,6 +2448,7 @@ static void destroy(ps_space *s) {
     lc_free_with_allocator(NULL, payload);
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
+  lc_free_with_allocator(NULL, s->journal_image);
   if (s->coordination) {
     (void)ps_coordination_close(s->coordination, NULL);
     s->fd = -1;
@@ -2315,6 +2491,57 @@ static int root_valid(const unsigned char *p) {
            generation <= get64(p + 8))) &&
          get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 &&
          get32(p + 72) == PS_RUN_HEADER && checksum(p, 76) == get32(p + 76);
+}
+static int canonical_observe(ps_space *s, lc_error *error) {
+  unsigned char roots[2 * PS_ROOT_BYTES], next[64];
+  const unsigned char *root;
+  int rc, a, b;
+  if (!s->journal_image)
+    return err(error, LC_ERR_PENDING, "container canonical view needs refresh");
+  rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
+  if (rc == LC_OK)
+    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  a = root_valid(roots);
+  b = root_valid(roots + PS_ROOT_BYTES);
+  root = b && (!a || get64(roots + PS_ROOT_BYTES + 8) > get64(roots + 8))
+             ? roots + PS_ROOT_BYTES
+             : roots;
+  if ((!a && !b) || get64(root + 8) != s->generation ||
+      memcmp(root + 56, s->identity, 16))
+    return err(error, LC_ERR_PENDING,
+               "container checkpoint view needs refresh");
+  while (s->journal <= PS_JOURNAL - sizeof(next)) {
+    rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    if (!memcmp(next, s->journal_image + s->journal, sizeof(next)))
+      return LC_OK;
+    /* Identity-only grants do not change the application projection. Their
+     * global frontier is distinct from this participant's spending endpoint.
+     * Every other changed prefix, including incomplete/invalid data, fences
+     * allocation until canonical refresh/recovery can reconcile it. */
+    if (get32(next) != (uint32_t)EVENT_MAGIC || get32(next + 4) != 64 ||
+        s->sequence == UINT64_MAX || get64(next + 8) != s->sequence + 1 ||
+        get32(next + 16) || get32(next + 20) != PS_RESERVE_IDS ||
+        get64(next + 24) || get64(next + 32) ||
+        s->token_limit > UINT64_MAX - TOKEN_RANGE ||
+        get64(next + 40) != s->token_limit + TOKEN_RANGE || get64(next + 48) ||
+        get32(next + 56) || get32(next + 60) != checksum(next, 60) ||
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
+      return err(error, LC_ERR_PENDING, "container journal view needs refresh");
+    memcpy(s->journal_image + s->journal, next, sizeof(next));
+    s->token_limit = get64(next + 40);
+    ++s->sequence;
+    s->journal += sizeof(next);
+    /* A reopen grant follows complete rejected-tail retirement and its
+     * barrier. A peer may have erased this observer's old checkpoint residue.
+     * Later changed prefixes still have to reconcile against these zeros. */
+    memset(s->journal_image + s->journal, 0, PS_JOURNAL - s->journal);
+    __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+  }
+  return LC_OK;
 }
 typedef struct metadata_recovery {
   ps_space *space;
@@ -2824,9 +3051,6 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
-  rc = pins_recover(s, error);
-  if (rc != LC_OK)
-    goto done;
   rc = metadata_claim_initial(s, error);
   if (rc != LC_OK)
     goto done;
@@ -2838,6 +3062,10 @@ static int recover(ps_space *s, lc_error *error) {
   if (rc != LC_OK)
     goto done;
   __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
+  if (ps_coordination_shared(s->coordination)) {
+    s->journal_image = wire;
+    wire = NULL;
+  }
   rc = grant_tokens(s, error);
   if (rc == LC_OK)
     rc = sync_file(s, error); /* accepted tail, retired sibling and grant */
@@ -2877,6 +3105,7 @@ int ps_open(const char *path, int create, const ps_options *options,
             ps_space **out, lc_error *error) {
   ps_options defaults = {0};
   ps_coordination_options coordination = {0};
+  ps_coordination_guard *opening = NULL;
   ps_space *s;
   uint64_t bound;
   int rc;
@@ -2966,12 +3195,19 @@ int ps_open(const char *path, int create, const ps_options *options,
   }
   if (ps_coordination_shared(s->coordination))
     s->range_pins = 1; /* Later participants may introduce new witnesses. */
-  if (create) {
+  rc = allocation_begin(s, &opening, error);
+  if (rc == LC_OK && create && opening) {
+    s->journal_image = lc_calloc_with_allocator(NULL, 1, PS_JOURNAL);
+    if (!s->journal_image)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate observed control journal");
+  }
+  if (rc == LC_OK && create) {
     rc = reserve_file(s, 0, s->capacity, error);
     if (rc == LC_OK)
       rc = random_bytes(s->identity, 16, error);
     s->token_next = 1;
     s->token_limit = TOKEN_RANGE;
+    s->token_end = TOKEN_RANGE;
     if (rc == LC_OK)
       rc = initial_free(s, error);
     if (rc == LC_OK)
@@ -2980,7 +3216,7 @@ int ps_open(const char *path, int create, const ps_options *options,
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
-  } else
+  } else if (rc == LC_OK)
     rc = recover(s, error);
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
     rc = err(error, LC_ERR_INVALID,
@@ -2989,6 +3225,7 @@ int ps_open(const char *path, int create, const ps_options *options,
     rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
     rc = metadata_protect(s, bound, 0, 0, error);
+  rc = allocation_end(s, opening, rc, error);
   if (rc != LC_OK) {
     destroy(s);
     return rc;
@@ -3049,7 +3286,7 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
   rc = healthy(s, error);
   if (rc == LC_OK)
     rc = ps_internal_budget_check(s, budget, 0, 0, 0, error);
-  if (rc == LC_OK && s->token_next > s->token_limit)
+  if (rc == LC_OK && s->token_next > s->token_end)
     rc = err(error, LC_ERR_INVALID,
              "incarnation grant consumed; close and reopen");
   if (rc == LC_OK) {
@@ -3078,6 +3315,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
   ps_extent *extent, *grown;
   size_t n, done = 0, take;
   uint64_t run_bytes;
+  ps_coordination_guard *guard = NULL;
   int rc, split = 0;
   if (!w->used)
     return LC_OK;
@@ -3100,6 +3338,12 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       }
       p->extents = grown;
       p->capacity = n;
+    }
+    rc = ps_internal_allocation_begin(s, &guard, error);
+    if (rc != LC_OK) {
+      rc = allocation_end(s, guard, rc, error);
+      pthread_mutex_unlock(&s->mutex);
+      return rc;
     }
     extent = &p->extents[p->count];
     memset(extent, 0, sizeof(*extent));
@@ -3127,6 +3371,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       p->payload_claimed = 1;
       p->bytes += take;
     }
+    rc = allocation_end(s, guard, rc, error);
     pthread_mutex_unlock(&s->mutex);
     if (rc != LC_OK)
       return rc;
@@ -3243,6 +3488,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
                         ps_ref *refs, uint64_t *prefix, lc_error *error) {
   ps_space *s;
   ps_budget *budget;
+  ps_coordination_guard *guard = NULL;
   ps_entry *p, *old;
   unsigned char *wire = NULL;
   size_t i, j, bytes = 64, cursor, prior, descriptor;
@@ -3282,6 +3528,10 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     goto done;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
   if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
                       count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
@@ -3331,6 +3581,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     put32(wire + 60,
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
     rc = transfer(s, wire, bytes, JOURNAL_OFFSET + s->journal, 1, error);
+    if (rc == LC_OK && s->journal_image)
+      memcpy(s->journal_image + s->journal, wire, bytes);
   }
   if (rc == LC_OK) {
     s->sequence += count;
@@ -3358,6 +3610,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
         break;
       }
   }
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && durable && (forced || mode == PS_COMMIT_DEFAULT))
     rc = wait_durable(s, sequence, error);
@@ -4265,7 +4518,7 @@ int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
        old->publication_sequence >
            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
     rc = err(error, LC_ERR_INVALID, "owned stream already exists");
-  if (rc == LC_OK && create && s->token_next > s->token_limit)
+  if (rc == LC_OK && create && s->token_next > s->token_end)
     rc = err(error, LC_ERR_INVALID, "incarnation grant consumed; reopen");
   if (rc == LC_OK && create)
     rc = checkpoint_allowance_floor(s, s->metadata + 80, s->live_entries + 1, 0,
@@ -4388,6 +4641,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   uint64_t bytes = desired, reserved = 0, sequence = 0;
   ps_run **choice = NULL, **link, **partial, **fit;
   ps_run *spare = NULL;
+  ps_coordination_guard *guard = NULL;
   int rc, clean = 0, registered = 0;
   if (p)
     p->extents = lc_calloc_with_allocator(NULL, 1, sizeof(*p->extents));
@@ -4402,10 +4656,14 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   p->key.key = base;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_refresh(s, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
-      (base != head->entry->stream_capacity || s->token_next > s->token_limit ||
+      (base != head->entry->stream_capacity || s->token_next > s->token_end ||
        base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
   /* Protect metadata before retaining a free-list selection: admission may
@@ -4494,6 +4752,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
       ++budget->users;
     registered = 1;
   }
+  rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && !clean)
     rc = initialize_range(s, p->extents[0].offset, reserved, zero, error);

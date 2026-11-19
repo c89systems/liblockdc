@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership), [private checkpoint workspace](#private-checkpoint-workspace-and-ownership-handoff) and process-death release | Live allocator/canonical/projection refresh, shared capacity economy, owned-stream reader generations and normal shared admission |
+| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership), [private checkpoint workspace](#private-checkpoint-workspace-and-ownership-handoff), [live allocator authority](#live-allocator-authority-and-canonical-observation) and process-death release | Application/canonical projection replay, shared capacity economy, owned-stream reader generations, shared readiness and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -5936,4 +5936,142 @@ active writers, owned-stream/logical reader integration, shared durability
 prefixes and coordinated recovery remain unqualified. The controlled frozen-peer
 fixture establishes existing-claim isolation, not general concurrent-writer
 admission. The full goal remains active, multifile remains the default/reference,
+and production cutover still requires its explicit deployment decision.
+
+## Live allocator authority and canonical observation
+
+Shared allocation now has a resident container guard at byte 4, separate from
+publication, recovery, reader presence, transaction stripes and namespace
+identities. The local allocator mutex precedes this guard. Nested helpers borrow
+their caller's authority. Budget admission holds it across metadata protection
+and physical payload assignment; immutable chunks and owned grants hold it
+through capacity checks, selection and witnessing. Transfers and unchanged
+resizes keep their allocation-free, syscall-free path. Returning private
+capacity remains possible from a stale or failed owner.
+
+Initial recovery, journal framing and checkpoint selection use the same guard
+to prevent physical ownership from changing during their authority transition.
+Cold validation and checkpoint I/O currently hold this guard. Application input,
+immutable body writes and owned zero preparation run outside it. A deterministic
+test pauses a clear GETLK result before its range is claimed, verifies that a
+second allocator cannot enter, and separately acquires publication authority.
+Exclusive lifetime authority bypasses the shared guard.
+
+Before shared admission, collection observes drained witnesses and subtracts
+new foreign ranges from common free intervals. Work follows free fragmentation
+and foreign claims, without scanning canonical entries or copying payloads.
+The residual-interval walk retains the arbitrary-conflict ordering guarantee of
+opening recovery. Packed allocation also probes its selected candidate page;
+a peer may have privately occupied cells that are absent from this process's
+bitmap. A skipped fragmented candidate restores the original request size so
+that private interference cannot increase the funded extent/descriptor bound.
+
+Shared common pages are always uncertified. A peer can claim, dirty and release
+a range entirely between observations, so current absence of a witness cannot
+preserve an old clean hint. Continuously private ranges retain their hints.
+Reclaimed foreign pages are also uncertified. The exclusive owner's amortized
+zero-preparation path is unchanged. Shared preparation cost still needs
+qualification with the complete architecture.
+
+Allocation checks the selected root generation/identity and the next journal
+prefix against a resident observation of the bounded 128 KiB control journal.
+The observation contains descriptors and identity grants; application values
+remain in their streamed extents. Exclusive spaces allocate no journal image.
+Local framing updates that observation after successful physical writes.
+Checkpoint changes, application-changing frames and unknown/incomplete changed
+prefixes return `PENDING` before a stale projection can allocate or publish a
+journal/checkpoint revision. Those owners remain available for cleanup and
+later reconciliation.
+
+Identity-only reopen grants refresh directly. `token_limit` is the observed
+global frontier; `token_end` remains the endpoint of this participant's own
+grant. Writers, catalog identities, stream heads and grants check that local
+endpoint. Observing a larger peer grant therefore cannot widen spending
+authority. A reopen grant follows rejected-tail retirement and its barrier;
+observers also adopt the cleared remainder of the journal when importing that
+grant. This permits progress after checkpoint residue is erased or an
+interrupted prefix is retired. It does not skip application-changing frames.
+
+The observer currently applies only identity grants. Full application replay
+belongs at revision entry, ahead of captured lookups and capacity plans. Extending
+the allowance helper to apply application changes after those values have been
+captured would invalidate its caller's decisions. Normal Pouch still rejects
+shared native admission; unjournaled owned-stream readiness and logical reader
+refresh remain separate unfinished requirements.
+
+Seven new groups exercise two real shared OFDs. They cover 64 rounds of
+simultaneous budget admission/private 16 KiB production, eight rounds of
+competing 6 MiB requests admitting exactly one, kernel-observed nonoverlapping
+ownership, deterministic query/claim exclusion, open/admission/unlock/query
+faults, and allocation failures during late foreign-range discovery. The token
+endpoint boundary fixture rejects the first ID beyond the local grant after a
+peer raises the global frontier. Changed application revisions and checkpoints
+fence stale mutation; a repaired rejected prefix permits identity-only refresh
+and renewed admission.
+
+The packed-cell test leaves one free cell, pauses a peer's private write into
+it, and publishes another value with exactly one page and one descriptor worth
+of credits. The private ranges remain disjoint; the stale peer publication
+returns `PENDING`, and reopen retains the accepted values. Separate exec tests
+introduce claims after the first allocator is already open, preserve their
+captured bytes through publication/checkpoint, and recover capacity after
+normal close or SIGKILL. A history case dirties and releases foreign space
+entirely before the first allocator observes it, then verifies zero-filled
+owned admission under capacity pressure.
+
+Qualification passes 55 Debug groups and 57 groups each on GNU and musl release
+builds, including the strict 96-case lease-capacity matrix and 48 attachment
+windows. The final test harness additionally reruns all seven raw allocator
+groups on all three configurations. Four raw TSan scenarios pass with
+instrumented OpenSSL 3.6.5, constrained 128 KiB workers and no suppressions.
+Five strict Memcheck profiles pass with 2,877 matching allocations/frees, no
+remaining heap/errors/suppressions and three inherited descriptors each.
+
+The initial raw blocking Memcheck thread case stalled with one owned thread in
+`fcntl_setlk` and the other guest threads in `anon_pipe_read`; its interrupted
+run is not counted. For the three contended Memcheck profiles, the test-only
+`--cooperative-wait` seam retains real OFD locks and retries nonblocking
+acquisition with scheduler yields. The two single-thread Memcheck profiles use
+the raw syscall. Product code, native qualification and all four TSan runs use
+blocking OFD waits. Seven negative controls fail at their intended observations
+when allocator authority, late discovery, packed observation, request-size
+restoration, clean-hint invalidation, journal fencing or tail adoption is removed.
+
+Matched GNU measurements use frozen `48eea152`, current native and multifile
+implementations, 10 MiB roots, normal release stacks and three alternating
+samples per profile. All 36 runs verify their reopened results. Native
+before/after medians, milliseconds:
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 54.68 / 67.89 | 608.99 / 565.75 | 95.23 / 85.87 | 1300.79 / 1251.74 |
+| Work | 47.83 / 56.57 | 599.96 / 559.85 | 88.32 / 77.90 | 1292.92 / 1246.03 |
+| Work CPU | 17.27 / 15.83 | 52.24 / 52.06 | 61.50 / 55.18 | 150.33 / 153.09 |
+| Maximum mutation worker | 30.22 / 35.75 | 580.91 / 540.73 | 55.04 / 54.35 | 1278.68 / 1231.90 |
+| Maximum worker index flush | 19.37 / 21.30 | 18.60 / 17.94 | 33.43 / 25.40 | 19.43 / 19.89 |
+| Maintenance | 6.84 / 6.57 | 8.99 / 6.26 | 6.91 / 6.49 | 7.87 / 7.25 |
+| Close | 0.360 / 0.285 | 0.385 / 0.368 | 0.607 / 0.638 | 0.651 / 0.809 |
+| Reopen alone | 3.23 / 3.02 | 3.35 / 3.22 | 5.57 / 4.73 | 5.06 / 5.50 |
+
+Native wider NoSync `fcntl` counts remain three before/after, and maintenance
+retains three barriers. Small NoSync work rose about 18%, wider NoSync work fell
+about 12%, and durable work fell about 7%/4% in these samples. Other phases move
+in both directions. These samples establish neither general nonregression nor
+shared-mode performance. Current NoSync indexed work remains about 2.8--2.9 times
+multifile's 20.28/27.20 ms; reference close takes 36.65/60.62 ms versus native
+0.285/0.638 ms. Work, readiness, maintenance, close and reopen must remain
+separate when assessing that tradeoff. Performance acceptance remains open.
+
+Evidence is in ignored `build/pouch-space-live-allocator/`:
+`qualified-*.log`, `pressure-*.log`, `fixture-*.log`, `tsan-*.log`,
+`memcheck-*.log`, `negative-controls.log`, `no-*.log`, `performance.log`,
+`performance-summary.tsv` and `fcntl-{baseline,current}.log`, with native scripts
+and the frozen baseline alongside them. `blocked-raw-memcheck-threads*.log`
+preserves the incomplete checker run separately.
+
+This lands live private-resource isolation and canonical observation against a
+current projection. Full application projection replay, shared readiness and
+durability, owned-stream/logical reader integration, multi-participant forecast
+capacity and coordinated abandoned-work recovery still precede normal shared
+admission. The full goal remains active. Multifile remains the default/reference,
 and production cutover still requires its explicit deployment decision.

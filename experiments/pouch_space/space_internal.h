@@ -94,6 +94,10 @@ struct ps_space {
   int fd, poisoned, durable, root;
   int range_pins;
   ps_coordination *coordination;
+  /* Protected by the local allocator mutex, or sole-owner open recovery.
+   * Nested allocation helpers borrow the outer guard; no producer I/O spans it.
+   */
+  ps_coordination_guard *allocation_guard;
   pthread_mutex_t mutex;
   pthread_mutex_t sync_io_mutex, commit_mutex;
   pthread_cond_t commit_cond;
@@ -101,7 +105,9 @@ struct ps_space {
   ps_io io;
   unsigned char identity[16];
   uint64_t capacity, maximum, generation, sequence, syncs, checkpoints;
-  uint64_t token_next, token_limit;
+  uint64_t token_next, token_end, token_limit;
+  /* Observed control journal for shared revision comparison, never bodies. */
+  unsigned char *journal_image;
   uint64_t pending_sequence, durable_sequence;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   size_t journal, metadata, readers, writers;
@@ -170,6 +176,10 @@ int ps_catalog_validate_directory(ps_space *, lc_error *);
 void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
 int ps_internal_healthy(ps_space *, lc_error *);
+int ps_internal_allocation_begin(ps_space *, ps_coordination_guard **,
+                                 lc_error *);
+int ps_internal_allocation_end(ps_space *, ps_coordination_guard *, int,
+                               lc_error *);
 int ps_internal_event(ps_space *, ps_entry *, int, lc_error *);
 int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
                           lc_error *);
