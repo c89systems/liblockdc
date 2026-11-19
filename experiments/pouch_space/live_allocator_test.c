@@ -528,6 +528,170 @@ static int reserve_io(void *c, int fd, off_t at, off_t n) {
   (void)c;
   return fallocate(fd, 0, at, n);
 }
+static ssize_t trace_private_write(void *context, int fd, const void *p,
+                                   size_t n, off_t at) {
+  if (n == PS_CHUNK && at >= PS_DATA)
+    *(uint64_t *)context = (uint64_t)at;
+  return pwrite(fd, p, n, at);
+}
+static void prepared_grant_child(int ready, int control) {
+  lc_error e = {0};
+  ps_space *space = NULL;
+  uint64_t written = 0;
+  ps_io io = {&written, read_io,    trace_private_write,
+              sync_io,  reserve_io, NULL};
+  ps_options options = {0};
+  char command;
+  options.io = &io;
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(write(ready, "O", 1) == 1);
+  REQUIRE(read(control, &command, 1) == 1 && command == 'W');
+  REQUIRE(private_value(space, NULL, 9000));
+  REQUIRE(write(ready, &written, sizeof(written)) == sizeof(written));
+  for (;;)
+    pause();
+}
+static uint64_t expect_zero_grant(ps_space *space, ps_owned_head *head,
+                                  const ps_owned_status *info, uint64_t base,
+                                  uint64_t physical, uint64_t syncs) {
+  lc_error e = {0};
+  ps_owned_run *run = NULL;
+  ps_key key = {info->ref.incarnation, base, PS_OWNED_RUN};
+  unsigned char bytes[PS_PAGE - PS_RUN_HEADER];
+  ps_stats before = status(space);
+  int found = 0;
+  ok(ps_owned_grant(head, NULL, base, PS_PAGE, &run, &found, &e), &e);
+  REQUIRE(found && ps_owned_run_capacity(run) == sizeof(bytes));
+  REQUIRE(status(space).syncs == before.syncs + syncs);
+  ps_entry *p = ps_internal_lookup(space, key);
+  REQUIRE(p && p->count == 1 &&
+          (!physical || p->extents[0].offset == physical));
+  uint64_t selected = p->extents[0].offset;
+  ok(ps_owned_read(run, 0, bytes, sizeof(bytes), &e), &e);
+  for (size_t i = 0; i < sizeof(bytes); ++i)
+    REQUIRE(!bytes[i]);
+  ps_owned_run_close(run);
+  return selected;
+}
+static uint64_t prepared_prefix(ps_space *space, uint64_t offset,
+                                uint64_t bytes) {
+  ps_coordination_guard *guard = NULL;
+  lc_error e = {0};
+  REQUIRE(!pthread_mutex_lock(&space->mutex));
+  ok(ps_internal_capture_begin(space, &guard, &e), &e);
+  uint64_t prepared = ps_readiness_zero_prefix(space, offset, bytes);
+  ok(ps_internal_capture_end(space, guard, LC_OK, &e), &e);
+  REQUIRE(!pthread_mutex_unlock(&space->mutex));
+  return prepared;
+}
+static void prepared_grants(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *x = NULL, *y = NULL;
+  ps_owned_status ix, iy;
+  ps_key kx = {89, 1, PS_STREAM}, ky = {89, 2, PS_STREAM};
+  const uint64_t payload = PS_PAGE - PS_RUN_HEADER;
+  int ready[2], control[2], exited;
+  unsigned char observed;
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  REQUIRE(pipe(ready) == 0 && pipe(control) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    char output[16], input[16];
+    REQUIRE(close(ready[0]) == 0 && close(control[1]) == 0);
+    snprintf(output, sizeof(output), "%d", ready[1]);
+    snprintf(input, sizeof(input), "%d", control[0]);
+    execl(executable, executable, "--prepared-grant-child", path, output, input,
+          (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(close(ready[1]) == 0 && close(control[0]) == 0);
+  REQUIRE(read(ready[0], &observed, 1) == 1 && observed == 'O');
+  ok(ps_owned_open(a, NULL, kx, 1, NULL, &x, &ix, &e), &e);
+  ok(ps_owned_open(b, NULL, ky, 1, NULL, &y, &iy, &e), &e);
+  uint64_t first = expect_zero_grant(a, x, &ix, 0, 0, 1);
+  expect_zero_grant(b, y, &iy, 0, first + PS_PAGE, 0);
+  uint64_t start = first + 2 * PS_PAGE;
+  uint64_t end = start + prepared_prefix(a, start, PS_MIB);
+
+  /* A private writer makes no payload publication. Let it disappear before
+   * the peer can observe the claim, then require preparation on reuse. */
+  REQUIRE(write(control[1], "W", 1) == 1 && close(control[1]) == 0);
+  uint64_t dirtied;
+  REQUIRE(read(ready[0], &dirtied, sizeof(dirtied)) == sizeof(dirtied));
+  REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(close(ready[0]) == 0);
+  REQUIRE(dirtied >= start && dirtied + PS_CHUNK <= end);
+  REQUIRE(pread(a->fd, &observed, 1, (off_t)(dirtied + PS_RUN_HEADER)) == 1 &&
+          observed == 9000 % 251);
+  for (uint64_t at = dirtied; at < dirtied + PS_CHUNK; at += PS_PAGE)
+    REQUIRE(!prepared_prefix(a, at, PS_PAGE));
+  REQUIRE(prepared_prefix(a, dirtied + PS_CHUNK, PS_PAGE) == PS_PAGE);
+  uint64_t replacement = expect_zero_grant(a, x, &ix, payload, 0, 1);
+  ok(ps_checkpoint(a, &e), &e);
+  expect_zero_grant(b, y, &iy, payload, replacement + PS_PAGE, 0);
+  REQUIRE(prepared_prefix(b, dirtied + PS_CHUNK, PS_PAGE) == PS_PAGE);
+  ps_owned_close(x);
+  ps_owned_close(y);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+
+  /* The next process cohort has no live zero proof, even when pages remain
+   * physically zero and the bitmap bytes survived the previous close. */
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ok(ps_owned_open(a, NULL, kx, 0, &ix.ref, &x, &ix, &e), &e);
+  REQUIRE(ix.capacity == 2 * payload);
+  REQUIRE(!prepared_prefix(a, dirtied + PS_CHUNK, PS_PAGE));
+  expect_zero_grant(a, x, &ix, ix.capacity, 0, 1);
+  ps_owned_close(x);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+typedef struct prepare_fault {
+  trace trace;
+  int armed, calls;
+} prepare_fault;
+static int fail_prepare_sync(void *context, int fd) {
+  prepare_fault *fault = context;
+  if (fault->armed) {
+    ++fault->calls;
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static void prepared_grant_fault(void) {
+  lc_error e = {0};
+  prepare_fault fault = {0};
+  ps_io io = {&fault, read_io, write_io, fail_prepare_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status info;
+  const ps_key key = {89, 1, PS_STREAM};
+  int found = 0;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_owned_open(a, NULL, key, 1, NULL, &head, &info, &e), &e);
+  fault.armed = 1;
+  REQUIRE(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e) ==
+              LC_ERR_TRANSPORT &&
+          !run && !found && fault.calls == 1 && fault.trace.header >= PS_DATA);
+  lc_error_cleanup(&e);
+  ps_owned_close(head);
+  ok(ps_close(a, &e), &e);
+  ok(ps_owned_open(b, NULL, key, 0, NULL, &head, &info, &e), &e);
+  REQUIRE(!info.capacity);
+  expect_zero_grant(b, head, &info, 0, fault.trace.header, 1);
+  ps_owned_close(head);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void processes(void) {
   for (int killed = 0; killed < 2; ++killed) {
     lc_error e = {0};
@@ -3489,6 +3653,11 @@ static void stream_handoff_faults(void) {
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 int main(int argc, char **argv) {
+  if (argc == 5 && !strcmp(argv[1], "--prepared-grant-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    prepared_grant_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--stream-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     stream_handoff_child(atoi(argv[3]), atoi(argv[4]));
@@ -3580,7 +3749,10 @@ int main(int argc, char **argv) {
     owned_stream_cold();
   else if (!strcmp(argv[2], "owned-stream-faults"))
     owned_stream_faults();
-  else if (!strcmp(argv[2], "stream-handoff")) {
+  else if (!strcmp(argv[2], "prepared-grants")) {
+    prepared_grants();
+    prepared_grant_fault();
+  } else if (!strcmp(argv[2], "stream-handoff")) {
     stream_handoff(0);
     stream_handoff(1);
     stream_abort_and_cold_open();

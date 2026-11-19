@@ -9,6 +9,8 @@
 #define READY_MAGIC UINT64_C(0x3159444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
+#define ZERO_WORDS (PS_PAGE / sizeof(uint64_t) - 2 * WORDS)
+#define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
 enum readiness_word {
   GENERATION,
   MAGIC,
@@ -137,6 +139,7 @@ int ps_readiness_validate(ps_space *s, lc_error *e) {
 }
 int ps_readiness_opened(ps_space *s, lc_error *e) {
   uint64_t record[WORDS] = {0};
+  size_t i;
   int selected = 1, rc;
   if (!s->readiness)
     return LC_OK;
@@ -152,6 +155,8 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   } else {
     __atomic_store_n(s->readiness->page, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
+    for (i = 0; i < ZERO_WORDS; ++i)
+      __atomic_store_n(s->readiness->page + 2 * WORDS + i, 0, __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
   }
   record[MAGIC] = READY_MAGIC;
@@ -230,4 +235,55 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   if (root > record[ROOT])
     record[ROOT] = root;
   return select_record(s, record, selected, e);
+}
+
+/* Bitmap operations need allocation authority, like the readiness slots.
+ * A terminated preparer can leave a subset marked since every marked page
+ * already crossed the barrier. A private writer cannot touch a page until
+ * the whole claim has revoked those bits. A cold cohort starts empty. */
+uint64_t ps_readiness_zero_prefix(ps_space *s, uint64_t offset,
+                                  uint64_t bytes) {
+  uint64_t first, page, end;
+  if (!s->readiness || offset < PS_DATA || offset >= ZERO_END)
+    return 0;
+  if (bytes > ZERO_END - offset)
+    bytes = ZERO_END - offset;
+  first = page = (offset - PS_DATA) / PS_PAGE;
+  end = first + bytes / PS_PAGE;
+  while (page < end &&
+         (__atomic_load_n(s->readiness->page + 2 * WORDS + page / 64,
+                          __ATOMIC_ACQUIRE) &
+          (UINT64_C(1) << (page % 64))))
+    ++page;
+  return (page - first) * PS_PAGE;
+}
+void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
+                             int prepared) {
+  uint64_t page, end, mask, *word;
+  unsigned int shift, count;
+  if (!s->readiness || !bytes || offset >= ZERO_END)
+    return;
+  if (offset < PS_DATA) {
+    if (bytes <= PS_DATA - offset)
+      return;
+    bytes -= PS_DATA - offset;
+    offset = PS_DATA;
+  }
+  if (bytes > ZERO_END - offset)
+    bytes = ZERO_END - offset;
+  page = (offset - PS_DATA) / PS_PAGE;
+  end = (offset - PS_DATA + bytes + PS_PAGE - 1) / PS_PAGE;
+  while (page < end) {
+    shift = (unsigned int)(page % 64);
+    count = 64 - shift;
+    if (end - page < count)
+      count = (unsigned int)(end - page);
+    mask = count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << shift;
+    word = s->readiness->page + 2 * WORDS + page / 64;
+    if (prepared)
+      __atomic_fetch_or(word, mask, __ATOMIC_ACQ_REL);
+    else
+      __atomic_fetch_and(word, ~mask, __ATOMIC_ACQ_REL);
+    page += count;
+  }
 }

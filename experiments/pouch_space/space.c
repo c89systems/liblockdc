@@ -531,10 +531,12 @@ static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
       return rc;
   }
   rc = ps_coordination_range(s->coordination, offset, bytes, 1, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    ps_readiness_zero_pages(s, offset, bytes, 0);
     s->physical_claim_bytes += bytes;
-  else if (first && ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET,
-                                          1, 0, NULL) != LC_OK) {
+  } else if (first &&
+             ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 0,
+                                   NULL) != LC_OK) {
     lc_error_cleanup(error);
     rc = healthy(s, error);
   }
@@ -777,7 +779,7 @@ static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
 }
 static int take_payload_selected(ps_space *s, ps_budget *budget,
                                  ps_run **choice, uint64_t reserved,
-                                 uint64_t funded, uint64_t *out, int *clean,
+                                 uint64_t funded, uint64_t *out,
                                  lc_error *error) {
   uint64_t offset = (*choice)->offset;
   int rc;
@@ -803,7 +805,7 @@ static int take_payload_selected(ps_space *s, ps_budget *budget,
         return err(error, LC_ERR_PROTOCOL, "payload selection changed");
     }
   }
-  take_selected(choice, &s->free_bytes, reserved, out, clean);
+  take_selected(choice, &s->free_bytes, reserved, out, NULL);
   return LC_OK;
 }
 static int take_payload_locked(ps_space *s, ps_budget *budget, uint64_t *bytes,
@@ -823,8 +825,7 @@ static int take_payload_locked(ps_space *s, ps_budget *budget, uint64_t *bytes,
   }
   if (!*link)
     return err(error, LC_ERR_INVALID, "payload capacity exhausted; grow");
-  return take_payload_selected(s, budget, link, *bytes, *bytes, out, NULL,
-                               error);
+  return take_payload_selected(s, budget, link, *bytes, *bytes, out, error);
 }
 static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
                         uint64_t *out, lc_error *error) {
@@ -1271,9 +1272,8 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   if (rc != LC_OK)
     return rc;
   pins_collect_locked(s, present);
-  /* A foreign producer may claim, dirty and release common pages entirely
-   * between observations. Only continuously private ownership can preserve a
-   * clean hint in shared mode; a current GETLK result cannot prove history. */
+  /* A foreign writer can dirty common pages between observations. Drop local
+   * hints for those pages. The cohort bitmap follows every physical claim. */
   for (run = s->free; run; run = run->next)
     if (!run->claimed)
       run->clean = 0;
@@ -5920,6 +5920,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
   unsigned char header[PS_RUN_HEADER];
   uint64_t bytes = desired, reserved = 0, sequence = 0;
+  uint64_t prepared, partial_bytes, candidate;
   ps_run **choice = NULL, **link, **partial, **fit;
   ps_run *spare = NULL;
   ps_coordination_guard *guard = NULL;
@@ -5951,21 +5952,36 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     for (;;) {
       partial = fit = NULL;
       choice = NULL;
+      partial_bytes = 0;
+      clean = 0;
       for (link = &s->free; *link; link = &(*link)->next) {
         if ((*link)->claimed && !budget)
           continue;
-        if ((*link)->clean && (*link)->bytes >= bytes) {
+        candidate = (*link)->bytes < bytes ? (*link)->bytes : bytes;
+        prepared = s->readiness
+                       ? ps_readiness_zero_prefix(s, (*link)->offset, candidate)
+                   : (*link)->clean ? candidate
+                                    : 0;
+        if (prepared == bytes) {
           choice = link;
+          clean = 1;
           break;
         }
-        if ((*link)->clean && !partial)
+        if (prepared && !partial) {
           partial = link;
+          partial_bytes = prepared;
+        }
         if ((*link)->bytes >= bytes &&
             (!fit || ((*fit)->claimed && !(*link)->claimed)))
           fit = link;
       }
+      if (!choice && partial) {
+        choice = partial;
+        bytes = partial_bytes;
+        clean = 1;
+      }
       if (!choice)
-        choice = partial ? partial : fit;
+        choice = fit;
       if (!choice)
         for (link = &s->free; *link; link = &(*link)->next)
           if (!(*link)->claimed || budget) {
@@ -5991,7 +6007,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   }
   if (rc == LC_OK) {
     reserved = bytes;
-    if (!(*choice)->claimed && !(*choice)->clean && bytes < PS_MIB) {
+    if (!(*choice)->claimed && !clean && bytes < PS_MIB) {
       reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
       while (reserved > bytes) {
         rc = owned_preparation_allowance(s, budget, bytes, reserved, error);
@@ -6013,7 +6029,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   }
   if (rc == LC_OK) {
     rc = take_payload_selected(s, budget, choice, reserved, bytes,
-                               &p->extents[0].offset, &clean, error);
+                               &p->extents[0].offset, error);
     if (rc == LC_OK)
       ps_internal_budget_spend(budget, bytes, 0, 0);
   }
@@ -6073,8 +6089,9 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     if (spare) {
       spare->offset = p->extents[0].offset + bytes;
       spare->bytes = reserved - bytes;
-      spare->clean = 1;
-      free_insert(s, spare); /* only fully synchronized zeros become reusable */
+      spare->clean = !s->readiness;
+      ps_readiness_zero_pages(s, spare->offset, spare->bytes, 1);
+      free_insert(s, spare);
       spare = NULL;
     }
   }

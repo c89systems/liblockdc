@@ -18,4 +18,10 @@ int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
 int ps_readiness_publish(ps_space *, lc_error *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
                            lc_error *);
+/* Prepared pages are durably zeroed common payload capacity. Claims revoke
+ * the proof before writing. Publish only fully zeroed pages under allocation
+ * authority while returning a continuously owned range to the common pool. */
+uint64_t ps_readiness_zero_prefix(ps_space *, uint64_t offset, uint64_t bytes);
+void ps_readiness_zero_pages(ps_space *, uint64_t offset, uint64_t bytes,
+                             int prepared);
 #endif

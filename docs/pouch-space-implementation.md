@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), and [shared stream completion](#shared-stream-completion) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), and [shared grant preparation](#shared-grant-preparation) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6872,3 +6872,76 @@ readiness retains the separate matched evidence from the preceding stage.
 The verification, trace and run data are in
 `build/pouch-space-clean-handoff/`. Shared outbox and collection authority,
 capacity under destructive maintenance, and performance acceptance remain open.
+
+## Shared grant preparation
+
+A stream grant may initialize up to 1 MiB while it holds physical ownership
+and the allocator remains available to other writers. After durable zeroing,
+it returns unused pages to the common pool and records their zero proof in
+the live readiness page. A peer can use that prepared prefix without another
+preparation sync. Every physical claim clears the proof before a writer can
+touch the pages. A claim can finish or its owner can die between observations
+without leaving a stale proof. Grant identity, frame checks, and durable
+payload publication still follow the ordinary journal rules.
+
+The bitmap covers the first 123.5 MiB of the payload region. Pages outside
+that span use checked preparation. The free list and range ownership still
+determine eligibility. A checkpoint can retain a live proof, and a cold
+cohort starts with an empty bitmap. The batch releases spare capacity to
+common allocation instead of holding a private cache across operations.
+
+The qualification also found an early retirement visibility defect present
+in `78d5cb6b`. The local head fenced mutation as soon as it selected removal,
+and that flag also rejected read windows before the removal became durable.
+Read admission now checks durable retirement. The held-barrier lifecycle
+test verifies read admission before completion, rejection afterward, and
+continued use of an already captured window.
+
+All 90 allocator and lifecycle groups passed on Debug, GNU release, and musl
+release. Four ThreadSanitizer and two strict Memcheck profiles passed. The
+new fixture checks live reuse without a sync, revocation for the exact pages
+of an unpublished write by a killed process, checkpoint adoption, cold reset,
+and reuse after a failed preparation sync.
+
+All 48 final matched GNU queue runs verified delivered payloads and reopened
+state. The native profiles start at 10 MiB. Times are median milliseconds for
+`78d5cb6b` shared / current shared / native exclusive / multifile. Both shared
+versions use independent producer owners and a separate consumer owner.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 43.68 / 33.51 / 4.55 / 3.94 | 354.26 / 445.72 / 314.82 / 309.09 | 105.13 / 101.58 / 6.79 / 5.65 | 561.92 / 633.63 / 452.99 / 571.63 |
+| Foreground syncs, previous / current shared | 4 / 2 | 109 / 109 | 10 / 4 | 122 / 112 |
+| Maintenance | 20.42 / 27.32 / 7.52 / 0.21 | 17.41 / 15.50 / 7.46 / 0.32 | 31.89 / 31.29 / 11.90 / 0.37 | 25.65 / 28.21 / 6.65 / 0.45 |
+| Close | 0.34 / 0.34 / 0.21 / 40.06 | 0.39 / 0.30 / 0.17 / 30.37 | 0.91 / 0.79 / 0.41 / 78.76 | 0.84 / 0.79 / 0.38 / 52.43 |
+| Reopen | 11.63 / 13.43 / 2.78 / 0.57 | 11.18 / 13.00 / 3.01 / 0.48 | 28.50 / 27.89 / 3.64 / 1.06 | 26.76 / 28.43 / 3.77 / 0.92 |
+
+The small durable comparison varied substantially across seven additional
+pairs. The baseline and current work medians were 487.03 and 448.22 ms.
+Current work was faster in three of seven pairs, and paired ratios ranged
+from 0.68 to 1.28. The durable profiles still need latency qualification.
+On wider NoSync queues, current worker CPU rose from 96.52 to 119.58 ms
+despite four foreground syncs instead of ten. The four-delivery trace shows
+one remaining foreground sync from a new grant, nine checkpoint syncs, and
+six reopen syncs. Shared projection work and admission remain separate costs
+to isolate. Shared NoSync foreground work is still about 9 to 18 times
+multifile across the two queue profiles.
+
+All 36 exclusive GNU index controls also verified reopened query results.
+The figures below are median milliseconds for `78d5cb6b` native / current
+native / multifile. Index readiness includes the maximum worker flush and
+the first and repeated query passes measured independently of close and
+reopen. The wider durable foreground result remains slower than the frozen
+native run even with a similar sync count of 261 versus 263.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 56.78 / 48.05 / 20.05 | 565.77 / 593.40 / 532.51 | 78.11 / 71.96 / 27.64 | 992.77 / 1327.91 / 1384.71 |
+| Maximum worker index flush | 24.45 / 17.23 / 1.04 | 18.98 / 20.70 / 1.50 | 25.56 / 25.31 / 1.49 | 12.98 / 17.17 / 2.65 |
+| First query pass | 0.28 / 0.25 / 0.24 | 0.22 / 0.22 / 0.27 | 0.37 / 0.40 / 0.21 | 0.30 / 0.39 / 0.27 |
+| Repeated query pass | 0.09 / 0.06 / 0.11 | 0.05 / 0.05 / 0.08 | 0.11 / 0.16 / 0.09 | 0.10 / 0.09 / 0.12 |
+| Close | 0.34 / 0.29 / 35.59 | 0.30 / 0.30 / 32.47 | 0.65 / 0.78 / 58.55 | 0.57 / 0.74 / 70.37 |
+| Reopen | 3.13 / 2.88 / 0.81 | 3.29 / 3.33 / 0.86 | 4.79 / 4.44 / 1.22 | 4.48 / 5.22 / 1.23 |
+
+Verification logs, the queue and index runs, and the sync trace are in
+`build/pouch-space-prepared-grants/`.
