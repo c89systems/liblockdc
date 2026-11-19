@@ -15,8 +15,8 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, guarded stream takeover, and [container namespace handoff](#container-namespace-ownership-handoff) | Shared capacity forecasts, SDK logical projection and collection authority, cross-peer source liveness, and normal shared admission |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, guarded stream takeover, and [container namespace handoff](#container-namespace-ownership-handoff) | Shared capacity forecasts, SDK logical projection and collection authority, and normal shared admission |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) and [namespace body source liveness](#cross-process-namespace-source-liveness) | Logical SDK snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
 Native Pouch currently admits one process at a time. Shared coordination
@@ -6635,3 +6635,56 @@ revalidate under namespace authority across decisions and publication,
 including lease, queue, and transaction checks. Peer liveness of body sources
 referenced by older metadata views, collection authority, capacity under
 shared pressure, and shared throughput remain open.
+
+## Cross-process namespace source liveness
+
+A captured namespace checkpoint can name a body that the reader will open
+later. Snapshot capture installs a compatible OFD read lock on a namespace
+stripe while holding the namespace mutation guard. The witness lasts through
+the metadata view. A body window opened from that view keeps its own
+physical ranges pinned and can outlive both the view and the catalog binding.
+
+Before removing a selected source or publishing a piece remap, maintenance
+checks for local views and peer witnesses under the namespace guard. The
+namespace mutex also covers the check and selection against local snapshots
+that borrow an active writer's guard. The final check runs after repack
+preparation so a witness acquired during that preparation defers publication.
+Append and checkpoint selection continue while a snapshot is open.
+
+The 2,048 lock bytes occupy the upper half of the reserved readiness page.
+Each open file description counts its views per stripe and releases the
+kernel lock on its final view close. A stripe collision can defer
+reclamation in another namespace. The witnesses have no persisted data
+and disappear when the last reference to the file description closes.
+An acquisition failure unwinds the snapshot. An uncertain peer query or
+release fails the local owner closed. A failed release can keep a peer's
+reclamation deferred until the affected handle closes.
+
+All 87 affected cases passed on Debug, GNU release, and musl release.
+The three new shared-source cases also passed ThreadSanitizer and strict
+Memcheck. The cases cover both durability policies, compatible snapshots
+on independent handles, multiple snapshots on one handle, independent
+namespace reclaim, late repack deferral, a delayed body open, and physical
+retention across logical removal. They also inject witness acquisition,
+query and release faults, and terminate a child while it holds a snapshot.
+
+All 36 matched GNU lifecycle runs verified reopened results. The figures
+are median milliseconds for `ea07601b` native / current native / multifile.
+Each profile uses 10 MiB initial capacity and two rounds of streamed
+mutations under exclusive SDK admission.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 41.95 / 41.93 / 14.88 | 546.28 / 553.80 / 423.80 | 70.90 / 71.79 / 25.35 | 1019.47 / 1107.39 / 1195.64 |
+| Maximum worker index flush | 17.74 / 17.80 / 0.90 | 19.85 / 14.29 / 1.03 | 21.15 / 27.83 / 2.12 | 21.28 / 15.98 / 4.00 |
+| Maintenance | 5.56 / 7.49 / 0.16 | 6.39 / 6.48 / 0.24 | 7.88 / 6.85 / 0.26 | 5.53 / 6.51 / 0.32 |
+| Close | 0.25 / 0.31 / 26.68 | 0.29 / 0.27 / 41.26 | 0.63 / 0.58 / 53.90 | 0.65 / 0.56 / 66.79 |
+| Reopen | 2.94 / 3.34 / 0.80 | 3.13 / 3.15 / 0.93 | 4.54 / 4.15 / 1.25 | 4.48 / 4.32 / 1.60 |
+
+Native NoSync work took about 2.8 times multifile in these samples. The
+index flushes have different canonical durability boundaries. Logs and
+the frozen baseline are in `build/pouch-space-namespace-liveness/`.
+
+Shared SDK admission still requires logical projection revalidation across
+lease, lock, queue, and transaction decisions, plus collection authority.
+Shared throughput and capacity under peer pressure remain to be measured.

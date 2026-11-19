@@ -36,6 +36,7 @@ typedef struct captured {
 } captured;
 struct ps_namespace_view {
   ps_namespace *ns;
+  ps_coordination_guard *witness;
   size_t count;
   captured *items;
   ps_values *metadata;
@@ -586,6 +587,18 @@ void ps_ns_leave(struct ps_namespace_data *d) {
   d->edit = NULL;
   d->busy = 0;
   pthread_mutex_unlock(&d->mutex);
+}
+int ps_ns_require_unpinned(struct ps_namespace_data *d, lc_error *e) {
+  int pinned = d->views != 0;
+  int rc = LC_OK;
+  if (!pinned)
+    rc = ps_coordination_namespace_view_conflict(
+        ps_space_coordination(d->ns->root->space), d->ns->hash, &pinned, e);
+  if (rc == LC_OK && pinned)
+    rc = lc_error_set(e, LC_ERR_INVALID, 0,
+                      "captured namespace metadata still protects sources",
+                      NULL, "pouch_namespace_busy", "pouch");
+  return rc;
 }
 /* Hold the shared name guard through selection and pin acquisition. An
  * existing local writer keeps it while the data mutex protects our capture. */
@@ -1139,6 +1152,7 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
                            lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_view *view;
+  ps_coordination *coordination;
   ps_stream_info info;
   size_t i;
   uint64_t first, count;
@@ -1162,8 +1176,13 @@ int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
     return rc;
   }
   ++d->views;
-  rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
-                                 &view->coverage, e);
+  coordination = ps_space_coordination(ns->root->space);
+  if (ps_coordination_shared(coordination))
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_VIEW,
+                              ns->hash, 0, &view->witness, e);
+  if (rc == LC_OK)
+    rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
+                                   &view->coverage, e);
   view->active = d->active;
   view->tail = d->tail;
   first = view->coverage.segment;
@@ -1360,6 +1379,7 @@ void ps_namespace_view_close(ps_namespace_view *view) {
   ps_values_close(view->metadata);
   pthread_mutex_lock(&view->ns->data->mutex);
   --view->ns->data->views;
+  ps_coordination_unlock(view->witness);
   pthread_mutex_unlock(&view->ns->data->mutex);
   ps_namespace_release(view->ns);
   lc_free_with_allocator(NULL, view);

@@ -2293,6 +2293,249 @@ static void shared_handoff(const char *path) {
   }
   shared_namespace = 0;
 }
+typedef struct shared_body_pin {
+  ps_namespace *ns;
+  ps_namespace_window *window;
+  uint64_t offset;
+} shared_body_pin;
+static int open_old_body(void *context, uint64_t segment,
+                         const lc_pouch_state_entry *entry, lc_error *e) {
+  shared_body_pin *pin = context;
+  unsigned int kind;
+  uint64_t id;
+  (void)segment;
+  if (entry->control)
+    return LC_OK;
+  REQUIRE(!pin->window && entry->found && entry->version == 1);
+  REQUIRE(entry->payload_span.payload_length == 64);
+  REQUIRE(ps_namespace_parse_source_leaf(entry->payload_span.container_leaf,
+                                         &kind, &id));
+  REQUIRE(kind == PS_CATALOG_SEGMENT && id == 1);
+  pin->offset = entry->payload_span.payload_offset;
+  return ps_namespace_read_open(pin->ns, kind, id, pin->offset, 64,
+                                &pin->window, e);
+}
+static void source_busy(int rc, lc_error *e) {
+  REQUIRE(rc == LC_ERR_INVALID && e->server_code &&
+          !strcmp(e->server_code, "pouch_namespace_busy"));
+  clear(e);
+}
+typedef struct late_view {
+  ps_namespace *ns;
+  ps_coordination_guard *witness;
+} late_view;
+static int install_late_view(void *context, ps_piece_publish_fn publish,
+                             void *publication, lc_error *e) {
+  late_view *late = context;
+  ps_coordination_guard *guard = NULL;
+  ps_coordination *coordination =
+      ps_space_coordination(ps_root_space(late->ns->root));
+  REQUIRE(!late->witness);
+  ok(ps_namespace_guard(late->ns, &guard, e), e);
+  ok(ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_VIEW,
+                          late->ns->hash, 0, &late->witness, e),
+     e);
+  ok(ps_namespace_unguard(late->ns, guard, LC_OK, e), e);
+  return publish(publication, e);
+}
+static void shared_source_pins(const char *path) {
+  shared_namespace = 1;
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_root_options options = {0};
+    ps_root *a = NULL, *b = NULL;
+    ps_namespace_view *old = NULL, *second = NULL, *fresh = NULL;
+    ps_namespace_window *removed = NULL;
+    shared_body_pin pin = {0};
+    ps_namespace_repack_result result;
+    unsigned char bytes[64];
+    struct iovec part = {bytes, sizeof(bytes)};
+    options.storage.durable_sync = durable;
+    ok(ps_root_open(path, 1, &options, &a, &e), &e);
+    ps_namespace *x = acquire(a, "shared", 1, &e);
+    ok(append(a, x, 1, 0, sizeof(bytes), &e), &e);
+    ok(ps_namespace_checkpoint_flush(x, &e), &e);
+    ok(ps_namespace_view_open(x, &old, &e), &e);
+    ok(ps_namespace_view_open(x, &second, &e), &e);
+
+    ok(ps_root_open(path, 0, &options, &b, &e), &e);
+    ps_namespace *y = acquire(b, "shared", 0, &e);
+    ok(append(b, y, 2, 1, sizeof(bytes), &e), &e);
+    ok(ps_namespace_checkpoint_flush(y, &e), &e);
+    REQUIRE(!ps_namespace_source_refs(y, PS_CATALOG_SEGMENT, 1));
+    ok(ps_namespace_view_open(y, &fresh, &e), &e);
+    shared_records latest = {0};
+    ok(ps_namespace_view_visit(fresh, 1, visit_shared, &latest, &e), &e);
+    REQUIRE(latest.version == 2 && latest.keys == 1);
+    ps_namespace_view_close(fresh);
+    source_busy(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+    source_busy(ps_namespace_repack(y, PS_CATALOG_SEGMENT, 1, 1, NULL, NULL,
+                                    &result, &e),
+                &e);
+
+    ps_namespace *other = acquire(b, "independent", 1, &e);
+    ok(append(b, other, 1, 0, sizeof(bytes), &e), &e);
+    ok(append(b, other, 2, 1, sizeof(bytes), &e), &e);
+    ok(ps_namespace_reclaim(other, PS_CATALOG_SEGMENT, 1, &e), &e);
+    ps_namespace_release(other);
+    ps_namespace_view_close(old);
+    source_busy(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+    pin.ns = x;
+    ok(ps_namespace_view_visit(second, 1, open_old_body, &pin, &e), &e);
+    REQUIRE(pin.window);
+    ps_namespace_view_close(second);
+    ok(ps_namespace_checkpoint_flush(y, &e), &e);
+
+    /* Inject a foreign witness after preparation, under the same name
+     * guard used by view capture. Publication must recheck liveness. */
+    late_view late = {x, NULL};
+    ok(ps_namespace_repack(y, PS_CATALOG_SEGMENT, 1, 1, install_late_view,
+                           &late, &result, &e),
+       &e);
+    REQUIRE(late.witness && result.visited == 1 && result.pending &&
+            !result.replaced);
+    source_busy(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+    ps_coordination_unlock(late.witness);
+    ok(ps_namespace_repack(y, PS_CATALOG_SEGMENT, 1, 1, NULL, NULL, &result,
+                           &e),
+       &e);
+    REQUIRE(result.replaced == 1);
+    ok(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+    REQUIRE(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, 1, pin.offset,
+                                   sizeof(bytes), &removed,
+                                   &e) == LC_ERR_INVALID &&
+            !removed);
+    clear(&e);
+    ok(lc_pouch_record_io_read(ps_namespace_read_input(pin.window), pin.offset,
+                               &part, 1, &e),
+       &e);
+    REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+    ps_namespace_read_close(pin.window);
+    ps_namespace_release(y);
+    ps_namespace_release(x);
+    ok(ps_root_close(b, &e), &e);
+    ok(ps_root_close(a, &e), &e);
+    REQUIRE(unlink(path) == 0);
+  }
+  shared_namespace = 0;
+}
+typedef struct view_fault {
+  int cmd, type, err, fired;
+} view_fault;
+static int view_fault_lock(void *context, int fd, int cmd, struct flock *lock) {
+  view_fault *fault = context;
+  if (cmd == fault->cmd && lock->l_type == fault->type &&
+      lock->l_start >= (off_t)(PS_METADATA_START - PS_PAGE / 2) &&
+      lock->l_start < (off_t)PS_METADATA_START) {
+    fault->cmd = 0;
+    ++fault->fired;
+    errno = fault->err;
+    return -1;
+  }
+  return fcntl(fd, cmd, lock);
+}
+static void shared_source_faults(const char *path) {
+  lc_error e = {0};
+  ps_root_options options = {0};
+  ps_root *a = NULL, *b = NULL;
+  ps_namespace_view *view = NULL;
+  view_fault fault = {0};
+  ps_coordination_io io = {&fault, view_fault_lock};
+  shared_namespace = 1;
+  options.storage.durable_sync = 1;
+  options.storage.coordination_io = &io;
+  ok(ps_root_open(path, 1, &options, &a, &e), &e);
+  ps_namespace *x = acquire(a, "shared", 1, &e);
+  ok(append(a, x, 1, 0, 64, &e), &e);
+  ok(ps_namespace_checkpoint_flush(x, &e), &e);
+  fault = (view_fault){F_OFD_SETLK, F_RDLCK, EAGAIN, 0};
+  REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_PENDING && !view);
+  REQUIRE(fault.fired == 1);
+  clear(&e);
+  fault = (view_fault){F_OFD_SETLK, F_RDLCK, EIO, 0};
+  REQUIRE(ps_namespace_view_open(x, &view, &e) == LC_ERR_TRANSPORT && !view);
+  REQUIRE(fault.fired == 1);
+  clear(&e);
+  ok(ps_namespace_view_open(x, &view, &e), &e);
+  ok(ps_root_open(path, 0, &options, &b, &e), &e);
+  ps_namespace *y = acquire(b, "shared", 0, &e);
+  ok(append(b, y, 2, 1, 64, &e), &e);
+  ok(ps_namespace_checkpoint_flush(y, &e), &e);
+  fault = (view_fault){F_OFD_GETLK, F_WRLCK, EIO, 0};
+  REQUIRE(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e) ==
+          LC_ERR_TRANSPORT);
+  REQUIRE(fault.fired == 1);
+  clear(&e);
+  REQUIRE(ps_check(ps_root_space(b), &e) == LC_ERR_TRANSPORT);
+  clear(&e);
+  ps_namespace_release(y);
+  ok(ps_root_close(b, &e), &e);
+  b = NULL;
+  ok(ps_root_open(path, 0, &options, &b, &e), &e);
+  y = acquire(b, "shared", 0, &e);
+  fault = (view_fault){F_OFD_SETLK, F_UNLCK, EIO, 0};
+  ps_namespace_view_close(view);
+  REQUIRE(fault.fired == 1);
+  REQUIRE(ps_check(ps_root_space(a), &e) == LC_ERR_TRANSPORT);
+  clear(&e);
+  source_busy(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+  ps_namespace_release(x);
+  ok(ps_root_close(a, &e), &e);
+  ok(ps_namespace_reclaim(y, PS_CATALOG_SEGMENT, 1, &e), &e);
+  ps_namespace_release(y);
+  ok(ps_root_close(b, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  shared_namespace = 0;
+}
+static void namespace_view_child(const char *path, int notify) {
+  lc_error e = {0};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace_view *view = NULL;
+  shared_namespace = 1;
+  options.storage.durable_sync = 1;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "shared", 0, &e);
+  ok(ps_namespace_view_open(ns, &view, &e), &e);
+  REQUIRE(write(notify, "R", 1) == 1);
+  for (;;)
+    pause();
+}
+static void shared_source_exit(const char *path) {
+  lc_error e = {0};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  int notify[2], exited;
+  char byte;
+  shared_namespace = 1;
+  options.storage.durable_sync = 1;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "shared", 1, &e);
+  ok(append(root, ns, 1, 0, 64, &e), &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  REQUIRE(pipe(notify) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    char fd[24];
+    REQUIRE(close(notify[0]) == 0);
+    snprintf(fd, sizeof(fd), "%d", notify[1]);
+    execlp(program, program, "--view-child", path, fd, (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(close(notify[1]) == 0);
+  REQUIRE(read(notify[0], &byte, 1) == 1 && byte == 'R');
+  ok(append(root, ns, 2, 1, 64, &e), &e);
+  source_busy(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+  REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(close(notify[0]) == 0);
+  ok(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, 1, &e), &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  shared_namespace = 0;
+}
 static void namespace_abandoned_child(const char *path, int notify) {
   lc_error e = {0};
   ps_root_options options = {0};
@@ -2432,6 +2675,12 @@ static void *worker(void *p) {
     budget_transfer(r->path);
   else if (!strcmp(r->mode, "shared-handoff"))
     shared_handoff(r->path);
+  else if (!strcmp(r->mode, "shared-source-pins"))
+    shared_source_pins(r->path);
+  else if (!strcmp(r->mode, "shared-source-faults"))
+    shared_source_faults(r->path);
+  else if (!strcmp(r->mode, "shared-source-exit"))
+    shared_source_exit(r->path);
   else if (!strcmp(r->mode, "shared-abandoned"))
     shared_abandoned(r->path);
   else
@@ -2441,6 +2690,10 @@ static void *worker(void *p) {
 int main(int argc, char **argv) {
   if (argc == 4 && !strcmp(argv[1], "--shared-child")) {
     namespace_abandoned_child(argv[2], atoi(argv[3]));
+    return 0;
+  }
+  if (argc == 4 && !strcmp(argv[1], "--view-child")) {
+    namespace_view_child(argv[2], atoi(argv[3]));
     return 0;
   }
   REQUIRE(argc == 3);

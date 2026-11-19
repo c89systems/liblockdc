@@ -13,7 +13,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_SYNC,
   PS_COORDINATION_TRANSACTION,
   PS_COORDINATION_NAMESPACE,
-  PS_COORDINATION_STREAM
+  PS_COORDINATION_STREAM,
+  PS_COORDINATION_NAMESPACE_VIEW
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -59,6 +60,9 @@ int ps_coordination_shared(const ps_coordination *);
  * collisions serialize safely. All participants must use the same identity.
  * Stream incarnations use disjoint stripes and require wait=0. Namespace
  * and stream guards may be released by a different thread.
+ * Namespace views take compatible read witnesses with wait=0. Acquire
+ * while holding the corresponding namespace guard, and release after the
+ * last use of captured metadata. Witnesses may be released across threads.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
  * finish while another guard waits.
@@ -72,6 +76,11 @@ int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
  * close/reopen. Cleanup remains legal.
  */
 void ps_coordination_unlock(ps_coordination_guard *);
+
+/* The namespace guard must cover a decisive query and any resulting
+ * retirement. Callers also check their own namespace's local view count. */
+int ps_coordination_namespace_view_conflict(ps_coordination *, uint64_t, int *,
+                                            lc_error *);
 
 /* Query foreign OFD ownership without acquiring authority. A conflict is a
  * half-open range; no conflict is first=last=0. Query failure poisons the owner

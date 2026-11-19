@@ -209,11 +209,8 @@ static int failure(lc_error *e, const char *message) {
 static int drop(struct ps_namespace_data *d, ps_ns_resource *r, lc_error *e) {
   int rc = ps_catalog_remove(d->ns->root->space, d->ns->identity.owner, r->kind,
                              r->leaf, strlen(r->leaf), &r->binding.revision, e);
-  if (rc == LC_OK) {
-    pthread_mutex_lock(&d->mutex);
+  if (rc == LC_OK)
     ps_ns_remove(d, r);
-    pthread_mutex_unlock(&d->mutex);
-  }
   return rc;
 }
 static int reap(struct ps_namespace_data *d, uint64_t *closed,
@@ -281,8 +278,11 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
           rc = lc_error_set(e, LC_ERR_PROTOCOL, 0,
                             "unselected namespace source has canonical state",
                             NULL, NULL, "pouch");
-        if (rc == LC_OK)
+        if (rc == LC_OK) {
+          pthread_mutex_lock(&d->mutex);
           rc = drop(d, unused, e);
+          pthread_mutex_unlock(&d->mutex);
+        }
       }
       if (rc == LC_OK)
         rc = reap(d, closed, pending, e);
@@ -308,11 +308,7 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
-  if (d->views)
-    rc = lc_error_set(e, LC_ERR_INVALID, 0,
-                      "captured namespace metadata still protects body sources",
-                      NULL, "pouch_namespace_busy", "pouch");
-  pthread_mutex_unlock(&d->mutex);
+  rc = ps_ns_require_unpinned(d, e);
   ps_key_checkpoint_info(d->checkpoint, &coverage);
   if (rc == LC_OK &&
       (!id || (kind != PS_CATALOG_BODY && kind != PS_CATALOG_SEGMENT)))
@@ -330,9 +326,10 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
       rc = failure(e, "namespace source is still referenced or uncovered");
     if (rc == LC_OK && r)
       rc = drop(d, r, e);
-    if (rc == LC_OK)
-      rc = reap(d, &closed, &pending, e);
   }
+  pthread_mutex_unlock(&d->mutex);
+  if (rc == LC_OK)
+    rc = reap(d, &closed, &pending, e);
   ps_ns_leave(d);
   return rc;
 }

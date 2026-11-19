@@ -33,11 +33,13 @@ static int select_guarded(void *context, lc_error *e) {
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
-  rc = d->views || ps_ns_find(d, r->kind, r->id) != r
-           ? busy(e)
-           : ps_key_checkpoint_ranges_select(d->checkpoint, r->kind, r->id,
-                                             s->epoch, s->publish,
-                                             s->publication, e);
+  rc = ps_ns_require_unpinned(d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_find(d, r->kind, r->id) != r
+             ? busy(e)
+             : ps_key_checkpoint_ranges_select(d->checkpoint, r->kind, r->id,
+                                               s->epoch, s->publish,
+                                               s->publication, e);
   pthread_mutex_unlock(&d->mutex);
   if (shared)
     ps_ns_leave(d);
@@ -62,13 +64,15 @@ static int finish_tail(void *context, lc_error *e) {
     return rc;
   pthread_mutex_lock(&d->mutex);
   ps_key_checkpoint_info(d->checkpoint, &coverage);
-  rc = d->views || ps_ns_find(d, r->kind, r->id) != r ||
-               (!s->unused &&
-                (coverage.pending || !coverage.epoch ||
-                 r->id > coverage.segment ||
-                 (r->id == coverage.segment && coverage.offset != s->tail)))
-           ? busy(e)
-           : ps_stream_status(r->stream, &info, e);
+  rc = ps_ns_require_unpinned(d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_find(d, r->kind, r->id) != r ||
+                 (!s->unused &&
+                  (coverage.pending || !coverage.epoch ||
+                   r->id > coverage.segment ||
+                   (r->id == coverage.segment && coverage.offset != s->tail)))
+             ? busy(e)
+             : ps_stream_status(r->stream, &info, e);
   if (rc == LC_OK && info.tail != s->tail)
     rc = busy(e);
   if (rc == LC_OK)
@@ -146,7 +150,9 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
     return rc;
   pthread_mutex_lock(&d->mutex);
   r = ps_ns_find(d, kind, id);
-  if (!d->checkpoint_ready || d->views || !r || r->unselected || r->repacking)
+  rc = ps_ns_require_unpinned(d, e);
+  if (rc == LC_OK &&
+      (!d->checkpoint_ready || !r || r->unselected || r->repacking))
     rc = busy(e);
   if (rc == LC_OK)
     rc = ps_stream_status(r->stream, &info, e);

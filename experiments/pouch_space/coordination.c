@@ -14,6 +14,8 @@
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
 #define NS_SLOTS (2U * PS_PAGE - NS_BASE)
+#define VIEW_SLOTS (PS_PAGE / 2U)
+#define VIEW_BASE (PS_METADATA_START - VIEW_SLOTS)
 struct ps_coordination_guard {
   ps_coordination *owner;
   pthread_mutex_t mutex;
@@ -25,6 +27,7 @@ struct ps_coordination_guard {
 typedef struct ps_keyed_guard {
   ps_coordination_guard guard;
   pthread_cond_t available;
+  size_t views; /* OFD locks merge, so only the last local view releases it. */
 } ps_keyed_guard;
 struct ps_coordination {
   int fd, shared, poisoned;
@@ -232,19 +235,39 @@ static void drop(ps_coordination_guard *guard) {
   }
   __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
 }
-static int dynamic_guard(ps_coordination *owner, uint64_t identity, int stream,
-                         ps_coordination_guard **out, lc_error *e) {
-  ps_coordination_guard *guard, *candidate;
-  ps_keyed_guard *keyed;
-  uint64_t offset;
-  size_t bucket;
-  int rc;
-  /* The registry is keyed by the actual lock byte, including collisions. */
+static uint64_t keyed_offset(enum ps_coordination_domain domain,
+                             uint64_t identity) {
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
-  offset = stream ? STREAM_BASE + identity % (TXN_BASE - STREAM_BASE)
-                  : NS_BASE + identity % NS_SLOTS;
+  if (domain == PS_COORDINATION_STREAM)
+    return STREAM_BASE + identity % (TXN_BASE - STREAM_BASE);
+  if (domain == PS_COORDINATION_NAMESPACE_VIEW)
+    return VIEW_BASE + identity % VIEW_SLOTS;
+  return NS_BASE + identity % NS_SLOTS;
+}
+int ps_coordination_namespace_view_conflict(ps_coordination *owner,
+                                            uint64_t identity, int *present,
+                                            lc_error *e) {
+  uint64_t first, last;
+  int rc;
+  *present = 0;
+  if (!owner->shared)
+    return LC_OK;
+  rc = ps_coordination_conflict(
+      owner, keyed_offset(PS_COORDINATION_NAMESPACE_VIEW, identity), 1, &first,
+      &last, e);
+  if (rc == LC_OK)
+    *present = first != last;
+  return rc;
+}
+static int dynamic_guard(ps_coordination *owner, uint64_t offset,
+                         ps_coordination_guard **out, lc_error *e) {
+  ps_coordination_guard *guard, *candidate;
+  ps_keyed_guard *keyed;
+  size_t bucket;
+  int rc;
+  /* The registry is keyed by the actual lock byte, including collisions. */
   bucket = (size_t)(offset % BUCKETS);
   pthread_mutex_lock(&owner->registry);
   for (guard = owner->buckets[bucket]; guard; guard = guard->next)
@@ -333,6 +356,25 @@ static void local_unlock(ps_coordination_guard *guard) {
   }
   pthread_mutex_unlock(&guard->mutex);
 }
+static int pin_view(ps_coordination_guard *guard, lc_error *e) {
+  ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
+  int rc;
+  pthread_mutex_lock(&guard->mutex);
+  rc = ps_coordination_check(guard->owner, e);
+  if (rc == LC_OK && !keyed->views)
+    rc = ps_coordination_range(guard->owner, guard->offset, 1, 1, e);
+  if (rc == LC_OK)
+    ++keyed->views;
+  pthread_mutex_unlock(&guard->mutex);
+  return rc;
+}
+static void unpin_view(ps_coordination_guard *guard) {
+  ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
+  pthread_mutex_lock(&guard->mutex);
+  if (!--keyed->views)
+    (void)ps_coordination_range(guard->owner, guard->offset, 1, 0, NULL);
+  pthread_mutex_unlock(&guard->mutex);
+}
 int ps_coordination_lock(ps_coordination *owner,
                          enum ps_coordination_domain domain, uint64_t identity,
                          int wait, ps_coordination_guard **out, lc_error *e) {
@@ -341,8 +383,9 @@ int ps_coordination_lock(ps_coordination *owner,
   if (out)
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
-      domain < PS_COORDINATION_PUBLICATION || domain > PS_COORDINATION_STREAM ||
-      (domain == PS_COORDINATION_STREAM && wait) ||
+      domain < PS_COORDINATION_PUBLICATION ||
+      domain > PS_COORDINATION_NAMESPACE_VIEW ||
+      (domain >= PS_COORDINATION_STREAM && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES))
@@ -352,14 +395,21 @@ int ps_coordination_lock(ps_coordination *owner,
     return rc;
   __atomic_add_fetch(&owner->users, 1, __ATOMIC_ACQ_REL);
   if (domain >= PS_COORDINATION_NAMESPACE)
-    rc = dynamic_guard(owner, identity, domain == PS_COORDINATION_STREAM,
-                       &guard, e);
+    rc = dynamic_guard(owner, keyed_offset(domain, identity), &guard, e);
   else
     guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
                               ? (size_t)identity + 4
                               : (size_t)domain];
   if (rc != LC_OK) {
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
+    return rc;
+  }
+  if (domain == PS_COORDINATION_NAMESPACE_VIEW) {
+    rc = pin_view(guard, e);
+    if (rc == LC_OK)
+      *out = guard;
+    else
+      drop(guard);
     return rc;
   }
   rc = local_lock(guard, wait);
@@ -388,6 +438,11 @@ void ps_coordination_unlock(ps_coordination_guard *guard) {
   ps_coordination *owner;
   if (!guard)
     return;
+  if (guard->offset >= VIEW_BASE) {
+    unpin_view(guard);
+    drop(guard);
+    return;
+  }
   owner = guard->owner;
   if (owner->shared && kernel_lock(guard, 0, 0)) {
     if (owner->failure_flag)
