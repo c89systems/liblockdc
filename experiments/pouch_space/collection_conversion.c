@@ -1,0 +1,726 @@
+#include "collection_conversion.h"
+#include "lc_api_internal.h"
+#include <string.h>
+
+#define INTENT_BYTES (144U + LC_COLLECTION_HEAD_BYTES)
+#define PAGE_BYTES (40U + PS_COLLECTION_CONVERSION_BATCH * 32U)
+#define PROGRESS_BYTES 88U
+
+typedef struct conversion_candidate {
+  lc_u64 id;
+  ps_catalog_info binding;
+} conversion_candidate;
+struct ps_collection_conversion {
+  ps_space *space;
+  uint64_t collection, owner;
+  ps_collection_segment *anchor;
+  ps_catalog_info binding;
+  ps_ref source_ref;
+  lc_collection_disk_head source;
+  ps_collection_conversion_progress progress;
+  lc_u64 watermark, last_segment, last_offset;
+  conversion_candidate pending[PS_COLLECTION_CONVERSION_BATCH];
+  size_t count;
+  int discarded, aborting;
+  unsigned char scratch[PAGE_BYTES];
+};
+static int failure(lc_error *e, int code, const char *message) {
+  return lc_error_set(e, code, 0L, message, NULL,
+                      code == LC_ERR_PROTOCOL ? "collection_corrupt" : NULL,
+                      "pouch");
+}
+static lc_u64 get(const unsigned char *p) {
+  lc_u64 n = 0U;
+  size_t i;
+  for (i = 0U; i < 8U; ++i)
+    n |= (lc_u64)p[i] << (8U * i);
+  return n;
+}
+static void put(unsigned char *p, lc_u64 n) {
+  size_t i;
+  for (i = 0U; i < 8U; ++i)
+    p[i] = (unsigned char)(n >> (8U * i));
+}
+static int same_ref(const ps_ref *a, const ps_ref *b) {
+  return a->incarnation == b->incarnation &&
+         !memcmp(a->container, b->container, sizeof(a->container));
+}
+/* Zero is the initial cursor, then snapshot group, then normal history. */
+static int compare(lc_u64 as, lc_u64 ao, lc_u64 bs, lc_u64 bo) {
+  if (as != bs) {
+    if (!as || !bs)
+      return as ? 1 : -1;
+    as ^= LC_COLLECTION_SNAPSHOT_BIT;
+    bs ^= LC_COLLECTION_SNAPSHOT_BIT;
+    return as < bs ? -1 : 1;
+  }
+  return ao == bo ? 0 : ao < bo ? -1 : 1;
+}
+static ps_key key(uint64_t owner, lc_u64 id, unsigned int kind) {
+  ps_key k;
+  k.owner = owner;
+  k.key = id;
+  k.kind = kind;
+  return k;
+}
+static int load_value(ps_collection_conversion *w, lc_u64 id, void *bytes,
+                      size_t length, int optional, int *present, lc_error *e) {
+  ps_reader *reader = NULL;
+  ps_ref ref;
+  uint64_t size;
+  int found, rc;
+  rc = ps_value_info(w->space, key(w->owner, id, PS_CONTROL), &ref, &size,
+                     &found, e);
+  if (rc == LC_OK && !found && !optional)
+    rc = failure(e, LC_ERR_PROTOCOL, "collection conversion page is missing");
+  if (rc == LC_OK && found && size != length)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "collection conversion value has wrong size");
+  if (rc == LC_OK && found)
+    rc =
+        ps_read_open(w->space, key(w->owner, id, PS_CONTROL), &ref, &reader, e);
+  if (rc == LC_OK && found)
+    rc = ps_read_at(reader, 0U, bytes, length, e);
+  ps_reader_close(reader);
+  if (rc == LC_OK && present)
+    *present = found;
+  return rc;
+}
+static int store_value(ps_collection_conversion *w, lc_u64 id,
+                       const void *bytes, size_t length, lc_error *e) {
+  ps_writer *writer = NULL;
+  int rc = ps_begin(w->space, NULL, key(w->owner, id, PS_CONTROL), &writer, e);
+  if (rc == LC_OK)
+    rc = ps_write(writer, bytes, length, e);
+  if (rc == LC_OK)
+    rc = ps_publish(writer, NULL, e);
+  ps_writer_close(writer);
+  return rc;
+}
+static int binding_get(ps_space *s, uint64_t owner, const void *name,
+                       size_t length, ps_catalog_info *out, int *found,
+                       lc_error *e) {
+  ps_catalog_view *view = NULL;
+  ps_catalog_info info;
+  int rc =
+      ps_catalog_get(s, owner, PS_CATALOG_CONVERSION, name, length, &view, e);
+  if (rc == LC_OK && view)
+    rc = ps_catalog_view_info(view, &info, e);
+  if (rc == LC_OK) {
+    *found = view != NULL;
+    if (view)
+      *out = info;
+  }
+  ps_catalog_view_close(view);
+  return rc;
+}
+static int candidate_get(ps_collection_conversion *w, lc_u64 id,
+                         ps_catalog_info *info, lc_error *e) {
+  unsigned char name[8];
+  int found, rc;
+  put(name, id);
+  rc = binding_get(w->space, w->owner, name, sizeof(name), info, &found, e);
+  if (rc == LC_OK && (!found || info->stream.owner != w->owner ||
+                      !info->stream.key || info->stream.kind != PS_STREAM))
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "collection conversion candidate is missing");
+  return rc;
+}
+static int progress_load(ps_collection_conversion *w, lc_error *e) {
+  unsigned char *p = w->scratch;
+  int found, rc = load_value(w, 1U, p, PROGRESS_BYTES, 1, &found, e);
+  if (rc != LC_OK || !found)
+    return rc;
+  if (memcmp(p, "LCPSCCPR", 8U) || get(p + 8U) != w->owner)
+    return failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion progress is invalid");
+  w->progress.pages = get(p + 16U);
+  w->progress.records = get(p + 24U);
+  w->progress.candidates = get(p + 32U);
+  w->progress.source_segment = get(p + 40U);
+  w->progress.source_offset = get(p + 48U);
+  w->watermark = get(p + 56U);
+  w->last_segment = get(p + 64U);
+  w->last_offset = get(p + 72U);
+  w->aborting = get(p + 80U) != 0U;
+  if (get(p + 80U) > 1U || w->progress.pages > w->progress.records ||
+      (w->progress.records &&
+       (w->progress.records - 1U) / PS_COLLECTION_CONVERSION_BATCH >=
+           w->progress.pages) ||
+      (!w->progress.pages != !w->progress.records) ||
+      (!w->watermark != !w->progress.candidates) ||
+      (!w->last_segment != !w->progress.records) ||
+      (!w->progress.source_segment && w->progress.source_offset) ||
+      (w->last_segment &&
+       compare(w->last_segment, w->last_offset, w->progress.source_segment,
+               w->progress.source_offset) >= 0))
+    return failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion progress is inconsistent");
+  return LC_OK;
+}
+typedef struct cleanup {
+  ps_space *space;
+  uint64_t owner, watermark, pages;
+  int speculative, allow_anchor, keep_progress;
+} cleanup;
+static int remove_value(void *context, ps_key k, const ps_ref *ref,
+                        uint64_t bytes, lc_error *e) {
+  cleanup *c = context;
+  (void)bytes;
+  if (c->keep_progress && k.key == 1U)
+    return LC_OK;
+  if (c->speculative && k.key <= c->pages + 1U)
+    return LC_OK;
+  return ps_value_remove(c->space, k, ref, e);
+}
+static int remove_binding(void *context, const void *name, size_t length,
+                          const ps_catalog_info *info, lc_error *e) {
+  cleanup *c = context;
+  ps_owned_head *head = NULL;
+  ps_owned_status status;
+  cleanup children;
+  int rc = LC_OK;
+  if (!length) {
+    if (c->speculative || !c->allow_anchor || info->stream.kind != PS_STREAM ||
+        info->stream.key || !info->stream.owner ||
+        info->stream.owner == c->owner)
+      return failure(e, LC_ERR_PROTOCOL,
+                     "collection conversion anchor is invalid");
+    /* An active converter owns this head. Acquire it before touching children,
+     * so collection/orphan cleanup cannot dismantle a running workspace. */
+    rc = ps_owned_open(c->space, NULL, info->stream, 0, &info->target, &head,
+                       &status, e);
+    /* Once cancellation is selected by the caller's collection removal,
+     * detach the anchor first. A failed cascade is then an ordinary orphan
+     * tree, never a resumable conversion with partly removed dependencies. */
+    if (rc == LC_OK)
+      rc = ps_catalog_remove(c->space, c->owner, PS_CATALOG_CONVERSION, name,
+                             length, &info->revision, e);
+    if (rc == LC_OK) {
+      children = *c;
+      children.owner = info->stream.owner;
+      children.allow_anchor = 0;
+      rc = ps_catalog_visit(c->space, children.owner, PS_CATALOG_CONVERSION,
+                            remove_binding, &children, e);
+      if (rc == LC_OK)
+        rc = ps_values_visit(c->space, children.owner, PS_CONTROL, PS_CONTROL,
+                             remove_value, &children, e);
+    }
+    ps_owned_close(head);
+    return rc;
+  } else if ((length != 8U && length != 9U) ||
+             (length == 9U && ((const unsigned char *)name)[8] != 1U) ||
+             !get(name) || info->stream.kind != PS_STREAM ||
+             (length == 8U && info->stream.owner != c->owner))
+    rc =
+        failure(e, LC_ERR_PROTOCOL, "collection conversion binding is invalid");
+  if (rc == LC_OK && c->speculative &&
+      (length != 8U || info->id <= c->watermark)) {
+    ps_owned_close(head);
+    return LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = ps_catalog_remove(c->space, c->owner, PS_CATALOG_CONVERSION, name,
+                           length, &info->revision, e);
+  /* Visitor pins defer actual head retirement to the next orphan pass. */
+  ps_owned_close(head);
+  return rc;
+}
+int ps_collection_conversion_reclaim(ps_space *s, uint64_t owner, lc_error *e) {
+  cleanup c;
+  memset(&c, 0, sizeof(c));
+  c.space = s;
+  c.owner = owner;
+  c.allow_anchor = 1;
+  return ps_catalog_visit(s, owner, PS_CATALOG_CONVERSION, remove_binding, &c,
+                          e);
+}
+static int recover_prefix(ps_collection_conversion *w, lc_error *e) {
+  cleanup c;
+  int rc;
+  memset(&c, 0, sizeof(c));
+  c.space = w->space;
+  c.owner = w->owner;
+  c.watermark = w->watermark;
+  c.pages = w->progress.pages;
+  c.speculative = 1;
+  rc = ps_catalog_visit(w->space, w->owner, PS_CATALOG_CONVERSION,
+                        remove_binding, &c, e);
+  if (rc == LC_OK)
+    rc = ps_values_visit(w->space, w->owner, PS_CONTROL, PS_CONTROL,
+                         remove_value, &c, e);
+  return rc;
+}
+int ps_collection_conversion_open(ps_space *s, uint64_t collection,
+                                  lc_pouch_crypto *target, int create,
+                                  ps_collection_conversion **out, lc_error *e) {
+  ps_collection_conversion *w;
+  ps_owned_status status;
+  ps_reader *reader = NULL;
+  unsigned char *p;
+  char *key_id = NULL;
+  struct iovec part;
+  unsigned int flags;
+  int found, rc;
+  if (out)
+    *out = NULL;
+  if (!s || !collection || !out)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion requires an owner");
+  w = lc_calloc_with_allocator(NULL, 1U, sizeof(*w));
+  if (!w)
+    return failure(e, LC_ERR_NOMEM,
+                   "cannot allocate collection conversion workspace");
+  w->space = s;
+  w->collection = collection;
+  p = w->scratch;
+  flags = (lc_pouch_crypto_enabled(target) ? 1U : 0U) |
+          (lc_pouch_crypto_compression_enabled(target) ? 2U : 0U);
+  rc = flags & 1U ? lc_pouch_crypto_key_id(target, &key_id, e) : LC_OK;
+  if (rc == LC_OK && key_id && strlen(key_id) >= 80U)
+    rc = failure(e, LC_ERR_INVALID,
+                 "collection conversion key identity is too long");
+  if (rc == LC_OK)
+    rc = binding_get(s, collection, NULL, 0U, &w->binding, &found, e);
+  if (rc == LC_OK && !found && !create)
+    rc = failure(e, LC_ERR_INVALID, "collection has no conversion workspace");
+  if (rc == LC_OK && found) {
+    if (w->binding.stream.kind != PS_STREAM || w->binding.stream.key ||
+        !w->binding.stream.owner || w->binding.stream.owner == collection)
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion anchor is invalid");
+    if (rc == LC_OK) {
+      w->owner = w->binding.stream.owner;
+      rc = ps_collection_segment_open(s, w->binding.stream, 0,
+                                      &w->binding.target, NULL, NULL,
+                                      &w->anchor, e);
+    }
+    if (rc == LC_OK)
+      rc = ps_collection_segment_status(w->anchor, &status, NULL, e);
+    if (rc == LC_OK && (!status.sealed || status.tail != INTENT_BYTES))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion intent is incomplete");
+    part.iov_base = p;
+    part.iov_len = INTENT_BYTES;
+    if (rc == LC_OK)
+      rc = lc_pouch_record_io_read(ps_collection_segment_io(w->anchor), 0U,
+                                   &part, 1, e);
+    if (rc == LC_OK && (memcmp(p, "LCPSCCIN", 8U) ||
+                        get(p + 8U) != collection || get(p + 16U) != w->owner ||
+                        get(p + 24U) > 3U || !memchr(p + 56U, 0, 80U)))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion intent is invalid");
+    if (rc == LC_OK && (get(p + 24U) != flags ||
+                        strcmp((const char *)p + 56U, key_id ? key_id : "")))
+      rc = failure(e, LC_ERR_INVALID,
+                   "collection conversion target differs from durable intent");
+    if (rc == LC_OK) {
+      memcpy(w->source_ref.container, p + 32U, 16U);
+      w->source_ref.incarnation = get(p + 48U);
+      rc = lc_collection_head_decode(p + 144U, &w->source, e);
+    }
+  } else if (rc == LC_OK) {
+    rc = ps_read_open(s, key(collection, 1U, PS_CONTROL), NULL, &reader, e);
+    if (rc == LC_OK && ps_read_size(reader) != LC_COLLECTION_HEAD_BYTES)
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion source head is invalid");
+    if (rc == LC_OK) {
+      ps_read_reference(reader, &w->source_ref);
+      rc = ps_read_at(reader, 0U, p + 144U, LC_COLLECTION_HEAD_BYTES, e);
+    }
+    if (rc == LC_OK)
+      rc = lc_collection_head_decode(p + 144U, &w->source, e);
+    if (rc == LC_OK)
+      rc = ps_catalog_allocate_id(s, &w->owner, e);
+    if (rc == LC_OK && w->owner == collection)
+      rc = failure(e, LC_ERR_INVALID,
+                   "collection identity is outside reserved allocator");
+    if (rc == LC_OK)
+      rc = ps_collection_segment_open(s, key(w->owner, 0U, PS_STREAM), 1, NULL,
+                                      NULL, NULL, &w->anchor, e);
+    if (rc == LC_OK) {
+      memcpy(p, "LCPSCCIN", 8U);
+      put(p + 8U, collection);
+      put(p + 16U, w->owner);
+      put(p + 24U, flags);
+      memcpy(p + 32U, w->source_ref.container, 16U);
+      put(p + 48U, w->source_ref.incarnation);
+      if (key_id)
+        memcpy(p + 56U, key_id, strlen(key_id));
+      part.iov_base = p;
+      part.iov_len = INTENT_BYTES;
+      rc = lc_pouch_record_io_append(ps_collection_segment_io(w->anchor), &part,
+                                     1, e);
+    }
+    if (rc == LC_OK)
+      rc = ps_collection_segment_seal(w->anchor, e);
+    if (rc == LC_OK)
+      rc = ps_collection_segment_status(w->anchor, &status, NULL, e);
+    if (rc == LC_OK)
+      rc = ps_catalog_put(s, NULL, collection, PS_CATALOG_CONVERSION, NULL, 0U,
+                          NULL, key(w->owner, 0U, PS_STREAM), &status.ref,
+                          &w->binding, e);
+  }
+  ps_reader_close(reader);
+  lc_free_with_allocator(NULL, key_id);
+  if (rc == LC_OK)
+    rc = progress_load(w, e);
+  if (rc == LC_OK && w->aborting) {
+    rc = ps_collection_conversion_discard(w, e);
+    ps_collection_conversion_close(w);
+    if (rc == LC_OK && create)
+      return ps_collection_conversion_open(s, collection, target, 1, out, e);
+    return rc == LC_OK ? failure(e, LC_ERR_INVALID,
+                                 "collection conversion was cancelled")
+                       : rc;
+  }
+  if (rc == LC_OK)
+    rc = recover_prefix(w, e);
+  if (rc == LC_OK)
+    *out = w;
+  else
+    ps_collection_conversion_close(w);
+  return rc;
+}
+void ps_collection_conversion_close(ps_collection_conversion *w) {
+  if (w) {
+    ps_collection_segment_close(w->anchor);
+    lc_free_with_allocator(NULL, w);
+  }
+}
+void ps_collection_conversion_status(const ps_collection_conversion *w,
+                                     ps_collection_conversion_progress *out) {
+  *out = w->progress;
+}
+void ps_collection_conversion_source_head(const ps_collection_conversion *w,
+                                          lc_collection_disk_head *head,
+                                          ps_ref *ref) {
+  *head = w->source;
+  *ref = w->source_ref;
+}
+int ps_collection_conversion_source_bind(ps_collection_conversion *w, lc_u64 id,
+                                         const ps_catalog_info *source,
+                                         lc_error *e) {
+  unsigned char name[9];
+  ps_catalog_info info;
+  int found, rc;
+  if (!w || w->discarded || w->aborting || !id || !source ||
+      source->stream.kind != PS_STREAM || !source->stream.owner ||
+      !source->stream.key)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion source is invalid");
+  put(name, id);
+  name[8] = 1U;
+  rc = binding_get(w->space, w->owner, name, sizeof(name), &info, &found, e);
+  if (rc == LC_OK && found &&
+      (info.stream.owner != source->stream.owner ||
+       info.stream.key != source->stream.key ||
+       !same_ref(&info.target, &source->target)))
+    rc = failure(e, LC_ERR_INVALID,
+                 "collection conversion source identity changed");
+  if (rc == LC_OK && !found)
+    rc = ps_catalog_put(w->space, NULL, w->owner, PS_CATALOG_CONVERSION, name,
+                        sizeof(name), NULL, source->stream, &source->target,
+                        &info, e);
+  return rc;
+}
+int ps_collection_conversion_source_get(ps_collection_conversion *w, lc_u64 id,
+                                        ps_catalog_info *out, lc_error *e) {
+  unsigned char name[9];
+  ps_catalog_info info;
+  int found, rc;
+  if (!w || w->discarded || w->aborting || !id || !out)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion source requires an ID");
+  put(name, id);
+  name[8] = 1U;
+  rc = binding_get(w->space, w->owner, name, sizeof(name), &info, &found, e);
+  if (rc == LC_OK && !found)
+    rc = failure(e, LC_ERR_INVALID, "collection conversion source is missing");
+  if (rc == LC_OK)
+    *out = info;
+  return rc;
+}
+int ps_collection_conversion_candidate_create(ps_collection_conversion *w,
+                                              lc_u64 id,
+                                              ps_collection_segment **out,
+                                              lc_error *e) {
+  unsigned char name[8];
+  ps_catalog_info info;
+  ps_owned_status status;
+  ps_collection_segment *segment = NULL;
+  uint64_t physical;
+  int found, rc;
+  if (out)
+    *out = NULL;
+  if (!w || w->discarded || w->aborting || !id || !out)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion candidate requires an ID");
+  if (w->count == PS_COLLECTION_CONVERSION_BATCH)
+    return failure(e, LC_ERR_PENDING,
+                   "collection conversion candidates need a checkpoint");
+  put(name, id);
+  rc = binding_get(w->space, w->owner, name, sizeof(name), &info, &found, e);
+  if (rc == LC_OK && found)
+    rc = failure(e, LC_ERR_INVALID,
+                 "collection conversion candidate ID already exists");
+  if (rc == LC_OK)
+    rc = ps_catalog_allocate_id(w->space, &physical, e);
+  if (rc == LC_OK)
+    rc =
+        ps_collection_segment_open(w->space, key(w->owner, physical, PS_STREAM),
+                                   1, NULL, NULL, NULL, &segment, e);
+  if (rc == LC_OK)
+    rc = ps_collection_segment_status(segment, &status, NULL, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_put(w->space, NULL, w->owner, PS_CATALOG_CONVERSION, name,
+                        sizeof(name), NULL, key(w->owner, physical, PS_STREAM),
+                        &status.ref, &info, e);
+  if (rc == LC_OK) {
+    w->pending[w->count].id = id;
+    w->pending[w->count++].binding = info;
+    *out = segment;
+  } else
+    ps_collection_segment_close(segment);
+  return rc;
+}
+int ps_collection_conversion_candidate_open(ps_collection_conversion *w,
+                                            lc_u64 id,
+                                            ps_collection_segment **out,
+                                            lc_error *e) {
+  ps_catalog_info info;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!w || w->discarded || w->aborting || !id || !out)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion candidate requires an ID");
+  rc = candidate_get(w, id, &info, e);
+  if (rc == LC_OK)
+    rc = ps_collection_segment_open(w->space, info.stream, 0, &info.target,
+                                    NULL, NULL, out, e);
+  return rc;
+}
+static void entry_get(const unsigned char *p, ps_collection_relocation *r) {
+  r->source_segment = get(p);
+  r->source_offset = get(p + 8U);
+  r->target_segment = get(p + 16U);
+  r->target_offset = get(p + 24U);
+}
+static int page_load(ps_collection_conversion *w, lc_u64 page, size_t *count,
+                     lc_error *e) {
+  unsigned char *p = w->scratch;
+  ps_collection_relocation current, prior;
+  size_t i, n;
+  int rc = load_value(w, page + 1U, p, PAGE_BYTES, 0, NULL, e);
+  if (rc != LC_OK)
+    return rc;
+  if (memcmp(p, "LCPSCCMP", 8U) || get(p + 8U) != w->owner ||
+      get(p + 16U) != page || !get(p + 24U) ||
+      get(p + 24U) > PS_COLLECTION_CONVERSION_BATCH || get(p + 32U))
+    return failure(e, LC_ERR_PROTOCOL,
+                   "collection conversion relocation page is invalid");
+  n = (size_t)get(p + 24U);
+  memset(&prior, 0, sizeof(prior));
+  for (i = 0U; i < n; ++i) {
+    entry_get(p + 40U + i * 32U, &current);
+    if (!current.source_segment || !current.target_segment ||
+        compare(prior.source_segment, prior.source_offset,
+                current.source_segment, current.source_offset) >= 0)
+      return failure(e, LC_ERR_PROTOCOL,
+                     "collection conversion relocation order is invalid");
+    prior = current;
+  }
+  *count = n;
+  return LC_OK;
+}
+int ps_collection_conversion_checkpoint(ps_collection_conversion *w,
+                                        lc_u64 segment, lc_u64 offset,
+                                        const ps_collection_relocation *rows,
+                                        size_t count, lc_error *e) {
+  ps_collection_conversion_progress next;
+  ps_catalog_info info;
+  ps_owned_status status;
+  lc_u64 watermark, last_segment, last_offset;
+  unsigned char *p;
+  size_t i;
+  int rc;
+  if (!w || w->discarded || w->aborting || !segment ||
+      count > PS_COLLECTION_CONVERSION_BATCH || (count && !rows))
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion checkpoint is invalid");
+  next = w->progress;
+  if (compare(segment, offset, next.source_segment, next.source_offset) < 0 ||
+      next.records > LC_U64_MAX - count ||
+      next.candidates > LC_U64_MAX - w->count ||
+      (count && next.pages >= LC_U64_MAX - 1U))
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion checkpoint does not advance");
+  watermark = w->watermark;
+  last_segment = w->last_segment;
+  last_offset = w->last_offset;
+  /* Validate the entire proposed selection before writing a page. */
+  for (i = 0U; i < w->count; ++i) {
+    rc = ps_owned_inspect(w->space, w->pending[i].binding.stream,
+                          &w->pending[i].binding.target, &status, e);
+    if (rc != LC_OK)
+      return rc;
+    if (!status.sealed)
+      return failure(e, LC_ERR_PENDING,
+                     "collection conversion candidate is not sealed");
+    if (w->pending[i].binding.id > watermark)
+      watermark = w->pending[i].binding.id;
+  }
+  for (i = 0U; i < count; ++i) {
+    if (!rows[i].source_segment || !rows[i].target_segment ||
+        compare(rows[i].source_segment, rows[i].source_offset,
+                w->progress.source_segment, w->progress.source_offset) < 0 ||
+        compare(last_segment, last_offset, rows[i].source_segment,
+                rows[i].source_offset) >= 0 ||
+        compare(rows[i].source_segment, rows[i].source_offset, segment,
+                offset) >= 0)
+      return failure(e, LC_ERR_INVALID,
+                     "collection conversion mapping does not precede cursor");
+    rc = candidate_get(w, rows[i].target_segment, &info, e);
+    if (rc == LC_OK)
+      rc = ps_owned_inspect(w->space, info.stream, &info.target, &status, e);
+    if (rc != LC_OK)
+      return rc;
+    if (!status.sealed || rows[i].target_offset >= status.tail)
+      return failure(e, LC_ERR_INVALID,
+                     "collection conversion mapping escapes candidate");
+    last_segment = rows[i].source_segment;
+    last_offset = rows[i].source_offset;
+  }
+  p = w->scratch;
+  if (count) {
+    memset(p, 0, PAGE_BYTES);
+    memcpy(p, "LCPSCCMP", 8U);
+    put(p + 8U, w->owner);
+    put(p + 16U, next.pages + 1U);
+    put(p + 24U, count);
+    for (i = 0U; i < count; ++i) {
+      put(p + 40U + 32U * i, rows[i].source_segment);
+      put(p + 48U + 32U * i, rows[i].source_offset);
+      put(p + 56U + 32U * i, rows[i].target_segment);
+      put(p + 64U + 32U * i, rows[i].target_offset);
+    }
+    rc = store_value(w, next.pages + 2U, p, PAGE_BYTES, e);
+    if (rc != LC_OK)
+      return rc;
+    ++next.pages;
+  }
+  next.records += count;
+  next.candidates += w->count;
+  next.source_segment = segment;
+  next.source_offset = offset;
+  memset(p, 0, PROGRESS_BYTES);
+  memcpy(p, "LCPSCCPR", 8U);
+  put(p + 8U, w->owner);
+  put(p + 16U, next.pages);
+  put(p + 24U, next.records);
+  put(p + 32U, next.candidates);
+  put(p + 40U, next.source_segment);
+  put(p + 48U, next.source_offset);
+  put(p + 56U, watermark);
+  put(p + 64U, last_segment);
+  put(p + 72U, last_offset);
+  rc = store_value(w, 1U, p, PROGRESS_BYTES, e);
+  if (rc == LC_OK) {
+    w->progress = next;
+    w->watermark = watermark;
+    w->last_segment = last_segment;
+    w->last_offset = last_offset;
+    w->count = 0U;
+  }
+  return rc;
+}
+int ps_collection_conversion_lookup(ps_collection_conversion *w, lc_u64 segment,
+                                    lc_u64 offset,
+                                    ps_collection_relocation *out, int *present,
+                                    lc_error *e) {
+  ps_collection_relocation row, first, last;
+  lc_u64 lo, hi, mid;
+  size_t count = 0U, a, b, m;
+  int rc;
+  if (!w || w->discarded || w->aborting || !segment || !out || !present)
+    return failure(e, LC_ERR_INVALID,
+                   "collection relocation lookup requires an ID");
+  lo = 1U;
+  hi = w->progress.pages + 1U;
+  while (lo < hi) {
+    mid = lo + (hi - lo) / 2U;
+    rc = page_load(w, mid, &count, e);
+    if (rc != LC_OK)
+      return rc;
+    entry_get(w->scratch + 40U, &first);
+    entry_get(w->scratch + 40U + 32U * (count - 1U), &last);
+    if (compare(segment, offset, first.source_segment, first.source_offset) < 0)
+      hi = mid;
+    else if (compare(segment, offset, last.source_segment, last.source_offset) >
+             0)
+      lo = mid + 1U;
+    else {
+      a = 0U;
+      b = count;
+      while (a < b) {
+        m = a + (b - a) / 2U;
+        entry_get(w->scratch + 40U + 32U * m, &row);
+        rc = compare(segment, offset, row.source_segment, row.source_offset);
+        if (rc < 0)
+          b = m;
+        else if (rc > 0)
+          a = m + 1U;
+        else {
+          *out = row;
+          *present = 1;
+          return LC_OK;
+        }
+      }
+      break;
+    }
+  }
+  *present = 0;
+  return LC_OK;
+}
+int ps_collection_conversion_discard(ps_collection_conversion *w, lc_error *e) {
+  cleanup c;
+  int rc;
+  if (!w || w->discarded)
+    return failure(e, LC_ERR_INVALID,
+                   "collection conversion workspace is closed");
+  memset(&c, 0, sizeof(c));
+  c.space = w->space;
+  c.owner = w->owner;
+  c.keep_progress = 1;
+  if (!w->aborting) {
+    unsigned char *p = w->scratch;
+    memset(p, 0, PROGRESS_BYTES);
+    memcpy(p, "LCPSCCPR", 8U);
+    put(p + 8U, w->owner);
+    put(p + 16U, w->progress.pages);
+    put(p + 24U, w->progress.records);
+    put(p + 32U, w->progress.candidates);
+    put(p + 40U, w->progress.source_segment);
+    put(p + 48U, w->progress.source_offset);
+    put(p + 56U, w->watermark);
+    put(p + 64U, w->last_segment);
+    put(p + 72U, w->last_offset);
+    put(p + 80U, 1U);
+    rc = store_value(w, 1U, p, PROGRESS_BYTES, e);
+    if (rc != LC_OK)
+      return rc;
+    w->aborting = 1;
+  }
+  rc = ps_catalog_visit(w->space, w->owner, PS_CATALOG_CONVERSION,
+                        remove_binding, &c, e);
+  if (rc == LC_OK)
+    rc = ps_values_visit(w->space, w->owner, PS_CONTROL, PS_CONTROL,
+                         remove_value, &c, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_remove(w->space, w->collection, PS_CATALOG_CONVERSION, NULL,
+                           0U, &w->binding.revision, e);
+  if (rc == LC_OK)
+    w->discarded = 1;
+  return rc;
+}

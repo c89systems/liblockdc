@@ -1,4 +1,5 @@
 #include "collection_reclaim.h"
+#include "collection_conversion.h"
 #include "collections.h"
 #include "lc_api_internal.h"
 #include "lc_collection_storage.h"
@@ -108,15 +109,21 @@ int ps_collection_resources_remove(ps_space *storage,
     }
   return rc;
 }
+static int reclaim_control(void *context, ps_key key, const ps_ref *ref,
+                           uint64_t bytes, lc_error *e) {
+  (void)bytes;
+  return ps_value_remove(context, key, ref, e);
+}
 int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
                                    lc_error *e) {
   ps_collection_resources list;
   ps_owned_head *head;
   ps_owned_status status;
-  ps_key control;
-  ps_reader *value = NULL;
   size_t i, j;
-  int rc = ps_collection_resources_capture(storage, owner, &list, e);
+  int rc = ps_collection_conversion_reclaim(storage, owner, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = ps_collection_resources_capture(storage, owner, &list, e);
   for (i = 0U; rc == LC_OK && i < list.count; ++i) {
     for (j = 0U; j < i && list.items[j].id != list.items[i].id; ++j) {
     }
@@ -135,19 +142,8 @@ int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
   ps_collection_resources_clear(&list);
   if (rc == LC_OK)
     rc = ps_query_artifacts_reclaim(storage, owner, e);
-  control.owner = owner;
-  control.key = 1U;
-  control.kind = PS_CONTROL;
-  if (rc == LC_OK) {
-    rc = ps_read_open(storage, control, NULL, &value, e);
-    if (rc == LC_ERR_INVALID) {
-      /* A prior pass may have removed the head control before identity
-       * retirement failed. Unpublished construction can also have no head. */
-      lc_error_cleanup(e);
-      rc = LC_OK;
-    } else if (rc == LC_OK)
-      rc = ps_delete(storage, control, e);
-  }
-  ps_reader_close(value);
+  if (rc == LC_OK)
+    rc = ps_values_visit(storage, owner, PS_CONTROL, PS_CONTROL,
+                         reclaim_control, storage, e);
   return rc;
 }

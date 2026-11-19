@@ -10,7 +10,8 @@ enum ps_catalog_kind {
   PS_CATALOG_SNAPSHOT,
   PS_CATALOG_PROJECTION,
   PS_CATALOG_CONTROL,
-  PS_CATALOG_BODY
+  PS_CATALOG_BODY,
+  PS_CATALOG_CONVERSION
 };
 typedef struct ps_catalog_view ps_catalog_view;
 typedef struct ps_catalog_info {

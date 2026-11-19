@@ -4950,3 +4950,72 @@ dirty-writer interference. Measure single-writer sync, warm/cold reads, concurre
 scans, append and deletion churn, checkpoint/growth latency and scratch footprint.
 Report material regressions before production cutover. Native integration and
 these acceptance gates remain required even after individual components pass.
+
+### Durable collection conversion ownership and relocation progress
+
+`ps_collection_conversion` now owns an offline native conversion workspace. Its
+sealed intent captures the canonical collection head, its exact reference and
+the target compression/encryption identity. A separate durably reserved owner
+keeps conversion storage independent of existing logical segment identities.
+One exclusive anchor admits a converter; closing it preserves the durable work.
+An incompatible target request rejects without replacing the intent.
+
+A dedicated catalog role protects exact source aliases and candidate segments.
+Candidates receive fresh physical keys while the caller plans their logical
+segment IDs. Their byte owners can close before progress publication without
+making them orphan candidates. The workspace admits at most 64 new candidates
+between checkpoints, and requires all of them to be sealed before selection.
+Ordinary sibling writers do not acquire conversion authority or wait for its
+producer I/O.
+
+Relocation pages contain at most 64 source/target coordinate pairs. Each page
+becomes durable before the replacement progress control selects it, including
+on NoSync roots. The cursor advances through snapshots before normal segments;
+new mappings cannot fall behind the completed cursor. Lookup uses fixed scratch
+and binary search over typed pages instead of materializing the historical
+relocation table. Recovery enumerates current catalog metadata, retains the
+selected candidate prefix and removes later candidate bindings and unselected
+pages. Reusing a rolled-back logical candidate ID receives a fresh physical key.
+
+Fault qualification exposed a cancellation ordering gap: removing a candidate
+before changing progress could leave a resumable prefix referring to missing
+storage. Cancellation now selects an always-durable marker before deleting
+workspace dependencies. Reopen finishes cancellation before creating fresh
+work. The marker stays discoverable until the anchor is detached; ordinary
+orphan cleanup then removes the remaining controls and storage. Collection
+cleanup acquires a closed workspace anchor before cascading, so an active
+converter prevents partial removal of its collection tree. Held source byte
+owners remain readable while unreferenced storage waits for normal reclamation.
+
+Native integration fixtures convert real three-unit, generated 1 MiB streamed
+values across all four codec combinations and both durability policies, close
+candidate owners, run orphan cleanup, checkpoint and reopen. The converted
+stream, relocation and captured source remain readable. They also cover target
+policy/key mismatch, competing converter admission, speculative rollback,
+logical ID reuse, candidate limits, cursor ordering and collection orphan
+cascades. An additional 320 synthetic relocation keys exercise six-page lookup
+and gaps without confusing metadata-table qualification with a collection walk.
+A source read paused inside conversion permits a sibling writer to seal before
+conversion resumes.
+
+The failure matrix covers 452 allocation and I/O failure points, including
+partial writes and persisted torn writes, across intent creation, source
+binding, candidate admission, checkpoint, reopen, cancellation and cascade.
+I/O cases restore the modeled durable image. Every scenario reopens and
+successfully rebuilds or reads the selected result while retaining the original
+source.
+Nine selected Debug checks and seven checks each on GNU and musl release pass,
+including the full matrix and existing catalog/root/collection regressions.
+Final workspace checks pass on all three configurations, TSan with instrumented
+OpenSSL and strict Memcheck. Memcheck reports zero remaining allocations, zero
+errors and only the three inherited file descriptors. Formatting and the
+existing source-manifest/stack gates also pass.
+
+This workspace does not yet perform the canonical collection walk, authorize
+bounded source retirement, select new collection bindings/head or change root
+compression policy. Those operations must consume its durable progress while
+preserving unit/index dependencies, edit-body/receipt adjacency and history.
+Root conversion intent, final policy publication, shared-root ownership and
+matched end-to-end qualification remain outstanding. The native root continues
+to reject an explicit compression-policy change; the multifile backend remains
+the default/reference and production cutover still requires an explicit decision.
