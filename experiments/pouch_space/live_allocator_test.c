@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -16,6 +17,27 @@
 static size_t checks, allocations, allocation_fail;
 static int measuring;
 static int cooperative_wait;
+static int mapping_fail;
+void *__real_mmap(void *, size_t, int, int, int, off_t);
+static int fail_mapping(int flags, off_t offset) {
+  if (mapping_fail && (flags & MAP_SHARED) && offset == PS_READINESS_OFFSET) {
+    errno = ENOMEM;
+    return 1;
+  }
+  return 0;
+}
+void *__wrap_mmap(void *p, size_t n, int prot, int flags, int fd,
+                  off_t offset) {
+  return fail_mapping(flags, offset)
+             ? MAP_FAILED
+             : __real_mmap(p, n, prot, flags, fd, offset);
+}
+void *__wrap_mmap64(void *p, size_t n, int prot, int flags, int fd,
+                    off_t offset) {
+  /* Both entry points already take a 64-bit offset on x86_64. Musl
+   * exports mmap without the separate glibc mmap64 symbol. */
+  return __wrap_mmap(p, n, prot, flags, fd, offset);
+}
 typedef struct test_adapter {
   ps_coordination_io original, selected;
   struct test_adapter *next;
@@ -1463,9 +1485,9 @@ static void projection_lifecycle(void) {
             (unsigned long long)a->live_entries, elapsed, m.operations, m.syncs,
             m.payload_reads);
     REQUIRE(a->generation > generation && a->generation == b->generation &&
-            m.syncs == 1 && !m.payload_reads && m.operations < 100);
+            m.syncs == 0 && !m.payload_reads && m.operations < 100);
     ok(ps_refresh(a, &e), &e);
-    REQUIRE(m.syncs == 1 && !m.payload_reads);
+    REQUIRE(m.syncs == 0 && !m.payload_reads);
     m.armed = 0;
     REQUIRE(a->token_next == next_token + round && a->token_end == endpoint);
     ok(ps_budget_status(budget, &after, &e), &e);
@@ -1866,6 +1888,15 @@ static void projection_boundaries(void) {
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
   lc_error_cleanup(&e);
   REQUIRE(coverage(NULL, 0) == claims);
+  unsigned char pending[64], erased[64] = {0};
+  REQUIRE(pread(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
+          sizeof(pending));
+  REQUIRE(pwrite(b->fd, erased, sizeof(erased), PS_JOURNAL_OFFSET) ==
+          sizeof(erased));
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
+          sizeof(pending));
   ok(ps_checkpoint(b, &e), &e);
   ok(ps_refresh(a, &e), &e);
   unsigned char prefix[64], damaged[64];
@@ -1942,6 +1973,329 @@ static void projection_pressure(void) {
   REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
   free(bytes);
 }
+static ps_readiness_certificate readiness(ps_space *s) {
+  lc_error e = {0};
+  ps_coordination_guard *guard = NULL;
+  ps_readiness_certificate certificate;
+  pthread_mutex_lock(&s->mutex);
+  ok(ps_coordination_lock(s->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &guard, &e),
+     &e);
+  ok(ps_readiness_read(s, &certificate, &e), &e);
+  ps_coordination_unlock(guard);
+  pthread_mutex_unlock(&s->mutex);
+  return certificate;
+}
+typedef struct durable_gate {
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int paused, entered, released, attempted, finished;
+  size_t calls;
+} durable_gate;
+static int durable_sync(void *context, int fd) {
+  durable_gate *g = context;
+  pthread_mutex_lock(&g->mutex);
+  ++g->calls;
+  if (g->paused) {
+    g->paused = 0;
+    g->entered = 1;
+    pthread_cond_broadcast(&g->cond);
+    while (!g->released)
+      pthread_cond_wait(&g->cond, &g->mutex);
+  }
+  pthread_mutex_unlock(&g->mutex);
+  return fdatasync(fd);
+}
+static ssize_t durable_write(void *context, int fd, const void *p, size_t n,
+                             off_t offset) {
+  (void)context;
+  return pwrite(fd, p, n, offset);
+}
+static int durable_attempt(void *context, int fd, int command,
+                           struct flock *lock) {
+  durable_gate *g = context;
+  if (lock->l_start == 5 && lock->l_type == F_WRLCK &&
+      (command == F_OFD_SETLKW ||
+       (cooperative_wait && command == F_OFD_SETLK))) {
+    pthread_mutex_lock(&g->mutex);
+    g->attempted = 1;
+    pthread_cond_broadcast(&g->cond);
+    pthread_mutex_unlock(&g->mutex);
+  }
+  return fcntl(fd, command, lock);
+}
+typedef struct durable_work {
+  ps_space *space;
+  durable_gate *gate;
+} durable_work;
+static void *durable_flush(void *context) {
+  durable_work *work = context;
+  lc_error e = {0};
+  ok(ps_flush(work->space, &e), &e);
+  pthread_mutex_lock(&work->gate->mutex);
+  work->gate->finished = 1;
+  pthread_cond_broadcast(&work->gate->cond);
+  pthread_mutex_unlock(&work->gate->mutex);
+  return NULL;
+}
+static void shared_durability(void) {
+  for (int late = 0; late < 2; ++late) {
+    lc_error e = {0};
+    durable_gate x = {0}, y = {0};
+    REQUIRE(!pthread_mutex_init(&x.mutex, NULL) &&
+            !pthread_cond_init(&x.cond, NULL));
+    REQUIRE(!pthread_mutex_init(&y.mutex, NULL) &&
+            !pthread_cond_init(&y.cond, NULL));
+    ps_io ai = {&x, read_io, durable_write, durable_sync, reserve_io, NULL};
+    ps_io bi = {&y, read_io, durable_write, durable_sync, reserve_io, NULL};
+    ps_coordination_io coordinator = {&y, durable_attempt};
+    ps_options ao = {0}, bo = {0};
+    ao.io = &ai;
+    ao.coordination_io = &coordinator;
+    bo.io = &bi;
+    ps_space *a = NULL, *b = NULL;
+    ps_owned_head *head = NULL;
+    ps_owned_run *run = NULL;
+    ps_owned_status info;
+    ps_key stream = {88, 1, PS_STREAM};
+    int found;
+    ok(ps_open(path, 1, &bo, &b, &e), &e);
+    ok(ps_owned_open(b, NULL, stream, 1, NULL, &head, &info, &e), &e);
+    ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+    REQUIRE(found);
+    ok(ps_checkpoint(b, &e), &e);
+    ok(ps_open(path, 0, &ao, &a, &e), &e);
+    unsigned char byte = 0x41;
+    ok(ps_owned_write(run, 0, &byte, 1, &e), &e);
+    ok(ps_owned_commit(head, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+    capture_put(a, 1, 65);
+    uint64_t wire = readiness(a).ready;
+    ps_stats before_a = status(a), before_b = status(b);
+    x.calls = y.calls = 0;
+    x.paused = late;
+    y.paused = 1;
+    y.attempted = 0;
+    pthread_t first, second;
+    durable_work first_work = {b, &y}, second_work = {a, &x};
+    REQUIRE(!pthread_create(&first, NULL, durable_flush, &first_work));
+    pthread_mutex_lock(&y.mutex);
+    while (!y.entered && !y.finished)
+      pthread_cond_wait(&y.cond, &y.mutex);
+    REQUIRE(y.entered);
+    pthread_mutex_unlock(&y.mutex);
+    REQUIRE(!pthread_create(&second, NULL, durable_flush, &second_work));
+    pthread_mutex_lock(&y.mutex);
+    while (!y.attempted)
+      pthread_cond_wait(&y.cond, &y.mutex);
+    pthread_mutex_unlock(&y.mutex);
+    ps_coordination_guard *independent = NULL;
+    ok(ps_coordination_lock(a->coordination, PS_COORDINATION_ALLOCATION, 0, 0,
+                            &independent, &e),
+       &e);
+    ps_coordination_unlock(independent);
+    /* Sync leadership waits outside local and global allocation authority. */
+    if (late)
+      capture_put(a, 2, 65);
+    ps_readiness_certificate during = readiness(a);
+    REQUIRE(during.durable < wire && during.ready == wire + (uint64_t)late);
+    pthread_mutex_lock(&y.mutex);
+    y.released = 1;
+    pthread_cond_broadcast(&y.cond);
+    pthread_mutex_unlock(&y.mutex);
+    REQUIRE(!pthread_join(first, NULL));
+    if (late) {
+      pthread_mutex_lock(&x.mutex);
+      while (!x.entered && !x.finished)
+        pthread_cond_wait(&x.cond, &x.mutex);
+      REQUIRE(x.entered);
+      pthread_mutex_unlock(&x.mutex);
+      during = readiness(a);
+      REQUIRE(during.durable == wire && during.ready == wire + 1);
+      uint64_t selected, durable;
+      ok(ps_publication_prefix(a, &selected, &durable, &e), &e);
+      REQUIRE(durable < selected);
+      pthread_mutex_lock(&x.mutex);
+      x.released = 1;
+      pthread_cond_broadcast(&x.cond);
+      pthread_mutex_unlock(&x.mutex);
+    }
+    REQUIRE(!pthread_join(second, NULL));
+    REQUIRE(x.calls == (size_t)late && y.calls == 1);
+    REQUIRE(status(a).syncs == before_a.syncs + (uint64_t)late &&
+            status(b).syncs == before_b.syncs + 1);
+    REQUIRE(readiness(a).durable == readiness(a).ready);
+    ps_owned_run_close(run);
+    ps_owned_close(head);
+    ok(ps_close(a, &e), &e);
+    ok(ps_close(b, &e), &e);
+    ok(ps_open(path, 0, NULL, &a, &e), &e);
+    ps_reader *reader = NULL;
+    ok(ps_read_open(a, key(1), NULL, &reader, &e), &e);
+    captured_expect(reader, 1, 65);
+    ps_reader_close(reader);
+    ok(ps_close(a, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+    REQUIRE(!pthread_cond_destroy(&x.cond) && !pthread_mutex_destroy(&x.mutex));
+    REQUIRE(!pthread_cond_destroy(&y.cond) && !pthread_mutex_destroy(&y.mutex));
+  }
+}
+static void readiness_cohort(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL, *c = NULL;
+  mapping_fail = 1;
+  REQUIRE(ps_open(path, 1, NULL, &a, &e) == LC_ERR_TRANSPORT && !a);
+  mapping_fail = 0;
+  lc_error_cleanup(&e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ps_readiness_certificate certificate = readiness(a);
+  REQUIRE(certificate.ready == a->sequence &&
+          certificate.durable < certificate.ready);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  uint64_t syncs = status(a).syncs;
+  ok(ps_flush(a, &e), &e);
+  REQUIRE(status(a).syncs == syncs);
+  certificate = readiness(a);
+  REQUIRE(certificate.ready == certificate.durable);
+  ps_reader *source = NULL, *imported = NULL;
+  ok(ps_read_open(a, key(1), NULL, &source, &e), &e);
+  size_t ticket_bytes = ps_reader_ticket_bytes(source);
+  void *ticket = malloc(ticket_bytes);
+  REQUIRE(ticket);
+  ok(ps_reader_ticket(source, ticket, ticket_bytes, &e), &e);
+  ok(ps_reader_import(path, ticket, ticket_bytes, &imported, &e), &e);
+  ps_reader_close(source);
+  free(ticket);
+  uint64_t records[16], zero = 0;
+  REQUIRE(pread(a->fd, records, sizeof(records), PS_READINESS_OFFSET) ==
+          sizeof(records));
+  size_t selected = records[0] > records[8] ? 0 : 8;
+  /* Interrupted overwrite of the older slot leaves the selected record. */
+  REQUIRE(pwrite(a->fd, &zero, sizeof(zero),
+                 PS_READINESS_OFFSET + (8 - selected) * 8) == sizeof(zero));
+  REQUIRE(readiness(a).ready == certificate.ready);
+  /* A committed slot with a bad checksum cannot fall back to an older slot. */
+  size_t older = 8 - selected;
+  REQUIRE(pwrite(a->fd, records + older, 8 * sizeof(zero),
+                 PS_READINESS_OFFSET + older * 8) == 8 * sizeof(zero));
+  uint64_t damaged = records[selected + 7] ^ 1;
+  REQUIRE(pwrite(a->fd, &damaged, sizeof(damaged),
+                 PS_READINESS_OFFSET + (selected + 7) * 8) == sizeof(damaged));
+  REQUIRE(ps_refresh(a, &e) == LC_ERR_TRANSPORT);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
+  lc_error_cleanup(&e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
+  lc_error_cleanup(&e);
+  ok(ps_close(b, &e), &e);
+  /* Imported readers hold physical presence, not canonical membership. */
+  ok(ps_open(path, 0, NULL, &c, &e), &e);
+  certificate = readiness(c);
+  REQUIRE(certificate.ready == certificate.durable);
+  ps_reader *restored = NULL;
+  ok(ps_read_open(c, key(1), NULL, &restored, &e), &e);
+  captured_expect(restored, 1, 65);
+  ps_reader_close(restored);
+  captured_expect(imported, 1, 65);
+  ps_reader_close(imported);
+  ok(ps_close(c, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+typedef struct readiness_fault {
+  int kind, reason, armed;
+  size_t calls, nth;
+} readiness_fault;
+static int readiness_lock(void *context, int fd, int command,
+                          struct flock *lock) {
+  readiness_fault *f = context;
+  int match = f->kind == 1   ? command == F_OFD_SETLKW && lock->l_start == 5
+              : f->kind == 2 ? command == F_OFD_SETLK && lock->l_start == 5 &&
+                                   lock->l_type == F_UNLCK
+              : f->kind == 3 ? command == F_OFD_SETLKW && lock->l_start == 4
+              : f->kind == 4 ? command == F_OFD_SETLK && lock->l_start == 4 &&
+                                   lock->l_type == F_UNLCK
+                             : command == F_OFD_SETLK && lock->l_start == 3 &&
+                                   lock->l_type == F_RDLCK;
+  if (f->armed && match && ++f->calls == f->nth) {
+    errno = f->reason;
+    return -1;
+  }
+  return fcntl(fd, command, lock);
+}
+static int readiness_sync_fault(void *context, int fd) {
+  readiness_fault *f = context;
+  if (f->kind == 6 && f->armed && ++f->calls == f->nth) {
+    errno = f->reason;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static void readiness_faults(void) {
+  for (int kind = 1; kind <= 6; ++kind)
+    for (int reason = 0; reason < 3; ++reason)
+      for (size_t nth = 1; nth <= (kind == 3 || kind == 4 ? 2U : 1U); ++nth) {
+        lc_error e = {0};
+        readiness_fault f = {kind,
+                             reason == 0   ? EINTR
+                             : reason == 1 ? EAGAIN
+                                           : EIO,
+                             kind == 5, 0, nth};
+        ps_coordination_io io = {&f, readiness_lock};
+        ps_io disk = {&f,         read_io, durable_write, readiness_sync_fault,
+                      reserve_io, NULL};
+        ps_options options = {0};
+        options.coordination_io = &io;
+        options.io = &disk;
+        ps_space *s = NULL;
+        int rc = ps_open(path, 1, &options, &s, &e);
+        if (kind == 5 && reason) {
+          REQUIRE(rc == (reason == 1 ? LC_ERR_PENDING : LC_ERR_TRANSPORT) &&
+                  !s);
+          lc_error_cleanup(&e);
+          REQUIRE(!coverage(NULL, 0) && !unlink(path));
+          continue;
+        }
+        ok(rc, &e);
+        f.armed = 0;
+        ps_space *observer = NULL;
+        if (kind == 6)
+          ok(ps_open(path, 0, NULL, &observer, &e), &e);
+        capture_put(s, 1, 65);
+        uint64_t stable = kind == 6 ? readiness(observer).durable : 0;
+        uint64_t selected, durable;
+        ok(ps_publication_prefix(s, &selected, &durable, &e), &e);
+        REQUIRE(durable < selected);
+        f.calls = 0;
+        f.armed = kind != 5;
+        rc = ps_flush(s, &e);
+        f.armed = 0;
+        if (!reason || kind == 5)
+          ok(rc, &e);
+        else {
+          REQUIRE(rc == ((kind == 1 || kind == 3) && reason == 1
+                             ? LC_ERR_PENDING
+                             : LC_ERR_TRANSPORT));
+          lc_error_cleanup(&e);
+          uint64_t after, acknowledged;
+          ok(ps_status(s, &(ps_stats){0}, &e), &e);
+          if (kind == 2 || kind == 4 || kind == 6) {
+            REQUIRE(ps_check(s, &e) == LC_ERR_TRANSPORT);
+            lc_error_cleanup(&e);
+            if (kind == 6)
+              REQUIRE(readiness(observer).durable == stable);
+          } else {
+            ok(ps_publication_prefix(s, &after, &acknowledged, &e), &e);
+            REQUIRE(after == selected && acknowledged == durable);
+            ok(ps_flush(s, &e), &e);
+          }
+        }
+        ok(ps_close(s, &e), &e);
+        ok(ps_close(observer, &e), &e);
+        REQUIRE(!coverage(NULL, 0) && !unlink(path));
+      }
+}
 int main(int argc, char **argv) {
   if (argc == 5 && !strcmp(argv[1], "--projection-child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
@@ -1957,7 +2311,8 @@ int main(int argc, char **argv) {
   cooperative_wait = argc == 4;
   if (cooperative_wait) {
     REQUIRE(!strcmp(argv[2], "threads") || !strcmp(argv[2], "serialized") ||
-            !strcmp(argv[2], "packed") || !strcmp(argv[2], "capture-race"));
+            !strcmp(argv[2], "packed") || !strcmp(argv[2], "capture-race") ||
+            !strcmp(argv[2], "shared-durable"));
     fprintf(stderr,
             "test-only cooperative OFD waits; real kernel locks retained\n");
   }
@@ -2001,6 +2356,12 @@ int main(int argc, char **argv) {
     projection_boundaries();
   else if (!strcmp(argv[2], "projection-pressure"))
     projection_pressure();
+  else if (!strcmp(argv[2], "shared-durable"))
+    shared_durability();
+  else if (!strcmp(argv[2], "readiness-cohort"))
+    readiness_cohort();
+  else if (!strcmp(argv[2], "readiness-faults"))
+    readiness_faults();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));
     processes();

@@ -47,6 +47,8 @@ static int allocation_refresh(ps_space *, lc_error *);
 static int canonical_observe(ps_space *, lc_error *);
 static int canonical_journal(ps_space *, lc_error *);
 static int canonical_refresh(ps_space *, lc_error *);
+static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
+static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 struct ps_values {
   ps_space *space;
   ps_entry **items;
@@ -191,13 +193,64 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
   pthread_cond_broadcast(&s->commit_cond);
   pthread_mutex_unlock(&s->commit_mutex);
 }
+/* Global sync leadership precedes allocation authority. No allocator/commit
+ * mutex spans file I/O or a wait for that leader. Only this owner's journal
+ * framing establishes a dependency from its local completed-byte H prefix to
+ * a global wire prefix; observing a foreign frame cannot certify local bytes.
+ */
+static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
+                          int *synced, lc_error *error) {
+  ps_coordination_guard *leader = NULL, *guard = NULL;
+  ps_readiness_certificate certificate;
+  uint64_t target = 0, wire = 0;
+  int rc, covered = 0;
+  *synced = 0;
+  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
+                            &leader, error);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&s->mutex);
+  rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = ps_readiness_read(s, &certificate, error);
+  if (rc == LC_OK) {
+    covered = requested <= s->own_ready_sequence &&
+              certificate.durable >= s->own_ready_wire;
+    target = covered ? s->own_ready_sequence
+                     : __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+    wire = certificate.ready;
+  }
+  rc = allocation_end(s, guard, rc, error);
+  guard = NULL;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && !covered) {
+    *synced = 1;
+    rc = sync_file(s, error);
+    if (rc == LC_OK) {
+      pthread_mutex_lock(&s->mutex);
+      rc = allocation_begin(s, &guard, error);
+      if (rc == LC_OK)
+        rc = ps_readiness_stabilize(s, wire, 0, error);
+      rc = allocation_end(s, guard, rc, error);
+      pthread_mutex_unlock(&s->mutex);
+    }
+  }
+  ps_coordination_unlock(leader);
+  if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+    lc_error_cleanup(error);
+    rc = healthy(s, error);
+  }
+  if (rc == LC_OK)
+    *completed = target;
+  return rc;
+}
 /* The caller has already published complete immutable bytes. One caller leads
  * a sync of the ready prefix; arrivals during I/O form the next group. Neither
  * the directory mutex nor the commit mutex is held across the actual sync.
  * Structural and commit barriers share the separate sync I/O mutex. */
 static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
-  uint64_t target, covered;
-  int rc = LC_OK;
+  uint64_t target, covered, completed;
+  int rc = LC_OK, synced;
   pthread_mutex_lock(&s->commit_mutex);
   ++s->sync_requests;
   while (__atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED) < sequence) {
@@ -212,13 +265,16 @@ static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
     covered = target - __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED);
     s->syncing = 1;
     pthread_mutex_unlock(&s->commit_mutex);
-    rc = sync_file(s, error);
+    completed = target;
+    synced = 1;
+    rc = s->readiness ? shared_durable(s, sequence, &completed, &synced, error)
+                      : sync_file(s, error);
     pthread_mutex_lock(&s->commit_mutex);
-    ++s->sync_batches;
+    s->sync_batches += synced;
     if (rc == LC_OK) {
-      if (target > __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED))
-        __atomic_store_n(&s->durable_sequence, target, __ATOMIC_RELEASE);
-      if (covered > s->max_sync_batch)
+      if (completed > __atomic_load_n(&s->durable_sequence, __ATOMIC_RELAXED))
+        __atomic_store_n(&s->durable_sequence, completed, __ATOMIC_RELEASE);
+      if (synced && covered > s->max_sync_batch)
         s->max_sync_batch = covered;
     }
     s->syncing = 0;
@@ -1596,8 +1652,8 @@ static int initial_free(ps_space *s, lc_error *error) {
   s->free->offset = PS_DATA;
   s->free->bytes = s->free_bytes = s->capacity - PS_DATA;
   s->free->clean = s->generation == 0;
-  s->metadata_free->offset = 2 * PS_PAGE;
-  s->metadata_free->bytes = s->metadata_free_bytes = PS_METADATA_RESERVE;
+  s->metadata_free->offset = PS_METADATA_START;
+  s->metadata_free->bytes = s->metadata_free_bytes = PS_METADATA_WORKSPACE;
   s->metadata_free->clean = s->generation == 0;
   return LC_OK;
 }
@@ -1893,7 +1949,7 @@ static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
   return allocation_end(s, guard, rc, error);
 }
 static int metadata_offset(ps_space *s, uint64_t offset) {
-  return offset % PS_PAGE == 0 && offset >= 2 * PS_PAGE &&
+  return offset % PS_PAGE == 0 && offset >= PS_METADATA_START &&
          offset <= s->capacity - PS_PAGE &&
          (offset < JOURNAL_OFFSET || offset >= PS_DATA);
 }
@@ -2334,7 +2390,7 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
   put64(root + 40, new_root.generation);
   put64(root + 48, s->token_limit);
   memcpy(root + 56, s->identity, 16);
-  put32(root + 72, PS_RUN_HEADER);
+  put32(root + 72, PS_ROOT_LAYOUT);
   put32(root + 76, checksum(root, 76));
   if (rc == LC_OK)
     rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
@@ -2364,6 +2420,12 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
   s->metadata_fallbacks += dense;
   s->directory = new_root;
   s->journal = 0;
+  rc = ps_readiness_stabilize(s, s->sequence, s->generation, error);
+  if (rc != LC_OK) {
+    ps_directory_close(directory);
+    lc_free_with_allocator(NULL, trim);
+    return rc;
+  }
   mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
   if (s->metadata_claims_active) {
     /* New pages are the prefix inserted by this checkpoint. Selected pages
@@ -2454,6 +2516,7 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
     ++s->sequence;
     s->journal += bytes;
     __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+    rc = ps_readiness_publish(s, error);
   }
   return rc;
 }
@@ -2529,6 +2592,7 @@ static void destroy(ps_space *s) {
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
   lc_free_with_allocator(NULL, s->journal_image);
+  ps_readiness_close(s);
   if (s->coordination) {
     (void)ps_coordination_close(s->coordination, NULL);
     s->fd = -1;
@@ -2565,12 +2629,12 @@ static int root_valid(const unsigned char *p) {
   return get64(p) == ROOT_MAGIC && get64(p + 8) && capacity >= PS_MIB &&
          capacity <= INT64_MAX && capacity % PS_MIB == 0 &&
          ((!offset && !generation) ||
-          (offset >= 2 * PS_PAGE && offset % PS_PAGE == 0 &&
+          (offset >= PS_METADATA_START && offset % PS_PAGE == 0 &&
            offset <= capacity - PS_PAGE &&
            (offset < JOURNAL_OFFSET || offset >= PS_DATA) && generation &&
            generation <= get64(p + 8))) &&
          get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 &&
-         get32(p + 72) == PS_RUN_HEADER && checksum(p, 76) == get32(p + 76);
+         get32(p + 72) == PS_ROOT_LAYOUT && checksum(p, 76) == get32(p + 76);
 }
 static int canonical_observe(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES];
@@ -2596,13 +2660,22 @@ static int canonical_observe(ps_space *s, lc_error *error) {
 }
 static int canonical_journal(ps_space *s, lc_error *error) {
   unsigned char next[64];
-  int rc;
+  ps_readiness_certificate certificate;
+  int rc = ps_readiness_read(s, &certificate, error);
+  if (rc != LC_OK)
+    return rc;
+  if (s->generation < certificate.root)
+    return err(error, LC_ERR_PENDING,
+               "certified checkpoint view needs refresh");
   while (s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
     if (rc != LC_OK)
       return rc;
     if (!memcmp(next, s->journal_image + s->journal, sizeof(next)))
-      return LC_OK;
+      break;
+    if (s->readiness && s->sequence >= certificate.ready)
+      return err(error, LC_ERR_PENDING,
+                 "journal boundary is not yet certified");
     /* Identity-only grants do not change the application projection. Their
      * global frontier is distinct from this participant's spending endpoint.
      * Every other changed prefix, including incomplete/invalid data, fences
@@ -2626,6 +2699,12 @@ static int canonical_journal(ps_space *s, lc_error *error) {
     memset(s->journal_image + s->journal, 0, PS_JOURNAL - s->journal);
     __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
   }
+  if (s->readiness && s->sequence < certificate.ready)
+    return err(error, LC_ERR_PENDING, "certified journal view needs refresh");
+  if (s->readiness && certificate.durable >= s->own_ready_wire &&
+      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
+          s->own_ready_sequence)
+    mark_durable(s, s->own_ready_sequence);
   return LC_OK;
 }
 typedef struct metadata_read_page {
@@ -2964,6 +3043,9 @@ static int recover(ps_space *s, lc_error *error) {
   s->directory.generation = get64(root + 40);
   s->token_limit = get64(root + 48);
   memcpy(s->identity, root + 56, 16);
+  rc = ps_readiness_validate(s, 0, error);
+  if (rc != LC_OK)
+    return rc;
   if (s->maximum && s->capacity > s->maximum)
     return err(error, LC_ERR_INVALID,
                "committed capacity exceeds configured maximum");
@@ -3139,6 +3221,9 @@ static int recover(ps_space *s, lc_error *error) {
     ++s->sequence;
   }
   s->journal = cursor;
+  rc = ps_readiness_validate(s, 1, error);
+  if (rc != LC_OK)
+    goto done;
   /* Clear all of the rejected tail, not only its first record: subsequent
    * equal-sized appends must never resurrect a stale suffix with reused seqs.
    * The exact journal image is already in memory. Leave known-zero bytes
@@ -3228,7 +3313,7 @@ static int projection_same(const ps_entry *a, const ps_entry *b) {
           (!b->stream_sealed || a->bytes <= b->bytes));
 }
 static int projection_journal(ps_space *v, uint64_t checkpoint,
-                              lc_error *error) {
+                              uint64_t certified, lc_error *error) {
   static const unsigned char zero[64] = {0};
   const unsigned char *p;
   size_t bytes;
@@ -3252,8 +3337,9 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
         return LC_OK;
       if (magic == (uint32_t)EVENT_MAGIC && bytes == 64 &&
           v->sequence != UINT64_MAX && get64(p + 8) == v->sequence + 1 &&
-          !get32(p + 16) && get32(p + 20) == PS_RESERVE_IDS && !get64(p + 24) &&
-          !get64(p + 32) && !get64(p + 48) && !get32(p + 56) &&
+          get64(p + 8) <= certified && !get32(p + 16) &&
+          get32(p + 20) == PS_RESERVE_IDS && !get64(p + 24) && !get64(p + 32) &&
+          !get64(p + 48) && !get32(p + 56) &&
           v->token_limit <= UINT64_MAX - TOKEN_RANGE &&
           get64(p + 40) == v->token_limit + TOKEN_RANGE) {
         v->token_limit += TOKEN_RANGE;
@@ -3518,7 +3604,11 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
+  ps_readiness_certificate certificate;
   memset(&recovery, 0, sizeof(recovery));
+  rc = ps_readiness_read(s, &certificate, error);
+  if (rc != LC_OK)
+    return rc;
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -3540,6 +3630,9 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
       get64(root + 16) < s->capacity || get64(root + 48) < s->token_limit)
     return err(error, LC_ERR_PENDING,
                "checkpoint would regress a live projection");
+  if (get64(root + 8) < certificate.root)
+    return err(error, LC_ERR_PENDING,
+               "selected root is behind certified retirement");
   if ((s->maximum && get64(root + 16) > s->maximum) || fstat(s->fd, &st) ||
       st.st_size < (off_t)get64(root + 16))
     return err(error, LC_ERR_INVALID, "checkpoint capacity unavailable");
@@ -3587,7 +3680,12 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
   if (rc == LC_OK)
     rc = ps_catalog_validate_directory(v, error);
   if (rc == LC_OK)
-    rc = projection_journal(v, get64(root + 24), error);
+    rc = projection_journal(v, get64(root + 24),
+                            s->readiness ? certificate.ready : UINT64_MAX,
+                            error);
+  if (rc == LC_OK && v->sequence < certificate.ready)
+    rc = err(error, LC_ERR_PENDING,
+             "checkpoint is behind the certified journal prefix");
   if (rc != LC_OK)
     goto done;
   if (v->live_entries > (uint64_t)((size_t)-1 / sizeof(*items))) {
@@ -3647,8 +3745,15 @@ static int canonical_refresh(ps_space *s, lc_error *error) {
       memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
                   error);
-  if (rc == LC_OK)
+  if (rc == LC_OK &&
+      (!s->readiness || certificate.root < v->generation ||
+       memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
     rc = sync_file(s, error);
+    if (rc == LC_OK)
+      rc = ps_readiness_stabilize(
+          s, certificate.ready > v->sequence ? certificate.ready : v->sequence,
+          v->generation, error);
+  }
   if (rc == LC_OK) {
     projection_entries(s, v, items, count);
     projection_install(s, v);
@@ -3812,6 +3917,8 @@ int ps_open(const char *path, int create, const ps_options *options,
   if (rc == LC_OK && create) {
     rc = reserve_file(s, 0, s->capacity, error);
     if (rc == LC_OK)
+      rc = ps_readiness_attach(s, error);
+    if (rc == LC_OK)
       rc = random_bytes(s->identity, 16, error);
     s->token_next = 1;
     s->token_limit = TOKEN_RANGE;
@@ -3824,8 +3931,11 @@ int ps_open(const char *path, int create, const ps_options *options,
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
-  } else if (rc == LC_OK)
-    rc = recover(s, error);
+  } else if (rc == LC_OK) {
+    rc = ps_readiness_attach(s, error);
+    if (rc == LC_OK)
+      rc = recover(s, error);
+  }
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
     rc = err(error, LC_ERR_INVALID,
              "committed capacity exceeds configured maximum");
@@ -3833,6 +3943,8 @@ int ps_open(const char *path, int create, const ps_options *options,
     rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
     rc = metadata_protect(s, bound, 0, 0, error);
+  if (rc == LC_OK)
+    rc = ps_readiness_opened(s, error);
   rc = allocation_end(s, opening, rc, error);
   if (rc != LC_OK) {
     destroy(s);
@@ -4212,6 +4324,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
       }
     }
     __atomic_store_n(&s->pending_sequence, sequence, __ATOMIC_RELEASE);
+    rc = ps_readiness_publish(s, error);
     for (i = 0; i < count; ++i)
       if (entry_release_claims(s, writers[i]->entry, error) != LC_OK) {
         rc = healthy(s, error);

@@ -10,11 +10,13 @@ enum ps_coordination_domain {
   PS_COORDINATION_PUBLICATION = 0,
   PS_COORDINATION_RECOVERY,
   PS_COORDINATION_ALLOCATION,
+  PS_COORDINATION_SYNC,
   PS_COORDINATION_TRANSACTION,
   PS_COORDINATION_NAMESPACE
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
- * or -1 with errno, as on Linux. No persistent data passes through this seam. */
+ * or -1 with errno, as on Linux. No persistent data passes through this seam.
+ */
 typedef struct ps_coordination_io {
   void *context;
   int (*lock)(void *, int, int, struct flock *);
@@ -31,12 +33,12 @@ typedef struct ps_coordination_options {
 
 /* fd must be a fresh, writable open file description, not a dup or an inherited
  * handle. Success adopts it; failure leaves it with the caller, unlocked.
- * Native flock controls lifetime compatibility. Shared participants additionally
- * use Linux OFD byte locks, independent of PIDs and released on the last close
- * of their owning file description.
- * These are coordination capabilities only: shared allocator admission and
- * cross-process projection/reader recovery require their own integration.
- * Fork before open, or exec before using a child. CLOEXEC belongs to the caller.
+ * Native flock controls lifetime compatibility. Shared participants
+ * additionally use Linux OFD byte locks, independent of PIDs and released on
+ * the last close of their owning file description. These are coordination
+ * capabilities only: shared allocator admission and cross-process
+ * projection/reader recovery require their own integration. Fork before open,
+ * or exec before using a child. CLOEXEC belongs to the caller.
  */
 int ps_coordination_open(int, const ps_coordination_options *,
                          ps_coordination **, lc_error *);
@@ -48,9 +50,10 @@ int ps_coordination_check(ps_coordination *, lc_error *);
 size_t ps_coordination_users(ps_coordination *);
 /* Immutable lifetime admission mode; does not acquire a guard. */
 int ps_coordination_shared(const ps_coordination *);
-/* Publication/recovery/allocation use identity zero.
+/* Publication/recovery/allocation/sync use identity zero.
  * Transaction uses stripe < 256.
  * Allocation uses byte 4, separate from publication and reader presence.
+ * Sync leadership uses byte 5; never wait for it while holding allocation.
  * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
@@ -62,7 +65,8 @@ int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
 /* Release on the acquiring thread. An uncertain kernel unlock poisons the
- * owner; further acquisition fails until close/reopen. Cleanup remains legal. */
+ * owner; further acquisition fails until close/reopen. Cleanup remains legal.
+ */
 void ps_coordination_unlock(ps_coordination_guard *);
 
 /* Query foreign OFD ownership without acquiring authority. A conflict is a

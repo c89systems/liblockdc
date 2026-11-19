@@ -17,6 +17,10 @@
 #define PS_CELL 64U
 #define PS_CHUNK 16384U
 #define PS_METADATA_RESERVE 131072U
+/* Isolated volatile coordination page, excluded from descriptor ownership. */
+#define PS_READINESS_OFFSET (2U * PS_PAGE)
+#define PS_METADATA_START (3U * PS_PAGE)
+#define PS_METADATA_WORKSPACE (PS_METADATA_RESERVE - PS_PAGE)
 #define PS_JOURNAL 131072U
 #define PS_JOURNAL_OFFSET (2U * PS_PAGE + PS_METADATA_RESERVE)
 #define PS_DATA (PS_JOURNAL_OFFSET + PS_JOURNAL)

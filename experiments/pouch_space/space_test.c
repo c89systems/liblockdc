@@ -577,7 +577,7 @@ static void short_io_and_corruption(void) {
   fd = open(path, O_RDWR);
   CHECK(fd >= 0);
   byte = 0xff;
-  CHECK(pwrite(fd, &byte, 1, 2 * PS_PAGE) ==
+  CHECK(pwrite(fd, &byte, 1, PS_METADATA_START) ==
         1); /* root 0 after explicit checkpoint */
   CHECK(close(fd) == 0);
   BAD(ps_open(path, 0, NULL, &s, &error));
@@ -7111,7 +7111,7 @@ static void piece_incremental(int durable) {
     CHECK(pread(fd, root, sizeof(root), (off_t)(slot * PS_PAGE)) ==
           sizeof(root));
     if (fixture_get64(root)) {
-      CHECK((uint32_t)fixture_get64(root + 72) == PS_RUN_HEADER);
+      CHECK((uint32_t)fixture_get64(root + 72) == PS_ROOT_LAYOUT);
       fixture_put(root + 72, PS_RUN_IDENTITY_BYTES, 4);
       fixture_put(root + 76, crc32(0, root, 76), 4);
       CHECK(pwrite(fd, root, sizeof(root), (off_t)(slot * PS_PAGE)) ==

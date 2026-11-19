@@ -1,0 +1,20 @@
+#ifndef POUCH_SPACE_READINESS_H
+#define POUCH_SPACE_READINESS_H
+#include "space.h"
+typedef struct ps_readiness ps_readiness;
+typedef struct ps_readiness_certificate {
+  uint64_t ready, durable, root;
+} ps_readiness_certificate;
+/* All access is under container allocation authority. Membership is an OFD
+ * read witness at byte 3, separate from physical-reader presence at byte 2.
+ * Certificates are volatile cohort state, not replay authority after reopen.
+ */
+int ps_readiness_attach(ps_space *, lc_error *);
+void ps_readiness_close(ps_space *);
+int ps_readiness_validate(ps_space *, int prefix, lc_error *);
+int ps_readiness_opened(ps_space *, lc_error *);
+int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
+int ps_readiness_publish(ps_space *, lc_error *);
+int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
+                           lc_error *);
+#endif

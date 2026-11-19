@@ -8,7 +8,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
-#define FIXED (PS_COORDINATION_TXN_STRIPES + 3U)
+#define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
 #define BUCKETS 67U
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
@@ -31,8 +31,8 @@ struct ps_coordination {
   ps_coordination_guard fixed[FIXED], *buckets[BUCKETS];
 };
 static int fail(lc_error *e, int code, int reason, const char *message) {
-  return lc_error_set(e, code, 0, message,
-                      reason ? strerror(reason) : NULL, NULL, "pouch");
+  return lc_error_set(e, code, 0, message, reason ? strerror(reason) : NULL,
+                      NULL, "pouch");
 }
 static int native_lock(void *context, int fd, int command, struct flock *lock) {
   (void)context;
@@ -163,7 +163,7 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
   for (i = 0; i < FIXED; ++i) {
     owner->fixed[i].owner = owner;
     owner->fixed[i].fixed = 1;
-    owner->fixed[i].offset = i < 2 ? i : i == 2 ? 4 : TXN_BASE + i - 3;
+    owner->fixed[i].offset = i < 2 ? i : i < 4 ? i + 2 : TXN_BASE + i - 4;
     rc = pthread_mutex_init(&owner->fixed[i].mutex, NULL);
     if (rc)
       break;
@@ -173,9 +173,10 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
       rc = flock(fd, (owner->shared ? LOCK_SH : LOCK_EX) | LOCK_NB);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0)
-      rc = fail(e, errno == EAGAIN || errno == EWOULDBLOCK ? LC_ERR_PENDING
-                                                          : LC_ERR_TRANSPORT,
-                 errno, "container already open; another owner is active");
+      rc = fail(e,
+                errno == EAGAIN || errno == EWOULDBLOCK ? LC_ERR_PENDING
+                                                        : LC_ERR_TRANSPORT,
+                errno, "container already open; another owner is active");
   } else
     rc = fail(e, LC_ERR_TRANSPORT, rc,
               "cannot initialize container coordination guard");
@@ -226,7 +227,7 @@ static void drop(ps_coordination_guard *guard) {
   __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
 }
 static int namespace_guard(ps_coordination *owner, uint64_t identity,
-                            ps_coordination_guard **out, lc_error *e) {
+                           ps_coordination_guard **out, lc_error *e) {
   ps_coordination_guard *guard, *candidate;
   uint64_t offset;
   size_t bucket;
@@ -246,7 +247,8 @@ static int namespace_guard(ps_coordination *owner, uint64_t identity,
       return LC_OK;
     }
   pthread_mutex_unlock(&owner->registry);
-  candidate = lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*candidate));
+  candidate =
+      lc_calloc_with_allocator(&owner->allocator, 1, sizeof(*candidate));
   if (!candidate) {
     return fail(e, LC_ERR_NOMEM, 0,
                 "cannot allocate namespace coordination guard");
@@ -305,7 +307,7 @@ int ps_coordination_lock(ps_coordination *owner,
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
       domain > PS_COORDINATION_NAMESPACE ||
-      (domain <= PS_COORDINATION_ALLOCATION && identity) ||
+      (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES))
     return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");
@@ -317,7 +319,7 @@ int ps_coordination_lock(ps_coordination *owner,
     rc = namespace_guard(owner, identity, &guard, e);
   else
     guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
-                              ? (size_t)identity + 3
+                              ? (size_t)identity + 4
                               : (size_t)domain];
   if (rc != LC_OK) {
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
@@ -333,8 +335,9 @@ int ps_coordination_lock(ps_coordination *owner,
   rc = ps_coordination_check(owner, e);
   if (rc == LC_OK && owner->shared && kernel_lock(guard, 1, wait)) {
     reason = errno;
-    rc = fail(e, reason == EAGAIN || reason == EACCES ? LC_ERR_PENDING
-                                                    : LC_ERR_TRANSPORT,
+    rc = fail(e,
+              reason == EAGAIN || reason == EACCES ? LC_ERR_PENDING
+                                                   : LC_ERR_TRANSPORT,
               reason, "cannot acquire container file authority");
   }
   if (rc != LC_OK) {

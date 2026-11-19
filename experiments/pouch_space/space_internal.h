@@ -5,6 +5,7 @@
 #include "coordination.h"
 #include "directory.h"
 #include "owned.h"
+#include "readiness.h"
 #include "space.h"
 #include <pthread.h>
 typedef struct ps_catalog_index {
@@ -101,6 +102,9 @@ struct ps_space {
    * Nested allocation helpers borrow the outer guard; no producer I/O spans it.
    */
   ps_coordination_guard *allocation_guard;
+  ps_readiness *readiness;
+  /* Local completed-byte prefix certified by this owner's journal framing. */
+  uint64_t own_ready_sequence, own_ready_wire;
   pthread_mutex_t mutex;
   pthread_mutex_t sync_io_mutex, commit_mutex;
   pthread_cond_t commit_cond;

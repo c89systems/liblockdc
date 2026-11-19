@@ -6253,3 +6253,73 @@ cache/owner coordination and global forecast-capacity qualification remain
 before normal shared admission. The full goal remains active. Multifile remains
 the default/reference, and performance acceptance and deployment cutover remain
 explicit unfinished decisions.
+
+## Shared journal durability certificates
+
+Shared spaces now keep a volatile certificate for the ready journal sequence,
+the durable journal sequence, and the newest checkpoint whose retirement is
+durable. An OFD membership witness distinguishes a live cohort from a cold
+reopen. After the last member closes, disk recovery establishes the next
+cohort's initial certificate. Imported readers retain physical range witnesses
+across that boundary. They do not join the cohort.
+
+The certificate occupies one isolated 4 KiB page taken from the fixed metadata
+region. Journal and data offsets are unchanged. The root declares this
+geometry, so roots from the earlier experiment must be recreated. This change
+does not require any conversion of multifile roots.
+
+Under allocation authority, writers publish complete journal bytes before
+advancing readiness. The certificate alternates between two checked records.
+A zero commit marker identifies an interrupted update. A committed record with
+an invalid checksum fails admission even if the other slot is readable.
+A warm open validates its recovered prefix against the resident certificate
+before clearing a journal suffix or issuing another incarnation grant.
+
+Sync leadership uses a separate OFD guard. The leader snapshots readiness
+under allocation authority, drops that authority for the file sync, and
+certifies only the sequence captured before the barrier. Concurrent producers
+can continue publishing. A follower can reuse the barrier when it covers the
+wire sequence of its own local publication. Unjournaled owned-stream readiness
+still uses each owner's local prefix. Importing a foreign wire sequence does
+not acknowledge that owner's local work.
+
+A completed checkpoint advertises retirement only after its final barrier.
+Peers can adopt that checkpoint without a duplicate sync. If a process dies
+during root publication or retirement, the adopter stabilizes the selected root
+and retirement before reuse. A stale checkpoint or an erased journal prefix
+cannot lower a live certified boundary.
+
+The three new test groups exercise shared sync leadership, late publication,
+member and mapping failure, failed sync, uncertain lock release, committed
+certificate damage and cold restart with a surviving imported reader. The
+existing projection tests distinguish completed retirement from takeover after
+SIGKILL. In the GNU 352-entry adoption fixture, the completed peer checkpoint
+takes 0.42 to 0.62 ms with no extra barrier and no monitored payload reads.
+
+These certificates establish a shared durability boundary for journal frames.
+Peer application replay, cross-process owned-stream readiness and public
+shared-root admission still require implementation and qualification.
+
+The affected suite passed 68 groups in Debug and 70 each in GNU and musl
+release, including the two release capacity and attachment groups. The focused
+five-group suite passed on all three final builds. Five TSan and five strict
+Memcheck profiles passed. TSan caught a lock-order cycle in the initial test
+fixture. The final fixture releases its pause mutex while observing readiness.
+Memcheck's shared sync test uses a cooperative wait around real OFD locks.
+
+The matched GNU run used three alternating samples per 10 MiB profile. All 36
+runs verified reopened results. Each cell gives the median in milliseconds,
+ordered as pre-change native / current native / multifile.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 43.64 / 45.72 / 18.07 | 561.07 / 650.40 / 413.49 | 76.44 / 73.78 / 22.90 | 1152.07 / 1235.87 / 1177.70 |
+| Maximum worker index flush | 14.45 / 18.03 / 1.18 | 17.05 / 17.61 / 1.24 | 29.62 / 29.82 / 2.06 | 18.54 / 16.40 / 4.61 |
+| Maintenance | 6.33 / 6.51 / 0.28 | 6.03 / 7.95 / 0.29 | 8.10 / 5.79 / 0.41 | 5.87 / 6.90 / 0.38 |
+| Close | 0.37 / 0.32 / 30.50 | 0.29 / 0.38 / 32.08 | 0.81 / 0.61 / 59.22 | 0.74 / 0.62 / 53.57 |
+| Reopen | 3.27 / 5.28 / 0.79 | 3.18 / 3.78 / 0.91 | 5.82 / 5.06 / 1.41 | 4.84 / 4.59 / 1.20 |
+
+Native durable work increased in both profiles. NoSync work was 2.5 to 3.2 times
+the multifile reference. These are exclusive-backend lifecycle measurements.
+Performance acceptance remains open. Logs and the frozen native baseline are
+in `build/pouch-space-shared-durability/`.

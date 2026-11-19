@@ -7,7 +7,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
 endif()
 
 set(pouch_space_sources space.c budget.c directory.c stream.c catalog.c record_io.c frame.c control.c collection_segment.c collection_reclaim.c collection_conversion.c collection_walk.c collection_transform.c collections.c root.c root_conversion.c namespace.c namespace_index.c namespace_metadata.c namespace_reclaim.c namespace_recode.c namespace_conversion.c namespace_repack.c namespace_retention.c namespace_work.c outbox_markers.c query_index.c query_revision.c checkpoint_record.c checkpoint.c pouch.c maintenance.c)
-list(APPEND pouch_space_sources coordination.c)
+list(APPEND pouch_space_sources coordination.c readiness.c)
 add_library(pouch_space_experiment STATIC ${pouch_space_sources})
 target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -104,13 +104,15 @@ if(LOCKDC_BUILD_TESTS)
   target_link_libraries(pouch_space_live_allocator_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_live_allocator_test PRIVATE
     "LINKER:--wrap=ps_coordination_open"
+    "LINKER:--wrap=mmap" "LINKER:--wrap=mmap64"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_live_allocator_test)
   foreach(mode threads faults fence processes serialized packed history
       captures capture-faults capture-owned capture-race
       projection projection-faults projection-recovery projection-threads
-      projection-boundaries projection-pressure)
+      projection-boundaries projection-pressure shared-durable readiness-cohort
+      readiness-faults)
     add_test(NAME pouch_space_live-allocator_${mode}
       COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120
