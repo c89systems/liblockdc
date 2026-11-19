@@ -555,6 +555,8 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
       b->remaining = prior;
     }
     ps_internal_budget_trim(s, &trim);
+    if (rc == LC_OK)
+      rc = ps_internal_healthy(s, e);
   }
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, trim);

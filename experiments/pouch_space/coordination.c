@@ -48,6 +48,9 @@ int ps_coordination_check(ps_coordination *owner, lc_error *e) {
                     "container coordination uncertain; close and reopen")
              : LC_OK;
 }
+int ps_coordination_shared(const ps_coordination *owner) {
+  return owner && owner->shared;
+}
 size_t ps_coordination_users(ps_coordination *owner) {
   return owner ? __atomic_load_n(&owner->users, __ATOMIC_ACQUIRE) : 0;
 }

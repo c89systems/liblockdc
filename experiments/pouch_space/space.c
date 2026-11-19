@@ -442,6 +442,23 @@ static int physical_release(ps_space *s, uint64_t offset, uint64_t bytes,
              : ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 0,
                                      error);
 }
+static int metadata_claim_range(ps_space *s, uint64_t offset, uint64_t bytes,
+                                lc_error *error) {
+  int rc = physical_claim(s, offset, bytes, error);
+  if (rc == LC_OK)
+    s->metadata_claim_bytes += bytes;
+  return rc;
+}
+static int metadata_release_range(ps_space *s, uint64_t offset, uint64_t bytes,
+                                  lc_error *error) {
+  uint64_t before = s->physical_claim_bytes;
+  int rc = physical_release(s, offset, bytes, error);
+  /* A failed final presence unlock can follow a known successful range
+   * release. Attribute exactly the ownership physical_release relinquished;
+   * uncertain releases stay assigned to metadata until owner close. */
+  s->metadata_claim_bytes -= before - s->physical_claim_bytes;
+  return rc;
+}
 /* Sorted free intervals. Their number follows fragmentation, not capacity.
  * Nodes are preallocated before irreversible metadata changes when needed. */
 static void interval_insert(ps_run **head, uint64_t *available, ps_run *node) {
@@ -932,9 +949,10 @@ static int entry_foreign_pinned(ps_space *s, ps_entry *p) {
  * free intervals plus pin fragments, without restarting from the pool head. */
 static int pins_recover(ps_space *s, lc_error *error) {
   ps_payload_page *page;
-  ps_run *run, *held, **link = &s->free;
+  ps_run *run, *held, **link;
+  uint64_t *available;
   uint64_t first, last;
-  int rc, present;
+  int rc, present, pool;
   if (!s->range_pins)
     return LC_OK;
   rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
@@ -951,32 +969,38 @@ static int pins_recover(ps_space *s, lc_error *error) {
       payload_unavailable(page);
     }
   }
-  while (*link) {
-    run = *link;
-    rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
-                                  &first, &last, error);
-    if (rc != LC_OK)
-      return rc;
-    if (first == last) {
-      link = &run->next;
-      continue;
+  /* Foreign metadata workspace can occupy the fixed region as well as
+   * dynamic pages. Both pools must be subtracted before this participant
+   * claims its own workspace or writes an incarnation grant. */
+  for (pool = 0; pool < 2; ++pool) {
+    link = pool ? &s->metadata_free : &s->free;
+    available = pool ? &s->metadata_free_bytes : &s->free_bytes;
+    while (*link) {
+      run = *link;
+      rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
+                                    &first, &last, error);
+      if (rc != LC_OK)
+        return rc;
+      if (first == last) {
+        link = &run->next;
+        continue;
+      }
+      first = first / PS_PAGE * PS_PAGE;
+      last = aligned(last);
+      held = lc_calloc_with_allocator(NULL, 1, sizeof(*held));
+      if (!held)
+        return err(error, LC_ERR_NOMEM, "cannot retain foreign reader pages");
+      held->offset = first;
+      held->bytes = last - first;
+      rc = exclude_selected(link, available, held->offset, held->bytes, error);
+      if (rc != LC_OK) {
+        lc_free_with_allocator(NULL, held);
+        return rc;
+      }
+      held->next = s->pinned_free;
+      s->pinned_free = held;
+      s->pinned_free_bytes += held->bytes;
     }
-    first = first / PS_PAGE * PS_PAGE;
-    last = aligned(last);
-    held = lc_calloc_with_allocator(NULL, 1, sizeof(*held));
-    if (!held)
-      return err(error, LC_ERR_NOMEM, "cannot retain foreign reader pages");
-    held->offset = first;
-    held->bytes = last - first;
-    rc = exclude_selected(link, &s->free_bytes, held->offset, held->bytes,
-                          error);
-    if (rc != LC_OK) {
-      lc_free_with_allocator(NULL, held);
-      return rc;
-    }
-    held->next = s->pinned_free;
-    s->pinned_free = held;
-    s->pinned_free_bytes += held->bytes;
   }
   return LC_OK;
 }
@@ -989,6 +1013,11 @@ static void pins_collect(ps_space *s, int present) {
     if (present &&
         (pin_conflict(s, run->offset, run->bytes, &held, NULL) != LC_OK ||
          held)) {
+      link = &run->next;
+      continue;
+    }
+    if (run->offset < PS_DATA && s->metadata_claims_active &&
+        metadata_claim_range(s, run->offset, run->bytes, NULL) != LC_OK) {
       link = &run->next;
       continue;
     }
@@ -1417,6 +1446,22 @@ static int metadata_claimed_bound(ps_space *s, uint64_t bytes, uint64_t entries,
   return metadata_bound(bytes + s->reserved_metadata,
                         entries + s->reserved_entries, bound, error);
 }
+/* Metadata is one private physical pool. Preparation consumes witnessed free
+ * pages; root selection exchanges their witnesses for the pages it retires.
+ * Initial recovery subtracts foreign claims before acquiring this pool. */
+static int metadata_claim_initial(ps_space *s, lc_error *error) {
+  ps_run *run;
+  int rc;
+  if (!ps_coordination_shared(s->coordination))
+    return LC_OK;
+  for (run = s->metadata_free; run; run = run->next) {
+    rc = metadata_claim_range(s, run->offset, run->bytes, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  s->metadata_claims_active = 1;
+  return LC_OK;
+}
 static uint64_t metadata_target(ps_space *s, uint64_t bound) {
   uint64_t allocated = (uint64_t)s->metadata_pages * PS_PAGE;
   /* Enough free pages for one complete rewrite, and two complete images
@@ -1450,6 +1495,13 @@ static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
       return rc;
     }
     node->bytes = bytes;
+    if (s->metadata_claims_active) {
+      rc = metadata_claim_range(s, node->offset, node->bytes, error);
+      if (rc != LC_OK) {
+        free_insert(s, node);
+        return rc;
+      }
+    }
     metadata_insert(s, node);
   }
   s->metadata_workspace = bound;
@@ -1638,8 +1690,58 @@ static void metadata_register(ps_space *s, ps_meta_page *p) {
   s->page_buckets[hash] = p;
   ++s->metadata_pages;
 }
+static void metadata_claim_unlink(ps_meta_page *p) {
+  if (!p->claim_link)
+    return;
+  *p->claim_link = p->claim_next;
+  if (p->claim_next)
+    p->claim_next->claim_link = p->claim_link;
+  p->claim_link = NULL;
+  p->claim_next = NULL;
+}
+static int metadata_unclaim_page(ps_space *s, ps_meta_page *p,
+                                 lc_error *error) {
+  uint64_t before = s->metadata_claim_bytes;
+  int rc = metadata_release_range(s, p->run.offset, PS_PAGE, error);
+  if (s->metadata_claim_bytes < before)
+    p->claimed = 0;
+  return rc;
+}
+static int metadata_claim_retirement(ps_space *s, ps_meta_page *p,
+                                     lc_error *error) {
+  int rc;
+  if (p->claimed)
+    return LC_OK;
+  rc = metadata_claim_range(s, p->run.offset, PS_PAGE, error);
+  if (rc != LC_OK)
+    return rc;
+  p->claimed = 1;
+  p->claim_link = &s->metadata_retirement_claims;
+  p->claim_next = s->metadata_retirement_claims;
+  if (p->claim_next)
+    p->claim_next->claim_link = &p->claim_next;
+  s->metadata_retirement_claims = p;
+  return LC_OK;
+}
+static int metadata_retirement_done(ps_space *s, lc_error *error) {
+  ps_meta_page *p;
+  int rc = LC_OK, result;
+  /* Retired pages unlink before their nodes enter the free pool. Remaining
+   * claims cover old descriptor pages that still have selected references.
+   * On an aborted checkpoint all old pages remain selected. */
+  while ((p = s->metadata_retirement_claims) != NULL) {
+    metadata_claim_unlink(p);
+    result = metadata_unclaim_page(s, p, rc == LC_OK ? error : NULL);
+    if (rc == LC_OK)
+      rc = result;
+  }
+  return rc;
+}
 static void metadata_release(ps_space *s, ps_meta_page *p) {
   ps_meta_page **link = &s->page_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
+  if (s->metadata_claims_active && !p->claimed)
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+  metadata_claim_unlink(p);
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
@@ -1649,8 +1751,11 @@ static void metadata_release(ps_space *s, ps_meta_page *p) {
   --s->metadata_pages;
   if (s->metadata_free_bytes < metadata_target(s, s->metadata_workspace))
     metadata_insert(s, &p->run);
-  else
+  else {
+    if (s->metadata_claims_active && p->run.offset >= PS_DATA)
+      (void)metadata_release_range(s, p->run.offset, p->run.bytes, NULL);
     free_insert(s, &p->run);
+  }
 }
 static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
                              lc_error *error) {
@@ -1669,6 +1774,7 @@ static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
   p->generation = s->generation + 1;
   p->index = index;
   p->references = index != 0;
+  p->claimed = s->metadata_claims_active;
   metadata_register(s, p);
   *out = p;
   return LC_OK;
@@ -1799,6 +1905,50 @@ static int metadata_unref(ps_space *s, ps_directory_value ref,
   }
   return LC_OK;
 }
+static int metadata_prepare_retirement(ps_space *s,
+                                       const ps_directory_pages *changes,
+                                       lc_error *error) {
+  ps_meta_page *page;
+  ps_entry *p;
+  ps_directory_value ref;
+  uint64_t offset;
+  size_t i, at, take;
+  int rc;
+  if (!s->metadata_claims_active)
+    return LC_OK;
+  for (i = 0; i < changes->retired_count; ++i) {
+    page = metadata_find(s, changes->retired[i].offset);
+    if (!page || !page->index ||
+        page->generation != changes->retired[i].generation)
+      return err(error, LC_ERR_PROTOCOL,
+                 "directory retirement ownership mismatch");
+    rc = metadata_claim_retirement(s, page, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  for (p = s->dirty; p; p = p->dirty_next) {
+    ref = p->checkpoint_ref;
+    offset = ref.offset / PS_PAGE * PS_PAGE;
+    at = (size_t)(ref.offset % PS_PAGE);
+    while (ref.bytes) {
+      page = metadata_find(s, offset);
+      if (!page || page->index || !page->references || at < META_HEADER ||
+          at >= META_HEADER + page->used)
+        return err(error, LC_ERR_PROTOCOL,
+                   "metadata retirement ownership mismatch");
+      rc = metadata_claim_retirement(s, page, error);
+      if (rc != LC_OK)
+        return rc;
+      take = META_HEADER + page->used - at;
+      if (take > ref.bytes)
+        take = (size_t)ref.bytes;
+      ref.bytes -= take;
+      offset = page->following;
+      at = META_HEADER;
+    }
+  }
+  return LC_OK;
+}
 static void metadata_abort(ps_space *s, uint64_t generation) {
   ps_meta_page *p = s->pages, *next;
   while (p) {
@@ -1839,6 +1989,8 @@ static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
     if (bytes >= node->bytes) {
       *link = node->next;
       s->metadata_free_bytes -= node->bytes;
+      if (s->metadata_claims_active)
+        (void)metadata_release_range(s, node->offset, node->bytes, NULL);
       free_insert(s, node);
     } else {
       spare->offset = node->offset;
@@ -1847,6 +1999,8 @@ static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
       node->offset += bytes;
       node->bytes -= bytes;
       s->metadata_free_bytes -= bytes;
+      if (s->metadata_claims_active)
+        (void)metadata_release_range(s, spare->offset, spare->bytes, NULL);
       free_insert(s, spare);
       return NULL;
     }
@@ -1940,6 +2094,10 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
     rc = metadata_flush(&builder, error);
   if (rc == LC_OK)
     rc = ps_directory_flush(directory, s->generation + 1, &new_root, error);
+  if (rc == LC_OK) {
+    ps_directory_changed_pages(directory, &changes);
+    rc = metadata_prepare_retirement(s, &changes, error);
+  }
   if (rc == LC_OK)
     rc = sync_file(s, error); /* payloads, journal and new metadata pages */
   memset(root, 0, sizeof(root));
@@ -1967,6 +2125,10 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
     if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
       metadata_abort(s, s->generation + 1);
+    if (metadata_retirement_done(s, NULL) != LC_OK) {
+      lc_error_cleanup(error);
+      rc = healthy(s, error);
+    }
     ps_directory_close(directory);
     lc_free_with_allocator(NULL, trim);
     return rc;
@@ -1978,6 +2140,17 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   s->directory = new_root;
   s->journal = 0;
   mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
+  if (s->metadata_claims_active) {
+    /* New pages are the prefix inserted by this checkpoint. Selected pages
+     * are canonical ownership, not a process-private reservation. */
+    for (page = s->pages; page && page->generation == s->generation;
+         page = page->next)
+      if (metadata_unclaim_page(s, page, error) != LC_OK) {
+        lc_free_with_allocator(NULL, trim);
+        ps_directory_close(directory);
+        return healthy(s, error);
+      }
+  }
   ps_directory_changed_pages(directory, &changes);
   for (i = 0; i < changes.retired_count; ++i) {
     page = metadata_find(s, changes.retired[i].offset);
@@ -2004,6 +2177,11 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   }
   if (rc != LC_OK) {
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    lc_free_with_allocator(NULL, trim);
+    return rc;
+  }
+  rc = metadata_retirement_done(s, error);
+  if (rc != LC_OK) {
     lc_free_with_allocator(NULL, trim);
     return rc;
   }
@@ -2649,6 +2827,9 @@ static int recover(ps_space *s, lc_error *error) {
   rc = pins_recover(s, error);
   if (rc != LC_OK)
     goto done;
+  rc = metadata_claim_initial(s, error);
+  if (rc != LC_OK)
+    goto done;
   /* The grant reuses rejected journal sequences. Stabilize their retirement
    * before that valid event can reach storage, including an apparently clean
    * retry whose zeros came from an earlier failed recovery's file cache.
@@ -2783,6 +2964,8 @@ int ps_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
+  if (ps_coordination_shared(s->coordination))
+    s->range_pins = 1; /* Later participants may introduce new witnesses. */
   if (create) {
     rc = reserve_file(s, 0, s->capacity, error);
     if (rc == LC_OK)
@@ -2791,6 +2974,8 @@ int ps_open(const char *path, int create, const ps_options *options,
     s->token_limit = TOKEN_RANGE;
     if (rc == LC_OK)
       rc = initial_free(s, error);
+    if (rc == LC_OK)
+      rc = metadata_claim_initial(s, error);
     if (rc == LC_OK)
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
@@ -3994,7 +4179,9 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->metadata_workspace_bytes = s->metadata_workspace;
   out->metadata_fallbacks = s->metadata_fallbacks;
   out->reserved_payload_bytes = s->reserved_payload;
-  out->claimed_payload_bytes = s->physical_claim_bytes;
+  out->claimed_payload_bytes =
+      s->physical_claim_bytes - s->metadata_claim_bytes;
+  out->claimed_metadata_bytes = s->metadata_claim_bytes;
   out->reserved_metadata_bytes = s->reserved_metadata;
   out->reserved_entries = s->reserved_entries;
   out->budgets = s->budgets;

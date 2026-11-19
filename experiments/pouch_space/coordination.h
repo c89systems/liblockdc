@@ -45,6 +45,8 @@ int ps_coordination_open(int, const ps_coordination_options *,
 int ps_coordination_close(ps_coordination *, lc_error *);
 int ps_coordination_check(ps_coordination *, lc_error *);
 size_t ps_coordination_users(ps_coordination *);
+/* Immutable lifetime admission mode; does not acquire a guard. */
+int ps_coordination_shared(const ps_coordination *);
 /* Publication/recovery use identity zero; transaction uses stripe < 256.
  * Namespace keys map deterministically into bytes 512..8191 of the root pages;
  * collisions serialize safely. All participants must use the same identity.

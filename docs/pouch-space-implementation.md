@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership) and process-death release | Shared metadata forecast protection, canonical/projection refresh, owned-stream reader generations and normal shared admission |
+| Shared ownership | [File authority and guard lifetime](#container-file-authority-and-guard-lifetime), [concrete private payload claims](#concrete-private-payload-ownership), [private checkpoint workspace](#private-checkpoint-workspace-and-ownership-handoff) and process-death release | Live allocator/canonical/projection refresh, shared capacity economy, owned-stream reader generations and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes) through replacement, checkpoint, writer death and reopen | Owned-stream and logical snapshot integration |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -5824,3 +5824,116 @@ exclusive owner's late-reader optimization cannot be reused for arbitrary late
 shared writers. The full goal and performance/capacity acceptance remain active;
 multifile remains the default/reference and production cutover still requires
 its explicit deployment decision.
+
+## Private checkpoint workspace and ownership handoff
+
+Shared file authority now witnesses the actual free checkpoint workspace that
+protects positive descriptor/entry credits. It uses the existing metadata bound
+and free pools, without another reservation ledger, participant array or
+persistent format change. Budget transfers remain allocation-free and make no
+lock calls. Closing a budget can release excess dynamic workspace using its
+existing preallocated split node. Failed metadata release during resize now
+returns the owner's fail-stop error rather than reporting success.
+
+Preparing a checkpoint transfers its free-page witnesses to the new pages.
+Before the first checkpoint barrier, the allocator acquires witnesses for
+retiring directory pages and every old descriptor page referenced by dirty
+entries. A resident intrusive list deduplicates those claims. After the new root
+is stable and the old root is invalidated, the new selected pages relinquish
+their private witnesses. Retiring pages retain their witnesses when returned to
+the workspace; pages returned to common payload capacity release them. Old
+descriptor pages that still contain selected entries release their temporary
+retirement claims. Aborted preparation returns its pages to the workspace and
+releases the old-page claims. An uncertain unlock ends further admission until
+owner close/reopen.
+
+Selected canonical metadata belongs to the root, rather than a participant's
+private pool. An idle participant therefore cannot pin an obsolete canonical
+image indefinitely. The handoff follows changed directory pages and affected
+descriptor chains; it adds no complete-image scan or allocation to track
+retirement claims. Exclusive lifetime authority bypasses this range protocol.
+Application producers still run outside allocator authority, and this change
+adds no durability barrier or buffered application-value staging.
+
+Opening ownership recovery now subtracts foreign claims from both common payload
+free space and the fixed metadata region before acquiring its own workspace or
+issuing an incarnation grant. Released foreign fixed-region pages become private
+metadata workspace when collected; dynamic pages return to common capacity.
+Shared owners keep foreign-range observation enabled for their lifetime.
+`claimed_metadata_bytes` attributes free/prepared workspace and pending
+retirement witnesses, excluding selected canonical pages. Payload attribution
+remains separate. Quarantined unbound foreign workspace contributes to the
+existing allocated/retired physical-byte statistics until its owner drains.
+
+Four new metadata groups extend the physical-ownership tests. They cover
+512 KiB/4,096-entry forecasts beyond the fixed region, budget transfer and close
+with allocation unavailable, directory-bound transitions at 31/32 and 961/962
+entries, and shrink/reuse. Fragmented 1 MiB/8,192-entry forecasts exercise every
+measured admission allocation/acquisition site, EINTR/EAGAIN/EIO, rollback and
+uncertain release. Checkpoint faults cover every measured allocation and lock
+site while replacing a captured 4 MiB value whose old descriptor spans several
+pages and shares its first page with retained entries. Canonical pages do not
+remain privately claimed after successful handoff or healthy rollback.
+
+The paused-producer test completes 63 peer publications/checkpoints while an
+input write and its large forecast remain private. A separately exec'd owner
+holds actual fixed/dynamic workspace while another allocator opens, publishes
+and repeatedly checkpoints. Independently captured reserved bytes remain
+unchanged. Normal budget/root close and SIGKILL both permit subsequent
+reclamation, 2 MiB value publication and verified reopen. These process tests
+have exactly one active canonical allocator: the first owner performs no more
+canonical publication after handing control to the second.
+
+Qualification passes 44 distinct Debug groups, with constrained 128 KiB workers,
+and 46 groups on each GNU and musl release configuration. The latter include
+the strict 96-case lease-capacity matrix and 48 attachment windows on the current
+product code. The enlarged multi-page descriptor fault scenario additionally
+passes on all three configurations. Three TSan scenarios pass with instrumented
+OpenSSL 3.6.5 and no suppressions. Three strict Memcheck profiles finish with
+23,792 matching allocations/frees, zero remaining heap/errors/suppressions and
+three inherited descriptors each. Negative controls that omit metadata
+ownership or fixed-region quarantine fail their intended ownership observations.
+
+Matched GNU measurements use frozen `3e0ec5f2`, the current implementation and
+multifile, with 10 MiB roots, normal release stacks and three alternating samples
+per profile. All 36 runs verify their reopened results. Native before/after
+medians, milliseconds:
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Lifecycle | 61.43 / 70.61 | 691.51 / 758.34 | 94.38 / 110.88 | 1387.59 / 1286.05 |
+| Work | 53.80 / 62.51 | 684.40 / 751.64 | 86.06 / 98.54 | 1380.86 / 1278.02 |
+| Work CPU | 18.28 / 18.88 | 58.80 / 54.28 | 52.27 / 49.60 | 145.99 / 152.30 |
+| Maximum worker index flush | 26.74 / 24.10 | 22.27 / 17.91 | 35.30 / 41.99 | 19.50 / 17.40 |
+| Maintenance | 7.62 / 8.23 | 8.12 / 8.39 | 8.31 / 12.33 | 8.79 / 8.42 |
+| Close | 0.389 / 0.325 | 0.318 / 0.449 | 0.710 / 0.771 | 0.738 / 0.625 |
+| Reopen alone | 3.18 / 4.00 | 4.39 / 3.85 | 6.28 / 4.41 | 5.12 / 4.92 |
+
+Native `fcntl` counts remain three before/after in the wider NoSync trace;
+traced wall time is not performance evidence. Maintenance retains three
+barriers. NoSync work medians rose about 16% and 14% in these samples; durable
+work moved about +10% and -7%. CPU and other phases move in both directions.
+These results do not establish general nonregression. Current NoSync indexed
+work also remains about 2.6--3.1 times multifile's 23.99/31.35 ms. Work, mutation
+completion, index flush, maintenance, close, reopen and verification remain
+separate in the raw records. Performance acceptance remains unproven.
+
+Evidence is in ignored `build/pouch-space-metadata-ownership/`:
+`handoff-debug.log`, `handoff-repair-debug.log`, `qualified-*.log`,
+`pressure-*.log`, `large-ref-pinned-debug.log`, `large-ref-*-release.log`,
+`tsan-*.log`, `large-ref-tsan.log`, `memcheck-metadata-{lifecycle,producers}.log`,
+`large-ref-memcheck.log`, `ownership-negative.log`, `fixed-negative.log`,
+`performance.log`, `performance-summary.tsv` and `fcntl-{baseline,current}.log`.
+Native qualification scripts and the frozen baseline are alongside them.
+Earlier failed candidates and the interrupted broader fault run remain separate;
+their incomplete runs are not counted as completed qualification.
+
+This completes physical private-workspace protection and checkpoint ownership
+handoff. Normal Pouch still has exclusive admission. Active allocators still
+need live canonical/projection refresh and discovery of newly arriving claims
+under publication authority. Per-participant workspace economics with many
+active writers, owned-stream/logical reader integration, shared durability
+prefixes and coordinated recovery remain unqualified. The controlled frozen-peer
+fixture establishes existing-claim isolation, not general concurrent-writer
+admission. The full goal remains active, multifile remains the default/reference,
+and production cutover still requires its explicit deployment decision.

@@ -81,7 +81,8 @@ typedef struct ps_ref {
   uint64_t incarnation;
 } ps_ref;
 typedef struct ps_stats {
-  /* allocated_bytes counts physical payload reservations once per page.
+  /* allocated_bytes counts physical payload reservations once per page and
+   * unbound foreign workspace quarantined during recovery.
    * Retired/private bytes attribute whole runs or rounded cells to owners;
    * packed_bytes includes those owners and excludes unused page slack.
    * Recovered unbound foreign pins count whole quarantined pages as retired.
@@ -101,6 +102,10 @@ typedef struct ps_stats {
   /* Unspent claims plus unpublished payload allocations, covered by lifetime
    * file authority or shared range witnesses. No second allocation charge. */
   uint64_t claimed_payload_bytes;
+  /* Free/prepared checkpoint workspace and pending retirement claims of a
+   * shared participant. Canonically selected pages belong to the root.
+   * Exclusive lifetime authority needs no separate witnesses. */
+  uint64_t claimed_metadata_bytes;
   uint64_t budgets;
   /* Component maxima of unclaimed future maintenance, not summed owner
    * credits. Allocator admission also protects their incremental checkpoint

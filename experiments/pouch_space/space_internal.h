@@ -2,8 +2,8 @@
 #define POUCH_SPACE_INTERNAL_H
 #include "budget.h"
 #include "catalog.h"
-#include "directory.h"
 #include "coordination.h"
+#include "directory.h"
 #include "owned.h"
 #include "space.h"
 #include <pthread.h>
@@ -85,6 +85,8 @@ typedef struct ps_meta_page {
   uint64_t generation, following;
   size_t used, references;
   int index;
+  int claimed;
+  struct ps_meta_page *claim_next, **claim_link;
   struct ps_meta_page *next, **link, *hash_next;
 } ps_meta_page;
 struct ps_space {
@@ -108,6 +110,10 @@ struct ps_space {
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload, reserved_metadata, reserved_entries;
   uint64_t physical_claim_bytes;
+  /* Shared participants witness private checkpoint workspace. Selected pages
+   * belong to canonical authority; retirement claims precede root selection. */
+  uint64_t metadata_claim_bytes;
+  int metadata_claims_active;
   uint64_t claimed_free_bytes;
   size_t budgets;
   ps_budget_plan reserve_base;
@@ -121,6 +127,7 @@ struct ps_space {
   ps_entry *stream_buckets[BUCKETS];
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];
+  ps_meta_page *metadata_retirement_claims;
   ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
   ps_payload_page *pinned_pages;
   ps_payload_page *available[CELLS + 1];

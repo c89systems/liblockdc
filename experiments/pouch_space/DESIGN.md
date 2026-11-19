@@ -95,6 +95,13 @@ common runs. Same-process credit transfers remain allocation-free and make no
 lock calls. Exclusive file authority covers these ranges; shared coordination
 uses OFD witnesses, without a persisted ledger or payload copying. See
 [private payload ownership](../../docs/pouch-space-implementation.md#concrete-private-payload-ownership).
+Shared authority also witnesses the free checkpoint workspace protecting
+descriptor/entry credits. Checkpoint preparation transfers those witnesses to
+new pages and claims retiring pages before root selection; completed selection
+returns retired pages to the private pool and releases new canonical pages.
+Selected metadata belongs to root authority, rather than the process. Recovery
+excludes foreign workspace in both the fixed and dynamic regions. See
+[checkpoint workspace ownership](../../docs/pouch-space-implementation.md#private-checkpoint-workspace-and-ownership-handoff).
 Writers pin their budget; space close rejects outstanding claims. Release returns
 unspent credits and excess dynamic metadata workspace using a preallocated split
 node. A budget provides capacity admission, not key isolation, rollback, or
