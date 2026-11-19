@@ -160,8 +160,10 @@ struct ps_space {
   ps_meta_page *metadata_retirement_claims;
   ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
   ps_payload_page *pinned_pages;
+  ps_payload_page **pinned_page_probe;
   ps_payload_page *available[CELLS + 1];
   ps_run *free, *metadata_free, *pinned_free;
+  ps_run **pinned_free_probe;
   uint64_t pinned_free_bytes;
   ps_catalog_index catalogs;
 };

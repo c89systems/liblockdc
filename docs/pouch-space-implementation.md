@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), and [certified allocator refresh](#certified-allocator-refresh) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), and [bounded quarantine rechecks](#bounded-quarantine-rechecks) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7353,4 +7353,79 @@ shared allocator admission.
 The traces, tests, and comparison data are in
 `build/pouch-space-certified-prefix/`. Shared range observation, outbox
 and collection authority, destructive shared capacity, and broader
+performance acceptance remain open.
+
+## Bounded quarantine rechecks
+
+In a traced wider NoSync queue run on `dcd7e519`, over 39,000 of 45,498
+physical ownership queries rechecked quarantined free intervals and packed
+pages. The allocator now resumes a sweep across ordinary admissions and
+reader cleanup. Each pass checks up to two quarantined intervals and two
+packed pages while another owner holds the presence byte. If presence
+clears, the allocator can collect the lists without per-range queries.
+Journal adoption advances any resume link whose interval it consumes.
+Rollback restores the link with the interval.
+
+Capacity admission and explicit checkpoint maintenance can sweep the full
+quarantine. A packed writer with a budget that cannot fund a new page
+retries the existing page bins after a sweep. Each recovered interval or page
+requires a current ownership observation. Admission still discovers fresh conflicts
+in the common free pool, and selection still checks foreign ownership on
+the packed page it intends to use. The resident retired-byte count can lag
+a peer release during ordinary work. A partially released interval can stay
+quarantined while any part of it remains held.
+
+The deterministic allocator fixture holds 25 separated page witnesses
+across two file descriptions. It checks bounded traversal and visits every
+witness across successive admissions. The same near-full budget is rejected
+while peers hold the pages and admitted after killing the process that owns
+24 of them. The surviving witness stays quarantined. A second fixture pins
+12 packed pages, releases the last in the allocator's pending sweep, and
+publishes into the reclaimed slack with zero payload-page credit. Reads of
+the other 11 captured bodies verify retention.
+
+The matched GNU queue comparison verified all 48 runs, including payload
+delivery and reopened state. Small runs deliver 16 values of 1 KiB with two
+writers. Wider runs deliver 32 values of 4 KiB with four writers. Times are
+median milliseconds for `dcd7e519` shared / current shared / native exclusive /
+multifile. All native runs start with 10 MiB.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 19.98 / 19.61 / 4.53 / 3.77 | 520.78 / 386.54 / 386.04 / 270.75 | 70.63 / 38.36 / 6.59 / 4.08 | 633.73 / 671.47 / 607.67 / 524.13 |
+| Maintenance | 24.26 / 24.39 / 8.34 / 0.16 | 19.78 / 21.42 / 6.12 / 0.27 | 49.04 / 48.15 / 10.57 / 0.36 | 33.54 / 32.74 / 7.10 / 0.36 |
+| Close | 0.25 / 0.28 / 0.19 / 30.07 | 0.29 / 0.30 / 0.16 / 30.95 | 0.61 / 0.72 / 0.30 / 72.70 | 0.86 / 0.77 / 0.34 / 62.74 |
+| Reopen | 17.51 / 13.07 / 2.61 / 0.56 | 18.93 / 12.22 / 3.87 / 0.66 | 28.36 / 25.09 / 3.21 / 0.65 | 26.02 / 27.43 / 2.98 / 0.79 |
+
+Wider NoSync work takes 46% less time than in the previous shared build.
+It still takes 9.4 times as long as multifile. The four-way samples show
+inconsistent durable changes across the two shapes. A matched syscall
+trace of the wider NoSync profile counted 41,936 and 9,187 physical
+ownership queries, a 78% reduction. OFD lock operations were 20,730 and
+20,807, respectively. Both traced runs verified delivery and reopened state.
+
+All 36 exclusive index runs verified the query results before close and
+after reopen. Wider medians in milliseconds follow for `dcd7e519` native /
+current native / multifile. The runs used 48 values of 4 KiB, four writers,
+and two rounds. This control exercises index publication and querying
+without shared allocator admission.
+
+| Phase | Wider NoSync | Wider durable |
+| --- | ---: | ---: |
+| Work | 69.65 / 68.43 / 24.60 | 1023.39 / 1118.83 / 1362.37 |
+| Maximum worker index flush | 24.76 / 24.37 / 2.06 | 12.31 / 17.51 / 1.83 |
+| First query pass | 0.47 / 0.47 / 0.25 | 0.34 / 0.35 / 0.24 |
+| Repeated query pass | 0.11 / 0.13 / 0.11 | 0.15 / 0.11 / 0.10 |
+| Close | 0.67 / 0.75 / 56.72 | 0.58 / 0.97 / 76.97 |
+| Reopen | 3.39 / 4.17 / 1.24 | 4.12 / 5.50 / 1.34 |
+
+All 66 selected allocator, recovery, lease, and SDK groups passed on Debug,
+GNU release, and musl release. The two release builds also passed 23 groups
+covering reader tickets, physical claims, and payload and grant budgets.
+ThreadSanitizer passed the capture race. Strict Memcheck passed the
+quarantine fixture and structural replay, with all heap blocks freed and
+only the three standard descriptors left open.
+Raw measurements and test logs are in `build/pouch-space-range-observation/`.
+
+Shared outbox and collection authority, destructive shared capacity, and
 performance acceptance remain open.

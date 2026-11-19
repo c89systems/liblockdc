@@ -45,6 +45,7 @@ struct ps_reader {
 #define TICKET_HEADER 112U
 static int allocation_refresh(ps_space *, lc_error *);
 static int allocation_ranges_refresh(ps_space *, lc_error *);
+static int pins_reclaim_locked(ps_space *, lc_error *);
 static int canonical_observe(ps_space *, lc_error *);
 static int canonical_journal(ps_space *, const ps_readiness_certificate *,
                              int replay, int verify_end, lc_error *);
@@ -674,6 +675,13 @@ static int budget_ranges_locked(ps_space *s, uint64_t target,
     return rc;
   }
   bytes = target - s->claimed_free_bytes;
+  if (target > s->free_bytes) {
+    rc = pins_reclaim_locked(s, error);
+    if (rc != LC_OK)
+      return rc;
+    if (target > s->free_bytes)
+      return err(error, LC_ERR_INVALID, "concrete payload capacity exhausted");
+  }
   for (run = s->free; bytes && run; run = run->next) {
     if (run->claimed)
       continue;
@@ -816,6 +824,8 @@ static int take_payload_selected(ps_space *s, ps_budget *budget,
 static int take_payload_locked(ps_space *s, ps_budget *budget, uint64_t *bytes,
                                uint64_t *out, lc_error *error) {
   ps_run **link, **first = NULL;
+  int rc, reclaimed = 0;
+again:
   for (link = &s->free; *link; link = &(*link)->next) {
     if ((*link)->claimed && !budget)
       continue;
@@ -827,6 +837,13 @@ static int take_payload_locked(ps_space *s, ps_budget *budget, uint64_t *bytes,
   if (!*link && first) {
     link = first;
     *bytes = (*link)->bytes;
+  }
+  if (!*link && !reclaimed && (s->pinned_free || s->pinned_pages)) {
+    rc = pins_reclaim_locked(s, error);
+    if (rc != LC_OK)
+      return rc;
+    reclaimed = 1;
+    goto again;
   }
   if (!*link)
     return err(error, LC_ERR_INVALID, "payload capacity exhausted; grow");
@@ -1225,11 +1242,21 @@ static int pins_recover(ps_space *s, lc_error *error) {
                                     &s->metadata_free_bytes, error)
                      : rc;
 }
-static void pins_collect_locked(ps_space *s, int present) {
-  ps_run **link = &s->pinned_free, *run;
-  ps_payload_page *page, **pages = &s->pinned_pages;
+/* Quarantine is a conservative positive observation. A live participant can
+ * release ranges, or exit without notifying us. Advance through both lists
+ * on ordinary work, and prove all remaining candidates on capacity pressure
+ * or explicit collection. The common free pool and selected packed pages
+ * still undergo conflict checks. Resume at a link to bound each pass.
+ * New quarantines enter at the head, ahead of a pass already in progress. */
+#define PIN_PROBES 2
+static void pins_collect_locked(ps_space *s, int present, int full) {
+  ps_run **link, *run;
+  ps_payload_page *page, **pages;
+  size_t probes;
   int held;
-  while (*link) {
+  full = full || !present;
+  link = !full && s->pinned_free_probe ? s->pinned_free_probe : &s->pinned_free;
+  for (probes = 0; *link && (full || probes < PIN_PROBES); ++probes) {
     run = *link;
     if (present &&
         (pin_conflict(s, run->offset, run->bytes, &held, NULL) != LC_OK ||
@@ -1246,7 +1273,10 @@ static void pins_collect_locked(ps_space *s, int present) {
     s->pinned_free_bytes -= run->bytes;
     free_insert(s, run);
   }
-  while (*pages) {
+  s->pinned_free_probe = *link ? link : NULL;
+  pages =
+      !full && s->pinned_page_probe ? s->pinned_page_probe : &s->pinned_pages;
+  for (probes = 0; *pages && (full || probes < PIN_PROBES); ++probes) {
     page = *pages;
     if (!present ||
         (pin_conflict(s, page->run.offset, PS_PAGE, &held, NULL) == LC_OK &&
@@ -1257,14 +1287,25 @@ static void pins_collect_locked(ps_space *s, int present) {
     } else
       pages = &page->pinned_next;
   }
+  s->pinned_page_probe = *pages ? pages : NULL;
 }
-static void pins_collect(ps_space *s, int present) {
+static int pins_reclaim_locked(ps_space *s, lc_error *error) {
+  int present, rc;
+  if (!s->pinned_free && !s->pinned_pages)
+    return LC_OK;
+  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  if (rc != LC_OK)
+    return rc;
+  pins_collect_locked(s, present, 1);
+  return healthy(s, error);
+}
+static void pins_collect(ps_space *s, int present, int full) {
   ps_coordination_guard *guard = NULL;
   int rc = allocation_begin(s, &guard, NULL);
   if (rc == LC_OK && guard)
     rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL);
   if (rc == LC_OK)
-    pins_collect_locked(s, present);
+    pins_collect_locked(s, present, full);
   (void)allocation_end(s, guard, rc, NULL);
 }
 static int allocation_refresh(ps_space *s, lc_error *error) {
@@ -1276,7 +1317,7 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   int present, rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
   if (rc != LC_OK)
     return rc;
-  pins_collect_locked(s, present);
+  pins_collect_locked(s, present, 0);
   /* A foreign writer can dirty common pages between observations. Drop local
    * hints for those pages. The cohort bitmap follows every physical claim. */
   for (run = s->free; run; run = run->next)
@@ -1288,7 +1329,7 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
              ? foreign_pool(s, &s->free, &s->free_bytes, error)
              : rc;
 }
-static void collect(ps_space *s) {
+static void collect_retired(ps_space *s, int full) {
   ps_entry **link = &s->retired, *p;
   int present = 0;
   if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
@@ -1296,7 +1337,8 @@ static void collect(ps_space *s) {
   if (s->range_pins) {
     if (pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL) != LC_OK)
       return;
-    pins_collect(s, present);
+    if (s->pinned_free || s->pinned_pages)
+      pins_collect(s, present, full);
   }
   while (*link) {
     p = *link;
@@ -1312,6 +1354,7 @@ static void collect(ps_space *s) {
       link = &p->retired_next;
   }
 }
+static void collect(ps_space *s) { collect_retired(s, 0); }
 static size_t event_bytes(const ps_entry *p, int event) {
   return event == PS_PUT || event == PS_SEAL ? entry_bytes(p) : 64;
 }
@@ -1736,20 +1779,30 @@ static uint64_t metadata_target(ps_space *s, uint64_t bound) {
    * from its retired image without relying on unprotected payload capacity. */
   return allocated < bound ? 2 * bound - allocated : bound;
 }
+static int metadata_fits(ps_space *s, uint64_t target, uint64_t payload,
+                         uint64_t floor) {
+  uint64_t extra =
+      target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
+  return s->reserved_payload <= s->free_bytes &&
+         payload <= s->free_bytes - s->reserved_payload &&
+         floor <= s->free_bytes - s->reserved_payload - payload &&
+         extra <= s->free_bytes - s->reserved_payload - payload - floor;
+}
 static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
                                 uint64_t payload, uint64_t floor,
                                 lc_error *error) {
-  uint64_t extra, bytes;
+  uint64_t bytes;
   ps_run *node;
   int rc;
-  extra = target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
-  if (s->reserved_payload > s->free_bytes ||
-      payload > s->free_bytes - s->reserved_payload ||
-      s->free_bytes - s->reserved_payload - payload < floor ||
-      extra > s->free_bytes - s->reserved_payload - payload - floor)
-    return err(error, LC_ERR_INVALID,
-               "container capacity reserved for checkpoint and maintenance; "
-               "checkpoint or grow");
+  if (!metadata_fits(s, target, payload, floor)) {
+    rc = pins_reclaim_locked(s, error);
+    if (rc != LC_OK)
+      return rc;
+    if (!metadata_fits(s, target, payload, floor))
+      return err(error, LC_ERR_INVALID,
+                 "container capacity reserved for checkpoint and maintenance; "
+                 "checkpoint or grow");
+  }
   while (s->metadata_free_bytes < target) {
     node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
     if (!node)
@@ -1882,7 +1935,7 @@ static int payload_reserve_locked(ps_space *s, ps_entry *entry,
   size_t requested = *bytes;
   size_t count = cell_count(*bytes), bin, at;
   uint64_t mask, reserve = PS_PAGE;
-  int rc, fresh = 0, present;
+  int rc, fresh = 0, present, retry_packed = 1, check_quarantine;
 again:
   p = NULL;
   *bytes = requested;
@@ -1916,7 +1969,16 @@ again:
       goto again;
     }
   }
+  check_quarantine = !p && retry_packed && s->pinned_pages;
   rc = immutable_extent_allowance(s, entry, p ? 0 : PS_PAGE, budget, error);
+  if (rc == LC_ERR_INVALID && check_quarantine) {
+    lc_error_cleanup(error);
+    rc = pins_reclaim_locked(s, error);
+    if (rc != LC_OK)
+      return rc;
+    retry_packed = 0;
+    goto again;
+  }
   if (rc != LC_OK)
     return rc;
   if (!p) {
@@ -2507,7 +2569,7 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
     p->previous = NULL;
     p->safe = 1;
   }
-  collect(s);
+  collect_retired(s, 1);
   return healthy(s, error);
 }
 static int checkpoint_locked(ps_space *s, lc_error *error) {
@@ -3036,6 +3098,7 @@ static int recover_revision(ps_space *s, const unsigned char *wire,
 typedef struct replay_change {
   struct replay_change *next;
   ps_run **link, *run, *split;
+  ps_run **prior_probe;
   ps_run before;
   uint64_t *available, bytes;
   ps_payload_page *page;
@@ -3073,6 +3136,8 @@ static void replay_finish(ps_space *s, replay_change *change, int commit) {
       } else {
         *c->run = c->before;
         *c->link = c->run;
+        if (c->prior_probe)
+          s->pinned_free_probe = c->prior_probe;
         *c->available += c->bytes;
         lc_free_with_allocator(NULL, c->split);
       }
@@ -3130,6 +3195,12 @@ static int replay_range(ps_space *s, uint64_t offset, uint64_t bytes,
       run->offset += take;
       run->bytes = right;
     } else {
+      /* A suspended quarantine sweep may resume through this node. Move
+       * its link before commit can free the node, and undo it on rollback. */
+      if (s->pinned_free_probe == &run->next) {
+        c->prior_probe = s->pinned_free_probe;
+        s->pinned_free_probe = link;
+      }
       *link = run->next;
       c->removed = 1;
     }
@@ -3980,6 +4051,8 @@ static void projection_install(ps_space *s, ps_space *v) {
   memcpy(s->payload_buckets, v->payload_buckets, sizeof(s->payload_buckets));
   memcpy(s->available, v->available, sizeof(s->available));
   s->pinned_pages = v->pinned_pages;
+  s->pinned_page_probe = NULL;
+  s->pinned_free_probe = NULL;
   if (s->pages)
     s->pages->link = &s->pages;
   if (s->payload_pages)
@@ -5526,7 +5599,7 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
         metadata_trim_needed(s))
       rc = checkpoint_locked(s, error);
     else
-      collect(s);
+      collect_retired(s, 1);
   }
   if (rc == LC_OK)
     rc = healthy(s, error);
@@ -6016,11 +6089,11 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
   unsigned char header[PS_RUN_HEADER];
   uint64_t bytes = desired, reserved = 0, sequence = 0;
-  uint64_t prepared, partial_bytes, candidate;
+  uint64_t prepared, partial_bytes, candidate, free_before;
   ps_run **choice = NULL, **link, **partial, **fit;
   ps_run *spare = NULL;
   ps_coordination_guard *guard = NULL;
-  int rc, clean = 0, registered = 0;
+  int rc, clean = 0, registered = 0, reclaimed = 0;
   if (p)
     p->extents = lc_calloc_with_allocator(NULL, 1, sizeof(*p->extents));
   if (!p || !p->extents || !zero) {
@@ -6044,6 +6117,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
    * transfer common intervals into the checkpoint-only pool. */
   if (rc == LC_OK)
     rc = owned_allowance(s, budget, 0, error);
+select_run:
   if (rc == LC_OK) {
     for (;;) {
       partial = fit = NULL;
@@ -6084,6 +6158,13 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
             choice = link;
             break;
           }
+      if (!choice && !reclaimed && (s->pinned_free || s->pinned_pages)) {
+        rc = pins_reclaim_locked(s, error);
+        if (rc != LC_OK)
+          break;
+        reclaimed = 1;
+        continue;
+      }
       if (!choice) {
         rc = err(error, LC_ERR_INVALID,
                  "owned payload capacity exhausted; grow");
@@ -6091,7 +6172,12 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
       }
       if (bytes > (*choice)->bytes)
         bytes = (*choice)->bytes;
+      free_before = s->free_bytes;
       rc = owned_allowance(s, budget, bytes, error);
+      /* The bound is already protected. A newly reclaimed common interval
+       * can change or coalesce the selected node before we take it. */
+      if (rc == LC_OK && s->free_bytes != free_before)
+        continue;
       if (rc == LC_OK || bytes == PS_PAGE)
         break;
       lc_error_cleanup(error);
@@ -6105,6 +6191,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     reserved = bytes;
     if (!(*choice)->claimed && !clean && bytes < PS_MIB) {
       reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
+      free_before = s->free_bytes;
       while (reserved > bytes) {
         rc = owned_preparation_allowance(s, budget, bytes, reserved, error);
         if (rc == LC_OK)
@@ -6115,6 +6202,8 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
         if (reserved < bytes)
           reserved = bytes;
       }
+      if (s->free_bytes != free_before)
+        goto select_run;
       if (reserved > bytes) {
         spare = lc_calloc_with_allocator(NULL, 1, sizeof(*spare));
         if (!spare)

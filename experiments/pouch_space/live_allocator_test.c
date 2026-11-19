@@ -2637,6 +2637,159 @@ static void certified_prefix_interruption(void) {
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+enum { QUARANTINE_WITNESSES = 24 };
+typedef struct quarantine_queries {
+  uint64_t visited;
+  size_t count;
+} quarantine_queries;
+static uint64_t quarantine_offset(size_t index) {
+  return PS_DATA + (2 * index + 1) * PS_PAGE;
+}
+static int quarantine_query(void *context, int fd, int command,
+                            struct flock *lock) {
+  quarantine_queries *q = context;
+  uint64_t offset = (uint64_t)lock->l_start;
+  if (command == F_OFD_GETLK && lock->l_len == PS_PAGE &&
+      offset >= quarantine_offset(0) &&
+      offset <= quarantine_offset(QUARANTINE_WITNESSES)) {
+    uint64_t relative = offset - quarantine_offset(0);
+    if (!(relative % (2 * PS_PAGE))) {
+      q->visited |= UINT64_C(1) << (relative / (2 * PS_PAGE));
+      ++q->count;
+    }
+  }
+  return fcntl(fd, command, lock);
+}
+static int quarantine_witness(size_t first, size_t last) {
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  struct flock lock = {0};
+  REQUIRE(fd >= 0);
+  lock.l_type = F_RDLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = 2; /* Physical ownership presence byte. */
+  lock.l_len = 1;
+  REQUIRE(fcntl(fd, F_OFD_SETLK, &lock) == 0);
+  lock.l_len = PS_PAGE;
+  for (size_t index = first; index < last; ++index) {
+    lock.l_start = (off_t)quarantine_offset(index);
+    REQUIRE(fcntl(fd, F_OFD_SETLK, &lock) == 0);
+  }
+  return fd;
+}
+static void quarantine_capacity(void) {
+  lc_error e = {0};
+  quarantine_queries q = {0};
+  ps_coordination_io io = {&q, quarantine_query};
+  ps_options options = {0};
+  ps_space *s = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {0};
+  int ready[2], lifetime[2], exited;
+  char byte;
+  options.coordination_io = &io;
+  ok(ps_open(path, 1, &options, &s, &e), &e);
+  REQUIRE(!pipe(ready) && !pipe(lifetime));
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    REQUIRE(!close(ready[0]) && !close(lifetime[1]) && !close(s->fd));
+    (void)quarantine_witness(1, QUARANTINE_WITNESSES + 1);
+    REQUIRE(write(ready[1], "Q", 1) == 1);
+    REQUIRE(read(lifetime[0], &byte, 1) == 0);
+    _exit(0);
+  }
+  REQUIRE(!close(ready[1]) && !close(lifetime[0]));
+  int survivor = quarantine_witness(0, 1);
+  REQUIRE(read(ready[0], &byte, 1) == 1 && byte == 'Q' && !close(ready[0]));
+  ok(ps_budget_foreground_check(s, &e), &e);
+  uint64_t held = (QUARANTINE_WITNESSES + 1) * PS_PAGE;
+  REQUIRE(status(s).retired_bytes == held);
+  q.visited = 0;
+  for (int sample = 0; sample <= QUARANTINE_WITNESSES / 2; ++sample) {
+    q.count = 0;
+    ok(ps_budget_foreground_check(s, &e), &e);
+    REQUIRE(q.count && q.count <= 2);
+  }
+  REQUIRE(q.visited == (UINT64_C(1) << (QUARANTINE_WITNESSES + 1)) - 1);
+  REQUIRE(status(s).retired_bytes == held);
+  plan.payload_bytes = s->free_bytes + QUARANTINE_WITNESSES * PS_PAGE;
+  plan.maintenance = 1;
+  REQUIRE(ps_budget_open(s, &plan, &budget, &e) == LC_ERR_INVALID && !budget);
+  lc_error_cleanup(&e);
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(!close(lifetime[1]));
+  ok(ps_budget_foreground_check(s, &e), &e);
+  REQUIRE(status(s).retired_bytes >= held - 2 * PS_PAGE);
+  ok(ps_budget_open(s, &plan, &budget, &e), &e);
+  REQUIRE(status(s).claimed_payload_bytes == plan.payload_bytes);
+  REQUIRE(status(s).retired_bytes == PS_PAGE);
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(!close(survivor));
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(!status(s).retired_bytes);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void quarantine_packed(void) {
+  enum { PAGES = 12, BODY = PS_PAGE / 2 + PS_CELL };
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL, *holder = NULL;
+  ps_reader *held[PAGES];
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {0, 256, 1, 0};
+  ps_writer *writer = NULL;
+  unsigned char bytes[65] = {7};
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &holder, &e), &e);
+  for (size_t i = 0; i < PAGES; ++i) {
+    capture_put(a, i + 1, BODY);
+    ok(ps_read_open(holder, key(i + 1), NULL, &held[i], &e), &e);
+  }
+  REQUIRE(status(a).packed_pages == PAGES);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_budget_open(b, &plan, &budget, &e), &e);
+  ps_payload_page *last = b->pinned_pages;
+  REQUIRE(last && b->pinned_page_probe && *b->pinned_page_probe);
+  while (last->pinned_next)
+    last = last->pinned_next;
+  uint64_t offset = last->run.offset;
+  size_t release = 0;
+  while (release < PAGES) {
+    ps_entry *entry = ps_internal_lookup(b, key(release + 1));
+    REQUIRE(entry && entry->count == 1);
+    if (entry->extents[0].offset / PS_PAGE * PS_PAGE == offset)
+      break;
+    ++release;
+  }
+  REQUIRE(release < PAGES);
+  ps_reader_close(held[release]);
+  ok(ps_begin(b, budget, key(PAGES + 1), &writer, &e), &e);
+  ok(ps_write(writer, bytes, sizeof(bytes), &e), &e);
+  ok(ps_publish(writer, NULL, &e), &e);
+  ps_writer_close(writer);
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(status(b).packed_pages == PAGES);
+  ps_entry *published = ps_internal_lookup(b, key(PAGES + 1));
+  REQUIRE(published && published->count == 1 &&
+          published->extents[0].offset / PS_PAGE * PS_PAGE == offset);
+  ps_reader *reader = NULL;
+  unsigned char observed[sizeof(bytes)];
+  ok(ps_read_open(b, key(PAGES + 1), NULL, &reader, &e), &e);
+  ok(ps_read_at(reader, 0, observed, sizeof(observed), &e), &e);
+  REQUIRE(!memcmp(bytes, observed, sizeof(bytes)));
+  ps_reader_close(reader);
+  for (size_t i = 0; i < PAGES; ++i)
+    if (i != release) {
+      captured_expect(held[i], (unsigned char)(i + 1), BODY);
+      ps_reader_close(held[i]);
+    }
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(holder, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void journal_replay(void) {
   lc_error e = {0};
   projection_io m = {0};
@@ -3892,6 +4045,9 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "certified-prefix")) {
     certified_prefix_reads();
     certified_prefix_interruption();
+  } else if (!strcmp(argv[2], "quarantine")) {
+    quarantine_capacity();
+    quarantine_packed();
   } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
   else if (!strcmp(argv[2], "journal-replay-faults"))
