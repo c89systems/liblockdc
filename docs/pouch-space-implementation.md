@@ -13,9 +13,9 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows and production-engine recovery suites | Capacity beyond the qualified operation/claim profiles |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites and [shared queue decisions](#shared-queue-delivery-and-transaction-replay) | Shared queue performance, outbox ownership and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), and [SDK namespace authority](#shared-sdk-namespace-authority) | Public queue and transaction coordination, collection authority, shared capacity, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), and [SDK namespace authority](#shared-sdk-namespace-authority) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and guarded state point reads | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -6741,3 +6741,80 @@ Normal shared admission remains gated. The next validation needs public
 queue and transaction workflows, collection authority, and shared capacity
 and throughput under contention. Changed peer state can still require a
 full namespace replay, and physical read handoff costs need measurement.
+
+## Shared queue delivery and transaction replay
+
+Shared dequeue holds one namespace scope from candidate selection through the
+delivery lease, message metadata, optional state lease, and construction of
+the returned stream handle. A failure within that scope can roll back the
+lease and any partial page without contending with a peer in the same
+namespace. Ack, nack, and extend also keep their preconditions and writes
+inside one scope. Transaction-tagged queue operations acquire the XID guard
+first and check the selected decision before changing delivery state.
+
+A shared terminal decision syncs its journal prefix before applying
+participants, including with the ordinary NoSync policy. A busy participant
+can return `LC_ERR_PENDING` with the durable decision. A peer can replay the
+decision after the busy scope ends. A shared timed batch waits for an
+available page, then drains it under one scope. Waits and watcher callbacks
+run outside namespace authority. A busy snapshot yields another bounded
+polling interval for a watcher.
+
+Live journal replay can import checked empty stream heads and new catalog
+bindings while their frame awaits a barrier. These additions reserve
+ownership without releasing a predecessor. Catalog lookup and enumeration
+still hide a binding until its addition is durable. A later local removal
+uses its own completion sequence, and foreign destructive frames continue to
+wait for durability. Temporary budgets, foreground checks, and new or
+growing standing reserves refresh the canonical view before admitting work.
+
+The broader 86-group matrix passed on Debug, GNU release, and musl release.
+The final reserve and catalog corrections passed 12 focused groups on Debug
+and 17 each on GNU and musl. Four ThreadSanitizer and three strict Memcheck
+profiles passed. The cases cover delivery faults and partial batch rollback,
+watcher and batch retries, independent writer progress, delivery with state,
+ack, nack, extend, durable commit with a busy participant, replay by a peer,
+rollback with higher-fenced redelivery, and verified reopen. Paused-sync
+tests verify catalog addition and removal visibility and unrelated admission
+while an addition awaits durability.
+
+All 36 matched GNU queue runs verified payload coverage and reopened state.
+The small profile has 16 deliveries of 1 KiB with two writers. The wider
+profile has 32 deliveries of 4 KiB with four writers. All modes warm each
+queue before timing. The shared profile uses one producer handle per writer
+and a separate consumer handle for all deliveries. The table shows
+median milliseconds for native exclusive / native shared / multifile, all
+with the same workload and 10 MiB initial native capacity.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 4.39 / 234.64 / 3.80 | 326.02 / 552.31 / 282.19 | 6.42 / 370.72 / 4.96 | 482.95 / 752.88 / 512.67 |
+| Maintenance | 7.18 / 16.17 / 0.24 | 6.73 / 15.52 / 0.25 | 12.35 / 24.35 / 0.41 | 7.00 / 24.46 / 0.38 |
+| Close | 0.23 / 0.26 / 35.29 | 0.19 / 0.25 / 32.80 | 0.37 / 0.80 / 66.87 | 0.45 / 0.72 / 61.07 |
+| Reopen | 2.61 / 10.85 / 0.66 | 3.16 / 10.87 / 0.61 | 3.13 / 24.31 / 0.82 | 3.80 / 24.78 / 0.74 |
+
+Shared NoSync work took about 53 to 58 times exclusive native and recorded
+45 to 73 sync calls through work and maintenance, compared with 3 in the
+exclusive native profiles. A traced two-writer NoSync run reached 10 sync
+barriers from stream recovery during append begin. Grant publication also
+appeared in the trace. Repeated recovery on normal owner handoff remains the
+largest observed performance gap in the shared queue route.
+
+All 36 matched exclusive index lifecycle runs also verified reopened
+results. The values below are median milliseconds for `10313575` native /
+current native / multifile and use the same index workload as the preceding
+stage.
+
+| Phase | Small NoSync | Small durable | Wider NoSync | Wider durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 47.56 / 47.28 / 21.22 | 494.30 / 484.09 / 411.39 | 100.40 / 81.25 / 25.50 | 1223.94 / 1215.78 / 1358.06 |
+| Maximum worker index flush | 22.78 / 17.62 / 1.02 | 16.28 / 17.29 / 1.12 | 42.28 / 23.98 / 1.71 | 17.97 / 17.94 / 4.32 |
+| Maintenance | 6.55 / 8.63 / 0.26 | 8.90 / 7.38 / 0.23 | 7.99 / 6.95 / 0.40 | 6.94 / 7.35 / 0.40 |
+| Close | 0.36 / 0.31 / 37.30 | 0.22 / 0.30 / 41.34 | 0.76 / 0.67 / 64.31 | 0.82 / 0.55 / 58.11 |
+| Reopen | 3.12 / 3.19 / 0.81 | 3.08 / 3.74 / 0.88 | 4.87 / 5.80 / 1.15 | 4.73 / 4.54 / 1.33 |
+
+The test logs, sync trace, and matched-run data are in
+`build/pouch-space-shared-queue/`. Shared outbox and collection authority,
+shared capacity under destructive maintenance, queue handoff performance,
+and readiness acceptance remain open. Normal shared admission remains
+gated.

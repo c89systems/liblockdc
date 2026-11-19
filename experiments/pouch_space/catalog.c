@@ -243,14 +243,19 @@ static int ref_matches(ps_space *s, ps_entry *p, const ps_ref *ref) {
   return ref && !memcmp(ref->container, s->identity, 16) && p && !p->deleted &&
          ref->incarnation == p->token;
 }
-static int pending(ps_space *s, const ps_entry *p) {
-  return p && p->publication_sequence >
-                  __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+static int unpublished(const ps_entry *p, uint64_t local, uint64_t peer) {
+  return p->peer_sequence ? p->peer_sequence > peer
+                          : p->publication_sequence > local;
 }
-static ps_entry *visible(ps_entry *p, uint64_t prefix) {
+static int pending(ps_space *s, const ps_entry *p) {
+  return p &&
+         unpublished(p, __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE),
+                     s->peer_durable);
+}
+static ps_entry *visible(ps_entry *p, uint64_t prefix, uint64_t peer) {
   if (p && p->deleted)
-    return p->publication_sequence > prefix ? p : NULL;
-  while (p && p->publication_sequence > prefix)
+    return unpublished(p, prefix, peer) ? p : NULL;
+  while (p && unpublished(p, prefix, peer))
     p = p->previous;
   return p;
 }
@@ -421,7 +426,7 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   rc = ps_internal_capture_begin(s, &guard, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   p = named(s, owner, kind, name, length);
-  p = visible(p, prefix);
+  p = visible(p, prefix, s->peer_durable);
   if (rc == LC_OK && p) {
     ++p->pins;
     if (p->catalog->target) {
@@ -492,7 +497,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   for (i = 0; rc == LC_OK && i < s->catalogs.capacity; ++i)
     for (p = s->catalogs.buckets[i]; p; p = p->catalog->next)
       if (p->key.owner == owner && p->catalog->kind == kind &&
-          visible(p, prefix))
+          visible(p, prefix, s->peer_durable))
         ++count;
   if (rc == LC_OK && count) {
     if (count > (size_t)-1 / sizeof(*entries))
@@ -506,7 +511,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   for (i = 0; rc == LC_OK && i < s->catalogs.capacity; ++i)
     for (p = s->catalogs.buckets[i]; p; p = p->catalog->next)
       if (p->key.owner == owner && p->catalog->kind == kind &&
-          (v = visible(p, prefix)) != NULL) {
+          (v = visible(p, prefix, s->peer_durable)) != NULL) {
         entries[at++] = v;
         ++v->pins;
         if (v->catalog->target) {

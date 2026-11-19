@@ -208,10 +208,11 @@ int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
 int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);
 int ps_internal_entry_pin(ps_space *, ps_entry *, lc_error *);
 void ps_internal_entry_unpin(ps_space *, ps_entry *);
-int ps_internal_allocation_begin(ps_space *, ps_coordination_guard **,
-                                 lc_error *);
-int ps_internal_allocation_end(ps_space *, ps_coordination_guard *, int,
-                               lc_error *);
+/* Refresh the peer prefix and free ranges before changing local reservations.
+ * Finish with ps_internal_capture_end. No caller retains an allocator choice
+ * across this boundary. */
+int ps_internal_admission_begin(ps_space *, ps_coordination_guard **,
+                                lc_error *);
 int ps_internal_event(ps_space *, ps_entry *, int, lc_error *);
 int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
                           lc_error *);

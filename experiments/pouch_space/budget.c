@@ -118,27 +118,32 @@ static int reserve_valid(const ps_budget_plan *p, int recover, lc_error *e) {
 int ps_reserve_base(ps_space *s, const ps_budget_plan *p, int recover,
                     lc_error *e) {
   ps_budget_plan prior;
-  int rc = reserve_valid(p, recover, e);
+  ps_coordination_guard *guard = NULL;
+  int admit, rc = reserve_valid(p, recover, e);
   if (!s || rc != LC_OK)
     return rc == LC_OK ? invalid(e, "maintenance reserve requires space") : rc;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
   prior = s->reserve_base;
-  if (rc == LC_OK) {
+  admit = !recover && (p->payload_bytes > prior.payload_bytes ||
+                       p->metadata_bytes > prior.metadata_bytes ||
+                       p->entries > prior.entries);
+  if (rc == LC_OK && admit)
+    rc = ps_internal_admission_begin(s, &guard, e);
+  if (rc == LC_OK)
     s->reserve_base = *p;
-    if (!recover && (p->payload_bytes > prior.payload_bytes ||
-                     p->metadata_bytes > prior.metadata_bytes ||
-                     p->entries > prior.entries))
-      rc = ps_internal_budget_admit(s, 0, e);
-    if (rc != LC_OK)
-      s->reserve_base = prior;
-  }
+  if (rc == LC_OK && admit)
+    rc = ps_internal_budget_admit(s, 0, e);
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (rc != LC_OK)
+    s->reserve_base = prior;
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 int ps_reserve_open(ps_space *s, const ps_budget_plan *p, int recover,
                     ps_reserve **out, lc_error *e) {
   ps_reserve *r;
+  ps_coordination_guard *guard = NULL;
   int rc;
   if (out)
     *out = NULL;
@@ -156,16 +161,19 @@ int ps_reserve_open(ps_space *s, const ps_budget_plan *p, int recover,
   rc = ps_internal_healthy(s, e);
   if (rc == LC_OK && s->reserve_next == UINT64_MAX)
     rc = invalid(e, "maintenance reserve owner identity exhausted");
+  if (rc == LC_OK && !recover)
+    rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK) {
     r->id = ++s->reserve_next;
     s->reserves = reserve_insert(s->reserves, r);
     if (!recover)
       rc = ps_internal_budget_admit(s, 0, e);
-    if (rc != LC_OK)
-      s->reserves = reserve_remove(s->reserves, r);
-    else
-      ++s->reserve_count;
   }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (rc == LC_OK)
+    ++s->reserve_count;
+  else if (r->id)
+    s->reserves = reserve_remove(s->reserves, r);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
     *out = r;
@@ -177,24 +185,29 @@ int ps_reserve_resize(ps_reserve *r, const ps_budget_plan *p, int recover,
                       lc_error *e) {
   ps_budget_plan prior;
   ps_space *s;
-  int rc = reserve_valid(p, recover, e);
+  ps_coordination_guard *guard = NULL;
+  int admit, rc = reserve_valid(p, recover, e);
   if (!r || rc != LC_OK)
     return rc == LC_OK ? invalid(e, "maintenance reserve requires owner") : rc;
   s = r->space;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
   prior = r->plan;
+  admit = !recover && (p->payload_bytes > prior.payload_bytes ||
+                       p->metadata_bytes > prior.metadata_bytes ||
+                       p->entries > prior.entries);
+  if (rc == LC_OK && admit)
+    rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK) {
     r->plan = *p;
     s->reserves = reserve_change(s->reserves, r);
-    if (!recover && (p->payload_bytes > prior.payload_bytes ||
-                     p->metadata_bytes > prior.metadata_bytes ||
-                     p->entries > prior.entries))
+    if (admit)
       rc = ps_internal_budget_admit(s, 0, e);
-    if (rc != LC_OK) {
-      r->plan = prior;
-      s->reserves = reserve_change(s->reserves, r);
-    }
+  }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (rc != LC_OK) {
+    r->plan = prior;
+    s->reserves = reserve_change(s->reserves, r);
   }
   pthread_mutex_unlock(&s->mutex);
   return rc;
@@ -390,7 +403,7 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
                    lc_error *e) {
   ps_budget *b;
   ps_coordination_guard *guard = NULL;
-  int rc;
+  int rc, accounted = 0;
   if (out)
     *out = NULL;
   if (!s || !plan || !out || plan->payload_bytes % PS_PAGE ||
@@ -419,16 +432,19 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
        plan->metadata_bytes > UINT64_MAX - s->reserved_metadata ||
        plan->entries > UINT64_MAX - s->reserved_entries))
     rc = invalid(e, "capacity budget totals overflow");
+  if (rc == LC_OK)
+    rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK) {
     s->reserved_payload += plan->payload_bytes;
     s->reserved_metadata += plan->metadata_bytes;
     s->reserved_entries += plan->entries;
-    rc = ps_internal_allocation_begin(s, &guard, e);
-    if (rc == LC_OK)
-      rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    accounted = 1;
+    rc = ps_internal_budget_admit(s, plan->maintenance, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
-    rc = ps_internal_allocation_end(s, guard, rc, e);
+  }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (accounted) {
     if (rc != LC_OK) {
       ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
                                plan->entries);
@@ -455,13 +471,15 @@ int ps_budget_status(ps_budget *b, ps_budget_plan *out, lc_error *e) {
   return LC_OK;
 }
 int ps_budget_foreground_check(ps_space *s, lc_error *e) {
+  ps_coordination_guard *guard;
   int rc;
   if (!s)
     return invalid(e, "foreground capacity check requires space");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK)
     rc = ps_internal_budget_admit(s, 0, e);
+  rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
@@ -506,7 +524,7 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
   ps_run *trim = NULL;
   ps_coordination_guard *guard = NULL;
   uint64_t payload, metadata, entries;
-  int rc, grows;
+  int rc, grows, accounted = 0;
   if (!b || !plan || plan->payload_bytes % PS_PAGE || plan->maintenance < 0 ||
       plan->maintenance > 1)
     return invalid(e, "capacity resize requires an aligned matching plan");
@@ -544,18 +562,21 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
                       plan->metadata_bytes > UINT64_MAX - metadata ||
                       plan->entries > UINT64_MAX - entries))
     rc = invalid(e, "capacity resize totals overflow");
+  if (rc == LC_OK && grows)
+    rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK) {
     s->reserved_payload = payload + plan->payload_bytes;
     s->reserved_metadata = metadata + plan->metadata_bytes;
     s->reserved_entries = entries + plan->entries;
     b->remaining = *plan;
+    accounted = 1;
     if (grows)
-      rc = ps_internal_allocation_begin(s, &guard, e);
-    if (rc == LC_OK && grows)
       rc = ps_internal_budget_admit(s, plan->maintenance, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
-    rc = ps_internal_allocation_end(s, guard, rc, e);
+  }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  if (accounted) {
     if (rc != LC_OK) {
       s->reserved_payload = payload + prior.payload_bytes;
       s->reserved_metadata = metadata + prior.metadata_bytes;

@@ -15125,8 +15125,64 @@ int lc_pouch_client_queue_stats_method(lc_client *self,
   return rc;
 }
 
-int lc_pouch_client_queue_ack_method(lc_client *self, const lc_ack_op *req,
-                                     lc_ack_res *out, lc_error *error) {
+/* A terminal decision and a new transactional queue change must share the
+ * same XID authority. The namespace scope then covers validation, publication
+ * and cleanup of every record touched by a delivery or its completion. */
+static int lc_pouch_queue_shared_scope(lc_client_handle *client, const char *ns,
+                                       const char *txn_id,
+                                       lc_pouch_state_precondition_fn operation,
+                                       void *context, lc_error *error) {
+  lc_pouch_txn_guard guard = {0};
+  lc_pouch_txn_record record = {0};
+  int rc = LC_OK;
+  guard.fd = -1;
+  if (lc_pouch_txn_id_present(txn_id)) {
+    rc = lc_pouch_client_validate_optional_txn_id(txn_id, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_txn_guard_lock(client->pouch, txn_id, 0, &guard, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_xa_read_txn(client->pouch, txn_id, &record, error);
+    if (rc == LC_OK && record.state && strcmp(record.state, "prepare") != 0)
+      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch queue transaction already decided", NULL, NULL,
+                        "pouch");
+    lc_pouch_txn_record_cleanup(&record);
+  }
+  if (rc == LC_OK)
+    rc = lc_pouch_state_with_namespace_lock(client->pouch, ns, operation,
+                                            context, error);
+  lc_pouch_txn_guard_release(&guard);
+  return rc;
+}
+
+typedef struct lc_pouch_queue_operation {
+  lc_client *self;
+  const void *request;
+  void *result;
+} lc_pouch_queue_operation;
+
+static int lc_pouch_queue_complete(lc_client *self,
+                                   const lc_message_ref *message,
+                                   const void *request, void *result,
+                                   lc_pouch_state_precondition_fn operation,
+                                   lc_error *error) {
+  lc_pouch_queue_operation context;
+  lc_client_handle *client = (lc_client_handle *)self;
+  context.self = self;
+  context.request = request;
+  context.result = result;
+  if (client && result && message && message->ns && message->ns[0] &&
+      client->pouch->storage.coordinated_namespaces)
+    return lc_pouch_queue_shared_scope(client, message->ns, message->txn_id,
+                                       operation, &context, error);
+  return operation(&context, error);
+}
+
+static int lc_pouch_queue_ack(void *context, lc_error *error) {
+  lc_pouch_queue_operation *op = context;
+  lc_client *self = op->self;
+  const lc_ack_op *req = op->request;
+  lc_ack_res *out = op->result;
   lc_client_handle *client;
   lc_pouch_queue_record record;
   int rc;
@@ -15189,8 +15245,23 @@ int lc_pouch_client_queue_ack_method(lc_client *self, const lc_ack_op *req,
   return rc;
 }
 
-int lc_pouch_client_queue_nack_method(lc_client *self, const lc_nack_op *req,
-                                      lc_nack_res *out, lc_error *error) {
+int lc_pouch_client_queue_ack_method(lc_client *self, const lc_ack_op *req,
+                                     lc_ack_res *out, lc_error *error) {
+  int rc;
+  if (out)
+    memset(out, 0, sizeof(*out));
+  rc = lc_pouch_queue_complete(self, req ? &req->message : NULL, req, out,
+                               lc_pouch_queue_ack, error);
+  if (rc != LC_OK)
+    lc_ack_res_cleanup(out);
+  return rc;
+}
+
+static int lc_pouch_queue_nack(void *context, lc_error *error) {
+  lc_pouch_queue_operation *op = context;
+  lc_client *self = op->self;
+  const lc_nack_op *req = op->request;
+  lc_nack_res *out = op->result;
   lc_client_handle *client;
   lc_pouch_queue_record record;
   lc_pouch_unix_seconds now;
@@ -15290,9 +15361,23 @@ int lc_pouch_client_queue_nack_method(lc_client *self, const lc_nack_op *req,
   return rc;
 }
 
-int lc_pouch_client_queue_extend_method(lc_client *self,
-                                        const lc_extend_op *req,
-                                        lc_extend_res *out, lc_error *error) {
+int lc_pouch_client_queue_nack_method(lc_client *self, const lc_nack_op *req,
+                                      lc_nack_res *out, lc_error *error) {
+  int rc;
+  if (out)
+    memset(out, 0, sizeof(*out));
+  rc = lc_pouch_queue_complete(self, req ? &req->message : NULL, req, out,
+                               lc_pouch_queue_nack, error);
+  if (rc != LC_OK)
+    lc_nack_res_cleanup(out);
+  return rc;
+}
+
+static int lc_pouch_queue_extend(void *context, lc_error *error) {
+  lc_pouch_queue_operation *op = context;
+  lc_client *self = op->self;
+  const lc_extend_op *req = op->request;
+  lc_extend_res *out = op->result;
   lc_client_handle *client;
   lc_pouch_queue_record record;
   lc_pouch_unix_seconds now;
@@ -15355,6 +15440,19 @@ int lc_pouch_client_queue_extend_method(lc_client *self,
   if (rc != LC_OK) {
     lc_extend_res_cleanup(out);
   }
+  return rc;
+}
+
+int lc_pouch_client_queue_extend_method(lc_client *self,
+                                        const lc_extend_op *req,
+                                        lc_extend_res *out, lc_error *error) {
+  int rc;
+  if (out)
+    memset(out, 0, sizeof(*out));
+  rc = lc_pouch_queue_complete(self, req ? &req->message : NULL, req, out,
+                               lc_pouch_queue_extend, error);
+  if (rc != LC_OK)
+    lc_extend_res_cleanup(out);
   return rc;
 }
 
@@ -15854,9 +15952,40 @@ static int lc_pouch_client_dequeue_once(lc_client_handle *client,
   return rc;
 }
 
-int lc_pouch_client_dequeue_method(lc_client *self, const lc_dequeue_req *req,
-                                   lc_message **out, lc_error *error) {
+static int lc_pouch_queue_attach_state(lc_client_handle *,
+                                       const lc_dequeue_req *, lc_message *,
+                                       lc_message **, lc_error *);
+
+typedef struct lc_pouch_queue_delivery {
   lc_client_handle *client;
+  const char *ns;
+  const lc_dequeue_req *request;
+  long visibility_timeout;
+  lc_message **out;
+  int with_state;
+} lc_pouch_queue_delivery;
+
+static int lc_pouch_queue_deliver(void *context, lc_error *error) {
+  lc_pouch_queue_delivery *delivery = context;
+  lc_message *message = NULL;
+  int rc = lc_pouch_client_dequeue_once(
+      delivery->client, delivery->ns, delivery->request,
+      delivery->visibility_timeout, &message, error);
+  if (rc == LC_OK && message) {
+    if (delivery->with_state)
+      rc = lc_pouch_queue_attach_state(delivery->client, delivery->request,
+                                       message, delivery->out, error);
+    else
+      *delivery->out = message;
+  }
+  return rc;
+}
+
+static int lc_pouch_client_dequeue(lc_client *self, const lc_dequeue_req *req,
+                                   int with_state, lc_message **out,
+                                   lc_error *error) {
+  lc_client_handle *client;
+  lc_pouch_queue_delivery delivery;
   const char *ns = NULL;
   struct timespec deadline;
   long visibility_timeout;
@@ -15890,16 +16019,39 @@ int lc_pouch_client_dequeue_method(lc_client *self, const lc_dequeue_req *req,
   visibility_timeout = req->visibility_timeout_seconds > 0L
                            ? req->visibility_timeout_seconds
                            : 30L;
+  delivery.client = client;
+  delivery.ns = ns;
+  delivery.request = req;
+  delivery.visibility_timeout = visibility_timeout;
+  delivery.out = out;
+  delivery.with_state = with_state;
   do {
-    rc = lc_pouch_client_dequeue_once(client, ns, req, visibility_timeout, out,
-                                      error);
-    if (rc != LC_OK || *out != NULL || !has_deadline ||
+    if (client->pouch->storage.coordinated_namespaces)
+      rc = lc_pouch_queue_shared_scope(
+          client, ns, req->txn_id, lc_pouch_queue_deliver, &delivery, error);
+    else
+      rc = lc_pouch_queue_deliver(&delivery, error);
+    if (rc != LC_OK && *out != NULL) {
+      lc_message_close(*out);
+      *out = NULL;
+      break;
+    }
+    if ((rc != LC_OK && !(rc == LC_ERR_PENDING &&
+                          client->pouch->storage.coordinated_namespaces)) ||
+        *out != NULL || !has_deadline ||
         lc_pouch_queue_wait_deadline_reached(&deadline)) {
       break;
     }
+    if (rc == LC_ERR_PENDING)
+      lc_error_cleanup(error);
     lc_pouch_queue_dequeue_poll_delay();
   } while (1);
   return rc;
+}
+
+int lc_pouch_client_dequeue_method(lc_client *self, const lc_dequeue_req *req,
+                                   lc_message **out, lc_error *error) {
+  return lc_pouch_client_dequeue(self, req, 0, out, error);
 }
 
 /* A local dequeue failure must not leave an inaccessible delivery leased. This
@@ -15958,12 +16110,10 @@ static int lc_pouch_queue_rollback_published_delivery(
   return rc;
 }
 
-int lc_pouch_client_dequeue_with_state_method(lc_client *self,
-                                              const lc_dequeue_req *req,
-                                              lc_message **out,
-                                              lc_error *error) {
-  lc_client_handle *client;
-  lc_message *message;
+static int lc_pouch_queue_attach_state(lc_client_handle *client,
+                                       const lc_dequeue_req *req,
+                                       lc_message *message, lc_message **out,
+                                       lc_error *error) {
   lc_message_handle *handle;
   lc_pouch_state_read_result read_result;
   lc_pouch_state_write_result lease_write_result;
@@ -15977,14 +16127,6 @@ int lc_pouch_client_dequeue_with_state_method(lc_client *self,
   int state_lease_acquired;
   int rc;
 
-  if (self == NULL || req == NULL || out == NULL) {
-    return lc_error_set(error, LC_ERR_INVALID, 0L,
-                        "pouch dequeue_with_state requires self, req, and out",
-                        NULL, NULL, NULL);
-  }
-  *out = NULL;
-  client = (lc_client_handle *)self;
-  message = NULL;
   state_key = NULL;
   state_object_key = NULL;
   state_lease_id[0] = '\0';
@@ -15992,10 +16134,6 @@ int lc_pouch_client_dequeue_with_state_method(lc_client *self,
   memset(&read_result, 0, sizeof(read_result));
   memset(&lease_write_result, 0, sizeof(lease_write_result));
   memset(&lease_record, 0, sizeof(lease_record));
-  rc = lc_pouch_client_dequeue_method(self, req, &message, error);
-  if (rc != LC_OK || message == NULL) {
-    return rc;
-  }
   handle = (lc_message_handle *)message;
   state_key =
       lc_pouch_queue_state_lease_key(handle->queue, handle->message_id, error);
@@ -16129,7 +16267,14 @@ cleanup:
   return rc;
 }
 
-int lc_pouch_client_dequeue_batch_method(lc_client *self,
+int lc_pouch_client_dequeue_with_state_method(lc_client *self,
+                                              const lc_dequeue_req *req,
+                                              lc_message **out,
+                                              lc_error *error) {
+  return lc_pouch_client_dequeue(self, req, 1, out, error);
+}
+
+static int lc_pouch_client_dequeue_batch(lc_client *self,
                                          const lc_dequeue_req *req,
                                          lc_dequeue_batch_res *out,
                                          lc_error *error) {
@@ -16410,6 +16555,56 @@ int lc_pouch_client_dequeue_batch_method(lc_client *self,
   return rc;
 }
 
+static int lc_pouch_queue_deliver_batch(void *context, lc_error *error) {
+  lc_pouch_queue_operation *delivery = context;
+  return lc_pouch_client_dequeue_batch(delivery->self, delivery->request,
+                                       delivery->result, error);
+}
+
+int lc_pouch_client_dequeue_batch_method(lc_client *self,
+                                         const lc_dequeue_req *req,
+                                         lc_dequeue_batch_res *out,
+                                         lc_error *error) {
+  lc_client_handle *client = (lc_client_handle *)self;
+  lc_dequeue_req attempt;
+  lc_pouch_queue_operation delivery;
+  const char *ns = NULL;
+  struct timespec deadline;
+  int has_deadline, rc;
+  if (!client || !req || !out || !client->pouch->storage.coordinated_namespaces)
+    return lc_pouch_client_dequeue_batch(self, req, out, error);
+  memset(out, 0, sizeof(*out));
+  rc = lc_pouch_client_public_namespace(client, req->ns, &ns, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_queue_wait_deadline(req->wait_seconds, &deadline,
+                                      &has_deadline, error);
+  if (rc != LC_OK)
+    return rc;
+  /* A shared batch waits for a deliverable page, then drains that page
+   * under one scope. No wait or consumer callback owns the namespace. */
+  attempt = *req;
+  attempt.wait_seconds = 0;
+  delivery.self = self;
+  delivery.request = &attempt;
+  delivery.result = out;
+  do {
+    rc = lc_pouch_queue_shared_scope(client, ns, req->txn_id,
+                                     lc_pouch_queue_deliver_batch, &delivery,
+                                     error);
+    if (rc != LC_OK && out->count) {
+      lc_dequeue_batch_cleanup(out);
+      break;
+    }
+    if ((rc != LC_OK && rc != LC_ERR_PENDING) || out->count || !has_deadline ||
+        lc_pouch_queue_wait_deadline_reached(&deadline))
+      break;
+    if (rc == LC_ERR_PENDING)
+      lc_error_cleanup(error);
+    lc_pouch_queue_dequeue_poll_delay();
+  } while (1);
+  return rc;
+}
+
 static int lc_pouch_client_subscribe_common(lc_client *self,
                                             const lc_dequeue_req *req,
                                             const lc_consumer *consumer,
@@ -16608,6 +16803,13 @@ static int lc_pouch_client_watch_queue_method_impl(
 
     memset(&stats, 0, sizeof(stats));
     rc = lc_pouch_client_queue_stats_method(self, &stats_req, &stats, error);
+    if (rc == LC_ERR_PENDING &&
+        ((lc_client_handle *)self)->pouch->storage.coordinated_namespaces) {
+      lc_error_cleanup(error);
+      lc_pouch_queue_dequeue_poll_delay();
+      rc = LC_OK;
+      continue;
+    }
     if (rc != LC_OK) {
       break;
     }
@@ -19003,7 +19205,11 @@ static int lc_pouch_client_txn_decision(
                                       key, lc_pouch_txn_decision_record_locked,
                                       &context, error);
   }
-  if (rc == LC_OK && xa_durable)
+  /* Shared application can stop at a busy participant. Make the selected
+   * decision and the preceding staged records durable before reporting it. */
+  if (rc == LC_OK &&
+      (xa_durable || (context.apply_decision &&
+                      client->pouch->storage.coordinated_namespaces)))
     rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_TXN_NAMESPACE,
                                        error);
 #ifdef LOCKDC_TEST_BUILD

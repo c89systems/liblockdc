@@ -499,17 +499,6 @@ static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
   }
   return rc;
 }
-int ps_internal_allocation_begin(ps_space *s, ps_coordination_guard **guard,
-                                 lc_error *error) {
-  int rc = allocation_begin(s, guard, error);
-  if (rc == LC_OK && *guard)
-    rc = allocation_refresh(s, error);
-  return rc;
-}
-int ps_internal_allocation_end(ps_space *s, ps_coordination_guard *guard,
-                               int rc, lc_error *error) {
-  return allocation_end(s, guard, rc, error);
-}
 int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
                               lc_error *error) {
   int rc = healthy(s, error);
@@ -527,8 +516,8 @@ int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
 /* Mutations and reservation plans select against the imported prefix before
  * looking at keys or spending workspace. Nested allocation stays observe-only.
  */
-static int revision_begin(ps_space *s, ps_coordination_guard **guard,
-                          lc_error *error) {
+int ps_internal_admission_begin(ps_space *s, ps_coordination_guard **guard,
+                                lc_error *error) {
   int rc = ps_internal_capture_begin(s, guard, error);
   return rc == LC_OK && *guard ? allocation_ranges_refresh(s, error) : rc;
 }
@@ -3215,7 +3204,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   ps_key key;
   replay_change *changes = NULL;
   size_t i, j, count = 1;
-  int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, raw_grant,
+  int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, additive,
       structural, rc;
   if (group)
     count = get32(wire + 16);
@@ -3231,11 +3220,14 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   key.kind = get32(wire + 16);
   key.owner = get64(wire + 24);
   key.key = get64(wire + 32);
-  raw_grant = !group && key.kind == PS_OWNED_RUN &&
-              get32(wire + 20) == PS_PUT && bytes >= 80 && !get32(wire + 72);
-  structural = !group && !immutable_key(key) && !raw_grant;
-  /* A checked new grant extends private append capacity while leaving the
-   * logical tail unchanged. Destructive transitions still require durability.
+  additive = !group && get32(wire + 20) == PS_PUT &&
+             (key.kind == PS_STREAM ||
+              (key.kind == PS_CATALOG && key.key == get64(wire + 40)) ||
+              (key.kind == PS_OWNED_RUN && bytes >= 80 && !get32(wire + 72)));
+  structural = !group && !immutable_key(key) && !additive;
+  /* New heads, bindings and raw capacity consume ownership without releasing
+   * a predecessor. Import their checked frames to keep unrelated writers
+   * moving. Catalog visibility and destructive transitions require durability.
    */
   if (structural && s->sequence >= s->peer_durable)
     return err(error, LC_ERR_PENDING,
@@ -3261,7 +3253,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
       rc = verify_owned(s, single, header, error);
     }
     if (rc == LC_OK) {
-      if (immutable_key(key))
+      if (immutable_key(key) || (key.kind == PS_CATALOG && event == PS_PUT))
         single->peer_sequence = s->sequence + 1;
       rc = apply_journal_event(s, single, event, 0, error);
     }
@@ -3356,6 +3348,7 @@ static void mark_removed(ps_space *s, ps_entry *p, uint64_t sequence) {
   --s->live_entries;
   p->deleted = 1;
   p->publication_sequence = sequence;
+  p->peer_sequence = 0;
   if (!p->dirty_link)
     dirty_entry(s, p, NULL);
 }
@@ -4471,7 +4464,7 @@ static int flush_writer(ps_writer *w, lc_error *error) {
       p->extents = grown;
       p->capacity = n;
     }
-    rc = revision_begin(s, &guard, error);
+    rc = ps_internal_admission_begin(s, &guard, error);
     if (rc != LC_OK) {
       rc = allocation_end(s, guard, rc, error);
       pthread_mutex_unlock(&s->mutex);
@@ -4562,7 +4555,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   durable = s->durable || w->entry->key.kind == PS_CONTROL ||
             w->entry->key.kind == PS_OWNED_RUN;
   pthread_mutex_lock(&s->mutex);
-  rc = revision_begin(s, &guard, error);
+  rc = ps_internal_admission_begin(s, &guard, error);
   old = lookup(s, w->entry->key);
   prior = old && !old->deleted ? entry_bytes(old) : 0;
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN &&
@@ -4661,7 +4654,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
   if (rc != LC_OK)
     goto done;
   pthread_mutex_lock(&s->mutex);
-  rc = revision_begin(s, &guard, error);
+  rc = ps_internal_admission_begin(s, &guard, error);
   if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
                       count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
@@ -5374,7 +5367,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
   if (!tombstone)
     return err(error, LC_ERR_NOMEM, "cannot allocate pending retirement");
   pthread_mutex_lock(&s->mutex);
-  rc = revision_begin(s, &guard, error);
+  rc = ps_internal_admission_begin(s, &guard, error);
   p = lookup(s, key);
   matched = p && !p->deleted &&
             (!expected || (!memcmp(expected->container, s->identity, 16) &&
@@ -5921,7 +5914,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   p->key.owner = head->entry->token;
   p->key.key = base;
   pthread_mutex_lock(&s->mutex);
-  rc = revision_begin(s, &guard, error);
+  rc = ps_internal_admission_begin(s, &guard, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
@@ -6048,7 +6041,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   }
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
-    rc = revision_begin(s, &guard, error);
+    rc = ps_internal_admission_begin(s, &guard, error);
   if (rc == LC_OK && spare)
     rc = physical_release(s, p->extents[0].offset + bytes, reserved - bytes,
                           error);

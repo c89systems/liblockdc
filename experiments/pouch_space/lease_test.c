@@ -1626,6 +1626,7 @@ static void artifacts(const char *directory) {
   free(seen);
 }
 #include "lease_capacity_cases.h"
+#include "shared_queue_cases.h"
 typedef struct run {
   const char *directory, *mode;
   int native, sync, cold, no_error;
@@ -1643,6 +1644,10 @@ static void *worker(void *context) {
     lease_policy(r->directory);
   else if (!strcmp(r->mode, "shared-authority"))
     shared_lease(r->directory);
+  else if (!strcmp(r->mode, "shared-queue-delivery"))
+    shared_queue_delivery(r->directory);
+  else if (!strcmp(r->mode, "shared-queue-transaction"))
+    shared_queue_transaction(r->directory);
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))

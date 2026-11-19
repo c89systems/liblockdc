@@ -447,8 +447,13 @@ static void fence(void) {
   ok(ps_publish(w, NULL, &e), &e);
   ps_writer_close(w);
   uint64_t before = coverage(NULL, 0);
-  REQUIRE(ps_budget_open(b, &plan, &budget, &e) == LC_ERR_PENDING && !budget);
-  lc_error_cleanup(&e);
+  ok(ps_budget_open(b, &plan, &budget, &e), &e);
+  w = private_value(a, NULL, 2);
+  ok(ps_publish(w, NULL, &e), &e);
+  ps_writer_close(w);
+  plan.payload_bytes += PS_PAGE;
+  ok(ps_budget_resize(budget, &plan, &e), &e);
+  ok(ps_budget_close(budget, &e), &e);
   ok(ps_check(b, &e), &e);
   REQUIRE(coverage(NULL, 0) == before);
   ok(ps_checkpoint(a, &e), &e);
@@ -2694,8 +2699,9 @@ static void replay_structural(int rollover) {
   ok(ps_open(path, 1, NULL, &a, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
   ok(ps_owned_open(b, NULL, stream, 1, NULL, &head, &info, &e), &e);
-  REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING);
-  lc_error_cleanup(&e);
+  ok(ps_refresh(a, &e), &e);
+  ok(ps_owned_inspect(a, stream, &info.ref, &peer, &e), &e);
+  REQUIRE(!peer.sealed && !peer.tail && !peer.runs);
   ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &original, &found, &e), &e);
   REQUIRE(found);
   ok(ps_owned_write(original, 0, bytes, 1000, &e), &e);
@@ -2755,9 +2761,114 @@ static void replay_structural(int rollover) {
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   free(bytes);
 }
+static void *publish_catalog_namespace(void *context) {
+  ps_catalog_info info;
+  lc_error e = {0};
+  ok(ps_catalog_create_namespace(context, "new", 3, &info, &e), &e);
+  return NULL;
+}
+static int count_catalog_namespace(void *context, const void *name,
+                                   size_t bytes, const ps_catalog_info *info,
+                                   lc_error *e) {
+  size_t *count = context;
+  (void)e;
+  REQUIRE(bytes == 3 && !memcmp(name, "new", 3) && info->id);
+  ++*count;
+  return LC_OK;
+}
+typedef struct remove_catalog {
+  ps_space *space;
+  ps_ref revision;
+} remove_catalog;
+static void *remove_catalog_namespace(void *context) {
+  remove_catalog *work = context;
+  lc_error e = {0};
+  ok(ps_catalog_remove(work->space, 0, PS_CATALOG_NAMESPACE, "new", 3,
+                       &work->revision, &e),
+     &e);
+  return NULL;
+}
+static void wait_catalog_sync(durable_gate *gate) {
+  pthread_mutex_lock(&gate->mutex);
+  while (!gate->entered)
+    pthread_cond_wait(&gate->cond, &gate->mutex);
+  pthread_mutex_unlock(&gate->mutex);
+}
+static void finish_catalog_sync(durable_gate *gate, pthread_t thread) {
+  pthread_mutex_lock(&gate->mutex);
+  gate->released = 1;
+  pthread_cond_broadcast(&gate->cond);
+  pthread_mutex_unlock(&gate->mutex);
+  REQUIRE(!pthread_join(thread, NULL));
+}
+static void additive_catalog(void) {
+  lc_error e = {0};
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_catalog_view *view = NULL;
+  ps_budget_plan plan = {PS_PAGE, 0, 0, 0};
+  ps_budget *budget = NULL;
+  ps_reserve *reserve = NULL;
+  ps_catalog_info info;
+  pthread_t thread;
+  size_t seen = 0;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  gate.paused = 1;
+  REQUIRE(!pthread_create(&thread, NULL, publish_catalog_namespace, a));
+  wait_catalog_sync(&gate);
+  ok(ps_reserve_open(b, &plan, 0, &reserve, &e), &e);
+  ok(ps_budget_open(b, &plan, &budget, &e), &e);
+  ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(!view);
+  ok(ps_catalog_visit(b, 0, PS_CATALOG_NAMESPACE, count_catalog_namespace,
+                      &seen, &e),
+     &e);
+  REQUIRE(!seen);
+  capture_put(b, 2, 65);
+  ok(ps_budget_close(budget, &e), &e);
+  ps_reserve_close(reserve);
+  finish_catalog_sync(&gate, thread);
+  ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(view);
+  ok(ps_catalog_view_info(view, &info, &e), &e);
+  ps_catalog_view_close(view);
+  ok(ps_catalog_visit(b, 0, PS_CATALOG_NAMESPACE, count_catalog_namespace,
+                      &seen, &e),
+     &e);
+  REQUIRE(seen == 1);
+  /* The same descriptor now carries a local removal. Its live addition's
+   * earlier wire prefix cannot certify that new removal. */
+  remove_catalog work = {b, info.revision};
+  gate.entered = gate.released = 0;
+  gate.paused = 1;
+  REQUIRE(!pthread_create(&thread, NULL, remove_catalog_namespace, &work));
+  wait_catalog_sync(&gate);
+  ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(view);
+  ps_catalog_view_close(view);
+  REQUIRE(ps_catalog_get(a, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e) ==
+              LC_ERR_PENDING &&
+          !view);
+  lc_error_cleanup(&e);
+  finish_catalog_sync(&gate, thread);
+  ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(!view);
+  ok(ps_catalog_get(a, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(!view);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  REQUIRE(!unlink(path));
+}
 static void journal_replay_structural(void) {
   replay_structural(0);
   replay_structural(1);
+  additive_catalog();
 }
 typedef struct tail_callback {
   ps_space *owner, *peer;
