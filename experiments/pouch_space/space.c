@@ -2795,6 +2795,14 @@ static int root_valid(const unsigned char *p) {
          get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 &&
          get32(p + 72) == PS_ROOT_LAYOUT && checksum(p, 76) == get32(p + 76);
 }
+static int canonical_certificate(ps_space *s, ps_readiness_certificate *out,
+                                 lc_error *error) {
+  int rc = ps_readiness_read(s, out, error);
+  if (rc == LC_OK && (out->pending & PS_READINESS_RECOVERY))
+    return err(error, LC_ERR_PENDING,
+               "container recovery cleanup awaits durability");
+  return rc;
+}
 static int canonical_observe(ps_space *s, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES];
   const unsigned char *root;
@@ -2802,7 +2810,7 @@ static int canonical_observe(ps_space *s, lc_error *error) {
   int rc, a, b;
   if (!s->journal_image)
     return err(error, LC_ERR_PENDING, "container canonical view needs refresh");
-  rc = ps_readiness_read(s, &certificate, error);
+  rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
   if (certificate.root == s->generation &&
@@ -3629,7 +3637,7 @@ static int recover(ps_space *s, lc_error *error) {
   ps_entry *p = NULL;
   struct stat st;
   size_t cursor = 0, bytes, i, first, last;
-  int a, b, event, rc;
+  int a, b, event, rc, retire_sibling, retirement_needed;
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -3761,6 +3769,11 @@ static int recover(ps_space *s, lc_error *error) {
     ++first;
   while (last > first && !wire[last - 1])
     --last;
+  retire_sibling =
+      memcmp(roots + (1 - s->root) * PS_ROOT_BYTES, zero, sizeof(zero)) != 0;
+  retirement_needed = first < last || retire_sibling;
+  if (retirement_needed)
+    ps_readiness_begin(s, PS_READINESS_RECOVERY);
   if (first < last) {
     memset(wire + first, 0, last - first);
     ps_readiness_begin(s, PS_READINESS_JOURNAL);
@@ -3769,7 +3782,7 @@ static int recover(ps_space *s, lc_error *error) {
     if (rc != LC_OK)
       goto done;
   }
-  if (memcmp(roots + (1 - s->root) * PS_ROOT_BYTES, zero, sizeof(zero))) {
+  if (retire_sibling) {
     ps_readiness_begin(s, PS_READINESS_ROOT);
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - s->root) * PS_PAGE, 1,
                   error);
@@ -3791,13 +3804,21 @@ static int recover(ps_space *s, lc_error *error) {
   rc = metadata_claim_initial(s, error);
   if (rc != LC_OK)
     goto done;
-  /* The grant reuses rejected journal sequences. Stabilize their retirement
-   * before that valid event can reach storage, including an apparently clean
-   * retry whose zeros came from an earlier failed recovery's file cache.
-   * The final barrier below separately fences the new incarnation range. */
-  rc = sync_file(s, error);
-  if (rc != LC_OK)
-    goto done;
+  /* A live certificate for this exact ready prefix and no pending change
+   * precludes an interrupted append. A durable prefix has a stable end.
+   * Otherwise a checkpoint strictly before the cohort origin proves this
+   * journal has only extended the suffix scrubbed by the first cold open.
+   * A checkpoint in the cohort can reuse that region and void the proof.
+   * Cold or uncertain recovery stabilizes retirement before reusing seqs. */
+  if (retirement_needed || certificate.pending ||
+      certificate.root != s->generation || certificate.ready != s->sequence ||
+      (certificate.durable != s->sequence &&
+       get64(root + 24) >= certificate.origin)) {
+    rc = sync_file(s, error);
+    if (rc != LC_OK)
+      goto done;
+    ps_readiness_finish(s, PS_READINESS_RECOVERY);
+  }
   __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
   if (ps_coordination_shared(s->coordination)) {
     s->journal_image = wire;
@@ -4155,7 +4176,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   int a, b, selected, rc;
   ps_readiness_certificate certificate;
   memset(&recovery, 0, sizeof(recovery));
-  rc = ps_readiness_read(s, &certificate, error);
+  rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
   /* A writer announces every root or journal change before touching disk.

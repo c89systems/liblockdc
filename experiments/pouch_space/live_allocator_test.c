@@ -2515,6 +2515,139 @@ static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
   captured_expect(r, (unsigned char)byte, bytes);
   ps_reader_close(r);
 }
+typedef struct reopen_disk {
+  size_t syncs, fail_sync;
+} reopen_disk;
+static int reopen_sync(void *context, int fd) {
+  reopen_disk *disk = context;
+  if (++disk->syncs == disk->fail_sync) {
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static void reopen_cohort(void) {
+  lc_error e = {0};
+  reopen_disk disk = {0};
+  ps_io io = {&disk, read_io, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *first = NULL, *join = NULL;
+  ps_ref before, after;
+  ps_coordination_guard *guard = NULL;
+  ps_budget_plan plan = {PS_PAGE, 0, 0, 0};
+  ps_budget *budget = NULL;
+  unsigned char byte = 0xa5;
+  options.io = &io;
+  ok(ps_open(path, 1, NULL, &first, &e), &e);
+  capture_put(first, 1, 65);
+  ok(ps_flush(first, &e), &e);
+
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 1);
+  ps_writer *writer = replay_value(join, key(2), 2, 65, &e);
+  ok(ps_publish(writer, &before, &e), &e);
+  ps_writer_close(writer);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+
+  /* A join through an unacknowledged prefix still fences that prefix. */
+  ps_readiness_certificate cert = readiness(first);
+  REQUIRE(cert.ready > cert.durable);
+  disk.syncs = 0;
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 2);
+  expect_value(join, key(2), 65, 2);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+
+  /* Failing the one-barrier join cannot certify its new incarnation grant. */
+  cert = readiness(first);
+  disk = (reopen_disk){0, 1};
+  REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join);
+  lc_error_cleanup(&e);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.durable &&
+          readiness(first).ready == cert.ready);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 2);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+
+  /* Leave a rejected suffix on a different page from the next grant.
+   * Interrupt recovery after the clear and before its first barrier. */
+  ok(ps_refresh(first, &e), &e);
+  ok(ps_coordination_lock(first->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &guard, &e),
+     &e);
+  ps_readiness_begin(first, PS_READINESS_JOURNAL);
+  off_t suffix = PS_JOURNAL_OFFSET + PS_JOURNAL - 1;
+  REQUIRE(pwrite(first->fd, &byte, 1, suffix) == 1);
+  REQUIRE(!fdatasync(first->fd));
+  ps_coordination_unlock(guard);
+  int ready[2], child_status;
+  REQUIRE(!pipe(ready));
+  pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (!pid) {
+    close(ready[0]);
+    projection_io stopped = {.armed = 1, .phase = 1, .ready = ready[1]};
+    ps_io child_io = {&stopped,        projection_read, projection_write,
+                      projection_sync, reserve_io,      NULL};
+    options.io = &child_io;
+    (void)ps_open(path, 0, &options, &join, &e);
+    _exit(1);
+  }
+  REQUIRE(!close(ready[1]));
+  char signal;
+  REQUIRE(read(ready[0], &signal, 1) == 1 && signal == 'R');
+  REQUIRE(!kill(pid, SIGKILL) && waitpid(pid, &child_status, 0) == pid &&
+          WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGKILL);
+  REQUIRE(!close(ready[0]));
+  REQUIRE(pread(first->fd, &byte, 1, suffix) == 1 && byte == 0);
+  REQUIRE(ps_checkpoint(first, &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_budget_open(first, &plan, &budget, &e) == LC_ERR_PENDING &&
+          !budget);
+  lc_error_cleanup(&e);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 2 && !readiness(first).pending);
+  ok(ps_budget_open(first, &plan, &budget, &e), &e);
+  ok(ps_budget_close(budget, &e), &e);
+  ok(ps_close(first, &e), &e);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 2);
+  expect_value(join, key(1), 65, 1);
+  expect_value(join, key(2), 65, 2);
+  writer = replay_value(join, key(3), 3, 65, &e);
+  ok(ps_publish(writer, &after, &e), &e);
+  REQUIRE(after.incarnation > before.incarnation);
+  ps_writer_close(writer);
+
+  /* After a cold open the journal extends a scrubbed suffix until the next
+   * checkpoint. Ready appends alone do not invalidate that proof. */
+  cert = readiness(join);
+  REQUIRE(cert.ready > cert.durable);
+  disk.syncs = 0;
+  ok(ps_open(path, 0, &options, &first, &e), &e);
+  REQUIRE(disk.syncs == 1);
+  expect_value(first, key(3), 65, 3);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+  ok(ps_checkpoint(first, &e), &e);
+  capture_put(first, 4, 65);
+  disk.syncs = 0;
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 2);
+  expect_value(join, key(4), 65, 4);
+  ok(ps_close(first, &e), &e);
+  ok(ps_close(join, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void certified_prefix_reads(void) {
   lc_error e = {0};
   projection_io disk = {0};
@@ -4467,6 +4600,8 @@ int main(int argc, char **argv) {
     shared_durability();
   else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();
+  else if (!strcmp(argv[2], "reopen-cohort"))
+    reopen_cohort();
   else if (!strcmp(argv[2], "readiness-faults"))
     readiness_faults();
   else if (!strcmp(argv[2], "certified-prefix")) {

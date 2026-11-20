@@ -195,7 +195,8 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->origin = record[ORIGIN];
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE);
-    if (out->pending & ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL))
+    if (out->pending & ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL |
+                                   PS_READINESS_RECOVERY))
       rc = failed(s, e, "shared readiness has unknown pending changes");
   }
   return rc;

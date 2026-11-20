@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [live cohort admission](#live-cohort-admission-with-one-sync) | Cold admission and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -8140,3 +8140,73 @@ increased by 0.30 ms from the prior native build. Native queue and indexed
 reopen issued six sync calls per sample and took 12–13 ms. Multifile issued
 none and took 0.35–0.51 ms. The raw timings, sync and CPU counters, and test
 logs are in `build/pouch-space-structural-progress/`.
+
+## Live cohort admission with one sync
+
+The first owner to reopen a root stabilizes the retired journal suffix and
+sibling root before appending its incarnation grant. A second sync makes the
+grant durable before any reference from that range can escape. A live join
+can omit the first sync when the checked root and journal end match the
+cohort's ready certificate, no transition is pending, and the rejected
+suffix and sibling root are both zero. The accepted prefix must be durable
+or extend the suffix scrubbed at the first cold open. A checkpoint sequence
+strictly below the cohort's origin proves no checkpoint has reused that
+journal since the scrub. Subsequent frames only append to the scrubbed
+region. The grant sync makes the accepted prefix and its new grant durable
+together. A dirty or uncertain boundary follows the two-sync path.
+
+Recovery records a pending transition before erasing any tail or sibling
+bytes. A recovering process can die after the erasure has reached the file
+cache. Resident admissions defer in that case, even when a read sees a zero
+journal header. A subsequent opener clears the transition only after the
+retirement barrier. The volatile certificate provides no shortcut after the
+last owner exits. The remaining grant sync still runs under allocation
+authority.
+
+The new fixture observes one sync on clean live joins, including an
+unacknowledged prefix that extends the scrubbed journal. An unacknowledged
+prefix after a new checkpoint and the first cold admission each take two
+syncs. The fixture fails the grant sync and checks that the certified
+prefix does not advance. It also kills an opener between erasing a distant
+suffix byte and starting the retirement sync. The survivor defers checkpoint
+and reservation admission until a new opener stabilizes retirement. Cold
+readback verifies both earlier values and a higher incarnation for new
+references. The previous binary fails the one-sync bound. The first
+implementation still made six sync calls across the three-owner queue and
+indexed reopens. The namespace-open trace identified ready records appended
+after the first owner's scrub and before the next join. Test and trace logs
+are in `build/pouch-space-live-reopen/`.
+
+The first qualification passed 42 Debug, 48 GNU release and 30 musl release
+groups. After extending the proof to ready appends, 19 focused groups passed
+on each final build, including cold selective persistence, live owner death,
+namespace handoff, and the shared lifecycle fixtures.
+
+All 72 final matched GNU runs verified after reopen. Two producer clients
+and a consumer/query client open separately. The run balances all six orders
+of the three configurations. Values are medians of six samples, prior
+single-file (`5f5254f0`) / current single-file / multifile. Times are in
+milliseconds.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Reopen syncs | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 23.05 / 27.09 / 93.84 | 9.24 / 11.41 / 19.85 | 0.25 / 0.27 / 0.07 | 11.32 / 8.21 / 0.36 | 6 / 4 / 0 | 0.41 / 0.36 / 0.55 |
+| Queue, 64 KiB durable | 304.91 / 294.78 / 351.98 | 67.61 / 60.83 / 71.58 | 0.26 / 0.31 / 0.12 | 12.82 / 8.30 / 0.41 | 6 / 4 / 0 | 0.47 / 0.51 / 0.46 |
+| Indexed state, 4 KiB NoSync | 54.49 / 48.67 / 168.44 | 1.82 / 1.59 / 18.28 | 0.50 / 0.53 / 0.34 | 13.34 / 8.81 / 0.63 | 6 / 4 / 0 | 1.27 / 1.18 / 1.76 |
+| Outbox, 64 KiB durable | 933.55 / 905.66 / 1520.95 | 179.20 / 162.32 / 288.10 | 0.60 / 0.59 / 0.29 | 42.74 / 40.71 / 63.57 | 18 / 16 / 0 | 67.59 / 60.19 / 121.41 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 35.32 / 30.74 / 129.86 | 19.48 / 16.76 / 38.64 | 0.43 / 0.35 / 9.93 | 0.19 / 0.18 / 14.31 |
+
+Queue and indexed reopen use four syncs across three owners and are 27–35%
+faster than the prior build in this matrix. The first owner uses two syncs.
+Outbox setup includes additional syncs for reconciliation. Shared queue and
+indexed reopen remains substantially slower than multifile.
+
+The 4 KiB NoSync queue work median increased from 23.05 to 27.09 ms in the
+matrix. Twelve alternating prior/current pairs then observed medians of
+27.96 and 24.28 ms, with six pairs slower on the current build. Reopen
+improved in all twelve pairs, with medians of 11.18 and 8.18 ms. All 24
+focused samples verified after reopen. The raw timings and counters are
+in `compare.log` and `queue-nosync-control.log`.

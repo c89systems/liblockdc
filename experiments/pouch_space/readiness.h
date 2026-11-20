@@ -3,7 +3,11 @@
 #include "space.h"
 typedef struct ps_readiness ps_readiness;
 #define PS_READINESS_WORDS 9U
-enum ps_readiness_change { PS_READINESS_ROOT = 1, PS_READINESS_JOURNAL = 2 };
+enum ps_readiness_change {
+  PS_READINESS_ROOT = 1,
+  PS_READINESS_JOURNAL = 2,
+  PS_READINESS_RECOVERY = 4
+};
 typedef struct ps_readiness_certificate {
   uint64_t ready, durable, root, origin, pending;
 } ps_readiness_certificate;
@@ -16,8 +20,9 @@ void ps_readiness_close(ps_space *);
 int ps_readiness_validate(ps_space *, lc_error *);
 int ps_readiness_opened(ps_space *, lc_error *);
 int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
-/* Mark an in-flight disk transition before its first canonical write. Only
- * publication or a checked recovery boundary can clear that transition. */
+/* Mark an in-flight disk transition before its first canonical write.
+ * A rejected suffix being erased keeps its own fence until a sync proves
+ * retirement. Reading back a matching journal header cannot clear it. */
 void ps_readiness_begin(ps_space *, unsigned int changes);
 void ps_readiness_finish(ps_space *, unsigned int changes);
 int ps_readiness_publish(ps_space *, lc_error *);
