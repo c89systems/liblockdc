@@ -8,6 +8,11 @@
 #include "readiness.h"
 #include "space.h"
 #include <pthread.h>
+
+/* A creating root retains initialization authority until its root metadata has
+ * committed. Ordinary physical opens release authority before returning. */
+int ps_internal_open(const char *, int create, const ps_options *,
+                     int hold_initialization, ps_space **, lc_error *);
 typedef struct ps_catalog_index {
   struct ps_entry **buckets;
   size_t capacity, count;

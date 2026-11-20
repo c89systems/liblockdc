@@ -4367,8 +4367,8 @@ static int sync_parent(const char *path, lc_error *error) {
   return rc == 0 ? LC_OK
                  : err(error, LC_ERR_TRANSPORT, "container parent sync failed");
 }
-int ps_open(const char *path, int create, const ps_options *options,
-            ps_space **out, lc_error *error) {
+int ps_internal_open(const char *path, int create, const ps_options *options,
+                     int hold_initialization, ps_space **out, lc_error *error) {
   ps_options defaults = {0};
   ps_coordination_options coordination = {0};
   ps_coordination_guard *opening = NULL;
@@ -4382,6 +4382,8 @@ int ps_open(const char *path, int create, const ps_options *options,
                "container open requires path and output");
   if (!options)
     options = &defaults;
+  if (options->shared != 0 && options->shared != 1)
+    return err(error, LC_ERR_INVALID, "invalid container ownership mode");
   if ((options->initial_capacity && (options->initial_capacity < PS_MIB ||
                                      options->initial_capacity % PS_MIB ||
                                      options->initial_capacity > INT64_MAX)) ||
@@ -4446,6 +4448,8 @@ int ps_open(const char *path, int create, const ps_options *options,
   }
   coordination.failure_flag = &s->poisoned;
   coordination.io = options->coordination_io;
+  coordination.shared = options->shared;
+  coordination.wait_lifetime = create != 0;
   rc = ps_coordination_open(s->fd, &coordination, &s->coordination, error);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PENDING)
@@ -4454,7 +4458,9 @@ int ps_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
-  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &s->range_pins, error);
+  rc = ps_coordination_initialize(s->coordination, create, 1, error);
+  if (rc == LC_OK)
+    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &s->range_pins, error);
   if (rc != LC_OK) {
     destroy(s);
     return rc;
@@ -4499,6 +4505,8 @@ int ps_open(const char *path, int create, const ps_options *options,
   if (rc == LC_OK)
     rc = ps_readiness_opened(s, error);
   rc = allocation_end(s, opening, rc, error);
+  if (rc == LC_OK && !(create && hold_initialization))
+    rc = ps_coordination_initialize(s->coordination, create, 0, error);
   if (rc != LC_OK) {
     destroy(s);
     return rc;
@@ -4506,6 +4514,10 @@ int ps_open(const char *path, int create, const ps_options *options,
   mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
   *out = s;
   return LC_OK;
+}
+int ps_open(const char *path, int create, const ps_options *options,
+            ps_space **out, lc_error *error) {
+  return ps_internal_open(path, create, options, 0, out, error);
 }
 int ps_close(ps_space *s, lc_error *error) {
   if (!s)

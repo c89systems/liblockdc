@@ -66,16 +66,6 @@ static pthread_mutex_t sync_mutex = PTHREAD_MUTEX_INITIALIZER;
  * Process-wide snapshots around overlapping writers would count peer work. */
 static pthread_key_t sync_phase_key;
 static int sync_phase_key_initialized;
-static int shared_fixture;
-int __real_ps_coordination_open(int, const ps_coordination_options *,
-                                ps_coordination **, lc_error *);
-int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
-                                ps_coordination **out, lc_error *e) {
-  ps_coordination_options selected = *options;
-  if (shared_fixture)
-    selected.shared = 1;
-  return __real_ps_coordination_open(fd, &selected, out, e);
-}
 static double now(clockid_t clock) {
   struct timespec time;
   if (clock_gettime(clock, &time) != 0)
@@ -225,7 +215,7 @@ static void open_store(comparison *run, int create, lc_error *e) {
       LC_POUCH_SETTING_QUERY_INDEXING | LC_POUCH_SETTING_BACKGROUND_COMPACTION |
       LC_POUCH_SETTING_QUEUE_WATCH | LC_POUCH_SETTING_COMPRESSION |
       LC_POUCH_SETTING_QUERY_ENGINE | LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
-  settings.single_writer = 1;
+  settings.single_writer = !run->shared;
   settings.durable_sync = run->sync;
   settings.compression = "none";
   settings.query_engine = run->index ? "index" : "scan";
@@ -245,10 +235,12 @@ static void open_store(comparison *run, int create, lc_error *e) {
             ? ps_pouch_client_open(&config, create, NULL, &run->client, e)
             : lc_client_open(&config, &run->client, e),
         e);
-  for (size_t i = 0U; run->shared && i < run->writers; ++i)
-    check(ps_pouch_client_open(&config, 0, NULL,
-                               &run->workers[i].producer_client, e),
+  for (size_t i = 0U; run->shared && i < run->writers; ++i) {
+    lc_client **producer = &run->workers[i].producer_client;
+    check(run->container ? ps_pouch_client_open(&config, 0, NULL, producer, e)
+                         : lc_client_open(&config, producer, e),
           e);
+  }
   for (size_t i = 0U; run->outbox && i < run->writers; ++i) {
     lc_outbox_config outbox;
     lc_outbox_config_init(&outbox);
@@ -619,14 +611,18 @@ int main(int argc, char **argv) {
   require(
       !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
           !strcmp(argv[1], "runtime-shared-queue") ||
+          !strcmp(argv[1], "pouch-shared-queue") ||
           !strcmp(argv[1], "pouch-outbox") ||
           !strcmp(argv[1], "runtime-shared-outbox") ||
+          !strcmp(argv[1], "pouch-shared-outbox") ||
           !strcmp(argv[1], "runtime-outbox") || !strcmp(argv[1], "pouch-xa") ||
           !strcmp(argv[1], "runtime-xa") || !strcmp(argv[1], "pouch-index") ||
-          !strcmp(argv[1], "runtime-index"),
+          !strcmp(argv[1], "runtime-index") ||
+          !strcmp(argv[1], "runtime-shared-index") ||
+          !strcmp(argv[1], "pouch-shared-index"),
       "mode");
   run.container = !strncmp(argv[1], "runtime-", 8U);
-  run.shared = shared_fixture = !strncmp(argv[1], "runtime-shared-", 15U);
+  run.shared = strstr(argv[1], "-shared-") != NULL;
   run.outbox = strstr(argv[1], "outbox") != NULL;
   run.xa = strstr(argv[1], "-xa") != NULL;
   run.index = strstr(argv[1], "-index") != NULL;

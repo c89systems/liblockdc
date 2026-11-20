@@ -4299,6 +4299,16 @@ int lc_pouch_set_single_writer(lc_pouch *pouch, int enabled, lc_error *error) {
                         "pouch single-writer control is closed after abort",
                         NULL, NULL, "pouch");
   }
+  if (pouch->storage.ops != NULL) {
+    mode_changed = pouch->single_writer != normalized;
+    pthread_mutex_unlock(&pouch->single_writer_mutex);
+    (void)pthread_rwlock_unlock(&pouch->writer_mode_guard);
+    return mode_changed
+               ? lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                              "container writer mode requires a reopen", NULL,
+                              NULL, "pouch")
+               : LC_OK;
+  }
   had_root_lock = pouch->writer_root_lock != NULL;
   if (pouch->single_writer == normalized && had_root_lock) {
     pthread_mutex_unlock(&pouch->single_writer_mutex);

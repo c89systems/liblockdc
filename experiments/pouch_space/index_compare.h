@@ -7,6 +7,8 @@ static int index_one(worker *w, size_t row, producer *source, consumer *sink,
   lc_update_opts options = {0};
   lc_lease *lease = NULL;
   lc_get_res result = {0};
+  lc_client *producer =
+      w->producer_client ? w->producer_client : w->run->client;
   char key[64];
   snprintf(key, sizeof(key), "row-%lu", (unsigned long)row);
   lc_acquire_req_init(&request);
@@ -16,7 +18,7 @@ static int index_one(worker *w, size_t row, producer *source, consumer *sink,
   request.owner = "index-benchmark";
   request.ttl_seconds = 3600L;
   options.content_type = "application/json";
-  int rc = lc_acquire(w->run->client, &request, &lease, e);
+  int rc = lc_acquire(producer, &request, &lease, e);
   if (rc == LC_OK)
     rc = lc_lease_update(lease, &source->source, &options, e);
   if (rc == LC_OK) {

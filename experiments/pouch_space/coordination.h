@@ -42,6 +42,8 @@ typedef struct ps_coordination_options {
    * until close and uses atomic accesses. Either layer may declare failure;
    * neither may clear it while the owner is alive. No callback on hot reads. */
   int *failure_flag;
+  /* The sole creator of a new inode may wait for a racing opener to leave. */
+  int wait_lifetime;
 } ps_coordination_options;
 
 /* fd must be a fresh, writable open file description, not a dup or an inherited
@@ -63,6 +65,10 @@ int ps_coordination_check(ps_coordination *, lc_error *);
 size_t ps_coordination_users(ps_coordination *);
 /* Immutable lifetime admission mode; does not acquire a guard. */
 int ps_coordination_shared(const ps_coordination *);
+/* Hold write authority from file initialization through root publication.
+ * Existing-file opens probe with compatible read authority. */
+int ps_coordination_initialize(ps_coordination *, int create, int acquire,
+                               lc_error *);
 /* Publication/recovery/allocation/sync use identity zero.
  * Transaction uses stripe < 256.
  * Allocation uses byte 4, separate from publication and reader presence.
@@ -127,8 +133,6 @@ int ps_coordination_conflict(ps_coordination *, uint64_t, uint64_t, uint64_t *,
 int ps_coordination_range(ps_coordination *, uint64_t, uint64_t, int acquire,
                           lc_error *);
 
-/* Borrowed while the space is alive; never independently closed. Native spaces
- * still acquire exclusive lifetime authority; shared allocator admission is
- * not enabled by this capability. */
+/* Borrowed while the space is alive; never independently closed. */
 ps_coordination *ps_space_coordination(ps_space *);
 #endif

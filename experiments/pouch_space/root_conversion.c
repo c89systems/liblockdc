@@ -449,6 +449,17 @@ int ps_root_conversion_run(ps_root *root, const char *path,
   lc_free_with_allocator(NULL, key_id);
   if (rc == LC_OK)
     rc = load(&c, &found, e);
+  if (rc == LC_OK &&
+      ps_coordination_shared(ps_space_coordination(root->space))) {
+    if (found || (options->compression_explicit &&
+                  !!options->crypto.compression_enabled !=
+                      lc_pouch_crypto_compression_enabled(root->crypto)))
+      return lc_error_set(
+          e, LC_ERR_UNSUPPORTED, 0,
+          "container codec conversion requires an exclusive open", NULL,
+          "pouch_root_conversion_exclusive", "pouch");
+    return LC_OK;
+  }
   if (rc == LC_OK && found)
     rc = execute(&c, e);
   if (rc == LC_OK && options->compression_explicit &&

@@ -15,12 +15,12 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Shared capacity across lease and messaging workloads, throughput, and normal shared admission |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), and [collection topology retention](#shared-collection-append-and-captured-reads) | Qualification of shared indexed queries and sustained reclamation |
+| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Shared lease and messaging capacity, tail latency, and reopen cost |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
-Native Pouch currently admits one process at a time. Shared coordination
-participants are supported at the file authority layer.
+The private single-file SDK path admits independently opened shared owners.
+Normal Pouch continues to open multifile roots.
 Earlier sections below retain the evidence and constraints of their individual
 implementation stages; their unfinished-work lists are historical snapshots.
 
@@ -1533,12 +1533,10 @@ table, copies configuration, initializes logging/lifecycle ownership and enters
 transaction recovery. There is no separate container method table, public
 backend selector, persistent format change or ABI change.
 
-The private wrapper adds only create/open intent, initial/maximum physical
-capacity and the existing I/O fault seam. Logical settings keep their ordinary
-SDK precedence and validation; unsupported indexing/background/watch/shared
-settings are rejected by the existing container owner. Creation requires a new
-file; it cannot adopt or overwrite another store. Native root conversion and
-production cutover remain outside this admission seam.
+The private wrapper supplies create/open intent, initial and maximum physical
+capacity, and I/O fault seams. Logical settings keep their ordinary SDK
+precedence and validation. Creation requires a new file. See
+[shared SDK admission](#shared-sdk-admission) for the ownership and codec rules.
 
 The implemented SDK call envelope covers streamed get/get-in-namespace, mapped
 load, scan queries and namespace query configuration. It reuses production
@@ -7766,3 +7764,77 @@ Small NoSync still includes two `fdatasync` calls per sample median and takes
 15.2 times as long as multifile. Broad shared capacity acceptance for lease
 and messaging workloads remains open. Raw runs and test logs are in
 `build/pouch-space-collection-reuse/`.
+
+## Shared SDK admission
+
+`ps_pouch_client_open` uses the resolved SDK `single_writer` setting for
+both the logical runtime and physical ownership. The default is exclusive.
+Shared clients use independent open file descriptions and coordinate state
+projection and sequence allocation by namespace, with separate transaction
+stripes. State lookups use the refreshed in-container projection. Lease,
+queue, outbox, collection, and state recovery tests now enter through this
+path. Their fault hooks inject I/O failures and pauses without overriding
+ownership mode. Changing the writer mode requires closing and reopening.
+
+Shared creation holds an initialization byte through durable publication of
+root metadata and base maintenance admission. An open during this interval
+returns pending. Shared and exclusive lifetimes conflict. Codec policy
+conversion uses an exclusive reopen with all peer owners closed. Shared
+admission requires a matching or inherited codec policy and refuses a durable
+conversion intent before namespace recovery. The conversion crash cases
+verify that exclusive recovery then finishes the conversion and preserves the
+data.
+
+Peer indexed reads observe the installed generation. In all four codec
+profiles and with both sync policies, a peer publishes a revision after
+replacement and deletion, the first owner reads the new index, and a cold
+reopen finds the published sequence and results. A second check flushes the
+index from a peer between two updates under an active lease. Both flushes
+retain the last committed sequence. After release, the peer indexes only the
+final value. Shared background indexing uses the asynchronous path.
+
+All 80 selected groups passed on Debug, GNU release, and musl release. The
+added lease visibility check passed separately in all four index groups on
+each build.
+
+All 72 GNU release comparison runs verified their results through reopen.
+Both backends used preopened shared roots with two independent producer
+clients and one consumer or query client. Each sample used 12 values. Queue
+timings follow a warm-up on each namespace. Indexed state used two update
+rounds with an explicit completed canonical prefix before each index flush
+on both backends. Single-file roots began at 10 MiB. Figures are medians of
+three runs in milliseconds, single-file / multifile. Index work includes
+readiness and queries. Index mutation and readiness are also reported
+separately below.
+
+| Workload | Body | Policy | Work | Close | Reopen | Verify after reopen |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| Queue | 4 KiB | NoSync | 53.06 / 94.33 | 0.21 / 0.08 | 15.90 / 0.60 | 0.50 / 0.79 |
+| Queue | 4 KiB | Durable | 380.02 / 374.29 | 0.27 / 0.12 | 25.90 / 0.37 | 0.38 / 0.43 |
+| Queue | 64 KiB | NoSync | 79.99 / 101.94 | 0.34 / 0.07 | 18.59 / 0.59 | 0.53 / 0.68 |
+| Queue | 64 KiB | Durable | 377.95 / 387.17 | 0.32 / 0.15 | 13.28 / 0.45 | 0.40 / 0.61 |
+| Outbox | 4 KiB | NoSync | 495.02 / 508.56 | 0.62 / 0.15 | 26.52 / 13.15 | 5.20 / 29.78 |
+| Outbox | 4 KiB | Durable | 1222.77 / 1304.59 | 0.62 / 0.35 | 60.49 / 57.21 | 87.12 / 158.47 |
+| Outbox | 64 KiB | NoSync | 548.54 / 489.97 | 0.81 / 0.17 | 27.68 / 12.96 | 7.36 / 27.53 |
+| Outbox | 64 KiB | Durable | 1057.75 / 1455.87 | 0.71 / 0.26 | 56.49 / 56.36 | 67.00 / 165.32 |
+| Indexed state | 4 KiB | NoSync | 63.41 / 161.15 | 0.48 / 0.27 | 16.51 / 0.45 | 1.27 / 1.72 |
+| Indexed state | 4 KiB | Durable | 568.49 / 592.28 | 0.71 / 0.34 | 19.52 / 0.69 | 1.17 / 2.38 |
+| Indexed state | 64 KiB | NoSync | 115.85 / 171.40 | 1.04 / 0.37 | 16.42 / 0.48 | 2.67 / 2.51 |
+| Indexed state | 64 KiB | Durable | 583.95 / 573.26 | 0.78 / 0.41 | 18.51 / 0.56 | 2.66 / 3.01 |
+
+| Indexed body | Policy | Mutation | Flush | First query pass | Repeated pass |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 KiB | NoSync | 36.64 / 130.32 | 25.95 / 30.93 | 0.37 / 12.56 | 0.17 / 10.68 |
+| 4 KiB | Durable | 554.34 / 587.78 | 14.87 / 15.37 | 0.34 / 7.96 | 0.12 / 0.76 |
+| 64 KiB | NoSync | 88.47 / 128.57 | 29.77 / 30.46 | 0.38 / 10.19 | 0.13 / 9.63 |
+| 64 KiB | Durable | 567.34 / 548.92 | 19.25 / 22.47 | 0.43 / 34.52 | 0.15 / 0.68 |
+
+Shared indexed flush medians were comparable in all four profiles. The
+single-file backend completed nine of the twelve work profiles faster. The
+64 KiB NoSync outbox profile took 12% longer, and the 4 KiB NoSync queue
+profile had a 26.43 ms per-item p95 against 19.50 ms despite faster total
+work. Shared queue and index cold reopen took 13–26 ms, compared with less
+than 1 ms for multifile. The earlier collection benchmark also found a
+material small-append NoSync gap. These results leave sustained capacity,
+tail latency, and reopen as acceptance work. Raw runs, per-phase counters,
+CPU times, and test logs are in `build/pouch-space-shared-admission/`.

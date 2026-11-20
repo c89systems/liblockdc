@@ -145,6 +145,7 @@ typedef struct ps_options {
   /* Optional native OFD query/guard seam, including admission before recovery.
    */
   const struct ps_coordination_io *coordination_io;
+  int shared; /* zero selects exclusive lifetime ownership */
 } ps_options;
 
 /* create != 0 requires a new pathname; open never creates or truncates. */

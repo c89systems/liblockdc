@@ -1744,7 +1744,7 @@ int lc_pouch_state_shared_mutation_enter(
                         "pouch shared mutation lock requires output", NULL,
                         NULL, "pouch");
   }
-  if (lc_pouch_single_writer_enabled(pouch)) {
+  if (pouch->storage.ops != NULL || lc_pouch_single_writer_enabled(pouch)) {
     return LC_OK;
   }
   return lc_pouch_state_shared_mutation_acquire(pouch, out, error);
@@ -6649,7 +6649,7 @@ static int lc_pouch_state_reserve_index_records(
                         NULL, "pouch");
   }
   single_writer = lc_pouch_single_writer_enabled(pouch);
-  if (single_writer) {
+  if (pouch->storage.ops != NULL || single_writer) {
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 1, error);
     if (cache == NULL) {
       return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
@@ -6678,12 +6678,14 @@ static int lc_pouch_state_reserve_index_records(
       if (first_index_out != NULL) {
         *first_index_out = base + 1UL;
       }
-      /* The exclusive owner has one resident allocator, so its projection is
-       * authoritative while live. A normal close checkpoints this value for
-       * the next cold index read; abort or recovery replays finalized records.
-       * The sequence file remains a shared-root allocator. */
+      /* A typed owner has refreshed the projection under namespace authority.
+       * The exclusive multifile owner has one resident allocator. */
       return LC_OK;
     }
+    if (pouch->storage.ops != NULL)
+      return lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "container index reservation requires a projection",
+                          NULL, NULL, "pouch");
   }
   shared_mutation_held =
       !single_writer && lc_pouch_state_shared_mutation_is_held(pouch);
@@ -10618,8 +10620,8 @@ static int lc_pouch_state_manifest_lookup_cached(
   }
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
   single_writer = lc_pouch_single_writer_snapshot(pouch, &writer_mode_epoch);
-  if (single_writer && cache != NULL && cache->initialized &&
-      cache->writer_mode_epoch == writer_mode_epoch &&
+  if ((pouch->storage.ops != NULL || single_writer) && cache != NULL &&
+      cache->initialized && cache->writer_mode_epoch == writer_mode_epoch &&
       (pouch->storage.ops != NULL ||
        (cache->namespace_path != NULL && cache->active_segment_leaf != NULL))) {
     rc = lc_pouch_state_cache_manifest_copy(pouch, cache, manifest, error);
@@ -10752,8 +10754,8 @@ static int lc_pouch_state_manifest_view(lc_pouch *pouch, const char *ns,
   }
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
   single_writer = lc_pouch_single_writer_snapshot(pouch, &writer_mode_epoch);
-  if (single_writer && cache != NULL && cache->initialized &&
-      cache->writer_mode_epoch == writer_mode_epoch &&
+  if ((pouch->storage.ops != NULL || single_writer) && cache != NULL &&
+      cache->initialized && cache->writer_mode_epoch == writer_mode_epoch &&
       (pouch->storage.ops != NULL ||
        (cache->namespace_path != NULL && cache->active_segment_leaf != NULL))) {
     rc = lc_pouch_state_cache_manifest_borrow(pouch, cache, manifest, error);
@@ -14637,8 +14639,8 @@ static int lc_pouch_state_write_resolved_locked(
     rc = LC_OK;
   } else {
     manifest_from_cache =
-        single_writer && cache != NULL && cache->initialized &&
-        cache->writer_mode_epoch == writer_mode_epoch &&
+        (pouch->storage.ops != NULL || single_writer) && cache != NULL &&
+        cache->initialized && cache->writer_mode_epoch == writer_mode_epoch &&
         (pouch->storage.ops != NULL ||
          (cache->namespace_path != NULL && cache->active_segment_leaf != NULL));
     if (manifest_from_cache) {

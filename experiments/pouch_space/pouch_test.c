@@ -30,7 +30,6 @@ static size_t checks, allocation, fail_at;
 static int armed;
 static char *crypto_key;
 static int fail_crypto_init;
-static int shared_state_fixture;
 static const char *executable_path;
 static int fail_shared_view;
 static int shared_state_fcntl(void *context, int fd, int cmd,
@@ -44,18 +43,6 @@ static int shared_state_fcntl(void *context, int fd, int cmd,
     return -1;
   }
   return fcntl(fd, cmd, lock);
-}
-int __real_ps_coordination_open(int, const ps_coordination_options *,
-                                ps_coordination **, lc_error *);
-int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
-                                ps_coordination **out, lc_error *e) {
-  ps_coordination_options selected = *options;
-  static const ps_coordination_io io = {NULL, shared_state_fcntl};
-  if (shared_state_fixture) {
-    selected.shared = 1;
-    selected.io = &io;
-  }
-  return __real_ps_coordination_open(fd, &selected, out, e);
 }
 #define REQUIRE(x)                                                             \
   do {                                                                         \
@@ -158,6 +145,14 @@ static ps_pouch_state_options options(int crypto, int sync) {
   o.logical.durable_sync = sync;
   o.logical.crypto_key = crypto & 1 ? crypto_key : NULL;
   o.logical.compression = crypto & 2 ? "zlib" : "none";
+  return o;
+}
+static ps_pouch_state_options shared_options(int crypto, int sync) {
+  static const ps_coordination_io io = {NULL, shared_state_fcntl};
+  ps_pouch_state_options o = options(crypto, sync);
+  o.logical.single_writer_set = 1;
+  o.logical.single_writer = 0;
+  o.coordination_io = &io;
   return o;
 }
 typedef struct input {
@@ -1041,6 +1036,107 @@ typedef struct gate {
   pthread_cond_t changed;
   int entered, released;
 } gate;
+typedef struct root_init_cut {
+  io_fault io;
+  gate held;
+  const char *path;
+  ps_pouch_state_options options;
+  lc_pouch *pouch;
+  lc_error error;
+  int rc;
+} root_init_cut;
+static ssize_t root_init_write(void *context, int fd, const void *bytes,
+                               size_t length, off_t offset) {
+  root_init_cut *cut = context;
+  if (length >= 8U && !memcmp(bytes, "LCPSROOT", 8U)) {
+    pthread_mutex_lock(&cut->held.mutex);
+    cut->held.entered = 1;
+    pthread_cond_signal(&cut->held.changed);
+    while (!cut->held.released)
+      pthread_cond_wait(&cut->held.changed, &cut->held.mutex);
+    pthread_mutex_unlock(&cut->held.mutex);
+  }
+  return io_write(&cut->io, fd, bytes, length, offset);
+}
+static void *root_init_create(void *context) {
+  root_init_cut *cut = context;
+  cut->rc = ps_pouch_state_open(cut->path, 1, &allocator, &cut->options,
+                                &cut->pouch, &cut->error);
+  return NULL;
+}
+static void shared_admission(const char *path) {
+  for (int sync = 0; sync <= 1; ++sync) {
+    root_init_cut cut = {0};
+    ps_io io = {&cut, io_read, root_init_write, io_sync, io_reserve, NULL};
+    ps_pouch_state_options shared = shared_options(sync ? 3 : 0, sync);
+    ps_pouch_state_options exclusive = shared;
+    lc_pouch *peer = NULL;
+    lc_error e = {0};
+    pthread_t creator;
+    cut.path = path;
+    cut.options = shared;
+    cut.options.io = &io;
+    exclusive.logical.single_writer = 1;
+    REQUIRE(!pthread_mutex_init(&cut.held.mutex, NULL));
+    REQUIRE(!pthread_cond_init(&cut.held.changed, NULL));
+    REQUIRE(!pthread_create(&creator, NULL, root_init_create, &cut));
+    pthread_mutex_lock(&cut.held.mutex);
+    while (!cut.held.entered)
+      pthread_cond_wait(&cut.held.changed, &cut.held.mutex);
+    pthread_mutex_unlock(&cut.held.mutex);
+    REQUIRE(ps_pouch_state_open(path, 0, &allocator, &shared, &peer, &e) ==
+                LC_ERR_PENDING &&
+            !peer);
+    clear(&e);
+    pthread_mutex_lock(&cut.held.mutex);
+    cut.held.released = 1;
+    pthread_cond_signal(&cut.held.changed);
+    pthread_mutex_unlock(&cut.held.mutex);
+    REQUIRE(!pthread_join(creator, NULL));
+    ok(cut.rc, &cut.error);
+    clear(&cut.error);
+    REQUIRE(lc_pouch_supports_concurrent_writes(cut.pouch));
+    REQUIRE(ps_pouch_state_open(path, 0, &allocator, &exclusive, &peer, &e) ==
+                LC_ERR_INVALID &&
+            !peer);
+    clear(&e);
+    ok(lc_pouch_set_single_writer(cut.pouch, 0, &e), &e);
+    REQUIRE(lc_pouch_set_single_writer(cut.pouch, 1, &e) == LC_ERR_UNSUPPORTED);
+    clear(&e);
+    ok(ps_pouch_state_open(path, 0, &allocator, &shared, &peer, &e), &e);
+    input in = source(87, 42);
+    lc_pouch_state_write_result result = {0};
+    ok(put(peer, "admission", "value", &in, NULL, &result, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &result);
+    read_value(cut.pouch, "admission", "value", 87, 42, 1, &e);
+    lc_pouch_close(peer);
+    peer = NULL;
+
+    shared.logical.compression = exclusive.logical.compression =
+        sync ? "none" : "zlib";
+    REQUIRE(ps_pouch_state_open(path, 0, &allocator, &shared, &peer, &e) ==
+                LC_ERR_UNSUPPORTED &&
+            !peer && e.server_code &&
+            !strcmp(e.server_code, "pouch_root_conversion_exclusive"));
+    clear(&e);
+    read_value(cut.pouch, "admission", "value", 87, 42, 1, &e);
+    lc_pouch_close(cut.pouch);
+    ok(ps_pouch_state_open(path, 0, &allocator, &exclusive, &peer, &e), &e);
+    REQUIRE(!lc_pouch_supports_concurrent_writes(peer));
+    read_value(peer, "admission", "value", 87, 42, 1, &e);
+    REQUIRE(lc_pouch_set_single_writer(peer, 0, &e) == LC_ERR_UNSUPPORTED);
+    clear(&e);
+    lc_pouch_close(peer);
+    peer = NULL;
+    ok(ps_pouch_state_open(path, 0, &allocator, &shared, &peer, &e), &e);
+    read_value(peer, "admission", "value", 87, 42, 1, &e);
+    lc_pouch_close(peer);
+    REQUIRE(!live && !unlink(path));
+    REQUIRE(!pthread_cond_destroy(&cut.held.changed));
+    REQUIRE(!pthread_mutex_destroy(&cut.held.mutex));
+    clear(&e);
+  }
+}
 typedef struct job {
   lc_pouch *pouch;
   gate *held;
@@ -2469,13 +2565,14 @@ static void validation(const char *path) {
       o.logical.compression = "unknown";
       expected = LC_ERR_INVALID;
     }
-    if (bad == 0 || bad == 1 || bad == 2 || bad == 4) {
+    if (bad == 0 || bad == 1 || bad == 2 || bad == 3 || bad == 4) {
       ok(ps_pouch_state_open(path, 1, &allocator, bad ? &o : NULL, &p, &e), &e);
-      REQUIRE(p && (bad == 1 ? p->compaction_thread_started
-                    : bad == 0 || bad == 2
-                        ? p->indexer_thread_started
-                        : p->queue_watch_enabled &&
-                              !strcmp(p->queue_watch_mode, "inprocess")));
+      REQUIRE(p &&
+              (bad == 1               ? p->compaction_thread_started
+               : bad == 0 || bad == 2 ? p->indexer_thread_started
+               : bad == 3 ? lc_pouch_supports_concurrent_writes(p)
+                          : p->queue_watch_enabled &&
+                                !strcmp(p->queue_watch_mode, "inprocess")));
       lc_pouch_close(p);
       REQUIRE(!live && !unlink(path));
       continue;
@@ -5628,10 +5725,9 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
 #include "body_select_client_cases.h"
 #include "ordered_read_cases.h"
 static void shared_state(const char *path, const char *directory) {
-  shared_state_fixture = 1;
   for (int durable = 0; durable <= 1; ++durable) {
     lc_error e = {0};
-    ps_pouch_state_options o = options(durable ? 3 : 0, durable);
+    ps_pouch_state_options o = shared_options(durable ? 3 : 0, durable);
     lc_pouch *a = NULL, *b = NULL;
     lc_pouch_state_write_result w = {0};
     lc_pouch_state_read_result old = {0}, current = {0};
@@ -5730,7 +5826,6 @@ static void shared_state(const char *path, const char *directory) {
     REQUIRE(live == 0 && unlink(path) == 0);
     clear(&e);
   }
-  shared_state_fixture = 0;
 }
 typedef struct replay_probe {
   const lc_pouch_storage_ops *storage;
@@ -5780,10 +5875,9 @@ static void delta_put(lc_pouch *pouch, const char *key, unsigned char seed,
   lc_pouch_state_write_result_cleanup(&allocator, &result);
 }
 static void shared_state_delta(const char *path) {
-  shared_state_fixture = 1;
   for (int durable = 0; durable <= 1; ++durable) {
     lc_error e = {0};
-    ps_pouch_state_options o = options(durable ? 3 : 0, durable);
+    ps_pouch_state_options o = shared_options(durable ? 3 : 0, durable);
     lc_pouch *a = NULL, *b = NULL;
     lc_pouch_state_read_result held = {0}, read = {0};
     lc_pouch_storage_ops storage;
@@ -5867,16 +5961,14 @@ static void shared_state_delta(const char *path) {
     lc_pouch_close(a);
     REQUIRE(live == 0 && unlink(path) == 0);
   }
-  shared_state_fixture = 0;
 }
 static void shared_state_committed_index_failure(const char *path) {
   lc_error e = {0};
-  ps_pouch_state_options o = options(0, 0);
+  ps_pouch_state_options o = shared_options(0, 0);
   lc_pouch *pouch = NULL;
   lc_pouch_state_write_options write = {0};
   lc_pouch_state_write_result result = {0};
   input body = source(59, 17);
-  shared_state_fixture = 1;
   o.logical.query_indexing_enabled = 1;
   ok(ps_pouch_state_open(path, 1, &allocator, &o, &pouch, &e), &e);
   delta_put(pouch, "before", 16, &e);
@@ -5890,7 +5982,6 @@ static void shared_state_committed_index_failure(const char *path) {
   read_value(pouch, "delta", "before", 59, 16, 1, &e);
   lc_pouch_close(pouch);
   REQUIRE(live == 0 && unlink(path) == 0);
-  shared_state_fixture = 0;
 }
 typedef struct abandoned_producer {
   int notify, started;
@@ -5909,13 +6000,12 @@ static size_t append_then_wait(lc_source *source, void *buffer, size_t bytes,
     pause();
 }
 static void shared_state_child(const char *path, int notify) {
-  ps_pouch_state_options o = options(0, 1);
+  ps_pouch_state_options o = shared_options(0, 1);
   lc_pouch *p = NULL;
   lc_error e = {0};
   lc_pouch_state_write_result result = {0};
   abandoned_producer producer = {notify, 0};
   lc_source source = {0};
-  shared_state_fixture = 1;
   source.impl = &producer;
   source.read = append_then_wait;
   ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
@@ -5926,14 +6016,13 @@ static void shared_state_child(const char *path, int notify) {
 }
 static void shared_state_crash(const char *path) {
   lc_error e = {0};
-  ps_pouch_state_options o = options(0, 1);
+  ps_pouch_state_options o = shared_options(0, 1);
   lc_pouch *p = NULL;
   lc_pouch_state_read_result current = {0};
   lc_pouch_state_write_result w = {0};
   input in = source(41, 1);
   int notify[2], status;
   char byte;
-  shared_state_fixture = 1;
   ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
   ok(put(p, "shared", "key", &in, NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
@@ -5967,7 +6056,6 @@ static void shared_state_crash(const char *path) {
   lc_pouch_close(p);
   REQUIRE(live == 0 && unlink(path) == 0);
   clear(&e);
-  shared_state_fixture = 0;
 }
 typedef struct run {
   const char *path, *directory, *mode;
@@ -5976,6 +6064,8 @@ static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "lifecycle"))
     lifecycle(r->path, r->directory);
+  else if (!strcmp(r->mode, "shared-admission"))
+    shared_admission(r->path);
   else if (!strcmp(r->mode, "shared-state"))
     shared_state(r->path, r->directory);
   else if (!strcmp(r->mode, "shared-state-delta")) {

@@ -11,7 +11,7 @@ static void index_crash_execute(const char *path, int sync, int action,
                                 outbox_crash_io *context, lc_error *e) {
   ps_io io = {context,           outbox_crash_read,    outbox_crash_write,
               outbox_crash_sync, outbox_crash_reserve, NULL};
-  lc_client *client = index_client_admit(path, sync, 0, action != 3, &io,
+  lc_client *client = index_client_admit(path, sync, 0, action != 3, 0, &io,
                                          index_crash_admitted, context, e);
   if (action)
     index_change(client, e);

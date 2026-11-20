@@ -38,7 +38,7 @@ static int index_admit(void *context, const char *path, const lc_allocator *a,
   return rc;
 }
 static lc_client *index_client_admit(const char *path, int sync, int create,
-                                     int indexing, const ps_io *io,
+                                     int indexing, int shared, const ps_io *io,
                                      void (*ready)(void *), void *context,
                                      lc_error *e) {
   char endpoint[1600];
@@ -48,9 +48,9 @@ static lc_client *index_client_admit(const char *path, int sync, int create,
   lc_client *client = NULL;
   index_admission admission = {io, create, ready, context};
   REQUIRE(snprintf(endpoint, sizeof(endpoint),
-                   "pouch://%s?single_writer=true&background_compaction=false&"
+                   "pouch://%s?single_writer=%s&background_compaction=false&"
                    "queue_watch=false&query_engine=index",
-                   path) < (int)sizeof(endpoint));
+                   path, shared ? "false" : "true") < (int)sizeof(endpoint));
   lc_client_config_init(&config);
   lc_pouch_settings_init(&settings);
   settings.set_mask =
@@ -76,14 +76,17 @@ static lc_client *index_client_admit(const char *path, int sync, int create,
   config.allocator = allocator;
   config.pouch_settings = &settings;
   config.pouch_crypto_key = index_codec() & 1 ? index_key : NULL;
-  ok(lc_client_open_with_pouch_factory(&config, index_admit, &admission,
-                                       &client, e),
+  ok(ready ? lc_client_open_with_pouch_factory(&config, index_admit, &admission,
+                                               &client, e)
+           : ps_pouch_client_open(&config, create,
+                                  &(ps_pouch_client_options){.io = io}, &client,
+                                  e),
      e);
   return client;
 }
 static lc_client *index_client(const char *path, int sync, int create,
                                int indexing, const ps_io *io, lc_error *e) {
-  return index_client_admit(path, sync, create, indexing, io, NULL, NULL, e);
+  return index_client_admit(path, sync, create, indexing, 0, io, NULL, NULL, e);
 }
 static lc_pouch *index_pouch(lc_client *client) {
   return ((lc_client_handle *)client)->pouch;
@@ -389,6 +392,82 @@ static void index_verify(lc_client *client, int action, int completed,
     if (completed)
       REQUIRE(indexed == expected[action != 0][i]);
   }
+}
+static void index_shared_lease(lc_client *writer, lc_client *peer,
+                               lc_error *e) {
+  lc_acquire_req request;
+  lc_lease *lease = NULL;
+  lc_pouch_generation base = 0, seq = 0;
+  const char *const staged[] = {"{\"kind\":\"intermediate\"}",
+                                "{\"kind\":\"ready\"}"};
+  ok(lc_pouch_query_index_manifest_seq(index_pouch(peer), index_namespace,
+                                       &base, e),
+     e);
+  REQUIRE(base > 0);
+  lc_acquire_req_init(&request);
+  request.ns = index_namespace;
+  request.key = "one";
+  request.owner = "index-shared";
+  request.ttl_seconds = 300L;
+  ok(lc_acquire(writer, &request, &lease, e), e);
+  for (size_t i = 0; i < sizeof(staged) / sizeof(*staged); ++i) {
+    lc_source *source = NULL;
+    ok(lc_source_from_memory(staged[i], strlen(staged[i]), &source, e), e);
+    ok(lc_lease_update(lease, source, NULL, e), e);
+    lc_source_close(source);
+    ok(index_flush(peer, e), e);
+    ok(lc_pouch_query_index_manifest_seq(index_pouch(peer), index_namespace,
+                                         &seq, e),
+       e);
+    REQUIRE(seq == base &&
+            index_query(peer, "index", index_selectors[0], e) == 1U);
+  }
+  ok(lc_lease_release(lease, NULL, e), e);
+  ok(index_flush(peer, e), e);
+  REQUIRE(index_query(writer, "index", "eq{field=/kind,value=ready}", e) == 1U);
+  REQUIRE(index_query(writer, "index", "eq{field=/kind,value=intermediate}",
+                      e) == 0U);
+}
+static void index_shared(const char *directory) {
+  char path[1400];
+  lc_error e = {0};
+  REQUIRE(snprintf(path, sizeof(path), "%s/index-shared", directory) <
+          (int)sizeof(path));
+  for (int sync = 0; sync <= 1; ++sync) {
+    lc_client *a =
+        index_client_admit(path, sync, 1, 1, 1, NULL, NULL, NULL, &e);
+    lc_client *b =
+        index_client_admit(path, sync, 0, 1, 1, NULL, NULL, NULL, &e);
+    lc_pouch_generation state = 0, indexed = 0;
+    index_seed(a, 1, &e);
+    REQUIRE(index_query(b, "index", index_selectors[0], &e) == 1U);
+    index_shared_lease(b, a, &e);
+    index_change(b, &e);
+    ok(lc_pouch_query_index_manifest_seq(index_pouch(a), index_namespace,
+                                         &indexed, &e),
+       &e);
+    ok(lc_pouch_state_query_index_seq(index_pouch(a), index_namespace, &state,
+                                      &e),
+       &e);
+    REQUIRE(indexed > 0 && indexed < state);
+    ok(index_flush(b, &e), &e);
+    REQUIRE(index_query(a, "index", index_selectors[0], &e) == 4U);
+    index_verify(a, 1, 1, &e);
+    lc_client_close(b);
+    lc_client_close(a);
+    REQUIRE(!live);
+    a = index_client_admit(path, sync, 0, 1, 1, NULL, NULL, NULL, &e);
+    ok(lc_pouch_query_index_manifest_seq(index_pouch(a), index_namespace,
+                                         &indexed, &e),
+       &e);
+    REQUIRE(indexed == state);
+    REQUIRE(index_query(a, "index", index_selectors[0], &e) == 4U);
+    lc_client_close(a);
+    REQUIRE(!live);
+    one_file(path);
+    REQUIRE(!unlink(path));
+  }
+  lc_error_cleanup(&e);
 }
 static int index_immediate_sync(void *context, int fd) {
   (void)context;

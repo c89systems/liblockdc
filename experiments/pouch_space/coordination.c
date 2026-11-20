@@ -11,6 +11,7 @@
 #define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
 #define BUCKETS 67U
 #define STREAM_BASE UINT64_C(8)
+#define INITIALIZE_OFFSET 6U
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
 #define COLLECTION_SLOTS 512U
@@ -64,6 +65,30 @@ int ps_coordination_check(ps_coordination *owner, lc_error *e) {
 }
 int ps_coordination_shared(const ps_coordination *owner) {
   return owner && owner->shared;
+}
+int ps_coordination_initialize(ps_coordination *owner, int create, int acquire,
+                               lc_error *e) {
+  struct flock lock = {0};
+  int rc, reason;
+  if (!owner->shared)
+    return LC_OK;
+  lock.l_type = !acquire ? F_UNLCK : create ? F_WRLCK : F_RDLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = INITIALIZE_OFFSET;
+  lock.l_len = 1;
+  do {
+    rc = owner->io.lock(owner->io.context, owner->fd,
+                        acquire && create ? F_OFD_SETLKW : F_OFD_SETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+  if (rc == 0)
+    return LC_OK;
+  reason = errno;
+  if (acquire && !create && (reason == EAGAIN || reason == EACCES))
+    return fail(e, LC_ERR_PENDING, reason,
+                "container initialization in progress");
+  return fail(e, LC_ERR_TRANSPORT, reason,
+              acquire ? "cannot acquire container initialization authority"
+                      : "cannot release container initialization authority");
 }
 size_t ps_coordination_users(ps_coordination *owner) {
   return owner ? __atomic_load_n(&owner->users, __ATOMIC_ACQUIRE) : 0;
@@ -183,8 +208,11 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
       break;
   }
   if (!rc) {
+    int mode = owner->shared ? LOCK_SH : LOCK_EX;
+    if (!options->wait_lifetime)
+      mode |= LOCK_NB;
     do {
-      rc = flock(fd, (owner->shared ? LOCK_SH : LOCK_EX) | LOCK_NB);
+      rc = flock(fd, mode);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0)
       rc = fail(e,

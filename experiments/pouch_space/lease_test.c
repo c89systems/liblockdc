@@ -32,15 +32,6 @@ static int benchmark_normal, measure_enabled;
 static size_t measured_syncs;
 static double phase_started, phase_elapsed;
 static int shared_lease_fixture;
-int __real_ps_coordination_open(int, const ps_coordination_options *,
-                                ps_coordination **, lc_error *);
-int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
-                                ps_coordination **out, lc_error *e) {
-  ps_coordination_options selected = *options;
-  if (shared_lease_fixture)
-    selected.shared = 1;
-  return __real_ps_coordination_open(fd, &selected, out, e);
-}
 #define REQUIRE(x)                                                             \
   do {                                                                         \
     __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
@@ -274,9 +265,10 @@ static void configure(fixture *f, int native, int sync, int crypto) {
   f->sync = sync;
   f->crypto = crypto;
   REQUIRE(snprintf(f->endpoint, sizeof(f->endpoint),
-                   "pouch://%s?single_writer=true&background_compaction=false&"
+                   "pouch://%s?single_writer=%s&background_compaction=false&"
                    "query_indexing=false&queue_watch=false&query_engine=scan",
-                   f->path) < (int)sizeof(f->endpoint));
+                   f->path, shared_lease_fixture ? "false" : "true") <
+          (int)sizeof(f->endpoint));
   f->endpoints[0] = f->endpoint;
   lc_pouch_settings_init(&f->settings);
   f->settings.set_mask =

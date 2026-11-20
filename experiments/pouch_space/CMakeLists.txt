@@ -33,7 +33,6 @@ if(LOCKDC_BUILD_BENCHMARKS)
   target_include_directories(pouch_space_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_compare PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_compare PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_target(pouch_space_compare)
   add_executable(pouch_space_lifecycle_compare lifecycle_compare.c
@@ -41,7 +40,6 @@ if(LOCKDC_BUILD_BENCHMARKS)
   target_include_directories(pouch_space_lifecycle_compare PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_lifecycle_compare PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_lifecycle_compare PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_lifecycle_compare)
   if(LOCKDC_BUILD_TESTS)
@@ -62,14 +60,16 @@ if(LOCKDC_BUILD_BENCHMARKS)
     endforeach()
   endif()
   if(LOCKDC_BUILD_TESTS)
-    foreach(mode pouch-queue runtime-queue runtime-shared-queue pouch-outbox runtime-outbox runtime-shared-outbox pouch-xa runtime-xa pouch-index runtime-index)
+    foreach(mode pouch-queue runtime-queue pouch-shared-queue runtime-shared-queue
+        pouch-outbox runtime-outbox pouch-shared-outbox runtime-shared-outbox
+        pouch-xa runtime-xa pouch-index runtime-index pouch-shared-index runtime-shared-index)
       foreach(sync 0 1)
         foreach(reopen 0 1)
           set(reopen_args)
           if(reopen)
             set(reopen_args --reopen)
           endif()
-          if(reopen AND mode STREQUAL "runtime-shared-queue")
+          if(reopen AND mode MATCHES "-shared-queue$")
             list(APPEND reopen_args --warm-queues)
           endif()
           add_test(NAME pouch_space_compare_${mode}_${sync}_${reopen}
@@ -445,7 +445,6 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_collection_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_collection_sdk_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_collection_sdk_test PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_collection_sdk_test)
@@ -515,7 +514,6 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_lease_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_lease_test PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
@@ -564,7 +562,7 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(codec RANGE 0 3)
-    foreach(mode index-artifacts index-open-faults index-durability index-recovery index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
+    foreach(mode index-artifacts index-shared index-open-faults index-durability index-recovery index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
       if((codec EQUAL 1 OR codec EQUAL 2) AND mode MATCHES "(faults|crash)$")
         continue()
       endif()
@@ -606,7 +604,6 @@ if(LOCKDC_BUILD_TESTS)
   target_include_directories(pouch_space_pouch_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_pouch_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_pouch_test PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=OPENSSL_init_crypto"
     "LINKER:--wrap=clock_gettime"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
@@ -621,7 +618,7 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_pouch_read-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_lifetime-faults PROPERTIES TIMEOUT 600)
   set_tests_properties(pouch_space_pouch_staging-faults PROPERTIES TIMEOUT 600)
-  foreach(mode staging-active-faults staging-active-recovery-faults shared-state-crash shared-state-delta)
+  foreach(mode staging-active-faults staging-active-recovery-faults shared-admission shared-state-crash shared-state-delta)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()

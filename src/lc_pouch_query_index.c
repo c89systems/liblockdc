@@ -5990,22 +5990,26 @@ int lc_pouch_query_index_operation_begin(lc_pouch *pouch, const char *ns,
                                          const char *operation_id,
                                          lc_pouch_unix_seconds expires_at_unix,
                                          int *started_out, lc_error *error) {
-  int rc;
+  int rc, single_writer;
 
   if (started_out != NULL) {
     *started_out = 0;
   }
   if (pouch == NULL || ns == NULL || ns[0] == '\0' || key == NULL ||
       key[0] == '\0' || !pouch->query_indexing_enabled ||
-      !lc_pouch_single_writer_enabled(pouch) ||
       lc_pouch_query_index_key_is_staged(key)) {
     return LC_OK;
   }
+  single_writer = lc_pouch_single_writer_enabled(pouch);
+  if (!single_writer && pouch->storage.ops == NULL)
+    return LC_OK;
   if (operation_id == NULL || operation_id[0] == '\0') {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch active query-index operation requires an id",
                         NULL, NULL, "pouch");
   }
+  if (!single_writer)
+    return LC_OK;
   if (!pouch->indexer_mutex_initialized) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch active query-index operation requires an "

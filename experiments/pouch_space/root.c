@@ -8,6 +8,7 @@
 #include "namespace.h"
 #include "owned.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <pthread.h>
 #include <string.h>
 #include <zlib.h>
@@ -163,7 +164,7 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   ps_root_options defaults = {0};
   ps_root *root;
   char *key_file = NULL;
-  int rc;
+  int rc, shared = 0;
   if (out)
     *out = NULL;
   if (!path || !*path || !out)
@@ -188,16 +189,24 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
                             &root->crypto, &key_file, error);
   lc_free_with_allocator(&root->crypto_allocator, key_file);
   if (rc == LC_OK)
-    rc = ps_open(path, create, &options->storage, &root->space, error);
+    rc = ps_internal_open(path, create, &options->storage, 1, &root->space,
+                          error);
+  if (rc == LC_OK)
+    shared = ps_coordination_shared(ps_space_coordination(root->space));
   if (rc == LC_OK)
     rc = create ? ps_root_config_write(root, root->crypto, error)
                 : config_read(root, error);
   if (rc == LC_OK)
     rc = reserve_base(root, !create, error);
+  if (rc == LC_OK && !create && shared)
+    rc = ps_root_conversion_run(root, path, options, error);
   if (rc == LC_OK && !create)
     rc = ps_root_namespace_visit(root, recover_namespace, root, error);
-  if (rc == LC_OK && !create)
+  if (rc == LC_OK && !create && !shared)
     rc = ps_root_conversion_run(root, path, options, error);
+  if (rc == LC_OK && create)
+    rc = ps_coordination_initialize(ps_space_coordination(root->space), 1, 0,
+                                    error);
   if (rc != LC_OK) {
     (void)ps_root_close(root, NULL);
     return rc;

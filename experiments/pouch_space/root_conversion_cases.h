@@ -440,6 +440,16 @@ static void root_conversion_crashes(const char *directory, int codec,
     REQUIRE(waitpid(child, &status, 0) == child && WIFSIGNALED(status) &&
             WTERMSIG(status) == SIGKILL);
     f.settings.set_mask &= ~LC_POUCH_SETTING_COMPRESSION;
+    if (strcmp(events[i], "complete")) {
+      f.settings.set_mask |= LC_POUCH_SETTING_SINGLE_WRITER;
+      f.settings.single_writer = 0;
+      REQUIRE(ps_pouch_client_open(&f.config, 0, NULL, &f.client, &f.error) ==
+                  LC_ERR_UNSUPPORTED &&
+              !f.client && f.error.server_code &&
+              !strcmp(f.error.server_code, "pouch_root_conversion_exclusive"));
+      clear(&f.error);
+      f.settings.set_mask &= ~LC_POUCH_SETTING_SINGLE_WRITER;
+    }
     open_client(&f, 0);
     root_check(&f, 8193, !(codec & 2), etags);
     close_store(&f);

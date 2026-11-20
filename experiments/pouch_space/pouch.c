@@ -62,6 +62,7 @@ static int client_runtime_open(void *context, const char *path,
     options.initial_capacity = admission->physical->initial_capacity;
     options.maximum_capacity = admission->physical->maximum_capacity;
     options.io = admission->physical->io;
+    options.coordination_io = admission->physical->coordination_io;
   }
   return ps_pouch_state_open(path, admission->create, allocator, &options, out,
                              e);
@@ -832,12 +833,10 @@ int ps_pouch_state_open(const char *path, int create,
                              options ? &options->logical : NULL, &pouch, e);
   if (rc != LC_OK)
     return rc;
-  if (!pouch->single_writer ||
-      (options && options->logical.crypto_generate_key_file)) {
+  if (options && options->logical.crypto_generate_key_file) {
     lc_pouch_close(pouch);
     return lc_error_set(e, LC_ERR_UNSUPPORTED, 0,
-                        "container state harness requires exclusive mode "
-                        "and no generated key file",
+                        "container roots do not generate external key files",
                         NULL, NULL, "pouch");
   }
   owner = lc_calloc_with_allocator(&pouch->allocator, 1, sizeof(*owner));
@@ -851,12 +850,14 @@ int ps_pouch_state_open(const char *path, int create,
   owner->references = 1;
   memset(&root_options, 0, sizeof(root_options));
   root_options.storage.durable_sync = pouch->durable_sync;
+  root_options.storage.shared = !pouch->single_writer;
   root_options.crypto_allocator = &pouch->allocator;
   root_options.crypto.compression_enabled = !strcmp(pouch->compression, "zlib");
   if (options) {
     root_options.storage.initial_capacity = options->initial_capacity;
     root_options.storage.maximum_capacity = options->maximum_capacity;
     root_options.storage.io = options->io;
+    root_options.storage.coordination_io = options->coordination_io;
     root_options.crypto.key_string = options->logical.crypto_key;
     root_options.crypto.key_file = options->logical.crypto_key_file;
     root_options.compression_explicit = options->logical.compression != NULL;

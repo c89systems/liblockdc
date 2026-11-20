@@ -13,8 +13,8 @@ typedef struct ps_root_options {
   const lc_allocator *crypto_allocator;
   /* Creation uses crypto.compression_enabled. Reopen inherits the stored
    * policy unless explicit. A different explicit policy converts the complete
-   * root before admission. Interrupted conversion finishes its durable target
-   * first, including when the next request is implicit or opposite.
+   * root before exclusive admission. An exclusive reopen finishes interrupted
+   * conversion first, including when the next request is implicit or opposite.
    */
   int compression_explicit;
 } ps_root_options;
@@ -23,18 +23,19 @@ typedef struct ps_namespace_info {
   ps_ref incarnation;
 } ps_namespace_info;
 
-/* One native container owner, with the physical layer's exclusive lifetime
- * lock. Creation requires a new file. Reopen requires committed root metadata;
+/* One native container owner with the requested lifetime coordination mode.
+ * Creation requires a new file. Reopen requires committed root metadata;
  * failed initialization is never silently adopted as another crypto policy.
  * Before returning, reopen recovers every catalogued namespace's canonical
  * suffix and reinstates its checkpoint capacity claims. An unused namespace
  * cannot lose completion capacity to a producer in another namespace. Recovery
  * also registers unclaimed key-deletion requirements before ordinary admission.
  * Recovery errors reject open, with no writable capability or partial owners.
- * Open also completes durable codec-conversion intent before admission. A
- * failed conversion leaves recoverable work and returns no writable root.
+ * Exclusive open also completes durable codec-conversion intent before
+ * admission. Shared open requires a settled, matching codec policy. A failed
+ * conversion leaves recoverable work and returns no writable root.
  * Capacity never grows implicitly; an offline physical owner may explicitly
- * grow the container before retrying. Shared-process ownership is pending. */
+ * grow the container before retrying. */
 int ps_root_open(const char *, int create, const ps_root_options *, ps_root **,
                  lc_error *);
 /* Stop calls before close. Outstanding namespace pins or physical child

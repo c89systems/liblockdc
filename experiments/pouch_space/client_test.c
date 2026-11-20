@@ -2985,6 +2985,8 @@ static void *worker(void *context) {
     xa_faults(r->directory, 0);
   else if (!strcmp(r->mode, "index-artifacts"))
     index_artifacts(r->directory);
+  else if (!strcmp(r->mode, "index-shared"))
+    index_shared(r->directory);
   else if (!strcmp(r->mode, "index-open-faults"))
     index_open_faults(r->directory);
   else if (!strcmp(r->mode, "index-durability"))

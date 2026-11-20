@@ -61,18 +61,7 @@ static int catalog_lock(void *context, int fd, int cmd, struct flock *lock) {
   }
   return rc;
 }
-int __real_ps_coordination_open(int, const ps_coordination_options *,
-                                ps_coordination **, lc_error *);
-int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
-                                ps_coordination **out, lc_error *e) {
-  const ps_coordination_io io = {NULL, catalog_lock};
-  ps_coordination_options selected = *options;
-  if (shared_catalog_mode) {
-    selected.shared = 1;
-    selected.io = &io;
-  }
-  return __real_ps_coordination_open(fd, &selected, out, e);
-}
+static const ps_coordination_io catalog_io = {NULL, catalog_lock};
 static int allocation_armed, allocation_fired;
 static size_t allocation_calls, allocation_fail;
 static pthread_t allocation_thread;
@@ -171,8 +160,10 @@ static void open_client(fixture *f, int create) {
   ps_pouch_client_options physical = {0};
   f->opening_create = create;
   physical.io = f->io;
-  if (shared_catalog_mode)
+  if (shared_catalog_mode) {
     physical.maximum_capacity = PS_DEFAULT_CAPACITY;
+    physical.coordination_io = &catalog_io;
+  }
   if (f->worker_mode)
     ok(lc_client_open_with_pouch_factory(&f->config, background_factory, f,
                                          &f->client, &f->error),
@@ -210,9 +201,10 @@ static void setup_io_mode(fixture *f, const char *directory, int codec,
   REQUIRE(snprintf(f->path, sizeof(f->path), "%s/root-%zu", directory,
                    roots++) > 0);
   REQUIRE(snprintf(f->endpoint, sizeof(f->endpoint),
-                   "pouch://%s?single_writer=true&background_compaction=%s&"
+                   "pouch://%s?single_writer=%s&background_compaction=%s&"
                    "query_indexing=%s&queue_watch=false&query_engine=scan",
-                   f->path, worker_mode ? "true" : "false",
+                   f->path, shared_catalog_mode ? "false" : "true",
+                   worker_mode ? "true" : "false",
                    query_mode ? "true" : "false") > 0);
   f->endpoints[0] = f->endpoint;
   lc_client_config_init(&f->config);
@@ -305,6 +297,7 @@ static void catalog_wait(int state) {
 }
 static void shared_catalog(const char *directory, int codec, int sync) {
   fixture f;
+  ps_pouch_client_options physical = {0};
   catalog_creator first = {0}, second = {0};
   lc_collection_config config;
   lc_collection *other = NULL;
@@ -316,7 +309,8 @@ static void shared_catalog(const char *directory, int codec, int sync) {
   int present;
   setup(&f, directory, codec, sync, 0);
   first.client = f.client;
-  ok(ps_pouch_client_open(&f.config, 0, NULL, &second.client, &f.error),
+  physical.coordination_io = &catalog_io;
+  ok(ps_pouch_client_open(&f.config, 0, &physical, &second.client, &f.error),
      &f.error);
   peer = ((lc_client_handle *)second.client)->pouch;
   root = ps_pouch_state_root(peer);
@@ -437,10 +431,12 @@ static void reclaim_after_exit(const char *path, ps_root *peer, lc_error *e) {
   REQUIRE(child >= 0);
   if (!child) {
     ps_space *space = NULL;
+    ps_options options = {0};
     ps_owned_run *run = NULL;
     int found;
     REQUIRE(!close(ready[0]));
-    ok(ps_open(path, 0, NULL, &space, e), e);
+    options.shared = 1;
+    ok(ps_open(path, 0, &options, &space, e), e);
     ok(ps_owned_open(space, NULL, key, 1, NULL, &head, &owned, e), e);
     ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, e), e);
     REQUIRE(found && run);

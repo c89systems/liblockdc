@@ -31,16 +31,6 @@
 /* Time the real synchronization calls of both engines in this executable,
  * without clocks or profiling modes in the storage implementation. */
 static uint64_t fd_sync_calls, full_sync_calls, syscall_sync_ns;
-static int shared_fixture;
-int __real_ps_coordination_open(int, const ps_coordination_options *,
-                                ps_coordination **, lc_error *);
-int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
-                                ps_coordination **out, lc_error *e) {
-  ps_coordination_options selected = *options;
-  if (shared_fixture)
-    selected.shared = 1;
-  return __real_ps_coordination_open(fd, &selected, out, e);
-}
 int __real_fdatasync(int);
 int __real_fsync(int);
 static int timed_sync(int fd, int data_only) {
@@ -635,7 +625,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
       LC_POUCH_SETTING_QUERY_ENGINE;
   settings.durable_sync = c->sync;
   settings.segment_target_bytes = c->compaction ? 65536U : PS_MIB;
-  if (c->peers && !c->runtime) {
+  if (c->peers) {
     settings.set_mask |= LC_POUCH_SETTING_SINGLE_WRITER;
     settings.single_writer = 0;
   }
@@ -1355,8 +1345,8 @@ int main(int argc, char **argv) {
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
-  shared_fixture = !strcmp(argv[1], "runtime-shared-collection");
-  c.peers = shared_fixture || !strcmp(argv[1], "pouch-peer-collection");
+  c.peers = !strcmp(argv[1], "runtime-shared-collection") ||
+            !strcmp(argv[1], "pouch-peer-collection");
   c.sdk = strstr(argv[1], "-sdk-") != NULL;
   c.namespace_maintenance = strstr(argv[1], "maintain") != NULL;
   c.compaction = strstr(argv[1], "compact") != NULL || c.namespace_maintenance;
