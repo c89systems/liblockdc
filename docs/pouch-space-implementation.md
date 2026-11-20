@@ -16,7 +16,7 @@ Current implementation and acceptance status:
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), and [fixed-capacity simultaneous producers](#transaction-authority-for-independent-producers) | 10 MiB alternating and simultaneous fixtures qualified. Namespace handoff tails, larger envelopes and concurrent terminal operations remain open. |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants) | Cold replay cost and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
@@ -8962,3 +8962,69 @@ respectively. Durable outbox reopen had a median paired change of +5.05 ms and
 foreground work +66.39 ms. Outbox foreground work was faster in three of six
 pairs. These samples leave the outbox timing effect uncertain. Results are
 under the `grant-record-` prefix in `build/pouch-space-concurrent/`.
+
+## Indexed churn and piece durability
+
+The matched lifecycle fixture now runs two independently opened writers and
+one background maintenance owner through twelve revisions of sixteen 64 KiB
+state values. The writers keep the same keys and stream 12 MiB of new bodies
+between them, so the 10 MiB native container must recycle space during foreground
+work. The fixture checks each revision's explicit index flush, results for the
+current and superseded values on both query passes, and the last published
+manifest and streamed bytes after close and reopen. Native admission checks
+the physical capacity and records foreground checkpoints.
+
+The first GNU baseline failed a durable workload with a local authority
+timeout. The Debug reproduction stopped at the same error during index
+readiness. Its stack shows the maintenance worker holding logical namespace
+and stream edit authority while a piece discard waited for shared sync
+leadership. An unrelated writer held that leadership in `fdatasync` while
+preparing an owned grant.
+
+The piece selector still validates exact predecessor identity and current
+canonical liveness under namespace and stream edit authority. It selects the
+complete replacement mapping there and releases the guards before waiting for
+durability. A ready replacement or discard admits fresh captures of surviving
+logical ranges. The old mapping stays recoverable until physical checkpoint
+retirement, and captured readers retain independent pins. A relocation is
+acknowledged after its barrier. Stream seal, stream retirement and catalog
+changes still use their durable visibility boundaries.
+
+The paused-sync fixture proves that a separate owner can acquire both guards
+and capture an installed replacement or discard ahead of durability. The
+old pin still reads its original bytes. Both durability policies exercise
+both selection cases. Structural replay verifies the same visibility rule
+through a checkpoint. The existing repack I/O and allocation fault sweeps
+and namespace tail-recovery checks still pass.
+
+Debug passed 15 distinct affected checks. GNU and musl Release passed 23 each,
+including indexed recovery for plaintext and combined-codec roots, codec
+conversion and fixed-capacity concurrent messaging. Both release builds
+completed the four indexed churn profiles. The Pouch and source-manifest
+boundary checks also passed.
+
+The alternating GNU comparison verified 22 of 24 attempts. The current
+single-file and multifile builds completed every attempt. Two of four prior
+durable attempts stopped on namespace mapping or file authority contention.
+The table reports medians in milliseconds over successful attempts in the
+order prior single-file (`392738a9`), current single-file and multifile.
+Each policy and build has four samples except prior durable, which has two.
+
+| Workload | Work | Per-item p95 | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 2287.01 / 2028.09 / 1422.14 | 51.39 / 53.20 / 22.25 | 204.02 / 208.02 / 263.95 | 49.37 / 23.00 / 99.20 | 28.22 / 20.25 / 123.10 |
+| Durable | 5912.25 / 5296.30 / 4774.42 | 109.55 / 100.04 / 71.87 | 140.49 / 169.23 / 207.65 | 39.72 / 42.79 / 140.88 | 1.71 / 17.89 / 160.08 |
+
+| Workload | Close | Cold reopen | Verify after reopen | Lifecycle sync calls |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 1.80 / 10.63 / 0.81 | 13.50 / 13.74 / 0.58 | 5.97 / 6.61 / 6.01 | 343 / 275 / 124 |
+| Durable | 7.49 / 1.70 / 0.82 | 12.97 / 15.19 / 0.65 | 5.50 / 6.15 / 6.20 | 1301 / 1216 / 796 |
+
+Current single-file work was 43% longer on NoSync and 11% longer on durable
+roots compared with multifile, while explicit flush and both query passes
+completed sooner. Foreground checkpoints ranged from 8 to 19. Allocation
+at the end of foreground work ranged from 2,617,344 to 4,874,240 bytes.
+The benchmark isolates a shorter relocation handoff and leaves foreground
+mutation barriers and cold replay as costs to address. Logs, unsuccessful
+attempts and the baseline stack are under the `index-reclaim-` prefix in
+`build/pouch-space-concurrent/`.

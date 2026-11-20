@@ -6,6 +6,7 @@
 #include "lc_pouch_query_index.h"
 #include "lc_xa_internal.h"
 #include "pouch.h"
+#include "pouch_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <openssl/evp.h>
@@ -37,13 +38,14 @@ typedef struct worker {
   double index_seconds;
   index_phase mutations;
   lc_index_seq index_seq;
+  char revision;
   index_phase index_phases[3], reopen_phases[2];
   int result;
 } worker;
 struct comparison {
   size_t rows, bytes, writers, rounds;
   int container, outbox, xa, index, sync, started, preopened, stable_index;
-  int shared, warm_queues;
+  int shared, warm_queues, reclaim;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -54,10 +56,12 @@ struct comparison {
 typedef struct producer {
   lc_source source;
   size_t size, offset;
+  char revision;
 } producer;
 typedef struct consumer {
   lc_sink sink;
   size_t size, offset;
+  char revision;
 } consumer;
 static uint64_t data_syncs, full_syncs;
 static double sync_seconds;
@@ -129,12 +133,17 @@ static size_t number(const char *text, size_t minimum, size_t maximum) {
           "invalid numeric argument");
   return (size_t)result;
 }
-static unsigned char byte_at(size_t offset, size_t size) {
-  static const unsigned char prefix[] = "{\"v\":\"";
-  return offset < sizeof(prefix) - 1U ? prefix[offset]
-         : offset == size - 2U        ? '"'
-         : offset == size - 1U        ? '}'
-                                      : (unsigned char)('a' + offset % 26U);
+static unsigned char byte_at(size_t offset, size_t size, char revision) {
+  const char *prefix = revision ? "{\"r\":\"a\",\"v\":\"" : "{\"v\":\"";
+  size_t prefix_bytes = revision ? sizeof("{\"r\":\"a\",\"v\":\"") - 1U
+                                 : sizeof("{\"v\":\"") - 1U;
+  if (revision && offset == 6U)
+    return (unsigned char)revision;
+  if (offset < prefix_bytes)
+    return (unsigned char)prefix[offset];
+  return offset == size - 2U   ? '"'
+         : offset == size - 1U ? '}'
+                               : (unsigned char)('a' + offset % 26U);
 }
 static size_t produce(lc_source *self, void *bytes, size_t size, lc_error *e) {
   producer *source = self->impl;
@@ -144,7 +153,8 @@ static size_t produce(lc_source *self, void *bytes, size_t size, lc_error *e) {
   if (size > source->size - source->offset)
     size = source->size - source->offset;
   for (size_t i = 0U; i < size; ++i)
-    ((unsigned char *)bytes)[i] = byte_at(source->offset + i, source->size);
+    ((unsigned char *)bytes)[i] =
+        byte_at(source->offset + i, source->size, source->revision);
   source->offset += size;
   return size;
 }
@@ -159,7 +169,7 @@ static int consume(lc_sink *self, const void *bytes, size_t size, lc_error *e) {
   const unsigned char *data = bytes;
   int valid = size <= sink->size - sink->offset;
   for (size_t i = 0U; valid && i < size; ++i)
-    valid = data[i] == byte_at(sink->offset + i, sink->size);
+    valid = data[i] == byte_at(sink->offset + i, sink->size, sink->revision);
   if (!valid) {
     lc_error_set(e, LC_ERR_PROTOCOL, 0L, "benchmark payload differs", NULL,
                  NULL, "pouch");
@@ -179,7 +189,7 @@ static void payload_digest(comparison *run) {
     size_t count =
         run->bytes - at < sizeof(scratch) ? run->bytes - at : sizeof(scratch);
     for (size_t i = 0U; i < count; ++i)
-      scratch[i] = byte_at(at + i, run->bytes);
+      scratch[i] = byte_at(at + i, run->bytes, 0);
     require(EVP_DigestUpdate(context, scratch, count) == 1, "digest update");
     at += count;
   }
@@ -220,6 +230,7 @@ static void open_store(comparison *run, int create, lc_error *e) {
   settings.compression = "none";
   settings.query_engine = run->index ? "index" : "scan";
   settings.query_indexing_enabled = run->index;
+  settings.background_compaction_enabled = run->reclaim;
   if (run->index) {
     settings.set_mask |= LC_POUCH_SETTING_INDEXER_FLUSH_DOCS |
                          LC_POUCH_SETTING_INDEXER_FLUSH_INTERVAL_SECONDS;
@@ -235,6 +246,7 @@ static void open_store(comparison *run, int create, lc_error *e) {
             ? ps_pouch_client_open(&config, create, NULL, &run->client, e)
             : lc_client_open(&config, &run->client, e),
         e);
+  settings.background_compaction_enabled = 0;
   for (size_t i = 0U; run->shared && i < run->writers; ++i) {
     lc_client **producer = &run->workers[i].producer_client;
     check(run->container ? ps_pouch_client_open(&config, 0, NULL, producer, e)
@@ -459,15 +471,21 @@ static void *run_worker(void *context) {
     pthread_cond_wait(&run->condition, &run->mutex);
   pthread_mutex_unlock(&run->mutex);
   w->result = LC_OK;
+  const char *phase = "mutation";
   for (size_t round = 0U; round < run->rounds && w->result == LC_OK; ++round) {
+    phase = "mutation";
+    if (run->reclaim)
+      w->revision = (char)('a' + round);
     index_phase_begin(&w->mutations);
     for (size_t row = w->ordinal; row < run->rows && w->result == LC_OK;
          row += run->writers) {
       producer source;
       consumer sink;
       producer_init(&source, run->bytes);
+      source.revision = w->revision;
       memset(&sink, 0, sizeof(sink));
       sink.size = run->bytes;
+      sink.revision = w->revision;
       sink.sink.impl = &sink;
       sink.sink.write = consume;
       double start = now(CLOCK_MONOTONIC);
@@ -482,19 +500,22 @@ static void *run_worker(void *context) {
     }
     index_phase_end(&w->mutations);
     if (w->result == LC_OK && run->index) {
+      phase = "index readiness";
       double start = now(CLOCK_MONOTONIC);
       w->result = index_queries(w, 1, &e);
       w->index_seconds += now(CLOCK_MONOTONIC) - start;
     }
   }
   if (w->result == LC_OK && run->outbox) {
+    phase = "outbox cleanup";
     lc_outbox_job *job = NULL;
     w->result =
         lc_outbox_dispatcher_next_with_state(w->dispatcher, 0L, &job, &e);
     require(!job, "stateful cleanup probe has no remaining delivery");
   }
   if (w->result != LC_OK)
-    fprintf(stderr, "worker %lu: %s [%s]\n", (unsigned long)w->ordinal,
+    fprintf(stderr, "worker %zu in %s (revision %c), error %d: %s [%s]\n",
+            w->ordinal, phase, w->revision ? w->revision : '-', w->result,
             e.message ? e.message : "", e.server_code ? e.server_code : "");
   lc_error_cleanup(&e);
   return NULL;
@@ -602,12 +623,13 @@ int main(int argc, char **argv) {
       work_seconds, maintenance_started, preopen_seconds = 0.0;
   index_phase maintenance = {0}, closing = {0}, reopening = {0},
               verification = {0};
+  ps_stats native_work = {0};
   uint64_t measured_syncs, files;
   double measured_sync_seconds;
   struct rusage usage;
   require(argc >= 7,
           "MODE DIRECTORY ROWS BYTES SYNC WRITERS [--reopen] [--rounds N] "
-          "[--stable-index] [--warm-queues]");
+          "[--stable-index] [--warm-queues] [--reclaim]");
   require(
       !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
           !strcmp(argv[1], "runtime-shared-queue") ||
@@ -636,6 +658,8 @@ int main(int argc, char **argv) {
       run.stable_index = 1;
     else if (!strcmp(argv[i], "--warm-queues") && !run.warm_queues)
       run.warm_queues = 1;
+    else if (!strcmp(argv[i], "--reclaim") && !run.reclaim)
+      run.reclaim = 1;
     else
       require(0, "unknown or incomplete comparison option");
   }
@@ -648,10 +672,15 @@ int main(int argc, char **argv) {
   run.bytes = number(argv[4], 64U, PS_MIB);
   run.sync = (int)number(argv[5], 0U, 1U);
   run.writers = number(argv[6], 1U, 16U);
-  require(run.writers <= run.rows &&
-              run.rows * (run.bytes + 8192U) * run.rounds * 4U <
-                  PS_DEFAULT_CAPACITY - PS_DATA,
+  require(run.writers <= run.rows && run.rows * (run.bytes + 8192U) *
+                                             (run.reclaim ? 1 : run.rounds) *
+                                             4U <
+                                         PS_DEFAULT_CAPACITY - PS_DATA,
           "10 MiB development capacity");
+  require(!run.reclaim ||
+              (run.shared && run.index && run.writers >= 2U &&
+               run.rows * run.bytes * run.rounds > PS_DEFAULT_CAPACITY),
+          "reclaim requires shared indexed input exceeding 10 MiB");
   require(
       snprintf(pattern, sizeof(pattern), "%s/queue-outbox-XXXXXX", argv[2]) > 0,
       "fixture path");
@@ -718,6 +747,14 @@ int main(int argc, char **argv) {
   maintenance_started = now(CLOCK_MONOTONIC);
   index_phase_begin(&maintenance);
   lc_pouch *pouch = ((lc_client_handle *)run.client)->pouch;
+  if (run.reclaim && run.container) {
+    check(
+        ps_status(ps_root_space(ps_pouch_state_root(pouch)), &native_work, &e),
+        &e);
+    require(native_work.capacity == PS_DEFAULT_CAPACITY &&
+                native_work.checkpoints > 0,
+            "native root reclaimed within 10 MiB during indexed work");
+  }
   if (run.xa) {
     size_t retired = 0U;
     check(lc_pouch_client_xa_retire(run.client, 0L, 0U, &retired, &e), &e);
@@ -741,6 +778,11 @@ int main(int argc, char **argv) {
   files = count_files(store);
   if (run.container)
     require(files == 1U, "one persistent container file");
+  if (run.reclaim && run.container) {
+    struct stat status;
+    require(!stat(store, &status) && status.st_size == PS_DEFAULT_CAPACITY,
+            "native root retained fixed physical capacity");
+  }
   index_phase_begin(&reopening);
   open_store(&run, 0, &e);
   index_phase_end(&reopening);
@@ -816,7 +858,8 @@ int main(int argc, char **argv) {
       "index_repeat_pass_sync_calls=%llu index_flush_sync_ms=%.6f "
       "index_first_pass_sync_ms=%.6f index_repeat_pass_sync_ms=%.6f "
       "reopen_first_pass_ms=%.6f reopen_repeat_pass_ms=%.6f "
-      "indexed_queries=%zu verified=1\n",
+      "indexed_queries=%zu reclaim=%d work_checkpoints=%llu "
+      "work_allocated_bytes=%llu verified=1\n",
       argv[1], run.rows, run.bytes, run.writers, run.sync, run.preopened,
       run.rounds, run.stable_index, run.warm_queues, lifecycle_seconds * 1e3,
       cpu_seconds * 1e3, run.latencies[(run.rows * run.rounds - 1U) / 2U] * 1e3,
@@ -838,7 +881,9 @@ int main(int argc, char **argv) {
       (unsigned long long)phase_sync_calls[2], phase_sync_seconds[0] * 1e3,
       phase_sync_seconds[1] * 1e3, phase_sync_seconds[2] * 1e3,
       reopen_phase_seconds[0] * 1e3, reopen_phase_seconds[1] * 1e3,
-      run.index ? run.writers * 6U * run.rounds : 0U);
+      run.index ? run.writers * 6U * run.rounds : 0U, run.reclaim,
+      (unsigned long long)native_work.checkpoints,
+      (unsigned long long)native_work.allocated_bytes);
   lc_error_cleanup(&e);
   sync_phase_key_initialized = 0;
   require(!pthread_key_delete(sync_phase_key), "close sync attribution key");

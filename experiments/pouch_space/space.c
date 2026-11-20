@@ -3413,8 +3413,9 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
     return rc;
   }
   /* Ready frames establish allocator ownership in journal order. Catalog
-   * visibility and new admissions to changed streams use the durable clock.
-   * Retired extents still belong to the old root or its captured readers. */
+   * visibility and stream seal/retirement use the durable clock. Piece maps
+   * preserve live bytes and can be captured at the ready prefix. Retired
+   * extents still belong to the old root or its captured readers. */
   if (group)
     rc = decode_revision(s, wire, bytes, NULL, &entries, error);
   else {
@@ -3589,7 +3590,6 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         if (!old || old->deleted || !head ||
             p->stream_capacity != old->stream_capacity)
           return err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch");
-        head->stream_structure_wire = wire;
       } else {
         if (old && !old->deleted)
           return err(error, LC_ERR_PROTOCOL,
@@ -3650,7 +3650,6 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
       if (!head || !head->stream_runs)
         return err(error, LC_ERR_PROTOCOL, "piece removal has no head");
       --head->stream_runs;
-      head->stream_structure_wire = wire;
       if (!head->dirty_link)
         dirty_entry(s, head, NULL);
     }
@@ -4810,7 +4809,8 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   }
   return rc;
 }
-int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
+static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
+                         lc_error *error) {
   ps_space *s;
   ps_entry *old;
   size_t prior;
@@ -4869,13 +4869,20 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
     w->failed = 1;
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && durable)
-    rc = wait_durable(s, sequence, error);
+  if (rc == LC_OK) {
+    if (ready)
+      *ready = sequence;
+    else if (durable)
+      rc = wait_durable(s, sequence, error);
+  }
   if (rc == LC_OK && ref)
     *ref = published_ref;
   if (rc != LC_OK)
     w->failed = 1;
   return rc;
+}
+int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
+  return publish_value(w, ref, NULL, error);
 }
 int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
                             lc_error *error) {
@@ -5992,8 +5999,8 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
       head->entry->stream_complete_generation &&
       head->entry->stream_complete_generation == head->space->generation;
 }
-/* Existing run handles already own immutable mappings. A new admission must
- * use durable geometry even when allocator replay has advanced beyond it. */
+/* Existing run handles already own immutable mappings. New admissions fence
+ * a seal or stream retirement until it is durable. */
 static int stream_structure_ready(ps_space *s, const ps_entry *head,
                                   lc_error *error) {
   return head && head->stream_structure_wire > s->peer_durable
@@ -7021,6 +7028,7 @@ typedef struct piece_selection {
   ps_owned_head *head;
   ps_entry *old, *tombstone;
   ps_writer *writer;
+  uint64_t sequence;
   int published;
 } piece_selection;
 uint64_t ps_owned_run_storage(const ps_owned_run *run) {
@@ -7063,7 +7071,7 @@ static int piece_publish(void *context, lc_error *error) {
   if (selection->published)
     return err(error, LC_ERR_INVALID, "piece publication already selected");
   if (selection->writer) {
-    rc = ps_publish(selection->writer, NULL, error);
+    rc = publish_value(selection->writer, NULL, &selection->sequence, error);
     selection->published = selection->writer->published;
     return rc;
   }
@@ -7088,11 +7096,12 @@ static int piece_publish(void *context, lc_error *error) {
     dirty_entry(s, tombstone, old);
     install(s, tombstone);
     selection->tombstone = NULL;
+    selection->sequence = sequence;
     selection->published = 1;
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+  return rc;
 }
 static int piece_select(piece_selection *selection, ps_piece_select_fn select,
                         void *context, lc_error *error) {
@@ -7100,6 +7109,11 @@ static int piece_select(piece_selection *selection, ps_piece_select_fn select,
                   : piece_publish(selection, error);
   if (rc == LC_OK && !selection->published)
     rc = err(error, LC_ERR_PROTOCOL, "piece selector omitted publication");
+  /* The owner has released liveness and stream edit authority. Both maps
+   * represent the same live bytes, and the old extents stay protected by
+   * physical checkpoint ordering and existing capture pins. */
+  if (rc == LC_OK)
+    rc = wait_durable(selection->head->space, selection->sequence, error);
   if (rc != LC_OK && selection->published)
     __atomic_store_n(&selection->head->space->poisoned, 1, __ATOMIC_RELAXED);
   return rc;

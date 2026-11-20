@@ -84,9 +84,15 @@ static int index_queries(worker *w, int flush, lc_error *e) {
       "{\"exists\":\"/v\"}",
       "{\"prefix\":{\"field\":\"/v\",\"value\":\"ghij\"}}",
       "{\"icontains\":{\"field\":\"/...\",\"value\":\"UVWXYZ\"}}"};
+  char current[48], previous[48];
   lc_index_flush_req request;
   lc_index_flush_res result = {0};
   uint64_t expected = 0U;
+  if (w->revision) {
+    snprintf(current, sizeof(current), "eq{field=/r,value=%c}", w->revision);
+    snprintf(previous, sizeof(previous), "eq{field=/r,value=%c}",
+             w->revision == 'a' ? 'z' : w->revision - 1);
+  }
   lc_index_flush_req_init(&request);
   request.ns = w->ns;
   request.mode = "sync";
@@ -130,12 +136,16 @@ static int index_queries(worker *w, int flush, lc_error *e) {
       lc_query_req_init(&query);
       query.ns = w->ns;
       query.engine = "index";
-      query.selector_json = selectors[i];
+      if (w->revision && i)
+        query.selector_lql = i == 1U ? current : previous;
+      else
+        query.selector_json = selectors[i];
       rc = lc_query_keys(w->run->client, &query, &handler, &keys, &queried, e);
       if (rc == LC_OK)
-        require(keys.seen == expected && queried.metadata_json &&
+        require(keys.seen == (w->revision && i == 2U ? 0U : expected) &&
+                    queried.metadata_json &&
                     strstr(queried.metadata_json, "\"engine\":\"index\""),
-                "indexed query covers every streamed record");
+                "indexed query matches the current revision");
       if (rc == LC_OK)
         ++phase->queries;
       lc_query_res_cleanup(&queried);
@@ -152,6 +162,8 @@ static void index_verify_reopen(worker *w, lc_error *e) {
   check(lc_pouch_query_index_manifest_seq(pouch, w->ns, &indexed, e), e);
   require(state == indexed && state > 0U,
           "published index survives cold reopen");
+  if (w->revision)
+    require(indexed == w->index_seq, "cold reopen retains last explicit flush");
   check(index_queries(w, 0, e), e);
   for (size_t row = w->ordinal; row < run->rows; row += run->writers) {
     lc_get_res result = {0};
@@ -161,6 +173,7 @@ static void index_verify_reopen(worker *w, lc_error *e) {
     sink.sink.impl = &sink;
     sink.sink.write = consume;
     sink.size = run->bytes;
+    sink.revision = w->revision;
     check(lc_get_in_namespace(run->client, w->ns, key, NULL, &sink.sink,
                               &result, e),
           e);

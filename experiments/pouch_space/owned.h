@@ -109,9 +109,10 @@ typedef struct ps_owned_range {
 uint64_t ps_owned_run_storage(const ps_owned_run *);
 int ps_owned_run_matches(const ps_owned_run *, const ps_owned_range *, size_t);
 typedef int (*ps_piece_publish_fn)(void *, lc_error *);
-/* Runs the supplied publication exactly once while holding canonical liveness
+/* Runs the supplied selection exactly once while holding canonical liveness
  * authority, after copying has finished. Reject stale captured liveness before
- * invoking it; return its result unchanged. NULL selects directly. */
+ * invoking it, then return its result unchanged. The repack waits for
+ * durability after the selector returns. NULL selects directly. */
 typedef int (*ps_piece_select_fn)(void *, ps_piece_publish_fn, void *,
                                   lc_error *);
 /* Replace one completed bounded piece with its sorted coalesced live ranges.

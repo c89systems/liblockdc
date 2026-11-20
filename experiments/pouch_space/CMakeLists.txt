@@ -43,6 +43,16 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_lifecycle_compare)
   if(LOCKDC_BUILD_TESTS)
+    foreach(mode pouch-shared-index runtime-shared-index)
+      foreach(sync 0 1)
+        add_test(NAME pouch_space_compare_${mode}_reclaim_${sync}
+          COMMAND pouch_space_lifecycle_compare ${mode}
+            ${CMAKE_CURRENT_BINARY_DIR} 16 65536 ${sync} 2 --reopen --rounds 12
+            --stable-index --reclaim)
+        set_tests_properties(pouch_space_compare_${mode}_reclaim_${sync}
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endforeach()
+    endforeach()
     foreach(mode pouch-index runtime-index)
       foreach(sync 0 1)
         add_test(NAME pouch_space_compare_${mode}_churn_${sync}
@@ -121,7 +131,7 @@ if(LOCKDC_BUILD_TESTS)
       readiness-faults journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants
-      stream-handoff stream-handoff-faults stream-takeover)
+      stream-handoff stream-handoff-faults stream-takeover piece-barrier-handoff)
     add_test(NAME pouch_space_live-allocator_${mode}
       COMMAND pouch_space_live_allocator_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_live-allocator_${mode} PROPERTIES TIMEOUT 120

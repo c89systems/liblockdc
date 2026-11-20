@@ -3751,6 +3751,20 @@ static void ready_structural_stream(int rollover) {
       observer = NULL;
       ok(ps_catalog_visit_orphans(peer, find_orphan, &orphan, &e), &e);
       REQUIRE(!orphan.found);
+    } else if (edit.action == STRUCTURAL_REPACK ||
+               edit.action == STRUCTURAL_DROP_PIECE) {
+      int kept = edit.action == STRUCTURAL_REPACK;
+      ok(ps_owned_status_capture(observer, &info, &e), &e);
+      REQUIRE(info.runs == (uint64_t)kept && info.sealed && !info.retired);
+      ok(ps_owned_grant(observer, NULL, 0, 0, &current, &found, &e), &e);
+      REQUIRE(found == kept);
+      if (kept) {
+        REQUIRE(ps_owned_run_mapped(current));
+        ok(ps_owned_read(current, 100, bytes, 100, &e), &e);
+        REQUIRE(bytes[0] == 's' && bytes[99] == 's');
+        ps_owned_run_close(current);
+        current = NULL;
+      }
     } else {
       REQUIRE(ps_owned_status_capture(observer, &info, &e) == LC_ERR_PENDING);
       lc_error_cleanup(&e);
@@ -4431,6 +4445,100 @@ static int reject_stream_publish(void *context, uint64_t tail, lc_error *e) {
   REQUIRE(ps_stream_begin(peer, &blocked, e) == LC_ERR_PENDING && !blocked);
   return LC_ERR_PENDING;
 }
+typedef struct piece_barrier_work {
+  ps_space *space;
+  ps_stream *stream;
+  int discard;
+} piece_barrier_work;
+static int select_piece_under_namespace(void *context,
+                                        ps_piece_publish_fn publish,
+                                        void *publication, lc_error *e) {
+  piece_barrier_work *work = context;
+  ps_coordination_guard *guard = NULL;
+  int rc =
+      ps_coordination_lock(ps_space_coordination(work->space),
+                           PS_COORDINATION_NAMESPACE_STATE, 31, 0, &guard, e);
+  if (rc == LC_OK)
+    rc = publish(publication, e);
+  ps_coordination_unlock(guard);
+  return rc;
+}
+static void *replace_piece_at_barrier(void *context) {
+  piece_barrier_work *work = context;
+  ps_owned_range retained = {0, 1};
+  lc_error e = {0};
+  ok(ps_stream_piece_repack(
+         work->stream, 0, NULL, work->discard ? NULL : &retained,
+         work->discard ? 0 : 1, select_piece_under_namespace, work, &e),
+     &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void piece_barrier_handoff(int durable, int discard) {
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_stream *x = NULL, *y = NULL;
+  ps_stream_window *original = NULL, *current = NULL;
+  ps_coordination_guard *state = NULL, *edit = NULL;
+  ps_readiness_certificate certificate;
+  ps_stream_info info;
+  ps_stream_piece_info piece;
+  pthread_t thread;
+  int found = 0;
+  char byte;
+  lc_error e = {0};
+  options.durable_sync = durable;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_stream_open(a, NULL, tail_stream(), 1, NULL, NULL, NULL, &x, &e), &e);
+  append_byte(x, 0, "a", &e);
+  ok(ps_stream_seal(x, &e), &e);
+  ok(ps_stream_status(x, &info, &e), &e);
+  REQUIRE(info.runs == 1);
+  ok(ps_stream_window_open(x, 0, 1, &original, &e), &e);
+  options.io = NULL;
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  piece_barrier_work work = {a, x, discard};
+  gate.paused = 1;
+  REQUIRE(!pthread_create(&thread, NULL, replace_piece_at_barrier, &work));
+  wait_catalog_sync(&gate);
+  certificate = readiness(a);
+  REQUIRE(certificate.durable < certificate.ready);
+  ok(ps_coordination_lock(ps_space_coordination(b),
+                          PS_COORDINATION_NAMESPACE_STATE, 31, 0, &state, &e),
+     &e);
+  ok(ps_coordination_lock(ps_space_coordination(b), PS_COORDINATION_STREAM,
+                          info.ref.incarnation, 0, &edit, &e),
+     &e);
+  ps_coordination_unlock(edit);
+  ps_coordination_unlock(state);
+  ok(ps_stream_open(b, NULL, tail_stream(), 0, NULL, NULL, NULL, &y, &e), &e);
+  ok(ps_stream_piece_next(y, 0, &piece, &found, &e), &e);
+  REQUIRE(found == !discard);
+  if (!discard) {
+    REQUIRE(piece.mapped);
+    ok(ps_stream_window_open(y, 0, 1, &current, &e), &e);
+    ok(ps_stream_window_read(current, 0, &byte, 1, &e), &e);
+    REQUIRE(byte == 'a');
+    ps_stream_window_close(current);
+  }
+  ok(ps_stream_window_read(original, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == 'a');
+  finish_catalog_sync(&gate, thread);
+  certificate = readiness(a);
+  REQUIRE(certificate.durable == certificate.ready);
+  ps_stream_window_close(original);
+  ok(ps_stream_close(y, &e), &e);
+  ok(ps_stream_close(x, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
+}
 static void stream_abort_and_cold_open(void) {
   lc_error e = {0};
   ps_options options = {0};
@@ -4754,6 +4862,10 @@ int main(int argc, char **argv) {
     stream_handoff(0);
     stream_handoff(1);
     stream_abort_and_cold_open();
+  } else if (!strcmp(argv[2], "piece-barrier-handoff")) {
+    for (int durable = 0; durable <= 1; ++durable)
+      for (int discard = 0; discard <= 1; ++discard)
+        piece_barrier_handoff(durable, discard);
   } else if (!strcmp(argv[2], "stream-handoff-faults"))
     stream_handoff_faults();
   else if (!strcmp(argv[2], "stream-takeover"))
