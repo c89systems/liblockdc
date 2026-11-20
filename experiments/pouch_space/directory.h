@@ -31,16 +31,24 @@ typedef struct ps_directory_pages {
 typedef int (*ps_directory_visit_fn)(void *, ps_key, ps_directory_value,
                                      lc_error *);
 typedef int (*ps_directory_page_fn)(void *, ps_directory_root, lc_error *);
+typedef int (*ps_directory_next_fn)(void *, ps_key *, ps_directory_value *,
+                                    lc_error *);
 
 /* Conservative complete-tree page allowance for every valid post-deletion
  * shape, including small directories that still retain multiple leaves. */
 uint64_t ps_directory_page_bound(uint64_t entries);
+uint64_t ps_directory_packed_pages(uint64_t entries);
+int ps_directory_key_compare(ps_key, ps_key);
 
 /* root {0,0} is empty. A handle belongs to one checkpoint owner. Reads and
  * mutations cache only index pages actually visited. Any error after open
  * makes the handle unusable except for pages/close. */
 int ps_directory_open(const ps_directory_io *, ps_directory_root,
                       ps_directory **, lc_error *);
+/* Populate a new empty directory from exactly count sorted distinct keys.
+ * Pages use the ordinary directory format and accept subsequent mutations. */
+int ps_directory_build(ps_directory *, uint64_t count, ps_directory_next_fn,
+                       void *, lc_error *);
 int ps_directory_get(ps_directory *, ps_key, ps_directory_value *, int *,
                      lc_error *);
 int ps_directory_put(ps_directory *, ps_key, ps_directory_value, lc_error *);

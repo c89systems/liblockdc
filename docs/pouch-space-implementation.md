@@ -9637,3 +9637,84 @@ Cold recovery, joins that have outstanding capacity obligations and sustained
 NoSync mutation latency remain qualification work. Raw phase, matched and
 test logs are under `covered-admission-` in
 `build/pouch-space-concurrent/`.
+
+## Packed checkpoint directories under churn
+
+Fixed-capacity traces of four indexed writers located pressure at physical
+admission. Live owned runs accounted for 7.96–8.47 MB, with another
+0.98–1.33 MB in peer claims or quarantine in the sampled refusals. Local
+metadata pools occupied roughly 230–326 KiB per owner. Most of the already
+retired values in those samples were individual packed cells. Reclaiming
+one cell seldom releases a complete page for a metadata claim.
+
+A full checkpoint now writes descriptors in typed key order and builds the
+directory bottom-up using the fewest pages allowed by its 63-slot nodes.
+Entries and child references are distributed evenly across each level so
+the resulting tree supports ordinary lookups, inserts and deletes. The
+capacity bound is the number of packed descriptor pages plus the exact
+number of directory pages. Admission preserves workspace for one complete
+rewrite and two images counting the selected checkpoint. Incremental
+checkpoints use the existing path-copy algorithm when spare capacity can
+cover its looser directory bound and leave room for the next packed image.
+
+Explicit metadata repack uses the same packed construction. The rewrite
+uses the in-memory descriptor references and the selected index page
+ownership list. It leaves body streams in place, uses the existing page
+format and retires the old image after the existing publication barriers.
+The directory fixture checks exact page counts, no reads of the old tree,
+reopen, deletion and insertion around the 63-entry and 3,969-entry fanout
+boundaries. Physical claim faults cover acquisition across fragmented
+ranges and retirement after a new image is selected.
+
+Eight Debug ASan/UBSan groups and 21 musl Release groups passed. The
+GNU Release selection passed 39 of 40 checks on its first run. The
+fragmented-claim fixture needed a larger request to force acquisition
+across disjoint ranges after the workspace reduction. It passed its
+GNU rerun and the musl selection. GNU also passed the ordinary and
+fixed-capacity checkpoint fault sweeps and the explicit repack fault
+sweep.
+
+In the matched GNU Release rotation, both native builds used fixed 10 MiB
+containers. The table counts workflows that completed and verified after
+reopen. The indexed data volumes are cumulative writes across rounds.
+
+| Workload | Prior native (`234a7779`) | Packed native | Multifile |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 4/4 | 3/4 | 4/4 |
+| Four writers, NoSync indexed, 20 MiB | 0/4 | 3/4 | 4/4 |
+| Two writers, durable indexed, 15 MiB | 2/2 | 1/2 | 2/2 |
+| Two writers, warmed NoSync queue | 2/2 | 2/2 | 2/2 |
+| Two writers, durable outbox | 2/2 | 2/2 | 2/2 |
+
+The native NoSync failures were ordinary capacity refusals. One packed
+durable indexed attempt failed with an overlapping ownership error also
+observed on an earlier native build. Eight additional instrumented durable
+runs, four with two writers and four with four, verified after reopen and
+did not reproduce the error. Its cause remains open.
+
+The next two tables report medians of successful runs in milliseconds,
+ordered prior native, packed native and multifile. The packed durable
+indexed row has one successful sample. For indexed workloads, the work
+phase includes the concurrent mutation and index workers. The readiness
+columns report the slowest index worker for each measured phase.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1567.08 / 1809.08 / 1673.31 | 86.55 / 93.25 / 44.69 | 11.97 / 3.77 / 1.34 | 12.20 / 15.57 / 1.25 | 5.13 / 6.68 / 9.79 |
+| NoSync indexed, 20 MiB | — / 4057.16 / 3079.11 | — / 144.29 / 53.23 | — / 8.01 / 1.43 | — / 19.04 / 1.26 | — / 7.82 / 12.32 |
+| Durable indexed, 15 MiB | 6712.90 / 9385.86 / 8498.52 | 92.84 / 138.69 / 117.12 | 4.55 / 2.37 / 1.02 | 11.35 / 17.60 / 0.76 | 7.57 / 6.53 / 9.60 |
+| Warmed NoSync queue | 11.63 / 11.47 / 95.63 | 2.27 / 2.04 / 22.22 | 0.29 / 0.28 / 0.10 | 3.08 / 3.27 / 0.49 | 0.21 / 0.33 / 0.56 |
+| Durable outbox | 1265.12 / 1580.67 / 1855.84 | 252.78 / 331.49 / 349.60 | 0.62 / 0.75 / 0.33 | 35.40 / 62.10 / 76.54 | 79.42 / 126.13 / 156.98 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 306.37 / 304.54 / 413.26 | 105.74 / 96.42 / 205.73 | 31.83 / 43.68 / 224.26 |
+| NoSync indexed, 20 MiB | — / 425.02 / 724.55 | — / 147.39 / 331.83 | — / 125.45 / 296.90 |
+| Durable indexed, 15 MiB | 153.07 / 294.07 / 209.61 | 14.27 / 9.85 / 184.83 | 2.28 / 31.62 / 178.99 |
+
+Packing improved admission under the heavier churn. Both NoSync indexed
+profiles still had a fixed-capacity refusal, and mutation tails and
+grouped reopen remain higher than multifile. The warm queue and durable
+outbox samples continue to favor the container during active work.
+Raw traces, matched attempts and diagnostic repeats are under `churn-` in
+`build/pouch-space-concurrent/`.

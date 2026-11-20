@@ -650,7 +650,9 @@ static void metadata_fragmented_faults(void) {
     ok(ps_delete(s, key(id), &e), &e);
   ok(ps_checkpoint(s, &e), &e);
   uint64_t initial = kernel_metadata();
-  ps_budget_plan plan = {0, PS_MIB, 8192, 0};
+  /* The protected images must exceed the free tail so admission acquires
+   * several disjoint metadata claims and can fail partway through. */
+  ps_budget_plan plan = {0, 2 * PS_MIB, 8192, 0};
   f.calls = allocations = allocation_fail = 0;
   measuring = 1;
   int rc = ps_budget_open(s, &plan, &budget, &e);

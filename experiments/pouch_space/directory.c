@@ -20,6 +20,17 @@ uint64_t ps_directory_page_bound(uint64_t entries) {
   }
   return pages;
 }
+static uint64_t packed_groups(uint64_t count) {
+  return count / LIMIT + (count % LIMIT != 0);
+}
+uint64_t ps_directory_packed_pages(uint64_t entries) {
+  uint64_t pages = 0, nodes = packed_groups(entries);
+  while (nodes) {
+    pages += nodes;
+    nodes = nodes == 1 ? 0 : packed_groups(nodes);
+  }
+  return pages;
+}
 
 typedef struct directory_node directory_node;
 typedef struct directory_item {
@@ -70,7 +81,7 @@ static uint32_t load32(const unsigned char *p) {
 static uint32_t page_crc(const unsigned char *p) {
   return (uint32_t)crc32(crc32(0, p, 12), p + 16, PS_PAGE - 16);
 }
-static int key_compare(ps_key a, ps_key b) {
+int ps_directory_key_compare(ps_key a, ps_key b) {
   if (a.kind != b.kind)
     return a.kind < b.kind ? -1 : 1;
   if (a.owner != b.owner)
@@ -149,7 +160,8 @@ static int read_node(ps_directory *d, ps_directory_root ref,
     item->value.incarnation = load64(slot + 40);
     if (!item->key.kind || load32(slot + 4) || load64(slot + 48) ||
         load64(slot + 56) ||
-        (i && key_compare(node->items[i - 1].key, item->key) >= 0) ||
+        (i &&
+         ps_directory_key_compare(node->items[i - 1].key, item->key) >= 0) ||
         (node->level
              ? (!item->value.offset || item->value.offset % PS_PAGE ||
                 item->value.offset > (uint64_t)INT64_MAX - PS_PAGE ||
@@ -194,10 +206,10 @@ static int child_node(ps_directory *d, directory_node *parent,
   *out = item->child;
   if ((!(*out)->dirty && (*out)->count < MINIMUM) ||
       (*out)->level + 1 != parent->level ||
-      key_compare((*out)->items[0].key, item->key) ||
+      ps_directory_key_compare((*out)->items[0].key, item->key) ||
       (index + 1 < parent->count &&
-       key_compare((*out)->items[(*out)->count - 1].key,
-                   parent->items[index + 1].key) >= 0))
+       ps_directory_key_compare((*out)->items[(*out)->count - 1].key,
+                                parent->items[index + 1].key) >= 0))
     return directory_error(error, LC_ERR_PROTOCOL,
                            "checkpoint directory child binding mismatch");
   return LC_OK;
@@ -207,7 +219,7 @@ static unsigned int position(directory_node *node, ps_key key) {
   unsigned int low = 0, high = node->count, middle;
   while (low < high) {
     middle = low + (high - low) / 2;
-    if (key_compare(node->items[middle].key, key) < 0)
+    if (ps_directory_key_compare(node->items[middle].key, key) < 0)
       low = middle + 1;
     else
       high = middle;
@@ -216,7 +228,8 @@ static unsigned int position(directory_node *node, ps_key key) {
 }
 static unsigned int branch_position(directory_node *node, ps_key key) {
   unsigned int index = position(node, key);
-  if (index == node->count || key_compare(node->items[index].key, key) > 0)
+  if (index == node->count ||
+      ps_directory_key_compare(node->items[index].key, key) > 0)
     return index ? index - 1 : 0;
   return index;
 }
@@ -244,6 +257,79 @@ int ps_directory_open(const ps_directory_io *io, ps_directory_root root,
   *out = d;
   return LC_OK;
 }
+typedef struct packed_level {
+  uint64_t remaining, pages;
+} packed_level;
+typedef struct packed_directory {
+  packed_level levels[MAX_LEVEL + 1];
+  ps_directory_next_fn next;
+  void *context;
+  ps_key previous;
+} packed_directory;
+static int build_node(ps_directory *d, packed_directory *plan,
+                      unsigned int level, directory_node **out,
+                      lc_error *error) {
+  packed_level *steps = &plan->levels[level];
+  directory_node *node = new_node(d, level, error);
+  directory_item *item;
+  unsigned int i;
+  int rc = LC_OK;
+  if (!node)
+    return LC_ERR_NOMEM;
+  /* Balance the final groups too. Splitting after a maximal prefix could
+   * leave an underfull last page that the ordinary reader cannot adopt. */
+  node->count = (unsigned int)(steps->remaining / steps->pages +
+                               (steps->remaining % steps->pages != 0));
+  steps->remaining -= node->count;
+  --steps->pages;
+  node->dirty = 1;
+  for (i = 0; rc == LC_OK && i < node->count; ++i) {
+    item = &node->items[i];
+    if (level) {
+      rc = build_node(d, plan, level - 1, &item->child, error);
+      if (rc == LC_OK)
+        item->key = item->child->items[0].key;
+    } else {
+      rc = plan->next(plan->context, &item->key, &item->value, error);
+      if (rc == LC_OK &&
+          (!item->key.kind || !valid_value(item->value) ||
+           ps_directory_key_compare(plan->previous, item->key) >= 0))
+        rc = directory_error(error, LC_ERR_PROTOCOL,
+                             "packed directory input is not ordered");
+      if (rc == LC_OK)
+        plan->previous = item->key;
+    }
+  }
+  if (rc == LC_OK)
+    *out = node;
+  return rc;
+}
+int ps_directory_build(ps_directory *d, uint64_t count,
+                       ps_directory_next_fn next, void *context,
+                       lc_error *error) {
+  packed_directory plan;
+  unsigned int level = 0;
+  int rc = available(d, error);
+  if (rc == LC_OK && (!next || d->original.offset || d->node_count))
+    rc = directory_error(error, LC_ERR_INVALID,
+                         "packed directory requires an empty tree and input");
+  if (rc != LC_OK || !count)
+    return finish_operation(d, rc);
+  memset(&plan, 0, sizeof(plan));
+  plan.next = next;
+  plan.context = context;
+  for (;;) {
+    plan.levels[level].remaining = count;
+    plan.levels[level].pages = count = packed_groups(count);
+    if (count == 1)
+      break;
+    if (level == MAX_LEVEL)
+      return finish_operation(d, directory_error(error, LC_ERR_INVALID,
+                                                 "packed directory too deep"));
+    ++level;
+  }
+  return finish_operation(d, build_node(d, &plan, level, &d->root, error));
+}
 int ps_directory_get(ps_directory *d, ps_key key, ps_directory_value *out,
                      int *found, lc_error *error) {
   directory_node *node;
@@ -261,7 +347,8 @@ int ps_directory_get(ps_directory *d, ps_key key, ps_directory_value *out,
     rc = child_node(d, node, branch_position(node, key), &node, error);
   if (rc == LC_OK && node) {
     index = position(node, key);
-    if (index < node->count && !key_compare(node->items[index].key, key)) {
+    if (index < node->count &&
+        !ps_directory_key_compare(node->items[index].key, key)) {
       *out = node->items[index].value;
       *found = 1;
     }
@@ -286,7 +373,8 @@ static int put_node(ps_directory *d, directory_node *node, ps_key key,
   *split = NULL;
   index = node->level ? branch_position(node, key) : position(node, key);
   if (!node->level) {
-    if (index < node->count && !key_compare(node->items[index].key, key)) {
+    if (index < node->count &&
+        !ps_directory_key_compare(node->items[index].key, key)) {
       if (memcmp(&node->items[index].value, &value, sizeof(value))) {
         node->items[index].value = value;
         node->dirty = 1;
@@ -428,7 +516,8 @@ static int remove_node(ps_directory *d, directory_node *node, ps_key key,
   int rc;
   index = node->level ? branch_position(node, key) : position(node, key);
   if (!node->level) {
-    if (index < node->count && !key_compare(node->items[index].key, key)) {
+    if (index < node->count &&
+        !ps_directory_key_compare(node->items[index].key, key)) {
       remove_item(node, index);
       *removed = 1;
     }
@@ -495,7 +584,8 @@ static int visit_node(ps_directory *d, directory_node *node, visit_state *state,
       if (rc == LC_OK)
         rc = visit_node(d, child, state, error);
     } else {
-      if (state->found && key_compare(state->previous, node->items[i].key) >= 0)
+      if (state->found &&
+          ps_directory_key_compare(state->previous, node->items[i].key) >= 0)
         return directory_error(error, LC_ERR_PROTOCOL,
                                "checkpoint directory key ranges overlap");
       state->previous = node->items[i].key;

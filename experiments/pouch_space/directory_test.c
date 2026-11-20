@@ -693,6 +693,51 @@ static void api_boundaries(void) {
        "boundaries");
 }
 
+static int packed_next(void *v, ps_key *out_key, ps_directory_value *out_value,
+                       lc_error *e) {
+  uint64_t *ordinal = v;
+  (void)e;
+  *out_key = key(*ordinal);
+  *out_value = value(*ordinal, *ordinal + 1);
+  ++*ordinal;
+  return LC_OK;
+}
+static void packed_tree(void) {
+  static const uint64_t counts[] = {0, 1, 63, 64, 3969, 3970};
+  static const size_t pages[] = {0, 1, 1, 3, 64, 67};
+  uint64_t *expected = calloc(KEYS, sizeof(*expected));
+  pager p;
+  ps_directory_io io = pager_init(&p);
+  ps_directory_root empty = {0};
+  CHECK(expected);
+  for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+    uint64_t ordinal = 0;
+    int removed = 0;
+    pager_clear(&p);
+    memset(expected, 0, KEYS * sizeof(*expected));
+    ps_directory *d = open_directory(&io, empty);
+    OK(ps_directory_build(d, counts[i], packed_next, &ordinal, &error));
+    CHECK(ordinal == counts[i]);
+    ps_directory_root root = flush(&p, d, 1, 1);
+    CHECK(!p.reads && p.writes == pages[i] && used_pages(&p) == pages[i] &&
+          ps_directory_packed_pages(counts[i]) == pages[i]);
+    for (uint64_t k = 0; k < counts[i]; ++k)
+      expected[k] = k + 1;
+    verify(&io, root, expected);
+    d = open_directory(&io, root);
+    if (counts[i]) {
+      OK(ps_directory_remove(d, key(0), &removed, &error));
+      CHECK(removed);
+      expected[0] = 0;
+    }
+    OK(ps_directory_put(d, key(counts[i]), value(counts[i], 9000), &error));
+    expected[counts[i]] = 9000;
+    root = flush(&p, d, 2, 1);
+    verify(&io, root, expected);
+  }
+  pager_close(&p);
+  free(expected);
+}
 static void *default_stack_worker(void *unused) {
   (void)unused;
   growth_and_copy_on_write();
@@ -700,6 +745,7 @@ static void *default_stack_worker(void *unused) {
   failure_boundaries();
   corruption_and_identity();
   api_boundaries();
+  packed_tree();
   return NULL;
 }
 int main(void) {

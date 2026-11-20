@@ -1728,7 +1728,7 @@ static void metadata_faults(int repack) {
   unsigned char actual[16];
   size_t kind, phase, count, i, n;
   int rc, resumed;
-  for (kind = 0; kind < (repack ? 3U : 2U); ++kind) {
+  for (kind = 0; kind < 3U; ++kind) {
     count = 0;
     for (phase = 0; phase <= count; ++phase) {
       clean();
@@ -1788,7 +1788,7 @@ static void metadata_faults(int repack) {
       OK(ps_checkpoint(s, &error));
       OK(ps_close(s, &error));
     }
-    CHECK(kind == 2 ? count > 0 : count > 15);
+    CHECK(kind == 2 ? (repack ? !count : count > 0) : count > 15);
     if (repack)
       printf("metadata repack failure sites (%s): %lu\n",
              kind == 0   ? "write/sync"
@@ -1895,8 +1895,8 @@ static void metadata_repack(void) {
           !after.journal_bytes && after.live_bytes == before.live_bytes &&
           after.private_bytes == before.private_bytes &&
           after.checkpoints == before.checkpoints + 1 &&
-          after.metadata_pages <= (after.metadata_bytes + 4031) / 4032 +
-                                      ps_directory_page_bound(after.entries));
+          after.metadata_pages == (after.metadata_bytes + 4031) / 4032 +
+                                      ps_directory_packed_pages(after.entries));
     CHECK(after.metadata_pages < before.metadata_pages / 4);
     read_value(held, "A", 1);
     ps_reader_close(held);
@@ -2335,8 +2335,8 @@ static void metadata_capacity_faults(void) {
       OK(ps_metadata_repack(s, &error));
       OK(ps_close(s, &error));
     }
-    CHECK(sites > 0);
-    printf("checkpoint capacity failure sites (%s): %lu\n",
+    CHECK(kind == 2 ? !sites : sites > 0);
+    printf("packed checkpoint capacity failure sites (%s): %lu\n",
            kind == 0   ? "write/sync"
            : kind == 1 ? "allocation"
                        : "read",

@@ -1844,7 +1844,7 @@ static int metadata_bound(uint64_t bytes, uint64_t entries, uint64_t *bound,
       entries > (uint64_t)INT64_MAX / PS_PAGE)
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   pages = (bytes + META_PAYLOAD - 1) / META_PAYLOAD;
-  pages += ps_directory_page_bound(entries);
+  pages += ps_directory_packed_pages(entries);
   if (pages > UINT64_MAX / (2 * PS_PAGE))
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   *bound = pages * PS_PAGE;
@@ -2315,7 +2315,8 @@ static int directory_write(void *v, uint64_t offset, const void *page,
     ++s->directory_page_writes;
   return rc;
 }
-static int directory_open(ps_space *s, ps_directory **out, lc_error *error) {
+static int directory_open(ps_space *s, ps_directory_root root,
+                          ps_directory **out, lc_error *error) {
   ps_directory_io io;
   memset(&io, 0, sizeof(io));
   io.context = s;
@@ -2323,7 +2324,7 @@ static int directory_open(ps_space *s, ps_directory **out, lc_error *error) {
   io.read = directory_read;
   io.allocate = directory_allocate;
   io.write = directory_write;
-  return ps_directory_open(&io, s->directory, out, error);
+  return ps_directory_open(&io, root, out, error);
 }
 static uint32_t metadata_crc(const unsigned char *page) {
   return (uint32_t)crc32(checksum(page, 48), page + 52, PS_PAGE - 52);
@@ -2421,7 +2422,7 @@ static int metadata_unref(ps_space *s, ps_directory_value ref,
 }
 static int metadata_prepare_retirement(ps_space *s,
                                        const ps_directory_pages *changes,
-                                       lc_error *error) {
+                                       int dense, lc_error *error) {
   ps_meta_page *page;
   ps_entry *p;
   ps_directory_value ref;
@@ -2430,6 +2431,14 @@ static int metadata_prepare_retirement(ps_space *s,
   int rc;
   if (!s->metadata_claims_active)
     return LC_OK;
+  if (dense)
+    for (page = s->pages; page; page = page->next) {
+      if (!page->index || page->generation > s->generation)
+        continue;
+      rc = metadata_claim_retirement(s, page, error);
+      if (rc != LC_OK)
+        return rc;
+    }
   for (i = 0; i < changes->retired_count; ++i) {
     page = metadata_find(s, changes->retired[i].offset);
     if (!page || !page->index ||
@@ -2529,14 +2538,80 @@ void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
     *spare = metadata_trim(s, *spare);
   }
 }
-static int checkpoint_body(ps_space *s, lc_error *error) {
-  unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire = NULL;
+static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
+                                 lc_error *error) {
+  unsigned char *wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
+  int rc;
+  if (!wire)
+    return err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
+  encode_entry(wire, p, builder->space->sequence, PS_PUT);
+  rc = metadata_append(builder, wire, entry_bytes(p), &p->pending_ref, error);
+  lc_free_with_allocator(NULL, wire);
+  return rc;
+}
+typedef struct checkpoint_entries {
+  metadata_builder *builder;
+  ps_entry **next;
+} checkpoint_entries;
+static int checkpoint_entry_compare(const void *a, const void *b) {
+  ps_entry *const *left = a, *const *right = b;
+  return ps_directory_key_compare((*left)->key, (*right)->key);
+}
+static int checkpoint_entry_next(void *v, ps_key *key,
+                                 ps_directory_value *value, lc_error *error) {
+  checkpoint_entries *entries = v;
+  ps_entry *p = *entries->next++;
+  int rc = checkpoint_descriptor(entries->builder, p, error);
+  if (rc == LC_OK) {
+    *key = p->key;
+    *value = p->pending_ref;
+  }
+  return rc;
+}
+static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
+                                     metadata_builder *builder,
+                                     lc_error *error) {
+  checkpoint_entries entries;
+  ps_entry *p, **slots = NULL;
+  size_t count = 0;
+  int rc;
+  if (s->live_entries > SIZE_MAX / sizeof(*slots))
+    return err(error, LC_ERR_NOMEM, "checkpoint directory is too large");
+  if (s->live_entries) {
+    slots =
+        lc_calloc_with_allocator(NULL, (size_t)s->live_entries, sizeof(*slots));
+    if (!slots)
+      return err(error, LC_ERR_NOMEM, "cannot collect checkpoint keys");
+  }
+  for (p = s->dirty; p; p = p->dirty_next) {
+    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
+    if (!p->deleted && count < s->live_entries)
+      slots[count++] = p;
+    else if (!p->deleted)
+      break;
+  }
+  if (p || count != s->live_entries)
+    rc =
+        err(error, LC_ERR_PROTOCOL, "checkpoint directory entry count changed");
+  else {
+    if (count > 1)
+      qsort(slots, count, sizeof(*slots), checkpoint_entry_compare);
+    entries.builder = builder;
+    entries.next = slots;
+    rc = ps_directory_build(directory, count, checkpoint_entry_next, &entries,
+                            error);
+  }
+  lc_free_with_allocator(NULL, slots);
+  return rc;
+}
+static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
+  unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
-  ps_meta_page *page;
+  ps_meta_page *page, *next_page;
   ps_run *trim = NULL;
-  uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
+  uint64_t bound, extra, incremental, floor = PS_MAINTENANCE_RESERVE;
   ps_directory *directory = NULL;
-  ps_directory_root new_root = {0};
+  ps_directory_root new_root = {0}, empty = {0};
   ps_directory_pages changes;
   metadata_builder builder;
   size_t i;
@@ -2546,27 +2621,29 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
                "container checkpoint generation exhausted");
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
+  if (force_dense)
+    metadata_dirty_all(s);
   rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
     s->metadata_workspace = bound;
   if (rc == LC_OK && s->dirty)
     rc = metadata_protect(s, bound, 0, 0, error);
-  /* Keep ordinary checkpoints incremental when spare common capacity exists.
-   * At capacity, a dense rewrite returns every old metadata page and restores
-   * the protected image allowance instead of slowly fragmenting it away. */
-  if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound &&
-      reserve_floor(s, s->metadata, s->live_entries, bound, &floor, NULL) ==
-          LC_OK &&
-      s->free_bytes >= s->reserved_payload &&
-      s->free_bytes - s->reserved_payload >=
-          2 * bound - s->metadata_free_bytes &&
-      s->free_bytes - s->reserved_payload -
-              (2 * bound - s->metadata_free_bytes) >=
-          floor)
-    rc = metadata_fill(s, bound, 2 * bound, 0, floor, NULL, error);
-  if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound) {
-    metadata_dirty_all(s);
-    dense = 1;
+  if (rc == LC_OK && s->dirty) {
+    /* Leave a complete packed image for the next checkpoint. A path-copy
+     * attempt can need more pages because the resulting tree is not packed. */
+    extra = (ps_directory_page_bound(s->live_entries) -
+             ps_directory_packed_pages(s->live_entries)) *
+            PS_PAGE;
+    incremental =
+        bound <= (UINT64_MAX - extra) / 2 ? 2 * bound + extra : UINT64_MAX;
+    if (!force_dense && s->metadata_free_bytes < incremental &&
+        reserve_floor(s, s->metadata, s->live_entries, bound, &floor, NULL) ==
+            LC_OK &&
+        !ordinary_shortfall(s, incremental, 0, floor, NULL))
+      rc = metadata_fill(s, bound, incremental, 0, floor, NULL, error);
+    dense = force_dense || s->metadata_free_bytes < incremental;
+    if (dense)
+      metadata_dirty_all(s);
   }
   if (rc == LC_OK && (s->dirty || metadata_trim_needed(s))) {
     trim = lc_calloc_with_allocator(NULL, 1, sizeof(*trim));
@@ -2574,27 +2651,20 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
       rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint trim interval");
   }
   if (rc == LC_OK)
-    rc = directory_open(s, &directory, error);
+    rc = directory_open(s, dense ? empty : s->directory, &directory, error);
   if (rc == LC_OK && s->dirty) {
     builder.buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
     if (!builder.buffer)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate descriptor page buffer");
   }
-  for (p = s->dirty; p && rc == LC_OK; p = p->dirty_next) {
+  if (rc == LC_OK && dense)
+    rc = checkpoint_pack_directory(s, directory, &builder, error);
+  for (p = s->dirty; !dense && p && rc == LC_OK; p = p->dirty_next) {
     memset(&p->pending_ref, 0, sizeof(p->pending_ref));
     if (p->deleted)
       rc = ps_directory_remove(directory, p->key, &removed, error);
     else {
-      wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
-      if (!wire) {
-        rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
-        break;
-      }
-      encode_entry(wire, p, s->sequence, PS_PUT);
-      rc = metadata_append(&builder, wire, entry_bytes(p), &p->pending_ref,
-                           error);
-      lc_free_with_allocator(NULL, wire);
-      wire = NULL;
+      rc = checkpoint_descriptor(&builder, p, error);
       if (rc == LC_OK)
         rc = ps_directory_put(directory, p->key, p->pending_ref, error);
     }
@@ -2605,7 +2675,7 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
     rc = ps_directory_flush(directory, s->generation + 1, &new_root, error);
   if (rc == LC_OK) {
     ps_directory_changed_pages(directory, &changes);
-    rc = metadata_prepare_retirement(s, &changes, error);
+    rc = metadata_prepare_retirement(s, &changes, dense, error);
   }
   if (rc == LC_OK)
     rc = sync_file(s, error); /* payloads, journal and new metadata pages */
@@ -2670,6 +2740,12 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
       }
   }
   ps_directory_changed_pages(directory, &changes);
+  if (dense)
+    for (page = s->pages; page; page = next_page) {
+      next_page = page->next;
+      if (page->index && page->generation < s->generation)
+        metadata_release(s, page);
+    }
   for (i = 0; i < changes.retired_count; ++i) {
     page = metadata_find(s, changes.retired[i].offset);
     if (!page || !page->index ||
@@ -2713,14 +2789,17 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
   collect_retired(s, 1);
   return healthy(s, error);
 }
-static int checkpoint_locked(ps_space *s, lc_error *error) {
+static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
   ps_coordination_guard *guard = NULL;
   int rc = allocation_begin(s, &guard, error);
   if (rc == LC_OK && guard)
     rc = allocation_refresh(s, error);
   if (rc == LC_OK)
-    rc = checkpoint_body(s, error);
+    rc = checkpoint_body(s, force_dense, error);
   return allocation_end(s, guard, rc, error);
+}
+static int checkpoint_locked(ps_space *s, lc_error *error) {
+  return checkpoint_select(s, 0, error);
 }
 /* A checkpoint can return retired runs to ordinary capacity. Count only
  * complete pages whose local and foreign readers have released them. Packed
@@ -3908,7 +3987,7 @@ static int recover(ps_space *s, lc_error *error) {
   values->packed.offset = 0;
   rc = initial_free(s, error);
   if (rc == LC_OK)
-    rc = directory_open(s, &directory, error);
+    rc = directory_open(s, s->directory, &directory, error);
   if (rc == LC_OK)
     rc = ps_directory_visit(directory, recover_directory_entry,
                             recover_directory_page, &recovery, error);
@@ -4515,7 +4594,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   }
   rc = initial_free(v, error);
   if (rc == LC_OK)
-    rc = directory_open(v, &directory, error);
+    rc = directory_open(v, v->directory, &directory, error);
   if (rc == LC_OK)
     rc = ps_directory_visit(directory, recover_directory_entry,
                             recover_directory_page, &recovery, error);
@@ -6043,14 +6122,8 @@ int ps_metadata_repack(ps_space *s, lc_error *error) {
     return err(error, LC_ERR_INVALID, "metadata repack requires container");
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
-  if (rc == LC_OK) {
-    /* Dirty ownership already carries each old checkpoint reference through
-     * replacement/tombstone chains. Promote only current live entries; the
-     * normal checkpoint then retires every old descriptor reference exactly
-     * once, after the new root and old-root retirement are durable. */
-    metadata_dirty_all(s);
-    rc = checkpoint_locked(s, error);
-  }
+  if (rc == LC_OK)
+    rc = checkpoint_select(s, 1, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
