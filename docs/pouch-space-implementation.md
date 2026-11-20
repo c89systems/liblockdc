@@ -7599,8 +7599,61 @@ stays cold after open and work discovery. Root recovery has discarded empty
 ordinary-state receivers since `10313575`. Logs are in
 `build/pouch-space-shared-catalog/`.
 
-The root-wide orphan pass still relies on local stream ownership while a
-peer can be preparing an unpublished collection tree. Shared maintenance
-requires a publication claim visible to that pass. Collection append handoff
-also requires fresh canonical tail and run mappings, and obsolete snapshot
+The [stream publication claims](#stream-publication-claims) below protect
+unpublished trees from the root-wide orphan pass. Collection append handoff
+requires fresh canonical tail and run mappings, and obsolete snapshot
 reclamation requires cross-process reader lifetime evidence.
+
+## Stream publication claims
+
+Shared stream creation witnesses its new incarnation with an OFD read lock
+before publishing the stream head. The first catalog binding takes over
+that claim through the durability barrier. Closing an unpublished stream
+releases it. An owner adopting an existing unbound stream takes an exclusive
+claim. A failed precondition leaves the creator's claim with the stream so
+the creator can retry or close.
+
+The root orphan pass refreshes its candidate inventory and revalidates each
+candidate before taking the exclusive claim. It skips active claims and can
+still retire unrelated candidates. For a collection tree it holds the identity
+claim until child cleanup and identity retirement finish. A peer cannot
+rebind that unbound identity during cleanup. Process exit lets the kernel
+release the abandoned claim.
+
+The 512 claim slots occupy part of the volatile readiness lock address
+range. Colliding preparations share a slot and may run concurrently. A
+collision can defer orphan cleanup or adoption of an existing unbound
+stream. New stream admission can choose another incarnation if its first
+slot is held exclusively. Claims are advisory locks over existing reserved
+bytes. Shared participants use the same coordination layout.
+
+The SDK cut at receiver admission exposed the unpublished collection tree
+to a peer orphan pass before the catalog name was selected. The previous
+revision failed the skip-and-reclaim assertion. The new pass preserves the
+live tree, reclaims a separate abandoned stream, and verifies the new
+collection through reopen. A separate cut verifies that a peer rejects
+adoption and binding during live preparation, then can reclaim the unbound
+stream after a successful binding released the claim. An abruptly killed
+publisher case verifies retirement of a stream with an allocated grant.
+These cases run plaintext and encrypted/compressed under both durability
+policies. The coordination fixtures verify colliding local and foreign
+witnesses, waiter handoff, and process exit.
+
+All 52 selected groups passed on Debug, GNU release, and musl release. The
+groups include shared queue and outbox workflows, stream handoff and faults,
+live journal replay, collection maintenance, and codec conversion.
+
+All 12 matched GNU outbox runs verified effect bodies and duplicate
+receipts after reopen. Two producers and a peer dispatcher deliver 16
+effects of 4 KiB from a 10 MiB single-file root. Times are median milliseconds
+for the pre-claim binary / current, with three samples per cell.
+
+| Phase | NoSync | Durable |
+| --- | ---: | ---: |
+| Work | 496.03 / 502.08 | 1345.07 / 1412.26 |
+| Maintenance | 19.82 / 27.02 | 26.05 / 22.43 |
+| Close | 0.64 / 0.67 | 0.65 / 0.62 |
+| Reopen | 25.03 / 25.76 | 56.69 / 56.41 |
+
+Work samples overlap for both durability policies. Raw runs and test logs
+are in `build/pouch-space-orphan-claims/`.

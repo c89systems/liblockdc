@@ -5821,6 +5821,37 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
       head->entry->stream_complete_generation &&
       head->entry->stream_complete_generation == head->space->generation;
 }
+int ps_internal_stream_claim(ps_space *s, uint64_t token,
+                             ps_coordination_guard **claim, lc_error *e) {
+  *claim = NULL;
+  if (!ps_coordination_shared(s->coordination))
+    return LC_OK;
+  return ps_coordination_lock(s->coordination, PS_COORDINATION_STREAM_CLAIM,
+                              token, 0, claim, e);
+}
+static int prepare_new_stream(ps_space *s, ps_entry *p, lc_error *e) {
+  uint64_t token = s->token_next;
+  size_t i;
+  int rc;
+  if (!ps_coordination_shared(s->coordination)) {
+    p->token = s->token_next++;
+    return LC_OK;
+  }
+  for (i = 0; i < PS_COORDINATION_STREAM_CLAIM_SLOTS && token <= s->token_end;
+       ++i, ++token) {
+    rc = ps_coordination_stream_prepare(s->coordination, token,
+                                        &p->stream_claim, e);
+    if (rc == LC_OK) {
+      p->token = token;
+      s->token_next = token + 1;
+      return LC_OK;
+    }
+    if (rc != LC_ERR_PENDING)
+      return rc;
+    lc_error_cleanup(e);
+  }
+  return err(e, LC_ERR_PENDING, "no stream publication claim available");
+}
 int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
                               uint64_t *tail) {
   ps_owned_head head;
@@ -5838,8 +5869,9 @@ int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
   return 1;
 }
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
-                      const ps_ref *ref, int guarded, ps_owned_head **out,
-                      ps_owned_status *status, lc_error *error) {
+                      const ps_ref *ref, int guarded, int prepare,
+                      ps_owned_head **out, ps_owned_status *status,
+                      lc_error *error) {
   ps_owned_head *head;
   ps_coordination_guard *guard;
   ps_entry *p = NULL, *old;
@@ -5874,8 +5906,9 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK && create)
     rc = checkpoint_allowance_floor(s, s->metadata + 80, s->live_entries + 1, 0,
                                     PS_MAINTENANCE_RESERVE, budget, error);
+  if (rc == LC_OK && create)
+    rc = prepare_new_stream(s, p, error);
   if (rc == LC_OK && create) {
-    p->token = s->token_next++;
     rc = append_event(s, p, PS_PUT, error);
     if (rc == LC_OK) {
       ps_internal_budget_spend(budget, 0, 80, 1);
@@ -5897,6 +5930,8 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK && ref &&
       (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
     rc = err(error, LC_ERR_INVALID, "stale or foreign owned stream reference");
+  if (rc == LC_OK && prepare && !p->catalog_refs && !p->stream_claim)
+    rc = ps_internal_stream_claim(s, p->token, &p->stream_claim, error);
   if (rc == LC_OK) {
     head->space = s;
     head->entry = p;
@@ -5905,8 +5940,10 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
-  } else if (create && p->state == 0)
+  } else if (create && p->state == 0) {
+    ps_coordination_unlock(p->stream_claim);
     entry_free(p);
+  }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && create && s->durable)
@@ -5922,12 +5959,16 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
 int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                   const ps_ref *ref, ps_owned_head **out,
                   ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 0, out, status, error);
+  return owned_open(s, budget, key, create, ref, 0, 0, out, status, error);
 }
 int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
                           int create, const ps_ref *ref, ps_owned_head **out,
                           ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 1, out, status, error);
+  return owned_open(s, budget, key, create, ref, 1, 0, out, status, error);
+}
+int ps_owned_open_prepared(ps_space *s, ps_key key, ps_owned_head **out,
+                           ps_owned_status *status, lc_error *error) {
+  return owned_open(s, NULL, key, 0, NULL, 0, 1, out, status, error);
 }
 void ps_owned_close(ps_owned_head *head) {
   ps_space *s;
@@ -5935,8 +5976,11 @@ void ps_owned_close(ps_owned_head *head) {
     return;
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  if (!--head->entry->stream_handles)
+  if (!--head->entry->stream_handles) {
     head->entry->orphan_claimed = 0;
+    ps_coordination_unlock(head->entry->stream_claim);
+    head->entry->stream_claim = NULL;
+  }
   ps_internal_entry_unpin(s, head->entry);
   --s->readers;
   if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
@@ -7139,13 +7183,14 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
 }
 int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
   ps_space *s;
+  ps_coordination_guard *guard;
   int rc;
   if (!head)
     return err(error, LC_ERR_INVALID,
                "orphan claim requires an owned identity");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   if (rc == LC_OK &&
       (head->entry->deleted || head->entry->catalog_refs ||
        head->entry->catalog_pins ||
@@ -7153,8 +7198,12 @@ int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
     rc = err(error, LC_ERR_INVALID,
              "owned identity is retained by a catalog binding or view");
+  if (rc == LC_OK && !head->entry->stream_claim)
+    rc = ps_internal_stream_claim(s, head->entry->token,
+                                  &head->entry->stream_claim, error);
   if (rc == LC_OK)
     head->entry->orphan_claimed = 1;
+  rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

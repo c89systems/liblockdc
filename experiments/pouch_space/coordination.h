@@ -6,6 +6,7 @@
 typedef struct ps_coordination ps_coordination;
 typedef struct ps_coordination_guard ps_coordination_guard;
 #define PS_COORDINATION_TXN_STRIPES 256U
+#define PS_COORDINATION_STREAM_CLAIM_SLOTS (PS_PAGE / 8U)
 enum ps_coordination_domain {
   PS_COORDINATION_PUBLICATION = 0,
   PS_COORDINATION_RECOVERY,
@@ -17,7 +18,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_NAMESPACE_VIEW,
   PS_COORDINATION_NAMESPACE_STATE,
   PS_COORDINATION_CONTROL_STATE,
-  PS_COORDINATION_COLLECTION_CATALOG
+  PS_COORDINATION_COLLECTION_CATALOG,
+  PS_COORDINATION_STREAM_CLAIM
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -73,6 +75,9 @@ int ps_coordination_shared(const ps_coordination *);
  * own projection and release it before acquiring participant authority.
  * Collection catalog guards key on the durable namespace identity. Acquire
  * before changing a collection name or the namespace's collection work hint.
+ * Stream claims key on the incarnation. Creation, first binding and orphan
+ * selection acquire without waiting under canonical capture. The guard can
+ * span preparation or reclamation and be released across threads.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
  * finish while another guard waits.
@@ -81,6 +86,11 @@ int ps_coordination_shared(const ps_coordination *);
 int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
+/* New incarnations can prepare concurrently even when their lock bytes
+ * coincide. Adopting or reclaiming an existing incarnation needs the
+ * exclusive stream claim above. */
+int ps_coordination_stream_prepare(ps_coordination *, uint64_t,
+                                   ps_coordination_guard **, lc_error *);
 /* Release fixed guards on the acquiring thread. An uncertain
  * kernel unlock poisons the owner; further acquisition fails until
  * close/reopen. Cleanup remains legal.

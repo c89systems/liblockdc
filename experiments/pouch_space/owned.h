@@ -25,8 +25,8 @@ typedef struct ps_owned_status {
   int sealed, retired, complete;
 } ps_owned_status;
 
-/* The optional budget funds creation only; an open cached owner retains no
- * claim. */
+/* The optional budget funds creation only. Shared creation retains an orphan
+ * liveness claim until first durable binding or final close. */
 int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
                   ps_owned_head **, ps_owned_status *, lc_error *);
 /* Shared canonical stream views can overlap during staged cache replacement.
@@ -35,6 +35,10 @@ int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
                           const ps_ref *, ps_owned_head **, ps_owned_status *,
                           lc_error *);
 void ps_owned_close(ps_owned_head *);
+/* Reopen an unpublished stream for preparation, such as a reserved successor
+ * left by an interrupted publisher. Retain its claim until binding or close. */
+int ps_owned_open_prepared(ps_space *, ps_key, ps_owned_head **,
+                           ps_owned_status *, lc_error *);
 int ps_owned_status_get(ps_owned_head *, ps_owned_status *, lc_error *);
 /* Check durable retirement when admitting a new read window. A previously
  * captured reader reads its pinned mappings directly. */
@@ -160,7 +164,7 @@ int ps_owned_seal(ps_owned_head *, lc_error *);
 /* Revalidate absence of durable catalog references/views and exclude new
  * bindings until this exclusive owner closes. Used before cascading a closed
  * logical owner's child metadata; failure never authorizes child removal.
- * This process-local claim leaves the identity present for retry after a
+ * The lifetime claim leaves the identity present for retry after a
  * failed cleanup or process death. It writes no format or payload bytes. */
 int ps_owned_claim_orphan(ps_owned_head *, lc_error *);
 int ps_owned_retire(ps_owned_head *, lc_error *);

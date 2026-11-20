@@ -214,6 +214,33 @@ static void lifecycle(void) {
      &e);
   ps_coordination_unlock(busy);
   ps_coordination_unlock(guard);
+  ps_coordination_guard *second = NULL, *foreign = NULL;
+  uint64_t collision = 1 + PS_COORDINATION_STREAM_CLAIM_SLOTS;
+  ok(ps_coordination_stream_prepare(a, 1, &guard, &e), &e);
+  ok(ps_coordination_stream_prepare(a, collision, &second, &e), &e);
+  ok(ps_coordination_stream_prepare(b, collision, &foreign, &e), &e);
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_STREAM_CLAIM, 1, 0, &busy,
+                               &e) == LC_ERR_PENDING &&
+          !busy);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(guard);
+  ps_coordination_unlock(foreign);
+  REQUIRE(ps_coordination_lock(b, PS_COORDINATION_STREAM_CLAIM, 1, 0, &busy,
+                               &e) == LC_ERR_PENDING &&
+          !busy);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(second);
+  ok(ps_coordination_lock(b, PS_COORDINATION_STREAM_CLAIM, 1, 0, &busy, &e),
+     &e);
+  REQUIRE(ps_coordination_stream_prepare(b, collision, &guard, &e) ==
+              LC_ERR_PENDING &&
+          !guard);
+  lc_error_cleanup(&e);
+  REQUIRE(ps_coordination_stream_prepare(a, collision, &guard, &e) ==
+              LC_ERR_PENDING &&
+          !guard);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(busy);
   guard = (ps_coordination_guard *)1;
   REQUIRE(ps_coordination_lock(a, PS_COORDINATION_CONTROL_STATE, 2, 0, &guard,
                                &e) == LC_ERR_INVALID &&
@@ -645,7 +672,8 @@ static void processes(const char *self) {
       PS_COORDINATION_PUBLICATION,   PS_COORDINATION_RECOVERY,
       PS_COORDINATION_ALLOCATION,    PS_COORDINATION_SYNC,
       PS_COORDINATION_TRANSACTION,   PS_COORDINATION_NAMESPACE,
-      PS_COORDINATION_CONTROL_STATE, PS_COORDINATION_COLLECTION_CATALOG};
+      PS_COORDINATION_CONTROL_STATE, PS_COORDINATION_COLLECTION_CATALOG,
+      PS_COORDINATION_STREAM_CLAIM};
   lc_error_init(&e);
   for (size_t i = 0; i < sizeof(domains) / sizeof(*domains); ++i)
     for (int abrupt = 0; abrupt < 2; ++abrupt) {
@@ -655,7 +683,8 @@ static void processes(const char *self) {
       uint64_t identity = domain == PS_COORDINATION_NAMESPACE ||
                                   domain == PS_COORDINATION_COLLECTION_CATALOG
                               ? UINT64_MAX
-                              : 0;
+                          : domain == PS_COORDINATION_STREAM_CLAIM ? 1
+                                                                   : 0;
       ok(ps_coordination_lock(owner, domain, identity, 0, &guard, &e), &e);
       int ready[2], command[2], status;
       REQUIRE(!pipe(ready) && !pipe(command));

@@ -336,7 +336,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                        size_t value_length, ps_catalog_info *out, int identity,
                        lc_error *e) {
   ps_entry *p, *old, *head;
-  ps_coordination_guard *guard;
+  ps_coordination_guard *guard, *claim = NULL, *preparation = NULL;
   ps_catalog_info info;
   uint64_t sequence = 0, growth = 0, added = 0, prior, next;
   int marker = kind == PS_CATALOG_MARKER;
@@ -379,6 +379,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
     if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind &&
         old->catalog->kind == PS_CATALOG_NAMESPACE)
       rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
+    if (rc == LC_OK && head && !head->catalog_refs && !head->stream_claim)
+      rc = ps_internal_stream_claim(s, head->token, &claim, e);
     if (rc == LC_OK) {
       p->token = s->token_next++;
       p->key.key = old && !old->deleted ? old->key.key : p->token;
@@ -401,6 +403,10 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
        * resolves the current index again, rather than retaining that pointer.
        */
       ps_catalog_apply_record(s, p, sequence);
+      if (head) {
+        preparation = head->stream_claim;
+        head->stream_claim = NULL;
+      }
       p->publication_sequence = sequence;
       ps_internal_install(s, p);
       installed = 1;
@@ -415,6 +421,12 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   }
   if (rc == LC_OK)
     rc = ps_internal_durable(s, sequence, e);
+  if (preparation || claim) {
+    ps_coordination_unlock(preparation);
+    ps_coordination_unlock(claim);
+    if (rc == LC_OK)
+      rc = ps_coordination_check(s->coordination, e);
+  }
   if (rc == LC_OK)
     *out = info;
   return rc;
@@ -620,6 +632,7 @@ static int orphan(ps_entry *p, uint64_t prefix) {
          p->catalog_release <= prefix;
 }
 int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
+  ps_coordination_guard *guard;
   ps_entry *p;
   size_t i;
   int rc;
@@ -627,18 +640,20 @@ int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
     return cat_error(e, LC_ERR_INVALID, "orphan work test requires output");
   *out = 0;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_capture_begin(s, &guard, e);
   for (i = 0U; rc == LC_OK && i < BUCKETS && !*out; ++i)
     for (p = s->stream_buckets[i]; p; p = p->stream_next)
       if (!p->catalog_refs) {
         *out = 1;
         break;
       }
+  rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
                              void *context, lc_error *e) {
+  ps_coordination_guard *guard;
   ps_entry **entries = NULL, *p;
   ps_ref ref;
   size_t i, count = 0, at = 0;
@@ -647,7 +662,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
   if (!s || !callback)
     return cat_error(e, LC_ERR_INVALID, "orphan visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_healthy(s, e);
+  rc = ps_internal_capture_begin(s, &guard, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
     for (p = s->stream_buckets[i]; p; p = p->stream_next)
@@ -669,6 +684,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
         ++p->pins;
         ++s->readers;
       }
+  rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   memcpy(ref.container, s->identity, 16);
   for (i = 0; i < at && rc == LC_OK; ++i) {

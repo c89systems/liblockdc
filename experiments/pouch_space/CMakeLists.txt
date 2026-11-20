@@ -464,6 +464,10 @@ if(LOCKDC_BUILD_TESTS)
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-catalog ${codec} ${sync})
         set_tests_properties(pouch_space_collection_shared-catalog_${codec}_${sync} PROPERTIES
           TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        add_test(NAME pouch_space_collection_shared-orphans_${codec}_${sync}
+          COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-orphans ${codec} ${sync})
+        set_tests_properties(pouch_space_collection_shared-orphans_${codec}_${sync} PROPERTIES
+          TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
         add_test(NAME pouch_space_root_conversion-crash_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-crash ${codec} ${sync})
         set_tests_properties(pouch_space_root_conversion-crash_${codec}_${sync} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

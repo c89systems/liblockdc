@@ -541,12 +541,19 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
   ps_owned_head *head = NULL;
   ps_owned_status status;
   int rc = ps_owned_open(c->space, NULL, key, 0, ref, &head, &status, error);
+  if (rc == LC_OK) {
+    rc = ps_owned_claim_orphan(head, error);
+    if (rc == LC_ERR_PENDING) {
+      ps_owned_close(head);
+      lc_error_cleanup(error);
+      ++c->skipped;
+      return ps_check(c->space, error);
+    }
+  }
   if (rc == LC_OK && key.key == 0U) {
     /* Collection identity is the last retirement in its owner tree. Claiming
      * excludes a concurrent name publication before touching any children. */
-    rc = ps_owned_claim_orphan(head, error);
-    if (rc == LC_OK)
-      rc = ps_collection_reclaim_children(c->space, key.owner, error);
+    rc = ps_collection_reclaim_children(c->space, key.owner, error);
   }
   if (rc == LC_OK)
     rc = ps_owned_retire(head, error);
@@ -554,8 +561,10 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
   if (rc == LC_ERR_INVALID) {
     lc_error_cleanup(error);
     ++c->skipped;
-    return LC_OK;
+    return ps_check(c->space, error);
   }
+  if (rc == LC_OK)
+    rc = ps_check(c->space, error);
   if (rc == LC_OK)
     ++c->reclaimed;
   return rc;

@@ -17,7 +17,8 @@
 #define VIEW_SLOTS (PS_PAGE / 2U)
 #define VIEW_BASE (PS_METADATA_START - VIEW_SLOTS)
 #define STATE_BASE (PS_READINESS_OFFSET + 256U)
-#define STATE_SLOTS (VIEW_BASE - STATE_BASE)
+#define STREAM_CLAIM_BASE (VIEW_BASE - PS_COORDINATION_STREAM_CLAIM_SLOTS)
+#define STATE_SLOTS (STREAM_CLAIM_BASE - STATE_BASE)
 #define COLLECTION_CATALOG_SLOTS (STATE_BASE - PS_READINESS_OFFSET - 2U)
 struct ps_coordination_guard {
   ps_coordination *owner;
@@ -242,6 +243,12 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
                              uint64_t identity) {
   if (domain == PS_COORDINATION_CONTROL_STATE)
     return STATE_BASE - 2 + identity;
+  if (domain == PS_COORDINATION_STREAM_CLAIM) {
+    /* Consecutive incarnations in one allocation grant cover the table. */
+    --identity;
+    return STREAM_CLAIM_BASE +
+           (identity ^ (identity >> 32)) % PS_COORDINATION_STREAM_CLAIM_SLOTS;
+  }
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
@@ -349,7 +356,7 @@ static int local_lock(ps_coordination_guard *guard, int wait) {
                 : pthread_mutex_trylock(&guard->mutex);
   if (!rc && !guard->fixed) {
     ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
-    while (!rc && guard->held)
+    while (!rc && (guard->held || keyed->views))
       rc = wait ? pthread_cond_wait(&keyed->available, &guard->mutex) : EBUSY;
     if (!rc)
       guard->held = 1;
@@ -370,6 +377,8 @@ static int pin_view(ps_coordination_guard *guard, lc_error *e) {
   int rc;
   pthread_mutex_lock(&guard->mutex);
   rc = ps_coordination_check(guard->owner, e);
+  if (rc == LC_OK && guard->held)
+    rc = fail(e, LC_ERR_PENDING, 0, "container file authority is held");
   if (rc == LC_OK && !keyed->views)
     rc = ps_coordination_range(guard->owner, guard->offset, 1, 1, e);
   if (rc == LC_OK)
@@ -377,28 +386,35 @@ static int pin_view(ps_coordination_guard *guard, lc_error *e) {
   pthread_mutex_unlock(&guard->mutex);
   return rc;
 }
-static void unpin_view(ps_coordination_guard *guard) {
+static int unpin_view(ps_coordination_guard *guard) {
   ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
+  int pinned;
   pthread_mutex_lock(&guard->mutex);
-  if (!--keyed->views)
+  pinned = keyed->views != 0;
+  if (pinned && !--keyed->views) {
     (void)ps_coordination_range(guard->owner, guard->offset, 1, 0, NULL);
+    pthread_cond_signal(&keyed->available);
+  }
   pthread_mutex_unlock(&guard->mutex);
+  return pinned;
 }
-int ps_coordination_lock(ps_coordination *owner,
-                         enum ps_coordination_domain domain, uint64_t identity,
-                         int wait, ps_coordination_guard **out, lc_error *e) {
+static int lock_guard(ps_coordination *owner,
+                      enum ps_coordination_domain domain, uint64_t identity,
+                      int wait, int view, ps_coordination_guard **out,
+                      lc_error *e) {
   ps_coordination_guard *guard = NULL;
   int rc, reason;
   if (out)
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_COLLECTION_CATALOG ||
+      domain > PS_COORDINATION_STREAM_CLAIM ||
       (domain >= PS_COORDINATION_STREAM &&
        domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES) ||
+      (domain == PS_COORDINATION_STREAM_CLAIM && !identity) ||
       (domain == PS_COORDINATION_CONTROL_STATE && identity >= 2))
     return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");
   rc = ps_coordination_check(owner, e);
@@ -415,7 +431,7 @@ int ps_coordination_lock(ps_coordination *owner,
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
     return rc;
   }
-  if (domain == PS_COORDINATION_NAMESPACE_VIEW) {
+  if (view || domain == PS_COORDINATION_NAMESPACE_VIEW) {
     rc = pin_view(guard, e);
     if (rc == LC_OK)
       *out = guard;
@@ -445,12 +461,21 @@ int ps_coordination_lock(ps_coordination *owner,
   *out = guard;
   return LC_OK;
 }
+int ps_coordination_lock(ps_coordination *owner,
+                         enum ps_coordination_domain domain, uint64_t identity,
+                         int wait, ps_coordination_guard **out, lc_error *e) {
+  return lock_guard(owner, domain, identity, wait, 0, out, e);
+}
+int ps_coordination_stream_prepare(ps_coordination *owner, uint64_t identity,
+                                   ps_coordination_guard **out, lc_error *e) {
+  return lock_guard(owner, PS_COORDINATION_STREAM_CLAIM, identity, 0, 1, out,
+                    e);
+}
 void ps_coordination_unlock(ps_coordination_guard *guard) {
   ps_coordination *owner;
   if (!guard)
     return;
-  if (guard->offset >= VIEW_BASE) {
-    unpin_view(guard);
+  if (guard->offset >= STREAM_CLAIM_BASE && unpin_view(guard)) {
     drop(guard);
     return;
   }

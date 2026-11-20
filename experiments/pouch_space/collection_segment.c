@@ -272,7 +272,10 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
   s->preferred = PS_PAGE;
   s->space = space;
   s->references = 1UL;
-  rc = ps_owned_open(space, NULL, key, create, expected, &s->head, &status, e);
+  rc = create || expected
+           ? ps_owned_open(space, NULL, key, create, expected, &s->head,
+                           &status, e)
+           : ps_owned_open_prepared(space, key, &s->head, &status, e);
   if (rc == LC_OK)
     rc = ps_owned_runs_capture(s->head, &captured, &count, e);
   for (i = 0U; rc == LC_OK && i < count; ++i) {

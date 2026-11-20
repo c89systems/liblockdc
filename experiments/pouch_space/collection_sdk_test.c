@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -362,6 +363,139 @@ static void shared_catalog(const char *directory, int codec, int sync) {
   ps_namespace_release(ns);
   lc_client_close(second.client);
   reopen(&f);
+  close_store(&f);
+  lc_error_cleanup(&f.error);
+}
+typedef struct orphan_cut {
+  ps_root *peer;
+  int calls;
+} orphan_cut;
+static void reclaim_during_create(void *context, lc_pouch *writer) {
+  orphan_cut *cut = context;
+  ps_catalog_view *view = NULL;
+  lc_error e;
+  uint64_t reclaimed, skipped;
+  if (++cut->calls != 2)
+    return;
+  (void)writer;
+  lc_error_init(&e);
+  /* Import the private identity and its children before catalog selection. */
+  ok(ps_catalog_get(cut->peer->space, 0, PS_CATALOG_NAMESPACE, "journal", 7,
+                    &view, &e),
+     &e);
+  REQUIRE(view);
+  ps_catalog_view_close(view);
+  ok(ps_root_reclaim_orphans(cut->peer, &reclaimed, &skipped, &e), &e);
+  REQUIRE(reclaimed == 1 && skipped == 1);
+  lc_error_cleanup(&e);
+}
+static void orphan_claim_handoff(ps_root *peer, ps_space *space, lc_error *e) {
+  ps_key key = {0, 8, PS_STREAM};
+  const char name[] = "prepared";
+  ps_owned_head *head = NULL, *other = NULL;
+  ps_owned_status status, selected;
+  ps_catalog_info binding;
+  uint64_t reclaimed, skipped;
+  ok(ps_catalog_allocate_id(space, &key.owner, e), e);
+  ok(ps_owned_open(space, NULL, key, 1, NULL, &head, &status, e), e);
+  ok(ps_flush(space, e), e);
+  REQUIRE(ps_owned_open_prepared(peer->space, key, &other, &selected, e) ==
+              LC_ERR_PENDING &&
+          !other);
+  clear(e);
+  REQUIRE(ps_catalog_put(peer->space, NULL, key.owner, PS_CATALOG_BODY, name,
+                         sizeof(name) - 1U, NULL, key, &status.ref, &binding,
+                         e) == LC_ERR_PENDING);
+  clear(e);
+  ok(ps_catalog_put(space, NULL, key.owner, PS_CATALOG_BODY, name,
+                    sizeof(name) - 1U, NULL, key, &status.ref, &binding, e),
+     e);
+  ok(ps_catalog_remove(peer->space, key.owner, PS_CATALOG_BODY, name,
+                       sizeof(name) - 1U, &binding.revision, e),
+     e);
+  /* Publication releases the preparation claim while the creator's handle
+   * is still alive. A later durable unbind can be reclaimed by a peer. */
+  ok(ps_root_reclaim_orphans(peer, &reclaimed, &skipped, e), e);
+  REQUIRE(reclaimed == 1 && skipped == 0);
+  ps_owned_close(head);
+}
+static void reclaim_after_exit(const char *path, ps_root *peer, lc_error *e) {
+  int ready[2], status;
+  ps_key key = {0, 9, PS_STREAM};
+  ps_ref receipt;
+  ps_owned_head *head = NULL;
+  ps_owned_status owned;
+  uint64_t reclaimed, skipped;
+  pid_t child;
+  ok(ps_catalog_allocate_id(peer->space, &key.owner, e), e);
+  REQUIRE(!pipe(ready));
+  child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    ps_space *space = NULL;
+    ps_owned_run *run = NULL;
+    int found;
+    REQUIRE(!close(ready[0]));
+    ok(ps_open(path, 0, NULL, &space, e), e);
+    ok(ps_owned_open(space, NULL, key, 1, NULL, &head, &owned, e), e);
+    ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, e), e);
+    REQUIRE(found && run);
+    ok(ps_flush(space, e), e);
+    REQUIRE(write(ready[1], &owned.ref, sizeof(owned.ref)) ==
+            (ssize_t)sizeof(owned.ref));
+    for (;;)
+      pause();
+  }
+  REQUIRE(!close(ready[1]));
+  REQUIRE(read(ready[0], &receipt, sizeof(receipt)) ==
+          (ssize_t)sizeof(receipt));
+  REQUIRE(!close(ready[0]));
+  ok(ps_root_reclaim_orphans(peer, &reclaimed, &skipped, e), e);
+  REQUIRE(reclaimed == 0 && skipped == 1);
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &status, 0) == child &&
+          WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  ok(ps_root_reclaim_orphans(peer, &reclaimed, &skipped, e), e);
+  REQUIRE(reclaimed == 1 && skipped == 0);
+  REQUIRE(ps_owned_open(peer->space, NULL, key, 0, &receipt, &head, &owned,
+                        e) == LC_ERR_INVALID);
+  clear(e);
+}
+static void shared_orphans(const char *directory, int codec, int sync) {
+  fixture f;
+  orphan_cut cut = {0};
+  lc_client *peer;
+  lc_collection *fresh = NULL;
+  lc_collection_config config;
+  ps_owned_head *unused = NULL;
+  ps_owned_status status;
+  ps_key abandoned = {0, 7, PS_STREAM};
+  ps_space *space;
+  setup(&f, directory, codec, sync, 0);
+  space =
+      ps_root_space(ps_pouch_state_root(((lc_client_handle *)f.client)->pouch));
+  ok(ps_pouch_client_open(&f.config, 0, NULL, &peer, &f.error), &f.error);
+  cut.peer = ps_pouch_state_root(((lc_client_handle *)peer)->pouch);
+  ok(ps_catalog_allocate_id(space, &abandoned.owner, &f.error), &f.error);
+  ok(ps_owned_open(space, NULL, abandoned, 1, NULL, &unused, &status, &f.error),
+     &f.error);
+  ps_owned_close(unused);
+  ok(ps_flush(space, &f.error), &f.error);
+  lc_collection_config_init(&config);
+  config.name = "new-owner";
+  lc_collection_root_test_context = &cut;
+  lc_collection_root_test_hook = reclaim_during_create;
+  ok(lc_client_create_collection(f.client, &config, &fresh, &f.error),
+     &f.error);
+  lc_collection_root_test_hook = NULL;
+  lc_collection_root_test_context = NULL;
+  REQUIRE(cut.calls == 2);
+  lc_collection_close(fresh);
+  orphan_claim_handoff(cut.peer, space, &f.error);
+  reclaim_after_exit(f.path, cut.peer, &f.error);
+  lc_client_close(peer);
+  reopen(&f);
+  ok(lc_client_open_collection(f.client, &config, &fresh, &f.error), &f.error);
+  lc_collection_close(fresh);
   close_store(&f);
   lc_error_cleanup(&f.error);
 }
@@ -1828,6 +1962,7 @@ int main(int argc, char **argv) {
       (argc == 5 &&
        (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
         !strcmp(argv[2], "shared-catalog") ||
+        !strcmp(argv[2], "shared-orphans") ||
         !strcmp(argv[2], "root-conversion-faults") ||
         !strcmp(argv[2], "root-conversion-controls") ||
         !strcmp(argv[2], "root-conversion-crash") ||
@@ -1860,6 +1995,9 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[2], "shared-catalog")) {
       shared_catalog_mode = 1;
       shared_catalog(directory, codec, sync);
+    } else if (!strcmp(argv[2], "shared-orphans")) {
+      shared_catalog_mode = 1;
+      shared_orphans(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-faults")) {
       root_conversion_faults(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-controls")) {

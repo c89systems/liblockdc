@@ -65,6 +65,7 @@ typedef struct ps_entry {
   int owned_linked;
   size_t stream_handles;
   int stream_guarded, stream_sealed, orphan_claimed;
+  ps_coordination_guard *stream_claim; /* Local preparation or orphan pass. */
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
   int payload_claimed;
@@ -225,6 +226,8 @@ int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
                              const void *, size_t, uint64_t prefix,
                              ps_catalog_info *);
 int ps_internal_complete_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
+int ps_internal_stream_claim(ps_space *, uint64_t, ps_coordination_guard **,
+                             lc_error *);
 /* Caller holds the namespace-name guard while checking and claiming its
  * immutable catalog owner's writer stamp. */
 int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);
