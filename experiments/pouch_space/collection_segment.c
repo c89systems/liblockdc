@@ -79,8 +79,6 @@ static int cs_mapping(ps_collection_segment *s, uint64_t at,
                     "collection canonical range has no physical owner");
   }
   *run = s->runs[lo];
-  if (s->shared)
-    ps_owned_run_retain(run->run);
   pthread_mutex_unlock(&s->mutex);
   return LC_OK;
 }
@@ -100,8 +98,6 @@ static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
                : n;
     rc = writing ? ps_owned_write(run.run, at - run.base, p, take, e)
                  : ps_owned_read(run.run, at - run.base, p, take, e);
-    if (s->shared)
-      ps_owned_run_close(run.run);
     if (rc != LC_OK)
       return rc;
     at += take;
@@ -277,11 +273,14 @@ static int cs_new(ps_space *space, int writable, ps_collection_segment **out,
   return LC_OK;
 }
 
-static int cs_load(ps_collection_segment *s, ps_owned_head *head,
+static int cs_load(ps_collection_segment *s, ps_key key, const ps_ref *ref,
                    ps_owned_status *status, lc_error *e) {
   ps_owned_run **captured = NULL;
   size_t count = 0U, i;
-  int rc = ps_owned_runs_capture_status(head, status, &captured, &count, e);
+  int rc = s->head ? ps_owned_runs_capture_status(s->head, status, &captured,
+                                                  &count, e)
+                   : ps_owned_runs_key_status(s->space, key, ref, status,
+                                              &captured, &count, e);
   for (i = 0U; rc == LC_OK && i < count; ++i) {
     rc = cs_room(s, e);
     if (rc == LC_OK &&
@@ -357,14 +356,20 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
     return cs_error(e, LC_ERR_INVALID,
                     "collection canonical owner requires a space and output");
   rc = cs_new(space, 1, &s, e);
+  if (rc == LC_OK && !create && !expected)
+    rc = ps_owned_open_prepared(space, key, &s->head, &status, e);
+  else if (rc == LC_OK && s->shared)
+    rc = ps_owned_open_guarded(space, NULL, key, create, expected, &s->head,
+                               &status, e);
+  else if (rc == LC_OK)
+    rc =
+        ps_owned_open(space, NULL, key, create, expected, &s->head, &status, e);
   if (rc == LC_OK)
-    rc = create || expected
-             ? ps_owned_open(space, NULL, key, create, expected, &s->head,
-                             &status, e)
-             : ps_owned_open_prepared(space, key, &s->head, &status, e);
-  if (rc == LC_OK)
-    rc = cs_load(s, s->head, &status, e);
-  if (rc == LC_OK && !create && !status.sealed && recover)
+    rc = cs_load(s, key, expected, &status, e);
+  if (rc == LC_OK && s->shared && recover && status.sealed)
+    rc = cs_error(e, LC_ERR_PROTOCOL, "selected collection writer is sealed");
+  if (rc == LC_OK && !create && !status.sealed && recover &&
+      (!s->shared || (status.capacity && !status.complete)))
     rc = cs_recover(s, &status, recover, context, e);
   if (rc != LC_OK) {
     ps_collection_segment_close(s);
@@ -374,71 +379,19 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
   return LC_OK;
 }
 
-int ps_collection_segment_view(ps_collection_segment *source,
+int ps_collection_segment_view(ps_space *space, ps_key key, const ps_ref *ref,
                                ps_collection_segment **out, lc_error *e) {
   ps_collection_segment *view = NULL;
   ps_owned_status status;
-  int rc = cs_new(source->space, 0, &view, e);
+  int rc = cs_new(space, 0, &view, e);
   if (rc == LC_OK)
-    rc = cs_load(view, source->head, &status, e);
+    rc = cs_load(view, key, ref, &status, e);
   if (rc != LC_OK) {
     ps_collection_segment_close(view);
     return rc;
   }
   *out = view;
   return LC_OK;
-}
-
-int ps_collection_segment_refresh(ps_collection_segment *s,
-                                  ps_collection_segment_recover_fn recover,
-                                  void *context, lc_error *e) {
-  ps_collection_segment *view = NULL;
-  ps_collection_run *old;
-  ps_owned_status status;
-  size_t count;
-  int reload, rc;
-  rc = ps_owned_status_capture(s->head, &status, e);
-  if (rc != LC_OK)
-    return rc;
-  if (status.retired || status.sealed)
-    return cs_error(e, LC_ERR_PROTOCOL, "selected collection writer is closed");
-  pthread_mutex_lock(&s->mutex);
-  reload = s->count != status.runs || s->capacity != status.capacity;
-  pthread_mutex_unlock(&s->mutex);
-  if (reload) {
-    rc = cs_new(s->space, 0, &view, e);
-    if (rc == LC_OK)
-      rc = cs_load(view, s->head, &status, e);
-    if (rc != LC_OK) {
-      ps_collection_segment_close(view);
-      return rc;
-    }
-    pthread_mutex_lock(&s->mutex);
-    old = s->runs;
-    count = s->count;
-    s->runs = view->runs;
-    s->count = view->count;
-    s->room = view->room;
-    s->capacity = view->capacity;
-    s->preferred = view->preferred;
-    view->runs = old;
-    view->count = count;
-    pthread_mutex_unlock(&s->mutex);
-    ps_collection_segment_close(view);
-  }
-  if (!status.complete && status.capacity)
-    rc = cs_recover(s, &status, recover, context, e);
-  else {
-    pthread_mutex_lock(&s->mutex);
-    s->tail = status.tail;
-    pthread_mutex_unlock(&s->mutex);
-  }
-  if (rc == LC_OK) {
-    pthread_mutex_lock(&s->mutex);
-    s->editing = 0;
-    pthread_mutex_unlock(&s->mutex);
-  }
-  return rc;
 }
 
 void ps_collection_segment_retain(ps_collection_segment *s) {

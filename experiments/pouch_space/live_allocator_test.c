@@ -160,7 +160,9 @@ static uint64_t coverage(ps_space *ignore, int capture) {
   struct stat st;
   REQUIRE(fstat(fd, &st) == 0 && st.st_size >= 0);
   size_t count = 2;
-  pending[0].first = 2 * PS_PAGE;
+  /* Count allocator range witnesses. The readiness page carries logical
+   * lifetime locks that own no workspace or payload bytes. */
+  pending[0].first = PS_METADATA_START;
   pending[0].last = PS_JOURNAL_OFFSET;
   pending[1].first = PS_DATA;
   pending[1].last = (uint64_t)st.st_size > PS_DEFAULT_CAPACITY

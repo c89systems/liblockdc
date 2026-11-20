@@ -5924,7 +5924,8 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (!create)
     p = lookup(s, key);
   if (rc == LC_OK && (!p || p->deleted ||
-                      (p->stream_handles && (!guarded || !p->stream_guarded))))
+                      (p->stream_handles && (!guarded || !p->stream_guarded ||
+                                             (prepare && !p->catalog_refs)))))
     rc = err(error, LC_ERR_INVALID,
              "owned stream missing or already has an open owner");
   if (rc == LC_OK && ref &&
@@ -5968,7 +5969,8 @@ int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
 }
 int ps_owned_open_prepared(ps_space *s, ps_key key, ps_owned_head **out,
                            ps_owned_status *status, lc_error *error) {
-  return owned_open(s, NULL, key, 0, NULL, 0, 1, out, status, error);
+  int shared = ps_coordination_shared(ps_space_coordination(s));
+  return owned_open(s, NULL, key, 0, NULL, shared, 1, out, status, error);
 }
 void ps_owned_close(ps_owned_head *head) {
   ps_space *s;
@@ -6483,7 +6485,7 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   if (count)
     *count = 0;
   if (!s || !out || !count ||
-      (!head && (!ref || key.kind != PS_STREAM || start >= end)))
+      (!head && (!ref || key.kind != PS_STREAM || (!status && start >= end))))
     return err(error, LC_ERR_INVALID,
                "mapping capture requires head and outputs");
   pthread_mutex_lock(&s->mutex);
@@ -6509,7 +6511,7 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
       owned_status(&selected, status);
     }
   }
-  if (rc == LC_OK && ref) {
+  if (rc == LC_OK && ref && end) {
     while (first && first->key.key + first->stream_capacity <= start)
       first = first->owned_next;
     capacity = 0;
@@ -6571,6 +6573,11 @@ int ps_owned_runs_capture_status(ps_owned_head *head, ps_owned_status *status,
   const ps_key none = {0};
   return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
                       none, NULL, 0, 0, status, out, count, error);
+}
+int ps_owned_runs_key_status(ps_space *s, ps_key key, const ps_ref *ref,
+                             ps_owned_status *status, ps_owned_run ***out,
+                             size_t *count, lc_error *error) {
+  return capture_runs(s, NULL, key, ref, 0, 0, status, out, count, error);
 }
 int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
                         uint64_t start, uint64_t end, ps_owned_run ***out,

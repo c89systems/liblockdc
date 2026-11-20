@@ -83,6 +83,9 @@ int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
                           lc_error *);
 int ps_owned_runs_capture_status(ps_owned_head *, ps_owned_status *,
                                  ps_owned_run ***, size_t *, lc_error *);
+int ps_owned_runs_key_status(ps_space *, ps_key, const ps_ref *,
+                             ps_owned_status *, ps_owned_run ***, size_t *,
+                             lc_error *);
 int ps_owned_runs_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
                         uint64_t end, ps_owned_run ***, size_t *, lc_error *);
 typedef struct ps_owned_range {

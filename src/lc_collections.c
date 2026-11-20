@@ -172,7 +172,13 @@ int lc_collection_capture_enter(lc_collection_handle *collection,
       lc_cc_commit_leave(pin);
       break;
     }
-    rc = lc_cc_order_refresh(collection, error);
+    /* A shared reader may have skipped repair because a peer owns APPEND.
+     * Select the current topology under metadata authority before resolving
+     * any bindings. Older bindings may already have been reclaimed. */
+    if (collection->segments.replay)
+      rc = lc_collection_head_read(collection, error);
+    if (rc == LC_OK)
+      rc = lc_cc_order_refresh(collection, error);
     if (rc != LC_OK || !collection->order.edit_in_progress) {
       if (rc != LC_OK) {
         lc_collection_metadata_leave(collection);
@@ -938,11 +944,15 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   }
   rc = lc_collection_record_leaf(segment, leaf, error);
   memset(&input, 0, sizeof(input));
-  if (rc == LC_OK)
-    rc = captured ? collection->segments.replay(collection->segments.context,
-                                                segment, &input, error)
-                  : collection->segments.open(collection->segments.context,
-                                              segment, 0, &input, error);
+  if (rc == LC_OK && captured)
+    rc = collection->segments.replay(collection->segments.context, segment,
+                                     &input, error);
+  else if (rc == LC_OK && collection->layout.release_active &&
+           collection->active.ops && collection->active_fd_segment == segment)
+    rc = lc_collection_segment_clone(&collection->active, &input, error);
+  else if (rc == LC_OK)
+    rc = collection->segments.open(collection->segments.context, segment, 0,
+                                   &input, error);
   if (rc == LC_OK)
     rc = lc_pouch_record_io_tail(input.io, &limit, error);
   if (rc != LC_OK) {
@@ -1206,6 +1216,13 @@ static int lc_collection_reconcile(lc_collection_handle *collection,
   return lc_cc_replay_tail(collection, 1, error);
 }
 
+static void lc_cc_append_release(lc_collection_handle *collection,
+                                 lc_collection_lock *pin) {
+  if (pin->authority.ops && collection->layout.release_active)
+    collection->layout.release_active(collection->layout.context);
+  lc_collection_lock_leave(pin);
+}
+
 int lc_collection_prepare(lc_collection_handle *collection, lc_error *error) {
   lc_collection_guard guard;
   lc_collection_lock probe;
@@ -1242,7 +1259,7 @@ int lc_collection_prepare(lc_collection_handle *collection, lc_error *error) {
       rc = lc_collection_reconcile(collection, error);
       lc_collection_metadata_leave(collection);
     }
-    lc_collection_lock_leave(&guard.append_pin);
+    lc_cc_append_release(collection, &guard.append_pin);
   }
   pthread_mutex_unlock(&collection->append_mutex);
   lc_cc_root_leave(&guard);
@@ -1525,7 +1542,7 @@ static int lc_cc_write_enter(lc_collection_call *call,
       }
     }
     if (rc != LC_OK) {
-      lc_collection_lock_leave(&guard->append_pin);
+      lc_cc_append_release(collection, &guard->append_pin);
       pthread_mutex_unlock(&collection->append_mutex);
       guard->append = 0;
     }
@@ -1600,7 +1617,7 @@ void lc_collection_control_leave(lc_collection_guard *guard) {
 
 static void lc_cc_write_unlock(lc_collection_guard *guard) {
   if (guard->append) {
-    lc_collection_lock_leave(&guard->append_pin);
+    lc_cc_append_release(guard->collection, &guard->append_pin);
     pthread_mutex_unlock(&guard->collection->append_mutex);
     guard->append = 0;
   }
@@ -1727,7 +1744,7 @@ static int file_layout_cleanup(void *context, lc_pouch_maintenance_result *out,
   return lc_collection_file_cleanup(context, out, error);
 }
 lc_collection_layout lc_collection_file_layout(lc_collection_handle *c) {
-  lc_collection_layout layout;
+  lc_collection_layout layout = {0};
   layout.active = file_layout_active;
   layout.rotate = file_layout_rotate;
   layout.discard = file_layout_discard;
@@ -3089,7 +3106,7 @@ int lc_collection_owned_open(lc_pouch *pouch, lc_client_handle *client,
     }
   }
   if (appended)
-    lc_collection_lock_leave(&append_pin);
+    lc_cc_append_release(collection, &append_pin);
   if (entered)
     lc_collection_root_end(&scope, &guard);
   if (rc != LC_OK) {

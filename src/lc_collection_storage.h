@@ -149,6 +149,9 @@ typedef struct lc_collection_layout {
   int (*rotate)(void *, int force, lc_u64 limit, lc_error *);
   int (*discard)(void *, lc_u64, lc_error *);
   int (*cleanup)(void *, lc_pouch_maintenance_result *, lc_error *);
+  /* Release the append scope's working mappings. Private uploads and commits
+   * keep their own segment capabilities. */
+  void (*release_active)(void *);
   void *context;
 } lc_collection_layout;
 lc_collection_layout lc_collection_file_layout(struct lc_collection_handle *);

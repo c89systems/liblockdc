@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), and [shared collection append](#shared-collection-append-and-captured-reads) | Fixed-capacity reuse, shared throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Shared capacity across lease and messaging workloads, throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), and [collection topology retention](#shared-collection-append-and-captured-reads) | Qualification of shared indexed queries and sustained reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7680,8 +7680,8 @@ The shared reader witness covers the whole collection. It permits peer
 compaction to publish a new topology and defers cleanup of obsolete bindings
 until captured readers drain. This can defer cleanup during readers of the
 current topology as well. Dropped collection trees use the same witness
-before removing their children. Physical reuse with idle peer caches still
-requires qualification because resident segment maps can retain run pins.
+before removing their children. The [fixed-capacity reuse work](#shared-collection-reuse-at-fixed-capacity)
+below releases the physical run pins held by idle receivers.
 
 The SDK cases check alternating append positions and duplicate receipts
 across independently opened roots. A paused producer exposes an unpublished
@@ -7715,3 +7715,54 @@ multifile for 64 KiB and 4 KiB, respectively. Both single-file NoSync
 profiles recorded two foreground `fdatasync` calls per sample median.
 Raw runs and qualification logs are in
 `build/pouch-space-collection-handoff/`.
+
+## Shared collection reuse at fixed capacity
+
+Shared collection readers acquire the selected run mappings directly from
+their catalog reference. A shared appender opens its working segment under
+append authority and releases it before unlocking. Captured readers, staged
+uploads, and grouped commits retain their own handles for the duration of
+their I/O. An idle receiver retains its catalog identity and logical
+projection. Identity creation holds its physical claim through durable name
+publication. Drop can claim and retire the identity again by its saved
+reference. Retirement retries retain scalar metadata and head authority.
+
+A capture reads the selected topology under collection metadata authority
+even when a peer owns APPEND and the reader skipped repair. The case with a
+busy APPEND lane opens the latest topology after compaction has already retired
+the old bindings. It verifies the captured entry's body in the latest topology.
+
+The reuse fixture keeps both independently opened roots and their receivers
+live for 28 cycles at a hard 10 MiB maximum. Each cycle streams and verifies
+a 384 KiB value, deletes the preceding value, then compacts and checkpoints.
+Writers alternate by cycle. Every pass retires obsolete bindings and both
+idle roots report zero retained payload bytes. The fixture writes 10.5 MiB
+of application bodies across the 28 cycles and verifies the last body after
+cold reopen. The prior build failed the idle payload witness assertion.
+All four plaintext and encrypted/compressed profiles under NoSync and
+durable sync passed on Debug, GNU release, and musl release.
+
+The allocator coverage probe previously counted stream preparation locks
+in the readiness page as allocator bytes. The same assertion failed on the
+prior binary. Starting workspace inspection at `PS_METADATA_START` restored
+the exact payload and metadata witness checks. The targeted Debug rerun passed
+all ten groups, including the failed allocator group from the initial 46
+selected tests. All 43 selected groups passed on each release build.
+
+All 36 matched GNU runs verified bodies through reopen. The comparison uses
+two independent collection writers and the previous 4 KiB and 64 KiB
+workloads. The figures are median milliseconds for `d81a7f61` shared /
+current shared / multifile.
+
+| Phase | 4 KiB NoSync | 4 KiB durable | 64 KiB NoSync | 64 KiB durable |
+| --- | ---: | ---: | ---: | ---: |
+| Append work | 17.82 / 14.90 / 0.98 | 97.45 / 120.96 / 71.36 | 14.60 / 16.82 / 4.60 | 150.68 / 134.11 / 140.57 |
+| Close | 0.15 / 0.15 / 40.51 | 0.19 / 0.22 / 26.94 | 0.17 / 0.16 / 49.27 | 0.18 / 0.18 / 33.72 |
+| Reopen | 27.16 / 37.83 / 7.21 | 21.23 / 23.07 / 7.13 | 34.18 / 40.30 / 5.83 | 27.49 / 23.67 / 10.28 |
+| Verification after reopen | 0.37 / 0.33 / 0.32 | 0.32 / 0.44 / 0.36 | 2.64 / 3.05 / 2.81 | 3.21 / 2.77 / 3.04 |
+
+The two shared versions showed the same foreground sync counts per profile.
+Small NoSync still includes two `fdatasync` calls per sample median and takes
+15.2 times as long as multifile. Broad shared capacity acceptance for lease
+and messaging workloads remains open. Raw runs and test logs are in
+`build/pouch-space-collection-reuse/`.

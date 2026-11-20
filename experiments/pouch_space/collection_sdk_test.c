@@ -171,12 +171,16 @@ static void open_client(fixture *f, int create) {
   ps_pouch_client_options physical = {0};
   f->opening_create = create;
   physical.io = f->io;
+  if (shared_catalog_mode)
+    physical.maximum_capacity = PS_DEFAULT_CAPACITY;
   if (f->worker_mode)
     ok(lc_client_open_with_pouch_factory(&f->config, background_factory, f,
                                          &f->client, &f->error),
        &f->error);
   else
-    ok(ps_pouch_client_open(&f->config, create, f->io ? &physical : NULL,
+    ok(ps_pouch_client_open(&f->config, create,
+                            f->io || physical.maximum_capacity ? &physical
+                                                               : NULL,
                             &f->client, &f->error),
        &f->error);
 }
@@ -966,6 +970,8 @@ static void shared_captured_cleanup(fixture *f) {
   lc_collection_read_opts opts;
   lc_collection_read_res read;
   lc_pouch_maintenance_result cleanup = {0};
+  lc_collection_handle *compactor = f->collection->impl;
+  lc_collection_lock append_pin;
   ((lc_client_handle *)f->client)->pouch->compaction_delete_grace_seconds = 0;
   capture.sink.write = consume_during_compaction;
   capture.sink.impl = &capture;
@@ -989,6 +995,13 @@ static void shared_captured_cleanup(fixture *f) {
      &f->error);
   REQUIRE(cleanup.cleanup_deleted_count && !cleanup.cleanup_pending_count);
   lc_pouch_maintenance_result_cleanup(NULL, &cleanup);
+  /* A busy APPEND lane forces the reader to select its topology without
+   * repair. The earlier topology's bindings have already been retired. */
+  ok(lc_collection_lock_enter(compactor->authority, LC_COLLECTION_AUTH_APPEND,
+                              0, 1, 1, &append_pin, &f->error),
+     &f->error);
+  read_entry(f->peer, 3U, 262144U, &f->error);
+  lc_collection_lock_leave(&append_pin);
 }
 typedef struct nested_source {
   lc_source source;
@@ -1102,6 +1115,61 @@ static void shared_append(const char *directory, int codec, int sync) {
   REQUIRE(!pthread_cond_destroy(&g.condition));
   REQUIRE(!pthread_mutex_destroy(&g.mutex));
   lc_error_cleanup(&f.error);
+}
+static void idle_collection_capacity(lc_client *client, lc_error *e) {
+  lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
+  ps_stats stats;
+  ok(ps_status(ps_root_space(ps_pouch_state_root(pouch)), &stats, e), e);
+  REQUIRE(stats.capacity == PS_DEFAULT_CAPACITY);
+  REQUIRE(!stats.retained_payload_bytes);
+}
+static void shared_capacity(const char *directory, int codec, int sync) {
+  fixture f;
+  lc_client *peer = NULL;
+  lc_collection_config config;
+  lc_collection_delete_res deleted;
+  lc_collection_append_res inserted;
+  lc_pouch_maintenance_result pass;
+  ps_pouch_client_options fixed = {0};
+  setup(&f, directory, codec, sync, 1);
+  lc_collection_close(f.peer);
+  f.peer = NULL;
+  fixed.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(ps_pouch_client_open(&f.config, 0, &fixed, &peer, &f.error), &f.error);
+  lc_collection_config_init(&config);
+  config.name = "events/\303\245";
+  ok(lc_client_open_collection(peer, &config, &f.peer, &f.error), &f.error);
+  ((lc_client_handle *)f.client)->pouch->compaction_delete_grace_seconds = 0;
+  ((lc_client_handle *)peer)->pouch->compaction_delete_grace_seconds = 0;
+  for (uint64_t position = 1; position <= 28U; ++position) {
+    lc_collection *writer = position % 2 ? f.collection : f.peer;
+    lc_collection *reader = position % 2 ? f.peer : f.collection;
+    char id[32];
+    snprintf(id, sizeof(id), "cycle-%llu", (unsigned long long)position);
+    inserted = append(writer, id, 393216U, &f.error);
+    REQUIRE(inserted.position == position);
+    read_entry(reader, position, 393216U, &f.error);
+    if (position > 1U) {
+      ok(lc_collection_delete_entry(writer, position - 1U, &deleted, &f.error),
+         &f.error);
+      REQUIRE(deleted.deleted);
+    }
+    memset(&pass, 0, sizeof(pass));
+    ok(ps_pouch_collection_maintain(writer, 1, 0, &pass, &f.error), &f.error);
+    REQUIRE(pass.compacted_collection_count == 1U &&
+            pass.cleanup_deleted_count);
+    lc_pouch_maintenance_result_cleanup(NULL, &pass);
+    idle_collection_capacity(f.client, &f.error);
+    idle_collection_capacity(peer, &f.error);
+  }
+  lc_collection_close(f.peer);
+  f.peer = NULL;
+  lc_client_close(peer);
+  reopen(&f);
+  read_entry(f.peer, inserted.position, 393216U, &f.error);
+  close_store(&f);
+  lc_error_cleanup(&f.error);
+  puts("shared capacity: 28 reuse cycles at 10 MiB passed");
 }
 typedef struct handoff_task {
   lc_collection_writer *writer;
@@ -2155,6 +2223,7 @@ int main(int argc, char **argv) {
         !strcmp(argv[2], "shared-catalog") ||
         !strcmp(argv[2], "shared-orphans") ||
         !strcmp(argv[2], "shared-append") ||
+        !strcmp(argv[2], "shared-capacity") ||
         !strcmp(argv[2], "root-conversion-faults") ||
         !strcmp(argv[2], "root-conversion-controls") ||
         !strcmp(argv[2], "root-conversion-crash") ||
@@ -2193,6 +2262,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[2], "shared-append")) {
       shared_catalog_mode = 1;
       shared_append(directory, codec, sync);
+    } else if (!strcmp(argv[2], "shared-capacity")) {
+      shared_catalog_mode = 1;
+      shared_capacity(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-faults")) {
       root_conversion_faults(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-controls")) {
