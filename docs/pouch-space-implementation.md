@@ -9226,3 +9226,64 @@ The overlap did not recur in the instrumented runs, leaving its cause
 unresolved. Wider durable runs still expose contention during private repack.
 Logs are under the `namespace-observation-` prefix in
 `build/pouch-space-concurrent/`.
+
+## Shared namespace refresh during repack
+
+A private repack holds a reference to its source and pins the source mappings
+while it prepares an encoded replacement. Foreground recovery can install a
+fresh directory after a peer publishes. Each local source incarnation has at
+most one repack in flight, including across a directory refresh. Range capture,
+tail rotation and mapping selection validate the current source. Selection
+also checks the liveness epoch and the physical predecessor. A stale
+candidate defers to another maintenance pass and returns its private
+space. Existing read windows continue using their captured mappings. An
+open body builder retains its source handle until close.
+
+The gated test reproduces the previous `namespace mapping is being replaced`
+error with two independently opened roots. Under both durability policies,
+the peer replaces a canonical value during the private copy. The original
+owner refreshes, rejects a second repack for the same source and publishes a
+second value while the copy is still paused. A captured reader survives the
+refresh and the stale candidate's release. The next sweep replaces the
+mapping and reopen verifies the current values and checkpoint sequence.
+
+Debug passed 35 focused checks. GNU and musl Release passed 19 each. Both
+repack concurrency cases passed ThreadSanitizer. The checks cover shared
+source pin faults and process exit, active-source retirement, codec
+conversion, indexed recovery and concurrent lease and messaging at fixed
+capacity.
+
+The GNU comparison alternates the previous single-file build (`21d2a99e`),
+the current single-file build and multifile. It runs twelve indexed revisions,
+64 KiB values and live reclamation at fixed 10 MiB. The four-writer profiles
+stream 12 MiB each. The two-writer durable profile streams 15 MiB. Three
+attempts per build and profile verified 24 of 27 workflows. The current build
+verified all six durable attempts. The previous build failed two of three
+15 MiB attempts on the namespace mapping error. The current build refused
+ordinary capacity in one of three four-writer NoSync attempts. The previously
+observed `overlapping container ownership` error did not recur in this matrix.
+
+The tables show successful-attempt medians in milliseconds, ordered as
+previous single-file, current single-file and multifile. The 15 MiB prior
+result represents one successful attempt. The current four-writer NoSync
+result represents two attempts. All owners close before reopen. The OS file
+cache is retained.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync | 1988.24 / 2222.28 / 1520.99 | 120.46 / 114.25 / 35.34 | 3.93 / 2.70 / 1.35 | 24.72 / 22.44 / 1.19 | 7.19 / 6.88 / 8.29 |
+| Four writers, durable | 4815.94 / 4098.23 / 5122.55 | 154.05 / 131.33 / 130.82 | 4.17 / 3.34 / 1.07 | 30.55 / 24.10 / 0.93 | 6.56 / 6.58 / 7.21 |
+| Two writers, durable, 15 MiB | 9259.63 / 8494.91 / 7079.62 | 123.13 / 130.94 / 95.23 | 2.74 / 2.26 / 0.99 | 19.68 / 18.63 / 0.77 | 8.84 / 9.23 / 6.96 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync | 285.52 / 386.34 / 362.48 | 104.79 / 124.03 / 202.54 | 63.39 / 47.13 / 275.33 |
+| Four writers, durable | 266.87 / 273.01 / 561.80 | 89.15 / 75.59 / 632.57 | 27.45 / 40.64 / 953.33 |
+| Two writers, durable, 15 MiB | 216.08 / 173.99 / 247.58 | 25.47 / 20.08 / 244.78 | 2.85 / 25.03 / 360.69 |
+
+The four-writer durable work median was 20% below multifile with comparable
+per-item p95. The two-writer durable median was 20% above. The four-writer
+NoSync work median was 46% above multifile, with a 3.2× per-item p95. The
+fixed-capacity refusal, foreground tails and cold admission costs remain
+open for qualification. Raw attempts and phase counters are under the
+`namespace-repack-refresh-` prefix in `build/pouch-space-concurrent/`.

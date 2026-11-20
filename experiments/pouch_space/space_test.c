@@ -7523,7 +7523,10 @@ int main(int argc, char **argv) {
         namespace_repack(durable);
     } else if (strcmp(argv[2], "namespace-repack-concurrency") == 0) {
       for (int durable = 0; durable < 2; ++durable)
-        namespace_repack_concurrency(durable);
+        namespace_repack_concurrency(durable, 0);
+    } else if (strcmp(argv[2], "namespace-repack-shared-refresh") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        namespace_repack_concurrency(durable, 1);
     } else if (strcmp(argv[2], "namespace-repack-churn") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         namespace_repack_churn(durable);

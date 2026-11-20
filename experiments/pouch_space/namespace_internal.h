@@ -18,8 +18,9 @@ typedef struct ps_ns_resource {
   ps_ns_label *label;
   ps_catalog_info binding;
   ps_stream *stream;
+  size_t references;
   int unselected, pooled, repacking, retiring;
-  struct ps_ns_resource *next;
+  struct ps_ns_resource *next, *repack_next;
 } ps_ns_resource;
 enum ps_namespace_scope {
   PS_NS_IDLE,
@@ -31,7 +32,7 @@ struct ps_namespace_data {
   ps_namespace *ns;
   pthread_mutex_t mutex;
   pthread_cond_t scope_changed;
-  ps_ns_resource **items, *retired;
+  ps_ns_resource **items, *retired, *repacking;
   ps_ns_label *labels;
   size_t count, capacity, views;
   uint64_t active, tail, pending_seal;
@@ -55,7 +56,8 @@ struct ps_namespace_data {
  * the existing namespace-capability lifetime, including after source removal.
  */
 ps_ns_resource *ps_ns_resource_new(unsigned int, uint64_t, lc_error *);
-void ps_ns_resource_free(ps_ns_resource *);
+void ps_ns_resource_retain(ps_ns_resource *);
+void ps_ns_resource_release(ps_ns_resource *);
 void ps_ns_resource_park(struct ps_namespace_data *, ps_ns_resource *);
 int ps_ns_index_room(struct ps_namespace_data *, lc_error *);
 ps_ns_resource *ps_ns_find(struct ps_namespace_data *, unsigned int, uint64_t);

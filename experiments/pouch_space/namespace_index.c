@@ -74,20 +74,26 @@ ps_ns_resource *ps_ns_resource_new(unsigned int kind, uint64_t id,
   lc_free_with_allocator(NULL, leaf);
   r->id = id;
   r->kind = kind;
+  r->references = 1;
   r->label = label;
   r->leaf = label->value;
   return r;
 }
-void ps_ns_resource_free(ps_ns_resource *r) {
-  if (!r)
+void ps_ns_resource_retain(ps_ns_resource *r) {
+  __atomic_add_fetch(&r->references, 1, __ATOMIC_RELAXED);
+}
+void ps_ns_resource_release(ps_ns_resource *r) {
+  if (!r || __atomic_sub_fetch(&r->references, 1, __ATOMIC_ACQ_REL))
     return;
-  ps_stream_close(r->stream, NULL);
+  /* A captured read can drain after the directory and any repack release
+   * the source. Its window already owns the mappings it needs. */
+  ps_stream_drop_view(r->stream);
   if (!r->pooled)
     lc_free_with_allocator(NULL, r->label);
   lc_free_with_allocator(NULL, r);
 }
 void ps_ns_resource_park(struct ps_namespace_data *d, ps_ns_resource *r) {
-  if (!r->repacking &&
+  if (!__atomic_load_n(&r->repacking, __ATOMIC_ACQUIRE) &&
       ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
     ps_stream_park(r->stream);
 }

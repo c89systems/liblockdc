@@ -265,7 +265,7 @@ static void namespace_repack(int durable) {
 typedef struct repack_actor {
   ps_namespace *ns;
   ps_namespace_repack_result result;
-  int rc;
+  int silent, rc;
 } repack_actor;
 static uint64_t namespace_churn_put(ps_root *root, ps_namespace *ns,
                                     const char *key_name, uint64_t index,
@@ -467,32 +467,50 @@ static void *repack_worker(void *context) {
   lc_error e;
   lc_error_init(&e);
   a->rc = ps_namespace_repack(a->ns, PS_CATALOG_SEGMENT, 1, 1, NULL, NULL,
-                              &a->result, &e);
+                              &a->result, a->silent ? NULL : &e);
   lc_error_cleanup(&e);
   return NULL;
 }
-static void namespace_repack_concurrency(int durable) {
+static void namespace_repack_concurrency(int durable, int shared) {
   commit_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
   ps_io io = {&gate, gate_read, gate_write, repack_sync, gate_reserve, NULL};
   ps_root_options options = {0};
   ps_root *root = NULL;
   ps_namespace *ns = NULL;
+  ps_root *peer = NULL;
+  ps_namespace *peer_ns = NULL;
+  ps_namespace_body *published_body = NULL;
   ps_namespace_view *view = NULL;
   namespace_repack_pin pin = {0};
   repack_actor actor = {0};
   pthread_t thread;
   unsigned char bytes[4];
   struct iovec part = {bytes, sizeof(bytes)};
-  char name[32];
+  char name[32], body_leaf[32];
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
+  options.storage.shared = shared;
   options.storage.io = &io;
   OK(ps_root_open(path, 1, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "repack", 1, &ns, &error));
+  if (shared) {
+    options.storage.io = NULL;
+    OK(ps_root_open(path, 0, &options, &peer, &error));
+    OK(ps_root_namespace_acquire(peer, "repack", 0, &peer_ns, &error));
+  }
   for (unsigned int i = 0; i < 120; ++i) {
     CHECK(snprintf(name, sizeof(name), "lease/%u", i) > 0);
     checkpoint_put(root, ns, name, i + 1, 1, i + 1, 1, 0);
+  }
+  if (shared) {
+    struct iovec body_part = {(void *)"data", 4};
+    OK(ps_namespace_body_begin(ns, 4, &published_body, &error));
+    OK(lc_pouch_record_io_append(ps_namespace_body_output(published_body),
+                                 &body_part, 1, &error));
+    OK(ps_namespace_body_commit(published_body, &error));
+    CHECK(snprintf(body_leaf, sizeof(body_leaf), "%s",
+                   ps_namespace_body_leaf(published_body)) > 0);
   }
   OK(ps_namespace_checkpoint_flush(ns, &error));
   pin.ns = ns;
@@ -500,7 +518,9 @@ static void namespace_repack_concurrency(int durable) {
   OK(ps_namespace_view_visit(view, 1, namespace_repack_visit, &pin, &error));
   ps_namespace_view_close(view);
   OK(ps_checkpoint(ps_root_space(root), &error));
+  OK(ps_namespace_checkpoint_recover(ns, &error));
   actor.ns = ns;
+  actor.silent = shared;
   gate.enabled = gate.hold_payload = 1;
   CHECK(pthread_create(&thread, NULL, repack_worker, &actor) == 0);
   await_gate(&gate, 0);
@@ -508,8 +528,23 @@ static void namespace_repack_concurrency(int durable) {
    * Canonical replacement, a peer publication, checkpoint and admitted body
    * consumption must finish before its I/O is released. Its stale liveness
    * must then prevent selection of the completed candidate. */
-  checkpoint_put(root, ns, "lease/0", 121, 2, 1, 1, 0);
-  put(ps_root_space(root), state(999), "peer", 4, 4);
+  if (shared) {
+    ps_namespace_repack_result competing;
+    int rc;
+    checkpoint_put(peer, peer_ns, "lease/0", 121, 2, 1, 1, 0);
+    OK(ps_namespace_checkpoint_recover(ns, &error));
+    CHECK(!strcmp(ps_namespace_body_leaf(published_body), body_leaf));
+    ps_namespace_body_close(published_body);
+    rc = ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 1, NULL, NULL,
+                             &competing, &error);
+    CHECK(rc == LC_ERR_INVALID && error.server_code &&
+          !strcmp(error.server_code, "pouch_namespace_busy"));
+    lc_error_cleanup(&error);
+    checkpoint_put(root, ns, "lease/1", 122, 2, 2, 1, 0);
+  } else {
+    checkpoint_put(root, ns, "lease/0", 121, 2, 1, 1, 0);
+    put(ps_root_space(root), state(999), "peer", 4, 4);
+  }
   OK(ps_checkpoint(ps_root_space(root), &error));
   OK(lc_pouch_record_io_read(ps_namespace_read_input(pin.body), pin.offset,
                              &part, 1, &error));
@@ -521,6 +556,9 @@ static void namespace_repack_concurrency(int durable) {
   CHECK(pthread_join(thread, NULL) == 0 && actor.rc == LC_OK);
   CHECK(actor.result.visited == 1 && !actor.result.replaced &&
         actor.result.pending);
+  OK(lc_pouch_record_io_read(ps_namespace_read_input(pin.body), pin.offset,
+                             &part, 1, &error));
+  CHECK(!memcmp(bytes, "data", sizeof(bytes)));
   ps_namespace_read_close(pin.body);
   pin.body = NULL;
   OK(ps_namespace_checkpoint_flush(ns, &error));
@@ -534,7 +572,26 @@ static void namespace_repack_concurrency(int durable) {
   ps_namespace_view_close(view);
   ps_namespace_read_close(pin.body);
   ps_namespace_release(ns);
+  if (shared) {
+    ps_namespace_release(peer_ns);
+    OK(ps_root_close(peer, &error));
+  }
   OK(ps_root_close(root, &error));
+  if (shared) {
+    checkpoint_seen seen = {0};
+    OK(ps_root_open(path, 0, &options, &root, &error));
+    OK(ps_root_namespace_acquire(root, "repack", 0, &ns, &error));
+    pin = (namespace_repack_pin){0};
+    pin.ns = ns;
+    OK(ps_namespace_view_open(ns, &view, &error));
+    OK(ps_namespace_view_visit(view, 1, namespace_repack_visit, &pin, &error));
+    OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
+    CHECK(pin.count == 120 && seen.first_version == 2 && seen.maximum == 122);
+    ps_namespace_view_close(view);
+    ps_namespace_read_close(pin.body);
+    ps_namespace_release(ns);
+    OK(ps_root_close(root, &error));
+  }
   CHECK(pthread_cond_destroy(&gate.cond) == 0 &&
         pthread_mutex_destroy(&gate.mutex) == 0);
   clean();

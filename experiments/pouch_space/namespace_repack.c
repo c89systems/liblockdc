@@ -23,6 +23,14 @@ static int busy(lc_error *e) {
                       "namespace body ownership is changing or captured", NULL,
                       "pouch_namespace_busy", "pouch");
 }
+static int current_source(struct ps_namespace_data *d, ps_ns_resource *r,
+                          lc_error *e) {
+  return ps_ns_find(d, r->kind, r->id) == r
+             ? LC_OK
+             : lc_error_set(e, LC_ERR_PENDING, 0,
+                            "namespace repack source changed", NULL, NULL,
+                            "pouch");
+}
 static int select_guarded(void *context, lc_error *e) {
   repack_selection *s = context;
   struct ps_namespace_data *d = s->data;
@@ -35,11 +43,10 @@ static int select_guarded(void *context, lc_error *e) {
   pthread_mutex_lock(&d->mutex);
   rc = ps_ns_require_unpinned(d, e);
   if (rc == LC_OK)
-    rc = ps_ns_find(d, r->kind, r->id) != r
-             ? busy(e)
-             : ps_key_checkpoint_ranges_select(d->checkpoint, r->kind, r->id,
-                                               s->epoch, s->publish,
-                                               s->publication, e);
+    rc = current_source(d, r, e);
+  if (rc == LC_OK)
+    rc = ps_key_checkpoint_ranges_select(
+        d->checkpoint, r->kind, r->id, s->epoch, s->publish, s->publication, e);
   pthread_mutex_unlock(&d->mutex);
   if (shared)
     ps_ns_leave(d);
@@ -66,11 +73,11 @@ static int finish_tail(void *context, lc_error *e) {
   ps_key_checkpoint_info(d->checkpoint, &coverage);
   rc = ps_ns_require_unpinned(d, e);
   if (rc == LC_OK)
-    rc = ps_ns_find(d, r->kind, r->id) != r ||
-                 (!s->unused &&
-                  (coverage.pending || !coverage.epoch ||
-                   r->id > coverage.segment ||
-                   (r->id == coverage.segment && coverage.offset != s->tail)))
+    rc = current_source(d, r, e);
+  if (rc == LC_OK)
+    rc = (!s->unused &&
+          (coverage.pending || !coverage.epoch || r->id > coverage.segment ||
+           (r->id == coverage.segment && coverage.offset != s->tail)))
              ? busy(e)
              : ps_stream_status(r->stream, &info, e);
   if (rc == LC_OK && info.tail != s->tail)
@@ -101,9 +108,9 @@ static int plan_tail(repack_selection *s, ps_budget_plan *plan, lc_error *e) {
   ps_stream_info info;
   int rc;
   pthread_mutex_lock(&d->mutex);
-  rc = ps_ns_find(d, r->kind, r->id) != r
-           ? busy(e)
-           : ps_stream_status(r->stream, &info, e);
+  rc = current_source(d, r, e);
+  if (rc == LC_OK)
+    rc = ps_stream_status(r->stream, &info, e);
   if (rc == LC_OK && info.tail != s->tail)
     rc = busy(e);
   if (rc == LC_OK && !info.sealed) {
@@ -125,12 +132,19 @@ static int deferred(int rc, lc_error *e) {
   }
   return 0;
 }
+static int repack_active(struct ps_namespace_data *d, ps_ns_resource *r) {
+  ps_ns_resource *job;
+  for (job = d->repacking; job; job = job->repack_next)
+    if (job->kind == r->kind && job->id == r->id &&
+        job->binding.target.incarnation == r->binding.target.incarnation)
+      return 1;
+  return 0;
+}
 int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
                         size_t limit, ps_piece_select_fn gate, void *context,
                         ps_namespace_repack_result *out, lc_error *e) {
   struct ps_namespace_data *d;
-  ps_ns_resource *r = NULL;
-  ps_stream_window *pin = NULL;
+  ps_ns_resource *r = NULL, **job;
   ps_stream_info info;
   ps_stream_piece_info piece;
   ps_checkpoint_info coverage;
@@ -158,7 +172,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   r = ps_ns_find(d, kind, id);
   rc = ps_ns_require_unpinned(d, e);
   if (rc == LC_OK &&
-      (!d->checkpoint_ready || !r || r->unselected || r->repacking))
+      (!d->checkpoint_ready || !r || r->unselected || repack_active(d, r)))
     rc = busy(e);
   if (rc == LC_OK)
     rc = ps_stream_status(r->stream, &info, e);
@@ -169,10 +183,13 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
     else if (coverage.epoch && kind == PS_CATALOG_BODY && info.sealed)
       cover = info.tail;
     rc = ps_stream_pin_mappings(r->stream, e);
-    if (rc == LC_OK)
-      rc = ps_stream_window_open(r->stream, 0, 0, &pin, e);
     if (rc == LC_OK) {
-      r->repacking = 1;
+      /* Hold the source and its mappings across the private copy. A shared
+       * refresh can install a new owner while this job is outside authority. */
+      ps_ns_resource_retain(r);
+      __atomic_store_n(&r->repacking, 1, __ATOMIC_RELEASE);
+      r->repack_next = d->repacking;
+      d->repacking = r;
       cursor = r->reclaim_cursor;
     } else
       ps_ns_resource_park(d, r);
@@ -220,11 +237,13 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
      * are instead rejected by the source epoch at selection. */
     pthread_mutex_lock(&d->mutex);
     ps_key_checkpoint_info(d->checkpoint, &coverage);
-    rc = coverage.pending && !unused
-             ? busy(e)
-             : ps_key_checkpoint_ranges(
-                   d->checkpoint, kind, id, piece.base,
-                   unused ? piece.bytes : piece.completed_bytes, &live, e);
+    rc = current_source(d, r, e);
+    if (rc == LC_OK)
+      rc = coverage.pending && !unused
+               ? busy(e)
+               : ps_key_checkpoint_ranges(
+                     d->checkpoint, kind, id, piece.base,
+                     unused ? piece.bytes : piece.completed_bytes, &live, e);
     pthread_mutex_unlock(&d->mutex);
     if (rc != LC_OK)
       break;
@@ -311,10 +330,14 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   }
   pthread_mutex_lock(&d->mutex);
   r->reclaim_cursor = cursor;
-  r->repacking = 0;
+  for (job = &d->repacking; *job != r; job = &(*job)->repack_next) {
+  }
+  *job = r->repack_next;
+  r->repack_next = NULL;
+  __atomic_store_n(&r->repacking, 0, __ATOMIC_RELEASE);
   ps_ns_resource_park(d, r);
   pthread_mutex_unlock(&d->mutex);
-  ps_stream_window_close(pin);
+  ps_ns_resource_release(r);
   ps_namespace_release(ns);
   return rc;
 }

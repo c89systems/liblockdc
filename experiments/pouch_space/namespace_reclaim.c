@@ -171,6 +171,7 @@ int ps_ns_body_commit(ps_namespace_body *b, lc_error *e) {
   if (rc == LC_OK) {
     pthread_mutex_lock(&b->data->mutex);
     ps_ns_resource_park(b->data, r);
+    ps_ns_resource_retain(r);
     ps_ns_insert(b->data, r);
     pthread_mutex_unlock(&b->data->mutex);
   }
@@ -191,11 +192,10 @@ void ps_namespace_body_close(ps_namespace_body *b) {
   if (!b)
     return;
   ps_record_abort(&b->writer);
-  if (b->resource && !b->resource->pooled) {
-    if (b->resource->stream && ps_check(b->ns->root->space, NULL) == LC_OK)
-      ps_stream_retire(b->resource->stream, NULL);
-    ps_ns_resource_free(b->resource);
-  }
+  if (b->resource && !b->resource->pooled && b->resource->stream &&
+      ps_check(b->ns->root->space, NULL) == LC_OK)
+    ps_stream_retire(b->resource->stream, NULL);
+  ps_ns_resource_release(b->resource);
   if (b->owns_budget)
     ps_budget_close(b->budget, NULL);
   ps_namespace_release(b->ns);
@@ -221,7 +221,8 @@ static int reap(struct ps_namespace_data *d, uint64_t *closed,
   int rc = LC_OK;
   *closed = *pending = 0;
   while (r && rc == LC_OK) {
-    if (__atomic_load_n(&r->retiring, __ATOMIC_ACQUIRE)) {
+    if (__atomic_load_n(&r->retiring, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&r->repacking, __ATOMIC_ACQUIRE)) {
       ++*pending;
       link = &r->next;
       r = r->next;
@@ -254,7 +255,7 @@ static int reap(struct ps_namespace_data *d, uint64_t *closed,
       pthread_mutex_lock(&d->mutex);
       *link = next;
       pthread_mutex_unlock(&d->mutex);
-      ps_ns_resource_free(r);
+      ps_ns_resource_release(r);
       r = next;
       ++*closed;
     }

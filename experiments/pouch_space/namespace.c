@@ -284,10 +284,10 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
   ps_key_checkpoint_close(d->checkpoint);
   (void)ps_budget_close(d->retention_budget, NULL);
   for (i = 0; i < d->count; ++i)
-    ps_ns_resource_free(d->items[i]);
+    ps_ns_resource_release(d->items[i]);
   for (r = d->retired; r; r = next) {
     next = r->next;
-    ps_ns_resource_free(r);
+    ps_ns_resource_release(r);
   }
   for (label = d->labels; label; label = next_label) {
     next_label = label->next;
@@ -497,12 +497,9 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   ps_ns_resource **items;
   ps_key_checkpoint *checkpoint;
   ps_budget *retention_budget;
-  size_t i, count;
+  size_t count;
   int rc;
   d->shared_valid = 0;
-  for (i = 0; i < d->count; ++i)
-    if (d->items[i]->repacking)
-      return failure(e, LC_ERR_PENDING, "namespace mapping is being replaced");
   rc = load(d->ns, d, &fresh, e);
   if (rc == LC_OK && fresh->checkpoint != d->checkpoint &&
       d->checkpoint_observer.prepare)
@@ -538,10 +535,6 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   fresh->count = count;
   fresh->checkpoint = checkpoint == d->checkpoint ? NULL : checkpoint;
   fresh->retention_budget = retention_budget;
-  for (i = 0; i < count; ++i) {
-    ps_stream_drop_view(items[i]->stream);
-    items[i]->stream = NULL;
-  }
   ps_namespace_data_destroy(fresh);
   d->shared_valid = 1;
   return LC_OK;
@@ -946,7 +939,7 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
     ps_ns_insert(d, s);
     pthread_mutex_unlock(&d->mutex);
   } else {
-    ps_ns_resource_free(s);
+    ps_ns_resource_release(s);
   }
   return rc;
 }
