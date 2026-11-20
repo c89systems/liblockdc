@@ -1225,23 +1225,75 @@ static void compaction_pressure_deadline(struct timespec *deadline,
     deadline->tv_nsec -= 1000000000L;
   }
 }
+int lc_pouch_compaction_capacity_turn(lc_pouch *pouch,
+                                      lc_pouch_compaction_capacity *state,
+                                      unsigned int *delay) {
+  const lc_pouch_storage_maintenance_ops *ops = pouch->storage.ops->maintenance;
+  lc_pouch_storage_capacity sample = {0};
+  int rc, run, unchanged;
+
+  rc = ops->capacity_pressure(pouch->storage.context, state->draining, &sample,
+                              NULL);
+  if (rc != LC_OK && rc != LC_ERR_PENDING)
+    return 0;
+  if (sample.pressured ||
+      (state->draining &&
+       (sample.activity != state->activity ||
+        (rc == LC_OK && sample.available > state->available)))) {
+    state->draining = 1;
+    state->quiet_turns = 2 * lc_pouch_compaction_source_count(pouch);
+  }
+  state->activity = sample.activity;
+  run = rc == LC_OK && (sample.pressured || state->quiet_turns);
+  if (rc == LC_ERR_PENDING) {
+    /* A contender still owns the allocator. Retry the probe without starting
+     * a pass that may park on that authority with a namespace held. */
+    if (state->busy < 32)
+      ++state->busy;
+  } else {
+    state->busy = 0;
+    if (!sample.pressured || sample.available > state->available)
+      state->stalled = 0;
+    else if (state->stalled < 32)
+      ++state->stalled;
+    state->available = run ? sample.available : 0;
+    if (!sample.pressured) {
+      /* One observation after the final turn confirms that it made no
+       * headroom gain and that a peer did not publish in the meantime. */
+      if (state->quiet_turns)
+        --state->quiet_turns;
+      else
+        state->draining = 0;
+    }
+  }
+  if (sample.pressured) {
+    unchanged = state->stalled > state->busy ? state->stalled : state->busy;
+    if (unchanged < 8)
+      *delay = 5;
+    else if (unchanged < 16)
+      *delay = 25;
+    else if (unchanged < 32)
+      *delay = 100;
+    else
+      *delay = 1000;
+  }
+  return run;
+}
 static void *lc_pouch_compaction_worker(void *arg) {
   lc_pouch *pouch = arg;
   const lc_pouch_storage_maintenance_ops *ops =
       pouch->storage.ops ? pouch->storage.ops->maintenance : NULL;
   int probes_pressure = ops && ops->capacity_pressure;
   struct timespec regular = {0}, probe = {0};
-  uint64_t prior_available = 0;
-  int recovery_turns = 0;
-  int armed = 0, stalled = 0;
+  lc_pouch_compaction_capacity capacity = {0};
+  int armed = 0;
   if (probes_pressure)
     compaction_pressure_deadline(&probe, 250);
   pthread_mutex_lock(&pouch->compaction_mutex);
   while (!pouch->compaction_stop) {
     struct timespec now;
     const struct timespec *wake;
-    int regular_due, probe_due, pressured = 0, recovery_due = 0;
-    uint64_t available;
+    int regular_due, probe_due, capacity_due = 0;
     unsigned int pressure_delay = 250;
     if (!armed && pouch->compaction_pending) {
       armed = 1;
@@ -1265,40 +1317,10 @@ static void *lc_pouch_compaction_worker(void *arg) {
     regular_due = armed && compaction_due(&now, &regular);
     probe_due = probes_pressure && compaction_due(&now, &probe);
     pthread_mutex_unlock(&pouch->compaction_mutex);
-    if (probe_due) {
-      int rc = ops->capacity_pressure(pouch->storage.context, &pressured,
-                                      &available, NULL);
-      if (rc != LC_OK)
-        pressured = 0;
-      if (rc == LC_OK && (!pressured || available > prior_available))
-        stalled = 0;
-      else if (stalled < 32)
-        ++stalled;
-      if (rc == LC_OK)
-        prior_available = pressured ? available : 0;
-      if (pressured)
-        recovery_turns = 2 * lc_pouch_compaction_source_count(pouch);
-      else if (rc == LC_OK && recovery_turns) {
-        /* Capacity can recover before a terminal or retention source gets
-         * its turn. Drain a bounded rotation at the idle probe cadence. */
-        --recovery_turns;
-        recovery_due = 1;
-      }
-      if (pressured || rc == LC_ERR_PENDING) {
-        /* A full quiet interval between bounded passes lets allocating
-         * writers consume the headroom from an entire namespace rotation.
-         * Yield between turns, and back off if a rotation restores no room. */
-        if (stalled < 8)
-          pressure_delay = 5;
-        else if (stalled < 16)
-          pressure_delay = 25;
-        else if (stalled < 32)
-          pressure_delay = 100;
-        else
-          pressure_delay = 1000;
-      }
-    }
-    if (regular_due || pressured || recovery_due)
+    if (probe_due)
+      capacity_due =
+          lc_pouch_compaction_capacity_turn(pouch, &capacity, &pressure_delay);
+    if (regular_due || capacity_due)
       lc_pouch_compaction_run_pass(pouch);
     if (regular_due)
       lc_pouch_compaction_deadline(pouch, &regular);
@@ -1493,12 +1515,16 @@ static void lc_pouch_compaction_worker_close(lc_pouch *pouch) {
 
 void lc_pouch_compaction_note_mutation(lc_pouch *pouch, const char *ns,
                                        int terminal) {
+  const lc_pouch_storage_maintenance_ops *ops;
   lc_error error;
   int queued;
 
   if (pouch == NULL || ns == NULL || ns[0] == '\0') {
     return;
   }
+  ops = pouch->storage.ops ? pouch->storage.ops->maintenance : NULL;
+  if (ops && ops->note_mutation)
+    ops->note_mutation(pouch->storage.context);
   lc_error_init(&error);
   queued = 0;
   if (!pouch->background_compaction_enabled ||

@@ -33,7 +33,7 @@ static int benchmark_normal, measure_enabled;
 static size_t measured_syncs;
 static double phase_started, phase_elapsed;
 static int shared_lease_fixture;
-static pthread_key_t failed_authority;
+static pthread_key_t failed_authority, next_acquire_xid;
 static int report_failed_authority;
 #define REQUIRE(x)                                                             \
   do {                                                                         \
@@ -70,6 +70,16 @@ static const ps_coordination_io traced_authority = {NULL, trace_authority};
 static void clear(lc_error *e) {
   lc_error_cleanup(e);
   lc_error_init(e);
+}
+int __real_lc_xid_new(char[LC_XID_STRING_SIZE], lc_error *);
+int __wrap_lc_xid_new(char out[LC_XID_STRING_SIZE], lc_error *e) {
+  const char *xid =
+      report_failed_authority ? pthread_getspecific(next_acquire_xid) : NULL;
+  if (!xid)
+    return __real_lc_xid_new(out, e);
+  memcpy(out, xid, LC_XID_STRING_SIZE);
+  REQUIRE(!pthread_setspecific(next_acquire_xid, NULL));
+  return LC_OK;
 }
 static double real_clock(clockid_t id) {
   struct timespec t;
@@ -379,6 +389,8 @@ static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
                                    long seconds, lc_error *e) {
   lc_acquire_req req;
   lc_lease *lease = NULL;
+  const char *expected =
+      report_failed_authority ? pthread_getspecific(next_acquire_xid) : NULL;
   lc_acquire_req_init(&req);
   req.key = key;
   req.owner = "expiry-test";
@@ -387,6 +399,9 @@ static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
   req.txn_id = xid;
   ok(f->client->acquire(f->client, &req, &lease, e), e);
   REQUIRE(lease && lease->fencing_token > 0);
+  if (expected)
+    REQUIRE(!pthread_getspecific(next_acquire_xid) &&
+            !strcmp(lease->txn_id, expected));
   return lease;
 }
 static lc_lease *acquire(fixture *f, const char *key, const char *xid,

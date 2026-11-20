@@ -531,6 +531,7 @@ static void shared_autonomous_capacity(const char *directory, int codec,
   configure(&owners[1], 0, sync, codec);
   open_store(&owners[1], 0, &e);
   worker = churn_maintenance_owner(&owners[0], &e);
+  REQUIRE(worker->segment_target_bytes == PS_MIB);
   space = ps_root_space(ps_pouch_state_root(worker));
   for (size_t i = 0; i < 2; ++i)
     outbox[i] = shared_outbox_open(&owners[i], "effects", "capacity", 300, &e);
@@ -627,7 +628,7 @@ enum { CONCURRENT_CYCLES = 8 };
 typedef struct churn_lane {
   fixture writer, peer;
   rendezvous first_read;
-  const char *ns;
+  const char *ns, *first_xid;
   uint64_t seed;
 } churn_lane;
 
@@ -644,6 +645,8 @@ static void *churn_lane_run(void *context) {
     if (trace)
       fprintf(stderr, "%s cycle=%llu lease\n", lane->ns,
               (unsigned long long)cycle);
+    if (cycle == 1)
+      REQUIRE(!pthread_setspecific(next_acquire_xid, lane->first_xid));
     churn_expiry(writer, peer, seed, 1, 0, &fence, NULL,
                  cycle == 1 ? &lane->first_read : NULL, &e);
     if (trace)
@@ -664,6 +667,10 @@ static void *churn_lane_run(void *context) {
 static void shared_concurrent_capacity(const char *directory, int codec,
                                        int sync, uint64_t segment_bytes) {
   static const char *const names[] = {"writer-a", "writer-b"};
+  /* Both XIDs mapped to slot 106 in the legacy 256-stripe scheme. Their
+   * staged retention writes must still enter both producer callbacks. */
+  static const char *const xids[] = {"r00000000000000000u0",
+                                     "r0000000000000000380"};
   churn_lane *lanes = calloc(2, sizeof(*lanes));
   pthread_t tasks[2];
   lc_error e = {0};
@@ -671,6 +678,7 @@ static void shared_concurrent_capacity(const char *directory, int codec,
   REQUIRE(lanes);
   shared_lease_fixture = 1;
   REQUIRE(!pthread_key_create(&failed_authority, NULL));
+  REQUIRE(!pthread_key_create(&next_acquire_xid, NULL));
   report_failed_authority = 1;
   strcpy(scenario, "shared concurrent capacity");
   now(1000);
@@ -679,6 +687,7 @@ static void shared_concurrent_capacity(const char *directory, int codec,
   for (size_t i = 0; i < 2; ++i) {
     churn_lane *lane = &lanes[i];
     lane->ns = names[i];
+    lane->first_xid = xids[i];
     lane->seed = 100 + i * CONCURRENT_CYCLES;
     if (i)
       strcpy(lane->writer.path, lanes[0].writer.path);
@@ -699,9 +708,7 @@ static void shared_concurrent_capacity(const char *directory, int codec,
   }
   lc_pouch *worker = churn_maintenance_owner(&lanes[0].writer, &e);
   uint64_t effective_target = worker->segment_target_bytes;
-  REQUIRE(
-      effective_target ==
-      (segment_bytes ? segment_bytes : LC_POUCH_DEFAULT_SEGMENT_TARGET_BYTES));
+  REQUIRE(effective_target == (segment_bytes ? segment_bytes : PS_MIB));
   double started = real_clock(CLOCK_MONOTONIC);
   for (size_t i = 0; i < 2; ++i)
     REQUIRE(!pthread_create(&tasks[i], NULL, churn_lane_run, &lanes[i]));
@@ -740,6 +747,7 @@ static void shared_concurrent_capacity(const char *directory, int codec,
   shared_lease_fixture = 0;
   report_failed_authority = 0;
   REQUIRE(!pthread_key_delete(failed_authority));
+  REQUIRE(!pthread_key_delete(next_acquire_xid));
   free(lanes);
   clear(&e);
 }

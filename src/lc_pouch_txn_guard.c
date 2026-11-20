@@ -53,7 +53,6 @@ int lc_pouch_txn_guard_lock(lc_pouch *pouch, const char *txn_id, int wait,
         "pouch transaction guard requires pouch, xid, and output", NULL, NULL,
         "pouch");
   }
-  guard->stripe = lc_pouch_txn_guard_stripe(txn_id);
   rc = lc_pouch_state_shared_mutation_enter(pouch, &guard->shared_mutation,
                                             error);
   if (rc != LC_OK) {
@@ -61,16 +60,15 @@ int lc_pouch_txn_guard_lock(lc_pouch *pouch, const char *txn_id, int wait,
   }
   if (pouch->storage.ops != NULL) {
     guard->storage = pouch->storage;
-    rc = guard->storage.ops->txn_guard_lock(guard->storage.context,
-                                            guard->stripe, wait,
-                                            &guard->typed_handle, error);
+    rc = guard->storage.ops->txn_guard_lock(guard->storage.context, txn_id,
+                                            wait, &guard->typed_handle, error);
     if (rc != LC_OK) {
       memset(&guard->storage, 0, sizeof(guard->storage));
       lc_pouch_state_shared_mutation_leave(&guard->shared_mutation);
     }
     return rc;
   }
-  stripe = guard->stripe;
+  stripe = guard->stripe = lc_pouch_txn_guard_stripe(txn_id);
   pthread_rc =
       pthread_once(&lc_pouch_txn_guard_once, lc_pouch_txn_guard_mutexes_init);
   if (pthread_rc != 0) {
@@ -181,7 +179,10 @@ void lc_pouch_txn_guard_release(lc_pouch_txn_guard *guard) {
 
 int lc_pouch_txn_guard_covers(const lc_pouch_txn_guard *guard,
                               const char *txn_id) {
-  return guard != NULL && txn_id != NULL &&
-         (guard->mutex_locked || guard->typed_handle != NULL) &&
+  if (guard == NULL || txn_id == NULL)
+    return 0;
+  if (guard->typed_handle != NULL)
+    return guard->storage.ops->txn_guard_covers(guard->typed_handle, txn_id);
+  return guard->mutex_locked &&
          guard->stripe == lc_pouch_txn_guard_stripe(txn_id);
 }

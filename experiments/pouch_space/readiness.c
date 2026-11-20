@@ -6,14 +6,15 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-/* Live participants must agree on stream lock addresses. The prior
- * volatile protocol is safe to discard only on cold admission. */
-#define READY_MAGIC UINT64_C(0x3459444145525350)
+/* Live participants must agree on advisory lock addresses and which words
+ * belong to the zero bitmap. Cold admission replaces the volatile page. */
+#define READY_MAGIC UINT64_C(0x3659444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
+#define ACTIVITY_WORD (PENDING_WORD - 1)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
-#define ZERO_WORDS (PENDING_WORD - 2 * WORDS)
+#define ZERO_WORDS (ACTIVITY_WORD - 2 * WORDS)
 #define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
 enum readiness_word {
   GENERATION,
@@ -169,6 +170,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
     for (i = 0; i < ZERO_WORDS; ++i)
       __atomic_store_n(s->readiness->page + 2 * WORDS + i, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PENDING_WORD, 0, __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
   }
@@ -236,6 +238,16 @@ void ps_readiness_set_pressure(ps_space *s, int requested) {
     (void)__atomic_fetch_and(s->readiness->page + PENDING_WORD, ~PRESSURE_BIT,
                              __ATOMIC_RELEASE);
   }
+}
+uint64_t ps_readiness_activity(ps_space *s) {
+  uint64_t *word = s->readiness ? s->readiness->page + ACTIVITY_WORD
+                                : &s->maintenance_activity;
+  return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+}
+void ps_readiness_note_mutation(ps_space *s) {
+  uint64_t *word = s->readiness ? s->readiness->page + ACTIVITY_WORD
+                                : &s->maintenance_activity;
+  (void)__atomic_fetch_add(word, 1, __ATOMIC_RELEASE);
 }
 void ps_readiness_begin(ps_space *s, unsigned int changes) {
   if (s->readiness)

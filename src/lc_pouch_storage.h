@@ -150,6 +150,11 @@ enum lc_pouch_storage_work_kind {
   LC_POUCH_STORAGE_WORK_TERMINAL,
   LC_POUCH_STORAGE_WORK_COLLECTION
 };
+typedef struct lc_pouch_storage_capacity {
+  uint64_t available;
+  uint64_t activity;
+  int pressured;
+} lc_pouch_storage_capacity;
 /* Discovery/control metadata belongs to the physical owner. The existing
  * scheduler retains cadence, fairness, coalescing and worker lifetime. State
  * and collection passes retain their common logical policies; physical copies
@@ -166,9 +171,12 @@ typedef struct lc_pouch_storage_maintenance_ops {
   int (*collections_run)(void *, lc_pouch *,
                          const lc_pouch_maintenance_options *,
                          lc_pouch_maintenance_result *, lc_error *);
-  /* Optional root-wide hint. A positive result requests one ordinary pass.
-   * Available bytes describe the remaining ordinary admission headroom. */
-  int (*capacity_pressure)(void *, int *, uint64_t *, lc_error *);
+  /* During a drain, sample headroom even after the pressure hint clears.
+   * PENDING preserves an advisory pressure level, without a verified
+   * headroom sample. Activity spans all live owners of the root. */
+  int (*capacity_pressure)(void *, int draining, lc_pouch_storage_capacity *,
+                           lc_error *);
+  void (*note_mutation)(void *);
 } lc_pouch_storage_maintenance_ops;
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
@@ -228,14 +236,15 @@ typedef struct lc_pouch_storage_ops {
    * Discovery reads only hints, without opening work records or bodies. */
   int (*retention_hint_next)(void *, const char *, char **, char **,
                              lc_error *);
-  /* Volatile transaction authority for stripe < TXN_GUARD_STRIPES. wait=0
+  /* Volatile transaction authority for the supplied XID. wait=0
    * returns PENDING on contention without waiting. Successful acquisition
    * retains the owner and returns a non-NULL opaque handle; failure leaves
    * NULL. Release on the acquiring thread, after protected work, exactly once.
-   * No pathname, publication or durability operation. The common facade owns
-   * root mutation ordering. Exclusive owners coordinate threads; future shared
-   * owners must additionally coordinate processes inside their root file. */
-  int (*txn_guard_lock)(void *, size_t stripe, int wait, void **, lc_error *);
+   * The common facade owns root mutation ordering. Covers tests the physical
+   * authority for an XID, including aliases, to avoid recursive acquisition. */
+  int (*txn_guard_lock)(void *, const char *txn_id, int wait, void **,
+                        lc_error *);
+  int (*txn_guard_covers)(void *handle, const char *txn_id);
   void (*txn_guard_release)(void *, void *);
   void (*close)(void *);
   /* Private SDK admission. The owner supplies catalog identity and binds the

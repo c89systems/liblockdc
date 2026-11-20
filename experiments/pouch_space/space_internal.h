@@ -143,6 +143,7 @@ struct ps_space {
   uint64_t sync_requests, sync_batches, max_sync_batch;
   size_t journal, metadata, readers, writers;
   uint64_t live_entries, free_bytes, metadata_free_bytes;
+  uint64_t maintenance_activity;
   int maintenance_pressure;
   uint64_t metadata_workspace;
   uint64_t metadata_fallbacks;

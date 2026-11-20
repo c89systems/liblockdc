@@ -5,7 +5,6 @@
 
 typedef struct ps_coordination ps_coordination;
 typedef struct ps_coordination_guard ps_coordination_guard;
-#define PS_COORDINATION_TXN_STRIPES 256U
 #define PS_COORDINATION_STREAM_CLAIM_SLOTS (PS_PAGE / 8U)
 enum ps_coordination_domain {
   PS_COORDINATION_PUBLICATION = 0,
@@ -70,7 +69,8 @@ int ps_coordination_shared(const ps_coordination *);
 int ps_coordination_initialize(ps_coordination *, int create, int acquire,
                                lc_error *);
 /* Publication/recovery/allocation/sync use identity zero.
- * Transaction uses stripe < 256.
+ * Transaction uses a slot below PS_TRANSACTION_GUARD_SLOTS in the upper
+ * advisory range, beyond all physical allocations and stream witnesses.
  * Allocation uses byte 4, separate from publication and reader presence.
  * Sync leadership uses byte 5; never wait for it while holding allocation.
  * Namespace keys map deterministically into bytes 512..5119 of the root pages;
@@ -93,12 +93,13 @@ int ps_coordination_initialize(ps_coordination *, int create, int acquire,
  * span preparation or reclamation and be released across threads.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
- * finish while another guard waits.
- * Exclusive transaction guards use resident mutexes without allocation or
- * file-lock syscalls; exclusive lifetime authority excludes other processes. */
+ * finish while another guard waits. Exclusive lifetime authority excludes
+ * other processes, so each guard needs only the local coordination gate. */
 int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
+int ps_coordination_transaction_covers(const ps_coordination_guard *,
+                                       uint64_t slot);
 /* A namespace handoff can absorb short maintenance scopes. It leaves
  * long-running owners on the normal PENDING path and takes no other locks. */
 int ps_coordination_namespace_handoff(ps_coordination *,

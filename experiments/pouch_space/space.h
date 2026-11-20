@@ -11,10 +11,12 @@
  * Stop concurrent calls before closing the space itself. */
 #define PS_MIB UINT64_C(1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
-/* The upper half of signed file offsets is reserved for advisory stream
- * authority. These bytes are beyond EOF and never allocated or read. */
+/* The upper half of signed file offsets is reserved for stream and
+ * transaction authority. These bytes are never allocated or read. */
 #define PS_MAX_CAPACITY (UINT64_C(1) << 62)
-#define PS_MAX_INCARNATION ((uint64_t)INT64_MAX - PS_MAX_CAPACITY)
+#define PS_TRANSACTION_GUARD_SLOTS (UINT64_C(1) << 60)
+#define PS_MAX_INCARNATION                                                     \
+  ((uint64_t)INT64_MAX - PS_MAX_CAPACITY - PS_TRANSACTION_GUARD_SLOTS)
 /* Native experiment: filesystem block-sized physical allocation with small
  * logical tails sharing independently owned cells. */
 #define PS_PAGE 4096U
@@ -270,6 +272,9 @@ int ps_grow(ps_space *, uint64_t, lc_error *);
 int ps_check(ps_space *, lc_error *);
 int ps_status(ps_space *, ps_stats *, lc_error *);
 int ps_maintenance_pressure_requested(ps_space *);
-int ps_maintenance_pressure(ps_space *, int *, uint64_t *, lc_error *);
+/* A busy probe preserves the advisory level. A drain can request a sample
+ * even while pressure is clear. */
+int ps_maintenance_pressure(ps_space *, int draining, int *, uint64_t *,
+                            lc_error *);
 
 #endif

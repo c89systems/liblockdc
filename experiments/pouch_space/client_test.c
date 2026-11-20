@@ -2479,23 +2479,13 @@ static void retention_discovery_compare(const char *directory, int reverse) {
   lc_error_cleanup(&e);
 }
 
-/* Exercise transaction authority through the same private facade used by the
- * public engine. The spelling of an xid is irrelevant to stripe admission. */
+/* Exercise the authority used by the public engine. This pair shares
+ * multifile's stripe 15 but has distinct container lock addresses. */
+static const char guard_xid[] = "xid-0";
+static const char guard_neighbor[] = "xid-347";
 static void guard_unused(const lc_pouch_txn_guard *g) {
   REQUIRE(g->fd == -1 && !g->mutex_locked && !g->typed_handle &&
           !g->shared_mutation);
-}
-static void guard_names(lc_pouch_txn_guard *held, char *same, char *other) {
-  same[0] = other[0] = '\0';
-  for (unsigned int i = 1; !same[0] || !other[0]; ++i) {
-    char name[32];
-    REQUIRE(i < 100000 && snprintf(name, sizeof(name), "xid-%u", i) > 0);
-    if (lc_pouch_txn_guard_covers(held, name)) {
-      if (!same[0])
-        strcpy(same, name);
-    } else if (!other[0])
-      strcpy(other, name);
-  }
 }
 static void guard_lifecycle(const char *directory) {
   lc_error e;
@@ -2528,33 +2518,35 @@ static void guard_lifecycle(const char *directory) {
                   LC_ERR_INVALID);
           clear(&e);
         }
-        ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
-        char same[32], other[32];
-        guard_names(&g, same, other);
-        REQUIRE(lc_pouch_txn_guard_covers(&g, "xid-0") &&
-                lc_pouch_txn_guard_covers(&g, same) &&
-                !lc_pouch_txn_guard_covers(&g, other));
+        ok(lc_pouch_txn_guard_acquire(p, guard_xid, &g, &e), &e);
+        REQUIRE(lc_pouch_txn_guard_covers(&g, guard_xid) &&
+                lc_pouch_txn_guard_covers(&g, guard_neighbor) == native &&
+                !lc_pouch_txn_guard_covers(&g, "xid-1"));
+        if (!native) {
+          ok(lc_pouch_txn_guard_lock(p, guard_neighbor, 0, &second, &e), &e);
+          lc_pouch_txn_guard_release(&second);
+        }
         for (int no_error = 0; no_error < 2; ++no_error) {
-          REQUIRE(lc_pouch_txn_guard_lock(p, same, 0, &second,
+          REQUIRE(lc_pouch_txn_guard_lock(p, guard_xid, 0, &second,
                                           no_error ? NULL : &e) ==
                   LC_ERR_PENDING);
           guard_unused(&second);
           lc_pouch_txn_guard_release(&second);
           clear(&e);
         }
-        ok(lc_pouch_txn_guard_lock(p, other, 0, &second, &e), &e);
+        ok(lc_pouch_txn_guard_lock(p, "xid-1", 0, &second, &e), &e);
         lc_pouch_txn_guard_release(&second);
         lc_pouch_txn_guard_release(&g);
         lc_pouch_txn_guard_release(&g);
-        REQUIRE(!lc_pouch_txn_guard_covers(&g, same));
-        ok(lc_pouch_txn_guard_acquire(p, same, &g, &e), &e);
+        REQUIRE(!lc_pouch_txn_guard_covers(&g, guard_xid));
+        ok(lc_pouch_txn_guard_acquire(p, guard_xid, &g, &e), &e);
         if (!native) {
           char peer_path[1450];
           REQUIRE(snprintf(peer_path, sizeof(peer_path), "%s/guard-peer",
                            directory) < (int)sizeof(peer_path));
           lc_pouch *peer =
               visit_open(peer_path, 0, sync, 1, NULL, &allocator, &e);
-          ok(lc_pouch_txn_guard_lock(peer, same, 0, &second, &e), &e);
+          ok(lc_pouch_txn_guard_lock(peer, guard_xid, 0, &second, &e), &e);
           lc_pouch_txn_guard_release(&second);
           lc_pouch_close(peer);
           one_file(peer_path);
@@ -2623,26 +2615,25 @@ static void guard_concurrency(const char *directory) {
                        sync) < (int)sizeof(path));
       lc_pouch *p = visit_open(path, native, sync, 1, NULL, &allocator, &e);
       lc_pouch_txn_guard held;
-      ok(lc_pouch_txn_guard_acquire(p, "xid-0", &held, &e), &e);
-      char same[32], other[32];
-      guard_names(&held, same, other);
-      /* Independent authority succeeds while this stripe remains held. */
+      ok(lc_pouch_txn_guard_acquire(p, guard_xid, &held, &e), &e);
+      /* Independent container authority succeeds while this XID is held. */
       for (int i = 0; i < 3; ++i) {
         guard_actor a = {0};
         a.p = p;
-        a.xid = i == 0 ? "xid-0" : i == 1 ? same : other;
+        a.xid = i == 0 ? guard_xid : i == 1 ? guard_neighbor : "xid-1";
         REQUIRE(!pthread_mutex_init(&a.mutex, NULL));
         REQUIRE(!pthread_cond_init(&a.changed, NULL));
         pthread_t thread;
         REQUIRE(!pthread_create(&thread, NULL, guard_act, &a));
         REQUIRE(!pthread_join(thread, NULL));
-        REQUIRE(a.complete && a.rc == (i == 2 ? LC_OK : LC_ERR_PENDING));
+        REQUIRE(a.complete &&
+                a.rc == (!i || (i == 1 && native) ? LC_ERR_PENDING : LC_OK));
         REQUIRE(!pthread_cond_destroy(&a.changed));
         REQUIRE(!pthread_mutex_destroy(&a.mutex));
       }
       guard_actor a = {0};
       a.p = p;
-      a.xid = same;
+      a.xid = guard_xid;
       a.wait = 1;
       REQUIRE(!pthread_mutex_init(&a.mutex, NULL));
       REQUIRE(!pthread_cond_init(&a.changed, NULL));
@@ -2723,7 +2714,7 @@ static void guard_faults(const char *directory) {
         p = visit_open(path, 0, sync, 0, &io, &allocator, &e);
         size_t count = mutex_init_calls;
         mutex_init_armed = 0;
-        REQUIRE(count >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES + 1U);
+        REQUIRE(count > 0);
         lc_pouch_close(p);
         REQUIRE(!live);
         /* Discover the actual initialization sites. File coordination now
@@ -2762,7 +2753,7 @@ static void guard_faults(const char *directory) {
       armed = f.armed = 0;
       REQUIRE(!f.calls);
       lc_pouch_txn_guard_release(&g);
-      REQUIRE(native ? total == 1 : total == 0);
+      REQUIRE(total == 1);
       for (size_t nth = 1; nth <= total; ++nth)
         for (int no_error = 0; no_error < 2; ++no_error) {
           allocation = 0;
@@ -2794,9 +2785,8 @@ static void guard_faults(const char *directory) {
       if (!native) {
         ok(lc_pouch_txn_guard_acquire(p, "xid-0", &g, &e), &e);
         void *handle = NULL;
-        REQUIRE(p->storage.ops->txn_guard_lock(
-                    p->storage.context, LC_POUCH_STORAGE_TXN_GUARD_STRIPES, 0,
-                    &handle, &e) == LC_ERR_INVALID);
+        REQUIRE(p->storage.ops->txn_guard_lock(p->storage.context, "", 0,
+                                               &handle, &e) == LC_ERR_INVALID);
         REQUIRE(!handle);
         clear(&e);
         f.calls = 0;
@@ -2831,9 +2821,9 @@ static void guard_faults(const char *directory) {
         one_file(path);
     }
   namespace_artifacts(directory, "guard-");
-  printf("transaction guards: 1024 container mutex initialization cuts, four "
-         "native allocation cuts; both policies and nullable errors; "
-         "uncertain storage admission, retry, no-I/O container acquire\n");
+  puts("transaction guards: open initializer and guard allocation faults, "
+       "both policies and nullable errors, uncertain storage admission, "
+       "retry, and no-I/O container acquire");
   lc_error_cleanup(&e);
 }
 static void guard_public(const char *directory) {

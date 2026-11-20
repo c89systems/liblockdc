@@ -134,8 +134,8 @@ static void lifecycle(void) {
   allocations = 0;
   allocation_fail = 1;
   measuring = 1;
-  int rc = ps_coordination_lock(owner, PS_COORDINATION_TRANSACTION, 3, 0,
-                                &guard, &e);
+  int rc =
+      ps_coordination_lock(owner, PS_COORDINATION_ALLOCATION, 0, 0, &guard, &e);
   measuring = 0;
   ok(rc, &e);
   REQUIRE(!allocations && ps_coordination_users(owner) == 1);
@@ -143,8 +143,9 @@ static void lifecycle(void) {
   lc_error_cleanup(&e);
   REQUIRE(ps_open(path, 0, NULL, &other, &e) == LC_ERR_INVALID && !other);
   lc_error_cleanup(&e);
-  REQUIRE(ps_coordination_lock(owner, PS_COORDINATION_TRANSACTION, 3, 0,
-                                &busy, &e) == LC_ERR_PENDING && !busy);
+  REQUIRE(ps_coordination_lock(owner, PS_COORDINATION_ALLOCATION, 0, 0, &busy,
+                               &e) == LC_ERR_PENDING &&
+          !busy);
   lc_error_cleanup(&e);
   ps_coordination_unlock(guard);
   ok(ps_close(space, &e), &e);
@@ -246,8 +247,10 @@ static void lifecycle(void) {
                                &e) == LC_ERR_INVALID &&
           !guard);
   lc_error_cleanup(&e);
-  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 256, 0, &guard,
-                                &e) == LC_ERR_INVALID && !guard);
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION,
+                               PS_TRANSACTION_GUARD_SLOTS, 0, &guard,
+                               &e) == LC_ERR_INVALID &&
+          !guard);
   lc_error_cleanup(&e);
   REQUIRE(ps_coordination_lock(a, PS_COORDINATION_PUBLICATION, 1, 0, &guard,
                                 &e) == LC_ERR_INVALID && !guard);
@@ -597,7 +600,7 @@ static void faults(void) {
         REQUIRE(!close(fd));
       }
     }
-  REQUIRE(mutex_sites > PS_COORDINATION_TXN_STRIPES);
+  REQUIRE(mutex_sites > 4);
   for (int reason_index = 0; reason_index < 4; ++reason_index) {
     static const int reasons[] = {EINTR, EAGAIN, EACCES, EIO};
     syscall_fault fault = {0, 1, reasons[reason_index]};
@@ -656,12 +659,16 @@ static void faults(void) {
   allocations = 0;
   allocation_fail = 1;
   measuring = 1;
-  int rc = ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 0, 0, &guard,
-                                &e);
+  int rc =
+      ps_coordination_lock(a, PS_COORDINATION_ALLOCATION, 0, 0, &guard, &e);
   ps_coordination_unlock(guard);
   measuring = 0;
   ok(rc, &e);
   REQUIRE(!allocations && !fault.calls);
+  ok(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 0, 0, &guard, &e),
+     &e);
+  ps_coordination_unlock(guard);
+  REQUIRE(!fault.calls);
   ok(ps_coordination_close(a, &e), &e);
   lc_error_cleanup(&e);
 }
@@ -688,7 +695,22 @@ static void independent_stream_authority(void) {
                                &busy, &e) == LC_ERR_PENDING &&
           !busy);
   lc_error_cleanup(&e);
+  /* Both ends of the transaction band are separate from stream authority. */
+  ok(ps_coordination_lock(b, PS_COORDINATION_TRANSACTION, 0, 0, &two, &e), &e);
+  REQUIRE(ps_coordination_transaction_covers(two, 0) &&
+          !ps_coordination_transaction_covers(one, 0));
+  ok(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION,
+                          PS_TRANSACTION_GUARD_SLOTS - 1, 0, &busy, &e),
+     &e);
+  REQUIRE(
+      ps_coordination_transaction_covers(busy, PS_TRANSACTION_GUARD_SLOTS - 1));
+  ps_coordination_unlock(busy);
   ps_coordination_unlock(one);
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 0, 0, &busy,
+                               &e) == LC_ERR_PENDING &&
+          !busy);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(two);
   REQUIRE(ps_coordination_lock(a, PS_COORDINATION_STREAM,
                                PS_MAX_INCARNATION + 1, 0, &busy,
                                &e) == LC_ERR_INVALID &&

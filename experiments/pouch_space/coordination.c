@@ -9,10 +9,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
+#define FIXED (PS_COORDINATION_SYNC + 1U)
 #define BUCKETS 67U
 #define INITIALIZE_OFFSET 6U
-#define TXN_BASE UINT64_C(256)
+#define TXN_BASE (PS_MAX_CAPACITY + PS_MAX_INCARNATION)
 #define NS_BASE UINT64_C(512)
 #define COLLECTION_SLOTS 512U
 #define COLLECTION_BASE (2U * PS_PAGE - 6U * COLLECTION_SLOTS)
@@ -202,7 +202,7 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
   for (i = 0; i < FIXED; ++i) {
     owner->fixed[i].owner = owner;
     owner->fixed[i].fixed = 1;
-    owner->fixed[i].offset = i < 2 ? i : i < 4 ? i + 2 : TXN_BASE + i - 4;
+    owner->fixed[i].offset = i < 2 ? i : i + 2;
     rc = pthread_mutex_init(&owner->fixed[i].mutex, NULL);
     if (rc)
       break;
@@ -273,6 +273,8 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
                              uint64_t identity) {
   if (domain == PS_COORDINATION_STREAM)
     return PS_MAX_CAPACITY + identity - 1;
+  if (domain == PS_COORDINATION_TRANSACTION)
+    return TXN_BASE + identity;
   if (domain == PS_COORDINATION_CONTROL_STATE)
     return STATE_BASE - 2 + identity;
   if (domain == PS_COORDINATION_STREAM_CLAIM) {
@@ -295,6 +297,11 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
            (domain - PS_COORDINATION_COLLECTION_APPEND) * COLLECTION_SLOTS +
            identity % COLLECTION_SLOTS;
   return NS_BASE + identity % NS_SLOTS;
+}
+int ps_coordination_transaction_covers(const ps_coordination_guard *guard,
+                                       uint64_t slot) {
+  return guard && slot < PS_TRANSACTION_GUARD_SLOTS &&
+         guard->offset == keyed_offset(PS_COORDINATION_TRANSACTION, slot);
 }
 int ps_coordination_namespace_view_conflict(ps_coordination *owner,
                                             uint64_t identity, int *present,
@@ -456,7 +463,7 @@ static int lock_guard(ps_coordination *owner,
        domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
-       identity >= PS_COORDINATION_TXN_STRIPES) ||
+       identity >= PS_TRANSACTION_GUARD_SLOTS) ||
       (domain == PS_COORDINATION_STREAM &&
        (!identity || identity > PS_MAX_INCARNATION)) ||
       (domain == PS_COORDINATION_STREAM_CLAIM && !identity) ||
@@ -466,12 +473,10 @@ static int lock_guard(ps_coordination *owner,
   if (rc != LC_OK)
     return rc;
   __atomic_add_fetch(&owner->users, 1, __ATOMIC_ACQ_REL);
-  if (domain >= PS_COORDINATION_NAMESPACE)
+  if (domain > PS_COORDINATION_SYNC)
     rc = dynamic_guard(owner, keyed_offset(domain, identity), &guard, e);
   else
-    guard = &owner->fixed[domain == PS_COORDINATION_TRANSACTION
-                              ? (size_t)identity + 4
-                              : (size_t)domain];
+    guard = &owner->fixed[domain];
   if (rc != LC_OK) {
     __atomic_sub_fetch(&owner->users, 1, __ATOMIC_RELEASE);
     return rc;
@@ -555,7 +560,8 @@ void ps_coordination_unlock(ps_coordination_guard *guard) {
   if (!guard)
     return;
   if (((guard->offset >= COLLECTION_BASE && guard->offset < 2U * PS_PAGE) ||
-       guard->offset >= STREAM_CLAIM_BASE) &&
+       (guard->offset >= STREAM_CLAIM_BASE &&
+        guard->offset < PS_METADATA_START)) &&
       unpin_view(guard)) {
     drop(guard);
     return;

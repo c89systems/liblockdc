@@ -514,7 +514,7 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_lease_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_lease_test PRIVATE
-    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync"
+    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync" "LINKER:--wrap=lc_xid_new"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_lease_test)
@@ -548,7 +548,7 @@ if(LOCKDC_BUILD_TESTS)
         PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       set(shared_modes shared-queue-pressure shared-outbox-pressure)
       if(crypto EQUAL 0 OR crypto EQUAL 3)
-        list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-unpaced-capacity shared-lease-pressure)
+        list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-unpaced-capacity shared-concurrent-capacity shared-lease-pressure)
       endif()
       foreach(mode IN LISTS shared_modes)
         add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
@@ -619,7 +619,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_pouch_test)
-  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-tail maintenance-checksums shared-state)
+  foreach(mode lifecycle body-select faults concurrency io-faults crypto-init durable-scope durable-scope-faults durable-scope-crash validation mutations mutation-faults mutation-io-faults retention-hint mutation-concurrency mutation-capacity key-bounds reads ordered-reads read-faults read-io-faults read-concurrency snapshots projection projection-faults projection-concurrency sequence-recovery lifetimes lifetime-faults staging staging-faults staging-recovery staging-recovery-faults staging-concurrency staging-crash maintenance maintenance-abandoned maintenance-faults maintenance-io-faults maintenance-concurrency maintenance-piece-concurrency maintenance-tail maintenance-capacity-schedule maintenance-checksums shared-state)
     add_test(NAME pouch_space_pouch_${mode} COMMAND pouch_space_pouch_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_pouch_${mode} PROPERTIES TIMEOUT 240
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

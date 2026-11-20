@@ -10,7 +10,7 @@
  * The runtime remains live during acquisition and throughout protected work.
  * A typed owner retains its own lifetime until release, including after close.
  * Guards are released by the acquiring thread. No payload producer is invoked
- * while acquiring authority. Stripes may serialize unrelated xids. */
+ * while acquiring authority. Multifile uses striped authority. */
 typedef struct lc_pouch_txn_guard {
   int fd;
   pthread_mutex_t *mutex;
@@ -25,6 +25,6 @@ int lc_pouch_txn_guard_lock(lc_pouch *, const char *txn_id, int wait,
 int lc_pouch_txn_guard_acquire(lc_pouch *, const char *txn_id,
                                lc_pouch_txn_guard *, lc_error *);
 void lc_pouch_txn_guard_release(lc_pouch_txn_guard *);
-/* Used to avoid reacquiring an already-held nonrecursive stripe in cleanup. */
+/* Used to avoid reacquiring already-held nonrecursive authority in cleanup. */
 int lc_pouch_txn_guard_covers(const lc_pouch_txn_guard *, const char *txn_id);
 #endif

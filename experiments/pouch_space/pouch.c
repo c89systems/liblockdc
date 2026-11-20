@@ -12,16 +12,13 @@
 #include "outbox_markers.h"
 #include "pouch_internal.h"
 #include "query_index.h"
+#include "readiness.h"
 #include "root_internal.h"
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <zlib.h>
-
-#if LC_POUCH_STORAGE_TXN_GUARD_STRIPES != PS_COORDINATION_TXN_STRIPES
-#error Container transaction authority must match the logical stripe count
-#endif
 
 typedef struct queue_waiter {
   const char *ns, *queue;
@@ -615,25 +612,29 @@ static int retention_hint_next(void *context, const char *after, char **name,
   lc_free_with_allocator(&owner->allocator, d.next);
   return rc;
 }
-static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
-                          lc_error *e) {
+static uint64_t txn_guard_slot(const char *txn_id) {
+  return ps_namespace_name_hash(txn_id) % PS_TRANSACTION_GUARD_SLOTS;
+}
+static int txn_guard_lock(void *context, const char *txn_id, int wait,
+                          void **out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_coordination_guard *guard = NULL;
   int rc;
-  *out = NULL;
-  if (stripe >= LC_POUCH_STORAGE_TXN_GUARD_STRIPES)
+  if (out)
+    *out = NULL;
+  if (!txn_id || !*txn_id || !out)
     return lc_error_set(e, LC_ERR_INVALID, 0,
-                        "invalid container transaction guard stripe", NULL,
-                        NULL, "pouch");
+                        "container transaction authority needs XID and output",
+                        NULL, NULL, "pouch");
   rc = check(context, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_coordination_lock(ps_space_coordination(ps_root_space(owner->root)),
-                            PS_COORDINATION_TRANSACTION, stripe, wait, &guard,
-                            e);
+                            PS_COORDINATION_TRANSACTION, txn_guard_slot(txn_id),
+                            wait, &guard, e);
   if (rc != LC_OK)
     return rc;
-  /* Storage can become uncertain while a caller waits for this stripe. */
+  /* Storage can become uncertain while a caller waits for this XID. */
   rc = check(context, e);
   if (rc != LC_OK) {
     ps_coordination_unlock(guard);
@@ -642,6 +643,9 @@ static int txn_guard_lock(void *context, size_t stripe, int wait, void **out,
   __atomic_add_fetch(&owner->references, 1, __ATOMIC_RELAXED);
   *out = guard;
   return LC_OK;
+}
+static int txn_guard_covers(void *handle, const char *txn_id) {
+  return ps_coordination_transaction_covers(handle, txn_guard_slot(txn_id));
 }
 static void txn_guard_release(void *context, void *handle) {
   ps_coordination_unlock(handle);
@@ -701,15 +705,22 @@ static int collections_maintain(void *context, lc_pouch *pouch,
   ps_pouch_owner *owner = context;
   return ps_collection_maintenance_run(owner->root, pouch, options, out, e);
 }
-static int capacity_pressure(void *context, int *needed, uint64_t *available,
-                             lc_error *e) {
+static int capacity_pressure(void *context, int draining,
+                             lc_pouch_storage_capacity *sample, lc_error *e) {
   ps_pouch_owner *owner = context;
-  return ps_maintenance_pressure(ps_root_space(owner->root), needed, available,
-                                 e);
+  ps_space *space = ps_root_space(owner->root);
+  int rc = ps_maintenance_pressure(space, draining, &sample->pressured,
+                                   &sample->available, e);
+  sample->activity = ps_readiness_activity(space);
+  return rc;
+}
+static void note_mutation(void *context) {
+  ps_pouch_owner *owner = context;
+  ps_readiness_note_mutation(ps_root_space(owner->root));
 }
 static const lc_pouch_storage_maintenance_ops maintenance_ops = {
-    work_ensure,    work_remove,          work_next,
-    state_maintain, collections_maintain, capacity_pressure};
+    work_ensure,          work_remove,       work_next,    state_maintain,
+    collections_maintain, capacity_pressure, note_mutation};
 static int outbox_markers_open(void *context, const char *ns, int kind,
                                int create, lc_pouch_outbox_store *out,
                                lc_error *e) {
@@ -799,6 +810,7 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  retention_hint_remove,
                                                  retention_hint_next,
                                                  txn_guard_lock,
+                                                 txn_guard_covers,
                                                  txn_guard_release,
                                                  release,
                                                  collection_open,
@@ -850,6 +862,10 @@ int ps_pouch_state_open(const char *path, int create,
                              options ? &options->logical : NULL, &pouch, e);
   if (rc != LC_OK)
     return rc;
+  /* One segment can turn over within the initial container's ordinary
+   * headroom. Explicit settings still govern their owner. */
+  if (!options || !options->logical.segment_target_bytes)
+    pouch->segment_target_bytes = PS_MIB;
   if (options && options->logical.crypto_generate_key_file) {
     lc_pouch_close(pouch);
     return lc_error_set(e, LC_ERR_UNSUPPORTED, 0,

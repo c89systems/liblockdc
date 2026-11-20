@@ -2115,11 +2115,18 @@ static void projection_pressure(void) {
   capture_put(a, 1, 65);
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
-  ok(ps_maintenance_pressure(a, &pressure, &headroom, &e), &e);
+  ok(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e), &e);
   REQUIRE(!pressure && !headroom);
+  ok(ps_maintenance_pressure(a, 1, &pressure, &headroom, &e), &e);
+  REQUIRE(!pressure && headroom > 7 * PS_MIB);
+  REQUIRE(!ps_readiness_activity(a) && !ps_readiness_activity(b));
   ok(ps_budget_open(a, &plan, &funded, &e), &e);
   ps_writer *private = private_value(a, funded, 9000);
   ok(ps_budget_open(b, &occupied, &padding, &e), &e);
+  occupied.payload_bytes = 4 * PS_MIB;
+  ok(ps_budget_resize(padding, &occupied, &e), &e);
+  ok(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e), &e);
+  REQUIRE(pressure && headroom > 5 * PS_MIB && headroom < 6 * PS_MIB);
   for (uint64_t step = 4 * PS_MIB; step >= PS_PAGE;) {
     ps_budget_plan attempt = occupied;
     attempt.payload_bytes += step;
@@ -2136,12 +2143,15 @@ static void projection_pressure(void) {
   ok(ps_coordination_lock(ps_space_coordination(b), PS_COORDINATION_ALLOCATION,
                           0, 1, &guard, &e),
      &e);
-  REQUIRE(ps_maintenance_pressure(a, &pressure, &headroom, &e) ==
+  REQUIRE(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e) ==
               LC_ERR_PENDING &&
-          !pressure && !headroom);
+          pressure && !headroom);
+  ps_readiness_note_mutation(a);
+  ps_readiness_note_mutation(b);
+  REQUIRE(ps_readiness_activity(a) == 2 && ps_readiness_activity(b) == 2);
   lc_error_cleanup(&e);
   ps_coordination_unlock(guard);
-  ok(ps_maintenance_pressure(a, &pressure, &headroom, &e), &e);
+  ok(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e), &e);
   REQUIRE(pressure && headroom < 2 * PS_MIB);
   ok(ps_checkpoint(b, &e), &e);
   ok(ps_refresh(a, &e), &e);
@@ -2162,12 +2172,13 @@ static void projection_pressure(void) {
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_close(a, &e), &e);
   ok(ps_budget_close(padding, &e), &e);
-  ok(ps_maintenance_pressure(b, &pressure, &headroom, &e), &e);
+  ok(ps_maintenance_pressure(b, 0, &pressure, &headroom, &e), &e);
   REQUIRE(!pressure && headroom > 7 * PS_MIB);
-  ok(ps_maintenance_pressure(b, &pressure, &headroom, &e), &e);
+  ok(ps_maintenance_pressure(b, 0, &pressure, &headroom, &e), &e);
   REQUIRE(!pressure && !headroom);
   ok(ps_close(b, &e), &e);
   ok(ps_open(path, 0, NULL, &a, &e), &e);
+  REQUIRE(!ps_readiness_activity(a));
   ps_reader *reader = NULL;
   ok(ps_read_open(a, key(9000), NULL, &reader, &e), &e);
   captured_expect(reader, 9000 % 251, PS_CHUNK);

@@ -28,6 +28,10 @@ typedef struct lc_pouch_state_commit_group lc_pouch_state_commit_group;
 typedef struct lc_pouch_state_metadata_append_batcher
     lc_pouch_state_metadata_append_batcher;
 typedef struct lc_pouch_writer_root_lock_entry lc_pouch_writer_root_lock_entry;
+typedef struct lc_pouch_compaction_capacity {
+  uint64_t available, activity;
+  int draining, quiet_turns, stalled, busy;
+} lc_pouch_compaction_capacity;
 typedef struct lc_pouch_indexer_pending_namespace
     lc_pouch_indexer_pending_namespace;
 
@@ -453,6 +457,9 @@ void lc_pouch_writer_mode_operation_end(lc_pouch *pouch);
  * restart; neither path scans the root at open. */
 void lc_pouch_compaction_note_mutation(lc_pouch *pouch, const char *ns,
                                        int terminal);
+int lc_pouch_compaction_capacity_turn(lc_pouch *,
+                                      lc_pouch_compaction_capacity *,
+                                      unsigned int *delay_ms);
 /**
  * Persists terminal-reclaim work after a durable history cursor advances so a
  * restart can reclaim newly unpinned history without an open-time sweep.

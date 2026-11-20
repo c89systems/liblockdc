@@ -1844,6 +1844,7 @@ static int metadata_fits(ps_space *s, uint64_t target, uint64_t payload,
 static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
                                 uint64_t payload, uint64_t floor,
                                 lc_error *error) {
+  uint64_t usable = s->capacity - PS_DATA;
   uint64_t bytes;
   ps_run *node;
   int rc;
@@ -1854,10 +1855,10 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
     if (rc != LC_OK)
       return rc;
   }
-  /* Writers publish only a hint. An idle independent maintenance owner
-   * reconciles it with current witnesses before scheduling a pass. */
+  /* Leave a burst of ordinary headroom for independent producers while the
+   * worker observes the hint and admits its first bounded pass. */
   (void)ordinary_headroom(s, target, floor, &bytes);
-  if (bytes < payload || bytes - payload <= (s->capacity - PS_DATA) / 2)
+  if (bytes < payload || bytes - payload <= usable / 2 + usable / 8)
     ps_readiness_set_pressure(s, 1);
   if (!metadata_fits(s, target, payload, floor)) {
     rc = pins_reclaim_locked(s, error);
@@ -5863,16 +5864,16 @@ int ps_check(ps_space *s, lc_error *error) {
 int ps_maintenance_pressure_requested(ps_space *s) {
   return ps_readiness_pressure(s);
 }
-int ps_maintenance_pressure(ps_space *s, int *needed, uint64_t *available,
-                            lc_error *error) {
+int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
+                            uint64_t *available, lc_error *error) {
   ps_coordination_guard *guard = NULL;
   uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
   int rc;
   if (!s || !needed || !available)
     return err(error, LC_ERR_INVALID, "capacity pressure requires outputs");
-  *needed = 0;
+  *needed = ps_readiness_pressure(s);
   *available = 0;
-  if (!ps_readiness_pressure(s))
+  if (!*needed && !draining)
     return LC_OK;
   rc = pthread_mutex_trylock(&s->mutex);
   if (rc)
@@ -5891,10 +5892,12 @@ int ps_maintenance_pressure(ps_space *s, int *needed, uint64_t *available,
     rc = reserve_floor(s, s->metadata, s->live_entries, bound, &floor, error);
   if (rc == LC_OK) {
     (void)ordinary_headroom(s, metadata_target(s, bound), floor, available);
-    *needed =
-        *available < (s->capacity - PS_DATA) - (s->capacity - PS_DATA) / 4;
-    if (!*needed)
+    *needed = ps_readiness_pressure(s);
+    if (*needed &&
+        *available >= (s->capacity - PS_DATA) - (s->capacity - PS_DATA) / 4) {
       ps_readiness_set_pressure(s, 0);
+      *needed = 0;
+    }
   }
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);

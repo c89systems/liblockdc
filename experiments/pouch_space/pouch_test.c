@@ -4085,6 +4085,73 @@ static void maintenance_fill(lc_pouch *p, lc_error *e) {
   }
   REQUIRE(0);
 }
+typedef struct capacity_probe {
+  lc_pouch_storage_capacity sample;
+  int rc, draining;
+} capacity_probe;
+static int sample_capacity(void *context, int draining,
+                           lc_pouch_storage_capacity *out, lc_error *e) {
+  capacity_probe *probe = context;
+  (void)e;
+  probe->draining = draining;
+  *out = probe->sample;
+  return probe->rc;
+}
+static void maintenance_capacity_schedule(void) {
+  static const lc_pouch_storage_maintenance_ops maintenance = {
+      .capacity_pressure = sample_capacity};
+  static const lc_pouch_storage_ops storage = {.maintenance = &maintenance};
+  lc_pouch_compaction_capacity state = {0};
+  capacity_probe probe = {0};
+  lc_pouch *pouch = calloc(1, sizeof(*pouch));
+  unsigned int delay = 250;
+  size_t i;
+  REQUIRE(pouch);
+  pouch->storage.ops = &storage;
+  pouch->storage.context = &probe;
+  REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(!probe.draining && delay == 250);
+
+  /* A known pressure request keeps the retry short during allocator
+   * contention. Work starts with a verified observation. */
+  probe.rc = LC_ERR_PENDING;
+  probe.sample.pressured = 1;
+  REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(!probe.draining && delay == 5);
+  probe.rc = LC_OK;
+  probe.sample.pressured = 0;
+  probe.sample.available = 8 * PS_MIB;
+  for (i = 0; i < 10; ++i) {
+    delay = 250;
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+    REQUIRE(probe.draining && delay == 250);
+  }
+
+  /* New work after the last scheduled turn gets another fair drain.
+   * Busy samples cannot use up those turns. A physical gain starts a new
+   * window even when no logical mutation accompanied it. */
+  ++probe.sample.activity;
+  probe.sample.available -= PS_MIB;
+  for (i = 0; i < 10; ++i)
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  probe.rc = LC_ERR_PENDING;
+  probe.sample.available = 0;
+  for (i = 0; i < 32; ++i)
+    REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 250);
+  probe.rc = LC_OK;
+  probe.sample.available = 8 * PS_MIB;
+  for (i = 0; i < 10; ++i) {
+    delay = 250;
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+    REQUIRE(probe.draining && delay == 250);
+  }
+  REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(probe.draining);
+  REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(!probe.draining);
+  free(pouch);
+}
 typedef struct maintenance_strip {
   void *ns;
   size_t pieces;
@@ -6154,6 +6221,8 @@ static void *worker(void *context) {
     staging_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
+  else if (!strcmp(r->mode, "maintenance-capacity-schedule"))
+    maintenance_capacity_schedule();
   else if (!strcmp(r->mode, "maintenance-tail"))
     maintenance_partial_tail(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-abandoned"))

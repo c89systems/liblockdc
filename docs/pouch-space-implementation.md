@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, [point-captured piece preparation](#piece-capture-through-the-allocator), [active-source cutover and retirement](#active-source-cutover-and-retirement), bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse), and [simultaneous-producer measurements](#stream-authority-and-segment-sizing) | Namespace handoff under simultaneous load and completion sizing for larger envelopes and concurrent terminal operations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), and [fixed-capacity simultaneous producers](#transaction-authority-for-independent-producers) | 10 MiB alternating and simultaneous fixtures qualified. Namespace handoff tails, larger envelopes and concurrent terminal operations remain open. |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8765,3 +8765,141 @@ was slower in two of those pairs, with a median paired difference of
 −21.52 ms and a median paired sync-time difference of −23.55 ms. The
 steady-state outbox timing difference remains uncertain. Raw results are
 under the `rotation-` prefix in `build/pouch-space-concurrent/`.
+
+## Fixed-capacity geometry and pressure drain
+
+The experimental backend defaults to 1 MiB segments. This target lets
+completed sources turn over within the initial 10 MiB container. The
+previous 64 MiB default kept superseded bodies together in active sources
+through several workload cycles. A shorter target can publish more segment
+bindings and routing changes. Explicit targets retain their existing
+meaning, and a single frame can exceed the target. The multifile reference
+keeps its own geometry. Container capacity and explicit growth are separate
+from the rotation target.
+
+The allocator requests pressure work when five eighths of usable capacity
+remains as ordinary headroom. This leaves room for another burst while the
+worker responds. The worker clears the hint at three quarters. A busy probe
+preserves the hint for retry and defers maintenance admission. Busy observations
+and verified stalls have separate backoff counters. After pressure clears, the
+worker samples both headroom and a cohort-wide mutation counter while it
+drains. A mutation or a gain in headroom renews the quiet window. Busy
+observations consume no quiet turns, and a final sample checks progress after
+the last turn before the worker returns to the idle cadence.
+
+The native adapter records existing logical mutation notifications even on
+peers with their worker disabled. The counter uses one atomic word in the
+volatile readiness page, without acquisition of allocator or namespace
+authority. A fresh cohort resets it. The readiness marker fences live cohorts
+that disagree on the page layout. Durable admission and recovery still use
+the canonical journal, and the pressure and activity hints confer no capacity
+or visibility rights.
+
+Debug and GNU passed all 21 selected checks per build. Musl passed 19 of 21.
+The scheduling fixture exercises busy probes, headroom gains and peer activity
+after the last quiet turn. The allocator fixture observes the earlier request
+under a live peer reservation and checks both the shared activity counter and
+its reset on cold admission. The matrix also covers readiness recovery,
+namespace retirement faults, shared queue and outbox recovery, and multifile
+background compaction on its normal and small stacks.
+
+All 12 alternating workloads streamed 18 MiB each through the fixed 10 MiB
+container with the new default. After foreground work, they reached the 3 MiB
+reclamation bound within 101 ms and retained 2,129,920–2,961,408 bytes. Ten of
+12 simultaneous workloads completed and verified after reopen. All four
+targeted reruns of the two failing musl profiles completed. The initial runs
+reached a timeout on namespace state byte 9619 and a separate callback
+rendezvous timeout. The earlier build also returned pending on namespace state
+in a matched run. The guard fixtures confirm that different transaction IDs
+on the same stripe serialize. Staged retention holds that guard across body
+production, so a stripe collision can prevent independent callbacks from
+overlapping. The particular timeout run did not identify both transaction IDs.
+
+Six GNU prior/current simultaneous pairs used identical 1 MiB targets. All
+six prior runs and five current runs completed. Plaintext NoSync median
+foreground time was 3.41 s prior and 3.97 s current. Two current durable
+runs completed in 7.09 and 8.90 s. Their paired prior runs took 8.96 and
+7.45 s. The third current durable run returned pending on namespace state
+byte 8871. These runs leave shared admission under simultaneous load open.
+
+All 72 matched lifecycle runs verified after reopen with background
+maintenance disabled. The medians below are milliseconds across six GNU
+samples with two shared writers and explicit 1 MiB segments. The order is
+prior single-file (`7e6a20e1`), current single-file and multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 35.31 / 28.68 / 114.28 | 14.55 / 10.89 / 34.71 | 0.26 / 0.26 / 0.07 | 5.32 / 6.02 / 0.35 | 0.38 / 0.43 / 0.50 |
+| Queue, 64 KiB durable | 352.61 / 405.13 / 458.98 | 69.41 / 80.54 / 106.43 | 0.34 / 0.31 / 0.13 | 5.98 / 8.17 / 0.61 | 0.45 / 0.64 / 0.52 |
+| Indexed state, 4 KiB NoSync | 109.07 / 77.01 / 219.86 | 20.13 / 1.66 / 23.05 | 1.49 / 0.64 / 0.30 | 6.87 / 6.11 / 0.47 | 1.58 / 1.16 / 2.32 |
+| Outbox, 64 KiB durable | 1236.26 / 1189.60 / 1751.98 | 235.14 / 232.01 / 362.54 | 0.56 / 0.74 / 0.33 | 58.07 / 53.31 / 66.45 | 78.53 / 77.68 / 171.69 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 74.39 / 39.20 / 175.49 | 30.88 / 30.32 / 31.17 | 0.40 / 0.45 / 11.96 | 0.20 / 0.19 / 7.76 |
+
+Durable queue work was slower than the prior single-file build in five of six
+pairs, with a median paired difference of 61.20 ms. Outbox work was faster
+in five of six pairs by a median 106.33 ms. Native queue and index reopen
+remain materially slower than multifile. Logs and counters are under the
+`native-bound-` prefix in `build/pouch-space-concurrent/`.
+
+## Transaction authority for independent producers
+
+The simultaneous-producer fixture mints two distinct implicit XIDs that
+both selected slot 106 in the original 256-stripe scheme. With that scheme,
+one writer reached its first source callback and waited at the rendezvous.
+The other writer was blocked acquiring the transaction slot during staged
+retention admission. The debugger captured both stacks on the timeout.
+
+Native transaction authority uses the full XID as input to its slot hash,
+with 60 slot bits in a separate advisory range above stream authority. The
+existing keyed registry allocates a guard on demand while it has users.
+Same-XID operations still serialize across threads and peer opens, and
+process death releases OFD authority. Recursion avoidance compares the
+actual physical slot, so a hash alias still shares one lock. Multifile
+continues to use its existing stripe and lock-file layout.
+
+The virtual transaction band retains the 4 EiB file-capacity ceiling and
+reduces the experimental incarnation ceiling to `3 * 2^60 - 1`. It needs
+no physical file allocation. The volatile readiness marker fences live
+cohorts that disagree about lock addresses. The durable record layout is
+unchanged.
+
+Debug, GNU and musl each passed 25 selected checks. They include same-XID
+exclusion, distinct XIDs on the former stripe, registry allocation failure,
+uncertain storage admission, process-death release and both ends of the
+advisory range. GNU also passed the plaintext and combined-codec XA
+concurrency suites and all 5,328 XA process-death cases.
+
+All 24 fixed-capacity runs verified after reopen. They streamed 18 MiB each
+through the initial 10 MiB container with the 1 MiB default segment target.
+In all 12 simultaneous runs both first callbacks entered before either
+continued. Foreground work took 4.32–10.15 seconds with 50–76 physical
+checkpoints. All 12 alternating runs reached the 3 MiB reclamation bound
+within 104 ms of finishing foreground work. The two-writer evidence covers
+one designated maintenance owner and the tested workload sizes.
+
+All 72 matched GNU lifecycle samples verified. The timings below use explicit
+1 MiB segments, two shared writers and background maintenance disabled. Each
+cell reports medians in milliseconds in the order capacity-only single-file
+candidate, single-file with sparse transaction authority, and multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 26.85 / 29.86 / 88.62 | 10.14 / 12.40 / 18.15 | 0.25 / 0.28 / 0.07 | 5.27 / 5.24 / 0.42 | 0.30 / 0.34 / 0.53 |
+| Queue, 64 KiB durable | 337.60 / 355.52 / 363.42 | 68.60 / 71.67 / 71.07 | 0.26 / 0.29 / 0.12 | 5.60 / 5.32 / 0.50 | 0.50 / 0.40 / 0.46 |
+| Indexed state, 4 KiB NoSync | 60.30 / 61.58 / 189.14 | 1.35 / 1.59 / 21.67 | 0.51 / 0.52 / 0.30 | 5.46 / 6.05 / 0.57 | 0.99 / 1.14 / 1.78 |
+| Outbox, 64 KiB durable | 1183.44 / 1073.93 / 1507.13 | 222.61 / 212.50 / 292.81 | 0.57 / 0.51 / 0.29 | 43.49 / 42.59 / 66.54 | 77.74 / 69.28 / 133.20 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 37.30 / 35.71 / 141.10 | 23.58 / 22.55 / 29.91 | 0.36 / 0.37 / 20.09 | 0.16 / 0.16 / 13.12 |
+
+The median paired differences in foreground work were −1.24 ms for NoSync
+queue, +3.43 ms for durable queue, +2.90 ms for indexed state and −67.25 ms
+for durable outbox. Outbox process CPU had medians of 120.68 ms before and
+130.45 ms after the guard change. Queue and indexed reopen still perform
+two syncs. The durable outbox reopen performs fourteen. Test logs, the old
+timeout stacks and benchmark counters are under the `txn-authority-` prefix
+in `build/pouch-space-concurrent/`.
