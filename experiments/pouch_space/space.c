@@ -342,11 +342,16 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
   return NULL;
 }
 static size_t entry_bytes(const ps_entry *p) {
+  size_t header = 64;
   if (p->key.kind == PS_CATALOG)
     return ps_catalog_record_bytes(p);
-  return p->key.kind == PS_STREAM      ? 80
-         : p->key.kind == PS_OWNED_RUN ? 80 + 24 * p->count
-                                       : 64 + 24 * p->count;
+  if (p->key.kind == PS_STREAM)
+    return 80;
+  if (p->key.kind == PS_OWNED_RUN)
+    header = 80;
+  if (p->key.kind == PS_KEY_METADATA)
+    header += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
+  return header + 24 * p->count;
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
   ps_entry *p;
@@ -461,6 +466,7 @@ static void retire(ps_space *s, ps_entry *p) {
 static void install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);
   p->previous = old;
+  ps_internal_reserve_install(s, p, old);
   if (p->key.kind == PS_OWNED_RUN && !p->deleted)
     owned_link(s, p, old);
   if (old)
@@ -477,6 +483,7 @@ static void install(ps_space *s, ps_entry *p) {
 }
 static void entry_free(ps_entry *p) {
   ps_catalog_free_record(p);
+  lc_free_with_allocator(NULL, p->deletion_reserve);
   lc_free_with_allocator(NULL, p->ranges);
   lc_free_with_allocator(NULL, p->range_bitmap);
   lc_free_with_allocator(NULL, p->range_rank);
@@ -1407,6 +1414,7 @@ static void collect_retired(ps_space *s, int full) {
     if (*link)
       (*link)->retired_link = link;
     unregister_entry(p);
+    ps_internal_reserve_forget(s, p);
     entry_free(p);
   }
 }
@@ -1440,6 +1448,10 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
     if (p->key.kind == PS_OWNED_RUN) {
       put64(wire + 64, p->stream_capacity);
       put32(wire + 72, (uint32_t)p->owned_mapped);
+    }
+    if (p->key.kind == PS_KEY_METADATA) {
+      put64(wire + 64, p->deletion_bytes);
+      first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
     }
     for (i = 0; i < p->count; ++i) {
       put64(wire + first + 24 * i, p->extents[i].offset);
@@ -1475,6 +1487,8 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
               : get32(wire + 56);
   first =
       get32(wire + 16) == PS_OWNED_RUN && get32(wire + 20) == PS_PUT ? 80 : 64;
+  if (get32(wire + 16) == PS_KEY_METADATA && type == PS_PUT)
+    first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
   if (count > (PS_JOURNAL - 64) / 24 ||
       (get32(wire + 16) != PS_CATALOG &&
        bytes != (get32(wire + 16) == PS_STREAM && (get32(wire + 20) == PS_PUT ||
@@ -1571,6 +1585,17 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   if (sum != p->bytes)
     goto invalid;
+  if (p->key.kind == PS_KEY_METADATA && type == PS_PUT) {
+    uint64_t deletion = get64(wire + 64);
+    int rc;
+    if (deletion > p->bytes && deletion - p->bytes > 512)
+      goto invalid;
+    rc = ps_internal_reserve_entry(p, deletion, error);
+    if (rc != LC_OK) {
+      entry_free(p);
+      return rc;
+    }
+  }
   *out = p;
   return LC_OK;
 invalid:
@@ -4027,6 +4052,7 @@ done:
 static int projection_same(const ps_entry *a, const ps_entry *b) {
   size_t i;
   if (a->deleted || a->count != b->count ||
+      a->deletion_bytes != b->deletion_bytes ||
       a->owned_mapped != b->owned_mapped ||
       (a->key.kind != PS_STREAM && a->bytes != b->bytes) ||
       (a->key.kind == PS_OWNED_RUN && a->stream_capacity != b->stream_capacity))
@@ -4198,6 +4224,8 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     if (p->catalog)
       p->catalog->link = NULL;
     if (p->state != 0) {
+      lc_free_with_allocator(NULL, p->deletion_reserve);
+      p->deletion_reserve = NULL;
       p->state = 2;
       p->safe = 1;
       if (p->key.kind == PS_STREAM || p->key.kind == PS_OWNED_RUN)
@@ -4229,6 +4257,11 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       dest->owned_linked = q->owned_linked;
       dest->writer_stamp = q->writer_stamp;
       dest->writer_generation = q->writer_generation;
+      /* The staged tree owns independent nodes, even when its selected
+       * descriptor reuses an existing reader-visible incarnation. */
+      lc_free_with_allocator(NULL, dest->deletion_reserve);
+      dest->deletion_reserve = q->deletion_reserve;
+      q->deletion_reserve = NULL;
       if (dest->key.kind == PS_STREAM) {
         dest->stream_capacity = q->stream_capacity;
         dest->stream_runs = q->stream_runs;
@@ -4347,6 +4380,13 @@ static void projection_install(ps_space *s, ps_space *v) {
   s->packed_pages = v->packed_pages;
   s->packed_bytes = v->packed_bytes;
   s->pinned_free_bytes = v->pinned_free_bytes;
+  s->selected_reserves = v->selected_reserves;
+  s->retiring_reserves = v->retiring_reserves;
+  s->selected_reserve_count = v->selected_reserve_count;
+  s->reserve_pruned_local = v->reserve_pruned_local;
+  s->reserve_pruned_peer = v->reserve_pruned_peer;
+  if (s->retiring_reserves)
+    s->retiring_reserves->retiring_link = &s->retiring_reserves;
   s->peer_durable = v->peer_durable;
   if (s->peer_durable >= s->own_ready_wire)
     mark_durable(s, s->own_ready_sequence);
@@ -5021,6 +5061,19 @@ static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
 int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   return publish_value(w, ref, NULL, error);
 }
+int ps_writer_key_deletion(ps_writer *w, uint64_t bytes, lc_error *error) {
+  uint64_t encoded;
+  if (!w || w->failed || w->published || w->entry->key.kind != PS_KEY_METADATA)
+    return err(error, LC_ERR_INVALID,
+               "deletion reserve requires an unpublished key slot");
+  encoded = w->entry->bytes + w->used;
+  if (bytes > encoded && bytes - encoded > 512)
+    return err(error, LC_ERR_INVALID, "deletion reserve exceeds its key slot");
+  return ps_internal_reserve_entry(w->entry, bytes, error);
+}
+uint64_t ps_reader_key_deletion(const ps_reader *r) {
+  return r->entry->deletion_bytes;
+}
 int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
                             lc_error *error) {
   if (!w || !ref || !bytes || w->failed || w->published)
@@ -5031,21 +5084,21 @@ int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
   *bytes = w->entry->bytes + w->used;
   return LC_OK;
 }
-int ps_revision_publish(ps_writer *const *writers, size_t count,
-                        int force_durable, enum ps_commit_mode mode,
-                        ps_ref *refs, uint64_t *prefix, lc_error *error) {
+int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
+                        enum ps_commit_mode mode, ps_ref *refs,
+                        uint64_t *prefix, lc_error *error) {
   ps_space *s;
   ps_budget *budget;
   ps_coordination_guard *guard = NULL;
   ps_entry *p, *old;
   unsigned char *wire = NULL;
   size_t i, j, bytes = 64, cursor, prior, descriptor;
-  uint64_t metadata, entries, growth = 0, added = 0, sequence = 0;
+  uint64_t metadata, entries, growth = 0, added = 0, sequence = 0, deletion = 0;
   int rc = LC_OK, durable, forced;
   if (prefix)
     *prefix = 0;
   if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0] ||
-      (force_durable != 0 && force_durable != 1) ||
+      (flags & ~(PS_REVISION_FORCE_DURABLE | PS_REVISION_ADMIT_RESERVE)) ||
       (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
     return err(error, LC_ERR_INVALID, "revision requires immutable writers");
   s = writers[0]->space;
@@ -5084,8 +5137,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     rc = checkpoint_locked(s, error);
   metadata = s->metadata;
   entries = s->live_entries;
-  durable = s->durable || force_durable;
-  forced = force_durable;
+  forced = (flags & PS_REVISION_FORCE_DURABLE) != 0;
+  durable = s->durable || forced;
   for (i = 0; rc == LC_OK && i < count; ++i) {
     p = writers[i]->entry;
     old = lookup(s, p->key);
@@ -5104,12 +5157,17 @@ int ps_revision_publish(ps_writer *const *writers, size_t count,
     }
     if (p->key.kind == PS_CONTROL)
       durable = forced = 1;
+    if (p->deletion_bytes > deletion)
+      deletion = p->deletion_bytes;
   }
   if (rc == LC_OK)
     rc = ps_internal_budget_check(s, budget, 0, growth, added, error);
   if (rc == LC_OK)
     rc = checkpoint_allowance_floor(s, metadata, entries, 0,
                                     PS_MAINTENANCE_RESERVE, budget, error);
+  if (rc == LC_OK && deletion && (flags & PS_REVISION_ADMIT_RESERVE) &&
+      ps_coordination_shared(s->coordination))
+    rc = ps_internal_reserve_recheck(s, deletion, error);
   if (rc == LC_OK) {
     memset(wire, 0, 64);
     put32(wire, REVISION_MAGIC);
@@ -6147,7 +6205,7 @@ int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   out->reserve_payload_bytes = reserve.payload_bytes;
   out->reserve_metadata_bytes = reserve.metadata_bytes;
   out->reserve_entries = reserve.entries;
-  out->reserve_owners = s->reserve_count;
+  out->reserve_owners = s->reserve_count + s->selected_reserve_count;
   out->directory_page_writes = s->directory_page_writes;
   out->descriptor_page_writes = s->descriptor_page_writes;
   out->packed_pages = s->packed_pages;

@@ -82,6 +82,8 @@ int ps_checkpoint_record_encode(const lc_allocator *allocator,
   }
   if (rc != LC_OK)
     ps_checkpoint_record_close(out);
+  else
+    out->deletion_bytes = lc_pouch_state_entry_delete_bytes(entry);
   return rc;
 }
 int ps_checkpoint_record_write(ps_space *space, ps_budget *budget, ps_key key,
@@ -98,6 +100,8 @@ int ps_checkpoint_record_write(ps_space *space, ps_budget *budget, ps_key key,
   rc = ps_begin(space, budget, key, &writer, e);
   if (rc == LC_OK)
     rc = ps_write(writer, record->bytes, record->length, e);
+  if (rc == LC_OK && key.kind == PS_KEY_METADATA)
+    rc = ps_writer_key_deletion(writer, record->deletion_bytes, e);
   if (rc == LC_OK)
     *out = writer;
   else

@@ -236,7 +236,7 @@ static void checkpoint_records(int durable) {
   note.version = 2;
   note.index_seq = 9;
   OK(ps_checkpoint_record_encode(&allocator, &note, &decision, &error));
-  OK(ps_budget_plan_value(&plan, metadata.length, &error));
+  OK(ps_budget_plan_key_slot(&plan, slot.kind, metadata.length, 0, &error));
   OK(ps_budget_plan_value(&plan, decision.length, &error));
   OK(ps_budget_open(s, &plan, &budget, &error));
   OK(ps_begin(s, budget, slot, &writers[0], &error));

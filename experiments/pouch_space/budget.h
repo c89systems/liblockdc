@@ -28,6 +28,7 @@ typedef struct ps_budget_plan {
   int maintenance;
 } ps_budget_plan;
 typedef struct ps_reserve ps_reserve;
+#define PS_KEY_SLOT_DESCRIPTOR_EXTRA 8U
 /* Compose scalar costs without changing the destination admission class. */
 int ps_budget_plan_add(ps_budget_plan *, const ps_budget_plan *, lc_error *);
 /* Unclaimed future maintenance requirements. The space protects the component
@@ -66,6 +67,8 @@ int ps_budget_plan_value(ps_budget_plan *, uint64_t bytes, lc_error *);
 /* Any encoded length up to this bound. Even an aligned limit can require one
  * extra extent when a shorter value splits an existing packed tail. */
 int ps_budget_plan_value_bound(ps_budget_plan *, uint64_t bytes, lc_error *);
+int ps_budget_plan_key_slot(ps_budget_plan *, unsigned int kind, uint64_t bytes,
+                            int upper_bound, lc_error *);
 int ps_budget_plan_piece(ps_budget_plan *, uint64_t logical_bytes,
                          size_t ranges, uint64_t live_bytes, lc_error *);
 /* Compound namespace workspace: one bounded piece, optional successor and

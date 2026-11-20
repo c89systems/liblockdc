@@ -9486,3 +9486,73 @@ case must exercise a namespace the joining owner has never touched, close
 or kill its last writer, fill ordinary capacity from another namespace,
 then prove that maintenance completes and the committed values survive
 cold reopen.
+
+## Standing deletion reserves in selected descriptors
+
+Key metadata descriptors now carry their canonical deletion bound. The
+allocator rebuilds the component maxima from those descriptors during
+physical directory recovery, journal replay and adoption of a newer
+root. Pending logical appends retain local claims for obligations the
+selected slots do not cover. A replacement can increase the allocator's
+floor at publication. An older requirement remains protected until the
+replacement reaches the durable prefix, including when the new value
+becomes visible earlier under NoSync.
+
+A direct native metadata revision that grows the shared reserve checks
+ordinary admission again under allocator authority before selection.
+A peer can consume headroom after private preparation. The final check
+allows healthy refusal in that case and adds no durability barrier.
+A private revision following a shrinking descriptor funds its own
+growth against the new selected requirement, because another sync can
+retire the older descriptor before that revision commits.
+
+The deterministic fixture starts a peer before the namespace exists.
+It proves a competing capacity claim can refuse a prepared revision,
+then releases the claim and retries. The peer observes the selected
+requirement through journal replay, physical checkpoint adoption and
+publisher close without acquiring the namespace. The fixture also
+covers certified retirement, overlapping private admission, an
+independent publisher exiting without cleanup and cold reopen. It uses
+fixed 10 MiB under both durability policies.
+
+The experimental descriptor adds eight bytes for each ordinary key
+slot. Recreate roots from the earlier experimental layout for this
+build. This stage moves selected deletion reserves into physical
+recovery. Joining roots still reconstruct outstanding checkpoint
+capacity and unselected-tail obligations in each namespace.
+
+The broader GNU Release pass covered 37 groups before the final
+handoff refinement. The final tree passed nine Debug, 14 GNU Release
+and 14 musl Release groups. These include allocation and I/O fault
+models, deferred metadata visibility, interrupted checkpoint coverage,
+indexed-query recovery and concurrent lease and messaging capacity.
+
+The first matched GNU rotation verified 29 of 30 runs. The prior
+native build (`4d2da540`) refused capacity once during four-writer
+NoSync indexed mutation. The candidate and multifile verified every
+run. The final matched rotation verified all 12 workflows. The tables
+report that final rotation in milliseconds, with one sample per build
+per workload. Values are in the order prior native, current native
+and multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 1922.25 / 1593.23 / 1563.48 | 96.38 / 94.74 / 37.45 | 45.44 / 3.98 / 1.52 | 21.24 / 27.05 / 1.28 | 6.61 / 7.99 / 10.28 |
+| Two writers, durable indexed, 15 MiB | 7608.66 / 8892.22 / 6103.17 | 105.59 / 105.90 / 69.73 | 1.74 / 3.13 / 1.35 | 13.39 / 26.50 / 0.92 | 6.53 / 8.97 / 12.32 |
+| Two writers, NoSync warm queue | 13.94 / 11.22 / 84.75 | 2.47 / 2.22 / 15.95 | 0.36 / 0.37 / 0.12 | 3.51 / 4.79 / 0.38 | 0.33 / 0.34 / 0.80 |
+| Two writers, durable outbox | 1026.42 / 1165.65 / 1648.70 | 190.82 / 216.21 / 336.38 | 0.58 / 0.71 / 0.54 | 69.78 / 35.57 / 72.92 | 62.89 / 59.76 / 156.00 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 260.76 / 281.83 / 387.30 | 188.70 / 143.14 / 212.62 | 21.02 / 93.71 / 201.70 |
+| Two writers, durable indexed, 15 MiB | 153.41 / 177.99 / 234.42 | 22.87 / 43.26 / 291.96 | 28.21 / 3.50 / 382.51 |
+
+Durable indexed work in the first rotation had medians of 7293, 6615
+and 6274 ms. The final current sample spent 9349 ms cumulatively in
+sync calls across writers, compared with 7378 ms in the prior sample
+with a similar call count. It also made 28 physical checkpoints versus
+23. These samples show variable durable cost. They do not isolate a
+latency change caused by descriptor-based reserves. Indexed reopen and
+four-writer NoSync write tails remain qualification work. Raw attempts
+and test logs are under `selected-reserve-` in
+`build/pouch-space-concurrent/`.

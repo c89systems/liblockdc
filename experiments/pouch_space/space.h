@@ -189,6 +189,9 @@ int ps_write(ps_writer *, const void *, size_t, lc_error *);
  * I/O errors poison the space; outcome may be uncertain. Reopen/reconcile. */
 int ps_publish(ps_writer *, ps_ref *, lc_error *);
 void ps_writer_close(ps_writer *);
+/* Bind a canonical key slot's deletion requirement to its publication. */
+int ps_writer_key_deletion(ps_writer *, uint64_t bytes, lc_error *);
+uint64_t ps_reader_key_deletion(const ps_reader *);
 /* Readers pin an immutable incarnation across replacement, delete/reclaim.
  * Durable reads select the completed commit prefix, keeping the prior value
  * visible while replacements/deletions await sync. NoSync reads select the

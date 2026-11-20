@@ -7,6 +7,10 @@
  * The identity can be embedded in another member of the same revision. */
 int ps_revision_writer_info(const ps_writer *, ps_ref *, uint64_t *,
                             lc_error *);
+enum ps_revision_flags {
+  PS_REVISION_FORCE_DURABLE = 1,
+  PS_REVISION_ADMIT_RESERVE = 2
+};
 /* Publish a complete set of distinct immutable values in one checksummed
  * physical journal frame. Writers belong to the same space and capacity
  * budget (which may be NULL). No producer executes under publication authority.
@@ -17,10 +21,13 @@ int ps_revision_writer_info(const ps_writer *, ps_ref *, uint64_t *,
  * individual entries have valid checksums. A durable root (or any CONTROL
  * member) exposes and acknowledges only a completed shared durability prefix
  * covering the whole revision, including non-CONTROL members on NoSync roots.
- * force_durable=1 requires that same barrier on any root; zero follows root
- * policy. DEFER_SYNC returns after selection without waiting for that prefix;
+ * PS_REVISION_FORCE_DURABLE requires that same barrier on any root.
+ * PS_REVISION_ADMIT_RESERVE checks the growth of a canonical deletion reserve
+ * against current shared capacity before selection. Completing prior canonical
+ * stream debt uses its existing admission.
+ * DEFER_SYNC returns after selection without waiting for that prefix;
  * durable readers still select only the completed prefix. CONTROL members and
- * force_durable always wait, including in deferred mode. The optional prefix
+ * forced revisions always wait, including in deferred mode. The optional prefix
  * output identifies the selected revision for later obligation retirement.
  * NoSync otherwise follows ordinary value publication. Journal rollover
  * can additionally checkpoint before selection. Existing captured readers pin
@@ -29,7 +36,7 @@ int ps_revision_writer_info(const ps_writer *, ps_ref *, uint64_t *,
  * them and rebuild. Uncertain I/O poisons the space as for ps_publish.
  * Outputs, when supplied, are valid only on success. One caller owns each
  * writer throughout the operation; stop concurrent use before publishing. */
-int ps_revision_publish(ps_writer *const *, size_t, int force_durable,
+int ps_revision_publish(ps_writer *const *, size_t, int flags,
                         enum ps_commit_mode, ps_ref *, uint64_t *prefix,
                         lc_error *);
 #endif

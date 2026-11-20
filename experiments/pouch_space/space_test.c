@@ -7434,6 +7434,9 @@ int main(int argc, char **argv) {
         native_metadata_lifecycle(durable);
         native_metadata_retirement(durable);
       }
+    } else if (strcmp(argv[2], "native-metadata-shared-reserve") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        native_metadata_shared_reserve(durable);
     } else if (strcmp(argv[2], "native-metadata-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int kind = 0; kind < 3; ++kind)

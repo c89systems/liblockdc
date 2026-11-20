@@ -13,11 +13,6 @@ static void plan_max(ps_budget_plan *p, const ps_budget_plan *q) {
   if (q->entries > p->entries)
     p->entries = q->entries;
 }
-void ps_internal_reserve_plan(ps_space *s, ps_budget_plan *out) {
-  *out = s->reserve_base;
-  if (s->reserves)
-    plan_max(out, &s->reserves->maximum);
-}
 static unsigned int reserve_height(ps_reserve *r) { return r ? r->height : 0; }
 static void reserve_update(ps_reserve *r) {
   unsigned int a = reserve_height(r->left), b = reserve_height(r->right);
@@ -106,6 +101,113 @@ static ps_reserve *reserve_change(ps_reserve *root, ps_reserve *r) {
   }
   reserve_update(root);
   return root;
+}
+static void selected_reserve_remove(ps_space *s, ps_reserve *r) {
+  if (r->retiring_link) {
+    *r->retiring_link = r->retiring_next;
+    if (r->retiring_next)
+      r->retiring_next->retiring_link = r->retiring_link;
+    r->retiring_link = NULL;
+    r->retiring_next = NULL;
+  }
+  s->selected_reserves = reserve_remove(s->selected_reserves, r);
+  r->height = 0;
+  --s->selected_reserve_count;
+}
+static void selected_reserves_prune(ps_space *s) {
+  ps_reserve *r, *next;
+  uint64_t durable;
+  if (!s->retiring_reserves)
+    return;
+  durable = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  if (s->reserve_pruned_local == durable &&
+      s->reserve_pruned_peer == s->peer_durable)
+    return;
+  s->reserve_pruned_local = durable;
+  s->reserve_pruned_peer = s->peer_durable;
+  for (r = s->retiring_reserves; r; r = next) {
+    next = r->retiring_next;
+    if (r->retire_local <= durable && r->retire_peer <= s->peer_durable)
+      selected_reserve_remove(s, r);
+  }
+}
+void ps_internal_reserve_plan(ps_space *s, ps_budget_plan *out) {
+  selected_reserves_prune(s);
+  *out = s->reserve_base;
+  if (s->reserves)
+    plan_max(out, &s->reserves->maximum);
+  if (s->selected_reserves)
+    plan_max(out, &s->selected_reserves->maximum);
+}
+/* Physical descriptors own these nodes. Decode and preparation allocate them
+ * before an entry can become live; installation updates the max without I/O. */
+int ps_internal_reserve_entry(ps_entry *p, uint64_t bytes, lc_error *e) {
+  ps_budget_plan plan = {0};
+  ps_reserve *r, *prior = p->deletion_reserve;
+  int rc;
+  if (bytes == p->deletion_bytes)
+    return LC_OK;
+  if (!bytes) {
+    lc_free_with_allocator(NULL, prior);
+    p->deletion_reserve = NULL;
+    p->deletion_bytes = 0;
+    return LC_OK;
+  }
+  rc = ps_budget_plan_maintenance(&plan, bytes, e);
+  if (rc != LC_OK)
+    return rc;
+  r = prior ? prior : lc_calloc_with_allocator(NULL, 1, sizeof(*r));
+  if (!r)
+    return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate key slot reserve",
+                        NULL, NULL, "pouch-space");
+  r->id = p->token;
+  r->plan = plan;
+  p->deletion_reserve = r;
+  p->deletion_bytes = bytes;
+  return LC_OK;
+}
+void ps_internal_reserve_install(ps_space *s, ps_entry *p, ps_entry *previous) {
+  ps_reserve *old = previous ? previous->deletion_reserve : NULL;
+  if (old && old->height) {
+    old->retire_local = p->publication_sequence;
+    old->retire_peer = p->peer_sequence;
+    if (old->retire_local <=
+            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) &&
+        old->retire_peer <= s->peer_durable)
+      selected_reserve_remove(s, old);
+    else {
+      old->retiring_next = s->retiring_reserves;
+      old->retiring_link = &s->retiring_reserves;
+      if (old->retiring_next)
+        old->retiring_next->retiring_link = &old->retiring_next;
+      s->retiring_reserves = old;
+    }
+  }
+  if (p->deletion_reserve) {
+    s->selected_reserves =
+        reserve_insert(s->selected_reserves, p->deletion_reserve);
+    ++s->selected_reserve_count;
+  }
+}
+void ps_internal_reserve_forget(ps_space *s, ps_entry *p) {
+  if (p->deletion_reserve && p->deletion_reserve->height)
+    selected_reserve_remove(s, p->deletion_reserve);
+}
+int ps_internal_reserve_recheck(ps_space *s, uint64_t deletion, lc_error *e) {
+  ps_budget_plan base = s->reserve_base, current = base, proposed = {0};
+  int rc;
+  selected_reserves_prune(s);
+  if (s->selected_reserves)
+    plan_max(&current, &s->selected_reserves->maximum);
+  rc = ps_budget_plan_maintenance(&proposed, deletion, e);
+  if (rc != LC_OK || (proposed.payload_bytes <= current.payload_bytes &&
+                      proposed.metadata_bytes <= current.metadata_bytes &&
+                      proposed.entries <= current.entries))
+    return rc;
+  plan_max(&s->reserve_base, &proposed);
+  rc = ps_internal_budget_admit(s, 0, NULL, NULL, e);
+  s->reserve_base = base;
+  return rc;
 }
 static int reserve_valid(const ps_budget_plan *p, int recover, lc_error *e) {
   if (!p || p->payload_bytes % PS_PAGE || p->maintenance ||
@@ -294,6 +396,21 @@ int ps_budget_plan_value_bound(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
     *p = next;
   return rc;
 }
+int ps_budget_plan_key_slot(ps_budget_plan *p, unsigned int kind,
+                            uint64_t bytes, int upper_bound, lc_error *e) {
+  ps_budget_plan next;
+  int rc;
+  if (!p)
+    return invalid(e, "capacity key slot requires a plan");
+  next = *p;
+  rc = upper_bound ? ps_budget_plan_value_bound(&next, bytes, e)
+                   : ps_budget_plan_value(&next, bytes, e);
+  if (rc == LC_OK && kind == PS_KEY_METADATA)
+    rc = plan_add(&next, 0, PS_KEY_SLOT_DESCRIPTOR_EXTRA, 0, e);
+  if (rc == LC_OK)
+    *p = next;
+  return rc;
+}
 int ps_budget_plan_piece(ps_budget_plan *p, uint64_t logical, size_t ranges,
                          uint64_t live, lc_error *e) {
   ps_budget_plan next;
@@ -357,7 +474,7 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
   if (rc == LC_OK && deletion)
     rc = ps_budget_plan_span(&next, deletion + PS_FRAME_BYTES, e);
   if (rc == LC_OK && deletion)
-    rc = ps_budget_plan_value_bound(&next, deletion + 512, e);
+    rc = ps_budget_plan_key_slot(&next, PS_KEY_METADATA, deletion + 512, 1, e);
   /* Empty selected heads also need coverage before their obsolete catalog
    * bindings can retire. Cover the predecessor, then the empty successor at
    * retirement. Neither publication needs a logical tombstone. */

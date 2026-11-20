@@ -74,6 +74,7 @@ static void native_metadata_fixture(native_metadata_batch *b, int replacement,
   native_metadata_fixture_full(b, replacement, first, "empty");
 }
 typedef struct native_metadata_seen {
+  const char *first_key;
   size_t keys, decisions;
   uint64_t index, version, decision_version, boundary;
   int found;
@@ -90,7 +91,8 @@ static int native_metadata_visit(void *context, uint64_t segment,
     return LC_OK;
   }
   if (!entry->control) {
-    CHECK(!strcmp(entry->key, "alpha") || !strcmp(entry->key, "bravo"));
+    CHECK(!strcmp(entry->key, seen->first_key ? seen->first_key : "alpha") ||
+          !strcmp(entry->key, "bravo"));
     if (!seen->keys) {
       seen->found = entry->found;
       seen->version = entry->version;
@@ -299,6 +301,138 @@ static void native_metadata_retirement(int durable) {
   native_metadata_free(&original);
   native_metadata_free(&changed);
   free(etag);
+  clean();
+}
+static void native_metadata_shared_reserve(int durable) {
+  ps_root_options options = {0};
+  ps_root *owner = NULL, *peer = NULL;
+  ps_namespace *ns = NULL;
+  ps_namespace_metadata *plan = NULL;
+  ps_budget *pressure = NULL;
+  ps_budget_plan claim = {0};
+  ps_space *other;
+  ps_stats base, live, observed;
+  native_metadata_batch original, changed;
+  native_metadata_seen seen = {0};
+  char *large = malloc(60 * 1024 + 1);
+  CHECK(large);
+  memset(large, 'k', 60 * 1024);
+  large[60 * 1024] = 0;
+  clean();
+  options.storage.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.storage.durable_sync = durable;
+  options.storage.shared = 1;
+  OK(ps_root_open(path, 1, &options, &owner, &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  other = ps_root_space(peer);
+  OK(ps_status(other, &base, &error));
+  OK(ps_root_namespace_acquire(owner, "cold", 1, &ns, &error));
+  native_metadata_fixture(&original, 0, large);
+  native_metadata_fixture(&changed, 1, large);
+  OK(ps_namespace_metadata_begin(ns, 0, &original.batch, original.bytes, &plan,
+                                 &error));
+  /* Another allocator can use ordinary capacity after private admission.
+   * Select the new standing requirement only if it still fits at commit. */
+  OK(ps_budget_open(other, &claim, &pressure, &error));
+  for (uint64_t step = PS_DEFAULT_CAPACITY / (2 * PS_PAGE); step; step /= 2) {
+    claim.payload_bytes += step * PS_PAGE;
+    int rc = ps_budget_resize(pressure, &claim, &error);
+    if (rc != LC_OK) {
+      CHECK(rc == LC_ERR_INVALID);
+      lc_error_cleanup(&error);
+      claim.payload_bytes -= step * PS_PAGE;
+    }
+  }
+  CHECK(claim.payload_bytes > PS_DEFAULT_CAPACITY / 2);
+  CHECK(ps_namespace_metadata_commit(plan, &original.batch, PS_COMMIT_DEFAULT,
+                                     &error) == LC_ERR_INVALID);
+  lc_error_cleanup(&error);
+  ps_namespace_metadata_close(plan);
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_owners == base.reserve_owners &&
+        observed.reserve_payload_bytes == base.reserve_payload_bytes);
+  OK(ps_budget_close(pressure, &error));
+  OK(native_metadata_write(ns, &original, PS_COMMIT_DEFAULT, &error));
+  OK(ps_flush(ps_root_space(owner), &error));
+  OK(ps_status(ps_root_space(owner), &live, &error));
+  CHECK(live.reserve_owners == 2 &&
+        live.reserve_payload_bytes > base.reserve_payload_bytes + 120 * 1024);
+  /* This root opened before the namespace existed. Following the physical
+   * journal and then a physical root checkpoint must establish the same
+   * reserve without loading the canonical keys. */
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes &&
+        observed.reserve_metadata_bytes == live.reserve_metadata_bytes &&
+        observed.reserve_entries == live.reserve_entries &&
+        observed.reserve_owners == live.reserve_owners);
+  OK(ps_checkpoint(ps_root_space(owner), &error));
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes &&
+        observed.reserve_owners == live.reserve_owners);
+  ps_namespace_release(ns);
+  OK(ps_root_close(owner, &error));
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes &&
+        observed.reserve_owners == live.reserve_owners);
+  OK(ps_root_open(path, 0, &options, &owner, &error));
+  OK(ps_root_namespace_acquire(owner, "cold", 0, &ns, &error));
+  OK(native_metadata_write(ns, &changed, PS_COMMIT_DEFER_SYNC, &error));
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes);
+  /* A new private plan cannot borrow a shrinking descriptor's reserve.
+   * Durability may remove that descriptor while the new plan is open. */
+  OK(ps_namespace_metadata_begin(ns, 0, &original.batch, original.bytes, &plan,
+                                 &error));
+  OK(ps_flush(ps_root_space(owner), &error));
+  OK(ps_status(ps_root_space(owner), &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes);
+  ps_namespace_metadata_close(plan);
+  ps_namespace_release(ns);
+  OK(ps_root_close(owner, &error));
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.capacity == PS_DEFAULT_CAPACITY &&
+        observed.reserve_payload_bytes == base.reserve_payload_bytes &&
+        observed.reserve_entries == base.reserve_entries &&
+        observed.reserve_owners == base.reserve_owners);
+  /* A different publisher can exit without closing. The already-open peer
+   * still obtains the selected reserve from the child process's revision. */
+  pid_t child = fork();
+  int child_status;
+  CHECK(child >= 0);
+  if (!child) {
+    ps_root *writer = NULL;
+    ps_namespace *created = NULL;
+    OK(ps_root_open(path, 0, &options, &writer, &error));
+    OK(ps_root_namespace_acquire(writer, "abandoned", 1, &created, &error));
+    OK(native_metadata_write(created, &original, PS_COMMIT_DEFAULT, &error));
+    OK(ps_flush(ps_root_space(writer), &error));
+    _exit(0);
+  }
+  CHECK(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) &&
+        WEXITSTATUS(child_status) == 0);
+  OK(ps_refresh(other, &error));
+  OK(ps_status(other, &observed, &error));
+  CHECK(observed.reserve_payload_bytes == live.reserve_payload_bytes &&
+        observed.reserve_owners == live.reserve_owners);
+  OK(ps_root_close(peer, &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_root_namespace_acquire(peer, "cold", 0, &ns, &error));
+  seen.first_key = large;
+  OK(native_metadata_capture(ns, &seen, &error));
+  CHECK(seen.keys == 2 && !seen.found && seen.version == 2 &&
+        seen.decisions == 1 && seen.decision_version == 2 &&
+        seen.boundary == 8 && seen.index == 7);
+  ps_namespace_release(ns);
+  OK(ps_root_close(peer, &error));
+  native_metadata_free(&original);
+  native_metadata_free(&changed);
+  free(large);
   clean();
 }
 typedef struct native_metadata_thread {

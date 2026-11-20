@@ -9,6 +9,7 @@ typedef struct ps_checkpoint_record {
   lc_allocator allocator;
   unsigned char *bytes;
   size_t length;
+  uint64_t deletion_bytes;
 } ps_checkpoint_record;
 int ps_checkpoint_record_encode(const lc_allocator *,
                                 const lc_pouch_state_entry *,

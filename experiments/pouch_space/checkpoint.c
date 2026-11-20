@@ -38,7 +38,7 @@ struct key_slot {
   uint64_t id, bound, selected_incarnation;
   unsigned int kind;
   ps_reserve *reserve;
-  uint64_t required_deletion;
+  uint64_t required_deletion, selected_deletion;
   key_summary summary;
   ps_checkpoint_record pending;
   source_count *body;
@@ -310,10 +310,10 @@ static int reserve_slot(ps_key_checkpoint *c, key_slot *s, uint64_t bytes,
   int rc;
   if (bytes == s->required_deletion)
     return LC_OK;
-  if (!bytes) {
+  if (bytes <= s->selected_deletion) {
     ps_reserve_close(s->reserve);
     s->reserve = NULL;
-    s->required_deletion = 0;
+    s->required_deletion = bytes;
     return LC_OK;
   }
   rc = ps_budget_plan_maintenance(&plan, bytes, e);
@@ -635,6 +635,10 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
         !lc_pouch_state_entry_project(NULL, &entry, &projected))
       rc = failure(e, LC_ERR_PROTOCOL,
                    "checkpoint has no canonical key projection");
+    if (rc == LC_OK && ps_reader_key_deletion(reader) !=
+                           lc_pouch_state_entry_delete_bytes(&projected))
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint deletion requirement disagrees with its slot");
   }
   if (rc == LC_OK) {
     lc_free_with_allocator(&c->allocator, slot->key);
@@ -645,8 +649,8 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
     slot->body = source_get(c, &entry, &rc, e);
     if (slot->body)
       ++slot->body->prepared;
-    if (rc == LC_OK)
-      rc = reserve_slot(c, slot, slot->summary.deletion_bytes, 1, e);
+    slot->required_deletion = slot->selected_deletion =
+        slot->summary.deletion_bytes;
   }
   if (rc == LC_OK)
     *out = slot;
@@ -675,10 +679,20 @@ static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {
     c->query_index = slot->summary.query;
 }
 static void select_incarnation(ps_key_checkpoint *c, key_slot *slot,
-                               uint64_t incarnation) {
+                               uint64_t incarnation, uint64_t deletion) {
   if (!slot->selected_incarnation)
     ++c->selected_count;
   slot->selected_incarnation = incarnation;
+  slot->selected_deletion = deletion;
+  /* The allocator retains the preceding descriptor through durability. A
+   * subsequent append must fund growth against the new selected requirement,
+   * since that older descriptor can stop covering it while input is active.
+   * Keep any larger obligation that still belongs to an uncheckpointed tail. */
+  if (!slot->reserve || slot->required_deletion <= deletion) {
+    ps_reserve_close(slot->reserve);
+    slot->reserve = NULL;
+    slot->required_deletion = deletion;
+  }
 }
 static void install_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
   source_count *source = slot->body;
@@ -1243,11 +1257,11 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
   }
   if (bound > change->bound) {
     if (change->bound) {
-      rc = ps_budget_plan_value_bound(&before, change->bound, e);
+      rc = ps_budget_plan_key_slot(&before, kind, change->bound, 1, e);
       if (rc != LC_OK)
         return rc;
     }
-    rc = ps_budget_plan_value_bound(&after, bound, e);
+    rc = ps_budget_plan_key_slot(&after, kind, bound, 1, e);
     if (rc != LC_OK)
       return rc;
     subtract_plan(&plan, &before);
@@ -1588,7 +1602,7 @@ static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
     }
     if (s->pending.bytes) {
       memset(&cost, 0, sizeof(cost));
-      (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
+      (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
       subtract_plan(&c->claim, &cost);
       c->dirty_bytes -= s->pending.length;
     }
@@ -1604,7 +1618,7 @@ static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
     dirty_add(c, s);
     c->dirty_bytes += s->pending.length;
     memset(&cost, 0, sizeof(cost));
-    (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
+    (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
     (void)add_plan(&c->claim, &cost, NULL);
   }
   if (d->state_index > c->state_index)
@@ -2018,9 +2032,12 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     if (writers[count])
       ++count;
   }
-  if (rc == LC_OK)
-    rc = ps_revision_publish(writers, count, d->body_replacement, mode, NULL,
-                             &prefix, e);
+  if (rc == LC_OK) {
+    int flags = d->body_replacement ? PS_REVISION_FORCE_DURABLE : 0;
+    if (!d->maintenance && !d->body_replacement)
+      flags |= PS_REVISION_ADMIT_RESERVE;
+    rc = ps_revision_publish(writers, count, flags, mode, NULL, &prefix, e);
+  }
   if (rc == LC_OK) {
     pthread_mutex_lock(&c->mutex);
     for (change = d->changes; change; change = change->next) {
@@ -2031,7 +2048,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
         insert_slot(c, s);
         change->created = 0;
       }
-      select_incarnation(c, s, change->selected_incarnation);
+      select_incarnation(c, s, change->selected_incarnation,
+                         change->summary.deletion_bytes);
       bind_source(c, s, change->body, &change->summary);
       release_prepared_source(c, change->body);
       change->body = NULL;
@@ -2424,7 +2442,7 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     plan = NULL;
     for (s = c->dirty; s && count < CHECKPOINT_BATCH; s = s->dirty_next) {
       memset(&cost, 0, sizeof(cost));
-      rc = ps_budget_plan_value(&cost, s->pending.length, e);
+      rc = ps_budget_plan_key_slot(&cost, s->kind, s->pending.length, 0, e);
       if (rc != LC_OK || cost.metadata_bytes > PS_JOURNAL - 64 - descriptors)
         break;
       descriptors += cost.metadata_bytes;
@@ -2468,10 +2486,10 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
       rc = observer.prepare(observer.context, c->ns->name, refs, ordinary,
                             &plan, e);
     if (rc == LC_OK)
-      rc = ps_revision_publish(writers, outputs, force_durable,
-                               force_durable ? PS_COMMIT_DEFAULT
-                                             : PS_COMMIT_DEFER_SYNC,
-                               NULL, &prefix, e);
+      rc = ps_revision_publish(
+          writers, outputs, force_durable ? PS_REVISION_FORCE_DURABLE : 0,
+          force_durable ? PS_COMMIT_DEFAULT : PS_COMMIT_DEFER_SYNC, NULL,
+          &prefix, e);
     if (observer.finish && plan)
       observer.finish(observer.context, plan, rc == LC_OK);
     for (i = 0; i < outputs; ++i)
@@ -2480,9 +2498,9 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     if (rc == LC_OK) {
       for (i = 0; i < count; ++i) {
         s = slots[i];
-        select_incarnation(c, s, incarnations[i]);
+        select_incarnation(c, s, incarnations[i], s->summary.deletion_bytes);
         memset(&cost, 0, sizeof(cost));
-        (void)ps_budget_plan_value_bound(&cost, s->bound, NULL);
+        (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
         subtract_plan(&c->claim, &cost);
         c->dirty_bytes -= s->pending.length;
         dirty_remove(c, s);

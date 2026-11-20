@@ -75,6 +75,8 @@ typedef struct ps_entry {
   int value_checked; /* transient immutable-payload validation: 0 unknown */
   int payload_claimed;
   int reader_claimed;
+  uint64_t deletion_bytes;
+  struct ps_reserve *deletion_reserve;
   /* Temporary checkpoint projection binding; never serialized. */
   struct ps_entry *projection;
   ps_extent *extents;
@@ -158,6 +160,9 @@ struct ps_space {
   ps_budget_plan reserve_base;
   struct ps_reserve *reserves;
   uint64_t reserve_next, reserve_count;
+  struct ps_reserve *selected_reserves, *retiring_reserves;
+  uint64_t selected_reserve_count;
+  uint64_t reserve_pruned_local, reserve_pruned_peer;
   uint64_t directory_page_writes, descriptor_page_writes;
   size_t metadata_pages;
   size_t packed_pages;
@@ -188,6 +193,8 @@ struct ps_reserve {
   unsigned int height;
   ps_budget_plan plan, maximum;
   struct ps_reserve *left, *right;
+  uint64_t retire_local, retire_peer;
+  struct ps_reserve *retiring_next, **retiring_link;
 };
 
 typedef struct ps_catalog_record {
@@ -251,6 +258,11 @@ int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
 int ps_internal_budget_admit(ps_space *, int, const ps_budget_plan *,
                              const ps_budget_plan *, lc_error *);
 void ps_internal_reserve_plan(ps_space *, ps_budget_plan *);
+int ps_internal_reserve_entry(ps_entry *, uint64_t deletion_bytes, lc_error *);
+int ps_internal_reserve_recheck(ps_space *, uint64_t deletion_bytes,
+                                lc_error *);
+void ps_internal_reserve_install(ps_space *, ps_entry *, ps_entry *previous);
+void ps_internal_reserve_forget(ps_space *, ps_entry *);
 void ps_internal_budget_trim(ps_space *, ps_run **);
 int ps_internal_budget_check(ps_space *, ps_budget *, uint64_t, uint64_t,
                              uint64_t, lc_error *);
