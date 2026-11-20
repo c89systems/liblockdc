@@ -24,9 +24,14 @@ struct ps_writer {
   int failed, published;
   unsigned char buffer[PS_CHUNK];
 };
+typedef struct packed_read {
+  uint64_t offset;
+  unsigned char bytes[PS_PAGE];
+} packed_read;
 struct ps_reader {
   ps_space *space;
   ps_entry *entry;
+  packed_read *packed;
   size_t extent, offset, loaded;
   size_t random_extent;
   uint64_t random_base;
@@ -1731,15 +1736,35 @@ static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
     rc = err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
   return rc;
 }
+/* The caller retains the captured cells for the whole read pass. Unrelated
+ * cells in this buffer confer no authority and are never exposed. */
+static int read_extent(ps_space *s, const ps_extent *extent,
+                       unsigned char *buffer, packed_read *packed,
+                       lc_error *error) {
+  uint64_t page;
+  int rc;
+  if (!packed || !(extent->flags & EXTENT_PACKED))
+    return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
+  page = extent->offset / PS_PAGE * PS_PAGE;
+  if (packed->offset != page) {
+    rc = transfer(s, packed->bytes, PS_PAGE, page, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    packed->offset = page;
+  }
+  memcpy(buffer, packed->bytes + (extent->offset - page),
+         (size_t)extent->bytes);
+  return LC_OK;
+}
 static int verify_value_payloads(ps_space *s, ps_entry *p,
-                                 unsigned char *buffer, lc_error *error) {
+                                 unsigned char *buffer, packed_read *packed,
+                                 lc_error *error) {
   size_t i;
   int rc;
   if (p->key.kind == PS_OWNED_RUN && !p->owned_mapped)
     return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
-    rc = transfer(s, buffer, (size_t)p->extents[i].bytes, p->extents[i].offset,
-                  0, error);
+    rc = read_extent(s, &p->extents[i], buffer, packed, error);
     if (rc != LC_OK)
       return rc;
     if (checksum(buffer, (size_t)p->extents[i].bytes) != p->extents[i].crc)
@@ -1747,7 +1772,11 @@ static int verify_value_payloads(ps_space *s, ps_entry *p,
   }
   return p->key.kind == PS_OWNED_RUN ? owned_map_load(s, p, error) : LC_OK;
 }
-static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
+typedef struct recovery_values {
+  unsigned char buffer[PS_CHUNK];
+  packed_read packed;
+} recovery_values;
+static int verify_entry(ps_space *s, ps_entry *p, recovery_values *values,
                         lc_error *error) {
   /* Derived bytes never determine how far canonical authority can recover.
    * Their descriptors still own exact, checked ranges; readers validate their
@@ -1755,7 +1784,7 @@ static int verify_entry(ps_space *s, ps_entry *p, unsigned char *buffer,
    * payload must not truncate later acknowledged canonical publications. */
   if (p->key.kind >= PS_QUERY_FIRST && p->key.kind <= PS_QUERY_LAST)
     return LC_OK;
-  return verify_value_payloads(s, p, buffer, error);
+  return verify_value_payloads(s, p, values->buffer, &values->packed, error);
 }
 static int initial_free(ps_space *s, lc_error *error) {
   s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
@@ -3112,7 +3141,7 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
 /* Validate the entire candidate before changing any selected ownership. A
  * complete inner record is not independently recoverable inside a revision. */
 static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
-                           unsigned char *buffer, ps_entry ***out,
+                           recovery_values *values, ps_entry ***out,
                            lc_error *error) {
   ps_entry **entries = NULL, *old;
   size_t count, i, j, cursor = 64, member_bytes;
@@ -3153,8 +3182,8 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
         rc = err(error, LC_ERR_PROTOCOL,
                  "revision overwrites collection position");
     }
-    if (rc == LC_OK && buffer)
-      rc = verify_entry(s, entries[i], buffer, error);
+    if (rc == LC_OK && values)
+      rc = verify_entry(s, entries[i], values, error);
     cursor += member_bytes;
   }
   if (rc == LC_OK && cursor != bytes)
@@ -3185,10 +3214,10 @@ static void install_revision(ps_space *s, ps_entry **entries, size_t count,
   s->sequence += count;
 }
 static int recover_revision(ps_space *s, const unsigned char *wire,
-                            size_t bytes, unsigned char *buffer,
+                            size_t bytes, recovery_values *values,
                             lc_error *error) {
   ps_entry **entries;
-  int rc = decode_revision(s, wire, bytes, buffer, &entries, error);
+  int rc = decode_revision(s, wire, bytes, values, &entries, error);
   if (rc == LC_OK) {
     install_revision(s, entries, get32(wire + 16), 0, 0);
     lc_free_with_allocator(NULL, entries);
@@ -3669,8 +3698,8 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   return LC_OK;
 }
 static int recover(ps_space *s, lc_error *error) {
-  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire,
-                                          *buffer;
+  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire;
+  recovery_values *values;
   ps_readiness_certificate certificate;
   const unsigned char *root;
   ps_directory *directory = NULL;
@@ -3716,15 +3745,16 @@ static int recover(ps_space *s, lc_error *error) {
     return err(error, LC_ERR_PROTOCOL,
                "container shorter than committed capacity");
   wire = lc_alloc_with_allocator(NULL, PS_JOURNAL);
-  buffer = lc_alloc_with_allocator(NULL, PS_CHUNK);
-  if (!wire || !buffer) {
+  values = lc_alloc_with_allocator(NULL, sizeof(*values));
+  if (!wire || !values) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate recovery buffers");
     goto done;
   }
   memset(&recovery, 0, sizeof(recovery));
   recovery.space = s;
   recovery.wire = wire;
-  recovery.buffer = buffer;
+  recovery.buffer = values->buffer;
+  values->packed.offset = 0;
   rc = initial_free(s, error);
   if (rc == LC_OK)
     rc = directory_open(s, &directory, error);
@@ -3758,7 +3788,7 @@ static int recover(ps_space *s, lc_error *error) {
          (event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER)))
       pending_data = 1;
     if (get32(wire + cursor) == REVISION_MAGIC) {
-      rc = recover_revision(s, wire + cursor, bytes, buffer, error);
+      rc = recover_revision(s, wire + cursor, bytes, values, error);
       if (rc == LC_ERR_NOMEM || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
         goto done;
       if (rc != LC_OK) {
@@ -3790,7 +3820,7 @@ static int recover(ps_space *s, lc_error *error) {
       break;
     }
     if (event == PS_PUT) {
-      rc = verify_entry(s, p, buffer, error);
+      rc = verify_entry(s, p, values, error);
       if (rc != LC_OK) {
         entry_free(p);
         if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
@@ -3888,7 +3918,7 @@ static int recover(ps_space *s, lc_error *error) {
     s->token_end = certificate.grant_used + TOKEN_RANGE;
   }
 done:
-  lc_free_with_allocator(NULL, buffer);
+  lc_free_with_allocator(NULL, values);
   lc_free_with_allocator(NULL, wire);
   return rc;
 }
@@ -5141,8 +5171,7 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   while (count && r->extent < r->entry->count) {
     extent = &r->entry->extents[r->extent];
     if (!r->loaded) {
-      rc = transfer(r->space, r->buffer, (size_t)extent->bytes, extent->offset,
-                    0, error);
+      rc = read_extent(r->space, extent, r->buffer, r->packed, error);
       if (rc != LC_OK)
         return rc;
       if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
@@ -5191,8 +5220,7 @@ int ps_read_at(ps_reader *r, uint64_t offset, void *buffer, size_t count,
     }
     if (!r->random_loaded) {
       r->loaded = 0;
-      rc = transfer(r->space, r->buffer, (size_t)extent->bytes, extent->offset,
-                    0, error);
+      rc = read_extent(r->space, extent, r->buffer, r->packed, error);
       if (rc != LC_OK)
         return rc;
       if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
@@ -5325,7 +5353,7 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
     rc = err(error, LC_ERR_NOMEM,
              "cannot allocate immutable validation scratch");
   else
-    rc = verify_value_payloads(s, p, buffer, error);
+    rc = verify_value_payloads(s, p, buffer, NULL, error);
   if (rc == LC_ERR_PROTOCOL) {
     lc_error_cleanup(error);
     checked = -1;
@@ -5445,6 +5473,53 @@ int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
     *out = reader;
   else
     lc_free_with_allocator(NULL, reader);
+  return rc;
+}
+typedef struct value_walk {
+  ps_reader reader;
+  packed_read packed;
+} value_walk;
+static int value_position(const void *left, const void *right) {
+  const ps_entry *a = *(ps_entry *const *)left;
+  const ps_entry *b = *(ps_entry *const *)right;
+  uint64_t x = a->count ? a->extents[0].offset : 0;
+  uint64_t y = b->count ? b->extents[0].offset : 0;
+  return x < y ? -1 : x != y;
+}
+int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
+                        void *context, lc_error *error) {
+  value_walk *walk;
+  ps_reader *r;
+  ps_entry **order;
+  size_t i, bytes;
+  int rc;
+  if (!view || !read)
+    return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
+  if (!view->count)
+    return LC_OK;
+  if (view->count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
+    return err(error, LC_ERR_NOMEM, "captured read order exceeds local limit");
+  bytes = view->count * sizeof(*order);
+  walk = lc_alloc_with_allocator(NULL, sizeof(*walk) + bytes);
+  if (!walk)
+    return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
+  order = (void *)(walk + 1);
+  memcpy(order, view->items, bytes);
+  qsort(order, view->count, sizeof(*order), value_position);
+  walk->packed.offset = 0;
+  r = &walk->reader;
+  rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < view->count; ++i) {
+    rc = healthy(view->space, error);
+    if (rc != LC_OK)
+      break;
+    memset(r, 0, offsetof(ps_reader, buffer));
+    r->space = view->space;
+    r->entry = order[i];
+    r->packed = &walk->packed;
+    rc = read(context, r->entry->key, r, error);
+  }
+  lc_free_with_allocator(NULL, walk);
   return rc;
 }
 void ps_values_close(ps_values *view) {
@@ -6985,7 +7060,7 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     if (run->entry->mapped_end > bytes)
       return err(error, LC_ERR_PROTOCOL,
                  "mapped piece exceeds its completed prefix");
-    rc = operation ? verify_value_payloads(s, run->entry, scratch, error)
+    rc = operation ? verify_value_payloads(s, run->entry, scratch, NULL, error)
                    : healthy(s, error);
     if (rc == LC_OK && out)
       memset(out, 0, sizeof(*out));

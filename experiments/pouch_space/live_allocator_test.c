@@ -1154,6 +1154,111 @@ static void capture_put_key(ps_space *s, ps_key k, size_t bytes) {
 static void capture_put(ps_space *s, uint64_t id, size_t bytes) {
   capture_put_key(s, key(id), bytes);
 }
+typedef struct packed_replay_probe {
+  uint64_t page;
+  size_t reads;
+} packed_replay_probe;
+static ssize_t packed_replay_read(void *context, int fd, void *bytes, size_t n,
+                                  off_t offset) {
+  packed_replay_probe *probe = context;
+  if (probe->page && (uint64_t)offset >= probe->page &&
+      (uint64_t)offset - probe->page < PS_PAGE)
+    ++probe->reads;
+  return pread(fd, bytes, n, offset);
+}
+static ssize_t packed_replay_write(void *context, int fd, const void *bytes,
+                                   size_t n, off_t offset) {
+  (void)context;
+  return pwrite(fd, bytes, n, offset);
+}
+static int packed_replay_visit(void *context, ps_key item, ps_reader *reader,
+                               lc_error *e) {
+  char byte;
+  size_t *seen = context;
+  REQUIRE(item.key >= 800 && item.key < 816);
+  REQUIRE(!(*seen & ((size_t)1 << (item.key - 800))));
+  *seen |= (size_t)1 << (item.key - 800);
+  ok(ps_read_at(reader, 64, &byte, 1, e), e);
+  REQUIRE((unsigned char)byte == item.key % 251);
+  captured_expect(reader, (unsigned char)(item.key % 251), 65);
+  return LC_OK;
+}
+static void packed_replay_locality(void) {
+  packed_replay_probe probe = {0};
+  ps_io io = {&probe,  packed_replay_read, packed_replay_write,
+              sync_io, reserve_io,         NULL};
+  ps_options options = {0};
+  ps_space *s = NULL;
+  ps_writer *group[8] = {0};
+  ps_values *view = NULL;
+  ps_reader *reader = NULL;
+  ps_entry *slot;
+  off_t corrupt;
+  size_t seen = 0;
+  char bytes[65];
+  lc_error e = {0};
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &s, &e), &e);
+  for (uint64_t i = 800; i < 808; ++i)
+    capture_put(s, i, sizeof(bytes));
+  for (size_t i = 0; i < 8; ++i) {
+    memset(bytes, (int)((i + 808) % 251), sizeof(bytes));
+    ok(ps_begin(s, NULL, key(i + 808), &group[i], &e), &e);
+    ok(ps_write(group[i], bytes, sizeof(bytes), &e), &e);
+  }
+  ok(ps_revision_publish(group, 8, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  for (size_t i = 0; i < 8; ++i)
+    ps_writer_close(group[i]);
+  ok(ps_flush(s, &e), &e);
+  slot = ps_internal_lookup(s, key(800));
+  REQUIRE(slot && slot->count == 1);
+  probe.page = slot->extents[0].offset / PS_PAGE * PS_PAGE;
+  for (uint64_t i = 800; i < 816; ++i) {
+    slot = ps_internal_lookup(s, key(i));
+    REQUIRE(slot && slot->count == 1 &&
+            slot->extents[0].flags == EXTENT_PACKED &&
+            slot->extents[0].offset / PS_PAGE * PS_PAGE == probe.page);
+  }
+  corrupt = (off_t)slot->extents[0].offset;
+  ok(ps_close(s, &e), &e);
+  probe.reads = 0;
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  REQUIRE(probe.reads == 1);
+  ps_key sample = key(800);
+  ok(ps_values_capture(s, sample.owner, PS_STATE, PS_STATE, &view, &e), &e);
+  REQUIRE(ps_values_count(view) == 16);
+  memset(bytes, 'z', sizeof(bytes));
+  ps_writer *later = NULL;
+  ok(ps_begin(s, NULL, key(807), &later, &e), &e);
+  ok(ps_write(later, bytes, sizeof(bytes), &e), &e);
+  ok(ps_publish(later, NULL, &e), &e);
+  ps_writer_close(later);
+  ok(ps_flush(s, &e), &e);
+  probe.reads = 0;
+  ok(ps_values_read_walk(view, packed_replay_visit, &seen, &e), &e);
+  REQUIRE(seen == 65535 && probe.reads == 1);
+  ps_values_close(view);
+  ok(ps_read_open(s, key(807), NULL, &reader, &e), &e);
+  captured_expect(reader, 'z', sizeof(bytes));
+  ps_reader_close(reader);
+  /* Damage a later cell after the first seven members of its revision. One
+   * page fetch still requires independent integrity checks for every slot. */
+  REQUIRE(pwrite(s->fd, "!", 1, corrupt) == 1 && !fdatasync(s->fd));
+  ok(ps_close(s, &e), &e);
+  probe.reads = 0;
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  REQUIRE(probe.reads == 1);
+  ok(ps_read_open(s, key(807), NULL, &reader, &e), &e);
+  captured_expect(reader, 807 % 251, sizeof(bytes));
+  ps_reader_close(reader);
+  for (uint64_t i = 808; i < 816; ++i) {
+    REQUIRE(ps_read_open(s, key(i), NULL, &reader, &e) == LC_ERR_INVALID &&
+            !reader);
+    lc_error_cleanup(&e);
+  }
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void capture_fragmented(ps_space *s, uint64_t id) {
   lc_error e = {0};
   unsigned char *buffer = malloc(PS_CHUNK);
@@ -4894,7 +4999,9 @@ int main(int argc, char **argv) {
     stream_handoff(0);
     stream_handoff(1);
     stream_abort_and_cold_open();
-  } else if (!strcmp(argv[2], "piece-barrier-handoff")) {
+  } else if (!strcmp(argv[2], "packed-replay-locality"))
+    packed_replay_locality();
+  else if (!strcmp(argv[2], "piece-barrier-handoff")) {
     for (int durable = 0; durable <= 1; ++durable)
       for (int discard = 0; discard <= 1; ++discard)
         piece_barrier_handoff(durable, discard);

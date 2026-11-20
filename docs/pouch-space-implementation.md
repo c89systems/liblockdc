@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants) and [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission) | Cold replay cost and sustained-load acceptance remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), and [packed-page replay](#packed-page-reads-during-eager-admission) | Cold replay cost and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -9087,3 +9087,72 @@ work remains 16% longer on NoSync and 11% longer on durable roots compared
 with multifile in these samples. Cold reopen remains a separate cost. Logs
 and the zero-range counter are under the `index-preparation-` prefix in
 `build/pouch-space-concurrent/`.
+
+## Packed-page reads during eager admission
+
+Physical journal replay keeps the most recently fetched packed payload page
+in a bounded buffer. Distinct values sharing that page still pass independent
+extent checksum and descriptor validation. A corrupt cell still rejects the
+entire candidate revision, along with any unaccepted suffix. The buffer is
+private to one replay under allocator authority.
+
+Namespace admission walks one immutable capture of selected key slots in
+first-extent order. The pass sorts a copy of the existing metadata pointers,
+borrows a single bounded reader per slot, and retains the most recently fetched
+packed page. Only the slot's pinned cells are supplied to the canonical decoder.
+Canonical replay verifies slot identity, rebuilds the same deletion obligations,
+and restores pending checkpoint debt at admission. The capture retains its
+original enumeration and remains usable with independent readers. The page
+buffer and borrowed reader end with the pass.
+
+The locality fixture checks one page fetch for sixteen separately verified
+values in physical replay and one fetch while walking the captured values.
+The capture keeps the prior incarnation after replacement. Damage to the last
+cell of an eight-member revision leaves the earlier independent publications
+recoverable and rejects the entire revision and following replacement.
+
+Debug passed 13 focused behavior and fault groups and both source boundary
+checks. GNU and musl Release each passed 22 selected groups, including
+shared queue and outbox recovery, root codec conversion with 1 MiB growth,
+indexed churn, and eager capacity obligation recovery.
+
+The alternating GNU comparison verified 46 of 48 attempts. Both failed
+attempts reached `pouch_namespace_busy` during sustained indexed mutations
+before reopen. The prior native build failed one durable attempt and the
+current native build failed one NoSync attempt. Each profile and build has
+four samples except those two cases, which have three. Values are medians in
+milliseconds, ordered as prior single-file (`620bed49`), current single-file,
+and multifile. Reopen covers one cold owner and two live joins with the
+operating system's file cache retained.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Reopened verification |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Indexed NoSync | 1620.10 / 1673.85 / 1506.70 | 49.82 / 49.04 / 24.58 | 2.24 / 1.60 / 0.69 | 13.98 / 11.89 / 0.65 | 6.24 / 5.84 / 5.77 |
+| Indexed durable | 5453.56 / 5359.14 / 5179.85 | 85.66 / 91.15 / 82.11 | 6.81 / 1.82 / 0.97 | 12.23 / 13.67 / 0.70 | 5.71 / 5.53 / 6.47 |
+| Warm queue NoSync | 10.71 / 9.64 / 107.24 | 2.07 / 2.00 / 24.66 | 0.27 / 0.24 / 0.08 | 3.75 / 3.13 / 0.54 | 0.39 / 0.36 / 0.65 |
+| Durable outbox | 1270.97 / 1194.75 / 1596.21 | 233.59 / 247.13 / 304.19 | 0.47 / 0.55 / 0.27 | 45.29 / 50.96 / 74.67 | 74.96 / 72.93 / 143.78 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Indexed NoSync | 225.81 / 191.64 / 287.85 | 44.55 / 74.44 / 92.29 | 41.78 / 29.35 / 109.57 |
+| Indexed durable | 161.70 / 152.93 / 185.18 | 59.21 / 12.52 / 166.73 | 17.77 / 15.77 / 209.52 |
+
+The probe measures the native SDK opens from both builds. Its counts sum
+positive `pread` calls across the three owners. Physical and namespace
+times are in milliseconds. Key-checkpoint decode overlaps namespace
+recovery and is reported separately for attribution.
+
+| Workload | Reads | MiB read | Physical admission | Namespace recovery | Key-checkpoint decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Indexed NoSync | 2995.5 / 1872 | 3.36 / 4.33 | 5.72 / 4.97 | 7.87 / 6.34 | 4.65 / 3.63 |
+| Indexed durable | 2784 / 1920 | 3.63 / 4.51 | 5.05 / 6.15 | 6.72 / 6.39 | 4.25 / 3.54 |
+| Warm queue NoSync | 246 / 175.5 | 0.57 / 0.77 | 2.45 / 2.05 | 0.89 / 0.81 | 0.54 / 0.46 |
+| Durable outbox | 1472 / 1297.5 | 1.64 / 2.18 | 6.02 / 5.23 | 2.46 / 2.52 | 1.16 / 1.08 |
+
+Indexed NoSync reopen improved in all three complete pairs by a median
+1.76 ms. Warm queue improved in three of four by a median 0.33 ms. Durable
+indexed and durable outbox reopen had median paired increases of 1.31 ms
+and 4.32 ms. Packed-page reads reduce call count while moving more bytes
+from the file cache. The indexed and queue reopens still use one sync and the
+durable outbox uses thirteen, including SDK recovery. Logs and the GNU
+probe are under the `reopen-admission-` prefix in `build/pouch-space-concurrent/`.

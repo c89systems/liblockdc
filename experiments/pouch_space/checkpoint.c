@@ -610,10 +610,9 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
-static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
-                              size_t i, ps_key key, ps_ref ref, key_slot **out,
-                              lc_error *e) {
-  ps_reader *reader = NULL;
+static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
+                                ps_key key, ps_ref ref, key_slot **out,
+                                lc_error *e) {
   lc_pouch_state_entry entry, projected;
   key_slot *slot;
   int rc;
@@ -622,11 +621,7 @@ static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
   slot = new_slot(c, "", 0, key.kind, key.key, e);
   if (!slot)
     return LC_ERR_NOMEM;
-  rc = ps_values_read_open(values, i, &reader, e);
-  if (rc == LC_OK)
-    rc =
-        ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
-  ps_reader_close(reader);
+  rc = ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
   if (rc == LC_OK &&
       ((!entry.key || !entry.seen) ||
        (key.kind == PS_KEY_DECISION ? !entry.control || !entry.decision
@@ -662,6 +657,17 @@ static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
   lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   return rc;
 }
+static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
+                              size_t i, ps_key key, ps_ref ref, key_slot **out,
+                              lc_error *e) {
+  ps_reader *reader = NULL;
+  int rc = ps_values_read_open(values, i, &reader, e);
+  *out = NULL;
+  if (rc == LC_OK)
+    rc = decode_selected_slot(c, reader, key, ref, out, e);
+  ps_reader_close(reader);
+  return rc;
+}
 static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {
   if (slot->summary.index > c->state_index)
     c->state_index = slot->summary.index;
@@ -691,32 +697,26 @@ static void select_checkpoint(ps_key_checkpoint *c,
   c->latest_segment = selected->segment;
   c->latest_offset = selected->offset;
 }
-static int load_slots(ps_key_checkpoint *c, const ps_values *values,
-                      lc_error *e) {
+static int load_slot(void *context, ps_key key, ps_reader *reader,
+                     lc_error *e) {
+  ps_key_checkpoint *c = context;
   ps_ref ref;
-  ps_key key;
-  uint64_t bytes;
-  size_t i;
-  int rc = LC_OK;
-  for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
-    key_slot *slot = NULL;
-    rc = ps_values_info(values, i, &key, &ref, &bytes, e);
-    if (rc == LC_OK && key.kind == PS_NAMESPACE_CHECKPOINT)
-      continue;
-    if (rc == LC_OK)
-      rc = room(c, c->count + 1, e);
-    if (rc == LC_OK)
-      rc = read_selected_slot(c, values, i, key, ref, &slot, e);
-    if (rc == LC_OK &&
-        (find_key(c, slot->key, key.kind) || find_id(c, key.key)))
-      rc = failure(e, LC_ERR_PROTOCOL,
-                   "checkpoint repeats a canonical key slot");
-    if (rc == LC_OK)
-      install_selected_slot(c, slot);
-    else if (slot) {
-      release_prepared_source(c, slot->body);
-      close_slot(c, slot);
-    }
+  key_slot *slot = NULL;
+  int rc;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT)
+    return LC_OK;
+  rc = room(c, c->count + 1, e);
+  if (rc == LC_OK) {
+    ps_read_reference(reader, &ref);
+    rc = decode_selected_slot(c, reader, key, ref, &slot, e);
+  }
+  if (rc == LC_OK && (find_key(c, slot->key, key.kind) || find_id(c, key.key)))
+    rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a canonical key slot");
+  if (rc == LC_OK)
+    install_selected_slot(c, slot);
+  else if (slot) {
+    release_prepared_source(c, slot->body);
+    close_slot(c, slot);
   }
   return rc;
 }
@@ -750,7 +750,7 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
     rc = ps_key_checkpoint_capture(c, &values, &selected, e);
   if (rc == LC_OK) {
     select_checkpoint(c, &selected);
-    rc = load_slots(c, values, e);
+    rc = ps_values_read_walk(values, load_slot, c, e);
   }
   ps_values_close(values);
   if (rc == LC_OK)
