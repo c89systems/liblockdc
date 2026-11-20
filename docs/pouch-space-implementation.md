@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants) | Cold replay cost and sustained-load acceptance remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants) and [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission) | Cold replay cost and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -9027,4 +9027,63 @@ at the end of foreground work ranged from 2,617,344 to 4,874,240 bytes.
 The benchmark isolates a shorter relocation handoff and leaves foreground
 mutation barriers and cold replay as costs to address. Logs, unsuccessful
 attempts and the baseline stack are under the `index-reclaim-` prefix in
+`build/pouch-space-concurrent/`.
+
+## Prepared extents through budget and workspace admission
+
+The readiness bitmap records durable zeroing independently of advisory
+ownership. Opening a payload budget or protecting free checkpoint workspace
+keeps the existing zero proof while the pages are still unwritten. Spending
+payload credit or allocating a checkpoint page clears the proof under
+allocator authority before the writer can modify the page. Returning unused
+capacity and adopting a peer checkpoint preserve valid proofs. Cold admission
+still starts with an empty bitmap.
+
+Grant allocation scans the bitmap by machine word across each eligible free
+interval. It chooses the first prepared span large enough for the requested
+grant, or the largest prepared span shorter than the request. A dirty prefix
+can share a free interval with a prepared suffix. Selecting the suffix splits
+the free interval while preserving physical claims and charges only the
+chosen span to its owner.
+
+The shared allocator fixture exercises an exact funded grant with zero extra
+syncs, revocation at spend, and retention of the unspent proof after release.
+A killed producer leaves real dirty bytes after spending a funded range.
+The next grant skips that range and uses the prepared suffix without a sync.
+A peer reuses the remaining suffix after a checkpoint. The fixture also
+checks cold reset and proof withholding after a failed preparation barrier.
+
+Debug, GNU Release and musl Release each passed 32 focused checks, including
+budget, live projection, funded grant faults, metadata growth faults, indexed
+churn and root conversion. All 24 shared lease and messaging pressure runs
+streamed 18 MiB each through a fixed 10 MiB container and verified after
+reopen. The Pouch and source-manifest boundary checks passed.
+
+All 36 alternating GNU samples verified. Medians below use four samples per
+profile and build, in the order prior single-file (`fd7a3189`), current
+single-file and multifile. Both indexed profiles use the 12 MiB churn
+fixture above. The warm queue sends twelve 4 KiB values with two writers.
+`FALLOC_FL_ZERO_RANGE` counts and requested bytes cover the entire invocation,
+including any range clears outside foreground grant preparation.
+
+| Workload | Work (ms) | P95 (ms) | Zero-range calls | Requested zero-range MiB | Lifecycle sync calls |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Indexed NoSync | 2230.30 / 1866.24 / 1611.68 | 62.37 / 58.12 / 27.72 | 158 / 114 / 0 | 34.55 / 13.07 / 0 | 287.5 / 235 / 124 |
+| Indexed durable | 5854.23 / 5716.73 / 5137.11 | 96.04 / 96.44 / 81.03 | 126 / 147.5 / 0 | 15.54 / 13.13 / 0 | 1178.5 / 1162.5 / 796 |
+| Warm queue NoSync | 29.64 / 12.20 / 95.57 | 11.41 / 2.32 / 20.30 | 5 / 1 / 0 | 4.98 / 1.00 / 0 | 12 / 9 / 0 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | Close | Cold reopen | Reopened verification |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Indexed NoSync | 283.64 / 211.97 / 325.86 | 45.20 / 56.36 / 102.34 | 33.97 / 11.66 / 147.93 | 2.07 / 7.19 / 0.79 | 16.10 / 17.12 / 0.60 | 6.24 / 5.95 / 6.04 |
+| Indexed durable | 165.40 / 164.84 / 214.92 | 14.09 / 15.19 / 149.93 | 26.71 / 7.51 / 114.45 | 6.38 / 1.65 / 0.76 | 15.62 / 15.95 / 0.69 | 6.13 / 8.03 / 5.90 |
+| Warm queue NoSync | — | — | — | 0.27 / 0.25 / 0.05 | 3.89 / 3.43 / 0.36 | 0.40 / 0.38 / 0.56 |
+
+Requested zero-range bytes fell in every matched pair. Indexed NoSync work
+and warm queue work improved by median paired differences of 116.62 ms and
+17.47 ms. Indexed durable work improved in two of four pairs and had a
+median paired difference of +5.64 ms. The durable run used smaller zero
+ranges, with more calls in three of four pairs. Current indexed foreground
+work remains 16% longer on NoSync and 11% longer on durable roots compared
+with multifile in these samples. Cold reopen remains a separate cost. Logs
+and the zero-range counter are under the `index-preparation-` prefix in
 `build/pouch-space-concurrent/`.

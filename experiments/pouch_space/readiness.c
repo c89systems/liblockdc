@@ -316,21 +316,55 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
  * A terminated preparer can leave a subset marked since every marked page
  * already crossed the barrier. A private writer cannot touch a page until
  * the whole claim has revoked those bits. A cold cohort starts empty. */
-uint64_t ps_readiness_zero_prefix(ps_space *s, uint64_t offset,
-                                  uint64_t bytes) {
-  uint64_t first, page, end;
+static uint64_t zero_span_end(ps_space *s, uint64_t page, uint64_t end,
+                              int prepared) {
+  uint64_t word;
+  unsigned int shift;
+  while (page < end) {
+    shift = (unsigned int)(page % 64);
+    word = __atomic_load_n(s->readiness->page + 2 * WORDS + page / 64,
+                           __ATOMIC_ACQUIRE);
+    word = (prepared ? ~word : word) >> shift;
+    if (word) {
+      page += (unsigned int)__builtin_ctzll(word);
+      break;
+    }
+    page += 64 - shift;
+  }
+  return page < end ? page : end;
+}
+uint64_t ps_readiness_zero_find(ps_space *s, uint64_t offset, uint64_t bytes,
+                                uint64_t wanted, uint64_t *selected) {
+  uint64_t first, page, next, end, best = 0;
+  *selected = offset;
   if (!s->readiness || offset < PS_DATA || offset >= ZERO_END)
     return 0;
   if (bytes > ZERO_END - offset)
     bytes = ZERO_END - offset;
-  first = page = (offset - PS_DATA) / PS_PAGE;
+  first = (offset - PS_DATA) / PS_PAGE;
   end = first + bytes / PS_PAGE;
-  while (page < end &&
-         (__atomic_load_n(s->readiness->page + 2 * WORDS + page / 64,
-                          __ATOMIC_ACQUIRE) &
-          (UINT64_C(1) << (page % 64))))
-    ++page;
-  return (page - first) * PS_PAGE;
+  for (page = zero_span_end(s, first, end, 0); page < end;
+       page = zero_span_end(s, next, end, 0)) {
+    next = zero_span_end(s, page, end, 1);
+    if (next - page > best) {
+      *selected = offset + (page - first) * PS_PAGE;
+      best = next - page;
+      if (best * PS_PAGE >= wanted)
+        return wanted;
+    }
+  }
+  return best * PS_PAGE;
+}
+uint64_t ps_readiness_zero_prefix(ps_space *s, uint64_t offset,
+                                  uint64_t bytes) {
+  uint64_t start;
+  if (!s->readiness || offset < PS_DATA || offset >= ZERO_END)
+    return 0;
+  if (bytes > ZERO_END - offset)
+    bytes = ZERO_END - offset;
+  start = (offset - PS_DATA) / PS_PAGE;
+  return (zero_span_end(s, start, start + bytes / PS_PAGE, 1) - start) *
+         PS_PAGE;
 }
 void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
                              int prepared) {

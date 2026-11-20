@@ -35,9 +35,13 @@ void ps_readiness_finish(ps_space *, unsigned int changes);
 int ps_readiness_publish(ps_space *, lc_error *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
                            lc_error *);
-/* Prepared pages are durably zeroed common payload capacity. Claims revoke
- * the proof before writing. Publish only fully zeroed pages under allocation
- * authority while returning a continuously owned range to the common pool. */
+/* Prepared pages are durably zeroed free payload capacity. The allocator
+ * checks proofs under allocation authority and revokes them before spending
+ * pages. A capacity reservation can retain the proof while bytes stay free. */
+/* Return the first span that fits wanted, or the largest shorter span, within
+ * a page-aligned free range. The output is the physical start of that span. */
+uint64_t ps_readiness_zero_find(ps_space *, uint64_t offset, uint64_t bytes,
+                                uint64_t wanted, uint64_t *selected);
 uint64_t ps_readiness_zero_prefix(ps_space *, uint64_t offset, uint64_t bytes);
 void ps_readiness_zero_pages(ps_space *, uint64_t offset, uint64_t bytes,
                              int prepared);

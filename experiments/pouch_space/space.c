@@ -534,8 +534,8 @@ int ps_internal_admission_begin(ps_space *s, ps_coordination_guard **guard,
   int rc = ps_internal_capture_begin(s, guard, error);
   return rc == LC_OK && *guard ? allocation_ranges_refresh(s, error) : rc;
 }
-static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
-                          lc_error *error) {
+static int physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
+                            lc_error *error) {
   int first = s->physical_claim_bytes == 0, rc;
   if (first) {
     rc = ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 1,
@@ -544,15 +544,20 @@ static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
       return rc;
   }
   rc = ps_coordination_range(s->coordination, offset, bytes, 1, error);
-  if (rc == LC_OK) {
-    ps_readiness_zero_pages(s, offset, bytes, 0);
+  if (rc == LC_OK)
     s->physical_claim_bytes += bytes;
-  } else if (first &&
-             ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 0,
-                                   NULL) != LC_OK) {
+  else if (first && ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET,
+                                          1, 0, NULL) != LC_OK) {
     lc_error_cleanup(error);
     rc = healthy(s, error);
   }
+  return rc;
+}
+static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
+                          lc_error *error) {
+  int rc = physical_witness(s, offset, bytes, error);
+  if (rc == LC_OK)
+    ps_readiness_zero_pages(s, offset, bytes, 0);
   return rc;
 }
 static int physical_release(ps_space *s, uint64_t offset, uint64_t bytes,
@@ -574,7 +579,7 @@ static int physical_release(ps_space *s, uint64_t offset, uint64_t bytes,
 }
 static int metadata_claim_range(ps_space *s, uint64_t offset, uint64_t bytes,
                                 lc_error *error) {
-  int rc = physical_claim(s, offset, bytes, error);
+  int rc = physical_witness(s, offset, bytes, error);
   if (rc == LC_OK)
     s->metadata_claim_bytes += bytes;
   return rc;
@@ -704,7 +709,8 @@ static int budget_ranges_locked(ps_space *s, uint64_t target,
       tail->offset += n;
       tail->bytes -= n;
     }
-    rc = physical_claim(s, run->offset, n, error);
+    /* The concrete pool reserves free pages without modifying their bytes. */
+    rc = physical_witness(s, run->offset, n, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, tail);
       break;
@@ -806,6 +812,7 @@ static int take_payload_selected(ps_space *s, ps_budget *budget,
   if ((*choice)->claimed == 1 && budget) {
     if (reserved != funded || reserved > s->claimed_free_bytes)
       return err(error, LC_ERR_PROTOCOL, "invalid concrete payload spend");
+    ps_readiness_zero_pages(s, offset, funded, 0);
     s->claimed_free_bytes -= funded; /* ownership moves to the writer */
   } else {
     rc = physical_claim(s, offset, reserved, error);
@@ -2196,6 +2203,7 @@ static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
     lc_free_with_allocator(NULL, p);
     return rc;
   }
+  ps_readiness_zero_pages(s, p->run.offset, PS_PAGE, 0);
   p->run.bytes = PS_PAGE;
   p->generation = s->generation + 1;
   p->index = index;
@@ -6387,7 +6395,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
   unsigned char header[PS_RUN_HEADER];
   uint64_t bytes = desired, reserved = 0, sequence = 0;
-  uint64_t prepared, partial_bytes, candidate, free_before;
+  uint64_t prepared, partial_bytes, at, selected = 0, partial_at, free_before;
   ps_run **choice = NULL, **link, **partial, **fit;
   ps_run *spare = NULL;
   ps_coordination_guard *guard = NULL;
@@ -6423,23 +6431,27 @@ select_run:
       partial = fit = NULL;
       choice = NULL;
       partial_bytes = 0;
+      partial_at = 0;
       clean = 0;
       for (link = &s->free; *link; link = &(*link)->next) {
         if ((*link)->claimed && !budget)
           continue;
-        candidate = (*link)->bytes < bytes ? (*link)->bytes : bytes;
-        prepared = s->readiness
-                       ? ps_readiness_zero_prefix(s, (*link)->offset, candidate)
-                   : (*link)->clean ? candidate
-                                    : 0;
+        at = (*link)->offset;
+        prepared =
+            s->readiness
+                ? ps_readiness_zero_find(s, at, (*link)->bytes, bytes, &at)
+            : (*link)->clean ? ((*link)->bytes < bytes ? (*link)->bytes : bytes)
+                             : 0;
         if (prepared == bytes) {
           choice = link;
+          selected = at;
           clean = 1;
           break;
         }
-        if (prepared && !partial) {
+        if (prepared > partial_bytes) {
           partial = link;
           partial_bytes = prepared;
+          partial_at = at;
         }
         if ((*link)->bytes >= bytes &&
             (!fit || ((*fit)->claimed && !(*link)->claimed)))
@@ -6447,6 +6459,7 @@ select_run:
       }
       if (!choice && partial) {
         choice = partial;
+        selected = partial_at;
         bytes = partial_bytes;
         clean = 1;
       }
@@ -6470,6 +6483,8 @@ select_run:
                  "owned payload capacity exhausted; grow");
         break;
       }
+      if (!clean)
+        selected = (*choice)->offset;
       if (bytes > (*choice)->bytes)
         bytes = (*choice)->bytes;
       free_before = s->free_bytes;
@@ -6512,11 +6527,27 @@ select_run:
       }
     }
   }
+  if (rc == LC_OK && selected != (*choice)->offset) {
+    ps_run *prefix = lc_alloc_with_allocator(NULL, sizeof(*prefix));
+    if (!prefix)
+      rc = err(error, LC_ERR_NOMEM, "cannot split prepared payload interval");
+    else {
+      *prefix = **choice;
+      prefix->bytes = selected - prefix->offset;
+      (*choice)->offset = selected;
+      (*choice)->bytes -= prefix->bytes;
+      prefix->next = *choice;
+      *choice = prefix;
+      choice = &prefix->next;
+    }
+  }
   if (rc == LC_OK) {
     rc = take_payload_selected(s, budget, choice, reserved, bytes,
                                &p->extents[0].offset, error);
     if (rc == LC_OK)
       ps_internal_budget_spend(budget, bytes, 0, 0);
+    else
+      ps_internal_free_coalesce(s);
   }
   if (rc == LC_OK) {
     p->token = s->token_next++;

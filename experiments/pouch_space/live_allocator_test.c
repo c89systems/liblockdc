@@ -547,6 +547,8 @@ static void prepared_grant_child(int ready, int control) {
   lc_error e = {0};
   ps_space *space = NULL;
   uint64_t written = 0;
+  ps_budget_plan plan = {PS_CHUNK, 4096, 1, 0};
+  ps_budget *budget = NULL;
   ps_io io = {&written, read_io,    trace_private_write,
               sync_io,  reserve_io, NULL};
   ps_options options = {0};
@@ -555,12 +557,14 @@ static void prepared_grant_child(int ready, int control) {
   ok(ps_open(path, 0, &options, &space, &e), &e);
   REQUIRE(write(ready, "O", 1) == 1);
   REQUIRE(read(control, &command, 1) == 1 && command == 'W');
-  REQUIRE(private_value(space, NULL, 9000));
+  ok(ps_budget_open(space, &plan, &budget, &e), &e);
+  REQUIRE(private_value(space, budget, 9000));
   REQUIRE(write(ready, &written, sizeof(written)) == sizeof(written));
   for (;;)
     pause();
 }
-static uint64_t expect_zero_grant(ps_space *space, ps_owned_head *head,
+static uint64_t expect_zero_grant(ps_space *space, ps_budget *budget,
+                                  ps_owned_head *head,
                                   const ps_owned_status *info, uint64_t base,
                                   uint64_t physical, uint64_t syncs) {
   lc_error e = {0};
@@ -569,13 +573,17 @@ static uint64_t expect_zero_grant(ps_space *space, ps_owned_head *head,
   unsigned char bytes[PS_PAGE - PS_RUN_HEADER];
   ps_stats before = status(space);
   int found = 0;
-  ok(ps_owned_grant(head, NULL, base, PS_PAGE, &run, &found, &e), &e);
+  ok(ps_owned_grant(head, budget, base, PS_PAGE, &run, &found, &e), &e);
   REQUIRE(found && ps_owned_run_capacity(run) == sizeof(bytes));
   REQUIRE(status(space).syncs == before.syncs + syncs);
   ps_entry *p = ps_internal_lookup(space, key);
-  REQUIRE(p && p->count == 1 &&
-          (!physical || p->extents[0].offset == physical));
+  REQUIRE(p && p->count == 1);
   uint64_t selected = p->extents[0].offset;
+  if (physical && selected != physical)
+    fprintf(stderr, "grant at %llu selected %llu, expected %llu\n",
+            (unsigned long long)base, (unsigned long long)selected,
+            (unsigned long long)physical);
+  REQUIRE(!physical || selected == physical);
   ok(ps_owned_read(run, 0, bytes, sizeof(bytes), &e), &e);
   for (size_t i = 0; i < sizeof(bytes); ++i)
     REQUIRE(!bytes[i]);
@@ -593,11 +601,23 @@ static uint64_t prepared_prefix(ps_space *space, uint64_t offset,
   REQUIRE(!pthread_mutex_unlock(&space->mutex));
   return prepared;
 }
+static void retain_preparation_after(ps_space *space, uint64_t first) {
+  ps_coordination_guard *guard = NULL;
+  lc_error e = {0};
+  REQUIRE(!pthread_mutex_lock(&space->mutex));
+  ok(ps_internal_capture_begin(space, &guard, &e), &e);
+  ps_readiness_zero_pages(space, PS_DATA, first - PS_DATA, 0);
+  ok(ps_internal_capture_end(space, guard, LC_OK, &e), &e);
+  REQUIRE(!pthread_mutex_unlock(&space->mutex));
+  lc_error_cleanup(&e);
+}
 static void prepared_grants(void) {
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
   ps_owned_head *x = NULL, *y = NULL;
   ps_owned_status ix, iy;
+  ps_budget_plan plan = {4 * PS_PAGE, PS_OWNED_DESCRIPTOR_BYTES, 1, 0};
+  ps_budget *budget = NULL;
   ps_key kx = {89, 1, PS_STREAM}, ky = {89, 2, PS_STREAM};
   const uint64_t payload = PS_PAGE - PS_RUN_HEADER;
   int ready[2], control[2], exited;
@@ -620,8 +640,15 @@ static void prepared_grants(void) {
   REQUIRE(read(ready[0], &observed, 1) == 1 && observed == 'O');
   ok(ps_owned_open(a, NULL, kx, 1, NULL, &x, &ix, &e), &e);
   ok(ps_owned_open(b, NULL, ky, 1, NULL, &y, &iy, &e), &e);
-  uint64_t first = expect_zero_grant(a, x, &ix, 0, 0, 1);
-  expect_zero_grant(b, y, &iy, 0, first + PS_PAGE, 0);
+  uint64_t first = expect_zero_grant(a, NULL, x, &ix, 0, 0, 1);
+  uint64_t funded = first + PS_PAGE;
+  ok(ps_budget_open(b, &plan, &budget, &e), &e);
+  REQUIRE(prepared_prefix(a, funded, plan.payload_bytes) == plan.payload_bytes);
+  expect_zero_grant(b, budget, y, &iy, 0, funded, 0);
+  REQUIRE(!prepared_prefix(a, funded, PS_PAGE));
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(prepared_prefix(a, funded + PS_PAGE, plan.payload_bytes - PS_PAGE) ==
+          plan.payload_bytes - PS_PAGE);
   uint64_t start = first + 2 * PS_PAGE;
   uint64_t end = start + prepared_prefix(a, start, PS_MIB);
 
@@ -639,10 +666,15 @@ static void prepared_grants(void) {
   for (uint64_t at = dirtied; at < dirtied + PS_CHUNK; at += PS_PAGE)
     REQUIRE(!prepared_prefix(a, at, PS_PAGE));
   REQUIRE(prepared_prefix(a, dirtied + PS_CHUNK, PS_PAGE) == PS_PAGE);
-  uint64_t replacement = expect_zero_grant(a, x, &ix, payload, 0, 1);
+  /* Isolate the prepared suffix of the writer's free interval from any
+   * earlier prepared pages returned by the metadata workspace. */
+  retain_preparation_after(a, dirtied + PS_CHUNK);
+  uint64_t replacement =
+      expect_zero_grant(a, NULL, x, &ix, payload, dirtied + PS_CHUNK, 0);
   ok(ps_checkpoint(a, &e), &e);
-  expect_zero_grant(b, y, &iy, payload, replacement + PS_PAGE, 0);
-  REQUIRE(prepared_prefix(b, dirtied + PS_CHUNK, PS_PAGE) == PS_PAGE);
+  expect_zero_grant(b, NULL, y, &iy, payload, replacement + PS_PAGE, 0);
+  REQUIRE(!prepared_prefix(b, dirtied, PS_CHUNK));
+  REQUIRE(prepared_prefix(b, replacement + 2 * PS_PAGE, PS_PAGE) == PS_PAGE);
   ps_owned_close(x);
   ps_owned_close(y);
   ok(ps_close(b, &e), &e);
@@ -653,8 +685,8 @@ static void prepared_grants(void) {
   ok(ps_open(path, 0, NULL, &a, &e), &e);
   ok(ps_owned_open(a, NULL, kx, 0, &ix.ref, &x, &ix, &e), &e);
   REQUIRE(ix.capacity == 2 * payload);
-  REQUIRE(!prepared_prefix(a, dirtied + PS_CHUNK, PS_PAGE));
-  expect_zero_grant(a, x, &ix, ix.capacity, 0, 1);
+  REQUIRE(!prepared_prefix(a, replacement + 2 * PS_PAGE, PS_PAGE));
+  expect_zero_grant(a, NULL, x, &ix, ix.capacity, 0, 1);
   ps_owned_close(x);
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
@@ -696,7 +728,7 @@ static void prepared_grant_fault(void) {
   ok(ps_close(a, &e), &e);
   ok(ps_owned_open(b, NULL, key, 0, NULL, &head, &info, &e), &e);
   REQUIRE(!info.capacity);
-  expect_zero_grant(b, head, &info, 0, fault.trace.header, 1);
+  expect_zero_grant(b, NULL, head, &info, 0, fault.trace.header, 1);
   ps_owned_close(head);
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
