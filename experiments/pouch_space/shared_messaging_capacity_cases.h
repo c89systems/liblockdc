@@ -66,7 +66,7 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
                          int last, int manual, long *fence,
                          lc_pouch_state_read_result *held, lc_error *e) {
   lc_update_opts options = {0};
-  lc_lease *lease = acquire(writer, "churn", NULL, e);
+  lc_lease *lease = acquire_with_wait(writer, "churn", NULL, 2, e);
   churn_stream body;
   REQUIRE(*fence < lease->fencing_token);
   *fence = lease->fencing_token;
@@ -345,26 +345,32 @@ static void shared_autonomous_capacity(const char *directory, int codec,
 
   for (uint64_t cycle = 1; cycle <= CYCLES; ++cycle) {
     size_t writer = cycle % 2, peer = 1 - writer;
-    snprintf(scenario, sizeof(scenario), "codec=%d sync=%d cycle=%llu worker",
-             codec, sync, (unsigned long long)cycle);
+    snprintf(scenario, sizeof(scenario), "codec=%d sync=%d cycle=%llu", codec,
+             sync, (unsigned long long)cycle);
+    size_t phase = strlen(scenario);
     now(1000U + cycle * 10U);
+    strcpy(scenario + phase, " lease");
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES, 0,
                  &fence, NULL, &e);
+    strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], cycle, &e);
+    strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
     if (cycle % BURST)
       continue;
-    /* Restart the maintenance owner between bursts. Its worker discovers
-     * durable hints while the two SDK owners retain their ordinary state. */
-    ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker,
-                           &e),
-       &e);
-    space = ps_root_space(ps_pouch_state_root(worker));
+    strcpy(scenario + phase, " worker");
+    if (!worker) {
+      ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker,
+                             &e),
+         &e);
+      space = ps_root_space(ps_pouch_state_root(worker));
+    }
     double start = real_clock(CLOCK_MONOTONIC);
     for (;;) {
       ok(ps_status(space, &stats, &e), &e);
       REQUIRE(stats.capacity == PS_DEFAULT_CAPACITY);
-      if (stats.checkpoints && stats.allocated_bytes <= 3 * PS_MIB &&
+      if (stats.checkpoints > checkpoints &&
+          stats.allocated_bytes <= 3 * PS_MIB &&
           (cycle == CYCLES || churn_expired(&owners[peer], &e)))
         break;
       if (real_clock(CLOCK_MONOTONIC) - start >= 24) {
@@ -379,7 +385,7 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     double waited = real_clock(CLOCK_MONOTONIC) - start;
     if (waited > longest_wait)
       longest_wait = waited;
-    checkpoints += stats.checkpoints;
+    checkpoints = stats.checkpoints;
     if (getenv("POUCH_SPACE_CHURN_TRACE"))
       fprintf(stderr, "worker cycle=%llu allocated=%llu checkpoints=%llu\n",
               (unsigned long long)cycle,
@@ -387,10 +393,9 @@ static void shared_autonomous_capacity(const char *directory, int codec,
               (unsigned long long)checkpoints);
     if (stats.allocated_bytes > peak)
       peak = stats.allocated_bytes;
-    lc_pouch_close(worker);
-    worker = NULL;
     churn_read_state(&owners[peer], "stable", 1000, &e);
   }
+  lc_pouch_close(worker);
   lc_outbox_close(outbox[1]);
   lc_outbox_close(outbox[0]);
   lc_client_close(owners[1].client);

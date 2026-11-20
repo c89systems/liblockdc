@@ -140,8 +140,9 @@ static int retire_source(void *context, const ps_namespace_source *source,
                                             &task, e);
   }
 outcome:
-  if (rc == LC_ERR_INVALID && e && e->server_code &&
-      !strcmp(e->server_code, "pouch_namespace_busy")) {
+  if (rc == LC_ERR_PENDING ||
+      (rc == LC_ERR_INVALID && e && e->server_code &&
+       !strcmp(e->server_code, "pouch_namespace_busy"))) {
     lc_error_cleanup(e);
     ++w->result.pending_sources;
     return LC_OK;
@@ -304,8 +305,9 @@ int ps_pouch_state_maintain(lc_pouch *pouch,
                             const lc_pouch_maintenance_options *options,
                             lc_pouch_maintenance_result *out, lc_error *e) {
   int rc = compact_run(pouch, options->ns, options, out, NULL, e);
-  if (rc == LC_ERR_INVALID && e && e->server_code &&
-      !strcmp(e->server_code, "pouch_namespace_busy")) {
+  if (rc == LC_ERR_PENDING ||
+      (rc == LC_ERR_INVALID && e && e->server_code &&
+       !strcmp(e->server_code, "pouch_namespace_busy"))) {
     lc_error_cleanup(e);
     lc_error_init(e);
     out->skipped = 1;

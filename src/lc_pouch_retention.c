@@ -33,11 +33,14 @@ int lc_pouch_retention_note_phase(int phase, lc_error *error) {
 }
 
 int lc_pouch_retention_check_reservation(lc_pouch *pouch, const char *ns,
-                                         const char *key, lc_error *error) {
+                                         const char *key, int *reserved,
+                                         lc_error *error) {
   lc_pouch_retention_work work;
   int rc = lc_pouch_retention_work_read(pouch, ns, &work, error);
-  if (rc == LC_OK && work.present && work.phase != LC_POUCH_RETENTION_IDLE &&
-      strcmp(work.key, key) == 0)
+  *reserved = rc == LC_OK && work.present &&
+              work.phase != LC_POUCH_RETENTION_IDLE &&
+              strcmp(work.key, key) == 0;
+  if (*reserved)
     rc = lc_error_set(error, LC_ERR_PENDING, 0L,
                       "state retention cleanup transaction is unfinished",
                       work.txn_id, NULL, "pouch");

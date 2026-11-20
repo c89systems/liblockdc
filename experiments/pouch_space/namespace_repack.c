@@ -116,9 +116,10 @@ static int plan_tail(repack_selection *s, ps_budget_plan *plan, lc_error *e) {
   return rc;
 }
 static int deferred(int rc, lc_error *e) {
-  if (rc == LC_ERR_INVALID && e && e->server_code &&
-      (!strcmp(e->server_code, "pouch_piece_needs_validation") ||
-       !strcmp(e->server_code, "pouch_namespace_busy"))) {
+  if (rc == LC_ERR_PENDING ||
+      (rc == LC_ERR_INVALID && e && e->server_code &&
+       (!strcmp(e->server_code, "pouch_piece_needs_validation") ||
+        !strcmp(e->server_code, "pouch_namespace_busy")))) {
     lc_error_cleanup(e);
     return 1;
   }

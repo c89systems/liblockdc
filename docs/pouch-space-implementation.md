@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [background state reclamation](#background-state-reclamation-at-fixed-capacity) | Same-namespace foreground progress during background reclamation, default-cadence pressure handling, and messaging completion during maximal competing reservations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance) | Default-cadence pressure handling and messaging completion during maximal competing reservations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8106,8 +8106,9 @@ plaintext durable run reached cycle 16 and returned `LC_ERR_PENDING` while
 trying to acquire file authority in the lease phase. The controlled capacity
 test continues to close the worker between bursts. The exploratory logs are
 `test-overlap.log` and `test-final-debug.log` in the same directory.
-Same-namespace worker contention, default-cadence pressure, and queue and
-outbox completion under a maximal opposing reservation remain acceptance work.
+[Foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance)
+addresses the observed overlap failures. Default-cadence pressure and queue
+and outbox completion under a maximal opposing reservation remain open.
 
 GNU and musl release passed 71 and 27 selected groups during qualification.
 Ten focused groups passed on each final release build, including peer
@@ -8210,3 +8211,83 @@ matrix. Twelve alternating prior/current pairs then observed medians of
 improved in all twelve pairs, with medians of 11.18 and 8.18 ms. All 24
 focused samples verified after reopen. The raw timings and counters are
 in `compare.log` and `queue-nosync-control.log`.
+
+## Foreground admission during continuous maintenance
+
+The native namespace state and physical namespace guards try immediately.
+On contention they allow a 64 ms monotonic retry budget at acquisition.
+The retries precede the guarded operation. A longer conflict returns
+`LC_ERR_PENDING`, and contention releases the attempted guard before retrying.
+A retention scan that cannot select its first candidate yields the pass.
+
+Repacking captures and pins the completed source piece, then releases stream
+edit authority before preparing the replacement. The selector acquires logical
+and physical namespace authority before entering the stream edit scope again.
+Publication checks the exact previous mapping and the selected liveness
+boundary. The stream installs its resident mapping while it still owns edit
+authority. This order keeps a foreground appender from acquiring the namespace
+while the worker holds its stream and is waiting for that namespace. An
+already captured read retains the earlier bytes. Background work reports pending
+selection as work to revisit.
+
+An SDK cache whose append suffix loses its selected boundary discards any
+partial replay and rebuilds from one current snapshot. The retry is confined
+to rebuilding the metadata projection. A blocking shared lease acquire
+uses its existing `block_seconds` deadline to wait on a confirmed retention
+reservation for the requested key. It drops namespace and transaction authority
+between polls so expiry can finish. Nonblocking acquisition and an expired
+blocking deadline report `LC_ERR_PENDING` while that reservation remains.
+
+The continuous fixture uses an independent worker alongside two SDK owners.
+It starts the worker after the first burst and keeps it open through the
+remaining cycles. The SDK fixture requests a two-second lease wait. Tests
+check that admitted bodies are streamed and verified, that fences advance,
+and that queue acknowledgements and the outbox's durable duplicate receipts
+survive foreground and background overlap. The test clock still advances the
+completed receipt selector. The worker runs on a one-second cadence and the
+fixture waits for reuse after each burst.
+
+The baseline aborted on a namespace guard during the lease phase. A traced
+run exposed a moving replay boundary during outbox work. The first handoff
+change then exposed the reverse stream/namespace order and the unfinished
+retention reservation. The associated logs are under
+`build/pouch-space-continuous/`.
+
+The deterministic handoff test proves that a peer can acquire the stream edit
+guard after private copy and before maintenance selection. Guard tests cover
+release during acquisition, a longer conflict, and independent stripes.
+A suffix replay fault after one applied record exercises projection rebuild.
+The paused expiry test verifies immediate pending, pending at the blocking
+deadline, and a successfully acquired higher fence after completion.
+
+Final Debug, GNU release and musl release passed 11, 46 and 29 selected
+groups. All eight continuous runs streamed 18 MiB each through a fixed
+10 MiB container and verified the final bodies and empty queue after reopen.
+Peak allocation at the reuse checkpoints was 3,104,768 bytes and the longest
+observed wait to the reuse and expiry boundary was 16.04 seconds.
+
+The two multifile Debug reference groups for cleanup and outbox passed.
+All 72 matched GNU runs verified after reopen with two separately opened
+producers and background maintenance disabled. All six configuration
+orders are represented. Values are medians of six samples in milliseconds,
+prior single-file (`dbebe58b`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 27.62 / 29.45 / 79.30 | 10.47 / 12.00 / 16.97 | 0.25 / 0.24 / 0.06 | 8.03 / 8.95 / 0.38 | 0.34 / 0.40 / 0.46 |
+| Queue, 64 KiB durable | 300.16 / 317.44 / 344.53 | 61.55 / 63.10 / 69.22 | 0.27 / 0.26 / 0.11 | 9.92 / 8.93 / 0.40 | 0.54 / 0.48 / 0.44 |
+| Indexed state, 4 KiB NoSync | 53.64 / 56.14 / 157.79 | 0.86 / 1.64 / 19.37 | 0.44 / 0.54 / 0.29 | 9.76 / 10.95 / 0.62 | 1.10 / 1.18 / 1.78 |
+| Outbox, 64 KiB durable | 893.65 / 878.61 / 1378.68 | 166.32 / 168.11 / 276.89 | 0.57 / 0.55 / 0.28 | 40.87 / 38.61 / 54.25 | 58.09 / 55.94 / 130.72 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 31.61 / 38.33 / 128.09 | 18.66 / 19.08 / 33.56 | 0.37 / 0.36 / 13.60 | 0.14 / 0.16 / 9.51 |
+
+Foreground work medians were within 7% of the prior single-file build.
+The indexed per-item p95 increased by 0.78 ms, and the small queue p95
+increased by 1.53 ms. Queue and indexed reopen used four syncs and took
+8.9–11.0 ms against 0.38–0.62 ms for multifile. These runs measure the normal
+foreground path. The continuous fixture measures overlapping maintenance
+and paced reuse at a one-second cadence. Pressure-triggered work at the
+default cadence and messaging completion under a maximal opposing reservation
+remain open. Raw timings and counters are in `compare.log`.

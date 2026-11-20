@@ -544,15 +544,65 @@ int ps_stream_piece_matches(ps_stream *s, uint64_t base,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+typedef struct stream_piece_selection {
+  ps_stream *stream;
+  uint64_t base;
+  ps_owned_run *replacement;
+  ps_piece_select_fn select;
+  void *context;
+  ps_piece_publish_fn publish;
+  void *publication;
+} stream_piece_selection;
+static int publish_repacked_piece(void *context, lc_error *error) {
+  stream_piece_selection *selection = context;
+  ps_stream *s = selection->stream;
+  ps_owned_run *old = NULL;
+  ps_coordination_guard *edit = NULL;
+  ps_owned_status status;
+  size_t at;
+  int continued;
+  int rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
+  if (rc == LC_OK)
+    rc = selection->publish(selection->publication, error);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    at = mapping_lower(s->runs, s->count, selection->base);
+    if (at < s->count && s->runs[at].base == selection->base) {
+      old = s->runs[at].handle;
+      if (selection->replacement) {
+        ps_owned_run_retain(selection->replacement);
+        s->runs[at].handle = selection->replacement;
+      } else {
+        memmove(s->runs + at, s->runs + at + 1,
+                (s->count - at - 1) * sizeof(*s->runs));
+        --s->count;
+      }
+    }
+    pthread_mutex_unlock(&s->mutex);
+  }
+  ps_owned_run_close(old);
+  return ps_owned_edit_end(s->head, edit, rc, error);
+}
+static int select_repacked_piece(void *context, ps_piece_publish_fn publish,
+                                 void *publication, lc_error *error) {
+  stream_piece_selection *selection = context;
+  selection->publish = publish;
+  selection->publication = publication;
+  return selection->select
+             ? selection->select(selection->context, publish_repacked_piece,
+                                 selection, error)
+             : publish_repacked_piece(selection, error);
+}
 int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
                            const ps_owned_range *ranges, size_t count,
                            ps_piece_select_fn select, void *context,
                            lc_error *error) {
-  ps_owned_run *old = NULL, *replacement = NULL;
+  ps_owned_run *old = NULL;
   ps_coordination_guard *edit = NULL;
   ps_owned_status status;
+  stream_piece_selection selection = {0};
   size_t at;
-  int rc, continued, installed = 0;
+  int rc, continued;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
                         "piece replacement requires owner");
@@ -579,26 +629,24 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
     ps_owned_run_retain(old);
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK)
-    rc = ps_owned_run_repack(s->head, old, budget, ranges, count, select,
-                             context, &replacement, error);
-  pthread_mutex_lock(&s->mutex);
-  if (rc == LC_OK) {
-    if (replacement)
-      s->runs[at].handle = replacement;
-    else {
-      memmove(s->runs + at, s->runs + at + 1,
-              (s->count - at - 1) * sizeof(*s->runs));
-      --s->count;
-    }
-    installed = 1;
-  }
+  /* Completed or sealed pieces are immutable and the old run stays pinned.
+   * The selector must take namespace authority before reacquiring the edit
+   * guard. Carrying that guard through the private copy reverses the order
+   * used by an appender in the same namespace. */
   rc = ps_owned_edit_end(s->head, edit, rc, error);
+  selection.stream = s;
+  selection.base = base;
+  selection.select = select;
+  selection.context = context;
+  if (rc == LC_OK)
+    rc = ps_owned_run_repack(s->head, old, budget, ranges, count,
+                             select_repacked_piece, &selection,
+                             &selection.replacement, error);
+  pthread_mutex_lock(&s->mutex);
   s->remapping = 0;
   pthread_mutex_unlock(&s->mutex);
-  if (installed)
-    ps_owned_run_close(old); /* replaced directory ownership */
-  ps_owned_run_close(old);   /* preparation capture */
+  ps_owned_run_close(selection.replacement);
+  ps_owned_run_close(old);
   return rc;
 }
 static int stream_transition(ps_stream *s, int retirement, lc_error *error) {

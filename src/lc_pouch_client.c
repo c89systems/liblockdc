@@ -250,6 +250,7 @@ typedef struct lc_pouch_acquire_context {
   int has_query_hidden;
   int query_hidden;
   int metadata_prepared;
+  int retention_pending;
   int acquired;
   int txn_explicit;
   char lease_id[128];
@@ -12723,6 +12724,7 @@ static void lc_pouch_acquire_context_cleanup(lc_pouch_acquire_context *ctx) {
   ctx->has_query_hidden = 0;
   ctx->query_hidden = 0;
   ctx->metadata_prepared = 0;
+  ctx->retention_pending = 0;
   ctx->acquired = 0;
   ctx->lease_id[0] = '\0';
 }
@@ -12809,7 +12811,8 @@ static int lc_pouch_acquire_prepare_metadata(
   *apply = 1;
   if (!state_view->has_body || state_view->retention > 0) {
     rc = lc_pouch_retention_check_reservation(ctx->client->pouch, ctx->ns,
-                                              ctx->req->key, error);
+                                              ctx->req->key,
+                                              &ctx->retention_pending, error);
     if (rc != LC_OK)
       return rc;
   }
@@ -12983,6 +12986,7 @@ static int lc_pouch_client_acquire(lc_client *self, const lc_acquire_req *req,
     }
   }
   for (;;) {
+    int wait_retention, clock_rc;
     lc_pouch_acquire_context_cleanup(&acquire_context);
     if (txn_explicit) {
       rc = lc_pouch_txn_guard_acquire(client->pouch, effective_request.txn_id,
@@ -13001,7 +13005,11 @@ static int lc_pouch_client_acquire(lc_client *self, const lc_acquire_req *req,
       (void)lc_pouch_rollback_acquire_claim(&acquire_context, &rollback_error);
       lc_error_cleanup(&rollback_error);
     }
-    if (rc != LC_OK || acquire_context.acquired) {
+    wait_retention = rc == LC_ERR_PENDING &&
+                     acquire_context.retention_pending &&
+                     req->block_seconds > 0L &&
+                     client->pouch->storage.coordinated_namespaces;
+    if ((rc != LC_OK && !wait_retention) || acquire_context.acquired) {
       break;
     }
     lc_pouch_txn_guard_release(&txn_guard);
@@ -13010,15 +13018,19 @@ static int lc_pouch_client_acquire(lc_client *self, const lc_acquire_req *req,
                         NULL, NULL, NULL);
       break;
     }
-    rc = lc_pouch_now_unix(&now_seconds, error);
-    if (rc != LC_OK) {
+    clock_rc = lc_pouch_now_unix(&now_seconds, error);
+    if (clock_rc != LC_OK) {
+      rc = clock_rc;
       break;
     }
     if (now_seconds >= block_deadline_unix) {
-      rc = lc_error_set(error, LC_ERR_INVALID, 0L, "pouch lease already held",
-                        NULL, NULL, NULL);
+      if (!wait_retention)
+        rc = lc_error_set(error, LC_ERR_INVALID, 0L, "pouch lease already held",
+                          NULL, NULL, NULL);
       break;
     }
+    if (wait_retention)
+      lc_error_cleanup(error);
     lc_pouch_acquire_poll_delay();
   }
   if (rc != LC_OK) {
@@ -18761,7 +18773,8 @@ int lc_pouch_retention_run(lc_pouch *pouch, const char *ns, size_t max_attempts,
     lc_pouch_txn_guard_release(&foreign_guard);
     lc_pouch_txn_record_cleanup(&foreign);
     if (rc == LC_ERR_PENDING) {
-      stop = !fresh || ctx.work.phase != LC_POUCH_RETENTION_IDLE;
+      stop = !fresh || ctx.work.phase != LC_POUCH_RETENTION_IDLE ||
+             ctx.candidate.key == NULL;
     } else if (rc != LC_OK) {
       pslog_field fields[4];
       fields[0] = lc_log_str_field("ns", ns);

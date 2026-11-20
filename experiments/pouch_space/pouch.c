@@ -148,8 +148,9 @@ static int namespace_state_lock(void *context, const char *name, void **out,
     rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 1, 1,
                               &guard, e);
   else
-    rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_STATE,
-                              ps_namespace_name_hash(name), 0, &guard, e);
+    rc = ps_coordination_namespace_handoff(
+        coordination, PS_COORDINATION_NAMESPACE_STATE,
+        ps_namespace_name_hash(name), &guard, e);
   *out = guard;
   return rc;
 }

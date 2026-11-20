@@ -353,18 +353,23 @@ static producer source(const char *bytes) {
   p.length = strlen(bytes);
   return p;
 }
-static lc_lease *acquire(fixture *f, const char *key, const char *xid,
-                         lc_error *e) {
+static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
+                                   long seconds, lc_error *e) {
   lc_acquire_req req;
   lc_lease *lease = NULL;
   lc_acquire_req_init(&req);
   req.key = key;
   req.owner = "expiry-test";
   req.ttl_seconds = 300;
+  req.block_seconds = seconds;
   req.txn_id = xid;
   ok(f->client->acquire(f->client, &req, &lease, e), e);
   REQUIRE(lease && lease->fencing_token > 0);
   return lease;
+}
+static lc_lease *acquire(fixture *f, const char *key, const char *xid,
+                         lc_error *e) {
+  return acquire_with_wait(f, key, xid, 0, e);
 }
 static void payload(lc_lease *lease, const lc_update_opts *options,
                     lc_error *e) {
@@ -862,6 +867,76 @@ static void *concurrent_worker(void *context) {
   lc_error_cleanup(&e);
   gate_signal(&task->done, 0);
   return NULL;
+}
+typedef struct retention_poll {
+  rendezvous *release, *done;
+  size_t calls;
+} retention_poll;
+static void retention_acquire_polled(void *context) {
+  retention_poll *poll = context;
+  ++poll->calls;
+  if (poll->release) {
+    gate_signal(poll->release, 1);
+    gate_wait(poll->done, 0);
+  } else
+    now(1004);
+}
+static void shared_wait_for_retention(const char *directory) {
+  fixture *owners = calloc(2, sizeof(*owners));
+  concurrent_task cleanup = {0};
+  rendezvous staged;
+  retention_poll poll = {0};
+  pthread_t worker;
+  lc_acquire_req req;
+  lc_lease *lease = NULL;
+  lc_error e = {0};
+  REQUIRE(owners);
+  shared_lease_fixture = 1;
+  now(1000);
+  setup(&owners[0], directory, 0, 1, 3, &e);
+  strcpy(owners[1].path, owners[0].path);
+  configure(&owners[1], 0, 1, 3);
+  open_store(&owners[1], 0, &e);
+  write_parent(&owners[0], "wait", 2, 0, &e);
+  now(1002);
+  cleanup.f = &owners[0];
+  gate_init(&cleanup.done);
+  gate_init(&staged);
+  phase_gate = &staged;
+  gated_phase = LC_POUCH_RETENTION_STAGED;
+  REQUIRE(!pthread_create(&worker, NULL, concurrent_worker, &cleanup));
+  gate_wait(&staged, 0);
+
+  lc_acquire_req_init(&req);
+  req.key = "wait";
+  req.owner = "waiter";
+  req.ttl_seconds = 300;
+  REQUIRE(lc_acquire(owners[1].client, &req, &lease, &e) == LC_ERR_PENDING &&
+          !lease);
+  clear(&e);
+
+  req.block_seconds = 1;
+  lc_pouch_test_before_acquire_poll_context = &poll;
+  lc_pouch_test_before_acquire_poll_hook = retention_acquire_polled;
+  REQUIRE(lc_acquire(owners[1].client, &req, &lease, &e) == LC_ERR_PENDING &&
+          !lease && poll.calls == 1);
+  clear(&e);
+  poll.release = &staged;
+  poll.done = &cleanup.done;
+  ok(lc_acquire(owners[1].client, &req, &lease, &e), &e);
+  REQUIRE(lease && poll.calls == 2 && lease->fencing_token > owners[0].fencing);
+  ok(lc_lease_release(lease, NULL, &e), &e);
+  lc_pouch_test_before_acquire_poll_hook = NULL;
+  lc_pouch_test_before_acquire_poll_context = NULL;
+  REQUIRE(!pthread_join(worker, NULL));
+  phase_gate = NULL;
+  gate_destroy(&staged);
+  gate_destroy(&cleanup.done);
+  lc_client_close(owners[1].client);
+  close_store(&owners[0]);
+  shared_lease_fixture = 0;
+  free(owners);
+  clear(&e);
 }
 static lc_lease *independent_lease(fixture *f, const char *key, lc_error *e) {
   char xid[LC_XID_STRING_SIZE];
@@ -1639,9 +1714,10 @@ static void *worker(void *context) {
     phase_failures(r->directory);
   else if (!strcmp(r->mode, "policy"))
     lease_policy(r->directory);
-  else if (!strcmp(r->mode, "shared-authority"))
+  else if (!strcmp(r->mode, "shared-authority")) {
     shared_lease(r->directory);
-  else if (!strcmp(r->mode, "shared-queue-delivery"))
+    shared_wait_for_retention(r->directory);
+  } else if (!strcmp(r->mode, "shared-queue-delivery"))
     shared_queue_delivery(r->directory);
   else if (!strcmp(r->mode, "shared-queue-transaction"))
     shared_queue_transaction(r->directory);

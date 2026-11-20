@@ -4776,7 +4776,7 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
       (!w->expected_owned || old != w->expected_owned || old->deleted ||
        !stream_lookup(s, old->key.owner) || !w->entry->owned_mapped ||
        w->entry->stream_capacity != old->stream_capacity))
-    rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
+    rc = err(error, LC_ERR_PENDING, "captured piece mapping changed");
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN)
     rc =
         stream_structure_ready(s, stream_lookup(s, w->entry->key.owner), error);
@@ -6944,7 +6944,7 @@ static int piece_publish(void *context, lc_error *error) {
   if (rc == LC_OK &&
       (lookup(s, old->key) != old || old->deleted ||
        selection->head->entry->deleted || !selection->head->entry->stream_runs))
-    rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
+    rc = err(error, LC_ERR_PENDING, "captured piece mapping changed");
   if (rc == LC_OK)
     rc = append_event_locked(s, old, PS_REMOVE, error);
   if (rc == LC_OK) {
@@ -7109,12 +7109,15 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     ++s->readers;
     pthread_mutex_unlock(&s->mutex);
     selection.writer = writer;
+    /* The selector can install its resident mapping before releasing edit
+     * authority. It must retain its own handle after a successful publish. */
+    *out = result;
     rc = piece_select(&selection, select, context, error);
   }
-  if (rc == LC_OK) {
-    *out = result;
+  if (rc == LC_OK)
     result = NULL;
-  }
+  else
+    *out = NULL;
   if (result && result->entry)
     ps_owned_run_close(result);
   else

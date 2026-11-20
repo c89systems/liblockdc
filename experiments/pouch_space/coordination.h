@@ -98,6 +98,11 @@ int ps_coordination_initialize(ps_coordination *, int create, int acquire,
 int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
                          uint64_t, int wait, ps_coordination_guard **,
                          lc_error *);
+/* A namespace handoff can absorb short maintenance scopes. It leaves
+ * long-running owners on the normal PENDING path and takes no other locks. */
+int ps_coordination_namespace_handoff(ps_coordination *,
+                                      enum ps_coordination_domain, uint64_t,
+                                      ps_coordination_guard **, lc_error *);
 /* New incarnations can prepare concurrently even when their lock bytes
  * coincide. Adopting or reclaiming an existing incarnation needs the
  * exclusive stream claim above. */

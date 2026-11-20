@@ -73,7 +73,8 @@ int lc_pouch_retention_hint_next(lc_pouch *pouch, const char *after, char **ns,
 int lc_pouch_retention_run(lc_pouch *pouch, const char *ns, size_t max_attempts,
                            lc_pouch_maintenance_result *out, lc_error *error);
 int lc_pouch_retention_check_reservation(lc_pouch *pouch, const char *ns,
-                                         const char *key, lc_error *error);
+                                         const char *key, int *reserved,
+                                         lc_error *error);
 int lc_pouch_retention_owns_journal(lc_pouch *pouch, const char *ns,
                                     const char *key, const char *txn_id,
                                     int *out, lc_error *error);

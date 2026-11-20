@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <string.h>
 #include <sys/file.h>
+#include <time.h>
 #include <unistd.h>
 
 #define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
@@ -508,6 +509,31 @@ int ps_coordination_lock(ps_coordination *owner,
                          enum ps_coordination_domain domain, uint64_t identity,
                          int wait, ps_coordination_guard **out, lc_error *e) {
   return lock_guard(owner, domain, identity, wait, 0, out, e);
+}
+int ps_coordination_namespace_handoff(ps_coordination *owner,
+                                      enum ps_coordination_domain domain,
+                                      uint64_t identity,
+                                      ps_coordination_guard **out,
+                                      lc_error *e) {
+  const struct timespec pause = {0, 1000000L};
+  struct timespec now, deadline;
+  int rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
+  if (rc != LC_ERR_PENDING || clock_gettime(CLOCK_MONOTONIC, &deadline))
+    return rc;
+  deadline.tv_nsec += 64000000L;
+  if (deadline.tv_nsec >= 1000000000L) {
+    ++deadline.tv_sec;
+    deadline.tv_nsec -= 1000000000L;
+  }
+  do {
+    (void)nanosleep(&pause, NULL);
+    if (clock_gettime(CLOCK_MONOTONIC, &now) || now.tv_sec > deadline.tv_sec ||
+        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+      break;
+    lc_error_cleanup(e);
+    rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
+  } while (rc == LC_ERR_PENDING);
+  return rc;
 }
 int ps_coordination_stream_prepare(ps_coordination *owner, uint64_t identity,
                                    ps_coordination_guard **out, lc_error *e) {

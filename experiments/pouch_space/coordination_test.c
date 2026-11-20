@@ -475,6 +475,59 @@ static void threads(void) {
   ok(ps_coordination_close(b, &e), &e);
   lc_error_cleanup(&e);
 }
+typedef struct handoff_probe {
+  ps_coordination_guard *release;
+  size_t conflicts;
+} handoff_probe;
+static int observe_handoff(void *context, int fd, int command,
+                           struct flock *lock) {
+  handoff_probe *probe = context;
+  int rc = fcntl(fd, command, lock);
+  int reason = errno;
+  if (rc < 0 && reason == EAGAIN && command == F_OFD_SETLK &&
+      lock->l_type == F_WRLCK) {
+    ++probe->conflicts;
+    ps_coordination_unlock(probe->release);
+    probe->release = NULL;
+  }
+  errno = reason;
+  return rc;
+}
+static void namespace_handoff(void) {
+  const enum ps_coordination_domain domains[] = {
+      PS_COORDINATION_NAMESPACE, PS_COORDINATION_NAMESPACE_STATE};
+  lc_error e = {0};
+  handoff_probe probe = {0};
+  ps_coordination_io io = {&probe, observe_handoff};
+  file_create();
+  ps_coordination *owner = owner_open(1, NULL, &e);
+  ps_coordination *peer = owner_open(1, &io, &e);
+  for (size_t i = 0; i < sizeof(domains) / sizeof(*domains); ++i) {
+    ps_coordination_guard *held = NULL, *acquired = NULL;
+    ok(ps_coordination_lock(owner, domains[i], 0, 0, &held, &e), &e);
+    probe.release = held;
+    probe.conflicts = 0;
+    ok(ps_coordination_namespace_handoff(peer, domains[i], 1, &acquired, &e),
+       &e);
+    REQUIRE(!probe.conflicts && probe.release == held);
+    ps_coordination_unlock(acquired);
+    ok(ps_coordination_namespace_handoff(peer, domains[i], 0, &acquired, &e),
+       &e);
+    REQUIRE(probe.conflicts == 1 && !probe.release);
+    ps_coordination_unlock(acquired);
+
+    ok(ps_coordination_lock(owner, domains[i], 0, 0, &held, &e), &e);
+    REQUIRE(ps_coordination_namespace_handoff(peer, domains[i], 0, &acquired,
+                                              &e) == LC_ERR_PENDING &&
+            !acquired);
+    lc_error_cleanup(&e);
+    REQUIRE(ps_coordination_users(owner) == 1 &&
+            ps_coordination_users(peer) == 0);
+    ps_coordination_unlock(held);
+  }
+  ok(ps_coordination_close(peer, &e), &e);
+  ok(ps_coordination_close(owner, &e), &e);
+}
 static void faults(void) {
   file_create();
   lc_error e;
@@ -757,9 +810,10 @@ int main(int argc, char **argv) {
     lifecycle();
   else if (!strcmp(argv[2], "root-lifetime"))
     root_lifetime();
-  else if (!strcmp(argv[2], "threads"))
+  else if (!strcmp(argv[2], "threads")) {
     threads();
-  else if (!strcmp(argv[2], "faults"))
+    namespace_handoff();
+  } else if (!strcmp(argv[2], "faults"))
     faults();
   else {
     REQUIRE(!strcmp(argv[2], "processes"));

@@ -5830,6 +5830,7 @@ static void shared_state(const char *path, const char *directory) {
 typedef struct replay_probe {
   const lc_pouch_storage_ops *storage;
   size_t full, suffix, applied, fail_at;
+  int fail_code;
 } replay_probe;
 typedef struct replay_probe_visit {
   lc_pouch_storage_visit_fn visit;
@@ -5851,8 +5852,8 @@ static int count_suffix_record(void *context, uint64_t segment,
   replay_probe_visit *probe = context;
   int rc;
   if (++probe->seen == active_replay_probe->fail_at)
-    return lc_error_set(e, LC_ERR_NOMEM, 0, "injected suffix replay failure",
-                        NULL, NULL, "test");
+    return lc_error_set(e, active_replay_probe->fail_code, 0,
+                        "injected suffix replay failure", NULL, NULL, "test");
   rc = probe->visit(probe->context, segment, record, e);
   if (rc == LC_OK)
     ++active_replay_probe->applied;
@@ -5917,6 +5918,7 @@ static void shared_state_delta(const char *path) {
     delta_put(a, "base-1", 8, &e);
     delta_put(a, "base-2", 9, &e);
     probe.fail_at = 2;
+    probe.fail_code = LC_ERR_NOMEM;
     REQUIRE(lc_pouch_state_read_metadata(b, "delta", "base-2", &read, &e) ==
             LC_ERR_NOMEM);
     REQUIRE(!read.found && probe.full == 1 && probe.suffix == 2 &&
@@ -5955,6 +5957,14 @@ static void shared_state_delta(const char *path) {
     delta_put(a, "rotated", 10, &e);
     read_value(b, "delta", "rotated", 59, 10, 1, &e);
     REQUIRE(probe.full == 4 && probe.suffix == 2);
+
+    delta_put(a, "base-5", 11, &e);
+    delta_put(a, "rotated", 12, &e);
+    probe.fail_at = 2;
+    probe.fail_code = LC_ERR_PENDING;
+    read_value(b, "delta", "rotated", 59, 12, 2, &e);
+    read_value(b, "delta", "base-5", 59, 11, 2, &e);
+    REQUIRE(probe.full == 5 && probe.suffix == 3 && probe.applied == 4);
     b->storage.ops = probe.storage;
     active_replay_probe = NULL;
     lc_pouch_close(b);

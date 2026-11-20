@@ -10444,11 +10444,19 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
         pouch->storage.context, cache->storage_namespace, &info,
         cache->active_segment_offset, lc_pouch_state_storage_replay, &replay,
         error);
-  } else {
+    if (rc == LC_ERR_PENDING) {
+      /* The selected boundary can move between inspection and capture.
+       * Drop the partial projection and capture a whole current view. */
+      lc_error_cleanup(error);
+      extend = 0;
+    }
+  }
+  if (!extend) {
     cache->initialized = 0;
     lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
     cache->max_version = cache->max_query_index_seq = 0;
     cache->max_segment_id = cache->segment_count = 0;
+    replay.staging_changed = 0;
     rc = pouch->storage.ops->replay(
         pouch->storage.context, cache->storage_namespace, &info,
         lc_pouch_state_storage_replay, &replay, error);
