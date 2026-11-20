@@ -12,6 +12,7 @@
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
+#define PRESSURE_BIT (UINT64_C(1) << 63)
 #define ZERO_WORDS (PENDING_WORD - 2 * WORDS)
 #define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
 enum readiness_word {
@@ -170,6 +171,8 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   rc = select_record(s, record, selected, e);
   if (rc == LC_OK) {
     s->readiness->active = 1;
+    if (s->maintenance_pressure)
+      ps_readiness_set_pressure(s, 1);
     s->own_ready_wire = s->sequence;
     s->own_ready_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
@@ -194,12 +197,30 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->root = record[ROOT];
     out->origin = record[ORIGIN];
     out->pending =
-        __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE);
+        __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
+        ~PRESSURE_BIT;
     if (out->pending & ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL |
                                    PS_READINESS_RECOVERY))
       rc = failed(s, e, "shared readiness has unknown pending changes");
   }
   return rc;
+}
+int ps_readiness_pressure(ps_space *s) {
+  if (!s->readiness)
+    return __atomic_load_n(&s->maintenance_pressure, __ATOMIC_ACQUIRE);
+  return (__atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
+          PRESSURE_BIT) != 0;
+}
+void ps_readiness_set_pressure(ps_space *s, int requested) {
+  if (!s->readiness || !s->readiness->active) {
+    __atomic_store_n(&s->maintenance_pressure, requested, __ATOMIC_RELEASE);
+  } else if (requested) {
+    (void)__atomic_fetch_or(s->readiness->page + PENDING_WORD, PRESSURE_BIT,
+                            __ATOMIC_RELEASE);
+  } else {
+    (void)__atomic_fetch_and(s->readiness->page + PENDING_WORD, ~PRESSURE_BIT,
+                             __ATOMIC_RELEASE);
+  }
 }
 void ps_readiness_begin(ps_space *s, unsigned int changes) {
   if (s->readiness)

@@ -2217,10 +2217,31 @@ static int visit_shared(void *context, uint64_t segment,
   }
   return LC_OK;
 }
+typedef struct checkpoint_visibility {
+  ps_space *publisher;
+  int synced;
+} checkpoint_visibility;
+static int advance_checkpoint_visibility(void *context, int fd, int cmd,
+                                         struct flock *lock) {
+  checkpoint_visibility *change = context;
+  if (change->publisher && cmd == F_OFD_SETLK && lock->l_type == F_RDLCK &&
+      lock->l_start >= (off_t)(PS_METADATA_START - PS_PAGE / 2) &&
+      lock->l_start < (off_t)PS_METADATA_START) {
+    ps_space *publisher = change->publisher;
+    lc_error e = {0};
+    change->publisher = NULL;
+    ok(ps_flush(publisher, &e), &e);
+    lc_error_cleanup(&e);
+    ++change->synced;
+  }
+  return fcntl(fd, cmd, lock);
+}
 static void shared_handoff(const char *path) {
   for (int durable = 0; durable <= 1; ++durable) {
     lc_error e = {0};
     ps_root_options options = {0};
+    checkpoint_visibility visibility = {0};
+    ps_coordination_io io = {&visibility, advance_checkpoint_visibility};
     ps_root *a = NULL, *b = NULL;
     ps_namespace *x, *y, *other;
     ps_namespace_view *old = NULL, *view = NULL;
@@ -2238,6 +2259,7 @@ static void shared_handoff(const char *path) {
     shared_records checkpoint = {0};
     shared_namespace = 1;
     options.storage.durable_sync = durable;
+    options.storage.coordination_io = &io;
     ok(ps_root_open(path, 1, &options, &a, &e), &e);
     x = acquire(a, "shared", 1, &e);
     other = acquire(a, "independent", 1, &e);
@@ -2295,6 +2317,8 @@ static void shared_handoff(const char *path) {
             ps_namespace_source_refs(x, PS_CATALOG_SEGMENT, 1) == 1);
     ok(ps_namespace_view_visit(old, 1, visit, &original, &e), &e);
     REQUIRE(original.count == 1 && original.version == 1);
+    ps_namespace_view_close(old);
+    old = NULL;
     ok(ps_ns_enter_checkpoint(y, &owner, &e), &e);
     pthread_mutex_lock(&owner->mutex);
     ok(ps_key_checkpoint_flush_deferred(owner->checkpoint, &e), &e);
@@ -2306,7 +2330,15 @@ static void shared_handoff(const char *path) {
     REQUIRE(point.checkpoint_epoch == deferred.epoch);
     ok(ps_namespace_projection(x, &point, &e), &e);
     REQUIRE(point.checkpoint_epoch == (durable ? 0 : deferred.epoch));
-    ok(ps_flush(ps_root_space(b), &e), &e);
+    if (durable) {
+      ok(ps_flush(ps_root_space(b), &e), &e);
+    } else {
+      /* The observer's seed predates the sync. Make the prepared checkpoint
+       * visible at acquisition of the replay view, while the name is held. */
+      visibility.publisher = ps_root_space(b);
+      ok(ps_namespace_checkpoint_recover(x, &e), &e);
+      REQUIRE(visibility.synced == 1 && !visibility.publisher);
+    }
     ok(ps_namespace_projection(x, &point, &e), &e);
     REQUIRE(point.checkpoint_epoch == deferred.epoch);
     ok(append(b, y, 3, 1, 65, &e), &e);

@@ -512,7 +512,7 @@ int ps_coordination_lock(ps_coordination *owner,
 }
 int ps_coordination_namespace_handoff(ps_coordination *owner,
                                       enum ps_coordination_domain domain,
-                                      uint64_t identity,
+                                      uint64_t identity, int pressured,
                                       ps_coordination_guard **out,
                                       lc_error *e) {
   const struct timespec pause = {0, 1000000L};
@@ -520,7 +520,7 @@ int ps_coordination_namespace_handoff(ps_coordination *owner,
   int rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
   if (rc != LC_ERR_PENDING || clock_gettime(CLOCK_MONOTONIC, &deadline))
     return rc;
-  deadline.tv_nsec += 64000000L;
+  deadline.tv_nsec += pressured ? 250000000L : 64000000L;
   if (deadline.tv_nsec >= 1000000000L) {
     ++deadline.tv_sec;
     deadline.tv_nsec -= 1000000000L;

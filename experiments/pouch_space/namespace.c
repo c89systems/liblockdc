@@ -1761,18 +1761,34 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   ps_namespace_view *view = NULL;
   uint64_t segment = 0, end = 0, bytes = 0, span;
   size_t i;
-  int rc, unchanged = 0;
+  int rc, attempt, unchanged = 0;
   if (d->checkpoint_ready)
     return LC_OK;
-  rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, &view, e);
-  if (rc == LC_OK) {
+  for (attempt = 0;; ++attempt) {
+    rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, &view, e);
+    if (rc != LC_OK)
+      break;
     rc = ps_key_checkpoint_confirm_seed(d->checkpoint, view->metadata,
                                         &view->coverage, e);
-    if (rc == LC_ERR_PENDING) {
-      pthread_mutex_lock(&d->mutex);
-      d->shared_valid = 0;
-      pthread_mutex_unlock(&d->mutex);
-    }
+    if (rc != LC_ERR_PENDING)
+      break;
+    pthread_mutex_lock(&d->mutex);
+    d->shared_valid = 0;
+    pthread_mutex_unlock(&d->mutex);
+    if (attempt ||
+        !ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
+      break;
+    /* An independent sync can make a previously prepared checkpoint
+     * visible while this owner holds namespace authority. Rebase against
+     * that selection before replaying any canonical suffix. */
+    ps_namespace_view_close(view);
+    view = NULL;
+    lc_error_cleanup(e);
+    pthread_mutex_lock(&d->mutex);
+    rc = reload_shared(d, e);
+    pthread_mutex_unlock(&d->mutex);
+    if (rc != LC_OK)
+      break;
   }
   if (rc == LC_OK && d->replay_segment && view->count == 1)
     unchanged = view->items[0].start == view->items[0].tail;

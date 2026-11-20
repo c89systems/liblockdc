@@ -265,5 +265,7 @@ int ps_grow(ps_space *, uint64_t, lc_error *);
  */
 int ps_check(ps_space *, lc_error *);
 int ps_status(ps_space *, ps_stats *, lc_error *);
+int ps_maintenance_pressure_requested(ps_space *);
+int ps_maintenance_pressure(ps_space *, int *, uint64_t *, lc_error *);
 
 #endif

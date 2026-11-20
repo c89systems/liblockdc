@@ -164,6 +164,9 @@ typedef struct lc_pouch_storage_maintenance_ops {
   int (*collections_run)(void *, lc_pouch *,
                          const lc_pouch_maintenance_options *,
                          lc_pouch_maintenance_result *, lc_error *);
+  /* Optional root-wide hint. A positive result requests one ordinary pass.
+   * Available bytes describe the remaining ordinary admission headroom. */
+  int (*capacity_pressure)(void *, int *, uint64_t *, lc_error *);
 } lc_pouch_storage_maintenance_ops;
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);

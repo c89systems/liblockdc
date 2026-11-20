@@ -507,17 +507,17 @@ static void namespace_handoff(void) {
     ok(ps_coordination_lock(owner, domains[i], 0, 0, &held, &e), &e);
     probe.release = held;
     probe.conflicts = 0;
-    ok(ps_coordination_namespace_handoff(peer, domains[i], 1, &acquired, &e),
+    ok(ps_coordination_namespace_handoff(peer, domains[i], 1, 0, &acquired, &e),
        &e);
     REQUIRE(!probe.conflicts && probe.release == held);
     ps_coordination_unlock(acquired);
-    ok(ps_coordination_namespace_handoff(peer, domains[i], 0, &acquired, &e),
+    ok(ps_coordination_namespace_handoff(peer, domains[i], 0, 1, &acquired, &e),
        &e);
     REQUIRE(probe.conflicts == 1 && !probe.release);
     ps_coordination_unlock(acquired);
 
     ok(ps_coordination_lock(owner, domains[i], 0, 0, &held, &e), &e);
-    REQUIRE(ps_coordination_namespace_handoff(peer, domains[i], 0, &acquired,
+    REQUIRE(ps_coordination_namespace_handoff(peer, domains[i], 0, 0, &acquired,
                                               &e) == LC_ERR_PENDING &&
             !acquired);
     lc_error_cleanup(&e);

@@ -321,18 +321,23 @@ static void shared_autonomous_capacity(const char *directory, int codec,
   strcpy(owners[1].path, owners[0].path);
   configure(&owners[1], 0, sync, codec);
   open_store(&owners[1], 0, &e);
-  for (size_t i = 0; i < 2; ++i)
-    outbox[i] = shared_outbox_open(&owners[i], "effects", "capacity", 300, &e);
-
   options.maximum_capacity = PS_DEFAULT_CAPACITY;
   options.logical.single_writer_set = 1;
   options.logical.query_indexing_enabled_set = 1;
   options.logical.background_compaction_enabled_set = 1;
   options.logical.background_compaction_enabled = 1;
-  options.logical.compaction_interval_seconds = 1;
   options.logical.durable_sync = sync;
   options.logical.crypto_key = codec & 1 ? crypto_key : NULL;
   options.logical.compression = codec & 2 ? "zlib" : "none";
+  ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker, &e),
+     &e);
+  REQUIRE(worker->compaction_interval_seconds ==
+          LC_POUCH_DEFAULT_COMPACTION_INTERVAL_SECONDS);
+  space = ps_root_space(ps_pouch_state_root(worker));
+  ok(ps_status(space, &stats, &e), &e);
+  REQUIRE(!stats.checkpoints);
+  for (size_t i = 0; i < 2; ++i)
+    outbox[i] = shared_outbox_open(&owners[i], "effects", "capacity", 300, &e);
 
   /* Keep a live encoded body in the same source as expiring bodies. */
   now(1000);
@@ -359,12 +364,6 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     if (cycle % BURST)
       continue;
     strcpy(scenario + phase, " worker");
-    if (!worker) {
-      ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker,
-                             &e),
-         &e);
-      space = ps_root_space(ps_pouch_state_root(worker));
-    }
     double start = real_clock(CLOCK_MONOTONIC);
     for (;;) {
       ok(ps_status(space, &stats, &e), &e);

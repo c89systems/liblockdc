@@ -3,6 +3,7 @@
 #include "budget.h"
 #include "coordination.h"
 #include "lc_api_internal.h"
+#include "lc_pouch_format.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_retention.h"
 #include "lc_pouch_txn_guard.h"

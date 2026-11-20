@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance) | Default-cadence pressure handling and messaging completion during maximal competing reservations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), and [capacity pressure at the default cadence](#capacity-pressure-at-the-default-cadence) | Unpaced sustained load and messaging completion during maximal competing reservations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8107,8 +8107,10 @@ trying to acquire file authority in the lease phase. The controlled capacity
 test continues to close the worker between bursts. The exploratory logs are
 `test-overlap.log` and `test-final-debug.log` in the same directory.
 [Foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance)
-addresses the observed overlap failures. Default-cadence pressure and queue
-and outbox completion under a maximal opposing reservation remain open.
+addresses the observed overlap failures. The later
+[capacity pressure stage](#capacity-pressure-at-the-default-cadence) tests
+overlap at the default cadence. Queue and outbox completion under a maximal
+opposing reservation remains open.
 
 GNU and musl release passed 71 and 27 selected groups during qualification.
 Ten focused groups passed on each final release build, including peer
@@ -8288,6 +8290,74 @@ The indexed per-item p95 increased by 0.78 ms, and the small queue p95
 increased by 1.53 ms. Queue and indexed reopen used four syncs and took
 8.9–11.0 ms against 0.38–0.62 ms for multifile. These runs measure the normal
 foreground path. The continuous fixture measures overlapping maintenance
-and paced reuse at a one-second cadence. Pressure-triggered work at the
-default cadence and messaging completion under a maximal opposing reservation
-remain open. Raw timings and counters are in `compare.log`.
+and paced reuse at a one-second cadence. The next stage exercises pressure
+at the default cadence. Raw timings and counters are in `compare.log`.
+
+## Capacity pressure at the default cadence
+
+The allocator marks an advisory pressure bit when admitting the proposed
+work would leave at most half of usable container bytes as ordinary headroom.
+Headroom accounts for claimed work, checkpoint workspace, and the protected
+maintenance floor. An already open peer can observe the shared bit without
+taking allocator authority or reading the journal. An exclusive owner keeps
+the same signal locally. The scheduling bit is distinct from readiness and
+retirement fences. The allocator's admission checks govern every allocation.
+
+The worker samples the hint every 250 ms. When it is set, the worker tries
+local and shared allocator authority without waiting, refreshes the selected
+view and live claims, and recomputes headroom. A busy allocator defers the
+probe. The worker clears pressure at three quarters of usable capacity.
+While pressure persists, a probe can run one pass through the existing fair
+namespace and work-source rotation. After eight probes without improved
+headroom, the worker backs off to one second. Normal scheduled passes keep
+their configured deadline. Active bodies and standing obligations retain
+their capacity under both schedules.
+
+While the hint is set, contended namespace acquisition can wait up to 250 ms
+before returning pending. The ordinary 64 ms budget continues to apply when
+pressure is clear. A peer sync can reveal a prepared checkpoint between loading
+the seed and capturing the replay view. Recovery invalidates the old selection,
+rebases the namespace under its edit guard, and tries once more before replaying
+any records. A deterministic witness test syncs a peer between those captures
+and verifies the recovered key and history.
+
+The default-cadence baseline reached cycle four with 7,487,488 bytes allocated
+and zero worker checkpoints after 24 seconds. The final fixture opens an idle
+maintenance owner before the writers start producing values, requests the
+default 30-minute cadence, and keeps the worker open. The two SDK writers pace
+four bursts across two independent root handles. They wait for reuse between
+bursts, verify outbox receipts during the workload, and verify the live bodies
+and empty queue after cold reopen.
+The allocator fixture observes a live peer's reservation above 8 MiB, verifies
+that a busy allocation gate defers the probe, and checks that releasing the
+claim clears the pressure signal.
+
+Debug, GNU release and musl release passed 9, 43 and 26 selected groups. Four
+multifile compaction cases and the multifile cleanup suite also passed. In all
+eight default-cadence runs the two owners streamed 18 MiB over 16 cycles through
+a fixed 10 MiB container. The longest wait to the required reuse and expiry
+boundary was 3.92 seconds, and the largest allocation at that boundary was
+3,137,536 bytes. This qualification covers paced bursts. Unpaced sustained load
+and queue and outbox completion during maximal opposing reservations remain open.
+
+All 72 matched GNU samples verified after reopen. Each workload used two
+preopened producers with background maintenance disabled. All six configuration
+orders are represented. Values are medians of six samples in milliseconds,
+prior single-file (`018e1085`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 27.03 / 23.03 / 88.18 | 11.87 / 9.55 / 19.40 | 0.26 / 0.26 / 0.07 | 9.62 / 8.87 / 0.39 | 0.37 / 0.33 / 0.43 |
+| Queue, 64 KiB durable | 310.08 / 295.28 / 341.62 | 58.64 / 57.31 / 66.23 | 0.33 / 0.27 / 0.13 | 8.50 / 8.22 / 0.49 | 0.43 / 0.45 / 0.51 |
+| Indexed state, 4 KiB NoSync | 49.41 / 54.74 / 172.65 | 1.81 / 1.64 / 18.94 | 0.66 / 0.55 / 0.29 | 9.05 / 9.31 / 0.61 | 1.24 / 1.08 / 1.75 |
+| Outbox, 64 KiB durable | 924.48 / 939.72 / 1362.49 | 176.01 / 171.72 / 254.30 | 0.50 / 0.53 / 0.25 | 38.68 / 38.27 / 55.04 | 59.31 / 58.63 / 127.26 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 34.24 / 34.65 / 132.05 | 15.26 / 19.40 / 28.69 | 0.45 / 0.34 / 11.29 | 0.19 / 0.18 / 11.99 |
+
+Indexed mutation time stayed within half a millisecond of the prior build.
+Explicit flush took 4.14 ms longer in these samples. Queue and indexed reopen
+still used four syncs across the reopened owners and took 8.2–9.3 ms versus
+0.39–0.61 ms for multifile. The raw timings and qualification logs are in
+`build/pouch-space-pressure/`.

@@ -285,9 +285,10 @@ int ps_namespace_guard(ps_namespace *ns, ps_coordination_guard **guard,
   ps_coordination *coordination = ps_space_coordination(ns->root->space);
   *guard = NULL;
   return ps_coordination_shared(coordination)
-             ? ps_coordination_namespace_handoff(coordination,
-                                                 PS_COORDINATION_NAMESPACE,
-                                                 ns->hash, guard, error)
+             ? ps_coordination_namespace_handoff(
+                   coordination, PS_COORDINATION_NAMESPACE, ns->hash,
+                   ps_maintenance_pressure_requested(ns->root->space), guard,
+                   error)
              : LC_OK;
 }
 int ps_namespace_unguard(ps_namespace *ns, ps_coordination_guard *guard, int rc,

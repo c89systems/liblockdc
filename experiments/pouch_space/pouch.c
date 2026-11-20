@@ -138,8 +138,8 @@ static int namespace_state_lock(void *context, const char *name, void **out,
                                 lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_coordination_guard *guard = NULL;
-  ps_coordination *coordination =
-      ps_space_coordination(ps_root_space(owner->root));
+  ps_space *space = ps_root_space(owner->root);
+  ps_coordination *coordination = ps_space_coordination(space);
   int rc;
   if (!strcmp(name, ".txns"))
     rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 0, 1,
@@ -150,7 +150,8 @@ static int namespace_state_lock(void *context, const char *name, void **out,
   else
     rc = ps_coordination_namespace_handoff(
         coordination, PS_COORDINATION_NAMESPACE_STATE,
-        ps_namespace_name_hash(name), &guard, e);
+        ps_namespace_name_hash(name), ps_maintenance_pressure_requested(space),
+        &guard, e);
   *out = guard;
   return rc;
 }
@@ -692,8 +693,15 @@ static int collections_maintain(void *context, lc_pouch *pouch,
   ps_pouch_owner *owner = context;
   return ps_collection_maintenance_run(owner->root, pouch, options, out, e);
 }
+static int capacity_pressure(void *context, int *needed, uint64_t *available,
+                             lc_error *e) {
+  ps_pouch_owner *owner = context;
+  return ps_maintenance_pressure(ps_root_space(owner->root), needed, available,
+                                 e);
+}
 static const lc_pouch_storage_maintenance_ops maintenance_ops = {
-    work_ensure, work_remove, work_next, state_maintain, collections_maintain};
+    work_ensure,    work_remove,          work_next,
+    state_maintain, collections_maintain, capacity_pressure};
 static int outbox_markers_open(void *context, const char *ns, int kind,
                                int create, lc_pouch_outbox_store *out,
                                lc_error *e) {

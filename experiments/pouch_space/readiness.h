@@ -20,6 +20,10 @@ void ps_readiness_close(ps_space *);
 int ps_readiness_validate(ps_space *, lc_error *);
 int ps_readiness_opened(ps_space *, lc_error *);
 int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
+/* Advisory capacity scheduling. Workers can sample without allocator
+ * authority. Updating the level requires the allocator scope. */
+int ps_readiness_pressure(ps_space *);
+void ps_readiness_set_pressure(ps_space *, int);
 /* Mark an in-flight disk transition before its first canonical write.
  * A rejected suffix being erased keeps its own fence until a sync proves
  * retirement. Reading back a matching journal header cannot clear it. */

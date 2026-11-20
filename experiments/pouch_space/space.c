@@ -478,19 +478,23 @@ static void entry_free(ps_entry *p) {
   lc_free_with_allocator(NULL, p->extents);
   lc_free_with_allocator(NULL, p);
 }
-static int allocation_begin(ps_space *s, ps_coordination_guard **guard,
-                            lc_error *error) {
+static int allocation_lock(ps_space *s, ps_coordination_guard **guard, int wait,
+                           lc_error *error) {
   int rc;
   *guard = NULL;
   if (!ps_coordination_shared(s->coordination) || s->allocation_guard)
     return LC_OK;
-  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
-                            guard, error);
+  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_ALLOCATION, 0,
+                            wait, guard, error);
   if (rc == LC_OK) {
     s->allocation_guard = *guard;
     s->allocation_ranges_checked = 0;
   }
   return rc;
+}
+static int allocation_begin(ps_space *s, ps_coordination_guard **guard,
+                            lc_error *error) {
+  return allocation_lock(s, guard, 1, error);
 }
 static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
                           lc_error *error) {
@@ -1819,14 +1823,23 @@ static uint64_t metadata_target(ps_space *s, uint64_t bound) {
    * from its retired image without relying on unprotected payload capacity. */
   return allocated < bound ? 2 * bound - allocated : bound;
 }
-static int metadata_fits(ps_space *s, uint64_t target, uint64_t payload,
-                         uint64_t floor) {
+static int ordinary_headroom(ps_space *s, uint64_t target, uint64_t floor,
+                             uint64_t *available) {
   uint64_t extra =
       target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
-  return s->reserved_payload <= s->free_bytes &&
-         payload <= s->free_bytes - s->reserved_payload &&
-         floor <= s->free_bytes - s->reserved_payload - payload &&
-         extra <= s->free_bytes - s->reserved_payload - payload - floor;
+  *available = 0;
+  if (s->reserved_payload > s->free_bytes ||
+      floor > s->free_bytes - s->reserved_payload ||
+      extra > s->free_bytes - s->reserved_payload - floor)
+    return 0;
+  *available = s->free_bytes - s->reserved_payload - floor - extra;
+  return 1;
+}
+static int metadata_fits(ps_space *s, uint64_t target, uint64_t payload,
+                         uint64_t floor) {
+  uint64_t available;
+  return ordinary_headroom(s, target, floor, &available) &&
+         payload <= available;
 }
 static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
                                 uint64_t payload, uint64_t floor,
@@ -1841,6 +1854,11 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
     if (rc != LC_OK)
       return rc;
   }
+  /* Writers publish only a hint. An idle independent maintenance owner
+   * reconciles it with current witnesses before scheduling a pass. */
+  (void)ordinary_headroom(s, target, floor, &bytes);
+  if (bytes < payload || bytes - payload <= (s->capacity - PS_DATA) / 2)
+    ps_readiness_set_pressure(s, 1);
   if (!metadata_fits(s, target, payload, floor)) {
     rc = pins_reclaim_locked(s, error);
     if (rc != LC_OK)
@@ -5812,6 +5830,46 @@ int ps_check(ps_space *s, lc_error *error) {
   if (!s)
     return err(error, LC_ERR_INVALID, "container admission requires space");
   return healthy(s, error);
+}
+int ps_maintenance_pressure_requested(ps_space *s) {
+  return ps_readiness_pressure(s);
+}
+int ps_maintenance_pressure(ps_space *s, int *needed, uint64_t *available,
+                            lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
+  int rc;
+  if (!s || !needed || !available)
+    return err(error, LC_ERR_INVALID, "capacity pressure requires outputs");
+  *needed = 0;
+  *available = 0;
+  if (!ps_readiness_pressure(s))
+    return LC_OK;
+  rc = pthread_mutex_trylock(&s->mutex);
+  if (rc)
+    return err(error, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT,
+               "capacity pressure cannot acquire allocator");
+  rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = allocation_lock(s, &guard, 0, error);
+  if (rc == LC_OK && guard)
+    rc = canonical_refresh(s, 0, error);
+  if (rc == LC_OK && guard)
+    rc = allocation_ranges_refresh(s, error);
+  if (rc == LC_OK)
+    rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
+  if (rc == LC_OK)
+    rc = reserve_floor(s, s->metadata, s->live_entries, bound, &floor, error);
+  if (rc == LC_OK) {
+    (void)ordinary_headroom(s, metadata_target(s, bound), floor, available);
+    *needed =
+        *available < (s->capacity - PS_DATA) - (s->capacity - PS_DATA) / 4;
+    if (!*needed)
+      ps_readiness_set_pressure(s, 0);
+  }
+  rc = allocation_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
 }
 int ps_status(ps_space *s, ps_stats *out, lc_error *error) {
   ps_entry *p;

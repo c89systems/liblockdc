@@ -2108,10 +2108,15 @@ static void projection_pressure(void) {
   ps_space *a = NULL, *b = NULL;
   ps_budget *funded = NULL, *padding = NULL;
   ps_budget_plan plan = {PS_CHUNK, 4096, 8, 0}, occupied = {0};
+  ps_coordination_guard *guard = NULL;
+  uint64_t headroom;
+  int pressure;
   ok(ps_open(path, 1, NULL, &a, &e), &e);
   capture_put(a, 1, 65);
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_maintenance_pressure(a, &pressure, &headroom, &e), &e);
+  REQUIRE(!pressure && !headroom);
   ok(ps_budget_open(a, &plan, &funded, &e), &e);
   ps_writer *private = private_value(a, funded, 9000);
   ok(ps_budget_open(b, &occupied, &padding, &e), &e);
@@ -2128,6 +2133,16 @@ static void projection_pressure(void) {
     }
   }
   REQUIRE(occupied.payload_bytes > 8 * PS_MIB);
+  ok(ps_coordination_lock(ps_space_coordination(b), PS_COORDINATION_ALLOCATION,
+                          0, 1, &guard, &e),
+     &e);
+  REQUIRE(ps_maintenance_pressure(a, &pressure, &headroom, &e) ==
+              LC_ERR_PENDING &&
+          !pressure && !headroom);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(guard);
+  ok(ps_maintenance_pressure(a, &pressure, &headroom, &e), &e);
+  REQUIRE(pressure && headroom < 2 * PS_MIB);
   ok(ps_checkpoint(b, &e), &e);
   ok(ps_refresh(a, &e), &e);
   ps_writer *probe = NULL;
@@ -2147,6 +2162,10 @@ static void projection_pressure(void) {
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_close(a, &e), &e);
   ok(ps_budget_close(padding, &e), &e);
+  ok(ps_maintenance_pressure(b, &pressure, &headroom, &e), &e);
+  REQUIRE(!pressure && headroom > 7 * PS_MIB);
+  ok(ps_maintenance_pressure(b, &pressure, &headroom, &e), &e);
+  REQUIRE(!pressure && !headroom);
   ok(ps_close(b, &e), &e);
   ok(ps_open(path, 0, NULL, &a, &e), &e);
   ps_reader *reader = NULL;

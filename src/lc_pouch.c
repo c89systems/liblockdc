@@ -1211,46 +1211,75 @@ size_t lc_pouch_test_compaction_queue_count(lc_pouch *pouch) {
 }
 #endif
 
+static int compaction_due(const struct timespec *now,
+                          const struct timespec *deadline) {
+  return now->tv_sec > deadline->tv_sec ||
+         (now->tv_sec == deadline->tv_sec && now->tv_nsec >= deadline->tv_nsec);
+}
+static void compaction_pressure_deadline(struct timespec *deadline,
+                                         int stalled) {
+  (void)clock_gettime(CLOCK_REALTIME, deadline);
+  deadline->tv_nsec += stalled ? 1000000000L : 250000000L;
+  if (deadline->tv_nsec >= 1000000000L) {
+    ++deadline->tv_sec;
+    deadline->tv_nsec -= 1000000000L;
+  }
+}
 static void *lc_pouch_compaction_worker(void *arg) {
-  lc_pouch *pouch;
-  int armed;
-
-  pouch = (lc_pouch *)arg;
-  armed = 0;
+  lc_pouch *pouch = arg;
+  const lc_pouch_storage_maintenance_ops *ops =
+      pouch->storage.ops ? pouch->storage.ops->maintenance : NULL;
+  int probes_pressure = ops && ops->capacity_pressure;
+  struct timespec regular = {0}, probe = {0};
+  uint64_t prior_available = 0;
+  int armed = 0, stalled = 0;
+  if (probes_pressure)
+    compaction_pressure_deadline(&probe, 0);
   pthread_mutex_lock(&pouch->compaction_mutex);
   while (!pouch->compaction_stop) {
-    struct timespec deadline;
-    int wait_rc;
-
-    /* Ordinary opens stay idle; existing work or a failed hint discovery arms
-     * the same bounded cadence so transient I/O cannot lose durable work. */
-    if (!armed) {
-      while (!pouch->compaction_stop && !pouch->compaction_pending) {
-        (void)pthread_cond_wait(&pouch->compaction_cond,
-                                &pouch->compaction_mutex);
-      }
-      if (pouch->compaction_stop) {
-        break;
-      }
-      pouch->compaction_pending = 0;
+    struct timespec now;
+    const struct timespec *wake;
+    int regular_due, probe_due, pressured = 0;
+    uint64_t available;
+    if (!armed && pouch->compaction_pending) {
       armed = 1;
+      lc_pouch_compaction_deadline(pouch, &regular);
     }
-    lc_pouch_compaction_deadline(pouch, &deadline);
-    wait_rc = 0;
-    while (!pouch->compaction_stop && wait_rc != ETIMEDOUT) {
-      wait_rc = pthread_cond_timedwait(&pouch->compaction_cond,
-                                       &pouch->compaction_mutex, &deadline);
-      if (pouch->compaction_pending) {
-        /* Work is coalesced, but later writes never postpone an already
-         * scheduled bounded maintenance turn. */
-        pouch->compaction_pending = 0;
-      }
+    pouch->compaction_pending = 0;
+    wake = armed ? &regular : NULL;
+    if (probes_pressure && (!wake || compaction_due(wake, &probe)))
+      wake = &probe;
+    if (!wake) {
+      (void)pthread_cond_wait(&pouch->compaction_cond,
+                              &pouch->compaction_mutex);
+      continue;
     }
-    if (pouch->compaction_stop) {
-      break;
+    (void)clock_gettime(CLOCK_REALTIME, &now);
+    if (!compaction_due(&now, wake)) {
+      (void)pthread_cond_timedwait(&pouch->compaction_cond,
+                                   &pouch->compaction_mutex, wake);
+      continue;
     }
+    regular_due = armed && compaction_due(&now, &regular);
+    probe_due = probes_pressure && compaction_due(&now, &probe);
     pthread_mutex_unlock(&pouch->compaction_mutex);
-    lc_pouch_compaction_run_pass(pouch);
+    if (probe_due) {
+      int rc = ops->capacity_pressure(pouch->storage.context, &pressured,
+                                      &available, NULL);
+      if (rc != LC_OK)
+        pressured = 0;
+      if (!pressured || available > prior_available)
+        stalled = 0;
+      else if (stalled < 8)
+        ++stalled;
+      prior_available = pressured ? available : 0;
+    }
+    if (regular_due || pressured)
+      lc_pouch_compaction_run_pass(pouch);
+    if (regular_due)
+      lc_pouch_compaction_deadline(pouch, &regular);
+    if (probe_due)
+      compaction_pressure_deadline(&probe, stalled == 8);
     pthread_mutex_lock(&pouch->compaction_mutex);
   }
   pthread_mutex_unlock(&pouch->compaction_mutex);
