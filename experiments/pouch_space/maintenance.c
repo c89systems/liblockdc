@@ -73,17 +73,15 @@ typedef struct retire_task {
   compact *work;
   unsigned int kind;
   uint64_t id;
-  int active, rotated;
+  int active;
+  ps_namespace_retirement *retirement;
 } retire_task;
 static int retire_locked(void *context, lc_error *e) {
   retire_task *task = context;
   compact *w = task->work;
   int rc;
-  if (task->active) {
-    rc = ps_namespace_rotate_obsolete(w->ns, task->id, &task->rotated, e);
-    if (rc != LC_OK || !task->rotated)
-      return rc;
-  }
+  if (task->active)
+    return ps_namespace_unlink_active(w->ns, task->id, &task->retirement, e);
   if (ps_namespace_source_refs(w->ns, task->kind, task->id)) {
     ++w->result.pending_sources;
     return LC_OK;
@@ -115,7 +113,16 @@ static int retire_source(void *context, const ps_namespace_source *source,
     rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
                                             &task, e);
     task.active = 0;
-    if (rc != LC_OK || task.rotated)
+    if (task.retirement) {
+      int retired = ps_namespace_retire_unlinked(w->ns, task.retirement,
+                                                 rc == LC_OK ? e : NULL);
+      if (retired == LC_OK)
+        ++w->result.reclaimed_sources;
+      if (rc == LC_OK)
+        rc = retired;
+      goto outcome;
+    }
+    if (rc != LC_OK)
       goto outcome;
   }
   if (!source->sealed ||
@@ -264,8 +271,9 @@ static int compact_run(lc_pouch *pouch, const char *name,
   rc = lc_pouch_state_with_namespace_lock(pouch, name, compact_locked, &w, e);
   /* Private encoded copying owns no logical or physical publication gate.
    * Every durable map selection reacquires logical authority and rechecks its
-   * captured body generation. Whole-source retirement and final work-marker
-   * decisions are likewise serialized with canonical mutations. */
+   * captured body generation. Whole-source unlink and work-marker selection
+   * are serialized with canonical mutations. The active predecessor's
+   * physical retirement follows its durable unlink under stream authority. */
   if (rc == LC_OK && !w.result.skipped)
     rc = ps_namespace_sources_visit(w.ns, retire_source, &w, e);
   if (rc == LC_OK && !w.result.skipped)

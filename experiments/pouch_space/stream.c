@@ -599,7 +599,7 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
                            lc_error *error) {
   ps_owned_run *old = NULL;
   stream_piece_selection selection = {0};
-  int rc, found;
+  int rc;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
                         "piece replacement requires owner");
@@ -617,10 +617,7 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
    * prefix. Keep the writer's stamp and resident append state intact.
    * Publication checks this predecessor under namespace and stream
    * authority after the private copy is complete. */
-  rc = ps_owned_grant(s->head, NULL, base, 0, &old, &found, error);
-  if (rc == LC_OK && !found)
-    rc = stream_error(error, LC_ERR_PENDING,
-                      "piece replacement is no longer selected");
+  rc = ps_owned_capture_piece(s->head, base, count != 0, &old, error);
   selection.stream = s;
   selection.base = base;
   selection.select = select;

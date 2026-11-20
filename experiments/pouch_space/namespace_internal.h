@@ -18,7 +18,7 @@ typedef struct ps_ns_resource {
   ps_ns_label *label;
   ps_catalog_info binding;
   ps_stream *stream;
-  int unselected, pooled, repacking;
+  int unselected, pooled, repacking, retiring;
   struct ps_ns_resource *next;
 } ps_ns_resource;
 struct ps_namespace_data {
@@ -72,6 +72,9 @@ int ps_ns_finish_seal(struct ps_namespace_data *, lc_error *);
 int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
                         lc_error *);
 int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);
+/* Select a durable empty successor and record its predecessor for sealing
+ * or direct retirement. Caller has finished any earlier pending seal. */
+int ps_ns_select_successor(struct ps_namespace_data *, ps_budget *, lc_error *);
 int ps_ns_head_write(struct ps_namespace_data *, ps_budget *, uint64_t active,
                      lc_error *);
 /* Funded body construction while the conversion owner holds mutation

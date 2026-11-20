@@ -221,6 +221,12 @@ static int reap(struct ps_namespace_data *d, uint64_t *closed,
   int rc = LC_OK;
   *closed = *pending = 0;
   while (r && rc == LC_OK) {
+    if (__atomic_load_n(&r->retiring, __ATOMIC_ACQUIRE)) {
+      ++*pending;
+      link = &r->next;
+      r = r->next;
+      continue;
+    }
     rc = ps_stream_status(r->stream, &info, e);
     if (rc == LC_OK && !info.retired) {
       rc = ps_stream_retire(r->stream, e);
@@ -289,6 +295,69 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
         rc = reap(d, closed, pending, e);
       ps_ns_leave(d);
     }
+  }
+  return rc;
+}
+int ps_namespace_unlink_active(ps_namespace *ns, uint64_t expected,
+                               ps_namespace_retirement **retirement,
+                               lc_error *e) {
+  struct ps_namespace_data *d;
+  ps_checkpoint_info coverage;
+  ps_ns_resource *source = NULL;
+  int rc;
+  if (!retirement)
+    return failure(e, "active unlink requires retirement output");
+  *retirement = NULL;
+  rc = ps_ns_enter_checkpoint(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&d->mutex);
+  ps_key_checkpoint_info(d->checkpoint, &coverage);
+  if (d->active == expected && d->tail && coverage.epoch &&
+      coverage.segment == expected && coverage.offset == d->tail &&
+      !coverage.pending &&
+      !ps_key_checkpoint_source_refs(d->checkpoint, PS_CATALOG_SEGMENT,
+                                     expected)) {
+    rc = ps_ns_require_unpinned(d, e);
+    if (rc == LC_OK)
+      source = ps_ns_find(d, PS_CATALOG_SEGMENT, expected);
+  }
+  pthread_mutex_unlock(&d->mutex);
+  if (rc == LC_OK && source)
+    rc = ps_ns_finish_seal(d, e);
+  if (rc == LC_OK && source)
+    rc = ps_ns_select_successor(d, NULL, e);
+  if (rc == LC_OK && source) {
+    /* The covered predecessor is unreachable from the new durable route.
+     * A crash before unlink can still use ordinary predecessor sealing.
+     * After unlink the orphan sweep can finish physical retirement. */
+    pthread_mutex_lock(&d->mutex);
+    rc = drop(d, source, e);
+    if (rc == LC_OK) {
+      d->pending_seal = 0;
+      __atomic_store_n(&source->retiring, 1, __ATOMIC_RELEASE);
+      ps_namespace_retain(ns);
+      *retirement = source;
+    }
+    pthread_mutex_unlock(&d->mutex);
+  }
+  ps_ns_leave(d);
+  return rc;
+}
+int ps_namespace_retire_unlinked(ps_namespace *ns,
+                                 ps_namespace_retirement *retirement,
+                                 lc_error *e) {
+  int rc;
+  if (!ns || !retirement)
+    return failure(e, "retire requires an unlinked namespace source");
+  rc = ps_stream_retire(retirement->stream, e);
+  __atomic_store_n(&retirement->retiring, 0, __ATOMIC_RELEASE);
+  ps_namespace_release(ns);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    rc = lc_error_set(e, LC_ERR_PENDING, 0,
+                      "unlinked source still has an active owner", NULL, NULL,
+                      "pouch");
   }
   return rc;
 }

@@ -6039,7 +6039,7 @@ int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
   return 1;
 }
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
-                      const ps_ref *ref, int guarded, int prepare,
+                      const ps_ref *ref, int guarded, int prepare, int defer,
                       ps_owned_head **out, ps_owned_status *status,
                       lc_error *error) {
   ps_owned_head *head;
@@ -6122,7 +6122,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && create && s->durable)
+  if (rc == LC_OK && create && s->durable && !defer)
     rc = wait_durable(s, sequence, error);
   if (rc == LC_OK)
     *out = head;
@@ -6135,17 +6135,30 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
 int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                   const ps_ref *ref, ps_owned_head **out,
                   ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 0, 0, out, status, error);
+  return owned_open(s, budget, key, create, ref, 0, 0, 0, out, status, error);
 }
 int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
                           int create, const ps_ref *ref, ps_owned_head **out,
                           ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 1, 0, out, status, error);
+  return owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, error);
+}
+int ps_owned_stage_empty(ps_space *s, ps_budget *budget, ps_key key,
+                         ps_owned_head **out, ps_ref *ref, lc_error *error) {
+  ps_owned_status status;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!ref)
+    return err(error, LC_ERR_INVALID, "staged stream requires a reference");
+  rc = owned_open(s, budget, key, 1, NULL, 1, 0, 1, out, &status, error);
+  if (rc == LC_OK)
+    *ref = status.ref;
+  return rc;
 }
 int ps_owned_open_prepared(ps_space *s, ps_key key, ps_owned_head **out,
                            ps_owned_status *status, lc_error *error) {
   int shared = ps_coordination_shared(ps_space_coordination(s));
-  return owned_open(s, NULL, key, 0, NULL, shared, 1, out, status, error);
+  return owned_open(s, NULL, key, 0, NULL, shared, 1, 0, out, status, error);
 }
 void ps_owned_close(ps_owned_head *head) {
   ps_space *s;
@@ -6598,9 +6611,9 @@ select_run:
   lc_free_with_allocator(NULL, spare);
   return rc;
 }
-int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
-                   uint64_t desired, ps_owned_run **out, int *found,
-                   lc_error *error) {
+static int owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
+                       uint64_t desired, int verify_identity,
+                       ps_owned_run **out, int *found, lc_error *error) {
   ps_owned_run *run;
   ps_coordination_guard *guard;
   ps_space *s;
@@ -6638,7 +6651,7 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
     }
     rc = ps_internal_capture_end(s, guard, rc, error);
     pthread_mutex_unlock(&s->mutex);
-    if (rc == LC_OK && run->entry)
+    if (rc == LC_OK && run->entry && verify_identity)
       rc = verify_owned(s, p, header, error);
   }
   if (rc == LC_OK && run->entry) {
@@ -6648,6 +6661,19 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
     ps_owned_run_close(run);
   else
     lc_free_with_allocator(NULL, run);
+  return rc;
+}
+int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
+                   uint64_t desired, ps_owned_run **out, int *found,
+                   lc_error *error) {
+  return owned_grant(head, budget, base, desired, 1, out, found, error);
+}
+int ps_owned_capture_piece(ps_owned_head *head, uint64_t base, int keep_bytes,
+                           ps_owned_run **out, lc_error *error) {
+  int found;
+  int rc = owned_grant(head, NULL, base, 0, keep_bytes, out, &found, error);
+  if (rc == LC_OK && !found)
+    rc = err(error, LC_ERR_PENDING, "captured piece mapping changed");
   return rc;
 }
 uint64_t ps_owned_run_capacity(const ps_owned_run *run) {

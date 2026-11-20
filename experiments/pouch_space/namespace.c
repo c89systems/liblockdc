@@ -859,6 +859,8 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
                    lc_error *e) {
   segment *s;
   ps_catalog_view *view = NULL;
+  ps_owned_head *staged = NULL;
+  ps_ref target;
   ps_stream_info info;
   int rc;
   if (ps_ns_find(d, PS_CATALOG_SEGMENT, id))
@@ -893,18 +895,27 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
                         &s->stream, e);
     if (rc == LC_ERR_INVALID && !view) {
       lc_error_cleanup(e);
-      rc = ps_stream_open(d->ns->root->space, budget, s->binding.stream, 1,
-                          NULL, recover, s, &s->stream, e);
+      rc = ps_owned_stage_empty(d->ns->root->space, budget, s->binding.stream,
+                                &staged, &target, e);
     }
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && !staged) {
     rc = ps_stream_status(s->stream, &info, e);
-  if (rc == LC_OK && (info.tail || info.sealed))
-    rc = failure(e, LC_ERR_PROTOCOL, "staged namespace segment is not empty");
+    if (rc == LC_OK && (info.tail || info.sealed))
+      rc = failure(e, LC_ERR_PROTOCOL, "staged namespace segment is not empty");
+    if (rc == LC_OK)
+      target = info.ref;
+  }
   if (rc == LC_OK && !view)
     rc = ps_catalog_put(d->ns->root->space, budget, d->ns->identity.owner,
                         PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), NULL,
-                        s->binding.stream, &info.ref, &s->binding, e);
+                        s->binding.stream, &target, &s->binding, e);
+  if (staged) {
+    ps_owned_close(staged);
+    if (rc == LC_OK)
+      rc = ps_stream_open(d->ns->root->space, NULL, s->binding.stream, 0,
+                          &s->binding.target, recover, s, &s->stream, e);
+  }
   ps_catalog_view_close(view);
   if (rc == LC_OK) {
     ps_ns_resource_park(d, s);
@@ -1010,7 +1021,8 @@ int ps_ns_rotation_plan(struct ps_namespace_data *d, ps_budget_plan *out,
     *out = plan;
   return rc;
 }
-int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
+int ps_ns_select_successor(struct ps_namespace_data *d, ps_budget *budget,
+                           lc_error *e) {
   ps_budget_plan plan = {0};
   ps_budget *owned = NULL;
   uint64_t next;
@@ -1035,12 +1047,15 @@ int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
     d->tail = 0;
     ps_ns_find(d, PS_CATALOG_SEGMENT, next)->unselected = 0;
     pthread_mutex_unlock(&d->mutex);
-    rc = ps_ns_finish_seal(d, e);
   }
   closed = ps_budget_close(owned, rc == LC_OK ? e : NULL);
   if (rc == LC_OK)
     rc = closed;
   return rc;
+}
+int ps_ns_rotate(struct ps_namespace_data *d, ps_budget *budget, lc_error *e) {
+  int rc = ps_ns_select_successor(d, budget, e);
+  return rc == LC_OK ? ps_ns_finish_seal(d, e) : rc;
 }
 static int projection(struct ps_namespace_data *d,
                       const ps_checkpoint_info *coverage,
@@ -1327,34 +1342,6 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   } else {
     rc = failure(e, LC_ERR_INVALID,
                  "namespace rotation expected segment is stale");
-  }
-  ps_ns_leave(d);
-  return rc;
-}
-int ps_namespace_rotate_obsolete(ps_namespace *ns, uint64_t expected,
-                                 int *rotated, lc_error *e) {
-  struct ps_namespace_data *d;
-  ps_checkpoint_info coverage;
-  int eligible, rc = ps_ns_enter_checkpoint(ns, &d, e);
-  *rotated = 0;
-  if (rc != LC_OK)
-    return rc;
-  pthread_mutex_lock(&d->mutex);
-  ps_key_checkpoint_info(d->checkpoint, &coverage);
-  eligible = d->active == expected && d->tail && coverage.epoch &&
-             coverage.segment == expected && coverage.offset == d->tail &&
-             !coverage.pending &&
-             !ps_key_checkpoint_source_refs(d->checkpoint, PS_CATALOG_SEGMENT,
-                                            expected);
-  if (eligible)
-    rc = ps_ns_require_unpinned(d, e);
-  pthread_mutex_unlock(&d->mutex);
-  if (rc == LC_OK && eligible) {
-    rc = ps_ns_finish_seal(d, e);
-    if (rc == LC_OK)
-      rc = ps_ns_rotate(d, NULL, e);
-    if (rc == LC_OK)
-      *rotated = 1;
   }
   ps_ns_leave(d);
   return rc;

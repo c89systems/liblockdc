@@ -11,6 +11,7 @@ typedef struct ps_namespace_view ps_namespace_view;
 typedef struct ps_namespace_body ps_namespace_body;
 typedef struct ps_namespace_recode ps_namespace_recode;
 typedef struct ps_namespace_conversion ps_namespace_conversion;
+typedef struct ps_ns_resource ps_namespace_retirement;
 struct lc_pouch_storage_batch;
 struct lc_pouch_storage_namespace_info;
 enum ps_namespace_append_mode {
@@ -134,10 +135,15 @@ void ps_namespace_append_close(ps_namespace_append *);
  * expected is the caller's observed active segment (zero for initialization).
  * An already selected expected+1 is a successful retry, even after reopen. */
 int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
-/* Move off an active source whose complete tail is checkpointed and has no
- * live bodies. The caller retains logical namespace mutation authority. */
-int ps_namespace_rotate_obsolete(ps_namespace *, uint64_t expected,
-                                 int *rotated, lc_error *);
+/* Unlink the active source after durable cutover if the checkpoint covers
+ * its entire tail and retains no bodies. The caller holds logical namespace
+ * mutation authority. An ineligible source leaves the retirement NULL. */
+int ps_namespace_unlink_active(ps_namespace *, uint64_t expected,
+                               ps_namespace_retirement **, lc_error *);
+/* Consume a returned retirement under stream authority alone. If the stream
+ * is still busy, the namespace's regular reaper retains the pending work. */
+int ps_namespace_retire_unlinked(ps_namespace *, ps_namespace_retirement *,
+                                 lc_error *);
 int ps_namespace_parse_source_leaf(const char *, unsigned int *, uint64_t *);
 int ps_namespace_read_open(ps_namespace *, unsigned int kind, uint64_t id,
                            uint64_t offset, uint64_t bytes,

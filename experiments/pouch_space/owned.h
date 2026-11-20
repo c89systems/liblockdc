@@ -34,6 +34,11 @@ int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
 int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
                           const ps_ref *, ps_owned_head **, ps_owned_status *,
                           lc_error *);
+/* Stage an empty head for a following durable catalog binding in this space.
+ * The binding's barrier covers both records. Keep this handle until the
+ * binding returns so the shared preparation claim protects the head. */
+int ps_owned_stage_empty(ps_space *, ps_budget *, ps_key, ps_owned_head **,
+                         ps_ref *, lc_error *);
 void ps_owned_close(ps_owned_head *);
 /* Reopen an unpublished stream for preparation, such as a reserved successor
  * left by an interrupted publisher. Retain its claim until binding or close. */
@@ -70,6 +75,10 @@ int ps_owned_inspect(ps_space *, ps_key, const ps_ref *, ps_owned_status *,
  * the journal. Already durable zero space needs no preparation barrier. */
 int ps_owned_grant(ps_owned_head *, ps_budget *, uint64_t base,
                    uint64_t desired, ps_owned_run **, int *found, lc_error *);
+/* Capture the exact mapping for remap or removal. A removal uses the
+ * certified descriptor alone. Keeping bytes verifies the run identity. */
+int ps_owned_capture_piece(ps_owned_head *, uint64_t base, int keep_bytes,
+                           ps_owned_run **, lc_error *);
 uint64_t ps_owned_run_capacity(const ps_owned_run *);
 uint64_t ps_owned_run_base(const ps_owned_run *);
 int ps_owned_run_mapped(const ps_owned_run *);

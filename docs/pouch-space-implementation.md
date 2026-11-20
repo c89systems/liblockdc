@@ -12,7 +12,7 @@ Current implementation and acceptance status:
 
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
-| Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, [point-captured piece preparation](#piece-capture-through-the-allocator), bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
+| Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, [point-captured piece preparation](#piece-capture-through-the-allocator), [active-source cutover and retirement](#active-source-cutover-and-retirement), bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse), and [simultaneous-producer measurements](#stream-authority-and-segment-sizing) | Namespace handoff under simultaneous load and completion sizing for larger envelopes and concurrent terminal operations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
@@ -8685,3 +8685,83 @@ interleaved pairs all verified and produced prior/current medians of
 pairs slower. The two series leave the steady-state outbox timing
 difference uncertain. Raw results are in `build/pouch-space-concurrent/`
 under the `repack-` prefix.
+
+## Active-source cutover and retirement
+
+Namespace creation of an empty successor stages the stream head before
+publishing its catalog binding. The catalog barrier covers both records.
+The staging handle retains the preparation claim until the binding
+returns. An interruption can leave an unbound empty head for retry or
+orphan reclamation. Routing selects the successor only after its binding
+is durable.
+
+An active source qualifies for direct retirement when the selected
+checkpoint covers its entire tail, retains zero body references and has
+no captured namespace view. Maintenance switches routing, durably unlinks
+the predecessor and releases namespace authority. An in-process
+reservation keeps the unlinked source on the retirement list while the
+worker finishes under stream authority. A pending physical retirement
+stays on the list for the regular reaper. A crash before unlink can
+resume ordinary predecessor sealing. A crash after unlink can recover
+the old physical stream through orphan reclamation.
+
+The fresh-successor fixture measures three durability barriers before
+namespace handoff and one to retire the predecessor afterward. A second
+handle appends through the new route between those phases. The regular
+reaper leaves the reserved retirement alone, and an existing reader
+returns the original bytes before and after physical retirement.
+Exclusive and shared roots pass this fixture under both durability
+policies. The simulated crash sweep exercises 42 write and sync cuts
+across those four profiles and verifies the deletion and a subsequent
+append at each recovered cut.
+
+Discarding a piece with zero live ranges again uses only its certified
+allocator descriptor. The abandonment fixture checks for zero reads
+during that work. Piece preparation with live bytes verifies the run
+identity and retains the bounded payload verification from repack.
+
+Debug, GNU and musl each passed all 12 selected namespace, recovery,
+maintenance and shared-admission checks. The four alternating capacity
+profiles per build passed 10 of 12 checks. GNU and musl both refused
+ordinary capacity in the plaintext NoSync profile with the default
+segment target. The GNU failure was during cycle-six outbox work, as in
+a run before this patch. The musl failure was at the cycle-thirteen
+lease. Two interleaved Debug pairs against `ce2d4dea` all passed in that
+profile. In three more interleaved Debug plaintext durable pairs, the
+prior build passed all three and the current build passed two. The
+other run finished foreground work and timed out at 3,514,368 bytes
+allocated with pressure clear and 70 checkpoints. Earlier builds also
+reached that late-drain failure. The relative incidence is uncertain.
+
+All 12 simultaneous-producer runs verified after reopen across Debug,
+GNU and musl. These runs used an explicit 1 MiB segment target and
+streamed 18 MiB each through the fixed 10 MiB file. They recorded 33–74
+physical checkpoints over 3.46–7.96 seconds of foreground work. The
+default segment geometry and bounded reclamation after pressure clears
+remain open acceptance gates.
+
+All 72 matched GNU lifecycle samples verified after reopening. These
+runs used two shared writers, 1 MiB segment targets and disabled
+background maintenance. Each cell gives the median of six samples in
+milliseconds, ordered as prior single-file (`ce2d4dea`), current
+single-file and multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 31.89 / 31.85 / 102.08 | 12.60 / 14.36 / 20.55 | 0.31 / 0.25 / 0.08 | 6.52 / 5.08 / 0.52 | 0.37 / 0.31 / 0.60 |
+| Queue, 64 KiB durable | 378.23 / 390.12 / 444.05 | 71.34 / 84.20 / 89.90 | 0.30 / 0.33 / 0.13 | 5.52 / 7.44 / 0.58 | 0.44 / 0.63 / 0.48 |
+| Indexed state, 4 KiB NoSync | 64.19 / 69.15 / 188.26 | 1.90 / 0.98 / 25.44 | 0.64 / 0.67 / 0.29 | 7.39 / 6.77 / 0.49 | 1.04 / 1.35 / 1.60 |
+| Outbox, 64 KiB durable | 1173.70 / 1311.92 / 1606.95 | 223.76 / 269.50 / 312.71 | 0.68 / 0.54 / 0.28 | 42.74 / 56.39 / 82.22 | 73.44 / 79.56 / 163.03 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 43.04 / 45.80 / 144.54 | 21.02 / 29.79 / 33.85 | 0.40 / 0.40 / 15.61 | 0.16 / 0.19 / 17.95 |
+
+Indexed flush was slower than the prior build in all six matched pairs
+by a median 7.92 ms, with four measured flush syncs in both builds.
+Durable outbox work was slower in five of six pairs by a median 127.11 ms.
+Four additional interleaved outbox pairs all verified. The current build
+was slower in two of those pairs, with a median paired difference of
+−21.52 ms and a median paired sync-time difference of −23.55 ms. The
+steady-state outbox timing difference remains uncertain. Raw results are
+under the `rotation-` prefix in `build/pouch-space-concurrent/`.

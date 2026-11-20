@@ -277,6 +277,7 @@ static void streaming_capacity(void) {
  * This does not pretend that killing a process simulates loss of page cache. */
 typedef struct model {
   unsigned char *stable;
+  size_t stable_capacity;
   size_t stable_bytes, operations, fail_at, short_limit, reads;
   size_t writes, syncs, grants, fail_sync_at;
   uint64_t write_bytes;
@@ -349,7 +350,7 @@ static int model_sync(void *v, int fd) {
     return -1;
   }
   CHECK(fdatasync(fd) == 0);
-  CHECK(fstat(fd, &st) == 0 && st.st_size <= (off_t)(4 * PS_MIB));
+  CHECK(fstat(fd, &st) == 0 && st.st_size <= (off_t)m->stable_capacity);
   m->stable_bytes = (size_t)st.st_size;
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
   return 0;
@@ -394,12 +395,16 @@ static int model_zero(void *v, int fd, off_t offset, off_t n) {
   }
   return rc;
 }
-static ps_io model_init(model *m) {
+static ps_io model_init_capacity(model *m, size_t capacity) {
   ps_io io = {m, model_read, model_write, model_sync, model_reserve, NULL};
   memset(m, 0, sizeof(*m));
-  m->stable = malloc((size_t)(4 * PS_MIB));
+  m->stable_capacity = capacity;
+  m->stable = malloc(capacity);
   CHECK(m->stable != NULL);
   return io;
+}
+static ps_io model_init(model *m) {
+  return model_init_capacity(m, (size_t)(4 * PS_MIB));
 }
 static void crash(model *m) {
   int fd = open(path, O_RDWR | O_TRUNC);
@@ -7452,6 +7457,14 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "namespace-tail-concurrency") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         namespace_tail_concurrency(durable);
+    } else if (strcmp(argv[2], "namespace-active-retirement") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int shared = 0; shared < 2; ++shared)
+          namespace_active_retirement(durable, shared);
+    } else if (strcmp(argv[2], "namespace-active-retirement-faults") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        for (int shared = 0; shared < 2; ++shared)
+          namespace_active_retirement_faults(durable, shared);
     } else if (strcmp(argv[2], "standing-prefix") == 0) {
       standing_bound();
       for (int durable = 0; durable < 2; ++durable)
