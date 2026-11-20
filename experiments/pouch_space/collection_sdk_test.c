@@ -4,8 +4,10 @@
 #include "collection_segment.h"
 #include "collection_transform.h"
 #include "collection_walk.h"
+#include "collections.h"
 #include "lc_collection_internal.h"
 #include "lc_collection_query.h"
+#include "namespace_work.h"
 #include "owned.h"
 #include "pouch.h"
 #include "pouch_internal.h"
@@ -26,6 +28,50 @@ static char *key;
 static char scenario[192];
 static int diagnostic;
 static int query_mode;
+static int shared_catalog_mode;
+static pthread_mutex_t catalog_cut_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t catalog_cut_changed = PTHREAD_COND_INITIALIZER;
+static int catalog_cut_state;
+static off_t catalog_cut_offset;
+static int catalog_lock(void *context, int fd, int cmd, struct flock *lock) {
+  int pause = 0, rc;
+  (void)context;
+  if (cmd == F_OFD_SETLKW && lock->l_type == F_WRLCK) {
+    pthread_mutex_lock(&catalog_cut_mutex);
+    if (catalog_cut_state == 1 && lock->l_start >= PS_READINESS_OFFSET &&
+        lock->l_start < PS_READINESS_OFFSET + 254U) {
+      catalog_cut_offset = lock->l_start;
+      catalog_cut_state = 2;
+      pause = 1;
+    } else if (catalog_cut_state == 3 && lock->l_start == catalog_cut_offset) {
+      catalog_cut_state = 4;
+      pthread_cond_broadcast(&catalog_cut_changed);
+    }
+    pthread_mutex_unlock(&catalog_cut_mutex);
+  }
+  rc = fcntl(fd, cmd, lock);
+  if (!rc && pause) {
+    pthread_mutex_lock(&catalog_cut_mutex);
+    catalog_cut_state = 3;
+    pthread_cond_broadcast(&catalog_cut_changed);
+    while (catalog_cut_state < 5)
+      pthread_cond_wait(&catalog_cut_changed, &catalog_cut_mutex);
+    pthread_mutex_unlock(&catalog_cut_mutex);
+  }
+  return rc;
+}
+int __real_ps_coordination_open(int, const ps_coordination_options *,
+                                ps_coordination **, lc_error *);
+int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
+                                ps_coordination **out, lc_error *e) {
+  const ps_coordination_io io = {NULL, catalog_lock};
+  ps_coordination_options selected = *options;
+  if (shared_catalog_mode) {
+    selected.shared = 1;
+    selected.io = &io;
+  }
+  return __real_ps_coordination_open(fd, &selected, out, e);
+}
 static int allocation_armed, allocation_fired;
 static size_t allocation_calls, allocation_fail;
 static pthread_t allocation_thread;
@@ -225,6 +271,99 @@ static void reopen(fixture *f) {
   open_client(f, 0);
   open_collection(f, 0, &f->collection);
   open_collection(f, 0, &f->peer);
+}
+typedef struct catalog_creator {
+  lc_client *client;
+  lc_collection *collection;
+  lc_error error;
+  int rc;
+} catalog_creator;
+static void *catalog_create(void *context) {
+  catalog_creator *creator = context;
+  lc_collection_config config;
+  lc_collection_config_init(&config);
+  config.name = "contended";
+  lc_error_init(&creator->error);
+  creator->rc = lc_client_create_collection(
+      creator->client, &config, &creator->collection, &creator->error);
+  return NULL;
+}
+static void catalog_wait(int state) {
+  struct timespec deadline;
+  REQUIRE(!clock_gettime(CLOCK_REALTIME, &deadline));
+  deadline.tv_sec += 15;
+  pthread_mutex_lock(&catalog_cut_mutex);
+  while (catalog_cut_state < state)
+    REQUIRE(!pthread_cond_timedwait(&catalog_cut_changed, &catalog_cut_mutex,
+                                    &deadline));
+  pthread_mutex_unlock(&catalog_cut_mutex);
+}
+static void shared_catalog(const char *directory, int codec, int sync) {
+  fixture f;
+  catalog_creator first = {0}, second = {0};
+  lc_collection_config config;
+  lc_collection *other = NULL;
+  lc_pouch_maintenance_options options = {0};
+  lc_pouch *peer;
+  ps_root *root;
+  ps_namespace *ns = NULL;
+  pthread_t a, b;
+  int present;
+  setup(&f, directory, codec, sync, 0);
+  first.client = f.client;
+  ok(ps_pouch_client_open(&f.config, 0, NULL, &second.client, &f.error),
+     &f.error);
+  peer = ((lc_client_handle *)second.client)->pouch;
+  root = ps_pouch_state_root(peer);
+  lc_collection_config_init(&config);
+  config.ns = "independent";
+  config.name = "other";
+  pthread_mutex_lock(&catalog_cut_mutex);
+  catalog_cut_state = 1;
+  pthread_mutex_unlock(&catalog_cut_mutex);
+  REQUIRE(!pthread_create(&a, NULL, catalog_create, &first));
+  catalog_wait(3);
+  REQUIRE(!pthread_create(&b, NULL, catalog_create, &second));
+  catalog_wait(4);
+  ok(lc_client_create_collection(f.client, &config, &other, &f.error),
+     &f.error);
+  pthread_mutex_lock(&catalog_cut_mutex);
+  catalog_cut_state = 5;
+  pthread_cond_broadcast(&catalog_cut_changed);
+  pthread_mutex_unlock(&catalog_cut_mutex);
+  REQUIRE(!pthread_join(a, NULL) && !pthread_join(b, NULL));
+  ok(first.rc, &first.error);
+  REQUIRE(second.rc == LC_ERR_INVALID && !second.collection &&
+          second.error.server_code &&
+          !strcmp(second.error.server_code, "collection_exists"));
+  clear(&first.error);
+  clear(&second.error);
+  lc_collection_close(other);
+  ok(lc_collection_drop(first.collection, &f.error), &f.error);
+  lc_collection_close(first.collection);
+  ok(lc_collection_drop(f.collection, &f.error), &f.error);
+  lc_collection_close(f.collection);
+  lc_collection_close(f.peer);
+  f.collection = f.peer = NULL;
+  options.ns = "journal";
+  options.cleanup_only = 1;
+  ok(ps_collection_maintenance_run(root, peer, &options, NULL, &f.error),
+     &f.error);
+  ok(ps_root_namespace_acquire(root, options.ns, 0, &ns, &f.error), &f.error);
+  ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_COLLECTION, &present,
+                           &f.error),
+     &f.error);
+  REQUIRE(!present);
+  open_collection(&f, 1, &f.collection);
+  ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_COLLECTION, &present,
+                           &f.error),
+     &f.error);
+  REQUIRE(present);
+  ps_namespace_release(ns);
+  lc_client_close(second.client);
+  reopen(&f);
+  close_store(&f);
+  lc_error_cleanup(&f.error);
 }
 static unsigned char byte_at(uint64_t at, uint64_t size) {
   static const char prefix[] = "{\"blob\":\"";
@@ -1688,6 +1827,7 @@ int main(int argc, char **argv) {
       (argc == 3 && !strcmp(argv[2], "root-conversion-growth")) ||
       (argc == 5 &&
        (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+        !strcmp(argv[2], "shared-catalog") ||
         !strcmp(argv[2], "root-conversion-faults") ||
         !strcmp(argv[2], "root-conversion-controls") ||
         !strcmp(argv[2], "root-conversion-crash") ||
@@ -1717,7 +1857,10 @@ int main(int argc, char **argv) {
   } else if (argc == 5) {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strcmp(argv[2], "root-conversion-faults")) {
+    if (!strcmp(argv[2], "shared-catalog")) {
+      shared_catalog_mode = 1;
+      shared_catalog(directory, codec, sync);
+    } else if (!strcmp(argv[2], "root-conversion-faults")) {
       root_conversion_faults(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-controls")) {
       root_conversion_controls(directory, codec, sync);

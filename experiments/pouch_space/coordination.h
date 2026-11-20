@@ -16,7 +16,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_STREAM,
   PS_COORDINATION_NAMESPACE_VIEW,
   PS_COORDINATION_NAMESPACE_STATE,
-  PS_COORDINATION_CONTROL_STATE
+  PS_COORDINATION_CONTROL_STATE,
+  PS_COORDINATION_COLLECTION_CATALOG
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -70,6 +71,8 @@ int ps_coordination_shared(const ps_coordination *);
  * Control state uses dedicated bytes for the transaction and XA ledgers.
  * Acquire XID authority first when needed. Ledger callbacks operate on their
  * own projection and release it before acquiring participant authority.
+ * Collection catalog guards key on the durable namespace identity. Acquire
+ * before changing a collection name or the namespace's collection work hint.
  * wait=0 returns PENDING on contention, with NULL output. No root/registry
  * mutex spans waiting. Guards are nonrecursive. Independent identities may
  * finish while another guard waits.

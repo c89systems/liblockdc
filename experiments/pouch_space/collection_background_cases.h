@@ -224,21 +224,21 @@ static void background_discovery(const char *directory, int codec, int sync) {
   ps_root *root = client_root(&f);
   ok(ps_root_namespace_acquire(root, "cold/\303\245", 0, &ns, &f.error),
      &f.error);
-  struct ps_namespace_data *recovered = ns->data;
-  REQUIRE(recovered && !ns->collections);
+  /* Root recovery discards empty ordinary state for a collection-only
+   * namespace. Discovering either work class must leave that state cold. */
+  REQUIRE(!ns->data && !ns->collections);
   ok(lc_collection_maintenance_next(fixture_pouch(&f), NULL, &name, &cursor,
                                     &f.error),
      &f.error);
-  REQUIRE(name && !strcmp(name, "cold/\303\245") && cursor &&
-          ns->data == recovered && !ns->collections);
+  REQUIRE(name && !strcmp(name, "cold/\303\245") && cursor && !ns->data &&
+          !ns->collections);
   lc_free_with_allocator(NULL, name);
   lc_free_with_allocator(NULL, cursor);
   name = cursor = NULL;
   ok(ps_namespace_work_next(root, NULL, LC_POUCH_STORAGE_WORK_ORDINARY, NULL,
                             &name, &cursor, &f.error),
      &f.error);
-  REQUIRE(name && !strcmp(name, "ordinary") && ns->data == recovered &&
-          !ns->collections);
+  REQUIRE(name && !strcmp(name, "ordinary") && !ns->data && !ns->collections);
   lc_free_with_allocator(NULL, name);
   lc_free_with_allocator(NULL, cursor);
   ps_namespace_release(ns);

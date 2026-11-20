@@ -642,17 +642,20 @@ static void processes(const char *self) {
   file_create();
   lc_error e;
   const enum ps_coordination_domain domains[] = {
-      PS_COORDINATION_PUBLICATION,  PS_COORDINATION_RECOVERY,
-      PS_COORDINATION_ALLOCATION,   PS_COORDINATION_SYNC,
-      PS_COORDINATION_TRANSACTION,  PS_COORDINATION_NAMESPACE,
-      PS_COORDINATION_CONTROL_STATE};
+      PS_COORDINATION_PUBLICATION,   PS_COORDINATION_RECOVERY,
+      PS_COORDINATION_ALLOCATION,    PS_COORDINATION_SYNC,
+      PS_COORDINATION_TRANSACTION,   PS_COORDINATION_NAMESPACE,
+      PS_COORDINATION_CONTROL_STATE, PS_COORDINATION_COLLECTION_CATALOG};
   lc_error_init(&e);
   for (size_t i = 0; i < sizeof(domains) / sizeof(*domains); ++i)
     for (int abrupt = 0; abrupt < 2; ++abrupt) {
       enum ps_coordination_domain domain = domains[i];
       ps_coordination *owner = owner_open(1, NULL, &e);
       ps_coordination_guard *guard = NULL, *busy = NULL;
-      uint64_t identity = domain == PS_COORDINATION_NAMESPACE ? UINT64_MAX : 0;
+      uint64_t identity = domain == PS_COORDINATION_NAMESPACE ||
+                                  domain == PS_COORDINATION_COLLECTION_CATALOG
+                              ? UINT64_MAX
+                              : 0;
       ok(ps_coordination_lock(owner, domain, identity, 0, &guard, &e), &e);
       int ready[2], command[2], status;
       REQUIRE(!pipe(ready) && !pipe(command));

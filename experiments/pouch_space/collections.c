@@ -92,6 +92,37 @@ static void gate_destroy(collection_gate *gate) {
 static ps_space *space(ps_collection_owner *owner) {
   return owner->ns->root->space;
 }
+static int catalog_enter(ps_namespace *ns, int wait, void **pin, lc_error *e) {
+  ps_coordination *coordination = ps_space_coordination(ns->root->space);
+  ps_coordination_guard *guard = NULL;
+  int rc;
+  *pin = NULL;
+  if (ps_coordination_shared(coordination)) {
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_COLLECTION_CATALOG,
+                              ns->identity.owner, wait, &guard, e);
+    *pin = guard;
+    return rc;
+  }
+  rc = wait ? pthread_mutex_lock(&ns->collection_catalog)
+            : pthread_mutex_trylock(&ns->collection_catalog);
+  if (rc != 0)
+    return failure(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, NULL,
+                   "cannot enter collection catalog authority");
+  *pin = &ns->collection_catalog;
+  return LC_OK;
+}
+static void catalog_leave(ps_namespace *ns, void *pin) {
+  if (pin == &ns->collection_catalog)
+    pthread_mutex_unlock(&ns->collection_catalog);
+  else
+    ps_coordination_unlock(pin);
+}
+static int catalog_end(ps_namespace *ns, void *pin, int rc, lc_error *e) {
+  catalog_leave(ns, pin);
+  if (rc == LC_OK && pin && pin != &ns->collection_catalog)
+    rc = ps_check(ns->root->space, e);
+  return rc;
+}
 static ps_key key_for(ps_collection_owner *owner, uint64_t id) {
   ps_key key;
   key.owner = owner->numeric;
@@ -656,8 +687,7 @@ static int lock_enter(void *context, enum lc_collection_authority_kind kind,
     return rc;
   switch (kind) {
   case LC_COLLECTION_AUTH_CATALOG:
-    mutex = &owner->ns->collection_catalog;
-    break;
+    return catalog_enter(owner->ns, wait, pin, e);
   case LC_COLLECTION_AUTH_APPEND:
     mutex = &owner->append;
     break;
@@ -719,8 +749,9 @@ static void lock_leave(void *context, enum lc_collection_authority_kind kind,
       kind == LC_COLLECTION_AUTH_READERS || kind == LC_COLLECTION_AUTH_COMMIT ||
       kind == LC_COLLECTION_AUTH_COMPACTION)
     gate_leave(pin);
-  else if (kind == LC_COLLECTION_AUTH_CATALOG ||
-           kind == LC_COLLECTION_AUTH_APPEND)
+  else if (kind == LC_COLLECTION_AUTH_CATALOG)
+    catalog_leave(((ps_collection_owner *)context)->ns, pin);
+  else if (kind == LC_COLLECTION_AUTH_APPEND)
     pthread_mutex_unlock(pin);
   else
     pthread_rwlock_unlock(pin);
@@ -1301,6 +1332,7 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
   ps_owned_status status;
   lc_collection_disk_head head;
   collection_receiver temporary;
+  void *catalog;
   int found = 0, rc;
   *out = NULL;
   rc = ps_root_namespace_acquire(root, ns_name, create, &ns, e);
@@ -1310,9 +1342,10 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
                    "collection does not exist");
   if (rc != LC_OK)
     return rc;
-  pthread_mutex_lock(&ns->collection_catalog);
-  rc = ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
-                      config->name, strlen(config->name), &view, e);
+  rc = catalog_enter(ns, 1, &catalog, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
+                        config->name, strlen(config->name), &view, e);
   if (rc == LC_OK && view) {
     rc = ps_catalog_view_info(view, &info, e);
     if (rc == LC_OK)
@@ -1367,7 +1400,11 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
   }
   if (owner)
     owner_release(owner);
-  pthread_mutex_unlock(&ns->collection_catalog);
+  rc = catalog_end(ns, catalog, rc, e);
+  if (rc != LC_OK && *out) {
+    (*out)->close(*out);
+    *out = NULL;
+  }
   if (rc == LC_OK && !found)
     lc_pouch_compaction_note_mutation(logical->pouch, ns_name, 0);
   ps_namespace_release(ns);
@@ -1424,6 +1461,7 @@ int ps_collection_client_visit(ps_root *root, lc_client *client,
   lc_collection_info info;
   lc_collection_call scope;
   lc_collection_guard guard;
+  void *catalog;
   size_t i;
   int rc;
   memset(&list, 0, sizeof(list));
@@ -1438,10 +1476,12 @@ int ps_collection_client_visit(ps_root *root, lc_client *client,
     rc = LC_OK;
   }
   if (rc == LC_OK && list.ns) {
-    pthread_mutex_lock(&list.ns->collection_catalog);
-    rc = ps_catalog_visit(root->space, list.ns->identity.owner,
-                          PS_CATALOG_COLLECTION, capture_collection, &list, e);
-    pthread_mutex_unlock(&list.ns->collection_catalog);
+    rc = catalog_enter(list.ns, 1, &catalog, e);
+    if (rc == LC_OK)
+      rc =
+          ps_catalog_visit(root->space, list.ns->identity.owner,
+                           PS_CATALOG_COLLECTION, capture_collection, &list, e);
+    rc = catalog_end(list.ns, catalog, rc, e);
   }
   lc_collection_root_end(&scope, &guard);
   if (rc == LC_OK && list.count > 1U)
@@ -1510,12 +1550,14 @@ static int maintenance_admit(ps_namespace *ns, lc_pouch *pouch,
   ps_catalog_view *view = NULL;
   ps_catalog_info current;
   ps_collection_owner *owner = NULL;
+  void *catalog;
   int rc;
   *out = NULL;
-  pthread_mutex_lock(&ns->collection_catalog);
-  rc =
-      ps_catalog_get(ns->root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
-                     item->name, strlen(item->name), &view, e);
+  rc = catalog_enter(ns, 1, &catalog, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_get(ns->root->space, ns->identity.owner,
+                        PS_CATALOG_COLLECTION, item->name, strlen(item->name),
+                        &view, e);
   if (rc == LC_OK && view)
     rc = ps_catalog_view_info(view, &current, e);
   if (rc == LC_OK && view &&
@@ -1523,9 +1565,11 @@ static int maintenance_admit(ps_namespace *ns, lc_pouch *pouch,
       same_ref(&current.target, &item->identity.target))
     rc = load_owner(ns, item->name, &current, &pouch->allocator, &owner, e);
   ps_catalog_view_close(view);
-  pthread_mutex_unlock(&ns->collection_catalog);
+  rc = catalog_end(ns, catalog, rc, e);
   if (rc == LC_OK && owner)
     rc = receiver_open(owner, pouch, NULL, out, e);
+  else if (owner)
+    owner_release(owner);
   return rc;
 }
 static int count_binding(void *context, const void *name, size_t length,
@@ -1548,6 +1592,7 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   lc_error local, first;
   uint64_t reclaimed, skipped;
   size_t i;
+  void *catalog;
   int present = 0, pending = 0, dropped, rc, first_rc;
   memset(&list, 0, sizeof(list));
   list.allocator = &pouch->allocator;
@@ -1568,10 +1613,11 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   /* A durable catalog prefix, not the resident receiver cache, selects work.
    * Capture only names/identities; one corrupt receiver cannot hide its peers.
    */
-  pthread_mutex_lock(&ns->collection_catalog);
-  rc = ps_catalog_visit(root->space, ns->identity.owner, PS_CATALOG_COLLECTION,
-                        capture_maintenance, &list, e);
-  pthread_mutex_unlock(&ns->collection_catalog);
+  rc = catalog_enter(ns, 1, &catalog, e);
+  if (rc == LC_OK)
+    rc = ps_catalog_visit(root->space, ns->identity.owner,
+                          PS_CATALOG_COLLECTION, capture_maintenance, &list, e);
+  rc = catalog_end(ns, catalog, rc, e);
   lc_error_init(&local);
   lc_error_init(&first);
   first_rc = rc;
@@ -1610,16 +1656,17 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   if (first_rc == LC_OK) {
     rc = ps_root_reclaim_orphans(root, &reclaimed, &skipped, &local);
     if (rc == LC_OK) {
-      pthread_mutex_lock(&ns->collection_catalog);
-      rc = ps_catalog_visit(root->space, ns->identity.owner,
-                            PS_CATALOG_COLLECTION, count_binding, &present,
-                            &local);
+      rc = catalog_enter(ns, 1, &catalog, &local);
+      if (rc == LC_OK)
+        rc = ps_catalog_visit(root->space, ns->identity.owner,
+                              PS_CATALOG_COLLECTION, count_binding, &present,
+                              &local);
       if (rc == LC_OK)
         rc = ps_catalog_orphans_pending(root->space, &pending, &local);
       if (rc == LC_OK && !present && !pending)
         rc = ps_namespace_work_remove(ns, LC_POUCH_STORAGE_WORK_COLLECTION,
                                       &local);
-      pthread_mutex_unlock(&ns->collection_catalog);
+      rc = catalog_end(ns, catalog, rc, &local);
     }
     if (rc == LC_OK && pending && out)
       ++out->cleanup_pending_count;

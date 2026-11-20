@@ -18,6 +18,7 @@
 #define VIEW_BASE (PS_METADATA_START - VIEW_SLOTS)
 #define STATE_BASE (PS_READINESS_OFFSET + 256U)
 #define STATE_SLOTS (VIEW_BASE - STATE_BASE)
+#define COLLECTION_CATALOG_SLOTS (STATE_BASE - PS_READINESS_OFFSET - 2U)
 struct ps_coordination_guard {
   ps_coordination *owner;
   pthread_mutex_t mutex;
@@ -244,6 +245,8 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
   identity ^= identity >> 33;
   identity *= UINT64_C(0xff51afd7ed558ccd);
   identity ^= identity >> 33;
+  if (domain == PS_COORDINATION_COLLECTION_CATALOG)
+    return PS_READINESS_OFFSET + identity % COLLECTION_CATALOG_SLOTS;
   if (domain == PS_COORDINATION_STREAM)
     return STREAM_BASE + identity % (TXN_BASE - STREAM_BASE);
   if (domain == PS_COORDINATION_NAMESPACE_VIEW)
@@ -390,7 +393,7 @@ int ps_coordination_lock(ps_coordination *owner,
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_CONTROL_STATE ||
+      domain > PS_COORDINATION_COLLECTION_CATALOG ||
       (domain >= PS_COORDINATION_STREAM &&
        domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||

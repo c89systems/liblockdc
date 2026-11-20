@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), and [bounded quarantine rechecks](#bounded-quarantine-rechecks) | Collection authority, shared capacity and throughput, and normal shared admission |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), and [collection catalog authority](#shared-collection-catalog-authority) | Collection publication and reader handoff, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7567,3 +7567,40 @@ Shared NoSync work still took 34% longer in both. Collection authority,
 fixed-capacity destructive maintenance with peers, and broader acceptance
 across lease, queue, and indexed workloads remain open. Raw runs and test
 logs are in `build/pouch-space-inline-markers/`.
+
+## Shared collection catalog authority
+
+Shared collection name operations and maintenance use OFD catalog authority
+keyed by the durable namespace identity. The same scope covers creation,
+logical drop, binding admission, inventory for maintenance, and the final
+empty-catalog check before removing the collection work hint. Mutation scopes
+also preserve the local receiver cache's identity. Exclusive roots use the
+resident namespace mutex. The shared catalog uses 254 lock bytes in the
+readiness page. Namespaces sharing a byte serialize catalog operations.
+
+Creation rechecks the durable work hint under that scope. A previously
+active owner can recreate a collection after a peer removed the namespace's
+last hint, even when the creator cached the earlier hint as present.
+
+The SDK fixture pauses a creator after kernel acquisition. A competing
+creator on an independently opened root reaches the blocking acquisition.
+A collection in another namespace is created while the first scope is held.
+On release, exactly one contender publishes and the other receives
+`collection_exists`. The fixture then removes the last collection, lets a
+peer clear the work hint, recreates the collection from the first owner,
+and verifies reopen. It runs plaintext and encrypted/compressed profiles
+under both durability policies. The coordination fixture verifies guard
+handoff between exec'd processes, including abrupt holder exit.
+
+The 23 selected coordination, collection, query, and maintenance groups
+passed on Debug, GNU release, and musl release. Debug qualification also
+corrected the discovery fixture to assert that a collection-only namespace
+stays cold after open and work discovery. Root recovery has discarded empty
+ordinary-state receivers since `10313575`. Logs are in
+`build/pouch-space-shared-catalog/`.
+
+The root-wide orphan pass still relies on local stream ownership while a
+peer can be preparing an unpublished collection tree. Shared maintenance
+requires a publication claim visible to that pass. Collection append handoff
+also requires fresh canonical tail and run mappings, and obsolete snapshot
+reclamation requires cross-process reader lifetime evidence.

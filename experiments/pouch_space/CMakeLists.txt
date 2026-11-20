@@ -444,6 +444,7 @@ if(LOCKDC_BUILD_TESTS)
   target_compile_definitions(pouch_space_collection_sdk_test PRIVATE LOCKDC_TEST_BUILD=1)
   target_link_libraries(pouch_space_collection_sdk_test PRIVATE pouch_space_test_experiment)
   target_link_options(pouch_space_collection_sdk_test PRIVATE
+    "LINKER:--wrap=ps_coordination_open"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_collection_sdk_test)
@@ -459,6 +460,10 @@ if(LOCKDC_BUILD_TESTS)
         COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-faults ${codec} ${sync})
       set_tests_properties(pouch_space_root_conversion-faults_${codec}_${sync} PROPERTIES TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       if(codec EQUAL 0 OR codec EQUAL 3)
+        add_test(NAME pouch_space_collection_shared-catalog_${codec}_${sync}
+          COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} shared-catalog ${codec} ${sync})
+        set_tests_properties(pouch_space_collection_shared-catalog_${codec}_${sync} PROPERTIES
+          TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
         add_test(NAME pouch_space_root_conversion-crash_${codec}_${sync}
           COMMAND pouch_space_collection_sdk_test ${CMAKE_CURRENT_BINARY_DIR} root-conversion-crash ${codec} ${sync})
         set_tests_properties(pouch_space_root_conversion-crash_${codec}_${sync} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

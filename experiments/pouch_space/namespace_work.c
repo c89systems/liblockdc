@@ -83,12 +83,15 @@ int ps_namespace_work_ensure(ps_namespace *ns,
                    "invalid maintenance hint admission class");
   bit = 1U << (unsigned int)kind;
   pthread_mutex_lock(&ns->maintenance);
-  if (!(ns->work_loaded & bit)) {
+  /* Shared collection name publication and hint removal take the namespace's
+   * collection catalog authority. A peer may have cleared our cached hint. */
+  if (!(ns->work_loaded & bit) ||
+      (kind == LC_POUCH_STORAGE_WORK_COLLECTION &&
+       ps_coordination_shared(ps_space_coordination(ns->root->space)))) {
     rc = ps_namespace_work_get(ns, kind, &present, e);
     if (rc == LC_OK) {
       ns->work_loaded |= bit;
-      if (present)
-        ns->work_present |= bit;
+      ns->work_present = (ns->work_present & ~bit) | (present ? bit : 0U);
     }
   }
   if (rc == LC_OK && !(ns->work_present & bit)) {
