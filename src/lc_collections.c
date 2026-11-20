@@ -172,10 +172,10 @@ int lc_collection_capture_enter(lc_collection_handle *collection,
       lc_cc_commit_leave(pin);
       break;
     }
-    /* A shared reader may have skipped repair because a peer owns APPEND.
-     * Select the current topology under metadata authority before resolving
-     * any bindings. Older bindings may already have been reclaimed. */
-    if (collection->segments.replay)
+    /* A container receiver may have skipped repair because another receiver
+     * owns APPEND. Select the current topology under metadata authority before
+     * resolving bindings, including on roots with exclusive file ownership. */
+    if (collection->pouch->storage.ops)
       rc = lc_collection_head_read(collection, error);
     if (rc == LC_OK)
       rc = lc_cc_order_refresh(collection, error);
