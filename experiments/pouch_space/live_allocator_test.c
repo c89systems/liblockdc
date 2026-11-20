@@ -4253,23 +4253,25 @@ static void *finish_stream_append(void *context) {
   return NULL;
 }
 typedef struct piece_handoff {
-  ps_space *peer;
-  uint64_t stream;
+  ps_coordination_guard *peer_edit;
   int entered;
 } piece_handoff;
 static int admit_peer_before_piece_selection(void *context,
                                              ps_piece_publish_fn publish,
                                              void *publication, lc_error *e) {
   piece_handoff *handoff = context;
-  ps_coordination_guard *guard = NULL;
-  /* The private copy has been prepared. The selector can wait for
-   * namespace authority without blocking a peer at the stream edit gate. */
-  ok(ps_coordination_lock(ps_space_coordination(handoff->peer),
-                          PS_COORDINATION_STREAM, handoff->stream, 0, &guard,
-                          e),
-     e);
-  ps_coordination_unlock(guard);
+  REQUIRE(handoff->peer_edit);
+  ps_coordination_unlock(handoff->peer_edit);
+  handoff->peer_edit = NULL;
   ++handoff->entered;
+  return publish(publication, e);
+}
+static int replace_piece_before_selection(void *context,
+                                          ps_piece_publish_fn publish,
+                                          void *publication, lc_error *e) {
+  ps_stream *peer = context;
+  ps_owned_range live = {0, 5};
+  ok(ps_stream_piece_repack(peer, 0, NULL, &live, 1, NULL, NULL, e), e);
   return publish(publication, e);
 }
 static void stream_handoff(int durable) {
@@ -4322,7 +4324,7 @@ static void stream_handoff(int durable) {
   lc_error_cleanup(&e);
   ps_owned_range retained = {0, 5};
   REQUIRE(ps_stream_piece_repack(y, 0, NULL, &retained, 1, NULL, NULL, &e) ==
-          LC_ERR_PENDING);
+          LC_ERR_INVALID);
   lc_error_cleanup(&e);
   ok(ps_stream_window_read(old, 0, &byte, 1, &e), &e);
   REQUIRE(byte == 'a');
@@ -4361,11 +4363,19 @@ static void stream_handoff(int durable) {
   lc_error_cleanup(&e);
   ok(ps_stream_status(y, &info, &e), &e);
   REQUIRE(info.sealed && info.tail == 5);
-  piece_handoff handoff = {a, info.ref.incarnation, 0};
+  piece_handoff handoff = {0};
+  /* The peer holds edit authority until the private copy reaches selection. */
+  ok(ps_coordination_lock(ps_space_coordination(a), PS_COORDINATION_STREAM,
+                          info.ref.incarnation, 0, &handoff.peer_edit, &e),
+     &e);
   ok(ps_stream_piece_repack(y, 0, NULL, &retained, 1,
                             admit_peer_before_piece_selection, &handoff, &e),
      &e);
-  REQUIRE(handoff.entered == 1);
+  REQUIRE(handoff.entered == 1 && !handoff.peer_edit);
+  REQUIRE(ps_stream_piece_repack(y, 0, NULL, &retained, 1,
+                                 replace_piece_before_selection, x,
+                                 &e) == LC_ERR_PENDING);
+  lc_error_cleanup(&e);
   ok(ps_stream_window_read(old, 0, &byte, 1, &e), &e);
   REQUIRE(byte == 'a');
   ps_stream_window_close(old);

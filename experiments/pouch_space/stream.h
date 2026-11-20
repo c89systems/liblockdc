@@ -20,9 +20,10 @@ typedef struct ps_stream_piece_info {
   int mapped;
 } ps_stream_piece_info;
 /* Present pieces only, in logical order. cursor may address a historical hole.
- * Remapping excludes another remapper/structural transition but not an append
- * into a later unfinished piece. The selector reacquires canonical liveness
- * authority after copying and validates its capture before publication.
+ * Remapping excludes local remappers and structural transitions. Preparation
+ * pins a completed mapping while appenders retain access to later pieces.
+ * The selector acquires canonical liveness and stream edit authority after
+ * copying and validates its capture before publication.
  * Ranges are relative to the piece. */
 int ps_stream_piece_next(ps_stream *, uint64_t cursor, ps_stream_piece_info *,
                          int *found, lc_error *);

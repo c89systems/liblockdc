@@ -598,11 +598,8 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
                            ps_piece_select_fn select, void *context,
                            lc_error *error) {
   ps_owned_run *old = NULL;
-  ps_coordination_guard *edit = NULL;
-  ps_owned_status status;
   stream_piece_selection selection = {0};
-  size_t at;
-  int rc, continued;
+  int rc, found;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
                         "piece replacement requires owner");
@@ -616,24 +613,14 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     return rc;
-  rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
-  if (rc == LC_OK && edit)
-    rc = stream_refresh_edit(s, &status, continued, 0, error);
-  pthread_mutex_lock(&s->mutex);
-  at = mapping_lower(s->runs, s->count, base);
-  if (rc == LC_OK && (at == s->count || s->runs[at].base != base))
-    rc = stream_error(error, LC_ERR_INVALID,
+  /* The allocator selects and pins an exact mapping at the certified
+   * prefix. Keep the writer's stamp and resident append state intact.
+   * Publication checks this predecessor under namespace and stream
+   * authority after the private copy is complete. */
+  rc = ps_owned_grant(s->head, NULL, base, 0, &old, &found, error);
+  if (rc == LC_OK && !found)
+    rc = stream_error(error, LC_ERR_PENDING,
                       "piece replacement is no longer selected");
-  if (rc == LC_OK) {
-    old = s->runs[at].handle;
-    ps_owned_run_retain(old);
-  }
-  pthread_mutex_unlock(&s->mutex);
-  /* Completed or sealed pieces are immutable and the old run stays pinned.
-   * The selector must take namespace authority before reacquiring the edit
-   * guard. Carrying that guard through the private copy reverses the order
-   * used by an appender in the same namespace. */
-  rc = ps_owned_edit_end(s->head, edit, rc, error);
   selection.stream = s;
   selection.base = base;
   selection.select = select;

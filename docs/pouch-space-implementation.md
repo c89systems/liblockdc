@@ -12,7 +12,7 @@ Current implementation and acceptance status:
 
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
-| Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
+| Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, [point-captured piece preparation](#piece-capture-through-the-allocator), bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse), and [simultaneous-producer measurements](#stream-authority-and-segment-sizing) | Namespace handoff under simultaneous load and completion sizing for larger envelopes and concurrent terminal operations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
@@ -8618,3 +8618,70 @@ Durable outbox work was slower than the prior single-file build in three
 of six pairs. The median paired difference was +40.37 ms, with individual
 differences spanning −334.36 to +358.05 ms. Raw runs, timing and fault
 logs are in `build/pouch-space-concurrent/`.
+
+## Piece capture through the allocator
+
+On `96885b4e`, the two-producer GNU probe reproduced an encrypted and
+compressed NoSync refusal at an exact stream lock address while the
+maintenance worker was repacking. Preparing a piece previously took the
+stream edit lock and could run the append-owner refresh. That refresh
+could change the writer stamp and materialize the full mapping directory.
+
+Preparation now looks up the exact logical piece under certified allocator
+capture. The run handle pins its physical mapping through verification and
+the bounded copy. This path leaves the append stamp and resident append
+state alone. Selection still runs under canonical liveness and stream
+edit authority. Publication compares the exact predecessor and updates the
+resident mapping before releasing edit authority.
+
+The deterministic handoff case holds a peer's edit lock from before copy
+admission until the selector runs. The selector releases that lock and
+publishes. In a second case, a peer commits another replacement between
+preparation and selection. Publication returns `PENDING`, and a previously
+captured reader still returns the old bytes. Both durability policies
+exercise this order and verify the selected body after reopen.
+
+Four of five initial GNU workload runs completed with the 1 MiB target.
+The remaining run returned `PENDING` on the namespace state lock for
+`writer-b`. Timing instrumentation observed worker holds as long as
+80 ms. Call stacks from a separate trace attributed several of the long
+holds to obsolete active-source rotation. Rotation currently publishes
+the successor and routing, then seals the predecessor while holding
+namespace authority. One instrumented run also exhausted ordinary
+capacity. These are separate limits on the simultaneous-producer
+workload. The lock observer captured overlapping producer callbacks.
+
+The first Debug matrix reached a plaintext NoSync capacity refusal during
+outbox work in the sixth alternating cycle. The focused rerun passed, and
+three interleaved runs of each build passed. Debug, GNU and musl each passed
+the 15 selected checks, including the original alternating 10 MiB gate.
+
+All 12 final simultaneous-producer runs completed across the three
+builds with the explicit 1 MiB segment target. Each streamed 18 MiB
+through the fixed 10 MiB file, verified both retained bodies and empty
+queues after reopen, and recorded 46–73 physical checkpoints during
+4.18–8.94 seconds of work. The earlier capacity and namespace handoff
+failures keep sustained admission qualification open.
+
+All 72 matched GNU lifecycle samples verified after reopen. The samples use
+two shared writers, 1 MiB segment targets, and background maintenance
+disabled. Times are medians of six samples in milliseconds, prior
+single-file (`96885b4e`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 26.82 / 25.74 / 90.03 | 9.78 / 11.47 / 18.95 | 0.30 / 0.32 / 0.08 | 5.13 / 5.16 / 0.37 | 0.40 / 0.40 / 0.52 |
+| Queue, 64 KiB durable | 309.29 / 319.96 / 383.78 | 64.63 / 60.13 / 74.34 | 0.33 / 0.26 / 0.14 | 5.91 / 5.88 / 0.62 | 0.55 / 0.43 / 0.67 |
+| Indexed state, 4 KiB NoSync | 56.65 / 60.71 / 168.17 | 2.16 / 1.58 / 19.09 | 0.67 / 0.58 / 0.29 | 6.34 / 6.48 / 0.50 | 1.37 / 1.12 / 1.64 |
+| Outbox, 64 KiB durable | 1049.59 / 1173.46 / 1518.25 | 186.40 / 228.83 / 294.90 | 0.61 / 0.65 / 0.27 | 46.55 / 40.47 / 64.59 | 81.29 / 78.47 / 145.55 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 37.52 / 38.68 / 130.77 | 17.36 / 22.88 / 23.89 | 0.46 / 0.41 / 10.59 | 0.21 / 0.15 / 15.19 |
+
+The matched outbox work median increased by 123.87 ms. Eight further
+interleaved pairs all verified and produced prior/current medians of
+1191.91/1195.94 ms. The median paired difference was −3.69 ms, with three
+pairs slower. The two series leave the steady-state outbox timing
+difference uncertain. Raw results are in `build/pouch-space-concurrent/`
+under the `repack-` prefix.
