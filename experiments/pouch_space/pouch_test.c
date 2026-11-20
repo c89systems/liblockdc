@@ -4150,6 +4150,21 @@ static void maintenance_capacity_schedule(void) {
   REQUIRE(probe.draining);
   REQUIRE(!lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
   REQUIRE(!probe.draining);
+
+  probe.sample.pressured = 1;
+  probe.sample.available = PS_CHUNK;
+  for (i = 0; i < 33; ++i)
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 1000);
+  /* A new write can obsolete old state even when common capacity keeps
+   * falling. Renew the fast cadence as soon as this work is visible. */
+  ++probe.sample.activity;
+  probe.sample.available -= PS_PAGE;
+  REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 5);
+  for (i = 0; i < 33; ++i)
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 1000);
   free(pouch);
 }
 typedef struct maintenance_strip {

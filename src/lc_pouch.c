@@ -1230,16 +1230,16 @@ int lc_pouch_compaction_capacity_turn(lc_pouch *pouch,
                                       unsigned int *delay) {
   const lc_pouch_storage_maintenance_ops *ops = pouch->storage.ops->maintenance;
   lc_pouch_storage_capacity sample = {0};
-  int rc, run, unchanged;
+  int rc, run, unchanged, mutated;
 
   rc = ops->capacity_pressure(pouch->storage.context, state->draining, &sample,
                               NULL);
   if (rc != LC_OK && rc != LC_ERR_PENDING)
     return 0;
+  mutated = sample.activity != state->activity;
   if (sample.pressured ||
       (state->draining &&
-       (sample.activity != state->activity ||
-        (rc == LC_OK && sample.available > state->available)))) {
+       (mutated || (rc == LC_OK && sample.available > state->available)))) {
     state->draining = 1;
     state->quiet_turns = 2 * lc_pouch_compaction_source_count(pouch);
   }
@@ -1250,9 +1250,13 @@ int lc_pouch_compaction_capacity_turn(lc_pouch *pouch,
      * a pass that may park on that authority with a namespace held. */
     if (state->busy < 32)
       ++state->busy;
+    if (mutated)
+      state->stalled = 0;
   } else {
     state->busy = 0;
-    if (!sample.pressured || sample.available > state->available)
+    /* New history can create reclaimable work while writers consume each
+     * gain in headroom before the next sample. Back off only on idle stalls. */
+    if (!sample.pressured || mutated || sample.available > state->available)
       state->stalled = 0;
     else if (state->stalled < 32)
       ++state->stalled;

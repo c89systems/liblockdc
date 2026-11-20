@@ -9287,3 +9287,72 @@ NoSync work median was 46% above multifile, with a 3.2× per-item p95. The
 fixed-capacity refusal, foreground tails and cold admission costs remain
 open for qualification. Raw attempts and phase counters are under the
 `namespace-repack-refresh-` prefix in `build/pouch-space-concurrent/`.
+
+## Capacity recovery at admission
+
+A traced four-writer NoSync run reached 72–92 KiB of local free payload while
+about 124 KiB of retired extents remained behind the physical checkpoint.
+The same refusal reached lease metadata admission and the sink of an active
+streaming update. Optional zero preparation also encountered earlier temporary
+pressure while peers held 2.7–3.7 MiB of quarantined ranges. Those earlier
+attempts could fall back to smaller preparation and completed.
+
+A failed budget admission can now reclaim prior retirements and recompute
+the proposal. It restores the already admitted aggregate credits before
+attempting the checkpoint. Exact stream grants can use the same path while
+the producer is active, including at the final one-page grant fallback.
+The allocator makes at most one recovery attempt per claim. It considers
+whole pages whose local and remote pins have drained and checks its current
+checkpoint allowance before using the existing durable root selection
+protocol. A speculative extension of zero preparation uses ordinary
+admission. Any remaining shortfall returns the existing capacity error.
+
+The maintenance worker now treats new canonical activity as a reason to
+resume prompt pressure checks. Other writers can consume a pass's entire
+headroom gain between samples. Idle stalls still back off, and a busy
+allocator probe still defers maintenance work.
+
+The fixed-capacity test exercises budget open, budget resize and an
+already-started streaming write under both durability policies. A peer
+holds a retired value and reads it intact while admission is refused. Once
+the pin drains, one checkpoint funds the new claim. The streaming case
+already wrote its first chunk before pressure and verifies both chunks
+after reopen. Three injected sync failures cover the checkpoint barriers.
+The failed claim preserves its original accounting, and reopen verifies
+both the earlier durable deletion and an unaffected live value. The
+scheduler fixture verifies that a new mutation restarts the fast cadence
+even when headroom falls, and that the worker backs off again when idle.
+Debug passed 18 focused checks, GNU Release passed 29 and musl Release
+passed 24. These include independent shared owners, retained readers,
+allocator and value faults, and fixed-capacity lease and messaging runs.
+
+The alternating GNU comparison verified 29 of 30 workflows at fixed
+10 MiB. The current build verified all four durable attempts and five of
+six four-writer NoSync attempts. The previous native build (`8923d339`)
+and multifile completed every matched attempt. An earlier traced baseline
+also refused ordinary capacity. The remaining candidate refusal stopped
+one writer during mutation in revision i.
+
+These are successful-attempt medians in milliseconds in the order
+previous native, current native and multifile. Each durable cell contains
+two samples per build. The NoSync cells have six samples for the previous
+native build and multifile and five for the current build. Four-writer
+profiles stream 12 MiB. The two-writer durable profile streams 15 MiB.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync | 2027.31 / 2124.64 / 1777.09 | 109.11 / 99.90 / 44.04 | 4.16 / 5.86 / 1.72 | 30.68 / 28.91 / 1.26 | 8.23 / 8.48 / 10.00 |
+| Four writers, durable | 4561.75 / 4561.34 / 5785.59 | 145.57 / 156.36 / 155.39 | 33.90 / 3.71 / 2.82 | 34.51 / 30.92 / 1.54 | 9.68 / 8.67 / 9.05 |
+| Two writers, durable, 15 MiB | 9031.23 / 7220.91 / 7070.61 | 119.67 / 97.96 / 91.21 | 2.42 / 4.26 / 1.65 | 19.17 / 16.92 / 0.88 | 9.72 / 9.26 / 8.71 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync | 332.07 / 361.60 / 428.62 | 142.53 / 131.76 / 265.85 | 50.45 / 32.29 / 286.80 |
+| Four writers, durable | 284.03 / 234.81 / 615.58 | 69.28 / 40.62 / 581.52 | 46.95 / 38.50 / 800.72 |
+| Two writers, durable, 15 MiB | 188.16 / 164.19 / 233.35 | 41.49 / 40.38 / 113.01 | 34.65 / 2.70 / 125.23 |
+
+The new path proves reuse when selected retirements can fund admission.
+Sustained four-writer NoSync admission and latency remain open. Reopen costs
+remain visible separately. Raw phase samples, stress attempts and trace
+outputs are under `capacity-admission-` and `capacity-pressure-trace-` in
+`build/pouch-space-concurrent/`.

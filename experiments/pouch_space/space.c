@@ -1854,29 +1854,30 @@ static uint64_t metadata_target(ps_space *s, uint64_t bound) {
    * from its retired image without relying on unprotected payload capacity. */
   return allocated < bound ? 2 * bound - allocated : bound;
 }
-static int ordinary_headroom(ps_space *s, uint64_t target, uint64_t floor,
-                             uint64_t *available) {
+static uint64_t ordinary_shortfall(ps_space *s, uint64_t target,
+                                   uint64_t payload, uint64_t floor,
+                                   uint64_t *available) {
   uint64_t extra =
       target > s->metadata_free_bytes ? target - s->metadata_free_bytes : 0;
-  *available = 0;
-  if (s->reserved_payload > s->free_bytes ||
-      floor > s->free_bytes - s->reserved_payload ||
-      extra > s->free_bytes - s->reserved_payload - floor)
-    return 0;
-  *available = s->free_bytes - s->reserved_payload - floor - extra;
-  return 1;
-}
-static int metadata_fits(ps_space *s, uint64_t target, uint64_t payload,
-                         uint64_t floor) {
-  uint64_t available;
-  return ordinary_headroom(s, target, floor, &available) &&
-         payload <= available;
+  uint64_t total;
+  if (available)
+    *available = 0;
+  if (floor > UINT64_MAX - extra ||
+      s->reserved_payload > UINT64_MAX - floor - extra)
+    return UINT64_MAX;
+  total = s->reserved_payload + floor + extra;
+  if (available && total <= s->free_bytes)
+    *available = s->free_bytes - total;
+  if (payload > UINT64_MAX - total)
+    return UINT64_MAX;
+  total += payload;
+  return total > s->free_bytes ? total - s->free_bytes : 0;
 }
 static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
                                 uint64_t payload, uint64_t floor,
-                                lc_error *error) {
+                                uint64_t *shortfall, lc_error *error) {
   uint64_t usable = s->capacity - PS_DATA;
-  uint64_t bytes;
+  uint64_t bytes, missing;
   ps_run *node;
   int rc;
   /* Catalog and stream publication may borrow a capture guard. Its selected
@@ -1888,17 +1889,21 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
   }
   /* Leave a burst of ordinary headroom for independent producers while the
    * worker observes the hint and admits its first bounded pass. */
-  (void)ordinary_headroom(s, target, floor, &bytes);
-  if (bytes < payload || bytes - payload <= usable / 2 + usable / 8)
+  missing = ordinary_shortfall(s, target, payload, floor, &bytes);
+  if (missing || bytes - payload <= usable / 2 + usable / 8)
     ps_readiness_set_pressure(s, 1);
-  if (!metadata_fits(s, target, payload, floor)) {
+  if (missing) {
     rc = pins_reclaim_locked(s, error);
     if (rc != LC_OK)
       return rc;
-    if (!metadata_fits(s, target, payload, floor))
+    missing = ordinary_shortfall(s, target, payload, floor, NULL);
+    if (missing) {
+      if (shortfall)
+        *shortfall = missing;
       return err(error, LC_ERR_INVALID,
                  "container capacity reserved for checkpoint and maintenance; "
                  "checkpoint or grow");
+    }
   }
   while (s->metadata_free_bytes < target) {
     node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
@@ -1926,19 +1931,21 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
   return LC_OK;
 }
 static int metadata_fill(ps_space *s, uint64_t bound, uint64_t target,
-                         uint64_t payload, uint64_t floor, lc_error *error) {
+                         uint64_t payload, uint64_t floor, uint64_t *shortfall,
+                         lc_error *error) {
   ps_coordination_guard *guard = NULL;
   int rc = allocation_begin(s, &guard, error);
   if (rc == LC_OK && guard)
     rc = allocation_refresh(s, error);
   if (rc == LC_OK)
-    rc = metadata_fill_locked(s, bound, target, payload, floor, error);
+    rc = metadata_fill_locked(s, bound, target, payload, floor, shortfall,
+                              error);
   return allocation_end(s, guard, rc, error);
 }
 static int metadata_protect(ps_space *s, uint64_t bound, uint64_t payload,
                             uint64_t floor, lc_error *error) {
   return metadata_fill(s, bound, metadata_target(s, bound), payload, floor,
-                       error);
+                       NULL, error);
 }
 static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
                          uint64_t bound, uint64_t *floor, lc_error *e) {
@@ -1968,10 +1975,10 @@ static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
   *floor += extra + plan.payload_bytes;
   return LC_OK;
 }
-static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
-                                      uint64_t entries, uint64_t payload,
-                                      uint64_t floor, ps_budget *budget,
-                                      lc_error *error) {
+static int capacity_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
+                              uint64_t payload, uint64_t floor,
+                              ps_budget *budget, uint64_t *shortfall,
+                              lc_error *error) {
   uint64_t bound, current;
   uint64_t growth = bytes > s->metadata ? bytes - s->metadata : 0;
   uint64_t added = entries > s->live_entries ? entries - s->live_entries : 0;
@@ -2002,7 +2009,15 @@ static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
     if (rc != LC_OK)
       return rc;
   }
-  return metadata_protect(s, bound, payload, floor, error);
+  return metadata_fill(s, bound, metadata_target(s, bound), payload, floor,
+                       shortfall, error);
+}
+static int checkpoint_allowance_floor(ps_space *s, uint64_t bytes,
+                                      uint64_t entries, uint64_t payload,
+                                      uint64_t floor, ps_budget *budget,
+                                      lc_error *error) {
+  return capacity_allowance(s, bytes, entries, payload, floor, budget, NULL,
+                            error);
 }
 static int immutable_allowance(ps_space *s, ps_entry *entry, uint64_t bytes,
                                uint64_t entries, uint64_t payload,
@@ -2470,11 +2485,6 @@ static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
   }
   return spare;
 }
-int ps_internal_budget_admit(ps_space *s, int maintenance, lc_error *e) {
-  return checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0,
-                                    maintenance ? 0 : PS_MAINTENANCE_RESERVE,
-                                    NULL, e);
-}
 void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
   uint64_t bound;
   if (metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, NULL) ==
@@ -2517,7 +2527,7 @@ static int checkpoint_body(ps_space *s, lc_error *error) {
       s->free_bytes - s->reserved_payload -
               (2 * bound - s->metadata_free_bytes) >=
           floor)
-    rc = metadata_fill(s, bound, 2 * bound, 0, floor, error);
+    rc = metadata_fill(s, bound, 2 * bound, 0, floor, NULL, error);
   if (rc == LC_OK && s->dirty && s->metadata_free_bytes < 2 * bound) {
     metadata_dirty_all(s);
     dense = 1;
@@ -2675,6 +2685,91 @@ static int checkpoint_locked(ps_space *s, lc_error *error) {
   if (rc == LC_OK)
     rc = checkpoint_body(s, error);
   return allocation_end(s, guard, rc, error);
+}
+/* A checkpoint can return retired runs to ordinary capacity. Count only
+ * complete pages whose local and foreign readers have released them. Packed
+ * cells on a partially occupied page cannot fund a page-sized claim. */
+static int retirement_can_fund(ps_space *s, uint64_t missing) {
+  ps_entry *p;
+  size_t i;
+  int foreign = 0;
+  if (missing > s->capacity - PS_DATA || !s->retired)
+    return 0;
+  if (s->range_pins &&
+      pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &foreign, NULL) != LC_OK)
+    return 0;
+  for (p = s->retired; p; p = p->retired_next) {
+    if (p->pins || (foreign && entry_foreign_pinned(s, p)))
+      continue;
+    for (i = 0; i < p->count; ++i) {
+      ps_extent *extent = &p->extents[i];
+      uint64_t bytes = aligned(extent->bytes);
+      if (extent->flags & EXTENT_PACKED) {
+        ps_payload_page *page = payload_find(s, extent->offset);
+        int pinned = 0;
+        if (!page || page->external_pins ||
+            page->occupied != extent_mask(extent) ||
+            (foreign && (pin_conflict(s, page->run.offset, PS_PAGE, &pinned,
+                                      NULL) != LC_OK ||
+                         pinned)))
+          continue;
+      }
+      if (bytes >= missing)
+        return 1;
+      missing -= bytes;
+    }
+  }
+  return 0;
+}
+/* Called under allocation authority for a failed exact claim. The checkpoint
+ * uses the already admitted credits. The caller then recomputes the proposed
+ * claim against the selected directory and the remaining reader witnesses. */
+static int reclaim_admission(ps_space *s, uint64_t missing, int *attempted,
+                             lc_error *e) {
+  uint64_t bound;
+  int rc;
+  if (*attempted || !missing || !retirement_can_fund(s, missing))
+    return LC_ERR_INVALID;
+  rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, NULL);
+  if (rc != LC_OK ||
+      ordinary_shortfall(s, metadata_target(s, bound), 0, 0, NULL))
+    return LC_ERR_INVALID;
+  *attempted = 1;
+  lc_error_cleanup(e);
+  if (s->journal || s->dirty)
+    return checkpoint_locked(s, e);
+  collect_retired(s, 1);
+  return healthy(s, e);
+}
+int ps_internal_budget_admit(ps_space *s, int maintenance,
+                             const ps_budget_plan *prior,
+                             const ps_budget_plan *proposed, lc_error *e) {
+  ps_budget_plan empty = {0};
+  uint64_t floor = maintenance ? 0 : PS_MAINTENANCE_RESERVE, missing = 0;
+  int rc, attempted = 0;
+  rc = capacity_allowance(s, s->metadata, s->live_entries, 0, floor, NULL,
+                          proposed ? &missing : NULL, e);
+  if (rc != LC_ERR_INVALID || !missing)
+    return rc;
+  if (!prior)
+    prior = &empty;
+  s->reserved_payload =
+      s->reserved_payload - proposed->payload_bytes + prior->payload_bytes;
+  s->reserved_metadata =
+      s->reserved_metadata - proposed->metadata_bytes + prior->metadata_bytes;
+  s->reserved_entries =
+      s->reserved_entries - proposed->entries + prior->entries;
+  rc = reclaim_admission(s, missing, &attempted, e);
+  s->reserved_payload =
+      s->reserved_payload - prior->payload_bytes + proposed->payload_bytes;
+  s->reserved_metadata =
+      s->reserved_metadata - prior->metadata_bytes + proposed->metadata_bytes;
+  s->reserved_entries =
+      s->reserved_entries - prior->entries + proposed->entries;
+  if (rc == LC_OK)
+    rc = checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0, floor,
+                                    NULL, e);
+  return rc;
 }
 /* A shared publisher terminates a complete frame with a clear next header.
  * An adopter can distinguish obsolete bytes from an abandoned append even
@@ -5993,7 +6088,7 @@ int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
   if (rc == LC_OK)
     rc = reserve_floor(s, s->metadata, s->live_entries, bound, &floor, error);
   if (rc == LC_OK) {
-    (void)ordinary_headroom(s, metadata_target(s, bound), floor, available);
+    (void)ordinary_shortfall(s, metadata_target(s, bound), 0, floor, available);
     *needed = ps_readiness_pressure(s);
     if (*needed &&
         *available >= (s->capacity - PS_DATA) - (s->capacity - PS_DATA) / 4) {
@@ -6446,16 +6541,26 @@ int ps_owned_inspect(ps_space *space, ps_key key, const ps_ref *ref,
   return rc;
 }
 static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
-                           lc_error *error) {
-  return checkpoint_allowance_floor(s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES,
-                                    s->live_entries + 1, payload,
-                                    PS_MAINTENANCE_RESERVE, budget, error);
+                           int *attempted, lc_error *error) {
+  uint64_t missing = 0;
+  int rc = capacity_allowance(
+      s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES, s->live_entries + 1, payload,
+      PS_MAINTENANCE_RESERVE, budget,
+      attempted && !*attempted ? &missing : NULL, error);
+  if (rc == LC_ERR_INVALID && missing) {
+    rc = reclaim_admission(s, missing, attempted, error);
+    if (rc == LC_OK)
+      rc = checkpoint_allowance_floor(
+          s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES, s->live_entries + 1,
+          payload, PS_MAINTENANCE_RESERVE, budget, error);
+  }
+  return rc;
 }
 static int owned_preparation_allowance(ps_space *s, ps_budget *budget,
                                        uint64_t bytes, uint64_t reserved,
                                        lc_error *error) {
   if (!budget)
-    return owned_allowance(s, NULL, reserved, error);
+    return owned_allowance(s, NULL, reserved, NULL, error);
   /* The grant's pages and descriptor are already included in the claim.
    * Extra zero preparation may borrow only unclaimed common headroom. */
   return checkpoint_allowance_floor(s, s->metadata, s->live_entries,
@@ -6471,10 +6576,11 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   unsigned char header[PS_RUN_HEADER];
   uint64_t bytes = desired, reserved = 0, sequence = 0;
   uint64_t prepared, partial_bytes, at, selected = 0, partial_at, free_before;
+  uint64_t generation;
   ps_run **choice = NULL, **link, **partial, **fit;
   ps_run *spare = NULL;
   ps_coordination_guard *guard = NULL;
-  int rc, clean = 0, registered = 0, reclaimed = 0;
+  int rc, clean = 0, registered = 0, reclaimed = 0, checkpointed = 0;
   if (p)
     p->extents = lc_calloc_with_allocator(NULL, 1, sizeof(*p->extents));
   if (!p || !p->extents || !zero) {
@@ -6499,7 +6605,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   /* Protect metadata before retaining a free-list selection: admission may
    * transfer common intervals into the checkpoint-only pool. */
   if (rc == LC_OK)
-    rc = owned_allowance(s, budget, 0, error);
+    rc = owned_allowance(s, budget, 0, !budget ? &checkpointed : NULL, error);
 select_run:
   if (rc == LC_OK) {
     for (;;) {
@@ -6563,10 +6669,14 @@ select_run:
       if (bytes > (*choice)->bytes)
         bytes = (*choice)->bytes;
       free_before = s->free_bytes;
-      rc = owned_allowance(s, budget, bytes, error);
+      generation = s->generation;
+      rc = owned_allowance(s, budget, bytes,
+                           !budget && bytes == PS_PAGE ? &checkpointed : NULL,
+                           error);
       /* The bound is already protected. A newly reclaimed common interval
        * can change or coalesce the selected node before we take it. */
-      if (rc == LC_OK && s->free_bytes != free_before)
+      if (rc == LC_OK &&
+          (s->free_bytes != free_before || s->generation != generation))
         continue;
       if (rc == LC_OK || bytes == PS_PAGE)
         break;
@@ -6696,7 +6806,7 @@ select_run:
                       base != head->entry->stream_capacity))
     rc = err(error, LC_ERR_INVALID, "owned stream changed during preparation");
   if (rc == LC_OK)
-    rc = owned_allowance(s, budget, 0, error);
+    rc = owned_allowance(s, budget, 0, !budget ? &checkpointed : NULL, error);
   if (rc == LC_OK)
     rc = append_event(s, p, PS_PUT, error);
   if (rc == LC_OK) {

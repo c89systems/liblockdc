@@ -133,7 +133,7 @@ int ps_reserve_base(ps_space *s, const ps_budget_plan *p, int recover,
   if (rc == LC_OK)
     s->reserve_base = *p;
   if (rc == LC_OK && admit)
-    rc = ps_internal_budget_admit(s, 0, e);
+    rc = ps_internal_budget_admit(s, 0, NULL, NULL, e);
   rc = ps_internal_capture_end(s, guard, rc, e);
   if (rc != LC_OK)
     s->reserve_base = prior;
@@ -167,7 +167,7 @@ int ps_reserve_open(ps_space *s, const ps_budget_plan *p, int recover,
     r->id = ++s->reserve_next;
     s->reserves = reserve_insert(s->reserves, r);
     if (!recover)
-      rc = ps_internal_budget_admit(s, 0, e);
+      rc = ps_internal_budget_admit(s, 0, NULL, NULL, e);
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   if (rc == LC_OK)
@@ -202,7 +202,7 @@ int ps_reserve_resize(ps_reserve *r, const ps_budget_plan *p, int recover,
     r->plan = *p;
     s->reserves = reserve_change(s->reserves, r);
     if (admit)
-      rc = ps_internal_budget_admit(s, 0, e);
+      rc = ps_internal_budget_admit(s, 0, NULL, NULL, e);
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   if (rc != LC_OK) {
@@ -439,7 +439,7 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     s->reserved_metadata += plan->metadata_bytes;
     s->reserved_entries += plan->entries;
     accounted = 1;
-    rc = ps_internal_budget_admit(s, plan->maintenance, e);
+    rc = ps_internal_budget_admit(s, plan->maintenance, NULL, plan, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
   }
@@ -471,6 +471,7 @@ int ps_budget_status(ps_budget *b, ps_budget_plan *out, lc_error *e) {
   return LC_OK;
 }
 int ps_budget_foreground_check(ps_space *s, lc_error *e) {
+  const ps_budget_plan empty = {0};
   ps_coordination_guard *guard;
   int rc;
   if (!s)
@@ -478,7 +479,7 @@ int ps_budget_foreground_check(ps_space *s, lc_error *e) {
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_admission_begin(s, &guard, e);
   if (rc == LC_OK)
-    rc = ps_internal_budget_admit(s, 0, e);
+    rc = ps_internal_budget_admit(s, 0, NULL, &empty, e);
   rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   return rc;
@@ -571,7 +572,7 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
     b->remaining = *plan;
     accounted = 1;
     if (grows)
-      rc = ps_internal_budget_admit(s, plan->maintenance, e);
+      rc = ps_internal_budget_admit(s, plan->maintenance, &prior, plan, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
   }

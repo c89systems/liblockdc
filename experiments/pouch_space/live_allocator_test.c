@@ -4611,6 +4611,118 @@ static void *replace_piece_at_barrier(void *context) {
   lc_error_cleanup(&e);
   return NULL;
 }
+static void capacity_checkpoint(int durable, int streaming, int resize,
+                                size_t fail_sync) {
+  lc_error e = {0};
+  readiness_fault fault = {6, EIO, 0, 0, fail_sync};
+  ps_io io = {&fault,     read_io, durable_write, readiness_sync_fault,
+              reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_reader *pin = NULL;
+  ps_budget *padding = NULL, *admission = NULL;
+  ps_budget_plan plan = {PS_CHUNK, 0, 0, 0}, fill = {0};
+  stream_recovery recovery = {0};
+  ps_stream *stream = NULL;
+  ps_stream_writer *append = NULL;
+  ps_stream_window *window = NULL;
+  unsigned char *body = streaming ? malloc(2 * PS_CHUNK) : NULL;
+  uint64_t available, checkpoints;
+  int needed;
+  options.durable_sync = durable;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  capture_put(writer, 1, 4 * PS_CHUNK);
+  capture_put(writer, 2, 41);
+  if (streaming) {
+    REQUIRE(body);
+    memset(body, 0x37, PS_CHUNK);
+    memset(body + PS_CHUNK, 0x91, PS_CHUNK);
+    ok(ps_stream_open(writer, NULL, tail_stream(), 1, NULL, recover_stream,
+                      &recovery, &stream, &e),
+       &e);
+    ok(ps_stream_begin(stream, &append, &e), &e);
+    ok(ps_stream_write(append, body, PS_CHUNK, &e), &e);
+  }
+  ok(ps_checkpoint(writer, &e), &e);
+  options.io = NULL;
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  ok(ps_read_open(peer, key(1), NULL, &pin, &e), &e);
+  if (resize) {
+    ps_budget_plan initial = {PS_PAGE, 0, 0, 0};
+    ok(ps_budget_open(writer, &initial, &admission, &e), &e);
+  }
+  ok(ps_maintenance_pressure(writer, 1, &needed, &available, &e), &e);
+  REQUIRE(available > PS_MIB && available % PS_PAGE == 0);
+  fill.payload_bytes = available;
+  ok(ps_budget_open(writer, &fill, &padding, &e), &e);
+  ok(ps_delete(writer, key(1), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+  checkpoints = status(writer).checkpoints;
+  if (resize) {
+    ps_budget_plan retained;
+    REQUIRE(ps_budget_resize(admission, &plan, &e) == LC_ERR_INVALID);
+    lc_error_cleanup(&e);
+    ok(ps_budget_status(admission, &retained, &e), &e);
+    REQUIRE(retained.payload_bytes == PS_PAGE);
+  } else {
+    REQUIRE(ps_budget_open(writer, &plan, &admission, NULL) == LC_ERR_INVALID &&
+            !admission);
+  }
+  REQUIRE(status(writer).checkpoints == checkpoints);
+  captured_expect(pin, 1, 4 * PS_CHUNK);
+  ps_reader_close(pin);
+  if (streaming) {
+    ok(ps_stream_write(append, body + PS_CHUNK, PS_CHUNK, &e), &e);
+    ok(ps_stream_commit(append, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+    ps_stream_writer_close(append);
+    ok(ps_stream_seal(stream, &e), &e);
+    ok(ps_stream_close(stream, &e), &e);
+    ok(ps_flush(writer, &e), &e);
+  } else if (fail_sync) {
+    fault.armed = 1;
+    REQUIRE(ps_budget_open(writer, &plan, &admission, &e) == LC_ERR_TRANSPORT &&
+            !admission);
+    REQUIRE(fault.calls == fail_sync);
+    lc_error_cleanup(&e);
+    REQUIRE(status(writer).reserved_payload_bytes == fill.payload_bytes);
+  } else if (resize) {
+    ok(ps_budget_resize(admission, &plan, &e), &e);
+  } else {
+    ok(ps_budget_open(writer, &plan, &admission, &e), &e);
+  }
+  if (!fail_sync)
+    REQUIRE(status(writer).checkpoints == checkpoints + 1);
+  (void)ps_budget_close(admission, NULL);
+  (void)ps_budget_close(padding, NULL);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  REQUIRE(status(writer).capacity == PS_DEFAULT_CAPACITY);
+  expect_value(writer, key(1), 0, 0);
+  expect_value(writer, key(2), 41, 2);
+  if (streaming) {
+    unsigned char recovered[997];
+    ok(ps_stream_open(writer, NULL, tail_stream(), 0, NULL, recover_stream,
+                      &recovery, &stream, &e),
+       &e);
+    ok(ps_stream_window_open(stream, 0, 2 * PS_CHUNK, &window, &e), &e);
+    for (size_t offset = 0; offset < 2 * PS_CHUNK;) {
+      size_t n = 2 * PS_CHUNK - offset;
+      if (n > sizeof(recovered))
+        n = sizeof(recovered);
+      ok(ps_stream_window_read(window, offset, recovered, n, &e), &e);
+      REQUIRE(!memcmp(recovered, body + offset, n));
+      offset += n;
+    }
+    ps_stream_window_close(window);
+    ok(ps_stream_close(stream, &e), &e);
+  }
+  ok(ps_close(writer, &e), &e);
+  free(body);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void piece_barrier_handoff(int durable, int discard) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
   ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
@@ -4960,7 +5072,15 @@ int main(int argc, char **argv) {
     projection_boundaries();
   else if (!strcmp(argv[2], "projection-pressure"))
     projection_pressure();
-  else if (!strcmp(argv[2], "projection-tail"))
+  else if (!strcmp(argv[2], "capacity-checkpoint")) {
+    for (int durable = 0; durable <= 1; ++durable) {
+      capacity_checkpoint(durable, 0, 0, 0);
+      capacity_checkpoint(durable, 0, 1, 0);
+      capacity_checkpoint(durable, 1, 0, 0);
+    }
+    for (size_t sync = 1; sync <= 3; ++sync)
+      capacity_checkpoint(1, 0, 0, sync);
+  } else if (!strcmp(argv[2], "projection-tail"))
     projection_tail();
   else if (!strcmp(argv[2], "shared-durable"))
     shared_durability();

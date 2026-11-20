@@ -248,7 +248,8 @@ int ps_internal_admission_begin(ps_space *, ps_coordination_guard **,
 int ps_internal_event(ps_space *, ps_entry *, int, lc_error *);
 int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
                           lc_error *);
-int ps_internal_budget_admit(ps_space *, int, lc_error *);
+int ps_internal_budget_admit(ps_space *, int, const ps_budget_plan *,
+                             const ps_budget_plan *, lc_error *);
 void ps_internal_reserve_plan(ps_space *, ps_budget_plan *);
 void ps_internal_budget_trim(ps_space *, ps_run **);
 int ps_internal_budget_check(ps_space *, ps_budget *, uint64_t, uint64_t,
