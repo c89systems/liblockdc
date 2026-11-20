@@ -27,6 +27,7 @@ static size_t checks;
 static size_t allocation_call, allocation_fail;
 static size_t allocation_max;
 static int measure_allocations;
+static void fixture_put(unsigned char *, uint64_t, size_t);
 typedef struct allocation_pause {
   pthread_mutex_t mutex;
   pthread_cond_t cond;
@@ -332,9 +333,9 @@ static ssize_t model_write(void *v, int fd, const void *p, size_t n,
   ssize_t result = pwrite(fd, p, n, offset);
   /* Selective persistence: an opening grant may reach stable storage even
    * when earlier cleanup writes and the following sync are lost. */
-  if (result == (ssize_t)n && m->persist_grants && n == 64 &&
-      offset >= PS_JOURNAL_OFFSET && offset + (off_t)n <= PS_DATA &&
-      !memcmp(p, "PSV1", 4)) {
+  if (result == (ssize_t)n && m->persist_grants && n == PS_TOKEN_RECORD_BYTES &&
+      (offset == PS_TOKEN_RECORD_OFFSET ||
+       offset == PS_PAGE + PS_TOKEN_RECORD_OFFSET)) {
     memcpy(m->stable + offset, p, n);
     ++m->grants;
   }
@@ -994,12 +995,14 @@ static void incarnation_grants(void) {
   OK(ps_status(s, &stats, &error));
   CHECK(stats.journal_bytes == PS_JOURNAL);
   OK(ps_close(s, &error));
-  s = reopen(&io); /* range grant must checkpoint a completely full journal */
+  s = reopen(&io); /* grant publication can leave a full journal intact */
   expect(s, state(1), &lost, NULL, 0);
   OK(ps_status(s, &stats, &error));
-  CHECK(stats.checkpoints == 1 && stats.journal_bytes == 64);
+  CHECK(!stats.checkpoints && stats.journal_bytes == PS_JOURNAL);
   next = put(s, state(1), NULL, 0, 1);
   CHECK(next.incarnation > lost.incarnation);
+  OK(ps_status(s, &stats, &error));
+  CHECK(stats.checkpoints == 1 && stats.journal_bytes == 64);
   OK(ps_close(s, &error));
   s = reopen(&io);
   expect(s, state(1), &next, NULL, 0);
@@ -1086,13 +1089,13 @@ static void shared_pool_power_loss(void) {
  * Fixtures retain valid payloads for a stale event hidden behind a zero gap:
  * clearing just that gap would resurrect the event on the next reopen. */
 static ps_ref reopen_sanitize_fixture(model *m, const ps_io *io, int durable,
-                                      int layout, int cross_page) {
+                                      int layout) {
   ps_space *s;
   ps_stats first, second;
   ps_ref keep;
   unsigned char old_root[PS_ROOT_BYTES];
   unsigned char *journal = calloc(1, PS_JOURNAL);
-  size_t sibling, prefix = 0;
+  size_t sibling;
   int fd;
   CHECK(journal != NULL);
   clean();
@@ -1102,45 +1105,26 @@ static ps_ref reopen_sanitize_fixture(model *m, const ps_io *io, int durable,
   keep = put(s, state(1), "keep", 4, 1);
   OK(ps_checkpoint(s, &error));
   sibling = !memcmp(m->stable, "PSROOT1", 7) ? PS_PAGE : 0;
-  if (cross_page) {
-    ps_options options = {0};
-    options.io = io;
-    options.durable_sync = durable;
-    /* Each successful reopen leaves a 64-byte grant. Put the next opening
-     * grant at the end of one physical page and the stale event on the next,
-     * so selective persistence does not depend on sub-page torn writes. */
-    for (size_t i = 0; i < PS_PAGE / 64 - 1; ++i) {
-      OK(ps_close(s, &error));
-      OK(ps_open(path, 0, &options, &s, &error));
-    }
-    OK(ps_status(s, &first, &error));
-    prefix = (size_t)first.journal_bytes;
-    CHECK(prefix == PS_PAGE - 64);
-    fd = open(path, O_RDONLY);
-    CHECK(fd >= 0);
-    CHECK(pread(fd, journal, prefix, PS_JOURNAL_OFFSET) == (ssize_t)prefix);
-    CHECK(close(fd) == 0);
-  }
   if (layout == 2 || layout == 3 || layout == 6) {
-    put(s, state(2), "discard-first", 13, 1);
+    put(s, state(2), NULL, 0, 1);
     OK(ps_status(s, &first, &error));
     if (layout == 6)
       OK(ps_delete(s, state(1), &error));
     else
       put(s, state(3), "stale-second", 12, 1);
     OK(ps_status(s, &second, &error));
-    CHECK(first.journal_bytes >= 64 &&
+    CHECK(first.journal_bytes == 64 &&
           second.journal_bytes > first.journal_bytes &&
           second.journal_bytes < PS_JOURNAL);
     fd = open(path, O_RDONLY);
     CHECK(fd >= 0);
-    CHECK(pread(fd, journal + prefix + 64,
+    CHECK(pread(fd, journal + first.journal_bytes,
                 (size_t)(second.journal_bytes - first.journal_bytes),
                 PS_JOURNAL_OFFSET + (off_t)first.journal_bytes) ==
           (ssize_t)(second.journal_bytes - first.journal_bytes));
     CHECK(close(fd) == 0);
-    /* The second event expects the sequence that follows the new 64-byte
-     * opening grant. Its payload is valid and remains on disk. */
+    /* The stale suffix still has a valid payload and the sequence that
+     * follows a new 64-byte publication at the beginning of the journal. */
     if (layout == 3)
       journal[PS_JOURNAL - 1] = 0xa5;
   } else if (layout == 1)
@@ -1170,7 +1154,7 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
   ps_options options = {0};
   ps_space *s = NULL;
   ps_stats status;
-  ps_ref keep = reopen_sanitize_fixture(&m, &io, durable, layout, 0);
+  ps_ref keep = reopen_sanitize_fixture(&m, &io, durable, layout);
   ps_ref issued, next;
   unsigned char *journal = malloc(PS_JOURNAL);
   unsigned char sibling[PS_ROOT_BYTES];
@@ -1196,7 +1180,7 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
     OK(rc);
     /* This is an I/O bound, not an on-disk encoding assertion. Cleanup must
      * not dirty a clean 128 KiB journal or an already retired root. */
-    CHECK(m.syncs == 2);
+    CHECK(m.syncs == 1);
     if (layout == 0)
       CHECK(m.writes == 1 && m.write_bytes <= PS_PAGE);
     else if (layout == 1 || layout == 4 || layout == 5)
@@ -1210,7 +1194,7 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
   absent(s, state(2));
   absent(s, state(3));
   OK(ps_status(s, &status, &error));
-  CHECK(status.capacity == PS_MIB && status.journal_bytes == 64);
+  CHECK(status.capacity == PS_MIB && !status.journal_bytes);
   fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
   CHECK(pread(fd, journal, PS_JOURNAL, PS_JOURNAL_OFFSET) == PS_JOURNAL);
@@ -1254,6 +1238,31 @@ static void reopen_sanitization(void) {
         for (int torn = 0; torn < 2; ++torn)
           reopen_sanitize_case(durable, layout, nth, torn);
     }
+  /* An otherwise checked root with the former layout must fail before an
+   * opener can clear its journal. The former reader rejects the new bit. */
+  model m;
+  ps_io io = model_init(&m);
+  ps_options options = {0};
+  ps_space *space = create(PS_MIB, 0, &io);
+  unsigned char root[PS_ROOT_BYTES];
+  int fd;
+  OK(ps_close(space, &error));
+  size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
+  memcpy(root, m.stable + offset, sizeof(root));
+  fixture_put(root + 72, PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_FIXED_GRANTS, 4);
+  fixture_put(root + 76, crc32(0, root, 76), 4);
+  fd = open(path, O_RDWR);
+  CHECK(fd >= 0 &&
+        pwrite(fd, root, sizeof(root), (off_t)offset) == (ssize_t)sizeof(root));
+  CHECK(close(fd) == 0);
+  m.writes = m.syncs = 0;
+  options.io = &io;
+  CHECK(ps_open(path, 0, &options, &space, &error) == LC_ERR_PROTOCOL &&
+        !space);
+  CHECK(!m.writes && !m.syncs);
+  lc_error_cleanup(&error);
+  free(m.stable);
+  clean();
   printf("reopen: bounded clean writes, sparse/stale tails, both sibling-root "
          "states and %zu I/O failure sites with lost/torn persistence\n",
          sites);
@@ -1270,7 +1279,7 @@ static void reopen_cleanup_ordering(void) {
         ps_options options = {0};
         ps_space *s = NULL;
         ps_ref keep =
-            reopen_sanitize_fixture(&m, &io, durable, layouts[layout], 1);
+            reopen_sanitize_fixture(&m, &io, durable, layouts[layout]);
         options.io = &io;
         options.durable_sync = durable;
         if (hot_retry) {
@@ -1286,12 +1295,11 @@ static void reopen_cleanup_ordering(void) {
           m.fail_sync_at = 0;
           fd = open(path, O_RDONLY);
           CHECK(fd >= 0);
-          CHECK(pread(fd, prefix, sizeof(prefix),
-                      PS_JOURNAL_OFFSET + PS_PAGE - sizeof(prefix)) ==
+          CHECK(pread(fd, prefix, sizeof(prefix), PS_JOURNAL_OFFSET + 64) ==
                 (ssize_t)sizeof(prefix));
           CHECK(close(fd) == 0);
           for (size_t i = 0; i < sizeof(prefix); ++i)
-            CHECK(prefix[i] == 0); /* The grant cannot precede retirement. */
+            CHECK(prefix[i] == 0);
         }
         m.grants = 0;
         m.persist_grants = m.fail_grant_sync = 1;
@@ -1301,16 +1309,21 @@ static void reopen_cleanup_ordering(void) {
         m.persist_grants = m.fail_grant_sync = 0;
         crash(&m);
         OK(ps_open(path, 0, &options, &s, &error));
+        put(s, state(4), NULL, 0, 1);
+        OK(ps_flush(s, &error));
+        OK(ps_close(s, &error));
+        crash(&m);
+        OK(ps_open(path, 0, &options, &s, &error));
         expect(s, state(1), &keep, "keep", 4);
         absent(s, state(2));
         absent(s, state(3));
+        expect(s, state(4), NULL, NULL, 0);
         OK(ps_close(s, &error));
         free(m.stable);
         clean();
       }
-  puts("reopen ordering: 8 page-separated selectively persisted grants cannot "
-       "revive stale PUT/DELETE events, including cached-zero retries after "
-       "failed sync");
+  puts("reopen ordering: 8 independently persisted grants preserve the "
+       "journal sequence across stale PUT/DELETE and cached-zero retries");
 }
 
 typedef struct commit_gate {
@@ -5725,8 +5738,7 @@ static void catalog_bounds_rollover(void) {
   CHECK(stats.journal_bytes == PS_JOURNAL);
   OK(ps_stream_close(stream, &error));
   OK(ps_close(space, &error));
-  space =
-      reopen(NULL); /* Full accepted journal checkpoints while granting IDs. */
+  space = reopen(NULL); /* Grant publication leaves the full journal intact. */
   stream = stream_open(space, 1, 0, &target.ref, NULL);
   next = catalog_expect(space, 1, PS_CATALOG_COLLECTION, name,
                         PS_CATALOG_NAME_MAX, 1);

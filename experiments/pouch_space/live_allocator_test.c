@@ -2620,7 +2620,16 @@ static void reopen_cohort(void) {
           readiness(first).grant_limit == cert.grant_limit);
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2 && join->token_next > cert.grant_limit);
+  REQUIRE(disk.syncs == 1 && join->token_next > cert.grant_limit &&
+          readiness(first).ready == cert.ready);
+  /* An existing allocator can adopt the grant without changing its own
+   * range or replaying a synthetic journal event. */
+  uint64_t prior_end = first->token_end;
+  ok(ps_budget_open(first, &plan, &budget, &e), &e);
+  REQUIRE(first->token_limit == join->token_limit &&
+          first->token_end == prior_end);
+  ok(ps_budget_close(budget, &e), &e);
+  budget = NULL;
   ok(ps_close(join, &e), &e);
   join = NULL;
 
@@ -2671,7 +2680,7 @@ static void reopen_cohort(void) {
 
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2);
+  REQUIRE(disk.syncs == 1);
   expect_value(join, key(1), 65, 1);
   expect_value(join, key(2), 65, 2);
   writer = replay_value(join, key(3), 3, 65, &e);

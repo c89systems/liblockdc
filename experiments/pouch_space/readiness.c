@@ -6,9 +6,9 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-/* Live participants must agree on advisory lock addresses and which words
- * belong to the zero bitmap. Cold admission replaces the volatile page. */
-#define READY_MAGIC UINT64_C(0x3659444145525350)
+/* Live participants must agree on lock addresses, bitmap geometry and how
+ * the certified incarnation frontier advances. Cold admission resets this. */
+#define READY_MAGIC UINT64_C(0x3759444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
@@ -206,6 +206,9 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     rc = identity(s, record, e);
   if (rc == LC_OK && s->readiness->active && record[READY] < s->sequence)
     rc = failed(s, e, "shared ready journal prefix regressed");
+  if (rc == LC_OK && s->readiness->active &&
+      record[GRANT_LIMIT] < s->token_limit)
+    rc = failed(s, e, "shared incarnation frontier regressed");
   if (rc == LC_OK) {
     out->ready = record[READY];
     out->durable = record[DURABLE];

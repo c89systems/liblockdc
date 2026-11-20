@@ -11,9 +11,11 @@
 #define PS_OWNED_RUN 4U
 #define PS_RUN_IDENTITY_BYTES 64U
 #define PS_RUN_HEADER 96U
-/* Declared root geometry, not a repository release or protocol version. Old
- * experimental roots without the dedicated coordination page are rejected. */
-#define PS_ROOT_LAYOUT (PS_RUN_HEADER | UINT32_C(0x10000))
+/* Required root geometry includes the coordination page and grant slots.
+ * An opener that expects journal grants cannot recover this layout. */
+#define PS_ROOT_LAYOUT_FIXED_GRANTS UINT32_C(0x20000)
+#define PS_ROOT_LAYOUT                                                         \
+  (PS_RUN_HEADER | UINT32_C(0x10000) | PS_ROOT_LAYOUT_FIXED_GRANTS)
 #define PS_OWNED_DESCRIPTOR_BYTES 104U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;

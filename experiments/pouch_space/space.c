@@ -1451,11 +1451,13 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   size_t count, i, first;
   uint64_t sum = 0, offset, n;
   ps_entry *p;
+  uint32_t type;
   *out = NULL;
   if (bytes < 64 || get32(wire) != EVENT_MAGIC || get32(wire + 4) != bytes ||
       get32(wire + 60) !=
           (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
+  type = get32(wire + 20);
   count = get32(wire + 16) == PS_STREAM || get32(wire + 16) == PS_CATALOG
               ? 0
               : get32(wire + 56);
@@ -1467,7 +1469,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
                                                    get32(wire + 20) == PS_SEAL)
                      ? 80
                      : first + count * 24)) ||
-      get32(wire + 20) > PS_SEAL)
+      (type != PS_PUT && type != PS_REMOVE && type != PS_SEAL))
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
   if (!p)
@@ -1477,14 +1479,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   p->key.key = get64(wire + 32);
   p->token = get64(wire + 40);
   p->bytes = get64(wire + 48);
-  *event = (int)get32(wire + 20);
-  if (*event == PS_RESERVE_IDS) {
-    if (p->key.kind || p->key.owner || p->key.key || !p->token ||
-        p->token % TOKEN_RANGE || count || p->bytes)
-      goto invalid;
-    *out = p;
-    return LC_OK;
-  }
+  *event = (int)type;
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
        (count || p->bytes || get32(wire + 56) ||
@@ -2707,14 +2702,52 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
     rc = append_event_locked(s, p, event, error);
   return allocation_end(s, guard, rc, error);
 }
-static int valid_token_grant(uint64_t prior, uint64_t next) {
-  return next > prior && next <= PS_MAX_INCARNATION &&
-         (next - prior == TOKEN_RANGE || next - prior == TOKEN_POOL);
+static uint64_t token_record_limit(ps_space *s, const unsigned char *record) {
+  uint64_t limit = get64(record + 8);
+  return !memcmp(record, "LCPSID01", 8) && limit &&
+                 limit <= PS_MAX_INCARNATION && limit % TOKEN_RANGE == 0 &&
+                 !memcmp(record + 16, s->identity, 16) &&
+                 get32(record + 32) == checksum(record, 32) &&
+                 !get32(record + 36)
+             ? limit
+             : 0;
 }
-/* A cold or depleted cohort reserves a durable pool. Every live assignment
- * gets a private range and is recorded before the opener can use it. */
-static int grant_tokens(ps_space *s, lc_error *error) {
-  ps_entry grant = {0};
+static int read_token_limit(ps_space *s, uint64_t *limit, int *selected,
+                            lc_error *error) {
+  unsigned char record[PS_TOKEN_RECORD_BYTES];
+  uint64_t a, b, prior;
+  int rc =
+      transfer(s, record, sizeof(record), PS_TOKEN_RECORD_OFFSET, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  a = token_record_limit(s, record);
+  rc = transfer(s, record, sizeof(record), PS_PAGE + PS_TOKEN_RECORD_OFFSET, 0,
+                error);
+  if (rc != LC_OK)
+    return rc;
+  b = token_record_limit(s, record);
+  *selected = b > a;
+  *limit = *selected ? b : a;
+  prior = *selected ? a : b;
+  if (*limit < s->token_limit ||
+      (prior && *limit - prior != TOKEN_RANGE && *limit - prior != TOKEN_POOL))
+    return err(error, LC_ERR_PROTOCOL,
+               "invalid container incarnation grant records");
+  return LC_OK;
+}
+static int write_token_limit(ps_space *s, int slot, uint64_t limit,
+                             lc_error *error) {
+  unsigned char record[PS_TOKEN_RECORD_BYTES] = {0};
+  memcpy(record, "LCPSID01", 8);
+  put64(record + 8, limit);
+  memcpy(record + 16, s->identity, 16);
+  put32(record + 32, checksum(record, 32));
+  return transfer(s, record, sizeof(record),
+                  (uint64_t)slot * PS_PAGE + PS_TOKEN_RECORD_OFFSET, 1, error);
+}
+/* The preceding slot remains intact. A new pool that persists ahead of its
+ * barrier can be skipped safely: it does not advance the journal prefix. */
+static int grant_tokens(ps_space *s, int slot, lc_error *error) {
   uint64_t limit = s->token_limit;
   uint64_t count = ps_coordination_shared(s->coordination) &&
                            limit <= PS_MAX_INCARNATION - TOKEN_POOL
@@ -2723,11 +2756,10 @@ static int grant_tokens(ps_space *s, lc_error *error) {
   int rc;
   if (limit > PS_MAX_INCARNATION - count)
     return err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
-  grant.token = limit + count;
-  rc = append_event_locked(s, &grant, PS_RESERVE_IDS, error);
+  rc = write_token_limit(s, slot, limit + count, error);
   if (rc == LC_OK) {
     s->token_next = limit + 1;
-    s->token_limit = grant.token;
+    s->token_limit = limit + count;
     s->token_end = limit + TOKEN_RANGE;
   }
   return rc;
@@ -2820,6 +2852,8 @@ static int canonical_certificate(ps_space *s, ps_readiness_certificate *out,
   if (rc == LC_OK && (out->pending & PS_READINESS_RECOVERY))
     return err(error, LC_ERR_PENDING,
                "container recovery cleanup awaits durability");
+  if (rc == LC_OK)
+    s->token_limit = out->grant_limit;
   return rc;
 }
 static int canonical_observe(ps_space *s, lc_error *error) {
@@ -2891,35 +2925,15 @@ static int canonical_journal(ps_space *s,
       return err(error, LC_ERR_PENDING,
                  "journal boundary is not yet certified");
     }
-    if (replay &&
-        (get32(next) == REVISION_MAGIC ||
-         (get32(next) == EVENT_MAGIC && get32(next + 20) != PS_RESERVE_IDS))) {
-      rc = replay_frame(s, next, certificate->ready, error);
-      if (rc != LC_OK)
-        return rc;
-      continue;
-    }
     /* Allocation helpers may already hold state derived from the old view.
-     * Only a grant can advance their observation without revising that state.
-     * Its global frontier is distinct from our private spending endpoint. */
-    if (get32(next) != (uint32_t)EVENT_MAGIC || get32(next + 4) != 64 ||
-        s->sequence == UINT64_MAX || get64(next + 8) != s->sequence + 1 ||
-        get32(next + 16) || get32(next + 20) != PS_RESERVE_IDS ||
-        get64(next + 24) || get64(next + 32) ||
-        !valid_token_grant(s->token_limit, get64(next + 40)) ||
-        get64(next + 48) || get32(next + 56) ||
-        get32(next + 60) != checksum(next, 60) ||
-        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
+     * Advancing the journal would revise that state. Grant publication is
+     * observed separately from the journal through the certificate. */
+    if (!replay ||
+        (get32(next) != REVISION_MAGIC && get32(next) != EVENT_MAGIC))
       return err(error, LC_ERR_PENDING, "container journal view needs refresh");
-    memcpy(s->journal_image + s->journal, next, sizeof(next));
-    s->token_limit = get64(next + 40);
-    ++s->sequence;
-    s->journal += sizeof(next);
-    /* A reopen grant follows complete rejected-tail retirement and its
-     * barrier. A peer may have erased this observer's old checkpoint residue.
-     * Later changed prefixes still have to reconcile against these zeros. */
-    memset(s->journal_image + s->journal, 0, PS_JOURNAL - s->journal);
-    __atomic_fetch_add(&s->pending_sequence, 1, __ATOMIC_RELEASE);
+    rc = replay_frame(s, next, certificate->ready, error);
+    if (rc != LC_OK)
+      return rc;
   }
   if (s->readiness && s->sequence < certificate->ready)
     return err(error, LC_ERR_PENDING, "certified journal view needs refresh");
@@ -3567,14 +3581,6 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
                                lc_error *error) {
   ps_entry *old, *head;
   int rc;
-  if (event == PS_RESERVE_IDS) {
-    if (!valid_token_grant(s->token_limit, p->token))
-      return err(error, LC_ERR_PROTOCOL,
-                 "invalid incarnation range progression");
-    s->token_limit = p->token;
-    entry_free(p);
-    return LC_OK;
-  }
   old = lookup(s, p->key);
   if (event == PS_PUT) {
     if (p->key.kind == PS_OWNED_RUN) {
@@ -3664,9 +3670,10 @@ static int recover(ps_space *s, lc_error *error) {
   metadata_recovery recovery;
   ps_entry *p = NULL;
   struct stat st;
+  uint64_t grant_limit;
   size_t cursor = 0, bytes, i, first, last;
   int a, b, event, rc, retire_sibling, retirement_needed, range_available;
-  int pending_data = 0;
+  int pending_data = 0, grant_slot;
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -3690,7 +3697,9 @@ static int recover(ps_space *s, lc_error *error) {
   s->directory.generation = get64(root + 40);
   s->token_limit = get64(root + 48);
   memcpy(s->identity, root + 56, 16);
-  rc = ps_readiness_read(s, &certificate, error);
+  rc = read_token_limit(s, &grant_limit, &grant_slot, error);
+  if (rc == LC_OK)
+    rc = ps_readiness_read(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
   if (s->maximum && s->capacity > s->maximum)
@@ -3722,6 +3731,7 @@ static int recover(ps_space *s, lc_error *error) {
     rc = ps_catalog_validate_directory(s, error);
   if (rc != LC_OK)
     goto done;
+  s->token_limit = grant_limit;
   rc = transfer(s, wire, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
   if (rc != LC_OK)
     goto done;
@@ -3734,7 +3744,7 @@ static int recover(ps_space *s, lc_error *error) {
     if (bytes < 64 || bytes > PS_JOURNAL - cursor)
       break;
     /* Stamp hints carry live ownership, with no data or tail visibility.
-     * Any later data, grant or stream boundary keeps the admission barrier. */
+     * Any later data or stream boundary keeps the admission barrier. */
     event = get32(wire + cursor + 20);
     if (s->sequence >= certificate.durable &&
         (get32(wire + cursor) == REVISION_MAGIC ||
@@ -3844,15 +3854,17 @@ static int recover(ps_space *s, lc_error *error) {
                     certificate.grant_used < certificate.grant_limit;
   /* A live join can leave the selected prefix untouched and spend an already
    * durable range. It still stabilizes any unacknowledged data before using
-   * the recovered projection, which does not preserve prior visibility.
-   * When appending a new grant, require a stable end or a journal that has
-   * only extended the suffix scrubbed at the beginning of this cohort. */
+   * the recovered projection. A new grant does not advance the accepted
+   * journal sequence, so its barrier can also stabilize the cleanup. */
   s->peer_durable = certificate.durable;
+  if (!range_available) {
+    rc = grant_tokens(s, 1 - grant_slot, error);
+    if (rc != LC_OK)
+      goto done;
+  }
   if (retirement_needed || certificate.pending ||
       certificate.root != s->generation || certificate.ready != s->sequence ||
-      (range_available && pending_data) ||
-      (certificate.durable != s->sequence && !range_available &&
-       get64(root + 24) >= certificate.origin)) {
+      pending_data || !range_available) {
     rc = sync_file(s, error);
     if (rc != LC_OK)
       goto done;
@@ -3867,12 +3879,6 @@ static int recover(ps_space *s, lc_error *error) {
   if (range_available) {
     s->token_next = certificate.grant_used + 1;
     s->token_end = certificate.grant_used + TOKEN_RANGE;
-  } else {
-    rc = grant_tokens(s, error);
-    if (rc == LC_OK)
-      rc = sync_file(s, error);
-    if (rc == LC_OK)
-      s->peer_durable = s->sequence;
   }
 done:
   lc_free_with_allocator(NULL, buffer);
@@ -4256,9 +4262,12 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   if (get64(root + 8) == s->generation)
     return canonical_journal(s, &certificate, 1, 1, error);
   if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
-      get64(root + 16) < s->capacity || get64(root + 48) < s->token_limit)
+      get64(root + 16) < s->capacity)
     return err(error, LC_ERR_PENDING,
                "checkpoint would regress a live projection");
+  if (get64(root + 48) > certificate.grant_limit)
+    return err(error, LC_ERR_PENDING,
+               "checkpoint incarnation frontier awaits certification");
   if (get64(root + 8) < certificate.root)
     return err(error, LC_ERR_PENDING,
                "selected root is behind certified retirement");
@@ -4311,6 +4320,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     rc = ps_catalog_validate_directory(v, error);
   if (rc != LC_OK)
     goto done;
+  v->token_limit = certificate.grant_limit;
   /* The checkpoint prefix covers the resident journal. Consequently only
    * checkpoint entries, including those superseded by the following tail,
    * can match an existing incarnation. Bind them before decoding that tail. */
@@ -4584,6 +4594,8 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     s->token_next = 1;
     s->token_limit = opening ? TOKEN_POOL : TOKEN_RANGE;
     s->token_end = TOKEN_RANGE;
+    if (rc == LC_OK)
+      rc = write_token_limit(s, 0, s->token_limit, error);
     if (rc == LC_OK)
       rc = initial_free(s, error);
     if (rc == LC_OK)

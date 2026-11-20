@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [pooled incarnation grants](#pooled-incarnation-grants-and-reopen) | Cold admission and sustained-load acceptance remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants) | Cold replay cost and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -8903,3 +8903,62 @@ for durable outbox. Outbox process CPU had medians of 120.68 ms before and
 two syncs. The durable outbox reopen performs fourteen. Test logs, the old
 timeout stacks and benchmark counters are under the `txn-authority-` prefix
 in `build/pouch-space-concurrent/`.
+
+## Cold admission and independent incarnation grants
+
+An incarnation range also supplies the identity used by a live writer's
+ownership stamps. Admission still reserves that range before returning. The
+durable high-water frontier lives in two alternating, checksummed 40-byte
+records, each at offset 512 within one of the two fixed root pages. Each
+record binds the frontier to the container identity. Recovery uses the
+highest valid frontier and retains the preceding record when advancing it.
+
+Recovery can stabilize the new grant, rejected journal tail and sibling-root
+retirement in one barrier because advancing the grant leaves the canonical
+journal sequence unchanged. If the new grant persists independently while
+cleanup is lost, the next cold opener skips the reserved range and retries
+cleanup at the original replay boundary. A live peer learns the durable
+frontier from the readiness certificate and keeps its own spending endpoint.
+A clean join can still spend a range from the existing pool without a sync.
+Refilling the pool requires one sync even with a full journal. Each checkpoint
+records the frontier under which its own descriptors were written.
+
+The required root geometry word now marks the two fixed grant records, and
+the volatile readiness marker fences peers that publish grants differently.
+The experiment recreates files from earlier layouts using the existing
+format-version marker.
+
+Debug, GNU Release and musl Release each passed 32 selected checks. The
+recovery fixtures cover 34 I/O failure sites with lost and torn persistence,
+eight cases in which the grant persists ahead of cleanup, and successful
+same-size appends after recovery. A live peer observes a refill without a
+journal revision. The full-journal fixture defers the checkpoint until real
+publication needs it. All 24 fixed-capacity pressure runs verified after
+reopen. Each streamed 18 MiB through the initial 10 MiB container using the
+1 MiB segment target.
+
+All 72 matched GNU lifecycle samples verified. Each cell reports six-sample
+medians in milliseconds in the order prior single-file (`af1d3dcd`), current
+single-file and multifile. The runs used two shared writers, 12 rows, explicit
+1 MiB segments and background maintenance disabled. The indexed runs used two
+rounds and a matched canonical durability boundary.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 29.44 / 26.28 / 91.09 | 12.80 / 8.98 / 18.92 | 0.23 / 0.29 / 0.06 | 5.33 / 3.18 / 0.43 | 0.37 / 0.36 / 0.55 |
+| Queue, 64 KiB durable | 329.77 / 309.30 / 423.59 | 70.26 / 59.14 / 93.96 | 0.30 / 0.28 / 0.13 | 5.36 / 3.87 / 0.54 | 0.42 / 0.55 / 0.64 |
+| Indexed state, 4 KiB NoSync | 67.71 / 52.75 / 161.30 | 12.11 / 2.39 / 17.99 | 0.59 / 0.68 / 0.26 | 6.13 / 4.43 / 0.63 | 1.39 / 1.28 / 2.41 |
+| Outbox, 64 KiB durable | 984.05 / 1083.81 / 1480.00 | 194.38 / 197.92 / 282.88 | 0.56 / 0.63 / 0.28 | 40.82 / 45.28 / 65.97 | 68.18 / 68.12 / 129.70 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 37.49 / 35.66 / 134.33 | 26.00 / 19.29 / 23.93 | 0.42 / 0.45 / 5.08 | 0.21 / 0.16 / 0.52 |
+
+Every single-file reopen issued one fewer sync. Queue and indexed reopen used
+one sync each. Durable outbox reopen, including SDK recovery, used thirteen.
+Reopen improved in all six pairs for both queue profiles and five of six for
+indexed state. The median paired changes were −2.39, −1.43 and −1.52 ms,
+respectively. Durable outbox reopen had a median paired change of +5.05 ms and
+foreground work +66.39 ms. Outbox foreground work was faster in three of six
+pairs. These samples leave the outbox timing effect uncertain. Results are
+under the `grant-record-` prefix in `build/pouch-space-concurrent/`.

@@ -30,8 +30,7 @@ typedef struct ps_catalog_index {
 enum ps_event {
   PS_PUT,
   PS_REMOVE,
-  PS_RESERVE_IDS,
-  PS_SEAL,
+  PS_SEAL = 3,
   PS_STREAM_TAIL,
   PS_STREAM_OWNER,
   PS_NAMESPACE_OWNER,
