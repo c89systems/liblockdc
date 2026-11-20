@@ -144,15 +144,6 @@ void ps_catalog_free_record(ps_entry *p) {
 size_t ps_catalog_record_bytes(const ps_entry *p) {
   return 104 + p->catalog->length + p->catalog->value_length;
 }
-/* This is only an admission hint. The full decoder and catalog transition
- * checks still validate every field before replay changes ownership. */
-int ps_catalog_marker_frame(const ps_entry *old, const unsigned char *wire,
-                            size_t bytes) {
-  return read32(wire + 20) == PS_REMOVE
-             ? old && old->catalog && old->catalog->kind == PS_CATALOG_MARKER
-             : read32(wire + 20) == PS_PUT && bytes >= 104 &&
-                   read32(wire + 64) == PS_CATALOG_MARKER;
-}
 void ps_catalog_encode_record(unsigned char *wire, const ps_entry *p) {
   const ps_catalog_record *r = p->catalog;
   write32(wire + 64, r->kind);
@@ -234,15 +225,21 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
   }
   return reserve_index(s, e);
 }
+static void release_target(ps_entry *target, uint64_t sequence, uint64_t wire) {
+  if (target) {
+    --target->catalog_refs;
+    if (sequence > target->catalog_release)
+      target->catalog_release = sequence;
+    if (wire > target->catalog_release_wire)
+      target->catalog_release_wire = wire;
+  }
+}
 void ps_catalog_apply_record(ps_space *s, ps_entry *p, uint64_t sequence) {
   ps_entry *old = named(s, p->key.owner, p->catalog->kind, p->catalog->name,
                         p->catalog->length);
   if (old) {
-    if (!old->deleted && old->catalog->target) {
-      --old->catalog->target->catalog_refs;
-      if (sequence > old->catalog->target->catalog_release)
-        old->catalog->target->catalog_release = sequence;
-    }
+    if (!old->deleted)
+      release_target(old->catalog->target, sequence, p->peer_sequence);
     ps_catalog_unlink(s, old);
   }
   if (p->catalog->target)
@@ -264,13 +261,20 @@ int ps_catalog_validate_directory(ps_space *s, lc_error *e) {
     }
   return LC_OK;
 }
-void ps_catalog_drop_record(ps_space *s, ps_entry *p, uint64_t sequence) {
-  if (p->catalog->target) {
-    --p->catalog->target->catalog_refs;
-    if (sequence > p->catalog->target->catalog_release)
-      p->catalog->target->catalog_release = sequence;
-  }
+void ps_catalog_drop_record(ps_space *s, ps_entry *p, uint64_t sequence,
+                            uint64_t wire) {
+  release_target(p->catalog->target, sequence, wire);
   ps_internal_remove(s, p, sequence);
+  p->peer_sequence = wire;
+}
+static int target_retained(const ps_entry *p, uint64_t prefix, uint64_t peer) {
+  return p->catalog_refs || p->catalog_pins || p->catalog_release > prefix ||
+         p->catalog_release_wire > peer;
+}
+int ps_catalog_target_retained(ps_space *s, const ps_entry *p) {
+  return target_retained(
+      p, __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE),
+      s->peer_durable);
 }
 static int ref_matches(ps_space *s, ps_entry *p, const ps_ref *ref) {
   return ref && !memcmp(ref->container, s->identity, 16) && p && !p->deleted &&
@@ -471,7 +475,7 @@ int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
     rc = ps_internal_event(s, p, PS_REMOVE, e);
   if (rc == LC_OK) {
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
-    ps_catalog_drop_record(s, p, sequence);
+    ps_catalog_drop_record(s, p, sequence, 0);
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
@@ -627,9 +631,8 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   lc_free_with_allocator(NULL, entries);
   return rc;
 }
-static int orphan(ps_entry *p, uint64_t prefix) {
-  return !p->catalog_refs && !p->catalog_pins && !p->stream_handles &&
-         p->catalog_release <= prefix;
+static int orphan(const ps_entry *p, uint64_t prefix, uint64_t peer) {
+  return !p->stream_handles && !target_retained(p, prefix, peer);
 }
 int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
   ps_coordination_guard *guard;
@@ -657,16 +660,19 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
   ps_entry **entries = NULL, *p;
   ps_ref ref;
   size_t i, count = 0, at = 0;
-  uint64_t prefix;
+  uint64_t prefix, peer;
   int rc, collect = 0;
   if (!s || !callback)
     return cat_error(e, LC_ERR_INVALID, "orphan visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
+  /* Use the same eligibility boundary for sizing and filling the snapshot.
+   * A finishing local sync can advance durability without this mutex. */
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  peer = s->peer_durable;
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
     for (p = s->stream_buckets[i]; p; p = p->stream_next)
-      if (orphan(p, prefix))
+      if (orphan(p, prefix, peer))
         ++count;
   if (rc == LC_OK && count) {
     if (count > (size_t)-1 / sizeof(*entries))
@@ -679,7 +685,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
   }
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
     for (p = s->stream_buckets[i]; p; p = p->stream_next)
-      if (orphan(p, prefix)) {
+      if (orphan(p, prefix, peer)) {
         entries[at++] = p;
         ++p->pins;
         ++s->readers;

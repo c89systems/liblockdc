@@ -56,7 +56,7 @@ typedef struct ps_entry {
   uint64_t
       peer_sequence; /* imported visibility uses the certified wire clock */
   uint64_t stream_capacity, stream_runs, stream_ready, stream_wire;
-  uint64_t stream_edit_wire, stream_complete_generation;
+  uint64_t stream_edit_wire, stream_complete_generation, stream_structure_wire;
   uint64_t writer_stamp, writer_generation;
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */
@@ -88,7 +88,7 @@ typedef struct ps_entry {
   ps_directory_value checkpoint_ref, pending_ref;
   struct ps_entry *stream_next;
   struct ps_catalog_record *catalog;
-  uint64_t catalog_refs, catalog_release;
+  uint64_t catalog_refs, catalog_release, catalog_release_wire;
   size_t catalog_pins;
 } ps_entry;
 typedef struct ps_run {
@@ -202,14 +202,14 @@ int ps_catalog_decode_record(ps_entry *, const unsigned char *, size_t,
                              lc_error *);
 void ps_catalog_encode_record(unsigned char *, const ps_entry *);
 size_t ps_catalog_record_bytes(const ps_entry *);
-int ps_catalog_marker_frame(const ps_entry *, const unsigned char *, size_t);
 void ps_catalog_free_record(ps_entry *);
 int ps_catalog_prepare_record(ps_space *, ps_entry *, int checkpoint,
                               lc_error *);
 void ps_catalog_apply_record(ps_space *, ps_entry *, uint64_t);
 void ps_catalog_unlink(ps_space *, ps_entry *);
 int ps_catalog_validate_directory(ps_space *, lc_error *);
-void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t);
+void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t, uint64_t);
+int ps_catalog_target_retained(ps_space *, const ps_entry *);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
 int ps_internal_healthy(ps_space *, lc_error *);
 /* Capture selection and its first physical witness under the same canonical

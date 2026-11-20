@@ -3377,10 +3377,18 @@ static void additive_catalog(void) {
   ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
   REQUIRE(view);
   ps_catalog_view_close(view);
-  REQUIRE(ps_catalog_get(a, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e) ==
-              LC_ERR_PENDING &&
-          !view);
+  uint64_t generation = a->generation;
+  ok(ps_catalog_get(a, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
+  REQUIRE(view);
+  ps_catalog_view_close(view);
+  int continued;
+  REQUIRE(ps_internal_namespace_stamp(a, info.id, &continued, &e) ==
+          LC_ERR_PENDING);
   lc_error_cleanup(&e);
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  capture_put(a, 3, 65);
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(a->generation == generation);
   finish_catalog_sync(&gate, thread);
   ok(ps_catalog_get(b, 0, PS_CATALOG_NAMESPACE, "new", 3, &view, &e), &e);
   REQUIRE(!view);
@@ -3391,6 +3399,196 @@ static void additive_catalog(void) {
   REQUIRE(!pthread_cond_destroy(&gate.cond) &&
           !pthread_mutex_destroy(&gate.mutex));
   REQUIRE(!unlink(path));
+}
+enum structural_action {
+  STRUCTURAL_SEAL,
+  STRUCTURAL_REPACK,
+  STRUCTURAL_DROP_PIECE,
+  STRUCTURAL_EDIT_CATALOG,
+  STRUCTURAL_RETIRE
+};
+typedef struct structural_edit {
+  ps_owned_head *head;
+  ps_owned_run *old, *replacement;
+  ps_space *space;
+  ps_ref binding, target;
+  ps_key target_key;
+  enum structural_action action;
+} structural_edit;
+static void *publish_structural_edit(void *context) {
+  structural_edit *edit = context;
+  lc_error e = {0};
+  ps_owned_range range = {100, 100};
+  if (edit->action == STRUCTURAL_SEAL)
+    ok(ps_owned_seal(edit->head, &e), &e);
+  else if (edit->action == STRUCTURAL_EDIT_CATALOG) {
+    if (edit->target.incarnation) {
+      ps_catalog_info result;
+      ok(ps_catalog_put(edit->space, NULL, 88, PS_CATALOG_BODY, "stream", 6,
+                        &edit->binding, edit->target_key, &edit->target,
+                        &result, &e),
+         &e);
+    } else
+      ok(ps_catalog_remove(edit->space, 88, PS_CATALOG_BODY, "stream", 6,
+                           &edit->binding, &e),
+         &e);
+  } else if (edit->action == STRUCTURAL_RETIRE)
+    ok(ps_owned_retire(edit->head, &e), &e);
+  else
+    ok(ps_owned_run_repack(edit->head, edit->old, NULL, &range,
+                           edit->action == STRUCTURAL_REPACK, NULL, NULL,
+                           &edit->replacement, &e),
+       &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+typedef struct orphan_probe {
+  uint64_t incarnation;
+  int found;
+} orphan_probe;
+static int find_orphan(void *context, ps_key key, const ps_ref *ref,
+                       lc_error *error) {
+  orphan_probe *probe = context;
+  (void)key;
+  (void)error;
+  if (ref->incarnation == probe->incarnation)
+    probe->found = 1;
+  return LC_OK;
+}
+static void ready_structural_stream(int rollover) {
+  lc_error e = {0};
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *owner = NULL, *peer = NULL;
+  ps_owned_head *observer = NULL;
+  ps_owned_run *captured = NULL, *current = NULL;
+  ps_owned_status info;
+  ps_catalog_info binding;
+  ps_catalog_view *view = NULL;
+  structural_edit edit = {0};
+  unsigned char bytes[PS_CHUNK];
+  pthread_t thread;
+  int found;
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &owner, &e), &e);
+  ok(ps_owned_open(owner, NULL, tail_stream(), 1, NULL, &edit.head, &info, &e),
+     &e);
+  ps_ref ref = info.ref;
+  ok(ps_owned_grant(edit.head, NULL, 0, PS_PAGE, &edit.old, &found, &e), &e);
+  REQUIRE(found);
+  memset(bytes, 's', sizeof(bytes));
+  ok(ps_owned_write(edit.old, 0, bytes, 1000, &e), &e);
+  ps_piece_checksum crc;
+  ok(ps_owned_piece_extend(edit.old, 0, NULL, 1000, bytes, &crc, &e), &e);
+  ok(ps_owned_commit(edit.head, 1000, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ok(ps_flush(owner, &e), &e);
+  ok(ps_catalog_put(owner, NULL, 88, PS_CATALOG_BODY, "stream", 6, NULL,
+                    tail_stream(), &ref, &binding, &e),
+     &e);
+  edit.space = owner;
+  edit.binding = binding.revision;
+  if (rollover) {
+    ps_owned_head *next = NULL;
+    edit.target_key = tail_stream();
+    ++edit.target_key.key;
+    ok(ps_owned_open(owner, NULL, edit.target_key, 1, NULL, &next, &info, &e),
+       &e);
+    edit.target = info.ref;
+    ps_owned_close(next);
+  }
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_owned_open(peer, NULL, tail_stream(), 0, &ref, &observer, &info, &e),
+     &e);
+  ok(ps_owned_grant(observer, NULL, 0, 0, &captured, &found, &e), &e);
+  REQUIRE(found);
+  orphan_probe orphan = {ref.incarnation, 0};
+  for (edit.action = STRUCTURAL_SEAL; edit.action <= STRUCTURAL_RETIRE;
+       ++edit.action) {
+    if (rollover) {
+      ok(ps_refresh(owner, &e), &e);
+      ok(ps_checkpoint(owner, &e), &e);
+    }
+    gate.entered = gate.released = 0;
+    gate.paused = 1;
+    REQUIRE(!pthread_create(&thread, NULL, publish_structural_edit, &edit));
+    wait_catalog_sync(&gate);
+    uint64_t generation = owner->generation;
+    ps_readiness_certificate before = readiness(peer);
+    REQUIRE(before.ready > before.durable);
+    ok(ps_refresh(peer, &e), &e);
+    if (edit.action == STRUCTURAL_EDIT_CATALOG) {
+      ok(ps_catalog_get(peer, 88, PS_CATALOG_BODY, "stream", 6, &view, &e), &e);
+      REQUIRE(view);
+      ok(ps_catalog_view_info(view, &binding, &e), &e);
+      REQUIRE(binding.target.incarnation == ref.incarnation);
+      ps_catalog_view_close(view);
+      REQUIRE(ps_owned_claim_orphan(observer, &e) == LC_ERR_INVALID);
+      lc_error_cleanup(&e);
+      REQUIRE(ps_owned_retire(observer, &e) == LC_ERR_INVALID);
+      lc_error_cleanup(&e);
+      ps_owned_close(observer);
+      observer = NULL;
+      ok(ps_catalog_visit_orphans(peer, find_orphan, &orphan, &e), &e);
+      REQUIRE(!orphan.found);
+    } else {
+      REQUIRE(ps_owned_status_capture(observer, &info, &e) == LC_ERR_PENDING);
+      lc_error_cleanup(&e);
+      REQUIRE(ps_owned_grant(observer, NULL, 0, 0, &current, &found, &e) ==
+                  LC_ERR_PENDING &&
+              !current && !found);
+      lc_error_cleanup(&e);
+    }
+    ok(ps_owned_read(captured, 600, bytes, 1, &e), &e);
+    REQUIRE(bytes[0] == 's');
+    capture_put(peer, 10U + (unsigned int)edit.action, 65);
+    REQUIRE(peer->generation == generation &&
+            readiness(peer).durable == before.durable);
+    finish_catalog_sync(&gate, thread);
+    if (edit.action == STRUCTURAL_EDIT_CATALOG) {
+      ok(ps_catalog_get(peer, 88, PS_CATALOG_BODY, "stream", 6, &view, &e), &e);
+      REQUIRE((view != NULL) == rollover);
+      if (view) {
+        ok(ps_catalog_view_info(view, &binding, &e), &e);
+        REQUIRE(binding.target.incarnation == edit.target.incarnation);
+        ps_catalog_view_close(view);
+      }
+      ok(ps_catalog_visit_orphans(peer, find_orphan, &orphan, &e), &e);
+      REQUIRE(orphan.found);
+      ok(ps_owned_open(peer, NULL, tail_stream(), 0, &ref, &observer, &info,
+                       &e),
+         &e);
+    }
+    ok(ps_owned_status_capture(observer, &info, &e), &e);
+    REQUIRE(info.sealed && info.retired == (edit.action == STRUCTURAL_RETIRE));
+    if (edit.action == STRUCTURAL_REPACK) {
+      ps_owned_run_close(edit.old);
+      edit.old = edit.replacement;
+      edit.replacement = NULL;
+      ok(ps_owned_grant(observer, NULL, 0, 0, &current, &found, &e), &e);
+      REQUIRE(found && ps_owned_run_mapped(current));
+      ok(ps_owned_read(current, 100, bytes, 100, &e), &e);
+      REQUIRE(bytes[0] == 's' && bytes[99] == 's');
+      ps_owned_run_close(current);
+      current = NULL;
+    }
+  }
+  ok(ps_checkpoint(peer, &e), &e);
+  ok(ps_owned_read(captured, 999, bytes, 1, &e), &e);
+  REQUIRE(bytes[0] == 's');
+  ps_owned_run_close(captured);
+  ps_owned_run_close(edit.old);
+  ps_owned_close(observer);
+  ps_owned_close(edit.head);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(owner, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  for (unsigned int n = 10; n < 15; ++n)
+    expect_value(peer, key(n), 65, n);
+  ok(ps_close(peer, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 typedef struct marker_edit {
   ps_space *space;
@@ -3560,6 +3758,8 @@ static void journal_replay_structural(void) {
   replay_structural(0);
   replay_structural(1);
   additive_catalog();
+  ready_structural_stream(0);
+  ready_structural_stream(1);
   inline_catalog_markers();
   catalog_workspace_with_peer_writer();
 }

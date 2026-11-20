@@ -51,12 +51,13 @@ static int canonical_journal(ps_space *, const ps_readiness_certificate *,
                              int replay, int verify_end, lc_error *);
 static int replay_frame(ps_space *, const unsigned char *, uint64_t,
                         lc_error *);
-static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t,
+static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t, uint64_t,
                                lc_error *);
 static ps_entry *selected_value(ps_space *, ps_entry *, uint64_t);
 static int canonical_refresh(ps_space *, int verify_disk, lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
+static int stream_structure_ready(ps_space *, const ps_entry *, lc_error *);
 struct ps_values {
   ps_space *space;
   ps_entry **items;
@@ -3345,12 +3346,10 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
 static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             size_t bytes, uint64_t certified, int staged,
                             lc_error *error) {
-  ps_entry **entries = NULL, *single = NULL, *marker_removed = NULL;
-  ps_key key;
+  ps_entry **entries = NULL, *single = NULL;
   replay_change *changes = NULL;
   size_t i, j, count = 1;
-  int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, additive,
-      marker = 0, structural, rc, retried = 0;
+  int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, rc, retried = 0;
   if (group)
     count = get32(wire + 16);
   if (certified <= s->sequence || !count || count > certified - s->sequence ||
@@ -3362,29 +3361,9 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
       ++s->sequence;
     return rc;
   }
-  key.kind = get32(wire + 16);
-  key.owner = get64(wire + 24);
-  key.key = get64(wire + 32);
-  if (!group && key.kind == PS_CATALOG) {
-    if (get32(wire + 20) == PS_REMOVE)
-      marker_removed = lookup(s, key);
-    marker = ps_catalog_marker_frame(marker_removed, wire, bytes);
-    if (!marker)
-      marker_removed = NULL;
-  }
-  additive = !group && get32(wire + 20) == PS_PUT &&
-             (key.kind == PS_STREAM ||
-              (key.kind == PS_CATALOG && key.key == get64(wire + 40)) ||
-              (key.kind == PS_OWNED_RUN && bytes >= 80 && !get32(wire + 72)));
-  structural = !group && !immutable_key(key) && !additive && !marker;
-  /* New heads, bindings and raw capacity consume ownership without releasing
-   * a predecessor. Import their checked frames to keep unrelated writers
-   * moving. Inline marker edits also own no external resources. Both live
-   * catalog forms keep their previous visible revision until durable.
-   */
-  if (structural && s->sequence >= s->peer_durable)
-    return err(error, LC_ERR_PENDING,
-               "peer structural frame awaits durability");
+  /* Ready frames establish allocator ownership in journal order. Catalog
+   * visibility and new admissions to changed streams use the durable clock.
+   * Retired extents still belong to the old root or its captured readers. */
   if (group)
     rc = decode_revision(s, wire, bytes, NULL, &entries, error);
   else {
@@ -3421,11 +3400,9 @@ replay_extents:
       rc = verify_owned(s, single, header, error);
     }
     if (rc == LC_OK) {
-      if (immutable_key(key) || (key.kind == PS_CATALOG && event == PS_PUT))
+      if (immutable_key(single->key) || single->key.kind == PS_CATALOG)
         single->peer_sequence = s->sequence + 1;
-      rc = apply_journal_event(s, single, event, 0, error);
-      if (rc == LC_OK && marker_removed)
-        marker_removed->peer_sequence = s->sequence + 1;
+      rc = apply_journal_event(s, single, event, 0, s->sequence + 1, error);
     }
   }
   replay_finish(s, changes, rc == LC_OK);
@@ -3549,7 +3526,8 @@ static int remove_owned(ps_space *s, ps_entry *head, uint64_t sequence,
 /* Common transition checks for cold recovery and certified live replay.
  * Success consumes the decoded entry. Errors leave it with the caller. */
 static int apply_journal_event(ps_space *s, ps_entry *p, int event,
-                               uint64_t release, lc_error *error) {
+                               uint64_t release, uint64_t wire,
+                               lc_error *error) {
   ps_entry *old, *head;
   int rc;
   if (event == PS_RESERVE_IDS) {
@@ -3569,6 +3547,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         if (!old || old->deleted || !head ||
             p->stream_capacity != old->stream_capacity)
           return err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch");
+        head->stream_structure_wire = wire;
       } else {
         if (old && !old->deleted)
           return err(error, LC_ERR_PROTOCOL,
@@ -3601,13 +3580,14 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         return err(error, LC_ERR_PROTOCOL, "journal stream seal mismatch");
       old->bytes = p->bytes;
       old->stream_sealed = 1;
+      old->stream_structure_wire = wire;
       if (!old->dirty_link)
         dirty_entry(s, old, NULL);
       entry_free(p);
       return LC_OK;
     }
     if (p->key.kind == PS_CATALOG) {
-      ps_catalog_drop_record(s, old, release);
+      ps_catalog_drop_record(s, old, release, wire);
       entry_free(p);
       return LC_OK;
     }
@@ -3617,8 +3597,10 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
       rc = remove_owned(s, old, release, 0, error);
       if (rc == LC_OK)
         rc = remove_owned(s, old, release, 1, error);
-      if (rc == LC_OK)
+      if (rc == LC_OK) {
+        old->stream_structure_wire = wire;
         entry_free(p);
+      }
       return rc;
     }
     if (p->key.kind == PS_OWNED_RUN) {
@@ -3626,6 +3608,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
       if (!head || !head->stream_runs)
         return err(error, LC_ERR_PROTOCOL, "piece removal has no head");
       --head->stream_runs;
+      head->stream_structure_wire = wire;
       if (!head->dirty_link)
         dirty_entry(s, head, NULL);
     }
@@ -3755,7 +3738,7 @@ static int recover(ps_space *s, lc_error *error) {
         break;
       }
     }
-    rc = apply_journal_event(s, p, event, s->sequence + 1, error);
+    rc = apply_journal_event(s, p, event, s->sequence + 1, 0, error);
     if (rc != LC_OK) {
       entry_free(p);
       goto done;
@@ -4032,6 +4015,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       dest->pending_ref = q->pending_ref;
       dest->catalog_refs = q->catalog_refs;
       dest->catalog_release = 0;
+      dest->catalog_release_wire = q->catalog_release_wire;
       dest->owned_linked = q->owned_linked;
       dest->writer_stamp = q->writer_stamp;
       dest->writer_generation = q->writer_generation;
@@ -4043,6 +4027,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->stream_wire = q->stream_wire;
         dest->stream_edit_wire = q->stream_edit_wire;
         dest->stream_complete_generation = q->stream_complete_generation;
+        dest->stream_structure_wire = q->stream_structure_wire;
         dest->bytes = q->bytes;
       }
     }
@@ -4771,6 +4756,9 @@ int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
        !stream_lookup(s, old->key.owner) || !w->entry->owned_mapped ||
        w->entry->stream_capacity != old->stream_capacity))
     rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
+  if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN)
+    rc =
+        stream_structure_ready(s, stream_lookup(s, w->entry->key.owner), error);
   if (rc == LC_OK && old && !old->deleted &&
       w->entry->key.kind == PS_COLLECTION)
     rc = err(error, LC_ERR_INVALID, "collection position already published");
@@ -5881,6 +5869,19 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
       head->entry->stream_complete_generation &&
       head->entry->stream_complete_generation == head->space->generation;
 }
+/* Existing run handles already own immutable mappings. A new admission must
+ * use durable geometry even when allocator replay has advanced beyond it. */
+static int stream_structure_ready(ps_space *s, const ps_entry *head,
+                                  lc_error *error) {
+  return head && head->stream_structure_wire > s->peer_durable
+             ? err(error, LC_ERR_PENDING, "stream geometry awaits durability")
+             : LC_OK;
+}
+static int owned_capture_begin(ps_owned_head *head,
+                               ps_coordination_guard **guard, lc_error *e) {
+  int rc = ps_internal_capture_begin(head->space, guard, e);
+  return rc == LC_OK ? stream_structure_ready(head->space, head->entry, e) : rc;
+}
 int ps_internal_stream_claim(ps_space *s, uint64_t token,
                              ps_coordination_guard **claim, lc_error *e) {
   *claim = NULL;
@@ -5919,7 +5920,8 @@ int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
   head.space = s;
   head.entry = lookup(s, key);
   if (!head.entry || head.entry->token != ref->incarnation ||
-      memcmp(s->identity, ref->container, 16))
+      memcmp(s->identity, ref->container, 16) ||
+      stream_structure_ready(s, head.entry, NULL) != LC_OK)
     return 0;
   owned_status(&head, &status);
   if (status.retired || status.sealed ||
@@ -5956,6 +5958,8 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
   old = lookup(s, key);
+  if (rc == LC_OK)
+    rc = stream_structure_ready(s, old, error);
   if (rc == LC_OK && create && old &&
       (!old->deleted ||
        old->publication_sequence >
@@ -5991,6 +5995,9 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (rc == LC_OK && ref &&
       (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
     rc = err(error, LC_ERR_INVALID, "stale or foreign owned stream reference");
+  if (rc == LC_OK && prepare && !p->catalog_refs &&
+      ps_catalog_target_retained(s, p))
+    rc = err(error, LC_ERR_PENDING, "prior stream binding still retained");
   if (rc == LC_OK && prepare && !p->catalog_refs && !p->stream_claim)
     rc = ps_internal_stream_claim(s, p->token, &p->stream_claim, error);
   if (rc == LC_OK) {
@@ -6058,6 +6065,8 @@ int ps_owned_status_get(ps_owned_head *head, ps_owned_status *out,
   pthread_mutex_lock(&head->space->mutex);
   rc = healthy(head->space, error);
   if (rc == LC_OK)
+    rc = stream_structure_ready(head->space, head->entry, error);
+  if (rc == LC_OK)
     owned_status(head, out);
   pthread_mutex_unlock(&head->space->mutex);
   return rc;
@@ -6068,7 +6077,7 @@ int ps_owned_status_capture(ps_owned_head *head, ps_owned_status *out,
   ps_coordination_guard *guard;
   int rc;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   if (rc == LC_OK) {
     owned_status(head, out);
     /* Local removal already fences mutations and name reuse. Read windows
@@ -6127,8 +6136,10 @@ int ps_internal_namespace_stamp(ps_space *s, uint64_t identity, int *continued,
   rc = ps_internal_capture_begin(s, &allocator, error);
   if (rc == LC_OK) {
     p = lookup(s, key);
-    if (!p || p->deleted || !p->catalog ||
-        p->catalog->kind != PS_CATALOG_NAMESPACE)
+    if (p && p->peer_sequence > s->peer_durable)
+      rc = err(error, LC_ERR_PENDING, "namespace ownership awaits durability");
+    else if (!p || p->deleted || !p->catalog ||
+             p->catalog->kind != PS_CATALOG_NAMESPACE)
       rc = err(error, LC_ERR_PROTOCOL, "namespace writer has no catalog owner");
     else
       rc = claim_writer_stamp(s, p, PS_NAMESPACE_OWNER, continued, error);
@@ -6153,7 +6164,7 @@ int ps_owned_edit_begin(ps_owned_head *head, int append,
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &allocator, error);
+  rc = owned_capture_begin(head, &allocator, error);
   if (rc == LC_OK) {
     owned_status(head, status);
     if (!p->deleted && !p->stream_sealed)
@@ -6175,7 +6186,7 @@ int ps_owned_mark_edit(ps_owned_head *head, lc_error *error) {
   ps_coordination_guard *guard;
   int continued, rc;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream is retired or sealed");
   if (rc == LC_OK)
@@ -6195,6 +6206,8 @@ int ps_owned_inspect(ps_space *space, ps_key key, const ps_ref *ref,
   rc = healthy(space, error);
   head.space = space;
   head.entry = lookup(space, key);
+  if (rc == LC_OK)
+    rc = stream_structure_ready(space, head.entry, error);
   if (rc == LC_OK && (!head.entry || head.entry->deleted))
     rc = err(error, LC_ERR_INVALID, "owned inspection target is missing");
   if (rc == LC_OK && ref &&
@@ -6249,6 +6262,8 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   p->key.key = base;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_admission_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = stream_structure_ready(s, head->entry, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK &&
@@ -6407,6 +6422,8 @@ select_run:
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
     rc = ps_internal_admission_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = stream_structure_ready(s, head->entry, error);
   if (rc == LC_OK && spare)
     rc = physical_release(s, p->extents[0].offset + bytes, reserved - bytes,
                           error);
@@ -6501,7 +6518,7 @@ int ps_owned_grant(ps_owned_head *head, ps_budget *budget, uint64_t base,
     key.owner = head->entry->token;
     key.key = base;
     pthread_mutex_lock(&s->mutex);
-    rc = ps_internal_capture_begin(s, &guard, error);
+    rc = owned_capture_begin(head, &guard, error);
     p = lookup(s, key);
     if (rc == LC_OK && p && !p->deleted)
       rc = ps_internal_entry_pin(s, p, error);
@@ -6556,6 +6573,8 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
         memcmp(ref->container, s->identity, 16) || end > head->bytes)
       rc = err(error, LC_ERR_PROTOCOL, "certified stream prefix changed");
   }
+  if (rc == LC_OK)
+    rc = stream_structure_ready(s, head, error);
   if (rc == LC_OK &&
       (head->deleted ||
        (end && (start >= end || end > head->stream_capacity)) ||
@@ -6889,6 +6908,7 @@ static int piece_publish(void *context, lc_error *error) {
   piece_selection *selection = context;
   ps_space *s = selection->head->space;
   ps_entry *old = selection->old, *tombstone = selection->tombstone;
+  ps_coordination_guard *guard;
   uint64_t sequence = 0;
   int rc;
   if (selection->published)
@@ -6899,13 +6919,13 @@ static int piece_publish(void *context, lc_error *error) {
     return rc;
   }
   pthread_mutex_lock(&s->mutex);
-  rc = healthy(s, error);
+  rc = owned_capture_begin(selection->head, &guard, error);
   if (rc == LC_OK &&
       (lookup(s, old->key) != old || old->deleted ||
        selection->head->entry->deleted || !selection->head->entry->stream_runs))
     rc = err(error, LC_ERR_INVALID, "captured piece mapping changed");
   if (rc == LC_OK)
-    rc = append_event(s, old, PS_REMOVE, error);
+    rc = append_event_locked(s, old, PS_REMOVE, error);
   if (rc == LC_OK) {
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     --selection->head->entry->stream_runs;
@@ -6921,6 +6941,7 @@ static int piece_publish(void *context, lc_error *error) {
     selection->tombstone = NULL;
     selection->published = 1;
   }
+  rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
 }
@@ -6962,6 +6983,8 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   selection.old = old;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK)
+    rc = stream_structure_ready(s, head->entry, error);
   if (rc == LC_OK &&
       (head->entry->deleted || old->deleted || lookup(s, old->key) != old ||
        (old->key.key >= head->entry->bytes &&
@@ -7151,7 +7174,7 @@ static int owned_commit(ps_owned_head *head, uint64_t tail, int complete,
     return err(error, LC_ERR_INVALID, "invalid canonical commit mode");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   previous = head->entry->bytes;
   if (rc == LC_OK && !owned_tail_allowed(head->entry, tail))
     rc = err(error, LC_ERR_INVALID, "owned commit tail outside append range");
@@ -7165,7 +7188,7 @@ static int owned_commit(ps_owned_head *head, uint64_t tail, int complete,
     rc = publish(context, tail, error);
     if (rc == LC_OK) {
       pthread_mutex_lock(&s->mutex);
-      rc = ps_internal_capture_begin(s, &guard, error);
+      rc = owned_capture_begin(head, &guard, error);
       if (rc == LC_OK && s->durable &&
           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) < sequence)
         rc = err(error, LC_ERR_PROTOCOL,
@@ -7218,7 +7241,7 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
     return err(error, LC_ERR_INVALID, "owned recovery requires head");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   previous = head->entry->bytes;
   if (rc == LC_OK && !owned_tail_allowed(head->entry, tail))
     rc = err(error, LC_ERR_PROTOCOL, "recovered tail outside owned range");
@@ -7230,7 +7253,7 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
     rc = wait_durable(s, sequence, error);
   if (rc == LC_OK) {
     pthread_mutex_lock(&s->mutex);
-    rc = ps_internal_capture_begin(s, &guard, error);
+    rc = owned_capture_begin(head, &guard, error);
     if (rc == LC_OK && (!owned_tail_allowed(head->entry, tail) ||
                         head->entry->bytes != previous))
       rc = err(error, LC_ERR_PENDING, "owned stream changed during recovery");
@@ -7251,7 +7274,7 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
     return err(error, LC_ERR_INVALID, "owned seal requires head");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   sealed = head->entry->stream_sealed;
   tail = head->entry->bytes;
   needs_sync = head->entry->stream_ready >
@@ -7270,7 +7293,7 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   if (rc == LC_OK && head->entry->deleted)
     rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
   if (rc == LC_OK && head->entry->bytes != tail)
@@ -7300,12 +7323,9 @@ int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
                "orphan claim requires an owned identity");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   if (rc == LC_OK &&
-      (head->entry->deleted || head->entry->catalog_refs ||
-       head->entry->catalog_pins ||
-       head->entry->catalog_release >
-           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
+      (head->entry->deleted || ps_catalog_target_retained(s, head->entry)))
     rc = err(error, LC_ERR_INVALID,
              "owned identity is retained by a catalog binding or view");
   if (rc == LC_OK && !head->entry->stream_claim)
@@ -7326,11 +7346,9 @@ int ps_owned_retire(ps_owned_head *head, lc_error *error) {
     return err(error, LC_ERR_INVALID, "owned retirement requires head");
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = owned_capture_begin(head, &guard, error);
   if (rc == LC_OK && !head->entry->deleted &&
-      (head->entry->catalog_refs || head->entry->catalog_pins ||
-       head->entry->catalog_release >
-           __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
+      ps_catalog_target_retained(s, head->entry))
     rc = err(error, LC_ERR_INVALID,
              "stream is retained by a catalog binding or view");
   if (rc == LC_OK && !head->entry->deleted)

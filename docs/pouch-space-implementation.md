@@ -13,9 +13,9 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [background state reclamation](#background-state-reclamation-at-fixed-capacity) | Messaging completion during maximal competing reservations and default-cadence pressure handling |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [background state reclamation](#background-state-reclamation-at-fixed-capacity) | Same-namespace foreground progress during background reclamation, default-cadence pressure handling, and messaging completion during maximal competing reservations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), and [idle namespace owners](#namespace-mapping-lifetime) | Tail latency and reopen cost |
+| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -8027,9 +8027,8 @@ The completed receipt selector still uses the existing test-clock override
 after its dispatcher stops. State retention and physical reclamation run
 through the actual worker. The initial overlapping variant reproduced
 `LC_ERR_PENDING` during foreground operations when a peer's structural frame
-awaited durability. Concurrent progress through that gate, default-cadence
-pressure handling, and messaging completion against a held maximal reservation
-remain open.
+awaited durability. [Allocator progress during structural publication](#allocator-progress-during-structural-publication)
+addresses that gate and records the remaining namespace contention.
 
 The same qualification exposed busy-append capture on an exclusive root with
 two collection receivers. A receiver could skip repair and still resolve an
@@ -8065,3 +8064,79 @@ NoSync queue work increased 6 ms from the prior single-file build. All four
 current work medians were lower than multifile. Cold queue and indexed-state
 reopen remained about 13 ms against less than 1 ms. Raw runs, counters, fault
 sweeps, and the overlapping worker traces are in `build/pouch-space-autonomous/`.
+
+## Allocator progress during structural publication
+
+Ready journal frames update the peer's allocator ownership in order. A seal,
+piece replacement, piece retirement, or stream retirement records its wire
+boundary on the affected stream. New mapping admissions on that stream defer
+until the boundary is durable. Captured readers retain their original mapping
+handles. Removed physical ranges remain owned until the normal checkpoint
+retirement protocol or longer while a capture holds the range. Another stream
+can obtain budgets, allocate and publish in the meantime.
+
+Catalog replacement and removal use the same durable visibility clock as new
+bindings. A peer sees the old name and target until the selecting frame is
+durable. Although the allocator has already applied the structural edit, the
+old target retains its catalog release dependency on that frame. Orphan
+claims, stream retirement, and preparation of an unbound stream check that
+dependency. Orphan discovery uses the same durable boundary when counting and
+capturing candidates. Namespace ownership stamping defers while its selected
+binding is pending. Checkpoint adoption imports the same fences when the
+following ready journal contains unacknowledged edits.
+
+Selection of an empty-piece removal refreshes the canonical allocator while
+holding allocation authority, then rechecks the exact mapping and publishes
+its removal under that authority. This fixes an additional pending failure
+when an unrelated writer advances the journal during maintenance preparation.
+
+The paused-sync fixture verifies seals, mapped replacements, piece and stream
+retirements, and catalog removal or rebinding. It exercises both resident
+journal replay and adoption of a newer checkpoint with a ready suffix. A
+second owner publishes unrelated values while the original sync remains
+paused. The test verifies that the durable clock has not advanced, that fresh
+access to affected geometry defers, and that earlier body captures survive
+release of the old physical ownership. The prior importer failed at the
+first pending catalog removal. The retained test log is
+`build/pouch-space-structural-progress/test-before.log`.
+
+Exploratory Debug runs kept the one-second worker open through the next
+foreground burst. Both combined-codec profiles completed 16 cycles. The
+plaintext durable run reached cycle 16 and returned `LC_ERR_PENDING` while
+trying to acquire file authority in the lease phase. The controlled capacity
+test continues to close the worker between bursts. The exploratory logs are
+`test-overlap.log` and `test-final-debug.log` in the same directory.
+Same-namespace worker contention, default-cadence pressure, and queue and
+outbox completion under a maximal opposing reservation remain acceptance work.
+
+GNU and musl release passed 71 and 27 selected groups during qualification.
+Ten focused groups passed on each final release build, including peer
+journal and checkpoint replay, collection orphan handling, namespace handoff,
+and concurrent piece maintenance. Final Debug passed the paused-sync fixture
+and two controlled capacity profiles. Across eight controlled runs, each
+profile streamed 18 MiB through a fixed 10 MiB container. Peak allocation
+at the reuse checkpoints was 3,104,768 bytes, and the longest measured wait
+to the reuse and expiry boundary was 16.65 seconds.
+
+All 72 GNU samples verified after reopen. Two producers used preopened
+roots with background maintenance disabled. The run balances all six orders
+of the three configurations. Figures are medians of six samples in milliseconds,
+prior single-file (`195f81e1`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 24.01 / 24.12 / 84.06 | 10.05 / 8.57 / 17.54 | 0.24 / 0.28 / 0.07 | 11.51 / 11.72 / 0.35 | 0.39 / 0.43 / 0.49 |
+| Queue, 64 KiB durable | 271.35 / 272.49 / 342.26 | 54.03 / 54.85 / 69.24 | 0.29 / 0.31 / 0.16 | 11.67 / 11.96 / 0.43 | 0.61 / 0.48 / 0.48 |
+| Indexed state, 4 KiB NoSync | 46.13 / 46.66 / 144.38 | 1.36 / 1.66 / 15.60 | 0.53 / 0.59 / 0.34 | 14.88 / 12.89 / 0.51 | 1.17 / 1.20 / 1.74 |
+| Outbox, 64 KiB durable | 852.41 / 812.47 / 1310.65 | 158.01 / 153.10 / 240.36 | 0.53 / 0.63 / 0.30 | 41.47 / 41.10 / 65.03 | 53.92 / 53.93 / 120.34 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 32.14 / 31.56 / 103.78 | 14.19 / 15.34 / 24.17 | 0.33 / 0.41 / 9.61 | 0.21 / 0.19 / 12.98 |
+
+Current foreground work medians were within 5% of the prior native build
+and 20–71% below multifile in these profiles. The indexed per-item p95
+increased by 0.30 ms from the prior native build. Native queue and indexed
+reopen issued six sync calls per sample and took 12–13 ms. Multifile issued
+none and took 0.35–0.51 ms. The raw timings, sync and CPU counters, and test
+logs are in `build/pouch-space-structural-progress/`.
