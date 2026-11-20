@@ -126,35 +126,37 @@ static void outbox_marker_retention(lc_pouch *p, int kind, lc_error *e) {
 static void outbox_marker_pinned(lc_pouch *p, lc_error *e) {
   ps_root *root = ps_pouch_state_root(p);
   ps_namespace *ns = NULL;
-  ps_catalog_view *view = NULL;
+  ps_catalog_view *view = NULL, *missing = NULL;
   ps_catalog_info info;
-  ps_reader *reader = NULL;
+  const unsigned char *original, *captured;
+  size_t original_length, captured_length;
   unsigned char name[] = {0U, 'p', 'i', 'n'};
-  uint64_t reclaimed, skipped;
   int pending;
   ok(lc_pouch_outbox_state_reclaim_marker_write(p, "work/a", "pin", "parent",
                                                 "state", e),
      e);
   ok(ps_root_namespace_acquire(root, "work/a", 0, &ns, e), e);
   REQUIRE(!ns->data && !ns->collections);
-  ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_CONTROL, name,
+  ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_MARKER, name,
                     sizeof(name), &view, e),
      e);
   REQUIRE(view);
   ok(ps_catalog_view_info(view, &info, e), e);
+  REQUIRE(!info.stream.kind && !info.target.incarnation);
+  ok(ps_catalog_view_marker(view, &original, &original_length, e), e);
   ok(lc_pouch_outbox_state_reclaim_marker_remove(p, "work/a", "pin", e), e);
-  ps_key key = {info.stream.owner, 1U, PS_CONTROL};
-  ok(ps_read_open(root->space, key, NULL, &reader, e), e);
-  ps_reader_close(reader);
-  ok(ps_catalog_orphans_pending(root->space, &pending, e), e);
-  REQUIRE(pending);
-  ps_catalog_view_close(view);
-  ok(ps_root_reclaim_orphans(root, &reclaimed, &skipped, e), e);
-  REQUIRE(reclaimed);
-  REQUIRE(ps_read_open(root->space, key, NULL, &reader, e) == LC_ERR_INVALID);
-  clear(e);
-  ps_namespace_release(ns);
   ok(ps_checkpoint(root->space, e), e);
+  ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_MARKER, name,
+                    sizeof(name), &missing, e),
+     e);
+  REQUIRE(!missing);
+  ok(ps_catalog_view_marker(view, &captured, &captured_length, e), e);
+  REQUIRE(original_length && captured == original &&
+          captured_length == original_length);
+  ok(ps_catalog_orphans_pending(root->space, &pending, e), e);
+  REQUIRE(!pending);
+  ps_catalog_view_close(view);
+  ps_namespace_release(ns);
 }
 static void outbox_marker_owner_identity(lc_pouch *p, lc_error *e) {
   ps_root *root = ps_pouch_state_root(p);
@@ -167,8 +169,7 @@ static void outbox_marker_owner_identity(lc_pouch *p, lc_error *e) {
   ok(ps_root_namespace_acquire(root, "work/a", 0, &ns, e), e);
   ps_key stream = {ns->identity.owner, UINT64_MAX, PS_STREAM};
   ps_key control = {ns->identity.owner, 1U, PS_CONTROL};
-  /* A canonical stream can use the same numeric key. Its owner's unrelated
-   * control must survive reclamation when no marker-owner tag is present. */
+  /* An unrelated control survives retirement of a canonical stream. */
   ok(ps_owned_open(root->space, NULL, stream, 1, NULL, &head, &status, e), e);
   ok(ps_owned_seal(head, e), e);
   ps_owned_close(head);
@@ -280,6 +281,9 @@ typedef struct outbox_marker_result {
 static int outbox_marker_kind(int operation) {
   return operation <= 3 || operation == 11 ? -1 : operation <= 7 ? 0 : 1;
 }
+static int outbox_marker_read_operation(int operation) {
+  return operation == 3 || operation == 7 || operation == 10;
+}
 static void outbox_marker_seed(lc_pouch *p, int operation, lc_error *e) {
   int kind = outbox_marker_kind(operation);
   if (operation == 0 || operation == 4 || operation == 8)
@@ -298,7 +302,7 @@ static void outbox_marker_seed(lc_pouch *p, int operation, lc_error *e) {
     ps_catalog_view *view = NULL;
     const unsigned char name[] = {0U, 'm', 'a', 'r', 'k', 'e', 'r'};
     ok(ps_root_namespace_acquire(root, "work/a", 0, &ns, e), e);
-    ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_CONTROL, name,
+    ok(ps_catalog_get(root->space, ns->identity.owner, PS_CATALOG_MARKER, name,
                       sizeof(name), &view, e),
        e);
     REQUIRE(view);
@@ -392,8 +396,8 @@ static void outbox_marker_verify(lc_pouch *p, int operation, int completed,
   if (operation == 11)
     REQUIRE(!parent);
   outbox_marker_result_clear(p, &result);
-  /* Retry on the recovered owner, then remove every public marker. Deferred
-   * control cleanup must converge with no unbound identity left behind. */
+  /* Retry on the recovered owner, then remove every public marker and
+   * checkpoint the resulting directory. */
   ok(outbox_marker_action(p, operation, &result, e), e);
   outbox_marker_result_clear(p, &result);
   if (kind == -1)
@@ -484,7 +488,10 @@ static void outbox_marker_faults(const char *directory, int allocation_mode) {
       for (int operation = 0; operation < 12; ++operation) {
         size_t sites = outbox_marker_trial(directory, operation, sync, persist,
                                            0U, allocation_mode);
-        REQUIRE(sites);
+        if (!allocation_mode && outbox_marker_read_operation(operation))
+          REQUIRE(!sites); /* The open catalog already owns the marker bytes. */
+        else
+          REQUIRE(sites);
         for (size_t cut = 1U; cut <= sites; ++cut) {
           (void)outbox_marker_trial(directory, operation, sync, persist, cut,
                                     allocation_mode);

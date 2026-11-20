@@ -6,7 +6,6 @@
 #include "lc_collection_head.h"
 #include "lc_pouch_record.h"
 #include "namespace.h"
-#include "outbox_markers.h"
 #include "owned.h"
 #include "root_internal.h"
 #include <pthread.h>
@@ -548,11 +547,6 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
     rc = ps_owned_claim_orphan(head, error);
     if (rc == LC_OK)
       rc = ps_collection_reclaim_children(c->space, key.owner, error);
-  }
-  if (rc == LC_OK && key.key == PS_OUTBOX_MARKER_STREAM_KEY) {
-    rc = ps_owned_claim_orphan(head, error);
-    if (rc == LC_OK)
-      rc = ps_outbox_marker_reclaim_child(c->space, key.owner, ref, error);
   }
   if (rc == LC_OK)
     rc = ps_owned_retire(head, error);

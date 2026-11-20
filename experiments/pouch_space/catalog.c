@@ -32,7 +32,7 @@ static void write32(unsigned char *p, uint32_t n) {
     p[i] = (unsigned char)(n >> (i * 8));
 }
 static int arguments(unsigned int kind, const void *name, size_t length) {
-  return kind <= PS_CATALOG_CONVERSION && (name || !length) &&
+  return kind <= PS_CATALOG_MARKER && (name || !length) &&
          length <= PS_CATALOG_NAME_MAX;
 }
 static uint64_t name_hash(uint64_t owner, unsigned int kind, const void *name,
@@ -115,16 +115,21 @@ static int reserve_index(ps_space *s, lc_error *e) {
   return LC_OK;
 }
 static int attach_record(ps_entry *p, unsigned int kind, const void *name,
-                         size_t length, lc_error *e) {
+                         size_t length, const void *value, size_t value_length,
+                         lc_error *e) {
   p->catalog = lc_calloc_with_allocator(NULL, 1, sizeof(*p->catalog));
   if (p->catalog)
-    p->catalog->name = lc_alloc_with_allocator(NULL, length + 1);
+    p->catalog->name = lc_alloc_with_allocator(NULL, length + 1 + value_length);
   if (!p->catalog || !p->catalog->name)
     return cat_error(e, LC_ERR_NOMEM, "cannot allocate catalog record");
   if (length)
     memcpy(p->catalog->name, name, length);
   p->catalog->name[length] = 0;
   p->catalog->length = length;
+  p->catalog->value_length = value_length;
+  p->catalog->value = p->catalog->name + length + 1;
+  if (value_length)
+    memcpy(p->catalog->name + length + 1, value, value_length);
   p->catalog->kind = kind;
   p->catalog->hash = name_hash(p->key.owner, kind, name, length);
   return LC_OK;
@@ -136,33 +141,61 @@ void ps_catalog_free_record(ps_entry *p) {
     p->catalog = NULL;
   }
 }
+size_t ps_catalog_record_bytes(const ps_entry *p) {
+  return 104 + p->catalog->length + p->catalog->value_length;
+}
+/* This is only an admission hint. The full decoder and catalog transition
+ * checks still validate every field before replay changes ownership. */
+int ps_catalog_marker_frame(const ps_entry *old, const unsigned char *wire,
+                            size_t bytes) {
+  return read32(wire + 20) == PS_REMOVE
+             ? old && old->catalog && old->catalog->kind == PS_CATALOG_MARKER
+             : read32(wire + 20) == PS_PUT && bytes >= 104 &&
+                   read32(wire + 64) == PS_CATALOG_MARKER;
+}
 void ps_catalog_encode_record(unsigned char *wire, const ps_entry *p) {
   const ps_catalog_record *r = p->catalog;
   write32(wire + 64, r->kind);
   write32(wire + 68, (uint32_t)r->length);
   write32(wire + 72, r->stream.kind);
+  write32(wire + 76, (uint32_t)r->value_length);
   write64(wire + 80, r->stream.owner);
   write64(wire + 88, r->stream.key);
   write64(wire + 96, r->token);
   if (r->length)
     memcpy(wire + 104, r->name, r->length);
+  if (r->value_length)
+    memcpy(wire + 104 + r->length, r->value, r->value_length);
 }
 int ps_catalog_decode_record(ps_entry *p, const unsigned char *wire,
                              size_t bytes, lc_error *e) {
-  size_t length;
+  size_t length, value_length;
+  unsigned int kind, stream_kind;
   int rc;
   if (bytes < 104)
     return cat_error(e, LC_ERR_PROTOCOL, "truncated catalog record");
   length = read32(wire + 68);
-  if (!arguments(read32(wire + 64), wire + 104, length) ||
-      bytes != 104 + length || read32(wire + 76) ||
-      (read32(wire + 72) == PS_STREAM
-           ? !read64(wire + 96)
-           : read32(wire + 72) || read32(wire + 64) != PS_CATALOG_NAMESPACE ||
-                 p->key.owner || p->token != p->key.key || read64(wire + 80) ||
-                 read64(wire + 88) || read64(wire + 96)))
+  value_length = read32(wire + 76);
+  kind = read32(wire + 64);
+  stream_kind = read32(wire + 72);
+  if (!arguments(kind, wire + 104, length) || length > bytes - 104 ||
+      value_length != bytes - 104 - length)
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog record");
-  rc = attach_record(p, read32(wire + 64), wire + 104, length, e);
+  if (kind == PS_CATALOG_MARKER) {
+    if (!p->key.owner || !length || value_length > PS_CATALOG_MARKER_MAX ||
+        stream_kind || read64(wire + 80) || read64(wire + 88) ||
+        read64(wire + 96))
+      return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog marker record");
+  } else if (value_length ||
+             (stream_kind == PS_STREAM
+                  ? !read64(wire + 96)
+                  : stream_kind || kind != PS_CATALOG_NAMESPACE ||
+                        p->key.owner || p->token != p->key.key ||
+                        read64(wire + 80) || read64(wire + 88) ||
+                        read64(wire + 96)))
+    return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog target record");
+  rc = attach_record(p, kind, wire + 104, length, wire + 104 + length,
+                     value_length, e);
   if (rc == LC_OK) {
     p->catalog->stream.kind = read32(wire + 72);
     p->catalog->stream.owner = read64(wire + 80);
@@ -188,7 +221,7 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
        (old->deleted ? old->key.key == p->key.key
                      : old->key.key != p->key.key || old->token >= p->token)))
     return cat_error(e, LC_ERR_PROTOCOL, "catalog name identity mismatch");
-  if (!p->catalog->stream.kind &&
+  if (!p->catalog->stream.kind && p->catalog->kind != PS_CATALOG_MARKER &&
       (p->key.owner || p->catalog->kind != PS_CATALOG_NAMESPACE ||
        p->token != p->key.key || p->catalog->stream.owner ||
        p->catalog->stream.key || p->catalog->token))
@@ -299,20 +332,24 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
 static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                        unsigned int kind, const void *name, size_t length,
                        const ps_ref *expected, ps_key stream,
-                       const ps_ref *target, ps_catalog_info *out, int identity,
+                       const ps_ref *target, const void *value,
+                       size_t value_length, ps_catalog_info *out, int identity,
                        lc_error *e) {
   ps_entry *p, *old, *head;
   ps_coordination_guard *guard;
   ps_catalog_info info;
-  uint64_t sequence = 0, growth = 0, added = 0;
+  uint64_t sequence = 0, growth = 0, added = 0, prior, next;
+  int marker = kind == PS_CATALOG_MARKER;
   int rc, installed = 0;
   if (out)
     memset(out, 0, sizeof(*out));
-  if (!s || !out ||
-      (identity ? owner || kind != PS_CATALOG_NAMESPACE || expected || target ||
-                      stream.kind || stream.owner || stream.key
-                : !target || stream.kind != PS_STREAM) ||
-      !arguments(kind, name, length))
+  if (!s || !out || !arguments(kind, name, length) ||
+      (identity && (owner || expected)) ||
+      (marker && (!owner || !length || target || stream.kind ||
+                  value_length > PS_CATALOG_MARKER_MAX ||
+                  value_length > PS_CATALOG_NAME_MAX - length ||
+                  (!value && value_length))) ||
+      (!identity && !marker && (!target || stream.kind != PS_STREAM)))
     return cat_error(e, LC_ERR_INVALID,
                      "catalog publication arguments invalid");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -320,26 +357,27 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
     return cat_error(e, LC_ERR_NOMEM, "cannot allocate catalog publication");
   p->key.kind = PS_CATALOG;
   p->key.owner = owner;
-  rc = attach_record(p, kind, name, length, e);
+  rc = attach_record(p, kind, name, length, value, value_length, e);
   if (rc == LC_OK) {
     p->catalog->stream = stream;
     p->catalog->token = target ? target->incarnation : 0;
     pthread_mutex_lock(&s->mutex);
     rc = ps_internal_capture_begin(s, &guard, e);
     old = named(s, owner, kind, name, length);
-    head = identity ? NULL : ps_internal_lookup(s, stream);
+    head = target ? ps_internal_lookup(s, stream) : NULL;
     if (rc == LC_OK && pending(s, old))
       rc = cat_error(e, LC_ERR_INVALID, "catalog change in flight; retry");
     if (rc == LC_OK &&
         (expected ? !ref_matches(s, old, expected) : old && !old->deleted))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
-    if (rc == LC_OK && (s->token_next > s->token_end ||
-                        (!identity && (!ref_matches(s, head, target) ||
-                                       head->orphan_claimed))))
+    if (rc == LC_OK &&
+        (s->token_next > s->token_end ||
+         (target && (!ref_matches(s, head, target) || head->orphan_claimed))))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog stream reference or identity invalid");
-    if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind)
+    if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind &&
+        old->catalog->kind == PS_CATALOG_NAMESPACE)
       rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
     if (rc == LC_OK) {
       p->token = s->token_next++;
@@ -347,7 +385,9 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       rc = ps_catalog_prepare_record(s, p, 0, e);
     }
     if (rc == LC_OK) {
-      growth = old && !old->deleted ? 0 : 104 + length;
+      prior = old && !old->deleted ? ps_catalog_record_bytes(old) : 0;
+      next = ps_catalog_record_bytes(p);
+      growth = next > prior ? next - prior : 0;
       added = old && !old->deleted ? 0 : 1;
       rc = ps_internal_allowance(s, budget, s->metadata + growth,
                                  s->live_entries + added, e);
@@ -384,13 +424,21 @@ int ps_catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
                    const ps_ref *expected, ps_key stream, const ps_ref *target,
                    ps_catalog_info *out, lc_error *e) {
   return catalog_put(s, budget, owner, kind, name, length, expected, stream,
-                     target, out, 0, e);
+                     target, NULL, 0, out, 0, e);
+}
+int ps_catalog_put_marker(ps_space *s, uint64_t owner, const void *name,
+                          size_t length, const ps_ref *expected,
+                          const void *value, size_t value_length,
+                          ps_catalog_info *out, lc_error *e) {
+  ps_key stream = {0};
+  return catalog_put(s, NULL, owner, PS_CATALOG_MARKER, name, length, expected,
+                     stream, NULL, value, value_length, out, 0, e);
 }
 int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
                                 ps_catalog_info *out, lc_error *e) {
   ps_key stream = {0};
   return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
-                     stream, NULL, out, 1, e);
+                     stream, NULL, NULL, 0, out, 1, e);
 }
 int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
@@ -472,6 +520,16 @@ int ps_catalog_view_info(const ps_catalog_view *view, ps_catalog_info *out,
   information(view->space, view->entry, out);
   return LC_OK;
 }
+int ps_catalog_view_marker(const ps_catalog_view *view,
+                           const unsigned char **value, size_t *length,
+                           lc_error *e) {
+  const ps_catalog_record *record = view ? view->entry->catalog : NULL;
+  if (!record || record->kind != PS_CATALOG_MARKER || !value || !length)
+    return cat_error(e, LC_ERR_INVALID, "catalog view is not a marker");
+  *value = record->value;
+  *length = record->value_length;
+  return LC_OK;
+}
 void ps_catalog_view_close(ps_catalog_view *view) {
   ps_space *s;
   if (!view)
@@ -497,7 +555,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   size_t i, count = 0, at = 0;
   uint64_t prefix;
   int rc, collect = 0;
-  if (!s || !callback || kind > PS_CATALOG_CONVERSION)
+  if (!s || !callback || kind > PS_CATALOG_MARKER)
     return cat_error(e, LC_ERR_INVALID, "catalog visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);

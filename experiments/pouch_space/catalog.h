@@ -3,6 +3,7 @@
 #include "space.h"
 #define PS_CATALOG 5U
 #define PS_CATALOG_NAME_MAX (PS_JOURNAL - 104U)
+#define PS_CATALOG_MARKER_MAX 8192U
 enum ps_catalog_kind {
   PS_CATALOG_NAMESPACE,
   PS_CATALOG_COLLECTION,
@@ -11,7 +12,8 @@ enum ps_catalog_kind {
   PS_CATALOG_PROJECTION,
   PS_CATALOG_CONTROL,
   PS_CATALOG_BODY,
-  PS_CATALOG_CONVERSION
+  PS_CATALOG_CONVERSION,
+  PS_CATALOG_MARKER
 };
 typedef struct ps_catalog_view ps_catalog_view;
 typedef struct ps_catalog_info {
@@ -39,6 +41,12 @@ int ps_catalog_put(ps_space *, ps_budget *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, const ps_ref *expected,
                    ps_key stream, const ps_ref *target, ps_catalog_info *,
                    lc_error *);
+/* Bounded work markers live in an immutable catalog record. The name and
+ * value together must fit one journal frame. Replacement is revision-checked.
+ * Marker views preserve the selected durable bytes through removal. */
+int ps_catalog_put_marker(ps_space *, uint64_t owner, const void *name, size_t,
+                          const ps_ref *expected, const void *value, size_t,
+                          ps_catalog_info *, lc_error *);
 int ps_catalog_remove(ps_space *, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
                       lc_error *);
@@ -50,6 +58,8 @@ int ps_catalog_get(ps_space *, uint64_t owner, unsigned int kind,
                    lc_error *);
 int ps_catalog_view_info(const ps_catalog_view *, ps_catalog_info *,
                          lc_error *);
+int ps_catalog_view_marker(const ps_catalog_view *, const unsigned char **,
+                           size_t *, lc_error *);
 void ps_catalog_view_close(ps_catalog_view *);
 typedef int (*ps_catalog_visit_fn)(void *, const void *, size_t,
                                    const ps_catalog_info *, lc_error *);

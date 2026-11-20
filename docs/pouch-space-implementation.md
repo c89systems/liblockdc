@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), and [shared outbox claim handoff](#shared-outbox-claim-handoff) | Shared queue performance, concurrent outbox workflows, and capacity beyond the qualified profiles |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), and [bounded quarantine rechecks](#bounded-quarantine-rechecks) | Collection authority, shared capacity and throughput, and normal shared admission |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
@@ -7489,3 +7489,81 @@ blocking a peer's attachment open before the retirement became durable.
 The current marker representation and concurrent outbox qualification
 remain open. Raw runs, test logs, and comparisons are in
 `build/pouch-space-outbox-shared/`.
+
+## Inline outbox markers
+
+The five existing outbox cleanup marker families store their bounded
+metadata in checksummed catalog records. The catalog keys each record by
+namespace, family and exact name. One revision-checked publication or
+tombstone replaces the former stream identity, owner tag, control value,
+binding and retirement sequence. Marker values count toward the protected
+metadata allowance, including growth on replacement. Name inventory visits
+the selected catalog records and leaves their value bytes to the read API.
+Application bodies continue to use the existing streaming paths.
+
+Peers can import create, replace and remove frames for the inline marker
+kind before the writer's barrier completes. These frames own no payload
+ranges or stream targets. New lookups and inventory still select the last
+durable revision. A captured view retains its immutable bytes through
+replacement, removal and checkpoint adoption. Marker writes and removals
+acknowledge only after durability under both sync policies. Collection
+controls and other stream-backed bindings retain their existing
+publication rules.
+
+The paused-barrier test covers creation, a replacement growing to 8 KiB,
+and removal. It checks the visible revision while the barrier is paused,
+rejects a stale revision, and publishes unrelated state through the peer in
+all three cases. It also checks retained bytes across checkpoints and
+verifies the resulting marker and state through a cold reopen. These tests
+create fresh experimental roots for the inline representation.
+
+The first 32-effect, four-producer NoSync probes exposed a separate
+allocator defect. The observer had placed a peer's private preparation page
+in its checkpoint workspace. Catalog admission may borrow a capture guard
+that has selected the current journal without checking private ranges.
+Metadata admission now checks common ranges once per allocation-guard
+tenure before using the pool. The deterministic regression holds an
+unpublished peer body while a marker forces workspace growth, then verifies
+both through peer replay and checkpoint adoption.
+
+The Debug storage fixtures passed 116 I/O cuts, 280 allocation cuts, and
+116 process exits across marker changes and checkpointing. Warm reads of
+resident marker values perform zero file I/O. Allocation failures on the
+read path and recovery of old, new, or absent durable revisions remain
+covered by the fixtures.
+
+All 44 selected groups passed on Debug, GNU release, and musl release. They
+cover catalog and checkpoint recovery, owner coordination, shared outbox and
+queue workflows, and codec conversion. Structural replay passed
+ThreadSanitizer. The marker adapter passed strict Memcheck with zero errors,
+zero outstanding heap blocks, and only the three inherited descriptors open.
+
+All 36 matched GNU runs verified payloads and duplicate receipts after reopen.
+Each run uses two producers, a dispatcher, and scan queries. The small profile
+delivers eight 1 KiB effects, and the overlap profile delivers 16 effects of
+4 KiB each. Single-file runs start at 10 MiB. Times are median milliseconds
+for native shared / native exclusive / multifile.
+
+| Phase | Small NoSync | Small durable | Overlap NoSync | Overlap durable |
+| --- | ---: | ---: | ---: | ---: |
+| Work | 269.56 / 114.75 / 201.34 | 589.52 / 543.89 / 727.25 | 432.17 / 196.90 / 322.44 | 1298.99 / 1223.81 / 1427.11 |
+| Maintenance | 21.41 / 5.90 / 0.45 | 20.31 / 7.68 / 0.30 | 26.01 / 6.29 / 0.41 | 22.31 / 5.60 / 0.47 |
+| Close | 0.38 / 0.28 / 36.43 | 0.40 / 0.34 / 44.22 | 0.73 / 0.50 / 30.38 | 0.63 / 0.32 / 33.57 |
+| Reopen | 17.91 / 4.11 / 11.04 | 32.94 / 22.59 / 36.77 | 20.20 / 5.72 / 11.40 | 55.44 / 42.02 / 75.90 |
+
+The six wider GNU samples likewise verified 32 effects of 4 KiB with four
+producers and a peer dispatcher, three runs per durability policy. The
+earlier six two-producer probes on `2b6b17a2` failed during marker retirement.
+
+The 12 matched musl runs compared shared operation on `2b6b17a2` and this
+implementation, with one producer, a peer dispatcher, and eight effects of
+4 KiB. Median NoSync work fell from 451.76 to 254.76 ms, and foreground sync
+calls fell from 129 to 57. Durable work fell from 910.58 to 749.05 ms, and
+foreground sync calls fell from 273 to 185. Every run verified its reopened
+receipts.
+
+Shared durable work beat multifile in both measured two-producer profiles.
+Shared NoSync work still took 34% longer in both. Collection authority,
+fixed-capacity destructive maintenance with peers, and broader acceptance
+across lease, queue, and indexed workloads remain open. Raw runs and test
+logs are in `build/pouch-space-inline-markers/`.

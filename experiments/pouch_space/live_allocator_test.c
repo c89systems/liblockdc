@@ -3331,10 +3331,176 @@ static void additive_catalog(void) {
           !pthread_mutex_destroy(&gate.mutex));
   REQUIRE(!unlink(path));
 }
+typedef struct marker_edit {
+  ps_space *space;
+  const unsigned char *bytes;
+  size_t length;
+  ps_catalog_info current;
+} marker_edit;
+static void *publish_marker_edit(void *context) {
+  marker_edit *edit = context;
+  lc_error e = {0};
+  ps_catalog_info result;
+  const ps_ref *prior = edit->current.id ? &edit->current.revision : NULL;
+  if (edit->bytes) {
+    ok(ps_catalog_put_marker(edit->space, 88, "marker", 6, prior, edit->bytes,
+                             edit->length, &result, &e),
+       &e);
+    edit->current = result;
+  } else {
+    ok(ps_catalog_remove(edit->space, 88, PS_CATALOG_MARKER, "marker", 6, prior,
+                         &e),
+       &e);
+  }
+  return NULL;
+}
+static void expect_marker_view(ps_catalog_view *view,
+                               const unsigned char *expected, size_t length,
+                               lc_error *e) {
+  const unsigned char *bytes;
+  size_t size;
+  ok(ps_catalog_view_marker(view, &bytes, &size, e), e);
+  REQUIRE(size == length && !memcmp(bytes, expected, length));
+}
+static ps_catalog_view *expect_marker(ps_space *space,
+                                      const unsigned char *expected,
+                                      size_t length, lc_error *e) {
+  ps_catalog_view *view = NULL;
+  ok(ps_catalog_get(space, 88, PS_CATALOG_MARKER, "marker", 6, &view, e), e);
+  if (expected)
+    expect_marker_view(view, expected, length, e);
+  else
+    REQUIRE(!view);
+  return view;
+}
+static void inline_catalog_markers(void) {
+  lc_error e = {0};
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  marker_edit edit = {0};
+  pthread_t thread;
+  unsigned char one = 17, *large = malloc(PS_CATALOG_MARKER_MAX);
+  ps_catalog_view *old, *latest;
+  ps_catalog_info info;
+  REQUIRE(large);
+  memset(large, 51, PS_CATALOG_MARKER_MAX);
+  options.io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  REQUIRE(ps_catalog_put_marker(a, 88, "marker", 6, NULL, large,
+                                PS_CATALOG_MARKER_MAX + 1, &info,
+                                &e) == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  edit.space = a;
+  edit.bytes = &one;
+  edit.length = 1;
+  gate.paused = 1;
+  REQUIRE(!pthread_create(&thread, NULL, publish_marker_edit, &edit));
+  wait_catalog_sync(&gate);
+  expect_marker(b, NULL, 0, &e);
+  capture_put(b, 11, 65);
+  finish_catalog_sync(&gate, thread);
+  old = expect_marker(b, &one, 1, &e);
+  ok(ps_catalog_view_info(old, &info, &e), &e);
+  REQUIRE(info.id == edit.current.id && !info.stream.kind);
+
+  gate.entered = gate.released = 0;
+  gate.paused = 1;
+  edit.space = b;
+  edit.bytes = large;
+  edit.length = PS_CATALOG_MARKER_MAX;
+  REQUIRE(!pthread_create(&thread, NULL, publish_marker_edit, &edit));
+  wait_catalog_sync(&gate);
+  ps_catalog_view_close(expect_marker(a, &one, 1, &e));
+  REQUIRE(ps_catalog_remove(a, 88, PS_CATALOG_MARKER, "marker", 6,
+                            &info.revision, &e) == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  capture_put(a, 12, 65);
+  finish_catalog_sync(&gate, thread);
+  REQUIRE(info.id == edit.current.id &&
+          info.revision.incarnation != edit.current.revision.incarnation);
+  ok(ps_checkpoint(a, &e), &e);
+  latest = expect_marker(b, large, PS_CATALOG_MARKER_MAX, &e);
+  expect_marker_view(old, &one, 1, &e);
+
+  gate.entered = gate.released = 0;
+  gate.paused = 1;
+  edit.space = a;
+  edit.bytes = NULL;
+  REQUIRE(!pthread_create(&thread, NULL, publish_marker_edit, &edit));
+  wait_catalog_sync(&gate);
+  ps_catalog_view_close(expect_marker(b, large, PS_CATALOG_MARKER_MAX, &e));
+  capture_put(b, 13, 65);
+  finish_catalog_sync(&gate, thread);
+  expect_marker(b, NULL, 0, &e);
+  ok(ps_checkpoint(b, &e), &e);
+  expect_marker(a, NULL, 0, &e);
+  expect_marker_view(latest, large, PS_CATALOG_MARKER_MAX, &e);
+  expect_marker_view(old, &one, 1, &e);
+  ps_catalog_view_close(latest);
+  ps_catalog_view_close(old);
+  ok(ps_catalog_put_marker(b, 88, "marker", 6, NULL, large,
+                           PS_CATALOG_MARKER_MAX, &info, &e),
+     &e);
+  REQUIRE(info.id != edit.current.id);
+  ok(ps_close(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  ps_catalog_view_close(expect_marker(a, large, PS_CATALOG_MARKER_MAX, &e));
+  expect_value(a, key(11), 65, 11);
+  expect_value(a, key(12), 65, 12);
+  expect_value(a, key(13), 65, 13);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  free(large);
+}
+static void catalog_workspace_with_peer_writer(void) {
+  lc_error e = {0};
+  ps_space *writer = NULL, *catalog = NULL;
+  ps_catalog_info info;
+  ps_writer *body;
+  unsigned char *value = malloc(PS_CATALOG_MARKER_MAX);
+  uint64_t offset, first, last, available;
+  REQUIRE(value);
+  memset(value, 19, PS_CATALOG_MARKER_MAX);
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &catalog, &e), &e);
+  REQUIRE(catalog->free);
+  offset = catalog->free->offset;
+  available = catalog->metadata_free_bytes;
+  body = replay_value(writer, key(21), 21, PS_CHUNK, &e);
+  ok(ps_coordination_conflict(catalog->coordination, offset, PS_PAGE, &first,
+                              &last, &e),
+     &e);
+  REQUIRE(first == offset && last == offset + PS_PAGE);
+  /* The peer's writer holds a private range absent from the journal. Growing
+   * the catalog's protected workspace must exclude it before choosing pages. */
+  ok(ps_catalog_put_marker(catalog, 88, "marker", 6, NULL, value,
+                           PS_CATALOG_MARKER_MAX, &info, &e),
+     &e);
+  REQUIRE(catalog->metadata_free_bytes > available);
+  ok(ps_publish(body, NULL, &e), &e);
+  ps_writer_close(body);
+  expect_value(catalog, key(21), PS_CHUNK, 21);
+  ps_catalog_view_close(
+      expect_marker(catalog, value, PS_CATALOG_MARKER_MAX, &e));
+  ok(ps_checkpoint(catalog, &e), &e);
+  expect_value(writer, key(21), PS_CHUNK, 21);
+  ok(ps_close(catalog, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  free(value);
+}
 static void journal_replay_structural(void) {
   replay_structural(0);
   replay_structural(1);
   additive_catalog();
+  inline_catalog_markers();
+  catalog_workspace_with_peer_writer();
 }
 typedef struct tail_callback {
   ps_space *owner, *peer;

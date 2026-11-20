@@ -117,6 +117,7 @@ struct ps_space {
    * Nested allocation helpers borrow the outer guard; no producer I/O spans it.
    */
   ps_coordination_guard *allocation_guard;
+  int allocation_ranges_checked;
   ps_readiness *readiness;
   /* Local completed-byte prefix certified by this owner's journal framing. */
   uint64_t own_ready_sequence, own_ready_wire;
@@ -183,8 +184,9 @@ struct ps_reserve {
 
 typedef struct ps_catalog_record {
   unsigned int kind;
-  size_t length;
+  size_t length, value_length;
   unsigned char *name;
+  const unsigned char *value;
   ps_key stream;
   uint64_t token, hash;
   ps_entry *target, *next;
@@ -193,6 +195,8 @@ typedef struct ps_catalog_record {
 int ps_catalog_decode_record(ps_entry *, const unsigned char *, size_t,
                              lc_error *);
 void ps_catalog_encode_record(unsigned char *, const ps_entry *);
+size_t ps_catalog_record_bytes(const ps_entry *);
+int ps_catalog_marker_frame(const ps_entry *, const unsigned char *, size_t);
 void ps_catalog_free_record(ps_entry *);
 int ps_catalog_prepare_record(ps_space *, ps_entry *, int checkpoint,
                               lc_error *);

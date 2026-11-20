@@ -78,7 +78,7 @@ static void outbox_marker_crashes(const char *directory) {
           (int)sizeof(path));
   for (int sync = 0; sync < 2; ++sync)
     for (int operation = 0; operation < 12; ++operation) {
-      if (operation == 3 || operation == 7 || operation == 10)
+      if (outbox_marker_read_operation(operation))
         continue;
       size_t sites = 0U;
       for (size_t stop = 0U; stop <= sites; ++stop)

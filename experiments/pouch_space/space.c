@@ -337,7 +337,7 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
 }
 static size_t entry_bytes(const ps_entry *p) {
   if (p->key.kind == PS_CATALOG)
-    return 104 + p->catalog->length;
+    return ps_catalog_record_bytes(p);
   return p->key.kind == PS_STREAM      ? 80
          : p->key.kind == PS_OWNED_RUN ? 80 + 24 * p->count
                                        : 64 + 24 * p->count;
@@ -485,8 +485,10 @@ static int allocation_begin(ps_space *s, ps_coordination_guard **guard,
     return LC_OK;
   rc = ps_coordination_lock(s->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
                             guard, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
     s->allocation_guard = *guard;
+    s->allocation_ranges_checked = 0;
+  }
   return rc;
 }
 static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
@@ -1325,9 +1327,10 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
       run->clean = 0;
   ps_internal_free_coalesce(s);
   rc = healthy(s, error);
-  return rc == LC_OK && present
-             ? foreign_pool(s, &s->free, &s->free_bytes, error)
-             : rc;
+  if (rc == LC_OK && present)
+    rc = foreign_pool(s, &s->free, &s->free_bytes, error);
+  s->allocation_ranges_checked = rc == LC_OK;
+  return rc;
 }
 static void collect_retired(ps_space *s, int full) {
   ps_entry **link = &s->retired, *p;
@@ -1794,6 +1797,13 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
   uint64_t bytes;
   ps_run *node;
   int rc;
+  /* Catalog and stream publication may borrow a capture guard. Its selected
+   * journal does not describe a peer's private writer or budget ranges. */
+  if (s->allocation_guard && !s->allocation_ranges_checked) {
+    rc = allocation_ranges_refresh(s, error);
+    if (rc != LC_OK)
+      return rc;
+  }
   if (!metadata_fits(s, target, payload, floor)) {
     rc = pins_reclaim_locked(s, error);
     if (rc != LC_OK)
@@ -3302,12 +3312,12 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
 static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             size_t bytes, uint64_t certified, int staged,
                             lc_error *error) {
-  ps_entry **entries = NULL, *single = NULL;
+  ps_entry **entries = NULL, *single = NULL, *marker_removed = NULL;
   ps_key key;
   replay_change *changes = NULL;
   size_t i, j, count = 1;
   int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, additive,
-      structural, rc;
+      marker = 0, structural, rc;
   if (group)
     count = get32(wire + 16);
   if (certified <= s->sequence || !count || count > certified - s->sequence ||
@@ -3322,14 +3332,22 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   key.kind = get32(wire + 16);
   key.owner = get64(wire + 24);
   key.key = get64(wire + 32);
+  if (!group && key.kind == PS_CATALOG) {
+    if (get32(wire + 20) == PS_REMOVE)
+      marker_removed = lookup(s, key);
+    marker = ps_catalog_marker_frame(marker_removed, wire, bytes);
+    if (!marker)
+      marker_removed = NULL;
+  }
   additive = !group && get32(wire + 20) == PS_PUT &&
              (key.kind == PS_STREAM ||
               (key.kind == PS_CATALOG && key.key == get64(wire + 40)) ||
               (key.kind == PS_OWNED_RUN && bytes >= 80 && !get32(wire + 72)));
-  structural = !group && !immutable_key(key) && !additive;
+  structural = !group && !immutable_key(key) && !additive && !marker;
   /* New heads, bindings and raw capacity consume ownership without releasing
    * a predecessor. Import their checked frames to keep unrelated writers
-   * moving. Catalog visibility and destructive transitions require durability.
+   * moving. Inline marker edits also own no external resources. Both live
+   * catalog forms keep their previous visible revision until durable.
    */
   if (structural && s->sequence >= s->peer_durable)
     return err(error, LC_ERR_PENDING,
@@ -3358,6 +3376,8 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
       if (immutable_key(key) || (key.kind == PS_CATALOG && event == PS_PUT))
         single->peer_sequence = s->sequence + 1;
       rc = apply_journal_event(s, single, event, 0, error);
+      if (rc == LC_OK && marker_removed)
+        marker_removed->peer_sequence = s->sequence + 1;
     }
   }
   replay_finish(s, changes, rc == LC_OK);
@@ -3779,9 +3799,11 @@ static int projection_same(const ps_entry *a, const ps_entry *b) {
   if (a->catalog &&
       (a->catalog->kind != b->catalog->kind ||
        a->catalog->length != b->catalog->length ||
+       a->catalog->value_length != b->catalog->value_length ||
        !same_key(a->catalog->stream, b->catalog->stream) ||
        a->catalog->token != b->catalog->token ||
-       memcmp(a->catalog->name, b->catalog->name, a->catalog->length)))
+       memcmp(a->catalog->name, b->catalog->name, a->catalog->length) ||
+       memcmp(a->catalog->value, b->catalog->value, a->catalog->value_length)))
     return 0;
   return a->key.kind != PS_STREAM ||
          (a->stream_capacity <= b->stream_capacity &&
