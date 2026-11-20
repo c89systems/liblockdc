@@ -86,6 +86,11 @@ void ps_ns_resource_free(ps_ns_resource *r) {
     lc_free_with_allocator(NULL, r->label);
   lc_free_with_allocator(NULL, r);
 }
+void ps_ns_resource_park(struct ps_namespace_data *d, ps_ns_resource *r) {
+  if (!r->repacking &&
+      ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
+    ps_stream_park(r->stream);
+}
 int ps_ns_index_room(struct ps_namespace_data *d, lc_error *e) {
   ps_ns_resource **items;
   size_t capacity = d->capacity ? d->capacity * 2 : 8;

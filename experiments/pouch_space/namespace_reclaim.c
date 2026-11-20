@@ -170,6 +170,7 @@ int ps_ns_body_commit(ps_namespace_body *b, lc_error *e) {
                         r->binding.stream, &info.ref, &r->binding, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&b->data->mutex);
+    ps_ns_resource_park(b->data, r);
     ps_ns_insert(b->data, r);
     pthread_mutex_unlock(&b->data->mutex);
   }

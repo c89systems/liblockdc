@@ -374,6 +374,8 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(s->stream, &info, e);
+    if (rc == LC_OK)
+      ps_ns_resource_park(d, s);
     if (s->kind != PS_CATALOG_SEGMENT) {
       if (rc == LC_OK && !info.sealed)
         rc = failure(e, LC_ERR_PROTOCOL, "namespace snapshot is not sealed");
@@ -597,6 +599,10 @@ static int data_get(ps_namespace *ns, struct ps_namespace_data **out,
 int ps_ns_data_get(ps_namespace *ns, struct ps_namespace_data **out,
                    lc_error *e) {
   return data_get(ns, out, 1, e);
+}
+int ps_ns_data_lookup(ps_namespace *ns, struct ps_namespace_data **out,
+                      lc_error *e) {
+  return data_get(ns, out, 0, e);
 }
 static int same_projection(const lc_pouch_storage_namespace_info *a,
                            const lc_pouch_storage_namespace_info *b) {
@@ -831,14 +837,17 @@ static void unlock_current(struct ps_namespace_data *d, int entered) {
 int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
   if (d->pending_seal) {
+    segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, d->pending_seal);
     /* A durable seal must never outlive the routing decision that made its
      * predecessor inactive. NoSync publication can defer this dependency. */
     rc = ps_flush(d->ns->root->space, e);
     if (rc == LC_OK)
-      rc = ps_stream_seal(
-          ps_ns_find(d, PS_CATALOG_SEGMENT, d->pending_seal)->stream, e);
+      rc = ps_stream_seal(s->stream, e);
+    pthread_mutex_lock(&d->mutex);
+    ps_ns_resource_park(d, s);
     if (rc == LC_OK)
       d->pending_seal = 0;
+    pthread_mutex_unlock(&d->mutex);
   }
   return rc;
 }
@@ -894,6 +903,7 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
                         s->binding.stream, &info.ref, &s->binding, e);
   ps_catalog_view_close(view);
   if (rc == LC_OK) {
+    ps_ns_resource_park(d, s);
     pthread_mutex_lock(&d->mutex);
     ps_ns_insert(d, s);
     pthread_mutex_unlock(&d->mutex);
@@ -1119,6 +1129,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
                               ps_namespace_append **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_append *append;
+  segment *s = NULL;
   uint64_t selected;
   uint64_t span;
   ps_budget_plan checkpoint = {0};
@@ -1183,7 +1194,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   if (rc == LC_OK && selected != d->active)
     rc = prepare(d, append->budget, selected, e);
   if (rc == LC_OK) {
-    segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
+    s = ps_ns_find(d, PS_CATALOG_SEGMENT, selected);
     rc = begin_reserve(s->stream, append->budget, span, exact, &append->writer,
                        e);
     append->segment = s->id;
@@ -1201,6 +1212,11 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   }
   if (rc != LC_OK) {
     ps_record_abort(&append->writer);
+    if (s) {
+      pthread_mutex_lock(&d->mutex);
+      ps_ns_resource_park(d, s);
+      pthread_mutex_unlock(&d->mutex);
+    }
     ps_checkpoint_delta_close(append->delta);
     ps_budget_close(append->budget, NULL);
     ps_ns_leave(d);
@@ -1273,12 +1289,17 @@ int ps_namespace_append_commit(ps_namespace_append *append,
   return rc;
 }
 void ps_namespace_append_close(ps_namespace_append *append) {
+  struct ps_namespace_data *d;
   if (!append)
     return;
+  d = append->data;
   ps_record_abort(&append->writer);
+  pthread_mutex_lock(&d->mutex);
+  ps_ns_resource_park(d, ps_ns_find(d, PS_CATALOG_SEGMENT, append->segment));
+  pthread_mutex_unlock(&d->mutex);
   ps_checkpoint_delta_close(append->delta);
   ps_budget_close(append->budget, NULL);
-  ps_ns_leave(append->data);
+  ps_ns_leave(d);
   ps_namespace_release(append->ns);
   lc_free_with_allocator(NULL, append);
 }

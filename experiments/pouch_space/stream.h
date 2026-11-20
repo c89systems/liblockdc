@@ -53,6 +53,11 @@ int ps_stream_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
 /* One cached owner per typed logical stream. Close requires no reader or
  * appender. Stop concurrent API calls before close; readers pin this owner. */
 int ps_stream_close(ps_stream *, lc_error *);
+/* Shared namespace owners may release cached run claims while retaining the
+ * validated append state. Existing windows retain only their own mappings.
+ * Maintenance reacquires the full map under namespace selection authority. */
+void ps_stream_park(ps_stream *);
+int ps_stream_pin_mappings(ps_stream *, lc_error *);
 /* Drop a cache's owner after it excludes writes and new captures. Previously
  * acquired windows retain the retired local view until their last close. */
 void ps_stream_drop_view(ps_stream *);

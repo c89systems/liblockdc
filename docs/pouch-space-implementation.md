@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), and [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity) | Messaging completion during maximal competing reservations and autonomous maintenance |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Capacity with idle namespace owners, tail latency, and reopen cost |
+| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), and [idle namespace owners](#namespace-mapping-lifetime) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7907,6 +7907,86 @@ to 9 for the large one. Single-file issued more maintenance writes and made
 Cold reopen still took 2.3–2.6 ms against 0.4–0.5 ms. The stage logs and raw
 comparison runs are in `build/pouch-space-shared-capacity/`.
 
-The mixed workload uses explicit maintenance with alternating owners. An idle
-namespace owner can still pin the last mapping it cached. Queue and outbox
-completion against a held maximal peer reservation remains open.
+The mixed workload uses explicit maintenance with alternating owners. The
+[namespace mapping lifetime](#namespace-mapping-lifetime) work below extends
+it to an idle third owner. Queue and outbox completion against a held maximal
+peer reservation remains open.
+
+## Namespace mapping lifetime
+
+A shared namespace owner retains its source identities, selected tails, and
+validated completion state. The physical mapping claims belong to live
+operations. Recovery releases its temporary mappings after validating a
+source. A continued append reuses its checksum state and captures the
+incomplete piece and unused grants under the stream edit guard. That capture
+walks backward from the final grant and returns the selected suffix in logical
+order. A foreign or uncertain edit still takes the full recovery path. The
+appender releases its mappings after commit or abort.
+
+Read windows capture the runs that cover their byte range. Namespace metadata
+views retain the existing witness that protects later body admission. Repack
+captures the selected mappings under namespace authority and retains them
+through the bounded pass, then releases them. Its encoded-body copy still
+runs outside namespace and allocator publication authority.
+
+The strengthened mixed workload opens a third SDK owner after the first
+cycle's data and receipt are written. It keeps that owner idle during the
+remaining churn and uses it for the final state read. Once each cycle's
+operations and held reads finish, every open owner must report zero physical
+reader claims. The initial Debug run failed in cycle one with 1,626,112
+bytes still claimed by a quiescent owner. A separate namespace check captures
+64 bytes from a multi-grant retired source, verifies that the claims cover
+only the reader's range, and reads those bytes after peer reclamation.
+
+The churn profiles processed 31.5 MiB each at a fixed 10 MiB capacity. The
+maintaining owner reported peak post-maintenance allocation of 880–900 KiB
+across the three builds. The prior two-owner fixture reported about 2 MiB.
+Debug passed all 81 selected groups, including allocation and I/O fault
+sweeps. GNU and musl release each passed all 77 selected groups. The tests
+include stream handoff, process exit, bounded recoding, lease pressure, and
+shared index publication and recovery.
+
+The first comparison saw higher sync time in the current build. A control
+using byte-identical executables reproduced a timing penalty for the second
+run in every pair, regardless of executable location. The final GNU run
+uses all six orders of the prior single-file build (`4965272f`), the current
+build, and multifile. The harness synchronizes fixture-directory changes and
+pauses briefly between samples, outside measured phases. Each workload has
+two independent producer clients and a third consumer or query client, uses
+12 values, and starts preopened. Queue samples warm each namespace. Indexed
+state uses two update rounds with a completed canonical prefix before each
+explicit index flush.
+
+All 216 runs verified their results after reopen. Values are medians of six
+runs in milliseconds, prior single-file / current single-file / multifile.
+
+| Workload | Body | Policy | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| Queue | 4 KiB | NoSync | 20.39 / 23.36 / 81.97 | 8.37 / 9.11 / 18.36 | 0.28 / 0.34 / 0.07 | 12.62 / 15.11 / 0.45 | 0.33 / 0.43 / 0.56 |
+| Queue | 4 KiB | Durable | 320.99 / 301.11 / 364.43 | 66.68 / 60.28 / 72.84 | 0.28 / 0.26 / 0.17 | 14.36 / 12.82 / 0.61 | 0.50 / 0.35 / 0.61 |
+| Queue | 64 KiB | NoSync | 59.23 / 53.98 / 98.03 | 13.33 / 14.80 / 20.05 | 0.42 / 0.31 / 0.08 | 14.85 / 12.45 / 0.42 | 0.65 / 0.62 / 0.57 |
+| Queue | 64 KiB | Durable | 308.62 / 289.27 / 382.38 | 61.18 / 55.92 / 74.59 | 0.38 / 0.26 / 0.14 | 14.90 / 12.28 / 0.49 | 0.65 / 0.61 / 0.47 |
+| Outbox | 4 KiB | NoSync | 342.79 / 324.86 / 500.96 | 80.67 / 81.62 / 113.61 | 0.47 / 0.52 / 0.18 | 19.78 / 16.51 / 15.38 | 5.65 / 4.61 / 28.09 |
+| Outbox | 4 KiB | Durable | 903.74 / 940.68 / 1580.05 | 185.45 / 183.34 / 329.93 | 0.61 / 0.51 / 0.30 | 47.57 / 43.87 / 62.52 | 61.42 / 61.38 / 138.64 |
+| Outbox | 64 KiB | NoSync | 354.42 / 318.84 / 500.57 | 73.92 / 70.17 / 103.59 | 0.76 / 0.50 / 0.18 | 21.41 / 17.72 / 14.96 | 7.91 / 4.67 / 27.65 |
+| Outbox | 64 KiB | Durable | 961.94 / 992.82 / 1465.53 | 177.37 / 183.97 / 274.36 | 0.77 / 0.58 / 0.32 | 42.47 / 42.68 / 61.78 | 71.47 / 58.47 / 137.49 |
+| Indexed state | 4 KiB | NoSync | 53.54 / 54.79 / 172.22 | 1.89 / 1.84 / 18.89 | 0.74 / 0.66 / 0.36 | 16.03 / 15.43 / 0.58 | 1.20 / 1.31 / 2.18 |
+| Indexed state | 4 KiB | Durable | 474.58 / 501.76 / 538.67 | 51.32 / 51.44 / 62.16 | 0.63 / 0.53 / 0.41 | 13.82 / 14.67 / 0.53 | 1.40 / 1.19 / 1.67 |
+| Indexed state | 64 KiB | NoSync | 86.88 / 82.18 / 164.65 | 13.45 / 13.24 / 17.43 | 0.72 / 0.59 / 0.35 | 14.45 / 13.77 / 0.48 | 2.86 / 2.87 / 3.09 |
+| Indexed state | 64 KiB | Durable | 487.61 / 485.82 / 593.12 | 46.69 / 50.04 / 65.43 | 0.65 / 0.76 / 0.47 | 13.21 / 12.96 / 0.60 | 2.94 / 2.93 / 3.28 |
+
+| Indexed body | Policy | Mutation | Flush | First query pass | Repeated pass |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 4 KiB | NoSync | 33.02 / 33.24 / 125.54 | 19.32 / 17.95 / 30.30 | 0.50 / 0.40 / 10.33 | 0.19 / 0.19 / 12.43 |
+| 4 KiB | Durable | 462.36 / 486.64 / 514.21 | 16.13 / 13.07 / 23.36 | 0.39 / 0.37 / 26.66 | 0.15 / 0.16 / 13.15 |
+| 64 KiB | NoSync | 60.53 / 61.42 / 121.13 | 25.40 / 21.91 / 29.71 | 0.58 / 0.47 / 6.47 | 0.27 / 0.21 / 6.84 |
+| 64 KiB | Durable | 474.20 / 472.62 / 575.95 | 14.61 / 15.14 / 30.36 | 0.43 / 0.47 / 19.31 | 0.15 / 0.18 / 14.69 |
+
+Current work medians ranged from 10% faster to 15% slower than the prior
+single-file build. The small NoSync queue accounted for the 15% increase,
+about 3 ms per sample.
+All twelve work and per-item p95 medians were lower than multifile. Queue
+and indexed-state cold reopen still took 12–16 ms against 0.4–0.6 ms.
+Raw runs, sync and CPU counters, the order control, and qualification logs
+are in `build/pouch-space-namespace-retention/`. Autonomous maintenance and
+completion under maximal competing reservations remain open.

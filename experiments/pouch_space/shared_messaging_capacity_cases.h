@@ -194,11 +194,12 @@ static void churn_reclaim(fixture *f, lc_error *e) {
 static void shared_messaging_capacity(const char *directory, int codec,
                                       int sync) {
   fixture *owners = calloc(2, sizeof(*owners));
+  fixture *idle = calloc(1, sizeof(*idle));
   lc_outbox *outbox[2];
   lc_error e = {0};
   long fence = 0;
   uint64_t peak = 0;
-  REQUIRE(owners);
+  REQUIRE(owners && idle);
   shared_lease_fixture = 1;
   setup(&owners[0], directory, 0, sync, codec, &e);
   strcpy(owners[1].path, owners[0].path);
@@ -221,6 +222,12 @@ static void shared_messaging_capacity(const char *directory, int codec,
     churn_queue(&owners[writer], &owners[peer], cycle, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
+    if (cycle == 1) {
+      strcpy(scenario + phase, " open idle peer");
+      strcpy(idle->path, owners[0].path);
+      configure(idle, 0, sync, codec);
+      open_store(idle, 0, &e);
+    }
     strcpy(scenario + phase, " reclaim");
     churn_reclaim(&owners[peer], &e);
     if (held.body) {
@@ -251,7 +258,16 @@ static void shared_messaging_capacity(const char *directory, int codec,
                 (unsigned long long)stats.entries);
       }
     }
+    strcpy(scenario + phase, " idle physical retention");
+    for (size_t i = 0; i < 2; ++i) {
+      ok(ps_status(fixture_space(&owners[i]), &stats, &e), &e);
+      REQUIRE(!stats.retained_payload_bytes);
+    }
+    ok(ps_status(fixture_space(idle), &stats, &e), &e);
+    REQUIRE(!stats.retained_payload_bytes);
   }
+  churn_read_state(idle, "churn", CHURN_CYCLES, &e);
+  lc_client_close(idle->client);
   lc_outbox_close(outbox[1]);
   lc_outbox_close(outbox[0]);
   lc_client_close(owners[1].client);
@@ -267,6 +283,7 @@ static void shared_messaging_capacity(const char *directory, int codec,
          (unsigned long long)CHURN_CYCLES * CHURN_BYTES * 3,
          (unsigned long long)peak);
   shared_lease_fixture = 0;
+  free(idle);
   free(owners);
   clear(&e);
 }

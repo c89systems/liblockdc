@@ -2366,7 +2366,7 @@ static int open_old_body(void *context, uint64_t segment,
   if (entry->control)
     return LC_OK;
   REQUIRE(!pin->window && entry->found && entry->version == 1);
-  REQUIRE(entry->payload_span.payload_length == 64);
+  REQUIRE(entry->payload_span.payload_length == sizeof(body));
   REQUIRE(ps_namespace_parse_source_leaf(entry->payload_span.container_leaf,
                                          &kind, &id));
   REQUIRE(kind == PS_CATALOG_SEGMENT && id == 1);
@@ -2407,12 +2407,16 @@ static void shared_source_pins(const char *path) {
     ps_namespace_window *removed = NULL;
     shared_body_pin pin = {0};
     ps_namespace_repack_result result;
+    ps_namespace_status selected;
+    ps_stats physical;
     unsigned char bytes[64];
     struct iovec part = {bytes, sizeof(bytes)};
     options.storage.durable_sync = durable;
     ok(ps_root_open(path, 1, &options, &a, &e), &e);
     ps_namespace *x = acquire(a, "shared", 1, &e);
-    ok(append(a, x, 1, 0, sizeof(bytes), &e), &e);
+    ok(append(a, x, 1, 0, sizeof(body), &e), &e);
+    ok(ps_namespace_status_get(x, &selected, &e), &e);
+    REQUIRE(selected.runs > 2);
     ok(ps_namespace_checkpoint_flush(x, &e), &e);
     ok(ps_namespace_view_open(x, &old, &e), &e);
     ok(ps_namespace_view_open(x, &second, &e), &e);
@@ -2443,6 +2447,9 @@ static void shared_source_pins(const char *path) {
     ok(ps_namespace_view_visit(second, 1, open_old_body, &pin, &e), &e);
     REQUIRE(pin.window);
     ps_namespace_view_close(second);
+    ok(ps_status(ps_root_space(a), &physical, &e), &e);
+    REQUIRE(physical.retained_payload_bytes &&
+            physical.retained_payload_bytes <= 2 * PS_CHUNK);
     ok(ps_namespace_checkpoint_flush(y, &e), &e);
 
     /* Inject a foreign witness after preparation, under the same name
@@ -2470,6 +2477,8 @@ static void shared_source_pins(const char *path) {
        &e);
     REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
     ps_namespace_read_close(pin.window);
+    ok(ps_status(ps_root_space(a), &physical, &e), &e);
+    REQUIRE(!physical.retained_payload_bytes);
     ps_namespace_release(y);
     ps_namespace_release(x);
     ok(ps_root_close(b, &e), &e);

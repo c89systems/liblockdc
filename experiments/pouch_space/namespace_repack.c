@@ -138,14 +138,19 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   ps_budget *budget = NULL;
   repack_selection selection;
   uint64_t cursor = 0, cover = 0, encoded, table, footprint;
-  int rc, found = 0, matches = 0, partial, unused;
+  int rc, found = 0, matches = 0, partial, unused, shared;
   if (!out || !limit || !id ||
       (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_BODY))
     return lc_error_set(e, LC_ERR_INVALID, 0,
                         "source repack requires identity, limit and output",
                         NULL, NULL, "pouch");
   memset(out, 0, sizeof(*out));
-  rc = ps_ns_data_get(ns, &d, e);
+  rc = ps_ns_data_lookup(ns, &d, e);
+  if (rc != LC_OK)
+    return rc;
+  shared = ps_coordination_shared(ps_space_coordination(ns->root->space));
+  if (shared)
+    rc = ps_ns_enter(d, e);
   if (rc != LC_OK)
     return rc;
   pthread_mutex_lock(&d->mutex);
@@ -162,13 +167,18 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
       cover = id < coverage.segment ? info.tail : coverage.offset;
     else if (coverage.epoch && kind == PS_CATALOG_BODY && info.sealed)
       cover = info.tail;
-    rc = ps_stream_window_open(r->stream, 0, 0, &pin, e);
+    rc = ps_stream_pin_mappings(r->stream, e);
+    if (rc == LC_OK)
+      rc = ps_stream_window_open(r->stream, 0, 0, &pin, e);
     if (rc == LC_OK) {
       r->repacking = 1;
       cursor = r->reclaim_cursor;
-    }
+    } else
+      ps_ns_resource_park(d, r);
   }
   pthread_mutex_unlock(&d->mutex);
+  if (shared)
+    ps_ns_leave(d);
   if (rc != LC_OK)
     return rc;
   ps_namespace_retain(ns);
@@ -301,6 +311,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   pthread_mutex_lock(&d->mutex);
   r->reclaim_cursor = cursor;
   r->repacking = 0;
+  ps_ns_resource_park(d, r);
   pthread_mutex_unlock(&d->mutex);
   ps_stream_window_close(pin);
   ps_namespace_release(ns);

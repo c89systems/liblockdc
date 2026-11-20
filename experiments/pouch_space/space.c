@@ -6558,6 +6558,7 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   }
   if (rc == LC_OK &&
       (head->deleted ||
+       (end && (start >= end || end > head->stream_capacity)) ||
        head->stream_runs > (uint64_t)((size_t)-1 / sizeof(*items))))
     rc = err(error, LC_ERR_INVALID,
              "mapping capture is unavailable or too large");
@@ -6571,7 +6572,16 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
       owned_status(&selected, status);
     }
   }
-  if (rc == LC_OK && ref && end) {
+  if (rc == LC_OK && end && end == head->stream_capacity) {
+    /* A continued append usually needs only the last, partially used run. */
+    first = NULL;
+    capacity = 0;
+    for (p = head->owned_last; p && p->key.key + p->stream_capacity > start;
+         p = p->owned_prev) {
+      first = p;
+      ++capacity;
+    }
+  } else if (rc == LC_OK && end) {
     while (first && first->key.key + first->stream_capacity <= start)
       first = first->owned_next;
     capacity = 0;
@@ -6643,6 +6653,13 @@ int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
                         uint64_t start, uint64_t end, ps_owned_run ***out,
                         size_t *count, lc_error *error) {
   return capture_runs(s, NULL, key, ref, start, end, NULL, out, count, error);
+}
+int ps_owned_runs_edit_range(ps_owned_head *head, uint64_t start, uint64_t end,
+                             ps_owned_run ***out, size_t *count,
+                             lc_error *error) {
+  const ps_key none = {0};
+  return capture_runs(head->space, head->entry, none, NULL, start, end, NULL,
+                      out, count, error);
 }
 int ps_owned_run_mapped(const ps_owned_run *run) {
   return run && run->entry->owned_mapped;

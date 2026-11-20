@@ -48,6 +48,7 @@ struct ps_namespace_data {
  */
 ps_ns_resource *ps_ns_resource_new(unsigned int, uint64_t, lc_error *);
 void ps_ns_resource_free(ps_ns_resource *);
+void ps_ns_resource_park(struct ps_namespace_data *, ps_ns_resource *);
 int ps_ns_index_room(struct ps_namespace_data *, lc_error *);
 ps_ns_resource *ps_ns_find(struct ps_namespace_data *, unsigned int, uint64_t);
 int ps_ns_source(struct ps_namespace_data *, unsigned int, uint64_t, int after,
@@ -58,6 +59,7 @@ void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 /* Mutation authority never spans an application producer while holding a mutex.
  */
 int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
+int ps_ns_data_lookup(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_retention_restore(struct ps_namespace_data *, lc_error *);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
 int ps_ns_enter_checkpoint(ps_namespace *, struct ps_namespace_data **,
