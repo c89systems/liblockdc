@@ -75,8 +75,9 @@ int ps_coordination_initialize(ps_coordination *, int create, int acquire,
  * Sync leadership uses byte 5; never wait for it while holding allocation.
  * Namespace keys map deterministically into bytes 512..5119 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
- * Stream incarnations use disjoint stripes and require wait=0. Namespace
- * and stream guards may be released by a different thread.
+ * Each stream incarnation has its own advisory byte beyond the maximum
+ * container capacity and requires wait=0. Namespace and stream guards may
+ * be released by a different thread.
  * Namespace views take compatible read witnesses with wait=0. Acquire
  * while holding the corresponding namespace guard, and release after the
  * last use of captured metadata. Witnesses may be released across threads.

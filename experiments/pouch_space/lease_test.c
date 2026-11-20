@@ -33,6 +33,8 @@ static int benchmark_normal, measure_enabled;
 static size_t measured_syncs;
 static double phase_started, phase_elapsed;
 static int shared_lease_fixture;
+static pthread_key_t failed_authority;
+static int report_failed_authority;
 #define REQUIRE(x)                                                             \
   do {                                                                         \
     __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED);                          \
@@ -42,12 +44,29 @@ static int shared_lease_fixture;
     }                                                                          \
   } while (0)
 static void ok(int rc, lc_error *e) {
+  if (rc == LC_ERR_PENDING && report_failed_authority)
+    fprintf(
+        stderr, "last unavailable authority at byte %llu\n",
+        (unsigned long long)(uintptr_t)pthread_getspecific(failed_authority));
   if (rc != LC_OK)
     fprintf(stderr, "lease %d: %s (%s)\n", rc,
             e && e->message ? e->message : "?",
             e && e->detail ? e->detail : "?");
   REQUIRE(rc == LC_OK);
 }
+static int trace_authority(void *context, int fd, int command,
+                           struct flock *lock) {
+  int rc = fcntl(fd, command, lock);
+  (void)context;
+  if (rc < 0 && (errno == EAGAIN || errno == EACCES)) {
+    int saved = errno;
+    (void)pthread_setspecific(failed_authority,
+                              (void *)(uintptr_t)lock->l_start);
+    errno = saved;
+  }
+  return rc;
+}
+static const ps_coordination_io traced_authority = {NULL, trace_authority};
 static void clear(lc_error *e) {
   lc_error_cleanup(e);
   lc_error_init(e);
@@ -246,6 +265,8 @@ static void open_store(fixture *f, int create, lc_error *e) {
   REQUIRE(!f->client);
   ps_pouch_client_options physical = {0};
   physical.io = f->io;
+  if (report_failed_authority)
+    physical.coordination_io = &traced_authority;
   if (shared_lease_fixture)
     physical.maximum_capacity = PS_DEFAULT_CAPACITY;
   ok(f->native
@@ -1706,6 +1727,7 @@ typedef struct run {
   int diagnostic;
   size_t selected;
   int io_mode;
+  uint64_t segment_bytes;
 } run;
 static void *worker(void *context) {
   run *r = context;
@@ -1732,6 +1754,9 @@ static void *worker(void *context) {
            !strcmp(r->mode, "shared-unpaced-capacity"))
     shared_autonomous_capacity(r->directory, r->io_mode, r->sync,
                                !strcmp(r->mode, "shared-unpaced-capacity"));
+  else if (!strcmp(r->mode, "shared-concurrent-capacity"))
+    shared_concurrent_capacity(r->directory, r->io_mode, r->sync,
+                               r->segment_bytes);
   else if (!strcmp(r->mode, "shared-lease-pressure"))
     shared_lease_pressure(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "shared-queue-pressure") ||
@@ -1833,14 +1858,23 @@ int main(int argc, char **argv) {
   if (!strcmp(r.mode, "shared-messaging-capacity") ||
       !strcmp(r.mode, "shared-autonomous-capacity") ||
       !strcmp(r.mode, "shared-unpaced-capacity") ||
+      !strcmp(r.mode, "shared-concurrent-capacity") ||
       !strcmp(r.mode, "shared-lease-pressure") ||
       !strcmp(r.mode, "shared-queue-pressure") ||
       !strcmp(r.mode, "shared-outbox-pressure")) {
-    REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
-            argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
-            argv[4][0] <= '1');
+    REQUIRE((argc == 5 ||
+             (argc == 6 && !strcmp(r.mode, "shared-concurrent-capacity"))) &&
+            strlen(argv[3]) == 1 && argv[3][0] >= '0' && argv[3][0] <= '3' &&
+            strlen(argv[4]) == 1 && argv[4][0] >= '0' && argv[4][0] <= '1');
     r.io_mode = argv[3][0] - '0';
     r.sync = argv[4][0] - '0';
+    if (argc == 6) {
+      char *end;
+      errno = 0;
+      r.segment_bytes = strtoull(argv[5], &end, 10);
+      REQUIRE(!errno && end != argv[5] && !*end && r.segment_bytes >= PS_PAGE &&
+              r.segment_bytes <= LC_POUCH_DEFAULT_SEGMENT_TARGET_BYTES);
+    }
   } else if (!strncmp(r.mode, "allocation-", 11)) {
     REQUIRE(argc == 7 || argc == 8);
     for (int i = 3; i < 7; ++i)

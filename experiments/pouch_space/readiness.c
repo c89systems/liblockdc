@@ -6,9 +6,9 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
-/* Live participants must all announce disk changes before writing. The
- * previous volatile protocol is safe to discard only on cold admission. */
-#define READY_MAGIC UINT64_C(0x3359444145525350)
+/* Live participants must agree on stream lock addresses. The prior
+ * volatile protocol is safe to discard only on cold admission. */
+#define READY_MAGIC UINT64_C(0x3459444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)

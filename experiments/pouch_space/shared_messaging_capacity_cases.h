@@ -6,6 +6,7 @@ typedef struct churn_stream {
   lc_sink sink;
   uint64_t state;
   size_t offset;
+  rendezvous *first_read;
 } churn_stream;
 
 static unsigned char churn_byte(churn_stream *stream) {
@@ -22,6 +23,11 @@ static size_t churn_produce(lc_source *source, void *bytes, size_t count,
   churn_stream *stream = source->impl;
   unsigned char *buffer = bytes;
   (void)e;
+  if (stream->first_read) {
+    gate_signal(stream->first_read, 0);
+    gate_wait(stream->first_read, 1);
+    stream->first_read = NULL;
+  }
   if (count > CHURN_BYTES - stream->offset)
     count = CHURN_BYTES - stream->offset;
   for (size_t i = 0; i < count; ++i)
@@ -64,7 +70,8 @@ static void churn_read_state(fixture *f, const char *key, uint64_t seed,
 
 static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
                          int last, int manual, long *fence,
-                         lc_pouch_state_read_result *held, lc_error *e) {
+                         lc_pouch_state_read_result *held,
+                         rendezvous *first_read, lc_error *e) {
   lc_update_opts options = {0};
   lc_lease *lease = acquire_with_wait(writer, "churn", NULL, 2, e);
   churn_stream body;
@@ -74,6 +81,7 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
   options.has_retention_seconds = 1;
   options.retention_seconds = 2;
   churn_stream_init(&body, seed);
+  body.first_read = first_read;
   ok(lc_lease_update(lease, &body.source, &options, e), e);
   REQUIRE(body.offset == CHURN_BYTES);
   ok(lc_lease_release(lease, NULL, e), e);
@@ -91,15 +99,15 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
   }
 }
 
-static void churn_queue(fixture *writer, fixture *peer, uint64_t seed,
-                        lc_error *e) {
+static void churn_queue(fixture *writer, fixture *peer, const char *ns,
+                        uint64_t seed, lc_error *e) {
   lc_enqueue_req request = {0};
   lc_enqueue_res result = {0};
   lc_dequeue_req dequeue = shared_queue_request();
   lc_message *message = NULL;
   churn_stream body;
   size_t written = 0;
-  request.ns = dequeue.ns = "queues";
+  request.ns = dequeue.ns = ns;
   request.queue = dequeue.queue;
   request.content_type = "application/octet-stream";
   churn_stream_init(&body, seed);
@@ -399,9 +407,9 @@ static void shared_messaging_capacity(const char *directory, int codec,
     size_t phase = strlen(scenario);
     strcpy(scenario + phase, " lease");
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CHURN_CYCLES,
-                 1, &fence, cycle == 1 ? &held : NULL, &e);
+                 1, &fence, cycle == 1 ? &held : NULL, NULL, &e);
     strcpy(scenario + phase, " queue");
-    churn_queue(&owners[writer], &owners[peer], cycle, &e);
+    churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
     if (cycle == 1) {
@@ -482,13 +490,34 @@ static int churn_expired(fixture *owner, lc_error *e) {
     ok(rc, e);
   return expired;
 }
+static lc_pouch *churn_maintenance_owner(fixture *f, lc_error *e) {
+  ps_pouch_state_options options = {0};
+  lc_pouch *worker = NULL;
+  ps_stats stats;
+  options.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.logical.single_writer_set = 1;
+  options.logical.query_indexing_enabled_set = 1;
+  options.logical.background_compaction_enabled_set = 1;
+  options.logical.background_compaction_enabled = 1;
+  if (f->settings.set_mask & LC_POUCH_SETTING_SEGMENT_TARGET_BYTES)
+    options.logical.segment_target_bytes = f->settings.segment_target_bytes;
+  options.logical.durable_sync = f->sync;
+  options.logical.crypto_key = f->crypto & 1 ? crypto_key : NULL;
+  options.logical.compression = f->crypto & 2 ? "zlib" : "none";
+  ok(ps_pouch_state_open(f->path, 0, &allocator, &options, &worker, e), e);
+  REQUIRE(worker->compaction_interval_seconds ==
+          LC_POUCH_DEFAULT_COMPACTION_INTERVAL_SECONDS);
+  ok(ps_status(ps_root_space(ps_pouch_state_root(worker)), &stats, e), e);
+  REQUIRE(!stats.checkpoints);
+  return worker;
+}
+
 static void shared_autonomous_capacity(const char *directory, int codec,
                                        int sync, int unpaced) {
   enum { CYCLES = 16, BURST = 4 };
   fixture *owners = calloc(2, sizeof(*owners));
   lc_pouch *worker = NULL;
   lc_outbox *outbox[2];
-  ps_pouch_state_options options = {0};
   ps_space *space = NULL;
   ps_stats stats;
   lc_error e = {0};
@@ -501,21 +530,8 @@ static void shared_autonomous_capacity(const char *directory, int codec,
   strcpy(owners[1].path, owners[0].path);
   configure(&owners[1], 0, sync, codec);
   open_store(&owners[1], 0, &e);
-  options.maximum_capacity = PS_DEFAULT_CAPACITY;
-  options.logical.single_writer_set = 1;
-  options.logical.query_indexing_enabled_set = 1;
-  options.logical.background_compaction_enabled_set = 1;
-  options.logical.background_compaction_enabled = 1;
-  options.logical.durable_sync = sync;
-  options.logical.crypto_key = codec & 1 ? crypto_key : NULL;
-  options.logical.compression = codec & 2 ? "zlib" : "none";
-  ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker, &e),
-     &e);
-  REQUIRE(worker->compaction_interval_seconds ==
-          LC_POUCH_DEFAULT_COMPACTION_INTERVAL_SECONDS);
+  worker = churn_maintenance_owner(&owners[0], &e);
   space = ps_root_space(ps_pouch_state_root(worker));
-  ok(ps_status(space, &stats, &e), &e);
-  REQUIRE(!stats.checkpoints);
   for (size_t i = 0; i < 2; ++i)
     outbox[i] = shared_outbox_open(&owners[i], "effects", "capacity", 300, &e);
 
@@ -537,9 +553,9 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     now(1000U + cycle * 10U);
     strcpy(scenario + phase, " lease");
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES, 0,
-                 &fence, NULL, &e);
+                 &fence, NULL, NULL, &e);
     strcpy(scenario + phase, " queue");
-    churn_queue(&owners[writer], &owners[peer], cycle, &e);
+    churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
     work_seconds += real_clock(CLOCK_MONOTONIC) - cycle_start;
@@ -604,6 +620,127 @@ static void shared_autonomous_capacity(const char *directory, int codec,
       longest_wait * 1000);
   shared_lease_fixture = 0;
   free(owners);
+  clear(&e);
+}
+
+enum { CONCURRENT_CYCLES = 8 };
+typedef struct churn_lane {
+  fixture writer, peer;
+  rendezvous first_read;
+  const char *ns;
+  uint64_t seed;
+} churn_lane;
+
+static void *churn_lane_run(void *context) {
+  churn_lane *lane = context;
+  fixture *writer = &lane->writer, *peer = &lane->peer;
+  long fence = 0;
+  lc_error e = {0};
+  lc_outbox *output = shared_outbox_open(writer, lane->ns, "producer", 300, &e);
+  lc_outbox *input = shared_outbox_open(peer, lane->ns, "consumer", 300, &e);
+  int trace = getenv("POUCH_SPACE_CHURN_TRACE") != NULL;
+  for (uint64_t cycle = 1; cycle <= CONCURRENT_CYCLES; ++cycle) {
+    uint64_t seed = lane->seed + cycle;
+    if (trace)
+      fprintf(stderr, "%s cycle=%llu lease\n", lane->ns,
+              (unsigned long long)cycle);
+    churn_expiry(writer, peer, seed, 1, 0, &fence, NULL,
+                 cycle == 1 ? &lane->first_read : NULL, &e);
+    if (trace)
+      fprintf(stderr, "%s cycle=%llu queue\n", lane->ns,
+              (unsigned long long)cycle);
+    churn_queue(writer, peer, lane->ns, seed, &e);
+    if (trace)
+      fprintf(stderr, "%s cycle=%llu outbox\n", lane->ns,
+              (unsigned long long)cycle);
+    churn_outbox(output, input, seed, &e);
+  }
+  lc_outbox_close(input);
+  lc_outbox_close(output);
+  clear(&e);
+  return NULL;
+}
+
+static void shared_concurrent_capacity(const char *directory, int codec,
+                                       int sync, uint64_t segment_bytes) {
+  static const char *const names[] = {"writer-a", "writer-b"};
+  churn_lane *lanes = calloc(2, sizeof(*lanes));
+  pthread_t tasks[2];
+  lc_error e = {0};
+  ps_stats stats;
+  REQUIRE(lanes);
+  shared_lease_fixture = 1;
+  REQUIRE(!pthread_key_create(&failed_authority, NULL));
+  report_failed_authority = 1;
+  strcpy(scenario, "shared concurrent capacity");
+  now(1000);
+  setup(&lanes[0].writer, directory, 0, sync, codec, &e);
+  close_store(&lanes[0].writer);
+  for (size_t i = 0; i < 2; ++i) {
+    churn_lane *lane = &lanes[i];
+    lane->ns = names[i];
+    lane->seed = 100 + i * CONCURRENT_CYCLES;
+    if (i)
+      strcpy(lane->writer.path, lanes[0].writer.path);
+    strcpy(lane->peer.path, lane->writer.path);
+    configure(&lane->writer, 0, sync, codec);
+    configure(&lane->peer, 0, sync, codec);
+    lane->writer.config.default_namespace = lane->ns;
+    lane->peer.config.default_namespace = lane->ns;
+    if (segment_bytes) {
+      lane->writer.settings.set_mask |= LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
+      lane->peer.settings.set_mask |= LC_POUCH_SETTING_SEGMENT_TARGET_BYTES;
+      lane->writer.settings.segment_target_bytes = segment_bytes;
+      lane->peer.settings.segment_target_bytes = segment_bytes;
+    }
+    open_store(&lane->writer, 0, &e);
+    open_store(&lane->peer, 0, &e);
+    gate_init(&lane->first_read);
+  }
+  lc_pouch *worker = churn_maintenance_owner(&lanes[0].writer, &e);
+  uint64_t effective_target = worker->segment_target_bytes;
+  REQUIRE(
+      effective_target ==
+      (segment_bytes ? segment_bytes : LC_POUCH_DEFAULT_SEGMENT_TARGET_BYTES));
+  double started = real_clock(CLOCK_MONOTONIC);
+  for (size_t i = 0; i < 2; ++i)
+    REQUIRE(!pthread_create(&tasks[i], NULL, churn_lane_run, &lanes[i]));
+  for (size_t i = 0; i < 2; ++i)
+    gate_wait(&lanes[i].first_read, 0);
+  for (size_t i = 0; i < 2; ++i)
+    gate_signal(&lanes[i].first_read, 1);
+  for (size_t i = 0; i < 2; ++i) {
+    REQUIRE(!pthread_join(tasks[i], NULL));
+    gate_destroy(&lanes[i].first_read);
+  }
+  double work = real_clock(CLOCK_MONOTONIC) - started;
+  ok(ps_status(ps_root_space(ps_pouch_state_root(worker)), &stats, &e), &e);
+  REQUIRE(stats.capacity == PS_DEFAULT_CAPACITY && stats.checkpoints > 0);
+  lc_pouch_close(worker);
+  for (size_t i = 0; i < 2; ++i) {
+    lc_client_close(lanes[i].peer.client);
+    lc_client_close(lanes[i].writer.client);
+    lanes[i].writer.client = NULL;
+  }
+  REQUIRE(!live);
+  for (size_t i = 0; i < 2; ++i) {
+    churn_lane *lane = &lanes[i];
+    open_store(&lane->writer, 0, &e);
+    churn_read_state(&lane->writer, "churn", lane->seed + CONCURRENT_CYCLES,
+                     &e);
+    shared_queue_stats(&lane->writer, lane->ns, 0, 0, &e);
+    close_store(&lane->writer);
+  }
+  printf("shared concurrent capacity codec=%d sync=%d cycles=%d bytes=%llu "
+         "segment_bytes=%llu checkpoints=%llu work_ms=%.3f verified=1\n",
+         codec, sync, 2 * CONCURRENT_CYCLES,
+         (unsigned long long)CONCURRENT_CYCLES * 2 * CHURN_BYTES * 3,
+         (unsigned long long)effective_target,
+         (unsigned long long)stats.checkpoints, work * 1000);
+  shared_lease_fixture = 0;
+  report_failed_authority = 0;
+  REQUIRE(!pthread_key_delete(failed_authority));
+  free(lanes);
   clear(&e);
 }
 

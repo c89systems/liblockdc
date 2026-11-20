@@ -11,7 +11,6 @@
 
 #define FIXED (PS_COORDINATION_TXN_STRIPES + 4U)
 #define BUCKETS 67U
-#define STREAM_BASE UINT64_C(8)
 #define INITIALIZE_OFFSET 6U
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
@@ -272,6 +271,8 @@ static void drop(ps_coordination_guard *guard) {
 }
 static uint64_t keyed_offset(enum ps_coordination_domain domain,
                              uint64_t identity) {
+  if (domain == PS_COORDINATION_STREAM)
+    return PS_MAX_CAPACITY + identity - 1;
   if (domain == PS_COORDINATION_CONTROL_STATE)
     return STATE_BASE - 2 + identity;
   if (domain == PS_COORDINATION_STREAM_CLAIM) {
@@ -285,8 +286,6 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
   identity ^= identity >> 33;
   if (domain == PS_COORDINATION_COLLECTION_CATALOG)
     return PS_READINESS_OFFSET + identity % COLLECTION_CATALOG_SLOTS;
-  if (domain == PS_COORDINATION_STREAM)
-    return STREAM_BASE + identity % (TXN_BASE - STREAM_BASE);
   if (domain == PS_COORDINATION_NAMESPACE_VIEW)
     return VIEW_BASE + identity % VIEW_SLOTS;
   if (domain == PS_COORDINATION_NAMESPACE_STATE)
@@ -458,6 +457,8 @@ static int lock_guard(ps_coordination *owner,
       (domain <= PS_COORDINATION_SYNC && identity) ||
       (domain == PS_COORDINATION_TRANSACTION &&
        identity >= PS_COORDINATION_TXN_STRIPES) ||
+      (domain == PS_COORDINATION_STREAM &&
+       (!identity || identity > PS_MAX_INCARNATION)) ||
       (domain == PS_COORDINATION_STREAM_CLAIM && !identity) ||
       (domain == PS_COORDINATION_CONTROL_STATE && identity >= 2))
     return fail(e, LC_ERR_INVALID, 0, "invalid container coordination guard");

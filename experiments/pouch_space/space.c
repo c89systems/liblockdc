@@ -2707,7 +2707,7 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
   return allocation_end(s, guard, rc, error);
 }
 static int valid_token_grant(uint64_t prior, uint64_t next) {
-  return next > prior &&
+  return next > prior && next <= PS_MAX_INCARNATION &&
          (next - prior == TOKEN_RANGE || next - prior == TOKEN_POOL);
 }
 /* A cold or depleted cohort reserves a durable pool. Every live assignment
@@ -2716,11 +2716,11 @@ static int grant_tokens(ps_space *s, lc_error *error) {
   ps_entry grant = {0};
   uint64_t limit = s->token_limit;
   uint64_t count = ps_coordination_shared(s->coordination) &&
-                           limit <= UINT64_MAX - TOKEN_POOL
+                           limit <= PS_MAX_INCARNATION - TOKEN_POOL
                        ? TOKEN_POOL
                        : TOKEN_RANGE;
   int rc;
-  if (limit > UINT64_MAX - count)
+  if (limit > PS_MAX_INCARNATION - count)
     return err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
   grant.token = limit + count;
   rc = append_event_locked(s, &grant, PS_RESERVE_IDS, error);
@@ -2803,14 +2803,15 @@ static int root_valid(const unsigned char *p) {
   uint64_t capacity = get64(p + 16);
   uint64_t offset = get64(p + 32), generation = get64(p + 40);
   return get64(p) == ROOT_MAGIC && get64(p + 8) && capacity >= PS_MIB &&
-         capacity <= INT64_MAX && capacity % PS_MIB == 0 &&
+         capacity <= PS_MAX_CAPACITY && capacity % PS_MIB == 0 &&
          ((!offset && !generation) ||
           (offset >= PS_METADATA_START && offset % PS_PAGE == 0 &&
            offset <= capacity - PS_PAGE &&
            (offset < JOURNAL_OFFSET || offset >= PS_DATA) && generation &&
            generation <= get64(p + 8))) &&
-         get64(p + 48) && get64(p + 48) % TOKEN_RANGE == 0 &&
-         get32(p + 72) == PS_ROOT_LAYOUT && checksum(p, 76) == get32(p + 76);
+         get64(p + 48) && get64(p + 48) <= PS_MAX_INCARNATION &&
+         get64(p + 48) % TOKEN_RANGE == 0 && get32(p + 72) == PS_ROOT_LAYOUT &&
+         checksum(p, 76) == get32(p + 76);
 }
 static int canonical_certificate(ps_space *s, ps_readiness_certificate *out,
                                  lc_error *error) {
@@ -4483,14 +4484,15 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     options = &defaults;
   if (options->shared != 0 && options->shared != 1)
     return err(error, LC_ERR_INVALID, "invalid container ownership mode");
-  if ((options->initial_capacity && (options->initial_capacity < PS_MIB ||
-                                     options->initial_capacity % PS_MIB ||
-                                     options->initial_capacity > INT64_MAX)) ||
-      (options->maximum_capacity && (options->maximum_capacity % PS_MIB ||
-                                     options->maximum_capacity > INT64_MAX)))
-    return err(
-        error, LC_ERR_INVALID,
-        "container capacity must be whole MiB within signed 64-bit offsets");
+  if ((options->initial_capacity &&
+       (options->initial_capacity < PS_MIB ||
+        options->initial_capacity % PS_MIB ||
+        options->initial_capacity > PS_MAX_CAPACITY)) ||
+      (options->maximum_capacity &&
+       (options->maximum_capacity % PS_MIB ||
+        options->maximum_capacity > PS_MAX_CAPACITY)))
+    return err(error, LC_ERR_INVALID,
+               "container capacity must be whole MiB and at most 4 EiB");
   s = lc_calloc_with_allocator(NULL, 1, sizeof(*s));
   if (!s)
     return err(error, LC_ERR_NOMEM, "cannot allocate container handle");
@@ -5567,7 +5569,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
   count = get64(wire + 64);
   if (count > (PS_JOURNAL - 64U) / 24U ||
       bytes != TICKET_HEADER + count * 24U || !get64(wire + 48) ||
-      get64(wire + 24) < PS_MIB || get64(wire + 24) > INT64_MAX ||
+      get64(wire + 24) < PS_MIB || get64(wire + 24) > PS_MAX_CAPACITY ||
       get64(wire + 24) % PS_MIB || get32(wire + 76) || get32(wire + 100) ||
       get64(wire + 104))
     return err(error, LC_ERR_INVALID, "invalid captured reader metadata");
@@ -5812,7 +5814,7 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   capacity = s->capacity;
   rc = healthy(s, error);
-  if (rc == LC_OK && (bytes > (uint64_t)INT64_MAX - capacity ||
+  if (rc == LC_OK && (bytes > PS_MAX_CAPACITY - capacity ||
                       (s->maximum && bytes > s->maximum - capacity)))
     rc =
         err(error, LC_ERR_INVALID, "container growth exceeds maximum capacity");

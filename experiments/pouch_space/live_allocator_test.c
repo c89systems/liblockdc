@@ -2395,7 +2395,7 @@ static void readiness_cohort(void) {
   lc_error_cleanup(&e);
   /* A checksum-valid record from the previous live protocol also fences
    * admission. The disk format can still reopen after the cohort drains. */
-  records[selected + 1] = UINT64_C(0x3159444145525350);
+  records[selected + 1] = UINT64_C(0x3359444145525350);
   records[crc] = crc32(0, (const unsigned char *)(records + selected),
                        (uInt)((PS_READINESS_WORDS - 1) * sizeof(zero)));
   REQUIRE(pwrite(b->fd, records + selected, PS_READINESS_WORDS * sizeof(zero),
@@ -4555,7 +4555,7 @@ static int stream_unlock_fault(void *context, int fd, int command,
                                struct flock *lock) {
   int *fail = context;
   if (*fail == 1 && command == F_OFD_SETLK && lock->l_type == F_UNLCK &&
-      lock->l_start >= 8 && lock->l_start < 256) {
+      lock->l_start >= (off_t)PS_MAX_CAPACITY) {
     ++*fail;
     errno = EIO;
     return -1;

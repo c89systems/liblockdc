@@ -11,6 +11,10 @@
  * Stop concurrent calls before closing the space itself. */
 #define PS_MIB UINT64_C(1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
+/* The upper half of signed file offsets is reserved for advisory stream
+ * authority. These bytes are beyond EOF and never allocated or read. */
+#define PS_MAX_CAPACITY (UINT64_C(1) << 62)
+#define PS_MAX_INCARNATION ((uint64_t)INT64_MAX - PS_MAX_CAPACITY)
 /* Native experiment: filesystem block-sized physical allocation with small
  * logical tails sharing independently owned cells. */
 #define PS_PAGE 4096U

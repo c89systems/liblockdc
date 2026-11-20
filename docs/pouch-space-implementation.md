@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), and [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse) | Sustained simultaneous producers and completion sizing for larger envelopes and concurrent terminal operations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse), and [simultaneous-producer measurements](#stream-authority-and-segment-sizing) | Namespace handoff under simultaneous load and completion sizing for larger envelopes and concurrent terminal operations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8540,3 +8540,81 @@ with a median paired difference of −7.84 ms. Durable outbox reopen was
 slower in five pairs, with a median paired difference of +0.99 ms. Durable
 outbox work was slower in eight pairs with a median paired difference of
 +31.80 ms. The logs and raw runs are in `build/pouch-space-unpaced/`.
+
+## Stream authority and segment sizing
+
+The simultaneous-producer workload gives two independent writer/consumer
+pairs separate namespaces in the same fixed 10 MiB file. Both first producer
+callbacks must enter before either continues. Each pair then runs eight
+unpaced lease, queue and stateful outbox cycles while an independent worker
+schedules maintenance. Each of the 48 bodies streams 384 KiB. The workload
+checks fencing, peer payloads, empty queues, and duplicate outbox receipts
+with zero producer reads. On successful runs it verifies both retained
+bodies and empty queues after every owner closes and the file reopens.
+
+All four baseline Debug profiles refused ordinary capacity around the
+fourth cycle. The 64 MiB default segment target left superseded bodies in
+active sources. Smaller targets sealed those sources earlier. A 320 KiB
+trial missed the qualified 3 MiB reclamation boundary in one alternating
+encrypted/compressed NoSync run. A 1 MiB trial with exact stream locks
+returned `PENDING` at a lease operation in an alternating plaintext
+durable run. This batch retains the existing default while keeping target
+sizing available to the stress probe. The target controls when to rotate
+before the next append, and a single streamed frame can exceed it.
+
+Stream edits formerly mapped all incarnations onto 248 advisory bytes.
+Failures in the concurrent test identified bytes 50 and 78 in that table.
+Each stream incarnation now has an exact advisory byte beyond the maximum
+container capacity. The physical offset limit is 4 EiB, with the upper
+half of the signed offset space available for locks. These locks allocate
+no file bytes. The deterministic test takes the locks for incarnations 5
+and 13 from different opens while proving that a second open of incarnation
+5 still observes contention. It also exercises the last advisory byte and
+the rejected boundary. A new volatile readiness marker fences mixed live
+cohorts. After the old cohort closes, the same persistent file reopens.
+
+A catalog-only work discovery trial found pending work while authority
+for an uncached namespace was held. The combined changes also exposed
+ordinary capacity refusals and a missed post-pressure reclamation bound.
+An isolated GNU plaintext NoSync comparison held segment geometry
+constant and rotated run order. Exact stream locks and the striped
+control passed three runs each. The catalog-only trial failed one of
+three runs in cycle six. The discovery patch and results are recorded
+under `build/pouch-space-concurrent/` for follow-up.
+
+A trial which skipped busy namespaces immediately raised checkpoint churn
+and reduced completion rates. The current batch retains bounded namespace
+handoff. The standalone `shared-concurrent-capacity CODEC SYNC [SEGMENT_BYTES]`
+mode of `pouch_space_lease_test` measures this workload. It remains a manual
+stress probe while namespace handoff and simultaneous completion admission
+are being qualified.
+
+The exact-lock batch passed 23 selected CTest groups on each of Debug, GNU
+release and musl release, including all alternating fixed-capacity profiles.
+With a 1 MiB segment target the standalone GNU probe completed one of four
+profiles. Two durable runs returned `PENDING` on actual per-stream addresses
+during outbox work in cycle two. One encrypted/compressed NoSync run timed
+out waiting for both first producer callbacks. The current evidence
+distinguishes false contention between different streams from the remaining
+same-stream handoff and startup delays.
+
+All 72 matched GNU lifecycle samples verified after reopen. The samples use
+two shared writers, a 1 MiB segment target on each backend, and background
+maintenance disabled. Times below are medians of six samples in milliseconds,
+prior single-file (`4fcd8b35`) / exact-lock single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 22.77 / 24.26 / 85.74 | 8.17 / 10.24 / 16.88 | 0.24 / 0.25 / 0.07 | 4.23 / 4.82 / 0.44 | 0.31 / 0.28 / 0.48 |
+| Queue, 64 KiB durable | 347.93 / 335.39 / 371.89 | 67.67 / 69.06 / 72.31 | 0.33 / 0.32 / 0.15 | 6.09 / 5.56 / 0.50 | 0.42 / 0.48 / 0.48 |
+| Indexed state, 4 KiB NoSync | 62.68 / 62.47 / 169.92 | 1.53 / 0.79 / 17.90 | 0.66 / 0.57 / 0.30 | 5.69 / 6.30 / 0.57 | 1.08 / 1.12 / 1.90 |
+| Outbox, 64 KiB durable | 1018.56 / 1148.92 / 1462.13 | 191.98 / 221.21 / 281.07 | 0.65 / 0.68 / 0.30 | 42.42 / 41.91 / 63.82 | 76.52 / 73.18 / 133.77 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 37.67 / 36.71 / 130.41 | 23.56 / 22.47 / 27.65 | 0.44 / 0.43 / 10.16 | 0.17 / 0.18 / 13.62 |
+
+Durable outbox work was slower than the prior single-file build in three
+of six pairs. The median paired difference was +40.37 ms, with individual
+differences spanning −334.36 to +358.05 ms. Raw runs, timing and fault
+logs are in `build/pouch-space-concurrent/`.

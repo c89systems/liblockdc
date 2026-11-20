@@ -665,6 +665,39 @@ static void faults(void) {
   ok(ps_coordination_close(a, &e), &e);
   lc_error_cleanup(&e);
 }
+static void independent_stream_authority(void) {
+  const uint64_t first = 5, second = 13; /* Both used to map to byte 18. */
+  lc_error e = {0};
+  ps_coordination *a = owner_open(1, NULL, &e);
+  ps_coordination *b = owner_open(1, NULL, &e);
+  ps_coordination_guard *one = NULL, *two = NULL, *busy = NULL;
+  ok(ps_coordination_lock(a, PS_COORDINATION_STREAM, first, 0, &one, &e), &e);
+  ok(ps_coordination_lock(b, PS_COORDINATION_STREAM, second, 0, &two, &e), &e);
+  REQUIRE(ps_coordination_lock(b, PS_COORDINATION_STREAM, first, 0, &busy,
+                               &e) == LC_ERR_PENDING &&
+          !busy);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(one);
+  ok(ps_coordination_lock(b, PS_COORDINATION_STREAM, first, 0, &one, &e), &e);
+  ps_coordination_unlock(one);
+  ps_coordination_unlock(two);
+  ok(ps_coordination_lock(a, PS_COORDINATION_STREAM, PS_MAX_INCARNATION, 0,
+                          &one, &e),
+     &e);
+  REQUIRE(ps_coordination_lock(b, PS_COORDINATION_STREAM, PS_MAX_INCARNATION, 0,
+                               &busy, &e) == LC_ERR_PENDING &&
+          !busy);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(one);
+  REQUIRE(ps_coordination_lock(a, PS_COORDINATION_STREAM,
+                               PS_MAX_INCARNATION + 1, 0, &busy,
+                               &e) == LC_ERR_INVALID &&
+          !busy);
+  lc_error_cleanup(&e);
+  ok(ps_coordination_close(b, &e), &e);
+  ok(ps_coordination_close(a, &e), &e);
+  lc_error_cleanup(&e);
+}
 static void child_hold(int ready, int command,
                         enum ps_coordination_domain domain, uint64_t identity) {
   lc_error e;
@@ -813,6 +846,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "threads")) {
     threads();
     namespace_handoff();
+    independent_stream_authority();
   } else if (!strcmp(argv[2], "faults"))
     faults();
   else {
