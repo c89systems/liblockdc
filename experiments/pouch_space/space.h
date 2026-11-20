@@ -282,7 +282,8 @@ int ps_check(ps_space *, lc_error *);
 int ps_status(ps_space *, ps_stats *, lc_error *);
 int ps_maintenance_pressure_requested(ps_space *);
 /* A busy probe preserves the advisory level. A drain can request a sample
- * even while pressure is clear. */
+ * even while pressure is clear. At low headroom a pressured sample can
+ * commit enough eligible retirements with one physical checkpoint. */
 int ps_maintenance_pressure(ps_space *, int draining, int *, uint64_t *,
                             lc_error *);
 

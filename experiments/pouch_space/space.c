@@ -2721,11 +2721,11 @@ static int retirement_can_fund(ps_space *s, uint64_t missing) {
   }
   return 0;
 }
-/* Called under allocation authority for a failed exact claim. The checkpoint
- * uses the already admitted credits. The caller then recomputes the proposed
- * claim against the selected directory and the remaining reader witnesses. */
-static int reclaim_admission(ps_space *s, uint64_t missing, int *attempted,
-                             lc_error *e) {
+/* Under allocation authority, use already admitted credits when eligible
+ * retirements can cover the requested amount. The caller resamples the
+ * selected directory and reader witnesses before admitting work. */
+static int reclaim_capacity(ps_space *s, uint64_t missing, int *attempted,
+                            lc_error *e) {
   uint64_t bound;
   int rc;
   if (*attempted || !missing || !retirement_can_fund(s, missing))
@@ -2759,7 +2759,7 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
       s->reserved_metadata - proposed->metadata_bytes + prior->metadata_bytes;
   s->reserved_entries =
       s->reserved_entries - proposed->entries + prior->entries;
-  rc = reclaim_admission(s, missing, &attempted, e);
+  rc = reclaim_capacity(s, missing, &attempted, e);
   s->reserved_payload =
       s->reserved_payload - prior->payload_bytes + proposed->payload_bytes;
   s->reserved_metadata =
@@ -6061,11 +6061,20 @@ int ps_check(ps_space *s, lc_error *error) {
 int ps_maintenance_pressure_requested(ps_space *s) {
   return ps_readiness_pressure(s);
 }
+static int sample_headroom(ps_space *s, uint64_t *available, lc_error *e) {
+  uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
+  int rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, e);
+  if (rc == LC_OK)
+    rc = reserve_floor(s, s->metadata, s->live_entries, bound, &floor, e);
+  if (rc == LC_OK)
+    (void)ordinary_shortfall(s, metadata_target(s, bound), 0, floor, available);
+  return rc;
+}
 int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
                             uint64_t *available, lc_error *error) {
   ps_coordination_guard *guard = NULL;
-  uint64_t bound, floor = PS_MAINTENANCE_RESERVE;
-  int rc;
+  uint64_t quarter, amount;
+  int rc, attempted = 0, reclaimed;
   if (!s || !needed || !available)
     return err(error, LC_ERR_INVALID, "capacity pressure requires outputs");
   *needed = ps_readiness_pressure(s);
@@ -6084,17 +6093,24 @@ int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
   if (rc == LC_OK && guard)
     rc = allocation_ranges_refresh(s, error);
   if (rc == LC_OK)
-    rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
+    rc = sample_headroom(s, available, error);
   if (rc == LC_OK)
-    rc = reserve_floor(s, s->metadata, s->live_entries, bound, &floor, error);
-  if (rc == LC_OK) {
-    (void)ordinary_shortfall(s, metadata_target(s, bound), 0, floor, available);
     *needed = ps_readiness_pressure(s);
-    if (*needed &&
-        *available >= (s->capacity - PS_DATA) - (s->capacity - PS_DATA) / 4) {
-      ps_readiness_set_pressure(s, 0);
-      *needed = 0;
-    }
+  quarter = (s->capacity - PS_DATA) / 4;
+  if (rc == LC_OK && *needed && *available < quarter) {
+    /* At low headroom, commit selected retirements before the next logical
+     * maintenance pass. Require at least one stream chunk, or an eighth of
+     * remaining headroom, to amortize the root selection barriers. */
+    amount = *available / 8;
+    reclaimed = reclaim_capacity(s, amount > PS_CHUNK ? amount : PS_CHUNK,
+                                 &attempted, error);
+    if (attempted)
+      rc =
+          reclaimed == LC_OK ? sample_headroom(s, available, error) : reclaimed;
+  }
+  if (rc == LC_OK && *needed && *available >= s->capacity - PS_DATA - quarter) {
+    ps_readiness_set_pressure(s, 0);
+    *needed = 0;
   }
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
@@ -6548,7 +6564,7 @@ static int owned_allowance(ps_space *s, ps_budget *budget, uint64_t payload,
       PS_MAINTENANCE_RESERVE, budget,
       attempted && !*attempted ? &missing : NULL, error);
   if (rc == LC_ERR_INVALID && missing) {
-    rc = reclaim_admission(s, missing, attempted, error);
+    rc = reclaim_capacity(s, missing, attempted, error);
     if (rc == LC_OK)
       rc = checkpoint_allowance_floor(
           s, s->metadata + PS_OWNED_DESCRIPTOR_BYTES, s->live_entries + 1,

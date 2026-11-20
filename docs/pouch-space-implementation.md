@@ -9356,3 +9356,75 @@ Sustained four-writer NoSync admission and latency remain open. Reopen costs
 remain visible separately. Raw phase samples, stress attempts and trace
 outputs are under `capacity-admission-` and `capacity-pressure-trace-` in
 `build/pouch-space-concurrent/`.
+
+## Releasing retired pages under pressure
+
+A smaller speculative zero-preparation window was evaluated before changing
+maintenance. It verified five of eight four-writer NoSync runs, compared
+with seven of eight on the unchanged native build. Median mutation syncs
+across successful runs rose from 130 to 162. The existing preparation
+policy remains in use.
+
+A pressure probe now checks already selected retirements when ordinary
+headroom falls below one quarter of usable capacity. It considers whole
+pages with no local or foreign witnesses. To amortize root selection, the
+eligible pages must cover at least one stream chunk or one eighth of
+remaining headroom, whichever is larger. The worker uses the existing
+physical checkpoint and standing allowance, then resamples headroom before
+the logical maintenance pass. A probe can do this once. A busy allocator
+still defers the probe without waiting for authority.
+
+The native test holds a retired body from a second owner and proves that
+the probe leaves those bytes readable. After the pin drains, a contended
+probe preserves the pressure request and returns pending. The first
+uncontended probe recovers the body pages. A repeated probe and a different
+owner both observe the selected root without writing another checkpoint.
+The fixture exercises both durability modes and all three checkpoint sync
+failures, then verifies the previous durable deletion and the unaffected
+value after reopen.
+
+The early-checkpoint pilot verified eight of eight four-writer NoSync
+runs at fixed 10 MiB. Its baseline verified six of eight and refused
+ordinary capacity in mutation and index readiness. Median successful
+work increased from 1744 to 1943 ms in that pilot, with a median of two
+more foreground checkpoints.
+
+Debug passed 11 selected checks and GNU Release passed 27. Musl Release
+passed 26 of 27 in its first pass. The plaintext durable lease and
+messaging case timed out on namespace state authority at byte 8871, a
+signature previously seen in sustained shared admission. Four alternating
+reruns per native build all passed. The cause of the intermittent timeout
+remains open.
+
+The uninstrumented GNU comparison verified 37 of 39 workflows. The current
+native build verified all 13 at fixed 10 MiB. The prior build (`98310cfd`)
+completed eleven, with two ordinary capacity refusals in the added 20 MiB
+NoSync workload. Multifile completed all 13.
+
+The tables report successful-attempt medians in milliseconds in the order
+prior native, current native and multifile. Each build ran six 12 MiB NoSync
+samples, two samples of each durable workload and three 20 MiB NoSync samples.
+The prior 20 MiB timing represents one completion.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync, 12 MiB | 1541.81 / 1603.25 / 1487.38 | 74.07 / 80.68 / 42.63 | 6.88 / 9.78 / 1.15 | 25.21 / 25.74 / 1.09 | 7.09 / 7.49 / 9.32 |
+| Four writers, NoSync, 20 MiB | 4006.26 / 3203.65 / 2548.30 | 113.11 / 102.77 / 40.19 | 4.85 / 8.12 / 1.74 | 38.08 / 33.60 / 1.33 | 11.02 / 10.63 / 11.16 |
+| Four writers, durable, 12 MiB | 4254.90 / 3725.39 / 5035.00 | 139.57 / 124.06 / 145.50 | 29.73 / 3.91 / 1.00 | 29.28 / 37.84 / 1.01 | 7.70 / 10.01 / 8.24 |
+| Two writers, durable, 15 MiB | 7364.31 / 6722.52 / 6401.39 | 103.45 / 92.76 / 77.41 | 5.05 / 52.04 / 0.86 | 20.72 / 19.57 / 0.81 | 7.75 / 10.12 / 11.42 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync, 12 MiB | 255.19 / 273.59 / 361.99 | 87.75 / 90.88 / 186.28 | 16.03 / 60.27 / 158.16 |
+| Four writers, NoSync, 20 MiB | 361.40 / 375.71 / 604.96 | 138.31 / 184.12 / 336.93 | 88.27 / 39.00 / 424.31 |
+| Four writers, durable, 12 MiB | 262.58 / 202.72 / 500.11 | 90.38 / 59.55 / 349.02 | 29.78 / 56.73 / 405.23 |
+| Two writers, durable, 15 MiB | 194.34 / 166.89 / 209.94 | 26.38 / 35.68 / 208.07 | 27.39 / 2.99 / 256.33 |
+
+Two instrumented 15 MiB repeats per native build verified. One current
+close spent 46.0 ms waiting for the compaction worker to exit. The other
+spent 0.17 ms on that join. In the same current repeats, namespace recovery
+took 9.6–10.9 ms of the 19–20 ms grouped reopen. The two live joins together
+spent 6.5–7.0 ms recovering namespaces. Close latency, repeated namespace
+recovery and NoSync write tails remain qualification work. Raw attempts
+and instrumentation are under `extent-preparation-` and
+`pressure-checkpoint-` in `build/pouch-space-concurrent/`.

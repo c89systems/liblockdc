@@ -126,7 +126,7 @@ if(LOCKDC_BUILD_TESTS)
   foreach(mode threads faults fence processes serialized packed history
       captures capture-faults capture-owned capture-race packed-replay-locality
       projection projection-faults projection-recovery projection-threads
-      projection-boundaries projection-pressure projection-tail capacity-checkpoint
+      projection-boundaries projection-pressure projection-tail capacity-checkpoint pressure-reclaim
       shared-durable readiness-cohort reopen-cohort certified-prefix quarantine
       readiness-faults journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process

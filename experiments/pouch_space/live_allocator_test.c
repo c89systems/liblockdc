@@ -4723,6 +4723,81 @@ static void capacity_checkpoint(int durable, int streaming, int resize,
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   lc_error_cleanup(&e);
 }
+static void pressure_reclaim(int durable, size_t fail_sync) {
+  lc_error e = {0};
+  readiness_fault fault = {6, EIO, 0, 0, fail_sync};
+  ps_io io = {&fault,     read_io, durable_write, readiness_sync_fault,
+              reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *writer = NULL, *maintenance = NULL;
+  ps_reader *pin = NULL;
+  ps_budget *padding = NULL;
+  ps_budget_plan plan = {0};
+  ps_coordination_guard *guard = NULL;
+  uint64_t available, checkpoints, low;
+  int needed;
+  options.durable_sync = durable;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  capture_put(writer, 1, 4 * PS_CHUNK);
+  capture_put(writer, 2, 41);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_read_open(writer, key(1), NULL, &pin, &e), &e);
+  options.io = &io;
+  ok(ps_open(path, 0, &options, &maintenance, &e), &e);
+  options.io = NULL;
+  ok(ps_maintenance_pressure(maintenance, 1, &needed, &available, &e), &e);
+  REQUIRE(available > PS_MIB && available % PS_PAGE == 0);
+  plan.payload_bytes = available - PS_PAGE;
+  ok(ps_budget_open(maintenance, &plan, &padding, &e), &e);
+  ok(ps_delete(writer, key(1), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+
+  checkpoints = status(maintenance).checkpoints;
+  ok(ps_maintenance_pressure(maintenance, 0, &needed, &low, &e), &e);
+  REQUIRE(needed && low < PS_CHUNK &&
+          status(maintenance).checkpoints == checkpoints);
+  captured_expect(pin, 1, 4 * PS_CHUNK);
+  ps_reader_close(pin);
+
+  /* A worker cannot start a checkpoint by waiting on a live allocator. */
+  ok(ps_coordination_lock(ps_space_coordination(writer),
+                          PS_COORDINATION_ALLOCATION, 0, 1, &guard, &e),
+     &e);
+  REQUIRE(ps_maintenance_pressure(maintenance, 0, &needed, &available, &e) ==
+              LC_ERR_PENDING &&
+          needed && !available &&
+          status(maintenance).checkpoints == checkpoints);
+  lc_error_cleanup(&e);
+  ps_coordination_unlock(guard);
+
+  if (fail_sync) {
+    fault.armed = 1;
+    REQUIRE(ps_maintenance_pressure(maintenance, 0, &needed, &available, &e) ==
+                LC_ERR_TRANSPORT &&
+            fault.calls == fail_sync);
+    lc_error_cleanup(&e);
+    REQUIRE(status(maintenance).reserved_payload_bytes == plan.payload_bytes);
+  } else {
+    ok(ps_maintenance_pressure(maintenance, 0, &needed, &available, &e), &e);
+    REQUIRE(needed && available >= low + 4 * PS_CHUNK &&
+            status(maintenance).checkpoints == checkpoints + 1);
+    ok(ps_maintenance_pressure(maintenance, 0, &needed, &available, &e), &e);
+    REQUIRE(status(maintenance).checkpoints == checkpoints + 1);
+    checkpoints = status(writer).checkpoints;
+    ok(ps_maintenance_pressure(writer, 0, &needed, &available, &e), &e);
+    REQUIRE(status(writer).checkpoints == checkpoints);
+  }
+  (void)ps_budget_close(padding, NULL);
+  ok(ps_close(maintenance, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  REQUIRE(status(writer).capacity == PS_DEFAULT_CAPACITY);
+  expect_value(writer, key(1), 0, 0);
+  expect_value(writer, key(2), 41, 2);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void piece_barrier_handoff(int durable, int discard) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
   ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
@@ -5080,6 +5155,11 @@ int main(int argc, char **argv) {
     }
     for (size_t sync = 1; sync <= 3; ++sync)
       capacity_checkpoint(1, 0, 0, sync);
+  } else if (!strcmp(argv[2], "pressure-reclaim")) {
+    pressure_reclaim(0, 0);
+    pressure_reclaim(1, 0);
+    for (size_t sync = 1; sync <= 3; ++sync)
+      pressure_reclaim(1, sync);
   } else if (!strcmp(argv[2], "projection-tail"))
     projection_tail();
   else if (!strcmp(argv[2], "shared-durable"))
