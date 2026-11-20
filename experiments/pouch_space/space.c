@@ -6108,6 +6108,20 @@ int ps_owned_edit_begin(ps_owned_head *head, int append,
   }
   return rc;
 }
+int ps_owned_mark_edit(ps_owned_head *head, lc_error *error) {
+  ps_space *s = head->space;
+  ps_coordination_guard *guard;
+  int continued, rc;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed))
+    rc = err(error, LC_ERR_INVALID, "owned stream is retired or sealed");
+  if (rc == LC_OK)
+    rc = claim_writer_stamp(s, head->entry, PS_STREAM_EDIT, &continued, error);
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_owned_inspect(ps_space *space, ps_key key, const ps_ref *ref,
                      ps_owned_status *out, lc_error *error) {
   ps_owned_head head;
@@ -6457,7 +6471,8 @@ uint64_t ps_owned_run_base(const ps_owned_run *run) {
 }
 static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                         const ps_ref *ref, uint64_t start, uint64_t end,
-                        ps_owned_run ***out, size_t *count, lc_error *error) {
+                        ps_owned_status *status, ps_owned_run ***out,
+                        size_t *count, lc_error *error) {
   ps_coordination_guard *guard;
   ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_run **items = NULL;
@@ -6487,6 +6502,12 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   if (rc == LC_OK) {
     first = head->owned_first;
     capacity = (size_t)head->stream_runs;
+    if (status) {
+      ps_owned_head selected;
+      selected.space = s;
+      selected.entry = head;
+      owned_status(&selected, status);
+    }
   }
   if (rc == LC_OK && ref) {
     while (first && first->key.key + first->stream_capacity <= start)
@@ -6542,14 +6563,19 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
 }
 int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
                           size_t *count, lc_error *error) {
+  return ps_owned_runs_capture_status(head, NULL, out, count, error);
+}
+int ps_owned_runs_capture_status(ps_owned_head *head, ps_owned_status *status,
+                                 ps_owned_run ***out, size_t *count,
+                                 lc_error *error) {
   const ps_key none = {0};
   return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
-                      none, NULL, 0, 0, out, count, error);
+                      none, NULL, 0, 0, status, out, count, error);
 }
 int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
                         uint64_t start, uint64_t end, ps_owned_run ***out,
                         size_t *count, lc_error *error) {
-  return capture_runs(s, NULL, key, ref, start, end, out, count, error);
+  return capture_runs(s, NULL, key, ref, start, end, NULL, out, count, error);
 }
 int ps_owned_run_mapped(const ps_owned_run *run) {
   return run && run->entry->owned_mapped;

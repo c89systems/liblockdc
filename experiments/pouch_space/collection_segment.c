@@ -18,7 +18,7 @@ struct ps_collection_segment {
   size_t count, room;
   uint64_t tail, capacity, preferred;
   unsigned long references;
-  int sealed, recovering;
+  int sealed, recovering, shared, editing;
 };
 
 static int cs_error(lc_error *e, int code, const char *message) {
@@ -79,6 +79,8 @@ static int cs_mapping(ps_collection_segment *s, uint64_t at,
                     "collection canonical range has no physical owner");
   }
   *run = s->runs[lo];
+  if (s->shared)
+    ps_owned_run_retain(run->run);
   pthread_mutex_unlock(&s->mutex);
   return LC_OK;
 }
@@ -98,6 +100,8 @@ static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
                : n;
     rc = writing ? ps_owned_write(run.run, at - run.base, p, take, e)
                  : ps_owned_read(run.run, at - run.base, p, take, e);
+    if (s->shared)
+      ps_owned_run_close(run.run);
     if (rc != LC_OK)
       return rc;
     at += take;
@@ -207,7 +211,13 @@ static int cs_append(void *context, const struct iovec *parts, int count,
   }
   rc = s->sealed ? cs_error(e, LC_ERR_INVALID,
                             "cannot append to a sealed collection segment")
-                 : cs_grant(s, end, e);
+                 : LC_OK;
+  if (rc == LC_OK && s->shared && !s->editing) {
+    rc = ps_owned_mark_edit(s->head, e);
+    s->editing = rc == LC_OK;
+  }
+  if (rc == LC_OK)
+    rc = cs_grant(s, end, e);
   if (rc == LC_OK)
     s->tail = end;
   pthread_mutex_unlock(&s->mutex);
@@ -229,35 +239,25 @@ static void cs_discard(void *context, uint64_t at) {
 
 static const lc_pouch_record_io_ops cs_ops = {cs_read, cs_append, cs_patch,
                                               cs_tail, cs_discard};
+static const lc_pouch_record_io_ops cs_view_ops = {cs_read, NULL, NULL, cs_tail,
+                                                   NULL};
 
 lc_pouch_record_io ps_collection_segment_io(ps_collection_segment *s) {
   lc_pouch_record_io io;
-  io.ops = s ? &cs_ops : NULL;
+  io.ops = s ? (s->head ? &cs_ops : &cs_view_ops) : NULL;
   io.context = s;
   return io;
 }
 
-int ps_collection_segment_open(ps_space *space, ps_key key, int create,
-                               const ps_ref *expected,
-                               ps_collection_segment_recover_fn recover,
-                               void *context, ps_collection_segment **out,
-                               lc_error *e) {
+static int cs_new(ps_space *space, int writable, ps_collection_segment **out,
+                  lc_error *e) {
   ps_collection_segment *s;
-  ps_owned_status status;
-  ps_owned_run **captured = NULL;
-  size_t count = 0U, i;
-  uint64_t accepted;
-  int rc;
-  if (out)
-    *out = NULL;
-  if (!space || !out)
-    return cs_error(e, LC_ERR_INVALID,
-                    "collection canonical owner requires a space and output");
   s = lc_calloc_with_allocator(NULL, 1U, sizeof(*s));
   if (!s)
     return cs_error(e, LC_ERR_NOMEM, "cannot allocate collection segment");
-  s->zero = lc_calloc_with_allocator(NULL, 1U, PS_CHUNK);
-  if (!s->zero) {
+  if (writable)
+    s->zero = lc_calloc_with_allocator(NULL, 1U, PS_CHUNK);
+  if (writable && !s->zero) {
     lc_free_with_allocator(NULL, s->zero);
     lc_free_with_allocator(NULL, s);
     return cs_error(e, LC_ERR_NOMEM,
@@ -271,21 +271,25 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
   }
   s->preferred = PS_PAGE;
   s->space = space;
+  s->shared = ps_coordination_shared(ps_space_coordination(space));
   s->references = 1UL;
-  rc = create || expected
-           ? ps_owned_open(space, NULL, key, create, expected, &s->head,
-                           &status, e)
-           : ps_owned_open_prepared(space, key, &s->head, &status, e);
-  if (rc == LC_OK)
-    rc = ps_owned_runs_capture(s->head, &captured, &count, e);
+  *out = s;
+  return LC_OK;
+}
+
+static int cs_load(ps_collection_segment *s, ps_owned_head *head,
+                   ps_owned_status *status, lc_error *e) {
+  ps_owned_run **captured = NULL;
+  size_t count = 0U, i;
+  int rc = ps_owned_runs_capture_status(head, status, &captured, &count, e);
   for (i = 0U; rc == LC_OK && i < count; ++i) {
     rc = cs_room(s, e);
     if (rc == LC_OK &&
-        ((!status.sealed && ps_owned_run_base(captured[i]) != s->capacity) ||
+        ((!status->sealed && ps_owned_run_base(captured[i]) != s->capacity) ||
          ps_owned_run_base(captured[i]) < s->capacity ||
-         ps_owned_run_base(captured[i]) > status.capacity ||
+         ps_owned_run_base(captured[i]) > status->capacity ||
          ps_owned_run_capacity(captured[i]) >
-             status.capacity - ps_owned_run_base(captured[i])))
+             status->capacity - ps_owned_run_base(captured[i])))
       rc = cs_error(e, LC_ERR_PROTOCOL,
                     "collection segment has an invalid owned range");
     if (rc == LC_OK) {
@@ -296,37 +300,145 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
   for (i = 0U; i < count; ++i)
     ps_owned_run_close(captured[i]);
   lc_free_with_allocator(NULL, captured);
-  if (rc == LC_OK && ((!status.sealed && s->capacity != status.capacity) ||
-                      s->count != status.runs))
+  if (rc == LC_OK && ((!status->sealed && s->capacity != status->capacity) ||
+                      s->count != status->runs))
     rc = cs_error(e, LC_ERR_PROTOCOL,
                   "collection owned range directory is inconsistent");
   if (rc == LC_OK) {
-    s->capacity = status.capacity;
-    s->tail = status.tail;
-    s->sealed = status.sealed;
-    accepted = s->tail;
-    if (!create && !s->sealed && recover) {
-      s->recovering = 1;
-      rc = recover(ps_collection_segment_io(s), status.tail, status.capacity,
-                   &accepted, context, e);
-      s->recovering = 0;
-      if (rc == LC_OK && (accepted < status.tail || accepted > status.capacity))
-        rc = cs_error(e, LC_ERR_PROTOCOL,
-                      "collection recovery returned an invalid boundary");
-      if (rc == LC_OK && accepted < status.capacity)
-        rc = cs_clear(s, accepted, status.capacity, e);
-      if (rc == LC_OK)
-        rc = ps_owned_recovered(s->head, accepted, e);
-      if (rc == LC_OK)
-        s->tail = accepted;
-    }
+    s->capacity = status->capacity;
+    s->tail = status->tail;
+    s->sealed = status->sealed;
   }
+  return rc;
+}
+
+static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
+                      ps_collection_segment_recover_fn recover, void *context,
+                      lc_error *e) {
+  uint64_t accepted = status->tail;
+  int rc;
+  pthread_mutex_lock(&s->mutex);
+  s->recovering = 1;
+  pthread_mutex_unlock(&s->mutex);
+  rc = recover(ps_collection_segment_io(s), status->tail, status->capacity,
+               &accepted, context, e);
+  pthread_mutex_lock(&s->mutex);
+  s->recovering = 0;
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && (accepted < status->tail || accepted > status->capacity))
+    rc = cs_error(e, LC_ERR_PROTOCOL,
+                  "collection recovery returned an invalid boundary");
+  if (rc == LC_OK && accepted < status->capacity)
+    rc = cs_clear(s, accepted, status->capacity, e);
+  if (rc == LC_OK)
+    rc = ps_owned_recovered(s->head, accepted, e);
+  if (rc == LC_OK && s->shared)
+    rc = ps_owned_commit_canonical(s->head, accepted, PS_COMMIT_DEFER_SYNC,
+                                   NULL, NULL, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    s->tail = accepted;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  return rc;
+}
+
+int ps_collection_segment_open(ps_space *space, ps_key key, int create,
+                               const ps_ref *expected,
+                               ps_collection_segment_recover_fn recover,
+                               void *context, ps_collection_segment **out,
+                               lc_error *e) {
+  ps_collection_segment *s = NULL;
+  ps_owned_status status;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!space || !out)
+    return cs_error(e, LC_ERR_INVALID,
+                    "collection canonical owner requires a space and output");
+  rc = cs_new(space, 1, &s, e);
+  if (rc == LC_OK)
+    rc = create || expected
+             ? ps_owned_open(space, NULL, key, create, expected, &s->head,
+                             &status, e)
+             : ps_owned_open_prepared(space, key, &s->head, &status, e);
+  if (rc == LC_OK)
+    rc = cs_load(s, s->head, &status, e);
+  if (rc == LC_OK && !create && !status.sealed && recover)
+    rc = cs_recover(s, &status, recover, context, e);
   if (rc != LC_OK) {
     ps_collection_segment_close(s);
     return rc;
   }
   *out = s;
   return LC_OK;
+}
+
+int ps_collection_segment_view(ps_collection_segment *source,
+                               ps_collection_segment **out, lc_error *e) {
+  ps_collection_segment *view = NULL;
+  ps_owned_status status;
+  int rc = cs_new(source->space, 0, &view, e);
+  if (rc == LC_OK)
+    rc = cs_load(view, source->head, &status, e);
+  if (rc != LC_OK) {
+    ps_collection_segment_close(view);
+    return rc;
+  }
+  *out = view;
+  return LC_OK;
+}
+
+int ps_collection_segment_refresh(ps_collection_segment *s,
+                                  ps_collection_segment_recover_fn recover,
+                                  void *context, lc_error *e) {
+  ps_collection_segment *view = NULL;
+  ps_collection_run *old;
+  ps_owned_status status;
+  size_t count;
+  int reload, rc;
+  rc = ps_owned_status_capture(s->head, &status, e);
+  if (rc != LC_OK)
+    return rc;
+  if (status.retired || status.sealed)
+    return cs_error(e, LC_ERR_PROTOCOL, "selected collection writer is closed");
+  pthread_mutex_lock(&s->mutex);
+  reload = s->count != status.runs || s->capacity != status.capacity;
+  pthread_mutex_unlock(&s->mutex);
+  if (reload) {
+    rc = cs_new(s->space, 0, &view, e);
+    if (rc == LC_OK)
+      rc = cs_load(view, s->head, &status, e);
+    if (rc != LC_OK) {
+      ps_collection_segment_close(view);
+      return rc;
+    }
+    pthread_mutex_lock(&s->mutex);
+    old = s->runs;
+    count = s->count;
+    s->runs = view->runs;
+    s->count = view->count;
+    s->room = view->room;
+    s->capacity = view->capacity;
+    s->preferred = view->preferred;
+    view->runs = old;
+    view->count = count;
+    pthread_mutex_unlock(&s->mutex);
+    ps_collection_segment_close(view);
+  }
+  if (!status.complete && status.capacity)
+    rc = cs_recover(s, &status, recover, context, e);
+  else {
+    pthread_mutex_lock(&s->mutex);
+    s->tail = status.tail;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    s->editing = 0;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  return rc;
 }
 
 void ps_collection_segment_retain(ps_collection_segment *s) {
@@ -350,7 +462,8 @@ void ps_collection_segment_close(ps_collection_segment *s) {
 int ps_collection_segment_status(ps_collection_segment *s,
                                  ps_owned_status *status, uint64_t *tail,
                                  lc_error *e) {
-  int rc = ps_owned_status_get(s->head, status, e);
+  int rc = s->shared ? ps_owned_status_capture(s->head, status, e)
+                     : ps_owned_status_get(s->head, status, e);
   if (rc == LC_OK && tail)
     rc = cs_tail(s, tail, e);
   return rc;
@@ -392,8 +505,17 @@ int ps_collection_segment_truncate(ps_collection_segment *s, uint64_t end,
 int ps_collection_segment_publish(ps_collection_segment *s,
                                   enum ps_commit_mode mode, lc_error *e) {
   uint64_t tail;
+  int rc;
   (void)cs_tail(s, &tail, e);
-  return ps_owned_commit(s->head, tail, mode, NULL, NULL, e);
+  if (!s->shared)
+    return ps_owned_commit(s->head, tail, mode, NULL, NULL, e);
+  rc = ps_owned_commit_canonical(s->head, tail, mode, NULL, NULL, e);
+  if (rc == LC_OK) {
+    pthread_mutex_lock(&s->mutex);
+    s->editing = 0;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  return rc;
 }
 
 int ps_collection_segment_sync(ps_collection_segment *s, lc_error *e) {
@@ -492,10 +614,13 @@ void ps_collection_segment_bind(ps_collection_segment *segment,
       cs_owner_clone, cs_owner_close, cs_owner_reserve, cs_owner_truncate,
       cs_owner_patch, cs_owner_sync,  cs_owner_ready,   cs_owner_publish,
       cs_owner_sync,  cs_owner_seal};
+  static const lc_collection_segment_ops view_ops = {
+      cs_owner_clone, cs_owner_close, NULL, NULL, NULL,
+      NULL,           NULL,           NULL, NULL, NULL};
   memset(out, 0, sizeof(*out));
   if (!segment)
     return;
-  out->ops = &ops;
+  out->ops = segment->head ? &ops : &view_ops;
   out->context = segment;
   out->io = out->unit_io = ps_collection_segment_io(segment);
   ps_collection_segment_retain(segment);

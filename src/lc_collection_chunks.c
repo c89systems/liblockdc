@@ -284,8 +284,12 @@ static int lc_ck_region_reserve(lc_collection_handle *c,
     rc = lc_collection_segment_reserve(&c->active, end, error);
   if (rc == LC_OK)
     rc = lc_collection_segment_clone(&c->active, &s->region, error);
-  if (rc != LC_OK)
+  if (rc == LC_OK && c->segments.publish_reservations)
+    rc = lc_collection_segment_ready(&c->active, error);
+  if (rc != LC_OK) {
+    lc_collection_segment_close(&s->region);
     return lc_ck_write_failed(&c->active, offset, rc, error);
+  }
   s->pending.segment = c->head.active;
   s->pending.offset = (lc_u64)offset + 32U;
   s->region_end = end;

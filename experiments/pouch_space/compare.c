@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
 #include "catalog.h"
+#include "coordination.h"
 #include "lc_api_internal.h"
 #include "lc_collection_internal.h"
 #include "lc_collection_json.h"
@@ -30,6 +31,16 @@
 /* Time the real synchronization calls of both engines in this executable,
  * without clocks or profiling modes in the storage implementation. */
 static uint64_t fd_sync_calls, full_sync_calls, syscall_sync_ns;
+static int shared_fixture;
+int __real_ps_coordination_open(int, const ps_coordination_options *,
+                                ps_coordination **, lc_error *);
+int __wrap_ps_coordination_open(int fd, const ps_coordination_options *options,
+                                ps_coordination **out, lc_error *e) {
+  ps_coordination_options selected = *options;
+  if (shared_fixture)
+    selected.shared = 1;
+  return __real_ps_coordination_open(fd, &selected, out, e);
+}
 int __real_fdatasync(int);
 int __real_fsync(int);
 static int timed_sync(int fd, int data_only) {
@@ -63,6 +74,7 @@ typedef struct comparison comparison;
 typedef struct worker {
   comparison *run;
   size_t ordinal;
+  lc_client *peer;
   lc_collection *collection;
   ps_stream *stream;
   ps_namespace *namespace;
@@ -72,7 +84,7 @@ typedef struct worker {
   int rc;
 } worker;
 struct comparison {
-  int container, collection, sync, streams, existing_records, runtime;
+  int container, collection, sync, streams, existing_records, runtime, peers;
   int read_method; /* 1: read-many; 2: scan bodies; 3: scan metadata; 4: points.
                     */
   int mutation; /* 1: metadata over seeded bodies; 2: tombstone seeded keys. */
@@ -623,6 +635,10 @@ static void open_stores(comparison *c, int create, lc_error *e) {
       LC_POUCH_SETTING_QUERY_ENGINE;
   settings.durable_sync = c->sync;
   settings.segment_target_bytes = c->compaction ? 65536U : PS_MIB;
+  if (c->peers && !c->runtime) {
+    settings.set_mask |= LC_POUCH_SETTING_SINGLE_WRITER;
+    settings.single_writer = 0;
+  }
   settings.compression = "none";
   settings.query_engine = "scan";
   config.endpoints = &endpoint;
@@ -638,15 +654,23 @@ static void open_stores(comparison *c, int create, lc_error *e) {
     c->pouch->compaction_max_io_bytes_per_sec = 0U;
   }
   for (i = 0; i < c->writers; ++i) {
+    lc_client *client = c->client;
+    if (c->peers) {
+      check(c->runtime
+                ? ps_pouch_client_open(&config, 0, NULL, &c->workers[i].peer, e)
+                : lc_client_open(&config, &c->workers[i].peer, e),
+            e);
+      client = c->workers[i].peer;
+    }
     snprintf(name, sizeof(name), "collection-%lu", (unsigned long)i);
     lc_collection_config_init(&collection);
     collection.name = name;
     if (create)
-      check(lc_client_create_collection(c->client, &collection,
+      check(lc_client_create_collection(client, &collection,
                                         &c->workers[i].collection, e),
             e);
     else
-      check(lc_client_open_collection(c->client, &collection,
+      check(lc_client_open_collection(client, &collection,
                                       &c->workers[i].collection, e),
             e);
   }
@@ -674,6 +698,10 @@ static void close_stores(comparison *c, lc_error *e) {
       for (i = 0; i < c->writers; ++i) {
         lc_collection_close(c->workers[i].collection);
         c->workers[i].collection = NULL;
+        if (c->workers[i].peer) {
+          lc_client_close(c->workers[i].peer);
+          c->workers[i].peer = NULL;
+        }
       }
     lc_client_close(c->client);
     c->client = NULL;
@@ -1277,6 +1305,7 @@ int main(int argc, char **argv) {
           "runtime-scan-bodies|pouch-scan-bodies|"
           "runtime-scan-metadata|pouch-scan-metadata|"
           "stream-collection|pouch-collection|runtime-collection|"
+          "pouch-peer-collection|runtime-shared-collection|"
           "pouch-collection-compact|runtime-collection-compact|"
           "pouch-collection-maintain|runtime-collection-maintain "
           "DIRECTORY ROWS BYTES SYNC WRITERS CHUNK [--reopen]\n",
@@ -1291,6 +1320,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "space-collection") ||
               !strcmp(argv[1], "pouch-collection") ||
               !strcmp(argv[1], "runtime-collection") ||
+              !strcmp(argv[1], "pouch-peer-collection") ||
+              !strcmp(argv[1], "runtime-shared-collection") ||
               !strcmp(argv[1], "pouch-collection-compact") ||
               !strcmp(argv[1], "runtime-collection-compact") ||
               !strcmp(argv[1], "pouch-collection-maintain") ||
@@ -1324,6 +1355,8 @@ int main(int argc, char **argv) {
   c.streams = !strncmp(argv[1], "stream-", 7);
   c.container = c.streams || !strncmp(argv[1], "space-", 6);
   c.runtime = !strncmp(argv[1], "runtime-", 8);
+  shared_fixture = !strcmp(argv[1], "runtime-shared-collection");
+  c.peers = shared_fixture || !strcmp(argv[1], "pouch-peer-collection");
   c.sdk = strstr(argv[1], "-sdk-") != NULL;
   c.namespace_maintenance = strstr(argv[1], "maintain") != NULL;
   c.compaction = strstr(argv[1], "compact") != NULL || c.namespace_maintenance;

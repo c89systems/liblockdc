@@ -53,6 +53,8 @@ int ps_owned_edit_begin(ps_owned_head *, int append, ps_coordination_guard **,
                         ps_owned_status *, int *continued, lc_error *);
 int ps_owned_edit_end(ps_owned_head *, ps_coordination_guard *, int,
                       lc_error *);
+/* A logical collection appender already owns its cross-process edit scope. */
+int ps_owned_mark_edit(ps_owned_head *, lc_error *);
 /* Capture head metadata without acquiring its exclusive writer owner, reading
  * payloads, allocating handles or changing pins. A retained catalog/read pin
  * protects the caller's subsequent use; this scalar observation alone does not.
@@ -79,6 +81,8 @@ void ps_owned_run_retain(ps_owned_run *);
  * entries or read buffers. */
 int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
                           lc_error *);
+int ps_owned_runs_capture_status(ps_owned_head *, ps_owned_status *,
+                                 ps_owned_run ***, size_t *, lc_error *);
 int ps_owned_runs_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
                         uint64_t end, ps_owned_run ***, size_t *, lc_error *);
 typedef struct ps_owned_range {

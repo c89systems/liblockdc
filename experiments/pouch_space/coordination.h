@@ -19,7 +19,13 @@ enum ps_coordination_domain {
   PS_COORDINATION_NAMESPACE_STATE,
   PS_COORDINATION_CONTROL_STATE,
   PS_COORDINATION_COLLECTION_CATALOG,
-  PS_COORDINATION_STREAM_CLAIM
+  PS_COORDINATION_STREAM_CLAIM,
+  PS_COORDINATION_COLLECTION_APPEND,
+  PS_COORDINATION_COLLECTION_COMMIT,
+  PS_COORDINATION_COLLECTION_METADATA,
+  PS_COORDINATION_COLLECTION_STREAMS,
+  PS_COORDINATION_COLLECTION_COMPACTION,
+  PS_COORDINATION_COLLECTION_READERS
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -61,7 +67,7 @@ int ps_coordination_shared(const ps_coordination *);
  * Transaction uses stripe < 256.
  * Allocation uses byte 4, separate from publication and reader presence.
  * Sync leadership uses byte 5; never wait for it while holding allocation.
- * Namespace keys map deterministically into bytes 512..8191 of the root pages;
+ * Namespace keys map deterministically into bytes 512..5119 of the root pages;
  * collisions serialize safely. All participants must use the same identity.
  * Stream incarnations use disjoint stripes and require wait=0. Namespace
  * and stream guards may be released by a different thread.
@@ -91,6 +97,11 @@ int ps_coordination_lock(ps_coordination *, enum ps_coordination_domain,
  * exclusive stream claim above. */
 int ps_coordination_stream_prepare(ps_coordination *, uint64_t,
                                    ps_coordination_guard **, lc_error *);
+/* Collection lifetimes use disjoint keyed lanes. Pins may cross threads. */
+int ps_coordination_collection_lock(ps_coordination *,
+                                    enum ps_coordination_domain, uint64_t,
+                                    int exclusive, int wait,
+                                    ps_coordination_guard **, lc_error *);
 /* Release fixed guards on the acquiring thread. An uncertain
  * kernel unlock poisons the owner; further acquisition fails until
  * close/reopen. Cleanup remains legal.

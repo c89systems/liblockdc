@@ -92,6 +92,9 @@ static void gate_destroy(collection_gate *gate) {
 static ps_space *space(ps_collection_owner *owner) {
   return owner->ns->root->space;
 }
+static int shared_collection(ps_collection_owner *owner) {
+  return ps_coordination_shared(ps_space_coordination(space(owner)));
+}
 static int catalog_enter(ps_namespace *ns, int wait, void **pin, lc_error *e) {
   ps_coordination *coordination = ps_space_coordination(ns->root->space);
   ps_coordination_guard *guard = NULL;
@@ -268,8 +271,9 @@ static int get_segment(ps_collection_owner *owner, lc_u64 id, int create,
         rc = ps_collection_segment_open(
             space(owner), prior ? identity.stream : key_for(owner, id), 0,
             prior ? &identity.target : NULL,
-            prior ? ps_collection_canonical_recover : NULL, leaf, &s->segment,
-            e);
+            prior && !shared_collection(owner) ? ps_collection_canonical_recover
+                                               : NULL,
+            leaf, &s->segment, e);
         if (!prior && create && rc == LC_ERR_INVALID) {
           clear(e);
           rc = ps_collection_segment_open(space(owner), key_for(owner, id), 1,
@@ -437,11 +441,29 @@ static int segment_open(void *context, lc_u64 id, int create,
 }
 static int read_open(void *context, lc_u64 id, lc_pouch_record_io *input,
                      void **pin, lc_error *e) {
+  ps_collection_owner *owner = context;
   ps_collection_segment *segment = NULL;
-  int rc = get_segment(context, id, 0, &segment, e);
+  int rc = get_segment(owner, id, 0, &segment, e);
+  if (rc == LC_OK && shared_collection(owner)) {
+    ps_collection_segment *view = NULL;
+    rc = ps_collection_segment_view(segment, &view, e);
+    ps_collection_segment_close(segment);
+    segment = view;
+  }
   if (rc == LC_OK) {
     *input = ps_collection_segment_io(segment);
     *pin = segment;
+  }
+  return rc;
+}
+static int replay_open(void *context, lc_u64 id, lc_collection_segment *out,
+                       lc_error *e) {
+  lc_pouch_record_io input;
+  void *pin = NULL;
+  int rc = read_open(context, id, &input, &pin, e);
+  if (rc == LC_OK) {
+    ps_collection_segment_bind(pin, out);
+    ps_collection_segment_close(pin);
   }
   return rc;
 }
@@ -485,7 +507,8 @@ static int order_refresh(void *context, lc_collection_order *order,
   if (rc == LC_OK && (order->snapshot != c->head.snapshot ||
                       order->replay_segment != c->head.active ||
                       order->replay_offset < active.tail))
-    rc = lc_collection_projection_capture(c, e);
+    rc = shared_collection(owner) ? lc_collection_projection_catchup(c, e)
+                                  : lc_collection_projection_capture(c, e);
   return rc;
 }
 static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
@@ -685,6 +708,27 @@ static int lock_enter(void *context, enum lc_collection_authority_kind kind,
   *pin = NULL;
   if (rc != LC_OK)
     return rc;
+  if (kind != LC_COLLECTION_AUTH_CATALOG && shared_collection(owner)) {
+    static const enum ps_coordination_domain domains[] = {
+        PS_COORDINATION_COLLECTION_CATALOG,
+        PS_COORDINATION_COLLECTION_METADATA,
+        PS_COORDINATION_COLLECTION_APPEND,
+        PS_COORDINATION_COLLECTION_COMMIT,
+        PS_COORDINATION_COLLECTION_READERS,
+        PS_COORDINATION_COLLECTION_STREAMS,
+        PS_COORDINATION_COLLECTION_COMPACTION};
+    ps_coordination_guard *guard = NULL;
+    /* A pull producer may enter a different collection from its callback.
+     * A colliding append byte must not wait for that same producer. */
+    if (kind == LC_COLLECTION_AUTH_APPEND && wait &&
+        lc_collection_source_callback_active())
+      wait = 0;
+    rc = ps_coordination_collection_lock(ps_space_coordination(space(owner)),
+                                         domains[kind], owner->numeric,
+                                         exclusive, wait, &guard, e);
+    *pin = guard;
+    return rc;
+  }
   switch (kind) {
   case LC_COLLECTION_AUTH_CATALOG:
     return catalog_enter(owner->ns, wait, pin, e);
@@ -744,13 +788,16 @@ static int lock_enter(void *context, enum lc_collection_authority_kind kind,
 }
 static void lock_leave(void *context, enum lc_collection_authority_kind kind,
                        void *pin) {
-  (void)context;
-  if (kind == LC_COLLECTION_AUTH_STREAMS ||
-      kind == LC_COLLECTION_AUTH_READERS || kind == LC_COLLECTION_AUTH_COMMIT ||
-      kind == LC_COLLECTION_AUTH_COMPACTION)
+  ps_collection_owner *owner = context;
+  if (kind == LC_COLLECTION_AUTH_CATALOG)
+    catalog_leave(owner->ns, pin);
+  else if (shared_collection(owner))
+    ps_coordination_unlock(pin);
+  else if (kind == LC_COLLECTION_AUTH_STREAMS ||
+           kind == LC_COLLECTION_AUTH_READERS ||
+           kind == LC_COLLECTION_AUTH_COMMIT ||
+           kind == LC_COLLECTION_AUTH_COMPACTION)
     gate_leave(pin);
-  else if (kind == LC_COLLECTION_AUTH_CATALOG)
-    catalog_leave(((ps_collection_owner *)context)->ns, pin);
   else if (kind == LC_COLLECTION_AUTH_APPEND)
     pthread_mutex_unlock(pin);
   else
@@ -759,17 +806,27 @@ static void lock_leave(void *context, enum lc_collection_authority_kind kind,
 static int layout_active(void *context, lc_error *e) {
   collection_receiver *binding = context;
   lc_collection_handle *c = binding->receiver;
+  ps_collection_owner *owner = binding->owner;
+  ps_collection_segment *segment = NULL;
   lc_collection_segment active;
+  char leaf[64];
+  int shared = shared_collection(owner);
   int rc;
-  if (c->active.ops && c->active_fd_segment == c->head.active)
+  if (!shared && c->active.ops && c->active_fd_segment == c->head.active)
     return LC_OK;
-  memset(&active, 0, sizeof(active));
-  rc = segment_open(binding->owner, c->head.active, 0, &active, e);
+  rc = get_segment(owner, c->head.active, 0, &segment, e);
+  if (rc == LC_OK && shared)
+    rc = lc_collection_record_leaf(c->head.active, leaf, e);
+  if (rc == LC_OK && shared)
+    rc = ps_collection_segment_refresh(segment, ps_collection_canonical_recover,
+                                       leaf, e);
   if (rc == LC_OK) {
+    ps_collection_segment_bind(segment, &active);
     lc_collection_segment_close(&c->active);
     c->active = active;
     c->active_fd_segment = c->head.active;
   }
+  ps_collection_segment_close(segment);
   return rc;
 }
 static int layout_rotate(void *context, int force, lc_u64 limit, lc_error *e) {
@@ -808,19 +865,33 @@ static int layout_rotate(void *context, int force, lc_u64 limit, lc_error *e) {
 }
 /* Metadata authority excludes admission of old read generations. Captured
  * operations release their lifetime pins without taking that authority. */
-static int obsolete_readers(ps_collection_owner *owner, lc_u64 current) {
+static int obsolete_readers(ps_collection_owner *owner, lc_u64 current,
+                            int *busy, lc_error *e) {
   collection_topology *t;
-  int busy = 0;
+  *busy = 0;
+  if (shared_collection(owner)) {
+    ps_coordination_guard *guard = NULL;
+    int rc = ps_coordination_collection_lock(
+        ps_space_coordination(space(owner)), PS_COORDINATION_COLLECTION_READERS,
+        owner->numeric, 1, 0, &guard, e);
+    if (rc == LC_ERR_PENDING) {
+      clear(e);
+      *busy = 1;
+      return LC_OK;
+    }
+    ps_coordination_unlock(guard);
+    return rc == LC_OK ? ps_check(space(owner), e) : rc;
+  }
   pthread_mutex_lock(&owner->cache);
   for (t = owner->topologies; t; t = t->next) {
     if (t->id == current)
       continue;
     pthread_mutex_lock(&t->gate.mutex);
-    busy |= t->gate.readers != 0U || t->gate.writer;
+    *busy |= t->gate.readers != 0U || t->gate.writer;
     pthread_mutex_unlock(&t->gate.mutex);
   }
   pthread_mutex_unlock(&owner->cache);
-  return busy;
+  return LC_OK;
 }
 /* An uncached obsolete child needs only its physical identity, never canonical
  * replay. Retain failed retirements in the owner cache so a raw catalog view
@@ -900,8 +971,9 @@ static int layout_cleanup(void *context, lc_pouch_maintenance_result *out,
   lc_pouch_unix_seconds instant;
   lc_u64 marked, grace = c->pouch->compaction_delete_grace_seconds, retry_id;
   size_t i, j;
-  int busy = obsolete_readers(owner, c->head.snapshot);
-  int pending, rc = lc_pouch_now_unix(&instant, e);
+  int busy, pending, rc = obsolete_readers(owner, c->head.snapshot, &busy, e);
+  if (rc == LC_OK)
+    rc = lc_pouch_now_unix(&instant, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_collection_resources_capture(space(owner), owner->numeric, &list, e);
@@ -1078,6 +1150,10 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   c->reads.close = read_close;
   c->reads.context = owner;
   c->segments.open = segment_open;
+  if (shared_collection(owner)) {
+    c->segments.replay = replay_open;
+    c->segments.publish_reservations = 1;
+  }
   c->segments.context = owner;
   c->segments.private_limit = PS_MIB;
   c->control.load = control_load;

@@ -114,8 +114,7 @@ static int reclaim_control(void *context, ps_key key, const ps_ref *ref,
   (void)bytes;
   return ps_value_remove(context, key, ref, e);
 }
-int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
-                                   lc_error *e) {
+static int reclaim_children(ps_space *storage, uint64_t owner, lc_error *e) {
   ps_collection_resources list;
   ps_owned_head *head;
   ps_owned_status status;
@@ -146,4 +145,19 @@ int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
     rc = ps_values_visit(storage, owner, PS_CONTROL, PS_CONTROL,
                          reclaim_control, storage, e);
   return rc;
+}
+
+int ps_collection_reclaim_children(ps_space *storage, uint64_t owner,
+                                   lc_error *e) {
+  ps_coordination *coordination = ps_space_coordination(storage);
+  ps_coordination_guard *guard = NULL;
+  int rc = LC_OK;
+  if (ps_coordination_shared(coordination))
+    rc = ps_coordination_collection_lock(coordination,
+                                         PS_COORDINATION_COLLECTION_READERS,
+                                         owner, 1, 0, &guard, e);
+  if (rc == LC_OK)
+    rc = reclaim_children(storage, owner, e);
+  ps_coordination_unlock(guard);
+  return rc == LC_OK ? ps_check(storage, e) : rc;
 }

@@ -13,7 +13,9 @@
 #define STREAM_BASE UINT64_C(8)
 #define TXN_BASE UINT64_C(256)
 #define NS_BASE UINT64_C(512)
-#define NS_SLOTS (2U * PS_PAGE - NS_BASE)
+#define COLLECTION_SLOTS 512U
+#define COLLECTION_BASE (2U * PS_PAGE - 6U * COLLECTION_SLOTS)
+#define NS_SLOTS (COLLECTION_BASE - NS_BASE)
 #define VIEW_SLOTS (PS_PAGE / 2U)
 #define VIEW_BASE (PS_METADATA_START - VIEW_SLOTS)
 #define STATE_BASE (PS_READINESS_OFFSET + 256U)
@@ -260,6 +262,10 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
     return VIEW_BASE + identity % VIEW_SLOTS;
   if (domain == PS_COORDINATION_NAMESPACE_STATE)
     return STATE_BASE + identity % STATE_SLOTS;
+  if (domain >= PS_COORDINATION_COLLECTION_APPEND)
+    return COLLECTION_BASE +
+           (domain - PS_COORDINATION_COLLECTION_APPEND) * COLLECTION_SLOTS +
+           identity % COLLECTION_SLOTS;
   return NS_BASE + identity % NS_SLOTS;
 }
 int ps_coordination_namespace_view_conflict(ps_coordination *owner,
@@ -336,12 +342,12 @@ static int dynamic_guard(ps_coordination *owner, uint64_t offset,
   *out = guard;
   return LC_OK;
 }
-static int kernel_lock(ps_coordination_guard *guard, int acquire, int wait) {
+static int kernel_lock(ps_coordination_guard *guard, short kind, int wait) {
   ps_coordination *owner = guard->owner;
   struct flock lock;
   int rc;
   memset(&lock, 0, sizeof(lock));
-  lock.l_type = acquire ? F_WRLCK : F_UNLCK;
+  lock.l_type = kind;
   lock.l_whence = SEEK_SET;
   lock.l_start = (off_t)guard->offset;
   lock.l_len = 1;
@@ -372,17 +378,26 @@ static void local_unlock(ps_coordination_guard *guard) {
   }
   pthread_mutex_unlock(&guard->mutex);
 }
-static int pin_view(ps_coordination_guard *guard, lc_error *e) {
+static int pin_view(ps_coordination_guard *guard, int wait, lc_error *e) {
   ps_keyed_guard *keyed = (ps_keyed_guard *)guard;
-  int rc;
+  int rc = 0, reason;
   pthread_mutex_lock(&guard->mutex);
-  rc = ps_coordination_check(guard->owner, e);
-  if (rc == LC_OK && guard->held)
-    rc = fail(e, LC_ERR_PENDING, 0, "container file authority is held");
-  if (rc == LC_OK && !keyed->views)
-    rc = ps_coordination_range(guard->owner, guard->offset, 1, 1, e);
+  while (!rc && guard->held)
+    rc = wait ? pthread_cond_wait(&keyed->available, &guard->mutex) : EBUSY;
+  rc = rc ? fail(e, rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT, rc,
+                 "cannot acquire local container read authority")
+          : ps_coordination_check(guard->owner, e);
+  if (rc == LC_OK && !keyed->views && guard->owner->shared &&
+      kernel_lock(guard, F_RDLCK, wait)) {
+    reason = errno;
+    rc = fail(e,
+              reason == EAGAIN || reason == EACCES ? LC_ERR_PENDING
+                                                   : LC_ERR_TRANSPORT,
+              reason, "cannot acquire container read authority");
+  }
   if (rc == LC_OK)
     ++keyed->views;
+  pthread_cond_broadcast(&keyed->available);
   pthread_mutex_unlock(&guard->mutex);
   return rc;
 }
@@ -408,7 +423,7 @@ static int lock_guard(ps_coordination *owner,
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_STREAM_CLAIM ||
+      domain > PS_COORDINATION_COLLECTION_READERS ||
       (domain >= PS_COORDINATION_STREAM &&
        domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
@@ -432,7 +447,7 @@ static int lock_guard(ps_coordination *owner,
     return rc;
   }
   if (view || domain == PS_COORDINATION_NAMESPACE_VIEW) {
-    rc = pin_view(guard, e);
+    rc = pin_view(guard, wait, e);
     if (rc == LC_OK)
       *out = guard;
     else
@@ -446,7 +461,7 @@ static int lock_guard(ps_coordination *owner,
                 "cannot acquire local container authority");
   }
   rc = ps_coordination_check(owner, e);
-  if (rc == LC_OK && owner->shared && kernel_lock(guard, 1, wait)) {
+  if (rc == LC_OK && owner->shared && kernel_lock(guard, F_WRLCK, wait)) {
     reason = errno;
     rc = fail(e,
               reason == EAGAIN || reason == EACCES ? LC_ERR_PENDING
@@ -471,16 +486,27 @@ int ps_coordination_stream_prepare(ps_coordination *owner, uint64_t identity,
   return lock_guard(owner, PS_COORDINATION_STREAM_CLAIM, identity, 0, 1, out,
                     e);
 }
+int ps_coordination_collection_lock(ps_coordination *owner,
+                                    enum ps_coordination_domain domain,
+                                    uint64_t identity, int exclusive, int wait,
+                                    ps_coordination_guard **out, lc_error *e) {
+  if (domain < PS_COORDINATION_COLLECTION_APPEND ||
+      domain > PS_COORDINATION_COLLECTION_READERS)
+    return fail(e, LC_ERR_INVALID, 0, "invalid collection authority");
+  return lock_guard(owner, domain, identity, wait, !exclusive, out, e);
+}
 void ps_coordination_unlock(ps_coordination_guard *guard) {
   ps_coordination *owner;
   if (!guard)
     return;
-  if (guard->offset >= STREAM_CLAIM_BASE && unpin_view(guard)) {
+  if (((guard->offset >= COLLECTION_BASE && guard->offset < 2U * PS_PAGE) ||
+       guard->offset >= STREAM_CLAIM_BASE) &&
+      unpin_view(guard)) {
     drop(guard);
     return;
   }
   owner = guard->owner;
-  if (owner->shared && kernel_lock(guard, 0, 0)) {
+  if (owner->shared && kernel_lock(guard, F_UNLCK, 0)) {
     if (owner->failure_flag)
       __atomic_store_n(owner->failure_flag, 1, __ATOMIC_RELEASE);
     __atomic_store_n(&owner->poisoned, 1, __ATOMIC_RELEASE);

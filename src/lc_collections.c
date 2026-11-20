@@ -299,6 +299,20 @@ void lc_collection_call_callback(lc_collection_call *call, int enabled,
   call->source_callback = enabled && source;
 }
 
+int lc_collection_source_callback_active(void) {
+  lc_collection_call *call;
+  pthread_t thread = pthread_self();
+  int active = 0;
+  pthread_mutex_lock(&lc_collection_lifecycle_mutex);
+  for (call = lc_collection_calls; call; call = call->next)
+    if (pthread_equal(call->thread, thread) && call->source_callback) {
+      active = 1;
+      break;
+    }
+  pthread_mutex_unlock(&lc_collection_lifecycle_mutex);
+  return active;
+}
+
 void lc_collection_call_end(lc_collection_call *call) {
   lc_collection_call **link;
   lc_collection_handle *collection;
@@ -907,10 +921,12 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   lc_collection_segment input;
   int rc;
   int changed;
+  int captured = collection->segments.replay &&
+                 (!repair || segment != collection->head.active);
   /* A caught-up projection needs no path allocation, open or replay. The
    * append lock and pinned active inode make this EOF observation
    * authoritative. */
-  if (!snapshot && segment == collection->head.active &&
+  if (!captured && !snapshot && segment == collection->head.active &&
       collection->active_fd_segment == segment && collection->active.ops &&
       order->replay_segment == segment && order->replay_offset == offset &&
       ids->replay_segment == segment && ids->replay_offset == offset) {
@@ -923,8 +939,10 @@ int lc_collection_replay_into(lc_collection_handle *collection,
   rc = lc_collection_record_leaf(segment, leaf, error);
   memset(&input, 0, sizeof(input));
   if (rc == LC_OK)
-    rc = collection->segments.open(collection->segments.context, segment, 0,
-                                   &input, error);
+    rc = captured ? collection->segments.replay(collection->segments.context,
+                                                segment, &input, error)
+                  : collection->segments.open(collection->segments.context,
+                                              segment, 0, &input, error);
   if (rc == LC_OK)
     rc = lc_pouch_record_io_tail(input.io, &limit, error);
   if (rc != LC_OK) {
@@ -1110,31 +1128,11 @@ int lc_collection_projection_capture(lc_collection_handle *collection,
   return lc_cc_rebuild_mode(collection, 0, 1, error);
 }
 
-static int lc_collection_reconcile(lc_collection_handle *collection,
-                                   lc_error *error) {
+static int lc_cc_replay_tail(lc_collection_handle *collection, int repair,
+                             lc_error *error) {
   lc_u64 segment;
   lc_u64 offset;
-  int rc;
-  rc = lc_collection_head_read(collection, error);
-  if (rc == LC_OK)
-    rc = lc_cc_active(collection, error);
-  if (rc != LC_OK)
-    return rc;
-  rc = lc_cc_order_refresh(collection, error);
-  if (rc == LC_OK)
-    rc = collection->projections.ids_refresh(collection->projections.context,
-                                             &collection->ids, error);
-  if (rc != LC_OK || !collection->trusted ||
-      collection->order.edit_in_progress ||
-      collection->order.snapshot != collection->head.snapshot ||
-      collection->ids.snapshot != collection->head.snapshot) {
-    if (rc != LC_OK && rc != LC_ERR_PROTOCOL &&
-        !(rc == LC_ERR_TRANSPORT && errno == ENOENT))
-      return rc;
-    lc_error_cleanup(error);
-    lc_error_init(error);
-    return lc_cc_rebuild(collection, 0, error);
-  }
+  int rc = LC_OK;
   /* A raw-only checkpoint changes no identity. Matching logical watermarks
    * prove that advancing this derived cursor cannot skip a missing binding. */
   if (collection->ids.count ==
@@ -1163,10 +1161,49 @@ static int lc_collection_reconcile(lc_collection_handle *collection,
   for (; rc == LC_OK && segment <= collection->head.active; ++segment) {
     rc = lc_collection_replay_into(
         collection, &collection->order, &collection->ids, segment, offset, 0,
-        collection->head.snapshot_generation, 1, error);
+        collection->head.snapshot_generation, repair, error);
     offset = 0U;
   }
   return rc;
+}
+
+int lc_collection_projection_catchup(lc_collection_handle *collection,
+                                     lc_error *error) {
+  if (!collection->trusted || collection->order.edit_in_progress ||
+      collection->order.snapshot != collection->head.snapshot ||
+      collection->ids.snapshot != collection->head.snapshot)
+    return lc_collection_projection_capture(collection, error);
+  {
+    int rc = lc_cc_replay_tail(collection, 0, error);
+    if (rc != LC_OK)
+      collection->trusted = 0;
+    return rc;
+  }
+}
+
+static int lc_collection_reconcile(lc_collection_handle *collection,
+                                   lc_error *error) {
+  int rc = lc_collection_head_read(collection, error);
+  if (rc == LC_OK)
+    rc = lc_cc_active(collection, error);
+  if (rc != LC_OK)
+    return rc;
+  rc = lc_cc_order_refresh(collection, error);
+  if (rc == LC_OK)
+    rc = collection->projections.ids_refresh(collection->projections.context,
+                                             &collection->ids, error);
+  if (rc != LC_OK || !collection->trusted ||
+      collection->order.edit_in_progress ||
+      collection->order.snapshot != collection->head.snapshot ||
+      collection->ids.snapshot != collection->head.snapshot) {
+    if (rc != LC_OK && rc != LC_ERR_PROTOCOL &&
+        !(rc == LC_ERR_TRANSPORT && errno == ENOENT))
+      return rc;
+    lc_error_cleanup(error);
+    lc_error_init(error);
+    return lc_cc_rebuild(collection, 0, error);
+  }
+  return lc_cc_replay_tail(collection, 1, error);
 }
 
 int lc_collection_prepare(lc_collection_handle *collection, lc_error *error) {

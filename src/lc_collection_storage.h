@@ -84,11 +84,13 @@ int lc_collection_segment_publish(lc_collection_segment *, lc_pouch *,
                                   lc_error *);
 typedef struct lc_collection_segments {
   int (*open)(void *, lc_u64, int create, lc_collection_segment *, lc_error *);
+  int (*replay)(void *, lc_u64, lc_collection_segment *, lc_error *);
   void *context;
   /* Zero retains the logical owner's normal reservation target. A physical
    * ceiling bounds private allocation, never the size of an application value.
    */
   lc_u64 private_limit;
+  int publish_reservations;
 } lc_collection_segments;
 struct lc_collection_handle;
 lc_collection_segments

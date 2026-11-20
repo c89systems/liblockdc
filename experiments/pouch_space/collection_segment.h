@@ -23,6 +23,13 @@ typedef int (*ps_collection_segment_recover_fn)(lc_pouch_record_io,
 int ps_collection_segment_open(ps_space *, ps_key, int create, const ps_ref *,
                                ps_collection_segment_recover_fn, void *,
                                ps_collection_segment **, lc_error *);
+/* Stable peer-selected mappings for readers. Refresh is for the active
+ * writer under logical append and metadata authority. */
+int ps_collection_segment_view(ps_collection_segment *,
+                               ps_collection_segment **, lc_error *);
+int ps_collection_segment_refresh(ps_collection_segment *,
+                                  ps_collection_segment_recover_fn, void *,
+                                  lc_error *);
 void ps_collection_segment_retain(ps_collection_segment *);
 void ps_collection_segment_close(ps_collection_segment *);
 lc_pouch_record_io ps_collection_segment_io(ps_collection_segment *);

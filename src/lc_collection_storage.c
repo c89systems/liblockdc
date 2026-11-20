@@ -254,7 +254,7 @@ static int segment_open(void *context, lc_u64 segment, int create,
   return lc_collection_segment_adopt_file(fd, out, e);
 }
 lc_collection_segments lc_collection_file_segments(lc_collection_handle *c) {
-  lc_collection_segments segments;
+  lc_collection_segments segments = {0};
   segments.open = segment_open;
   segments.context = c;
   segments.private_limit = 0U;

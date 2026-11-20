@@ -912,6 +912,197 @@ static void concurrency(const char *directory, int sync) {
   lc_error_cleanup(&f.error);
   printf("SDK independent producers durable=%d passed\n", sync);
 }
+static void shared_torn_append(fixture *f, const lc_collection_config *config) {
+  pid_t child = fork();
+  int status;
+  REQUIRE(child >= 0);
+  if (!child) {
+    lc_client *client = NULL;
+    lc_collection *collection = NULL;
+    lc_collection_call call;
+    lc_collection_guard guard;
+    lc_collection_handle *c;
+    unsigned char torn[32];
+    struct iovec part;
+    memset(torn, 0xa5, sizeof(torn));
+    part.iov_base = torn;
+    part.iov_len = sizeof(torn);
+    ok(ps_pouch_client_open(&f->config, 0, NULL, &client, &f->error),
+       &f->error);
+    ok(lc_client_open_collection(client, config, &collection, &f->error),
+       &f->error);
+    c = collection->impl;
+    ok(lc_collection_call_begin(collection, 1, &call, &f->error), &f->error);
+    ok(lc_collection_append_enter(&call, &guard, &f->error), &f->error);
+    ok(lc_pouch_record_io_append(c->active.io, &part, 1, &f->error), &f->error);
+    ok(ps_flush(ps_root_space(ps_pouch_state_root(c->pouch)), &f->error),
+       &f->error);
+    _exit(91);
+  }
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 91);
+}
+typedef struct compacting_consumer {
+  lc_sink sink;
+  consumer output;
+  lc_collection *compactor;
+  int compacted;
+} compacting_consumer;
+static int consume_during_compaction(lc_sink *sink, const void *bytes, size_t n,
+                                     lc_error *e) {
+  compacting_consumer *capture = sink->impl;
+  if (!capture->compacted) {
+    lc_pouch_maintenance_result result = {0};
+    capture->compacted = 1;
+    ok(lc_collection_compact(capture->compactor, 1, 0, &result, e), e);
+    REQUIRE(result.compacted_collection_count == 1U &&
+            result.cleanup_pending_count && !result.cleanup_deleted_count);
+    lc_pouch_maintenance_result_cleanup(NULL, &result);
+  }
+  return consume(&capture->output.sink, bytes, n, e);
+}
+static void shared_captured_cleanup(fixture *f) {
+  compacting_consumer capture = {0};
+  lc_collection_read_opts opts;
+  lc_collection_read_res read;
+  lc_pouch_maintenance_result cleanup = {0};
+  ((lc_client_handle *)f->client)->pouch->compaction_delete_grace_seconds = 0;
+  capture.sink.write = consume_during_compaction;
+  capture.sink.impl = &capture;
+  capture.compactor = f->collection;
+  capture.output.sink.impl = &capture.output;
+  capture.output.position = 3U;
+  capture.output.size = 262144U;
+  lc_collection_read_opts_init(&opts);
+  opts.has_after = opts.has_through = 1;
+  opts.after = 2U;
+  opts.through = 3U;
+  opts.on_metadata = metadata;
+  opts.metadata_context = &capture.output;
+  lc_collection_read_res_init(&read);
+  ok(lc_collection_read(f->peer, &opts, &capture.sink, &read, &f->error),
+     &f->error);
+  REQUIRE(capture.compacted && capture.output.delivered == 1U &&
+          capture.output.at == capture.output.size + 1U);
+  lc_collection_read_res_cleanup(&read);
+  ok(lc_collection_compact(f->collection, 0, 1, &cleanup, &f->error),
+     &f->error);
+  REQUIRE(cleanup.cleanup_deleted_count && !cleanup.cleanup_pending_count);
+  lc_pouch_maintenance_result_cleanup(NULL, &cleanup);
+}
+typedef struct nested_source {
+  lc_source source;
+  producer input;
+  lc_collection *other;
+  int observed;
+} nested_source;
+static size_t nested_produce(lc_source *source, void *bytes, size_t n,
+                             lc_error *e) {
+  nested_source *nested = source->impl;
+  if (!nested->observed) {
+    lc_collection_append_req req;
+    lc_collection_append_res out;
+    lc_collection_handle *other_handle = nested->other->impl;
+    lc_collection_lock pin;
+    producer other;
+    int rc = lc_collection_lock_enter(
+        other_handle->authority, LC_COLLECTION_AUTH_APPEND, 0, 1, 0, &pin, e);
+    if (rc == LC_ERR_PENDING)
+      clear(e);
+    else
+      ok(rc, e);
+    producer_init(&other, 512U);
+    lc_collection_append_req_init(&req);
+    req.append_id = "nested";
+    REQUIRE(lc_collection_append(nested->other, &req, &other.source, &out, e) ==
+            LC_ERR_PENDING);
+    REQUIRE(!other.at);
+    clear(e);
+    lc_collection_lock_leave(&pin);
+    nested->observed = 1;
+  }
+  return produce(&nested->input.source, bytes, n, e);
+}
+static void shared_nested_append(fixture *f, lc_client *peer) {
+  lc_collection_config config;
+  lc_collection_append_req req;
+  lc_collection_append_res result;
+  nested_source nested = {0};
+  lc_collection_config_init(&config);
+  config.name = "callback-peer";
+  ok(lc_client_create_collection(peer, &config, &nested.other, &f->error),
+     &f->error);
+  nested.source.read = nested_produce;
+  nested.source.impl = &nested;
+  producer_init(&nested.input, 512U);
+  lc_collection_append_req_init(&req);
+  req.append_id = "pull";
+  ok(lc_collection_append(f->collection, &req, &nested.source, &result,
+                          &f->error),
+     &f->error);
+  REQUIRE(nested.observed && result.position == 5U);
+  REQUIRE(append(nested.other, "nested", 512U, &f->error).position == 1U);
+  lc_collection_close(nested.other);
+}
+static void shared_append(const char *directory, int codec, int sync) {
+  fixture f;
+  lc_client *peer_client = NULL;
+  lc_collection_config config;
+  lc_collection_append_res first, second, duplicate;
+  lc_collection_append_status_res status;
+  gate g = {0};
+  worker w = {0};
+  pthread_t thread;
+  setup(&f, directory, codec, sync, 1);
+  lc_collection_close(f.peer);
+  f.peer = NULL;
+  ok(ps_pouch_client_open(&f.config, 0, NULL, &peer_client, &f.error),
+     &f.error);
+  lc_collection_config_init(&config);
+  config.name = "events/\303\245";
+  ok(lc_client_open_collection(peer_client, &config, &f.peer, &f.error),
+     &f.error);
+  first = append(f.collection, "first", 512U, &f.error);
+  REQUIRE(first.position == 1U);
+  read_entry(f.peer, first.position, 512U, &f.error);
+  REQUIRE(!pthread_mutex_init(&g.mutex, NULL));
+  REQUIRE(!pthread_cond_init(&g.condition, NULL));
+  g.collection = w.collection = f.collection;
+  lc_collection_append_test_context = &g;
+  lc_collection_append_test_hook = pause_chunk;
+  REQUIRE(!pthread_create(&thread, NULL, upload, &w));
+  gate_wait(&g, 0);
+  ok(lc_collection_append_status(f.peer, "held", &status, &f.error), &f.error);
+  REQUIRE(status.state == LC_COLLECTION_APPEND_ABSENT);
+  second = append(f.peer, "second", 131072U, &f.error);
+  REQUIRE(second.position == 2U);
+  read_entry(f.peer, second.position, 131072U, &f.error);
+  gate_signal(&g, 1);
+  REQUIRE(!pthread_join(thread, NULL));
+  lc_collection_append_test_hook = NULL;
+  lc_collection_append_test_context = NULL;
+  REQUIRE(w.result.position == 3U);
+  read_entry(f.peer, w.result.position, 262144U, &f.error);
+  duplicate = append(f.peer, "first", 512U, &f.error);
+  REQUIRE(duplicate.position == 1U);
+  shared_torn_append(&f, &config);
+  REQUIRE(append(f.peer, "after-torn", 1024U, &f.error).position == 4U);
+  shared_nested_append(&f, peer_client);
+  shared_captured_cleanup(&f);
+  lc_collection_close(f.peer);
+  f.peer = NULL;
+  lc_client_close(peer_client);
+  reopen(&f);
+  read_entry(f.collection, first.position, 512U, &f.error);
+  read_entry(f.collection, second.position, 131072U, &f.error);
+  read_entry(f.peer, w.result.position, 262144U, &f.error);
+  read_entry(f.peer, 4U, 1024U, &f.error);
+  read_entry(f.peer, 5U, 512U, &f.error);
+  close_store(&f);
+  REQUIRE(!pthread_cond_destroy(&g.condition));
+  REQUIRE(!pthread_mutex_destroy(&g.mutex));
+  lc_error_cleanup(&f.error);
+}
 typedef struct handoff_task {
   lc_collection_writer *writer;
   lc_collection_append_res result;
@@ -1963,6 +2154,7 @@ int main(int argc, char **argv) {
        (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
         !strcmp(argv[2], "shared-catalog") ||
         !strcmp(argv[2], "shared-orphans") ||
+        !strcmp(argv[2], "shared-append") ||
         !strcmp(argv[2], "root-conversion-faults") ||
         !strcmp(argv[2], "root-conversion-controls") ||
         !strcmp(argv[2], "root-conversion-crash") ||
@@ -1998,6 +2190,9 @@ int main(int argc, char **argv) {
     } else if (!strcmp(argv[2], "shared-orphans")) {
       shared_catalog_mode = 1;
       shared_orphans(directory, codec, sync);
+    } else if (!strcmp(argv[2], "shared-append")) {
+      shared_catalog_mode = 1;
+      shared_append(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-faults")) {
       root_conversion_faults(directory, codec, sync);
     } else if (!strcmp(argv[2], "root-conversion-controls")) {

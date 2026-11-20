@@ -110,6 +110,7 @@ int lc_collection_owned_open(lc_pouch *, lc_client_handle *, const char *ns,
 int lc_collection_file_catalog_bound(lc_collection_handle *, lc_error *);
 int lc_collection_file_catalog_remove(lc_collection_handle *, lc_error *);
 void lc_collection_call_end(lc_collection_call *call);
+int lc_collection_source_callback_active(void);
 /* A writer owns this independent reference, including after public close. */
 void lc_collection_handle_hold(lc_collection_handle *collection);
 void lc_collection_handle_release(lc_collection_handle *collection);
@@ -228,6 +229,7 @@ int lc_collection_refresh_view(lc_collection_handle *collection,
 /* Refresh receiver-local disposable metadata under metadata authority only.
  * Does not repair/truncate canonical storage or wait for append authority. */
 int lc_collection_projection_capture(lc_collection_handle *, lc_error *);
+int lc_collection_projection_catchup(lc_collection_handle *, lc_error *);
 int lc_collection_record_input(lc_collection_handle *, lc_u64,
                                lc_collection_input *, lc_error *);
 int lc_collection_record_ref(lc_collection_handle *collection, lc_u64 segment,

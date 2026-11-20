@@ -558,7 +558,7 @@ static int reclaim_orphan(void *context, ps_key key, const ps_ref *ref,
   if (rc == LC_OK)
     rc = ps_owned_retire(head, error);
   ps_owned_close(head);
-  if (rc == LC_ERR_INVALID) {
+  if (rc == LC_ERR_INVALID || rc == LC_ERR_PENDING) {
     lc_error_cleanup(error);
     ++c->skipped;
     return ps_check(c->space, error);

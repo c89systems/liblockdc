@@ -15,8 +15,8 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), and [collection catalog authority](#shared-collection-catalog-authority) | Collection publication and reader handoff, shared capacity and throughput, and normal shared admission |
-| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), and [shared projection and stream captures](#shared-projection-and-stream-captures) | Qualification of shared query and collection captures |
+| Shared ownership | File and allocator authority, live checkpoint and journal adoption, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), and [shared collection append](#shared-collection-append-and-captured-reads) | Fixed-capacity reuse, shared throughput, and normal shared admission |
+| Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), and [collection topology retention](#shared-collection-append-and-captured-reads) | Qualification of shared indexed queries and sustained reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
 Native Pouch currently admits one process at a time. Shared coordination
@@ -7657,3 +7657,61 @@ for the pre-claim binary / current, with three samples per cell.
 
 Work samples overlap for both durability policies. Raw runs and test logs
 are in `build/pouch-space-orphan-claims/`.
+
+## Shared collection append and captured reads
+
+Collections use separate keyed OFD authorities for append, commit, metadata,
+upload lifetime, compaction, and reader lifetime. Logical append keeps the
+existing append, commit, and metadata order. Nested append calls from a
+source callback try the shared append authority and return pending if its
+lock byte is busy. The collection lanes each use 512 bytes in the reserved
+root pages. Participants use the same coordination layout.
+
+Shared append admission refreshes the selected tail and owned run mappings.
+An edit marks the working suffix before bytes are extended. Complete records
+and upload reservations publish their ready boundary under append authority.
+An unfinished upload can then continue writing in its existing reservation
+while a peer appends. A writer repairs an uncertified working suffix under
+append authority before admitting later bytes. Read captures use immutable
+run handles and the selected tail, then replay only the missing projection
+suffix when the snapshot and the receiver's replay state permit it.
+
+The shared reader witness covers the whole collection. It permits peer
+compaction to publish a new topology and defers cleanup of obsolete bindings
+until captured readers drain. This can defer cleanup during readers of the
+current topology as well. Dropped collection trees use the same witness
+before removing their children. Physical reuse with idle peer caches still
+requires qualification because resident segment maps can retain run pins.
+
+The SDK cases check alternating append positions and duplicate receipts
+across independently opened roots. A paused producer exposes an unpublished
+upload while its peer appends, reads, and verifies its own body. A separate
+process exits after flushing a torn append and a live peer recovers the
+working tail. A captured read verifies its complete body during peer
+compaction, and cleanup retires old bindings after the capture closes.
+Additional coverage checks nested append contention and bodies after cold
+reopen. The cases run both sync policies with plaintext and with encryption
+and compression. All 63 selected groups passed on Debug, GNU release, and
+musl release, including the multifile collection suites.
+
+All 36 GNU collection comparison runs verified bodies before and after
+reopen. Two writers append to independent collections per root. Shared
+single-file and multifile use independently opened SDK clients per writer.
+Exclusive single-file uses one root owner for both. The profiles append
+16 values of 4 KiB and 24 values of 64 KiB. Each single-file root begins at
+10 MiB. Times are median milliseconds for shared / exclusive / multifile.
+
+| Phase | 4 KiB NoSync | 4 KiB durable | 64 KiB NoSync | 64 KiB durable |
+| --- | ---: | ---: | ---: | ---: |
+| Append work | 12.54 / 9.96 / 1.10 | 118.90 / 95.00 / 88.64 | 14.26 / 12.43 / 4.79 | 130.96 / 130.31 / 129.77 |
+| Body verification | 0.46 / 0.32 / 0.35 | 0.44 / 0.32 / 0.46 | 2.65 / 2.70 / 2.80 | 2.72 / 2.67 / 2.86 |
+| Close | 0.17 / 0.05 / 32.28 | 0.23 / 0.05 / 34.61 | 0.16 / 0.05 / 39.26 | 0.18 / 0.06 / 30.56 |
+| Reopen | 29.33 / 13.70 / 6.75 | 22.20 / 11.36 / 6.67 | 31.39 / 21.96 / 8.57 | 21.34 / 8.37 / 5.64 |
+| Verification after reopen | 0.31 / 0.20 / 0.32 | 0.39 / 0.20 / 0.31 | 2.98 / 2.57 / 2.66 | 2.96 / 2.62 / 2.97 |
+
+Shared durable append was within 1% of multifile for 64 KiB values and 34%
+slower for 4 KiB. Shared NoSync append took 3.0 and 11.4 times as long as
+multifile for 64 KiB and 4 KiB, respectively. Both single-file NoSync
+profiles recorded two foreground `fdatasync` calls per sample median.
+Raw runs and qualification logs are in
+`build/pouch-space-collection-handoff/`.
