@@ -60,6 +60,9 @@ int ps_namespace_checkpoint_recover(ps_namespace *, lc_error *);
 /* Before exposing the root, recover state claims and release empty caches. */
 int ps_namespace_recover_on_open(ps_namespace *, lc_error *);
 uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);
+/* Upper bound on live encoded bytes, or UINT64_MAX without a current
+ * projection. The caller holds logical namespace mutation authority. */
+uint64_t ps_namespace_source_bytes(ps_namespace *, unsigned int, uint64_t);
 /* Conservative durable work marker, independent of the segment head/tail.
  * Ensure precedes expiry-bearing publication, including for NoSync roots. A
  * failed mutation may leave a harmless positive hint. */

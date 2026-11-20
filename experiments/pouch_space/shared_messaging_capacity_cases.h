@@ -63,7 +63,7 @@ static void churn_read_state(fixture *f, const char *key, uint64_t seed,
 }
 
 static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
-                         int last, long *fence,
+                         int last, int manual, long *fence,
                          lc_pouch_state_read_result *held, lc_error *e) {
   lc_update_opts options = {0};
   lc_lease *lease = acquire(writer, "churn", NULL, e);
@@ -84,8 +84,10 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
   }
   if (!last) {
     now(1000U + seed * 10U + 2U);
-    REQUIRE(clean(peer, 1, e).retention_deleted_state_count == 1);
-    parent(writer, "churn", 0, 0, e);
+    if (manual) {
+      REQUIRE(clean(peer, 1, e).retention_deleted_state_count == 1);
+      parent(writer, "churn", 0, 0, e);
+    }
   }
 }
 
@@ -217,7 +219,7 @@ static void shared_messaging_capacity(const char *directory, int codec,
     size_t phase = strlen(scenario);
     strcpy(scenario + phase, " lease");
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CHURN_CYCLES,
-                 &fence, cycle == 1 ? &held : NULL, &e);
+                 1, &fence, cycle == 1 ? &held : NULL, &e);
     strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], cycle, &e);
     strcpy(scenario + phase, " outbox");
@@ -284,6 +286,127 @@ static void shared_messaging_capacity(const char *directory, int codec,
          (unsigned long long)peak);
   shared_lease_fixture = 0;
   free(idle);
+  free(owners);
+  clear(&e);
+}
+
+static int churn_expired(fixture *owner, lc_error *e) {
+  lc_pouch_state_read_result result = {0};
+  lc_pouch *pouch = store(owner);
+  int rc = lc_pouch_state_read_metadata(pouch, "orders", "churn", &result, e);
+  int expired = rc == LC_OK && !result.has_body && !result.retention;
+  lc_pouch_state_read_result_cleanup(&pouch->allocator, &result);
+  if (rc == LC_ERR_PENDING)
+    clear(e); /* The background peer can own the namespace during capture. */
+  else
+    ok(rc, e);
+  return expired;
+}
+static void shared_autonomous_capacity(const char *directory, int codec,
+                                       int sync) {
+  enum { CYCLES = 16, BURST = 4 };
+  fixture *owners = calloc(2, sizeof(*owners));
+  lc_pouch *worker = NULL;
+  lc_outbox *outbox[2];
+  ps_pouch_state_options options = {0};
+  ps_space *space = NULL;
+  ps_stats stats;
+  lc_error e = {0};
+  uint64_t checkpoints = 0, peak = 0;
+  double longest_wait = 0;
+  long fence = 0;
+  REQUIRE(owners);
+  shared_lease_fixture = 1;
+  setup(&owners[0], directory, 0, sync, codec, &e);
+  strcpy(owners[1].path, owners[0].path);
+  configure(&owners[1], 0, sync, codec);
+  open_store(&owners[1], 0, &e);
+  for (size_t i = 0; i < 2; ++i)
+    outbox[i] = shared_outbox_open(&owners[i], "effects", "capacity", 300, &e);
+
+  options.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.logical.single_writer_set = 1;
+  options.logical.query_indexing_enabled_set = 1;
+  options.logical.background_compaction_enabled_set = 1;
+  options.logical.background_compaction_enabled = 1;
+  options.logical.compaction_interval_seconds = 1;
+  options.logical.durable_sync = sync;
+  options.logical.crypto_key = codec & 1 ? crypto_key : NULL;
+  options.logical.compression = codec & 2 ? "zlib" : "none";
+
+  /* Keep a live encoded body in the same source as expiring bodies. */
+  now(1000);
+  lc_lease *stable = acquire(&owners[0], "stable", NULL, &e);
+  churn_stream body;
+  churn_stream_init(&body, 1000);
+  ok(lc_lease_update(stable, &body.source, NULL, &e), &e);
+  REQUIRE(body.offset == CHURN_BYTES);
+  ok(lc_lease_release(stable, NULL, &e), &e);
+
+  for (uint64_t cycle = 1; cycle <= CYCLES; ++cycle) {
+    size_t writer = cycle % 2, peer = 1 - writer;
+    snprintf(scenario, sizeof(scenario), "codec=%d sync=%d cycle=%llu worker",
+             codec, sync, (unsigned long long)cycle);
+    now(1000U + cycle * 10U);
+    churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES, 0,
+                 &fence, NULL, &e);
+    churn_queue(&owners[writer], &owners[peer], cycle, &e);
+    churn_outbox(outbox[writer], outbox[peer], cycle, &e);
+    if (cycle % BURST)
+      continue;
+    /* Restart the maintenance owner between bursts. Its worker discovers
+     * durable hints while the two SDK owners retain their ordinary state. */
+    ok(ps_pouch_state_open(owners[0].path, 0, &allocator, &options, &worker,
+                           &e),
+       &e);
+    space = ps_root_space(ps_pouch_state_root(worker));
+    double start = real_clock(CLOCK_MONOTONIC);
+    for (;;) {
+      ok(ps_status(space, &stats, &e), &e);
+      REQUIRE(stats.capacity == PS_DEFAULT_CAPACITY);
+      if (stats.checkpoints && stats.allocated_bytes <= 3 * PS_MIB &&
+          (cycle == CYCLES || churn_expired(&owners[peer], &e)))
+        break;
+      if (real_clock(CLOCK_MONOTONIC) - start >= 24) {
+        fprintf(stderr, "worker: allocated=%llu checkpoints=%llu\n",
+                (unsigned long long)stats.allocated_bytes,
+                (unsigned long long)stats.checkpoints);
+        REQUIRE(0);
+      }
+      const struct timespec pause = {0, 100000000};
+      (void)nanosleep(&pause, NULL);
+    }
+    double waited = real_clock(CLOCK_MONOTONIC) - start;
+    if (waited > longest_wait)
+      longest_wait = waited;
+    checkpoints += stats.checkpoints;
+    if (getenv("POUCH_SPACE_CHURN_TRACE"))
+      fprintf(stderr, "worker cycle=%llu allocated=%llu checkpoints=%llu\n",
+              (unsigned long long)cycle,
+              (unsigned long long)stats.allocated_bytes,
+              (unsigned long long)checkpoints);
+    if (stats.allocated_bytes > peak)
+      peak = stats.allocated_bytes;
+    lc_pouch_close(worker);
+    worker = NULL;
+    churn_read_state(&owners[peer], "stable", 1000, &e);
+  }
+  lc_outbox_close(outbox[1]);
+  lc_outbox_close(outbox[0]);
+  lc_client_close(owners[1].client);
+  close_store(&owners[0]);
+  open_store(&owners[0], 0, &e);
+  churn_read_state(&owners[0], "stable", 1000, &e);
+  churn_read_state(&owners[0], "churn", CYCLES, &e);
+  shared_queue_stats(&owners[0], "queues", 0, 0, &e);
+  close_store(&owners[0]);
+  printf(
+      "shared autonomous capacity codec=%d sync=%d cycles=%d bytes=%llu "
+      "peak_after_worker=%llu checkpoints=%llu max_wait_ms=%.3f verified=1\n",
+      codec, sync, CYCLES, (unsigned long long)CYCLES * CHURN_BYTES * 3,
+      (unsigned long long)peak, (unsigned long long)checkpoints,
+      longest_wait * 1000);
+  shared_lease_fixture = 0;
   free(owners);
   clear(&e);
 }

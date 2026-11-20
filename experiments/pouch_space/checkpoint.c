@@ -47,7 +47,7 @@ struct key_slot {
   key_slot *retire_next, **retire_link;
   uint64_t retire_sequence;
   key_slot *left, *right;
-  uint64_t range_end;
+  uint64_t range_end, range_bytes;
   unsigned int height;
   int retained;
 };
@@ -102,6 +102,9 @@ static void dirty_remove(ps_key_checkpoint *, key_slot *);
  * updates leave it alone; selecting a piece visits only overlapping bodies.
  * Nodes are already funded key slots, so canonical accept cannot allocate. */
 static unsigned int range_height(key_slot *s) { return s ? s->height : 0; }
+static uint64_t add_range_bytes(uint64_t a, uint64_t b) {
+  return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
 static void range_update(key_slot *s) {
   unsigned int a = range_height(s->left), b = range_height(s->right);
   s->height = 1 + (a > b ? a : b);
@@ -110,6 +113,11 @@ static void range_update(key_slot *s) {
     s->range_end = s->left->range_end;
   if (s->right && s->right->range_end > s->range_end)
     s->range_end = s->right->range_end;
+  s->range_bytes = s->summary.body_end - s->summary.body_start;
+  if (s->left)
+    s->range_bytes = add_range_bytes(s->range_bytes, s->left->range_bytes);
+  if (s->right)
+    s->range_bytes = add_range_bytes(s->range_bytes, s->right->range_bytes);
 }
 static key_slot *range_left(key_slot *s) {
   key_slot *r = s->right;
@@ -980,6 +988,17 @@ static source_count *source_find(ps_key_checkpoint *c, unsigned int kind,
     if (s->kind == kind && s->id == id)
       return s;
   return NULL;
+}
+uint64_t ps_key_checkpoint_source_bytes(ps_key_checkpoint *c, unsigned int kind,
+                                        uint64_t id) {
+  source_count *source;
+  uint64_t bytes = 0;
+  pthread_mutex_lock(&c->mutex);
+  source = source_find(c, kind, id);
+  if (source && source->ranges)
+    bytes = source->ranges->range_bytes;
+  pthread_mutex_unlock(&c->mutex);
+  return bytes;
 }
 static int range_busy(lc_error *e) {
   return lc_error_set(e, LC_ERR_INVALID, 0,

@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), and [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity) | Messaging completion during maximal competing reservations and autonomous maintenance |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), and [background state reclamation](#background-state-reclamation-at-fixed-capacity) | Messaging completion during maximal competing reservations and default-cadence pressure handling |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), and [idle namespace owners](#namespace-mapping-lifetime) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -7988,5 +7988,80 @@ about 3 ms per sample.
 All twelve work and per-item p95 medians were lower than multifile. Queue
 and indexed-state cold reopen still took 12–16 ms against 0.4–0.6 ms.
 Raw runs, sync and CPU counters, the order control, and qualification logs
-are in `build/pouch-space-namespace-retention/`. Autonomous maintenance and
-completion under maximal competing reservations remain open.
+are in `build/pouch-space-namespace-retention/`.
+
+## Background state reclamation at fixed capacity
+
+The common worker keeps its namespace rotation, logical retention policy, and
+configured cadence. Native background passes estimate physical bytes available
+for reclamation from the selected mappings and the upper bound on live encoded
+body bytes. The interval tree maintains that upper bound during ordinary body
+reference changes. The estimate discounts mapping overhead on partially live
+sources and caps the background threshold at one 16-piece pass, up to 256 KiB
+with the current piece size. A pass can select an active stream and picks the
+source with the largest estimate in the selected namespace. Explicit state
+maintenance still uses its configured thresholds.
+
+The eligibility estimate authorizes scheduling. Existing checkpoint coverage,
+capture witnesses, and exact live-range validation authorize physical selection.
+A drained source uses whole-source retirement. Partially live sources use the
+existing bounded encoded relocation path. Shared directory refresh retains the
+sweep offset for the same stream incarnation, so a checkpoint in another
+namespace cannot repeatedly send the sweep back through its already visited
+live prefix. The namespace worker uses the existing final physical checkpoint
+after state and collection maintenance to make retired space available.
+
+The initial plaintext NoSync worker left 7,462,912 bytes allocated after the
+first burst. Native selection reclaimed the drained messaging sources, then
+the second burst exposed a stalled sweep through a multi-grant live prefix.
+The shared cursor fix allowed that source's obsolete grants to be reclaimed.
+
+The sustained fixture keeps two SDK writers open and opens an independent
+shared Pouch worker with a one-second cadence between bursts. Sixteen cycles
+stream 18 MiB of lease, queue, and outbox bodies in four bursts at a hard
+10 MiB cap. Before the next burst, the worker must discover durable hints,
+checkpoint, reduce its reported allocation to at most 3 MiB, and finish the
+due lease expiry. One permanent body shares a stream with the expiring values.
+Both expected bodies are verified after cold reopen.
+The completed receipt selector still uses the existing test-clock override
+after its dispatcher stops. State retention and physical reclamation run
+through the actual worker. The initial overlapping variant reproduced
+`LC_ERR_PENDING` during foreground operations when a peer's structural frame
+awaited durability. Concurrent progress through that gate, default-cadence
+pressure handling, and messaging completion against a held maximal reservation
+remain open.
+
+The same qualification exposed busy-append capture on an exclusive root with
+two collection receivers. A receiver could skip repair and still resolve an
+outdated active segment after compaction had removed its binding. The
+container capture path now loads the selected head under metadata authority
+before resolving segments in both writer modes.
+
+GNU and musl release each passed all 57 selected groups. Across their eight
+burst runs, the maximum reported allocation at the reuse checkpoints was
+3,104,768 bytes, and the longest wait to the required reuse and expiry boundary
+was 16.9 seconds. Debug passed 34 groups during qualification, including the
+four burst profiles and the collection sweeps with 512 I/O and 273 allocation
+cuts. The sweeps exercise exclusive-root capture while another receiver owns
+append authority. The combined-codec durable burst also passed on the final
+Debug build with the single end-of-pass checkpoint.
+
+All 72 balanced GNU foreground samples verified after reopen. Both single-file
+builds and multifile used the same SDK scenarios with background maintenance
+disabled. Figures are medians of six runs in milliseconds, prior single-file
+(`399c5677`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 23.47 / 29.47 / 102.27 | 10.35 / 11.14 / 21.93 | 0.26 / 0.26 / 0.07 | 14.05 / 12.63 / 0.58 | 0.52 / 0.36 / 0.72 |
+| Queue, 64 KiB durable | 336.01 / 341.40 / 437.48 | 67.77 / 72.72 / 94.05 | 0.29 / 0.34 / 0.16 | 13.91 / 12.64 / 0.58 | 0.66 / 0.53 / 0.66 |
+| Indexed state, 4 KiB NoSync | 65.10 / 62.21 / 192.25 | 1.33 / 1.66 / 20.97 | 0.66 / 0.56 / 0.30 | 15.23 / 12.78 / 0.54 | 1.43 / 1.54 / 1.76 |
+| Outbox, 64 KiB durable | 1016.79 / 1062.03 / 1626.74 | 194.39 / 199.06 / 315.43 | 0.65 / 0.63 / 0.32 | 51.03 / 45.61 / 84.65 | 62.41 / 63.11 / 148.19 |
+
+Indexed-state mutation took 37.52 / 36.37 / 144.55 ms, explicit flush took
+25.68 / 24.35 / 30.50 ms, and first and repeated query passes took
+0.49 / 0.45 / 17.83 ms and 0.19 / 0.19 / 21.69 ms respectively. Small
+NoSync queue work increased 6 ms from the prior single-file build. All four
+current work medians were lower than multifile. Cold queue and indexed-state
+reopen remained about 13 ms against less than 1 ms. Raw runs, counters, fault
+sweeps, and the overlapping worker traces are in `build/pouch-space-autonomous/`.

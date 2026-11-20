@@ -5,6 +5,7 @@
 #include "pouch_internal.h"
 #include <string.h>
 
+enum { MAINTENANCE_PIECES = 16 };
 typedef struct compact {
   lc_pouch *pouch;
   const char *name, *reason;
@@ -14,6 +15,9 @@ typedef struct compact {
   lc_pouch_maintenance_result *maintenance;
   ps_pouch_compaction_result result;
   uint64_t candidates, bytes;
+  uint64_t selected_id, selected_bytes;
+  unsigned int selected_kind;
+  int background;
 } compact;
 static int fail(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
@@ -21,7 +25,8 @@ static int fail(lc_error *e, int code, const char *message) {
 static int candidate(void *context, const ps_namespace_source *source,
                      lc_error *e) {
   compact *w = context;
-  int active = !w->options || w->options->force ||
+  uint64_t bytes = source->stored_bytes;
+  int active = w->background || !w->options || w->options->force ||
                (w->options->terminal_reclaim &&
                 source->stored_bytes >= w->pouch->terminal_reclaim_min_bytes);
   if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
@@ -29,10 +34,33 @@ static int candidate(void *context, const ps_namespace_source *source,
       (source->kind == PS_CATALOG_SEGMENT &&
        source->id == w->before.active_segment && !active))
     return LC_OK;
-  if (source->stored_bytes > UINT64_MAX - w->bytes)
+  if (w->background) {
+    uint64_t live = ps_namespace_source_bytes(w->ns, source->kind, source->id);
+    uint64_t minimum = w->pouch->compaction_min_reclaimable_bytes;
+    if (minimum > MAINTENANCE_PIECES * PS_CHUNK)
+      minimum = MAINTENANCE_PIECES * PS_CHUNK;
+    if (live >= bytes)
+      return LC_OK;
+    bytes -= live;
+    /* Discount page rounding and sparse-map overhead for retained bodies.
+     * This estimate only schedules work. Selection uses exact ranges. */
+    if (live) {
+      if (source->runs > bytes / PS_PAGE)
+        return LC_OK;
+      bytes -= source->runs * PS_PAGE;
+    }
+    if (!bytes || bytes < minimum)
+      return LC_OK;
+    if (bytes > w->selected_bytes) {
+      w->selected_bytes = bytes;
+      w->selected_kind = source->kind;
+      w->selected_id = source->id;
+    }
+  }
+  if (bytes > UINT64_MAX - w->bytes)
     return fail(e, LC_ERR_PROTOCOL, "maintenance candidate size overflow");
   ++w->candidates;
-  w->bytes += source->stored_bytes;
+  w->bytes += bytes;
   return LC_OK;
 }
 static int select_logical(void *context, ps_piece_publish_fn publish,
@@ -73,7 +101,9 @@ static int retire_source(void *context, const ps_namespace_source *source,
   int rc;
   if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
       (source->kind == PS_CATALOG_SEGMENT &&
-       source->id > w->after.covered_segment))
+       source->id > w->after.covered_segment) ||
+      (w->background &&
+       (source->kind != w->selected_kind || source->id != w->selected_id)))
     return LC_OK;
   task.work = w;
   task.kind = source->kind;
@@ -92,8 +122,8 @@ static int retire_source(void *context, const ps_namespace_source *source,
       (source->kind == PS_CATALOG_SEGMENT &&
        source->id == w->after.active_segment) ||
       ps_namespace_source_refs(w->ns, source->kind, source->id)) {
-    rc = ps_namespace_repack(w->ns, source->kind, source->id, 16,
-                             select_logical, w, &repack, e);
+    rc = ps_namespace_repack(w->ns, source->kind, source->id,
+                             MAINTENANCE_PIECES, select_logical, w, &repack, e);
     if (rc == LC_OK) {
       w->result.body_bytes += repack.body_bytes;
       w->result.copied_bytes += repack.mapping_bytes;
@@ -153,7 +183,10 @@ static int compact_locked(void *context, lc_error *e) {
   }
   if (w->result.skipped)
     return LC_OK;
-  rc = ps_namespace_sources_visit(w->ns, candidate, w, e);
+  if (w->background && w->before.runs)
+    rc = ps_namespace_checkpoint_recover(w->ns, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_sources_visit(w->ns, candidate, w, e);
   if (rc == LC_OK && w->maintenance) {
     w->maintenance->candidate_segment_count = (unsigned long)w->candidates;
     w->maintenance->candidate_bytes = w->bytes;
@@ -169,9 +202,9 @@ static int compact_locked(void *context, lc_error *e) {
       w->reason = "disabled";
     else if (!w->candidates)
       w->reason = "no-candidates";
-    else if (w->candidates < minimum_segments)
+    else if (!w->background && w->candidates < minimum_segments)
       w->reason = "below-segment-threshold";
-    else if (w->bytes < minimum_bytes)
+    else if (!w->background && w->bytes < minimum_bytes)
       w->reason = "below-reclaimable-threshold";
     if (w->reason) {
       w->result.skipped = 1;
@@ -226,6 +259,7 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.name = name;
   w.options = options;
   w.maintenance = maintenance;
+  w.background = options && options->background && !options->force;
   rc = lc_pouch_state_with_namespace_lock(pouch, name, compact_locked, &w, e);
   /* Private encoded copying owns no logical or physical publication gate.
    * Every durable map selection reacquires logical authority and rechecks its

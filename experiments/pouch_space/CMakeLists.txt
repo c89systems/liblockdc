@@ -547,7 +547,7 @@ if(LOCKDC_BUILD_TESTS)
       set_tests_properties(pouch_space_lease_io-${crypto}-${sync}
         PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       if(crypto EQUAL 0 OR crypto EQUAL 3)
-        foreach(mode shared-messaging-capacity shared-lease-pressure)
+        foreach(mode shared-messaging-capacity shared-autonomous-capacity shared-lease-pressure)
           add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
             COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${crypto} ${sync})
           set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}

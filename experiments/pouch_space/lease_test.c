@@ -1651,6 +1651,8 @@ static void *worker(void *context) {
     shared_outbox_recovery(r->directory);
   else if (!strcmp(r->mode, "shared-messaging-capacity"))
     shared_messaging_capacity(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-autonomous-capacity"))
+    shared_autonomous_capacity(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "shared-lease-pressure"))
     shared_lease_pressure(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "protection"))
@@ -1746,6 +1748,7 @@ int main(int argc, char **argv) {
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
   run r = {directory, argv[2]};
   if (!strcmp(r.mode, "shared-messaging-capacity") ||
+      !strcmp(r.mode, "shared-autonomous-capacity") ||
       !strcmp(r.mode, "shared-lease-pressure")) {
     REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
             argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&

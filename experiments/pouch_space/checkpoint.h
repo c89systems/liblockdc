@@ -130,6 +130,9 @@ int ps_key_checkpoint_read(ps_key_checkpoint *, uint64_t slot, ps_reader **,
 /* Constant-time source ownership observation for ordinary reclamation. */
 uint64_t ps_key_checkpoint_source_refs(ps_key_checkpoint *, unsigned int,
                                        uint64_t);
+/* Sum of body intervals. Overlaps may be counted more than once. */
+uint64_t ps_key_checkpoint_source_bytes(ps_key_checkpoint *, unsigned int,
+                                        uint64_t);
 /* Bounded coalesced body ranges relative to one logical piece. Uses only the
  * live interval index, not canonical history or body bytes. Free ranges with
  * the default allocator. Epoch selection rejects changed or prepared body

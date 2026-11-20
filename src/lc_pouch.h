@@ -160,6 +160,8 @@ typedef struct lc_pouch_maintenance_options {
   /** Explicit namespace age sweep using the last update time. This is distinct
    * from per-object expiry and is never enabled automatically. */
   lc_pouch_unix_seconds retention_updated_before_unix;
+  /** Set by the worker for storage-specific background selection. */
+  int background;
 } lc_pouch_maintenance_options;
 
 typedef struct lc_pouch_maintenance_result {

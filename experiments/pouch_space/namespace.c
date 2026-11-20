@@ -171,6 +171,10 @@ static int collect_resource(void *context, const void *name, size_t length,
     lc_free_with_allocator(NULL, s->label);
     s->label = old->label;
     s->leaf = old->leaf;
+    /* A bounded sweep resumes by logical offset. A peer checkpoint can
+     * refresh the directory without replacing this stream incarnation. */
+    if (old->binding.target.incarnation == binding->target.incarnation)
+      s->reclaim_cursor = old->reclaim_cursor;
   } else {
     s->label->next = d->labels;
     d->labels = s->label;
@@ -1891,4 +1895,16 @@ uint64_t ps_namespace_source_refs(ps_namespace *ns, unsigned int kind,
     refs = ps_key_checkpoint_source_refs(d->checkpoint, kind, id);
   pthread_mutex_unlock(&d->mutex);
   return refs;
+}
+uint64_t ps_namespace_source_bytes(ps_namespace *ns, unsigned int kind,
+                                   uint64_t id) {
+  struct ps_namespace_data *d;
+  uint64_t bytes = UINT64_MAX;
+  if (ps_ns_data_lookup(ns, &d, NULL) != LC_OK)
+    return bytes;
+  pthread_mutex_lock(&d->mutex);
+  if (d->checkpoint_ready)
+    bytes = ps_key_checkpoint_source_bytes(d->checkpoint, kind, id);
+  pthread_mutex_unlock(&d->mutex);
+  return bytes;
 }

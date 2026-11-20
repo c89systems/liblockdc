@@ -1158,6 +1158,7 @@ static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
     memset(&result, 0, sizeof(result));
     options.ns = ns;
     options.terminal_reclaim = terminal_reclaim;
+    options.background = 1;
     lc_error_init(&maintenance_error);
     rc = lc_pouch_maintenance_run(pouch, &options, &result, &maintenance_error);
     if (rc != LC_OK) {
