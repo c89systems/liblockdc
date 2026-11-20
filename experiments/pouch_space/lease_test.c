@@ -245,9 +245,11 @@ static void open_store(fixture *f, int create, lc_error *e) {
   REQUIRE(!f->client);
   ps_pouch_client_options physical = {0};
   physical.io = f->io;
-  ok(f->native ? lc_client_open(&f->config, &f->client, e)
-               : ps_pouch_client_open(&f->config, create,
-                                      f->io ? &physical : NULL, &f->client, e),
+  if (shared_lease_fixture)
+    physical.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(f->native
+         ? lc_client_open(&f->config, &f->client, e)
+         : ps_pouch_client_open(&f->config, create, &physical, &f->client, e),
      e);
 }
 static void close_store(fixture *f) {
@@ -1620,6 +1622,8 @@ static void artifacts(const char *directory) {
 #include "lease_capacity_cases.h"
 #include "shared_outbox_cases.h"
 #include "shared_queue_cases.h"
+
+#include "shared_messaging_capacity_cases.h"
 typedef struct run {
   const char *directory, *mode;
   int native, sync, cold, no_error;
@@ -1645,6 +1649,10 @@ static void *worker(void *context) {
     shared_outbox_handoff(r->directory);
   else if (!strcmp(r->mode, "shared-outbox-recovery"))
     shared_outbox_recovery(r->directory);
+  else if (!strcmp(r->mode, "shared-messaging-capacity"))
+    shared_messaging_capacity(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-lease-pressure"))
+    shared_lease_pressure(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))
@@ -1737,7 +1745,14 @@ int main(int argc, char **argv) {
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
   run r = {directory, argv[2]};
-  if (!strncmp(r.mode, "allocation-", 11)) {
+  if (!strcmp(r.mode, "shared-messaging-capacity") ||
+      !strcmp(r.mode, "shared-lease-pressure")) {
+    REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
+            argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
+            argv[4][0] <= '1');
+    r.io_mode = argv[3][0] - '0';
+    r.sync = argv[4][0] - '0';
+  } else if (!strncmp(r.mode, "allocation-", 11)) {
     REQUIRE(argc == 7 || argc == 8);
     for (int i = 3; i < 7; ++i)
       REQUIRE(strlen(argv[i]) == 1 && argv[i][0] >= '0' && argv[i][0] <= '1');

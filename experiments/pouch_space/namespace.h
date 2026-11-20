@@ -130,6 +130,10 @@ void ps_namespace_append_close(ps_namespace_append *);
  * expected is the caller's observed active segment (zero for initialization).
  * An already selected expected+1 is a successful retry, even after reopen. */
 int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
+/* Move off an active source whose complete tail is checkpointed and has no
+ * live bodies. The caller retains logical namespace mutation authority. */
+int ps_namespace_rotate_obsolete(ps_namespace *, uint64_t expected,
+                                 int *rotated, lc_error *);
 int ps_namespace_parse_source_leaf(const char *, unsigned int *, uint64_t *);
 int ps_namespace_read_open(ps_namespace *, unsigned int kind, uint64_t id,
                            uint64_t offset, uint64_t bytes,

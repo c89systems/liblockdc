@@ -13,9 +13,9 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), and [inline outbox markers](#inline-outbox-markers) | Shared messaging performance and capacity beyond the qualified profiles |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), and [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity) | Messaging completion during maximal competing reservations and autonomous maintenance |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Shared lease and messaging capacity, tail latency, and reopen cost |
+| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), and [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity) | Capacity with idle namespace owners, tail latency, and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements | Consistent acceptance against multifile remains unproven |
 
@@ -7838,3 +7838,75 @@ than 1 ms for multifile. The earlier collection benchmark also found a
 material small-append NoSync gap. These results leave sustained capacity,
 tail latency, and reopen as acceptance work. Raw runs, per-phase counters,
 CPU times, and test logs are in `build/pouch-space-shared-admission/`.
+
+## Shared messaging reuse at fixed capacity
+
+A checkpointed active stream with zero live references can be retired in one
+maintenance pass. Under namespace authority, maintenance confirms the exact
+stream identity and tail, checks that no checkpoint keys are pending, and
+selects a funded successor through the existing seal and rotation path. It
+then uses whole-source reclamation. Referenced streams still use bounded
+relocation. The original mixed-workload fixture exhausted capacity in cycle
+11 even with forced maintenance after each cycle.
+
+The resulting capacity reuse exposed a journal replay failure in cycle 27.
+A peer had released its last reader and reused freed bytes within the same
+checkpoint generation. The importing allocator still held an old logical
+extent for those bytes and rejected the new publication. After a shared
+checkpoint, the allocator now releases obsolete ownership and quarantines
+the physical range while a foreign reader still holds it. Selected packed
+cells retain their occupancy map. An externally held page with zero selected
+cells is quarantined as a whole page. A certified publication can consume
+its precise quarantine range, and ordinary allocation continues to honor
+physical reader witnesses. Focused checks cover exact reuse of a full run,
+a packed cell, and a retired packed page reused as a full run. They also
+verify the captured old body before releasing the reader.
+
+Two independently opened SDK roots alternate roles for 28 cycles at a hard
+10 MiB maximum. Each cycle streams and verifies three 384 KiB bodies through
+a lease, a queue, and a transactional outbox, for 31.5 MiB of application data
+per profile. The fixture checks monotonically increasing fencing, lease
+expiry, queue acknowledgement, outbox checkpoints and completion, and replay
+of the duplicate receipt without another body read. The receipt selector's
+test clock advances after completion to exercise retention without waiting
+for the policy deadline. After forced namespace maintenance and a physical
+checkpoint each cycle, the maximum reported allocation stays below 2 MiB.
+The fixture verifies a held body through reclamation and verifies the final
+live body and empty queue after cold reopen.
+
+Eight shared lease pressure cases expire and clear a lease with an 8 KiB key,
+16 attachments, and a held body reader while another live root holds about
+8.2 MiB of ordinary physically claimed capacity. The reservation is taken
+before expiry or at the staged expiry boundary. The peer verifies expiry
+and attachment cleanup. Both fixtures cover plaintext and combined
+encryption/compression under NoSync and durable sync.
+
+The 65 selected storage and SDK groups passed on Debug, GNU release, and musl
+release, including maintenance allocation and I/O fault sweeps. All 16 existing
+delete and compaction comparator groups passed on each of those builds.
+
+All 24 matched GNU delete-and-compact runs verified absence after maintenance
+and reopen. Two writer threads delete from independent namespaces in a
+preopened root. The small workload deletes eight 16 KiB values, and the large
+one deletes sixteen 384 KiB values. Each backend then compacts the drained
+prefixes. The single-file fixture checks that maintenance retires one source
+per namespace with zero relocated body bytes. Figures are medians of three
+runs in milliseconds, single-file / multifile.
+
+| Body | Policy | Delete work | Maintenance | Close | Reopen | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 16 KiB | NoSync | 0.60 / 10.07 | 39.41 / 62.40 | 0.05 / 23.64 | 2.29 / 0.41 | 0.06 / 0.19 |
+| 16 KiB | Durable | 20.64 / 23.07 | 29.61 / 65.90 | 0.06 / 23.25 | 2.56 / 0.49 | 0.06 / 0.28 |
+| 384 KiB | NoSync | 3.81 / 12.49 | 37.24 / 77.72 | 0.04 / 19.41 | 2.39 / 0.44 | 0.08 / 0.37 |
+| 384 KiB | Durable | 54.08 / 49.39 | 29.31 / 76.15 | 0.04 / 20.02 | 2.26 / 0.38 | 0.10 / 0.34 |
+
+Maintenance was 1.6–2.6 times as fast across the four profiles. Median
+maintenance read calls fell from 50 to 3 for the small workload and from 214
+to 9 for the large one. Single-file issued more maintenance writes and made
+18 NoSync and 20 durable sync calls, against 20 for multifile in both modes.
+Cold reopen still took 2.3–2.6 ms against 0.4–0.5 ms. The stage logs and raw
+comparison runs are in `build/pouch-space-shared-capacity/`.
+
+The mixed workload uses explicit maintenance with alternating owners. An idle
+namespace owner can still pin the last mapping it cached. Queue and outbox
+completion against a held maximal peer reservation remains open.

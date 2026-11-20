@@ -118,7 +118,7 @@ if(LOCKDC_BUILD_TESTS)
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail
       shared-durable readiness-cohort certified-prefix quarantine
-      readiness-faults journal-replay journal-replay-faults
+      readiness-faults journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants
       stream-handoff stream-handoff-faults stream-takeover)
@@ -546,6 +546,14 @@ if(LOCKDC_BUILD_TESTS)
         COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} io-${crypto}-${sync})
       set_tests_properties(pouch_space_lease_io-${crypto}-${sync}
         PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      if(crypto EQUAL 0 OR crypto EQUAL 3)
+        foreach(mode shared-messaging-capacity shared-lease-pressure)
+          add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
+            COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${crypto} ${sync})
+          set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}
+            PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        endforeach()
+      endif()
     endforeach()
   endforeach()
   add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

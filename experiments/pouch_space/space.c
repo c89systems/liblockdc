@@ -1073,13 +1073,37 @@ static void payload_unregister(ps_space *s, ps_payload_page *p) {
     p->next->link = p->link;
   --s->packed_pages;
 }
+static void quarantine_run(ps_space *s, ps_run *run) {
+  run->next = s->pinned_free;
+  s->pinned_free = run;
+  s->pinned_free_bytes += run->bytes;
+}
+static void quarantine_page(ps_space *s, ps_payload_page *page) {
+  if (!page->external_pins) {
+    page->external_pins = 1;
+    page->pinned_next = s->pinned_pages;
+    s->pinned_pages = page;
+    payload_unavailable(page);
+  }
+}
 static void payload_reconsider(ps_space *s, ps_payload_page *p) {
-  if (p->occupied || p->external_pins) {
+  if (p->occupied) {
     payload_available(s, p);
     return;
   }
   payload_unregister(s, p);
-  free_insert(s, &p->run);
+  if (p->external_pins) {
+    ps_payload_page **link = &s->pinned_pages;
+    while (*link != p)
+      link = &(*link)->pinned_next;
+    if (s->pinned_page_probe == &p->pinned_next)
+      s->pinned_page_probe = link;
+    *link = p->pinned_next;
+    /* No selected cells remain. Keep the unknown physical witness without
+     * retaining a local cell map that would reject a peer's full-page reuse. */
+    quarantine_run(s, &p->run);
+  } else
+    free_insert(s, &p->run);
 }
 static void payload_release(ps_space *s, ps_extent *extent) {
   ps_payload_page *p = payload_find(s, extent->offset);
@@ -1115,7 +1139,8 @@ static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
   payload_available(s, p);
   return LC_OK;
 }
-static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
+static int release_entry_runs(ps_space *s, ps_entry *p, int quarantine,
+                              lc_error *error) {
   size_t i;
   ps_run *list = NULL, *node;
   ps_payload_page *page;
@@ -1145,15 +1170,21 @@ static int release_entry_runs(ps_space *s, ps_entry *p, lc_error *error) {
   while (list) {
     node = list;
     list = node->next;
-    if (rc == LC_OK)
-      free_insert(s, node);
-    else
+    if (rc != LC_OK)
       lc_free_with_allocator(NULL, node);
+    else if (quarantine)
+      quarantine_run(s, node);
+    else
+      free_insert(s, node);
   }
   if (rc == LC_OK)
-    for (i = 0; i < p->count; ++i)
-      if (p->extents[i].flags & EXTENT_PACKED)
+    for (i = 0; i < p->count; ++i) {
+      if (p->extents[i].flags & EXTENT_PACKED) {
+        if (quarantine)
+          quarantine_page(s, payload_find(s, p->extents[i].offset));
         payload_release(s, &p->extents[i]);
+      }
+    }
   return rc;
 }
 static int pin_conflict(ps_space *s, uint64_t offset, uint64_t bytes,
@@ -1214,9 +1245,7 @@ static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
       lc_free_with_allocator(NULL, held);
       return rc;
     }
-    held->next = s->pinned_free;
-    s->pinned_free = held;
-    s->pinned_free_bytes += held->bytes;
+    quarantine_run(s, held);
   }
   return LC_OK;
 }
@@ -1232,12 +1261,8 @@ static int pins_recover(ps_space *s, lc_error *error) {
     rc = pin_conflict(s, page->run.offset, PS_PAGE, &present, error);
     if (rc != LC_OK)
       return rc;
-    if (present) {
-      page->external_pins = 1;
-      page->pinned_next = s->pinned_pages;
-      s->pinned_pages = page;
-      payload_unavailable(page);
-    }
+    if (present)
+      quarantine_page(s, page);
   }
   rc = foreign_pool(s, &s->free, &s->free_bytes, error);
   return rc == LC_OK ? foreign_pool(s, &s->metadata_free,
@@ -1334,7 +1359,7 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
 }
 static void collect_retired(ps_space *s, int full) {
   ps_entry **link = &s->retired, *p;
-  int present = 0;
+  int present = 0, foreign, shared;
   if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
     return;
   if (s->range_pins) {
@@ -1343,18 +1368,29 @@ static void collect_retired(ps_space *s, int full) {
     if (s->pinned_free || s->pinned_pages)
       pins_collect(s, present, full);
   }
+  shared = ps_coordination_shared(s->coordination);
   while (*link) {
     p = *link;
-    if (p->state == 2 && p->safe && !p->pins &&
-        (!present || !entry_foreign_pinned(s, p)) &&
-        release_entry_runs(s, p, NULL) == LC_OK) {
-      *link = p->retired_next;
-      if (*link)
-        (*link)->retired_link = link;
-      unregister_entry(p);
-      entry_free(p);
-    } else
+    if (p->state != 2 || !p->safe || p->pins) {
       link = &p->retired_next;
+      continue;
+    }
+    foreign = present && entry_foreign_pinned(s, p);
+    /* After a shared checkpoint a foreign reader owns only physical
+     * retention. A later publication can be the first evidence that its
+     * witness drained. Keep the bytes quarantined, without obsolete logical
+     * ownership that would reject that publication during same-root replay. */
+    if ((foreign && !shared) ||
+        __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) ||
+        release_entry_runs(s, p, foreign, NULL) != LC_OK) {
+      link = &p->retired_next;
+      continue;
+    }
+    *link = p->retired_next;
+    if (*link)
+      (*link)->retired_link = link;
+    unregister_entry(p);
+    entry_free(p);
   }
 }
 static void collect(ps_space *s) { collect_retired(s, 0); }
@@ -1972,10 +2008,7 @@ again:
     if (rc != LC_OK)
       return rc;
     if (present) {
-      p->external_pins = 1;
-      p->pinned_next = s->pinned_pages;
-      s->pinned_pages = p;
-      payload_unavailable(p);
+      quarantine_page(s, p);
       goto again;
     }
   }
@@ -3317,7 +3350,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   replay_change *changes = NULL;
   size_t i, j, count = 1;
   int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, additive,
-      marker = 0, structural, rc;
+      marker = 0, structural, rc, retried = 0;
   if (group)
     count = get32(wire + 16);
   if (certified <= s->sequence || !count || count > certified - s->sequence ||
@@ -3359,6 +3392,9 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
     if (rc == LC_OK)
       entries = &single;
   }
+  if (rc != LC_OK)
+    return rc;
+replay_extents:
   for (i = 0; rc == LC_OK && i < count; ++i) {
     if (staged) {
       /* The complete staged projection can be discarded on error. */
@@ -3366,6 +3402,18 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
         rc = payload_claim(s, &entries[i]->extents[j], error);
     } else
       rc = replay_payload(s, entries[i], &changes, error);
+  }
+  if (!staged && rc == LC_ERR_PROTOCOL && s->retired && !retried) {
+    /* Retirement collection can defer a demotion on allocation failure.
+     * Undo this frame before collection changes any recorded free links. */
+    replay_finish(s, changes, 0);
+    changes = NULL;
+    collect_retired(s, 0);
+    lc_error_cleanup(error);
+    rc = healthy(s, error);
+    retried = 1;
+    if (rc == LC_OK)
+      goto replay_extents;
   }
   if (rc == LC_OK && !group) {
     if (event == PS_PUT && single->key.kind == PS_OWNED_RUN) {
@@ -4934,7 +4982,7 @@ void ps_writer_close(ps_writer *w) {
     /* Even an uncertain publication is left untouched on disk by a poisoned
      * handle. Its memory can be discarded; no further allocation is allowed. */
     if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
-        release_entry_runs(s, w->entry, NULL) != LC_OK)
+        release_entry_runs(s, w->entry, 0, NULL) != LC_OK)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
     unregister_entry(w->entry);
     entry_free(w->entry);
@@ -6408,7 +6456,7 @@ select_run:
   } else {
     if (registered) {
       if (!__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED) &&
-          release_entry_runs(s, p, NULL) != LC_OK)
+          release_entry_runs(s, p, 0, NULL) != LC_OK)
         __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
       unregister_entry(p);
     }

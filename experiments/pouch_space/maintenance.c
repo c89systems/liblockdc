@@ -45,11 +45,17 @@ typedef struct retire_task {
   compact *work;
   unsigned int kind;
   uint64_t id;
+  int active, rotated;
 } retire_task;
 static int retire_locked(void *context, lc_error *e) {
   retire_task *task = context;
   compact *w = task->work;
   int rc;
+  if (task->active) {
+    rc = ps_namespace_rotate_obsolete(w->ns, task->id, &task->rotated, e);
+    if (rc != LC_OK || !task->rotated)
+      return rc;
+  }
   if (ps_namespace_source_refs(w->ns, task->kind, task->id)) {
     ++w->result.pending_sources;
     return LC_OK;
@@ -63,12 +69,25 @@ static int retire_source(void *context, const ps_namespace_source *source,
                          lc_error *e) {
   compact *w = context;
   ps_namespace_repack_result repack;
-  retire_task task;
+  retire_task task = {0};
   int rc;
   if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
       (source->kind == PS_CATALOG_SEGMENT &&
        source->id > w->after.covered_segment))
     return LC_OK;
+  task.work = w;
+  task.kind = source->kind;
+  task.id = source->id;
+  if (source->kind == PS_CATALOG_SEGMENT &&
+      source->id == w->after.active_segment && source->tail &&
+      !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
+    task.active = 1;
+    rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
+                                            &task, e);
+    task.active = 0;
+    if (rc != LC_OK || task.rotated)
+      goto outcome;
+  }
   if (!source->sealed ||
       (source->kind == PS_CATALOG_SEGMENT &&
        source->id == w->after.active_segment) ||
@@ -82,20 +101,15 @@ static int retire_source(void *context, const ps_namespace_source *source,
         ++w->result.pending_sources;
       else if ((source->sealed || repack.finished_tail) &&
                !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
-        task.work = w;
-        task.kind = source->kind;
-        task.id = source->id;
         rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name,
                                                 retire_locked, &task, e);
       }
     }
   } else {
-    task.work = w;
-    task.kind = source->kind;
-    task.id = source->id;
     rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
                                             &task, e);
   }
+outcome:
   if (rc == LC_ERR_INVALID && e && e->server_code &&
       !strcmp(e->server_code, "pouch_namespace_busy")) {
     lc_error_cleanup(e);

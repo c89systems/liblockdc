@@ -1303,6 +1303,34 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   ps_ns_leave(d);
   return rc;
 }
+int ps_namespace_rotate_obsolete(ps_namespace *ns, uint64_t expected,
+                                 int *rotated, lc_error *e) {
+  struct ps_namespace_data *d;
+  ps_checkpoint_info coverage;
+  int eligible, rc = ps_ns_enter_checkpoint(ns, &d, e);
+  *rotated = 0;
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&d->mutex);
+  ps_key_checkpoint_info(d->checkpoint, &coverage);
+  eligible = d->active == expected && d->tail && coverage.epoch &&
+             coverage.segment == expected && coverage.offset == d->tail &&
+             !coverage.pending &&
+             !ps_key_checkpoint_source_refs(d->checkpoint, PS_CATALOG_SEGMENT,
+                                            expected);
+  if (eligible)
+    rc = ps_ns_require_unpinned(d, e);
+  pthread_mutex_unlock(&d->mutex);
+  if (rc == LC_OK && eligible) {
+    rc = ps_ns_finish_seal(d, e);
+    if (rc == LC_OK)
+      rc = ps_ns_rotate(d, NULL, e);
+    if (rc == LC_OK)
+      *rotated = 1;
+  }
+  ps_ns_leave(d);
+  return rc;
+}
 int ps_namespace_read_open(ps_namespace *ns, unsigned int kind, uint64_t id,
                            uint64_t offset, uint64_t bytes,
                            ps_namespace_window **out, lc_error *e) {

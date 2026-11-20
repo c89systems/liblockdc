@@ -976,7 +976,8 @@ static void verify_states(comparison *c, lc_error *e) {
   }
   for (id = 0; id < c->rows; ++id) {
     ordinal = id % c->writers;
-    make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
+    if (c->mutation != 2)
+      make_body(c->workers[ordinal].body, c->bytes, id, c->rounds - 1);
     offset = 0;
     if (c->streams) {
       lc_pouch_record_io io;
@@ -1237,6 +1238,10 @@ static void compact_all(comparison *c, lc_error *e) {
                   result.copied_bytes <= 16 * PS_CHUNK,
               "container compaction checkpoints the keys and bounds encoded "
               "relocation");
+      if (c->mutation == 2)
+        require(result.reclaimed_sources == 1 && !result.pending_sources &&
+                    !result.copied_bytes,
+                "wholly obsolete source retires without body copying");
     } else {
       lc_pouch_maintenance_options options = {0};
       lc_pouch_maintenance_result result = {0};
@@ -1284,7 +1289,8 @@ int main(int argc, char **argv) {
         "usage: %s "
         "space-state|stream-state|runtime-state|pouch-state|space-collection|"
         "runtime-metadata|pouch-metadata|runtime-delete|pouch-delete|"
-        "runtime-compact|pouch-compact|"
+        "runtime-compact|pouch-compact|runtime-delete-compact|pouch-delete-"
+        "compact|"
         "runtime-scope|pouch-scope|"
         "runtime-staged|pouch-staged|",
         argv[0]);
@@ -1324,6 +1330,8 @@ int main(int argc, char **argv) {
               !strcmp(argv[1], "pouch-delete") ||
               !strcmp(argv[1], "runtime-compact") ||
               !strcmp(argv[1], "pouch-compact") ||
+              !strcmp(argv[1], "runtime-delete-compact") ||
+              !strcmp(argv[1], "pouch-delete-compact") ||
               !strcmp(argv[1], "runtime-scope") ||
               !strcmp(argv[1], "pouch-scope") ||
               !strcmp(argv[1], "runtime-staged") ||

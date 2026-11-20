@@ -6,9 +6,11 @@
  * Neither mode invents a larger floor or grows the physical container. */
 typedef struct lease_capacity_trace {
   ps_space *space;
+  ps_space *peer_space;
   ps_budget *peer;
   ps_stats phases[LC_POUCH_RETENTION_PHASE_COUNT];
   unsigned long seen;
+  uint64_t peer_reserved;
   int fill_phase;
   size_t children_applied;
 } lease_capacity_trace;
@@ -36,14 +38,20 @@ static ps_budget *lease_capacity_peer(ps_space *space, lc_error *e) {
   ok(ps_budget_open(space, &plan, &budget, e), e);
   return budget;
 }
+static void lease_capacity_claim(lease_capacity_trace *profile, lc_error *e) {
+  ps_stats stats;
+  profile->peer = lease_capacity_peer(profile->peer_space, e);
+  ok(ps_status(profile->peer_space, &stats, e), e);
+  REQUIRE(stats.reserved_payload_bytes);
+  profile->peer_reserved = stats.reserved_payload_bytes;
+}
 static int lease_capacity_note(int phase, void *context, lc_error *e) {
   lease_capacity_trace *profile = context;
   if (phase == LC_POUCH_RETENTION_ATTACHMENT_APPLIED)
     ++profile->children_applied;
   int rc = note_phase(phase, NULL, e);
-  if (rc == LC_OK && phase == profile->fill_phase && !profile->peer) {
-    profile->peer = lease_capacity_peer(profile->space, e);
-  }
+  if (rc == LC_OK && phase == profile->fill_phase && !profile->peer)
+    lease_capacity_claim(profile, e);
   if (rc == LC_OK) {
     rc = ps_status(profile->space, &profile->phases[phase], e);
     profile->seen |= 1UL << phase;
@@ -98,9 +106,10 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   lc_error e;
   lc_error_init(&e);
   fixture *f = calloc(1, sizeof(*f));
+  fixture *peer = shared_lease_fixture ? calloc(1, sizeof(*peer)) : NULL;
   size_t key_bytes = large ? 8192 : 5;
   char *key = malloc(key_bytes + 1);
-  REQUIRE(f && key);
+  REQUIRE(f && key && (!shared_lease_fixture || peer));
   memset(key, 'k', key_bytes);
   key[key_bytes] = 0;
   now(1000);
@@ -119,10 +128,19 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   REQUIRE(pinned.body);
   lease_capacity_trace profile = {0};
   profile.space = ps_root_space(ps_pouch_state_root(store(f)));
-  profile.fill_phase = fill_phase;
-  if (!fill_phase) {
-    profile.peer = lease_capacity_peer(profile.space, &e);
+  profile.peer_space = profile.space;
+  if (peer) {
+    REQUIRE(!phase_fail);
+    strcpy(peer->path, f->path);
+    configure(peer, 0, sync, crypto);
+    open_store(peer, 0, &e);
+    parent(peer, key, 1, 1050, &e);
+    profile.peer_space = ps_root_space(ps_pouch_state_root(store(peer)));
+    REQUIRE(profile.peer_space != profile.space);
   }
+  profile.fill_phase = fill_phase;
+  if (!fill_phase)
+    lease_capacity_claim(&profile, &e);
   ok(ps_status(profile.space, &profile.phases[0], &e), &e);
   profile.seen = 1;
   now(1050);
@@ -149,9 +167,10 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
   printf(
       "expiry_capacity_result sync=%d crypto=%d key_bytes=%zu attachments=%zu "
       "fill_phase=%d fault_phase=%d complete=%d rc=%d phases=%lu "
-      "work_ms=%.6f reason=%s\n",
+      "peer_reserved=%llu work_ms=%.6f reason=%s\n",
       sync, crypto, key_bytes, attached, fill_phase, fault_phase, completed, rc,
-      profile.seen, elapsed * 1e3, e.message ? e.message : "complete");
+      profile.seen, (unsigned long long)profile.peer_reserved, elapsed * 1e3,
+      e.message ? e.message : "complete");
   for (int phase = 0; phase < LC_POUCH_RETENTION_PHASE_COUNT; ++phase)
     if (profile.seen & (1UL << phase))
       lease_capacity_snapshot(&profile, phase, sync, crypto, key_bytes,
@@ -208,6 +227,13 @@ static int lease_capacity_case(const char *directory, int sync, int crypto,
     attachments(f, key, 0, &e);
   }
   ok(ps_budget_close(profile.peer, &e), &e);
+  if (peer) {
+    parent(peer, key, !completed, completed ? 0 : 1050, &e);
+    if (completed)
+      attachments(peer, key, 0, &e);
+    lc_client_close(peer->client);
+    free(peer);
+  }
   lc_pouch_maintenance_result_cleanup(&store(f)->allocator, &result);
   /* Characterization always proves full recovery after the peer releases its
    * claim; it does not relabel that retry as progress under the held peer. */

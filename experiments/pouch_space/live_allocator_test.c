@@ -2875,6 +2875,65 @@ static void journal_replay(void) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void journal_replay_retired(void) {
+  for (int shape = 0; shape < 3; ++shape) {
+    size_t old_bytes = shape == 0 ? PS_CHUNK : 65;
+    size_t new_bytes = shape == 2 ? PS_PAGE : old_bytes;
+    ps_space *a = NULL, *b = NULL;
+    ps_reader *held = NULL;
+    lc_error e = {0};
+    ok(ps_open(path, 1, NULL, &a, &e), &e);
+    ok(ps_open(path, 0, NULL, &b, &e), &e);
+    capture_put(a, 1, old_bytes);
+    ok(ps_checkpoint(a, &e), &e);
+    ps_entry *original = ps_internal_lookup(a, key(1));
+    REQUIRE(original && original->count == 1);
+    uint64_t offset = original->extents[0].offset;
+    ok(ps_read_open(b, key(1), NULL, &held, &e), &e);
+    ok(ps_delete(a, key(1), &e), &e);
+    ok(ps_checkpoint(a, &e), &e);
+    uint64_t generation = a->generation;
+    REQUIRE(status(a).retired_bytes >= old_bytes);
+    ok(ps_refresh(b, &e), &e);
+    ps_budget_plan plan = {0};
+    ps_budget *budget = NULL;
+    ps_writer *writer = NULL;
+    unsigned char chunk[1024];
+    ok(ps_budget_plan_value(&plan, new_bytes, &e), &e);
+    ok(ps_budget_open(b, &plan, &budget, &e), &e);
+    ok(ps_begin(b, budget, key(2), &writer, &e), &e);
+    captured_expect(held, 1, old_bytes);
+    ps_reader_close(held);
+
+    /* B reuses the exact physical range within the same checkpoint generation.
+     * A's earlier quarantine must admit this certified journal frame. */
+    memset(chunk, 2, sizeof(chunk));
+    for (size_t left = new_bytes; left;) {
+      size_t n = left < sizeof(chunk) ? left : sizeof(chunk);
+      ok(ps_write(writer, chunk, n, &e), &e);
+      left -= n;
+    }
+    ok(ps_publish(writer, NULL, &e), &e);
+    ps_writer_close(writer);
+    ok(ps_budget_close(budget, &e), &e);
+    ok(ps_flush(b, &e), &e);
+    ps_entry *published = ps_internal_lookup(b, key(2));
+    if (published && published->extents[0].offset != offset)
+      fprintf(stderr, "shape=%d old=%lu new=%lu\n", shape,
+              (unsigned long)offset,
+              (unsigned long)published->extents[0].offset);
+    REQUIRE(published && published->count == 1 &&
+            published->extents[0].offset == offset);
+    REQUIRE(b->generation == generation);
+    expect_value(a, key(2), new_bytes, 2);
+    REQUIRE(a->generation == generation);
+    expect_value(a, key(1), 0, 0);
+    ok(ps_close(b, &e), &e);
+    ok(ps_close(a, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+    lc_error_cleanup(&e);
+  }
+}
 static void projection_tail(void) {
   lc_error e = {0};
   projection_io m = {0};
@@ -4218,6 +4277,8 @@ int main(int argc, char **argv) {
     quarantine_packed();
   } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
+  else if (!strcmp(argv[2], "journal-replay-retired"))
+    journal_replay_retired();
   else if (!strcmp(argv[2], "journal-replay-faults"))
     journal_replay_faults();
   else if (!strcmp(argv[2], "journal-replay-structural"))
