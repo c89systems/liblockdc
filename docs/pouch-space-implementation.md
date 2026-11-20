@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [capacity pressure at the default cadence](#capacity-pressure-at-the-default-cadence), and [protected messaging completion](#protected-messaging-completion-under-peer-reservation) | Unpaced sustained load and completion sizing for larger envelopes and concurrent terminal operations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), and [unpaced fixed-capacity reuse](#unpaced-fixed-capacity-reuse) | Sustained simultaneous producers and completion sizing for larger envelopes and concurrent terminal operations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8308,10 +8308,11 @@ local and shared allocator authority without waiting, refreshes the selected
 view and live claims, and recomputes headroom. A busy allocator defers the
 probe. The worker clears pressure at three quarters of usable capacity.
 While pressure persists, a probe can run one pass through the existing fair
-namespace and work-source rotation. After eight probes without improved
-headroom, the worker backs off to one second. Normal scheduled passes keep
-their configured deadline. Active bodies and standing obligations retain
-their capacity under both schedules.
+namespace and work-source rotation. The initial scheduler backed off to one
+second after eight probes without improved headroom. The later
+[unpaced stage](#unpaced-fixed-capacity-reuse) changes the rate of pressure
+passes. Normal scheduled passes keep their configured deadline. Active bodies
+and standing obligations retain their capacity under both schedules.
 
 While the hint is set, contended namespace acquisition can wait up to 250 ms
 before returning pending. The ordinary 64 ms budget continues to apply when
@@ -8339,8 +8340,8 @@ a fixed 10 MiB container. The longest wait to the required reuse and expiry
 boundary was 3.92 seconds, and the largest allocation at that boundary was
 3,137,536 bytes. This qualification covers paced bursts. The later
 [messaging completion stage](#protected-messaging-completion-under-peer-reservation)
-exercises a maximum ordinary peer reservation. Unpaced sustained load remains
-open.
+exercises a maximum ordinary peer reservation. The
+[unpaced stage](#unpaced-fixed-capacity-reuse) removes the waits between bursts.
 
 All 72 matched GNU samples verified after reopen. Each workload used two
 preopened producers with background maintenance disabled. All six configuration
@@ -8483,3 +8484,59 @@ with a median paired difference of −54.51 ms. Reopen was slower in nine pairs
 by a median paired 5.13 ms. Close was slower in eleven pairs by a median
 paired 0.22 ms. All 24 control runs verified after reopen. Logs and raw
 timings are in `build/pouch-space-completion-pressure/`.
+
+## Unpaced fixed-capacity reuse
+
+Removing the waits between bursts from the default-cadence fixture reached
+ordinary capacity refusal in cycle six in all four baseline profiles. The
+physical trace reached the failure while extending an appender's owned range
+during streaming. The allocator still protected checkpoint and maintenance
+space.
+
+The worker still samples an idle container every 250 ms. When pressure is
+active it can schedule the next bounded fair turn after 5 ms. Consecutive
+observations without more headroom, including busy allocator probes, increase
+that delay to 25 ms at eight, 100 ms at sixteen, and one second at thirty-two.
+Restored headroom resets the backoff. Each turn uses the existing bounded
+namespace and source selection. When pressure clears, the worker allows up to
+two further turns per work-source kind at the idle interval. This gives due
+lease expiry and terminal work a chance to finish even if another source
+already reclaimed enough capacity to clear pressure. Before those final turns
+were added, two paced profiles reclaimed capacity and then timed out waiting
+for a due lease to be removed.
+
+All 12 unpaced runs across Debug, GNU and musl streamed 18 MiB each through a
+fixed 10 MiB container. Roots alternated across 16 cycles with the independent
+worker open at the default 30-minute cadence. Each cycle streamed a 384 KiB
+lease body, queue payload and outbox payload. The fixture advances the lease
+and terminal-retention clocks, then verifies fencing and receipts during the
+run and the retained bodies and empty queue after cold reopen. Physical
+reclamation ran during foreground work. The worker completed 41–97
+checkpoints before the end of the last cycle. Work took 5.62–10.33 seconds,
+followed by at most 1.10 seconds for the final reuse boundary. Another 12
+paced runs passed and took at most 1.21 seconds to reach reuse and expiry
+between bursts. The unpaced evidence covers alternating foreground operations
+across the two handles. Sustained simultaneous producers remain open.
+
+Debug, GNU and musl passed 19, 23 and 19 selected CTest groups. Four additional
+multifile compaction checks passed. All 72 matched GNU samples verified after
+reopen with background maintenance disabled. Values are medians of six samples
+in milliseconds, prior single-file (`e588dbc8`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 26.02 / 28.72 / 104.39 | 8.12 / 11.08 / 27.86 | 0.28 / 0.26 / 0.09 | 5.64 / 6.45 / 0.48 | 0.35 / 0.34 / 0.53 |
+| Queue, 64 KiB durable | 428.61 / 405.43 / 434.91 | 87.68 / 99.99 / 89.25 | 0.34 / 0.32 / 0.14 | 6.70 / 7.02 / 0.55 | 0.62 / 0.50 / 0.53 |
+| Indexed state, 4 KiB NoSync | 62.63 / 82.36 / 192.07 | 1.49 / 1.76 / 20.87 | 0.66 / 0.67 / 0.38 | 6.21 / 7.11 / 0.73 | 1.13 / 1.47 / 2.24 |
+| Outbox, 64 KiB durable | 1342.61 / 1262.02 / 1878.86 | 261.21 / 256.98 / 357.01 | 0.63 / 0.68 / 0.34 | 45.85 / 62.84 / 81.42 | 84.32 / 97.21 / 174.66 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 41.84 / 53.91 / 138.03 | 25.87 / 24.20 / 31.69 | 0.37 / 0.44 / 13.24 | 0.18 / 0.17 / 16.96 |
+
+Ten alternating prior/current pairs each for indexed state and durable
+outbox verified all 40 control runs. Indexed work was slower in three pairs,
+with a median paired difference of −7.84 ms. Durable outbox reopen was
+slower in five pairs, with a median paired difference of +0.99 ms. Durable
+outbox work was slower in eight pairs with a median paired difference of
++31.80 ms. The logs and raw runs are in `build/pouch-space-unpaced/`.

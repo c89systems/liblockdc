@@ -483,7 +483,7 @@ static int churn_expired(fixture *owner, lc_error *e) {
   return expired;
 }
 static void shared_autonomous_capacity(const char *directory, int codec,
-                                       int sync) {
+                                       int sync, int unpaced) {
   enum { CYCLES = 16, BURST = 4 };
   fixture *owners = calloc(2, sizeof(*owners));
   lc_pouch *worker = NULL;
@@ -492,8 +492,8 @@ static void shared_autonomous_capacity(const char *directory, int codec,
   ps_space *space = NULL;
   ps_stats stats;
   lc_error e = {0};
-  uint64_t checkpoints = 0, peak = 0;
-  double longest_wait = 0;
+  uint64_t checkpoints = 0, checkpoints_during_work = 0, peak = 0;
+  double longest_wait = 0, work_seconds = 0;
   long fence = 0;
   REQUIRE(owners);
   shared_lease_fixture = 1;
@@ -530,6 +530,7 @@ static void shared_autonomous_capacity(const char *directory, int codec,
 
   for (uint64_t cycle = 1; cycle <= CYCLES; ++cycle) {
     size_t writer = cycle % 2, peer = 1 - writer;
+    double cycle_start = real_clock(CLOCK_MONOTONIC);
     snprintf(scenario, sizeof(scenario), "codec=%d sync=%d cycle=%llu", codec,
              sync, (unsigned long long)cycle);
     size_t phase = strlen(scenario);
@@ -541,7 +542,14 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     churn_queue(&owners[writer], &owners[peer], cycle, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
-    if (cycle % BURST)
+    work_seconds += real_clock(CLOCK_MONOTONIC) - cycle_start;
+    if (cycle == CYCLES) {
+      ok(ps_status(space, &stats, &e), &e);
+      checkpoints_during_work = stats.checkpoints;
+      if (unpaced)
+        REQUIRE(checkpoints_during_work > 0);
+    }
+    if (unpaced ? cycle != CYCLES : cycle % BURST != 0)
       continue;
     strcpy(scenario + phase, " worker");
     double start = real_clock(CLOCK_MONOTONIC);
@@ -553,9 +561,10 @@ static void shared_autonomous_capacity(const char *directory, int codec,
           (cycle == CYCLES || churn_expired(&owners[peer], &e)))
         break;
       if (real_clock(CLOCK_MONOTONIC) - start >= 24) {
-        fprintf(stderr, "worker: allocated=%llu checkpoints=%llu\n",
+        fprintf(stderr, "worker: allocated=%llu checkpoints=%llu pressure=%d\n",
                 (unsigned long long)stats.allocated_bytes,
-                (unsigned long long)stats.checkpoints);
+                (unsigned long long)stats.checkpoints,
+                ps_maintenance_pressure_requested(space));
         REQUIRE(0);
       }
       const struct timespec pause = {0, 100000000};
@@ -585,10 +594,13 @@ static void shared_autonomous_capacity(const char *directory, int codec,
   shared_queue_stats(&owners[0], "queues", 0, 0, &e);
   close_store(&owners[0]);
   printf(
-      "shared autonomous capacity codec=%d sync=%d cycles=%d bytes=%llu "
-      "peak_after_worker=%llu checkpoints=%llu max_wait_ms=%.3f verified=1\n",
-      codec, sync, CYCLES, (unsigned long long)CYCLES * CHURN_BYTES * 3,
-      (unsigned long long)peak, (unsigned long long)checkpoints,
+      "shared autonomous capacity codec=%d sync=%d unpaced=%d cycles=%d "
+      "bytes=%llu peak_after_worker=%llu checkpoints=%llu "
+      "checkpoints_during_work=%llu work_ms=%.3f max_wait_ms=%.3f verified=1\n",
+      codec, sync, unpaced, CYCLES,
+      (unsigned long long)CYCLES * CHURN_BYTES * 3, (unsigned long long)peak,
+      (unsigned long long)checkpoints,
+      (unsigned long long)checkpoints_during_work, work_seconds * 1000,
       longest_wait * 1000);
   shared_lease_fixture = 0;
   free(owners);

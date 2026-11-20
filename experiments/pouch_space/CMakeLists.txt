@@ -548,7 +548,7 @@ if(LOCKDC_BUILD_TESTS)
         PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       set(shared_modes shared-queue-pressure shared-outbox-pressure)
       if(crypto EQUAL 0 OR crypto EQUAL 3)
-        list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-lease-pressure)
+        list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-unpaced-capacity shared-lease-pressure)
       endif()
       foreach(mode IN LISTS shared_modes)
         add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}

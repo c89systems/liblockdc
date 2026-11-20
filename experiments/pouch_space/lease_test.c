@@ -1728,8 +1728,10 @@ static void *worker(void *context) {
     shared_outbox_recovery(r->directory);
   else if (!strcmp(r->mode, "shared-messaging-capacity"))
     shared_messaging_capacity(r->directory, r->io_mode, r->sync);
-  else if (!strcmp(r->mode, "shared-autonomous-capacity"))
-    shared_autonomous_capacity(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-autonomous-capacity") ||
+           !strcmp(r->mode, "shared-unpaced-capacity"))
+    shared_autonomous_capacity(r->directory, r->io_mode, r->sync,
+                               !strcmp(r->mode, "shared-unpaced-capacity"));
   else if (!strcmp(r->mode, "shared-lease-pressure"))
     shared_lease_pressure(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "shared-queue-pressure") ||
@@ -1830,6 +1832,7 @@ int main(int argc, char **argv) {
   run r = {directory, argv[2]};
   if (!strcmp(r.mode, "shared-messaging-capacity") ||
       !strcmp(r.mode, "shared-autonomous-capacity") ||
+      !strcmp(r.mode, "shared-unpaced-capacity") ||
       !strcmp(r.mode, "shared-lease-pressure") ||
       !strcmp(r.mode, "shared-queue-pressure") ||
       !strcmp(r.mode, "shared-outbox-pressure")) {
