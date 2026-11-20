@@ -3802,8 +3802,8 @@ static void *publish_marker_edit(void *context) {
   ps_catalog_info result;
   const ps_ref *prior = edit->current.id ? &edit->current.revision : NULL;
   if (edit->bytes) {
-    ok(ps_catalog_put_marker(edit->space, 88, "marker", 6, prior, edit->bytes,
-                             edit->length, &result, &e),
+    ok(ps_catalog_put_marker(edit->space, NULL, 88, "marker", 6, prior,
+                             edit->bytes, edit->length, &result, &e),
        &e);
     edit->current = result;
   } else {
@@ -3848,7 +3848,7 @@ static void inline_catalog_markers(void) {
   options.io = &io;
   ok(ps_open(path, 1, &options, &a, &e), &e);
   ok(ps_open(path, 0, &options, &b, &e), &e);
-  REQUIRE(ps_catalog_put_marker(a, 88, "marker", 6, NULL, large,
+  REQUIRE(ps_catalog_put_marker(a, NULL, 88, "marker", 6, NULL, large,
                                 PS_CATALOG_MARKER_MAX + 1, &info,
                                 &e) == LC_ERR_INVALID);
   lc_error_cleanup(&e);
@@ -3900,7 +3900,7 @@ static void inline_catalog_markers(void) {
   expect_marker_view(old, &one, 1, &e);
   ps_catalog_view_close(latest);
   ps_catalog_view_close(old);
-  ok(ps_catalog_put_marker(b, 88, "marker", 6, NULL, large,
+  ok(ps_catalog_put_marker(b, NULL, 88, "marker", 6, NULL, large,
                            PS_CATALOG_MARKER_MAX, &info, &e),
      &e);
   REQUIRE(info.id != edit.current.id);
@@ -3938,7 +3938,7 @@ static void catalog_workspace_with_peer_writer(void) {
   REQUIRE(first == offset && last == offset + PS_PAGE);
   /* The peer's writer holds a private range absent from the journal. Growing
    * the catalog's protected workspace must exclude it before choosing pages. */
-  ok(ps_catalog_put_marker(catalog, 88, "marker", 6, NULL, value,
+  ok(ps_catalog_put_marker(catalog, NULL, 88, "marker", 6, NULL, value,
                            PS_CATALOG_MARKER_MAX, &info, &e),
      &e);
   REQUIRE(catalog->metadata_free_bytes > available);

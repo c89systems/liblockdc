@@ -14883,6 +14883,7 @@ static int lc_pouch_state_write_resolved_locked(
     lc_pouch_state_control_admission admission;
     lc_pouch_storage_batch batch;
     lc_pouch_state_entry preview = {0};
+    enum lc_pouch_storage_append_mode mode = LC_POUCH_STORAGE_APPEND_PREFIX;
     uint64_t required = LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key);
     size_t length = 0;
     memset(&admission, 0, sizeof(admission));
@@ -14917,13 +14918,41 @@ static int lc_pouch_state_write_resolved_locked(
           &pouch->allocator, &preview, put_record_type, &preview.payload_span,
           LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE, &admission.metadata,
           &length, error);
+      mode = LC_POUCH_STORAGE_APPEND_MAINTENANCE;
+      admission.header.payload_len = cipher_bytes;
+      admission.header.payload_crc = stored_crc;
+    } else if (options && options->maintenance_stream_bytes) {
+      /* A repeatable internal source provided its plaintext length. Fund a
+       * checked encoded upper bound and the key checkpoint before writing
+       * the pending prefix. The normal stream path fills and finalizes it. */
+      preview.payload_span.present = 1;
+      preview.payload_span.container_leaf = "seg-00000000000000000001.log";
+      admission.header.payload_len = lc_pouch_crypto_stream_bound(
+          pouch->crypto, options->maintenance_stream_bytes,
+          !options->disable_compression, NULL);
+      rc = lc_pouch_state_encode_payload_meta(
+          &pouch->allocator, version, updated_at_unix, 0UL, 0UL, content_type,
+          placeholder_etag, NULL, &preview.payload_span, payload_context,
+          metadata, metadata_length, LC_POUCH_STATE_RECORD_DESCRIPTOR_RESERVE,
+          has_query_hidden, query_hidden, staged_delete_marker, retention,
+          &admission.metadata, &length, error);
+      if (rc == LC_OK)
+        rc = lc_pouch_state_meta_set_index_sequences(
+            &pouch->allocator, &admission.metadata, &length, 0UL,
+            query_index_seq, error);
+      mode = LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX;
+    }
+    if (rc == LC_OK && mode != LC_POUCH_STORAGE_APPEND_PREFIX) {
+      if (admission.header.payload_len > LC_U64_MAX - required - length)
+        rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                          "pouch completion exceeds its append size bound",
+                          NULL, NULL, "pouch");
+      else
+        required += length + admission.header.payload_len;
       admission.key = key;
       admission.header.type = put_record_type;
       admission.header.key_len = (unsigned long)strlen(key);
       admission.header.meta_len = (unsigned long)length;
-      admission.header.payload_len = cipher_bytes;
-      admission.header.payload_crc = stored_crc;
-      required += length + cipher_bytes;
       batch.count = 1;
       batch.prefix = lc_pouch_state_control_prefix;
       batch.context = &admission;
@@ -14931,11 +14960,9 @@ static int lc_pouch_state_write_resolved_locked(
     cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
     if (rc == LC_OK)
       rc = lc_pouch_state_storage_append_open(
-          pouch, cache, required,
-          control_admission ? LC_POUCH_STORAGE_APPEND_MAINTENANCE
-                            : LC_POUCH_STORAGE_APPEND_PREFIX,
-          control_admission ? &batch : NULL, &manifest, &storage_append,
-          &segment_size, error);
+          pouch, cache, required, mode,
+          mode == LC_POUCH_STORAGE_APPEND_PREFIX ? NULL : &batch, &manifest,
+          &storage_append, &segment_size, error);
     lc_free_with_allocator(&pouch->allocator, admission.metadata);
     if (rc != LC_OK) {
       lc_pouch_state_append_lock_release(&append_lock);

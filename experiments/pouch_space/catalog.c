@@ -395,6 +395,9 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       next = ps_catalog_record_bytes(p);
       growth = next > prior ? next - prior : 0;
       added = old && !old->deleted ? 0 : 1;
+      rc = ps_internal_budget_check(s, budget, 0, growth, added, e);
+    }
+    if (rc == LC_OK) {
       rc = ps_internal_allowance(s, budget, s->metadata + growth,
                                  s->live_entries + added, e);
     }
@@ -442,13 +445,14 @@ int ps_catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
   return catalog_put(s, budget, owner, kind, name, length, expected, stream,
                      target, NULL, 0, out, 0, e);
 }
-int ps_catalog_put_marker(ps_space *s, uint64_t owner, const void *name,
-                          size_t length, const ps_ref *expected,
-                          const void *value, size_t value_length,
-                          ps_catalog_info *out, lc_error *e) {
+int ps_catalog_put_marker(ps_space *s, ps_budget *budget, uint64_t owner,
+                          const void *name, size_t length,
+                          const ps_ref *expected, const void *value,
+                          size_t value_length, ps_catalog_info *out,
+                          lc_error *e) {
   ps_key stream = {0};
-  return catalog_put(s, NULL, owner, PS_CATALOG_MARKER, name, length, expected,
-                     stream, NULL, value, value_length, out, 0, e);
+  return catalog_put(s, budget, owner, PS_CATALOG_MARKER, name, length,
+                     expected, stream, NULL, value, value_length, out, 0, e);
 }
 int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
                                 ps_catalog_info *out, lc_error *e) {

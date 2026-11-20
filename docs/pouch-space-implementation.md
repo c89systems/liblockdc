@@ -13,7 +13,7 @@ Current implementation and acceptance status:
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
-| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), and [capacity pressure at the default cadence](#capacity-pressure-at-the-default-cadence) | Unpaced sustained load and messaging completion during maximal competing reservations |
+| Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [capacity pressure at the default cadence](#capacity-pressure-at-the-default-cadence), and [protected messaging completion](#protected-messaging-completion-under-peer-reservation) | Unpaced sustained load and completion sizing for larger envelopes and concurrent terminal operations |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
@@ -8337,8 +8337,10 @@ multifile compaction cases and the multifile cleanup suite also passed. In all
 eight default-cadence runs the two owners streamed 18 MiB over 16 cycles through
 a fixed 10 MiB container. The longest wait to the required reuse and expiry
 boundary was 3.92 seconds, and the largest allocation at that boundary was
-3,137,536 bytes. This qualification covers paced bursts. Unpaced sustained load
-and queue and outbox completion during maximal opposing reservations remain open.
+3,137,536 bytes. This qualification covers paced bursts. The later
+[messaging completion stage](#protected-messaging-completion-under-peer-reservation)
+exercises a maximum ordinary peer reservation. Unpaced sustained load remains
+open.
 
 All 72 matched GNU samples verified after reopen. Each workload used two
 preopened producers with background maintenance disabled. All six configuration
@@ -8421,3 +8423,63 @@ with a median paired difference of +0.28 ms. Reopen improved in every pair
 for both workloads. Cold queue and indexed reopen remains slower than
 multifile. The raw timings and test logs are in
 `build/pouch-space-cohort-grants/`.
+
+## Protected messaging completion under peer reservation
+
+The initial fixed-capacity fixtures failed all eight plaintext and combined-codec
+cases at transactional queue acknowledgement or the first outbox terminal
+marker. Their ordinary admission paths attempted to preserve the floor that
+exists to fund completion.
+
+The native backend funds a transactional queue's metadata-only staged
+acknowledgement, the terminal update to a prepared transaction, and verified
+lease clearing through the maintenance admission path. The decision still
+crosses its durability barrier before participant application. Terminal outbox
+retention and exact-key checkpoint cleanup markers claim their catalog cost
+through bounded maintenance budgets.
+
+For a stateful outbox's terminal parent, the repeatable internal JSON generator
+first supplies a byte count. The native appender funds the codec size bound,
+pending record prefix and changed-key checkpoint before admitting the stream.
+A fresh generator feeds the usual streaming codec and record finalizer with the
+reservation as its write ceiling. Unused capacity remains available to the
+active segment. The durable parent still precedes checkpoint cleanup. This
+path covers an admitted operation whose completion fits protected space.
+
+Debug, GNU release and musl release passed 25, 27 and 23 selected CTest groups.
+Eight further GNU cases covered encryption-only and compression-only. Across
+the fixtures, a separately opened owner held 10,067,968 ordinary bytes during
+queue completion and 10,051,584 during outbox completion, and another ordinary
+page was denied before each operation. Capacity remained 10 MiB. Queue checks
+cover live replay under the held reservation, cold application of an
+interrupted durable decision, and a captured body through acknowledgement.
+The outbox cases include escaped completion evidence at the public 4 KiB
+limit. They verify the duplicate receipt after cold reopen and reclaim the
+durable completed parent. A cut after parent durability leaves checkpoint
+cleanup for recovery. Four multifile stateful outbox reference cases passed.
+
+The fixture qualifies one prepared queue transaction or one stateful outbox
+completion at a time. Larger outbox envelopes and several simultaneous
+completions still need a standing-capacity proof.
+
+All 72 matched GNU runs verified after reopen. Background maintenance was
+disabled. Values are medians of six samples in milliseconds, prior single-file
+(`84390b98`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 26.92 / 22.18 / 87.44 | 9.63 / 8.46 / 18.91 | 0.31 / 0.24 / 0.09 | 5.63 / 5.03 / 0.40 | 0.38 / 0.30 / 0.46 |
+| Queue, 64 KiB durable | 321.19 / 314.75 / 378.90 | 61.42 / 63.60 / 70.16 | 0.30 / 0.33 / 0.15 | 6.47 / 5.77 / 0.53 | 0.55 / 0.61 / 0.54 |
+| Indexed state, 4 KiB NoSync | 61.58 / 57.94 / 172.43 | 1.72 / 1.65 / 17.17 | 0.68 / 0.76 / 0.35 | 7.03 / 6.57 / 0.53 | 1.55 / 1.11 / 1.76 |
+| Outbox, 64 KiB durable | 972.62 / 1085.73 / 1457.06 | 172.29 / 195.90 / 280.69 | 0.67 / 0.77 / 0.29 | 38.95 / 41.51 / 71.80 | 73.59 / 74.93 / 141.88 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 37.27 / 36.27 / 129.88 | 25.06 / 18.13 / 28.83 | 0.45 / 0.47 / 13.83 | 0.17 / 0.18 / 11.85 |
+
+Durable outbox work and per-item p95 rose in the matched matrix and fell in
+the twelve alternating prior/current pairs. Work was slower in four pairs,
+with a median paired difference of −54.51 ms. Reopen was slower in nine pairs
+by a median paired 5.13 ms. Close was slower in eleven pairs by a median
+paired 0.22 ms. All 24 control runs verified after reopen. Logs and raw
+timings are in `build/pouch-space-completion-pressure/`.

@@ -1,5 +1,7 @@
 #include "outbox_markers.h"
+#include "budget.h"
 #include "lc_api_internal.h"
+#include "lc_pouch_internal.h"
 #include "root_internal.h"
 #include <string.h>
 
@@ -206,6 +208,7 @@ static int change_marker(marker_store *store, const char *name,
                          const unsigned char *value, size_t size, int remove,
                          lc_error *e) {
   ps_catalog_view *view = NULL;
+  ps_budget *budget = NULL;
   ps_catalog_info prior, selected;
   unsigned char *encoded = NULL;
   void *authority = NULL;
@@ -223,15 +226,24 @@ static int change_marker(marker_store *store, const char *name,
                         PS_CATALOG_MARKER, encoded, length, &view, e);
   if (rc == LC_OK && view)
     rc = ps_catalog_view_info(view, &prior, e);
+  if (rc == LC_OK && !remove &&
+      (store->kind == -1 || store->kind == LC_POUCH_RETENTION_COMPLETED)) {
+    ps_budget_plan plan = {0};
+    plan.maintenance = 1;
+    rc = ps_budget_plan_catalog(&plan, length + size, e);
+    if (rc == LC_OK)
+      rc = ps_budget_open(store->root->space, &plan, &budget, e);
+  }
   if (rc == LC_OK && !remove)
-    rc = ps_catalog_put_marker(store->root->space, store->ns->identity.owner,
-                               encoded, length, view ? &prior.revision : NULL,
-                               value, size, &selected, e);
+    rc = ps_catalog_put_marker(
+        store->root->space, budget, store->ns->identity.owner, encoded, length,
+        view ? &prior.revision : NULL, value, size, &selected, e);
   if (rc == LC_OK && remove && view)
     rc = ps_catalog_remove(store->root->space, store->ns->identity.owner,
                            PS_CATALOG_MARKER, encoded, length, &prior.revision,
                            e);
   ps_catalog_view_close(view);
+  (void)ps_budget_close(budget, NULL);
   ps_outbox_marker_leave(store->ns, authority);
   lc_free_with_allocator(&store->allocator, encoded);
   return rc;

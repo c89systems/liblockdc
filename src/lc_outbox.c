@@ -1725,19 +1725,25 @@ static int lc_outbox_save_envelope(lc_client_handle *client, lc_lease *lease,
 static int lc_outbox_save_completed_parent(lc_outbox_job_handle *job,
                                            const lc_outbox_record *record,
                                            lc_error *error) {
+  lc_lease_handle *lease;
+  int rc;
   if (job == NULL || job->lease == NULL || record == NULL)
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "active outbox job is required for completion", NULL,
                         NULL, NULL);
-  if (job->client != NULL && job->client->is_pouch &&
-      job->record.checkpoint_present != 0) {
+  if (!job->client || !job->client->is_pouch)
+    return lc_outbox_save_envelope(job->client, job->lease, record, error);
+  lease = (lc_lease_handle *)job->lease;
+  if (job->record.checkpoint_present != 0) {
     /* A retry can be claimed through ordinary next(), so its parent lease did
      * not necessarily enter immediate mode during the original stateful
      * handoff. Complete this durable parent before deleting any checkpoint. */
-    ((lc_lease_handle *)job->lease)->pouch_commit_immediately =
-        LC_POUCH_COMMIT_PARENT_IMMEDIATELY;
+    lease->pouch_commit_immediately = LC_POUCH_COMMIT_PARENT_IMMEDIATELY;
   }
-  return lc_outbox_save_envelope(job->client, job->lease, record, error);
+  lease->pouch_maintenance_completion = 1;
+  rc = lc_outbox_save_envelope(job->client, job->lease, record, error);
+  lease->pouch_maintenance_completion = 0;
+  return rc;
 }
 
 /* The completed parent is already durable and its exact-key marker was

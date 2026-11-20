@@ -16,7 +16,8 @@ struct lc_pouch_storage_namespace_info;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
   PS_APPEND_COMPLETE,
-  PS_APPEND_MAINTENANCE
+  PS_APPEND_MAINTENANCE,
+  PS_APPEND_MAINTENANCE_PREFIX
 };
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;

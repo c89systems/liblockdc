@@ -936,7 +936,8 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
   uint64_t bytes = minimum ? minimum : 1, need, preferred = PS_PAGE;
   int rc = LC_OK;
   *budget = NULL;
-  *exact = mode == PS_APPEND_MAINTENANCE;
+  *exact =
+      mode == PS_APPEND_MAINTENANCE || mode == PS_APPEND_MAINTENANCE_PREFIX;
   if (s) {
     rc = ps_stream_status(s->stream, &info, e);
     preferred = info.preferred_grant_bytes;
@@ -976,9 +977,8 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
   if (rc != LC_OK)
     return rc;
   if (!plan.payload_bytes && !plan.metadata_bytes && !plan.entries)
-    return mode == PS_APPEND_MAINTENANCE
-               ? LC_OK
-               : ps_budget_foreground_check(d->ns->root->space, e);
+    return plan.maintenance ? LC_OK
+                            : ps_budget_foreground_check(d->ns->root->space, e);
   rc = ps_budget_open(d->ns->root->space, &plan, budget, e);
   if (rc == LC_ERR_INVALID && !*exact &&
       plan.payload_bytes > exact_plan.payload_bytes) {
@@ -1138,22 +1138,25 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   uint64_t span;
   ps_budget_plan checkpoint = {0};
   int rc, exact = 0;
+  int complete = mode == PS_APPEND_COMPLETE || mode == PS_APPEND_MAINTENANCE;
+  int maintenance =
+      mode == PS_APPEND_MAINTENANCE || mode == PS_APPEND_MAINTENANCE_PREFIX;
   if (out)
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
-  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_MAINTENANCE ||
+  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_MAINTENANCE_PREFIX ||
       (mode != PS_APPEND_PREFIX && !minimum) ||
-      (batch && mode == PS_APPEND_PREFIX))
+      (batch && mode == PS_APPEND_PREFIX) ||
+      (mode == PS_APPEND_MAINTENANCE_PREFIX && !batch))
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
   if (minimum > (uint64_t)INT64_MAX ||
-      (mode != PS_APPEND_PREFIX &&
-       minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
+      (complete && minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
-  span = mode == PS_APPEND_PREFIX ? minimum : minimum + PS_FRAME_BYTES;
+  span = complete ? minimum + PS_FRAME_BYTES : minimum;
   rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
@@ -1184,8 +1187,8 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     }
   }
   if (rc == LC_OK)
-    rc = ps_checkpoint_delta_open(d->checkpoint, mode == PS_APPEND_MAINTENANCE,
-                                  &append->delta, e);
+    rc =
+        ps_checkpoint_delta_open(d->checkpoint, maintenance, &append->delta, e);
   if (rc == LC_OK && batch)
     rc =
         ps_checkpoint_delta_plan(append->delta, batch, minimum, &checkpoint, e);
@@ -1204,9 +1207,9 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     append->segment = s->id;
     append->incarnation = s->binding.target.incarnation;
     append->leaf = s->leaf;
-    append->complete = mode != PS_APPEND_PREFIX;
+    append->complete = complete;
     append->expected = span;
-    if (rc == LC_OK && append->complete)
+    if (rc == LC_OK && mode != PS_APPEND_PREFIX)
       append->writer.limit = append->writer.start + span;
     if (rc == LC_OK && append->complete)
       rc = ps_record_frame_begin(&append->writer, minimum, e);

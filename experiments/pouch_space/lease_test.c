@@ -1732,6 +1732,10 @@ static void *worker(void *context) {
     shared_autonomous_capacity(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "shared-lease-pressure"))
     shared_lease_pressure(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-queue-pressure") ||
+           !strcmp(r->mode, "shared-outbox-pressure"))
+    shared_messaging_pressure(r->directory, r->io_mode, r->sync,
+                              !strcmp(r->mode, "shared-outbox-pressure"));
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))
@@ -1826,7 +1830,9 @@ int main(int argc, char **argv) {
   run r = {directory, argv[2]};
   if (!strcmp(r.mode, "shared-messaging-capacity") ||
       !strcmp(r.mode, "shared-autonomous-capacity") ||
-      !strcmp(r.mode, "shared-lease-pressure")) {
+      !strcmp(r.mode, "shared-lease-pressure") ||
+      !strcmp(r.mode, "shared-queue-pressure") ||
+      !strcmp(r.mode, "shared-outbox-pressure")) {
     REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
             argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
             argv[4][0] <= '1');

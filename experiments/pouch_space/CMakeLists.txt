@@ -546,14 +546,16 @@ if(LOCKDC_BUILD_TESTS)
         COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} io-${crypto}-${sync})
       set_tests_properties(pouch_space_lease_io-${crypto}-${sync}
         PROPERTIES TIMEOUT 600 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      set(shared_modes shared-queue-pressure shared-outbox-pressure)
       if(crypto EQUAL 0 OR crypto EQUAL 3)
-        foreach(mode shared-messaging-capacity shared-autonomous-capacity shared-lease-pressure)
-          add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
-            COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${crypto} ${sync})
-          set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}
-            PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
-        endforeach()
+        list(APPEND shared_modes shared-messaging-capacity shared-autonomous-capacity shared-lease-pressure)
       endif()
+      foreach(mode IN LISTS shared_modes)
+        add_test(NAME pouch_space_lease_${mode}_${crypto}_${sync}
+          COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${crypto} ${sync})
+        set_tests_properties(pouch_space_lease_${mode}_${crypto}_${sync}
+          PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endforeach()
     endforeach()
   endforeach()
   add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

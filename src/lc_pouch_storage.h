@@ -103,7 +103,9 @@ int lc_pouch_state_snapshot_publish(lc_pouch *, const char *ns,
 enum lc_pouch_storage_append_mode {
   LC_POUCH_STORAGE_APPEND_PREFIX = 0,
   LC_POUCH_STORAGE_APPEND_COMPLETE,
-  LC_POUCH_STORAGE_APPEND_MAINTENANCE
+  LC_POUCH_STORAGE_APPEND_MAINTENANCE,
+  /* A bounded pending record with a funded key prefix and codec ceiling. */
+  LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX
 };
 /* Known canonical prefixes, borrowed only during append admission. No producer
  * or payload I/O runs in this callback. Query/index values may change later;

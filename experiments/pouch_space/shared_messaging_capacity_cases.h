@@ -180,6 +180,186 @@ static ps_space *fixture_space(fixture *f) {
   return ps_root_space(ps_pouch_state_root(store(f)));
 }
 
+static ps_budget *pressure_rival(fixture *writer, fixture *worker,
+                                 lc_error *e) {
+  ps_budget *rival = lease_capacity_peer(fixture_space(writer), e);
+  ps_budget *extra = NULL;
+  ps_budget_plan plan = {0};
+  ok(ps_budget_status(rival, &plan, e), e);
+  REQUIRE(plan.payload_bytes > 8 * PS_MIB);
+  printf("completion pressure: competing ordinary bytes=%llu\n",
+         (unsigned long long)plan.payload_bytes);
+  plan.payload_bytes = PS_PAGE;
+  REQUIRE(ps_budget_open(fixture_space(worker), &plan, &extra, e) ==
+              LC_ERR_INVALID &&
+          !extra);
+  clear(e);
+  return rival;
+}
+
+static void pressure_queue(fixture *writer, fixture *worker, lc_error *e) {
+  lc_dequeue_req request = shared_queue_request();
+  lc_message *message = NULL;
+  lc_ack_res acknowledged = {0};
+  lc_txn_decision_res decided = {0};
+  lc_txn_decision_req decision = {0};
+  lc_txn_replay_req replay = {0};
+  lc_txn_replay_res applied = {0};
+  char xid[LC_XID_STRING_SIZE], key[256];
+  lc_txn_participant participant = {"orders", key, NULL};
+  int recover_on_open = !worker->sync && worker->crypto == 3;
+  ok(lc_xid_new(xid, e), e);
+  request.txn_id = decision.txn_id = replay.txn_id = xid;
+  shared_queue_enqueue(writer, NULL, e);
+  ok(lc_dequeue(worker->client, &request, &message, e), e);
+  REQUIRE(message && message->txn_id && !strcmp(message->txn_id, xid));
+  REQUIRE(snprintf(key, sizeof(key), "q/jobs/msg/%s", message->message_id) <
+          (int)sizeof(key));
+  decision.participants = &participant;
+  decision.participant_count = 1;
+  ok(lc_txn_prepare(worker->client, &decision, &decided, e), e);
+  REQUIRE(decided.state && !strcmp(decided.state, "prepare"));
+  lc_txn_decision_res_cleanup(&decided);
+  ps_budget *rival = pressure_rival(writer, worker, e);
+  lc_ack_op ack = shared_queue_ack(message);
+  strcpy(scenario, "capacity queue ack");
+  ok(worker->client->queue_ack(worker->client, &ack, &acknowledged, e), e);
+  REQUIRE(acknowledged.acked);
+  lc_ack_res_cleanup(&acknowledged);
+  shared_queue_stats(writer, NULL, 1, 0, e);
+  strcpy(scenario, "capacity queue commit");
+  if (!worker->sync) {
+    uint64_t ready, durable;
+    lc_pouch_test_after_txn_decision_hook = lose_decision_ack;
+    REQUIRE(lc_txn_commit(worker->client, &decision, &decided, e) ==
+            LC_ERR_TRANSPORT);
+    lc_pouch_test_after_txn_decision_hook = NULL;
+    clear(e);
+    ok(ps_publication_prefix(fixture_space(worker), &ready, &durable, e), e);
+    REQUIRE(ready == durable);
+    if (!recover_on_open) {
+      strcpy(scenario, "capacity queue replay under pressure");
+      ok(lc_txn_replay(worker->client, &replay, &applied, e), e);
+      REQUIRE(applied.state && !strcmp(applied.state, "commit"));
+      lc_txn_replay_res_cleanup(&applied);
+    }
+  } else {
+    ok(lc_txn_commit(worker->client, &decision, &decided, e), e);
+    REQUIRE(decided.state && !strcmp(decided.state, "commit"));
+  }
+  lc_txn_decision_res_cleanup(&decided);
+  shared_queue_stats(writer, NULL, recover_on_open, 0, e);
+  shared_queue_read(message, e);
+  message->close(message);
+  ok(ps_budget_close(rival, e), e);
+  lc_client_close(worker->client);
+  worker->client = NULL;
+  close_store(writer);
+  open_store(writer, 0, e);
+  strcpy(scenario, "capacity queue cold recovery");
+  /* Startup applies and retires native-only terminal transaction records. */
+  REQUIRE(lc_txn_replay(writer->client, &replay, &applied, e) ==
+          LC_ERR_INVALID);
+  REQUIRE(e->message &&
+          !strcmp(e->message, "pouch transaction replay record not found"));
+  clear(e);
+  lc_txn_replay_res_cleanup(&applied);
+  shared_queue_stats(writer, NULL, 0, 0, e);
+}
+
+static int cut_outbox_checkpoint_cleanup(void *context, lc_error *e) {
+  int *cuts = context;
+  ++*cuts;
+  return lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                      "injected cut after durable outbox completion", NULL,
+                      NULL, "test");
+}
+
+static void pressure_outbox(fixture *writer, fixture *worker, lc_error *e) {
+  lc_outbox *publisher =
+      shared_outbox_open(writer, "orders", "publisher", 300, e);
+  lc_outbox *owner = shared_outbox_open(worker, "orders", "worker", 300, e);
+  lc_outbox_dispatcher *dispatcher = NULL;
+  lc_outbox_receipt first = {0}, duplicate = {0};
+  lc_outbox_job *job = NULL;
+  producer checkpoint = source("{\"saved\":true}");
+  lc_outbox_completion completion = {0};
+  char *evidence = malloc(LC_OUTBOX_MAX_COMPLETION_EVIDENCE_BYTES + 1U);
+  size_t reclaimed = 0;
+  lc_i64 next_due = 0;
+  int cuts = 0;
+  int cut = !worker->sync && worker->crypto == 3;
+  REQUIRE(evidence);
+  memset(evidence, '\\', LC_OUTBOX_MAX_COMPLETION_EVIDENCE_BYTES);
+  evidence[LC_OUTBOX_MAX_COMPLETION_EVIDENCE_BYTES] = '\0';
+  completion.delivery_reference = evidence;
+  shared_outbox_append(publisher, "capacity", &first, 0, e);
+  ok(lc_outbox_dispatcher_get_or_start(owner, &dispatcher, e), e);
+  ok(lc_outbox_dispatcher_notify_outbox_key(dispatcher, first.outbox_key, e),
+     e);
+  ok(lc_outbox_dispatcher_next_with_state(dispatcher, 5000, &job, e), e);
+  REQUIRE(job && lc_outbox_job_state(job));
+  shared_outbox_check_body(job, e);
+  checkpoint.pub.impl = &checkpoint;
+  ok(lc_lease_update(lc_outbox_job_state(job), &checkpoint.pub, NULL, e), e);
+  REQUIRE(checkpoint.length == checkpoint.at);
+  ps_budget *rival = pressure_rival(writer, worker, e);
+  strcpy(scenario, "capacity outbox complete");
+  if (cut) {
+    lc_outbox_test_before_stateful_terminal_cleanup_hook =
+        cut_outbox_checkpoint_cleanup;
+    lc_outbox_test_before_stateful_terminal_cleanup_context = &cuts;
+  }
+  ok(lc_outbox_job_complete(job, &completion, e), e);
+  lc_outbox_test_before_stateful_terminal_cleanup_hook = NULL;
+  lc_outbox_test_before_stateful_terminal_cleanup_context = NULL;
+  REQUIRE(cuts == cut);
+  free(evidence);
+  ok(lc_outbox_dispatcher_stop(dispatcher, -1, e), e);
+  lc_outbox_dispatcher_close(dispatcher);
+  lc_outbox_close(owner);
+  lc_outbox_close(publisher);
+  ok(ps_budget_close(rival, e), e);
+  lc_client_close(worker->client);
+  worker->client = NULL;
+  close_store(writer);
+  open_store(writer, 0, e);
+  strcpy(scenario, "capacity outbox reopen and duplicate");
+  publisher = shared_outbox_open(writer, "orders", "publisher", 300, e);
+  shared_outbox_append(publisher, "capacity", &duplicate, 1, e);
+  REQUIRE(!strcmp(duplicate.outbox_key, first.outbox_key));
+  ok(lc_outbox_test_reclaim_terminal(publisher, LC_POUCH_RETENTION_COMPLETED,
+                                     (lc_i64)time(NULL) + 86400L * 31L,
+                                     &reclaimed, &next_due, e),
+     e);
+  REQUIRE(reclaimed == 1);
+  lc_outbox_close(publisher);
+  lc_outbox_receipt_cleanup(&first);
+  lc_outbox_receipt_cleanup(&duplicate);
+}
+
+static void shared_messaging_pressure(const char *directory, int codec,
+                                      int sync, int outbox) {
+  fixture *owners = calloc(2, sizeof(*owners));
+  lc_error e = {0};
+  REQUIRE(owners);
+  shared_lease_fixture = 1;
+  now(1000);
+  setup(&owners[0], directory, 0, sync, codec, &e);
+  strcpy(owners[1].path, owners[0].path);
+  configure(&owners[1], 0, sync, codec);
+  open_store(&owners[1], 0, &e);
+  if (outbox)
+    pressure_outbox(&owners[0], &owners[1], &e);
+  else
+    pressure_queue(&owners[0], &owners[1], &e);
+  close_store(&owners[0]);
+  retire(&owners[0]);
+  shared_lease_fixture = 0;
+  free(owners);
+  clear(&e);
+}
+
 static void churn_reclaim(fixture *f, lc_error *e) {
   const char *const names[] = {"orders", "queues", "effects", ".txns"};
   for (size_t n = 0; n < sizeof(names) / sizeof(*names); ++n) {

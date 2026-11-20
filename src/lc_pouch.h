@@ -255,6 +255,9 @@ typedef struct lc_pouch_state_write_options {
    * leave this clear; arbitrary application producers keep streaming admission.
    */
   int maintenance_completion;
+  /* Plaintext size of a repeatable internal control stream. The native
+   * appender reserves a codec bound while the source remains streamed. */
+  uint64_t maintenance_stream_bytes;
 } lc_pouch_state_write_options;
 
 typedef struct lc_pouch_state_write_result {

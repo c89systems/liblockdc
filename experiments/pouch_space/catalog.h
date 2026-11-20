@@ -44,9 +44,10 @@ int ps_catalog_put(ps_space *, ps_budget *, uint64_t owner, unsigned int kind,
 /* Bounded work markers live in an immutable catalog record. The name and
  * value together must fit one journal frame. Replacement is revision-checked.
  * Marker views preserve the selected durable bytes through removal. */
-int ps_catalog_put_marker(ps_space *, uint64_t owner, const void *name, size_t,
-                          const ps_ref *expected, const void *value, size_t,
-                          ps_catalog_info *, lc_error *);
+int ps_catalog_put_marker(ps_space *, ps_budget *, uint64_t owner,
+                          const void *name, size_t, const ps_ref *expected,
+                          const void *value, size_t, ps_catalog_info *,
+                          lc_error *);
 int ps_catalog_remove(ps_space *, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
                       lc_error *);

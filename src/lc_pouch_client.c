@@ -8452,6 +8452,8 @@ static int lc_pouch_write_lease_record_with_visibility(
     options.has_metadata = 1;
     options.metadata = (const unsigned char *)buffer.bytes;
     options.metadata_length = buffer.length;
+    options.maintenance_completion =
+        client->pouch->storage.ops && lease_id && !lease_id[0];
     if (force_query_hidden) {
       options.has_query_hidden = 1;
       options.query_hidden = 1;
@@ -8690,6 +8692,8 @@ static int lc_pouch_replace_lease_prepare_metadata(
     options->has_metadata = 1;
     options->metadata = (const unsigned char *)ctx->lease_metadata.bytes;
     options->metadata_length = ctx->lease_metadata.length;
+    options->maintenance_completion =
+        ctx->client->pouch->storage.ops && ctx->clear_lease;
   }
   lc_pouch_lease_record_cleanup(&lease_record);
   return rc;
@@ -10349,6 +10353,9 @@ static int lc_pouch_queue_stage_record(lc_client_handle *client,
     options.has_query_hidden = 1;
     options.query_hidden = 1;
     options.object_record = 1;
+    options.maintenance_completion = client->pouch->storage.ops &&
+                                     record->payload == NULL &&
+                                     strcmp(record->status, "acked") == 0;
     rc = lc_pouch_state_stage_write(client->pouch, record->ns,
                                     record->storage_key, txn_id, source,
                                     &options, &result, error);
@@ -17690,6 +17697,8 @@ static int lc_pouch_txn_decision_record_locked(void *context, lc_error *error) {
     options.content_type = "application/x-lockdc-pouch-txn";
     options.object_record = 1;
     if (read_result.found) {
+      options.maintenance_completion =
+          ctx->client->pouch->storage.ops && ctx->apply_decision;
       options.has_expected_version = 1;
       options.expected_version = read_result.version;
     }
@@ -22144,12 +22153,17 @@ static int lc_pouch_lease_load_method(lc_lease *self, const lonejson_map *map,
   return rc;
 }
 
+static int lc_pouch_lease_update_reserved(lc_lease *, lc_source *,
+                                          const lc_update_opts *, uint64_t,
+                                          lc_error *);
 static int lc_pouch_lease_save_method(lc_lease *self, const lonejson_map *map,
                                       const void *src,
                                       const lc_update_opts *opts,
                                       lc_error *error) {
+  lc_lease_handle *lease = (lc_lease_handle *)self;
   lc_source *source;
   lc_update_opts update;
+  size_t measured = 0;
   int rc;
 
   if (self == NULL || map == NULL || src == NULL) {
@@ -22162,12 +22176,27 @@ static int lc_pouch_lease_save_method(lc_lease *self, const lonejson_map *map,
   if (rc != LC_OK) {
     return rc;
   }
+  if (lease->pouch_maintenance_completion &&
+      lease->client->pouch->storage.ops) {
+    lc_sink *discard = NULL;
+    /* The terminal envelope is a repeatable internal generator. Size it
+     * without keeping JSON bytes, then stream a fresh cursor into storage. */
+    rc = lc_sink_to_discard(&discard, error);
+    if (rc == LC_OK)
+      rc = lc_copy(source, discard, &measured, error);
+    lc_sink_close(discard);
+    lc_source_close(source);
+    if (rc == LC_OK)
+      rc = lc_pouch_lonejson_source_open(map, src, &source, error);
+    if (rc != LC_OK)
+      return rc;
+  }
   memset(&update, 0, sizeof(update));
   if (opts != NULL)
     update = *opts;
   if (update.content_type == NULL)
     update.content_type = "application/json";
-  rc = lc_pouch_lease_update_method(self, source, &update, error);
+  rc = lc_pouch_lease_update_reserved(self, source, &update, measured, error);
   lc_source_close(source);
   return rc;
 }
@@ -22280,8 +22309,9 @@ static int lc_pouch_lease_staged_update_method(lc_lease *self, lc_source *src,
   return rc;
 }
 
-int lc_pouch_lease_update_method(lc_lease *self, lc_source *src,
-                                 const lc_update_opts *opts, lc_error *error) {
+static int lc_pouch_lease_update_reserved(lc_lease *self, lc_source *src,
+                                          const lc_update_opts *opts,
+                                          uint64_t measured, lc_error *error) {
   lc_lease_handle *lease;
   lc_lease_ref lease_ref;
   lc_pouch_lease_precondition lease_precondition;
@@ -22320,6 +22350,7 @@ int lc_pouch_lease_update_method(lc_lease *self, lc_source *src,
     options.content_type = opts != NULL && opts->content_type != NULL
                                ? opts->content_type
                                : "application/json";
+    options.maintenance_stream_bytes = measured;
     if (lease->pouch_state_key != NULL ||
         lease->pouch_commit_immediately == LC_POUCH_COMMIT_STATE_IMMEDIATELY) {
       options.has_query_hidden = 1;
@@ -22422,6 +22453,11 @@ int lc_pouch_lease_update_method(lc_lease *self, lc_source *src,
   }
   lc_update_res_cleanup(&res);
   return rc;
+}
+
+int lc_pouch_lease_update_method(lc_lease *self, lc_source *src,
+                                 const lc_update_opts *opts, lc_error *error) {
+  return lc_pouch_lease_update_reserved(self, src, opts, 0, error);
 }
 
 static int lc_pouch_lease_mutate_method(lc_lease *self,
