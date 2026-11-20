@@ -657,11 +657,11 @@ if(LOCKDC_BUILD_TESTS)
   target_include_directories(pouch_space_namespace_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_namespace_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_namespace_test PRIVATE
-    "LINKER:--wrap=ps_coordination_open"
+    "LINKER:--wrap=ps_coordination_open" "LINKER:--wrap=pthread_cond_wait"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_namespace_test)
-  foreach(mode lifecycle faults concurrency validation reservation publication bodies recode recode-faults recode-capacity body-select body-select-faults body-select-concurrency compound-recode compound-recode-faults compound-recode-concurrency conversion conversion-faults conversion-guards body-budget body-budget-faults append-budget append-budget-faults batch-admission batch-faults budget-transfer shared-handoff shared-abandoned shared-source-pins shared-source-faults shared-source-exit)
+  foreach(mode lifecycle faults concurrency validation reservation publication bodies recode recode-faults recode-capacity body-select body-select-faults body-select-concurrency compound-recode compound-recode-faults compound-recode-concurrency conversion conversion-faults conversion-guards body-budget body-budget-faults append-budget append-budget-faults batch-admission batch-faults budget-transfer shared-handoff shared-scope-handoff shared-abandoned shared-source-pins shared-source-faults shared-source-exit)
     add_test(NAME pouch_space_namespace_${mode}
       COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_namespace_${mode} PROPERTIES TIMEOUT 120

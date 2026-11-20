@@ -15,7 +15,7 @@ Current implementation and acceptance status:
 | Canonical metadata and reclamation | Incremental key checkpoints, sparse mappings, [point-captured piece preparation](#piece-capture-through-the-allocator), [active-source cutover and retirement](#active-source-cutover-and-retirement), bounded encoded relocation, native metadata publication and resident ordered keys | General capacity and latency acceptance |
 | Lease/messaging completion | Strict 96-case pressure matrix, 48 attachment-window workflows, production-engine recovery suites, [shared queue decisions](#shared-queue-delivery-and-transaction-replay), [shared outbox claim handoff](#shared-outbox-claim-handoff), [inline outbox markers](#inline-outbox-markers), [shared lease pressure and messaging reuse](#shared-messaging-reuse-at-fixed-capacity), [foreground admission during continuous maintenance](#foreground-admission-during-continuous-maintenance), [protected messaging completion](#protected-messaging-completion-under-peer-reservation), and [fixed-capacity simultaneous producers](#transaction-authority-for-independent-producers) | 10 MiB alternating and simultaneous fixtures qualified. Namespace handoff tails, larger envelopes and concurrent terminal operations remain open. |
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
-| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
+| Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [local capture handoff](#local-namespace-capture-handoff), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
 | Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), and [packed-page replay](#packed-page-reads-during-eager-admission) | Cold replay cost and sustained-load acceptance remain open |
 
@@ -9156,3 +9156,73 @@ and 4.32 ms. Packed-page reads reduce call count while moving more bytes
 from the file cache. The indexed and queue reopens still use one sync and the
 durable outbox uses thirteen, including SDK recovery. Logs and the GNU
 probe are under the `reopen-admission-` prefix in `build/pouch-space-concurrent/`.
+
+## Local namespace capture handoff
+
+The local namespace gate now records whether a thread is capturing a
+projection, acquiring an edit or holding an admitted edit. Checking for an
+available scope and reserving it happen under the same namespace mutex. A
+reader arriving during physical acquisition waits for the local transition.
+It can borrow the admitted edit's current projection, take its own physical
+pins and complete while the producer is still running. If acquisition fails,
+the owner clears the scope and wakes waiters. Errors from the existing file
+authority deadline remain visible to the operation that encountered them.
+
+An edit may wait behind a local read capture. That scope covers internal
+selection and pinning, with body production and consumption outside it.
+Competing edits still receive `pouch_namespace_busy` while an edit is
+reserved or active. Conversion retains its separate ownership check. The
+condition belongs to the namespace, so unrelated namespaces can capture and
+publish while a wait is in progress.
+
+Six deterministic cases exercise both arrival orders and a failed read
+acquisition under both durability policies. They pause at the physical
+namespace lock and observe the other thread entering the local wait.
+An unrelated namespace commits during the pause. A read borrows a valid
+projection before a paused producer completes, a second edit is rejected,
+and a captured view still reads the old version after publication.
+
+Debug passed 28 selected checks, including both source boundary checks.
+GNU and musl Release each passed 31. They cover ordinary and shared reads,
+source pin faults and process exit, relocation, codec conversion with
+explicit 1 MiB growth, indexed recovery, and concurrent lease and messaging
+at fixed capacity. The six new cases also passed ThreadSanitizer.
+
+The alternating comparison verified 45 of 48 attempts. All four current
+four-writer attempts completed and verified. The prior build passed two of
+four of those attempts. Its failures were a capacity refusal and a namespace
+mapping handoff returning pending. One current two-writer durable attempt
+stopped with `overlapping container ownership` before reopen. All other
+attempts completed. The comparison recorded zero instances of the local
+scope's `pouch_namespace_busy` error.
+
+Indexed workloads stream 12 MiB through sixteen 64 KiB values with twelve
+rounds and live reclamation at fixed 10 MiB. The warm queue workload sends
+twelve 4 KiB values. Each cell shows successful-attempt medians in milliseconds
+in the order prior native (`53a79952`), current native, and multifile. Each
+build has four samples per workload except for the two cases above.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Indexed NoSync, two writers | 2035.91 / 1902.44 / 1548.85 | 66.47 / 57.13 / 22.59 | 1.88 / 1.76 / 0.63 | 14.62 / 17.54 / 0.60 | 6.49 / 8.02 / 6.77 |
+| Indexed durable, two writers | 6886.02 / 6352.92 / 5618.72 | 122.33 / 104.12 / 91.80 | 1.87 / 10.73 / 0.79 | 15.33 / 16.47 / 0.82 | 7.42 / 7.70 / 7.30 |
+| Indexed NoSync, four writers | 1608.82 / 1746.79 / 1598.72 | 90.95 / 95.21 / 42.33 | 11.66 / 9.81 / 0.98 | 31.70 / 24.37 / 1.17 | 9.56 / 6.69 / 8.65 |
+| Warm queue NoSync, two writers | 10.46 / 12.15 / 112.42 | 1.92 / 2.27 / 31.00 | 0.26 / 0.26 / 0.06 | 3.08 / 3.63 / 0.37 | 0.39 / 0.51 / 0.54 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Indexed NoSync, two writers | 222.63 / 238.89 / 276.62 | 49.25 / 67.69 / 94.17 | 35.76 / 27.88 / 145.65 |
+| Indexed durable, two writers | 165.31 / 170.14 / 310.34 | 37.99 / 46.70 / 256.57 | 2.20 / 19.07 / 248.27 |
+| Indexed NoSync, four writers | 370.74 / 333.21 / 436.53 | 110.86 / 137.52 / 216.41 | 22.95 / 32.36 / 271.64 |
+
+Current indexed foreground medians were 9–23% above multifile. Index flush
+and queries completed sooner at each indexed width. The four-writer median
+per-item p95 was 95.21 ms on the current build and 42.33 ms on multifile.
+
+All eight instrumented repeats of the two-writer durable profile completed.
+Two of four additional durable runs with four writers or 15 MiB of input
+returned `namespace mapping is being replaced`. The other two verified.
+The overlap did not recur in the instrumented runs, leaving its cause
+unresolved. Wider durable runs still expose contention during private repack.
+Logs are under the `namespace-observation-` prefix in
+`build/pouch-space-concurrent/`.

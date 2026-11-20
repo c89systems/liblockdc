@@ -59,6 +59,8 @@ static int failure(lc_error *e, int rc, const char *message) {
                       "pouch");
 }
 static int checkpoint_ready(struct ps_namespace_data *, lc_error *);
+static int lock_current(struct ps_namespace_data *, int *, lc_error *);
+static void unlock_current(struct ps_namespace_data *, int);
 static void put64(unsigned char *p, uint64_t value) {
   size_t i;
   for (i = 0; i < 8; ++i) {
@@ -292,6 +294,7 @@ void ps_namespace_data_destroy(struct ps_namespace_data *d) {
     lc_free_with_allocator(NULL, label);
   }
   lc_free_with_allocator(NULL, d->items);
+  pthread_cond_destroy(&d->scope_changed);
   pthread_mutex_destroy(&d->mutex);
   lc_free_with_allocator(NULL, d);
 }
@@ -305,6 +308,11 @@ static int allocate_data(ps_namespace *ns, struct ps_namespace_data **out,
   if (pthread_mutex_init(&d->mutex, NULL)) {
     lc_free_with_allocator(NULL, d);
     return failure(e, LC_ERR_TRANSPORT, "cannot initialize namespace mutex");
+  }
+  if (pthread_cond_init(&d->scope_changed, NULL)) {
+    pthread_mutex_destroy(&d->mutex);
+    lc_free_with_allocator(NULL, d);
+    return failure(e, LC_ERR_TRANSPORT, "cannot initialize namespace handoff");
   }
   *out = d;
   return LC_OK;
@@ -539,20 +547,12 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   return LC_OK;
 }
 static int namespace_current(struct ps_namespace_data *d, lc_error *e) {
-  int rc = LC_OK;
+  int entered, rc;
   if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
     return LC_OK;
-  pthread_mutex_lock(&d->mutex);
-  if (d->busy) {
-    if (!d->shared_valid || !d->edit)
-      rc = failure(e, LC_ERR_PENDING, "namespace is being reconciled");
-    pthread_mutex_unlock(&d->mutex);
-    return rc;
-  }
-  pthread_mutex_unlock(&d->mutex);
-  rc = ps_ns_enter(d, e);
+  rc = lock_current(d, &entered, e);
   if (rc == LC_OK)
-    ps_ns_leave(d);
+    unlock_current(d, entered);
   return rc;
 }
 static int data_get(ps_namespace *ns, struct ps_namespace_data **out,
@@ -754,21 +754,14 @@ static int projection_selected(struct ps_namespace_data *d,
   }
   return rc;
 }
-static int enter_scope(struct ps_namespace_data *d,
+/* The local scope is reserved before requesting file authority. Waiters can
+ * borrow a valid resident projection as soon as an edit has been admitted. */
+static int admit_scope(struct ps_namespace_data *d,
                        namespace_observation *observed, lc_error *e) {
   ps_coordination_guard *guard = NULL;
-  int rc = LC_OK, continued = 0;
-  pthread_mutex_lock(&d->mutex);
-  if (d->busy)
-    rc = lc_error_set(e, LC_ERR_INVALID, 0L,
-                      "namespace already has an active producer or rotation",
-                      NULL, "pouch_namespace_busy", "pouch");
-  else
-    d->busy = 1;
-  pthread_mutex_unlock(&d->mutex);
-  if (rc != LC_OK ||
-      !ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
-    return rc;
+  int continued = 0, rc;
+  if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
+    return LC_OK;
   rc = ps_namespace_guard(d->ns, &guard, e);
   if (rc == LC_OK && guard && observed)
     rc = projection_selected(d, observed, e);
@@ -779,23 +772,41 @@ static int enter_scope(struct ps_namespace_data *d,
   if (rc == LC_OK && guard && (!observed || !observed->ready) &&
       (!d->shared_valid || !continued))
     rc = reload_shared(d, e);
-  if (rc == LC_OK && (!observed || !observed->ready))
+  if (rc == LC_OK && (!observed || !observed->ready)) {
     d->edit = guard;
-  else {
+    if (d->scope == PS_NS_EDIT_PENDING)
+      d->scope = PS_NS_EDITING;
+  } else {
     rc = ps_namespace_unguard(d->ns, guard, rc, e);
-    d->busy = 0;
+    d->scope = PS_NS_IDLE;
   }
+  pthread_cond_broadcast(&d->scope_changed);
   pthread_mutex_unlock(&d->mutex);
   return rc;
 }
 int ps_ns_enter(struct ps_namespace_data *d, lc_error *e) {
-  return enter_scope(d, NULL, e);
+  int rc = LC_OK;
+  int shared =
+      ps_coordination_shared(ps_space_coordination(d->ns->root->space));
+  pthread_mutex_lock(&d->mutex);
+  while (rc == LC_OK && d->scope == PS_NS_OBSERVING)
+    if (pthread_cond_wait(&d->scope_changed, &d->mutex))
+      rc = failure(e, LC_ERR_TRANSPORT, "cannot wait for namespace capture");
+  if (rc == LC_OK && d->scope != PS_NS_IDLE)
+    rc = lc_error_set(e, LC_ERR_INVALID, 0L,
+                      "namespace already has an active producer or rotation",
+                      NULL, "pouch_namespace_busy", "pouch");
+  if (rc == LC_OK)
+    d->scope = shared ? PS_NS_EDIT_PENDING : PS_NS_EDITING;
+  pthread_mutex_unlock(&d->mutex);
+  return rc == LC_OK ? admit_scope(d, NULL, e) : rc;
 }
 void ps_ns_leave(struct ps_namespace_data *d) {
   pthread_mutex_lock(&d->mutex);
   (void)ps_namespace_unguard(d->ns, d->edit, LC_OK, NULL);
   d->edit = NULL;
-  d->busy = 0;
+  d->scope = PS_NS_IDLE;
+  pthread_cond_broadcast(&d->scope_changed);
   pthread_mutex_unlock(&d->mutex);
 }
 int ps_ns_require_unpinned(struct ps_namespace_data *d, lc_error *e) {
@@ -815,14 +826,26 @@ int ps_ns_require_unpinned(struct ps_namespace_data *d, lc_error *e) {
  * A successful point observation returns with ready set and no held guard. */
 static int lock_current_scope(struct ps_namespace_data *d, int *entered,
                               namespace_observation *observed, lc_error *e) {
-  int rc;
+  int rc = LC_OK;
   *entered = 0;
   pthread_mutex_lock(&d->mutex);
-  if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)) ||
-      (d->busy && d->edit && d->shared_valid))
+  if (!ps_coordination_shared(ps_space_coordination(d->ns->root->space)))
     return LC_OK;
+  while (rc == LC_OK && (d->scope == PS_NS_EDIT_PENDING ||
+                         (d->scope == PS_NS_OBSERVING && !d->edit)))
+    if (pthread_cond_wait(&d->scope_changed, &d->mutex))
+      rc = failure(e, LC_ERR_TRANSPORT, "cannot wait for namespace handoff");
+  if (rc == LC_OK && d->scope != PS_NS_IDLE) {
+    if (d->edit && d->shared_valid)
+      return LC_OK;
+    rc = failure(e, LC_ERR_PENDING, "namespace is being reconciled");
+  }
+  if (rc == LC_OK)
+    d->scope = PS_NS_OBSERVING;
   pthread_mutex_unlock(&d->mutex);
-  rc = enter_scope(d, observed, e);
+  if (rc != LC_OK)
+    return rc;
+  rc = admit_scope(d, observed, e);
   if (rc == LC_OK && (!observed || !observed->ready)) {
     *entered = 1;
     pthread_mutex_lock(&d->mutex);

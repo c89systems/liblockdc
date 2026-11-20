@@ -16,12 +16,13 @@ static int recode_enter(struct ps_namespace_data *data, const void *owner,
                         lc_error *e) {
   int rc = LC_OK;
   pthread_mutex_lock(&data->mutex);
-  if (data->busy || (data->conversion && data->conversion != owner))
+  if (data->scope != PS_NS_IDLE ||
+      (data->conversion && data->conversion != owner))
     rc = lc_error_set(e, LC_ERR_INVALID, 0,
                       "namespace conversion already has an owner or producer",
                       NULL, "pouch_namespace_busy", "pouch");
   else
-    data->busy = 1;
+    data->scope = PS_NS_EDITING;
   pthread_mutex_unlock(&data->mutex);
   return rc;
 }

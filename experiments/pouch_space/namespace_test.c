@@ -92,6 +92,19 @@ typedef struct gate {
   pthread_cond_t changed;
   int entered, released;
 } gate;
+static __thread pthread_cond_t *watched_scope;
+static __thread gate *scope_wait;
+int __real_pthread_cond_wait(pthread_cond_t *, pthread_mutex_t *);
+int __wrap_pthread_cond_wait(pthread_cond_t *condition,
+                             pthread_mutex_t *mutex) {
+  if (scope_wait && condition == watched_scope) {
+    pthread_mutex_lock(&scope_wait->mutex);
+    scope_wait->entered = 1;
+    pthread_cond_broadcast(&scope_wait->changed);
+    pthread_mutex_unlock(&scope_wait->mutex);
+  }
+  return __real_pthread_cond_wait(condition, mutex);
+}
 typedef struct input {
   lc_source pub;
   size_t at, bytes;
@@ -2236,6 +2249,149 @@ static int advance_checkpoint_visibility(void *context, int fd, int cmd,
   }
   return fcntl(fd, cmd, lock);
 }
+typedef struct scope_acquisition {
+  gate acquiring;
+  off_t offset;
+  int record, armed, reject;
+} scope_acquisition;
+static int hold_scope_acquisition(void *context, int fd, int cmd,
+                                  struct flock *lock) {
+  scope_acquisition *scope = context;
+  gate *g = &scope->acquiring;
+  int reject = 0;
+  if (cmd == F_OFD_SETLK && lock->l_type == F_WRLCK && lock->l_len == 1) {
+    pthread_mutex_lock(&g->mutex);
+    if (scope->record)
+      scope->offset = lock->l_start;
+    if (scope->armed && lock->l_start == scope->offset) {
+      scope->armed = 0;
+      g->entered = 1;
+      pthread_cond_broadcast(&g->changed);
+      while (!g->released)
+        pthread_cond_wait(&g->changed, &g->mutex);
+      reject = scope->reject;
+    }
+    pthread_mutex_unlock(&g->mutex);
+  }
+  if (reject) {
+    errno = EIO;
+    return -1;
+  }
+  return fcntl(fd, cmd, lock);
+}
+static void await_scope_gate(gate *g) {
+  pthread_mutex_lock(&g->mutex);
+  while (!g->entered && !g->released)
+    pthread_cond_wait(&g->changed, &g->mutex);
+  REQUIRE(g->entered);
+  pthread_mutex_unlock(&g->mutex);
+}
+static void release_scope_gate(gate *g) {
+  pthread_mutex_lock(&g->mutex);
+  g->released = 1;
+  pthread_cond_broadcast(&g->changed);
+  pthread_mutex_unlock(&g->mutex);
+}
+static void destroy_scope_gate(gate *g) {
+  REQUIRE(!pthread_cond_destroy(&g->changed));
+  REQUIRE(!pthread_mutex_destroy(&g->mutex));
+}
+typedef struct scope_job {
+  ps_root *root;
+  ps_namespace *ns;
+  pthread_cond_t *changed;
+  gate *waiting, *producing;
+  lc_pouch_storage_namespace_info point;
+  int rc;
+} scope_job;
+static void *run_scope_job(void *context) {
+  scope_job *job = context;
+  lc_pouch_state_entry written = {0};
+  lc_error e = {0};
+  watched_scope = job->changed;
+  scope_wait = job->waiting;
+  job->rc = job->producing ? put(job->root, job->ns, 2, 0, 31, job->producing,
+                                 NULL, &written, &e)
+                           : ps_namespace_projection(job->ns, &job->point, &e);
+  if (job->waiting)
+    release_scope_gate(job->waiting);
+  lc_pouch_state_entry_cleanup(&allocator, &written);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void shared_scope_handoff(const char *path, int durable, int edit_first,
+                                 int reject_read) {
+  scope_acquisition scope = {
+      {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0}, -1, 0, 0};
+  gate waiting = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+  gate producing = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0};
+  ps_coordination_io io = {&scope, hold_scope_acquisition};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace *ns, *other;
+  struct ps_namespace_data *data = NULL;
+  ps_coordination_guard *discover = NULL;
+  ps_namespace_append *overlap = NULL;
+  ps_namespace_view *captured = NULL;
+  lc_pouch_storage_namespace_info before;
+  records old = {0};
+  lc_error e = {0};
+  pthread_t reader, writer;
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  options.storage.coordination_io = &io;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ns = acquire(root, "shared", 1, &e);
+  other = acquire(root, "independent", 1, &e);
+  ok(append(root, ns, 1, 0, 31, &e), &e);
+  ok(ps_namespace_projection(ns, &before, &e), &e);
+  ok(ps_ns_data_lookup(ns, &data, &e), &e);
+  scope.record = 1;
+  ok(ps_namespace_guard(ns, &discover, &e), &e);
+  scope.record = 0;
+  ok(ps_namespace_unguard(ns, discover, LC_OK, &e), &e);
+  REQUIRE(scope.offset >= 0);
+  scope_job read = {root, ns, &data->scope_changed,
+                    edit_first ? &waiting : NULL};
+  scope_job edit = {root, ns, &data->scope_changed,
+                    edit_first ? NULL : &waiting, &producing};
+  scope.armed = 1;
+  scope.reject = reject_read;
+  REQUIRE(!pthread_create(edit_first ? &writer : &reader, NULL, run_scope_job,
+                          edit_first ? &edit : &read));
+  await_scope_gate(&scope.acquiring);
+  REQUIRE(!pthread_create(edit_first ? &reader : &writer, NULL, run_scope_job,
+                          edit_first ? &read : &edit));
+  await_scope_gate(&waiting);
+  ok(append(root, other, 1, 0, 31, &e), &e);
+  release_scope_gate(&scope.acquiring);
+  await_scope_gate(&producing);
+  REQUIRE(!pthread_join(reader, NULL));
+  REQUIRE(read.rc == (reject_read ? LC_ERR_TRANSPORT : LC_OK));
+  if (!reject_read)
+    REQUIRE(read.point.tail == before.tail &&
+            read.point.active_incarnation == before.active_incarnation);
+  REQUIRE(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &overlap,
+                                    &e) == LC_ERR_INVALID &&
+          !overlap);
+  REQUIRE(e.server_code && !strcmp(e.server_code, "pouch_namespace_busy"));
+  clear(&e);
+  ok(ps_namespace_view_open(ns, &captured, &e), &e);
+  release_scope_gate(&producing);
+  REQUIRE(!pthread_join(writer, NULL) && edit.rc == LC_OK);
+  ok(ps_namespace_view_visit(captured, 1, visit, &old, &e), &e);
+  REQUIRE(old.count == 1 && old.version == 1);
+  ps_namespace_view_close(captured);
+  count(ns, 2, &e);
+  ps_namespace_release(other);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  destroy_scope_gate(&scope.acquiring);
+  destroy_scope_gate(&waiting);
+  destroy_scope_gate(&producing);
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
+}
 static void shared_handoff(const char *path) {
   for (int durable = 0; durable <= 1; ++durable) {
     lc_error e = {0};
@@ -2775,7 +2931,13 @@ static void *worker(void *p) {
     budget_transfer(r->path);
   else if (!strcmp(r->mode, "shared-handoff"))
     shared_handoff(r->path);
-  else if (!strcmp(r->mode, "shared-source-pins"))
+  else if (!strcmp(r->mode, "shared-scope-handoff")) {
+    for (int durable = 0; durable <= 1; ++durable) {
+      for (int edit_first = 0; edit_first <= 1; ++edit_first)
+        shared_scope_handoff(r->path, durable, edit_first, 0);
+      shared_scope_handoff(r->path, durable, 0, 1);
+    }
+  } else if (!strcmp(r->mode, "shared-source-pins"))
     shared_source_pins(r->path);
   else if (!strcmp(r->mode, "shared-source-faults"))
     shared_source_faults(r->path);

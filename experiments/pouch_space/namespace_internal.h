@@ -21,9 +21,16 @@ typedef struct ps_ns_resource {
   int unselected, pooled, repacking, retiring;
   struct ps_ns_resource *next;
 } ps_ns_resource;
+enum ps_namespace_scope {
+  PS_NS_IDLE,
+  PS_NS_OBSERVING,
+  PS_NS_EDIT_PENDING,
+  PS_NS_EDITING
+};
 struct ps_namespace_data {
   ps_namespace *ns;
   pthread_mutex_t mutex;
+  pthread_cond_t scope_changed;
   ps_ns_resource **items, *retired;
   ps_ns_label *labels;
   size_t count, capacity, views;
@@ -35,7 +42,8 @@ struct ps_namespace_data {
   ps_key_checkpoint *checkpoint;
   ps_checkpoint_observer checkpoint_observer;
   ps_coordination_guard *edit;
-  int busy, checkpoint_ready;
+  enum ps_namespace_scope scope;
+  int checkpoint_ready;
   int shared_valid;
   int retention_loaded, retention_present;
   ps_budget *retention_budget;

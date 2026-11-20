@@ -58,7 +58,7 @@ int ps_namespace_conversion_open(ps_namespace *ns, lc_pouch_crypto *crypto,
   rc = ps_ns_data_get(ns, &work->data, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&work->data->mutex);
-    if (work->data->conversion || work->data->busy)
+    if (work->data->conversion || work->data->scope != PS_NS_IDLE)
       rc = lc_error_set(e, LC_ERR_INVALID, 0,
                         "namespace conversion already has an owner", NULL,
                         "pouch_namespace_busy", "pouch");
