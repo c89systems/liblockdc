@@ -2561,34 +2561,55 @@ static void reopen_cohort(void) {
   capture_put(first, 1, 65);
   ok(ps_flush(first, &e), &e);
 
+  ps_readiness_certificate cert = readiness(first);
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1);
+  REQUIRE(!disk.syncs && readiness(first).ready == cert.ready &&
+          readiness(first).durable == cert.durable);
   ps_writer *writer = replay_value(join, key(2), 2, 65, &e);
   ok(ps_publish(writer, &before, &e), &e);
   ps_writer_close(writer);
   ok(ps_close(join, &e), &e);
   join = NULL;
 
-  /* A join through an unacknowledged prefix still fences that prefix. */
-  ps_readiness_certificate cert = readiness(first);
+  /* A failed attempt to stabilize published data cannot assign a range or
+   * certify that data. Successful recovery needs only that one barrier. */
+  cert = readiness(first);
   REQUIRE(cert.ready > cert.durable);
-  disk.syncs = 0;
+  disk = (reopen_disk){0, 1};
+  REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join);
+  lc_error_cleanup(&e);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.durable &&
+          readiness(first).ready == cert.ready &&
+          readiness(first).grant_used == cert.grant_used);
+  disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.ready);
   expect_value(join, key(2), 65, 2);
   ok(ps_close(join, &e), &e);
   join = NULL;
 
-  /* Failing the one-barrier join cannot certify its new incarnation grant. */
+  /* Each reopen burns a private range even if the owner publishes nothing.
+   * Refill needs a durable grant only when the live pool runs out. */
+  cert = readiness(first);
+  for (uint64_t used = cert.grant_used; used < cert.grant_limit;
+       used += TOKEN_RANGE) {
+    disk = (reopen_disk){0};
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+    REQUIRE(!disk.syncs && join->token_next == used + 1 &&
+            join->token_end == used + TOKEN_RANGE);
+    ok(ps_close(join, &e), &e);
+    join = NULL;
+  }
   cert = readiness(first);
   disk = (reopen_disk){0, 1};
   REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join);
   lc_error_cleanup(&e);
   REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.durable &&
-          readiness(first).ready == cert.ready);
+          readiness(first).ready == cert.ready &&
+          readiness(first).grant_limit == cert.grant_limit);
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2);
+  REQUIRE(disk.syncs == 2 && join->token_next > cert.grant_limit);
   ok(ps_close(join, &e), &e);
   join = NULL;
 
@@ -2630,7 +2651,7 @@ static void reopen_cohort(void) {
   lc_error_cleanup(&e);
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2 && !readiness(first).pending);
+  REQUIRE(disk.syncs == 1 && !readiness(first).pending);
   ok(ps_budget_open(first, &plan, &budget, &e), &e);
   ok(ps_budget_close(budget, &e), &e);
   ok(ps_close(first, &e), &e);
@@ -2647,8 +2668,8 @@ static void reopen_cohort(void) {
   REQUIRE(after.incarnation > before.incarnation);
   ps_writer_close(writer);
 
-  /* After a cold open the journal extends a scrubbed suffix until the next
-   * checkpoint. Ready appends alone do not invalidate that proof. */
+  /* Appended data needs one barrier even when the journal has stayed in the
+   * same scrubbed generation since the cold open. */
   cert = readiness(join);
   REQUIRE(cert.ready > cert.durable);
   disk.syncs = 0;
@@ -2661,8 +2682,32 @@ static void reopen_cohort(void) {
   capture_put(first, 4, 65);
   disk.syncs = 0;
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 2);
+  REQUIRE(disk.syncs == 1);
   expect_value(join, key(4), 65, 4);
+  ps_key stream = {88, 115, PS_STREAM};
+  ps_owned_head *head = NULL;
+  ps_owned_status status = {0};
+  int continued;
+  ok(ps_owned_open(first, NULL, stream, 1, NULL, &head, &status, &e), &e);
+  ps_owned_close(head);
+  ok(ps_checkpoint(first, &e), &e);
+  ok(ps_close(first, &e), &e);
+  ok(ps_close(join, &e), &e);
+  ok(ps_open(path, 0, NULL, &first, &e), &e);
+  ok(ps_owned_open(first, NULL, stream, 0, NULL, &head, &status, &e), &e);
+  ok(ps_owned_edit_begin(head, 0, &guard, &status, &continued, &e), &e);
+  REQUIRE(!continued);
+  ok(ps_owned_edit_end(head, guard, LC_OK, &e), &e);
+  /* An ownership-only hint can remain volatile through the join. An explicit
+   * flush on that joiner must still synchronize the observed prefix. */
+  cert = readiness(first);
+  REQUIRE(cert.ready > cert.durable);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(!disk.syncs && readiness(join).durable == cert.durable);
+  ok(ps_flush(join, &e), &e);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.ready);
+  ps_owned_close(head);
   ok(ps_close(first, &e), &e);
   ok(ps_close(join, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
@@ -3112,6 +3157,9 @@ static void projection_tail(void) {
   ok(ps_read_open(a, key(1), NULL, &old, &e), &e);
   ps_entry *original = ps_internal_lookup(a, key(1));
   ok(ps_open(path, 0, &publisher, &b, &e), &e);
+  ps_writer *residue_writer = replay_value(b, key(7), 0, 0, &e);
+  ok(ps_publish(residue_writer, NULL, &e), &e);
+  ps_writer_close(residue_writer);
   REQUIRE(b->journal == sizeof(residue));
   REQUIRE(pread(b->fd, residue, sizeof(residue), PS_JOURNAL_OFFSET) ==
           sizeof(residue));
@@ -3150,7 +3198,7 @@ static void projection_tail(void) {
   REQUIRE(ps_internal_lookup(a, key(1)) == original &&
           !ps_internal_lookup(a, key(2))->deleted);
   REQUIRE(pwrite(b->fd, &last, 1, end) == 1);
-  /* A valid previous-generation grant can only appear at the journal start.
+  /* A valid previous-generation frame can only appear at the journal start.
    * It must never be accepted as the end of an adopted tail. */
   REQUIRE(pwrite(b->fd, residue, sizeof(residue), end + 1) == sizeof(residue));
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING);

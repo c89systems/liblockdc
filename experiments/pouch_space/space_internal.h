@@ -26,6 +26,7 @@ typedef struct ps_catalog_index {
 #define META_HEADER 64U
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
 #define TOKEN_RANGE UINT64_C(4294967296)
+#define TOKEN_POOL (16 * TOKEN_RANGE)
 enum ps_event {
   PS_PUT,
   PS_REMOVE,

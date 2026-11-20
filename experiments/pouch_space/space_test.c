@@ -1034,6 +1034,48 @@ static void incarnation_grants(void) {
        "interrupted opens");
 }
 
+static void shared_pool_power_loss(void) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_options options = {0};
+  ps_space *first = NULL, *second = NULL, *third = NULL;
+  ps_reader *reader = NULL;
+  ps_ref keep, lost[2], next;
+  size_t syncs, writes;
+  options.io = &io;
+  options.shared = 1;
+  options.initial_capacity = PS_MIB;
+  clean();
+  OK(ps_open(path, 1, &options, &first, &error));
+  keep = put(first, state(1), "keep", 4, 1);
+  OK(ps_flush(first, &error));
+  syncs = m.syncs;
+  writes = m.writes;
+  OK(ps_open(path, 0, &options, &second, &error));
+  OK(ps_open(path, 0, &options, &third, &error));
+  CHECK(m.syncs == syncs && m.writes == writes);
+  lost[0] = put(second, state(1), "lost", 4, 1);
+  lost[1] = put(third, state(2), "lost", 4, 1);
+  CHECK(lost[1].incarnation > lost[0].incarnation &&
+        lost[0].incarnation > keep.incarnation && m.syncs == syncs);
+  OK(ps_close(first, &error));
+  OK(ps_close(second, &error));
+  OK(ps_close(third, &error));
+  crash(&m);
+
+  OK(ps_open(path, 0, &options, &first, &error));
+  expect(first, state(1), &keep, "keep", 4);
+  absent(first, state(2));
+  next = put(first, state(2), "next", 4, 1);
+  CHECK(next.incarnation > lost[1].incarnation);
+  BAD(ps_read_open(first, state(2), &lost[1], &reader, &error));
+  CHECK(!reader);
+  OK(ps_close(first, &error));
+  free(m.stable);
+  clean();
+  puts("shared incarnations: pooled joins survive loss of every NoSync write");
+}
+
 /* Recovery must invalidate every rejected byte before reusing journal
  * sequences, while a clean open need only persist its incarnation grant.
  * Fixtures retain valid payloads for a stale event hidden behind a zero gap:
@@ -7544,9 +7586,10 @@ int main(int argc, char **argv) {
       budget_capacity(1);
     } else if (strcmp(argv[2], "commit") == 0)
       commit_coordination();
-    else if (strcmp(argv[2], "reopen-ordering") == 0)
+    else if (strcmp(argv[2], "reopen-ordering") == 0) {
       reopen_cleanup_ordering();
-    else if (strcmp(argv[2], "reopen-sanitize") == 0)
+      shared_pool_power_loss();
+    } else if (strcmp(argv[2], "reopen-sanitize") == 0)
       reopen_sanitization();
     else if (strcmp(argv[2], "reopen") == 0)
       reopen_retirement();

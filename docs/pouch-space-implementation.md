@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and shared indexed visibility through peer changes and reopen | Shared indexed publication under sustained churn and reclamation |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [live cohort admission](#live-cohort-admission-with-one-sync) | Cold admission and sustained-load acceptance remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [pooled incarnation grants](#pooled-incarnation-grants-and-reopen) | Cold admission and sustained-load acceptance remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -8361,3 +8361,63 @@ Explicit flush took 4.14 ms longer in these samples. Queue and indexed reopen
 still used four syncs across the reopened owners and took 8.2–9.3 ms versus
 0.39–0.61 ms for multifile. The raw timings and qualification logs are in
 `build/pouch-space-pressure/`.
+
+## Pooled incarnation grants and reopen
+
+A shared container reserves sixteen owner ranges in its initial checkpoint or
+in one durably selected journal grant. An owner still receives one aligned
+range of 2³² incarnations. Under allocator authority, the cohort's checked
+readiness record advances the assigned endpoint before the handle can spend
+from it. Exiting owners leave their ranges consumed. A cold admission skips
+the entire previously reserved pool, including unused ranges, so a NoSync
+reference can never alias a later object after loss of the volatile record.
+
+A clean live join with an available range adds no journal frame or sync. If
+only namespace or stream owner stamps extend the certified durable prefix,
+the join preserves the older durable boundary. An explicit flush can still
+advance it. Unacknowledged data and structural changes need a barrier before
+the recovered projection is admitted. Cold admission still stabilizes
+retirement before appending and syncing a fresh grant. Pool exhaustion takes
+the same conservative path if the journal end is uncertain.
+
+Durable cleanup can now clear old journal bytes without publishing a later
+frame. A resident owner with an exact root and ready sequence, no pending
+transition, and a zero disk header can update its cached end. An abandoned
+cleanup still fences resident allocation until recovery completes the barrier.
+
+The deterministic fixtures cover zero-write and zero-sync live joins, an
+explicit flush after a stamps-only join, pool exhaustion, failure of the
+refill sync, and process death between suffix cleanup and its barrier.
+The power-loss model drops all NoSync value writes from two pooled owners,
+restores the acknowledged value, and verifies that a replacement incarnation
+exceeds both lost references. Debug, GNU release and musl release passed 8,
+78 and 44 selected groups. The release groups include shared queue and outbox
+recovery and six paced lease/messaging runs at a fixed 10 MiB cap.
+
+All 72 matched GNU samples verified after reopen. Two separately opened
+producers and one consumer or query owner shared the same container. Background
+maintenance was disabled. Values are medians of six samples in milliseconds,
+prior single-file (`16166b68`) / current single-file / multifile.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Reopen syncs | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Queue, 4 KiB NoSync | 30.54 / 28.74 / 129.53 | 11.42 / 11.16 / 32.19 | 0.25 / 0.24 / 0.08 | 9.07 / 5.04 / 0.48 | 4 / 2 / 0 | 0.43 / 0.38 / 0.49 |
+| Queue, 64 KiB durable | 338.81 / 380.60 / 420.18 | 72.15 / 72.46 / 101.75 | 0.30 / 0.32 / 0.16 | 9.62 / 6.37 / 0.51 | 4 / 2 / 0 | 0.54 / 0.48 / 0.69 |
+| Indexed state, 4 KiB NoSync | 93.37 / 92.55 / 235.89 | 9.38 / 8.06 / 33.24 | 0.69 / 0.51 / 0.62 | 10.08 / 5.52 / 0.52 | 4 / 2 / 0 | 1.54 / 3.19 / 2.52 |
+| Outbox, 64 KiB durable | 1015.03 / 1021.50 / 1712.09 | 201.11 / 209.32 / 334.86 | 0.78 / 0.55 / 0.46 | 44.58 / 39.30 / 74.30 | 16 / 14 / 0 | 64.55 / 69.51 / 164.05 |
+
+| Indexed mutation | Explicit index flush | First query pass | Repeated query pass |
+| ---: | ---: | ---: | ---: |
+| 57.67 / 61.29 / 207.26 | 23.18 / 30.43 / 31.31 | 0.38 / 0.34 / 0.90 | 0.18 / 0.17 / 1.82 |
+
+Queue and indexed reopen was 34–45% faster and used two syncs in every
+sample. The higher durable queue work and explicit index flush medians in
+the matrix prompted twelve alternating prior/current pairs for each workload.
+Those controls verified all 48 samples. Durable queue work ran slower on
+the new build in five of twelve pairs, with a median paired difference of
+−1.96 ms. Explicit index flush was slower in three pairs, with a median
+paired difference of −2.98 ms. Indexed per-item p95 was slower in ten pairs
+with a median paired difference of +0.28 ms. Reopen improved in every pair
+for both workloads. Cold queue and indexed reopen remains slower than
+multifile. The raw timings and test logs are in
+`build/pouch-space-cohort-grants/`.

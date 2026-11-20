@@ -2706,31 +2706,30 @@ static int append_event(ps_space *s, ps_entry *p, int event, lc_error *error) {
     rc = append_event_locked(s, p, event, error);
   return allocation_end(s, guard, rc, error);
 }
-/* Reserve incarnation numbers once per open. Returned NoSync references must
- * never alias a later value even if every write since this grant is lost. */
+static int valid_token_grant(uint64_t prior, uint64_t next) {
+  return next > prior &&
+         (next - prior == TOKEN_RANGE || next - prior == TOKEN_POOL);
+}
+/* A cold or depleted cohort reserves a durable pool. Every live assignment
+ * gets a private range and is recorded before the opener can use it. */
 static int grant_tokens(ps_space *s, lc_error *error) {
-  ps_coordination_guard *guard = NULL;
-  ps_entry grant;
-  uint64_t limit;
-  int rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK && guard)
-    rc = allocation_refresh(s, error);
-  if (rc != LC_OK)
-    return allocation_end(s, guard, rc, error);
-  limit = s->token_limit;
-  if (limit > UINT64_MAX - TOKEN_RANGE) {
-    rc = err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
-    return allocation_end(s, guard, rc, error);
-  }
-  memset(&grant, 0, sizeof(grant));
-  grant.token = limit + TOKEN_RANGE;
-  rc = append_event(s, &grant, PS_RESERVE_IDS, error);
+  ps_entry grant = {0};
+  uint64_t limit = s->token_limit;
+  uint64_t count = ps_coordination_shared(s->coordination) &&
+                           limit <= UINT64_MAX - TOKEN_POOL
+                       ? TOKEN_POOL
+                       : TOKEN_RANGE;
+  int rc;
+  if (limit > UINT64_MAX - count)
+    return err(error, LC_ERR_INVALID, "container incarnation ranges exhausted");
+  grant.token = limit + count;
+  rc = append_event_locked(s, &grant, PS_RESERVE_IDS, error);
   if (rc == LC_OK) {
     s->token_next = limit + 1;
     s->token_limit = grant.token;
-    s->token_end = grant.token;
+    s->token_end = limit + TOKEN_RANGE;
   }
-  return allocation_end(s, guard, rc, error);
+  return rc;
 }
 static void destroy(ps_space *s) {
   ps_entry *p;
@@ -2858,6 +2857,7 @@ static int canonical_observe(ps_space *s, lc_error *error) {
 static int canonical_journal(ps_space *s,
                              const ps_readiness_certificate *certificate,
                              int replay, int verify_end, lc_error *error) {
+  static const unsigned char zero[64] = {0};
   unsigned char next[64];
   int rc;
   if (s->generation < certificate->root)
@@ -2875,6 +2875,15 @@ static int canonical_journal(ps_space *s,
       return rc;
     if (!memcmp(next, s->journal_image + s->journal, sizeof(next)))
       break;
+    /* A recovering join can erase old checkpoint residue without advancing
+     * the ready sequence. Only a clean, exact certificate and a zero disk
+     * header authorize replacing that observer's cached end. */
+    if (!certificate->pending && s->generation == certificate->root &&
+        s->sequence == certificate->ready &&
+        !memcmp(next, zero, sizeof(next))) {
+      memset(s->journal_image + s->journal, 0, sizeof(next));
+      break;
+    }
     if (s->readiness && s->sequence >= certificate->ready) {
       ps_readiness_begin(s, PS_READINESS_JOURNAL);
       return err(error, LC_ERR_PENDING,
@@ -2895,9 +2904,9 @@ static int canonical_journal(ps_space *s,
         s->sequence == UINT64_MAX || get64(next + 8) != s->sequence + 1 ||
         get32(next + 16) || get32(next + 20) != PS_RESERVE_IDS ||
         get64(next + 24) || get64(next + 32) ||
-        s->token_limit > UINT64_MAX - TOKEN_RANGE ||
-        get64(next + 40) != s->token_limit + TOKEN_RANGE || get64(next + 48) ||
-        get32(next + 56) || get32(next + 60) != checksum(next, 60) ||
+        !valid_token_grant(s->token_limit, get64(next + 40)) ||
+        get64(next + 48) || get32(next + 56) ||
+        get32(next + 60) != checksum(next, 60) ||
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
       return err(error, LC_ERR_PENDING, "container journal view needs refresh");
     memcpy(s->journal_image + s->journal, next, sizeof(next));
@@ -3557,8 +3566,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   ps_entry *old, *head;
   int rc;
   if (event == PS_RESERVE_IDS) {
-    if (s->token_limit > UINT64_MAX - TOKEN_RANGE ||
-        p->token != s->token_limit + TOKEN_RANGE)
+    if (!valid_token_grant(s->token_limit, p->token))
       return err(error, LC_ERR_PROTOCOL,
                  "invalid incarnation range progression");
     s->token_limit = p->token;
@@ -3655,7 +3663,8 @@ static int recover(ps_space *s, lc_error *error) {
   ps_entry *p = NULL;
   struct stat st;
   size_t cursor = 0, bytes, i, first, last;
-  int a, b, event, rc, retire_sibling, retirement_needed;
+  int a, b, event, rc, retire_sibling, retirement_needed, range_available;
+  int pending_data = 0;
   rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
   if (rc == LC_OK)
     rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
@@ -3722,6 +3731,13 @@ static int recover(ps_space *s, lc_error *error) {
     bytes = get32(wire + cursor + 4);
     if (bytes < 64 || bytes > PS_JOURNAL - cursor)
       break;
+    /* Stamp hints carry live ownership, with no data or tail visibility.
+     * Any later data, grant or stream boundary keeps the admission barrier. */
+    event = get32(wire + cursor + 20);
+    if (s->sequence >= certificate.durable &&
+        (get32(wire + cursor) == REVISION_MAGIC ||
+         (event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER)))
+      pending_data = 1;
     if (get32(wire + cursor) == REVISION_MAGIC) {
       rc = recover_revision(s, wire + cursor, bytes, buffer, error);
       if (rc == LC_ERR_NOMEM || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
@@ -3822,19 +3838,23 @@ static int recover(ps_space *s, lc_error *error) {
   rc = metadata_claim_initial(s, error);
   if (rc != LC_OK)
     goto done;
-  /* A live certificate for this exact ready prefix and no pending change
-   * precludes an interrupted append. A durable prefix has a stable end.
-   * Otherwise a checkpoint strictly before the cohort origin proves this
-   * journal has only extended the suffix scrubbed by the first cold open.
-   * A checkpoint in the cohort can reuse that region and void the proof.
-   * Cold or uncertain recovery stabilizes retirement before reusing seqs. */
+  range_available = certificate.grant_limit == s->token_limit &&
+                    certificate.grant_used < certificate.grant_limit;
+  /* A live join can leave the selected prefix untouched and spend an already
+   * durable range. It still stabilizes any unacknowledged data before using
+   * the recovered projection, which does not preserve prior visibility.
+   * When appending a new grant, require a stable end or a journal that has
+   * only extended the suffix scrubbed at the beginning of this cohort. */
+  s->peer_durable = certificate.durable;
   if (retirement_needed || certificate.pending ||
       certificate.root != s->generation || certificate.ready != s->sequence ||
-      (certificate.durable != s->sequence &&
+      (range_available && pending_data) ||
+      (certificate.durable != s->sequence && !range_available &&
        get64(root + 24) >= certificate.origin)) {
     rc = sync_file(s, error);
     if (rc != LC_OK)
       goto done;
+    s->peer_durable = s->sequence;
     ps_readiness_finish(s, PS_READINESS_RECOVERY);
   }
   __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
@@ -3842,9 +3862,16 @@ static int recover(ps_space *s, lc_error *error) {
     s->journal_image = wire;
     wire = NULL;
   }
-  rc = grant_tokens(s, error);
-  if (rc == LC_OK)
-    rc = sync_file(s, error); /* accepted tail, retired sibling and grant */
+  if (range_available) {
+    s->token_next = certificate.grant_used + 1;
+    s->token_end = certificate.grant_used + TOKEN_RANGE;
+  } else {
+    rc = grant_tokens(s, error);
+    if (rc == LC_OK)
+      rc = sync_file(s, error);
+    if (rc == LC_OK)
+      s->peer_durable = s->sequence;
+  }
 done:
   lc_free_with_allocator(NULL, buffer);
   lc_free_with_allocator(NULL, wire);
@@ -4552,7 +4579,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     if (rc == LC_OK)
       rc = random_bytes(s->identity, 16, error);
     s->token_next = 1;
-    s->token_limit = TOKEN_RANGE;
+    s->token_limit = opening ? TOKEN_POOL : TOKEN_RANGE;
     s->token_end = TOKEN_RANGE;
     if (rc == LC_OK)
       rc = initial_free(s, error);
@@ -4583,7 +4610,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
-  mark_durable(s, __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE));
+  mark_durable(s, s->peer_durable);
   *out = s;
   return LC_OK;
 }

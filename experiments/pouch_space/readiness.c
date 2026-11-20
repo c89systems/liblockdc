@@ -8,7 +8,7 @@
 
 /* Live participants must all announce disk changes before writing. The
  * previous volatile protocol is safe to discard only on cold admission. */
-#define READY_MAGIC UINT64_C(0x3259444145525350)
+#define READY_MAGIC UINT64_C(0x3359444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
@@ -23,6 +23,8 @@ enum readiness_word {
   DURABLE,
   ROOT,
   ORIGIN,
+  GRANT_USED,
+  GRANT_LIMIT,
   CRC
 };
 /* Each slot has an atomic commit generation followed by a checked record.
@@ -52,7 +54,11 @@ static int slot_read(const uint64_t *source, uint64_t *record) {
     record[i] = __atomic_load_n(source + i, __ATOMIC_RELAXED);
   if (__atomic_load_n(source, __ATOMIC_ACQUIRE) != generation ||
       record[MAGIC] != READY_MAGIC || record[DURABLE] > record[READY] ||
-      record[ORIGIN] > record[DURABLE] || record[CRC] != record_crc(record))
+      record[ORIGIN] > record[DURABLE] || !record[GRANT_USED] ||
+      record[GRANT_USED] % TOKEN_RANGE || record[GRANT_LIMIT] % TOKEN_RANGE ||
+      record[GRANT_USED] > record[GRANT_LIMIT] ||
+      record[GRANT_LIMIT] - record[GRANT_USED] >= TOKEN_POOL ||
+      record[CRC] != record_crc(record))
     return -1;
   return 1;
 }
@@ -137,7 +143,8 @@ int ps_readiness_validate(ps_space *s, lc_error *e) {
   if (rc == LC_OK)
     rc = identity(s, record, e);
   if (rc == LC_OK &&
-      (record[READY] > s->sequence || record[ROOT] > s->generation))
+      (record[READY] > s->sequence || record[ROOT] > s->generation ||
+       record[GRANT_LIMIT] > s->token_limit))
     rc = failed(s, e, "recovery would discard a live certified prefix");
   return rc;
 }
@@ -154,7 +161,8 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     rc = identity(s, record, e);
     if (rc != LC_OK)
       return rc;
-    if (record[READY] > s->sequence || record[ROOT] > s->generation)
+    if (record[READY] > s->sequence || record[ROOT] > s->generation ||
+        record[DURABLE] > s->peer_durable || record[GRANT_USED] >= s->token_end)
       return failed(s, e, "recovery regressed shared readiness");
   } else {
     __atomic_store_n(s->readiness->page, 0, __ATOMIC_RELEASE);
@@ -166,8 +174,13 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   }
   record[MAGIC] = READY_MAGIC;
   memcpy(record + IDENTITY, s->identity, 16);
-  record[READY] = record[DURABLE] = s->sequence;
+  record[READY] = s->sequence;
+  record[DURABLE] = s->peer_durable;
   record[ROOT] = s->generation;
+  /* Publish assignment before the owner releases allocation authority. Death
+   * after this point permanently consumes the owner's range in this cohort. */
+  record[GRANT_USED] = s->token_end;
+  record[GRANT_LIMIT] = s->token_limit;
   rc = select_record(s, record, selected, e);
   if (rc == LC_OK) {
     s->readiness->active = 1;
@@ -196,6 +209,8 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->durable = record[DURABLE];
     out->root = record[ROOT];
     out->origin = record[ORIGIN];
+    out->grant_used = record[GRANT_USED];
+    out->grant_limit = record[GRANT_LIMIT];
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
         ~PRESSURE_BIT;

@@ -2,7 +2,7 @@
 #define POUCH_SPACE_READINESS_H
 #include "space.h"
 typedef struct ps_readiness ps_readiness;
-#define PS_READINESS_WORDS 9U
+#define PS_READINESS_WORDS 11U
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
   PS_READINESS_JOURNAL = 2,
@@ -10,6 +10,7 @@ enum ps_readiness_change {
 };
 typedef struct ps_readiness_certificate {
   uint64_t ready, durable, root, origin, pending;
+  uint64_t grant_used, grant_limit;
 } ps_readiness_certificate;
 /* All access is under container allocation authority. Membership is an OFD
  * read witness at byte 3, separate from physical-reader presence at byte 2.
