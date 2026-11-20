@@ -9428,3 +9428,61 @@ spent 6.5–7.0 ms recovering namespaces. Close latency, repeated namespace
 recovery and NoSync write tails remain qualification work. Raw attempts
 and instrumentation are under `extent-preparation-` and
 `pressure-checkpoint-` in `build/pouch-space-concurrent/`.
+
+## Reading stream headers during admission
+
+Initial stream recovery reads a raw run's identity and adjacent piece
+footer together while it holds stream edit authority. The allocator still
+pins the exact mapping and validates its identity. Stream recovery uses the
+captured footer for the initial validation pass, including a sealed partial
+piece, then releases it before canonical recovery or repair. Namespace
+admission still restores selected deletion reserves and funds outstanding
+checkpoint work from the canonical suffix.
+
+The live-owner fixture observes one 96-byte read per raw run in both
+durability modes. It verifies bytes from the sealed partial run, then
+independently damages its identity and footer and verifies that each open
+fails. Restoring the bytes permits another open. Debug passed 12 focused
+checks. GNU Release passed 33 and musl Release passed 30, including stream
+repair, handoff, checkpoint obligations, shared indexed queries, retention
+and concurrent lease and messaging capacity.
+
+All 39 matched GNU runs verified. The tables report medians in milliseconds
+in the order prior native (`4381e8fe`), current native and multifile.
+Each build ran four NoSync indexed samples and three of each other
+workload. Both native builds used fixed 10 MiB containers. The queue
+workload starts with warmed queues. Reopen measures a cold open followed
+by each live join, with payload verification measured separately.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 1616.71 / 1710.00 / 1600.77 | 74.90 / 94.64 / 39.36 | 6.95 / 3.45 / 1.05 | 27.06 / 24.13 / 1.23 | 10.25 / 7.52 / 7.80 |
+| Two writers, durable indexed, 15 MiB | 7291.13 / 6528.99 / 5703.84 | 98.01 / 90.12 / 70.17 | 7.52 / 1.81 / 1.06 | 21.18 / 14.70 / 0.71 | 8.51 / 7.45 / 8.08 |
+| Two writers, NoSync queue | 9.96 / 11.58 / 104.26 | 1.90 / 2.22 / 20.51 | 0.28 / 0.30 / 0.09 | 3.38 / 3.70 / 0.40 | 0.31 / 0.43 / 0.55 |
+| Two writers, durable outbox | 1104.90 / 1004.45 / 1462.74 | 210.64 / 184.99 / 269.44 | 0.65 / 0.58 / 0.27 | 41.01 / 36.16 / 69.90 | 77.80 / 67.45 / 143.83 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 241.56 / 277.33 / 362.50 | 99.28 / 123.00 / 298.27 | 54.22 / 19.45 / 265.06 |
+| Two writers, durable indexed, 15 MiB | 144.85 / 145.19 / 214.93 | 28.45 / 18.36 / 227.09 | 12.99 / 24.88 / 262.62 |
+
+Two instrumented samples of each indexed workload per native build also
+verified. Reads per open fell from 1093–1182 to 838–860 in NoSync and from
+794–848 to 634–663 in durable mode. The concurrent runs produced different
+selected layouts and read byte totals. Durable grouped reopen in this
+small instrumented sample ranged from 14.8–17.8 ms on the prior build
+and 18.0–19.8 ms on the current build. The deterministic fixture establishes
+the read saving. The reopen timing across runs does not isolate its effect.
+Raw comparison, phase and release test logs are under `stream-footer-`
+in `build/pouch-space-concurrent/`.
+
+The remaining admission cost follows the amount of selected namespace
+state. Changing that dependency requires container-level recovery of the
+standing deletion reserve and outstanding checkpoint capacity. Both
+obligations must track the selected canonical revision across peer close
+and process death. That would let a joining owner recover capacity before
+loading derived state for the namespaces it actually uses. A qualification
+case must exercise a namespace the joining owner has never touched, close
+or kill its last writer, fill ordinary capacity from another namespace,
+then prove that maintenance completes and the committed values survive
+cold reopen.

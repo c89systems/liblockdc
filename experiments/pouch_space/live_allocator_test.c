@@ -4416,6 +4416,104 @@ static void append_byte(ps_stream *s, uint64_t start, const char *body,
   ok(ps_stream_commit(writer, PS_COMMIT_DEFAULT, NULL, NULL, e), e);
   ps_stream_writer_close(writer);
 }
+typedef struct header_probe {
+  off_t offsets[16];
+  size_t count, combined, identities, footers;
+  int armed;
+} header_probe;
+static ssize_t header_read(void *context, int fd, void *out, size_t n,
+                           off_t at) {
+  header_probe *probe = context;
+  if (probe->armed)
+    for (size_t i = 0; i < probe->count; ++i) {
+      if (at == probe->offsets[i] && n == PS_RUN_HEADER)
+        ++probe->combined;
+      if (at == probe->offsets[i] && n == PS_RUN_IDENTITY_BYTES)
+        ++probe->identities;
+      if (at == probe->offsets[i] + PS_RUN_IDENTITY_BYTES)
+        ++probe->footers;
+    }
+  return pread(fd, out, n, at);
+}
+static void stream_header_capture(int durable) {
+  lc_error e = {0};
+  header_probe probe = {0};
+  ps_io io = {&probe, header_read, durable_write, sync_io, reserve_io, NULL};
+  ps_options options = {0};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_stream *stream = NULL;
+  ps_stream_writer *append = NULL;
+  ps_stream_window *view = NULL;
+  ps_stream_info info;
+  stream_recovery recovery = {0};
+  char *body = malloc(PS_CHUNK);
+  char last;
+  off_t partial = 0;
+  REQUIRE(body);
+  memset(body, 'a', PS_CHUNK);
+  options.durable_sync = durable;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_stream_open(writer, NULL, tail_stream(), 1, NULL, recover_stream,
+                    &recovery, &stream, &e),
+     &e);
+  ok(ps_stream_begin(stream, &append, &e), &e);
+  ok(ps_stream_write(append, body, PS_CHUNK, &e), &e);
+  ok(ps_stream_write(append, body, PS_CHUNK, &e), &e);
+  ok(ps_stream_commit(append, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_stream_writer_close(append);
+  ok(ps_stream_seal(stream, &e), &e);
+  ok(ps_stream_status(stream, &info, &e), &e);
+  for (ps_entry *p = writer->entries; p; p = p->all_next)
+    if (p->state == 1 && !p->deleted && p->key.kind == PS_OWNED_RUN &&
+        p->key.owner == info.ref.incarnation) {
+      REQUIRE(!p->owned_mapped && p->count == 1 &&
+              probe.count < sizeof(probe.offsets) / sizeof(probe.offsets[0]));
+      probe.offsets[probe.count++] = (off_t)p->extents[0].offset;
+      if (p->key.key < info.tail && p->stream_capacity > info.tail - p->key.key)
+        partial = (off_t)p->extents[0].offset;
+    }
+  REQUIRE(probe.count == info.runs && probe.count > 1 && partial);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_checkpoint(writer, &e), &e);
+
+  options.io = &io;
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  probe.armed = 1;
+  ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                    &stream, &e),
+     &e);
+  REQUIRE(probe.combined == probe.count && !probe.identities && !probe.footers);
+  probe.armed = 0;
+  ok(ps_stream_window_open(stream, 2 * PS_CHUNK - 1, 1, &view, &e), &e);
+  ok(ps_stream_window_read(view, 2 * PS_CHUNK - 1, &last, 1, &e), &e);
+  REQUIRE(last == 'a');
+  ps_stream_window_close(view);
+  ok(ps_stream_close(stream, &e), &e);
+
+  /* Both checks still apply to a live join, including the sealed partial run.
+   */
+  for (size_t i = 0; i < 2; ++i) {
+    off_t at = partial + (i ? PS_RUN_IDENTITY_BYTES : 0);
+    unsigned char original, damaged;
+    REQUIRE(pread(writer->fd, &original, 1, at) == 1);
+    damaged = original ^ 1;
+    REQUIRE(pwrite(writer->fd, &damaged, 1, at) == 1);
+    REQUIRE(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                           &stream, &e) == LC_ERR_PROTOCOL &&
+            !stream);
+    lc_error_cleanup(&e);
+    REQUIRE(pwrite(writer->fd, &original, 1, at) == 1);
+  }
+  ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                    &stream, &e),
+     &e);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  free(body);
+  lc_error_cleanup(&e);
+}
 static void *finish_stream_append(void *context) {
   lc_error e = {0};
   ps_stream_writer *w = context;
@@ -5195,6 +5293,9 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "prepared-grants")) {
     prepared_grants();
     prepared_grant_fault();
+  } else if (!strcmp(argv[2], "stream-header-capture")) {
+    stream_header_capture(0);
+    stream_header_capture(1);
   } else if (!strcmp(argv[2], "stream-handoff")) {
     stream_handoff(0);
     stream_handoff(1);

@@ -95,17 +95,17 @@ static size_t mapping_lower(const stream_run *runs, size_t count,
   return lo;
 }
 static int stream_mapping_next(ps_stream *s, uint64_t offset, stream_run *out,
-                               int *found) {
-  size_t at;
+                               size_t *at) {
+  int found;
   pthread_mutex_lock(&s->mutex);
-  at = mapping_lower(s->runs, s->count, offset);
-  *found = at < s->count;
-  if (*found) {
-    *out = s->runs[at];
+  *at = mapping_lower(s->runs, s->count, offset);
+  found = *at < s->count;
+  if (found) {
+    *out = s->runs[*at];
     ps_owned_run_retain(out->handle);
   }
   pthread_mutex_unlock(&s->mutex);
-  return LC_OK;
+  return found;
 }
 static int stream_mapping(ps_stream *s, uint64_t offset, stream_run *out,
                           lc_error *error) {
@@ -150,13 +150,15 @@ static int stream_io(ps_stream *s, uint64_t offset, void *bytes, size_t n,
  * or a whole-source scan. The scratch buffer is reused after body input.
  */
 static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
-                         void *scratch, int *repaired, lc_error *error) {
+                         const ps_owned_footer *footers, void *scratch,
+                         int *repaired, lc_error *error) {
   stream_run run = {0};
   uint64_t bytes, end, prior;
+  size_t at;
   ps_piece_checksum checksum, rebuilt = {0};
   int rc, found;
   while (s->checked < tail) {
-    (void)stream_mapping_next(s, s->checked, &run, &found);
+    found = stream_mapping_next(s, s->checked, &run, &at);
     if (!found || run.base >= tail) {
       if (found)
         ps_owned_run_close(run.handle);
@@ -175,10 +177,14 @@ static int stream_pieces(ps_stream *s, uint64_t tail, int inspect, int partial,
     }
     bytes = end > tail ? tail - run.base : run.capacity;
     prior = s->checked - run.base;
-    rc = inspect ? ps_owned_piece_inspect(run.handle, bytes, &checksum, error)
-                 : ps_owned_piece_extend(run.handle, prior,
-                                         prior ? &s->checksum : NULL, bytes,
-                                         scratch, &checksum, error);
+    if (inspect)
+      rc = footers
+               ? ps_owned_piece_inspect_initial(run.handle, bytes, &footers[at],
+                                                &checksum, error)
+               : ps_owned_piece_inspect(run.handle, bytes, &checksum, error);
+    else
+      rc = ps_owned_piece_extend(run.handle, prior, prior ? &s->checksum : NULL,
+                                 bytes, scratch, &checksum, error);
     if (inspect == 2 && rc == LC_ERR_PROTOCOL) {
       /* Only the canonical recovery callback can authorize this repair.
        * Fully covered pieces were already inspected in strict mode. A valid
@@ -204,7 +210,7 @@ int ps_stream_recovery_cover(ps_stream *s, uint64_t covered, lc_error *error) {
                         "piece coverage requires canonical recovery");
   if (s->recovery_floor < covered)
     s->recovery_floor = covered;
-  return stream_pieces(s, covered, 1, 0, NULL, NULL, error);
+  return stream_pieces(s, covered, 1, 0, NULL, NULL, NULL, error);
 }
 static int clear_suffix(ps_stream *s, uint64_t offset, unsigned char *zero,
                         lc_error *error) {
@@ -240,13 +246,15 @@ static void stream_destroy(ps_stream *s) {
  * later grants are needed for an append. Full capture remains the recovery
  * and maintenance path. */
 static int capture_mappings(ps_stream *s, enum stream_mappings mappings,
-                            lc_error *error) {
+                            ps_owned_footer **footers, lc_error *error) {
   ps_owned_run **captured = NULL;
   stream_run *runs = NULL;
   size_t i, count = 0;
   int rc = LC_OK;
   if (mappings == STREAM_FULL)
-    rc = ps_owned_runs_capture(s->head, &captured, &count, error);
+    rc = footers ? ps_owned_runs_capture_initial(s->head, &captured, &count,
+                                                 footers, error)
+                 : ps_owned_runs_capture(s->head, &captured, &count, error);
   else if (s->checked < s->capacity)
     rc = ps_owned_runs_edit_range(s->head, s->checked, s->capacity, &captured,
                                   &count, error);
@@ -277,29 +285,37 @@ static int capture_mappings(ps_stream *s, enum stream_mappings mappings,
 static int stream_load(ps_stream *s, const ps_owned_status *status,
                        ps_stream_recover_fn recover, void *context,
                        lc_error *error) {
+  ps_owned_footer *footers = NULL;
   uint64_t accepted;
-  int rc, repaired = 0;
+  int rc, repaired = 0, recover_tail = 0;
   s->ref = status->ref;
   s->tail = s->recovery_floor = status->tail;
   s->sealed = status->sealed;
   s->edit_wire = status->edit_wire;
-  rc = capture_mappings(s, STREAM_FULL, error);
+  rc = capture_mappings(s, STREAM_FULL, &footers, error);
   if (rc == LC_OK)
     s->capacity = status->capacity;
   if (rc == LC_OK)
-    rc = stream_pieces(s, s->tail, 1, s->sealed, NULL, NULL, error);
-  if (rc != LC_OK || !s->capacity || s->sealed)
-    return rc;
-  if (!recover)
-    return stream_error(error, LC_ERR_INVALID,
+    rc = stream_pieces(s, s->tail, 1, s->sealed, footers, NULL, NULL, error);
+  if (rc == LC_OK && s->capacity && !s->sealed) {
+    if (!recover)
+      rc = stream_error(error, LC_ERR_INVALID,
                         "existing stream requires canonical recovery");
-  if (status->complete) {
-    rc = stream_pieces(s, s->tail, 1, 1, NULL, NULL, error);
-    if (rc != LC_ERR_PROTOCOL)
-      return rc;
-    /* Canonical validation can still rebuild an uncovered partial footer. */
-    lc_error_cleanup(error);
+    else if (!status->complete)
+      recover_tail = 1;
+    else {
+      rc = stream_pieces(s, s->tail, 1, 1, footers, NULL, NULL, error);
+      if (rc == LC_ERR_PROTOCOL) {
+        /* Canonical validation can rebuild an uncovered partial footer. */
+        lc_error_cleanup(error);
+        rc = LC_OK;
+        recover_tail = 1;
+      }
+    }
   }
+  lc_free_with_allocator(NULL, footers);
+  if (!recover_tail)
+    return rc;
   s->recovery_buffer = lc_alloc_with_allocator(NULL, PS_CHUNK);
   if (!s->recovery_buffer)
     return stream_error(error, LC_ERR_NOMEM,
@@ -312,7 +328,8 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
     rc = stream_error(error, LC_ERR_PROTOCOL,
                       "canonical recovery returned invalid tail");
   if (rc == LC_OK)
-    rc = stream_pieces(s, accepted, 2, 1, s->recovery_buffer, &repaired, error);
+    rc = stream_pieces(s, accepted, 2, 1, NULL, s->recovery_buffer, &repaired,
+                       error);
   /* Readers need only the validated prefix. Newly accepted bytes and repaired
    * footers join readiness, even if the canonical tail stayed put. Rejected
    * suffix repair waits for the first write admission. */
@@ -395,7 +412,8 @@ static int stream_refresh_edit(ps_stream *s, const ps_owned_status *status,
        s->edit_wire == status->edit_wire)) {
     if (s->mappings == STREAM_PARKED ||
         (!append && s->mappings == STREAM_SUFFIX))
-      rc = capture_mappings(s, append ? STREAM_SUFFIX : STREAM_FULL, error);
+      rc = capture_mappings(s, append ? STREAM_SUFFIX : STREAM_FULL, NULL,
+                            error);
     pthread_mutex_unlock(&s->mutex);
     return rc;
   }
@@ -448,7 +466,7 @@ int ps_stream_pin_mappings(ps_stream *s, lc_error *error) {
   int rc = LC_OK;
   pthread_mutex_lock(&s->mutex);
   if (s->mappings != STREAM_FULL)
-    rc = capture_mappings(s, STREAM_FULL, error);
+    rc = capture_mappings(s, STREAM_FULL, NULL, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
@@ -953,8 +971,8 @@ int ps_stream_commit(ps_stream_writer *w, enum ps_commit_mode mode,
     return stream_error(error, LC_ERR_INVALID, "invalid canonical commit mode");
   rc = stream_flush(w, error);
   if (rc == LC_OK)
-    rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, w->buffer, NULL,
-                       error);
+    rc = stream_pieces(w->stream, w->start + w->bytes, 0, 1, NULL, w->buffer,
+                       NULL, error);
   if (rc == LC_OK)
     rc = ps_owned_commit_canonical(w->stream->head, w->start + w->bytes, mode,
                                    publish, context, error);

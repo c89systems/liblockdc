@@ -19,6 +19,9 @@
 #define PS_OWNED_DESCRIPTOR_BYTES 104U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;
+typedef struct ps_owned_footer {
+  unsigned char bytes[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
+} ps_owned_footer;
 typedef struct ps_owned_status {
   ps_ref ref;
   uint64_t tail, capacity, runs;
@@ -92,6 +95,11 @@ void ps_owned_run_retain(ps_owned_run *);
  * entries or read buffers. */
 int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
                           lc_error *);
+/* Read raw identities and adjacent footers together for stream initialization.
+ * The caller holds stream edit authority through the inspection and frees the
+ * parallel footer array before repair or release of that authority. */
+int ps_owned_runs_capture_initial(ps_owned_head *, ps_owned_run ***, size_t *,
+                                  ps_owned_footer **, lc_error *);
 int ps_owned_runs_capture_status(ps_owned_head *, ps_owned_status *,
                                  ps_owned_run ***, size_t *, lc_error *);
 int ps_owned_runs_key_status(ps_space *, ps_key, const ps_ref *,
@@ -155,6 +163,9 @@ int ps_owned_piece_extend(ps_owned_run *, uint64_t prior_bytes,
 /* Checksum state output is optional. */
 int ps_owned_piece_inspect(ps_owned_run *, uint64_t bytes, ps_piece_checksum *,
                            lc_error *);
+int ps_owned_piece_inspect_initial(ps_owned_run *, uint64_t bytes,
+                                   const ps_owned_footer *, ps_piece_checksum *,
+                                   lc_error *);
 int ps_owned_piece_verify(ps_owned_run *, uint64_t bytes, void *scratch,
                           lc_error *);
 /* Clear an owned unpublished suffix, preserving reservation and bytes outside

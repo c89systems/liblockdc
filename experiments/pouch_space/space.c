@@ -1720,6 +1720,17 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
   lc_free_with_allocator(NULL, table);
   return rc;
 }
+static int validate_owned_identity(ps_space *s, ps_entry *p,
+                                   const unsigned char *header,
+                                   lc_error *error) {
+  if (checksum(header, PS_RUN_IDENTITY_BYTES) != p->extents[0].crc ||
+      get64(header) != OWNED_MAGIC || get64(header + 8) != p->token ||
+      get64(header + 16) != p->key.owner || get64(header + 24) != p->key.key ||
+      get64(header + 32) != p->extents[0].offset ||
+      get64(header + 40) != p->bytes || memcmp(header + 48, s->identity, 16))
+    return err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
+  return LC_OK;
+}
 static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
                         lc_error *error) {
   int rc;
@@ -1727,14 +1738,7 @@ static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
     return owned_map_load(s, p, error);
   rc = transfer(s, header, PS_RUN_IDENTITY_BYTES, p->extents[0].offset, 0,
                 error);
-  if (rc == LC_OK &&
-      (checksum(header, PS_RUN_IDENTITY_BYTES) != p->extents[0].crc ||
-       get64(header) != OWNED_MAGIC || get64(header + 8) != p->token ||
-       get64(header + 16) != p->key.owner || get64(header + 24) != p->key.key ||
-       get64(header + 32) != p->extents[0].offset ||
-       get64(header + 40) != p->bytes || memcmp(header + 48, s->identity, 16)))
-    rc = err(error, LC_ERR_PROTOCOL, "owned run identity header mismatch");
-  return rc;
+  return rc == LC_OK ? validate_owned_identity(s, p, header, error) : rc;
 }
 /* The caller retains the captured cells for the whole read pass. Unrelated
  * cells in this buffer confer no authority and are never exposed. */
@@ -6939,16 +6943,20 @@ uint64_t ps_owned_run_base(const ps_owned_run *run) {
 static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                         const ps_ref *ref, uint64_t start, uint64_t end,
                         ps_owned_status *status, ps_owned_run ***out,
-                        size_t *count, lc_error *error) {
+                        size_t *count, ps_owned_footer **footers,
+                        lc_error *error) {
   ps_coordination_guard *guard;
   ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_run **items = NULL;
+  ps_owned_footer *captured = NULL;
   size_t n = 0, capacity = 0, i;
   int rc;
   if (out)
     *out = NULL;
   if (count)
     *count = 0;
+  if (footers)
+    *footers = NULL;
   if (!s || !out || !count ||
       (!head && (!ref || key.kind != PS_STREAM || (!status && start >= end))))
     return err(error, LC_ERR_INVALID,
@@ -6998,7 +7006,9 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   }
   if (rc == LC_OK && capacity) {
     items = lc_calloc_with_allocator(NULL, capacity, sizeof(*items));
-    if (!items)
+    if (items && footers && capacity <= SIZE_MAX / sizeof(*captured))
+      captured = lc_alloc_with_allocator(NULL, capacity * sizeof(*captured));
+    if (!items || (footers && !captured))
       rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
   }
   for (p = first; rc == LC_OK && p != limit; p = p->owned_next) {
@@ -7027,16 +7037,28 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   for (i = 0; rc == LC_OK && i < n; ++i) {
-    unsigned char header[PS_RUN_IDENTITY_BYTES];
-    rc = verify_owned(s, items[i]->entry, header, error);
+    unsigned char header[PS_RUN_HEADER];
+    p = items[i]->entry;
+    if (captured && !p->owned_mapped) {
+      rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
+      if (rc == LC_OK)
+        rc = validate_owned_identity(s, p, header, error);
+      if (rc == LC_OK)
+        memcpy(captured[i].bytes, header + PS_RUN_IDENTITY_BYTES,
+               sizeof(captured[i].bytes));
+    } else
+      rc = verify_owned(s, p, header, error);
   }
   if (rc == LC_OK) {
     *out = items;
     *count = n;
+    if (footers)
+      *footers = captured;
   } else {
     for (i = 0; i < n; ++i)
       ps_owned_run_close(items[i]);
     lc_free_with_allocator(NULL, items);
+    lc_free_with_allocator(NULL, captured);
   }
   return rc;
 }
@@ -7049,24 +7071,32 @@ int ps_owned_runs_capture_status(ps_owned_head *head, ps_owned_status *status,
                                  lc_error *error) {
   const ps_key none = {0};
   return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
-                      none, NULL, 0, 0, status, out, count, error);
+                      none, NULL, 0, 0, status, out, count, NULL, error);
+}
+int ps_owned_runs_capture_initial(ps_owned_head *head, ps_owned_run ***out,
+                                  size_t *count, ps_owned_footer **footers,
+                                  lc_error *error) {
+  const ps_key none = {0};
+  return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
+                      none, NULL, 0, 0, NULL, out, count, footers, error);
 }
 int ps_owned_runs_key_status(ps_space *s, ps_key key, const ps_ref *ref,
                              ps_owned_status *status, ps_owned_run ***out,
                              size_t *count, lc_error *error) {
-  return capture_runs(s, NULL, key, ref, 0, 0, status, out, count, error);
+  return capture_runs(s, NULL, key, ref, 0, 0, status, out, count, NULL, error);
 }
 int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
                         uint64_t start, uint64_t end, ps_owned_run ***out,
                         size_t *count, lc_error *error) {
-  return capture_runs(s, NULL, key, ref, start, end, NULL, out, count, error);
+  return capture_runs(s, NULL, key, ref, start, end, NULL, out, count, NULL,
+                      error);
 }
 int ps_owned_runs_edit_range(ps_owned_head *head, uint64_t start, uint64_t end,
                              ps_owned_run ***out, size_t *count,
                              lc_error *error) {
   const ps_key none = {0};
   return capture_runs(head->space, head->entry, none, NULL, start, end, NULL,
-                      out, count, error);
+                      out, count, NULL, error);
 }
 int ps_owned_run_mapped(const ps_owned_run *run) {
   return run && run->entry->owned_mapped;
@@ -7165,7 +7195,7 @@ int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
 static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                        int operation, uint64_t prior,
                        const ps_piece_checksum *prefix, ps_piece_checksum *out,
-                       lc_error *error) {
+                       const ps_owned_footer *captured, lc_error *error) {
   unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
   ps_space *s;
   uint64_t offset;
@@ -7217,9 +7247,13 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     }
     return rc;
   }
-  if (rc == LC_OK)
-    rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES, 0,
-                  error);
+  if (rc == LC_OK) {
+    if (captured)
+      memcpy(footer, captured->bytes, sizeof(footer));
+    else
+      rc = transfer(s, footer, sizeof(footer), offset + PS_RUN_IDENTITY_BYTES,
+                    0, error);
+  }
   if (rc == LC_OK && (memcmp(footer, "LCPSPIEC", 8) ||
                       (get64(footer + 8) & ~reconstructed) != bytes ||
                       get64(footer + 20) != run->entry->token ||
@@ -7246,15 +7280,20 @@ int ps_owned_piece_extend(ps_owned_run *run, uint64_t prior,
                           lc_error *error) {
   if (!out)
     return err(error, LC_ERR_INVALID, "piece extension requires CRC output");
-  return owned_piece(run, bytes, scratch, 2, prior, prefix, out, error);
+  return owned_piece(run, bytes, scratch, 2, prior, prefix, out, NULL, error);
 }
 int ps_owned_piece_inspect(ps_owned_run *run, uint64_t bytes,
                            ps_piece_checksum *out, lc_error *error) {
-  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, error);
+  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, NULL, error);
+}
+int ps_owned_piece_inspect_initial(ps_owned_run *run, uint64_t bytes,
+                                   const ps_owned_footer *captured,
+                                   ps_piece_checksum *out, lc_error *error) {
+  return owned_piece(run, bytes, NULL, 0, 0, NULL, out, captured, error);
 }
 int ps_owned_piece_verify(ps_owned_run *run, uint64_t bytes, void *scratch,
                           lc_error *error) {
-  return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, error);
+  return owned_piece(run, bytes, scratch, 1, 0, NULL, NULL, NULL, error);
 }
 typedef struct piece_selection {
   ps_owned_head *head;
