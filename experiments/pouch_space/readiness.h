@@ -17,6 +17,7 @@ typedef struct ps_readiness_certificate {
  * Certificates are volatile cohort state, not replay authority after reopen.
  */
 int ps_readiness_attach(ps_space *, lc_error *);
+int ps_readiness_joined(const ps_space *);
 void ps_readiness_close(ps_space *);
 int ps_readiness_validate(ps_space *, lc_error *);
 int ps_readiness_opened(ps_space *, lc_error *);

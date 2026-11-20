@@ -135,6 +135,9 @@ void ps_readiness_close(ps_space *s) {
     lc_free_with_allocator(NULL, s->readiness);
   }
 }
+int ps_readiness_joined(const ps_space *s) {
+  return s->readiness && s->readiness->existing;
+}
 int ps_readiness_validate(ps_space *s, lc_error *e) {
   uint64_t record[WORDS];
   int selected, rc;

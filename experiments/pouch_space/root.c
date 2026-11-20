@@ -28,22 +28,50 @@ static int reserve_base(ps_root *root, int recover, lc_error *e) {
     rc = ps_reserve_base(root->space, &plan, recover, e);
   return rc;
 }
-static int recover_namespace(const char *name,
-                             const ps_namespace_info *identity, void *context,
-                             lc_error *error) {
-  ps_root *root = context;
-  ps_namespace *ns = NULL;
-  int rc;
-  (void)identity; /* The catalog visitor has already checked the incarnation. */
-  rc = ps_root_namespace_acquire(root, name, 0, &ns, error);
-  if (rc == LC_OK)
-    rc = ps_namespace_recover_on_open(ns, error);
-  ps_namespace_release(ns);
-  return rc;
-}
 static int failure(lc_error *error, int code, const char *reason,
                    const char *message) {
   return lc_error_set(error, code, 0L, message, NULL, reason, "pouch");
+}
+static int namespace_binding(const ps_catalog_info *binding, lc_error *error) {
+  static const unsigned char no_target[16] = {0};
+  if (!binding->id || binding->revision.incarnation != binding->id ||
+      binding->stream.kind || binding->stream.owner || binding->stream.key ||
+      binding->target.incarnation ||
+      memcmp(binding->target.container, no_target, sizeof(no_target)))
+    return failure(
+        error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
+        "pouch namespace binding is not an immutable metadata owner");
+  return LC_OK;
+}
+static int recover_namespace(void *context, const void *name, size_t length,
+                             const ps_catalog_info *binding, lc_error *error) {
+  ps_root *root = context;
+  ps_namespace *ns = NULL;
+  char *text;
+  int proven = 0, rc;
+  if (!length || memchr(name, 0, length))
+    return failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
+                   "namespace catalog contains invalid name");
+  rc = namespace_binding(binding, error);
+  if (rc == LC_OK)
+    rc =
+        ps_namespace_admission_proven(root->space, binding->id, &proven, error);
+  if (rc != LC_OK || proven)
+    return rc;
+  text = lc_alloc_with_allocator(NULL, length + 1);
+  if (!text)
+    return failure(error, LC_ERR_NOMEM, NULL, "cannot capture namespace name");
+  memcpy(text, name, length);
+  text[length] = 0;
+  rc = ps_root_namespace_acquire(root, text, 0, &ns, error);
+  if (rc == LC_OK && ns->identity.owner != binding->id)
+    rc = failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
+                 "namespace identity changed during catalog visit");
+  if (rc == LC_OK)
+    rc = ps_namespace_recover_on_open(ns, error);
+  ps_namespace_release(ns);
+  lc_free_with_allocator(NULL, text);
+  return rc;
 }
 static void put32(unsigned char *p, uint32_t v) {
   size_t i;
@@ -201,7 +229,8 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   if (rc == LC_OK && !create && shared)
     rc = ps_root_conversion_run(root, path, options, error);
   if (rc == LC_OK && !create)
-    rc = ps_root_namespace_visit(root, recover_namespace, root, error);
+    rc = ps_catalog_visit(root->space, 0, PS_CATALOG_NAMESPACE,
+                          recover_namespace, root, error);
   if (rc == LC_OK && !create && !shared)
     rc = ps_root_conversion_run(root, path, options, error);
   if (rc == LC_OK && create)
@@ -306,7 +335,6 @@ static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
   ps_catalog_view *view = NULL;
   ps_catalog_info binding;
   ps_coordination_guard *guard;
-  size_t i;
   int rc = ps_namespace_guard(ns, &guard, error);
   if (rc == LC_OK)
     rc = ps_catalog_get(ns->root->space, 0, PS_CATALOG_NAMESPACE, ns->name,
@@ -323,19 +351,12 @@ static int namespace_load(ps_namespace *ns, int create, lc_error *error) {
   rc = ps_namespace_unguard(ns, guard, rc, error);
   if (rc != LC_OK)
     return rc;
-  if (!binding.id || binding.revision.incarnation != binding.id ||
-      binding.stream.kind || binding.stream.owner || binding.stream.key ||
-      binding.target.incarnation)
-    goto corrupt;
-  for (i = 0; i < sizeof(binding.target.container); ++i)
-    if (binding.target.container[i])
-      goto corrupt;
+  rc = namespace_binding(&binding, error);
+  if (rc != LC_OK)
+    return rc;
   ns->identity.owner = binding.id;
   ns->identity.incarnation = binding.revision;
   return LC_OK;
-corrupt:
-  return failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
-                 "pouch namespace binding is not an immutable metadata owner");
 }
 static int namespace_locks_init(ps_namespace *ns, lc_error *error) {
   if (pthread_mutex_init(&ns->collection_catalog, NULL) != 0)

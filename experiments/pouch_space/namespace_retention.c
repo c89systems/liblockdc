@@ -1,5 +1,6 @@
 #include "lc_api_internal.h"
 #include "namespace_internal.h"
+#include "space_internal.h"
 #include <string.h>
 #include <zlib.h>
 
@@ -8,6 +9,7 @@
  * incarnation-bound progress record. Work contains no outcome or application
  * body. */
 #define WORK_PROGRESS_SLOT 7U
+#define WORK_IDENTITY_SLOT 3U
 static int failure(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-space");
 }
@@ -177,14 +179,20 @@ static int progress_plan(ps_budget_plan *plan, unsigned int writes,
 }
 static int snapshot(ps_namespace *, ps_reader **, retention_snapshot *,
                     lc_error *);
+int ps_ns_retention_recovery_needed(ps_space *s, uint64_t owner) {
+  ps_key key = {0, WORK_IDENTITY_SLOT, PS_CONTROL};
+  key.owner = owner;
+  return ps_internal_lookup(s, key) != NULL;
+}
 int ps_ns_retention_restore(struct ps_namespace_data *d, lc_error *e) {
   ps_reader *reader = NULL;
   ps_budget_plan plan;
   ps_ref identity;
   uint64_t bytes;
   retention_snapshot captured;
-  int present, rc = ps_value_info(d->ns->root->space, control(d->ns, 3),
-                                  &identity, &bytes, &present, e);
+  int present,
+      rc = ps_value_info(d->ns->root->space, control(d->ns, WORK_IDENTITY_SLOT),
+                         &identity, &bytes, &present, e);
   if (rc != LC_OK || !present)
     return rc;
   /* Only live work retains a completion claim. Finished work may already have

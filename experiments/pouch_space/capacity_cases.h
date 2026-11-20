@@ -2,6 +2,7 @@
 #define POUCH_SPACE_CAPACITY_CASES_H
 #include "checkpoint_cases.h"
 #include "namespace_work.h"
+#include "root_internal.h"
 
 static void standing_bound(void) {
   lc_allocator allocator = {0};
@@ -471,6 +472,101 @@ static int standing_visit(void *context, uint64_t segment,
     ++seen->count;
   }
   return LC_OK;
+}
+static void covered_root_admission(int durable) {
+  ps_root_options options = {0};
+  ps_root *root = NULL, *peer = NULL;
+  ps_namespace *ns = NULL, *quiet = NULL, *joining = NULL;
+  ps_namespace_append *append = NULL;
+  ps_coordination_guard *guard = NULL, *other_guard = NULL;
+  ps_space *space = NULL;
+  ps_stats stats;
+  ps_namespace_status status;
+  lc_pouch_retention_work work = {0};
+  clean();
+  options.storage.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.storage.durable_sync = durable;
+  options.storage.shared = 1;
+  OK(ps_root_open(path, 1, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "covered", 1, &ns, &error));
+  OK(ps_root_namespace_acquire(root, "quiet", 1, &quiet, &error));
+  obligation_group(ns, "lease/0", 1);
+  OK(ps_namespace_checkpoint_flush(ns, &error));
+  OK(ps_checkpoint(ps_root_space(root), &error));
+  /* A joining root needs neither name's mutation authority. The source
+   * proof must come from the physical checkpoint beyond the journal. */
+  OK(ps_namespace_guard(ns, &guard, &error));
+  OK(ps_namespace_guard(quiet, &other_guard, &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_status(ps_root_space(peer), &stats, &error));
+  CHECK(!stats.budgets && stats.capacity == PS_DEFAULT_CAPACITY);
+  OK(ps_namespace_unguard(quiet, other_guard, LC_OK, &error));
+  OK(ps_namespace_unguard(ns, guard, LC_OK, &error));
+  OK(ps_root_namespace_acquire(peer, "covered", 0, &joining, &error));
+  OK(ps_namespace_status_get(joining, &status, &error));
+  CHECK(status.checkpoint_keys == 1 && status.covered_offset == status.tail);
+  ps_namespace_release(joining);
+  OK(ps_root_close(peer, &error));
+
+  /* An unpublished edit revokes the proof even across journal rollover.
+   * The join must await the ordinary recovery authority. */
+  OK(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append,
+                               &error));
+  OK(ps_checkpoint(ps_root_space(root), &error));
+  CHECK(ps_root_open(path, 0, &options, &peer, &error) == LC_ERR_PENDING &&
+        !peer);
+  lc_error_cleanup(&error);
+  ps_namespace_append_close(append);
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_checkpoint(ps_root_space(peer), &error));
+  OK(ps_root_close(peer, &error));
+  ps_namespace_release(quiet);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+
+  /* A raw owner starts a new cohort without validating namespace sources.
+   * The old cohort's checkpoint hint cannot admit a joining logical root. */
+  OK(ps_open(path, 0, &options.storage, &space, &error));
+  OK(ps_coordination_lock(
+      ps_space_coordination(space), PS_COORDINATION_NAMESPACE,
+      ps_namespace_name_hash("covered"), 0, &guard, &error));
+  CHECK(ps_root_open(path, 0, &options, &peer, &error) == LC_ERR_PENDING &&
+        !peer);
+  lc_error_cleanup(&error);
+  ps_coordination_unlock(guard);
+  OK(ps_root_open(path, 0, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "covered", 0, &ns, &error));
+  OK(ps_namespace_guard(ns, &guard, &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_namespace_unguard(ns, guard, LC_OK, &error));
+  OK(ps_root_close(peer, &error));
+  OK(ps_close(space, &error));
+
+  /* Covered canonical records can still coexist with funded retention work.
+   * Preserve that claim at a join, even when the stream looks clean. */
+  OK(ps_namespace_retention_hint_ensure(ns, &error));
+  work.present = 1;
+  work.phase = LC_POUCH_RETENTION_ACTIVE;
+  work.txn_id = "00000000000000000000";
+  work.key = "lease/0";
+  OK(ps_namespace_retention_work_store(ns, &work, &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_status(ps_root_space(peer), &stats, &error));
+  CHECK(stats.budgets == 1 && stats.reserved_payload_bytes >= 2 * PS_PAGE);
+  OK(ps_root_close(peer, &error));
+  memset(&work, 0, sizeof(work));
+  OK(ps_namespace_retention_work_store(ns, &work, &error));
+  obligation_group(ns, "lease/1", 1);
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_status(ps_root_space(peer), &stats, &error));
+  CHECK(stats.budgets == 1 && stats.reserved_payload_bytes > 0);
+  OK(ps_root_close(peer, &error));
+  OK(ps_namespace_checkpoint_flush(ns, &error));
+  OK(ps_namespace_status_get(ns, &status, &error));
+  CHECK(status.checkpoint_keys == 2 && status.covered_offset == status.tail);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  clean();
 }
 static void standing_deletion(int durable, size_t key_bytes) {
   ps_root_options options = {0};

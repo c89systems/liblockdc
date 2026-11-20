@@ -113,8 +113,8 @@ int ps_checkpoint_capture_values(ps_namespace *, const ps_checkpoint_info *,
                                  ps_values **, ps_checkpoint_info *,
                                  lc_error *);
 /* Refresh an initialized coverage memo in the caller's canonical capture. */
-int ps_key_checkpoint_point(ps_namespace *, uint64_t prefix,
-                            ps_checkpoint_info *, int *current, lc_error *);
+int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
+                        ps_checkpoint_info *, int *current, lc_error *);
 /* A coverage token can stay fixed while forward checkpoint slots publish. */
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
                                    const ps_checkpoint_info *, lc_error *);

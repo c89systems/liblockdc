@@ -1422,10 +1422,12 @@ static void collect(ps_space *s) { collect_retired(s, 0); }
 static size_t event_bytes(const ps_entry *p, int event) {
   return event == PS_PUT || event == PS_SEAL ? entry_bytes(p) : 64;
 }
+#define STREAM_SEALED_FLAG 1U
+#define STREAM_ADMITTED_FLAG 2U
 static int live_hint(uint32_t event) {
   return event == PS_STREAM_TAIL || event == PS_STREAM_OWNER ||
          event == PS_NAMESPACE_OWNER || event == PS_STREAM_EDIT ||
-         event == PS_STREAM_COMPLETE;
+         event == PS_STREAM_COMPLETE || event == PS_STREAM_ADMITTED;
 }
 static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
                          int event) {
@@ -1460,7 +1462,9 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       put32(wire + first + 20 + 24 * i, p->extents[i].flags);
     }
     if (p->key.kind == PS_STREAM) {
-      put32(wire + 56, (uint32_t)p->stream_sealed);
+      put32(wire + 56, p->stream_sealed     ? STREAM_SEALED_FLAG
+                       : p->stream_admitted ? STREAM_ADMITTED_FLAG
+                                            : 0U);
       put64(wire + 64, p->stream_capacity);
       put64(wire + 72, p->stream_runs);
     }
@@ -1527,10 +1531,13 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     return LC_OK;
   }
   if (p->key.kind == PS_STREAM && (*event == PS_PUT || *event == PS_SEAL)) {
-    p->stream_sealed = (int)get32(wire + 56);
+    uint32_t flags = get32(wire + 56);
+    p->stream_sealed = (flags & STREAM_SEALED_FLAG) != 0;
+    p->stream_admitted = (flags & STREAM_ADMITTED_FLAG) != 0;
     p->stream_capacity = get64(wire + 64);
     p->stream_runs = get64(wire + 72);
-    if (get32(wire + 56) > 1 || (*event == PS_SEAL && !p->stream_sealed) ||
+    if (flags > STREAM_ADMITTED_FLAG ||
+        (*event == PS_SEAL && !p->stream_sealed) ||
         p->bytes > p->stream_capacity || p->stream_capacity > INT64_MAX ||
         (!p->stream_capacity && p->stream_runs) ||
         p->stream_runs > p->stream_capacity / (PS_PAGE - PS_RUN_HEADER))
@@ -3111,6 +3118,8 @@ typedef struct metadata_recovery {
   ps_space *space;
   unsigned char *wire, *buffer;
   uint64_t loaded;
+  uint64_t cohort_origin;
+  int certified_root;
   /* Warm directory order need not match packed descriptor order. Cache each
    * checked metadata page once for this adoption, never application values. */
   metadata_read_page **cache;
@@ -3253,6 +3262,8 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
   if (rc == LC_OK && p->key.kind == PS_OWNED_RUN && p->owned_mapped)
     rc = owned_map_load(s, p, error);
   if (rc == LC_OK) {
+    if (!recovery->certified_root || get64(wire + 8) <= recovery->cohort_origin)
+      p->stream_admitted = 0;
     if (p->key.kind == PS_CATALOG)
       ps_catalog_apply_record(s, p, 0);
     p->checkpoint_ref = ref;
@@ -3512,8 +3523,15 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
   }
   return LC_OK;
 }
-/* Stream completion is live-only. A replacement checkpoint supplies the
- * accepted boundary, with no claim about edits beyond it. */
+/* Writer completion stays within one physical generation. An admission proof
+ * can survive a checkpoint in the same cohort, until the next edit. */
+static void stream_admitted(ps_space *s, ps_entry *p, int admitted) {
+  if (p->stream_admitted != admitted) {
+    p->stream_admitted = admitted;
+    if (!p->dirty_link)
+      dirty_entry(s, p, NULL);
+  }
+}
 static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                            int select, lc_error *error) {
   ps_key key;
@@ -3532,7 +3550,12 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                  head->catalog->kind != PS_CATALOG_NAMESPACE
            : key.kind != PS_STREAM || head->stream_sealed))
     return err(error, LC_ERR_PROTOCOL, "live owner hint does not match head");
-  if (event != PS_STREAM_TAIL && event != PS_STREAM_COMPLETE) {
+  if (event == PS_STREAM_ADMITTED) {
+    if (value > head->stream_capacity || (select && value != head->bytes))
+      return err(error, LC_ERR_PROTOCOL, "admission proof has the wrong tail");
+    if (select)
+      stream_admitted(s, head, 1);
+  } else if (event != PS_STREAM_TAIL && event != PS_STREAM_COMPLETE) {
     if (!value || value > s->token_limit || value % TOKEN_RANGE)
       return err(error, LC_ERR_PROTOCOL, "invalid owned stream writer stamp");
     if (select) {
@@ -3541,6 +3564,7 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
       if (event == PS_STREAM_EDIT) {
         head->stream_edit_wire = get64(wire + 8);
         head->stream_complete_generation = 0;
+        stream_admitted(s, head, 0);
       }
     }
   } else if (value < head->bytes || value > head->stream_capacity)
@@ -3550,6 +3574,7 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
     head->stream_wire = get64(wire + 8);
     head->stream_complete_generation =
         event == PS_STREAM_COMPLETE ? s->generation : 0;
+    stream_admitted(s, head, event == PS_STREAM_COMPLETE);
     if (!head->dirty_link)
       dirty_entry(s, head, NULL);
   }
@@ -3878,6 +3903,8 @@ static int recover(ps_space *s, lc_error *error) {
   recovery.space = s;
   recovery.wire = wire;
   recovery.buffer = values->buffer;
+  recovery.certified_root = certificate.root == s->generation;
+  recovery.cohort_origin = certificate.origin;
   values->packed.offset = 0;
   rc = initial_free(s, error);
   if (rc == LC_OK)
@@ -3909,7 +3936,8 @@ static int recover(ps_space *s, lc_error *error) {
     event = get32(wire + cursor + 20);
     if (s->sequence >= certificate.durable &&
         (get32(wire + cursor) == REVISION_MAGIC ||
-         (event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER)))
+         (event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER &&
+          event != PS_STREAM_ADMITTED)))
       pending_data = 1;
     if (get32(wire + cursor) == REVISION_MAGIC) {
       rc = recover_revision(s, wire + cursor, bytes, values, error);
@@ -4267,6 +4295,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->stream_runs = q->stream_runs;
         dest->stream_storage = q->stream_storage;
         dest->stream_sealed = q->stream_sealed;
+        dest->stream_admitted = q->stream_admitted;
         dest->stream_wire = q->stream_wire;
         dest->stream_edit_wire = q->stream_edit_wire;
         dest->stream_complete_generation = q->stream_complete_generation;
@@ -4476,6 +4505,8 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   recovery.space = v;
   recovery.wire = v->journal_image;
   recovery.buffer = buffer;
+  recovery.certified_root = certificate.root == v->generation;
+  recovery.cohort_origin = certificate.origin;
   recovery.cache =
       lc_calloc_with_allocator(NULL, BUCKETS, sizeof(*recovery.cache));
   if (!recovery.cache) {
@@ -4511,7 +4542,9 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
       p->projection = old;
       if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
         p->bytes = old->bytes;
-        dirty_entry(v, p, NULL);
+        p->stream_admitted = 0;
+        if (!p->dirty_link)
+          dirty_entry(v, p, NULL);
       }
     }
     for (i = 0; i < p->count; ++i) {
@@ -6316,6 +6349,44 @@ int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
   *tail = status.tail;
   return 1;
 }
+int ps_internal_admitted_tail(ps_space *s, ps_key key, const ps_ref *ref,
+                              uint64_t *tail) {
+  ps_entry *p = lookup(s, key);
+  if (!p || p->deleted || p->stream_sealed || !p->stream_admitted ||
+      p->token != ref->incarnation || memcmp(s->identity, ref->container, 16) ||
+      stream_structure_ready(s, p, NULL) != LC_OK)
+    return 0;
+  *tail = p->bytes;
+  return 1;
+}
+int ps_internal_certify_tail(ps_space *s, ps_key key, const ps_ref *ref,
+                             uint64_t tail, lc_error *e) {
+  ps_coordination_guard *guard;
+  ps_entry *p;
+  int rc;
+  if (!s->readiness)
+    return LC_OK;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, e);
+  p = lookup(s, key);
+  if (rc == LC_OK && p && !p->deleted && !p->stream_sealed &&
+      !p->stream_admitted && p->bytes == tail && p->token == ref->incarnation &&
+      !memcmp(s->identity, ref->container, 16)) {
+    ps_entry hint = {0};
+    hint.key = key;
+    hint.token = p->token;
+    hint.bytes = tail;
+    /* A proof is optional. Leave rollover to a canonical publisher. */
+    if (event_bytes(&hint, PS_STREAM_ADMITTED) <= PS_JOURNAL - s->journal) {
+      rc = append_event_locked(s, &hint, PS_STREAM_ADMITTED, e);
+      if (rc == LC_OK)
+        stream_admitted(s, p, 1);
+    }
+  }
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                       const ps_ref *ref, int guarded, int prepare, int defer,
                       ps_owned_head **out, ps_owned_status *status,
@@ -6520,6 +6591,7 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
     if (event == PS_STREAM_EDIT) {
       p->stream_edit_wire = s->sequence;
       p->stream_complete_generation = 0;
+      stream_admitted(s, p, 0);
     }
   }
   return rc;
@@ -7650,6 +7722,7 @@ static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
     head->bytes = tail;
     head->stream_complete_generation =
         complete && s->readiness ? s->generation : 0;
+    stream_admitted(s, head, complete && s->readiness);
     if (!head->dirty_link)
       dirty_entry(s, head, NULL);
     head->stream_ready = *sequence;

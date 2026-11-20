@@ -9556,3 +9556,84 @@ latency change caused by descriptor-based reserves. Indexed reopen and
 four-writer NoSync write tails remain qualification work. Raw attempts
 and test logs are under `selected-reserve-` in
 `build/pouch-space-concurrent/`.
+
+## Shared-root admission for covered namespaces
+
+A joining root checks checkpoint coverage, the active routing binding and
+the current tail in one allocator capture. It can defer namespace recovery
+when there is no selected stream, or the checkpoint covers the exact
+verified active tail. A selected or pending retention work identity keeps
+the eager path. This lets root admission proceed without acquiring the
+namespace mutation guard for a covered sibling. The allocator already
+owns the standing deletion reserve for its selected key descriptors.
+
+Canonical stream completion proves the tail for the readiness cohort.
+A full namespace recovery can also certify a fully covered active stream.
+It publishes a small readiness hint when the current journal has room.
+A physical checkpoint carries the proof bit with the stream descriptor.
+The descriptor must come from a certified root and its sequence must
+follow the current cohort's origin. Starting a producer revokes the
+proof before writing bytes, including if a physical checkpoint takes
+place during that edit. A new cohort recovers normally and ignores the
+old proof. Writer takeover and suffix repair retain their own completion
+checks.
+
+This changes when a joining owner validates a covered namespace's
+individual key records and sources. Physical ownership, routing and
+checkpoint controls are still checked at admission. Logical source and
+key validation can occur on first access. The first owner in a cohort
+still performs the full recovery pass. A join with an uncovered tail or
+retention work still reconstructs its outstanding capacity before return.
+
+The deterministic fixed 10 MiB fixture exercises both durability modes.
+A join succeeds while a peer holds the guards for a covered namespace and
+an empty one. It can then load and use the covered namespace. The same
+join requires recovery authority after an unpublished edit revokes the
+proof, even after a physical checkpoint. A new cohort cannot reuse the
+old proof. Once a logical root completes recovery, another join can use
+the fresh proof. Separate joins restore active retention workspace and
+an uncovered canonical suffix before returning.
+
+Debug ASan/UBSan passed 13 groups, GNU Release passed 38 and musl
+Release passed 35. The release checks include producer takeover, root and
+namespace fault recovery, retained sources, retention progress, shared
+indexed queries and fixed-capacity lease and messaging workflows. GNU
+also passed codec conversion and explicit growth.
+
+The two instrumented GNU repeats per native build and workload verified.
+In the indexed profiles, the first cold open continued to recover all
+namespaces. Every final live join on the candidate made zero calls to
+eager namespace recovery. NoSync indexed live opens went from
+817–839 reads per owner to 391–398 and from 4.02–6.29 ms to 1.48–1.84 ms.
+Durable live opens went from 654–674 reads to 329–349 and from 4.09–4.75 ms
+to 1.35–1.53 ms. Queue joins went from 54–55 reads to 23. Queue cold-open variance dominated the grouped timings in
+those small samples.
+
+The uninstrumented matched GNU comparison verified 40 of 42 runs. Each
+native build refused ordinary capacity once during four-writer NoSync
+mutation. Each verified four of five runs of that profile and all other
+workloads. Multifile verified every run. The other workloads have three
+samples per build. Both native builds used fixed 10 MiB containers.
+
+The tables report successful-attempt medians in milliseconds in the order
+prior native (`6d8b162f`), current native and multifile. Grouped reopen
+includes one cold open plus the live joins. Verification after reopen
+includes the first application reads.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 1522.39 / 1479.92 / 1307.23 | 84.57 / 77.41 / 29.02 | 3.14 / 3.15 / 1.13 | 25.82 / 13.08 / 0.95 | 8.35 / 5.30 / 7.16 |
+| Two writers, durable indexed, 15 MiB | 6943.68 / 6827.42 / 5613.87 | 97.36 / 91.35 / 66.80 | 1.99 / 8.07 / 0.99 | 15.83 / 11.10 / 0.57 | 8.16 / 7.08 / 7.06 |
+| Two writers, warmed NoSync queue | 10.93 / 12.12 / 85.53 | 1.98 / 2.25 / 17.32 | 0.26 / 0.33 / 0.07 | 3.17 / 3.08 / 0.57 | 0.40 / 0.26 / 0.42 |
+| Two writers, durable outbox | 977.70 / 1207.07 / 1446.41 | 173.56 / 209.82 / 283.77 | 0.66 / 0.86 / 0.33 | 33.53 / 44.93 / 63.36 | 60.29 / 70.13 / 141.74 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 209.81 / 231.34 / 315.61 | 91.32 / 95.74 / 169.66 | 21.74 / 30.01 / 254.33 | 1.04 / 0.76 / 1.32 |
+| Two writers, durable indexed, 15 MiB | 163.19 / 166.14 / 163.28 | 33.36 / 46.15 / 152.90 | 19.67 / 3.14 / 210.50 | 0.45 / 0.51 / 0.68 |
+
+Live admission removed repeated recovery from the covered benchmark joins.
+Cold recovery, joins that have outstanding capacity obligations and sustained
+NoSync mutation latency remain qualification work. Raw phase, matched and
+test logs are under `covered-admission-` in
+`build/pouch-space-concurrent/`.

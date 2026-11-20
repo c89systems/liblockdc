@@ -75,15 +75,15 @@ static uint64_t get64(const unsigned char *p) {
     value |= (uint64_t)p[i] << (i * 8);
   return value;
 }
-static ps_key head_key(ps_namespace *ns) {
+static ps_key head_key(uint64_t owner) {
   ps_key key = {0, 1, PS_ROUTING};
-  key.owner = ns->identity.owner;
+  key.owner = owner;
   return key;
 }
-static int decode_head(ps_namespace *ns, const unsigned char *bytes,
+static int decode_head(uint64_t owner, const unsigned char *bytes,
                        uint64_t *active, lc_error *e) {
   size_t i;
-  if (memcmp(bytes, "LCPSNSHD", 8) || get64(bytes + 8) != ns->identity.owner ||
+  if (memcmp(bytes, "LCPSNSHD", 8) || get64(bytes + 8) != owner ||
       !get64(bytes + 16) || get64(bytes + 24) != get64(bytes + 16) ||
       get64(bytes + 32) != LC_POUCH_RECORD_HEADER_BYTES ||
       get64(bytes + 120) != (uint64_t)crc32(0L, bytes, 120))
@@ -99,7 +99,8 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_reader *reader = NULL;
   size_t got;
-  int rc = ps_read_open(d->ns->root->space, head_key(d->ns), NULL, &reader, e);
+  int rc = ps_read_open(d->ns->root->space, head_key(d->ns->identity.owner),
+                        NULL, &reader, e);
   if (rc == LC_ERR_INVALID) {
     lc_error_cleanup(e);
     return LC_OK;
@@ -115,7 +116,7 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
     return rc;
   if (got != sizeof(bytes))
     return failure(e, LC_ERR_PROTOCOL, "namespace head is incomplete");
-  return decode_head(d->ns, bytes, &d->active, e);
+  return decode_head(d->ns->identity.owner, bytes, &d->active, e);
 }
 int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
                      uint64_t active, lc_error *e) {
@@ -129,7 +130,8 @@ int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
   put64(bytes + 24, active);
   put64(bytes + 32, LC_POUCH_RECORD_HEADER_BYTES);
   put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
-  rc = ps_begin(d->ns->root->space, budget, head_key(d->ns), &writer, e);
+  rc = ps_begin(d->ns->root->space, budget, head_key(d->ns->identity.owner),
+                &writer, e);
   if (rc == LC_OK)
     rc = ps_write(writer, bytes, sizeof(bytes), e);
   if (rc == LC_OK)
@@ -670,6 +672,16 @@ static int capture_selected_view(struct ps_namespace_data *d,
   }
   return rc;
 }
+static int active_binding(ps_space *s, ps_key stream, uint64_t prefix,
+                          char *leaf, ps_catalog_info *binding) {
+  return lc_pouch_namespace_format_segment_leaf(stream.key, leaf,
+                                                PS_NS_LEAF_BYTES) &&
+         ps_internal_catalog_find(s, stream.owner, PS_CATALOG_SEGMENT, leaf,
+                                  strlen(leaf), prefix, binding) &&
+         binding->stream.kind == stream.kind &&
+         binding->stream.owner == stream.owner &&
+         binding->stream.key == stream.key;
+}
 /* Observe the projection boundary under the namespace guard and one allocator
  * capture. The live completion stamp certifies that no producer recovery is
  * needed to learn the selected tail. Cold or incomplete streams use load(). */
@@ -690,32 +702,29 @@ static int projection_selected(struct ps_namespace_data *d,
   rc = ps_internal_capture_begin(s, &allocator, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   if (rc == LC_OK)
-    rc = ps_internal_fixed_value(s, head_key(ns), prefix, head, sizeof(head),
-                                 d->observed_head, &token, &current, e);
+    rc = ps_internal_fixed_value(s, head_key(ns->identity.owner), prefix, head,
+                                 sizeof(head), d->observed_head, &token,
+                                 &current, e);
   if (rc == LC_OK && current && token) {
     if (token == d->observed_head)
       active = d->observed_active;
     else {
-      rc = decode_head(ns, head, &active, e);
+      rc = decode_head(ns->identity.owner, head, &active, e);
       if (rc == LC_OK) {
         d->observed_head = token;
         d->observed_active = active;
       }
     }
   }
-  if (rc == LC_OK && active &&
-      lc_pouch_namespace_format_segment_leaf(active, leaf, sizeof(leaf))) {
+  if (rc == LC_OK && active) {
     stream.owner = ns->identity.owner;
     stream.key = active;
-    found = ps_internal_catalog_find(s, stream.owner, PS_CATALOG_SEGMENT, leaf,
-                                     strlen(leaf), prefix, &binding) &&
-            binding.stream.kind == stream.kind &&
-            binding.stream.owner == stream.owner &&
-            binding.stream.key == stream.key &&
+    found = active_binding(s, stream, prefix, leaf, &binding) &&
             ps_internal_complete_tail(s, stream, &binding.target, &tail);
   }
   if (found && !observed->window) {
-    rc = ps_key_checkpoint_point(ns, prefix, &d->observed_coverage, &found, e);
+    rc = ps_checkpoint_point(s, ns->identity.owner, prefix,
+                             &d->observed_coverage, &found, e);
     coverage = d->observed_coverage;
   }
   if (rc == LC_OK && found && !observed->window &&
@@ -1867,22 +1876,64 @@ int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
     ps_ns_leave(d);
   return rc;
 }
+int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
+                                  lc_error *e) {
+  ps_coordination_guard *guard;
+  ps_checkpoint_info coverage = {0};
+  ps_catalog_info binding;
+  ps_key stream = {0, 0, PS_STREAM};
+  unsigned char head[NS_HEAD_BYTES];
+  char leaf[PS_NS_LEAF_BYTES];
+  uint64_t prefix, token, tail;
+  int current = 0, rc;
+  *proven = 0;
+  if (!ps_readiness_joined(s))
+    return LC_OK;
+  stream.owner = owner;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, e);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  if (rc == LC_OK && !ps_ns_retention_recovery_needed(s, owner))
+    rc = ps_internal_fixed_value(s, head_key(owner), prefix, head, sizeof(head),
+                                 0, &token, &current, e);
+  if (rc == LC_OK && current && token)
+    rc = decode_head(owner, head, &stream.key, e);
+  if (rc == LC_OK && current)
+    rc = ps_checkpoint_point(s, owner, prefix, &coverage, &current, e);
+  if (rc == LC_OK && current && coverage.segment > stream.key)
+    rc = failure(e, LC_ERR_PROTOCOL,
+                 "checkpoint coverage exceeds namespace head");
+  if (rc == LC_OK && current && coverage.segment == stream.key)
+    *proven = !stream.key ||
+              (active_binding(s, stream, prefix, leaf, &binding) &&
+               ps_internal_admitted_tail(s, stream, &binding.target, &tail) &&
+               coverage.offset == tail);
+  rc = ps_internal_capture_end(s, guard, rc, e);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_namespace_recover_on_open(ps_namespace *ns, lc_error *e) {
   ps_checkpoint_info coverage;
   struct ps_namespace_data *d;
-  int rc = ps_namespace_checkpoint_recover(ns, e);
+  int rc = ps_ns_enter_checkpoint(ns, &d, e);
   if (rc != LC_OK)
     return rc;
   /* The opening root has no local callers. Retain any state sources or
    * capacity obligations that recovery just validated. */
-  d = ns->data;
   ps_key_checkpoint_info(d->checkpoint, &coverage);
-  if (!d->active && !d->count && !coverage.epoch &&
+  if (d->active && coverage.segment == d->active &&
+      coverage.offset == d->tail && !ps_namespace_data_budgets(d)) {
+    segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, d->active);
+    rc = ps_internal_certify_tail(ns->root->space, s->binding.stream,
+                                  &s->binding.target, d->tail, e);
+  }
+  ps_ns_leave(d);
+  if (rc == LC_OK && !d->active && !d->count && !coverage.epoch &&
       !ps_namespace_data_budgets(d)) {
     __atomic_store_n(&ns->data, NULL, __ATOMIC_RELEASE);
     ps_namespace_data_destroy(d);
   }
-  return LC_OK;
+  return rc;
 }
 int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
   struct ps_namespace_data *d;

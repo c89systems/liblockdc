@@ -35,7 +35,8 @@ enum ps_event {
   PS_STREAM_OWNER,
   PS_NAMESPACE_OWNER,
   PS_STREAM_EDIT,
-  PS_STREAM_COMPLETE
+  PS_STREAM_COMPLETE,
+  PS_STREAM_ADMITTED
 };
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
@@ -69,7 +70,7 @@ typedef struct ps_entry {
   struct ps_entry *owned_first, *owned_last, *owned_prev, *owned_next;
   int owned_linked;
   size_t stream_handles;
-  int stream_guarded, stream_sealed, orphan_claimed;
+  int stream_guarded, stream_sealed, stream_admitted, orphan_claimed;
   ps_coordination_guard *stream_claim; /* Local preparation or orphan pass. */
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
@@ -240,6 +241,11 @@ int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
                              const void *, size_t, uint64_t prefix,
                              ps_catalog_info *);
 int ps_internal_complete_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
+int ps_internal_admitted_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
+/* A namespace owner verified this exact active tail under mutation authority.
+ * The cohort proof only excludes replay debt. Writers still repair suffixes. */
+int ps_internal_certify_tail(ps_space *, ps_key, const ps_ref *, uint64_t,
+                             lc_error *);
 int ps_internal_stream_claim(ps_space *, uint64_t, ps_coordination_guard **,
                              lc_error *);
 /* Caller holds the namespace-name guard while checking and claiming its

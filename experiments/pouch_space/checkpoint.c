@@ -503,11 +503,11 @@ static ps_key control_key(ps_namespace *ns) {
   key.owner = ns->identity.owner;
   return key;
 }
-static int decode_control(ps_namespace *ns, const unsigned char *bytes,
+static int decode_control(uint64_t owner, const unsigned char *bytes,
                           uint64_t token, ps_checkpoint_info *out,
                           lc_error *e) {
   size_t i;
-  if (memcmp(bytes, "LCPSCKPT", 8) || get64(bytes + 8) != ns->identity.owner ||
+  if (memcmp(bytes, "LCPSCKPT", 8) || get64(bytes + 8) != owner ||
       !get64(bytes + 16) || (!get64(bytes + 24) && get64(bytes + 32)) ||
       get64(bytes + 120) != (uint64_t)crc32(0, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
@@ -543,21 +543,22 @@ static int read_control(ps_namespace *ns, ps_reader *reader,
   if (got != sizeof(bytes))
     return failure(e, LC_ERR_PROTOCOL, "checkpoint coverage is incomplete");
   ps_read_reference(reader, &ref);
-  return decode_control(ns, bytes, ref.incarnation, out, e);
+  return decode_control(ns->identity.owner, bytes, ref.incarnation, out, e);
 }
-int ps_key_checkpoint_point(ps_namespace *ns, uint64_t prefix,
-                            ps_checkpoint_info *out, int *current,
-                            lc_error *e) {
+int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
+                        ps_checkpoint_info *out, int *current, lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
+  ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
   uint64_t token;
   ps_checkpoint_info decoded;
-  int rc =
-      ps_internal_fixed_value(ns->root->space, control_key(ns), prefix, bytes,
-                              sizeof(bytes), out->control, &token, current, e);
+  int rc;
+  key.owner = owner;
+  rc = ps_internal_fixed_value(s, key, prefix, bytes, sizeof(bytes),
+                               out->control, &token, current, e);
   if (rc == LC_OK && *current && token != out->control) {
     memset(&decoded, 0, sizeof(decoded));
     if (token)
-      rc = decode_control(ns, bytes, token, &decoded, e);
+      rc = decode_control(owner, bytes, token, &decoded, e);
     if (rc == LC_OK)
       *out = decoded;
   }

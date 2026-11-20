@@ -59,6 +59,9 @@ int ps_namespace_checkpoint_flush(ps_namespace *, lc_error *);
 /* Replays the canonical suffix and reinstalls its outstanding checkpoint
  * capacity claim without publishing a new key checkpoint. */
 int ps_namespace_checkpoint_recover(ps_namespace *, lc_error *);
+/* Check the physical coverage and ready tail in one live-cohort capture. */
+int ps_namespace_admission_proven(ps_space *, uint64_t owner, int *,
+                                  lc_error *);
 /* Before exposing the root, recover state claims and release empty caches. */
 int ps_namespace_recover_on_open(ps_namespace *, lc_error *);
 uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);

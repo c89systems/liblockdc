@@ -71,6 +71,9 @@ void ps_ns_remove(struct ps_namespace_data *, ps_ns_resource *);
 int ps_ns_data_get(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_data_lookup(ps_namespace *, struct ps_namespace_data **, lc_error *);
 int ps_ns_retention_restore(struct ps_namespace_data *, lc_error *);
+/* Caller holds the allocator capture. A selected or pending workspace owner
+ * requires ordinary namespace recovery. */
+int ps_ns_retention_recovery_needed(ps_space *, uint64_t owner);
 int ps_ns_enter(struct ps_namespace_data *, lc_error *);
 int ps_ns_enter_checkpoint(ps_namespace *, struct ps_namespace_data **,
                            lc_error *);
