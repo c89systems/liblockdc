@@ -1730,6 +1730,62 @@ static double projection_milliseconds(void) {
   REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
   return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
+typedef struct descriptor_probe {
+  uint64_t pages[72];
+  size_t reads[72], count;
+} descriptor_probe;
+static ssize_t descriptor_read(void *context, int fd, void *bytes, size_t n,
+                               off_t offset) {
+  descriptor_probe *probe = context;
+  for (size_t i = 0; i < probe->count; ++i)
+    if (n == PS_PAGE && (uint64_t)offset == probe->pages[i])
+      ++probe->reads[i];
+  return pread(fd, bytes, n, offset);
+}
+static void directory_reopen_locality(int evict) {
+  lc_error e = {0};
+  descriptor_probe probe = {0};
+  ps_io io = {&probe, descriptor_read, write_io, sync_io, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_space *writer = NULL, *observer = NULL;
+  uint64_t count = evict ? 2100 : 96;
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  /* Interleave disjoint key ranges on the same descriptor pages. The
+   * sorted directory visits those pages from both key ranges. */
+  for (uint64_t id = 1; id <= count; ++id) {
+    capture_put(writer, id, 0);
+    capture_put(writer, 8192 + id, 0);
+  }
+  /* An ordered image spanning more than the cache bound exercises slot
+   * reuse. The smaller incremental image exercises lookup of shared pages. */
+  ok(evict ? ps_metadata_repack(writer, &e) : ps_checkpoint(writer, &e), &e);
+  for (ps_meta_page *page = writer->pages; page; page = page->next)
+    if (!page->index) {
+      REQUIRE(probe.count < sizeof(probe.pages) / sizeof(probe.pages[0]));
+      probe.pages[probe.count++] = page->run.offset;
+    }
+  REQUIRE(probe.count >= (evict ? 65U : 3U));
+  for (int cold = 0; cold <= 1; ++cold) {
+    if (cold)
+      ok(ps_close(writer, &e), &e);
+    memset(probe.reads, 0, sizeof(probe.reads));
+    ok(ps_open(path, 0, &options, &observer, &e), &e);
+    for (size_t i = 0; i < probe.count; ++i)
+      REQUIRE(probe.reads[i] == 1);
+    for (uint64_t id = 1; id <= count; ++id) {
+      ps_ref ref;
+      uint64_t bytes;
+      int present;
+      ok(ps_value_info(observer, key(id), &ref, &bytes, &present, &e), &e);
+      REQUIRE(present && !bytes && ref.incarnation);
+      ok(ps_value_info(observer, key(8192 + id), &ref, &bytes, &present, &e),
+         &e);
+      REQUIRE(present && !bytes && ref.incarnation);
+    }
+    ok(ps_close(observer, &e), &e);
+  }
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void projection_quarantine(int durable, int explicit_sweep) {
   lc_error e = {0};
   ps_options options = {.durable_sync = durable};
@@ -5342,6 +5398,8 @@ int main(int argc, char **argv) {
     capture_race();
   else if (!strcmp(argv[2], "projection")) {
     projection_lifecycle();
+    directory_reopen_locality(0);
+    directory_reopen_locality(1);
     for (int durable = 0; durable <= 1; ++durable)
       projection_quarantine(durable, 0);
   } else if (!strcmp(argv[2], "projection-faults"))

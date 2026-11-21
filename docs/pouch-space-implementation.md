@@ -9843,3 +9843,82 @@ profiles had two. Both native builds used fixed 10 MiB containers.
 Fixed-capacity admission, indexed mutation tails and grouped reopen
 remain qualification work. The trace, paired runs and targeted check
 logs are under `packed-ownership-` in `build/pouch-space-concurrent/`.
+
+## Bounded descriptor caching during recovery
+
+Root reopen traces found repeated reads of the same checkpoint descriptor
+pages. The directory enumerates typed keys in order, while incremental
+checkpoints can pack descriptors in a different order. In two traced
+indexed roots, one-page buffering fetched 42 distinct descriptor pages
+355 times per owner and 60 distinct pages 308 times per owner. The
+successful final reopen groups performed zero journal payload reads
+during physical admission. Live joins also skipped logical namespace
+recovery, which isolated the repeated reads to the selected directory.
+
+Physical open and checkpoint adoption now use one directory loader. It
+caches up to 64 checked descriptor pages per traversal, with hash lookup
+and eviction in insertion order. Small roots allocate pages as needed
+and the loader releases the cache before returning to journal recovery.
+The page checks cover CRC, container identity, generation, extent bounds
+and continuation links. Directory binding, overlap, catalog and owned-run
+validation continue during recovery. The cache holds descriptor bytes in
+the existing page format.
+
+The locality fixture interleaves 192 entries from disjoint key ranges in
+an incremental checkpoint. The prior build reread selected pages and
+failed the one-read-per-page assertion. Both a live join and a cold open
+now pass. A separate 4,200-entry packed image spans more than 64 descriptor
+pages and exercises cache eviction and reuse. Both modes check every key.
+Targeted verification passed 11 Debug ASan/UBSan, 25 GNU Release and 19
+musl Release groups, including recovery allocation and I/O faults,
+checkpoint adoption, concurrent fixed-capacity leases and outbox recovery.
+
+The instrumented GNU runs separate the first cold owner from later live
+joins in the same reopen group. Times are medians in milliseconds. Join
+rows pool the individual owners. Each native build verified two traces
+per profile except for the prior 12 MiB profile, which completed one
+before an ordinary capacity refusal on its other attempt. The traces
+represent equivalent workloads with independently laid-out roots.
+
+| Indexed workload | Cold open, prior / cached | Live join, prior / cached | Reads per live join, prior / cached |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync, 12 MiB | 5.84 / 4.72 | 1.55 / 1.02 | 395 / 74 |
+| Four writers, NoSync, 20 MiB | 8.51 / 6.82 | 2.16 / 1.40 | 244.5 / 153 |
+| Two writers, durable, 15 MiB | 8.99 / 5.74 | 1.71 / 1.29 | 351.5 / 86.5 |
+
+The separate pressure capture recorded nearly 9 MiB of live owned runs
+at a 12 MiB-workload refusal. That owner had already met its 180 KiB
+checkpoint workspace target. It was short 4–16 KiB of ordinary headroom
+during the failed burst. The trace also showed peer-held ranges and
+retired packed cells. Capacity under churn remains open.
+
+The uninstrumented GNU rotation verified 31 of 36 workflows. All five
+failures were ordinary capacity refusals in the 20 MiB profile. The
+prior native build completed zero of three attempts in that profile,
+the cached build completed one of three, and multifile completed all
+three. The 12 MiB profile verified three runs per build. The remaining
+profiles verified two per build.
+
+The tables give successful-run medians in milliseconds in the order
+prior native (`d0fd76d9`), cached native and multifile. The native builds
+used fixed 10 MiB containers. Grouped reopen includes the first cold
+open and later live joins. The cached 20 MiB row has one sample.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1440.76 / 1300.45 / 1158.36 | 79.28 / 70.91 / 25.72 | 7.69 / 3.01 / 0.84 | 12.15 / 11.07 / 0.87 | 5.27 / 5.59 / 7.55 |
+| NoSync indexed, 20 MiB | — / 3826.37 / 2430.97 | — / 112.15 / 36.31 | — / 42.42 / 1.13 | — / 13.39 / 0.80 | — / 7.46 / 9.13 |
+| Durable indexed, 15 MiB | 6316.76 / 5993.10 / 4822.37 | 82.18 / 78.06 / 57.91 | 2.09 / 1.70 / 0.75 | 9.52 / 8.92 / 0.67 | 5.45 / 7.94 / 6.68 |
+| Warmed NoSync queue | 10.67 / 9.59 / 79.54 | 2.19 / 1.77 / 22.65 | 0.20 / 0.24 / 0.05 | 4.40 / 2.89 / 0.35 | 0.21 / 0.24 / 0.42 |
+| Durable outbox | 1048.10 / 905.09 / 1466.94 | 193.78 / 173.67 / 373.87 | 0.52 / 0.49 / 0.29 | 44.48 / 32.76 / 49.56 | 54.71 / 59.27 / 112.57 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 234.30 / 236.82 / 285.03 | 106.45 / 77.23 / 152.09 | 48.90 / 12.24 / 193.78 | 0.82 / 0.81 / 1.33 |
+| NoSync indexed, 20 MiB | — / 516.48 / 623.96 | — / 160.18 / 247.79 | — / 19.80 / 327.25 | — / 1.17 / 1.61 |
+| Durable indexed, 15 MiB | 165.15 / 137.31 / 129.02 | 21.80 / 7.56 / 123.34 | 19.36 / 8.15 / 125.65 | 0.47 / 0.57 / 0.67 |
+
+The grouped indexed reopen gap remains substantial. Fixed-capacity
+admission and indexed mutation tails also remain qualification work.
+Raw traces, matched attempts and test logs are under `adopt-` in
+`build/pouch-space-concurrent/`.

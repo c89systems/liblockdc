@@ -3215,32 +3215,77 @@ static int canonical_journal(ps_space *s,
     ps_readiness_finish(s, PS_READINESS_JOURNAL);
   return LC_OK;
 }
+#define META_READ_PAGES 64U
 typedef struct metadata_read_page {
-  uint64_t offset;
-  struct metadata_read_page *next;
+  uint64_t offset, generation, following;
+  size_t used;
+  struct metadata_read_page *next, **link;
   unsigned char bytes[PS_PAGE];
 } metadata_read_page;
 typedef struct metadata_recovery {
   ps_space *space;
-  unsigned char *wire, *buffer;
-  uint64_t loaded;
+  unsigned char *wire;
   uint64_t cohort_origin;
   int certified_root;
-  /* Warm directory order need not match packed descriptor order. Cache each
-   * checked metadata page once for this adoption, never application values. */
-  metadata_read_page **cache;
+  /* Directory order need not match the packing order of descriptor pages.
+   * Retain a bounded set of checked immutable pages for this traversal. */
+  metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
+  size_t next_slot;
 } metadata_recovery;
 static void metadata_read_cache_close(metadata_recovery *r) {
-  metadata_read_page *p, *next;
   size_t i;
-  if (!r->cache)
-    return;
-  for (i = 0; i < BUCKETS; ++i)
-    for (p = r->cache[i]; p; p = next) {
-      next = p->next;
-      lc_free_with_allocator(NULL, p);
+  for (i = 0; i < META_READ_PAGES; ++i)
+    lc_free_with_allocator(NULL, r->slots[i]);
+}
+static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
+                                    metadata_read_page **out, lc_error *error) {
+  ps_space *s = r->space;
+  metadata_read_page **bucket, *page;
+  const unsigned char *buffer;
+  int rc;
+  if (!metadata_offset(s, offset))
+    return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
+  bucket = &r->buckets[(offset / PS_PAGE) % META_READ_PAGES];
+  for (page = *bucket; page; page = page->next)
+    if (page->offset == offset) {
+      *out = page;
+      return LC_OK;
     }
-  lc_free_with_allocator(NULL, r->cache);
+  page = r->slots[r->next_slot];
+  if (page) {
+    *page->link = page->next;
+    if (page->next)
+      page->next->link = page->link;
+  } else {
+    page = lc_alloc_with_allocator(NULL, sizeof(*page));
+    if (!page)
+      return err(error, LC_ERR_NOMEM,
+                 "cannot cache checkpoint descriptor page");
+    r->slots[r->next_slot] = page;
+  }
+  rc = transfer(s, page->bytes, PS_PAGE, offset, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  buffer = page->bytes;
+  page->offset = offset;
+  page->generation = get64(buffer + 16);
+  page->following = get64(buffer + 8);
+  page->used = get32(buffer + 4);
+  if (get32(buffer) != META_MAGIC || !page->used || page->used > META_PAYLOAD ||
+      !page->generation || page->generation > s->generation ||
+      get64(buffer + 24) != offset || memcmp(buffer + 32, s->identity, 16) ||
+      get32(buffer + 48) != metadata_crc(buffer) || get32(buffer + 52) ||
+      get64(buffer + 56) ||
+      (page->following && !metadata_offset(s, page->following)))
+    return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
+  page->next = *bucket;
+  page->link = bucket;
+  if (page->next)
+    page->next->link = &page->next;
+  *bucket = page;
+  r->next_slot = (r->next_slot + 1) % META_READ_PAGES;
+  *out = page;
+  return LC_OK;
 }
 static int recover_directory_page(void *v, ps_directory_root ref,
                                   lc_error *error) {
@@ -3268,55 +3313,22 @@ static int recover_directory_page(void *v, ps_directory_root ref,
 static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
                          lc_error *error) {
   ps_space *s = recovery->space;
-  unsigned char *wire = recovery->wire, *buffer = recovery->buffer;
-  uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0, next;
-  size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take, used;
+  uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
+  size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take;
   ps_meta_page *p;
-  metadata_read_page *cached;
-  int rc, fresh;
+  metadata_read_page *page = NULL;
+  int rc;
   while (done < ref.bytes) {
-    if (!metadata_offset(s, offset))
-      return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
-    fresh = recovery->loaded != offset;
-    if (fresh && recovery->cache)
-      for (cached = recovery->cache[(offset / PS_PAGE) % BUCKETS]; cached;
-           cached = cached->next)
-        if (cached->offset == offset) {
-          memcpy(buffer, cached->bytes, PS_PAGE);
-          fresh = 0; /* This immutable page has already passed its CRC. */
-          break;
-        }
-    if (fresh) {
-      rc = transfer(s, buffer, PS_PAGE, offset, 0, error);
-      if (rc != LC_OK)
-        return rc;
-    }
-    used = get32(buffer + 4);
-    next = get64(buffer + 8);
-    if (get32(buffer) != META_MAGIC || !used || used > META_PAYLOAD ||
-        !get64(buffer + 16) || get64(buffer + 16) > s->generation ||
-        (generation && get64(buffer + 16) != generation) ||
-        get64(buffer + 24) != offset || memcmp(buffer + 32, s->identity, 16) ||
-        (fresh && get32(buffer + 48) != metadata_crc(buffer)) ||
-        get32(buffer + 52) || get64(buffer + 56) ||
-        (next && !metadata_offset(s, next)) || at < META_HEADER ||
-        at >= META_HEADER + used)
+    rc = metadata_read_cache_page(recovery, offset, &page, error);
+    if (rc != LC_OK)
+      return rc;
+    if ((generation && page->generation != generation) || at < META_HEADER ||
+        at >= META_HEADER + page->used)
       return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
-    if (fresh && recovery->cache) {
-      cached = lc_alloc_with_allocator(NULL, sizeof(*cached));
-      if (!cached)
-        return err(error, LC_ERR_NOMEM,
-                   "cannot cache checkpoint descriptor page");
-      cached->offset = offset;
-      memcpy(cached->bytes, buffer, PS_PAGE);
-      cached->next = recovery->cache[(offset / PS_PAGE) % BUCKETS];
-      recovery->cache[(offset / PS_PAGE) % BUCKETS] = cached;
-    }
-    recovery->loaded = offset;
-    generation = get64(buffer + 16);
+    generation = page->generation;
     p = metadata_find(s, offset);
-    if (p && (p->index || p->generation != generation || p->used != used ||
-              p->following != next))
+    if (p && (p->index || p->generation != generation ||
+              p->used != page->used || p->following != page->following))
       return err(error, LC_ERR_PROTOCOL, "conflicting metadata ownership");
     if (!p) {
       p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -3330,19 +3342,19 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
       p->run.offset = offset;
       p->run.bytes = PS_PAGE;
       p->generation = generation;
-      p->used = used;
-      p->following = next;
+      p->used = page->used;
+      p->following = page->following;
       metadata_register(s, p);
     }
     ++p->references;
-    take = META_HEADER + used - at;
+    take = META_HEADER + page->used - at;
     if (take > ref.bytes - done)
       take = (size_t)ref.bytes - done;
-    memcpy(wire + done, buffer + at, take);
+    memcpy(recovery->wire + done, page->bytes + at, take);
     done += take;
-    if (done < ref.bytes && (!next || used != META_PAYLOAD))
+    if (done < ref.bytes && (!page->following || page->used != META_PAYLOAD))
       return err(error, LC_ERR_PROTOCOL, "truncated packed metadata record");
-    offset = next;
+    offset = page->following;
     at = META_HEADER;
   }
   return LC_OK;
@@ -3818,6 +3830,29 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
              ? LC_OK
              : err(error, LC_ERR_PROTOCOL, "unreferenced owned run directory");
 }
+static int recover_directory(ps_space *s, unsigned char *wire,
+                             const ps_readiness_certificate *certificate,
+                             lc_error *error) {
+  ps_directory *directory = NULL;
+  metadata_recovery recovery = {0};
+  int rc = initial_free(s, error);
+  recovery.space = s;
+  recovery.wire = wire;
+  recovery.certified_root = certificate->root == s->generation;
+  recovery.cohort_origin = certificate->origin;
+  if (rc == LC_OK)
+    rc = directory_open(s, s->directory, &directory, error);
+  if (rc == LC_OK)
+    rc = ps_directory_visit(directory, recover_directory_entry,
+                            recover_directory_page, &recovery, error);
+  ps_directory_close(directory);
+  metadata_read_cache_close(&recovery);
+  if (rc == LC_OK)
+    rc = validate_owned_directory(s, error);
+  if (rc == LC_OK)
+    rc = ps_catalog_validate_directory(s, error);
+  return rc;
+}
 static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
   ps_entry *head = stream_lookup(s, p->key.owner);
   if (!head || head->stream_sealed || p->key.key != head->stream_capacity ||
@@ -3957,8 +3992,6 @@ static int recover(ps_space *s, lc_error *error) {
   recovery_values *values;
   ps_readiness_certificate certificate;
   const unsigned char *root;
-  ps_directory *directory = NULL;
-  metadata_recovery recovery;
   ps_entry *p = NULL;
   struct stat st;
   uint64_t grant_limit;
@@ -4005,24 +4038,8 @@ static int recover(ps_space *s, lc_error *error) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate recovery buffers");
     goto done;
   }
-  memset(&recovery, 0, sizeof(recovery));
-  recovery.space = s;
-  recovery.wire = wire;
-  recovery.buffer = values->buffer;
-  recovery.certified_root = certificate.root == s->generation;
-  recovery.cohort_origin = certificate.origin;
   values->packed.offset = 0;
-  rc = initial_free(s, error);
-  if (rc == LC_OK)
-    rc = directory_open(s, s->directory, &directory, error);
-  if (rc == LC_OK)
-    rc = ps_directory_visit(directory, recover_directory_entry,
-                            recover_directory_page, &recovery, error);
-  ps_directory_close(directory);
-  if (rc == LC_OK)
-    rc = validate_owned_directory(s, error);
-  if (rc == LC_OK)
-    rc = ps_catalog_validate_directory(s, error);
+  rc = recover_directory(s, wire, &certificate, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -4527,19 +4544,15 @@ static void projection_install(ps_space *s, ps_space *v) {
     mark_durable(s, s->own_ready_sequence);
 }
 static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
-  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0},
-                                          *buffer = NULL;
+  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   const unsigned char *root;
   ps_space *v = NULL;
-  ps_directory *directory = NULL;
-  metadata_recovery recovery;
   ps_entry *p, *old, **items = NULL;
   ps_run *run;
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
   ps_readiness_certificate certificate;
-  memset(&recovery, 0, sizeof(recovery));
   rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
     return rc;
@@ -4586,8 +4599,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
       st.st_size < (off_t)get64(root + 16))
     return err(error, LC_ERR_INVALID, "checkpoint capacity unavailable");
   v = lc_calloc_with_allocator(NULL, 1, sizeof(*v));
-  buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
-  if (!v || !buffer) {
+  if (!v) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint projection");
     goto done;
   }
@@ -4608,29 +4620,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate projection control buffer");
     goto done;
   }
-  recovery.space = v;
-  recovery.wire = v->journal_image;
-  recovery.buffer = buffer;
-  recovery.certified_root = certificate.root == v->generation;
-  recovery.cohort_origin = certificate.origin;
-  recovery.cache =
-      lc_calloc_with_allocator(NULL, BUCKETS, sizeof(*recovery.cache));
-  if (!recovery.cache) {
-    rc = err(error, LC_ERR_NOMEM, "cannot allocate projection page cache");
-    goto done;
-  }
-  rc = initial_free(v, error);
-  if (rc == LC_OK)
-    rc = directory_open(v, v->directory, &directory, error);
-  if (rc == LC_OK)
-    rc = ps_directory_visit(directory, recover_directory_entry,
-                            recover_directory_page, &recovery, error);
-  ps_directory_close(directory);
-  directory = NULL;
-  if (rc == LC_OK)
-    rc = validate_owned_directory(v, error);
-  if (rc == LC_OK)
-    rc = ps_catalog_validate_directory(v, error);
+  rc = recover_directory(v, v->journal_image, &certificate, error);
   if (rc != LC_OK)
     goto done;
   v->token_limit = certificate.grant_limit;
@@ -4751,8 +4741,6 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     destroy(v);
   }
   lc_free_with_allocator(NULL, items);
-  lc_free_with_allocator(NULL, buffer);
-  metadata_read_cache_close(&recovery);
   return rc;
 }
 int ps_refresh(ps_space *s, lc_error *error) {
