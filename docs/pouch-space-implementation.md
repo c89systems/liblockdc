@@ -10301,3 +10301,76 @@ indexed mutation latency and grouped reopen remain qualification work.
 Targeted verification passed 38 GNU Release, 15 Debug ASan/UBSan and
 23 musl Release groups. Raw measurements and test logs are under
 `checkpoint-journal-` in `build/pouch-space-concurrent/`.
+
+## Writer-assisted retirement of covered segments
+
+In a traced four-writer refusal, selected stream runs used 8.45–8.51 MiB
+of the fixed 10 MiB container. There was no retired run payload left for
+the physical checkpoint to release. Common free space had fallen to
+76–84 KiB before the standing reserve and existing budgets. The background
+worker had estimated reclaimable history in earlier passes. About 390 ms
+elapsed between the last completed state pass and the first refusal.
+
+While the pressure hint is set, an ordinary namespace append checks its
+own sealed predecessors for segments that lost their last reference. It
+publishes pending key checkpoint coverage before selecting up to four
+obsolete segments. The common catalog path rechecks coverage, references
+and namespace view witnesses and durably removes the confirmed bindings.
+Stream retirement follows catalog removal. Successful retirement releases
+the resident source while captured readers retain their own physical pins.
+The allocator's checkpoint still governs when the pages can be reused.
+
+This work can add durable metadata publication to a pressured NoSync
+append. It runs before the producer starts and uses the writer's existing
+namespace edit authority. A captured namespace view defers the work and
+the append can still proceed. Independent namespaces can publish through
+their own authority. The path also works when producers run with their
+own background workers disabled.
+
+The two-owner fixture runs under both durability policies. A peer budget
+raises pressure. A captured namespace view initially protects five obsolete
+bindings. After the view closes, the next append removes four and the
+following append removes the fifth. The still referenced predecessor stays
+bound. A reader captured before the replacement reads its original body
+through physical checkpoint. Cold reopen verifies the retained key, the
+replacement and the later append.
+
+In an instrumented pilot, the 12 MiB NoSync profile completed six of six
+revised attempts and five of six reference attempts. The 20 MiB profile
+completed six of six revised attempts and three of six reference attempts.
+Every pilot refusal was ordinary capacity pressure. Logs use the
+`capacity-ownership-` and `capacity-assist-` prefixes in
+`build/pouch-space-concurrent/`.
+
+All 42 workflows in the uninstrumented GNU rotation completed and verified.
+Each native build used a fixed 10 MiB container. The tables give medians
+in milliseconds in the order prior native (`4626c3ba`), revised native,
+multifile. Each build ran four attempts in each NoSync indexed profile
+and two in each remaining profile. Grouped reopen includes the cold
+owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1194.81 / 1137.13 / 1289.15 | 63.49 / 59.62 / 31.62 | 5.17 / 35.21 / 1.09 | 8.84 / 10.49 / 0.84 | 4.76 / 4.60 / 6.50 |
+| NoSync indexed, 20 MiB | 2804.82 / 2441.62 / 2105.57 | 88.49 / 82.10 / 33.26 | 17.81 / 3.51 / 1.12 | 15.92 / 13.67 / 0.84 | 8.22 / 8.10 / 9.32 |
+| Durable indexed, 15 MiB | 6277.64 / 5676.11 / 5183.83 | 88.50 / 76.03 / 62.40 | 1.75 / 11.42 / 1.07 | 9.29 / 10.90 / 0.55 | 6.08 / 6.54 / 7.24 |
+| Warmed NoSync queue | 9.11 / 11.02 / 71.39 | 1.66 / 2.09 / 15.77 | 0.30 / 0.22 / 0.06 | 4.46 / 4.35 / 0.36 | 0.22 / 0.20 / 0.42 |
+| Durable outbox | 872.75 / 858.11 / 1257.62 | 187.58 / 171.60 / 229.85 | 0.57 / 0.73 / 0.31 | 31.38 / 28.93 / 53.38 | 55.05 / 57.93 / 110.95 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 234.34 / 230.99 / 295.70 | 64.07 / 63.87 / 187.89 | 35.52 / 20.31 / 213.95 | 0.65 / 0.68 / 1.17 |
+| NoSync indexed, 20 MiB | 312.95 / 324.32 / 472.40 | 110.54 / 78.04 / 250.58 | 68.20 / 41.71 / 283.11 | 1.38 / 1.29 / 1.67 |
+| Durable indexed, 15 MiB | 153.87 / 141.64 / 180.50 | 31.67 / 35.07 / 155.67 | 13.58 / 2.36 / 153.06 | 0.45 / 0.55 / 0.64 |
+
+Heavy NoSync median work fell by 13% relative to the prior build. Every
+native attempt in this final rotation completed, so the pilot provides
+the observed difference in refusals. Indexed mutation tails and grouped
+indexed reopen still exceed the multifile measurements.
+
+Targeted verification passed 28 GNU Release, 14 Debug ASan/UBSan and 21
+musl Release groups, including checkpoint and catalog fault injection,
+shared lease and outbox recovery, and index recovery. The older capacity
+fixture now verifies native tombstones at full capacity by checking the
+active stream identity and tail and reading back both deletions after cold
+reopen.

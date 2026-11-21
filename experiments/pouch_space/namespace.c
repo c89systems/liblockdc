@@ -1211,6 +1211,9 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   rc = checkpoint_ready(d, e);
   if (rc == LC_OK)
     rc = ps_ns_finish_seal(d, e);
+  if (rc == LC_OK && !maintenance &&
+      ps_maintenance_pressure_requested(ns->root->space))
+    rc = ps_ns_reclaim_before_append(d, e);
   if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint)) {
     pthread_mutex_lock(&d->mutex);
     rc = ps_key_checkpoint_flush(d->checkpoint, e);

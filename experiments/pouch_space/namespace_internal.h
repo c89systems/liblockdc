@@ -82,6 +82,7 @@ void ps_ns_leave(struct ps_namespace_data *);
  * mutation authority and the data mutex across this check and publication. */
 int ps_ns_require_unpinned(struct ps_namespace_data *, lc_error *);
 int ps_ns_finish_seal(struct ps_namespace_data *, lc_error *);
+int ps_ns_reclaim_before_append(struct ps_namespace_data *, lc_error *);
 int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
                         lc_error *);
 int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);

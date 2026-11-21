@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "budget.h"
 #include "checkpoint_record.h"
 #include "coordination.h"
 #include "frame.h"
@@ -1813,21 +1814,21 @@ static void mutation_capacity(const char *path, const char *directory) {
   full_before = storage_info(p, "full", &e);
   peer_before = storage_info(p, "victim", &e);
   read_value(p, "full", "key-0", 65569, 0, 1, &e);
-  /* These small-key tombstones fit the standing bounded-work reserve even
-   * when rotation is required. This does not cover the maximum key size. */
+  /* Native tombstones spend the standing reserve through metadata revision,
+   * even with no ordinary headroom for a successor stream. */
   ok(lc_pouch_state_delete(p, "full", "key-0", NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
   full_after = storage_info(p, "full", &e);
-  REQUIRE(full_after.active_segment == full_before.active_segment + 1 &&
-          full_after.tail);
+  REQUIRE(full_after.active_segment == full_before.active_segment &&
+          full_after.tail == full_before.tail);
   ok(lc_pouch_state_read_metadata(p, "full", "key-0", &r, &e), &e);
   REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
   ok(lc_pouch_state_delete(p, "victim", "key", NULL, &w, &e), &e);
   lc_pouch_state_write_result_cleanup(&allocator, &w);
   peer_after = storage_info(p, "victim", &e);
-  REQUIRE(peer_after.active_segment == peer_before.active_segment + 1 &&
-          peer_after.tail);
+  REQUIRE(peer_after.active_segment == peer_before.active_segment &&
+          peer_after.tail == peer_before.tail);
   lc_pouch_close(p);
   REQUIRE(live == 0);
   ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
@@ -4530,6 +4531,82 @@ static void maintenance_busy_namespace(const char *path) {
   REQUIRE(live == 0 && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static void maintenance_append_pressure(const char *path, int sync) {
+  const char *name = "append-pressure";
+  const size_t bytes = 4 * PS_CHUNK;
+  ps_pouch_state_options o = shared_options(0, sync);
+  lc_pouch *writer = NULL, *peer = NULL;
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_state_read_result pinned = {0};
+  ps_namespace *ns = NULL;
+  ps_namespace_view *view = NULL;
+  ps_namespace_status status;
+  ps_budget *pressure = NULL;
+  ps_budget_plan plan = {5 * PS_MIB, 0, 0, 0};
+  ps_space *space;
+  lc_error e = {0};
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &peer, &e), &e);
+  input kept = source(bytes, 7), before = source(bytes, 31);
+  input after = source(bytes, 47), progress = source(17, 61);
+  ok(put(writer, name, "kept", &kept, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(put(writer, name, "latest", &before, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(lc_pouch_state_read(peer, name, "latest", &pinned, &e), &e);
+  for (unsigned char seed = 34; seed < 38; ++seed) {
+    input superseded = source(bytes, seed);
+    ok(put(writer, name, "latest", &superseded, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+  }
+  ok(put(writer, name, "latest", &after, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+
+  space = ps_root_space(ps_pouch_state_root(peer));
+  ok(ps_root_namespace_acquire(ps_pouch_state_root(peer), name, 0, &ns, &e),
+     &e);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == 7 && status.active_segment == 7);
+  ok(ps_refresh(space, &e), &e);
+  ok(ps_budget_open(space, &plan, &pressure, &e), &e);
+  REQUIRE(ps_maintenance_pressure_requested(space));
+  ok(ps_namespace_view_open(ns, &view, &e), &e);
+  ok(put(writer, name, "progress", &progress, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == 8 && status.active_segment == 8);
+  ps_namespace_view_close(view);
+
+  progress = source(17, 73);
+  ok(put(writer, name, "progress", &progress, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == 4 && status.active_segment == 8);
+  progress = source(17, 85);
+  ok(put(writer, name, "progress", &progress, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == 3 && status.active_segment == 8);
+  ps_space *writer_space = ps_root_space(ps_pouch_state_root(writer));
+  ok(ps_refresh(writer_space, &e), &e);
+  ok(ps_checkpoint(writer_space, &e), &e);
+  drain(pinned.body, bytes, 31, &e);
+  lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+  ok(ps_budget_close(pressure, &e), &e);
+  ps_namespace_release(ns);
+  lc_pouch_close(peer);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0);
+
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &writer, &e), &e);
+  read_value(writer, name, "kept", bytes, 7, 1, &e);
+  read_value(writer, name, "latest", bytes, 47, 6, &e);
+  read_value(writer, name, "progress", 17, 85, 3, &e);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 static void maintenance(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -6412,7 +6489,10 @@ static void *worker(void *context) {
     staging_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
-  else if (!strcmp(r->mode, "maintenance-capacity-schedule"))
+  else if (!strcmp(r->mode, "maintenance-append-pressure")) {
+    maintenance_append_pressure(r->path, 0);
+    maintenance_append_pressure(r->path, 1);
+  } else if (!strcmp(r->mode, "maintenance-capacity-schedule"))
     maintenance_capacity_schedule();
   else if (!strcmp(r->mode, "maintenance-tail"))
     maintenance_partial_tail(r->path, r->directory);

@@ -227,25 +227,16 @@ static int segment_covered(struct ps_namespace_data *d, ps_ns_resource *r,
          (r->id < coverage->segment ||
           (r->id == coverage->segment && coverage->offset >= info->tail));
 }
-int ps_namespace_unlink_covered(ps_namespace *ns, uint64_t minimum_bytes,
-                                ps_namespace_retirement **retirements,
-                                size_t *completed, lc_error *e) {
+static int unlink_covered_locked(struct ps_namespace_data *d,
+                                 uint64_t minimum_bytes, size_t minimum_count,
+                                 ps_namespace_retirement **retirements,
+                                 size_t *completed, lc_error *e) {
   ps_catalog_removal removals[PS_NAMESPACE_RETIRE_LIMIT];
   ps_ns_resource *sources[PS_NAMESPACE_RETIRE_LIMIT], *r;
-  struct ps_namespace_data *d;
   ps_checkpoint_info coverage;
   ps_stream_info info;
   size_t i, count = 0;
-  int rc;
-  if (!retirements || !completed)
-    return failure(e, "covered unlink requires retirement outputs");
-  *completed = 0;
-  rc = ps_ns_data_get(ns, &d, e);
-  if (rc == LC_OK)
-    rc = ps_ns_enter(d, e);
-  if (rc != LC_OK)
-    return rc;
-  pthread_mutex_lock(&d->mutex);
+  int rc = LC_OK;
   ps_key_checkpoint_info(d->checkpoint, &coverage);
   for (i = 0;
        rc == LC_OK && d->checkpoint_ready && coverage.epoch &&
@@ -268,17 +259,92 @@ int ps_namespace_unlink_covered(ps_namespace *ns, uint64_t minimum_bytes,
     removals[count].kind = r->kind;
     ++count;
   }
-  if (rc == LC_OK && count > 1)
+  if (rc == LC_OK && count >= minimum_count)
     rc = ps_ns_require_unpinned(d, e);
-  if (rc == LC_OK && count > 1)
-    rc = ps_catalog_remove_many(ns->root->space, ns->identity.owner, removals,
-                                count, completed, e);
+  if (rc == LC_OK && count >= minimum_count)
+    rc = ps_catalog_remove_many(d->ns->root->space, d->ns->identity.owner,
+                                removals, count, completed, e);
   for (i = 0; i < *completed; ++i) {
     ps_ns_remove(d, sources[i]);
     retirements[i] = retain_retirement(d, sources[i]);
   }
+  return rc;
+}
+int ps_namespace_unlink_covered(ps_namespace *ns, uint64_t minimum_bytes,
+                                ps_namespace_retirement **retirements,
+                                size_t *completed, lc_error *e) {
+  struct ps_namespace_data *d;
+  int rc;
+  if (!retirements || !completed)
+    return failure(e, "covered unlink requires retirement outputs");
+  *completed = 0;
+  rc = ps_ns_data_get(ns, &d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_enter(d, e);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&d->mutex);
+  rc = unlink_covered_locked(d, minimum_bytes, 2, retirements, completed, e);
   pthread_mutex_unlock(&d->mutex);
   ps_ns_leave(d);
+  return rc;
+}
+
+/* The appending owner already holds namespace edit authority. Complete
+ * durable coverage before unlinking sources that lost their last reference.
+ * The common selector rechecks coverage and view witnesses after the flush. */
+int ps_ns_reclaim_before_append(struct ps_namespace_data *d, lc_error *e) {
+  ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
+  ps_ns_resource **link = &d->retired;
+  lc_error local = {0};
+  size_t i, count = 0;
+  int rc = LC_OK;
+  if (!e)
+    e = &local;
+  pthread_mutex_lock(&d->mutex);
+  for (i = 0; i < d->count; ++i) {
+    ps_ns_resource *source = d->items[i];
+    if (source->kind == PS_CATALOG_SEGMENT && !source->unselected &&
+        source->id < d->active &&
+        !ps_key_checkpoint_source_refs(d->checkpoint, source->kind, source->id))
+      break;
+  }
+  if (i < d->count) {
+    rc = ps_ns_require_unpinned(d, e);
+    if (rc == LC_OK)
+      rc = ps_key_checkpoint_flush(d->checkpoint, e);
+    if (rc == LC_OK)
+      rc = unlink_covered_locked(d, 0, 1, retirements, &count, e);
+  }
+  pthread_mutex_unlock(&d->mutex);
+  if (rc == LC_ERR_PENDING ||
+      (rc == LC_ERR_INVALID && e->server_code &&
+       !strcmp(e->server_code, "pouch_namespace_busy"))) {
+    lc_error_cleanup(e);
+    rc = LC_OK;
+  }
+  /* Confirmed unlinks were prepended under this same namespace authority.
+   * Release completed owners directly. Captured windows own their mappings
+   * independently, and unfinished retirements stay available to the reaper. */
+  while (count) {
+    ps_ns_resource *source = retirements[--count];
+    int retired =
+        ps_namespace_retire_unlinked(d->ns, source, rc == LC_OK ? e : NULL);
+    if (retired == LC_OK) {
+      pthread_mutex_lock(&d->mutex);
+      *link = source->next;
+      pthread_mutex_unlock(&d->mutex);
+      ps_ns_resource_release(source);
+    } else
+      link = &source->next;
+    if (rc == LC_OK) {
+      if (retired == LC_ERR_PENDING)
+        lc_error_cleanup(e);
+      else
+        rc = retired;
+    }
+  }
+  lc_error_cleanup(&local);
   return rc;
 }
 static int reap(struct ps_namespace_data *d, uint64_t *closed,
