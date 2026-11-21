@@ -2895,6 +2895,108 @@ static void fragmented_preparation(void) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+typedef struct checkpoint_preparation_io {
+  uint64_t offsets[16], lengths[16], bytes;
+  size_t ranges, syncs;
+  int fail_zero, fail_barrier;
+} checkpoint_preparation_io;
+static int checkpoint_zero(void *context, int fd, off_t offset, off_t bytes) {
+  static const unsigned char zero[PS_PAGE];
+  checkpoint_preparation_io *io = context;
+  REQUIRE(offset >= PS_DATA && !(offset % PS_PAGE) && bytes > 0 &&
+          !(bytes % PS_PAGE) && io->ranges < 16);
+  io->offsets[io->ranges] = (uint64_t)offset;
+  io->lengths[io->ranges++] = (uint64_t)bytes;
+  io->bytes += (uint64_t)bytes;
+  for (off_t at = 0; at < bytes; at += PS_PAGE) {
+    REQUIRE(pwrite(fd, zero, sizeof(zero), offset + at) == sizeof(zero));
+    if (io->fail_zero) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return 0;
+}
+static int checkpoint_preparation_sync(void *context, int fd) {
+  checkpoint_preparation_io *io = context;
+  ++io->syncs;
+  if (io->fail_barrier && io->ranges) {
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+enum checkpoint_preparation_case {
+  CHECKPOINT_PREPARE,
+  CHECKPOINT_ZERO_FAILURE,
+  CHECKPOINT_BARRIER_FAILURE
+};
+static void checkpoint_preparation(enum checkpoint_preparation_case outcome) {
+  const ps_key stream = {89, 1, PS_STREAM};
+  checkpoint_preparation_io probe = {0};
+  ps_io io = {&probe,     read_io,        write_io, checkpoint_preparation_sync,
+              reserve_io, checkpoint_zero};
+  ps_options options = {.io = &io};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_reader *held = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_status info;
+  ps_coordination_guard *guard = NULL;
+  lc_error e = {0};
+  uint64_t base, syncs;
+
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 24; ++id)
+    capture_put(writer, id, PS_STREAM_PIECE_BYTES);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_read_open(peer, key(2), NULL, &held, &e), &e);
+  for (uint64_t id = 2; id <= 24; id += 2)
+    ok(ps_delete(writer, key(id), &e), &e);
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(!probe.ranges);
+  capture_put(writer, 42, 65);
+  REQUIRE(!pthread_mutex_lock(&writer->mutex));
+  ok(ps_internal_capture_begin(writer, &guard, &e), &e);
+  ps_readiness_set_pressure(writer, 1);
+  ok(ps_internal_capture_end(writer, guard, LC_OK, &e), &e);
+  REQUIRE(!pthread_mutex_unlock(&writer->mutex));
+
+  probe.fail_zero = outcome == CHECKPOINT_ZERO_FAILURE;
+  probe.fail_barrier = outcome == CHECKPOINT_BARRIER_FAILURE;
+  syncs = probe.syncs;
+  int rc = ps_checkpoint(writer, &e);
+  if (probe.fail_barrier) {
+    REQUIRE(rc == LC_ERR_TRANSPORT && probe.syncs == syncs + 1);
+    lc_error_cleanup(&e);
+  } else {
+    ok(rc, &e);
+    REQUIRE(probe.syncs == syncs + 3);
+  }
+  REQUIRE(probe.ranges && probe.bytes <= PS_MIB);
+  REQUIRE(probe.fail_zero ? probe.ranges == 1 : probe.ranges > 1);
+  for (size_t i = 0; i < probe.ranges; ++i)
+    REQUIRE(prepared_prefix(peer, probe.offsets[i], probe.lengths[i]) ==
+            (outcome == CHECKPOINT_PREPARE ? probe.lengths[i] : 0));
+  captured_expect(held, 2, PS_STREAM_PIECE_BYTES);
+  ps_reader_close(held);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_owned_open(peer, NULL, stream, 1, NULL, &head, &info, &e), &e);
+  if (outcome == CHECKPOINT_PREPARE) {
+    base = expect_zero_grant(peer, NULL, head, &info, 0, probe.offsets[0], 0);
+    REQUIRE(!prepared_prefix(peer, base, PS_PAGE));
+  } else {
+    expect_zero_grant(peer, NULL, head, &info, 0, 0, 1);
+  }
+  ps_owned_close(head);
+  ok(ps_checkpoint(peer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  REQUIRE(!prepared_prefix(peer, probe.offsets[0], probe.lengths[0]));
+  expect_value(peer, key(1), PS_STREAM_PIECE_BYTES, 1);
+  ok(ps_close(peer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct reopen_disk {
   size_t syncs, fail_sync;
 } reopen_disk;
@@ -6059,6 +6161,9 @@ int main(int argc, char **argv) {
     fragmented_preparation();
     prepared_grants();
     prepared_grant_fault();
+    checkpoint_preparation(CHECKPOINT_PREPARE);
+    checkpoint_preparation(CHECKPOINT_ZERO_FAILURE);
+    checkpoint_preparation(CHECKPOINT_BARRIER_FAILURE);
   } else if (!strcmp(argv[2], "stream-header-capture")) {
     stream_header_capture(0);
     stream_header_capture(1);

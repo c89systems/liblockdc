@@ -161,6 +161,13 @@ static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
   }
   return LC_OK;
 }
+static int zero_file_range(ps_space *s, uint64_t offset, uint64_t bytes) {
+  int rc;
+  do {
+    rc = s->io.zero(s->io.context, s->fd, (off_t)offset, (off_t)bytes);
+  } while (rc < 0 && errno == EINTR);
+  return rc;
+}
 static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
                             unsigned char *zero, lc_error *error) {
   size_t n;
@@ -168,9 +175,7 @@ static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
   if (!bytes)
     return LC_OK;
   if (s->io.zero) {
-    do {
-      rc = s->io.zero(s->io.context, s->fd, (off_t)offset, (off_t)bytes);
-    } while (rc < 0 && errno == EINTR);
+    rc = zero_file_range(s, offset, bytes);
     if (rc == 0)
       return LC_OK;
     if (errno != EOPNOTSUPP && errno != ENOSYS && errno != EINVAL)
@@ -2692,6 +2697,41 @@ static int clear_checkpoint_journal(ps_space *s, unsigned char *image,
   memset(image, 0, bytes);
   return transfer(s, image, bytes, JOURNAL_OFFSET, 1, error);
 }
+#define CHECKPOINT_ZERO_RANGES 16U
+typedef struct checkpoint_zero_range {
+  uint64_t offset, bytes;
+} checkpoint_zero_range;
+/* Reserve no capacity. Allocator authority protects already-free common
+ * pages during this bounded pass and the checkpoint's existing barriers.
+ * A failed optional zero write can only affect those free bytes. */
+static size_t checkpoint_prepare_free(ps_space *s,
+                                      checkpoint_zero_range *ranges) {
+  ps_run *run;
+  size_t count = 0;
+  uint64_t bytes, clean, remaining = PS_MIB;
+  if (!s->readiness || !s->allocation_guard || !s->generation || s->durable ||
+      !s->io.zero || !s->allocation_ranges_checked || !ps_readiness_pressure(s))
+    return 0;
+  for (run = s->free; run && count < CHECKPOINT_ZERO_RANGES &&
+                      remaining >= PS_STREAM_PIECE_BYTES;
+       run = run->next) {
+    if (run->claimed)
+      continue;
+    bytes = ps_readiness_zero_coverage(
+        s, run->offset, run->bytes < remaining ? run->bytes : remaining);
+    if (bytes < PS_STREAM_PIECE_BYTES)
+      continue;
+    clean = ps_readiness_zero_prefix(s, run->offset, bytes);
+    if (clean == bytes)
+      continue;
+    if (zero_file_range(s, run->offset + clean, bytes - clean) != 0)
+      break;
+    ranges[count].offset = run->offset + clean;
+    ranges[count++].bytes = bytes - clean;
+    remaining -= bytes - clean;
+  }
+  return count;
+}
 static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
@@ -2699,11 +2739,12 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   ps_run *trim = NULL;
   uint64_t bound, extra, incremental, floor = PS_MAINTENANCE_RESERVE;
   uint64_t prepared = 0;
+  checkpoint_zero_range zero_ranges[CHECKPOINT_ZERO_RANGES];
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0}, empty = {0};
   ps_directory_pages changes;
   metadata_builder builder;
-  size_t i;
+  size_t i, zero_count = 0;
   int next = 1 - s->root, rc, removed, dense = 0;
   if (s->generation == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
@@ -2766,6 +2807,8 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     ps_directory_changed_pages(directory, &changes);
     rc = metadata_prepare_retirement(s, &changes, dense, error);
   }
+  if (rc == LC_OK)
+    zero_count = checkpoint_prepare_free(s, zero_ranges);
   if (rc == LC_OK)
     rc = sync_file(s, error); /* payloads, journal and new metadata pages */
   memset(root, 0, sizeof(root));
@@ -2883,9 +2926,17 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     p->safe = 1;
   }
   rc = pins_reclaim_locked(s, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
     collect_retired(s);
-  return rc == LC_OK ? healthy(s, error) : rc;
+    rc = healthy(s, error);
+  }
+  /* Publish proofs only after successful checkpoint completion, while these
+   * intervals are still protected by the same allocator scope. */
+  if (rc == LC_OK)
+    for (i = 0; i < zero_count; ++i)
+      ps_readiness_zero_pages(s, zero_ranges[i].offset, zero_ranges[i].bytes,
+                              1);
+  return rc;
 }
 static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
   ps_coordination_guard *guard = NULL;

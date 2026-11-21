@@ -429,15 +429,20 @@ static uint64_t bitmap_span_end(const uint64_t *bitmap, uint64_t page,
   }
   return page < end ? page : end;
 }
+uint64_t ps_readiness_zero_coverage(ps_space *s, uint64_t offset,
+                                    uint64_t bytes) {
+  if (!s->readiness || offset < PS_DATA || offset >= BITMAP_END)
+    return 0;
+  return bytes > BITMAP_END - offset ? BITMAP_END - offset : bytes;
+}
 uint64_t ps_readiness_zero_find(ps_space *s, uint64_t offset, uint64_t bytes,
                                 uint64_t wanted, uint64_t *selected) {
   const uint64_t *bitmap;
   uint64_t first, page, next, end, best = 0;
   *selected = offset;
-  if (!s->readiness || offset < PS_DATA || offset >= BITMAP_END)
+  bytes = ps_readiness_zero_coverage(s, offset, bytes);
+  if (!bytes)
     return 0;
-  if (bytes > BITMAP_END - offset)
-    bytes = BITMAP_END - offset;
   bitmap = s->readiness->page + ZERO_BITMAP;
   first = (offset - PS_DATA) / PS_PAGE;
   end = first + bytes / PS_PAGE;
@@ -456,10 +461,9 @@ uint64_t ps_readiness_zero_find(ps_space *s, uint64_t offset, uint64_t bytes,
 uint64_t ps_readiness_zero_prefix(ps_space *s, uint64_t offset,
                                   uint64_t bytes) {
   uint64_t start;
-  if (!s->readiness || offset < PS_DATA || offset >= BITMAP_END)
+  bytes = ps_readiness_zero_coverage(s, offset, bytes);
+  if (!bytes)
     return 0;
-  if (bytes > BITMAP_END - offset)
-    bytes = BITMAP_END - offset;
   start = (offset - PS_DATA) / PS_PAGE;
   return (bitmap_span_end(s->readiness->page + ZERO_BITMAP, start,
                           start + bytes / PS_PAGE, 1) -

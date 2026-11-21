@@ -11117,3 +11117,106 @@ passed.
 
 Logs and traces use the `prep-next-` and `prep-scoped-` prefixes in
 `build/pouch-space-concurrent/`.
+
+## Preparing common free pages during pressured checkpoints
+
+Three eight-writer NoSync probes at 10 MiB logged 355 dirty foreground
+grants and 90 checkpoints under pressure. At 42 of those checkpoints
+the largest common free run was at most 160 KiB. At 24 there was no
+prepared common span. A checkpoint can prepare several of those
+fragments using a barrier that it already needs.
+
+A shared NoSync checkpoint under pressure now zeroes up to 1 MiB
+across at most sixteen common free intervals. It considers intervals
+that cover at least one 32 KiB stream piece within the tracked span.
+The pass runs with the allocator's checked free projection, before
+the first checkpoint barrier. A successful checkpoint certifies the
+cleared pages with the existing volatile bitmap before releasing
+allocator authority. Prepared pages stay in the common pool.
+The pass uses the zero-range operation when available. A failed
+optional operation ends the pass and contributes no proof for that
+range. A failed checkpoint installs none of the new proofs.
+
+The fragmented fixture uses a pinned retired value, several common
+holes, and separate checkpoint and grant owners. The new checkpoint
+prepares more than one interval within 1 MiB, uses three barriers,
+and lets the peer take the prepared grant with no additional sync.
+The fixture verifies revocation of the spent proof and reads the
+pinned bytes through the checkpoint. Partial zeroing and an injected
+first barrier failure both leave the affected grant requiring its
+own successful preparation. Cold admission resets the bitmap. The
+prior build fails the fixture at the missing checkpoint preparation.
+
+The policy pilot verified 16 eight-writer NoSync workflows. The table
+reports four-run medians for each preparation budget.
+
+| Preparation policy | Work (s) | Per-item p95 (ms) | Foreground syncs |
+| --- | ---: | ---: | ---: |
+| Prior | 2.24 | 98.76 | 172.5 |
+| Four ranges, 256 KiB | 2.23 | 86.65 | 153 |
+| Eight ranges, 512 KiB | 2.31 | 101.31 | 149.5 |
+| Sixteen ranges, 1 MiB | 2.00 | 83.44 | 128.5 |
+
+A separate set of three matched instrumented runs per build verified
+1,152 items per build. Foreground preparation waits fell from 662
+to 401 and summed preparation time fell from 10.29 to 6.02 s.
+The 57 slowest items spent 1.17 and 0.80 s in preparation, respectively.
+Summed allocator-lock time rose from 7.99 to 8.75 s. These figures
+sum concurrent calls and include profiling overhead.
+
+Three further instrumented workflows observed 62 nonempty zeroing
+passes. Median added zeroing time under allocator authority was
+0.23 ms, p95 was 0.37 ms, and the maximum observed was 1.57 ms.
+The median pass cleared 872 KiB and the largest cleared 1 MiB.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`2be5a09b`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 1003.34 / 848.36 / 1291.69 | 52.17 / 45.99 / 28.29 | 5.13 / 2.79 / 0.99 | 9.69 / 8.29 / 0.96 | 4.95 / 5.19 / 7.76 |
+| NoSync indexed, 4 writers, 20 MiB | 1762.63 / 1354.87 / 2018.56 | 58.95 / 42.73 / 29.63 | 3.43 / 6.87 / 1.03 | 11.98 / 11.09 / 0.82 | 7.61 / 7.20 / 9.65 |
+| Durable indexed, 2 writers, 15 MiB | 3506.70 / 4092.22 / 5555.23 | 49.03 / 59.49 / 68.79 | 17.91 / 1.92 / 0.91 | 7.89 / 7.83 / 0.82 | 6.22 / 5.26 / 8.37 |
+| Warmed NoSync queue | 11.35 / 11.27 / 92.94 | 2.11 / 2.30 / 24.77 | 0.27 / 0.28 / 0.06 | 5.60 / 5.61 / 0.48 | 0.27 / 0.25 / 0.41 |
+| Durable outbox | 1009.18 / 854.33 / 1275.26 | 191.60 / 155.94 / 242.75 | 0.44 / 0.48 / 0.29 | 44.48 / 31.05 / 48.28 | 72.32 / 52.37 / 106.22 |
+| NoSync indexed, 8 writers, 24 MiB | 2193.03 / 1998.70 / 2801.75 | 90.84 / 80.38 / 60.20 | 21.89 / 11.86 / 1.69 | 19.13 / 24.13 / 1.79 | 10.06 / 11.81 / 13.16 |
+| Durable indexed, 8 writers, 24 MiB | 4237.61 / 4012.84 / 8737.85 | 138.22 / 126.16 / 205.97 | 5.82 / 7.32 / 1.66 | 17.62 / 24.17 / 1.57 | 9.88 / 10.17 / 13.77 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 242.42 / 214.45 / 296.12 | 51.14 / 63.60 / 187.63 | 47.57 / 39.94 / 214.26 | 0.74 / 0.84 / 1.42 |
+| NoSync indexed, 4 writers, 20 MiB | 368.28 / 280.96 / 433.06 | 72.98 / 58.83 / 278.71 | 53.29 / 33.89 / 335.47 | 1.32 / 1.22 / 1.88 |
+| Durable indexed, 2 writers, 15 MiB | 115.49 / 155.51 / 191.48 | 9.92 / 12.97 / 173.54 | 8.50 / 11.20 / 216.29 | 0.55 / 0.45 / 0.92 |
+| NoSync indexed, 8 writers, 24 MiB | 459.60 / 401.60 / 819.40 | 182.44 / 182.66 / 513.87 | 95.44 / 114.34 / 577.54 | 2.33 / 2.92 / 3.00 |
+| Durable indexed, 8 writers, 24 MiB | 470.08 / 395.60 / 1181.19 | 159.18 / 142.12 / 1536.28 | 53.93 / 65.15 / 2061.32 | 2.24 / 2.38 / 3.26 |
+
+Eight-writer NoSync work fell from 2.19 to 2.00 s and per-item
+p95 from 90.84 to 80.38 ms. Multifile took 2.80 s for work with
+a 60.20 ms p95. Revised median foreground mutation syncs fell
+from 160.5 to 141. Process CPU through end-of-work maintenance
+rose from 2.23 to 2.36 s. Grouped reopen rose from 19.13 to
+24.13 ms, with multifile at 1.79 ms.
+
+The heavy four-writer NoSync profile fell from 1.76 to 1.35 s
+for work and from 58.95 to 42.73 ms for per-item p95. Its
+median foreground mutation syncs fell from 143 to 128. The
+durable profiles exercise the ordinary checkpoint path outside
+the preparation gate. Work, close, and reopen still depend on
+the layout and sync scheduling in each complete run.
+
+Verification passed 41 GNU Release, 18 Debug ASan/UBSan and 18 musl
+Release groups. The GNU run initially reproduced a stale clean-reopen
+expectation in checkpoint idempotence on both builds. The corrected
+fixture verifies a no-op checkpoint after a clean reopen, then
+durably publishes a real journal suffix, recovers it and checks
+that the first checkpoint consumes it. The corrected fixture
+passed on the prior build and all three revised builds. Other
+gates covered checkpoint and explicit growth faults, shared
+capacity, reader ownership, and stream and journal recovery.
+
+Raw shapes, pilots, paired traces, matched samples, and test logs are
+in `build/pouch-space-concurrent/checkpoint-preparation/`.

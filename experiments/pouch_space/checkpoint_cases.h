@@ -129,8 +129,20 @@ static void checkpoint_idempotence(int durable) {
   OK(ps_open(path, 0, &options, &space, &error));
   OK(ps_status(space, &before, &error));
   CHECK(before.capacity == PS_DEFAULT_CAPACITY + PS_MIB &&
+        !before.journal_bytes);
+  checkpoint_unchanged(space, &probe);
+
+  /* Recover a real journal suffix. Opening a clean root assigns incarnations
+   * in the fixed grant records and leaves no journal work for a checkpoint. */
+  ps_ref replayed = put(space, state(4), "replayed", 8, 1);
+  OK(ps_flush(space, &error));
+  OK(ps_close(space, &error));
+  OK(ps_open(path, 0, &options, &space, &error));
+  OK(ps_status(space, &before, &error));
+  CHECK(before.capacity == PS_DEFAULT_CAPACITY + PS_MIB &&
         before.journal_bytes);
   expect(space, state(1), &current, "current", 7);
+  expect(space, state(4), &replayed, "replayed", 8);
   absent(space, state(2));
   OK(ps_checkpoint(space, &error));
   OK(ps_status(space, &after, &error));

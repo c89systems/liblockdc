@@ -54,6 +54,8 @@ void ps_readiness_sync_wake(ps_space *);
 /* Prepared pages are durably zeroed free payload capacity. The allocator
  * checks proofs under allocation authority and revokes them before spending
  * pages. A capacity reservation can retain the proof while bytes stay free. */
+uint64_t ps_readiness_zero_coverage(ps_space *, uint64_t offset,
+                                    uint64_t bytes);
 /* Return the first span that fits wanted, or the largest shorter span, within
  * a page-aligned free range. The output is the physical start of that span. */
 uint64_t ps_readiness_zero_find(ps_space *, uint64_t offset, uint64_t bytes,
