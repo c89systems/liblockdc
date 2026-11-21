@@ -24,7 +24,8 @@ enum ps_coordination_domain {
   PS_COORDINATION_COLLECTION_METADATA,
   PS_COORDINATION_COLLECTION_STREAMS,
   PS_COORDINATION_COLLECTION_COMPACTION,
-  PS_COORDINATION_COLLECTION_READERS
+  PS_COORDINATION_COLLECTION_READERS,
+  PS_COORDINATION_NAMESPACE_WAITER
 };
 /* Native fcntl seam for interruption/failure tests. SETLK/SETLKW return zero
  * or -1 with errno, as on Linux. No persistent data passes through this seam.
@@ -106,6 +107,10 @@ int ps_coordination_namespace_handoff(ps_coordination *,
                                       enum ps_coordination_domain, uint64_t,
                                       int, ps_coordination_guard **,
                                       lc_error *);
+/* Background state acquisition yields to a waiting foreground handoff.
+ * Pressure permits bounded retry against the current state holder. */
+int ps_coordination_namespace_maintenance(ps_coordination *, uint64_t, int,
+                                          ps_coordination_guard **, lc_error *);
 /* New incarnations can prepare concurrently even when their lock bytes
  * coincide. Adopting or reclaiming an existing incarnation needs the
  * exclusive stream claim above. */

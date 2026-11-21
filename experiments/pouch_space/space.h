@@ -20,7 +20,10 @@
   ((uint64_t)INT64_MAX - PS_TRANSACTION_GUARD_SLOTS)
 #define PS_CREDIT_RECORD_BASE                                                  \
   (PS_TRANSACTION_GUARD_BASE - PS_CREDIT_RECORD_SLOTS)
-#define PS_MAX_INCARNATION (PS_CREDIT_RECORD_BASE - PS_MAX_CAPACITY)
+/* The top page of advisory addresses below the credit records is reserved
+ * for namespace handoff. The incarnation grant boundary is still aligned
+ * down to the same complete token range. */
+#define PS_MAX_INCARNATION (PS_CREDIT_RECORD_BASE - PS_MAX_CAPACITY - PS_PAGE)
 /* Native experiment: filesystem block-sized physical allocation with small
  * logical tails sharing independently owned cells. */
 #define PS_PAGE 4096U

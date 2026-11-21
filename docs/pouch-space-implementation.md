@@ -12132,3 +12132,83 @@ ASan/UBSan and musl Release. This covers shared lease and messaging pressure,
 funded revisions, fault recovery, and root conversion with explicit growth.
 Raw runs, capacity traces, and handoff diagnostics are under
 `build/pouch-space-concurrent/allocator-tail/`.
+
+## Foreground namespace-state handoff
+
+In the 192 MiB NoSync trace, a maintenance worker held a namespace-state
+byte for 141 ms while planning compaction. It retook the same byte one
+millisecond later to publish a repacked piece and held it for 121 ms.
+The foreground lease operation exhausted the 250 ms handoff budget during
+that second hold. Both holders ran on the same thread and OFD.
+
+A foreground state acquisition still tries immediately. On contention it
+registers a compatible OFD read witness keyed to the same state slot, then
+retries against the existing deadline. After acquiring state, a background
+callback checks for those witnesses before entering the namespace. This
+orders the next handoff after an admitted callback finishes. The check
+covers the same OFD's locally counted waiters and foreign OFDs. Multiple
+waiters can register together, and process exit releases a dead waiter's
+witness. The advisory bytes fit in the unused remainder of the last
+incarnation grant range. Active namespace and token addresses retain their
+existing mapping. The 64 ms ordinary and 250 ms pressure deadlines stay
+in place.
+
+The storage boundary carries an explicit foreground or background request.
+Background compaction uses it for initial planning, piece publication,
+retirement and finish callbacks. Pressure is sampled at each background acquisition. Quiet maintenance
+defers immediately on contention. Pressured maintenance can still retry against its current holder
+and yields once it observes a registered foreground waiter.
+
+The gated fixture admits the foreground witness while maintenance is
+acquiring state, then verifies that maintenance yields and the foreground
+operation inherits the namespace. It exercises both a shared handle and two
+independently opened handles. Another fixture kills a process while its
+waiter witness is registered and verifies that background work resumes on
+the same state slot. Existing checks cover uncontended operations, the
+bounded timeout, maintenance progress, and shared lease and messaging
+pressure.
+
+All seven uninstrumented, matched 192 MiB runs verified through reopen.
+The 10 MiB native root completed three NoSync and two durable trials
+with eight independent producers. Multifile ran once in each mode.
+The preceding native rotation completed four of six attempts. The two
+failures were state handoff timeouts.
+
+Times are medians. Work, CPU and index phases are in seconds. Mutation
+p95, close, reopen and verification are in milliseconds. CPU includes
+maintenance. Index phase time is the maximum across workers.
+
+| Backend | Durability | Work | CPU | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 37.78 | 51.74 | 221.82 | 25.86 | 31.37 | 55.93 | 35.70 |
+| Native | Durable | 55.94 | 56.49 | 264.38 | 35.37 | 36.59 | 58.13 | 40.49 |
+| Multifile | NoSync | 21.88 | 10.14 | 53.69 | 4.01 | 0.24 | 1.17 | 44.37 |
+| Multifile | Durable | 74.69 | 12.52 | 216.42 | 3.48 | 0.34 | 1.28 | 41.43 |
+
+| Backend | Durability | Index flush | First query pass | Repeat query pass |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 5.26 | 1.99 | 0.78 |
+| Native | Durable | 5.63 | 1.32 | 0.47 |
+| Multifile | NoSync | 6.11 | 3.72 | 4.58 |
+| Multifile | Durable | 8.35 | 12.77 | 17.31 |
+
+The successful NoSync samples moved from 33.09 to 37.78 s of work and
+from 46.69 to 51.74 s of CPU through maintenance. Median work checkpoints
+increased from 91 to 128. Independent runs produce different layouts
+and maintenance schedules. These timings capture the combined workflow
+and leave the cause of the regression open. Durable work and indexed
+readiness took less time than multifile. CPU, foreground tails, close
+and reopen remain above multifile in this workload.
+
+One additional instrumented NoSync run verified through reopen. It recorded
+1,203 live checkpoint adoptions, with 7.76 s of aggregate thread CPU and
+7.80 s of elapsed time under allocator authority. Reading and decoding
+the directory accounted for 3.20 s of that CPU. The longest adoption took
+21.20 ms. The trace also saw a 281 ms foreground hold while selecting a
+GET source. The body copy runs after that scope releases. The added
+evidence separates checkpoint adoption and foreground selection from the
+maintenance handoff failure.
+
+Verification passed 24 GNU Release groups and 14 groups each on Debug
+ASan/UBSan and musl Release. Raw timings and holder traces are under
+`build/pouch-space-concurrent/namespace-handoff/`.

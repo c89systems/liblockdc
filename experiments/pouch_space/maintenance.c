@@ -19,7 +19,7 @@ typedef struct compact {
   ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
   size_t retirement_count;
   unsigned int selected_kind;
-  int background, defer_busy;
+  int background;
 } compact;
 static int fail(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
@@ -39,9 +39,9 @@ static int compact_namespace(compact *w, lc_pouch_state_precondition_fn fn,
                              void *context, lc_error *e) {
   if (background_stopping(w))
     return stop_pending(e);
-  if (w->defer_busy)
-    return lc_pouch_state_try_with_namespace_lock(w->pouch, w->name, fn,
-                                                  context, e);
+  if (w->background)
+    return lc_pouch_state_with_background_namespace_lock(w->pouch, w->name, fn,
+                                                         context, e);
   return lc_pouch_state_with_namespace_lock(w->pouch, w->name, fn, context, e);
 }
 static int candidate(void *context, const ps_namespace_source *source,
@@ -299,10 +299,6 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.options = options;
   w.maintenance = maintenance;
   w.background = options && options->background && !options->force;
-  /* Pressure needs reclaim to make progress beside continuously active
-   * writers. Quiet turns can give an occupied namespace another turn. */
-  w.defer_busy =
-      w.background && !ps_maintenance_pressure_requested(ps_root_space(root));
   rc = compact_namespace(&w, compact_locked, &w, e);
   for (i = 0; i < w.retirement_count; ++i) {
     int retired = ps_namespace_retire_unlinked(w.ns, w.retirements[i],

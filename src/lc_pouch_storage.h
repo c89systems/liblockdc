@@ -183,6 +183,10 @@ typedef struct lc_pouch_storage_maintenance_ops {
    * authority. A present hint is rechecked by the retention engine. */
   int (*retention_pending)(void *, const char *, int *, lc_error *);
 } lc_pouch_storage_maintenance_ops;
+enum lc_pouch_namespace_lock_policy {
+  LC_POUCH_NAMESPACE_FOREGROUND = 0,
+  LC_POUCH_NAMESPACE_BACKGROUND
+};
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   /* Force the completed publication prefix durable, including on NoSync
@@ -269,8 +273,9 @@ typedef struct lc_pouch_storage_ops {
   const lc_pouch_storage_metadata_ops *metadata;
   /* Coordinated typed owners serialize state projections and decisions per
    * logical namespace. Acquire before source or publication authority.
-   * wait=0 reports PENDING for a busy namespace without a handoff wait. */
-  int (*namespace_state_lock)(void *, const char *, int wait, void **,
+   * Background requests may yield to pending foreground work. */
+  int (*namespace_state_lock)(void *, const char *,
+                              enum lc_pouch_namespace_lock_policy, void **,
                               lc_error *);
   void (*namespace_state_unlock)(void *, void *);
 } lc_pouch_storage_ops;

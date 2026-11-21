@@ -22,6 +22,10 @@
 #define STREAM_CLAIM_BASE (VIEW_BASE - PS_COORDINATION_STREAM_CLAIM_SLOTS)
 #define STATE_SLOTS (STREAM_CLAIM_BASE - STATE_BASE)
 #define COLLECTION_CATALOG_SLOTS (STATE_BASE - PS_READINESS_OFFSET - 2U)
+#define NAMESPACE_WAITER_BASE (PS_MAX_CAPACITY + PS_MAX_INCARNATION)
+#if STATE_SLOTS > PS_PAGE
+#error "namespace waiters must fit below the credit record range"
+#endif
 struct ps_coordination_guard {
   ps_coordination *owner;
   pthread_mutex_t mutex;
@@ -291,6 +295,8 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
     return VIEW_BASE + identity % VIEW_SLOTS;
   if (domain == PS_COORDINATION_NAMESPACE_STATE)
     return STATE_BASE + identity % STATE_SLOTS;
+  if (domain == PS_COORDINATION_NAMESPACE_WAITER)
+    return NAMESPACE_WAITER_BASE + identity % STATE_SLOTS;
   if (domain >= PS_COORDINATION_COLLECTION_APPEND)
     return COLLECTION_BASE +
            (domain - PS_COORDINATION_COLLECTION_APPEND) * COLLECTION_SLOTS +
@@ -457,7 +463,8 @@ static int lock_guard(ps_coordination *owner,
     *out = NULL;
   if (!owner || !out || (wait != 0 && wait != 1) ||
       domain < PS_COORDINATION_PUBLICATION ||
-      domain > PS_COORDINATION_COLLECTION_READERS ||
+      domain > PS_COORDINATION_NAMESPACE_WAITER ||
+      (domain == PS_COORDINATION_NAMESPACE_WAITER && (!view || wait)) ||
       (domain >= PS_COORDINATION_STREAM &&
        domain <= PS_COORDINATION_NAMESPACE_STATE && wait) ||
       (domain <= PS_COORDINATION_SYNC && identity) ||
@@ -515,20 +522,75 @@ int ps_coordination_lock(ps_coordination *owner,
                          int wait, ps_coordination_guard **out, lc_error *e) {
   return lock_guard(owner, domain, identity, wait, 0, out, e);
 }
-int ps_coordination_namespace_handoff(ps_coordination *owner,
-                                      enum ps_coordination_domain domain,
-                                      uint64_t identity, int pressured,
-                                      ps_coordination_guard **out,
-                                      lc_error *e) {
+static int namespace_waiters(ps_coordination *owner, uint64_t identity,
+                             int *waiting, lc_error *e) {
+  uint64_t offset = keyed_offset(PS_COORDINATION_NAMESPACE_WAITER, identity);
+  uint64_t first, last;
+  ps_coordination_guard *guard;
+  int rc;
+  *waiting = 0;
+  /* GETLK ignores the querying OFD. Its local waiters are registered as
+   * compatible views, so one departing thread cannot clear another. */
+  pthread_mutex_lock(&owner->registry);
+  for (guard = owner->buckets[offset % BUCKETS]; guard; guard = guard->next)
+    if (guard->offset == offset) {
+      pthread_mutex_lock(&guard->mutex);
+      *waiting = ((ps_keyed_guard *)guard)->views != 0;
+      pthread_mutex_unlock(&guard->mutex);
+      break;
+    }
+  pthread_mutex_unlock(&owner->registry);
+  if (*waiting || !owner->shared)
+    return LC_OK;
+  rc = ps_coordination_conflict(owner, offset, 1, &first, &last, e);
+  *waiting = first != last;
+  return rc;
+}
+static int namespace_handoff_try(ps_coordination *owner,
+                                 enum ps_coordination_domain domain,
+                                 uint64_t identity, int background, int *wait,
+                                 ps_coordination_guard **out, lc_error *e) {
+  int waiting, rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
+  if (rc != LC_OK || !background)
+    return rc;
+  /* Observe intent after acquiring state. An operation already admitted
+   * may finish while a foreground waiter registers. Subsequent background
+   * attempts must yield while that waiter owns its witness. */
+  rc = namespace_waiters(owner, identity, &waiting, e);
+  if (rc != LC_OK || waiting) {
+    ps_coordination_unlock(*out);
+    *out = NULL;
+    *wait = 0;
+    if (rc == LC_OK)
+      rc = ps_coordination_check(owner, e);
+    if (rc == LC_OK)
+      rc = fail(e, LC_ERR_PENDING, 0, "namespace state has waiting work");
+  }
+  return rc;
+}
+static int namespace_handoff(ps_coordination *owner,
+                             enum ps_coordination_domain domain,
+                             uint64_t identity, int pressured, int background,
+                             ps_coordination_guard **out, lc_error *e) {
   const struct timespec pause = {0, 1000000L};
   struct timespec now, deadline;
-  int rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
-  if (rc != LC_ERR_PENDING || clock_gettime(CLOCK_MONOTONIC, &deadline))
+  ps_coordination_guard *intent = NULL;
+  int wait = !background || pressured;
+  int rc =
+      namespace_handoff_try(owner, domain, identity, background, &wait, out, e);
+  if (rc != LC_ERR_PENDING || !wait ||
+      clock_gettime(CLOCK_MONOTONIC, &deadline))
     return rc;
   deadline.tv_nsec += pressured ? 250000000L : 64000000L;
   if (deadline.tv_nsec >= 1000000000L) {
     ++deadline.tv_sec;
     deadline.tv_nsec -= 1000000000L;
+  }
+  if (!background && domain == PS_COORDINATION_NAMESPACE_STATE) {
+    int registered = lock_guard(owner, PS_COORDINATION_NAMESPACE_WAITER,
+                                identity, 0, 1, &intent, e);
+    if (registered != LC_OK)
+      return registered;
   }
   do {
     (void)nanosleep(&pause, NULL);
@@ -536,9 +598,33 @@ int ps_coordination_namespace_handoff(ps_coordination *owner,
         (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
       break;
     lc_error_cleanup(e);
-    rc = ps_coordination_lock(owner, domain, identity, 0, out, e);
-  } while (rc == LC_ERR_PENDING);
+    rc = namespace_handoff_try(owner, domain, identity, background, &wait, out,
+                               e);
+  } while (rc == LC_ERR_PENDING && wait);
+  if (intent) {
+    ps_coordination_unlock(intent);
+    if (ps_coordination_check(owner, NULL) != LC_OK) {
+      ps_coordination_unlock(*out);
+      *out = NULL;
+      lc_error_cleanup(e);
+      return ps_coordination_check(owner, e);
+    }
+  }
   return rc;
+}
+int ps_coordination_namespace_handoff(ps_coordination *owner,
+                                      enum ps_coordination_domain domain,
+                                      uint64_t identity, int pressured,
+                                      ps_coordination_guard **out,
+                                      lc_error *e) {
+  return namespace_handoff(owner, domain, identity, pressured, 0, out, e);
+}
+int ps_coordination_namespace_maintenance(ps_coordination *owner,
+                                          uint64_t identity, int pressured,
+                                          ps_coordination_guard **out,
+                                          lc_error *e) {
+  return namespace_handoff(owner, PS_COORDINATION_NAMESPACE_STATE, identity,
+                           pressured, 1, out, e);
 }
 int ps_coordination_stream_prepare(ps_coordination *owner, uint64_t identity,
                                    ps_coordination_guard **out, lc_error *e) {
@@ -560,7 +646,9 @@ void ps_coordination_unlock(ps_coordination_guard *guard) {
     return;
   if (((guard->offset >= COLLECTION_BASE && guard->offset < 2U * PS_PAGE) ||
        (guard->offset >= STREAM_CLAIM_BASE &&
-        guard->offset < PS_METADATA_START)) &&
+        guard->offset < PS_METADATA_START) ||
+       (guard->offset >= NAMESPACE_WAITER_BASE &&
+        guard->offset < PS_CREDIT_RECORD_BASE)) &&
       unpin_view(guard)) {
     drop(guard);
     return;

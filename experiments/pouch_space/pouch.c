@@ -131,27 +131,28 @@ static int namespace_info(void *context, void *ns,
   (void)context;
   return ps_namespace_projection(ns, out, e);
 }
-static int namespace_state_lock(void *context, const char *name, int wait,
+static int namespace_state_lock(void *context, const char *name,
+                                enum lc_pouch_namespace_lock_policy policy,
                                 void **out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_coordination_guard *guard = NULL;
   ps_space *space = ps_root_space(owner->root);
   ps_coordination *coordination = ps_space_coordination(space);
-  int rc;
+  int rc, pressured = ps_maintenance_pressure_requested(space);
+  int wait = policy == LC_POUCH_NAMESPACE_FOREGROUND || pressured;
   if (!strcmp(name, ".txns"))
     rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 0,
                               wait, &guard, e);
   else if (!strcmp(name, ".xa"))
     rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 1,
                               wait, &guard, e);
-  else if (wait)
+  else if (policy == LC_POUCH_NAMESPACE_BACKGROUND)
+    rc = ps_coordination_namespace_maintenance(
+        coordination, ps_namespace_name_hash(name), pressured, &guard, e);
+  else
     rc = ps_coordination_namespace_handoff(
         coordination, PS_COORDINATION_NAMESPACE_STATE,
-        ps_namespace_name_hash(name), ps_maintenance_pressure_requested(space),
-        &guard, e);
-  else
-    rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_STATE,
-                              ps_namespace_name_hash(name), 0, &guard, e);
+        ps_namespace_name_hash(name), pressured, &guard, e);
   *out = guard;
   return rc;
 }

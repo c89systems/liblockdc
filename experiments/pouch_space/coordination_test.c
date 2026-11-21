@@ -531,6 +531,88 @@ static void namespace_handoff(void) {
   ok(ps_coordination_close(peer, &e), &e);
   ok(ps_coordination_close(owner, &e), &e);
 }
+typedef struct priority_handoff {
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  ps_coordination *background, *foreground;
+  int intercepted, registered, background_rc, foreground_rc;
+} priority_handoff;
+static int namespace_waiter_marker(const struct flock *lock) {
+  return lock->l_type == F_RDLCK &&
+         (uint64_t)lock->l_start >= PS_CREDIT_RECORD_BASE - PS_PAGE &&
+         (uint64_t)lock->l_start < PS_CREDIT_RECORD_BASE;
+}
+static int pause_background_handoff(void *context, int fd, int command,
+                                    struct flock *lock) {
+  priority_handoff *gate = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc != 0 || command != F_OFD_SETLK)
+    return rc;
+  pthread_mutex_lock(&gate->mutex);
+  if (lock->l_type == F_WRLCK && !gate->intercepted) {
+    /* Background holds the state byte but has yet to check for waiters. */
+    gate->intercepted = 1;
+    pthread_cond_broadcast(&gate->changed);
+    while (!gate->registered)
+      pthread_cond_wait(&gate->changed, &gate->mutex);
+  } else if (gate->intercepted && namespace_waiter_marker(lock)) {
+    gate->registered = 1;
+    pthread_cond_broadcast(&gate->changed);
+  }
+  pthread_mutex_unlock(&gate->mutex);
+  return rc;
+}
+static void *priority_background(void *context) {
+  priority_handoff *gate = context;
+  ps_coordination_guard *guard = NULL;
+  gate->background_rc = ps_coordination_namespace_maintenance(
+      gate->background, 19, 1, &guard, NULL);
+  REQUIRE(!guard);
+  return NULL;
+}
+static void *priority_foreground(void *context) {
+  priority_handoff *gate = context;
+  ps_coordination_guard *guard = NULL;
+  gate->foreground_rc = ps_coordination_namespace_handoff(
+      gate->foreground, PS_COORDINATION_NAMESPACE_STATE, 19, 1, &guard, NULL);
+  ps_coordination_unlock(guard);
+  return NULL;
+}
+static void namespace_handoff_priority(int same_owner) {
+  lc_error e = {0};
+  priority_handoff gate = {0};
+  ps_coordination_io io = {&gate, pause_background_handoff};
+  ps_coordination_guard *other = NULL;
+  pthread_t background, foreground;
+  file_create();
+  REQUIRE(!pthread_mutex_init(&gate.mutex, NULL) &&
+          !pthread_cond_init(&gate.changed, NULL));
+  gate.background = owner_open(1, &io, &e);
+  gate.foreground = same_owner ? gate.background : owner_open(1, &io, &e);
+  REQUIRE(!pthread_create(&background, NULL, priority_background, &gate));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.intercepted)
+    pthread_cond_wait(&gate.changed, &gate.mutex);
+  pthread_mutex_unlock(&gate.mutex);
+  ok(ps_coordination_namespace_maintenance(gate.background, 20, 0, &other, &e),
+     &e);
+  ps_coordination_unlock(other);
+  REQUIRE(!pthread_create(&foreground, NULL, priority_foreground, &gate));
+  REQUIRE(!pthread_join(background, NULL) && !pthread_join(foreground, NULL));
+  REQUIRE(gate.background_rc == LC_ERR_PENDING && gate.foreground_rc == LC_OK &&
+          gate.registered);
+  REQUIRE(!ps_coordination_users(gate.background) &&
+          !ps_coordination_users(gate.foreground));
+  ok(ps_coordination_namespace_maintenance(gate.background, 19, 0, &other, &e),
+     &e);
+  ps_coordination_unlock(other);
+  if (!same_owner)
+    ok(ps_coordination_close(gate.foreground, &e), &e);
+  ok(ps_coordination_close(gate.background, &e), &e);
+  REQUIRE(!pthread_cond_destroy(&gate.changed) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  lc_error_cleanup(&e);
+}
 static void faults(void) {
   file_create();
   lc_error e;
@@ -756,6 +838,32 @@ static void child_counter(int ready, int command) {
   ok(ps_coordination_close(owner, &e), &e);
   lc_error_cleanup(&e);
 }
+typedef struct queued_process {
+  int ready, command;
+} queued_process;
+static int hold_waiter_marker(void *context, int fd, int command,
+                              struct flock *lock) {
+  queued_process *gate = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc == 0 && command == F_OFD_SETLK && namespace_waiter_marker(lock)) {
+    pipe_write(gate->ready, 'W');
+    REQUIRE(pipe_read(gate->command) == 'C');
+  }
+  return rc;
+}
+static void child_handoff(int ready, int command, uint64_t identity) {
+  lc_error e = {0};
+  queued_process gate = {ready, command};
+  ps_coordination_io io = {&gate, hold_waiter_marker};
+  ps_coordination *owner = owner_open(1, &io, &e);
+  ps_coordination_guard *guard = NULL;
+  ok(ps_coordination_namespace_handoff(owner, PS_COORDINATION_NAMESPACE_STATE,
+                                       identity, 1, &guard, &e),
+     &e);
+  ps_coordination_unlock(guard);
+  ok(ps_coordination_close(owner, &e), &e);
+  lc_error_cleanup(&e);
+}
 static pid_t spawn(const char *self, const char *mode, int ready[2], int command[2],
                      enum ps_coordination_domain domain, uint64_t identity) {
   pid_t child = fork();
@@ -772,6 +880,31 @@ static pid_t spawn(const char *self, const char *mode, int ready[2], int command
     _exit(127);
   }
   return child;
+}
+static void dead_namespace_waiter(const char *self) {
+  lc_error e = {0};
+  ps_coordination *owner = owner_open(1, NULL, &e);
+  ps_coordination_guard *guard = NULL;
+  int ready[2], command[2], status;
+  ok(ps_coordination_lock(owner, PS_COORDINATION_NAMESPACE_STATE, 19, 0, &guard,
+                          &e),
+     &e);
+  REQUIRE(!pipe(ready) && !pipe(command));
+  pid_t child = spawn(self, "handoff", ready, command,
+                      PS_COORDINATION_NAMESPACE_STATE, 19);
+  REQUIRE(!close(ready[1]) && !close(command[0]) && pipe_read(ready[0]) == 'W');
+  ps_coordination_unlock(guard);
+  REQUIRE(ps_coordination_namespace_maintenance(owner, 19, 1, &guard, &e) ==
+              LC_ERR_PENDING &&
+          !guard);
+  lc_error_cleanup(&e);
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &status, 0) == child &&
+          WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  ok(ps_coordination_namespace_maintenance(owner, 19, 0, &guard, &e), &e);
+  ps_coordination_unlock(guard);
+  ok(ps_coordination_close(owner, &e), &e);
+  REQUIRE(!close(ready[0]) && !close(command[1]));
+  lc_error_cleanup(&e);
 }
 static void processes(const char *self) {
   file_create();
@@ -842,6 +975,7 @@ static void processes(const char *self) {
   REQUIRE(pread(fd, &value, sizeof(value), 0) == (ssize_t)sizeof(value));
   REQUIRE(value == 800 && !close(fd));
   REQUIRE(!close(ready[0]) && !close(command[1]));
+  dead_namespace_waiter(self);
   lc_error_cleanup(&e);
 }
 int main(int argc, char **argv) {
@@ -850,6 +984,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[3], "hold"))
       child_hold(atoi(argv[4]), atoi(argv[5]), atoi(argv[6]),
                    strtoull(argv[7], NULL, 10));
+    else if (!strcmp(argv[3], "handoff"))
+      child_handoff(atoi(argv[4]), atoi(argv[5]), strtoull(argv[7], NULL, 10));
     else
       child_counter(atoi(argv[4]), atoi(argv[5]));
     return 0;
@@ -868,6 +1004,8 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "threads")) {
     threads();
     namespace_handoff();
+    namespace_handoff_priority(0);
+    namespace_handoff_priority(1);
     independent_stream_authority();
   } else if (!strcmp(argv[2], "faults"))
     faults();
