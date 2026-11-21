@@ -4358,11 +4358,88 @@ static void maintenance_partial_tail(const char *path, const char *directory) {
   for (int sync = 0; sync < 2; ++sync)
     maintenance_physical_threshold(path, sync);
 }
+static void maintenance_sealed_batch(const char *path, int sync, int tail) {
+  const char *name = "sealed-batch";
+  const size_t bytes = 4 * PS_CHUNK;
+  const unsigned char versions = tail ? 3 : 6;
+  const uint64_t active = versions + 1;
+  ps_pouch_state_options o = shared_options(0, sync);
+  lc_pouch *writer = NULL, *worker = NULL;
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_state_read_result pinned = {0};
+  lc_pouch_maintenance_options maintain = {0};
+  lc_pouch_maintenance_result result = {0};
+  ps_namespace_status status;
+  void *ns = NULL;
+  lc_error e = {0};
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  o.logical.compaction_min_reclaimable_bytes = PS_PAGE;
+  o.logical.compaction_interval_seconds = 3600;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+  input first = source(bytes, 7);
+  ok(put(writer, name, "kept", &first, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  for (unsigned char version = 1; version <= versions; ++version) {
+    input current = source(bytes, version);
+    ok(put(writer, name, "latest", &current, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+    if (!tail && version == 1)
+      ok(lc_pouch_state_read(writer, name, "latest", &pinned, &e), &e);
+  }
+  if (tail) {
+    /* Leave two obsolete sealed sources and an obsolete active tail. */
+    ok(lc_pouch_state_delete(writer, name, "latest", NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+  }
+  o.logical.background_compaction_enabled = 1;
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &worker, &e), &e);
+  ok(worker->storage.ops->namespace_open(worker->storage.context, name, 0, &ns,
+                                         &e),
+     &e);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == active && status.active_segment == active);
+  maintain.ns = name;
+  maintain.background = 1;
+  ok(lc_pouch_maintenance_run(worker, &maintain, &result, &e), &e);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == (tail ? 2 : 3) &&
+          status.active_segment == active);
+  REQUIRE(result.compacted && result.cleanup_pending_count);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  if (!tail) {
+    drain(pinned.body, bytes, 1, &e);
+    lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+  }
+  ok(lc_pouch_maintenance_run(worker, &maintain, &result, &e), &e);
+  REQUIRE(result.compacted);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.bound_segments == 2 &&
+          status.active_segment == active + (tail ? 1 : 0));
+  worker->storage.ops->namespace_close(worker->storage.context, ns);
+  lc_pouch_close(worker);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &writer, &e), &e);
+  read_value(writer, name, "kept", bytes, 7, 1, &e);
+  if (tail) {
+    ok(lc_pouch_state_read(writer, name, "latest", &pinned, &e), &e);
+    REQUIRE(!pinned.found);
+    lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+  } else
+    read_value(writer, name, "latest", bytes, versions, versions, &e);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 static void maintenance(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
   maintenance_empty(path);
   maintenance_metadata(path);
+  maintenance_sealed_batch(path, 0, 0);
+  maintenance_sealed_batch(path, 1, 0);
+  maintenance_sealed_batch(path, 0, 1);
   for (int crypto = 0; crypto < 4; ++crypto)
     for (int sync = 0; sync < 2; ++sync) {
       ps_pouch_state_options o = options(crypto, sync);

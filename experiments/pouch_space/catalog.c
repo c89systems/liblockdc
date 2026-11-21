@@ -460,30 +460,61 @@ int ps_catalog_create_namespace(ps_space *s, const void *name, size_t length,
   return catalog_put(s, NULL, 0, PS_CATALOG_NAMESPACE, name, length, NULL,
                      stream, NULL, NULL, 0, out, 1, e);
 }
-int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
-                      const void *name, size_t length, const ps_ref *expected,
-                      lc_error *e) {
+int ps_catalog_remove_many(ps_space *s, uint64_t owner,
+                           const ps_catalog_removal *items, size_t count,
+                           size_t *completed, lc_error *e) {
+  const ps_catalog_removal *item;
   ps_entry *p;
   ps_coordination_guard *guard;
   uint64_t sequence = 0;
-  int rc;
-  if (!s || !expected || !arguments(kind, name, length))
+  size_t i, published = 0;
+  int rc, durable;
+  if (completed)
+    *completed = 0;
+  if (!s || !items || !count || !completed)
     return cat_error(e, LC_ERR_INVALID, "catalog removal arguments invalid");
+  for (i = 0; i < count; ++i)
+    if (!items[i].expected ||
+        !arguments(items[i].kind, items[i].name, items[i].length))
+      return cat_error(e, LC_ERR_INVALID, "catalog removal arguments invalid");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
-  p = named(s, owner, kind, name, length);
-  if (rc == LC_OK && (pending(s, p) || !ref_matches(s, p, expected)))
-    rc = cat_error(e, LC_ERR_INVALID,
-                   "catalog revision changed or busy; reload binding");
-  if (rc == LC_OK)
+  while (rc == LC_OK && published < count) {
+    item = &items[published];
+    p = named(s, owner, item->kind, item->name, item->length);
+    if (pending(s, p) || !ref_matches(s, p, item->expected)) {
+      rc = cat_error(e, LC_ERR_INVALID,
+                     "catalog revision changed or busy; reload binding");
+      break;
+    }
     rc = ps_internal_event(s, p, PS_REMOVE, e);
-  if (rc == LC_OK) {
-    sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
-    ps_catalog_drop_record(s, p, sequence, 0);
+    if (rc == LC_OK) {
+      sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
+      ps_catalog_drop_record(s, p, sequence, 0);
+      ++published;
+    }
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
-  return rc == LC_OK ? ps_internal_durable(s, sequence, e) : rc;
+  if (published) {
+    durable = ps_internal_durable(s, sequence, rc == LC_OK ? e : NULL);
+    if (durable == LC_OK)
+      *completed = published;
+    if (rc == LC_OK)
+      rc = durable;
+  }
+  return rc;
+}
+int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
+                      const void *name, size_t length, const ps_ref *expected,
+                      lc_error *e) {
+  ps_catalog_removal item;
+  size_t completed;
+  item.name = name;
+  item.length = length;
+  item.expected = expected;
+  item.kind = kind;
+  return ps_catalog_remove_many(s, owner, &item, 1, &completed, e);
 }
 int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, ps_catalog_view **out,

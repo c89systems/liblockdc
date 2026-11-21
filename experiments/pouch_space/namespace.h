@@ -143,6 +143,13 @@ int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
  * mutation authority. An ineligible source leaves the retirement NULL. */
 int ps_namespace_unlink_active(ps_namespace *, uint64_t expected,
                                ps_namespace_retirement **, lc_error *);
+enum { PS_NAMESPACE_RETIRE_LIMIT = 4 };
+/* Unlink a batch of two or more covered, sealed segments with no remaining
+ * references under logical namespace authority. The caller consumes all
+ * returned retirements even when an error follows a durable prefix. */
+int ps_namespace_unlink_covered(ps_namespace *, uint64_t minimum_bytes,
+                                ps_namespace_retirement **, size_t *,
+                                lc_error *);
 /* Consume a returned retirement under stream authority alone. If the stream
  * is still busy, the namespace's regular reaper retains the pending work. */
 int ps_namespace_retire_unlinked(ps_namespace *, ps_namespace_retirement *,

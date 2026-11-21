@@ -214,6 +214,73 @@ static int drop(struct ps_namespace_data *d, ps_ns_resource *r, lc_error *e) {
     ps_ns_remove(d, r);
   return rc;
 }
+static ps_namespace_retirement *retain_retirement(struct ps_namespace_data *d,
+                                                  ps_ns_resource *r) {
+  __atomic_store_n(&r->retiring, 1, __ATOMIC_RELEASE);
+  ps_namespace_retain(d->ns);
+  return r;
+}
+static int segment_covered(struct ps_namespace_data *d, ps_ns_resource *r,
+                           const ps_checkpoint_info *coverage,
+                           const ps_stream_info *info) {
+  return r->id != d->active && coverage->epoch &&
+         (r->id < coverage->segment ||
+          (r->id == coverage->segment && coverage->offset >= info->tail));
+}
+int ps_namespace_unlink_covered(ps_namespace *ns, uint64_t minimum_bytes,
+                                ps_namespace_retirement **retirements,
+                                size_t *completed, lc_error *e) {
+  ps_catalog_removal removals[PS_NAMESPACE_RETIRE_LIMIT];
+  ps_ns_resource *sources[PS_NAMESPACE_RETIRE_LIMIT], *r;
+  struct ps_namespace_data *d;
+  ps_checkpoint_info coverage;
+  ps_stream_info info;
+  size_t i, count = 0;
+  int rc;
+  if (!retirements || !completed)
+    return failure(e, "covered unlink requires retirement outputs");
+  *completed = 0;
+  rc = ps_ns_data_get(ns, &d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_enter(d, e);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&d->mutex);
+  ps_key_checkpoint_info(d->checkpoint, &coverage);
+  for (i = 0;
+       rc == LC_OK && d->checkpoint_ready && coverage.epoch &&
+       !coverage.pending && i < d->count && count < PS_NAMESPACE_RETIRE_LIMIT;
+       ++i) {
+    r = d->items[i];
+    if (r->kind != PS_CATALOG_SEGMENT || r->unselected || r->id == d->active ||
+        r->id > coverage.segment ||
+        ps_key_checkpoint_source_refs(d->checkpoint, r->kind, r->id))
+      continue;
+    rc = ps_stream_status(r->stream, &info, e);
+    if (rc != LC_OK || !info.sealed || !info.stored_bytes ||
+        info.stored_bytes < minimum_bytes ||
+        !segment_covered(d, r, &coverage, &info))
+      continue;
+    sources[count] = r;
+    removals[count].name = r->leaf;
+    removals[count].length = strlen(r->leaf);
+    removals[count].expected = &r->binding.revision;
+    removals[count].kind = r->kind;
+    ++count;
+  }
+  if (rc == LC_OK && count > 1)
+    rc = ps_ns_require_unpinned(d, e);
+  if (rc == LC_OK && count > 1)
+    rc = ps_catalog_remove_many(ns->root->space, ns->identity.owner, removals,
+                                count, completed, e);
+  for (i = 0; i < *completed; ++i) {
+    ps_ns_remove(d, sources[i]);
+    retirements[i] = retain_retirement(d, sources[i]);
+  }
+  pthread_mutex_unlock(&d->mutex);
+  ps_ns_leave(d);
+  return rc;
+}
 static int reap(struct ps_namespace_data *d, uint64_t *closed,
                 uint64_t *pending, lc_error *e) {
   ps_ns_resource *r = d->retired, **link = &d->retired;
@@ -336,9 +403,7 @@ int ps_namespace_unlink_active(ps_namespace *ns, uint64_t expected,
     rc = drop(d, source, e);
     if (rc == LC_OK) {
       d->pending_seal = 0;
-      __atomic_store_n(&source->retiring, 1, __ATOMIC_RELEASE);
-      ps_namespace_retain(ns);
-      *retirement = source;
+      *retirement = retain_retirement(d, source);
     }
     pthread_mutex_unlock(&d->mutex);
   }
@@ -392,8 +457,7 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
         (r->unselected || !info.sealed ||
          ps_key_checkpoint_source_refs(d->checkpoint, kind, id) ||
          (kind == PS_CATALOG_SEGMENT &&
-          (id == d->active || !coverage.epoch || id > coverage.segment ||
-           (id == coverage.segment && coverage.offset < info.tail)))))
+          !segment_covered(d, r, &coverage, &info))))
       rc = failure(e, "namespace source is still referenced or uncovered");
     if (rc == LC_OK && r)
       rc = drop(d, r, e);

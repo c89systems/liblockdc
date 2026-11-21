@@ -51,6 +51,17 @@ int ps_catalog_put_marker(ps_space *, ps_budget *, uint64_t owner,
 int ps_catalog_remove(ps_space *, uint64_t owner, unsigned int kind,
                       const void *name, size_t length, const ps_ref *expected,
                       lc_error *);
+typedef struct ps_catalog_removal {
+  const void *name;
+  size_t length;
+  const ps_ref *expected;
+  unsigned int kind;
+} ps_catalog_removal;
+/* Independent removals share one durability wait. completed reports the
+ * prefix confirmed by that wait, even when a later removal fails. */
+int ps_catalog_remove_many(ps_space *, uint64_t owner,
+                           const ps_catalog_removal *, size_t count,
+                           size_t *completed, lc_error *);
 /* Missing is success with *out==NULL. Views select the completed durable
  * prefix and pin the binding and any target; retirement cannot invalidate them.
  * Release a view after admitting the stream/read handles that will use it. */

@@ -10008,3 +10008,79 @@ three of eight candidate runs. The other attempts refused capacity.
 Raw logs are under `retained-allocation-`,
 `retained-maintenance-` and `stream-reclaim-` in
 `build/pouch-space-concurrent/`.
+
+## Batching covered sealed source retirement
+
+Background maintenance can now durably unlink two to four obsolete sealed
+segments in one namespace turn. The ordinary candidate pass must see
+at least two eligible segments before planning a batch. After publishing
+the canonical checkpoint, maintenance rechecks coverage, live references,
+the active tail and captured namespace views. If fewer than two segments
+qualify, the ordinary candidate ranking supplies the work. A full batch
+or any deferred candidates prompt another turn.
+
+The catalog publishes the existing removal records under one allocator
+capture and waits for the selected prefix once. A later stale binding
+can leave an earlier removal confirmed and eligible for retirement.
+Each confirmed source leaves the resident directory under namespace
+authority. Its stream retires afterward under stream authority. Live
+body readers retain their captured ranges, and allocator checkpoint
+coverage still controls when those ranges can be reused.
+
+In the two-owner fixture, the first pass reduces seven bound segments
+to three and the follow-up reduces three to two. A peer finishes reading
+the original body after its segment is unlinked, and a cold reopen
+recovers both live values and versions. The fixture runs in both
+durability modes. A second fixture verifies that a batch of two reports
+an obsolete active tail for the next pass, which then retires that tail.
+The modeled catalog test checks one sync for a confirmed prefix, a stale
+second binding, a failed second journal write and a failed final barrier.
+Cold recovery verifies the durable bindings after each case.
+
+Targeted final verification passed 25 GNU Release, 11 Debug ASan/UBSan
+and 22 musl Release test groups, including catalog recovery, shared
+source pins and owner exit, allocator checkpoint pressure, fixed-capacity
+leases, queue transactions and outbox recovery.
+
+An earlier candidate gave whole-source priority to a single eligible
+segment. Across eight alternating NoSync attempts per native build,
+it completed two 12 MiB runs and one 20 MiB run. The prior build
+completed eight and four respectively. The final candidate restricts
+that priority to a backlog. It completed all eight 12 MiB runs, matching
+the prior build, and completed five 20 MiB runs against three on the
+prior build. Every failed run refused capacity.
+
+The main GNU rotation verified 36 of 42 workflows. Both native builds
+used fixed 10 MiB containers. The follow-up rotation paired the native
+builds for four additional attempts per NoSync indexed profile.
+
+| Workload | Prior native (`a00ba004`) | Batched retirement | Multifile |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 4/4 | 4/4 | 4/4 |
+| Four writers, NoSync indexed, 20 MiB | 0/4 | 2/4 | 4/4 |
+| Two writers, durable indexed, 15 MiB | 2/2 | 2/2 | 2/2 |
+| Two writers, warmed NoSync queue | 2/2 | 2/2 | 2/2 |
+| Two writers, durable outbox | 2/2 | 2/2 | 2/2 |
+
+The next tables report successful-run medians from the main rotation
+in milliseconds, in the same build order. Grouped reopen includes the
+cold owner and the later live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1469.36 / 1421.72 / 1397.19 | 81.14 / 80.09 / 32.24 | 4.64 / 6.57 / 1.07 | 8.68 / 9.86 / 0.94 | 5.13 / 5.19 / 6.86 |
+| NoSync indexed, 20 MiB | — / 3298.98 / 2255.00 | — / 109.46 / 37.28 | — / 21.82 / 1.07 | — / 11.48 / 0.92 | — / 7.26 / 9.48 |
+| Durable indexed, 15 MiB | 6629.14 / 6020.81 / 5739.50 | 95.38 / 88.17 / 71.86 | 4.00 / 6.89 / 0.82 | 7.38 / 8.89 / 0.61 | 5.32 / 5.39 / 6.39 |
+| Warmed NoSync queue | 10.19 / 10.42 / 83.50 | 1.89 / 1.98 / 19.80 | 0.20 / 0.19 / 0.06 | 2.50 / 2.15 / 0.34 | 0.21 / 0.24 / 0.41 |
+| Durable outbox | 1011.45 / 934.82 / 1368.05 | 207.27 / 182.35 / 304.21 | 0.58 / 0.57 / 0.30 | 49.09 / 32.19 / 91.19 | 103.77 / 58.08 / 114.90 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 234.07 / 246.43 / 317.28 | 111.61 / 57.52 / 189.38 | 38.75 / 36.72 / 236.32 | 0.75 / 0.73 / 1.16 |
+| NoSync indexed, 20 MiB | — / 377.93 / 530.82 | — / 97.49 / 269.51 | — / 43.32 / 318.18 | — / 1.25 / 1.74 |
+| Durable indexed, 15 MiB | 131.92 / 135.12 / 222.27 | 19.21 / 17.50 / 272.25 | 21.35 / 1.92 / 338.72 | 0.41 / 0.41 / 0.64 |
+
+The 20 MiB profile continues to hit capacity under churn. Indexed
+mutation tails and grouped reopen remain slower than multifile in
+the completed profiles. Raw runs and test logs are under
+`sealed-batch-` in `build/pouch-space-concurrent/`.

@@ -14,13 +14,20 @@ typedef struct compact {
   const lc_pouch_maintenance_options *options;
   lc_pouch_maintenance_result *maintenance;
   ps_pouch_compaction_result result;
-  uint64_t candidates, bytes;
+  uint64_t candidates, bytes, obsolete_sealed;
   uint64_t selected_id, selected_bytes;
+  ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
+  size_t retirement_count;
   unsigned int selected_kind;
   int background;
 } compact;
 static int fail(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
+}
+static uint64_t background_minimum(const compact *w) {
+  uint64_t minimum = w->pouch->compaction_min_reclaimable_bytes;
+  return minimum > MAINTENANCE_PIECES * PS_CHUNK ? MAINTENANCE_PIECES * PS_CHUNK
+                                                 : minimum;
 }
 static int candidate(void *context, const ps_namespace_source *source,
                      lc_error *e) {
@@ -36,9 +43,6 @@ static int candidate(void *context, const ps_namespace_source *source,
     return LC_OK;
   if (w->background) {
     uint64_t live = ps_namespace_source_bytes(w->ns, source->kind, source->id);
-    uint64_t minimum = w->pouch->compaction_min_reclaimable_bytes;
-    if (minimum > MAINTENANCE_PIECES * PS_CHUNK)
-      minimum = MAINTENANCE_PIECES * PS_CHUNK;
     if (live >= bytes)
       return LC_OK;
     bytes -= live;
@@ -49,8 +53,11 @@ static int candidate(void *context, const ps_namespace_source *source,
         return LC_OK;
       bytes -= source->runs * PS_PAGE;
     }
-    if (!bytes || bytes < minimum)
+    if (!bytes || bytes < background_minimum(w))
       return LC_OK;
+    if (!live && source->kind == PS_CATALOG_SEGMENT && source->sealed &&
+        source->id != w->before.active_segment)
+      ++w->obsolete_sealed;
     if (bytes > w->selected_bytes) {
       w->selected_bytes = bytes;
       w->selected_kind = source->kind;
@@ -229,6 +236,11 @@ static int compact_locked(void *context, lc_error *e) {
     w->result.records = w->after.checkpoint_keys;
     w->result.metadata_bytes = w->before.pending_metadata_bytes;
   }
+  /* Use the shared durability wait when there is a backlog of whole sources.
+   * A lone eligible source stays in the ordinary candidate ranking. */
+  if (rc == LC_OK && w->obsolete_sealed > 1)
+    rc = ps_namespace_unlink_covered(w->ns, background_minimum(w),
+                                     w->retirements, &w->retirement_count, e);
   return rc;
 }
 static int finish_locked(void *context, lc_error *e) {
@@ -256,6 +268,7 @@ static int compact_run(lc_pouch *pouch, const char *name,
   compact w;
   ps_root *root = ps_pouch_state_root(pouch);
   uint64_t orphaned, skipped;
+  size_t i;
   int rc;
   memset(&w, 0, sizeof(w));
   if (out)
@@ -269,12 +282,27 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.maintenance = maintenance;
   w.background = options && options->background && !options->force;
   rc = lc_pouch_state_with_namespace_lock(pouch, name, compact_locked, &w, e);
+  for (i = 0; i < w.retirement_count; ++i) {
+    int retired = ps_namespace_retire_unlinked(w.ns, w.retirements[i],
+                                               rc == LC_OK ? e : NULL);
+    if (retired == LC_ERR_PENDING) {
+      if (rc == LC_OK)
+        lc_error_cleanup(e);
+      ++w.result.pending_sources;
+    } else if (rc == LC_OK)
+      rc = retired;
+  }
+  /* A full batch may have left more sealed sources. Other candidates from
+   * the planning pass, including partially live sources, also need a turn. */
+  if (w.retirement_count && (w.retirement_count == PS_NAMESPACE_RETIRE_LIMIT ||
+                             w.retirement_count < w.candidates))
+    ++w.result.pending_sources;
   /* Private encoded copying owns no logical or physical publication gate.
    * Every durable map selection reacquires logical authority and rechecks its
    * captured body generation. Whole-source unlink and work-marker selection
-   * are serialized with canonical mutations. The active predecessor's
-   * physical retirement follows its durable unlink under stream authority. */
-  if (rc == LC_OK && !w.result.skipped)
+   * are serialized with canonical mutations. Unlinked batch sources and the
+   * active predecessor retire physically under stream authority. */
+  if (rc == LC_OK && !w.result.skipped && !w.retirement_count)
     rc = ps_namespace_sources_visit(w.ns, retire_source, &w, e);
   if (rc == LC_OK && !w.result.skipped)
     rc = lc_pouch_state_with_namespace_lock(pouch, name, finish_locked, &w, e);

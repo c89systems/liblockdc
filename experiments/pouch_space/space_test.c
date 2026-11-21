@@ -5713,6 +5713,66 @@ static void catalog_reopen_faults(void) {
        "rebuild, spanning descriptors and acknowledged revisions survive");
 }
 
+static void catalog_removal_prefix(void) {
+  static const char *names[] = {"first", "second", "third"};
+  model m;
+  ps_io io = model_init(&m);
+  for (size_t fault = 0; fault <= 3; ++fault) {
+    ps_catalog_info saved[3];
+    ps_catalog_removal items[3];
+    ps_catalog_view *view = NULL;
+    ps_ref stale;
+    ps_space *s;
+    size_t completed, syncs;
+    int rc;
+    if (fault == 1)
+      continue;
+    clean();
+    s = create(PS_MIB, 0, &io);
+    for (size_t i = 0; i < 3; ++i) {
+      OK(ps_catalog_put_marker(s, NULL, 1, names[i], strlen(names[i]), NULL,
+                               "m", 1, &saved[i], &error));
+      items[i].name = names[i];
+      items[i].length = strlen(names[i]);
+      items[i].expected = &saved[i].revision;
+      items[i].kind = PS_CATALOG_MARKER;
+    }
+    stale = saved[1].revision;
+    ++stale.incarnation;
+    if (!fault)
+      items[1].expected = &stale;
+    m.operations = 0;
+    m.fail_at = fault;
+    m.tear = 1;
+    syncs = m.syncs;
+    rc = ps_catalog_remove_many(s, 1, items, 2, &completed, &error);
+    CHECK(rc == (fault ? LC_ERR_TRANSPORT : LC_ERR_INVALID));
+    CHECK(completed == (fault ? 0U : 1U));
+    lc_error_cleanup(&error);
+    if (!fault) {
+      CHECK(m.syncs == syncs + 1);
+      OK(ps_catalog_get(s, 1, PS_CATALOG_MARKER, names[0], items[0].length,
+                        &view, &error));
+      CHECK(!view);
+      items[1].expected = &saved[1].revision;
+      syncs = m.syncs;
+      OK(ps_catalog_remove_many(s, 1, items + 1, 2, &completed, &error));
+      CHECK(completed == 2 && m.syncs == syncs + 1);
+    }
+    OK(ps_close(s, &error));
+    crash(&m);
+    s = reopen(&io);
+    for (size_t i = 0; i < 3; ++i) {
+      OK(ps_catalog_get(s, 1, PS_CATALOG_MARKER, names[i], items[i].length,
+                        &view, &error));
+      CHECK(!!view == !!fault);
+      ps_catalog_view_close(view);
+    }
+    OK(ps_close(s, &error));
+  }
+  free(m.stable);
+  clean();
+}
 static void catalog_bounds_rollover(void) {
   ps_space *space;
   ps_stream *stream;
@@ -7656,6 +7716,7 @@ int main(int argc, char **argv) {
       catalog_faults();
       catalog_visitors();
       catalog_reopen_faults();
+      catalog_removal_prefix();
       catalog_bounds_rollover();
       catalog_invalid_records();
       catalog_concurrency(0);
