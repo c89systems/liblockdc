@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
+#include "crc.h"
 #include "lc_api_internal.h"
 #include "revision.h"
 #include "space_internal.h"
@@ -129,7 +130,7 @@ static uint32_t get32(const unsigned char *p) {
          (uint32_t)p[3] << 24U;
 }
 static uint32_t checksum(const void *p, size_t n) {
-  return (uint32_t)crc32(0, p, (uInt)n);
+  return (uint32_t)ps_crc32(0, p, (uInt)n);
 }
 static int err(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-space");
@@ -1897,7 +1898,7 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       ps_catalog_encode_record(wire, p);
   }
   put32(wire + 60,
-        (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
+        (uint32_t)ps_crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
 }
 /* The CRC covers the same byte sequence with the stored checksum omitted.
  * Most descriptors fit in a bounded buffer and can use one zlib update. */
@@ -1910,7 +1911,7 @@ static uint32_t entry_checksum(const unsigned char *wire, size_t bytes) {
     memcpy(compact + 60, wire + 64, bytes - 64);
     return checksum(compact, bytes - 4);
   }
-  return (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64));
+  return (uint32_t)ps_crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64));
 }
 /* A checkpoint walk hands out small immutable entries in batches. The
  * walk and each returned entry own one reference. Releasing an entry
@@ -2156,7 +2157,7 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
       count > p->stream_capacity || get64(header + 40) != p->bytes ||
       get64(header + 48) != p->token || get32(header + 60) > 1 ||
       get32(header + 56) !=
-          (uint32_t)crc32(checksum(header, 56), header + 60, 4) ||
+          (uint32_t)ps_crc32(checksum(header, 56), header + 60, 4) ||
       64 + table_bytes > p->bytes)
     return err(e, LC_ERR_PROTOCOL, "invalid mapped piece header");
   table = lc_alloc_with_allocator(NULL, (size_t)table_bytes);
@@ -2829,7 +2830,7 @@ static int directory_open(ps_space *s, ps_directory_root root,
   return ps_directory_open(&io, root, out, error);
 }
 static uint32_t metadata_crc(const unsigned char *page) {
-  return (uint32_t)crc32(checksum(page, 48), page + 52, PS_PAGE - 52);
+  return (uint32_t)ps_crc32(checksum(page, 48), page + 52, PS_PAGE - 52);
 }
 typedef struct metadata_builder {
   ps_space *space;
@@ -4168,7 +4169,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
       get64(wire + 24) || get64(wire + 32) || get64(wire + 40) ||
       get64(wire + 48) || get32(wire + 56) ||
       get32(wire + 60) !=
-          (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
+          (uint32_t)ps_crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
     return err(error, LC_ERR_PROTOCOL, "invalid container revision frame");
   entries = lc_calloc_with_allocator(NULL, count, sizeof(*entries));
   if (!entries)
@@ -5139,7 +5140,7 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
        * previous generation. Once replay starts, require its end marker. */
       if (!v->journal && get64(p + 8) <= checkpoint &&
           get32(p + 60) ==
-              (uint32_t)crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64)))
+              (uint32_t)ps_crc32(checksum(p, 60), p + 64, (uInt)(bytes - 64)))
         return LC_OK;
       if (get64(p + 8) > checkpoint && get64(p + 8) <= certified) {
         rc = apply_peer_frame(v, p, bytes, certified, 1, error);
@@ -6280,8 +6281,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
                    PS_PUT);
       cursor += entry_bytes(writers[i]->entry);
     }
-    put32(wire + 60,
-          (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
+    put32(wire + 60, (uint32_t)ps_crc32(checksum(wire, 60), wire + 64,
+                                        (uInt)(bytes - 64)));
     rc = write_journal_frame(s, wire, bytes, error);
   }
   if (rc == LC_OK) {
@@ -7026,9 +7027,9 @@ size_t ps_reader_ticket_bytes(const ps_reader *r) {
 }
 static uint32_t ticket_checksum(const unsigned char *wire, size_t bytes) {
   static const unsigned char zero[4] = {0};
-  uLong crc = crc32(0, wire, 96);
-  crc = crc32(crc, zero, sizeof(zero));
-  return (uint32_t)crc32(crc, wire + 100, (uInt)(bytes - 100));
+  uLong crc = ps_crc32(0, wire, 96);
+  crc = ps_crc32(crc, zero, sizeof(zero));
+  return (uint32_t)ps_crc32(crc, wire + 100, (uInt)(bytes - 100));
 }
 int ps_reader_ticket(ps_reader *r, void *buffer, size_t bytes,
                      lc_error *error) {
@@ -8657,7 +8658,7 @@ static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
     rc = transfer(s, scratch, n, offset, 0, error);
     if (rc != LC_OK)
       return rc;
-    *crc = (uint32_t)crc32(*crc, scratch, (uInt)n);
+    *crc = (uint32_t)ps_crc32(*crc, scratch, (uInt)n);
     length -= n;
     offset += n;
   }
@@ -8964,7 +8965,8 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     put64(header + 40, 64 + table_bytes + live);
     put64(header + 48, writer->entry->token);
     put32(header + 60, (uint32_t)bitmap);
-    put32(header + 56, (uint32_t)crc32(checksum(header, 56), header + 60, 4));
+    put32(header + 56,
+          (uint32_t)ps_crc32(checksum(header, 56), header + 60, 4));
     rc = ps_write(writer, header, sizeof(header), error);
     if (rc == LC_OK)
       rc = ps_write(writer, table, (size_t)table_bytes, error);

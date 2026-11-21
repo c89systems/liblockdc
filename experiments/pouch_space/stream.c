@@ -1,4 +1,5 @@
 #include "stream.h"
+#include "crc.h"
 #include "lc_api_internal.h"
 #include "owned.h"
 
@@ -949,12 +950,12 @@ int ps_stream_writer_crc(ps_stream_writer *w, uint64_t offset, uint64_t length,
     n = left < PS_CHUNK ? (size_t)left : PS_CHUNK;
     rc = stream_io(w->stream, w->start + offset, scratch, n, 0, error);
     if (rc == LC_OK)
-      crc = (unsigned long)crc32((uLong)crc, scratch, (uInt)n);
+      crc = (unsigned long)ps_crc32((uLong)crc, scratch, (uInt)n);
     offset += n;
     length -= n;
   }
   if (rc == LC_OK && length)
-    crc = (unsigned long)crc32(
+    crc = (unsigned long)ps_crc32(
         (uLong)crc, w->buffer + (size_t)(offset - w->flushed), (uInt)length);
   lc_free_with_allocator(NULL, scratch);
   if (rc == LC_OK)

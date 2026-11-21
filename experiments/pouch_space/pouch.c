@@ -2,6 +2,7 @@
 #include "checkpoint.h"
 #include "collections.h"
 #include "coordination.h"
+#include "crc.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include "lc_pouch_internal.h"
@@ -404,7 +405,7 @@ static size_t source_read(lc_source *pub, void *bytes, size_t length,
       n = length - at;
       if (n > LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES)
         n = LC_POUCH_STATE_SNAPSHOT_CHUNK_BYTES;
-      source->crc = (unsigned long)crc32(
+      source->crc = (unsigned long)ps_crc32(
           (uLong)source->crc, (const unsigned char *)bytes + at, (uInt)n);
     }
     if (source->offset == source->length &&

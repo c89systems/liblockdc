@@ -1,4 +1,5 @@
 #include "record_io.h"
+#include "crc.h"
 #include "frame.h"
 #include "lc_api_internal.h"
 #include <string.h>
@@ -180,7 +181,7 @@ static int append(void *context, const struct iovec *parts, int count,
           n = parts[i].iov_len - at;
           if (n > PS_CHUNK)
             n = PS_CHUNK;
-          out->frame_crc = (unsigned long)crc32(
+          out->frame_crc = (unsigned long)ps_crc32(
               (uLong)out->frame_crc,
               (const unsigned char *)parts[i].iov_base + at, (uInt)n);
         }

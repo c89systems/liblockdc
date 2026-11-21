@@ -13006,3 +13006,63 @@ and 2.17 ms respectively. Single-file retains the elapsed-work lead in
 these samples, and CPU and serial reopen remain gaps. Raw runs, observer
 sources, traces, and tests are under
 `build/pouch-space-concurrent/live-open-projection/`.
+
+## Carry-less multiplication for IEEE CRC-32
+
+A fresh profile of `d1579946` attributed 940 of 15,852 CPU samples to
+checksum code in the indexed workload. The native backend now uses
+PCLMUL folding for buffers of at least 32 bytes on supported x86_64 CPUs.
+It folds four lanes across larger buffers and uses zlib for shorter inputs,
+partial tails, and CPUs without PCLMUL. The reflected IEEE polynomial and
+seed handling preserve existing checksums for stored frames, directories,
+and incrementally streamed payloads.
+[Chromium's IEEE CRC implementation](https://chromium.googlesource.com/chromium/src/+/HEAD/third_party/zlib/crc32_simd.c),
+[Intel ISA-L's IEEE CRC implementation](https://github.com/intel/isa-l/blob/master/crc/crc32_ieee_avx2.asm)
+
+Three microbenchmark repeats with unaligned, chained inputs reduced median
+4 KiB checksum CPU time from 1,100 ns to 314 ns and 32-byte time from 77 ns
+to 12 ns. The same workload profile after the change attributed 531 of
+16,617 samples to checksum code. The equivalence fixture checks zlib
+against known answers, arbitrary seeds, split updates, and unaligned
+buffers ending at a guard page. Both binaries reopened and verified
+8,192 values in a 10 MiB checkpoint image created by the other. The
+qualification passed 50 GNU Release groups, 25 musl Release groups, and
+25 ASan/UBSan groups covering storage, recovery, concurrency, streaming,
+leases, and transactional messaging.
+
+The GNU Release workload streamed 192 MiB with eight writers, a fixed
+10 MiB single-file container, reclaim, and reopen. Single-file numbers
+are medians of four NoSync and two durable pairs against `d1579946`.
+Multifile has one reference run per mode. Every run verified. Work and
+process CPU are in seconds. Mutation p95 and the final 16 rounds' p95
+are in milliseconds.
+
+| Backend | Mode | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Single-file prior | NoSync | 16.85 | 21.04 | 107.68 | 133.31 |
+| Single-file PCLMUL | NoSync | 16.99 | 19.50 | 106.76 | 142.21 |
+| Multifile | NoSync | 21.38 | 9.57 | 52.92 | 50.03 |
+| Single-file prior | Durable | 31.44 | 25.41 | 134.97 | 161.90 |
+| Single-file PCLMUL | Durable | 30.82 | 24.51 | 128.99 | 153.77 |
+| Multifile | Durable | 69.11 | 11.77 | 195.03 | 187.97 |
+
+Index columns show the slowest worker in seconds. Open, joins, verify,
+and close columns are in milliseconds. Joins measure eight serial
+live joins. Verification runs after reopen.
+
+| Backend | Mode | Index flush | First query | Repeat query | First open | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single-file prior | NoSync | 3.47 | 0.70 | 0.27 | 33.92 | 46.62 | 22.92 | 27.79 |
+| Single-file PCLMUL | NoSync | 3.48 | 0.70 | 0.24 | 30.22 | 34.55 | 21.98 | 24.82 |
+| Multifile | NoSync | 5.66 | 3.39 | 4.68 | 0.20 | 1.41 | 38.87 | 3.82 |
+| Single-file prior | Durable | 3.58 | 0.38 | 0.07 | 32.45 | 42.84 | 21.82 | 25.14 |
+| Single-file PCLMUL | Durable | 3.66 | 0.39 | 0.11 | 30.74 | 42.41 | 22.54 | 25.32 |
+| Multifile | Durable | 8.52 | 11.72 | 15.69 | 0.29 | 1.70 | 39.65 | 3.90 |
+
+CPU fell in every matched pair, by 7.3% in the NoSync median and 3.5% in
+the durable median. NoSync work was within 1% and its late-window median
+was 6.7% higher. Three NoSync pairs had higher late-window p95 and one
+had lower p95. The pairs establish a CPU gain, and further work is needed
+on NoSync tail latency, total CPU, and reopen relative to multifile.
+Raw runs, profiles, and tests are under
+`build/pouch-space-concurrent/projection-cpu/`.

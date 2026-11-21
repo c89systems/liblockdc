@@ -1,4 +1,5 @@
 #include "frame.h"
+#include "crc.h"
 #include "lc_api_internal.h"
 #include "space.h"
 #include <string.h>
@@ -49,7 +50,7 @@ int ps_frame_read(lc_pouch_record_io io, uint64_t start, uint64_t end,
     rc = lc_pouch_record_io_read(io, at, &part, 1, e);
     if (rc != LC_OK)
       return rc;
-    crc = (unsigned long)crc32((uLong)crc, *scratch, (uInt)n);
+    crc = (unsigned long)ps_crc32((uLong)crc, *scratch, (uInt)n);
   }
   if (crc != header.payload_crc)
     return invalid(e, "namespace batch frame checksum mismatch");

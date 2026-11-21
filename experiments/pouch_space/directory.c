@@ -1,4 +1,5 @@
 #include "directory.h"
+#include "crc.h"
 #include "lc_api_internal.h"
 
 #include <string.h>
@@ -79,7 +80,7 @@ static uint32_t load32(const unsigned char *p) {
          (uint32_t)p[3] << 24U;
 }
 static uint32_t page_crc(const unsigned char *p) {
-  return (uint32_t)crc32(crc32(0, p, 12), p + 16, PS_PAGE - 16);
+  return (uint32_t)ps_crc32(ps_crc32(0, p, 12), p + 16, PS_PAGE - 16);
 }
 int ps_directory_key_compare(ps_key a, ps_key b) {
   if (a.kind != b.kind)
