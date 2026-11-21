@@ -2543,9 +2543,9 @@ static void shared_handoff(const char *path) {
 typedef struct projection_probe {
   ps_root *peer_root;
   ps_namespace *peer;
-  size_t acquisitions, expected_acquisitions, headers;
+  size_t acquisitions, headers;
   off_t header;
-  int armed, held, reject, corrupt, discover;
+  int armed, held, reject, corrupt, discover, checkpoint_peer, expect_allocator;
 } projection_probe;
 static int projection_lock(void *context, int fd, int command,
                            struct flock *lock) {
@@ -2557,14 +2557,19 @@ static int projection_lock(void *context, int fd, int command,
     return -1;
   }
   int rc = fcntl(fd, command, lock);
-  if (!rc && p->armed && p->peer && command == F_OFD_SETLK &&
-      lock->l_type == F_RDLCK && lock->l_start >= PS_DATA &&
-      lock->l_start < (off_t)PS_DEFAULT_CAPACITY) {
+  if (!rc && p->armed && (p->peer || p->checkpoint_peer) &&
+      command == F_OFD_SETLK && lock->l_type == F_RDLCK &&
+      lock->l_start >= PS_DATA && lock->l_start < (off_t)PS_DEFAULT_CAPACITY) {
     lc_error e = {0};
-    ps_namespace *ns = p->peer;
     REQUIRE(!p->held && !p->acquisitions);
-    p->peer = NULL;
-    ok(append(p->peer_root, ns, 1, 0, 65, &e), &e);
+    if (p->peer) {
+      ps_namespace *ns = p->peer;
+      p->peer = NULL;
+      ok(append(p->peer_root, ns, 1, 0, 65, &e), &e);
+    } else {
+      p->checkpoint_peer = 0;
+      ok(ps_checkpoint(ps_root_space(p->peer_root), &e), &e);
+    }
     clear(&e);
   }
   if (rc || !p->armed || lock->l_start != 4)
@@ -2587,7 +2592,12 @@ static ssize_t projection_read(void *context, int fd, void *bytes, size_t n,
       !(at % PS_PAGE))
     p->header = at;
   if (p->armed && rc == PS_RUN_IDENTITY_BYTES && at == p->header) {
-    REQUIRE(!p->held && p->acquisitions == p->expected_acquisitions);
+    if (p->held || (p->acquisitions != 0) != p->expect_allocator)
+      fprintf(stderr,
+              "stream header read with allocator held=%d, acquisitions=%zu, "
+              "expect allocator=%d\n",
+              p->held, p->acquisitions, p->expect_allocator);
+    REQUIRE(!p->held && (p->acquisitions != 0) == p->expect_allocator);
     ++p->headers;
     if (p->corrupt)
       *(unsigned char *)bytes ^= 1;
@@ -2655,13 +2665,12 @@ static void shared_projection_capture(const char *path, int durable) {
   ps_namespace_read_close(window);
   window = NULL;
   ps_coordination_unlock(allocator_guard);
-  probe.headers = 0;
+  probe.acquisitions = probe.headers = 0;
   probe.reject = 0;
-  probe.expected_acquisitions = 1;
   probe.peer_root = b;
   probe.peer = peer;
   ok(ps_namespace_view_open(x, &view, &e), &e);
-  REQUIRE(probe.acquisitions == 1 && probe.headers && !probe.peer);
+  REQUIRE(!probe.acquisitions && probe.headers && !probe.peer);
   probe.armed = 0;
   ok(ps_namespace_view_visit(view, 1, visit, &selected, &e), &e);
   REQUIRE(selected.count == 1 && selected.version == 1);
@@ -2670,7 +2679,7 @@ static void shared_projection_capture(const char *path, int durable) {
   ok(ps_namespace_projection(x, &after, &e), &e);
 
   probe.acquisitions = probe.headers = 0;
-  probe.expected_acquisitions = 0;
+  probe.expect_allocator = 0;
   probe.armed = probe.corrupt = 1;
   REQUIRE(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
                                  written.payload_span.payload_offset,
@@ -2695,6 +2704,16 @@ static void shared_projection_capture(const char *path, int durable) {
      &e);
   REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
   ps_namespace_read_close(window);
+
+  memset(&selected, 0, sizeof(selected));
+  probe.acquisitions = probe.headers = 0;
+  probe.armed = probe.checkpoint_peer = probe.expect_allocator = 1;
+  ok(ps_namespace_view_open(x, &view, &e), &e);
+  REQUIRE(probe.acquisitions && probe.headers && !probe.checkpoint_peer);
+  probe.armed = 0;
+  ok(ps_namespace_view_visit(view, 1, visit, &selected, &e), &e);
+  REQUIRE(selected.count == 1 && selected.version == 1);
+  ps_namespace_view_close(view);
   lc_pouch_state_entry_cleanup(&allocator, &written);
   ps_namespace_release(peer);
   ps_namespace_release(x);

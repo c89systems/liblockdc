@@ -13565,3 +13565,116 @@ outbox timing remains a separate measurement.
 
 Raw traces, comparisons, and test logs are under
 `build/pouch-space-concurrent/partitioned-admission/`.
+
+## Keep captured reads across same-root journal advances
+
+A provisional read still selects from an exactly certified resident
+prefix. Once all its extent witnesses are in place, the second check
+validates the lifetime of those extents. Within the same physical root
+generation a replacing journal event may retire an extent logically.
+The allocator keeps its bytes owned until a checkpoint advances the
+root. A stable, identity- and checksum-verified certificate with the same
+root and nondecreasing ready, durable, and token grant bounds therefore
+keeps the original selection valid. This also holds while a peer is
+writing a journal frame. After a successful check, a later checkpoint
+observes the exact OFD range witnesses before the captured bytes can be
+reused.
+
+A root change, checkpoint retirement, recovery, or an uncertain
+certificate still takes the guarded path. The initial observation still
+requires the original exact-prefix match and rejects a pending journal
+write. The namespace guard covers selection and stream header
+verification. Single-value reads, batch captures, namespace views, and
+active-stream windows share the post-pin check.
+
+SQLite's WAL end mark shows how a reader can retain its initial prefix
+as the log advances. Lee, Kim, and Kang show how immutability can
+validate a protection that has already been published. Here the physical
+checkpoint boundary and exact OFD witnesses establish the two parts of
+the lifetime guarantee. [SQLite WAL reader algorithm](https://www.sqlite.org/fileformat2.html#walread),
+[Leveraging Immutability to Validate Hazard Pointers for Optimistic Traversals](https://jhyeon.kim/papers/pldi25.pdf)
+
+The deterministic fixtures publish a peer replacement during single or
+batch pin acquisition, retain the original bytes through a later
+checkpoint, and verify reclamation after the reader closes. A peer
+checkpoint during pinning exercises guarded recapture. The namespace
+fixture checks that a peer append can complete without an allocator
+acquisition by the reader and that a checkpoint forces allocator
+recapture before a stream header read. It exercises both durability
+modes. The regression selection passed 91 GNU Release groups and 55
+each on ASan/UBSan and musl Release, including lease authority, queue
+transactions, outbox recovery, indexed crash recovery, and growth.
+
+In separate instrumented runs, witness checks rejected 2,412 of 31,409
+captures on the control and 22 of 30,996 on the revised 192 MiB NoSync
+workload. At 96 MiB durable the counts were 890 of 15,998 and 13 of
+16,037. These runs measured retries. The timing comparisons below used
+uninstrumented executables.
+
+The 46 matched workload runs used `fcf7d60c` as the single-file
+control. Indexed workloads used eight writers, 24 rows, 64 KiB values,
+and a fixed 10 MiB native root. Native builds ran five pairs at 96 MiB
+NoSync, three pairs each at 96 MiB durable and 192 MiB NoSync, and two
+pairs at 192 MiB durable. Each indexed workload includes one fresh
+multifile run. Work and CPU are in seconds. Mutation and last-16-round
+p95 are in milliseconds. Values are medians within each build.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 5.95 | 6.42 | 76.44 | 81.95 |
+| 96 MiB NoSync | Revised | 5.97 | 5.95 | 78.03 | 78.65 |
+| 96 MiB NoSync | Multifile | 10.77 | 4.30 | 52.84 | 60.79 |
+| 96 MiB durable | Prior | 12.81 | 7.38 | 96.25 | 112.66 |
+| 96 MiB durable | Revised | 13.50 | 7.43 | 110.51 | 106.27 |
+| 96 MiB durable | Multifile | 31.47 | 5.45 | 197.02 | 166.01 |
+| 192 MiB NoSync | Prior | 15.26 | 16.65 | 103.62 | 133.97 |
+| 192 MiB NoSync | Revised | 15.25 | 16.11 | 99.92 | 117.89 |
+| 192 MiB NoSync | Multifile | 21.49 | 9.20 | 53.18 | 58.67 |
+| 192 MiB durable | Prior | 28.83 | 22.06 | 123.77 | 150.95 |
+| 192 MiB durable | Revised | 28.76 | 21.47 | 120.68 | 150.92 |
+| 192 MiB durable | Multifile | 66.49 | 11.60 | 195.47 | 159.42 |
+
+CPU fell in all five 96 MiB NoSync pairs and all three 192 MiB NoSync
+pairs. Elapsed work varied across those pairs. At 192 MiB the late p95
+fell by 16–25 ms in every NoSync pair. The 96 MiB durable median work and
+mutation p95 rose, while late p95 fell. At 192 MiB durable one pair
+improved and the other regressed on work, CPU, and late p95.
+
+Index phases report the longest worker in seconds. First-owner open,
+eight live joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.47 | 0.20 | 0.06 | 12.89 | 20.65 | 11.33 | 14.31 |
+| 96 MiB NoSync | Revised | 1.42 | 0.18 | 0.07 | 14.32 | 23.49 | 13.36 | 17.93 |
+| 96 MiB NoSync | Multifile | 3.10 | 1.72 | 2.38 | 0.21 | 1.14 | 24.71 | 2.53 |
+| 96 MiB durable | Prior | 1.54 | 0.11 | 0.03 | 13.36 | 19.93 | 11.85 | 13.13 |
+| 96 MiB durable | Revised | 1.60 | 0.11 | 0.02 | 13.87 | 21.13 | 11.81 | 15.39 |
+| 96 MiB durable | Multifile | 4.45 | 4.95 | 6.44 | 0.25 | 1.18 | 24.16 | 2.79 |
+| 192 MiB NoSync | Prior | 3.33 | 0.46 | 0.12 | 32.17 | 34.57 | 20.84 | 30.02 |
+| 192 MiB NoSync | Revised | 3.36 | 0.43 | 0.16 | 31.35 | 37.83 | 25.33 | 31.21 |
+| 192 MiB NoSync | Multifile | 5.74 | 3.46 | 4.36 | 0.30 | 1.59 | 40.82 | 4.56 |
+| 192 MiB durable | Prior | 3.31 | 0.32 | 0.07 | 33.95 | 38.68 | 21.84 | 29.16 |
+| 192 MiB durable | Revised | 3.44 | 0.33 | 0.08 | 28.39 | 35.28 | 20.11 | 29.03 |
+| 192 MiB durable | Multifile | 8.36 | 11.20 | 14.57 | 0.22 | 1.21 | 39.63 | 3.29 |
+
+Both messaging workloads ran twice per build with two writers.
+Times are medians in milliseconds. Two additional `a7e4fec6` outbox runs
+took 970.17 ms median work. The two `a7e4fec6` 96 MiB durable indexed
+runs took 13.02 s.
+
+| Workload | Prior work / CPU / p95 | Revised work / CPU / p95 | Multifile work / CPU / p95 |
+| --- | ---: | ---: | ---: |
+| Warmed NoSync queue | 8.46 / 14.71 / 1.61 | 9.12 / 15.92 / 1.85 | 110.72 / 28.21 / 34.99 |
+| Durable outbox | 1029.14 / 104.75 / 212.84 | 832.32 / 90.80 / 162.45 | 1382.46 / 167.78 / 298.45 |
+
+The eight-lease fixture verified all 160 runs across four codec
+configurations, two durability policies, and warm and cold expiry.
+In the five cold plaintext runs per policy, median expiry took 157.77 ms
+NoSync and 152.17 ms durable for single-file, versus 407.66 ms and
+397.94 ms for multifile. Cold opening took 4.24 and 1.28 ms for
+single-file and 0.58 and 0.67 ms for multifile. The fixture uses
+`native=0` for single-file.
+
+Raw comparisons, traces, and test logs are under
+`build/pouch-space-concurrent/read-retirement/`.

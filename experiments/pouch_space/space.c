@@ -6395,7 +6395,7 @@ void ps_writer_close(ps_writer *w) {
 }
 int ps_internal_read_witness_valid(ps_space *s) {
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  return ps_readiness_resident(s);
+  return ps_readiness_retains_capture(s);
 }
 static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
                     ps_entry **out, lc_error *error) {
@@ -6416,8 +6416,8 @@ static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
    * been retired since selection. Publish the extent witnesses before
    * rechecking the certificate. Reclaimers can clear a page hint only after
    * observing a free range with no kernel witness under allocator authority.
-   * At a matching certificate this incarnation is still selected, so a
-   * reclaimer either excludes the range or observes our witness. */
+   * A matching root rules out reuse since selection. Any subsequent
+   * checkpoint that retires these bytes must observe our witness. */
   if (provisional && !ps_internal_read_witness_valid(s)) {
     ps_internal_entry_unpin(s, p);
     return healthy(s, error);

@@ -39,6 +39,11 @@ int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
  * a checked instant. A miss needs ordinary allocator capture. No physical
  * ownership or allocator permission follows from a match. */
 int ps_readiness_resident(ps_space *);
+/* After retaining extents from a certified resident prefix, check that a
+ * checkpoint or recovery cannot already have made those extents reusable.
+ * Journal and durability advances can retire values within the same root;
+ * reclamation of their storage still requires a checkpoint transition. */
+int ps_readiness_retains_capture(ps_space *);
 /* A newer certified root can seed private preparation. Installation still
  * needs the allocator and a fresh certificate. */
 int ps_readiness_preview(ps_space *, ps_readiness_certificate *);

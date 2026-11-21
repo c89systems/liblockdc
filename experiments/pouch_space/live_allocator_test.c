@@ -1995,13 +1995,13 @@ static void *read_resident(void *context) {
 }
 static void resident_capture(void) {
   for (int durable = 0; durable <= 1; ++durable)
-    for (int phase = 1; phase <= 3; ++phase) {
+    for (int phase = 1; phase <= 5; ++phase) {
       lc_error e = {0};
       ps_space *a = NULL, *b = NULL;
       ps_reader *held = NULL;
       ps_ref original;
       uint64_t bytes;
-      int present;
+      int present, journal_only = phase >= 4;
       query_gate g = {0};
       pthread_t thread;
       REQUIRE(!pthread_mutex_init(&g.mutex, NULL) &&
@@ -2018,9 +2018,10 @@ static void resident_capture(void) {
       const ps_entry *old = ps_internal_lookup(a, key(1));
       REQUIRE(old && old->count >= 2);
       uint64_t old_offset = old->extents[0].offset;
-      resident_reader worker = {a, phase == 1 ? &original : NULL, NULL, 0,
-                                phase == 3};
-      g.armed = phase == 1 ? 1 : 2;
+      uint64_t selected = a->sequence;
+      resident_reader worker = {a, phase == 1 || phase == 4 ? &original : NULL,
+                                NULL, 0, phase == 3 || phase == 5};
+      g.armed = phase == 1 || phase == 4 ? 1 : 2;
       REQUIRE(!pthread_create(&thread, NULL, read_resident, &worker));
       pthread_mutex_lock(&g.mutex);
       while (!g.entered)
@@ -2030,7 +2031,10 @@ static void resident_capture(void) {
           .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 4, .l_len = 1};
       REQUIRE(!fcntl(b->fd, F_OFD_GETLK, &lock) && lock.l_type == F_UNLCK);
       capture_put(b, 1, 193);
-      ok(ps_checkpoint(b, &e), &e);
+      if (journal_only)
+        REQUIRE(b->generation == a->generation && b->sequence > selected);
+      else
+        ok(ps_checkpoint(b, &e), &e);
       if (phase == 1) {
         REQUIRE(!status(b).retired_bytes);
         capture_put(b, 2, PS_CHUNK);
@@ -2048,7 +2052,14 @@ static void resident_capture(void) {
         REQUIRE(worker.result == LC_ERR_INVALID && !worker.reader);
       else {
         REQUIRE(worker.result == LC_OK);
-        captured_expect(worker.reader, 1, 193);
+        if (journal_only) {
+          /* The capture keeps the certified prefix while the replacement is
+           * journaled. Its exact witness also survives physical retirement. */
+          REQUIRE(a->sequence == selected);
+          ok(ps_checkpoint(b, &e), &e);
+          REQUIRE(status(b).retired_bytes >= PS_CHUNK);
+        }
+        captured_expect(worker.reader, 1, journal_only ? PS_CHUNK + 65 : 193);
         ps_reader_close(worker.reader);
       }
       REQUIRE(!status(a).retained_payload_bytes);
@@ -3864,9 +3875,15 @@ static void certified_resident_observation(int durable) {
   REQUIRE(!fault.calls);
   captured_expect(reader, 1, PS_PAGE);
   ps_reader_close(reader);
+  ps_readiness_begin(a, PS_READINESS_JOURNAL);
+  REQUIRE(!ps_readiness_resident(b) && ps_internal_read_witness_valid(b));
+  ps_readiness_begin(a, PS_READINESS_ROOT);
+  REQUIRE(!ps_internal_read_witness_valid(b));
+  ps_readiness_finish(a, PS_READINESS_ROOT | PS_READINESS_JOURNAL);
   /* A pending transition denies the lock-free path even if the record still
    * names the resident prefix. */
   ps_readiness_begin(a, PS_READINESS_RECOVERY);
+  REQUIRE(!ps_internal_read_witness_valid(b));
   REQUIRE(ps_value_validate(b, artifact, &original, &valid, &e) ==
               LC_ERR_PENDING &&
           !valid && fault.calls == 1);

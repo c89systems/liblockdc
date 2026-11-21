@@ -224,11 +224,12 @@ static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
                    s, e,
                    "shared readiness certificate is uncertain; close cohort");
 }
-static int checked_snapshot(ps_space *s, uint64_t *record) {
+static int checked_snapshot(ps_space *s, uint64_t *record, uint64_t allowed) {
   const uint64_t *page = s->readiness->page;
+  const uint64_t blocked = ~(PRESSURE_BIT | allowed);
   uint64_t first, second;
   int selected;
-  if (__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) & ~PRESSURE_BIT)
+  if (__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) & blocked)
     return 0;
   first = __atomic_load_n(page, __ATOMIC_ACQUIRE);
   second = __atomic_load_n(page + WORDS, __ATOMIC_ACQUIRE);
@@ -237,19 +238,26 @@ static int checked_snapshot(ps_space *s, uint64_t *record) {
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   return first == __atomic_load_n(page, __ATOMIC_RELAXED) &&
          second == __atomic_load_n(page + WORDS, __ATOMIC_RELAXED) &&
-         !(__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) &
-           ~PRESSURE_BIT) &&
+         !(__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) & blocked) &&
          !memcmp(record + IDENTITY, s->identity, 16);
 }
 int ps_readiness_prepared_durable(ps_space *s, uint64_t ticket) {
   uint64_t record[WORDS];
-  return checked_snapshot(s, record) && record[PREPARED_DURABLE] >= ticket;
+  return checked_snapshot(s, record, 0) && record[PREPARED_DURABLE] >= ticket;
 }
 int ps_readiness_resident(ps_space *s) {
   uint64_t record[WORDS];
-  return s->readiness && s->readiness->active && checked_snapshot(s, record) &&
-         record[ROOT] == s->generation && record[READY] == s->sequence &&
-         record[DURABLE] == s->peer_durable &&
+  return s->readiness && s->readiness->active &&
+         checked_snapshot(s, record, 0) && record[ROOT] == s->generation &&
+         record[READY] == s->sequence && record[DURABLE] == s->peer_durable &&
+         record[GRANT_LIMIT] >= s->token_limit;
+}
+int ps_readiness_retains_capture(ps_space *s) {
+  uint64_t record[WORDS];
+  return s->readiness && s->readiness->active &&
+         checked_snapshot(s, record, PS_READINESS_JOURNAL) &&
+         record[ROOT] == s->generation && record[READY] >= s->sequence &&
+         record[DURABLE] >= s->peer_durable &&
          record[GRANT_LIMIT] >= s->token_limit;
 }
 static void certificate_from_record(ps_readiness_certificate *out,
@@ -274,7 +282,7 @@ int ps_readiness_preview(ps_space *s, ps_readiness_certificate *out) {
   if ((__atomic_load_n(page + ROOT, __ATOMIC_RELAXED) <= s->generation &&
        __atomic_load_n(page + WORDS + ROOT, __ATOMIC_RELAXED) <=
            s->generation) ||
-      !checked_snapshot(s, record) || record[ROOT] <= s->generation ||
+      !checked_snapshot(s, record, 0) || record[ROOT] <= s->generation ||
       record[READY] < s->sequence || record[GRANT_LIMIT] < s->token_limit)
     return 0;
   certificate_from_record(out, record);
