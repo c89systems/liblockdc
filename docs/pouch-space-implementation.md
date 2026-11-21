@@ -10374,3 +10374,82 @@ shared lease and outbox recovery, and index recovery. The older capacity
 fixture now verifies native tombstones at full capacity by checking the
 active stream identity and tail and reading back both deletions after cold
 reopen.
+
+## Sharing durability for completed private stream writes
+
+Two traced heavy NoSync runs spent 1.12–1.24 seconds in the grant
+preparation barriers alone, with 152–180 such calls per run. Total
+preparation wait was 3.39–3.93 seconds across concurrent callers. The
+shared barrier could cover framed journal publications from peers.
+Private preparation had no corresponding shared completion marker.
+
+After a writer completes the private writes for a grant or an active
+stream repair, it registers a ticket in the live readiness page. A sync
+leader captures the journal prefix and the issued preparation prefix
+before I/O. It advances the corresponding checked fields only after
+successful sync. A successful checkpoint or adoption barrier can cover
+preparation too. A writer consuming a peer certificate can advance its
+local completion only through the sequence that issued the ticket.
+Grant publication and zero-proof installation continue after durability
+under allocation authority.
+
+Tickets carry no allocation or journal visibility rights. Killed owners
+leave private bytes behind the existing ownership checks. The live
+readiness marker fences peers with the previous layout, and cold reopen
+resets both ticket counters.
+
+The two-owner fixture with a paused grant verifies that a successful
+earlier peer sync or checkpoint covers preparation. A later ticket or a
+failed barrier requires a separate successful sync. A separate local
+publication after the peer snapshot stays ahead of the first grant's
+completion. The fixture also checks journal invisibility before grant
+publication, a preserved payload after cold reopen and reset of the
+live counters. Existing grant fault, stream recovery and journal
+ordering suites exercise the remaining paths.
+
+In two alternating traced heavy pairs, grant preparation took 220 and
+212 syncs on the prior runs and 92 and 89 on the revised runs.
+Revised preparation waits exceeding 0.25 ms numbered 171 and 169.
+These runs show that a large fraction of preparation requests completed
+without issuing a separate sync.
+
+All 42 uninstrumented matched workflows verified. The native builds used
+fixed 10 MiB containers. Each build ran four attempts in each NoSync
+indexed profile and two in each remaining profile. The tables show
+medians in milliseconds in the order prior native (`79587b2b`), revised
+native, multifile. Grouped reopen includes the cold owner and live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1095.61 / 994.70 / 1304.75 | 60.28 / 50.61 / 31.42 | 34.46 / 3.83 / 1.02 | 9.87 / 13.03 / 0.77 | 4.63 / 4.95 / 6.84 |
+| NoSync indexed, 20 MiB | 2637.19 / 2278.78 / 2077.70 | 87.11 / 73.64 / 32.48 | 34.70 / 5.19 / 1.17 | 12.91 / 14.11 / 0.86 | 7.13 / 7.54 / 9.69 |
+| Durable indexed, 15 MiB | 5787.35 / 7553.96 / 5689.67 | 82.50 / 101.41 / 69.54 | 5.53 / 20.96 / 0.78 | 8.91 / 9.91 / 0.62 | 6.09 / 5.80 / 6.43 |
+| Warmed NoSync queue | 8.76 / 9.94 / 72.07 | 1.57 / 1.82 / 14.57 | 0.22 / 0.22 / 0.06 | 2.60 / 5.09 / 0.46 | 0.22 / 0.24 / 0.46 |
+| Durable outbox | 912.97 / 1035.43 / 1421.92 | 184.66 / 191.46 / 280.15 | 0.61 / 0.53 / 0.31 | 29.19 / 33.29 / 73.49 | 78.98 / 67.31 / 165.05 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 233.96 / 204.16 / 323.40 | 61.36 / 72.07 / 179.40 | 15.05 / 15.50 / 211.59 | 0.67 / 0.79 / 1.26 |
+| NoSync indexed, 20 MiB | 317.74 / 282.68 / 441.77 | 64.15 / 66.16 / 298.75 | 37.98 / 29.50 / 337.96 | 1.19 / 1.27 / 1.69 |
+| Durable indexed, 15 MiB | 144.45 / 191.56 / 212.35 | 16.44 / 8.10 / 256.64 | 2.31 / 2.25 / 329.29 | 0.48 / 0.38 / 0.65 |
+
+Heavy NoSync work fell 14% and mutation p95 fell 15% from the prior
+native build. Median mutation sync calls fell from 280 to 194 in that
+profile and from 119 to 85 in the lighter NoSync indexed profile.
+
+The first two durable indexed comparisons favored the prior native
+build by 0.89 and 2.64 seconds. A follow-up alternated four more pairs
+for each durable profile and all 16 verified. Revised indexed work
+finished sooner in two pairs and its median was 5.44 s against 5.53 s on
+the prior build. The paired differences ranged from 0.24 s faster to 0.40 s
+slower, with a paired median of 0.12 s slower. Durable outbox also split
+two pairs each, with medians of 0.83 s revised and 0.87 s prior. The
+durable data leaves a possible modest cost and substantial run
+variation.
+
+Targeted verification passed 35 GNU Release, 16 Debug ASan/UBSan and
+23 musl Release groups, including live publication and recovery,
+stream repair, fixed-capacity leases and outbox recovery.
+
+Raw runs and test logs are under `mutation-barrier-` and
+`shared-preparation-` in `build/pouch-space-concurrent/`.

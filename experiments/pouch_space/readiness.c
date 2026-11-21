@@ -8,13 +8,14 @@
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x3759444145525350)
+#define READY_MAGIC UINT64_C(0x3859444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
 #define ACTIVITY_WORD (PENDING_WORD - 1)
+#define PREPARATION_WORD (ACTIVITY_WORD - 1)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
-#define ZERO_WORDS (ACTIVITY_WORD - 2 * WORDS)
+#define ZERO_WORDS (PREPARATION_WORD - 2 * WORDS)
 #define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
 enum readiness_word {
   GENERATION,
@@ -26,6 +27,7 @@ enum readiness_word {
   ORIGIN,
   GRANT_USED,
   GRANT_LIMIT,
+  PREPARED_DURABLE,
   CRC
 };
 /* Each slot has an atomic commit generation followed by a checked record.
@@ -45,7 +47,28 @@ static uint64_t record_crc(const uint64_t *record) {
   return (uint64_t)crc32(0, (const unsigned char *)record,
                          (uInt)((WORDS - 1) * sizeof(*record)));
 }
-static int slot_read(const uint64_t *source, uint64_t *record) {
+uint64_t ps_readiness_issued_tickets(ps_space *s) {
+  return s->readiness ? __atomic_load_n(s->readiness->page + PREPARATION_WORD,
+                                        __ATOMIC_ACQUIRE)
+                      : 0;
+}
+int ps_readiness_prepare_ticket(ps_space *s, uint64_t *out, lc_error *e) {
+  uint64_t *word, issued;
+  *out = 0;
+  if (!s->readiness || !s->readiness->active)
+    return LC_OK;
+  word = s->readiness->page + PREPARATION_WORD;
+  issued = __atomic_load_n(word, __ATOMIC_RELAXED);
+  do {
+    if (issued == UINT64_MAX)
+      return failed(s, e, "shared preparation tickets exhausted; close cohort");
+  } while (!__atomic_compare_exchange_n(word, &issued, issued + 1, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+  *out = issued + 1;
+  return LC_OK;
+}
+static int slot_read(const uint64_t *source, uint64_t *record,
+                     uint64_t issued) {
   size_t i;
   uint64_t generation = __atomic_load_n(source, __ATOMIC_ACQUIRE);
   if (!generation)
@@ -59,14 +82,15 @@ static int slot_read(const uint64_t *source, uint64_t *record) {
       record[GRANT_USED] % TOKEN_RANGE || record[GRANT_LIMIT] % TOKEN_RANGE ||
       record[GRANT_USED] > record[GRANT_LIMIT] ||
       record[GRANT_LIMIT] - record[GRANT_USED] >= TOKEN_POOL ||
-      record[CRC] != record_crc(record))
+      record[PREPARED_DURABLE] > issued || record[CRC] != record_crc(record))
     return -1;
   return 1;
 }
 static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
   uint64_t second[WORDS];
-  int a = slot_read(s->readiness->page, record);
-  int b = slot_read(s->readiness->page + WORDS, second);
+  uint64_t issued = ps_readiness_issued_tickets(s);
+  int a = slot_read(s->readiness->page, record, issued);
+  int b = slot_read(s->readiness->page + WORDS, second, issued);
   /* Only a zero generation identifies a slot interrupted before publication.
    * A malformed committed record cannot fall back to an older acknowledgement.
    */
@@ -173,6 +197,8 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
     for (i = 0; i < ZERO_WORDS; ++i)
       __atomic_store_n(s->readiness->page + 2 * WORDS + i, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(s->readiness->page + PREPARATION_WORD, 0,
+                     __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PENDING_WORD, 0, __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
@@ -219,6 +245,7 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->origin = record[ORIGIN];
     out->grant_used = record[GRANT_USED];
     out->grant_limit = record[GRANT_LIMIT];
+    out->prepared_durable = record[PREPARED_DURABLE];
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
         ~PRESSURE_BIT;
@@ -292,7 +319,7 @@ int ps_readiness_publish(ps_space *s, lc_error *e) {
   return rc;
 }
 int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
-                           lc_error *e) {
+                           uint64_t prepared, lc_error *e) {
   uint64_t record[WORDS];
   int selected, rc;
   if (!s->readiness || !s->readiness->active)
@@ -307,11 +334,14 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   if (wire > record[READY])
     record[READY] =
         wire; /* A newly stabilized selected root proves this prefix. */
-  if (wire > record[DURABLE] || root > record[ROOT]) {
+  if (wire > record[DURABLE] || root > record[ROOT] ||
+      prepared > record[PREPARED_DURABLE]) {
     if (wire > record[DURABLE])
       record[DURABLE] = wire;
     if (root > record[ROOT])
       record[ROOT] = root;
+    if (prepared > record[PREPARED_DURABLE])
+      record[PREPARED_DURABLE] = prepared;
     rc = select_record(s, record, selected, e);
   }
   if (rc == LC_OK && root)

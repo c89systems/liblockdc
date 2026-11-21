@@ -2,7 +2,7 @@
 #define POUCH_SPACE_READINESS_H
 #include "space.h"
 typedef struct ps_readiness ps_readiness;
-#define PS_READINESS_WORDS 11U
+#define PS_READINESS_WORDS 12U
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
   PS_READINESS_JOURNAL = 2,
@@ -14,8 +14,9 @@ enum ps_readiness_change {
 typedef struct ps_readiness_certificate {
   uint64_t ready, durable, root, origin, pending;
   uint64_t grant_used, grant_limit;
+  uint64_t prepared_durable;
 } ps_readiness_certificate;
-/* All access is under container allocation authority. Membership is an OFD
+/* Certificate access uses container allocation authority. Membership is an OFD
  * read witness at byte 3, separate from physical-reader presence at byte 2.
  * Certificates are volatile cohort state, not replay authority after reopen.
  */
@@ -37,8 +38,13 @@ void ps_readiness_note_mutation(ps_space *);
 void ps_readiness_begin(ps_space *, unsigned int changes);
 void ps_readiness_finish(ps_space *, unsigned int changes);
 int ps_readiness_publish(ps_space *, lc_error *);
+/* Register completed private writes before waiting for sync leadership.
+ * Leaders capture the issued prefix before I/O and certify it afterward.
+ * These tickets carry no journal visibility or allocation rights. */
+int ps_readiness_prepare_ticket(ps_space *, uint64_t *, lc_error *);
+uint64_t ps_readiness_issued_tickets(ps_space *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
-                           lc_error *);
+                           uint64_t prepared, lc_error *);
 /* Prepared pages are durably zeroed free payload capacity. The allocator
  * checks proofs under allocation authority and revokes them before spending
  * pages. A capacity reservation can retain the proof while bytes stay free. */

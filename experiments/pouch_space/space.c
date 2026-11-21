@@ -210,13 +210,14 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
 /* Global sync leadership precedes allocation authority. No allocator/commit
  * mutex spans file I/O or a wait for that leader. Only this owner's journal
  * framing establishes a dependency from its local completed-byte H prefix to
- * a global wire prefix; observing a foreign frame cannot certify local bytes.
+ * a global wire prefix. Completed private writes can separately register a
+ * ticket that precedes the shared barrier, without publishing a journal frame.
  */
-static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
-                          int *synced, lc_error *error) {
+static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
+                          uint64_t *completed, int *synced, lc_error *error) {
   ps_coordination_guard *leader = NULL, *guard = NULL;
   ps_readiness_certificate certificate;
-  uint64_t target = 0, wire = 0;
+  uint64_t target = 0, wire = 0, prepared = 0;
   int rc, covered = 0;
   *synced = 0;
   rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
@@ -231,9 +232,18 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
     s->peer_durable = certificate.durable;
     covered = requested <= s->own_ready_sequence &&
               certificate.durable >= s->own_ready_wire;
-    target = covered ? s->own_ready_sequence
-                     : __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
-    wire = certificate.ready;
+    if (covered)
+      target = s->own_ready_sequence;
+    else if (ticket && ticket <= certificate.prepared_durable) {
+      covered = 1;
+      /* The ticket follows this owner's completed local prefix. A later
+       * local completion can still arrive after the peer's barrier. */
+      target = requested;
+    } else {
+      target = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+      wire = certificate.ready;
+      prepared = ps_readiness_issued_tickets(s);
+    }
   }
   rc = allocation_end(s, guard, rc, error);
   guard = NULL;
@@ -245,7 +255,7 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
       pthread_mutex_lock(&s->mutex);
       rc = allocation_begin(s, &guard, error);
       if (rc == LC_OK)
-        rc = ps_readiness_stabilize(s, wire, 0, error);
+        rc = ps_readiness_stabilize(s, wire, 0, prepared, error);
       if (rc == LC_OK && s->peer_durable < wire)
         s->peer_durable = wire;
       rc = allocation_end(s, guard, rc, error);
@@ -265,7 +275,8 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t *completed,
  * a sync of the ready prefix; arrivals during I/O form the next group. Neither
  * the directory mutex nor the commit mutex is held across the actual sync.
  * Structural and commit barriers share the separate sync I/O mutex. */
-static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
+static int wait_ready(ps_space *s, uint64_t sequence, uint64_t ticket,
+                      lc_error *error) {
   uint64_t target, covered, completed;
   int rc = LC_OK, synced;
   pthread_mutex_lock(&s->commit_mutex);
@@ -284,8 +295,9 @@ static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
     pthread_mutex_unlock(&s->commit_mutex);
     completed = target;
     synced = 1;
-    rc = s->readiness ? shared_durable(s, sequence, &completed, &synced, error)
-                      : sync_file(s, error);
+    rc = s->readiness
+             ? shared_durable(s, sequence, ticket, &completed, &synced, error)
+             : sync_file(s, error);
     pthread_mutex_lock(&s->commit_mutex);
     s->sync_batches += synced;
     if (rc == LC_OK) {
@@ -301,6 +313,14 @@ static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
   }
   pthread_mutex_unlock(&s->commit_mutex);
   return rc;
+}
+static int wait_durable(ps_space *s, uint64_t sequence, lc_error *error) {
+  return wait_ready(s, sequence, 0, error);
+}
+static int wait_prepared(ps_space *s, uint64_t sequence, lc_error *error) {
+  uint64_t ticket;
+  int rc = ps_readiness_prepare_ticket(s, &ticket, error);
+  return rc == LC_OK ? wait_ready(s, sequence, ticket, error) : rc;
 }
 static int reserve_file(ps_space *s, uint64_t begin, uint64_t bytes,
                         lc_error *error) {
@@ -2624,6 +2644,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   ps_meta_page *page, *next_page;
   ps_run *trim = NULL;
   uint64_t bound, extra, incremental, floor = PS_MAINTENANCE_RESERVE;
+  uint64_t prepared = 0;
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0}, empty = {0};
   ps_directory_pages changes;
@@ -2716,8 +2737,10 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
   if (rc == LC_OK && s->journal_image && s->journal)
     rc = clear_checkpoint_journal(s, s->journal_image, s->journal, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    prepared = ps_readiness_issued_tickets(s);
     rc = sync_file(s, error); /* obsolete root and covered journal retired */
+  }
   lc_free_with_allocator(NULL, builder.buffer);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PROTOCOL)
@@ -2739,7 +2762,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   s->metadata_fallbacks += dense;
   s->directory = new_root;
   s->journal = 0;
-  rc = ps_readiness_stabilize(s, s->sequence, s->generation, error);
+  rc = ps_readiness_stabilize(s, s->sequence, s->generation, prepared, error);
   if (rc != LC_OK) {
     ps_directory_close(directory);
     lc_free_with_allocator(NULL, trim);
@@ -4856,10 +4879,12 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   if (rc == LC_OK &&
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
+    uint64_t prepared = ps_readiness_issued_tickets(s);
     rc = sync_file(s, error);
     if (rc == LC_OK) {
       ps_readiness_finish(s, PS_READINESS_CHECKPOINT_RETIRE);
-      rc = ps_readiness_stabilize(s, v->sequence, v->generation, error);
+      rc = ps_readiness_stabilize(s, v->sequence, v->generation, prepared,
+                                  error);
       if (rc == LC_OK)
         v->peer_durable = v->sequence;
     }
@@ -7160,7 +7185,7 @@ select_run:
       sequence = __atomic_add_fetch(&s->pending_sequence, 1, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&s->mutex);
     if (rc == LC_OK)
-      rc = wait_durable(s, sequence, error);
+      rc = wait_prepared(s, sequence, error);
   }
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
@@ -8052,7 +8077,7 @@ int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
-    rc = wait_durable(s, sequence, error);
+    rc = wait_prepared(s, sequence, error);
   if (rc == LC_OK) {
     pthread_mutex_lock(&s->mutex);
     rc = owned_capture_begin(head, &guard, error);

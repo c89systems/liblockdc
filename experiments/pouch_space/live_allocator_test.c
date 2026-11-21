@@ -2486,6 +2486,7 @@ typedef struct durable_gate {
   pthread_cond_t cond;
   int paused, entered, released, attempted, finished;
   size_t calls;
+  int hold_leadership, fail_sync;
 } durable_gate;
 static int durable_sync(void *context, int fd) {
   durable_gate *g = context;
@@ -2499,6 +2500,10 @@ static int durable_sync(void *context, int fd) {
       pthread_cond_wait(&g->cond, &g->mutex);
   }
   pthread_mutex_unlock(&g->mutex);
+  if (g->fail_sync) {
+    errno = EIO;
+    return -1;
+  }
   return fdatasync(fd);
 }
 static ssize_t durable_write(void *context, int fd, const void *p, size_t n,
@@ -2515,6 +2520,8 @@ static int durable_attempt(void *context, int fd, int command,
     pthread_mutex_lock(&g->mutex);
     g->attempted = 1;
     pthread_cond_broadcast(&g->cond);
+    while (g->hold_leadership && !g->released)
+      pthread_cond_wait(&g->cond, &g->mutex);
     pthread_mutex_unlock(&g->mutex);
   }
   return fcntl(fd, command, lock);
@@ -3865,6 +3872,111 @@ static void finish_catalog_sync(durable_gate *gate, pthread_t thread) {
   pthread_cond_broadcast(&gate->cond);
   pthread_mutex_unlock(&gate->mutex);
   REQUIRE(!pthread_join(thread, NULL));
+}
+typedef struct grant_work {
+  ps_owned_head *head;
+  ps_owned_run *run;
+} grant_work;
+static void *prepare_grant(void *context) {
+  grant_work *work = context;
+  lc_error e = {0};
+  int found;
+  ok(ps_owned_grant(work->head, NULL, 0, PS_PAGE, &work->run, &found, &e), &e);
+  REQUIRE(found);
+  return NULL;
+}
+enum preparation_barrier {
+  READY_BEFORE_SYNC,
+  READY_DURING_SYNC,
+  FAILED_SYNC,
+  READY_BEFORE_CHECKPOINT
+};
+static void shared_preparation(enum preparation_barrier when) {
+  durable_gate leader = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  durable_gate writer = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io ai = {&leader, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_io bi = {&writer, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_coordination_io coordinator = {&writer, durable_attempt};
+  ps_options ao = {.io = &ai},
+             bo = {.io = &bi, .coordination_io = &coordinator};
+  const ps_key stream = {88, 1, PS_STREAM};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_status info, observed;
+  grant_work grant = {0};
+  pthread_t sync_thread, grant_thread;
+  lc_error e = {0};
+  ok(ps_open(path, 1, &bo, &b, &e), &e);
+  ok(ps_owned_open(b, NULL, stream, 1, NULL, &grant.head, &info, &e), &e);
+  ok(ps_flush(b, &e), &e);
+  ok(ps_open(path, 0, &ao, &a, &e), &e);
+  capture_put(a, 1, 65);
+  uint64_t a_syncs = status(a).syncs, b_syncs = status(b).syncs;
+  durable_work flush = {a, &leader};
+  if (when == READY_DURING_SYNC) {
+    leader.paused = 1;
+    REQUIRE(!pthread_create(&sync_thread, NULL, durable_flush, &flush));
+    wait_catalog_sync(&leader);
+  }
+  writer.attempted = 0;
+  writer.hold_leadership = 1;
+  REQUIRE(!pthread_create(&grant_thread, NULL, prepare_grant, &grant));
+  pthread_mutex_lock(&writer.mutex);
+  while (!writer.attempted)
+    pthread_cond_wait(&writer.cond, &writer.mutex);
+  pthread_mutex_unlock(&writer.mutex);
+  ok(ps_owned_inspect(a, stream, &info.ref, &observed, &e), &e);
+  REQUIRE(!observed.runs && status(b).syncs == b_syncs);
+
+  if (when == READY_DURING_SYNC)
+    finish_catalog_sync(&leader, sync_thread);
+  else if (when == FAILED_SYNC) {
+    leader.fail_sync = 1;
+    REQUIRE(ps_flush(a, &e) == LC_ERR_TRANSPORT);
+    lc_error_cleanup(&e);
+  } else if (when == READY_BEFORE_CHECKPOINT)
+    ok(ps_checkpoint(a, &e), &e);
+  else
+    ok(ps_flush(a, &e), &e);
+  REQUIRE(status(a).syncs ==
+          a_syncs + (when == READY_BEFORE_CHECKPOINT ? 3 : 1));
+  uint64_t later = 0;
+  if (when == READY_BEFORE_SYNC) {
+    /* A later local frame can arrive while the first preparation is waiting
+     * to consume the certificate. It still needs its own durability proof. */
+    capture_put(b, 2, 67);
+    later = __atomic_load_n(&b->pending_sequence, __ATOMIC_ACQUIRE);
+  }
+  finish_catalog_sync(&writer, grant_thread);
+  REQUIRE(status(b).syncs ==
+          b_syncs + (when == READY_DURING_SYNC || when == FAILED_SYNC));
+  REQUIRE(!later ||
+          __atomic_load_n(&b->durable_sequence, __ATOMIC_ACQUIRE) < later);
+
+  unsigned char marker = 0x6a, byte = 0;
+  ok(ps_owned_write(grant.run, 0, &marker, 1, &e), &e);
+  ok(ps_owned_commit(grant.head, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_owned_run_close(grant.run);
+  ps_owned_close(grant.head);
+  ok(ps_close(a, &e), &e);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  REQUIRE(!ps_readiness_issued_tickets(b) && !readiness(b).prepared_durable);
+  ok(ps_owned_open(b, NULL, stream, 0, &info.ref, &grant.head, &observed, &e),
+     &e);
+  int found;
+  ok(ps_owned_grant(grant.head, NULL, 0, 0, &grant.run, &found, &e), &e);
+  REQUIRE(found && observed.runs == 1 && observed.tail == 1);
+  ok(ps_owned_read(grant.run, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == marker);
+  ps_owned_run_close(grant.run);
+  ps_owned_close(grant.head);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+  REQUIRE(!pthread_cond_destroy(&leader.cond) &&
+          !pthread_mutex_destroy(&leader.mutex));
+  REQUIRE(!pthread_cond_destroy(&writer.cond) &&
+          !pthread_mutex_destroy(&writer.mutex));
 }
 static void additive_catalog(void) {
   lc_error e = {0};
@@ -5618,7 +5730,12 @@ int main(int argc, char **argv) {
     projection_tail();
   else if (!strcmp(argv[2], "shared-durable"))
     shared_durability();
-  else if (!strcmp(argv[2], "readiness-cohort"))
+  else if (!strcmp(argv[2], "shared-preparation")) {
+    shared_preparation(READY_BEFORE_SYNC);
+    shared_preparation(READY_DURING_SYNC);
+    shared_preparation(FAILED_SYNC);
+    shared_preparation(READY_BEFORE_CHECKPOINT);
+  } else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();
   else if (!strcmp(argv[2], "reopen-cohort"))
     reopen_cohort();
