@@ -1920,6 +1920,97 @@ static void directory_reopen_locality(enum directory_layout layout) {
   }
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void reject_descriptor_checksum(ps_directory_value ref) {
+  unsigned char original[PS_PAGE], damaged[PS_PAGE];
+  off_t page = (off_t)(ref.offset / PS_PAGE * PS_PAGE);
+  size_t at = (size_t)(ref.offset % PS_PAGE);
+  lc_error e = {0};
+  ps_space *join = NULL;
+  int fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0 && at >= META_HEADER && at <= PS_PAGE - 64);
+  REQUIRE(pread(fd, original, sizeof(original), page) == sizeof(original));
+  memcpy(damaged, original, sizeof(damaged));
+  damaged[at + 60] ^= 1U;
+  /* Keep the enclosing page valid. The descriptor has its own checksum. */
+  uint32_t crc =
+      (uint32_t)crc32(crc32(0, damaged, 48), damaged + 52, PS_PAGE - 52);
+  for (size_t i = 0; i < 4; ++i)
+    damaged[48 + i] = (unsigned char)(crc >> (8 * i));
+  REQUIRE(pwrite(fd, damaged, sizeof(damaged), page) == sizeof(damaged));
+  REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join);
+  REQUIRE(e.message &&
+          !strcmp(e.message, "invalid container metadata checksum"));
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(fd, original, sizeof(original), page) == sizeof(original));
+  REQUIRE(!fdatasync(fd) && !close(fd));
+}
+static void checkpoint_decode(void) {
+  ps_space *writer = NULL, *join = NULL;
+  ps_reader *small = NULL, *large = NULL, *current = NULL;
+  lc_error e = {0};
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 36; ++id)
+    capture_put(writer, id, id == 3 ? 3 * PS_CHUNK : 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  ps_directory_value short_ref =
+      ps_internal_lookup(writer, key(24))->checkpoint_ref;
+  ps_directory_value extent_vector =
+      ps_internal_lookup(writer, key(3))->checkpoint_ref;
+  REQUIRE(short_ref.bytes == 88 && extent_vector.bytes > 128);
+  reject_descriptor_checksum(short_ref);
+  reject_descriptor_checksum(extent_vector);
+
+  size_t sites = 0;
+  for (size_t cut = 0; cut <= sites; ++cut) {
+    allocations = 0;
+    allocation_fail = cut;
+    measuring = 1;
+    int rc = ps_open(path, 0, NULL, &join, &e);
+    measuring = 0;
+    if (!cut) {
+      ok(rc, &e);
+      sites = allocations;
+    }
+    if (rc == LC_OK) {
+      ok(ps_close(join, &e), &e);
+      join = NULL;
+    } else {
+      REQUIRE(rc == LC_ERR_NOMEM && !join);
+      lc_error_cleanup(&e);
+    }
+  }
+  REQUIRE(sites);
+
+  ok(ps_open(path, 0, NULL, &join, &e), &e);
+  ok(ps_read_open(join, key(1), NULL, &small, &e), &e);
+  ok(ps_read_open(join, key(3), NULL, &large, &e), &e);
+  for (uint64_t id = 2; id <= 36; ++id)
+    ok(ps_delete(writer, key(id), &e), &e);
+  capture_put(writer, 1, 129);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_refresh(join, &e), &e);
+  ok(ps_read_open(join, key(1), NULL, &current, &e), &e);
+  captured_expect(current, 1, 129);
+  ps_reader_close(current);
+  captured_expect(small, 1, 65);
+  captured_expect(large, 3, 3 * PS_CHUNK);
+  ps_reader_close(large);
+  ps_reader_close(small);
+  ok(ps_close(join, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 36; ++id) {
+    ps_ref ref;
+    uint64_t bytes;
+    int present;
+    ok(ps_value_info(writer, key(id), &ref, &bytes, &present, &e), &e);
+    REQUIRE(present == (id == 1));
+    if (present)
+      REQUIRE(bytes == 129);
+  }
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void projection_quarantine(int durable, int explicit_sweep) {
   lc_error e = {0};
   ps_options options = {.durable_sync = durable};
@@ -6353,6 +6444,8 @@ int main(int argc, char **argv) {
       projection_quarantine(durable, 0);
   } else if (!strcmp(argv[2], "projection-faults"))
     projection_faults();
+  else if (!strcmp(argv[2], "checkpoint-decode"))
+    checkpoint_decode();
   else if (!strcmp(argv[2], "projection-recovery"))
     projection_recovery();
   else if (!strcmp(argv[2], "projection-threads"))

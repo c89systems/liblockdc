@@ -544,14 +544,35 @@ static void install(ps_space *s, ps_entry *p) {
     ++s->live_entries;
   }
 }
+#define CHECKPOINT_ENTRIES_PER_BATCH 16U
+typedef struct ps_entry_batch_slot {
+  ps_entry entry;
+  ps_extent extent;
+} ps_entry_batch_slot;
+typedef struct ps_entry_batch {
+  size_t capacity, used, references;
+} ps_entry_batch;
+typedef struct ps_entry_batch_builder {
+  ps_entry_batch *open;
+  size_t remaining;
+} ps_entry_batch_builder;
+
+static void entry_batch_release(ps_entry_batch *batch) {
+  if (batch && !--batch->references)
+    lc_free_with_allocator(NULL, batch);
+}
 static void entry_free(ps_entry *p) {
   ps_catalog_free_record(p);
   lc_free_with_allocator(NULL, p->deletion_reserve);
   lc_free_with_allocator(NULL, p->ranges);
   lc_free_with_allocator(NULL, p->range_bitmap);
   lc_free_with_allocator(NULL, p->range_rank);
-  lc_free_with_allocator(NULL, p->extents);
-  lc_free_with_allocator(NULL, p);
+  if (!p->embedded_extents)
+    lc_free_with_allocator(NULL, p->extents);
+  if (p->batch)
+    entry_batch_release(p->batch);
+  else
+    lc_free_with_allocator(NULL, p);
 }
 static int allocation_lock(ps_space *s, ps_coordination_guard **guard, int wait,
                            lc_error *error) {
@@ -1574,16 +1595,72 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
   put32(wire + 60,
         (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)));
 }
-static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
-                        ps_entry **out, int *event, lc_error *error) {
+/* The CRC covers the same byte sequence with the stored checksum omitted.
+ * Most descriptors fit in a bounded buffer and can use one zlib update. */
+static uint32_t entry_checksum(const unsigned char *wire, size_t bytes) {
+  unsigned char compact[124];
+  if (bytes == 64)
+    return checksum(wire, 60);
+  if (bytes <= sizeof(compact) + 4) {
+    memcpy(compact, wire, 60);
+    memcpy(compact + 60, wire + 64, bytes - 64);
+    return checksum(compact, bytes - 4);
+  }
+  return (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64));
+}
+/* A checkpoint walk hands out small immutable entries in batches. The
+ * walk and each returned entry own one reference. Releasing an entry
+ * requires no write to a sibling, including when pins survive adoption. */
+static ps_entry *decoded_entry_new(ps_entry_batch_builder *builder,
+                                   size_t count) {
+  ps_entry_batch *batch;
+  ps_entry_batch_slot *slot;
+  ps_entry *p;
+  if (builder && count <= 1) {
+    batch = builder->open;
+    if (!batch) {
+      size_t capacity = builder->remaining < CHECKPOINT_ENTRIES_PER_BATCH
+                            ? builder->remaining
+                            : CHECKPOINT_ENTRIES_PER_BATCH;
+      batch = lc_calloc_with_allocator(
+          NULL, 1, sizeof(*batch) + capacity * sizeof(*slot));
+      if (!batch)
+        return NULL;
+      batch->references = 1;
+      batch->capacity = capacity;
+      builder->open = batch;
+    }
+    slot = (ps_entry_batch_slot *)(batch + 1) + batch->used;
+    p = &slot->entry;
+    if (count)
+      p->extents = &slot->extent;
+    p->batch = batch;
+    ++batch->references;
+    if (++batch->used == batch->capacity) {
+      builder->open = NULL;
+      entry_batch_release(batch);
+    }
+  } else {
+    p = lc_calloc_with_allocator(NULL, 1,
+                                 sizeof(*p) + count * sizeof(*p->extents));
+    if (!p)
+      return NULL;
+    if (count)
+      p->extents = (ps_extent *)(p + 1);
+  }
+  p->embedded_extents = count != 0;
+  return p;
+}
+static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
+                        const unsigned char *wire, size_t bytes, ps_entry **out,
+                        int *event, lc_error *error) {
   size_t count, i, first;
   uint64_t sum = 0, offset, n;
   ps_entry *p;
   uint32_t type;
   *out = NULL;
   if (bytes < 64 || get32(wire) != EVENT_MAGIC || get32(wire + 4) != bytes ||
-      get32(wire + 60) !=
-          (uint32_t)crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64)))
+      get32(wire + 60) != entry_checksum(wire, bytes))
     return err(error, LC_ERR_PROTOCOL, "invalid container metadata checksum");
   type = get32(wire + 20);
   count = get32(wire + 16) == PS_STREAM || get32(wire + 16) == PS_CATALOG
@@ -1601,7 +1678,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
                      : first + count * 24)) ||
       (type != PS_PUT && type != PS_REMOVE && type != PS_SEAL))
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
-  p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  p = decoded_entry_new(builder, count);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate container entry");
   p->key.kind = get32(wire + 16);
@@ -1658,14 +1735,6 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
          (p->stream_capacity > PS_STREAM_PIECE_BYTES || !count ||
           p->bytes < 64 || p->bytes > 64 + 9 * p->stream_capacity)))
       goto invalid;
-  }
-  if (count) {
-    p->extents = lc_calloc_with_allocator(NULL, count, sizeof(*p->extents));
-    if (!p->extents) {
-      entry_free(p);
-      return err(error, LC_ERR_NOMEM,
-                 "cannot allocate container extent vector");
-    }
   }
   p->count = p->capacity = count;
   for (i = 0; i < count; ++i) {
@@ -3374,6 +3443,7 @@ typedef struct metadata_directory_entry {
 typedef struct metadata_recovery {
   ps_space *space;
   unsigned char *wire;
+  ps_entry_batch_builder *batch_entries;
   uint64_t cohort_origin;
   int certified_root;
   /* Directory order need not match the packing order of descriptor pages.
@@ -3591,7 +3661,8 @@ static int recover_directory_entry(metadata_recovery *recovery, ps_key key,
     return err(error, LC_ERR_PROTOCOL, "invalid checkpoint descriptor span");
   rc = metadata_read(recovery, ref, &wire, error);
   if (rc == LC_OK)
-    rc = decode_entry(s, wire, (size_t)ref.bytes, &p, &event, error);
+    rc = decode_entry(s, recovery->batch_entries, wire, (size_t)ref.bytes, &p,
+                      &event, error);
   if (rc == LC_OK && (event != PS_PUT || !same_key(p->key, key) ||
                       p->token != ref.incarnation ||
                       get64(wire + 8) > s->sequence || lookup(s, key)))
@@ -3615,9 +3686,12 @@ static int recover_directory_entry(metadata_recovery *recovery, ps_key key,
 static int recover_directory_batch(metadata_recovery *r, lc_error *error) {
   size_t i;
   int rc = metadata_read_ahead(r, error);
-  for (i = 0; rc == LC_OK && i < r->count; ++i)
+  for (i = 0; rc == LC_OK && i < r->count; ++i) {
+    if (r->batch_entries)
+      r->batch_entries->remaining = r->count - i;
     rc =
         recover_directory_entry(r, r->entries[i].key, r->entries[i].ref, error);
+  }
   r->count = 0;
   return rc;
 }
@@ -3660,7 +3734,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member boundary");
       break;
     }
-    rc = decode_entry(s, wire + cursor, member_bytes, &entries[i], &event,
+    rc = decode_entry(s, NULL, wire + cursor, member_bytes, &entries[i], &event,
                       error);
     if (rc == LC_OK && (event != PS_PUT || !immutable_key(entries[i]->key)))
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
@@ -3961,7 +4035,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   if (group)
     rc = decode_revision(s, wire, bytes, NULL, &entries, error);
   else {
-    rc = decode_entry(s, wire, bytes, &single, &event, error);
+    rc = decode_entry(s, NULL, wire, bytes, &single, &event, error);
     if (rc == LC_OK)
       entries = &single;
   }
@@ -4070,9 +4144,10 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
-                             lc_error *error) {
+                             int opening, lc_error *error) {
   ps_directory *directory = NULL;
   metadata_recovery *recovery = NULL;
+  ps_entry_batch_builder batch_entries = {0};
   int rc = initial_free(s, error);
   if (rc == LC_OK && s->directory.offset)
     rc = directory_open(s, s->directory, &directory, error);
@@ -4083,6 +4158,9 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   }
   if (rc == LC_OK && recovery) {
     recovery->space = s;
+    /* During live adoption most entries bind to resident incarnations.
+     * Those temporary entries must be independently releasable. */
+    recovery->batch_entries = opening ? &batch_entries : NULL;
     recovery->wire = wire;
     recovery->certified_root = certificate->root == s->generation;
     recovery->cohort_origin = certificate->origin;
@@ -4093,6 +4171,7 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   }
   ps_directory_close(directory);
   if (recovery) {
+    entry_batch_release(batch_entries.open);
     metadata_read_cache_close(recovery);
     lc_free_with_allocator(NULL, recovery);
   }
@@ -4295,7 +4374,7 @@ static int recover(ps_space *s, lc_error *error) {
     goto done;
   }
   values->packed.offset = 0;
-  rc = recover_directory(s, wire, &certificate, error);
+  rc = recover_directory(s, wire, &certificate, 1, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -4344,7 +4423,7 @@ static int recover(ps_space *s, lc_error *error) {
       ++s->sequence;
       continue;
     }
-    rc = decode_entry(s, wire + cursor, bytes, &p, &event, error);
+    rc = decode_entry(s, NULL, wire + cursor, bytes, &p, &event, error);
     if (rc == LC_ERR_NOMEM)
       goto done;
     if (rc != LC_OK) {
@@ -4890,7 +4969,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate projection control buffer");
     goto done;
   }
-  rc = recover_directory(v, v->journal_image, &certificate, error);
+  rc = recover_directory(v, v->journal_image, &certificate, 0, error);
   if (rc != LC_OK)
     goto done;
   v->token_limit = certificate.grant_limit;

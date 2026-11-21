@@ -133,7 +133,7 @@ if(LOCKDC_BUILD_TESTS)
       captures capture-faults capture-owned capture-race packed-replay-locality
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail capacity-checkpoint pressure-reclaim
-      shared-durable shared-preparation readiness-cohort reopen-cohort certified-prefix quarantine
+      shared-durable shared-preparation readiness-cohort reopen-cohort certified-prefix quarantine checkpoint-decode
       readiness-faults journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants

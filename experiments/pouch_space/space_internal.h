@@ -62,6 +62,7 @@ typedef struct ps_entry {
   uint64_t
       stream_storage; /* derived selected mappings, not pinned old values */
   int owned_mapped;
+  int embedded_extents;
   ps_mapped_range *ranges;
   unsigned char *range_bitmap;
   uint16_t *range_rank;
@@ -80,6 +81,7 @@ typedef struct ps_entry {
   struct ps_reserve *deletion_reserve;
   /* Temporary checkpoint projection binding; never serialized. */
   struct ps_entry *projection;
+  struct ps_entry_batch *batch; /* Recovery storage retained by this entry. */
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */

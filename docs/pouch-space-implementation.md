@@ -11664,3 +11664,87 @@ groups. Coverage includes the previously failing GNU multifile unit group,
 staged-publication barrier faults, process recovery, XA, shared queue/outbox
 transactions and fixed-capacity messaging. Logs are in
 `build/pouch-space-concurrent/lease-delete-renew/`.
+
+## Allocating and checking descriptors during physical recovery
+
+Earlier live-join traces attributed roughly 0.24 ms each to descriptor
+checksums and to entry allocation for about 1,060 descriptors. Those traces
+included instrumentation overhead.
+
+The decoder now verifies the existing CRC with one update for descriptors up
+to 128 bytes. Both byte spans outside the stored CRC fit in a 124-byte
+stack buffer. Larger descriptors retain the incremental CRC. Recovered
+entries hold their immutable extent vector in the same allocation as the
+entry. Initial physical opens place descriptors with zero or one extent
+in groups of up to 16 entries. A reader pins its entry independently
+of the others. The group releases its storage with its last entry.
+
+Live checkpoint adoption allocates decoded entries individually. When the
+new checkpoint binds to an existing incarnation, the temporary copy releases
+its storage immediately. A prototype that also grouped entries during live
+adoption verified all 60 matched workloads. In a separate three-way
+eight-writer comparison, limiting grouping to admission reduced median
+peak RSS from 33.8 to 30.9 MiB in NoSync and from 33.2 to 30.1 MiB in durable
+mode. The prior build measured 28.8 and 30.3 MiB in that comparison. Each
+build and durability policy had three trials.
+
+The copied-layout control measured the effect of the CRC change on the
+same images. Adding it to the allocation change reduced median live join
+from 1.32 to 1.19 ms in NoSync and from 1.42 to 1.25 ms in durable mode.
+Each build and layout used twelve preflushed copies. Each copy opened one
+cold owner followed by eight live joins.
+
+The deterministic fixture corrupts a short descriptor and a multi-extent
+descriptor independently while preserving the enclosing page's checksum.
+Either bad descriptor rejects admission. The fixture then injects failure
+at every allocation reported by a successful join. A fresh join pins old
+small and large values, reads them after a peer's checkpoint replaces
+their bindings, and verifies the new selection after cold reopen.
+
+The final admission-only build was measured against ten identical
+preflushed copies per build and durability policy. Each copy was opened by
+one cold owner and eight live joins. The table gives medians in milliseconds
+as prior / revised. Read counts and durability barriers matched between builds.
+Each cold owner crossed one barrier and each live join crossed zero.
+
+| Layout | Cold owner | Individual live join | Sum of eight live joins | Reads per live join |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed | 7.15 / 6.02 | 1.32 / 1.21 | 10.47 / 9.76 | 86 / 86 |
+| Durable indexed | 6.69 / 6.77 | 1.46 / 1.34 | 11.65 / 10.96 | 97 / 97 |
+
+All 30 final matched workflows verified. Each workload ran twice per
+build. The tables give medians in milliseconds in the order prior native
+(`dbb75cd6`), revised native and multifile. Native roots remained at
+10 MiB. Grouped reopen includes the cold owner and the live joins.
+
+| Workload | Work | Per-item p95 | Process CPU through maintenance | Close | Grouped reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 20 MiB | 1538.95 / 1392.09 / 2027.65 | 51.24 / 47.03 / 28.54 | 1031.37 / 1080.14 / 780.69 | 8.48 / 3.09 / 0.96 | 10.76 / 11.40 / 0.93 | 7.42 / 6.48 / 9.40 |
+| Warmed NoSync queue | 8.93 / 10.58 / 73.77 | 1.66 / 2.10 / 13.58 | 14.66 / 18.10 / 26.09 | 0.24 / 0.27 / 0.05 | 5.34 / 4.25 / 0.36 | 0.21 / 0.25 / 0.44 |
+| Durable outbox | 991.91 / 959.08 / 1264.37 | 183.46 / 178.02 / 224.49 | 117.38 / 119.51 / 171.39 | 0.54 / 0.55 / 0.41 | 38.67 / 32.92 / 62.84 | 59.01 / 55.88 / 135.26 |
+| NoSync indexed, 8 writers, 24 MiB | 2050.36 / 1757.64 / 2559.52 | 87.87 / 75.14 / 52.58 | 2207.96 / 1844.43 / 1023.96 | 6.67 / 5.70 / 1.59 | 17.13 / 18.50 / 1.37 | 9.71 / 10.15 / 14.24 |
+| Durable indexed, 8 writers, 24 MiB | 4275.20 / 4007.65 / 8326.87 | 127.47 / 114.14 / 198.31 | 2806.22 / 2934.98 / 1337.52 | 8.45 / 12.27 / 1.68 | 21.97 / 19.23 / 1.62 | 10.29 / 10.90 / 13.67 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 20 MiB | 322.60 / 289.53 / 436.66 | 78.29 / 78.14 / 270.92 | 35.35 / 25.67 / 305.93 | 1.24 / 1.04 / 1.71 |
+| NoSync indexed, 8 writers, 24 MiB | 441.30 / 371.26 / 799.23 | 189.69 / 157.68 / 437.75 | 104.46 / 77.68 / 594.48 | 2.05 / 2.16 / 3.30 |
+| Durable indexed, 8 writers, 24 MiB | 435.48 / 475.80 / 1252.01 | 100.44 / 126.60 / 1381.49 | 53.24 / 58.80 / 1744.42 | 2.14 / 2.40 / 3.02 |
+
+Eight-writer median peak RSS in these runs was 30.1 MiB in NoSync and
+29.9 MiB in durable mode. The prior native build measured 30.5 and
+30.3 MiB. Grouped reopen rose from 17.13 to 18.50 ms in the eight-writer
+NoSync workflow and fell from 21.97 to 19.23 ms in durable mode. Each
+run built its own layout and included maintenance. Grouped reopen and
+NoSync CPU and per-item p95 remain qualification work.
+
+The prototype passed 47 GNU Release, 21 Debug ASan/UBSan and 21 musl
+Release groups. The admission-only version passed 15 GNU Release,
+13 Debug ASan/UBSan and 13 musl Release groups. The final checks cover
+checkpoint adoption, journal and revision faults, reader pins, staged
+lease deletes and concurrent fixed-capacity messaging. GNU also
+verified codec conversion both within the initial capacity and with
+explicit 1 MiB growth. Formatting and diff checks passed.
+
+Raw runs, controls and test logs are in
+`build/pouch-space-concurrent/checkpoint-decode/`.
