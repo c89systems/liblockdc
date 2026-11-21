@@ -1808,7 +1808,12 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
       rc = ps_catalog_orphans_pending(root->space, &pending, &local);
     if (rc == LC_OK && pending && out)
       ++out->cleanup_pending_count;
-    if (rc == LC_OK)
+    /* On a shared root, discovery without collection work adds no checkpoint
+     * obligation. Capacity admission and journal rollover settle unrelated
+     * work. Collection maintenance and orphan retirement drain their work. */
+    if (rc == LC_OK &&
+        (scan_collections || reclaimed ||
+         !ps_coordination_shared(ps_space_coordination(root->space))))
       rc = ps_checkpoint(root->space, &local);
     if (rc != LC_OK) {
       first_rc = rc;

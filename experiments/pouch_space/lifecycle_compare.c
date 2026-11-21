@@ -702,6 +702,23 @@ static void report_capacity(lc_client *client, const char *label,
           (unsigned long long)stats.allocated_bytes,
           (unsigned long long)stats.retired_bytes);
 }
+static uint64_t native_work_stats(comparison *run, ps_stats *primary,
+                                  lc_error *e) {
+  uint64_t checkpoints = 0;
+  for (size_t i = 0; i <= run->writers; ++i) {
+    lc_client *client = i ? run->workers[i - 1].producer_client : run->client;
+    lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
+    ps_stats snapshot;
+    check(ps_status(ps_root_space(ps_pouch_state_root(pouch)), &snapshot, e),
+          e);
+    require(snapshot.capacity == PS_DEFAULT_CAPACITY,
+            "native reclamation participants retained fixed capacity");
+    if (!i)
+      *primary = snapshot;
+    checkpoints += snapshot.checkpoints;
+  }
+  return checkpoints;
+}
 int main(int argc, char **argv) {
   comparison run = {0};
   lc_error e;
@@ -713,7 +730,8 @@ int main(int argc, char **argv) {
               verification = {0};
   open_phases reopened = {0};
   ps_stats native_work = {0};
-  uint64_t measured_syncs, files;
+  uint64_t measured_syncs, files, checkpoints_at_start = 0,
+                                  work_checkpoints = 0;
   double measured_sync_seconds;
   struct rusage usage;
   require(argc >= 7,
@@ -813,6 +831,8 @@ int main(int argc, char **argv) {
     check(lc_outbox_dispatcher_get_or_start(run.workers[i].outbox,
                                             &run.workers[i].dispatcher, &e),
           &e);
+  if (run.reclaim && run.container)
+    checkpoints_at_start = native_work_stats(&run, &native_work, &e);
   for (size_t i = 0U; i < run.writers; ++i)
     require(!pthread_create(&threads[i], NULL, run_worker, &run.workers[i]),
             "start writer");
@@ -845,12 +865,10 @@ int main(int argc, char **argv) {
   index_phase_begin(&maintenance);
   lc_pouch *pouch = ((lc_client_handle *)run.client)->pouch;
   if (run.reclaim && run.container) {
-    check(
-        ps_status(ps_root_space(ps_pouch_state_root(pouch)), &native_work, &e),
-        &e);
-    require(native_work.capacity == PS_DEFAULT_CAPACITY &&
-                native_work.checkpoints > 0,
+    uint64_t completed = native_work_stats(&run, &native_work, &e);
+    require(completed > checkpoints_at_start,
             "native root reclaimed within 10 MiB during indexed work");
+    work_checkpoints = completed - checkpoints_at_start;
   }
   if (run.xa) {
     size_t retired = 0U;
@@ -985,7 +1003,7 @@ int main(int argc, char **argv) {
       phase_sync_seconds[1] * 1e3, phase_sync_seconds[2] * 1e3,
       reopen_phase_seconds[0] * 1e3, reopen_phase_seconds[1] * 1e3,
       run.index ? run.writers * 6U * run.rounds : 0U, run.reclaim,
-      (unsigned long long)native_work.checkpoints,
+      (unsigned long long)work_checkpoints,
       (unsigned long long)native_work.allocated_bytes);
   lc_error_cleanup(&e);
   sync_phase_key_initialized = 0;

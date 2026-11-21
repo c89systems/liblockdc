@@ -12617,3 +12617,80 @@ trial reduced kernel query cost and increased elapsed work time and mutation
 tail latency under shared pressure. The code is retained
 locally in stash commit `a73fbe54`. Raw runs and the frozen control are
 under `build/pouch-space-concurrent/ownership-batching/`.
+
+## Checkpoint scheduling after background discovery
+
+Two native trace runs per durability mode sampled allocator wait and hold
+time and attributed each checkpoint and sync to its caller. The detailed
+rotation attributed 174 of 207 NoSync checkpoints and 319 of 335 durable
+checkpoints to collection maintenance. The first of the three ordered
+checkpoint barriers accounted for 72–75% of checkpoint sync time. The
+detailed traces also found 1,453 shared commit or preparation barriers in
+NoSync and 4,392 in durable mode. Those barriers account for 14.48 and
+27.58 seconds of cumulative thread time respectively.
+
+Background discovery on a shared root skips the physical checkpoint
+when the pass found neither collection work nor any orphans to retire.
+Journal rollover and capacity admission still select root-wide checkpoints
+as needed. Actual collection work, orphan retirements, explicit maintenance,
+and exclusive roots keep their checkpoint paths. This lets durable
+retirement and capacity admission operate at the root level while an
+unrelated namespace discovery pass stays cheap.
+
+The deterministic fixture leaves a replacement journaled across background
+discovery in two namespaces while a captured reader holds the old value.
+Forced maintenance selects the accumulated work once. The prior reader
+still reads its original value, and cold reopen verifies the replacement
+and both namespaces. It runs in both durability modes. The lifecycle
+comparison now sums the checkpoint delta across all owners and verifies
+the capacity of each. A writer can select a checkpoint even when the
+coordinating handle's local count stays at zero.
+
+All ten matched runs verified through reclaim and reopen. The frozen
+control uses the production code at `6529e2ac` and the same revised
+comparison driver. The rotation ran two trials per native build and
+durability mode and one multifile trial per mode. Each run streamed
+192 MiB across eight writers, 24 rows, and 128 rounds of 64 KiB values.
+The single-file runs held a fixed 10 MiB. Figures are medians per group.
+
+Work, slowest writer mutation work, and process CPU through maintenance
+are in seconds. Mutation p95 is in milliseconds. The last window covers
+rounds 113–128.
+
+| Backend | Durability | Work | Mutation work | CPU | Mutation p95 | Last-window p95 | Work checkpoints |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 17.61 | 13.27 | 22.99 | 110.82 | 129.02 | 116.0 |
+| Native | Durable | 30.19 | 26.74 | 28.06 | 134.31 | 182.58 | 124.5 |
+| Prior native | NoSync | 19.89 | 14.63 | 24.62 | 120.89 | 165.40 | 188.0 |
+| Prior native | Durable | 43.63 | 38.34 | 41.27 | 177.76 | 214.93 | 359.0 |
+| Multifile | NoSync | 23.74 | 9.64 | 10.88 | 58.63 | 49.84 | — |
+| Multifile | Durable | 72.15 | 40.93 | 13.22 | 212.66 | 180.26 | — |
+
+Index phase times are in seconds and report the slowest worker for each
+phase. Close, first-owner reopen, eight live joins, and post-open
+verification are in milliseconds.
+
+| Backend | Durability | Index flush | First query pass | Repeat query pass | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 3.71 | 0.74 | 0.34 | 33.41 | 37.71 | 49.08 | 24.53 |
+| Native | Durable | 3.25 | 0.38 | 0.09 | 27.63 | 32.50 | 42.71 | 22.42 |
+| Prior native | NoSync | 3.77 | 1.54 | 0.54 | 31.54 | 38.29 | 48.51 | 26.74 |
+| Prior native | Durable | 5.30 | 1.07 | 0.30 | 30.90 | 34.60 | 41.48 | 22.42 |
+| Multifile | NoSync | 6.19 | 3.91 | 5.18 | 5.00 | 0.41 | 2.09 | 54.23 |
+| Multifile | Durable | 8.62 | 11.66 | 14.31 | 5.72 | 0.42 | 1.95 | 47.87 |
+
+The final change passed 27 distinct GNU Release checks and 14 checks each
+on Debug ASan/UBSan and musl Release. The two exclusive-root collection
+background discovery checks failed at the cold collection snapshot
+assertion on both the unchanged baseline and the candidate. Checkpoint
+and maintenance I/O fault matrices passed the broader trial. Raw
+measurements and qualification logs are under
+`build/pouch-space-concurrent/checkpoint-hold/`.
+
+Native still used about twice the CPU of multifile. It also had higher
+NoSync mutation tail latency and took longer to reopen and close.
+The reduced checkpoint count leaves the cost of each remaining checkpoint
+and of shared commit barriers as separate targets. Moving checkpoint
+preparation out of allocator authority requires preserving the accepted
+journal suffix beyond the checkpoint cut. The current root starts replay
+at a fixed physical journal offset.

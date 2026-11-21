@@ -2,6 +2,7 @@
 #include "../../tests/support/lc_test_tmp.h"
 #include "budget.h"
 #include "checkpoint_record.h"
+#include "collections.h"
 #include "coordination.h"
 #include "frame.h"
 #include "lc_api_internal.h"
@@ -4069,6 +4070,84 @@ static void maintenance_metadata(const char *path) {
   REQUIRE(!live);
   lc_error_cleanup(&e);
 }
+static void maintenance_checkpoint_batch(const char *path, int sync) {
+  const char *names[] = {"first", "second"};
+  ps_pouch_state_options o = shared_options(0, sync);
+  ps_key key = {UINT64_MAX - 1, 1, PS_STATE};
+  lc_pouch *writer = NULL, *worker = NULL;
+  ps_space *space, *background = NULL;
+  ps_reader *old = NULL, *latest = NULL;
+  ps_stats before, after;
+  unsigned char body;
+  size_t got;
+  lc_error e = {0};
+  lc_pouch_maintenance_options maintain = {0};
+
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+  space = ps_root_space(ps_pouch_state_root(writer));
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    lc_pouch_state_write_result written = {0};
+    input value = source(65, 7);
+    ok(put(writer, names[i], "key", &value, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+  }
+  for (unsigned char version = 1; version <= 2; ++version) {
+    ps_writer *value = NULL;
+    ok(ps_begin(space, NULL, key, &value, &e), &e);
+    ok(ps_write(value, &version, sizeof(version), &e), &e);
+    ok(ps_publish(value, NULL, &e), &e);
+    ps_writer_close(value);
+    if (version == 1) {
+      ok(ps_checkpoint(space, &e), &e);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &worker, &e), &e);
+      background = ps_root_space(ps_pouch_state_root(worker));
+      ok(ps_read_open(background, key, NULL, &old, &e), &e);
+    }
+  }
+  ok(ps_flush(space, &e), &e);
+  ok(ps_refresh(background, &e), &e);
+  ok(ps_status(background, &before, &e), &e);
+  REQUIRE(before.journal_bytes && before.retired_bytes);
+
+  maintain.background = 1;
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    maintain.ns = names[i];
+    ok(ps_collection_maintenance_run(ps_pouch_state_root(worker), worker,
+                                     &maintain, NULL, &e),
+       &e);
+  }
+  ok(ps_status(background, &after, &e), &e);
+  REQUIRE(after.checkpoints == before.checkpoints &&
+          after.journal_bytes == before.journal_bytes);
+
+  /* Forced collection maintenance selects the accumulated physical work.
+   * The previously captured incarnation remains readable across selection. */
+  maintain.force = 1;
+  ok(ps_collection_maintenance_run(ps_pouch_state_root(worker), worker,
+                                   &maintain, NULL, &e),
+     &e);
+  ok(ps_status(background, &after, &e), &e);
+  REQUIRE(after.checkpoints == before.checkpoints + 1 && !after.journal_bytes);
+  ok(ps_read(old, &body, sizeof(body), &got, &e), &e);
+  REQUIRE(got == sizeof(body) && body == 1);
+  ps_reader_close(old);
+  lc_pouch_close(worker);
+  lc_pouch_close(writer);
+  REQUIRE(!live);
+
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &writer, &e), &e);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    read_value(writer, names[i], "key", 65, 7, 1, &e);
+  space = ps_root_space(ps_pouch_state_root(writer));
+  ok(ps_read_open(space, key, NULL, &latest, &e), &e);
+  ok(ps_read(latest, &body, sizeof(body), &got, &e), &e);
+  REQUIRE(got == sizeof(body) && body == 2);
+  ps_reader_close(latest);
+  lc_pouch_close(writer);
+  REQUIRE(!live && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void maintenance_fill(lc_pouch *p, lc_error *e) {
   ps_space *s = ps_root_space(ps_pouch_state_root(p));
   ps_key key = {UINT64_MAX - 1, 1, PS_STATE};
@@ -6972,7 +7051,10 @@ static void *worker(void *context) {
     maintenance_pressure_rotation(r->path, 1);
   } else if (!strcmp(r->mode, "maintenance-capacity-schedule"))
     maintenance_capacity_schedule();
-  else if (!strcmp(r->mode, "maintenance-tail"))
+  else if (!strcmp(r->mode, "maintenance-checkpoint-batch")) {
+    maintenance_checkpoint_batch(r->path, 0);
+    maintenance_checkpoint_batch(r->path, 1);
+  } else if (!strcmp(r->mode, "maintenance-tail"))
     maintenance_partial_tail(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-abandoned"))
     maintenance_abandoned(r->path, r->directory);
