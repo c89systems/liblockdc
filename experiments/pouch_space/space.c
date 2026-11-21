@@ -1219,7 +1219,7 @@ static int pin_conflict(ps_space *s, uint64_t offset, uint64_t bytes,
   *present = rc != LC_OK || first != last;
   return rc;
 }
-static int entry_foreign_pinned(ps_space *s, ps_entry *p) {
+static int entry_foreign_pinned(ps_space *s, const ps_entry *p) {
   size_t i;
   int present;
   for (i = 0; i < p->count; ++i)
@@ -2812,47 +2812,54 @@ static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
 static int checkpoint_locked(ps_space *s, lc_error *error) {
   return checkpoint_select(s, 0, error);
 }
-/* A checkpoint can return retired runs to ordinary capacity. Combine the
- * cells from all eligible retirements before crediting a complete page.
- * The forecast touches only retired ownership and uses no temporary
- * allocation. A full-page witness check also catches foreign readers of
- * cells absent from this projection. */
+static uint64_t retirement_shortfall(ps_space *s, const ps_entry *p,
+                                     uint64_t missing, int foreign,
+                                     ps_payload_page **touched) {
+  size_t i;
+  if (!p->count || p->pins || (foreign && entry_foreign_pinned(s, p)))
+    return missing;
+  for (i = 0; i < p->count && missing; ++i) {
+    const ps_extent *extent = &p->extents[i];
+    uint64_t bytes = aligned(extent->bytes);
+    if (extent->flags & EXTENT_PACKED) {
+      int pinned = 0;
+      ps_payload_page *page = payload_find(s, extent->offset);
+      if (!page || page->external_pins || page->reclaim_cells == page->occupied)
+        continue;
+      if (!page->reclaim_cells) {
+        page->reclaim_next = *touched;
+        *touched = page;
+      }
+      page->reclaim_cells |= extent_mask(extent);
+      if (page->reclaim_cells != page->occupied ||
+          (foreign && (pin_conflict(s, page->run.offset, PS_PAGE, &pinned,
+                                    NULL) != LC_OK ||
+                       pinned)))
+        continue;
+    }
+    missing = bytes < missing ? missing - bytes : 0;
+  }
+  return missing;
+}
+/* Whole-stream retirement marks its runs deleted in place. They keep their
+ * last checkpoint references and payload ownership until root selection.
+ * Include those dirty deletions and replaced entries in one forecast. Packed
+ * contributors share a cell mask, and the full-page witness check covers
+ * foreign readers of cells absent from this projection. */
 static int retirement_can_fund(ps_space *s, uint64_t missing) {
   ps_entry *p;
   ps_payload_page *page, *touched = NULL;
-  size_t i;
   int foreign = 0;
-  if (missing > s->capacity - PS_DATA || !s->retired)
+  if (missing > s->capacity - PS_DATA || (!s->dirty && !s->retired))
     return 0;
   if (s->range_pins &&
       pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &foreign, NULL) != LC_OK)
     return 0;
-  for (p = s->retired; p && missing; p = p->retired_next) {
-    if (p->pins || (foreign && entry_foreign_pinned(s, p)))
-      continue;
-    for (i = 0; i < p->count && missing; ++i) {
-      const ps_extent *extent = &p->extents[i];
-      uint64_t bytes = aligned(extent->bytes);
-      if (extent->flags & EXTENT_PACKED) {
-        int pinned = 0;
-        page = payload_find(s, extent->offset);
-        if (!page || page->external_pins ||
-            page->reclaim_cells == page->occupied)
-          continue;
-        if (!page->reclaim_cells) {
-          page->reclaim_next = touched;
-          touched = page;
-        }
-        page->reclaim_cells |= extent_mask(extent);
-        if (page->reclaim_cells != page->occupied ||
-            (foreign && (pin_conflict(s, page->run.offset, PS_PAGE, &pinned,
-                                      NULL) != LC_OK ||
-                         pinned)))
-          continue;
-      }
-      missing = bytes < missing ? missing - bytes : 0;
-    }
-  }
+  for (p = s->dirty; p && missing; p = p->dirty_next)
+    if (p->state == 1 && p->deleted)
+      missing = retirement_shortfall(s, p, missing, foreign, &touched);
+  for (p = s->retired; p && missing; p = p->retired_next)
+    missing = retirement_shortfall(s, p, missing, foreign, &touched);
   while (touched) {
     page = touched;
     touched = page->reclaim_next;

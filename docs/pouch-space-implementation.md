@@ -9922,3 +9922,89 @@ The grouped indexed reopen gap remains substantial. Fixed-capacity
 admission and indexed mutation tails also remain qualification work.
 Raw traces, matched attempts and test logs are under `adopt-` in
 `build/pouch-space-concurrent/`.
+
+## Using published stream retirement at admission
+
+Four-writer traces split owned stream allocations by the catalog's
+selected routing. At a 20 MiB workload refusal, bound sealed sources
+accounted for 6,422,528 bytes and the active sources accounted for
+2,334,720 bytes. The workload uses a fixed 10 MiB container. A separate
+maintenance trace recorded a whole-source retirement of about 1 MiB
+while foreground admissions were running short by one or two pages.
+Sixty-seven of 88 successful maintenance passes in that trace retired
+a whole source.
+
+Whole-stream retirement marks its grants deleted in place under the
+selected journal prefix. Those grants remain in the dirty list until a
+checkpoint retires the old root. The admission forecast previously
+looked only at the retired list, where replaced immutable values already
+appear. It now checks both disjoint sets and combines their packed-cell
+masks when appropriate. Local pins and foreign witnesses still exclude
+the affected bytes from the forecast. The allocator attempts one
+checkpoint when the eligible retirements can meet the shortfall from
+existing protected workspace. It rechecks capacity before spending it.
+
+The fixed-capacity fixture retires a sealed stream with a 64 KiB grant.
+It exhausts ordinary headroom and holds the captured run through
+retirement. The foreground and background checks refuse to use the
+grant while pinned, and the captured bytes remain readable. Once the
+pin is released, one checkpoint funds either a new streamed value or
+background headroom. Both paths failed at this boundary on the prior
+build. The tests cover a local NoSync owner, a durable peer importing
+the retirement, and cold reopen. Fault injection stops each of the three
+checkpoint barriers, verifies surviving budget accounting, and reopens
+the acknowledged state.
+
+Targeted verification passed 10 Debug ASan/UBSan, 25 GNU Release and 18
+musl Release groups. These include reader pins and owner exit, journal
+adoption, namespace handoff, maintenance, fixed-capacity concurrent
+leases, queue transactions and outbox recovery.
+
+A dedicated heavy-profile trace found 1,064,960 bytes in already
+published, uncheckpointed run deletions during a prior-build shortfall.
+Three forecasts on the candidate used published stream removals to
+start a checkpoint for shortfalls of 223,744, 317,440 and 164,352 bytes.
+The prior and current traces each completed one of three attempts.
+The late refusals on the candidate showed zero already-published run
+deletions. One such sample held 7,491,584 bytes in sealed, still-bound
+sources and 1,437,696 bytes in active sources. The remaining pressure
+can arrive before maintenance selects enough source retirements.
+
+The uninstrumented GNU comparison verified 36 of 42 workflows. All
+six failures were capacity refusals. The table reports completions
+that verified after reopen. Both native builds used fixed 10 MiB
+containers.
+
+| Workload | Prior native (`6b6ba403`) | Stream retirement forecast | Multifile |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 3/4 | 3/4 | 4/4 |
+| Four writers, NoSync indexed, 20 MiB | 3/4 | 1/4 | 4/4 |
+| Two writers, durable indexed, 15 MiB | 2/2 | 2/2 | 2/2 |
+| Two writers, warmed NoSync queue | 2/2 | 2/2 | 2/2 |
+| Two writers, durable outbox | 2/2 | 2/2 | 2/2 |
+
+The next tables report successful-run medians in milliseconds, in the
+same build order. The candidate's heavy profile has one sample.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1192.45 / 1273.21 / 1235.58 | 59.27 / 65.39 / 29.39 | 9.38 / 2.61 / 0.92 | 8.48 / 8.63 / 0.86 | 4.74 / 4.72 / 6.76 |
+| NoSync indexed, 20 MiB | 3473.95 / 2586.91 / 2107.96 | 119.41 / 90.90 / 33.00 | 3.60 / 45.29 / 1.10 | 12.48 / 13.16 / 0.77 | 7.13 / 7.58 / 9.28 |
+| Durable indexed, 15 MiB | 6306.55 / 5530.42 / 4575.34 | 83.53 / 69.68 / 53.41 | 21.64 / 4.16 / 1.00 | 10.61 / 8.38 / 0.60 | 6.87 / 7.08 / 6.82 |
+| Warmed NoSync queue | 8.71 / 10.84 / 81.55 | 1.59 / 2.11 / 20.68 | 0.23 / 0.24 / 0.07 | 2.28 / 2.23 / 0.34 | 0.27 / 0.21 / 0.43 |
+| Durable outbox | 869.25 / 877.14 / 1208.88 | 177.41 / 159.83 / 227.60 | 0.54 / 0.47 / 0.24 | 38.36 / 32.33 / 50.58 | 64.44 / 69.28 / 115.12 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 237.26 / 264.31 / 308.21 | 78.37 / 110.21 / 198.47 | 17.27 / 50.18 / 209.08 | 0.64 / 0.66 / 1.27 |
+| NoSync indexed, 20 MiB | 346.87 / 365.33 / 484.26 | 170.45 / 163.62 / 297.96 | 61.44 / 12.11 / 347.57 | 1.20 / 1.21 / 1.73 |
+| Durable indexed, 15 MiB | 137.84 / 129.53 / 151.86 | 39.07 / 3.77 / 212.40 | 6.66 / 29.51 / 307.11 | 0.57 / 0.51 / 0.72 |
+
+The matched rotation leaves heavy churn, indexed mutation tails and
+grouped reopen open. Four additional alternating heavy-profile pairs
+verified one prior run and two candidate runs. Across both uninstrumented
+rotations, the heavy profile verified four of eight prior runs and
+three of eight candidate runs. The other attempts refused capacity.
+Raw logs are under `retained-allocation-`,
+`retained-maintenance-` and `stream-reclaim-` in
+`build/pouch-space-concurrent/`.

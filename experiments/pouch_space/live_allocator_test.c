@@ -5059,6 +5059,99 @@ static void packed_capacity_reclaim(int durable, int background) {
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void stream_capacity_reclaim(int durable, int background,
+                                    size_t fail_sync) {
+  lc_error e = {0};
+  readiness_fault fault = {6, EIO, 0, 0, fail_sync};
+  ps_io io = {&fault,     read_io, durable_write, readiness_sync_fault,
+              reserve_io, NULL};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *peer = NULL, *requester;
+  ps_owned_head *head = NULL;
+  ps_owned_run *pin = NULL;
+  ps_owned_status selected;
+  ps_budget *padding = NULL, *budget = NULL;
+  ps_writer *value = NULL;
+  ps_budget_plan plan = {PS_CHUNK, 128, 1, 0}, fill = {0};
+  unsigned char body[PS_CHUNK], captured = 0;
+  uint64_t available, checkpoints;
+  int found, needed;
+  memset(body, 0x51, sizeof(body));
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_owned_open(writer, NULL, tail_stream(), 1, NULL, &head, &selected, &e),
+     &e);
+  ok(ps_owned_grant(head, NULL, 0, 4 * PS_CHUNK, &pin, &found, &e), &e);
+  REQUIRE(found && ps_owned_run_capacity(pin) == 4 * PS_CHUNK - PS_RUN_HEADER);
+  ok(ps_owned_write(pin, 0, body, 1, &e), &e);
+  ok(ps_owned_commit(head, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ok(ps_owned_seal(head, &e), &e);
+  capture_put(writer, 1, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  if (fail_sync)
+    options.io = &io;
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  options.io = NULL;
+  requester = durable ? peer : writer;
+  ok(ps_maintenance_pressure(requester, 1, &needed, &available, &e), &e);
+  REQUIRE(available > PS_MIB && available % PS_PAGE == 0);
+  fill.payload_bytes = available;
+  ok(ps_budget_open(requester, &fill, &padding, &e), &e);
+  checkpoints = status(requester).checkpoints;
+  ok(ps_owned_retire(head, &e), &e);
+  ps_owned_close(head);
+  head = NULL;
+  if (background) {
+    ok(ps_maintenance_pressure(requester, 0, &needed, &available, &e), &e);
+    REQUIRE(needed && available < PS_CHUNK);
+  } else {
+    REQUIRE(ps_budget_open(requester, &plan, &budget, &e) == LC_ERR_INVALID &&
+            !budget);
+    lc_error_cleanup(&e);
+  }
+  REQUIRE(status(requester).checkpoints == checkpoints);
+  ok(ps_owned_read(pin, 0, &captured, 1, &e), &e);
+  REQUIRE(captured == body[0]);
+  ps_owned_run_close(pin);
+  /* The removed stream's runs still belong to the retained root. The first
+   * admission that can use them must select the next checkpoint. */
+  if (fail_sync) {
+    fault.armed = 1;
+    REQUIRE(ps_maintenance_pressure(requester, 0, &needed, &available, &e) ==
+                LC_ERR_TRANSPORT &&
+            fault.calls == fail_sync);
+    lc_error_cleanup(&e);
+    REQUIRE(status(requester).reserved_payload_bytes == fill.payload_bytes);
+  } else if (background) {
+    ok(ps_maintenance_pressure(requester, 0, &needed, &available, &e), &e);
+    REQUIRE(needed && available >= PS_CHUNK);
+    ok(ps_maintenance_pressure(requester, 0, &needed, &available, &e), &e);
+    REQUIRE(needed && available >= PS_CHUNK);
+  } else {
+    ok(ps_budget_open(requester, &plan, &budget, &e), &e);
+    ok(ps_begin(requester, budget, key(2), &value, &e), &e);
+    ok(ps_write(value, body, sizeof(body), &e), &e);
+    ok(ps_publish(value, NULL, &e), &e);
+    ps_writer_close(value);
+    ok(ps_budget_close(budget, &e), &e);
+    ok(ps_flush(requester, &e), &e);
+  }
+  if (!fail_sync)
+    REQUIRE(status(requester).checkpoints == checkpoints + 1);
+  (void)ps_budget_close(padding, NULL);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  REQUIRE(status(writer).capacity == PS_DEFAULT_CAPACITY);
+  REQUIRE(ps_owned_open(writer, NULL, tail_stream(), 0, NULL, &head, &selected,
+                        &e) == LC_ERR_INVALID &&
+          !head);
+  lc_error_cleanup(&e);
+  expect_value(writer, key(1), 65, 1);
+  if (!background)
+    expect_value(writer, key(2), PS_CHUNK, body[0]);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void piece_barrier_handoff(int durable, int discard) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
   ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
@@ -5420,6 +5513,7 @@ int main(int argc, char **argv) {
       capacity_checkpoint(durable, 0, 1, 0);
       capacity_checkpoint(durable, 1, 0, 0);
       packed_capacity_reclaim(durable, 0);
+      stream_capacity_reclaim(durable, 0, 0);
     }
     for (size_t sync = 1; sync <= 3; ++sync)
       capacity_checkpoint(1, 0, 0, sync);
@@ -5428,8 +5522,12 @@ int main(int argc, char **argv) {
     pressure_reclaim(1, 0);
     packed_capacity_reclaim(0, 1);
     packed_capacity_reclaim(1, 1);
-    for (size_t sync = 1; sync <= 3; ++sync)
+    stream_capacity_reclaim(0, 1, 0);
+    stream_capacity_reclaim(1, 1, 0);
+    for (size_t sync = 1; sync <= 3; ++sync) {
       pressure_reclaim(1, sync);
+      stream_capacity_reclaim(1, 1, sync);
+    }
   } else if (!strcmp(argv[2], "projection-tail"))
     projection_tail();
   else if (!strcmp(argv[2], "shared-durable"))
