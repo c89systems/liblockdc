@@ -12849,3 +12849,74 @@ Verification passed 46 GNU Release groups and 16 each on Debug
 ASan/UBSan and musl Release. The full-turn addition passed in all three
 configurations. Raw trials and logs are under
 `build/pouch-space-concurrent/rolling-journal/`.
+
+## Checkpoint cutoff with concurrent publication
+
+The trial froze a directory at the accepted sequence and released shared
+allocator authority for the first checkpoint barrier. The draft kept private
+witnesses on its new pages. After reacquiring authority, the owner checked
+that the selected generation survived, sampled the accepted sequence again,
+and published the frozen cut. The successor journal started at the first
+uncaptured byte. Its remaining frames were reachable from either selector
+until the predecessor retired. A competing checkpoint could supersede the
+draft while the barrier ran.
+
+The initial trial held unused metadata workspace across the barrier. The
+eight-writer smoke runs exhausted ordinary admission at 10 MiB in both
+durability modes. The measured version returned unused workspace before
+releasing authority. It took the split path only with ordinary headroom of
+at least twice the packed-image bound and at least one stream chunk. The
+eligible callers were explicit checkpoints and background capacity reclaim.
+
+The deterministic fixture paused the first barrier, acquired allocator
+authority from another process, and completed two durable replacements.
+It checked adoption by a resident beyond the new directory cut while that
+resident held the superseded value. It also exercised a live join, first
+owner recovery, a competing checkpoint, background capacity reclaim,
+an injected first-barrier failure, and process death at four checkpoint
+boundaries. The candidate passed 47 GNU Release groups and 17 each on
+Debug ASan/UBSan and musl Release.
+
+Eight uninstrumented matched trials streamed 192 MiB with eight writers
+through reclaim and reopen at a fixed 10 MiB. Each build ran twice per
+durability mode. The frozen rolling-journal control was `c4cf0064`.
+Elapsed work and process CPU through maintenance are in seconds. Mutation
+p95 is in milliseconds. The late window covers rounds 113–128. Figures
+are medians.
+
+| Build | Durability | Work | CPU | Mutation p95 | Late-window p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Rolling journal | NoSync | 17.85 | 22.96 | 113.05 | 128.29 |
+| Split first barrier | NoSync | 18.82 | 24.31 | 118.14 | 150.34 |
+| Rolling journal | Durable | 33.27 | 31.42 | 141.19 | 172.63 |
+| Split first barrier | Durable | 32.12 | 29.93 | 136.17 | 191.69 |
+
+Index phases report the slowest worker in seconds. Close, first-owner
+reopen, eight live joins and post-open verification are in milliseconds.
+
+| Build | Durability | Index flush | First query | Repeat query | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Rolling journal | NoSync | 3.50 | 0.74 | 0.27 | 36.09 | 39.72 | 54.45 | 26.72 |
+| Split first barrier | NoSync | 3.74 | 0.86 | 0.30 | 30.49 | 35.88 | 51.27 | 24.78 |
+| Rolling journal | Durable | 3.97 | 0.49 | 0.15 | 28.51 | 37.22 | 47.68 | 23.68 |
+| Split first barrier | Durable | 3.75 | 0.55 | 0.14 | 33.00 | 36.70 | 47.94 | 28.22 |
+
+A separate NoSync trace recorded 46 of 123 first barriers outside the
+allocator, accounting for 440 ms. The preceding rolling-journal trace
+spent 1,462 ms on first barriers under authority and 419 ms on selection
+and retirement barriers. The split trace spent 838 ms under authority on
+first barriers and 731 ms on the two later barriers. The traces establish
+where the I/O ran. The matched runs measure the workload effect.
+
+The branch retains the rolling-journal runtime. Durable elapsed work fell
+3.5% in the trial, and late-window p95 rose 17% in NoSync and 11% in durable
+mode. The tested source is in stash `a20bac1e`. Raw trials, the barrier
+trace and qualification logs are under
+`build/pouch-space-concurrent/checkpoint-cut/`.
+
+The next checkpoint design should measure selection and retirement
+separately. A durably selected successor could serve peer publications
+while the predecessor's pages and covered journal bytes remain protected.
+Reclamation would need a second proof, with explicit bounds on the
+quarantined interval at 10 MiB. That design would target the later barrier
+time that remained under allocator authority in this trial.
