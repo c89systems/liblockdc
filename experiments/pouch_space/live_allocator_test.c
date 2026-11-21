@@ -1865,8 +1865,8 @@ static double projection_milliseconds(void) {
   return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
 typedef struct descriptor_probe {
-  uint64_t pages[144];
-  size_t reads[144], count;
+  uint64_t pages[256];
+  size_t reads[256], count;
   size_t calls, superblocks;
   uint64_t following;
 } descriptor_probe;
@@ -1901,7 +1901,7 @@ static void directory_reopen_locality(enum directory_layout layout) {
   ps_options options = {.io = &io};
   ps_space *writer = NULL, *observer = NULL;
   uint64_t count = layout == DIRECTORY_ORDERED       ? 4200
-                   : layout == DIRECTORY_INTERLEAVED ? 3150
+                   : layout == DIRECTORY_INTERLEAVED ? 5600
                                                      : 96;
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
   /* Interleave disjoint key ranges on the same descriptor pages. The
@@ -1912,8 +1912,8 @@ static void directory_reopen_locality(enum directory_layout layout) {
   }
   if (layout == DIRECTORY_INTERLEAVED)
     ok(ps_open(path, 0, &options, &observer, &e), &e);
-  /* The wide interleaving revisits pages across batches. The ordered
-   * rewrite spans more than one cacheful of checked descriptor pages. */
+  /* Both large layouts exceed the cache. Interleaved keys reference the
+   * same physical pages from two distant parts of the logical directory. */
   ok(layout == DIRECTORY_ORDERED ? ps_metadata_repack(writer, &e)
                                  : ps_checkpoint(writer, &e),
      &e);
@@ -1922,10 +1922,8 @@ static void directory_reopen_locality(enum directory_layout layout) {
       REQUIRE(probe.count < sizeof(probe.pages) / sizeof(probe.pages[0]));
       probe.pages[probe.count++] = page->run.offset;
     }
-  if (layout == DIRECTORY_ORDERED)
+  if (layout != DIRECTORY_SMALL)
     REQUIRE(probe.count > 128U);
-  else if (layout == DIRECTORY_INTERLEAVED)
-    REQUIRE(probe.count > 64U && probe.count <= 128U);
   else
     REQUIRE(probe.count >= 3U);
   for (int admission = observer ? DIRECTORY_ADOPT : DIRECTORY_JOIN;
@@ -5273,25 +5271,40 @@ static void catalog_workspace_with_peer_writer(void) {
   ps_catalog_info info;
   ps_writer *body;
   unsigned char *value = malloc(PS_CATALOG_MARKER_MAX);
-  uint64_t offset, first, last, available;
+  uint64_t offset, first, last;
+  int overflow = 0;
   REQUIRE(value);
   memset(value, 19, PS_CATALOG_MARKER_MAX);
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
   ok(ps_open(path, 0, NULL, &catalog, &e), &e);
   REQUIRE(catalog->free);
   offset = catalog->free->offset;
-  available = catalog->metadata_free_bytes;
   body = replay_value(writer, key(21), 21, PS_CHUNK, &e);
   ok(ps_coordination_conflict(catalog->coordination, offset, PS_PAGE, &first,
                               &last, &e),
      &e);
   REQUIRE(first == offset && last == offset + PS_PAGE);
-  /* The peer's writer holds a private range absent from the journal. Growing
-   * the catalog's protected workspace must exclude it before choosing pages. */
+  /* Drive the checkpoint beyond the fixed metadata area while the peer's
+   * writer owns a payload range absent from the journal. */
+  for (unsigned int i = 0; i <= PS_METADATA_WORKSPACE / PS_CATALOG_MARKER_MAX;
+       ++i) {
+    char name[32];
+    int length = snprintf(name, sizeof(name), "overflow-%u", i);
+    REQUIRE(length > 0 && (size_t)length < sizeof(name));
+    ok(ps_catalog_put_marker(catalog, NULL, 88, name, (size_t)length, NULL,
+                             value, PS_CATALOG_MARKER_MAX, &info, &e),
+       &e);
+  }
   ok(ps_catalog_put_marker(catalog, NULL, 88, "marker", 6, NULL, value,
                            PS_CATALOG_MARKER_MAX, &info, &e),
      &e);
-  REQUIRE(catalog->metadata_free_bytes > available);
+  ok(ps_checkpoint(catalog, &e), &e);
+  for (ps_meta_page *page = catalog->pages; page; page = page->next) {
+    overflow |= page->run.offset >= PS_DATA;
+    REQUIRE(page->run.offset + PS_PAGE <= offset ||
+            page->run.offset >= offset + PS_CHUNK);
+  }
+  REQUIRE(overflow);
   ok(ps_publish(body, NULL, &e), &e);
   ps_writer_close(body);
   expect_value(catalog, key(21), PS_CHUNK, 21);

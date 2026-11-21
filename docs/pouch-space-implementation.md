@@ -11991,3 +11991,65 @@ ASan/UBSan and musl Release. The GNU groups included indexed crash
 recovery, lease and messaging pressure, queue, outbox, revision and
 checkpoint adoption. Raw comparisons and profiles are under
 `build/pouch-space-concurrent/native-cost/`.
+
+## Physical ordering for checkpoint recovery
+
+Directory order groups logical keys. Incremental checkpoints can place
+nearby keys on distant descriptor pages and interleave distant keys on
+the same page. Recovery now collects checked directory bindings, decodes
+their descriptors in physical order through the bounded page cache,
+then installs them in directory order. The install phase preserves
+stream-head, owned-run and catalog dependencies. Each raw page and
+descriptor still passes its own checks. The scheduling vector contains
+only keys, descriptor references and decoded metadata.
+
+An interleaved fixture with 11,200 entries spans 181 descriptor pages,
+exceeding the 128-page cache. The prior loader reads some pages again.
+The revised loader reads each page once in 88 calls on live adoption,
+live join and first-owner reopen. The checks also exercise a corrupt
+page in a combined read and short and multi-extent descriptors with
+independently invalid checksums. The catalog workspace fixture now
+drives a real checkpoint into ordinary container space while a peer
+holds an unpublished body. It verifies the selected pages exclude
+the private range and the peer can subsequently publish its bytes.
+
+The identical-image control used six copies per build of each closed
+10 MiB image, captured after a verified 96 MiB workload. Each copy was
+opened by one first owner and eight live joins. These are median elapsed
+milliseconds and read calls in prior / revised order. First owners
+performed one durability barrier and live joins performed zero.
+
+| Layout | First-owner time | First-owner reads | Individual live-join time | Live-join reads |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 41.84 / 44.52 | 1,511 / 1,508 | 3.86 / 3.31 | 137 / 134 |
+| Durable | 46.29 / 42.39 | 1,870 / 1,551 | 4.58 / 3.84 | 521 / 202 |
+
+All ten GNU Release workflow runs verified through reopen with eight
+independent writers. Both native builds ran twice per durability mode
+at a fixed 10 MiB. Multifile ran once per mode. Each workflow created
+its own layout. The tables show medians in the order prior native
+(`03e9b94c`), revised native and multifile.
+
+| Durability | Work (s) | CPU through maintenance (s) | Mutation p95 (ms) | Close (ms) | First reopen (ms) | Eight live joins (ms) | Verify after reopen (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 9.79 / 9.34 / 10.37 | 12.54 / 11.93 / 4.43 | 112.50 / 107.24 / 54.30 | 16.63 / 13.48 / 3.83 | 13.97 / 14.17 / 0.36 | 30.60 / 24.22 / 1.61 | 19.97 / 17.23 / 23.38 |
+| Durable | 17.58 / 18.00 / 33.26 | 14.39 / 13.91 / 5.38 | 139.09 / 146.40 / 190.59 | 17.00 / 19.76 / 2.46 | 14.43 / 14.94 / 0.28 | 25.10 / 29.32 / 1.45 | 17.50 / 17.76 / 23.58 |
+
+| Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) | First pass after reopen (ms) | Repeat pass after reopen (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 1.75 / 1.58 / 2.75 | 0.65 / 0.63 / 1.74 | 0.28 / 0.29 / 2.29 | 2.64 / 2.20 / 2.99 | 1.32 / 1.02 / 1.88 |
+| Durable | 1.92 / 1.99 / 3.85 | 0.39 / 0.43 / 5.84 | 0.13 / 0.16 / 7.52 | 2.37 / 2.26 / 2.92 | 1.11 / 1.10 / 1.92 |
+
+Revised peak RSS through the workflow was 62.4 MiB in NoSync and
+60.4 MiB in durable mode. The prior build measured 58.1 and
+56.7 MiB. The identical-image result isolates loader work. Live-join
+time on independently built layouts remains sensitive to checkpoint
+placement, and the revised durable runs spent more time in close
+and grouped join. NoSync mutation tails and CPU remain above multifile.
+
+Verification passed 42 GNU Release groups and 17 groups each on Debug
+ASan/UBSan and musl. The tests included staged adoption failure, codec
+conversion with explicit growth and crash recovery, reader and writer
+ownership, journal replay, and shared lease and messaging capacity.
+Raw runs and the two retained images are under
+`build/pouch-space-concurrent/physical-order/`.

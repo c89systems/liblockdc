@@ -3716,6 +3716,8 @@ typedef struct metadata_read_page {
 typedef struct metadata_directory_entry {
   ps_key key;
   ps_directory_value ref;
+  size_t ordinal;
+  ps_entry *decoded;
 } metadata_directory_entry;
 typedef struct metadata_recovery {
   ps_space *space;
@@ -3727,13 +3729,18 @@ typedef struct metadata_recovery {
    * Retain a bounded set of checked immutable pages for this traversal. */
   metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
   size_t next_slot, batch;
-  metadata_directory_entry entries[META_DIRECTORY_BATCH];
-  size_t count;
+  metadata_directory_entry *entries;
+  size_t count, capacity;
 } metadata_recovery;
-static void metadata_read_cache_close(metadata_recovery *r) {
+static void metadata_recovery_close(metadata_recovery *r) {
   size_t i;
   for (i = 0; i < META_READ_PAGES; ++i)
     lc_free_with_allocator(NULL, r->slots[i]);
+  for (i = 0; i < r->count; ++i)
+    if (r->entries[i].decoded)
+      entry_free(r->entries[i].decoded);
+  lc_free_with_allocator(NULL, r->entries);
+  lc_free_with_allocator(NULL, r);
 }
 static metadata_read_page *metadata_read_find(const metadata_recovery *r,
                                               uint64_t offset) {
@@ -3809,29 +3816,30 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   *out = page;
   return LC_OK;
 }
-static int metadata_offset_order(const void *a, const void *b) {
-  uint64_t left = *(const uint64_t *)a, right = *(const uint64_t *)b;
+static int metadata_physical_order(const void *a, const void *b) {
+  uint64_t left = ((const metadata_directory_entry *)a)->ref.offset;
+  uint64_t right = ((const metadata_directory_entry *)b)->ref.offset;
   return left < right ? -1 : left != right;
 }
-static int metadata_read_ahead(metadata_recovery *r, lc_error *error) {
+static int metadata_read_ahead(metadata_recovery *r, size_t first, size_t end,
+                               lc_error *error) {
   uint64_t offsets[META_DIRECTORY_BATCH];
+  uint64_t offset;
   metadata_read_page *page;
   size_t i, start, part, count = 0;
   int rc = LC_OK;
   ++r->batch;
-  for (i = 0; i < r->count; ++i)
-    offsets[i] = r->entries[i].ref.offset / PS_PAGE * PS_PAGE;
-  qsort(offsets, r->count, sizeof(*offsets), metadata_offset_order);
-  for (i = 0; i < r->count; ++i) {
-    if (count && offsets[i] == offsets[count - 1])
+  for (i = first; i < end; ++i) {
+    offset = r->entries[i].ref.offset / PS_PAGE * PS_PAGE;
+    if (count && offset == offsets[count - 1])
       continue;
-    if (!metadata_offset(r->space, offsets[i]))
+    if (!metadata_offset(r->space, offset))
       return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
     /* Protect every known starting page before loading adjacent misses. */
-    page = metadata_read_find(r, offsets[i]);
+    page = metadata_read_find(r, offset);
     if (page)
       page->batch = r->batch;
-    offsets[count++] = offsets[i];
+    offsets[count++] = offset;
   }
   for (i = 0; rc == LC_OK && i < count;) {
     start = i++;
@@ -3928,9 +3936,11 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
   *wire = recovery->wire;
   return LC_OK;
 }
-static int recover_directory_entry(metadata_recovery *recovery, ps_key key,
-                                   ps_directory_value ref, lc_error *error) {
+static int decode_directory_entry(metadata_recovery *recovery,
+                                  metadata_directory_entry *item,
+                                  lc_error *error) {
   ps_space *s = recovery->space;
+  ps_directory_value ref = item->ref;
   const unsigned char *wire = NULL;
   ps_entry *p = NULL;
   int event, rc;
@@ -3940,45 +3950,86 @@ static int recover_directory_entry(metadata_recovery *recovery, ps_key key,
   if (rc == LC_OK)
     rc = decode_entry(s, recovery->batch_entries, wire, (size_t)ref.bytes, &p,
                       &event, error);
-  if (rc == LC_OK && (event != PS_PUT || !same_key(p->key, key) ||
-                      p->token != ref.incarnation ||
-                      get64(wire + 8) > s->sequence || lookup(s, key)))
+  if (rc == LC_OK &&
+      (event != PS_PUT || !same_key(p->key, item->key) ||
+       p->token != ref.incarnation || get64(wire + 8) > s->sequence))
     rc = err(error, LC_ERR_PROTOCOL, "checkpoint descriptor binding mismatch");
-  if (rc == LC_OK && p->key.kind == PS_CATALOG)
-    rc = ps_catalog_prepare_record(s, p, 1, error);
-  if (rc == LC_OK && p->key.kind == PS_OWNED_RUN && p->owned_mapped)
-    rc = owned_map_load(s, p, error);
   if (rc == LC_OK) {
     if (!recovery->certified_root || get64(wire + 8) <= recovery->cohort_origin)
       p->stream_admitted = 0;
-    if (p->key.kind == PS_CATALOG)
-      ps_catalog_apply_record(s, p, 0);
     p->checkpoint_ref = ref;
-    register_entry(s, p);
-    install(s, p);
+    item->decoded = p;
   } else if (p)
     entry_free(p);
   return rc;
 }
-static int recover_directory_batch(metadata_recovery *r, lc_error *error) {
-  size_t i;
-  int rc = metadata_read_ahead(r, error);
-  for (i = 0; rc == LC_OK && i < r->count; ++i) {
-    if (r->batch_entries)
-      r->batch_entries->remaining = r->count - i;
-    rc =
-        recover_directory_entry(r, r->entries[i].key, r->entries[i].ref, error);
+static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
+  ps_space *s = r->space;
+  ps_entry *p;
+  size_t i, end, at;
+  int rc = LC_OK;
+  /* Decode neighboring descriptors together. Logical installation still
+   * follows the checked directory, including stream heads before runs. */
+  qsort(r->entries, r->count, sizeof(*r->entries), metadata_physical_order);
+  for (i = 0; rc == LC_OK && i < r->count;) {
+    end = r->count - i > META_DIRECTORY_BATCH ? i + META_DIRECTORY_BATCH
+                                              : r->count;
+    rc = metadata_read_ahead(r, i, end, error);
+    for (; rc == LC_OK && i < end; ++i) {
+      if (r->batch_entries)
+        r->batch_entries->remaining = r->count - i;
+      rc = decode_directory_entry(r, &r->entries[i], error);
+    }
   }
-  r->count = 0;
-  return rc;
+  if (rc != LC_OK)
+    return rc;
+  for (i = 0; i < r->count; ++i)
+    while ((at = r->entries[i].ordinal) != i) {
+      metadata_directory_entry item = r->entries[i];
+      r->entries[i] = r->entries[at];
+      r->entries[at] = item;
+    }
+  for (i = 0; i < r->count; ++i) {
+    p = r->entries[i].decoded;
+    if (lookup(s, p->key))
+      return err(error, LC_ERR_PROTOCOL,
+                 "checkpoint descriptor binding mismatch");
+    if (p->key.kind == PS_CATALOG)
+      rc = ps_catalog_prepare_record(s, p, 1, error);
+    else if (p->key.kind == PS_OWNED_RUN && p->owned_mapped)
+      rc = owned_map_load(s, p, error);
+    if (rc != LC_OK)
+      return rc;
+    if (p->key.kind == PS_CATALOG)
+      ps_catalog_apply_record(s, p, 0);
+    r->entries[i].decoded = NULL;
+    register_entry(s, p);
+    install(s, p);
+  }
+  return LC_OK;
 }
 static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
                                    lc_error *error) {
   metadata_recovery *r = v;
-  r->entries[r->count].key = key;
-  r->entries[r->count++].ref = ref;
-  return r->count == META_DIRECTORY_BATCH ? recover_directory_batch(r, error)
-                                          : LC_OK;
+  metadata_directory_entry *item;
+  size_t capacity;
+  if (r->count == r->capacity) {
+    if (r->capacity > (size_t)-1 / sizeof(*item) / 2)
+      return err(error, LC_ERR_NOMEM, "checkpoint binding list too large");
+    capacity = r->capacity ? 2 * r->capacity : META_DIRECTORY_BATCH;
+    item =
+        lc_realloc_with_allocator(NULL, r->entries, capacity * sizeof(*item));
+    if (!item)
+      return err(error, LC_ERR_NOMEM, "cannot collect checkpoint bindings");
+    r->entries = item;
+    r->capacity = capacity;
+  }
+  item = &r->entries[r->count];
+  item->key = key;
+  item->ref = ref;
+  item->ordinal = r->count++;
+  item->decoded = NULL;
+  return LC_OK;
 }
 /* Validate the entire candidate before changing any selected ownership. A
  * complete inner record is not independently recoverable inside a revision. */
@@ -4443,14 +4494,13 @@ static int recover_directory(ps_space *s, unsigned char *wire,
     recovery->cohort_origin = certificate->origin;
     rc = ps_directory_visit(directory, capture_directory_entry,
                             recover_directory_page, recovery, error);
-    if (rc == LC_OK && recovery->count)
-      rc = recover_directory_batch(recovery, error);
   }
   ps_directory_close(directory);
+  if (rc == LC_OK && recovery && recovery->count)
+    rc = recover_directory_bindings(recovery, error);
   if (recovery) {
     entry_batch_release(batch_entries.open);
-    metadata_read_cache_close(recovery);
-    lc_free_with_allocator(NULL, recovery);
+    metadata_recovery_close(recovery);
   }
   if (rc == LC_OK)
     rc = validate_owned_directory(s, error);
