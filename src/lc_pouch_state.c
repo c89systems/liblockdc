@@ -365,8 +365,10 @@ static int lc_pouch_state_cache_active_append_fd(
     lc_pouch *pouch, lc_pouch_namespace_logstore *cache,
     const lc_pouch_namespace_manifest *manifest, int *out, lc_error *error);
 static int lc_pouch_state_storage_prepare(lc_pouch *, const char *, lc_error *);
-static int lc_pouch_state_namespace_lock_acquire(
-    lc_pouch *, const char *, lc_pouch_state_namespace_lock *, lc_error *);
+static int
+lc_pouch_state_namespace_lock_acquire(lc_pouch *, const char *, int wait,
+                                      lc_pouch_state_namespace_lock *,
+                                      lc_error *);
 static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *,
                                                           const char *,
                                                           lc_error *);
@@ -1351,7 +1353,7 @@ static int lc_pouch_state_cache_guard_lock(lc_pouch *pouch, const char *ns,
   }
   if (pouch->storage.coordinated_namespaces) {
     int rc = lc_pouch_state_namespace_lock_acquire(
-        pouch, ns, &guard->storage_scope, error);
+        pouch, ns, 1, &guard->storage_scope, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
       if (rc != LC_OK)
@@ -2132,10 +2134,9 @@ static int
 lc_pouch_state_delete_locked(lc_pouch *pouch, const char *ns, const char *key,
                              const lc_pouch_state_write_options *options,
                              lc_pouch_state_write_result *out, lc_error *error);
-static int
-lc_pouch_state_lock_namespace_for_mutation(lc_pouch *pouch, const char *ns,
-                                           lc_pouch_state_namespace_lock *lock,
-                                           lc_error *error);
+static int lc_pouch_state_lock_namespace_for_mutation(
+    lc_pouch *pouch, const char *ns, int wait,
+    lc_pouch_state_namespace_lock *lock, lc_error *error);
 static int lc_pouch_state_visit_internal(lc_pouch *pouch, const char *ns,
                                          const char *prefix,
                                          lc_pouch_state_visit_fn visitor,
@@ -2601,7 +2602,7 @@ static char *lc_pouch_state_empty_etag(const lc_allocator *allocator,
 }
 
 static int
-lc_pouch_state_namespace_lock_acquire(lc_pouch *pouch, const char *ns,
+lc_pouch_state_namespace_lock_acquire(lc_pouch *pouch, const char *ns, int wait,
                                       lc_pouch_state_namespace_lock *lock,
                                       lc_error *error) {
   char *namespace_path;
@@ -2642,7 +2643,7 @@ lc_pouch_state_namespace_lock_acquire(lc_pouch *pouch, const char *ns,
   }
   if (pouch->storage.coordinated_namespaces) {
     int rc = pouch->storage.ops->namespace_state_lock(
-        pouch->storage.context, ns, &lock->storage_guard, error);
+        pouch->storage.context, ns, wait, &lock->storage_guard, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_namespace_lock_track(lock, pouch, ns, error);
       if (rc != LC_OK) {
@@ -2979,8 +2980,8 @@ static int lc_pouch_state_key_lock_acquire(lc_pouch *pouch, const char *ns,
     return LC_OK;
   }
   if (pouch->storage.coordinated_namespaces) {
-    rc = lc_pouch_state_namespace_lock_acquire(pouch, ns, &lock->storage_scope,
-                                               error);
+    rc = lc_pouch_state_namespace_lock_acquire(pouch, ns, 1,
+                                               &lock->storage_scope, error);
     if (rc == LC_OK)
       lock->projection_uses_namespace_mutex = 1;
     return rc;
@@ -3233,9 +3234,9 @@ static int lc_pouch_state_finish_commit_group_after_mutation(
   return rc;
 }
 
-int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
-                                       lc_pouch_state_precondition_fn callback,
-                                       void *context, lc_error *error) {
+static int lc_pouch_state_with_namespace_lock_mode(
+    lc_pouch *pouch, const char *ns, int wait,
+    lc_pouch_state_precondition_fn callback, void *context, lc_error *error) {
   lc_pouch_state_commit_group *commit_group;
   lc_pouch_state_namespace_lock lock;
   int owns_commit_group;
@@ -3252,7 +3253,8 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
   if (rc != LC_OK) {
     return rc;
   }
-  rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, &lock, error);
+  rc =
+      lc_pouch_state_lock_namespace_for_mutation(pouch, ns, wait, &lock, error);
   if (rc != LC_OK) {
     lc_pouch_writer_mode_operation_end(pouch);
     return rc;
@@ -3275,6 +3277,18 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
   lc_pouch_state_namespace_lock_release(&lock);
   lc_pouch_writer_mode_operation_end(pouch);
   return rc;
+}
+int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
+                                       lc_pouch_state_precondition_fn callback,
+                                       void *context, lc_error *error) {
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 1, callback,
+                                                 context, error);
+}
+int lc_pouch_state_try_with_namespace_lock(
+    lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
+    void *context, lc_error *error) {
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 0, callback,
+                                                 context, error);
 }
 
 int lc_pouch_state_with_key_lock(lc_pouch *pouch, const char *ns,
@@ -3311,12 +3325,15 @@ int lc_pouch_state_with_key_lock(lc_pouch *pouch, const char *ns,
   return rc;
 }
 
-static int
-lc_pouch_state_lock_namespace_for_mutation(lc_pouch *pouch, const char *ns,
-                                           lc_pouch_state_namespace_lock *lock,
-                                           lc_error *error) {
+static int lc_pouch_state_lock_namespace_for_mutation(
+    lc_pouch *pouch, const char *ns, int wait,
+    lc_pouch_state_namespace_lock *lock, lc_error *error) {
   int rc;
 
+  if (!wait && !pouch->storage.coordinated_namespaces)
+    return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
+                        "storage has no nonblocking namespace authority", NULL,
+                        NULL, "pouch");
   rc = pouch->storage.ops
            ? pouch->storage.ops->check(pouch->storage.context, error)
            : lc_pouch_namespace_ensure_layout(&pouch->allocator,
@@ -3324,7 +3341,7 @@ lc_pouch_state_lock_namespace_for_mutation(lc_pouch *pouch, const char *ns,
   if (rc != LC_OK) {
     return rc;
   }
-  return lc_pouch_state_namespace_lock_acquire(pouch, ns, lock, error);
+  return lc_pouch_state_namespace_lock_acquire(pouch, ns, wait, lock, error);
 }
 
 static int lc_pouch_state_ensure_namespace_locked(lc_pouch *pouch,
@@ -13440,17 +13457,18 @@ static int lc_pouch_storage_age_sweep(void *context, lc_error *error) {
 static int lc_pouch_storage_maintenance_run(
     lc_pouch *pouch, const lc_pouch_maintenance_options *options,
     lc_pouch_maintenance_result *out, lc_error *error) {
+  const lc_pouch_storage_maintenance_ops *ops = pouch->storage.ops->maintenance;
   lc_pouch_maintenance_result local_out = {0}, retention = {0};
   lc_pouch_storage_age_work age;
   lc_error local_error;
-  int rc;
+  int rc, run_retention = !options->cleanup_only;
   lc_error_init(&local_error);
   if (!error)
     error = &local_error;
   if (!out)
     out = &local_out;
   memset(out, 0, sizeof(*out));
-  if (!pouch->storage.ops->maintenance) {
+  if (!ops) {
     rc = lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
                       "storage owner has no maintenance capability", NULL, NULL,
                       "pouch");
@@ -13466,13 +13484,16 @@ static int lc_pouch_storage_maintenance_run(
   rc = lc_pouch_writer_mode_operation_begin(pouch, error);
   if (rc != LC_OK)
     goto done;
-  if (!options->cleanup_only)
+  if (run_retention && options->background && !options->force &&
+      ops->retention_pending)
+    rc = ops->retention_pending(pouch->storage.context, options->ns,
+                                &run_retention, error);
+  if (rc == LC_OK && run_retention)
     rc = lc_pouch_retention_run(pouch, options->ns,
                                 LC_POUCH_RETENTION_ATTEMPT_LIMIT, &retention,
                                 error);
   if (rc == LC_OK)
-    rc = pouch->storage.ops->maintenance->state_run(pouch->storage.context,
-                                                    pouch, options, out, error);
+    rc = ops->state_run(pouch->storage.context, pouch, options, out, error);
   if (rc == LC_OK && options->retention_updated_before_unix > 0) {
     age.pouch = pouch;
     age.options = options;
@@ -13526,7 +13547,7 @@ int lc_pouch_maintenance_run(lc_pouch *pouch,
       return rc;
     }
   }
-  rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, &lock, error);
+  rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, 1, &lock, error);
   if (rc != LC_OK) {
     lc_pouch_writer_mode_operation_end(pouch);
     return rc;
@@ -14310,7 +14331,7 @@ int lc_pouch_state_recover_staged_decisions(lc_pouch *pouch, const char *ns,
       return LC_OK;
     }
   }
-  rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, &lock, error);
+  rc = lc_pouch_state_lock_namespace_for_mutation(pouch, ns, 1, &lock, error);
   if (rc != LC_OK) {
     return rc;
   }

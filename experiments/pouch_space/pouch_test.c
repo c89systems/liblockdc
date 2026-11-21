@@ -9,6 +9,8 @@
 #include "namespace.h"
 #include "pouch.h"
 #include "pouch_internal.h"
+#include "readiness.h"
+#include "root_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -4432,6 +4434,102 @@ static void maintenance_sealed_batch(const char *path, int sync, int tail) {
   REQUIRE(live == 0 && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+typedef struct maintenance_probe {
+  ps_coordination_guard *handoff;
+  size_t conflicts;
+} maintenance_probe;
+static int maintenance_attempt(void *context, int fd, int cmd,
+                               struct flock *lock) {
+  maintenance_probe *probe = context;
+  /* Report an unexpected blocking catalog acquisition as contention instead
+   * of parking the fixture on authority that only this thread can release. */
+  int rc = fcntl(fd, cmd == F_OFD_SETLKW ? F_OFD_SETLK : cmd, lock);
+  if (rc < 0 && (cmd == F_OFD_SETLK || cmd == F_OFD_SETLKW) &&
+      lock->l_type == F_WRLCK && (errno == EAGAIN || errno == EACCES)) {
+    int reason = errno;
+    ++probe->conflicts;
+    ps_coordination_unlock(probe->handoff);
+    probe->handoff = NULL;
+    errno = reason;
+  }
+  return rc;
+}
+static void maintenance_busy_namespace(const char *path) {
+  static const char *names[] = {"occupied", "available"};
+  const size_t bytes = 4 * PS_CHUNK;
+  ps_pouch_state_options o = shared_options(0, 0);
+  lc_pouch *writer = NULL, *worker = NULL;
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_maintenance_options maintain = {0};
+  lc_pouch_maintenance_result result = {0};
+  ps_namespace *ns = NULL;
+  ps_namespace_info identity;
+  ps_coordination_guard *held = NULL, *other = NULL;
+  ps_root *root;
+  ps_space *space;
+  ps_coordination *coordination;
+  maintenance_probe probe = {0};
+  ps_coordination_io io = {&probe, maintenance_attempt};
+  lc_error e = {0};
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  o.logical.compaction_min_reclaimable_bytes = PS_PAGE;
+  o.logical.compaction_interval_seconds = 3600;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    for (unsigned char version = 1; version <= 2; ++version) {
+      input body = source(bytes, version);
+      ok(put(writer, names[i], "key", &body, NULL, &written, &e), &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &written);
+    }
+  o.coordination_io = &io;
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &worker, &e), &e);
+  /* Drive each background-policy pass on this thread. */
+  worker->background_compaction_enabled = 1;
+  root = ps_pouch_state_root(writer);
+  space = ps_root_space(root);
+  coordination = ps_space_coordination(space);
+  ok(ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_STATE,
+                          ps_namespace_name_hash(names[0]), 0, &held, &e),
+     &e);
+  probe.conflicts = 0;
+  maintain.ns = names[0];
+  maintain.background = 1;
+  ok(lc_pouch_maintenance_run(worker, &maintain, &result, &e), &e);
+  REQUIRE(result.skipped && result.cleanup_pending_count &&
+          probe.conflicts == 1);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+
+  ok(ps_root_namespace_acquire(root, names[1], 0, &ns, &e), &e);
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  ps_namespace_release(ns);
+  ok(ps_coordination_lock(coordination, PS_COORDINATION_COLLECTION_CATALOG,
+                          identity.owner, 0, &other, &e),
+     &e);
+  maintain.ns = names[1];
+  ok(lc_pouch_maintenance_run(worker, &maintain, &result, &e), &e);
+  REQUIRE(result.compacted && result.cleanup_deleted_count &&
+          probe.conflicts == 1);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  ps_coordination_unlock(other);
+
+  ok(ps_coordination_lock(coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &other, &e),
+     &e);
+  ps_readiness_set_pressure(space, 1);
+  ps_coordination_unlock(other);
+  probe.handoff = held;
+  maintain.ns = names[0];
+  ok(lc_pouch_maintenance_run(worker, &maintain, &result, &e), &e);
+  REQUIRE(result.compacted && result.cleanup_deleted_count &&
+          probe.conflicts == 2 && !probe.handoff);
+  lc_pouch_maintenance_result_cleanup(&allocator, &result);
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+    read_value(writer, names[i], "key", bytes, 2, 2, &e);
+  lc_pouch_close(worker);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0 && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 static void maintenance(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -4440,6 +4538,7 @@ static void maintenance(const char *path, const char *directory) {
   maintenance_sealed_batch(path, 0, 0);
   maintenance_sealed_batch(path, 1, 0);
   maintenance_sealed_batch(path, 0, 1);
+  maintenance_busy_namespace(path);
   for (int crypto = 0; crypto < 4; ++crypto)
     for (int sync = 0; sync < 2; ++sync) {
       ps_pouch_state_options o = options(crypto, sync);

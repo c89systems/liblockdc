@@ -131,24 +131,27 @@ static int namespace_info(void *context, void *ns,
   (void)context;
   return ps_namespace_projection(ns, out, e);
 }
-static int namespace_state_lock(void *context, const char *name, void **out,
-                                lc_error *e) {
+static int namespace_state_lock(void *context, const char *name, int wait,
+                                void **out, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_coordination_guard *guard = NULL;
   ps_space *space = ps_root_space(owner->root);
   ps_coordination *coordination = ps_space_coordination(space);
   int rc;
   if (!strcmp(name, ".txns"))
-    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 0, 1,
-                              &guard, e);
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 0,
+                              wait, &guard, e);
   else if (!strcmp(name, ".xa"))
-    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 1, 1,
-                              &guard, e);
-  else
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_CONTROL_STATE, 1,
+                              wait, &guard, e);
+  else if (wait)
     rc = ps_coordination_namespace_handoff(
         coordination, PS_COORDINATION_NAMESPACE_STATE,
         ps_namespace_name_hash(name), ps_maintenance_pressure_requested(space),
         &guard, e);
+  else
+    rc = ps_coordination_lock(coordination, PS_COORDINATION_NAMESPACE_STATE,
+                              ps_namespace_name_hash(name), 0, &guard, e);
   *out = guard;
   return rc;
 }
@@ -518,6 +521,17 @@ static int retention_work_load(void *context, const char *name,
   ps_namespace_release(ns);
   return rc;
 }
+static int retention_pending(void *context, const char *name, int *present,
+                             lc_error *e) {
+  ps_pouch_owner *owner = context;
+  ps_namespace *ns = NULL;
+  int rc = retention_namespace(owner, name, &ns, e);
+  *present = 0;
+  if (rc == LC_OK && ns)
+    rc = ps_namespace_retention_hint_present(ns, present, e);
+  ps_namespace_release(ns);
+  return rc;
+}
 static int retention_work_store(void *context, const char *name,
                                 const lc_pouch_retention_work *work,
                                 lc_error *e) {
@@ -719,8 +733,8 @@ static void note_mutation(void *context) {
   ps_readiness_note_mutation(ps_root_space(owner->root));
 }
 static const lc_pouch_storage_maintenance_ops maintenance_ops = {
-    work_ensure,          work_remove,       work_next,    state_maintain,
-    collections_maintain, capacity_pressure, note_mutation};
+    work_ensure,          work_remove,       work_next,     state_maintain,
+    collections_maintain, capacity_pressure, note_mutation, retention_pending};
 static int outbox_markers_open(void *context, const char *ns, int kind,
                                int create, lc_pouch_outbox_store *out,
                                lc_error *e) {

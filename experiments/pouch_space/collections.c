@@ -1725,7 +1725,7 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   uint64_t reclaimed, skipped;
   size_t i;
   void *catalog;
-  int present = 0, pending = 0, dropped, rc, first_rc;
+  int present = 0, pending = 0, scan_collections, dropped, rc, first_rc;
   memset(&list, 0, sizeof(list));
   list.allocator = &pouch->allocator;
   rc = ps_root_namespace_acquire(root, options->ns, 0, &ns, e);
@@ -1741,15 +1741,20 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
     ps_namespace_release(ns);
     return rc;
   }
+  scan_collections = present || !options->background || options->force;
   present = 0;
   /* A durable catalog prefix, not the resident receiver cache, selects work.
-   * Capture only names/identities; one corrupt receiver cannot hide its peers.
+   * Background discovery can bypass the namespace catalog until its durable
+   * collection hint is published. Root orphan reclamation still runs.
    */
-  rc = catalog_enter(ns, 1, &catalog, e);
-  if (rc == LC_OK)
-    rc = ps_catalog_visit(root->space, ns->identity.owner,
-                          PS_CATALOG_COLLECTION, capture_maintenance, &list, e);
-  rc = catalog_end(ns, catalog, rc, e);
+  if (scan_collections) {
+    rc = catalog_enter(ns, 1, &catalog, e);
+    if (rc == LC_OK)
+      rc = ps_catalog_visit(root->space, ns->identity.owner,
+                            PS_CATALOG_COLLECTION, capture_maintenance, &list,
+                            e);
+    rc = catalog_end(ns, catalog, rc, e);
+  }
   lc_error_init(&local);
   lc_error_init(&first);
   first_rc = rc;
@@ -1787,7 +1792,7 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   lc_free_with_allocator(list.allocator, list.items);
   if (first_rc == LC_OK) {
     rc = ps_root_reclaim_orphans(root, &reclaimed, &skipped, &local);
-    if (rc == LC_OK) {
+    if (rc == LC_OK && scan_collections) {
       rc = catalog_enter(ns, 1, &catalog, &local);
       if (rc == LC_OK)
         rc = ps_catalog_visit(root->space, ns->identity.owner,
@@ -1799,7 +1804,8 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
         rc = ps_namespace_work_remove(ns, LC_POUCH_STORAGE_WORK_COLLECTION,
                                       &local);
       rc = catalog_end(ns, catalog, rc, &local);
-    }
+    } else if (rc == LC_OK)
+      rc = ps_catalog_orphans_pending(root->space, &pending, &local);
     if (rc == LC_OK && pending && out)
       ++out->cleanup_pending_count;
     if (rc == LC_OK)

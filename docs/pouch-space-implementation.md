@@ -10084,3 +10084,88 @@ The 20 MiB profile continues to hit capacity under churn. Indexed
 mutation tails and grouped reopen remain slower than multifile in
 the completed profiles. Raw runs and test logs are under
 `sealed-batch-` in `build/pouch-space-concurrent/`.
+
+## Durable hints and namespace handoff during background maintenance
+
+The native background path observes durable retention and collection
+hints before acquiring their namespace authority. A present retention
+hint runs through the existing transaction and recovery path. A present
+collection hint runs the existing catalog pass. Collection creation writes
+the hint before durably publishing the binding. An ordinary pass still
+reclaims root orphans, checks for deferred orphans and checkpoints the root
+when its selected namespace has no collection hint. Hints published after
+an observation remain discoverable by subsequent passes.
+
+A quiet native state maintenance turn attempts each logical namespace
+acquisition once and reports a busy namespace for a later turn. Under
+capacity pressure, state maintenance uses the existing bounded namespace
+handoff. Explicit and forced maintenance use ordinary handoff. Both paths
+use the same durable publication, staged-decision checks and source
+liveness checks.
+
+A shared-owner fixture holds one namespace, observes a single failed
+acquisition and pending cleanup, then compacts another namespace while
+both the first state gate and the second namespace's unused collection
+catalog gate are held. The pressure portion releases the first gate
+on contact and verifies that the same maintenance invocation reclaims
+the occupied namespace. Both surviving values are read back.
+
+Four instrumented 20 MiB runs per build measured 74 prior and 75 revised
+background turns. The indexed fixture has no expiry work. The revised
+build confirmed the hint was absent in every traced turn. Times are
+median and p95 in milliseconds.
+
+| Stage | Prior (`0d90ad9f`) | Revised |
+| --- | ---: | ---: |
+| Retention observation and work | 27.40 / 250.07 | 0.01 / 0.20 |
+| State maintenance | 38.73 / 233.84 | 95.41 / 283.30 |
+| Collections and root cleanup | 12.10 / 31.88 | 10.97 / 17.45 |
+| Whole turn | 105.77 / 405.48 | 107.67 / 295.48 |
+
+Retention and collection times fell, as did whole-turn p95. The time
+spent in state maintenance increased in this sample. The
+four instrumented traces completed on the revised build and two completed
+on the prior build.
+
+An earlier trial used one attempt even when the container was pressed
+for capacity. It completed zero of ten matched indexed runs. The revised
+policy retains bounded handoff under pressure. Its main GNU
+rotation verified 41 of 42 workflows. Adding four alternating pairs per
+NoSync profile gave these totals. Both native builds used fixed 10 MiB
+containers and every failed workflow reported a capacity refusal.
+
+| Workload | Prior native | Revised native | Multifile |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 8/8 | 7/8 | 4/4 |
+| Four writers, NoSync indexed, 20 MiB | 5/8 | 5/8 | 4/4 |
+| Two writers, durable indexed, 15 MiB | 2/2 | 2/2 | 2/2 |
+| Two writers, warmed NoSync queue | 2/2 | 2/2 | 2/2 |
+| Two writers, durable outbox | 2/2 | 2/2 | 2/2 |
+
+The next tables report successful-run medians from the main rotation,
+in milliseconds and in the same build order. The revised 12 MiB row
+has three successful runs. Grouped reopen includes the cold owner and
+the later live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1082.43 / 1303.32 / 1207.56 | 56.26 / 69.81 / 29.76 | 36.94 / 6.35 / 1.02 | 9.36 / 10.47 / 0.80 | 4.74 / 5.32 / 6.20 |
+| NoSync indexed, 20 MiB | 2602.36 / 2869.56 / 1929.86 | 81.62 / 89.85 / 28.23 | 10.76 / 9.56 / 1.08 | 13.11 / 12.22 / 0.83 | 7.16 / 6.78 / 9.24 |
+| Durable indexed, 15 MiB | 6008.30 / 5902.43 / 5108.68 | 80.12 / 83.29 / 61.40 | 6.65 / 24.85 / 0.86 | 8.72 / 8.74 / 0.65 | 5.81 / 5.37 / 8.64 |
+| Warmed NoSync queue | 11.27 / 9.79 / 80.22 | 2.04 / 1.85 / 16.21 | 0.35 / 0.23 / 0.06 | 3.39 / 2.65 / 0.33 | 0.27 / 0.30 / 0.41 |
+| Durable outbox | 827.18 / 871.83 / 1250.32 | 145.89 / 162.40 / 232.37 | 0.61 / 0.53 / 0.97 | 26.10 / 31.40 / 75.66 | 50.72 / 60.68 / 139.85 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 203.82 / 211.77 / 293.06 | 103.47 / 82.73 / 156.51 | 25.69 / 13.85 / 233.13 | 0.68 / 0.73 / 1.07 |
+| NoSync indexed, 20 MiB | 326.59 / 301.59 / 434.56 | 120.99 / 127.80 / 252.79 | 78.96 / 46.95 / 339.04 | 1.17 / 1.10 / 1.69 |
+| Durable indexed, 15 MiB | 122.85 / 143.39 / 211.25 | 50.95 / 12.35 / 324.61 | 10.02 / 11.37 / 341.40 | 0.48 / 0.40 / 0.78 |
+
+The paired results leave sustained indexed churn, foreground mutation
+tails and grouped reopen as qualification work. Targeted verification
+passed 30 GNU Release, 14 Debug ASan/UBSan and 19 musl Release
+groups, including the shared lease and messaging pressure workloads,
+native collection maintenance, and multifile background and small-stack
+compaction. Raw runs and test logs are under `pressure-worker-`,
+`pressure-trace-` and `pressure-checked-` in
+`build/pouch-space-concurrent/`.

@@ -577,6 +577,9 @@ void lc_pouch_query_index_cache_cleanup(lc_pouch *pouch);
 int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
                                        lc_pouch_state_precondition_fn callback,
                                        void *context, lc_error *error);
+int lc_pouch_state_try_with_namespace_lock(
+    lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
+    void *context, lc_error *error);
 /** Non-zero when this thread currently holds a namespace lock for `pouch`. */
 int lc_pouch_state_namespace_lock_held_by_current_thread(lc_pouch *pouch);
 int lc_pouch_state_with_key_lock(lc_pouch *pouch, const char *ns,

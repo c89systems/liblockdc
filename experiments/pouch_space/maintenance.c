@@ -19,7 +19,7 @@ typedef struct compact {
   ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
   size_t retirement_count;
   unsigned int selected_kind;
-  int background;
+  int background, defer_busy;
 } compact;
 static int fail(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
@@ -28,6 +28,13 @@ static uint64_t background_minimum(const compact *w) {
   uint64_t minimum = w->pouch->compaction_min_reclaimable_bytes;
   return minimum > MAINTENANCE_PIECES * PS_CHUNK ? MAINTENANCE_PIECES * PS_CHUNK
                                                  : minimum;
+}
+static int compact_namespace(compact *w, lc_pouch_state_precondition_fn fn,
+                             void *context, lc_error *e) {
+  if (w->defer_busy)
+    return lc_pouch_state_try_with_namespace_lock(w->pouch, w->name, fn,
+                                                  context, e);
+  return lc_pouch_state_with_namespace_lock(w->pouch, w->name, fn, context, e);
 }
 static int candidate(void *context, const ps_namespace_source *source,
                      lc_error *e) {
@@ -72,9 +79,7 @@ static int candidate(void *context, const ps_namespace_source *source,
 }
 static int select_logical(void *context, ps_piece_publish_fn publish,
                           void *publication, lc_error *e) {
-  compact *w = context;
-  return lc_pouch_state_with_namespace_lock(w->pouch, w->name, publish,
-                                            publication, e);
+  return compact_namespace(context, publish, publication, e);
 }
 typedef struct retire_task {
   compact *work;
@@ -117,8 +122,7 @@ static int retire_source(void *context, const ps_namespace_source *source,
       source->id == w->after.active_segment && source->tail &&
       !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
     task.active = 1;
-    rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
-                                            &task, e);
+    rc = compact_namespace(w, retire_locked, &task, e);
     task.active = 0;
     if (task.retirement) {
       int retired = ps_namespace_retire_unlinked(w->ns, task.retirement,
@@ -145,13 +149,11 @@ static int retire_source(void *context, const ps_namespace_source *source,
         ++w->result.pending_sources;
       else if ((source->sealed || repack.finished_tail) &&
                !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
-        rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name,
-                                                retire_locked, &task, e);
+        rc = compact_namespace(w, retire_locked, &task, e);
       }
     }
   } else {
-    rc = lc_pouch_state_with_namespace_lock(w->pouch, w->name, retire_locked,
-                                            &task, e);
+    rc = compact_namespace(w, retire_locked, &task, e);
   }
 outcome:
   if (rc == LC_ERR_PENDING ||
@@ -281,7 +283,11 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.options = options;
   w.maintenance = maintenance;
   w.background = options && options->background && !options->force;
-  rc = lc_pouch_state_with_namespace_lock(pouch, name, compact_locked, &w, e);
+  /* Pressure needs reclaim to make progress beside continuously active
+   * writers. Quiet turns can give an occupied namespace another turn. */
+  w.defer_busy =
+      w.background && !ps_maintenance_pressure_requested(ps_root_space(root));
+  rc = compact_namespace(&w, compact_locked, &w, e);
   for (i = 0; i < w.retirement_count; ++i) {
     int retired = ps_namespace_retire_unlinked(w.ns, w.retirements[i],
                                                rc == LC_OK ? e : NULL);
@@ -305,7 +311,7 @@ static int compact_run(lc_pouch *pouch, const char *name,
   if (rc == LC_OK && !w.result.skipped && !w.retirement_count)
     rc = ps_namespace_sources_visit(w.ns, retire_source, &w, e);
   if (rc == LC_OK && !w.result.skipped)
-    rc = lc_pouch_state_with_namespace_lock(pouch, name, finish_locked, &w, e);
+    rc = compact_namespace(&w, finish_locked, &w, e);
   if (w.ns)
     pouch->storage.ops->namespace_close(pouch->storage.context, w.ns);
   if (rc == LC_OK && !w.result.skipped && !maintenance)

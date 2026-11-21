@@ -177,6 +177,9 @@ typedef struct lc_pouch_storage_maintenance_ops {
   int (*capacity_pressure)(void *, int draining, lc_pouch_storage_capacity *,
                            lc_error *);
   void (*note_mutation)(void *);
+  /* Observe the durable expiry hint without acquiring logical state
+   * authority. A present hint is rechecked by the retention engine. */
+  int (*retention_pending)(void *, const char *, int *, lc_error *);
 } lc_pouch_storage_maintenance_ops;
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
@@ -262,8 +265,10 @@ typedef struct lc_pouch_storage_ops {
   const struct lc_pouch_index_store_ops *(*query_indexes)(void *, void **);
   const lc_pouch_storage_metadata_ops *metadata;
   /* Coordinated typed owners serialize state projections and decisions per
-   * logical namespace. Acquire before any source or publication authority. */
-  int (*namespace_state_lock)(void *, const char *, void **, lc_error *);
+   * logical namespace. Acquire before source or publication authority.
+   * wait=0 reports PENDING for a busy namespace without a handoff wait. */
+  int (*namespace_state_lock)(void *, const char *, int wait, void **,
+                              lc_error *);
   void (*namespace_state_unlock)(void *, void *);
 } lc_pouch_storage_ops;
 typedef struct lc_pouch_storage {
