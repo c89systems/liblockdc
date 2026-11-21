@@ -1730,6 +1730,45 @@ static double projection_milliseconds(void) {
   REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
   return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
+static void projection_quarantine(int durable, int explicit_sweep) {
+  lc_error e = {0};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_values *view = NULL;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  capture_put(writer, 1, 65);
+  ok(ps_metadata_repack(writer, &e), &e);
+  capture_put(writer, 2, 66);
+  ok(ps_metadata_repack(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  if (!explicit_sweep) {
+    ok(ps_values_capture(peer, key(1).owner, PS_STATE, PS_STATE, &view, &e),
+       &e);
+    REQUIRE(ps_values_count(view) == 2);
+  }
+  /* A third repack selects the first image's two pages. The peer still
+   * sees those pages as a quarantined interval in its resident projection. */
+  capture_put(writer, 3, 67);
+  ok(ps_metadata_repack(writer, &e), &e);
+  if (explicit_sweep)
+    ok(ps_checkpoint(peer, &e), &e);
+  else
+    ps_values_close(view);
+  ok(ps_refresh(peer, &e), &e);
+  capture_put(peer, 4, 68);
+  ok(ps_checkpoint(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 4; ++id) {
+    ps_reader *reader = NULL;
+    ok(ps_read_open(writer, key(id), NULL, &reader, &e), &e);
+    captured_expect(reader, (unsigned char)id, 64 + id);
+    ps_reader_close(reader);
+  }
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void projection_lifecycle(void) {
   lc_error e = {0};
   projection_io m = {0};
@@ -5301,17 +5340,21 @@ int main(int argc, char **argv) {
     capture_owned();
   else if (!strcmp(argv[2], "capture-race"))
     capture_race();
-  else if (!strcmp(argv[2], "projection"))
+  else if (!strcmp(argv[2], "projection")) {
     projection_lifecycle();
-  else if (!strcmp(argv[2], "projection-faults"))
+    for (int durable = 0; durable <= 1; ++durable)
+      projection_quarantine(durable, 0);
+  } else if (!strcmp(argv[2], "projection-faults"))
     projection_faults();
   else if (!strcmp(argv[2], "projection-recovery"))
     projection_recovery();
   else if (!strcmp(argv[2], "projection-threads"))
     projection_threads();
-  else if (!strcmp(argv[2], "projection-boundaries"))
+  else if (!strcmp(argv[2], "projection-boundaries")) {
     projection_boundaries();
-  else if (!strcmp(argv[2], "projection-pressure"))
+    for (int durable = 0; durable <= 1; ++durable)
+      projection_quarantine(durable, 1);
+  } else if (!strcmp(argv[2], "projection-pressure"))
     projection_pressure();
   else if (!strcmp(argv[2], "capacity-checkpoint")) {
     for (int durable = 0; durable <= 1; ++durable) {

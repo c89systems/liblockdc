@@ -1350,14 +1350,25 @@ static int pins_reclaim_locked(ps_space *s, lc_error *error) {
   pins_collect_locked(s, present, 1);
   return healthy(s, error);
 }
-static void pins_collect(ps_space *s, int present, int full) {
+/* A missing witness can mean a peer selected the range in a new checkpoint
+ * or publication. A no-work checkpoint may sweep only against a certified
+ * current view. Its next admission or refresh handles a newer view. */
+static int pins_reclaim_current(ps_space *s, lc_error *error) {
   ps_coordination_guard *guard = NULL;
-  int rc = allocation_begin(s, &guard, NULL);
-  if (rc == LC_OK && guard)
-    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL);
+  ps_readiness_certificate certificate;
+  int rc;
+  if (!s->pinned_free && !s->pinned_pages)
+    return LC_OK;
+  rc = allocation_begin(s, &guard, error);
+  if (rc == LC_OK && s->allocation_guard)
+    rc = ps_readiness_read(s, &certificate, error);
+  if (rc == LC_OK && s->allocation_guard &&
+      (certificate.pending || certificate.root != s->generation ||
+       certificate.ready != s->sequence))
+    return allocation_end(s, guard, LC_OK, error);
   if (rc == LC_OK)
-    pins_collect_locked(s, present, full);
-  (void)allocation_end(s, guard, rc, NULL);
+    rc = pins_reclaim_locked(s, error);
+  return allocation_end(s, guard, rc, error);
 }
 static int allocation_refresh(ps_space *s, lc_error *error) {
   int rc = canonical_observe(s, error);
@@ -1381,17 +1392,16 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   s->allocation_ranges_checked = rc == LC_OK;
   return rc;
 }
-static void collect_retired(ps_space *s, int full) {
+/* Releasing resident entries can narrow ownership on a stale projection.
+ * Sweeping foreign quarantine and acquiring workspace needs a current view. */
+static void collect_retired(ps_space *s) {
   ps_entry **link = &s->retired, *p;
   int present = 0, foreign, shared;
-  if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+  if (!s->retired || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
     return;
-  if (s->range_pins) {
-    if (pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL) != LC_OK)
-      return;
-    if (s->pinned_free || s->pinned_pages)
-      pins_collect(s, present, full);
-  }
+  if (s->range_pins &&
+      pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL) != LC_OK)
+    return;
   shared = ps_coordination_shared(s->coordination);
   while (*link) {
     p = *link;
@@ -1418,7 +1428,6 @@ static void collect_retired(ps_space *s, int full) {
     entry_free(p);
   }
 }
-static void collect(ps_space *s) { collect_retired(s, 0); }
 static size_t event_bytes(const ps_entry *p, int event) {
   return event == PS_PUT || event == PS_SEAL ? entry_bytes(p) : 64;
 }
@@ -2786,8 +2795,10 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     p->previous = NULL;
     p->safe = 1;
   }
-  collect_retired(s, 1);
-  return healthy(s, error);
+  rc = pins_reclaim_locked(s, error);
+  if (rc == LC_OK)
+    collect_retired(s);
+  return rc == LC_OK ? healthy(s, error) : rc;
 }
 static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
   ps_coordination_guard *guard = NULL;
@@ -2867,8 +2878,10 @@ static int reclaim_capacity(ps_space *s, uint64_t missing, int *attempted,
   lc_error_cleanup(e);
   if (s->journal || s->dirty)
     return checkpoint_locked(s, e);
-  collect_retired(s, 1);
-  return healthy(s, e);
+  rc = pins_reclaim_locked(s, e);
+  if (rc == LC_OK)
+    collect_retired(s);
+  return rc == LC_OK ? healthy(s, e) : rc;
 }
 int ps_internal_budget_admit(ps_space *s, int maintenance,
                              const ps_budget_plan *prior,
@@ -3718,7 +3731,7 @@ replay_extents:
      * Undo this frame before collection changes any recorded free links. */
     replay_finish(s, changes, 0);
     changes = NULL;
-    collect_retired(s, 0);
+    collect_retired(s);
     lc_error_cleanup(error);
     rc = healthy(s, error);
     retried = 1;
@@ -5652,7 +5665,7 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   ps_internal_entry_unpin(s, p);
   --s->readers;
   if (p->state == 2 && p->safe && !p->pins)
-    collect(s);
+    collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, buffer);
   return rc;
@@ -5815,7 +5828,7 @@ void ps_values_close(ps_values *view) {
   for (i = 0; i < view->count; ++i)
     ps_internal_entry_unpin(s, view->items[i]);
   --s->readers;
-  collect(s);
+  collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, view->items);
   lc_free_with_allocator(NULL, view);
@@ -5856,7 +5869,7 @@ void ps_reader_close(ps_reader *r) {
   ps_internal_entry_unpin(s, r->entry);
   --s->readers;
   if (r->entry->state == 2 && r->entry->safe && !r->entry->pins)
-    collect(s);
+    collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, r);
 }
@@ -6122,8 +6135,11 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
             __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) ||
         metadata_trim_needed(s))
       rc = checkpoint_locked(s, error);
-    else
-      collect_retired(s, 1);
+    else {
+      rc = pins_reclaim_current(s, error);
+      if (rc == LC_OK)
+        collect_retired(s);
+    }
   }
   if (rc == LC_OK)
     rc = healthy(s, error);
@@ -6610,7 +6626,7 @@ void ps_owned_close(ps_owned_head *head) {
   ps_internal_entry_unpin(s, head->entry);
   --s->readers;
   if (head->entry->state == 2 && head->entry->safe && !head->entry->pins)
-    collect(s);
+    collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, head);
 }
@@ -7333,7 +7349,7 @@ void ps_owned_run_close(ps_owned_run *run) {
   ps_internal_entry_unpin(s, run->entry);
   --s->readers;
   if (run->entry->state == 2 && run->entry->safe && !run->entry->pins)
-    collect(s);
+    collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, run);
 }
@@ -8044,4 +8060,4 @@ void ps_internal_remove(ps_space *s, ps_entry *p, uint64_t sequence) {
 int ps_internal_durable(ps_space *s, uint64_t sequence, lc_error *e) {
   return wait_durable(s, sequence, e);
 }
-void ps_internal_collect(ps_space *s) { collect(s); }
+void ps_internal_collect(ps_space *s) { collect_retired(s); }

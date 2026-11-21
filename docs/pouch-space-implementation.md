@@ -9784,3 +9784,62 @@ The capacity tests establish progress when ordinary space is exhausted
 and every cell on the required pages is eligible for retirement. Raw
 captures and test logs are under `packed-retirement-` and
 `ownership-repro-` in `build/pouch-space-concurrent/`.
+
+## Quarantine reclamation across checkpoint handoff
+
+The four-writer NoSync reproduction on `5bde0f3d` failed while adopting
+a peer checkpoint. An older projection had promoted a quarantined 8 KiB
+fixed metadata interval at offset 45,056 into its private workspace. The
+peer had just selected that interval in the new root and released its
+private witnesses. Adoption then tried to overlay the stale workspace on
+the selected pages and rejected the overlap.
+
+Releasing a reader or replaying a peer frame now collects only retired
+entries from the resident view. Allocation admission can reap foreign
+quarantine after observing current ownership. An explicit no-work
+checkpoint can sweep quarantine when the readiness certificate matches
+its generation and journal prefix with no pending structural changes.
+A stale no-work checkpoint defers that sweep to admission or refresh.
+The checkpoint publication barriers and reader range witnesses still
+govern page reuse.
+
+The deterministic fixture alternates packed metadata images, opens a
+second owner, and lets the publishing owner select pages the observer
+still considers quarantined. Both releasing a captured value set and
+running a no-work checkpoint reproduced the overlap on the packed
+retirement build. Both now permit the observer to refresh, publish and
+checkpoint under both durability policies. Cold reopen checks all four
+values. The final worktree passed 13 Debug sanitizer, 32 GNU Release and
+25 musl Release checks including projection faults, reader retention,
+owner exit, fixed-capacity concurrent leases and outbox recovery.
+
+The matched GNU comparison verified 35 of 36 workflows. The build with
+the quarantine change and multifile each verified all 12 of their runs.
+The one prior-build failure was an ordinary capacity refusal in the
+20 MiB profile. The final native build also verified nine of ten further
+indexed workflows, with one ordinary capacity refusal in the 12 MiB
+NoSync profile. The overlap signature was absent from that comparison
+and the further runs.
+
+The tables give medians of successful matched runs in milliseconds in the
+order prior native (`e0140136`), final native and multifile. The two
+four-writer profiles had three attempts per build. The three other
+profiles had two. Both native builds used fixed 10 MiB containers.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 2060.51 / 2175.48 / 1892.06 | 134.99 / 144.70 / 48.95 | 2.97 / 4.06 / 1.13 | 11.75 / 13.87 / 1.13 | 5.06 / 5.52 / 8.44 |
+| NoSync indexed, 20 MiB | 4049.26 / 4010.58 / 3911.65 | 126.68 / 119.91 / 64.56 | 58.69 / 4.61 / 1.75 | 20.88 / 19.27 / 0.92 | 9.56 / 9.58 / 12.01 |
+| Durable indexed, 15 MiB | 10287.18 / 9289.98 / 7659.61 | 164.48 / 137.92 / 108.54 | 30.35 / 3.94 / 0.94 | 13.01 / 13.71 / 0.62 | 8.66 / 8.00 / 8.81 |
+| Warmed NoSync queue | 12.32 / 11.46 / 170.20 | 2.33 / 2.10 / 64.32 | 0.27 / 0.45 / 0.06 | 2.65 / 4.31 / 0.40 | 0.22 / 0.29 / 0.54 |
+| Durable outbox | 1959.89 / 1687.29 / 3131.91 | 442.24 / 392.12 / 693.20 | 0.65 / 0.65 / 0.37 | 43.94 / 52.50 / 189.78 | 79.97 / 142.72 / 407.42 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 439.12 / 343.27 / 464.49 | 121.19 / 125.71 / 318.59 | 41.99 / 73.72 / 413.65 | 0.78 / 0.82 / 1.42 |
+| NoSync indexed, 20 MiB | 595.48 / 557.79 / 964.26 | 269.42 / 268.06 / 543.83 | 74.30 / 82.13 / 790.59 | 1.60 / 1.82 / 2.29 |
+| Durable indexed, 15 MiB | 251.51 / 222.65 / 288.76 | 29.03 / 29.81 / 269.50 | 15.06 / 15.95 / 350.41 | 0.69 / 0.62 / 0.86 |
+
+Fixed-capacity admission, indexed mutation tails and grouped reopen
+remain qualification work. The trace, paired runs and targeted check
+logs are under `packed-ownership-` in `build/pouch-space-concurrent/`.
