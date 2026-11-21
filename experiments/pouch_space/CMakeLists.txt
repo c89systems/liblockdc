@@ -136,7 +136,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_live_allocator_test)
   foreach(mode threads faults fence processes serialized packed history
-      captures capture-faults capture-owned capture-race packed-replay-locality
+      captures capture-faults capture-owned capture-race packed-replay-locality key-index-growth
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail capacity-checkpoint pressure-reclaim
       shared-durable shared-preparation readiness-cohort reopen-cohort certified-prefix quarantine checkpoint-decode

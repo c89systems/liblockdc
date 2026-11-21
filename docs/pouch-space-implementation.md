@@ -12460,3 +12460,101 @@ XA durability, and source ownership under replacement. CPU, resident
 memory, late mutation latency, and indexed-workload reopen and close
 remain qualification gates. Raw results and diagnostics are under
 `build/pouch-space-concurrent/state-delta/`.
+
+## Adaptive physical key index
+
+One-ms CPU samples on the 192 MiB workload identified checkpoint
+projection preparation as the largest named native cost. A second NoSync
+trace with source lines showed that physical key lookup dominated inside
+that preparation. The index held 257 buckets even as the checkpoint
+selected thousands of keys. Close and reopen sampling showed a separate
+split. The first owner of one verified NoSync layout spent 7.19 ms on
+physical open and about 24 ms on namespace recovery. Each live join spent
+about 5.6–6.6 ms on physical open and skipped namespace recovery.
+
+The physical key table grows by selected key count, including tombstones
+until checkpoint retirement. It reserves room before appending a new
+key, before selecting a compound revision, and before applying a replay
+frame. A checkpoint reader sizes the table from the captured binding
+count. Installation consumes that already prepared table and updates
+links without allocation. The table is resident metadata under the existing
+storage format.
+
+Live checkpoint preparation also groups decoded rows that match an
+existing key and incarnation. The temporary rows are freed as a batch
+after installation. Rows with a new incarnation remain independently
+owned. Every descriptor still passes its checks, and matching rows
+still require identical retained payload ownership. The overlay walk
+looks up only resident rows with local preparation, reader pins, or
+catalog pins.
+
+A fixed 10 MiB growth fixture runs both durability modes. It exhausts
+the initial table, refuses allocation during a single publication and
+a two-key revision, and checks that both attempts leave the journal at its
+original boundary. A successful retry grows a peer through journal replay. An
+injected replay failure leaves both revision members unapplied. The
+fixture then refuses allocation while preparing a larger replacement
+checkpoint and retries with the old reader still held. It checks
+replacement, deletion, the original captured bytes, and every surviving
+key after cold reopen.
+
+In the source-line CPU profiles, samples in key comparison, lookup and
+hashing fell from 2,622 of 18,355 to 1,258 of 18,894. Both workloads
+verified through reopen. Profiled process CPU through maintenance was
+23.80 and 23.77 s. Installation, incarnation comparison and file
+authority remained visible costs.
+
+The matched uninstrumented GNU Release rotation verified all nine runs.
+The candidate ran three NoSync and two durable trials. Frozen
+`6c715c0f` and multifile ran one control per mode. Each trial streamed
+192 MiB across 24 rows, 64 KiB values, 128 rounds and eight independent
+writers. Native roots held a fixed 10 MiB.
+
+Work, CPU through maintenance and mutation work are in seconds.
+Mutation p95, close, open and verification are in milliseconds.
+Mutation work and each index phase report the longest worker in that
+phase. Candidate figures are medians.
+
+| Backend | Durability | Work | CPU | Mutation work | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 19.07 | 24.67 | 13.91 | 116.45 | 30.32 | 33.37 | 44.09 | 23.26 |
+| Native | Durable | 38.85 | 37.38 | 34.36 | 162.55 | 31.02 | 31.27 | 41.47 | 22.53 |
+| Prior native | NoSync | 20.44 | 27.98 | 15.32 | 119.97 | 33.90 | 44.44 | 55.44 | 24.07 |
+| Prior native | Durable | 40.00 | 44.41 | 35.32 | 174.97 | 28.88 | 32.59 | 52.94 | 22.71 |
+| Multifile | NoSync | 24.81 | 10.45 | 10.51 | 66.64 | 4.02 | 0.25 | 1.53 | 44.59 |
+| Multifile | Durable | 82.56 | 12.98 | 46.77 | 247.56 | 3.99 | 0.25 | 1.26 | 40.48 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 3.76 | 1.62 | 0.49 |
+| Native | Durable | 4.12 | 0.94 | 0.24 |
+| Prior native | NoSync | 3.81 | 1.82 | 0.62 |
+| Prior native | Durable | 4.37 | 1.07 | 0.26 |
+| Multifile | NoSync | 6.58 | 3.92 | 4.68 |
+| Multifile | Durable | 9.33 | 12.99 | 16.46 |
+
+Candidate NoSync CPU was 12% below the frozen native control, and
+durable CPU was 16% below. Median NoSync mutation p95 rose from 79 ms
+in rounds 1–16 to 151 ms in rounds 113–128. Candidate peak RSS was
+about 100 MiB in NoSync and 99 MiB in durable mode, compared with
+110 MiB and 107 MiB for the frozen native controls.
+
+Ten musl pairs used independent copies of the same closed 10 MiB
+image from the verified NoSync workload. The order reversed after
+five pairs. The candidate finished the eight live joins sooner in
+every pair with the same read and barrier counts. First-owner timing
+was mixed, and the grouped close median increased by 0.56 ms.
+
+| Phase | Prior (ms) | Candidate (ms) | Read calls per phase | Sync barriers per phase |
+| --- | ---: | ---: | ---: | ---: |
+| First owner | 68.36 | 69.69 | 2,650 | 1 |
+| Eight live joins | 70.75 | 58.93 | 1,600 | 0 |
+| Close nine owners | 9.60 | 10.16 | — | — |
+
+Verification passed 49 GNU Release groups and 30 groups each on
+Debug ASan/UBSan and musl Release. Coverage included fixed-capacity
+allocation faults, shared lease and messaging, staged-decision recovery,
+projection and journal replay, and root codec conversion with explicit
+growth. CPU, memory, NoSync tail latency, first-owner reopen and close
+remain qualification gates. Raw measurements and retained images are
+under `build/pouch-space-concurrent/native-profile/`.

@@ -123,6 +123,10 @@ typedef struct ps_meta_page {
   struct ps_meta_page *claim_next, **claim_link;
   struct ps_meta_page *next, **link, *hash_next;
 } ps_meta_page;
+typedef struct ps_key_index {
+  ps_entry **buckets;
+  size_t count, capacity;
+} ps_key_index;
 struct ps_space {
   /* fd is borrowed from coordination after successful lifetime admission. */
   int fd, poisoned, durable, root;
@@ -182,7 +186,8 @@ struct ps_space {
   size_t metadata_pages;
   size_t packed_pages;
   uint64_t packed_bytes;
-  ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
+  ps_entry *entries, *retired, *dirty;
+  ps_key_index keys;
   /* Current immutable keys, including tombstones that select older values
    * at a completed prefix. Each bucket groups keys by namespace owner. */
   ps_entry *value_buckets[BUCKETS];

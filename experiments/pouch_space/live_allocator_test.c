@@ -18,6 +18,7 @@
 #include <zlib.h>
 
 static size_t checks, allocations, allocation_fail;
+static size_t key_index_fail;
 static int measuring;
 static int cooperative_wait;
 static int mapping_fail;
@@ -115,6 +116,10 @@ void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
 }
 void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
                                       size_t b) {
+  if (key_index_fail && n == key_index_fail && b == sizeof(ps_entry *)) {
+    key_index_fail = 0;
+    return NULL;
+  }
   return allocation_fails() ? NULL : __real_lc_calloc_with_allocator(a, n, b);
 }
 void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
@@ -1154,6 +1159,113 @@ static void capture_put_key(ps_space *s, ps_key k, size_t bytes) {
 }
 static void capture_put(ps_space *s, uint64_t id, size_t bytes) {
   capture_put_key(s, key(id), bytes);
+}
+static void index_expect(ps_space *s, uint64_t id, size_t bytes, lc_error *e) {
+  ps_reader *reader = NULL;
+  ok(ps_read_open(s, key(id), NULL, &reader, e), e);
+  captured_expect(reader, (unsigned char)(id % 251), bytes);
+  ps_reader_close(reader);
+}
+static void index_writers(ps_space *s, uint64_t first, ps_writer **writers,
+                          size_t count, lc_error *e) {
+  for (size_t i = 0; i < count; ++i) {
+    unsigned char bytes[65];
+    memset(bytes, (int)((first + i) % 251), sizeof(bytes));
+    ok(ps_begin(s, NULL, key(first + i), &writers[i], e), e);
+    ok(ps_write(writers[i], bytes, sizeof(bytes), e), e);
+  }
+}
+static void key_index_growth(int durable) {
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *held = NULL, *reader = NULL;
+  ps_writer *writers[2];
+  ps_stats before;
+  size_t limit;
+  lc_error e = {0};
+  options.shared = 1;
+  options.durable_sync = durable;
+  options.initial_capacity = options.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  capture_put(a, 1, 65);
+  limit = a->keys.capacity;
+  REQUIRE(limit && a->keys.count == 1);
+  for (size_t i = 2; i <= limit; ++i)
+    capture_put(a, i, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, &options, &b, &e), &e);
+  ok(ps_read_open(b, key(1), NULL, &held, &e), &e);
+  REQUIRE(a->keys.count == limit && b->keys.count == limit &&
+          b->keys.capacity == limit);
+  before = status(a);
+
+  index_writers(a, limit + 1, writers, 1, &e);
+  key_index_fail = 2 * limit;
+  REQUIRE(ps_publish(writers[0], NULL, &e) == LC_ERR_NOMEM && !key_index_fail &&
+          e.message && !strcmp(e.message, "cannot grow container key index"));
+  lc_error_cleanup(&e);
+  ps_writer_close(writers[0]);
+  REQUIRE(status(a).journal_bytes == before.journal_bytes &&
+          a->keys.count == limit);
+
+  index_writers(a, limit + 1, writers, 2, &e);
+  key_index_fail = 2 * limit;
+  REQUIRE(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                              &e) == LC_ERR_NOMEM &&
+          !key_index_fail && e.message &&
+          !strcmp(e.message, "cannot grow container key index"));
+  lc_error_cleanup(&e);
+  for (size_t i = 0; i < 2; ++i)
+    ps_writer_close(writers[i]);
+  REQUIRE(status(a).journal_bytes == before.journal_bytes &&
+          a->keys.count == limit);
+  REQUIRE(ps_read_open(a, key(limit + 1), NULL, &reader, &e) ==
+              LC_ERR_INVALID &&
+          !reader);
+  lc_error_cleanup(&e);
+
+  index_writers(a, limit + 1, writers, 2, &e);
+  ok(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  for (size_t i = 0; i < 2; ++i)
+    ps_writer_close(writers[i]);
+  key_index_fail = 2 * limit;
+  REQUIRE(ps_read_open(b, key(limit + 2), NULL, &reader, &e) == LC_ERR_NOMEM &&
+          !reader && !key_index_fail && b->keys.count == limit && e.message &&
+          !strcmp(e.message, "cannot grow container key index"));
+  lc_error_cleanup(&e);
+  index_expect(b, limit + 1, 65, &e);
+  index_expect(b, limit + 2, 65, &e);
+  REQUIRE(a->keys.count == limit + 2 && b->keys.count == limit + 2);
+
+  for (size_t i = limit + 3; i <= 2 * limit + 2; ++i)
+    capture_put(a, i, 65);
+  capture_put(a, 1, 97);
+  ok(ps_delete(a, key(2), &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  key_index_fail = 4 * limit;
+  REQUIRE(ps_refresh(b, &e) == LC_ERR_NOMEM && !key_index_fail &&
+          b->keys.count == limit + 2 && e.message &&
+          !strcmp(e.message, "cannot grow container key index"));
+  lc_error_cleanup(&e);
+  ok(ps_refresh(b, &e), &e);
+  REQUIRE(b->keys.count == 2 * limit + 1 && b->keys.capacity > 2 * limit &&
+          status(b).capacity == PS_DEFAULT_CAPACITY);
+  index_expect(b, 1, 97, &e);
+  index_expect(b, 2 * limit + 2, 65, &e);
+  captured_expect(held, 1, 65);
+  ps_reader_close(held);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+
+  ok(ps_open(path, 0, &options, &a, &e), &e);
+  for (size_t i = 1; i <= 2 * limit + 2; ++i)
+    if (i != 2)
+      index_expect(a, i, i == 1 ? 97 : 65, &e);
+  REQUIRE(ps_read_open(a, key(2), NULL, &reader, &e) == LC_ERR_INVALID &&
+          !reader);
+  lc_error_cleanup(&e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!unlink(path));
 }
 typedef struct packed_replay_probe {
   uint64_t page;
@@ -6990,6 +7102,9 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "packed-replay-locality")) {
     packed_replay_locality();
     packed_revision_batch();
+  } else if (!strcmp(argv[2], "key-index-growth")) {
+    key_index_growth(0);
+    key_index_growth(1);
   } else if (!strcmp(argv[2], "piece-barrier-handoff")) {
     for (int durable = 0; durable <= 1; ++durable)
       for (int discard = 0; discard <= 1; ++discard)

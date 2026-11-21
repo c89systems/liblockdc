@@ -406,21 +406,57 @@ static int immutable_key(ps_key k) {
          (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
-static size_t bucket(ps_key k) {
-  uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^ k.kind;
+static size_t key_bucket(ps_key k, size_t capacity) {
+  uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^
+               (k.kind * UINT64_C(0xc2b2ae3d27d4eb4f));
   h ^= h >> 33;
   h *= UINT64_C(0xff51afd7ed558ccd);
-  return (size_t)((h ^ (h >> 33)) % BUCKETS);
+  return (size_t)(h ^ (h >> 33)) & (capacity - 1);
 }
 static int same_key(ps_key a, ps_key b) {
   return a.owner == b.owner && a.key == b.key && a.kind == b.kind;
 }
 static ps_entry *lookup(ps_space *s, ps_key k) {
   ps_entry *p;
-  for (p = s->buckets[bucket(k)]; p; p = p->hash_next)
+  if (!s->keys.capacity)
+    return NULL;
+  for (p = s->keys.buckets[key_bucket(k, s->keys.capacity)]; p;
+       p = p->hash_next)
     if (same_key(k, p->key))
       return p;
   return NULL;
+}
+/* Reserve for selected keys, including current tombstones. Rehashing moves
+ * only index links and runs before publication or replay begins to install. */
+static int key_index_reserve(ps_space *s, size_t added, lc_error *error) {
+  ps_entry **buckets, *p, *next;
+  size_t needed, capacity, i, at;
+  if (added > (size_t)-1 - s->keys.count)
+    return err(error, LC_ERR_NOMEM, "container key index exceeds local limit");
+  needed = s->keys.count + added;
+  if (needed <= s->keys.capacity)
+    return LC_OK;
+  capacity = s->keys.capacity ? s->keys.capacity : 64U;
+  while (capacity < needed) {
+    if (capacity > (size_t)-1 / sizeof(*buckets) / 2)
+      return err(error, LC_ERR_NOMEM,
+                 "container key index exceeds local limit");
+    capacity *= 2;
+  }
+  buckets = lc_calloc_with_allocator(NULL, capacity, sizeof(*buckets));
+  if (!buckets)
+    return err(error, LC_ERR_NOMEM, "cannot grow container key index");
+  for (i = 0; i < s->keys.capacity; ++i)
+    for (p = s->keys.buckets[i]; p; p = next) {
+      next = p->hash_next;
+      at = key_bucket(p->key, capacity);
+      p->hash_next = buckets[at];
+      buckets[at] = p;
+    }
+  lc_free_with_allocator(NULL, s->keys.buckets);
+  s->keys.buckets = buckets;
+  s->keys.capacity = capacity;
+  return LC_OK;
 }
 static size_t entry_bytes(const ps_entry *p) {
   size_t header = 64;
@@ -538,10 +574,11 @@ static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   head->stream_storage += entry_storage(p);
 }
 static void retire(ps_space *s, ps_entry *p) {
-  ps_entry **link = &s->buckets[bucket(p->key)];
+  ps_entry **link = &s->keys.buckets[key_bucket(p->key, s->keys.capacity)];
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
+  --s->keys.count;
   value_unregister(p);
   if (p->key.kind == PS_CATALOG)
     ps_catalog_unlink(s, p);
@@ -562,8 +599,8 @@ static void retire(ps_space *s, ps_entry *p) {
     --s->live_entries;
   }
 }
-static void install(ps_space *s, ps_entry *p) {
-  ps_entry *old = lookup(s, p->key);
+static void install(ps_space *s, ps_entry *p, ps_entry *old) {
+  size_t at = key_bucket(p->key, s->keys.capacity);
   p->previous = old;
   ps_internal_reserve_install(s, p, old);
   if (p->key.kind == PS_OWNED_RUN && !p->deleted)
@@ -571,8 +608,9 @@ static void install(ps_space *s, ps_entry *p) {
   if (old)
     retire(s, old);
   p->state = 1;
-  p->hash_next = s->buckets[bucket(p->key)];
-  s->buckets[bucket(p->key)] = p;
+  p->hash_next = s->keys.buckets[at];
+  s->keys.buckets[at] = p;
+  ++s->keys.count;
   if (immutable_key(p->key))
     value_register(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted)
@@ -3472,9 +3510,13 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
   rc = LC_OK;
   if (bytes > PS_JOURNAL - s->journal)
     rc = checkpoint_locked(s, error);
-  encode_entry(wire, p, s->sequence + 1, event);
-  if (rc == LC_OK)
+  if (rc == LC_OK && event == PS_PUT && s->keys.count == s->keys.capacity &&
+      !lookup(s, p->key))
+    rc = key_index_reserve(s, 1, error);
+  if (rc == LC_OK) {
+    encode_entry(wire, p, s->sequence + 1, event);
     rc = write_journal_frame(s, wire, bytes, error);
+  }
   if (wire != hint_frame)
     lc_free_with_allocator(NULL, wire);
   if (rc == LC_OK) {
@@ -3584,6 +3626,7 @@ static void destroy(ps_space *s) {
     lc_free_with_allocator(NULL, payload);
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
+  lc_free_with_allocator(NULL, s->keys.buckets);
   lc_free_with_allocator(NULL, s->journal_image);
   if (s->credit_record) {
     (void)munmap(s->credit_words, PS_PAGE);
@@ -3751,9 +3794,9 @@ typedef struct metadata_directory_entry {
   ps_entry *decoded;
 } metadata_directory_entry;
 typedef struct metadata_recovery {
-  ps_space *space;
+  ps_space *space, *resident;
   unsigned char *wire;
-  ps_entry_batch_builder *batch_entries;
+  ps_entry_batch_builder batch_entries;
   uint64_t cohort_origin;
   int certified_root;
   /* Directory order need not match the packing order of descriptor pages.
@@ -3974,13 +4017,19 @@ static int decode_directory_entry(metadata_recovery *recovery,
   ps_directory_value ref = item->ref;
   const unsigned char *wire = NULL;
   ps_entry *p = NULL;
+  ps_entry *old =
+      recovery->resident ? lookup(recovery->resident, item->key) : NULL;
+  ps_entry_batch_builder *batch = NULL;
   int event, rc;
+  if (old && old->token != ref.incarnation)
+    old = NULL;
+  if (!recovery->resident || old)
+    batch = &recovery->batch_entries;
   if (ref.bytes < 64 || ref.bytes > PS_JOURNAL)
     return err(error, LC_ERR_PROTOCOL, "invalid checkpoint descriptor span");
   rc = metadata_read(recovery, ref, &wire, error);
   if (rc == LC_OK)
-    rc = decode_entry(s, recovery->batch_entries, wire, (size_t)ref.bytes, &p,
-                      &event, error);
+    rc = decode_entry(s, batch, wire, (size_t)ref.bytes, &p, &event, error);
   if (rc == LC_OK &&
       (event != PS_PUT || !same_key(p->key, item->key) ||
        p->token != ref.incarnation || get64(wire + 8) > s->sequence))
@@ -3989,6 +4038,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
     if (!recovery->certified_root || get64(wire + 8) <= recovery->cohort_origin)
       p->stream_admitted = 0;
     p->checkpoint_ref = ref;
+    p->projection = old;
     item->decoded = p;
   } else if (p)
     entry_free(p);
@@ -3998,7 +4048,9 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
   ps_entry *p;
   size_t i, end, at;
-  int rc = LC_OK;
+  int rc = key_index_reserve(s, r->count, error);
+  if (rc != LC_OK)
+    return rc;
   /* Decode neighboring descriptors together. Logical installation still
    * follows the checked directory, including stream heads before runs. */
   qsort(r->entries, r->count, sizeof(*r->entries), metadata_physical_order);
@@ -4007,8 +4059,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
                                               : r->count;
     rc = metadata_read_ahead(r, i, end, error);
     for (; rc == LC_OK && i < end; ++i) {
-      if (r->batch_entries)
-        r->batch_entries->remaining = r->count - i;
+      r->batch_entries.remaining = r->count - i;
       rc = decode_directory_entry(r, &r->entries[i], error);
     }
   }
@@ -4035,7 +4086,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
       ps_catalog_apply_record(s, p, 0);
     r->entries[i].decoded = NULL;
     register_entry(s, p);
-    install(s, p);
+    install(s, p, NULL);
   }
   return LC_OK;
 }
@@ -4068,7 +4119,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
                            recovery_values *values, ps_entry ***out,
                            lc_error *error) {
   ps_entry **entries = NULL, *old;
-  size_t count, i, j, cursor = 64, member_bytes;
+  size_t count, i, j, cursor = 64, member_bytes, added = 0;
   int event, rc = LC_OK;
   count = get32(wire + 16);
   if (bytes < 64 || get32(wire) != REVISION_MAGIC || get32(wire + 4) != bytes ||
@@ -4102,6 +4153,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
         rc = err(error, LC_ERR_PROTOCOL, "duplicate revision member key");
     if (rc == LC_OK) {
       old = lookup(s, entries[i]->key);
+      added += old == NULL;
       if (old && !old->deleted && entries[i]->key.kind == PS_COLLECTION)
         rc = err(error, LC_ERR_PROTOCOL,
                  "revision overwrites collection position");
@@ -4112,6 +4164,8 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   if (rc == LC_OK && cursor != bytes)
     rc = err(error, LC_ERR_PROTOCOL, "revision has trailing members");
+  if (rc == LC_OK)
+    rc = key_index_reserve(s, added, error);
   if (rc == LC_OK) {
     *out = entries;
     return LC_OK;
@@ -4133,7 +4187,7 @@ static void install_revision(ps_space *s, ps_entry **entries, size_t count,
     }
     register_entry(s, p);
     dirty_entry(s, p, old);
-    install(s, p);
+    install(s, p, old);
   }
   s->sequence += count;
 }
@@ -4503,10 +4557,9 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
-                             int opening, lc_error *error) {
+                             ps_space *resident, lc_error *error) {
   ps_directory *directory = NULL;
   metadata_recovery *recovery = NULL;
-  ps_entry_batch_builder batch_entries = {0};
   int rc = initial_free(s, error);
   if (rc == LC_OK && s->directory.offset)
     rc = directory_open(s, s->directory, &directory, error);
@@ -4517,9 +4570,9 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   }
   if (rc == LC_OK && recovery) {
     recovery->space = s;
-    /* During live adoption most entries bind to resident incarnations.
-     * Those temporary entries must be independently releasable. */
-    recovery->batch_entries = opening ? &batch_entries : NULL;
+    /* A live batch groups entries already bound to the same resident
+     * incarnation. Only independent allocations can become new residents. */
+    recovery->resident = resident;
     recovery->wire = wire;
     recovery->certified_root = certificate->root == s->generation;
     recovery->cohort_origin = certificate->origin;
@@ -4530,7 +4583,7 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   if (rc == LC_OK && recovery && recovery->count)
     rc = recover_directory_bindings(recovery, error);
   if (recovery) {
-    entry_batch_release(batch_entries.open);
+    entry_batch_release(recovery->batch_entries.open);
     metadata_recovery_close(recovery);
   }
   if (rc == LC_OK)
@@ -4597,6 +4650,11 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   int rc;
   old = lookup(s, p->key);
   if (event == PS_PUT) {
+    if (!old) {
+      rc = key_index_reserve(s, 1, error);
+      if (rc != LC_OK)
+        return rc;
+    }
     if (p->key.kind == PS_OWNED_RUN) {
       if (p->owned_mapped) {
         head = stream_lookup(s, p->key.owner);
@@ -4670,7 +4728,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   }
   register_entry(s, p);
   dirty_entry(s, p, old);
-  install(s, p);
+  install(s, p, old);
   return LC_OK;
 }
 static int recover(ps_space *s, lc_error *error) {
@@ -4732,7 +4790,7 @@ static int recover(ps_space *s, lc_error *error) {
     goto done;
   }
   values->packed.offset = 0;
-  rc = recover_directory(s, wire, &certificate, 1, error);
+  rc = recover_directory(s, wire, &certificate, NULL, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -5092,9 +5150,10 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     }
   }
   s->entries = projected(v->entries);
+  for (i = 0; i < v->keys.capacity; ++i)
+    v->keys.buckets[i] = projected(v->keys.buckets[i]);
   for (i = 0; i < BUCKETS; ++i) {
     ps_entry **link;
-    s->buckets[i] = projected(v->buckets[i]);
     s->value_buckets[i] = projected(v->value_buckets[i]);
     for (link = &s->value_buckets[i]; *link; link = &(*link)->value_next)
       (*link)->value_link = link;
@@ -5142,6 +5201,7 @@ static void projection_install(ps_space *s, ps_space *v) {
     v->field = previous;                                                       \
   } while (0)
   PROJECTION_SWAP(free, ps_run *);
+  PROJECTION_SWAP(keys, ps_key_index);
   PROJECTION_SWAP(metadata_free, ps_run *);
   PROJECTION_SWAP(pinned_free, ps_run *);
   PROJECTION_SWAP(pages, ps_meta_page *);
@@ -5201,19 +5261,18 @@ static int projection_stage(ps_space *s, ps_space *v,
                             lc_error *error) {
   ps_entry *p, *old;
   size_t i;
-  int rc = recover_directory(v, v->journal_image, certificate, 0, error);
+  int rc = recover_directory(v, v->journal_image, certificate, s, error);
   if (rc != LC_OK)
     return rc;
   /* The checkpoint prefix covers the resident journal. Consequently only
    * checkpoint entries, including those superseded by the following tail,
    * can match an existing incarnation. Bind them before decoding that tail. */
   for (p = v->entries; p; p = p->all_next) {
-    old = lookup(s, p->key);
-    if (old && old->token == p->token) {
+    old = p->projection;
+    if (old) {
       if (!projection_same(old, p))
         return err(error, LC_ERR_PROTOCOL,
                    "checkpoint changes an existing incarnation");
-      p->projection = old;
       if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
         p->bytes = old->bytes;
         p->stream_admitted = 0;
@@ -5230,9 +5289,10 @@ static int projection_stage(ps_space *s, ps_space *v,
   /* Overlay only continuously retained ownership. Unpinned old canonical
    * ranges may already have been reused by peers; never retire them here. */
   for (p = s->entries; p; p = p->all_next) {
+    if (p->state != 0 && !p->pins && !p->catalog_pins)
+      continue;
     old = lookup(v, p->key);
-    if ((old && old->projection == p) ||
-        (p->state != 0 && !p->pins && !p->catalog_pins))
+    if (old && old->projection == p)
       continue;
     for (i = 0; i < p->count; ++i) {
       rc = payload_claim(v, &p->extents[i], error);
@@ -5915,7 +5975,7 @@ static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
     w->entry->value_checked = 1;
     old = lookup(s, w->entry->key); /* rollover may have retired a tombstone */
     dirty_entry(s, w->entry, old);
-    install(s, w->entry);
+    install(s, w->entry, old);
     w->published = 1;
     rc = entry_release_claims(s, w->entry, error);
     sequence = w->entry->publication_sequence;
@@ -6054,6 +6114,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
   if (rc == LC_OK && deletion && (flags & PS_REVISION_ADMIT_RESERVE) &&
       ps_coordination_shared(s->coordination))
     rc = ps_internal_reserve_recheck(s, deletion, error);
+  if (rc == LC_OK)
+    rc = key_index_reserve(s, (size_t)added, error);
   if (rc == LC_OK) {
     memset(wire, 0, 64);
     put32(wire, REVISION_MAGIC);
@@ -6083,7 +6145,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
       p->durable_visibility = durable;
       p->value_checked = 1;
       dirty_entry(s, p, old);
-      install(s, p);
+      install(s, p, old);
       writers[i]->published = 1;
       if (refs) {
         memcpy(refs[i].container, s->identity, sizeof(refs[i].container));
@@ -7016,7 +7078,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     register_entry(s, tombstone);
     dirty_entry(s, tombstone, p);
-    install(s, tombstone);
+    install(s, tombstone, p);
     sequence = tombstone->publication_sequence;
   } else
     entry_free(tombstone);
@@ -7475,7 +7537,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
       p->publication_sequence = sequence;
       register_entry(s, p);
       dirty_entry(s, p, old);
-      install(s, p);
+      install(s, p, old);
     }
   }
   if (!create)
@@ -8032,7 +8094,7 @@ select_run:
     p->publication_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     dirty_entry(s, p, NULL);
-    install(s, p);
+    install(s, p, lookup(s, p->key));
     /* Transfer private range witnesses directly to the returned run. */
     (void)ps_internal_entry_pin(s, p, NULL);
     rc = entry_release_claims(s, p, error);
@@ -8622,7 +8684,7 @@ static int piece_publish(void *context, lc_error *error) {
     tombstone->publication_sequence = sequence;
     register_entry(s, tombstone);
     dirty_entry(s, tombstone, old);
-    install(s, tombstone);
+    install(s, tombstone, old);
     selection->tombstone = NULL;
     selection->sequence = sequence;
     selection->published = 1;
@@ -9080,7 +9142,7 @@ void ps_internal_install(ps_space *s, ps_entry *p) {
   ps_entry *old = lookup(s, p->key);
   register_entry(s, p);
   dirty_entry(s, p, old);
-  install(s, p);
+  install(s, p, old);
 }
 void ps_internal_remove(ps_space *s, ps_entry *p, uint64_t sequence) {
   mark_removed(s, p, sequence);
