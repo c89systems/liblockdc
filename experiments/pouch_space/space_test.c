@@ -6,6 +6,7 @@
 #include "lc_pouch_record.h"
 #include "owned.h"
 #include "space.h"
+#include "space_internal.h"
 #include "stream.h"
 #include <dirent.h>
 #include <errno.h>
@@ -1180,7 +1181,7 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
     OK(rc);
     /* This is an I/O bound, not an on-disk encoding assertion. Cleanup must
      * not dirty a clean 128 KiB journal or an already retired root. */
-    CHECK(m.syncs == 1);
+    CHECK(m.syncs == (layout == 4 ? 2U : 1U));
     if (layout == 0)
       CHECK(m.writes == 1 && m.write_bytes <= PS_PAGE);
     else if (layout == 1 || layout == 4 || layout == 5)
@@ -1250,7 +1251,7 @@ static void reopen_sanitization(void) {
   size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
   memcpy(root, m.stable + offset, sizeof(root));
   fixture_put(root + 72, PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_FIXED_GRANTS, 4);
-  fixture_put(root + 76, crc32(0, root, 76), 4);
+  fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
   fd = open(path, O_RDWR);
   CHECK(fd >= 0 &&
         pwrite(fd, root, sizeof(root), (off_t)offset) == (ssize_t)sizeof(root));
@@ -7239,7 +7240,7 @@ static void piece_incremental(int durable) {
     if (fixture_get64(root)) {
       CHECK((uint32_t)fixture_get64(root + 72) == PS_ROOT_LAYOUT);
       fixture_put(root + 72, PS_RUN_IDENTITY_BYTES, 4);
-      fixture_put(root + 76, crc32(0, root, 76), 4);
+      fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
       CHECK(pwrite(fd, root, sizeof(root), (off_t)(slot * PS_PAGE)) ==
             sizeof(root));
     }

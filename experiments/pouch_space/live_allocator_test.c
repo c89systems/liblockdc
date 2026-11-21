@@ -487,7 +487,8 @@ static void fence(void) {
                           &guard, &e),
      &e);
   ps_readiness_begin(a, PS_READINESS_JOURNAL);
-  REQUIRE(pwrite(a->fd, rejected, sizeof(rejected), PS_JOURNAL_OFFSET) ==
+  REQUIRE(pwrite(a->fd, rejected, sizeof(rejected),
+                 (off_t)JOURNAL_POSITION(a->journal_start)) ==
           (ssize_t)sizeof(rejected));
   ps_coordination_unlock(guard);
   REQUIRE(ps_budget_open(a, &plan, &budget, &e) == LC_ERR_PENDING && !budget);
@@ -1956,11 +1957,13 @@ static int projection_sync(void *context, int fd) {
 static ssize_t projection_write(void *context, int fd, const void *bytes,
                                 size_t n, off_t offset) {
   projection_io *m = context;
-  if (m->armed && m->phase >= 4 && offset == PS_JOURNAL_OFFSET) {
+  if (m->armed && m->phase >= 4 && offset >= PS_JOURNAL_OFFSET &&
+      offset < PS_DATA) {
     /* The selected root is durable. Stop after erasing only part of its
      * predecessor's journal so no valid header can describe the old tail. */
-    REQUIRE(m->syncs == 2 && n >= 64 && !((const unsigned char *)bytes)[0]);
-    REQUIRE(pwrite(fd, bytes, 32, offset) == 32);
+    size_t piece = n < 32 ? n : 32;
+    REQUIRE(m->syncs == 2 && piece && !((const unsigned char *)bytes)[0]);
+    REQUIRE(pwrite(fd, bytes, piece, offset) == (ssize_t)piece);
     REQUIRE(write(m->ready, "R", 1) == 1);
     for (;;)
       pause();
@@ -2514,7 +2517,11 @@ static void projection_recovery(void) {
       REQUIRE(status(join).syncs == 1);
     }
     ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
-    REQUIRE(status(s).syncs == before.syncs + (phase == 5 ? 0 : 1));
+    /* At the second barrier the successor header can be readable without
+     * being durable. Stabilize it before doing any predecessor retirement. */
+    REQUIRE(status(s).syncs == before.syncs + (phase == 2   ? 2
+                                               : phase == 5 ? 0
+                                                            : 1));
     captured_expect(old, 1, 65);
     captured_expect(current, 1, 1000);
     ps_reader_close(old);
@@ -2817,25 +2824,22 @@ static void projection_boundaries(void) {
   capture_put(b, 3, 65);
   uint64_t generation = a->generation, claims = coverage(NULL, 0);
   unsigned char pending[64], erased[64] = {0};
-  REQUIRE(pread(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
-          sizeof(pending));
-  REQUIRE(pwrite(b->fd, erased, sizeof(erased), PS_JOURNAL_OFFSET) ==
-          sizeof(erased));
+  off_t origin = (off_t)JOURNAL_POSITION(b->journal_start);
+  REQUIRE(pread(b->fd, pending, sizeof(pending), origin) == sizeof(pending));
+  REQUIRE(pwrite(b->fd, erased, sizeof(erased), origin) == sizeof(erased));
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
   lc_error_cleanup(&e);
   REQUIRE(coverage(NULL, 0) == claims);
-  REQUIRE(pwrite(b->fd, pending, sizeof(pending), PS_JOURNAL_OFFSET) ==
-          sizeof(pending));
+  REQUIRE(pwrite(b->fd, pending, sizeof(pending), origin) == sizeof(pending));
   ok(ps_refresh(a, &e), &e);
   REQUIRE(a->generation == b->generation && a->sequence == b->sequence);
   unsigned char prefix[64], damaged[64];
-  REQUIRE(pread(b->fd, prefix, sizeof(prefix), PS_JOURNAL_OFFSET) ==
-          sizeof(prefix));
+  REQUIRE(pread(b->fd, prefix, sizeof(prefix), origin) == sizeof(prefix));
   memset(damaged, 0xa5, sizeof(damaged));
   capture_put(b, 4, 65);
   ok(ps_checkpoint(b, &e), &e);
-  REQUIRE(pwrite(b->fd, damaged, sizeof(damaged), PS_JOURNAL_OFFSET) ==
-          sizeof(damaged));
+  origin = (off_t)JOURNAL_POSITION(b->journal_start);
+  REQUIRE(pwrite(b->fd, damaged, sizeof(damaged), origin) == sizeof(damaged));
   generation = a->generation;
   REQUIRE(ps_refresh(a, &e) == LC_ERR_PENDING && a->generation == generation);
   lc_error_cleanup(&e);
@@ -2847,6 +2851,107 @@ static void projection_boundaries(void) {
   ok(ps_close(a, &e), &e);
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
+}
+static void journal_fixture_number(unsigned char *p, uint64_t value,
+                                   size_t bytes) {
+  for (size_t i = 0; i < bytes; ++i) {
+    p[i] = (unsigned char)value;
+    value >>= 8;
+  }
+}
+static void journal_wrap(int successor) {
+  const uint64_t start = PS_JOURNAL - 96;
+  unsigned char prior[PS_ROOT_BYTES], erased[PS_ROOT_BYTES] = {0};
+  unsigned char covered[96];
+  ps_space *writer = NULL, *peer = NULL;
+  lc_error e = {0};
+  off_t previous, next;
+  size_t prefix, suffix;
+  int fd;
+
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  REQUIRE(!writer->journal);
+  previous = (off_t)writer->root * PS_PAGE;
+  REQUIRE(pread(writer->fd, prior, sizeof(prior), previous) == sizeof(prior));
+  ok(ps_close(writer, &e), &e);
+  /* Start an empty journal just before the wrap. The ordinary checkpoint
+   * will select the actual next cursor after its completed frame. */
+  journal_fixture_number(prior + ROOT_JOURNAL_START, start, 8);
+  journal_fixture_number(prior + ROOT_CHECKSUM, crc32(0, prior, ROOT_CHECKSUM),
+                         4);
+  fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0);
+  REQUIRE(pwrite(fd, prior, sizeof(prior), previous) == sizeof(prior));
+  REQUIRE(!fdatasync(fd) && !close(fd));
+
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  REQUIRE(writer->journal_start == start);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  capture_put(writer, 1, 65);
+  prefix = writer->journal;
+  REQUIRE(prefix == 88 && prefix < sizeof(covered));
+  REQUIRE(pread(writer->fd, covered, prefix, (off_t)JOURNAL_POSITION(start)) ==
+          (ssize_t)prefix);
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(writer->journal_start == start + prefix && !writer->journal);
+  next = (off_t)writer->root * PS_PAGE;
+  REQUIRE(next != previous);
+  ok(ps_refresh(peer, &e), &e);
+  REQUIRE(peer->journal_start == writer->journal_start);
+  capture_put(writer, 2, 65);
+  suffix = writer->journal;
+  REQUIRE(suffix > PS_JOURNAL - (writer->journal_start % PS_JOURNAL));
+  ok(ps_flush(writer, &e), &e);
+  index_expect(peer, 1, 65, &e);
+  index_expect(peer, 2, 65, &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+
+  /* Restore the predecessor's recoverable bytes while leaving the accepted
+   * wrapped suffix in place. Both selectors must reach that same suffix. */
+  fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0);
+  REQUIRE(pwrite(fd, prior, sizeof(prior), previous) == sizeof(prior));
+  REQUIRE(pwrite(fd, covered, prefix, (off_t)JOURNAL_POSITION(start)) ==
+          (ssize_t)prefix);
+  if (!successor)
+    REQUIRE(pwrite(fd, erased, sizeof(erased), next) == sizeof(erased));
+  REQUIRE(!fdatasync(fd) && !close(fd));
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  REQUIRE(writer->journal_start == start + (successor ? prefix : 0));
+  REQUIRE(writer->journal == suffix + (successor ? 0 : prefix));
+  index_expect(writer, 1, 65, &e);
+  index_expect(writer, 2, 65, &e);
+
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(writer->journal_start == start + prefix + suffix);
+  capture_put(writer, 3, 65);
+  ok(ps_flush(writer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  for (uint64_t key_id = 1; key_id <= 3; ++key_id)
+    index_expect(writer, key_id, 65, &e);
+  if (successor) {
+    ok(ps_checkpoint(writer, &e), &e);
+    uint64_t full_start = writer->journal_start;
+    uint64_t generation = writer->generation;
+    for (size_t i = 0; i < PS_JOURNAL / 64; ++i)
+      capture_put(writer, 4, 0);
+    REQUIRE(writer->journal == PS_JOURNAL && writer->generation == generation);
+    /* A full logical turn leaves the same physical offset. The next append
+     * must still advance the durable cursor and retire the complete turn. */
+    capture_put(writer, 5, 65);
+    REQUIRE(writer->journal == 88 && writer->generation == generation + 1 &&
+            writer->journal_start == full_start + PS_JOURNAL);
+    ok(ps_flush(writer, &e), &e);
+    ok(ps_close(writer, &e), &e);
+    ok(ps_open(path, 0, NULL, &writer, &e), &e);
+    index_expect(writer, 4, 0, &e);
+    index_expect(writer, 5, 65, &e);
+  }
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
 }
 static void projection_pressure(void) {
   lc_error e = {0};
@@ -3770,7 +3875,7 @@ static void reopen_cohort(void) {
                           &guard, &e),
      &e);
   ps_readiness_begin(first, PS_READINESS_JOURNAL);
-  off_t suffix = PS_JOURNAL_OFFSET + PS_JOURNAL - 1;
+  off_t suffix = (off_t)JOURNAL_POSITION(first->journal_start + PS_JOURNAL - 1);
   REQUIRE(pwrite(first->fd, &byte, 1, suffix) == 1);
   REQUIRE(!fdatasync(first->fd));
   ps_coordination_unlock(guard);
@@ -4482,8 +4587,8 @@ static void projection_tail(void) {
   ok(ps_publish(residue_writer, NULL, &e), &e);
   ps_writer_close(residue_writer);
   REQUIRE(b->journal == sizeof(residue));
-  REQUIRE(pread(b->fd, residue, sizeof(residue), PS_JOURNAL_OFFSET) ==
-          sizeof(residue));
+  REQUIRE(pread(b->fd, residue, sizeof(residue),
+                (off_t)JOURNAL_POSITION(b->journal_start)) == sizeof(residue));
   ok(ps_budget_open(a, &plan, &budget, &e), &e);
   producer = private_value(a, budget, 9000);
   capture_put(b, 6, 65);
@@ -4505,7 +4610,7 @@ static void projection_tail(void) {
   /* The first tail operation is valid. Damage the following atomic group
    * and verify even the valid deletion stays outside our live projection. */
   unsigned char last, damaged;
-  off_t end = (off_t)(PS_JOURNAL_OFFSET + b->journal - 1);
+  off_t end = (off_t)JOURNAL_POSITION(b->journal_start + b->journal - 1);
   REQUIRE(pread(b->fd, &last, 1, end) == 1);
   damaged = last ^ 1;
   REQUIRE(pwrite(b->fd, &damaged, 1, end) == 1);
@@ -4587,7 +4692,7 @@ static void journal_replay_faults(void) {
     size_t cursor = a->journal;
     if (!failure) {
       unsigned char original, damaged;
-      off_t last = (off_t)(PS_JOURNAL_OFFSET + b->journal - 1);
+      off_t last = (off_t)JOURNAL_POSITION(b->journal_start + b->journal - 1);
       REQUIRE(pread(b->fd, &original, 1, last) == 1);
       damaged = original ^ 1;
       REQUIRE(pwrite(b->fd, &damaged, 1, last) == 1);
@@ -7071,6 +7176,9 @@ int main(int argc, char **argv) {
     quarantine_packed();
     witness_filter();
     witness_projection();
+  } else if (!strcmp(argv[2], "journal-wrap")) {
+    journal_wrap(0);
+    journal_wrap(1);
   } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
   else if (!strcmp(argv[2], "journal-replay-retired"))

@@ -184,6 +184,19 @@ static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
   }
   return LC_OK;
 }
+static int journal_transfer(ps_space *s, uint64_t cursor, void *bytes,
+                            size_t count, int writing, lc_error *error) {
+  uint64_t offset = JOURNAL_POSITION(cursor);
+  size_t first = (size_t)(PS_DATA - offset);
+  int rc;
+  if (first > count)
+    first = count;
+  rc = transfer(s, bytes, first, offset, writing, error);
+  if (rc == LC_OK && first < count)
+    rc = transfer(s, (unsigned char *)bytes + first, count - first,
+                  JOURNAL_OFFSET, writing, error);
+  return rc;
+}
 static int zero_file_range(ps_space *s, uint64_t offset, uint64_t bytes) {
   int rc;
   do {
@@ -3091,10 +3104,11 @@ static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
   lc_free_with_allocator(NULL, slots);
   return rc;
 }
-static int clear_checkpoint_journal(ps_space *s, unsigned char *image,
-                                    size_t bytes, lc_error *error) {
+static int clear_checkpoint_journal(ps_space *s, uint64_t cursor,
+                                    unsigned char *image, size_t bytes,
+                                    lc_error *error) {
   memset(image, 0, bytes);
-  return transfer(s, image, bytes, JOURNAL_OFFSET, 1, error);
+  return journal_transfer(s, cursor, image, bytes, 1, error);
 }
 #define CHECKPOINT_ZERO_RANGES 16U
 typedef struct checkpoint_zero_range {
@@ -3138,6 +3152,8 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   ps_run *trim = NULL;
   uint64_t bound, extra, incremental, floor = PS_MAINTENANCE_RESERVE;
   uint64_t prepared = 0;
+  size_t covered = s->journal_image ? s->journal : 0;
+  uint64_t journal_start = s->journal_start;
   checkpoint_zero_range zero_ranges[CHECKPOINT_ZERO_RANGES];
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0}, empty = {0};
@@ -3148,6 +3164,9 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   if (s->generation == UINT64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
+  if (covered > UINT64_MAX - journal_start - PS_JOURNAL)
+    return err(error, LC_ERR_INVALID, "container journal cursor exhausted");
+  journal_start += covered;
   memset(&builder, 0, sizeof(builder));
   builder.space = s;
   if (force_dense)
@@ -3223,19 +3242,22 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   put64(root + 48, s->token_limit);
   memcpy(root + 56, s->identity, 16);
   put32(root + 72, PS_ROOT_LAYOUT);
-  put32(root + 76, checksum(root, 76));
+  put32(root + ROOT_JOURNAL_COVERED, (uint32_t)covered);
+  put64(root + ROOT_JOURNAL_START, journal_start);
+  put32(root + ROOT_CHECKSUM, checksum(root, ROOT_CHECKSUM));
   if (rc == LC_OK) {
     ps_readiness_begin(s, PS_READINESS_ROOT);
     rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
   }
   if (rc == LC_OK)
     rc = sync_file(s, error);
-  if (rc == LC_OK && s->journal_image && s->journal)
+  if (rc == LC_OK && covered)
     ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
   if (rc == LC_OK)
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
-  if (rc == LC_OK && s->journal_image && s->journal)
-    rc = clear_checkpoint_journal(s, s->journal_image, s->journal, error);
+  if (rc == LC_OK && covered)
+    rc = clear_checkpoint_journal(s, s->journal_start, s->journal_image,
+                                  covered, error);
   if (rc == LC_OK) {
     prepared = ps_readiness_issued_tickets(s);
     rc = sync_file(s, error); /* obsolete root and covered journal retired */
@@ -3260,6 +3282,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   ++s->checkpoints;
   s->metadata_fallbacks += dense;
   s->directory = new_root;
+  s->journal_start = journal_start;
   s->journal = 0;
   rc = ps_readiness_stabilize(s, s->sequence, s->generation, prepared, error);
   if (rc != LC_OK) {
@@ -3486,7 +3509,8 @@ static int write_journal_frame(ps_space *s, unsigned char *wire, size_t bytes,
     length += marker;
   }
   ps_readiness_begin(s, PS_READINESS_JOURNAL);
-  rc = transfer(s, wire, length, JOURNAL_OFFSET + s->journal, 1, error);
+  rc = journal_transfer(s, s->journal_start + s->journal, wire, length, 1,
+                        error);
   if (rc == LC_OK && s->journal_image)
     memcpy(s->journal_image + s->journal, wire, length);
   return rc;
@@ -3666,6 +3690,8 @@ static int random_bytes(void *bytes, size_t n, lc_error *error) {
 static int root_valid(const unsigned char *p) {
   uint64_t capacity = get64(p + 16);
   uint64_t offset = get64(p + 32), generation = get64(p + 40);
+  uint64_t journal_start = get64(p + ROOT_JOURNAL_START);
+  uint32_t covered = get32(p + ROOT_JOURNAL_COVERED);
   return get64(p) == ROOT_MAGIC && get64(p + 8) && capacity >= PS_MIB &&
          capacity <= PS_MAX_CAPACITY && capacity % PS_MIB == 0 &&
          ((!offset && !generation) ||
@@ -3675,7 +3701,17 @@ static int root_valid(const unsigned char *p) {
            generation <= get64(p + 8))) &&
          get64(p + 48) && get64(p + 48) <= PS_MAX_INCARNATION &&
          get64(p + 48) % TOKEN_RANGE == 0 && get32(p + 72) == PS_ROOT_LAYOUT &&
-         checksum(p, 76) == get32(p + 76);
+         journal_start <= UINT64_MAX - PS_JOURNAL && covered <= PS_JOURNAL &&
+         covered <= journal_start &&
+         checksum(p, ROOT_CHECKSUM) == get32(p + ROOT_CHECKSUM);
+}
+static int root_follows(const unsigned char *root, const unsigned char *prior) {
+  return !memcmp(root + 56, prior + 56, 16) &&
+         get64(root + 8) - 1 == get64(prior + 8) &&
+         get64(root + 24) >= get64(prior + 24) &&
+         get64(root + ROOT_JOURNAL_START) -
+                 get32(root + ROOT_JOURNAL_COVERED) ==
+             get64(prior + ROOT_JOURNAL_START);
 }
 static int checkpoint_retirement(const ps_readiness_certificate *certificate,
                                  uint64_t generation, uint64_t sequence,
@@ -3743,7 +3779,8 @@ static int canonical_journal(ps_space *s,
   observe_local_durability(s);
   while ((verify_end || s->sequence < certificate->ready) &&
          s->journal <= PS_JOURNAL - sizeof(next)) {
-    rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
+    rc = journal_transfer(s, s->journal_start + s->journal, next, sizeof(next),
+                          0, error);
     if (rc != LC_OK)
       return rc;
     if (!memcmp(next, s->journal_image + s->journal, sizeof(next)))
@@ -4512,8 +4549,8 @@ static int replay_frame(ps_space *s, const unsigned char *prefix,
     if (!body)
       return err(error, LC_ERR_NOMEM, "cannot load certified journal frame");
     memcpy(body, prefix, 64);
-    rc = transfer(s, body + 64, bytes - 64, JOURNAL_OFFSET + s->journal + 64, 0,
-                  error);
+    rc = journal_transfer(s, s->journal_start + s->journal + 64, body + 64,
+                          bytes - 64, 0, error);
     wire = body;
   }
   if (rc == LC_OK)
@@ -4754,19 +4791,17 @@ static int recover(ps_space *s, lc_error *error) {
   b = root_valid(roots[1]);
   if (!a && !b)
     return err(error, LC_ERR_PROTOCOL, "no recoverable container root");
-  if (a && b &&
-      (memcmp(roots[0] + 56, roots[1] + 56, 16) == 0
-           ? get64(roots[0] + 8) == get64(roots[1] + 8)
-           : 1))
-    return err(error, LC_ERR_PROTOCOL, "conflicting container roots");
   s->root = b && (!a || get64(roots[1] + 8) > get64(roots[0] + 8));
   root = roots[s->root];
+  if (a && b && !root_follows(root, roots[1 - s->root]))
+    return err(error, LC_ERR_PROTOCOL, "conflicting container roots");
   s->generation = get64(root + 8);
   s->capacity = get64(root + 16);
   s->sequence = get64(root + 24);
   s->directory.offset = get64(root + 32);
   s->directory.generation = get64(root + 40);
   s->token_limit = get64(root + 48);
+  s->journal_start = get64(root + ROOT_JOURNAL_START);
   memcpy(s->identity, root + 56, 16);
   rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
                           roots[1] + PS_TOKEN_RECORD_OFFSET, &grant_limit,
@@ -4794,7 +4829,7 @@ static int recover(ps_space *s, lc_error *error) {
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
-  rc = transfer(s, wire, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
+  rc = journal_transfer(s, s->journal_start, wire, PS_JOURNAL, 0, error);
   if (rc != LC_OK)
     goto done;
   cursor = 0;
@@ -4887,13 +4922,21 @@ static int recover(ps_space *s, lc_error *error) {
     --last;
   retire_sibling = memcmp(roots[1 - s->root], zero, sizeof(zero)) != 0;
   retirement_needed = first < last || retire_sibling;
+  /* A process can die with the new selector readable but unsynced. Fence
+   * it before erasing bytes needed by a still-valid predecessor. */
+  if (a && b && certificate.root < s->generation &&
+      !(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE)) {
+    rc = sync_file(s, error);
+    if (rc != LC_OK)
+      goto done;
+  }
   if (retirement_needed)
     ps_readiness_begin(s, PS_READINESS_RECOVERY);
   if (first < last) {
     memset(wire + first, 0, last - first);
     ps_readiness_begin(s, PS_READINESS_JOURNAL);
-    rc = transfer(s, wire + first, last - first, JOURNAL_OFFSET + first, 1,
-                  error);
+    rc = journal_transfer(s, s->journal_start + first, wire + first,
+                          last - first, 1, error);
     if (rc != LC_OK)
       goto done;
   }
@@ -4991,9 +5034,18 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
                               uint64_t certified, lc_error *error) {
   static const unsigned char zero[64] = {0};
   const unsigned char *p;
-  size_t bytes;
+  size_t bytes, loaded = 0;
   uint32_t magic;
-  int rc = transfer(v, v->journal_image, PS_JOURNAL, JOURNAL_OFFSET, 0, error);
+  int rc;
+  if (checkpoint == certified) {
+    loaded = sizeof(zero);
+    rc = journal_transfer(v, v->journal_start, v->journal_image, loaded, 0,
+                          error);
+    if (rc != LC_OK || !memcmp(v->journal_image, zero, loaded))
+      return rc;
+  }
+  rc = journal_transfer(v, v->journal_start + loaded, v->journal_image + loaded,
+                        PS_JOURNAL - loaded, 0, error);
   if (rc != LC_OK)
     return rc;
   while (v->journal <= PS_JOURNAL - 64) {
@@ -5231,6 +5283,7 @@ static void projection_install(ps_space *s, ps_space *v) {
   s->generation = v->generation;
   s->sequence = v->sequence;
   s->token_limit = v->token_limit;
+  s->journal_start = v->journal_start;
   s->journal = v->journal;
   s->directory = v->directory;
   s->metadata = v->metadata;
@@ -5334,6 +5387,7 @@ static int projection_load(ps_space *s, ps_space *v, const unsigned char *root,
   v->directory.offset = get64(root + 32);
   v->directory.generation = get64(root + 40);
   v->token_limit = get64(root + 48);
+  v->journal_start = get64(root + ROOT_JOURNAL_START);
   memcpy(v->identity, s->identity, 16);
   v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
   if (!v->journal_image)
@@ -5382,7 +5436,7 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
-  int retiring_journal;
+  int retiring_journal, retired_certificate;
   ps_readiness_certificate certificate;
   rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
@@ -5403,9 +5457,7 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   selected = b && (!a || get64(roots + PS_ROOT_BYTES + 8) > get64(roots + 8));
   root = roots + selected * PS_ROOT_BYTES;
   if ((!a && !b) || memcmp(root + 56, s->identity, 16) ||
-      (a && b &&
-       (get64(roots + 8) == get64(roots + PS_ROOT_BYTES + 8) ||
-        memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16)))) {
+      (a && b && !root_follows(root, roots + (1 - selected) * PS_ROOT_BYTES))) {
     ps_readiness_begin(s, PS_READINESS_ROOT);
     return err(error, LC_ERR_PROTOCOL,
                "conflicting checkpoint projection roots");
@@ -5416,8 +5468,14 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
                              error);
   if (rc != LC_OK)
     return rc;
-  retiring_journal =
+  retired_certificate =
       (certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) != 0;
+  /* A successor that covers the entire certified prefix can still have
+   * residue from its predecessor at the wrap. Its own window is empty. */
+  retiring_journal =
+      retired_certificate || (get64(root + 8) > certificate.root &&
+                              get64(root + 24) == certificate.ready &&
+                              get32(root + ROOT_JOURNAL_COVERED));
   if (get64(root + 8) == s->generation)
     return canonical_journal(s, &certificate, 1, 1, error);
   if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
@@ -5495,6 +5553,12 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   if (rc == LC_OK)
     rc = metadata_bound(v->metadata, v->live_entries, &v->metadata_workspace,
                         error);
+  if (rc == LC_OK && a && b && certificate.root < v->generation &&
+      !retired_certificate) {
+    rc = sync_file(s, error);
+    if (rc == LC_OK && retiring_journal)
+      ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
+  }
   /* Even apparently zero sibling bytes can be an abandoned cached retirement
    * whose barrier never completed. Stabilize that retirement before admitting
    * any of its ranges. This is a structural adoption barrier, not a journal
@@ -5507,8 +5571,12 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
                   error);
   }
-  if (rc == LC_OK && retiring_journal)
-    rc = clear_checkpoint_journal(s, v->journal_image, PS_JOURNAL, error);
+  if (rc == LC_OK && retiring_journal) {
+    size_t covered = get32(root + ROOT_JOURNAL_COVERED);
+    rc = clear_checkpoint_journal(s, v->journal_start - covered,
+                                  v->journal_image, covered, error);
+    memset(v->journal_image, 0, 64);
+  }
   if (rc == LC_OK &&
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {

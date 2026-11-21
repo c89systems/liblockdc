@@ -22,6 +22,10 @@ typedef struct ps_catalog_index {
 #define REVISION_MAGIC UINT32_C(0x31525350)
 #define BUCKETS 257U
 #define JOURNAL_OFFSET PS_JOURNAL_OFFSET
+#define JOURNAL_POSITION(cursor) (JOURNAL_OFFSET + ((cursor) % PS_JOURNAL))
+#define ROOT_JOURNAL_COVERED 76U
+#define ROOT_JOURNAL_START 80U
+#define ROOT_CHECKSUM 88U
 #define META_MAGIC UINT32_C(0x3141544d)
 #define META_HEADER 64U
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
@@ -151,6 +155,9 @@ struct ps_space {
   uint64_t token_next, token_end, token_limit;
   /* Observed control journal for shared revision comparison, never bodies. */
   unsigned char *journal_image;
+  /* Monotonic byte position selected by the root. The resident buffer and
+   * journal length are linear relative to this cursor. */
+  uint64_t journal_start;
   uint64_t pending_sequence, durable_sequence;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   size_t journal, metadata, readers, writers;

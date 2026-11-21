@@ -12781,3 +12781,71 @@ must preserve those accepted bytes on either side of root selection,
 including physical wrap, and stabilize retirement before reusing covered
 space. Journal exhaustion during preparation needs a bounded completion
 or fallback path at 10 MiB.
+
+## Persisted cursor for the rolling journal
+
+The root selector records an absolute journal byte position and the
+length it retires from its predecessor. These fields are inside the
+root checksum. The shared checkpoint moves the origin by the covered
+length and clears that exact range after the selection barrier. Two
+valid selectors must agree on the predecessor boundary before recovery
+can retire its bytes. A logical window of up to 128 KiB uses at most two
+physical ranges, and a complete turn advances the logical origin even
+when the physical offset repeats. The layout marker requires fresh
+prototype files.
+
+An interrupted checkpoint can leave a readable successor header before
+its selection barrier completes. Recovery now stabilizes that header
+before modifying either the predecessor selector or its journal. A live
+retirement certificate can already prove that barrier. A clean checkpoint
+adoption with a certified empty suffix reads the end marker first and can
+skip the full-window read.
+
+The wrap fixture drives ordinary append, checkpoint, peer replay, and
+cold recovery entry points. It restores the predecessor selector and
+covered bytes while preserving the same physically wrapped, accepted
+suffix. It verifies the result with either the predecessor or both
+selectors present. It also fills a complete logical turn and verifies
+automatic rollover at the same physical offset. The live recovery fixture
+kills the checkpoint owner at the selection and retirement boundaries.
+It verifies the additional stabilization when the new selector is
+readable before its barrier.
+
+Eight matched 192 MiB runs with eight independent writers verified
+through reclaim and reopen at a fixed 10 MiB. Each build ran twice per
+durability mode. The control was frozen at `e7cfe99e`. The figures are
+medians. Elapsed work, the slowest writer's mutation work, and process CPU
+through maintenance are in seconds. Mutation p95 and its last window,
+rounds 113–128, are in milliseconds.
+
+| Build | Durability | Work | Mutation work | CPU | Mutation p95 | Last-window p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Fixed origin | NoSync | 16.95 | 12.86 | 20.34 | 109.19 | 138.05 |
+| Rolling window | NoSync | 15.98 | 12.34 | 21.31 | 103.54 | 142.50 |
+| Fixed origin | Durable | 31.01 | 27.27 | 25.77 | 124.51 | 146.78 |
+| Rolling window | Durable | 28.99 | 25.58 | 25.33 | 124.53 | 160.42 |
+
+Index phases report the slowest worker in seconds. Close, first-owner
+reopen, eight live joins, and verification after reopen are in milliseconds.
+
+| Build | Durability | Index flush | First query | Repeat query | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fixed origin | NoSync | 3.61 | 0.61 | 0.28 | 32.74 | 35.09 | 45.98 | 22.22 |
+| Rolling window | NoSync | 3.23 | 0.61 | 0.25 | 29.65 | 34.29 | 44.95 | 22.65 |
+| Fixed origin | Durable | 3.76 | 0.40 | 0.08 | 30.78 | 31.70 | 39.87 | 20.65 |
+| Rolling window | Durable | 3.29 | 0.41 | 0.08 | 25.44 | 30.33 | 39.69 | 20.56 |
+
+Elapsed work fell about 6% in each mode. NoSync CPU and durable tail
+latency were higher in this rotation. The 192 MiB NoSync cause trace
+attributed 117 of 128 checkpoint calls to capacity reclamation with the
+allocator already held. Only nine calls acquired their own allocator
+scope. The first barrier used 1.462 of 1.881 seconds of checkpoint sync
+time. Moving that barrier outside the allocator needs an earlier capacity
+entry point that can prepare a checkpoint before the nested reclaim call.
+The prototype still needs to prove durable peer publication while that
+barrier is paused and live adoption by an observer already beyond the cut.
+
+Verification passed 46 GNU Release groups and 16 each on Debug
+ASan/UBSan and musl Release. The full-turn addition passed in all three
+configurations. Raw trials and logs are under
+`build/pouch-space-concurrent/rolling-journal/`.

@@ -41,7 +41,7 @@
 #define PS_JOURNAL_OFFSET (2U * PS_PAGE + PS_METADATA_RESERVE)
 #define PS_DATA (PS_JOURNAL_OFFSET + PS_JOURNAL)
 #define PS_MAINTENANCE_RESERVE PS_CHUNK
-#define PS_ROOT_BYTES 80U
+#define PS_ROOT_BYTES 92U
 /* The incarnation grant slots occupy unused sectors of the two root pages. */
 #define PS_TOKEN_RECORD_OFFSET 512U
 #define PS_TOKEN_RECORD_BYTES 40U
