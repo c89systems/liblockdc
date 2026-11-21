@@ -7090,8 +7090,12 @@ select_run:
           partial_bytes = prepared;
           partial_at = at;
         }
+        /* When no prepared interval fits, favor a common run that can
+         * certify more spare pages within the same preparation barrier. */
         if ((*link)->bytes >= bytes &&
-            (!fit || ((*fit)->claimed && !(*link)->claimed)))
+            (!fit || ((*fit)->claimed && !(*link)->claimed) ||
+             (s->readiness && !budget && (*fit)->bytes < PS_MIB &&
+              (*link)->bytes > (*fit)->bytes)))
           fit = link;
       }
       if (!choice && partial) {

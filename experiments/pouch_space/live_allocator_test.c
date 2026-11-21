@@ -2833,6 +2833,40 @@ static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
   captured_expect(r, (unsigned char)byte, bytes);
   ps_reader_close(r);
 }
+static void fragmented_preparation(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_owned_head *x = NULL, *y = NULL;
+  ps_owned_status ix, iy;
+  const ps_key hole = key(51), separator = key(52);
+  const ps_key kx = {89, 1, PS_STREAM}, ky = {89, 2, PS_STREAM};
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  ps_writer *w = replay_value(a, hole, 0x51, PS_PAGE, &e);
+  ok(ps_publish(w, NULL, &e), &e);
+  ps_writer_close(w);
+  w = replay_value(a, separator, 0x52, PS_PAGE, &e);
+  ok(ps_publish(w, NULL, &e), &e);
+  ps_writer_close(w);
+  uint64_t low = ps_internal_lookup(a, hole)->extents[0].offset;
+  REQUIRE(ps_internal_lookup(a, separator)->extents[0].offset == low + PS_PAGE);
+  ok(ps_delete(a, hole, &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_owned_open(a, NULL, kx, 1, NULL, &x, &ix, &e), &e);
+  ok(ps_owned_open(b, NULL, ky, 1, NULL, &y, &iy, &e), &e);
+  /* The low dirty hole fits this grant exactly. A wider dirty run can
+   * prepare the same grant and a usable peer grant in one barrier. */
+  uint64_t first = expect_zero_grant(a, NULL, x, &ix, 0, 0, 1);
+  expect_zero_grant(b, NULL, y, &iy, 0, first + PS_PAGE, 0);
+  REQUIRE(first > low + PS_PAGE);
+  REQUIRE(!prepared_prefix(b, low, PS_PAGE));
+  expect_value(b, separator, PS_PAGE, 0x52);
+  ps_owned_close(x);
+  ps_owned_close(y);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct reopen_disk {
   size_t syncs, fail_sync;
 } reopen_disk;
@@ -5764,6 +5798,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "owned-stream-faults"))
     owned_stream_faults();
   else if (!strcmp(argv[2], "prepared-grants")) {
+    fragmented_preparation();
     prepared_grants();
     prepared_grant_fault();
   } else if (!strcmp(argv[2], "stream-header-capture")) {

@@ -10661,3 +10661,87 @@ messaging and the explicit 1 MiB growth check.
 
 Raw comparisons, traces and test logs are under the `wider-piece-`
 and `tail-cost-` prefixes in `build/pouch-space-concurrent/`.
+
+## Preparing more shared grants per durability barrier
+
+Three traces of the 20 MiB indexed NoSync workload at fixed 10 MiB
+attributed 40% of the combined time of the slowest 48 of 960 native
+items to preparation durability waits. A separate free-range trace
+found 466 grants that needed zeroing. Their median preparation span
+was 64 KiB, with 4.86 MiB of unclaimed free space at that point. Small
+dirty holes met individual grant sizes but produced few spare pages.
+
+When a shared unbudgeted owner needs a dirty extent, the allocator
+favors a longer common run until the existing 1 MiB preparation cap
+is met. Fully or partially prepared ranges retain priority. The
+existing headroom check can shrink each preparation, and fragmented
+space can still fund smaller grants. Zeroing and the durability wait
+use the existing private ownership protocol. Spare pages become
+eligible for reuse only after their zeroing is covered and their
+private claim is released. Budgeted grants retain their existing
+range selection.
+
+A fragmented two-owner fixture reclaims a one-page hole ahead of a
+wider free run. The prior build takes the hole and the peer needs
+another sync. The revised allocator prepares both allocations in
+one sync, leaves the dirty hole uncertified, and preserves the
+intervening value. The full fixture also covers killed private
+writers, a failed preparation sync, and cold reset of zero proofs.
+
+Both longer-run policies verified their four paired pilots at 10 MiB.
+Keeping the 1 MiB cap beat a 256 KiB cap in all four heavy pairs.
+In three final heavy trace runs, preparation calls fell from 601 to
+343 and summed wait time from 8.96 to 5.08 s across 960 items. Range
+ownership queries increased from 1.21 to 1.63 million. The independently
+traced samples showed a higher pooled p95 despite lower accumulated
+wait time. The matched uninstrumented comparisons below show lower
+p95 in each heavy pair.
+
+All 42 workflows in the five established profiles verified. Native
+roots stayed at 10 MiB. Each build ran four samples per NoSync indexed
+profile and two for each other workload. Values are medians in
+milliseconds in the order prior native (`95a9be7e`), revised native,
+multifile. Grouped reopen includes the cold owner and live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1090.63 / 942.83 / 1594.14 | 53.38 / 47.69 / 38.03 | 16.66 / 4.07 / 1.16 | 9.25 / 9.20 / 0.95 | 5.87 / 5.79 / 6.93 |
+| NoSync indexed, 20 MiB | 2501.19 / 1858.73 / 2780.10 | 81.32 / 52.89 / 50.09 | 13.27 / 19.09 / 1.29 | 13.00 / 13.64 / 1.09 | 7.70 / 8.08 / 10.84 |
+| Durable indexed, 15 MiB | 5125.22 / 3781.49 / 5875.57 | 76.11 / 59.60 / 72.39 | 6.43 / 3.88 / 0.93 | 9.32 / 8.82 / 0.60 | 5.35 / 7.24 / 7.95 |
+| Warmed NoSync queue | 12.15 / 9.82 / 95.92 | 2.21 / 1.81 / 23.76 | 0.27 / 0.27 / 0.06 | 5.59 / 2.89 / 0.39 | 0.28 / 0.20 / 0.55 |
+| Durable outbox | 1071.86 / 1120.74 / 1642.72 | 238.90 / 207.82 / 378.40 | 0.78 / 0.57 / 0.34 | 38.41 / 46.55 / 66.74 | 76.77 / 79.65 / 160.00 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 257.33 / 247.18 / 438.50 | 56.31 / 52.17 / 204.41 | 28.36 / 26.02 / 268.81 | 0.91 / 0.88 / 1.30 |
+| NoSync indexed, 20 MiB | 377.37 / 358.05 / 643.85 | 62.81 / 80.26 / 367.45 | 26.79 / 21.55 / 429.50 | 1.25 / 1.43 / 2.08 |
+| Durable indexed, 15 MiB | 161.11 / 210.85 / 223.54 | 12.69 / 24.14 / 272.61 | 25.22 / 2.29 / 325.30 | 0.45 / 0.58 / 0.75 |
+
+The heavy NoSync median used 114.5 mutation syncs, down from 158.5.
+Process CPU through end-of-work maintenance was 1773 / 1821 / 911 ms.
+Grouped reopen remained near 14 ms and close had a 19 ms median.
+The multifile heavy p95 was 50 ms in this rotation and 34 ms in
+the preceding rotation.
+
+The additional eight-writer probe uses 24 retained 64 KiB keys over
+16 mutation rounds with index verification each round. At fixed
+10 MiB both native builds refused both runs with a capacity error.
+Multifile verified both, with 3.35 s median work. The eight-writer
+capacity path remains open.
+
+A traced native follow-up repeated the eight-writer run with segment
+targets of 1 MiB, 512 KiB, and 256 KiB. Both 1 MiB runs refused
+admission. The worker examined only active sources in those runs.
+Both 512 KiB runs and both 256 KiB runs verified at the same 10 MiB
+capacity, with sealed candidates available to maintenance. Their
+work medians were 3.46 and 3.91 s, respectively, with per-item p95
+near 130 and 137 ms. The smaller targets were confined to the probe.
+
+Targeted gates passed 28 GNU Release, 14 Debug ASan/UBSan, and 14
+musl Release groups. They covered preparation across peers and
+checkpoints, independent writers at fixed capacity, process death,
+faults, recovery, and the shared messaging workflows.
+
+Raw comparisons, phase traces, control sizes and test logs have
+the `zero-fit-`, `allocator-phase-`, `zero-shape-`, and
+`eight-pressure-` prefixes in `build/pouch-space-concurrent/`.
