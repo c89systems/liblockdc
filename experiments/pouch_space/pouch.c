@@ -184,11 +184,14 @@ static int namespaces_visit(void *context,
 }
 static int replay(void *context, void *ns,
                   lc_pouch_storage_namespace_info *info,
+                  enum lc_pouch_storage_replay_mode mode,
                   lc_pouch_storage_visit_fn visit, void *opaque, lc_error *e) {
   ps_namespace_view *view = NULL;
   int rc;
   (void)context;
-  rc = ps_namespace_view_open(ns, &view, e);
+  rc = mode == LC_POUCH_STORAGE_REPLAY_STATE
+           ? ps_namespace_state_view_open(ns, &view, e)
+           : ps_namespace_view_open(ns, &view, e);
   if (rc == LC_OK && info)
     ps_namespace_view_projection(view, info);
   if (rc == LC_OK)

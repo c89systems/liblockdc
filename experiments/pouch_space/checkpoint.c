@@ -582,6 +582,8 @@ static int checkpoint_retain_value(void *context, ps_key key,
     return incarnation != capture->known->control;
   if (capture->mode == PS_CHECKPOINT_CAPTURE_SEED)
     return 0;
+  if (capture->mode == PS_CHECKPOINT_CAPTURE_STATE)
+    return key.kind == PS_KEY_METADATA;
   return !keep_selected_slot(find_id(capture->resident, key.key), key,
                              incarnation);
 }
@@ -642,12 +644,16 @@ static int retain_selected_record(void *context, ps_key key,
 }
 int ps_checkpoint_capture_selected_locked(ps_namespace *ns, uint64_t prefix,
                                           const ps_checkpoint_info *coverage,
-                                          int seed_only, ps_values **out,
-                                          lc_error *e) {
+                                          enum ps_checkpoint_capture_mode mode,
+                                          ps_values **out, lc_error *e) {
   selected_checkpoint selected;
   int rc;
+  if (mode == PS_CHECKPOINT_CAPTURE_STATE)
+    return ps_internal_values_capture_locked(
+        ns->root->space, ns->identity.owner, PS_KEY_METADATA, PS_KEY_METADATA,
+        prefix, NULL, NULL, out, e);
   selected.control = coverage->control;
-  selected.seed_only = seed_only;
+  selected.seed_only = mode == PS_CHECKPOINT_CAPTURE_SEED;
   selected.invalid = 0;
   rc = ps_internal_values_capture_locked(
       ns->root->space, ns->identity.owner, PS_KEY_METADATA,

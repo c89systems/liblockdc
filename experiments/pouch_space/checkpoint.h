@@ -112,7 +112,9 @@ enum ps_checkpoint_capture_mode {
   /* Capture slot identities and retain coverage only when it needs decoding. */
   PS_CHECKPOINT_CAPTURE_SEED,
   /* Also retain payloads for slots that the resident owner cannot reuse. */
-  PS_CHECKPOINT_CAPTURE_CHANGED
+  PS_CHECKPOINT_CAPTURE_CHANGED,
+  /* State projection uses coverage for the watermarks of covered decisions. */
+  PS_CHECKPOINT_CAPTURE_STATE
 };
 int ps_key_checkpoint_capture(ps_key_checkpoint *,
                               enum ps_checkpoint_capture_mode, ps_values **,
@@ -121,8 +123,8 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *,
  * capture after releasing allocator authority, including on failure. */
 int ps_checkpoint_capture_selected_locked(ps_namespace *, uint64_t prefix,
                                           const ps_checkpoint_info *,
-                                          int seed_only, ps_values **,
-                                          lc_error *);
+                                          enum ps_checkpoint_capture_mode,
+                                          ps_values **, lc_error *);
 /* A memo-only miss reports noncurrent without reading the disk. */
 int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
                         int memo_only, ps_checkpoint_info *, int *current,

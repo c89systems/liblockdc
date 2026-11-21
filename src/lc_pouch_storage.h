@@ -187,6 +187,10 @@ enum lc_pouch_namespace_lock_policy {
   LC_POUCH_NAMESPACE_FOREGROUND = 0,
   LC_POUCH_NAMESPACE_BACKGROUND
 };
+enum lc_pouch_storage_replay_mode {
+  LC_POUCH_STORAGE_REPLAY_FULL,
+  LC_POUCH_STORAGE_REPLAY_STATE
+};
 typedef struct lc_pouch_storage_ops {
   int (*check)(void *, lc_error *);
   /* Force the completed publication prefix durable, including on NoSync
@@ -199,9 +203,11 @@ typedef struct lc_pouch_storage_ops {
                         lc_error *);
   int (*namespaces_visit)(void *, lc_pouch_storage_namespace_visit_fn, void *,
                           lc_error *);
-  /* Report the same captured boundary visited by the full replay. */
+  /* Both replays report the captured boundary. State replay can represent
+   * covered decisions with the checkpoint's exact sequence watermarks. */
   int (*replay)(void *, void *, lc_pouch_storage_namespace_info *,
-                lc_pouch_storage_visit_fn, void *, lc_error *);
+                enum lc_pouch_storage_replay_mode, lc_pouch_storage_visit_fn,
+                void *, lc_error *);
   /* Visit an append suffix only after checking the selected incarnation,
    * checkpoint epoch and end against the expected namespace boundary. */
   int (*replay_suffix)(void *, void *, const lc_pouch_storage_namespace_info *,

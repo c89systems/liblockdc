@@ -2513,6 +2513,116 @@ static void projection_threads(void) {
             pthread_mutex_destroy(&g.mutex) == 0);
   }
 }
+typedef struct adoption_read_gate {
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  ps_space *space;
+  ps_reader *reader;
+  uint64_t page;
+  size_t allocator_acquires;
+  int entered, released, fault, result;
+} adoption_read_gate;
+static int count_adoption_authority(void *context, int fd, int command,
+                                    struct flock *lock) {
+  adoption_read_gate *gate = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc == 0 && (command == F_OFD_SETLK || command == F_OFD_SETLKW) &&
+      lock->l_start == 4 && lock->l_type == F_WRLCK)
+    ++gate->allocator_acquires;
+  return rc;
+}
+static ssize_t pause_checkpoint_read(void *context, int fd, void *out, size_t n,
+                                     off_t offset) {
+  adoption_read_gate *gate = context;
+  if ((uint64_t)offset == gate->page && gate->page && !gate->entered) {
+    pthread_mutex_lock(&gate->mutex);
+    gate->entered = 1;
+    pthread_cond_broadcast(&gate->changed);
+    while (!gate->released)
+      pthread_cond_wait(&gate->changed, &gate->mutex);
+    pthread_mutex_unlock(&gate->mutex);
+    if (gate->fault) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return pread(fd, out, n, offset);
+}
+static void *adopt_on_read(void *context) {
+  adoption_read_gate *gate = context;
+  gate->result = ps_read_open(gate->space, key(2), NULL, &gate->reader, NULL);
+  return NULL;
+}
+static void projection_read_handoff(int advance_root, int fault) {
+  lc_error e = {0};
+  adoption_read_gate gate = {0};
+  ps_io io = {&gate, pause_checkpoint_read, write_io, sync_io, reserve_io,
+              NULL};
+  ps_coordination_io coordination = {&gate, count_adoption_authority};
+  ps_options options = {.io = &io, .coordination_io = &coordination};
+  ps_space *writer = NULL;
+  ps_coordination_guard *authority = NULL;
+  ps_reader *old = NULL, *current = NULL;
+  size_t final_bytes = advance_root ? 81 : 73;
+  pthread_t reader;
+  REQUIRE(!pthread_mutex_init(&gate.mutex, NULL) &&
+          !pthread_cond_init(&gate.changed, NULL));
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  capture_put(writer, 1, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &gate.space, &e), &e);
+  ok(ps_read_open(gate.space, key(1), NULL, &old, &e), &e);
+  capture_put(writer, 1, 129);
+  ok(ps_checkpoint(writer, &e), &e);
+  gate.page = writer->directory.offset;
+  gate.fault = fault;
+  gate.allocator_acquires = 0;
+  REQUIRE(gate.page && !pthread_create(&reader, NULL, adopt_on_read, &gate));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.entered)
+    pthread_cond_wait(&gate.changed, &gate.mutex);
+  REQUIRE(!gate.allocator_acquires);
+  pthread_mutex_unlock(&gate.mutex);
+
+  /* A peer can publish while this member reads a candidate directory. */
+  ok(ps_coordination_lock(ps_space_coordination(writer),
+                          PS_COORDINATION_ALLOCATION, 0, 0, &authority, &e),
+     &e);
+  ps_coordination_unlock(authority);
+  capture_put(writer, 2, 73);
+  if (advance_root) {
+    ok(ps_checkpoint(writer, &e), &e);
+    capture_put(writer, 2, final_bytes);
+  }
+  ok(ps_flush(writer, &e), &e);
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.changed);
+  pthread_mutex_unlock(&gate.mutex);
+  REQUIRE(!pthread_join(reader, NULL) && gate.allocator_acquires == 1);
+  if (fault && !advance_root) {
+    REQUIRE(gate.result == LC_ERR_TRANSPORT && !gate.reader &&
+            ps_check(gate.space, NULL) == LC_ERR_TRANSPORT);
+  } else {
+    REQUIRE(gate.result == LC_OK && gate.reader &&
+            gate.space->generation == writer->generation);
+    captured_expect(gate.reader, 2, final_bytes);
+    ps_reader_close(gate.reader);
+    captured_expect(old, 1, 65);
+  }
+  ps_reader_close(old);
+  ok(ps_close(gate.space, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  ok(ps_read_open(writer, key(2), NULL, &current, &e), &e);
+  captured_expect(current, 2, final_bytes);
+  ps_reader_close(current);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  REQUIRE(!pthread_cond_destroy(&gate.changed) &&
+          !pthread_mutex_destroy(&gate.mutex));
+  lc_error_cleanup(&e);
+}
 static void projection_boundaries(void) {
   /* Exercise acquisition, witness observation and final guard release while
    * a captured reader and a funded producer survive checkpoint adoption. */
@@ -6769,6 +6879,9 @@ int main(int argc, char **argv) {
     projection_threads();
   else if (!strcmp(argv[2], "projection-boundaries")) {
     projection_boundaries();
+    for (int advance_root = 0; advance_root <= 1; ++advance_root)
+      for (int fault = 0; fault <= 1; ++fault)
+        projection_read_handoff(advance_root, fault);
     for (int durable = 0; durable <= 1; ++durable)
       projection_quarantine(durable, 1);
   } else if (!strcmp(argv[2], "projection-pressure"))

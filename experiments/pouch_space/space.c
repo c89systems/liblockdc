@@ -63,7 +63,17 @@ static int replay_frame(ps_space *, const unsigned char *, uint64_t,
 static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t, uint64_t,
                                lc_error *);
 static ps_entry *selected_value(ps_space *, ps_entry *, uint64_t);
-static int canonical_refresh(ps_space *, int verify_disk, lc_error *);
+typedef struct checkpoint_preview {
+  ps_readiness_certificate certificate;
+  ps_space *view;
+  lc_error error;
+  unsigned char roots[2 * PS_ROOT_BYTES];
+  int result;
+} checkpoint_preview;
+static void preview_checkpoint(ps_space *, checkpoint_preview *);
+static void projection_destroy(ps_space *);
+static int canonical_refresh(ps_space *, checkpoint_preview *, int verify_disk,
+                             lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 static int stream_structure_ready(ps_space *, const ps_entry *, lc_error *);
@@ -636,12 +646,22 @@ static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
 }
 static int capture_begin(ps_space *s, ps_coordination_guard **guard,
                          int verify_disk, lc_error *error) {
+  checkpoint_preview preview, *prepared = NULL;
   int rc = healthy(s, error);
   *guard = NULL;
+  if (rc == LC_OK && !verify_disk && !s->allocation_guard &&
+      ps_readiness_preview(s, &preview.certificate)) {
+    preview_checkpoint(s, &preview);
+    prepared = &preview;
+  }
   if (rc == LC_OK)
     rc = allocation_begin(s, guard, error);
   if (rc == LC_OK && *guard)
-    rc = canonical_refresh(s, verify_disk, error);
+    rc = canonical_refresh(s, prepared, verify_disk, error);
+  if (prepared) {
+    projection_destroy(preview.view);
+    lc_error_cleanup(&preview.error);
+  }
   return rc;
 }
 int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
@@ -5173,11 +5193,132 @@ static void projection_install(ps_space *s, ps_space *v) {
   if (s->peer_durable >= s->own_ready_wire)
     mark_durable(s, s->own_ready_sequence);
 }
-static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
+/* Prepare only private metadata. The resident mutex protects the local
+ * entries and witnesses this projection will carry across installation. The
+ * selected checkpoint must be revalidated before importing any peer journal. */
+static int projection_stage(ps_space *s, ps_space *v,
+                            const ps_readiness_certificate *certificate,
+                            lc_error *error) {
+  ps_entry *p, *old;
+  size_t i;
+  int rc = recover_directory(v, v->journal_image, certificate, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  /* The checkpoint prefix covers the resident journal. Consequently only
+   * checkpoint entries, including those superseded by the following tail,
+   * can match an existing incarnation. Bind them before decoding that tail. */
+  for (p = v->entries; p; p = p->all_next) {
+    old = lookup(s, p->key);
+    if (old && old->token == p->token) {
+      if (!projection_same(old, p))
+        return err(error, LC_ERR_PROTOCOL,
+                   "checkpoint changes an existing incarnation");
+      p->projection = old;
+      if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
+        p->bytes = old->bytes;
+        p->stream_admitted = 0;
+        if (!p->dirty_link)
+          dirty_entry(v, p, NULL);
+      }
+    }
+    for (i = 0; i < p->count; ++i) {
+      rc = payload_claim(v, &p->extents[i], error);
+      if (rc != LC_OK)
+        return rc;
+    }
+  }
+  /* Overlay only continuously retained ownership. Unpinned old canonical
+   * ranges may already have been reused by peers; never retire them here. */
+  for (p = s->entries; p; p = p->all_next) {
+    old = lookup(v, p->key);
+    if ((old && old->projection == p) ||
+        (p->state != 0 && !p->pins && !p->catalog_pins))
+      continue;
+    for (i = 0; i < p->count; ++i) {
+      rc = payload_claim(v, &p->extents[i], error);
+      if (rc != LC_OK)
+        return rc;
+    }
+  }
+  if (s->credit_record)
+    rc = exclude_run(v, s->credit_record->offset, PS_PAGE, error);
+  return rc == LC_OK ? projection_pool(v, s->free, error) : rc;
+}
+static ps_space *projection_new(ps_space *s, lc_error *error) {
+  ps_space *v = lc_calloc_with_allocator(NULL, 1, sizeof(*v));
+  if (!v) {
+    err(error, LC_ERR_NOMEM, "cannot allocate checkpoint projection");
+    return NULL;
+  }
+  v->fd = s->fd;
+  v->coordination = s->coordination;
+  v->io = s->io;
+  return v;
+}
+static void projection_destroy(ps_space *v) {
+  if (v) {
+    v->fd = -1;
+    v->coordination = NULL;
+    destroy(v);
+  }
+}
+static int projection_load(ps_space *s, ps_space *v, const unsigned char *root,
+                           int selected,
+                           const ps_readiness_certificate *certificate,
+                           lc_error *error) {
+  v->root = selected;
+  v->generation = get64(root + 8);
+  v->capacity = get64(root + 16);
+  v->sequence = get64(root + 24);
+  v->peer_durable = certificate->durable;
+  v->directory.offset = get64(root + 32);
+  v->directory.generation = get64(root + 40);
+  v->token_limit = get64(root + 48);
+  memcpy(v->identity, s->identity, 16);
+  v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
+  if (!v->journal_image)
+    return err(error, LC_ERR_NOMEM,
+               "cannot allocate projection control buffer");
+  return projection_stage(s, v, certificate, error);
+}
+static int read_checkpoint_roots(ps_space *s, unsigned char *roots,
+                                 lc_error *error) {
+  int rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
+  if (rc == LC_OK)
+    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
+  return rc;
+}
+static void preview_checkpoint(ps_space *s, checkpoint_preview *preview) {
+  const unsigned char zero[PS_ROOT_BYTES] = {0};
+  const unsigned char *root;
+  int selected;
+  lc_error_init(&preview->error);
+  preview->view = projection_new(s, &preview->error);
+  preview->result = preview->view
+                        ? read_checkpoint_roots(preview->view, preview->roots,
+                                                &preview->error)
+                        : LC_ERR_NOMEM;
+  if (preview->result != LC_OK)
+    return;
+  selected =
+      get64(preview->roots + PS_ROOT_BYTES + 8) == preview->certificate.root;
+  root = preview->roots + selected * PS_ROOT_BYTES;
+  if (root_valid(root) && get64(root + 8) == preview->certificate.root &&
+      !memcmp(root + 56, s->identity, 16) &&
+      !memcmp(preview->roots + (1 - selected) * PS_ROOT_BYTES, zero,
+              sizeof(zero)) &&
+      get64(root + 16) >= s->capacity && get64(root + 24) >= s->sequence &&
+      get64(root + 48) <= preview->certificate.grant_limit &&
+      (!s->maximum || get64(root + 16) <= s->maximum))
+    preview->result = projection_load(s, preview->view, root, selected,
+                                      &preview->certificate, &preview->error);
+}
+static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
+                             int verify_disk, lc_error *error) {
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   const unsigned char *root;
   ps_space *v = NULL;
-  ps_entry *p, *old, **items = NULL;
+  ps_entry *p, **items = NULL;
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
@@ -5194,9 +5335,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     return canonical_journal(s, &certificate, 1,
                              (certificate.pending & PS_READINESS_JOURNAL) != 0,
                              error);
-  rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
-  if (rc == LC_OK)
-    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
+  rc = read_checkpoint_roots(s, roots, error);
   if (rc != LC_OK)
     return rc;
   a = root_valid(roots);
@@ -5234,75 +5373,34 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   if ((s->maximum && get64(root + 16) > s->maximum) || fstat(s->fd, &st) ||
       st.st_size < (off_t)get64(root + 16))
     return err(error, LC_ERR_INVALID, "checkpoint capacity unavailable");
-  v = lc_calloc_with_allocator(NULL, 1, sizeof(*v));
-  if (!v) {
-    rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint projection");
-    goto done;
+  /* A peer can retire and reuse pages while we prepare. Accept successful
+   * work only against the same selected roots and readiness certificate.
+   * A failed draft belongs to that same epoch or is discarded with it. */
+  if (preview && !certificate.pending &&
+      certificate.root == preview->certificate.root &&
+      certificate.origin == preview->certificate.origin &&
+      certificate.root == get64(root + 8) &&
+      (preview->result != LC_OK ||
+       (preview->view && preview->view->generation &&
+        !memcmp(preview->roots, roots, sizeof(roots))))) {
+    v = preview->view;
+    preview->view = NULL;
+    rc = preview->result;
+    if (rc != LC_OK && error) {
+      lc_error_cleanup(error);
+      *error = preview->error;
+      lc_error_init(&preview->error);
+    }
+  } else {
+    v = projection_new(s, error);
+    rc = v ? projection_load(s, v, root, selected, &certificate, error)
+           : LC_ERR_NOMEM;
   }
-  v->fd = s->fd;
-  v->coordination = s->coordination;
-  v->io = s->io;
-  v->root = selected;
-  v->generation = get64(root + 8);
-  v->capacity = get64(root + 16);
-  v->sequence = get64(root + 24);
-  v->peer_durable = certificate.durable;
-  v->directory.offset = get64(root + 32);
-  v->directory.generation = get64(root + 40);
-  v->token_limit = get64(root + 48);
-  memcpy(v->identity, s->identity, 16);
-  v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
-  if (!v->journal_image) {
-    rc = err(error, LC_ERR_NOMEM, "cannot allocate projection control buffer");
-    goto done;
-  }
-  rc = recover_directory(v, v->journal_image, &certificate, 0, error);
   if (rc != LC_OK)
     goto done;
   v->token_limit = certificate.grant_limit;
-  /* The checkpoint prefix covers the resident journal. Consequently only
-   * checkpoint entries, including those superseded by the following tail,
-   * can match an existing incarnation. Bind them before decoding that tail. */
-  for (p = v->entries; p; p = p->all_next) {
-    old = lookup(s, p->key);
-    if (old && old->token == p->token) {
-      if (!projection_same(old, p)) {
-        rc = err(error, LC_ERR_PROTOCOL,
-                 "checkpoint changes an existing incarnation");
-        goto done;
-      }
-      p->projection = old;
-      if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
-        p->bytes = old->bytes;
-        p->stream_admitted = 0;
-        if (!p->dirty_link)
-          dirty_entry(v, p, NULL);
-      }
-    }
-    for (i = 0; i < p->count; ++i) {
-      rc = payload_claim(v, &p->extents[i], error);
-      if (rc != LC_OK)
-        goto done;
-    }
-  }
-  /* Overlay only continuously retained ownership. Unpinned old canonical
-   * ranges may already have been reused by peers; never retire them here. */
-  for (p = s->entries; p; p = p->all_next) {
-    old = lookup(v, p->key);
-    if ((old && old->projection == p) ||
-        (p->state != 0 && !p->pins && !p->catalog_pins))
-      continue;
-    for (i = 0; i < p->count; ++i) {
-      rc = payload_claim(v, &p->extents[i], error);
-      if (rc != LC_OK)
-        goto done;
-    }
-  }
-  if (s->credit_record)
-    rc = exclude_run(v, s->credit_record->offset, PS_PAGE, error);
-  if (rc == LC_OK)
-    rc = projection_pool(v, s->free, error);
-  if (rc == LC_OK && !retiring_journal)
+  v->peer_durable = certificate.durable;
+  if (!retiring_journal)
     rc = projection_journal(v, get64(root + 24), certificate.ready, error);
   if (rc == LC_OK && v->sequence < certificate.ready)
     rc = err(error, LC_ERR_PENDING,
@@ -5371,13 +5469,9 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
       ps_readiness_finish(s, PS_READINESS_JOURNAL);
   }
 done:
-  if (v) {
-    if (v->poisoned)
-      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
-    v->fd = -1;
-    v->coordination = NULL;
-    destroy(v);
-  }
+  if (v && v->poisoned)
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+  projection_destroy(v);
   lc_free_with_allocator(NULL, items);
   return rc;
 }
@@ -7125,7 +7219,7 @@ int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
   if (rc == LC_OK)
     rc = allocation_lock(s, &guard, 0, error);
   if (rc == LC_OK && guard)
-    rc = canonical_refresh(s, 0, error);
+    rc = canonical_refresh(s, NULL, 0, error);
   if (rc == LC_OK && guard)
     rc = allocation_ranges_refresh(s, error);
   if (rc == LC_OK)

@@ -147,6 +147,34 @@ int ps_readiness_resident(ps_space *s) {
          record[DURABLE] == s->peer_durable &&
          record[GRANT_LIMIT] >= s->token_limit;
 }
+static void certificate_from_record(ps_readiness_certificate *out,
+                                    const uint64_t *record) {
+  out->ready = record[READY];
+  out->durable = record[DURABLE];
+  out->root = record[ROOT];
+  out->origin = record[ORIGIN];
+  out->grant_used = record[GRANT_USED];
+  out->grant_limit = record[GRANT_LIMIT];
+  out->prepared_durable = record[PREPARED_DURABLE];
+  out->pending = 0;
+}
+int ps_readiness_preview(ps_space *s, ps_readiness_certificate *out) {
+  const uint64_t *page;
+  uint64_t record[WORDS];
+  if (!s->readiness || !s->readiness->active)
+    return 0;
+  page = s->readiness->page;
+  /* A cheap hint leaves same-root capture on its existing path. A miss
+   * cannot change which root is selected once the allocator is acquired. */
+  if ((__atomic_load_n(page + ROOT, __ATOMIC_RELAXED) <= s->generation &&
+       __atomic_load_n(page + WORDS + ROOT, __ATOMIC_RELAXED) <=
+           s->generation) ||
+      !checked_snapshot(s, record) || record[ROOT] <= s->generation ||
+      record[READY] < s->sequence || record[GRANT_LIMIT] < s->token_limit)
+    return 0;
+  certificate_from_record(out, record);
+  return 1;
+}
 static uint32_t *sync_word(ps_space *s) {
   return (uint32_t *)(s->readiness->page + SYNC_WORD);
 }
@@ -309,13 +337,7 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
       record[GRANT_LIMIT] < s->token_limit)
     rc = failed(s, e, "shared incarnation frontier regressed");
   if (rc == LC_OK) {
-    out->ready = record[READY];
-    out->durable = record[DURABLE];
-    out->root = record[ROOT];
-    out->origin = record[ORIGIN];
-    out->grant_used = record[GRANT_USED];
-    out->grant_limit = record[GRANT_LIMIT];
-    out->prepared_durable = record[PREPARED_DURABLE];
+    certificate_from_record(out, record);
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
         ~PRESSURE_BIT;

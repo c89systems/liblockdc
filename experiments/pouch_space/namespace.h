@@ -172,6 +172,8 @@ void ps_namespace_read_close(ps_namespace_window *);
  * callback error stops a visit without consuming the view; the next visit
  * starts at the captured beginning again. */
 int ps_namespace_view_open(ps_namespace *, ps_namespace_view **, lc_error *);
+int ps_namespace_state_view_open(ps_namespace *, ps_namespace_view **,
+                                 lc_error *);
 /* Admit only the selected active range after matching the expected boundary. */
 int ps_namespace_view_suffix_open(
     ps_namespace *, const struct lc_pouch_storage_namespace_info *,

@@ -12212,3 +12212,83 @@ maintenance handoff failure.
 Verification passed 24 GNU Release groups and 14 groups each on Debug
 ASan/UBSan and musl Release. Raw timings and holder traces are under
 `build/pouch-space-concurrent/namespace-handoff/`.
+
+## Shared checkpoint preparation and state replay
+
+A live member can prepare a private projection from a newer certified
+checkpoint before taking allocator authority. It reads the directory, builds
+packed-page ownership, and overlays continuously retained local ranges.
+Under allocator authority it checks the selected root pair and certificate,
+imports the current journal, validates foreign ownership, and installs the
+projection. A moved root discards the draft and its errors. The fallback
+builds once under authority. Explicit disk verification continues to use
+the locked path.
+
+A two-acquisition draft reduced the locked interval but lengthened total
+adoption. The final path takes allocator authority once. A traced 192 MiB
+NoSync run reused 849 prepared projections, and average elapsed time inside
+allocator authority for adoption fell from 6.48 to 2.66 ms. Gated tests pause
+directory reads while a peer publishes a journal revision or advances the
+checkpoint. They check one allocator acquisition, preservation of the old
+reader, correct adoption, and stable versus stale read-fault behavior.
+
+Ordinary projection replay captures selected state records and applies the
+checkpoint sequence watermarks. It still processes an uncovered append
+suffix. Explicit decision recovery retains full replay and can resolve a
+pending staged outcome after a checkpoint. Three traced NoSync runs before
+the filter each visited more than 1.2 million checkpoint and append records
+across about 3,200 projection replays. Historical decisions accounted for
+about 0.6 million visits, and replay used 17.0–17.2 s of process CPU.
+
+The staged recovery test exposed a typed shared-root lookup that attempted
+to refresh from a multifile segment path. It now reuses the typed state
+projection under the namespace guard. The test checks native NoSync and
+durable encoded roots, identical watermarks across both replay modes,
+recovery of a staged tombstone, and an unaffected streamed value.
+
+One lease release exhausted its 250 ms authority deadline behind a 282 ms
+maintenance finish callback. Final reaping of detached sources and unused
+successors now acquires physical namespace and stream authority. Terminal
+marker retirement checks eligibility first and then rechecks under logical
+namespace authority before clearing the marker. The fixture checks retention
+of a terminal marker while the source is below the selection threshold
+and its removal after completed reclamation.
+
+All seven runs in the final matched GNU Release rotation verified through
+reopen. Native completed three NoSync and two durable trials. Multifile
+completed one in each mode. Each trial used eight producer handles, 24 rows
+and 128 rounds of 64 KiB values, for 192 MiB of streamed writes. The native
+container stayed at 10 MiB. Earlier adoption-only and filtered-replay trials
+had intermittent namespace-state timeouts.
+
+Work and process CPU through maintenance are in seconds. Mutation p95,
+close, reopen and proof are in milliseconds. Native figures are medians.
+The index tables show the maximum worker time per phase in each trial.
+
+| Backend | Durability | Work | CPU | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 29.62 | 46.69 | 166.19 | 34.35 | 36.69 | 57.65 | 24.07 |
+| Native | Durable | 46.99 | 54.07 | 206.88 | 28.90 | 33.44 | 54.91 | 24.53 |
+| Multifile | NoSync | 22.55 | 10.85 | 53.89 | 5.49 | 0.40 | 1.75 | 47.69 |
+| Multifile | Durable | 74.82 | 13.90 | 216.41 | 5.77 | 0.45 | 1.51 | 60.64 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 3.86 | 1.71 | 0.68 |
+| Native | Durable | 4.68 | 1.15 | 0.23 |
+| Multifile | NoSync | 6.36 | 3.38 | 4.94 |
+| Multifile | Durable | 8.90 | 11.96 | 15.82 |
+
+The frozen pre-change native binary recorded 34.82 s of NoSync work and
+53.07 s of durable work in one matched run per mode. In the final native
+NoSync rotation, median mutation p95 was 71 ms in rounds 1–16 and 249 ms
+in rounds 113–128. CPU, late mutation latency, close and grouped reopen
+remain qualification gates. Native durable work and all three index phases
+were faster than multifile in this rotation.
+
+Verification passed 44 GNU Release groups and 23 groups each on Debug
+ASan/UBSan and musl Release. Coverage includes staged recovery fault cuts,
+checkpoint adoption boundaries, maintenance tail and close, shared
+lease and messaging pressure, and root conversion with explicit growth.
+Raw trials and diagnostics are under
+`build/pouch-space-concurrent/parallel-adoption/`.

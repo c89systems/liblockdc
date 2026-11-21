@@ -594,6 +594,11 @@ int lc_pouch_state_with_namespace_durable_batch(
 int lc_pouch_state_with_background_namespace_lock(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error);
+/* Typed physical maintenance can serialize a marker selection with logical
+ * writers using the authority alone. The callback verifies its own inputs. */
+int lc_pouch_state_with_namespace_authority(
+    lc_pouch *pouch, const char *ns, enum lc_pouch_namespace_lock_policy,
+    lc_pouch_state_precondition_fn callback, void *context, lc_error *error);
 /** Non-zero when this thread currently holds a namespace lock for `pouch`. */
 int lc_pouch_state_namespace_lock_held_by_current_thread(lc_pouch *pouch);
 int lc_pouch_state_with_key_lock(lc_pouch *pouch, const char *ns,

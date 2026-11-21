@@ -8,6 +8,7 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
 #include "namespace.h"
+#include "namespace_work.h"
 #include "pouch.h"
 #include "pouch_internal.h"
 #include "readiness.h"
@@ -4199,6 +4200,7 @@ static void maintenance_physical_threshold(const char *path, int sync) {
   maintenance_strip strip = {0};
   lc_pouch_maintenance_options opts = {0};
   lc_pouch_maintenance_result result = {0};
+  int terminal_pending;
   char *key = lc_alloc_with_allocator(&allocator, 6);
   REQUIRE(key);
   memset(key, 'k', 5);
@@ -4246,8 +4248,14 @@ static void maintenance_physical_threshold(const char *path, int sync) {
           source_info.stored_bytes <= PS_STREAM_PIECE_BYTES);
   opts.ns = "threshold";
   opts.terminal_reclaim = 1;
+  ok(ps_namespace_work_ensure(strip.ns, LC_POUCH_STORAGE_WORK_TERMINAL, 1, &e),
+     &e);
   ok(lc_pouch_maintenance_run(p, &opts, &result, &e), &e);
   REQUIRE(!result.candidate_bytes);
+  ok(ps_namespace_work_get(strip.ns, LC_POUCH_STORAGE_WORK_TERMINAL,
+                           &terminal_pending, &e),
+     &e);
+  REQUIRE(terminal_pending);
   ok(ps_namespace_status_get(strip.ns, &status, &e), &e);
   REQUIRE(status.active_segment == 1 && status.tail > PS_MIB);
   lc_pouch_maintenance_result_cleanup(&allocator, &result);
@@ -4255,6 +4263,10 @@ static void maintenance_physical_threshold(const char *path, int sync) {
   ok(lc_pouch_maintenance_run(p, &opts, &result, &e), &e);
   REQUIRE(result.candidate_bytes == source_info.stored_bytes &&
           !result.cleanup_pending_count);
+  ok(ps_namespace_work_get(strip.ns, LC_POUCH_STORAGE_WORK_TERMINAL,
+                           &terminal_pending, &e),
+     &e);
+  REQUIRE(!terminal_pending);
   ok(ps_namespace_status_get(strip.ns, &status, &e), &e);
   REQUIRE(status.active_segment == 2 && !status.tail);
   lc_pouch_maintenance_result_cleanup(&allocator, &result);
@@ -5436,6 +5448,76 @@ static void staged_absent(lc_pouch *p, const char *key, lc_error *e) {
   REQUIRE(!r.found);
   lc_pouch_state_read_result_cleanup(&allocator, &r);
 }
+typedef struct checkpoint_replay_observation {
+  size_t decisions, values;
+  lc_pouch_generation state, query;
+} checkpoint_replay_observation;
+static int observe_checkpoint_replay(void *context, uint64_t segment,
+                                     const lc_pouch_state_entry *entry,
+                                     lc_error *e) {
+  checkpoint_replay_observation *seen = context;
+  (void)e;
+  REQUIRE(!segment);
+  if (entry->decision)
+    ++seen->decisions;
+  else if (!entry->control)
+    ++seen->values;
+  if (entry->index_seq > seen->state)
+    seen->state = entry->index_seq;
+  if (entry->query_index_seq > seen->query)
+    seen->query = entry->query_index_seq;
+  return LC_OK;
+}
+static void checkpoint_decision_projection(const char *path) {
+  for (int durable = 0; durable <= 1; ++durable) {
+    lc_error e = {0};
+    ps_pouch_state_options o = shared_options(durable ? 3 : 0, durable);
+    lc_pouch *writer = NULL, *peer = NULL;
+    void *ns = NULL;
+    lc_pouch_state_write_result written = {0};
+    checkpoint_replay_observation state = {0}, full = {0};
+    lc_pouch_storage_namespace_info state_info, full_info;
+    lc_pouch_generation decision, query, recovered;
+    input body = source(59, 27);
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+    ok(put(writer, "staged", "visible", &body, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+    staged_put(writer, "attempt", 31, 13, 1, 0, 0, 0, &e);
+    ok(lc_pouch_state_query_index_seq(writer, "staged", &query, &e), &e);
+    decision = staged_decision(writer, 2, &e);
+    ok(writer->storage.ops->namespace_open(writer->storage.context, "staged", 0,
+                                           &ns, &e),
+       &e);
+    ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+    ok(writer->storage.ops->replay(writer->storage.context, ns, &state_info,
+                                   LC_POUCH_STORAGE_REPLAY_STATE,
+                                   observe_checkpoint_replay, &state, &e),
+       &e);
+    ok(writer->storage.ops->replay(writer->storage.context, ns, &full_info,
+                                   LC_POUCH_STORAGE_REPLAY_FULL,
+                                   observe_checkpoint_replay, &full, &e),
+       &e);
+    REQUIRE(state_info.checkpoint_epoch &&
+            state_info.checkpoint_epoch == full_info.checkpoint_epoch &&
+            state_info.tail == full_info.tail && state.values == 2 &&
+            state.values == full.values && !state.decisions &&
+            full.decisions == 1 && state.state == decision &&
+            state.state == full.state && state.query == query &&
+            state.query == full.query);
+    writer->storage.ops->namespace_close(writer->storage.context, ns);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &peer, &e), &e);
+    staged_absent(peer, "key/.staging/attempt", &e);
+    read_value(peer, "staged", "visible", 59, 27, 1, &e);
+    ok(lc_pouch_state_index_seq(peer, "staged", &recovered, &e), &e);
+    REQUIRE(recovered == decision + 1);
+    ok(lc_pouch_state_query_index_seq(peer, "staged", &recovered, &e), &e);
+    REQUIRE(recovered == query);
+    lc_pouch_close(peer);
+    lc_pouch_close(writer);
+    REQUIRE(!live && !unlink(path));
+    lc_error_cleanup(&e);
+  }
+}
 static int staged_clock_enabled;
 static lc_pouch_unix_seconds staged_clock_now;
 int __real_clock_gettime(clockid_t, struct timespec *);
@@ -6381,11 +6463,12 @@ typedef struct replay_probe_visit {
 static replay_probe *active_replay_probe;
 static int count_full_replay(void *context, void *ns,
                              lc_pouch_storage_namespace_info *info,
+                             enum lc_pouch_storage_replay_mode mode,
                              lc_pouch_storage_visit_fn visit, void *opaque,
                              lc_error *e) {
   ++active_replay_probe->full;
-  return active_replay_probe->storage->replay(context, ns, info, visit, opaque,
-                                              e);
+  return active_replay_probe->storage->replay(context, ns, info, mode, visit,
+                                              opaque, e);
 }
 static int count_suffix_record(void *context, uint64_t segment,
                                const lc_pouch_state_entry *record,
@@ -6691,9 +6774,10 @@ static void *worker(void *context) {
     staging_faults(r->path, 1, 1);
   else if (!strcmp(r->mode, "staging-active-recovery-faults"))
     staging_faults(r->path, 1, 0);
-  else if (!strcmp(r->mode, "staging-recovery"))
+  else if (!strcmp(r->mode, "staging-recovery")) {
+    checkpoint_decision_projection(r->path);
     staging_recovery(r->path, r->directory);
-  else if (!strcmp(r->mode, "maintenance"))
+  } else if (!strcmp(r->mode, "maintenance"))
     maintenance(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-append-pressure")) {
     maintenance_append_pressure(r->path, 0);

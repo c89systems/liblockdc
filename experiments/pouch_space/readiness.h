@@ -30,6 +30,9 @@ int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
  * a checked instant. A miss needs ordinary allocator capture. No physical
  * ownership or allocator permission follows from a match. */
 int ps_readiness_resident(ps_space *);
+/* A newer certified root can seed private preparation. Installation still
+ * needs the allocator and a fresh certificate. */
+int ps_readiness_preview(ps_space *, ps_readiness_certificate *);
 /* Advisory capacity scheduling. Workers can sample without allocator
  * authority. Updating the level requires the allocator scope. */
 int ps_readiness_pressure(ps_space *);

@@ -3234,8 +3234,8 @@ static int lc_pouch_state_finish_commit_group_after_mutation(
 
 static int lc_pouch_state_with_namespace_lock_mode(
     lc_pouch *pouch, const char *ns, enum lc_pouch_namespace_lock_policy policy,
-    int batch_durability, lc_pouch_state_precondition_fn callback,
-    void *context, lc_error *error) {
+    int batch_durability, int recover_staged,
+    lc_pouch_state_precondition_fn callback, void *context, lc_error *error) {
   lc_pouch_state_commit_group *commit_group;
   lc_pouch_state_namespace_lock lock;
   int owns_commit_group;
@@ -3265,7 +3265,8 @@ static int lc_pouch_state_with_namespace_lock_mode(
     lc_pouch_writer_mode_operation_end(pouch);
     return rc;
   }
-  rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
+  if (recover_staged)
+    rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
   if (rc == LC_OK) {
     /* A typed store can publish a series of metadata revisions under this
      * authority and cover them with one root barrier before releasing it.
@@ -3288,19 +3289,25 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
                                        lc_pouch_state_precondition_fn callback,
                                        void *context, lc_error *error) {
   return lc_pouch_state_with_namespace_lock_mode(
-      pouch, ns, LC_POUCH_NAMESPACE_FOREGROUND, 0, callback, context, error);
+      pouch, ns, LC_POUCH_NAMESPACE_FOREGROUND, 0, 1, callback, context, error);
 }
 int lc_pouch_state_with_namespace_durable_batch(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error) {
   return lc_pouch_state_with_namespace_lock_mode(
-      pouch, ns, LC_POUCH_NAMESPACE_FOREGROUND, 1, callback, context, error);
+      pouch, ns, LC_POUCH_NAMESPACE_FOREGROUND, 1, 1, callback, context, error);
 }
 int lc_pouch_state_with_background_namespace_lock(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error) {
   return lc_pouch_state_with_namespace_lock_mode(
-      pouch, ns, LC_POUCH_NAMESPACE_BACKGROUND, 0, callback, context, error);
+      pouch, ns, LC_POUCH_NAMESPACE_BACKGROUND, 0, 1, callback, context, error);
+}
+int lc_pouch_state_with_namespace_authority(
+    lc_pouch *pouch, const char *ns, enum lc_pouch_namespace_lock_policy policy,
+    lc_pouch_state_precondition_fn callback, void *context, lc_error *error) {
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, policy, 0, 0,
+                                                 callback, context, error);
 }
 
 int lc_pouch_state_with_key_lock(lc_pouch *pouch, const char *ns,
@@ -9542,7 +9549,8 @@ static int lc_pouch_state_collect_decisions(
                           NULL, "pouch");
     rc = pouch->storage.ops->replay(
         pouch->storage.context, cache->storage_namespace, NULL,
-        lc_pouch_state_collect_decision, &visit, error);
+        LC_POUCH_STORAGE_REPLAY_FULL, lc_pouch_state_collect_decision, &visit,
+        error);
     /* Flatten even on failure: the caller owns all collected records and
      * releases them before retrying. Historical settled decisions allocate
      * nothing; pending lookup shares the resident key index's load bound. */
@@ -10489,7 +10497,8 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
     replay.staging_changed = 0;
     rc = pouch->storage.ops->replay(
         pouch->storage.context, cache->storage_namespace, &info,
-        lc_pouch_state_storage_replay, &replay, error);
+        LC_POUCH_STORAGE_REPLAY_STATE, lc_pouch_state_storage_replay, &replay,
+        error);
   }
   if (rc == LC_OK && !extend && info.active_segment != 0) {
     leaf =
@@ -10878,7 +10887,10 @@ lc_pouch_state_cache_lookup(lc_pouch *pouch, const char *ns,
   if (cache == NULL) {
     return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
   }
-  rc = lc_pouch_state_cache_refresh_for_mode(pouch, cache, manifest, error);
+  rc = pouch->storage.ops != NULL
+           ? lc_pouch_state_storage_prepare(pouch, ns, error)
+           : lc_pouch_state_cache_refresh_for_mode(pouch, cache, manifest,
+                                                   error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -14274,7 +14286,6 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
   for (decision = decisions; rc == LC_OK && decision != NULL;
        decision = decision->next) {
     lc_pouch_state_entry staged;
-    lc_pouch_generation max_version;
     lc_pouch_generation tombstone_version;
     lc_pouch_unix_seconds updated_at_unix;
 
@@ -14285,7 +14296,7 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
      * normal mode-aware lookup so shared writers and invalidated projections
      * still refresh under the mutation authority held by this caller. */
     rc = lc_pouch_state_cache_lookup(pouch, ns, &manifest, decision->staged_key,
-                                     &staged, &max_version, error);
+                                     &staged, NULL, error);
     if (rc != LC_OK) {
       lc_pouch_state_entry_cleanup(&pouch->allocator, &staged);
       break;
@@ -14296,7 +14307,6 @@ static int lc_pouch_state_recover_staged_decisions_locked(lc_pouch *pouch,
       lc_pouch_state_entry_cleanup(&pouch->allocator, &staged);
       continue;
     }
-    (void)max_version;
     tombstone_version = staged.version + 1UL;
     updated_at_unix = lc_pouch_maintenance_now_seconds();
     rc = lc_pouch_state_append_tombstone(

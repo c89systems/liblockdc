@@ -261,23 +261,52 @@ static int compact_locked(void *context, lc_error *e) {
                                      w->retirements, &w->retirement_count, e);
   return rc;
 }
-static int finish_locked(void *context, lc_error *e) {
-  compact *w = context;
+static int reap_finished(compact *w, lc_error *e) {
   uint64_t closed, pending;
-  int rc = ps_namespace_status_get(w->ns, &w->after, e);
-  if (rc == LC_OK)
-    rc = ps_namespace_reap(w->ns, &closed, &pending, e);
+  int rc = ps_namespace_reap(w->ns, &closed, &pending, e);
   if (rc == LC_OK) {
     w->result.pending_sources += pending;
     if (w->maintenance)
       w->maintenance->cleanup_deleted_count += (unsigned long)closed;
   }
-  if (rc == LC_OK && w->options && w->options->terminal_reclaim &&
-      !w->result.pending_sources && !w->maintenance->cleanup_pending_count &&
-      !w->after.pending_keys &&
-      w->after.tail < w->pouch->terminal_reclaim_min_bytes)
+  return rc;
+}
+static int terminal_complete(const compact *w) {
+  return !w->result.pending_sources && !w->maintenance->cleanup_pending_count &&
+         !w->after.pending_keys &&
+         w->after.tail < w->pouch->terminal_reclaim_min_bytes;
+}
+static int finish_terminal_locked(void *context, lc_error *e) {
+  compact *w = context;
+  int rc = ps_namespace_status_get(w->ns, &w->after, e);
+  if (rc == LC_OK && terminal_complete(w))
+    rc = reap_finished(w, e);
+  if (rc == LC_OK && terminal_complete(w))
     rc = lc_pouch_terminal_reclaim_marker_remove(w->pouch, w->name, e);
   return rc;
+}
+static int finish_compaction(compact *w, lc_error *e) {
+  int rc;
+  if (background_stopping(w))
+    return stop_pending(e);
+  /* Detached sources and abandoned successors are selected under physical
+   * namespace and stream authority. A terminal marker also needs a current
+   * check serialized with logical mutations. Only take that scope when
+   * the physical pass finds a marker eligible for retirement. */
+  rc = reap_finished(w, e);
+  if (rc != LC_OK || !w->options || !w->options->terminal_reclaim ||
+      w->result.pending_sources || w->maintenance->cleanup_pending_count)
+    return rc;
+  rc = ps_namespace_status_get(w->ns, &w->after, e);
+  if (rc != LC_OK || !terminal_complete(w))
+    return rc;
+  if (background_stopping(w))
+    return stop_pending(e);
+  return lc_pouch_state_with_namespace_authority(
+      w->pouch, w->name,
+      w->background ? LC_POUCH_NAMESPACE_BACKGROUND
+                    : LC_POUCH_NAMESPACE_FOREGROUND,
+      finish_terminal_locked, w, e);
 }
 static int compact_run(lc_pouch *pouch, const char *name,
                        const lc_pouch_maintenance_options *options,
@@ -323,7 +352,7 @@ static int compact_run(lc_pouch *pouch, const char *name,
   if (rc == LC_OK && !w.result.skipped && !w.retirement_count)
     rc = ps_namespace_sources_visit(w.ns, retire_source, &w, e);
   if (rc == LC_OK && !w.result.skipped)
-    rc = compact_namespace(&w, finish_locked, &w, e);
+    rc = finish_compaction(&w, e);
   if (w.ns)
     pouch->storage.ops->namespace_close(pouch->storage.context, w.ns);
   if (rc == LC_OK && !w.result.skipped && !maintenance)
