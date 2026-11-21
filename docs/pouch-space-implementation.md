@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [local capture handoff](#local-namespace-capture-handoff), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), and [packed-page replay](#packed-page-reads-during-eager-admission) | Cold replay cost and sustained-load acceptance remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), and [packed-page replay](#packed-page-reads-during-eager-admission) | Cold replay cost and [sustained fixed-capacity admission](#sustained-indexed-work-and-checkpoint-workspace) remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -11748,3 +11748,83 @@ explicit 1 MiB growth. Formatting and diff checks passed.
 
 Raw runs, controls and test logs are in
 `build/pouch-space-concurrent/checkpoint-decode/`.
+
+## Sustained indexed work and checkpoint workspace
+
+The lifecycle comparison now accepts up to 64 rounds. The reclaim workload
+uses a distinct indexed revision in every round. It verifies streamed bytes,
+the current and preceding revision queries, index sequence advancement and
+the final selection after reopen. At more than sixteen rounds it reports the
+wall span and per-item p95 for each window of up to sixteen rounds. Writers
+advance independently, so neighboring wall spans can overlap. Reopen reports
+the first owner and the subsequent joins inside the grouped timer.
+
+The longer workload streams 96 MiB through 24 logical rows. Eight writer
+threads each have their own open handle. A ninth handle runs indexed reads,
+flushes and maintenance. The native container starts and stays at 10 MiB
+with 1 MiB segment targets. Both backends use the same rounds and verification.
+
+The native run hit protected-capacity refusals in repeated GNU trials under
+both durability policies. The first uninstrumented NoSync attempt failed
+at round 47. The traced failures occurred chiefly during update, including
+before the producer started and after it had supplied bytes. A durable
+trial also failed release. Complete multifile runs verified the same
+workload in both durability modes.
+
+At the end of a traced NoSync refusal the nine handles held 4.04 MiB of
+checkpoint workspace, and none retained payload or reader claims. At the end
+of a durable refusal the checkpoint workspace claims reached 4.32 MiB,
+with only 24 KiB of payload claims and zero reader claims. In a NoSync
+failure sample, the selected directory held 1,241 key metadata records and
+1,216 decision records. Selected owned runs held 4.51 MiB. The failure
+had 104 KiB of local free space with a 92 KiB maintenance floor and
+12 KiB of outstanding payload reservations. A further 4 KiB request
+was refused. A single handle's quarantine included 3.64 MiB of unbound
+foreign claims. That quarantine overlaps the workspace reported by
+other handles.
+
+The handle-count control keeps the eight writer threads and workload
+while sharing producer handles across threads. That changes allocator
+and lock sharing. The acceptance case requires eight independent producer
+handles.
+
+| Durability | Producer handles plus primary | Verified | Checkpoint workspace at completion or refusal |
+| --- | ---: | ---: | ---: |
+| NoSync | 2 + 1 | 2/2 | 1.55–1.57 MiB |
+| NoSync | 4 + 1 | 2/2 | 2.60–2.61 MiB |
+| NoSync | 8 + 1 | 0/2 | 3.97–4.00 MiB |
+| Durable | 2 + 1 | 2/2 | 1.55–1.56 MiB |
+| Durable | 4 + 1 | 2/2 | 2.59–2.62 MiB |
+| Durable | 8 + 1 | 0/2 | 3.91–4.16 MiB |
+
+One full multifile verification per durability mode used the same
+independent handles and the final timing fields. Work, process CPU,
+readiness and query passes are in seconds. Mutation p95, close and open
+phases are in milliseconds.
+
+| Durability | Work | CPU through maintenance | Mutation p95 | Explicit index flush | First query pass | Repeat query pass | Close | Reopen first owner | Reopen joins |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NoSync | 11.75 | 5.09 | 59.76 | 3.02 | 2.02 | 2.54 | 3.58 | 0.28 | 1.36 |
+| Durable | 37.07 | 5.77 | 225.99 | 4.29 | 6.37 | 7.95 | 3.06 | 0.25 | 1.47 |
+
+The selected checkpoint belongs to the root, while open and adoption
+currently fund a complete successor in each handle's private workspace.
+The next capacity design needs one root-wide standing checkpoint allowance
+and bounded private protection for outstanding positive growth. It must
+preserve already admitted writers while peers publish, including when
+packed descriptor or directory page counts cross a boundary. Failed
+preparation, process exit, root retirement, and explicit 1 MiB growth
+must preserve the same bound. The eight-independent-handle 96 MiB
+workload is the end-to-end acceptance case for that change.
+
+The 27-round test crosses from one-letter revisions to two-letter revisions
+and verifies both backends at fixed native development capacity.
+Fifteen lifecycle groups passed on each of GNU Release, Debug ASan/UBSan
+and musl Release. Coverage includes the extended indexed runs, the
+existing indexed pressure profiles, queue, outbox and XA. Formatting
+and diff checks passed.
+
+Raw trials and traces are in `build/pouch-space-concurrent/sustained/`.
+The independent native case can be reproduced with the
+`pouch_space_lifecycle_compare` target and the arguments
+`runtime-shared-index DIRECTORY 24 65536 SYNC 8 --rounds 64 --stable-index --reclaim --reopen`.

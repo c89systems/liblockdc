@@ -89,9 +89,11 @@ static int index_queries(worker *w, int flush, lc_error *e) {
   lc_index_flush_res result = {0};
   uint64_t expected = 0U;
   if (w->revision) {
-    snprintf(current, sizeof(current), "eq{field=/r,value=%c}", w->revision);
-    snprintf(previous, sizeof(previous), "eq{field=/r,value=%c}",
-             w->revision == 'a' ? 'z' : w->revision - 1);
+    char revision[3];
+    revision_text(w->revision, revision);
+    snprintf(current, sizeof(current), "eq{field=/r,value=%s}", revision);
+    revision_text(w->revision == 1U ? 26U : w->revision - 1U, revision);
+    snprintf(previous, sizeof(previous), "eq{field=/r,value=%s}", revision);
   }
   lc_index_flush_req_init(&request);
   request.ns = w->ns;

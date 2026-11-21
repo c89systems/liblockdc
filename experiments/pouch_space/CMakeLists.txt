@@ -50,6 +50,12 @@ if(LOCKDC_BUILD_BENCHMARKS)
     set_tests_properties(pouch_space_compare_runtime-shared-index_pressure
       PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
     foreach(mode pouch-shared-index runtime-shared-index)
+      add_test(NAME pouch_space_compare_${mode}_extended_rounds
+        COMMAND pouch_space_lifecycle_compare ${mode}
+          ${CMAKE_CURRENT_BINARY_DIR} 8 65536 0 2 --reopen --rounds 27
+          --stable-index --reclaim)
+      set_tests_properties(pouch_space_compare_${mode}_extended_rounds
+        PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       foreach(sync 0 1)
         add_test(NAME pouch_space_compare_${mode}_reclaim_${sync}
           COMMAND pouch_space_lifecycle_compare ${mode}

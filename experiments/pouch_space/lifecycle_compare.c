@@ -20,6 +20,13 @@
 #include <unistd.h>
 
 typedef struct comparison comparison;
+enum { ROUNDS_PER_WINDOW = 16, MAX_ROUNDS = 64 };
+typedef struct work_window {
+  double started, finished;
+} work_window;
+typedef struct open_phases {
+  double owner, joins;
+} open_phases;
 typedef struct index_phase {
   double seconds, cpu_seconds, sync_seconds;
   double started_seconds, started_cpu;
@@ -38,7 +45,8 @@ typedef struct worker {
   double index_seconds;
   index_phase mutations;
   lc_index_seq index_seq;
-  char revision;
+  size_t revision;
+  work_window windows[MAX_ROUNDS / ROUNDS_PER_WINDOW];
   index_phase index_phases[3], reopen_phases[2];
   int result;
 } worker;
@@ -56,12 +64,12 @@ struct comparison {
 typedef struct producer {
   lc_source source;
   size_t size, offset;
-  char revision;
+  size_t revision;
 } producer;
 typedef struct consumer {
   lc_sink sink;
   size_t size, offset;
-  char revision;
+  size_t revision;
 } consumer;
 static uint64_t data_syncs, full_syncs;
 static double sync_seconds;
@@ -133,12 +141,29 @@ static size_t number(const char *text, size_t minimum, size_t maximum) {
           "invalid numeric argument");
   return (size_t)result;
 }
-static unsigned char byte_at(size_t offset, size_t size, char revision) {
-  const char *prefix = revision ? "{\"r\":\"a\",\"v\":\"" : "{\"v\":\"";
-  size_t prefix_bytes = revision ? sizeof("{\"r\":\"a\",\"v\":\"") - 1U
-                                 : sizeof("{\"v\":\"") - 1U;
-  if (revision && offset == 6U)
-    return (unsigned char)revision;
+static void revision_text(size_t revision, char text[3]) {
+  if (revision <= 26U) {
+    text[0] = (char)('a' + revision - 1U);
+    text[1] = '\0';
+  } else {
+    revision -= 27U;
+    text[0] = (char)('a' + revision / 26U);
+    text[1] = (char)('a' + revision % 26U);
+    text[2] = '\0';
+  }
+}
+static unsigned char byte_at(size_t offset, size_t size, size_t revision) {
+  const char *prefix = revision > 26U ? "{\"r\":\"aa\",\"v\":\""
+                       : revision     ? "{\"r\":\"a\",\"v\":\""
+                                      : "{\"v\":\"";
+  size_t prefix_bytes =
+      revision ? sizeof("{\"r\":\"a\",\"v\":\"") - 1U + (revision > 26U)
+               : sizeof("{\"v\":\"") - 1U;
+  if (revision && (offset == 6U || (revision > 26U && offset == 7U))) {
+    char text[3];
+    revision_text(revision, text);
+    return (unsigned char)text[offset - 6U];
+  }
   if (offset < prefix_bytes)
     return (unsigned char)prefix[offset];
   return offset == size - 2U   ? '"'
@@ -214,7 +239,8 @@ static void entry_init(worker *w, size_t row, lc_outbox_entry *entry,
   entry->content_type = "application/json";
   entry->payload_digest = w->run->digest;
 }
-static void open_store(comparison *run, int create, lc_error *e) {
+static void open_store(comparison *run, int create, open_phases *phases,
+                       lc_error *e) {
   lc_client_config config;
   lc_pouch_settings settings;
   const char *endpoint = run->endpoint;
@@ -242,10 +268,16 @@ static void open_store(comparison *run, int create, lc_error *e) {
   config.endpoint_count = 1U;
   config.default_namespace = "bench";
   config.pouch_settings = &settings;
+  double started = phases ? now(CLOCK_MONOTONIC) : 0;
   check(run->container
             ? ps_pouch_client_open(&config, create, NULL, &run->client, e)
             : lc_client_open(&config, &run->client, e),
         e);
+  if (phases) {
+    double finished = now(CLOCK_MONOTONIC);
+    phases->owner = finished - started;
+    started = finished;
+  }
   settings.background_compaction_enabled = 0;
   for (size_t i = 0U; run->shared && i < run->writers; ++i) {
     lc_client **producer = &run->workers[i].producer_client;
@@ -253,6 +285,8 @@ static void open_store(comparison *run, int create, lc_error *e) {
                          : lc_client_open(&config, producer, e),
           e);
   }
+  if (phases && run->shared)
+    phases->joins = now(CLOCK_MONOTONIC) - started;
   for (size_t i = 0U; run->outbox && i < run->writers; ++i) {
     lc_outbox_config outbox;
     lc_outbox_config_init(&outbox);
@@ -473,10 +507,13 @@ static void *run_worker(void *context) {
   w->result = LC_OK;
   const char *phase = "mutation";
   for (size_t round = 0U; round < run->rounds && w->result == LC_OK; ++round) {
+    work_window *window = &w->windows[round / ROUNDS_PER_WINDOW];
     phase = "mutation";
     if (run->reclaim)
-      w->revision = (char)('a' + round);
+      w->revision = round + 1U;
     index_phase_begin(&w->mutations);
+    if (round % ROUNDS_PER_WINDOW == 0)
+      window->started = w->mutations.started_seconds;
     for (size_t row = w->ordinal; row < run->rows && w->result == LC_OK;
          row += run->writers) {
       producer source;
@@ -503,7 +540,8 @@ static void *run_worker(void *context) {
       phase = "index readiness";
       double start = now(CLOCK_MONOTONIC);
       w->result = index_queries(w, 1, &e);
-      w->index_seconds += now(CLOCK_MONOTONIC) - start;
+      window->finished = now(CLOCK_MONOTONIC);
+      w->index_seconds += window->finished - start;
     }
   }
   if (w->result == LC_OK && run->outbox) {
@@ -514,8 +552,8 @@ static void *run_worker(void *context) {
     require(!job, "stateful cleanup probe has no remaining delivery");
   }
   if (w->result != LC_OK)
-    fprintf(stderr, "worker %zu in %s (revision %c), error %d: %s [%s]\n",
-            w->ordinal, phase, w->revision ? w->revision : '-', w->result,
+    fprintf(stderr, "worker %zu in %s (revision %zu), error %d: %s [%s]\n",
+            w->ordinal, phase, w->revision, w->result,
             e.message ? e.message : "", e.server_code ? e.server_code : "");
   lc_error_cleanup(&e);
   return NULL;
@@ -614,6 +652,55 @@ static int compare_double(const void *a, const void *b) {
   double left = *(const double *)a, right = *(const double *)b;
   return left < right ? -1 : left > right;
 }
+static void report_work_windows(comparison *run, double work_seconds) {
+  for (size_t from = 0; from < run->rounds; from += ROUNDS_PER_WINDOW) {
+    size_t rounds = run->rounds - from;
+    size_t window = from / ROUNDS_PER_WINDOW;
+    double first = run->workers[0].windows[window].started;
+    double last = run->workers[0].windows[window].finished;
+    if (rounds > ROUNDS_PER_WINDOW)
+      rounds = ROUNDS_PER_WINDOW;
+    for (size_t i = 1; i < run->writers; ++i) {
+      const work_window *w = &run->workers[i].windows[window];
+      if (w->started < first)
+        first = w->started;
+      if (w->finished > last)
+        last = w->finished;
+    }
+    require(last > first && last - first <= work_seconds,
+            "round window belongs to the work interval");
+    double *latencies = run->latencies + from * run->rows;
+    size_t items = rounds * run->rows;
+    qsort(latencies, items, sizeof(*latencies), compare_double);
+    fprintf(stderr,
+            "rounds_first=%zu rounds_last=%zu items=%zu work_ms=%.6f "
+            "p95_ms=%.6f\n",
+            from + 1, from + rounds, items, (last - first) * 1e3,
+            latencies[(items - 1) * 95U / 100U] * 1e3);
+  }
+}
+static void report_capacity(lc_client *client, const char *label,
+                            size_t owner) {
+  if (!client)
+    return;
+  lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
+  ps_stats stats;
+  if (ps_status(ps_root_space(ps_pouch_state_root(pouch)), &stats, NULL) !=
+      LC_OK)
+    return;
+  fprintf(stderr,
+          "capacity_owner=%s owner_number=%zu checkpoint_bytes=%llu "
+          "checkpoint_claim_bytes=%llu workspace_bytes=%llu "
+          "payload_claim_bytes=%llu retained_bytes=%llu allocated_bytes=%llu "
+          "retired_bytes=%llu\n",
+          label, owner, (unsigned long long)stats.metadata_available_bytes,
+          (unsigned long long)stats.claimed_metadata_bytes,
+          (unsigned long long)stats.metadata_workspace_bytes,
+          (unsigned long long)stats.claimed_payload_bytes,
+          (unsigned long long)stats.retained_payload_bytes,
+          (unsigned long long)stats.allocated_bytes,
+          (unsigned long long)stats.retired_bytes);
+}
 int main(int argc, char **argv) {
   comparison run = {0};
   lc_error e;
@@ -623,6 +710,7 @@ int main(int argc, char **argv) {
       work_seconds, maintenance_started, preopen_seconds = 0.0;
   index_phase maintenance = {0}, closing = {0}, reopening = {0},
               verification = {0};
+  open_phases reopened = {0};
   ps_stats native_work = {0};
   uint64_t measured_syncs, files;
   double measured_sync_seconds;
@@ -653,7 +741,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "--reopen") && !run.preopened)
       run.preopened = 1;
     else if (!strcmp(argv[i], "--rounds") && i + 1 < argc)
-      run.rounds = number(argv[++i], 1U, 16U);
+      run.rounds = number(argv[++i], 1U, MAX_ROUNDS);
     else if (!strcmp(argv[i], "--stable-index") && !run.stable_index)
       run.stable_index = 1;
     else if (!strcmp(argv[i], "--warm-queues") && !run.warm_queues)
@@ -710,12 +798,12 @@ int main(int argc, char **argv) {
   payload_digest(&run);
   lc_error_init(&e);
   start = now(CLOCK_MONOTONIC);
-  open_store(&run, 1, &e);
+  open_store(&run, 1, NULL, &e);
   create_seconds = now(CLOCK_MONOTONIC) - start;
   if (run.preopened) {
     close_store(&run);
     start = now(CLOCK_MONOTONIC);
-    open_store(&run, 0, &e);
+    open_store(&run, 0, NULL, &e);
     preopen_seconds = now(CLOCK_MONOTONIC) - start;
   }
   if (run.warm_queues)
@@ -739,8 +827,16 @@ int main(int argc, char **argv) {
   pthread_mutex_unlock(&run.mutex);
   for (size_t i = 0U; i < run.writers; ++i)
     require(!pthread_join(threads[i], NULL), "join writer");
-  for (size_t i = 0U; i < run.writers; ++i)
-    require(run.workers[i].result == LC_OK, "completed workflow");
+  for (size_t i = 0U; i < run.writers; ++i) {
+    if (run.workers[i].result == LC_OK)
+      continue;
+    if (run.container) {
+      report_capacity(run.client, "primary", 0);
+      for (size_t peer = 0; peer < run.writers; ++peer)
+        report_capacity(run.workers[peer].producer_client, "writer", peer);
+    }
+    require(0, "completed workflow");
+  }
   for (size_t i = 0U; run.outbox && i < run.writers; ++i)
     check(lc_outbox_dispatcher_stop(run.workers[i].dispatcher, -1L, &e), &e);
   work_seconds = now(CLOCK_MONOTONIC) - start;
@@ -784,14 +880,18 @@ int main(int argc, char **argv) {
             "native root retained fixed physical capacity");
   }
   index_phase_begin(&reopening);
-  open_store(&run, 0, &e);
+  open_store(&run, 0, &reopened, &e);
   index_phase_end(&reopening);
+  require(reopened.owner + reopened.joins <= reopening.seconds,
+          "owner and join timers belong to the reopen interval");
   /* Reopened query passes have their own thread attribution. Their parent
    * interval deliberately uses wall time only so those phases do not nest. */
   start = now(CLOCK_MONOTONIC);
   verify_reopen(&run, &e);
   verification.seconds = now(CLOCK_MONOTONIC) - start;
   close_store(&run);
+  if (run.rounds > ROUNDS_PER_WINDOW)
+    report_work_windows(&run, work_seconds);
   qsort(run.latencies, run.rows * run.rounds, sizeof(*run.latencies),
         compare_double);
   require(!getrusage(RUSAGE_SELF, &usage), "memory observation");
@@ -844,7 +944,8 @@ int main(int argc, char **argv) {
       "lifecycle_ms=%.6f cpu_ms=%.6f p50_ms=%.6f p95_ms=%.6f "
       "sync_calls=%llu sync_ms=%.6f files=%llu create_ms=%.6f close_ms=%.6f "
       "reopen_verify_ms=%.6f preopen_ms=%.6f work_ms=%.6f "
-      "maintenance_ms=%.6f reopen_ms=%.6f verify_ms=%.6f "
+      "maintenance_ms=%.6f reopen_ms=%.6f reopen_owner_ms=%.6f "
+      "reopen_joins_ms=%.6f verify_ms=%.6f "
       "mutation_worker_max_ms=%.6f mutation_thread_cpu_ms=%.6f "
       "mutation_sync_calls=%llu mutation_sync_ms=%.6f "
       "maintenance_sync_calls=%llu close_sync_calls=%llu "
@@ -868,9 +969,10 @@ int main(int argc, char **argv) {
       (unsigned long long)files, create_seconds * 1e3, closing.seconds * 1e3,
       (reopening.seconds + verification.seconds) * 1e3, preopen_seconds * 1e3,
       work_seconds * 1e3, maintenance.seconds * 1e3, reopening.seconds * 1e3,
-      verification.seconds * 1e3, max_mutation_seconds * 1e3,
-      mutation_cpu_seconds * 1e3, (unsigned long long)mutation_sync_calls,
-      mutation_sync_seconds * 1e3, (unsigned long long)maintenance.sync_calls,
+      reopened.owner * 1e3, reopened.joins * 1e3, verification.seconds * 1e3,
+      max_mutation_seconds * 1e3, mutation_cpu_seconds * 1e3,
+      (unsigned long long)mutation_sync_calls, mutation_sync_seconds * 1e3,
+      (unsigned long long)maintenance.sync_calls,
       (unsigned long long)closing.sync_calls,
       (unsigned long long)reopening.sync_calls, usage.ru_maxrss,
       max_index_seconds * 1e3, max_phase_seconds[0] * 1e3,
