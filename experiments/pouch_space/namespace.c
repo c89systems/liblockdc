@@ -1737,6 +1737,30 @@ static int replay_read(void *context, uint64_t offset,
   }
   return LC_OK;
 }
+typedef struct checkpoint_visit {
+  enum ps_checkpoint_capture_mode capture;
+  ps_namespace_record_fn visit;
+  void *context;
+} checkpoint_visit;
+static int visit_checkpoint_slot(void *context, ps_key key, ps_reader *reader,
+                                 lc_error *e) {
+  checkpoint_visit *selected = context;
+  lc_allocator allocator = {0};
+  lc_pouch_state_entry record = {0};
+  char leaf[PS_NS_LEAF_BYTES];
+  int rc;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT ||
+      (selected->capture == PS_CHECKPOINT_CAPTURE_STATE &&
+       key.kind == PS_KEY_DECISION))
+    return LC_OK;
+  if (!lc_pouch_namespace_format_snapshot_leaf(key.key, leaf, sizeof(leaf)))
+    return failure(e, LC_ERR_PROTOCOL, "invalid checkpoint slot label");
+  rc = ps_checkpoint_record_read(reader, &allocator, leaf, &record, e);
+  if (rc == LC_OK)
+    rc = selected->visit(selected->context, 0, &record, e);
+  lc_pouch_state_entry_cleanup(&allocator, &record);
+  return rc;
+}
 static int view_visit(ps_namespace_view *view, int verify, int selected,
                       ps_namespace_record_fn visit, void *context,
                       lc_error *e) {
@@ -1751,11 +1775,7 @@ static int view_visit(ps_namespace_view *view, int verify, int selected,
                                              NULL};
   replay_input input;
   lc_pouch_record_io io;
-  ps_reader *metadata_reader = NULL;
-  ps_key metadata_key;
-  ps_ref metadata_ref;
-  uint64_t metadata_bytes;
-  char *leaf = NULL;
+  checkpoint_visit checkpoint;
   if (!view || !visit)
     return failure(e, LC_ERR_INVALID,
                    "namespace replay requires view and callback");
@@ -1771,31 +1791,12 @@ static int view_visit(ps_namespace_view *view, int verify, int selected,
     rc = visit(context, 0, &record, e);
     memset(&record, 0, sizeof(record));
   }
-  for (i = 0; selected && rc == LC_OK && i < ps_values_count(view->metadata);
-       ++i) {
-    rc = ps_values_info(view->metadata, i, &metadata_key, &metadata_ref,
-                        &metadata_bytes, e);
-    if (rc == LC_OK && (metadata_key.kind == PS_NAMESPACE_CHECKPOINT ||
-                        (view->capture == PS_CHECKPOINT_CAPTURE_STATE &&
-                         metadata_key.kind == PS_KEY_DECISION)))
-      continue;
-    if (rc == LC_OK) {
-      leaf = lc_pouch_namespace_snapshot_leaf(&allocator, metadata_key.key);
-      if (!leaf)
-        rc = failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint slot label");
-    }
-    if (rc == LC_OK)
-      rc = ps_values_read_open(view->metadata, i, &metadata_reader, e);
-    if (rc == LC_OK)
-      rc = ps_checkpoint_record_read(metadata_reader, &allocator, leaf, &record,
-                                     e);
-    if (rc == LC_OK)
-      rc = visit(context, 0, &record, e);
-    ps_reader_close(metadata_reader);
-    metadata_reader = NULL;
-    lc_free_with_allocator(&allocator, leaf);
-    leaf = NULL;
-    lc_pouch_state_entry_cleanup(&allocator, &record);
+  if (selected && rc == LC_OK && ps_values_count(view->metadata)) {
+    checkpoint.capture = view->capture;
+    checkpoint.visit = visit;
+    checkpoint.context = context;
+    rc = ps_values_read_walk(view->metadata, visit_checkpoint_slot, &checkpoint,
+                             e);
   }
   for (i = 0; rc == LC_OK && i < view->count; ++i) {
     captured *c = &view->items[i];

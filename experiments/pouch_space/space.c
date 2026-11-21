@@ -6719,29 +6719,30 @@ int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
   value_walk *walk;
   ps_reader *r;
   ps_entry **order;
-  size_t i, bytes;
+  size_t i, count = 0, at = 0, bytes;
   int rc;
   if (!view || !read)
     return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
-  if (!view->count)
-    return LC_OK;
   for (i = 0; i < view->count; ++i)
-    if (!view->items[i].retained)
-      return err(error, LC_ERR_INVALID, "capture has no retained payload");
-  if (view->count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
+    count += view->items[i].retained != NULL;
+  if (!count)
+    return LC_OK;
+  if (count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
     return err(error, LC_ERR_NOMEM, "captured read order exceeds local limit");
-  bytes = view->count * sizeof(*order);
+  bytes = count * sizeof(*order);
   walk = lc_alloc_with_allocator(NULL, sizeof(*walk) + bytes);
   if (!walk)
     return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
   order = (void *)(walk + 1);
   for (i = 0; i < view->count; ++i)
-    order[i] = view->items[i].retained;
-  qsort(order, view->count, sizeof(*order), value_position);
+    if (view->items[i].retained)
+      order[at++] = view->items[i].retained;
+  if (count > 1)
+    qsort(order, count, sizeof(*order), value_position);
   walk->packed.offset = 0;
   r = &walk->reader;
   rc = LC_OK;
-  for (i = 0; rc == LC_OK && i < view->count; ++i) {
+  for (i = 0; rc == LC_OK && i < count; ++i) {
     rc = healthy(view->space, error);
     if (rc != LC_OK)
       break;

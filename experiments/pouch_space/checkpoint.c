@@ -730,17 +730,6 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
   lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   return rc;
 }
-static int read_selected_slot(ps_key_checkpoint *c, const ps_values *values,
-                              size_t i, ps_key key, ps_ref ref, key_slot **out,
-                              lc_error *e) {
-  ps_reader *reader = NULL;
-  int rc = ps_values_read_open(values, i, &reader, e);
-  *out = NULL;
-  if (rc == LC_OK)
-    rc = decode_selected_slot(c, reader, key, ref, out, e);
-  ps_reader_close(reader);
-  return rc;
-}
 static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {
   if (slot->summary.index > c->state_index)
     c->state_index = slot->summary.index;
@@ -780,27 +769,38 @@ static void select_checkpoint(ps_key_checkpoint *c,
   c->latest_segment = selected->segment;
   c->latest_offset = selected->offset;
 }
-static int load_slot(void *context, ps_key key, ps_reader *reader,
-                     lc_error *e) {
-  ps_key_checkpoint *c = context;
+static int read_unique_slot(ps_key_checkpoint *c, ps_key_checkpoint *slots,
+                            ps_key key, ps_reader *reader, key_slot **out,
+                            lc_error *e) {
   ps_ref ref;
   key_slot *slot = NULL;
-  int rc;
-  if (key.kind == PS_NAMESPACE_CHECKPOINT)
-    return LC_OK;
-  rc = room(c, c->count + 1, e);
+  int rc = room(slots, slots->count + 1, e);
+  *out = NULL;
   if (rc == LC_OK) {
     ps_read_reference(reader, &ref);
     rc = decode_selected_slot(c, reader, key, ref, &slot, e);
   }
-  if (rc == LC_OK && (find_key(c, slot->key, key.kind) || find_id(c, key.key)))
+  if (rc == LC_OK &&
+      (find_key(slots, slot->key, key.kind) || find_id(slots, key.key)))
     rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a canonical key slot");
   if (rc == LC_OK)
-    install_selected_slot(c, slot);
+    *out = slot;
   else if (slot) {
     release_prepared_source(c, slot->body);
     close_slot(c, slot);
   }
+  return rc;
+}
+static int load_slot(void *context, ps_key key, ps_reader *reader,
+                     lc_error *e) {
+  ps_key_checkpoint *c = context;
+  key_slot *slot;
+  int rc;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT)
+    return LC_OK;
+  rc = read_unique_slot(c, c, key, reader, &slot, e);
+  if (rc == LC_OK)
+    install_selected_slot(c, slot);
   return rc;
 }
 int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
@@ -899,16 +899,36 @@ static void drop_selected_slot(ps_key_checkpoint *c, key_slot **link) {
   --c->count;
   close_slot(c, slot);
 }
+typedef struct checkpoint_rebase {
+  ps_key_checkpoint *resident, *staged;
+} checkpoint_rebase;
+static int stage_selected_slot(void *context, ps_key key, ps_reader *reader,
+                               lc_error *e) {
+  checkpoint_rebase *rebase = context;
+  key_slot *old, *slot;
+  int rc;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT)
+    return LC_OK;
+  old = find_id(rebase->resident, key.key);
+  if (old && old->retained && old->kind == key.kind)
+    return LC_OK;
+  rc =
+      read_unique_slot(rebase->resident, rebase->staged, key, reader, &slot, e);
+  if (rc == LC_OK)
+    insert_slot(rebase->staged, slot);
+  return rc;
+}
 /* Prepare all changed rows and their deletion obligations before consuming the
  * old ledger. The temporary slot indexes contain only rows needing decoding. */
 static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
                            const ps_checkpoint_info *coverage, lc_error *e) {
   ps_key_checkpoint staged = {0};
+  checkpoint_rebase rebase;
   key_slot **link, *s, *next, *old;
   ps_key key;
   ps_ref ref;
   uint64_t bytes;
-  size_t i, kept = 0;
+  size_t i, kept = 0, changed = 0;
   int rc = LC_OK;
   staged.allocator = c->allocator;
   for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
@@ -923,19 +943,16 @@ static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
       }
       old->retained = 1;
       ++kept;
-      continue;
-    }
-    rc = room(&staged, staged.count + 1, e);
-    if (rc == LC_OK)
-      rc = read_selected_slot(c, values, i, key, ref, &s, e);
-    if (rc == LC_OK) {
-      if (find_key(&staged, s->key, s->kind) || find_id(&staged, s->id)) {
-        release_prepared_source(c, s->body);
-        close_slot(c, s);
-        rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a staged slot");
-      } else
-        insert_slot(&staged, s);
-    }
+    } else
+      ++changed;
+  }
+  if (rc == LC_OK && changed) {
+    rebase.resident = c;
+    rebase.staged = &staged;
+    rc = ps_values_read_walk(values, stage_selected_slot, &rebase, e);
+    if (rc == LC_OK && staged.count != changed)
+      rc = failure(e, LC_ERR_PROTOCOL,
+                   "checkpoint changed slot has no captured payload");
   }
   for (s = staged.slots; rc == LC_OK && s; s = s->next) {
     old = find_id(c, s->id);

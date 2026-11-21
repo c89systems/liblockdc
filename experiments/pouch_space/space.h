@@ -234,7 +234,8 @@ size_t ps_values_count(const ps_values *);
 int ps_values_info(const ps_values *, size_t, ps_key *, ps_ref *, uint64_t *,
                    lc_error *);
 int ps_values_read_open(const ps_values *, size_t, ps_reader **, lc_error *);
-/* Read the pinned values in physical order with a shared packed-page buffer.
+/* Visit retained payloads in physical order with a shared packed-page buffer.
+ * Identity-only entries in a selective capture are skipped.
  * Each reader is borrowed for its callback. The caller may read it but must
  * leave its ownership with the walk and keep the capture open throughout. */
 typedef int (*ps_value_read_fn)(void *, ps_key, ps_reader *, lc_error *);

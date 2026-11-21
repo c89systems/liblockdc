@@ -1184,6 +1184,12 @@ static int packed_replay_visit(void *context, ps_key item, ps_reader *reader,
   captured_expect(reader, (unsigned char)(item.key % 251), 65);
   return LC_OK;
 }
+static int retain_odd_replay_slots(void *context, ps_key item,
+                                   uint64_t incarnation) {
+  (void)context;
+  REQUIRE(incarnation != 0);
+  return (item.key & 1) != 0;
+}
 static void packed_replay_locality(void) {
   packed_replay_probe probe = {0};
   ps_io io = {&probe,  packed_replay_read, packed_replay_write,
@@ -1191,7 +1197,7 @@ static void packed_replay_locality(void) {
   ps_options options = {0};
   ps_space *s = NULL;
   ps_writer *group[8] = {0};
-  ps_values *view = NULL;
+  ps_values *view = NULL, *selective = NULL;
   ps_reader *reader = NULL;
   ps_entry *slot;
   off_t corrupt;
@@ -1228,6 +1234,10 @@ static void packed_replay_locality(void) {
   ps_key sample = key(800);
   ok(ps_values_capture(s, sample.owner, PS_STATE, PS_STATE, &view, &e), &e);
   REQUIRE(ps_values_count(view) == 16);
+  ok(ps_internal_values_capture(s, sample.owner, PS_STATE, PS_STATE,
+                                retain_odd_replay_slots, NULL, &selective, &e),
+     &e);
+  REQUIRE(ps_values_count(selective) == 16);
   memset(bytes, 'z', sizeof(bytes));
   ps_writer *later = NULL;
   ok(ps_begin(s, NULL, key(807), &later, &e), &e);
@@ -1239,6 +1249,10 @@ static void packed_replay_locality(void) {
   ok(ps_values_read_walk(view, packed_replay_visit, &seen, &e), &e);
   REQUIRE(seen == 65535 && probe.reads == 1);
   ps_values_close(view);
+  probe.reads = seen = 0;
+  ok(ps_values_read_walk(selective, packed_replay_visit, &seen, &e), &e);
+  REQUIRE(seen == 0xaaaa && probe.reads == 1);
+  ps_values_close(selective);
   ok(ps_read_open(s, key(807), NULL, &reader, &e), &e);
   captured_expect(reader, 'z', sizeof(bytes));
   ps_reader_close(reader);

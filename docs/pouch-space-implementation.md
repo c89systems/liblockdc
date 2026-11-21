@@ -12292,3 +12292,74 @@ checkpoint adoption boundaries, maintenance tail and close, shared
 lease and messaging pressure, and root conversion with explicit growth.
 Raw trials and diagnostics are under
 `build/pouch-space-concurrent/parallel-adoption/`.
+
+## Reading selected namespace slots in physical order
+
+At `eea8320b`, an instrumented fixed-capacity NoSync run made 3,216 full
+state replays. Of these, 2,751 followed a checkpoint epoch change, 376
+followed a stream identity change, and 89 built a cold or invalidated
+cache. No replay used the same-stream suffix path. The replays decoded
+621,696 selected metadata slots and used 9.70 s of thread CPU in aggregate.
+
+State projection now walks the retained slots in physical order. The
+walk borrows one reader and a packed-page buffer for the capture. Each
+slot still has its own extent checksum. The walker visits checkpoint
+metadata before reading the uncovered append suffix in canonical order.
+The full replay continues to include selected decisions. Checkpoint
+adoption uses the same walker for changed slots, verifies the number
+of staged replacements, then installs the new ownership ledger.
+Identity-only slots in a selective capture remain available for matching.
+
+The packed-page fixture captures 16 slots and retains only the eight
+with odd IDs in the selective pass. It replaces one retained slot after
+capture. Both the complete and selective passes read their original
+values from one page fetch. Checkpoint and lifetime fault matrices and
+shared-source tests exercise errors and live replacement.
+
+All five candidate and both multifile trials verified through reopen.
+The frozen native NoSync trial returned an authority timeout in round 121.
+The frozen native durable trial verified in 41.90 s of work with 46.29 s
+of process CPU. All used eight writers, 24 rows and 128 rounds of 64 KiB
+values. Native capacity stayed at 10 MiB for 192 MiB of streamed writes.
+
+Work and process CPU through maintenance are in seconds. Mutation p95,
+close, reopen, and verification are in milliseconds. Native figures are
+medians of three NoSync and two durable trials. Each index phase measures
+its slowest worker per trial.
+
+| Backend | Durability | Work | CPU | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 23.37 | 32.51 | 132.99 | 33.75 | 36.60 | 56.59 | 23.73 |
+| Native | Durable | 40.30 | 44.21 | 173.41 | 31.51 | 33.97 | 53.49 | 23.75 |
+| Multifile | NoSync | 23.14 | 10.03 | 55.93 | 3.77 | 0.24 | 1.60 | 41.84 |
+| Multifile | Durable | 66.70 | 11.17 | 190.12 | 3.94 | 0.29 | 1.39 | 38.93 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 4.02 | 1.88 | 0.65 |
+| Native | Durable | 4.15 | 1.15 | 0.23 |
+| Multifile | NoSync | 6.39 | 4.03 | 4.82 |
+| Multifile | Durable | 8.11 | 11.29 | 14.94 |
+
+Native NoSync work was within 1% of the multifile control. It used 3.24
+times the CPU and had 2.38 times the mutation p95. Median native p95
+rose from 72 ms in rounds 1–16 to 182 ms in rounds 113–128. NoSync CPU,
+late-window latency, and reopen costs remain qualification gates.
+
+In a completed instrumented candidate run, the same replay scope used
+5.27 s of CPU for 624,091 metadata slots. The instrumented prior retry
+also timed out, with 8.35 s of replay CPU for 612,711 slots visited
+before shutdown. Replay times are diagnostic and exclude other work
+in each operation.
+
+A separate completed candidate trace compared the exact selected slot
+identities between successive captures on the same handle with empty
+append suffixes. Across 3,022 pairs, 584,967 of 592,233 selected slots
+kept their incarnation. There were 3,040 replacements, 4,226 additions,
+and no missing prior slots in those pairs. This exposes an opportunity
+to reuse resident key projections across checkpoint epochs, subject to
+checking the applied boundary and the current complete slot set.
+
+Verification passed 35 GNU Release groups and 24 groups each on Debug
+ASan/UBSan and musl Release. Raw timing, fault coverage and replay
+diagnostics are under `build/pouch-space-concurrent/state-refresh/`.

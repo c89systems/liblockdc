@@ -144,17 +144,25 @@ char *lc_pouch_namespace_segment_leaf(const lc_allocator *allocator,
   return lc_strdup_with_allocator(allocator, stack);
 }
 
+int lc_pouch_namespace_format_snapshot_leaf(uint64_t segment_id, char *buffer,
+                                            size_t capacity) {
+  size_t prefix = sizeof(LC_POUCH_SNAPSHOT_PREFIX) - 1;
+  if (capacity < prefix + 20U + sizeof(LC_POUCH_SNAPSHOT_SUFFIX) ||
+      lc_u64_format_base10_padded((lc_u64)segment_id, 20U, buffer + prefix,
+                                  capacity - prefix) != 20)
+    return 0;
+  memcpy(buffer, LC_POUCH_SNAPSHOT_PREFIX, prefix);
+  memcpy(buffer + prefix + 20U, LC_POUCH_SNAPSHOT_SUFFIX,
+         sizeof(LC_POUCH_SNAPSHOT_SUFFIX));
+  return 1;
+}
+
 char *lc_pouch_namespace_snapshot_leaf(const lc_allocator *allocator,
                                        uint64_t segment_id) {
   char stack[96];
-  char id[32];
-
-  if (lc_u64_format_base10_padded((lc_u64)segment_id, 20U, id, sizeof(id)) <
-          0 ||
-      snprintf(stack, sizeof(stack), "%s%s%s", LC_POUCH_SNAPSHOT_PREFIX, id,
-               LC_POUCH_SNAPSHOT_SUFFIX) < 0) {
+  if (!lc_pouch_namespace_format_snapshot_leaf(segment_id, stack,
+                                               sizeof(stack)))
     return NULL;
-  }
   return lc_strdup_with_allocator(allocator, stack);
 }
 
