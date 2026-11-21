@@ -155,12 +155,20 @@ struct ps_space {
   uint64_t metadata_workspace;
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload, reserved_metadata, reserved_entries;
+  /* Volatile budget ledger. A record page is physically owned and registered
+   * by its offset in a distinct OFD witness range. Foreign totals belong to
+   * one allocator capture. */
+  ps_run *credit_record;
+  uint64_t *credit_words;
+  uint64_t peer_metadata_credits, peer_entry_credits;
+  int credit_totals_checked;
   uint64_t physical_claim_bytes;
   /* Shared participants witness private checkpoint workspace. Selected pages
    * belong to canonical authority; retirement claims precede root selection. */
   uint64_t metadata_claim_bytes;
   uint64_t reader_claim_bytes;
   int metadata_claims_active;
+  int metadata_materialized;
   uint64_t claimed_free_bytes;
   size_t budgets;
   ps_budget_plan reserve_base;
@@ -287,6 +295,8 @@ int ps_internal_allowance(ps_space *, ps_budget *, uint64_t, uint64_t,
                           lc_error *);
 int ps_internal_budget_admit(ps_space *, int, const ps_budget_plan *,
                              const ps_budget_plan *, lc_error *);
+int ps_internal_budget_prepare_record(ps_space *, lc_error *);
+void ps_internal_budget_publish_record(ps_space *);
 void ps_internal_reserve_plan(ps_space *, ps_budget_plan *);
 int ps_internal_reserve_entry(ps_entry *, uint64_t deletion_bytes, lc_error *);
 int ps_internal_reserve_recheck(ps_space *, uint64_t deletion_bytes,

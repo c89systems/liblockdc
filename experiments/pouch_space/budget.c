@@ -560,7 +560,15 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     accounted = 1;
     rc = ps_internal_budget_admit(s, plan->maintenance, NULL, plan, e);
     if (rc == LC_OK)
+      rc = ps_internal_budget_prepare_record(s, e);
+    if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
+  }
+  if (accounted && rc != LC_OK) {
+    ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
+                             plan->entries);
+    ps_internal_budget_trim(s, &b->trim);
+    accounted = 0;
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   if (accounted) {
@@ -692,8 +700,16 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
     accounted = 1;
     if (grows)
       rc = ps_internal_budget_admit(s, plan->maintenance, &prior, plan, e);
+    if (rc == LC_OK && grows)
+      rc = ps_internal_budget_prepare_record(s, e);
     if (rc == LC_OK)
       rc = ps_internal_budget_ranges(s, s->reserved_payload, NULL, e);
+  }
+  if (accounted && rc != LC_OK) {
+    s->reserved_payload = payload + prior.payload_bytes;
+    s->reserved_metadata = metadata + prior.metadata_bytes;
+    s->reserved_entries = entries + prior.entries;
+    b->remaining = prior;
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
   if (accounted) {
@@ -704,6 +720,7 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
       b->remaining = prior;
     }
     ps_internal_budget_trim(s, &trim);
+    ps_internal_budget_publish_record(s);
     if (rc == LC_OK)
       rc = ps_internal_healthy(s, e);
   }
@@ -733,6 +750,7 @@ int ps_budget_close(ps_budget *b, lc_error *e) {
                            b->remaining.metadata_bytes, b->remaining.entries);
   --s->budgets;
   ps_internal_budget_trim(s, &b->trim);
+  ps_internal_budget_publish_record(s);
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, b->trim);
   lc_free_with_allocator(NULL, b->payload_trim);

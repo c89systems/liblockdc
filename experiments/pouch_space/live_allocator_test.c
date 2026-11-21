@@ -840,9 +840,10 @@ typedef struct query_gate {
 } query_gate;
 static int pause_query(void *context, int fd, int command, struct flock *lock) {
   query_gate *g = context;
+  int credit = command == F_OFD_GETLK &&
+               (uint64_t)lock->l_start == PS_CREDIT_RECORD_BASE;
   int rc = fcntl(fd, command, lock);
-  if (rc == 0 && command == F_OFD_GETLK && lock->l_type == F_UNLCK &&
-      lock->l_start >= PS_DATA) {
+  if (rc == 0 && credit) {
     pthread_mutex_lock(&g->mutex);
     if (g->armed) {
       g->armed = 0;
@@ -1414,10 +1415,7 @@ static int capture_lock(void *context, int fd, int command,
               : f->kind == 3 ? command == F_OFD_SETLKW && lock->l_start == 4
               : f->kind == 4 ? command == F_OFD_SETLK && lock->l_start == 4 &&
                                    lock->l_type == F_UNLCK
-              : f->kind == 5
-                  ? command == F_OFD_GETLK
-                  : command == F_OFD_SETLK && lock->l_start >= 2 * PS_PAGE &&
-                        lock->l_type == F_RDLCK;
+                             : f->kind == 5 && command == F_OFD_GETLK;
   if (f->armed && ((match && ++f->calls == f->nth) ||
                    (f->rollback && command == F_OFD_SETLK &&
                     lock->l_start >= 2 * PS_PAGE && lock->l_type == F_UNLCK))) {
@@ -2458,21 +2456,13 @@ static void projection_threads(void) {
   }
 }
 static void projection_boundaries(void) {
-  /* Admission and physical staging are one revision scope. Exercise partial
-   * workspace acquisition/rollback as well as uncertain final guard release. */
-  for (int kind = 3; kind <= 6; ++kind)
-    for (int reason = 0; reason < 4; ++reason) {
-      if (reason == 3 && kind != 6)
-        continue;
+  /* Exercise acquisition, witness observation and final guard release while
+   * a captured reader and a funded producer survive checkpoint adoption. */
+  for (int kind = 3; kind <= 5; ++kind)
+    for (int reason = 0; reason < 3; ++reason) {
       lc_error e = {0};
-      capture_fault f = {kind,
-                         reason == 0                  ? EINTR
-                         : reason == 1 || reason == 3 ? EAGAIN
-                                                      : EIO,
-                         0,
-                         reason == 3,
-                         kind == 6 ? 2U : 1U,
-                         0};
+      capture_fault f = {
+          kind, reason == 0 ? EINTR : reason == 1 ? EAGAIN : EIO, 0, 0, 1, 0};
       ps_coordination_io io = {&f, capture_lock};
       ps_options options = {0};
       options.coordination_io = &io;
@@ -2495,14 +2485,13 @@ static void projection_boundaries(void) {
       int rc = ps_refresh(a, &e);
       f.armed = 0;
       REQUIRE(f.calls >= f.nth);
-      int poisoned = ((kind == 4 || kind == 5) && reason) || reason == 3;
+      int poisoned = (kind == 4 || kind == 5) && reason;
       if (!reason) {
         ok(rc, &e);
         REQUIRE(a->generation > generation);
       } else {
-        REQUIRE(rc == ((kind == 3 || kind == 6) && reason == 1
-                           ? LC_ERR_PENDING
-                           : LC_ERR_TRANSPORT));
+        REQUIRE(rc ==
+                (kind == 3 && reason == 1 ? LC_ERR_PENDING : LC_ERR_TRANSPORT));
         lc_error_cleanup(&e);
         REQUIRE((a->generation > generation) == (kind == 4));
         if (!poisoned) {
@@ -3797,6 +3786,51 @@ static void quarantine_capacity(void) {
   ok(ps_close(s, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void quarantine_partial_release(void) {
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ps_budget *budget = NULL;
+  const uint64_t start = PS_DATA, first = start + PS_MIB,
+                 second = first + PS_MIB, end = second + PS_MIB;
+  struct flock hold = {0};
+  ok(ps_open(path, 1, NULL, &s, &e), &e);
+  int peer = quarantine_witness(0, 0);
+  hold.l_type = F_RDLCK;
+  hold.l_whence = SEEK_SET;
+  hold.l_start = (off_t)start;
+  hold.l_len = (off_t)(end - start);
+  REQUIRE(!fcntl(peer, F_OFD_SETLK, &hold));
+  ok(ps_budget_foreground_check(s, &e), &e);
+  REQUIRE(status(s).retired_bytes == end - start);
+  hold.l_type = F_UNLCK;
+  hold.l_len = (off_t)(first - start);
+  REQUIRE(!fcntl(peer, F_OFD_SETLK, &hold));
+  hold.l_start = (off_t)(first + PS_CELL);
+  hold.l_len = (off_t)(second - (first + PS_CELL));
+  REQUIRE(!fcntl(peer, F_OFD_SETLK, &hold));
+  hold.l_start = (off_t)(second + PS_PAGE);
+  hold.l_len = (off_t)(end - (second + PS_PAGE));
+  REQUIRE(!fcntl(peer, F_OFD_SETLK, &hold));
+
+  /* An ordinary probe can still defer a large partially pinned interval.
+   * A capacity check must free every negative residual while keeping both
+   * pages touched by the remaining witnesses. */
+  ok(ps_budget_foreground_check(s, &e), &e);
+  REQUIRE(status(s).retired_bytes == end - start);
+  ps_budget_plan plan = {s->free_bytes + end - start - PS_PAGE, 0, 0, 1};
+  REQUIRE(ps_budget_open(s, &plan, &budget, &e) == LC_ERR_INVALID && !budget);
+  lc_error_cleanup(&e);
+  REQUIRE(status(s).retired_bytes == 2 * PS_PAGE);
+  plan.payload_bytes -= PS_PAGE;
+  ok(ps_budget_open(s, &plan, &budget, &e), &e);
+  REQUIRE(status(s).claimed_payload_bytes == plan.payload_bytes);
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(!close(peer));
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(!status(s).retired_bytes);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct witness_queries {
   size_t payload;
   size_t large;
@@ -3804,7 +3838,8 @@ typedef struct witness_queries {
 static int count_payload_queries(void *context, int fd, int command,
                                  struct flock *lock) {
   witness_queries *queries = context;
-  if (command == F_OFD_GETLK && lock->l_start >= PS_DATA) {
+  if (command == F_OFD_GETLK && lock->l_start >= PS_DATA &&
+      (uint64_t)lock->l_start < PS_MAX_CAPACITY) {
     ++queries->payload;
     if (lock->l_len >= (off_t)PS_MIB)
       ++queries->large;
@@ -6502,6 +6537,7 @@ int main(int argc, char **argv) {
     certified_resident_observation(1);
   } else if (!strcmp(argv[2], "quarantine")) {
     quarantine_capacity();
+    quarantine_partial_release();
     quarantine_packed();
     witness_filter();
   } else if (!strcmp(argv[2], "journal-replay"))

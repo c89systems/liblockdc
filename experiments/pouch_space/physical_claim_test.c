@@ -168,6 +168,11 @@ static uint64_t kernel_region(uint64_t start, uint64_t end) {
   return total;
 }
 static uint64_t kernel_bytes(void) { return kernel_region(PS_DATA, 0); }
+static uint64_t kernel_payload(void) {
+  REQUIRE(!capturing);
+  return kernel_bytes() - PS_PAGE * kernel_region(PS_CREDIT_RECORD_BASE,
+                                                  PS_TRANSACTION_GUARD_BASE);
+}
 static uint64_t kernel_metadata(void) {
   return kernel_region(2 * PS_PAGE, PS_JOURNAL_OFFSET) + kernel_bytes();
 }
@@ -237,10 +242,10 @@ static void lifecycle(void) {
     ps_budget_plan plan = {16 * PS_PAGE, 4096, 4, 0};
     ok(ps_open(path, 1, &options, &s, &e), &e);
     ok(ps_budget_open(s, &plan, &a, &e), &e);
-    REQUIRE(kernel_bytes() == plan.payload_bytes);
+    REQUIRE(kernel_payload() == plan.payload_bytes);
     ps_budget_plan second = {8 * PS_PAGE, 4096, 4, 0};
     ok(ps_budget_open(s, &second, &b, &e), &e);
-    REQUIRE(kernel_bytes() == 24 * PS_PAGE);
+    REQUIRE(kernel_payload() == 24 * PS_PAGE);
     ps_budget_plan move = {PS_PAGE, 0, 0, 0};
     allocations = 0;
     allocation_fail = 1;
@@ -254,7 +259,7 @@ static void lifecycle(void) {
     REQUIRE(plan.payload_bytes == 15 * PS_PAGE);
     plan.payload_bytes += 2 * PS_PAGE;
     ok(ps_budget_resize(a, &plan, &e), &e);
-    REQUIRE(kernel_bytes() == 26 * PS_PAGE);
+    REQUIRE(kernel_payload() == 26 * PS_PAGE);
     before = f.calls;
     allocations = 0;
     measuring = 1;
@@ -268,7 +273,7 @@ static void lifecycle(void) {
     measuring = 0;
     ok(rc, &e);
     REQUIRE(!allocations);
-    REQUIRE(kernel_bytes() == 17 * PS_PAGE);
+    REQUIRE(kernel_payload() == 17 * PS_PAGE);
     ps_writer *w = NULL;
     unsigned char *body = malloc(PS_CHUNK);
     REQUIRE(body);
@@ -279,12 +284,12 @@ static void lifecycle(void) {
     REQUIRE(st.claimed_payload_bytes == 17 * PS_PAGE &&
             st.private_bytes == PS_CHUNK);
     REQUIRE(st.reserved_payload_bytes == 13 * PS_PAGE &&
-            kernel_bytes() == 17 * PS_PAGE);
+            kernel_payload() == 17 * PS_PAGE);
     ok(ps_checkpoint(s, &e), &e);
-    REQUIRE(kernel_bytes() == 17 * PS_PAGE);
+    REQUIRE(kernel_payload() == 17 * PS_PAGE);
     ok(ps_publish(w, NULL, &e), &e);
     ps_writer_close(w);
-    REQUIRE(kernel_bytes() == 13 * PS_PAGE);
+    REQUIRE(kernel_payload() == 13 * PS_PAGE);
     ok(ps_budget_close(a, &e), &e);
     REQUIRE(kernel_bytes() == 0);
     verify(s, 1, PS_CHUNK, &e);
@@ -325,7 +330,7 @@ static void fragmented_faults(void) {
   size_t sites = allocations, locks = f.calls;
   ok(rc, &e);
   REQUIRE(locks >= 17 && sites >= 4);
-  REQUIRE(kernel_bytes() == plan.payload_bytes);
+  REQUIRE(kernel_payload() == plan.payload_bytes);
   ok(ps_budget_close(b, &e), &e);
   b = NULL;
   for (size_t site = 1; site <= sites; ++site) {
@@ -415,16 +420,16 @@ static void faults(void) {
   ok(ps_close(s, &e), &e);
   REQUIRE(kernel_bytes() == 0);
   ok(ps_open(path, 0, &options, &s, &e), &e);
-  /* Metadata now retains the presence witness. Use fragmented payload claims
-   * to reach a second acquisition and its rollback release independently. */
+  /* Fail record registration after the physical acquisition, then fail the
+   * rollback release. The witnesses must survive until owner close. */
   for (uint64_t id = 1; id <= 8; ++id)
     ok(publish(s, NULL, id, PS_PAGE, &e), &e);
   for (uint64_t id = 1; id <= 8; id += 2)
     ok(ps_delete(s, key(id), &e), &e);
   ok(ps_checkpoint(s, &e), &e);
   f.calls = 0;
-  f.fail = 2;
-  f.fail2 = 3;
+  f.fail = 3;
+  f.fail2 = 4;
   REQUIRE(ps_budget_open(s, &plan, &b, &e) == LC_ERR_TRANSPORT && !b);
   lc_error_cleanup(&e);
   f.fail = f.fail2 = 0;
@@ -472,16 +477,16 @@ static void metadata_lifecycle(void) {
     ps_stats st = status(s, &e);
     REQUIRE(st.claimed_metadata_bytes == kernel_metadata() &&
             st.claimed_payload_bytes == 0);
-    /* Admission crosses the fixed-region capacity and several directory
-     * levels. All promised metadata is observable from an independent OFD. */
+    /* Admission crosses several directory levels. One physical record is
+     * enough to keep the promise across checkpoints. */
     ps_budget_plan plan = {0, 512 * 1024, 4096, 0};
     ok(ps_budget_open(s, &plan, &budget, &e), &e);
     ps_budget_plan empty = {0};
     ok(ps_budget_open(s, &empty, &peer, &e), &e);
     st = status(s, &e);
-    REQUIRE(st.metadata_available_bytes > PS_METADATA_RESERVE &&
-            st.claimed_metadata_bytes == kernel_metadata() &&
-            st.claimed_metadata_bytes == st.metadata_available_bytes);
+    REQUIRE(st.metadata_workspace_bytes > PS_METADATA_RESERVE &&
+            st.claimed_metadata_bytes == PS_PAGE &&
+            st.claimed_metadata_bytes == kernel_metadata());
     size_t before = f.calls;
     allocations = 0;
     allocation_fail = 1;
@@ -490,16 +495,14 @@ static void metadata_lifecycle(void) {
     measuring = 0;
     ok(rc, &e);
     REQUIRE(!allocations && f.calls == before);
-    /* Selections and deletions around 31/32 and 961/962 entries exercise
-     * image growth, shrink, COW reuse and the forecast's lifetime. */
+    /* Selections and deletions exercise image growth, shrink, and reuse. */
     for (uint64_t id = 1; id <= 994; ++id) {
       ok(publish(s, peer, id, 0, &e), &e);
-      if (id == 31 || id == 32 || id == 961 || id == 962 || id == 994) {
+      if (id == 63 || id == 64 || id == 994) {
         ok(ps_checkpoint(s, &e), &e);
         st = status(s, &e);
-        REQUIRE(st.claimed_metadata_bytes == kernel_metadata() &&
-                st.metadata_available_bytes >= st.metadata_workspace_bytes &&
-                st.claimed_metadata_bytes == st.metadata_available_bytes);
+        REQUIRE(st.claimed_metadata_bytes == PS_PAGE &&
+                st.claimed_metadata_bytes == kernel_metadata());
       }
     }
     for (uint64_t id = 32; id <= 994; ++id)
@@ -539,17 +542,13 @@ static void metadata_faults(void) {
   lock_fault f = {0};
   ps_coordination_io io = {&f, lock_call};
   options.coordination_io = &io;
-  /* Creation failures consume no FD authority. Initial metadata ownership
-   * installs a presence witness followed by its fixed-region witness. */
-  for (size_t site = 1; site <= 2; ++site) {
-    f.calls = 0;
-    f.fail = site;
-    f.reason = EIO;
-    REQUIRE(ps_open(path, 1, &options, &s, &e) == LC_ERR_TRANSPORT && !s);
-    f.fail = 0;
-    lc_error_cleanup(&e);
-    REQUIRE(kernel_metadata() == 0 && unlink(path) == 0);
-  }
+  /* Even an empty root needs a live member witness. */
+  f.fail = 1;
+  f.reason = EIO;
+  REQUIRE(ps_open(path, 1, &options, &s, &e) == LC_ERR_TRANSPORT && !s);
+  f.fail = 0;
+  lc_error_cleanup(&e);
+  REQUIRE(kernel_metadata() == 0 && unlink(path) == 0);
   ok(ps_open(path, 1, &options, &s, &e), &e);
   for (uint64_t id = 1; id <= 32; ++id)
     ok(publish(s, NULL, id, 0, &e), &e);
@@ -650,8 +649,8 @@ static void metadata_fragmented_faults(void) {
     ok(ps_delete(s, key(id), &e), &e);
   ok(ps_checkpoint(s, &e), &e);
   uint64_t initial = kernel_metadata();
-  /* The protected images must exceed the free tail so admission acquires
-   * several disjoint metadata claims and can fail partway through. */
+  /* The protected images exceed the free tail. Logical admission still
+   * needs only a single physical record, even on a fragmented root. */
   ps_budget_plan plan = {0, 2 * PS_MIB, 8192, 0};
   f.calls = allocations = allocation_fail = 0;
   measuring = 1;
@@ -692,8 +691,8 @@ static void metadata_fragmented_faults(void) {
       REQUIRE(kernel_metadata() == initial);
     }
   f.calls = 0;
-  f.fail = 2;
-  f.fail2 = 3;
+  f.fail = 3;
+  f.fail2 = 4;
   f.reason = EIO;
   REQUIRE(ps_budget_open(s, &plan, &budget, &e) == LC_ERR_TRANSPORT && !budget);
   f.fail = f.fail2 = 0;
@@ -757,13 +756,11 @@ static void metadata_checkpoint_faults(void) {
       lc_error_cleanup(&e);
       if (!f.failed_release) {
         ps_stats st = status(s, &e);
-        /* A failed checkpoint may retain its optional incremental spare.
-         * Separate the captured old body from protected free workspace. */
+        /* Healthy failure returns borrowed workspace to the root. */
         REQUIRE(kernel_metadata() ==
                     st.claimed_metadata_bytes + st.retained_payload_bytes &&
                 st.retained_payload_bytes == 4 * PS_MIB &&
-                st.claimed_metadata_bytes == st.metadata_available_bytes &&
-                st.metadata_available_bytes >= st.metadata_workspace_bytes);
+                st.claimed_metadata_bytes == PS_PAGE);
         ok(ps_checkpoint(s, &e), &e);
       }
     }
@@ -829,6 +826,10 @@ static void metadata_producers(void) {
   gate g = {0};
   pthread_t thread;
   funded_work work = {0};
+  ps_space *publisher = NULL;
+  ps_budget *padding = NULL, *refused = NULL;
+  uint64_t available;
+  int pressure;
   REQUIRE(pthread_mutex_init(&g.mutex, NULL) == 0 &&
           pthread_cond_init(&g.cond, NULL) == 0);
   ps_io io = {&g, read_io, write_io, sync_io, reserve_io, NULL};
@@ -846,20 +847,36 @@ static void metadata_producers(void) {
   pthread_mutex_unlock(&g.mutex);
   REQUIRE(ps_budget_close(work.budget, &e) == LC_ERR_INVALID);
   lc_error_cleanup(&e);
-  for (uint64_t id = 2; id <= 64; ++id) {
-    ok(publish(work.space, NULL, id, 0, &e), &e);
-    ok(ps_checkpoint(work.space, &e), &e);
+  ok(ps_open(path, 0, NULL, &publisher, &e), &e);
+  for (uint64_t id = 2; id <= 65; ++id) {
+    ok(publish(publisher, NULL, id, 0, &e), &e);
+    if (id == 64 || id == 65)
+      ok(ps_checkpoint(publisher, &e), &e);
     ps_stats st = status(work.space, &e);
-    REQUIRE(st.metadata_available_bytes >= st.metadata_workspace_bytes &&
-            st.claimed_metadata_bytes + st.claimed_payload_bytes ==
+    REQUIRE(st.claimed_metadata_bytes + st.claimed_payload_bytes ==
                 kernel_metadata() &&
+            st.claimed_metadata_bytes == PS_PAGE &&
             st.claimed_payload_bytes == 128);
   }
+  ok(ps_maintenance_pressure(publisher, 1, &pressure, &available, &e), &e);
+  ps_budget_plan fill = {available, 0, 0, 0};
+  ok(ps_budget_open(publisher, &fill, &padding, &e), &e);
+  ps_budget_plan extra = {PS_PAGE, 0, 0, 0};
+  REQUIRE(ps_budget_open(publisher, &extra, &refused, &e) == LC_ERR_INVALID &&
+          !refused);
+  lc_error_cleanup(&e);
   pthread_mutex_lock(&g.mutex);
   g.released = 1;
   pthread_cond_broadcast(&g.cond);
   pthread_mutex_unlock(&g.mutex);
   REQUIRE(pthread_join(thread, NULL) == 0);
+  ok(ps_checkpoint(publisher, &e), &e);
+  verify(publisher, 1, 65, &e);
+  ok(ps_budget_close(padding, &e), &e);
+  ok(ps_grow(publisher, PS_MIB, &e), &e);
+  ok(ps_refresh(work.space, &e), &e);
+  REQUIRE(status(work.space, &e).capacity == PS_DEFAULT_CAPACITY + PS_MIB);
+  ok(ps_close(publisher, &e), &e);
   ok(ps_budget_close(work.budget, &e), &e);
   verify(work.space, 1, 65, &e);
   ok(ps_checkpoint(work.space, &e), &e);
@@ -957,13 +974,13 @@ static void owned_producers(void) {
   pthread_mutex_unlock(&g.mutex);
   /* The funded page and borrowed zero-preparation suffix remain one private
    * physical owner until the preparation barrier permits suffix reuse. */
-  REQUIRE(kernel_bytes() == PS_MIB &&
+  REQUIRE(kernel_payload() == PS_MIB &&
           status(s, &e).claimed_payload_bytes == PS_MIB);
   REQUIRE(ps_budget_close(work.budget, &e) == LC_ERR_INVALID);
   lc_error_cleanup(&e);
   ok(publish(s, NULL, 4, 32, &e), &e);
   verify(s, 4, 32, &e);
-  REQUIRE(kernel_bytes() == PS_MIB);
+  REQUIRE(kernel_payload() == PS_MIB);
   pthread_mutex_lock(&g.mutex);
   g.released = 1;
   pthread_cond_broadcast(&g.cond);
@@ -1021,10 +1038,8 @@ static void child_metadata(int ready, int control) {
   REQUIRE(close(ready) == 0 && close(control) == 0);
 }
 static void metadata_processes(void) {
-  /* Publication has exactly one active canonical allocator at a time. The
-   * other process retains real metadata credits but
-   * performs no further publication. This isolates peer resource exclusion
-   * from the pending incremental projection/allocator-refresh integration. */
+  /* An idle child holds large logical credits using one physical page.
+   * A live peer must honor the credits until release or owner death. */
   for (int killed = 0; killed < 2; ++killed) {
     int ready[2], control[2];
     REQUIRE(pipe(ready) == 0 && pipe(control) == 0);
@@ -1045,7 +1060,7 @@ static void metadata_processes(void) {
     REQUIRE(read(ready[0], &foreign, sizeof(foreign)) ==
             (ssize_t)sizeof(foreign));
     REQUIRE(!foreign.claimed_payload_bytes &&
-            foreign.claimed_metadata_bytes > PS_METADATA_RESERVE);
+            foreign.claimed_metadata_bytes == PS_PAGE);
     capturing = 1;
     REQUIRE(kernel_metadata() == foreign.claimed_metadata_bytes);
     capturing = 0;
@@ -1053,22 +1068,27 @@ static void metadata_processes(void) {
     ps_space *s = NULL;
     ok(ps_open(path, 0, NULL, &s, &e), &e);
     ps_stats initial = status(s, &e);
-    REQUIRE(initial.retired_bytes >= foreign.metadata_available_bytes &&
-            initial.metadata_available_bytes >=
-                initial.metadata_workspace_bytes);
+    REQUIRE(initial.retired_bytes >= foreign.claimed_metadata_bytes);
     for (uint64_t id = 3; id <= 1000; ++id)
       ok(publish(s, NULL, id, 0, &e), &e);
     ok(publish(s, NULL, 1001, 65536, &e), &e);
     ok(ps_checkpoint(s, &e), &e);
     verify(s, 2, 81, &e);
     verify(s, 1001, 65536, &e);
-    /* Churn the selected directory while the private workspace remains held.
-     * Canonical pages can be retired without taking the peer's future pool. */
+    /* Churn can borrow a working image without changing the peer's record. */
     for (int round = 0; round < 8; ++round) {
       ok(publish(s, NULL, 1003, 0, &e), &e);
       ok(ps_checkpoint(s, &e), &e);
     }
     verify_images();
+    uint64_t available;
+    int pressure;
+    ps_budget *probe = NULL;
+    ok(ps_maintenance_pressure(s, 1, &pressure, &available, &e), &e);
+    ps_budget_plan headroom = {available + 16 * PS_PAGE, 0, 0, 0};
+    REQUIRE(ps_budget_open(s, &headroom, &probe, &e) == LC_ERR_INVALID &&
+            !probe);
+    lc_error_cleanup(&e);
     char reply;
     int state;
     if (killed) {
@@ -1090,6 +1110,8 @@ static void metadata_processes(void) {
     ps_stats drained = status(s, &e);
     REQUIRE(drained.retired_bytes == 0 &&
             kernel_metadata() == drained.claimed_metadata_bytes);
+    ok(ps_budget_open(s, &headroom, &probe, &e), &e);
+    ok(ps_budget_close(probe, &e), &e);
     ok(publish(s, NULL, 1002, 2 * PS_MIB, &e), &e);
     verify(s, 1002, 2 * PS_MIB, &e);
     ok(ps_checkpoint(s, &e), &e);
@@ -1119,7 +1141,7 @@ static void processes(void) {
   REQUIRE(close(ready[1]) == 0);
   char reply;
   REQUIRE(read(ready[0], &reply, 1) == 1 && reply == 'R');
-  REQUIRE(kernel_bytes() == PS_MIB);
+  REQUIRE(kernel_payload() == PS_MIB);
   REQUIRE(kill(pid, SIGKILL) == 0);
   int state;
   REQUIRE(waitpid(pid, &state, 0) == pid && WIFSIGNALED(state) &&

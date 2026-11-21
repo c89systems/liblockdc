@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [local capture handoff](#local-namespace-capture-handoff), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), and [packed-page replay](#packed-page-reads-during-eager-admission) | Cold replay cost and [sustained fixed-capacity admission](#sustained-indexed-work-and-checkpoint-workspace) remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), [packed-page replay](#packed-page-reads-during-eager-admission), and [96 MiB of verified independent-writer churn at 10 MiB](#shared-checkpoint-capacity) | NoSync mutation tails, CPU cost, and grouped reopen remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -11828,3 +11828,82 @@ Raw trials and traces are in `build/pouch-space-concurrent/sustained/`.
 The independent native case can be reproduced with the
 `pouch_space_lifecycle_compare` target and the arguments
 `runtime-shared-index DIRECTORY 24 65536 SYNC 8 --rounds 64 --stable-index --reclaim --reopen`.
+
+## Shared checkpoint capacity
+
+The allocator computes one packed-image bound per root from canonical
+descriptor bytes and entries plus all outstanding positive credits. It
+adds the counts before rounding descriptor and directory pages, so a
+peer publication across a page boundary preserves the full funded amount.
+A funded publication exchanges its credits for live metadata within the
+same allocator scope. Payload credits continue to own specific free ranges,
+and producers release allocator authority before writing their bodies.
+
+Let `B` be the packed-image bound, `A` the selected metadata size and
+`F` the available checkpoint capacity after payload claims. Admission
+preserves both `F >= B` and `F + A >= 2B`. A dense rewrite selects at
+most `B` bytes and retires the prior image, preserving both bounds.
+Path copying requires extra headroom for its new pages and preserves
+one packed successor alongside the selected image. A shared publisher
+borrows physical pages while holding allocator authority. It returns
+the surplus after durable selection and retirement or a healthy abort.
+
+A handle with outstanding metadata credits owns one 4 KiB scratch page
+for two counters. An OFD lock in a separate advisory range registers the
+page by its physical address. The allocator reads only registered pages,
+and caches foreign totals for the duration of one capture. Credit changes
+are published under allocator authority. A handle can drop a completed
+record by releasing its registration and then its physical witness. A
+peer that already observed the registration can finish reading its old
+contents because reuse requires allocator authority. Process exit releases
+both witnesses. The advisory range uses part of the theoretical stream
+incarnation address space and leaves transaction lock addresses intact.
+The counter page uses ordinary container capacity and contains volatile
+scratch. Live participants use the same coordination protocol.
+
+A full pressure pass now rechecks both residuals of a quarantined interval
+when a peer releases part of its former lock. Each residual gets its own
+kernel query. A deterministic fixture starts with a contiguous 3 MiB
+witness and releases all but one cell and one page. A budget takes the
+released pages while the two affected pages remain protected. Another
+fixture pauses a funded producer during payload I/O while a peer grows the
+directory across 63 to 64 entries, checkpoints, and reserves all ordinary
+headroom. The producer finishes, its value verifies through the peer, and
+both handles adopt explicit 1 MiB growth. Graceful release and SIGKILL
+fixtures verify that capacity held by a foreign record becomes available.
+
+The checkpoint-capacity change passed 70 GNU Release groups. After the
+quarantine change, 37 targeted GNU groups and 20 groups each on Debug
+ASan/UBSan and musl Release passed. Scope included checkpoint and allocation
+faults, prepared grants, adoption, retained readers, lease and messaging
+capacity, and shared collection capacity. GNU also verified root conversion
+at the initial capacity, through explicit growth, and across a crash.
+
+The final timing rotation verified all six runs of the 96 MiB workload.
+Native ran twice per durability mode at 10 MiB and multifile ran once per
+mode. All runs used 24 rows, 64 rounds and eight independent producer handles.
+The tables report medians. Work and CPU are in seconds. Mutation p95, close,
+reopen and post-reopen verification are in milliseconds.
+
+| Backend | Durability | Work | CPU through maintenance | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 11.67 | 13.84 | 129.62 | 15.48 | 21.89 | 25.67 | 20.55 |
+| Multifile | NoSync | 10.77 | 4.11 | 53.00 | 2.52 | 0.22 | 1.35 | 24.50 |
+| Native | Durable | 21.99 | 18.80 | 189.20 | 17.82 | 23.78 | 67.99 | 22.86 |
+| Multifile | Durable | 33.49 | 5.38 | 192.06 | 2.60 | 0.22 | 1.22 | 23.11 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) | First pass after reopen (ms) | Repeat pass after reopen (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 2.07 | 0.69 | 0.27 | 2.17 | 1.01 |
+| Multifile | NoSync | 2.97 | 1.75 | 2.34 | 3.13 | 2.08 |
+| Native | Durable | 2.34 | 0.47 | 0.20 | 2.23 | 1.21 |
+| Multifile | Durable | 3.81 | 5.54 | 7.91 | 2.92 | 1.86 |
+
+Before partial quarantine was corrected, both final uninstrumented NoSync
+runs refused late mutations despite zero retained checkpoint claims. Both
+durable runs passed. Four subsequent instrumented NoSync runs passed and
+observed 4–12 KiB residuals in intervals still fully quarantined during
+capacity refusals. The final sample establishes the 96 MiB workload at the
+development capacity. NoSync mutation tails, CPU and grouped reopen still
+need performance qualification. Raw data is under
+`build/pouch-space-concurrent/root-workspace/`.

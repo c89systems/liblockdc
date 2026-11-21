@@ -11,12 +11,16 @@
  * Stop concurrent calls before closing the space itself. */
 #define PS_MIB UINT64_C(1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
-/* The upper half of signed file offsets is reserved for stream and
- * transaction authority. These bytes are never allocated or read. */
+/* The upper half of signed file offsets is reserved for stream,
+ * credit-record and transaction witnesses. It has no physical pages. */
 #define PS_MAX_CAPACITY (UINT64_C(1) << 62)
 #define PS_TRANSACTION_GUARD_SLOTS (UINT64_C(1) << 60)
-#define PS_MAX_INCARNATION                                                     \
-  ((uint64_t)INT64_MAX - PS_MAX_CAPACITY - PS_TRANSACTION_GUARD_SLOTS)
+#define PS_CREDIT_RECORD_SLOTS (PS_MAX_CAPACITY / PS_PAGE)
+#define PS_TRANSACTION_GUARD_BASE                                              \
+  ((uint64_t)INT64_MAX - PS_TRANSACTION_GUARD_SLOTS)
+#define PS_CREDIT_RECORD_BASE                                                  \
+  (PS_TRANSACTION_GUARD_BASE - PS_CREDIT_RECORD_SLOTS)
+#define PS_MAX_INCARNATION (PS_CREDIT_RECORD_BASE - PS_MAX_CAPACITY)
 /* Native experiment: filesystem block-sized physical allocation with small
  * logical tails sharing independently owned cells. */
 #define PS_PAGE 4096U
@@ -109,18 +113,17 @@ typedef struct ps_stats {
   uint64_t entries, metadata_bytes, journal_bytes, syncs, checkpoints;
   uint64_t sync_requests, sync_batches, max_sync_batch;
   uint64_t metadata_pages, directory_page_writes, descriptor_page_writes;
-  /* Free pages protected from payload allocation and the complete current
-   * plus claimed-future checkpoint bound. After successful checkpoint,
-   * available >= workspace. */
+  /* Resident free metadata pages and the last computed packed checkpoint
+   * bound. Shared roots borrow any additional pages under allocator authority.
+   */
   uint64_t metadata_available_bytes, metadata_workspace_bytes;
   uint64_t metadata_fallbacks;
   uint64_t reserved_payload_bytes, reserved_metadata_bytes, reserved_entries;
   /* Unspent claims plus unpublished payload allocations, covered by lifetime
    * file authority or shared range witnesses. No second allocation charge. */
   uint64_t claimed_payload_bytes;
-  /* Free/prepared checkpoint workspace and pending retirement claims of a
-   * shared participant. Canonically selected pages belong to the root.
-   * Exclusive lifetime authority needs no separate witnesses. */
+  /* The volatile credit record plus prepared workspace and retirement claims
+   * of a shared participant. Selected pages belong to the root. */
   uint64_t claimed_metadata_bytes;
   /* Local captured payload witnesses on shared roots, excluding unspent and
    * unpublished producer ownership. Counted once per retained incarnation. */

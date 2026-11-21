@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -585,6 +586,7 @@ static int allocation_lock(ps_space *s, ps_coordination_guard **guard, int wait,
   if (rc == LC_OK) {
     s->allocation_guard = *guard;
     s->allocation_ranges_checked = 0;
+    s->credit_totals_checked = 0;
   }
   return rc;
 }
@@ -595,6 +597,7 @@ static int allocation_begin(ps_space *s, ps_coordination_guard **guard,
 static int allocation_end(ps_space *s, ps_coordination_guard *guard, int rc,
                           lc_error *error) {
   if (guard) {
+    ps_internal_budget_publish_record(s);
     s->allocation_guard = NULL;
     ps_coordination_unlock(guard);
     if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
@@ -920,6 +923,140 @@ static int take_interval(ps_run **head, uint64_t *available, uint64_t *bytes,
                "container payload capacity exhausted; checkpoint or grow");
   take_selected(link, available, *bytes, out, clean);
   return LC_OK;
+}
+static uint64_t credit_record_slot(uint64_t offset) {
+  return PS_CREDIT_RECORD_BASE + offset / PS_PAGE;
+}
+int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
+  ps_run **link, **last = NULL, *source, *run;
+  void *mapping;
+  int rc;
+  if (!s->allocation_guard || s->credit_record ||
+      (!s->reserved_metadata && !s->reserved_entries))
+    return LC_OK;
+  /* Keep contiguous prepared payload at the start of common intervals. */
+  for (link = &s->free; *link; link = &(*link)->next)
+    if (!(*link)->claimed)
+      last = link;
+  if (!last)
+    return err(error, LC_ERR_INVALID, "container budget credit page exhausted");
+  run = lc_calloc_with_allocator(NULL, 1, sizeof(*run));
+  if (!run)
+    return err(error, LC_ERR_NOMEM, "cannot allocate budget credit record");
+  source = *last;
+  source->bytes -= PS_PAGE;
+  run->offset = source->offset + source->bytes;
+  run->bytes = PS_PAGE;
+  s->free_bytes -= PS_PAGE;
+  if (!source->bytes) {
+    *last = source->next;
+    lc_free_with_allocator(NULL, source);
+  }
+  rc = metadata_claim_range(s, run->offset, run->bytes, error);
+  if (rc == LC_OK) {
+    ps_readiness_zero_pages(s, run->offset, run->bytes, 0);
+    mapping = mmap(NULL, PS_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd,
+                   (off_t)run->offset);
+    if (mapping == MAP_FAILED)
+      rc = err(error, LC_ERR_TRANSPORT, "cannot map budget credit record");
+    else {
+      uint64_t *words = mapping;
+      words[0] = words[1] = 0;
+      rc = ps_coordination_range(s->coordination,
+                                 credit_record_slot(run->offset), 1, 1, error);
+      if (rc == LC_OK) {
+        s->credit_record = run;
+        s->credit_words = words;
+        return LC_OK;
+      }
+      (void)munmap(mapping, PS_PAGE);
+    }
+    (void)metadata_release_range(s, run->offset, run->bytes, NULL);
+  }
+  free_insert(s, run);
+  return rc;
+}
+void ps_internal_budget_publish_record(ps_space *s) {
+  ps_run *run = s->credit_record;
+  ps_coordination_guard *guard = NULL;
+  if (!run || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+    return;
+  if (s->reserved_metadata || s->reserved_entries) {
+    if (__atomic_load_n(s->credit_words, __ATOMIC_RELAXED) ==
+            s->reserved_metadata &&
+        __atomic_load_n(s->credit_words + 1, __ATOMIC_RELAXED) ==
+            s->reserved_entries)
+      return;
+    if (s->allocation_guard) {
+      __atomic_store_n(s->credit_words, s->reserved_metadata, __ATOMIC_RELEASE);
+      __atomic_store_n(s->credit_words + 1, s->reserved_entries,
+                       __ATOMIC_RELEASE);
+    } else if (allocation_begin(s, &guard, NULL) == LC_OK) {
+      /* An out-of-capture partial shrink changes the same two-word record
+       * a peer may be reading. Publish both words under allocator authority. */
+      (void)allocation_end(s, guard, LC_OK, NULL);
+    } else {
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    }
+    return;
+  }
+  /* Leave the record unchanged. A peer may already have observed its slot
+   * under allocation authority. That peer can still read the old promise:
+   * reuse of the physical page needs the same allocator guard. */
+  if (ps_coordination_range(s->coordination, credit_record_slot(run->offset), 1,
+                            0, NULL) != LC_OK ||
+      metadata_release_range(s, run->offset, run->bytes, NULL) != LC_OK)
+    return;
+  (void)munmap(s->credit_words, PS_PAGE);
+  s->credit_words = NULL;
+  s->credit_record = NULL;
+  free_insert(s, run);
+}
+static int peer_credits_read(ps_space *s, uint64_t low, uint64_t high,
+                             uint64_t *metadata, uint64_t *entries,
+                             lc_error *error) {
+  uint64_t first, last, offset, words[2];
+  int rc;
+  while (low < high) {
+    rc = ps_coordination_conflict(s->coordination, low, high - low, &first,
+                                  &last, error);
+    if (rc != LC_OK || first == last)
+      return rc;
+    offset = (first - PS_CREDIT_RECORD_BASE) * PS_PAGE;
+    if (last - first != 1 || offset < PS_DATA || offset >= s->capacity)
+      return err(error, LC_ERR_PROTOCOL, "invalid budget credit witness");
+    rc = transfer(s, words, sizeof(words), offset, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    if (words[0] > UINT64_MAX - *metadata || words[1] > UINT64_MAX - *entries)
+      return err(error, LC_ERR_PROTOCOL,
+                 "shared budget credit totals overflow");
+    *metadata += words[0];
+    *entries += words[1];
+    /* GETLK can return any witness. Recurse into the smaller residual to
+     * bound stack use by the address width, even with many live writers. */
+    if (first - low < high - last) {
+      rc = peer_credits_read(s, low, first, metadata, entries, error);
+      low = last;
+    } else {
+      rc = peer_credits_read(s, last, high, metadata, entries, error);
+      high = first;
+    }
+    if (rc != LC_OK)
+      return rc;
+  }
+  return LC_OK;
+}
+static int peer_credits(ps_space *s, lc_error *error) {
+  int rc;
+  if (!s->allocation_guard || s->credit_totals_checked)
+    return LC_OK;
+  s->peer_metadata_credits = s->peer_entry_credits = 0;
+  rc = peer_credits_read(s, PS_CREDIT_RECORD_BASE, PS_TRANSACTION_GUARD_BASE,
+                         &s->peer_metadata_credits, &s->peer_entry_credits,
+                         error);
+  s->credit_totals_checked = rc == LC_OK;
+  return rc;
 }
 static int take_payload_selected(ps_space *s, ps_budget *budget,
                                  ps_run **choice, uint64_t reserved,
@@ -1410,22 +1547,68 @@ static int pins_recover(ps_space *s, lc_error *error) {
  * still undergo conflict checks. Resume at a link to bound each pass.
  * New quarantines enter at the head, ahead of a pass already in progress. */
 #define PIN_PROBES 2
-static void pins_collect_locked(ps_space *s, int present, int full) {
+static int quarantine_partition(ps_run *run, uint64_t first, uint64_t last,
+                                lc_error *error) {
+  uint64_t end = run->offset + run->bytes;
+  ps_run *before = NULL, *after = NULL;
+  if (run->offset < first) {
+    before = lc_calloc_with_allocator(NULL, 1, sizeof(*before));
+    if (!before)
+      return err(error, LC_ERR_NOMEM, "cannot split quarantined interval");
+    before->offset = run->offset;
+    before->bytes = first - run->offset;
+  }
+  if (last < end) {
+    after = lc_calloc_with_allocator(NULL, 1, sizeof(*after));
+    if (!after) {
+      lc_free_with_allocator(NULL, before);
+      return err(error, LC_ERR_NOMEM, "cannot split quarantined interval");
+    }
+    after->offset = last;
+    after->bytes = end - last;
+    after->next = run->next;
+    run->next = after;
+  }
+  if (before) {
+    before->next = run->next;
+    run->next = before;
+  }
+  run->offset = first;
+  run->bytes = last - first;
+  return LC_OK;
+}
+static int pins_collect_locked(ps_space *s, int present, int full,
+                               lc_error *error) {
   ps_run **link, *run;
   ps_payload_page *page, **pages;
+  uint64_t first, last;
   size_t probes;
-  int held;
+  int held, rc = LC_OK;
   full = full || !present;
   link = !full && s->pinned_free_probe ? s->pinned_free_probe : &s->pinned_free;
   for (probes = 0; *link && (full || probes < PIN_PROBES); ++probes) {
     run = *link;
-    if (present &&
-        (pin_conflict(s, run->offset, run->bytes, &held, NULL) != LC_OK ||
-         held)) {
+    first = last = 0;
+    if (present)
+      rc = ps_coordination_conflict(s->coordination, run->offset, run->bytes,
+                                    &first, &last, error);
+    if (rc != LC_OK)
+      break;
+    if (first != last) {
+      first = first / PS_PAGE * PS_PAGE;
+      last = aligned(last);
+      /* An OFD can shrink a formerly coalesced range. Requery both
+       * residuals on the full pass before returning any part to allocation.
+       * Ordinary admission retains its fixed probe budget. */
+      if (full && (first != run->offset || last - first != run->bytes)) {
+        rc = quarantine_partition(run, first, last, error);
+        if (rc != LC_OK)
+          break;
+      }
       link = &run->next;
       continue;
     }
-    if (run->offset < PS_DATA && s->metadata_claims_active &&
+    if (run->offset < PS_DATA && s->metadata_materialized &&
         metadata_claim_range(s, run->offset, run->bytes, NULL) != LC_OK) {
       link = &run->next;
       continue;
@@ -1435,6 +1618,8 @@ static void pins_collect_locked(ps_space *s, int present, int full) {
     free_insert(s, run);
   }
   s->pinned_free_probe = *link ? link : NULL;
+  if (rc != LC_OK)
+    return rc;
   pages =
       !full && s->pinned_page_probe ? s->pinned_page_probe : &s->pinned_pages;
   for (probes = 0; *pages && (full || probes < PIN_PROBES); ++probes) {
@@ -1449,6 +1634,7 @@ static void pins_collect_locked(ps_space *s, int present, int full) {
       pages = &page->pinned_next;
   }
   s->pinned_page_probe = *pages ? pages : NULL;
+  return healthy(s, error);
 }
 static int pins_reclaim_locked(ps_space *s, lc_error *error) {
   int present, rc;
@@ -1457,8 +1643,7 @@ static int pins_reclaim_locked(ps_space *s, lc_error *error) {
   rc = physical_presence(s, &present, error);
   if (rc != LC_OK)
     return rc;
-  pins_collect_locked(s, present, 1);
-  return healthy(s, error);
+  return pins_collect_locked(s, present, 1, error);
 }
 /* A missing witness can mean a peer selected the range in a new checkpoint
  * or publication. A no-work checkpoint may sweep only against a certified
@@ -1489,7 +1674,9 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   int present, imported, rc = physical_presence(s, &present, error);
   if (rc != LC_OK)
     return rc;
-  pins_collect_locked(s, present, 0);
+  rc = pins_collect_locked(s, present, 0, error);
+  if (rc != LC_OK)
+    return rc;
   /* A foreign writer can dirty common pages between observations. Drop local
    * hints for those pages. The cohort bitmap follows every physical claim. */
   for (run = s->free; run; run = run->next)
@@ -1502,6 +1689,8 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
     if (rc == LC_OK)
       rc = foreign_pool(s, &s->free, &s->free_bytes, !imported, error);
   }
+  if (rc == LC_OK && present && !s->metadata_materialized)
+    rc = foreign_pool(s, &s->metadata_free, &s->metadata_free_bytes, 0, error);
   s->allocation_ranges_checked = rc == LC_OK;
   return rc;
 }
@@ -2021,36 +2210,66 @@ static int metadata_bound(uint64_t bytes, uint64_t entries, uint64_t *bound,
 }
 static int metadata_claimed_bound(ps_space *s, uint64_t bytes, uint64_t entries,
                                   uint64_t *bound, lc_error *error) {
+  int rc = peer_credits(s, error);
+  if (rc != LC_OK)
+    return rc;
   if (bytes > UINT64_MAX - s->reserved_metadata ||
       entries > UINT64_MAX - s->reserved_entries)
     return err(error, LC_ERR_INVALID, "container metadata budget overflow");
-  return metadata_bound(bytes + s->reserved_metadata,
-                        entries + s->reserved_entries, bound, error);
+  bytes += s->reserved_metadata;
+  entries += s->reserved_entries;
+  if (s->allocation_guard) {
+    if (bytes > UINT64_MAX - s->peer_metadata_credits ||
+        entries > UINT64_MAX - s->peer_entry_credits)
+      return err(error, LC_ERR_INVALID, "shared metadata budget overflow");
+    bytes += s->peer_metadata_credits;
+    entries += s->peer_entry_credits;
+  }
+  return metadata_bound(bytes, entries, bound, error);
 }
-/* Metadata is one private physical pool. Preparation consumes witnessed free
- * pages; root selection exchanges their witnesses for the pages it retires.
- * Initial recovery subtracts foreign claims before acquiring this pool. */
-static int metadata_claim_initial_locked(ps_space *s, lc_error *error) {
+/* Checkpoint preparation witnesses physical pages under allocator authority.
+ * Between checkpoints the common floor is an admission rule. */
+static int metadata_prepare_workspace(ps_space *s, lc_error *error) {
   ps_run *run;
   int rc;
-  if (!ps_coordination_shared(s->coordination))
+  if (!s->metadata_claims_active)
     return LC_OK;
-  for (run = s->metadata_free; run; run = run->next) {
-    rc = metadata_claim_range(s, run->offset, run->bytes, error);
+  if (!s->allocation_ranges_checked) {
+    rc = allocation_ranges_refresh(s, error);
     if (rc != LC_OK)
       return rc;
   }
-  s->metadata_claims_active = 1;
+  for (run = s->metadata_free; run; run = run->next) {
+    rc = metadata_claim_range(s, run->offset, run->bytes, error);
+    if (rc != LC_OK)
+      break;
+  }
+  if (run) {
+    ps_run *claimed;
+    for (claimed = s->metadata_free; claimed != run; claimed = claimed->next)
+      (void)metadata_release_range(s, claimed->offset, claimed->bytes, NULL);
+    return rc;
+  }
+  s->metadata_materialized = 1;
   return LC_OK;
 }
-static int metadata_claim_initial(ps_space *s, lc_error *error) {
-  ps_coordination_guard *guard = NULL;
-  int rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK)
-    rc = pins_recover(s, error);
-  if (rc == LC_OK)
-    rc = metadata_claim_initial_locked(s, error);
-  return allocation_end(s, guard, rc, error);
+static void metadata_return_workspace(ps_space *s) {
+  ps_run **link = &s->metadata_free, *run;
+  if (!s->metadata_materialized ||
+      __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+    return;
+  while ((run = *link) != NULL) {
+    if (metadata_release_range(s, run->offset, run->bytes, NULL) != LC_OK)
+      return;
+    if (run->offset < PS_DATA)
+      link = &run->next;
+    else {
+      *link = run->next;
+      s->metadata_free_bytes -= run->bytes;
+      free_insert(s, run);
+    }
+  }
+  s->metadata_materialized = 0;
 }
 static uint64_t metadata_target(ps_space *s, uint64_t bound) {
   uint64_t allocated = (uint64_t)s->metadata_pages * PS_PAGE;
@@ -2110,7 +2329,8 @@ static int metadata_fill_locked(ps_space *s, uint64_t bound, uint64_t target,
                  "checkpoint or grow");
     }
   }
-  while (s->metadata_free_bytes < target) {
+  while ((!s->metadata_claims_active || s->metadata_materialized) &&
+         s->metadata_free_bytes < target) {
     node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
     if (!node)
       return err(error, LC_ERR_NOMEM,
@@ -2158,6 +2378,9 @@ static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
   uint64_t future, target, extra;
   int rc;
   ps_internal_reserve_plan(s, &plan);
+  /* The first positive allowance on a handle needs one ledger page. */
+  if (s->metadata_claims_active && (plan.metadata_bytes || plan.entries))
+    *floor += PS_PAGE;
   if (bytes < s->metadata)
     bytes = s->metadata;
   if (entries < s->live_entries)
@@ -2690,8 +2913,9 @@ static ps_run *metadata_trim(ps_space *s, ps_run *spare) {
 }
 void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
   uint64_t bound;
-  if (metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, NULL) ==
-      LC_OK) {
+  if (!s->metadata_claims_active &&
+      metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, NULL) ==
+          LC_OK) {
     s->metadata_workspace = bound;
     *spare = metadata_trim(s, *spare);
   }
@@ -2827,6 +3051,8 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   if (rc == LC_OK)
     s->metadata_workspace = bound;
   if (rc == LC_OK && s->dirty)
+    rc = metadata_prepare_workspace(s, error);
+  if (rc == LC_OK && s->dirty)
     rc = metadata_protect(s, bound, 0, 0, error);
   if (rc == LC_OK && s->dirty) {
     /* Leave a complete packed image for the next checkpoint. A path-copy
@@ -2845,7 +3071,8 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     if (dense)
       metadata_dirty_all(s);
   }
-  if (rc == LC_OK && (s->dirty || metadata_trim_needed(s))) {
+  if (rc == LC_OK && !s->metadata_claims_active &&
+      (s->dirty || metadata_trim_needed(s))) {
     trim = lc_calloc_with_allocator(NULL, 1, sizeof(*trim));
     if (!trim)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate checkpoint trim interval");
@@ -3015,6 +3242,7 @@ static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
     rc = allocation_refresh(s, error);
   if (rc == LC_OK)
     rc = checkpoint_body(s, force_dense, error);
+  metadata_return_workspace(s);
   return allocation_end(s, guard, rc, error);
 }
 static int checkpoint_locked(ps_space *s, lc_error *error) {
@@ -3102,8 +3330,12 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
                              const ps_budget_plan *proposed, lc_error *e) {
   ps_budget_plan empty = {0};
   uint64_t floor = maintenance ? 0 : PS_MAINTENANCE_RESERVE, missing = 0;
+  uint64_t record = s->allocation_guard && !s->credit_record &&
+                            (s->reserved_metadata || s->reserved_entries)
+                        ? PS_PAGE
+                        : 0;
   int rc, attempted = 0;
-  rc = capacity_allowance(s, s->metadata, s->live_entries, 0, floor, NULL,
+  rc = capacity_allowance(s, s->metadata, s->live_entries, record, floor, NULL,
                           proposed ? &missing : NULL, e);
   if (rc != LC_ERR_INVALID || !missing)
     return rc;
@@ -3123,8 +3355,8 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
   s->reserved_entries =
       s->reserved_entries - prior->entries + proposed->entries;
   if (rc == LC_OK)
-    rc = checkpoint_allowance_floor(s, s->metadata, s->live_entries, 0, floor,
-                                    NULL, e);
+    rc = checkpoint_allowance_floor(s, s->metadata, s->live_entries, record,
+                                    floor, NULL, e);
   return rc;
 }
 /* A shared publisher terminates a complete frame with a clear next header.
@@ -3281,6 +3513,10 @@ static void destroy(ps_space *s) {
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
   lc_free_with_allocator(NULL, s->journal_image);
+  if (s->credit_record) {
+    (void)munmap(s->credit_words, PS_PAGE);
+    lc_free_with_allocator(NULL, s->credit_record);
+  }
   ps_readiness_close(s);
   if (s->coordination) {
     (void)ps_coordination_close(s->coordination, NULL);
@@ -4500,7 +4736,7 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
-  rc = metadata_claim_initial(s, error);
+  rc = pins_recover(s, error);
   if (rc != LC_OK)
     goto done;
   range_available = certificate.grant_limit == s->token_limit &&
@@ -4607,12 +4843,11 @@ static int projection_journal(ps_space *v, uint64_t checkpoint,
   }
   return LC_OK;
 }
-static int projection_pool(ps_space *v, const ps_run *source, int metadata,
-                           lc_error *error) {
+static int projection_pool(ps_space *v, const ps_run *source, lc_error *error) {
   ps_run *copy;
   int rc;
   for (; source; source = source->next) {
-    if (!metadata && source->claimed != 1)
+    if (source->claimed != 1)
       continue;
     copy = lc_calloc_with_allocator(NULL, 1, sizeof(*copy));
     if (!copy)
@@ -4625,62 +4860,8 @@ static int projection_pool(ps_space *v, const ps_run *source, int metadata,
       lc_free_with_allocator(NULL, copy);
       return rc;
     }
-    if (metadata)
-      metadata_insert(v, copy);
-    else
-      free_insert(v, copy);
+    free_insert(v, copy);
   }
-  return LC_OK;
-}
-static int projection_workspace(ps_space *s, ps_space *v, lc_error *error) {
-  ps_run *run, *node;
-  uint64_t bound, target, bytes, floor = PS_MAINTENANCE_RESERVE;
-  int rc;
-  /* Initial fixed workspace and overflow additions are claimed only after
-   * foreign ranges and this OFD's continuously private ranges are excluded. */
-  for (run = v->metadata_free; run; run = run->next) {
-    if (run->claimed)
-      continue;
-    rc = metadata_claim_range(s, run->offset, run->bytes, error);
-    if (rc != LC_OK)
-      return rc;
-    run->claimed = 2;
-  }
-  v->reserved_payload = s->reserved_payload;
-  v->reserved_metadata = s->reserved_metadata;
-  v->reserved_entries = s->reserved_entries;
-  v->reserve_base = s->reserve_base;
-  v->reserves = s->reserves;
-  rc = metadata_claimed_bound(v, v->metadata, v->live_entries, &bound, error);
-  if (rc == LC_OK)
-    rc = reserve_floor(v, v->metadata, v->live_entries, bound, &floor, error);
-  if (rc != LC_OK)
-    return rc;
-  target = metadata_target(v, bound);
-  bytes = target > v->metadata_free_bytes ? target - v->metadata_free_bytes : 0;
-  if (v->reserved_payload > v->free_bytes ||
-      floor > v->free_bytes - v->reserved_payload ||
-      bytes > v->free_bytes - v->reserved_payload - floor)
-    return err(error, LC_ERR_PENDING,
-               "checkpoint needs more protected workspace");
-  while (v->metadata_free_bytes < target) {
-    node = lc_calloc_with_allocator(NULL, 1, sizeof(*node));
-    if (!node)
-      return err(error, LC_ERR_NOMEM, "cannot stage checkpoint workspace");
-    bytes = target - v->metadata_free_bytes;
-    rc = take_interval(&v->free, &v->free_bytes, &bytes, &node->offset,
-                       &node->clean, error);
-    if (rc == LC_OK)
-      rc = metadata_claim_range(s, node->offset, bytes, error);
-    if (rc != LC_OK) {
-      lc_free_with_allocator(NULL, node);
-      return rc;
-    }
-    node->bytes = bytes;
-    node->claimed = 2;
-    metadata_insert(v, node);
-  }
-  v->metadata_workspace = bound;
   return LC_OK;
 }
 static ps_entry *projected(ps_entry *p) {
@@ -4823,7 +5004,6 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
 static void projection_install(ps_space *s, ps_space *v) {
   ps_entry *p, **link;
   ps_payload_page *page;
-  ps_run *run;
   size_t i;
 #define PROJECTION_SWAP(field, type)                                           \
   do {                                                                         \
@@ -4856,8 +5036,6 @@ static void projection_install(ps_space *s, ps_space *v) {
     for (link = &s->catalogs.buckets[i]; (p = *link) != NULL;
          link = &p->catalog->next)
       p->catalog->link = link;
-  for (run = s->metadata_free; run; run = run->next)
-    run->claimed = 0;
   s->root = v->root;
   s->capacity = v->capacity;
   s->generation = v->generation;
@@ -4890,7 +5068,6 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   const unsigned char *root;
   ps_space *v = NULL;
   ps_entry *p, *old, **items = NULL;
-  ps_run *run;
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
@@ -5011,9 +5188,10 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
         goto done;
     }
   }
-  rc = projection_pool(v, s->metadata_free, 1, error);
+  if (s->credit_record)
+    rc = exclude_run(v, s->credit_record->offset, PS_PAGE, error);
   if (rc == LC_OK)
-    rc = projection_pool(v, s->free, 0, error);
+    rc = projection_pool(v, s->free, error);
   if (rc == LC_OK && !retiring_journal)
     rc = projection_journal(v, get64(root + 24), certificate.ready, error);
   if (rc == LC_OK && v->sequence < certificate.ready)
@@ -5047,7 +5225,8 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   if (rc == LC_OK)
     rc = pins_recover(v, error);
   if (rc == LC_OK)
-    rc = projection_workspace(s, v, error);
+    rc = metadata_bound(v->metadata, v->live_entries, &v->metadata_workspace,
+                        error);
   /* Even apparently zero sibling bytes can be an abandoned cached retirement
    * whose barrier never completed. Stabilize that retirement before admitting
    * any of its ranges. This is a structural adoption barrier, not a journal
@@ -5080,13 +5259,8 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     projection_install(s, v);
     if (certificate.pending & PS_READINESS_JOURNAL)
       ps_readiness_finish(s, PS_READINESS_JOURNAL);
-  } else {
-  done:
-    if (v)
-      for (run = v->metadata_free; run; run = run->next)
-        if (run->claimed == 2)
-          (void)metadata_release_range(s, run->offset, run->bytes, NULL);
   }
+done:
   if (v) {
     if (v->poisoned)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
@@ -5234,8 +5408,10 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     destroy(s);
     return rc;
   }
-  if (ps_coordination_shared(s->coordination))
+  if (ps_coordination_shared(s->coordination)) {
     s->range_pins = 1; /* Later participants may introduce new witnesses. */
+    s->metadata_claims_active = 1;
+  }
   rc = allocation_begin(s, &opening, error);
   if (rc == LC_OK && create && opening) {
     s->journal_image = lc_calloc_with_allocator(NULL, 1, PS_JOURNAL);
@@ -5256,8 +5432,6 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     if (rc == LC_OK)
       rc = initial_free(s, error);
     if (rc == LC_OK)
-      rc = metadata_claim_initial(s, error);
-    if (rc == LC_OK)
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
@@ -5270,7 +5444,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     rc = err(error, LC_ERR_INVALID,
              "committed capacity exceeds configured maximum");
   if (rc == LC_OK)
-    rc = metadata_bound(s->metadata, s->live_entries, &bound, error);
+    rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
     rc = metadata_protect(s, bound, 0, 0, error);
   if (rc == LC_OK)

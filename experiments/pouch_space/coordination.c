@@ -12,7 +12,6 @@
 #define FIXED (PS_COORDINATION_SYNC + 1U)
 #define BUCKETS 67U
 #define INITIALIZE_OFFSET 6U
-#define TXN_BASE (PS_MAX_CAPACITY + PS_MAX_INCARNATION)
 #define NS_BASE UINT64_C(512)
 #define COLLECTION_SLOTS 512U
 #define COLLECTION_BASE (2U * PS_PAGE - 6U * COLLECTION_SLOTS)
@@ -274,7 +273,7 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
   if (domain == PS_COORDINATION_STREAM)
     return PS_MAX_CAPACITY + identity - 1;
   if (domain == PS_COORDINATION_TRANSACTION)
-    return TXN_BASE + identity;
+    return PS_TRANSACTION_GUARD_BASE + identity;
   if (domain == PS_COORDINATION_CONTROL_STATE)
     return STATE_BASE - 2 + identity;
   if (domain == PS_COORDINATION_STREAM_CLAIM) {
