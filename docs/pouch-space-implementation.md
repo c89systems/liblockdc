@@ -13009,8 +13009,8 @@ sources, traces, and tests are under
 
 ## Carry-less multiplication for IEEE CRC-32
 
-A fresh profile of `d1579946` attributed 940 of 15,852 CPU samples to
-checksum code in the indexed workload. The native backend now uses
+A profile of `d1579946` attributed 929 of 15,852 CPU samples to `crc32_z`
+in the indexed workload. The native backend now uses
 PCLMUL folding for buffers of at least 32 bytes on supported x86_64 CPUs.
 It folds four lanes across larger buffers and uses zlib for shorter inputs,
 partial tails, and CPUs without PCLMUL. The reflected IEEE polynomial and
@@ -13021,9 +13021,11 @@ and incrementally streamed payloads.
 
 Three microbenchmark repeats with unaligned, chained inputs reduced median
 4 KiB checksum CPU time from 1,100 ns to 314 ns and 32-byte time from 77 ns
-to 12 ns. The same workload profile after the change attributed 531 of
-16,617 samples to checksum code. The equivalence fixture checks zlib
-against known answers, arbitrary seeds, split updates, and unaligned
+to 12 ns. A fresh profile of the committed build attributed 452 of
+16,020 samples to `crc32_z` and `ps_crc32_pclmul` combined. The earlier
+profile labeled final captured the intermediate 128-byte dispatch build.
+The equivalence fixture checks the accelerated path against zlib using
+known answers, arbitrary seeds, split updates, and unaligned
 buffers ending at a guard page. Both binaries reopened and verified
 8,192 values in a 10 MiB checkpoint image created by the other. The
 qualification passed 50 GNU Release groups, 25 musl Release groups, and
@@ -13065,4 +13067,90 @@ was 6.7% higher. Three NoSync pairs had higher late-window p95 and one
 had lower p95. The pairs establish a CPU gain, and further work is needed
 on NoSync tail latency, total CPU, and reopen relative to multifile.
 Raw runs, profiles, and tests are under
-`build/pouch-space-concurrent/projection-cpu/`.
+`build/pouch-space-concurrent/projection-cpu/`. The corrected profile is
+the baseline trace in `build/pouch-space-concurrent/allocator-hot/`.
+
+## Flat physical key index and checkpoint projection install
+
+The source-line profile of `8c45b3ba` attributed 737 samples to key
+comparison and lookup in directory recovery. The resident key index now
+uses contiguous slots containing a hash and an entry pointer. It caps
+occupancy at 75%, checks full typed keys on hash matches, and shifts
+dependent slots back when a checkpoint retires a tombstone. Replacement
+updates the slot in place. Reservation still precedes publication and
+replay. The directory's order and descriptor binding checks establish
+uniqueness before insertion. The design uses the cache locality of
+linear probing and the hash-before-object comparison used by Swiss
+tables. [Linear probing with constant independence](https://arxiv.org/abs/cs/0612055),
+[Swiss Tables design notes](https://abseil.io/about/design/swisstables)
+
+Checkpoint adoption rewires the checked draft using the original
+successor pointer at each entry. A private list retains the draft nodes
+that map to existing incarnations until all destination links are in
+place. This removes a vector allocation and two full entry walks while
+preserving captured-reader addresses and the existing validation and
+installation ordering.
+
+The key-index fixture tests retirement across a cluster that wraps the
+table, replacements, and an independent reader holding the old payload.
+It also injects index growth failures during publication, atomic replay,
+and checkpoint adoption. The full selection passed 68 GNU Release groups
+and 33 each on ASan/UBSan and musl. The groups included recovery faults,
+process death, independent writer progress, explicit growth, shared lease
+authority, and transactional messaging at fixed capacity.
+
+All 24 matched GNU Release workflows verified. Indexed runs had eight
+writers at a fixed 10 MiB, with three 192 MiB NoSync pairs and two 96 MiB
+durable pairs against `8c45b3ba`. One fresh multifile run per mode served
+as a reference. Work and process CPU are in seconds. The latency columns
+are in milliseconds and the late window covers the final 16 rounds.
+
+| Backend | Mode | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Single-file prior | NoSync | 16.37 | 20.21 | 103.88 | 129.39 |
+| Single-file revised | NoSync | 16.46 | 19.89 | 105.39 | 135.92 |
+| Multifile | NoSync | 21.18 | 9.79 | 58.82 | 59.24 |
+| Single-file prior | Durable | 14.03 | 8.62 | 108.46 | 111.07 |
+| Single-file revised | Durable | 13.84 | 8.49 | 110.56 | 116.25 |
+| Multifile | Durable | 32.21 | 5.40 | 198.59 | 202.38 |
+
+Index phases report the slowest worker in seconds. First owner, eight
+serial live joins, post-open verification, and close are in milliseconds.
+
+| Backend | Mode | Index flush | First query | Repeat query | First owner | Live joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Single-file prior | NoSync | 3.38 | 0.73 | 0.26 | 29.39 | 33.39 | 21.63 | 24.13 |
+| Single-file revised | NoSync | 3.41 | 0.71 | 0.27 | 30.56 | 37.18 | 19.98 | 27.34 |
+| Multifile | NoSync | 6.01 | 3.45 | 3.08 | 0.35 | 1.50 | 51.86 | 4.04 |
+| Single-file prior | Durable | 1.73 | 0.15 | 0.04 | 14.95 | 26.30 | 15.50 | 17.99 |
+| Single-file revised | Durable | 1.66 | 0.12 | 0.04 | 14.97 | 25.34 | 15.60 | 17.60 |
+| Multifile | Durable | 4.47 | 5.63 | 6.27 | 0.30 | 1.66 | 29.90 | 2.22 |
+
+Indexed CPU fell in each of the five native pairs. Median savings were
+1.6% in NoSync and 1.5% in durable mode. Elapsed work changed by less than
+1.5% in either mode. Late-window medians rose 5.0% in NoSync and 4.7%
+in durable mode. One pair per mode had a lower late-window p95. Median
+NoSync live join and close also rose. Indexed CPU, NoSync latency, and
+indexed reopen and close still trail the multifile reference.
+
+The 12-row warmed queue and durable outbox ran twice per build with two
+writers. Times are medians in milliseconds. The durable outbox p95 rose
+in both native pairs and stayed below the multifile median.
+
+| Workload | Metric | Prior single-file | Revised single-file | Multifile |
+| --- | --- | ---: | ---: | ---: |
+| Warmed queue | Work / CPU / p95 | 12.99 / 20.82 / 2.60 | 11.73 / 19.01 / 2.15 | 103.64 / 28.95 / 35.43 |
+| Durable outbox | Work / CPU / p95 | 1047.40 / 113.57 / 201.60 | 1085.60 / 115.19 / 249.64 | 1502.52 / 177.07 / 296.50 |
+
+The eight-lease comparison verified all 160 warm and cold runs across
+codecs and durability policies. In the five plaintext cold runs per
+policy, median single-file expiry took 205 ms NoSync and 203 ms durable,
+versus 418 and 383 ms on multifile. The single-file test flag is
+`native=0`. Four follow-up traces confirmed 76 sync calls for single-file
+expiry and 113 for multifile. Multifile used 64 syncs for atomic
+retention work-file replacement and directory persistence. Single-file
+used 32 syncs for the corresponding typed work records. The traces
+also identify the explicit phase barriers on both paths.
+
+Raw workloads, traces, and test logs are under
+`build/pouch-space-concurrent/allocator-hot/`.

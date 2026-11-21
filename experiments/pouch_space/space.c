@@ -423,57 +423,82 @@ static int immutable_key(ps_key k) {
          (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
-static size_t key_bucket(ps_key k, size_t capacity) {
+static uint64_t key_hash(ps_key k) {
   uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^
                (k.kind * UINT64_C(0xc2b2ae3d27d4eb4f));
   h ^= h >> 33;
   h *= UINT64_C(0xff51afd7ed558ccd);
-  return (size_t)(h ^ (h >> 33)) & (capacity - 1);
+  return h ^ (h >> 33);
 }
 static int same_key(ps_key a, ps_key b) {
   return a.owner == b.owner && a.key == b.key && a.kind == b.kind;
 }
-static ps_entry *lookup(ps_space *s, ps_key k) {
-  ps_entry *p;
-  if (!s->keys.capacity)
-    return NULL;
-  for (p = s->keys.buckets[key_bucket(k, s->keys.capacity)]; p;
-       p = p->hash_next)
-    if (same_key(k, p->key))
-      return p;
-  return NULL;
+static ps_key_slot *key_slot(const ps_key_index *index, ps_key k,
+                             uint64_t hash) {
+  size_t mask = index->capacity - 1, at = (size_t)hash & mask;
+  ps_key_slot *slot = &index->slots[at];
+  while (slot->entry &&
+         (slot->hash != hash || !same_key(k, slot->entry->key))) {
+    at = (at + 1) & mask;
+    slot = &index->slots[at];
+  }
+  return slot;
 }
-/* Reserve for selected keys, including current tombstones. Rehashing moves
- * only index links and runs before publication or replay begins to install. */
+static ps_entry *lookup(ps_space *s, ps_key k) {
+  return s->keys.capacity ? key_slot(&s->keys, k, key_hash(k))->entry : NULL;
+}
+static size_t key_index_limit(size_t capacity) {
+  return capacity - capacity / 4;
+}
+/* Reserve for selected keys, including current tombstones, before appending
+ * or applying journal bytes. Keep a free slot at the end of every probe. */
 static int key_index_reserve(ps_space *s, size_t added, lc_error *error) {
-  ps_entry **buckets, *p, *next;
+  ps_key_slot *slots, slot;
   size_t needed, capacity, i, at;
   if (added > (size_t)-1 - s->keys.count)
     return err(error, LC_ERR_NOMEM, "container key index exceeds local limit");
   needed = s->keys.count + added;
-  if (needed <= s->keys.capacity)
+  if (needed <= key_index_limit(s->keys.capacity))
     return LC_OK;
   capacity = s->keys.capacity ? s->keys.capacity : 64U;
-  while (capacity < needed) {
-    if (capacity > (size_t)-1 / sizeof(*buckets) / 2)
+  while (key_index_limit(capacity) < needed) {
+    if (capacity > (size_t)-1 / sizeof(*slots) / 2)
       return err(error, LC_ERR_NOMEM,
                  "container key index exceeds local limit");
     capacity *= 2;
   }
-  buckets = lc_calloc_with_allocator(NULL, capacity, sizeof(*buckets));
-  if (!buckets)
+  slots = lc_calloc_with_allocator(NULL, capacity, sizeof(*slots));
+  if (!slots)
     return err(error, LC_ERR_NOMEM, "cannot grow container key index");
-  for (i = 0; i < s->keys.capacity; ++i)
-    for (p = s->keys.buckets[i]; p; p = next) {
-      next = p->hash_next;
-      at = key_bucket(p->key, capacity);
-      p->hash_next = buckets[at];
-      buckets[at] = p;
-    }
-  lc_free_with_allocator(NULL, s->keys.buckets);
-  s->keys.buckets = buckets;
+  for (i = 0; i < s->keys.capacity; ++i) {
+    slot = s->keys.slots[i];
+    if (!slot.entry)
+      continue;
+    at = (size_t)slot.hash & (capacity - 1);
+    while (slots[at].entry)
+      at = (at + 1) & (capacity - 1);
+    slots[at] = slot;
+  }
+  lc_free_with_allocator(NULL, s->keys.slots);
+  s->keys.slots = slots;
   s->keys.capacity = capacity;
   return LC_OK;
+}
+static void key_index_remove(ps_key_index *index, ps_key key) {
+  size_t mask = index->capacity - 1;
+  size_t hole = (size_t)(key_slot(index, key, key_hash(key)) - index->slots);
+  size_t at, home;
+  /* A displaced entry crosses the hole if the hole is nearer its home
+   * than its present position, including across the end of the array. */
+  for (at = (hole + 1) & mask; index->slots[at].entry; at = (at + 1) & mask) {
+    home = (size_t)index->slots[at].hash & mask;
+    if (((hole - home) & mask) < ((at - home) & mask)) {
+      index->slots[hole] = index->slots[at];
+      hole = at;
+    }
+  }
+  index->slots[hole].entry = NULL;
+  --index->count;
 }
 static size_t entry_bytes(const ps_entry *p) {
   size_t header = 64;
@@ -591,11 +616,6 @@ static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   head->stream_storage += entry_storage(p);
 }
 static void retire(ps_space *s, ps_entry *p) {
-  ps_entry **link = &s->keys.buckets[key_bucket(p->key, s->keys.capacity)];
-  while (*link != p)
-    link = &(*link)->hash_next;
-  *link = p->hash_next;
-  --s->keys.count;
   value_unregister(p);
   if (p->key.kind == PS_CATALOG)
     ps_catalog_unlink(s, p);
@@ -604,7 +624,6 @@ static void retire(ps_space *s, ps_entry *p) {
   if (p->key.kind == PS_STREAM && !p->deleted) {
     stream_unregister(s, p);
   }
-  p->hash_next = NULL;
   p->state = 2;
   p->retired_link = &s->retired;
   p->retired_next = s->retired;
@@ -617,7 +636,8 @@ static void retire(ps_space *s, ps_entry *p) {
   }
 }
 static void install(ps_space *s, ps_entry *p, ps_entry *old) {
-  size_t at = key_bucket(p->key, s->keys.capacity);
+  uint64_t hash = key_hash(p->key);
+  ps_key_slot *slot = key_slot(&s->keys, p->key, hash);
   p->previous = old;
   ps_internal_reserve_install(s, p, old);
   if (p->key.kind == PS_OWNED_RUN && !p->deleted)
@@ -625,9 +645,9 @@ static void install(ps_space *s, ps_entry *p, ps_entry *old) {
   if (old)
     retire(s, old);
   p->state = 1;
-  p->hash_next = s->keys.buckets[at];
-  s->keys.buckets[at] = p;
-  ++s->keys.count;
+  slot->entry = p;
+  slot->hash = hash;
+  s->keys.count += old == NULL;
   if (immutable_key(p->key))
     value_register(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted)
@@ -3334,8 +3354,10 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     p->dirty_link = NULL;
     p->checkpoint_ref = p->pending_ref;
     p->previous = NULL;
-    if (p->deleted)
+    if (p->deleted) {
+      key_index_remove(&s->keys, p->key);
       retire(s, p);
+    }
   }
   if (rc != LC_OK) {
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
@@ -3538,8 +3560,8 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
   rc = LC_OK;
   if (bytes > PS_JOURNAL - s->journal)
     rc = checkpoint_locked(s, error);
-  if (rc == LC_OK && event == PS_PUT && s->keys.count == s->keys.capacity &&
-      !lookup(s, p->key))
+  if (rc == LC_OK && event == PS_PUT &&
+      s->keys.count == key_index_limit(s->keys.capacity) && !lookup(s, p->key))
     rc = key_index_reserve(s, 1, error);
   if (rc == LC_OK) {
     encode_entry(wire, p, s->sequence + 1, event);
@@ -3654,7 +3676,7 @@ static void destroy(ps_space *s) {
     lc_free_with_allocator(NULL, payload);
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
-  lc_free_with_allocator(NULL, s->keys.buckets);
+  lc_free_with_allocator(NULL, s->keys.slots);
   lc_free_with_allocator(NULL, s->journal_image);
   if (s->credit_record) {
     (void)munmap(s->credit_words, PS_PAGE);
@@ -4114,9 +4136,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     }
   for (i = 0; i < r->count; ++i) {
     p = r->entries[i].decoded;
-    if (lookup(s, p->key))
-      return err(error, LC_ERR_PROTOCOL,
-                 "checkpoint descriptor binding mismatch");
+    /* The directory walk checked that every binding key is distinct. */
     if (p->key.kind == PS_CATALOG)
       rc = ps_catalog_prepare_record(s, p, 1, error);
     else if (p->key.kind == PS_OWNED_RUN && p->owned_mapped)
@@ -5179,17 +5199,14 @@ static int projection_pool(ps_space *v, const ps_run *source, lc_error *error) {
 static ps_entry *projected(ps_entry *p) {
   return p && p->projection ? p->projection : p;
 }
-static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
-                               size_t count) {
-  ps_entry *p, *next, *q, *keep = NULL, *dest;
+static void projection_entries(ps_space *s, ps_space *v) {
+  ps_entry *p, *next, *q, *keep = NULL, *consumed = NULL, *dest;
   ps_catalog_record *record;
   size_t i;
   /* Preparation is finished. Nothing below allocates or performs file I/O. */
-  for (i = 0; i < count; ++i) {
-    q = items[i];
+  for (q = v->entries; q; q = q->all_next)
     if (q->projection)
       q->projection->projection = q;
-  }
   for (p = s->entries; p; p = next) {
     next = p->all_next;
     if (p->projection) {
@@ -5200,7 +5217,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       entry_free(p); /* Drop stale resident metadata, never free its ranges. */
       continue;
     }
-    p->previous = p->hash_next = p->stream_next = NULL;
+    p->previous = p->stream_next = NULL;
     p->value_next = NULL;
     p->value_link = NULL;
     p->retired_next = p->dirty_next = NULL;
@@ -5224,8 +5241,8 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
   }
   s->retired = projected(v->retired);
   s->dirty = projected(v->dirty);
-  for (i = 0; i < count; ++i) {
-    q = items[i];
+  for (q = v->entries; q; q = next) {
+    next = q->all_next;
     dest = projected(q);
     if (dest != q) {
       /* Captured readers access immutable fields without the allocator
@@ -5263,8 +5280,7 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
         dest->bytes = q->bytes;
       }
     }
-    dest->all_next = projected(q->all_next);
-    dest->hash_next = projected(q->hash_next);
+    dest->all_next = projected(next);
     dest->value_next = projected(q->value_next);
     dest->value_link = NULL;
     dest->stream_next = projected(q->stream_next);
@@ -5280,10 +5296,14 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       record->target = projected(q->catalog->target);
       record->next = projected(q->catalog->next);
     }
+    if (dest != q) {
+      q->all_next = consumed;
+      consumed = q;
+    }
   }
   s->entries = projected(v->entries);
   for (i = 0; i < v->keys.capacity; ++i)
-    v->keys.buckets[i] = projected(v->keys.buckets[i]);
+    v->keys.slots[i].entry = projected(v->keys.slots[i].entry);
   for (i = 0; i < BUCKETS; ++i) {
     ps_entry **link;
     s->value_buckets[i] = projected(v->value_buckets[i]);
@@ -5317,9 +5337,13 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       s->retired = p;
     }
   }
-  for (i = 0; i < count; ++i)
-    if (items[i]->projection)
-      entry_free(items[i]);
+  /* Every link now points at its final entry. Reused staged entries are
+   * kept until here because other links can still refer to their bindings. */
+  while (consumed) {
+    q = consumed;
+    consumed = q->all_next;
+    entry_free(q);
+  }
   v->entries = NULL;
 }
 static void projection_install(ps_space *s, ps_space *v) {
@@ -5516,9 +5540,7 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
   unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   const unsigned char *root;
   ps_space *v = NULL;
-  ps_entry *p, **items = NULL;
   struct stat st;
-  size_t count = 0, i;
   int a, b, selected, rc;
   int retiring_journal, retired_certificate;
   ps_readiness_certificate certificate;
@@ -5611,26 +5633,6 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     ps_readiness_begin(s, PS_READINESS_JOURNAL);
   if (rc != LC_OK)
     goto done;
-  /* Include every superseded frame still needed by readers or cold replay.
-   * The vector lets installation rewire links without walking a live list
-   * whose nodes are moving in place. */
-  for (p = v->entries; p; p = p->all_next) {
-    if (count == (size_t)-1 / sizeof(*items)) {
-      rc = err(error, LC_ERR_NOMEM, "checkpoint projection is too large");
-      goto done;
-    }
-    ++count;
-  }
-  if (count) {
-    items = lc_calloc_with_allocator(NULL, count, sizeof(*items));
-    if (!items) {
-      rc =
-          err(error, LC_ERR_NOMEM, "cannot bind checkpoint projection entries");
-      goto done;
-    }
-    for (i = 0, p = v->entries; p; p = p->all_next)
-      items[i++] = p;
-  }
   v->range_pins = 1;
   if (rc == LC_OK)
     rc = pins_recover(v, s, error);
@@ -5675,7 +5677,7 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     }
   }
   if (rc == LC_OK) {
-    projection_entries(s, v, items, count);
+    projection_entries(s, v);
     projection_install(s, v);
     if (certificate.pending & PS_READINESS_JOURNAL)
       ps_readiness_finish(s, PS_READINESS_JOURNAL);
@@ -5684,7 +5686,6 @@ done:
   if (v && v->poisoned)
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
   projection_destroy(v);
-  lc_free_with_allocator(NULL, items);
   return rc;
 }
 int ps_refresh(ps_space *s, lc_error *error) {

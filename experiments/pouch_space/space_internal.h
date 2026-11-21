@@ -90,7 +90,7 @@ typedef struct ps_entry {
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
   struct ps_entry *previous;
-  struct ps_entry *all_next, *hash_next;
+  struct ps_entry *all_next;
   struct ps_entry **all_link;
   struct ps_entry *value_next, **value_link;
   struct ps_entry *retired_next, **retired_link;
@@ -127,8 +127,12 @@ typedef struct ps_meta_page {
   struct ps_meta_page *claim_next, **claim_link;
   struct ps_meta_page *next, **link, *hash_next;
 } ps_meta_page;
+typedef struct ps_key_slot {
+  ps_entry *entry;
+  uint64_t hash;
+} ps_key_slot;
 typedef struct ps_key_index {
-  ps_entry **buckets;
+  ps_key_slot *slots;
   size_t count, capacity;
 } ps_key_index;
 struct ps_space {
