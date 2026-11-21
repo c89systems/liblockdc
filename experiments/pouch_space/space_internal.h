@@ -231,6 +231,11 @@ typedef int (*ps_value_retain_fn)(void *, ps_key, uint64_t incarnation);
 int ps_internal_values_capture(ps_space *, uint64_t owner, unsigned int first,
                                unsigned int last, ps_value_retain_fn, void *,
                                ps_values **, lc_error *);
+/* Capture from the caller's canonical scope and already sampled prefix. */
+int ps_internal_values_capture_locked(ps_space *, uint64_t owner,
+                                      unsigned int first, unsigned int last,
+                                      uint64_t prefix, ps_value_retain_fn,
+                                      void *, ps_values **, lc_error *);
 int ps_internal_healthy(ps_space *, lc_error *);
 /* Capture selection and its first physical witness under the same canonical
  * authority. Captured handles subsequently retain their incarnation directly.
@@ -241,10 +246,10 @@ int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
 int ps_internal_observe_begin(ps_space *, ps_coordination_guard **, lc_error *);
 int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
                             lc_error *);
-/* Caller holds a canonical capture and samples one local visibility prefix
- * for all values. Fixed controls have no application body or reader lifetime.
- * A deferred replacement requires the namespace owner to resolve visibility.
- * An exact match to a previously decoded incarnation leaves the buffer alone.
+/* Select at the caller's sampled prefix. A deferred replacement requires
+ * the namespace owner to resolve visibility. An already decoded incarnation
+ * leaves the buffer alone. NULL requests a memo-only observation and reports
+ * a changed incarnation as noncurrent. Reading a buffer requires a capture.
  */
 int ps_internal_fixed_value(ps_space *, ps_key, uint64_t prefix, void *, size_t,
                             uint64_t known, uint64_t *incarnation, int *current,

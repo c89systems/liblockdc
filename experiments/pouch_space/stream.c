@@ -44,7 +44,7 @@ struct ps_stream_writer {
 struct ps_stream_window {
   ps_stream *stream;
   uint64_t start, end;
-  stream_run *runs;
+  ps_owned_run **runs;
   size_t count;
 };
 struct ps_stream_reader {
@@ -1056,8 +1056,8 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
     if (rc == LC_OK) {
       window->count = last - first;
       for (i = 0; i < window->count; ++i) {
-        window->runs[i] = s->runs[first + i];
-        ps_owned_run_retain(window->runs[i].handle);
+        window->runs[i] = s->runs[first + i].handle;
+        ps_owned_run_retain(window->runs[i]);
       }
     }
   }
@@ -1070,12 +1070,17 @@ static int window_admit(ps_stream *s, uint64_t offset, uint64_t bytes,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-static void window_release(ps_stream_window *window) {
+static void window_runs_close(ps_stream_window *window) {
   size_t i;
-  int destroy;
   for (i = 0; i < window->count; ++i)
-    ps_owned_run_close(window->runs[i].handle);
+    ps_owned_run_close(window->runs[i]);
   lc_free_with_allocator(NULL, window->runs);
+  window->runs = NULL;
+  window->count = 0;
+}
+static void window_release(ps_stream_window *window) {
+  int destroy;
+  window_runs_close(window);
   if (!window->stream)
     return;
   pthread_mutex_lock(&window->stream->mutex);
@@ -1103,56 +1108,45 @@ int ps_stream_window_open(ps_stream *s, uint64_t offset, uint64_t bytes,
     lc_free_with_allocator(NULL, window);
   return rc;
 }
+static int window_geometry(ps_stream_window *window, uint64_t start,
+                           uint64_t end, lc_error *error) {
+  uint64_t cursor = start;
+  size_t i;
+  for (i = 0; i < window->count; ++i) {
+    uint64_t base = ps_owned_run_base(window->runs[i]);
+    uint64_t limit = base + ps_owned_run_capacity(window->runs[i]);
+    if (base > cursor || limit <= cursor)
+      return stream_error(error, LC_ERR_PROTOCOL,
+                          "certified stream range is unmapped");
+    cursor = limit;
+  }
+  if (cursor < end)
+    return stream_error(error, LC_ERR_PROTOCOL,
+                        "certified stream range is incomplete");
+  return LC_OK;
+}
 static int window_capture(ps_space *space, ps_key key, const ps_ref *ref,
                           uint64_t start, uint64_t end,
                           ps_stream_window *window, lc_error *error) {
-  ps_owned_run **runs = NULL;
-  uint64_t cursor = start;
-  size_t count = 0, i;
-  int rc;
-  rc = ps_owned_runs_range(space, key, ref, start, end, &runs, &count, error);
-  if (rc == LC_OK && count) {
-    window->runs = lc_calloc_with_allocator(NULL, count, sizeof(*window->runs));
-    if (!window->runs)
-      rc = stream_error(error, LC_ERR_NOMEM, "cannot capture stream mappings");
-  }
-  for (i = 0; rc == LC_OK && i < count; ++i) {
-    stream_run *run = &window->runs[i];
-    run->base = ps_owned_run_base(runs[i]);
-    run->capacity = ps_owned_run_capacity(runs[i]);
-    if (run->base > cursor || run->base + run->capacity <= cursor)
-      rc = stream_error(error, LC_ERR_PROTOCOL,
-                        "certified stream range is unmapped");
-    else {
-      cursor = run->base + run->capacity;
-      run->handle = runs[i];
-      runs[i] = NULL;
-      ++window->count;
-    }
-  }
-  if (rc == LC_OK && cursor < end)
-    rc = stream_error(error, LC_ERR_PROTOCOL,
-                      "certified stream range is incomplete");
-  for (i = 0; i < count; ++i)
-    ps_owned_run_close(runs[i]);
-  lc_free_with_allocator(NULL, runs);
-  if (rc != LC_OK) {
-    release_runs(window->runs, window->count);
-    window->runs = NULL;
-    window->count = 0;
-  }
+  int rc = ps_owned_runs_range(space, key, ref, start, end, &window->runs,
+                               &window->count, error);
+  if (rc == LC_OK)
+    rc = window_geometry(window, start, end, error);
+  if (rc != LC_OK)
+    window_runs_close(window);
   return rc;
 }
-int ps_stream_window_capture(ps_space *space, ps_key key, const ps_ref *ref,
-                             uint64_t start, uint64_t end,
-                             ps_stream_window **out, lc_error *error) {
+int ps_stream_window_pin_locked(ps_space *space, ps_key key, const ps_ref *ref,
+                                uint64_t start, uint64_t end,
+                                ps_stream_window **out, lc_error *error) {
   ps_stream_window *window;
   int rc;
   *out = NULL;
   window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
   if (!window)
     return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream window");
-  rc = window_capture(space, key, ref, start, end, window, error);
+  rc = ps_owned_runs_pin_range(space, key, ref, start, end, &window->runs,
+                               &window->count, error);
   if (rc == LC_OK) {
     window->start = start;
     window->end = end;
@@ -1161,26 +1155,41 @@ int ps_stream_window_capture(ps_space *space, ps_key key, const ps_ref *ref,
     lc_free_with_allocator(NULL, window);
   return rc;
 }
+int ps_stream_window_verify(ps_stream_window *window, lc_error *error) {
+  int rc = ps_owned_runs_verify(window->runs, window->count, NULL, error);
+  if (rc == LC_OK)
+    rc = window_geometry(window, window->start, window->end, error);
+  return rc;
+}
 int ps_stream_window_read(ps_stream_window *window, uint64_t offset,
                           void *bytes, size_t n, lc_error *error) {
   unsigned char *out = bytes;
-  size_t at, take;
+  size_t at = 0, hi, mid, take;
   int rc;
   if (!window || (!bytes && n) || offset < window->start ||
       offset > window->end || n > window->end - offset)
     return stream_error(error, LC_ERR_INVALID,
                         "offset read outside captured stream window");
-  at = mapping_lower(window->runs, window->count, offset);
+  hi = window->count;
+  while (at < hi) {
+    ps_owned_run *run;
+    mid = at + (hi - at) / 2;
+    run = window->runs[mid];
+    if (ps_owned_run_base(run) + ps_owned_run_capacity(run) <= offset)
+      at = mid + 1;
+    else
+      hi = mid;
+  }
   while (n) {
-    stream_run *run;
-    if (at == window->count || offset < window->runs[at].base)
+    ps_owned_run *run = at < window->count ? window->runs[at] : NULL;
+    uint64_t base = ps_owned_run_base(run);
+    if (!run || offset < base)
       return stream_error(error, LC_ERR_PROTOCOL,
                           "captured stream range is unmapped");
-    run = &window->runs[at];
-    take = (size_t)(run->base + run->capacity - offset);
+    take = (size_t)(base + ps_owned_run_capacity(run) - offset);
     if (take > n)
       take = n;
-    rc = ps_owned_read(run->handle, offset - run->base, out, take, error);
+    rc = ps_owned_read(run, offset - base, out, take, error);
     if (rc != LC_OK)
       return rc;
     offset += take;

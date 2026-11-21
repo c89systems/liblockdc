@@ -5899,6 +5899,10 @@ int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
     *incarnation = known;
     return LC_OK;
   }
+  if (!buffer) {
+    *current = 0;
+    return LC_OK;
+  }
   for (i = 0; i < p->count; ++i) {
     const ps_extent *extent = p->extents + i;
     if (extent->bytes > left)
@@ -6011,33 +6015,35 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   lc_free_with_allocator(NULL, buffer);
   return rc;
 }
-int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,
-                               unsigned int last, ps_value_retain_fn retain,
-                               void *context, ps_values **out,
-                               lc_error *error) {
+static void values_discard_locked(ps_values *view) {
+  size_t i;
+  for (i = 0; i < view->count; ++i)
+    if (view->items[i].retained)
+      ps_internal_entry_unpin(view->space, view->items[i].retained);
+  lc_free_with_allocator(NULL, view->items);
+  lc_free_with_allocator(NULL, view);
+}
+int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
+                                      unsigned int first, unsigned int last,
+                                      uint64_t prefix,
+                                      ps_value_retain_fn retain, void *context,
+                                      ps_values **out, lc_error *error) {
   ps_values *view;
-  ps_coordination_guard *guard;
   ps_entry *p, *selected;
-  uint64_t prefix;
   size_t i, n = 0, at = 0;
-  int rc;
-  if (out)
-    *out = NULL;
-  if (!s || !out || first > last)
-    return err(error, LC_ERR_INVALID, "value visit requires owner and kinds");
+  int rc = LC_OK;
+  *out = NULL;
   view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
   if (!view)
     return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
-  pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
-  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
+  view->space = s;
+  for (i = 0; i < BUCKETS; ++i)
     for (p = s->buckets[i]; p; p = p->hash_next)
       if (p->key.owner == owner && p->key.kind >= first &&
           p->key.kind <= last && immutable_key(p->key) &&
           selected_value(s, p, prefix))
         ++n;
-  if (rc == LC_OK && n) {
+  if (n) {
     if (n <= (size_t)-1 / sizeof(*view->items))
       view->items = lc_calloc_with_allocator(NULL, n, sizeof(*view->items));
     if (!view->items)
@@ -6060,24 +6066,39 @@ int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,
         }
         ++at;
       }
-  rc = ps_internal_capture_end(s, guard, rc, error);
+  view->count = at;
   if (rc == LC_OK) {
-    view->space = s;
-    view->count = at;
     ++s->readers;
-  } else
-    while (at) {
-      ps_entry *retained = view->items[--at].retained;
-      if (retained)
-        ps_internal_entry_unpin(s, retained);
-    }
-  pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK)
     *out = view;
-  else {
-    lc_free_with_allocator(NULL, view->items);
-    lc_free_with_allocator(NULL, view);
+  } else
+    values_discard_locked(view);
+  return rc;
+}
+int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,
+                               unsigned int last, ps_value_retain_fn retain,
+                               void *context, ps_values **out,
+                               lc_error *error) {
+  ps_coordination_guard *guard;
+  uint64_t prefix;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (!s || !out || first > last)
+    return err(error, LC_ERR_INVALID, "value visit requires owner and kinds");
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  if (rc == LC_OK) {
+    prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+    rc = ps_internal_values_capture_locked(s, owner, first, last, prefix,
+                                           retain, context, out, error);
   }
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  if (rc != LC_OK && *out) {
+    --s->readers;
+    values_discard_locked(*out);
+    *out = NULL;
+  }
+  pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
@@ -6183,19 +6204,14 @@ int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
 }
 void ps_values_close(ps_values *view) {
   ps_space *s;
-  size_t i;
   if (!view)
     return;
   s = view->space;
   pthread_mutex_lock(&s->mutex);
-  for (i = 0; i < view->count; ++i)
-    if (view->items[i].retained)
-      ps_internal_entry_unpin(s, view->items[i].retained);
   --s->readers;
+  values_discard_locked(view);
   collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
-  lc_free_with_allocator(NULL, view->items);
-  lc_free_with_allocator(NULL, view);
 }
 int ps_values_visit(ps_space *s, uint64_t owner, unsigned int first,
                     unsigned int last, ps_value_visit_fn visit, void *context,
@@ -7564,30 +7580,23 @@ uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
 uint64_t ps_owned_run_base(const ps_owned_run *run) {
   return run ? run->entry->key.key : 0;
 }
-static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
-                        const ps_ref *ref, uint64_t start, uint64_t end,
-                        ps_owned_status *status, ps_owned_run ***out,
-                        size_t *count, ps_owned_footer **footers,
-                        lc_error *error) {
-  ps_coordination_guard *guard;
+static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
+                           const ps_ref *ref, uint64_t start, uint64_t end,
+                           ps_owned_status *status, ps_owned_run ***out,
+                           size_t *count, lc_error *error) {
   ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_run **items = NULL;
-  ps_owned_footer *captured = NULL;
-  size_t n = 0, capacity = 0, i;
-  int rc;
+  size_t n = 0, capacity = 0;
+  int rc = LC_OK;
   if (out)
     *out = NULL;
   if (count)
     *count = 0;
-  if (footers)
-    *footers = NULL;
-  if (!s || !out || !count ||
+  if (!out || !count ||
       (!head && (!ref || key.kind != PS_STREAM || (!status && start >= end))))
     return err(error, LC_ERR_INVALID,
                "mapping capture requires head and outputs");
-  pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
-  if (rc == LC_OK && !head) {
+  if (!head) {
     head = lookup(s, key);
     if (!head || head->token != ref->incarnation ||
         memcmp(ref->container, s->identity, 16) || end > head->bytes)
@@ -7630,9 +7639,7 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   }
   if (rc == LC_OK && capacity) {
     items = lc_calloc_with_allocator(NULL, capacity, sizeof(*items));
-    if (items && footers && capacity <= SIZE_MAX / sizeof(*captured))
-      captured = lc_alloc_with_allocator(NULL, capacity * sizeof(*captured));
-    if (!items || (footers && !captured))
+    if (!items)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
   }
   for (p = first; rc == LC_OK && p != limit; p = p->owned_next) {
@@ -7658,21 +7665,80 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   }
   if (rc == LC_OK && n != capacity)
     rc = err(error, LC_ERR_PROTOCOL, "mapping count differs from its head");
-  rc = ps_internal_capture_end(s, guard, rc, error);
-  pthread_mutex_unlock(&s->mutex);
-  for (i = 0; rc == LC_OK && i < n; ++i) {
+  if (rc == LC_OK) {
+    *out = items;
+    *count = n;
+  } else {
+    while (n) {
+      ps_owned_run *run = items[--n];
+      ps_internal_entry_unpin(s, run->entry);
+      --s->readers;
+      lc_free_with_allocator(NULL, run);
+    }
+    lc_free_with_allocator(NULL, items);
+  }
+  return rc;
+}
+int ps_owned_runs_pin_range(ps_space *s, ps_key key, const ps_ref *ref,
+                            uint64_t start, uint64_t end, ps_owned_run ***out,
+                            size_t *count, lc_error *e) {
+  return pin_runs_locked(s, NULL, key, ref, start, end, NULL, out, count, e);
+}
+int ps_owned_runs_verify(ps_owned_run *const *items, size_t count,
+                         ps_owned_footer *footers, lc_error *error) {
+  size_t i;
+  int rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < count; ++i) {
     unsigned char header[PS_RUN_HEADER];
-    p = items[i]->entry;
-    if (captured && !p->owned_mapped) {
+    ps_entry *p = items[i]->entry;
+    ps_space *s = items[i]->space;
+    if (footers && !p->owned_mapped) {
       rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
       if (rc == LC_OK)
         rc = validate_owned_identity(s, p, header, error);
       if (rc == LC_OK)
-        memcpy(captured[i].bytes, header + PS_RUN_IDENTITY_BYTES,
-               sizeof(captured[i].bytes));
+        memcpy(footers[i].bytes, header + PS_RUN_IDENTITY_BYTES,
+               sizeof(footers[i].bytes));
     } else
       rc = verify_owned(s, p, header, error);
   }
+  return rc;
+}
+static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
+                        const ps_ref *ref, uint64_t start, uint64_t end,
+                        ps_owned_status *status, ps_owned_run ***out,
+                        size_t *count, ps_owned_footer **footers,
+                        lc_error *error) {
+  ps_coordination_guard *guard;
+  ps_owned_run **items = NULL;
+  ps_owned_footer *captured = NULL;
+  size_t n = 0, i;
+  int rc;
+  if (out)
+    *out = NULL;
+  if (count)
+    *count = 0;
+  if (footers)
+    *footers = NULL;
+  if (!s || !out || !count ||
+      (!head && (!ref || key.kind != PS_STREAM || (!status && start >= end))))
+    return err(error, LC_ERR_INVALID,
+               "mapping capture requires head and outputs");
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = pin_runs_locked(s, head, key, ref, start, end, status, &items, &n,
+                         error);
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  if (rc == LC_OK && footers && n) {
+    if (n <= SIZE_MAX / sizeof(*captured))
+      captured = lc_alloc_with_allocator(NULL, n * sizeof(*captured));
+    if (!captured)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping footers");
+  }
+  if (rc == LC_OK)
+    rc = ps_owned_runs_verify(items, n, captured, error);
   if (rc == LC_OK) {
     *out = items;
     *count = n;

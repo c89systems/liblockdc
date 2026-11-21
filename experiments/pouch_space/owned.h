@@ -107,6 +107,13 @@ int ps_owned_runs_key_status(ps_space *, ps_key, const ps_ref *,
                              lc_error *);
 int ps_owned_runs_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
                         uint64_t end, ps_owned_run ***, size_t *, lc_error *);
+/* Select and pin from a held canonical allocator scope. Check identities
+ * and optional footers after releasing that scope. */
+int ps_owned_runs_pin_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
+                            uint64_t end, ps_owned_run ***, size_t *,
+                            lc_error *);
+int ps_owned_runs_verify(ps_owned_run *const *, size_t, ps_owned_footer *,
+                         lc_error *);
 /* Capture the writable suffix, including grants beyond the published tail.
  * The caller owns stream edit authority through use of the mappings. */
 int ps_owned_runs_edit_range(ps_owned_head *, uint64_t start, uint64_t end,

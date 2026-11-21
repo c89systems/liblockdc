@@ -53,6 +53,11 @@ typedef struct namespace_observation {
   uint64_t start, source, bytes;
   int ready, seed_only;
 } namespace_observation;
+typedef struct namespace_selection {
+  ps_catalog_info binding;
+  ps_checkpoint_info coverage;
+  char leaf[PS_NS_LEAF_BYTES];
+} namespace_selection;
 static int failure(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL,
                       rc == LC_ERR_PROTOCOL ? "pouch_namespace_corrupt" : NULL,
@@ -611,14 +616,16 @@ static int same_projection(const lc_pouch_storage_namespace_info *a,
          a->active_incarnation == b->active_incarnation &&
          a->checkpoint_epoch == b->checkpoint_epoch && a->tail == b->tail;
 }
-/* Namespace exclusion spans selection and the first mapping/view witnesses. */
-static int capture_selected_view(struct ps_namespace_data *d,
-                                 namespace_observation *observed,
-                                 const ps_checkpoint_info *coverage,
-                                 const ps_catalog_info *binding,
-                                 const char *leaf, lc_error *e) {
+/* Namespace exclusion spans the canonical capture, header verification, and
+ * acquisition of the view witness. */
+static int capture_selected_view_locked(struct ps_namespace_data *d,
+                                        namespace_observation *observed,
+                                        const namespace_selection *selection,
+                                        uint64_t prefix, lc_error *e) {
   ps_namespace_view *view = observed->view;
   ps_space *space = d->ns->root->space;
+  const ps_checkpoint_info *coverage = &selection->coverage;
+  const ps_catalog_info *binding = &selection->binding;
   uint64_t active = observed->projection.active_segment;
   uint64_t tail = observed->projection.tail;
   uint64_t start = observed->start;
@@ -630,26 +637,16 @@ static int capture_selected_view(struct ps_namespace_data *d,
         (active == coverage->segment && start < coverage->offset))
       return failure(e, LC_ERR_PROTOCOL,
                      "namespace replay suffix is out of range");
-    view->coverage = *coverage;
   } else {
     /* The complete view is local to this stream when no predecessor has
      * uncovered records. Multi-stream captures use ordinary recovery. */
     if (coverage->segment != active && (coverage->segment || active != 1))
       return LC_OK;
     start = coverage->offset;
-    rc = ps_checkpoint_capture_values(d->ns, coverage, observed->seed_only,
-                                      &view->metadata, &view->coverage, e);
-    if (rc == LC_OK && view->coverage.control != coverage->control) {
-      /* A barrier may have advanced selected visibility between captures. */
-      ps_values_close(view->metadata);
-      view->metadata = NULL;
-      return LC_OK;
-    }
+    rc = ps_checkpoint_capture_selected_locked(
+        d->ns, prefix, coverage, observed->seed_only, &view->metadata, e);
   }
-  if (rc == LC_OK)
-    rc = ps_coordination_lock(ps_space_coordination(space),
-                              PS_COORDINATION_NAMESPACE_VIEW, d->ns->hash, 0,
-                              &view->witness, e);
+  view->coverage = *coverage;
   if (rc == LC_OK && start < tail) {
     view->items = lc_calloc_with_allocator(NULL, 1, sizeof(*view->items));
     if (!view->items)
@@ -659,19 +656,12 @@ static int capture_selected_view(struct ps_namespace_data *d,
       view->items->id = active;
       view->items->start = start;
       view->items->tail = tail;
-      strcpy(view->items->leaf, leaf);
-      rc = ps_stream_window_capture(space, binding->stream, &binding->target,
-                                    start, tail, &view->items->reader, e);
+      strcpy(view->items->leaf, selection->leaf);
+      rc = ps_stream_window_pin_locked(space, binding->stream, &binding->target,
+                                       start, tail, &view->items->reader, e);
     }
   }
-  if (rc == LC_OK) {
-    view->projection = observed->projection;
-    pthread_mutex_lock(&d->mutex);
-    ++d->views;
-    view->registered = 1;
-    pthread_mutex_unlock(&d->mutex);
-    observed->ready = 1;
-  }
+  observed->ready = rc == LC_OK;
   return rc;
 }
 static int active_binding(ps_space *s, ps_key stream, uint64_t prefix,
@@ -684,77 +674,122 @@ static int active_binding(ps_space *s, ps_key stream, uint64_t prefix,
          binding->stream.owner == stream.owner &&
          binding->stream.key == stream.key;
 }
-/* Observe the projection boundary under the namespace guard and one allocator
- * capture. The live completion stamp certifies that no producer recovery is
- * needed to learn the selected tail. Cold or incomplete streams use load(). */
-static int projection_selected(struct ps_namespace_data *d,
-                               namespace_observation *observed, lc_error *e) {
+/* A matching completion stamp gives the selected tail without replaying
+ * the producer. An unknown memo falls back to decoding under authority. */
+static int select_projection_locked(struct ps_namespace_data *d,
+                                    namespace_observation *observed,
+                                    namespace_selection *selection,
+                                    uint64_t prefix, int memo_only, int *found,
+                                    lc_error *e) {
   ps_namespace *ns = d->ns;
   lc_pouch_storage_namespace_info *out = &observed->projection;
   ps_space *s = ns->root->space;
-  ps_coordination_guard *allocator;
-  ps_catalog_info binding;
-  ps_checkpoint_info coverage;
+  ps_checkpoint_info *coverage = &selection->coverage;
   ps_key stream = {0, 0, PS_STREAM};
   unsigned char head[NS_HEAD_BYTES];
-  char leaf[PS_NS_LEAF_BYTES];
-  uint64_t prefix, token, active = 0, tail;
-  int rc, current, found = 0;
-  pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &allocator, e);
-  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  if (rc == LC_OK)
-    rc = ps_internal_fixed_value(s, head_key(ns->identity.owner), prefix, head,
-                                 sizeof(head), d->observed_head, &token,
-                                 &current, e);
-  if (rc == LC_OK && current && token) {
-    if (token == d->observed_head)
-      active = d->observed_active;
-    else {
-      rc = decode_head(ns->identity.owner, head, &active, e);
-      if (rc == LC_OK) {
-        d->observed_head = token;
-        d->observed_active = active;
-      }
-    }
+  uint64_t token, active, tail;
+  int rc, current;
+  *found = 0;
+  rc = ps_internal_fixed_value(s, head_key(ns->identity.owner), prefix,
+                               memo_only ? NULL : head, sizeof(head),
+                               d->observed_head, &token, &current, e);
+  if (rc != LC_OK || !current || !token)
+    return rc;
+  if (token == d->observed_head)
+    active = d->observed_active;
+  else {
+    rc = decode_head(ns->identity.owner, head, &active, e);
+    if (rc != LC_OK)
+      return rc;
+    d->observed_head = token;
+    d->observed_active = active;
   }
-  if (rc == LC_OK && active) {
+  if (active) {
     stream.owner = ns->identity.owner;
     stream.key = active;
-    found = active_binding(s, stream, prefix, leaf, &binding) &&
-            ps_internal_complete_tail(s, stream, &binding.target, &tail);
+    *found =
+        active_binding(s, stream, prefix, selection->leaf,
+                       &selection->binding) &&
+        ps_internal_complete_tail(s, stream, &selection->binding.target, &tail);
   }
-  if (found && !observed->window) {
-    rc = ps_checkpoint_point(s, ns->identity.owner, prefix,
-                             &d->observed_coverage, &found, e);
-    coverage = d->observed_coverage;
+  if (*found && !observed->window) {
+    rc = ps_checkpoint_point(s, ns->identity.owner, prefix, memo_only,
+                             &d->observed_coverage, found, e);
+    *coverage = d->observed_coverage;
   }
-  if (rc == LC_OK && found && !observed->window &&
-      (coverage.segment > active ||
-       (coverage.segment == active && coverage.offset > tail)))
-    rc = failure(e, LC_ERR_PROTOCOL, "checkpoint exceeds namespace tail");
-  rc = ps_internal_capture_end(s, allocator, rc, e);
-  pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && found && observed->window) {
-    if (active != observed->source || observed->start > tail ||
-        observed->bytes > tail - observed->start)
-      return LC_OK;
-    rc = ps_stream_window_capture(
-        s, binding.stream, &binding.target, observed->start,
-        observed->start + observed->bytes, &observed->window->reader, e);
-    observed->ready = rc == LC_OK;
+  if (rc != LC_OK || !*found)
     return rc;
+  if (!observed->window &&
+      (coverage->segment > active ||
+       (coverage->segment == active && coverage->offset > tail)))
+    return failure(e, LC_ERR_PROTOCOL, "checkpoint exceeds namespace tail");
+  out->active_segment = active;
+  out->tail = tail;
+  out->active_incarnation = selection->binding.target.incarnation;
+  if (!observed->window) {
+    out->segments = active - coverage->segment + (coverage->segment != 0);
+    out->checkpoint_epoch = coverage->epoch;
+  }
+  return LC_OK;
+}
+static int projection_selected(struct ps_namespace_data *d,
+                               namespace_observation *observed, lc_error *e) {
+  ps_namespace *ns = d->ns;
+  ps_space *s = ns->root->space;
+  const lc_pouch_storage_namespace_info *out = &observed->projection;
+  namespace_selection selection;
+  ps_coordination_guard *allocator;
+  ps_namespace_view *view = observed->view;
+  uint64_t prefix;
+  int rc, found = 0, point = !view && !observed->window;
+  pthread_mutex_lock(&s->mutex);
+  rc = point ? ps_internal_observe_begin(s, &allocator, e)
+             : ps_internal_capture_begin(s, &allocator, e);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  if (rc == LC_OK)
+    rc = select_projection_locked(d, observed, &selection, prefix,
+                                  point && !allocator, &found, e);
+  if (rc == LC_OK && !found && point && !allocator) {
+    rc = ps_internal_capture_begin(s, &allocator, e);
+    prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+    if (rc == LC_OK)
+      rc = select_projection_locked(d, observed, &selection, prefix, 0, &found,
+                                    e);
   }
   if (rc == LC_OK && found) {
-    out->active_segment = active;
-    out->segments = active - coverage.segment + (coverage.segment != 0);
-    out->tail = tail;
-    out->active_incarnation = binding.target.incarnation;
-    out->checkpoint_epoch = coverage.epoch;
-    if (observed->view)
-      rc = capture_selected_view(d, observed, &coverage, &binding, leaf, e);
+    if (observed->window) {
+      if (out->active_segment == observed->source &&
+          observed->start <= out->tail &&
+          observed->bytes <= out->tail - observed->start) {
+        rc = ps_stream_window_pin_locked(
+            s, selection.binding.stream, &selection.binding.target,
+            observed->start, observed->start + observed->bytes,
+            &observed->window->reader, e);
+        observed->ready = rc == LC_OK;
+      }
+    } else if (view)
+      rc = capture_selected_view_locked(d, observed, &selection, prefix, e);
     else
       observed->ready = 1;
+  }
+  rc = ps_internal_capture_end(s, allocator, rc, e);
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK || !observed->ready || point)
+    return rc;
+  if (observed->window)
+    return ps_stream_window_verify(observed->window->reader, e);
+  if (view->count)
+    rc = ps_stream_window_verify(view->items[0].reader, e);
+  if (rc == LC_OK)
+    rc = ps_coordination_lock(ps_space_coordination(s),
+                              PS_COORDINATION_NAMESPACE_VIEW, ns->hash, 0,
+                              &view->witness, e);
+  if (rc == LC_OK) {
+    view->projection = *out;
+    pthread_mutex_lock(&d->mutex);
+    ++d->views;
+    view->registered = 1;
+    pthread_mutex_unlock(&d->mutex);
   }
   return rc;
 }
@@ -1956,7 +1991,7 @@ int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
   if (rc == LC_OK && current && token)
     rc = decode_head(owner, head, &stream.key, e);
   if (rc == LC_OK && current)
-    rc = ps_checkpoint_point(s, owner, prefix, &coverage, &current, e);
+    rc = ps_checkpoint_point(s, owner, prefix, 0, &coverage, &current, e);
   if (rc == LC_OK && current && coverage.segment > stream.key)
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint coverage exceeds namespace head");

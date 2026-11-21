@@ -546,15 +546,16 @@ static int read_control(ps_namespace *ns, ps_reader *reader,
   return decode_control(ns->identity.owner, bytes, ref.incarnation, out, e);
 }
 int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
-                        ps_checkpoint_info *out, int *current, lc_error *e) {
+                        int memo_only, ps_checkpoint_info *out, int *current,
+                        lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
   ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
   uint64_t token;
   ps_checkpoint_info decoded;
   int rc;
   key.owner = owner;
-  rc = ps_internal_fixed_value(s, key, prefix, bytes, sizeof(bytes),
-                               out->control, &token, current, e);
+  rc = ps_internal_fixed_value(s, key, prefix, memo_only ? NULL : bytes,
+                               sizeof(bytes), out->control, &token, current, e);
   if (rc == LC_OK && *current && token != out->control) {
     memset(&decoded, 0, sizeof(decoded));
     if (token)
@@ -626,16 +627,35 @@ static int checkpoint_capture_values(ps_namespace *ns,
     ps_values_close(values);
   return rc;
 }
-int ps_checkpoint_capture_values(ps_namespace *ns,
-                                 const ps_checkpoint_info *known, int seed_only,
-                                 ps_values **out, ps_checkpoint_info *coverage,
-                                 lc_error *e) {
-  checkpoint_capture capture;
-  capture.resident = NULL;
-  capture.known = known;
-  capture.mode =
-      seed_only ? PS_CHECKPOINT_CAPTURE_SEED : PS_CHECKPOINT_CAPTURE_FULL;
-  return checkpoint_capture_values(ns, &capture, out, coverage, e);
+typedef struct selected_checkpoint {
+  uint64_t control;
+  int seed_only, invalid;
+} selected_checkpoint;
+static int retain_selected_record(void *context, ps_key key,
+                                  uint64_t incarnation) {
+  selected_checkpoint *selected = context;
+  if (key.kind != PS_NAMESPACE_CHECKPOINT)
+    return !selected->seed_only;
+  if (key.key != 1 || incarnation != selected->control)
+    selected->invalid = 1;
+  return 0;
+}
+int ps_checkpoint_capture_selected_locked(ps_namespace *ns, uint64_t prefix,
+                                          const ps_checkpoint_info *coverage,
+                                          int seed_only, ps_values **out,
+                                          lc_error *e) {
+  selected_checkpoint selected;
+  int rc;
+  selected.control = coverage->control;
+  selected.seed_only = seed_only;
+  selected.invalid = 0;
+  rc = ps_internal_values_capture_locked(
+      ns->root->space, ns->identity.owner, PS_KEY_METADATA,
+      PS_NAMESPACE_CHECKPOINT, prefix, retain_selected_record, &selected, out,
+      e);
+  if (rc == LC_OK && selected.invalid)
+    rc = failure(e, LC_ERR_PROTOCOL, "unexpected namespace coverage slot");
+  return rc;
 }
 int ps_key_checkpoint_capture(ps_key_checkpoint *c,
                               enum ps_checkpoint_capture_mode mode,

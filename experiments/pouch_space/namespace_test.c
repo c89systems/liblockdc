@@ -2540,6 +2540,150 @@ static void shared_handoff(const char *path) {
   }
   shared_namespace = 0;
 }
+typedef struct projection_probe {
+  ps_root *peer_root;
+  ps_namespace *peer;
+  size_t acquisitions, headers;
+  off_t header;
+  int armed, held, reject, corrupt, discover;
+} projection_probe;
+static int projection_lock(void *context, int fd, int command,
+                           struct flock *lock) {
+  projection_probe *p = context;
+  int take = p->armed && lock->l_start == 4 && command == F_OFD_SETLKW &&
+             lock->l_type == F_WRLCK;
+  if (take && p->reject) {
+    errno = EAGAIN;
+    return -1;
+  }
+  int rc = fcntl(fd, command, lock);
+  if (rc || !p->armed || lock->l_start != 4)
+    return rc;
+  if (take) {
+    REQUIRE(!p->held);
+    p->held = 1;
+    ++p->acquisitions;
+  } else if (command == F_OFD_SETLK && lock->l_type == F_UNLCK) {
+    REQUIRE(p->held);
+    p->held = 0;
+  }
+  return rc;
+}
+static ssize_t projection_read(void *context, int fd, void *bytes, size_t n,
+                               off_t at) {
+  projection_probe *p = context;
+  ssize_t rc = pread(fd, bytes, n, at);
+  if (p->discover && rc == PS_RUN_IDENTITY_BYTES && at >= PS_DATA &&
+      !(at % PS_PAGE))
+    p->header = at;
+  if (p->armed && rc == PS_RUN_IDENTITY_BYTES && at == p->header) {
+    REQUIRE(!p->held && p->acquisitions == 1);
+    ++p->headers;
+    if (p->peer) {
+      lc_error e = {0};
+      ps_namespace *ns = p->peer;
+      p->peer = NULL;
+      ok(append(p->peer_root, ns, 1, 0, 65, &e), &e);
+      clear(&e);
+    }
+    if (p->corrupt)
+      *(unsigned char *)bytes ^= 1;
+  }
+  return rc;
+}
+static void shared_projection_capture(const char *path, int durable) {
+  projection_probe probe = {0};
+  ps_coordination_io locks = {&probe, projection_lock};
+  ps_io disk = {&probe,      projection_read, direct_write,
+                direct_sync, direct_reserve,  NULL};
+  ps_root_options options = {0};
+  ps_root *a = NULL, *b = NULL;
+  ps_namespace_view *view = NULL;
+  ps_namespace_window *window = NULL;
+  lc_pouch_storage_namespace_info before, after;
+  lc_pouch_state_entry written = {0};
+  ps_coordination_guard *allocator_guard = NULL;
+  ps_stats st;
+  lc_error e = {0};
+  records selected = {0};
+  uint64_t segment;
+  unsigned char bytes[65];
+  struct iovec part = {bytes, sizeof(bytes)};
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  options.storage.io = &disk;
+  options.storage.coordination_io = &locks;
+  ok(ps_root_open(path, 1, &options, &a, &e), &e);
+  ps_namespace *x = acquire(a, "projection", 1, &e);
+  ok(put(a, x, 1, 0, sizeof(bytes), NULL, &segment, &written, &e), &e);
+  options.storage.io = NULL;
+  options.storage.coordination_io = NULL;
+  ok(ps_root_open(path, 0, &options, &b, &e), &e);
+  ps_namespace *peer = acquire(b, "independent", 1, &e);
+  ok(ps_namespace_projection(x, &before, &e), &e);
+  REQUIRE(before.active_segment == segment && before.tail);
+  probe.discover = 1;
+  ok(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                            written.payload_span.payload_offset, sizeof(bytes),
+                            &window, &e),
+     &e);
+  probe.discover = 0;
+  REQUIRE(probe.header >= PS_DATA);
+  ps_namespace_read_close(window);
+  window = NULL;
+  ok(ps_coordination_lock(ps_space_coordination(ps_root_space(b)),
+                          PS_COORDINATION_ALLOCATION, 0, 1, &allocator_guard,
+                          &e),
+     &e);
+  probe.armed = probe.reject = 1;
+  ok(ps_namespace_projection(x, &after, &e), &e);
+  REQUIRE(!probe.acquisitions && !probe.headers && after.tail == before.tail &&
+          after.active_incarnation == before.active_incarnation &&
+          after.checkpoint_epoch == before.checkpoint_epoch);
+  ps_coordination_unlock(allocator_guard);
+  probe.reject = 0;
+  probe.peer_root = b;
+  probe.peer = peer;
+  ok(ps_namespace_view_open(x, &view, &e), &e);
+  REQUIRE(probe.acquisitions == 1 && probe.headers && !probe.peer);
+  probe.armed = 0;
+  ok(ps_namespace_view_visit(view, 1, visit, &selected, &e), &e);
+  REQUIRE(selected.count == 1 && selected.version == 1);
+  ps_namespace_view_close(view);
+  count(peer, 1, &e);
+
+  probe.acquisitions = probe.headers = 0;
+  probe.armed = probe.corrupt = 1;
+  REQUIRE(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                                 written.payload_span.payload_offset,
+                                 sizeof(bytes), &window,
+                                 &e) == LC_ERR_PROTOCOL &&
+          !window);
+  REQUIRE(probe.acquisitions == 1 && probe.headers == 1 && !probe.held);
+  clear(&e);
+  probe.armed = probe.corrupt = 0;
+  ok(ps_status(ps_root_space(a), &st, &e), &e);
+  REQUIRE(!st.retained_payload_bytes);
+  probe.acquisitions = probe.headers = 0;
+  probe.armed = 1;
+  ok(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                            written.payload_span.payload_offset, sizeof(bytes),
+                            &window, &e),
+     &e);
+  REQUIRE(probe.acquisitions == 1 && probe.headers == 1 && !probe.held);
+  probe.armed = 0;
+  ok(lc_pouch_record_io_read(ps_namespace_read_input(window),
+                             written.payload_span.payload_offset, &part, 1, &e),
+     &e);
+  REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+  ps_namespace_read_close(window);
+  lc_pouch_state_entry_cleanup(&allocator, &written);
+  ps_namespace_release(peer);
+  ps_namespace_release(x);
+  ok(ps_root_close(b, &e), &e);
+  ok(ps_root_close(a, &e), &e);
+  REQUIRE(!unlink(path));
+}
 typedef struct shared_body_pin {
   ps_namespace *ns;
   ps_namespace_window *window;
@@ -2929,9 +3073,11 @@ static void *worker(void *p) {
     append_budget_faults(r->path, 1);
   else if (!strcmp(r->mode, "budget-transfer"))
     budget_transfer(r->path);
-  else if (!strcmp(r->mode, "shared-handoff"))
+  else if (!strcmp(r->mode, "shared-handoff")) {
     shared_handoff(r->path);
-  else if (!strcmp(r->mode, "shared-scope-handoff")) {
+    shared_projection_capture(r->path, 0);
+    shared_projection_capture(r->path, 1);
+  } else if (!strcmp(r->mode, "shared-scope-handoff")) {
     for (int durable = 0; durable <= 1; ++durable) {
       for (int edit_first = 0; edit_first <= 1; ++edit_first)
         shared_scope_handoff(r->path, durable, edit_first, 0);
