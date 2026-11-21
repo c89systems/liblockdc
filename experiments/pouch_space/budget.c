@@ -416,7 +416,7 @@ int ps_budget_plan_piece(ps_budget_plan *p, uint64_t logical, size_t ranges,
   ps_budget_plan next;
   uint64_t table;
   int rc;
-  if (!p || !logical || logical > PS_CHUNK || ranges > logical ||
+  if (!p || !logical || logical > PS_STREAM_PIECE_BYTES || ranges > logical ||
       live > logical || (!!ranges != !!live))
     return invalid(e, "piece capacity plan requires bounded live ranges");
   if (!ranges)
@@ -447,7 +447,7 @@ int ps_budget_plan_preferred_span(ps_budget_plan *p, uint64_t bytes,
    * floor((bytes - 1 + header) / page) pages. Geometric growth is fourfold;
    * only the final grant can exceed the exact-span bound. */
   prior = (bytes - 1 + PS_RUN_HEADER) / PS_PAGE * PS_PAGE;
-  last = prior >= PS_CHUNK / 4 ? PS_CHUNK : prior * 4;
+  last = prior >= PS_STREAM_PIECE_BYTES / 4 ? PS_STREAM_PIECE_BYTES : prior * 4;
   if (last < preferred)
     last = preferred;
   rc = plan_add(&next, last - PS_PAGE, 0, 0, e);
@@ -462,7 +462,9 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
   if (!p || deletion > (uint64_t)INT64_MAX - 512)
     return invalid(e, "maintenance plan deletion exceeds canonical bounds");
   next = *p;
-  rc = ps_budget_plan_piece(&next, PS_CHUNK, PS_CHUNK / 2, PS_CHUNK, e);
+  rc =
+      ps_budget_plan_piece(&next, PS_STREAM_PIECE_BYTES,
+                           PS_STREAM_PIECE_BYTES / 2, PS_STREAM_PIECE_BYTES, e);
   if (rc == LC_OK)
     rc = ps_budget_plan_stream(&next, e);
   if (rc == LC_OK)

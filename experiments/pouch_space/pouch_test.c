@@ -4207,7 +4207,7 @@ static void maintenance_physical_threshold(const char *path, int sync) {
   o.logical.segment_target_bytes = 8 * PS_MIB;
   o.logical.background_compaction_enabled = 1;
   o.logical.compaction_interval_seconds = 3600;
-  o.logical.terminal_reclaim_min_bytes = 2 * PS_CHUNK;
+  o.logical.terminal_reclaim_min_bytes = 2 * PS_STREAM_PIECE_BYTES;
   o.logical.compaction_min_segment_count = 1;
   ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
   change.has_metadata = 1;
@@ -4242,7 +4242,8 @@ static void maintenance_physical_threshold(const char *path, int sync) {
   ok(ps_namespace_sources_visit(strip.ns, maintenance_source_info, &source_info,
                                 &e),
      &e);
-  REQUIRE(source_info.runs == 1 && source_info.stored_bytes <= PS_CHUNK);
+  REQUIRE(source_info.runs == 1 &&
+          source_info.stored_bytes <= PS_STREAM_PIECE_BYTES);
   opts.ns = "threshold";
   opts.terminal_reclaim = 1;
   ok(lc_pouch_maintenance_run(p, &opts, &result, &e), &e);

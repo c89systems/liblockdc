@@ -3034,8 +3034,8 @@ static void canonical_stream_lifecycle(void) {
   ps_stream_reader_close(held);
   stream_expect(stream, large_offset, body, (size_t)PS_MIB + 17, 100);
   OK(ps_stream_status(stream, &info, &error));
-  CHECK(info.runs <= 2 + info.tail / (PS_CHUNK - PS_RUN_HEADER) &&
-        info.capacity - info.tail < PS_CHUNK);
+  CHECK(info.runs <= 2 + info.tail / (PS_STREAM_PIECE_BYTES - PS_RUN_HEADER) &&
+        info.capacity - info.tail < PS_STREAM_PIECE_BYTES);
   BAD(ps_stream_read_open(stream, UINT64_MAX, 0, &held, &error));
   CHECK(held == NULL);
   BAD(ps_stream_read_open(stream, 0, UINT64_MAX, &held, &error));
@@ -3945,6 +3945,7 @@ static void canonical_stream_private_capacity(void) {
   ps_stream_info info;
   ps_catalog_info owner;
   ps_stats stats;
+  ps_reader *held[1024] = {0};
   ps_ref latest, next;
   pthread_t thread;
   unsigned char *body = malloc(PS_PAGE), *name;
@@ -3983,9 +3984,11 @@ static void canonical_stream_private_capacity(void) {
   CHECK(stats.metadata_bytes == 32 * 4032 &&
         stats.metadata_available_bytes == stats.metadata_workspace_bytes);
   /* Replacing one fixed-size descriptor consumes payload capacity without
-   * changing that boundary. Superseded values stay owned until checkpoint. */
-  for (count = 0; count < 1024; ++count) {
+   * changing that boundary. Pin each replaced value so the publication
+   * recheck cannot recover headroom by checkpointing it. */
+  for (count = 0; count < sizeof(held) / sizeof(*held); ++count) {
     ps_writer *w = NULL;
+    OK(ps_read_open(space, state(1), &latest, &held[count], &error));
     body[0] = (unsigned char)count;
     OK(ps_begin(space, NULL, state(1), &w, &error));
     rc = ps_write(w, body, PS_PAGE, &error);
@@ -3997,7 +4000,8 @@ static void canonical_stream_private_capacity(void) {
     latest = next;
     expected = body[0];
   }
-  CHECK(count > 100 && count < 1024 && rc == LC_ERR_INVALID && error.message &&
+  CHECK(count > 100 && count < sizeof(held) / sizeof(*held) &&
+        rc == LC_ERR_INVALID && error.message &&
         strstr(error.message, "capacity"));
   lc_error_cleanup(&error);
   body[0] = expected;
@@ -4016,6 +4020,8 @@ static void canonical_stream_private_capacity(void) {
 
   /* Checkpoint retires the peer's old payloads. A fresh attempt can now
    * acquire its descriptor workspace and publish without growth. */
+  for (size_t i = 0; i <= count; ++i)
+    ps_reader_close(held[i]);
   OK(ps_checkpoint(space, &error));
   OK(canonical_append(stream, canonical, sizeof(canonical), 31, 2, &start,
                       &error));
@@ -4370,8 +4376,8 @@ static void canonical_stream_prepared_pool(int zero_mode) {
   OK(ps_status(space, &after, &error));
   OK(ps_stream_status(stream, &info, &error));
   CHECK(after.syncs == before.syncs + 1 &&
-        info.runs <= 2 + info.tail / (PS_CHUNK - PS_RUN_HEADER) &&
-        info.capacity - info.tail < PS_CHUNK);
+        info.runs <= 2 + info.tail / (PS_STREAM_PIECE_BYTES - PS_RUN_HEADER) &&
+        info.capacity - info.tail < PS_STREAM_PIECE_BYTES);
   CHECK(zero_mode ? m.zero_calls > 0 : m.zero_calls == 0);
   CHECK(info.tail == 100 * (1024 + 43) && !after.private_bytes);
   /* All spare pages were certified only after the first preparation sync.
@@ -7125,14 +7131,14 @@ static void append_growth_high_water(void) {
   ps_stream *stream = stream_open(s, 1, 1, NULL, NULL);
   OK(canonical_append(stream, bytes, 400000, 317, 1, &at, &error));
   OK(ps_stream_status(stream, &before, &error));
-  CHECK(before.preferred_grant_bytes == PS_CHUNK);
+  CHECK(before.preferred_grant_bytes == PS_STREAM_PIECE_BYTES);
   OK(ps_stream_begin(stream, &w, &error));
   OK(ps_stream_reserve_exact(w, NULL, before.capacity - before.tail + 1,
                              &error));
   ps_stream_writer_close(w);
   OK(ps_stream_status(stream, &clipped, &error));
   CHECK(clipped.capacity - before.capacity == PS_PAGE - PS_RUN_HEADER &&
-        clipped.preferred_grant_bytes == PS_CHUNK);
+        clipped.preferred_grant_bytes == PS_STREAM_PIECE_BYTES);
   fill = clipped.capacity - clipped.tail - 43;
   CHECK(fill <= PS_MIB);
   OK(canonical_append(stream, bytes, (size_t)fill, 317, 2, &at, &error));
@@ -7143,10 +7149,11 @@ static void append_growth_high_water(void) {
   stream = stream_open(s, 1, 0, &clipped.ref, NULL);
   OK(ps_stream_status(stream, &before, &error));
   CHECK(before.tail == before.capacity &&
-        before.preferred_grant_bytes == PS_CHUNK);
+        before.preferred_grant_bytes == PS_STREAM_PIECE_BYTES);
   OK(canonical_append(stream, bytes, 31, 7, 3, &at, &error));
   OK(ps_stream_status(stream, &after, &error));
-  CHECK(after.capacity - before.capacity == PS_CHUNK - PS_RUN_HEADER);
+  CHECK(after.capacity - before.capacity ==
+        PS_STREAM_PIECE_BYTES - PS_RUN_HEADER);
   stream_expect(stream, at, bytes, 31, 3);
   OK(ps_stream_close(stream, &error));
   OK(ps_close(s, &error));
@@ -7352,24 +7359,25 @@ static void bounded_pieces(int durable, int checkpointed) {
   ps_owned_run *run = NULL;
   ps_piece_checksum checksum = {0};
   recovery_trace trace = {0};
-  unsigned char *body = malloc(3 * PS_CHUNK + 17);
+  const size_t length = 3 * PS_STREAM_PIECE_BYTES + 17;
+  unsigned char *body = malloc(length);
   unsigned char *scratch = malloc(PS_CHUNK);
   unsigned char footer[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES], damaged[32];
   unsigned char byte, wrong;
   uint64_t base, bytes, first, offset, physical;
-  int found, fd, rc;
+  int found, fd, rc, checked_late_window = 0;
   CHECK(body && scratch);
-  for (size_t i = 0; i < 3 * PS_CHUNK + 17; ++i)
+  for (size_t i = 0; i < length; ++i)
     body[i] = (unsigned char)(i * 17U + 3U);
   clean();
   space = create(3 * PS_MIB, durable, &io);
   stream = stream_open(space, 1, 1, NULL, NULL);
   OK(ps_checkpoint(space,
                    &error)); /* zero-tail anchor for candidate recovery */
-  OK(canonical_append(stream, body, 3 * PS_CHUNK + 17, 37, 1, &offset, &error));
-  stream_expect(stream, offset, body, 3 * PS_CHUNK + 17, 1);
+  OK(canonical_append(stream, body, length, 37, 1, &offset, &error));
+  stream_expect(stream, offset, body, length, 1);
   OK(ps_stream_status(stream, &info, &error));
-  CHECK(info.runs >= 4 && info.preferred_grant_bytes == PS_CHUNK);
+  CHECK(info.runs >= 4 && info.preferred_grant_bytes == PS_STREAM_PIECE_BYTES);
   if (checkpointed)
     OK(ps_checkpoint(space, &error));
   OK(ps_stream_close(stream, &error));
@@ -7380,15 +7388,27 @@ static void bounded_pieces(int durable, int checkpointed) {
     OK(ps_owned_grant(head, NULL, base, 0, &run, &found, &error));
     CHECK(found);
     bytes = ps_owned_run_capacity(run);
-    CHECK(bytes && bytes + PS_RUN_HEADER <= PS_CHUNK);
+    CHECK(bytes && bytes + PS_RUN_HEADER <= PS_STREAM_PIECE_BYTES);
     if (base + bytes <= info.tail) {
       m.read_bytes = 0;
       OK(ps_owned_piece_verify(run, bytes, scratch, &error));
       CHECK(m.read_bytes == bytes + sizeof(footer));
+      if (!checked_late_window && bytes > PS_CHUNK + 37) {
+        uint64_t late = PS_CHUNK + 37;
+        OK(ps_owned_read(run, late, &byte, 1, &error));
+        wrong = byte ^ 1;
+        OK(ps_owned_write(run, late, &wrong, 1, &error));
+        CHECK(ps_owned_piece_verify(run, bytes, scratch, &error) ==
+              LC_ERR_PROTOCOL);
+        lc_error_cleanup(&error);
+        OK(ps_owned_write(run, late, &byte, 1, &error));
+        OK(ps_owned_piece_verify(run, bytes, scratch, &error));
+        checked_late_window = 1;
+      }
     }
     if (!base) {
       first = bytes;
-      byte = scratch[43];
+      OK(ps_owned_read(run, 43, &byte, 1, &error));
       wrong = byte ^ 1;
       OK(ps_owned_write(run, 43, &wrong, 1, &error));
       CHECK(ps_owned_piece_verify(run, bytes, scratch, &error) ==
@@ -7401,7 +7421,7 @@ static void bounded_pieces(int durable, int checkpointed) {
     ps_owned_run_close(run);
     run = NULL;
   }
-  CHECK(base == info.capacity);
+  CHECK(base == info.capacity && checked_late_window);
   OK(ps_owned_grant(head, NULL, 0, 0, &run, &found, &error));
   physical = piece_physical(status.ref.incarnation) + PS_RUN_IDENTITY_BYTES;
   fd = open(path, O_RDWR);
@@ -7450,13 +7470,13 @@ static void bounded_pieces(int durable, int checkpointed) {
     CHECK(!durable && rc == LC_OK && rejected && trace.bytes);
     stream = rejected;
   }
-  stream_expect(stream, offset, body, 3 * PS_CHUNK + 17, 1);
+  stream_expect(stream, offset, body, length, 1);
   OK(ps_stream_seal(stream, &error));
   OK(ps_stream_close(stream, &error));
   OK(ps_close(space, &error));
   space = piece_reopen(durable, &io);
   stream = stream_open(space, 1, 0, &info.ref, NULL);
-  stream_expect(stream, offset, body, 3 * PS_CHUNK + 17, 1);
+  stream_expect(stream, offset, body, length, 1);
   OK(ps_stream_close(stream, &error));
   OK(ps_owned_open(space, NULL, stream_key(1), 0, &info.ref, &head, &status,
                    &error));

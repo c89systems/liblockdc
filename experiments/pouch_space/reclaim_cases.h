@@ -196,7 +196,7 @@ static void namespace_repack(int durable) {
                            &error));
     CHECK(result.visited <= 2);
     replaced += result.replaced;
-    if (result.visited < 2)
+    if (!result.pending)
       break;
     CHECK(step < 199);
   }
@@ -247,7 +247,7 @@ static void namespace_repack(int durable) {
     OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, 1, 2, NULL, NULL, &result,
                            &error));
     replaced += result.replaced;
-    if (result.visited < 2)
+    if (!result.pending)
       break;
     CHECK(step < 199);
   }
@@ -363,15 +363,17 @@ static int churn_sources(void *context, const ps_namespace_source *source,
                          lc_error *e) {
   churn_sweep *s = context;
   ps_namespace_repack_result result = {0};
+  const size_t pieces = 16 * PS_CHUNK / PS_STREAM_PIECE_BYTES;
   if (source->kind != PS_CATALOG_SEGMENT)
     return LC_OK;
   if (source->sealed &&
       !ps_namespace_source_refs(s->ns, source->kind, source->id))
     return ps_namespace_reclaim(s->ns, source->kind, source->id, e);
   for (unsigned int step = 0; step < 16; ++step) {
-    OK(ps_namespace_repack(s->ns, source->kind, source->id, 16, NULL, NULL,
+    OK(ps_namespace_repack(s->ns, source->kind, source->id, pieces, NULL, NULL,
                            &result, e));
-    CHECK(result.visited <= 16 && result.body_bytes <= result.mapping_bytes &&
+    CHECK(result.visited <= pieces &&
+          result.body_bytes <= result.mapping_bytes &&
           result.mapping_bytes <= 16 * PS_CHUNK);
     s->copied += result.mapping_bytes;
     if (!result.pending)
@@ -745,22 +747,27 @@ static void owned_repack(int durable) {
   ps_owned_head *head = NULL;
   ps_owned_status info;
   ps_owned_run *raw = NULL, *mapped = NULL, *next = NULL, **capture = NULL;
-  ps_owned_range keep[2] = {{2, 17}, {9000, 26}};
+  const uint64_t first = PS_CHUNK + 17, second = PS_CHUNK + 9000;
+  ps_owned_range keep[2] = {{2, first}, {second, 26}};
   ps_piece_checksum crc = {0};
+  ps_ref identity;
   ps_budget_plan plan = {0};
   ps_budget *budget = NULL;
   ps_stats before, after;
-  unsigned char *bytes = malloc(PS_CHUNK), *readback = malloc(PS_CHUNK);
+  unsigned char *bytes = malloc(PS_STREAM_PIECE_BYTES);
+  unsigned char *readback = malloc(PS_STREAM_PIECE_BYTES);
   uint64_t span, base;
   size_t count;
   int found;
   CHECK(bytes && readback);
-  for (size_t i = 0; i < PS_CHUNK; ++i)
+  for (size_t i = 0; i < PS_STREAM_PIECE_BYTES; ++i)
     bytes[i] = (unsigned char)(i % 251);
   clean();
   s = create(PS_DEFAULT_CAPACITY, durable, NULL);
   OK(ps_owned_open(s, NULL, stream_key(1), 1, NULL, &head, &info, &error));
-  OK(ps_owned_grant(head, NULL, 0, PS_CHUNK, &raw, &found, &error));
+  identity = info.ref;
+  OK(ps_owned_grant(head, NULL, 0, PS_STREAM_PIECE_BYTES, &raw, &found,
+                    &error));
   CHECK(found);
   span = ps_owned_run_capacity(raw);
   OK(ps_owned_write(raw, 0, bytes, (size_t)span, &error));
@@ -770,7 +777,7 @@ static void owned_repack(int durable) {
                             &error) == LC_ERR_INVALID &&
         !mapped);
   lc_error_cleanup(&error);
-  OK(ps_budget_plan_piece(&plan, span, 2, 43, &error));
+  OK(ps_budget_plan_piece(&plan, span, 2, first + 26, &error));
   plan.maintenance = 1;
   OK(ps_budget_open(s, &plan, &budget, &error));
   OK(ps_owned_run_repack(head, raw, budget, keep, 2, NULL, NULL, &mapped,
@@ -780,11 +787,12 @@ static void owned_repack(int durable) {
   CHECK(ps_owned_run_mapped(mapped) && ps_owned_run_capacity(mapped) == span);
   OK(ps_owned_read(raw, 0, readback, (size_t)span, &error));
   CHECK(!memcmp(bytes, readback, (size_t)span));
-  OK(ps_owned_read(mapped, 2, readback, 17, &error));
-  CHECK(!memcmp(bytes + 2, readback, 17));
-  OK(ps_owned_read(mapped, 9000, readback, 26, &error));
-  CHECK(!memcmp(bytes + 9000, readback, 26));
-  CHECK(ps_owned_read(mapped, 19, readback, 1, &error) == LC_ERR_PROTOCOL);
+  OK(ps_owned_read(mapped, 2, readback, (size_t)first, &error));
+  CHECK(!memcmp(bytes + 2, readback, (size_t)first));
+  OK(ps_owned_read(mapped, second, readback, 26, &error));
+  CHECK(!memcmp(bytes + second, readback, 26));
+  CHECK(ps_owned_read(mapped, first + 2, readback, 1, &error) ==
+        LC_ERR_PROTOCOL);
   lc_error_cleanup(&error);
   BAD(ps_owned_write(mapped, 2, bytes, 1, &error));
   OK(ps_owned_runs_capture(head, &capture, &count, &error));
@@ -794,17 +802,28 @@ static void owned_repack(int durable) {
   lc_free_with_allocator(NULL, capture);
   OK(ps_checkpoint(s, &error));
   OK(ps_status(s, &before, &error));
-  CHECK(before.retired_bytes >= PS_CHUNK);
+  CHECK(before.retired_bytes >= PS_STREAM_PIECE_BYTES);
   ps_owned_run_close(raw);
   raw = NULL;
   OK(ps_status(s, &after, &error));
-  CHECK(before.allocated_bytes >= after.allocated_bytes + PS_CHUNK);
-  keep[0].offset = 9005;
-  keep[0].bytes = 5;
+  CHECK(before.allocated_bytes >=
+        after.allocated_bytes + PS_STREAM_PIECE_BYTES);
+  ps_owned_run_close(mapped);
+  ps_owned_close(head);
+  OK(ps_close(s, &error));
+  s = piece_reopen(durable, NULL);
+  OK(ps_owned_open(s, NULL, stream_key(1), 0, &identity, &head, &info, &error));
+  OK(ps_owned_grant(head, NULL, 0, 0, &mapped, &found, &error));
+  CHECK(found && ps_owned_run_mapped(mapped) &&
+        ps_owned_run_capacity(mapped) == span);
+  OK(ps_owned_read(mapped, second, readback, 26, &error));
+  CHECK(!memcmp(bytes + second, readback, 26));
+  keep[0].offset = 3;
+  keep[0].bytes = first - 1;
   OK(ps_owned_run_repack(head, mapped, NULL, keep, 1, NULL, NULL, &next,
                          &error));
-  OK(ps_owned_read(mapped, 2, readback, 17, &error));
-  CHECK(!memcmp(bytes + 2, readback, 17));
+  OK(ps_owned_read(mapped, 2, readback, (size_t)first, &error));
+  CHECK(!memcmp(bytes + 2, readback, (size_t)first));
   CHECK(ps_owned_run_repack(head, mapped, NULL, keep, 1, NULL, NULL, &raw,
                             &error) == LC_ERR_INVALID &&
         !raw);
@@ -812,8 +831,8 @@ static void owned_repack(int durable) {
   ps_owned_run_close(mapped);
   mapped = next;
   next = NULL;
-  OK(ps_owned_read(mapped, 9005, readback, 5, &error));
-  CHECK(!memcmp(bytes + 9005, readback, 5));
+  OK(ps_owned_read(mapped, 3, readback, (size_t)(first - 1), &error));
+  CHECK(!memcmp(bytes + 3, readback, (size_t)(first - 1)));
   OK(ps_owned_run_repack(head, mapped, NULL, NULL, 0, NULL, NULL, &next,
                          &error));
   CHECK(!next);
@@ -1006,20 +1025,21 @@ static void stream_repack(int durable) {
   ps_stream_info info;
   ps_owned_range keep;
   ps_stats before, pinned, after;
-  unsigned char *a = malloc(22000), *b = malloc(22000), *got = malloc(22000);
+  const size_t length = 3 * PS_STREAM_PIECE_BYTES / 2;
+  unsigned char *a = malloc(length), *b = malloc(length), *got = malloc(length);
   uint64_t first, second, cursor = 0, start, end;
-  size_t n;
+  size_t n, retained = 0;
   int found;
   CHECK(a && b && got);
-  memset(a, 'a', 22000);
-  memset(b, 'b', 22000);
+  memset(a, 'a', length);
+  memset(b, 'b', length);
   clean();
   s = create(PS_DEFAULT_CAPACITY, durable, NULL);
   stream = stream_open(s, 1, 1, NULL, NULL);
-  OK(canonical_append(stream, a, 22000, 317, 1, &first, &error));
-  OK(canonical_append(stream, b, 22000, 317, 2, &second, &error));
+  OK(canonical_append(stream, a, length, 317, 1, &first, &error));
+  OK(canonical_append(stream, b, length, 317, 2, &second, &error));
   OK(ps_stream_seal(stream, &error));
-  OK(ps_stream_read_open(stream, first + 43, 22000, &old, &error));
+  OK(ps_stream_read_open(stream, first + 43, length, &old, &error));
   OK(ps_status(s, &before, &error));
   for (;;) {
     OK(ps_stream_piece_next(stream, cursor, &piece, &found, &error));
@@ -1027,11 +1047,13 @@ static void stream_repack(int durable) {
       break;
     cursor = piece.base + piece.bytes;
     start = second + 43 > piece.base ? second + 43 : piece.base;
-    end = second + 43 + 22000 < piece.base + piece.completed_bytes
-              ? second + 43 + 22000
+    end = second + 43 + length < piece.base + piece.completed_bytes
+              ? second + 43 + length
               : piece.base + piece.completed_bytes;
     keep.offset = start - piece.base;
     keep.bytes = start < end ? end - start : 0;
+    if (keep.bytes)
+      ++retained;
     OK(ps_stream_piece_repack(stream, piece.base, NULL,
                               keep.bytes ? &keep : NULL, keep.bytes ? 1 : 0,
                               NULL, NULL, &error));
@@ -1039,14 +1061,14 @@ static void stream_repack(int durable) {
   OK(ps_checkpoint(s, &error));
   OK(ps_status(s, &pinned, &error));
   CHECK(pinned.retired_bytes);
-  OK(ps_stream_read(old, got, 22000, &n, &error));
-  CHECK(n == 22000 && !memcmp(got, a, n));
+  OK(ps_stream_read(old, got, length, &n, &error));
+  CHECK(n == length && !memcmp(got, a, n));
   ps_stream_reader_close(old);
   OK(ps_status(s, &after, &error));
   CHECK(!after.retired_bytes && after.allocated_bytes < before.allocated_bytes);
-  OK(ps_stream_read_open(stream, second + 43, 22000, &old, &error));
-  OK(ps_stream_read(old, got, 22000, &n, &error));
-  CHECK(n == 22000 && !memcmp(got, b, n));
+  OK(ps_stream_read_open(stream, second + 43, length, &old, &error));
+  OK(ps_stream_read(old, got, length, &n, &error));
+  CHECK(n == length && !memcmp(got, b, n));
   ps_stream_reader_close(old);
   old = NULL;
   CHECK(ps_stream_read_open(stream, first + 43, 1, &old, &error) ==
@@ -1054,14 +1076,14 @@ static void stream_repack(int durable) {
   lc_error_cleanup(&error);
   CHECK(!old);
   OK(ps_stream_status(stream, &info, &error));
-  CHECK(info.runs == 2 && info.sealed);
+  CHECK(retained >= 2 && info.runs == retained && info.sealed);
   OK(ps_stream_close(stream, &error));
   OK(ps_close(s, &error));
   s = piece_reopen(durable, NULL);
   stream = stream_open(s, 1, 0, &info.ref, NULL);
-  OK(ps_stream_read_open(stream, second + 43, 22000, &old, &error));
-  OK(ps_stream_read(old, got, 22000, &n, &error));
-  CHECK(n == 22000 && !memcmp(got, b, n));
+  OK(ps_stream_read_open(stream, second + 43, length, &old, &error));
+  OK(ps_stream_read(old, got, length, &n, &error));
+  CHECK(n == length && !memcmp(got, b, n));
   ps_stream_reader_close(old);
   OK(ps_stream_close(stream, &error));
   OK(ps_close(s, &error));

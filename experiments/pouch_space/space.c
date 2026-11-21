@@ -1587,8 +1587,8 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
          (p->bytes < PS_RUN_HEADER ||
           p->stream_capacity != p->bytes - PS_RUN_HEADER)) ||
         (p->owned_mapped &&
-         (p->stream_capacity > PS_CHUNK || !count || p->bytes < 64 ||
-          p->bytes > 64 + 9 * p->stream_capacity)))
+         (p->stream_capacity > PS_STREAM_PIECE_BYTES || !count ||
+          p->bytes < 64 || p->bytes > 64 + 9 * p->stream_capacity)))
       goto invalid;
   }
   if (count) {
@@ -7628,6 +7628,21 @@ int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
                    size_t n, lc_error *error) {
   return owned_io(run, offset, (void *)bytes, n, 1, error);
 }
+static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
+                           void *scratch, uint32_t *crc, lc_error *error) {
+  size_t n;
+  int rc;
+  while (length) {
+    n = length < PS_CHUNK ? (size_t)length : PS_CHUNK;
+    rc = transfer(s, scratch, n, offset, 0, error);
+    if (rc != LC_OK)
+      return rc;
+    *crc = (uint32_t)crc32(*crc, scratch, (uInt)n);
+    length -= n;
+    offset += n;
+  }
+  return LC_OK;
+}
 static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                        int operation, uint64_t prior,
                        const ps_piece_checksum *prefix, ps_piece_checksum *out,
@@ -7639,8 +7654,8 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   uint64_t reconstructed = UINT64_C(1) << 63;
   int rc;
   if (!run || !bytes || bytes > ps_owned_run_capacity(run) ||
-      ps_owned_run_capacity(run) > PS_CHUNK || (operation && !scratch) ||
-      prior > bytes || (prior && !prefix) ||
+      ps_owned_run_capacity(run) > PS_STREAM_PIECE_BYTES ||
+      (operation && !scratch) || prior > bytes || (prior && !prefix) ||
       (prefix && (prefix->reconstructed < 0 || prefix->reconstructed > 1 ||
                   (!prior && prefix->crc))))
     return err(error, LC_ERR_INVALID,
@@ -7661,13 +7676,10 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   offset = run->entry->extents[0].offset;
   rc = healthy(s, error);
   if (rc == LC_OK && operation == 2) {
-    rc = transfer(s, scratch, (size_t)(bytes - prior),
-                  offset + PS_RUN_HEADER + prior, 0, error);
+    crc = prior ? prefix->crc : 0;
+    rc = owned_piece_crc(s, offset + PS_RUN_HEADER + prior, bytes - prior,
+                         scratch, &crc, error);
     if (rc == LC_OK) {
-      crc = checksum(scratch, (size_t)(bytes - prior));
-      if (prior)
-        crc =
-            (uint32_t)crc32_combine(prefix->crc, crc, (z_off_t)(bytes - prior));
       memcpy(footer, "LCPSPIEC", 8);
       put64(footer + 8,
             bytes | (prefix && prefix->reconstructed ? reconstructed : 0));
@@ -7700,8 +7712,10 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
                       "reconstructed piece needs canonical body validation",
                       NULL, "pouch_piece_needs_validation", "pouch-space");
   if (rc == LC_OK && operation) {
-    rc = transfer(s, scratch, (size_t)bytes, offset + PS_RUN_HEADER, 0, error);
-    if (rc == LC_OK && checksum(scratch, (size_t)bytes) != get32(footer + 16))
+    crc = 0;
+    rc =
+        owned_piece_crc(s, offset + PS_RUN_HEADER, bytes, scratch, &crc, error);
+    if (rc == LC_OK && crc != get32(footer + 16))
       rc = err(error, LC_ERR_PROTOCOL, "finalized piece checksum mismatch");
   }
   if (rc == LC_OK && out) {
@@ -7836,14 +7850,14 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   ps_owned_run *result = NULL;
   unsigned char header[64] = {0}, *table = NULL, *scratch = NULL;
   uint64_t valid = 0, end = 0, live = 0, table_bytes, pos;
-  size_t i;
+  size_t i, n;
   int rc, bitmap;
   if (out)
     *out = NULL;
   if (!head || !source || !out || (count && !ranges) ||
       source->space != head->space ||
       source->entry->key.owner != head->entry->token ||
-      (count && ps_owned_run_capacity(source) > PS_CHUNK) ||
+      (count && ps_owned_run_capacity(source) > PS_STREAM_PIECE_BYTES) ||
       count > ps_owned_run_capacity(source))
     return err(error, LC_ERR_INVALID,
                "piece replacement requires matching bounded owners");
@@ -7936,14 +7950,18 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
       rc = ps_write(writer, table, (size_t)table_bytes, error);
   }
   for (i = 0; rc == LC_OK && i < count; ++i) {
-    if (old->owned_mapped) {
-      rc = ps_owned_read(source, ranges[i].offset, scratch,
-                         (size_t)ranges[i].bytes, error);
-      if (rc == LC_OK)
-        rc = ps_write(writer, scratch, (size_t)ranges[i].bytes, error);
-    } else
+    if (!old->owned_mapped && valid <= PS_CHUNK)
       rc = ps_write(writer, scratch + ranges[i].offset, (size_t)ranges[i].bytes,
                     error);
+    else {
+      end = ranges[i].offset + ranges[i].bytes;
+      for (pos = ranges[i].offset; rc == LC_OK && pos < end; pos += n) {
+        n = end - pos < PS_CHUNK ? (size_t)(end - pos) : PS_CHUNK;
+        rc = ps_owned_read(source, pos, scratch, n, error);
+        if (rc == LC_OK)
+          rc = ps_write(writer, scratch, n, error);
+      }
+    }
   }
   if (rc == LC_OK)
     rc = flush_writer(writer, error);

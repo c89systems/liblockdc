@@ -10592,3 +10592,72 @@ and messaging cases. After restoring the maintenance notification,
 seven focused checks passed across the three builds. Raw traces, red
 and green fixtures, matched rows and test logs have the `stage-frame-`
 prefix in `build/pouch-space-concurrent/`.
+
+## Separating canonical piece size from streaming I/O
+
+In three traced heavy NoSync indexed workflows at fixed 10 MiB, stream
+grant admission accounted for 41% of the combined elapsed time of the
+slowest 48 of 960 native mutations. This time accrued in the body
+update phase. Stream ownership previously stopped at the same 16 KiB
+boundary used by streaming I/O and immutable value extents.
+
+Canonical grants now grow geometrically to 32 KiB. The producer and
+sequential reader keep 16 KiB buffers. Checksum and relocation work use
+the same bounded I/O window.
+Extending a completion footer seeds its CRC with the checked prefix and
+reads the new suffix in those windows. Raw and sparse replacements use
+the same bounded I/O for retained ranges crossing a window. The budget
+accounts for the larger grant and one larger replacement. Checkpoint
+range selection and mapped descriptor recovery accept the new size.
+The maintenance pass keeps its 256 KiB relocation ceiling by visiting
+at most eight pieces per source.
+
+The wider-piece fixtures verify footer recovery and repair, corruption
+in a second I/O window, raw-to-mapped and mapped-to-mapped relocation
+across windows, pinned reads through replacement, and cold reopen.
+In three revised trace runs on the same profile, accumulated grant
+admission time fell 36% across all 960 mutations and 29% within the
+slowest 48. These sums include simultaneous work by different writers.
+
+All 42 matched GNU workflows verified. Native roots stayed at 10 MiB.
+Each build ran four samples for each NoSync indexed workload and two
+for each other workload. The tables give medians in milliseconds in the
+order prior native (`44daa589`), revised native, multifile. Grouped
+reopen includes the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1334.37 / 945.09 / 1294.70 | 68.52 / 43.86 / 33.72 | 22.75 / 5.09 / 1.15 | 12.33 / 8.70 / 1.06 | 5.45 / 4.75 / 7.70 |
+| NoSync indexed, 20 MiB | 2377.59 / 2245.08 / 2191.32 | 70.70 / 66.57 / 34.21 | 22.97 / 3.76 / 1.29 | 13.80 / 11.96 / 1.00 | 7.49 / 7.43 / 11.05 |
+| Durable indexed, 15 MiB | 4282.73 / 4470.01 / 5779.55 | 62.41 / 60.50 / 72.88 | 5.08 / 2.10 / 2.12 | 8.66 / 8.70 / 0.75 | 5.85 / 6.13 / 8.19 |
+| Warmed NoSync queue | 11.68 / 9.69 / 74.89 | 2.39 / 1.80 / 16.50 | 0.39 / 0.28 / 0.08 | 3.16 / 2.60 / 0.35 | 0.26 / 0.20 / 0.51 |
+| Durable outbox | 896.74 / 850.90 / 1372.02 | 179.71 / 151.22 / 253.33 | 0.52 / 0.53 / 0.42 | 31.17 / 30.18 / 62.28 | 61.85 / 53.87 / 133.13 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 240.59 / 227.37 / 324.63 | 57.34 / 53.98 / 216.56 | 38.94 / 22.30 / 214.45 | 0.85 / 0.68 / 1.32 |
+| NoSync indexed, 20 MiB | 302.44 / 320.70 / 491.92 | 80.70 / 71.32 / 297.65 | 20.29 / 40.59 / 307.10 | 1.27 / 1.20 / 2.05 |
+| Durable indexed, 15 MiB | 160.38 / 162.65 / 205.05 | 5.42 / 4.71 / 143.38 | 2.16 / 2.45 / 121.32 | 0.53 / 0.49 / 0.79 |
+
+Heavy NoSync work finished sooner in three of four native pairs and
+per-item p95 fell in all four. Median mutation-worker CPU fell from
+1508 to 1289 ms and sync calls fell from 199.5 to 171.5. Heavy NoSync
+work is within 3% of multifile in this rotation, with roughly twice its
+per-item p95 and 12 ms of grouped reopen. Durable indexed work took
+4.47 s versus 5.78 s for multifile. The warmed queue and durable
+outbox retained their steady-state advantage. Process CPU through
+end-of-work maintenance and grouped reopen remain higher than multifile
+in all three indexed profiles. In the heavy profile they measure
+1594 versus 825 ms and 11.96 versus 1.00 ms, respectively.
+
+The GNU Release gate passed 47 groups after focused reruns of two
+corrected fixtures. The repack fixture now uses the completion signal
+even when the last sweep visits exactly its piece limit. The private
+grant fixture also failed on the prior commit. It now pins superseded
+values to exercise exhaustion without recoverable headroom. The
+32-group Debug ASan/UBSan and musl Release gates passed, including
+both corrected fixtures, codec conversion, shared fixed-capacity
+messaging and the explicit 1 MiB growth check.
+
+Raw comparisons, traces and test logs are under the `wider-piece-`
+and `tail-cost-` prefixes in `build/pouch-space-concurrent/`.

@@ -1067,7 +1067,7 @@ int ps_key_checkpoint_ranges(ps_key_checkpoint *c, unsigned int kind,
   source_count *s;
   size_t capacity = 0;
   int rc = LC_OK;
-  if (!c || !out || !bytes || bytes > PS_CHUNK ||
+  if (!c || !out || !bytes || bytes > PS_STREAM_PIECE_BYTES ||
       base > (uint64_t)INT64_MAX - bytes)
     return failure(e, LC_ERR_INVALID, "body capture requires a bounded piece");
   memset(out, 0, sizeof(*out));

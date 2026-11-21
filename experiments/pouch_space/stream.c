@@ -58,8 +58,8 @@ static int stream_error(lc_error *e, int rc, const char *message) {
 }
 static void note_grant(ps_stream *s, uint64_t capacity) {
   uint64_t next = (capacity + PS_RUN_HEADER) * 4;
-  if (next > PS_CHUNK)
-    next = PS_CHUNK;
+  if (next > PS_STREAM_PIECE_BYTES)
+    next = PS_STREAM_PIECE_BYTES;
   if (s->preferred_grant < next)
     s->preferred_grant = next;
 }

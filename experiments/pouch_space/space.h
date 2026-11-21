@@ -22,6 +22,9 @@
 #define PS_PAGE 4096U
 #define PS_CELL 64U
 #define PS_CHUNK 16384U
+/* Canonical ownership and relocation granularity. Streaming I/O still uses
+ * PS_CHUNK, including when a piece spans several I/O windows. */
+#define PS_STREAM_PIECE_BYTES 32768U
 #define PS_METADATA_RESERVE 131072U
 /* Isolated volatile coordination page, excluded from descriptor ownership. */
 #define PS_READINESS_OFFSET (2U * PS_PAGE)

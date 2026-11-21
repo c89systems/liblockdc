@@ -143,8 +143,8 @@ int ps_owned_write(ps_owned_run *, uint64_t offset, const void *, size_t,
  * header is immutable; its separate completion footer joins canonical byte
  * readiness, without a per-record ownership journal event. Caller excludes
  * writes to [0, bytes) while completing/checking it. scratch has PS_CHUNK
- * bytes. A full grant is at most PS_CHUNK physical bytes in the canonical
- * stream. Other owned users may retain larger grants and do not use this
+ * bytes. Canonical grants can span up to PS_STREAM_PIECE_BYTES physical bytes.
+ * Other owned users may retain larger grants and do not use this
  * capability. Inspect validates the footer only; verify also reads and checks
  * those bytes. Uncovered recovery may rebuild a footer after canonical
  * validation. A reconstructed inherited prefix requires canonical body proof
