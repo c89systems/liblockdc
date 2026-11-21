@@ -71,7 +71,10 @@ typedef struct checkpoint_preview {
   int result;
 } checkpoint_preview;
 static void preview_checkpoint(ps_space *, checkpoint_preview *);
+static ps_space *projection_new(ps_space *, lc_error *);
 static void projection_destroy(ps_space *);
+static void projection_select(ps_space *, const unsigned char *, int);
+static void projection_install(ps_space *, ps_space *);
 static int canonical_refresh(ps_space *, checkpoint_preview *, int verify_disk,
                              lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
@@ -4768,12 +4771,73 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   install(s, p, old);
   return LC_OK;
 }
-static int recover(ps_space *s, lc_error *error) {
+#define RECOVERY_HEADERS                                                       \
+  (PS_PAGE + PS_TOKEN_RECORD_OFFSET + PS_TOKEN_RECORD_BYTES)
+
+static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
+                                  const unsigned char *headers,
+                                  unsigned char *wire,
+                                  ps_readiness_certificate *certificate,
+                                  int *moved, lc_error *error) {
+  ps_readiness_certificate current;
+  lc_error draft_error;
+  ps_space *draft = projection_new(s, error);
+  size_t i;
+  int rc, prepared = LC_OK;
+  *moved = 0;
+  if (!draft)
+    return LC_ERR_NOMEM;
+  projection_select(draft, headers + s->root * PS_PAGE, s->root);
+  lc_error_init(&draft_error);
+  /* The draft owns only memory. A checkpoint may retire any of the pages
+   * being read, so even a draft error is provisional until revalidation. */
+  rc = allocation_end(s, *guard, LC_OK, error);
+  *guard = NULL;
+  if (rc == LC_OK) {
+    prepared = recover_directory(draft, wire, certificate, NULL, &draft_error);
+    rc = allocation_begin(s, guard, error);
+  }
+  if (rc == LC_OK)
+    rc = ps_readiness_read(s, &current, error);
+  if (rc == LC_OK)
+    rc = transfer(s, wire, RECOVERY_HEADERS, 0, 0, error);
+  if (rc == LC_OK) {
+    *moved = current.pending || current.root != certificate->root ||
+             current.origin != certificate->origin ||
+             current.grant_limit != certificate->grant_limit ||
+             memcmp(wire, headers, RECOVERY_HEADERS);
+    if (!*moved) {
+      rc = prepared;
+      if (rc == LC_OK) {
+        s->entries = draft->entries;
+        draft->entries = NULL;
+        if (s->entries)
+          s->entries->all_link = &s->entries;
+        memcpy(s->value_buckets, draft->value_buckets,
+               sizeof(s->value_buckets));
+        memcpy(s->stream_buckets, draft->stream_buckets,
+               sizeof(s->stream_buckets));
+        for (i = 0; i < BUCKETS; ++i)
+          if (s->value_buckets[i])
+            s->value_buckets[i]->value_link = &s->value_buckets[i];
+        projection_install(s, draft);
+        *certificate = current;
+      } else if (error) {
+        lc_error_cleanup(error);
+        *error = draft_error;
+        lc_error_init(&draft_error);
+      }
+    }
+  }
+  lc_error_cleanup(&draft_error);
+  projection_destroy(draft);
+  return rc;
+}
+static int recover(ps_space *s, ps_coordination_guard **guard,
+                   lc_error *error) {
   unsigned char zero[PS_ROOT_BYTES] = {0};
-  unsigned char
-      superblocks[PS_PAGE + PS_TOKEN_RECORD_OFFSET + PS_TOKEN_RECORD_BYTES],
-      *wire;
-  recovery_values *values;
+  unsigned char superblocks[RECOVERY_HEADERS], *wire = NULL;
+  recovery_values *values = NULL;
   ps_readiness_certificate certificate;
   const unsigned char *roots[2], *root;
   ps_entry *p = NULL;
@@ -4781,28 +4845,26 @@ static int recover(ps_space *s, lc_error *error) {
   uint64_t grant_limit;
   size_t cursor = 0, bytes, i, first, last;
   int a, b, event, rc, retire_sibling, retirement_needed, range_available;
-  int pending_data = 0, grant_slot;
+  int pending_data = 0, grant_slot, moved = 0;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
+restart:
   rc = transfer(s, superblocks, sizeof(superblocks), 0, 0, error);
   if (rc != LC_OK)
-    return rc;
+    goto done;
   a = root_valid(roots[0]);
   b = root_valid(roots[1]);
-  if (!a && !b)
-    return err(error, LC_ERR_PROTOCOL, "no recoverable container root");
+  if (!a && !b) {
+    rc = err(error, LC_ERR_PROTOCOL, "no recoverable container root");
+    goto done;
+  }
   s->root = b && (!a || get64(roots[1] + 8) > get64(roots[0] + 8));
   root = roots[s->root];
-  if (a && b && !root_follows(root, roots[1 - s->root]))
-    return err(error, LC_ERR_PROTOCOL, "conflicting container roots");
-  s->generation = get64(root + 8);
-  s->capacity = get64(root + 16);
-  s->sequence = get64(root + 24);
-  s->directory.offset = get64(root + 32);
-  s->directory.generation = get64(root + 40);
-  s->token_limit = get64(root + 48);
-  s->journal_start = get64(root + ROOT_JOURNAL_START);
-  memcpy(s->identity, root + 56, 16);
+  if (a && b && !root_follows(root, roots[1 - s->root])) {
+    rc = err(error, LC_ERR_PROTOCOL, "conflicting container roots");
+    goto done;
+  }
+  projection_select(s, root, s->root);
   rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
                           roots[1] + PS_TOKEN_RECORD_OFFSET, &grant_limit,
                           &grant_slot, error);
@@ -4811,21 +4873,36 @@ static int recover(ps_space *s, lc_error *error) {
   if (rc == LC_OK)
     rc = checkpoint_retirement(&certificate, s->generation, s->sequence, error);
   if (rc != LC_OK)
-    return rc;
-  if (s->maximum && s->capacity > s->maximum)
-    return err(error, LC_ERR_INVALID,
-               "committed capacity exceeds configured maximum");
-  if (fstat(s->fd, &st) != 0 || st.st_size < (off_t)s->capacity)
-    return err(error, LC_ERR_PROTOCOL,
-               "container shorter than committed capacity");
-  wire = lc_alloc_with_allocator(NULL, PS_JOURNAL);
-  values = lc_alloc_with_allocator(NULL, sizeof(*values));
-  if (!wire || !values) {
-    rc = err(error, LC_ERR_NOMEM, "cannot allocate recovery buffers");
+    goto done;
+  if (s->maximum && s->capacity > s->maximum) {
+    rc = err(error, LC_ERR_INVALID,
+             "committed capacity exceeds configured maximum");
     goto done;
   }
+  if (fstat(s->fd, &st) != 0 || st.st_size < (off_t)s->capacity) {
+    rc = err(error, LC_ERR_PROTOCOL,
+             "container shorter than committed capacity");
+    goto done;
+  }
+  if (!wire) {
+    wire = lc_alloc_with_allocator(NULL, PS_JOURNAL);
+    values = lc_alloc_with_allocator(NULL, sizeof(*values));
+    if (!wire || !values) {
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate recovery buffers");
+      goto done;
+    }
+  }
   values->packed.offset = 0;
-  rc = recover_directory(s, wire, &certificate, NULL, error);
+  retire_sibling = memcmp(roots[1 - s->root], zero, sizeof(zero)) != 0;
+  if (!moved && *guard && s->directory.offset && !retire_sibling &&
+      !certificate.pending && certificate.root == s->generation &&
+      certificate.grant_limit == grant_limit) {
+    rc = recover_live_directory(s, guard, superblocks, wire, &certificate,
+                                &moved, error);
+    if (rc == LC_OK && moved)
+      goto restart;
+  } else
+    rc = recover_directory(s, wire, &certificate, NULL, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -4920,7 +4997,6 @@ static int recover(ps_space *s, lc_error *error) {
     last -= sizeof(zero);
   while (last > first && !wire[last - 1])
     --last;
-  retire_sibling = memcmp(roots[1 - s->root], zero, sizeof(zero)) != 0;
   retirement_needed = first < last || retire_sibling;
   /* A process can die with the new selector readable but unsynced. Fence
    * it before erasing bytes needed by a still-valid predecessor. */
@@ -4962,6 +5038,9 @@ static int recover(ps_space *s, lc_error *error) {
   rc = pins_recover(s, s, error);
   if (rc != LC_OK)
     goto done;
+  /* Open built its free map from scratch and queried the physical witnesses
+   * under the same allocator hold that admits the protected metadata pool. */
+  s->allocation_ranges_checked = s->allocation_guard != NULL;
   range_available = certificate.grant_limit == s->token_limit &&
                     certificate.grant_used < certificate.grant_limit;
   /* A live join can leave the selected prefix untouched and spend an already
@@ -5375,20 +5454,24 @@ static void projection_destroy(ps_space *v) {
     destroy(v);
   }
 }
-static int projection_load(ps_space *s, ps_space *v, const unsigned char *root,
-                           int selected,
-                           const ps_readiness_certificate *certificate,
-                           lc_error *error) {
+static void projection_select(ps_space *v, const unsigned char *root,
+                              int selected) {
   v->root = selected;
   v->generation = get64(root + 8);
   v->capacity = get64(root + 16);
   v->sequence = get64(root + 24);
-  v->peer_durable = certificate->durable;
   v->directory.offset = get64(root + 32);
   v->directory.generation = get64(root + 40);
   v->token_limit = get64(root + 48);
   v->journal_start = get64(root + ROOT_JOURNAL_START);
-  memcpy(v->identity, s->identity, 16);
+  memcpy(v->identity, root + 56, sizeof(v->identity));
+}
+static int projection_load(ps_space *s, ps_space *v, const unsigned char *root,
+                           int selected,
+                           const ps_readiness_certificate *certificate,
+                           lc_error *error) {
+  projection_select(v, root, selected);
+  v->peer_durable = certificate->durable;
   v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
   if (!v->journal_image)
     return err(error, LC_ERR_NOMEM,
@@ -5770,7 +5853,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
   } else if (rc == LC_OK) {
     rc = ps_readiness_attach(s, error);
     if (rc == LC_OK)
-      rc = recover(s, error);
+      rc = recover(s, &opening, error);
   }
   if (rc == LC_OK && s->maximum && s->capacity > s->maximum)
     rc = err(error, LC_ERR_INVALID,

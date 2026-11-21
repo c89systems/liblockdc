@@ -12920,3 +12920,89 @@ while the predecessor's pages and covered journal bytes remain protected.
 Reclamation would need a second proof, with explicit bounds on the
 quarantined interval at 10 MiB. That design would target the later barrier
 time that remained under allocator authority in this trial.
+
+## Deferred checkpoint cleanup sync trial
+
+This trial completed shared NoSync checkpoints after two syncs. A peer
+reused a predecessor payload page while the checkpoint's cleanup writes
+were still eligible to be lost on power failure. The fault model restored
+both selectors with that reuse, repeated the case with partially persisted
+cleanup, and exercised a completely full rolling journal. The successor
+recovered the selected value in all three cases.
+
+LMDB flushes dirty pages before publishing an alternating meta page and
+tracks the oldest reader when deciding which pages can be reused. Pouch's
+publication order additionally requires syncing invalidation of the old
+recoverable selector before reclamation. The trial exercised a different
+failure contract. The branch keeps the specified retirement ordering.
+[LMDB commit, meta selection, and page reclamation implementation](https://github.com/LMDB/lmdb/blob/mdb.master/libraries/liblmdb/mdb.c)
+
+Five matched 192 MiB NoSync pairs on the fixed 10 MiB root gave medians of
+17.60 to 18.64 s elapsed work, 112.56 to 114.88 ms mutation p95, and 150.07
+to 143.63 ms late-window p95 when deferring cleanup. The two pairs that
+also deferred cleanup in durable mode moved elapsed work from 34.50 to
+36.87 s and late-window p95 from 171.74 to 189.85 ms. All runs verified
+through reclaim and reopen. The final experimental source is preserved
+in stash `83ae49c7`. Raw runs are under
+`build/pouch-space-concurrent/selector-retirement/`.
+
+## Validate live-open directory reads before admission
+
+A live join with a clean readiness certificate and a selected directory
+now decodes the directory outside allocator authority. It uses private
+memory for the draft. After reacquiring authority, it checks the selector
+and grant bytes, cohort origin, and readiness generation before using any
+of the draft. A moved root or interrupted publication triggers one complete
+recovery under the allocator. A read error from a stable view is returned
+to the caller. Journal replay, witness checks, and incarnation admission
+use the current authoritative view. The physical witness scan also serves
+metadata admission during that same allocator hold.
+
+The design borrows the optimistic read and bounded locking fallback from
+Linux sequence locks. The ART synchronization paper identifies a related
+constraint, where speculative reads can observe inconsistent intermediate
+state. Pouch uses checked reads into private memory and defers admission
+until it revalidates the underlying generation.
+[Linux sequence locks](https://docs.kernel.org/locking/seqlock.html),
+[The ART of Practical Synchronization, section 3.2](https://15721.courses.cs.cmu.edu/spring2019/papers/08-oltpindexes2/leis-damon2016.pdf)
+
+The deterministic fixture pauses a joining handle's directory read. A
+writer completes a durable publication and another join obtains its
+incarnation range while the first join waits. The fixture exercises a
+stable directory, a replaced directory, and read errors in both cases.
+The resumed join uses the current root and a distinct incarnation range.
+Verification passed 48 GNU Release groups and 20 each on ASan/UBSan and
+musl Release, including fixed-capacity lease and messaging workloads.
+Four focused groups passed again on each build after the final scratch
+buffer adjustment.
+
+Seven paired trials per scenario opened eight handles on byte-identical
+copies of a 10 MiB image with 8,192 checked values. The first owner stayed
+open during the batch. Timings are medians in milliseconds. Allocator time
+is the sum of the eight joins' exclusive allocator holds. The fixture
+verified payload reads after each batch.
+
+| Scenario | Build | Eight joins | Allocator time | Process CPU | Physical witness queries |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Serial | Prior | 44.22 | 44.05 | 44.05 | 72 |
+| Serial | Revised | 47.95 | 5.19 | 47.89 | 48 |
+| Concurrent | Prior | 56.27 | 55.40 | 57.54 | 72 |
+| Concurrent | Revised | 18.03 | 9.84 | 79.89 | 48 |
+
+All eight matched 192 MiB indexed workloads verified at 10 MiB with
+eight writers. The candidate's NoSync elapsed median was 17.93 s against
+17.06 s. Its durable elapsed median was 42.91 s against 32.51 s, with
+aggregate sync time of 38.93 s against 28.39 s. The durable discrepancy
+prompted an additional run per path with open calls counted by phase in
+the same instrumented binary. Both traces reported zero physical opens
+during work and maintenance. The preview ran eight times after work, once
+per live join, and never ran before work. The locked trace took 42.11 s
+and the preview trace took 36.07 s. Those measurements establish the
+reopen effect and leave steady-state performance unresolved.
+
+The earlier multifile reference verified at 23.02 s NoSync and 68.01 s
+durable on the same workload shape. Its eight serial joins took 1.91 ms
+and 2.17 ms respectively. Single-file retains the elapsed-work lead in
+these samples, and CPU and serial reopen remain gaps. Raw runs, observer
+sources, traces, and tests are under
+`build/pouch-space-concurrent/live-open-projection/`.

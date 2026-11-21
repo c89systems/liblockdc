@@ -2071,7 +2071,7 @@ static void directory_reopen_locality(enum directory_layout layout) {
       REQUIRE(probe.reads[i] == 1);
     REQUIRE(probe.calls < probe.count && probe.following);
     if (admission != DIRECTORY_ADOPT)
-      REQUIRE(probe.superblocks == 1);
+      REQUIRE(probe.superblocks == (admission == DIRECTORY_JOIN ? 2U : 1U));
     printf("directory_admission layout=%d pass=%d pages=%zu reads=%zu\n",
            layout, admission, probe.count, probe.calls);
     for (uint64_t id = 1; id <= count; ++id) {
@@ -2685,6 +2685,70 @@ static void *adopt_on_read(void *context) {
   adoption_read_gate *gate = context;
   gate->result = ps_read_open(gate->space, key(2), NULL, &gate->reader, NULL);
   return NULL;
+}
+static void *join_on_read(void *context) {
+  adoption_read_gate *gate = context;
+  ps_io io = {gate, pause_checkpoint_read, write_io, sync_io, reserve_io, NULL};
+  ps_coordination_io coordination = {gate, count_adoption_authority};
+  ps_options options = {.io = &io, .coordination_io = &coordination};
+  gate->result = ps_open(path, 0, &options, &gate->space, NULL);
+  return NULL;
+}
+static void live_open_handoff(int advance_root, int fault) {
+  lc_error e = {0};
+  adoption_read_gate gate = {0};
+  ps_space *writer = NULL, *other_join = NULL;
+  ps_coordination_guard *authority = NULL;
+  pthread_t joining;
+  size_t bytes = advance_root ? 81 : 73;
+  REQUIRE(!pthread_mutex_init(&gate.mutex, NULL) &&
+          !pthread_cond_init(&gate.changed, NULL));
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  capture_put(writer, 1, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  gate.page = writer->directory.offset;
+  gate.fault = fault;
+  REQUIRE(gate.page && !pthread_create(&joining, NULL, join_on_read, &gate));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.entered)
+    pthread_cond_wait(&gate.changed, &gate.mutex);
+  REQUIRE(gate.allocator_acquires == 1);
+  pthread_mutex_unlock(&gate.mutex);
+
+  ok(ps_coordination_lock(ps_space_coordination(writer),
+                          PS_COORDINATION_ALLOCATION, 0, 0, &authority, &e),
+     &e);
+  ps_coordination_unlock(authority);
+  capture_put(writer, 2, 73);
+  if (advance_root) {
+    ok(ps_checkpoint(writer, &e), &e);
+    capture_put(writer, 2, bytes);
+  }
+  ok(ps_flush(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &other_join, &e), &e);
+  pthread_mutex_lock(&gate.mutex);
+  gate.released = 1;
+  pthread_cond_broadcast(&gate.changed);
+  pthread_mutex_unlock(&gate.mutex);
+  REQUIRE(!pthread_join(joining, NULL) && gate.allocator_acquires == 2);
+  if (fault && !advance_root) {
+    REQUIRE(gate.result == LC_ERR_TRANSPORT && !gate.space);
+    ok(ps_open(path, 0, NULL, &gate.space, &e), &e);
+  } else
+    REQUIRE(gate.result == LC_OK && gate.space);
+  REQUIRE(gate.space->generation == writer->generation &&
+          gate.space->token_next > other_join->token_end);
+  index_expect(gate.space, 1, 65, &e);
+  index_expect(gate.space, 2, bytes, &e);
+  capture_put(gate.space, 1, 140);
+  ok(ps_checkpoint(gate.space, &e), &e);
+  index_expect(writer, 1, 140, &e);
+  ok(ps_close(other_join, &e), &e);
+  ok(ps_close(gate.space, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  REQUIRE(!pthread_cond_destroy(&gate.changed) &&
+          !pthread_mutex_destroy(&gate.mutex));
 }
 static void projection_read_handoff(int advance_root, int fault) {
   lc_error e = {0};
@@ -7113,8 +7177,10 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "projection-boundaries")) {
     projection_boundaries();
     for (int advance_root = 0; advance_root <= 1; ++advance_root)
-      for (int fault = 0; fault <= 1; ++fault)
+      for (int fault = 0; fault <= 1; ++fault) {
         projection_read_handoff(advance_root, fault);
+        live_open_handoff(advance_root, fault);
+      }
     for (int durable = 0; durable <= 1; ++durable)
       projection_quarantine(durable, 1);
   } else if (!strcmp(argv[2], "projection-pressure"))
