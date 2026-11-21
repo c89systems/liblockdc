@@ -2928,6 +2928,98 @@ static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
   captured_expect(r, (unsigned char)byte, bytes);
   ps_reader_close(r);
 }
+typedef struct resident_names {
+  ps_catalog_info owner;
+  size_t count;
+} resident_names;
+static int count_namespace(void *context, const void *name, size_t length,
+                           const ps_catalog_info *info, lc_error *e) {
+  resident_names *names = context;
+  (void)e;
+  REQUIRE(length == 8 && !memcmp(name, "resident", length) &&
+          info->id == names->owner.id &&
+          info->revision.incarnation == names->owner.revision.incarnation);
+  ++names->count;
+  return LC_OK;
+}
+static void certified_resident_observation(int durable) {
+  lc_error e = {0};
+  readiness_fault fault = {3, EAGAIN, 0, 0, 1};
+  ps_coordination_io io = {&fault, readiness_lock};
+  ps_options options = {0}, peer_options = {0};
+  ps_coordination_guard *namespace = NULL, *allocator = NULL;
+  ps_space *a = NULL, *b = NULL;
+  resident_names names = {0};
+  uint64_t owner;
+  ps_key artifact = {88, 1, PS_QUERY_FIRST};
+  ps_ref original, replacement;
+  uint64_t bytes;
+  int continued, present, valid;
+  options.durable_sync = durable;
+  options.coordination_io = &io;
+  peer_options.durable_sync = 1;
+  ok(ps_open(path, 1, &options, &b, &e), &e);
+  ok(ps_catalog_create_namespace(b, "resident", 8, &names.owner, &e), &e);
+  owner = artifact.owner = names.owner.id;
+  capture_put_key(b, artifact, PS_PAGE);
+  ok(ps_flush(b, &e), &e);
+  ok(ps_open(path, 0, &peer_options, &a, &e), &e);
+  ok(ps_coordination_lock(b->coordination, PS_COORDINATION_NAMESPACE, owner, 0,
+                          &namespace, &e),
+     &e);
+  ok(ps_internal_namespace_stamp(b, owner, &continued, &e), &e);
+  REQUIRE(!continued);
+  ok(ps_value_info(b, artifact, &original, &bytes, &present, &e), &e);
+  REQUIRE(present && bytes == PS_PAGE);
+  ok(ps_coordination_lock(a->coordination, PS_COORDINATION_ALLOCATION, 0, 1,
+                          &allocator, &e),
+     &e);
+  /* Fail an accidental wait so that a regression cannot hang this test. */
+  fault.armed = 1;
+  ok(ps_internal_namespace_stamp(b, owner, &continued, &e), &e);
+  REQUIRE(continued);
+  ok(ps_internal_namespace_checkpoint_stabilize(b, owner, &e), &e);
+  ok(ps_catalog_visit(b, 0, PS_CATALOG_NAMESPACE, count_namespace, &names, &e),
+     &e);
+  REQUIRE(names.count == 1);
+  ok(ps_value_validate(b, artifact, &original, &valid, &e), &e);
+  REQUIRE(valid && !fault.calls);
+  /* A pending transition denies the lock-free path even if the record still
+   * names the resident prefix. */
+  ps_readiness_begin(a, PS_READINESS_RECOVERY);
+  REQUIRE(ps_value_validate(b, artifact, &original, &valid, &e) ==
+              LC_ERR_PENDING &&
+          !valid && fault.calls == 1);
+  lc_error_cleanup(&e);
+  ps_readiness_finish(a, PS_READINESS_RECOVERY);
+  ps_coordination_unlock(allocator);
+  ps_coordination_unlock(namespace);
+
+  /* The old resident cache cannot validate a displaced incarnation. The
+   * first check of the new payload has to acquire a physical witness. */
+  fault.nth = SIZE_MAX;
+  fault.calls = 0;
+  ps_writer *w = replay_value(a, artifact, 42, 2 * PS_PAGE, &e);
+  ok(ps_revision_publish(&w, 1, 0, PS_COMMIT_DEFER_SYNC, &replacement, NULL,
+                         &e),
+     &e);
+  ps_writer_close(w);
+  ok(ps_value_validate(b, artifact, &original, &valid, &e), &e);
+  REQUIRE(valid && fault.calls == 1);
+  ok(ps_value_validate(b, artifact, &original, &valid, &e), &e);
+  REQUIRE(valid && fault.calls == 1);
+  ok(ps_flush(a, &e), &e);
+  ok(ps_value_validate(b, artifact, &original, &valid, &e), &e);
+  REQUIRE(!valid && fault.calls == 2);
+  ok(ps_value_validate(b, artifact, &replacement, &valid, &e), &e);
+  REQUIRE(valid && fault.calls == 3);
+  ok(ps_value_validate(b, artifact, &replacement, &valid, &e), &e);
+  REQUIRE(valid && fault.calls == 3);
+  fault.armed = 0;
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void fragmented_preparation(void) {
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
@@ -6205,6 +6297,8 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "certified-prefix")) {
     certified_prefix_reads();
     certified_prefix_interruption();
+    certified_resident_observation(0);
+    certified_resident_observation(1);
   } else if (!strcmp(argv[2], "quarantine")) {
     quarantine_capacity();
     quarantine_packed();

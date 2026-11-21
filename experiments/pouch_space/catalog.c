@@ -609,7 +609,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   if (!s || !callback || kind > PS_CATALOG_MARKER)
     return cat_error(e, LC_ERR_INVALID, "catalog visit arguments invalid");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, e);
+  rc = ps_internal_observe_begin(s, &guard, e);
   /* Sync completion does not need the allocator mutex. Both passes must use
    * one watermark, or a newly visible name can exceed the counted vector. */
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);

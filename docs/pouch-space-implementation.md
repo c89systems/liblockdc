@@ -11298,3 +11298,85 @@ messaging, and streaming handoff. Formatting and diff checks passed.
 
 The traces, matched samples, and test logs are in
 `build/pouch-space-concurrent/allocator-cpu/`.
+
+## Observing a checked resident projection without allocator authority
+
+An allocator-site trace attributed roughly 8,400 acquisitions per
+eight-writer NoSync run to query artifact validation, catalog
+enumeration and reacquisition of namespace ownership. These callers
+often inspect identities or values that the local owner has already
+checked.
+
+The readiness page can now prove that a resident projection matches
+the selected root, journal prefix and durability watermark. The
+observer holds the local space mutex and checks both readiness slot
+generations, the record checksum, the container identity and the
+absence of a pending transition. A changed or uncertain observation
+uses the ordinary allocator capture. Catalog enumeration still
+retains its in-memory names and targets across callbacks. Validation
+of an uncached artifact reacquires allocator authority and selects
+its incarnation again before pinning payload bytes. An existing
+namespace writer stamp can be reused under the namespace guard.
+Publishing a new stamp still takes allocator authority. The same
+resident check applies when examining outstanding checkpoint
+publications before any required sync.
+
+The deterministic fixture holds allocator authority in a second
+owner. Resident catalog enumeration, cached validation and namespace
+stamp reuse all complete without requesting that authority. A
+pending recovery marker forces the usual allocator acquisition.
+Under both observer policies a deferred durable replacement leaves
+the old artifact valid until flush completes. The next observation
+rejects the old incarnation, validates the replacement under a
+payload witness, then reuses the checked result.
+
+In three instrumented matched runs per build, medians of successful
+allocator acquisitions fell from 35,602 to 27,569. Query artifact
+validation fell from 4,352 to 102 acquisitions, catalog enumeration
+from 1,427 to 4, and namespace stamps from 2,753 to 769. All six
+traces verified 384 items each. They include instrumentation
+overhead.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`bbd845d0`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 900.28 / 806.24 / 1290.60 | 49.86 / 40.12 / 28.81 | 4.38 / 2.90 / 1.17 | 8.30 / 8.80 / 1.36 | 4.98 / 4.85 / 8.96 |
+| NoSync indexed, 4 writers, 20 MiB | 1493.38 / 1301.27 / 2161.84 | 48.04 / 44.05 / 33.03 | 6.59 / 4.15 / 1.42 | 10.87 / 13.11 / 1.08 | 7.99 / 7.26 / 13.15 |
+| Durable indexed, 2 writers, 15 MiB | 3902.62 / 3220.59 / 5568.78 | 58.22 / 46.10 / 72.71 | 4.91 / 1.72 / 0.75 | 6.92 / 5.97 / 1.11 | 5.89 / 5.15 / 6.88 |
+| Warmed NoSync queue | 8.68 / 11.78 / 86.86 | 1.62 / 2.25 / 21.07 | 0.23 / 0.25 / 0.05 | 3.44 / 2.68 / 0.39 | 0.21 / 0.32 / 0.43 |
+| Durable outbox | 1006.74 / 925.73 / 1526.31 | 196.81 / 177.71 / 300.07 | 0.76 / 0.73 / 0.30 | 34.59 / 35.49 / 58.47 | 79.31 / 61.50 / 135.16 |
+| NoSync indexed, 8 writers, 24 MiB | 2001.94 / 1715.02 / 2663.48 | 79.34 / 73.69 / 56.39 | 29.26 / 11.96 / 1.88 | 20.06 / 16.96 / 1.96 | 11.69 / 9.74 / 17.82 |
+| Durable indexed, 8 writers, 24 MiB | 4001.45 / 4094.49 / 9031.34 | 122.69 / 136.79 / 215.75 | 8.87 / 6.92 / 1.97 | 19.84 / 24.21 / 1.74 | 10.75 / 11.55 / 14.81 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 219.87 / 209.01 / 326.15 | 61.96 / 32.59 / 193.08 | 21.54 / 19.19 / 199.70 | 0.77 / 0.74 / 1.57 |
+| NoSync indexed, 4 writers, 20 MiB | 298.97 / 243.62 / 475.45 | 63.63 / 41.14 / 319.84 | 39.54 / 27.81 / 370.53 | 1.57 / 1.14 / 2.49 |
+| Durable indexed, 2 writers, 15 MiB | 118.95 / 108.32 / 219.18 | 10.36 / 4.33 / 197.95 | 2.81 / 6.83 / 255.09 | 0.51 / 0.39 / 0.63 |
+| NoSync indexed, 8 writers, 24 MiB | 418.70 / 408.59 / 789.82 | 172.40 / 159.29 / 440.55 | 104.86 / 76.79 / 604.68 | 2.71 / 2.13 / 4.28 |
+| Durable indexed, 8 writers, 24 MiB | 408.68 / 367.04 / 1218.58 | 126.42 / 119.61 / 1667.28 | 94.51 / 62.62 / 2137.74 | 2.42 / 2.53 / 3.41 |
+
+At eight writers in NoSync, work took 1.72 s versus 2.00 s for the
+prior native build and 2.66 s for multifile. Process CPU through
+maintenance fell from 2.39 to 2.17 s, with multifile at 1.13 s.
+Per-item p95 fell from 79.34 to 73.69 ms, with multifile at 56.39 ms.
+Both four-writer NoSync profiles improved work and p95. The warmed
+NoSync queue and eight-writer durable profiles spent longer in work
+than the prior native build in their two-sample comparisons. NoSync
+CPU and tail latency, and indexed close and reopen, remain open for
+qualification.
+
+Verification passed 35 GNU Release, 15 Debug ASan/UBSan and
+15 musl Release groups. Coverage includes shared readiness faults,
+journal and checkpoint replay, writer takeover, reader pins and
+fixed-capacity lease and messaging. Formatting and diff checks
+passed.
+
+Raw traces, matched samples and test logs are in
+`build/pouch-space-concurrent/allocation-sites/`.

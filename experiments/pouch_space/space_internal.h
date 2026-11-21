@@ -236,6 +236,9 @@ int ps_internal_healthy(ps_space *, lc_error *);
  * authority. Captured handles subsequently retain their incarnation directly.
  */
 int ps_internal_capture_begin(ps_space *, ps_coordination_guard **, lc_error *);
+/* Like capture for memory-only observation. A proven resident prefix can
+ * return without allocator authority. Callers must not claim physical bytes. */
+int ps_internal_observe_begin(ps_space *, ps_coordination_guard **, lc_error *);
 int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
                             lc_error *);
 /* Caller holds a canonical capture and samples one local visibility prefix

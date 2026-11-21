@@ -597,6 +597,23 @@ int ps_internal_capture_begin(ps_space *s, ps_coordination_guard **guard,
                               lc_error *error) {
   return capture_begin(s, guard, 0, error);
 }
+static void observe_local_durability(ps_space *s) {
+  if (s->readiness && s->peer_durable >= s->own_ready_wire &&
+      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
+          s->own_ready_sequence)
+    mark_durable(s, s->own_ready_sequence);
+}
+int ps_internal_observe_begin(ps_space *s, ps_coordination_guard **guard,
+                              lc_error *error) {
+  int rc = healthy(s, error);
+  *guard = NULL;
+  if (rc != LC_OK)
+    return rc;
+  if (!ps_readiness_resident(s))
+    return ps_internal_capture_begin(s, guard, error);
+  observe_local_durability(s);
+  return LC_OK;
+}
 int ps_internal_capture_end(ps_space *s, ps_coordination_guard *guard, int rc,
                             lc_error *error) {
   return allocation_end(s, guard, rc, error);
@@ -3324,10 +3341,7 @@ static int canonical_journal(ps_space *s,
     return err(error, LC_ERR_PENDING,
                "certified checkpoint view needs refresh");
   s->peer_durable = certificate->durable;
-  if (s->readiness && certificate->durable >= s->own_ready_wire &&
-      __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
-          s->own_ready_sequence)
-    mark_durable(s, s->own_ready_sequence);
+  observe_local_durability(s);
   while ((verify_end || s->sequence < certificate->ready) &&
          s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = transfer(s, next, sizeof(next), JOURNAL_OFFSET + s->journal, 0, error);
@@ -5829,7 +5843,7 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   if (!s->readiness)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = ps_internal_observe_begin(s, &guard, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
     for (p = s->buckets[i]; p; p = p->hash_next) {
@@ -5921,6 +5935,16 @@ int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+static ps_entry *validation_value(ps_space *s, ps_key key,
+                                  const ps_ref *expected) {
+  ps_entry *p =
+      selected_value(s, lookup(s, key),
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
+  return p && (!expected || (expected->incarnation == p->token &&
+                             !memcmp(expected->container, s->identity, 16)))
+             ? p
+             : NULL;
+}
 int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
                       int *valid, lc_error *error) {
   ps_entry *p;
@@ -5931,13 +5955,12 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
     return err(error, LC_ERR_INVALID, "value validation requires typed output");
   *valid = 0;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
-  p = selected_value(s, lookup(s, key),
-                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
-  if (rc != LC_OK || !p ||
-      (expected && (memcmp(expected->container, s->identity, 16) ||
-                    expected->incarnation != p->token)))
-    p = NULL;
+  rc = ps_internal_observe_begin(s, &guard, error);
+  p = rc == LC_OK ? validation_value(s, key, expected) : NULL;
+  if (p && !p->value_checked && s->readiness && !s->allocation_guard) {
+    rc = ps_internal_capture_begin(s, &guard, error);
+    p = rc == LC_OK ? validation_value(s, key, expected) : NULL;
+  }
   if (p && p->value_checked) {
     *valid = p->value_checked > 0;
     p = NULL;
@@ -7012,12 +7035,15 @@ int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
   }
   return rc;
 }
+static int writer_stamp_current(const ps_space *s, const ps_entry *p) {
+  return p->writer_generation == s->generation &&
+         p->writer_stamp == s->token_end;
+}
 static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
                               int *continued, lc_error *error) {
   ps_entry stamp;
   int rc;
-  *continued =
-      p->writer_generation == s->generation && p->writer_stamp == s->token_end;
+  *continued = writer_stamp_current(s, p);
   if (*continued && event != PS_STREAM_EDIT)
     return LC_OK;
   memset(&stamp, 0, sizeof(stamp));
@@ -7044,6 +7070,18 @@ int ps_internal_namespace_stamp(ps_space *s, uint64_t identity, int *continued,
   int rc;
   key.key = identity;
   pthread_mutex_lock(&s->mutex);
+  p = lookup(s, key);
+  /* The caller owns the namespace guard. A peer cannot replace this
+   * stamp while that guard is held. A new stamp still needs the allocator. */
+  if (p && !p->deleted && p->catalog &&
+      p->catalog->kind == PS_CATALOG_NAMESPACE &&
+      p->peer_sequence <= s->peer_durable && writer_stamp_current(s, p) &&
+      ps_readiness_resident(s)) {
+    *continued = 1;
+    rc = healthy(s, error);
+    pthread_mutex_unlock(&s->mutex);
+    return rc;
+  }
   rc = ps_internal_capture_begin(s, &allocator, error);
   if (rc == LC_OK) {
     p = lookup(s, key);
