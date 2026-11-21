@@ -1740,8 +1740,8 @@ static double projection_milliseconds(void) {
   return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
 typedef struct descriptor_probe {
-  uint64_t pages[72];
-  size_t reads[72], count;
+  uint64_t pages[144];
+  size_t reads[144], count;
   size_t calls, superblocks;
   uint64_t following;
 } descriptor_probe;
@@ -1763,13 +1763,21 @@ static ssize_t descriptor_read(void *context, int fd, void *bytes, size_t n,
     probe->following = (uint64_t)offset + PS_PAGE;
   return pread(fd, bytes, n, offset);
 }
-static void directory_reopen_locality(int evict) {
+enum directory_layout {
+  DIRECTORY_SMALL,
+  DIRECTORY_INTERLEAVED,
+  DIRECTORY_ORDERED
+};
+enum directory_admission { DIRECTORY_ADOPT, DIRECTORY_JOIN, DIRECTORY_COLD };
+static void directory_reopen_locality(enum directory_layout layout) {
   lc_error e = {0};
   descriptor_probe probe = {0};
   ps_io io = {&probe, descriptor_read, write_io, sync_io, reserve_io, NULL};
   ps_options options = {.io = &io};
   ps_space *writer = NULL, *observer = NULL;
-  uint64_t count = evict ? 2100 : 96;
+  uint64_t count = layout == DIRECTORY_ORDERED       ? 4200
+                   : layout == DIRECTORY_INTERLEAVED ? 3150
+                                                     : 96;
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
   /* Interleave disjoint key ranges on the same descriptor pages. The
    * sorted directory visits those pages from both key ranges. */
@@ -1777,29 +1785,43 @@ static void directory_reopen_locality(int evict) {
     capture_put(writer, id, 0);
     capture_put(writer, 8192 + id, 0);
   }
-  /* An ordered image spanning more than the cache bound exercises slot
-   * reuse. The smaller incremental image exercises lookup of shared pages. */
-  ok(evict ? ps_metadata_repack(writer, &e) : ps_checkpoint(writer, &e), &e);
+  if (layout == DIRECTORY_INTERLEAVED)
+    ok(ps_open(path, 0, &options, &observer, &e), &e);
+  /* The wide interleaving revisits pages across batches. The ordered
+   * rewrite spans more than one cacheful of checked descriptor pages. */
+  ok(layout == DIRECTORY_ORDERED ? ps_metadata_repack(writer, &e)
+                                 : ps_checkpoint(writer, &e),
+     &e);
   for (ps_meta_page *page = writer->pages; page; page = page->next)
     if (!page->index) {
       REQUIRE(probe.count < sizeof(probe.pages) / sizeof(probe.pages[0]));
       probe.pages[probe.count++] = page->run.offset;
     }
-  REQUIRE(probe.count >= (evict ? 65U : 3U));
-  for (int cold = 0; cold <= 1; ++cold) {
-    if (cold)
+  if (layout == DIRECTORY_ORDERED)
+    REQUIRE(probe.count > 128U);
+  else if (layout == DIRECTORY_INTERLEAVED)
+    REQUIRE(probe.count > 64U && probe.count <= 128U);
+  else
+    REQUIRE(probe.count >= 3U);
+  for (int admission = observer ? DIRECTORY_ADOPT : DIRECTORY_JOIN;
+       admission <= DIRECTORY_COLD; ++admission) {
+    if (admission == DIRECTORY_COLD)
       ok(ps_close(writer, &e), &e);
     memset(probe.reads, 0, sizeof(probe.reads));
     probe.calls = 0;
     probe.superblocks = 0;
     probe.following = 0;
-    ok(ps_open(path, 0, &options, &observer, &e), &e);
+    if (admission == DIRECTORY_ADOPT)
+      ok(ps_refresh(observer, &e), &e);
+    else
+      ok(ps_open(path, 0, &options, &observer, &e), &e);
     for (size_t i = 0; i < probe.count; ++i)
       REQUIRE(probe.reads[i] == 1);
     REQUIRE(probe.calls < probe.count && probe.following);
-    REQUIRE(probe.superblocks == 1);
-    printf("directory_admission cold=%d pages=%zu reads=%zu\n", cold,
-           probe.count, probe.calls);
+    if (admission != DIRECTORY_ADOPT)
+      REQUIRE(probe.superblocks == 1);
+    printf("directory_admission layout=%d pass=%d pages=%zu reads=%zu\n",
+           layout, admission, probe.count, probe.calls);
     for (uint64_t id = 1; id <= count; ++id) {
       ps_ref ref;
       uint64_t bytes;
@@ -1811,8 +1833,9 @@ static void directory_reopen_locality(int evict) {
       REQUIRE(present && !bytes && ref.incarnation);
     }
     ok(ps_close(observer, &e), &e);
+    observer = NULL;
   }
-  if (!evict) {
+  if (layout == DIRECTORY_SMALL) {
     /* The second page in a shared transfer must pass its own checks. */
     unsigned char original, changed;
     off_t offset = (off_t)probe.following;
@@ -5851,8 +5874,9 @@ int main(int argc, char **argv) {
     capture_race();
   else if (!strcmp(argv[2], "projection")) {
     projection_lifecycle();
-    directory_reopen_locality(0);
-    directory_reopen_locality(1);
+    directory_reopen_locality(DIRECTORY_SMALL);
+    directory_reopen_locality(DIRECTORY_INTERLEAVED);
+    directory_reopen_locality(DIRECTORY_ORDERED);
     for (int durable = 0; durable <= 1; ++durable)
       projection_quarantine(durable, 0);
   } else if (!strcmp(argv[2], "projection-faults"))

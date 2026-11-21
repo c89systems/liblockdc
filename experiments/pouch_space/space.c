@@ -3282,12 +3282,12 @@ static int canonical_journal(ps_space *s,
     ps_readiness_finish(s, PS_READINESS_JOURNAL);
   return LC_OK;
 }
-#define META_READ_PAGES 64U
-#define META_READ_AHEAD_PAGES 8U
 #define META_DIRECTORY_BATCH 128U
+#define META_READ_PAGES META_DIRECTORY_BATCH
+#define META_READ_AHEAD_PAGES 8U
 typedef struct metadata_read_page {
   uint64_t offset, generation, following;
-  size_t used;
+  size_t used, batch;
   struct metadata_read_page *next, **link;
   unsigned char bytes[PS_PAGE];
 } metadata_read_page;
@@ -3303,7 +3303,7 @@ typedef struct metadata_recovery {
   /* Directory order need not match the packing order of descriptor pages.
    * Retain a bounded set of checked immutable pages for this traversal. */
   metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
-  size_t next_slot;
+  size_t next_slot, batch;
   metadata_directory_entry entries[META_DIRECTORY_BATCH];
   size_t count;
 } metadata_recovery;
@@ -3326,15 +3326,26 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   ps_space *s = r->space;
   metadata_read_page **bucket, *page;
   const unsigned char *buffer;
+  size_t examined;
   int rc = LC_OK;
   if (!metadata_offset(s, offset))
     return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
   page = metadata_read_find(r, offset);
   if (page) {
+    page->batch = r->batch;
     *out = page;
     return LC_OK;
   }
   bucket = &r->buckets[(offset / PS_PAGE) % META_READ_PAGES];
+  /* Prefer an unused slot or an older batch. A descriptor spanning pages can
+   * take the working set beyond one page per binding. In that case the walk
+   * makes one full turn and reuses the next slot. */
+  for (examined = 0; examined < META_READ_PAGES; ++examined) {
+    page = r->slots[r->next_slot];
+    if (!page || page->batch != r->batch)
+      break;
+    r->next_slot = (r->next_slot + 1) % META_READ_PAGES;
+  }
   page = r->slots[r->next_slot];
   if (page) {
     *page->link = page->next;
@@ -3355,6 +3366,7 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
     return rc;
   buffer = page->bytes;
   page->offset = offset;
+  page->batch = r->batch;
   page->generation = get64(buffer + 16);
   page->following = get64(buffer + 8);
   page->used = get32(buffer + 4);
@@ -3383,6 +3395,7 @@ static int metadata_read_ahead(metadata_recovery *r, lc_error *error) {
   metadata_read_page *page;
   size_t i, start, part, count = 0;
   int rc = LC_OK;
+  ++r->batch;
   for (i = 0; i < r->count; ++i)
     offsets[i] = r->entries[i].ref.offset / PS_PAGE * PS_PAGE;
   qsort(offsets, r->count, sizeof(*offsets), metadata_offset_order);
@@ -3391,10 +3404,12 @@ static int metadata_read_ahead(metadata_recovery *r, lc_error *error) {
       continue;
     if (!metadata_offset(r->space, offsets[i]))
       return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
+    /* Protect every known starting page before loading adjacent misses. */
+    page = metadata_read_find(r, offsets[i]);
+    if (page)
+      page->batch = r->batch;
     offsets[count++] = offsets[i];
   }
-  if (count > META_READ_PAGES)
-    return LC_OK;
   for (i = 0; rc == LC_OK && i < count;) {
     start = i++;
     if (metadata_read_find(r, offsets[start]))
@@ -3404,16 +3419,6 @@ static int metadata_read_ahead(metadata_recovery *r, lc_error *error) {
            !metadata_read_find(r, offsets[i]))
       ++i;
     if (i - start < 2)
-      continue;
-    /* Leave pages needed by this batch resident. Demand reads still handle
-     * continuations and any batches that do not fit the cache. */
-    for (part = 0; part < i - start; ++part) {
-      page = r->slots[(r->next_slot + part) % META_READ_PAGES];
-      if (page && bsearch(&page->offset, offsets, count, sizeof(*offsets),
-                          metadata_offset_order))
-        break;
-    }
-    if (part != i - start)
       continue;
     rc = transfer(r->space, r->wire, (i - start) * PS_PAGE, offsets[start], 0,
                   error);

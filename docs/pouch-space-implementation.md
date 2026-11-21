@@ -10927,3 +10927,98 @@ diff checks passed.
 
 Logs and traces use the `witness-prior-`, `witness-current-`, and
 `witness-filter-` prefixes in `build/pouch-space-concurrent/`.
+
+## Keeping descriptor pages for the current recovery batch
+
+Three traced eight-writer runs in each durability mode separated the
+cold owner from eight live joins. The joins spent 11.76–15.91 ms in
+aggregate. Rebuilding the physical directory accounted for 8.14–11.86
+ms of that time. Cold namespace recovery took 3.53–4.93 ms. The cold
+grant and durability phase took 2.22–21.23 ms. Grouped reopen measured
+19.29–39.64 ms. These traces used the prior native build.
+
+The previous recovery cache could evict descriptors that a later
+binding needed. The recovery reader now has one checked page slot per
+binding in a 128-entry batch. Before fetching adjacent misses, it
+marks all resident starting pages referenced by that batch. It prefers
+empty slots and pages from earlier batches. A descriptor that spans
+pages can exceed the batch's working set. The selection makes one
+bounded pass before reusing a slot in that case.
+
+This uses up to 512 KiB of temporary descriptor page bytes, up from
+256 KiB. Cold recovery, live joins, and resident adoption of a peer's
+checkpoint use the same bounded reader. Adjacent transfers still
+verify each page independently. Descriptors still acquire ownership
+in validated directory order.
+
+The interleaved fixture reads 102 checked pages in 29 transfers in
+all three paths. It checks each recovered key. The previous build
+fails the same test's one-read-per-page assertion.
+A 134-page ordered image verifies cache turnover and uses 69
+transfers in either open path. The small fixture still corrupts a
+page inside a combined transfer, verifies rejection, and restores it.
+
+The identical-layout comparison used six flushed copies per build
+and durability mode. Each opened one cold owner followed by eight
+live joins. The layout was fixed within each pair. These are wall
+time medians. Each cold open crossed one durability barrier and the
+live joins crossed none.
+
+Each table cell lists prior native first, followed by revised native.
+
+| Layout | Pread calls per cold open | Pread calls per live join | Median cold open | Median live join |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync | 690 / 639 | 137 / 86 | 8.179 / 10.787 ms | 1.473 / 1.492 ms |
+| Durable | 853 / 644 | 306 / 97 | 8.335 / 8.782 ms | 1.848 / 1.355 ms |
+
+Decoder and allocation changes produced little consistent live-join
+benefit in the isolated trial. A 256-page cache reached the same
+read count as the selected batch-aware 128-page cache on both layouts.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`25cd1f08`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 983.25 / 846.09 / 1364.50 | 51.58 / 46.08 / 30.48 | 5.27 / 2.40 / 0.98 | 9.91 / 8.18 / 1.03 | 4.68 / 4.78 / 7.39 |
+| NoSync indexed, 4 writers, 20 MiB | 1712.06 / 1570.15 / 2176.91 | 55.69 / 53.52 / 35.59 | 5.23 / 5.73 / 1.16 | 14.47 / 11.07 / 0.86 | 7.22 / 7.44 / 9.54 |
+| Durable indexed, 2 writers, 15 MiB | 4724.72 / 3556.81 / 6203.27 | 76.32 / 53.36 / 78.33 | 4.30 / 1.68 / 0.76 | 11.02 / 7.61 / 0.58 | 5.35 / 5.57 / 7.65 |
+| Warmed NoSync queue | 9.13 / 10.13 / 80.40 | 1.67 / 2.07 / 17.51 | 0.23 / 0.19 / 0.08 | 4.02 / 4.07 / 0.42 | 0.21 / 0.19 / 0.47 |
+| Durable outbox | 1177.06 / 961.68 / 1631.59 | 231.39 / 177.65 / 305.66 | 0.52 / 0.52 / 0.31 | 46.22 / 43.17 / 64.36 | 80.21 / 71.29 / 169.15 |
+| NoSync indexed, 8 writers, 24 MiB | 2380.86 / 2188.89 / 2717.11 | 102.27 / 86.80 / 61.98 | 19.29 / 6.50 / 1.71 | 22.50 / 19.75 / 1.86 | 11.32 / 10.18 / 14.50 |
+| Durable indexed, 8 writers, 24 MiB | 4988.01 / 3912.09 / 9231.24 | 147.07 / 116.39 / 223.21 | 20.50 / 7.25 / 2.09 | 26.29 / 17.87 / 1.95 | 11.40 / 9.66 / 17.14 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 226.23 / 226.06 / 319.21 | 65.88 / 38.44 / 212.44 | 19.79 / 35.34 / 231.96 | 0.77 / 0.72 / 1.38 |
+| NoSync indexed, 4 writers, 20 MiB | 293.25 / 288.19 / 456.86 | 67.39 / 93.90 / 308.00 | 55.88 / 31.80 / 371.13 | 1.25 / 1.22 / 1.75 |
+| Durable indexed, 2 writers, 15 MiB | 169.88 / 124.55 / 157.21 | 12.05 / 25.73 / 92.58 | 17.06 / 6.51 / 108.90 | 0.45 / 0.49 / 0.80 |
+| NoSync indexed, 8 writers, 24 MiB | 470.06 / 412.90 / 819.19 | 172.32 / 174.26 / 501.79 | 102.09 / 116.30 / 603.31 | 2.68 / 2.38 / 3.26 |
+| Durable indexed, 8 writers, 24 MiB | 473.86 / 366.31 / 1450.34 | 192.99 / 137.20 / 1812.04 | 98.61 / 52.71 / 1815.79 | 2.78 / 2.16 / 3.95 |
+
+At eight writers, grouped reopen fell from 22.50 to 19.75 ms in
+NoSync and from 26.29 to 17.87 ms in durable mode. Multifile reopened
+in 1.86 and 1.95 ms, respectively. The full workflow builds its own
+layout in each run and includes concurrent maintenance. The
+identical-layout comparison isolates the reduction in read calls.
+Median cold opens on the identical copies ranged from 8 to 11 ms.
+
+At eight writers in NoSync, revised native work took 2.19 s and
+multifile took 2.72 s. Native process CPU through end-of-work
+maintenance was 2.53 s, versus 1.06 s for multifile. Per-item p95
+was 86.80 and 61.98 ms, respectively. Native durable indexed work
+at eight writers took 3.91 s, with multifile at 9.23 s. Grouped
+reopen, NoSync CPU and NoSync write tails remain qualification work.
+
+Verification passed 42 GNU Release, 22 Debug ASan/UBSan and 22 musl
+Release groups. The gates cover resident projection, journal recovery,
+process contention, metadata capacity, explicit growth and its fault
+paths, shared lease and messaging capacity, and resumable conversion.
+Formatting and diff checks passed.
+
+Raw phase traces, copied-layout observations, benchmark runs, and test
+logs are in `build/pouch-space-concurrent/reopen-surface/`.
