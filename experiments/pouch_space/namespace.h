@@ -14,6 +14,7 @@ typedef struct ps_namespace_conversion ps_namespace_conversion;
 typedef struct ps_ns_resource ps_namespace_retirement;
 struct lc_pouch_storage_batch;
 struct lc_pouch_storage_namespace_info;
+struct lc_pouch_storage_state_refresh;
 enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
   PS_APPEND_COMPLETE,
@@ -174,6 +175,10 @@ void ps_namespace_read_close(ps_namespace_window *);
 int ps_namespace_view_open(ps_namespace *, ps_namespace_view **, lc_error *);
 int ps_namespace_state_view_open(ps_namespace *, ps_namespace_view **,
                                  lc_error *);
+int ps_namespace_refresh_state(ps_namespace *,
+                               struct lc_pouch_storage_namespace_info *,
+                               const struct lc_pouch_storage_state_refresh *,
+                               lc_error *);
 /* Admit only the selected active range after matching the expected boundary. */
 int ps_namespace_view_suffix_open(
     ps_namespace *, const struct lc_pouch_storage_namespace_info *,

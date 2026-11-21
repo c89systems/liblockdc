@@ -1935,6 +1935,7 @@ typedef struct lc_pouch_state_cache_record {
   lc_pouch_state_payload_span payload_span;
   char *record_container_leaf;
   uint64_t record_offset;
+  uint64_t storage_slot;
   char *payload_context;
   char *descriptor;
   unsigned char *metadata;
@@ -3605,6 +3606,8 @@ struct lc_pouch_namespace_logstore {
   uint64_t active_segment_id;
   uint64_t storage_incarnation;
   uint64_t storage_checkpoint_epoch;
+  lc_pouch_storage_state_slot *storage_slots;
+  size_t storage_slot_count;
   uint64_t max_segment_id;
   unsigned long segment_count;
   lc_pouch_generation max_version;
@@ -4043,6 +4046,9 @@ lc_pouch_namespace_logstore_clear_records(const lc_allocator *allocator,
   ns->record_bucket_count = 0U;
   ns->record_count = 0U;
   ns->body_cache_bytes = 0U;
+  lc_free_with_allocator(NULL, ns->storage_slots);
+  ns->storage_slots = NULL;
+  ns->storage_slot_count = 0U;
   lc_free_with_allocator(allocator, ns->active_segment_leaf);
   lc_free_with_allocator(allocator, ns->latest_snapshot_leaf);
   lc_free_with_allocator(allocator, ns->namespace_path);
@@ -5690,9 +5696,34 @@ int lc_pouch_state_entry_project(const lc_pouch_state_entry *prior,
   return 1;
 }
 
+size_t
+lc_pouch_storage_state_slot_find(const lc_pouch_storage_state_slot *slots,
+                                 size_t count, uint64_t id) {
+  size_t low = 0, high = count;
+  while (low < high) {
+    size_t mid = low + (high - low) / 2;
+    if (slots[mid].id < id)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low < count && slots[low].id == id ? low : count;
+}
+
+static void lc_pouch_state_slot_dirty(lc_pouch_namespace_logstore *cache,
+                                      const lc_pouch_state_cache_record *row) {
+  if (row->storage_slot) {
+    size_t at = lc_pouch_storage_state_slot_find(
+        cache->storage_slots, cache->storage_slot_count, row->storage_slot);
+    if (at < cache->storage_slot_count)
+      cache->storage_slots[at].incarnation = 0;
+  }
+}
+
 static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
                                             lc_pouch_namespace_logstore *ns,
                                             const lc_pouch_state_entry *entry,
+                                            uint64_t selected_slot,
                                             lc_error *error) {
   lc_pouch_state_cache_record *record;
   lc_pouch_state_entry current, projected;
@@ -5743,7 +5774,13 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
                         "pouch body has no key lifetime", NULL, NULL, "pouch");
   record = lc_pouch_state_cache_record_find(ns, entry->key);
-  lc_pouch_state_entry_borrow_cache_record(record, &current);
+  if (selected_slot && record && record->storage_slot &&
+      record->storage_slot != selected_slot)
+    return lc_error_set(error, LC_ERR_PENDING, 0L,
+                        "checkpoint changed a key's slot identity", NULL, NULL,
+                        "pouch");
+  lc_pouch_state_entry_borrow_cache_record(selected_slot ? NULL : record,
+                                           &current);
   if (!lc_pouch_state_entry_project(&current, entry, &projected))
     return LC_OK;
   entry = &projected;
@@ -5908,6 +5945,10 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
   record->staged_delete_marker = entry->staged_delete_marker;
   record->found = entry->found;
   record->record_type = entry->record_type;
+  if (selected_slot)
+    record->storage_slot = selected_slot;
+  else
+    lc_pouch_state_slot_dirty(ns, record);
   if (query_index_seq > ns->max_query_index_seq) {
     ns->max_query_index_seq = query_index_seq;
   }
@@ -9672,7 +9713,7 @@ static int lc_pouch_state_cache_replay_file(
     if (!found) {
       break;
     }
-    rc = lc_pouch_state_cache_apply_entry(pouch, cache, &entry, error);
+    rc = lc_pouch_state_cache_apply_entry(pouch, cache, &entry, 0, error);
     if (rc != LC_OK) {
       break;
     }
@@ -10203,6 +10244,7 @@ typedef struct lc_pouch_storage_replay_context {
   lc_pouch *pouch;
   lc_pouch_namespace_logstore *cache;
   int staging_changed;
+  int incremental;
 } lc_pouch_storage_replay_context;
 
 static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
@@ -10214,7 +10256,96 @@ static int lc_pouch_state_storage_replay(void *context, uint64_t segment,
       (entry->key && lc_pouch_state_key_is_staged(entry->key)))
     replay->staging_changed = 1;
   return lc_pouch_state_cache_apply_entry(replay->pouch, replay->cache, entry,
-                                          error);
+                                          0, error);
+}
+
+static void
+lc_pouch_state_storage_reset(lc_pouch_storage_replay_context *replay,
+                             int incremental) {
+  lc_pouch_namespace_logstore *cache = replay->cache;
+  if (!incremental)
+    lc_pouch_namespace_logstore_clear_records(&replay->pouch->allocator, cache);
+  cache->initialized = 0;
+  cache->max_version = cache->max_query_index_seq = 0;
+  cache->max_segment_id = cache->segment_count = 0;
+  replay->staging_changed = 0;
+  replay->incremental = incremental;
+}
+
+static void lc_pouch_state_storage_begin(void *context, int incremental,
+                                         lc_pouch_storage_state_slot *slots,
+                                         size_t count) {
+  lc_pouch_storage_replay_context *replay = context;
+  lc_pouch_namespace_logstore *cache = replay->cache;
+  lc_pouch_state_storage_reset(replay, incremental);
+  lc_free_with_allocator(NULL, cache->storage_slots);
+  cache->storage_slots = slots;
+  cache->storage_slot_count = count;
+}
+
+static int lc_pouch_state_storage_selected(void *context, uint64_t slot,
+                                           const lc_pouch_state_entry *entry,
+                                           lc_error *error) {
+  lc_pouch_storage_replay_context *replay = context;
+  int rc;
+  if (!slot || !entry->key || !entry->seen || entry->control)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "checkpoint slot requires a canonical state record",
+                        NULL, NULL, "pouch");
+  rc = lc_pouch_state_cache_apply_entry(replay->pouch, replay->cache, entry,
+                                        slot, error);
+  if (rc == LC_ERR_PENDING && !replay->incremental) {
+    lc_error_cleanup(error);
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "checkpoint repeats a canonical state record", NULL,
+                        NULL, "pouch");
+  }
+  return rc;
+}
+
+static int
+lc_pouch_state_storage_refresh(lc_pouch_storage_replay_context *replay,
+                               lc_pouch_storage_namespace_info *info,
+                               lc_error *error) {
+  lc_pouch_namespace_logstore *cache = replay->cache;
+  lc_pouch *pouch = replay->pouch;
+  lc_pouch_storage_state_refresh refresh = {0};
+  lc_pouch_state_cache_record *record;
+  int rc;
+  if (cache->initialized) {
+    refresh.previous = cache->storage_slots;
+    refresh.previous_count = cache->storage_slot_count;
+  }
+  refresh.context = replay;
+  refresh.begin = lc_pouch_state_storage_begin;
+  refresh.selected = lc_pouch_state_storage_selected;
+  refresh.visit = lc_pouch_state_storage_replay;
+  for (;;) {
+    rc = pouch->storage.ops->refresh_state(pouch->storage.context,
+                                           cache->storage_namespace, info,
+                                           &refresh, error);
+    if (rc == LC_OK && replay->incremental &&
+        cache->record_count != cache->storage_slot_count)
+      rc = lc_error_set(error, LC_ERR_PENDING, 0L,
+                        "checkpoint does not cover the resident key set", NULL,
+                        NULL, "pouch");
+    if (rc != LC_ERR_PENDING || !refresh.previous_count)
+      break;
+    lc_error_cleanup(error);
+    refresh.previous = NULL;
+    refresh.previous_count = 0;
+  }
+  if (rc == LC_OK && replay->incremental) {
+    /* The current coverage supplies control watermarks. Unchanged slots can
+     * also be ahead of coverage during a partial checkpoint publication. */
+    for (record = cache->records; record; record = record->next) {
+      if (record->index_seq > cache->max_version)
+        cache->max_version = record->index_seq;
+      if (record->query_index_seq > cache->max_query_index_seq)
+        cache->max_query_index_seq = record->query_index_seq;
+    }
+  }
+  return rc;
 }
 
 struct lc_pouch_state_snapshot {
@@ -10238,6 +10369,7 @@ typedef struct lc_pouch_checkpoint_swap {
 } lc_pouch_checkpoint_swap;
 typedef struct lc_pouch_checkpoint_plan {
   size_t count;
+  lc_pouch_namespace_logstore *cache;
   lc_pouch_checkpoint_swap *swaps;
 } lc_pouch_checkpoint_plan;
 void lc_pouch_state_checkpoint_finish(lc_pouch *pouch, void *context,
@@ -10256,6 +10388,7 @@ void lc_pouch_state_checkpoint_finish(lc_pouch *pouch, void *context,
       swap->leaf = old;
       record->record_offset = 0;
       record->has_record_ref = 1;
+      lc_pouch_state_slot_dirty(plan->cache, record);
     }
     lc_free_with_allocator(&pouch->allocator, swap->leaf);
   }
@@ -10290,6 +10423,7 @@ int lc_pouch_state_checkpoint_prepare(
                         "cannot prepare checkpoint reference update", NULL,
                         NULL, "pouch");
   }
+  plan->cache = cache;
   for (i = 0; i < count; ++i) {
     lc_pouch_checkpoint_swap *swap;
     record = lc_pouch_state_cache_record_find(cache, refs[i].key);
@@ -10431,7 +10565,7 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
   lc_pouch_state_namespace_lock *scope = NULL;
   lc_pouch_namespace_logstore *cache;
   lc_pouch_storage_namespace_info info;
-  lc_pouch_storage_replay_context replay;
+  lc_pouch_storage_replay_context replay = {0};
   char *leaf = NULL;
   int extend = 0;
   int rc = pouch->storage.ops->check(pouch->storage.context, error);
@@ -10489,18 +10623,17 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
       extend = 0;
     }
   }
-  if (!extend) {
-    cache->initialized = 0;
-    lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
-    cache->max_version = cache->max_query_index_seq = 0;
-    cache->max_segment_id = cache->segment_count = 0;
-    replay.staging_changed = 0;
+  if (!extend && scope && pouch->storage.ops->refresh_state)
+    rc = lc_pouch_state_storage_refresh(&replay, &info, error);
+  else if (!extend) {
+    lc_pouch_state_storage_reset(&replay, 0);
     rc = pouch->storage.ops->replay(
         pouch->storage.context, cache->storage_namespace, &info,
         LC_POUCH_STORAGE_REPLAY_STATE, lc_pouch_state_storage_replay, &replay,
         error);
   }
-  if (rc == LC_OK && !extend && info.active_segment != 0) {
+  if (rc == LC_OK && !extend && info.active_segment != 0 &&
+      info.active_segment != cache->active_segment_id) {
     leaf =
         lc_pouch_namespace_segment_leaf(&pouch->allocator, info.active_segment);
     if (leaf == NULL)
@@ -10512,8 +10645,10 @@ static int lc_pouch_state_storage_prepare(lc_pouch *pouch, const char *ns,
     lc_pouch_state_cache_invalidate_namespace(pouch, ns);
     return rc;
   }
-  if (!extend)
+  if (!extend && info.active_segment != cache->active_segment_id) {
+    lc_free_with_allocator(&pouch->allocator, cache->active_segment_leaf);
     cache->active_segment_leaf = leaf;
+  }
   cache->active_segment_id = cache->max_segment_id = info.active_segment;
   cache->segment_count = (unsigned long)info.segments;
   cache->active_segment_offset = info.tail;
@@ -13696,7 +13831,7 @@ static int lc_pouch_state_cache_apply_write(
   entry.found = found;
   entry.record_type = record_type;
   lc_error_init(&ignored);
-  rc = lc_pouch_state_cache_apply_entry(pouch, cache, &entry, &ignored);
+  rc = lc_pouch_state_cache_apply_entry(pouch, cache, &entry, 0, &ignored);
   lc_error_cleanup(&ignored);
   if (rc != LC_OK) {
     lc_pouch_namespace_logstore_clear_records(&pouch->allocator, cache);
@@ -17518,7 +17653,7 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
             lc_pouch_namespace_logstore_find(stage->pouch, stage->ns, 0, NULL);
         if (cache && cache->initialized &&
             lc_pouch_state_cache_apply_entry(
-                stage->pouch, cache, &lease_append.entry, NULL) != LC_OK)
+                stage->pouch, cache, &lease_append.entry, 0, NULL) != LC_OK)
           lc_pouch_state_cache_invalidate_namespace(stage->pouch, stage->ns);
       }
     }

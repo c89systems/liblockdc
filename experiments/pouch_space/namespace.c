@@ -43,8 +43,10 @@ struct ps_namespace_view {
   ps_values *metadata;
   ps_checkpoint_info coverage;
   lc_pouch_storage_namespace_info projection;
+  const lc_pouch_storage_state_refresh *refresh;
+  size_t matched_slots;
   enum ps_checkpoint_capture_mode capture;
-  int suffix, registered;
+  int suffix, registered, incremental;
 };
 typedef struct namespace_observation {
   lc_pouch_storage_namespace_info projection;
@@ -617,6 +619,17 @@ static int same_projection(const lc_pouch_storage_namespace_info *a,
          a->active_incarnation == b->active_incarnation &&
          a->checkpoint_epoch == b->checkpoint_epoch && a->tail == b->tail;
 }
+static int retain_changed_state(void *context, ps_key key,
+                                uint64_t incarnation) {
+  ps_namespace_view *view = context;
+  const lc_pouch_storage_state_refresh *refresh = view->refresh;
+  size_t at = lc_pouch_storage_state_slot_find(
+      refresh->previous, refresh->previous_count, key.key);
+  if (at == refresh->previous_count)
+    return 1;
+  ++view->matched_slots;
+  return refresh->previous[at].incarnation != incarnation;
+}
 /* Namespace exclusion spans the canonical capture, header verification, and
  * acquisition of the view witness. */
 static int capture_selected_view_locked(struct ps_namespace_data *d,
@@ -644,8 +657,15 @@ static int capture_selected_view_locked(struct ps_namespace_data *d,
     if (coverage->segment != active && (coverage->segment || active != 1))
       return LC_OK;
     start = coverage->offset;
-    rc = ps_checkpoint_capture_selected_locked(
-        d->ns, prefix, coverage, view->capture, &view->metadata, e);
+    if (view->refresh && view->refresh->previous_count && coverage->epoch &&
+        coverage->segment == active && start == tail) {
+      view->incremental = 1;
+      rc = ps_internal_values_capture_locked(
+          space, d->ns->identity.owner, PS_KEY_METADATA, PS_KEY_METADATA,
+          prefix, retain_changed_state, view, &view->metadata, e);
+    } else
+      rc = ps_checkpoint_capture_selected_locked(
+          d->ns, prefix, coverage, view->capture, &view->metadata, e);
   }
   view->coverage = *coverage;
   if (rc == LC_OK && start < tail) {
@@ -688,15 +708,19 @@ static int select_projection_locked(struct ps_namespace_data *d,
   ps_checkpoint_info *coverage = &selection->coverage;
   ps_key stream = {0, 0, PS_STREAM};
   unsigned char head[NS_HEAD_BYTES];
-  uint64_t token, active, tail;
+  uint64_t token, active = 0, tail = 0;
   int rc, current;
   *found = 0;
   rc = ps_internal_fixed_value(s, head_key(ns->identity.owner), prefix,
                                memo_only ? NULL : head, sizeof(head),
                                d->observed_head, &token, &current, e);
-  if (rc != LC_OK || !current || !token)
+  if (rc != LC_OK || !current)
     return rc;
-  if (token == d->observed_head)
+  if (!token) {
+    if (observed->window || (observed->view && !observed->view->refresh))
+      return LC_OK;
+    *found = 1; /* Metadata can have a checkpoint without a stream head. */
+  } else if (token == d->observed_head)
     active = d->observed_active;
   else {
     rc = decode_head(ns->identity.owner, head, &active, e);
@@ -720,13 +744,17 @@ static int select_projection_locked(struct ps_namespace_data *d,
   }
   if (rc != LC_OK || !*found)
     return rc;
+  if (!active && (!coverage->epoch || coverage->offset)) {
+    *found = 0;
+    return LC_OK;
+  }
   if (!observed->window &&
       (coverage->segment > active ||
        (coverage->segment == active && coverage->offset > tail)))
     return failure(e, LC_ERR_PROTOCOL, "checkpoint exceeds namespace tail");
   out->active_segment = active;
   out->tail = tail;
-  out->active_incarnation = selection->binding.target.incarnation;
+  out->active_incarnation = active ? selection->binding.target.incarnation : 0;
   if (!observed->window) {
     out->segments = active - coverage->segment + (coverage->segment != 0);
     out->checkpoint_epoch = coverage->epoch;
@@ -1557,6 +1585,7 @@ static int view_open(ps_namespace *ns,
                      const lc_pouch_storage_namespace_info *expected,
                      uint64_t resume_segment, uint64_t start,
                      enum ps_checkpoint_capture_mode capture,
+                     const lc_pouch_storage_state_refresh *refresh,
                      ps_namespace_view **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_view *view;
@@ -1578,6 +1607,7 @@ static int view_open(ps_namespace *ns,
     return failure(e, LC_ERR_NOMEM, "cannot allocate namespace view");
   view->ns = ns;
   view->capture = capture;
+  view->refresh = refresh;
   view->suffix = expected != NULL;
   ps_namespace_retain(ns);
   observed.view = view;
@@ -1671,11 +1701,11 @@ static int view_open(ps_namespace *ns,
 }
 int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
                            lc_error *e) {
-  return view_open(ns, NULL, 0, 0, PS_CHECKPOINT_CAPTURE_FULL, out, e);
+  return view_open(ns, NULL, 0, 0, PS_CHECKPOINT_CAPTURE_FULL, NULL, out, e);
 }
 int ps_namespace_state_view_open(ps_namespace *ns, ps_namespace_view **out,
                                  lc_error *e) {
-  return view_open(ns, NULL, 0, 0, PS_CHECKPOINT_CAPTURE_STATE, out, e);
+  return view_open(ns, NULL, 0, 0, PS_CHECKPOINT_CAPTURE_STATE, NULL, out, e);
 }
 int ps_namespace_view_suffix_open(ps_namespace *ns,
                                   const lc_pouch_storage_namespace_info *info,
@@ -1686,7 +1716,8 @@ int ps_namespace_view_suffix_open(ps_namespace *ns,
       *out = NULL;
     return failure(e, LC_ERR_INVALID, "namespace suffix requires a boundary");
   }
-  return view_open(ns, info, 0, start, PS_CHECKPOINT_CAPTURE_FULL, out, e);
+  return view_open(ns, info, 0, start, PS_CHECKPOINT_CAPTURE_FULL, NULL, out,
+                   e);
 }
 void ps_namespace_view_projection(const ps_namespace_view *view,
                                   lc_pouch_storage_namespace_info *out) {
@@ -1740,6 +1771,7 @@ static int replay_read(void *context, uint64_t offset,
 typedef struct checkpoint_visit {
   enum ps_checkpoint_capture_mode capture;
   ps_namespace_record_fn visit;
+  const lc_pouch_storage_state_refresh *refresh;
   void *context;
 } checkpoint_visit;
 static int visit_checkpoint_slot(void *context, ps_key key, ps_reader *reader,
@@ -1756,8 +1788,12 @@ static int visit_checkpoint_slot(void *context, ps_key key, ps_reader *reader,
   if (!lc_pouch_namespace_format_snapshot_leaf(key.key, leaf, sizeof(leaf)))
     return failure(e, LC_ERR_PROTOCOL, "invalid checkpoint slot label");
   rc = ps_checkpoint_record_read(reader, &allocator, leaf, &record, e);
-  if (rc == LC_OK)
-    rc = selected->visit(selected->context, 0, &record, e);
+  if (rc == LC_OK) {
+    if (selected->refresh)
+      rc = selected->refresh->selected(selected->context, key.key, &record, e);
+    else
+      rc = selected->visit(selected->context, 0, &record, e);
+  }
   lc_pouch_state_entry_cleanup(&allocator, &record);
   return rc;
 }
@@ -1794,6 +1830,7 @@ static int view_visit(ps_namespace_view *view, int verify, int selected,
   if (selected && rc == LC_OK && ps_values_count(view->metadata)) {
     checkpoint.capture = view->capture;
     checkpoint.visit = visit;
+    checkpoint.refresh = view->refresh;
     checkpoint.context = context;
     rc = ps_values_read_walk(view->metadata, visit_checkpoint_slot, &checkpoint,
                              e);
@@ -1835,6 +1872,51 @@ int ps_namespace_view_visit(ps_namespace_view *view, int verify,
                             ps_namespace_record_fn visit, void *context,
                             lc_error *e) {
   return view_visit(view, verify, view && !view->suffix, visit, context, e);
+}
+static int state_slot_order(const void *a, const void *b) {
+  const lc_pouch_storage_state_slot *x = a, *y = b;
+  return x->id < y->id ? -1 : x->id != y->id;
+}
+int ps_namespace_refresh_state(ps_namespace *ns,
+                               lc_pouch_storage_namespace_info *info,
+                               const lc_pouch_storage_state_refresh *refresh,
+                               lc_error *e) {
+  ps_namespace_view *view = NULL;
+  lc_pouch_storage_state_slot *slots = NULL;
+  size_t i, count, retained = 0;
+  int rc =
+      view_open(ns, NULL, 0, 0, PS_CHECKPOINT_CAPTURE_STATE, refresh, &view, e);
+  if (rc == LC_OK && view->incremental &&
+      view->matched_slots != refresh->previous_count)
+    rc = failure(e, LC_ERR_PENDING, "checkpoint no longer has prior slots");
+  if (rc == LC_OK) {
+    count = ps_values_count(view->metadata);
+    if (count)
+      slots = lc_calloc_with_allocator(NULL, count, sizeof(*slots));
+    if (count && !slots)
+      rc = failure(e, LC_ERR_NOMEM, "cannot retain state slot identities");
+    for (i = 0; rc == LC_OK && i < count; ++i) {
+      ps_key key;
+      ps_ref ref;
+      uint64_t bytes;
+      rc = ps_values_info(view->metadata, i, &key, &ref, &bytes, e);
+      if (rc == LC_OK && key.kind == PS_KEY_METADATA) {
+        slots[retained].id = key.key;
+        slots[retained++].incarnation = ref.incarnation;
+      }
+    }
+  }
+  if (rc == LC_OK) {
+    if (retained > 1)
+      qsort(slots, retained, sizeof(*slots), state_slot_order);
+    *info = view->projection;
+    refresh->begin(refresh->context, view->incremental, slots, retained);
+    slots = NULL;
+    rc = ps_namespace_view_visit(view, 1, refresh->visit, refresh->context, e);
+  }
+  lc_free_with_allocator(NULL, slots);
+  ps_namespace_view_close(view);
+  return rc;
 }
 void ps_namespace_view_close(ps_namespace_view *view) {
   size_t i;
@@ -1879,7 +1961,7 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
     return rc;
   for (attempt = 0;; ++attempt) {
     rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset,
-                   PS_CHECKPOINT_CAPTURE_SEED, &view, e);
+                   PS_CHECKPOINT_CAPTURE_SEED, NULL, &view, e);
     if (rc != LC_OK)
       break;
     rc = ps_key_checkpoint_confirm_seed(d->checkpoint, view->metadata,

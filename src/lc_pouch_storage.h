@@ -24,6 +24,26 @@ typedef int (*lc_pouch_storage_replay_fn)(void *, lc_pouch_storage_visit_fn,
 typedef int (*lc_pouch_storage_namespace_visit_fn)(void *, const char *,
                                                    lc_error *);
 
+typedef struct lc_pouch_storage_state_slot {
+  uint64_t id, incarnation;
+} lc_pouch_storage_state_slot;
+/* Slots are sorted by ID. Return count when the ID is absent. */
+size_t lc_pouch_storage_state_slot_find(const lc_pouch_storage_state_slot *,
+                                        size_t count, uint64_t id);
+typedef struct lc_pouch_storage_state_refresh {
+  const lc_pouch_storage_state_slot *previous;
+  size_t previous_count;
+  void *context;
+  /* Takes ownership of the detached slot identities from the default
+   * allocator. Incremental capture covers all previous IDs, with no
+   * uncovered suffix. Selection stops consulting previous before begin. */
+  void (*begin)(void *, int incremental, lc_pouch_storage_state_slot *,
+                size_t count);
+  int (*selected)(void *, uint64_t slot, const lc_pouch_state_entry *,
+                  lc_error *);
+  lc_pouch_storage_visit_fn visit;
+} lc_pouch_storage_state_refresh;
+
 /* Enumerate exact logical names through their owning storage. Names are
  * borrowed for the callback. No body replay, filtering or ordering guarantee.
  * Callbacks may open namespaces and return an error to stop the walk. Container
@@ -213,6 +233,10 @@ typedef struct lc_pouch_storage_ops {
   int (*replay_suffix)(void *, void *, const lc_pouch_storage_namespace_info *,
                        uint64_t start, lc_pouch_storage_visit_fn, void *,
                        lc_error *);
+  /* A closed checkpoint can reuse unchanged physical slots. On a capture
+   * conflict the caller may request a fresh projection with no prior slots. */
+  int (*refresh_state)(void *, void *, lc_pouch_storage_namespace_info *,
+                       const lc_pouch_storage_state_refresh *, lc_error *);
   /* Rotation target and known span. PREFIX permits an unknown remainder;
    * COMPLETE requires the declared size, MAINTENANCE additionally permits
    * spending protected work capacity. Reserve all dependencies before staging.

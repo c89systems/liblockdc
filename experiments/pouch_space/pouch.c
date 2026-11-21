@@ -212,6 +212,13 @@ static int replay_suffix(void *context, void *ns,
   ps_namespace_view_close(view);
   return rc;
 }
+static int refresh_state(void *context, void *ns,
+                         lc_pouch_storage_namespace_info *info,
+                         const lc_pouch_storage_state_refresh *refresh,
+                         lc_error *e) {
+  (void)context;
+  return ps_namespace_refresh_state(ns, info, refresh, e);
+}
 static int append_begin(void *context, void *ns, uint64_t target,
                         uint64_t minimum,
                         enum lc_pouch_storage_append_mode mode,
@@ -821,6 +828,7 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  namespaces_visit,
                                                  replay,
                                                  replay_suffix,
+                                                 refresh_state,
                                                  append_begin,
                                                  append_commit,
                                                  append_close,

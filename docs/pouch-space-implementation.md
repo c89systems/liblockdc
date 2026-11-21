@@ -12363,3 +12363,100 @@ checking the applied boundary and the current complete slot set.
 Verification passed 35 GNU Release groups and 24 groups each on Debug
 ASan/UBSan and musl Release. Raw timing, fault coverage and replay
 diagnostics are under `build/pouch-space-concurrent/state-refresh/`.
+
+## Incremental logical checkpoint refresh
+
+A coordinated Pouch handle now retains the IDs and incarnations of the
+selected state slots. The cursor owns only identities and holds no payload
+pins. The next closed checkpoint can reuse a slot when its incarnation
+matches. Capture under allocator authority retains payloads only for changed
+or new slots. The logical namespace guard protects the resident records
+through application. A local mutation or checkpoint reference update
+invalidates the affected identity.
+
+The capture must cover its active stream through the selected tail.
+Metadata-only namespaces certify a zero stream incarnation. Selected rows
+replace their resident versions from canonical metadata, including an append
+already applied at the same logical generation. The applied key count must
+match the selected slot count. A missing previous slot or a mismatched
+binding triggers a complete capture. Open suffixes retain ordinary
+checkpoint replay or the existing same-stream suffix path. Decode and
+allocation failures invalidate the resident projection. Current checkpoint
+coverage and retained records supply the state and query watermarks.
+Decision recovery continues to use the complete decision view.
+
+The shared-state-delta fixture uses two handles in NoSync and encoded
+durable modes. It checks changed-slot counts, local mutation and insertion,
+a tail-only replay followed by checkpoint adoption at the same generation,
+and agreement on both watermarks. Failure after the first changed row
+invalidates the projection and a clean retry recovers the selected result.
+The fixture also exercises a missing prior identity, metadata-only refresh,
+and an old streaming reader held across replacement and failure.
+
+The final matched GNU Release rotation verified all nine endurance runs
+through reopen. Native completed three NoSync and two durable trials. The
+frozen `3a432809` native build and multifile ran once in each mode. Every
+trial wrote 192 MiB across 24 rows, 64 KiB values, 128 rounds and eight
+independent writers. The native root stayed at 10 MiB.
+
+Work and CPU through maintenance are in seconds. Mutation work is the
+longest worker's time accumulated in mutation phases. Mutation p95, close,
+reopen and verification are in milliseconds. Each index phase reports the
+longest worker for that phase. Native candidate figures are medians.
+
+| Backend | Durability | Work | CPU | Mutation work (s) | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 18.56 | 23.48 | 13.77 | 111.33 | 25.87 | 32.27 | 47.10 | 21.22 |
+| Native | Durable | 37.20 | 37.08 | 32.65 | 157.61 | 28.51 | 33.34 | 52.30 | 25.05 |
+| Prior native | NoSync | 21.36 | 31.70 | 16.34 | 123.19 | 25.47 | 30.66 | 48.07 | 22.12 |
+| Prior native | Durable | 41.26 | 42.53 | 36.35 | 162.43 | 23.08 | 30.66 | 48.20 | 21.78 |
+| Multifile | NoSync | 22.01 | 9.49 | 8.83 | 55.26 | 4.58 | 0.28 | 1.95 | 45.23 |
+| Multifile | Durable | 66.34 | 10.67 | 35.01 | 194.27 | 3.75 | 0.23 | 1.32 | 38.54 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 3.77 | 1.26 | 0.51 |
+| Native | Durable | 4.04 | 0.79 | 0.27 |
+| Prior native | NoSync | 3.67 | 1.54 | 0.52 |
+| Prior native | Durable | 4.42 | 0.95 | 0.34 |
+| Multifile | NoSync | 5.92 | 3.84 | 4.62 |
+| Multifile | Durable | 8.63 | 11.42 | 14.76 |
+
+Candidate NoSync CPU fell by 26% from the frozen native run in the same
+rotation. The candidate used 2.47 times multifile CPU, and its median
+mutation p95 rose from 76 ms in rounds 1–16 to 154 ms in rounds 113–128.
+All index phases still led the multifile control. Candidate peak RSS
+was about 108 MiB in NoSync and 112 MiB in durable mode, compared with
+about 16 MiB in the multifile controls.
+
+Separate queue and outbox controls verified 32 deliveries of 4 KiB with
+four independent writers and reopen. Each row reports one run. Queue
+initialization is warm. All figures are in milliseconds and CPU includes
+post-work maintenance.
+
+| Workflow | Durability | Backend | Work | CPU | Mutation p95 | Close | First reopen | Four live joins | Verify after reopen |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Queue | NoSync | Native | 39.00 | 68.21 | 6.59 | 0.65 | 5.55 | 1.02 | 0.37 |
+| Queue | NoSync | Multifile | 263.96 | 66.04 | 48.27 | 0.14 | 0.13 | 0.33 | 0.90 |
+| Queue | Durable | Native | 527.17 | 96.02 | 81.33 | 0.69 | 5.41 | 1.00 | 0.42 |
+| Queue | Durable | Multifile | 813.76 | 89.04 | 127.91 | 0.25 | 0.22 | 0.41 | 1.01 |
+| Outbox | NoSync | Native | 719.19 | 185.24 | 126.08 | 1.56 | 11.09 | 8.07 | 10.76 |
+| Outbox | NoSync | Multifile | 965.89 | 327.21 | 177.92 | 0.54 | 33.08 | 1.27 | 55.68 |
+| Outbox | Durable | Native | 1766.06 | 317.24 | 270.66 | 1.93 | 92.59 | 2.64 | 192.81 |
+| Outbox | Durable | Multifile | 3414.49 | 420.71 | 503.59 | 0.76 | 143.50 | 1.74 | 277.04 |
+
+The instrumented NoSync run decoded 82,609 slots across 3,223 refreshes.
+The 2,800 incremental refreshes decoded 6,391 of 549,465 selected slots.
+Total refresh CPU was 1.13 s. The physical-order replay from the previous
+stage decoded 624,091 slots and used 5.27 s. The instrumented durable run
+used 2.73 s of refresh CPU. It made 1,964 incremental refreshes and 1,411
+complete refreshes. Both profiles verified through reopen and recorded no
+refresh failures or fallbacks.
+
+Verification passed 47 GNU Release groups and 30 groups each on Debug
+ASan/UBSan and musl Release. The checks include encoded staged recovery,
+durable scope faults and process exits, shared queue and outbox delivery,
+XA durability, and source ownership under replacement. CPU, resident
+memory, late mutation latency, and indexed-workload reopen and close
+remain qualification gates. Raw results and diagnostics are under
+`build/pouch-space-concurrent/state-delta/`.
