@@ -157,7 +157,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_physical_claim_test)
-  foreach(mode lifecycle faults producers processes metadata-lifecycle metadata-faults metadata-processes metadata-producers)
+  foreach(mode lifecycle faults producers processes metadata-lifecycle metadata-faults metadata-processes metadata-producers metadata-credit-slots)
     add_test(NAME pouch_space_physical-claims_${mode}
       COMMAND pouch_space_physical_claim_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_physical-claims_${mode} PROPERTIES TIMEOUT 120

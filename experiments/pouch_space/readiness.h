@@ -3,6 +3,7 @@
 #include "space.h"
 typedef struct ps_readiness ps_readiness;
 #define PS_READINESS_WORDS 12U
+#define PS_READINESS_CREDIT_SLOTS 32U
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
   PS_READINESS_JOURNAL = 2,
@@ -23,6 +24,14 @@ typedef struct ps_readiness_certificate {
 int ps_readiness_attach(ps_space *, lc_error *);
 int ps_readiness_joined(const ps_space *);
 void ps_readiness_close(ps_space *);
+/* The credit slot lives with the owner's OFD. Acquisition and credit
+ * increases require allocator authority. A zero balance only clears a bit. */
+int ps_readiness_credit_reserve(ps_space *, lc_error *);
+int ps_readiness_credit_registered(const ps_space *);
+int ps_readiness_credit_publish(ps_space *);
+int ps_readiness_credit_collect(ps_space *, uint64_t *, uint64_t *, lc_error *);
+int ps_readiness_credit_spilled(const ps_space *);
+void ps_readiness_credit_note_spill(ps_space *);
 int ps_readiness_validate(ps_space *, lc_error *);
 int ps_readiness_opened(ps_space *, lc_error *);
 int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);

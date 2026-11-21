@@ -847,7 +847,9 @@ typedef struct query_gate {
 static int pause_query(void *context, int fd, int command, struct flock *lock) {
   query_gate *g = context;
   int credit = command == F_OFD_GETLK &&
-               (uint64_t)lock->l_start == PS_CREDIT_RECORD_BASE;
+               (uint64_t)lock->l_start >= PS_CREDIT_RECORD_BASE &&
+               (uint64_t)lock->l_start <
+                   PS_CREDIT_RECORD_BASE + PS_READINESS_CREDIT_SLOTS;
   int rc = fcntl(fd, command, lock);
   if (rc == 0 && credit) {
     pthread_mutex_lock(&g->mutex);
@@ -909,6 +911,8 @@ static void serialized(void) {
   ok(ps_open(path, 0, &bo, &b, &e), &e);
   ps_budget_plan baseline = {0, 1, 1, 0};
   ps_budget *held = NULL;
+  ok(ps_budget_open(a, &baseline, &held, &e), &e);
+  ok(ps_budget_close(held, &e), &e);
   ok(ps_budget_open(b, &baseline, &held, &e), &e);
   admission first = {a, NULL, &g, 0, 0}, second = {b, NULL, &g, 0, 1};
   pthread_t x, y;

@@ -1054,6 +1054,7 @@ int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
   void *mapping;
   int rc;
   if (!s->allocation_guard || s->credit_record ||
+      ps_readiness_credit_registered(s) ||
       (!s->reserved_metadata && !s->reserved_entries))
     return LC_OK;
   /* Keep contiguous prepared payload at the start of common intervals. */
@@ -1089,6 +1090,7 @@ int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
       if (rc == LC_OK) {
         s->credit_record = run;
         s->credit_words = words;
+        ps_readiness_credit_note_spill(s);
         return LC_OK;
       }
       (void)munmap(mapping, PS_PAGE);
@@ -1101,7 +1103,18 @@ int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
 void ps_internal_budget_publish_record(ps_space *s) {
   ps_run *run = s->credit_record;
   ps_coordination_guard *guard = NULL;
-  if (!run || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+  if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
+    return;
+  if (ps_readiness_credit_registered(s)) {
+    if (!ps_readiness_credit_publish(s)) {
+      if (allocation_begin(s, &guard, NULL) == LC_OK)
+        (void)allocation_end(s, guard, LC_OK, NULL);
+      else
+        __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+    }
+    return;
+  }
+  if (!run)
     return;
   if (s->reserved_metadata || s->reserved_entries) {
     if (__atomic_load_n(s->credit_words, __ATOMIC_RELAXED) ==
@@ -1174,9 +1187,12 @@ static int peer_credits(ps_space *s, lc_error *error) {
   if (!s->allocation_guard || s->credit_totals_checked)
     return LC_OK;
   s->peer_metadata_credits = s->peer_entry_credits = 0;
-  rc = peer_credits_read(s, PS_CREDIT_RECORD_BASE, PS_TRANSACTION_GUARD_BASE,
-                         &s->peer_metadata_credits, &s->peer_entry_credits,
-                         error);
+  rc = ps_readiness_credit_collect(s, &s->peer_metadata_credits,
+                                   &s->peer_entry_credits, error);
+  if (rc == LC_OK && ps_readiness_credit_spilled(s))
+    rc = peer_credits_read(s, credit_record_slot(PS_DATA),
+                           PS_TRANSACTION_GUARD_BASE, &s->peer_metadata_credits,
+                           &s->peer_entry_credits, error);
   s->credit_totals_checked = rc == LC_OK;
   return rc;
 }
@@ -3484,11 +3500,16 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
                              const ps_budget_plan *proposed, lc_error *e) {
   ps_budget_plan empty = {0};
   uint64_t floor = maintenance ? 0 : PS_MAINTENANCE_RESERVE, missing = 0;
-  uint64_t record = s->allocation_guard && !s->credit_record &&
-                            (s->reserved_metadata || s->reserved_entries)
-                        ? PS_PAGE
-                        : 0;
+  uint64_t record = 0;
   int rc, attempted = 0;
+  if (s->allocation_guard && !s->credit_record &&
+      (s->reserved_metadata || s->reserved_entries)) {
+    rc = ps_readiness_credit_reserve(s, e);
+    if (rc != LC_OK)
+      return rc;
+    if (!ps_readiness_credit_registered(s))
+      record = PS_PAGE;
+  }
   rc = capacity_allowance(s, s->metadata, s->live_entries, record, floor, NULL,
                           &missing, e);
   if (rc != LC_ERR_INVALID || !missing)

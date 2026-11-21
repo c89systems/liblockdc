@@ -13154,3 +13154,109 @@ also identify the explicit phase barriers on both paths.
 
 Raw workloads, traces, and test logs are under
 `build/pouch-space-concurrent/allocator-hot/`.
+
+## Shared readiness slots for budget credits
+
+Two traced 96 MiB indexed runs identified allocator locking and credit
+discovery as recurring CPU costs. In NoSync, readers issued 41,333 direct
+and 31,278 batched range acquisitions. Credit discovery issued 177,123
+kernel queries and read a physical page record for each live credit it
+found. It often ran while a writer held allocator authority.
+
+The readiness page now has 32 slots for metadata and entry credits. An
+owner registers one slot on its first budget and keeps its OFD witness
+until close. Under allocator authority, peers check only advertised
+balances and count them only while the witness is held. A zero balance
+clears its active bit without erasing the previous balance. A peer that
+already sampled the bit can conservatively count that previous balance.
+A dead owner's stale bit is discarded after a negative kernel query.
+Additional owners use a page-backed credit record. A cohort that has
+used a page record continues checking that range until the last close.
+Concrete payload reservations and reader pins retain their existing
+ownership rules.
+
+SQLite's WAL index pairs shared read marks with byte locks, and LMDB
+reuses an owner's shared slot across transactions. Pouch applies those
+ideas to capacity admission, with a kernel liveness check for each
+positive balance. [SQLite WAL-index lock layout](https://www.sqlite.org/walformat.html#wal_locks),
+[Howard Chu on LMDB slots and liveness, section 4.2](https://concurrentes-fiuba.github.io/papers_final/20120829-LinuxCon-MDB-txt.pdf)
+
+The credit table uses part of the existing readiness page. Advisory zero
+and witness bitmaps cover 52.25 MiB of payload space, down from 60.5 MiB.
+The ordinary physical checks cover ranges beyond those bitmaps. The
+readiness marker changes for the live cohort. The earlier binary refused
+to join an active revised cohort, and a revised peer still joined it.
+Both builds reopened and verified data from the other's closed checkpoint
+image at 10 MiB.
+
+The 33-owner fixture fills the table, faults registration of the spill
+record, and checks capacity accounting through spill release and slot
+reuse. The process fixture checks that a live peer honors held credits
+and can spend the recovered headroom after ordinary release or `SIGKILL`.
+The serialized admission fixture pauses a peer credit query while an
+independent publication guard remains available. Verification passed
+78 GNU Release groups and 38 each on musl and ASan/UBSan, including
+explicit growth, recovery, shared leases and transactional messaging.
+
+In a traced 96 MiB run per mode, credit queries fell from 177,123 to
+97,354 in NoSync and from 206,913 to 117,620 in durable mode. The earlier
+build acquired and released about 6,300 budget credit witnesses in
+each run. The revised build registered nine per run and released them
+on close. The uninstrumented workloads below measure the runtime effect.
+
+All 31 matched workflows verified. Indexed workloads had eight writers
+and fixed 10 MiB native roots. The single-file builds ran three pairs
+at 96 MiB NoSync, two at 96 MiB durable, and three at 192 MiB NoSync.
+The prior binary is `07277190`. Each indexed shape has one fresh
+multifile reference. Figures are medians where repeated. Work and CPU
+are in seconds. The p95 columns are in milliseconds, with the late
+window covering the last 16 rounds.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 7.20 | 7.12 | 90.60 | 101.56 |
+| 96 MiB NoSync | Revised | 6.37 | 6.51 | 81.06 | 92.08 |
+| 96 MiB NoSync | Multifile | 12.35 | 4.67 | 62.56 | 61.12 |
+| 96 MiB durable | Prior | 14.72 | 8.87 | 120.75 | 136.78 |
+| 96 MiB durable | Revised | 14.52 | 8.60 | 119.63 | 137.02 |
+| 96 MiB durable | Multifile | 40.49 | 6.86 | 231.78 | 218.88 |
+| 192 MiB NoSync | Prior | 18.68 | 24.59 | 120.44 | 151.68 |
+| 192 MiB NoSync | Revised | 17.74 | 22.79 | 110.63 | 150.02 |
+| 192 MiB NoSync | Multifile | 24.82 | 11.32 | 66.88 | 74.08 |
+
+CPU fell in each 96 MiB pair. At 192 MiB, CPU rose by 1.16 and 1.35 s
+in two pairs and fell by 3.92 s in the third. Elapsed work, mutation p95,
+and late-window p95 improved in two of the three long pairs.
+
+Index phases give the longest worker in seconds. First owner, eight
+live joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.69 | 0.26 | 0.09 | 13.52 | 21.83 | 12.60 | 14.81 |
+| 96 MiB NoSync | Revised | 1.55 | 0.26 | 0.10 | 13.67 | 21.56 | 13.89 | 16.74 |
+| 96 MiB NoSync | Multifile | 3.55 | 2.49 | 2.72 | 0.36 | 1.86 | 27.32 | 3.92 |
+| 96 MiB durable | Prior | 1.75 | 0.13 | 0.04 | 13.29 | 22.27 | 12.14 | 11.78 |
+| 96 MiB durable | Revised | 1.73 | 0.15 | 0.05 | 15.71 | 24.65 | 12.61 | 15.71 |
+| 96 MiB durable | Multifile | 5.32 | 7.18 | 9.59 | 0.32 | 1.23 | 27.12 | 3.08 |
+| 192 MiB NoSync | Prior | 3.85 | 0.91 | 0.36 | 34.86 | 48.07 | 24.94 | 39.55 |
+| 192 MiB NoSync | Revised | 3.56 | 0.79 | 0.30 | 29.90 | 41.57 | 25.55 | 27.70 |
+| 192 MiB NoSync | Multifile | 6.88 | 4.04 | 4.58 | 0.38 | 1.85 | 53.44 | 4.73 |
+
+Warmed queue and durable outbox ran twice per build with two writers.
+Times are medians in milliseconds.
+
+| Workload | Metric | Prior single-file | Revised single-file | Multifile |
+| --- | --- | ---: | ---: | ---: |
+| Warmed queue | Work / CPU / p95 | 15.66 / 22.02 / 2.23 | 8.56 / 14.77 / 1.57 | 81.27 / 25.90 / 18.03 |
+| Durable outbox | Work / CPU / p95 | 1218.20 / 122.67 / 228.20 | 963.89 / 110.78 / 188.21 | 1452.05 / 173.22 / 287.56 |
+
+A separate 96 MiB NoSync trace sampled 699 allocator acquisitions. The
+largest immediate callers were budget open (113), revision publication
+(109), value read open (93), and namespace admission (91). Read open for
+query artifacts accounted for 57 samples. Key metadata preparation and
+delta planning accounted for 90 budget opens together. This locates
+remaining allocator traffic on the revised path.
+
+Raw workloads, interoperability checks, call stacks, and test logs are
+under `build/pouch-space-concurrent/reader-witness/`.

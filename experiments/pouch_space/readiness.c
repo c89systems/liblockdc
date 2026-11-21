@@ -14,18 +14,25 @@
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x4159444145525350)
+#define READY_MAGIC UINT64_C(0x4259444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
 #define ACTIVITY_WORD (PENDING_WORD - 1)
 #define PREPARATION_WORD (ACTIVITY_WORD - 1)
 #define SYNC_WORD (PREPARATION_WORD - 1)
+#define CREDIT_SPILL (SYNC_WORD - 1)
+#define CREDIT_ACTIVE (CREDIT_SPILL - 1)
+#define CREDIT_RECORDS (CREDIT_ACTIVE - 2 * PS_READINESS_CREDIT_SLOTS)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
-#define BITMAP_WORDS ((SYNC_WORD - 2 * WORDS) / 2)
+#define BITMAP_WORDS ((CREDIT_RECORDS - 2 * WORDS) / 2)
 #define ZERO_BITMAP (2 * WORDS)
 #define WITNESS_BITMAP (ZERO_BITMAP + BITMAP_WORDS)
 #define BITMAP_END (PS_DATA + (uint64_t)BITMAP_WORDS * 64 * PS_PAGE)
+#if PS_READINESS_CREDIT_SLOTS >= 64 ||                                         \
+    PS_READINESS_CREDIT_SLOTS > PS_DATA / PS_PAGE
+#error "credit slots must fit in the bitmap and below dynamic credit witnesses"
+#endif
 enum readiness_word {
   GENERATION,
   MAGIC,
@@ -45,12 +52,110 @@ enum readiness_word {
  */
 struct ps_readiness {
   uint64_t *page;
+  uint64_t credit_metadata, credit_entries;
+  unsigned int credit_slot;
   int existing, active;
 };
 static int failed(ps_space *s, lc_error *e, const char *message) {
   __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELEASE);
   lc_error_set(e, LC_ERR_TRANSPORT, 0, message, NULL, NULL, "pouch-space");
   return LC_ERR_TRANSPORT;
+}
+int ps_readiness_credit_registered(const ps_space *s) {
+  return s->readiness && s->readiness->credit_slot < PS_READINESS_CREDIT_SLOTS;
+}
+int ps_readiness_credit_reserve(ps_space *s, lc_error *e) {
+  ps_readiness *r = s->readiness;
+  uint64_t offset, first, last;
+  unsigned int i;
+  int rc;
+  if (!r || ps_readiness_credit_registered(s))
+    return LC_OK;
+  for (i = 0; i < PS_READINESS_CREDIT_SLOTS; ++i) {
+    offset = PS_CREDIT_RECORD_BASE + i;
+    rc = ps_coordination_conflict(s->coordination, offset, 1, &first, &last, e);
+    if (rc != LC_OK)
+      return rc;
+    if (first != last)
+      continue;
+    rc = ps_coordination_range(s->coordination, offset, 1, 1, e);
+    if (rc != LC_OK)
+      return rc;
+    /* Acquisition and peer sums share allocator authority. A previous OFD
+     * can leave a positive bit on death, including during publication. */
+    (void)__atomic_fetch_and(r->page + CREDIT_ACTIVE, ~(UINT64_C(1) << i),
+                             __ATOMIC_RELEASE);
+    r->credit_slot = i;
+    break;
+  }
+  return LC_OK;
+}
+int ps_readiness_credit_publish(ps_space *s) {
+  ps_readiness *r = s->readiness;
+  uint64_t *record, bit;
+  if (r->credit_metadata == s->reserved_metadata &&
+      r->credit_entries == s->reserved_entries)
+    return 1;
+  bit = UINT64_C(1) << r->credit_slot;
+  if (!s->reserved_metadata && !s->reserved_entries) {
+    /* Peers that already observed our bit can still count the previous
+     * promise. Only new positive promises need the allocator. */
+    (void)__atomic_fetch_and(r->page + CREDIT_ACTIVE, ~bit, __ATOMIC_RELEASE);
+  } else {
+    if (!s->allocation_guard)
+      return 0;
+    record = r->page + CREDIT_RECORDS + 2 * r->credit_slot;
+    __atomic_store_n(record, s->reserved_metadata, __ATOMIC_RELAXED);
+    __atomic_store_n(record + 1, s->reserved_entries, __ATOMIC_RELAXED);
+    (void)__atomic_fetch_or(r->page + CREDIT_ACTIVE, bit, __ATOMIC_RELEASE);
+  }
+  r->credit_metadata = s->reserved_metadata;
+  r->credit_entries = s->reserved_entries;
+  return 1;
+}
+int ps_readiness_credit_collect(ps_space *s, uint64_t *metadata,
+                                uint64_t *entries, lc_error *e) {
+  ps_readiness *r = s->readiness;
+  const uint64_t *record;
+  uint64_t active, offset, first, last, bytes, count, bit;
+  unsigned int slot;
+  int rc;
+  if (!r)
+    return LC_OK;
+  active = __atomic_load_n(r->page + CREDIT_ACTIVE, __ATOMIC_ACQUIRE) &
+           ((UINT64_C(1) << PS_READINESS_CREDIT_SLOTS) - 1);
+  if (ps_readiness_credit_registered(s))
+    active &= ~(UINT64_C(1) << r->credit_slot);
+  while (active) {
+    slot = (unsigned int)__builtin_ctzll(active);
+    bit = UINT64_C(1) << slot;
+    active &= ~bit;
+    offset = PS_CREDIT_RECORD_BASE + slot;
+    rc = ps_coordination_conflict(s->coordination, offset, 1, &first, &last, e);
+    if (rc != LC_OK)
+      return rc;
+    if (first == last) {
+      (void)__atomic_fetch_and(r->page + CREDIT_ACTIVE, ~bit, __ATOMIC_RELEASE);
+      continue;
+    }
+    record = r->page + CREDIT_RECORDS + 2 * slot;
+    bytes = __atomic_load_n(record, __ATOMIC_RELAXED);
+    count = __atomic_load_n(record + 1, __ATOMIC_RELAXED);
+    if (bytes > UINT64_MAX - *metadata || count > UINT64_MAX - *entries)
+      return lc_error_set(e, LC_ERR_PROTOCOL, 0,
+                          "shared budget credit totals overflow", NULL, NULL,
+                          "pouch-space");
+    *metadata += bytes;
+    *entries += count;
+  }
+  return LC_OK;
+}
+int ps_readiness_credit_spilled(const ps_space *s) {
+  return s->readiness &&
+         __atomic_load_n(s->readiness->page + CREDIT_SPILL, __ATOMIC_ACQUIRE);
+}
+void ps_readiness_credit_note_spill(ps_space *s) {
+  __atomic_store_n(s->readiness->page + CREDIT_SPILL, 1, __ATOMIC_RELEASE);
 }
 static uint64_t record_crc(const uint64_t *record) {
   return (uint64_t)crc32(0, (const unsigned char *)record,
@@ -235,6 +340,7 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
     return rc;
   }
   r->existing = first != last;
+  r->credit_slot = PS_READINESS_CREDIT_SLOTS;
   r->page = mmap(NULL, PS_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd,
                  PS_READINESS_OFFSET);
   if (r->page == MAP_FAILED) {
@@ -244,9 +350,12 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
   s->readiness = r;
   /* The first owner resets witnesses before claiming any dynamic workspace.
    * Unlike member handles, read-only imports can survive this reset. */
-  if (!r->existing)
+  if (!r->existing) {
+    __atomic_store_n(r->page + CREDIT_ACTIVE, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(r->page + CREDIT_SPILL, 0, __ATOMIC_RELEASE);
     for (i = 0; i < BITMAP_WORDS; ++i)
       __atomic_store_n(r->page + WITNESS_BITMAP + i, 0, __ATOMIC_RELEASE);
+  }
   return ps_coordination_range(s->coordination, MEMBER_OFFSET, 1, 1, e);
 }
 void ps_readiness_close(ps_space *s) {
