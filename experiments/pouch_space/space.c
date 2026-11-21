@@ -2454,6 +2454,12 @@ static int capacity_allowance(ps_space *s, uint64_t bytes, uint64_t entries,
   int rc = ps_internal_budget_check(s, budget, payload, growth, added, error);
   if (rc != LC_OK)
     return rc;
+  /* Shared admission counts exact outstanding credits in the checkpoint
+   * bound. With no additional physical pages to acquire, exchanging a credit
+   * for selected metadata cannot increase that bound. Rollover still proves
+   * the ranges it actually borrows when it prepares a checkpoint. */
+  if (budget && !payload && s->allocation_guard)
+    return LC_OK;
   /* The owner's positive growth is already present in aggregate future
    * credits. Keep that protection until publication, including through peer
    * checkpoints while a writer performs private payload I/O. */
@@ -3377,9 +3383,14 @@ int ps_internal_budget_admit(ps_space *s, int maintenance,
                         : 0;
   int rc, attempted = 0;
   rc = capacity_allowance(s, s->metadata, s->live_entries, record, floor, NULL,
-                          proposed ? &missing : NULL, e);
+                          &missing, e);
   if (rc != LC_ERR_INVALID || !missing)
     return rc;
+  /* Raising the standing maintenance floor may need the same retirement
+   * pass as opening or growing a budget. It has no tentative credits to
+   * remove while the checkpoint runs. */
+  if (!proposed)
+    proposed = &empty;
   if (!prior)
     prior = &empty;
   s->reserved_payload =
@@ -5706,7 +5717,9 @@ static int flush_writer_batch(ps_writer *const *writers, size_t count,
   if (i == count)
     return LC_OK;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_admission_begin(s, &guard, error);
+  /* Existing packed pages prove their individual witnesses. A new page or
+   * unbudgeted growth refreshes physical ownership through admission. */
+  rc = ps_internal_capture_begin(s, &guard, error);
   for (j = i; rc == LC_OK && j < count; ++j) {
     first[j] = writers[j]->entry->count;
     rc = reserve_writer_tail(writers[j], error);
@@ -5778,7 +5791,7 @@ static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
   durable = s->durable || w->entry->key.kind == PS_CONTROL ||
             w->entry->key.kind == PS_OWNED_RUN;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_admission_begin(s, &guard, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   old = lookup(s, w->entry->key);
   prior = old && !old->deleted ? entry_bytes(old) : 0;
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN &&
@@ -5907,7 +5920,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
   if (rc != LC_OK)
     goto done;
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_admission_begin(s, &guard, error);
+  rc = ps_internal_capture_begin(s, &guard, error);
   if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
                       count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
@@ -7885,7 +7898,7 @@ select_run:
   }
   pthread_mutex_lock(&s->mutex);
   if (rc == LC_OK)
-    rc = ps_internal_admission_begin(s, &guard, error);
+    rc = ps_internal_capture_begin(s, &guard, error);
   if (rc == LC_OK)
     rc = stream_structure_ready(s, head->entry, error);
   if (rc == LC_OK && spare)
@@ -7903,9 +7916,9 @@ select_run:
       spare = NULL;
     }
   }
-  /* Preparation released allocator authority. Recheck against peer metadata
-   * growth before installing this new grant's descriptor. Its payload is
-   * already privately owned, so no second payload charge is required. */
+  /* Preparation released allocator authority. Revalidate the current
+   * selection and the descriptor's allowance. The grant already owns its
+   * physical bytes, so publication only spends metadata credits. */
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream_sealed ||
                       stream_lookup(s, head->entry->token) != head->entry ||
                       base != head->entry->stream_capacity))

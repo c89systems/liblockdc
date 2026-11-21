@@ -12053,3 +12053,82 @@ conversion with explicit growth and crash recovery, reader and writer
 ownership, journal replay, and shared lease and messaging capacity.
 Raw runs and the two retained images are under
 `build/pouch-space-concurrent/physical-order/`.
+
+## Funded publication and maintenance reserve admission
+
+Budget admission protects the packed checkpoint bound including outstanding
+metadata credits. Publication with no new payload pages now verifies the
+local budget against the selected prefix and converts those credits into
+live metadata under allocator authority. A packed write checks the witness
+on its candidate page. Taking a new physical page, extending the standing
+reserve or rolling the journal into a checkpoint still verifies the
+applicable capacity and ownership.
+
+In two 96 MiB NoSync traces per build, mean dynamic range queries fell from
+293,949 to 248,320 and mean peer credit queries fell from 230,406 to 151,828.
+Both traces on each build verified through reopen. The uninstrumented 96 MiB
+pairs were mixed. Median native NoSync work increased from 9.52 to 10.08 s
+and mutation p95 from 106.03 to 114.68 ms. Durable work went from 17.51 to
+17.32 s, with process CPU through maintenance falling from 14.87 to 13.87 s.
+These pairs isolate the publication change before the reserve retry was added.
+
+The lifecycle workload now extends to 128 rounds, or 192 MiB at the same
+24 rows, 64 KiB values and eight independent producer handles. The root
+stays at 10 MiB. The funded-only build refused NoSync mutations in both
+uninstrumented trials. Two traces also reproduced refusals. One stack
+identified lease-update prefix admission through `ps_reserve_open`.
+It refused a 4 KiB shortfall while more than 3 MiB of deleted stream
+ranges awaited checkpoint retirement.
+
+An increased maintenance reserve now uses the same one-pass retirement
+forecast and checkpoint retry as budget admission. A tentative reserve
+changes the requested floor. The checkpoint runs with the already admitted
+budget totals, then the caller recomputes capacity before accepting the
+reserve. A failed check or checkpoint restores the caller's prior reserve
+state.
+
+A deterministic fixture first refuses the increased reserve while a peer's
+reader holds the only retireable payload. After the reader closes, one
+checkpoint funds the reserve. The same fixture injects failure at each of
+the three sync barriers, checks the original budget and reserve accounting,
+and verifies the durable deletion and unaffected value on cold reopen.
+Other fixtures prove a funded revision still checks ownership at rollover,
+and a packed write avoids a page held by a peer reader.
+
+The final GNU Release rotation attempted four native NoSync runs and two
+native durable runs at 192 MiB. Three NoSync runs, one durable run and both
+multifile controls verified through reopen. The two remaining native runs
+returned `LC_ERR_PENDING` acquiring file authority. A separate reproduction
+identified the 250 ms pressure handoff for namespace state authority during
+lease release. The benchmark now reports OS error detail with the worker
+failure. The final rotation recorded no protected-capacity refusal.
+
+Times below are medians of successful runs. Work, CPU and index phases are
+in seconds. Mutation p95, close, reopen and verification are in milliseconds.
+CPU includes maintenance. Index phase times are the maximum across workers
+in each run.
+
+| Backend | Durability | Work | CPU | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Native | NoSync | 33.09 | 46.69 | 201.06 | 26.66 | 29.54 | 50.06 | 34.50 |
+| Multifile | NoSync | 21.91 | 9.55 | 55.01 | 4.30 | 0.23 | 1.25 | 41.57 |
+| Native | Durable | 48.21 | 51.79 | 226.78 | 28.34 | 30.89 | 51.36 | 34.07 |
+| Multifile | Durable | 68.25 | 11.47 | 198.43 | 3.22 | 0.30 | 1.45 | 37.55 |
+
+| Backend | Durability | Index flush | First query pass | Repeat query pass |
+| --- | --- | ---: | ---: | ---: |
+| Native | NoSync | 4.30 | 1.71 | 0.86 |
+| Multifile | NoSync | 6.02 | 3.32 | 4.68 |
+| Native | Durable | 5.01 | 1.37 | 0.43 |
+| Multifile | Durable | 8.36 | 10.80 | 14.85 |
+
+Native NoSync median mutation p95 rises from 74 ms in rounds 1–16 to 288 ms
+in rounds 113–128. Peak RSS is about 102 MiB for native NoSync and 15 MiB for
+multifile. The longer run exposes CPU and late-window latency growth alongside
+the namespace handoff failures. These remain qualification gates.
+
+Verification passed 34 GNU Release groups and 15 groups each on Debug
+ASan/UBSan and musl Release. This covers shared lease and messaging pressure,
+funded revisions, fault recovery, and root conversion with explicit growth.
+Raw runs, capacity traces, and handoff diagnostics are under
+`build/pouch-space-concurrent/allocator-tail/`.

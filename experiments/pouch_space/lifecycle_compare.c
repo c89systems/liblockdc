@@ -20,7 +20,7 @@
 #include <unistd.h>
 
 typedef struct comparison comparison;
-enum { ROUNDS_PER_WINDOW = 16, MAX_ROUNDS = 64 };
+enum { ROUNDS_PER_WINDOW = 16, MAX_ROUNDS = 128 };
 typedef struct work_window {
   double started, finished;
 } work_window;
@@ -552,9 +552,10 @@ static void *run_worker(void *context) {
     require(!job, "stateful cleanup probe has no remaining delivery");
   }
   if (w->result != LC_OK)
-    fprintf(stderr, "worker %zu in %s (revision %zu), error %d: %s [%s]\n",
+    fprintf(stderr, "worker %zu in %s (revision %zu), error %d: %s [%s]%s%s\n",
             w->ordinal, phase, w->revision, w->result,
-            e.message ? e.message : "", e.server_code ? e.server_code : "");
+            e.message ? e.message : "", e.server_code ? e.server_code : "",
+            e.detail ? " " : "", e.detail ? e.detail : "");
   lc_error_cleanup(&e);
   return NULL;
 }

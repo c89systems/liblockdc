@@ -5901,6 +5901,105 @@ static void *replace_piece_at_barrier(void *context) {
   lc_error_cleanup(&e);
   return NULL;
 }
+typedef struct admission_queries {
+  size_t ranges, credits;
+} admission_queries;
+static int count_admission_queries(void *context, int fd, int command,
+                                   struct flock *lock) {
+  admission_queries *queries = context;
+  uint64_t offset = (uint64_t)lock->l_start;
+  if (command == F_OFD_GETLK) {
+    if (offset >= PS_DATA && offset < PS_MAX_CAPACITY)
+      ++queries->ranges;
+    if (offset >= PS_CREDIT_RECORD_BASE && offset < PS_TRANSACTION_GUARD_BASE)
+      ++queries->credits;
+  }
+  return fcntl(fd, command, lock);
+}
+static void funded_revision_conversion(int rollover) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_budget *local = NULL, *peer = NULL;
+  ps_writer *writers[2] = {NULL, NULL};
+  const ps_budget_plan plan = {2 * PS_CHUNK, 1024, 2, 0};
+  const ps_budget_plan foreign = {PS_MIB, 65536, 16, 0};
+  admission_queries queries = {0};
+  ps_coordination_io io = {&queries, count_admission_queries};
+  ps_options options = {.coordination_io = &io};
+  unsigned char body[PS_CHUNK];
+  uint64_t checkpoints;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_budget_open(a, &plan, &local, &e), &e);
+  ok(ps_budget_open(b, &foreign, &peer, &e), &e);
+  for (size_t i = 0; i < 2; ++i) {
+    memset(body, (int)(i + 1), sizeof(body));
+    ok(ps_begin(a, local, key(i + 1), &writers[i], &e), &e);
+    ok(ps_write(writers[i], body, sizeof(body), &e), &e);
+  }
+  if (rollover)
+    for (uint64_t i = 3; PS_JOURNAL - a->journal >= 128; ++i)
+      capture_put(a, i, 0);
+  checkpoints = status(a).checkpoints;
+  queries = (admission_queries){0};
+  ok(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  REQUIRE(status(a).checkpoints == checkpoints + rollover);
+  if (rollover)
+    REQUIRE(queries.credits && queries.ranges);
+  else
+    REQUIRE(!queries.credits && !queries.ranges);
+  ps_writer_close(writers[0]);
+  ps_writer_close(writers[1]);
+  expect_value(b, key(1), PS_CHUNK, 1);
+  expect_value(b, key(2), PS_CHUNK, 2);
+  ok(ps_budget_close(local, &e), &e);
+  ok(ps_budget_close(peer, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
+static void funded_packed_publication(int pinned) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_budget *local = NULL, *peer = NULL;
+  ps_writer *writer = NULL;
+  ps_reader *reader = NULL;
+  const ps_budget_plan plan = {PS_PAGE, 256, 1, 0};
+  const ps_budget_plan foreign = {PS_MIB, 65536, 16, 0};
+  admission_queries queries = {0};
+  ps_coordination_io io = {&queries, count_admission_queries};
+  ps_options options = {.coordination_io = &io};
+  unsigned char body[65];
+  memset(body, 2, sizeof(body));
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  capture_put(a, 1, 65);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_budget_open(a, &plan, &local, &e), &e);
+  ok(ps_budget_open(b, &foreign, &peer, &e), &e);
+  if (pinned)
+    ok(ps_read_open(b, key(1), NULL, &reader, &e), &e);
+  ok(ps_begin(a, local, key(2), &writer, &e), &e);
+  ok(ps_write(writer, body, sizeof(body), &e), &e);
+  queries = (admission_queries){0};
+  ok(ps_publish(writer, NULL, &e), &e);
+  REQUIRE(status(a).packed_pages == (pinned ? 2U : 1U));
+  if (pinned) {
+    REQUIRE(queries.ranges > 1 && queries.credits);
+    captured_expect(reader, 1, 65);
+  } else
+    REQUIRE(queries.ranges == 1 && !queries.credits);
+  ps_writer_close(writer);
+  ps_reader_close(reader);
+  expect_value(b, key(1), 65, 1);
+  expect_value(b, key(2), 65, 2);
+  ok(ps_budget_close(local, &e), &e);
+  ok(ps_budget_close(peer, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void capacity_checkpoint(int durable, int streaming, int resize,
                                 size_t fail_sync) {
   lc_error e = {0};
@@ -6010,6 +6109,71 @@ static void capacity_checkpoint(int durable, int streaming, int resize,
   }
   ok(ps_close(writer, &e), &e);
   free(body);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
+static void reserve_capacity_reclaim(int durable, size_t fail_sync) {
+  lc_error e = {0};
+  readiness_fault fault = {6, EIO, 0, 0, fail_sync};
+  ps_io io = {&fault,     read_io, durable_write, readiness_sync_fault,
+              reserve_io, NULL};
+  ps_options options = {.durable_sync = durable, .io = &io};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_reader *pin = NULL;
+  ps_budget *padding = NULL;
+  ps_reserve *reserve = NULL;
+  const ps_budget_plan plan = {PS_CHUNK, 512, 1, 0};
+  ps_budget_plan fill = {0};
+  ps_stats before, after;
+  int needed;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  capture_put(writer, 1, 4 * PS_CHUNK);
+  capture_put(writer, 2, 41);
+  ok(ps_checkpoint(writer, &e), &e);
+  options.io = NULL;
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  ok(ps_read_open(peer, key(1), NULL, &pin, &e), &e);
+  ok(ps_maintenance_pressure(writer, 1, &needed, &fill.payload_bytes, &e), &e);
+  REQUIRE(fill.payload_bytes > PS_MIB);
+  ok(ps_budget_open(writer, &fill, &padding, &e), &e);
+  ok(ps_delete(writer, key(1), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+
+  before = status(writer);
+  REQUIRE(ps_reserve_open(writer, &plan, 0, &reserve, &e) == LC_ERR_INVALID &&
+          !reserve);
+  lc_error_cleanup(&e);
+  after = status(writer);
+  REQUIRE(after.checkpoints == before.checkpoints &&
+          after.reserve_owners == before.reserve_owners);
+  captured_expect(pin, 1, 4 * PS_CHUNK);
+  ps_reader_close(pin);
+
+  if (fail_sync) {
+    fault.armed = 1;
+    REQUIRE(ps_reserve_open(writer, &plan, 0, &reserve, &e) ==
+                LC_ERR_TRANSPORT &&
+            !reserve && fault.calls == fail_sync);
+    lc_error_cleanup(&e);
+    REQUIRE(status(writer).reserve_owners == before.reserve_owners);
+  } else {
+    ok(ps_reserve_open(writer, &plan, 0, &reserve, &e), &e);
+    after = status(writer);
+    REQUIRE(after.checkpoints == before.checkpoints + 1 &&
+            after.reserve_owners == before.reserve_owners + 1 &&
+            after.reserve_payload_bytes == plan.payload_bytes);
+    expect_value(peer, key(2), 41, 2);
+    ps_reserve_close(reserve);
+  }
+  REQUIRE(status(writer).reserved_payload_bytes == fill.payload_bytes);
+  ok(ps_budget_close(padding, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  REQUIRE(status(writer).capacity == PS_DEFAULT_CAPACITY);
+  expect_value(writer, key(1), 0, 0);
+  expect_value(writer, key(2), 41, 2);
+  ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   lc_error_cleanup(&e);
 }
@@ -6610,15 +6774,22 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "projection-pressure"))
     projection_pressure();
   else if (!strcmp(argv[2], "capacity-checkpoint")) {
+    funded_revision_conversion(0);
+    funded_revision_conversion(1);
+    funded_packed_publication(0);
+    funded_packed_publication(1);
     for (int durable = 0; durable <= 1; ++durable) {
       capacity_checkpoint(durable, 0, 0, 0);
       capacity_checkpoint(durable, 0, 1, 0);
       capacity_checkpoint(durable, 1, 0, 0);
+      reserve_capacity_reclaim(durable, 0);
       packed_capacity_reclaim(durable, 0);
       stream_capacity_reclaim(durable, 0, 0);
     }
-    for (size_t sync = 1; sync <= 3; ++sync)
+    for (size_t sync = 1; sync <= 3; ++sync) {
       capacity_checkpoint(1, 0, 0, sync);
+      reserve_capacity_reclaim(1, sync);
+    }
   } else if (!strcmp(argv[2], "pressure-reclaim")) {
     pressure_reclaim(0, 0);
     pressure_reclaim(1, 0);
