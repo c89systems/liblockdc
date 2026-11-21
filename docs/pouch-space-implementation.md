@@ -11637,3 +11637,30 @@ recovery change.
 Shutdown logs and traces are in
 `build/pouch-space-concurrent/lifecycle-cost/`. The copied-layout reopen
 diagnostics are in `build/pouch-space-concurrent/recovery-cost/`.
+
+## Preserving staged deletes through lease renewal
+
+The transaction delete-and-renew failure found during shutdown qualification
+reproduced on both backends. A staged delete is a metadata-only record.
+Renewal used a body read for the staged key and therefore missed the marker.
+The private lease read also missed it and fell back to the committed body.
+
+Renewal now reads the staged metadata, including the marker. It reports an
+absent value with version zero and no state ETag while extending the active
+lease. A private lease body lookup can return either a captured stream or the
+bodyless delete marker from the same lookup. Private get maps that marker to
+an empty result. Public reads continue to see the committed value until the
+transaction selects its replacement.
+
+The fixture covers both backends, NoSync and durable mode, and plain and
+encrypted/compressed storage. It checks the lease's fencing token, the
+private and public views of the staged delete, and a streamed replacement
+written using the lease's default preconditions. The replacement's version
+and exact bytes survive commit and cold reopen. The prior single-file build
+fails the renewal version assertion.
+
+Verification passed 19 GNU Release, 18 Debug ASan/UBSan and 18 musl Release
+groups. Coverage includes the previously failing GNU multifile unit group,
+staged-publication barrier faults, process recovery, XA, shared queue/outbox
+transactions and fixed-capacity messaging. Logs are in
+`build/pouch-space-concurrent/lease-delete-renew/`.

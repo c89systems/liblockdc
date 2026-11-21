@@ -1839,6 +1839,77 @@ static void stage_barrier(const char *directory) {
   }
   shared_lease_fixture = 0;
 }
+static void stage_delete_renew(const char *directory) {
+  const char *replacement =
+      "{\"value\":43,\"description\":\"recreated after renewal\"}";
+  fixture *f = calloc(1, sizeof(*f));
+  lc_error e = {0};
+  REQUIRE(f);
+  shared_lease_fixture = 1;
+  for (int multifile = 0; multifile <= 1; ++multifile)
+    for (int sync = 0; sync <= 1; ++sync)
+      for (int crypto = 0; crypto <= 3; crypto += 3) {
+        char xid[LC_XID_STRING_SIZE];
+        now(1000);
+        setup(f, directory, multifile, sync, crypto, &e);
+        write_parent(f, "order", 0, 0, &e);
+        ok(lc_xid_new(xid, &e), &e);
+        lc_lease *lease = acquire(f, "order", xid, &e);
+        lc_version original = lease->version;
+        long fencing = lease->fencing_token;
+        REQUIRE(original > 0 && lease->state_etag);
+        ok(lease->remove(lease, NULL, &e), &e);
+        parent(f, "order", 1, 0, &e);
+
+        lc_keepalive_req renewal = {500};
+        ok(lease->keepalive(lease, &renewal, &e), &e);
+        REQUIRE(!lease->version && !lease->state_etag &&
+                lease->fencing_token == fencing);
+        lc_sink *sink = NULL;
+        lc_get_res got = {0};
+        ok(lc_sink_to_memory(&sink, &e), &e);
+        ok(lc_lease_get(lease, sink, NULL, &got, &e), &e);
+        REQUIRE(got.no_content);
+        lc_get_res_cleanup(&got);
+        lc_sink_close(sink);
+        sink = NULL;
+
+        producer next = source(replacement);
+        next.pub.impl = &next;
+        ok(lease->update(lease, &next.pub, NULL, &e), &e);
+        REQUIRE(next.at == next.length && next.calls >= 3 &&
+                lease->version == original + 2 && lease->state_etag);
+        parent(f, "order", 1, 0, &e);
+        lc_txn_participant participant = {.ns = "orders", .key = "order"};
+        lc_txn_decision_req decision;
+        lc_txn_decision_res decided = {0};
+        lc_txn_decision_req_init(&decision);
+        decision.txn_id = xid;
+        decision.participants = &participant;
+        decision.participant_count = 1;
+        ok(f->client->txn_commit(f->client, &decision, &decided, &e), &e);
+        lc_txn_decision_res_cleanup(&decided);
+        lc_lease_close(lease);
+
+        close_store(f);
+        open_store(f, 0, &e);
+        ok(lc_sink_to_memory(&sink, &e), &e);
+        ok(f->client->get(f->client, "order", NULL, sink, &got, &e), &e);
+        const void *bytes;
+        size_t length;
+        ok(lc_sink_memory_bytes(sink, &bytes, &length, &e), &e);
+        REQUIRE(!got.no_content && got.version == original + 2 &&
+                length == strlen(replacement) &&
+                !memcmp(bytes, replacement, length));
+        lc_get_res_cleanup(&got);
+        lc_sink_close(sink);
+        close_store(f);
+        retire(f);
+      }
+  shared_lease_fixture = 0;
+  free(f);
+  lc_error_cleanup(&e);
+}
 static int selected_commit(fixture *f, lc_error *e) {
   lc_pouch_retention_work work = {0};
   lc_pouch_state_read_result parent_state = {0}, journal = {0};
@@ -2049,6 +2120,8 @@ static void *worker(void *context) {
     release_barrier(r->directory);
   else if (!strcmp(r->mode, "stage-barrier"))
     stage_barrier(r->directory);
+  else if (!strcmp(r->mode, "stage-delete-renew"))
+    stage_delete_renew(r->directory);
   else if (!strcmp(r->mode, "shared-authority")) {
     shared_lease(r->directory);
     shared_wait_for_retention(r->directory);

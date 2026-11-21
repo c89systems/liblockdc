@@ -18427,8 +18427,15 @@ int lc_pouch_state_discard_staged(lc_pouch *pouch, const char *ns,
   return rc;
 }
 
+typedef enum lc_pouch_state_read_mode {
+  LC_POUCH_STATE_READ_METADATA,
+  LC_POUCH_STATE_READ_BODY,
+  LC_POUCH_STATE_READ_STAGED
+} lc_pouch_state_read_mode;
+
 static int lc_pouch_state_read_internal(lc_pouch *pouch, const char *ns,
-                                        const char *key, int include_body,
+                                        const char *key,
+                                        lc_pouch_state_read_mode mode,
                                         lc_pouch_state_read_result *out,
                                         lc_error *error) {
   lc_pouch_namespace_logstore *cache;
@@ -18436,7 +18443,7 @@ static int lc_pouch_state_read_internal(lc_pouch *pouch, const char *ns,
   lc_pouch_state_entry current;
   lc_pouch_namespace_manifest manifest;
   lc_pouch_state_cache_guard cache_guard;
-  int rc;
+  int rc, open_body, include_body = mode != LC_POUCH_STATE_READ_METADATA;
 
   if (pouch == NULL || ns == NULL || ns[0] == '\0' || key == NULL ||
       key[0] == '\0' || out == NULL) {
@@ -18467,14 +18474,16 @@ static int lc_pouch_state_read_internal(lc_pouch *pouch, const char *ns,
     lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
     goto cleanup_unlocked;
   }
-  if (include_body && !current.payload_span.present) {
+  open_body = include_body && current.payload_span.present;
+  if (include_body && !open_body &&
+      !(mode == LC_POUCH_STATE_READ_STAGED && current.staged_delete_marker)) {
     lc_pouch_state_entry_cleanup(&pouch->allocator, &current);
     lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
     goto cleanup_unlocked;
   }
   cache = lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
   record = cache != NULL ? lc_pouch_state_cache_record_find(cache, key) : NULL;
-  if (include_body && pouch->storage.ops == NULL &&
+  if (open_body && pouch->storage.ops == NULL &&
       lc_pouch_single_writer_enabled(pouch) && cache != NULL &&
       record != NULL) {
     char *payload_span_path;
@@ -18542,7 +18551,7 @@ static int lc_pouch_state_read_internal(lc_pouch *pouch, const char *ns,
     }
   } else {
     rc = lc_pouch_state_read_result_from_entry(pouch, ns, &manifest, &current,
-                                               include_body, out, error);
+                                               open_body, out, error);
   }
   lc_pouch_state_entry_cleanup(&pouch->allocator, &current);
   lc_pouch_namespace_manifest_cleanup(&pouch->allocator, &manifest);
@@ -18692,7 +18701,15 @@ int lc_pouch_state_read_metadata_view_locked(
 
 int lc_pouch_state_read(lc_pouch *pouch, const char *ns, const char *key,
                         lc_pouch_state_read_result *out, lc_error *error) {
-  return lc_pouch_state_read_internal(pouch, ns, key, 1, out, error);
+  return lc_pouch_state_read_internal(pouch, ns, key, LC_POUCH_STATE_READ_BODY,
+                                      out, error);
+}
+
+int lc_pouch_state_read_staged(lc_pouch *pouch, const char *ns, const char *key,
+                               lc_pouch_state_read_result *out,
+                               lc_error *error) {
+  return lc_pouch_state_read_internal(pouch, ns, key,
+                                      LC_POUCH_STATE_READ_STAGED, out, error);
 }
 
 int lc_pouch_state_copy(lc_pouch *pouch, const char *ns, const char *key,
@@ -18797,7 +18814,8 @@ int lc_pouch_state_read_metadata(lc_pouch *pouch, const char *ns,
                                  const char *key,
                                  lc_pouch_state_read_result *out,
                                  lc_error *error) {
-  return lc_pouch_state_read_internal(pouch, ns, key, 0, out, error);
+  return lc_pouch_state_read_internal(pouch, ns, key,
+                                      LC_POUCH_STATE_READ_METADATA, out, error);
 }
 
 static int lc_pouch_state_read_many_internal(

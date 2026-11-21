@@ -613,6 +613,10 @@ int lc_pouch_state_read_metadata_locked(lc_pouch *pouch, const char *ns,
 int lc_pouch_state_read_locked(lc_pouch *pouch, const char *ns, const char *key,
                                lc_pouch_state_read_result *out,
                                lc_error *error);
+/* Capture a staged body or its metadata-only delete marker in one lookup. */
+int lc_pouch_state_read_staged(lc_pouch *pouch, const char *ns, const char *key,
+                               lc_pouch_state_read_result *out,
+                               lc_error *error);
 /** Writes a full state record while the caller holds the key mutation lock. */
 int lc_pouch_state_write_locked(lc_pouch *pouch, const char *ns,
                                 const char *key, lc_source *body,

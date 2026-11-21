@@ -14127,8 +14127,8 @@ int lc_pouch_client_keepalive_method(lc_client *self,
     }
   }
   if (rc == LC_OK && staged_key != NULL) {
-    rc = lc_pouch_state_read(client->pouch, ns, staged_key, &staged_state,
-                             error);
+    rc = lc_pouch_state_read_metadata(client->pouch, ns, staged_key,
+                                      &staged_state, error);
   }
   if (rc == LC_OK && staged_state.found) {
     if (lc_pouch_state_result_is_delete_marker(&staged_state)) {
@@ -14138,7 +14138,7 @@ int lc_pouch_client_keepalive_method(lc_client *self,
       lc_free_local(state_etag);
       state_etag = NULL;
       out->version = 0L;
-    } else {
+    } else if (staged_state.has_body) {
       rc = lc_pouch_generation_to_version(staged_state.version, &out->version,
                                           error);
       if (rc == LC_OK && staged_state.etag != NULL) {
@@ -21969,8 +21969,8 @@ static int lc_pouch_lease_read_private_state(lc_lease_handle *lease,
     if (staged_key == NULL) {
       return error != NULL ? error->code : LC_ERR_NOMEM;
     }
-    rc = lc_pouch_state_read(lease->client->pouch, lease->ns, staged_key, out,
-                             error);
+    rc = lc_pouch_state_read_staged(lease->client->pouch, lease->ns, staged_key,
+                                    out, error);
     lc_free_with_allocator(NULL, staged_key);
     if (rc != LC_OK) {
       return rc;
