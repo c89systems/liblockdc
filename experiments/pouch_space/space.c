@@ -216,6 +216,26 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
  * a global wire prefix. Completed private writes can separately register a
  * ticket that precedes the shared barrier, without publishing a journal frame.
  */
+static int prepared_sync_acquire(ps_space *s, uint64_t ticket,
+                                 ps_coordination_guard **leader,
+                                 lc_error *error) {
+  uint32_t observed;
+  int rc;
+  for (;;) {
+    observed = ps_readiness_sync_observe(s);
+    if (ps_readiness_prepared_durable(s, ticket))
+      return healthy(s, error);
+    rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 0,
+                              leader, error);
+    if (rc != LC_ERR_PENDING)
+      return rc;
+    lc_error_cleanup(error);
+    if (!ps_readiness_sync_wait(s, observed))
+      break;
+  }
+  return ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
+                              leader, error);
+}
 static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
                           uint64_t required_wire, uint64_t *completed,
                           int *synced, lc_error *error) {
@@ -224,10 +244,16 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
   uint64_t target = 0, wire = 0, prepared = 0;
   int rc, covered = 0;
   *synced = 0;
-  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
-                            &leader, error);
+  rc = ticket && !required_wire
+           ? prepared_sync_acquire(s, ticket, &leader, error)
+           : ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
+                                  &leader, error);
   if (rc != LC_OK)
     return rc;
+  if (!leader) {
+    *completed = requested;
+    return LC_OK;
+  }
   pthread_mutex_lock(&s->mutex);
   rc = allocation_begin(s, &guard, error);
   if (rc == LC_OK)
@@ -269,6 +295,7 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
     }
   }
   ps_coordination_unlock(leader);
+  ps_readiness_sync_wake(s);
   if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
     lc_error_cleanup(error);
     rc = healthy(s, error);

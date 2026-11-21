@@ -16,9 +16,9 @@ typedef struct ps_readiness_certificate {
   uint64_t grant_used, grant_limit;
   uint64_t prepared_durable;
 } ps_readiness_certificate;
-/* Certificate access uses container allocation authority. Membership is an OFD
- * read witness at byte 3, separate from physical-reader presence at byte 2.
- * Certificates are volatile cohort state, not replay authority after reopen.
+/* Certificate updates and authoritative selection use allocation authority.
+ * Membership is an OFD read witness at byte 3, separate from the reader
+ * presence witness at byte 2. Certificates are volatile cohort state.
  */
 int ps_readiness_attach(ps_space *, lc_error *);
 int ps_readiness_joined(const ps_space *);
@@ -45,6 +45,12 @@ int ps_readiness_prepare_ticket(ps_space *, uint64_t *, lc_error *);
 uint64_t ps_readiness_issued_tickets(ps_space *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
                            uint64_t prepared, lc_error *);
+/* A stable checked snapshot can prove a private preparation ticket without
+ * allocation authority. Notifications carry no proof or authority. */
+int ps_readiness_prepared_durable(ps_space *, uint64_t ticket);
+uint32_t ps_readiness_sync_observe(ps_space *);
+int ps_readiness_sync_wait(ps_space *, uint32_t observed);
+void ps_readiness_sync_wake(ps_space *);
 /* Prepared pages are durably zeroed free payload capacity. The allocator
  * checks proofs under allocation authority and revokes them before spending
  * pages. A capacity reservation can retain the proof while bytes stay free. */

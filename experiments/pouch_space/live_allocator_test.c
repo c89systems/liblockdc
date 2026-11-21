@@ -2538,8 +2538,7 @@ static int durable_attempt(void *context, int fd, int command,
                            struct flock *lock) {
   durable_gate *g = context;
   if (lock->l_start == 5 && lock->l_type == F_WRLCK &&
-      (command == F_OFD_SETLKW ||
-       (cooperative_wait && command == F_OFD_SETLK))) {
+      (command == F_OFD_SETLKW || command == F_OFD_SETLK)) {
     pthread_mutex_lock(&g->mutex);
     g->attempted = 1;
     pthread_cond_broadcast(&g->cond);
@@ -2562,6 +2561,12 @@ static void *durable_flush(void *context) {
   pthread_cond_broadcast(&work->gate->cond);
   pthread_mutex_unlock(&work->gate->mutex);
   return NULL;
+}
+static void join_durability_waiter(pthread_t thread) {
+  struct timespec deadline;
+  REQUIRE(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+  deadline.tv_sec += 3;
+  REQUIRE(!pthread_timedjoin_np(thread, NULL, &deadline));
 }
 static void shared_durability(void) {
   for (int late = 0; late < 2; ++late) {
@@ -4113,6 +4118,103 @@ static void shared_preparation(enum preparation_barrier when) {
           !pthread_mutex_destroy(&leader.mutex));
   REQUIRE(!pthread_cond_destroy(&writer.cond) &&
           !pthread_mutex_destroy(&writer.mutex));
+}
+static int observe_sync_conflict(void *context, int fd, int command,
+                                 struct flock *lock) {
+  durable_gate *gate = context;
+  int rc, reason;
+  if (command == F_OFD_SETLKW)
+    return durable_attempt(context, fd, command, lock);
+  rc = fcntl(fd, command, lock);
+  reason = errno;
+  if (rc < 0 && (reason == EAGAIN || reason == EACCES) &&
+      command == F_OFD_SETLK && lock->l_start == 5 && lock->l_type == F_WRLCK) {
+    pthread_mutex_lock(&gate->mutex);
+    gate->attempted = 1;
+    pthread_cond_broadcast(&gate->cond);
+    pthread_mutex_unlock(&gate->mutex);
+  }
+  errno = reason;
+  return rc;
+}
+static void shared_preparation_wait(int owner_dies) {
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_coordination_io coordinator = {&gate, observe_sync_conflict};
+  ps_options options = {.coordination_io = &coordinator};
+  const ps_key stream = {88, 1, PS_STREAM};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_owned_status info;
+  grant_work grant = {0};
+  pthread_t thread;
+  lc_error e = {0};
+  int ready[2], lifetime[2], status_code, found;
+  unsigned char marker = 0x6a, byte = 0;
+
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_owned_open(writer, NULL, stream, 1, NULL, &grant.head, &info, &e), &e);
+  ok(ps_flush(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  capture_put(peer, 1, 65);
+  REQUIRE(!pipe(ready) && !pipe(lifetime));
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    struct flock lock = {
+        .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 5, .l_len = 1};
+    REQUIRE(!close(ready[0]) && !close(lifetime[1]) && !close(writer->fd) &&
+            !close(peer->fd));
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    REQUIRE(fd >= 0 && fcntl(fd, F_OFD_SETLK, &lock) == 0 &&
+            write(ready[1], "L", 1) == 1);
+    REQUIRE(read(lifetime[0], &byte, 1) == 0);
+    _exit(0);
+  }
+  REQUIRE(!close(ready[1]) && !close(lifetime[0]) &&
+          read(ready[0], &byte, 1) == 1 && byte == 'L' && !close(ready[0]));
+  uint64_t syncs = status(writer).syncs;
+  gate.attempted = 0;
+  REQUIRE(!pthread_create(&thread, NULL, prepare_grant, &grant));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.attempted)
+    pthread_cond_wait(&gate.cond, &gate.mutex);
+  pthread_mutex_unlock(&gate.mutex);
+  uint64_t ticket = ps_readiness_issued_tickets(writer);
+  REQUIRE(ticket > readiness(peer).prepared_durable);
+  if (owner_dies)
+    REQUIRE(!kill(child, SIGKILL));
+  else
+    ok(ps_checkpoint(peer, &e), &e);
+  /* Structural completion can satisfy the waiter while the OFD leader is
+   * still alive. A killed leader releases the OFD without sending a wake. */
+  join_durability_waiter(thread);
+  if (!owner_dies)
+    REQUIRE(!kill(child, SIGKILL));
+  REQUIRE(waitpid(child, &status_code, 0) == child &&
+          WIFSIGNALED(status_code) && WTERMSIG(status_code) == SIGKILL &&
+          !close(lifetime[1]));
+  REQUIRE(status(writer).syncs == syncs + (uint64_t)owner_dies &&
+          readiness(peer).prepared_durable >= ticket);
+
+  ok(ps_owned_write(grant.run, 0, &marker, 1, &e), &e);
+  ok(ps_owned_commit(grant.head, 1, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_owned_run_close(grant.run);
+  ps_owned_close(grant.head);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  ok(ps_owned_open(writer, NULL, stream, 0, &info.ref, &grant.head, &info, &e),
+     &e);
+  ok(ps_owned_grant(grant.head, NULL, 0, 0, &grant.run, &found, &e), &e);
+  REQUIRE(found && info.tail == 1);
+  ok(ps_owned_read(grant.run, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == marker);
+  ps_owned_run_close(grant.run);
+  ps_owned_close(grant.head);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
 }
 static void preparation_leaves_peer_headroom(void) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -5921,6 +6023,8 @@ int main(int argc, char **argv) {
     shared_preparation(READY_DURING_SYNC);
     shared_preparation(FAILED_SYNC);
     shared_preparation(READY_BEFORE_CHECKPOINT);
+    shared_preparation_wait(0);
+    shared_preparation_wait(1);
     preparation_leaves_peer_headroom();
   } else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();

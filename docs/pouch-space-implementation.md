@@ -11022,3 +11022,98 @@ Formatting and diff checks passed.
 
 Raw phase traces, copied-layout observations, benchmark runs, and test
 logs are in `build/pouch-space-concurrent/reopen-surface/`.
+
+## Completing private preparation from a certified ticket
+
+Across three eight-writer NoSync traces at fixed 10 MiB, 1,152
+foreground items accumulated 13.83 seconds waiting for sync leadership
+and 3.61 seconds inside sync I/O. A preparation ticket could already
+be covered by a peer's barrier while its owner was still waiting for
+the OFD sync lock.
+
+A preparation waiter can now complete from a checksummed readiness
+snapshot that covers its ticket. The reader checks both slot
+generations around the observation. The ticket acknowledges the
+captured local preparation sequence. Later local publications need
+their own coverage. A waiter with work left competes for the existing
+OFD sync lock and uses the authoritative certificate under allocator
+authority.
+
+The readiness page uses a process-shared futex for notifications.
+Successful preparation certification and release of sync leadership
+wake waiters. A four-millisecond retry handles a dead leader, whose
+OFD releases without sending a notification. An unavailable futex
+falls back to the blocking OFD path. The notification word conveys
+no durability or allocation authority. The volatile cohort marker
+fences participants using the previous readiness protocol.
+
+The held-leader fixture observes a real contended lock attempt, then
+uses a separate checkpoint to satisfy the ticket while the leader
+still holds the lock. The prior build fails that bounded completion
+check. A second fixture kills the contended leader and verifies one
+replacement barrier. Both fixtures use the grant and cold-reopen
+its committed bytes. The late-ticket, failed-barrier and held
+publication fixtures exercise the ordering of the preparation proof.
+
+A broader trial used the same cooperative path for ordinary journal
+durability. It reduced summed acquisition time from 13.83 to 10.74
+seconds in the instrumented runs. All 60 matched workflows verified.
+Eight-writer NoSync median p95 rose from 85.62 to 99.09 ms and
+durable indexed work rose from 3.48 to 4.13 s. The selected
+implementation applies cooperative completion to private preparation.
+Ordinary journal requests continue using queued sync leadership.
+
+In three traced runs of the selected implementation, preparation wait
+fell from 9.82 to 9.16 seconds summed over 1,152 foreground items.
+The 57 slowest items accumulated 1.31 seconds in preparation on the
+prior build and 1.16 seconds on the revised build. Total measured
+item time and traced p95 varied with admission and sync scheduling.
+The timings sum concurrent calls and come from instrumented builds.
+
+All 48 uninstrumented matched runs verified across seven workflows.
+Eight-writer NoSync ran four times per build. The other profiles ran
+twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`c47b72f5`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 907.95 / 878.56 / 1310.13 | 47.14 / 45.57 / 33.25 | 2.25 / 4.10 / 0.97 | 9.24 / 9.35 / 0.92 | 4.80 / 4.93 / 6.99 |
+| NoSync indexed, 4 writers, 20 MiB | 1596.10 / 1750.39 / 1968.30 | 55.72 / 57.32 / 28.07 | 3.23 / 3.51 / 1.19 | 11.16 / 13.91 / 0.96 | 7.12 / 9.17 / 9.00 |
+| Durable indexed, 2 writers, 15 MiB | 3960.80 / 3828.70 / 4963.13 | 53.45 / 50.00 / 60.36 | 4.32 / 1.58 / 0.71 | 7.52 / 8.21 / 0.61 | 5.94 / 5.68 / 6.33 |
+| Warmed NoSync queue | 8.99 / 9.03 / 89.48 | 1.62 / 1.70 / 21.96 | 0.17 / 0.20 / 0.07 | 5.17 / 4.55 / 0.32 | 0.19 / 0.21 / 0.41 |
+| Durable outbox | 1076.02 / 969.50 / 1203.84 | 217.33 / 189.62 / 220.06 | 0.49 / 0.50 / 0.31 | 38.72 / 34.48 / 57.45 | 62.35 / 84.21 / 118.19 |
+| NoSync indexed, 8 writers, 24 MiB | 2225.02 / 2185.59 / 2466.23 | 93.81 / 90.31 / 53.13 | 6.85 / 7.09 / 1.45 | 19.39 / 21.22 / 1.45 | 10.15 / 10.23 / 13.35 |
+| Durable indexed, 8 writers, 24 MiB | 4080.95 / 4126.06 / 8952.49 | 123.44 / 137.14 / 223.91 | 7.63 / 17.75 / 1.61 | 20.20 / 17.76 / 1.91 | 10.33 / 9.45 / 13.25 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 250.52 / 220.54 / 294.20 | 36.63 / 47.82 / 176.94 | 31.34 / 42.21 / 210.15 | 0.73 / 0.70 / 1.27 |
+| NoSync indexed, 4 writers, 20 MiB | 298.70 / 356.97 / 470.76 | 84.64 / 60.64 / 254.05 | 12.40 / 41.72 / 337.82 | 1.22 / 1.53 / 1.64 |
+| Durable indexed, 2 writers, 15 MiB | 137.24 / 142.46 / 206.20 | 12.81 / 9.00 / 190.58 | 12.77 / 3.04 / 250.64 | 0.47 / 0.48 / 0.59 |
+| NoSync indexed, 8 writers, 24 MiB | 387.18 / 442.29 / 732.65 | 190.64 / 186.76 / 435.14 | 104.46 / 86.85 / 548.14 | 2.33 / 2.33 / 3.12 |
+| Durable indexed, 8 writers, 24 MiB | 365.73 / 424.66 / 1258.22 | 160.02 / 159.59 / 1866.80 | 73.89 / 58.29 / 1954.26 | 2.34 / 2.10 / 2.89 |
+
+Eight-writer NoSync work was 2.23 s before the change and 2.19 s
+after it. Per-item p95 was 93.81 and 90.31 ms, with multifile at
+53.13 ms. Native process CPU through maintenance was 2.48 s after
+the change, with multifile at 0.97 s. Median foreground mutation
+syncs rose from 157.5 to 165. Grouped reopen was 21.22 ms on the
+revised build and 1.45 ms on multifile.
+
+The 20 MiB four-writer NoSync workload used 5% less CPU and spent
+10% more time in work. Eight-writer durable work was 4.08 and
+4.13 s, with median p95 rising from 123.44 to 137.14 ms across
+two samples per build. The held-leader fixture establishes the
+liveness improvement. The mixed timings leave write-tail, CPU,
+and reopen qualification open.
+
+Verification passed 30 GNU Release, 15 Debug ASan/UBSan and 15 musl
+Release groups. These covered faulted readiness and sync, stream
+handoff and takeover, journal and checkpoint recovery, and fixed-
+capacity lease and messaging workflows. Formatting and diff checks
+passed.
+
+Logs and traces use the `prep-next-` and `prep-scoped-` prefixes in
+`build/pouch-space-concurrent/`.

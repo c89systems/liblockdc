@@ -1,21 +1,28 @@
 #define _GNU_SOURCE
 #include "lc_api_internal.h"
 #include "space_internal.h"
+#include <errno.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 #include <zlib.h>
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x3959444145525350)
+#define READY_MAGIC UINT64_C(0x4159444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
 #define ACTIVITY_WORD (PENDING_WORD - 1)
 #define PREPARATION_WORD (ACTIVITY_WORD - 1)
+#define SYNC_WORD (PREPARATION_WORD - 1)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
-#define BITMAP_WORDS ((PREPARATION_WORD - 2 * WORDS) / 2)
+#define BITMAP_WORDS ((SYNC_WORD - 2 * WORDS) / 2)
 #define ZERO_BITMAP (2 * WORDS)
 #define WITNESS_BITMAP (ZERO_BITMAP + BITMAP_WORDS)
 #define BITMAP_END (PS_DATA + (uint64_t)BITMAP_WORDS * 64 * PS_PAGE)
@@ -78,7 +85,8 @@ static int slot_read(const uint64_t *source, uint64_t *record,
   record[GENERATION] = generation;
   for (i = 1; i < WORDS; ++i)
     record[i] = __atomic_load_n(source + i, __ATOMIC_RELAXED);
-  if (__atomic_load_n(source, __ATOMIC_ACQUIRE) != generation ||
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  if (__atomic_load_n(source, __ATOMIC_RELAXED) != generation ||
       record[MAGIC] != READY_MAGIC || record[DURABLE] > record[READY] ||
       record[ORIGIN] > record[DURABLE] || !record[GRANT_USED] ||
       record[GRANT_USED] % TOKEN_RANGE || record[GRANT_LIMIT] % TOKEN_RANGE ||
@@ -88,7 +96,7 @@ static int slot_read(const uint64_t *source, uint64_t *record,
     return -1;
   return 1;
 }
-static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
+static int current_record(ps_space *s, uint64_t *record, int *selected) {
   uint64_t second[WORDS];
   uint64_t issued = ps_readiness_issued_tickets(s);
   int a = slot_read(s->readiness->page, record, issued);
@@ -98,12 +106,52 @@ static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
    */
   if (a < 0 || b < 0 || (!a && !b) ||
       (a && b && record[GENERATION] == second[GENERATION]))
-    return failed(s, e,
-                  "shared readiness certificate is uncertain; close cohort");
+    return 0;
   *selected = b && (!a || second[GENERATION] > record[GENERATION]);
   if (*selected)
     memcpy(record, second, sizeof(second));
-  return LC_OK;
+  return 1;
+}
+static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
+  return current_record(s, record, selected)
+             ? LC_OK
+             : failed(
+                   s, e,
+                   "shared readiness certificate is uncertain; close cohort");
+}
+int ps_readiness_prepared_durable(ps_space *s, uint64_t ticket) {
+  const uint64_t *page = s->readiness->page;
+  uint64_t first = __atomic_load_n(page, __ATOMIC_ACQUIRE);
+  uint64_t second = __atomic_load_n(page + WORDS, __ATOMIC_ACQUIRE);
+  uint64_t record[WORDS];
+  int selected;
+  if (!current_record(s, record, &selected))
+    return 0;
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  return first == __atomic_load_n(page, __ATOMIC_RELAXED) &&
+         second == __atomic_load_n(page + WORDS, __ATOMIC_RELAXED) &&
+         !(__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) &
+           ~PRESSURE_BIT) &&
+         !memcmp(record + IDENTITY, s->identity, 16) &&
+         record[PREPARED_DURABLE] >= ticket;
+}
+static uint32_t *sync_word(ps_space *s) {
+  return (uint32_t *)(s->readiness->page + SYNC_WORD);
+}
+uint32_t ps_readiness_sync_observe(ps_space *s) {
+  return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
+}
+int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
+  /* Owner death releases the OFD lock without changing the wake word. */
+  const struct timespec retry = {0, 4000000L};
+  return syscall(SYS_futex, sync_word(s), FUTEX_WAIT, observed, &retry, NULL,
+                 0) == 0 ||
+         errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
+}
+void ps_readiness_sync_wake(ps_space *s) {
+  uint32_t *word = sync_word(s);
+  (void)__atomic_add_fetch(word, 1, __ATOMIC_RELEASE);
+  (void)syscall(SYS_futex, word, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 }
 static int identity(ps_space *s, const uint64_t *record, lc_error *e) {
   return memcmp(record + IDENTITY, s->identity, 16)
@@ -118,7 +166,7 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
     return failed(s, e, "shared readiness generation exhausted; close cohort");
   ++record[GENERATION];
   record[CRC] = record_crc(record);
-  __atomic_store_n(slot, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(slot, 0, __ATOMIC_SEQ_CST);
   for (i = 1; i < WORDS; ++i)
     __atomic_store_n(slot + i, record[i], __ATOMIC_RELAXED);
   __atomic_store_n(slot, record[GENERATION], __ATOMIC_RELEASE);
@@ -208,6 +256,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
                        __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PREPARATION_WORD, 0,
                      __ATOMIC_RELEASE);
+    __atomic_store_n(sync_word(s), 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PENDING_WORD, 0, __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
@@ -330,7 +379,7 @@ int ps_readiness_publish(ps_space *s, lc_error *e) {
 int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
                            uint64_t prepared, lc_error *e) {
   uint64_t record[WORDS];
-  int selected, rc;
+  int selected, rc, prepared_advanced;
   if (!s->readiness || !s->readiness->active)
     return LC_OK;
   rc = current(s, record, &selected, e);
@@ -343,18 +392,20 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   if (wire > record[READY])
     record[READY] =
         wire; /* A newly stabilized selected root proves this prefix. */
-  if (wire > record[DURABLE] || root > record[ROOT] ||
-      prepared > record[PREPARED_DURABLE]) {
+  prepared_advanced = prepared > record[PREPARED_DURABLE];
+  if (wire > record[DURABLE] || root > record[ROOT] || prepared_advanced) {
     if (wire > record[DURABLE])
       record[DURABLE] = wire;
     if (root > record[ROOT])
       record[ROOT] = root;
-    if (prepared > record[PREPARED_DURABLE])
+    if (prepared_advanced)
       record[PREPARED_DURABLE] = prepared;
     rc = select_record(s, record, selected, e);
   }
   if (rc == LC_OK && root)
     ps_readiness_finish(s, PS_READINESS_ROOT);
+  if (rc == LC_OK && prepared_advanced)
+    ps_readiness_sync_wake(s);
   return rc;
 }
 
