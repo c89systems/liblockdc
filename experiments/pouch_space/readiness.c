@@ -8,15 +8,17 @@
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x3859444145525350)
+#define READY_MAGIC UINT64_C(0x3959444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
 #define ACTIVITY_WORD (PENDING_WORD - 1)
 #define PREPARATION_WORD (ACTIVITY_WORD - 1)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
-#define ZERO_WORDS (PREPARATION_WORD - 2 * WORDS)
-#define ZERO_END (PS_DATA + (uint64_t)ZERO_WORDS * 64 * PS_PAGE)
+#define BITMAP_WORDS ((PREPARATION_WORD - 2 * WORDS) / 2)
+#define ZERO_BITMAP (2 * WORDS)
+#define WITNESS_BITMAP (ZERO_BITMAP + BITMAP_WORDS)
+#define BITMAP_END (PS_DATA + (uint64_t)BITMAP_WORDS * 64 * PS_PAGE)
 enum readiness_word {
   GENERATION,
   MAGIC,
@@ -125,6 +127,7 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
 int ps_readiness_attach(ps_space *s, lc_error *e) {
   ps_readiness *r;
   uint64_t first, last;
+  size_t i;
   struct stat st;
   int rc;
   if (!ps_coordination_shared(s->coordination))
@@ -151,6 +154,11 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
     return failed(s, e, "cannot map shared readiness page");
   }
   s->readiness = r;
+  /* The first owner resets witnesses before claiming any dynamic workspace.
+   * Unlike member handles, read-only imports can survive this reset. */
+  if (!r->existing)
+    for (i = 0; i < BITMAP_WORDS; ++i)
+      __atomic_store_n(r->page + WITNESS_BITMAP + i, 0, __ATOMIC_RELEASE);
   return ps_coordination_range(s->coordination, MEMBER_OFFSET, 1, 1, e);
 }
 void ps_readiness_close(ps_space *s) {
@@ -195,8 +203,9 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   } else {
     __atomic_store_n(s->readiness->page, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
-    for (i = 0; i < ZERO_WORDS; ++i)
-      __atomic_store_n(s->readiness->page + 2 * WORDS + i, 0, __ATOMIC_RELEASE);
+    for (i = 0; i < BITMAP_WORDS; ++i)
+      __atomic_store_n(s->readiness->page + ZERO_BITMAP + i, 0,
+                       __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PREPARATION_WORD, 0,
                      __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
@@ -353,15 +362,14 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
  * A terminated preparer can leave a subset marked since every marked page
  * already crossed the barrier. A private writer cannot touch a page until
  * the whole claim has revoked those bits. A cold cohort starts empty. */
-static uint64_t zero_span_end(ps_space *s, uint64_t page, uint64_t end,
-                              int prepared) {
+static uint64_t bitmap_span_end(const uint64_t *bitmap, uint64_t page,
+                                uint64_t end, int set) {
   uint64_t word;
   unsigned int shift;
   while (page < end) {
     shift = (unsigned int)(page % 64);
-    word = __atomic_load_n(s->readiness->page + 2 * WORDS + page / 64,
-                           __ATOMIC_ACQUIRE);
-    word = (prepared ? ~word : word) >> shift;
+    word = __atomic_load_n(bitmap + page / 64, __ATOMIC_ACQUIRE);
+    word = (set ? ~word : word) >> shift;
     if (word) {
       page += (unsigned int)__builtin_ctzll(word);
       break;
@@ -372,17 +380,19 @@ static uint64_t zero_span_end(ps_space *s, uint64_t page, uint64_t end,
 }
 uint64_t ps_readiness_zero_find(ps_space *s, uint64_t offset, uint64_t bytes,
                                 uint64_t wanted, uint64_t *selected) {
+  const uint64_t *bitmap;
   uint64_t first, page, next, end, best = 0;
   *selected = offset;
-  if (!s->readiness || offset < PS_DATA || offset >= ZERO_END)
+  if (!s->readiness || offset < PS_DATA || offset >= BITMAP_END)
     return 0;
-  if (bytes > ZERO_END - offset)
-    bytes = ZERO_END - offset;
+  if (bytes > BITMAP_END - offset)
+    bytes = BITMAP_END - offset;
+  bitmap = s->readiness->page + ZERO_BITMAP;
   first = (offset - PS_DATA) / PS_PAGE;
   end = first + bytes / PS_PAGE;
-  for (page = zero_span_end(s, first, end, 0); page < end;
-       page = zero_span_end(s, next, end, 0)) {
-    next = zero_span_end(s, page, end, 1);
+  for (page = bitmap_span_end(bitmap, first, end, 0); page < end;
+       page = bitmap_span_end(bitmap, next, end, 0)) {
+    next = bitmap_span_end(bitmap, page, end, 1);
     if (next - page > best) {
       *selected = offset + (page - first) * PS_PAGE;
       best = next - page;
@@ -395,19 +405,21 @@ uint64_t ps_readiness_zero_find(ps_space *s, uint64_t offset, uint64_t bytes,
 uint64_t ps_readiness_zero_prefix(ps_space *s, uint64_t offset,
                                   uint64_t bytes) {
   uint64_t start;
-  if (!s->readiness || offset < PS_DATA || offset >= ZERO_END)
+  if (!s->readiness || offset < PS_DATA || offset >= BITMAP_END)
     return 0;
-  if (bytes > ZERO_END - offset)
-    bytes = ZERO_END - offset;
+  if (bytes > BITMAP_END - offset)
+    bytes = BITMAP_END - offset;
   start = (offset - PS_DATA) / PS_PAGE;
-  return (zero_span_end(s, start, start + bytes / PS_PAGE, 1) - start) *
+  return (bitmap_span_end(s->readiness->page + ZERO_BITMAP, start,
+                          start + bytes / PS_PAGE, 1) -
+          start) *
          PS_PAGE;
 }
-void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
-                             int prepared) {
+static void bitmap_pages(ps_space *s, size_t bitmap, uint64_t offset,
+                         uint64_t bytes, int set) {
   uint64_t page, end, mask, *word;
   unsigned int shift, count;
-  if (!s->readiness || !bytes || offset >= ZERO_END)
+  if (!s->readiness || !bytes || offset >= BITMAP_END)
     return;
   if (offset < PS_DATA) {
     if (bytes <= PS_DATA - offset)
@@ -415,8 +427,8 @@ void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
     bytes -= PS_DATA - offset;
     offset = PS_DATA;
   }
-  if (bytes > ZERO_END - offset)
-    bytes = ZERO_END - offset;
+  if (bytes > BITMAP_END - offset)
+    bytes = BITMAP_END - offset;
   page = (offset - PS_DATA) / PS_PAGE;
   end = (offset - PS_DATA + bytes + PS_PAGE - 1) / PS_PAGE;
   while (page < end) {
@@ -425,11 +437,30 @@ void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
     if (end - page < count)
       count = (unsigned int)(end - page);
     mask = count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << shift;
-    word = s->readiness->page + 2 * WORDS + page / 64;
-    if (prepared)
+    word = s->readiness->page + bitmap + page / 64;
+    if (set)
       __atomic_fetch_or(word, mask, __ATOMIC_ACQ_REL);
     else
       __atomic_fetch_and(word, ~mask, __ATOMIC_ACQ_REL);
     page += count;
   }
+}
+void ps_readiness_zero_pages(ps_space *s, uint64_t offset, uint64_t bytes,
+                             int prepared) {
+  bitmap_pages(s, ZERO_BITMAP, offset, bytes, prepared);
+}
+void ps_readiness_witness_pages(ps_space *s, uint64_t offset, uint64_t bytes,
+                                int possible) {
+  bitmap_pages(s, WITNESS_BITMAP, offset, bytes, possible);
+}
+int ps_readiness_witness_possible(ps_space *s, uint64_t offset,
+                                  uint64_t bytes) {
+  uint64_t start, end;
+  if (!s->readiness || !s->readiness->active || offset < PS_DATA ||
+      offset >= BITMAP_END || bytes > BITMAP_END - offset)
+    return 1;
+  start = (offset - PS_DATA) / PS_PAGE;
+  end = (offset - PS_DATA + bytes + PS_PAGE - 1) / PS_PAGE;
+  return bitmap_span_end(s->readiness->page + WITNESS_BITMAP, start, end, 0) <
+         end;
 }

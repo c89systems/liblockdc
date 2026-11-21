@@ -46,6 +46,9 @@ struct ps_reader {
  * that can legitimately arrive from a previous owner, without a persisted hint.
  * A new local export enables collection probes before its ticket escapes. */
 #define PIN_PRESENCE_OFFSET 2U
+/* Read-only imports keep byte 2, including across a cohort reset. Member
+ * claims are tracked separately and publish a page hint before acquisition. */
+#define MEMBER_PIN_PRESENCE_OFFSET 7U
 #define TICKET_MAGIC UINT64_C(0x3154454b435450)
 #define TICKET_HEADER 112U
 static int allocation_refresh(ps_space *, lc_error *);
@@ -572,17 +575,22 @@ int ps_internal_admission_begin(ps_space *s, ps_coordination_guard **guard,
 static int physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
                             lc_error *error) {
   int first = s->physical_claim_bytes == 0, rc;
+  if (s->readiness && !s->allocation_guard)
+    return err(error, LC_ERR_PROTOCOL,
+               "member physical claim requires allocator authority");
   if (first) {
-    rc = ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 1,
-                               error);
+    rc = ps_coordination_range(s->coordination, MEMBER_PIN_PRESENCE_OFFSET, 1,
+                               1, error);
     if (rc != LC_OK)
       return rc;
   }
+  ps_readiness_witness_pages(s, offset, bytes, 1);
   rc = ps_coordination_range(s->coordination, offset, bytes, 1, error);
   if (rc == LC_OK)
     s->physical_claim_bytes += bytes;
-  else if (first && ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET,
-                                          1, 0, NULL) != LC_OK) {
+  else if (first &&
+           ps_coordination_range(s->coordination, MEMBER_PIN_PRESENCE_OFFSET, 1,
+                                 0, NULL) != LC_OK) {
     lc_error_cleanup(error);
     rc = healthy(s, error);
   }
@@ -609,8 +617,8 @@ static int physical_release(ps_space *s, uint64_t offset, uint64_t bytes,
   s->physical_claim_bytes -= bytes;
   return s->physical_claim_bytes
              ? LC_OK
-             : ps_coordination_range(s->coordination, PIN_PRESENCE_OFFSET, 1, 0,
-                                     error);
+             : ps_coordination_range(s->coordination,
+                                     MEMBER_PIN_PRESENCE_OFFSET, 1, 0, error);
 }
 static int metadata_claim_range(ps_space *s, uint64_t offset, uint64_t bytes,
                                 lc_error *error) {
@@ -1242,6 +1250,15 @@ static int pin_conflict(ps_space *s, uint64_t offset, uint64_t bytes,
   *present = rc != LC_OK || first != last;
   return rc;
 }
+static int physical_presence(ps_space *s, int *present, lc_error *error) {
+  /* One kernel observation covers both kinds of presence even during a
+   * handoff. Intervening coordination locks can conservatively request a
+   * scan on shared roots. Exclusive admission only needs imported pins. */
+  uint64_t bytes = ps_coordination_shared(s->coordination)
+                       ? MEMBER_PIN_PRESENCE_OFFSET - PIN_PRESENCE_OFFSET + 1
+                       : 1;
+  return pin_conflict(s, PIN_PRESENCE_OFFSET, bytes, present, error);
+}
 static int entry_foreign_pinned(ps_space *s, const ps_entry *p) {
   size_t i;
   int present;
@@ -1260,13 +1277,14 @@ static int entry_foreign_pinned(ps_space *s, const ps_entry *p) {
  * and visit each clear residual once. Both traversal and queries follow actual
  * free intervals plus pin fragments, without restarting from the pool head. */
 static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
-                        lc_error *error) {
+                        int use_bitmap, lc_error *error) {
   ps_run *run, *held, **link = head;
   uint64_t first, last;
   int rc;
   while (*link) {
     run = *link;
-    if (run->claimed) {
+    if (run->claimed || (use_bitmap && !ps_readiness_witness_possible(
+                                           s, run->offset, run->bytes))) {
       link = &run->next;
       continue;
     }
@@ -1275,6 +1293,10 @@ static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
     if (rc != LC_OK)
       return rc;
     if (first == last) {
+      /* Common free pages have no local witnesses. The allocator excludes
+       * new member claims until this negative observation is recorded. */
+      if (use_bitmap)
+        ps_readiness_witness_pages(s, run->offset, run->bytes, 0);
       link = &run->next;
       continue;
     }
@@ -1301,7 +1323,7 @@ static int pins_recover(ps_space *s, lc_error *error) {
   int rc, present;
   if (!s->range_pins)
     return LC_OK;
-  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  rc = physical_presence(s, &present, error);
   if (rc != LC_OK || !present)
     return rc;
   for (page = s->payload_pages; page; page = page->next) {
@@ -1311,9 +1333,9 @@ static int pins_recover(ps_space *s, lc_error *error) {
     if (present)
       quarantine_page(s, page);
   }
-  rc = foreign_pool(s, &s->free, &s->free_bytes, error);
+  rc = foreign_pool(s, &s->free, &s->free_bytes, 0, error);
   return rc == LC_OK ? foreign_pool(s, &s->metadata_free,
-                                    &s->metadata_free_bytes, error)
+                                    &s->metadata_free_bytes, 0, error)
                      : rc;
 }
 /* Quarantine is a conservative positive observation. A live participant can
@@ -1367,7 +1389,7 @@ static int pins_reclaim_locked(ps_space *s, lc_error *error) {
   int present, rc;
   if (!s->pinned_free && !s->pinned_pages)
     return LC_OK;
-  rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  rc = physical_presence(s, &present, error);
   if (rc != LC_OK)
     return rc;
   pins_collect_locked(s, present, 1);
@@ -1399,7 +1421,7 @@ static int allocation_refresh(ps_space *s, lc_error *error) {
 }
 static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   ps_run *run;
-  int present, rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+  int present, imported, rc = physical_presence(s, &present, error);
   if (rc != LC_OK)
     return rc;
   pins_collect_locked(s, present, 0);
@@ -1410,8 +1432,11 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
       run->clean = 0;
   ps_internal_free_coalesce(s);
   rc = healthy(s, error);
-  if (rc == LC_OK && present)
-    rc = foreign_pool(s, &s->free, &s->free_bytes, error);
+  if (rc == LC_OK && present) {
+    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &imported, error);
+    if (rc == LC_OK)
+      rc = foreign_pool(s, &s->free, &s->free_bytes, !imported, error);
+  }
   s->allocation_ranges_checked = rc == LC_OK;
   return rc;
 }
@@ -1422,8 +1447,7 @@ static void collect_retired(ps_space *s) {
   int present = 0, foreign, shared;
   if (!s->retired || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
     return;
-  if (s->range_pins &&
-      pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, NULL) != LC_OK)
+  if (s->range_pins && physical_presence(s, &present, NULL) != LC_OK)
     return;
   shared = ps_coordination_shared(s->coordination);
   while (*link) {
@@ -2888,8 +2912,7 @@ static int retirement_can_fund(ps_space *s, uint64_t missing) {
   int foreign = 0;
   if (missing > s->capacity - PS_DATA || (!s->dirty && !s->retired))
     return 0;
-  if (s->range_pins &&
-      pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &foreign, NULL) != LC_OK)
+  if (s->range_pins && physical_presence(s, &foreign, NULL) != LC_OK)
     return 0;
   for (p = s->dirty; p && missing; p = p->dirty_next)
     if (p->state == 1 && p->deleted)

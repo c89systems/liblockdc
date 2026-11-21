@@ -3309,6 +3309,85 @@ static void quarantine_capacity(void) {
   ok(ps_close(s, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+typedef struct witness_queries {
+  size_t payload;
+  size_t large;
+} witness_queries;
+static int count_payload_queries(void *context, int fd, int command,
+                                 struct flock *lock) {
+  witness_queries *queries = context;
+  if (command == F_OFD_GETLK && lock->l_start >= PS_DATA) {
+    ++queries->payload;
+    if (lock->l_len >= (off_t)PS_MIB)
+      ++queries->large;
+  }
+  return fcntl(fd, command, lock);
+}
+static void witness_filter(void) {
+  witness_queries queries = {0};
+  size_t ticket_bytes;
+  uint64_t retired;
+  ps_coordination_io io = {&queries, count_payload_queries};
+  ps_options options = {.coordination_io = &io};
+  ps_budget_plan plan = {2 * PS_PAGE};
+  ps_budget *budget = NULL;
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *reader = NULL, *imported = NULL;
+  unsigned char *ticket;
+  lc_error e = {0};
+
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  capture_put(a, 42, PS_PAGE);
+  /* Keep a member witness on allocated data while scanning common pages. */
+  ok(ps_read_open(b, key(42), NULL, &reader, &e), &e);
+  ok(ps_budget_foreground_check(b, &e), &e);
+  ok(ps_budget_foreground_check(a, &e), &e);
+  retired = status(a).retired_bytes;
+  queries = (witness_queries){0};
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(!queries.large);
+
+  /* A new private reservation can exclude pages a peer just skipped. */
+  ok(ps_budget_open(b, &plan, &budget, &e), &e);
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(queries.payload &&
+          status(a).retired_bytes == retired + plan.payload_bytes);
+  ok(ps_budget_close(budget, &e), &e);
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(status(a).retired_bytes == retired);
+  queries = (witness_queries){0};
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(!queries.large);
+
+  ticket_bytes = ps_reader_ticket_bytes(reader);
+  ticket = malloc(ticket_bytes);
+  REQUIRE(ticket);
+  ok(ps_reader_ticket(reader, ticket, ticket_bytes, &e), &e);
+  queries = (witness_queries){0};
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(!queries.large);
+  ok(ps_reader_import(path, ticket, ticket_bytes, &imported, &e), &e);
+  free(ticket);
+  ps_reader_close(reader);
+  queries = (witness_queries){0};
+  ok(ps_budget_foreground_check(a, &e), &e);
+  REQUIRE(queries.large); /* The read-only importer requires a full scan. */
+  ok(ps_delete(a, key(42), &e), &e);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+
+  /* The imported OFD outlives every member and the volatile page map. */
+  ok(ps_open(path, 0, &options, &a, &e), &e);
+  REQUIRE(status(a).retired_bytes >= PS_PAGE);
+  captured_expect(imported, 42, PS_PAGE);
+  ps_reader_close(imported);
+  ok(ps_checkpoint(a, &e), &e);
+  REQUIRE(!status(a).retired_bytes);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void quarantine_packed(void) {
   enum { PAGES = 12, BODY = PS_PAGE / 2 + PS_CELL };
   lc_error e = {0};
@@ -5831,6 +5910,7 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "quarantine")) {
     quarantine_capacity();
     quarantine_packed();
+    witness_filter();
   } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
   else if (!strcmp(argv[2], "journal-replay-retired"))

@@ -55,4 +55,10 @@ uint64_t ps_readiness_zero_find(ps_space *, uint64_t offset, uint64_t bytes,
 uint64_t ps_readiness_zero_prefix(ps_space *, uint64_t offset, uint64_t bytes);
 void ps_readiness_zero_pages(ps_space *, uint64_t offset, uint64_t bytes,
                              int prepared);
+/* Possible cohort witnesses, recorded before the kernel claim under allocator
+ * authority. Clear only whole common free pages after a negative kernel query.
+ * Read-only imports and uncovered ranges still need kernel queries. */
+void ps_readiness_witness_pages(ps_space *, uint64_t offset, uint64_t bytes,
+                                int possible);
+int ps_readiness_witness_possible(ps_space *, uint64_t offset, uint64_t bytes);
 #endif

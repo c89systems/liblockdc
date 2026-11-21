@@ -10833,3 +10833,97 @@ during verification of the rotation change before the spare cap.
 Raw matches, capacity traces and test logs use the `pressure-rotation-`,
 `rotation-capacity-probe-`, and `rotation-headroom-` prefixes in
 `build/pouch-space-concurrent/`.
+
+## Skipping lock probes for unclaimed shared payload pages
+
+Eight-writer NoSync traces attributed 3.49 seconds of summed elapsed
+time to free-range ownership queries and their traversal. Most of that
+work ran under allocator authority. Each ordinary admission previously
+queried every free interval whenever a peer held a physical witness.
+
+The live readiness page now records possible member witnesses using one
+bit per payload page. A member marks the covering pages before acquiring
+the kernel range lock, under allocator authority. Readers of packed
+values mark the whole covering page. Failed, released or killed holders
+can leave positive bits. During ordinary admission, a fully covered
+common free range with clear bits skips the kernel query. For a marked
+range, the allocator queries the kernel and clears the bits only when
+that whole common range is clear. Quarantine still follows the actual
+lock ranges.
+
+Read-only imported readers keep their established presence lock and
+use the full kernel scan path. A valid handoff keeps the issuer's
+witness until import finishes. This also covers an import that starts
+while a scan is in progress. Cold recovery and checkpoint adoption
+retain their full range checks. Cold cohort admission resets the map
+before claiming local workspace. The first 60.5 MiB of payload supports
+both the zero-proof and witness maps. Ranges outside this span use
+ordinary kernel checking and checked preparation. The volatile cohort
+marker distinguishes the two protocols. The durable layout is unchanged.
+Owners must close the previous cohort before opening it with the revised
+protocol.
+
+The deterministic fixture retains a peer read witness on selected
+data while scanning common pages. The prior build queries the kernel
+for the clear free range. The revised build skips it, detects a later
+two-page reservation, and skips the clear range again after the claim
+drains. A read-only import restores the full scan and remains readable
+after the prior members close and a new cohort opens.
+
+Three instrumented runs per build verified 1,152 matched eight-writer
+items per build. Kernel lock queries fell from 2,266,357 to 344,583.
+Time inside the free-range scan fell from 3.49 to 0.21 s. Summed
+allocator lock-call time fell from 16.06 to 9.37 s. These measurements
+sum concurrent calls and use the instrumented builds. Preparation
+wait rose from 9.74 to 12.66 s in the same traces. The workflow times
+below come from the separate uninstrumented runs.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`312c8b52`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 945.16 / 875.15 / 1352.08 | 45.83 / 48.60 / 32.94 | 2.51 / 2.76 / 0.99 | 8.61 / 8.19 / 0.79 | 5.21 / 4.98 / 6.63 |
+| NoSync indexed, 4 writers, 20 MiB | 2043.01 / 1522.25 / 2116.49 | 62.07 / 46.70 / 32.09 | 4.05 / 7.38 / 1.33 | 10.52 / 13.39 / 1.10 | 7.17 / 7.21 / 13.73 |
+| Durable indexed, 2 writers, 15 MiB | 3522.00 / 3774.30 / 5847.40 | 51.44 / 53.60 / 76.45 | 2.10 / 19.59 / 1.19 | 9.65 / 8.92 / 0.88 | 8.69 / 7.84 / 10.56 |
+| Warmed NoSync queue | 12.16 / 11.23 / 86.31 | 2.55 / 2.03 / 19.03 | 0.24 / 0.30 / 0.10 | 2.96 / 4.03 / 0.49 | 0.23 / 0.31 / 0.51 |
+| Durable outbox | 1081.33 / 1082.96 / 1714.78 | 209.53 / 194.59 / 358.50 | 0.63 / 0.58 / 0.36 | 43.01 / 35.72 / 96.74 | 85.33 / 100.92 / 160.83 |
+| NoSync indexed, 8 writers, 24 MiB | 3237.15 / 2427.37 / 2802.76 | 122.07 / 105.20 / 57.21 | 20.20 / 12.31 / 1.97 | 22.71 / 24.21 / 1.59 | 10.80 / 10.97 / 13.40 |
+| Durable indexed, 8 writers, 24 MiB | 4818.88 / 5130.13 / 8974.07 | 143.73 / 168.46 / 218.45 | 19.78 / 7.59 / 1.74 | 28.90 / 23.11 / 2.09 | 12.85 / 9.84 / 14.94 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 211.32 / 190.46 / 347.60 | 64.61 / 36.81 / 176.15 | 23.10 / 30.90 / 245.82 | 0.76 / 0.80 / 1.15 |
+| NoSync indexed, 4 writers, 20 MiB | 321.45 / 272.60 / 455.52 | 107.00 / 67.99 / 277.50 | 37.21 / 36.96 / 376.02 | 1.19 / 1.20 / 2.47 |
+| Durable indexed, 2 writers, 15 MiB | 153.62 / 137.92 / 234.15 | 4.87 / 10.76 / 197.73 | 9.40 / 2.42 / 263.09 | 0.71 / 0.66 / 1.12 |
+| NoSync indexed, 8 writers, 24 MiB | 561.43 / 499.43 / 800.50 | 276.01 / 226.38 / 484.44 | 163.32 / 92.34 / 634.69 | 2.51 / 2.58 / 3.09 |
+| Durable indexed, 8 writers, 24 MiB | 454.37 / 552.79 / 1239.38 | 215.29 / 181.14 / 1709.13 | 98.65 / 118.03 / 2236.73 | 2.96 / 2.26 / 3.35 |
+
+In the eight-writer NoSync profile, revised native work fell by 25%
+and process CPU through end-of-work maintenance fell from 3.89
+to 2.71 s. Multifile took 2.80 s for work and 1.18 s of CPU. Native
+per-item p95 fell from 122 to 105 ms, with multifile at 57 ms.
+Grouped native reopen took 24.21 ms, with multifile at 1.59 ms.
+The 20 MiB four-writer NoSync profile also used 27% less process CPU
+and spent 25% less time in work than the prior native build.
+
+In the two durable indexed profiles, revised native used less process
+CPU and spent 6–7% more time in work than the prior native build.
+The eight-writer median p95 rose from 144 to 168 ms. Multifile took
+8.97 s for work with a 218 ms p95, compared with 5.13 s and 168 ms
+for revised native. Each durable profile has two samples per build.
+The remaining NoSync CPU, tail and grouped reopen gaps are still
+visible after removing most of the common-range kernel queries.
+
+Verification passed 56 GNU Release, 22 Debug ASan/UBSan and 22
+musl Release groups. These include shared lease and messaging capacity,
+physical claim and readiness faults, process death, reader import and
+handoff, allocator projection and journal recovery. Formatting and
+diff checks passed.
+
+Logs and traces use the `witness-prior-`, `witness-current-`, and
+`witness-filter-` prefixes in `build/pouch-space-concurrent/`.
