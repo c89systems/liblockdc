@@ -11380,3 +11380,87 @@ passed.
 
 Raw traces, matched samples and test logs are in
 `build/pouch-space-concurrent/allocation-sites/`.
+
+## Admitting buffered revision tails together
+
+The eight-writer NoSync trace counted 4,480 buffered payload tails
+in multi-member immutable revisions. Two-member revisions accounted
+for 1,792 tails, and revisions with three or four members accounted
+for 2,688. All of these tails were smaller than a page. Previously
+each writer reacquired the shared allocator and refreshed its range
+projection for its own tail.
+
+Revision preparation now admits up to eight writers and one 16 KiB
+chunk of buffered bytes per allocator capture. It applies the existing
+packing, budget and metadata checks to each tail. Each writer owns
+its admitted ranges through payload I/O after the allocator scope
+ends. The payload is written from the writer's existing bounded
+buffer. Single-writer streaming uses the same path each time its
+fixed buffer fills. Revision publication acquires its own authority
+and selects all members through the existing frame and durability
+policy.
+
+The four-member fixture observes one allocation scope for admission
+and a second for publication. During the first payload write, an
+independent owner sees all four keys absent, publishes its own
+value and checkpoints. The initiating owner then selects all four
+values and cold recovery verifies both owners' bytes. The prior
+implementation fails the fixture at the second payload write,
+where its allocator acquisition count exceeds one. An insufficient
+budget for the second writer also verifies that the batch performs
+no payload writes and closing the failed writers returns their
+claims.
+
+In three instrumented matched runs per build, median allocator
+acquisitions for buffered writer admission fell from 4,657 to 1,720.
+Median successful acquisitions across the complete work and
+maintenance phases fell from 27,030 to 24,402. Summed wait time at
+the writer admission site fell from 409 to 266 ms. Each trace
+verified all 384 items and includes instrumentation overhead.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`7a54d8f1`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 748.93 / 746.12 / 1249.85 | 41.55 / 40.93 / 28.80 | 3.87 / 3.80 / 0.95 | 7.78 / 7.05 / 1.21 | 5.36 / 4.69 / 9.51 |
+| NoSync indexed, 4 writers, 20 MiB | 1357.96 / 1298.97 / 1979.57 | 45.68 / 42.25 / 30.08 | 3.12 / 3.23 / 1.30 | 11.46 / 10.33 / 1.04 | 6.91 / 7.01 / 9.85 |
+| Durable indexed, 2 writers, 15 MiB | 3342.35 / 3085.69 / 5038.12 | 45.15 / 43.36 / 63.26 | 3.92 / 3.56 / 0.75 | 6.01 / 6.95 / 0.61 | 4.90 / 5.33 / 6.66 |
+| Warmed NoSync queue | 10.23 / 9.54 / 72.82 | 1.83 / 1.85 / 14.06 | 0.32 / 0.24 / 0.06 | 2.77 / 3.36 / 0.44 | 0.28 / 0.20 / 0.44 |
+| Durable outbox | 876.71 / 766.11 / 1222.72 | 167.99 / 156.04 / 224.83 | 0.64 / 0.51 / 0.29 | 32.62 / 30.44 / 55.27 | 82.02 / 54.25 / 126.60 |
+| NoSync indexed, 8 writers, 24 MiB | 1930.47 / 1763.17 / 2548.77 | 81.01 / 72.70 / 54.05 | 8.20 / 6.91 / 1.66 | 19.63 / 18.20 / 1.55 | 9.90 / 9.63 / 12.66 |
+| Durable indexed, 8 writers, 24 MiB | 3637.60 / 3485.97 / 8519.17 | 109.43 / 107.55 / 201.57 | 6.75 / 5.93 / 2.03 | 18.62 / 16.77 / 1.56 | 9.16 / 9.04 / 14.02 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 191.77 / 184.62 / 312.82 | 38.55 / 29.24 / 176.44 | 21.87 / 25.50 / 223.51 | 0.79 / 0.67 / 1.65 |
+| NoSync indexed, 4 writers, 20 MiB | 244.87 / 281.20 / 443.51 | 44.24 / 45.70 / 235.85 | 19.03 / 19.75 / 299.73 | 1.07 / 1.15 / 1.75 |
+| Durable indexed, 2 writers, 15 MiB | 123.58 / 132.62 / 141.21 | 11.36 / 5.01 / 138.83 | 2.43 / 1.61 / 136.52 | 0.35 / 0.45 / 0.65 |
+| NoSync indexed, 8 writers, 24 MiB | 465.64 / 351.82 / 741.99 | 179.12 / 169.83 / 445.00 | 83.67 / 56.42 / 596.91 | 2.31 / 2.10 / 2.87 |
+| Durable indexed, 8 writers, 24 MiB | 344.26 / 320.11 / 1267.44 | 119.73 / 87.71 / 1498.27 | 43.05 / 38.82 / 1725.10 | 1.90 / 1.96 / 3.20 |
+
+In the eight-writer NoSync profile, native work fell from 1.93 to
+1.76 s and per-item p95 fell from 81.01 to 72.70 ms. Multifile took
+2.55 s for work with a 54.05 ms p95. Explicit index flush fell from
+466 to 352 ms, with multifile at 742 ms. Process CPU through
+maintenance was 2.22 s prior, 2.15 s revised and 1.06 s for multifile.
+Grouped reopen took 18.20 ms with multifile at 1.55 ms.
+
+Eight-writer durable work fell from 3.64 to 3.49 s, with multifile at
+8.52 s. The heavier four-writer NoSync profile improved work and
+p95, and its explicit index flush rose from 245 to 281 ms. CPU and
+per-item latency under NoSync churn and indexed close and reopen
+remain qualification gaps.
+
+Verification passed 39 GNU Release, 14 Debug ASan/UBSan and 14 musl
+Release groups. They cover revision fault injection and process exits,
+checkpoint publication and large groups, fragmented budgeted writes,
+and shared lease and messaging under pressure. Formatting and diff
+checks passed.
+
+Raw traces, the prior fixture failure, matched samples and test logs
+are in `build/pouch-space-concurrent/private-write/`.

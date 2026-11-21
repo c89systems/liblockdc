@@ -960,16 +960,6 @@ again:
     return err(error, LC_ERR_INVALID, "payload capacity exhausted; grow");
   return take_payload_selected(s, budget, link, *bytes, *bytes, out, error);
 }
-static int take_payload(ps_space *s, ps_budget *budget, uint64_t *bytes,
-                        uint64_t *out, lc_error *error) {
-  ps_coordination_guard *guard = NULL;
-  int rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK && guard)
-    rc = allocation_refresh(s, error);
-  if (rc == LC_OK)
-    rc = take_payload_locked(s, budget, bytes, out, error);
-  return allocation_end(s, guard, rc, error);
-}
 /* Rebuild free intervals by subtracting reachable runs. Also rejects overlap.
  */
 static int exclude_selected(ps_run **link, uint64_t *available, uint64_t offset,
@@ -2240,7 +2230,7 @@ again:
     p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
     if (!p)
       return err(error, LC_ERR_NOMEM, "cannot allocate packed payload page");
-    rc = take_payload(s, budget, &reserve, &p->run.offset, error);
+    rc = take_payload_locked(s, budget, &reserve, &p->run.offset, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, p);
       return rc;
@@ -2278,17 +2268,6 @@ again:
     }
   }
   return err(error, LC_ERR_PROTOCOL, "packed payload free-span mismatch");
-}
-static int payload_reserve(ps_space *s, ps_entry *entry, ps_extent *extent,
-                           size_t *bytes, int split, ps_budget *budget,
-                           lc_error *error) {
-  ps_coordination_guard *guard = NULL;
-  int rc = allocation_begin(s, &guard, error);
-  if (rc == LC_OK && guard)
-    rc = allocation_refresh(s, error);
-  if (rc == LC_OK)
-    rc = payload_reserve_locked(s, entry, extent, bytes, split, budget, error);
-  return allocation_end(s, guard, rc, error);
 }
 static int metadata_offset(ps_space *s, uint64_t offset) {
   return offset % PS_PAGE == 0 && offset >= PS_METADATA_START &&
@@ -5307,41 +5286,27 @@ int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
              lc_error *error) {
   return begin_value(s, budget, key, 0, out, error);
 }
-static int flush_writer(ps_writer *w, lc_error *error) {
+/* Admit the buffered tail while the caller holds allocator authority.
+ * Every admitted extent belongs to the unpublished writer, including on
+ * failure and while payload I/O runs without the allocator. */
+static int reserve_writer_tail(ps_writer *w, lc_error *error) {
   ps_space *s = w->space;
   ps_entry *p = w->entry;
   ps_extent *extent, *grown;
   size_t n, done = 0, take;
   uint64_t run_bytes;
-  ps_coordination_guard *guard = NULL;
   int rc, split = 0;
-  if (!w->used)
-    return LC_OK;
   while (done < w->used) {
     if (p->count == (PS_JOURNAL - 64) / 24)
       return err(error, LC_ERR_INVALID,
                  "value extent metadata exceeds journal capacity");
-    pthread_mutex_lock(&s->mutex);
-    rc = healthy(s, error);
-    if (rc != LC_OK) {
-      pthread_mutex_unlock(&s->mutex);
-      return rc;
-    }
     if (p->count == p->capacity) {
       n = p->capacity ? p->capacity * 2 : 4;
       grown = lc_realloc_with_allocator(NULL, p->extents, n * sizeof(*grown));
-      if (!grown) {
-        pthread_mutex_unlock(&s->mutex);
+      if (!grown)
         return err(error, LC_ERR_NOMEM, "cannot grow private extent vector");
-      }
       p->extents = grown;
       p->capacity = n;
-    }
-    rc = ps_internal_admission_begin(s, &guard, error);
-    if (rc != LC_OK) {
-      rc = allocation_end(s, guard, rc, error);
-      pthread_mutex_unlock(&s->mutex);
-      return rc;
     }
     extent = &p->extents[p->count];
     memset(extent, 0, sizeof(*extent));
@@ -5349,38 +5314,70 @@ static int flush_writer(ps_writer *w, lc_error *error) {
     run_bytes = take / PS_PAGE * PS_PAGE;
     if (!run_bytes) {
       n = take;
-      rc = payload_reserve(s, p, extent, &take, !split, w->budget, error);
+      rc =
+          payload_reserve_locked(s, p, extent, &take, !split, w->budget, error);
       if (take < n)
         split = 1;
       run_bytes = take;
     } else {
       rc = immutable_extent_allowance(s, p, run_bytes, w->budget, error);
       if (rc == LC_OK)
-        rc = take_payload(s, w->budget, &run_bytes, &extent->offset, error);
+        rc = take_payload_locked(s, w->budget, &run_bytes, &extent->offset,
+                                 error);
       if (rc == LC_OK)
         ps_internal_budget_spend(w->budget, run_bytes, 0, 0);
     }
-    if (rc == LC_OK) {
-      if (run_bytes < take)
-        take = (size_t)run_bytes;
-      extent->bytes = take;
-      extent->crc = checksum(w->buffer + done, take);
-      ++p->count;
-      p->payload_claimed = 1;
-      p->bytes += take;
-    }
-    rc = allocation_end(s, guard, rc, error);
-    pthread_mutex_unlock(&s->mutex);
     if (rc != LC_OK)
       return rc;
-    /* No mutex is held during payload I/O or while callers produce input. */
-    rc = transfer(s, w->buffer + done, take, extent->offset, 1, error);
-    if (rc != LC_OK)
-      return rc;
+    if (run_bytes < take)
+      take = (size_t)run_bytes;
+    extent->bytes = take;
+    extent->crc = checksum(w->buffer + done, take);
+    ++p->count;
+    p->payload_claimed = 1;
+    p->bytes += take;
     done += take;
   }
-  w->used = 0;
   return LC_OK;
+}
+#define WRITER_FLUSH_BATCH 8
+/* One allocator capture for up to a chunk of already buffered tails. The
+ * caller limits both the number of writers and the bytes in this batch. */
+static int flush_writer_batch(ps_writer *const *writers, size_t count,
+                              lc_error *error) {
+  ps_space *s = writers[0]->space;
+  ps_coordination_guard *guard;
+  size_t i, j, at, first[WRITER_FLUSH_BATCH];
+  int rc;
+  for (i = 0; i < count && !writers[i]->used; ++i) {
+  }
+  if (i == count)
+    return LC_OK;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_admission_begin(s, &guard, error);
+  for (j = i; rc == LC_OK && j < count; ++j) {
+    first[j] = writers[j]->entry->count;
+    rc = reserve_writer_tail(writers[j], error);
+  }
+  rc = allocation_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  for (; rc == LC_OK && i < count; ++i) {
+    ps_writer *w = writers[i];
+    ps_entry *p = w->entry;
+    at = 0;
+    for (j = first[i]; rc == LC_OK && j < p->count; ++j) {
+      const ps_extent *extent = &p->extents[j];
+      rc = transfer(s, w->buffer + at, (size_t)extent->bytes, extent->offset, 1,
+                    error);
+      at += (size_t)extent->bytes;
+    }
+    if (rc == LC_OK)
+      w->used = 0;
+  }
+  return rc;
+}
+static int flush_writer(ps_writer *w, lc_error *error) {
+  return flush_writer_batch(&w, 1, error);
 }
 int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   const unsigned char *p = bytes;
@@ -5515,7 +5512,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
   ps_coordination_guard *guard = NULL;
   ps_entry *p, *old;
   unsigned char *wire = NULL;
-  size_t i, j, bytes = 64, cursor, prior, descriptor;
+  size_t i, j, batch, pending, bytes = 64, cursor, prior, descriptor;
   uint64_t metadata, entries, growth = 0, added = 0, sequence = 0, deletion = 0;
   int rc = LC_OK, durable, forced;
   if (prefix)
@@ -5535,13 +5532,20 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
       if (same_key(writers[j]->entry->key, writers[i]->entry->key))
         return err(error, LC_ERR_INVALID, "revision keys must be distinct");
   }
-  for (i = 0; rc == LC_OK && i < count; ++i) {
-    rc = flush_writer(writers[i], error);
-    descriptor = entry_bytes(writers[i]->entry);
-    if (rc == LC_OK && descriptor > PS_JOURNAL - bytes)
-      rc = err(error, LC_ERR_INVALID, "revision metadata exceeds journal");
-    if (rc == LC_OK)
-      bytes += descriptor;
+  for (i = 0; rc == LC_OK && i < count; i += batch) {
+    pending = 0;
+    for (batch = 0; batch < WRITER_FLUSH_BATCH && i + batch < count &&
+                    writers[i + batch]->used <= PS_CHUNK - pending;
+         ++batch)
+      pending += writers[i + batch]->used;
+    rc = flush_writer_batch(writers + i, batch, error);
+    for (j = i; rc == LC_OK && j < i + batch; ++j) {
+      descriptor = entry_bytes(writers[j]->entry);
+      if (descriptor > PS_JOURNAL - bytes)
+        rc = err(error, LC_ERR_INVALID, "revision metadata exceeds journal");
+      else
+        bytes += descriptor;
+    }
   }
   if (rc == LC_OK) {
     wire = lc_alloc_with_allocator(NULL, bytes + (s->readiness ? 64 : 0));

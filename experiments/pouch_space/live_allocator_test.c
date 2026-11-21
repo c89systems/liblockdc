@@ -2928,6 +2928,114 @@ static void expect_value(ps_space *s, ps_key name, size_t bytes, int byte) {
   captured_expect(r, (unsigned char)byte, bytes);
   ps_reader_close(r);
 }
+typedef struct revision_batch_probe {
+  ps_space *peer;
+  size_t acquisitions, writes;
+  int armed, held;
+} revision_batch_probe;
+static int revision_batch_lock(void *context, int fd, int command,
+                               struct flock *lock) {
+  revision_batch_probe *p = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc || !p->armed || lock->l_start != 4)
+    return rc;
+  if (command == F_OFD_SETLKW && lock->l_type == F_WRLCK) {
+    REQUIRE(!p->held);
+    p->held = 1;
+    ++p->acquisitions;
+  } else if (command == F_OFD_SETLK && lock->l_type == F_UNLCK) {
+    REQUIRE(p->held);
+    p->held = 0;
+  }
+  return rc;
+}
+static ssize_t revision_batch_write(void *context, int fd, const void *bytes,
+                                    size_t n, off_t at) {
+  revision_batch_probe *p = context;
+  if (p->armed && at >= PS_DATA) {
+    REQUIRE(!p->held && p->acquisitions == 1);
+    if (++p->writes == 1 && p->peer) {
+      lc_error e = {0};
+      for (uint64_t i = 201; i <= 204; ++i)
+        expect_value(p->peer, key(i), 0, 0);
+      capture_put(p->peer, 211, PS_PAGE);
+      ok(ps_checkpoint(p->peer, &e), &e);
+    }
+  }
+  return pwrite(fd, bytes, n, at);
+}
+static void packed_revision_batch(void) {
+  lc_error e = {0};
+  revision_batch_probe probe = {0};
+  ps_io disk = {&probe,  read_io,    revision_batch_write,
+                sync_io, reserve_io, NULL};
+  ps_coordination_io io = {&probe, revision_batch_lock};
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_budget *budget = NULL;
+  ps_budget_plan plan = {0};
+  ps_writer *writers[4] = {0};
+  unsigned char bytes[PS_PAGE - PS_CELL];
+  options.io = &disk;
+  options.coordination_io = &io;
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  for (size_t i = 0; i < 4; ++i)
+    ok(ps_budget_plan_value(&plan, 65, &e), &e);
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  for (size_t i = 0; i < 4; ++i) {
+    memset(bytes, (int)(201 + i), 65);
+    ok(ps_begin(a, budget, key(201 + i), &writers[i], &e), &e);
+    ok(ps_write(writers[i], bytes, 65, &e), &e);
+  }
+  probe.peer = b;
+  probe.armed = 1;
+  ok(ps_revision_publish(writers, 4, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  probe.armed = 0;
+  REQUIRE(probe.writes == 4 && probe.acquisitions == 2 && !probe.held);
+  for (size_t i = 0; i < 4; ++i) {
+    ps_writer_close(writers[i]);
+    expect_value(b, key(201 + i), 65, (int)(201 + i));
+  }
+  ok(ps_budget_close(budget, &e), &e);
+  expect_value(a, key(211), PS_PAGE, 211);
+
+  /* The first member fits. The second cannot spend another page. No payload
+   * in this batch can reach disk until all its extents are admitted. */
+  plan = (ps_budget_plan){0};
+  for (size_t i = 0; i < 2; ++i)
+    ok(ps_budget_plan_value(&plan, sizeof(bytes), &e), &e);
+  plan.payload_bytes = PS_PAGE;
+  ok(ps_budget_open(a, &plan, &budget, &e), &e);
+  for (size_t i = 0; i < 2; ++i) {
+    memset(bytes, (int)(221 + i), sizeof(bytes));
+    ok(ps_begin(a, budget, key(221 + i), &writers[i], &e), &e);
+    ok(ps_write(writers[i], bytes, sizeof(bytes), &e), &e);
+  }
+  probe = (revision_batch_probe){.armed = 1};
+  REQUIRE(ps_revision_publish(writers, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                              &e) == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  probe.armed = 0;
+  REQUIRE(!probe.writes && probe.acquisitions == 1 && !probe.held);
+  for (size_t i = 0; i < 2; ++i) {
+    ps_writer_close(writers[i]);
+    expect_value(b, key(221 + i), 0, 0);
+  }
+  ok(ps_budget_close(budget, &e), &e);
+  REQUIRE(!status(a).private_bytes && !status(a).claimed_payload_bytes);
+  ok(ps_flush(a, &e), &e);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, NULL, &a, &e), &e);
+  for (uint64_t i = 201; i <= 204; ++i)
+    expect_value(a, key(i), 65, (int)i);
+  expect_value(a, key(211), PS_PAGE, 211);
+  expect_value(a, key(221), 0, 0);
+  expect_value(a, key(222), 0, 0);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct resident_names {
   ps_catalog_info owner;
   size_t count;
@@ -6333,9 +6441,10 @@ int main(int argc, char **argv) {
     stream_handoff(0);
     stream_handoff(1);
     stream_abort_and_cold_open();
-  } else if (!strcmp(argv[2], "packed-replay-locality"))
+  } else if (!strcmp(argv[2], "packed-replay-locality")) {
     packed_replay_locality();
-  else if (!strcmp(argv[2], "piece-barrier-handoff")) {
+    packed_revision_batch();
+  } else if (!strcmp(argv[2], "piece-barrier-handoff")) {
     for (int durable = 0; durable <= 1; ++durable)
       for (int discard = 0; discard <= 1; ++discard)
         piece_barrier_handoff(durable, discard);
