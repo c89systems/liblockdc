@@ -1334,6 +1334,73 @@ static void captures(void) {
     REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
   }
 }
+static int retain_first_value(void *context, ps_key item,
+                              uint64_t incarnation) {
+  (void)context;
+  (void)incarnation;
+  return item.key == 1;
+}
+static void capture_identities(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *reader = NULL;
+  ps_values *view = NULL;
+  ps_key names[2];
+  ps_ref original[2];
+  uint64_t bytes;
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 1, PS_PAGE);
+  capture_put(a, 2, PS_PAGE);
+  ok(ps_checkpoint(a, &e), &e);
+  uint64_t baseline = coverage(NULL, 0);
+  ok(ps_internal_values_capture(a, key(1).owner, PS_STATE, PS_STATE,
+                                retain_first_value, NULL, &view, &e),
+     &e);
+  REQUIRE(ps_values_count(view) == 2 &&
+          status(a).retained_payload_bytes == PS_PAGE &&
+          coverage(NULL, 0) == baseline + PS_PAGE);
+  for (size_t i = 0; i < 2; ++i) {
+    ok(ps_values_info(view, i, &names[i], &original[i], &bytes, &e), &e);
+    REQUIRE(bytes == PS_PAGE && original[i].incarnation);
+  }
+  REQUIRE(names[0].key + names[1].key == 3);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_delete(b, key(1), &e), &e);
+  ok(ps_delete(b, key(2), &e), &e);
+  ok(ps_checkpoint(b, &e), &e);
+  REQUIRE(status(b).retired_bytes >= PS_PAGE);
+  REQUIRE(ps_read_open(a, key(2), NULL, &reader, &e) == LC_ERR_INVALID &&
+          !reader);
+  lc_error_cleanup(&e);
+  ok(ps_check(a, &e), &e);
+  for (size_t i = 0; i < 2; ++i) {
+    ps_key item;
+    ps_ref current;
+    ok(ps_values_info(view, i, &item, &current, &bytes, &e), &e);
+    REQUIRE(item.owner == names[i].owner && item.kind == names[i].kind &&
+            item.key == names[i].key && bytes == PS_PAGE &&
+            current.incarnation == original[i].incarnation &&
+            !memcmp(current.container, original[i].container,
+                    sizeof(current.container)));
+    if (item.key == 2) {
+      REQUIRE(ps_values_read_open(view, i, &reader, &e) == LC_ERR_INVALID &&
+              !reader);
+      lc_error_cleanup(&e);
+    } else {
+      ok(ps_values_read_open(view, i, &reader, &e), &e);
+      captured_expect(reader, 1, PS_PAGE);
+      ps_reader_close(reader);
+      reader = NULL;
+    }
+  }
+  ps_values_close(view);
+  REQUIRE(!status(a).retained_payload_bytes);
+  ok(ps_close(a, &e), &e);
+  ok(ps_checkpoint(b, &e), &e);
+  REQUIRE(!status(b).retired_bytes);
+  ok(ps_close(b, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct capture_fault {
   int kind, reason, armed, rollback;
   size_t nth, calls;
@@ -6068,9 +6135,10 @@ int main(int argc, char **argv) {
     packed();
   else if (!strcmp(argv[2], "history"))
     history();
-  else if (!strcmp(argv[2], "captures"))
+  else if (!strcmp(argv[2], "captures")) {
     captures();
-  else if (!strcmp(argv[2], "capture-faults"))
+    capture_identities();
+  } else if (!strcmp(argv[2], "capture-faults"))
     capture_faults();
   else if (!strcmp(argv[2], "capture-owned"))
     capture_owned();

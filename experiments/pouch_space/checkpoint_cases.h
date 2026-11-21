@@ -441,11 +441,16 @@ static void checkpoint_owner(int durable) {
   CHECK(observation.published == 1);
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(!info.epoch && info.pending && info.pending < 130);
-  OK(ps_key_checkpoint_capture(seed, &values, &info, &error));
+  OK(ps_key_checkpoint_capture(seed, PS_CHECKPOINT_CAPTURE_SEED, &values, &info,
+                               &error));
   CHECK(!info.control && ps_values_count(values));
   CHECK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error) ==
         LC_ERR_PENDING);
   lc_error_cleanup(&error);
+  ps_values_close(values);
+  values = NULL;
+  OK(ps_key_checkpoint_capture(seed, PS_CHECKPOINT_CAPTURE_CHANGED, &values,
+                               &info, &error));
   OK(ps_status(ps_root_space(root), &before, &error));
   allocation_call = 0;
   allocation_fail = 23;
@@ -520,7 +525,8 @@ static void checkpoint_owner(int durable) {
         info.slots == 130 && !info.pending);
   /* Coverage advances without changing any slot. Their existing ledger and
    * reservations already suffice, even if no allocations are available. */
-  OK(ps_key_checkpoint_capture(seed, &values, &info, &error));
+  OK(ps_key_checkpoint_capture(seed, PS_CHECKPOINT_CAPTURE_CHANGED, &values,
+                               &info, &error));
   allocation_call = 0;
   allocation_fail = 1;
   OK(ps_key_checkpoint_adopt(seed, values, &info, 0, 0, &resumed, &offset,

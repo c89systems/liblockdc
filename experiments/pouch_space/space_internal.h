@@ -224,6 +224,13 @@ int ps_catalog_validate_directory(ps_space *, lc_error *);
 void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t, uint64_t);
 int ps_catalog_target_retained(ps_space *, const ps_entry *);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
+/* Runs under allocator authority. The selector reads resident state only.
+ * Every selected row's identity is captured. The selector chooses which
+ * payloads must remain readable after releasing allocator authority. */
+typedef int (*ps_value_retain_fn)(void *, ps_key, uint64_t incarnation);
+int ps_internal_values_capture(ps_space *, uint64_t owner, unsigned int first,
+                               unsigned int last, ps_value_retain_fn, void *,
+                               ps_values **, lc_error *);
 int ps_internal_healthy(ps_space *, lc_error *);
 /* Capture selection and its first physical witness under the same canonical
  * authority. Captured handles subsequently retain their incarnation directly.

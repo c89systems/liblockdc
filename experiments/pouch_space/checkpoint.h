@@ -107,20 +107,28 @@ int ps_key_cursor_next(ps_key_cursor *, lc_pouch_state_entry *, int *,
 void ps_key_cursor_close(ps_key_cursor *);
 /* Capture slots and coverage at one completed visibility prefix, including
  * when the owner has a newer deferred metadata revision. */
-int ps_key_checkpoint_capture(ps_key_checkpoint *, ps_values **,
+enum ps_checkpoint_capture_mode {
+  PS_CHECKPOINT_CAPTURE_FULL,
+  /* Capture slot identities and retain coverage only when it needs decoding. */
+  PS_CHECKPOINT_CAPTURE_SEED,
+  /* Also retain payloads for slots that the resident owner cannot reuse. */
+  PS_CHECKPOINT_CAPTURE_CHANGED
+};
+int ps_key_checkpoint_capture(ps_key_checkpoint *,
+                              enum ps_checkpoint_capture_mode, ps_values **,
                               ps_checkpoint_info *, lc_error *);
 int ps_checkpoint_capture_values(ps_namespace *, const ps_checkpoint_info *,
-                                 ps_values **, ps_checkpoint_info *,
-                                 lc_error *);
+                                 int seed_only, ps_values **,
+                                 ps_checkpoint_info *, lc_error *);
 /* Refresh an initialized coverage memo in the caller's canonical capture. */
 int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
                         ps_checkpoint_info *, int *current, lc_error *);
 /* A coverage token can stay fixed while forward checkpoint slots publish. */
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
                                    const ps_checkpoint_info *, lc_error *);
-/* Adopt the pinned selection under namespace mutation authority. A nonzero
- * active segment certifies the same stream incarnation and a nonregressing
- * tail. The retained replay cursor is at or below the prior accepted tail. */
+/* Adopt identities and read retained changed slots under namespace mutation
+ * authority. A nonzero active segment certifies the same stream incarnation
+ * and a nonregressing tail. The replay cursor is at or below the prior tail. */
 int ps_key_checkpoint_adopt(ps_key_checkpoint *, const ps_values *,
                             const ps_checkpoint_info *, uint64_t active,
                             uint64_t prior_tail, int *resumed,

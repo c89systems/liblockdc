@@ -51,7 +51,7 @@ typedef struct namespace_observation {
   ps_namespace_window *window;
   const lc_pouch_storage_namespace_info *expected;
   uint64_t start, source, bytes;
-  int ready;
+  int ready, seed_only;
 } namespace_observation;
 static int failure(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL,
@@ -338,8 +338,10 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
   if (rc == LC_OK)
     rc = ps_ns_retention_restore(d, e);
   if (rc == LC_OK) {
+    /* Shared reload keeps the resident slots stable through adoption. */
     if (resident)
-      rc = ps_key_checkpoint_capture(resident, &values, &coverage, e);
+      rc = ps_key_checkpoint_capture(resident, PS_CHECKPOINT_CAPTURE_CHANGED,
+                                     &values, &coverage, e);
     else {
       rc = ps_key_checkpoint_open(ns, &d->checkpoint, e);
       if (rc == LC_OK)
@@ -635,8 +637,8 @@ static int capture_selected_view(struct ps_namespace_data *d,
     if (coverage->segment != active && (coverage->segment || active != 1))
       return LC_OK;
     start = coverage->offset;
-    rc = ps_checkpoint_capture_values(d->ns, coverage, &view->metadata,
-                                      &view->coverage, e);
+    rc = ps_checkpoint_capture_values(d->ns, coverage, observed->seed_only,
+                                      &view->metadata, &view->coverage, e);
     if (rc == LC_OK && view->coverage.control != coverage->control) {
       /* A barrier may have advanced selected visibility between captures. */
       ps_values_close(view->metadata);
@@ -1517,7 +1519,7 @@ void ps_namespace_read_close(ps_namespace_window *window) {
 }
 static int view_open(ps_namespace *ns,
                      const lc_pouch_storage_namespace_info *expected,
-                     uint64_t resume_segment, uint64_t start,
+                     uint64_t resume_segment, uint64_t start, int seed_only,
                      ps_namespace_view **out, lc_error *e) {
   struct ps_namespace_data *d;
   ps_namespace_view *view;
@@ -1543,6 +1545,7 @@ static int view_open(ps_namespace *ns,
   observed.view = view;
   observed.expected = expected;
   observed.start = start;
+  observed.seed_only = seed_only;
   rc = lock_current_scope(d, &entered, resume_segment ? NULL : &observed, e);
   if (rc != LC_OK) {
     ps_namespace_view_close(view);
@@ -1562,8 +1565,10 @@ static int view_open(ps_namespace *ns,
     if (expected)
       ps_key_checkpoint_info(d->checkpoint, &view->coverage);
     else
-      rc = ps_key_checkpoint_capture(d->checkpoint, &view->metadata,
-                                     &view->coverage, e);
+      rc = ps_key_checkpoint_capture(d->checkpoint,
+                                     seed_only ? PS_CHECKPOINT_CAPTURE_SEED
+                                               : PS_CHECKPOINT_CAPTURE_FULL,
+                                     &view->metadata, &view->coverage, e);
   }
   if (rc == LC_OK)
     rc = projection(d, &view->coverage, &view->projection, e);
@@ -1631,7 +1636,7 @@ static int view_open(ps_namespace *ns,
 }
 int ps_namespace_view_open(ps_namespace *ns, ps_namespace_view **out,
                            lc_error *e) {
-  return view_open(ns, NULL, 0, 0, out, e);
+  return view_open(ns, NULL, 0, 0, 0, out, e);
 }
 int ps_namespace_view_suffix_open(ps_namespace *ns,
                                   const lc_pouch_storage_namespace_info *info,
@@ -1642,7 +1647,7 @@ int ps_namespace_view_suffix_open(ps_namespace *ns,
       *out = NULL;
     return failure(e, LC_ERR_INVALID, "namespace suffix requires a boundary");
   }
-  return view_open(ns, info, 0, start, out, e);
+  return view_open(ns, info, 0, start, 0, out, e);
 }
 void ps_namespace_view_projection(const ps_namespace_view *view,
                                   lc_pouch_storage_namespace_info *out) {
@@ -1831,7 +1836,8 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   if (rc != LC_OK)
     return rc;
   for (attempt = 0;; ++attempt) {
-    rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, &view, e);
+    rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, 1, &view,
+                   e);
     if (rc != LC_OK)
       break;
     rc = ps_key_checkpoint_confirm_seed(d->checkpoint, view->metadata,

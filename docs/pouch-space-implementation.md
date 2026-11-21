@@ -11220,3 +11220,81 @@ capacity, reader ownership, and stream and journal recovery.
 
 Raw shapes, pilots, paired traces, matched samples, and test logs are
 in `build/pouch-space-concurrent/checkpoint-preparation/`.
+
+## Capturing checkpoint identities with selective payload retention
+
+In three eight-writer NoSync traces, internal writer seed checks and
+resident adoption accounted for 52–55% of the captured canonical key
+and decision rows. A seed check matches coverage, slot kind, incarnation
+and count. Resident adoption decodes only slots it cannot reuse.
+
+The native allocator now captures all selected identities at one
+completed prefix and takes physical read witnesses only for rows the
+caller will decode. A seed check retains a changed coverage record when
+it needs decoding. Resident adoption also retains new, changed or dirty
+slots. Shared namespace mutation authority keeps the resident ledger
+stable from the capture through adoption. Ordinary views and cold
+checkpoint loads retain every payload they can read. Captures carry
+copied key, incarnation and length metadata. Selected payloads still
+flow through the existing readers in bounded pieces.
+
+The mixed-capture fixture opens an independent peer, deletes both selected
+values and checkpoints. The capture keeps both old identities and the one
+retained payload. Its physical witness covers exactly one page. The
+identity-only row rejects payload reads and the last retained page becomes
+reusable when the capture closes. The checkpoint-owner fixture detects
+forward slot publication under an unchanged coverage token, retries a
+failed changed-slot adoption, and advances coverage while reusing all
+130 resident slots without allocations during adoption.
+
+Three paired eight-writer NoSync traces verified 1,152 items per build.
+Median physical payload read claims dropped from 77,299 to 46,640 and
+releases from 77,462 to 46,785. Claim and release pairs on the shared
+allocator lock stayed near 36,000. Median payload conflict probes fell
+from 100,910 to 92,433. Median traced system CPU fell from 1.90 to
+1.49 s. The traces include instrumentation overhead.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`298d0025`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 814.35 / 863.51 / 1314.58 | 42.01 / 44.80 / 29.73 | 3.03 / 2.67 / 1.16 | 7.57 / 8.25 / 0.94 | 5.09 / 5.27 / 6.89 |
+| NoSync indexed, 4 writers, 20 MiB | 1689.12 / 1503.11 / 2310.71 | 55.78 / 47.57 / 34.31 | 8.47 / 5.84 / 1.30 | 14.25 / 12.60 / 0.99 | 10.71 / 7.64 / 10.86 |
+| Durable indexed, 2 writers, 15 MiB | 3671.74 / 3414.42 / 5945.13 | 50.90 / 45.91 / 75.53 | 3.85 / 1.93 / 1.02 | 7.07 / 7.17 / 0.78 | 7.07 / 6.49 / 8.80 |
+| Warmed NoSync queue | 11.47 / 10.79 / 91.01 | 2.17 / 2.06 / 19.93 | 0.30 / 0.26 / 0.10 | 3.38 / 2.82 / 0.48 | 0.28 / 0.30 / 0.58 |
+| Durable outbox | 906.68 / 889.31 / 1436.81 | 171.11 / 162.56 / 270.85 | 0.81 / 0.77 / 0.30 | 34.88 / 35.22 / 68.72 | 60.75 / 61.52 / 155.68 |
+| NoSync indexed, 8 writers, 24 MiB | 2241.96 / 2129.87 / 2883.75 | 93.25 / 85.68 / 65.43 | 11.79 / 9.29 / 1.96 | 28.43 / 17.70 / 1.92 | 10.53 / 10.43 / 14.28 |
+| Durable indexed, 8 writers, 24 MiB | 4324.21 / 3754.68 / 9522.88 | 135.42 / 118.13 / 226.78 | 19.94 / 29.57 / 1.91 | 21.19 / 25.89 / 1.89 | 10.77 / 15.63 / 14.37 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 192.21 / 236.49 / 340.35 | 38.24 / 52.03 / 196.99 | 20.48 / 25.60 / 231.97 | 0.84 / 0.79 / 1.21 |
+| NoSync indexed, 4 writers, 20 MiB | 328.79 / 240.92 / 499.17 | 91.67 / 60.96 / 349.87 | 46.16 / 39.14 / 351.41 | 1.78 / 1.28 / 2.10 |
+| Durable indexed, 2 writers, 15 MiB | 137.34 / 129.85 / 195.89 | 21.00 / 4.40 / 160.88 | 7.78 / 2.20 / 136.30 | 0.62 / 0.52 / 0.97 |
+| NoSync indexed, 8 writers, 24 MiB | 445.92 / 446.03 / 859.40 | 211.97 / 188.88 / 524.50 | 118.60 / 97.22 / 641.31 | 2.42 / 2.40 / 3.38 |
+| Durable indexed, 8 writers, 24 MiB | 421.79 / 353.72 / 1232.15 | 161.69 / 159.10 / 1608.72 | 83.28 / 50.19 / 1991.54 | 2.47 / 3.67 / 3.34 |
+
+In the uninstrumented eight-writer NoSync profile, native work fell
+from 2.24 to 2.13 s and per-item p95 fell from 93.25 to 85.68 ms.
+Median process CPU through maintenance was 2.75 s prior, 2.74 s
+revised and 1.28 s for multifile. Median mutation-worker CPU was
+2.11 s for revised native and 0.89 s for multifile. The heavy
+four-writer NoSync profile improved work and p95.
+The smaller four-writer profile used less CPU, at 0.58 s versus
+0.67 s prior, while its work and p95 rose. Eight-writer durable work
+fell to 3.75 s versus 4.32 s prior and 9.52 s for multifile. Its
+close and reopen times increased. Qualification gaps include NoSync
+tail latency, NoSync CPU, and indexed close and reopen.
+
+Verification passed 42 GNU Release, 18 Debug ASan/UBSan and 18 musl
+Release groups. The groups covered capture faults and races, shared
+checkpoint refresh and journal recovery, fixed-capacity lease and
+messaging, and streaming handoff. Formatting and diff checks passed.
+
+The traces, matched samples, and test logs are in
+`build/pouch-space-concurrent/allocator-cpu/`.

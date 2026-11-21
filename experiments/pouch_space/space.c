@@ -66,9 +66,14 @@ static int canonical_refresh(ps_space *, int verify_disk, lc_error *);
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 static int stream_structure_ready(ps_space *, const ps_entry *, lc_error *);
+typedef struct ps_value_slot {
+  ps_key key;
+  uint64_t token, bytes;
+  ps_entry *retained;
+} ps_value_slot;
 struct ps_values {
   ps_space *space;
-  ps_entry **items;
+  ps_value_slot *items;
   size_t count;
 };
 struct ps_owned_head {
@@ -5979,8 +5984,10 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   lc_free_with_allocator(NULL, buffer);
   return rc;
 }
-int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
-                      unsigned int last, ps_values **out, lc_error *error) {
+int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,
+                               unsigned int last, ps_value_retain_fn retain,
+                               void *context, ps_values **out,
+                               lc_error *error) {
   ps_values *view;
   ps_coordination_guard *guard;
   ps_entry *p, *selected;
@@ -6014,11 +6021,17 @@ int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
       if (p->key.owner == owner && p->key.kind >= first &&
           p->key.kind <= last && immutable_key(p->key) &&
           (selected = selected_value(s, p, prefix)) != NULL) {
-        rc = ps_internal_entry_pin(s, selected, error);
-        if (rc == LC_OK)
-          view->items[at++] = selected;
-        else
-          break;
+        ps_value_slot *item = &view->items[at];
+        item->key = selected->key;
+        item->token = selected->token;
+        item->bytes = selected->bytes;
+        if (!retain || retain(context, item->key, item->token)) {
+          rc = ps_internal_entry_pin(s, selected, error);
+          if (rc != LC_OK)
+            break;
+          item->retained = selected;
+        }
+        ++at;
       }
   rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc == LC_OK) {
@@ -6026,8 +6039,11 @@ int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
     view->count = at;
     ++s->readers;
   } else
-    while (at)
-      ps_internal_entry_unpin(s, view->items[--at]);
+    while (at) {
+      ps_entry *retained = view->items[--at].retained;
+      if (retained)
+        ps_internal_entry_unpin(s, retained);
+    }
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
     *out = view;
@@ -6037,14 +6053,19 @@ int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
   }
   return rc;
 }
+int ps_values_capture(ps_space *s, uint64_t owner, unsigned int first,
+                      unsigned int last, ps_values **out, lc_error *error) {
+  return ps_internal_values_capture(s, owner, first, last, NULL, NULL, out,
+                                    error);
+}
 size_t ps_values_count(const ps_values *view) { return view ? view->count : 0; }
 int ps_values_info(const ps_values *view, size_t at, ps_key *key, ps_ref *ref,
                    uint64_t *bytes, lc_error *error) {
-  ps_entry *p;
+  const ps_value_slot *p;
   if (!view || at >= view->count || !key || !ref || !bytes)
     return err(error, LC_ERR_INVALID,
                "captured value requires index and output");
-  p = view->items[at];
+  p = &view->items[at];
   *key = p->key;
   memcpy(ref->container, view->space->identity, sizeof(ref->container));
   ref->incarnation = p->token;
@@ -6061,6 +6082,8 @@ int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
   if (!view || at >= view->count || !out)
     return err(error, LC_ERR_INVALID,
                "captured reader requires index and output");
+  if (!view->items[at].retained)
+    return err(error, LC_ERR_INVALID, "capture has no retained payload");
   reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
   if (!reader)
     return err(error, LC_ERR_NOMEM, "cannot allocate captured value reader");
@@ -6069,7 +6092,7 @@ int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
   rc = healthy(s, error);
   if (rc == LC_OK) {
     reader->space = s;
-    reader->entry = view->items[at];
+    reader->entry = view->items[at].retained;
     ++reader->entry->pins;
     ++s->readers;
   }
@@ -6102,6 +6125,9 @@ int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
     return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
   if (!view->count)
     return LC_OK;
+  for (i = 0; i < view->count; ++i)
+    if (!view->items[i].retained)
+      return err(error, LC_ERR_INVALID, "capture has no retained payload");
   if (view->count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
     return err(error, LC_ERR_NOMEM, "captured read order exceeds local limit");
   bytes = view->count * sizeof(*order);
@@ -6109,7 +6135,8 @@ int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
   if (!walk)
     return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
   order = (void *)(walk + 1);
-  memcpy(order, view->items, bytes);
+  for (i = 0; i < view->count; ++i)
+    order[i] = view->items[i].retained;
   qsort(order, view->count, sizeof(*order), value_position);
   walk->packed.offset = 0;
   r = &walk->reader;
@@ -6135,7 +6162,8 @@ void ps_values_close(ps_values *view) {
   s = view->space;
   pthread_mutex_lock(&s->mutex);
   for (i = 0; i < view->count; ++i)
-    ps_internal_entry_unpin(s, view->items[i]);
+    if (view->items[i].retained)
+      ps_internal_entry_unpin(s, view->items[i].retained);
   --s->readers;
   collect_retired(s);
   pthread_mutex_unlock(&s->mutex);

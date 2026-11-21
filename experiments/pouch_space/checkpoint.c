@@ -564,10 +564,31 @@ int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
   }
   return rc;
 }
-int ps_checkpoint_capture_values(ps_namespace *ns,
-                                 const ps_checkpoint_info *known,
-                                 ps_values **out, ps_checkpoint_info *coverage,
-                                 lc_error *e) {
+typedef struct checkpoint_capture {
+  ps_key_checkpoint *resident;
+  const ps_checkpoint_info *known;
+  enum ps_checkpoint_capture_mode mode;
+} checkpoint_capture;
+static int keep_selected_slot(const key_slot *slot, ps_key key,
+                              uint64_t incarnation) {
+  return slot && slot->kind == key.kind && !slot->dirty_link &&
+         slot->selected_incarnation == incarnation;
+}
+static int checkpoint_retain_value(void *context, ps_key key,
+                                   uint64_t incarnation) {
+  checkpoint_capture *capture = context;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT)
+    return incarnation != capture->known->control;
+  if (capture->mode == PS_CHECKPOINT_CAPTURE_SEED)
+    return 0;
+  return !keep_selected_slot(find_id(capture->resident, key.key), key,
+                             incarnation);
+}
+static int checkpoint_capture_values(ps_namespace *ns,
+                                     checkpoint_capture *capture,
+                                     ps_values **out,
+                                     ps_checkpoint_info *coverage,
+                                     lc_error *e) {
   ps_values *values = NULL;
   ps_reader *reader = NULL;
   ps_key key;
@@ -577,16 +598,20 @@ int ps_checkpoint_capture_values(ps_namespace *ns,
   int rc;
   *out = NULL;
   memset(coverage, 0, sizeof(*coverage));
-  rc = ps_values_capture(ns->root->space, ns->identity.owner, PS_KEY_METADATA,
-                         PS_NAMESPACE_CHECKPOINT, &values, e);
+  rc = ps_internal_values_capture(ns->root->space, ns->identity.owner,
+                                  PS_KEY_METADATA, PS_NAMESPACE_CHECKPOINT,
+                                  capture->mode == PS_CHECKPOINT_CAPTURE_FULL
+                                      ? NULL
+                                      : checkpoint_retain_value,
+                                  capture, &values, e);
   for (i = 0; rc == LC_OK && i < ps_values_count(values); ++i) {
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
     if (rc != LC_OK || key.kind != PS_NAMESPACE_CHECKPOINT)
       continue;
     if (key.key != 1)
       rc = failure(e, LC_ERR_PROTOCOL, "unknown namespace coverage slot");
-    else if (ref.incarnation == known->control)
-      *coverage = *known;
+    else if (ref.incarnation == capture->known->control)
+      *coverage = *capture->known;
     else {
       rc = ps_values_read_open(values, i, &reader, e);
       if (rc == LC_OK)
@@ -601,13 +626,30 @@ int ps_checkpoint_capture_values(ps_namespace *ns,
     ps_values_close(values);
   return rc;
 }
-int ps_key_checkpoint_capture(ps_key_checkpoint *c, ps_values **out,
-                              ps_checkpoint_info *coverage, lc_error *e) {
+int ps_checkpoint_capture_values(ps_namespace *ns,
+                                 const ps_checkpoint_info *known, int seed_only,
+                                 ps_values **out, ps_checkpoint_info *coverage,
+                                 lc_error *e) {
+  checkpoint_capture capture;
+  capture.resident = NULL;
+  capture.known = known;
+  capture.mode =
+      seed_only ? PS_CHECKPOINT_CAPTURE_SEED : PS_CHECKPOINT_CAPTURE_FULL;
+  return checkpoint_capture_values(ns, &capture, out, coverage, e);
+}
+int ps_key_checkpoint_capture(ps_key_checkpoint *c,
+                              enum ps_checkpoint_capture_mode mode,
+                              ps_values **out, ps_checkpoint_info *coverage,
+                              lc_error *e) {
+  checkpoint_capture capture;
   int rc;
   if (!c || !out || !coverage)
     return failure(e, LC_ERR_INVALID, "metadata capture requires output");
   pthread_mutex_lock(&c->mutex);
-  rc = ps_checkpoint_capture_values(c->ns, &c->selected, out, coverage, e);
+  capture.resident = c;
+  capture.known = &c->selected;
+  capture.mode = mode;
+  rc = checkpoint_capture_values(c->ns, &capture, out, coverage, e);
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
@@ -762,7 +804,8 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
            ? room(c, 1, e)
            : failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint sources");
   if (rc == LC_OK)
-    rc = ps_key_checkpoint_capture(c, &values, &selected, e);
+    rc = ps_key_checkpoint_capture(c, PS_CHECKPOINT_CAPTURE_FULL, &values,
+                                   &selected, e);
   if (rc == LC_OK) {
     select_checkpoint(c, &selected);
     rc = ps_values_read_walk(values, load_slot, c, e);
@@ -847,8 +890,7 @@ static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
     if (rc != LC_OK || key.kind == PS_NAMESPACE_CHECKPOINT)
       continue;
     old = find_id(c, key.key);
-    if (old && old->kind == key.kind && !old->dirty_link &&
-        old->selected_incarnation == ref.incarnation) {
+    if (keep_selected_slot(old, key, ref.incarnation)) {
       if (old->retained) {
         rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a retained slot");
         break;
