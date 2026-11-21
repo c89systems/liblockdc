@@ -1733,13 +1733,25 @@ static double projection_milliseconds(void) {
 typedef struct descriptor_probe {
   uint64_t pages[72];
   size_t reads[72], count;
+  size_t calls, superblocks;
+  uint64_t following;
 } descriptor_probe;
 static ssize_t descriptor_read(void *context, int fd, void *bytes, size_t n,
                                off_t offset) {
   descriptor_probe *probe = context;
+  size_t covered = 0;
+  if (!offset && n == PS_PAGE + PS_TOKEN_RECORD_OFFSET + PS_TOKEN_RECORD_BYTES)
+    ++probe->superblocks;
   for (size_t i = 0; i < probe->count; ++i)
-    if (n == PS_PAGE && (uint64_t)offset == probe->pages[i])
+    if (n >= PS_PAGE && (uint64_t)offset <= probe->pages[i] &&
+        probe->pages[i] - (uint64_t)offset <= n - PS_PAGE) {
       ++probe->reads[i];
+      ++covered;
+    }
+  if (covered)
+    ++probe->calls;
+  if (covered > 1 && !probe->following)
+    probe->following = (uint64_t)offset + PS_PAGE;
   return pread(fd, bytes, n, offset);
 }
 static void directory_reopen_locality(int evict) {
@@ -1769,9 +1781,16 @@ static void directory_reopen_locality(int evict) {
     if (cold)
       ok(ps_close(writer, &e), &e);
     memset(probe.reads, 0, sizeof(probe.reads));
+    probe.calls = 0;
+    probe.superblocks = 0;
+    probe.following = 0;
     ok(ps_open(path, 0, &options, &observer, &e), &e);
     for (size_t i = 0; i < probe.count; ++i)
       REQUIRE(probe.reads[i] == 1);
+    REQUIRE(probe.calls < probe.count && probe.following);
+    REQUIRE(probe.superblocks == 1);
+    printf("directory_admission cold=%d pages=%zu reads=%zu\n", cold,
+           probe.count, probe.calls);
     for (uint64_t id = 1; id <= count; ++id) {
       ps_ref ref;
       uint64_t bytes;
@@ -1782,6 +1801,22 @@ static void directory_reopen_locality(int evict) {
          &e);
       REQUIRE(present && !bytes && ref.incarnation);
     }
+    ok(ps_close(observer, &e), &e);
+  }
+  if (!evict) {
+    /* The second page in a shared transfer must pass its own checks. */
+    unsigned char original, changed;
+    off_t offset = (off_t)probe.following;
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    REQUIRE(fd >= 0 && pread(fd, &original, 1, offset) == 1);
+    changed = original ^ 1U;
+    REQUIRE(pwrite(fd, &changed, 1, offset) == 1 && fdatasync(fd) == 0);
+    REQUIRE(ps_open(path, 0, &options, &observer, &e) == LC_ERR_PROTOCOL &&
+            !observer);
+    lc_error_cleanup(&e);
+    REQUIRE(pwrite(fd, &original, 1, offset) == 1 && fdatasync(fd) == 0 &&
+            close(fd) == 0);
+    ok(ps_open(path, 0, &options, &observer, &e), &e);
     ok(ps_close(observer, &e), &e);
   }
   REQUIRE(!coverage(NULL, 0) && !unlink(path));

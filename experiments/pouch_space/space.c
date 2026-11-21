@@ -2993,20 +2993,12 @@ static uint64_t token_record_limit(ps_space *s, const unsigned char *record) {
              ? limit
              : 0;
 }
-static int read_token_limit(ps_space *s, uint64_t *limit, int *selected,
-                            lc_error *error) {
-  unsigned char record[PS_TOKEN_RECORD_BYTES];
+static int decode_token_limit(ps_space *s, const unsigned char *first,
+                              const unsigned char *second, uint64_t *limit,
+                              int *selected, lc_error *error) {
   uint64_t a, b, prior;
-  int rc =
-      transfer(s, record, sizeof(record), PS_TOKEN_RECORD_OFFSET, 0, error);
-  if (rc != LC_OK)
-    return rc;
-  a = token_record_limit(s, record);
-  rc = transfer(s, record, sizeof(record), PS_PAGE + PS_TOKEN_RECORD_OFFSET, 0,
-                error);
-  if (rc != LC_OK)
-    return rc;
-  b = token_record_limit(s, record);
+  a = token_record_limit(s, first);
+  b = token_record_limit(s, second);
   *selected = b > a;
   *limit = *selected ? b : a;
   prior = *selected ? a : b;
@@ -3223,12 +3215,18 @@ static int canonical_journal(ps_space *s,
   return LC_OK;
 }
 #define META_READ_PAGES 64U
+#define META_READ_AHEAD_PAGES 8U
+#define META_DIRECTORY_BATCH 128U
 typedef struct metadata_read_page {
   uint64_t offset, generation, following;
   size_t used;
   struct metadata_read_page *next, **link;
   unsigned char bytes[PS_PAGE];
 } metadata_read_page;
+typedef struct metadata_directory_entry {
+  ps_key key;
+  ps_directory_value ref;
+} metadata_directory_entry;
 typedef struct metadata_recovery {
   ps_space *space;
   unsigned char *wire;
@@ -3238,26 +3236,37 @@ typedef struct metadata_recovery {
    * Retain a bounded set of checked immutable pages for this traversal. */
   metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
   size_t next_slot;
+  metadata_directory_entry entries[META_DIRECTORY_BATCH];
+  size_t count;
 } metadata_recovery;
 static void metadata_read_cache_close(metadata_recovery *r) {
   size_t i;
   for (i = 0; i < META_READ_PAGES; ++i)
     lc_free_with_allocator(NULL, r->slots[i]);
 }
+static metadata_read_page *metadata_read_find(const metadata_recovery *r,
+                                              uint64_t offset) {
+  metadata_read_page *p;
+  for (p = r->buckets[(offset / PS_PAGE) % META_READ_PAGES]; p; p = p->next)
+    if (p->offset == offset)
+      return p;
+  return NULL;
+}
 static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
+                                    const unsigned char *read_ahead,
                                     metadata_read_page **out, lc_error *error) {
   ps_space *s = r->space;
   metadata_read_page **bucket, *page;
   const unsigned char *buffer;
-  int rc;
+  int rc = LC_OK;
   if (!metadata_offset(s, offset))
     return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
+  page = metadata_read_find(r, offset);
+  if (page) {
+    *out = page;
+    return LC_OK;
+  }
   bucket = &r->buckets[(offset / PS_PAGE) % META_READ_PAGES];
-  for (page = *bucket; page; page = page->next)
-    if (page->offset == offset) {
-      *out = page;
-      return LC_OK;
-    }
   page = r->slots[r->next_slot];
   if (page) {
     *page->link = page->next;
@@ -3270,7 +3279,10 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
                  "cannot cache checkpoint descriptor page");
     r->slots[r->next_slot] = page;
   }
-  rc = transfer(s, page->bytes, PS_PAGE, offset, 0, error);
+  if (read_ahead)
+    memcpy(page->bytes, read_ahead, PS_PAGE);
+  else
+    rc = transfer(s, page->bytes, PS_PAGE, offset, 0, error);
   if (rc != LC_OK)
     return rc;
   buffer = page->bytes;
@@ -3293,6 +3305,55 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   r->next_slot = (r->next_slot + 1) % META_READ_PAGES;
   *out = page;
   return LC_OK;
+}
+static int metadata_offset_order(const void *a, const void *b) {
+  uint64_t left = *(const uint64_t *)a, right = *(const uint64_t *)b;
+  return left < right ? -1 : left != right;
+}
+static int metadata_read_ahead(metadata_recovery *r, lc_error *error) {
+  uint64_t offsets[META_DIRECTORY_BATCH];
+  metadata_read_page *page;
+  size_t i, start, part, count = 0;
+  int rc = LC_OK;
+  for (i = 0; i < r->count; ++i)
+    offsets[i] = r->entries[i].ref.offset / PS_PAGE * PS_PAGE;
+  qsort(offsets, r->count, sizeof(*offsets), metadata_offset_order);
+  for (i = 0; i < r->count; ++i) {
+    if (count && offsets[i] == offsets[count - 1])
+      continue;
+    if (!metadata_offset(r->space, offsets[i]))
+      return err(error, LC_ERR_PROTOCOL, "metadata record outside container");
+    offsets[count++] = offsets[i];
+  }
+  if (count > META_READ_PAGES)
+    return LC_OK;
+  for (i = 0; rc == LC_OK && i < count;) {
+    start = i++;
+    if (metadata_read_find(r, offsets[start]))
+      continue;
+    while (i < count && i - start < META_READ_AHEAD_PAGES &&
+           offsets[i] == offsets[i - 1] + PS_PAGE &&
+           !metadata_read_find(r, offsets[i]))
+      ++i;
+    if (i - start < 2)
+      continue;
+    /* Leave pages needed by this batch resident. Demand reads still handle
+     * continuations and any batches that do not fit the cache. */
+    for (part = 0; part < i - start; ++part) {
+      page = r->slots[(r->next_slot + part) % META_READ_PAGES];
+      if (page && bsearch(&page->offset, offsets, count, sizeof(*offsets),
+                          metadata_offset_order))
+        break;
+    }
+    if (part != i - start)
+      continue;
+    rc = transfer(r->space, r->wire, (i - start) * PS_PAGE, offsets[start], 0,
+                  error);
+    for (part = start; rc == LC_OK && part < i; ++part)
+      rc = metadata_read_cache_page(
+          r, offsets[part], r->wire + (part - start) * PS_PAGE, &page, error);
+  }
+  return rc;
 }
 static int recover_directory_page(void *v, ps_directory_root ref,
                                   lc_error *error) {
@@ -3318,7 +3379,7 @@ static int recover_directory_page(void *v, ps_directory_root ref,
   return LC_OK;
 }
 static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
-                         lc_error *error) {
+                         const unsigned char **wire, lc_error *error) {
   ps_space *s = recovery->space;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take;
@@ -3326,7 +3387,7 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
   metadata_read_page *page = NULL;
   int rc;
   while (done < ref.bytes) {
-    rc = metadata_read_cache_page(recovery, offset, &page, error);
+    rc = metadata_read_cache_page(recovery, offset, NULL, &page, error);
     if (rc != LC_OK)
       return rc;
     if ((generation && page->generation != generation) || at < META_HEADER ||
@@ -3357,6 +3418,10 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
     take = META_HEADER + page->used - at;
     if (take > ref.bytes - done)
       take = (size_t)ref.bytes - done;
+    if (!done && take == ref.bytes) {
+      *wire = page->bytes + at;
+      return LC_OK;
+    }
     memcpy(recovery->wire + done, page->bytes + at, take);
     done += take;
     if (done < ref.bytes && (!page->following || page->used != META_PAYLOAD))
@@ -3364,18 +3429,18 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
     offset = page->following;
     at = META_HEADER;
   }
+  *wire = recovery->wire;
   return LC_OK;
 }
-static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
-                                   lc_error *error) {
-  metadata_recovery *recovery = v;
+static int recover_directory_entry(metadata_recovery *recovery, ps_key key,
+                                   ps_directory_value ref, lc_error *error) {
   ps_space *s = recovery->space;
-  unsigned char *wire = recovery->wire;
+  const unsigned char *wire = NULL;
   ps_entry *p = NULL;
   int event, rc;
   if (ref.bytes < 64 || ref.bytes > PS_JOURNAL)
     return err(error, LC_ERR_PROTOCOL, "invalid checkpoint descriptor span");
-  rc = metadata_read(recovery, ref, error);
+  rc = metadata_read(recovery, ref, &wire, error);
   if (rc == LC_OK)
     rc = decode_entry(s, wire, (size_t)ref.bytes, &p, &event, error);
   if (rc == LC_OK && (event != PS_PUT || !same_key(p->key, key) ||
@@ -3397,6 +3462,23 @@ static int recover_directory_entry(void *v, ps_key key, ps_directory_value ref,
   } else if (p)
     entry_free(p);
   return rc;
+}
+static int recover_directory_batch(metadata_recovery *r, lc_error *error) {
+  size_t i;
+  int rc = metadata_read_ahead(r, error);
+  for (i = 0; rc == LC_OK && i < r->count; ++i)
+    rc =
+        recover_directory_entry(r, r->entries[i].key, r->entries[i].ref, error);
+  r->count = 0;
+  return rc;
+}
+static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
+                                   lc_error *error) {
+  metadata_recovery *r = v;
+  r->entries[r->count].key = key;
+  r->entries[r->count++].ref = ref;
+  return r->count == META_DIRECTORY_BATCH ? recover_directory_batch(r, error)
+                                          : LC_OK;
 }
 /* Validate the entire candidate before changing any selected ownership. A
  * complete inner record is not independently recoverable inside a revision. */
@@ -3841,19 +3923,30 @@ static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
                              lc_error *error) {
   ps_directory *directory = NULL;
-  metadata_recovery recovery = {0};
+  metadata_recovery *recovery = NULL;
   int rc = initial_free(s, error);
-  recovery.space = s;
-  recovery.wire = wire;
-  recovery.certified_root = certificate->root == s->generation;
-  recovery.cohort_origin = certificate->origin;
-  if (rc == LC_OK)
+  if (rc == LC_OK && s->directory.offset)
     rc = directory_open(s, s->directory, &directory, error);
-  if (rc == LC_OK)
-    rc = ps_directory_visit(directory, recover_directory_entry,
-                            recover_directory_page, &recovery, error);
+  if (rc == LC_OK && directory) {
+    recovery = lc_calloc_with_allocator(NULL, 1, sizeof(*recovery));
+    if (!recovery)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate directory recovery batch");
+  }
+  if (rc == LC_OK && recovery) {
+    recovery->space = s;
+    recovery->wire = wire;
+    recovery->certified_root = certificate->root == s->generation;
+    recovery->cohort_origin = certificate->origin;
+    rc = ps_directory_visit(directory, capture_directory_entry,
+                            recover_directory_page, recovery, error);
+    if (rc == LC_OK && recovery->count)
+      rc = recover_directory_batch(recovery, error);
+  }
   ps_directory_close(directory);
-  metadata_read_cache_close(&recovery);
+  if (recovery) {
+    metadata_read_cache_close(recovery);
+    lc_free_with_allocator(NULL, recovery);
+  }
   if (rc == LC_OK)
     rc = validate_owned_directory(s, error);
   if (rc == LC_OK)
@@ -3995,32 +4088,35 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   return LC_OK;
 }
 static int recover(ps_space *s, lc_error *error) {
-  unsigned char roots[2 * PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0}, *wire;
+  unsigned char zero[PS_ROOT_BYTES] = {0};
+  unsigned char
+      superblocks[PS_PAGE + PS_TOKEN_RECORD_OFFSET + PS_TOKEN_RECORD_BYTES],
+      *wire;
   recovery_values *values;
   ps_readiness_certificate certificate;
-  const unsigned char *root;
+  const unsigned char *roots[2], *root;
   ps_entry *p = NULL;
   struct stat st;
   uint64_t grant_limit;
   size_t cursor = 0, bytes, i, first, last;
   int a, b, event, rc, retire_sibling, retirement_needed, range_available;
   int pending_data = 0, grant_slot;
-  rc = transfer(s, roots, PS_ROOT_BYTES, 0, 0, error);
-  if (rc == LC_OK)
-    rc = transfer(s, roots + PS_ROOT_BYTES, PS_ROOT_BYTES, PS_PAGE, 0, error);
+  roots[0] = superblocks;
+  roots[1] = superblocks + PS_PAGE;
+  rc = transfer(s, superblocks, sizeof(superblocks), 0, 0, error);
   if (rc != LC_OK)
     return rc;
-  a = root_valid(roots);
-  b = root_valid(roots + PS_ROOT_BYTES);
+  a = root_valid(roots[0]);
+  b = root_valid(roots[1]);
   if (!a && !b)
     return err(error, LC_ERR_PROTOCOL, "no recoverable container root");
   if (a && b &&
-      (memcmp(roots + 56, roots + PS_ROOT_BYTES + 56, 16) == 0
-           ? get64(roots + 8) == get64(roots + PS_ROOT_BYTES + 8)
+      (memcmp(roots[0] + 56, roots[1] + 56, 16) == 0
+           ? get64(roots[0] + 8) == get64(roots[1] + 8)
            : 1))
     return err(error, LC_ERR_PROTOCOL, "conflicting container roots");
-  s->root = b && (!a || get64(roots + PS_ROOT_BYTES + 8) > get64(roots + 8));
-  root = roots + PS_ROOT_BYTES * s->root;
+  s->root = b && (!a || get64(roots[1] + 8) > get64(roots[0] + 8));
+  root = roots[s->root];
   s->generation = get64(root + 8);
   s->capacity = get64(root + 16);
   s->sequence = get64(root + 24);
@@ -4028,7 +4124,9 @@ static int recover(ps_space *s, lc_error *error) {
   s->directory.generation = get64(root + 40);
   s->token_limit = get64(root + 48);
   memcpy(s->identity, root + 56, 16);
-  rc = read_token_limit(s, &grant_limit, &grant_slot, error);
+  rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
+                          roots[1] + PS_TOKEN_RECORD_OFFSET, &grant_limit,
+                          &grant_slot, error);
   if (rc == LC_OK)
     rc = ps_readiness_read(s, &certificate, error);
   if (rc != LC_OK)
@@ -4130,12 +4228,17 @@ static int recover(ps_space *s, lc_error *error) {
    */
   first = cursor;
   last = PS_JOURNAL;
+  while (last - first >= sizeof(zero) &&
+         !memcmp(wire + first, zero, sizeof(zero)))
+    first += sizeof(zero);
   while (first < last && !wire[first])
     ++first;
+  while (last - first >= sizeof(zero) &&
+         !memcmp(wire + last - sizeof(zero), zero, sizeof(zero)))
+    last -= sizeof(zero);
   while (last > first && !wire[last - 1])
     --last;
-  retire_sibling =
-      memcmp(roots + (1 - s->root) * PS_ROOT_BYTES, zero, sizeof(zero)) != 0;
+  retire_sibling = memcmp(roots[1 - s->root], zero, sizeof(zero)) != 0;
   retirement_needed = first < last || retire_sibling;
   if (retirement_needed)
     ps_readiness_begin(s, PS_READINESS_RECOVERY);

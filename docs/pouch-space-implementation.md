@@ -10169,3 +10169,78 @@ native collection maintenance, and multifile background and small-stack
 compaction. Raw runs and test logs are under `pressure-worker-`,
 `pressure-trace-` and `pressure-checked-` in
 `build/pouch-space-concurrent/`.
+
+## Coalesced physical reads during root recovery
+
+Instrumented indexed runs placed most live-join physical time in
+rebuilding the checked directory. Cold opens also spent time reserving
+the durable incarnation grant and recovering logical namespaces.
+
+The physical loader now gathers up to 128 directory bindings at a time.
+It reads adjacent descriptor pages together in groups of up to eight,
+within the existing 64-page checked cache. Each page is validated
+individually. The loader installs bindings in directory order and
+borrows descriptor bytes from a checked page for records that fit there.
+Spanning records are assembled in the existing scratch buffer. The same
+directory traversal serves physical open and checkpoint adoption.
+
+Open reads both root records and both incarnation grant records together
+under allocator authority, then validates and selects each pair as
+before. This trades 4,408 extra fixed bytes for three fewer read calls.
+The opener checks the whole journal and skips all-zero blocks when locating
+the rejected suffix. It erases the exact rejected span before publishing
+the recovered state.
+
+The deterministic fixtures cover an interleaved 192-entry directory
+and a packed 4,200-entry directory that exceeds the descriptor cache.
+Both cold and joining owners read each checked page once. The smaller
+case takes one I/O call for four pages. The larger case takes 34 for
+67 pages. A second page in a combined transfer is damaged independently
+and rejected, and restoring it permits another open.
+
+An observer test alternated the two builds on six byte-identical flushed
+copies per build of each indexed layout. Each copy starts a cold owner followed
+by the live joins. Join timings are medians over individual joins in
+milliseconds. Each cold open made one durability sync. Cold timing
+varied across the repetitions.
+
+| Indexed layout | Reads per cold open, prior / revised | Reads per live join, prior / revised | Live-join time, prior / revised |
+| --- | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 506 / 482 | 74 / 50 | 1.10 / 0.95 |
+| Durable indexed, 15 MiB | 402 / 365 | 92 / 55 | 1.19 / 1.03 |
+
+The uninstrumented GNU rotation verified 38 of 42 complete workflows.
+Every refusal occurred at fixed 10 MiB in the 20 MiB NoSync profile.
+Each native build completed two of four of those attempts. Multifile
+completed all four. Every other attempt completed. The tables give
+successful-run medians in milliseconds in the order prior native
+(`21a47693`), revised native, multifile. The 12 MiB workload used four
+attempts per build. The other workloads used two per build except the
+20 MiB workload. Grouped reopen includes the cold owner and the live
+joins. The complete workflows lay out their roots independently.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1251.07 / 1249.45 / 1195.06 | 70.38 / 72.84 / 28.33 | 14.79 / 5.63 / 0.92 | 9.73 / 11.63 / 0.79 | 5.50 / 4.73 / 6.41 |
+| NoSync indexed, 20 MiB | 3006.05 / 2605.24 / 1913.52 | 94.86 / 83.32 / 29.44 | 7.04 / 4.13 / 1.17 | 11.22 / 11.02 / 0.88 | 7.25 / 7.04 / 9.04 |
+| Durable indexed, 15 MiB | 5806.16 / 5931.39 / 5013.00 | 80.85 / 79.51 / 68.68 | 1.87 / 5.33 / 0.81 | 9.02 / 7.11 / 0.66 | 6.51 / 5.30 / 6.59 |
+| Warmed NoSync queue | 12.20 / 10.98 / 81.51 | 2.29 / 2.18 / 19.76 | 0.25 / 0.28 / 0.08 | 3.00 / 2.15 / 0.46 | 0.25 / 0.25 / 0.57 |
+| Durable outbox | 815.73 / 849.12 / 1173.21 | 162.44 / 156.21 / 207.33 | 0.51 / 0.52 / 0.31 | 28.17 / 33.82 / 71.54 | 57.13 / 58.30 / 119.91 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 206.12 / 237.78 / 277.37 | 71.51 / 87.36 / 161.47 | 24.29 / 31.51 / 203.59 | 0.84 / 0.70 / 1.09 |
+| NoSync indexed, 20 MiB | 362.19 / 312.38 / 396.14 | 134.86 / 107.59 / 238.50 | 78.90 / 67.27 / 293.10 | 1.20 / 1.11 / 1.62 |
+| Durable indexed, 15 MiB | 111.85 / 133.65 / 192.04 | 3.35 / 27.27 / 204.61 | 27.44 / 26.36 / 250.15 | 0.56 / 0.40 / 0.66 |
+
+Physical read counts and live-join times improved in the identical-layout
+test. The complete workflows still show a gap in grouped indexed reopen,
+and sustained fixed-capacity churn remains open.
+
+Targeted verification passed 36 GNU Release, 14 Debug ASan/UBSan
+and 22 musl Release groups. Tests covered selected-root and journal
+recovery, physical adoption and I/O faults, catalog rebuild, shared
+indexed queries and fixed-capacity lease and outbox recovery. Raw
+comparisons and phase traces are under `admission-batch-`,
+`admission-stage-` and `admission-layout-` in
+`build/pouch-space-concurrent/`.
