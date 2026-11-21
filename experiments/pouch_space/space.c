@@ -7151,6 +7151,14 @@ select_run:
     reserved = bytes;
     if (!(*choice)->claimed && !clean && bytes < PS_MIB) {
       reserved = (*choice)->bytes < PS_MIB ? (*choice)->bytes : PS_MIB;
+      if (s->readiness && ps_readiness_pressure(s)) {
+        /* Spare zeroing may borrow a small share of common space while
+         * peers are competing for room to continue admitted appends. */
+        uint64_t spare_bytes = (s->free_bytes - s->claimed_free_bytes) / 8;
+        spare_bytes = spare_bytes / PS_PAGE * PS_PAGE;
+        if (reserved - bytes > spare_bytes)
+          reserved = bytes + spare_bytes;
+      }
       free_before = s->free_bytes;
       while (reserved > bytes) {
         rc = owned_preparation_allowance(s, budget, bytes, reserved, error);

@@ -4012,6 +4012,55 @@ static void shared_preparation(enum preparation_barrier when) {
   REQUIRE(!pthread_cond_destroy(&writer.cond) &&
           !pthread_mutex_destroy(&writer.mutex));
 }
+static void preparation_leaves_peer_headroom(void) {
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
+  ps_coordination_io coordinator = {&gate, durable_attempt};
+  ps_options options = {.io = &io, .coordination_io = &coordinator};
+  ps_space *writer = NULL, *peer = NULL;
+  const ps_key stream = {88, 1, PS_STREAM};
+  grant_work grant = {0};
+  ps_owned_status status;
+  ps_budget *pressure = NULL, *continuation = NULL;
+  ps_budget_plan plan = {0};
+  pthread_t thread;
+  lc_error e = {0};
+  uint64_t available;
+  int needed;
+
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_owned_open(writer, NULL, stream, 1, NULL, &grant.head, &status, &e),
+     &e);
+  ok(ps_flush(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_maintenance_pressure(peer, 1, &needed, &available, &e), &e);
+  REQUIRE(!needed && available > 2 * PS_MIB);
+  plan.payload_bytes = available - 2 * PS_MIB;
+  ok(ps_budget_open(peer, &plan, &pressure, &e), &e);
+  REQUIRE(ps_maintenance_pressure_requested(writer));
+
+  gate.attempted = 0;
+  gate.hold_leadership = 1;
+  REQUIRE(!pthread_create(&thread, NULL, prepare_grant, &grant));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.attempted)
+    pthread_cond_wait(&gate.cond, &gate.mutex);
+  pthread_mutex_unlock(&gate.mutex);
+  /* The grant's private zero writes cannot be reused while its barrier is
+   * held. Another writer still has ordinary headroom for this claim. */
+  plan.payload_bytes = 3 * PS_MIB / 2;
+  ok(ps_budget_open(peer, &plan, &continuation, &e), &e);
+  finish_catalog_sync(&gate, thread);
+  ps_owned_run_close(grant.run);
+  ps_owned_close(grant.head);
+  ok(ps_budget_close(continuation, &e), &e);
+  ok(ps_budget_close(pressure, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
+}
 static void additive_catalog(void) {
   lc_error e = {0};
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -5769,6 +5818,7 @@ int main(int argc, char **argv) {
     shared_preparation(READY_DURING_SYNC);
     shared_preparation(FAILED_SYNC);
     shared_preparation(READY_BEFORE_CHECKPOINT);
+    preparation_leaves_peer_headroom();
   } else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();
   else if (!strcmp(argv[2], "reopen-cohort"))

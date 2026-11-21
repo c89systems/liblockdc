@@ -258,6 +258,7 @@ void ps_namespace_conversion_close(ps_namespace_conversion *);
  */
 int ps_namespace_reclaim(ps_namespace *, unsigned int kind, uint64_t id,
                          lc_error *);
+#define PS_NAMESPACE_REPACK_BYTES (256U * 1024U)
 typedef struct ps_namespace_repack_result {
   uint64_t visited, replaced;
   uint64_t body_bytes, mapping_bytes; /* retained encoded bytes selected */

@@ -1024,6 +1024,31 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
   }
   return rc;
 }
+static int pressure_rotation(struct ps_namespace_data *d, uint64_t target,
+                             int *rotate, lc_error *e) {
+  segment *active;
+  ps_stream_info info;
+  uint64_t live, threshold = target / 2;
+  int rc;
+  /* Seal substantial obsolete history early so it can enter the same
+   * bounded maintenance and retirement paths as a normal predecessor. */
+  if (threshold < PS_NAMESPACE_REPACK_BYTES)
+    threshold = PS_NAMESPACE_REPACK_BYTES;
+  if (d->tail < threshold)
+    return LC_OK;
+  active = ps_ns_find(d, PS_CATALOG_SEGMENT, d->active);
+  if (!active)
+    return failure(e, LC_ERR_PROTOCOL,
+                   "namespace active append stream is missing");
+  rc = ps_stream_status(active->stream, &info, e);
+  if (rc == LC_OK && info.stored_bytes >= threshold) {
+    live = ps_key_checkpoint_source_bytes(d->checkpoint, PS_CATALOG_SEGMENT,
+                                          d->active);
+    *rotate =
+        live <= info.stored_bytes && info.stored_bytes - live >= threshold / 2;
+  }
+  return rc;
+}
 int ps_ns_rotation_plan(struct ps_namespace_data *d, ps_budget_plan *out,
                         lc_error *e) {
   ps_budget_plan plan = *out;
@@ -1177,7 +1202,7 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   uint64_t selected;
   uint64_t span;
   ps_budget_plan checkpoint = {0};
-  int rc, exact = 0;
+  int rc, exact = 0, pressured, early = 0;
   int complete = mode == PS_APPEND_COMPLETE || mode == PS_APPEND_MAINTENANCE;
   int framed = complete || mode == PS_APPEND_FRAMED_PREFIX;
   int maintenance =
@@ -1213,8 +1238,9 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   rc = checkpoint_ready(d, e);
   if (rc == LC_OK)
     rc = ps_ns_finish_seal(d, e);
-  if (rc == LC_OK && !maintenance &&
-      ps_maintenance_pressure_requested(ns->root->space))
+  pressured =
+      !maintenance && ps_maintenance_pressure_requested(ns->root->space);
+  if (rc == LC_OK && pressured)
     rc = ps_ns_reclaim_before_append(d, e);
   if (rc == LC_OK && ps_key_checkpoint_due(d->checkpoint)) {
     pthread_mutex_lock(&d->mutex);
@@ -1229,6 +1255,10 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
       else {
         ++selected;
       }
+    } else if (pressured && target && selected < UINT64_MAX) {
+      rc = pressure_rotation(d, target, &early, e);
+      if (rc == LC_OK && early)
+        ++selected;
     }
   }
   if (rc == LC_OK)
@@ -1237,9 +1267,18 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   if (rc == LC_OK && batch)
     rc =
         ps_checkpoint_delta_plan(append->delta, batch, minimum, &checkpoint, e);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
     rc = plan_append(d, selected, span, mode, &checkpoint, &append->budget,
                      &exact, e);
+    /* Early rotation is opportunistic. An existing piece can still admit a
+     * record when ordinary headroom cannot fund a successor. */
+    if (rc == LC_ERR_INVALID && early) {
+      lc_error_cleanup(e);
+      selected = d->active;
+      rc = plan_append(d, selected, span, mode, &checkpoint, &append->budget,
+                       &exact, e);
+    }
+  }
   if (rc == LC_OK && batch)
     rc =
         ps_checkpoint_delta_fund(append->delta, append->budget, &checkpoint, e);

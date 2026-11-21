@@ -10745,3 +10745,91 @@ faults, recovery, and the shared messaging workflows.
 Raw comparisons, phase traces, control sizes and test logs have
 the `zero-fit-`, `allocator-phase-`, `zero-shape-`, and
 `eight-pressure-` prefixes in `build/pouch-space-concurrent/`.
+
+## Rotating obsolete history under shared capacity pressure
+
+The eight-writer workload exposed a capacity gap even though each
+namespace retained only three 64 KiB keys. With 1 MiB targets, active
+sources filled the root before enough covered predecessors could be
+retired. Smaller fixed targets gave maintenance earlier candidates in
+the diagnostic runs.
+
+Ordinary native appends under allocator pressure may select a successor
+below the configured target. The active tail and its stored bytes must
+reach the larger of half the effective target and the 256 KiB bounded
+repack window. The difference between stored bytes and referenced
+encoded body bytes must cover at least half that threshold. This
+estimate guides placement. Liveness checks, checkpoint coverage and
+reader witnesses still govern retirement.
+
+The append funds the successor before pulling producer bytes. If ordinary
+capacity cannot fund it, the append can still use the current segment.
+The existing publication path selects the next segment with the
+successful append, then completes the predecessor's seal. Both NoSync
+and durable fixtures verify a declined successor plan, an interrupted
+producer with the old head still selected, successful retry by a peer,
+an all-live namespace staying on its current segment, and a captured
+old body surviving retirement. Cold reopen verifies the accepted
+bodies and versions.
+
+Rotation alone left late NoSync refusals in one matched run and one
+CTest run. A six-sample exploratory rotation compared that policy,
+a shorter obsolete-history threshold, and a cap on spare zeroing.
+All 18 completed. Median work was 3.25, 3.33, and 3.07 s, respectively.
+The final allocator caps speculative spare zeroing, during shared
+pressure, at one eighth of the unclaimed common bytes rounded down
+to pages. The required grant still follows its own admission plan.
+A held-sync fixture shows that a peer can reserve 1.5 MiB of the
+remaining 2 MiB of ordinary headroom while preparation is private.
+The prior allocator refused that peer reservation.
+
+The final eight-writer NoSync CTest passed twelve consecutive GNU
+runs. In 60 matched workflows, all 42 established samples verified.
+The older native build refused all six eight-writer attempts before
+verification. The revised native and multifile builds each verified
+all four eight-writer NoSync and both eight-writer durable runs.
+Native roots stayed at 10 MiB. The eight-writer workload streamed
+24 MiB across sixteen rounds and verified indexed results in each
+round and after reopen.
+
+Tables give medians in milliseconds in the order prior native
+(`1fb68ef5`), revised native, multifile. Grouped reopen includes
+the cold owner and subsequent live joins. A dash marks the absence
+of a verified sample.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 861.46 / 943.49 / 1223.07 | 42.46 / 46.43 / 31.82 | 2.66 / 2.71 / 0.87 | 9.55 / 9.77 / 0.97 | 4.62 / 4.91 / 6.66 |
+| NoSync indexed, 4 writers, 20 MiB | 1670.33 / 1827.17 / 2021.46 | 53.78 / 54.07 / 30.42 | 6.01 / 5.01 / 1.06 | 11.31 / 10.76 / 0.80 | 6.94 / 7.32 / 9.21 |
+| Durable indexed, 2 writers, 15 MiB | 3511.12 / 3199.88 / 4935.87 | 49.91 / 44.39 / 60.33 | 1.99 / 4.59 / 0.76 | 11.08 / 6.42 / 0.56 | 5.84 / 5.34 / 7.47 |
+| Warmed NoSync queue | 9.81 / 8.84 / 84.55 | 1.79 / 1.87 / 18.08 | 0.29 / 0.28 / 0.06 | 6.86 / 2.78 / 0.37 | 0.27 / 0.27 / 0.58 |
+| Durable outbox | 964.16 / 841.46 / 1339.74 | 185.40 / 161.20 / 248.87 | 0.50 / 0.48 / 0.28 | 37.93 / 30.30 / 58.61 | 82.67 / 59.39 / 125.05 |
+| NoSync indexed, 8 writers, 24 MiB | — / 2857.99 / 2630.68 | — / 107.64 / 62.77 | — / 6.45 / 1.63 | — / 15.65 / 1.53 | — / 10.78 / 13.09 |
+| Durable indexed, 8 writers, 24 MiB | — / 4581.79 / 8744.11 | — / 140.58 / 210.74 | — / 6.03 / 1.60 | — / 22.67 / 1.66 | — / 9.98 / 13.76 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 188.25 / 194.22 / 321.68 | 51.58 / 33.23 / 184.29 | 23.02 / 11.17 / 186.66 | 0.65 / 0.74 / 1.19 |
+| NoSync indexed, 4 writers, 20 MiB | 315.76 / 305.73 / 433.62 | 90.95 / 63.84 / 244.20 | 35.37 / 45.49 / 281.49 | 1.17 / 1.29 / 1.64 |
+| Durable indexed, 2 writers, 15 MiB | 152.59 / 127.43 / 196.16 | 12.14 / 10.02 / 293.35 | 6.77 / 9.25 / 307.15 | 0.46 / 0.44 / 0.77 |
+| NoSync indexed, 8 writers, 24 MiB | — / 459.32 / 747.43 | — / 221.85 / 456.91 | — / 125.97 / 524.60 | — / 2.58 / 2.92 |
+| Durable indexed, 8 writers, 24 MiB | — / 502.03 / 1187.72 | — / 207.41 / 1578.12 | — / 114.99 / 2133.83 | — / 2.27 / 3.25 |
+
+The heavy four-writer NoSync workload spent 9% longer in work than
+the prior native build and its p95 was within 1 ms. Median mutation
+syncs rose from 112 to 157, while allocated bytes at work completion
+fell by 42%. In the eight-writer NoSync comparison, revised native
+used 3.28 s of process CPU through maintenance, versus 1.04 s for
+multifile. Its p95 and grouped reopen remain higher. Native durable
+eight-writer work took 4.58 s versus 8.74 s for multifile.
+
+The final targeted gates passed 31 GNU Release, 18 Debug ASan/UBSan,
+and 18 musl Release groups. They include the eight-writer workload,
+held preparation, namespace rotation faults, shared source pins and
+process exit, append budgets, conversion, and fixed-capacity lease
+and messaging workflows. The active-stage fault sweep also passed
+during verification of the rotation change before the spare cap.
+
+Raw matches, capacity traces and test logs use the `pressure-rotation-`,
+`rotation-capacity-probe-`, and `rotation-headroom-` prefixes in
+`build/pouch-space-concurrent/`.

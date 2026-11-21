@@ -4608,6 +4608,100 @@ static void maintenance_append_pressure(const char *path, int sync) {
   REQUIRE(live == 0 && unlink(path) == 0);
   lc_error_cleanup(&e);
 }
+static void maintenance_pressure_rotation(const char *path, int sync) {
+  const char *churn = "rotation-churn", *retained = "rotation-retained";
+  const size_t bytes = 64 * 1024;
+  ps_pouch_state_options o = shared_options(0, sync);
+  lc_pouch *writer = NULL, *peer = NULL;
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_state_read_result pinned = {0};
+  ps_namespace *ns = NULL;
+  ps_namespace_append *append = NULL;
+  ps_budget *pressure = NULL;
+  ps_budget_plan plan = {0};
+  ps_namespace_status before, after;
+  lc_error e = {0};
+  int needed;
+  uint64_t available;
+
+  o.logical.segment_target_bytes = PS_MIB;
+  o.initial_capacity = o.maximum_capacity = PS_DEFAULT_CAPACITY;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &writer, &e), &e);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &peer, &e), &e);
+  for (unsigned char seed = 1; seed <= 8; ++seed) {
+    char key[16];
+    REQUIRE(snprintf(key, sizeof(key), "kept-%u", (unsigned)seed) > 0);
+    input replaced = source(bytes, seed);
+    input live_body = source(bytes, seed);
+    ok(put(writer, churn, "key", &replaced, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+    ok(put(writer, retained, key, &live_body, NULL, &written, &e), &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+  }
+  ps_root *root = ps_pouch_state_root(writer);
+  ps_space *space = ps_root_space(root);
+  ok(ps_root_namespace_acquire(root, churn, 0, &ns, &e), &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  ok(ps_checkpoint(space, &e), &e);
+  ok(ps_namespace_status_get(ns, &before, &e), &e);
+  REQUIRE(before.active_segment == 1 && before.tail >= PS_MIB / 2 &&
+          before.tail < PS_MIB && !ps_maintenance_pressure_requested(space));
+  ok(lc_pouch_state_read(peer, churn, "key", &pinned, &e), &e);
+
+  /* Leave only protected headroom. This small append can reuse its current
+   * piece after the speculative successor plan declines admission. */
+  ok(ps_maintenance_pressure(space, 1, &needed, &available, &e), &e);
+  REQUIRE(!needed && available > PS_MIB);
+  plan.payload_bytes = available;
+  ok(ps_budget_open(space, &plan, &pressure, &e), &e);
+  REQUIRE(ps_maintenance_pressure_requested(space));
+  ok(ps_namespace_append_begin(ns, PS_MIB, 1, PS_APPEND_PREFIX, NULL, &append,
+                               &e),
+     &e);
+  REQUIRE(ps_namespace_append_segment(append) == before.active_segment);
+  ps_namespace_append_close(append);
+  ok(ps_budget_close(pressure, &e), &e);
+
+  input failed = source(bytes, 9);
+  failed.fail_after = PS_CHUNK;
+  REQUIRE(put(writer, churn, "key", &failed, NULL, &written, &e) ==
+          LC_ERR_TRANSPORT);
+  clear(&e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(ps_namespace_status_get(ns, &after, &e), &e);
+  REQUIRE(after.active_segment == before.active_segment &&
+          after.tail == before.tail && after.bound_segments == 2);
+  read_value(peer, churn, "key", bytes, 8, 8, &e);
+
+  input next = source(bytes, 10);
+  ok(put(peer, churn, "key", &next, NULL, &written, &e), &e);
+  REQUIRE(next.offset == bytes && written.version == 9);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  REQUIRE(storage_info(writer, churn, &e).active_segment == 2);
+  input live_body = source(17, 11);
+  ok(put(writer, retained, "extra", &live_body, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  REQUIRE(storage_info(writer, retained, &e).active_segment == 1);
+
+  input progress = source(17, 12);
+  ok(put(peer, churn, "extra", &progress, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(ps_namespace_status_get(ns, &after, &e), &e);
+  REQUIRE(after.active_segment == 2 && after.bound_segments == 1);
+  drain(pinned.body, bytes, 8, &e);
+  lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+  ps_namespace_release(ns);
+  lc_pouch_close(peer);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &writer, &e), &e);
+  read_value(writer, churn, "key", bytes, 10, 9, &e);
+  read_value(writer, churn, "extra", 17, 12, 1, &e);
+  read_value(writer, retained, "kept-8", bytes, 8, 1, &e);
+  lc_pouch_close(writer);
+  REQUIRE(live == 0 && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void maintenance(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -6493,6 +6587,8 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "maintenance-append-pressure")) {
     maintenance_append_pressure(r->path, 0);
     maintenance_append_pressure(r->path, 1);
+    maintenance_pressure_rotation(r->path, 0);
+    maintenance_pressure_rotation(r->path, 1);
   } else if (!strcmp(r->mode, "maintenance-capacity-schedule"))
     maintenance_capacity_schedule();
   else if (!strcmp(r->mode, "maintenance-tail"))

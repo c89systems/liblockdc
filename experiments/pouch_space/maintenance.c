@@ -5,10 +5,7 @@
 #include "pouch_internal.h"
 #include <string.h>
 
-enum {
-  MAINTENANCE_BYTES = 16 * PS_CHUNK,
-  MAINTENANCE_PIECES = MAINTENANCE_BYTES / PS_STREAM_PIECE_BYTES
-};
+enum { MAINTENANCE_PIECES = PS_NAMESPACE_REPACK_BYTES / PS_STREAM_PIECE_BYTES };
 typedef struct compact {
   lc_pouch *pouch;
   const char *name, *reason;
@@ -29,7 +26,8 @@ static int fail(lc_error *e, int code, const char *message) {
 }
 static uint64_t background_minimum(const compact *w) {
   uint64_t minimum = w->pouch->compaction_min_reclaimable_bytes;
-  return minimum > MAINTENANCE_BYTES ? MAINTENANCE_BYTES : minimum;
+  return minimum > PS_NAMESPACE_REPACK_BYTES ? PS_NAMESPACE_REPACK_BYTES
+                                             : minimum;
 }
 static int compact_namespace(compact *w, lc_pouch_state_precondition_fn fn,
                              void *context, lc_error *e) {

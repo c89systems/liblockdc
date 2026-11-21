@@ -43,6 +43,12 @@ if(LOCKDC_BUILD_BENCHMARKS)
     "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync")
   lc_configure_c_test_target(pouch_space_lifecycle_compare)
   if(LOCKDC_BUILD_TESTS)
+    add_test(NAME pouch_space_compare_runtime-shared-index_pressure
+      COMMAND pouch_space_lifecycle_compare runtime-shared-index
+        ${CMAKE_CURRENT_BINARY_DIR} 24 65536 0 8 --reopen --rounds 16
+        --stable-index --reclaim)
+    set_tests_properties(pouch_space_compare_runtime-shared-index_pressure
+      PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
     foreach(mode pouch-shared-index runtime-shared-index)
       foreach(sync 0 1)
         add_test(NAME pouch_space_compare_${mode}_reclaim_${sync}
