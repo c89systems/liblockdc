@@ -2801,11 +2801,14 @@ static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
 static int checkpoint_locked(ps_space *s, lc_error *error) {
   return checkpoint_select(s, 0, error);
 }
-/* A checkpoint can return retired runs to ordinary capacity. Count only
- * complete pages whose local and foreign readers have released them. Packed
- * cells on a partially occupied page cannot fund a page-sized claim. */
+/* A checkpoint can return retired runs to ordinary capacity. Combine the
+ * cells from all eligible retirements before crediting a complete page.
+ * The forecast touches only retired ownership and uses no temporary
+ * allocation. A full-page witness check also catches foreign readers of
+ * cells absent from this projection. */
 static int retirement_can_fund(ps_space *s, uint64_t missing) {
   ps_entry *p;
+  ps_payload_page *page, *touched = NULL;
   size_t i;
   int foreign = 0;
   if (missing > s->capacity - PS_DATA || !s->retired)
@@ -2813,28 +2816,39 @@ static int retirement_can_fund(ps_space *s, uint64_t missing) {
   if (s->range_pins &&
       pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &foreign, NULL) != LC_OK)
     return 0;
-  for (p = s->retired; p; p = p->retired_next) {
+  for (p = s->retired; p && missing; p = p->retired_next) {
     if (p->pins || (foreign && entry_foreign_pinned(s, p)))
       continue;
-    for (i = 0; i < p->count; ++i) {
-      ps_extent *extent = &p->extents[i];
+    for (i = 0; i < p->count && missing; ++i) {
+      const ps_extent *extent = &p->extents[i];
       uint64_t bytes = aligned(extent->bytes);
       if (extent->flags & EXTENT_PACKED) {
-        ps_payload_page *page = payload_find(s, extent->offset);
         int pinned = 0;
+        page = payload_find(s, extent->offset);
         if (!page || page->external_pins ||
-            page->occupied != extent_mask(extent) ||
+            page->reclaim_cells == page->occupied)
+          continue;
+        if (!page->reclaim_cells) {
+          page->reclaim_next = touched;
+          touched = page;
+        }
+        page->reclaim_cells |= extent_mask(extent);
+        if (page->reclaim_cells != page->occupied ||
             (foreign && (pin_conflict(s, page->run.offset, PS_PAGE, &pinned,
                                       NULL) != LC_OK ||
                          pinned)))
           continue;
       }
-      if (bytes >= missing)
-        return 1;
-      missing -= bytes;
+      missing = bytes < missing ? missing - bytes : 0;
     }
   }
-  return 0;
+  while (touched) {
+    page = touched;
+    touched = page->reclaim_next;
+    page->reclaim_next = NULL;
+    page->reclaim_cells = 0;
+  }
+  return missing == 0;
 }
 /* Under allocation authority, use already admitted credits when eligible
  * retirements can cover the requested amount. The caller resamples the

@@ -9718,3 +9718,69 @@ grouped reopen remain higher than multifile. The warm queue and durable
 outbox samples continue to favor the container during active work.
 Raw traces, matched attempts and diagnostic repeats are under `churn-` in
 `build/pouch-space-concurrent/`.
+
+## Reclaiming complete pages of retired packed values
+
+Both foreground admission and background pressure now combine the retired
+cell masks for each packed page they encounter. A page contributes one
+page of headroom only when the eligible masks cover its full resident
+occupancy and no retained range protects it. The allocator also checks the
+whole page for foreign witnesses, which can cover cells absent from the
+current projection. The forecast runs under allocation authority and
+clears its scratch state on every touched page before selecting a
+checkpoint. It allocates no temporary memory and scans only retired
+entries and the pages they touch.
+
+The fixed 10 MiB cases cover foreground budget admission for one packed
+page and background pressure for four packed pages. Each page has four
+1 KiB values. A single live or pinned value blocks the full request. The
+tests exercise NoSync with a local reader and durable mode with a peer
+reader. Releasing the final pin allows one checkpoint to provide the
+requested headroom. The tests verify the peer's surviving value and
+then cold reopen to check the retired and surviving keys. Both cases
+failed against the previous allocator at the point that required reuse
+of the fully retired pages.
+
+The packed retirement build passed 24 GNU Release checks covering
+capacity, reader pins, journal replay and shared lease and messaging.
+
+The matched GNU Release rotation verified 32 of 36 runs. Both native
+builds used fixed 10 MiB containers and multifile verified all 12 runs.
+The table reports completions that verified after reopen.
+
+| Workload | Prior native (`5bde0f3d`) | Packed retirement | Multifile |
+| --- | ---: | ---: | ---: |
+| Four writers, NoSync indexed, 12 MiB | 3/3 | 2/3 | 3/3 |
+| Four writers, NoSync indexed, 20 MiB | 1/3 | 2/3 | 3/3 |
+| Two writers, durable indexed, 15 MiB | 2/2 | 2/2 | 2/2 |
+| Two writers, warmed NoSync queue | 2/2 | 2/2 | 2/2 |
+| Two writers, durable outbox | 2/2 | 2/2 | 2/2 |
+
+The three failures at 20 MiB were ordinary capacity refusals. The
+candidate's 12 MiB failure was the earlier overlapping ownership
+signature, now observed under NoSync. Before this rotation, 28 further
+instrumented durable runs on `5bde0f3d` had verified successfully.
+
+The next two tables report medians of successful runs in milliseconds,
+ordered prior native, packed retirement and multifile. The prior 20 MiB
+row has one successful sample.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1603.60 / 1703.70 / 1713.60 | 74.72 / 95.58 / 35.63 | 4.24 / 8.51 / 1.35 | 12.40 / 14.69 / 1.15 | 6.17 / 6.12 / 7.06 |
+| NoSync indexed, 20 MiB | 4555.93 / 3339.97 / 2825.92 | 147.35 / 116.62 / 44.73 | 3.71 / 61.37 / 1.35 | 15.89 / 16.79 / 0.85 | 8.26 / 7.75 / 10.36 |
+| Durable indexed, 15 MiB | 7579.98 / 9323.14 / 7861.42 | 105.19 / 139.06 / 103.32 | 2.15 / 1.90 / 1.00 | 10.35 / 10.75 / 0.64 | 5.85 / 5.67 / 7.42 |
+| Warmed NoSync queue | 11.70 / 11.56 / 108.20 | 2.17 / 2.19 / 22.79 | 0.30 / 0.39 / 0.10 | 4.44 / 3.09 / 0.51 | 0.35 / 0.24 / 0.54 |
+| Durable outbox | 1237.95 / 1548.36 / 2140.63 | 260.53 / 316.78 / 399.15 | 0.76 / 0.65 / 0.36 | 79.40 / 55.96 / 165.57 | 81.44 / 147.82 / 187.84 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 338.12 / 302.53 / 436.77 | 111.81 / 156.72 / 310.14 | 58.54 / 116.78 / 338.46 | 0.92 / 1.03 / 1.19 |
+| NoSync indexed, 20 MiB | 451.73 / 358.17 / 645.16 | 157.89 / 192.27 / 323.91 | 57.12 / 54.19 / 453.46 | 1.45 / 1.24 / 1.85 |
+| Durable indexed, 15 MiB | 163.46 / 168.40 / 308.51 | 20.95 / 40.26 / 211.48 | 18.37 / 18.25 / 300.86 | 0.44 / 0.47 / 0.76 |
+
+These samples leave indexed tails, close and reopen performance open.
+The capacity tests establish progress when ordinary space is exhausted
+and every cell on the required pages is eligible for retirement. Raw
+captures and test logs are under `packed-retirement-` and
+`ownership-repro-` in `build/pouch-space-concurrent/`.

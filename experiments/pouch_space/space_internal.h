@@ -103,6 +103,9 @@ typedef struct ps_run {
 typedef struct ps_payload_page {
   ps_run run; /* reusable free-interval node; must be first */
   uint64_t occupied;
+  /* Scratch for a retirement forecast under allocation authority. */
+  uint64_t reclaim_cells;
+  struct ps_payload_page *reclaim_next;
   int external_pins;
   struct ps_payload_page *pinned_next;
   struct ps_payload_page *next, **link, *hash_next;

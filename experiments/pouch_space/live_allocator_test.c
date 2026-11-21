@@ -4896,6 +4896,74 @@ static void pressure_reclaim(int durable, size_t fail_sync) {
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   lc_error_cleanup(&e);
 }
+static void packed_capacity_reclaim(int durable, int background) {
+  lc_error e = {0};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_reader *pin = NULL;
+  ps_budget *padding = NULL, *budget = NULL;
+  const uint64_t bytes = background ? PS_CHUNK : PS_PAGE;
+  const uint64_t values = bytes / 1024;
+  ps_budget_plan plan = {bytes, 0, 0, 0}, fill = {0};
+  uint64_t available, checkpoints;
+  int needed;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  for (uint64_t id = 1; id <= values + 1; ++id)
+    capture_put(writer, id, 1024);
+  REQUIRE(status(writer).packed_pages == bytes / PS_PAGE + 1);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &peer, &e), &e);
+  ok(ps_maintenance_pressure(writer, 1, &needed, &available, &e), &e);
+  REQUIRE(available > PS_MIB && available % PS_PAGE == 0);
+  fill.payload_bytes = available;
+  ok(ps_budget_open(writer, &fill, &padding, &e), &e);
+  checkpoints = status(writer).checkpoints;
+  for (uint64_t id = 2; id <= values; ++id)
+    ok(ps_delete(writer, key(id), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+  /* A selected live cell and then a retained cell both prevent reclaiming
+   * the full request. Exercise a local pin and a kernel-witnessed peer pin. */
+  for (int retired = 0; retired <= 1; ++retired) {
+    if (background) {
+      ok(ps_maintenance_pressure(writer, 0, &needed, &available, &e), &e);
+      REQUIRE(needed && available < bytes);
+    } else {
+      REQUIRE(ps_budget_open(writer, &plan, &budget, &e) == LC_ERR_INVALID &&
+              !budget);
+      lc_error_cleanup(&e);
+    }
+    REQUIRE(status(writer).checkpoints == checkpoints);
+    if (!retired) {
+      ok(ps_read_open(durable ? peer : writer, key(1), NULL, &pin, &e), &e);
+      ok(ps_delete(writer, key(1), &e), &e);
+      ok(ps_flush(writer, &e), &e);
+    }
+  }
+  captured_expect(pin, 1, 1024);
+  ps_reader_close(pin);
+  if (background) {
+    ok(ps_maintenance_pressure(writer, 0, &needed, &available, &e), &e);
+    REQUIRE(needed && available >= bytes);
+  } else {
+    ok(ps_budget_open(writer, &plan, &budget, &e), &e);
+    REQUIRE(status(writer).reserved_payload_bytes ==
+            fill.payload_bytes + bytes);
+    ok(ps_budget_close(budget, &e), &e);
+  }
+  REQUIRE(status(writer).checkpoints == checkpoints + 1 &&
+          status(writer).packed_pages == 1);
+  ok(ps_budget_close(padding, &e), &e);
+  expect_value(peer, key(values + 1), 1024, (int)values + 1);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  REQUIRE(status(writer).capacity == PS_DEFAULT_CAPACITY);
+  for (uint64_t id = 1; id <= values; ++id)
+    expect_value(writer, key(id), 0, 0);
+  expect_value(writer, key(values + 1), 1024, (int)values + 1);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void piece_barrier_handoff(int durable, int discard) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
   ps_io io = {&gate, read_io, durable_write, durable_sync, reserve_io, NULL};
@@ -5250,12 +5318,15 @@ int main(int argc, char **argv) {
       capacity_checkpoint(durable, 0, 0, 0);
       capacity_checkpoint(durable, 0, 1, 0);
       capacity_checkpoint(durable, 1, 0, 0);
+      packed_capacity_reclaim(durable, 0);
     }
     for (size_t sync = 1; sync <= 3; ++sync)
       capacity_checkpoint(1, 0, 0, sync);
   } else if (!strcmp(argv[2], "pressure-reclaim")) {
     pressure_reclaim(0, 0);
     pressure_reclaim(1, 0);
+    packed_capacity_reclaim(0, 1);
+    packed_capacity_reclaim(1, 1);
     for (size_t sync = 1; sync <= 3; ++sync)
       pressure_reclaim(1, sync);
   } else if (!strcmp(argv[2], "projection-tail"))
