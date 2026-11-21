@@ -71,11 +71,18 @@ typedef struct ps_value_slot {
   ps_key key;
   uint64_t token, bytes;
   ps_entry *retained;
+  int witness;
 } ps_value_slot;
+typedef struct ps_value_range {
+  uint64_t offset, bytes;
+  ps_value_slot *item;
+} ps_value_range;
 struct ps_values {
   ps_space *space;
   ps_value_slot *items;
   size_t count;
+  ps_value_range *ranges, one_range;
+  size_t range_count;
 };
 struct ps_owned_head {
   ps_space *space;
@@ -446,6 +453,23 @@ static void unregister_entry(ps_entry *p) {
   if (p->all_next)
     p->all_next->all_link = p->all_link;
 }
+static void value_register(ps_space *s, ps_entry *p) {
+  ps_entry **head = &s->value_buckets[p->key.owner % BUCKETS];
+  p->value_next = *head;
+  p->value_link = head;
+  if (p->value_next)
+    p->value_next->value_link = &p->value_next;
+  *head = p;
+}
+static void value_unregister(ps_entry *p) {
+  if (!p->value_link)
+    return;
+  *p->value_link = p->value_next;
+  if (p->value_next)
+    p->value_next->value_link = p->value_link;
+  p->value_link = NULL;
+  p->value_next = NULL;
+}
 static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
   if (old) {
     p->checkpoint_ref = old->checkpoint_ref;
@@ -508,6 +532,7 @@ static void retire(ps_space *s, ps_entry *p) {
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
+  value_unregister(p);
   if (p->key.kind == PS_CATALOG)
     ps_catalog_unlink(s, p);
   if (p->key.kind == PS_OWNED_RUN)
@@ -538,6 +563,8 @@ static void install(ps_space *s, ps_entry *p) {
   p->state = 1;
   p->hash_next = s->buckets[bucket(p->key)];
   s->buckets[bucket(p->key)] = p;
+  if (immutable_key(p->key))
+    value_register(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted)
     stream_register(s, p);
   if (!p->deleted) {
@@ -1479,14 +1506,15 @@ static int entry_foreign_pinned(ps_space *s, const ps_entry *p) {
  * and visit each clear residual once. Both traversal and queries follow actual
  * free intervals plus pin fragments, without restarting from the pool head. */
 static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
-                        int use_bitmap, lc_error *error) {
+                        ps_space *witnesses, lc_error *error) {
   ps_run *run, *held, **link = head;
   uint64_t first, last;
   int rc;
   while (*link) {
     run = *link;
-    if (run->claimed || (use_bitmap && !ps_readiness_witness_possible(
-                                           s, run->offset, run->bytes))) {
+    if (run->claimed ||
+        (witnesses &&
+         !ps_readiness_witness_possible(witnesses, run->offset, run->bytes))) {
       link = &run->next;
       continue;
     }
@@ -1497,8 +1525,8 @@ static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
     if (first == last) {
       /* Common free pages have no local witnesses. The allocator excludes
        * new member claims until this negative observation is recorded. */
-      if (use_bitmap)
-        ps_readiness_witness_pages(s, run->offset, run->bytes, 0);
+      if (witnesses)
+        ps_readiness_witness_pages(witnesses, run->offset, run->bytes, 0);
       link = &run->next;
       continue;
     }
@@ -1520,24 +1548,35 @@ static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
   }
   return LC_OK;
 }
-static int pins_recover(ps_space *s, lc_error *error) {
+static int pins_recover(ps_space *s, ps_space *owner, lc_error *error) {
   ps_payload_page *page;
+  ps_space *witnesses = NULL;
   int rc, present;
   if (!s->range_pins)
     return LC_OK;
   rc = physical_presence(s, &present, error);
   if (rc != LC_OK || !present)
     return rc;
+  if (owner->readiness) {
+    rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &present, error);
+    if (rc != LC_OK)
+      return rc;
+    if (!present)
+      witnesses = owner;
+  }
   for (page = s->payload_pages; page; page = page->next) {
+    if (witnesses &&
+        !ps_readiness_witness_possible(witnesses, page->run.offset, PS_PAGE))
+      continue;
     rc = pin_conflict(s, page->run.offset, PS_PAGE, &present, error);
     if (rc != LC_OK)
       return rc;
     if (present)
       quarantine_page(s, page);
   }
-  rc = foreign_pool(s, &s->free, &s->free_bytes, 0, error);
+  rc = foreign_pool(s, &s->free, &s->free_bytes, witnesses, error);
   return rc == LC_OK ? foreign_pool(s, &s->metadata_free,
-                                    &s->metadata_free_bytes, 0, error)
+                                    &s->metadata_free_bytes, NULL, error)
                      : rc;
 }
 /* Quarantine is a conservative positive observation. A live participant can
@@ -1687,10 +1726,12 @@ static int allocation_ranges_refresh(ps_space *s, lc_error *error) {
   if (rc == LC_OK && present) {
     rc = pin_conflict(s, PIN_PRESENCE_OFFSET, 1, &imported, error);
     if (rc == LC_OK)
-      rc = foreign_pool(s, &s->free, &s->free_bytes, !imported, error);
+      rc =
+          foreign_pool(s, &s->free, &s->free_bytes, imported ? NULL : s, error);
   }
   if (rc == LC_OK && present && !s->metadata_materialized)
-    rc = foreign_pool(s, &s->metadata_free, &s->metadata_free_bytes, 0, error);
+    rc = foreign_pool(s, &s->metadata_free, &s->metadata_free_bytes, NULL,
+                      error);
   s->allocation_ranges_checked = rc == LC_OK;
   return rc;
 }
@@ -4736,7 +4777,7 @@ static int recover(ps_space *s, lc_error *error) {
     }
     p->previous = NULL;
   }
-  rc = pins_recover(s, error);
+  rc = pins_recover(s, s, error);
   if (rc != LC_OK)
     goto done;
   range_available = certificate.grant_limit == s->token_limit &&
@@ -4889,6 +4930,8 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
       continue;
     }
     p->previous = p->hash_next = p->stream_next = NULL;
+    p->value_next = NULL;
+    p->value_link = NULL;
     p->retired_next = p->dirty_next = NULL;
     p->retired_link = p->dirty_link = NULL;
     p->checkpoint_ref.offset = p->checkpoint_ref.bytes = 0;
@@ -4951,6 +4994,8 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
     }
     dest->all_next = projected(q->all_next);
     dest->hash_next = projected(q->hash_next);
+    dest->value_next = projected(q->value_next);
+    dest->value_link = NULL;
     dest->stream_next = projected(q->stream_next);
     dest->previous = projected(q->previous);
     dest->retired_next = projected(q->retired_next);
@@ -4967,7 +5012,11 @@ static void projection_entries(ps_space *s, ps_space *v, ps_entry **items,
   }
   s->entries = projected(v->entries);
   for (i = 0; i < BUCKETS; ++i) {
+    ps_entry **link;
     s->buckets[i] = projected(v->buckets[i]);
+    s->value_buckets[i] = projected(v->value_buckets[i]);
+    for (link = &s->value_buckets[i]; *link; link = &(*link)->value_next)
+      (*link)->value_link = link;
     s->stream_buckets[i] = projected(v->stream_buckets[i]);
   }
   for (i = 0; i < v->catalogs.capacity; ++i)
@@ -5223,7 +5272,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   }
   v->range_pins = 1;
   if (rc == LC_OK)
-    rc = pins_recover(v, error);
+    rc = pins_recover(v, s, error);
   if (rc == LC_OK)
     rc = metadata_bound(v->metadata, v->live_entries, &v->metadata_workspace,
                         error);
@@ -6093,7 +6142,6 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
                                                lc_error *error) {
   ps_coordination_guard *guard;
   uint64_t prefix, local = 0, peer = 0, completed;
-  size_t i;
   ps_entry *p;
   int rc, synced;
 
@@ -6102,21 +6150,21 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_observe_begin(s, &guard, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->buckets[i]; p; p = p->hash_next) {
-      if (p->key.owner != owner ||
-          (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION &&
-           p->key.kind != PS_NAMESPACE_CHECKPOINT) ||
-          (!s->durable && !p->durable_visibility))
-        continue;
-      if (p->peer_sequence) {
-        if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
-          peer = p->peer_sequence;
-      } else if (p->publication_sequence > prefix &&
-                 p->publication_sequence > local) {
-        local = p->publication_sequence;
-      }
+  for (p = s->value_buckets[owner % BUCKETS]; rc == LC_OK && p;
+       p = p->value_next) {
+    if (p->key.owner != owner ||
+        (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION &&
+         p->key.kind != PS_NAMESPACE_CHECKPOINT) ||
+        (!s->durable && !p->durable_visibility))
+      continue;
+    if (p->peer_sequence) {
+      if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
+        peer = p->peer_sequence;
+    } else if (p->publication_sequence > prefix &&
+               p->publication_sequence > local) {
+      local = p->publication_sequence;
     }
+  }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK || (!local && !peer))
@@ -6268,13 +6316,108 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   lc_free_with_allocator(NULL, buffer);
   return rc;
 }
-static void values_discard_locked(ps_values *view) {
-  size_t i;
-  for (i = 0; i < view->count; ++i)
-    if (view->items[i].retained)
-      ps_internal_entry_unpin(view->space, view->items[i].retained);
+static int value_range_order(const void *left, const void *right) {
+  uint64_t a = ((const ps_value_range *)left)->offset;
+  uint64_t b = ((const ps_value_range *)right)->offset;
+  return a < b ? -1 : a != b;
+}
+/* Sorted ranges belong to distinct retained entries. Merge only adjacent
+ * bytes whose entries are making the same pin transition in this capture. */
+static int values_witness_range(const ps_values *view, size_t *at, size_t limit,
+                                uint64_t *offset, uint64_t *bytes) {
+  const ps_value_range *range;
+  *bytes = 0;
+  while (*at < limit) {
+    range = &view->ranges[*at];
+    if (range->item->witness) {
+      if (*bytes && *offset + *bytes != range->offset)
+        break;
+      if (!*bytes)
+        *offset = range->offset;
+      *bytes += range->bytes;
+    }
+    ++*at;
+  }
+  return *bytes != 0;
+}
+static void values_free(ps_values *view) {
+  if (view->ranges != &view->one_range)
+    lc_free_with_allocator(NULL, view->ranges);
   lc_free_with_allocator(NULL, view->items);
   lc_free_with_allocator(NULL, view);
+}
+static void values_unwitness(ps_values *view, size_t limit) {
+  size_t at = 0;
+  uint64_t offset, bytes;
+  while (values_witness_range(view, &at, limit, &offset, &bytes))
+    if (reader_release_range(view->space, offset, bytes, NULL) != LC_OK)
+      break;
+}
+static int values_witness(ps_values *view, lc_error *error) {
+  ps_space *s = view->space;
+  ps_entry *p;
+  ps_value_range *range;
+  size_t i, j, count = 0, at = 0, done = 0;
+  uint64_t offset, bytes;
+  int rc;
+  for (i = 0; i < view->count; ++i) {
+    p = view->items[i].retained;
+    if (!p)
+      continue;
+    if (p->count > (size_t)-1 / sizeof(*range) - count)
+      return err(error, LC_ERR_NOMEM, "captured ranges exceed local limit");
+    count += p->count;
+    view->items[i].witness = p->count && !p->pins && !p->payload_claimed;
+  }
+  if (!count)
+    return LC_OK;
+  view->ranges = count == 1
+                     ? &view->one_range
+                     : lc_alloc_with_allocator(NULL, count * sizeof(*range));
+  if (!view->ranges)
+    return err(error, LC_ERR_NOMEM, "cannot allocate captured value ranges");
+  view->range_count = count;
+  range = view->ranges;
+  /* Keep the extents that already have a witness as well. Other readers
+   * may leave before this view and hand it their last pin. */
+  for (i = 0; i < view->count; ++i) {
+    p = view->items[i].retained;
+    if (p)
+      for (j = 0; j < p->count; ++j, ++range) {
+        range->offset = p->extents[j].offset;
+        range->bytes = extent_allocation(&p->extents[j]);
+        range->item = &view->items[i];
+      }
+  }
+  if (count > 1)
+    qsort(view->ranges, count, sizeof(*range), value_range_order);
+  while (values_witness_range(view, &at, count, &offset, &bytes)) {
+    rc = physical_claim(s, offset, bytes, error);
+    if (rc != LC_OK) {
+      values_unwitness(view, done);
+      if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+        lc_error_cleanup(error);
+        return healthy(s, error);
+      }
+      return rc;
+    }
+    s->reader_claim_bytes += bytes;
+    done = at;
+  }
+  return LC_OK;
+}
+static void values_discard_locked(ps_values *view) {
+  ps_entry *p;
+  size_t i;
+  for (i = 0; i < view->count; ++i) {
+    p = view->items[i].retained;
+    view->items[i].witness = p && !--p->pins && p->reader_claimed;
+  }
+  values_unwitness(view, view->range_count);
+  for (i = 0; i < view->count; ++i)
+    if (view->items[i].witness)
+      view->items[i].retained->reader_claimed = 0;
+  values_free(view);
 }
 int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
                                       unsigned int first, unsigned int last,
@@ -6282,7 +6425,7 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
                                       ps_value_retain_fn retain, void *context,
                                       ps_values **out, lc_error *error) {
   ps_values *view;
-  ps_entry *p, *selected;
+  ps_entry *p, *selected, *group = s->value_buckets[owner % BUCKETS];
   size_t i, n = 0, at = 0;
   int rc = LC_OK;
   *out = NULL;
@@ -6290,41 +6433,40 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
   if (!view)
     return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
   view->space = s;
-  for (i = 0; i < BUCKETS; ++i)
-    for (p = s->buckets[i]; p; p = p->hash_next)
-      if (p->key.owner == owner && p->key.kind >= first &&
-          p->key.kind <= last && immutable_key(p->key) &&
-          selected_value(s, p, prefix))
-        ++n;
+  for (p = group; p; p = p->value_next)
+    if (p->key.owner == owner && p->key.kind >= first && p->key.kind <= last &&
+        selected_value(s, p, prefix))
+      ++n;
   if (n) {
     if (n <= (size_t)-1 / sizeof(*view->items))
       view->items = lc_calloc_with_allocator(NULL, n, sizeof(*view->items));
     if (!view->items)
       rc = err(error, LC_ERR_NOMEM, "cannot capture selected value metadata");
   }
-  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->buckets[i]; p; p = p->hash_next)
-      if (p->key.owner == owner && p->key.kind >= first &&
-          p->key.kind <= last && immutable_key(p->key) &&
-          (selected = selected_value(s, p, prefix)) != NULL) {
-        ps_value_slot *item = &view->items[at];
-        item->key = selected->key;
-        item->token = selected->token;
-        item->bytes = selected->bytes;
-        if (!retain || retain(context, item->key, item->token)) {
-          rc = ps_internal_entry_pin(s, selected, error);
-          if (rc != LC_OK)
-            break;
-          item->retained = selected;
-        }
-        ++at;
-      }
+  for (p = group; rc == LC_OK && p; p = p->value_next)
+    if (p->key.owner == owner && p->key.kind >= first && p->key.kind <= last &&
+        (selected = selected_value(s, p, prefix)) != NULL) {
+      ps_value_slot *item = &view->items[at++];
+      item->key = selected->key;
+      item->token = selected->token;
+      item->bytes = selected->bytes;
+      if (!retain || retain(context, item->key, item->token))
+        item->retained = selected;
+    }
   view->count = at;
+  if (rc == LC_OK && ps_coordination_shared(s->coordination))
+    rc = values_witness(view, error);
   if (rc == LC_OK) {
+    for (i = 0; i < view->count; ++i)
+      if ((p = view->items[i].retained) != NULL) {
+        if (view->items[i].witness)
+          p->reader_claimed = 1;
+        ++p->pins;
+      }
     ++s->readers;
     *out = view;
   } else
-    values_discard_locked(view);
+    values_free(view);
   return rc;
 }
 int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,

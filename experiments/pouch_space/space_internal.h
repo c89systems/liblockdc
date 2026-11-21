@@ -88,6 +88,7 @@ typedef struct ps_entry {
   struct ps_entry *previous;
   struct ps_entry *all_next, *hash_next;
   struct ps_entry **all_link;
+  struct ps_entry *value_next, **value_link;
   struct ps_entry *retired_next, **retired_link;
   struct ps_entry *dirty_next, **dirty_link;
   ps_directory_value checkpoint_ref, pending_ref;
@@ -182,6 +183,9 @@ struct ps_space {
   size_t packed_pages;
   uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty, *buckets[BUCKETS];
+  /* Current immutable keys, including tombstones that select older values
+   * at a completed prefix. Each bucket groups keys by namespace owner. */
+  ps_entry *value_buckets[BUCKETS];
   ps_entry *stream_buckets[BUCKETS];
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];

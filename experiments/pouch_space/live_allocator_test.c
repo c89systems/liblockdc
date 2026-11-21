@@ -1402,6 +1402,48 @@ static void capture_identities(void) {
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void capture_owner_collision(void) {
+  lc_error e = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_values *original = NULL, *current = NULL;
+  ps_reader *reader = NULL;
+  ps_key first = key(1), second = key(2), other = key(1), selected;
+  ps_ref ref;
+  uint64_t bytes;
+  other.owner += BUCKETS; /* Same in-memory bucket, different namespace. */
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put_key(a, first, 65);
+  capture_put_key(a, other, 81);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_values_capture(a, first.owner, PS_STATE, PS_STATE, &original, &e), &e);
+  REQUIRE(ps_values_count(original) == 1);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  ok(ps_delete(b, first, &e), &e);
+  capture_put_key(b, second, 131);
+  ok(ps_checkpoint(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  ok(ps_delete(a, other, &e), &e);
+  ok(ps_values_capture(a, first.owner, PS_STATE, PS_STATE, &current, &e), &e);
+  REQUIRE(ps_values_count(current) == 1);
+  ok(ps_values_info(current, 0, &selected, &ref, &bytes, &e), &e);
+  REQUIRE(selected.owner == first.owner && selected.key == second.key &&
+          bytes == 131);
+  ok(ps_values_read_open(current, 0, &reader, &e), &e);
+  captured_expect(reader, second.key, 131);
+  ps_reader_close(reader);
+  ps_values_close(current);
+  ok(ps_values_read_open(original, 0, &reader, &e), &e);
+  captured_expect(reader, first.key, 65);
+  ps_reader_close(reader);
+  ps_values_close(original);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_values_capture(b, other.owner, PS_STATE, PS_STATE, &current, &e), &e);
+  REQUIRE(!ps_values_count(current));
+  ps_values_close(current);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 typedef struct capture_fault {
   int kind, reason, armed, rollback;
   size_t nth, calls;
@@ -1430,9 +1472,9 @@ static void capture_faults(void) {
    * uncertain releases fail stop and retain residual authority until close. */
   for (int vector = 0; vector < 2; ++vector)
     for (int kind = 1; kind <= 4; ++kind)
-      for (int reason = 0; reason < 3; ++reason)
-        for (size_t nth = 1; nth <= (kind <= 2 ? (vector ? 8U : 4U) : 1U);
-             ++nth) {
+      for (int reason = 0; reason < 3; ++reason) {
+        size_t sites = 0;
+        for (size_t nth = 0; nth <= sites; ++nth) {
           lc_error e = {0};
           capture_fault f = {
               kind, reason == 0 ? EINTR : reason == 1 ? EAGAIN : EIO, 0, 0, nth,
@@ -1453,7 +1495,7 @@ static void capture_faults(void) {
           int rc = vector
                        ? ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e)
                        : ps_read_open(s, key(1), NULL, &r, &e);
-          if (kind == 2 || !reason) {
+          if (!nth || kind == 2 || !reason) {
             ok(rc, &e);
             REQUIRE(status(s).retained_payload_bytes ==
                     (vector ? 2U : 1U) * (3 * PS_CHUNK + 128));
@@ -1468,9 +1510,13 @@ static void capture_faults(void) {
             REQUIRE(!r && !view && !s->readers);
             lc_error_cleanup(&e);
           }
-          REQUIRE(f.calls >= nth);
+          if (!nth) {
+            sites = f.calls;
+            REQUIRE(sites);
+          } else
+            REQUIRE(f.calls >= nth);
           f.armed = 0;
-          if ((kind == 2 || kind == 4) && reason) {
+          if (nth && (kind == 2 || kind == 4) && reason) {
             REQUIRE(ps_check(s, &e) == LC_ERR_TRANSPORT);
             lc_error_cleanup(&e);
             REQUIRE(status(s).retained_payload_bytes > 0);
@@ -1485,6 +1531,7 @@ static void capture_faults(void) {
           ok(ps_close(s, &e), &e);
           REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
         }
+      }
   /* A failed acquisition followed by an uncertain rollback must not escape
    * as a clean Pending result or expose a partially captured vector. */
   for (int vector = 0; vector < 2; ++vector) {
@@ -1509,7 +1556,7 @@ static void capture_faults(void) {
     ok(ps_close(s, &e), &e);
     REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
   }
-  for (size_t nth = 0; nth <= 2; ++nth) {
+  for (size_t nth = 0; nth <= 3; ++nth) {
     lc_error e = {0};
     ps_space *s = NULL;
     ps_values *view = NULL;
@@ -1518,7 +1565,8 @@ static void capture_faults(void) {
     ps_options options = {0};
     options.coordination_io = &io;
     ok(ps_open(path, 1, &options, &s, &e), &e);
-    capture_put(s, 1, 3 * PS_CHUNK + 65);
+    capture_put(s, 1, 65);
+    capture_put(s, 2, 65);
     ok(ps_checkpoint(s, &e), &e);
     uint64_t before = coverage(NULL, 0);
     allocations = 0;
@@ -1527,16 +1575,28 @@ static void capture_faults(void) {
     f.armed = 1;
     int rc = ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e);
     measuring = 0;
-    REQUIRE(allocations == (nth ? nth : 2));
-    /* Contiguous multi-chunk values need one physical witness operation;
-     * body size does not multiply the capture's range syscalls. */
+    REQUIRE(allocations == (nth ? nth : 3));
+    /* Adjacent values share one physical witness acquisition. A reader
+     * opened from the capture can retain just its value after view close. */
     REQUIRE(f.calls == (nth ? 0U : 1U));
     if (nth) {
       REQUIRE(rc == LC_ERR_NOMEM && !view && !s->readers);
       lc_error_cleanup(&e);
     } else {
+      ps_reader *reader = NULL;
       ok(rc, &e);
+      REQUIRE(ps_values_count(view) == 2 &&
+              status(s).retained_payload_bytes == 256);
+      ps_key selected;
+      ps_ref ref;
+      uint64_t bytes;
+      ok(ps_values_info(view, 0, &selected, &ref, &bytes, &e), &e);
+      ok(ps_values_read_open(view, 0, &reader, &e), &e);
       ps_values_close(view);
+      REQUIRE(status(s).retained_payload_bytes == 128 &&
+              coverage(NULL, 0) == before + 128);
+      captured_expect(reader, selected.key, 65);
+      ps_reader_close(reader);
     }
     REQUIRE(coverage(NULL, 0) == before);
     ok(ps_close(s, &e), &e);
@@ -3834,6 +3894,8 @@ static void quarantine_partial_release(void) {
 typedef struct witness_queries {
   size_t payload;
   size_t large;
+  uint64_t packed_offset;
+  size_t packed;
 } witness_queries;
 static int count_payload_queries(void *context, int fd, int command,
                                  struct flock *lock) {
@@ -3843,6 +3905,9 @@ static int count_payload_queries(void *context, int fd, int command,
     ++queries->payload;
     if (lock->l_len >= (off_t)PS_MIB)
       ++queries->large;
+    if ((uint64_t)lock->l_start == queries->packed_offset &&
+        lock->l_len == PS_PAGE)
+      ++queries->packed;
   }
   return fcntl(fd, command, lock);
 }
@@ -3908,6 +3973,45 @@ static void witness_filter(void) {
   ps_reader_close(imported);
   ok(ps_checkpoint(a, &e), &e);
   REQUIRE(!status(a).retired_bytes);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void witness_projection(void) {
+  witness_queries queries = {0};
+  ps_coordination_io io = {&queries, count_payload_queries};
+  ps_options options = {.coordination_io = &io};
+  ps_space *a = NULL, *b = NULL, *join = NULL;
+  ps_reader *whole = NULL, *packed = NULL;
+  ps_entry *entry;
+  lc_error e = {0};
+
+  ok(ps_open(path, 1, NULL, &a, &e), &e);
+  capture_put(a, 42, PS_PAGE);
+  capture_put(a, 43, 65);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_close(a, &e), &e);
+  ok(ps_open(path, 0, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  entry = ps_internal_lookup(a, key(43));
+  REQUIRE(entry && entry->count == 1);
+  queries.packed_offset = entry->extents[0].offset / PS_PAGE * PS_PAGE;
+
+  /* The cold cohort starts with a clear payload map. While a peer pins a
+   * different page, the packed page is still known to have no witness. */
+  ok(ps_read_open(b, key(42), NULL, &whole, &e), &e);
+  ok(ps_metadata_repack(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  ok(ps_close(join, &e), &e);
+  REQUIRE(!queries.packed);
+  ok(ps_read_open(b, key(43), NULL, &packed, &e), &e);
+  ok(ps_metadata_repack(b, &e), &e);
+  ok(ps_refresh(a, &e), &e);
+  REQUIRE(queries.packed);
+  captured_expect(packed, 43, 65);
+  ps_reader_close(packed);
+  ps_reader_close(whole);
+  ok(ps_close(b, &e), &e);
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
@@ -6464,6 +6568,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[2], "captures")) {
     captures();
     capture_identities();
+    capture_owner_collision();
   } else if (!strcmp(argv[2], "capture-faults"))
     capture_faults();
   else if (!strcmp(argv[2], "capture-owned"))
@@ -6540,6 +6645,7 @@ int main(int argc, char **argv) {
     quarantine_partial_release();
     quarantine_packed();
     witness_filter();
+    witness_projection();
   } else if (!strcmp(argv[2], "journal-replay"))
     journal_replay();
   else if (!strcmp(argv[2], "journal-replay-retired"))

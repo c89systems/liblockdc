@@ -17,7 +17,7 @@ Current implementation and acceptance status:
 | Codec conversion | Bounded namespace and collection conversion plus [resumable root orchestration](#resumable-root-codec-conversion-before-admission) | Qualified for exclusive admission; format migration remains deferred |
 | Shared ownership | [Shared SDK admission](#shared-sdk-admission), file and allocator authority, [container namespace handoff](#container-namespace-ownership-handoff), [SDK namespace authority](#shared-sdk-namespace-authority), [local capture handoff](#local-namespace-capture-handoff), [shared stream completion](#shared-stream-completion), [shared grant preparation](#shared-grant-preparation), [append suffix replay](#append-suffix-replay-for-shared-state), [checkpoint recovery on handoff](#checkpoint-recovery-on-handoff), [resident writer checkpoint adoption](#resident-writer-checkpoint-adoption), [certified allocator refresh](#certified-allocator-refresh), [bounded quarantine rechecks](#bounded-quarantine-rechecks), [collection catalog authority](#shared-collection-catalog-authority), [shared collection append](#shared-collection-append-and-captured-reads), [fixed-capacity collection reuse](#shared-collection-reuse-at-fixed-capacity), [idle namespace owners](#namespace-mapping-lifetime), and [allocator progress during structural publication](#allocator-progress-during-structural-publication) | Tail latency and reopen cost |
 | Captured reads | [Cross-process immutable value retention](#captured-immutable-values-across-process-lifetimes), [namespace body source liveness](#cross-process-namespace-source-liveness), [shared projection and stream captures](#shared-projection-and-stream-captures), [collection topology retention](#shared-collection-append-and-captured-reads), and [indexed updates during fixed-capacity reclamation](#indexed-churn-and-piece-durability) | Sustained load latency and broader concurrent workloads |
-| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), [packed-page replay](#packed-page-reads-during-eager-admission), and [96 MiB of verified independent-writer churn at 10 MiB](#shared-checkpoint-capacity) | NoSync mutation tails, CPU cost, and grouped reopen remain open |
+| Performance | Separate work, readiness, maintenance, close, reopen and verification measurements, including [single-barrier cold admission](#cold-admission-and-independent-incarnation-grants), [prepared extent reuse](#prepared-extents-through-budget-and-workspace-admission), [packed-page replay](#packed-page-reads-during-eager-admission), and [96 MiB of verified independent-writer churn at 10 MiB](#captured-value-indexing-and-range-witnesses) | NoSync mutation tails, CPU cost, and grouped reopen remain open |
 
 The private single-file SDK path admits independently opened shared owners.
 Normal Pouch continues to open multifile roots.
@@ -11907,3 +11907,87 @@ capacity refusals. The final sample establishes the 96 MiB workload at the
 development capacity. NoSync mutation tails, CPU and grouped reopen still
 need performance qualification. Raw data is under
 `build/pouch-space-concurrent/root-workspace/`.
+
+## Captured value indexing and range witnesses
+
+On the 96 MiB NoSync workload, two instrumented runs attributed roughly
+3.1 seconds of CPU to acquiring and releasing data-range locks.
+Selected-value captures covered about 335,000–344,000 extents of newly
+pinned entries per traced run. CPU samples also found the capture walking the
+root's full key table twice per call.
+
+The resident allocator indexes current immutable keys by namespace
+owner. Capture and checkpoint stabilization visit the relevant bucket
+and still resolve each key at the requested completed prefix. The
+index retains current tombstones because their predecessors can still
+be selected there. Checkpoint adoption transfers the index alongside
+the existing resident identities and their retained readers.
+
+A captured view sorts the extents of its retained entries by physical
+position. Acquisition and release coalesce adjacent ranges for entries
+undergoing the same pin transition. The view retains range metadata,
+and body reads continue to stream from the captured incarnation. A
+reader that outlives the view keeps its own witness. A failed acquisition
+rolls back the acquired spans. If release is uncertain the handle keeps
+its fail-stop ownership until close.
+
+Checkpoint adoption and live join also consult the cohort's existing
+witness bitmap when reconstructing payload ownership. Clear pages can
+skip the kernel probe under allocator authority. A read-only import,
+or a range outside bitmap coverage, requires a kernel check. The tests
+cover a packed page both before and after a peer pins it, across
+checkpoint adoption and live join. Other fixtures cover colliding
+namespace owners, retained values across adoption and deletion,
+adjacent witnesses, a surviving individual reader, and allocation and
+kernel failures at each capture boundary.
+
+Two instrumented NoSync runs per build verified the full workload.
+Average data-range acquisitions fell from 435,000 to 325,000 and
+releases from 436,000 to 326,000. Data-range queries fell from
+330,000 to 298,000. Sampled CPU time for acquisition and release
+fell from about 3.10 to 2.39 seconds. Counts include physical data
+ranges used by readers, writers, budgets and metadata preparation.
+
+The final uninstrumented rotation verified all eight runs. Both
+native builds ran twice in NoSync and once in durable mode. Multifile
+ran once per mode. The root stayed at 10 MiB in all native runs, with
+eight independent producer handles. The table reports medians.
+Work and CPU are in seconds. Mutation p95, close, reopen and verification
+are in milliseconds. Each run built its own layout.
+
+| Backend | Durability | Work | CPU through maintenance | Mutation p95 | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prior native (`460cae0c`) | NoSync | 11.24 | 14.61 | 124.84 | 15.66 | 21.83 | 29.39 | 22.94 |
+| Revised native | NoSync | 10.07 | 12.56 | 112.67 | 13.26 | 19.39 | 25.32 | 17.55 |
+| Multifile | NoSync | 10.99 | 4.18 | 56.16 | 2.35 | 0.27 | 1.18 | 24.02 |
+| Prior native | Durable | 20.37 | 18.20 | 182.23 | 18.09 | 20.61 | 26.56 | 23.02 |
+| Revised native | Durable | 20.66 | 16.50 | 176.38 | 19.85 | 19.80 | 63.28 | 18.18 |
+| Multifile | Durable | 35.20 | 5.58 | 196.67 | 2.95 | 0.24 | 1.22 | 25.12 |
+
+| Backend | Durability | Index flush (s) | First query pass (s) | Repeat query pass (s) | First pass after reopen (ms) | Repeat pass after reopen (ms) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Prior native | NoSync | 1.81 | 0.71 | 0.28 | 2.56 | 1.21 |
+| Revised native | NoSync | 1.83 | 0.78 | 0.31 | 2.19 | 1.10 |
+| Multifile | NoSync | 2.97 | 1.78 | 2.44 | 3.23 | 2.06 |
+| Prior native | Durable | 2.29 | 0.67 | 0.22 | 2.38 | 1.17 |
+| Revised native | Durable | 2.32 | 0.56 | 0.16 | 2.44 | 1.10 |
+| Multifile | Durable | 4.74 | 6.34 | 8.51 | 3.09 | 1.90 |
+
+An earlier timed profile of the prior build refused a late NoSync
+mutation. Subsequent completed traces found up to 4.2 MiB of dirty
+stream removals awaiting checkpoint retirement at admission pressure.
+Both final instrumented runs of the revised build completed. Stability
+across scheduling variations remains part of qualification.
+
+In the prior build's instrumented durable reopen, the cold owner spent
+14.1 ms recovering namespaces and 8.5 ms in physical open. Live
+joins spent 5.8–7.7 ms apiece rebuilding a directory with 3,347
+entries, and roughly 0.4 ms rebuilding payload ownership. The final
+durable pair also shows sensitivity to the resulting layout. NoSync
+CPU and mutation tails remain above multifile.
+
+Verification passed 61 GNU Release groups and 17 groups each on Debug
+ASan/UBSan and musl Release. The GNU groups included indexed crash
+recovery, lease and messaging pressure, queue, outbox, revision and
+checkpoint adoption. Raw comparisons and profiles are under
+`build/pouch-space-concurrent/native-cost/`.

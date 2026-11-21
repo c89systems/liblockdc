@@ -523,8 +523,8 @@ void ps_readiness_witness_pages(ps_space *s, uint64_t offset, uint64_t bytes,
 int ps_readiness_witness_possible(ps_space *s, uint64_t offset,
                                   uint64_t bytes) {
   uint64_t start, end;
-  if (!s->readiness || !s->readiness->active || offset < PS_DATA ||
-      offset >= BITMAP_END || bytes > BITMAP_END - offset)
+  if (!s->readiness || (!s->readiness->active && !s->readiness->existing) ||
+      offset < PS_DATA || offset >= BITMAP_END || bytes > BITMAP_END - offset)
     return 1;
   start = (offset - PS_DATA) / PS_PAGE;
   end = (offset - PS_DATA + bytes + PS_PAGE - 1) / PS_PAGE;
