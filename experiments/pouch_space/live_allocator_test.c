@@ -3898,11 +3898,13 @@ static void certified_prefix_reads(void) {
 
   ok(ps_checkpoint(b, &e), &e);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(disk.root_reads == 2 && disk.journal_reads == 3);
+  /* A private preview reads both roots. The allocator revalidates the
+   * pair before adopting either root. */
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 3);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(disk.root_reads == 2 && disk.journal_reads == 3);
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 3);
   ok(ps_refresh(a, &e), &e);
-  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 4);
+  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 4);
   /* A writer can exit just before issuing its first write. Confirm the old
    * end marker once, then return to reads using the live certificate. */
   ps_coordination_guard *guard = NULL;
@@ -3912,10 +3914,10 @@ static void certified_prefix_reads(void) {
   ps_readiness_begin(b, PS_READINESS_JOURNAL);
   ps_coordination_unlock(guard);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(!readiness(a).pending && disk.root_reads == 4 &&
+  REQUIRE(!readiness(a).pending && disk.root_reads == 6 &&
           disk.journal_reads == 5);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 5);
+  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 5);
   ok(ps_close(b, &e), &e);
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));

@@ -12694,3 +12694,90 @@ and of shared commit barriers as separate targets. Moving checkpoint
 preparation out of allocator authority requires preserving the accepted
 journal suffix beyond the checkpoint cut. The current root starts replay
 at a fixed physical journal offset.
+
+## Certified journal length and batched replay trial
+
+A prepared checkpoint can select an older cut while peers continue to
+append only if both the predecessor and the successor can reach the
+accepted suffix. The current checkpoint recovery starts from a fixed
+journal offset and handles the case where the new root covers the entire
+prefix. Live adoption already validates the complete projection before
+installing it.
+
+The first reader trial fetched the suffix a page at a time. It cut
+requested bytes and increased read calls. The next trial certifies the
+exact byte length with the ready sequence and checkpoint generation.
+The compact version stores the length in the unused low bits of the
+aligned grant frontier. The volatile protocol marker fences mixed live
+cohorts. Cold open can rebuild the certificate from the existing disk
+format.
+
+The exact span lets checkpoint adoption read the certified suffix and
+its end marker in one transfer. A same-root observer imports its
+missing suffix directly into the resident replay buffer in one
+transfer. Individual frames still pass their existing checks before
+application. A damaged later frame leaves the cache at the last accepted
+frame. A retry resumes at that boundary. Explicit verification and
+interrupted transitions use the checked disk-boundary path.
+
+The 192 MiB NoSync trace reduced checkpoint adoption bytes requested
+from 118.49 MB to 2.02 MB with about 900 adoptions per run and one read
+each. Same-root replay fell from 418,096 reads across 47,826 catch-ups
+to 48,744 reads across 48,744 catch-ups. The comparable thread CPU
+totals in same-root replay were 1.275 and 1.037 s.
+
+All six matched runs of the compact certificate verified through
+reclaim and reopen. The prior binary came from `ea4a1eb3`. Each run
+streamed 192 MiB of 64 KiB values with eight writers into a fixed
+10 MiB file. There was one pair in NoSync and two pairs in durable
+mode. Durable figures are medians. Work, mutation work and process CPU
+through maintenance are seconds. Mutation p95 is in milliseconds.
+Late-window p95 covers rounds 113–128.
+
+| Build | Durability | Work | Mutation work | CPU | Mutation p95 | Late-window p95 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Prior | NoSync | 16.32 | 12.61 | 21.37 | 100.09 | 130.16 |
+| Candidate | NoSync | 17.25 | 13.03 | 20.32 | 109.09 | 147.58 |
+| Prior | Durable | 29.70 | 26.31 | 24.39 | 124.26 | 156.34 |
+| Candidate | Durable | 32.02 | 28.15 | 25.15 | 133.65 | 159.47 |
+
+Index phases are in seconds. Each phase reports its slowest worker.
+Close, first-owner reopen, eight live joins and post-open verification
+are in milliseconds.
+
+| Build | Durability | Index flush | First query | Repeat query | Close | First reopen | Eight live joins | Verify after reopen |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Prior | NoSync | 3.25 | 0.70 | 0.25 | 24.80 | 30.69 | 41.66 | 21.81 |
+| Candidate | NoSync | 3.62 | 0.55 | 0.24 | 31.51 | 39.11 | 38.47 | 21.97 |
+| Prior | Durable | 3.36 | 0.37 | 0.10 | 23.74 | 30.98 | 38.99 | 21.54 |
+| Candidate | Durable | 3.81 | 0.38 | 0.07 | 24.91 | 32.04 | 49.48 | 22.56 |
+
+The compact trial passed 22 GNU Release groups and nine each on
+ASan/UBSan and musl. The focused fixture exercised a multi-page atomic
+revision, a short read followed by an I/O error, a damaged second frame
+during ordinary catch-up, and cold reopen. The readiness fixture rejects
+a checksum-valid certificate claiming more bytes than the journal can
+hold. The retained comparison fixture now accounts for both the private
+preview's root reads and the authoritative root reread.
+
+The branch retains the previous runtime. The compact trial shortened
+the measured replay operation and increased elapsed work in every
+matched pair. Its tested source is in stash `2f46811f`. Raw trials and
+logs are under `build/pouch-space-concurrent/journal-cut/`.
+
+Two NoSync control traces found at least half the journal free at 79 of
+116 and 96 of 126 checkpoints. The durable control found the same at 81 of
+118 checkpoints. Nearly all sampled checkpoints had the pressure hint
+set. The journal slack supports testing a rolling window in the current
+128 KiB region. Payload admission and checkpoint workspace still require
+their own headroom checks.
+
+The rolling-window trial needs a durable byte origin for each selected
+root and a bound on the predecessor's covered span. Writers must be able
+to append across a paused first barrier. An observer whose accepted
+sequence is already beyond the checkpoint cut must reach that same
+sequence by replaying the new root's suffix before adoption. Recovery
+must preserve those accepted bytes on either side of root selection,
+including physical wrap, and stabilize retirement before reusing covered
+space. Journal exhaustion during preparation needs a bounded completion
+or fallback path at 10 MiB.
