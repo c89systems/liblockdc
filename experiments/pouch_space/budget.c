@@ -518,13 +518,17 @@ void ps_internal_budget_spend(ps_budget *b, uint64_t payload, uint64_t metadata,
   b->space->reserved_metadata -= metadata;
   b->space->reserved_entries -= entries;
 }
-int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
-                   lc_error *e) {
+static int budget_open(ps_space *s, const ps_budget_plan *plan, int completion,
+                       ps_budget **out, lc_error *e) {
+  const ps_budget_plan empty = {0};
   ps_budget *b;
   ps_coordination_guard *guard = NULL;
+  int receiver = completion && !plan;
   int rc, accounted = 0;
   if (out)
     *out = NULL;
+  if (receiver)
+    plan = &empty;
   if (!s || !plan || !out || plan->payload_bytes % PS_PAGE ||
       plan->maintenance < 0 || plan->maintenance > 1)
     return invalid(e,
@@ -551,9 +555,9 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
        plan->metadata_bytes > UINT64_MAX - s->reserved_metadata ||
        plan->entries > UINT64_MAX - s->reserved_entries))
     rc = invalid(e, "capacity budget totals overflow");
-  if (rc == LC_OK)
+  if (rc == LC_OK && !receiver)
     rc = ps_internal_admission_begin(s, &guard, e);
-  if (rc == LC_OK) {
+  if (rc == LC_OK && !receiver) {
     s->reserved_payload += plan->payload_bytes;
     s->reserved_metadata += plan->metadata_bytes;
     s->reserved_entries += plan->entries;
@@ -571,13 +575,15 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     accounted = 0;
   }
   rc = ps_internal_capture_end(s, guard, rc, e);
-  if (accounted) {
-    if (rc != LC_OK) {
-      ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
-                               plan->entries);
-      ps_internal_budget_trim(s, &b->trim);
-    } else
-      ++s->budgets;
+  if (accounted && rc != LC_OK) {
+    ps_internal_budget_spend(b, plan->payload_bytes, plan->metadata_bytes,
+                             plan->entries);
+    ps_internal_budget_trim(s, &b->trim);
+  }
+  if (rc == LC_OK) {
+    if (completion)
+      b->remaining.maintenance = 1;
+    ++s->budgets;
   }
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK)
@@ -588,6 +594,14 @@ int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
     lc_free_with_allocator(NULL, b);
   }
   return rc;
+}
+int ps_budget_open(ps_space *s, const ps_budget_plan *plan, ps_budget **out,
+                   lc_error *e) {
+  return budget_open(s, plan, 0, out, e);
+}
+int ps_budget_open_completion(ps_space *s, const ps_budget_plan *plan,
+                              ps_budget **out, lc_error *e) {
+  return budget_open(s, plan, 1, out, e);
 }
 int ps_budget_status(ps_budget *b, ps_budget_plan *out, lc_error *e) {
   if (!b || !out)

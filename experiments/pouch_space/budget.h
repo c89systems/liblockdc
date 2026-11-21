@@ -85,6 +85,11 @@ int ps_budget_plan_preferred_span(ps_budget_plan *, uint64_t bytes,
                                   uint64_t preferred_grant, lc_error *);
 int ps_budget_open(ps_space *, const ps_budget_plan *, ps_budget **,
                    lc_error *);
+/* Admit the supplied plan with its own maintenance policy, then let the
+ * handle fund completion. A NULL plan creates an empty receiver under the
+ * local mutex. Only a later transfer or admitted resize adds usable credit. */
+int ps_budget_open_completion(ps_space *, const ps_budget_plan *, ps_budget **,
+                              lc_error *);
 /* Check the ordinary floor after increasing a mandatory completion claim,
  * before accepting ordinary producer bytes. Recovery and mandatory work may
  * restore/spend completion credits while the standing floor is in use. */

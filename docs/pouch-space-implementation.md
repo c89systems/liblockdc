@@ -13260,3 +13260,95 @@ remaining allocator traffic on the revised path.
 
 Raw workloads, interoperability checks, call stacks, and test logs are
 under `build/pouch-space-concurrent/reader-witness/`.
+
+## Admit checkpoint completion once
+
+Checkpoint planning reads the current claim and computes the outstanding
+cost. A standalone metadata update or offline body replacement admits that
+cost directly into its completion budget. The caller's ordinary or
+maintenance class controls admission. The handle becomes completion credit
+only after admission succeeds. Compound operations still admit the entire
+plan before streaming. They create a local completion receiver when there
+is funded credit to transfer.
+
+PostgreSQL's resource owner prepares local bookkeeping before acquiring
+the resource it will track. That separation suggested treating an empty
+completion receiver as local bookkeeping. The allocator still authorizes
+every new claim against the shared capacity and protects the maintenance
+floor. [PostgreSQL resource owner implementation](https://doxygen.postgresql.org/resowner_8c_source.html#l00459)
+
+The deterministic capacity fixture exhausts ordinary headroom, checks that
+direct ordinary admission fails, transfers pre-admitted credit to an empty
+receiver without taking allocator authority, and checks that completion
+credit cannot transfer back into ordinary credit. Direct admission of a
+funded completion budget takes one allocator acquisition and publishes a
+readable value. Verification passed 82 distinct GNU Release groups and 42
+each on musl Release and ASan/UBSan. Coverage includes fixed-capacity batch
+admission, compound recode and concurrency, explicit growth, publication
+faults, lease authority, queue transactions, and outbox recovery.
+
+The 96 MiB NoSync call-site trace sampled one in 128 allocator acquisitions.
+The total fell from 699 to 666, and the 45 samples attributed to empty
+budget admission from delta planning fell to zero.
+
+All 33 uninstrumented comparisons verified through reopen. Indexed runs
+used eight writers, 24 rows, 64 KiB values and fixed 10 MiB single-file
+roots. The control is `8c9f8b90`. The native builds ran four pairs at
+96 MiB NoSync, two at 96 MiB durable, and three at 192 MiB NoSync.
+Each indexed workload includes one fresh multifile reference. Values
+are medians where repeated. Work and CPU are in seconds. Mutation and
+late-window p95 are in milliseconds. The late window covers the last
+16 rounds.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 7.04 | 7.27 | 88.34 | 92.10 |
+| 96 MiB NoSync | Revised | 6.85 | 6.91 | 86.76 | 102.85 |
+| 96 MiB NoSync | Multifile | 11.36 | 5.24 | 59.35 | 53.77 |
+| 96 MiB durable | Prior | 14.46 | 10.48 | 112.83 | 131.37 |
+| 96 MiB durable | Revised | 14.10 | 10.21 | 109.64 | 123.76 |
+| 96 MiB durable | Multifile | 37.94 | 6.76 | 230.46 | 248.96 |
+| 192 MiB NoSync | Prior | 16.29 | 16.97 | 109.33 | 135.22 |
+| 192 MiB NoSync | Revised | 16.72 | 17.33 | 110.78 | 131.16 |
+| 192 MiB NoSync | Multifile | 20.42 | 9.47 | 49.91 | 46.99 |
+
+The 96 MiB NoSync build reduced work time in three of four pairs. CPU fell
+in two pairs and rose in two. Late p95 rose by less than 0.1 ms in one
+pair and by 12.8 and 14.2 ms in two others. It fell by 6.8 ms in the last
+pair. At 192 MiB, work time rose in two of three pairs and CPU rose in two.
+The median changes were 0.43 s of work time and 0.36 s of CPU.
+
+Index phases report the longest worker in seconds. First owner, eight
+live joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.72 | 0.27 | 0.11 | 14.50 | 23.65 | 13.46 | 14.61 |
+| 96 MiB NoSync | Revised | 1.63 | 0.24 | 0.09 | 18.40 | 28.60 | 15.89 | 17.88 |
+| 96 MiB NoSync | Multifile | 3.07 | 1.98 | 2.36 | 0.22 | 1.56 | 26.17 | 3.07 |
+| 96 MiB durable | Prior | 1.72 | 0.16 | 0.04 | 19.36 | 36.98 | 20.97 | 28.21 |
+| 96 MiB durable | Revised | 1.73 | 0.19 | 0.04 | 15.42 | 27.91 | 13.23 | 21.77 |
+| 96 MiB durable | Multifile | 4.57 | 6.48 | 7.11 | 0.35 | 1.83 | 31.63 | 3.25 |
+| 192 MiB NoSync | Prior | 3.57 | 0.54 | 0.21 | 29.02 | 37.21 | 23.52 | 27.02 |
+| 192 MiB NoSync | Revised | 3.63 | 0.55 | 0.22 | 31.03 | 36.86 | 21.32 | 35.88 |
+| 192 MiB NoSync | Multifile | 5.50 | 3.26 | 4.26 | 0.23 | 1.23 | 42.72 | 4.82 |
+
+Warmed queue and durable outbox ran twice per build with two writers.
+Times are medians in milliseconds.
+
+| Workload | Metric | Prior single-file | Revised single-file | Multifile |
+| --- | --- | ---: | ---: | ---: |
+| Warmed queue | Work / CPU / p95 | 9.17 / 13.60 / 2.87 | 8.85 / 15.20 / 1.62 | 89.21 / 29.13 / 18.30 |
+| Durable outbox | Work / CPU / p95 | 1026.36 / 134.07 / 194.84 | 1018.07 / 134.57 / 193.61 | 1366.51 / 201.61 / 258.51 |
+
+A separate verified 96 MiB NoSync trace inspected the resident view at
+11,560 value read opens. It found 2,871 certified misses or stale
+references, including seven query-artifact opens. A further 8,366
+calls had a current value without an existing local extent witness.
+The remaining 323 calls needed to refresh the resident view. A
+certified-miss shortcut would reach the first group. Reducing successful
+read-open cost requires a cheaper proof that the selected extents will
+remain live throughout the read.
+
+Raw comparisons, traces, and test logs are under
+`build/pouch-space-concurrent/completion-admission/`.

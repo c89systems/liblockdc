@@ -1451,14 +1451,11 @@ int ps_checkpoint_delta_open(ps_key_checkpoint *c, int maintenance,
 static int delta_plan_cost(ps_checkpoint_delta *d, ps_budget_plan *extra,
                            lc_error *e) {
   ps_key_checkpoint *c = d->checkpoint;
-  ps_budget_plan empty = {0}, current;
+  ps_budget_plan current = {0};
   int rc = LC_OK;
   memset(extra, 0, sizeof(*extra));
   pthread_mutex_lock(&c->mutex);
-  empty.maintenance = 1;
-  if (!c->budget)
-    rc = ps_budget_open(c->ns->root->space, &empty, &c->budget, e);
-  if (rc == LC_OK)
+  if (c->budget)
     rc = ps_budget_status(c->budget, &current, e);
   if (rc == LC_OK) {
     extra->payload_bytes = d->claim.payload_bytes > current.payload_bytes
@@ -1520,9 +1517,17 @@ int ps_checkpoint_delta_plan(ps_checkpoint_delta *d,
 }
 int ps_checkpoint_delta_fund(ps_checkpoint_delta *d, ps_budget *source,
                              const ps_budget_plan *extra, lc_error *e) {
+  ps_key_checkpoint *c = d->checkpoint;
+  int rc = LC_OK;
   if (!extra->payload_bytes && !extra->metadata_bytes && !extra->entries)
     return LC_OK;
-  return ps_budget_transfer(source, d->checkpoint->budget, extra, e);
+  pthread_mutex_lock(&c->mutex);
+  if (!c->budget)
+    rc = ps_budget_open_completion(c->ns->root->space, NULL, &c->budget, e);
+  if (rc == LC_OK)
+    rc = ps_budget_transfer(source, c->budget, extra, e);
+  pthread_mutex_unlock(&c->mutex);
+  return rc;
 }
 int ps_checkpoint_delta_bind(ps_checkpoint_delta *d, ps_record_writer *writer,
                              uint64_t segment, const char *leaf, lc_error *e) {
@@ -1907,11 +1912,27 @@ static int write_control(ps_key_checkpoint *c, uint64_t epoch, ps_writer **out,
   info.query_index = c->query_index;
   return write_control_values(c, c->budget, &info, out, e);
 }
+static int fund_completion_claim(ps_key_checkpoint *c,
+                                 const ps_budget_plan *cost, lc_error *e) {
+  ps_space *space = c->ns->root->space;
+  ps_budget *parent = NULL;
+  int rc;
+  pthread_mutex_lock(&c->mutex);
+  if (!c->budget)
+    rc = ps_budget_open_completion(space, cost, &c->budget, e);
+  else {
+    rc = ps_budget_open(space, cost, &parent, e);
+    if (rc == LC_OK)
+      rc = ps_budget_transfer(parent, c->budget, cost, e);
+  }
+  pthread_mutex_unlock(&c->mutex);
+  (void)ps_budget_close(parent, NULL);
+  return rc;
+}
 int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
                           const lc_pouch_storage_batch *batch, uint64_t bytes,
                           ps_checkpoint_delta **out, lc_error *e) {
   ps_checkpoint_delta *d = NULL;
-  ps_budget *parent = NULL;
   ps_budget_plan cost;
   lc_pouch_record_header h;
   const void *key, *meta;
@@ -1945,11 +1966,8 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
                  "native metadata exceeds one revision descriptor window");
   if (rc == LC_OK) {
     cost.maintenance = maintenance;
-    rc = ps_budget_open(c->ns->root->space, &cost, &parent, e);
+    rc = fund_completion_claim(c, &cost, e);
   }
-  if (rc == LC_OK)
-    rc = ps_checkpoint_delta_fund(d, parent, &cost, e);
-  (void)ps_budget_close(parent, NULL);
   if (rc == LC_OK) {
     d->metadata_only = 1;
     d->metadata_count = batch->count;
@@ -2374,7 +2392,6 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
                                    lc_error *e) {
   ps_checkpoint_body *body = NULL;
   ps_checkpoint_record converted = {0};
-  ps_budget *parent = NULL;
   ps_budget_plan cost;
   int rc;
   if (!c || !expected || !replacement)
@@ -2384,13 +2401,12 @@ int ps_key_checkpoint_replace_body(ps_key_checkpoint *c,
   if (rc == LC_OK)
     rc = ps_key_body_plan(c, expected, converted.length, &body, &cost, e);
   if (rc == LC_OK)
-    rc = ps_budget_open(c->ns->root->space, &cost, &parent, e);
-  if (rc == LC_OK)
-    rc = ps_key_body_fund(body, parent, e);
-  if (rc == LC_OK)
+    rc = fund_completion_claim(c, &cost, e);
+  if (rc == LC_OK) {
+    body->funded = 1;
     rc = ps_key_body_commit(body, replacement, e);
+  }
   ps_key_body_close(body);
-  (void)ps_budget_close(parent, NULL);
   ps_checkpoint_record_close(&converted);
   return rc;
 }

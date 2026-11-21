@@ -197,11 +197,14 @@ static void verify_images(void) {
   REQUIRE(close(fd) == 0);
 }
 typedef struct lock_fault {
-  size_t calls, fail, fail2;
+  size_t calls, fail, fail2, allocator_acquires;
   int reason, failed_release;
 } lock_fault;
 static int lock_call(void *context, int fd, int command, struct flock *lock) {
   lock_fault *f = context;
+  if ((command == F_OFD_SETLK || command == F_OFD_SETLKW) &&
+      lock->l_start == 4 && lock->l_len == 1 && lock->l_type == F_WRLCK)
+    ++f->allocator_acquires;
   /* This seam targets extent/presence ownership. Allocator authority has its
    * own acquisition/release faults in live_allocator_test.c. */
   if (command == F_OFD_SETLK && !(lock->l_start == 4 && lock->l_len == 1)) {
@@ -315,6 +318,43 @@ static void register_credit_slot(ps_space *s, lc_error *e) {
   ps_budget *registration = NULL;
   ok(ps_budget_open(s, &plan, &registration, e), e);
   ok(ps_budget_close(registration, e), e);
+}
+static void completion_admission(void) {
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ps_budget *padding = NULL, *receiver = NULL, *funded = NULL;
+  ps_budget_plan pad = {0}, unit = {PS_PAGE, 0, 0, 0}, value = {0}, actual;
+  lock_fault fault = {0};
+  ps_coordination_io io = {&fault, lock_call};
+  ps_options options = {.coordination_io = &io};
+  size_t acquisitions;
+  int pressure;
+  ok(ps_open(path, 1, &options, &s, &e), &e);
+  ok(ps_maintenance_pressure(s, 1, &pressure, &pad.payload_bytes, &e), &e);
+  ok(ps_budget_open(s, &pad, &padding, &e), &e);
+  REQUIRE(ps_budget_open_completion(s, &unit, &funded, &e) == LC_ERR_INVALID &&
+          !funded);
+  lc_error_cleanup(&e);
+  acquisitions = fault.allocator_acquires;
+  ok(ps_budget_open_completion(s, NULL, &receiver, &e), &e);
+  ok(ps_budget_status(receiver, &actual, &e), &e);
+  REQUIRE(actual.maintenance && !actual.payload_bytes &&
+          !actual.metadata_bytes && !actual.entries);
+  ok(ps_budget_transfer(padding, receiver, &unit, &e), &e);
+  REQUIRE(ps_budget_transfer(receiver, padding, &unit, &e) == LC_ERR_INVALID);
+  lc_error_cleanup(&e);
+  REQUIRE(fault.allocator_acquires == acquisitions);
+  ok(ps_budget_close(receiver, &e), &e);
+  ok(ps_budget_close(padding, &e), &e);
+  ok(ps_budget_plan_value(&value, 65, &e), &e);
+  acquisitions = fault.allocator_acquires;
+  ok(ps_budget_open_completion(s, &value, &funded, &e), &e);
+  REQUIRE(fault.allocator_acquires == acquisitions + 1);
+  ok(publish(s, funded, 1, 65, &e), &e);
+  ok(ps_budget_close(funded, &e), &e);
+  verify(s, 1, 65, &e);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!kernel_bytes() && !unlink(path));
 }
 static void fragmented_faults(void) {
   lc_error e = {0};
@@ -1244,7 +1284,9 @@ int main(int argc, char **argv) {
   REQUIRE(mkdtemp(directory));
   REQUIRE(snprintf(path, sizeof(path), "%s/store", directory) <
           (int)sizeof(path));
-  if (!strcmp(argv[2], "lifecycle"))
+  if (!strcmp(argv[2], "completion-admission"))
+    completion_admission();
+  else if (!strcmp(argv[2], "lifecycle"))
     lifecycle();
   else if (!strcmp(argv[2], "metadata-lifecycle"))
     metadata_lifecycle();
