@@ -13352,3 +13352,111 @@ remain live throughout the read.
 
 Raw comparisons, traces, and test logs are under
 `build/pouch-space-concurrent/completion-admission/`.
+
+## Validate resident read witnesses before capture
+
+A direct immutable read first checks the resident generation and ready
+and durable prefixes. An existing local pin or private publication
+witness can be borrowed immediately. A new witness covers the exact
+extents for the selected incarnation. The reader acquires those ranges
+and checks the shared certificate again before exposing a reader to the
+caller. If the certificate changed, it releases the provisional witness
+and retries with ordinary allocator capture. A miss can return from the
+certified view. Vector captures select and witness their batch under
+one allocator hold.
+
+The protocol applies the publish-and-recheck step from hazard pointers.
+The local mutex retains the in-memory descriptor, and the OFD range
+witness retains its immutable bytes. If a peer can reuse the bytes
+before seeing the new witness, it must have advanced the shared
+selection. The reader rejects the stale incarnation before any payload I/O.
+Once the reader certifies the selection, the allocator either excludes
+the selected bytes or finds the kernel witness during retirement. The
+advisory witness bitmap may retain a stale positive after a discarded
+capture. [Maged Michael, Hazard Pointers](https://www.cs.otago.ac.nz/cosc440/readings/hazard-pointers.pdf),
+[Folly's protect-and-recheck implementation](https://github.com/facebook/folly/blob/main/folly/synchronization/HazptrHolder.h)
+
+The deterministic cases run in both durability modes. A peer replaces
+the value and reuses its old extent while the reader waits before the
+physical claim. The reader rejects the old reference. A pause after
+the claim instead leaves the retired extent protected, and the reader
+then adopts the replacement. A process killed after taking a provisional
+witness releases it, and the peer reclaims capacity and verifies the
+next value after cold reopen. A query-artifact read also succeeds while
+a peer holds allocator authority. The fault matrix exercises both the
+direct fallback and batched capture. Verification passed 87 GNU Release
+groups and 50 each on musl Release and ASan/UBSan. Those runs cover
+shared lease authority, queue transactions, outbox recovery, explicit
+growth, and indexed queries through fault and crash recovery.
+
+The 96 MiB NoSync allocator trace sampled 566 acquisitions versus 666
+for `b9182b59`, at one sample per 128 acquisitions. Direct read-open
+samples fell from 91 to four. Revision publication (124) and namespace
+admission (92) were the largest remaining immediate callers.
+
+All 34 uninstrumented comparisons verified through reopen. Indexed
+workloads used eight writers, 24 rows and 64 KiB values. The native
+roots held a fixed 10 MiB. The control is `b9182b59`. The two native
+builds ran three pairs per NoSync workload and two pairs at 96 MiB
+durable. The 192 MiB durable comparison has one run per build. Each
+indexed workload includes one fresh multifile reference. Work and CPU
+are in seconds. Mutation and late-window p95 are in milliseconds. The
+late window covers the last 16 rounds.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 6.02 | 6.05 | 75.64 | 81.69 |
+| 96 MiB NoSync | Revised | 5.71 | 5.82 | 72.92 | 78.50 |
+| 96 MiB NoSync | Multifile | 10.39 | 4.06 | 56.13 | 56.13 |
+| 96 MiB durable | Prior | 13.36 | 7.60 | 101.16 | 117.16 |
+| 96 MiB durable | Revised | 13.06 | 7.49 | 100.06 | 116.01 |
+| 96 MiB durable | Multifile | 31.23 | 5.13 | 183.57 | 175.42 |
+| 192 MiB NoSync | Prior | 14.82 | 16.41 | 90.70 | 125.86 |
+| 192 MiB NoSync | Revised | 13.29 | 16.52 | 85.97 | 110.88 |
+| 192 MiB NoSync | Multifile | 20.54 | 9.24 | 50.50 | 46.29 |
+| 192 MiB durable | Prior | 26.92 | 20.95 | 107.44 | 149.72 |
+| 192 MiB durable | Revised | 24.66 | 21.96 | 105.44 | 129.38 |
+| 192 MiB durable | Multifile | 62.21 | 10.42 | 177.42 | 166.37 |
+
+Work time fell in all three 96 MiB NoSync pairs and two of three
+192 MiB NoSync pairs. The 192 MiB NoSync mutation p95 fell in all three
+pairs, with late p95 lower in two. CPU changed by less than 4% within
+each 192 MiB NoSync pair. The single 192 MiB durable pair reduced work
+time by 2.25 s and used 1.01 s more CPU.
+
+Index phases are the longest worker in seconds. First owner, eight live
+joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.50 | 0.25 | 0.09 | 12.55 | 20.12 | 11.18 | 13.46 |
+| 96 MiB NoSync | Revised | 1.33 | 0.20 | 0.07 | 13.56 | 18.76 | 11.20 | 11.37 |
+| 96 MiB NoSync | Multifile | 2.89 | 1.76 | 2.27 | 0.22 | 1.37 | 23.04 | 2.62 |
+| 96 MiB durable | Prior | 1.63 | 0.12 | 0.03 | 13.45 | 22.47 | 12.18 | 12.74 |
+| 96 MiB durable | Revised | 1.57 | 0.10 | 0.02 | 13.19 | 22.00 | 11.79 | 15.35 |
+| 96 MiB durable | Multifile | 4.00 | 5.61 | 7.23 | 0.25 | 1.39 | 31.27 | 2.96 |
+| 192 MiB NoSync | Prior | 3.12 | 0.54 | 0.21 | 29.54 | 34.05 | 20.39 | 23.34 |
+| 192 MiB NoSync | Revised | 2.66 | 0.44 | 0.14 | 29.31 | 35.08 | 20.97 | 25.14 |
+| 192 MiB NoSync | Multifile | 5.57 | 3.39 | 4.28 | 0.23 | 1.08 | 36.95 | 3.28 |
+| 192 MiB durable | Prior | 3.10 | 0.36 | 0.08 | 30.28 | 37.92 | 19.79 | 28.95 |
+| 192 MiB durable | Revised | 2.85 | 0.38 | 0.06 | 35.87 | 37.45 | 21.21 | 30.65 |
+| 192 MiB durable | Multifile | 7.60 | 10.44 | 14.00 | 0.24 | 1.23 | 39.93 | 3.79 |
+
+Warmed queue and durable outbox ran twice per build with two writers.
+Times are medians in milliseconds.
+
+| Workload | Metric | Prior single-file | Revised single-file | Multifile |
+| --- | --- | ---: | ---: | ---: |
+| Warmed queue | Work / CPU / p95 | 8.89 / 14.64 / 1.64 | 10.06 / 16.31 / 1.89 | 75.48 / 25.54 / 15.25 |
+| Durable outbox | Work / CPU / p95 | 998.71 / 109.88 / 200.33 | 1035.09 / 109.01 / 197.23 | 1354.25 / 168.67 / 274.24 |
+
+The eight-lease comparison verified all 160 runs across four codec
+configurations, both durability policies, and warm and cold expiry. In
+the five cold plaintext runs per policy, median expiry took 192.45 ms
+NoSync and 175.20 ms durable for single-file, versus 371.02 ms and
+372.61 ms for multifile. Cold opening took 5.61 and 1.56 ms for
+single-file and 0.57 and 0.54 ms for multifile. The lease fixture uses
+`native=0` for single-file.
+
+Raw comparisons, traces, and test logs are under
+`build/pouch-space-concurrent/resident-reader/`.

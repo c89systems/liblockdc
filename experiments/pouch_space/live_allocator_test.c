@@ -1657,6 +1657,13 @@ static void capture_faults(void) {
           if (vector)
             capture_fragmented(s, 2);
           ok(ps_checkpoint(s, &e), &e);
+          if (!vector && (kind == 3 || kind == 4)) {
+            ps_space *peer = NULL;
+            /* A stale direct reader still exercises guarded admission. */
+            ok(ps_open(path, 0, NULL, &peer, &e), &e);
+            capture_put(peer, 2, 0);
+            ok(ps_close(peer, &e), &e);
+          }
           uint64_t before = coverage(NULL, 0);
           f.armed = kind != 2;
           int rc = vector
@@ -1859,10 +1866,14 @@ static void capture_owned(void) {
 static int pause_capture(void *context, int fd, int command,
                          struct flock *lock) {
   query_gate *g = context;
+  int rc = 0, acquired = 0;
   if (command == F_OFD_SETLK && lock->l_start >= PS_DATA &&
       lock->l_type == F_RDLCK) {
     pthread_mutex_lock(&g->mutex);
     if (g->armed) {
+      acquired = g->armed == 2;
+      if (acquired)
+        rc = fcntl(fd, command, lock);
       g->armed = 0;
       g->entered = 1;
       pthread_cond_broadcast(&g->cond);
@@ -1871,7 +1882,7 @@ static int pause_capture(void *context, int fd, int command,
     }
     pthread_mutex_unlock(&g->mutex);
   }
-  return fcntl(fd, command, lock);
+  return acquired ? rc : fcntl(fd, command, lock);
 }
 typedef struct capture_worker {
   ps_space *space;
@@ -1889,8 +1900,14 @@ static void *one_capture(void *context) {
     w->gate->finished = 1;
     pthread_cond_broadcast(&w->gate->cond);
     pthread_mutex_unlock(&w->gate->mutex);
-  } else
-    ok(ps_read_open(w->space, key(1), NULL, &w->reader, &e), &e);
+  } else {
+    ps_values *view = NULL;
+    ok(ps_values_capture(w->space, key(1).owner, PS_STATE, PS_STATE, &view, &e),
+       &e);
+    REQUIRE(ps_values_count(view) == 1);
+    ok(ps_values_read_open(view, 0, &w->reader, &e), &e);
+    ps_values_close(view);
+  }
   return NULL;
 }
 static void capture_race(void) {
@@ -1951,6 +1968,161 @@ static void capture_race(void) {
     REQUIRE(pthread_cond_destroy(&g.cond) == 0 &&
             pthread_mutex_destroy(&g.mutex) == 0);
   }
+}
+typedef struct resident_reader {
+  ps_space *space;
+  const ps_ref *expected;
+  ps_reader *reader;
+  int result;
+} resident_reader;
+static void *read_resident(void *context) {
+  resident_reader *w = context;
+  lc_error e = {0};
+  w->result = ps_read_open(w->space, key(1), w->expected, &w->reader, &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void resident_capture(void) {
+  for (int durable = 0; durable <= 1; ++durable)
+    for (int phase = 1; phase <= 2; ++phase) {
+      lc_error e = {0};
+      ps_space *a = NULL, *b = NULL;
+      ps_reader *held = NULL;
+      ps_ref original;
+      uint64_t bytes;
+      int present;
+      query_gate g = {0};
+      pthread_t thread;
+      REQUIRE(!pthread_mutex_init(&g.mutex, NULL) &&
+              !pthread_cond_init(&g.cond, NULL));
+      ps_coordination_io io = {&g, pause_capture};
+      ps_options ao = {.durable_sync = durable, .coordination_io = &io};
+      ps_options bo = {.durable_sync = durable};
+      ok(ps_open(path, 1, &ao, &a, &e), &e);
+      capture_put(a, 1, PS_CHUNK + 65);
+      ok(ps_checkpoint(a, &e), &e);
+      ok(ps_open(path, 0, &bo, &b, &e), &e);
+      ok(ps_value_info(a, key(1), &original, &bytes, &present, &e), &e);
+      REQUIRE(present && bytes == PS_CHUNK + 65);
+      const ps_entry *old = ps_internal_lookup(a, key(1));
+      REQUIRE(old && old->count >= 2);
+      uint64_t old_offset = old->extents[0].offset;
+      resident_reader worker = {a, phase == 1 ? &original : NULL, NULL, 0};
+      g.armed = phase;
+      REQUIRE(!pthread_create(&thread, NULL, read_resident, &worker));
+      pthread_mutex_lock(&g.mutex);
+      while (!g.entered)
+        pthread_cond_wait(&g.cond, &g.mutex);
+      pthread_mutex_unlock(&g.mutex);
+      struct flock lock = {
+          .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 4, .l_len = 1};
+      REQUIRE(!fcntl(b->fd, F_OFD_GETLK, &lock) && lock.l_type == F_UNLCK);
+      capture_put(b, 1, 193);
+      ok(ps_checkpoint(b, &e), &e);
+      if (phase == 1) {
+        REQUIRE(!status(b).retired_bytes);
+        capture_put(b, 2, PS_CHUNK);
+        const ps_entry *reuse = ps_internal_lookup(b, key(2));
+        REQUIRE(reuse && reuse->count &&
+                reuse->extents[0].offset == old_offset);
+      } else
+        REQUIRE(status(b).retired_bytes >= PS_CHUNK);
+      pthread_mutex_lock(&g.mutex);
+      g.released = 1;
+      pthread_cond_broadcast(&g.cond);
+      pthread_mutex_unlock(&g.mutex);
+      REQUIRE(!pthread_join(thread, NULL));
+      if (phase == 1)
+        REQUIRE(worker.result == LC_ERR_INVALID && !worker.reader);
+      else {
+        REQUIRE(worker.result == LC_OK);
+        captured_expect(worker.reader, 1, 193);
+        ps_reader_close(worker.reader);
+      }
+      REQUIRE(!status(a).retained_payload_bytes);
+      ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
+      REQUIRE(status(a).retained_payload_bytes == 4 * PS_CELL);
+      ok(ps_delete(b, key(1), &e), &e);
+      ok(ps_checkpoint(b, &e), &e);
+      REQUIRE(status(b).retired_bytes >= 4 * PS_CELL);
+      captured_expect(held, 1, 193);
+      ps_reader_close(held);
+      ok(ps_close(a, &e), &e);
+      ok(ps_checkpoint(b, &e), &e);
+      REQUIRE(!status(b).retired_bytes);
+      ok(ps_close(b, &e), &e);
+      REQUIRE(!coverage(NULL, 0) && !unlink(path));
+      REQUIRE(!pthread_cond_destroy(&g.cond) &&
+              !pthread_mutex_destroy(&g.mutex));
+    }
+}
+typedef struct witness_pause {
+  int notify, armed;
+} witness_pause;
+static int pause_after_witness(void *context, int fd, int command,
+                               struct flock *lock) {
+  witness_pause *p = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc == 0 && p->armed && command == F_OFD_SETLK &&
+      lock->l_start >= PS_DATA && lock->l_type == F_RDLCK) {
+    REQUIRE(write(p->notify, "R", 1) == 1);
+    for (;;)
+      pause();
+  }
+  return rc;
+}
+static void resident_capture_child(int notify, int durable) {
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ps_reader *reader = NULL;
+  witness_pause p = {notify, 0};
+  ps_coordination_io io = {&p, pause_after_witness};
+  ps_options options = {.durable_sync = durable, .coordination_io = &io};
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  p.armed = 1;
+  ok(ps_read_open(s, key(1), NULL, &reader, &e), &e);
+  REQUIRE(0); /* The parent terminates the process during acquisition. */
+}
+static void resident_capture_crash(int durable) {
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ps_options options = {.durable_sync = durable};
+  int ready[2], exit_status;
+  char output[32], sync[32], entered;
+  ok(ps_open(path, 1, &options, &s, &e), &e);
+  capture_put(s, 1, PS_CHUNK);
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(!pipe(ready));
+  snprintf(output, sizeof(output), "%d", ready[1]);
+  snprintf(sync, sizeof(sync), "%d", durable);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    close(ready[0]);
+    execl(executable, executable, "--resident-capture-child", path, output,
+          sync, (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(!close(ready[1]) && read(ready[0], &entered, 1) == 1 &&
+          entered == 'R');
+  REQUIRE(!close(ready[0]));
+  struct flock lock = {
+      .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 4, .l_len = 1};
+  REQUIRE(!fcntl(s->fd, F_OFD_GETLK, &lock) && lock.l_type == F_UNLCK);
+  ok(ps_delete(s, key(1), &e), &e);
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(status(s).retired_bytes == PS_CHUNK);
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &exit_status, 0) == child &&
+          WIFSIGNALED(exit_status) && WTERMSIG(exit_status) == SIGKILL);
+  ok(ps_checkpoint(s, &e), &e);
+  REQUIRE(!status(s).retired_bytes);
+  capture_put(s, 2, PS_CHUNK);
+  ok(ps_checkpoint(s, &e), &e);
+  ok(ps_close(s, &e), &e);
+  ok(ps_open(path, 0, &options, &s, &e), &e);
+  index_expect(s, 2, PS_CHUNK, &e);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 typedef struct projection_io {
   size_t operations, fail, syncs, payload_reads;
@@ -3640,6 +3812,7 @@ static void certified_resident_observation(int durable) {
   ps_options options = {0}, peer_options = {0};
   ps_coordination_guard *namespace = NULL, *allocator = NULL;
   ps_space *a = NULL, *b = NULL;
+  ps_reader *reader = NULL;
   resident_names names = {0};
   uint64_t owner;
   ps_key artifact = {88, 1, PS_QUERY_FIRST};
@@ -3675,6 +3848,10 @@ static void certified_resident_observation(int durable) {
   REQUIRE(names.count == 1);
   ok(ps_value_validate(b, artifact, &original, &valid, &e), &e);
   REQUIRE(valid && !fault.calls);
+  ok(ps_read_open(b, artifact, &original, &reader, &e), &e);
+  REQUIRE(!fault.calls);
+  captured_expect(reader, 1, PS_PAGE);
+  ps_reader_close(reader);
   /* A pending transition denies the lock-free path even if the record still
    * names the resident prefix. */
   ps_readiness_begin(a, PS_READINESS_RECOVERY);
@@ -7155,6 +7332,11 @@ int main(int argc, char **argv) {
     projection_child(atoi(argv[3]), atoi(argv[4]));
     return 0;
   }
+  if (argc == 5 && !strcmp(argv[1], "--resident-capture-child")) {
+    snprintf(path, sizeof(path), "%s", argv[2]);
+    resident_capture_child(atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 5 && !strcmp(argv[1], "--child")) {
     snprintf(path, sizeof(path), "%s", argv[2]);
     child(atoi(argv[3]), atoi(argv[4]));
@@ -7199,7 +7381,11 @@ int main(int argc, char **argv) {
     capture_owned();
   else if (!strcmp(argv[2], "capture-race"))
     capture_race();
-  else if (!strcmp(argv[2], "projection")) {
+  else if (!strcmp(argv[2], "resident-capture")) {
+    resident_capture();
+    resident_capture_crash(0);
+    resident_capture_crash(1);
+  } else if (!strcmp(argv[2], "projection")) {
     projection_lifecycle();
     directory_reopen_locality(DIRECTORY_SMALL);
     directory_reopen_locality(DIRECTORY_INTERLEAVED);

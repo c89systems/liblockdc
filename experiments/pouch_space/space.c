@@ -772,12 +772,9 @@ int ps_internal_admission_begin(ps_space *s, ps_coordination_guard **guard,
   int rc = ps_internal_capture_begin(s, guard, error);
   return rc == LC_OK && *guard ? allocation_ranges_refresh(s, error) : rc;
 }
-static int physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
-                            lc_error *error) {
+static int take_physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
+                                 lc_error *error) {
   int first = s->physical_claim_bytes == 0, rc;
-  if (s->readiness && !s->allocation_guard)
-    return err(error, LC_ERR_PROTOCOL,
-               "member physical claim requires allocator authority");
   if (first) {
     rc = ps_coordination_range(s->coordination, MEMBER_PIN_PRESENCE_OFFSET, 1,
                                1, error);
@@ -795,6 +792,13 @@ static int physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
     rc = healthy(s, error);
   }
   return rc;
+}
+static int physical_witness(ps_space *s, uint64_t offset, uint64_t bytes,
+                            lc_error *error) {
+  if (s->readiness && !s->allocation_guard)
+    return err(error, LC_ERR_PROTOCOL,
+               "member physical claim requires allocator authority");
+  return take_physical_witness(s, offset, bytes, error);
 }
 static int physical_claim(ps_space *s, uint64_t offset, uint64_t bytes,
                           lc_error *error) {
@@ -1329,7 +1333,8 @@ static int reader_release_range(ps_space *s, uint64_t offset, uint64_t bytes,
   s->reader_claim_bytes -= before - s->physical_claim_bytes;
   return rc;
 }
-int ps_internal_entry_pin(ps_space *s, ps_entry *p, lc_error *error) {
+static int entry_pin(ps_space *s, ps_entry *p, int provisional,
+                     lc_error *error) {
   size_t i, next, undo;
   uint64_t offset, bytes;
   int rc;
@@ -1340,7 +1345,8 @@ int ps_internal_entry_pin(ps_space *s, ps_entry *p, lc_error *error) {
       ps_coordination_shared(s->coordination)) {
     for (i = 0; i < p->count; i = next) {
       next = entry_range(p, i, p->count, &offset, &bytes);
-      rc = physical_claim(s, offset, bytes, error);
+      rc = provisional ? take_physical_witness(s, offset, bytes, error)
+                       : physical_claim(s, offset, bytes, error);
       if (rc != LC_OK) {
         for (undo = 0; undo < i;) {
           undo = entry_range(p, undo, i, &offset, &bytes);
@@ -1358,6 +1364,9 @@ int ps_internal_entry_pin(ps_space *s, ps_entry *p, lc_error *error) {
   }
   ++p->pins;
   return LC_OK;
+}
+int ps_internal_entry_pin(ps_space *s, ps_entry *p, lc_error *error) {
+  return entry_pin(s, p, 0, error);
 }
 void ps_internal_entry_unpin(ps_space *s, ps_entry *p) {
   size_t i;
@@ -1634,8 +1643,9 @@ static int foreign_pool(ps_space *s, ps_run **head, uint64_t *available,
     if (rc != LC_OK)
       return rc;
     if (first == last) {
-      /* Common free pages have no local witnesses. The allocator excludes
-       * new member claims until this negative observation is recorded. */
+      /* A provisional reader must certify its selection after witnessing
+       * it. Free pages cannot belong to a successfully certified read.
+       * The allocator excludes other new member claims during this probe. */
       if (witnesses)
         ps_readiness_witness_pages(witnesses, run->offset, run->bytes, 0);
       link = &run->next;
@@ -6383,11 +6393,41 @@ void ps_writer_close(ps_writer *w) {
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, w);
 }
+static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
+                    ps_entry **out, lc_error *error) {
+  ps_entry *p =
+      selected_value(s, lookup(s, key),
+                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
+  int provisional, rc;
+  if (!p)
+    return err(error, LC_ERR_INVALID, "container key not found");
+  if (ref &&
+      (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
+    return err(error, LC_ERR_INVALID, "stale or foreign container reference");
+  provisional = resident && p->count && !p->pins && !p->payload_claimed;
+  rc = entry_pin(s, p, provisional, error);
+  if (rc != LC_OK)
+    return rc;
+  /* The resident entry stays in memory under s->mutex. Its bytes may have
+   * been retired since selection. Publish the extent witnesses before
+   * rechecking the certificate. Reclaimers can clear a page hint only after
+   * observing a free range with no kernel witness under allocator authority.
+   * At a matching certificate this incarnation is still selected, so a
+   * reclaimer either excludes the range or observes our witness. */
+  if (provisional) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!ps_readiness_resident(s)) {
+      ps_internal_entry_unpin(s, p);
+      return healthy(s, error);
+    }
+  }
+  *out = p;
+  return LC_OK;
+}
 int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
                  lc_error *error) {
   ps_reader *r;
   ps_coordination_guard *guard;
-  ps_entry *p;
   int rc;
   if (out)
     *out = NULL;
@@ -6398,23 +6438,19 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   if (!r)
     return err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
-  p = selected_value(s, lookup(s, key),
-                     __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE));
-  if (rc == LC_OK && (!p || p->deleted))
-    rc = err(error, LC_ERR_INVALID, "container key not found");
-  if (rc == LC_OK && ref &&
-      (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
-    rc = err(error, LC_ERR_INVALID, "stale or foreign container reference");
+  rc = ps_internal_observe_begin(s, &guard, error);
   if (rc == LC_OK)
-    rc = ps_internal_entry_pin(s, p, error);
-  if (rc == LC_OK)
-    r->entry = p;
+    rc = read_pin(s, key, ref, s->readiness && !s->allocation_guard, &r->entry,
+                  error);
+  if (rc == LC_OK && !r->entry) {
+    rc = ps_internal_capture_begin(s, &guard, error);
+    if (rc == LC_OK)
+      rc = read_pin(s, key, ref, 0, &r->entry, error);
+  }
   rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc == LC_OK) {
     ++s->readers;
     r->space = s;
-    r->entry = p;
     *out = r;
   } else if (r->entry)
     ps_internal_entry_unpin(s, r->entry);
