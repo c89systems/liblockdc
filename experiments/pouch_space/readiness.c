@@ -222,9 +222,13 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
         ~PRESSURE_BIT;
-    if (out->pending & ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL |
-                                   PS_READINESS_RECOVERY))
+    if (out->pending &
+        ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL |
+                    PS_READINESS_RECOVERY | PS_READINESS_CHECKPOINT_RETIRE))
       rc = failed(s, e, "shared readiness has unknown pending changes");
+    if ((out->pending & PS_READINESS_CHECKPOINT_RETIRE) &&
+        !(out->pending & PS_READINESS_ROOT))
+      rc = failed(s, e, "shared checkpoint retirement has no pending root");
   }
   return rc;
 }

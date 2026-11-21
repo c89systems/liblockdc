@@ -2613,6 +2613,11 @@ static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
   lc_free_with_allocator(NULL, slots);
   return rc;
 }
+static int clear_checkpoint_journal(ps_space *s, unsigned char *image,
+                                    size_t bytes, lc_error *error) {
+  memset(image, 0, bytes);
+  return transfer(s, image, bytes, JOURNAL_OFFSET, 1, error);
+}
 static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
@@ -2705,10 +2710,14 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   }
   if (rc == LC_OK)
     rc = sync_file(s, error);
+  if (rc == LC_OK && s->journal_image && s->journal)
+    ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
   if (rc == LC_OK)
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
+  if (rc == LC_OK && s->journal_image && s->journal)
+    rc = clear_checkpoint_journal(s, s->journal_image, s->journal, error);
   if (rc == LC_OK)
-    rc = sync_file(s, error); /* obsolete root cannot survive reuse */
+    rc = sync_file(s, error); /* obsolete root and covered journal retired */
   lc_free_with_allocator(NULL, builder.buffer);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PROTOCOL)
@@ -2723,6 +2732,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     lc_free_with_allocator(NULL, trim);
     return rc;
   }
+  ps_readiness_finish(s, PS_READINESS_CHECKPOINT_RETIRE);
   s->root = next;
   ++s->generation;
   ++s->checkpoints;
@@ -3118,6 +3128,15 @@ static int root_valid(const unsigned char *p) {
          get64(p + 48) && get64(p + 48) <= PS_MAX_INCARNATION &&
          get64(p + 48) % TOKEN_RANGE == 0 && get32(p + 72) == PS_ROOT_LAYOUT &&
          checksum(p, 76) == get32(p + 76);
+}
+static int checkpoint_retirement(const ps_readiness_certificate *certificate,
+                                 uint64_t generation, uint64_t sequence,
+                                 lc_error *error) {
+  if ((certificate->pending & PS_READINESS_CHECKPOINT_RETIRE) &&
+      (generation <= certificate->root || sequence != certificate->ready))
+    return err(error, LC_ERR_PROTOCOL,
+               "checkpoint retirement disagrees with the selected root");
+  return LC_OK;
 }
 static int canonical_certificate(ps_space *s, ps_readiness_certificate *out,
                                  lc_error *error) {
@@ -4129,6 +4148,8 @@ static int recover(ps_space *s, lc_error *error) {
                           &grant_slot, error);
   if (rc == LC_OK)
     rc = ps_readiness_read(s, &certificate, error);
+  if (rc == LC_OK)
+    rc = checkpoint_retirement(&certificate, s->generation, s->sequence, error);
   if (rc != LC_OK)
     return rc;
   if (s->maximum && s->capacity > s->maximum)
@@ -4152,7 +4173,8 @@ static int recover(ps_space *s, lc_error *error) {
   if (rc != LC_OK)
     goto done;
   cursor = 0;
-  while (PS_JOURNAL - cursor >= 64 && s->sequence != UINT64_MAX &&
+  while (!(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) &&
+         PS_JOURNAL - cursor >= 64 && s->sequence != UINT64_MAX &&
          (get32(wire + cursor) == EVENT_MAGIC ||
           get32(wire + cursor) == REVISION_MAGIC) &&
          get64(wire + cursor + 8) == s->sequence + 1) {
@@ -4291,7 +4313,8 @@ static int recover(ps_space *s, lc_error *error) {
     if (rc != LC_OK)
       goto done;
     s->peer_durable = s->sequence;
-    ps_readiness_finish(s, PS_READINESS_RECOVERY);
+    ps_readiness_finish(s,
+                        PS_READINESS_RECOVERY | PS_READINESS_CHECKPOINT_RETIRE);
   }
   __atomic_store_n(&s->pending_sequence, s->sequence, __ATOMIC_RELEASE);
   if (ps_coordination_shared(s->coordination)) {
@@ -4662,6 +4685,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   struct stat st;
   size_t count = 0, i;
   int a, b, selected, rc;
+  int retiring_journal;
   ps_readiness_certificate certificate;
   rc = canonical_certificate(s, &certificate, error);
   if (rc != LC_OK)
@@ -4693,6 +4717,12 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   }
   if (get64(root + 8) != certificate.root)
     ps_readiness_begin(s, PS_READINESS_ROOT);
+  rc = checkpoint_retirement(&certificate, get64(root + 8), get64(root + 24),
+                             error);
+  if (rc != LC_OK)
+    return rc;
+  retiring_journal =
+      (certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) != 0;
   if (get64(root + 8) == s->generation)
     return canonical_journal(s, &certificate, 1, 1, error);
   if (get64(root + 8) < s->generation || get64(root + 24) < s->sequence ||
@@ -4775,7 +4805,7 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
   rc = projection_pool(v, s->metadata_free, 1, error);
   if (rc == LC_OK)
     rc = projection_pool(v, s->free, 0, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK && !retiring_journal)
     rc = projection_journal(v, get64(root + 24), certificate.ready, error);
   if (rc == LC_OK && v->sequence < certificate.ready)
     rc = err(error, LC_ERR_PENDING,
@@ -4821,11 +4851,14 @@ static int canonical_refresh(ps_space *s, int verify_disk, lc_error *error) {
     rc = transfer(s, zero, sizeof(zero), (uint64_t)(1 - selected) * PS_PAGE, 1,
                   error);
   }
+  if (rc == LC_OK && retiring_journal)
+    rc = clear_checkpoint_journal(s, v->journal_image, PS_JOURNAL, error);
   if (rc == LC_OK &&
       (!s->readiness || certificate.root < v->generation ||
        memcmp(roots + (1 - selected) * PS_ROOT_BYTES, zero, sizeof(zero)))) {
     rc = sync_file(s, error);
     if (rc == LC_OK) {
+      ps_readiness_finish(s, PS_READINESS_CHECKPOINT_RETIRE);
       rc = ps_readiness_stabilize(s, v->sequence, v->generation, error);
       if (rc == LC_OK)
         v->peer_durable = v->sequence;

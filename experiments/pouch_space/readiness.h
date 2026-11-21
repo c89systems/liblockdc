@@ -6,7 +6,10 @@ typedef struct ps_readiness ps_readiness;
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
   PS_READINESS_JOURNAL = 2,
-  PS_READINESS_RECOVERY = 4
+  PS_READINESS_RECOVERY = 4,
+  /* The new root passed its selection barrier. Its covered journal and
+   * predecessor may be erased and stabilized by another owner. */
+  PS_READINESS_CHECKPOINT_RETIRE = 8
 };
 typedef struct ps_readiness_certificate {
   uint64_t ready, durable, root, origin, pending;

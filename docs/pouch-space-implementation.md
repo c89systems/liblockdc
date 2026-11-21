@@ -10244,3 +10244,60 @@ indexed queries and fixed-capacity lease and outbox recovery. Raw
 comparisons and phase traces are under `admission-batch-`,
 `admission-stage-` and `admission-layout-` in
 `build/pouch-space-concurrent/`.
+
+## Retiring the covered journal with its checkpoint
+
+A shared checkpoint writes and syncs the new directory, then selects and
+syncs its root. After the selection barrier, the checkpoint records that
+the predecessor and its covered journal may be retired. It erases the
+predecessor selector and the used journal prefix in the existing third
+barrier. The owner certifies the new root after retirement. This adds a
+write of the used journal span to the three-barrier checkpoint.
+
+A resident peer or a joining owner can finish interrupted retirement in
+one barrier. The retirement flag applies only while a newer selected
+root covers the certified journal sequence. Fixtures kill the checkpoint
+owner partway through journal erasure and exercise both recovery paths.
+An existing reader keeps its captured value, peers see the replacement,
+and cold reopen verifies the replacement. Both durability modes exercise
+a clean join and verify that a new publication survives reopen.
+
+An isolated GNU benchmark alternated six prior and revised runs per
+size. The shared owner flushed 65-byte values, checkpointed, and stayed
+open while a peer joined. Checkpoint syncs stayed at three. Join syncs
+fell from one to zero in every revised run. The table gives medians in
+milliseconds. A cold owner still needs its incarnation grant barrier.
+
+| Records | Covered journal | Checkpoint, prior / revised | Live join, prior / revised |
+| ---: | ---: | ---: | ---: |
+| 256 | 22 KiB | 6.41 / 7.18 | 1.71 / 0.47 |
+| 768 | 66 KiB | 10.22 / 9.26 | 1.93 / 1.08 |
+
+The matched GNU comparison verified 37 of 42 complete workflows. At
+fixed 10 MiB, each native build completed two of four 20 MiB NoSync
+attempts. Revised native completed three of four 12 MiB NoSync attempts.
+All five refusals report ordinary capacity pressure. Multifile and the
+other profiles completed every attempt. Successful-run medians are in
+milliseconds in the order prior native (`3242da5f`), revised native,
+multifile. The three remaining profiles ran twice per build. The full
+workflow includes the cold owner and live joins in grouped reopen.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1385.01 / 1346.91 / 1417.40 | 74.16 / 71.94 / 34.22 | 39.97 / 3.36 / 0.84 | 11.57 / 13.19 / 0.89 | 4.89 / 4.96 / 6.31 |
+| NoSync indexed, 20 MiB | 3291.43 / 3207.94 / 2322.66 | 102.22 / 98.88 / 38.51 | 21.05 / 46.95 / 1.28 | 15.89 / 12.98 / 1.17 | 8.16 / 7.12 / 10.05 |
+| Durable indexed, 15 MiB | 6272.99 / 6207.01 / 5407.06 | 94.20 / 85.67 / 68.85 | 4.60 / 20.10 / 0.78 | 7.52 / 8.44 / 0.71 | 5.68 / 6.76 / 6.68 |
+| Warmed NoSync queue | 12.07 / 11.07 / 119.23 | 2.53 / 2.13 / 34.81 | 0.34 / 0.26 / 0.05 | 2.55 / 3.25 / 0.42 | 0.29 / 0.22 / 0.58 |
+| Durable outbox | 908.09 / 1010.73 / 1539.09 | 187.87 / 212.00 / 302.75 | 0.52 / 0.99 / 0.39 | 34.58 / 40.32 / 57.89 | 49.55 / 64.22 / 151.42 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 228.65 / 264.72 / 349.33 | 65.16 / 91.52 / 206.74 | 34.38 / 26.38 / 211.31 | 0.68 / 0.79 / 1.07 |
+| NoSync indexed, 20 MiB | 423.50 / 400.62 / 507.93 | 151.22 / 140.23 / 327.50 | 99.06 / 80.51 / 341.88 | 1.18 / 1.18 / 1.78 |
+| Durable indexed, 15 MiB | 138.98 / 137.73 / 225.63 | 22.15 / 22.49 / 157.46 | 16.37 / 21.04 / 159.56 | 0.45 / 0.54 / 0.63 |
+
+Grouped reopen timings vary by profile. Sustained four-writer admission,
+indexed mutation latency and grouped reopen remain qualification work.
+Targeted verification passed 38 GNU Release, 15 Debug ASan/UBSan and
+23 musl Release groups. Raw measurements and test logs are under
+`checkpoint-journal-` in `build/pouch-space-concurrent/`.

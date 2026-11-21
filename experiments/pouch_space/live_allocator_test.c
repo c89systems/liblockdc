@@ -1705,6 +1705,15 @@ static int projection_sync(void *context, int fd) {
 static ssize_t projection_write(void *context, int fd, const void *bytes,
                                 size_t n, off_t offset) {
   projection_io *m = context;
+  if (m->armed && m->phase >= 4 && offset == PS_JOURNAL_OFFSET) {
+    /* The selected root is durable. Stop after erasing only part of its
+     * predecessor's journal so no valid header can describe the old tail. */
+    REQUIRE(m->syncs == 2 && n >= 64 && !((const unsigned char *)bytes)[0]);
+    REQUIRE(pwrite(fd, bytes, 32, offset) == 32);
+    REQUIRE(write(m->ready, "R", 1) == 1);
+    for (;;)
+      pause();
+  }
   if (m->pause_journal && offset >= PS_JOURNAL_OFFSET && offset < PS_DATA) {
     REQUIRE(n >= 64 && pwrite(fd, bytes, 32, offset) == 32);
     REQUIRE(write(m->ready, "J", 1) == 1);
@@ -2109,9 +2118,9 @@ static void projection_child(int ready, int phase) {
   REQUIRE(0);
 }
 static void projection_recovery(void) {
-  for (int phase = 2; phase <= 3; ++phase) {
+  for (int phase = 2; phase <= 5; ++phase) {
     lc_error e = {0};
-    ps_space *s = NULL;
+    ps_space *s = NULL, *join = NULL;
     ps_reader *old = NULL, *current = NULL;
     ok(ps_open(path, 1, NULL, &s, &e), &e);
     capture_put(s, 1, 65);
@@ -2137,12 +2146,17 @@ static void projection_recovery(void) {
             WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGKILL);
     REQUIRE(close(ready[0]) == 0);
     ps_stats before = status(s);
+    if (phase == 5) {
+      ok(ps_open(path, 0, NULL, &join, &e), &e);
+      REQUIRE(status(join).syncs == 1);
+    }
     ok(ps_read_open(s, key(1), NULL, &current, &e), &e);
-    REQUIRE(status(s).syncs == before.syncs + 1);
+    REQUIRE(status(s).syncs == before.syncs + (phase == 5 ? 0 : 1));
     captured_expect(old, 1, 65);
     captured_expect(current, 1, 1000);
     ps_reader_close(old);
     ps_reader_close(current);
+    ok(ps_close(join, &e), &e);
     ok(ps_checkpoint(s, &e), &e);
     ok(ps_close(s, &e), &e);
     ok(ps_open(path, 0, NULL, &s, &e), &e);
@@ -2823,6 +2837,42 @@ static int reopen_sync(void *context, int fd) {
   }
   return fdatasync(fd);
 }
+static void reopen_after_checkpoint(void) {
+  for (int durable = 0; durable <= 1; ++durable) {
+    reopen_disk disk = {0};
+    ps_io io = {&disk, read_io, durable_write, reopen_sync, reserve_io, NULL};
+    ps_options options = {.durable_sync = durable, .io = &io};
+    ps_space *writer = NULL, *peer = NULL, *join = NULL;
+    lc_error e = {0};
+    ok(ps_open(path, 1, &options, &writer, &e), &e);
+    capture_put(writer, 1, 65);
+    ok(ps_flush(writer, &e), &e);
+    ok(ps_open(path, 0, &options, &peer, &e), &e);
+    disk.syncs = 0;
+    ok(ps_checkpoint(writer, &e), &e);
+    REQUIRE(disk.syncs == 3);
+
+    disk.syncs = 0;
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+    REQUIRE(!disk.syncs);
+    expect_value(join, key(1), 65, 1);
+    ok(ps_refresh(peer, &e), &e);
+    REQUIRE(!disk.syncs);
+    expect_value(peer, key(1), 65, 1);
+    capture_put(join, 2, 65);
+    ok(ps_flush(join, &e), &e);
+    expect_value(writer, key(2), 65, 2);
+    ok(ps_close(peer, &e), &e);
+    ok(ps_close(join, &e), &e);
+    ok(ps_close(writer, &e), &e);
+
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+    expect_value(join, key(1), 65, 1);
+    expect_value(join, key(2), 65, 2);
+    ok(ps_close(join, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
 static void reopen_cohort(void) {
   lc_error e = {0};
   reopen_disk disk = {0};
@@ -2834,6 +2884,7 @@ static void reopen_cohort(void) {
   ps_budget_plan plan = {PS_PAGE, 0, 0, 0};
   ps_budget *budget = NULL;
   unsigned char byte = 0xa5;
+  reopen_after_checkpoint();
   options.io = &io;
   ok(ps_open(path, 1, NULL, &first, &e), &e);
   capture_put(first, 1, 65);
