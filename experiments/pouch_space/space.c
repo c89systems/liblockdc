@@ -6393,6 +6393,10 @@ void ps_writer_close(ps_writer *w) {
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, w);
 }
+int ps_internal_read_witness_valid(ps_space *s) {
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  return ps_readiness_resident(s);
+}
 static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
                     ps_entry **out, lc_error *error) {
   ps_entry *p =
@@ -6414,12 +6418,9 @@ static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
    * observing a free range with no kernel witness under allocator authority.
    * At a matching certificate this incarnation is still selected, so a
    * reclaimer either excludes the range or observes our witness. */
-  if (provisional) {
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (!ps_readiness_resident(s)) {
-      ps_internal_entry_unpin(s, p);
-      return healthy(s, error);
-    }
+  if (provisional && !ps_internal_read_witness_valid(s)) {
+    ps_internal_entry_unpin(s, p);
+    return healthy(s, error);
   }
   *out = p;
   return LC_OK;
@@ -6782,7 +6783,7 @@ static void values_unwitness(ps_values *view, size_t limit) {
     if (reader_release_range(view->space, offset, bytes, NULL) != LC_OK)
       break;
 }
-static int values_witness(ps_values *view, lc_error *error) {
+static int values_witness(ps_values *view, int provisional, lc_error *error) {
   ps_space *s = view->space;
   ps_entry *p;
   ps_value_range *range;
@@ -6821,7 +6822,8 @@ static int values_witness(ps_values *view, lc_error *error) {
   if (count > 1)
     qsort(view->ranges, count, sizeof(*range), value_range_order);
   while (values_witness_range(view, &at, count, &offset, &bytes)) {
-    rc = physical_claim(s, offset, bytes, error);
+    rc = provisional ? take_physical_witness(s, offset, bytes, error)
+                     : physical_claim(s, offset, bytes, error);
     if (rc != LC_OK) {
       values_unwitness(view, done);
       if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
@@ -6835,9 +6837,12 @@ static int values_witness(ps_values *view, lc_error *error) {
   }
   return LC_OK;
 }
-static void values_discard_locked(ps_values *view) {
+void ps_internal_values_discard_locked(ps_values *view) {
   ps_entry *p;
   size_t i;
+  if (!view)
+    return;
+  --view->space->readers;
   for (i = 0; i < view->count; ++i) {
     p = view->items[i].retained;
     view->items[i].witness = p && !--p->pins && p->reader_claimed;
@@ -6850,7 +6855,7 @@ static void values_discard_locked(ps_values *view) {
 }
 int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
                                       unsigned int first, unsigned int last,
-                                      uint64_t prefix,
+                                      uint64_t prefix, int provisional,
                                       ps_value_retain_fn retain, void *context,
                                       ps_values **out, lc_error *error) {
   ps_values *view;
@@ -6884,7 +6889,7 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
     }
   view->count = at;
   if (rc == LC_OK && ps_coordination_shared(s->coordination))
-    rc = values_witness(view, error);
+    rc = values_witness(view, provisional, error);
   if (rc == LC_OK) {
     for (i = 0; i < view->count; ++i)
       if ((p = view->items[i].retained) != NULL) {
@@ -6904,22 +6909,33 @@ int ps_internal_values_capture(ps_space *s, uint64_t owner, unsigned int first,
                                lc_error *error) {
   ps_coordination_guard *guard;
   uint64_t prefix;
-  int rc;
+  int rc, provisional;
   if (out)
     *out = NULL;
   if (!s || !out || first > last)
     return err(error, LC_ERR_INVALID, "value visit requires owner and kinds");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, error);
+  rc = ps_internal_observe_begin(s, &guard, error);
+  provisional = s->readiness && !s->allocation_guard;
   if (rc == LC_OK) {
     prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
     rc = ps_internal_values_capture_locked(s, owner, first, last, prefix,
-                                           retain, context, out, error);
+                                           provisional, retain, context, out,
+                                           error);
+  }
+  if (rc == LC_OK && provisional && !ps_internal_read_witness_valid(s)) {
+    ps_internal_values_discard_locked(*out);
+    *out = NULL;
+    rc = ps_internal_capture_begin(s, &guard, error);
+    if (rc == LC_OK) {
+      prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+      rc = ps_internal_values_capture_locked(s, owner, first, last, prefix, 0,
+                                             retain, context, out, error);
+    }
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc != LC_OK && *out) {
-    --s->readers;
-    values_discard_locked(*out);
+    ps_internal_values_discard_locked(*out);
     *out = NULL;
   }
   pthread_mutex_unlock(&s->mutex);
@@ -7033,8 +7049,7 @@ void ps_values_close(ps_values *view) {
     return;
   s = view->space;
   pthread_mutex_lock(&s->mutex);
-  --s->readers;
-  values_discard_locked(view);
+  ps_internal_values_discard_locked(view);
   collect_retired(s);
   pthread_mutex_unlock(&s->mutex);
 }
@@ -8405,10 +8420,20 @@ uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
 uint64_t ps_owned_run_base(const ps_owned_run *run) {
   return run ? run->entry->key.key : 0;
 }
+void ps_owned_runs_discard_locked(ps_owned_run **items, size_t count) {
+  while (count) {
+    ps_owned_run *run = items[--count];
+    ps_internal_entry_unpin(run->space, run->entry);
+    --run->space->readers;
+    lc_free_with_allocator(NULL, run);
+  }
+  lc_free_with_allocator(NULL, items);
+}
 static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
                            const ps_ref *ref, uint64_t start, uint64_t end,
-                           ps_owned_status *status, ps_owned_run ***out,
-                           size_t *count, lc_error *error) {
+                           int provisional, ps_owned_status *status,
+                           ps_owned_run ***out, size_t *count,
+                           lc_error *error) {
   ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_run **items = NULL;
   size_t n = 0, capacity = 0;
@@ -8477,7 +8502,7 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
       rc = err(error, LC_ERR_NOMEM, "cannot capture mapping handle");
       break;
     }
-    rc = ps_internal_entry_pin(s, p, error);
+    rc = entry_pin(s, p, provisional, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, items[n]);
       break;
@@ -8493,21 +8518,15 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
   if (rc == LC_OK) {
     *out = items;
     *count = n;
-  } else {
-    while (n) {
-      ps_owned_run *run = items[--n];
-      ps_internal_entry_unpin(s, run->entry);
-      --s->readers;
-      lc_free_with_allocator(NULL, run);
-    }
-    lc_free_with_allocator(NULL, items);
-  }
+  } else
+    ps_owned_runs_discard_locked(items, n);
   return rc;
 }
 int ps_owned_runs_pin_range(ps_space *s, ps_key key, const ps_ref *ref,
-                            uint64_t start, uint64_t end, ps_owned_run ***out,
-                            size_t *count, lc_error *e) {
-  return pin_runs_locked(s, NULL, key, ref, start, end, NULL, out, count, e);
+                            uint64_t start, uint64_t end, int provisional,
+                            ps_owned_run ***out, size_t *count, lc_error *e) {
+  return pin_runs_locked(s, NULL, key, ref, start, end, provisional, NULL, out,
+                         count, e);
 }
 int ps_owned_runs_verify(ps_owned_run *const *items, size_t count,
                          ps_owned_footer *footers, lc_error *error) {
@@ -8552,7 +8571,7 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
   if (rc == LC_OK)
-    rc = pin_runs_locked(s, head, key, ref, start, end, status, &items, &n,
+    rc = pin_runs_locked(s, head, key, ref, start, end, 0, status, &items, &n,
                          error);
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);

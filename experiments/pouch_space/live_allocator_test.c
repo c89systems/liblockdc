@@ -1657,11 +1657,11 @@ static void capture_faults(void) {
           if (vector)
             capture_fragmented(s, 2);
           ok(ps_checkpoint(s, &e), &e);
-          if (!vector && (kind == 3 || kind == 4)) {
+          if (kind == 3 || kind == 4) {
             ps_space *peer = NULL;
-            /* A stale direct reader still exercises guarded admission. */
+            /* A stale projection still exercises guarded admission. */
             ok(ps_open(path, 0, NULL, &peer, &e), &e);
-            capture_put(peer, 2, 0);
+            capture_put_key(peer, (ps_key){89, 1, PS_STATE}, 0);
             ok(ps_close(peer, &e), &e);
           }
           uint64_t before = coverage(NULL, 0);
@@ -1925,6 +1925,7 @@ static void capture_race(void) {
     capture_put(a, 1, PS_CHUNK + 65);
     ok(ps_checkpoint(a, &e), &e);
     ok(ps_open(path, 0, &bo, &b, &e), &e);
+    capture_put_key(b, (ps_key){89, 1, PS_STATE}, 0);
     capture_worker first = {a, NULL, &g, 0}, second = {b, NULL, &g, 1};
     pthread_t x, y;
     g.attempted = 0;
@@ -1973,18 +1974,28 @@ typedef struct resident_reader {
   ps_space *space;
   const ps_ref *expected;
   ps_reader *reader;
-  int result;
+  int result, batch;
 } resident_reader;
 static void *read_resident(void *context) {
   resident_reader *w = context;
   lc_error e = {0};
-  w->result = ps_read_open(w->space, key(1), w->expected, &w->reader, &e);
+  if (w->batch) {
+    ps_values *view = NULL;
+    w->result = ps_values_capture(w->space, key(1).owner, PS_STATE, PS_STATE,
+                                  &view, &e);
+    if (w->result == LC_OK) {
+      REQUIRE(ps_values_count(view) == 1);
+      w->result = ps_values_read_open(view, 0, &w->reader, &e);
+    }
+    ps_values_close(view);
+  } else
+    w->result = ps_read_open(w->space, key(1), w->expected, &w->reader, &e);
   lc_error_cleanup(&e);
   return NULL;
 }
 static void resident_capture(void) {
   for (int durable = 0; durable <= 1; ++durable)
-    for (int phase = 1; phase <= 2; ++phase) {
+    for (int phase = 1; phase <= 3; ++phase) {
       lc_error e = {0};
       ps_space *a = NULL, *b = NULL;
       ps_reader *held = NULL;
@@ -2007,8 +2018,9 @@ static void resident_capture(void) {
       const ps_entry *old = ps_internal_lookup(a, key(1));
       REQUIRE(old && old->count >= 2);
       uint64_t old_offset = old->extents[0].offset;
-      resident_reader worker = {a, phase == 1 ? &original : NULL, NULL, 0};
-      g.armed = phase;
+      resident_reader worker = {a, phase == 1 ? &original : NULL, NULL, 0,
+                                phase == 3};
+      g.armed = phase == 1 ? 1 : 2;
       REQUIRE(!pthread_create(&thread, NULL, read_resident, &worker));
       pthread_mutex_lock(&g.mutex);
       while (!g.entered)

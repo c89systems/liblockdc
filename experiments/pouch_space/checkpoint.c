@@ -645,20 +645,21 @@ static int retain_selected_record(void *context, ps_key key,
 int ps_checkpoint_capture_selected_locked(ps_namespace *ns, uint64_t prefix,
                                           const ps_checkpoint_info *coverage,
                                           enum ps_checkpoint_capture_mode mode,
-                                          ps_values **out, lc_error *e) {
+                                          int provisional, ps_values **out,
+                                          lc_error *e) {
   selected_checkpoint selected;
   int rc;
   if (mode == PS_CHECKPOINT_CAPTURE_STATE)
     return ps_internal_values_capture_locked(
         ns->root->space, ns->identity.owner, PS_KEY_METADATA, PS_KEY_METADATA,
-        prefix, NULL, NULL, out, e);
+        prefix, provisional, NULL, NULL, out, e);
   selected.control = coverage->control;
   selected.seed_only = mode == PS_CHECKPOINT_CAPTURE_SEED;
   selected.invalid = 0;
   rc = ps_internal_values_capture_locked(
       ns->root->space, ns->identity.owner, PS_KEY_METADATA,
-      PS_NAMESPACE_CHECKPOINT, prefix, retain_selected_record, &selected, out,
-      e);
+      PS_NAMESPACE_CHECKPOINT, prefix, provisional, retain_selected_record,
+      &selected, out, e);
   if (rc == LC_OK && selected.invalid)
     rc = failure(e, LC_ERR_PROTOCOL, "unexpected namespace coverage slot");
   return rc;

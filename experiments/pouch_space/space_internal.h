@@ -254,18 +254,23 @@ int ps_catalog_validate_directory(ps_space *, lc_error *);
 void ps_catalog_drop_record(ps_space *, ps_entry *, uint64_t, uint64_t);
 int ps_catalog_target_retained(ps_space *, const ps_entry *);
 ps_entry *ps_internal_lookup(ps_space *, ps_key);
-/* Runs under allocator authority. The selector reads resident state only.
+/* The selector reads resident state only and may run again on capture retry.
  * Every selected row's identity is captured. The selector chooses which
- * payloads must remain readable after releasing allocator authority. */
+ * payloads must remain readable for the capture's lifetime. */
 typedef int (*ps_value_retain_fn)(void *, ps_key, uint64_t incarnation);
 int ps_internal_values_capture(ps_space *, uint64_t owner, unsigned int first,
                                unsigned int last, ps_value_retain_fn, void *,
                                ps_values **, lc_error *);
-/* Capture from the caller's canonical scope and already sampled prefix. */
+/* Under the space mutex, capture at the sampled prefix. A provisional
+ * capture must be certified by its caller before returning or reading it. */
 int ps_internal_values_capture_locked(ps_space *, uint64_t owner,
                                       unsigned int first, unsigned int last,
-                                      uint64_t prefix, ps_value_retain_fn,
-                                      void *, ps_values **, lc_error *);
+                                      uint64_t prefix, int provisional,
+                                      ps_value_retain_fn, void *, ps_values **,
+                                      lc_error *);
+int ps_internal_read_witness_valid(ps_space *);
+/* Drop an unreturned capture before allowing another local adoption. */
+void ps_internal_values_discard_locked(ps_values *);
 int ps_internal_healthy(ps_space *, lc_error *);
 /* Capture selection and its first physical witness under the same canonical
  * authority. Captured handles subsequently retain their incarnation directly.

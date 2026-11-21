@@ -1138,7 +1138,7 @@ static int window_capture(ps_space *space, ps_key key, const ps_ref *ref,
   return rc;
 }
 int ps_stream_window_pin_locked(ps_space *space, ps_key key, const ps_ref *ref,
-                                uint64_t start, uint64_t end,
+                                uint64_t start, uint64_t end, int provisional,
                                 ps_stream_window **out, lc_error *error) {
   ps_stream_window *window;
   int rc;
@@ -1146,8 +1146,8 @@ int ps_stream_window_pin_locked(ps_space *space, ps_key key, const ps_ref *ref,
   window = lc_calloc_with_allocator(NULL, 1, sizeof(*window));
   if (!window)
     return stream_error(error, LC_ERR_NOMEM, "cannot allocate stream window");
-  rc = ps_owned_runs_pin_range(space, key, ref, start, end, &window->runs,
-                               &window->count, error);
+  rc = ps_owned_runs_pin_range(space, key, ref, start, end, provisional,
+                               &window->runs, &window->count, error);
   if (rc == LC_OK) {
     window->start = start;
     window->end = end;
@@ -1161,6 +1161,12 @@ int ps_stream_window_verify(ps_stream_window *window, lc_error *error) {
   if (rc == LC_OK)
     rc = window_geometry(window, window->start, window->end, error);
   return rc;
+}
+void ps_stream_window_discard_locked(ps_stream_window *window) {
+  if (window) {
+    ps_owned_runs_discard_locked(window->runs, window->count);
+    lc_free_with_allocator(NULL, window);
+  }
 }
 int ps_stream_window_read(ps_stream_window *window, uint64_t offset,
                           void *bytes, size_t n, lc_error *error) {

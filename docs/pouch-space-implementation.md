@@ -13460,3 +13460,108 @@ single-file and 0.57 and 0.54 ms for multifile. The lease fixture uses
 
 Raw comparisons, traces, and test logs are under
 `build/pouch-space-concurrent/resident-reader/`.
+
+## Certify namespace captures after pinning
+
+On `a7e4fec6`, a 192 MiB NoSync CPU profile attributed 544 of 14,196
+samples to the batch value capture routine. In a separate trace at the
+same size, namespace admission had the highest summed thread CPU under
+sampled allocator holds. A 96 MiB eligibility trace found a resident
+projection at 1,622 of 1,684 namespace view opens and 2,567 of 3,096
+stream-window opens.
+
+Namespace views and active-stream windows can now select from the
+resident prefix while holding the namespace guard. Routing and coverage
+must already be memoized for that selection. The capture acquires its
+extent witnesses and certifies the entire set before reading headers or
+returning a handle. A memo miss takes the allocator path. A change to the
+shared certificate drops all provisional pins under the local space
+mutex and retries once with the allocator. That ordering avoids treating
+a provisional range as retained ownership during another local
+checkpoint adoption. The namespace guard spans stream verification and
+registration of the returned view. Batch value captures use the same
+witness-and-recheck rule.
+
+The capture extends the earlier hazard-pointer design from a single
+descriptor to a set of extents. The checked readiness record is the
+version that validates the set. Leis et al. use version validation to
+keep speculative reads outside the write latch, and Folly's hazard
+pointer implementation publishes retention before rechecking the shared
+pointer. [The ART of Practical Synchronization, section 3.2](https://15721.courses.cs.cmu.edu/spring2019/papers/08-oltpindexes2/leis-damon2016.pdf),
+[Folly's protect-and-recheck implementation](https://github.com/facebook/folly/blob/main/folly/synchronization/HazptrHolder.h)
+
+In both durability modes the deterministic fixture opens a view and
+an active-stream window while a peer holds allocator authority. It
+then publishes from an independent namespace during witness acquisition
+and checks that the view retries before it reads a stream header. A
+related batch fixture makes the peer replace and checkpoint a value
+during capture, then checks the returned replacement and released
+capacity. The guarded and provisional fault paths, ownership handoff,
+process death, indexed crash recovery, and shared lease, queue and
+outbox checks passed in 91 GNU Release groups and 55 each on ASan/UBSan
+and musl Release.
+
+In matched 192 MiB NoSync allocator traces, one acquisition in 32
+was sampled. Namespace admission's count fell from 863 to 595 and
+batch value capture's count fell from 236 to 63. Total samples fell
+from 4,640 to 4,197. Summed sampled hold CPU fell from 39.12 to
+32.43 ms for namespace admission and from 17.73 to 4.08 ms for
+batch value capture. Revision publication had the most sampled
+acquisitions in the revised trace.
+
+All 29 pilot workflows and the 24 runs with the final native builds
+verified. The final builds ran two pairs per NoSync and messaging
+workload and four pairs at 96 MiB durable, with `a7e4fec6` as the
+control. Indexed
+roots held a fixed 10 MiB and used eight writers. The multifile figures
+are from the same workload settings in the pilot rotation. Index and
+work figures are in seconds except for p95. The late p95 covers the
+last 16 rounds. Messaging figures are in milliseconds.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 6.70 | 6.53 | 85.58 | 89.92 |
+| 96 MiB NoSync | Revised | 5.82 | 6.25 | 75.03 | 77.19 |
+| 96 MiB NoSync | Multifile | 11.49 | 4.85 | 58.10 | 59.88 |
+| 96 MiB durable | Prior | 10.52 | 7.25 | 82.28 | 95.43 |
+| 96 MiB durable | Revised | 11.21 | 7.32 | 86.51 | 94.57 |
+| 96 MiB durable | Multifile | 37.75 | 6.11 | 229.50 | 187.54 |
+| 192 MiB NoSync | Prior | 14.60 | 17.30 | 98.59 | 124.61 |
+| 192 MiB NoSync | Revised | 13.08 | 16.67 | 85.09 | 104.87 |
+| 192 MiB NoSync | Multifile | 19.57 | 9.16 | 46.86 | 48.92 |
+
+Both NoSync workloads finished sooner in both final pairs. At 192 MiB,
+CPU fell by 1.21 and 0.06 s, and late p95 fell by 20.17 and 19.30 ms.
+Durable work took longer in three of four pairs, and median cumulative
+sync time rose from 9.61 to 10.35 s. Median durable work took 11.21 s
+against the 37.75 s multifile reference.
+
+Index phases report the longest worker in seconds. First-owner open,
+eight live joins, post-open verification and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.70 | 0.22 | 0.07 | 13.23 | 20.78 | 12.16 | 14.50 |
+| 96 MiB NoSync | Revised | 1.38 | 0.18 | 0.06 | 13.23 | 21.35 | 12.64 | 14.81 |
+| 96 MiB NoSync | Multifile | 3.07 | 1.98 | 2.50 | 0.30 | 1.35 | 24.84 | 22.13 |
+| 96 MiB durable | Prior | 1.23 | 0.10 | 0.03 | 14.48 | 23.54 | 12.97 | 17.03 |
+| 96 MiB durable | Revised | 1.34 | 0.09 | 0.02 | 12.70 | 21.41 | 12.02 | 14.52 |
+| 96 MiB durable | Multifile | 4.78 | 6.46 | 8.29 | 0.24 | 1.47 | 25.06 | 2.81 |
+| 192 MiB NoSync | Prior | 3.05 | 0.44 | 0.14 | 28.36 | 34.17 | 20.61 | 23.95 |
+| 192 MiB NoSync | Revised | 2.70 | 0.44 | 0.14 | 26.59 | 34.73 | 20.81 | 22.56 |
+| 192 MiB NoSync | Multifile | 5.20 | 3.13 | 4.27 | 0.23 | 1.49 | 40.45 | 4.11 |
+
+| Workload | Prior work / CPU / p95 | Revised work / CPU / p95 | Multifile work / CPU / p95 |
+| --- | ---: | ---: | ---: |
+| Warmed NoSync queue | 8.70 / 14.41 / 1.66 | 9.78 / 16.31 / 1.80 | 89.50 / 26.30 / 21.71 |
+| Durable outbox | 862.82 / 104.65 / 157.38 | 942.57 / 115.20 / 189.90 | 1576.98 / 178.02 / 286.18 |
+
+The durable outbox took longer in both final pairs. In a separate
+instrumented 96 MiB durable run, 439 of 1,437 completed provisional
+namespace views retried after a certificate change. The instrumented
+outbox run saw one namespace-view retry and zero batch capture retries.
+The indexed retry path can account for repeated selection work. The
+outbox timing remains a separate measurement.
+
+Raw traces, comparisons, and test logs are under
+`build/pouch-space-concurrent/partitioned-admission/`.

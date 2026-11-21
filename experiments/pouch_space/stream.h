@@ -138,12 +138,13 @@ int ps_stream_read_open(ps_stream *, uint64_t offset, uint64_t bytes,
  * many windows while sharing bounded scratch across the actual replay. */
 int ps_stream_window_open(ps_stream *, uint64_t offset, uint64_t bytes,
                           ps_stream_window **, lc_error *);
-/* Pin within the caller's canonical allocator scope. Verify the resulting
- * window after releasing that scope and before the first read. */
+/* Pin the selected window under the space mutex. Certify any provisional
+ * pin and verify the window before the first read. */
 int ps_stream_window_pin_locked(ps_space *, ps_key, const ps_ref *,
-                                uint64_t start, uint64_t end,
+                                uint64_t start, uint64_t end, int provisional,
                                 ps_stream_window **, lc_error *);
 int ps_stream_window_verify(ps_stream_window *, lc_error *);
+void ps_stream_window_discard_locked(ps_stream_window *);
 int ps_stream_window_read(ps_stream_window *, uint64_t offset, void *, size_t,
                           lc_error *);
 void ps_stream_window_close(ps_stream_window *);

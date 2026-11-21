@@ -124,7 +124,8 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *,
 int ps_checkpoint_capture_selected_locked(ps_namespace *, uint64_t prefix,
                                           const ps_checkpoint_info *,
                                           enum ps_checkpoint_capture_mode,
-                                          ps_values **, lc_error *);
+                                          int provisional, ps_values **,
+                                          lc_error *);
 /* A memo-only miss reports noncurrent without reading the disk. */
 int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
                         int memo_only, ps_checkpoint_info *, int *current,

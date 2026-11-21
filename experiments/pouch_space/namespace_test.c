@@ -2543,7 +2543,7 @@ static void shared_handoff(const char *path) {
 typedef struct projection_probe {
   ps_root *peer_root;
   ps_namespace *peer;
-  size_t acquisitions, headers;
+  size_t acquisitions, expected_acquisitions, headers;
   off_t header;
   int armed, held, reject, corrupt, discover;
 } projection_probe;
@@ -2557,6 +2557,16 @@ static int projection_lock(void *context, int fd, int command,
     return -1;
   }
   int rc = fcntl(fd, command, lock);
+  if (!rc && p->armed && p->peer && command == F_OFD_SETLK &&
+      lock->l_type == F_RDLCK && lock->l_start >= PS_DATA &&
+      lock->l_start < (off_t)PS_DEFAULT_CAPACITY) {
+    lc_error e = {0};
+    ps_namespace *ns = p->peer;
+    REQUIRE(!p->held && !p->acquisitions);
+    p->peer = NULL;
+    ok(append(p->peer_root, ns, 1, 0, 65, &e), &e);
+    clear(&e);
+  }
   if (rc || !p->armed || lock->l_start != 4)
     return rc;
   if (take) {
@@ -2577,15 +2587,8 @@ static ssize_t projection_read(void *context, int fd, void *bytes, size_t n,
       !(at % PS_PAGE))
     p->header = at;
   if (p->armed && rc == PS_RUN_IDENTITY_BYTES && at == p->header) {
-    REQUIRE(!p->held && p->acquisitions == 1);
+    REQUIRE(!p->held && p->acquisitions == p->expected_acquisitions);
     ++p->headers;
-    if (p->peer) {
-      lc_error e = {0};
-      ps_namespace *ns = p->peer;
-      p->peer = NULL;
-      ok(append(p->peer_root, ns, 1, 0, 65, &e), &e);
-      clear(&e);
-    }
     if (p->corrupt)
       *(unsigned char *)bytes ^= 1;
   }
@@ -2640,8 +2643,21 @@ static void shared_projection_capture(const char *path, int durable) {
   REQUIRE(!probe.acquisitions && !probe.headers && after.tail == before.tail &&
           after.active_incarnation == before.active_incarnation &&
           after.checkpoint_epoch == before.checkpoint_epoch);
+  ok(ps_namespace_view_open(x, &view, &e), &e);
+  REQUIRE(!probe.acquisitions && probe.headers == 1);
+  ps_namespace_view_close(view);
+  view = NULL;
+  ok(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
+                            written.payload_span.payload_offset, sizeof(bytes),
+                            &window, &e),
+     &e);
+  REQUIRE(!probe.acquisitions && probe.headers == 2);
+  ps_namespace_read_close(window);
+  window = NULL;
   ps_coordination_unlock(allocator_guard);
+  probe.headers = 0;
   probe.reject = 0;
+  probe.expected_acquisitions = 1;
   probe.peer_root = b;
   probe.peer = peer;
   ok(ps_namespace_view_open(x, &view, &e), &e);
@@ -2651,15 +2667,17 @@ static void shared_projection_capture(const char *path, int durable) {
   REQUIRE(selected.count == 1 && selected.version == 1);
   ps_namespace_view_close(view);
   count(peer, 1, &e);
+  ok(ps_namespace_projection(x, &after, &e), &e);
 
   probe.acquisitions = probe.headers = 0;
+  probe.expected_acquisitions = 0;
   probe.armed = probe.corrupt = 1;
   REQUIRE(ps_namespace_read_open(x, PS_CATALOG_SEGMENT, segment,
                                  written.payload_span.payload_offset,
                                  sizeof(bytes), &window,
                                  &e) == LC_ERR_PROTOCOL &&
           !window);
-  REQUIRE(probe.acquisitions == 1 && probe.headers == 1 && !probe.held);
+  REQUIRE(!probe.acquisitions && probe.headers == 1 && !probe.held);
   clear(&e);
   probe.armed = probe.corrupt = 0;
   ok(ps_status(ps_root_space(a), &st, &e), &e);
@@ -2670,7 +2688,7 @@ static void shared_projection_capture(const char *path, int durable) {
                             written.payload_span.payload_offset, sizeof(bytes),
                             &window, &e),
      &e);
-  REQUIRE(probe.acquisitions == 1 && probe.headers == 1 && !probe.held);
+  REQUIRE(!probe.acquisitions && probe.headers == 1 && !probe.held);
   probe.armed = 0;
   ok(lc_pouch_record_io_read(ps_namespace_read_input(window),
                              written.payload_span.payload_offset, &part, 1, &e),

@@ -635,7 +635,8 @@ static int retain_changed_state(void *context, ps_key key,
 static int capture_selected_view_locked(struct ps_namespace_data *d,
                                         namespace_observation *observed,
                                         const namespace_selection *selection,
-                                        uint64_t prefix, lc_error *e) {
+                                        uint64_t prefix, int provisional,
+                                        lc_error *e) {
   ps_namespace_view *view = observed->view;
   ps_space *space = d->ns->root->space;
   const ps_checkpoint_info *coverage = &selection->coverage;
@@ -662,10 +663,11 @@ static int capture_selected_view_locked(struct ps_namespace_data *d,
       view->incremental = 1;
       rc = ps_internal_values_capture_locked(
           space, d->ns->identity.owner, PS_KEY_METADATA, PS_KEY_METADATA,
-          prefix, retain_changed_state, view, &view->metadata, e);
+          prefix, provisional, retain_changed_state, view, &view->metadata, e);
     } else
-      rc = ps_checkpoint_capture_selected_locked(
-          d->ns, prefix, coverage, view->capture, &view->metadata, e);
+      rc = ps_checkpoint_capture_selected_locked(d->ns, prefix, coverage,
+                                                 view->capture, provisional,
+                                                 &view->metadata, e);
   }
   view->coverage = *coverage;
   if (rc == LC_OK && start < tail) {
@@ -679,7 +681,8 @@ static int capture_selected_view_locked(struct ps_namespace_data *d,
       view->items->tail = tail;
       strcpy(view->items->leaf, selection->leaf);
       rc = ps_stream_window_pin_locked(space, binding->stream, &binding->target,
-                                       start, tail, &view->items->reader, e);
+                                       start, tail, provisional,
+                                       &view->items->reader, e);
     }
   }
   observed->ready = rc == LC_OK;
@@ -761,45 +764,83 @@ static int select_projection_locked(struct ps_namespace_data *d,
   }
   return LC_OK;
 }
+static void release_view_payloads(ps_namespace_view *view, int locked) {
+  size_t i;
+  for (i = 0; view->items && i < view->count; ++i) {
+    if (locked)
+      ps_stream_window_discard_locked(view->items[i].reader);
+    else
+      ps_stream_window_close(view->items[i].reader);
+  }
+  lc_free_with_allocator(NULL, view->items);
+  if (locked)
+    ps_internal_values_discard_locked(view->metadata);
+  else
+    ps_values_close(view->metadata);
+  view->items = NULL;
+  view->metadata = NULL;
+  view->count = view->matched_slots = 0;
+  view->incremental = 0;
+}
+static int projection_selected_locked(struct ps_namespace_data *d,
+                                      namespace_observation *observed,
+                                      int provisional, lc_error *e) {
+  ps_space *s = d->ns->root->space;
+  const lc_pouch_storage_namespace_info *out = &observed->projection;
+  namespace_selection selection;
+  uint64_t prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  int found, rc = select_projection_locked(d, observed, &selection, prefix,
+                                           provisional, &found, e);
+  if (rc != LC_OK || !found)
+    return rc;
+  if (observed->window) {
+    if (out->active_segment == observed->source &&
+        observed->start <= out->tail &&
+        observed->bytes <= out->tail - observed->start) {
+      rc = ps_stream_window_pin_locked(
+          s, selection.binding.stream, &selection.binding.target,
+          observed->start, observed->start + observed->bytes, provisional,
+          &observed->window->reader, e);
+      observed->ready = rc == LC_OK;
+    }
+  } else if (observed->view)
+    rc = capture_selected_view_locked(d, observed, &selection, prefix,
+                                      provisional, e);
+  else
+    observed->ready = 1;
+  return rc;
+}
 static int projection_selected(struct ps_namespace_data *d,
                                namespace_observation *observed, lc_error *e) {
   ps_namespace *ns = d->ns;
   ps_space *s = ns->root->space;
-  const lc_pouch_storage_namespace_info *out = &observed->projection;
-  namespace_selection selection;
   ps_coordination_guard *allocator;
   ps_namespace_view *view = observed->view;
-  uint64_t prefix;
-  int rc, found = 0, point = !view && !observed->window;
+  int rc, provisional, point = !view && !observed->window;
   pthread_mutex_lock(&s->mutex);
-  rc = point ? ps_internal_observe_begin(s, &allocator, e)
-             : ps_internal_capture_begin(s, &allocator, e);
-  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  rc = ps_internal_observe_begin(s, &allocator, e);
+  provisional = s->readiness && !s->allocation_guard;
   if (rc == LC_OK)
-    rc = select_projection_locked(d, observed, &selection, prefix,
-                                  point && !allocator, &found, e);
-  if (rc == LC_OK && !found && point && !allocator) {
-    rc = ps_internal_capture_begin(s, &allocator, e);
-    prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-    if (rc == LC_OK)
-      rc = select_projection_locked(d, observed, &selection, prefix, 0, &found,
-                                    e);
-  }
-  if (rc == LC_OK && found) {
-    if (observed->window) {
-      if (out->active_segment == observed->source &&
-          observed->start <= out->tail &&
-          observed->bytes <= out->tail - observed->start) {
-        rc = ps_stream_window_pin_locked(
-            s, selection.binding.stream, &selection.binding.target,
-            observed->start, observed->start + observed->bytes,
-            &observed->window->reader, e);
-        observed->ready = rc == LC_OK;
-      }
-    } else if (view)
-      rc = capture_selected_view_locked(d, observed, &selection, prefix, e);
-    else
-      observed->ready = 1;
+    rc = projection_selected_locked(d, observed, provisional, e);
+  if (provisional && (rc != LC_OK || !observed->ready ||
+                      (!point && !ps_internal_read_witness_valid(s)))) {
+    /* Another thread on this OFD must never adopt while speculative pins
+     * could refer to pages the peer has already reused. */
+    if (view)
+      release_view_payloads(view, 1);
+    else if (observed->window) {
+      ps_stream_window_discard_locked(observed->window->reader);
+      observed->window->reader = NULL;
+    }
+    observed->ready = 0;
+    if (rc == LC_OK) {
+      rc = ps_internal_capture_begin(s, &allocator, e);
+      if (rc == LC_OK)
+        rc = projection_selected_locked(d, observed, 0, e);
+    } else if (ps_internal_healthy(s, NULL) != LC_OK) {
+      lc_error_cleanup(e);
+      rc = ps_internal_healthy(s, e);
+    }
   }
   rc = ps_internal_capture_end(s, allocator, rc, e);
   pthread_mutex_unlock(&s->mutex);
@@ -814,7 +855,7 @@ static int projection_selected(struct ps_namespace_data *d,
                               PS_COORDINATION_NAMESPACE_VIEW, ns->hash, 0,
                               &view->witness, e);
   if (rc == LC_OK) {
-    view->projection = *out;
+    view->projection = observed->projection;
     pthread_mutex_lock(&d->mutex);
     ++d->views;
     view->registered = 1;
@@ -1919,14 +1960,9 @@ int ps_namespace_refresh_state(ps_namespace *ns,
   return rc;
 }
 void ps_namespace_view_close(ps_namespace_view *view) {
-  size_t i;
   if (!view)
     return;
-  if (view->items)
-    for (i = 0; i < view->count; ++i)
-      ps_stream_window_close(view->items[i].reader);
-  lc_free_with_allocator(NULL, view->items);
-  ps_values_close(view->metadata);
+  release_view_payloads(view, 0);
   if (view->registered) {
     pthread_mutex_lock(&view->ns->data->mutex);
     --view->ns->data->views;
