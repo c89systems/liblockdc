@@ -12558,3 +12558,62 @@ projection and journal replay, and root codec conversion with explicit
 growth. CPU, memory, NoSync tail latency, first-owner reopen and close
 remain qualification gates. Raw measurements and retained images are
 under `build/pouch-space-concurrent/native-profile/`.
+
+## Packed-page ownership batching trial
+
+Checkpoint adoption and open recover packed-page ownership with kernel OFD
+queries. A query can return any conflict in its requested interval. The trial
+sorted possible witness pages by physical offset and queried contiguous runs.
+A returned conflict quarantined each touched page and left two page-aligned
+residual ranges to verify. The scanner recursed into the smaller residual and
+iterated through the larger one. Each member recorded the pages it could
+itself witness until its last claim was released. Under allocator authority a
+negative kernel query could clear stale shared bits outside that local set.
+Read-only imports and ranges outside bitmap coverage still required kernel
+queries.
+
+The deterministic fixture selected 24 adjacent packed pages with two foreign
+readers and one local reader. It forced the second foreign witness to win the
+first query and found both in five queries. A separate join found the local
+witness. An injected error on a residual query failed the adopting handle and
+left a fresh join able to recover all three witnesses. An imported reader
+retained its witness and data through a cold reopen. Verification passed 53
+GNU Release groups and 34 each on Debug ASan/UBSan and musl Release on the
+first variant.
+
+The measured workload streamed 192 MiB through a fixed 10 MiB root with eight
+independent writers and verified through reclaim and reopen. Packed-page
+ownership queries fell from 284,523 to 31,600 in NoSync and from 483,812
+to 82,724 in durable mode. Estimated kernel query CPU fell from 329 to
+55 ms and from 610 to 166 ms respectively. CPU estimates sample one call
+in 64. Query counts include checkpoint adoption and open for the entire trial.
+
+The five uninstrumented trials of the first variant and frozen control all
+verified. The two NoSync candidate runs took 20.21 and 23.86 s through index
+readiness and maintenance, compared with 16.99 s for the frozen control.
+Durable work took 41.99 s compared with 37.60 s. Eight paired musl opens
+used identical copies of one verified closed image, alternating trial order.
+The first variant reduced median first-owner open from 74.12 to 67.69 ms,
+eight live joins from 61.64 to 58.81 ms, and grouped close from 10.32 to
+9.50 ms. The candidate and control performed the same reads and barriers.
+
+The second variant restored the projection's quarantine order before handing
+it to foreground reclamation. The four focused GNU checks passed, including
+the recorded order after the deliberately out-of-order query. Two further
+candidate-control NoSync pairs verified through reopen. In both pairs, the
+candidate took longer through index readiness and maintenance.
+
+| NoSync work phase | Frozen control | Ordered candidate |
+| --- | ---: | ---: |
+| Work, median (s) | 18.69 | 20.67 |
+| CPU through maintenance, median (s) | 21.79 | 20.84 |
+| Mutation p95 (ms), two runs | 112.60, 124.13 | 121.75, 129.28 |
+| Index flush (s), two runs | 3.61, 3.75 | 4.31, 4.42 |
+| First query pass (s), two runs | 1.24, 1.30 | 1.18, 1.47 |
+| Repeat query pass (s), two runs | 0.45, 0.46 | 0.38, 0.45 |
+
+The branch retains the adaptive-index implementation. The ownership batching
+trial reduced kernel query cost and increased elapsed work time and mutation
+tail latency under shared pressure. The code is retained
+locally in stash commit `a73fbe54`. Raw runs and the frozen control are
+under `build/pouch-space-concurrent/ownership-batching/`.
