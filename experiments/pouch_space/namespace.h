@@ -18,7 +18,8 @@ enum ps_namespace_append_mode {
   PS_APPEND_PREFIX = 0,
   PS_APPEND_COMPLETE,
   PS_APPEND_MAINTENANCE,
-  PS_APPEND_MAINTENANCE_PREFIX
+  PS_APPEND_MAINTENANCE_PREFIX,
+  PS_APPEND_FRAMED_PREFIX
 };
 typedef struct ps_namespace_status {
   uint64_t active_segment, segments, tail, runs;
@@ -97,7 +98,8 @@ int ps_namespace_retention_hint_remove(ps_namespace *, lc_error *);
  * byte when zero), with later unknown-size growth using ordinary admission.
  * COMPLETE requires exactly minimum positive bytes and preserves the standing
  * floor; MAINTENANCE is complete bounded work permitted to spend that floor.
- * Both are indivisible recovery units. Storage reserves its checksummed frame
+ * FRAMED_PREFIX grows like PREFIX and commits a single checksummed frame.
+ * Framed appends are indivisible recovery units. Storage reserves the frame
  * in addition to minimum canonical bytes; returned offsets address the actual
  * inner records. An invalid candidate frame contributes no records, while
  * corruption in required checkpoint metadata or an uncovered trusted prefix

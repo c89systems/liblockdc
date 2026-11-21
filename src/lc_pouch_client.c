@@ -508,6 +508,8 @@ typedef struct lc_pouch_txn_stage_write_context {
   const char *txn_id;
   lc_pouch_generation projected_version;
   int *removed;
+  lc_pouch_state_stage_lease *lease_update;
+  lc_pouch_txn_buffer lease_metadata;
 } lc_pouch_txn_stage_write_context;
 
 typedef struct lc_pouch_counting_source {
@@ -8825,8 +8827,8 @@ static int lc_pouch_client_prepare_txn_stage_write(
   *apply = 1;
   rc = lc_pouch_validate_lease_metadata_view(stage->client, stage->lease,
                                              stage->ns, stage->lease->key,
-                                             lease_state, NULL, error);
-  if (rc == LC_OK) {
+                                             lease_state, &lease_record, error);
+  if (rc == LC_OK && !lc_pouch_lease_ref_has_credentials(stage->lease)) {
     rc = lc_pouch_lease_record_parse(
         lease_state->metadata, lease_state->metadata_length,
         lease_state->version, &lease_record, error);
@@ -8919,6 +8921,19 @@ static int lc_pouch_client_prepare_txn_stage_write(
     options->has_expected_version = 0;
     options->expected_version = 0UL;
   }
+  if (rc == LC_OK && *apply && stage->lease_update) {
+    rc = lc_pouch_lease_record_build(
+        &stage->lease_metadata, stage->ns, stage->key, lease_record.owner,
+        lease_record.lease_id, lease_record.txn_id, lease_record.fencing_token,
+        lease_record.expires_at_unix, stage->projected_version,
+        lease_record.txn_explicit, error);
+    if (rc == LC_OK) {
+      stage->lease_update->metadata =
+          (const unsigned char *)stage->lease_metadata.bytes;
+      stage->lease_update->metadata_length = stage->lease_metadata.length;
+      stage->lease_update->expires_at = lease_record.expires_at_unix;
+    }
+  }
   lc_pouch_lease_record_cleanup(&lease_record);
   return rc;
 }
@@ -8930,6 +8945,7 @@ static int lc_pouch_client_stage_transaction_write(
     int *removed, lc_error *error) {
   lc_pouch_txn_stage_write_context context;
   lc_pouch_txn_guard guard;
+  lc_pouch_state_stage_lease lease_update = {0};
   lc_error discard_error;
   int discard_rc;
   int discarded;
@@ -8945,17 +8961,25 @@ static int lc_pouch_client_stage_transaction_write(
   context.key = key;
   context.txn_id = txn_id;
   context.removed = removed;
+  if (client && client->pouch->storage.ops &&
+      lc_pouch_lease_ref_has_credentials(lease) && lease->key &&
+      strcmp(key, lease->key) == 0 && !options->staged_delete_marker &&
+      !options->maintenance_completion && !options->maintenance_stream_bytes)
+    context.lease_update = &lease_update;
   rc = lc_pouch_retention_stage_begin(client, lease, ns, key, txn_id, options,
                                       &guard, error);
   if (rc == LC_OK)
     rc = lc_pouch_state_stage_write_prepared(
         client != NULL ? client->pouch : NULL, ns, key, txn_id,
         lease != NULL ? lease->key : NULL, source, options,
-        lc_pouch_client_prepare_txn_stage_write, &context, NULL, out, error);
+        lc_pouch_client_prepare_txn_stage_write, &context, NULL,
+        context.lease_update, out, error);
   if (rc == LC_OK) {
     out->version = context.projected_version;
-    if (context.projected_version != 0UL && lease != NULL &&
-        lease->key != NULL && strcmp(key, lease->key) == 0) {
+    if (context.lease_update) {
+      lc_pouch_compaction_note_mutation(client->pouch, ns, 0);
+    } else if (context.projected_version != 0UL && lease != NULL &&
+               lease->key != NULL && strcmp(key, lease->key) == 0) {
       lc_pouch_state_write_result lease_write_result;
 
       memset(&lease_write_result, 0, sizeof(lease_write_result));
@@ -9007,6 +9031,7 @@ static int lc_pouch_client_stage_transaction_write(
     }
   }
   lc_pouch_txn_guard_release(&guard);
+  lc_pouch_txn_buffer_cleanup(&context.lease_metadata);
   lc_error_cleanup(&discard_error);
   return rc;
 }
@@ -9093,7 +9118,7 @@ static int lc_pouch_client_stage_transaction_mutation(
         mutation->stage.ns, mutation->stage.key, mutation->stage.txn_id,
         mutation->stage.lease != NULL ? mutation->stage.lease->key : NULL, NULL,
         options, lc_pouch_client_prepare_txn_mutation_stage_write, mutation,
-        lc_pouch_client_prepare_txn_mutation_source, out, error);
+        lc_pouch_client_prepare_txn_mutation_source, NULL, out, error);
   lc_pouch_txn_guard_release(&guard);
   return rc;
 }

@@ -10518,3 +10518,77 @@ Targeted verification passed 35 GNU Release, 18 Debug ASan/UBSan and
 fixture with replacement-holder and stale-retry checks. Raw traces,
 matched runs and test logs are under `durable-revisions-` and
 `release-barrier-` in `build/pouch-space-concurrent/`.
+
+## Publishing a streamed stage and lease cursor in one frame
+
+An ordinary native same-key staged write now appends its lease version
+cursor and private body under one namespace authority. It reserves the
+frame and its fixed prefixes, admits both key obligations before pulling
+the body, and streams the encoded bytes into the active source. At
+producer completion it checks lease expiry again. The frame checksum
+combines the complete canonical prefixes and the encoded payload
+checksums already computed during streaming. The existing piece footer
+pass records checksums for the stored pieces. One canonical publication
+selects the body and the cursor together. The public body stays at its
+committed version until release.
+
+Recovery already validates a complete frame before accepting any inner
+record. The same wire format now supports frames whose length is known
+at producer completion. The variable-span tests cover empty and
+multi-piece bodies, I/O and allocation failure, and a persisted suffix
+containing complete inner records with a missing frame header. The
+public lease fixture uses plaintext and combined encryption and
+compression. Both profiles verify one ordinary durable sync, recovery
+with a failed sync or lost acknowledgement, retry with the old
+precondition after an unpersisted stage, and expiry at producer EOF.
+
+The first matched rotation exposed a duplicate checkpoint key in one
+durable indexed run. A trace found a staged key published to one slot,
+replayed from an older durable checkpoint, and published again under a
+second slot identity. An observation can select the earlier durable
+checkpoint while a lease release has already framed newer slot updates.
+Before recovering its checkpoint ledger, an editing owner now settles
+that namespace's already-framed slots through the shared durability
+certificate, then confirms its seed. Observation retains its durable
+visibility boundary. A two-owner fixture reproduces the earlier
+mismatch and verifies both peer takeover and return to the first owner.
+Only one selected slot remains for the staged data, including after a
+cold reopen.
+
+The final rotation restored the stage's established maintenance
+notification after the combined publish. All 36 matched workflows
+verified with fixed 10 MiB native containers. Each build ran four
+durable indexed samples and two of each other profile. The tables
+give medians in milliseconds in the order prior native (`fbfdeb88`),
+revised native, multifile. Grouped reopen includes the cold owner and
+later live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1209.21 / 1016.25 / 1248.58 | 61.07 / 50.45 / 30.23 | 18.49 / 22.11 / 1.01 | 9.49 / 9.44 / 0.99 | 4.72 / 5.16 / 6.76 |
+| NoSync indexed, 20 MiB | 2706.29 / 2552.54 / 2187.78 | 78.51 / 73.28 / 36.34 | 4.95 / 43.86 / 1.09 | 14.81 / 13.15 / 1.05 | 8.01 / 8.11 / 10.33 |
+| Durable indexed, 15 MiB | 5624.42 / 4857.59 / 5715.80 | 80.20 / 70.98 / 69.79 | 5.60 / 1.75 / 0.81 | 9.32 / 7.38 / 0.61 | 7.16 / 5.46 / 7.00 |
+| Warmed NoSync queue | 10.74 / 10.55 / 98.88 | 2.13 / 1.99 / 25.34 | 0.24 / 0.24 / 0.07 | 4.36 / 2.55 / 0.38 | 0.30 / 0.21 / 0.48 |
+| Durable outbox | 1016.67 / 952.83 / 1500.52 | 196.05 / 175.18 / 321.95 | 0.59 / 0.55 / 0.26 | 34.75 / 46.19 / 47.53 | 59.25 / 61.66 / 114.16 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 244.98 / 198.72 / 289.38 | 54.83 / 40.78 / 153.34 | 11.51 / 38.00 / 245.45 | 0.66 / 0.72 / 1.17 |
+| NoSync indexed, 20 MiB | 337.03 / 308.21 / 462.17 | 109.84 / 64.92 / 297.39 | 33.17 / 38.39 / 292.53 | 1.38 / 1.40 / 1.89 |
+| Durable indexed, 15 MiB | 149.70 / 151.91 / 228.07 | 20.64 / 13.64 / 232.47 | 1.95 / 9.13 / 320.10 | 0.58 / 0.44 / 0.72 |
+
+In the durable indexed workload, median mutation syncs fell from 1164
+to 911, a 22% reduction. Work fell 14% from the prior native median and
+finished sooner in three of four matched pairs. Total work CPU was
+1192 / 1126 / 750 ms. The heavy NoSync workload still has roughly twice
+the multifile mutation p95, and indexed grouped reopen and close remain
+qualification work.
+
+An earlier corrected rotation verified 48 matched workflows and six
+additional updated durable indexed workflows. Targeted verification
+passed 40 GNU Release, 28 Debug ASan/UBSan and 28 musl Release groups,
+including the active-stage fault sweep and shared codec, namespace
+and messaging cases. After restoring the maintenance notification,
+seven focused checks passed across the three builds. Raw traces, red
+and green fixtures, matched rows and test logs have the `stage-frame-`
+prefix in `build/pouch-space-concurrent/`.

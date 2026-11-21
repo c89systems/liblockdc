@@ -5213,7 +5213,7 @@ static void staged_put(lc_pouch *p, const char *txn, size_t length,
   if (prepared)
     ok(lc_pouch_state_stage_write_prepared(p, "staged", "key", txn, "key",
                                            &in.pub, &o, staged_prepare, NULL,
-                                           NULL, &w, e),
+                                           NULL, NULL, &w, e),
        e);
   else
     ok(lc_pouch_state_stage_write(p, "staged", "key", txn, &in.pub, &o, &w, e),

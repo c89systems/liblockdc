@@ -1546,50 +1546,48 @@ static void restore_disk(disk_model *m, const char *path) {
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
   m->freeze = 0;
 }
-enum release_barrier_outcome {
-  RELEASE_DURABLE,
-  RELEASE_LOST_SYNC,
-  RELEASE_LOST_ACK,
-  RELEASE_INTERRUPTED_CLEAR
+enum barrier_outcome {
+  BARRIER_DURABLE,
+  BARRIER_LOST_SYNC,
+  BARRIER_LOST_ACK,
+  BARRIER_INTERRUPTED_CLEAR
 };
-typedef struct release_disk {
+typedef struct barrier_disk {
   disk_model disk;
-  enum release_barrier_outcome outcome;
-  int release_armed;
-  size_t release_syncs, revisions;
-} release_disk;
-static int release_barrier_sync(void *context, int fd) {
-  release_disk *disk = context;
-  if (!disk->release_armed)
+  enum barrier_outcome outcome;
+  int armed;
+  size_t syncs, revisions;
+} barrier_disk;
+static int barrier_sync(void *context, int fd) {
+  barrier_disk *disk = context;
+  if (!disk->armed)
     return disk_sync(&disk->disk, fd);
-  ++disk->release_syncs;
-  if (disk->outcome != RELEASE_LOST_SYNC)
+  ++disk->syncs;
+  if (disk->outcome != BARRIER_LOST_SYNC)
     REQUIRE(!disk_sync(&disk->disk, fd));
-  if (disk->outcome == RELEASE_DURABLE ||
-      disk->outcome == RELEASE_INTERRUPTED_CLEAR)
+  if (disk->outcome == BARRIER_DURABLE ||
+      disk->outcome == BARRIER_INTERRUPTED_CLEAR)
     return 0;
   errno = EIO;
   return -1;
 }
 static int interrupt_lease_clear(void *context, lc_error *e) {
-  release_disk *disk = context;
+  barrier_disk *disk = context;
   if (++disk->revisions != 2)
     return LC_OK;
   return lc_error_set(e, LC_ERR_TRANSPORT, 0, "interrupted lease clear", NULL,
                       NULL, "test");
 }
 static void release_barrier_case(const char *directory, int crypto,
-                                 int rollback,
-                                 enum release_barrier_outcome outcome) {
-  release_disk disk = {0};
+                                 int rollback, enum barrier_outcome outcome) {
+  barrier_disk disk = {0};
   disk.outcome = outcome;
   disk.disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
   disk.disk.dirty = calloc(1, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
   disk.disk.scratch = malloc(PS_PAGE);
   fixture *f = calloc(1, sizeof(*f));
   REQUIRE(disk.disk.stable && disk.disk.dirty && disk.disk.scratch && f);
-  ps_io io = {&disk,        disk_read, disk_write, release_barrier_sync,
-              disk_reserve, NULL};
+  ps_io io = {&disk, disk_read, disk_write, barrier_sync, disk_reserve, NULL};
   lc_error e = {0};
   now(1000);
   setup_io(f, directory, 0, 1, crypto, &io, &e);
@@ -1620,21 +1618,21 @@ static void release_barrier_case(const char *directory, int crypto,
   retry.lease.lease_id = id;
   retry.lease.txn_id = txn;
   retry.lease.fencing_token = lease->fencing_token;
-  if (outcome == RELEASE_INTERRUPTED_CLEAR) {
+  if (outcome == BARRIER_INTERRUPTED_CLEAR) {
     lc_pouch_test_after_metadata_batch_append_context = &disk;
     lc_pouch_test_after_metadata_batch_append_hook = interrupt_lease_clear;
   }
-  disk.release_armed = 1;
+  disk.armed = 1;
   int rc = lc_lease_release(lease, &options, &e);
-  disk.release_armed = 0;
-  if (outcome == RELEASE_INTERRUPTED_CLEAR) {
+  disk.armed = 0;
+  if (outcome == BARRIER_INTERRUPTED_CLEAR) {
     lc_pouch_test_after_metadata_batch_append_hook = NULL;
     lc_pouch_test_after_metadata_batch_append_context = NULL;
     REQUIRE(disk.revisions == 2 && e.message &&
             !strcmp(e.message, "interrupted lease clear"));
   }
-  REQUIRE(disk.release_syncs == 1);
-  if (outcome == RELEASE_DURABLE)
+  REQUIRE(disk.syncs == 1);
+  if (outcome == BARRIER_DURABLE)
     ok(rc, &e);
   else {
     REQUIRE(rc == LC_ERR_TRANSPORT);
@@ -1645,12 +1643,12 @@ static void release_barrier_case(const char *directory, int crypto,
   close_store(f);
   restore_disk(&disk.disk, f->path);
   open_store(f, 0, &e);
-  int applied = outcome != RELEASE_LOST_SYNC && !rollback;
+  int applied = outcome != BARRIER_LOST_SYNC && !rollback;
   parent(f, "order", applied, 0, &e);
   if (crypto)
     attachments(f, "order", applied, &e);
   int held =
-      outcome == RELEASE_LOST_SYNC || outcome == RELEASE_INTERRUPTED_CLEAR;
+      outcome == BARRIER_LOST_SYNC || outcome == BARRIER_INTERRUPTED_CLEAR;
   lc_acquire_req contender;
   lc_acquire_req_init(&contender);
   contender.key = "order";
@@ -1693,11 +1691,152 @@ static void release_barrier(const char *directory) {
   shared_lease_fixture = 1;
   for (int crypto = 0; crypto <= 3; crypto += 3)
     for (int rollback = 0; rollback < 2; ++rollback)
-      for (enum release_barrier_outcome outcome = RELEASE_DURABLE;
-           outcome <= RELEASE_LOST_ACK; ++outcome)
+      for (enum barrier_outcome outcome = BARRIER_DURABLE;
+           outcome <= BARRIER_LOST_ACK; ++outcome)
         release_barrier_case(directory, crypto, rollback, outcome);
-  release_barrier_case(directory, 0, 0, RELEASE_INTERRUPTED_CLEAR);
-  release_barrier_case(directory, 0, 1, RELEASE_INTERRUPTED_CLEAR);
+  release_barrier_case(directory, 0, 0, BARRIER_INTERRUPTED_CLEAR);
+  release_barrier_case(directory, 0, 1, BARRIER_INTERRUPTED_CLEAR);
+  shared_lease_fixture = 0;
+}
+static size_t expire_at_eof(lc_source *pub, void *bytes, size_t n,
+                            lc_error *e) {
+  size_t got = pull(pub, bytes, n, e);
+  if (!got)
+    now(1300);
+  return got;
+}
+static void stage_barrier_case(const char *directory, int crypto,
+                               enum barrier_outcome outcome, int expires) {
+  barrier_disk disk = {0};
+  disk.outcome = outcome;
+  disk.disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+  disk.disk.dirty = calloc(1, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
+  disk.disk.scratch = malloc(PS_PAGE);
+  fixture *f = calloc(1, sizeof(*f));
+  REQUIRE(disk.disk.stable && disk.disk.dirty && disk.disk.scratch && f);
+  ps_io io = {&disk, disk_read, disk_write, barrier_sync, disk_reserve, NULL};
+  lc_error e = {0};
+  now(1000);
+  setup_io(f, directory, 0, 1, crypto, &io, &e);
+  write_parent(f, "order", 0, 0, &e);
+  lc_lease *lease = acquire(f, "order", NULL, &e);
+  lc_version prior_version = lease->version;
+  char *id = strdup(lease->lease_id), *txn = strdup(lease->txn_id);
+  char *etag = strdup(lease->state_etag);
+  REQUIRE(id && txn && etag && prior_version > 0);
+  lc_lease_ref ref = {"orders", "order", id, txn, lease->fencing_token};
+  lc_pouch_state_read_result state = {0};
+  ok(lc_pouch_state_read_metadata(store(f), "orders", "order", &state, &e), &e);
+  size_t metadata_length = state.metadata_length;
+  unsigned char *metadata = malloc(metadata_length);
+  REQUIRE(metadata_length && metadata);
+  memcpy(metadata, state.metadata, metadata_length);
+  lc_pouch_state_read_result_cleanup(&store(f)->allocator, &state);
+
+  const char *updated =
+      "{\"value\":43,\"description\":\"streamed replacement\"}";
+  producer next = source(updated);
+  next.pub.impl = &next;
+  if (expires)
+    next.pub.read = expire_at_eof;
+  disk.armed = !expires;
+  int rc = lc_lease_update(lease, &next.pub, NULL, &e);
+  disk.armed = 0;
+  REQUIRE(next.at == next.length && next.calls >= 3);
+  if (expires) {
+    REQUIRE(rc == LC_ERR_INVALID && e.message &&
+            !strcmp(e.message, "pouch lease validation failed"));
+  } else {
+    REQUIRE(disk.syncs == 1);
+    if (outcome == BARRIER_DURABLE) {
+      ok(rc, &e);
+      REQUIRE(lease->version == prior_version + 1);
+    } else
+      REQUIRE(rc == LC_ERR_TRANSPORT);
+  }
+  lc_lease_close(lease);
+  clear(&e);
+  disk.disk.freeze = 1;
+  close_store(f);
+  restore_disk(&disk.disk, f->path);
+  open_store(f, 0, &e);
+  parent(f, "order", 1, 0, &e);
+  int accepted = !expires && outcome != BARRIER_LOST_SYNC;
+  ok(lc_pouch_state_read_metadata(store(f), "orders", "order", &state, &e), &e);
+  REQUIRE(state.metadata_length == metadata_length &&
+          (memcmp(state.metadata, metadata, metadata_length) != 0) == accepted);
+  REQUIRE(state.version == (uint64_t)prior_version);
+  lc_pouch_state_read_result_cleanup(&store(f)->allocator, &state);
+  if (expires) {
+    lease = acquire(f, "order", NULL, &e);
+    REQUIRE(lease->fencing_token > ref.fencing_token &&
+            lease->version == prior_version &&
+            !strcmp(lease->state_etag, etag));
+    ok(lc_lease_release(lease, NULL, &e), &e);
+  } else {
+    lc_keepalive_op keep;
+    lc_keepalive_res renewed = {0};
+    lc_keepalive_op_init(&keep);
+    keep.lease = ref;
+    keep.ttl_seconds = 300;
+    ok(lc_keepalive(f->client, &keep, &renewed, &e), &e);
+    REQUIRE(renewed.version == prior_version + accepted && renewed.state_etag &&
+            (strcmp(renewed.state_etag, etag) != 0) == accepted);
+    lc_keepalive_res_cleanup(&renewed);
+    if (!accepted) {
+      lc_update_req req;
+      lc_update_res result = {0};
+      lc_update_req_init(&req);
+      req.lease = ref;
+      req.has_if_version = 1;
+      req.if_version = prior_version;
+      req.if_state_etag = etag;
+      next = source(updated);
+      next.pub.impl = &next;
+      ok(lc_update(f->client, &req, &next.pub, &result, &e), &e);
+      REQUIRE(result.new_version == prior_version + 1 &&
+              next.at == next.length);
+      lc_update_res_cleanup(&result);
+    }
+    lc_release_op finish;
+    lc_release_res released = {0};
+    lc_release_op_init(&finish);
+    finish.lease = ref;
+    ok(lc_release(f->client, &finish, &released, &e), &e);
+    REQUIRE(released.released);
+    lc_release_res_cleanup(&released);
+    lc_sink *sink = NULL;
+    lc_get_res read = {0};
+    const void *bytes;
+    size_t length;
+    ok(lc_sink_to_memory(&sink, &e), &e);
+    ok(f->client->get(f->client, "order", NULL, sink, &read, &e), &e);
+    ok(lc_sink_memory_bytes(sink, &bytes, &length, &e), &e);
+    REQUIRE(!read.no_content && length == strlen(updated) &&
+            !memcmp(bytes, updated, length));
+    lc_get_res_cleanup(&read);
+    lc_sink_close(sink);
+  }
+  close_store(f);
+  retire(f);
+  free(metadata);
+  free(etag);
+  free(id);
+  free(txn);
+  free(f);
+  free(disk.disk.stable);
+  free(disk.disk.dirty);
+  free(disk.disk.scratch);
+  lc_error_cleanup(&e);
+}
+static void stage_barrier(const char *directory) {
+  shared_lease_fixture = 1;
+  for (int crypto = 0; crypto <= 3; crypto += 3) {
+    for (enum barrier_outcome outcome = BARRIER_DURABLE;
+         outcome <= BARRIER_LOST_ACK; ++outcome)
+      stage_barrier_case(directory, crypto, outcome, 0);
+    stage_barrier_case(directory, crypto, BARRIER_DURABLE, 1);
+  }
   shared_lease_fixture = 0;
 }
 static int selected_commit(fixture *f, lc_error *e) {
@@ -1908,6 +2047,8 @@ static void *worker(void *context) {
     lease_policy(r->directory);
   else if (!strcmp(r->mode, "release-barrier"))
     release_barrier(r->directory);
+  else if (!strcmp(r->mode, "stage-barrier"))
+    stage_barrier(r->directory);
   else if (!strcmp(r->mode, "shared-authority")) {
     shared_lease(r->directory);
     shared_wait_for_retention(r->directory);

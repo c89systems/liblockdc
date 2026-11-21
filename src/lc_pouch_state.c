@@ -14563,13 +14563,20 @@ static int lc_pouch_state_write_delete_intent(
   lc_free_with_allocator(&pouch->allocator, meta);
   return rc;
 }
+typedef struct lc_pouch_state_lease_append {
+  lc_pouch_state_entry entry;
+  unsigned char *encoded;
+  size_t length;
+  lc_pouch_unix_seconds expires_at;
+} lc_pouch_state_lease_append;
+
 static int lc_pouch_state_write_resolved_locked(
     lc_pouch *pouch, const char *ns, const char *key, lc_source *body,
     const lc_pouch_state_write_options *options,
     lc_pouch_state_entry *prepared_current,
     lc_pouch_namespace_manifest *prepared_manifest,
-    int prepared_manifest_from_cache, lc_pouch_state_write_result *out,
-    lc_error *error) {
+    int prepared_manifest_from_cache, lc_pouch_state_lease_append *lease_append,
+    lc_pouch_state_write_result *out, lc_error *error) {
   lc_pouch_state_entry current;
   lc_pouch_namespace_logstore *cache;
   lc_pouch_namespace_manifest manifest;
@@ -14921,7 +14928,12 @@ static int lc_pouch_state_write_resolved_locked(
     uint64_t required = LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)strlen(key);
     size_t length = 0;
     memset(&admission, 0, sizeof(admission));
-    if (control_admission) {
+    if (lease_append) {
+      mode = LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX;
+      required += LC_POUCH_RECORD_HEADER_BYTES +
+                  (uint64_t)strlen(lease_append->entry.key) +
+                  lease_append->length;
+    } else if (control_admission) {
       /* The caller supplied a bounded memory source. Its actual encoded body
        * is ready, so admit the complete frame and changed-key checkpoint before
        * writing any canonical bytes. A provisional fixed-width source label
@@ -14976,7 +14988,8 @@ static int lc_pouch_state_write_resolved_locked(
             query_index_seq, error);
       mode = LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX;
     }
-    if (rc == LC_OK && mode != LC_POUCH_STORAGE_APPEND_PREFIX) {
+    if (rc == LC_OK && mode != LC_POUCH_STORAGE_APPEND_PREFIX &&
+        mode != LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX) {
       if (admission.header.payload_len > LC_U64_MAX - required - length)
         rc = lc_error_set(error, LC_ERR_INVALID, 0L,
                           "pouch completion exceeds its append size bound",
@@ -14995,8 +15008,11 @@ static int lc_pouch_state_write_resolved_locked(
     if (rc == LC_OK)
       rc = lc_pouch_state_storage_append_open(
           pouch, cache, required, mode,
-          mode == LC_POUCH_STORAGE_APPEND_PREFIX ? NULL : &batch, &manifest,
-          &storage_append, &segment_size, error);
+          mode == LC_POUCH_STORAGE_APPEND_PREFIX ||
+                  mode == LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX
+              ? NULL
+              : &batch,
+          &manifest, &storage_append, &segment_size, error);
     lc_free_with_allocator(&pouch->allocator, admission.metadata);
     if (rc != LC_OK) {
       lc_pouch_state_append_lock_release(&append_lock);
@@ -15156,6 +15172,24 @@ static int lc_pouch_state_write_resolved_locked(
   }
   record_io = lc_pouch_record_file_io(fd);
 append_ready:
+  if (lease_append) {
+    lc_pouch_state_entry *entry = &lease_append->entry;
+    rc = lc_pouch_state_reserve_index_records(pouch, ns, &manifest, 1UL, 0,
+                                              &entry->index_seq, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_meta_set_index_sequences(
+          &pouch->allocator, &lease_append->encoded, &lease_append->length,
+          entry->index_seq, entry->query_index_seq, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_record_write_complete(
+          record_io, LC_POUCH_STATE_RECORD_STATE_META, entry->key,
+          strlen(entry->key), lease_append->encoded, lease_append->length, NULL,
+          0, 0, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_record_io_tail(record_io, &segment_size, error);
+    if (rc != LC_OK)
+      goto append_finish;
+  }
   rc = lc_pouch_state_payload_span_set(&pouch->allocator, &payload_span,
                                        manifest.active_segment, segment_size,
                                        0UL, 0UL, 0UL, error);
@@ -15413,6 +15447,26 @@ append_ready:
     }
   }
 append_finish:
+  if (rc == LC_OK && lease_append) {
+    lc_pouch_state_entry *entry = &lease_append->entry;
+    lc_pouch_unix_seconds now;
+    /* The lease identity is still locked, but the producer may have taken
+     * long enough for its grant to expire. Keep both records private. */
+    rc = lc_pouch_now_unix(&now, error);
+    if (rc == LC_OK && now >= lease_append->expires_at)
+      rc = lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch lease validation failed", NULL, NULL, NULL);
+    if (rc == LC_OK && entry->updated_at_unix != updated_at_unix) {
+      /* Preserve the completion timestamp even for a long producer. */
+      entry->updated_at_unix = updated_at_unix;
+      lc_pouch_state_put64(lease_append->encoded + 8,
+                           (uint64_t)updated_at_unix);
+      rc = lc_pouch_record_finalize(
+          record_io, storage_append.start, LC_POUCH_STATE_RECORD_STATE_META,
+          entry->key, strlen(entry->key), lease_append->encoded,
+          lease_append->length, 0, 0, error);
+    }
+  }
   if (rc == LC_OK && pouch->storage.ops != NULL) {
     if (!namespace_locked)
       lc_pouch_state_projection_mutex_unlock(pouch, ns);
@@ -15526,7 +15580,7 @@ int lc_pouch_state_write_locked(lc_pouch *pouch, const char *ns,
                                 lc_pouch_state_write_result *out,
                                 lc_error *error) {
   return lc_pouch_state_write_resolved_locked(pouch, ns, key, body, options,
-                                              NULL, NULL, 0, out, error);
+                                              NULL, NULL, 0, NULL, out, error);
 }
 
 typedef struct lc_pouch_state_prepared_write_context {
@@ -17273,6 +17327,7 @@ typedef struct lc_pouch_state_prepared_stage_context {
   lc_pouch_state_stage_prepare_fn prepare;
   void *prepare_context;
   lc_pouch_state_stage_body_prepare_fn body_prepare;
+  const lc_pouch_state_stage_lease *lease_update;
   lc_pouch_state_write_result *out;
 } lc_pouch_state_prepared_stage_context;
 
@@ -17287,7 +17342,10 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
   lc_pouch_state_read_result committed_body;
   lc_pouch_state_read_result staged_body;
   lc_pouch_state_entry staged_entry;
+  lc_pouch_state_entry parent_entry = {0};
   lc_pouch_namespace_manifest manifest;
+  lc_pouch_namespace_manifest parent_manifest = {0};
+  lc_pouch_state_lease_append lease_append = {0};
   lc_pouch_state_write_options staged_write_options;
   lc_pouch_state_metadata_view committed_view;
   lc_pouch_state_metadata_view staged_view;
@@ -17299,7 +17357,6 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
   lc_pouch_unix_seconds operation_expires_at_unix;
   int apply;
   int query_index_guard_started;
-  int staged_entry_transferred;
   int rc;
 
   stage = (lc_pouch_state_prepared_stage_context *)context;
@@ -17328,9 +17385,13 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
   operation_expires_at_unix = 0L;
   apply = 1;
   query_index_guard_started = 0;
-  staged_entry_transferred = 0;
-  rc = lc_pouch_state_read_metadata_locked(stage->pouch, stage->ns, stage->key,
-                                           &committed, error);
+  if (stage->lease_update)
+    rc = lc_pouch_state_manifest_lookup_cached_for_mutation(
+        stage->pouch, stage->ns, stage->key, &parent_manifest, &parent_entry,
+        NULL, error);
+  else
+    rc = lc_pouch_state_read_metadata_locked(stage->pouch, stage->ns,
+                                             stage->key, &committed, error);
   if (rc == LC_OK) {
     staged_key = lc_pouch_state_staged_key(&stage->pouch->allocator, stage->key,
                                            stage->txn_id);
@@ -17352,11 +17413,38 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
     lease_source = &lease;
   }
   if (rc == LC_OK) {
-    lc_pouch_state_metadata_view_from_read_result(&committed, &committed_view);
     lc_pouch_state_metadata_view_from_entry(&staged_entry, &staged_view);
-    lc_pouch_state_metadata_view_from_read_result(lease_source, &lease_view);
+    if (stage->lease_update) {
+      lc_pouch_state_metadata_view_from_entry(&parent_entry, &committed_view);
+      lease_view = committed_view;
+    } else {
+      lc_pouch_state_metadata_view_from_read_result(&committed,
+                                                    &committed_view);
+      lc_pouch_state_metadata_view_from_read_result(lease_source, &lease_view);
+    }
     rc = stage->prepare(&committed_view, &staged_view, &lease_view,
                         stage->prepare_context, stage->options, &apply, error);
+  }
+  if (rc == LC_OK && apply && stage->lease_update) {
+    lc_pouch_state_entry *entry = &lease_append.entry;
+    *entry = parent_entry;
+    entry->metadata = (unsigned char *)stage->lease_update->metadata;
+    entry->metadata_length = stage->lease_update->metadata_length;
+    entry->updated_at_unix = lc_pouch_maintenance_now_seconds();
+    entry->version = entry->payload_span.present ? entry->version : 0UL;
+    entry->has_record_ref = 0;
+    lease_append.expires_at = stage->lease_update->expires_at;
+    rc = lc_pouch_state_retention_publish(stage->pouch, stage->ns, stage->key,
+                                          entry->retention, &entry->retention,
+                                          error);
+    if (rc == LC_OK)
+      rc = lc_pouch_state_snapshot_encode(
+          &stage->pouch->allocator, entry, LC_POUCH_STATE_RECORD_STATE_META,
+          &entry->payload_span, 0, &lease_append.encoded, &lease_append.length,
+          error);
+    entry->object_link |=
+        entry->record_type == LC_POUCH_STATE_RECORD_OBJECT_PUT;
+    entry->record_type = LC_POUCH_STATE_RECORD_STATE_META;
   }
   if (rc == LC_OK && apply) {
     body = stage->body;
@@ -17380,7 +17468,6 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
     }
   }
   if (rc == LC_OK && apply) {
-    staged_entry_transferred = 1;
     if (stage->options->query_index_operation_active &&
         !stage->options->object_record) {
       operation_expires_at_unix =
@@ -17401,7 +17488,16 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
       staged_write_options.suppress_query_index = 1;
       rc = lc_pouch_state_write_resolved_locked(
           stage->pouch, stage->ns, staged_key, body, &staged_write_options,
-          &staged_entry, &manifest, manifest.borrowed, stage->out, error);
+          &staged_entry, &manifest, manifest.borrowed,
+          stage->lease_update ? &lease_append : NULL, stage->out, error);
+      if (rc == LC_OK && stage->lease_update) {
+        lc_pouch_namespace_logstore *cache =
+            lc_pouch_namespace_logstore_find(stage->pouch, stage->ns, 0, NULL);
+        if (cache && cache->initialized &&
+            lc_pouch_state_cache_apply_entry(
+                stage->pouch, cache, &lease_append.entry, NULL) != LC_OK)
+          lc_pouch_state_cache_invalidate_namespace(stage->pouch, stage->ns);
+      }
     }
     if (rc == LC_OK) {
       stage->out->query_index_operation_guard_started =
@@ -17415,10 +17511,12 @@ static int lc_pouch_state_stage_write_prepared_locked(void *context,
   lc_pouch_state_read_result_cleanup(&stage->pouch->allocator, &lease);
   lc_pouch_state_read_result_cleanup(&stage->pouch->allocator, &staged_body);
   lc_pouch_state_read_result_cleanup(&stage->pouch->allocator, &committed_body);
-  if (!staged_entry_transferred) {
-    lc_pouch_state_entry_cleanup(&stage->pouch->allocator, &staged_entry);
-    lc_pouch_namespace_manifest_cleanup(&stage->pouch->allocator, &manifest);
-  }
+  lc_pouch_state_entry_cleanup(&stage->pouch->allocator, &staged_entry);
+  lc_pouch_namespace_manifest_cleanup(&stage->pouch->allocator, &manifest);
+  lc_free_with_allocator(&stage->pouch->allocator, lease_append.encoded);
+  lc_pouch_state_entry_cleanup(&stage->pouch->allocator, &parent_entry);
+  lc_pouch_namespace_manifest_cleanup(&stage->pouch->allocator,
+                                      &parent_manifest);
   lc_pouch_state_read_result_cleanup(&stage->pouch->allocator, &committed);
   if (rc != LC_OK && query_index_guard_started) {
     lc_pouch_query_index_operation_cancel(stage->pouch, stage->ns, stage->key,
@@ -17433,6 +17531,7 @@ int lc_pouch_state_stage_write_prepared(
     lc_pouch_state_write_options *options,
     lc_pouch_state_stage_prepare_fn prepare, void *prepare_context,
     lc_pouch_state_stage_body_prepare_fn body_prepare,
+    const lc_pouch_state_stage_lease *lease_update,
     lc_pouch_state_write_result *out, lc_error *error) {
   lc_pouch_state_prepared_stage_context context;
 
@@ -17441,7 +17540,11 @@ int lc_pouch_state_stage_write_prepared(
       lease_key == NULL || lease_key[0] == '\0' ||
       ((body == NULL && body_prepare == NULL) ||
        (body != NULL && body_prepare != NULL)) ||
-      options == NULL || prepare == NULL || out == NULL) {
+      options == NULL || prepare == NULL || out == NULL ||
+      (lease_update &&
+       (!pouch->storage.ops || strcmp(key, lease_key) != 0 ||
+        options->staged_delete_marker || options->maintenance_completion ||
+        options->maintenance_stream_bytes))) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch prepared stage requires pouch, namespace, key, "
                         "transaction, lease key, body callback, options, "
@@ -17459,6 +17562,7 @@ int lc_pouch_state_stage_write_prepared(
   context.prepare = prepare;
   context.prepare_context = prepare_context;
   context.body_prepare = body_prepare;
+  context.lease_update = lease_update;
   context.out = out;
   return lc_pouch_state_with_namespace_lock(
       pouch, ns, lc_pouch_state_stage_write_prepared_locked, &context, error);

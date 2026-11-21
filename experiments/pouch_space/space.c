@@ -214,7 +214,8 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
  * ticket that precedes the shared barrier, without publishing a journal frame.
  */
 static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
-                          uint64_t *completed, int *synced, lc_error *error) {
+                          uint64_t required_wire, uint64_t *completed,
+                          int *synced, lc_error *error) {
   ps_coordination_guard *leader = NULL, *guard = NULL;
   ps_readiness_certificate certificate;
   uint64_t target = 0, wire = 0, prepared = 0;
@@ -230,11 +231,13 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
     rc = ps_readiness_read(s, &certificate, error);
   if (rc == LC_OK) {
     s->peer_durable = certificate.durable;
-    covered = requested <= s->own_ready_sequence &&
+    covered = certificate.durable >= required_wire &&
+              requested <= s->own_ready_sequence &&
               certificate.durable >= s->own_ready_wire;
     if (covered)
       target = s->own_ready_sequence;
-    else if (ticket && ticket <= certificate.prepared_durable) {
+    else if (ticket && ticket <= certificate.prepared_durable &&
+             certificate.durable >= required_wire) {
       covered = 1;
       /* The ticket follows this owner's completed local prefix. A later
        * local completion can still arrive after the peer's barrier. */
@@ -295,9 +298,9 @@ static int wait_ready(ps_space *s, uint64_t sequence, uint64_t ticket,
     pthread_mutex_unlock(&s->commit_mutex);
     completed = target;
     synced = 1;
-    rc = s->readiness
-             ? shared_durable(s, sequence, ticket, &completed, &synced, error)
-             : sync_file(s, error);
+    rc = s->readiness ? shared_durable(s, sequence, ticket, 0, &completed,
+                                       &synced, error)
+                      : sync_file(s, error);
     pthread_mutex_lock(&s->commit_mutex);
     s->sync_batches += synced;
     if (rc == LC_OK) {
@@ -5703,6 +5706,50 @@ static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
                                   : p->publication_sequence > prefix))
       p = p->previous;
   return p && !p->deleted ? p : NULL;
+}
+int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
+                                               lc_error *error) {
+  ps_coordination_guard *guard;
+  uint64_t prefix, local = 0, peer = 0, completed;
+  size_t i;
+  ps_entry *p;
+  int rc, synced;
+
+  if (!s->readiness)
+    return LC_OK;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
+    for (p = s->buckets[i]; p; p = p->hash_next) {
+      if (p->key.owner != owner ||
+          (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION &&
+           p->key.kind != PS_NAMESPACE_CHECKPOINT) ||
+          (!s->durable && !p->durable_visibility))
+        continue;
+      if (p->peer_sequence) {
+        if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
+          peer = p->peer_sequence;
+      } else if (p->publication_sequence > prefix &&
+                 p->publication_sequence > local) {
+        local = p->publication_sequence;
+      }
+    }
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK || (!local && !peer))
+    return rc;
+  if (!peer)
+    return wait_durable(s, local, error);
+
+  rc = shared_durable(s, local, 0, peer, &completed, &synced, error);
+  pthread_mutex_lock(&s->commit_mutex);
+  ++s->sync_requests;
+  s->sync_batches += synced;
+  pthread_mutex_unlock(&s->commit_mutex);
+  if (rc == LC_OK)
+    mark_durable(s, completed);
+  return rc;
 }
 int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
                             void *buffer, size_t bytes, uint64_t known,

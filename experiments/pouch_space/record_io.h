@@ -15,8 +15,9 @@ typedef struct ps_record_writer {
   ps_stream_writer *writer;
   uint64_t start, tail;
   uint64_t limit; /* zero is unbounded; otherwise an absolute exclusive end */
-  uint64_t frame_length; /* zero is an ordinary canonical append */
+  uint64_t frame_length; /* exact inner length for a bounded frame */
   unsigned long frame_crc;
+  int framed;
   int frame_dirty;
   int failed;
   ps_record_admit_fn admit;
@@ -27,9 +28,9 @@ int ps_record_begin(ps_stream *, ps_record_writer *, lc_error *);
 /* Reserve a known private span without emitting or publishing record bytes. */
 int ps_record_reserve(ps_record_writer *, ps_budget *, uint64_t bytes,
                       lc_error *);
-/* The caller reserves the extra header before beginning this bounded frame.
- * CRC accumulates over appended bytes. Inner canonical fixups trigger a bounded
- * checksum of the final private bytes at commit instead. */
+/* The caller reserves the extra header before starting a frame. A positive
+ * length specifies the exact inner span. Zero takes the span at commit and
+ * combines the finalized prefixes with each producer's stored payload CRC. */
 int ps_record_frame_begin(ps_record_writer *, uint64_t length, lc_error *);
 /* Install once, before the first inner record. The callback borrows the
  * structured header/key/metadata prefix (the first three vectors, optionally

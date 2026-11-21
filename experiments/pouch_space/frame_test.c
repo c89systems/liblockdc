@@ -1,8 +1,11 @@
 #define _GNU_SOURCE
 #include "../../tests/support/lc_test_tmp.h"
+#include "checkpoint_record.h"
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_pouch_storage.h"
 #include "namespace.h"
+#include "namespace_metadata.h"
 #include "owned.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -183,9 +186,11 @@ static size_t produce(lc_source *pub, void *bytes, size_t n, lc_error *e) {
 }
 typedef struct fault {
   int armed;
+  uint64_t read_bytes;
 } fault;
 static ssize_t disk_read(void *context, int fd, void *p, size_t n, off_t at) {
   fault *f = context;
+  f->read_bytes += n;
   if (f->armed) {
     f->armed = 0;
     errno = EIO;
@@ -258,10 +263,12 @@ static int inspect(void *context, uint64_t segment,
   ps_namespace_read_close(window);
   return rc;
 }
-static void writer(const char *path) {
+static void writer(const char *path, int streamed) {
   static const size_t sizes[] = {0, 31, 65569, 131077};
   lc_error e;
   lc_error_init(&e);
+  enum ps_namespace_append_mode mode =
+      streamed ? PS_APPEND_FRAMED_PREFIX : PS_APPEND_COMPLETE;
   for (size_t which = 0; which < sizeof(sizes) / sizeof(sizes[0]); ++which)
     for (int failure = 0; failure < (sizes[which] > PS_CHUNK ? 3 : 1);
          ++failure) {
@@ -283,17 +290,23 @@ static void writer(const char *path) {
       ps_namespace_append_close(append);
       ok(ps_namespace_status_get(ns, &status, &e), &e);
       uint64_t n = status.tail;
-      ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL, &append,
-                                   &e),
-         &e);
+      ok(ps_namespace_append_begin(ns, 0, n, mode, NULL, &append, &e), &e);
       ok(append_body(root, append, sizes[which], 2, &e), &e);
+      if (streamed)
+        ok(append_body(root, append, sizes[which], 3, &e), &e);
       if (failure == 1) {
         allocation = 0;
         fail_allocation = 1;
       }
       if (failure == 2)
         f.armed = 1;
+      f.read_bytes = 0;
       int rc = ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e);
+      if (rc == LC_OK && streamed && sizes[which] > 2 * PS_CHUNK) {
+        /* Footers read the newly written piece bytes once. The frame
+         * checksum can only add bounded prefix reads to that pass. */
+        REQUIRE(f.read_bytes < 2 * sizes[which] + PS_CHUNK / 2);
+      }
       fail_allocation = 0;
       f.armed = 0;
       REQUIRE(rc == (failure == 1   ? LC_ERR_NOMEM
@@ -318,10 +331,10 @@ static void writer(const char *path) {
       } else
         ok(ps_check(ps_root_space(root), &e), &e);
       if (failure) {
-        ok(ps_namespace_append_begin(ns, 0, n, PS_APPEND_COMPLETE, NULL,
-                                     &append, &e),
-           &e);
+        ok(ps_namespace_append_begin(ns, 0, n, mode, NULL, &append, &e), &e);
         ok(append_body(root, append, sizes[which], 2, &e), &e);
+        if (streamed)
+          ok(append_body(root, append, sizes[which], 3, &e), &e);
         ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
         ps_namespace_append_close(append);
       }
@@ -330,7 +343,7 @@ static void writer(const char *path) {
         observer v = {ns, sizes[which], 0, n + PS_FRAME_BYTES};
         ok(ps_namespace_view_open(ns, &view, &e), &e);
         ok(ps_namespace_view_visit(view, 1, inspect, &v, &e), &e);
-        REQUIRE(v.count == 2);
+        REQUIRE(v.count == (streamed ? 3 : 2));
         ps_namespace_view_close(view);
         ps_namespace_release(ns);
         ok(ps_root_close(root, &e), &e);
@@ -346,11 +359,13 @@ static void writer(const char *path) {
 /* Alter bytes through the physical test boundary after releasing all canonical
  * owners. These fixtures deliberately violate producer rules to prove that
  * recovery validates a whole batch before accepting any of its records. */
-static void recovery(const char *path) {
+static void recovery(const char *path, int streamed) {
   lc_error e;
   lc_error_init(&e);
+  enum ps_namespace_append_mode mode =
+      streamed ? PS_APPEND_FRAMED_PREFIX : PS_APPEND_COMPLETE;
   for (int sync = 0; sync < 2; ++sync)
-    for (int damage = 0; damage < 7; ++damage) {
+    for (int damage = 0; damage < (streamed ? 8 : 7); ++damage) {
       ps_root_options o = {0};
       o.storage.durable_sync = sync;
       ps_root *root = NULL;
@@ -372,7 +387,7 @@ static void recovery(const char *path) {
       ok(ps_checkpoint(ps_root_space(root), &e), &e);
       ps_namespace_view *pin = NULL;
       ok(ps_namespace_view_open(ns, &pin, &e), &e);
-      ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE, NULL,
+      ok(ps_namespace_append_begin(ns, 0, streamed ? n : 2 * n, mode, NULL,
                                    &append, &e),
          &e);
       ok(append_body(root, append, 0, 2, &e), &e);
@@ -417,7 +432,8 @@ static void recovery(const char *path) {
       REQUIRE(h.type == PS_FRAME_TYPE && h.payload_len == 2 * n);
       /* 1/4: invalid CRC; 2/5: malformed final inner record with valid CRC.
        * 3: checkpoint inside an otherwise valid complete frame.
-       * 4/5/6: the entire frame belongs to the trusted checkpoint prefix. */
+       * 4/5/6: the entire frame belongs to the trusted checkpoint prefix.
+       * 7: both inner records reached disk before the envelope was patched. */
       if (damage == 1 || damage == 4)
         batch[bytes - 1] ^= 1;
       if (damage == 2 || damage == 5) {
@@ -425,9 +441,11 @@ static void recovery(const char *path) {
         h.payload_crc = crc32(0L, batch + PS_FRAME_BYTES, (uInt)(2 * n));
         lc_pouch_record_header_encode(&h, batch);
       }
+      if (damage == 7)
+        memset(batch, 0, PS_FRAME_BYTES);
       ok(ps_owned_write(run, n, batch, bytes, &e), &e);
       free(batch);
-      if (damage >= 3) {
+      if (damage >= 3 && damage <= 6) {
         ok(ps_owned_commit(head,
                            damage == 3 ? n + PS_FRAME_BYTES + n : n + bytes,
                            PS_COMMIT_DEFAULT, NULL, NULL, &e),
@@ -450,16 +468,17 @@ static void recovery(const char *path) {
       ok(rc, &e);
       ok(ps_root_namespace_acquire(root, "frame", 0, &ns, &e), &e);
       ok(ps_namespace_status_get(ns, &status, &e), &e);
-      REQUIRE(status.tail == (damage == 1 || damage == 2 ? n : n + bytes));
+      int discarded = damage == 1 || damage == 2 || damage == 7;
+      REQUIRE(status.tail == (discarded ? n : n + bytes));
       ps_namespace_view *view = NULL;
       v.count = 0;
       v.ns = ns;
       ok(ps_namespace_view_open(ns, &view, &e), &e);
       ok(ps_namespace_view_visit(view, 1, inspect, &v, &e), &e);
-      REQUIRE(v.count == (damage == 1 || damage == 2 ? 1 : 3));
+      REQUIRE(v.count == (discarded ? 1 : 3));
       ps_namespace_view_close(view);
-      if (damage == 1 || damage == 2) {
-        ok(ps_namespace_append_begin(ns, 0, 2 * n, PS_APPEND_COMPLETE, NULL,
+      if (discarded) {
+        ok(ps_namespace_append_begin(ns, 0, streamed ? n : 2 * n, mode, NULL,
                                      &append, &e),
            &e);
         ok(append_body(root, append, 0, 2, &e), &e);
@@ -469,7 +488,7 @@ static void recovery(const char *path) {
       }
       ps_namespace_release(ns);
       ok(ps_root_close(root, &e), &e);
-      if (damage == 1 || damage == 2) {
+      if (discarded) {
         ok(ps_root_open(path, 0, &o, &root, &e), &e);
         ok(ps_root_namespace_acquire(root, "frame", 0, &ns, &e), &e);
         ps_namespace_view *view = NULL;
@@ -486,6 +505,102 @@ static void recovery(const char *path) {
     }
   lc_error_cleanup(&e);
 }
+static int handoff_prefix(void *context, size_t index,
+                          lc_pouch_record_header *header, const void **key,
+                          const void **metadata, lc_error *e) {
+  ps_checkpoint_record *record = context;
+  REQUIRE(index == 0);
+  int rc = lc_pouch_record_header_decode(record->bytes, header, e);
+  if (rc == LC_OK) {
+    *key = record->bytes + LC_POUCH_RECORD_HEADER_BYTES;
+    *metadata = (const unsigned char *)*key + header->key_len;
+  }
+  return rc;
+}
+typedef struct handoff_seen {
+  size_t body, marker, suffix;
+} handoff_seen;
+static int inspect_handoff(void *context, uint64_t segment,
+                           const lc_pouch_state_entry *entry, lc_error *e) {
+  handoff_seen *seen = context;
+  (void)e;
+  if (entry->control)
+    return LC_OK;
+  REQUIRE(entry->found);
+  if (!strcmp(entry->key, "key")) {
+    REQUIRE(entry->version == 1 && entry->payload_span.present);
+    ++seen->body;
+    if (segment)
+      ++seen->suffix;
+  } else {
+    REQUIRE(!strcmp(entry->key, "marker") && !segment && entry->version == 1);
+    ++seen->marker;
+  }
+  return LC_OK;
+}
+static void checkpoint_handoff(const char *path, int return_to_owner) {
+  ps_root *root = NULL, *peer = NULL;
+  ps_namespace *ns = NULL, *other = NULL;
+  ps_namespace_append *append = NULL;
+  ps_namespace_metadata *metadata = NULL;
+  ps_namespace_view *view = NULL;
+  ps_checkpoint_record record = {0};
+  lc_pouch_state_entry marker = {0};
+  lc_error e = {0};
+  ps_root_options o = {0};
+  o.storage.shared = o.storage.durable_sync = 1;
+  ok(ps_root_open(path, 1, &o, &root, &e), &e);
+  ok(ps_root_open(path, 0, &o, &peer, &e), &e);
+  ok(ps_root_namespace_acquire(root, "handoff", 1, &ns, &e), &e);
+  ok(ps_root_namespace_acquire(peer, "handoff", 0, &other, &e), &e);
+
+  ok(ps_namespace_append_begin(ns, 0, 512, PS_APPEND_FRAMED_PREFIX, NULL,
+                               &append, &e),
+     &e);
+  ok(append_body(root, append, 1027, 1, &e), &e);
+  ok(ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, &e), &e);
+  ps_namespace_append_close(append);
+  marker.key = "marker";
+  marker.found = marker.seen = marker.has_query_index_seq = 1;
+  marker.index_seq = 2;
+  marker.version = 1;
+  marker.record_type = LC_POUCH_STATE_RECORD_STATE_META;
+  marker.content_type = "application/test";
+  marker.etag = "";
+  ok(ps_checkpoint_record_encode(NULL, &marker, &record, &e), &e);
+  lc_pouch_storage_batch batch = {1, handoff_prefix, &record};
+  ok(ps_namespace_metadata_begin(ns, 0, &batch, record.length, &metadata, &e),
+     &e);
+  ok(ps_namespace_metadata_commit(metadata, &batch, PS_COMMIT_DEFER_SYNC, &e),
+     &e);
+  ps_namespace_metadata_close(metadata);
+  ps_checkpoint_record_close(&record);
+
+  handoff_seen seen = {0};
+  ok(ps_namespace_view_open(other, &view, &e), &e);
+  ok(ps_namespace_view_visit(view, 1, inspect_handoff, &seen, &e), &e);
+  REQUIRE(seen.body == 1 && seen.suffix == 1 && seen.marker == 0);
+  ps_namespace_view_close(view);
+  ok(ps_namespace_checkpoint_flush(return_to_owner ? ns : other, &e), &e);
+  for (int cold = 0; cold < 2; ++cold) {
+    memset(&seen, 0, sizeof(seen));
+    ok(ps_namespace_view_open(other, &view, &e), &e);
+    ok(ps_namespace_view_visit(view, 1, inspect_handoff, &seen, &e), &e);
+    REQUIRE(seen.body == 1 && seen.suffix == 0 && seen.marker == 1);
+    ps_namespace_view_close(view);
+    ps_namespace_release(other);
+    if (!cold) {
+      ps_namespace_release(ns);
+      ok(ps_root_close(root, &e), &e);
+      ok(ps_root_close(peer, &e), &e);
+      ok(ps_root_open(path, 0, &o, &peer, &e), &e);
+      ok(ps_root_namespace_acquire(peer, "handoff", 0, &other, &e), &e);
+    }
+  }
+  ok(ps_root_close(peer, &e), &e);
+  REQUIRE(!unlink(path));
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *mode, *path;
 } run;
@@ -493,11 +608,16 @@ static void *worker(void *context) {
   run *r = context;
   if (!strcmp(r->mode, "codec"))
     codec();
-  else if (!strcmp(r->mode, "recovery"))
-    recovery(r->path);
-  else {
+  else if (!strcmp(r->mode, "recovery")) {
+    recovery(r->path, 0);
+    recovery(r->path, 1);
+  } else if (!strcmp(r->mode, "checkpoint-handoff")) {
+    checkpoint_handoff(r->path, 0);
+    checkpoint_handoff(r->path, 1);
+  } else {
     REQUIRE(!strcmp(r->mode, "writer"));
-    writer(r->path);
+    writer(r->path, 0);
+    writer(r->path, 1);
   }
   return NULL;
 }

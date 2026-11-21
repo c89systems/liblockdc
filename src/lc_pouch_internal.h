@@ -166,6 +166,14 @@ typedef int (*lc_pouch_state_stage_body_prepare_fn)(
     const lc_pouch_state_read_result *staged, void *context, lc_source **body,
     lc_error *error);
 
+/* Populated by stage preparation for a typed same-key lease write. The
+ * namespace authority pins the lease identity until publication. */
+typedef struct lc_pouch_state_stage_lease {
+  const unsigned char *metadata;
+  size_t metadata_length;
+  lc_pouch_unix_seconds expires_at;
+} lc_pouch_state_stage_lease;
+
 typedef int (*lc_pouch_state_scan_summary_visit_fn)(
     const lc_pouch_state_scan_summary_entry *entry, void *context,
     lc_error *error);
@@ -666,6 +674,7 @@ int lc_pouch_state_stage_write_prepared(
     lc_pouch_state_write_options *options,
     lc_pouch_state_stage_prepare_fn prepare, void *prepare_context,
     lc_pouch_state_stage_body_prepare_fn body_prepare,
+    const lc_pouch_state_stage_lease *lease_update,
     lc_pouch_state_write_result *out, lc_error *error);
 /**
  * Stages metadata-only state while preserving the selected transaction-local

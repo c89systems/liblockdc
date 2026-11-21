@@ -33,33 +33,70 @@ void ps_record_abort(ps_record_writer *out) {
 int ps_record_frame_begin(ps_record_writer *out, uint64_t length, lc_error *e) {
   unsigned char bytes[PS_FRAME_BYTES] = {0};
   int rc;
-  if (!out || !out->writer || out->failed || out->frame_length || !length ||
-      out->tail != out->start ||
+  if (!out || !out->writer || out->failed || out->framed ||
+      out->tail != out->start || out->start > UINT64_MAX - PS_FRAME_BYTES ||
       length > UINT64_MAX - PS_FRAME_BYTES - out->start)
-    return record_error(e, "batch frame requires a new bounded append");
+    return record_error(e, "batch frame requires a new append");
   rc = ps_stream_write(out->writer, bytes, sizeof(bytes), e);
   if (rc == LC_OK) {
     out->tail += sizeof(bytes);
+    out->framed = 1;
     out->frame_length = length;
   }
   return rc;
 }
+static int streaming_frame_crc(ps_record_writer *out, uint64_t length,
+                               lc_error *e) {
+  lc_pouch_record_header h;
+  unsigned char bytes[LC_POUCH_RECORD_HEADER_BYTES];
+  unsigned long crc = 0, prefix_crc;
+  uint64_t offset = PS_FRAME_BYTES, prefix, end = offset + length;
+  int rc;
+
+  while (offset < end) {
+    if (end - offset < sizeof(bytes))
+      return record_error(e, "streamed frame has an incomplete prefix");
+    rc = ps_stream_writer_read(out->writer, offset, bytes, sizeof(bytes), e);
+    if (rc == LC_OK)
+      rc = lc_pouch_record_header_decode(bytes, &h, e);
+    if (rc != LC_OK)
+      return rc;
+    prefix = sizeof(bytes) + (uint64_t)h.key_len + h.meta_len;
+    if (h.flags || h.type == PS_FRAME_TYPE || prefix > end - offset ||
+        h.payload_len > end - offset - prefix || h.payload_len > INT64_MAX)
+      return record_error(e, "streamed frame has an invalid record span");
+    rc = ps_stream_writer_crc(out->writer, offset, prefix, &prefix_crc, e);
+    if (rc != LC_OK)
+      return rc;
+    crc = (unsigned long)crc32_combine(crc, prefix_crc, (z_off_t)prefix);
+    if (h.payload_len)
+      crc = (unsigned long)crc32_combine(crc, h.payload_crc,
+                                         (z_off_t)h.payload_len);
+    offset += prefix + h.payload_len;
+  }
+  out->frame_crc = crc;
+  return LC_OK;
+}
 static int frame_finish(ps_record_writer *out, lc_error *e) {
   lc_pouch_record_header header;
   unsigned char bytes[PS_FRAME_BYTES];
+  uint64_t length;
   int rc = LC_OK;
-  if (!out->frame_length)
+  if (!out->framed)
     return LC_OK;
-  if (out->tail - out->start - PS_FRAME_BYTES != out->frame_length)
+  length = out->tail - out->start - PS_FRAME_BYTES;
+  if (!length || (out->frame_length && length != out->frame_length))
     return record_error(e, "batch frame differs from its declared span");
-  if (out->frame_dirty)
-    rc = ps_stream_writer_crc(out->writer, PS_FRAME_BYTES, out->frame_length,
+  if (!out->frame_length)
+    rc = streaming_frame_crc(out, length, e);
+  else if (out->frame_dirty)
+    rc = ps_stream_writer_crc(out->writer, PS_FRAME_BYTES, length,
                               &out->frame_crc, e);
   if (rc != LC_OK)
     return rc;
   memset(&header, 0, sizeof(header));
   header.type = PS_FRAME_TYPE;
-  header.payload_len = out->frame_length;
+  header.payload_len = length;
   header.payload_crc = out->frame_crc;
   lc_pouch_record_header_encode(&header, bytes);
   return ps_stream_write_at(out->writer, 0, bytes, sizeof(bytes), e);
@@ -158,7 +195,7 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
   uint64_t end = offset, record_end = 0;
   int i, rc = LC_OK;
   if (!out || !out->writer || out->failed ||
-      offset < out->start + (out->frame_length ? PS_FRAME_BYTES : 0) ||
+      offset < out->start + (out->framed ? PS_FRAME_BYTES : 0) ||
       offset > out->tail)
     return record_error(e, "canonical patch outside private append");
   for (i = 0; i < count; ++i) {
@@ -201,7 +238,7 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
 int ps_record_admission_set(ps_record_writer *out, ps_record_admit_fn admit,
                             void *context, lc_error *e) {
   if (!out || !out->writer || out->failed || !admit || out->admit ||
-      out->tail != out->start + (out->frame_length ? PS_FRAME_BYTES : 0))
+      out->tail != out->start + (out->framed ? PS_FRAME_BYTES : 0))
     return record_error(e, "canonical admission requires a new private append");
   out->admit = admit;
   out->admission_context = context;

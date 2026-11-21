@@ -254,6 +254,10 @@ int ps_internal_stream_claim(ps_space *, uint64_t, ps_coordination_guard **,
 /* Caller holds the namespace-name guard while checking and claiming its
  * immutable catalog owner's writer stamp. */
 int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);
+/* Under namespace edit authority, settle any visibility required by its
+ * already framed checkpoint slots before replay can assign slot identities. */
+int ps_internal_namespace_checkpoint_stabilize(ps_space *, uint64_t,
+                                               lc_error *);
 int ps_internal_entry_pin(ps_space *, ps_entry *, lc_error *);
 void ps_internal_entry_unpin(ps_space *, ps_entry *);
 /* Refresh the peer prefix and free ranges before changing local reservations.

@@ -1179,24 +1179,26 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   ps_budget_plan checkpoint = {0};
   int rc, exact = 0;
   int complete = mode == PS_APPEND_COMPLETE || mode == PS_APPEND_MAINTENANCE;
+  int framed = complete || mode == PS_APPEND_FRAMED_PREFIX;
   int maintenance =
       mode == PS_APPEND_MAINTENANCE || mode == PS_APPEND_MAINTENANCE_PREFIX;
   if (out)
     *out = NULL;
   if (!out)
     return failure(e, LC_ERR_INVALID, "namespace append requires output");
-  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_MAINTENANCE_PREFIX ||
+  if (mode < PS_APPEND_PREFIX || mode > PS_APPEND_FRAMED_PREFIX ||
       (mode != PS_APPEND_PREFIX && !minimum) ||
-      (batch && mode == PS_APPEND_PREFIX) ||
+      (batch &&
+       (mode == PS_APPEND_PREFIX || mode == PS_APPEND_FRAMED_PREFIX)) ||
       (mode == PS_APPEND_MAINTENANCE_PREFIX && !batch))
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
   if (minimum > (uint64_t)INT64_MAX ||
-      (complete && minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
+      (framed && minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
-  span = complete ? minimum + PS_FRAME_BYTES : minimum;
+  span = framed ? minimum + PS_FRAME_BYTES : minimum;
   rc = data_get(ns, &d, 0, e);
   if (rc != LC_OK)
     return rc;
@@ -1252,10 +1254,10 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     append->leaf = s->leaf;
     append->complete = complete;
     append->expected = span;
-    if (rc == LC_OK && mode != PS_APPEND_PREFIX)
+    if (rc == LC_OK && (complete || mode == PS_APPEND_MAINTENANCE_PREFIX))
       append->writer.limit = append->writer.start + span;
-    if (rc == LC_OK && append->complete)
-      rc = ps_record_frame_begin(&append->writer, minimum, e);
+    if (rc == LC_OK && framed)
+      rc = ps_record_frame_begin(&append->writer, complete ? minimum : 0, e);
     if (rc == LC_OK)
       rc = ps_checkpoint_delta_bind(append->delta, &append->writer, s->id,
                                     s->leaf, e);
@@ -1782,6 +1784,13 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   int rc, attempt, unchanged = 0;
   if (d->checkpoint_ready)
     return LC_OK;
+  /* Observation can select the older durable seed while a release or a
+   * partial checkpoint has already framed newer key slots. A writer must
+   * adopt those identities before allocating slots from the stream suffix. */
+  rc = ps_internal_namespace_checkpoint_stabilize(d->ns->root->space,
+                                                  d->ns->identity.owner, e);
+  if (rc != LC_OK)
+    return rc;
   for (attempt = 0;; ++attempt) {
     rc = view_open(d->ns, NULL, d->replay_segment, d->replay_offset, &view, e);
     if (rc != LC_OK)

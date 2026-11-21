@@ -105,7 +105,9 @@ enum lc_pouch_storage_append_mode {
   LC_POUCH_STORAGE_APPEND_COMPLETE,
   LC_POUCH_STORAGE_APPEND_MAINTENANCE,
   /* A bounded pending record with a funded key prefix and codec ceiling. */
-  LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX
+  LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX,
+  /* Unknown remaining payload in one indivisible canonical frame. */
+  LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX
 };
 /* Known canonical prefixes, borrowed only during append admission. No producer
  * or payload I/O runs in this callback. Query/index values may change later;
@@ -204,7 +206,8 @@ typedef struct lc_pouch_storage_ops {
   /* Rotation target and known span. PREFIX permits an unknown remainder;
    * COMPLETE requires the declared size, MAINTENANCE additionally permits
    * spending protected work capacity. Reserve all dependencies before staging.
-   * Both are indivisible recovery units. The declared span contains canonical
+   * COMPLETE, MAINTENANCE and FRAMED_PREFIX are indivisible recovery units.
+   * The declared span contains canonical
    * bytes only; storage accounts for its envelope in reservation and rotation.
    */
   int (*append_begin)(void *, void *, uint64_t, uint64_t,
