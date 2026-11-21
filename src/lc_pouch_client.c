@@ -12100,9 +12100,14 @@ static int lc_pouch_txn_apply_state_participant(
   context.state = state;
   context.commit_at_unix = commit_at_unix;
 
-  rc = lc_pouch_state_with_namespace_lock(
-      client->pouch, ns, lc_pouch_txn_apply_state_participant_locked, &context,
-      error);
+  if (lease != NULL)
+    rc = lc_pouch_state_with_namespace_durable_batch(
+        client->pouch, ns, lc_pouch_txn_apply_state_participant_locked,
+        &context, error);
+  else
+    rc = lc_pouch_state_with_namespace_lock(
+        client->pouch, ns, lc_pouch_txn_apply_state_participant_locked,
+        &context, error);
   if (rc == LC_OK) {
     lc_pouch_compaction_note_mutation(client->pouch, ns, 1);
   }

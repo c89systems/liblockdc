@@ -10453,3 +10453,68 @@ stream repair, fixed-capacity leases and outbox recovery.
 
 Raw runs and test logs are under `mutation-barrier-` and
 `shared-preparation-` in `build/pouch-space-concurrent/`.
+
+## One durability barrier for native lease release
+
+Two traced 240-item durable indexed runs published four key metadata
+revisions per lease cycle. Acquire published one, the staged version
+cursor published one, and release published two. The release revisions
+issued 472–477 syncs per run. Explicit index flush issued 23 revision
+syncs per run.
+
+Release without a separate transaction coordinator applies the parent
+decision, applies staged attachments, and clears the lease under one
+namespace authority. Native durable release now defers the metadata
+syncs in that sequence to the existing root completion barrier. It
+finishes under the namespace lock, and an error still attempts to
+persist any completed prefix. Each revision retains its publication
+order and durability fence. A peer barrier can cover an earlier
+revision before release finishes. Forced storage barriers and journal
+rollover retain their own boundaries. The scope starts after staged
+decision recovery and uses the existing durability policy if an outer
+group owns completion.
+
+The deterministic fixture previously observed two release syncs on the
+ordinary path. It now observes one across 14 cases covering commit,
+rollback, plaintext, combined encryption and compression with a staged
+attachment, loss of the last sync, loss of its acknowledgement, and an
+interruption at the lease-clear revision. Cold reopen verifies the
+selected parent and attachment state and the lease fence. If the last
+sync fails before persisting, recovery retains the old lease and stage.
+An interruption at clear keeps the old lease and the applied parent
+decision. A durable clear permits a replacement before a retry.
+Replaying the old credentials settles an unfinished release and
+leaves a replacement holder in place.
+
+All 48 matched GNU workflows verified. Each native build used a fixed
+10 MiB container. Each build ran four samples per indexed profile and
+two per messaging profile. Tables give medians in milliseconds in the
+order prior native (`9a7a5a46`), revised native, multifile. Grouped reopen
+includes the cold owner and later live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 1049.07 / 1115.09 / 1214.69 | 45.82 / 57.35 / 28.05 | 4.57 / 20.06 / 0.87 | 9.27 / 10.05 / 0.81 | 5.21 / 5.74 / 6.48 |
+| NoSync indexed, 20 MiB | 2121.49 / 2174.93 / 1965.50 | 63.39 / 62.07 / 28.82 | 19.70 / 23.71 / 1.08 | 12.82 / 12.29 / 0.79 | 7.42 / 6.84 / 9.59 |
+| Durable indexed, 15 MiB | 5379.69 / 5121.25 / 4878.06 | 72.20 / 70.51 / 57.89 | 6.94 / 4.53 / 0.78 | 7.70 / 7.74 / 0.61 | 5.52 / 5.34 / 6.97 |
+| Warmed NoSync queue | 9.06 / 11.05 / 73.11 | 1.67 / 2.07 / 13.84 | 0.28 / 0.30 / 0.05 | 2.73 / 3.10 / 0.33 | 0.29 / 0.28 / 0.48 |
+| Durable outbox | 887.94 / 875.23 / 1307.43 | 189.31 / 175.02 / 247.26 | 0.51 / 0.55 / 0.33 | 28.08 / 42.66 / 85.50 | 57.25 / 54.50 / 128.82 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 12 MiB | 206.45 / 197.67 / 283.11 | 57.74 / 40.85 / 157.71 | 23.17 / 18.90 / 227.24 | 0.78 / 0.79 / 1.08 |
+| NoSync indexed, 20 MiB | 277.41 / 266.85 / 440.61 | 83.01 / 85.61 / 265.49 | 32.59 / 28.05 / 288.81 | 1.22 / 1.09 / 1.69 |
+| Durable indexed, 15 MiB | 132.29 / 118.19 / 171.12 | 6.25 / 9.59 / 146.06 | 2.57 / 7.73 / 145.38 | 0.48 / 0.40 / 0.70 |
+
+Durable indexed mutation workers issued a median of 1174 syncs, down
+from 1408.5, a 17% reduction. Work improved in three of four matched
+pairs and the median fell by 4.8%. Indexed mutation tails and grouped
+open and close remain qualification work, especially under heavy
+NoSync churn. The queue and outbox results retain their steady-state
+advantage in this sample.
+
+Targeted verification passed 35 GNU Release, 18 Debug ASan/UBSan and
+22 musl Release groups. All three builds passed the final release fault
+fixture with replacement-holder and stale-retry checks. Raw traces,
+matched runs and test logs are under `durable-revisions-` and
+`release-barrier-` in `build/pouch-space-concurrent/`.

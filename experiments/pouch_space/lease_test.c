@@ -1546,6 +1546,160 @@ static void restore_disk(disk_model *m, const char *path) {
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
   m->freeze = 0;
 }
+enum release_barrier_outcome {
+  RELEASE_DURABLE,
+  RELEASE_LOST_SYNC,
+  RELEASE_LOST_ACK,
+  RELEASE_INTERRUPTED_CLEAR
+};
+typedef struct release_disk {
+  disk_model disk;
+  enum release_barrier_outcome outcome;
+  int release_armed;
+  size_t release_syncs, revisions;
+} release_disk;
+static int release_barrier_sync(void *context, int fd) {
+  release_disk *disk = context;
+  if (!disk->release_armed)
+    return disk_sync(&disk->disk, fd);
+  ++disk->release_syncs;
+  if (disk->outcome != RELEASE_LOST_SYNC)
+    REQUIRE(!disk_sync(&disk->disk, fd));
+  if (disk->outcome == RELEASE_DURABLE ||
+      disk->outcome == RELEASE_INTERRUPTED_CLEAR)
+    return 0;
+  errno = EIO;
+  return -1;
+}
+static int interrupt_lease_clear(void *context, lc_error *e) {
+  release_disk *disk = context;
+  if (++disk->revisions != 2)
+    return LC_OK;
+  return lc_error_set(e, LC_ERR_TRANSPORT, 0, "interrupted lease clear", NULL,
+                      NULL, "test");
+}
+static void release_barrier_case(const char *directory, int crypto,
+                                 int rollback,
+                                 enum release_barrier_outcome outcome) {
+  release_disk disk = {0};
+  disk.outcome = outcome;
+  disk.disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+  disk.disk.dirty = calloc(1, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
+  disk.disk.scratch = malloc(PS_PAGE);
+  fixture *f = calloc(1, sizeof(*f));
+  REQUIRE(disk.disk.stable && disk.disk.dirty && disk.disk.scratch && f);
+  ps_io io = {&disk,        disk_read, disk_write, release_barrier_sync,
+              disk_reserve, NULL};
+  lc_error e = {0};
+  now(1000);
+  setup_io(f, directory, 0, 1, crypto, &io, &e);
+  lc_lease *lease = acquire(f, "order", NULL, &e);
+  payload(lease, NULL, &e);
+  parent(f, "order", 0, 0, &e);
+  if (crypto) {
+    lc_attach_req attach;
+    lc_attach_res result = {0};
+    lc_attach_req_init(&attach);
+    attach.name = "receipt.txt";
+    attach.content_type = "text/plain";
+    producer receipt = source("staged receipt streamed under the lease");
+    receipt.pub.impl = &receipt;
+    ok(lc_lease_attach(lease, &attach, &receipt.pub, &result, &e), &e);
+    REQUIRE(receipt.at == receipt.length);
+    lc_attach_res_cleanup(&result);
+  }
+  lc_release_req options;
+  lc_release_op retry;
+  lc_release_req_init(&options);
+  lc_release_op_init(&retry);
+  options.rollback = retry.rollback = rollback;
+  retry.lease.ns = "orders";
+  retry.lease.key = "order";
+  char *id = strdup(lease->lease_id), *txn = strdup(lease->txn_id);
+  REQUIRE(id && txn);
+  retry.lease.lease_id = id;
+  retry.lease.txn_id = txn;
+  retry.lease.fencing_token = lease->fencing_token;
+  if (outcome == RELEASE_INTERRUPTED_CLEAR) {
+    lc_pouch_test_after_metadata_batch_append_context = &disk;
+    lc_pouch_test_after_metadata_batch_append_hook = interrupt_lease_clear;
+  }
+  disk.release_armed = 1;
+  int rc = lc_lease_release(lease, &options, &e);
+  disk.release_armed = 0;
+  if (outcome == RELEASE_INTERRUPTED_CLEAR) {
+    lc_pouch_test_after_metadata_batch_append_hook = NULL;
+    lc_pouch_test_after_metadata_batch_append_context = NULL;
+    REQUIRE(disk.revisions == 2 && e.message &&
+            !strcmp(e.message, "interrupted lease clear"));
+  }
+  REQUIRE(disk.release_syncs == 1);
+  if (outcome == RELEASE_DURABLE)
+    ok(rc, &e);
+  else {
+    REQUIRE(rc == LC_ERR_TRANSPORT);
+    lc_lease_close(lease);
+    clear(&e);
+  }
+  disk.disk.freeze = 1;
+  close_store(f);
+  restore_disk(&disk.disk, f->path);
+  open_store(f, 0, &e);
+  int applied = outcome != RELEASE_LOST_SYNC && !rollback;
+  parent(f, "order", applied, 0, &e);
+  if (crypto)
+    attachments(f, "order", applied, &e);
+  int held =
+      outcome == RELEASE_LOST_SYNC || outcome == RELEASE_INTERRUPTED_CLEAR;
+  lc_acquire_req contender;
+  lc_acquire_req_init(&contender);
+  contender.key = "order";
+  contender.owner = "contender";
+  contender.ttl_seconds = 300;
+  lc_lease *blocked = NULL;
+  if (held) {
+    REQUIRE(lc_acquire(f->client, &contender, &blocked, &e) == LC_ERR_INVALID &&
+            !blocked && e.message &&
+            !strcmp(e.message, "pouch lease already held"));
+    clear(&e);
+  } else
+    lease = acquire(f, "order", NULL, &e);
+  lc_release_res result = {0};
+  ok(lc_release(f->client, &retry, &result, &e), &e);
+  REQUIRE(result.released);
+  lc_release_res_cleanup(&result);
+  parent(f, "order", !rollback, 0, &e);
+  if (crypto)
+    attachments(f, "order", !rollback, &e);
+  if (held)
+    lease = acquire(f, "order", NULL, &e);
+  REQUIRE(lease->fencing_token > retry.lease.fencing_token);
+  REQUIRE(lc_acquire(f->client, &contender, &blocked, &e) == LC_ERR_INVALID &&
+          !blocked && e.message &&
+          !strcmp(e.message, "pouch lease already held"));
+  clear(&e);
+  ok(lc_lease_release(lease, NULL, &e), &e);
+  close_store(f);
+  retire(f);
+  free(id);
+  free(txn);
+  free(f);
+  free(disk.disk.stable);
+  free(disk.disk.dirty);
+  free(disk.disk.scratch);
+  lc_error_cleanup(&e);
+}
+static void release_barrier(const char *directory) {
+  shared_lease_fixture = 1;
+  for (int crypto = 0; crypto <= 3; crypto += 3)
+    for (int rollback = 0; rollback < 2; ++rollback)
+      for (enum release_barrier_outcome outcome = RELEASE_DURABLE;
+           outcome <= RELEASE_LOST_ACK; ++outcome)
+        release_barrier_case(directory, crypto, rollback, outcome);
+  release_barrier_case(directory, 0, 0, RELEASE_INTERRUPTED_CLEAR);
+  release_barrier_case(directory, 0, 1, RELEASE_INTERRUPTED_CLEAR);
+  shared_lease_fixture = 0;
+}
 static int selected_commit(fixture *f, lc_error *e) {
   lc_pouch_retention_work work = {0};
   lc_pouch_state_read_result parent_state = {0}, journal = {0};
@@ -1752,6 +1906,8 @@ static void *worker(void *context) {
     phase_failures(r->directory);
   else if (!strcmp(r->mode, "policy"))
     lease_policy(r->directory);
+  else if (!strcmp(r->mode, "release-barrier"))
+    release_barrier(r->directory);
   else if (!strcmp(r->mode, "shared-authority")) {
     shared_lease(r->directory);
     shared_wait_for_retention(r->directory);

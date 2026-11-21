@@ -3235,7 +3235,7 @@ static int lc_pouch_state_finish_commit_group_after_mutation(
 }
 
 static int lc_pouch_state_with_namespace_lock_mode(
-    lc_pouch *pouch, const char *ns, int wait,
+    lc_pouch *pouch, const char *ns, int wait, int batch_durability,
     lc_pouch_state_precondition_fn callback, void *context, lc_error *error) {
   lc_pouch_state_commit_group *commit_group;
   lc_pouch_state_namespace_lock lock;
@@ -3267,8 +3267,15 @@ static int lc_pouch_state_with_namespace_lock_mode(
     return rc;
   }
   rc = lc_pouch_state_recover_staged_decisions_locked(pouch, ns, error);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    /* A typed store can publish a series of metadata revisions under this
+     * authority and cover them with one root barrier before releasing it.
+     * Leave an enclosing owner's durability policy to that owner. */
+    if (batch_durability && owns_commit_group && pouch->storage.ops &&
+        pouch->durable_sync)
+      commit_group->force_sync = 1;
     rc = callback(context, error);
+  }
   rc = lc_pouch_state_finish_commit_group(commit_group, owns_commit_group, rc,
                                           error);
   if (rc != LC_OK) {
@@ -3281,13 +3288,19 @@ static int lc_pouch_state_with_namespace_lock_mode(
 int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
                                        lc_pouch_state_precondition_fn callback,
                                        void *context, lc_error *error) {
-  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 1, callback,
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 1, 0, callback,
+                                                 context, error);
+}
+int lc_pouch_state_with_namespace_durable_batch(
+    lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
+    void *context, lc_error *error) {
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 1, 1, callback,
                                                  context, error);
 }
 int lc_pouch_state_try_with_namespace_lock(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error) {
-  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 0, callback,
+  return lc_pouch_state_with_namespace_lock_mode(pouch, ns, 0, 0, callback,
                                                  context, error);
 }
 
