@@ -5073,6 +5073,117 @@ static void maintenance_piece_concurrency(const char *path,
   }
   lc_error_cleanup(&e);
 }
+typedef struct maintenance_shutdown {
+  io_fault io;
+  lc_pouch *pouch;
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  int abrupt, hold_sync, saw_map, entered, release;
+  size_t later_syncs;
+} maintenance_shutdown;
+static void maintenance_shutdown_hold(maintenance_shutdown *stop) {
+  pthread_mutex_lock(&stop->mutex);
+  REQUIRE(!stop->entered);
+  stop->entered = 1;
+  pthread_cond_broadcast(&stop->changed);
+  while (!__atomic_load_n(&stop->release, __ATOMIC_ACQUIRE))
+    pthread_cond_wait(&stop->changed, &stop->mutex);
+  pthread_mutex_unlock(&stop->mutex);
+}
+static ssize_t maintenance_shutdown_write(void *context, int fd, const void *p,
+                                          size_t n, off_t at) {
+  maintenance_shutdown *stop = context;
+  if (n >= 8 && !memcmp(p, "LCPSMAPR", 8) &&
+      !__atomic_exchange_n(&stop->saw_map, 1, __ATOMIC_ACQ_REL)) {
+    if (!stop->hold_sync)
+      maintenance_shutdown_hold(stop);
+  }
+  return io_write(&stop->io, fd, p, n, at);
+}
+static int maintenance_shutdown_sync(void *context, int fd) {
+  maintenance_shutdown *stop = context;
+  if (__atomic_load_n(&stop->release, __ATOMIC_ACQUIRE))
+    __atomic_fetch_add(&stop->later_syncs, 1, __ATOMIC_RELAXED);
+  else if (stop->hold_sync && __atomic_load_n(&stop->saw_map, __ATOMIC_ACQUIRE))
+    maintenance_shutdown_hold(stop);
+  return io_sync(&stop->io, fd);
+}
+static void *shutdown_maintenance_owner(void *context) {
+  maintenance_shutdown *stop = context;
+  if (stop->abrupt) {
+    lc_error e = {0};
+    ok(lc_pouch_abort(stop->pouch, &e), &e);
+    lc_error_cleanup(&e);
+  }
+  lc_pouch_close(stop->pouch);
+  return NULL;
+}
+static void maintenance_close(const char *path, int durable, int hold_sync,
+                              int abrupt) {
+  maintenance_shutdown stop = {.mutex = PTHREAD_MUTEX_INITIALIZER,
+                               .changed = PTHREAD_COND_INITIALIZER,
+                               .abrupt = abrupt,
+                               .hold_sync = hold_sync};
+  ps_io io = {&stop,
+              read_fail,
+              maintenance_shutdown_write,
+              maintenance_shutdown_sync,
+              io_reserve,
+              NULL};
+  ps_pouch_state_options o = shared_options(0, durable);
+  lc_pouch *p = NULL;
+  lc_error e = {0};
+  ps_namespace *ns = NULL;
+  pthread_t closer;
+  struct timespec deadline;
+  o.logical.segment_target_bytes = 8 * PS_MIB;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  maintenance_fixture(p, &e);
+  ok(ps_root_namespace_acquire(ps_pouch_state_root(p), "projection", 0, &ns,
+                               &e),
+     &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  ps_namespace_release(ns);
+  ok(ps_flush(ps_root_space(ps_pouch_state_root(p)), &e), &e);
+  lc_pouch_close(p);
+  REQUIRE(!live);
+
+  o.io = &io;
+  o.logical.background_compaction_enabled = 1;
+  o.logical.compaction_interval_seconds = 1;
+  o.logical.compaction_min_reclaimable_bytes = PS_PAGE;
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  REQUIRE(!clock_gettime(CLOCK_REALTIME, &deadline));
+  deadline.tv_sec += 15;
+  pthread_mutex_lock(&stop.mutex);
+  while (!stop.entered)
+    REQUIRE(!pthread_cond_timedwait(&stop.changed, &stop.mutex, &deadline));
+  pthread_mutex_unlock(&stop.mutex);
+  stop.pouch = p;
+  REQUIRE(!pthread_create(&closer, NULL, shutdown_maintenance_owner, &stop));
+  while (!lc_pouch_compaction_stopping(p))
+    sched_yield();
+  pthread_mutex_lock(&stop.mutex);
+  __atomic_store_n(&stop.release, 1, __ATOMIC_RELEASE);
+  pthread_cond_broadcast(&stop.changed);
+  pthread_mutex_unlock(&stop.mutex);
+  REQUIRE(!pthread_join(closer, NULL));
+  REQUIRE(!stop.later_syncs && !live);
+  REQUIRE(!pthread_cond_destroy(&stop.changed));
+  REQUIRE(!pthread_mutex_destroy(&stop.mutex));
+
+  o.io = NULL;
+  o.logical.background_compaction_enabled = 0;
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  maintenance_readback(p, &e);
+  ps_pouch_compaction_result resumed;
+  ok(ps_pouch_state_compact(p, "projection", &resumed, &e), &e);
+  REQUIRE(resumed.copied_bytes || resumed.reclaimed_sources);
+  maintenance_readback(p, &e);
+  lc_pouch_close(p);
+  REQUIRE(!live && !unlink(path));
+  lc_error_cleanup(&e);
+}
 typedef struct checksum_span {
   lc_pouch_state_payload_span span;
   char leaf[40];
@@ -6603,7 +6714,12 @@ static void *worker(void *context) {
     maintenance_concurrency(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-piece-concurrency"))
     maintenance_piece_concurrency(r->path, r->directory);
-  else if (!strcmp(r->mode, "maintenance-checksums"))
+  else if (!strcmp(r->mode, "maintenance-close")) {
+    for (int abrupt = 0; abrupt <= 1; ++abrupt)
+      for (int durable = 0; durable <= 1; ++durable)
+        for (int hold_sync = 0; hold_sync <= 1; ++hold_sync)
+          maintenance_close(r->path, durable, hold_sync, abrupt);
+  } else if (!strcmp(r->mode, "maintenance-checksums"))
     maintenance_checksums(r->path);
   else
     REQUIRE(0);

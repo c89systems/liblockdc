@@ -259,7 +259,7 @@ struct lc_pouch {
   int compaction_mutex_initialized;
   int compaction_cond_initialized;
   int compaction_thread_started;
-  int compaction_stop;
+  int compaction_stop; /* Atomic cooperative stop request. */
   int compaction_pending;
   /* Next background work source, protected by compaction_mutex. Discovery
    * cursors below retain the single maintenance worker's per-source progress.
@@ -465,6 +465,7 @@ void lc_pouch_writer_mode_operation_end(lc_pouch *pouch);
  * restart; neither path scans the root at open. */
 void lc_pouch_compaction_note_mutation(lc_pouch *pouch, const char *ns,
                                        int terminal);
+int lc_pouch_compaction_stopping(const lc_pouch *);
 int lc_pouch_compaction_capacity_turn(lc_pouch *,
                                       lc_pouch_compaction_capacity *,
                                       unsigned int *delay_ms);

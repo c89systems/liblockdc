@@ -13475,6 +13475,7 @@ static int lc_pouch_storage_maintenance_run(
   lc_pouch_storage_age_work age;
   lc_error local_error;
   int rc, run_retention = !options->cleanup_only;
+  int background = options->background && !options->force;
   lc_error_init(&local_error);
   if (!error)
     error = &local_error;
@@ -13497,14 +13498,17 @@ static int lc_pouch_storage_maintenance_run(
   rc = lc_pouch_writer_mode_operation_begin(pouch, error);
   if (rc != LC_OK)
     goto done;
-  if (run_retention && options->background && !options->force &&
-      ops->retention_pending)
+  if (background && lc_pouch_compaction_stopping(pouch))
+    goto deferred;
+  if (run_retention && background && ops->retention_pending)
     rc = ops->retention_pending(pouch->storage.context, options->ns,
                                 &run_retention, error);
   if (rc == LC_OK && run_retention)
     rc = lc_pouch_retention_run(pouch, options->ns,
                                 LC_POUCH_RETENTION_ATTEMPT_LIMIT, &retention,
                                 error);
+  if (rc == LC_OK && background && lc_pouch_compaction_stopping(pouch))
+    goto deferred;
   if (rc == LC_OK)
     rc = ops->state_run(pouch->storage.context, pouch, options, out, error);
   if (rc == LC_OK && options->retention_updated_before_unix > 0) {
@@ -13514,8 +13518,15 @@ static int lc_pouch_storage_maintenance_run(
     rc = lc_pouch_state_with_namespace_lock(
         pouch, options->ns, lc_pouch_storage_age_sweep, &age, error);
   }
+  if (rc == LC_OK && background && lc_pouch_compaction_stopping(pouch))
+    goto deferred;
   if (rc == LC_OK)
     rc = lc_collection_maintenance_run(pouch, options, out, error);
+  goto finish;
+deferred:
+  if (!out->cleanup_pending_count)
+    out->cleanup_pending_count = 1;
+finish:
   out->retention_scanned_count += retention.retention_scanned_count;
   out->retention_expired_count += retention.retention_expired_count;
   out->retention_deleted_state_count += retention.retention_deleted_state_count;

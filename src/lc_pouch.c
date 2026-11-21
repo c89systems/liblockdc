@@ -1169,7 +1169,8 @@ static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
       fields[2] = lc_log_code_field(&maintenance_error);
       fields[3] = lc_log_str_field("detail", maintenance_error.detail);
       lc_log_warn(pouch->logger, "compaction.background.error", fields, 4U);
-    } else if (result.cleanup_pending_count != 0UL) {
+    } else if (result.cleanup_pending_count != 0UL &&
+               !lc_pouch_compaction_stopping(pouch)) {
       lc_error queue_error;
       int queued;
 
@@ -1294,7 +1295,7 @@ static void *lc_pouch_compaction_worker(void *arg) {
   if (probes_pressure)
     compaction_pressure_deadline(&probe, 250);
   pthread_mutex_lock(&pouch->compaction_mutex);
-  while (!pouch->compaction_stop) {
+  while (!lc_pouch_compaction_stopping(pouch)) {
     struct timespec now;
     const struct timespec *wake;
     int regular_due, probe_due, capacity_due = 0;
@@ -1324,7 +1325,7 @@ static void *lc_pouch_compaction_worker(void *arg) {
     if (probe_due)
       capacity_due =
           lc_pouch_compaction_capacity_turn(pouch, &capacity, &pressure_delay);
-    if (regular_due || capacity_due)
+    if ((regular_due || capacity_due) && !lc_pouch_compaction_stopping(pouch))
       lc_pouch_compaction_run_pass(pouch);
     if (regular_due)
       lc_pouch_compaction_deadline(pouch, &regular);
@@ -1472,15 +1473,21 @@ int lc_pouch_runtime_start_maintenance(lc_pouch *pouch, lc_error *error) {
   return lc_pouch_compaction_worker_init(pouch, error);
 }
 
-static void lc_pouch_compaction_worker_close(lc_pouch *pouch) {
-  if (pouch == NULL) {
-    return;
-  }
+int lc_pouch_compaction_stopping(const lc_pouch *pouch) {
+  return __atomic_load_n(&pouch->compaction_stop, __ATOMIC_ACQUIRE);
+}
+
+static void lc_pouch_compaction_request_stop(lc_pouch *pouch) {
   if (pouch->compaction_thread_started) {
     pthread_mutex_lock(&pouch->compaction_mutex);
-    pouch->compaction_stop = 1;
+    __atomic_store_n(&pouch->compaction_stop, 1, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&pouch->compaction_cond);
     pthread_mutex_unlock(&pouch->compaction_mutex);
+  }
+}
+
+static void lc_pouch_compaction_worker_close(lc_pouch *pouch) {
+  if (pouch->compaction_thread_started) {
     pthread_join(pouch->compaction_thread, NULL);
     pouch->compaction_thread_started = 0;
   }
@@ -4003,6 +4010,7 @@ void lc_pouch_close(lc_pouch *pouch) {
     fields[0] = lc_log_str_field("path", pouch->root_path);
     lc_log_debug(pouch->logger, "close", fields, 1U);
   }
+  lc_pouch_compaction_request_stop(pouch);
   if (pouch->aborted) {
     lc_pouch_writer_presence_stop_abrupt(pouch);
   } else {
@@ -4086,6 +4094,7 @@ int lc_pouch_abort(lc_pouch *pouch, lc_error *error) {
   }
   pouch->aborted = 1;
   pthread_mutex_unlock(&pouch->single_writer_mutex);
+  lc_pouch_compaction_request_stop(pouch);
   lc_pouch_writer_presence_stop_abrupt(pouch);
   lc_pouch_indexer_worker_close(pouch);
   lc_pouch_compaction_worker_close(pouch);

@@ -11540,3 +11540,100 @@ fixed-capacity lease and messaging. Formatting and diff checks passed.
 
 Raw traces, matched samples and test logs are in
 `build/pouch-space-concurrent/namespace-capture/`.
+
+## Stopping background maintenance between durable publications
+
+Indexed close tracing counted barriers from all threads. The close caller
+issued no sync, while a NoSync compaction worker completed up to 11 syncs
+during one grouped close. Slow closes waited for that worker to finish a pass
+with several durable selections.
+
+Close and abort now signal the compaction worker before joining the other
+workers. Native maintenance checks that signal between retention, state and
+collection phases and before selecting more checkpoint, unlink or repack
+work. A selected operation and its durability wait run through completion.
+An unselected encoded copy can release its private allocation at the next
+publication gate. Sources already unlinked in a selected batch complete their
+retirement path. A barrier or another bounded operation already in progress
+can still delay close.
+
+The I/O fixture pauses the real worker at the first private map write or its
+subsequent sync. It exercises both shutdown entry points and both durability
+policies. The fixture releases the paused operation after observing the stop
+request and checks that no further sync starts. Cold reopen verifies stored
+bodies, versions, metadata and the tombstone. A subsequent maintenance pass
+reclaims more storage or relocates another piece. The same fixture using
+the prior native maintenance implementation fails its close-time sync assertion.
+
+In three paired traces per durability mode at eight writers and 24 MiB,
+every run verified all 384 items. Instrumented NoSync median close fell
+from 28.72 to 8.04 ms. The prior build finished 11 close-time syncs in each
+sample and the revised build finished one or two. The durable median fell
+from 8.34 to 6.89 ms, with zero to three close-time syncs in either build.
+
+All 60 uninstrumented matched runs verified across the seven workflows.
+Each four-writer NoSync profile and the eight-writer NoSync profile
+ran four times per build. The other profiles ran twice per build.
+Native roots stayed at 10 MiB. The tables give medians in milliseconds
+in the order prior native (`8e71ee1e`), revised native, multifile.
+Grouped reopen covers the cold owner and subsequent live joins.
+
+| Workload | Work | Per-item p95 | Close | Reopen | Verify after reopen |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 675.14 / 757.75 / 1382.80 | 36.92 / 44.96 / 34.13 | 2.57 / 2.34 / 0.85 | 7.12 / 7.43 / 0.82 | 4.68 / 4.61 / 6.64 |
+| NoSync indexed, 4 writers, 20 MiB | 1270.71 / 1365.34 / 2067.77 | 45.92 / 47.56 / 28.91 | 6.34 / 2.89 / 0.92 | 9.70 / 11.39 / 0.97 | 6.55 / 6.82 / 9.04 |
+| Durable indexed, 2 writers, 15 MiB | 3584.39 / 3518.21 / 5520.27 | 46.67 / 46.53 / 73.65 | 1.41 / 3.72 / 0.69 | 6.65 / 7.84 / 0.53 | 5.49 / 5.50 / 6.67 |
+| Warmed NoSync queue | 9.29 / 9.26 / 75.52 | 1.79 / 1.76 / 15.80 | 0.24 / 0.21 / 0.07 | 3.45 / 2.36 / 0.43 | 0.22 / 0.21 / 0.52 |
+| Durable outbox | 962.56 / 852.68 / 1375.53 | 196.98 / 158.98 / 255.38 | 0.43 / 0.57 / 0.30 | 31.36 / 35.26 / 72.52 | 55.73 / 56.28 / 128.53 |
+| NoSync indexed, 8 writers, 24 MiB | 1822.77 / 1712.11 / 2609.14 | 77.30 / 74.46 / 58.12 | 6.70 / 7.98 / 1.51 | 16.93 / 16.93 / 1.53 | 9.62 / 9.35 / 12.58 |
+| Durable indexed, 8 writers, 24 MiB | 3700.57 / 3627.00 / 9051.46 | 113.65 / 109.93 / 221.71 | 18.61 / 7.57 / 1.98 | 19.87 / 16.78 / 2.16 | 9.48 / 9.25 / 18.04 |
+
+| Workload | Explicit index flush | First query pass | Repeat query pass | First query pass after reopen |
+| --- | ---: | ---: | ---: | ---: |
+| NoSync indexed, 4 writers, 12 MiB | 176.61 / 207.69 / 338.70 | 42.54 / 34.84 / 194.24 | 19.23 / 39.67 / 224.00 | 0.70 / 0.72 / 1.15 |
+| NoSync indexed, 4 writers, 20 MiB | 268.51 / 302.62 / 520.60 | 49.99 / 46.17 / 243.56 | 18.08 / 41.16 / 299.88 | 1.05 / 1.09 / 1.61 |
+| Durable indexed, 2 writers, 15 MiB | 113.38 / 127.41 / 189.15 | 3.83 / 10.00 / 190.45 | 16.10 / 10.56 / 237.35 | 0.49 / 0.49 / 0.62 |
+| NoSync indexed, 8 writers, 24 MiB | 368.32 / 390.37 / 752.29 | 124.65 / 129.23 / 465.35 | 88.42 / 80.30 / 622.82 | 2.12 / 2.06 / 2.80 |
+| Durable indexed, 8 writers, 24 MiB | 421.57 / 378.30 / 1458.78 | 101.54 / 128.42 / 1564.54 | 88.26 / 46.90 / 2063.77 | 2.06 / 1.98 / 3.91 |
+
+Uninstrumented close varies with the work selected when shutdown starts.
+The eight-writer durable median fell from 18.61 to 7.57 ms and the NoSync
+median rose from 6.70 to 7.98 ms in this set. The heavier four-writer NoSync
+median fell from 6.34 to 2.89 ms. The two-writer durable median rose from
+1.41 to 3.72 ms. Both four-writer NoSync profiles spent more time in work
+and explicit index flush in this comparison. Close cancellation takes
+effect once shutdown starts, so the measurements alone cannot attribute
+those work-phase differences to cancellation.
+
+The eight-writer NoSync comparison used 1.91 s of process CPU through
+maintenance, with multifile at 1.01 s. In the revised traces physical
+directory reconstruction for live joins took 7.3–9.4 ms in aggregate,
+out of 16.9–19.5 ms for grouped reopen. Grouped reopen and NoSync CPU and
+tail latency remain qualification work.
+
+The shutdown change passed 48 GNU Release, 21 Debug ASan/UBSan and 21
+musl Release groups. These cover maintenance failure and concurrency,
+journal and checkpoint recovery, reader handoff and fixed-capacity lease
+and messaging. After extending the stop signal to abort, the eight-case
+shutdown fixture passed again on all three builds. GNU multifile controls
+covered compaction, small worker stacks and published-record recovery
+through abort and reopen. Formatting and diff checks passed.
+
+The broader GNU multifile unit group ran 37 cases and failed
+`test_transaction_bound_remove_renew_then_update_recreates_logical_value`.
+Both `8e71ee1e` and this batch reproduced the same lease version of 2 after
+renewing a transaction-local delete whose expected visible version is 0.
+The selected multifile abort/reopen case passed.
+
+A second trace used three copies of each prebuilt indexed layout, opening
+one cold owner followed by eight live joins per copy. The median live join
+spent 1.20 ms in the physical directory for NoSync and 1.12 ms for durable.
+Decoding about 1,060 descriptors took 0.53 and 0.49 ms, respectively.
+Metadata fetch and read-ahead together took about 0.34 ms in each layout.
+Every live join completed with zero barriers. These timings include
+instrumentation and isolate the largest measured costs for the next
+recovery change.
+
+Shutdown logs and traces are in
+`build/pouch-space-concurrent/lifecycle-cost/`. The copied-layout reopen
+diagnostics are in `build/pouch-space-concurrent/recovery-cost/`.

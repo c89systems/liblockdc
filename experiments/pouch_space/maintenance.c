@@ -29,8 +29,16 @@ static uint64_t background_minimum(const compact *w) {
   return minimum > PS_NAMESPACE_REPACK_BYTES ? PS_NAMESPACE_REPACK_BYTES
                                              : minimum;
 }
+static int background_stopping(const compact *w) {
+  return w->background && lc_pouch_compaction_stopping(w->pouch);
+}
+static int stop_pending(lc_error *e) {
+  return fail(e, LC_ERR_PENDING, "background maintenance is stopping");
+}
 static int compact_namespace(compact *w, lc_pouch_state_precondition_fn fn,
                              void *context, lc_error *e) {
+  if (background_stopping(w))
+    return stop_pending(e);
   if (w->defer_busy)
     return lc_pouch_state_try_with_namespace_lock(w->pouch, w->name, fn,
                                                   context, e);
@@ -109,6 +117,8 @@ static int retire_source(void *context, const ps_namespace_source *source,
   ps_namespace_repack_result repack;
   retire_task task = {0};
   int rc;
+  if (background_stopping(w))
+    return stop_pending(e);
   if ((source->kind != PS_CATALOG_SEGMENT && source->kind != PS_CATALOG_BODY) ||
       (source->kind == PS_CATALOG_SEGMENT &&
        source->id > w->after.covered_segment) ||
@@ -170,6 +180,8 @@ static int compact_locked(void *context, lc_error *e) {
   uint64_t closed, pending, minimum_bytes;
   unsigned long minimum_segments;
   int present, rc;
+  if (background_stopping(w))
+    return stop_pending(e);
   rc = w->pouch->storage.ops->namespace_open(w->pouch->storage.context, w->name,
                                              0, (void **)&w->ns, e);
   if (rc == LC_OK && w->options)
@@ -228,6 +240,8 @@ static int compact_locked(void *context, lc_error *e) {
       return LC_OK;
     }
   }
+  if (rc == LC_OK && background_stopping(w))
+    return stop_pending(e);
   if (rc == LC_OK)
     rc = ps_namespace_checkpoint_flush(w->ns, e);
   if (rc == LC_OK)
@@ -240,6 +254,8 @@ static int compact_locked(void *context, lc_error *e) {
   }
   /* Use the shared durability wait when there is a backlog of whole sources.
    * A lone eligible source stays in the ordinary candidate ranking. */
+  if (rc == LC_OK && w->obsolete_sealed > 1 && background_stopping(w))
+    return stop_pending(e);
   if (rc == LC_OK && w->obsolete_sealed > 1)
     rc = ps_namespace_unlink_covered(w->ns, background_minimum(w),
                                      w->retirements, &w->retirement_count, e);
