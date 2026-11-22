@@ -1564,6 +1564,16 @@ static size_t cell_count(uint64_t bytes) {
 static uint64_t cell_mask(size_t at, size_t count) {
   return count == CELLS ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << at;
 }
+/* Consume the lowest contiguous span in a nonempty free-cell mask. */
+static size_t cell_span(uint64_t *free_cells, size_t *at) {
+  uint64_t tail;
+  size_t count;
+  *at = (size_t)__builtin_ctzll(*free_cells);
+  tail = *free_cells >> *at;
+  count = tail == UINT64_MAX ? CELLS : (size_t)__builtin_ctzll(~tail);
+  *free_cells &= ~cell_mask(*at, count);
+  return count;
+}
 static uint64_t extent_mask(const ps_extent *extent) {
   return cell_mask((size_t)(extent->offset % PS_PAGE / PS_CELL),
                    cell_count(extent->bytes));
@@ -1688,15 +1698,16 @@ static void payload_unavailable(ps_payload_page *p) {
     p->available_link = NULL;
   }
 }
-/* One bin per largest contiguous free cell span. Admission probes at most 64
- * bins and 64 cells, independent of the number of partially occupied pages. */
+/* One bin per largest contiguous free cell span. Both binning and placement
+ * can skip occupied cells and consume each contiguous hole at once. */
 static void payload_available(ps_space *s, ps_payload_page *p) {
-  size_t i, span = 0, largest = 0;
+  uint64_t free_cells = ~p->occupied;
+  size_t at, span, largest = 0;
   payload_unavailable(p);
   if (p->external_pins)
     return;
-  for (i = 0; i < CELLS; ++i) {
-    span = p->occupied & (UINT64_C(1) << i) ? 0 : span + 1;
+  while (free_cells) {
+    span = cell_span(&free_cells, &at);
     if (span > largest)
       largest = span;
   }
@@ -1777,7 +1788,7 @@ typedef struct recovery_range {
 typedef struct payload_rebuild {
   recovery_range *ranges;
   size_t count, capacity;
-  int packed_changed;
+  int packed_changed, initial;
   uint64_t pages[REBUILD_BITMAP_WORDS];
 } payload_rebuild;
 
@@ -1883,6 +1894,51 @@ static int payload_subtract(ps_space *s, ps_run ***cursor, uint64_t offset,
   *cursor = link;
   return exclude_selected(link, &s->free_bytes, offset, bytes, error);
 }
+/* Locate a used page, or a free page with flip set to UINT64_MAX. The
+ * caller supplies a start strictly inside the compact bitmap. */
+static unsigned int payload_bitmap_next(const uint64_t *pages, unsigned int at,
+                                        unsigned int limit, uint64_t flip) {
+  unsigned int word = at / 64U;
+  uint64_t bits = (pages[word] ^ flip) & (UINT64_MAX << (at % 64U));
+  while (!bits) {
+    if (++word * 64U >= limit)
+      return limit;
+    bits = pages[word] ^ flip;
+  }
+  at = word * 64U + (unsigned int)__builtin_ctzll(bits);
+  return at < limit ? at : limit;
+}
+/* Initial recovery collects every selected common page in one bitmap. Build
+ * the complement directly, starting with the node from initial_free. */
+static int payload_build_initial_free(ps_space *s, const payload_rebuild *b,
+                                      lc_error *error) {
+  ps_run *spare = s->free, *run, **link = &s->free;
+  unsigned int first = PS_DATA / PS_PAGE, last;
+  unsigned int limit = (unsigned int)(s->capacity / PS_PAGE);
+  int clean = spare->clean;
+  s->free = NULL;
+  s->free_bytes = 0;
+  while (first < limit) {
+    first = payload_bitmap_next(b->pages, first, limit, UINT64_MAX);
+    if (first == limit)
+      break;
+    last = payload_bitmap_next(b->pages, first, limit, 0);
+    run = spare ? spare : lc_calloc_with_allocator(NULL, 1, sizeof(*run));
+    if (!run)
+      return err(error, LC_ERR_NOMEM,
+                 "cannot allocate recovered free interval");
+    spare = NULL;
+    run->offset = (uint64_t)first * PS_PAGE;
+    run->bytes = (uint64_t)(last - first) * PS_PAGE;
+    run->clean = clean;
+    *link = run;
+    link = &run->next;
+    s->free_bytes += run->bytes;
+    first = last;
+  }
+  lc_free_with_allocator(NULL, spare);
+  return LC_OK;
+}
 static int payload_rebuild_bitmap(ps_space *s, const payload_rebuild *build,
                                   lc_error *error) {
   ps_run **link = &s->free;
@@ -1913,11 +1969,9 @@ static int payload_rebuild_bitmap(ps_space *s, const payload_rebuild *build,
   }
   return end ? payload_subtract(s, &link, first, end - first, error) : LC_OK;
 }
-/* Initial discovery has already subtracted directory and descriptor pages.
- * Sweep the remaining common intervals once, leaving the gaps between owned
- * ranges as free space. The bitmap keeps work proportional to pages in a
- * compact root; sparse roots keep memory proportional to owned ranges. Each
- * packed page contributes one range and one bin update. */
+/* Compact initial recovery can publish the bitmap's gaps directly. Journal
+ * replay and sparse roots subtract ordered claims from existing intervals.
+ * Each packed page contributes one range and one bin update. */
 static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
                                 lc_error *error) {
   ps_run **link = &s->free;
@@ -1925,7 +1979,8 @@ static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
   size_t i;
   int rc = LC_OK;
   if (s->capacity <= REBUILD_BITMAP_CAPACITY)
-    rc = payload_rebuild_bitmap(s, build, error);
+    rc = build->initial ? payload_build_initial_free(s, build, error)
+                        : payload_rebuild_bitmap(s, build, error);
   if (build->count > 1)
     qsort(build->ranges, build->count, sizeof(*build->ranges),
           recovery_range_order);
@@ -1946,6 +2001,8 @@ static int recover_payload_ownership(ps_space *s, const ps_entry *end,
   payload_rebuild build = {0};
   ps_entry *p;
   int rc = LC_OK;
+  if (s->entries == end)
+    return LC_OK;
   for (p = s->entries; rc == LC_OK && p != end; p = p->all_next) {
     rc = payload_claim_entry(s, p, &build, error);
     p->previous = NULL;
@@ -3027,7 +3084,7 @@ static int payload_reserve_locked(ps_space *s, ps_entry *entry,
   ps_payload_page *p = NULL;
   size_t requested = *bytes;
   size_t count = cell_count(*bytes), bin, at;
-  uint64_t mask, reserve = PS_PAGE;
+  uint64_t reserve = PS_PAGE;
   int rc, fresh = 0, present, retry_packed = 1, check_quarantine;
 again:
   p = NULL;
@@ -3085,34 +3142,29 @@ again:
     payload_register(s, p);
     fresh = 1;
   }
-  for (at = 0; at + count <= CELLS; ++at) {
-    mask = cell_mask(at, count);
-    if (!(p->occupied & mask)) {
-      if (!fresh) {
-        rc = physical_claim(s, p->run.offset + at * PS_CELL, count * PS_CELL,
-                            error);
-        if (rc != LC_OK)
-          return rc;
-      }
-      p->occupied |= mask;
-      s->packed_bytes += count * PS_CELL;
-      payload_available(s, p);
-      extent->offset = p->run.offset + at * PS_CELL;
-      extent->flags = EXTENT_PACKED;
-      if (fresh) {
-        if (at && (rc = physical_release(s, p->run.offset, at * PS_CELL,
-                                         error)) != LC_OK)
-          return rc;
-        if (at + count < CELLS &&
-            (rc = physical_release(s, p->run.offset + (at + count) * PS_CELL,
-                                   (CELLS - at - count) * PS_CELL, error)) !=
-                LC_OK)
-          return rc;
-      }
-      return LC_OK;
-    }
+  at = 0;
+  if (!fresh) {
+    uint64_t free_cells = ~p->occupied;
+    size_t span = 0;
+    while (free_cells && span < count)
+      span = cell_span(&free_cells, &at);
+    if (span < count)
+      return err(error, LC_ERR_PROTOCOL, "packed payload free-span mismatch");
+    rc =
+        physical_claim(s, p->run.offset + at * PS_CELL, count * PS_CELL, error);
+    if (rc != LC_OK)
+      return rc;
   }
-  return err(error, LC_ERR_PROTOCOL, "packed payload free-span mismatch");
+  p->occupied |= cell_mask(at, count);
+  s->packed_bytes += count * PS_CELL;
+  payload_available(s, p);
+  extent->offset = p->run.offset + at * PS_CELL;
+  extent->flags = EXTENT_PACKED;
+  /* A fresh allocation starts at cell zero. Release its trailing slack. */
+  if (fresh && count < CELLS)
+    return physical_release(s, p->run.offset + count * PS_CELL,
+                            (CELLS - count) * PS_CELL, error);
+  return LC_OK;
 }
 static int metadata_offset(ps_space *s, uint64_t offset) {
   return offset % PS_PAGE == 0 && offset >= PS_METADATA_START &&
@@ -4582,6 +4634,13 @@ static int metadata_read_ahead(metadata_recovery *r,
   }
   return rc;
 }
+static int recover_metadata_claim(metadata_recovery *r, uint64_t offset,
+                                  lc_error *error) {
+  ps_space *s = r->space;
+  if (s->capacity <= REBUILD_BITMAP_CAPACITY && offset >= PS_DATA)
+    return payload_exclude(s, r->payload, offset, PS_PAGE, error);
+  return exclude_run(s, offset, PS_PAGE, error);
+}
 static int recover_directory_page(void *v, ps_directory_root ref,
                                   lc_error *error) {
   metadata_recovery *r = v;
@@ -4598,7 +4657,7 @@ static int recover_directory_page(void *v, ps_directory_root ref,
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover directory ownership");
-  rc = exclude_run(s, ref.offset, PS_PAGE, error);
+  rc = recover_metadata_claim(r, ref.offset, error);
   if (rc != LC_OK) {
     lc_free_with_allocator(NULL, p);
     return rc;
@@ -4611,9 +4670,10 @@ static int recover_directory_page(void *v, ps_directory_root ref,
   metadata_register(s, p);
   return LC_OK;
 }
-static int recover_descriptor_page(ps_space *s, uint64_t offset,
+static int recover_descriptor_page(metadata_recovery *r, uint64_t offset,
                                    uint64_t generation, size_t used,
                                    uint64_t following, lc_error *error) {
+  ps_space *s = r->space;
   ps_meta_page *p = metadata_find(s, offset);
   int rc;
   if (p && (p->index || p->generation != generation || p->used != used ||
@@ -4623,7 +4683,7 @@ static int recover_descriptor_page(ps_space *s, uint64_t offset,
     p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
     if (!p)
       return err(error, LC_ERR_NOMEM, "cannot recover descriptor ownership");
-    rc = exclude_run(s, offset, PS_PAGE, error);
+    rc = recover_metadata_claim(r, offset, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, p);
       return rc;
@@ -4640,7 +4700,6 @@ static int recover_descriptor_page(ps_space *s, uint64_t offset,
 }
 static int metadata_read(metadata_recovery *recovery, ps_descriptor_ref ref,
                          const unsigned char **wire, lc_error *error) {
-  ps_space *s = recovery->space;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take;
   metadata_read_page *page = NULL;
@@ -4653,7 +4712,7 @@ static int metadata_read(metadata_recovery *recovery, ps_descriptor_ref ref,
         at >= META_HEADER + page->used)
       return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
     generation = page->generation;
-    rc = recover_descriptor_page(s, offset, generation, page->used,
+    rc = recover_descriptor_page(recovery, offset, generation, page->used,
                                  page->following, error);
     if (rc != LC_OK)
       return rc;
@@ -4694,7 +4753,7 @@ static int reuse_directory_entry(metadata_recovery *r,
         at >= META_HEADER + page->used)
       return err(error, LC_ERR_PROTOCOL, "invalid retained descriptor span");
     generation = page->generation;
-    rc = recover_descriptor_page(r->space, offset, generation, page->used,
+    rc = recover_descriptor_page(r, offset, generation, page->used,
                                  page->following, error);
     if (rc != LC_OK)
       return rc;
@@ -4961,8 +5020,10 @@ static int collect_projection_binding(metadata_recovery *r, ps_key key,
 /* Packed leaf values have no descriptor reads or stream dependencies. Load
  * them straight into the new owner's slabs and size the key index after the
  * walk. This owner is private until recovery has validated its selection. */
-static int load_open_binding(ps_space *s, checkpoint_slab *batch, ps_key key,
+static int load_open_binding(metadata_recovery *r, ps_key key,
                              const ps_directory_value *value, lc_error *error) {
+  ps_space *s = r->space;
+  checkpoint_slab *batch = &r->open_slab;
   ps_entry_allocation *block = batch->block;
   ps_entry_slab_slot *slot;
   ps_entry *p;
@@ -4988,7 +5049,8 @@ static int load_open_binding(ps_space *s, checkpoint_slab *batch, ps_key key,
   p->extents = &slot->extent;
   p->embedded_extents = 1;
   unpack_binding(p, key, value);
-  return register_packed_binding(s, p, value->extent.deletion_bytes, error);
+  rc = register_packed_binding(s, p, value->extent.deletion_bytes, error);
+  return rc == LC_OK ? payload_claim(s, p->extents, r->payload, error) : rc;
 }
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
@@ -5054,6 +5116,8 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
       rc = ps_catalog_prepare_record(s, p, 1, error);
     else if (p->key.kind == PS_OWNED_RUN && p->stream->mapped)
       rc = owned_map_load(s, p, error);
+    if (rc == LC_OK && !r->resident)
+      rc = payload_claim_entry(s, p, r->payload, error);
     if (rc != LC_OK)
       return rc;
     if (p->key.kind == PS_CATALOG)
@@ -5074,9 +5138,8 @@ static int capture_directory_entry(void *v, ps_key key,
   ps_entry *old = NULL;
   size_t capacity;
   if (value->tag.storage == PS_DIRECTORY_PACKED_VALUE)
-    return r->resident
-               ? collect_projection_binding(r, key, value, error)
-               : load_open_binding(r->space, &r->open_slab, key, value, error);
+    return r->resident ? collect_projection_binding(r, key, value, error)
+                       : load_open_binding(r, key, value, error);
   if (r->count == r->capacity) {
     if (r->capacity > (size_t)-1 / sizeof(*item) / 2)
       return err(error, LC_ERR_NOMEM, "checkpoint binding list too large");
@@ -5661,6 +5724,7 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   ps_directory *directory = NULL;
   metadata_recovery *recovery = NULL;
   int rc = initial_free(s, error);
+  payload->initial = 1;
   if (rc == LC_OK && s->directory.offset)
     rc = directory_open(s, s->directory, &directory, error);
   if (rc == LC_OK && directory) {
@@ -5692,6 +5756,17 @@ static int recover_directory(ps_space *s, unsigned char *wire,
     rc = validate_owned_directory(s, error);
   if (rc == LC_OK)
     rc = ps_catalog_validate_directory(s, error);
+  return rc;
+}
+static int
+recover_checkpoint_directory(ps_space *s, unsigned char *wire,
+                             const ps_readiness_certificate *certificate,
+                             lc_error *error) {
+  payload_rebuild build = {0};
+  int rc = recover_directory(s, wire, certificate, NULL, 0, &build, error);
+  if (rc == LC_OK)
+    rc = payload_rebuild_free(s, &build, error);
+  lc_free_with_allocator(NULL, build.ranges);
   return rc;
 }
 static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
@@ -5998,10 +6073,8 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   rc = allocation_end(s, *guard, LC_OK, error);
   *guard = NULL;
   if (rc == LC_OK) {
-    prepared = recover_directory(draft, wire, certificate, NULL, 0, NULL,
-                                 &draft_error);
-    if (prepared == LC_OK)
-      prepared = recover_payload_ownership(draft, NULL, &draft_error);
+    prepared =
+        recover_checkpoint_directory(draft, wire, certificate, &draft_error);
     rc = allocation_begin(s, guard, error);
   }
   if (rc == LC_OK)
@@ -6114,11 +6187,11 @@ restart:
                                 &moved, error);
     if (rc == LC_OK && moved)
       goto restart;
-    checkpoint_entries = s->entries;
   } else
-    rc = recover_directory(s, wire, &certificate, NULL, 0, NULL, error);
+    rc = recover_checkpoint_directory(s, wire, &certificate, error);
   if (rc != LC_OK)
     goto done;
+  checkpoint_entries = s->entries;
   s->token_limit = grant_limit;
   bytes = PS_JOURNAL;
   if (certified) {

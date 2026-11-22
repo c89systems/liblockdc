@@ -4,6 +4,7 @@
 #include "revision.h"
 #include "space_internal.h"
 #include "stream.h"
+#include "wire.h"
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
@@ -2445,6 +2446,62 @@ static void checkpoint_ownership_overlap(void) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
+static void checkpoint_common_page(void) {
+  ps_space *writer = NULL, *owner = NULL, *join = NULL;
+  lc_error e = {0};
+  unsigned char root[PS_ROOT_BYTES], leaf[PS_PAGE], aliased[PS_PAGE];
+  uint64_t source, destination;
+  off_t selector;
+  int fd;
+
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  capture_put(writer, 1, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(writer->free && writer->directory.offset < PS_DATA);
+  source = writer->directory.offset;
+  destination = writer->free->offset;
+  selector = (off_t)writer->root * PS_PAGE;
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(destination >= PS_DATA);
+  fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0 && pread(fd, root, sizeof(root), selector) == sizeof(root));
+  REQUIRE(pread(fd, leaf, sizeof(leaf), (off_t)source) == sizeof(leaf));
+  REQUIRE(ps_wire_get64(root + 32) == source && !ps_wire_get32(leaf + 4) &&
+          ps_wire_get32(leaf + 8) == 1 &&
+          ps_wire_get32(leaf + 64 + 4) == PS_DIRECTORY_PACKED_VALUE);
+  /* Place a valid selected directory page in common capacity. */
+  ps_wire_put64(leaf + 24, destination);
+  checkpoint_leaf_checksum(leaf);
+  ps_wire_put64(root + 32, destination);
+  ps_wire_put32(root + ROOT_CHECKSUM, (uint32_t)crc32(0, root, ROOT_CHECKSUM));
+  REQUIRE(pwrite(fd, leaf, sizeof(leaf), (off_t)destination) == sizeof(leaf) &&
+          pwrite(fd, root, sizeof(root), selector) == sizeof(root) &&
+          !fdatasync(fd));
+  ok(ps_open(path, 0, NULL, &owner, &e), &e);
+  index_expect(owner, 1, 65, &e);
+  ok(ps_check(owner, &e), &e);
+
+  /* Both bindings decode and checksum, but a packed value cannot use the
+   * selected directory page as payload. */
+  memcpy(aliased, leaf, sizeof(leaf));
+  ps_wire_put64(aliased + 64 + 24, destination);
+  checkpoint_leaf_checksum(aliased);
+  REQUIRE(pwrite(fd, aliased, sizeof(aliased), (off_t)destination) ==
+          sizeof(aliased));
+  REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
+          e.message && !strcmp(e.message, "overlapping container ownership"));
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(fd, leaf, sizeof(leaf), (off_t)destination) == sizeof(leaf) &&
+          !fdatasync(fd) && !close(fd));
+  ok(ps_open(path, 0, NULL, &join, &e), &e);
+  capture_put(join, 2, PS_PAGE);
+  index_expect(join, 1, 65, &e);
+  index_expect(join, 2, PS_PAGE, &e);
+  ok(ps_check(join, &e), &e);
+  ok(ps_close(join, &e), &e);
+  ok(ps_close(owner, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_ownership_growth(void) {
   ps_space *writer = NULL, *peer = NULL, *join = NULL;
   ps_reader *retained = NULL;
@@ -2990,6 +3047,7 @@ static void checkpoint_prepared_bindings(void) {
 }
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
+  checkpoint_common_page();
   checkpoint_ownership_growth();
   checkpoint_orphan_run();
   checkpoint_namespace_names();

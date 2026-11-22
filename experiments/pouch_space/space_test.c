@@ -2562,6 +2562,40 @@ static void packing_lifecycle(void) {
   puts("packing: cell boundaries, shared-page pins, fragmented spans and full "
        "page return");
 }
+static void packing_fragment_fit(void) {
+  unsigned char body[3 * PS_CELL] = {0};
+  const size_t fits[] = {3, 29, 61};
+  const ps_entry *entry;
+  uint64_t page;
+  size_t i, cell;
+  ps_space *s = create(PS_DEFAULT_CAPACITY, 0, NULL);
+  for (i = 0; i < CELLS; ++i)
+    put(s, state(i), body, 1, 1);
+  entry = ps_internal_lookup(s, state(0));
+  CHECK(entry && entry->count == 1 && entry->extents[0].flags == EXTENT_PACKED);
+  page = entry->extents[0].offset;
+  CHECK(page % PS_PAGE == 0);
+  /* A too-short prefix, two interior fits, and a fit ending at bit 63. */
+  OK(ps_delete(s, state(1), &error));
+  for (i = 0; i < sizeof(fits) / sizeof(*fits); ++i)
+    for (cell = fits[i]; cell < fits[i] + 3; ++cell)
+      OK(ps_delete(s, state(cell), &error));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  for (i = 0; i < sizeof(fits) / sizeof(*fits); ++i) {
+    put(s, state(100 + i), body, sizeof(body), PS_CELL);
+    entry = ps_internal_lookup(s, state(100 + i));
+    CHECK(entry && entry->count == 1 &&
+          entry->extents[0].offset == page + fits[i] * PS_CELL);
+  }
+  put(s, state(200), body, 1, 1);
+  entry = ps_internal_lookup(s, state(200));
+  CHECK(entry && entry->count == 1 &&
+        entry->extents[0].offset == page + PS_CELL);
+  OK(ps_close(s, &error));
+  clean();
+}
 static void packing_faults(void) {
   model m;
   ps_io io = model_init(&m);
@@ -7970,6 +8004,7 @@ int main(int argc, char **argv) {
       metadata_growth_faults();
     } else if (strcmp(argv[2], "packing") == 0) {
       packing_lifecycle();
+      packing_fragment_fit();
       packing_faults();
       packing_concurrency();
       packing_invalid_ownership();
