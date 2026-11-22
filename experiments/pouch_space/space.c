@@ -42,7 +42,8 @@ struct ps_reader {
   size_t random_extent;
   uint64_t random_base;
   int random_loaded;
-  int imported, private_read;
+  int imported;
+  int *private_failure;
 };
 /* Every imported reader holds presence continuously from before acquiring its
  * extents until last close. A handoff retains its source until import succeeds.
@@ -123,16 +124,22 @@ static uint32_t checksum(const void *p, size_t n) {
 static int err(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-space");
 }
-static int io_error(ps_space *s, lc_error *e, const char *message) {
-  __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+static int io_failure(int *poisoned, lc_error *e, const char *message) {
+  __atomic_store_n(poisoned, 1, __ATOMIC_RELAXED);
   return lc_error_set(e, LC_ERR_TRANSPORT, errno, message, strerror(errno),
                       NULL, "pouch-space");
 }
-static int healthy(ps_space *s, lc_error *e) {
-  return __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)
+static int io_error(ps_space *s, lc_error *e, const char *message) {
+  return io_failure(&s->poisoned, e, message);
+}
+static int io_healthy(const int *poisoned, lc_error *e) {
+  return __atomic_load_n(poisoned, __ATOMIC_RELAXED)
              ? err(e, LC_ERR_TRANSPORT,
                    "container I/O outcome uncertain; close and reopen")
              : LC_OK;
+}
+static int healthy(ps_space *s, lc_error *e) {
+  return io_healthy(&s->poisoned, e);
 }
 static ssize_t native_read(void *c, int fd, void *p, size_t n, off_t o) {
   (void)c;
@@ -162,7 +169,7 @@ static int settle_recovery(ps_space *s, lc_error *error) {
              : LC_OK;
 }
 static int file_transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
-                         int writing, lc_error *error) {
+                         int writing, int *private_failure, lc_error *error) {
   unsigned char *p = bytes;
   ssize_t result;
   while (n) {
@@ -173,9 +180,9 @@ static int file_transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
     if (result <= 0 || (size_t)result > n) {
       if (result == 0)
         errno = EIO;
-      return io_error(s, error,
-                      writing ? "container offset write failed"
-                              : "container offset read failed");
+      return io_failure(private_failure ? private_failure : &s->poisoned, error,
+                        writing ? "container offset write failed"
+                                : "container offset read failed");
     }
     p += result;
     n -= (size_t)result;
@@ -186,7 +193,8 @@ static int file_transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
 static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
                     int writing, lc_error *error) {
   int rc = writing ? settle_recovery(s, error) : LC_OK;
-  return rc == LC_OK ? file_transfer(s, bytes, n, offset, writing, error) : rc;
+  return rc == LC_OK ? file_transfer(s, bytes, n, offset, writing, NULL, error)
+                     : rc;
 }
 static int journal_transfer(ps_space *s, uint64_t cursor, void *bytes,
                             size_t count, int writing, lc_error *error) {
@@ -2665,11 +2673,12 @@ static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
  * cells in this buffer confer no authority and are never exposed. */
 static int read_packed_bytes(ps_space *s, const ps_extent *extent,
                              packed_read *packed, const unsigned char **out,
-                             lc_error *error) {
+                             int *private_failure, lc_error *error) {
   uint64_t page = extent->offset / PS_PAGE * PS_PAGE;
   int rc;
   if (packed->offset != page) {
-    rc = transfer(s, packed->bytes, PS_PAGE, page, 0, error);
+    rc = file_transfer(s, packed->bytes, PS_PAGE, page, 0, private_failure,
+                       error);
     if (rc != LC_OK)
       return rc;
     packed->offset = page;
@@ -2679,11 +2688,13 @@ static int read_packed_bytes(ps_space *s, const ps_extent *extent,
 }
 static int read_extent(ps_space *s, const ps_extent *extent,
                        unsigned char *buffer, packed_read *packed,
-                       const unsigned char **data, lc_error *error) {
+                       const unsigned char **data, int *private_failure,
+                       lc_error *error) {
   if (packed && (extent->flags & EXTENT_PACKED))
-    return read_packed_bytes(s, extent, packed, data, error);
+    return read_packed_bytes(s, extent, packed, data, private_failure, error);
   *data = buffer;
-  return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
+  return file_transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0,
+                       private_failure, error);
 }
 static int verify_value_payloads(ps_space *s, ps_entry *p,
                                  unsigned char *buffer, packed_read *packed,
@@ -2694,7 +2705,7 @@ static int verify_value_payloads(ps_space *s, ps_entry *p,
   if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
     return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
-    rc = read_extent(s, &p->extents[i], buffer, packed, &data, error);
+    rc = read_extent(s, &p->extents[i], buffer, packed, &data, NULL, error);
     if (rc != LC_OK)
       return rc;
     if (checksum(data, (size_t)p->extents[i].bytes) != p->extents[i].crc)
@@ -4109,7 +4120,7 @@ static int write_token_limit(ps_space *s, int slot, uint64_t limit,
   ps_wire_put32(record + 32, checksum(record, 32));
   return file_transfer(s, record, sizeof(record),
                        (uint64_t)slot * PS_PAGE + PS_TOKEN_RECORD_OFFSET, 1,
-                       error);
+                       NULL, error);
 }
 /* The preceding slot remains intact. A new pool that persists ahead of its
  * barrier can be skipped safely: it does not advance the journal prefix. */
@@ -5881,7 +5892,7 @@ static void exclusive_record_close(ps_space *s) {
              CLOSE_PROOF_HEADER + count * CLOSE_PROOF_TAIL);
       (void)file_transfer(s, page,
                           (size_t)(tail - page) + count * CLOSE_PROOF_TAIL,
-                          PS_READINESS_OFFSET, 1, NULL);
+                          PS_READINESS_OFFSET, 1, NULL, NULL);
       return;
     }
     if (s->durable)
@@ -5919,7 +5930,7 @@ static void exclusive_record_close(ps_space *s) {
   ps_wire_put32(proof + 88, (uint32_t)count);
   ps_wire_put32(proof + 92, close_proof_crc(proof, count));
   (void)file_transfer(s, page, (size_t)(tail - page), PS_READINESS_OFFSET, 1,
-                      NULL);
+                      NULL, NULL);
 }
 enum exclusive_proof { EXCLUSIVE_UNPROVED, EXCLUSIVE_DURABLE, EXCLUSIVE_CLEAN };
 static int exclusive_open_proof(ps_space *s, const unsigned char *wire,
@@ -7824,7 +7835,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   return rc;
 }
 static void reader_payload_invalid(ps_reader *r) {
-  if (r->private_read)
+  if (r->private_failure)
     return;
   if (r->imported) {
     r->entry->value_checked = -1;
@@ -7840,7 +7851,8 @@ static void reader_payload_invalid(ps_reader *r) {
 static int reader_load(ps_reader *r, const ps_extent *extent,
                        const char *mismatch, lc_error *error) {
   const unsigned char *data;
-  int rc = read_extent(r->space, extent, r->buffer, r->packed, &data, error);
+  int rc = read_extent(r->space, extent, r->buffer, r->packed, &data,
+                       r->private_failure, error);
   if (rc != LC_OK)
     return rc;
   if (checksum(data, (size_t)extent->bytes) != extent->crc) {
@@ -7857,11 +7869,12 @@ int ps_internal_checkpoint_span(ps_reader *r, const unsigned char **out,
   const unsigned char *bytes;
   int rc;
   *out = NULL;
-  if (!r->private_read || p->count != 1 || !(extent->flags & EXTENT_PACKED) ||
-      extent->bytes != p->bytes ||
+  if (!r->private_failure || p->count != 1 ||
+      !(extent->flags & EXTENT_PACKED) || extent->bytes != p->bytes ||
       (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION))
     return LC_OK;
-  rc = read_packed_bytes(r->space, extent, r->packed, &bytes, error);
+  rc = read_packed_bytes(r->space, extent, r->packed, &bytes,
+                         r->private_failure, error);
   if (rc != LC_OK)
     return rc;
   if (checksum(bytes, (size_t)extent->bytes) != extent->crc)
@@ -8285,28 +8298,39 @@ void ps_internal_values_discard_locked(ps_values *view) {
   }
   values_free(view);
 }
+/* Occupancy bounds a selection even when a tombstone picks a predecessor or
+ * two owners share a bucket. The caller holds the local allocator mutex. */
+static int values_capacity(const ps_space *s, size_t bucket, unsigned int begin,
+                           unsigned int end, size_t limit, size_t *count,
+                           lc_error *error) {
+  unsigned int group;
+  *count = 0;
+  for (group = begin; group <= end; ++group) {
+    size_t occupied = s->value_buckets[group][bucket].count;
+    if (occupied > limit - *count)
+      return err(error, LC_ERR_NOMEM, "selected value metadata exceeds limit");
+    *count += occupied;
+  }
+  return LC_OK;
+}
 static int values_select_locked(ps_space *s, uint64_t owner, unsigned int first,
                                 unsigned int last, uint64_t prefix,
                                 ps_value_retain_fn retain, void *context,
                                 ps_values **out, lc_error *error) {
   ps_values *view;
   ps_entry *p, *selected;
-  size_t count = 0, bucket = owner % BUCKETS;
+  size_t count, bucket = owner % BUCKETS;
   size_t slot_bytes = sizeof(*view->items) + sizeof(*view->retained);
   size_t limit = (SIZE_MAX - sizeof(*view)) / slot_bytes;
   unsigned int group, begin = value_group(first), end;
+  int rc;
   *out = NULL;
   if (last > PS_NAMESPACE_CHECKPOINT)
     last = PS_NAMESPACE_CHECKPOINT;
   end = value_group(last);
-  /* Bucket occupancy bounds the capture even when a tombstone selects a
-   * predecessor or when two owners share a bucket. */
-  for (group = begin; group <= end; ++group) {
-    size_t occupied = s->value_buckets[group][bucket].count;
-    if (occupied > limit - count)
-      return err(error, LC_ERR_NOMEM, "selected value metadata exceeds limit");
-    count += occupied;
-  }
+  rc = values_capacity(s, bucket, begin, end, limit, &count, error);
+  if (rc != LC_OK)
+    return rc;
   view = lc_alloc_with_allocator(NULL, sizeof(*view) + count * slot_bytes);
   if (!view)
     return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
@@ -8466,58 +8490,64 @@ static int value_position(const void *left, const void *right) {
   uint64_t y = b->count ? b->extents[0].offset : 0;
   return x < y ? -1 : x != y;
 }
-static int values_read_walk(const ps_values *view, ps_space *io,
-                            int private_read, ps_value_read_fn read,
+static int values_read_walk(ps_space *s, value_walk *walk, size_t count,
+                            int *private_failure, ps_value_read_fn read,
                             void *context, lc_error *error) {
-  value_walk *walk;
-  ps_reader *r;
-  ps_entry **order;
-  size_t i, count = view->retained_count, bytes;
-  int rc;
-  if (!count)
-    return LC_OK;
-  if (count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
-    return err(error, LC_ERR_NOMEM, "captured read order exceeds local limit");
-  bytes = count * sizeof(*order);
-  walk = lc_alloc_with_allocator(NULL, sizeof(*walk) + bytes);
-  if (!walk)
-    return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
-  order = (void *)(walk + 1);
-  for (i = 0; i < count; ++i)
-    order[i] = view->retained[i]->retained;
+  ps_reader *r = &walk->reader;
+  ps_entry **order = (void *)(walk + 1);
+  size_t i;
+  int rc = LC_OK;
   if (count > 1)
     qsort(order, count, sizeof(*order), value_position);
   walk->packed.offset = 0;
-  r = &walk->reader;
-  rc = LC_OK;
   for (i = 0; rc == LC_OK && i < count; ++i) {
-    rc = healthy(io, error);
+    rc = io_healthy(private_failure ? private_failure : &s->poisoned, error);
     if (rc != LC_OK)
       break;
     memset(r, 0, sizeof(*r));
-    r->space = io;
-    r->private_read = private_read;
+    r->space = s;
+    r->private_failure = private_failure;
     r->entry = order[i];
     r->packed = &walk->packed;
     r->buffer = walk->buffer;
     rc = read(context, r->entry->key, r, error);
   }
-  lc_free_with_allocator(NULL, walk);
   return rc;
 }
 int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
                         void *context, lc_error *error) {
+  value_walk *walk;
+  ps_entry **order;
+  size_t i, count;
+  int rc;
   if (!view || !read)
     return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
-  return values_read_walk(view, view->space, 0, read, context, error);
+  count = view->retained_count;
+  if (!count)
+    return LC_OK;
+  if (count > (SIZE_MAX - sizeof(*walk)) / sizeof(*order))
+    return err(error, LC_ERR_NOMEM, "captured read order exceeds local limit");
+  walk = lc_alloc_with_allocator(NULL, sizeof(*walk) + count * sizeof(*order));
+  if (!walk)
+    return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
+  order = (void *)(walk + 1);
+  for (i = 0; i < count; ++i)
+    order[i] = view->retained[i]->retained;
+  rc = values_read_walk(view->space, walk, count, NULL, read, context, error);
+  lc_free_with_allocator(NULL, walk);
+  return rc;
 }
 int ps_internal_values_startup_walk(ps_space *s, uint64_t owner,
                                     ps_value_read_fn read, void *context,
                                     int *accepted, lc_error *error) {
-  ps_values *values = NULL;
-  ps_space *io = NULL;
+  value_walk *walk = NULL;
+  ps_entry **order, *p, *selected;
+  size_t capacity, count = 0, bucket = owner % BUCKETS;
+  size_t limit = (SIZE_MAX - sizeof(*walk)) / sizeof(*order);
+  unsigned int group, begin = value_group(PS_KEY_METADATA),
+                      end = value_group(PS_NAMESPACE_CHECKPOINT);
   uint64_t prefix;
-  int rc;
+  int rc, private_failure = 0;
   *accepted = 0;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
@@ -8525,32 +8555,38 @@ int ps_internal_values_startup_walk(ps_space *s, uint64_t owner,
     goto done;
   observe_local_durability(s);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  rc = values_select_locked(s, owner, PS_KEY_METADATA, PS_NAMESPACE_CHECKPOINT,
-                            prefix, NULL, NULL, &values, error);
+  rc = values_capacity(s, bucket, begin, end, limit, &capacity, error);
   if (rc != LC_OK)
     goto done;
-  io = projection_new(s, error);
-  if (!io) {
-    rc = LC_ERR_NOMEM;
-    goto done;
+  if (capacity) {
+    walk = lc_alloc_with_allocator(NULL,
+                                   sizeof(*walk) + capacity * sizeof(*order));
+    if (!walk) {
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate startup read order");
+      goto done;
+    }
+    order = (void *)(walk + 1);
+    for (group = begin; group <= end; ++group)
+      for (p = s->value_buckets[group][bucket].head; p; p = p->value_next)
+        if (p->key.owner == owner &&
+            (selected = selected_value(s, p, prefix)) != NULL)
+          order[count++] = selected;
+    rc = values_read_walk(s, walk, count, &private_failure, read, context,
+                          error);
   }
-  memcpy(io->identity, s->identity, sizeof(io->identity));
-  rc = values_read_walk(values, io, 1, read, context, error);
   /* The mutex preserves resident descriptors. A peer can retire their
    * bytes only across a physical checkpoint. Accept the private metadata
    * or its read error only if that transition has not begun. */
   if (ps_internal_read_witness_valid(s)) {
     *accepted = 1;
-    if (__atomic_load_n(&io->poisoned, __ATOMIC_RELAXED))
+    if (private_failure)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
   } else {
     lc_error_cleanup(error);
     rc = LC_OK;
   }
 done:
-  projection_destroy(io);
-  if (values)
-    values_free(values);
+  lc_free_with_allocator(NULL, walk);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

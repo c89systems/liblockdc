@@ -2600,7 +2600,7 @@ static int startup_seed_decode(void *context, ps_key key, ps_reader *reader,
   return rc;
 }
 static void checkpoint_startup_seed(int durable) {
-  for (int mode = 0; mode < 5; ++mode) {
+  for (int mode = 0; mode < 6; ++mode) {
     lc_error e = {0};
     startup_seed_probe probe = {.key = {123, 1, PS_KEY_METADATA}, .mode = mode};
     ps_io io = {&probe, startup_seed_read, write_io, sync_io, reserve_io, NULL};
@@ -2608,12 +2608,21 @@ static void checkpoint_startup_seed(int durable) {
     ps_reader *reader = NULL;
     int accepted;
     ok(ps_open(path, 1, &options, &probe.peer, &e), &e);
-    capture_put_key(probe.peer, probe.key, 65);
+    capture_put_key(probe.peer, probe.key, mode == 5 ? PS_PAGE : 65);
+    if (!mode) {
+      ps_key other = probe.key;
+      other.owner += BUCKETS;
+      capture_put_key(probe.peer, other, 65);
+      other.owner = probe.key.owner;
+      other.kind = PS_STATE;
+      capture_put_key(probe.peer, other, 65);
+    }
     ok(ps_checkpoint(probe.peer, &e), &e);
     options.io = &io;
     ok(ps_open(path, 0, &options, &probe.reader, &e), &e);
     const ps_entry *p = ps_internal_lookup(probe.reader, probe.key);
-    REQUIRE(p && p->count == 1);
+    REQUIRE(p && p->count == 1 &&
+            p->extents[0].flags == (mode == 5 ? 0 : EXTENT_PACKED));
     probe.old_offset = p->extents[0].offset;
     probe.page = probe.old_offset / PS_PAGE * PS_PAGE;
     uint64_t generation = probe.reader->generation;
