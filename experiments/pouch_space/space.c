@@ -7705,7 +7705,8 @@ int ps_internal_read_witness_valid(ps_space *s) {
   return ps_readiness_retains_capture(s);
 }
 static ps_reader *reader_new(ps_space *s, ps_entry *entry) {
-  size_t scratch = entry->bytes < PS_CHUNK ? (size_t)entry->bytes : PS_CHUNK;
+  size_t scratch =
+      entry && entry->bytes < PS_CHUNK ? (size_t)entry->bytes : PS_CHUNK;
   ps_reader *r = lc_alloc_with_allocator(NULL, sizeof(*r) + scratch);
   if (r) {
     memset(r, 0, sizeof(*r));
@@ -7745,9 +7746,8 @@ static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
 }
 int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
                  lc_error *error) {
-  ps_reader *r;
+  ps_reader *r = NULL;
   ps_entry *entry = NULL;
-  ps_coordination_guard *guard;
   int rc;
   if (out)
     *out = NULL;
@@ -7755,27 +7755,35 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
     return err(error, LC_ERR_INVALID,
                "container reader requires typed key and output");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_observe_begin(s, &guard, error);
-  if (rc == LC_OK)
+  rc = healthy(s, error);
+  if (rc == LC_OK && (!s->readiness || ps_readiness_resident(s))) {
+    observe_local_durability(s);
     rc = read_pin(s, key, ref, s->readiness && !s->allocation_guard, &entry,
                   error);
-  if (rc == LC_OK && !entry) {
-    rc = ps_internal_capture_begin(s, &guard, error);
-    if (rc == LC_OK)
-      rc = read_pin(s, key, ref, 0, &entry, error);
   }
-  rc = ps_internal_capture_end(s, guard, rc, error);
+  /* A resident selection can size its scratch exactly. On refresh, reserve
+   * the maximum before adopting the peer's checkpoint. */
   if (rc == LC_OK) {
     r = reader_new(s, entry);
     if (!r)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
   }
+  if (rc == LC_OK && !entry) {
+    ps_coordination_guard *guard;
+    rc = ps_internal_capture_begin(s, &guard, error);
+    if (rc == LC_OK)
+      rc = read_pin(s, key, ref, 0, &entry, error);
+    rc = ps_internal_capture_end(s, guard, rc, error);
+  }
   if (rc == LC_OK) {
+    r->entry = entry;
     ++s->readers;
     *out = r;
   } else if (entry)
     ps_internal_entry_unpin(s, entry);
   pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    lc_free_with_allocator(NULL, r);
   return rc;
 }
 static void reader_payload_invalid(ps_reader *r) {
