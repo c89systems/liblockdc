@@ -1789,7 +1789,12 @@ static void metadata_faults(int repack) {
       OK(ps_checkpoint(s, &error));
       OK(ps_close(s, &error));
     }
-    CHECK(kind == 2 ? (repack ? !count : count > 0) : count > 15);
+    if (kind == 0)
+      CHECK(count >= (repack ? ps_directory_packed_pages(512) : 1));
+    else if (kind == 1)
+      CHECK(count > 15);
+    else
+      CHECK(repack ? !count : count > 0);
     if (repack)
       printf("metadata repack failure sites (%s): %lu\n",
              kind == 0   ? "write/sync"
@@ -1858,9 +1863,13 @@ static void metadata_repack(void) {
   ps_stats before, after, unchanged;
   ps_reader *held = NULL;
   ps_writer *private_writer = NULL;
+  unsigned char original[PS_PAGE], hot[PS_PAGE], replacement[PS_PAGE];
   unsigned char *private_bytes = malloc(PS_CHUNK);
   size_t i;
   CHECK(private_bytes != NULL);
+  memset(original, 'A', sizeof(original));
+  memset(hot, 'B', sizeof(hot));
+  memset(replacement, 'C', sizeof(replacement));
   memset(private_bytes, 0x37, PS_CHUNK);
   BAD(ps_metadata_repack(NULL, &error));
   for (int sync = 0; sync < 2; ++sync) {
@@ -1868,7 +1877,7 @@ static void metadata_repack(void) {
     s = create(PS_DEFAULT_CAPACITY, sync, NULL);
     OK(ps_metadata_repack(s, &error));
     for (i = 0; i < entries; ++i)
-      put(s, state(i), "A", 1, 1);
+      put(s, state(i), original, sizeof(original), PS_PAGE);
     OK(ps_checkpoint(s, &error));
     OK(ps_read_open(s, state(0), NULL, &held, &error));
     /* Keep one cold reference per initial descriptor page, then separate hot
@@ -1876,7 +1885,7 @@ static void metadata_repack(void) {
     for (i = 0; i < entries; ++i) {
       if (i % 45 == 44)
         continue;
-      put(s, state(i), "B", 1, 1);
+      put(s, state(i), hot, sizeof(hot), PS_PAGE);
       OK(ps_checkpoint(s, &error));
     }
     OK(ps_status(s, &before, &error));
@@ -1885,7 +1894,7 @@ static void metadata_repack(void) {
     /* Repack also includes dirty replacement/tombstone ownership and excludes
      * an unpublished writer, even though its payload pages are already owned.
      */
-    put(s, state(0), "C", 1, 1);
+    put(s, state(0), replacement, sizeof(replacement), PS_PAGE);
     OK(ps_delete(s, state(1), &error));
     OK(ps_begin(s, NULL, state(999), &private_writer, &error));
     OK(ps_write(private_writer, private_bytes, PS_CHUNK, &error));
@@ -1899,13 +1908,17 @@ static void metadata_repack(void) {
           after.metadata_pages == (after.metadata_bytes + 4031) / 4032 +
                                       ps_directory_packed_pages(after.entries));
     CHECK(after.metadata_pages < before.metadata_pages / 4);
-    read_value(held, "A", 1);
+    read_value(held, original, sizeof(original));
     ps_reader_close(held);
     for (i = 0; i < entries; ++i) {
       if (i == 1)
         absent(s, state(i));
       else
-        expect(s, state(i), NULL, i == 0 ? "C" : i % 45 == 44 ? "A" : "B", 1);
+        expect(s, state(i), NULL,
+               i == 0         ? replacement
+               : i % 45 == 44 ? original
+                              : hot,
+               PS_PAGE);
     }
     OK(ps_publish(private_writer, NULL, &error));
     ps_writer_close(private_writer);
@@ -1920,10 +1933,10 @@ static void metadata_repack(void) {
           before.descriptor_page_writes == unchanged.descriptor_page_writes);
     OK(ps_close(s, &error));
     s = reopen(NULL);
-    expect(s, state(0), NULL, "C", 1);
+    expect(s, state(0), NULL, replacement, sizeof(replacement));
     absent(s, state(1));
-    expect(s, state(44), NULL, "A", 1);
-    expect(s, state(2), NULL, "B", 1);
+    expect(s, state(44), NULL, original, sizeof(original));
+    expect(s, state(2), NULL, hot, sizeof(hot));
     expect(s, state(999), NULL, private_bytes, PS_CHUNK);
     OK(ps_close(s, &error));
     printf("metadata repack: %lu fragmented pages to %lu dense pages\n",
@@ -2147,7 +2160,7 @@ static void metadata_capacity(void) {
   uint64_t fallbacks;
   unsigned char *body = malloc(PS_PAGE);
   unsigned char *name = malloc(PS_CHUNK + 17);
-  unsigned char tail[33];
+  unsigned char tail[33], descriptor_body[PS_PAGE];
   size_t i, count, got, pass, filled = 0;
   int rc;
   CHECK(body && name);
@@ -2168,13 +2181,17 @@ static void metadata_capacity(void) {
     original = binding.revision;
     OK(ps_catalog_get(s, 77, PS_CATALOG_PROJECTION, name, PS_CHUNK + 17,
                       &catalog_pin, &error));
+    /* Leave separate descriptors on cold pages so that repack can recover
+     * foreground capacity after the first fill. */
+    memset(descriptor_body, 'A', sizeof(descriptor_body));
     for (i = 0; i < 180; ++i)
-      put(s, state(i), "A", 1, 1);
+      put(s, state(i), descriptor_body, sizeof(descriptor_body), PS_PAGE);
     OK(ps_checkpoint(s, &error));
+    descriptor_body[0] = 'B';
     for (i = 0; i < 180; ++i) {
       if (i % 45 == 44)
         continue;
-      put(s, state(i), "B", 1, 1);
+      put(s, state(i), descriptor_body, sizeof(descriptor_body), PS_PAGE);
       OK(ps_checkpoint(s, &error));
     }
     OK(ps_read_open(s, state(44), NULL, &held, &error));
@@ -2223,7 +2240,8 @@ static void metadata_capacity(void) {
     }
     OK(ps_status(s, &stats, &error));
     CHECK(stats.capacity == 3 * PS_MIB && stats.metadata_fallbacks);
-    read_value(held, "A", 1);
+    descriptor_body[0] = 'A';
+    read_value(held, descriptor_body, sizeof(descriptor_body));
     ps_reader_close(held);
     OK(ps_catalog_view_info(catalog_pin, &observed, &error));
     CHECK(observed.id == binding.id &&
@@ -2420,7 +2438,7 @@ static void metadata_growth_faults(void) {
         if (!phase) {
           OK(rc);
           OK(ps_status(s, &after, &error));
-          CHECK(after.descriptor_page_writes > before.descriptor_page_writes &&
+          CHECK(after.directory_page_writes > before.directory_page_writes &&
                 after.metadata_available_bytes >=
                     after.metadata_workspace_bytes);
           sites = kind == 0   ? audit.model.operations

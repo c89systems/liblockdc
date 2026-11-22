@@ -3,8 +3,8 @@
 
 #include "space.h"
 
-/* Internal typed checkpoint index. Leaves bind keys to metadata records or
- * hold the extent information for a small value. */
+/* Internal typed checkpoint index. Leaves name descriptors or carry all
+ * physical ownership fields of a supported single-extent entry. */
 typedef struct ps_directory ps_directory;
 typedef struct ps_directory_root {
   uint64_t offset, generation;
@@ -12,14 +12,18 @@ typedef struct ps_directory_root {
 typedef struct ps_descriptor_ref {
   uint64_t offset, bytes, incarnation;
 } ps_descriptor_ref;
+enum ps_directory_storage {
+  PS_DIRECTORY_DESCRIPTOR = 0,
+  PS_DIRECTORY_PACKED_VALUE = 1,
+  PS_DIRECTORY_OWNED_RUN = 2
+};
 typedef struct ps_directory_value {
   ps_descriptor_ref ref;
   uint64_t deletion_bytes;
   uint32_t crc;
-  /* When set, ref identifies one packed payload extent. Otherwise it names a
-   * descriptor and both extra fields are zero. */
-  uint32_t packed;
+  uint32_t storage;
 } ps_directory_value;
+int ps_internal_immutable_key(ps_key);
 /* read/write transfer exactly one PS_PAGE block; the container handles short
  * I/O and EINTR. allocate reserves a distinct aligned page on success and no
  * page on failure. Pages reachable from any recoverable root or active

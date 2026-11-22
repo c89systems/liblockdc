@@ -1,6 +1,7 @@
 #include "directory.h"
 #include "crc.h"
 #include "lc_api_internal.h"
+#include "owned.h"
 
 #include <string.h>
 #include <zlib.h>
@@ -104,11 +105,14 @@ static int valid_value(ps_key key, const ps_directory_value *value) {
   if (!ref->offset || !ref->bytes || !ref->incarnation ||
       ref->offset > INT64_MAX || ref->bytes > (uint64_t)INT64_MAX - ref->offset)
     return 0;
-  if (!value->packed)
+  if (value->storage == PS_DIRECTORY_DESCRIPTOR)
     return !value->crc && !value->deletion_bytes;
-  return value->packed == 1 && ref->bytes < PS_PAGE &&
-         (key.kind == PS_KEY_METADATA ||
-          (key.kind == PS_KEY_DECISION && !value->deletion_bytes));
+  if (value->storage == PS_DIRECTORY_PACKED_VALUE)
+    return ref->bytes < PS_PAGE && ps_internal_immutable_key(key) &&
+           (key.kind == PS_KEY_METADATA || !value->deletion_bytes);
+  return value->storage == PS_DIRECTORY_OWNED_RUN && key.kind == PS_OWNED_RUN &&
+         !value->deletion_bytes && ref->offset % PS_PAGE == 0 &&
+         ref->bytes % PS_PAGE == 0 && ref->bytes <= PS_MIB;
 }
 static int available(ps_directory *d, lc_error *error) {
   return d && !d->failed && !d->flushed
@@ -161,7 +165,7 @@ static int slot_child(const unsigned char *slot, ps_directory_root parent,
 }
 static int slot_value(const unsigned char *slot, ps_key key,
                       ps_directory_value *value) {
-  value->packed = load32(slot + 4);
+  value->storage = load32(slot + 4);
   value->ref.offset = load64(slot + 24);
   value->ref.bytes = load64(slot + 32);
   value->ref.incarnation = load64(slot + 40);
@@ -782,8 +786,8 @@ static int write_node(ps_directory *d, directory_node *node,
       store64(slot + 24, value->ref.offset);
       store64(slot + 32, value->ref.bytes);
       store64(slot + 40, value->ref.incarnation);
-      if (value->packed) {
-        store32(slot + 4, value->packed);
+      if (value->storage != PS_DIRECTORY_DESCRIPTOR) {
+        store32(slot + 4, value->storage);
         store32(slot + 48, value->crc);
         store64(slot + 56, value->deletion_bytes);
       }

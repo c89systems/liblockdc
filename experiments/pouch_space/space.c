@@ -423,7 +423,7 @@ static int valid_key(ps_key k) {
          (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
-static int immutable_key(ps_key k) {
+int ps_internal_immutable_key(ps_key k) {
   return k.kind == PS_STATE || k.kind == PS_COLLECTION ||
          k.kind == PS_CONTROL || k.kind == PS_ROUTING ||
          (k.kind >= PS_QUERY_FIRST && k.kind <= PS_QUERY_LAST) ||
@@ -690,7 +690,7 @@ static void install(ps_space *s, ps_entry *p, ps_entry *old) {
   slot->entry = p;
   slot->hash = hash;
   s->keys.count += old == NULL;
-  if (immutable_key(p->key))
+  if (ps_internal_immutable_key(p->key))
     value_register(s, p);
   if (p->key.kind == PS_STREAM && !p->deleted)
     stream_register(s, p);
@@ -2271,7 +2271,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
        (count || p->bytes || wire_count ||
-        (!immutable_key(p->key) && p->key.kind != PS_OWNED_RUN &&
+        (!ps_internal_immutable_key(p->key) && p->key.kind != PS_OWNED_RUN &&
          p->key.kind != PS_STREAM && p->key.kind != PS_CATALOG))) ||
       (*event == PS_SEAL && p->key.kind != PS_STREAM))
     goto invalid;
@@ -3339,17 +3339,22 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
   size_t bytes, capacity;
   int rc;
   memset(value, 0, sizeof(*value));
-  if ((p->key.kind == PS_KEY_METADATA || p->key.kind == PS_KEY_DECISION) &&
-      p->count == 1 && p->extents[0].flags == EXTENT_PACKED) {
+  if (p->count == 1) {
+    if (ps_internal_immutable_key(p->key) &&
+        p->extents[0].flags == EXTENT_PACKED)
+      value->storage = PS_DIRECTORY_PACKED_VALUE;
+    else if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
+      value->storage = PS_DIRECTORY_OWNED_RUN;
+  }
+  if (value->storage != PS_DIRECTORY_DESCRIPTOR) {
     value->ref.offset = p->extents[0].offset;
     value->ref.bytes = p->bytes;
     value->ref.incarnation = p->token;
     value->deletion_bytes = p->deletion_bytes;
     value->crc = p->extents[0].crc;
-    value->packed = 1;
     return LC_OK;
   }
-  /* Packed values and deletions need no new descriptor reference. Record
+  /* Inline extents and deletions need no new descriptor reference. Record
    * only the descriptors written by this build, before selecting its root. */
   if (builder->binding_count == builder->binding_capacity) {
     if (builder->binding_capacity > SIZE_MAX / sizeof(*bindings) / 2)
@@ -4518,11 +4523,15 @@ static int decode_directory_entry(metadata_recovery *recovery,
     ps_internal_entry_free(p);
   return rc;
 }
+static int directory_extent_in_bounds(const ps_space *s,
+                                      const ps_descriptor_ref *ref) {
+  return ref->incarnation <= s->token_limit && ref->offset >= PS_DATA &&
+         ref->offset <= s->capacity && ref->bytes <= s->capacity - ref->offset;
+}
 static int check_packed_binding(ps_space *s, const ps_directory_value *value,
                                 lc_error *error) {
   ps_descriptor_ref ref = value->ref;
-  if (ref.incarnation > s->token_limit || ref.offset < PS_DATA ||
-      ref.offset > s->capacity || ref.bytes > s->capacity - ref.offset ||
+  if (!directory_extent_in_bounds(s, &ref) ||
       !valid_packed_extent(ref.offset, ref.bytes) ||
       (value->deletion_bytes > ref.bytes &&
        value->deletion_bytes - ref.bytes > 512))
@@ -4538,7 +4547,30 @@ static void unpack_binding(ps_entry *p, ps_key key,
   p->extents[0].offset = value->ref.offset;
   p->extents[0].bytes = value->ref.bytes;
   p->extents[0].crc = value->crc;
-  p->extents[0].flags = EXTENT_PACKED;
+  p->extents[0].flags =
+      value->storage == PS_DIRECTORY_OWNED_RUN ? EXTENT_OWNED : EXTENT_PACKED;
+}
+static int load_owned_binding(metadata_recovery *recovery,
+                              metadata_directory_entry *item, lc_error *error) {
+  ps_space *s = recovery->space;
+  const ps_descriptor_ref *ref = &item->value.ref;
+  ps_entry *p,
+      *old = recovery->resident ? lookup(recovery->resident, item->key) : NULL;
+  /* The directory checked the alignment and extent size. A plain run's
+   * capacity is its extent minus the immutable identity and footer area. */
+  if (!directory_extent_in_bounds(s, ref) || ref->bytes <= PS_RUN_HEADER ||
+      item->key.key > (uint64_t)INT64_MAX - (ref->bytes - PS_RUN_HEADER))
+    return err(error, LC_ERR_PROTOCOL, "invalid inline owned run extent");
+  if (old && old->token != ref->incarnation)
+    old = NULL;
+  p = space_entry_new(s, PS_OWNED_RUN, 1, old != NULL);
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot recover inline owned run");
+  unpack_binding(p, item->key, &item->value);
+  p->stream->capacity = ref->bytes - PS_RUN_HEADER;
+  p->projection = old;
+  item->decoded = p;
+  return LC_OK;
 }
 static int register_packed_binding(ps_space *s, ps_entry *p,
                                    uint64_t deletion_bytes, lc_error *error) {
@@ -4708,7 +4740,9 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->resident)
+    if (item->value.storage == PS_DIRECTORY_OWNED_RUN)
+      rc = load_owned_binding(r, item, error);
+    else if (item->resident)
       rc = reuse_directory_entry(r, item, error);
     else
       fetch[count++] = item;
@@ -4753,7 +4787,7 @@ static int capture_directory_entry(void *v, ps_key key,
   ps_descriptor_ref ref = value->ref;
   ps_entry *old = NULL;
   size_t capacity;
-  if (value->packed)
+  if (value->storage == PS_DIRECTORY_PACKED_VALUE)
     return r->resident
                ? collect_projection_binding(r, key, value, error)
                : load_open_binding(r->space, &r->open_slab, key, value, error);
@@ -4768,8 +4802,9 @@ static int capture_directory_entry(void *v, ps_key key,
     r->entries = item;
     r->capacity = capacity;
   }
-  if (r->shared_leaf && ref.incarnation <= r->space->token_limit &&
-      (immutable_key(key) || key.kind == PS_CATALOG)) {
+  if (value->storage == PS_DIRECTORY_DESCRIPTOR && r->shared_leaf &&
+      ref.incarnation <= r->space->token_limit &&
+      (ps_internal_immutable_key(key) || key.kind == PS_CATALOG)) {
     old = lookup(r->resident, key);
     if (old &&
         (old->deleted || old->dirty_link || old->token != ref.incarnation ||
@@ -4825,7 +4860,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
     if (rc == LC_OK &&
         (event == PS_REMOVE
              ? entries[i]->key.kind != PS_KEY_METADATA
-             : event != PS_PUT || !immutable_key(entries[i]->key)))
+             : event != PS_PUT || !ps_internal_immutable_key(entries[i]->key)))
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
     for (j = 0; rc == LC_OK && j < i; ++j)
       if (same_key(entries[j]->key, entries[i]->key))
@@ -5206,7 +5241,8 @@ replay_extents:
       rc = verify_owned(s, single, header, error);
     }
     if (rc == LC_OK) {
-      if (immutable_key(single->key) || single->key.kind == PS_CATALOG)
+      if (ps_internal_immutable_key(single->key) ||
+          single->key.kind == PS_CATALOG)
         single->peer_sequence = s->sequence + 1;
       rc = apply_journal_event(s, single, event, 0, s->sequence + 1, error);
     }
@@ -5449,8 +5485,9 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         return rc;
       ps_catalog_apply_record(s, p, release);
     } else {
-      if ((!immutable_key(p->key) || p->key.kind == PS_COLLECTION) && old &&
-          !old->deleted)
+      if ((!ps_internal_immutable_key(p->key) ||
+           p->key.kind == PS_COLLECTION) &&
+          old && !old->deleted)
         return err(error, LC_ERR_PROTOCOL,
                    "journal overwrites typed ownership");
       if (p->key.kind == PS_STREAM && (p->bytes || p->stream->capacity ||
@@ -6687,7 +6724,7 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
   if (out)
     *out = NULL;
   if (!s || !out ||
-      (!immutable_key(key) && !(owned && key.kind == PS_OWNED_RUN)))
+      (!ps_internal_immutable_key(key) && !(owned && key.kind == PS_OWNED_RUN)))
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
   w = lc_calloc_with_allocator(NULL, 1, sizeof(*w));
@@ -7258,7 +7295,7 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   int rc;
   if (out)
     *out = NULL;
-  if (!s || !out || !immutable_key(key))
+  if (!s || !out || !ps_internal_immutable_key(key))
     return err(error, LC_ERR_INVALID,
                "container reader requires typed key and output");
   r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
@@ -7539,7 +7576,7 @@ int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
                   int *present, lc_error *error) {
   ps_entry *p;
   int rc;
-  if (!s || !ref || !bytes || !present || !immutable_key(key))
+  if (!s || !ref || !bytes || !present || !ps_internal_immutable_key(key))
     return err(error, LC_ERR_INVALID,
                "value observation requires typed output");
   memset(ref, 0, sizeof(*ref));
@@ -7574,7 +7611,7 @@ int ps_value_validate(ps_space *s, ps_key key, const ps_ref *expected,
   ps_coordination_guard *guard;
   unsigned char *buffer = NULL;
   int rc, checked = 0;
-  if (!s || !valid || !immutable_key(key))
+  if (!s || !valid || !ps_internal_immutable_key(key))
     return err(error, LC_ERR_INVALID, "value validation requires typed output");
   *valid = 0;
   pthread_mutex_lock(&s->mutex);
@@ -8176,7 +8213,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
   p->key.kind = get32(wire + 72);
   p->token = get64(wire + 48);
   p->bytes = get64(wire + 56);
-  if (!immutable_key(p->key)) {
+  if (!ps_internal_immutable_key(p->key)) {
     rc = err(error, LC_ERR_INVALID, "captured ticket requires immutable value");
     goto done;
   }
@@ -8246,7 +8283,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
   ps_coordination_guard *guard;
   int rc, matched;
   uint64_t sequence = 0;
-  if (!s || !immutable_key(key))
+  if (!s || !ps_internal_immutable_key(key))
     return err(error, LC_ERR_INVALID, "container delete requires typed key");
   tombstone = ps_internal_entry_new(key.kind, 0);
   if (!tombstone)

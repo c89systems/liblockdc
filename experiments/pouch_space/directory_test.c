@@ -155,7 +155,8 @@ static void expect(ps_directory *d, uint64_t number, uint64_t incarnation) {
   if (incarnation) {
     CHECK(actual.ref.offset == wanted.ref.offset &&
           actual.ref.bytes == wanted.ref.bytes);
-    CHECK(actual.ref.incarnation == incarnation && !actual.packed);
+    CHECK(actual.ref.incarnation == incarnation &&
+          actual.storage == PS_DIRECTORY_DESCRIPTOR);
   }
 }
 typedef struct scan {
@@ -186,7 +187,8 @@ static int scan_entry(void *v, ps_key k, const ps_directory_value *actual,
   wanted = value(k.key, s->expected[k.key]);
   CHECK(actual->ref.offset == wanted.ref.offset &&
         actual->ref.bytes == wanted.ref.bytes &&
-        actual->ref.incarnation == wanted.ref.incarnation && !actual->packed);
+        actual->ref.incarnation == wanted.ref.incarnation &&
+        actual->storage == PS_DIRECTORY_DESCRIPTOR);
   s->previous = (size_t)k.key;
   ++s->count;
   return LC_OK;

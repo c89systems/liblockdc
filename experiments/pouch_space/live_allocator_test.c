@@ -2351,6 +2351,11 @@ static void checkpoint_page_checksum(unsigned char *page) {
   for (size_t i = 0; i < 4; ++i)
     page[48 + i] = (unsigned char)(crc >> (8 * i));
 }
+static void checkpoint_leaf_checksum(unsigned char *page) {
+  uint32_t crc = (uint32_t)crc32(crc32(0, page, 12), page + 16, PS_PAGE - 16);
+  for (size_t i = 0; i < 4; ++i)
+    page[12 + i] = (unsigned char)(crc >> (8 * i));
+}
 static void reject_descriptor_checksum(ps_descriptor_ref ref) {
   unsigned char original[PS_PAGE], damaged[PS_PAGE];
   off_t page = (off_t)(ref.offset / PS_PAGE * PS_PAGE);
@@ -2389,23 +2394,31 @@ static void checkpoint_ownership_overlap(void) {
     REQUIRE(first && second && first->count == 1 && second->count == 1);
     uint64_t offset = first->extents[0].offset;
     const ps_descriptor_ref ref = second->checkpoint_ref;
-    size_t at = (size_t)(ref.offset % PS_PAGE);
-    off_t page = (off_t)(ref.offset - at);
+    size_t at = ref.offset ? (size_t)(ref.offset % PS_PAGE) : 128;
+    off_t page =
+        (off_t)(ref.offset ? ref.offset - at : writer->directory.offset);
     unsigned char original[PS_PAGE], damaged[PS_PAGE];
-    REQUIRE(ref.bytes == 88 && at + ref.bytes <= sizeof(original) &&
+    REQUIRE((form == 1 ? ref.bytes == 88 : !ref.offset) &&
+            at + ref.bytes <= sizeof(original) &&
             offset != second->extents[0].offset);
     REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
             sizeof(original));
     memcpy(damaged, original, sizeof(damaged));
-    /* Keep the descriptor and enclosing page valid while giving both
-     * descriptors the same physical start. */
+    /* Keep framing valid while aliasing the two physical starts. */
+    size_t field = ref.offset ? 64 : 24;
     for (size_t i = 0; i < 8; ++i)
-      damaged[at + 64 + i] = (unsigned char)(offset >> (8 * i));
-    uint32_t crc =
-        (uint32_t)crc32(crc32(0, damaged + at, 60), damaged + at + 64, 24);
-    for (size_t i = 0; i < 4; ++i)
-      damaged[at + 60 + i] = (unsigned char)(crc >> (8 * i));
-    checkpoint_page_checksum(damaged);
+      damaged[at + field + i] = (unsigned char)(offset >> (8 * i));
+    if (ref.offset) {
+      uint32_t crc =
+          (uint32_t)crc32(crc32(0, damaged + at, 60), damaged + at + 64, 24);
+      for (size_t i = 0; i < 4; ++i)
+        damaged[at + 60 + i] = (unsigned char)(crc >> (8 * i));
+      checkpoint_page_checksum(damaged);
+    } else {
+      REQUIRE(original[4] == 0 && original[8] == 2 &&
+              original[at + 4] == PS_DIRECTORY_PACKED_VALUE);
+      checkpoint_leaf_checksum(damaged);
+    }
     REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
             sizeof(damaged));
     const char *message = form ? "overlapping container ownership"
@@ -2439,14 +2452,14 @@ static void checkpoint_binding_reuse(int durable) {
   ps_reader *pinned = NULL, *fresh = NULL;
   ok(ps_open(path, 1, &options, &writer, &e), &e);
   for (uint64_t id = 1; id <= 320; ++id)
-    capture_put(writer, id, 65);
+    capture_put(writer, id, id == 160 ? PS_PAGE : 65);
   ok(ps_checkpoint(writer, &e), &e);
   options.io = &io;
   ok(ps_open(path, 0, &options, &observer, &e), &e);
   ok(ps_open(path, 0, &options, &verifier, &e), &e);
   ok(ps_read_open(observer, key(1), NULL, &pinned, &e), &e);
   const ps_entry *before = ps_internal_lookup(observer, key(160));
-  REQUIRE(before);
+  REQUIRE(before && before->checkpoint_ref.bytes == 88);
   ps_descriptor_ref ref = before->checkpoint_ref;
   probe.pages[0] = ref.offset / PS_PAGE * PS_PAGE;
   probe.count = 1;
@@ -2488,7 +2501,7 @@ static void checkpoint_binding_reuse(int durable) {
   probe.reads[0] = 0;
   ok(ps_read_open(observer, key(160), NULL, &fresh, &e), &e);
   REQUIRE(observer->generation == writer->generation && probe.reads[0]);
-  captured_expect(fresh, 160, 65);
+  captured_expect(fresh, 160, PS_PAGE);
   ps_reader_close(fresh);
   ok(ps_close(verifier, &e), &e);
   ok(ps_close(observer, &e), &e);
@@ -2619,10 +2632,7 @@ static void checkpoint_packed_bindings(int durable) {
       damaged[64 + 57] = 5; /* deletion exceeds the selected key slot */
     else
       damaged[64 + 24] ^= 1U; /* misaligned packed extent */
-    uint32_t crc =
-        (uint32_t)crc32(crc32(0, damaged, 12), damaged + 16, PS_PAGE - 16);
-    for (size_t i = 0; i < 4; ++i)
-      damaged[12 + i] = (unsigned char)(crc >> (8 * i));
+    checkpoint_leaf_checksum(damaged);
     REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
             sizeof(damaged));
     uint64_t generation = observer->generation;
@@ -2767,25 +2777,31 @@ static void checkpoint_orphan_run(void) {
   REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
           sizeof(original));
   REQUIRE(original[4] == 0 && original[8] == 2 && original[64] == PS_STREAM &&
-          original[128] == PS_OWNED_RUN);
-  memcpy(damaged, original, sizeof(damaged));
-  damaged[8] = 1;
-  memcpy(damaged + 64, original + 128, 64);
-  memset(damaged + 128, 0, 64);
-  uint32_t crc =
-      (uint32_t)crc32(crc32(0, damaged, 12), damaged + 16, PS_PAGE - 16);
-  for (size_t i = 0; i < 4; ++i)
-    damaged[12 + i] = (unsigned char)(crc >> (8 * i));
-  REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
-          sizeof(damaged));
+          original[128] == PS_OWNED_RUN &&
+          original[132] == PS_DIRECTORY_OWNED_RUN);
   uint64_t generation = peer->generation;
-  REQUIRE(ps_refresh(peer, &e) == LC_ERR_PROTOCOL &&
-          peer->generation == generation && e.message &&
-          !strcmp(e.message, "owned run has no stream head"));
-  lc_error_cleanup(&e);
-  REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
-          e.message && !strcmp(e.message, "owned run has no stream head"));
-  lc_error_cleanup(&e);
+  for (int invalid_tail = 0; invalid_tail < 2; ++invalid_tail) {
+    const char *message = invalid_tail ? "invalid inline owned run extent"
+                                       : "owned run has no stream head";
+    memcpy(damaged, original, sizeof(damaged));
+    if (invalid_tail) {
+      memset(damaged + 128 + 16, 0xff, 8);
+    } else {
+      damaged[8] = 1;
+      memcpy(damaged + 64, original + 128, 64);
+      memset(damaged + 128, 0, 64);
+    }
+    checkpoint_leaf_checksum(damaged);
+    REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
+            sizeof(damaged));
+    REQUIRE(ps_refresh(peer, &e) == LC_ERR_PROTOCOL &&
+            peer->generation == generation && e.message &&
+            !strcmp(e.message, message));
+    lc_error_cleanup(&e);
+    REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
+            e.message && !strcmp(e.message, message));
+    lc_error_cleanup(&e);
+  }
   REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
           sizeof(original));
   ok(ps_refresh(peer, &e), &e);
@@ -2803,12 +2819,13 @@ static void checkpoint_prepared_bindings(void) {
   int partial = 0;
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
   for (uint64_t id = 1; id <= 68; ++id)
-    capture_put(writer, id, 65);
+    capture_put(writer, id, id == 1 ? PS_PAGE : 65);
   capture_put_key(writer, packed, 65);
   ok(ps_metadata_repack(writer, &e), &e);
   ok(ps_open(path, 0, NULL, &peer, &e), &e);
   ok(ps_read_open(peer, key(1), NULL, &old, &e), &e);
   ps_descriptor_ref prior = ps_internal_lookup(writer, key(1))->checkpoint_ref;
+  REQUIRE(prior.bytes == 88);
   uint64_t generation = writer->generation;
   capture_put(writer, 1, replacement);
   ok(ps_delete(writer, key(2), &e), &e);
@@ -2831,7 +2848,7 @@ static void checkpoint_prepared_bindings(void) {
     lc_error_cleanup(&e);
   }
   REQUIRE(partial && writer->generation == generation + 1);
-  captured_expect(old, 1, 65);
+  captured_expect(old, 1, PS_PAGE);
   ps_reader_close(old);
   ok(ps_close(peer, &e), &e);
   ok(ps_close(writer, &e), &e);
@@ -2868,7 +2885,7 @@ static void checkpoint_decode(void) {
   lc_error e = {0};
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
   for (uint64_t id = 1; id <= 36; ++id)
-    capture_put(writer, id, id == 3 ? 3 * PS_CHUNK : 65);
+    capture_put(writer, id, id == 3 ? 3 * PS_CHUNK : id == 24 ? PS_PAGE : 65);
   ok(ps_checkpoint(writer, &e), &e);
   ps_descriptor_ref short_ref =
       ps_internal_lookup(writer, key(24))->checkpoint_ref;
