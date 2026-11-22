@@ -2,7 +2,7 @@
 #define POUCH_SPACE_READINESS_H
 #include "space.h"
 typedef struct ps_readiness ps_readiness;
-#define PS_READINESS_WORDS 12U
+#define PS_READINESS_WORDS 13U
 #define PS_READINESS_CREDIT_SLOTS 32U
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
@@ -14,6 +14,7 @@ enum ps_readiness_change {
 };
 typedef struct ps_readiness_certificate {
   uint64_t ready, durable, root, origin, pending;
+  size_t journal_bytes; /* Relative to the selected root's journal start. */
   uint64_t grant_used, grant_limit;
   uint64_t prepared_durable;
 } ps_readiness_certificate;
@@ -65,7 +66,7 @@ int ps_readiness_publish(ps_space *, lc_error *);
 int ps_readiness_prepare_ticket(ps_space *, uint64_t *, lc_error *);
 uint64_t ps_readiness_issued_tickets(ps_space *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
-                           uint64_t prepared, lc_error *);
+                           size_t journal_bytes, uint64_t prepared, lc_error *);
 /* A stable checked snapshot can prove a private preparation ticket without
  * allocation authority. Notifications carry no proof or authority. */
 int ps_readiness_prepared_durable(ps_space *, uint64_t ticket);

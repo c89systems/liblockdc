@@ -56,11 +56,11 @@ preserves the previous selection.
 Reclamation follows durable root retirement and outstanding physical ownership.
 Linux OFD range witnesses retain reader extents and private writer workspace
 across independent opens. The shared readiness certificate identifies the
-root and accepted journal prefix. It can validate speculative adoption or
-private metadata reads before their results are installed. Startup namespace
-recovery validates privately decoded checkpoint metadata against the physical
-root and reloads through witnessed reads on a root transition. Shared readers
-retain exact physical witnesses for their lifetimes.
+root and accepted journal sequence and byte bounds. It can validate
+speculative adoption or private metadata reads before installation. Startup
+namespace recovery validates privately decoded checkpoint metadata against the
+physical root and reloads through witnessed reads on a root transition.
+Shared readers retain exact physical witnesses for their lifetimes.
 
 ## Verification and performance
 

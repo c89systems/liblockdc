@@ -3851,6 +3851,19 @@ static void readiness_cohort(void) {
                  PS_READINESS_OFFSET + older * sizeof(zero)) ==
           PS_READINESS_WORDS * sizeof(zero));
   size_t crc = selected + PS_READINESS_WORDS - 1;
+  uint64_t outside[PS_READINESS_WORDS];
+  memcpy(outside, records + selected, sizeof(outside));
+  outside[PS_READINESS_WORDS - 2] = PS_JOURNAL + 1;
+  outside[PS_READINESS_WORDS - 1] =
+      crc32(0, (const unsigned char *)outside, sizeof(outside) - sizeof(zero));
+  REQUIRE(pwrite(a->fd, outside, sizeof(outside),
+                 PS_READINESS_OFFSET + selected * sizeof(zero)) ==
+          sizeof(outside));
+  REQUIRE(ps_open(path, 0, NULL, &c, &e) == LC_ERR_TRANSPORT && !c);
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(a->fd, records + selected, sizeof(outside),
+                 PS_READINESS_OFFSET + selected * sizeof(zero)) ==
+          sizeof(outside));
   uint64_t damaged = records[crc] ^ 1;
   REQUIRE(pwrite(a->fd, &damaged, sizeof(damaged),
                  PS_READINESS_OFFSET + crc * sizeof(damaged)) ==
@@ -3861,7 +3874,7 @@ static void readiness_cohort(void) {
   lc_error_cleanup(&e);
   /* A checksum-valid record from the previous live protocol also fences
    * admission. The disk format can still reopen after the cohort drains. */
-  records[selected + 1] = UINT64_C(0x3359444145525350);
+  records[selected + 1] = UINT64_C(0x4259444145525350);
   records[crc] = crc32(0, (const unsigned char *)(records + selected),
                        (uInt)((PS_READINESS_WORDS - 1) * sizeof(zero)));
   REQUIRE(pwrite(b->fd, records + selected, PS_READINESS_WORDS * sizeof(zero),
@@ -4600,20 +4613,20 @@ static void certified_prefix_reads(void) {
      &e);
   ps_writer_close(w);
   expect_value(a, key(1), 65, 1);
-  REQUIRE(!disk.root_reads && disk.journal_reads == 2);
+  REQUIRE(!disk.root_reads && disk.journal_reads == 1);
   ok(ps_flush(b, &e), &e);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(!disk.root_reads && disk.journal_reads == 2);
+  REQUIRE(!disk.root_reads && disk.journal_reads == 1);
 
   ok(ps_checkpoint(b, &e), &e);
   expect_value(a, key(1), 65, 42);
   /* A private preview reads both roots. The allocator revalidates the
    * pair before adopting either root. */
-  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 3);
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 1);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 3);
+  REQUIRE(disk.root_reads == 4 && disk.journal_reads == 1);
   ok(ps_refresh(a, &e), &e);
-  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 4);
+  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 2);
   /* A writer can exit just before issuing its first write. Confirm the old
    * end marker once, then return to reads using the live certificate. */
   ps_coordination_guard *guard = NULL;
@@ -4624,9 +4637,9 @@ static void certified_prefix_reads(void) {
   ps_coordination_unlock(guard);
   expect_value(a, key(1), 65, 42);
   REQUIRE(!readiness(a).pending && disk.root_reads == 6 &&
-          disk.journal_reads == 5);
+          disk.journal_reads == 3);
   expect_value(a, key(1), 65, 42);
-  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 5);
+  REQUIRE(disk.root_reads == 6 && disk.journal_reads == 3);
   ok(ps_close(b, &e), &e);
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
@@ -5019,6 +5032,68 @@ static void quarantine_packed(void) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+typedef struct journal_import_probe {
+  size_t reads, bytes;
+} journal_import_probe;
+
+static ssize_t journal_import_read(void *context, int fd, void *bytes, size_t n,
+                                   off_t offset) {
+  journal_import_probe *probe = context;
+  if (offset >= PS_JOURNAL_OFFSET && offset < PS_DATA) {
+    ++probe->reads;
+    probe->bytes += n;
+  }
+  return pread(fd, bytes, n, offset);
+}
+
+static void journal_certified_import(void) {
+  lc_error e = {0};
+  journal_import_probe probe = {0};
+  ps_io io = {&probe, journal_import_read, write_io, sync_io, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_space *a = NULL, *b = NULL;
+  ps_reader *reader = NULL;
+  ps_writer *group[2];
+  ok(ps_open(path, 1, &options, &a, &e), &e);
+  ok(ps_open(path, 0, NULL, &b, &e), &e);
+  capture_put(b, 1, 65);
+  size_t first = b->journal;
+  group[0] = replay_value(b, key(2), 2, 65, &e);
+  group[1] = replay_value(b, key(3), 3, PS_CHUNK, &e);
+  ok(ps_revision_publish(group, 2, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
+  ps_writer_close(group[0]);
+  ps_writer_close(group[1]);
+  size_t end = b->journal;
+  REQUIRE(first && end > first && !a->journal &&
+          readiness(b).journal_bytes == end);
+
+  unsigned char last, changed;
+  off_t tail = (off_t)JOURNAL_POSITION(b->journal_start + end - 1);
+  REQUIRE(pread(b->fd, &last, 1, tail) == 1);
+  changed = last ^ 1;
+  REQUIRE(pwrite(b->fd, &changed, 1, tail) == 1);
+  probe = (journal_import_probe){0};
+  REQUIRE(ps_read_open(a, key(3), NULL, &reader, &e) == LC_ERR_PROTOCOL &&
+          !reader);
+  lc_error_cleanup(&e);
+  REQUIRE(probe.reads == 1 && probe.bytes == end && a->journal == first);
+  REQUIRE(ps_internal_lookup(a, key(1)) && !ps_internal_lookup(a, key(2)) &&
+          !ps_internal_lookup(a, key(3)));
+  REQUIRE(pwrite(b->fd, &last, 1, tail) == 1);
+  probe = (journal_import_probe){0};
+  ok(ps_read_open(a, key(3), NULL, &reader, &e), &e);
+  REQUIRE(probe.reads == 1 && probe.bytes == end - first && a->journal == end &&
+          a->sequence == b->sequence);
+  captured_expect(reader, 3, PS_CHUNK);
+  ps_reader_close(reader);
+  probe = (journal_import_probe){0};
+  expect_value(a, key(2), 65, 2);
+  REQUIRE(!probe.reads);
+  ok(ps_close(b, &e), &e);
+  ok(ps_close(a, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+
 static void journal_replay(void) {
   lc_error e = {0};
   projection_io m = {0};
@@ -7795,9 +7870,10 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "journal-wrap")) {
     journal_wrap(0);
     journal_wrap(1);
-  } else if (!strcmp(argv[2], "journal-replay"))
+  } else if (!strcmp(argv[2], "journal-replay")) {
+    journal_certified_import();
     journal_replay();
-  else if (!strcmp(argv[2], "journal-replay-retired"))
+  } else if (!strcmp(argv[2], "journal-replay-retired"))
     journal_replay_retired();
   else if (!strcmp(argv[2], "journal-replay-faults"))
     journal_replay_faults();

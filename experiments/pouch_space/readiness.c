@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "crc.h"
 #include "lc_api_internal.h"
 #include "space_internal.h"
 #include <errno.h>
@@ -14,7 +15,7 @@
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x4259444145525350)
+#define READY_MAGIC UINT64_C(0x4359444145525350)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
@@ -44,6 +45,7 @@ enum readiness_word {
   GRANT_USED,
   GRANT_LIMIT,
   PREPARED_DURABLE,
+  JOURNAL_BYTES,
   CRC
 };
 /* Each slot has an atomic commit generation followed by a checked record.
@@ -158,8 +160,7 @@ void ps_readiness_credit_note_spill(ps_space *s) {
   __atomic_store_n(s->readiness->page + CREDIT_SPILL, 1, __ATOMIC_RELEASE);
 }
 static uint64_t record_crc(const uint64_t *record) {
-  return (uint64_t)crc32(0, (const unsigned char *)record,
-                         (uInt)((WORDS - 1) * sizeof(*record)));
+  return ps_crc32(0, record, (WORDS - 1) * sizeof(*record));
 }
 uint64_t ps_readiness_issued_tickets(ps_space *s) {
   return s->readiness ? __atomic_load_n(s->readiness->page + PREPARATION_WORD,
@@ -197,7 +198,9 @@ static int slot_read(const uint64_t *source, uint64_t *record,
       record[GRANT_USED] % TOKEN_RANGE || record[GRANT_LIMIT] % TOKEN_RANGE ||
       record[GRANT_USED] > record[GRANT_LIMIT] ||
       record[GRANT_LIMIT] - record[GRANT_USED] >= TOKEN_POOL ||
-      record[PREPARED_DURABLE] > issued || record[CRC] != record_crc(record))
+      record[PREPARED_DURABLE] > issued || record[JOURNAL_BYTES] > PS_JOURNAL ||
+      (record[JOURNAL_BYTES] && record[JOURNAL_BYTES] < 64) ||
+      record[CRC] != record_crc(record))
     return -1;
   return 1;
 }
@@ -250,6 +253,7 @@ int ps_readiness_resident(ps_space *s) {
   return s->readiness && s->readiness->active &&
          checked_snapshot(s, record, 0) && record[ROOT] == s->generation &&
          record[READY] == s->sequence && record[DURABLE] == s->peer_durable &&
+         record[JOURNAL_BYTES] == s->journal &&
          record[GRANT_LIMIT] >= s->token_limit;
 }
 int ps_readiness_retains_capture(ps_space *s) {
@@ -257,6 +261,7 @@ int ps_readiness_retains_capture(ps_space *s) {
   return s->readiness && s->readiness->active &&
          checked_snapshot(s, record, PS_READINESS_JOURNAL) &&
          record[ROOT] == s->generation && record[READY] >= s->sequence &&
+         record[JOURNAL_BYTES] >= s->journal &&
          record[DURABLE] >= s->peer_durable &&
          record[GRANT_LIMIT] >= s->token_limit;
 }
@@ -266,6 +271,7 @@ static void certificate_from_record(ps_readiness_certificate *out,
   out->durable = record[DURABLE];
   out->root = record[ROOT];
   out->origin = record[ORIGIN];
+  out->journal_bytes = (size_t)record[JOURNAL_BYTES];
   out->grant_used = record[GRANT_USED];
   out->grant_limit = record[GRANT_LIMIT];
   out->prepared_durable = record[PREPARED_DURABLE];
@@ -385,7 +391,11 @@ int ps_readiness_validate(ps_space *s, lc_error *e) {
     rc = identity(s, record, e);
   if (rc == LC_OK &&
       (record[READY] > s->sequence || record[ROOT] > s->generation ||
-       record[GRANT_LIMIT] > s->token_limit))
+       record[GRANT_LIMIT] > s->token_limit ||
+       (record[ROOT] == s->generation &&
+        (record[JOURNAL_BYTES] > s->journal ||
+         ((record[READY] == s->sequence) !=
+          (record[JOURNAL_BYTES] == s->journal))))))
     rc = failed(s, e, "recovery would discard a live certified prefix");
   return rc;
 }
@@ -421,6 +431,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   record[MAGIC] = READY_MAGIC;
   memcpy(record + IDENTITY, s->identity, 16);
   record[READY] = s->sequence;
+  record[JOURNAL_BYTES] = s->journal;
   record[DURABLE] = s->peer_durable;
   record[ROOT] = s->generation;
   /* Publish assignment before the owner releases allocation authority. Death
@@ -515,9 +526,11 @@ int ps_readiness_publish(ps_space *s, lc_error *e) {
     rc = identity(s, record, e);
   if (rc != LC_OK)
     return rc;
-  if (s->sequence <= record[READY])
+  if (s->sequence <= record[READY] || s->generation != record[ROOT] ||
+      s->journal <= record[JOURNAL_BYTES] || s->journal > PS_JOURNAL)
     return failed(s, e, "journal publication would alias a shared prefix");
   record[READY] = s->sequence;
+  record[JOURNAL_BYTES] = s->journal;
   rc = select_record(s, record, selected, e);
   if (rc == LC_OK) {
     s->own_ready_wire = s->sequence;
@@ -528,7 +541,8 @@ int ps_readiness_publish(ps_space *s, lc_error *e) {
   return rc;
 }
 int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
-                           uint64_t prepared, lc_error *e) {
+                           size_t journal_bytes, uint64_t prepared,
+                           lc_error *e) {
   uint64_t record[WORDS];
   int selected, rc, prepared_advanced;
   if (!s->readiness || !s->readiness->active)
@@ -540,6 +554,9 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
     return rc;
   if (wire > record[READY] && (!root || root <= record[ROOT]))
     return failed(s, e, "sync completion exceeds the ready journal prefix");
+  if (root > record[ROOT] &&
+      (wire < record[READY] || journal_bytes > PS_JOURNAL))
+    return failed(s, e, "stabilized root would regress journal readiness");
   if (wire > record[READY])
     record[READY] =
         wire; /* A newly stabilized selected root proves this prefix. */
@@ -547,8 +564,10 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   if (wire > record[DURABLE] || root > record[ROOT] || prepared_advanced) {
     if (wire > record[DURABLE])
       record[DURABLE] = wire;
-    if (root > record[ROOT])
+    if (root > record[ROOT]) {
       record[ROOT] = root;
+      record[JOURNAL_BYTES] = journal_bytes;
+    }
     if (prepared_advanced)
       record[PREPARED_DURABLE] = prepared;
     rc = select_record(s, record, selected, e);

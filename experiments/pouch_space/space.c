@@ -61,6 +61,9 @@ static int canonical_journal(ps_space *, const ps_readiness_certificate *,
                              int replay, int verify_end, lc_error *);
 static int replay_frame(ps_space *, const unsigned char *, uint64_t,
                         lc_error *);
+static int import_certified_journal(ps_space *,
+                                    const ps_readiness_certificate *,
+                                    int staged, lc_error *);
 static int apply_journal_event(ps_space *, ps_entry *, int, uint64_t, uint64_t,
                                lc_error *);
 static ps_entry *selected_value(ps_space *, ps_entry *, uint64_t);
@@ -332,7 +335,7 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
       pthread_mutex_lock(&s->mutex);
       rc = allocation_begin(s, &guard, error);
       if (rc == LC_OK)
-        rc = ps_readiness_stabilize(s, wire, 0, prepared, error);
+        rc = ps_readiness_stabilize(s, wire, 0, 0, prepared, error);
       if (rc == LC_OK && s->peer_durable < wire)
         s->peer_durable = wire;
       rc = allocation_end(s, guard, rc, error);
@@ -3456,7 +3459,8 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   s->directory = new_root;
   s->journal_start = journal_start;
   s->journal = 0;
-  rc = ps_readiness_stabilize(s, s->sequence, s->generation, prepared, error);
+  rc = ps_readiness_stabilize(s, s->sequence, s->generation, s->journal,
+                              prepared, error);
   if (rc != LC_OK) {
     ps_directory_close(directory);
     lc_free_with_allocator(NULL, trim);
@@ -3956,6 +3960,12 @@ static int canonical_journal(ps_space *s,
                "certified checkpoint view needs refresh");
   s->peer_durable = certificate->durable;
   observe_local_durability(s);
+  if (!verify_end && !certificate->pending && s->readiness &&
+      s->generation == certificate->root) {
+    if (!replay && s->sequence < certificate->ready)
+      return err(error, LC_ERR_PENDING, "container journal view needs refresh");
+    return import_certified_journal(s, certificate, 0, error);
+  }
   while ((verify_end || s->sequence < certificate->ready) &&
          s->journal <= PS_JOURNAL - sizeof(next)) {
     rc = journal_transfer(s, s->journal_start + s->journal, next, sizeof(next),
@@ -3990,6 +4000,9 @@ static int canonical_journal(ps_space *s,
   }
   if (s->readiness && s->sequence < certificate->ready)
     return err(error, LC_ERR_PENDING, "certified journal view needs refresh");
+  if (s->readiness && s->generation == certificate->root &&
+      s->journal != certificate->journal_bytes)
+    return err(error, LC_ERR_PROTOCOL, "inconsistent certified journal bound");
   if (verify_end && (certificate->pending & PS_READINESS_JOURNAL))
     ps_readiness_finish(s, PS_READINESS_JOURNAL);
   return LC_OK;
@@ -4858,6 +4871,57 @@ static int replay_frame(ps_space *s, const unsigned char *prefix,
     memset(s->journal_image + s->journal, 0, journal_end_marker(s->journal));
   }
   lc_free_with_allocator(NULL, body);
+  return rc;
+}
+/* The allocator guards the certificate and its immutable published range.
+ * Use the reserved space beyond the resident prefix as the import buffer.
+ * Only complete frames move the byte and sequence watermarks together. */
+static int import_certified_journal(ps_space *s,
+                                    const ps_readiness_certificate *certificate,
+                                    int staged, lc_error *error) {
+  size_t first = s->journal, end = certificate->journal_bytes, bytes;
+  unsigned char old_end[64];
+  const unsigned char *wire;
+  uint64_t records, remaining;
+  uint32_t magic;
+  int rc;
+  if (end < first || end > PS_JOURNAL || s->sequence > certificate->ready ||
+      ((first == end) != (s->sequence == certificate->ready)) ||
+      (first != end && end - first < sizeof(old_end)))
+    return err(error, LC_ERR_PROTOCOL, "inconsistent certified journal bound");
+  if (first == end) {
+    if (staged)
+      memset(s->journal_image + first, 0, journal_end_marker(first));
+    return LC_OK;
+  }
+  if (!staged)
+    memcpy(old_end, s->journal_image + first, sizeof(old_end));
+  rc = journal_transfer(s, s->journal_start + first, s->journal_image + first,
+                        end - first, 0, error);
+  while (rc == LC_OK && s->journal < end) {
+    wire = s->journal_image + s->journal;
+    if (end - s->journal < 64) {
+      rc = err(error, LC_ERR_PROTOCOL, "truncated certified journal header");
+      break;
+    }
+    magic = get32(wire);
+    bytes = get32(wire + 4);
+    records = magic == REVISION_MAGIC ? get32(wire + 16) : 1;
+    remaining = certificate->ready - s->sequence;
+    if ((magic != EVENT_MAGIC && magic != REVISION_MAGIC) || bytes < 64 ||
+        bytes > end - s->journal || !records || records > remaining ||
+        ((records == remaining) != (bytes == end - s->journal))) {
+      rc = err(error, LC_ERR_PROTOCOL, "invalid certified journal boundary");
+      break;
+    }
+    rc = apply_peer_frame(s, wire, bytes, certificate->ready, staged, error);
+    if (rc == LC_OK)
+      s->journal += bytes;
+  }
+  if (rc != LC_OK && !staged && s->journal == first)
+    memcpy(s->journal_image + first, old_end, sizeof(old_end));
+  else
+    memset(s->journal_image + s->journal, 0, journal_end_marker(s->journal));
   return rc;
 }
 static int validate_owned_directory(ps_space *s, lc_error *error) {
@@ -5915,11 +5979,19 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     goto done;
   v->token_limit = certificate.grant_limit;
   v->peer_durable = certificate.durable;
-  if (!retiring_journal)
-    rc = projection_journal(v, get64(root + 24), certificate.ready, error);
+  if (!retiring_journal) {
+    if (!verify_disk && !certificate.pending &&
+        certificate.root == v->generation)
+      rc = import_certified_journal(v, &certificate, 1, error);
+    else
+      rc = projection_journal(v, get64(root + 24), certificate.ready, error);
+  }
   if (rc == LC_OK && v->sequence < certificate.ready)
     rc = err(error, LC_ERR_PENDING,
              "checkpoint is behind the certified journal prefix");
+  if (rc == LC_OK && certificate.root == v->generation &&
+      v->journal != certificate.journal_bytes)
+    rc = err(error, LC_ERR_PROTOCOL, "inconsistent certified journal bound");
   if (rc == LC_ERR_PENDING || rc == LC_ERR_PROTOCOL)
     ps_readiness_begin(s, PS_READINESS_JOURNAL);
   if (rc != LC_OK)
@@ -5961,8 +6033,8 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     rc = sync_file(s, error);
     if (rc == LC_OK) {
       ps_readiness_finish(s, PS_READINESS_CHECKPOINT_RETIRE);
-      rc = ps_readiness_stabilize(s, v->sequence, v->generation, prepared,
-                                  error);
+      rc = ps_readiness_stabilize(s, v->sequence, v->generation, v->journal,
+                                  prepared, error);
       if (rc == LC_OK)
         v->peer_durable = v->sequence;
     }
