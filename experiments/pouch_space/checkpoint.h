@@ -74,6 +74,9 @@ int ps_key_metadata_begin(ps_key_checkpoint *, int maintenance,
 int ps_key_metadata_commit(ps_checkpoint_delta *,
                            const lc_pouch_storage_batch *, enum ps_commit_mode,
                            lc_error *);
+void ps_key_metadata_visit_retired(const ps_checkpoint_delta *,
+                                   lc_pouch_storage_metadata_retired_fn,
+                                   void *);
 /* Offline physical conversion handoff. Caller excludes mutation and completes
  * stream debt first. Compare the entire selected canonical metadata with the
  * expected record, preserve its logical fields, and durably select only the

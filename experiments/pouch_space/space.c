@@ -4785,6 +4785,10 @@ static int capture_directory_entry(void *v, ps_key key,
   item->decoded = NULL;
   return LC_OK;
 }
+static int revision_retirement_matches(const ps_entry *entry,
+                                       uint64_t incarnation) {
+  return entry && !entry->deleted && entry->token == incarnation;
+}
 /* Validate the entire candidate before changing any selected ownership. A
  * complete inner record is not independently recoverable inside a revision. */
 static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
@@ -4818,7 +4822,10 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
     }
     rc = decode_entry(s, wire + cursor, member_bytes, 0, &entries[i], &event,
                       error);
-    if (rc == LC_OK && (event != PS_PUT || !immutable_key(entries[i]->key)))
+    if (rc == LC_OK &&
+        (event == PS_REMOVE
+             ? entries[i]->key.kind != PS_KEY_METADATA
+             : event != PS_PUT || !immutable_key(entries[i]->key)))
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
     for (j = 0; rc == LC_OK && j < i; ++j)
       if (same_key(entries[j]->key, entries[i]->key))
@@ -4826,11 +4833,16 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
     if (rc == LC_OK) {
       old = lookup(s, entries[i]->key);
       added += old == NULL;
-      if (old && !old->deleted && entries[i]->key.kind == PS_COLLECTION)
+      if (event == PS_REMOVE) {
+        if (!revision_retirement_matches(old, entries[i]->token))
+          rc =
+              err(error, LC_ERR_PROTOCOL, "revision retirement owner mismatch");
+        entries[i]->deleted = 1;
+      } else if (old && !old->deleted && entries[i]->key.kind == PS_COLLECTION)
         rc = err(error, LC_ERR_PROTOCOL,
                  "revision overwrites collection position");
     }
-    if (rc == LC_OK && values)
+    if (rc == LC_OK && values && event == PS_PUT)
       rc = verify_entry(s, entries[i], values, error);
     cursor += member_bytes;
   }
@@ -6943,13 +6955,16 @@ int ps_revision_writer_info(const ps_writer *w, ps_ref *ref, uint64_t *bytes,
   *bytes = w->entry->bytes + w->used;
   return LC_OK;
 }
-int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
-                        enum ps_commit_mode mode, ps_ref *refs,
-                        uint64_t *prefix, lc_error *error) {
+static int publish_revision(ps_writer *const *writers, size_t count,
+                            const ps_revision_retirement *retirements,
+                            size_t retire_count, int flags,
+                            enum ps_commit_mode mode, ps_ref *refs,
+                            uint64_t *prefix, lc_error *error) {
   ps_space *s;
   ps_budget *budget;
   ps_coordination_guard *guard = NULL;
   ps_entry *p, *old;
+  ps_entry **removed = NULL;
   unsigned char *wire = NULL;
   size_t i, j, batch, pending, bytes = 64, cursor, prior, descriptor;
   uint64_t metadata, entries, growth = 0, added = 0, sequence = 0, deletion = 0;
@@ -6957,6 +6972,8 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
   if (prefix)
     *prefix = 0;
   if (!writers || !count || count > (PS_JOURNAL - 64) / 64 || !writers[0] ||
+      retire_count > (PS_JOURNAL - 64) / 64 - count ||
+      (retire_count && !retirements) ||
       (flags & ~(PS_REVISION_FORCE_DURABLE | PS_REVISION_ADMIT_RESERVE)) ||
       (mode != PS_COMMIT_DEFAULT && mode != PS_COMMIT_DEFER_SYNC))
     return err(error, LC_ERR_INVALID, "revision requires immutable writers");
@@ -6971,6 +6988,20 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
       if (same_key(writers[j]->entry->key, writers[i]->entry->key))
         return err(error, LC_ERR_INVALID, "revision keys must be distinct");
   }
+  for (i = 0; i < retire_count; ++i) {
+    ps_key key = retirements[i].key;
+    if (key.kind != PS_KEY_METADATA || !valid_key(key) ||
+        !retirements[i].incarnation)
+      return err(error, LC_ERR_INVALID,
+                 "revision requires metadata retirement");
+    for (j = 0; j < i; ++j)
+      if (same_key(retirements[j].key, key))
+        return err(error, LC_ERR_INVALID, "revision keys must be distinct");
+    for (j = 0; j < count; ++j)
+      if (same_key(writers[j]->entry->key, key))
+        return err(error, LC_ERR_INVALID, "revision keys must be distinct");
+  }
+  bytes += retire_count * 64;
   for (i = 0; rc == LC_OK && i < count; i += batch) {
     pending = 0;
     for (batch = 0; batch < WRITER_FLUSH_BATCH && i + batch < count &&
@@ -6991,12 +7022,28 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
     if (!wire)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate revision publication");
   }
+  if (rc == LC_OK && retire_count) {
+    removed = lc_calloc_with_allocator(NULL, retire_count, sizeof(*removed));
+    if (!removed)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate revision retirements");
+  }
+  for (i = 0; rc == LC_OK && i < retire_count; ++i) {
+    removed[i] = ps_internal_entry_new(retirements[i].key.kind, 0);
+    if (!removed[i])
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate revision retirement");
+    else {
+      removed[i]->key = retirements[i].key;
+      removed[i]->token = retirements[i].incarnation;
+      removed[i]->deleted = 1;
+    }
+  }
   if (rc != LC_OK)
     goto done;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
-  if (rc == LC_OK && (count > UINT64_MAX - s->sequence ||
-                      count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
+  if (rc == LC_OK &&
+      (count + retire_count > UINT64_MAX - s->sequence ||
+       count + retire_count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
     rc = err(error, LC_ERR_INVALID, "revision publication sequence exhausted");
   if (rc == LC_OK && bytes > PS_JOURNAL - s->journal)
@@ -7026,6 +7073,15 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
     if (p->deletion_bytes > deletion)
       deletion = p->deletion_bytes;
   }
+  for (i = 0; rc == LC_OK && i < retire_count; ++i) {
+    old = lookup(s, removed[i]->key);
+    if (!revision_retirement_matches(old, removed[i]->token))
+      rc = err(error, LC_ERR_PENDING, "revision retirement owner changed");
+    else {
+      metadata -= entry_bytes(old);
+      --entries;
+    }
+  }
   if (rc == LC_OK)
     rc = ps_internal_budget_check(s, budget, 0, growth, added, error);
   if (rc == LC_OK)
@@ -7041,7 +7097,7 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
     put32(wire, REVISION_MAGIC);
     put32(wire + 4, (uint32_t)bytes);
     put64(wire + 8, s->sequence + 1);
-    put32(wire + 16, (uint32_t)count);
+    put32(wire + 16, (uint32_t)(count + retire_count));
     put32(wire + 20, (uint32_t)durable);
     cursor = 64;
     for (i = 0; i < count; ++i) {
@@ -7049,12 +7105,17 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
                    PS_PUT);
       cursor += entry_bytes(writers[i]->entry);
     }
+    for (i = 0; i < retire_count; ++i) {
+      encode_entry(wire + cursor, removed[i], s->sequence + 1 + count + i,
+                   PS_REMOVE);
+      cursor += 64;
+    }
     put32(wire + 60, (uint32_t)ps_crc32(checksum(wire, 60), wire + 64,
                                         (uInt)(bytes - 64)));
     rc = write_journal_frame(s, wire, bytes, error);
   }
   if (rc == LC_OK) {
-    s->sequence += count;
+    s->sequence += count + retire_count;
     s->journal += bytes;
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
     ps_internal_budget_spend(budget, 0, growth, added);
@@ -7071,6 +7132,16 @@ int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
         memcpy(refs[i].container, s->identity, sizeof(refs[i].container));
         refs[i].incarnation = p->token;
       }
+    }
+    for (i = 0; i < retire_count; ++i) {
+      p = removed[i];
+      old = lookup(s, p->key);
+      p->publication_sequence = ++sequence;
+      p->durable_visibility = durable;
+      register_entry(s, p);
+      dirty_entry(s, p, old);
+      install(s, p, old);
+      removed[i] = NULL;
     }
     __atomic_store_n(&s->pending_sequence, sequence, __ATOMIC_RELEASE);
     rc = ps_readiness_publish(s, error);
@@ -7091,7 +7162,26 @@ done:
     for (i = 0; i < count; ++i)
       writers[i]->failed = 1;
   lc_free_with_allocator(NULL, wire);
+  if (removed)
+    for (i = 0; i < retire_count; ++i)
+      if (removed[i])
+        ps_internal_entry_free(removed[i]);
+  lc_free_with_allocator(NULL, removed);
   return rc;
+}
+int ps_revision_publish(ps_writer *const *writers, size_t count, int flags,
+                        enum ps_commit_mode mode, ps_ref *refs,
+                        uint64_t *prefix, lc_error *error) {
+  return publish_revision(writers, count, NULL, 0, flags, mode, refs, prefix,
+                          error);
+}
+int ps_revision_publish_retiring(ps_writer *const *writers, size_t count,
+                                 const ps_revision_retirement *retirements,
+                                 size_t retire_count, int flags,
+                                 enum ps_commit_mode mode, uint64_t *prefix,
+                                 lc_error *error) {
+  return publish_revision(writers, count, retirements, retire_count, flags,
+                          mode, NULL, prefix, error);
 }
 int ps_publication_prefix(ps_space *s, uint64_t *selected, uint64_t *durable,
                           lc_error *error) {

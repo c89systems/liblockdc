@@ -5610,6 +5610,71 @@ int __wrap_clock_gettime(clockid_t id, struct timespec *out) {
   }
   return __real_clock_gettime(id, out);
 }
+typedef struct stage_order {
+  unsigned char live[31];
+  size_t next;
+} stage_order;
+
+static int stage_order_visit(const lc_pouch_state_visit_entry *entry,
+                             void *context, lc_error *e) {
+  stage_order *order = context;
+  char expected[40];
+  (void)e;
+  while (order->next < sizeof(order->live) && !order->live[order->next])
+    ++order->next;
+  REQUIRE(order->next < sizeof(order->live));
+  REQUIRE(snprintf(expected, sizeof(expected), "s/%02zu/.staging/attempt",
+                   order->next) < (int)sizeof(expected));
+  REQUIRE(!strcmp(entry->key, expected) && entry->has_payload);
+  ++order->next;
+  return LC_OK;
+}
+
+static void staging_order_retirement(const char *path) {
+  ps_pouch_state_options o = options(0, 0);
+  lc_pouch *p = NULL;
+  lc_error e = {0};
+  stage_order order = {0};
+  char key[16];
+  staged_open(path, 0, 1, &o, &p, &e);
+  for (size_t i = 0; i < sizeof(order.live); ++i) {
+    size_t at = 17 * i % sizeof(order.live);
+    input in = source(17, (unsigned char)at);
+    lc_pouch_state_write_result written = {0};
+    REQUIRE(snprintf(key, sizeof(key), "s/%02zu", at) < (int)sizeof(key));
+    in.pub.impl = &in;
+    ok(lc_pouch_state_stage_write(p, "stage-order", key, "attempt", &in.pub,
+                                  NULL, &written, &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &written);
+    order.live[at] = 1;
+  }
+  for (size_t i = 0; i < sizeof(order.live); ++i) {
+    size_t at = 12 * i % sizeof(order.live);
+    int discarded;
+    if (i == 15) {
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      staged_open(path, 0, 0, &o, &p, &e);
+    }
+    REQUIRE(snprintf(key, sizeof(key), "s/%02zu", at) < (int)sizeof(key));
+    ok(lc_pouch_state_discard_staged(p, "stage-order", key, "attempt",
+                                     &discarded, &e),
+       &e);
+    REQUIRE(discarded);
+    order.live[at] = 0;
+    order.next = 0;
+    ok(lc_pouch_state_visit_prefix(p, "stage-order", "s/", stage_order_visit,
+                                   &order, &e),
+       &e);
+    while (order.next < sizeof(order.live) && !order.live[order.next])
+      ++order.next;
+    REQUIRE(order.next == sizeof(order.live));
+  }
+  lc_pouch_close(p);
+  REQUIRE(!live && unlink(path) == 0);
+  lc_error_cleanup(&e);
+}
 static void staging(const char *path, const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -6067,9 +6132,9 @@ static uint32_t staged_revision_u32(const void *bytes) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
          ((uint32_t)p[3] << 24);
 }
-/* The seed contains live metadata with standing deletion reservations.
- * The terminal revision selects a tombstone with zero deletion reservation.
- * A preceding stream checkpoint only covers live seed records. */
+/* A terminal revision removes the stage's binding or selects a tombstone
+ * with zero deletion reservation. The fixture's preceding stream checkpoint
+ * only covers live seed records. */
 static size_t staged_terminal_revision(const void *bytes, size_t length,
                                        off_t at) {
   const unsigned char *p = bytes;
@@ -6085,9 +6150,13 @@ static size_t staged_terminal_revision(const void *bytes, size_t length,
     size_t member = staged_revision_u32(p + cursor + 4);
     REQUIRE(member >= 64 && member <= length - cursor);
     if (staged_revision_u32(p + cursor + 16) == PS_KEY_METADATA) {
-      REQUIRE(member >= 72);
-      terminal |= !staged_revision_u32(p + cursor + 64) &&
-                  !staged_revision_u32(p + cursor + 68);
+      if (member == 64)
+        terminal = 1; /* Physical removal contains no extent or reserve. */
+      else {
+        REQUIRE(member >= 72);
+        terminal |= !staged_revision_u32(p + cursor + 64) &&
+                    !staged_revision_u32(p + cursor + 68);
+      }
     }
     cursor += member;
   }
@@ -7044,9 +7113,10 @@ static void *worker(void *context) {
     lifetimes(r->path, r->directory);
   else if (!strcmp(r->mode, "lifetime-faults"))
     lifetime_faults(r->path);
-  else if (!strcmp(r->mode, "staging"))
+  else if (!strcmp(r->mode, "staging")) {
     staging(r->path, r->directory);
-  else if (!strcmp(r->mode, "staging-faults"))
+    staging_order_retirement(r->path);
+  } else if (!strcmp(r->mode, "staging-faults"))
     staging_faults(r->path, 0, 1);
   else if (!strcmp(r->mode, "staging-active-faults"))
     staging_faults(r->path, 0, 0);

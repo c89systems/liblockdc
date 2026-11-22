@@ -39,4 +39,15 @@ enum ps_revision_flags {
 int ps_revision_publish(ps_writer *const *, size_t, int flags,
                         enum ps_commit_mode, ps_ref *, uint64_t *prefix,
                         lc_error *);
+
+typedef struct ps_revision_retirement {
+  ps_key key;
+  uint64_t incarnation;
+} ps_revision_retirement;
+/* Select the writers and retire the exact named metadata incarnations in the
+ * same frame. A missing or changed retirement target rejects the revision. */
+int ps_revision_publish_retiring(ps_writer *const *, size_t,
+                                 const ps_revision_retirement *, size_t,
+                                 int flags, enum ps_commit_mode,
+                                 uint64_t *prefix, lc_error *);
 #endif

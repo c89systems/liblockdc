@@ -1839,6 +1839,7 @@ typedef struct lc_pouch_state_binary_append_item {
   int query_index_from_index;
   int lifetime_from_index;
   int maintenance_completion;
+  int retired;
 } lc_pouch_state_binary_append_item;
 
 typedef struct lc_pouch_state_metadata_append_request {
@@ -1958,9 +1959,9 @@ typedef struct lc_pouch_state_cache_record {
   int has_record_ref;
   unsigned char record_type;
   struct lc_pouch_state_cache_record *next;
+  struct lc_pouch_state_cache_record **link;
   struct lc_pouch_state_cache_record *bucket_next;
-  /* Intrusive key order shares record/key ownership with the point index.
-   * Tombstones keep their position until the projection is rebuilt. */
+  /* Intrusive key order shares record/key ownership with the point index. */
   struct lc_pouch_state_cache_record *ordered_left, *ordered_right;
   struct lc_pouch_state_cache_record *ordered_parent;
   unsigned int ordered_height;
@@ -5463,7 +5464,8 @@ static void lc_pouch_state_order_attach(lc_pouch_namespace_logstore *ns,
     parent->ordered_left = after;
   else
     parent->ordered_right = after;
-  after->ordered_parent = parent;
+  if (after)
+    after->ordered_parent = parent;
 }
 static lc_pouch_state_cache_record *
 lc_pouch_state_order_left(lc_pouch_namespace_logstore *ns,
@@ -5493,9 +5495,31 @@ lc_pouch_state_order_right(lc_pouch_namespace_logstore *ns,
   lc_pouch_state_order_update(next);
   return next;
 }
-/* The projection has one insertion point and never removes individual nodes.
- * Iterative AVL maintenance adds no allocation or recursive worker-stack use.
- * The existing hash index continues to serve exact-key mutations. */
+static void
+lc_pouch_state_order_rebalance(lc_pouch_namespace_logstore *ns,
+                               lc_pouch_state_cache_record *parent) {
+  while (parent) {
+    lc_pouch_state_cache_record *child;
+    unsigned int left, right;
+    lc_pouch_state_order_update(parent);
+    left = lc_pouch_state_order_height(parent->ordered_left);
+    right = lc_pouch_state_order_height(parent->ordered_right);
+    if (left > right + 1) {
+      child = parent->ordered_left;
+      if (lc_pouch_state_order_height(child->ordered_right) >
+          lc_pouch_state_order_height(child->ordered_left))
+        (void)lc_pouch_state_order_left(ns, child);
+      parent = lc_pouch_state_order_right(ns, parent);
+    } else if (right > left + 1) {
+      child = parent->ordered_right;
+      if (lc_pouch_state_order_height(child->ordered_left) >
+          lc_pouch_state_order_height(child->ordered_right))
+        (void)lc_pouch_state_order_right(ns, child);
+      parent = lc_pouch_state_order_left(ns, parent);
+    }
+    parent = parent->ordered_parent;
+  }
+}
 static void lc_pouch_state_order_insert(lc_pouch_namespace_logstore *ns,
                                         lc_pouch_state_cache_record *record) {
   lc_pouch_state_cache_record **link = &ns->ordered_root, *parent = NULL;
@@ -5507,26 +5531,31 @@ static void lc_pouch_state_order_insert(lc_pouch_namespace_logstore *ns,
   *link = record;
   record->ordered_parent = parent;
   record->ordered_height = 1;
-  while (parent) {
-    unsigned int left, right;
-    lc_pouch_state_order_update(parent);
-    left = lc_pouch_state_order_height(parent->ordered_left);
-    right = lc_pouch_state_order_height(parent->ordered_right);
-    if (left > right + 1) {
-      record = parent->ordered_left;
-      if (lc_pouch_state_order_height(record->ordered_right) >
-          lc_pouch_state_order_height(record->ordered_left))
-        (void)lc_pouch_state_order_left(ns, record);
-      parent = lc_pouch_state_order_right(ns, parent);
-    } else if (right > left + 1) {
-      record = parent->ordered_right;
-      if (lc_pouch_state_order_height(record->ordered_left) >
-          lc_pouch_state_order_height(record->ordered_right))
-        (void)lc_pouch_state_order_right(ns, record);
-      parent = lc_pouch_state_order_left(ns, parent);
+  lc_pouch_state_order_rebalance(ns, parent);
+}
+static void lc_pouch_state_order_remove(lc_pouch_namespace_logstore *ns,
+                                        lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record *parent = record->ordered_parent;
+  lc_pouch_state_cache_record *left = record->ordered_left;
+  lc_pouch_state_cache_record *right = record->ordered_right;
+  if (!left || !right)
+    lc_pouch_state_order_attach(ns, record, left ? left : right);
+  else {
+    lc_pouch_state_cache_record *next = right;
+    while (next->ordered_left)
+      next = next->ordered_left;
+    parent = next;
+    if (next != right) {
+      parent = next->ordered_parent;
+      lc_pouch_state_order_attach(ns, next, next->ordered_right);
+      next->ordered_right = right;
+      right->ordered_parent = next;
     }
-    parent = parent->ordered_parent;
+    lc_pouch_state_order_attach(ns, record, next);
+    next->ordered_left = left;
+    left->ordered_parent = next;
   }
+  lc_pouch_state_order_rebalance(ns, parent);
 }
 static lc_pouch_state_cache_record *
 lc_pouch_state_order_bound(const lc_pouch_namespace_logstore *ns,
@@ -5717,6 +5746,33 @@ static void lc_pouch_state_slot_dirty(lc_pouch_namespace_logstore *cache,
       cache->storage_slots[at].incarnation = 0;
   }
 }
+static void lc_pouch_state_cache_remove(lc_pouch *pouch,
+                                        lc_pouch_namespace_logstore *cache,
+                                        lc_pouch_state_cache_record *record) {
+  lc_pouch_state_cache_record **bucket;
+  size_t at;
+  lc_pouch_state_order_remove(cache, record);
+  *record->link = record->next;
+  if (record->next)
+    record->next->link = record->link;
+  bucket = &cache->record_buckets[lc_pouch_state_cache_key_hash(record->key) %
+                                  cache->record_bucket_count];
+  while (*bucket != record)
+    bucket = &(*bucket)->bucket_next;
+  *bucket = record->bucket_next;
+  if (record->storage_slot) {
+    at = lc_pouch_storage_state_slot_find(
+        cache->storage_slots, cache->storage_slot_count, record->storage_slot);
+    if (at < cache->storage_slot_count) {
+      --cache->storage_slot_count;
+      memmove(cache->storage_slots + at, cache->storage_slots + at + 1,
+              (cache->storage_slot_count - at) * sizeof(*cache->storage_slots));
+    }
+  }
+  --cache->record_count;
+  lc_pouch_state_cache_record_body_clear(&pouch->allocator, cache, record);
+  lc_pouch_state_cache_record_cleanup(&pouch->allocator, record);
+}
 
 static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
                                             lc_pouch_namespace_logstore *ns,
@@ -5804,6 +5860,9 @@ static int lc_pouch_state_cache_apply_entry(lc_pouch *pouch,
                           NULL, NULL);
     }
     record->next = ns->records;
+    record->link = &ns->records;
+    if (record->next)
+      record->next->link = &record->next;
     ns->records = record;
     lc_pouch_state_order_insert(ns, record);
     ++ns->record_count;
@@ -6937,6 +6996,10 @@ static int lc_pouch_state_batch_prefix(void *context, size_t index,
   *metadata = items[index].meta;
   return LC_OK;
 }
+static void lc_pouch_state_batch_retired(void *context, size_t index) {
+  lc_pouch_state_binary_append_item *items = context;
+  items[index].retired = 1;
+}
 static int lc_pouch_state_append_binary_records_locked(
     lc_pouch *pouch, const char *ns, lc_pouch_namespace_manifest *manifest,
     lc_pouch_state_binary_append_item *items, size_t item_count,
@@ -7209,13 +7272,16 @@ binary_append_ready:
 #endif
   if (rc == LC_OK) {
     if (pouch->storage.ops != NULL) {
+      lc_pouch_storage_metadata_result result = {0};
+      if (item_count > 1U) {
+        result.retired = lc_pouch_state_batch_retired;
+        result.context = items;
+      }
       rc = pouch->storage.ops->metadata->commit(
           pouch->storage.context, metadata_plan, &storage_batch,
-          lc_pouch_state_storage_commit_mode(pouch),
-          pouch->storage.coordinated_namespaces
-              ? &cache->storage_checkpoint_epoch
-              : NULL,
-          error);
+          lc_pouch_state_storage_commit_mode(pouch), &result, error);
+      if (rc == LC_OK && pouch->storage.coordinated_namespaces)
+        cache->storage_checkpoint_epoch = result.checkpoint_epoch;
     } else
       rc = lc_pouch_state_defer_fsync(pouch, fd, error);
   }
@@ -14015,6 +14081,29 @@ static int lc_pouch_state_append_record(
   return rc;
 }
 
+static void lc_pouch_state_finish_stage_cache(
+    lc_pouch *pouch, const char *ns,
+    const lc_pouch_namespace_manifest *manifest, const char *key,
+    const char *etag, lc_pouch_generation version,
+    lc_pouch_unix_seconds updated_at, uint64_t lifetime, int retired) {
+  if (retired) {
+    lc_pouch_namespace_logstore *cache =
+        lc_pouch_namespace_logstore_find(pouch, ns, 0, NULL);
+    if (cache && cache->initialized) {
+      lc_pouch_state_cache_record *row =
+          lc_pouch_state_cache_record_find(cache, key);
+      if (row)
+        lc_pouch_state_cache_remove(pouch, cache, row);
+      if (manifest->state_max_version > cache->max_version)
+        cache->max_version = manifest->state_max_version;
+    }
+  } else
+    (void)lc_pouch_state_cache_apply_write(
+        pouch, ns, manifest, key, NULL, etag, NULL, NULL, NULL, 0U, version,
+        0UL, 0UL, NULL, updated_at, 0, 0, 0, 0,
+        LC_POUCH_STATE_RECORD_STATE_DELETE, 0, lifetime);
+}
+
 static int lc_pouch_state_append_staged_commit_batch(
     lc_pouch *pouch, const char *ns, lc_pouch_namespace_manifest *manifest,
     const char *key, const char *staged_key, const lc_pouch_state_entry *staged,
@@ -14145,6 +14234,10 @@ static int lc_pouch_state_append_staged_commit_batch(
     items[2].meta_len = delete_meta_len;
     rc = lc_pouch_state_append_binary_records(pouch, ns, manifest, items, 3U,
                                               error);
+    if (rc == LC_OK)
+      lc_pouch_state_finish_stage_cache(
+          pouch, ns, manifest, staged_key, staged->etag, discard_version,
+          updated_at_unix, staged->lifetime, items[2].retired);
   }
   if (rc == LC_OK) {
     rc = lc_pouch_state_meta_index_seq(link_meta, link_meta_len,
@@ -14264,6 +14357,10 @@ static int lc_pouch_state_append_staged_delete_commit_batch(
     ++item_count;
     rc = lc_pouch_state_append_binary_records(pouch, ns, manifest, items,
                                               item_count, error);
+    if (rc == LC_OK)
+      lc_pouch_state_finish_stage_cache(
+          pouch, ns, manifest, staged_key, staged_etag, discard_version,
+          updated_at_unix, staged_lifetime, items[item_count - 1U].retired);
   }
   if (rc == LC_OK && delete_committed && committed_index_seq_out != NULL) {
     rc = lc_pouch_state_meta_index_seq(committed_delete_meta,
@@ -14328,12 +14425,6 @@ static int lc_pouch_state_commit_staged_delete_locked(
         object_record ? LC_POUCH_STATE_RECORD_OBJECT_DELETE
                       : LC_POUCH_STATE_RECORD_STATE_DELETE,
         0, committed->lifetime);
-  }
-  if (rc == LC_OK) {
-    (void)lc_pouch_state_cache_apply_write(
-        pouch, ns, manifest, staged_key, NULL, staged->etag, NULL, NULL, NULL,
-        0U, discard_version, 0UL, 0UL, NULL, updated_at_unix, 0, 0, 0, 0,
-        LC_POUCH_STATE_RECORD_STATE_DELETE, 0, staged->lifetime);
   }
   if (rc == LC_OK && delete_committed) {
     out->etag = etag;
@@ -14401,6 +14492,10 @@ static int lc_pouch_state_append_staged_discard_batch(
     items[1].meta_len = delete_meta_len;
     rc = lc_pouch_state_append_binary_records(pouch, ns, manifest, items, 2U,
                                               error);
+    if (rc == LC_OK)
+      lc_pouch_state_finish_stage_cache(pouch, ns, manifest, staged_key, etag,
+                                        tombstone_version, updated_at_unix,
+                                        lifetime, items[1].retired);
   }
   lc_free_with_allocator(&pouch->allocator, decision_meta);
   lc_free_with_allocator(&pouch->allocator, delete_meta);
@@ -18208,10 +18303,6 @@ static int lc_pouch_state_promote_staged_locked(
       staged.payload_span.present
           ? lc_pouch_state_body_lifetime(&committed, committed_index_seq)
           : committed.lifetime);
-  (void)lc_pouch_state_cache_apply_write(
-      pouch, ns, &manifest, staged_key, NULL, staged.etag, NULL, NULL, NULL, 0U,
-      discard_version, 0UL, 0UL, NULL, updated_at_unix, 0, 0, 0, 0,
-      LC_POUCH_STATE_RECORD_STATE_DELETE, 0, staged.lifetime);
   out->etag = lc_strdup_with_allocator(&pouch->allocator, staged.etag);
   if (out->etag == NULL) {
     rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
@@ -18435,10 +18526,6 @@ int lc_pouch_state_commit_staged_locked(lc_pouch *pouch, const char *ns,
       staged.payload_span.present
           ? lc_pouch_state_body_lifetime(&committed, committed_index_seq)
           : committed.lifetime);
-  (void)lc_pouch_state_cache_apply_write(
-      pouch, ns, &manifest, staged_key, NULL, staged.etag, NULL, NULL, NULL, 0U,
-      discard_version, 0UL, 0UL, NULL, updated_at_unix, 0, 0, 0, 0,
-      LC_POUCH_STATE_RECORD_STATE_DELETE, 0, staged.lifetime);
   out->etag = lc_strdup_with_allocator(&pouch->allocator, staged.etag);
   if (out->etag == NULL) {
     rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
@@ -18578,12 +18665,6 @@ int lc_pouch_state_discard_staged_locked(lc_pouch *pouch, const char *ns,
       rc = lc_pouch_state_append_staged_discard_batch(
           pouch, ns, &manifest, staged_key, etag, decision_version,
           tombstone_version, updated_at_unix, staged.lifetime, error);
-      if (rc == LC_OK) {
-        (void)lc_pouch_state_cache_apply_write(
-            pouch, ns, &manifest, staged_key, NULL, etag, NULL, NULL, NULL, 0U,
-            tombstone_version, 0UL, 0UL, NULL, updated_at_unix, 0, 0, 0, 0,
-            LC_POUCH_STATE_RECORD_STATE_DELETE, 0, staged.lifetime);
-      }
       if (rc == LC_OK && discarded != NULL) {
         *discarded = 1;
       }

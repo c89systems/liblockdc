@@ -100,6 +100,43 @@ static void revision_lifecycle(int durable, int control) {
   free(bytes);
   clean();
 }
+static void revision_retire_metadata(void) {
+  ps_key stage = key(PS_KEY_METADATA, 1, 3);
+  ps_revision_retirement retirement = {stage, 0};
+  ps_space *s;
+  ps_writer *writer = NULL;
+  ps_reader *held = NULL;
+  clean();
+  s = create(PS_MIB, 1, NULL);
+  retirement.incarnation = put(s, stage, "old stage", 9, 9).incarnation;
+  OK(ps_read_open(s, stage, NULL, &held, &error));
+  ps_ref newer = put(s, stage, "new stage", 9, 9);
+  OK(ps_begin(s, NULL, state(1), &writer, &error));
+  OK(ps_write(writer, "destination", 11, &error));
+  CHECK(ps_revision_publish_retiring(&writer, 1, &retirement, 1, 0,
+                                     PS_COMMIT_DEFAULT, NULL,
+                                     &error) == LC_ERR_PENDING);
+  lc_error_cleanup(&error);
+  ps_writer_close(writer);
+  absent(s, state(1));
+  expect(s, stage, &newer, "new stage", 9);
+  OK(ps_begin(s, NULL, state(1), &writer, &error));
+  OK(ps_write(writer, "destination", 11, &error));
+  retirement.incarnation = newer.incarnation;
+  OK(ps_revision_publish_retiring(&writer, 1, &retirement, 1, 0,
+                                  PS_COMMIT_DEFAULT, NULL, &error));
+  ps_writer_close(writer);
+  absent(s, stage);
+  expect(s, state(1), NULL, "destination", 11);
+  read_value(held, "old stage", 9);
+  ps_reader_close(held);
+  OK(ps_close(s, &error));
+  s = reopen(NULL);
+  absent(s, stage);
+  expect(s, state(1), NULL, "destination", 11);
+  OK(ps_close(s, &error));
+  clean();
+}
 static void revision_admission(void) {
   ps_space *s;
   ps_stats before, after;

@@ -44,7 +44,7 @@ struct key_slot {
   key_summary summary;
   ps_checkpoint_record pending;
   source_count *body;
-  key_slot *next, *hash_next, *id_next;
+  key_slot *next, **link, *hash_next, *id_next;
   key_slot *dirty_next, **dirty_link;
   key_slot *retire_next, **retire_link;
   uint64_t retire_sequence;
@@ -65,7 +65,8 @@ struct slot_change {
   key_slot *slot;
   uint64_t bound, selected_incarnation;
   uint64_t prior_deletion;
-  int created, prepared;
+  size_t ordinal;
+  int created, prepared, remove;
   key_summary summary;
   source_count *body;
   ps_checkpoint_record record;
@@ -313,6 +314,9 @@ static void insert_slot(ps_key_checkpoint *c, key_slot *s) {
   s->id_next = c->ids[bucket];
   c->ids[bucket] = s;
   s->next = c->slots;
+  s->link = &c->slots;
+  if (s->next)
+    s->next->link = &s->next;
   c->slots = s;
   ++c->count;
 }
@@ -1008,12 +1012,13 @@ int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,
                  "selected checkpoint changed during recovery");
   return rc;
 }
-static void drop_selected_slot(ps_key_checkpoint *c, key_slot **link) {
-  key_slot *slot = *link;
+static void drop_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
   key_slot **at;
   key_summary empty = {0};
   size_t bucket = (size_t)(slot->hash & (c->capacity - 1));
-  *link = slot->next;
+  *slot->link = slot->next;
+  if (slot->next)
+    slot->next->link = slot->link;
   for (at = &c->keys[bucket]; *at != slot; at = &(*at)->hash_next) {
   }
   *at = slot->hash_next;
@@ -1109,7 +1114,7 @@ static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
   }
   for (link = &c->slots; (s = *link) != NULL;) {
     if (rc == LC_OK && !s->retained)
-      drop_selected_slot(c, link);
+      drop_selected_slot(c, s);
     else {
       s->retained = 0;
       if (rc == LC_OK)
@@ -1874,7 +1879,7 @@ void ps_checkpoint_delta_close(ps_checkpoint_delta *d) {
   pthread_mutex_lock(&c->mutex);
   for (change = d->changes; change; change = next) {
     next = change->next;
-    if ((!d->accepted || !change->prepared) && !change->created)
+    if (change->slot && (!d->accepted || !change->prepared) && !change->created)
       (void)reserve_slot(c, change->slot, change->prior_deletion, 0, NULL);
     release_prepared_source(c, change->body);
     ps_checkpoint_record_close(&change->record);
@@ -2146,9 +2151,10 @@ static int metadata_read(void *context, uint64_t offset,
   return LC_OK;
 }
 
-static void omit_completed_stage_decisions(ps_checkpoint_delta *d) {
+static size_t prepare_completed_stages(ps_checkpoint_delta *d) {
   slot_change *decision, *stage;
   const char *key;
+  size_t remove = 0;
   for (decision = d->changes; decision; decision = decision->next) {
     if (!decision->prepared || decision->slot->kind != PS_KEY_DECISION)
       continue;
@@ -2165,9 +2171,18 @@ static void omit_completed_stage_decisions(ps_checkpoint_delta *d) {
          stage->summary.type == LC_POUCH_STATE_RECORD_OBJECT_DELETE) &&
         stage->summary.lifetime == stage->slot->summary.lifetime &&
         stage->slot->summary.index < decision->summary.index &&
-        decision->summary.index < stage->summary.index)
+        decision->summary.index < stage->summary.index) {
       decision->prepared = 0;
+      /* A selected descriptor carries its standing deletion obligation
+       * until the retirement frame is durable. Keep the ordinary tombstone
+       * if an additional local obligation still belongs to the stage. */
+      if (stage->slot->selected_incarnation && !stage->slot->reserve) {
+        stage->remove = 1;
+        ++remove;
+      }
+    }
   }
+  return remove;
 }
 
 int ps_key_metadata_commit(ps_checkpoint_delta *d,
@@ -2177,6 +2192,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
                                              NULL};
   ps_key_checkpoint *c;
   ps_writer **writers = NULL;
+  ps_revision_retirement *retirements = NULL;
   slot_change *change;
   ps_checkpoint_info selected = {0};
   lc_pouch_state_entry entry = {0};
@@ -2187,7 +2203,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   const void *key, *meta;
   ps_ref control_ref, slot_ref;
   uint64_t next, bytes, total = 0, prefix = 0;
-  size_t i, count = 0;
+  size_t i, count = 0, retire_count = 0, retired = 0;
   int rc = LC_OK, found, truncated;
   if (!d || !d->metadata_only || d->accepted || d->prepared || !batch ||
       !batch->prefix || batch->count != d->metadata_count ||
@@ -2239,8 +2255,12 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     if (rc == LC_OK && (!found || truncated || next != bytes))
       rc = failure(e, LC_ERR_PROTOCOL,
                    "native metadata has an incomplete record");
-    if (rc == LC_OK)
+    if (rc == LC_OK) {
       rc = prepare_entry(d, &entry, e);
+      if (rc == LC_OK && change && change->prepared &&
+          change->summary.index == entry.index_seq)
+        change->ordinal = i;
+    }
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
   if (rc == LC_OK &&
@@ -2248,7 +2268,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     rc = failure(e, LC_ERR_PROTOCOL,
                  "native metadata preparation exceeds its plan");
   if (rc == LC_OK) {
-    omit_completed_stage_decisions(d);
+    retire_count = prepare_completed_stages(d);
     selected.segment = c->latest_segment;
     selected.offset = c->latest_offset;
     selected.state_index =
@@ -2269,6 +2289,12 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     if (!writers)
       rc = failure(e, LC_ERR_NOMEM, "cannot allocate native metadata writers");
   }
+  if (rc == LC_OK && retire_count) {
+    retirements = lc_calloc_with_allocator(&c->allocator, retire_count,
+                                           sizeof(*retirements));
+    if (!retirements)
+      rc = failure(e, LC_ERR_NOMEM, "cannot allocate native stage retirements");
+  }
   for (change = d->changes; rc == LC_OK && change; change = change->next) {
     ps_key physical;
     if (!change->prepared)
@@ -2276,6 +2302,11 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     physical.owner = c->ns->identity.owner;
     physical.key = change->slot->id;
     physical.kind = change->slot->kind;
+    if (change->remove) {
+      retirements[retired].key = physical;
+      retirements[retired++].incarnation = change->slot->selected_incarnation;
+      continue;
+    }
     rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, physical,
                                     &change->record, &writers[count], e);
     if (rc == LC_OK) {
@@ -2296,7 +2327,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     int flags = d->body_replacement ? PS_REVISION_FORCE_DURABLE : 0;
     if (!d->maintenance && !d->body_replacement)
       flags |= PS_REVISION_ADMIT_RESERVE;
-    rc = ps_revision_publish(writers, count, flags, mode, NULL, &prefix, e);
+    rc = ps_revision_publish_retiring(writers, count, retirements, retired,
+                                      flags, mode, &prefix, e);
   }
   if (rc == LC_OK) {
     pthread_mutex_lock(&c->mutex);
@@ -2304,6 +2336,12 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
       key_slot *s = change->slot;
       if (!change->prepared)
         continue;
+      if (change->remove) {
+        --c->selected_count;
+        drop_selected_slot(c, s);
+        change->slot = NULL;
+        continue;
+      }
       if (change->created) {
         insert_slot(c, s);
         change->created = 0;
@@ -2327,8 +2365,18 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
   }
   for (i = 0; i < count; ++i)
     ps_writer_close(writers[i]);
+  lc_free_with_allocator(&c->allocator, retirements);
   lc_free_with_allocator(&c->allocator, writers);
   return rc;
+}
+void ps_key_metadata_visit_retired(const ps_checkpoint_delta *d,
+                                   lc_pouch_storage_metadata_retired_fn visit,
+                                   void *context) {
+  const slot_change *change;
+  if (d->accepted)
+    for (change = d->changes; change; change = change->next)
+      if (change->remove)
+        visit(context, change->ordinal);
 }
 typedef struct body_replacement_prefix {
   const ps_checkpoint_record *record;
@@ -2618,6 +2666,7 @@ int ps_key_cursor_next(ps_key_cursor *cursor, lc_pouch_state_entry *out,
   ps_reader *reader = NULL;
   key_slot *slot;
   lc_pouch_state_entry entry = {0};
+  char leaf[LC_POUCH_SNAPSHOT_LEAF_BYTES];
   ps_key key;
   int rc;
   if (found)
@@ -2629,6 +2678,7 @@ int ps_key_cursor_next(ps_key_cursor *cursor, lc_pouch_state_entry *out,
   rc = cursor_valid(cursor, e);
   slot = cursor->next;
   if (rc == LC_OK && slot) {
+    memcpy(leaf, slot->leaf, sizeof(leaf));
     key.owner = c->ns->identity.owner;
     key.key = slot->id;
     key.kind = slot->kind;
@@ -2636,8 +2686,7 @@ int ps_key_cursor_next(ps_key_cursor *cursor, lc_pouch_state_entry *out,
   }
   pthread_mutex_unlock(&c->mutex);
   if (rc == LC_OK && slot)
-    rc =
-        ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
+    rc = ps_checkpoint_record_read(reader, &c->allocator, leaf, &entry, e);
   ps_reader_close(reader);
   pthread_mutex_lock(&c->mutex);
   if (rc == LC_OK)

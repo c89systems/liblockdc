@@ -185,10 +185,10 @@ static int native_metadata_stage_capture(ps_namespace *ns, int *complete,
   seen.decision_key = native_other_stage;
   rc = native_metadata_capture(ns, &seen, e);
   if (rc == LC_OK) {
-    CHECK(seen.keys == 2 && seen.decisions == 1 && seen.decision_version == 1 &&
-          seen.version == (seen.found ? 1 : 3) &&
+    CHECK(seen.keys == (seen.found ? 2 : 1) && seen.decisions == 1 &&
+          seen.decision_version == 1 && seen.version == (seen.found ? 1 : 3) &&
           seen.boundary == (seen.found ? 4 : 8) &&
-          seen.index == (seen.found ? 3 : 7));
+          seen.index == (seen.found ? 3 : 5));
     *complete = !seen.found;
   }
   return rc;
@@ -201,6 +201,49 @@ static int native_metadata_write(ps_namespace *ns, native_metadata_batch *b,
     rc = ps_namespace_metadata_commit(plan, &b->batch, mode, e);
   ps_namespace_metadata_close(plan);
   return rc;
+}
+static void native_metadata_stage_peer(int durable) {
+  ps_root_options options = {0};
+  ps_root *root = NULL, *peer = NULL;
+  ps_namespace *ns = NULL, *other_ns = NULL;
+  ps_namespace_view *held = NULL;
+  native_metadata_batch original, changed;
+  native_metadata_seen seen = {0};
+  int complete;
+  clean();
+  options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
+  options.storage.durable_sync = durable;
+  options.storage.shared = 1;
+  OK(ps_root_open(path, 1, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "metadata", 1, &ns, &error));
+  native_metadata_stage(&original, 0);
+  native_metadata_stage(&changed, 1);
+  OK(native_metadata_write(ns, &original, PS_COMMIT_DEFAULT, &error));
+  OK(ps_flush(ps_root_space(root), &error));
+  OK(ps_root_open(path, 0, &options, &peer, &error));
+  OK(ps_root_namespace_acquire(peer, "metadata", 0, &other_ns, &error));
+  OK(ps_namespace_view_open(other_ns, &held, &error));
+  OK(native_metadata_write(ns, &changed, PS_COMMIT_DEFER_SYNC, &error));
+  OK(native_metadata_stage_capture(other_ns, &complete, &error));
+  CHECK(complete == !durable);
+  OK(ps_flush(ps_root_space(root), &error));
+  OK(native_metadata_stage_capture(other_ns, &complete, &error));
+  CHECK(complete);
+  OK(ps_refresh(ps_root_space(root), &error));
+  OK(ps_checkpoint(ps_root_space(root), &error));
+  seen.second_key = native_stage;
+  seen.decision_key = native_other_stage;
+  OK(ps_namespace_view_visit(held, 1, native_metadata_visit, &seen, &error));
+  CHECK(seen.found && seen.keys == 2 && seen.decisions == 1 &&
+        seen.boundary == 4);
+  ps_namespace_view_close(held);
+  ps_namespace_release(other_ns);
+  ps_namespace_release(ns);
+  OK(ps_root_close(peer, &error));
+  OK(ps_root_close(root, &error));
+  native_metadata_free(&original);
+  native_metadata_free(&changed);
+  clean();
 }
 static void native_metadata_lifecycle(int durable) {
   ps_root_options options = {0};

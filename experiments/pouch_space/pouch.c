@@ -301,7 +301,8 @@ static int metadata_begin(void *context, void *ns,
 static int metadata_commit(void *context, void *handle,
                            const lc_pouch_storage_batch *batch,
                            enum lc_pouch_storage_commit_mode mode,
-                           uint64_t *checkpoint_epoch, lc_error *e) {
+                           lc_pouch_storage_metadata_result *result,
+                           lc_error *e) {
   int rc;
   (void)context;
   if (mode != LC_POUCH_STORAGE_COMMIT_DEFAULT &&
@@ -313,8 +314,12 @@ static int metadata_commit(void *context, void *handle,
                                         ? PS_COMMIT_DEFAULT
                                         : PS_COMMIT_DEFER_SYNC,
                                     e);
-  if (rc == LC_OK && checkpoint_epoch)
-    *checkpoint_epoch = ps_namespace_metadata_epoch(handle);
+  if (rc == LC_OK && result) {
+    result->checkpoint_epoch = ps_namespace_metadata_epoch(handle);
+    if (result->retired)
+      ps_namespace_metadata_visit_retired(handle, result->retired,
+                                          result->context);
+  }
   return rc;
 }
 static void metadata_close(void *context, void *handle) {

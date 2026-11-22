@@ -11,5 +11,8 @@ int ps_namespace_metadata_commit(ps_namespace_metadata *,
 /* Selected epoch while the completed metadata operation still owns its scope.
  */
 uint64_t ps_namespace_metadata_epoch(ps_namespace_metadata *);
+void ps_namespace_metadata_visit_retired(ps_namespace_metadata *,
+                                         lc_pouch_storage_metadata_retired_fn,
+                                         void *);
 void ps_namespace_metadata_close(ps_namespace_metadata *);
 #endif

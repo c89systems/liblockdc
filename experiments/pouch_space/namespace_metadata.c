@@ -61,6 +61,11 @@ uint64_t ps_namespace_metadata_epoch(ps_namespace_metadata *metadata) {
   ps_key_checkpoint_info(metadata->data->checkpoint, &info);
   return info.epoch;
 }
+void ps_namespace_metadata_visit_retired(
+    ps_namespace_metadata *metadata, lc_pouch_storage_metadata_retired_fn visit,
+    void *context) {
+  ps_key_metadata_visit_retired(metadata->delta, visit, context);
+}
 void ps_namespace_metadata_close(ps_namespace_metadata *metadata) {
   if (!metadata)
     return;

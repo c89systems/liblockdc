@@ -146,6 +146,13 @@ enum lc_pouch_storage_commit_mode {
   LC_POUCH_STORAGE_COMMIT_DEFAULT = 0,
   LC_POUCH_STORAGE_COMMIT_DEFER_SYNC
 };
+typedef void (*lc_pouch_storage_metadata_retired_fn)(void *, size_t);
+typedef struct lc_pouch_storage_metadata_result {
+  uint64_t checkpoint_epoch;
+  /* Reports the ordinal of each input whose prior key slot was removed. */
+  lc_pouch_storage_metadata_retired_fn retired;
+  void *context;
+} lc_pouch_storage_metadata_result;
 /* Atomic canonical metadata, with no application producer or byte-stream
  * append. Prefixes are borrowed separately during begin and commit. Begin
  * admits key/metadata ceilings; commit receives their finalized generations.
@@ -154,8 +161,8 @@ typedef struct lc_pouch_storage_metadata_ops {
   int (*begin)(void *, void *, enum lc_pouch_storage_append_mode,
                const lc_pouch_storage_batch *, uint64_t, void **, lc_error *);
   int (*commit)(void *, void *, const lc_pouch_storage_batch *,
-                enum lc_pouch_storage_commit_mode, uint64_t *checkpoint_epoch,
-                lc_error *);
+                enum lc_pouch_storage_commit_mode,
+                lc_pouch_storage_metadata_result *, lc_error *);
   void (*close)(void *, void *);
   /* At a committed maintenance boundary, make superseded metadata reusable
    * if the next bounded record would otherwise exhaust completion capacity.

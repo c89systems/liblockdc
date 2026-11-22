@@ -7521,6 +7521,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[2], "native-metadata") == 0) {
       for (int durable = 0; durable < 2; ++durable) {
         native_metadata_lifecycle(durable);
+        native_metadata_stage_peer(durable);
         native_metadata_retirement(durable);
       }
     } else if (strcmp(argv[2], "native-metadata-shared-reserve") == 0) {
@@ -7650,6 +7651,7 @@ int main(int argc, char **argv) {
       for (int durable = 0; durable < 2; ++durable)
         for (int control = 0; control < 2; ++control)
           revision_lifecycle(durable, control);
+      revision_retire_metadata();
       revision_admission();
       revision_candidate_images();
       revision_rollover();
