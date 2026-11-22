@@ -6067,26 +6067,32 @@ static uint32_t staged_revision_u32(const void *bytes) {
   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
          ((uint32_t)p[3] << 24);
 }
-/* Target the terminal atomic revision, rather than the funded stream
- * checkpoint that may precede it. A decision slot belongs to that revision. */
-static int staged_terminal_revision(const void *bytes, size_t length,
-                                    off_t at) {
+/* The seed contains live metadata with standing deletion reservations.
+ * The terminal revision selects a tombstone with zero deletion reservation.
+ * A preceding stream checkpoint only covers live seed records. */
+static size_t staged_terminal_revision(const void *bytes, size_t length,
+                                       off_t at) {
   const unsigned char *p = bytes;
-  size_t cursor = 64;
+  size_t cursor = 64, members;
   int terminal = 0;
   if (at < PS_JOURNAL_OFFSET || at >= PS_DATA || length < 64 ||
       memcmp(p, "PSR1", 4))
     return 0;
   REQUIRE(staged_revision_u32(p + 4) == length);
-  for (uint32_t i = 0; i < staged_revision_u32(p + 16); ++i) {
+  members = staged_revision_u32(p + 16);
+  for (size_t i = 0; i < members; ++i) {
     REQUIRE(length - cursor >= 64);
     size_t member = staged_revision_u32(p + cursor + 4);
     REQUIRE(member >= 64 && member <= length - cursor);
-    terminal |= staged_revision_u32(p + cursor + 16) == PS_KEY_DECISION;
+    if (staged_revision_u32(p + cursor + 16) == PS_KEY_METADATA) {
+      REQUIRE(member >= 72);
+      terminal |= !staged_revision_u32(p + cursor + 64) &&
+                  !staged_revision_u32(p + cursor + 68);
+    }
     cursor += member;
   }
   REQUIRE(cursor == length);
-  return terminal;
+  return terminal ? members : 0;
 }
 static ssize_t staged_crash_write(void *context, int fd, const void *bytes,
                                   size_t length, off_t at) {
@@ -6158,7 +6164,7 @@ static void staging_crash(const char *path) {
 }
 typedef struct batch_crash_model {
   unsigned char *stable, *dirty, *scratch;
-  size_t calls, stop;
+  size_t calls, stop, terminal_members;
   int armed, cut;
 } batch_crash_model;
 static int batch_crash_here(batch_crash_model *m) {
@@ -6174,7 +6180,12 @@ static ssize_t batch_model_write(void *context, int fd, const void *p, size_t n,
   batch_crash_model *m = context;
   int cut = batch_crash_here(m);
   size_t boundary = 0;
-  if (m->armed && m->cut >= 3 && staged_terminal_revision(p, n, at)) {
+  size_t members = m->armed ? staged_terminal_revision(p, n, at) : 0;
+  if (members) {
+    REQUIRE(!m->terminal_members);
+    m->terminal_members = members;
+  }
+  if (members && m->cut >= 3) {
     boundary = m->cut == 3 ? 32 : 64;
     for (int record = 0; record < m->cut - 4; ++record) {
       REQUIRE(n - boundary >= 64);
@@ -6297,9 +6308,12 @@ static void batch_crash_verify(const char *path, ps_pouch_state_options *o,
   lc_pouch_close(p);
   REQUIRE(!live);
 }
-static size_t batch_crash_case(const char *path, size_t stop, int cut,
-                               int crypto, int sync, int rotating,
-                               int operation) {
+typedef struct batch_crash_counts {
+  size_t calls, members;
+} batch_crash_counts;
+static batch_crash_counts batch_crash_case(const char *path, size_t stop,
+                                           int cut, int crypto, int sync,
+                                           int rotating, int operation) {
   if (stop == SIZE_MAX)
     fprintf(stderr, "batch crash baseline crypto=%d sync=%d rotate=%d op=%d\n",
             crypto, sync, rotating, operation);
@@ -6367,24 +6381,25 @@ static size_t batch_crash_case(const char *path, size_t stop, int cut,
          &e);
       REQUIRE(w.version == 2);
     }
-    REQUIRE(write(report[1], &m.calls, sizeof(m.calls)) == sizeof(m.calls));
+    batch_crash_counts counts = {m.calls, m.terminal_members};
+    REQUIRE(write(report[1], &counts, sizeof(counts)) == sizeof(counts));
     _exit(0); /* Deliberately skip Pouch close and any cleanup durability. */
   }
   REQUIRE(close(report[1]) == 0);
   int status;
   REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status));
   int acknowledged = WEXITSTATUS(status) == 0;
-  size_t calls = 0;
-  ssize_t got = read(report[0], &calls, sizeof(calls));
+  batch_crash_counts counts = {0};
+  ssize_t got = read(report[0], &counts, sizeof(counts));
   REQUIRE(close(report[0]) == 0);
   if (stop != SIZE_MAX && (acknowledged || WEXITSTATUS(status) != 77 || got))
     fprintf(stderr,
             "batch cut not reached stop=%lu cut=%d crypto=%d sync=%d rotate=%d "
             "op=%d status=%d calls=%lu\n",
             (unsigned long)stop, cut, crypto, sync, rotating, operation, status,
-            (unsigned long)calls);
+            (unsigned long)counts.calls);
   REQUIRE(stop == SIZE_MAX
-              ? acknowledged && got == sizeof(calls)
+              ? acknowledged && got == sizeof(counts)
               : !acknowledged && WEXITSTATUS(status) == 77 && !got);
   REQUIRE(munmap(m.stable, PS_DEFAULT_CAPACITY) == 0 && close(image) == 0);
   free(m.dirty);
@@ -6396,18 +6411,18 @@ static size_t batch_crash_case(const char *path, size_t stop, int cut,
   batch_crash_verify(image_path, &o, operation, acknowledged, &e);
   REQUIRE(unlink(path) == 0 && unlink(image_path) == 0);
   lc_error_cleanup(&e);
-  return calls;
+  return counts;
 }
 static void staging_crash_matrix(const char *path, int crypto, int sync,
                                  int rotating) {
   size_t cases = 0, sites = 0;
   for (int operation = 0; operation < 3; ++operation) {
-    size_t calls =
+    batch_crash_counts counts =
         batch_crash_case(path, SIZE_MAX, 0, crypto, sync, rotating, operation);
-    REQUIRE(calls > 0);
+    REQUIRE(counts.calls && counts.members > 1);
     ++cases;
-    sites += calls;
-    for (size_t stop = 1; stop <= calls; ++stop)
+    sites += counts.calls;
+    for (size_t stop = 1; stop <= counts.calls; ++stop)
       for (int cut = 0; cut < 3; ++cut) {
         (void)batch_crash_case(path, stop, cut, crypto, sync, rotating,
                                operation);
@@ -6415,7 +6430,7 @@ static void staging_crash_matrix(const char *path, int crypto, int sync,
       }
     /* Cut the native revision header and every partial member prefix,
      * including the coverage member after the logical transaction members. */
-    for (int cut = 3; cut <= (operation == 1 ? 6 : 7); ++cut) {
+    for (int cut = 3; cut <= (int)counts.members + 3; ++cut) {
       (void)batch_crash_case(path, 0, cut, crypto, sync, rotating, operation);
       ++cases;
     }

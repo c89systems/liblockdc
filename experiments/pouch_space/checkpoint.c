@@ -2145,6 +2145,31 @@ static int metadata_read(void *context, uint64_t offset,
   }
   return LC_OK;
 }
+
+static void omit_completed_stage_decisions(ps_checkpoint_delta *d) {
+  slot_change *decision, *stage;
+  const char *key;
+  for (decision = d->changes; decision; decision = decision->next) {
+    if (!decision->prepared || decision->slot->kind != PS_KEY_DECISION)
+      continue;
+    key = decision->slot->key;
+    if (!lc_pouch_state_key_is_staged(key))
+      continue;
+    stage = delta_find(d, key, strlen(key), PS_KEY_METADATA);
+    /* The prior stage is already covered. The same native revision selects
+     * the accepted tombstone and the new coverage or neither of them. A
+     * standalone recovery decision still needs a slot, as do decisions in a
+     * stream whose checkpoint can publish rows before advancing coverage. */
+    if (stage && stage->prepared && stage->slot->summary.found &&
+        (stage->summary.type == LC_POUCH_STATE_RECORD_STATE_DELETE ||
+         stage->summary.type == LC_POUCH_STATE_RECORD_OBJECT_DELETE) &&
+        stage->summary.lifetime == stage->slot->summary.lifetime &&
+        stage->slot->summary.index < decision->summary.index &&
+        decision->summary.index < stage->summary.index)
+      decision->prepared = 0;
+  }
+}
+
 int ps_key_metadata_commit(ps_checkpoint_delta *d,
                            const lc_pouch_storage_batch *batch,
                            enum ps_commit_mode mode, lc_error *e) {
@@ -2223,6 +2248,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     rc = failure(e, LC_ERR_PROTOCOL,
                  "native metadata preparation exceeds its plan");
   if (rc == LC_OK) {
+    omit_completed_stage_decisions(d);
     selected.segment = c->latest_segment;
     selected.offset = c->latest_offset;
     selected.state_index =

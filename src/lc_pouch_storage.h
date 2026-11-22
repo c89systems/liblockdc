@@ -79,6 +79,7 @@ int lc_pouch_state_entry_project(const lc_pouch_state_entry *prior,
 int lc_pouch_state_decision_entry_accepts(int prior_present,
                                           uint64_t prior_index,
                                           const lc_pouch_state_entry *);
+int lc_pouch_state_key_is_staged(const char *);
 typedef struct lc_pouch_storage_checkpoint_ref {
   const char *key, *leaf;
   uint64_t index, lifetime;

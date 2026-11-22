@@ -33,6 +33,17 @@ static void native_metadata_free(native_metadata_batch *b) {
   for (size_t i = 0; i < 4; ++i)
     ps_checkpoint_record_close(&b->records[i]);
 }
+static void native_metadata_add(native_metadata_batch *b,
+                                const lc_pouch_state_entry *entry) {
+  size_t i = b->batch.count++;
+  CHECK(i < sizeof(b->records) / sizeof(b->records[0]));
+  OK(ps_checkpoint_record_encode(NULL, entry, &b->records[i], &error));
+  OK(lc_pouch_record_header_decode(b->records[i].bytes, &b->headers[i],
+                                   &error));
+  b->bytes += b->records[i].length;
+  b->batch.prefix = native_metadata_prefix;
+  b->batch.context = b;
+}
 static void native_metadata_fixture_full(native_metadata_batch *b,
                                          int replacement, const char *first,
                                          const char *etag) {
@@ -60,21 +71,15 @@ static void native_metadata_fixture_full(native_metadata_batch *b,
         entry.decision = "committed";
       }
     }
-    OK(ps_checkpoint_record_encode(NULL, &entry, &b->records[i], &error));
-    OK(lc_pouch_record_header_decode(b->records[i].bytes, &b->headers[i],
-                                     &error));
-    b->bytes += b->records[i].length;
+    native_metadata_add(b, &entry);
   }
-  b->batch.count = 4;
-  b->batch.prefix = native_metadata_prefix;
-  b->batch.context = b;
 }
 static void native_metadata_fixture(native_metadata_batch *b, int replacement,
                                     const char *first) {
   native_metadata_fixture_full(b, replacement, first, "empty");
 }
 typedef struct native_metadata_seen {
-  const char *first_key;
+  const char *first_key, *second_key, *decision_key;
   size_t keys, decisions;
   uint64_t index, version, decision_version, boundary;
   int found;
@@ -92,7 +97,7 @@ static int native_metadata_visit(void *context, uint64_t segment,
   }
   if (!entry->control) {
     CHECK(!strcmp(entry->key, seen->first_key ? seen->first_key : "alpha") ||
-          !strcmp(entry->key, "bravo"));
+          !strcmp(entry->key, seen->second_key ? seen->second_key : "bravo"));
     if (!seen->keys) {
       seen->found = entry->found;
       seen->version = entry->version;
@@ -101,6 +106,8 @@ static int native_metadata_visit(void *context, uint64_t segment,
     ++seen->keys;
   } else {
     CHECK(!strcmp(entry->decision, "committed"));
+    if (seen->decision_key)
+      CHECK(!strcmp(entry->key, seen->decision_key));
     seen->decision_version = entry->version;
     ++seen->decisions;
   }
@@ -125,6 +132,66 @@ static int native_metadata_observe(ps_namespace *ns) {
         seen.boundary == (seen.found ? 4 : 8) &&
         seen.index == (seen.found ? 3 : 7));
   return !seen.found;
+}
+static const char native_stage[] = "alpha/.staging/txn";
+static const char native_other_stage[] = "bravo/.staging/txn";
+
+static void native_metadata_stage(native_metadata_batch *b, int complete) {
+  lc_pouch_state_entry entry = {0};
+  memset(b, 0, sizeof(*b));
+  entry.key = "alpha";
+  entry.etag = "empty";
+  entry.content_type = "application/test";
+  entry.seen = entry.has_query_index_seq = 1;
+  entry.found = !complete;
+  entry.version = complete ? 3 : 1;
+  entry.index_seq = complete ? 5 : 1;
+  entry.record_type = complete ? LC_POUCH_STATE_RECORD_STATE_DELETE
+                               : LC_POUCH_STATE_RECORD_STATE_META;
+  native_metadata_add(b, &entry);
+  if (!complete) {
+    entry.key = (char *)native_stage;
+    entry.index_seq = 2;
+    native_metadata_add(b, &entry);
+  }
+  entry.key = (char *)(complete ? native_stage : native_other_stage);
+  entry.decision = "committed";
+  entry.control = 1;
+  entry.found = 0;
+  entry.version = complete ? 2 : 1;
+  entry.index_seq = complete ? 6 : 3;
+  entry.record_type = LC_POUCH_STATE_RECORD_DECISION;
+  native_metadata_add(b, &entry);
+  if (complete) {
+    entry.decision = NULL;
+    entry.control = 0;
+    entry.version = 3;
+    entry.index_seq = 7;
+    entry.record_type = LC_POUCH_STATE_RECORD_STATE_DELETE;
+    native_metadata_add(b, &entry);
+  }
+  entry.key = entry.etag = entry.decision = NULL;
+  entry.control = 1;
+  entry.index_seq = complete ? 8 : 4;
+  entry.record_type = LC_POUCH_STATE_RECORD_HIGH_WATER;
+  native_metadata_add(b, &entry);
+}
+
+static int native_metadata_stage_capture(ps_namespace *ns, int *complete,
+                                         lc_error *e) {
+  native_metadata_seen seen = {0};
+  int rc;
+  seen.second_key = native_stage;
+  seen.decision_key = native_other_stage;
+  rc = native_metadata_capture(ns, &seen, e);
+  if (rc == LC_OK) {
+    CHECK(seen.keys == 2 && seen.decisions == 1 && seen.decision_version == 1 &&
+          seen.version == (seen.found ? 1 : 3) &&
+          seen.boundary == (seen.found ? 4 : 8) &&
+          seen.index == (seen.found ? 3 : 7));
+    *complete = !seen.found;
+  }
+  return rc;
 }
 static int native_metadata_write(ps_namespace *ns, native_metadata_batch *b,
                                  enum ps_commit_mode mode, lc_error *e) {
@@ -215,9 +282,10 @@ static void native_metadata_faults(int durable, int kind) {
   options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
   options.storage.durable_sync = durable;
   options.storage.io = &io;
-  native_metadata_fixture(&original, 0, "alpha");
-  native_metadata_fixture(&changed, 1, "alpha");
+  native_metadata_stage(&original, 0);
+  native_metadata_stage(&changed, 1);
   for (size_t cut = 0; cut <= sites; ++cut) {
+    int selected = 0;
     clean();
     OK(ps_root_open(path, 1, &options, &root, &error));
     OK(ps_root_namespace_acquire(root, "metadata", 1, &ns, &error));
@@ -229,10 +297,8 @@ static void native_metadata_faults(int durable, int kind) {
     allocation_fail = kind == 1 ? (cut ? cut : (size_t)-1) : 0;
     m.fail_read = kind == 2 ? cut : 0;
     int rc = native_metadata_write(ns, &changed, PS_COMMIT_DEFAULT, &error);
-    if (rc == LC_OK && kind == 2) {
-      native_metadata_seen seen = {0};
-      rc = native_metadata_capture(ns, &seen, &error);
-    }
+    if (rc == LC_OK && kind == 2)
+      rc = native_metadata_stage_capture(ns, &selected, &error);
     if (!cut)
       sites = kind == 0 ? m.operations : kind == 1 ? allocation_call : m.reads;
     m.fail_at = m.fail_read = allocation_fail = 0;
@@ -245,12 +311,13 @@ static void native_metadata_faults(int durable, int kind) {
     crash(&m);
     OK(ps_root_open(path, 0, &options, &root, &error));
     OK(ps_root_namespace_acquire(root, "metadata", 0, &ns, &error));
-    int selected = native_metadata_observe(ns);
+    OK(native_metadata_stage_capture(ns, &selected, &error));
     CHECK(!durable || rc != LC_OK || selected);
     /* Both generations are valid as a whole; retry must finish the new one. */
     if (!selected)
       OK(native_metadata_write(ns, &changed, PS_COMMIT_DEFAULT, &error));
-    CHECK(native_metadata_observe(ns));
+    OK(native_metadata_stage_capture(ns, &selected, &error));
+    CHECK(selected);
     OK(ps_check(ps_root_space(root), &error));
     ps_namespace_release(ns);
     OK(ps_root_close(root, &error));

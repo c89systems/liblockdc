@@ -93,8 +93,6 @@ int lc_pouch_retention_resolve(lc_pouch_unix_seconds retention,
   return LC_OK;
 }
 
-static int lc_pouch_state_key_is_staged(const char *key);
-
 static int lc_pouch_state_retention_prepare(const char *key,
                                             lc_pouch_unix_seconds requested,
                                             lc_pouch_unix_seconds *out,
@@ -1817,7 +1815,7 @@ static int lc_pouch_state_record_type_is_object(unsigned char record_type) {
          record_type == LC_POUCH_STATE_RECORD_OBJECT_DELETE;
 }
 
-static int lc_pouch_state_key_is_staged(const char *key) {
+int lc_pouch_state_key_is_staged(const char *key) {
   return key != NULL &&
          (strncmp(key, ".staging/", sizeof(".staging/") - 1U) == 0 ||
           strstr(key, "/.staging/") != NULL);
