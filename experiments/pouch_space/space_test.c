@@ -2738,14 +2738,15 @@ static void fixture_entry_crc(unsigned char *record) {
 }
 static void packing_invalid_ownership(void) {
   ps_space *s = NULL;
-  unsigned char *buffer = malloc(PS_PAGE), *body = malloc(PS_PAGE);
-  unsigned char roots[PS_ROOT_BYTES], records[176];
-  unsigned char *record;
-  uint64_t directory, reference, offset;
+  size_t body_size = PS_CHUNK + PS_CELL + 1;
+  unsigned char *buffer = malloc(PS_PAGE), *body = malloc(body_size);
+  unsigned char records[176], *record, *tail;
+  ps_descriptor_ref ref = {0};
+  uint64_t journal, offset, packed = 0, neighbor = 0;
   size_t phase;
   int fd;
   CHECK(buffer && body);
-  memset(body, 'A', PS_PAGE);
+  memset(body, 'A', body_size);
   /* Keep all outer CRCs valid so these cases exercise ownership validation,
    * rather than being rejected merely as damaged encoded bytes. */
   for (phase = 0; phase < 8; ++phase) {
@@ -2753,17 +2754,32 @@ static void packing_invalid_ownership(void) {
     s = create(PS_MIB, 0, NULL);
     put(s, state(1), body,
         phase == 1   ? PS_PAGE
-        : phase == 7 ? PS_CELL + 1
-                     : PS_CELL,
+        : phase < 3  ? PS_CELL
+        : phase == 7 ? body_size
+                     : body_size - 1,
         31);
     put(s, state(2), body, phase == 2 ? PS_PAGE : PS_CELL, 31);
-    if (phase >= 3)
+    if (phase >= 3) {
+      /* A whole chunk followed by a packed tail uses an external descriptor.
+       * A value made of one packed extent is now stored inline in the leaf. */
+      const ps_entry *value = ps_internal_lookup(s, state(1));
+      const ps_entry *other = ps_internal_lookup(s, state(2));
+      CHECK(value && value->count == 2 &&
+            value->extents[1].flags == EXTENT_PACKED && other &&
+            other->count == 1 && other->extents[0].flags == EXTENT_PACKED);
+      packed = value->extents[1].offset;
+      neighbor = other->extents[0].offset;
       OK(ps_checkpoint(s, &error));
+      ref = value->checkpoint_ref;
+      CHECK(ref.offset && ref.bytes == 112 &&
+            ref.bytes <= PS_PAGE - ref.offset % PS_PAGE);
+    }
+    journal = JOURNAL_POSITION(s->journal_start);
     OK(ps_close(s, &error));
     fd = open(path, O_RDWR);
     CHECK(fd >= 0);
     if (phase < 3) {
-      CHECK(pread(fd, records, sizeof(records), PS_JOURNAL_OFFSET) ==
+      CHECK(pread(fd, records, sizeof(records), (off_t)journal) ==
             (ssize_t)sizeof(records));
       /* Alias two packed cells, a whole page with packed cells, and the
        * reverse recovery order. Bodies match, so both payload CRCs pass. */
@@ -2771,26 +2787,24 @@ static void packing_invalid_ownership(void) {
       offset = fixture_get64(records + (phase == 2 ? 88 : 0) + 64);
       fixture_put(record + 64, offset, 8);
       fixture_entry_crc(record);
-      CHECK(pwrite(fd, records, sizeof(records), PS_JOURNAL_OFFSET) ==
+      CHECK(pwrite(fd, records, sizeof(records), (off_t)journal) ==
             (ssize_t)sizeof(records));
     } else {
-      CHECK(pread(fd, roots, sizeof(roots), 0) == (ssize_t)sizeof(roots));
-      directory = fixture_get64(roots + 32);
-      CHECK(pread(fd, buffer, PS_PAGE, (off_t)directory) == PS_PAGE);
-      reference = fixture_get64(buffer + 64 + 24); /* first sorted leaf key */
-      offset = reference / PS_PAGE * PS_PAGE;
+      offset = ref.offset / PS_PAGE * PS_PAGE;
       CHECK(pread(fd, buffer, PS_PAGE, (off_t)offset) == PS_PAGE);
-      record = buffer + reference % PS_PAGE;
+      record = buffer + ref.offset % PS_PAGE;
+      tail = record + 88;
+      CHECK(fixture_get64(tail) == packed);
       if (phase == 3)
-        fixture_put(record + 84, 2, 4); /* unknown extent flags */
+        fixture_put(tail + 20, 2, 4); /* unknown extent flags */
       else if (phase == 4)
-        fixture_put(record + 64, PS_DATA + 1, 8); /* cell misalignment */
+        fixture_put(tail, packed + 1, 8); /* cell misalignment */
       else if (phase == 5)
-        fixture_put(record + 84, 0, 4); /* packed address as whole page */
+        fixture_put(tail + 20, 0, 4); /* packed address as whole page */
       else if (phase == 6)
-        fixture_put(record + 64, PS_DATA + PS_CELL, 8); /* duplicate cells */
+        fixture_put(tail, neighbor, 8); /* duplicate cells */
       else
-        fixture_put(record + 64, PS_DATA + PS_PAGE - PS_CELL,
+        fixture_put(tail, packed / PS_PAGE * PS_PAGE + PS_PAGE - PS_CELL,
                     8); /* span crosses physical page */
       fixture_entry_crc(record);
       uint32_t crc = (uint32_t)crc32(0, buffer, 48);
