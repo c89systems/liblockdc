@@ -2424,8 +2424,75 @@ static void checkpoint_ownership_overlap(void) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
+static void checkpoint_binding_reuse(int durable) {
+  lc_error e = {0};
+  descriptor_probe probe = {0};
+  ps_io io = {&probe, descriptor_read, write_io, sync_io, reserve_io, NULL};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *observer = NULL, *verifier = NULL;
+  ps_reader *pinned = NULL, *fresh = NULL;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 320; ++id)
+    capture_put(writer, id, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  options.io = &io;
+  ok(ps_open(path, 0, &options, &observer, &e), &e);
+  ok(ps_open(path, 0, &options, &verifier, &e), &e);
+  ok(ps_read_open(observer, key(1), NULL, &pinned, &e), &e);
+  const ps_entry *before = ps_internal_lookup(observer, key(160));
+  REQUIRE(before);
+  ps_directory_value ref = before->checkpoint_ref;
+  probe.pages[0] = ref.offset / PS_PAGE * PS_PAGE;
+  probe.count = 1;
+  uint64_t generation = observer->generation;
+  capture_put(writer, 1, 129);
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(writer->generation > generation);
+
+  /* Fail each draft allocation before allowing a successful adoption. The
+   * old captured reader must survive and the failed draft owns no ranges. */
+  for (size_t cut = 1;; ++cut) {
+    allocations = probe.reads[0] = 0;
+    allocation_fail = cut;
+    measuring = 1;
+    int rc = ps_read_open(observer, key(1), NULL, &fresh, &e);
+    measuring = 0;
+    if (rc == LC_OK)
+      break;
+    REQUIRE(rc == LC_ERR_NOMEM && !fresh && observer->generation == generation);
+    lc_error_cleanup(&e);
+  }
+  REQUIRE(observer->generation == writer->generation && !probe.reads[0]);
+  REQUIRE(ps_internal_lookup(observer, key(160)) == before);
+  captured_expect(fresh, 1, 129);
+  captured_expect(pinned, 1, 65);
+  ps_reader_close(fresh);
+  ps_reader_close(pinned);
+  ok(ps_check(observer, &e), &e);
+
+  /* An explicit refresh verifies the descriptor on disk. Repacking also
+   * replaces the leaf, so ordinary adoption must fetch the new descriptor. */
+  ok(ps_refresh(verifier, &e), &e);
+  REQUIRE(probe.reads[0] == 1);
+  ok(ps_metadata_repack(writer, &e), &e);
+  const ps_entry *repacked = ps_internal_lookup(writer, key(160));
+  REQUIRE(repacked && repacked->checkpoint_ref.incarnation == ref.incarnation &&
+          repacked->checkpoint_ref.offset != ref.offset);
+  probe.pages[0] = repacked->checkpoint_ref.offset / PS_PAGE * PS_PAGE;
+  probe.reads[0] = 0;
+  ok(ps_read_open(observer, key(160), NULL, &fresh, &e), &e);
+  REQUIRE(observer->generation == writer->generation && probe.reads[0]);
+  captured_expect(fresh, 160, 65);
+  ps_reader_close(fresh);
+  ok(ps_close(verifier, &e), &e);
+  ok(ps_close(observer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
+  checkpoint_binding_reuse(0);
+  checkpoint_binding_reuse(1);
   ps_space *writer = NULL, *join = NULL;
   ps_reader *small = NULL, *large = NULL, *current = NULL;
   lc_error e = {0};

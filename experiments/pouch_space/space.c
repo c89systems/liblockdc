@@ -3954,15 +3954,14 @@ typedef struct metadata_read_page {
 typedef struct metadata_directory_entry {
   ps_key key;
   ps_directory_value ref;
-  size_t ordinal;
-  ps_entry *decoded;
+  ps_entry *resident, *decoded;
 } metadata_directory_entry;
 typedef struct metadata_recovery {
   ps_space *space, *resident;
   unsigned char *wire;
   ps_entry_batch_builder batch_entries;
   uint64_t cohort_origin;
-  int certified_root;
+  int certified_root, reuse, shared_leaf;
   /* Directory order need not match the packing order of descriptor pages.
    * Retain a bounded set of checked immutable pages for this traversal. */
   metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
@@ -4055,20 +4054,21 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   return LC_OK;
 }
 static int metadata_physical_order(const void *a, const void *b) {
-  uint64_t left = ((const metadata_directory_entry *)a)->ref.offset;
-  uint64_t right = ((const metadata_directory_entry *)b)->ref.offset;
+  uint64_t left = (*(metadata_directory_entry *const *)a)->ref.offset;
+  uint64_t right = (*(metadata_directory_entry *const *)b)->ref.offset;
   return left < right ? -1 : left != right;
 }
-static int metadata_read_ahead(metadata_recovery *r, size_t first, size_t end,
-                               lc_error *error) {
+static int metadata_read_ahead(metadata_recovery *r,
+                               metadata_directory_entry *const *entries,
+                               size_t n, lc_error *error) {
   uint64_t offsets[META_DIRECTORY_BATCH];
   uint64_t offset;
   metadata_read_page *page;
   size_t i, start, part, count = 0;
   int rc = LC_OK;
   ++r->batch;
-  for (i = first; i < end; ++i) {
-    offset = r->entries[i].ref.offset / PS_PAGE * PS_PAGE;
+  for (i = 0; i < n; ++i) {
+    offset = entries[i]->ref.offset / PS_PAGE * PS_PAGE;
     if (count && offset == offsets[count - 1])
       continue;
     if (!metadata_offset(r->space, offset))
@@ -4099,9 +4099,15 @@ static int metadata_read_ahead(metadata_recovery *r, size_t first, size_t end,
 }
 static int recover_directory_page(void *v, ps_directory_root ref,
                                   lc_error *error) {
-  ps_space *s = ((metadata_recovery *)v)->space;
+  metadata_recovery *r = v;
+  ps_space *s = r->space;
+  const ps_meta_page *old =
+      r->reuse ? metadata_find(r->resident, ref.offset) : NULL;
   ps_meta_page *p;
   int rc;
+  /* The page callback precedes a leaf's bindings. Descending an internal
+   * page calls it again before visiting any binding. */
+  r->shared_leaf = old && old->index && old->generation == ref.generation;
   if (metadata_find(s, ref.offset))
     return err(error, LC_ERR_PROTOCOL, "overlapping directory ownership");
   p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
@@ -4120,12 +4126,38 @@ static int recover_directory_page(void *v, ps_directory_root ref,
   metadata_register(s, p);
   return LC_OK;
 }
+static int recover_descriptor_page(ps_space *s, uint64_t offset,
+                                   uint64_t generation, size_t used,
+                                   uint64_t following, lc_error *error) {
+  ps_meta_page *p = metadata_find(s, offset);
+  int rc;
+  if (p && (p->index || p->generation != generation || p->used != used ||
+            p->following != following))
+    return err(error, LC_ERR_PROTOCOL, "conflicting metadata ownership");
+  if (!p) {
+    p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+    if (!p)
+      return err(error, LC_ERR_NOMEM, "cannot recover descriptor ownership");
+    rc = exclude_run(s, offset, PS_PAGE, error);
+    if (rc != LC_OK) {
+      lc_free_with_allocator(NULL, p);
+      return rc;
+    }
+    p->run.offset = offset;
+    p->run.bytes = PS_PAGE;
+    p->generation = generation;
+    p->used = used;
+    p->following = following;
+    metadata_register(s, p);
+  }
+  ++p->references;
+  return LC_OK;
+}
 static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
                          const unsigned char **wire, lc_error *error) {
   ps_space *s = recovery->space;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), done = 0, take;
-  ps_meta_page *p;
   metadata_read_page *page = NULL;
   int rc;
   while (done < ref.bytes) {
@@ -4136,27 +4168,10 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
         at >= META_HEADER + page->used)
       return err(error, LC_ERR_PROTOCOL, "invalid packed metadata page");
     generation = page->generation;
-    p = metadata_find(s, offset);
-    if (p && (p->index || p->generation != generation ||
-              p->used != page->used || p->following != page->following))
-      return err(error, LC_ERR_PROTOCOL, "conflicting metadata ownership");
-    if (!p) {
-      p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
-      if (!p)
-        return err(error, LC_ERR_NOMEM, "cannot recover descriptor ownership");
-      rc = exclude_run(s, offset, PS_PAGE, error);
-      if (rc != LC_OK) {
-        lc_free_with_allocator(NULL, p);
-        return rc;
-      }
-      p->run.offset = offset;
-      p->run.bytes = PS_PAGE;
-      p->generation = generation;
-      p->used = page->used;
-      p->following = page->following;
-      metadata_register(s, p);
-    }
-    ++p->references;
+    rc = recover_descriptor_page(s, offset, generation, page->used,
+                                 page->following, error);
+    if (rc != LC_OK)
+      return rc;
     take = META_HEADER + page->used - at;
     if (take > ref.bytes - done)
       take = (size_t)ref.bytes - done;
@@ -4172,6 +4187,55 @@ static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
     at = META_HEADER;
   }
   *wire = recovery->wire;
+  return LC_OK;
+}
+/* A checked copy-on-write leaf that kept its identity still owns each
+ * immutable descriptor it named. Rebuild references to its checked page
+ * chain in the draft without copying the old projection's mutable links. */
+static int reuse_directory_entry(metadata_recovery *r,
+                                 metadata_directory_entry *item,
+                                 lc_error *error) {
+  const ps_entry *old = item->resident;
+  ps_directory_value ref = item->ref;
+  uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
+  size_t at = (size_t)(ref.offset % PS_PAGE), remaining = (size_t)ref.bytes;
+  ps_entry *p;
+  int rc;
+  while (remaining) {
+    const ps_meta_page *page = metadata_find(r->resident, offset);
+    size_t take;
+    if (!page || page->index ||
+        (generation && generation != page->generation) || at < META_HEADER ||
+        at >= META_HEADER + page->used)
+      return err(error, LC_ERR_PROTOCOL, "invalid retained descriptor span");
+    generation = page->generation;
+    rc = recover_descriptor_page(r->space, offset, generation, page->used,
+                                 page->following, error);
+    if (rc != LC_OK)
+      return rc;
+    take = META_HEADER + page->used - at;
+    if (remaining <= take)
+      break;
+    remaining -= take;
+    offset = page->following;
+    at = META_HEADER;
+  }
+  p = decoded_entry_new(&r->batch_entries, old->count);
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot stage retained descriptor");
+  p->key = old->key;
+  p->token = old->token;
+  p->bytes = old->bytes;
+  p->count = p->capacity = old->count;
+  if (p->count)
+    memcpy(p->extents, old->extents, p->count * sizeof(*p->extents));
+  p->checkpoint_ref = ref;
+  p->projection = item->resident;
+  item->decoded = p;
+  if (p->key.kind == PS_KEY_METADATA)
+    return ps_internal_reserve_entry(p, old->deletion_bytes, error);
+  if (p->key.kind == PS_CATALOG)
+    return ps_catalog_copy_record(p, old, error);
   return LC_OK;
 }
 static int decode_directory_entry(metadata_recovery *recovery,
@@ -4210,31 +4274,38 @@ static int decode_directory_entry(metadata_recovery *recovery,
 }
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
+  metadata_directory_entry **fetch;
   ps_entry *p;
-  size_t i, end, at;
+  size_t i, end, count = 0;
   int rc = key_index_reserve(s, r->count, error);
   if (rc != LC_OK)
     return rc;
-  /* Decode neighboring descriptors together. Logical installation still
-   * follows the checked directory, including stream heads before runs. */
-  qsort(r->entries, r->count, sizeof(*r->entries), metadata_physical_order);
-  for (i = 0; rc == LC_OK && i < r->count;) {
-    end = r->count - i > META_DIRECTORY_BATCH ? i + META_DIRECTORY_BATCH
-                                              : r->count;
-    rc = metadata_read_ahead(r, i, end, error);
-    for (; rc == LC_OK && i < end; ++i) {
+  fetch = lc_alloc_with_allocator(NULL, r->count * sizeof(*fetch));
+  if (!fetch)
+    return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
+  for (i = 0; rc == LC_OK && i < r->count; ++i) {
+    metadata_directory_entry *item = &r->entries[i];
+    if (item->resident) {
       r->batch_entries.remaining = r->count - i;
-      rc = decode_directory_entry(r, &r->entries[i], error);
+      rc = reuse_directory_entry(r, item, error);
+    } else
+      fetch[count++] = item;
+  }
+  /* Order only the reads still needed. Installation keeps directory order,
+   * including stream heads before their runs. */
+  if (rc == LC_OK && count > 1)
+    qsort(fetch, count, sizeof(*fetch), metadata_physical_order);
+  for (i = 0; rc == LC_OK && i < count;) {
+    end = count - i > META_DIRECTORY_BATCH ? i + META_DIRECTORY_BATCH : count;
+    rc = metadata_read_ahead(r, fetch + i, end - i, error);
+    for (; rc == LC_OK && i < end; ++i) {
+      r->batch_entries.remaining = count - i;
+      rc = decode_directory_entry(r, fetch[i], error);
     }
   }
+  lc_free_with_allocator(NULL, fetch);
   if (rc != LC_OK)
     return rc;
-  for (i = 0; i < r->count; ++i)
-    while ((at = r->entries[i].ordinal) != i) {
-      metadata_directory_entry item = r->entries[i];
-      r->entries[i] = r->entries[at];
-      r->entries[at] = item;
-    }
   for (i = 0; i < r->count; ++i) {
     p = r->entries[i].decoded;
     /* The directory walk checked that every binding key is distinct. */
@@ -4256,6 +4327,7 @@ static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
                                    lc_error *error) {
   metadata_recovery *r = v;
   metadata_directory_entry *item;
+  ps_entry *old = NULL;
   size_t capacity;
   if (r->count == r->capacity) {
     if (r->capacity > (size_t)-1 / sizeof(*item) / 2)
@@ -4268,10 +4340,20 @@ static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
     r->entries = item;
     r->capacity = capacity;
   }
-  item = &r->entries[r->count];
+  if (r->shared_leaf && ref.incarnation <= r->space->token_limit &&
+      (immutable_key(key) || key.kind == PS_CATALOG)) {
+    old = lookup(r->resident, key);
+    if (old &&
+        (old->deleted || old->dirty_link || old->token != ref.incarnation ||
+         old->checkpoint_ref.incarnation != ref.incarnation ||
+         old->checkpoint_ref.offset != ref.offset ||
+         old->checkpoint_ref.bytes != ref.bytes))
+      old = NULL;
+  }
+  item = &r->entries[r->count++];
   item->key = key;
   item->ref = ref;
-  item->ordinal = r->count++;
+  item->resident = old;
   item->decoded = NULL;
   return LC_OK;
 }
@@ -4718,7 +4800,7 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
-                             ps_space *resident, lc_error *error) {
+                             ps_space *resident, int reuse, lc_error *error) {
   ps_directory *directory = NULL;
   metadata_recovery *recovery = NULL;
   int rc = initial_free(s, error);
@@ -4737,6 +4819,8 @@ static int recover_directory(ps_space *s, unsigned char *wire,
     recovery->wire = wire;
     recovery->certified_root = certificate->root == s->generation;
     recovery->cohort_origin = certificate->origin;
+    recovery->reuse =
+        resident && reuse && recovery->certified_root && !certificate->pending;
     rc = ps_directory_visit(directory, capture_directory_entry,
                             recover_directory_page, recovery, error);
   }
@@ -4915,7 +4999,8 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   rc = allocation_end(s, *guard, LC_OK, error);
   *guard = NULL;
   if (rc == LC_OK) {
-    prepared = recover_directory(draft, wire, certificate, NULL, &draft_error);
+    prepared =
+        recover_directory(draft, wire, certificate, NULL, 0, &draft_error);
     rc = allocation_begin(s, guard, error);
   }
   if (rc == LC_OK)
@@ -5024,7 +5109,7 @@ restart:
     if (rc == LC_OK && moved)
       goto restart;
   } else
-    rc = recover_directory(s, wire, &certificate, NULL, error);
+    rc = recover_directory(s, wire, &certificate, NULL, 0, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -5516,10 +5601,10 @@ static void projection_install(ps_space *s, ps_space *v) {
  * selected checkpoint must be revalidated before importing any peer journal. */
 static int projection_stage(ps_space *s, ps_space *v,
                             const ps_readiness_certificate *certificate,
-                            lc_error *error) {
+                            int reuse, lc_error *error) {
   ps_entry *p, *old;
   payload_rebuild build = {0};
-  int rc = recover_directory(v, v->journal_image, certificate, s, error);
+  int rc = recover_directory(v, v->journal_image, certificate, s, reuse, error);
   if (rc != LC_OK)
     return rc;
   /* The checkpoint prefix covers the resident journal. Consequently only
@@ -5592,14 +5677,14 @@ static void projection_select(ps_space *v, const unsigned char *root,
 static int projection_load(ps_space *s, ps_space *v, const unsigned char *root,
                            int selected,
                            const ps_readiness_certificate *certificate,
-                           lc_error *error) {
+                           int reuse, lc_error *error) {
   projection_select(v, root, selected);
   v->peer_durable = certificate->durable;
   v->journal_image = lc_alloc_with_allocator(NULL, PS_JOURNAL);
   if (!v->journal_image)
     return err(error, LC_ERR_NOMEM,
                "cannot allocate projection control buffer");
-  return projection_stage(s, v, certificate, error);
+  return projection_stage(s, v, certificate, reuse, error);
 }
 static int read_checkpoint_roots(ps_space *s, unsigned char *roots,
                                  lc_error *error) {
@@ -5630,8 +5715,9 @@ static void preview_checkpoint(ps_space *s, checkpoint_preview *preview) {
       get64(root + 16) >= s->capacity && get64(root + 24) >= s->sequence &&
       get64(root + 48) <= preview->certificate.grant_limit &&
       (!s->maximum || get64(root + 16) <= s->maximum))
-    preview->result = projection_load(s, preview->view, root, selected,
-                                      &preview->certificate, &preview->error);
+    preview->result =
+        projection_load(s, preview->view, root, selected, &preview->certificate,
+                        1, &preview->error);
 }
 static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
                              int verify_disk, lc_error *error) {
@@ -5715,7 +5801,8 @@ static int canonical_refresh(ps_space *s, checkpoint_preview *preview,
     }
   } else {
     v = projection_new(s, error);
-    rc = v ? projection_load(s, v, root, selected, &certificate, error)
+    rc = v ? projection_load(s, v, root, selected, &certificate, !verify_disk,
+                             error)
            : LC_ERR_NOMEM;
   }
   if (rc != LC_OK)

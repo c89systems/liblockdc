@@ -141,6 +141,16 @@ void ps_catalog_free_record(ps_entry *p) {
     p->catalog = NULL;
   }
 }
+int ps_catalog_copy_record(ps_entry *p, const ps_entry *source, lc_error *e) {
+  const ps_catalog_record *r = source->catalog;
+  int rc = attach_record(p, r->kind, r->name, r->length, r->value,
+                         r->value_length, e);
+  if (rc == LC_OK) {
+    p->catalog->stream = r->stream;
+    p->catalog->token = r->token;
+  }
+  return rc;
+}
 size_t ps_catalog_record_bytes(const ps_entry *p) {
   return 104 + p->catalog->length + p->catalog->value_length;
 }

@@ -55,6 +55,7 @@ int ps_directory_put(ps_directory *, ps_key, ps_directory_value, lc_error *);
 int ps_directory_remove(ps_directory *, ps_key, int *, lc_error *);
 /* Walks verified entries and/or reachable page ownership. Page visitation
  * requires an unmodified view; recovery uses it to rebuild the free-space map.
+ * The page callback precedes that node's children or leaf bindings.
  * Callbacks must not re-enter this handle. */
 int ps_directory_visit(ps_directory *, ps_directory_visit_fn,
                        ps_directory_page_fn, void *, lc_error *);

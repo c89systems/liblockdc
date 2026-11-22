@@ -13807,3 +13807,117 @@ along with the indexed reopen and CPU gaps against multifile.
 
 Raw comparisons, traces, and test logs are under
 `build/pouch-space-concurrent/ordered-recovery/`.
+
+## Reuse immutable bindings during checkpoint adoption
+
+A 192 MiB NoSync trace on `c32dbd42` found 25,615 of 60,585 directory
+pages at an offset and generation already known to the adopting
+process. It found 1,940,317 of 3,111,561 descriptor bindings with the
+same incarnation, descriptor offset, and byte count as a
+clean resident entry. Btrfs uses matching block offsets and generations
+to recognize shared copy-on-write nodes during tree comparison. Pouch
+uses that identity for directory leaves. [Btrfs tree comparison](https://code.googlesource.com/linux/torvalds/linux/%2B/50c44fea13ec339d0d457079b254e8c8420d6511/fs/btrfs/send.c),
+[Btr-Diff paper](https://www.kernel.org/doc/ols/2014/ols2014-pimpale.pdf)
+
+The directory walk checks each selected leaf. A leaf with the same
+offset and generation as a resident leaf still names its original
+descriptor chains. On an ordinary adoption of a certified checkpoint
+with no pending transition, an exact clean resident binding for an
+immutable value or catalog record can supply the decoded fields and
+descriptor page geometry. The draft counts those pages in its own free
+map and builds its own entry links, catalog links, and reservations.
+Bindings that need a disk read are ordered by physical offset through a
+compact pointer array. The draft installs all entries in directory key
+order and validates their ownership before publication.
+
+An explicit refresh of a newer checkpoint and initial open decode the
+descriptors from disk. Ordinary adoption also reads changed bindings,
+stream heads, and owned runs. The allocator rechecks the selected root
+and certificate before installing a draft that was prepared outside
+allocator authority.
+
+The deterministic test keeps a reader pinned while a peer publishes a
+replacement in one leaf. It forces allocation failures during draft
+adoption, then checks the old bytes and the replacement bytes. The
+unchanged leaf stays readable without another descriptor-page read.
+Explicit refresh reads that page, and repacking forces an ordinary
+reader to fetch the relocated descriptor. The fixture exercises both
+durability modes.
+
+The instrumented binding-reuse build reused 1,475,107 of 3,505,670
+descriptors in the 192 MiB NoSync workload and 235,495 of 539,936
+at 96 MiB durable. Separate probes measured directory-phase CPU and
+counted bindings once per adoption. At 192 MiB NoSync the phase used
+2.77 CPU seconds over 862 adoptions for the prior build and 2.52
+seconds over 853 adoptions with reuse. CPU per binding fell from
+0.85 to 0.76 microseconds. At 96 MiB durable it fell from 0.99 to 0.85
+microseconds. The workload comparisons below used uninstrumented builds.
+
+All 40 matched workload runs verified. Indexed runs used eight
+writers, 24 rows, 64 KiB values, and a fixed 10 MiB native root.
+Native builds ran four counterbalanced pairs each at 192 MiB NoSync
+and 96 MiB durable and two pairs each at 96 MiB NoSync and 192 MiB
+durable. Each indexed setting includes a fresh multifile reference.
+Work and CPU are in seconds. Mutation and last-16-round p95 are in
+milliseconds. Values are medians within each build.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 6.21 | 6.92 | 76.48 | 82.20 |
+| 96 MiB NoSync | Binding reuse | 6.25 | 6.66 | 77.49 | 78.24 |
+| 96 MiB NoSync | Multifile | 10.91 | 4.84 | 57.35 | 45.78 |
+| 96 MiB durable | Prior | 12.97 | 8.50 | 103.29 | 121.46 |
+| 96 MiB durable | Binding reuse | 13.10 | 8.30 | 103.16 | 111.89 |
+| 96 MiB durable | Multifile | 33.96 | 5.91 | 193.61 | 163.86 |
+| 192 MiB NoSync | Prior | 15.92 | 17.36 | 105.21 | 136.23 |
+| 192 MiB NoSync | Binding reuse | 15.10 | 17.53 | 98.15 | 126.46 |
+| 192 MiB NoSync | Multifile | 21.81 | 9.88 | 54.70 | 47.57 |
+| 192 MiB durable | Prior | 29.50 | 22.33 | 124.47 | 147.98 |
+| 192 MiB durable | Binding reuse | 25.82 | 20.43 | 110.10 | 141.81 |
+| 192 MiB durable | Multifile | 69.39 | 12.07 | 202.10 | 181.93 |
+
+At 192 MiB NoSync, elapsed work fell in two pairs, mutation p95 fell
+in two, and late p95 fell in three. At 192 MiB durable all four metrics
+fell in both pairs. At 96 MiB durable CPU fell in all four pairs, and
+median work rose by 0.13 s.
+
+Index phases report the longest worker in seconds. First-owner open,
+eight live joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.50 | 0.20 | 0.05 | 13.02 | 19.47 | 12.50 | 17.14 |
+| 96 MiB NoSync | Binding reuse | 1.47 | 0.21 | 0.07 | 13.65 | 16.64 | 11.85 | 14.33 |
+| 96 MiB NoSync | Multifile | 2.91 | 1.88 | 2.28 | 0.39 | 2.18 | 25.37 | 3.95 |
+| 96 MiB durable | Prior | 1.62 | 0.13 | 0.03 | 14.42 | 20.19 | 12.18 | 15.94 |
+| 96 MiB durable | Binding reuse | 1.53 | 0.13 | 0.03 | 14.04 | 20.47 | 13.46 | 16.49 |
+| 96 MiB durable | Multifile | 4.25 | 5.92 | 7.84 | 0.30 | 1.41 | 25.68 | 3.53 |
+| 192 MiB NoSync | Prior | 3.53 | 0.49 | 0.13 | 29.09 | 40.60 | 23.59 | 30.85 |
+| 192 MiB NoSync | Binding reuse | 3.18 | 0.51 | 0.14 | 28.54 | 32.20 | 21.10 | 28.28 |
+| 192 MiB NoSync | Multifile | 5.95 | 3.49 | 4.53 | 0.21 | 1.14 | 42.02 | 4.28 |
+| 192 MiB durable | Prior | 3.56 | 0.33 | 0.06 | 33.72 | 40.85 | 24.10 | 33.39 |
+| 192 MiB durable | Binding reuse | 3.11 | 0.34 | 0.05 | 31.27 | 34.91 | 20.23 | 27.72 |
+| 192 MiB durable | Multifile | 8.02 | 11.54 | 14.99 | 0.25 | 1.25 | 42.96 | 4.49 |
+
+Both messaging workloads ran twice per build with two writers.
+Times are medians in milliseconds.
+
+| Workload | Prior work / CPU / p95 | Binding reuse work / CPU / p95 | Multifile work / CPU / p95 |
+| --- | ---: | ---: | ---: |
+| Warmed NoSync queue | 7.85 / 13.13 / 1.76 | 7.48 / 12.82 / 1.44 | 79.25 / 25.65 / 16.96 |
+| Durable outbox | 898.77 / 103.02 / 168.40 | 837.43 / 101.48 / 164.80 | 1197.02 / 162.95 / 217.21 |
+
+Regression coverage passed 92 GNU Release groups and 57 each on
+ASan/UBSan and musl Release. It included checkpoint extent reuse,
+process death, retained readers, stream and journal recovery, growth,
+coordinated leases, queue transactions, and outbox recovery.
+
+The eight-lease comparison verified 160 cases across both durability
+policies, four codec configurations, and warm and cold expiry. In the
+five cold plaintext cases per policy, single-file median expiry was
+197.92 ms NoSync and 248.38 ms durable. Multifile took 441.09 and
+381.05 ms. Single-file cold opening took 5.60 and 1.52 ms. Multifile
+took 0.62 and 0.69 ms. The fixture uses `native=0` for single-file.
+
+Raw comparisons, traces, and test logs are under
+`build/pouch-space-concurrent/descriptor-reuse/`.

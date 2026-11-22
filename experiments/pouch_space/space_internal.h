@@ -246,6 +246,7 @@ int ps_catalog_decode_record(ps_entry *, const unsigned char *, size_t,
 void ps_catalog_encode_record(unsigned char *, const ps_entry *);
 size_t ps_catalog_record_bytes(const ps_entry *);
 void ps_catalog_free_record(ps_entry *);
+int ps_catalog_copy_record(ps_entry *, const ps_entry *, lc_error *);
 int ps_catalog_prepare_record(ps_space *, ps_entry *, int checkpoint,
                               lc_error *);
 void ps_catalog_apply_record(ps_space *, ps_entry *, uint64_t);
