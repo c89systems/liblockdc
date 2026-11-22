@@ -6,6 +6,7 @@
 #include "namespace.h"
 #include "namespace_internal.h"
 #include "record_io.h"
+#include "space_internal.h"
 #include "stream.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -2540,6 +2541,71 @@ static void shared_handoff(const char *path) {
   }
   shared_namespace = 0;
 }
+typedef struct startup_checkpoint_probe {
+  const char *path;
+  uint64_t page;
+  int durable, reads;
+} startup_checkpoint_probe;
+static ssize_t advance_startup_checkpoint(void *context, int fd, void *bytes,
+                                          size_t n, off_t offset) {
+  startup_checkpoint_probe *probe = context;
+  if ((uint64_t)offset == probe->page && n == PS_PAGE && ++probe->reads == 1) {
+    lc_error e = {0};
+    ps_space *peer = NULL;
+    ps_options options = {.durable_sync = probe->durable, .shared = 1};
+    ok(ps_open(probe->path, 0, &options, &peer, &e), &e);
+    ok(ps_metadata_repack(peer, &e), &e);
+    ok(ps_close(peer, &e), &e);
+    clear(&e);
+    errno = EIO;
+    return -1;
+  }
+  return pread(fd, bytes, n, offset);
+}
+static void shared_startup_checkpoint(const char *path, int durable) {
+  lc_error e = {0};
+  ps_root *root = NULL;
+  ps_namespace_view *view = NULL;
+  ps_root_options options = {0};
+  ps_namespace_info identity;
+  shared_records recovered = {0};
+  startup_checkpoint_probe probe = {.path = path, .durable = durable};
+  ps_io io = {&probe,         advance_startup_checkpoint,
+              direct_write,   direct_sync,
+              direct_reserve, NULL};
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "startup", 1, &e);
+  ok(append(root, ns, 1, 0, 64, &e), &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  ps_space *space = ps_root_space(root);
+  ok(ps_checkpoint(space, &e), &e);
+  for (const ps_entry *p = space->entries; p; p = p->all_next)
+    if (p->key.kind == PS_KEY_METADATA && p->key.owner == identity.owner &&
+        !p->deleted && p->count && (p->extents[0].flags & EXTENT_PACKED)) {
+      probe.page = p->extents[0].offset / PS_PAGE * PS_PAGE;
+      break;
+    }
+  REQUIRE(probe.page >= PS_DATA);
+  uint64_t generation = space->generation;
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+
+  options.storage.io = &io;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  REQUIRE(probe.reads >= 2 && ps_root_space(root)->generation > generation);
+  ns = acquire(root, "startup", 0, &e);
+  ok(ps_namespace_view_open(ns, &view, &e), &e);
+  ok(ps_namespace_view_visit(view, 1, visit_shared, &recovered, &e), &e);
+  REQUIRE(recovered.keys == 1 && recovered.version == 1 &&
+          recovered.index == 1);
+  ps_namespace_view_close(view);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(!unlink(path));
+}
 typedef struct projection_probe {
   ps_root *peer_root;
   ps_namespace *peer;
@@ -3114,6 +3180,8 @@ static void *worker(void *p) {
     shared_handoff(r->path);
     shared_projection_capture(r->path, 0);
     shared_projection_capture(r->path, 1);
+    shared_startup_checkpoint(r->path, 0);
+    shared_startup_checkpoint(r->path, 1);
   } else if (!strcmp(r->mode, "shared-scope-handoff")) {
     for (int durable = 0; durable <= 1; ++durable) {
       for (int edit_first = 0; edit_first <= 1; ++edit_first)

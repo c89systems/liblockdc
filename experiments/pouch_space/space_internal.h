@@ -270,6 +270,13 @@ int ps_internal_values_capture_locked(ps_space *, uint64_t owner,
                                       ps_value_retain_fn, void *, ps_values **,
                                       lc_error *);
 int ps_internal_read_witness_valid(ps_space *);
+/* Only on an unpublished root while building disposable checkpoint metadata.
+ * The callback runs under the local space mutex with a borrowed reader. It
+ * must only build private state, which the caller discards if accepted is 0.
+ * Borrowed readers cannot escape the walk or re-enter the space. */
+int ps_internal_values_startup_walk(ps_space *, uint64_t owner,
+                                    ps_value_read_fn, void *, int *accepted,
+                                    lc_error *);
 /* Drop an unreturned capture before allowing another local adoption. */
 void ps_internal_values_discard_locked(ps_values *);
 int ps_internal_healthy(ps_space *, lc_error *);

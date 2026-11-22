@@ -38,7 +38,7 @@ struct ps_reader {
   size_t random_extent;
   uint64_t random_base;
   int random_loaded;
-  int imported;
+  int imported, private_read;
   unsigned char buffer[PS_CHUNK];
 };
 /* Every imported reader holds presence continuously from before acquiring its
@@ -6615,6 +6615,8 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   return rc;
 }
 static void reader_payload_invalid(ps_reader *r) {
+  if (r->private_read)
+    return;
   if (r->imported) {
     r->entry->value_checked = -1;
     return;
@@ -7007,14 +7009,13 @@ void ps_internal_values_discard_locked(ps_values *view) {
       view->items[i].retained->reader_claimed = 0;
   values_free(view);
 }
-int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
-                                      unsigned int first, unsigned int last,
-                                      uint64_t prefix, int provisional,
-                                      ps_value_retain_fn retain, void *context,
-                                      ps_values **out, lc_error *error) {
+static int values_select_locked(ps_space *s, uint64_t owner, unsigned int first,
+                                unsigned int last, uint64_t prefix,
+                                ps_value_retain_fn retain, void *context,
+                                ps_values **out, lc_error *error) {
   ps_values *view;
   ps_entry *p, *selected, *group = s->value_buckets[owner % BUCKETS];
-  size_t i, n = 0, at = 0;
+  size_t n = 0, at = 0;
   int rc = LC_OK;
   *out = NULL;
   view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
@@ -7042,7 +7043,26 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
         item->retained = selected;
     }
   view->count = at;
-  if (rc == LC_OK && ps_coordination_shared(s->coordination))
+  if (rc == LC_OK)
+    *out = view;
+  else
+    values_free(view);
+  return rc;
+}
+int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
+                                      unsigned int first, unsigned int last,
+                                      uint64_t prefix, int provisional,
+                                      ps_value_retain_fn retain, void *context,
+                                      ps_values **out, lc_error *error) {
+  ps_values *view;
+  ps_entry *p;
+  size_t i;
+  int rc = values_select_locked(s, owner, first, last, prefix, retain, context,
+                                &view, error);
+  *out = NULL;
+  if (rc != LC_OK)
+    return rc;
+  if (ps_coordination_shared(s->coordination))
     rc = values_witness(view, provisional, error);
   if (rc == LC_OK) {
     for (i = 0; i < view->count; ++i)
@@ -7156,15 +7176,14 @@ static int value_position(const void *left, const void *right) {
   uint64_t y = b->count ? b->extents[0].offset : 0;
   return x < y ? -1 : x != y;
 }
-int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
-                        void *context, lc_error *error) {
+static int values_read_walk(const ps_values *view, ps_space *io,
+                            int private_read, ps_value_read_fn read,
+                            void *context, lc_error *error) {
   value_walk *walk;
   ps_reader *r;
   ps_entry **order;
   size_t i, count = 0, at = 0, bytes;
   int rc;
-  if (!view || !read)
-    return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
   for (i = 0; i < view->count; ++i)
     count += view->items[i].retained != NULL;
   if (!count)
@@ -7185,16 +7204,66 @@ int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
   r = &walk->reader;
   rc = LC_OK;
   for (i = 0; rc == LC_OK && i < count; ++i) {
-    rc = healthy(view->space, error);
+    rc = healthy(io, error);
     if (rc != LC_OK)
       break;
     memset(r, 0, offsetof(ps_reader, buffer));
-    r->space = view->space;
+    r->space = io;
+    r->private_read = private_read;
     r->entry = order[i];
     r->packed = &walk->packed;
     rc = read(context, r->entry->key, r, error);
   }
   lc_free_with_allocator(NULL, walk);
+  return rc;
+}
+int ps_values_read_walk(const ps_values *view, ps_value_read_fn read,
+                        void *context, lc_error *error) {
+  if (!view || !read)
+    return err(error, LC_ERR_INVALID, "captured read walk requires visitor");
+  return values_read_walk(view, view->space, 0, read, context, error);
+}
+int ps_internal_values_startup_walk(ps_space *s, uint64_t owner,
+                                    ps_value_read_fn read, void *context,
+                                    int *accepted, lc_error *error) {
+  ps_values *values = NULL;
+  ps_space *io = NULL;
+  uint64_t prefix;
+  int rc;
+  *accepted = 0;
+  pthread_mutex_lock(&s->mutex);
+  rc = healthy(s, error);
+  if (rc != LC_OK || !ps_readiness_resident(s))
+    goto done;
+  observe_local_durability(s);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  rc = values_select_locked(s, owner, PS_KEY_METADATA, PS_NAMESPACE_CHECKPOINT,
+                            prefix, NULL, NULL, &values, error);
+  if (rc != LC_OK)
+    goto done;
+  io = projection_new(s, error);
+  if (!io) {
+    rc = LC_ERR_NOMEM;
+    goto done;
+  }
+  memcpy(io->identity, s->identity, sizeof(io->identity));
+  rc = values_read_walk(values, io, 1, read, context, error);
+  /* The mutex preserves resident descriptors. A peer can retire their
+   * bytes only across a physical checkpoint. Accept the private metadata
+   * or its read error only if that transition has not begun. */
+  if (ps_internal_read_witness_valid(s)) {
+    *accepted = 1;
+    if (__atomic_load_n(&io->poisoned, __ATOMIC_RELAXED))
+      __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+  } else {
+    lc_error_cleanup(error);
+    rc = LC_OK;
+  }
+done:
+  projection_destroy(io);
+  if (values)
+    values_free(values);
+  pthread_mutex_unlock(&s->mutex);
   return rc;
 }
 void ps_values_close(ps_values *view) {

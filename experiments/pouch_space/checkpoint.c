@@ -792,29 +792,31 @@ static int read_unique_slot(ps_key_checkpoint *c, ps_key_checkpoint *slots,
   }
   return rc;
 }
-static int load_slot(void *context, ps_key key, ps_reader *reader,
+typedef struct checkpoint_seed {
+  ps_key_checkpoint *checkpoint;
+  ps_checkpoint_info selected;
+} checkpoint_seed;
+static int load_seed(void *context, ps_key key, ps_reader *reader,
                      lc_error *e) {
-  ps_key_checkpoint *c = context;
+  checkpoint_seed *seed = context;
+  ps_key_checkpoint *c = seed->checkpoint;
   key_slot *slot;
   int rc;
-  if (key.kind == PS_NAMESPACE_CHECKPOINT)
-    return LC_OK;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT) {
+    if (key.key != 1)
+      return failure(e, LC_ERR_PROTOCOL, "unknown namespace coverage slot");
+    return read_control(c->ns, reader, &seed->selected, e);
+  }
   rc = read_unique_slot(c, c, key, reader, &slot, e);
   if (rc == LC_OK)
     install_selected_slot(c, slot);
   return rc;
 }
-int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
-                           lc_error *e) {
+static int new_checkpoint(ps_namespace *ns, ps_key_checkpoint **out,
+                          lc_error *e) {
   ps_key_checkpoint *c;
-  ps_values *values = NULL;
-  ps_checkpoint_info selected;
   int rc;
-  if (out)
-    *out = NULL;
-  if (!ns || !out)
-    return failure(e, LC_ERR_INVALID,
-                   "checkpoint owner requires namespace and output");
+  *out = NULL;
   c = lc_calloc_with_allocator(&ns->root->crypto_allocator, 1, sizeof(*c));
   if (!c)
     return failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint owner");
@@ -831,16 +833,60 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
            ? room(c, 1, e)
            : failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint sources");
   if (rc == LC_OK)
-    rc = ps_key_checkpoint_capture(c, PS_CHECKPOINT_CAPTURE_FULL, &values,
-                                   &selected, e);
-  if (rc == LC_OK) {
-    select_checkpoint(c, &selected);
-    rc = ps_values_read_walk(values, load_slot, c, e);
-  }
-  ps_values_close(values);
-  if (rc == LC_OK)
     *out = c;
   else
+    ps_key_checkpoint_close(c);
+  return rc;
+}
+int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
+                           lc_error *e) {
+  checkpoint_seed seed = {0};
+  ps_key_checkpoint *c;
+  ps_values *values = NULL;
+  ps_space *s;
+  uint64_t state_index, query_index;
+  int rc, startup, accepted = 0;
+  if (out)
+    *out = NULL;
+  if (!ns || !out)
+    return failure(e, LC_ERR_INVALID,
+                   "checkpoint owner requires namespace and output");
+  s = ns->root->space;
+  startup = ns->root->recovering_namespaces &&
+            ps_coordination_shared(ps_space_coordination(s));
+  rc = new_checkpoint(ns, &c, e);
+  if (rc != LC_OK)
+    return rc;
+  seed.checkpoint = c;
+  if (startup) {
+    rc = ps_internal_values_startup_walk(s, ns->identity.owner, load_seed,
+                                         &seed, &accepted, e);
+    if (rc == LC_OK && !accepted) {
+      ps_key_checkpoint_close(c);
+      memset(&seed, 0, sizeof(seed));
+      rc = new_checkpoint(ns, &c, e);
+      seed.checkpoint = c;
+    }
+  }
+  if (rc == LC_OK && !accepted) {
+    rc = ps_values_capture(s, ns->identity.owner, PS_KEY_METADATA,
+                           PS_NAMESPACE_CHECKPOINT, &values, e);
+    if (rc == LC_OK)
+      rc = ps_values_read_walk(values, load_seed, &seed, e);
+    ps_values_close(values);
+  }
+  if (rc == LC_OK) {
+    state_index = c->state_index;
+    query_index = c->query_index;
+    select_checkpoint(c, &seed.selected);
+    if (state_index > c->state_index)
+      c->state_index = state_index;
+    if (query_index > c->query_index)
+      c->query_index = query_index;
+  }
+  if (rc == LC_OK)
+    *out = c;
+  else if (c)
     ps_key_checkpoint_close(c);
   return rc;
 }

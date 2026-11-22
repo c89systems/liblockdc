@@ -2489,10 +2489,103 @@ static void checkpoint_binding_reuse(int durable) {
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+typedef struct startup_seed_probe {
+  ps_space *reader, *peer;
+  ps_key key;
+  uint64_t page, old_offset;
+  size_t bytes;
+  unsigned char first;
+  int mode, armed, reads;
+} startup_seed_probe;
+static ssize_t startup_seed_read(void *context, int fd, void *bytes, size_t n,
+                                 off_t offset) {
+  startup_seed_probe *probe = context;
+  if (probe->armed && (uint64_t)offset == probe->page) {
+    lc_error e = {0};
+    probe->armed = 0;
+    ++probe->reads;
+    REQUIRE(!probe->reader->reader_claim_bytes &&
+            !probe->reader->allocation_guard);
+    if (probe->mode > 0 && probe->mode < 4)
+      capture_put_key(probe->peer, probe->key, 129);
+    if (probe->mode == 2 || probe->mode == 3) {
+      ps_key reused = probe->key;
+      reused.key = 2;
+      ok(ps_checkpoint(probe->peer, &e), &e);
+      capture_put_key(probe->peer, reused, 65);
+      const ps_entry *p = ps_internal_lookup(probe->peer, reused);
+      REQUIRE(p && p->count == 1 && p->extents[0].offset == probe->old_offset);
+    }
+    lc_error_cleanup(&e);
+    if (probe->mode >= 3) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return pread(fd, bytes, n, offset);
+}
+static int startup_seed_decode(void *context, ps_key key, ps_reader *reader,
+                               lc_error *e) {
+  startup_seed_probe *probe = context;
+  unsigned char bytes[130];
+  REQUIRE(key.kind == PS_KEY_METADATA && key.owner == probe->key.owner &&
+          key.key == probe->key.key);
+  int rc = ps_read(reader, bytes, sizeof(bytes), &probe->bytes, e);
+  if (rc == LC_OK && probe->bytes)
+    probe->first = bytes[0];
+  return rc;
+}
+static void checkpoint_startup_seed(int durable) {
+  for (int mode = 0; mode < 5; ++mode) {
+    lc_error e = {0};
+    startup_seed_probe probe = {.key = {123, 1, PS_KEY_METADATA}, .mode = mode};
+    ps_io io = {&probe, startup_seed_read, write_io, sync_io, reserve_io, NULL};
+    ps_options options = {.durable_sync = durable};
+    ps_reader *reader = NULL;
+    int accepted;
+    ok(ps_open(path, 1, &options, &probe.peer, &e), &e);
+    capture_put_key(probe.peer, probe.key, 65);
+    ok(ps_checkpoint(probe.peer, &e), &e);
+    options.io = &io;
+    ok(ps_open(path, 0, &options, &probe.reader, &e), &e);
+    const ps_entry *p = ps_internal_lookup(probe.reader, probe.key);
+    REQUIRE(p && p->count == 1);
+    probe.old_offset = p->extents[0].offset;
+    probe.page = probe.old_offset / PS_PAGE * PS_PAGE;
+    uint64_t generation = probe.reader->generation;
+    probe.armed = 1;
+    int rc = ps_internal_values_startup_walk(probe.reader, probe.key.owner,
+                                             startup_seed_decode, &probe,
+                                             &accepted, &e);
+    REQUIRE(probe.reads == 1 && probe.reader->generation == generation);
+    if (mode < 2) {
+      ok(rc, &e);
+      REQUIRE(accepted && probe.bytes == 65 && probe.first == 1);
+    } else if (mode < 4) {
+      ok(rc, &e);
+      REQUIRE(!accepted && e.code == LC_OK && p->value_checked == 0);
+    } else {
+      REQUIRE(rc == LC_ERR_TRANSPORT && accepted);
+      lc_error_cleanup(&e);
+      REQUIRE(ps_check(probe.reader, &e) == LC_ERR_TRANSPORT);
+      lc_error_cleanup(&e);
+    }
+    if (mode < 4) {
+      ok(ps_read_open(probe.reader, probe.key, NULL, &reader, &e), &e);
+      captured_expect(reader, 1, mode ? 129 : 65);
+      ps_reader_close(reader);
+    }
+    ok(ps_close(probe.reader, &e), &e);
+    ok(ps_close(probe.peer, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);
+  checkpoint_startup_seed(0);
+  checkpoint_startup_seed(1);
   ps_space *writer = NULL, *join = NULL;
   ps_reader *small = NULL, *large = NULL, *current = NULL;
   lc_error e = {0};

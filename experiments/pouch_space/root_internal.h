@@ -36,6 +36,7 @@ struct ps_root {
   pthread_cond_t changed;
   ps_namespace *namespaces, **buckets;
   size_t capacity, count, calls, pins;
+  int recovering_namespaces;
 };
 /* Root close has already excluded namespace pins/calls. No payload I/O. */
 void ps_namespace_data_destroy(struct ps_namespace_data *);

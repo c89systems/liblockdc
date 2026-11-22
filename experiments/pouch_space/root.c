@@ -228,9 +228,12 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
     rc = reserve_base(root, !create, error);
   if (rc == LC_OK && !create && shared)
     rc = ps_root_conversion_run(root, path, options, error);
-  if (rc == LC_OK && !create)
+  if (rc == LC_OK && !create) {
+    root->recovering_namespaces = 1;
     rc = ps_catalog_visit(root->space, 0, PS_CATALOG_NAMESPACE,
                           recover_namespace, root, error);
+    root->recovering_namespaces = 0;
+  }
   if (rc == LC_OK && !create && !shared)
     rc = ps_root_conversion_run(root, path, options, error);
   if (rc == LC_OK && create)
