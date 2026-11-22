@@ -367,10 +367,9 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       (!identity && !marker && (!target || stream.kind != PS_STREAM)))
     return cat_error(e, LC_ERR_INVALID,
                      "catalog publication arguments invalid");
-  p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  p = ps_internal_entry_new(PS_CATALOG, 0);
   if (!p)
     return cat_error(e, LC_ERR_NOMEM, "cannot allocate catalog publication");
-  p->key.kind = PS_CATALOG;
   p->key.owner = owner;
   rc = attach_record(p, kind, name, length, value, value_length, e);
   if (rc == LC_OK) {
@@ -434,10 +433,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
     rc = ps_internal_capture_end(s, guard, rc, e);
     pthread_mutex_unlock(&s->mutex);
   }
-  if (!installed) {
-    ps_catalog_free_record(p);
-    lc_free_with_allocator(NULL, p);
-  }
+  if (!installed)
+    ps_internal_entry_free(p);
   if (rc == LC_OK)
     rc = ps_internal_durable(s, sequence, e);
   if (preparation || claim) {

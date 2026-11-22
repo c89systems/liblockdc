@@ -5,6 +5,12 @@
 
 #include <stdint.h>
 
+#define LC_POUCH_SNAPSHOT_PREFIX "snapshot-"
+#define LC_POUCH_SNAPSHOT_SUFFIX ".log"
+#define LC_POUCH_SNAPSHOT_LEAF_BYTES                                           \
+  (sizeof(LC_POUCH_SNAPSHOT_PREFIX) - 1U + 20U +                               \
+   sizeof(LC_POUCH_SNAPSHOT_SUFFIX))
+
 int lc_pouch_namespace_ensure(const lc_allocator *allocator,
                               const char *root_path, const char *ns,
                               lc_error *error);

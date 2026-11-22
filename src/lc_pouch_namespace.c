@@ -16,8 +16,6 @@
 
 #define LC_POUCH_SEGMENT_PREFIX "seg-"
 #define LC_POUCH_SEGMENT_SUFFIX ".log"
-#define LC_POUCH_SNAPSHOT_PREFIX "snapshot-"
-#define LC_POUCH_SNAPSHOT_SUFFIX ".log"
 
 typedef lc_pouch_namespace_marker_peer_stat lc_pouch_marker_entry;
 
@@ -147,7 +145,7 @@ char *lc_pouch_namespace_segment_leaf(const lc_allocator *allocator,
 int lc_pouch_namespace_format_snapshot_leaf(uint64_t segment_id, char *buffer,
                                             size_t capacity) {
   size_t prefix = sizeof(LC_POUCH_SNAPSHOT_PREFIX) - 1;
-  if (capacity < prefix + 20U + sizeof(LC_POUCH_SNAPSHOT_SUFFIX) ||
+  if (capacity < LC_POUCH_SNAPSHOT_LEAF_BYTES ||
       lc_u64_format_base10_padded((lc_u64)segment_id, 20U, buffer + prefix,
                                   capacity - prefix) != 20)
     return 0;

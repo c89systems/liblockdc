@@ -163,6 +163,7 @@ int ps_internal_reserve_entry(ps_entry *p, uint64_t bytes, lc_error *e) {
   r->id = p->token;
   r->plan = plan;
   p->deletion_reserve = r;
+  ps_internal_entry_auxiliary(p);
   p->deletion_bytes = bytes;
   return LC_OK;
 }

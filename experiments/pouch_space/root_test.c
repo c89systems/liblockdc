@@ -46,14 +46,18 @@ void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
 }
 void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
                                       size_t bytes) {
+  return allocation_fails() ? NULL
+                            : __real_lc_calloc_with_allocator(a, n, bytes);
+}
+ps_entry *__real_ps_internal_entry_new(unsigned int, size_t);
+ps_entry *__wrap_ps_internal_entry_new(unsigned int kind, size_t count) {
   /* Pause/fail the unpublished catalog entry allocation. This syscall-free
    * fault seam runs after the root registry lock is released, so same-name
    * waiters can arrive before the initializer fails. Assertions below concern
    * namespace admission and durable identities, not allocator layout. */
-  allocation_gate *gate =
-      thread_gate_ready && n == 1 && bytes == sizeof(ps_entry)
-          ? pthread_getspecific(thread_gate)
-          : NULL;
+  allocation_gate *gate = thread_gate_ready && kind == PS_CATALOG
+                              ? pthread_getspecific(thread_gate)
+                              : NULL;
   if (gate) {
     REQUIRE(pthread_setspecific(thread_gate, NULL) == 0);
     pthread_mutex_lock(&gate->mutex);
@@ -64,8 +68,7 @@ void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
     pthread_mutex_unlock(&gate->mutex);
     return NULL;
   }
-  return allocation_fails() ? NULL
-                            : __real_lc_calloc_with_allocator(a, n, bytes);
+  return __real_ps_internal_entry_new(kind, count);
 }
 void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
                                        size_t n) {

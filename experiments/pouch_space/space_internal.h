@@ -91,7 +91,7 @@ typedef struct ps_entry {
   struct ps_reserve *deletion_reserve;
   /* Temporary checkpoint projection binding; never serialized. */
   struct ps_entry *projection;
-  struct ps_entry_batch *batch; /* Recovery storage retained by this entry. */
+  struct ps_entry_allocation *allocation;
   ps_extent *extents;
   size_t count, capacity, pins;
   int state, safe, deleted; /* 0 private, 1 live, 2 retired */
@@ -201,6 +201,8 @@ struct ps_space {
   size_t packed_pages;
   uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty;
+  struct ps_entry_allocation *entry_allocations, *entry_available;
+  struct ps_entry_allocation *entry_temporary;
   ps_key_index keys;
   /* Current immutable keys, including tombstones that select older values
    * at a completed prefix. Each bucket groups keys by namespace owner. */
@@ -343,6 +345,9 @@ void ps_internal_budget_trim(ps_space *, ps_run **);
 int ps_internal_budget_check(ps_space *, ps_budget *, uint64_t, uint64_t,
                              uint64_t, lc_error *);
 void ps_internal_budget_spend(ps_budget *, uint64_t, uint64_t, uint64_t);
+ps_entry *ps_internal_entry_new(unsigned int kind, size_t extents);
+void ps_internal_entry_free(ps_entry *);
+void ps_internal_entry_auxiliary(ps_entry *);
 void ps_internal_install(ps_space *, ps_entry *);
 void ps_internal_remove(ps_space *, ps_entry *, uint64_t);
 int ps_internal_durable(ps_space *, uint64_t, lc_error *);

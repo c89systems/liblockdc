@@ -532,7 +532,26 @@ static void stream_unregister(ps_space *s, ps_entry *p) {
     link = &(*link)->stream->next;
   *link = p->stream->next;
 }
+typedef struct ps_entry_allocation {
+  struct ps_entry_allocation *next, **link;
+  /* Only slabs have an owner and can provide further entries. */
+  ps_space *owner;
+  struct ps_entry_allocation *available_next, **available_link;
+  uint64_t used, auxiliary;
+  int temporary;
+} ps_entry_allocation;
+
+static void entry_allocation_register(ps_space *s, ps_entry_allocation *block) {
+  block->link = &s->entry_allocations;
+  block->next = s->entry_allocations;
+  if (block->next)
+    block->next->link = &block->next;
+  s->entry_allocations = block;
+}
+
 static void register_entry(ps_space *s, ps_entry *p) {
+  if (!p->allocation->link)
+    entry_allocation_register(s, p->allocation);
   p->all_next = s->entries;
   p->all_link = &s->entries;
   if (p->all_next)
@@ -660,42 +679,55 @@ static void install(ps_space *s, ps_entry *p, ps_entry *old) {
     ++s->live_entries;
   }
 }
-#define CHECKPOINT_ENTRIES_PER_BATCH 16U
+#define ENTRY_SLAB_SLOTS 32U
+#define ENTRY_SLAB_MASK ((UINT64_C(1) << ENTRY_SLAB_SLOTS) - 1)
 typedef struct ps_stream_entry {
   ps_entry entry;
   ps_stream_state stream;
 } ps_stream_entry;
-typedef struct ps_entry_batch_slot {
+typedef struct ps_entry_slab_slot {
   ps_entry entry;
   ps_extent extent;
-} ps_entry_batch_slot;
-typedef struct ps_stream_batch_slot {
-  ps_stream_entry owner;
-  ps_extent extent;
-} ps_stream_batch_slot;
-typedef struct ps_entry_batch {
-  size_t capacity, used, references;
-} ps_entry_batch;
-typedef struct ps_entry_batch_builder {
-  ps_entry_batch *values, *streams;
-  size_t remaining;
-} ps_entry_batch_builder;
+} ps_entry_slab_slot;
 
-static void entry_batch_release(ps_entry_batch *batch) {
-  if (batch && !--batch->references)
-    lc_free_with_allocator(NULL, batch);
+static void entry_allocation_unlink(ps_entry_allocation *block) {
+  if (block->link) {
+    *block->link = block->next;
+    if (block->next)
+      block->next->link = block->link;
+  }
+}
+static void entry_available_link(ps_entry_allocation *block) {
+  ps_entry_allocation **head = block->temporary
+                                   ? &block->owner->entry_temporary
+                                   : &block->owner->entry_available;
+  block->available_link = head;
+  block->available_next = *head;
+  if (*head)
+    (*head)->available_link = &block->available_next;
+  *head = block;
+}
+static void entry_available_unlink(ps_entry_allocation *block) {
+  if (!block->available_link)
+    return;
+  *block->available_link = block->available_next;
+  if (block->available_next)
+    block->available_next->available_link = block->available_link;
+  block->available_link = NULL;
 }
 static int entry_has_stream(unsigned int kind) {
   return kind == PS_STREAM || kind == PS_OWNED_RUN;
 }
-static ps_entry *entry_new(unsigned int kind, size_t extent_count) {
+ps_entry *ps_internal_entry_new(unsigned int kind, size_t extent_count) {
   int extended = entry_has_stream(kind);
   size_t base = extended ? sizeof(ps_stream_entry) : sizeof(ps_entry);
-  unsigned char *storage = lc_calloc_with_allocator(
-      NULL, 1, base + extent_count * sizeof(ps_extent));
+  ps_entry_allocation *block = lc_calloc_with_allocator(
+      NULL, 1, sizeof(*block) + base + extent_count * sizeof(ps_extent));
+  unsigned char *storage;
   ps_entry *p;
-  if (!storage)
+  if (!block)
     return NULL;
+  storage = (unsigned char *)(block + 1);
   if (extended) {
     ps_stream_entry *owner = (ps_stream_entry *)storage;
     p = &owner->entry;
@@ -703,14 +735,61 @@ static ps_entry *entry_new(unsigned int kind, size_t extent_count) {
   } else
     p = (ps_entry *)storage;
   p->key.kind = kind;
+  p->allocation = block;
   if (extent_count) {
     p->extents = (ps_extent *)(storage + base);
     p->embedded_extents = 1;
   }
   return p;
 }
-static void entry_free(ps_entry *p) {
-  ps_catalog_free_record(p);
+/* The local allocator mutex, or private recovery ownership, protects slots.
+ * A released slot can be reused while a sibling is retained by a reader. */
+static ps_entry *space_entry_new(ps_space *s, unsigned int kind, size_t count,
+                                 int temporary) {
+  ps_entry_allocation *block;
+  ps_entry_slab_slot *slot;
+  unsigned int index;
+  if ((kind != PS_KEY_METADATA && kind != PS_KEY_DECISION) || count > 1)
+    return ps_internal_entry_new(kind, count);
+  block = temporary ? s->entry_temporary : s->entry_available;
+  if (!block) {
+    block = lc_alloc_with_allocator(NULL, sizeof(*block) +
+                                              ENTRY_SLAB_SLOTS * sizeof(*slot));
+    if (!block)
+      return NULL;
+    memset(block, 0, sizeof(*block));
+    block->owner = s;
+    block->temporary = temporary;
+    entry_allocation_register(s, block);
+    entry_available_link(block);
+  }
+  index = (unsigned int)__builtin_ctzll(~block->used & ENTRY_SLAB_MASK);
+  block->used |= UINT64_C(1) << index;
+  if (block->used == ENTRY_SLAB_MASK)
+    entry_available_unlink(block);
+  slot = (ps_entry_slab_slot *)(block + 1) + index;
+  memset(&slot->entry, 0, sizeof(slot->entry));
+  slot->entry.key.kind = kind;
+  slot->entry.allocation = block;
+  slot->entry.extents = &slot->extent;
+  slot->entry.capacity = 1;
+  slot->entry.embedded_extents = 1;
+  return &slot->entry;
+}
+static uint64_t entry_slab_bit(const ps_entry *p) {
+  const ps_entry_slab_slot *first =
+      (const ps_entry_slab_slot *)(p->allocation + 1);
+  return UINT64_C(1) << ((const ps_entry_slab_slot *)p - first);
+}
+void ps_internal_entry_auxiliary(ps_entry *p) {
+  if (p->allocation->owner)
+    /* Independent writers can add deletion reserves to private slots. */
+    (void)__atomic_fetch_or(&p->allocation->auxiliary, entry_slab_bit(p),
+                            __ATOMIC_RELAXED);
+}
+static void entry_fields_free(ps_entry *p) {
+  if (p->catalog)
+    ps_catalog_free_record(p);
   lc_free_with_allocator(NULL, p->deletion_reserve);
   if (p->stream && p->stream->mapped) {
     lc_free_with_allocator(NULL, p->stream->ranges);
@@ -719,10 +798,32 @@ static void entry_free(ps_entry *p) {
   }
   if (!p->embedded_extents)
     lc_free_with_allocator(NULL, p->extents);
-  if (p->batch)
-    entry_batch_release(p->batch);
-  else
-    lc_free_with_allocator(NULL, p);
+}
+void ps_internal_entry_free(ps_entry *p) {
+  ps_entry_allocation *block;
+  uint64_t bit, before;
+  if (!p)
+    return;
+  block = p->allocation;
+  if (!block->owner)
+    entry_fields_free(p);
+  else {
+    bit = entry_slab_bit(p);
+    if (__atomic_load_n(&block->auxiliary, __ATOMIC_RELAXED) & bit) {
+      entry_fields_free(p);
+      (void)__atomic_fetch_and(&block->auxiliary, ~bit, __ATOMIC_RELAXED);
+    }
+    before = block->used;
+    block->used &= ~bit;
+    if (block->used) {
+      if (before == ENTRY_SLAB_MASK)
+        entry_available_link(block);
+      return;
+    }
+    entry_available_unlink(block);
+  }
+  entry_allocation_unlink(block);
+  lc_free_with_allocator(NULL, block);
 }
 static int allocation_lock(ps_space *s, ps_coordination_guard **guard, int wait,
                            lc_error *error) {
@@ -1995,7 +2096,7 @@ static void collect_retired(ps_space *s) {
       (*link)->retired_link = link;
     unregister_entry(p);
     ps_internal_reserve_forget(s, p);
-    entry_free(p);
+    ps_internal_entry_free(p);
   }
 }
 static size_t event_bytes(const ps_entry *p, int event) {
@@ -2066,63 +2167,13 @@ static uint32_t entry_checksum(const unsigned char *wire, size_t bytes) {
   }
   return (uint32_t)ps_crc32(checksum(wire, 60), wire + 64, (uInt)(bytes - 64));
 }
-/* A checkpoint walk hands out small immutable entries in batches. The
- * walk and each returned entry own one reference. Releasing an entry
- * requires no write to a sibling, including when pins survive adoption. */
-static ps_entry *decoded_entry_new(ps_entry_batch_builder *builder,
-                                   unsigned int kind, size_t count) {
-  ps_entry_batch **open, *batch;
-  ps_entry *p;
-  int extended = entry_has_stream(kind);
-  if (!builder || count > 1)
-    return entry_new(kind, count);
-  open = extended ? &builder->streams : &builder->values;
-  batch = *open;
-  if (!batch) {
-    size_t capacity = builder->remaining < CHECKPOINT_ENTRIES_PER_BATCH
-                          ? builder->remaining
-                          : CHECKPOINT_ENTRIES_PER_BATCH;
-    size_t stride =
-        extended ? sizeof(ps_stream_batch_slot) : sizeof(ps_entry_batch_slot);
-    batch =
-        lc_calloc_with_allocator(NULL, 1, sizeof(*batch) + capacity * stride);
-    if (!batch)
-      return NULL;
-    batch->references = 1;
-    batch->capacity = capacity;
-    *open = batch;
-  }
-  if (extended) {
-    ps_stream_batch_slot *slot =
-        (ps_stream_batch_slot *)(batch + 1) + batch->used;
-    p = &slot->owner.entry;
-    p->stream = &slot->owner.stream;
-    if (count)
-      p->extents = &slot->extent;
-  } else {
-    ps_entry_batch_slot *slot =
-        (ps_entry_batch_slot *)(batch + 1) + batch->used;
-    p = &slot->entry;
-    if (count)
-      p->extents = &slot->extent;
-  }
-  p->batch = batch;
-  ++batch->references;
-  if (++batch->used == batch->capacity) {
-    *open = NULL;
-    entry_batch_release(batch);
-  }
-  p->key.kind = kind;
-  p->embedded_extents = count != 0;
-  return p;
-}
 static int valid_packed_extent(uint64_t offset, uint64_t bytes) {
   return bytes && bytes < PS_PAGE && offset % PS_CELL == 0 &&
          cell_count(bytes) * PS_CELL <= PS_PAGE - offset % PS_PAGE;
 }
-static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
-                        const unsigned char *wire, size_t bytes, ps_entry **out,
-                        int *event, lc_error *error) {
+static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
+                        int temporary, ps_entry **out, int *event,
+                        lc_error *error) {
   size_t count, i, first;
   uint64_t sum = 0, offset, n;
   ps_entry *p;
@@ -2145,7 +2196,7 @@ static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
                      : first + count * 24)) ||
       (type != PS_PUT && type != PS_REMOVE && type != PS_SEAL))
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
-  p = decoded_entry_new(builder, kind, count);
+  p = space_entry_new(s, kind, count, temporary);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate container entry");
   p->key.owner = get64(wire + 24);
@@ -2167,7 +2218,7 @@ static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
     rc = *event == PS_PUT ? ps_catalog_decode_record(p, wire, bytes, error)
                           : LC_OK;
     if (rc != LC_OK) {
-      entry_free(p);
+      ps_internal_entry_free(p);
       return rc;
     }
     *out = p;
@@ -2233,14 +2284,14 @@ static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
       goto invalid;
     rc = ps_internal_reserve_entry(p, deletion, error);
     if (rc != LC_OK) {
-      entry_free(p);
+      ps_internal_entry_free(p);
       return rc;
     }
   }
   *out = p;
   return LC_OK;
 invalid:
-  entry_free(p);
+  ps_internal_entry_free(p);
   return err(error, LC_ERR_PROTOCOL, "invalid container ownership descriptor");
 }
 static int owned_encoded_read(ps_space *s, ps_entry *p, uint64_t at,
@@ -3798,14 +3849,24 @@ static int grant_tokens(ps_space *s, int slot, lc_error *error) {
   return rc;
 }
 static void destroy(ps_space *s) {
-  ps_entry *p;
+  ps_entry_allocation *block;
+  ps_entry_slab_slot *slots;
+  uint64_t auxiliary;
   ps_run *r;
   ps_meta_page *page;
   ps_payload_page *payload;
-  while (s->entries) {
-    p = s->entries;
-    s->entries = p->all_next;
-    entry_free(p);
+  while (s->entry_allocations) {
+    block = s->entry_allocations;
+    s->entry_allocations = block->next;
+    if (!block->owner)
+      entry_fields_free((ps_entry *)(block + 1));
+    else {
+      slots = (ps_entry_slab_slot *)(block + 1);
+      auxiliary = __atomic_load_n(&block->auxiliary, __ATOMIC_RELAXED);
+      for (; auxiliary; auxiliary &= auxiliary - 1)
+        entry_fields_free(&slots[__builtin_ctzll(auxiliary)].entry);
+    }
+    lc_free_with_allocator(NULL, block);
   }
   while (s->free) {
     r = s->free;
@@ -4024,7 +4085,6 @@ typedef struct metadata_directory_entry {
 typedef struct metadata_recovery {
   ps_space *space, *resident;
   unsigned char *wire;
-  ps_entry_batch_builder batch_entries;
   uint64_t cohort_origin;
   int certified_root, reuse, shared_leaf;
   /* Directory order need not match the packing order of descriptor pages.
@@ -4040,7 +4100,7 @@ static void metadata_recovery_close(metadata_recovery *r) {
     lc_free_with_allocator(NULL, r->slots[i]);
   for (i = 0; i < r->count; ++i)
     if (r->entries[i].decoded)
-      entry_free(r->entries[i].decoded);
+      ps_internal_entry_free(r->entries[i].decoded);
   lc_free_with_allocator(NULL, r->entries);
   lc_free_with_allocator(NULL, r);
 }
@@ -4285,7 +4345,7 @@ static int reuse_directory_entry(metadata_recovery *r,
     offset = page->following;
     at = META_HEADER;
   }
-  p = decoded_entry_new(&r->batch_entries, old->key.kind, old->count);
+  p = space_entry_new(r->space, old->key.kind, old->count, 1);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot stage retained descriptor");
   p->key = old->key;
@@ -4312,17 +4372,15 @@ static int decode_directory_entry(metadata_recovery *recovery,
   ps_entry *p = NULL;
   ps_entry *old =
       recovery->resident ? lookup(recovery->resident, item->key) : NULL;
-  ps_entry_batch_builder *batch = NULL;
   int event, rc;
   if (old && old->token != ref.incarnation)
     old = NULL;
-  if (!recovery->resident || old)
-    batch = &recovery->batch_entries;
   if (ref.bytes < 64 || ref.bytes > PS_JOURNAL)
     return err(error, LC_ERR_PROTOCOL, "invalid checkpoint descriptor span");
   rc = metadata_read(recovery, ref, &wire, error);
   if (rc == LC_OK)
-    rc = decode_entry(s, batch, wire, (size_t)ref.bytes, &p, &event, error);
+    rc = decode_entry(s, wire, (size_t)ref.bytes, old != NULL, &p, &event,
+                      error);
   if (rc == LC_OK &&
       (event != PS_PUT || !same_key(p->key, item->key) ||
        p->token != ref.incarnation || get64(wire + 8) > s->sequence))
@@ -4336,7 +4394,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
     p->projection = old;
     item->decoded = p;
   } else if (p)
-    entry_free(p);
+    ps_internal_entry_free(p);
   return rc;
 }
 static int decode_packed_binding(metadata_recovery *r,
@@ -4354,8 +4412,9 @@ static int decode_packed_binding(metadata_recovery *r,
     return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
   if (old && old->token != ref.incarnation)
     old = NULL;
-  p = decoded_entry_new(!r->resident || old ? &r->batch_entries : NULL,
-                        item->key.kind, 1);
+  /* Draft copies that keep a resident incarnation release their slots after
+   * remapping. Group those copies away from bindings that survive adoption. */
+  p = space_entry_new(s, item->key.kind, 1, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
   p->key = item->key;
@@ -4384,10 +4443,8 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
     if (item->value.packed) {
-      r->batch_entries.remaining = r->count - i;
       rc = decode_packed_binding(r, item, error);
     } else if (item->resident) {
-      r->batch_entries.remaining = r->count - i;
       rc = reuse_directory_entry(r, item, error);
     } else
       fetch[count++] = item;
@@ -4400,7 +4457,6 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     end = count - i > META_DIRECTORY_BATCH ? i + META_DIRECTORY_BATCH : count;
     rc = metadata_read_ahead(r, fetch + i, end - i, error);
     for (; rc == LC_OK && i < end; ++i) {
-      r->batch_entries.remaining = count - i;
       rc = decode_directory_entry(r, fetch[i], error);
     }
   }
@@ -4492,7 +4548,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member boundary");
       break;
     }
-    rc = decode_entry(s, NULL, wire + cursor, member_bytes, &entries[i], &event,
+    rc = decode_entry(s, wire + cursor, member_bytes, 0, &entries[i], &event,
                       error);
     if (rc == LC_OK && (event != PS_PUT || !immutable_key(entries[i]->key)))
       rc = err(error, LC_ERR_PROTOCOL, "invalid revision member kind");
@@ -4520,7 +4576,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   for (i = 0; i < count; ++i)
     if (entries[i])
-      entry_free(entries[i]);
+      ps_internal_entry_free(entries[i]);
   lc_free_with_allocator(NULL, entries);
   return rc;
 }
@@ -4796,7 +4852,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   if (group)
     rc = decode_revision(s, wire, bytes, NULL, &entries, error);
   else {
-    rc = decode_entry(s, NULL, wire, bytes, &single, &event, error);
+    rc = decode_entry(s, wire, bytes, 0, &single, &event, error);
     if (rc == LC_OK)
       entries = &single;
   }
@@ -4841,7 +4897,7 @@ replay_extents:
       ++s->sequence;
   } else if (entries)
     for (i = 0; i < count; ++i)
-      entry_free(entries[i]);
+      ps_internal_entry_free(entries[i]);
   if (group)
     lc_free_with_allocator(NULL, entries);
   return rc;
@@ -4983,8 +5039,6 @@ static int recover_directory(ps_space *s, unsigned char *wire,
   if (rc == LC_OK && recovery && recovery->count)
     rc = recover_directory_bindings(recovery, error);
   if (recovery) {
-    entry_batch_release(recovery->batch_entries.values);
-    entry_batch_release(recovery->batch_entries.streams);
     metadata_recovery_close(recovery);
   }
   if (rc == LC_OK)
@@ -5097,12 +5151,12 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
       old->stream->structure_wire = wire;
       if (!old->dirty_link)
         dirty_entry(s, old, NULL);
-      entry_free(p);
+      ps_internal_entry_free(p);
       return LC_OK;
     }
     if (p->key.kind == PS_CATALOG) {
       ps_catalog_drop_record(s, old, release, wire);
-      entry_free(p);
+      ps_internal_entry_free(p);
       return LC_OK;
     }
     if (p->key.kind == PS_STREAM) {
@@ -5113,7 +5167,7 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         rc = remove_owned(s, old, release, 1, error);
       if (rc == LC_OK) {
         old->stream->structure_wire = wire;
-        entry_free(p);
+        ps_internal_entry_free(p);
       }
       return rc;
     }
@@ -5314,7 +5368,7 @@ restart:
       ++s->sequence;
       continue;
     }
-    rc = decode_entry(s, NULL, wire + cursor, bytes, &p, &event, error);
+    rc = decode_entry(s, wire + cursor, bytes, 0, &p, &event, error);
     if (rc == LC_ERR_NOMEM)
       goto done;
     if (rc != LC_OK) {
@@ -5324,7 +5378,7 @@ restart:
     if (event == PS_PUT) {
       rc = verify_entry(s, p, values, error);
       if (rc != LC_OK) {
-        entry_free(p);
+        ps_internal_entry_free(p);
         if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
           goto done;
         lc_error_cleanup(error);
@@ -5333,7 +5387,7 @@ restart:
     }
     rc = apply_journal_event(s, p, event, s->sequence + 1, 0, error);
     if (rc != LC_OK) {
-      entry_free(p);
+      ps_internal_entry_free(p);
       goto done;
     }
     cursor += bytes;
@@ -5560,7 +5614,8 @@ static void projection_entries(ps_space *s, ps_space *v) {
       continue;
     }
     if (p->state != 0 && !p->pins && !entry_catalog_pinned(p)) {
-      entry_free(p); /* Drop stale resident metadata, never free its ranges. */
+      ps_internal_entry_free(
+          p); /* Drop stale resident metadata, never free its ranges. */
       continue;
     }
     p->previous = NULL;
@@ -5614,6 +5669,8 @@ static void projection_entries(ps_space *s, ps_space *v) {
       lc_free_with_allocator(NULL, dest->deletion_reserve);
       dest->deletion_reserve = q->deletion_reserve;
       q->deletion_reserve = NULL;
+      if (dest->deletion_reserve)
+        ps_internal_entry_auxiliary(dest);
       if (dest->key.kind == PS_OWNED_RUN)
         dest->stream->owned_linked = q->stream->owned_linked;
       if (dest->key.kind == PS_STREAM) {
@@ -5698,14 +5755,27 @@ static void projection_entries(ps_space *s, ps_space *v) {
   while (consumed) {
     q = consumed;
     consumed = q->all_next;
-    entry_free(q);
+    ps_internal_entry_free(q);
   }
   v->entries = NULL;
 }
 static void projection_install(ps_space *s, ps_space *v) {
   ps_entry *p, **link;
   ps_payload_page *page;
+  ps_entry_allocation *block;
   size_t i;
+  /* Entries imported from the draft now belong to the resident owner. */
+  while ((block = v->entry_allocations) != NULL) {
+    entry_allocation_unlink(block);
+    entry_allocation_register(s, block);
+    if (block->owner) {
+      entry_available_unlink(block);
+      block->owner = s;
+      block->temporary = 0;
+      if (block->used != ENTRY_SLAB_MASK)
+        entry_available_link(block);
+    }
+  }
 #define PROJECTION_SWAP(field, type)                                           \
   do {                                                                         \
     type previous = s->field;                                                  \
@@ -6274,7 +6344,7 @@ int ps_space_private_active(ps_space *s, size_t cached_budgets) {
 static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
                        ps_writer **out, lc_error *error) {
   ps_writer *w;
-  ps_entry *p;
+  ps_entry *p = NULL;
   int rc;
   if (out)
     *out = NULL;
@@ -6283,15 +6353,8 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
   w = lc_calloc_with_allocator(NULL, 1, sizeof(*w));
-  p = entry_new(key.kind, 0);
-  if (!w || !p) {
-    lc_free_with_allocator(NULL, w);
-    lc_free_with_allocator(NULL, p);
+  if (!w)
     return err(error, LC_ERR_NOMEM, "cannot allocate container writer");
-  }
-  p->key = key;
-  w->entry = p;
-  w->space = s;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK)
@@ -6300,18 +6363,25 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
     rc = err(error, LC_ERR_INVALID,
              "incarnation grant consumed; close and reopen");
   if (rc == LC_OK) {
+    p = space_entry_new(s, key.kind, 0, 0);
+    if (!p)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate container writer entry");
+  }
+  if (rc == LC_OK) {
+    p->key = key;
     p->token = s->token_next++;
     register_entry(s, p);
     ++s->writers;
+    w->entry = p;
+    w->space = s;
     w->budget = budget;
     if (budget)
       ++budget->users;
   }
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK) {
-    entry_free(p);
+  if (rc != LC_OK)
     lc_free_with_allocator(NULL, w);
-  } else
+  else
     *out = w;
   return rc;
 }
@@ -6335,11 +6405,18 @@ static int reserve_writer_tail(ps_writer *w, lc_error *error) {
                  "value extent metadata exceeds journal capacity");
     if (p->count == p->capacity) {
       n = p->capacity ? p->capacity * 2 : 4;
-      grown = lc_realloc_with_allocator(NULL, p->extents, n * sizeof(*grown));
+      grown =
+          p->embedded_extents
+              ? lc_alloc_with_allocator(NULL, n * sizeof(*grown))
+              : lc_realloc_with_allocator(NULL, p->extents, n * sizeof(*grown));
       if (!grown)
         return err(error, LC_ERR_NOMEM, "cannot grow private extent vector");
+      if (p->embedded_extents)
+        memcpy(grown, p->extents, p->count * sizeof(*grown));
       p->extents = grown;
       p->capacity = n;
+      p->embedded_extents = 0;
+      ps_internal_entry_auxiliary(p);
     }
     extent = &p->extents[p->count];
     memset(extent, 0, sizeof(*extent));
@@ -6720,7 +6797,7 @@ void ps_writer_close(ps_writer *w) {
         release_entry_runs(s, w->entry, 0, NULL) != LC_OK)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
     unregister_entry(w->entry);
-    entry_free(w->entry);
+    ps_internal_entry_free(w->entry);
   }
   pthread_mutex_unlock(&s->mutex);
   lc_free_with_allocator(NULL, w);
@@ -7481,7 +7558,7 @@ void ps_reader_close(ps_reader *r) {
     return;
   s = r->space;
   if (r->imported) {
-    entry_free(r->entry);
+    ps_internal_entry_free(r->entry);
     destroy(s);
     lc_free_with_allocator(NULL, r);
     return;
@@ -7596,7 +7673,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
   s = lc_calloc_with_allocator(NULL, 1, sizeof(*s));
   if (s)
     s->fd = -1;
-  p = lc_calloc_with_allocator(NULL, 1, sizeof(*p));
+  p = ps_internal_entry_new(0, 0);
   r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
   if (!s || !p || !r) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate imported captured reader");
@@ -7671,7 +7748,7 @@ done:
   if (s)
     destroy(s);
   if (p)
-    entry_free(p);
+    ps_internal_entry_free(p);
   lc_free_with_allocator(NULL, r);
   return rc;
 }
@@ -7683,7 +7760,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
   uint64_t sequence = 0;
   if (!s || !immutable_key(key))
     return err(error, LC_ERR_INVALID, "container delete requires typed key");
-  tombstone = lc_calloc_with_allocator(NULL, 1, sizeof(*tombstone));
+  tombstone = ps_internal_entry_new(key.kind, 0);
   if (!tombstone)
     return err(error, LC_ERR_NOMEM, "cannot allocate pending retirement");
   pthread_mutex_lock(&s->mutex);
@@ -7707,7 +7784,7 @@ static int delete_value(ps_space *s, ps_key key, const ps_ref *expected,
     install(s, tombstone, p);
     sequence = tombstone->publication_sequence;
   } else
-    entry_free(tombstone);
+    ps_internal_entry_free(tombstone);
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   if (rc == LC_OK && matched && (s->durable || key.kind == PS_CONTROL))
@@ -8130,7 +8207,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   if (!head)
     return err(error, LC_ERR_NOMEM, "cannot allocate owned stream handle");
   if (create) {
-    p = entry_new(PS_STREAM, 0);
+    p = ps_internal_entry_new(PS_STREAM, 0);
     if (!p) {
       lc_free_with_allocator(NULL, head);
       return err(error, LC_ERR_NOMEM, "cannot allocate owned stream head");
@@ -8193,7 +8270,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     owned_status(head, status);
   } else if (create && p->state == 0) {
     ps_coordination_unlock(p->stream->claim);
-    entry_free(p);
+    ps_internal_entry_free(p);
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
@@ -8462,7 +8539,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
                           uint64_t desired, ps_owned_run *run,
                           lc_error *error) {
   ps_space *s = head->space;
-  ps_entry *p = entry_new(PS_OWNED_RUN, 1);
+  ps_entry *p = ps_internal_entry_new(PS_OWNED_RUN, 1);
   unsigned char *zero = lc_calloc_with_allocator(NULL, 1, PS_CHUNK);
   unsigned char header[PS_RUN_HEADER];
   uint64_t bytes = desired, reserved = 0, sequence = 0;
@@ -8474,7 +8551,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   int rc, clean = 0, registered = 0, reclaimed = 0, checkpointed = 0;
   if (!p || !zero) {
     if (p)
-      entry_free(p);
+      ps_internal_entry_free(p);
     lc_free_with_allocator(NULL, zero);
     return err(error, LC_ERR_NOMEM, "cannot allocate owned run preparation");
   }
@@ -8737,7 +8814,7 @@ select_run:
         __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
       unregister_entry(p);
     }
-    entry_free(p);
+    ps_internal_entry_free(p);
   }
   if (registered) {
     --s->writers;
@@ -9404,11 +9481,11 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   if (rc != LC_OK)
     return rc;
   if (!count) {
-    selection.tombstone = entry_new(PS_OWNED_RUN, 0);
+    selection.tombstone = ps_internal_entry_new(PS_OWNED_RUN, 0);
     if (!selection.tombstone)
       return err(error, LC_ERR_NOMEM, "cannot allocate piece retirement");
     rc = piece_select(&selection, select, context, error);
-    lc_free_with_allocator(NULL, selection.tombstone);
+    ps_internal_entry_free(selection.tombstone);
     return rc;
   }
   table_bytes = (uint64_t)count * 8;

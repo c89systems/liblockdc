@@ -700,7 +700,8 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_alloc_with_allocator"
     "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator"
-    "LINKER:--wrap=lc_strdup_with_allocator")
+    "LINKER:--wrap=lc_strdup_with_allocator"
+    "LINKER:--wrap=ps_internal_entry_new")
   lc_configure_c_test_target(pouch_space_root_test)
   foreach(mode lifecycle faults concurrency)
     add_test(NAME pouch_space_root_${mode}

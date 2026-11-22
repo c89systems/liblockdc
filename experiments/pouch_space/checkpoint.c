@@ -34,7 +34,7 @@ struct source_count {
   source_count *next;
 };
 struct key_slot {
-  char *key, *leaf;
+  char *key;
   uint64_t id, bound, selected_incarnation;
   unsigned int kind;
   ps_reserve *reserve;
@@ -50,6 +50,7 @@ struct key_slot {
   uint64_t range_end, range_bytes;
   unsigned int height;
   int retained;
+  char leaf[LC_POUCH_SNAPSHOT_LEAF_BYTES];
 };
 struct slot_change {
   key_slot *slot;
@@ -268,24 +269,24 @@ static void close_slot(ps_key_checkpoint *c, key_slot *s) {
   ps_reserve_close(s->reserve);
   ps_checkpoint_record_close(&s->pending);
   lc_free_with_allocator(&c->allocator, s->key);
-  lc_free_with_allocator(&c->allocator, s->leaf);
   lc_free_with_allocator(&c->allocator, s);
 }
 static key_slot *new_slot(ps_key_checkpoint *c, const void *key, size_t bytes,
                           unsigned int kind, uint64_t id, lc_error *e) {
   key_slot *s = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*s));
-  if (s) {
+  if (s && key)
     s->key = lc_alloc_with_allocator(&c->allocator, bytes + 1);
-    s->leaf = lc_pouch_namespace_snapshot_leaf(&c->allocator, id);
-  }
-  if (!s || !s->key || !s->leaf) {
+  if (!s || (key && !s->key) ||
+      !lc_pouch_namespace_format_snapshot_leaf(id, s->leaf, sizeof(s->leaf))) {
     if (s)
       close_slot(c, s);
     failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint key slot");
     return NULL;
   }
-  memcpy(s->key, key, bytes);
-  s->key[bytes] = 0;
+  if (key) {
+    memcpy(s->key, key, bytes);
+    s->key[bytes] = 0;
+  }
   s->kind = kind;
   s->id = id;
   return s;
@@ -688,7 +689,7 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
   int rc;
   *out = NULL;
   memset(&entry, 0, sizeof(entry));
-  slot = new_slot(c, "", 0, key.kind, key.key, e);
+  slot = new_slot(c, NULL, 0, key.kind, key.key, e);
   if (!slot)
     return LC_ERR_NOMEM;
   rc = ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
@@ -711,7 +712,6 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
                    "checkpoint deletion requirement disagrees with its slot");
   }
   if (rc == LC_OK) {
-    lc_free_with_allocator(&c->allocator, slot->key);
     slot->key = entry.key;
     entry.key = NULL;
     slot->selected_incarnation = ref.incarnation;
