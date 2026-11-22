@@ -2656,7 +2656,7 @@ static void checkpoint_open_slab_reuse(int durable) {
   lc_error e = {0};
   ps_options options = {.durable_sync = durable};
   ps_space *writer = NULL, *joined = NULL;
-  ps_reader *pinned = NULL, *reader = NULL;
+  ps_reader *pinned = NULL, *peer_pin = NULL, *reader = NULL;
   ps_key slot = {123, 1, PS_KEY_METADATA};
   size_t sites = 0;
   ok(ps_open(path, 1, &options, &writer, &e), &e);
@@ -2688,13 +2688,30 @@ static void checkpoint_open_slab_reuse(int durable) {
   ok(ps_open(path, 0, &options, &joined, &e), &e);
   slot.key = 1;
   ok(ps_read_open(joined, slot, NULL, &pinned, &e), &e);
+  ok(ps_read_open(writer, slot, NULL, &peer_pin, &e), &e);
   for (slot.key = 1; slot.key <= 32; ++slot.key)
     ok(ps_delete(joined, slot, &e), &e);
   slot.key = 67;
   capture_put_key(joined, slot, 193);
+  /* Cross a packed batch and grow a partially populated draft index.
+   * Mix borrowed slots, new slots, and an out-of-line descriptor. */
+  for (slot.key = 68; slot.key <= 232; ++slot.key)
+    capture_put_key(joined, slot, 65);
   ok(ps_checkpoint(joined, &e), &e);
+  uint64_t generation = writer->generation, physical = coverage(NULL, 0);
+  key_index_fail = 4 * writer->keys.capacity;
+  REQUIRE(ps_refresh(writer, &e) == LC_ERR_NOMEM && !key_index_fail &&
+          writer->generation == generation && coverage(NULL, 0) == physical);
+  lc_error_cleanup(&e);
+  ok(ps_refresh(writer, &e), &e);
+  slot.key = 232;
+  ok(ps_read_open(writer, slot, NULL, &reader, &e), &e);
+  captured_expect(reader, 232, 65);
+  ps_reader_close(reader);
   captured_expect(pinned, 1, 65);
+  captured_expect(peer_pin, 1, 65);
   ps_reader_close(pinned);
+  ps_reader_close(peer_pin);
   ok(ps_close(writer, &e), &e);
   ok(ps_close(joined, &e), &e);
   ok(ps_open(path, 0, &options, &joined, &e), &e);
@@ -2705,7 +2722,7 @@ static void checkpoint_open_slab_reuse(int durable) {
     ok(ps_value_info(joined, slot, &ref, &bytes, &present, &e), &e);
     REQUIRE(!present);
   }
-  for (slot.key = 33; slot.key <= 67; ++slot.key) {
+  for (slot.key = 33; slot.key <= 232; ++slot.key) {
     ok(ps_read_open(joined, slot, NULL, &reader, &e), &e);
     captured_expect(reader, (unsigned char)slot.key,
                     slot.key == 33   ? 129

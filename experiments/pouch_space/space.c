@@ -458,8 +458,8 @@ static size_t key_index_limit(size_t capacity) {
 }
 /* Used after the directory walk has proved that all selected keys are distinct.
  */
-static void key_index_add_distinct(ps_key_index *index, ps_entry *entry) {
-  uint64_t hash = key_hash(entry->key);
+static void key_index_add_distinct(ps_key_index *index, ps_entry *entry,
+                                   uint64_t hash) {
   size_t mask = index->capacity - 1;
   size_t at = (size_t)hash & mask;
   while (index->slots[at].entry)
@@ -4168,6 +4168,12 @@ typedef struct metadata_directory_entry {
   ps_directory_value value;
   ps_entry *resident, *decoded;
 } metadata_directory_entry;
+typedef struct projection_packed_binding {
+  ps_key key;
+  ps_directory_value value;
+  uint64_t hash;
+  ps_entry *resident;
+} projection_packed_binding;
 typedef struct checkpoint_slab {
   ps_entry_allocation *block;
   unsigned int next;
@@ -4184,6 +4190,8 @@ typedef struct metadata_recovery {
   size_t next_slot, batch;
   metadata_directory_entry *entries;
   size_t count, capacity;
+  projection_packed_binding *packed;
+  size_t packed_count;
   checkpoint_slab open_slab;
 } metadata_recovery;
 static void metadata_recovery_close(metadata_recovery *r) {
@@ -4194,6 +4202,7 @@ static void metadata_recovery_close(metadata_recovery *r) {
     if (r->entries[i].decoded)
       ps_internal_entry_free(r->entries[i].decoded);
   lc_free_with_allocator(NULL, r->entries);
+  lc_free_with_allocator(NULL, r->packed);
   lc_free_with_allocator(NULL, r);
 }
 static metadata_read_page *metadata_read_find(const metadata_recovery *r,
@@ -4511,13 +4520,29 @@ static void unpack_binding(ps_entry *p, ps_key key,
   p->extents[0].crc = value->crc;
   p->extents[0].flags = EXTENT_PACKED;
 }
-static int decode_packed_binding(metadata_recovery *r,
-                                 metadata_directory_entry *item,
-                                 lc_error *error) {
+static int register_packed_binding(ps_space *s, ps_entry *p,
+                                   uint64_t deletion_bytes, lc_error *error) {
+  if (deletion_bytes) {
+    int rc = ps_internal_reserve_entry(p, deletion_bytes, error);
+    if (rc != LC_OK)
+      return rc;
+    ps_internal_reserve_install(s, p, NULL);
+  }
+  register_entry(s, p);
+  value_register(s, p);
+  p->state = 1;
+  s->metadata += entry_bytes(p);
+  ++s->live_entries;
+  return LC_OK;
+}
+static int load_projection_binding(metadata_recovery *r,
+                                   const projection_packed_binding *binding,
+                                   lc_error *error) {
   ps_space *s = r->space;
-  const ps_directory_value *value = &item->value;
+  ps_key key = binding->key;
+  const ps_directory_value *value = &binding->value;
   ps_descriptor_ref ref = value->ref;
-  ps_entry *p, *old = lookup(r->resident, item->key);
+  ps_entry *p, *old = binding->resident;
   int rc = check_packed_binding(s, value, error);
   if (rc != LC_OK)
     return rc;
@@ -4530,18 +4555,74 @@ static int decode_packed_binding(metadata_recovery *r,
       old->bytes == ref.bytes && old->extents[0].offset == ref.offset &&
       old->extents[0].bytes == ref.bytes && old->extents[0].crc == value->crc &&
       old->extents[0].flags == EXTENT_PACKED) {
-    item->resident = old;
-    return LC_OK;
+    rc = payload_claim(s, &old->extents[0], r->payload, error);
+    if (rc == LC_OK) {
+      key_index_add_distinct(&s->keys, old, binding->hash);
+      s->metadata += entry_bytes(old);
+      ++s->live_entries;
+    }
+    return rc;
   }
   /* Draft copies that keep a resident incarnation release their slots after
    * remapping. Group those copies away from bindings that survive adoption. */
-  p = space_entry_new(s, item->key.kind, 1, old != NULL);
+  p = space_entry_new(s, key.kind, 1, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
-  unpack_binding(p, item->key, value);
+  unpack_binding(p, key, value);
   p->projection = old;
-  item->decoded = p;
-  return ps_internal_reserve_entry(p, value->deletion_bytes, error);
+  rc = register_packed_binding(s, p, value->deletion_bytes, error);
+  if (rc == LC_OK)
+    key_index_add_distinct(&s->keys, p, binding->hash);
+  else
+    ps_internal_entry_free(p);
+  return rc;
+}
+/* Resolve the window's independent resident probes before walking its
+ * payload ownership. The directory traversal has proved distinct keys. */
+static int load_projection_batch(metadata_recovery *r, lc_error *error) {
+  const ps_key_index *resident = &r->resident->keys;
+  ps_key_index *draft = &r->space->keys;
+  projection_packed_binding *p;
+  size_t i, added = r->packed_count;
+  int rc;
+  if (!draft->capacity && resident->count > added)
+    added = resident->count;
+  rc = key_index_reserve(r->space, added, error);
+  if (rc != LC_OK)
+    return rc;
+  if (resident->capacity)
+    for (i = 0; i < r->packed_count; ++i)
+      __builtin_prefetch(
+          &resident->slots[r->packed[i].hash & (resident->capacity - 1)]);
+  for (i = 0; i < r->packed_count; ++i) {
+    p = &r->packed[i];
+    p->resident =
+        resident->capacity ? key_slot(resident, p->key, p->hash)->entry : NULL;
+    if (p->resident)
+      __builtin_prefetch(p->resident->extents);
+  }
+  for (i = 0; rc == LC_OK && i < r->packed_count; ++i)
+    rc = load_projection_binding(r, &r->packed[i], error);
+  r->packed_count = 0;
+  return rc;
+}
+static int collect_projection_binding(metadata_recovery *r, ps_key key,
+                                      const ps_directory_value *value,
+                                      lc_error *error) {
+  projection_packed_binding *p;
+  if (!r->packed) {
+    r->packed =
+        lc_alloc_with_allocator(NULL, META_DIRECTORY_BATCH * sizeof(*p));
+    if (!r->packed)
+      return err(error, LC_ERR_NOMEM, "cannot allocate packed binding batch");
+  }
+  p = &r->packed[r->packed_count++];
+  p->key = key;
+  p->value = *value;
+  p->hash = key_hash(key);
+  return r->packed_count == META_DIRECTORY_BATCH
+             ? load_projection_batch(r, error)
+             : LC_OK;
 }
 /* Packed leaf values have no descriptor reads or stream dependencies. Load
  * them straight into the new owner's slabs and size the key index after the
@@ -4573,18 +4654,7 @@ static int load_open_binding(ps_space *s, checkpoint_slab *batch, ps_key key,
   p->extents = &slot->extent;
   p->embedded_extents = 1;
   unpack_binding(p, key, value);
-  if (value->deletion_bytes) {
-    rc = ps_internal_reserve_entry(p, value->deletion_bytes, error);
-    if (rc != LC_OK)
-      return rc;
-    ps_internal_reserve_install(s, p, NULL);
-  }
-  register_entry(s, p);
-  value_register(s, p);
-  p->state = 1;
-  s->metadata += entry_bytes(p);
-  ++s->live_entries;
-  return LC_OK;
+  return register_packed_binding(s, p, value->deletion_bytes, error);
 }
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
@@ -4593,15 +4663,22 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_entry *p;
   size_t i, end, count = 0;
   int rc;
-  if (s->live_entries > SIZE_MAX - r->count)
+  uint64_t unindexed = r->resident ? 0 : s->live_entries;
+  if (r->packed_count) {
+    rc = load_projection_batch(r, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  if (unindexed > SIZE_MAX - r->count)
     return err(error, LC_ERR_NOMEM, "container key index exceeds local limit");
-  rc = key_index_reserve(s, r->count + (size_t)s->live_entries, error);
+  rc = key_index_reserve(s, r->count + (size_t)unindexed, error);
   if (rc != LC_OK)
     return rc;
-  /* No other entries are installed yet. Finish indexing the packed owners
-   * before descriptor installation and journal replay can look them up. */
-  for (p = s->entries; p; p = p->all_next)
-    key_index_add_distinct(&s->keys, p);
+  /* A fresh open can size the index once after collecting its packed slots.
+   * Live adoption has already indexed both private and borrowed bindings. */
+  if (unindexed)
+    for (p = s->entries; p; p = p->all_next)
+      key_index_add_distinct(&s->keys, p, key_hash(p->key));
   if (batch.block && batch.next < ENTRY_SLAB_SLOTS)
     entry_available_link(batch.block);
   if (!r->count)
@@ -4611,9 +4688,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->value.packed)
-      rc = decode_packed_binding(r, item, error);
-    else if (item->resident)
+    if (item->resident)
       rc = reuse_directory_entry(r, item, error);
     else
       fetch[count++] = item;
@@ -4634,17 +4709,6 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     return rc;
   for (i = 0; i < r->count; ++i) {
     p = r->entries[i].decoded;
-    /* The directory walk checked that every binding key is distinct. */
-    if (!p) {
-      p = r->entries[i].resident;
-      rc = payload_claim_entry(s, p, r->payload, error);
-      if (rc != LC_OK)
-        return rc;
-      key_index_add_distinct(&s->keys, p);
-      s->metadata += entry_bytes(p);
-      ++s->live_entries;
-      continue;
-    }
     if (p->key.kind == PS_CATALOG)
       rc = ps_catalog_prepare_record(s, p, 1, error);
     else if (p->key.kind == PS_OWNED_RUN && p->stream->mapped)
@@ -4669,8 +4733,10 @@ static int capture_directory_entry(void *v, ps_key key,
   ps_descriptor_ref ref = value->ref;
   ps_entry *old = NULL;
   size_t capacity;
-  if (value->packed && !r->resident)
-    return load_open_binding(r->space, &r->open_slab, key, value, error);
+  if (value->packed)
+    return r->resident
+               ? collect_projection_binding(r, key, value, error)
+               : load_open_binding(r->space, &r->open_slab, key, value, error);
   if (r->count == r->capacity) {
     if (r->capacity > (size_t)-1 / sizeof(*item) / 2)
       return err(error, LC_ERR_NOMEM, "checkpoint binding list too large");
@@ -4682,8 +4748,7 @@ static int capture_directory_entry(void *v, ps_key key,
     r->entries = item;
     r->capacity = capacity;
   }
-  if (!value->packed && r->shared_leaf &&
-      ref.incarnation <= r->space->token_limit &&
+  if (r->shared_leaf && ref.incarnation <= r->space->token_limit &&
       (immutable_key(key) || key.kind == PS_CATALOG)) {
     old = lookup(r->resident, key);
     if (old &&
