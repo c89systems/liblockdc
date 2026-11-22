@@ -1,12 +1,11 @@
 # Pouch segment space: future storage direction
 
-Status: **draft for investigation and prototyping**. This is a possible future
-physical-storage refactor, not an implemented feature or authorization to change
-existing roots. The [current storage contract](pouch-storage.md) remains the
-implementation authority. Public settings, layout constants and allocation sizes
-below are not frozen interfaces.
+This proposal preserves the original design rationale and early progress notes.
+See the [current native implementation contract](pouch-space-implementation.md)
+for the implemented experiment and the [Pouch storage specification](pouch-storage.md)
+for production storage semantics.
 
-A [native container-foundation experiment](pouch-space-experiment.md) now
+A [native container-foundation experiment](archive/pouch-space-experiment.md) now
 implements a limited physical storage slice outside normal Pouch open behavior.
 It uses 10 MiB initial capacity and explicit 1 MiB growth steps on native x86_64
 Linux. Its measurements and correctness envelope do not establish a production

@@ -48,7 +48,7 @@ close/reopen and process death. Tickets require the issuer to retain its reader
 until import succeeds; they are not persistent reopening references. Kernel
 ownership is reconstructed before allocator admission, including unbound old
 values and packed pages. This does not admit another Pouch writer. See the
-[reader retention contract](../../docs/pouch-space-implementation.md#captured-immutable-values-across-process-lifetimes).
+[reader retention evidence](../../docs/archive/pouch-space-implementation.md#captured-immutable-values-across-process-lifetimes).
 Fork before
 open or exec before using the library in a child. Stop concurrent calls and close all readers
 and writers before closing their space.
@@ -94,14 +94,14 @@ writers consume it or return equal protected capacity when using prepared
 common runs. Same-process credit transfers remain allocation-free and make no
 lock calls. Exclusive file authority covers these ranges; shared coordination
 uses OFD witnesses, without a persisted ledger or payload copying. See
-[private payload ownership](../../docs/pouch-space-implementation.md#concrete-private-payload-ownership).
+[private payload ownership](../../docs/archive/pouch-space-implementation.md#concrete-private-payload-ownership).
 Shared authority also witnesses the free checkpoint workspace protecting
 descriptor/entry credits. Checkpoint preparation transfers those witnesses to
 new pages and claims retiring pages before root selection; completed selection
 returns retired pages to the private pool and releases new canonical pages.
 Selected metadata belongs to root authority, rather than the process. Recovery
 excludes foreign workspace in both the fixed and dynamic regions. See
-[checkpoint workspace ownership](../../docs/pouch-space-implementation.md#private-checkpoint-workspace-and-ownership-handoff).
+[checkpoint workspace ownership](../../docs/archive/pouch-space-implementation.md#private-checkpoint-workspace-and-ownership-handoff).
 Shared allocator experiments serialize observation and assignment under a
 resident OFD guard, discover late foreign claims and probe packed candidates.
 Common shared pages are uncertified even after a foreign witness disappears.
@@ -109,7 +109,7 @@ Root/journal observation fences application-changing stale views; identity-only
 grants refresh the global frontier while keeping the local spending endpoint.
 The bounded control-journal observation is resident metadata. Application replay
 and shared readiness still precede normal shared admission. See
-[live allocator authority](../../docs/pouch-space-implementation.md#live-allocator-authority-and-canonical-observation).
+[live allocator authority](../../docs/archive/pouch-space-implementation.md#live-allocator-authority-and-canonical-observation).
 Writers pin their budget; space close rejects outstanding claims. Release returns
 unspent credits and excess dynamic metadata workspace using a preallocated split
 node. A budget provides capacity admission, not key isolation, rollback, or
@@ -743,5 +743,5 @@ multi-process coordination and full Pouch integration remain future work. The
 foundation now implements forced ordinary-state relocation and makes no claim
 that all draft acceptance criteria are already satisfied.
 
-See [measurements and reproduction](../../docs/pouch-space-experiment.md) for
+See [measurements and reproduction](../../docs/archive/pouch-space-experiment.md) for
 the verified scope, observed regressions and commands.
