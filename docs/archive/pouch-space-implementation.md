@@ -1,8 +1,8 @@
-# Native container implementation contract
+# Native Pouch implementation history
 
 This archive preserves the implementation history and its stage-specific
 contracts, tests, and measurements.
-[Current native Pouch contract](../pouch-space-implementation.md)
+[Current Pouch Space contract](../pouch-space.md)
 
 The full native x86_64 backend is authorized for staged implementation on
 `experiment/pouch-space`. Normal Pouch still uses the multifile backend until
@@ -12,7 +12,7 @@ format migration is outside this implementation; production deployment still
 requires an explicit decision. Darwin, QEMU, 250 MiB and larger measurements remain
 deferred. Initial capacity stays 10 MiB, with explicit 1 MiB growth tests.
 
-Current implementation and acceptance status:
+Implementation status when this archive was active:
 
 | Surface | Implemented evidence | Acceptance status |
 | --- | --- | --- |

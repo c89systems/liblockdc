@@ -1,7 +1,7 @@
 # Native single-file foundation experiment
 
 This archive records the original foundation.
-[Current native Pouch contract](../pouch-space-implementation.md)
+[Current Pouch Space contract](../pouch-space.md)
 
 The [container foundation](../../experiments/pouch_space/space.h) implements one
 preallocated file, typed owner/key bindings, bounded streaming, independent
@@ -3488,7 +3488,7 @@ foundation permits rebinding a deleted physical key; it does not supply permanen
 position or retry authority. Full codec/index/XA/outbox integration remains part
 of the authorized native implementation; existing-root conversion is excluded.
 Production adoption still requires the
-broader [draft acceptance evidence](../pouch-space.md).
+broader [draft acceptance evidence](pouch-space-proposal.md#prototype-and-acceptance-evidence).
 
 ## Cleanup durability scopes and cold crypto initialization
 

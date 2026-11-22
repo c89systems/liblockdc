@@ -13,9 +13,8 @@ default runtime is an exclusive root writer with a resident namespace
 logstore. An explicit shared-root runtime is supported over that same format.
 This is not Go-disk interoperability or a parallel durable format.
 
-The [single-file design proposal](pouch-space.md) records the direction of a
-private native experiment. Normal Pouch uses the segmented storage specified
-here.
+Normal Pouch uses the segmented storage specified here. The private native
+single-file backend is described in the [Pouch Space contract](pouch-space.md).
 
 ## Reference Principle
 

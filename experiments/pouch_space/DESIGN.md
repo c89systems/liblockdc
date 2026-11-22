@@ -1,7 +1,7 @@
 # Native Pouch container foundation
 
-The current integration contract and milestone status are in
-[the native implementation contract](../../docs/pouch-space-implementation.md).
+The current integration contract is in
+[Pouch Space](../../docs/pouch-space.md).
 The fixture restrictions below describe the original physical foundation;
 later native integration supersedes its initial method restrictions.
 
