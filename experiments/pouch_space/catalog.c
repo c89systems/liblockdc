@@ -713,7 +713,7 @@ int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
   for (i = 0U; rc == LC_OK && i < BUCKETS && !*out; ++i)
-    for (p = s->stream_buckets[i]; p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; p; p = p->stream->next)
       if (!p->stream->catalog_refs) {
         *out = 1;
         break;
@@ -739,7 +739,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   peer = s->peer_durable;
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->stream_buckets[i]; p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; p; p = p->stream->next)
       if (orphan(p, prefix, peer))
         ++count;
   if (rc == LC_OK && count) {
@@ -752,7 +752,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
     }
   }
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->stream_buckets[i]; p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; p; p = p->stream->next)
       if (orphan(p, prefix, peer)) {
         entries[at++] = p;
         ++p->pins;

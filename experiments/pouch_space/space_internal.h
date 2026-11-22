@@ -148,6 +148,15 @@ typedef struct ps_entry_slabs {
   struct ps_entry_allocation *available, *temporary;
 } ps_entry_slabs;
 #define PS_VALUE_GROUPS (2U + PS_NAMESPACE_CHECKPOINT - PS_KEY_METADATA)
+typedef struct ps_space_buckets {
+  /* Keep checkpoint kinds apart from the other immutable keys. A bucket
+   * retains current tombstones that can still select older values. */
+  ps_value_bucket values[PS_VALUE_GROUPS][BUCKETS];
+  ps_entry *streams[BUCKETS];
+  ps_meta_page *metadata[BUCKETS];
+  ps_payload_page *payload[BUCKETS];
+  ps_payload_page *available[CELLS + 1];
+} ps_space_buckets;
 struct ps_space {
   /* fd is borrowed from coordination after successful lifetime admission. */
   int fd, poisoned, durable, root;
@@ -222,17 +231,15 @@ struct ps_space {
    * The resident mutex protects those entries through adoption or discard. */
   struct ps_space *projection_resident;
   ps_key_index keys;
-  /* Separate checkpoint kinds from other immutable keys and from each
-   * other. Include current tombstones that can still select older values. */
-  ps_value_bucket value_buckets[PS_VALUE_GROUPS][BUCKETS];
-  ps_entry *stream_buckets[BUCKETS];
+  /* Installed with the projection, so intrusive links to bucket heads keep
+   * their address. An unopened handle or imported reader needs no buckets. */
+  ps_space_buckets *buckets;
   ps_directory_root directory;
-  ps_meta_page *pages, *page_buckets[BUCKETS];
+  ps_meta_page *pages;
   ps_meta_page *metadata_retirement_claims;
-  ps_payload_page *payload_pages, *payload_buckets[BUCKETS];
+  ps_payload_page *payload_pages;
   ps_payload_page *pinned_pages;
   ps_payload_page **pinned_page_probe;
-  ps_payload_page *available[CELLS + 1];
   ps_run *free, *metadata_free, *pinned_free;
   ps_run **pinned_free_probe;
   uint64_t pinned_free_bytes;

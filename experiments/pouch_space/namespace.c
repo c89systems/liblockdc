@@ -2168,14 +2168,44 @@ int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
+/* The opening root has no local callers. Acquire the usual namespace
+ * authority and install the recovered owner directly, with no placeholder
+ * for a shared handoff to reconcile. */
+static int open_checkpoint_data(ps_namespace *ns,
+                                struct ps_namespace_data **out, lc_error *e) {
+  ps_space *space = ns->root->space;
+  struct ps_namespace_data *d = NULL;
+  ps_coordination_guard *edit;
+  int continued, rc;
+  if (__atomic_load_n(&ns->data, __ATOMIC_ACQUIRE) ||
+      !ps_coordination_shared(ps_space_coordination(space)))
+    return ps_ns_enter_checkpoint(ns, out, e);
+  *out = NULL;
+  rc = ps_namespace_guard(ns, &edit, e);
+  if (rc == LC_OK && edit)
+    rc = ps_internal_namespace_stamp(space, ns->identity.owner, &continued, e);
+  if (rc == LC_OK)
+    rc = load(ns, NULL, &d, e);
+  if (rc != LC_OK)
+    return ps_namespace_unguard(ns, edit, rc, e);
+  d->scope = PS_NS_EDITING;
+  d->edit = edit;
+  d->shared_valid = 1;
+  __atomic_store_n(&ns->data, d, __ATOMIC_RELEASE);
+  rc = checkpoint_ready(d, e);
+  if (rc == LC_OK)
+    *out = d;
+  else
+    ps_ns_leave(d);
+  return rc;
+}
 int ps_namespace_recover_on_open(ps_namespace *ns, lc_error *e) {
   ps_checkpoint_info coverage;
   struct ps_namespace_data *d;
-  int rc = ps_ns_enter_checkpoint(ns, &d, e);
+  int rc = open_checkpoint_data(ns, &d, e);
   if (rc != LC_OK)
     return rc;
-  /* The opening root has no local callers. Retain any state sources or
-   * capacity obligations that recovery just validated. */
+  /* Retain any state sources or capacity obligations validated by recovery. */
   ps_key_checkpoint_info(d->checkpoint, &coverage);
   if (d->active && coverage.segment == d->active &&
       coverage.offset == d->tail && !ps_namespace_data_budgets(d)) {

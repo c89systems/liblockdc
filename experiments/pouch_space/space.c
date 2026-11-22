@@ -569,17 +569,17 @@ static size_t entry_bytes(const ps_entry *p) {
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
   ps_entry *p;
-  for (p = s->stream_buckets[token % BUCKETS]; p; p = p->stream->next)
+  for (p = s->buckets->streams[token % BUCKETS]; p; p = p->stream->next)
     if (p->token == token)
       return p;
   return NULL;
 }
 static void stream_register(ps_space *s, ps_entry *p) {
-  p->stream->next = s->stream_buckets[p->token % BUCKETS];
-  s->stream_buckets[p->token % BUCKETS] = p;
+  p->stream->next = s->buckets->streams[p->token % BUCKETS];
+  s->buckets->streams[p->token % BUCKETS] = p;
 }
 static void stream_unregister(ps_space *s, ps_entry *p) {
-  ps_entry **link = &s->stream_buckets[p->token % BUCKETS];
+  ps_entry **link = &s->buckets->streams[p->token % BUCKETS];
   while (*link != p)
     link = &(*link)->stream->next;
   *link = p->stream->next;
@@ -619,7 +619,7 @@ static unsigned int value_group(unsigned int kind) {
   return kind < PS_KEY_METADATA ? 0 : kind - PS_KEY_METADATA + 1;
 }
 static ps_value_bucket *value_bucket(ps_space *s, ps_key key) {
-  return &s->value_buckets[value_group(key.kind)][key.owner % BUCKETS];
+  return &s->buckets->values[value_group(key.kind)][key.owner % BUCKETS];
 }
 static void value_register(ps_space *s, ps_entry *p) {
   ps_value_bucket *bucket = value_bucket(s, p->key);
@@ -1684,7 +1684,7 @@ static uint64_t entry_storage(const ps_entry *p) {
 static ps_payload_page *payload_find(ps_space *s, uint64_t offset) {
   ps_payload_page *p;
   offset = offset / PS_PAGE * PS_PAGE;
-  for (p = s->payload_buckets[(offset / PS_PAGE) % BUCKETS]; p;
+  for (p = s->buckets->payload[(offset / PS_PAGE) % BUCKETS]; p;
        p = p->hash_next)
     if (p->run.offset == offset)
       return p;
@@ -1712,11 +1712,11 @@ static void payload_available(ps_space *s, ps_payload_page *p) {
       largest = span;
   }
   if (largest) {
-    p->available_next = s->available[largest];
-    p->available_link = &s->available[largest];
+    p->available_next = s->buckets->available[largest];
+    p->available_link = &s->buckets->available[largest];
     if (p->available_next)
       p->available_next->available_link = &p->available_next;
-    s->available[largest] = p;
+    s->buckets->available[largest] = p;
   }
 }
 static void payload_register(ps_space *s, ps_payload_page *p) {
@@ -1726,14 +1726,14 @@ static void payload_register(ps_space *s, ps_payload_page *p) {
   if (p->next)
     p->next->link = &p->next;
   s->payload_pages = p;
-  p->hash_next = s->payload_buckets[hash];
-  s->payload_buckets[hash] = p;
+  p->hash_next = s->buckets->payload[hash];
+  s->buckets->payload[hash] = p;
   ++s->packed_pages;
 }
 static void payload_unregister(ps_space *s, ps_payload_page *p) {
   ps_payload_page **link;
   payload_unavailable(p);
-  link = &s->payload_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
+  link = &s->buckets->payload[(p->run.offset / PS_PAGE) % BUCKETS];
   while (*link != p)
     link = &(*link)->hash_next;
   *link = p->hash_next;
@@ -2785,6 +2785,9 @@ static int verify_entry(ps_space *s, ps_entry *p, recovery_values *values,
   return verify_value_payloads(s, p, values->buffer, &values->packed, error);
 }
 static int initial_free(ps_space *s, lc_error *error) {
+  s->buckets = lc_calloc_with_allocator(NULL, 1, sizeof(*s->buckets));
+  if (!s->buckets)
+    return err(error, LC_ERR_NOMEM, "cannot allocate container buckets");
   s->free = lc_calloc_with_allocator(NULL, 1, sizeof(*s->free));
   s->metadata_free =
       lc_calloc_with_allocator(NULL, 1, sizeof(*s->metadata_free));
@@ -3091,8 +3094,8 @@ again:
   *bytes = requested;
   count = cell_count(requested);
   for (bin = count; bin <= CELLS; ++bin)
-    if (s->available[bin]) {
-      p = s->available[bin];
+    if (s->buckets->available[bin]) {
+      p = s->buckets->available[bin];
       break;
     }
   /* Use existing slack before buying another page. Only the final subpage
@@ -3101,8 +3104,8 @@ again:
    * added, even with adversarial cell fragmentation. */
   if (!p && split)
     for (bin = count - 1; bin; --bin)
-      if (s->available[bin]) {
-        p = s->available[bin];
+      if (s->buckets->available[bin]) {
+        p = s->buckets->available[bin];
         count = bin;
         *bytes = count * PS_CELL;
         break;
@@ -3173,7 +3176,8 @@ static int metadata_offset(ps_space *s, uint64_t offset) {
 }
 static ps_meta_page *metadata_find(ps_space *s, uint64_t offset) {
   ps_meta_page *p;
-  for (p = s->page_buckets[(offset / PS_PAGE) % BUCKETS]; p; p = p->hash_next)
+  for (p = s->buckets->metadata[(offset / PS_PAGE) % BUCKETS]; p;
+       p = p->hash_next)
     if (p->run.offset == offset)
       return p;
   return NULL;
@@ -3185,8 +3189,8 @@ static void metadata_register(ps_space *s, ps_meta_page *p) {
   if (p->next)
     p->next->link = &p->next;
   s->pages = p;
-  p->hash_next = s->page_buckets[hash];
-  s->page_buckets[hash] = p;
+  p->hash_next = s->buckets->metadata[hash];
+  s->buckets->metadata[hash] = p;
   ++s->metadata_pages;
 }
 static void metadata_claim_unlink(ps_meta_page *p) {
@@ -3237,7 +3241,8 @@ static int metadata_retirement_done(ps_space *s, lc_error *error) {
   return rc;
 }
 static void metadata_release(ps_space *s, ps_meta_page *p) {
-  ps_meta_page **link = &s->page_buckets[(p->run.offset / PS_PAGE) % BUCKETS];
+  ps_meta_page **link =
+      &s->buckets->metadata[(p->run.offset / PS_PAGE) % BUCKETS];
   if (s->metadata_claims_active && !p->claimed)
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
   metadata_claim_unlink(p);
@@ -4285,6 +4290,7 @@ static void destroy(ps_space *s) {
   }
   lc_free_with_allocator(NULL, s->catalogs.buckets);
   lc_free_with_allocator(NULL, s->keys.slots);
+  lc_free_with_allocator(NULL, s->buckets);
   lc_free_with_allocator(NULL, s->journal_image);
   if (s->credit_record) {
     (void)munmap(s->credit_words, PS_PAGE);
@@ -5713,7 +5719,7 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
   size_t i;
   int rc = LC_OK;
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->stream_buckets[i]; rc == LC_OK && p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; rc == LC_OK && p; p = p->stream->next)
       rc = validate_owned_stream(p->stream, error);
   return rc;
 }
@@ -5974,7 +5980,8 @@ static void exclusive_record_close(ps_space *s) {
       return;
   }
   for (i = 0; covered && i < BUCKETS; ++i)
-    for (stream = s->stream_buckets[i]; stream; stream = stream->stream->next) {
+    for (stream = s->buckets->streams[i]; stream;
+         stream = stream->stream->next) {
       if (!stream->bytes || stream->stream->sealed)
         continue;
       if (count == CLOSE_PROOF_MAX_TAILS)
@@ -6061,7 +6068,6 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   ps_readiness_certificate current;
   lc_error draft_error;
   ps_space *draft = projection_new(s, error);
-  size_t group, i;
   int rc, prepared = LC_OK;
   *moved = 0;
   if (!draft)
@@ -6093,16 +6099,6 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
         draft->entries = NULL;
         if (s->entries)
           s->entries->all_link = &s->entries;
-        memcpy(s->value_buckets, draft->value_buckets,
-               sizeof(s->value_buckets));
-        memcpy(s->stream_buckets, draft->stream_buckets,
-               sizeof(s->stream_buckets));
-        for (group = 0; group < PS_VALUE_GROUPS; ++group)
-          for (i = 0; i < BUCKETS; ++i) {
-            ps_value_bucket *bucket = &s->value_buckets[group][i];
-            if (bucket->head)
-              bucket->head->value_link = &bucket->head;
-          }
         projection_install(s, draft);
         *certificate = current;
       } else if (error) {
@@ -6648,17 +6644,20 @@ static void projection_entries(ps_space *s, ps_space *v) {
   s->entries = projected(v->entries);
   for (group = 0; group < PS_VALUE_GROUPS; ++group)
     for (i = 0; i < BUCKETS; ++i) {
-      ps_value_bucket *bucket = &s->value_buckets[group][i];
+      ps_value_bucket *bucket = &v->buckets->values[group][i];
       ps_entry **link;
-      *bucket = v->value_buckets[group][i];
       bucket->head = projected(bucket->head);
       for (link = &bucket->head; *link; link = &(*link)->value_next)
         (*link)->value_link = link;
     }
   for (i = 0; i < BUCKETS; ++i)
-    s->stream_buckets[i] = projected(v->stream_buckets[i]);
-  for (i = 0; i < v->catalogs.capacity; ++i)
-    v->catalogs.buckets[i] = projected(v->catalogs.buckets[i]);
+    v->buckets->streams[i] = projected(v->buckets->streams[i]);
+  for (i = 0; i < v->catalogs.capacity; ++i) {
+    ps_entry **link = &v->catalogs.buckets[i];
+    *link = projected(*link);
+    for (; (p = *link) != NULL; link = &p->catalog->next)
+      p->catalog->link = link;
+  }
   for (p = s->entries; p; p = p->all_next) {
     p->all_link = p == s->entries ? &s->entries : p->all_link;
     if (p->all_next)
@@ -6682,7 +6681,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
     p = borrowed;
     borrowed = p->all_next;
     register_entry(s, p);
-    value_register(s, p);
+    value_register(v, p);
   }
   /* Every link now points at its final entry. Reused staged entries are
    * kept until here because other links can still refer to their bindings. */
@@ -6694,10 +6693,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
   v->entries = NULL;
 }
 static void projection_install(ps_space *s, ps_space *v) {
-  ps_entry *p, **link;
-  ps_payload_page *page;
   ps_entry_allocation *block;
-  size_t i;
   /* Entries imported from the draft now belong to the resident owner. */
   while ((block = v->entry_allocations) != NULL) {
     entry_allocation_unlink(block);
@@ -6718,6 +6714,7 @@ static void projection_install(ps_space *s, ps_space *v) {
   } while (0)
   PROJECTION_SWAP(free, ps_run *);
   PROJECTION_SWAP(keys, ps_key_index);
+  PROJECTION_SWAP(buckets, ps_space_buckets *);
   PROJECTION_SWAP(metadata_free, ps_run *);
   PROJECTION_SWAP(pinned_free, ps_run *);
   PROJECTION_SWAP(pages, ps_meta_page *);
@@ -6725,9 +6722,6 @@ static void projection_install(ps_space *s, ps_space *v) {
   PROJECTION_SWAP(catalogs, ps_catalog_index);
   PROJECTION_SWAP(journal_image, unsigned char *);
 #undef PROJECTION_SWAP
-  memcpy(s->page_buckets, v->page_buckets, sizeof(s->page_buckets));
-  memcpy(s->payload_buckets, v->payload_buckets, sizeof(s->payload_buckets));
-  memcpy(s->available, v->available, sizeof(s->available));
   s->pinned_pages = v->pinned_pages;
   s->pinned_page_probe = NULL;
   s->pinned_free_probe = NULL;
@@ -6735,13 +6729,6 @@ static void projection_install(ps_space *s, ps_space *v) {
     s->pages->link = &s->pages;
   if (s->payload_pages)
     s->payload_pages->link = &s->payload_pages;
-  for (i = 0; i <= CELLS; ++i)
-    if ((page = s->available[i]) != NULL)
-      page->available_link = &s->available[i];
-  for (i = 0; i < s->catalogs.capacity; ++i)
-    for (link = &s->catalogs.buckets[i]; (p = *link) != NULL;
-         link = &p->catalog->next)
-      p->catalog->link = link;
   s->root = v->root;
   s->capacity = v->capacity;
   s->generation = v->generation;
@@ -8070,7 +8057,7 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   rc = ps_internal_observe_begin(s, &guard, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   for (group = 1; rc == LC_OK && group < PS_VALUE_GROUPS; ++group)
-    for (p = s->value_buckets[group][bucket].head; p; p = p->value_next) {
+    for (p = s->buckets->values[group][bucket].head; p; p = p->value_next) {
       if (p->key.owner != owner || (!s->durable && !p->durable_visibility))
         continue;
       if (p->peer_sequence) {
@@ -8388,7 +8375,7 @@ static int values_capacity(const ps_space *s, size_t bucket, unsigned int begin,
   unsigned int group;
   *count = 0;
   for (group = begin; group <= end; ++group) {
-    size_t occupied = s->value_buckets[group][bucket].count;
+    size_t occupied = s->buckets->values[group][bucket].count;
     if (occupied > limit - *count)
       return err(error, LC_ERR_NOMEM, "selected value metadata exceeds limit");
     *count += occupied;
@@ -8422,7 +8409,7 @@ static int values_select_locked(ps_space *s, uint64_t owner, unsigned int first,
   view->items = (ps_value_slot *)(view + 1);
   view->retained = (ps_value_slot **)(view->items + count);
   for (group = begin; group <= end; ++group)
-    for (p = s->value_buckets[group][bucket].head; p; p = p->value_next) {
+    for (p = s->buckets->values[group][bucket].head; p; p = p->value_next) {
       if (p->key.owner != owner ||
           (!group && (p->key.kind < first || p->key.kind > last)))
         continue;
@@ -8649,7 +8636,7 @@ int ps_internal_values_startup_walk(ps_space *s, uint64_t owner,
     }
     order = (void *)(walk + 1);
     for (group = begin; group <= end; ++group)
-      for (p = s->value_buckets[group][bucket].head; p; p = p->value_next)
+      for (p = s->buckets->values[group][bucket].head; p; p = p->value_next)
         if (p->key.owner == owner &&
             (selected = selected_value(s, p, prefix)) != NULL)
           order[count++] = selected;
