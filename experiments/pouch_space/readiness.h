@@ -20,7 +20,7 @@ typedef struct ps_readiness_certificate {
 } ps_readiness_certificate;
 /* Certificate updates and authoritative selection use allocation authority.
  * Membership is an OFD read witness at byte 3, separate from the reader
- * presence witness at byte 2. Certificates are volatile cohort state.
+ * presence witness at byte 2. Live certificate fields are cohort state.
  */
 int ps_readiness_attach(ps_space *, lc_error *);
 int ps_readiness_joined(const ps_space *);
@@ -36,6 +36,14 @@ void ps_readiness_credit_note_spill(ps_space *);
 int ps_readiness_validate(ps_space *, lc_error *);
 int ps_readiness_opened(ps_space *, lc_error *);
 int ps_readiness_read(ps_space *, ps_readiness_certificate *, lc_error *);
+/* A closed cohort can supply only a completed durability boundary. Cold
+ * recovery must independently validate the corresponding on-disk prefix.
+ * The new live origin can be ahead of durability after ignoring old hints. */
+int ps_readiness_prior_durable(ps_space *, ps_readiness_certificate *);
+int ps_readiness_reused_open_barrier(const ps_space *);
+/* Publish this owner's range under allocation authority after its pool has
+ * crossed the durability barrier. The range is spent before use. */
+int ps_readiness_assign_grant(ps_space *, lc_error *);
 /* Under the local space mutex, prove the resident canonical projection at
  * a checked instant. A miss needs ordinary allocator capture. No physical
  * ownership or allocator permission follows from a match. */

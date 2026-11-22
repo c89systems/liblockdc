@@ -341,8 +341,8 @@ int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
                      "catalog identity requires space and output");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
-  if (rc == LC_OK && s->token_next > s->token_end)
-    rc = cat_error(e, LC_ERR_INVALID, "identity grant consumed; reopen");
+  if (rc == LC_OK)
+    rc = ps_internal_token_range(s, e);
   if (rc == LC_OK)
     *out = s->token_next++;
   pthread_mutex_unlock(&s->mutex);
@@ -389,14 +389,15 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
         (expected ? !ref_matches(s, old, expected) : old && !old->deleted))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
-    if (rc == LC_OK && (s->token_next > s->token_end ||
-                        (target && (!ref_matches(s, head, target) ||
-                                    head->stream->orphan_claimed))))
+    if (rc == LC_OK && target &&
+        (!ref_matches(s, head, target) || head->stream->orphan_claimed))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog stream reference or identity invalid");
     if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind &&
         old->catalog->kind == PS_CATALOG_NAMESPACE)
       rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
+    if (rc == LC_OK)
+      rc = ps_internal_token_range(s, e);
     if (rc == LC_OK && head && !head->stream->catalog_refs &&
         !head->stream->claim)
       rc = ps_internal_stream_claim(s, head->token, &claim, e);

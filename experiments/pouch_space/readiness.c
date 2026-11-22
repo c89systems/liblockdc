@@ -26,6 +26,8 @@
 #define CREDIT_ACTIVE (CREDIT_SPILL - 1)
 #define CREDIT_RECORDS (CREDIT_ACTIVE - 2 * PS_READINESS_CREDIT_SLOTS)
 #define PRESSURE_BIT (UINT64_C(1) << 63)
+#define REUSED_OPEN_BARRIER_BIT (UINT64_C(1) << 62)
+#define NONPENDING_BITS (PRESSURE_BIT | REUSED_OPEN_BARRIER_BIT)
 #define BITMAP_WORDS ((CREDIT_RECORDS - 2 * WORDS) / 2)
 #define ZERO_BITMAP (2 * WORDS)
 #define WITNESS_BITMAP (ZERO_BITMAP + BITMAP_WORDS)
@@ -194,7 +196,7 @@ static int slot_read(const uint64_t *source, uint64_t *record,
   __atomic_thread_fence(__ATOMIC_ACQUIRE);
   if (__atomic_load_n(source, __ATOMIC_RELAXED) != generation ||
       record[MAGIC] != READY_MAGIC || record[DURABLE] > record[READY] ||
-      record[ORIGIN] > record[DURABLE] || !record[GRANT_USED] ||
+      record[ORIGIN] > record[READY] || !record[GRANT_USED] ||
       record[GRANT_USED] % TOKEN_RANGE || record[GRANT_LIMIT] % TOKEN_RANGE ||
       record[GRANT_USED] > record[GRANT_LIMIT] ||
       record[GRANT_LIMIT] - record[GRANT_USED] >= TOKEN_POOL ||
@@ -229,7 +231,7 @@ static int current(ps_space *s, uint64_t *record, int *selected, lc_error *e) {
 }
 static int checked_snapshot(ps_space *s, uint64_t *record, uint64_t allowed) {
   const uint64_t *page = s->readiness->page;
-  const uint64_t blocked = ~(PRESSURE_BIT | allowed);
+  const uint64_t blocked = ~(NONPENDING_BITS | allowed);
   uint64_t first, second;
   int selected;
   if (__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) & blocked)
@@ -278,6 +280,14 @@ static void certificate_from_record(ps_readiness_certificate *out,
   out->grant_limit = record[GRANT_LIMIT];
   out->prepared_durable = record[PREPARED_DURABLE];
   out->pending = 0;
+}
+int ps_readiness_prior_durable(ps_space *s, ps_readiness_certificate *out) {
+  uint64_t record[WORDS];
+  if (!s->readiness || s->readiness->existing || s->readiness->active ||
+      !checked_snapshot(s, record, 0))
+    return 0;
+  certificate_from_record(out, record);
+  return 1;
 }
 int ps_readiness_preview(ps_space *s, ps_readiness_certificate *out) {
   const uint64_t *page;
@@ -415,7 +425,9 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     if (rc != LC_OK)
       return rc;
     if (record[READY] > s->sequence || record[ROOT] > s->generation ||
-        record[DURABLE] > s->peer_durable || record[GRANT_USED] >= s->token_end)
+        record[DURABLE] > s->peer_durable ||
+        (s->token_end ? record[GRANT_USED] >= s->token_end
+                      : record[GRANT_LIMIT] != s->token_limit))
       return failed(s, e, "recovery regressed shared readiness");
     advanced = record[DURABLE] < s->peer_durable;
   } else {
@@ -428,7 +440,9 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
                      __ATOMIC_RELEASE);
     __atomic_store_n(sync_word(s), 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(s->readiness->page + PENDING_WORD, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(s->readiness->page + PENDING_WORD,
+                     s->reused_open_barrier ? REUSED_OPEN_BARRIER_BIT : 0,
+                     __ATOMIC_RELEASE);
     record[ORIGIN] = s->sequence;
   }
   record[MAGIC] = READY_MAGIC;
@@ -437,9 +451,10 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
   record[JOURNAL_BYTES] = s->journal;
   record[DURABLE] = s->peer_durable;
   record[ROOT] = s->generation;
-  /* Publish assignment before the owner releases allocation authority. Death
-   * after this point permanently consumes the owner's range in this cohort. */
-  record[GRANT_USED] = s->token_end;
+  /* Burn the previous cohort's entire pool. Read-only admission to a live
+   * cohort leaves its frontier available to the next allocating owner. */
+  if (s->token_end || !s->readiness->existing)
+    record[GRANT_USED] = s->token_end ? s->token_end : s->token_limit;
   record[GRANT_LIMIT] = s->token_limit;
   rc = select_record(s, record, selected, e);
   if (rc == LC_OK) {
@@ -454,6 +469,30 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
       ps_readiness_sync_wake(s);
   }
   return rc;
+}
+int ps_readiness_reused_open_barrier(const ps_space *s) {
+  /* Keep this for the cohort, since a join may do logical recovery before
+   * the first opener finishes loading all of its namespaces. */
+  return s->readiness &&
+         (__atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
+          REUSED_OPEN_BARRIER_BIT);
+}
+int ps_readiness_assign_grant(ps_space *s, lc_error *e) {
+  uint64_t record[WORDS];
+  int selected, rc = current(s, record, &selected, e);
+  if (rc == LC_OK)
+    rc = identity(s, record, e);
+  if (rc != LC_OK)
+    return rc;
+  if (record[ROOT] != s->generation || record[READY] != s->sequence ||
+      record[GRANT_LIMIT] > s->token_limit || s->token_end > s->token_limit ||
+      (record[GRANT_LIMIT] == s->token_limit
+           ? s->token_end - record[GRANT_USED] != TOKEN_RANGE
+           : s->token_end <= record[GRANT_LIMIT]))
+    return failed(s, e, "invalid shared incarnation assignment");
+  record[GRANT_USED] = s->token_end;
+  record[GRANT_LIMIT] = s->token_limit;
+  return select_record(s, record, selected, e);
 }
 int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
   uint64_t record[WORDS];
@@ -473,7 +512,7 @@ int ps_readiness_read(ps_space *s, ps_readiness_certificate *out, lc_error *e) {
     certificate_from_record(out, record);
     out->pending =
         __atomic_load_n(s->readiness->page + PENDING_WORD, __ATOMIC_ACQUIRE) &
-        ~PRESSURE_BIT;
+        ~NONPENDING_BITS;
     if (out->pending &
         ~(uint64_t)(PS_READINESS_ROOT | PS_READINESS_JOURNAL |
                     PS_READINESS_RECOVERY | PS_READINESS_CHECKPOINT_RETIRE))

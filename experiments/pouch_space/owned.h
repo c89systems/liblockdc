@@ -197,9 +197,13 @@ int ps_owned_commit_canonical(ps_owned_head *, uint64_t tail,
                               enum ps_commit_mode, ps_commit_publish_fn, void *,
                               lc_error *);
 int ps_owned_barrier(ps_owned_head *, lc_error *);
-/* Canonical recovery has validated [checkpoint tail, tail) and cleared the
- * rejected suffix. Stabilize it before accepting the recovered tail hint.
- * Complete repairs join root readiness and may share a durability barrier. */
+/* Restore a checked tail or footer after loading a stream. When physical open
+ * reused an earlier barrier, a newly discovered suffix may need its own. */
+int ps_owned_restore_tail(ps_owned_head *, uint64_t tail, int advanced,
+                          lc_error *);
+/* Canonical recovery has validated [checkpoint tail, tail). Stabilize any
+ * newly admitted bytes and completed repairs before publishing the tail
+ * hint. Complete repairs can share a root durability barrier. */
 int ps_owned_recovered(ps_owned_head *, uint64_t tail, lc_error *);
 /* Structural transitions always synchronize. Seal first stabilizes canonical
  * bytes, then publishes the immutable final tail. Retirement journals one

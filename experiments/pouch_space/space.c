@@ -3982,8 +3982,8 @@ static int write_token_limit(ps_space *s, int slot, uint64_t limit,
 }
 /* The preceding slot remains intact. A new pool that persists ahead of its
  * barrier can be skipped safely: it does not advance the journal prefix. */
-static int grant_tokens(ps_space *s, int slot, lc_error *error) {
-  uint64_t limit = s->token_limit;
+static int grant_tokens(ps_space *s, int slot, uint64_t limit,
+                        lc_error *error) {
   uint64_t count = ps_coordination_shared(s->coordination) &&
                            limit <= PS_MAX_INCARNATION - TOKEN_POOL
                        ? TOKEN_POOL
@@ -3998,6 +3998,48 @@ static int grant_tokens(ps_space *s, int slot, lc_error *error) {
     s->token_end = limit + TOKEN_RANGE;
   }
   return rc;
+}
+int ps_internal_token_range(ps_space *s, lc_error *error) {
+  ps_coordination_guard *guard = NULL;
+  ps_readiness_certificate certificate;
+  unsigned char first[PS_TOKEN_RECORD_BYTES], second[PS_TOKEN_RECORD_BYTES];
+  uint64_t limit;
+  int rc, slot;
+  if (s->token_end)
+    return s->token_next <= s->token_end
+               ? LC_OK
+               : err(error, LC_ERR_INVALID,
+                     "incarnation grant consumed; close and reopen");
+  rc = ps_internal_capture_begin(s, &guard, error);
+  if (rc == LC_OK)
+    rc = ps_readiness_read(s, &certificate, error);
+  if (rc == LC_OK && certificate.grant_used < certificate.grant_limit) {
+    s->token_next = certificate.grant_used + 1;
+    s->token_end = certificate.grant_used + TOKEN_RANGE;
+  } else if (rc == LC_OK) {
+    /* A killed refill may have written a newer frontier without registering
+     * any owner. Stabilize that slot before spending it. Overwriting the
+     * other slot here could destroy the only known durable grant. */
+    rc = transfer(s, first, sizeof(first), PS_TOKEN_RECORD_OFFSET, 0, error);
+    if (rc == LC_OK)
+      rc = transfer(s, second, sizeof(second), PS_PAGE + PS_TOKEN_RECORD_OFFSET,
+                    0, error);
+    if (rc == LC_OK)
+      rc = decode_token_limit(s, first, second, &limit, &slot, error);
+    if (rc == LC_OK && limit == certificate.grant_limit)
+      rc = grant_tokens(s, 1 - slot, limit, error);
+    else if (rc == LC_OK && limit - certificate.grant_limit <= TOKEN_POOL) {
+      s->token_next = certificate.grant_limit + 1;
+      s->token_end = certificate.grant_limit + TOKEN_RANGE;
+      s->token_limit = limit;
+    } else if (rc == LC_OK)
+      rc = err(error, LC_ERR_PROTOCOL, "unassigned incarnation pool invalid");
+    if (rc == LC_OK)
+      rc = sync_file(s, error);
+  }
+  if (rc == LC_OK)
+    rc = ps_readiness_assign_grant(s, error);
+  return allocation_end(s, guard, rc, error);
 }
 static void destroy(ps_space *s) {
   ps_entry_allocation *block;
@@ -5251,7 +5293,7 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
     if (select)
       stream_admitted(s, head, 1);
   } else if (event != PS_STREAM_TAIL && event != PS_STREAM_COMPLETE) {
-    if (!value || value > s->token_limit || value % TOKEN_RANGE)
+    if (!value || (select && value > get64(wire + 8)))
       return err(error, LC_ERR_PROTOCOL, "invalid owned stream writer stamp");
     if (select) {
       ps_writer_stamp *stamp = entry_writer_stamp(head);
@@ -5711,14 +5753,14 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   unsigned char zero[PS_ROOT_BYTES] = {0};
   unsigned char superblocks[RECOVERY_HEADERS], *wire = NULL;
   recovery_values *values = NULL;
-  ps_readiness_certificate certificate;
+  ps_readiness_certificate certificate, prior;
   const unsigned char *roots[2], *root;
   ps_entry *p = NULL, *checkpoint_entries = NULL;
   struct stat st;
-  uint64_t grant_limit;
+  uint64_t grant_limit, effect;
   size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
-  int a, b, event, rc, retire_sibling, retirement_needed, range_available;
-  int pending_data = 0, grant_slot, moved = 0, certified;
+  int a, b, event, rc, retire_sibling, retirement_needed, known_grant;
+  int pending_data = 0, grant_slot, moved = 0, certified, cold_covered;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
 restart:
@@ -5802,6 +5844,7 @@ restart:
   if (rc != LC_OK)
     goto done;
   cursor = 0;
+  effect = s->sequence;
   while (!(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) &&
          journal_bound - cursor >= 64 && s->sequence != UINT64_MAX &&
          (get32(wire + cursor) == EVENT_MAGIC ||
@@ -5815,8 +5858,9 @@ restart:
     event = get32(wire + cursor + 20);
     if (s->sequence >= certificate.durable &&
         (get32(wire + cursor) == REVISION_MAGIC ||
-         (event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER &&
-          event != PS_STREAM_ADMITTED)))
+         !live_hint((uint32_t)event) ||
+         (s->sequence >= certificate.origin && event != PS_STREAM_OWNER &&
+          event != PS_NAMESPACE_OWNER && event != PS_STREAM_ADMITTED)))
       pending_data = 1;
     if (get32(wire + cursor) == REVISION_MAGIC) {
       rc = recover_revision(s, wire + cursor, bytes, values, error);
@@ -5826,6 +5870,7 @@ restart:
         lc_error_cleanup(error);
         break;
       }
+      effect = s->sequence;
       cursor += bytes;
       continue;
     }
@@ -5867,6 +5912,7 @@ restart:
     }
     cursor += bytes;
     ++s->sequence;
+    effect = s->sequence;
   }
   s->journal = cursor;
   rc = ps_readiness_validate(s, error);
@@ -5925,21 +5971,39 @@ restart:
   /* Open built its free map from scratch and queried the physical witnesses
    * under the same allocator hold that admits the protected metadata pool. */
   s->allocation_ranges_checked = s->allocation_guard != NULL;
-  range_available = certificate.grant_limit == s->token_limit &&
-                    certificate.grant_used < certificate.grant_limit;
-  /* A live join can leave the selected prefix untouched and spend an already
-   * durable range. It still stabilizes any unacknowledged data before using
-   * the recovered projection. A new grant does not advance the accepted
-   * journal sequence, so its barrier can also stabilize the cleanup. */
+  /* Check the complete cold replay before relying on the preceding barrier.
+   * Hints past that barrier are ignored in the next cohort. The previous
+   * cohort's allocator ranges and readiness hints do not carry forward. */
+  known_grant = ps_readiness_prior_durable(s, &prior) &&
+                prior.grant_limit == s->token_limit;
+  cold_covered = !retirement_needed && known_grant &&
+                 prior.root == s->generation && prior.ready == s->sequence &&
+                 prior.journal_bytes == s->journal && prior.durable >= effect;
   s->peer_durable = certificate.durable;
-  if (!range_available) {
-    rc = grant_tokens(s, 1 - grant_slot, error);
+  if (ps_readiness_joined(s) && certificate.grant_limit != grant_limit) {
+    if (certificate.grant_used != certificate.grant_limit ||
+        grant_limit - certificate.grant_limit > TOKEN_POOL) {
+      rc = err(error, LC_ERR_PROTOCOL, "unassigned incarnation pool invalid");
+      goto done;
+    }
+    s->token_next = certificate.grant_limit + 1;
+    s->token_end = certificate.grant_limit + TOKEN_RANGE;
+  } else if (!ps_readiness_joined(s) && !cold_covered &&
+             (!s->readiness || known_grant ||
+              get64(root + 48) == grant_limit)) {
+    rc = grant_tokens(s, 1 - grant_slot, grant_limit, error);
     if (rc != LC_OK)
       goto done;
   }
-  if (retirement_needed || certificate.pending ||
-      certificate.root != s->generation || certificate.ready != s->sequence ||
-      pending_data || !range_available) {
+  if (cold_covered) {
+    /* Ignoring old hints is safe, but does not make their bytes durable.
+     * A later crash may reuse their wire positions for canonical data. */
+    s->peer_durable = prior.durable;
+    s->reused_open_barrier = 1;
+  } else if (retirement_needed || certificate.pending ||
+             certificate.root != s->generation ||
+             certificate.ready != s->sequence || pending_data ||
+             certificate.grant_limit != s->token_limit) {
     rc = sync_file(s, error);
     if (rc != LC_OK)
       goto done;
@@ -5951,10 +6015,6 @@ restart:
   if (ps_coordination_shared(s->coordination)) {
     s->journal_image = wire;
     wire = NULL;
-  }
-  if (range_available) {
-    s->token_next = certificate.grant_used + 1;
-    s->token_end = certificate.grant_used + TOKEN_RANGE;
   }
 done:
   lc_free_with_allocator(NULL, values);
@@ -6848,9 +6908,8 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
   rc = healthy(s, error);
   if (rc == LC_OK)
     rc = ps_internal_budget_check(s, budget, 0, 0, 0, error);
-  if (rc == LC_OK && s->token_next > s->token_end)
-    rc = err(error, LC_ERR_INVALID,
-             "incarnation grant consumed; close and reopen");
+  if (rc == LC_OK)
+    rc = ps_internal_token_range(s, error);
   if (rc == LC_OK) {
     p = space_entry_new(s, key.kind, 0, 0);
     if (!p)
@@ -8863,8 +8922,8 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
        old->publication_sequence >
            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE)))
     rc = err(error, LC_ERR_INVALID, "owned stream already exists");
-  if (rc == LC_OK && create && s->token_next > s->token_end)
-    rc = err(error, LC_ERR_INVALID, "incarnation grant consumed; reopen");
+  if (rc == LC_OK && create)
+    rc = ps_internal_token_range(s, error);
   if (rc == LC_OK && create)
     rc = checkpoint_allowance_floor(s, s->metadata + 80, s->live_entries + 1, 0,
                                     PS_MAINTENANCE_RESERVE, budget, error);
@@ -9016,7 +9075,8 @@ int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
 }
 static int writer_stamp_current(const ps_space *s, const ps_entry *p) {
   const ps_writer_stamp *stamp = entry_writer_stamp(p);
-  return stamp->generation == s->generation && stamp->token == s->token_end;
+  return s->writer_id && stamp->generation == s->generation &&
+         stamp->token == s->writer_id;
 }
 static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
                               int *continued, lc_error *error) {
@@ -9028,11 +9088,14 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
   memset(&stamp, 0, sizeof(stamp));
   stamp.key = p->key;
   stamp.token = p->token;
-  stamp.bytes = s->token_end;
+  /* The first framed stamp supplies an identity in this live cohort.
+   * Recovered hints at or before the cohort origin cannot claim ownership. */
+  stamp.bytes = s->writer_id ? s->writer_id : s->sequence + 1;
   rc = append_event_locked(s, &stamp, event, error);
   if (rc == LC_OK) {
     ps_writer_stamp *writer = entry_writer_stamp(p);
-    writer->token = s->token_end;
+    s->writer_id = stamp.bytes;
+    writer->token = s->writer_id;
     writer->generation = s->generation;
     if (event == PS_STREAM_EDIT) {
       p->stream->edit_wire = s->sequence;
@@ -9204,10 +9267,11 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
     rc = stream_structure_ready(s, head->entry, error);
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream->sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
-  if (rc == LC_OK &&
-      (base != head->entry->stream->capacity || s->token_next > s->token_end ||
-       base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
+  if (rc == LC_OK && (base != head->entry->stream->capacity ||
+                      base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
+  if (rc == LC_OK)
+    rc = ps_internal_token_range(s, error);
   /* Protect metadata before retaining a free-list selection: admission may
    * transfer common intervals into the checkpoint-only pool. */
   if (rc == LC_OK)
@@ -10344,6 +10408,12 @@ int ps_owned_commit_canonical(ps_owned_head *head, uint64_t tail,
 int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
   return head ? sync_file(head->space, error)
               : err(error, LC_ERR_INVALID, "owned barrier requires head");
+}
+int ps_owned_restore_tail(ps_owned_head *head, uint64_t tail, int advanced,
+                          lc_error *error) {
+  if (advanced && ps_readiness_reused_open_barrier(head->space))
+    return ps_owned_recovered(head, tail, error);
+  return ps_owned_commit(head, tail, PS_COMMIT_DEFER_SYNC, NULL, NULL, error);
 }
 int ps_owned_recovered(ps_owned_head *head, uint64_t tail, lc_error *error) {
   ps_space *s;

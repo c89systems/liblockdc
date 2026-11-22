@@ -3633,7 +3633,7 @@ static void live_open_handoff(int advance_root, int fault,
   } else
     REQUIRE(gate.result == LC_OK && gate.space);
   REQUIRE(gate.space->generation == writer->generation &&
-          gate.space->token_next > other_join->token_end);
+          !gate.space->token_end && !other_join->token_end);
   expect_value(gate.space, first, 65, 1);
   index_expect(gate.space, 2, bytes, &e);
   capture_put_key(gate.space, first, 140);
@@ -4744,6 +4744,42 @@ static int reopen_sync(void *context, int fd) {
   }
   return fdatasync(fd);
 }
+typedef struct stopped_refill {
+  int ready, already_synced;
+} stopped_refill;
+static int refill_sync(void *context, int fd) {
+  stopped_refill *stop = context;
+  if (stop->already_synced)
+    REQUIRE(!fdatasync(fd));
+  REQUIRE(write(stop->ready, "R", 1) == 1);
+  for (;;)
+    pause();
+}
+static void interrupt_refill(int already_synced) {
+  int ready[2], status;
+  char signal;
+  REQUIRE(!pipe(ready));
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    stopped_refill stop = {ready[1], already_synced};
+    ps_io io = {&stop, read_io, durable_write, refill_sync, reserve_io, NULL};
+    ps_options options = {.io = &io};
+    ps_space *space = NULL;
+    lc_error e = {0};
+    uint64_t id;
+    REQUIRE(!close(ready[0]));
+    ok(ps_open(path, 0, &options, &space, &e), &e);
+    REQUIRE(!space->token_end);
+    (void)ps_catalog_allocate_id(space, &id, &e);
+    _exit(1);
+  }
+  REQUIRE(!close(ready[1]));
+  REQUIRE(read(ready[0], &signal, 1) == 1 && signal == 'R');
+  REQUIRE(!kill(child, SIGKILL) && waitpid(child, &status, 0) == child &&
+          WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  REQUIRE(!close(ready[0]));
+}
 static void reopen_after_checkpoint(void) {
   for (int durable = 0; durable <= 1; ++durable) {
     reopen_disk disk = {0};
@@ -4792,18 +4828,17 @@ static void reopen_after_checkpoint(void) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
-static void reopen_cohort(void) {
+static void reopen_cohort(int already_synced) {
   lc_error e = {0};
   reopen_disk disk = {0};
   ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
   ps_options options = {0};
-  ps_space *first = NULL, *join = NULL;
+  ps_space *first = NULL, *join = NULL, *retry = NULL;
   ps_ref before, after;
   ps_coordination_guard *guard = NULL;
   ps_budget_plan plan = {PS_PAGE, 0, 0, 0};
   ps_budget *budget = NULL;
   unsigned char byte = 0xa5;
-  reopen_after_checkpoint();
   options.io = &io;
   ok(ps_open(path, 1, NULL, &first, &e), &e);
   capture_put(first, 1, 65);
@@ -4813,7 +4848,8 @@ static void reopen_cohort(void) {
   ok(ps_open(path, 0, &options, &join, &e), &e);
   REQUIRE(!disk.syncs && disk.journal_read == cert.journal_bytes + 64 &&
           readiness(first).ready == cert.ready &&
-          readiness(first).durable == cert.durable);
+          readiness(first).durable == cert.durable &&
+          readiness(first).grant_used == cert.grant_used && !join->token_end);
   ps_writer *writer = replay_value(join, key(2), 2, 65, &e);
   ok(ps_publish(writer, &before, &e), &e);
   ps_writer_close(writer);
@@ -4837,28 +4873,57 @@ static void reopen_cohort(void) {
   ok(ps_close(join, &e), &e);
   join = NULL;
 
-  /* Each reopen burns a private range even if the owner publishes nothing.
-   * Refill needs a durable grant only when the live pool runs out. */
+  /* A live opener consumes nothing until it needs a persistent identity.
+   * Spending an already durable range needs no extra sync or journal frame. */
   cert = readiness(first);
   for (uint64_t used = cert.grant_used; used < cert.grant_limit;
        used += TOKEN_RANGE) {
     disk = (reopen_disk){0};
     ok(ps_open(path, 0, &options, &join, &e), &e);
-    REQUIRE(!disk.syncs && join->token_next == used + 1 &&
+    REQUIRE(!disk.syncs && !join->token_end &&
+            readiness(join).grant_used == used);
+    uint64_t id;
+    ok(ps_catalog_allocate_id(join, &id, &e), &e);
+    REQUIRE(!disk.syncs && id == used + 1 &&
             join->token_end == used + TOKEN_RANGE);
     ok(ps_close(join, &e), &e);
     join = NULL;
   }
   cert = readiness(first);
+  for (size_t i = 0; i < 2 * (TOKEN_POOL / TOKEN_RANGE); ++i) {
+    disk = (reopen_disk){0, 1};
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+    REQUIRE(!disk.syncs && !join->token_end &&
+            readiness(join).grant_used == cert.grant_used);
+    ok(ps_close(join, &e), &e);
+    join = NULL;
+  }
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &retry, &e), &e);
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  interrupt_refill(already_synced);
+  REQUIRE(readiness(first).grant_used == cert.grant_used &&
+          readiness(first).grant_limit == cert.grant_limit);
   disk = (reopen_disk){0, 1};
-  REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join);
+  uint64_t id;
+  REQUIRE(ps_catalog_allocate_id(join, &id, &e) == LC_ERR_TRANSPORT && !id);
   lc_error_cleanup(&e);
   REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.durable &&
           readiness(first).ready == cert.ready &&
           readiness(first).grant_limit == cert.grant_limit);
+  uint64_t uncertain = join->token_limit;
+  REQUIRE(uncertain > cert.grant_limit);
+  ok(ps_close(join, &e), &e);
   disk = (reopen_disk){0};
-  ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1 && join->token_next > cert.grant_limit &&
+  if (already_synced) {
+    ok(ps_close(retry, &e), &e);
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+  } else {
+    join = retry;
+  }
+  ok(ps_catalog_allocate_id(join, &id, &e), &e);
+  REQUIRE(disk.syncs == 1 && id == cert.grant_limit + 1 &&
+          join->token_limit == uncertain &&
           readiness(first).ready == cert.ready);
   /* An existing allocator can adopt the grant without changing its own
    * range or replaying a synthetic journal event. */
@@ -4913,18 +4978,22 @@ static void reopen_cohort(void) {
           !readiness(first).pending);
   ok(ps_budget_open(first, &plan, &budget, &e), &e);
   ok(ps_budget_close(budget, &e), &e);
+  cert = readiness(first);
   ok(ps_close(first, &e), &e);
   ok(ps_close(join, &e), &e);
   join = NULL;
 
-  disk = (reopen_disk){0};
+  disk = (reopen_disk){0, 1};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1 && disk.journal_read == PS_JOURNAL);
+  REQUIRE(!disk.syncs && !join->token_end && disk.journal_read == PS_JOURNAL &&
+          readiness(join).grant_used == cert.grant_limit);
   expect_value(join, key(1), 65, 1);
   expect_value(join, key(2), 65, 2);
+  disk.fail_sync = 0;
   writer = replay_value(join, key(3), 3, 65, &e);
   ok(ps_publish(writer, &after, &e), &e);
-  REQUIRE(after.incarnation > before.incarnation);
+  REQUIRE(after.incarnation > cert.grant_limit &&
+          after.incarnation > before.incarnation);
   ps_writer_close(writer);
 
   /* Appended data needs one barrier even when the journal has stayed in the
@@ -4969,6 +5038,94 @@ static void reopen_cohort(void) {
   ps_owned_close(head);
   ok(ps_close(first, &e), &e);
   ok(ps_close(join, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void cold_open_prior_durability(void) {
+  reopen_disk disk = {0};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_space *space = NULL;
+  lc_error e = {0};
+  ok(ps_open(path, 1, &options, &space, &e), &e);
+  capture_put(space, 1, 65);
+  ok(ps_flush(space, &e), &e);
+  ok(ps_close(space, &e), &e);
+  space = NULL;
+
+  disk = (reopen_disk){0, 1};
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  expect_value(space, key(1), 65, 1);
+  REQUIRE(!disk.syncs && !space->token_end);
+  disk.fail_sync = 0;
+  capture_put(space, 2, 65);
+  REQUIRE(readiness(space).ready > readiness(space).durable);
+  ok(ps_close(space, &e), &e);
+  space = NULL;
+
+  /* The preceding certificate cannot certify data beyond its barrier. */
+  disk = (reopen_disk){0, 1};
+  REQUIRE(ps_open(path, 0, &options, &space, &e) == LC_ERR_TRANSPORT &&
+          !space && disk.syncs == 1);
+  lc_error_cleanup(&e);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(disk.syncs == 1);
+  expect_value(space, key(1), 65, 1);
+  expect_value(space, key(2), 65, 2);
+  ok(ps_close(space, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void cold_open_volatile_hint(void) {
+  reopen_disk disk = {0};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_space *space = NULL, *joined = NULL;
+  ps_catalog_info ns;
+  ps_catalog_view *view = NULL;
+  ps_readiness_certificate cert;
+  unsigned char wire[64];
+  int continued, fd;
+  off_t at;
+  lc_error e = {0};
+  ok(ps_open(path, 1, &options, &space, &e), &e);
+  ok(ps_catalog_create_namespace(space, "memo", 4, &ns, &e), &e);
+  ok(ps_checkpoint(space, &e), &e);
+  at = (off_t)JOURNAL_POSITION(space->journal_start);
+  ok(ps_internal_namespace_stamp(space, ns.id, &continued, &e), &e);
+  cert = readiness(space);
+  REQUIRE(!continued && cert.ready == cert.durable + 1);
+  REQUIRE(pread(space->fd, wire, sizeof(wire), at) == sizeof(wire));
+  ok(ps_close(space, &e), &e);
+  space = NULL;
+
+  disk = (reopen_disk){0, 1};
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(!disk.syncs && !space->token_end &&
+          readiness(space).origin == cert.ready &&
+          readiness(space).durable == cert.durable);
+  ok(ps_open(path, 0, &options, &joined, &e), &e);
+  REQUIRE(!disk.syncs && readiness(joined).durable == cert.durable);
+  ok(ps_close(joined, &e), &e);
+  ok(ps_close(space, &e), &e);
+  space = NULL;
+
+  /* Model reuse of a volatile wire position at the same length. The
+   * recovered hint must never have promoted its position to durable. */
+  journal_fixture_number(wire + 20, PS_REMOVE, 4);
+  journal_fixture_number(wire + 48, 0, 8);
+  journal_fixture_number(wire + 60, crc32(0, wire, 60), 4);
+  fd = open(path, O_RDWR | O_CLOEXEC);
+  REQUIRE(fd >= 0 && pwrite(fd, wire, sizeof(wire), at) == sizeof(wire) &&
+          !close(fd));
+  REQUIRE(ps_open(path, 0, &options, &space, &e) == LC_ERR_TRANSPORT &&
+          !space && disk.syncs == 1);
+  lc_error_cleanup(&e);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(disk.syncs == 1);
+  ok(ps_catalog_get(space, 0, PS_CATALOG_NAMESPACE, "memo", 4, &view, &e), &e);
+  REQUIRE(!view);
+  ok(ps_close(space, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static void certified_prefix_reads(void) {
@@ -7967,6 +8124,64 @@ static void piece_barrier_handoff(int durable, int discard) {
   REQUIRE(!unlink(path));
   lc_error_cleanup(&e);
 }
+static void cold_open_stream_suffix(int join) {
+  reopen_disk disk = {0};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {.durable_sync = 1, .io = &io};
+  ps_space *space = NULL, *first_owner = NULL;
+  ps_stream *stream = NULL;
+  ps_stream_window *read = NULL;
+  stream_recovery recovery = {0};
+  ps_stream_info info;
+  char bytes[2];
+  lc_error e = {0};
+  ok(ps_open(path, 1, &options, &space, &e), &e);
+  ok(ps_stream_open(space, NULL, tail_stream(), 1, NULL, recover_stream,
+                    &recovery, &stream, &e),
+     &e);
+  append_byte(stream, 0, "a", &e);
+  ok(ps_stream_status(stream, &info, &e), &e);
+  ok(ps_checkpoint(space, &e), &e);
+  ps_key first = {info.ref.incarnation, 0, PS_OWNED_RUN};
+  ps_entry *run = ps_internal_lookup(space, first);
+  REQUIRE(info.tail == 1 && info.capacity > 1 && run && run->count == 1);
+  /* Model an appender dying after writing a complete record into its
+   * existing grant. Its next tail hint never reached the journal. */
+  off_t at = (off_t)(run->extents[0].offset + PS_RUN_HEADER + info.tail);
+  REQUIRE(pwrite(space->fd, "R", 1, at) == 1);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_close(space, &e), &e);
+  space = NULL;
+  stream = NULL;
+
+  disk = (reopen_disk){0, 1};
+  if (join)
+    ok(ps_open(path, 0, &options, &first_owner, &e), &e);
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(!disk.syncs);
+  REQUIRE(ps_stream_open(space, NULL, tail_stream(), 0, NULL, recover_stream,
+                         &recovery, &stream, &e) == LC_ERR_TRANSPORT &&
+          !stream && disk.syncs == 1);
+  lc_error_cleanup(&e);
+  ok(ps_close(space, &e), &e);
+  ok(ps_close(first_owner, &e), &e);
+  space = NULL;
+
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &space, &e), &e);
+  REQUIRE(!disk.syncs);
+  ok(ps_stream_open(space, NULL, tail_stream(), 0, NULL, recover_stream,
+                    &recovery, &stream, &e),
+     &e);
+  REQUIRE(disk.syncs == 1);
+  ok(ps_stream_window_open(stream, 0, sizeof(bytes), &read, &e), &e);
+  ok(ps_stream_window_read(read, 0, bytes, sizeof(bytes), &e), &e);
+  REQUIRE(!memcmp(bytes, "aR", sizeof(bytes)));
+  ps_stream_window_close(read);
+  ok(ps_stream_close(stream, &e), &e);
+  ok(ps_close(space, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void stream_abort_and_cold_open(void) {
   lc_error e = {0};
   ps_options options = {0};
@@ -8322,9 +8537,15 @@ int main(int argc, char **argv) {
     preparation_leaves_peer_headroom();
   } else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();
-  else if (!strcmp(argv[2], "reopen-cohort"))
-    reopen_cohort();
-  else if (!strcmp(argv[2], "readiness-faults"))
+  else if (!strcmp(argv[2], "reopen-cohort")) {
+    reopen_after_checkpoint();
+    reopen_cohort(0);
+    reopen_cohort(1);
+    cold_open_prior_durability();
+    cold_open_volatile_hint();
+    cold_open_stream_suffix(0);
+    cold_open_stream_suffix(1);
+  } else if (!strcmp(argv[2], "readiness-faults"))
     readiness_faults();
   else if (!strcmp(argv[2], "certified-prefix")) {
     certified_prefix_reads();

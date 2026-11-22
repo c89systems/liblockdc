@@ -331,12 +331,9 @@ static int stream_load(ps_stream *s, const ps_owned_status *status,
   if (rc == LC_OK)
     rc = stream_pieces(s, accepted, 2, 1, NULL, s->recovery_buffer, &repaired,
                        error);
-  /* Readers need only the validated prefix. Newly accepted bytes and repaired
-   * footers join readiness, even if the canonical tail stayed put. Rejected
-   * suffix repair waits for the first write admission. */
+  /* Rejected suffix repair waits for the first write admission. */
   if (rc == LC_OK && (accepted > s->tail || repaired))
-    rc = ps_owned_commit(s->head, accepted, PS_COMMIT_DEFER_SYNC, NULL, NULL,
-                         error);
+    rc = ps_owned_restore_tail(s->head, accepted, accepted > s->tail, error);
   if (rc == LC_OK) {
     s->tail = accepted;
     s->repair_pending = 1;

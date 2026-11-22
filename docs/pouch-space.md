@@ -41,6 +41,10 @@ durability barrier can be lost. Recovery checks framing, ownership, and commit
 boundaries before admitting complete canonical publication groups. Before
 admitting a cold namespace for writes, recovery checks for complete records past
 the selected stream tail and restores their outstanding capacity obligations.
+After validating the recovered prefix, the first owner can reuse proof from
+a previous durability barrier. Newly discovered stream records cross a
+barrier before the recovered tail becomes visible. Shared owners acquire an
+incarnation range when they first need a persistent identity.
 
 Private preparation reserves payload and descriptor capacity before spending it.
 Publication revalidates its logical authority. Producers run outside
