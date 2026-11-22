@@ -1,4 +1,5 @@
 #include "directory.h"
+#include "wire.h"
 
 #include <limits.h>
 #include <pthread.h>
@@ -751,8 +752,21 @@ static void packed_tree(void) {
   pager_close(&p);
   free(expected);
 }
+static void wire_fields(void) {
+  const unsigned char expected[] = {0xa5, 0x01, 0x23, 0x45, 0x67,
+                                    0x89, 0xab, 0xcd, 0xef, 0xa5,
+                                    0x98, 0xba, 0xdc, 0xfe, 0xa5};
+  unsigned char bytes[sizeof(expected)];
+  CHECK(ps_wire_get64(expected + 1) == UINT64_C(0xefcdab8967452301));
+  CHECK(ps_wire_get32(expected + 10) == UINT32_C(0xfedcba98));
+  memset(bytes, 0xa5, sizeof(bytes));
+  ps_wire_put64(bytes + 1, UINT64_C(0xefcdab8967452301));
+  ps_wire_put32(bytes + 10, UINT32_C(0xfedcba98));
+  CHECK(!memcmp(bytes, expected, sizeof(bytes)));
+}
 static void *default_stack_worker(void *unused) {
   (void)unused;
+  wire_fields();
   growth_and_copy_on_write();
   deletion_and_churn();
   failure_boundaries();

@@ -144,6 +144,9 @@ typedef struct ps_value_bucket {
   ps_entry *head;
   size_t count;
 } ps_value_bucket;
+typedef struct ps_entry_slabs {
+  struct ps_entry_allocation *available, *temporary;
+} ps_entry_slabs;
 #define PS_VALUE_GROUPS (2U + PS_NAMESPACE_CHECKPOINT - PS_KEY_METADATA)
 struct ps_space {
   /* fd is borrowed from coordination after successful lifetime admission. */
@@ -213,8 +216,8 @@ struct ps_space {
   size_t packed_pages;
   uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty;
-  struct ps_entry_allocation *entry_allocations, *entry_available;
-  struct ps_entry_allocation *entry_temporary;
+  struct ps_entry_allocation *entry_allocations;
+  ps_entry_slabs value_entries, stream_entries;
   /* A private checkpoint draft may point into the resident's entry slabs.
    * The resident mutex protects those entries through adoption or discard. */
   struct ps_space *projection_resident;

@@ -3,6 +3,7 @@
 #include "crc.h"
 #include "lc_api_internal.h"
 #include "owned.h"
+#include "wire.h"
 
 #include <string.h>
 #include <zlib.h>
@@ -64,27 +65,6 @@ struct ps_directory {
 
 static int directory_error(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-directory");
-}
-static void store64(unsigned char *p, uint64_t value) {
-  unsigned int i;
-  for (i = 0; i < 8; ++i)
-    p[i] = (unsigned char)(value >> (8U * i));
-}
-static uint64_t load64(const unsigned char *p) {
-  uint64_t value = 0;
-  unsigned int i;
-  for (i = 0; i < 8; ++i)
-    value |= (uint64_t)p[i] << (8U * i);
-  return value;
-}
-static void store32(unsigned char *p, uint32_t value) {
-  unsigned int i;
-  for (i = 0; i < 4; ++i)
-    p[i] = (unsigned char)(value >> (8U * i));
-}
-static uint32_t load32(const unsigned char *p) {
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8U | (uint32_t)p[2] << 16U |
-         (uint32_t)p[3] << 24U;
 }
 static uint32_t page_crc(const unsigned char *p) {
   return (uint32_t)ps_crc32(ps_crc32(0, p, 12), p + 16, PS_PAGE - 16);
@@ -173,35 +153,38 @@ static int read_page(ps_directory *d, ps_directory_root ref,
   int rc = d->io.read(d->io.context, ref.offset, page, error);
   if (rc != LC_OK)
     return rc;
-  if (load32(page) != DIRECTORY_MAGIC || load32(page + 4) > MAX_LEVEL ||
-      !load32(page + 8) || load32(page + 8) > LIMIT ||
-      load32(page + 12) != page_crc(page) ||
-      load64(page + 16) != ref.generation || load64(page + 24) != ref.offset ||
-      memcmp(page + 32, d->io.identity, 16) || load64(page + 48) ||
-      load64(page + 56))
+  if (ps_wire_get32(page) != DIRECTORY_MAGIC ||
+      ps_wire_get32(page + 4) > MAX_LEVEL || !ps_wire_get32(page + 8) ||
+      ps_wire_get32(page + 8) > LIMIT ||
+      ps_wire_get32(page + 12) != page_crc(page) ||
+      ps_wire_get64(page + 16) != ref.generation ||
+      ps_wire_get64(page + 24) != ref.offset ||
+      memcmp(page + 32, d->io.identity, 16) || ps_wire_get64(page + 48) ||
+      ps_wire_get64(page + 56))
     return directory_error(error, LC_ERR_PROTOCOL,
                            "invalid checkpoint directory page");
   return LC_OK;
 }
 static ps_key slot_key(const unsigned char *slot) {
   ps_key key;
-  key.owner = load64(slot + 8);
-  key.key = load64(slot + 16);
-  key.kind = load32(slot);
+  key.owner = ps_wire_get64(slot + 8);
+  key.key = ps_wire_get64(slot + 16);
+  key.kind = ps_wire_get32(slot);
   return key;
 }
 static int slot_child(const unsigned char *slot, ps_directory_root parent,
                       ps_directory_root *child) {
-  child->offset = load64(slot + 24);
-  child->generation = load64(slot + 32);
+  child->offset = ps_wire_get64(slot + 24);
+  child->generation = ps_wire_get64(slot + 32);
   return child->offset && valid_root(*child) &&
-         child->generation <= parent.generation && !load32(slot + 4) &&
-         !load64(slot + 40) && !load64(slot + 48) && !load64(slot + 56);
+         child->generation <= parent.generation && !ps_wire_get32(slot + 4) &&
+         !ps_wire_get64(slot + 40) && !ps_wire_get64(slot + 48) &&
+         !ps_wire_get64(slot + 56);
 }
 static int slot_value(const unsigned char *slot, ps_key key,
                       ps_directory_value *value) {
   size_t i;
-  uint32_t storage = load32(slot + 4);
+  uint32_t storage = ps_wire_get32(slot + 4);
   ps_directory_extent *extent = &value->extent;
   if (storage == PS_DIRECTORY_NAMESPACE) {
     if (slot[24] > PS_DIRECTORY_NAMESPACE_MAX)
@@ -215,23 +198,23 @@ static int slot_value(const unsigned char *slot, ps_key key,
   } else if (storage == PS_DIRECTORY_STREAM ||
              storage == PS_DIRECTORY_SEALED_STREAM) {
     ps_directory_stream *stream = &value->stream;
-    if (load32(slot + 52))
+    if (ps_wire_get32(slot + 52))
       return 0;
     stream->storage = storage;
-    stream->tail = load64(slot + 24);
-    stream->capacity = load64(slot + 32);
-    stream->incarnation = load64(slot + 40);
-    stream->runs = load32(slot + 48);
-    stream->admitted_at = load64(slot + 56);
+    stream->tail = ps_wire_get64(slot + 24);
+    stream->capacity = ps_wire_get64(slot + 32);
+    stream->incarnation = ps_wire_get64(slot + 40);
+    stream->runs = ps_wire_get32(slot + 48);
+    stream->admitted_at = ps_wire_get64(slot + 56);
   } else {
-    if (load32(slot + 52))
+    if (ps_wire_get32(slot + 52))
       return 0;
     extent->storage = storage;
-    extent->ref.offset = load64(slot + 24);
-    extent->ref.bytes = load64(slot + 32);
-    extent->ref.incarnation = load64(slot + 40);
-    extent->crc = load32(slot + 48);
-    extent->deletion_bytes = load64(slot + 56);
+    extent->ref.offset = ps_wire_get64(slot + 24);
+    extent->ref.bytes = ps_wire_get64(slot + 32);
+    extent->ref.incarnation = ps_wire_get64(slot + 40);
+    extent->crc = ps_wire_get32(slot + 48);
+    extent->deletion_bytes = ps_wire_get64(slot + 56);
   }
   return valid_value(key, value);
 }
@@ -250,13 +233,13 @@ static int read_node(ps_directory *d, ps_directory_root ref,
   rc = read_page(d, ref, page, error);
   if (rc != LC_OK)
     goto done;
-  node = new_node(d, load32(page + 4), error);
+  node = new_node(d, ps_wire_get32(page + 4), error);
   if (!node) {
     rc = LC_ERR_NOMEM;
     goto done;
   }
   node->original = ref;
-  node->count = load32(page + 8);
+  node->count = ps_wire_get32(page + 8);
   for (i = 0; i < node->count; ++i) {
     item = &node->items[i];
     slot = page + HEADER + SLOT * i;
@@ -713,8 +696,8 @@ static int scan_page(ps_directory *d, ps_directory_root ref,
   int rc = read_page(d, ref, page, error);
   if (rc != LC_OK)
     return rc;
-  level = load32(page + 4);
-  count = load32(page + 8);
+  level = ps_wire_get32(page + 4);
+  count = ps_wire_get32(page + 8);
   if (parent_level) {
     if (count < MINIMUM || level + 1 != parent_level ||
         ps_directory_key_compare(slot_key(page + HEADER), lower) ||
@@ -828,24 +811,24 @@ static int write_node(ps_directory *d, directory_node *node,
     return directory_error(error, LC_ERR_PROTOCOL,
                            "directory allocator returned an unaligned page");
   memset(page, 0, PS_PAGE);
-  store32(page, DIRECTORY_MAGIC);
-  store32(page + 4, node->level);
-  store32(page + 8, node->count);
-  store64(page + 16, generation);
-  store64(page + 24, offset);
+  ps_wire_put32(page, DIRECTORY_MAGIC);
+  ps_wire_put32(page + 4, node->level);
+  ps_wire_put32(page + 8, node->count);
+  ps_wire_put64(page + 16, generation);
+  ps_wire_put64(page + 24, offset);
   memcpy(page + 32, d->io.identity, 16);
   for (i = 0; i < node->count; ++i) {
     item = &node->items[i];
     slot = page + HEADER + SLOT * i;
-    store32(slot, item->key.kind);
-    store64(slot + 8, item->key.owner);
-    store64(slot + 16, item->key.key);
+    ps_wire_put32(slot, item->key.kind);
+    ps_wire_put64(slot + 8, item->key.owner);
+    ps_wire_put64(slot + 16, item->key.key);
     if (node->level) {
-      store64(slot + 24, item->binding.child.ref.offset);
-      store64(slot + 32, item->binding.child.ref.generation);
+      ps_wire_put64(slot + 24, item->binding.child.ref.offset);
+      ps_wire_put64(slot + 32, item->binding.child.ref.generation);
     } else {
       value = &item->binding.value;
-      store32(slot + 4, value->tag.storage);
+      ps_wire_put32(slot + 4, value->tag.storage);
       if (value->tag.storage == PS_DIRECTORY_NAMESPACE) {
         const ps_directory_name *name = &value->name;
         slot[24] = name->length;
@@ -853,22 +836,22 @@ static int write_node(ps_directory *d, directory_node *node,
       } else if (value->tag.storage == PS_DIRECTORY_STREAM ||
                  value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
         const ps_directory_stream *stream = &value->stream;
-        store64(slot + 24, stream->tail);
-        store64(slot + 32, stream->capacity);
-        store64(slot + 40, stream->incarnation);
-        store32(slot + 48, stream->runs);
-        store64(slot + 56, stream->admitted_at);
+        ps_wire_put64(slot + 24, stream->tail);
+        ps_wire_put64(slot + 32, stream->capacity);
+        ps_wire_put64(slot + 40, stream->incarnation);
+        ps_wire_put32(slot + 48, stream->runs);
+        ps_wire_put64(slot + 56, stream->admitted_at);
       } else {
         const ps_directory_extent *extent = &value->extent;
-        store64(slot + 24, extent->ref.offset);
-        store64(slot + 32, extent->ref.bytes);
-        store64(slot + 40, extent->ref.incarnation);
-        store32(slot + 48, extent->crc);
-        store64(slot + 56, extent->deletion_bytes);
+        ps_wire_put64(slot + 24, extent->ref.offset);
+        ps_wire_put64(slot + 32, extent->ref.bytes);
+        ps_wire_put64(slot + 40, extent->ref.incarnation);
+        ps_wire_put32(slot + 48, extent->crc);
+        ps_wire_put64(slot + 56, extent->deletion_bytes);
       }
     }
   }
-  store32(page + 12, page_crc(page));
+  ps_wire_put32(page + 12, page_crc(page));
   return d->io.write(d->io.context, offset, page, error);
 }
 int ps_directory_flush(ps_directory *d, uint64_t generation,

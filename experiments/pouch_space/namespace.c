@@ -6,6 +6,7 @@
 #include "record_io.h"
 #include "root_internal.h"
 #include "space_internal.h"
+#include "wire.h"
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
@@ -69,20 +70,6 @@ static int failure(lc_error *e, int rc, const char *message) {
 static int checkpoint_ready(struct ps_namespace_data *, lc_error *);
 static int lock_current(struct ps_namespace_data *, int *, lc_error *);
 static void unlock_current(struct ps_namespace_data *, int);
-static void put64(unsigned char *p, uint64_t value) {
-  size_t i;
-  for (i = 0; i < 8; ++i) {
-    p[i] = (unsigned char)value;
-    value >>= 8;
-  }
-}
-static uint64_t get64(const unsigned char *p) {
-  uint64_t value = 0;
-  size_t i;
-  for (i = 0; i < 8; ++i)
-    value |= (uint64_t)p[i] << (i * 8);
-  return value;
-}
 static ps_key head_key(uint64_t owner) {
   ps_key key = {0, 1, PS_ROUTING};
   key.owner = owner;
@@ -91,16 +78,17 @@ static ps_key head_key(uint64_t owner) {
 static int decode_head(uint64_t owner, const unsigned char *bytes,
                        uint64_t *active, lc_error *e) {
   size_t i;
-  if (memcmp(bytes, "LCPSNSHD", 8) || get64(bytes + 8) != owner ||
-      !get64(bytes + 16) || get64(bytes + 24) != get64(bytes + 16) ||
-      get64(bytes + 32) != LC_POUCH_RECORD_HEADER_BYTES ||
-      get64(bytes + 120) != (uint64_t)crc32(0L, bytes, 120))
+  if (memcmp(bytes, "LCPSNSHD", 8) || ps_wire_get64(bytes + 8) != owner ||
+      !ps_wire_get64(bytes + 16) ||
+      ps_wire_get64(bytes + 24) != ps_wire_get64(bytes + 16) ||
+      ps_wire_get64(bytes + 32) != LC_POUCH_RECORD_HEADER_BYTES ||
+      ps_wire_get64(bytes + 120) != (uint64_t)crc32(0L, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "namespace head identity or checksum is invalid");
   for (i = 40; i < 120; ++i)
     if (bytes[i])
       return failure(e, LC_ERR_PROTOCOL, "namespace head has unknown fields");
-  *active = get64(bytes + 16);
+  *active = ps_wire_get64(bytes + 16);
   return LC_OK;
 }
 static int head_read(struct ps_namespace_data *d, lc_error *e) {
@@ -139,11 +127,11 @@ static int head_write(struct ps_namespace_data *d, ps_budget *budget,
   int rc;
   memset(bytes, 0, sizeof(bytes));
   memcpy(bytes, "LCPSNSHD", 8);
-  put64(bytes + 8, d->ns->identity.owner);
-  put64(bytes + 16, active);
-  put64(bytes + 24, active);
-  put64(bytes + 32, LC_POUCH_RECORD_HEADER_BYTES);
-  put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
+  ps_wire_put64(bytes + 8, d->ns->identity.owner);
+  ps_wire_put64(bytes + 16, active);
+  ps_wire_put64(bytes + 24, active);
+  ps_wire_put64(bytes + 32, LC_POUCH_RECORD_HEADER_BYTES);
+  ps_wire_put64(bytes + 120, (uint64_t)crc32(0L, bytes, 120));
   rc = ps_begin(d->ns->root->space, budget, head_key(d->ns->identity.owner),
                 &writer, e);
   if (rc == LC_OK)

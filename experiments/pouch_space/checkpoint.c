@@ -8,6 +8,7 @@
 #include "revision.h"
 #include "root_internal.h"
 #include "space_internal.h"
+#include "wire.h"
 #include <pthread.h>
 #include <string.h>
 #include <zlib.h>
@@ -544,18 +545,6 @@ static void release_prepared_source(ps_key_checkpoint *c,
     --source->prepared;
   release_source(c, source);
 }
-static void put64(unsigned char *p, uint64_t value) {
-  unsigned int i;
-  for (i = 0; i < 8; ++i)
-    p[i] = (unsigned char)(value >> (i * 8));
-}
-static uint64_t get64(const unsigned char *p) {
-  uint64_t value = 0;
-  unsigned int i;
-  for (i = 0; i < 8; ++i)
-    value |= (uint64_t)p[i] << (i * 8);
-  return value;
-}
 static ps_key control_key(ps_namespace *ns) {
   ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
   key.owner = ns->identity.owner;
@@ -565,9 +554,10 @@ static int decode_control(uint64_t owner, const unsigned char *bytes,
                           uint64_t token, ps_checkpoint_info *out,
                           lc_error *e) {
   size_t i;
-  if (memcmp(bytes, "LCPSCKPT", 8) || get64(bytes + 8) != owner ||
-      !get64(bytes + 16) || (!get64(bytes + 24) && get64(bytes + 32)) ||
-      get64(bytes + 120) != (uint64_t)crc32(0, bytes, 120))
+  if (memcmp(bytes, "LCPSCKPT", 8) || ps_wire_get64(bytes + 8) != owner ||
+      !ps_wire_get64(bytes + 16) ||
+      (!ps_wire_get64(bytes + 24) && ps_wire_get64(bytes + 32)) ||
+      ps_wire_get64(bytes + 120) != (uint64_t)crc32(0, bytes, 120))
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage identity is invalid");
   for (i = 56; i < 120; ++i)
@@ -576,11 +566,11 @@ static int decode_control(uint64_t owner, const unsigned char *bytes,
                      "checkpoint coverage has unknown fields");
   memset(out, 0, sizeof(*out));
   out->control = token;
-  out->epoch = get64(bytes + 16);
-  out->segment = get64(bytes + 24);
-  out->offset = get64(bytes + 32);
-  out->state_index = get64(bytes + 40);
-  out->query_index = get64(bytes + 48);
+  out->epoch = ps_wire_get64(bytes + 16);
+  out->segment = ps_wire_get64(bytes + 24);
+  out->offset = ps_wire_get64(bytes + 32);
+  out->state_index = ps_wire_get64(bytes + 40);
+  out->query_index = ps_wire_get64(bytes + 48);
   if (out->query_index > out->state_index)
     return failure(e, LC_ERR_PROTOCOL,
                    "checkpoint query boundary exceeds state");
@@ -2025,13 +2015,13 @@ static int write_control_values(ps_key_checkpoint *c, ps_budget *budget,
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES] = {0};
   int rc;
   memcpy(bytes, "LCPSCKPT", 8);
-  put64(bytes + 8, c->ns->identity.owner);
-  put64(bytes + 16, info->epoch);
-  put64(bytes + 24, info->segment);
-  put64(bytes + 32, info->offset);
-  put64(bytes + 40, info->state_index);
-  put64(bytes + 48, info->query_index);
-  put64(bytes + 120, (uint64_t)crc32(0, bytes, 120));
+  ps_wire_put64(bytes + 8, c->ns->identity.owner);
+  ps_wire_put64(bytes + 16, info->epoch);
+  ps_wire_put64(bytes + 24, info->segment);
+  ps_wire_put64(bytes + 32, info->offset);
+  ps_wire_put64(bytes + 40, info->state_index);
+  ps_wire_put64(bytes + 48, info->query_index);
+  ps_wire_put64(bytes + 120, (uint64_t)crc32(0, bytes, 120));
   rc = ps_begin(c->ns->root->space, budget, control_key(c->ns), out, e);
   if (rc == LC_OK)
     rc = ps_write(*out, bytes, sizeof(bytes), e);

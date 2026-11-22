@@ -7115,13 +7115,25 @@ static void owned_stream_cold(void) {
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
   ps_owned_head *owner = NULL, *observer = NULL;
-  ps_owned_run *run = NULL;
+  ps_owned_run *run = NULL, *last = NULL;
   ps_owned_status info;
+  uint64_t base, last_base = 0;
+  unsigned char zero = 1;
   int found;
   ok(ps_open(path, 1, NULL, &a, &e), &e);
   ok(ps_owned_open(a, NULL, tail_stream(), 1, NULL, &owner, &info, &e), &e);
   ok(ps_owned_grant(owner, NULL, 0, PS_PAGE, &run, &found, &e), &e);
   REQUIRE(found);
+  base = ps_owned_run_capacity(run);
+  /* Populate multiple slabs of inline grants and keep a handle in the
+   * later slab while the joiner installs a replacement checkpoint. */
+  for (size_t i = 0; i < 40; ++i) {
+    last_base = base;
+    ok(ps_owned_grant(owner, NULL, base, PS_PAGE, &last, &found, &e), &e);
+    REQUIRE(found);
+    base += ps_owned_run_capacity(last);
+    ps_owned_run_close(last);
+  }
   ok(ps_checkpoint(a, &e), &e);
   ok(ps_owned_write(run, 0, "abc", 3, &e), &e);
   ok(ps_owned_commit(owner, 3, PS_COMMIT_DEFAULT, NULL, NULL, &e), &e);
@@ -7132,6 +7144,7 @@ static void owned_stream_cold(void) {
   ok(ps_close(a, &e), &e);
   ok(ps_open(path, 0, NULL, &a, &e), &e);
   ok(ps_owned_open(a, NULL, tail_stream(), 0, NULL, &owner, &info, &e), &e);
+  REQUIRE(info.runs == 41 && info.capacity == base);
   expect_tail(owner, 0, 0);
   expect_value(a, key(11), 65, 11);
   ok(ps_owned_grant(owner, NULL, 0, 0, &run, &found, &e), &e);
@@ -7141,9 +7154,17 @@ static void owned_stream_cold(void) {
   ok(ps_owned_recovered(owner, 1, &e), &e);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
   ok(ps_owned_open(b, NULL, tail_stream(), 0, NULL, &observer, &info, &e), &e);
+  REQUIRE(info.runs == 41 && info.capacity == base);
+  ok(ps_owned_grant(observer, NULL, last_base, 0, &last, &found, &e), &e);
+  REQUIRE(found);
+  ok(ps_checkpoint(a, &e), &e);
+  ok(ps_refresh(b, &e), &e);
+  ok(ps_owned_read(last, 0, &zero, 1, &e), &e);
+  REQUIRE(!zero);
   expect_tail(observer, 1, 0);
   expect_value(b, key(11), 65, 11);
   ps_owned_run_close(run);
+  ps_owned_run_close(last);
   ps_owned_close(owner);
   ps_owned_close(observer);
   ok(ps_close(b, &e), &e);

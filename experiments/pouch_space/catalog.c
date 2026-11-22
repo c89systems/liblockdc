@@ -1,6 +1,7 @@
 #include "catalog.h"
 #include "lc_api_internal.h"
 #include "space_internal.h"
+#include "wire.h"
 #include <string.h>
 
 struct ps_catalog_view {
@@ -9,27 +10,6 @@ struct ps_catalog_view {
 };
 static int cat_error(lc_error *e, int rc, const char *message) {
   return lc_error_set(e, rc, 0, message, NULL, NULL, "pouch-catalog");
-}
-static uint64_t read64(const unsigned char *p) {
-  uint64_t n = 0;
-  size_t i;
-  for (i = 0; i < 8; ++i)
-    n |= (uint64_t)p[i] << (i * 8);
-  return n;
-}
-static uint32_t read32(const unsigned char *p) {
-  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 |
-         (uint32_t)p[3] << 24;
-}
-static void write64(unsigned char *p, uint64_t n) {
-  size_t i;
-  for (i = 0; i < 8; ++i)
-    p[i] = (unsigned char)(n >> (i * 8));
-}
-static void write32(unsigned char *p, uint32_t n) {
-  size_t i;
-  for (i = 0; i < 4; ++i)
-    p[i] = (unsigned char)(n >> (i * 8));
 }
 static int arguments(unsigned int kind, const void *name, size_t length) {
   return kind <= PS_CATALOG_MARKER && (name || !length) &&
@@ -160,13 +140,13 @@ size_t ps_catalog_record_bytes(const ps_entry *p) {
 }
 void ps_catalog_encode_record(unsigned char *wire, const ps_entry *p) {
   const ps_catalog_record *r = p->catalog;
-  write32(wire + 64, r->kind);
-  write32(wire + 68, (uint32_t)r->length);
-  write32(wire + 72, r->stream.kind);
-  write32(wire + 76, (uint32_t)r->value_length);
-  write64(wire + 80, r->stream.owner);
-  write64(wire + 88, r->stream.key);
-  write64(wire + 96, r->token);
+  ps_wire_put32(wire + 64, r->kind);
+  ps_wire_put32(wire + 68, (uint32_t)r->length);
+  ps_wire_put32(wire + 72, r->stream.kind);
+  ps_wire_put32(wire + 76, (uint32_t)r->value_length);
+  ps_wire_put64(wire + 80, r->stream.owner);
+  ps_wire_put64(wire + 88, r->stream.key);
+  ps_wire_put64(wire + 96, r->token);
   if (r->length)
     memcpy(wire + 104, r->name, r->length);
   if (r->value_length)
@@ -179,33 +159,33 @@ int ps_catalog_decode_record(ps_entry *p, const unsigned char *wire,
   int rc;
   if (bytes < 104)
     return cat_error(e, LC_ERR_PROTOCOL, "truncated catalog record");
-  length = read32(wire + 68);
-  value_length = read32(wire + 76);
-  kind = read32(wire + 64);
-  stream_kind = read32(wire + 72);
+  length = ps_wire_get32(wire + 68);
+  value_length = ps_wire_get32(wire + 76);
+  kind = ps_wire_get32(wire + 64);
+  stream_kind = ps_wire_get32(wire + 72);
   if (!arguments(kind, wire + 104, length) || length > bytes - 104 ||
       value_length != bytes - 104 - length)
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog record");
   if (kind == PS_CATALOG_MARKER) {
     if (!p->key.owner || !length || value_length > PS_CATALOG_MARKER_MAX ||
-        stream_kind || read64(wire + 80) || read64(wire + 88) ||
-        read64(wire + 96))
+        stream_kind || ps_wire_get64(wire + 80) || ps_wire_get64(wire + 88) ||
+        ps_wire_get64(wire + 96))
       return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog marker record");
   } else if (value_length ||
              (stream_kind == PS_STREAM
-                  ? !read64(wire + 96)
+                  ? !ps_wire_get64(wire + 96)
                   : stream_kind || kind != PS_CATALOG_NAMESPACE ||
                         p->key.owner || p->token != p->key.key ||
-                        read64(wire + 80) || read64(wire + 88) ||
-                        read64(wire + 96)))
+                        ps_wire_get64(wire + 80) || ps_wire_get64(wire + 88) ||
+                        ps_wire_get64(wire + 96)))
     return cat_error(e, LC_ERR_PROTOCOL, "invalid catalog target record");
   rc = attach_record(p, kind, wire + 104, length, wire + 104 + length,
                      value_length, e);
   if (rc == LC_OK) {
-    p->catalog->stream.kind = read32(wire + 72);
-    p->catalog->stream.owner = read64(wire + 80);
-    p->catalog->stream.key = read64(wire + 88);
-    p->catalog->token = read64(wire + 96);
+    p->catalog->stream.kind = ps_wire_get32(wire + 72);
+    p->catalog->stream.owner = ps_wire_get64(wire + 80);
+    p->catalog->stream.key = ps_wire_get64(wire + 88);
+    p->catalog->token = ps_wire_get64(wire + 96);
   }
   return rc;
 }
