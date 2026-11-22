@@ -717,7 +717,7 @@ static int select_projection_locked(struct ps_namespace_data *d,
   *found = 0;
   rc = ps_internal_fixed_value(s, head_key(ns->identity.owner), prefix,
                                memo_only ? NULL : head, sizeof(head),
-                               d->observed_head, &token, &current, e);
+                               d->observed_head, &token, &current, NULL, e);
   if (rc != LC_OK || !current)
     return rc;
   if (!token) {
@@ -743,7 +743,7 @@ static int select_projection_locked(struct ps_namespace_data *d,
   }
   if (*found && !observed->window) {
     rc = ps_checkpoint_point(s, ns->identity.owner, prefix, memo_only,
-                             &d->observed_coverage, found, e);
+                             &d->observed_coverage, found, NULL, e);
     *coverage = d->observed_coverage;
   }
   if (rc != LC_OK || !*found)
@@ -2119,30 +2119,26 @@ int ps_namespace_checkpoint_recover(ps_namespace *ns, lc_error *e) {
     ps_ns_leave(d);
   return rc;
 }
-int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
-                                  lc_error *e) {
-  ps_coordination_guard *guard;
+int ps_namespace_admission_proven_locked(ps_space *s, uint64_t owner,
+                                         uint64_t prefix, int *proven,
+                                         int *private_failure, lc_error *e) {
   ps_checkpoint_info coverage = {0};
   ps_catalog_info binding;
   ps_key stream = {0, 0, PS_STREAM};
   unsigned char head[NS_HEAD_BYTES];
   char leaf[PS_NS_LEAF_BYTES];
-  uint64_t prefix, token, tail;
-  int current = 0, rc;
+  uint64_t token, tail;
+  int current = 0, rc = LC_OK;
   *proven = 0;
-  if (!ps_readiness_joined(s))
-    return LC_OK;
   stream.owner = owner;
-  pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, e);
-  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  if (rc == LC_OK && !ps_ns_retention_recovery_needed(s, owner))
+  if (!ps_ns_retention_recovery_needed(s, owner))
     rc = ps_internal_fixed_value(s, head_key(owner), prefix, head, sizeof(head),
-                                 0, &token, &current, e);
+                                 0, &token, &current, private_failure, e);
   if (rc == LC_OK && current && token)
     rc = decode_head(owner, head, &stream.key, e);
   if (rc == LC_OK && current)
-    rc = ps_checkpoint_point(s, owner, prefix, 0, &coverage, &current, e);
+    rc = ps_checkpoint_point(s, owner, prefix, 0, &coverage, &current,
+                             private_failure, e);
   if (rc == LC_OK && current && coverage.segment > stream.key)
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint coverage exceeds namespace head");
@@ -2151,6 +2147,23 @@ int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
               (active_binding(s, stream, prefix, leaf, &binding) &&
                ps_internal_admitted_tail(s, stream, &binding.target, &tail) &&
                coverage.offset == tail);
+  return rc;
+}
+int ps_namespace_admission_proven(ps_space *s, uint64_t owner, int *proven,
+                                  lc_error *e) {
+  ps_coordination_guard *guard;
+  uint64_t prefix;
+  int rc;
+  *proven = 0;
+  if (!ps_readiness_joined(s))
+    return LC_OK;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, e);
+  if (rc == LC_OK) {
+    prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+    rc =
+        ps_namespace_admission_proven_locked(s, owner, prefix, proven, NULL, e);
+  }
   rc = ps_internal_capture_end(s, guard, rc, e);
   pthread_mutex_unlock(&s->mutex);
   return rc;

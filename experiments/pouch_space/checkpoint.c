@@ -595,7 +595,7 @@ static int read_control(ps_namespace *ns, ps_reader *reader,
 }
 int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
                         int memo_only, ps_checkpoint_info *out, int *current,
-                        lc_error *e) {
+                        int *private_failure, lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
   ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
   uint64_t token;
@@ -603,7 +603,8 @@ int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
   int rc;
   key.owner = owner;
   rc = ps_internal_fixed_value(s, key, prefix, memo_only ? NULL : bytes,
-                               sizeof(bytes), out->control, &token, current, e);
+                               sizeof(bytes), out->control, &token, current,
+                               private_failure, e);
   if (rc == LC_OK && *current && token != out->control) {
     memset(&decoded, 0, sizeof(decoded));
     if (token)

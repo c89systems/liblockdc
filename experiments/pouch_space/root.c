@@ -43,16 +43,64 @@ static int namespace_binding(const ps_catalog_info *binding, lc_error *error) {
         "pouch namespace binding is not an immutable metadata owner");
   return LC_OK;
 }
+static int namespace_catalog_binding(const void *name, size_t length,
+                                     const ps_catalog_info *binding,
+                                     lc_error *error) {
+  if (!length || memchr(name, 0, length))
+    return failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
+                   "namespace catalog contains invalid name");
+  return namespace_binding(binding, error);
+}
+typedef struct namespace_admission {
+  ps_space *space;
+  uint64_t prefix;
+  int private_failure;
+} namespace_admission;
+static int check_namespace(void *context, const void *name, size_t length,
+                           const ps_catalog_info *binding, lc_error *error) {
+  namespace_admission *admission = context;
+  int proven = 0;
+  int rc = namespace_catalog_binding(name, length, binding, error);
+  if (rc == LC_OK)
+    rc = ps_namespace_admission_proven_locked(
+        admission->space, binding->id, admission->prefix, &proven,
+        &admission->private_failure, error);
+  return rc == LC_OK && !proven ? LC_ERR_PENDING : rc;
+}
+static int check_namespaces(ps_space *space, int *proven, lc_error *error) {
+  namespace_admission admission = {0};
+  int rc;
+  *proven = 0;
+  if (!ps_readiness_joined(space))
+    return LC_OK;
+  pthread_mutex_lock(&space->mutex);
+  rc = ps_internal_healthy(space, error);
+  if (rc == LC_OK && ps_readiness_resident(space)) {
+    admission.space = space;
+    admission.prefix =
+        __atomic_load_n(&space->durable_sequence, __ATOMIC_ACQUIRE);
+    rc = ps_internal_catalog_visit_locked(space, 0, PS_CATALOG_NAMESPACE,
+                                          admission.prefix, check_namespace,
+                                          &admission, error);
+    /* A peer can advance the root and reuse control bytes during the pass.
+     * A changed prefix or uncovered namespace calls for ordinary recovery. */
+    if (rc == LC_ERR_PENDING ||
+        !ps_internal_resident_read_valid(space, admission.private_failure)) {
+      lc_error_cleanup(error);
+      rc = LC_OK;
+    } else
+      *proven = rc == LC_OK;
+  }
+  pthread_mutex_unlock(&space->mutex);
+  return rc;
+}
 static int recover_namespace(void *context, const void *name, size_t length,
                              const ps_catalog_info *binding, lc_error *error) {
   ps_root *root = context;
   ps_namespace *ns = NULL;
   char *text;
   int proven = 0, rc;
-  if (!length || memchr(name, 0, length))
-    return failure(error, LC_ERR_PROTOCOL, "pouch_namespace_corrupt",
-                   "namespace catalog contains invalid name");
-  rc = namespace_binding(binding, error);
+  rc = namespace_catalog_binding(name, length, binding, error);
   if (rc == LC_OK)
     rc =
         ps_namespace_admission_proven(root->space, binding->id, &proven, error);
@@ -192,7 +240,7 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
   ps_root_options defaults = {0};
   ps_root *root;
   char *key_file = NULL;
-  int rc, shared = 0;
+  int rc, proven, shared = 0;
   if (out)
     *out = NULL;
   if (!path || !*path || !out)
@@ -230,8 +278,10 @@ int ps_root_open(const char *path, int create, const ps_root_options *options,
     rc = ps_root_conversion_run(root, path, options, error);
   if (rc == LC_OK && !create) {
     root->recovering_namespaces = 1;
-    rc = ps_catalog_visit(root->space, 0, PS_CATALOG_NAMESPACE,
-                          recover_namespace, root, error);
+    rc = check_namespaces(root->space, &proven, error);
+    if (rc == LC_OK && !proven)
+      rc = ps_catalog_visit(root->space, 0, PS_CATALOG_NAMESPACE,
+                            recover_namespace, root, error);
     root->recovering_namespaces = 0;
   }
   if (rc == LC_OK && !create && !shared)

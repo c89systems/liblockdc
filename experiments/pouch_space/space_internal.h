@@ -295,6 +295,8 @@ int ps_internal_values_capture_locked(ps_space *, uint64_t owner,
                                       ps_value_retain_fn, void *, ps_values **,
                                       lc_error *);
 int ps_internal_read_witness_valid(ps_space *);
+/* Commit the result of a short read only against its unchanged prefix. */
+int ps_internal_resident_read_valid(ps_space *, int private_failure);
 /* Only on an unpublished root while building disposable checkpoint metadata.
  * The callback runs under the local space mutex with a borrowed reader. It
  * must only build private state, which the caller discards if accepted is 0.
@@ -323,15 +325,20 @@ int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
 /* Select at the caller's sampled prefix. A deferred replacement requires
  * the namespace owner to resolve visibility. An already decoded incarnation
  * leaves the buffer alone. NULL requests a memo-only observation and reports
- * a changed incarnation as noncurrent. Reading a buffer requires a capture.
+ * a changed incarnation as noncurrent. Read under a capture or keep I/O
+ * failure private and recheck the resident prefix before using the result.
  */
 int ps_internal_fixed_value(ps_space *, ps_key, uint64_t prefix, void *, size_t,
                             uint64_t known, uint64_t *incarnation, int *current,
-                            lc_error *);
+                            int *private_failure, lc_error *);
 /* Scalar catalog and stream observations share the caller's capture. */
 int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
                              const void *, size_t, uint64_t prefix,
                              ps_catalog_info *);
+/* The callback borrows metadata under the local mutex and must not reenter. */
+int ps_internal_catalog_visit_locked(ps_space *, uint64_t owner,
+                                     unsigned int kind, uint64_t prefix,
+                                     ps_catalog_visit_fn, void *, lc_error *);
 int ps_internal_complete_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
 int ps_internal_admitted_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
 /* A namespace owner verified this exact active tail under mutation authority.

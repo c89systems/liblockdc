@@ -312,6 +312,23 @@ int ps_internal_catalog_find(ps_space *s, uint64_t owner, unsigned int kind,
   information(s, p, out);
   return 1;
 }
+int ps_internal_catalog_visit_locked(ps_space *s, uint64_t owner,
+                                     unsigned int kind, uint64_t prefix,
+                                     ps_catalog_visit_fn callback,
+                                     void *context, lc_error *e) {
+  ps_entry *p, *v;
+  ps_catalog_info info;
+  size_t i;
+  int rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < s->catalogs.capacity; ++i)
+    for (p = s->catalogs.buckets[i]; rc == LC_OK && p; p = p->catalog->next)
+      if (p->key.owner == owner && p->catalog->kind == kind &&
+          (v = visible(p, prefix, s->peer_durable)) != NULL) {
+        information(s, v, &info);
+        rc = callback(context, v->catalog->name, v->catalog->length, &info, e);
+      }
+  return rc;
+}
 int ps_catalog_allocate_id(ps_space *s, uint64_t *out, lc_error *e) {
   int rc;
   if (out)

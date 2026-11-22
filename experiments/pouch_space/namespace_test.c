@@ -2610,6 +2610,124 @@ static void shared_startup_checkpoint(const char *path, int durable) {
   ok(ps_root_close(root, &e), &e);
   REQUIRE(!unlink(path));
 }
+enum join_admission_fault {
+  JOIN_NO_FAULT,
+  JOIN_READ_ERROR,
+  JOIN_JOURNAL_RACE,
+  JOIN_CHECKPOINT_RACE
+};
+typedef struct join_admission_probe {
+  ps_root *peer;
+  ps_namespace *writer;
+  uint64_t offsets[2];
+  size_t sizes[2];
+  enum join_admission_fault fault;
+  unsigned int seen;
+  int allocator, captured_reads, injected;
+} join_admission_probe;
+static int join_admission_lock(void *context, int fd, int command,
+                               struct flock *lock) {
+  join_admission_probe *probe = context;
+  int rc = fcntl(fd, command, lock);
+  if (!rc && lock->l_start == 4) {
+    if (command == F_OFD_SETLKW && lock->l_type == F_WRLCK)
+      probe->allocator = 1;
+    else if (command == F_OFD_SETLK && lock->l_type == F_UNLCK)
+      probe->allocator = 0;
+  }
+  return rc;
+}
+static ssize_t join_admission_read(void *context, int fd, void *bytes, size_t n,
+                                   off_t offset) {
+  join_admission_probe *probe = context;
+  for (size_t i = 0; i < 2; ++i) {
+    if ((uint64_t)offset != probe->offsets[i] || n != probe->sizes[i])
+      continue;
+    if (probe->allocator) {
+      ++probe->captured_reads;
+      break;
+    }
+    probe->seen |= 1U << i;
+    if (probe->fault && !probe->injected) {
+      lc_error e = {0};
+      probe->injected = 1;
+      if (probe->fault == JOIN_JOURNAL_RACE)
+        ok(append(probe->peer, probe->writer, 2, 0, 65, &e), &e);
+      else if (probe->fault == JOIN_CHECKPOINT_RACE)
+        ok(ps_metadata_repack(ps_root_space(probe->peer), &e), &e);
+      clear(&e);
+      errno = EIO;
+      return -1;
+    }
+    break;
+  }
+  return pread(fd, bytes, n, offset);
+}
+static void shared_join_admission(const char *path, int durable,
+                                  enum join_admission_fault fault) {
+  const char *names[] = {"first", "second"};
+  lc_error e = {0};
+  ps_root *joiner = NULL;
+  ps_namespace *writers[2];
+  ps_root_options options = {0};
+  join_admission_probe probe = {.fault = fault};
+  ps_coordination_io locks = {&probe, join_admission_lock};
+  ps_io io = {&probe,      join_admission_read, direct_write,
+              direct_sync, direct_reserve,      NULL};
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  ok(ps_root_open(path, 1, &options, &probe.peer, &e), &e);
+  ps_space *space = ps_root_space(probe.peer);
+  for (size_t i = 0; i < 2; ++i) {
+    ps_namespace_info identity;
+    ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
+    writers[i] = acquire(probe.peer, names[i], 1, &e);
+    ok(append(probe.peer, writers[i], 1, 0, 64, &e), &e);
+    ok(ps_namespace_checkpoint_flush(writers[i], &e), &e);
+    ok(ps_namespace_identity(writers[i], &identity, &e), &e);
+    key.owner = identity.owner;
+    const ps_entry *p = ps_internal_lookup(space, key);
+    REQUIRE(p && p->count == 1);
+    probe.offsets[i] = p->extents[0].offset;
+    probe.sizes[i] = (size_t)p->bytes;
+  }
+  probe.writer = writers[0];
+  uint64_t generation = space->generation;
+  options.storage.io = &io;
+  options.storage.coordination_io = &locks;
+  int rc = ps_root_open(path, 0, &options, &joiner, &e);
+  if (fault == JOIN_READ_ERROR) {
+    REQUIRE(rc == LC_ERR_TRANSPORT && !joiner && probe.injected);
+    clear(&e);
+  } else {
+    ok(rc, &e);
+    if (fault == JOIN_NO_FAULT)
+      REQUIRE(probe.seen == 3U && !probe.captured_reads);
+    else {
+      REQUIRE(probe.injected && probe.seen);
+      if (fault == JOIN_JOURNAL_RACE)
+        REQUIRE(space->generation == generation);
+      else
+        REQUIRE(ps_root_space(joiner)->generation > generation);
+    }
+    for (size_t i = 0; i < 2; ++i) {
+      ps_namespace_view *view = NULL;
+      shared_records recovered = {0};
+      size_t expected = i == 0 && fault == JOIN_JOURNAL_RACE ? 2 : 1;
+      ps_namespace *ns = acquire(joiner, names[i], 0, &e);
+      ok(ps_namespace_view_open(ns, &view, &e), &e);
+      ok(ps_namespace_view_visit(view, 1, visit_shared, &recovered, &e), &e);
+      REQUIRE(recovered.keys == expected && recovered.version == expected);
+      ps_namespace_view_close(view);
+      ps_namespace_release(ns);
+    }
+    ok(ps_root_close(joiner, &e), &e);
+  }
+  ps_namespace_release(writers[1]);
+  ps_namespace_release(writers[0]);
+  ok(ps_root_close(probe.peer, &e), &e);
+  REQUIRE(!unlink(path));
+}
 typedef struct projection_probe {
   ps_root *peer_root;
   ps_namespace *peer;
@@ -3467,6 +3585,9 @@ static void *worker(void *p) {
     shared_projection_capture(r->path, 1);
     shared_startup_checkpoint(r->path, 0);
     shared_startup_checkpoint(r->path, 1);
+    for (int durable = 0; durable <= 1; ++durable)
+      for (int fault = JOIN_NO_FAULT; fault <= JOIN_CHECKPOINT_RACE; ++fault)
+        shared_join_admission(r->path, durable, fault);
   } else if (!strcmp(r->mode, "shared-scope-handoff")) {
     for (int durable = 0; durable <= 1; ++durable) {
       for (int edit_first = 0; edit_first <= 1; ++edit_first)

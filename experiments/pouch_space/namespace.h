@@ -65,6 +65,10 @@ int ps_namespace_checkpoint_recover(ps_namespace *, lc_error *);
 /* Check the physical coverage and ready tail in one live-cohort capture. */
 int ps_namespace_admission_proven(ps_space *, uint64_t owner, int *,
                                   lc_error *);
+/* Check coverage at a caller-selected prefix under the local space mutex. */
+int ps_namespace_admission_proven_locked(ps_space *, uint64_t owner,
+                                         uint64_t prefix, int *proven,
+                                         int *private_failure, lc_error *);
 /* Before exposing the root, recover state claims and release empty caches. */
 int ps_namespace_recover_on_open(ps_namespace *, lc_error *);
 uint64_t ps_namespace_source_refs(ps_namespace *, unsigned int, uint64_t);

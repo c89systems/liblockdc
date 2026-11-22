@@ -7752,6 +7752,14 @@ int ps_internal_read_witness_valid(ps_space *s) {
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   return ps_readiness_retains_capture(s);
 }
+int ps_internal_resident_read_valid(ps_space *s, int private_failure) {
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (!ps_readiness_resident(s))
+    return 0;
+  if (private_failure)
+    __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
+  return 1;
+}
 static ps_reader *reader_new(ps_space *s, ps_entry *entry) {
   size_t scratch =
       entry && entry->bytes < PS_CHUNK ? (size_t)entry->bytes : PS_CHUNK;
@@ -8056,7 +8064,7 @@ int ps_internal_namespace_cut_stabilize(ps_space *s, uint64_t owner,
 int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
                             void *buffer, size_t bytes, uint64_t known,
                             uint64_t *incarnation, int *current,
-                            lc_error *error) {
+                            int *private_failure, lc_error *error) {
   ps_entry *latest = lookup(s, key);
   ps_entry *p = selected_value(s, latest, prefix);
   unsigned char *dest = buffer;
@@ -8080,7 +8088,8 @@ int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
     const ps_extent *extent = p->extents + i;
     if (extent->bytes > left)
       return err(error, LC_ERR_PROTOCOL, "invalid fixed control extent");
-    rc = transfer(s, dest, (size_t)extent->bytes, extent->offset, 0, error);
+    rc = file_transfer(s, dest, (size_t)extent->bytes, extent->offset, 0,
+                       private_failure, error);
     if (rc != LC_OK)
       return rc;
     if (checksum(dest, (size_t)extent->bytes) != extent->crc)
