@@ -6,6 +6,36 @@ static int count_selection(void *context, lc_error *e) {
   ++*(unsigned int *)context;
   return LC_OK;
 }
+static void checkpoint_range_saturation(ps_key_checkpoint *c) {
+  lc_pouch_state_entry entry = {0};
+  const char *keys[] = {"huge/a", "huge/b", "huge/c"};
+  ps_checkpoint_ranges captured = {0};
+  entry.content_type = "application/test";
+  entry.etag = "range-etag";
+  entry.seen = entry.found = entry.payload_span.present = 1;
+  entry.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
+  entry.payload_span.container_leaf = "body-00000000000000000003.log";
+  entry.bytes = entry.cipher_bytes = entry.payload_span.payload_length =
+      (uint64_t)INT64_MAX;
+  for (size_t i = 0; i < 3; ++i) {
+    entry.key = (char *)keys[i];
+    entry.index_seq = entry.version = entry.lifetime = 10000 + i;
+    checkpoint_replay_one(c, &entry, 0, 0);
+  }
+  CHECK(ps_key_checkpoint_source_bytes(c, PS_CATALOG_BODY, 3) == UINT64_MAX);
+  OK(ps_key_checkpoint_ranges(c, PS_CATALOG_BODY, 3, 0, PS_CHUNK, &captured,
+                              &error));
+  CHECK(captured.count == 1 && captured.bytes == PS_CHUNK);
+  lc_free_with_allocator(NULL, captured.ranges);
+  entry.found = entry.payload_span.present = 0;
+  entry.record_type = LC_POUCH_STATE_RECORD_STATE_DELETE;
+  ++entry.index_seq;
+  ++entry.version;
+  checkpoint_replay_one(c, &entry, 0, 0);
+  CHECK(ps_key_checkpoint_source_refs(c, PS_CATALOG_BODY, 3) == 2 &&
+        ps_key_checkpoint_source_bytes(c, PS_CATALOG_BODY, 3) ==
+            UINT64_MAX - 1);
+}
 static void checkpoint_ranges(int durable) {
   ps_root_options options = {0};
   ps_root *root = NULL;
@@ -44,7 +74,7 @@ static void checkpoint_ranges(int durable) {
                                               ? "body-00000000000000000001.log"
                                               : "body-00000000000000000002.log";
       entry.payload_span.payload_offset = i * 31 % 2048;
-      entry.payload_span.payload_length = i * 13 % 113 + 1;
+      entry.payload_span.payload_length = i % 19 ? i * 13 % 113 + 1 : 0;
       entry.bytes = entry.cipher_bytes = entry.payload_span.payload_length;
     }
     model[slot].start = entry.payload_span.payload_offset;
@@ -54,14 +84,32 @@ static void checkpoint_ranges(int durable) {
     if (i % 17 != 0 && i != 699)
       continue;
     for (unsigned int source = 1; source <= 2; ++source) {
+      uint64_t refs = 0, bytes = 0;
       memset(expected, 0, sizeof(expected));
       memset(actual, 0, sizeof(actual));
       for (size_t j = 0; j < 96; ++j)
-        if (model[j].source == source)
+        if (model[j].source == source) {
+          ++refs;
+          bytes += model[j].bytes;
           for (uint64_t at = model[j].start;
                at < model[j].start + model[j].bytes; ++at)
             if (at >= 128 && at < 3128)
               expected[at - 128] = 1;
+        }
+      CHECK(ps_key_checkpoint_source_refs(c, PS_CATALOG_BODY, source) == refs &&
+            ps_key_checkpoint_source_bytes(c, PS_CATALOG_BODY, source) ==
+                bytes);
+      if (i < 102)
+        continue;
+      if (i == 102) {
+        allocation_call = 0;
+        allocation_fail = 1;
+        int rc = ps_key_checkpoint_ranges(c, PS_CATALOG_BODY, source, 128, 3000,
+                                          &captured, &error);
+        allocation_fail = 0;
+        CHECK(rc == LC_ERR_NOMEM && !captured.ranges && !captured.count);
+        lc_error_cleanup(&error);
+      }
       OK(ps_key_checkpoint_ranges(c, PS_CATALOG_BODY, source, 128, 3000,
                                   &captured, &error));
       uint64_t total = 0, end = 0;
@@ -107,6 +155,7 @@ static void checkpoint_ranges(int durable) {
                               &error));
   CHECK(captured.count && captured.bytes);
   lc_free_with_allocator(NULL, captured.ranges);
+  checkpoint_range_saturation(c);
   ps_key_checkpoint_close(c);
   ps_namespace_release(ns);
   OK(ps_root_close(root, &error));

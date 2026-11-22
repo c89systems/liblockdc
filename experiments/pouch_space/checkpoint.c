@@ -30,7 +30,9 @@ typedef struct key_summary {
 struct source_count {
   unsigned int kind;
   uint64_t id, references, prepared, epoch;
+  uint64_t bytes, byte_carries;
   key_slot *ranges;
+  int indexed;
   source_count *next;
 };
 struct key_slot {
@@ -46,9 +48,16 @@ struct key_slot {
   key_slot *dirty_next, **dirty_link;
   key_slot *retire_next, **retire_link;
   uint64_t retire_sequence;
-  key_slot *left, *right;
-  uint64_t range_end, range_bytes;
-  unsigned int height;
+  union {
+    struct {
+      key_slot *next, **link;
+    } list;
+    struct {
+      key_slot *left, *right;
+      uint64_t end;
+      unsigned int height;
+    } tree;
+  } range;
   int retained;
   char leaf[LC_POUCH_SNAPSHOT_LEAF_BYTES];
 };
@@ -99,55 +108,53 @@ static int failure(lc_error *e, int code, const char *message) {
   return lc_error_set(e, code, 0, message, NULL, NULL, "pouch");
 }
 static void dirty_remove(ps_key_checkpoint *, key_slot *);
-/* One intrusive AVL interval index per logical source. Metadata-only lease
- * updates leave it alone; selecting a piece visits only overlapping bodies.
- * Nodes are already funded key slots, so canonical accept cannot allocate. */
-static unsigned int range_height(key_slot *s) { return s ? s->height : 0; }
-static uint64_t add_range_bytes(uint64_t a, uint64_t b) {
-  return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+/* Exact interval queries start at repack. Until then, aggregate accounting
+ * and an intrusive list are sufficient even during replay and active writes.
+ * Each slot has space for either representation, so neither canonical accept
+ * nor construction of an interval index needs an allocation. */
+static unsigned int range_height(key_slot *s) {
+  return s ? s->range.tree.height : 0;
 }
 static void range_update(key_slot *s) {
-  unsigned int a = range_height(s->left), b = range_height(s->right);
-  s->height = 1 + (a > b ? a : b);
-  s->range_end = s->summary.body_end;
-  if (s->left && s->left->range_end > s->range_end)
-    s->range_end = s->left->range_end;
-  if (s->right && s->right->range_end > s->range_end)
-    s->range_end = s->right->range_end;
-  s->range_bytes = s->summary.body_end - s->summary.body_start;
-  if (s->left)
-    s->range_bytes = add_range_bytes(s->range_bytes, s->left->range_bytes);
-  if (s->right)
-    s->range_bytes = add_range_bytes(s->range_bytes, s->right->range_bytes);
+  key_slot *left = s->range.tree.left, *right = s->range.tree.right;
+  unsigned int a = range_height(left), b = range_height(right);
+  s->range.tree.height = 1 + (a > b ? a : b);
+  s->range.tree.end = s->summary.body_end;
+  if (left && left->range.tree.end > s->range.tree.end)
+    s->range.tree.end = left->range.tree.end;
+  if (right && right->range.tree.end > s->range.tree.end)
+    s->range.tree.end = right->range.tree.end;
 }
 static key_slot *range_left(key_slot *s) {
-  key_slot *r = s->right;
-  s->right = r->left;
-  r->left = s;
+  key_slot *r = s->range.tree.right;
+  s->range.tree.right = r->range.tree.left;
+  r->range.tree.left = s;
   range_update(s);
   range_update(r);
   return r;
 }
 static key_slot *range_right(key_slot *s) {
-  key_slot *l = s->left;
-  s->left = l->right;
-  l->right = s;
+  key_slot *l = s->range.tree.left;
+  s->range.tree.left = l->range.tree.right;
+  l->range.tree.right = s;
   range_update(s);
   range_update(l);
   return l;
 }
 static key_slot *range_balance(key_slot *s) {
-  if (!s)
-    return NULL;
+  key_slot *left = s->range.tree.left, *right = s->range.tree.right;
+  unsigned int a = range_height(left), b = range_height(right);
   range_update(s);
-  if (range_height(s->left) > range_height(s->right) + 1) {
-    if (range_height(s->left->right) > range_height(s->left->left))
-      s->left = range_left(s->left);
+  if (a > b + 1) {
+    if (range_height(left->range.tree.right) >
+        range_height(left->range.tree.left))
+      s->range.tree.left = range_left(left);
     return range_right(s);
   }
-  if (range_height(s->right) > range_height(s->left) + 1) {
-    if (range_height(s->right->left) > range_height(s->right->right))
-      s->right = range_right(s->right);
+  if (b > a + 1) {
+    if (range_height(right->range.tree.left) >
+        range_height(right->range.tree.right))
+      s->range.tree.right = range_right(right);
     return range_left(s);
   }
   return s;
@@ -158,40 +165,83 @@ static int range_before(key_slot *a, key_slot *b) {
 }
 static key_slot *range_insert(key_slot *root, key_slot *s) {
   if (!root) {
-    s->left = s->right = NULL;
+    s->range.tree.left = s->range.tree.right = NULL;
     range_update(s);
     return s;
   }
   if (range_before(s, root))
-    root->left = range_insert(root->left, s);
+    root->range.tree.left = range_insert(root->range.tree.left, s);
   else
-    root->right = range_insert(root->right, s);
+    root->range.tree.right = range_insert(root->range.tree.right, s);
   return range_balance(root);
 }
 static key_slot *range_detach_first(key_slot *root, key_slot **first) {
-  if (!root->left) {
+  if (!root->range.tree.left) {
     *first = root;
-    return root->right;
+    return root->range.tree.right;
   }
-  root->left = range_detach_first(root->left, first);
+  root->range.tree.left = range_detach_first(root->range.tree.left, first);
   return range_balance(root);
 }
 static key_slot *range_remove(key_slot *root, key_slot *s) {
   key_slot *next;
   if (root == s) {
-    if (!root->right)
-      return root->left;
+    if (!root->range.tree.right)
+      return root->range.tree.left;
     next = NULL;
-    root->right = range_detach_first(root->right, &next);
-    next->left = root->left;
-    next->right = root->right;
+    root->range.tree.right = range_detach_first(root->range.tree.right, &next);
+    next->range.tree.left = root->range.tree.left;
+    next->range.tree.right = root->range.tree.right;
     return range_balance(next);
   }
   if (range_before(s, root))
-    root->left = range_remove(root->left, s);
+    root->range.tree.left = range_remove(root->range.tree.left, s);
   else
-    root->right = range_remove(root->right, s);
+    root->range.tree.right = range_remove(root->range.tree.right, s);
   return range_balance(root);
+}
+static void source_link_range(source_count *source, key_slot *s) {
+  uint64_t bytes = s->summary.body_end - s->summary.body_start;
+  if (!bytes)
+    return;
+  /* Keep the exact aggregate so subtraction can recover after saturation. */
+  source->bytes += bytes;
+  source->byte_carries += source->bytes < bytes;
+  if (source->indexed)
+    source->ranges = range_insert(source->ranges, s);
+  else {
+    s->range.list.next = source->ranges;
+    s->range.list.link = &source->ranges;
+    if (source->ranges)
+      source->ranges->range.list.link = &s->range.list.next;
+    source->ranges = s;
+  }
+}
+static void source_unlink_range(source_count *source, key_slot *s) {
+  uint64_t bytes = s->summary.body_end - s->summary.body_start;
+  if (!bytes)
+    return;
+  source->byte_carries -= source->bytes < bytes;
+  source->bytes -= bytes;
+  if (source->indexed)
+    source->ranges = range_remove(source->ranges, s);
+  else {
+    *s->range.list.link = s->range.list.next;
+    if (s->range.list.next)
+      s->range.list.next->range.list.link = s->range.list.link;
+  }
+}
+static void source_index_ranges(source_count *source) {
+  key_slot *slot, *next;
+  if (source->indexed)
+    return;
+  slot = source->ranges;
+  source->ranges = NULL;
+  for (; slot; slot = next) {
+    next = slot->range.list.next;
+    source->ranges = range_insert(source->ranges, slot);
+  }
+  source->indexed = 1;
 }
 static uint64_t hash_key(const void *key, size_t n, unsigned int kind) {
   const unsigned char *p = key;
@@ -466,8 +516,7 @@ static void bind_source(ps_key_checkpoint *c, key_slot *s, source_count *source,
   }
   ++c->body_epoch; /* preflighted before the infallible canonical accept */
   if (prior) {
-    if (s->summary.body_end > s->summary.body_start)
-      prior->ranges = range_remove(prior->ranges, s);
+    source_unlink_range(prior, s);
     --prior->references;
     prior->epoch = c->body_epoch;
   }
@@ -476,8 +525,7 @@ static void bind_source(ps_key_checkpoint *c, key_slot *s, source_count *source,
   if (source) {
     ++source->references;
     source->epoch = c->body_epoch;
-    if (s->summary.body_end > s->summary.body_start)
-      source->ranges = range_insert(source->ranges, s);
+    source_link_range(source, s);
   }
   release_source(c, prior);
 }
@@ -1142,8 +1190,8 @@ uint64_t ps_key_checkpoint_source_bytes(ps_key_checkpoint *c, unsigned int kind,
   uint64_t bytes = 0;
   pthread_mutex_lock(&c->mutex);
   source = source_find(c, kind, id);
-  if (source && source->ranges)
-    bytes = source->ranges->range_bytes;
+  if (source)
+    bytes = source->byte_carries ? UINT64_MAX : source->bytes;
   pthread_mutex_unlock(&c->mutex);
   return bytes;
 }
@@ -1159,9 +1207,9 @@ static int range_collect(key_slot *s, uint64_t base, uint64_t end,
   uint64_t a, b;
   size_t n;
   int rc;
-  if (!s || s->range_end <= base)
+  if (!s || s->range.tree.end <= base)
     return LC_OK;
-  rc = range_collect(s->left, base, end, out, capacity, e);
+  rc = range_collect(s->range.tree.left, base, end, out, capacity, e);
   if (rc != LC_OK || s->summary.body_start >= end)
     return rc;
   a = s->summary.body_start > base ? s->summary.body_start : base;
@@ -1191,7 +1239,7 @@ static int range_collect(key_slot *s, uint64_t base, uint64_t end,
       out->bytes += b - a;
     }
   }
-  return range_collect(s->right, base, end, out, capacity, e);
+  return range_collect(s->range.tree.right, base, end, out, capacity, e);
 }
 int ps_key_checkpoint_ranges(ps_key_checkpoint *c, unsigned int kind,
                              uint64_t id, uint64_t base, uint64_t bytes,
@@ -1208,6 +1256,7 @@ int ps_key_checkpoint_ranges(ps_key_checkpoint *c, unsigned int kind,
   if (s && s->prepared)
     rc = range_busy(e);
   if (rc == LC_OK && s) {
+    source_index_ranges(s);
     out->epoch = s->epoch;
     rc = range_collect(s->ranges, base, base + bytes, out, &capacity, e);
   }
