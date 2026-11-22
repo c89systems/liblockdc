@@ -77,7 +77,7 @@ remain open performance work. Review material tradeoffs before deployment.
 - [Original proposal and design rationale](archive/pouch-space-proposal.md)
 - [Implementation history, tests, and benchmark results](archive/pouch-space-implementation.md)
 - [Foundation measurements and reproduction](archive/pouch-space-experiment.md)
-- [Physical interface](../experiments/pouch_space/space.h) and
-  [foundation design](../experiments/pouch_space/DESIGN.md)
+- [Original foundation design](archive/pouch-space-foundation-design.md)
+- [Physical interface](../experiments/pouch_space/space.h)
 
 Later implementation commits record their verification and measurements.

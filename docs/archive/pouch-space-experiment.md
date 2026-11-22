@@ -10,7 +10,7 @@ and explicit growth. Default capacity is 10 MiB; tests grow 1 to 2 to 3 MiB.
 The later stages add canonical append-owned streams, whole-stream lifecycle
 operations and typed name catalogs; their verification and measurements appear
 below in implementation order.
-Its [design and ordering contract](../../experiments/pouch_space/DESIGN.md) defines
+Its [design and ordering contract](pouch-space-foundation-design.md) defines
 the failure model and limits. It is not connected to normal Pouch open behavior.
 
 All persistent prototype metadata and payloads occupy that file. The comparison
@@ -404,7 +404,7 @@ the record owner supplies canonical validation, metadata/header patches and
 tail recovery. Reused space is durably initialized before grant publication.
 Preparation batches at most 1 MiB, returns spare zeroed pages only after its
 barrier, and can share that barrier with other ready work. The
-[design contract](../../experiments/pouch_space/DESIGN.md#canonical-append-owned-streams)
+[design contract](pouch-space-foundation-design.md#canonical-append-owned-streams)
 describes ownership, suffix repair and the native/fallback initialization paths.
 
 The stream fixture uses the actual Pouch binary header codec, payload CRC and
@@ -1557,7 +1557,7 @@ before rotation. Old body sources remain readable after deletion and Pouch close
 Positive expiry now publishes a conservative durable marker inside the file,
 rather than attempting to create the native retention hint sidecar. Namespace
 control slot 2 contains the checked 32-byte marker described in the
-[foundation design](../../experiments/pouch_space/DESIGN.md). It is durable before
+[foundation design](pouch-space-foundation-design.md). It is durable before
 expiry-bearing publication even under NoSync. A failed mutation may leave a
 positive hint. Get reads only metadata; marker clearing and retention execution
 are not implemented yet. No SDK selector or public-open cutover is introduced.
@@ -3451,7 +3451,7 @@ prior is `build/pouch-space-append-budget/pouch_space_compare-current`, SHA-256
 
 ## Next commitments
 
-The [integrated foundation](../../experiments/pouch_space/DESIGN.md) now replaces
+The [integrated foundation](pouch-space-foundation-design.md) now replaces
 the fixed 64 KiB checkpoint banks with growable typed metadata, packed descriptor
 pages, protected checkpoint workspace and a fixed payload reserve for maintenance.
 Earlier
