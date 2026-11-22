@@ -169,6 +169,7 @@ struct ps_space {
   uint64_t token_next, token_end, token_limit;
   uint64_t writer_id;
   int reused_open_barrier;
+  int deferred_recovery, open_grant_covered;
   unsigned char close_proof[2U * PS_READINESS_SLOT_BYTES];
   uint64_t exclusive_raw_writes, exclusive_raw_durable;
   /* Observed control journal for shared revision comparison, never bodies. */

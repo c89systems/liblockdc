@@ -173,8 +173,15 @@ static int native_zero(void *c, int fd, off_t o, off_t n) {
   (void)c;
   return fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, o, n);
 }
-static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
-                    int writing, lc_error *error) {
+static int sync_file_if(ps_space *, int recovery_only, lc_error *);
+static void mark_durable(ps_space *, uint64_t sequence);
+static int settle_recovery(ps_space *s, lc_error *error) {
+  return __atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE)
+             ? sync_file_if(s, 1, error)
+             : LC_OK;
+}
+static int file_transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
+                         int writing, lc_error *error) {
   unsigned char *p = bytes;
   ssize_t result;
   while (n) {
@@ -194,6 +201,11 @@ static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
     offset += (uint64_t)result;
   }
   return LC_OK;
+}
+static int transfer(ps_space *s, void *bytes, size_t n, uint64_t offset,
+                    int writing, lc_error *error) {
+  int rc = writing ? settle_recovery(s, error) : LC_OK;
+  return rc == LC_OK ? file_transfer(s, bytes, n, offset, writing, error) : rc;
 }
 static int journal_transfer(ps_space *s, uint64_t cursor, void *bytes,
                             size_t count, int writing, lc_error *error) {
@@ -221,6 +233,9 @@ static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
   int rc;
   if (!bytes)
     return LC_OK;
+  rc = settle_recovery(s, error);
+  if (rc != LC_OK)
+    return rc;
   if (s->io.zero) {
     rc = zero_file_range(s, offset, bytes);
     if (rc == 0)
@@ -238,17 +253,20 @@ static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
   }
   return LC_OK;
 }
-static int sync_file(ps_space *s, lc_error *error) {
-  uint64_t raw = 0;
-  int rc;
+static int sync_file_if(ps_space *s, int recovery_only, lc_error *error) {
+  uint64_t raw = 0, recovered = 0;
+  int rc, deferred;
   pthread_mutex_lock(&s->sync_io_mutex);
   rc = healthy(s, error);
-  if (rc != LC_OK) {
+  deferred = __atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE);
+  if (rc != LC_OK || (recovery_only && !deferred)) {
     pthread_mutex_unlock(&s->sync_io_mutex);
     return rc;
   }
   if (!s->readiness)
     raw = __atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE);
+  if (deferred)
+    recovered = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
   do {
     rc = s->io.sync(s->io.context, s->fd);
   } while (rc < 0 && errno == EINTR);
@@ -257,8 +275,15 @@ static int sync_file(ps_space *s, lc_error *error) {
     rc = io_error(s, error, "container sync failed");
   else if (!s->readiness)
     __atomic_store_n(&s->exclusive_raw_durable, raw, __ATOMIC_RELEASE);
+  if (rc == LC_OK && deferred) {
+    mark_durable(s, recovered);
+    __atomic_store_n(&s->deferred_recovery, 0, __ATOMIC_RELEASE);
+  }
   pthread_mutex_unlock(&s->sync_io_mutex);
   return rc;
+}
+static int sync_file(ps_space *s, lc_error *error) {
+  return sync_file_if(s, 0, error);
 }
 static void mark_durable(ps_space *s, uint64_t sequence) {
   pthread_mutex_lock(&s->commit_mutex);
@@ -429,7 +454,9 @@ static int wait_prepared(ps_space *s, uint64_t sequence, lc_error *error) {
 }
 static int reserve_file(ps_space *s, uint64_t begin, uint64_t bytes,
                         lc_error *error) {
-  int rc;
+  int rc = settle_recovery(s, error);
+  if (rc != LC_OK)
+    return rc;
   do {
     rc = s->io.reserve(s->io.context, s->fd, (off_t)begin, (off_t)bytes);
   } while (rc < 0 && errno == EINTR);
@@ -3958,10 +3985,21 @@ static size_t journal_end_marker(size_t offset) {
   size_t remaining = PS_JOURNAL - offset;
   return remaining < 64 ? remaining : 64;
 }
+/* The caller holds the container mutex and is about to mutate. A successor
+ * to the checkpointed grant can share the deferred recovery barrier. */
+static int prepare_recovery_write(ps_space *s, lc_error *error) {
+  if (s->open_grant_covered &&
+      __atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE) &&
+      s->token_limit <= PS_MAX_INCARNATION - TOKEN_RANGE)
+    return ps_internal_token_range(s, error);
+  return LC_OK;
+}
 static int write_journal_frame(ps_space *s, unsigned char *wire, size_t bytes,
                                lc_error *error) {
   size_t length = bytes;
-  int rc;
+  int rc = prepare_recovery_write(s, error);
+  if (rc != LC_OK)
+    return rc;
   if (s->journal_image) {
     size_t marker = journal_end_marker(s->journal + bytes);
     memset(wire + bytes, 0, marker);
@@ -4051,8 +4089,9 @@ static int write_token_limit(ps_space *s, int slot, uint64_t limit,
   put64(record + 8, limit);
   memcpy(record + 16, s->identity, 16);
   put32(record + 32, checksum(record, 32));
-  return transfer(s, record, sizeof(record),
-                  (uint64_t)slot * PS_PAGE + PS_TOKEN_RECORD_OFFSET, 1, error);
+  return file_transfer(s, record, sizeof(record),
+                       (uint64_t)slot * PS_PAGE + PS_TOKEN_RECORD_OFFSET, 1,
+                       error);
 }
 /* The preceding slot remains intact. A new pool that persists ahead of its
  * barrier can be skipped safely: it does not advance the journal prefix. */
@@ -4103,6 +4142,8 @@ int ps_internal_token_range(ps_space *s, lc_error *error) {
     if (rc == LC_OK && !s->readiness && limit != s->token_limit)
       rc =
           err(error, LC_ERR_PROTOCOL, "exclusive incarnation frontier changed");
+    if (rc == LC_OK && !s->readiness && !s->open_grant_covered)
+      rc = settle_recovery(s, error);
     if (rc == LC_OK && (!s->readiness || limit == certificate.grant_limit))
       rc = grant_tokens(s, 1 - slot, limit, error);
     else if (rc == LC_OK && limit - certificate.grant_limit <= TOKEN_POOL) {
@@ -5727,6 +5768,10 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
     }
     if (p->key.kind == PS_CATALOG) {
       ps_catalog_drop_record(s, old, release, wire);
+      if (!wire && !s->readiness)
+        /* The selected recovery view already includes this removal. The
+         * target's release fence still carries the real journal sequence. */
+        old->publication_sequence = 0;
       ps_internal_entry_free(p);
       return LC_OK;
     }
@@ -5779,8 +5824,7 @@ static int exclusive_raw_covered(const ps_space *s) {
          __atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE);
 }
 static int close_proof_matches(const ps_space *s, const unsigned char *proof) {
-  return get64(proof) == PS_CLOSE_PROOF_MAGIC &&
-         !memcmp(proof + 8, s->identity, 16) &&
+  return !memcmp(proof + 8, s->identity, 16) &&
          get64(proof + 24) == s->generation &&
          get64(proof + 32) == s->sequence &&
          get64(proof + 40) == s->token_limit && get64(proof + 48) == s->journal;
@@ -5794,24 +5838,30 @@ static void exclusive_record_close(ps_space *s) {
   unsigned char *proof = page + PS_CLOSE_PROOF_OFFSET;
   unsigned char *tail = proof + CLOSE_PROOF_HEADER;
   size_t i, count = 0;
-  int rc;
-  if (s->readiness || healthy(s, NULL) != LC_OK || !exclusive_raw_covered(s))
+  int rc, covered;
+  if (s->readiness || healthy(s, NULL) != LC_OK)
     return;
-  if (__atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
-      __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE)) {
+  covered = exclusive_raw_covered(s) &&
+            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) >=
+                __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
+  if (!covered) {
     /* Reinstating proven tails can advance the local clock. If the journal
      * and raw stream bytes stayed put, the original receipt still applies. */
-    if (close_proof_matches(s, s->close_proof) &&
+    if (get64(s->close_proof) == PS_CLOSE_PROOF_MAGIC &&
+        close_proof_matches(s, s->close_proof) &&
         !__atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE)) {
       count = get32(s->close_proof + 88);
       memcpy(proof, s->close_proof,
              CLOSE_PROOF_HEADER + count * CLOSE_PROOF_TAIL);
-      (void)transfer(s, page, (size_t)(tail - page) + count * CLOSE_PROOF_TAIL,
-                     PS_READINESS_OFFSET, 1, NULL);
+      (void)file_transfer(s, page,
+                          (size_t)(tail - page) + count * CLOSE_PROOF_TAIL,
+                          PS_READINESS_OFFSET, 1, NULL);
+      return;
     }
-    return;
+    if (s->durable)
+      return;
   }
-  for (i = 0; i < BUCKETS; ++i)
+  for (i = 0; covered && i < BUCKETS; ++i)
     for (stream = s->stream_buckets[i]; stream; stream = stream->stream->next) {
       if (!stream->bytes || stream->stream->sealed)
         continue;
@@ -5834,7 +5884,7 @@ static void exclusive_record_close(ps_space *s) {
     lc_free_with_allocator(NULL, wire);
   if (rc != LC_OK)
     return;
-  put64(proof, PS_CLOSE_PROOF_MAGIC);
+  put64(proof, covered ? PS_CLOSE_PROOF_MAGIC : PS_CLOSE_NOSYNC_MAGIC);
   memcpy(proof + 8, s->identity, 16);
   put64(proof + 24, s->generation);
   put64(proof + 32, s->sequence);
@@ -5842,25 +5892,33 @@ static void exclusive_record_close(ps_space *s) {
   put64(proof + 48, s->journal);
   put32(proof + 88, (uint32_t)count);
   put32(proof + 92, close_proof_crc(proof, count));
-  (void)transfer(s, page, (size_t)(tail - page), PS_READINESS_OFFSET, 1, NULL);
+  (void)file_transfer(s, page, (size_t)(tail - page), PS_READINESS_OFFSET, 1,
+                      NULL);
 }
+enum exclusive_proof { EXCLUSIVE_UNPROVED, EXCLUSIVE_DURABLE, EXCLUSIVE_CLEAN };
 static int exclusive_open_proof(ps_space *s, const unsigned char *wire,
-                                int clean, int *covered, lc_error *error) {
+                                int clean, enum exclusive_proof *accepted,
+                                lc_error *error) {
   unsigned char page[CLOSE_PROOF_BYTES], hash[32];
   const unsigned char *proof = page + PS_CLOSE_PROOF_OFFSET;
   size_t count, bytes;
+  uint64_t magic;
   int rc = transfer(s, page, sizeof(page), PS_READINESS_OFFSET, 0, error);
   if (rc != LC_OK)
     return rc;
   count = get32(proof + 88);
+  magic = get64(proof);
   if (clean && !get64(page) && !get64(page + PS_READINESS_SLOT_BYTES) &&
+      (magic == PS_CLOSE_PROOF_MAGIC ||
+       (magic == PS_CLOSE_NOSYNC_MAGIC && !s->durable && !count)) &&
       close_proof_matches(s, proof) && count <= CLOSE_PROOF_MAX_TAILS &&
       get32(proof + 92) == close_proof_crc(proof, count) &&
       close_proof_hash(wire, s->journal, hash) &&
       !memcmp(proof + 56, hash, sizeof(hash))) {
     bytes = CLOSE_PROOF_HEADER + count * CLOSE_PROOF_TAIL;
     memcpy(s->close_proof, proof, bytes);
-    *covered = 1;
+    *accepted =
+        magic == PS_CLOSE_PROOF_MAGIC ? EXCLUSIVE_DURABLE : EXCLUSIVE_CLEAN;
     /* This opening owns a private copy. Revoke the on-disk receipt before
      * any producer can touch bytes in a previously covered grant. */
     memset(page, 0, 8);
@@ -5959,7 +6017,7 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
   int a, b, event, rc, retire_sibling, retirement_needed, known_grant;
   int pending_data = 0, grant_slot, moved = 0, certified, cold_covered;
-  int exclusive_covered = 0;
+  enum exclusive_proof exclusive = EXCLUSIVE_UNPROVED;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
 restart:
@@ -6136,8 +6194,7 @@ restart:
     --last;
   retirement_needed = first < last || retire_sibling;
   if (!s->readiness) {
-    rc = exclusive_open_proof(s, wire, !retirement_needed, &exclusive_covered,
-                              error);
+    rc = exclusive_open_proof(s, wire, !retirement_needed, &exclusive, error);
     if (rc != LC_OK)
       goto done;
   }
@@ -6181,7 +6238,7 @@ restart:
    * cohort's allocator ranges and readiness hints do not carry forward. */
   known_grant = ps_readiness_prior_durable(s, &prior) &&
                 prior.grant_limit == s->token_limit;
-  cold_covered = exclusive_covered ||
+  cold_covered = exclusive == EXCLUSIVE_DURABLE ||
                  (!retirement_needed && known_grant &&
                   prior.root == s->generation && prior.ready == s->sequence &&
                   prior.journal_bytes == s->journal && prior.durable >= effect);
@@ -6195,6 +6252,7 @@ restart:
     s->token_next = certificate.grant_limit + 1;
     s->token_end = certificate.grant_limit + TOKEN_RANGE;
   } else if (!ps_readiness_joined(s) && !cold_covered &&
+             exclusive != EXCLUSIVE_CLEAN &&
              (known_grant || get64(root + 48) == grant_limit)) {
     /* Only replace the preceding slot when this frontier crossed a known
      * barrier. A cached refill may otherwise be the only readable slot. */
@@ -6205,8 +6263,15 @@ restart:
   if (cold_covered) {
     /* Ignoring old hints is safe, but does not make their bytes durable.
      * A later crash may reuse their wire positions for canonical data. */
-    s->peer_durable = exclusive_covered ? s->sequence : prior.durable;
+    s->peer_durable =
+        exclusive == EXCLUSIVE_DURABLE ? s->sequence : prior.durable;
     s->reused_open_barrier = 1;
+  } else if (exclusive == EXCLUSIVE_CLEAN) {
+    /* Publish the checked NoSync view for reads. The first mutation or
+     * explicit barrier must stabilize it before changing persistence.
+     * A checkpointed grant slot can fund that barrier without another sync. */
+    s->open_grant_covered = get64(root + 48) == grant_limit;
+    __atomic_store_n(&s->deferred_recovery, 1, __ATOMIC_RELEASE);
   } else if (retirement_needed || certificate.pending ||
              certificate.root != s->generation ||
              certificate.ready != s->sequence || pending_data ||
@@ -8713,7 +8778,8 @@ int ps_flush(ps_space *s, lc_error *error) {
   if (rc != LC_OK)
     return rc;
   sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
-  return wait_durable(s, sequence, error);
+  return sequence ? wait_durable(s, sequence, error)
+                  : settle_recovery(s, error);
 }
 int ps_checkpoint(ps_space *s, lc_error *error) {
   uint64_t bound;
@@ -9357,19 +9423,24 @@ int ps_owned_edit_begin(ps_owned_head *head, int append,
   int rc;
   *edit = NULL;
   *continued = 1;
-  if (!s->readiness)
+  if (s->readiness) {
+    rc = ps_coordination_lock(s->coordination, PS_COORDINATION_STREAM, p->token,
+                              0, edit, error);
+    if (rc != LC_OK)
+      return rc;
+  } else if (!append || !s->open_grant_covered ||
+             !__atomic_load_n(&s->deferred_recovery, __ATOMIC_ACQUIRE))
     return ps_owned_status_get(head, status, error);
-  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_STREAM, p->token,
-                            0, edit, error);
-  if (rc != LC_OK)
-    return rc;
   pthread_mutex_lock(&s->mutex);
   rc = owned_capture_begin(head, &allocator, error);
   if (rc == LC_OK) {
     owned_status(head, status);
     if (!p->deleted && !p->stream->sealed)
-      rc = claim_writer_stamp(s, p, append ? PS_STREAM_EDIT : PS_STREAM_OWNER,
-                              continued, error);
+      rc = s->readiness
+               ? claim_writer_stamp(s, p,
+                                    append ? PS_STREAM_EDIT : PS_STREAM_OWNER,
+                                    continued, error)
+               : prepare_recovery_write(s, error);
     else
       *continued = 0;
   }

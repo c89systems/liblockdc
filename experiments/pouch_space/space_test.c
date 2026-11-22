@@ -1378,7 +1378,7 @@ static int gate_sync(void *v, int fd) {
   pthread_mutex_lock(&g->mutex);
   g->fd = fd;
   ++g->syncs;
-  if (g->enabled && !g->entered) {
+  if (g->enabled && !g->hold_payload && !g->entered) {
     g->entered = 1;
     pthread_cond_broadcast(&g->cond);
     while (!g->released)
@@ -3052,6 +3052,97 @@ static void exclusive_close_recovery(enum close_proof_case mode) {
   OK(ps_stream_close(stream, &error));
   OK(ps_catalog_allocate_id(space, &next, &error));
   CHECK(next > info.ref.incarnation);
+  OK(ps_close(space, &error));
+  free(m.stable);
+  clean();
+}
+
+enum nosync_recovery_action {
+  NOSYNC_RECOVERY_FLUSH,
+  NOSYNC_RECOVERY_MUTATE,
+  NOSYNC_RECOVERY_WRITE_FAILURE,
+  NOSYNC_RECOVERY_DURABLE_OPEN
+};
+static void nosync_close_recovery(enum nosync_recovery_action action) {
+  const char body[] = "recovered stream";
+  model m;
+  ps_io io = model_init_capacity(&m, PS_DEFAULT_CAPACITY);
+  ps_options options = {0};
+  ps_space *space = create(PS_DEFAULT_CAPACITY, 0, &io);
+  ps_catalog_info marker;
+  ps_catalog_view *view = NULL;
+  ps_ref stable = put(space, state(1), "stable", 6, 1);
+  uint64_t start, issued = 0, next;
+  ps_stream *stream = stream_open(space, 1, 1, NULL, NULL);
+  size_t syncs, writes;
+  options.io = &io;
+  OK(ps_catalog_put_marker(space, NULL, 20, "work", 4, NULL, "ready", 5,
+                           &marker, &error));
+  OK(ps_catalog_remove(space, 20, PS_CATALOG_MARKER, "work", 4,
+                       &marker.revision, &error));
+  OK(canonical_append(stream, body, sizeof(body), 3, 1, &start, &error));
+  OK(ps_stream_close(stream, &error));
+  ps_ref recovered = put(space, state(2), "from-cache", 10, 2);
+  syncs = m.syncs;
+  OK(ps_close(space, &error));
+  CHECK(m.syncs == syncs);
+  m.fail_sync_at = syncs + 1;
+  for (int i = 0; i < 2; ++i) {
+    OK(ps_open(path, 0, &options, &space, &error));
+    CHECK(m.syncs == syncs);
+    expect(space, state(2), &recovered, "from-cache", 10);
+    OK(ps_catalog_get(space, 20, PS_CATALOG_MARKER, "work", 4, &view, &error));
+    CHECK(!view);
+    stream = stream_open(space, 1, 0, NULL, NULL);
+    stream_expect(stream, start, body, sizeof(body), 1);
+    OK(ps_stream_close(stream, &error));
+    CHECK(m.syncs == syncs);
+    if (!i)
+      OK(ps_close(space, &error));
+  }
+
+  if (action == NOSYNC_RECOVERY_DURABLE_OPEN) {
+    OK(ps_close(space, &error));
+    options.durable_sync = 1;
+    CHECK(ps_open(path, 0, &options, &space, &error) == LC_ERR_TRANSPORT &&
+          !space && m.syncs == syncs + 1);
+    lc_error_cleanup(&error);
+    options.durable_sync = 0;
+  } else if (action == NOSYNC_RECOVERY_WRITE_FAILURE) {
+    writes = m.writes;
+    m.persist_grants = 1;
+    CHECK(ps_delete(space, state(1), &error) == LC_ERR_TRANSPORT &&
+          m.syncs == syncs + 1 && m.writes == writes + 1 && m.grants == 1);
+    lc_error_cleanup(&error);
+    m.persist_grants = 0;
+    OK(ps_close(space, &error));
+  } else {
+    m.fail_sync_at = 0;
+    if (action == NOSYNC_RECOVERY_FLUSH) {
+      OK(ps_flush(space, &error));
+      OK(ps_flush(space, &error));
+    } else {
+      OK(ps_delete(space, state(1), &error));
+      absent(space, state(1));
+      OK(ps_catalog_allocate_id(space, &issued, &error));
+      CHECK(issued > recovered.incarnation);
+    }
+    CHECK(m.syncs == syncs + 1);
+    OK(ps_close(space, &error));
+  }
+  m.fail_sync_at = 0;
+  crash(&m);
+  OK(ps_open(path, 0, &options, &space, &error));
+  expect(space, state(1), &stable, "stable", 6);
+  if (action == NOSYNC_RECOVERY_FLUSH || action == NOSYNC_RECOVERY_MUTATE) {
+    expect(space, state(2), &recovered, "from-cache", 10);
+    stream = stream_open(space, 1, 0, NULL, NULL);
+    stream_expect(stream, start, body, sizeof(body), 1);
+    OK(ps_stream_close(stream, &error));
+  } else
+    absent(space, state(2));
+  OK(ps_catalog_allocate_id(space, &next, &error));
+  CHECK(next > recovered.incarnation && next > issued);
   OK(ps_close(space, &error));
   free(m.stable);
   clean();
@@ -7837,6 +7928,10 @@ int main(int argc, char **argv) {
       exclusive_close_recovery(CLOSE_PROOF_TORN);
       exclusive_close_recovery(CLOSE_PROOF_ADVANCED);
       exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH);
+      nosync_close_recovery(NOSYNC_RECOVERY_FLUSH);
+      nosync_close_recovery(NOSYNC_RECOVERY_MUTATE);
+      nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
+      nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
     } else if (strcmp(argv[2], "reopen-sanitize") == 0)
       reopen_sanitization();
     else if (strcmp(argv[2], "reopen") == 0)

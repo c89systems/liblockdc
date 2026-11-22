@@ -9,6 +9,7 @@
 #include "lc_pouch_txn_guard.h"
 #include "pouch.h"
 #include "pouch_internal.h"
+#include "readiness.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1989,7 +1990,9 @@ static size_t io_trial(const char *directory, int sync, int crypto, int mode,
   REQUIRE(baseline_fd >= 0);
   for (size_t at = 0; at < PS_DEFAULT_CAPACITY; at += PS_PAGE) {
     REQUIRE(pread(baseline_fd, m.scratch, PS_PAGE, (off_t)at) == PS_PAGE);
-    REQUIRE(!memcmp(m.stable + at, m.scratch, PS_PAGE));
+    /* Exclusive reopen consumes a receipt in the advisory slots. */
+    size_t slots = at == PS_READINESS_OFFSET ? 2 * PS_READINESS_SLOT_BYTES : 0;
+    REQUIRE(!memcmp(m.stable + at + slots, m.scratch + slots, PS_PAGE - slots));
   }
   REQUIRE(!close(baseline_fd));
   now(1050);

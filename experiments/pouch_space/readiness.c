@@ -377,10 +377,10 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
   /* The first owner resets witnesses before claiming any dynamic workspace.
    * Unlike member handles, read-only imports can survive this reset. */
   if (!r->existing) {
+    uint64_t magic = __atomic_load_n(r->page + MAGIC, __ATOMIC_ACQUIRE);
     /* Exclusive close uses the idle certificate slots. Revoke its proof
      * before a shared recovery can modify the journal. */
-    if (__atomic_load_n(r->page + MAGIC, __ATOMIC_ACQUIRE) ==
-        PS_CLOSE_PROOF_MAGIC)
+    if (magic == PS_CLOSE_PROOF_MAGIC || magic == PS_CLOSE_NOSYNC_MAGIC)
       __atomic_store_n(r->page + MAGIC, 0, __ATOMIC_RELEASE);
     __atomic_store_n(r->page + CREDIT_ACTIVE, 0, __ATOMIC_RELEASE);
     __atomic_store_n(r->page + CREDIT_SPILL, 0, __ATOMIC_RELEASE);

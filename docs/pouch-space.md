@@ -43,9 +43,12 @@ admitting a cold namespace for writes, recovery checks for complete records past
 the selected stream tail and restores their outstanding capacity obligations.
 After validating the recovered prefix, the first owner can reuse proof from
 a previous durability barrier. A clean exclusive close can record that
-proof for the exact journal and a bounded set of stream tails. Newly
-discovered records outside the proof cross a barrier before visibility.
+proof for the exact journal and a bounded set of stream tails. When reusing
+that durability proof, recovery syncs newly discovered records outside its
+coverage before exposing them.
 Owners that reopen using a proof acquire an incarnation range on first use.
+After a clean exclusive NoSync close, a checked journal can serve reads.
+The first persistent mutation or explicit flush stabilizes that recovered view.
 
 Private preparation reserves payload and descriptor capacity before spending it.
 Publication revalidates its logical authority. Producers run outside

@@ -6,6 +6,7 @@ typedef struct ps_readiness ps_readiness;
 #define PS_READINESS_SLOT_BYTES (PS_READINESS_WORDS * 8U)
 #define PS_CLOSE_PROOF_OFFSET 8U
 #define PS_CLOSE_PROOF_MAGIC UINT64_C(0x314650534f4c434c)
+#define PS_CLOSE_NOSYNC_MAGIC UINT64_C(0x314e50534f4c434c)
 #define PS_READINESS_CREDIT_SLOTS 32U
 enum ps_readiness_change {
   PS_READINESS_ROOT = 1,
