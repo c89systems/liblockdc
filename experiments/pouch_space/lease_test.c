@@ -283,6 +283,7 @@ static void open_store(fixture *f, int create, lc_error *e) {
          ? lc_client_open(&f->config, &f->client, e)
          : ps_pouch_client_open(&f->config, create, &physical, &f->client, e),
      e);
+  REQUIRE((store(f)->storage.ops == NULL) == f->native);
 }
 static void close_store(fixture *f) {
   lc_client_close(f->client);
@@ -1296,12 +1297,13 @@ static void compare(const char *directory) {
         ok(lc_pouch_retention_work_read(store(f), "orders", &work, &e), &e);
         REQUIRE(!work.present);
         lc_pouch_retention_work_cleanup(store(f), &work);
-        printf("lease-compare sample=%d native=%d sync=%d crypto=%d cold=%d "
+        printf("lease-compare sample=%d backend=%s sync=%d crypto=%d cold=%d "
                "records=8 save_ms=%.6f save_cpu_ms=%.6f save_syncs=%lu "
                "open_ms=%.6f open_cpu_ms=%.6f open_syncs=%lu "
                "expiry_ms=%.6f expiry_cpu_ms=%.6f expiry_syncs=%lu "
                "staged_decision_ms=%.6f verified=1\n",
-               sample, native, sync, crypto, cold, save.wall, save.cpu,
+               sample, store(f)->storage.ops ? "single-file" : "multifile",
+               sync, crypto, cold, save.wall, save.cpu,
                (unsigned long)save.syncs, opened.wall, opened.cpu,
                (unsigned long)opened.syncs, expired.wall, expired.cpu,
                (unsigned long)expired.syncs, expired.staged_decision);
