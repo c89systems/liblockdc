@@ -7161,9 +7161,9 @@ static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
 int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
                                                lc_error *error) {
   ps_coordination_guard *guard;
-  uint64_t prefix, local = 0, peer = 0, completed;
+  uint64_t prefix, local = 0, peer = 0;
   ps_entry *p;
-  int rc, synced;
+  int rc;
 
   if (!s->readiness)
     return LC_OK;
@@ -7187,8 +7187,14 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK || (!local && !peer))
-    return rc;
+  return rc == LC_OK ? ps_internal_durable_prefix(s, local, peer, error) : rc;
+}
+int ps_internal_durable_prefix(ps_space *s, uint64_t local, uint64_t peer,
+                               lc_error *error) {
+  uint64_t completed;
+  int rc, synced;
+  if (!local && !peer)
+    return LC_OK;
   if (!peer)
     return wait_durable(s, local, error);
 

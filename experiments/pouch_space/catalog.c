@@ -525,12 +525,12 @@ int ps_catalog_remove(ps_space *s, uint64_t owner, unsigned int kind,
   item.kind = kind;
   return ps_catalog_remove_many(s, owner, &item, 1, &completed, e);
 }
-int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
-                   const void *name, size_t length, ps_catalog_view **out,
-                   lc_error *e) {
+static int catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
+                       const void *name, size_t length, ps_catalog_view **out,
+                       uint64_t *local, uint64_t *peer, lc_error *e) {
   ps_catalog_view *view;
   ps_coordination_guard *guard;
-  ps_entry *p;
+  ps_entry *p, *latest;
   uint64_t prefix;
   int rc;
   if (out)
@@ -543,8 +543,12 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  p = named(s, owner, kind, name, length);
-  p = visible(p, prefix, s->peer_durable);
+  latest = named(s, owner, kind, name, length);
+  p = visible(latest, prefix, s->peer_durable);
+  if (rc == LC_OK && !p && local && latest && !latest->deleted) {
+    *local = latest->peer_sequence ? 0 : latest->publication_sequence;
+    *peer = latest->peer_sequence;
+  }
   if (rc == LC_OK && p) {
     ++p->pins;
     if (p->catalog->target) {
@@ -570,6 +574,24 @@ int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   pthread_mutex_unlock(&s->mutex);
   if (!*out)
     lc_free_with_allocator(NULL, view);
+  return rc;
+}
+int ps_catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
+                   const void *name, size_t length, ps_catalog_view **out,
+                   lc_error *e) {
+  return catalog_get(s, owner, kind, name, length, out, NULL, NULL, e);
+}
+int ps_catalog_get_segment_for_edit(ps_space *s, uint64_t owner,
+                                    const void *name, size_t length,
+                                    ps_catalog_view **out, lc_error *e) {
+  uint64_t local = 0, peer = 0;
+  int rc = catalog_get(s, owner, PS_CATALOG_SEGMENT, name, length, out, &local,
+                       &peer, e);
+  if (rc == LC_OK && (local || peer)) {
+    rc = ps_internal_durable_prefix(s, local, peer, e);
+    if (rc == LC_OK)
+      rc = ps_catalog_get(s, owner, PS_CATALOG_SEGMENT, name, length, out, e);
+  }
   return rc;
 }
 int ps_catalog_view_info(const ps_catalog_view *view, ps_catalog_info *out,

@@ -68,6 +68,10 @@ int ps_catalog_remove_many(ps_space *, uint64_t owner,
 int ps_catalog_get(ps_space *, uint64_t owner, unsigned int kind,
                    const void *name, size_t length, ps_catalog_view **,
                    lc_error *);
+/* With namespace edit authority held, certify and recover an unselected
+ * successor whose previous editor died after framing its binding. */
+int ps_catalog_get_segment_for_edit(ps_space *, uint64_t owner, const void *,
+                                    size_t, ps_catalog_view **, lc_error *);
 int ps_catalog_view_info(const ps_catalog_view *, ps_catalog_info *,
                          lc_error *);
 int ps_catalog_view_marker(const ps_catalog_view *, const unsigned char **,

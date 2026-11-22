@@ -1006,8 +1006,9 @@ static int prepare(struct ps_namespace_data *d, ps_budget *budget, uint64_t id,
   if (!s)
     return LC_ERR_NOMEM;
   s->unselected = 1;
-  rc = ps_catalog_get(d->ns->root->space, d->ns->identity.owner,
-                      PS_CATALOG_SEGMENT, s->leaf, strlen(s->leaf), &view, e);
+  rc =
+      ps_catalog_get_segment_for_edit(d->ns->root->space, d->ns->identity.owner,
+                                      s->leaf, strlen(s->leaf), &view, e);
   if (rc == LC_OK && view)
     rc = ps_catalog_view_info(view, &s->binding, e);
   if (rc == LC_OK && view &&

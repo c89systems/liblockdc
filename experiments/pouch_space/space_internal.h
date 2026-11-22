@@ -358,6 +358,8 @@ void ps_internal_entry_auxiliary(ps_entry *);
 void ps_internal_install(ps_space *, ps_entry *);
 void ps_internal_remove(ps_space *, ps_entry *, uint64_t);
 int ps_internal_durable(ps_space *, uint64_t, lc_error *);
+int ps_internal_durable_prefix(ps_space *, uint64_t local, uint64_t peer,
+                               lc_error *);
 void ps_internal_collect(ps_space *);
 int ps_internal_budget_ranges(ps_space *, uint64_t, ps_run **, lc_error *);
 void ps_internal_free_coalesce(ps_space *);

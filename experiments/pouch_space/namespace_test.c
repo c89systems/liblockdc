@@ -3123,6 +3123,114 @@ static void shared_abandoned(const char *path) {
   REQUIRE(unlink(path) == 0);
   shared_namespace = 0;
 }
+typedef struct successor_barrier {
+  int notify, flush_first, armed;
+} successor_barrier;
+static ssize_t successor_read(void *context, int fd, void *bytes, size_t n,
+                              off_t at) {
+  (void)context;
+  return pread(fd, bytes, n, at);
+}
+static int successor_sync(void *context, int fd) {
+  successor_barrier *barrier = context;
+  if (barrier->armed) {
+    /* Leave the framed binding at either edge of the sync callback,
+     * before the process certifies the result to its surviving peer. */
+    if (barrier->flush_first)
+      REQUIRE(fdatasync(fd) == 0);
+    REQUIRE(write(barrier->notify, "P", 1) == 1);
+    for (;;)
+      pause();
+  }
+  return fdatasync(fd);
+}
+static void successor_child(const char *path, int notify, int mode) {
+  successor_barrier barrier = {notify, mode & 1, 0};
+  ps_io io = {&barrier,       successor_read, direct_write,
+              successor_sync, direct_reserve, NULL};
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace_append *appender = NULL;
+  lc_error e = {0};
+  shared_namespace = 1;
+  options.storage.durable_sync = mode >> 1;
+  options.storage.io = &io;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "successor", 0, &e);
+  barrier.armed = 1;
+  ok(ps_namespace_append_begin(ns, 0, 1, PS_APPEND_PREFIX, NULL, &appender, &e),
+     &e);
+  REQUIRE(0);
+}
+static void shared_successor(const char *path, int mode) {
+  const char *leaf = "seg-00000000000000000001.log";
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_catalog_view *binding = NULL;
+  ps_catalog_info repaired;
+  ps_namespace_info identity;
+  ps_namespace_status admitted;
+  ps_owned_status staged;
+  int notify[2], exited;
+  char event;
+  lc_error e = {0};
+  shared_namespace = 1;
+  options.storage.durable_sync = mode >> 1;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ps_namespace *ns = acquire(root, "successor", 1, &e);
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  REQUIRE(pipe(notify) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    char notify_fd[24], flags[8];
+    REQUIRE(close(notify[0]) == 0);
+    snprintf(notify_fd, sizeof(notify_fd), "%d", notify[1]);
+    snprintf(flags, sizeof(flags), "%d", mode);
+    execlp(program, program, "--successor-child", path, notify_fd, flags,
+           (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(close(notify[1]) == 0);
+  REQUIRE(read(notify[0], &event, 1) == 1 && event == 'P');
+  ok(ps_catalog_get(ps_root_space(root), identity.owner, PS_CATALOG_SEGMENT,
+                    leaf, strlen(leaf), &binding, &e),
+     &e);
+  REQUIRE(!binding);
+  ps_key successor = {identity.owner, 1, PS_STREAM};
+  ok(ps_owned_inspect(ps_root_space(root), successor, NULL, &staged, &e), &e);
+  REQUIRE(!staged.tail && !staged.capacity);
+  REQUIRE(kill(child, SIGKILL) == 0 && waitpid(child, &exited, 0) == child &&
+          WIFSIGNALED(exited) && WTERMSIG(exited) == SIGKILL);
+  REQUIRE(close(notify[0]) == 0);
+  ok(ps_catalog_get(ps_root_space(root), identity.owner, PS_CATALOG_SEGMENT,
+                    leaf, strlen(leaf), &binding, &e),
+     &e);
+  REQUIRE(!binding);
+  ok(append(root, ns, 1, 0, 64, &e), &e);
+  ok(ps_flush(ps_root_space(root), &e), &e);
+  ok(ps_catalog_get(ps_root_space(root), identity.owner, PS_CATALOG_SEGMENT,
+                    leaf, strlen(leaf), &binding, &e),
+     &e);
+  ok(ps_catalog_view_info(binding, &repaired, &e), &e);
+  REQUIRE(repaired.target.incarnation == staged.ref.incarnation &&
+          !memcmp(repaired.target.container, staged.ref.container,
+                  sizeof(staged.ref.container)));
+  ps_catalog_view_close(binding);
+  ok(ps_namespace_status_get(ns, &admitted, &e), &e);
+  REQUIRE(admitted.active_segment == 1 && admitted.bound_segments == 1);
+  count(ns, 1, &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ns = acquire(root, "successor", 0, &e);
+  count(ns, 1, &e);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  shared_namespace = 0;
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -3196,11 +3304,18 @@ static void *worker(void *p) {
     shared_source_exit(r->path);
   else if (!strcmp(r->mode, "shared-abandoned"))
     shared_abandoned(r->path);
-  else
+  else if (!strcmp(r->mode, "shared-successor")) {
+    for (int mode = 0; mode < 4; ++mode)
+      shared_successor(r->path, mode);
+  } else
     concurrency(r->path);
   return NULL;
 }
 int main(int argc, char **argv) {
+  if (argc == 5 && !strcmp(argv[1], "--successor-child")) {
+    successor_child(argv[2], atoi(argv[3]), atoi(argv[4]));
+    return 0;
+  }
   if (argc == 4 && !strcmp(argv[1], "--shared-child")) {
     namespace_abandoned_child(argv[2], atoi(argv[3]));
     return 0;
