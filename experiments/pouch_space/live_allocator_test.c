@@ -2345,7 +2345,7 @@ static void checkpoint_page_checksum(unsigned char *page) {
   for (size_t i = 0; i < 4; ++i)
     page[48 + i] = (unsigned char)(crc >> (8 * i));
 }
-static void reject_descriptor_checksum(ps_directory_value ref) {
+static void reject_descriptor_checksum(ps_descriptor_ref ref) {
   unsigned char original[PS_PAGE], damaged[PS_PAGE];
   off_t page = (off_t)(ref.offset / PS_PAGE * PS_PAGE);
   size_t at = (size_t)(ref.offset % PS_PAGE);
@@ -2382,7 +2382,7 @@ static void checkpoint_ownership_overlap(void) {
     const ps_entry *second = ps_internal_lookup(writer, key(2));
     REQUIRE(first && second && first->count == 1 && second->count == 1);
     uint64_t offset = first->extents[0].offset;
-    const ps_directory_value ref = second->checkpoint_ref;
+    const ps_descriptor_ref ref = second->checkpoint_ref;
     size_t at = (size_t)(ref.offset % PS_PAGE);
     off_t page = (off_t)(ref.offset - at);
     unsigned char original[PS_PAGE], damaged[PS_PAGE];
@@ -2441,7 +2441,7 @@ static void checkpoint_binding_reuse(int durable) {
   ok(ps_read_open(observer, key(1), NULL, &pinned, &e), &e);
   const ps_entry *before = ps_internal_lookup(observer, key(160));
   REQUIRE(before);
-  ps_directory_value ref = before->checkpoint_ref;
+  ps_descriptor_ref ref = before->checkpoint_ref;
   probe.pages[0] = ref.offset / PS_PAGE * PS_PAGE;
   probe.count = 1;
   uint64_t generation = observer->generation;
@@ -2580,10 +2580,83 @@ static void checkpoint_startup_seed(int durable) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
+static void checkpoint_packed_bindings(int durable) {
+  lc_error e = {0};
+  ps_options options = {.durable_sync = durable};
+  ps_key slot = {123, 1, PS_KEY_METADATA}, decision = {123, 2, PS_KEY_DECISION},
+         large = {123, 3, PS_KEY_DECISION};
+  unsigned char payload[65], original[PS_PAGE], damaged[PS_PAGE];
+  ps_space *writer = NULL, *observer = NULL, *join = NULL;
+  ps_writer *value = NULL;
+  ps_reader *pinned = NULL, *reader = NULL;
+  memset(payload, 1, sizeof(payload));
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_open(path, 0, &options, &observer, &e), &e);
+  ok(ps_begin(writer, NULL, slot, &value, &e), &e);
+  ok(ps_write(value, payload, sizeof(payload), &e), &e);
+  ok(ps_writer_key_deletion(value, 128, &e), &e);
+  ok(ps_publish(value, NULL, &e), &e);
+  ps_writer_close(value);
+  capture_put_key(writer, decision, 129);
+  capture_put_key(writer, large, PS_CHUNK + 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  REQUIRE(!ps_internal_lookup(writer, slot)->checkpoint_ref.offset &&
+          !ps_internal_lookup(writer, decision)->checkpoint_ref.offset &&
+          ps_internal_lookup(writer, large)->checkpoint_ref.offset);
+  off_t page = (off_t)writer->directory.offset;
+  REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  REQUIRE(original[4] == 0 && original[8] == 3 && original[64 + 4] == 1);
+  for (int mode = 0; mode < 2; ++mode) {
+    memcpy(damaged, original, sizeof(damaged));
+    if (mode)
+      damaged[64 + 57] = 5; /* deletion exceeds the selected key slot */
+    else
+      damaged[64 + 24] ^= 1U; /* misaligned packed extent */
+    uint32_t crc =
+        (uint32_t)crc32(crc32(0, damaged, 12), damaged + 16, PS_PAGE - 16);
+    for (size_t i = 0; i < 4; ++i)
+      damaged[12 + i] = (unsigned char)(crc >> (8 * i));
+    REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
+            sizeof(damaged));
+    uint64_t generation = observer->generation;
+    REQUIRE(ps_refresh(observer, &e) == LC_ERR_PROTOCOL &&
+            observer->generation == generation);
+    lc_error_cleanup(&e);
+    REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_PROTOCOL && !join);
+    lc_error_cleanup(&e);
+  }
+  REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  ok(ps_read_open(observer, slot, NULL, &pinned, &e), &e);
+  REQUIRE(ps_reader_key_deletion(pinned) == 128);
+  capture_put_key(writer, slot, PS_PAGE);
+  ok(ps_metadata_repack(writer, &e), &e);
+  ok(ps_read_open(observer, slot, NULL, &reader, &e), &e);
+  REQUIRE(!ps_reader_key_deletion(reader));
+  captured_expect(reader, 1, PS_PAGE);
+  ps_reader_close(reader);
+  captured_expect(pinned, 1, 65);
+  ps_reader_close(pinned);
+  ok(ps_close(observer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  ok(ps_read_open(join, decision, NULL, &reader, &e), &e);
+  captured_expect(reader, 2, 129);
+  ps_reader_close(reader);
+  ok(ps_read_open(join, large, NULL, &reader, &e), &e);
+  captured_expect(reader, 3, PS_CHUNK + 65);
+  ps_reader_close(reader);
+  ok(ps_check(join, &e), &e);
+  ok(ps_close(join, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);
+  checkpoint_packed_bindings(0);
+  checkpoint_packed_bindings(1);
   checkpoint_startup_seed(0);
   checkpoint_startup_seed(1);
   ps_space *writer = NULL, *join = NULL;
@@ -2593,9 +2666,9 @@ static void checkpoint_decode(void) {
   for (uint64_t id = 1; id <= 36; ++id)
     capture_put(writer, id, id == 3 ? 3 * PS_CHUNK : 65);
   ok(ps_checkpoint(writer, &e), &e);
-  ps_directory_value short_ref =
+  ps_descriptor_ref short_ref =
       ps_internal_lookup(writer, key(24))->checkpoint_ref;
-  ps_directory_value extent_vector =
+  ps_descriptor_ref extent_vector =
       ps_internal_lookup(writer, key(3))->checkpoint_ref;
   REQUIRE(short_ref.bytes == 88 && extent_vector.bytes > 128);
   reject_descriptor_checksum(short_ref);

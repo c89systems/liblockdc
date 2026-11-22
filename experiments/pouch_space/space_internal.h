@@ -101,7 +101,7 @@ typedef struct ps_entry {
   struct ps_entry *value_next, **value_link;
   struct ps_entry *retired_next, **retired_link;
   struct ps_entry *dirty_next, **dirty_link;
-  ps_directory_value checkpoint_ref, pending_ref;
+  ps_descriptor_ref checkpoint_ref, pending_ref;
   struct ps_catalog_record *catalog;
 } ps_entry;
 typedef struct ps_run {

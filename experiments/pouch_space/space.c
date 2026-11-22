@@ -2113,6 +2113,10 @@ static ps_entry *decoded_entry_new(ps_entry_batch_builder *builder,
   p->embedded_extents = count != 0;
   return p;
 }
+static int valid_packed_extent(uint64_t offset, uint64_t bytes) {
+  return bytes && bytes < PS_PAGE && offset % PS_CELL == 0 &&
+         cell_count(bytes) * PS_CELL <= PS_PAGE - offset % PS_PAGE;
+}
 static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
                         const unsigned char *wire, size_t bytes, ps_entry **out,
                         int *event, lc_error *error) {
@@ -2208,8 +2212,7 @@ static int decode_entry(ps_space *s, ps_entry_batch_builder *builder,
              ? (count != 1 || p->extents[i].flags != EXTENT_OWNED ||
                 offset % PS_PAGE || n % PS_PAGE)
          : p->extents[i].flags == EXTENT_PACKED
-             ? (n >= PS_PAGE || offset % PS_CELL ||
-                cell_count(n) * PS_CELL > PS_PAGE - offset % PS_PAGE)
+             ? !valid_packed_extent(offset, n)
              : (p->extents[i].flags || offset % PS_PAGE || n % PS_PAGE)) ||
         UINT64_MAX - sum < n)
       goto invalid;
@@ -3026,7 +3029,7 @@ static int metadata_next(metadata_builder *b, int continuation,
   return rc;
 }
 static int metadata_append(metadata_builder *b, const unsigned char *wire,
-                           size_t bytes, ps_directory_value *ref,
+                           size_t bytes, ps_descriptor_ref *ref,
                            lc_error *error) {
   size_t done = 0, take;
   int rc;
@@ -3053,8 +3056,7 @@ static int metadata_append(metadata_builder *b, const unsigned char *wire,
       return rc;
   }
 }
-static int metadata_unref(ps_space *s, ps_directory_value ref,
-                          lc_error *error) {
+static int metadata_unref(ps_space *s, ps_descriptor_ref ref, lc_error *error) {
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, following;
   size_t at = (size_t)(ref.offset % PS_PAGE), take;
   ps_meta_page *p;
@@ -3083,7 +3085,7 @@ static int metadata_prepare_retirement(ps_space *s,
                                        int dense, lc_error *error) {
   ps_meta_page *page;
   ps_entry *p;
-  ps_directory_value ref;
+  ps_descriptor_ref ref;
   uint64_t offset;
   size_t i, at, take;
   int rc;
@@ -3198,13 +3200,27 @@ void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
   }
 }
 static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
-                                 lc_error *error) {
-  unsigned char *wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
+                                 ps_directory_value *value, lc_error *error) {
+  unsigned char *wire;
   int rc;
+  memset(value, 0, sizeof(*value));
+  if ((p->key.kind == PS_KEY_METADATA || p->key.kind == PS_KEY_DECISION) &&
+      p->count == 1 && p->extents[0].flags == EXTENT_PACKED) {
+    value->ref.offset = p->extents[0].offset;
+    value->ref.bytes = p->bytes;
+    value->ref.incarnation = p->token;
+    value->deletion_bytes = p->deletion_bytes;
+    value->crc = p->extents[0].crc;
+    value->packed = 1;
+    return LC_OK;
+  }
+  wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
   if (!wire)
     return err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
   encode_entry(wire, p, builder->space->sequence, PS_PUT);
   rc = metadata_append(builder, wire, entry_bytes(p), &p->pending_ref, error);
+  if (rc == LC_OK)
+    value->ref = p->pending_ref;
   lc_free_with_allocator(NULL, wire);
   return rc;
 }
@@ -3220,12 +3236,8 @@ static int checkpoint_entry_next(void *v, ps_key *key,
                                  ps_directory_value *value, lc_error *error) {
   checkpoint_entries *entries = v;
   ps_entry *p = *entries->next++;
-  int rc = checkpoint_descriptor(entries->builder, p, error);
-  if (rc == LC_OK) {
-    *key = p->key;
-    *value = p->pending_ref;
-  }
-  return rc;
+  *key = p->key;
+  return checkpoint_descriptor(entries->builder, p, value, error);
 }
 static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
                                      metadata_builder *builder,
@@ -3316,6 +3328,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   checkpoint_zero_range zero_ranges[CHECKPOINT_ZERO_RANGES];
   ps_directory *directory = NULL;
   ps_directory_root new_root = {0}, empty = {0};
+  ps_directory_value value;
   ps_directory_pages changes;
   metadata_builder builder;
   size_t i, zero_count = 0;
@@ -3374,9 +3387,9 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     if (p->deleted)
       rc = ps_directory_remove(directory, p->key, &removed, error);
     else {
-      rc = checkpoint_descriptor(&builder, p, error);
+      rc = checkpoint_descriptor(&builder, p, &value, error);
       if (rc == LC_OK)
-        rc = ps_directory_put(directory, p->key, p->pending_ref, error);
+        rc = ps_directory_put(directory, p->key, value, error);
     }
   }
   if (rc == LC_OK)
@@ -3992,7 +4005,7 @@ typedef struct metadata_read_page {
 } metadata_read_page;
 typedef struct metadata_directory_entry {
   ps_key key;
-  ps_directory_value ref;
+  ps_directory_value value;
   ps_entry *resident, *decoded;
 } metadata_directory_entry;
 typedef struct metadata_recovery {
@@ -4093,8 +4106,8 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   return LC_OK;
 }
 static int metadata_physical_order(const void *a, const void *b) {
-  uint64_t left = (*(metadata_directory_entry *const *)a)->ref.offset;
-  uint64_t right = (*(metadata_directory_entry *const *)b)->ref.offset;
+  uint64_t left = (*(metadata_directory_entry *const *)a)->value.ref.offset;
+  uint64_t right = (*(metadata_directory_entry *const *)b)->value.ref.offset;
   return left < right ? -1 : left != right;
 }
 static int metadata_read_ahead(metadata_recovery *r,
@@ -4107,7 +4120,7 @@ static int metadata_read_ahead(metadata_recovery *r,
   int rc = LC_OK;
   ++r->batch;
   for (i = 0; i < n; ++i) {
-    offset = entries[i]->ref.offset / PS_PAGE * PS_PAGE;
+    offset = entries[i]->value.ref.offset / PS_PAGE * PS_PAGE;
     if (count && offset == offsets[count - 1])
       continue;
     if (!metadata_offset(r->space, offset))
@@ -4192,7 +4205,7 @@ static int recover_descriptor_page(ps_space *s, uint64_t offset,
   ++p->references;
   return LC_OK;
 }
-static int metadata_read(metadata_recovery *recovery, ps_directory_value ref,
+static int metadata_read(metadata_recovery *recovery, ps_descriptor_ref ref,
                          const unsigned char **wire, lc_error *error) {
   ps_space *s = recovery->space;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
@@ -4235,7 +4248,7 @@ static int reuse_directory_entry(metadata_recovery *r,
                                  metadata_directory_entry *item,
                                  lc_error *error) {
   const ps_entry *old = item->resident;
-  ps_directory_value ref = item->ref;
+  ps_descriptor_ref ref = item->value.ref;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), remaining = (size_t)ref.bytes;
   ps_entry *p;
@@ -4281,7 +4294,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
                                   metadata_directory_entry *item,
                                   lc_error *error) {
   ps_space *s = recovery->space;
-  ps_directory_value ref = item->ref;
+  ps_descriptor_ref ref = item->value.ref;
   const unsigned char *wire = NULL;
   ps_entry *p = NULL;
   ps_entry *old =
@@ -4313,6 +4326,37 @@ static int decode_directory_entry(metadata_recovery *recovery,
     entry_free(p);
   return rc;
 }
+static int decode_packed_binding(metadata_recovery *r,
+                                 metadata_directory_entry *item,
+                                 lc_error *error) {
+  ps_space *s = r->space;
+  const ps_directory_value *value = &item->value;
+  ps_descriptor_ref ref = value->ref;
+  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
+  if (ref.incarnation > s->token_limit || ref.offset < PS_DATA ||
+      ref.offset > s->capacity || ref.bytes > s->capacity - ref.offset ||
+      !valid_packed_extent(ref.offset, ref.bytes) ||
+      (value->deletion_bytes > ref.bytes &&
+       value->deletion_bytes - ref.bytes > 512))
+    return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
+  if (old && old->token != ref.incarnation)
+    old = NULL;
+  p = decoded_entry_new(!r->resident || old ? &r->batch_entries : NULL,
+                        item->key.kind, 1);
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
+  p->key = item->key;
+  p->token = ref.incarnation;
+  p->bytes = ref.bytes;
+  p->count = p->capacity = 1;
+  p->extents[0].offset = ref.offset;
+  p->extents[0].bytes = ref.bytes;
+  p->extents[0].crc = value->crc;
+  p->extents[0].flags = EXTENT_PACKED;
+  p->projection = old;
+  item->decoded = p;
+  return ps_internal_reserve_entry(p, value->deletion_bytes, error);
+}
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
   metadata_directory_entry **fetch;
@@ -4326,7 +4370,10 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->resident) {
+    if (item->value.packed) {
+      r->batch_entries.remaining = r->count - i;
+      rc = decode_packed_binding(r, item, error);
+    } else if (item->resident) {
       r->batch_entries.remaining = r->count - i;
       rc = reuse_directory_entry(r, item, error);
     } else
@@ -4364,10 +4411,12 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   }
   return LC_OK;
 }
-static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
+static int capture_directory_entry(void *v, ps_key key,
+                                   const ps_directory_value *value,
                                    lc_error *error) {
   metadata_recovery *r = v;
   metadata_directory_entry *item;
+  ps_descriptor_ref ref = value->ref;
   ps_entry *old = NULL;
   size_t capacity;
   if (r->count == r->capacity) {
@@ -4381,7 +4430,8 @@ static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
     r->entries = item;
     r->capacity = capacity;
   }
-  if (r->shared_leaf && ref.incarnation <= r->space->token_limit &&
+  if (!value->packed && r->shared_leaf &&
+      ref.incarnation <= r->space->token_limit &&
       (immutable_key(key) || key.kind == PS_CATALOG)) {
     old = lookup(r->resident, key);
     if (old &&
@@ -4393,7 +4443,7 @@ static int capture_directory_entry(void *v, ps_key key, ps_directory_value ref,
   }
   item = &r->entries[r->count++];
   item->key = key;
-  item->ref = ref;
+  item->value = *value;
   item->resident = old;
   item->decoded = NULL;
   return LC_OK;

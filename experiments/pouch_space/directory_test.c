@@ -137,7 +137,8 @@ static ps_key key(uint64_t number) {
   return result;
 }
 static ps_directory_value value(uint64_t number, uint64_t incarnation) {
-  ps_directory_value result = {PS_DATA + number * 128, 64, incarnation};
+  ps_directory_value result = {
+      {PS_DATA + number * 128, 64, incarnation}, 0, 0, 0};
   return result;
 }
 static ps_directory *open_directory(ps_directory_io *io,
@@ -152,8 +153,9 @@ static void expect(ps_directory *d, uint64_t number, uint64_t incarnation) {
   OK(ps_directory_get(d, key(number), &actual, &found, &error));
   CHECK(found == (incarnation != 0));
   if (incarnation) {
-    CHECK(actual.offset == wanted.offset && actual.bytes == wanted.bytes);
-    CHECK(actual.incarnation == incarnation);
+    CHECK(actual.ref.offset == wanted.ref.offset &&
+          actual.ref.bytes == wanted.ref.bytes);
+    CHECK(actual.ref.incarnation == incarnation && !actual.packed);
   }
 }
 typedef struct scan {
@@ -173,7 +175,7 @@ static int scan_page(void *v, ps_directory_root ref, lc_error *e) {
   ++s->pages;
   return LC_OK;
 }
-static int scan_entry(void *v, ps_key k, ps_directory_value actual,
+static int scan_entry(void *v, ps_key k, const ps_directory_value *actual,
                       lc_error *e) {
   scan *s = v;
   ps_directory_value wanted;
@@ -182,8 +184,9 @@ static int scan_entry(void *v, ps_key k, ps_directory_value actual,
   CHECK(!s->count || s->previous < k.key);
   CHECK(s->expected[k.key] != 0);
   wanted = value(k.key, s->expected[k.key]);
-  CHECK(actual.offset == wanted.offset && actual.bytes == wanted.bytes &&
-        actual.incarnation == wanted.incarnation);
+  CHECK(actual->ref.offset == wanted.ref.offset &&
+        actual->ref.bytes == wanted.ref.bytes &&
+        actual->ref.incarnation == wanted.ref.incarnation && !actual->packed);
   s->previous = (size_t)k.key;
   ++s->count;
   return LC_OK;
@@ -461,7 +464,7 @@ static void disk32(unsigned char *p, uint32_t n) {
 static void repair_crc(unsigned char *p) {
   disk32(p + 12, (uint32_t)crc32(crc32(0, p, 12), p + 16, PS_PAGE - 16));
 }
-static int discard_entry(void *v, ps_key k, ps_directory_value value_,
+static int discard_entry(void *v, ps_key k, const ps_directory_value *value_,
                          lc_error *e) {
   (void)v;
   (void)k;
@@ -491,11 +494,11 @@ static void corruption_and_identity(void) {
   root = flush(&p, d, 1, 1);
   d = open_directory(&io, root);
   OK(ps_directory_get(d, wide, &out, &found, &error));
-  CHECK(found && out.incarnation == UINT64_MAX);
+  CHECK(found && out.ref.incarnation == UINT64_MAX);
   OK(ps_directory_get(d, collection, &out, &found, &error));
-  CHECK(found && out.incarnation == 2);
+  CHECK(found && out.ref.incarnation == 2);
   OK(ps_directory_get(d, owner, &out, &found, &error));
-  CHECK(found && out.incarnation == 3);
+  CHECK(found && out.ref.incarnation == 3);
   ps_directory_close(d);
   foreign = io;
   foreign.identity[7] ^= 1;
@@ -586,7 +589,7 @@ static void corruption_and_identity(void) {
        "binding validation");
 }
 
-static int failed_visit(void *context, ps_key k, ps_directory_value val,
+static int failed_visit(void *context, ps_key k, const ps_directory_value *val,
                         lc_error *e) {
   (void)context;
   (void)k;
@@ -635,13 +638,13 @@ static void api_boundaries(void) {
     d = open_directory(&io, empty);
     invalid_value = value(1, 1);
     if (i == 0)
-      invalid_value.offset = 0;
+      invalid_value.ref.offset = 0;
     else if (i == 1)
-      invalid_value.bytes = 0;
+      invalid_value.ref.bytes = 0;
     else if (i == 2)
-      invalid_value.incarnation = 0;
+      invalid_value.ref.incarnation = 0;
     else
-      invalid_value.bytes = UINT64_MAX;
+      invalid_value.ref.bytes = UINT64_MAX;
     BAD(ps_directory_put(d, key(1), invalid_value, &error));
     ps_directory_close(d);
   }

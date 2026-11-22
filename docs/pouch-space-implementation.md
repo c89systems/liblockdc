@@ -38,8 +38,10 @@ outside the native contract.
 ## Physical ownership and recovery
 
 Checksummed root selectors and a bounded rolling journal choose the accepted
-physical prefix. A copy-on-write directory and packed descriptors bind typed
-identities to extents. Acknowledged durable operations survive recovery.
+physical prefix. A copy-on-write directory binds typed identities to extents.
+Its leaves store ownership descriptors directly for small key metadata and
+transaction decisions. Other descriptors reside in packed metadata pages.
+Acknowledged durable operations survive recovery.
 NoSync work without a durability barrier can be lost. Recovery checks framing,
 ownership, and commit boundaries before admitting complete canonical publication
 groups.

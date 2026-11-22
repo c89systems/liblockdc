@@ -36,8 +36,13 @@ uint64_t ps_directory_packed_pages(uint64_t entries) {
 typedef struct directory_node directory_node;
 typedef struct directory_item {
   ps_key key;
-  ps_directory_value value;
-  directory_node *child;
+  union {
+    ps_directory_value value;
+    struct {
+      ps_directory_root ref;
+      directory_node *node;
+    } child;
+  } binding;
 } directory_item;
 struct directory_node {
   ps_directory_root original, written;
@@ -94,10 +99,16 @@ static int valid_root(ps_directory_root root) {
          (root.offset && root.offset % PS_PAGE == 0 &&
           root.offset <= (uint64_t)INT64_MAX - PS_PAGE && root.generation);
 }
-static int valid_value(ps_directory_value value) {
-  return value.offset && value.bytes && value.incarnation &&
-         value.offset <= INT64_MAX &&
-         value.bytes <= (uint64_t)INT64_MAX - value.offset;
+static int valid_value(ps_key key, const ps_directory_value *value) {
+  const ps_descriptor_ref *ref = &value->ref;
+  if (!ref->offset || !ref->bytes || !ref->incarnation ||
+      ref->offset > INT64_MAX || ref->bytes > (uint64_t)INT64_MAX - ref->offset)
+    return 0;
+  if (!value->packed)
+    return !value->crc && !value->deletion_bytes;
+  return value->packed == 1 && ref->bytes < PS_PAGE &&
+         (key.kind == PS_KEY_METADATA ||
+          (key.kind == PS_KEY_DECISION && !value->deletion_bytes));
 }
 static int available(ps_directory *d, lc_error *error) {
   return d && !d->failed && !d->flushed
@@ -123,6 +134,8 @@ static int read_node(ps_directory *d, ps_directory_root ref,
   unsigned char *page;
   directory_node *node;
   directory_item *item;
+  ps_directory_root child;
+  ps_directory_value *value;
   const unsigned char *slot;
   unsigned int i;
   int rc;
@@ -156,25 +169,34 @@ static int read_node(ps_directory *d, ps_directory_root ref,
     item->key.kind = load32(slot);
     item->key.owner = load64(slot + 8);
     item->key.key = load64(slot + 16);
-    item->value.offset = load64(slot + 24);
-    item->value.bytes = load64(slot + 32);
-    item->value.incarnation = load64(slot + 40);
-    if (!item->key.kind || load32(slot + 4) || load64(slot + 48) ||
-        load64(slot + 56) ||
-        (i &&
-         ps_directory_key_compare(node->items[i - 1].key, item->key) >= 0) ||
-        (node->level
-             ? (!item->value.offset || item->value.offset % PS_PAGE ||
-                item->value.offset > (uint64_t)INT64_MAX - PS_PAGE ||
-                !item->value.bytes || item->value.bytes > ref.generation ||
-                item->value.incarnation)
-             : !valid_value(item->value))) {
-      rc = directory_error(error, LC_ERR_PROTOCOL,
-                           "invalid checkpoint directory slot");
-      goto done;
+    if (!item->key.kind ||
+        (i && ps_directory_key_compare(node->items[i - 1].key, item->key) >= 0))
+      goto invalid_slot;
+    if (node->level) {
+      child.offset = load64(slot + 24);
+      child.generation = load64(slot + 32);
+      if (!child.offset || !valid_root(child) ||
+          child.generation > ref.generation || load32(slot + 4) ||
+          load64(slot + 40) || load64(slot + 48) || load64(slot + 56))
+        goto invalid_slot;
+      item->binding.child.ref = child;
+    } else {
+      value = &item->binding.value;
+      value->packed = load32(slot + 4);
+      value->ref.offset = load64(slot + 24);
+      value->ref.bytes = load64(slot + 32);
+      value->ref.incarnation = load64(slot + 40);
+      value->crc = load32(slot + 48);
+      value->deletion_bytes = load64(slot + 56);
+      if (load32(slot + 52) || !valid_value(item->key, value))
+        goto invalid_slot;
     }
   }
   *out = node;
+  goto done;
+invalid_slot:
+  rc = directory_error(error, LC_ERR_PROTOCOL,
+                       "invalid checkpoint directory slot");
 done:
   lc_free_with_allocator(NULL, page);
   return rc;
@@ -195,16 +217,14 @@ static int child_node(ps_directory *d, directory_node *parent,
                       unsigned int index, directory_node **out,
                       lc_error *error) {
   directory_item *item = &parent->items[index];
-  ps_directory_root ref;
   int rc;
-  if (!item->child) {
-    ref.offset = item->value.offset;
-    ref.generation = item->value.bytes;
-    rc = read_node(d, ref, &item->child, error);
+  if (!item->binding.child.node) {
+    rc =
+        read_node(d, item->binding.child.ref, &item->binding.child.node, error);
     if (rc != LC_OK)
       return rc;
   }
-  *out = item->child;
+  *out = item->binding.child.node;
   if ((!(*out)->dirty && (*out)->count < MINIMUM) ||
       (*out)->level + 1 != parent->level ||
       ps_directory_key_compare((*out)->items[0].key, item->key) ||
@@ -287,13 +307,13 @@ static int build_node(ps_directory *d, packed_directory *plan,
   for (i = 0; rc == LC_OK && i < node->count; ++i) {
     item = &node->items[i];
     if (level) {
-      rc = build_node(d, plan, level - 1, &item->child, error);
+      rc = build_node(d, plan, level - 1, &item->binding.child.node, error);
       if (rc == LC_OK)
-        item->key = item->child->items[0].key;
+        item->key = item->binding.child.node->items[0].key;
     } else {
-      rc = plan->next(plan->context, &item->key, &item->value, error);
+      rc = plan->next(plan->context, &item->key, &item->binding.value, error);
       if (rc == LC_OK &&
-          (!item->key.kind || !valid_value(item->value) ||
+          (!item->key.kind || !valid_value(item->key, &item->binding.value) ||
            ps_directory_key_compare(plan->previous, item->key) >= 0))
         rc = directory_error(error, LC_ERR_PROTOCOL,
                              "packed directory input is not ordered");
@@ -350,7 +370,7 @@ int ps_directory_get(ps_directory *d, ps_key key, ps_directory_value *out,
     index = position(node, key);
     if (index < node->count &&
         !ps_directory_key_compare(node->items[index].key, key)) {
-      *out = node->items[index].value;
+      *out = node->items[index].binding.value;
       *found = 1;
     }
   }
@@ -365,7 +385,7 @@ static void insert_item(directory_node *node, unsigned int index,
   node->dirty = 1;
 }
 static int put_node(ps_directory *d, directory_node *node, ps_key key,
-                    ps_directory_value value, directory_node **split,
+                    const ps_directory_value *value, directory_node **split,
                     lc_error *error) {
   directory_node *child, *right;
   directory_item item;
@@ -376,14 +396,14 @@ static int put_node(ps_directory *d, directory_node *node, ps_key key,
   if (!node->level) {
     if (index < node->count &&
         !ps_directory_key_compare(node->items[index].key, key)) {
-      if (memcmp(&node->items[index].value, &value, sizeof(value))) {
-        node->items[index].value = value;
+      if (memcmp(&node->items[index].binding.value, value, sizeof(*value))) {
+        node->items[index].binding.value = *value;
         node->dirty = 1;
       }
     } else {
       memset(&item, 0, sizeof(item));
       item.key = key;
-      item.value = value;
+      item.binding.value = *value;
       insert_item(node, index, &item);
     }
   } else {
@@ -400,7 +420,7 @@ static int put_node(ps_directory *d, directory_node *node, ps_key key,
     if (right) {
       memset(&item, 0, sizeof(item));
       item.key = right->items[0].key;
-      item.child = right;
+      item.binding.child.node = right;
       insert_item(node, index + 1, &item);
     }
   }
@@ -423,7 +443,7 @@ int ps_directory_put(ps_directory *d, ps_key key, ps_directory_value value,
                      lc_error *error) {
   directory_node *right, *root;
   int rc = available(d, error);
-  if (rc == LC_OK && (!key.kind || !valid_value(value)))
+  if (rc == LC_OK && (!key.kind || !valid_value(key, &value)))
     rc = directory_error(error, LC_ERR_INVALID,
                          "directory requires typed key and checked value span");
   if (rc == LC_OK)
@@ -434,7 +454,7 @@ int ps_directory_put(ps_directory *d, ps_key key, ps_directory_value value,
       rc = LC_ERR_NOMEM;
   }
   if (rc == LC_OK) {
-    rc = put_node(d, d->root, key, value, &right, error);
+    rc = put_node(d, d->root, key, &value, &right, error);
     if (rc == LC_OK && right) {
       if (d->root->level == MAX_LEVEL)
         rc = directory_error(error, LC_ERR_INVALID,
@@ -447,9 +467,9 @@ int ps_directory_put(ps_directory *d, ps_key key, ps_directory_value value,
           root->count = 2;
           root->dirty = 1;
           root->items[0].key = d->root->items[0].key;
-          root->items[0].child = d->root;
+          root->items[0].binding.child.node = d->root;
           root->items[1].key = right->items[0].key;
-          root->items[1].child = right;
+          root->items[1].binding.child.node = right;
           d->root = root;
         }
       }
@@ -592,7 +612,7 @@ static int visit_node(ps_directory *d, directory_node *node, visit_state *state,
       state->previous = node->items[i].key;
       state->found = 1;
       rc = state->visit ? state->visit(state->context, node->items[i].key,
-                                       node->items[i].value, error)
+                                       &node->items[i].binding.value, error)
                         : LC_OK;
     }
     if (rc != LC_OK)
@@ -631,6 +651,8 @@ static int write_node(ps_directory *d, directory_node *node,
                       uint64_t generation, unsigned char *page,
                       lc_error *error) {
   directory_item *item;
+  const ps_directory_value *value;
+  directory_node *child;
   unsigned char *slot;
   unsigned int i;
   uint64_t offset;
@@ -639,16 +661,17 @@ static int write_node(ps_directory *d, directory_node *node,
     node->written = node->original;
     return LC_OK;
   }
-  for (i = 0; i < node->count; ++i) {
-    item = &node->items[i];
-    if (node->level && item->child) {
-      rc = write_node(d, item->child, generation, page, error);
-      if (rc != LC_OK)
-        return rc;
-      item->value.offset = item->child->written.offset;
-      item->value.bytes = item->child->written.generation;
+  if (node->level)
+    for (i = 0; i < node->count; ++i) {
+      item = &node->items[i];
+      child = item->binding.child.node;
+      if (child) {
+        rc = write_node(d, child, generation, page, error);
+        if (rc != LC_OK)
+          return rc;
+        item->binding.child.ref = child->written;
+      }
     }
-  }
   rc = d->io.allocate(d->io.context, &offset, error);
   if (rc != LC_OK)
     return rc;
@@ -671,9 +694,20 @@ static int write_node(ps_directory *d, directory_node *node,
     store32(slot, item->key.kind);
     store64(slot + 8, item->key.owner);
     store64(slot + 16, item->key.key);
-    store64(slot + 24, item->value.offset);
-    store64(slot + 32, item->value.bytes);
-    store64(slot + 40, item->value.incarnation);
+    if (node->level) {
+      store64(slot + 24, item->binding.child.ref.offset);
+      store64(slot + 32, item->binding.child.ref.generation);
+    } else {
+      value = &item->binding.value;
+      store64(slot + 24, value->ref.offset);
+      store64(slot + 32, value->ref.bytes);
+      store64(slot + 40, value->ref.incarnation);
+      if (value->packed) {
+        store32(slot + 4, value->packed);
+        store32(slot + 48, value->crc);
+        store64(slot + 56, value->deletion_bytes);
+      }
+    }
   }
   store32(page + 12, page_crc(page));
   return d->io.write(d->io.context, offset, page, error);

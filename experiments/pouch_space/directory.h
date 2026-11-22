@@ -3,14 +3,22 @@
 
 #include "space.h"
 
-/* Internal typed checkpoint index. Values identify immutable, packed metadata
- * records; this layer never reads, copies, or caches document bodies. */
+/* Internal typed checkpoint index. Leaves bind keys to metadata records or
+ * hold the extent information for a small value. */
 typedef struct ps_directory ps_directory;
 typedef struct ps_directory_root {
   uint64_t offset, generation;
 } ps_directory_root;
-typedef struct ps_directory_value {
+typedef struct ps_descriptor_ref {
   uint64_t offset, bytes, incarnation;
+} ps_descriptor_ref;
+typedef struct ps_directory_value {
+  ps_descriptor_ref ref;
+  uint64_t deletion_bytes;
+  uint32_t crc;
+  /* When set, ref identifies one packed payload extent. Otherwise it names a
+   * descriptor and both extra fields are zero. */
+  uint32_t packed;
 } ps_directory_value;
 /* read/write transfer exactly one PS_PAGE block; the container handles short
  * I/O and EINTR. allocate reserves a distinct aligned page on success and no
@@ -28,7 +36,7 @@ typedef struct ps_directory_pages {
   const ps_directory_root *allocated, *retired;
   size_t allocated_count, retired_count;
 } ps_directory_pages;
-typedef int (*ps_directory_visit_fn)(void *, ps_key, ps_directory_value,
+typedef int (*ps_directory_visit_fn)(void *, ps_key, const ps_directory_value *,
                                      lc_error *);
 typedef int (*ps_directory_page_fn)(void *, ps_directory_root, lc_error *);
 typedef int (*ps_directory_next_fn)(void *, ps_key *, ps_directory_value *,
@@ -56,7 +64,8 @@ int ps_directory_remove(ps_directory *, ps_key, int *, lc_error *);
 /* Walks verified entries and/or reachable page ownership. Page visitation
  * requires an unmodified view; recovery uses it to rebuild the free-space map.
  * The page callback precedes that node's children or leaf bindings.
- * Callbacks must not re-enter this handle. */
+ * The binding is borrowed for the callback. Callbacks must not re-enter this
+ * handle. */
 int ps_directory_visit(ps_directory *, ps_directory_visit_fn,
                        ps_directory_page_fn, void *, lc_error *);
 /* Writes changed paths only. generation exceeds the starting root generation.
