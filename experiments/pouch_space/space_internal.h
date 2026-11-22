@@ -285,6 +285,10 @@ int ps_internal_read_witness_valid(ps_space *);
 int ps_internal_values_startup_walk(ps_space *, uint64_t owner,
                                     ps_value_read_fn, void *, int *accepted,
                                     lc_error *);
+/* Borrow checked metadata bytes for the startup walk callback. A null span
+ * means the reader needs ordinary I/O. */
+int ps_internal_checkpoint_span(ps_reader *, const unsigned char **,
+                                lc_error *);
 /* Drop an unreturned capture before allowing another local adoption. */
 void ps_internal_values_discard_locked(ps_values *);
 int ps_internal_healthy(ps_space *, lc_error *);

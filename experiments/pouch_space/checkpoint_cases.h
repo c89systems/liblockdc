@@ -169,8 +169,20 @@ static void checkpoint_idempotence(int durable) {
   clean();
 }
 
+typedef struct checkpoint_walk {
+  const char *leaf;
+  lc_pouch_state_entry metadata, decision;
+} checkpoint_walk;
+static int checkpoint_walk_decode(void *context, ps_key key, ps_reader *reader,
+                                  lc_error *e) {
+  checkpoint_walk *walk = context;
+  return ps_checkpoint_record_read(
+      reader, NULL, walk->leaf,
+      key.kind == PS_KEY_METADATA ? &walk->metadata : &walk->decision, e);
+}
 static void checkpoint_records(int durable) {
   lc_allocator allocator = {0};
+  ps_options options = {.durable_sync = durable, .shared = 1};
   lc_pouch_state_entry prior = {0}, changed = {0}, projected = {0},
                        decoded = {0};
   ps_checkpoint_record metadata = {0}, decision = {0};
@@ -186,8 +198,10 @@ static void checkpoint_records(int durable) {
   uint64_t bytes;
   size_t at, metadata_at = (size_t)-1;
   const char *leaf = "snapshot-00000000000000000001.log";
+  checkpoint_walk walk = {0};
+  int accepted;
   clean();
-  s = create(PS_DEFAULT_CAPACITY, durable, NULL);
+  OK(ps_open(path, 1, &options, &s, &error));
   prior.key = "lease/value";
   prior.record_type = LC_POUCH_STATE_RECORD_STATE_META;
   prior.seen = prior.found = 1;
@@ -280,9 +294,42 @@ static void checkpoint_records(int durable) {
   }
   OK(ps_budget_close(budget, &error));
   budget = NULL;
+  OK(ps_checkpoint(s, &error));
   OK(ps_values_capture(s, 9, PS_KEY_METADATA, PS_KEY_DECISION, &captured,
                        &error));
   CHECK(ps_values_count(captured) == 2);
+  walk.leaf = leaf;
+  OK(ps_internal_values_startup_walk(s, 9, checkpoint_walk_decode, &walk,
+                                     &accepted, &error));
+  CHECK(accepted);
+  /* The walk has already discarded its page cache. Decoded fields are owned. */
+  CHECK(!strcmp(walk.metadata.key, prior.key) &&
+        walk.metadata.payload_span.payload_offset == 128 &&
+        !strcmp(walk.decision.key, note.key) &&
+        !strcmp(walk.decision.decision, note.decision));
+  CHECK(lc_pouch_state_record_decode_span(metadata.bytes, metadata.length - 1,
+                                          &allocator, leaf, &walk.metadata,
+                                          &error) == LC_ERR_PROTOCOL);
+  lc_error_cleanup(&error);
+  CHECK(!strcmp(walk.metadata.key, prior.key));
+  const ps_entry *packed = ps_internal_lookup(s, slot);
+  unsigned char first, changed_byte;
+  CHECK(packed && packed->count == 1 &&
+        packed->extents[0].flags == EXTENT_PACKED);
+  off_t offset = (off_t)packed->extents[0].offset;
+  int checked = packed->value_checked;
+  CHECK(pread(s->fd, &first, 1, offset) == 1);
+  changed_byte = (unsigned char)(first ^ 1U);
+  CHECK(pwrite(s->fd, &changed_byte, 1, offset) == 1);
+  CHECK(ps_internal_values_startup_walk(s, 9, checkpoint_walk_decode, &walk,
+                                        &accepted, &error) == LC_ERR_PROTOCOL);
+  CHECK(accepted && packed->value_checked == checked && error.message &&
+        !strcmp(error.message, "captured value payload checksum mismatch") &&
+        !strcmp(walk.metadata.key, prior.key));
+  CHECK(pwrite(s->fd, &first, 1, offset) == 1);
+  lc_error_cleanup(&error);
+  lc_pouch_state_entry_cleanup(&allocator, &walk.metadata);
+  lc_pouch_state_entry_cleanup(&allocator, &walk.decision);
   CHECK(ps_close(s, &error) == LC_ERR_INVALID);
   lc_error_cleanup(&error);
   for (at = 0; at < 2; ++at) {

@@ -1,6 +1,7 @@
 #include "checkpoint_record.h"
 #include "lc_api_internal.h"
 #include "record_io.h"
+#include "space_internal.h"
 #include <string.h>
 
 typedef struct metadata_output {
@@ -112,6 +113,7 @@ int ps_checkpoint_record_read(ps_reader *reader, const lc_allocator *allocator,
                               const char *leaf, lc_pouch_state_entry *out,
                               lc_error *e) {
   lc_allocator fallback = {0};
+  const unsigned char *span;
   uint64_t next = 0;
   int found = 0, truncated = 0, rc;
   if (!reader || !leaf || !out)
@@ -119,6 +121,12 @@ int ps_checkpoint_record_read(ps_reader *reader, const lc_allocator *allocator,
                    "checkpoint input requires captured value and output");
   if (!allocator)
     allocator = &fallback;
+  rc = ps_internal_checkpoint_span(reader, &span, e);
+  if (rc != LC_OK)
+    return rc;
+  if (span)
+    return lc_pouch_state_record_decode_span(span, (size_t)ps_read_size(reader),
+                                             allocator, leaf, out, e);
   rc = lc_pouch_state_record_read(ps_record_value_input(reader), allocator,
                                   leaf, 0, ps_read_size(reader), 0, 0, NULL,
                                   out, &next, &found, &truncated, e);

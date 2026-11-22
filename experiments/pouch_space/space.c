@@ -2487,23 +2487,31 @@ static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
 }
 /* The caller retains the captured cells for the whole read pass. Unrelated
  * cells in this buffer confer no authority and are never exposed. */
-static int read_extent(ps_space *s, const ps_extent *extent,
-                       unsigned char *buffer, packed_read *packed,
-                       lc_error *error) {
-  uint64_t page;
+static int read_packed_bytes(ps_space *s, const ps_extent *extent,
+                             packed_read *packed, const unsigned char **out,
+                             lc_error *error) {
+  uint64_t page = extent->offset / PS_PAGE * PS_PAGE;
   int rc;
-  if (!packed || !(extent->flags & EXTENT_PACKED))
-    return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
-  page = extent->offset / PS_PAGE * PS_PAGE;
   if (packed->offset != page) {
     rc = transfer(s, packed->bytes, PS_PAGE, page, 0, error);
     if (rc != LC_OK)
       return rc;
     packed->offset = page;
   }
-  memcpy(buffer, packed->bytes + (extent->offset - page),
-         (size_t)extent->bytes);
+  *out = packed->bytes + (extent->offset - page);
   return LC_OK;
+}
+static int read_extent(ps_space *s, const ps_extent *extent,
+                       unsigned char *buffer, packed_read *packed,
+                       lc_error *error) {
+  const unsigned char *bytes;
+  int rc;
+  if (!packed || !(extent->flags & EXTENT_PACKED))
+    return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
+  rc = read_packed_bytes(s, extent, packed, &bytes, error);
+  if (rc == LC_OK)
+    memcpy(buffer, bytes, (size_t)extent->bytes);
+  return rc;
 }
 static int verify_value_payloads(ps_space *s, ps_entry *p,
                                  unsigned char *buffer, packed_read *packed,
@@ -6964,6 +6972,26 @@ static void reader_payload_invalid(ps_reader *r) {
   pthread_mutex_lock(&r->space->mutex);
   r->entry->value_checked = -1;
   pthread_mutex_unlock(&r->space->mutex);
+}
+int ps_internal_checkpoint_span(ps_reader *r, const unsigned char **out,
+                                lc_error *error) {
+  const ps_entry *p = r->entry;
+  const ps_extent *extent = p->extents;
+  const unsigned char *bytes;
+  int rc;
+  *out = NULL;
+  if (!r->private_read || p->count != 1 || !(extent->flags & EXTENT_PACKED) ||
+      extent->bytes != p->bytes ||
+      (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION))
+    return LC_OK;
+  rc = read_packed_bytes(r->space, extent, r->packed, &bytes, error);
+  if (rc != LC_OK)
+    return rc;
+  if (checksum(bytes, (size_t)extent->bytes) != extent->crc)
+    return err(error, LC_ERR_PROTOCOL,
+               "captured value payload checksum mismatch");
+  *out = bytes;
+  return LC_OK;
 }
 int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
             lc_error *error) {

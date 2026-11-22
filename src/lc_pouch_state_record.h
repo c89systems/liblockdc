@@ -98,6 +98,11 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
                                unsigned char **scratch, lc_pouch_state_entry *,
                                uint64_t *next, int *found, int *truncated_tail,
                                lc_error *);
+/* Decode exactly one record from a caller-verified contiguous capture.
+ * Fields in the result are owned. The input is borrowed for the call. */
+int lc_pouch_state_record_decode_span(const unsigned char *, size_t,
+                                      const lc_allocator *, const char *leaf,
+                                      lc_pouch_state_entry *, lc_error *);
 /* Streams an ordinary PUT (type 1 or 7), including plaintext SHA-256 and
  * optional compression/encryption. No whole-body staging. Failure asks the
  * owner to discard its private append, possibly containing earlier records in

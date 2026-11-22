@@ -8378,13 +8378,92 @@ static int lc_pouch_state_decode_record(
   }
 }
 
+static int lc_pouch_state_record_fields(const unsigned char *encoded,
+                                        uint64_t bytes,
+                                        lc_pouch_record_header *header,
+                                        uint64_t *payload, lc_error *error) {
+  uint64_t offset = LC_POUCH_RECORD_HEADER_BYTES;
+  int rc = lc_pouch_record_header_decode(encoded, header, error);
+  *payload = 0;
+  if (rc != LC_OK)
+    return rc;
+  if (header->flags & ~LC_POUCH_RECORD_FLAG_PENDING)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "pouch state segment record flags are invalid", NULL,
+                        NULL, "pouch");
+  if (header->flags & LC_POUCH_RECORD_FLAG_PENDING)
+    return LC_OK;
+  if (header->key_len > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
+      header->meta_len > LC_POUCH_STATE_RECORD_META_MAX_BYTES)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "pouch state segment record exceeds local limits", NULL,
+                        NULL, "pouch");
+  if (header->key_len > bytes - offset)
+    return LC_OK;
+  offset += header->key_len;
+  if (header->meta_len > bytes - offset)
+    return LC_OK;
+  offset += header->meta_len;
+  if (header->payload_len <= bytes - offset)
+    *payload = offset;
+  return LC_OK;
+}
+
+static int lc_pouch_state_record_select(
+    const lc_allocator *allocator, const lc_pouch_record_header *header,
+    const unsigned char *key, const unsigned char *meta, const char *leaf,
+    uint64_t start, uint64_t payload, lc_pouch_state_entry *entry,
+    lc_error *error) {
+  lc_pouch_state_entry candidate;
+  int rc;
+  memset(&candidate, 0, sizeof(candidate));
+  rc = lc_pouch_state_decode_record(allocator, header, key, meta, leaf, start,
+                                    payload, header->payload_len,
+                                    header->payload_crc, &candidate, error);
+  if (rc == LC_OK) {
+    lc_pouch_state_entry_cleanup(allocator, entry);
+    *entry = candidate;
+  } else
+    lc_pouch_state_entry_cleanup(allocator, &candidate);
+  return rc;
+}
+
+int lc_pouch_state_record_decode_span(const unsigned char *span, size_t bytes,
+                                      const lc_allocator *allocator,
+                                      const char *leaf,
+                                      lc_pouch_state_entry *entry,
+                                      lc_error *error) {
+  lc_pouch_record_header header;
+  const unsigned char *key, *meta;
+  uint64_t payload = 0;
+  int rc;
+  if (!span || !allocator || !leaf || !entry || bytes > (uint64_t)LC_I64_MAX)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch state record decode requires bounded inputs",
+                        NULL, NULL, "pouch");
+  if (bytes >= LC_POUCH_RECORD_HEADER_BYTES) {
+    rc = lc_pouch_state_record_fields(span, bytes, &header, &payload, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  if (!payload || header.payload_len != bytes - payload)
+    return lc_error_set(
+        error, LC_ERR_PROTOCOL, 0L,
+        "checkpoint metadata is not one complete canonical record", NULL, NULL,
+        "pouch");
+  key = header.key_len ? span + LC_POUCH_RECORD_HEADER_BYTES : NULL;
+  meta = header.meta_len ? span + LC_POUCH_RECORD_HEADER_BYTES + header.key_len
+                         : NULL;
+  return lc_pouch_state_record_select(allocator, &header, key, meta, leaf, 0,
+                                      payload, entry, error);
+}
+
 int lc_pouch_state_record_read(
     lc_pouch_record_io io, const lc_allocator *allocator, const char *leaf,
     uint64_t start, uint64_t end, int allow_truncated_tail, int verify_payload,
     unsigned char **scratch, lc_pouch_state_entry *entry, uint64_t *next,
     int *found, int *truncated_tail, lc_error *error) {
   lc_pouch_record_header header;
-  lc_pouch_state_entry candidate;
   unsigned char encoded[LC_POUCH_RECORD_HEADER_BYTES];
   unsigned char *key = NULL, *meta = NULL;
   struct iovec parts[2];
@@ -8408,29 +8487,13 @@ int lc_pouch_state_record_read(
   rc = lc_pouch_record_io_read(io, start, parts, 1, error);
   if (rc != LC_OK)
     return rc;
-  rc = lc_pouch_record_header_decode(encoded, &header, error);
+  rc = lc_pouch_state_record_fields(encoded, end - start, &header, &payload,
+                                    error);
   if (rc != LC_OK)
     return rc;
-  if (header.flags & ~LC_POUCH_RECORD_FLAG_PENDING)
-    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state segment record flags are invalid", NULL,
-                        NULL, "pouch");
-  if (header.flags & LC_POUCH_RECORD_FLAG_PENDING)
+  if (!payload)
     goto truncated;
-  if (header.key_len > LC_POUCH_STATE_RECORD_KEY_MAX_BYTES ||
-      header.meta_len > LC_POUCH_STATE_RECORD_META_MAX_BYTES)
-    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state segment record exceeds local limits", NULL,
-                        NULL, "pouch");
-  payload = start + sizeof(encoded);
-  if (header.key_len > end - payload)
-    goto truncated;
-  payload += header.key_len;
-  if (header.meta_len > end - payload)
-    goto truncated;
-  payload += header.meta_len;
-  if (header.payload_len > end - payload)
-    goto truncated;
+  payload += start;
   if (header.key_len) {
     key = lc_alloc_with_allocator(allocator, header.key_len);
     if (!key)
@@ -8477,20 +8540,14 @@ int lc_pouch_state_record_read(
                         "pouch state segment payload CRC mismatch", NULL, NULL,
                         "pouch");
   }
-  memset(&candidate, 0, sizeof(candidate));
   if (rc == LC_OK)
-    rc = lc_pouch_state_decode_record(allocator, &header, key, meta, leaf,
-                                      start, payload, header.payload_len,
-                                      header.payload_crc, &candidate, error);
+    rc = lc_pouch_state_record_select(allocator, &header, key, meta, leaf,
+                                      start, payload, entry, error);
   lc_free_with_allocator(allocator, key);
   lc_free_with_allocator(allocator, meta);
   if (rc == LC_OK) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    *entry = candidate;
     *next = payload + header.payload_len;
     *found = 1;
-  } else {
-    lc_pouch_state_entry_cleanup(allocator, &candidate);
   }
   return rc;
 truncated:
