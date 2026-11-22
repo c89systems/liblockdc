@@ -106,6 +106,7 @@ static int decode_head(uint64_t owner, const unsigned char *bytes,
 static int head_read(struct ps_namespace_data *d, lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_reader *reader = NULL;
+  ps_ref selected;
   size_t got;
   int rc = ps_read_open(d->ns->root->space, head_key(d->ns->identity.owner),
                         NULL, &reader, e);
@@ -119,17 +120,22 @@ static int head_read(struct ps_namespace_data *d, lc_error *e) {
     rc = failure(e, LC_ERR_PROTOCOL, "namespace head has invalid length");
   if (rc == LC_OK)
     rc = ps_read(reader, bytes, sizeof(bytes), &got, e);
+  ps_read_reference(reader, &selected);
   ps_reader_close(reader);
   if (rc != LC_OK)
     return rc;
   if (got != sizeof(bytes))
     return failure(e, LC_ERR_PROTOCOL, "namespace head is incomplete");
-  return decode_head(d->ns->identity.owner, bytes, &d->active, e);
+  rc = decode_head(d->ns->identity.owner, bytes, &d->active, e);
+  if (rc == LC_OK)
+    d->route_incarnation = selected.incarnation;
+  return rc;
 }
-int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
-                     uint64_t active, lc_error *e) {
+static int head_write(struct ps_namespace_data *d, ps_budget *budget,
+                      uint64_t active, lc_error *e) {
   unsigned char bytes[NS_HEAD_BYTES];
   ps_writer *writer = NULL;
+  ps_ref selected;
   int rc;
   memset(bytes, 0, sizeof(bytes));
   memcpy(bytes, "LCPSNSHD", 8);
@@ -143,7 +149,9 @@ int ps_ns_head_write(struct ps_namespace_data *d, ps_budget *budget,
   if (rc == LC_OK)
     rc = ps_write(writer, bytes, sizeof(bytes), e);
   if (rc == LC_OK)
-    rc = ps_publish(writer, NULL, e);
+    rc = ps_publish(writer, &selected, e);
+  if (rc == LC_OK)
+    d->route_incarnation = selected.incarnation;
   ps_writer_close(writer);
   return rc;
 }
@@ -398,6 +406,8 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
                         &s->binding.target, recover, s, &s->stream, e);
     if (rc == LC_OK)
       rc = ps_stream_status(s->stream, &info, e);
+    if (rc == LC_OK && s->kind == PS_CATALOG_SEGMENT && !info.sealed)
+      s->sparse = ps_stream_has_sparse_runs(s->stream);
     if (rc == LC_OK)
       ps_ns_resource_park(d, s);
     if (s->kind != PS_CATALOG_SEGMENT) {
@@ -416,11 +426,12 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
       rc = failure(e, LC_ERR_PROTOCOL,
                    "checkpoint coverage exceeds canonical tail");
     if (rc == LC_OK && s->id < d->active && !info.sealed) {
-      if (s->id + 1 != d->active)
+      if (s->sparse && s->id + 1 != d->active)
         rc = failure(e, LC_ERR_PROTOCOL,
-                     "namespace has an unexpected unsealed predecessor");
-      else
-        d->pending_seal = s->id;
+                     "sparse namespace predecessor lacks a final tail");
+      else if (s->id + 1 == d->active &&
+               (s->sparse || ns->root->space->durable))
+        d->seal_pending = s->id;
     }
   }
   if (rc == LC_OK &&
@@ -489,7 +500,8 @@ int ps_namespace_sources_visit(ps_namespace *ns, ps_namespace_source_fn visit,
       sources[count].capacity = info.capacity;
       sources[count].stored_bytes = info.stored_bytes;
       sources[count].runs = info.runs;
-      sources[count].sealed = info.sealed;
+      sources[count].closed =
+          s->kind == PS_CATALOG_SEGMENT ? s->id < d->active : info.sealed;
       ++count;
     }
   }
@@ -530,7 +542,8 @@ static int reload_shared(struct ps_namespace_data *d, lc_error *e) {
   d->capacity = fresh->capacity;
   d->active = fresh->active;
   d->tail = fresh->tail;
-  d->pending_seal = fresh->pending_seal;
+  d->route_incarnation = fresh->route_incarnation;
+  d->seal_pending = fresh->seal_pending;
   d->replay_segment = fresh->replay_segment;
   d->replay_offset = fresh->replay_offset;
   d->checkpoint = fresh->checkpoint;
@@ -970,20 +983,39 @@ static void unlock_current(struct ps_namespace_data *d, int entered) {
   if (entered)
     ps_ns_leave(d);
 }
+int ps_ns_stabilize_cut(struct ps_namespace_data *d, uint64_t coverage,
+                        lc_error *e) {
+  return ps_internal_namespace_cut_stabilize(d->ns->root->space,
+                                             d->ns->identity.owner,
+                                             d->route_incarnation, coverage, e);
+}
+int ps_ns_seal_predecessor(struct ps_namespace_data *d, uint64_t id,
+                           lc_error *e) {
+  segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, id);
+  ps_stream_info info;
+  int rc;
+  if (!s)
+    return LC_OK;
+  if (id >= d->active)
+    return failure(e, LC_ERR_INVALID, "cannot seal the namespace append head");
+  rc = ps_stream_status(s->stream, &info, e);
+  if (rc != LC_OK || info.sealed)
+    return rc;
+  /* A physical seal must follow the durable route that closed this source. */
+  rc = ps_ns_stabilize_cut(d, 0, e);
+  if (rc == LC_OK)
+    rc = ps_stream_seal(s->stream, e);
+  pthread_mutex_lock(&d->mutex);
+  ps_ns_resource_park(d, s);
+  pthread_mutex_unlock(&d->mutex);
+  return rc;
+}
 int ps_ns_finish_seal(struct ps_namespace_data *d, lc_error *e) {
   int rc = LC_OK;
-  if (d->pending_seal) {
-    segment *s = ps_ns_find(d, PS_CATALOG_SEGMENT, d->pending_seal);
-    /* A durable seal must never outlive the routing decision that made its
-     * predecessor inactive. NoSync publication can defer this dependency. */
-    rc = ps_flush(d->ns->root->space, e);
+  if (d->seal_pending) {
+    rc = ps_ns_seal_predecessor(d, d->seal_pending, e);
     if (rc == LC_OK)
-      rc = ps_stream_seal(s->stream, e);
-    pthread_mutex_lock(&d->mutex);
-    ps_ns_resource_park(d, s);
-    if (rc == LC_OK)
-      d->pending_seal = 0;
-    pthread_mutex_unlock(&d->mutex);
+      d->seal_pending = 0;
   }
   return rc;
 }
@@ -1186,7 +1218,9 @@ int ps_ns_select_successor(struct ps_namespace_data *d, ps_budget *budget,
   uint64_t next;
   int rc, closed;
   plan.maintenance = 1;
-  rc = ps_ns_rotation_plan(d, &plan, e);
+  rc = ps_ns_finish_seal(d, e);
+  if (rc == LC_OK)
+    rc = ps_ns_rotation_plan(d, &plan, e);
   if (rc == LC_OK && !budget) {
     rc = ps_budget_open(d->ns->root->space, &plan, &owned, e);
     budget = owned;
@@ -1195,12 +1229,12 @@ int ps_ns_select_successor(struct ps_namespace_data *d, ps_budget *budget,
   if (rc == LC_OK)
     rc = prepare(d, budget, next, e);
   if (rc == LC_OK)
-    rc = ps_ns_head_write(d, budget, next, e);
+    rc = head_write(d, budget, next, e);
   if (rc == LC_OK)
-    rc = ps_flush(d->ns->root->space, e);
+    rc = ps_ns_stabilize_cut(d, 0, e);
   if (rc == LC_OK) {
     pthread_mutex_lock(&d->mutex);
-    d->pending_seal = d->active;
+    d->seal_pending = d->active;
     d->active = next;
     d->tail = 0;
     ps_ns_find(d, PS_CATALOG_SEGMENT, next)->unselected = 0;
@@ -1450,7 +1484,7 @@ uint64_t ps_namespace_append_segments(const ps_namespace_append *append) {
 static int publish_append_head(void *context, uint64_t tail, lc_error *e) {
   ps_namespace_append *append = context;
   (void)tail;
-  return ps_ns_head_write(append->data, append->budget, append->segment, e);
+  return head_write(append->data, append->budget, append->segment, e);
 }
 int ps_namespace_append_commit(ps_namespace_append *append,
                                enum ps_commit_mode mode, lc_error *e) {
@@ -1475,15 +1509,18 @@ int ps_namespace_append_commit(ps_namespace_append *append,
     pthread_mutex_lock(&append->data->mutex);
     ps_checkpoint_delta_accept(append->delta);
     if (selecting) {
-      append->data->pending_seal = append->data->active;
+      segment *prior =
+          ps_ns_find(append->data, PS_CATALOG_SEGMENT, append->data->active);
+      /* Keep the final tail for sparse sources. Eager sealing on durable
+       * roots also avoids reopening dense predecessors for tail recovery. */
+      if (prior && (prior->sparse || append->ns->root->space->durable))
+        append->data->seal_pending = append->data->active;
       append->data->active = append->segment;
       ps_ns_find(append->data, PS_CATALOG_SEGMENT, append->segment)
           ->unselected = 0;
     }
     append->data->tail = tail;
     pthread_mutex_unlock(&append->data->mutex);
-    /* Seal cleanup stabilizes routing before the next mutation, never as
-     * fallible work after this successful logical publication. */
   }
   return rc;
 }
@@ -1511,11 +1548,11 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
   if (rc != LC_OK)
     return rc;
   if (d->active == expected) {
-    rc = ps_ns_finish_seal(d, e);
-    if (rc == LC_OK)
-      rc = ps_ns_rotate(d, NULL, e);
+    rc = ps_ns_rotate(d, NULL, e);
   } else if (expected != UINT64_MAX && d->active == expected + 1) {
-    rc = ps_ns_finish_seal(d, e);
+    rc = ps_ns_seal_predecessor(d, expected, e);
+    if (rc == LC_OK && d->seal_pending == expected)
+      d->seal_pending = 0;
   } else {
     rc = failure(e, LC_ERR_INVALID,
                  "namespace rotation expected segment is stale");

@@ -366,7 +366,7 @@ static int churn_sources(void *context, const ps_namespace_source *source,
   const size_t pieces = 16 * PS_CHUNK / PS_STREAM_PIECE_BYTES;
   if (source->kind != PS_CATALOG_SEGMENT)
     return LC_OK;
-  if (source->sealed &&
+  if (source->closed &&
       !ps_namespace_source_refs(s->ns, source->kind, source->id))
     return ps_namespace_reclaim(s->ns, source->kind, source->id, e);
   for (unsigned int step = 0; step < 16; ++step) {
@@ -380,7 +380,7 @@ static int churn_sources(void *context, const ps_namespace_source *source,
       break;
     CHECK(step < 15);
   }
-  if ((source->sealed || result.finished_tail) &&
+  if ((source->closed || result.finished_tail) &&
       !ps_namespace_source_refs(s->ns, source->kind, source->id))
     OK(ps_namespace_reclaim(s->ns, source->kind, source->id, e));
   return LC_OK;
@@ -581,6 +581,8 @@ static void namespace_repack_concurrency(int durable, int shared) {
   OK(ps_root_close(root, &error));
   if (shared) {
     checkpoint_seen seen = {0};
+    ps_namespace_info identity;
+    ps_owned_status predecessor;
     OK(ps_root_open(path, 0, &options, &root, &error));
     OK(ps_root_namespace_acquire(root, "repack", 0, &ns, &error));
     pin = (namespace_repack_pin){0};
@@ -591,6 +593,19 @@ static void namespace_repack_concurrency(int durable, int shared) {
     CHECK(pin.count == 120 && seen.first_version == 2 && seen.maximum == 122);
     ps_namespace_view_close(view);
     ps_namespace_read_close(pin.body);
+    OK(ps_namespace_identity(ns, &identity, &error));
+    ps_key key = {identity.owner, 1, PS_STREAM};
+    checkpoint_put(root, ns, "lease/0", 123, 3, 1, 1, 1);
+    OK(ps_flush(ps_root_space(root), &error));
+    ps_namespace_release(ns);
+    OK(ps_root_close(root, &error));
+    OK(ps_root_open(path, 0, &options, &root, &error));
+    OK(ps_root_namespace_acquire(root, "repack", 0, &ns, &error));
+    OK(ps_owned_inspect(ps_root_space(root), key, NULL, &predecessor, &error));
+    CHECK(!predecessor.sealed);
+    OK(ps_namespace_checkpoint_flush(ns, &error));
+    OK(ps_owned_inspect(ps_root_space(root), key, NULL, &predecessor, &error));
+    CHECK(predecessor.sealed);
     ps_namespace_release(ns);
     OK(ps_root_close(root, &error));
   }

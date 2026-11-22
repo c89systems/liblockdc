@@ -32,7 +32,7 @@ typedef struct ps_namespace_source {
   const char *leaf;
   unsigned int kind;
   uint64_t id, tail, capacity, stored_bytes, runs;
-  int sealed;
+  int closed; /* An inactive segment or a sealed immutable body. */
 } ps_namespace_source;
 typedef int (*ps_namespace_source_fn)(void *, const ps_namespace_source *,
                                       lc_error *);
@@ -137,7 +137,7 @@ int ps_namespace_append_commit(ps_namespace_append *, enum ps_commit_mode,
 void ps_namespace_append_close(ps_namespace_append *);
 /* Rotation is durable even for NoSync roots. A staged empty successor can be
  * reused after failure. The head commits cutover before sealing its
- * predecessor; recovery finishes that seal before admitting mutations.
+ * predecessor. An explicit retry can finish a seal interrupted by failure.
  * expected is the caller's observed active segment (zero for initialization).
  * An already selected expected+1 is a successful retry, even after reopen. */
 int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
@@ -147,7 +147,7 @@ int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
 int ps_namespace_unlink_active(ps_namespace *, uint64_t expected,
                                ps_namespace_retirement **, lc_error *);
 enum { PS_NAMESPACE_RETIRE_LIMIT = 4 };
-/* Unlink a batch of two or more covered, sealed segments with no remaining
+/* Unlink a batch of two or more covered inactive segments with no remaining
  * references under logical namespace authority. The caller consumes all
  * returned retirements even when an error follows a durable prefix. */
 int ps_namespace_unlink_covered(ps_namespace *, uint64_t minimum_bytes,

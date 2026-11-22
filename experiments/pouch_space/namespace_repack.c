@@ -11,7 +11,7 @@ typedef struct repack_selection {
   ps_piece_select_fn gate;
   void *context, *publication;
   ps_piece_publish_fn publish;
-  int unused;
+  int unused, sealed;
 } repack_selection;
 static int unchanged(void *context, lc_error *e) {
   (void)context;
@@ -44,9 +44,14 @@ static int select_guarded(void *context, lc_error *e) {
   rc = ps_ns_require_unpinned(d, e);
   if (rc == LC_OK)
     rc = current_source(d, r, e);
+  if (rc == LC_OK && !s->sealed && r->kind == PS_CATALOG_SEGMENT &&
+      r->id != d->active)
+    rc = busy(e); /* Retry a newly inactive source after sealing its tail. */
   if (rc == LC_OK)
     rc = ps_key_checkpoint_ranges_select(
         d->checkpoint, r->kind, r->id, s->epoch, s->publish, s->publication, e);
+  if (rc == LC_OK && !s->sealed)
+    r->sparse = 1;
   pthread_mutex_unlock(&d->mutex);
   if (shared)
     ps_ns_leave(d);
@@ -86,19 +91,18 @@ static int finish_tail(void *context, lc_error *e) {
     rc = ps_key_checkpoint_ranges_select(d->checkpoint, r->kind, r->id,
                                          s->epoch, unchanged, NULL, e);
   if (rc == LC_OK && !info.sealed) {
-    if (d->active == r->id)
-      rotate = 1;
-    else if (d->pending_seal != r->id)
+    if (r->kind != PS_CATALOG_SEGMENT || r->id > d->active)
       rc = busy(e);
+    else if (d->active == r->id)
+      rotate = 1;
   }
   pthread_mutex_unlock(&d->mutex);
   /* Mutation exclusion, not the data/interval mutex, spans the bounded
    * routing/seal I/O. A new view can still defer subsequent map selection.
    * No application producer or encoded-body copy runs under this authority. */
-  if (rc == LC_OK)
-    rc = ps_ns_finish_seal(d, e);
-  if (rc == LC_OK && rotate)
-    rc = ps_ns_rotate(d, s->budget, e);
+  if (rc == LC_OK && !info.sealed)
+    rc = rotate ? ps_ns_rotate(d, s->budget, e)
+                : ps_ns_seal_predecessor(d, r->id, e);
   ps_ns_leave(d);
   return rc;
 }
@@ -114,10 +118,10 @@ static int plan_tail(repack_selection *s, ps_budget_plan *plan, lc_error *e) {
   if (rc == LC_OK && info.tail != s->tail)
     rc = busy(e);
   if (rc == LC_OK && !info.sealed) {
-    if (d->active == r->id)
-      rc = ps_ns_rotation_plan(d, plan, e);
-    else if (d->pending_seal != r->id)
+    if (r->kind != PS_CATALOG_SEGMENT || r->id > d->active)
       rc = busy(e);
+    else if (d->active == r->id)
+      rc = ps_ns_rotation_plan(d, plan, e);
   }
   pthread_mutex_unlock(&d->mutex);
   return rc;
@@ -153,7 +157,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   ps_budget *budget = NULL;
   repack_selection selection;
   uint64_t cursor = 0, cover = 0, encoded, table, footprint;
-  int rc, found = 0, matches = 0, partial, unused, shared;
+  int rc, found = 0, matches = 0, partial, unused, shared, inactive = 0;
   if (!out || !limit || !id ||
       (kind != PS_CATALOG_SEGMENT && kind != PS_CATALOG_BODY))
     return lc_error_set(e, LC_ERR_INVALID, 0,
@@ -177,6 +181,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   if (rc == LC_OK)
     rc = ps_stream_status(r->stream, &info, e);
   if (rc == LC_OK) {
+    inactive = kind == PS_CATALOG_SEGMENT && id != d->active;
     ps_key_checkpoint_info(d->checkpoint, &coverage);
     if (coverage.epoch && kind == PS_CATALOG_SEGMENT && id <= coverage.segment)
       cover = id < coverage.segment ? info.tail : coverage.offset;
@@ -207,6 +212,7 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
   selection.tail = info.tail;
   selection.budget = NULL;
   selection.unused = 0;
+  selection.sealed = info.sealed;
   while (rc == LC_OK && out->visited < limit) {
     rc = ps_stream_piece_next(r->stream, cursor, &piece, &found, e);
     if (rc != LC_OK || !found) {
@@ -274,17 +280,20 @@ int ps_namespace_repack(ps_namespace *ns, unsigned int kind, uint64_t id,
       memset(&plan, 0, sizeof(plan));
       plan.maintenance = 1;
       rc = ps_budget_plan_piece(&plan, piece.bytes, live.count, live.bytes, e);
-      if (rc == LC_OK && partial)
+      if (rc == LC_OK && !info.sealed && (partial || inactive))
         rc = plan_tail(&selection, &plan, e);
       if (rc == LC_OK &&
           (plan.payload_bytes || plan.metadata_bytes || plan.entries))
         rc = ps_budget_open(ns->root->space, &plan, &budget, e);
-      if (rc == LC_OK && partial) {
+      /* Active full pieces can become sparse behind their checkpoint.
+       * An inactive source needs a final tail before it can gain holes. */
+      if (rc == LC_OK && !info.sealed && (partial || inactive)) {
         selection.budget = budget;
         rc = gate ? gate(context, finish_tail, &selection, e)
                   : finish_tail(&selection, e);
         if (rc == LC_OK) {
           info.sealed = 1;
+          selection.sealed = 1;
           out->finished_tail = 1;
         }
       }

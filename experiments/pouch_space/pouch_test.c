@@ -3954,7 +3954,7 @@ static int maintenance_reserved(void *context, const ps_namespace_source *s,
   (void)context;
   (void)e;
   if (s->kind == PS_CATALOG_SNAPSHOT || s->kind == PS_CATALOG_BODY)
-    REQUIRE(s->sealed && s->tail && s->capacity >= s->tail &&
+    REQUIRE(s->closed && s->tail && s->capacity >= s->tail &&
             s->capacity - s->tail < PS_PAGE);
   return LC_OK;
 }

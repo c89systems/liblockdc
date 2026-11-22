@@ -684,6 +684,10 @@ if(LOCKDC_BUILD_TESTS)
     COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} shared-successor)
   set_tests_properties(pouch_space_namespace_shared-successor PROPERTIES
     TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  add_test(NAME pouch_space_namespace_rolled-sources
+    COMMAND pouch_space_namespace_test ${CMAKE_CURRENT_BINARY_DIR} rolled-sources)
+  set_tests_properties(pouch_space_namespace_rolled-sources PROPERTIES
+    TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_executable(pouch_space_state_record_test state_record_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
   target_include_directories(pouch_space_state_record_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_state_record_test PRIVATE pouch_space_experiment)

@@ -14,7 +14,7 @@ typedef struct compact {
   const lc_pouch_maintenance_options *options;
   lc_pouch_maintenance_result *maintenance;
   ps_pouch_compaction_result result;
-  uint64_t candidates, bytes, obsolete_sealed;
+  uint64_t candidates, bytes, obsolete_segments;
   uint64_t selected_id, selected_bytes;
   ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
   size_t retirement_count;
@@ -70,9 +70,8 @@ static int candidate(void *context, const ps_namespace_source *source,
     }
     if (!bytes || bytes < background_minimum(w))
       return LC_OK;
-    if (!live && source->kind == PS_CATALOG_SEGMENT && source->sealed &&
-        source->id != w->before.active_segment)
-      ++w->obsolete_sealed;
+    if (!live && source->kind == PS_CATALOG_SEGMENT && source->closed)
+      ++w->obsolete_segments;
     if (bytes > w->selected_bytes) {
       w->selected_bytes = bytes;
       w->selected_kind = source->kind;
@@ -146,9 +145,7 @@ static int retire_source(void *context, const ps_namespace_source *source,
     if (rc != LC_OK)
       goto outcome;
   }
-  if (!source->sealed ||
-      (source->kind == PS_CATALOG_SEGMENT &&
-       source->id == w->after.active_segment) ||
+  if (!source->closed ||
       ps_namespace_source_refs(w->ns, source->kind, source->id)) {
     rc = ps_namespace_repack(w->ns, source->kind, source->id,
                              MAINTENANCE_PIECES, select_logical, w, &repack, e);
@@ -157,7 +154,7 @@ static int retire_source(void *context, const ps_namespace_source *source,
       w->result.copied_bytes += repack.mapping_bytes;
       if (repack.pending)
         ++w->result.pending_sources;
-      else if ((source->sealed || repack.finished_tail) &&
+      else if ((source->closed || repack.finished_tail) &&
                !ps_namespace_source_refs(w->ns, source->kind, source->id)) {
         rc = compact_namespace(w, retire_locked, &task, e);
       }
@@ -254,9 +251,9 @@ static int compact_locked(void *context, lc_error *e) {
   }
   /* Use the shared durability wait when there is a backlog of whole sources.
    * A lone eligible source stays in the ordinary candidate ranking. */
-  if (rc == LC_OK && w->obsolete_sealed > 1 && background_stopping(w))
+  if (rc == LC_OK && w->obsolete_segments > 1 && background_stopping(w))
     return stop_pending(e);
-  if (rc == LC_OK && w->obsolete_sealed > 1)
+  if (rc == LC_OK && w->obsolete_segments > 1)
     rc = ps_namespace_unlink_covered(w->ns, background_minimum(w),
                                      w->retirements, &w->retirement_count, e);
   return rc;

@@ -156,7 +156,8 @@ int ps_ns_source(struct ps_namespace_data *d, unsigned int kind, uint64_t id,
       out->capacity = info.capacity;
       out->stored_bytes = info.stored_bytes;
       out->runs = info.runs;
-      out->sealed = info.sealed;
+      out->closed =
+          kind == PS_CATALOG_SEGMENT ? r->id < d->active : info.sealed;
       *found = 1;
     }
   }

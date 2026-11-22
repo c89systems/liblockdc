@@ -328,6 +328,11 @@ int ps_internal_namespace_stamp(ps_space *, uint64_t, int *, lc_error *);
  * already framed checkpoint slots before replay can assign slot identities. */
 int ps_internal_namespace_checkpoint_stabilize(ps_space *, uint64_t,
                                                lc_error *);
+/* Under namespace edit authority, stabilize the route and, for unlink,
+ * the checkpoint coverage on which retirement depends. */
+int ps_internal_namespace_cut_stabilize(ps_space *, uint64_t owner,
+                                        uint64_t route, uint64_t coverage,
+                                        lc_error *);
 int ps_internal_entry_pin(ps_space *, ps_entry *, lc_error *);
 void ps_internal_entry_unpin(ps_space *, ps_entry *);
 /* Refresh the peer prefix and free ranges before changing local reservations.

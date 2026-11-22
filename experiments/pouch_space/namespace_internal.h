@@ -19,7 +19,7 @@ typedef struct ps_ns_resource {
   ps_catalog_info binding;
   ps_stream *stream;
   size_t references;
-  int unselected, pooled, repacking, retiring;
+  int unselected, sparse, pooled, repacking, retiring;
   struct ps_ns_resource *next, *repack_next;
 } ps_ns_resource;
 enum ps_namespace_scope {
@@ -35,7 +35,7 @@ struct ps_namespace_data {
   ps_ns_resource **items, *retired, *repacking;
   ps_ns_label *labels;
   size_t count, capacity, views;
-  uint64_t active, tail, pending_seal;
+  uint64_t active, tail, route_incarnation, seal_pending;
   uint64_t replay_segment, replay_offset;
   /* Decoded fixed controls, keyed by selected immutable incarnations. */
   uint64_t observed_head, observed_active;
@@ -81,16 +81,16 @@ void ps_ns_leave(struct ps_namespace_data *);
 /* A final source retirement or mapping selection holds both namespace
  * mutation authority and the data mutex across this check and publication. */
 int ps_ns_require_unpinned(struct ps_namespace_data *, lc_error *);
+int ps_ns_seal_predecessor(struct ps_namespace_data *, uint64_t, lc_error *);
 int ps_ns_finish_seal(struct ps_namespace_data *, lc_error *);
+int ps_ns_stabilize_cut(struct ps_namespace_data *, uint64_t coverage,
+                        lc_error *);
 int ps_ns_reclaim_before_append(struct ps_namespace_data *, lc_error *);
 int ps_ns_rotation_plan(struct ps_namespace_data *, ps_budget_plan *,
                         lc_error *);
 int ps_ns_rotate(struct ps_namespace_data *, ps_budget *, lc_error *);
-/* Select a durable empty successor and record its predecessor for sealing
- * or direct retirement. Caller has finished any earlier pending seal. */
+/* Select a durable empty successor under namespace edit authority. */
 int ps_ns_select_successor(struct ps_namespace_data *, ps_budget *, lc_error *);
-int ps_ns_head_write(struct ps_namespace_data *, ps_budget *, uint64_t active,
-                     lc_error *);
 /* Funded body construction while the conversion owner holds mutation
  * exclusion. The borrowed budget outlives the body builder. */
 int ps_ns_body_plan(ps_budget_plan *, uint64_t, lc_error *);

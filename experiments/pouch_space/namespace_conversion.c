@@ -111,7 +111,7 @@ static int cleanup(ps_namespace_conversion *work, size_t limit,
     return LC_OK;
   }
   if (source.stored_bytes &&
-      (!source.sealed ||
+      (!source.closed ||
        ps_namespace_source_refs(work->ns, source.kind, source.id))) {
     rc = ps_namespace_repack(work->ns, source.kind, source.id, limit, NULL,
                              NULL, &repack, e);
@@ -134,7 +134,7 @@ static int cleanup(ps_namespace_conversion *work, size_t limit,
       return rc;
   } else
     ++out->maintenance;
-  if (found && source.sealed &&
+  if (found && source.closed &&
       !ps_namespace_source_refs(work->ns, source.kind, source.id)) {
     rc = ps_namespace_reclaim(work->ns, source.kind, source.id, e);
     if (busy(rc, e)) {

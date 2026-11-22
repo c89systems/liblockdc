@@ -413,7 +413,7 @@ static void faults(const char *path) {
   lc_error_init(&e);
   for (int durable = 0; durable < 2; ++durable)
     for (int kind = 0; kind < 4; ++kind)
-      for (int phase = 0; phase < 5; ++phase) {
+      for (int phase = 0; phase < 6; ++phase) {
         size_t operations = 0;
         for (size_t at = 0; at <= operations; ++at) {
           memset(m.live, 0, PS_MIB);
@@ -429,7 +429,8 @@ static void faults(const char *path) {
             if (phase == 2) {
               ok(ps_namespace_rotate(ns, 1, &e), &e);
               ok(append(root, ns, 2, 0, 17, &e), &e);
-            }
+            } else if (phase == 5)
+              ok(append(root, ns, 2, 1, 17, &e), &e);
             ok(ps_checkpoint(ps_root_space(root), &e), &e);
           }
           if (phase == 2) {
@@ -457,7 +458,9 @@ static void faults(const char *path) {
                                            PS_APPEND_PREFIX, NULL, &reserved,
                                            &e);
             ps_namespace_append_close(reserved);
-          } else
+          } else if (phase == 5)
+            rc = append(root, ns, 3, 1, sizeof(body), &e);
+          else
             rc = append(root, ns, 2, 1, sizeof(body), &e);
           if (!at)
             operations = kind == 1 ? allocation : m.calls;
@@ -495,9 +498,10 @@ static void faults(const char *path) {
                     (!durable || at || recovered.count == 1));
             ok(append(root, ns, recovered.count + 1, 0, 7, &e), &e);
             count(ns, recovered.count + 1, &e);
-          } else if (phase == 4) {
-            REQUIRE(recovered.count >= 1 && recovered.count <= 2 &&
-                    (at || !durable || recovered.count == 2));
+          } else if (phase >= 4) {
+            size_t prior = phase == 5 ? 2U : 1U;
+            REQUIRE(recovered.count >= prior && recovered.count <= prior + 1 &&
+                    (at || !durable || recovered.count == prior + 1));
             ok(append(root, ns, recovered.count + 1, 0, 17, &e), &e);
             count(ns, recovered.count + 1, &e);
           } else
@@ -1479,7 +1483,7 @@ static int body_source(void *context, const ps_namespace_source *s,
                        lc_error *e) {
   body_sources *c = context;
   ++c->count;
-  REQUIRE(s->kind == PS_CATALOG_BODY && s->sealed && s->tail == 3 &&
+  REQUIRE(s->kind == PS_CATALOG_BODY && s->closed && s->tail == 3 &&
           s->capacity >= s->tail && s->capacity - s->tail < PS_PAGE);
   if (c->reenter)
     return append(c->root, c->ns, 1, 0, 31, e);
@@ -3231,6 +3235,96 @@ static void shared_successor(const char *path, int mode) {
   shared_namespace = 0;
   lc_error_cleanup(&e);
 }
+static void rolled_sources(const char *path, int reopen_durable) {
+  ps_root_options options = {0};
+  ps_root *root = NULL, *peer = NULL;
+  ps_namespace *ns, *joined;
+  ps_namespace_info identity;
+  ps_namespace_status status;
+  ps_namespace_window *window = NULL, *missing = NULL;
+  ps_namespace_view *view = NULL;
+  ps_namespace_retirement *retired[PS_NAMESPACE_RETIRE_LIMIT];
+  lc_pouch_state_entry first = {0};
+  ps_owned_status physical;
+  shared_records observed = {0};
+  ps_key key;
+  uint64_t offset;
+  size_t completed;
+  unsigned char bytes[64];
+  struct iovec part = {bytes, sizeof(bytes)};
+  lc_error e = {0};
+  shared_namespace = 1;
+  ok(ps_root_open(path, 1, &options, &root, &e), &e);
+  ns = acquire(root, "roll", 1, &e);
+  ok(put(root, ns, 1, 0, sizeof(bytes), NULL, NULL, &first, &e), &e);
+  offset = first.payload_span.payload_offset;
+  lc_pouch_state_entry_cleanup(&allocator, &first);
+  ok(append(root, ns, 2, 1, sizeof(bytes), &e), &e);
+  ok(append(root, ns, 3, 1, sizeof(bytes), &e), &e);
+  ok(ps_root_open(path, 0, &options, &peer, &e), &e);
+  joined = acquire(peer, "roll", 0, &e);
+  ok(append(peer, joined, 4, 0, sizeof(bytes), &e), &e);
+  ok(ps_flush(ps_root_space(peer), &e), &e);
+  ps_namespace_release(joined);
+  ps_namespace_release(ns);
+  ok(ps_root_close(peer, &e), &e);
+  ok(ps_root_close(root, &e), &e);
+
+  options.storage.durable_sync = reopen_durable;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ns = acquire(root, "roll", 0, &e);
+  ok(ps_namespace_identity(ns, &identity, &e), &e);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.active_segment == 3 && status.bound_segments == 3);
+  ok(ps_namespace_view_open(ns, &view, &e), &e);
+  ok(ps_namespace_view_visit(view, 1, visit_shared, &observed, &e), &e);
+  REQUIRE(observed.keys == 4 && observed.version == 4);
+  ps_namespace_view_close(view);
+  key.owner = identity.owner;
+  key.kind = PS_STREAM;
+  for (key.key = 1; key.key < 3; ++key.key) {
+    ok(ps_owned_inspect(ps_root_space(root), key, NULL, &physical, &e), &e);
+    REQUIRE(physical.tail && !physical.sealed);
+  }
+  ok(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 1, offset, sizeof(bytes),
+                            &window, &e),
+     &e);
+  ok(ps_namespace_checkpoint_flush(ns, &e), &e);
+  ok(ps_namespace_unlink_covered(ns, 0, retired, &completed, &e), &e);
+  REQUIRE(completed == 2);
+  for (size_t i = 0; i < completed; ++i)
+    ok(ps_namespace_retire_unlinked(ns, retired[i], &e), &e);
+  REQUIRE(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 1, offset,
+                                 sizeof(bytes), &missing,
+                                 &e) == LC_ERR_INVALID &&
+          !missing);
+  clear(&e);
+  ok(ps_checkpoint(ps_root_space(root), &e), &e);
+  ok(lc_pouch_record_io_read(ps_namespace_read_input(window), offset, &part, 1,
+                             &e),
+     &e);
+  REQUIRE(!memcmp(bytes, body, sizeof(bytes)));
+  ps_namespace_read_close(window);
+  ok(ps_namespace_rotate(ns, 3, &e), &e);
+  ok(ps_owned_inspect(ps_root_space(root), key, NULL, &physical, &e), &e);
+  REQUIRE(physical.sealed);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  ns = acquire(root, "roll", 0, &e);
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.active_segment == 4 && status.bound_segments == 2);
+  memset(&observed, 0, sizeof(observed));
+  ok(ps_namespace_view_open(ns, &view, &e), &e);
+  ok(ps_namespace_view_visit(view, 1, visit_shared, &observed, &e), &e);
+  REQUIRE(observed.keys == 1 && observed.version == 4);
+  ps_namespace_view_close(view);
+  ps_namespace_release(ns);
+  ok(ps_root_close(root, &e), &e);
+  REQUIRE(unlink(path) == 0);
+  shared_namespace = 0;
+  lc_error_cleanup(&e);
+}
 typedef struct run {
   const char *path, *key, *mode;
 } run;
@@ -3307,6 +3401,9 @@ static void *worker(void *p) {
   else if (!strcmp(r->mode, "shared-successor")) {
     for (int mode = 0; mode < 4; ++mode)
       shared_successor(r->path, mode);
+  } else if (!strcmp(r->mode, "rolled-sources")) {
+    rolled_sources(r->path, 0);
+    rolled_sources(r->path, 1);
   } else
     concurrency(r->path);
   return NULL;

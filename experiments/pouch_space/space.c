@@ -7207,6 +7207,37 @@ int ps_internal_durable_prefix(ps_space *s, uint64_t local, uint64_t peer,
     mark_durable(s, completed);
   return rc;
 }
+int ps_internal_namespace_cut_stabilize(ps_space *s, uint64_t owner,
+                                        uint64_t route, uint64_t coverage,
+                                        lc_error *error) {
+  const unsigned int kinds[] = {PS_ROUTING, PS_NAMESPACE_CHECKPOINT};
+  ps_coordination_guard *guard;
+  uint64_t local = 0, peer = 0, prefix;
+  size_t i;
+  int rc;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_capture_begin(s, &guard, error);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  for (i = 0; rc == LC_OK && i < (coverage ? 2U : 1U); ++i) {
+    ps_key key;
+    ps_entry *entry;
+    key.owner = owner;
+    key.key = 1;
+    key.kind = kinds[i];
+    entry = lookup(s, key);
+    if (!entry || entry->deleted || entry->token != (i ? coverage : route))
+      rc = err(error, LC_ERR_PENDING, "namespace cut has since changed");
+    else if (entry->peer_sequence > s->peer_durable &&
+             entry->peer_sequence > peer)
+      peer = entry->peer_sequence;
+    else if (!entry->peer_sequence && entry->publication_sequence > prefix &&
+             entry->publication_sequence > local)
+      local = entry->publication_sequence;
+  }
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc == LC_OK ? ps_internal_durable_prefix(s, local, peer, error) : rc;
+}
 int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
                             void *buffer, size_t bytes, uint64_t known,
                             uint64_t *incarnation, int *current,

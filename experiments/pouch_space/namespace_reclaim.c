@@ -248,7 +248,7 @@ static int unlink_covered_locked(struct ps_namespace_data *d,
         ps_key_checkpoint_source_refs(d->checkpoint, r->kind, r->id))
       continue;
     rc = ps_stream_status(r->stream, &info, e);
-    if (rc != LC_OK || !info.sealed || !info.stored_bytes ||
+    if (rc != LC_OK || !info.stored_bytes ||
         info.stored_bytes < minimum_bytes ||
         !segment_covered(d, r, &coverage, &info))
       continue;
@@ -261,6 +261,8 @@ static int unlink_covered_locked(struct ps_namespace_data *d,
   }
   if (rc == LC_OK && count >= minimum_count)
     rc = ps_ns_require_unpinned(d, e);
+  if (rc == LC_OK && count >= minimum_count)
+    rc = ps_ns_stabilize_cut(d, coverage.control, e);
   if (rc == LC_OK && count >= minimum_count)
     rc = ps_catalog_remove_many(d->ns->root->space, d->ns->identity.owner,
                                 removals, count, completed, e);
@@ -458,17 +460,17 @@ int ps_namespace_unlink_active(ps_namespace *ns, uint64_t expected,
   }
   pthread_mutex_unlock(&d->mutex);
   if (rc == LC_OK && source)
-    rc = ps_ns_finish_seal(d, e);
-  if (rc == LC_OK && source)
     rc = ps_ns_select_successor(d, NULL, e);
+  if (rc == LC_OK && source)
+    rc = ps_ns_stabilize_cut(d, coverage.control, e);
   if (rc == LC_OK && source) {
     /* The covered predecessor is unreachable from the new durable route.
-     * A crash before unlink can still use ordinary predecessor sealing.
-     * After unlink the orphan sweep can finish physical retirement. */
+     * A crash before unlink leaves the source eligible for normal
+     * reclamation. After unlink the orphan sweep can finish retirement. */
     pthread_mutex_lock(&d->mutex);
     rc = drop(d, source, e);
     if (rc == LC_OK) {
-      d->pending_seal = 0;
+      d->seal_pending = 0;
       *retirement = retain_retirement(d, source);
     }
     pthread_mutex_unlock(&d->mutex);
@@ -520,11 +522,13 @@ int ps_namespace_reclaim(ps_namespace *ns, unsigned int kind, uint64_t id,
     if (r)
       rc = ps_stream_status(r->stream, &info, e);
     if (rc == LC_OK && r &&
-        (r->unselected || !info.sealed ||
+        (r->unselected || (kind == PS_CATALOG_BODY && !info.sealed) ||
          ps_key_checkpoint_source_refs(d->checkpoint, kind, id) ||
          (kind == PS_CATALOG_SEGMENT &&
           !segment_covered(d, r, &coverage, &info))))
       rc = failure(e, "namespace source is still referenced or uncovered");
+    if (rc == LC_OK && r && kind == PS_CATALOG_SEGMENT)
+      rc = ps_ns_stabilize_cut(d, coverage.control, e);
     if (rc == LC_OK && r)
       rc = drop(d, r, e);
   }

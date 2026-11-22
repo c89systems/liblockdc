@@ -690,6 +690,15 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
 int ps_stream_seal(ps_stream *s, lc_error *error) {
   return stream_transition(s, 0, error);
 }
+int ps_stream_has_sparse_runs(ps_stream *s) {
+  uint64_t covered = 0;
+  size_t i;
+  for (i = 0; i < s->count && s->runs[i].base == covered &&
+              !ps_owned_run_mapped(s->runs[i].handle);
+       ++i)
+    covered += s->runs[i].capacity;
+  return covered != s->capacity;
+}
 int ps_stream_retire(ps_stream *s, lc_error *error) {
   return stream_transition(s, 1, error);
 }

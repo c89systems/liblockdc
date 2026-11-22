@@ -71,6 +71,8 @@ int ps_stream_status(ps_stream *, ps_stream_info *, lc_error *);
  * A sealed reopen trusts its final tail and does not call canonical recovery.
  */
 int ps_stream_seal(ps_stream *, lc_error *);
+/* Inspect complete mappings on a newly opened stream before parking it. */
+int ps_stream_has_sparse_runs(ps_stream *);
 int ps_stream_retire(ps_stream *, lc_error *);
 int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
                             lc_error *);

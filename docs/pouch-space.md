@@ -53,6 +53,9 @@ Reclamation waits for durable retirement and release of outstanding physical
 ownership. Linux OFD range locks retain reader extents and private writer
 workspace across independent opens. Shared admission validates its view against
 the selected root and accepted journal bounds before installing it.
+Namespace routing selects the sole append head. Dense NoSync predecessors can
+remain unsealed. Repacking a closed source records its final tail before removing
+grants. Unlinking an old segment requires its durable route and checkpoint coverage.
 
 ## Verification and performance
 
