@@ -1705,6 +1705,7 @@ typedef struct recovery_range {
 typedef struct payload_rebuild {
   recovery_range *ranges;
   size_t count, capacity;
+  int packed_changed;
 } payload_rebuild;
 
 static int payload_exclude(ps_space *s, payload_rebuild *build, uint64_t offset,
@@ -1757,6 +1758,8 @@ static int payload_claim(ps_space *s, const ps_extent *extent,
   s->packed_bytes += extent_allocation(extent);
   if (!build)
     payload_available(s, p);
+  else
+    build->packed_changed = 1;
   return LC_OK;
 }
 static int payload_claim_entry(ps_space *s, const ps_entry *p,
@@ -1792,9 +1795,26 @@ static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
     rc = exclude_selected(link, &s->free_bytes, range->offset, range->bytes,
                           error);
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && build->packed_changed)
     for (page = s->payload_pages; page; page = page->next)
       payload_available(s, page);
+  return rc;
+}
+/* Recovery prepends entries and retains their physical ownership even when
+ * a later frame supersedes them. The checkpoint boundary can already own
+ * every entry at and after end. */
+static int recover_payload_ownership(ps_space *s, const ps_entry *end,
+                                     lc_error *error) {
+  payload_rebuild build = {0};
+  ps_entry *p;
+  int rc = LC_OK;
+  for (p = s->entries; rc == LC_OK && p != end; p = p->all_next) {
+    rc = payload_claim_entry(s, p, &build, error);
+    p->previous = NULL;
+  }
+  if (rc == LC_OK)
+    rc = payload_rebuild_free(s, &build, error);
+  lc_free_with_allocator(NULL, build.ranges);
   return rc;
 }
 static int release_entry_runs(ps_space *s, ps_entry *p, int quarantine,
@@ -5498,6 +5518,8 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   if (rc == LC_OK) {
     prepared = recover_directory(draft, wire, certificate, NULL, 0, NULL,
                                  &draft_error);
+    if (prepared == LC_OK)
+      prepared = recover_payload_ownership(draft, NULL, &draft_error);
     rc = allocation_begin(s, guard, error);
   }
   if (rc == LC_OK)
@@ -5544,10 +5566,9 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   unsigned char zero[PS_ROOT_BYTES] = {0};
   unsigned char superblocks[RECOVERY_HEADERS], *wire = NULL;
   recovery_values *values = NULL;
-  payload_rebuild build = {0};
   ps_readiness_certificate certificate;
   const unsigned char *roots[2], *root;
-  ps_entry *p = NULL;
+  ps_entry *p = NULL, *checkpoint_entries = NULL;
   struct stat st;
   uint64_t grant_limit;
   size_t cursor = 0, bytes, first, last;
@@ -5608,6 +5629,7 @@ restart:
                                 &moved, error);
     if (rc == LC_OK && moved)
       goto restart;
+    checkpoint_entries = s->entries;
   } else
     rc = recover_directory(s, wire, &certificate, NULL, 0, NULL, error);
   if (rc != LC_OK)
@@ -5730,17 +5752,9 @@ restart:
     if (rc != LC_OK)
       goto done;
   }
-  /* Replay verifies every accepted PUT body, including superseded versions.
-   * Reopening must preserve that ownership until a new checkpoint retires the
-   * journal; otherwise reuse can make the next replay discard a durable tail.
-   */
-  for (p = s->entries; rc == LC_OK && p; p = p->all_next) {
-    rc = payload_claim_entry(s, p, &build, error);
-    p->previous = NULL;
-  }
-  if (rc == LC_OK)
-    rc = payload_rebuild_free(s, &build, error);
-  lc_free_with_allocator(NULL, build.ranges);
+  /* Keep the physical ownership of every accepted journal PUT until a
+   * checkpoint retires its frame. */
+  rc = recover_payload_ownership(s, checkpoint_entries, error);
   if (rc == LC_OK)
     rc = pins_recover(s, s, error);
   if (rc != LC_OK)

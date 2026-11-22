@@ -20,6 +20,8 @@
 static size_t checks, allocations, allocation_fail;
 static size_t key_index_fail;
 static int measuring;
+static __thread int (*packed_page_probe)(void *);
+static __thread void *packed_page_probe_context;
 static int cooperative_wait;
 static int mapping_fail;
 void *__real_mmap(void *, size_t, int, int, int, off_t);
@@ -116,6 +118,9 @@ void *__wrap_lc_alloc_with_allocator(const lc_allocator *a, size_t n) {
 }
 void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
                                       size_t b) {
+  if (packed_page_probe && n == 1 && b == sizeof(ps_payload_page) &&
+      packed_page_probe(packed_page_probe_context))
+    return NULL;
   if (key_index_fail && n == key_index_fail && b == sizeof(ps_key_slot)) {
     key_index_fail = 0;
     return NULL;
@@ -2686,6 +2691,8 @@ static void checkpoint_open_slab_reuse(int durable) {
   }
   REQUIRE(sites);
   ok(ps_open(path, 0, &options, &joined, &e), &e);
+  /* The retired checkpoint body and its journal replacement both own cells. */
+  REQUIRE(status(joined).packed_bytes == (65U * 2 + 3) * PS_CELL);
   slot.key = 1;
   ok(ps_read_open(joined, slot, NULL, &pinned, &e), &e);
   ok(ps_read_open(writer, slot, NULL, &peer_pin, &e), &e);
@@ -2712,9 +2719,13 @@ static void checkpoint_open_slab_reuse(int durable) {
   captured_expect(peer_pin, 1, 65);
   ps_reader_close(pinned);
   ps_reader_close(peer_pin);
+  slot.key = 33;
+  capture_put_key(joined, slot, 257);
+  ok(ps_flush(joined, &e), &e);
   ok(ps_close(writer, &e), &e);
   ok(ps_close(joined, &e), &e);
   ok(ps_open(path, 0, &options, &joined, &e), &e);
+  REQUIRE(status(joined).packed_bytes == (197U * 2 + 3 + 5 + 4) * PS_CELL);
   for (slot.key = 1; slot.key <= 32; ++slot.key) {
     ps_ref ref;
     uint64_t bytes;
@@ -2725,7 +2736,7 @@ static void checkpoint_open_slab_reuse(int durable) {
   for (slot.key = 33; slot.key <= 232; ++slot.key) {
     ok(ps_read_open(joined, slot, NULL, &reader, &e), &e);
     captured_expect(reader, (unsigned char)slot.key,
-                    slot.key == 33   ? 129
+                    slot.key == 33   ? 257
                     : slot.key == 44 ? PS_PAGE
                     : slot.key == 67 ? 193
                                      : 65);
@@ -3421,8 +3432,10 @@ typedef struct adoption_read_gate {
   ps_reader *reader;
   uint64_t page;
   size_t allocator_acquires;
-  int entered, released, fault, result;
+  int entered, released, fault, result, pause_ownership;
+  int read_leaf, skipped_directory_page;
 } adoption_read_gate;
+static void expect_value(ps_space *, ps_key, size_t, int);
 static int count_adoption_authority(void *context, int fd, int command,
                                     struct flock *lock) {
   adoption_read_gate *gate = context;
@@ -3432,22 +3445,42 @@ static int count_adoption_authority(void *context, int fd, int command,
     ++gate->allocator_acquires;
   return rc;
 }
+static int pause_adoption(void *context) {
+  adoption_read_gate *gate = context;
+  if (gate->entered)
+    return 0;
+  pthread_mutex_lock(&gate->mutex);
+  gate->entered = 1;
+  pthread_cond_broadcast(&gate->changed);
+  while (!gate->released)
+    pthread_cond_wait(&gate->changed, &gate->mutex);
+  pthread_mutex_unlock(&gate->mutex);
+  return gate->fault;
+}
 static ssize_t pause_checkpoint_read(void *context, int fd, void *out, size_t n,
                                      off_t offset) {
   adoption_read_gate *gate = context;
-  if ((uint64_t)offset == gate->page && gate->page && !gate->entered) {
-    pthread_mutex_lock(&gate->mutex);
-    gate->entered = 1;
-    pthread_cond_broadcast(&gate->changed);
-    while (!gate->released)
-      pthread_cond_wait(&gate->changed, &gate->mutex);
-    pthread_mutex_unlock(&gate->mutex);
-    if (gate->fault) {
+  if ((uint64_t)offset == gate->page && gate->page) {
+    if (gate->pause_ownership)
+      gate->read_leaf = 1;
+    else if (pause_adoption(gate)) {
       errno = EIO;
       return -1;
     }
   }
   return pread(fd, out, n, offset);
+}
+static int pause_packed_page(void *context) {
+  adoption_read_gate *gate = context;
+  if (!gate->read_leaf || gate->entered)
+    return 0;
+  /* This fixture has one directory leaf and no out-of-line descriptor. */
+  if (sizeof(ps_meta_page) == sizeof(ps_payload_page) &&
+      !gate->skipped_directory_page) {
+    gate->skipped_directory_page = 1;
+    return 0;
+  }
+  return pause_adoption(gate);
 }
 static void *adopt_on_read(void *context) {
   adoption_read_gate *gate = context;
@@ -3459,23 +3492,32 @@ static void *join_on_read(void *context) {
   ps_io io = {gate, pause_checkpoint_read, write_io, sync_io, reserve_io, NULL};
   ps_coordination_io coordination = {gate, count_adoption_authority};
   ps_options options = {.io = &io, .coordination_io = &coordination};
+  if (gate->pause_ownership) {
+    packed_page_probe = pause_packed_page;
+    packed_page_probe_context = gate;
+  }
   gate->result = ps_open(path, 0, &options, &gate->space, NULL);
   return NULL;
 }
-static void live_open_handoff(int advance_root, int fault) {
+static void live_open_handoff(int advance_root, int fault,
+                              int pause_ownership) {
   lc_error e = {0};
   adoption_read_gate gate = {0};
   ps_space *writer = NULL, *other_join = NULL;
   ps_coordination_guard *authority = NULL;
+  ps_key first = key(1);
   pthread_t joining;
   size_t bytes = advance_root ? 81 : 73;
   REQUIRE(!pthread_mutex_init(&gate.mutex, NULL) &&
           !pthread_cond_init(&gate.changed, NULL));
   ok(ps_open(path, 1, NULL, &writer, &e), &e);
-  capture_put(writer, 1, 65);
+  if (pause_ownership)
+    first.kind = PS_KEY_METADATA;
+  capture_put_key(writer, first, 65);
   ok(ps_checkpoint(writer, &e), &e);
   gate.page = writer->directory.offset;
   gate.fault = fault;
+  gate.pause_ownership = pause_ownership;
   REQUIRE(gate.page && !pthread_create(&joining, NULL, join_on_read, &gate));
   pthread_mutex_lock(&gate.mutex);
   while (!gate.entered)
@@ -3500,17 +3542,19 @@ static void live_open_handoff(int advance_root, int fault) {
   pthread_mutex_unlock(&gate.mutex);
   REQUIRE(!pthread_join(joining, NULL) && gate.allocator_acquires == 2);
   if (fault && !advance_root) {
-    REQUIRE(gate.result == LC_ERR_TRANSPORT && !gate.space);
+    REQUIRE(gate.result ==
+                (pause_ownership ? LC_ERR_NOMEM : LC_ERR_TRANSPORT) &&
+            !gate.space);
     ok(ps_open(path, 0, NULL, &gate.space, &e), &e);
   } else
     REQUIRE(gate.result == LC_OK && gate.space);
   REQUIRE(gate.space->generation == writer->generation &&
           gate.space->token_next > other_join->token_end);
-  index_expect(gate.space, 1, 65, &e);
+  expect_value(gate.space, first, 65, 1);
   index_expect(gate.space, 2, bytes, &e);
-  capture_put(gate.space, 1, 140);
+  capture_put_key(gate.space, first, 140);
   ok(ps_checkpoint(gate.space, &e), &e);
-  index_expect(writer, 1, 140, &e);
+  expect_value(writer, first, 140, 1);
   ok(ps_close(other_join, &e), &e);
   ok(ps_close(gate.space, &e), &e);
   ok(ps_close(writer, &e), &e);
@@ -8053,7 +8097,8 @@ int main(int argc, char **argv) {
     for (int advance_root = 0; advance_root <= 1; ++advance_root)
       for (int fault = 0; fault <= 1; ++fault) {
         projection_read_handoff(advance_root, fault);
-        live_open_handoff(advance_root, fault);
+        live_open_handoff(advance_root, fault, 0);
+        live_open_handoff(advance_root, fault, 1);
       }
     for (int durable = 0; durable <= 1; ++durable)
       projection_quarantine(durable, 1);
