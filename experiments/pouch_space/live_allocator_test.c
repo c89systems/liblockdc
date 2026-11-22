@@ -2443,6 +2443,49 @@ static void checkpoint_ownership_overlap(void) {
     REQUIRE(!coverage(NULL, 0) && !unlink(path));
   }
 }
+static void checkpoint_ownership_growth(void) {
+  ps_space *writer = NULL, *peer = NULL, *join = NULL;
+  ps_reader *retained = NULL;
+  lc_error e = {0};
+  const uint64_t grown = 17 * PS_MIB;
+  const size_t large = PS_MIB;
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  capture_put(writer, 1, large);
+  capture_put(writer, 2, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_read_open(peer, key(1), NULL, &retained, &e), &e);
+
+  capture_put(writer, 1, 2 * PS_PAGE);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_refresh(peer, &e), &e);
+  index_expect(peer, 1, 2 * PS_PAGE, &e);
+  index_expect(peer, 2, 65, &e);
+  ok(ps_check(peer, &e), &e);
+
+  /* Move from the compact range map to sparse recovery with the old
+   * multiword ownership still retained by another owner. */
+  for (uint64_t capacity = PS_DEFAULT_CAPACITY; capacity < grown;
+       capacity += PS_MIB)
+    ok(ps_grow(writer, PS_MIB, &e), &e);
+  ok(ps_refresh(peer, &e), &e);
+  REQUIRE(status(peer).capacity == grown);
+  captured_expect(retained, 1, large);
+  ok(ps_open(path, 0, NULL, &join, &e), &e);
+  index_expect(join, 1, 2 * PS_PAGE, &e);
+  index_expect(join, 2, 65, &e);
+  ok(ps_check(join, &e), &e);
+  ok(ps_close(join, &e), &e);
+  ps_reader_close(retained);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  index_expect(writer, 1, 2 * PS_PAGE, &e);
+  index_expect(writer, 2, 65, &e);
+  ok(ps_check(writer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_binding_reuse(int durable) {
   lc_error e = {0};
   descriptor_probe probe = {0};
@@ -2936,6 +2979,7 @@ static void checkpoint_prepared_bindings(void) {
 }
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
+  checkpoint_ownership_growth();
   checkpoint_orphan_run();
   checkpoint_namespace_names();
   checkpoint_prepared_bindings();

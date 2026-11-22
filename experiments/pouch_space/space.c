@@ -1717,18 +1717,48 @@ static void payload_release(ps_space *s, ps_extent *extent) {
 typedef struct recovery_range {
   uint64_t offset, bytes;
 } recovery_range;
+#define REBUILD_BITMAP_WORDS 64U
+#define REBUILD_BITMAP_CAPACITY (REBUILD_BITMAP_WORDS * 64U * PS_PAGE)
 typedef struct payload_rebuild {
   recovery_range *ranges;
   size_t count, capacity;
   int packed_changed;
+  uint64_t pages[REBUILD_BITMAP_WORDS];
 } payload_rebuild;
 
+/* A packed page is marked once and its cells are checked separately.
+ * Regular extents and owned stream runs mark every page in their range. */
+static int payload_mark_pages(payload_rebuild *build, uint64_t offset,
+                              uint64_t bytes, lc_error *error) {
+  unsigned int page = (unsigned int)(offset / PS_PAGE);
+  unsigned int end = page + (unsigned int)(bytes / PS_PAGE), count, bit;
+  uint64_t mask, *word;
+  while (page < end) {
+    bit = page % 64U;
+    count = 64U - bit;
+    if (count > end - page)
+      count = end - page;
+    mask = (UINT64_MAX >> (64U - count)) << bit;
+    word = &build->pages[page / 64U];
+    if (*word & mask)
+      return err(error, LC_ERR_PROTOCOL, "overlapping container ownership");
+    *word |= mask;
+    page += count;
+  }
+  return LC_OK;
+}
 static int payload_exclude(ps_space *s, payload_rebuild *build, uint64_t offset,
                            uint64_t bytes, lc_error *error) {
   recovery_range *ranges;
   size_t capacity;
   if (!build)
     return exclude_run(s, offset, bytes, error);
+  if (s->capacity <= REBUILD_BITMAP_CAPACITY) {
+    if (offset < PS_DATA || offset > s->capacity ||
+        bytes > s->capacity - offset || offset % PS_PAGE || bytes % PS_PAGE)
+      return err(error, LC_ERR_PROTOCOL, "invalid payload page ownership");
+    return payload_mark_pages(build, offset, bytes, error);
+  }
   if (build->count == build->capacity) {
     if (build->capacity > (size_t)-1 / sizeof(*ranges) / 2)
       return err(error, LC_ERR_NOMEM, "payload ownership list too large");
@@ -1790,25 +1820,63 @@ static int recovery_range_order(const void *a, const void *b) {
   uint64_t right = ((const recovery_range *)b)->offset;
   return left < right ? -1 : left != right;
 }
+static int payload_subtract(ps_space *s, ps_run ***cursor, uint64_t offset,
+                            uint64_t bytes, lc_error *error) {
+  ps_run **link = *cursor;
+  while (*link && (*link)->offset + (*link)->bytes <= offset)
+    link = &(*link)->next;
+  *cursor = link;
+  return exclude_selected(link, &s->free_bytes, offset, bytes, error);
+}
+static int payload_rebuild_bitmap(ps_space *s, const payload_rebuild *build,
+                                  lc_error *error) {
+  ps_run **link = &s->free;
+  uint64_t word, suffix;
+  uint64_t first = 0, end = 0, offset;
+  unsigned int i, bit, count;
+  unsigned int words = (unsigned int)(s->capacity / PS_PAGE + 63U) / 64U;
+  int rc;
+  for (i = PS_DATA / PS_PAGE / 64U; i < words; ++i) {
+    word = build->pages[i];
+    while (word) {
+      bit = (unsigned int)__builtin_ctzll(word);
+      suffix = word >> bit;
+      count =
+          suffix == UINT64_MAX ? 64U : (unsigned int)__builtin_ctzll(~suffix);
+      offset = (uint64_t)(i * 64U + bit) * PS_PAGE;
+      if (offset != end) {
+        if (end) {
+          rc = payload_subtract(s, &link, first, end - first, error);
+          if (rc != LC_OK)
+            return rc;
+        }
+        first = offset;
+      }
+      end = offset + (uint64_t)count * PS_PAGE;
+      word &= ~((UINT64_MAX >> (64U - count)) << bit);
+    }
+  }
+  return end ? payload_subtract(s, &link, first, end - first, error) : LC_OK;
+}
 /* Initial discovery has already subtracted directory and descriptor pages.
  * Sweep the remaining common intervals once, leaving the gaps between owned
- * ranges as free space. Each packed page contributes one range and one bin
- * update, regardless of how many cells the selected entries own. */
+ * ranges as free space. The bitmap keeps work proportional to pages in a
+ * compact root; sparse roots keep memory proportional to owned ranges. Each
+ * packed page contributes one range and one bin update. */
 static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
                                 lc_error *error) {
   ps_run **link = &s->free;
   ps_payload_page *page;
   size_t i;
   int rc = LC_OK;
+  if (s->capacity <= REBUILD_BITMAP_CAPACITY)
+    rc = payload_rebuild_bitmap(s, build, error);
   if (build->count > 1)
     qsort(build->ranges, build->count, sizeof(*build->ranges),
           recovery_range_order);
   for (i = 0; rc == LC_OK && i < build->count; ++i) {
     const recovery_range *range = &build->ranges[i];
-    while (*link && (*link)->offset + (*link)->bytes <= range->offset)
-      link = &(*link)->next;
-    rc = exclude_selected(link, &s->free_bytes, range->offset, range->bytes,
-                          error);
+    rc = payload_subtract(s, &link, range->offset, range->bytes, error);
   }
   if (rc == LC_OK && build->packed_changed)
     for (page = s->payload_pages; page; page = page->next)
