@@ -35,12 +35,13 @@ struct ps_reader {
   ps_space *space;
   ps_entry *entry;
   packed_read *packed;
+  unsigned char *buffer;
+  const unsigned char *data;
   size_t extent, offset, loaded;
   size_t random_extent;
   uint64_t random_base;
   int random_loaded;
   int imported, private_read;
-  unsigned char buffer[PS_CHUNK];
 };
 /* Every imported reader holds presence continuously from before acquiring its
  * extents until last close. A handoff retains its source until import succeeds.
@@ -2658,28 +2659,25 @@ static int read_packed_bytes(ps_space *s, const ps_extent *extent,
 }
 static int read_extent(ps_space *s, const ps_extent *extent,
                        unsigned char *buffer, packed_read *packed,
-                       lc_error *error) {
-  const unsigned char *bytes;
-  int rc;
-  if (!packed || !(extent->flags & EXTENT_PACKED))
-    return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
-  rc = read_packed_bytes(s, extent, packed, &bytes, error);
-  if (rc == LC_OK)
-    memcpy(buffer, bytes, (size_t)extent->bytes);
-  return rc;
+                       const unsigned char **data, lc_error *error) {
+  if (packed && (extent->flags & EXTENT_PACKED))
+    return read_packed_bytes(s, extent, packed, data, error);
+  *data = buffer;
+  return transfer(s, buffer, (size_t)extent->bytes, extent->offset, 0, error);
 }
 static int verify_value_payloads(ps_space *s, ps_entry *p,
                                  unsigned char *buffer, packed_read *packed,
                                  lc_error *error) {
+  const unsigned char *data;
   size_t i;
   int rc;
   if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
     return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
-    rc = read_extent(s, &p->extents[i], buffer, packed, error);
+    rc = read_extent(s, &p->extents[i], buffer, packed, &data, error);
     if (rc != LC_OK)
       return rc;
-    if (checksum(buffer, (size_t)p->extents[i].bytes) != p->extents[i].crc)
+    if (checksum(data, (size_t)p->extents[i].bytes) != p->extents[i].crc)
       return err(error, LC_ERR_PROTOCOL, "container payload checksum mismatch");
   }
   return p->key.kind == PS_OWNED_RUN ? owned_map_load(s, p, error) : LC_OK;
@@ -7706,6 +7704,17 @@ int ps_internal_read_witness_valid(ps_space *s) {
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
   return ps_readiness_retains_capture(s);
 }
+static ps_reader *reader_new(ps_space *s, ps_entry *entry) {
+  size_t scratch = entry->bytes < PS_CHUNK ? (size_t)entry->bytes : PS_CHUNK;
+  ps_reader *r = lc_alloc_with_allocator(NULL, sizeof(*r) + scratch);
+  if (r) {
+    memset(r, 0, sizeof(*r));
+    r->space = s;
+    r->entry = entry;
+    r->buffer = (unsigned char *)(r + 1);
+  }
+  return r;
+}
 static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
                     ps_entry **out, lc_error *error) {
   ps_entry *p =
@@ -7737,6 +7746,7 @@ static int read_pin(ps_space *s, ps_key key, const ps_ref *ref, int resident,
 int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
                  lc_error *error) {
   ps_reader *r;
+  ps_entry *entry = NULL;
   ps_coordination_guard *guard;
   int rc;
   if (out)
@@ -7744,29 +7754,28 @@ int ps_read_open(ps_space *s, ps_key key, const ps_ref *ref, ps_reader **out,
   if (!s || !out || !ps_internal_immutable_key(key))
     return err(error, LC_ERR_INVALID,
                "container reader requires typed key and output");
-  r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
-  if (!r)
-    return err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_observe_begin(s, &guard, error);
   if (rc == LC_OK)
-    rc = read_pin(s, key, ref, s->readiness && !s->allocation_guard, &r->entry,
+    rc = read_pin(s, key, ref, s->readiness && !s->allocation_guard, &entry,
                   error);
-  if (rc == LC_OK && !r->entry) {
+  if (rc == LC_OK && !entry) {
     rc = ps_internal_capture_begin(s, &guard, error);
     if (rc == LC_OK)
-      rc = read_pin(s, key, ref, 0, &r->entry, error);
+      rc = read_pin(s, key, ref, 0, &entry, error);
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
   if (rc == LC_OK) {
+    r = reader_new(s, entry);
+    if (!r)
+      rc = err(error, LC_ERR_NOMEM, "cannot allocate bounded reader");
+  }
+  if (rc == LC_OK) {
     ++s->readers;
-    r->space = s;
     *out = r;
-  } else if (r->entry)
-    ps_internal_entry_unpin(s, r->entry);
+  } else if (entry)
+    ps_internal_entry_unpin(s, entry);
   pthread_mutex_unlock(&s->mutex);
-  if (rc != LC_OK)
-    lc_free_with_allocator(NULL, r);
   return rc;
 }
 static void reader_payload_invalid(ps_reader *r) {
@@ -7779,6 +7788,22 @@ static void reader_payload_invalid(ps_reader *r) {
   pthread_mutex_lock(&r->space->mutex);
   r->entry->value_checked = -1;
   pthread_mutex_unlock(&r->space->mutex);
+}
+/* A walk retains the selected cells before reading a packed page. Reuse the
+ * checked bytes until the reader loads another extent. Standalone readers
+ * reserve at most one extent of scratch, including for random reads. */
+static int reader_load(ps_reader *r, const ps_extent *extent,
+                       const char *mismatch, lc_error *error) {
+  const unsigned char *data;
+  int rc = read_extent(r->space, extent, r->buffer, r->packed, &data, error);
+  if (rc != LC_OK)
+    return rc;
+  if (checksum(data, (size_t)extent->bytes) != extent->crc) {
+    reader_payload_invalid(r);
+    return err(error, LC_ERR_PROTOCOL, mismatch);
+  }
+  r->data = data;
+  return LC_OK;
 }
 int ps_internal_checkpoint_span(ps_reader *r, const unsigned char **out,
                                 lc_error *error) {
@@ -7818,20 +7843,16 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   while (count && r->extent < r->entry->count) {
     extent = &r->entry->extents[r->extent];
     if (!r->loaded) {
-      rc = read_extent(r->space, extent, r->buffer, r->packed, error);
+      rc = reader_load(r, extent, "container read payload checksum mismatch",
+                       error);
       if (rc != LC_OK)
         return rc;
-      if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
-        reader_payload_invalid(r);
-        return err(error, LC_ERR_PROTOCOL,
-                   "container read payload checksum mismatch");
-      }
       r->loaded = (size_t)extent->bytes;
     }
     n = r->loaded - r->offset;
     if (n > count)
       n = count;
-    memcpy(p, r->buffer + r->offset, n);
+    memcpy(p, r->data + r->offset, n);
     *out += n;
     p += n;
     count -= n;
@@ -7867,21 +7888,17 @@ int ps_read_at(ps_reader *r, uint64_t offset, void *buffer, size_t count,
     }
     if (!r->random_loaded) {
       r->loaded = 0;
-      rc = read_extent(r->space, extent, r->buffer, r->packed, error);
+      rc = reader_load(r, extent, "captured value payload checksum mismatch",
+                       error);
       if (rc != LC_OK)
         return rc;
-      if (checksum(r->buffer, (size_t)extent->bytes) != extent->crc) {
-        reader_payload_invalid(r);
-        return err(error, LC_ERR_PROTOCOL,
-                   "captured value payload checksum mismatch");
-      }
       r->random_loaded = 1;
     }
     within = (size_t)(offset - r->random_base);
     take = (size_t)extent->bytes - within;
     if (take > count)
       take = count;
-    memcpy(p, r->buffer + within, take);
+    memcpy(p, r->data + within, take);
     offset += take;
     p += take;
     count -= take;
@@ -8375,15 +8392,13 @@ int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
                "captured reader requires index and output");
   if (!view->items[at].retained)
     return err(error, LC_ERR_INVALID, "capture has no retained payload");
-  reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
+  reader = reader_new(view->space, view->items[at].retained);
   if (!reader)
     return err(error, LC_ERR_NOMEM, "cannot allocate captured value reader");
   s = view->space;
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK) {
-    reader->space = s;
-    reader->entry = view->items[at].retained;
     ++reader->entry->pins;
     ++s->readers;
   }
@@ -8397,6 +8412,7 @@ int ps_values_read_open(const ps_values *view, size_t at, ps_reader **out,
 typedef struct value_walk {
   ps_reader reader;
   packed_read packed;
+  unsigned char buffer[PS_CHUNK];
 } value_walk;
 static int value_position(const void *left, const void *right) {
   const ps_entry *a = *(ps_entry *const *)left;
@@ -8433,11 +8449,12 @@ static int values_read_walk(const ps_values *view, ps_space *io,
     rc = healthy(io, error);
     if (rc != LC_OK)
       break;
-    memset(r, 0, offsetof(ps_reader, buffer));
+    memset(r, 0, sizeof(*r));
     r->space = io;
     r->private_read = private_read;
     r->entry = order[i];
     r->packed = &walk->packed;
+    r->buffer = walk->buffer;
     rc = read(context, r->entry->key, r, error);
   }
   lc_free_with_allocator(NULL, walk);
@@ -8645,8 +8662,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
   if (s)
     s->fd = -1;
   p = ps_internal_entry_new(0, 0);
-  r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
-  if (!s || !p || !r) {
+  if (!s || !p) {
     rc = err(error, LC_ERR_NOMEM, "cannot allocate imported captured reader");
     goto done;
   }
@@ -8694,6 +8710,11 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
     rc = err(error, LC_ERR_INVALID, "captured ticket byte count mismatch");
     goto done;
   }
+  r = reader_new(s, p);
+  if (!r) {
+    rc = err(error, LC_ERR_NOMEM, "cannot allocate imported captured reader");
+    goto done;
+  }
   s->fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
   if (s->fd < 0 || fstat(s->fd, &st) != 0) {
     rc = err(error, LC_ERR_TRANSPORT, "cannot open captured reader file");
@@ -8709,8 +8730,6 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
   for (i = 0; rc == LC_OK && i < p->count; ++i)
     rc = import_pin(s->fd, p->extents[i].offset, p->extents[i].bytes, error);
   if (rc == LC_OK) {
-    r->space = s;
-    r->entry = p;
     r->imported = 1;
     *out = r;
     return LC_OK;
@@ -10140,11 +10159,10 @@ static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
       else
         hi = mid;
     }
-    reader = lc_calloc_with_allocator(NULL, 1, sizeof(*reader));
+    /* The run already pins this exact incarnation. */
+    reader = reader_new(run->space, p);
     if (!reader)
       return err(error, LC_ERR_NOMEM, "cannot allocate mapped read scratch");
-    reader->space = run->space;
-    reader->entry = p; /* run already pins this exact incarnation */
     while (n && rc == LC_OK) {
       uint64_t data;
       if (p->stream->range_bitmap) {

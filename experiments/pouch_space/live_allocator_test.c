@@ -1332,14 +1332,16 @@ static ssize_t packed_replay_write(void *context, int fd, const void *bytes,
 }
 static int packed_replay_visit(void *context, ps_key item, ps_reader *reader,
                                lc_error *e) {
-  char byte;
-  size_t *seen = context;
+  unsigned char bytes[65], expected = (unsigned char)(item.key % 251);
+  size_t got, *seen = context;
   REQUIRE(item.key >= 800 && item.key < 816);
   REQUIRE(!(*seen & ((size_t)1 << (item.key - 800))));
   *seen |= (size_t)1 << (item.key - 800);
-  ok(ps_read_at(reader, 64, &byte, 1, e), e);
-  REQUIRE((unsigned char)byte == item.key % 251);
-  captured_expect(reader, (unsigned char)(item.key % 251), 65);
+  ok(ps_read(reader, bytes, 1, &got, e), e);
+  REQUIRE(got == 1 && bytes[0] == expected);
+  ok(ps_read_at(reader, sizeof(bytes) - 1, bytes, 1, e), e);
+  REQUIRE(bytes[0] == expected);
+  captured_expect(reader, expected, sizeof(bytes) - 1);
   return LC_OK;
 }
 static int retain_odd_replay_slots(void *context, ps_key item,
