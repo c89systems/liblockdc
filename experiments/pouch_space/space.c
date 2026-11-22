@@ -85,9 +85,9 @@ static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 static int stream_structure_ready(ps_space *, const ps_entry *, lc_error *);
 typedef struct ps_value_slot {
-  ps_key key;
-  uint64_t token, bytes;
+  uint64_t key, token, bytes;
   ps_entry *retained;
+  unsigned int kind;
   int witness;
 } ps_value_slot;
 typedef struct ps_value_range {
@@ -96,8 +96,11 @@ typedef struct ps_value_range {
 } ps_value_range;
 struct ps_values {
   ps_space *space;
+  uint64_t owner;
   ps_value_slot *items;
-  size_t count;
+  /* Pin transitions and payload walks only visit retained items. */
+  ps_value_slot **retained;
+  size_t count, retained_count;
   ps_value_range *ranges, one_range;
   size_t range_count;
 };
@@ -575,15 +578,22 @@ static void unregister_entry(ps_entry *p) {
   if (p->all_next)
     p->all_next->all_link = p->all_link;
 }
+static unsigned int value_group(unsigned int kind) {
+  return kind < PS_KEY_METADATA ? 0 : kind - PS_KEY_METADATA + 1;
+}
+static ps_value_bucket *value_bucket(ps_space *s, ps_key key) {
+  return &s->value_buckets[value_group(key.kind)][key.owner % BUCKETS];
+}
 static void value_register(ps_space *s, ps_entry *p) {
-  ps_entry **head = &s->value_buckets[p->key.owner % BUCKETS];
-  p->value_next = *head;
-  p->value_link = head;
+  ps_value_bucket *bucket = value_bucket(s, p->key);
+  p->value_next = bucket->head;
+  p->value_link = &bucket->head;
   if (p->value_next)
     p->value_next->value_link = &p->value_next;
-  *head = p;
+  bucket->head = p;
+  ++bucket->count;
 }
-static void value_unregister(ps_entry *p) {
+static void value_unregister(ps_space *s, ps_entry *p) {
   if (!p->value_link)
     return;
   *p->value_link = p->value_next;
@@ -591,6 +601,7 @@ static void value_unregister(ps_entry *p) {
     p->value_next->value_link = p->value_link;
   p->value_link = NULL;
   p->value_next = NULL;
+  --value_bucket(s, p->key)->count;
 }
 static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
   if (old) {
@@ -650,7 +661,7 @@ static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   head->stream->storage += entry_storage(p);
 }
 static void retire(ps_space *s, ps_entry *p) {
-  value_unregister(p);
+  value_unregister(s, p);
   if (p->key.kind == PS_CATALOG)
     ps_catalog_unlink(s, p);
   if (p->key.kind == PS_OWNED_RUN)
@@ -5408,7 +5419,7 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   ps_readiness_certificate current;
   lc_error draft_error;
   ps_space *draft = projection_new(s, error);
-  size_t i;
+  size_t group, i;
   int rc, prepared = LC_OK;
   *moved = 0;
   if (!draft)
@@ -5444,9 +5455,12 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
                sizeof(s->value_buckets));
         memcpy(s->stream_buckets, draft->stream_buckets,
                sizeof(s->stream_buckets));
-        for (i = 0; i < BUCKETS; ++i)
-          if (s->value_buckets[i])
-            s->value_buckets[i]->value_link = &s->value_buckets[i];
+        for (group = 0; group < PS_VALUE_GROUPS; ++group)
+          for (i = 0; i < BUCKETS; ++i) {
+            ps_value_bucket *bucket = &s->value_buckets[group][i];
+            if (bucket->head)
+              bucket->head->value_link = &bucket->head;
+          }
         projection_install(s, draft);
         *certificate = current;
       } else if (error) {
@@ -5814,7 +5828,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
   ps_entry *p, *next, *q, *keep = NULL, *consumed = NULL, *borrowed = NULL,
                           *dest;
   ps_catalog_record *record;
-  size_t i;
+  size_t group, i;
   /* Preparation is finished. Nothing below allocates or performs file I/O. */
   for (i = 0; i < v->keys.capacity; ++i) {
     p = v->keys.slots[i].entry;
@@ -5944,13 +5958,17 @@ static void projection_entries(ps_space *s, ps_space *v) {
     }
   }
   s->entries = projected(v->entries);
-  for (i = 0; i < BUCKETS; ++i) {
-    ps_entry **link;
-    s->value_buckets[i] = projected(v->value_buckets[i]);
-    for (link = &s->value_buckets[i]; *link; link = &(*link)->value_next)
-      (*link)->value_link = link;
+  for (group = 0; group < PS_VALUE_GROUPS; ++group)
+    for (i = 0; i < BUCKETS; ++i) {
+      ps_value_bucket *bucket = &s->value_buckets[group][i];
+      ps_entry **link;
+      *bucket = v->value_buckets[group][i];
+      bucket->head = projected(bucket->head);
+      for (link = &bucket->head; *link; link = &(*link)->value_next)
+        (*link)->value_link = link;
+    }
+  for (i = 0; i < BUCKETS; ++i)
     s->stream_buckets[i] = projected(v->stream_buckets[i]);
-  }
   for (i = 0; i < v->catalogs.capacity; ++i)
     v->catalogs.buckets[i] = projected(v->catalogs.buckets[i]);
   for (p = s->entries; p; p = p->all_next) {
@@ -7234,6 +7252,8 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   ps_coordination_guard *guard;
   uint64_t prefix, local = 0, peer = 0;
   ps_entry *p;
+  unsigned int group;
+  size_t bucket = owner % BUCKETS;
   int rc;
 
   if (!s->readiness)
@@ -7241,21 +7261,18 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_observe_begin(s, &guard, error);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
-  for (p = s->value_buckets[owner % BUCKETS]; rc == LC_OK && p;
-       p = p->value_next) {
-    if (p->key.owner != owner ||
-        (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION &&
-         p->key.kind != PS_NAMESPACE_CHECKPOINT) ||
-        (!s->durable && !p->durable_visibility))
-      continue;
-    if (p->peer_sequence) {
-      if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
-        peer = p->peer_sequence;
-    } else if (p->publication_sequence > prefix &&
-               p->publication_sequence > local) {
-      local = p->publication_sequence;
+  for (group = 1; rc == LC_OK && group < PS_VALUE_GROUPS; ++group)
+    for (p = s->value_buckets[group][bucket].head; p; p = p->value_next) {
+      if (p->key.owner != owner || (!s->durable && !p->durable_visibility))
+        continue;
+      if (p->peer_sequence) {
+        if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
+          peer = p->peer_sequence;
+      } else if (p->publication_sequence > prefix &&
+                 p->publication_sequence > local) {
+        local = p->publication_sequence;
+      }
     }
-  }
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc == LC_OK ? ps_internal_durable_prefix(s, local, peer, error) : rc;
@@ -7471,7 +7488,6 @@ static int values_witness_range(const ps_values *view, size_t *at, size_t limit,
 static void values_free(ps_values *view) {
   if (view->ranges != &view->one_range)
     lc_free_with_allocator(NULL, view->ranges);
-  lc_free_with_allocator(NULL, view->items);
   lc_free_with_allocator(NULL, view);
 }
 static void values_unwitness(ps_values *view, size_t limit) {
@@ -7483,19 +7499,19 @@ static void values_unwitness(ps_values *view, size_t limit) {
 }
 static int values_witness(ps_values *view, int provisional, lc_error *error) {
   ps_space *s = view->space;
+  ps_value_slot *item;
   ps_entry *p;
   ps_value_range *range;
   size_t i, j, count = 0, at = 0, done = 0;
   uint64_t offset, bytes;
   int rc;
-  for (i = 0; i < view->count; ++i) {
-    p = view->items[i].retained;
-    if (!p)
-      continue;
+  for (i = 0; i < view->retained_count; ++i) {
+    item = view->retained[i];
+    p = item->retained;
     if (p->count > (size_t)-1 / sizeof(*range) - count)
       return err(error, LC_ERR_NOMEM, "captured ranges exceed local limit");
     count += p->count;
-    view->items[i].witness = p->count && !p->pins && !p->payload_claimed;
+    item->witness = p->count && !p->pins && !p->payload_claimed;
   }
   if (!count)
     return LC_OK;
@@ -7508,14 +7524,14 @@ static int values_witness(ps_values *view, int provisional, lc_error *error) {
   range = view->ranges;
   /* Keep the extents that already have a witness as well. Other readers
    * may leave before this view and hand it their last pin. */
-  for (i = 0; i < view->count; ++i) {
-    p = view->items[i].retained;
-    if (p)
-      for (j = 0; j < p->count; ++j, ++range) {
-        range->offset = p->extents[j].offset;
-        range->bytes = extent_allocation(&p->extents[j]);
-        range->item = &view->items[i];
-      }
+  for (i = 0; i < view->retained_count; ++i) {
+    item = view->retained[i];
+    p = item->retained;
+    for (j = 0; j < p->count; ++j, ++range) {
+      range->offset = p->extents[j].offset;
+      range->bytes = extent_allocation(&p->extents[j]);
+      range->item = item;
+    }
   }
   if (count > 1)
     qsort(view->ranges, count, sizeof(*range), value_range_order);
@@ -7536,19 +7552,23 @@ static int values_witness(ps_values *view, int provisional, lc_error *error) {
   return LC_OK;
 }
 void ps_internal_values_discard_locked(ps_values *view) {
+  ps_value_slot *item;
   ps_entry *p;
   size_t i;
   if (!view)
     return;
   --view->space->readers;
-  for (i = 0; i < view->count; ++i) {
-    p = view->items[i].retained;
-    view->items[i].witness = p && !--p->pins && p->reader_claimed;
+  for (i = 0; i < view->retained_count; ++i) {
+    item = view->retained[i];
+    p = item->retained;
+    item->witness = !--p->pins && p->reader_claimed;
   }
   values_unwitness(view, view->range_count);
-  for (i = 0; i < view->count; ++i)
-    if (view->items[i].witness)
-      view->items[i].retained->reader_claimed = 0;
+  for (i = 0; i < view->retained_count; ++i) {
+    item = view->retained[i];
+    if (item->witness)
+      item->retained->reader_claimed = 0;
+  }
   values_free(view);
 }
 static int values_select_locked(ps_space *s, uint64_t owner, unsigned int first,
@@ -7556,40 +7576,53 @@ static int values_select_locked(ps_space *s, uint64_t owner, unsigned int first,
                                 ps_value_retain_fn retain, void *context,
                                 ps_values **out, lc_error *error) {
   ps_values *view;
-  ps_entry *p, *selected, *group = s->value_buckets[owner % BUCKETS];
-  size_t n = 0, at = 0;
-  int rc = LC_OK;
+  ps_entry *p, *selected;
+  size_t count = 0, bucket = owner % BUCKETS;
+  size_t slot_bytes = sizeof(*view->items) + sizeof(*view->retained);
+  size_t limit = (SIZE_MAX - sizeof(*view)) / slot_bytes;
+  unsigned int group, begin = value_group(first), end;
   *out = NULL;
-  view = lc_calloc_with_allocator(NULL, 1, sizeof(*view));
+  if (last > PS_NAMESPACE_CHECKPOINT)
+    last = PS_NAMESPACE_CHECKPOINT;
+  end = value_group(last);
+  /* Bucket occupancy bounds the capture even when a tombstone selects a
+   * predecessor or when two owners share a bucket. */
+  for (group = begin; group <= end; ++group) {
+    size_t occupied = s->value_buckets[group][bucket].count;
+    if (occupied > limit - count)
+      return err(error, LC_ERR_NOMEM, "selected value metadata exceeds limit");
+    count += occupied;
+  }
+  view = lc_alloc_with_allocator(NULL, sizeof(*view) + count * slot_bytes);
   if (!view)
     return err(error, LC_ERR_NOMEM, "cannot allocate selected value capture");
+  memset(view, 0, sizeof(*view));
   view->space = s;
-  for (p = group; p; p = p->value_next)
-    if (p->key.owner == owner && p->key.kind >= first && p->key.kind <= last &&
-        selected_value(s, p, prefix))
-      ++n;
-  if (n) {
-    if (n <= (size_t)-1 / sizeof(*view->items))
-      view->items = lc_calloc_with_allocator(NULL, n, sizeof(*view->items));
-    if (!view->items)
-      rc = err(error, LC_ERR_NOMEM, "cannot capture selected value metadata");
-  }
-  for (p = group; rc == LC_OK && p; p = p->value_next)
-    if (p->key.owner == owner && p->key.kind >= first && p->key.kind <= last &&
-        (selected = selected_value(s, p, prefix)) != NULL) {
-      ps_value_slot *item = &view->items[at++];
-      item->key = selected->key;
-      item->token = selected->token;
-      item->bytes = selected->bytes;
-      if (!retain || retain(context, item->key, item->token))
-        item->retained = selected;
+  view->owner = owner;
+  view->items = (ps_value_slot *)(view + 1);
+  view->retained = (ps_value_slot **)(view->items + count);
+  for (group = begin; group <= end; ++group)
+    for (p = s->value_buckets[group][bucket].head; p; p = p->value_next) {
+      if (p->key.owner != owner ||
+          (!group && (p->key.kind < first || p->key.kind > last)))
+        continue;
+      selected = selected_value(s, p, prefix);
+      if (selected) {
+        ps_value_slot *item = &view->items[view->count++];
+        item->key = selected->key.key;
+        item->kind = selected->key.kind;
+        item->token = selected->token;
+        item->bytes = selected->bytes;
+        if (!retain || retain(context, selected->key, item->token)) {
+          item->retained = selected;
+          item->witness = 0;
+          view->retained[view->retained_count++] = item;
+        } else
+          item->retained = NULL;
+      }
     }
-  view->count = at;
-  if (rc == LC_OK)
-    *out = view;
-  else
-    values_free(view);
-  return rc;
+  *out = view;
+  return LC_OK;
 }
 int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
                                       unsigned int first, unsigned int last,
@@ -7597,7 +7630,7 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
                                       ps_value_retain_fn retain, void *context,
                                       ps_values **out, lc_error *error) {
   ps_values *view;
-  ps_entry *p;
+  ps_value_slot *item;
   size_t i;
   int rc = values_select_locked(s, owner, first, last, prefix, retain, context,
                                 &view, error);
@@ -7607,12 +7640,12 @@ int ps_internal_values_capture_locked(ps_space *s, uint64_t owner,
   if (ps_coordination_shared(s->coordination))
     rc = values_witness(view, provisional, error);
   if (rc == LC_OK) {
-    for (i = 0; i < view->count; ++i)
-      if ((p = view->items[i].retained) != NULL) {
-        if (view->items[i].witness)
-          p->reader_claimed = 1;
-        ++p->pins;
-      }
+    for (i = 0; i < view->retained_count; ++i) {
+      item = view->retained[i];
+      if (item->witness)
+        item->retained->reader_claimed = 1;
+      ++item->retained->pins;
+    }
     ++s->readers;
     *out = view;
   } else
@@ -7670,7 +7703,9 @@ int ps_values_info(const ps_values *view, size_t at, ps_key *key, ps_ref *ref,
     return err(error, LC_ERR_INVALID,
                "captured value requires index and output");
   p = &view->items[at];
-  *key = p->key;
+  key->owner = view->owner;
+  key->key = p->key;
+  key->kind = p->kind;
   memcpy(ref->container, view->space->identity, sizeof(ref->container));
   ref->incarnation = p->token;
   *bytes = p->bytes;
@@ -7724,10 +7759,8 @@ static int values_read_walk(const ps_values *view, ps_space *io,
   value_walk *walk;
   ps_reader *r;
   ps_entry **order;
-  size_t i, count = 0, at = 0, bytes;
+  size_t i, count = view->retained_count, bytes;
   int rc;
-  for (i = 0; i < view->count; ++i)
-    count += view->items[i].retained != NULL;
   if (!count)
     return LC_OK;
   if (count > ((size_t)-1 - sizeof(*walk)) / sizeof(*order))
@@ -7737,9 +7770,8 @@ static int values_read_walk(const ps_values *view, ps_space *io,
   if (!walk)
     return err(error, LC_ERR_NOMEM, "cannot allocate captured read order");
   order = (void *)(walk + 1);
-  for (i = 0; i < view->count; ++i)
-    if (view->items[i].retained)
-      order[at++] = view->items[i].retained;
+  for (i = 0; i < count; ++i)
+    order[i] = view->retained[i]->retained;
   if (count > 1)
     qsort(order, count, sizeof(*order), value_position);
   walk->packed.offset = 0;

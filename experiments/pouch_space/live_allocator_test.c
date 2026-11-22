@@ -1730,7 +1730,8 @@ static void capture_faults(void) {
     ok(ps_close(s, &e), &e);
     REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
   }
-  for (size_t nth = 0; nth <= 3; ++nth) {
+  /* The capture and its witness ranges are the two allocations. */
+  for (size_t nth = 0; nth <= 2; ++nth) {
     lc_error e = {0};
     ps_space *s = NULL;
     ps_values *view = NULL;
@@ -1749,7 +1750,7 @@ static void capture_faults(void) {
     f.armed = 1;
     int rc = ps_values_capture(s, 88, PS_STATE, PS_STATE, &view, &e);
     measuring = 0;
-    REQUIRE(allocations == (nth ? nth : 3));
+    REQUIRE(allocations == (nth ? nth : 2));
     /* Adjacent values share one physical witness acquisition. A reader
      * opened from the capture can retain just its value after view close. */
     REQUIRE(f.calls == (nth ? 0U : 1U));
@@ -2939,6 +2940,26 @@ static void projection_quarantine(int durable, int explicit_sweep) {
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void expect_capture_kinds(ps_space *space, uint64_t owner,
+                                 unsigned int first, unsigned int last,
+                                 uint64_t expected) {
+  lc_error e = {0};
+  ps_values *view = NULL;
+  ok(ps_values_capture(space, owner, first, last, &view, &e), &e);
+  for (size_t i = 0; i < ps_values_count(view); ++i) {
+    ps_key key;
+    ps_ref ref;
+    uint64_t bytes;
+    ok(ps_values_info(view, i, &key, &ref, &bytes, &e), &e);
+    REQUIRE(key.owner == owner && key.kind <= PS_NAMESPACE_CHECKPOINT &&
+            ref.incarnation && bytes == 65);
+    uint64_t kind = UINT64_C(1) << key.kind;
+    REQUIRE(expected & kind);
+    expected ^= kind;
+  }
+  REQUIRE(!expected);
+  ps_values_close(view);
+}
 static void projection_lifecycle(void) {
   lc_error e = {0};
   projection_io m = {0};
@@ -2959,11 +2980,21 @@ static void projection_lifecycle(void) {
   ps_owned_run *run = NULL;
   ps_owned_status owned;
   ps_key stream = {88, 900, PS_STREAM}, snapshot = {777, 1, PS_STATE};
+  ps_key slot = {777, 2, PS_KEY_METADATA}, decision = {777, 3, PS_KEY_DECISION},
+         control = {777, 1, PS_NAMESPACE_CHECKPOINT},
+         collision = {777 + BUCKETS, 2, PS_KEY_METADATA};
+  uint64_t slot_kind = UINT64_C(1) << PS_KEY_METADATA;
+  uint64_t surviving_kinds = (UINT64_C(1) << PS_KEY_DECISION) |
+                             (UINT64_C(1) << PS_NAMESPACE_CHECKPOINT);
   int found;
   ok(ps_open(path, 1, &options, &a, &e), &e);
   for (uint64_t id = 1; id <= 350; ++id)
     capture_put(a, id, id == 3 ? 3 * PS_CHUNK : 65);
   capture_put_key(a, snapshot, 65);
+  capture_put_key(a, slot, 65);
+  capture_put_key(a, decision, 65);
+  capture_put_key(a, control, 65);
+  capture_put_key(a, collision, 65);
   ok(ps_owned_open(a, NULL, stream, 1, NULL, &head, &owned, &e), &e);
   ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e), &e);
   REQUIRE(found);
@@ -2980,6 +3011,12 @@ static void projection_lifecycle(void) {
   ok(ps_catalog_get(a, 88, PS_CATALOG_BODY, "retained", 8, &binding, &e), &e);
   REQUIRE(binding && ps_values_count(values) == 1);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
+  expect_capture_kinds(b, slot.owner, PS_STATE, PS_NAMESPACE_CHECKPOINT,
+                       (UINT64_C(1) << PS_STATE) | surviving_kinds | slot_kind);
+  expect_capture_kinds(b, slot.owner, PS_KEY_METADATA, PS_KEY_METADATA,
+                       slot_kind);
+  expect_capture_kinds(b, slot.owner, PS_NAMESPACE_CHECKPOINT + 1,
+                       PS_NAMESPACE_CHECKPOINT + 1, 0);
   ps_budget_plan plan = {PS_CHUNK + 2 * PS_PAGE, 4096, 8, 0}, before, after;
   ps_budget *budget = NULL;
   ok(ps_budget_open(a, &plan, &budget, &e), &e);
@@ -2991,6 +3028,8 @@ static void projection_lifecycle(void) {
   /* Its structural tail hint is deliberately absent from the peer's view. */
   ok(ps_delete(b, key(1), &e), &e);
   ok(ps_delete(b, snapshot, &e), &e);
+  ok(ps_delete(b, slot, &e), &e);
+  expect_capture_kinds(b, slot.owner, PS_KEY_METADATA, PS_KEY_METADATA, 0);
   capture_put(b, 2, 1000);
   for (size_t round = 0; round < 3; ++round) {
     for (uint64_t id = 10; id <= 350; id += 3)
@@ -3022,6 +3061,10 @@ static void projection_lifecycle(void) {
     ok(ps_refresh(a, &e), &e);
     REQUIRE(m.syncs == 0 && !m.payload_reads);
     m.armed = 0;
+    expect_capture_kinds(a, slot.owner, PS_KEY_METADATA,
+                         PS_NAMESPACE_CHECKPOINT, surviving_kinds);
+    expect_capture_kinds(a, collision.owner, PS_KEY_METADATA, PS_KEY_METADATA,
+                         slot_kind);
     REQUIRE(a->token_next == next_token + round && a->token_end == endpoint);
     ok(ps_budget_status(budget, &after, &e), &e);
     REQUIRE(after.payload_bytes == before.payload_bytes &&
@@ -3095,6 +3138,8 @@ static void projection_lifecycle(void) {
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0));
   ok(ps_open(path, 0, NULL, &a, &e), &e);
+  expect_capture_kinds(a, slot.owner, PS_STATE, PS_NAMESPACE_CHECKPOINT,
+                       surviving_kinds);
   ok(ps_read_open(a, key(9000), NULL, &current, &e), &e);
   captured_expect(current, 9000 % 251, PS_CHUNK);
   ps_reader_close(current);

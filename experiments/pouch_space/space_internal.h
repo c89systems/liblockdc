@@ -140,6 +140,11 @@ typedef struct ps_key_index {
   ps_key_slot *slots;
   size_t count, capacity;
 } ps_key_index;
+typedef struct ps_value_bucket {
+  ps_entry *head;
+  size_t count;
+} ps_value_bucket;
+#define PS_VALUE_GROUPS (2U + PS_NAMESPACE_CHECKPOINT - PS_KEY_METADATA)
 struct ps_space {
   /* fd is borrowed from coordination after successful lifetime admission. */
   int fd, poisoned, durable, root;
@@ -209,9 +214,9 @@ struct ps_space {
    * The resident mutex protects those entries through adoption or discard. */
   struct ps_space *projection_resident;
   ps_key_index keys;
-  /* Current immutable keys, including tombstones that select older values
-   * at a completed prefix. Each bucket groups keys by namespace owner. */
-  ps_entry *value_buckets[BUCKETS];
+  /* Separate checkpoint kinds from other immutable keys and from each
+   * other. Include current tombstones that can still select older values. */
+  ps_value_bucket value_buckets[PS_VALUE_GROUPS][BUCKETS];
   ps_entry *stream_buckets[BUCKETS];
   ps_directory_root directory;
   ps_meta_page *pages, *page_buckets[BUCKETS];
