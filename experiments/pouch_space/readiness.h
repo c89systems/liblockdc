@@ -67,9 +67,10 @@ int ps_readiness_prepare_ticket(ps_space *, uint64_t *, lc_error *);
 uint64_t ps_readiness_issued_tickets(ps_space *);
 int ps_readiness_stabilize(ps_space *, uint64_t wire, uint64_t root,
                            size_t journal_bytes, uint64_t prepared, lc_error *);
-/* A stable checked snapshot can prove a private preparation ticket without
- * allocation authority. Notifications carry no proof or authority. */
-int ps_readiness_prepared_durable(ps_space *, uint64_t ticket);
+/* A stable checked snapshot can prove a published prefix or private
+ * preparation ticket without allocation authority. Zero omits that bound.
+ * Notifications carry no proof or authority. */
+int ps_readiness_durability_covers(ps_space *, uint64_t wire, uint64_t ticket);
 uint32_t ps_readiness_sync_observe(ps_space *);
 int ps_readiness_sync_wait(ps_space *, uint32_t observed);
 void ps_readiness_sync_wake(ps_space *);

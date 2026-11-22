@@ -4041,7 +4041,6 @@ static void shared_durability(void) {
     uint64_t wire = readiness(a).ready;
     ps_stats before_a = status(a), before_b = status(b);
     x.calls = y.calls = 0;
-    x.paused = late;
     y.paused = 1;
     y.attempted = 0;
     pthread_t first, second;
@@ -4072,23 +4071,18 @@ static void shared_durability(void) {
     pthread_cond_broadcast(&y.cond);
     pthread_mutex_unlock(&y.mutex);
     REQUIRE(!pthread_join(first, NULL));
+    join_durability_waiter(second);
+    REQUIRE(!x.calls && y.calls == 1);
     if (late) {
-      pthread_mutex_lock(&x.mutex);
-      while (!x.entered && !x.finished)
-        pthread_cond_wait(&x.cond, &x.mutex);
-      REQUIRE(x.entered);
-      pthread_mutex_unlock(&x.mutex);
       during = readiness(a);
       REQUIRE(during.durable == wire && during.ready == wire + 1);
       uint64_t selected, durable;
       ok(ps_publication_prefix(a, &selected, &durable, &e), &e);
       REQUIRE(durable < selected);
-      pthread_mutex_lock(&x.mutex);
-      x.released = 1;
-      pthread_cond_broadcast(&x.cond);
-      pthread_mutex_unlock(&x.mutex);
+      /* The follower can finish at its requested prefix. Work published
+       * during the sync still requires a separate barrier. */
+      ok(ps_flush(a, &e), &e);
     }
-    REQUIRE(!pthread_join(second, NULL));
     REQUIRE(x.calls == (size_t)late && y.calls == 1);
     REQUIRE(status(a).syncs == before_a.syncs + (uint64_t)late &&
             status(b).syncs == before_b.syncs + 1);
@@ -4204,7 +4198,8 @@ typedef struct readiness_fault {
 static int readiness_lock(void *context, int fd, int command,
                           struct flock *lock) {
   readiness_fault *f = context;
-  int match = f->kind == 1   ? command == F_OFD_SETLKW && lock->l_start == 5
+  int match = f->kind == 1   ? command == F_OFD_SETLK && lock->l_start == 5 &&
+                                   lock->l_type == F_WRLCK
               : f->kind == 2 ? command == F_OFD_SETLK && lock->l_start == 5 &&
                                    lock->l_type == F_UNLCK
               : f->kind == 3 ? command == F_OFD_SETLKW && lock->l_start == 4
@@ -4265,12 +4260,11 @@ static void readiness_faults(void) {
         f.armed = kind != 5;
         rc = ps_flush(s, &e);
         f.armed = 0;
-        if (!reason || kind == 5)
+        if (!reason || kind == 5 || (kind == 1 && reason == 1))
           ok(rc, &e);
         else {
-          REQUIRE(rc == ((kind == 1 || kind == 3) && reason == 1
-                             ? LC_ERR_PENDING
-                             : LC_ERR_TRANSPORT));
+          REQUIRE(rc == (kind == 3 && reason == 1 ? LC_ERR_PENDING
+                                                  : LC_ERR_TRANSPORT));
           lc_error_cleanup(&e);
           uint64_t after, acknowledged;
           ok(ps_status(s, &(ps_stats){0}, &e), &e);
@@ -4284,6 +4278,11 @@ static void readiness_faults(void) {
             REQUIRE(after == selected && acknowledged == durable);
             ok(ps_flush(s, &e), &e);
           }
+        }
+        if (kind == 1 && reason == 1) {
+          uint64_t after, acknowledged;
+          ok(ps_publication_prefix(s, &after, &acknowledged, &e), &e);
+          REQUIRE(f.calls == 2 && after == selected && acknowledged == after);
         }
         ok(ps_close(s, &e), &e);
         ok(ps_close(observer, &e), &e);
@@ -6086,6 +6085,56 @@ static int observe_sync_conflict(void *context, int fd, int command,
   }
   errno = reason;
   return rc;
+}
+typedef struct prefix_work {
+  ps_space *space;
+  uint64_t local, peer;
+} prefix_work;
+static void *stabilize_prefix(void *context) {
+  const prefix_work *work = context;
+  lc_error e = {0};
+  ok(ps_internal_durable_prefix(work->space, work->local, work->peer, &e), &e);
+  return NULL;
+}
+static void published_durability_wait(void) {
+  durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+  ps_coordination_io io = {&gate, observe_sync_conflict};
+  ps_options options = {.coordination_io = &io};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_coordination_guard *leader = NULL;
+  pthread_t waiter;
+  lc_error e = {0};
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_coordination_lock(peer->coordination, PS_COORDINATION_SYNC, 0, 1,
+                          &leader, &e),
+     &e);
+  capture_put(writer, 1, 65);
+  capture_put(peer, 2, 65);
+  prefix_work work = {writer, writer->own_ready_sequence,
+                      readiness(peer).ready};
+  REQUIRE(work.local && readiness(peer).durable < work.peer);
+  uint64_t syncs = status(writer).syncs;
+  REQUIRE(!pthread_create(&waiter, NULL, stabilize_prefix, &work));
+  pthread_mutex_lock(&gate.mutex);
+  while (!gate.attempted)
+    pthread_cond_wait(&gate.cond, &gate.mutex);
+  pthread_mutex_unlock(&gate.mutex);
+  REQUIRE(readiness(peer).durable < work.peer);
+  ok(ps_checkpoint(peer, &e), &e);
+  join_durability_waiter(waiter);
+  REQUIRE(readiness(peer).durable >= work.peer &&
+          status(writer).syncs == syncs);
+  ps_coordination_unlock(leader);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_open(path, 0, NULL, &writer, &e), &e);
+  expect_value(writer, key(1), 65, 1);
+  expect_value(writer, key(2), 65, 2);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  REQUIRE(!pthread_cond_destroy(&gate.cond) &&
+          !pthread_mutex_destroy(&gate.mutex));
 }
 static void shared_preparation_wait(int owner_dies) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
@@ -8173,9 +8222,10 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "projection-tail")) {
     projection_tail(0);
     projection_tail(1);
-  } else if (!strcmp(argv[2], "shared-durable"))
+  } else if (!strcmp(argv[2], "shared-durable")) {
     shared_durability();
-  else if (!strcmp(argv[2], "shared-preparation")) {
+    published_durability_wait();
+  } else if (!strcmp(argv[2], "shared-preparation")) {
     shared_preparation(READY_BEFORE_SYNC);
     shared_preparation(READY_DURING_SYNC);
     shared_preparation(FAILED_SYNC);

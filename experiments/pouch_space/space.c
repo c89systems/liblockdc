@@ -267,14 +267,13 @@ static void mark_durable(ps_space *s, uint64_t sequence) {
  * a global wire prefix. Completed private writes can separately register a
  * ticket that precedes the shared barrier, without publishing a journal frame.
  */
-static int prepared_sync_acquire(ps_space *s, uint64_t ticket,
-                                 ps_coordination_guard **leader,
-                                 lc_error *error) {
+static int durability_acquire(ps_space *s, uint64_t wire, uint64_t ticket,
+                              ps_coordination_guard **leader, lc_error *error) {
   uint32_t observed;
   int rc;
   for (;;) {
     observed = ps_readiness_sync_observe(s);
-    if (ps_readiness_prepared_durable(s, ticket))
+    if (ps_readiness_durability_covers(s, wire, ticket))
       return healthy(s, error);
     rc = ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 0,
                               leader, error);
@@ -292,11 +291,22 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
                           int *synced, lc_error *error) {
   ps_coordination_guard *leader = NULL, *guard = NULL;
   ps_readiness_certificate certificate;
-  uint64_t target = 0, wire = 0, prepared = 0;
+  uint64_t target = 0, wire = 0, prepared = 0, needed = required_wire;
   int rc, covered = 0;
   *synced = 0;
-  rc = ticket && !required_wire
-           ? prepared_sync_acquire(s, ticket, &leader, error)
+  if (requested && !ticket) {
+    pthread_mutex_lock(&s->mutex);
+    /* Capture one coherent local-to-journal witness before waiting. A peer
+     * can acknowledge this prefix even if a later local operation is pending.
+     * A local target beyond the published prefix still needs a leader. */
+    if (requested > s->own_ready_sequence)
+      needed = 0;
+    else if (s->own_ready_wire > needed)
+      needed = s->own_ready_wire;
+    pthread_mutex_unlock(&s->mutex);
+  }
+  rc = ticket || needed
+           ? durability_acquire(s, needed, ticket, &leader, error)
            : ps_coordination_lock(s->coordination, PS_COORDINATION_SYNC, 0, 1,
                                   &leader, error);
   if (rc != LC_OK)

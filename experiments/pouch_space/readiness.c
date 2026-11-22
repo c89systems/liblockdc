@@ -244,9 +244,11 @@ static int checked_snapshot(ps_space *s, uint64_t *record, uint64_t allowed) {
          !(__atomic_load_n(page + PENDING_WORD, __ATOMIC_ACQUIRE) & blocked) &&
          !memcmp(record + IDENTITY, s->identity, 16);
 }
-int ps_readiness_prepared_durable(ps_space *s, uint64_t ticket) {
+int ps_readiness_durability_covers(ps_space *s, uint64_t wire,
+                                   uint64_t ticket) {
   uint64_t record[WORDS];
-  return checked_snapshot(s, record, 0) && record[PREPARED_DURABLE] >= ticket;
+  return checked_snapshot(s, record, 0) && record[DURABLE] >= wire &&
+         record[PREPARED_DURABLE] >= ticket;
 }
 int ps_readiness_resident(ps_space *s) {
   uint64_t record[WORDS];
@@ -402,7 +404,7 @@ int ps_readiness_validate(ps_space *s, lc_error *e) {
 int ps_readiness_opened(ps_space *s, lc_error *e) {
   uint64_t record[WORDS] = {0};
   size_t i;
-  int selected = 1, rc;
+  int selected = 1, rc, advanced = 0;
   if (!s->readiness)
     return LC_OK;
   if (s->readiness->existing) {
@@ -415,6 +417,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     if (record[READY] > s->sequence || record[ROOT] > s->generation ||
         record[DURABLE] > s->peer_durable || record[GRANT_USED] >= s->token_end)
       return failed(s, e, "recovery regressed shared readiness");
+    advanced = record[DURABLE] < s->peer_durable;
   } else {
     __atomic_store_n(s->readiness->page, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + WORDS, 0, __ATOMIC_RELEASE);
@@ -447,6 +450,8 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     s->own_ready_sequence =
         __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE);
     ps_readiness_finish(s, PS_READINESS_ROOT | PS_READINESS_JOURNAL);
+    if (advanced)
+      ps_readiness_sync_wake(s);
   }
   return rc;
 }
@@ -544,7 +549,7 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
                            size_t journal_bytes, uint64_t prepared,
                            lc_error *e) {
   uint64_t record[WORDS];
-  int selected, rc, prepared_advanced;
+  int selected, rc, prepared_advanced, durable_advanced;
   if (!s->readiness || !s->readiness->active)
     return LC_OK;
   rc = current(s, record, &selected, e);
@@ -561,8 +566,9 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
     record[READY] =
         wire; /* A newly stabilized selected root proves this prefix. */
   prepared_advanced = prepared > record[PREPARED_DURABLE];
-  if (wire > record[DURABLE] || root > record[ROOT] || prepared_advanced) {
-    if (wire > record[DURABLE])
+  durable_advanced = wire > record[DURABLE];
+  if (durable_advanced || root > record[ROOT] || prepared_advanced) {
+    if (durable_advanced)
       record[DURABLE] = wire;
     if (root > record[ROOT]) {
       record[ROOT] = root;
@@ -574,7 +580,7 @@ int ps_readiness_stabilize(ps_space *s, uint64_t wire, uint64_t root,
   }
   if (rc == LC_OK && root)
     ps_readiness_finish(s, PS_READINESS_ROOT);
-  if (rc == LC_OK && prepared_advanced)
+  if (rc == LC_OK && (prepared_advanced || (root && durable_advanced)))
     ps_readiness_sync_wake(s);
   return rc;
 }
