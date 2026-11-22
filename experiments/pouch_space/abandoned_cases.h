@@ -324,6 +324,8 @@ static void namespace_abandoned_empty(void) {
     OK(ps_root_namespace_acquire(root, "empty", 1, &ns, &error));
     OK(ps_namespace_rotate(ns, 0, &error));
     for (unsigned int cycle = 0; cycle < 24; ++cycle) {
+      const size_t limit = 16;
+      uint64_t expected;
       /* Preserve fragmentation margins as well as physical payload capacity.
        * Only the initial half-MiB abandoned reservation is larger; subsequent
        * quarter-MiB operations reuse its capacity while other data stays live.
@@ -334,10 +336,14 @@ static void namespace_abandoned_empty(void) {
       OK(ps_namespace_checkpoint_flush(ns, &error));
       OK(ps_namespace_status_get(ns, &status, &error));
       CHECK(status.checkpoint_epoch && status.covered_segment == active &&
-            !status.covered_offset && !status.checkpoint_keys);
-      OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, active, 16, NULL, NULL,
+            !status.covered_offset && !status.checkpoint_keys &&
+            status.bound_segments == 1 && status.runs);
+      expected = status.runs < limit ? status.runs : limit;
+      OK(ps_namespace_repack(ns, PS_CATALOG_SEGMENT, active, limit, NULL, NULL,
                              &result, &error));
-      CHECK(result.finished_tail && result.pending && result.replaced == 16);
+      CHECK(result.finished_tail && result.visited == expected &&
+            result.replaced == expected &&
+            result.pending == (status.runs > limit));
       OK(ps_namespace_reclaim(ns, PS_CATALOG_SEGMENT, active, &error));
       ++active;
       OK(ps_checkpoint(ps_root_space(root), &error));
