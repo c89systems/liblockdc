@@ -321,13 +321,18 @@ static int shared_durable(ps_space *s, uint64_t requested, uint64_t ticket,
     rc = ps_readiness_read(s, &certificate, error);
   if (rc == LC_OK) {
     s->peer_durable = certificate.durable;
-    covered = certificate.durable >= required_wire &&
-              requested <= s->own_ready_sequence &&
-              certificate.durable >= s->own_ready_wire;
-    if (covered)
+    if (certificate.durable >= required_wire &&
+        requested <= s->own_ready_sequence &&
+        certificate.durable >= s->own_ready_wire) {
+      covered = 1;
       target = s->own_ready_sequence;
-    else if (ticket && ticket <= certificate.prepared_durable &&
-             certificate.durable >= required_wire) {
+    } else if (needed && !ticket && certificate.durable >= needed) {
+      /* The exact request may have become durable during lock acquisition,
+       * even when a later local publication is still outstanding. */
+      covered = 1;
+      target = requested;
+    } else if (ticket && ticket <= certificate.prepared_durable &&
+               certificate.durable >= required_wire) {
       covered = 1;
       /* The ticket follows this owner's completed local prefix. A later
        * local completion can still arrive after the peer's barrier. */

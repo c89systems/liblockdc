@@ -6096,9 +6096,10 @@ static void *stabilize_prefix(void *context) {
   ok(ps_internal_durable_prefix(work->space, work->local, work->peer, &e), &e);
   return NULL;
 }
-static void published_durability_wait(void) {
+static void published_durability_wait(int acquire_race) {
   durable_gate gate = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
-  ps_coordination_io io = {&gate, observe_sync_conflict};
+  ps_coordination_io io = {&gate, acquire_race ? durable_attempt
+                                               : observe_sync_conflict};
   ps_options options = {.coordination_io = &io};
   ps_space *writer = NULL, *peer = NULL;
   ps_coordination_guard *leader = NULL;
@@ -6106,15 +6107,17 @@ static void published_durability_wait(void) {
   lc_error e = {0};
   ok(ps_open(path, 1, &options, &writer, &e), &e);
   ok(ps_open(path, 0, NULL, &peer, &e), &e);
-  ok(ps_coordination_lock(peer->coordination, PS_COORDINATION_SYNC, 0, 1,
-                          &leader, &e),
-     &e);
+  if (!acquire_race)
+    ok(ps_coordination_lock(peer->coordination, PS_COORDINATION_SYNC, 0, 1,
+                            &leader, &e),
+       &e);
   capture_put(writer, 1, 65);
   capture_put(peer, 2, 65);
   prefix_work work = {writer, writer->own_ready_sequence,
                       readiness(peer).ready};
   REQUIRE(work.local && readiness(peer).durable < work.peer);
   uint64_t syncs = status(writer).syncs;
+  gate.hold_leadership = acquire_race;
   REQUIRE(!pthread_create(&waiter, NULL, stabilize_prefix, &work));
   pthread_mutex_lock(&gate.mutex);
   while (!gate.attempted)
@@ -6122,15 +6125,31 @@ static void published_durability_wait(void) {
   pthread_mutex_unlock(&gate.mutex);
   REQUIRE(readiness(peer).durable < work.peer);
   ok(ps_checkpoint(peer, &e), &e);
+  if (acquire_race) {
+    /* Add a newer publication after the peer's barrier. The proof covers
+     * the waiting request even though the owner now has a newer prefix. */
+    capture_put(writer, 3, 65);
+    pthread_mutex_lock(&gate.mutex);
+    gate.released = 1;
+    pthread_cond_broadcast(&gate.cond);
+    pthread_mutex_unlock(&gate.mutex);
+  }
   join_durability_waiter(waiter);
   REQUIRE(readiness(peer).durable >= work.peer &&
           status(writer).syncs == syncs);
   ps_coordination_unlock(leader);
+  if (acquire_race) {
+    ps_readiness_certificate cert = readiness(writer);
+    REQUIRE(cert.durable == work.peer && cert.ready > cert.durable);
+    ok(ps_flush(writer, &e), &e);
+  }
   ok(ps_close(writer, &e), &e);
   ok(ps_close(peer, &e), &e);
   ok(ps_open(path, 0, NULL, &writer, &e), &e);
   expect_value(writer, key(1), 65, 1);
   expect_value(writer, key(2), 65, 2);
+  if (acquire_race)
+    expect_value(writer, key(3), 65, 3);
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   REQUIRE(!pthread_cond_destroy(&gate.cond) &&
@@ -8224,7 +8243,8 @@ int main(int argc, char **argv) {
     projection_tail(1);
   } else if (!strcmp(argv[2], "shared-durable")) {
     shared_durability();
-    published_durability_wait();
+    published_durability_wait(0);
+    published_durability_wait(1);
   } else if (!strcmp(argv[2], "shared-preparation")) {
     shared_preparation(READY_BEFORE_SYNC);
     shared_preparation(READY_DURING_SYNC);
