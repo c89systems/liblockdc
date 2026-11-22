@@ -3116,12 +3116,12 @@ static void canonical_stream_faults(void) {
   ps_stream_info info;
   unsigned char *body = malloc(PS_CHUNK + 333);
   uint64_t first, next;
-  size_t kind, phase, count;
+  size_t kind, phase, count, reached, failures;
   int rc;
   CHECK(body != NULL);
   memset(body, 0xd3, PS_CHUNK + 333);
   for (kind = 0; kind < 2; ++kind) {
-    count = 0;
+    count = failures = 0;
     for (phase = 0; phase <= count; ++phase) {
       clean();
       m.fail_at = m.operations = 0;
@@ -3137,8 +3137,14 @@ static void canonical_stream_faults(void) {
       rc = canonical_append(stream, body, PS_CHUNK + 333, 37, 2, &next, &error);
       allocation_fail = 0;
       m.fail_at = 0;
-      if (!phase)
-        count = kind == 0 ? m.operations : allocation_call;
+      reached = kind == 0 ? m.operations : allocation_call;
+      if (!phase) {
+        CHECK(rc == LC_OK);
+        count = reached;
+      } else {
+        CHECK(reached >= phase);
+        failures += rc != LC_OK;
+      }
       if (rc != LC_OK)
         lc_error_cleanup(&error);
       OK(ps_stream_close(stream, &error));
@@ -3159,7 +3165,9 @@ static void canonical_stream_faults(void) {
       OK(ps_stream_close(stream, &error));
       OK(ps_close(space, &error));
     }
-    CHECK(count > 5);
+    CHECK(count && failures);
+    printf("stream append %s faults: %zu sites, %zu failed appends\n",
+           kind == 0 ? "I/O" : "allocation", count, failures);
   }
   free(body);
   free(m.stable);
