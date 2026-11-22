@@ -4661,8 +4661,15 @@ static void checkpoint_preparation(enum checkpoint_preparation_case outcome) {
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 typedef struct reopen_disk {
-  size_t syncs, fail_sync;
+  size_t syncs, fail_sync, journal_read;
 } reopen_disk;
+static ssize_t reopen_read(void *context, int fd, void *out, size_t bytes,
+                           off_t offset) {
+  reopen_disk *disk = context;
+  if (offset >= PS_JOURNAL_OFFSET && offset < PS_DATA)
+    disk->journal_read += bytes;
+  return pread(fd, out, bytes, offset);
+}
 static int reopen_sync(void *context, int fd) {
   reopen_disk *disk = context;
   if (++disk->syncs == disk->fail_sync) {
@@ -4674,7 +4681,8 @@ static int reopen_sync(void *context, int fd) {
 static void reopen_after_checkpoint(void) {
   for (int durable = 0; durable <= 1; ++durable) {
     reopen_disk disk = {0};
-    ps_io io = {&disk, read_io, durable_write, reopen_sync, reserve_io, NULL};
+    ps_io io = {&disk,       reopen_read, durable_write,
+                reopen_sync, reserve_io,  NULL};
     ps_options options = {.durable_sync = durable, .io = &io};
     ps_space *writer = NULL, *peer = NULL, *join = NULL;
     lc_error e = {0};
@@ -4686,13 +4694,24 @@ static void reopen_after_checkpoint(void) {
     ok(ps_checkpoint(writer, &e), &e);
     REQUIRE(disk.syncs == 3);
 
-    disk.syncs = 0;
+    disk = (reopen_disk){0};
     ok(ps_open(path, 0, &options, &join, &e), &e);
-    REQUIRE(!disk.syncs);
+    REQUIRE(!disk.syncs && disk.journal_read == 64);
     expect_value(join, key(1), 65, 1);
     ok(ps_refresh(peer, &e), &e);
     REQUIRE(!disk.syncs);
     expect_value(peer, key(1), 65, 1);
+    ok(ps_close(join, &e), &e);
+
+    /* A disagreeing end marker sends even a certified open through full
+     * recovery. The rejected bytes must be retired before new writes. */
+    unsigned char marker = 0xa5;
+    off_t end = (off_t)JOURNAL_POSITION(writer->journal_start);
+    REQUIRE(pwrite(writer->fd, &marker, 1, end) == 1);
+    disk = (reopen_disk){0};
+    ok(ps_open(path, 0, &options, &join, &e), &e);
+    REQUIRE(disk.syncs == 1 && disk.journal_read == PS_JOURNAL &&
+            pread(join->fd, &marker, 1, end) == 1 && !marker);
     capture_put(join, 2, 65);
     ok(ps_flush(join, &e), &e);
     expect_value(writer, key(2), 65, 2);
@@ -4710,7 +4729,7 @@ static void reopen_after_checkpoint(void) {
 static void reopen_cohort(void) {
   lc_error e = {0};
   reopen_disk disk = {0};
-  ps_io io = {&disk, read_io, durable_write, reopen_sync, reserve_io, NULL};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
   ps_options options = {0};
   ps_space *first = NULL, *join = NULL;
   ps_ref before, after;
@@ -4726,7 +4745,8 @@ static void reopen_cohort(void) {
 
   ps_readiness_certificate cert = readiness(first);
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(!disk.syncs && readiness(first).ready == cert.ready &&
+  REQUIRE(!disk.syncs && disk.journal_read == cert.journal_bytes + 64 &&
+          readiness(first).ready == cert.ready &&
           readiness(first).durable == cert.durable);
   ps_writer *writer = replay_value(join, key(2), 2, 65, &e);
   ok(ps_publish(writer, &before, &e), &e);
@@ -4823,7 +4843,8 @@ static void reopen_cohort(void) {
   lc_error_cleanup(&e);
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1 && !readiness(first).pending);
+  REQUIRE(disk.syncs == 1 && disk.journal_read == PS_JOURNAL &&
+          !readiness(first).pending);
   ok(ps_budget_open(first, &plan, &budget, &e), &e);
   ok(ps_budget_close(budget, &e), &e);
   ok(ps_close(first, &e), &e);
@@ -4832,7 +4853,7 @@ static void reopen_cohort(void) {
 
   disk = (reopen_disk){0};
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1);
+  REQUIRE(disk.syncs == 1 && disk.journal_read == PS_JOURNAL);
   expect_value(join, key(1), 65, 1);
   expect_value(join, key(2), 65, 2);
   writer = replay_value(join, key(3), 3, 65, &e);

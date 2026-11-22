@@ -5620,9 +5620,9 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   ps_entry *p = NULL, *checkpoint_entries = NULL;
   struct stat st;
   uint64_t grant_limit;
-  size_t cursor = 0, bytes, first, last;
+  size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
   int a, b, event, rc, retire_sibling, retirement_needed, range_available;
-  int pending_data = 0, grant_slot, moved = 0;
+  int pending_data = 0, grant_slot, moved = 0, certified;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
 restart:
@@ -5671,9 +5671,10 @@ restart:
   }
   values->packed.offset = 0;
   retire_sibling = memcmp(roots[1 - s->root], zero, sizeof(zero)) != 0;
-  if (!moved && *guard && s->directory.offset && !retire_sibling &&
-      !certificate.pending && certificate.root == s->generation &&
-      certificate.grant_limit == grant_limit) {
+  certified = *guard && !retire_sibling && !certificate.pending &&
+              certificate.root == s->generation &&
+              certificate.grant_limit == grant_limit;
+  if (!moved && certified && s->directory.offset) {
     rc = recover_live_directory(s, guard, superblocks, wire, &certificate,
                                 &moved, error);
     if (rc == LC_OK && moved)
@@ -5684,17 +5685,34 @@ restart:
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
-  rc = journal_transfer(s, s->journal_start, wire, PS_JOURNAL, 0, error);
+  bytes = PS_JOURNAL;
+  if (certified) {
+    marker = journal_end_marker(certificate.journal_bytes);
+    bytes = certificate.journal_bytes + marker;
+    /* Publishers mark a pending transition before touching the journal and
+     * clear it only after certifying the complete frame and its end marker.
+     * The revalidated certificate is stable under allocation authority. */
+    rc = journal_transfer(s, s->journal_start, wire, bytes, 0, error);
+    if (rc != LC_OK)
+      goto done;
+    if (!memcmp(wire + certificate.journal_bytes, zero, marker))
+      journal_bound = certificate.journal_bytes;
+  }
+  if (journal_bound == PS_JOURNAL && (!certified || bytes < PS_JOURNAL)) {
+    first = certified ? bytes : 0;
+    rc = journal_transfer(s, s->journal_start + first, wire + first,
+                          PS_JOURNAL - first, 0, error);
+  }
   if (rc != LC_OK)
     goto done;
   cursor = 0;
   while (!(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) &&
-         PS_JOURNAL - cursor >= 64 && s->sequence != UINT64_MAX &&
+         journal_bound - cursor >= 64 && s->sequence != UINT64_MAX &&
          (get32(wire + cursor) == EVENT_MAGIC ||
           get32(wire + cursor) == REVISION_MAGIC) &&
          get64(wire + cursor + 8) == s->sequence + 1) {
     bytes = get32(wire + cursor + 4);
-    if (bytes < 64 || bytes > PS_JOURNAL - cursor)
+    if (bytes < 64 || bytes > journal_bound - cursor)
       break;
     /* Stamp hints carry live ownership, with no data or tail visibility.
      * Any later data or stream boundary keeps the admission barrier. */
@@ -5764,7 +5782,7 @@ restart:
    * alone so a clean reopen does not dirty the entire journal for its grant.
    */
   first = cursor;
-  last = PS_JOURNAL;
+  last = journal_bound;
   while (last - first >= sizeof(zero) &&
          !memcmp(wire + first, zero, sizeof(zero)))
     first += sizeof(zero);
