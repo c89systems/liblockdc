@@ -1510,9 +1510,9 @@ static void retention_disk_restore(retention_disk *m, const char *path) {
   REQUIRE(fdatasync(fd) == 0 && close(fd) == 0);
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
 }
-/* Leave a peer claim holding the largest currently admissible payload. An old
- * journal supplies reclaimable capacity, so the next known work replacement
- * must checkpoint before its complete claim can fit. No file-sized filler. */
+/* Leave a peer claim holding the largest currently admissible payload.
+ * Keep an intended source of later reclamation pinned during this search:
+ * budget admission can itself checkpoint. */
 static ps_budget *retention_peer(ps_space *space, lc_error *e) {
   ps_budget_plan plan = {0};
   ps_budget *budget = NULL;
@@ -1534,6 +1534,18 @@ static ps_budget *retention_peer(ps_space *space, lc_error *e) {
   plan.payload_bytes = low * PS_PAGE;
   ok(ps_budget_open(space, &plan, &budget, e), e);
   return budget;
+}
+static ps_reader *retention_pin_identity(lc_pouch *p, lc_error *e) {
+  ps_root *root = ps_pouch_state_root(p);
+  ps_namespace *ns = NULL;
+  ps_namespace_info identity;
+  ps_reader *reader = NULL;
+  ok(ps_root_namespace_acquire(root, "work/a", 0, &ns, e), e);
+  ok(ps_namespace_identity(ns, &identity, e), e);
+  ps_key key = {identity.owner, 3, PS_CONTROL};
+  ok(ps_read_open(ps_root_space(root), key, NULL, &reader, e), e);
+  ps_namespace_release(ns);
+  return reader;
 }
 static void retention_recovered(lc_pouch *p, int action, int completed,
                                 const char *large, retention_disk *m,
@@ -1615,13 +1627,16 @@ static void retention_io_faults(const char *directory) {
                       NULL};
           lc_pouch *p = visit_open(path, 0, sync, 1, &io, &allocator, &e);
           ps_budget *peer = NULL;
+          ps_reader *reclaim = NULL;
           ok(lc_pouch_ensure_namespace(p, "work/a", &e), &e);
           if (action) {
             ok(lc_pouch_retention_hint_ensure(p, "work/a", &e), &e);
-            if (action == 6)
+            if (action == 6) {
               ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid,
                                                retired, 1, 2, &e),
                  &e);
+              reclaim = retention_pin_identity(p, &e);
+            }
             ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid,
                                              "old", action == 8 ? 0 : 1,
                                              action == 8 ? 0 : 2, &e),
@@ -1632,10 +1647,14 @@ static void retention_io_faults(const char *directory) {
             ok(lc_pouch_retention_work_write(p, "work/a", 2, retention_xid,
                                              "old", 1, 2, &e),
                &e);
-          if (action == 6)
+          if (action == 6) {
             peer = retention_peer(space, &e);
+            ps_reader_close(reclaim);
+          }
           ps_stats before, after;
           ok(ps_status(space, &before, &e), &e);
+          if (action == 6)
+            REQUIRE(before.journal_bytes && before.retired_bytes >= PS_CHUNK);
           m.fault.calls = 0;
           m.fault.fail = cut;
           m.fault.armed = 1;
@@ -1799,11 +1818,13 @@ static void retention_capacity_faults(const char *directory) {
         ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, old_key,
                                          1, 2, &e),
            &e);
+        ps_reader *reclaim = retention_pin_identity(p, &e);
         ok(lc_pouch_retention_work_write(p, "work/a", 1, retention_xid, "old",
                                          1, 2, &e),
            &e);
         ps_budget *peer =
             retention_peer(ps_root_space(ps_pouch_state_root(p)), &e);
+        ps_reader_close(reclaim);
         allocation = 0;
         fail_at = cut ? cut : SIZE_MAX;
         armed = 1;
