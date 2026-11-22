@@ -54,29 +54,35 @@ typedef struct ps_extent {
 typedef struct ps_mapped_range {
   uint64_t offset, bytes, data;
 } ps_mapped_range;
-typedef struct ps_entry {
-  ps_key key;
-  uint64_t token, bytes;
-  uint64_t publication_sequence;
-  uint64_t
-      peer_sequence; /* imported visibility uses the certified wire clock */
-  uint64_t stream_capacity, stream_runs, stream_ready, stream_wire;
-  uint64_t stream_edit_wire, stream_complete_generation, stream_structure_wire;
-  uint64_t writer_stamp, writer_generation;
-  uint64_t
-      stream_storage; /* derived selected mappings, not pinned old values */
-  int owned_mapped;
-  int embedded_extents;
+/* Stream heads and owned runs need state that ordinary values never use.
+ * This state shares an allocation and lifetime with its descriptor. */
+typedef struct ps_stream_state {
+  uint64_t capacity, runs, ready, wire;
+  uint64_t edit_wire, complete_generation, structure_wire;
+  uint64_t storage; /* derived selected mappings, excluding pinned old ones */
   ps_mapped_range *ranges;
   unsigned char *range_bitmap;
   uint16_t *range_rank;
   uint64_t mapped_end;
   size_t range_count;
   struct ps_entry *owned_first, *owned_last, *owned_prev, *owned_next;
-  int owned_linked;
-  size_t stream_handles;
-  int stream_guarded, stream_sealed, stream_admitted, orphan_claimed;
-  ps_coordination_guard *stream_claim; /* Local preparation or orphan pass. */
+  struct ps_entry *next;
+  int mapped, owned_linked;
+  size_t handles;
+  int guarded, sealed, admitted, orphan_claimed;
+  ps_coordination_guard *claim; /* Local preparation or orphan pass. */
+  uint64_t catalog_refs, catalog_release, catalog_release_wire;
+  size_t catalog_pins;
+} ps_stream_state;
+typedef struct ps_entry {
+  ps_key key;
+  uint64_t token, bytes;
+  uint64_t publication_sequence;
+  uint64_t
+      peer_sequence; /* imported visibility uses the certified wire clock */
+  uint64_t writer_stamp, writer_generation;
+  ps_stream_state *stream;
+  int embedded_extents;
   int durable_visibility; /* pending revision uses completed prefix */
   int value_checked; /* transient immutable-payload validation: 0 unknown */
   int payload_claimed;
@@ -96,10 +102,7 @@ typedef struct ps_entry {
   struct ps_entry *retired_next, **retired_link;
   struct ps_entry *dirty_next, **dirty_link;
   ps_directory_value checkpoint_ref, pending_ref;
-  struct ps_entry *stream_next;
   struct ps_catalog_record *catalog;
-  uint64_t catalog_refs, catalog_release, catalog_release_wire;
-  size_t catalog_pins;
 } ps_entry;
 typedef struct ps_run {
   uint64_t offset, bytes;
