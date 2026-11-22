@@ -7591,8 +7591,10 @@ int main(int argc, char **argv) {
         standing_deletion(durable, (size_t)PS_MIB);
       }
     } else if (strcmp(argv[2], "root-covered-admission") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
+      for (int durable = 0; durable < 2; ++durable) {
         covered_root_admission(durable);
+        covered_root_process_tail(durable);
+      }
     } else if (strcmp(argv[2], "root-obligations") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int partial = 0; partial < 2; ++partial)

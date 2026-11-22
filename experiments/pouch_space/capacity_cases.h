@@ -568,6 +568,109 @@ static void covered_root_admission(int durable) {
   OK(ps_root_close(root, &error));
   clean();
 }
+static void covered_root_process_tail(int durable) {
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace *ns = NULL;
+  ps_namespace_info identity;
+  ps_namespace_status before, after;
+  ps_space *space = NULL;
+  ps_stats stats;
+  ps_key stream = {0, 0, PS_STREAM};
+  ps_entry *head;
+  pid_t child;
+  int status;
+
+  clean();
+  options.storage.shared = 1;
+  options.storage.durable_sync = durable;
+  options.storage.maximum_capacity = PS_DEFAULT_CAPACITY;
+  OK(ps_root_open(path, 1, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "covered", 1, &ns, &error));
+  obligation_group(ns, "lease/0", 1);
+  OK(ps_namespace_checkpoint_flush(ns, &error));
+  OK(ps_namespace_identity(ns, &identity, &error));
+  OK(ps_namespace_status_get(ns, &before, &error));
+  CHECK(before.active_segment && before.tail &&
+        before.covered_segment == before.active_segment &&
+        before.covered_offset == before.tail);
+  OK(ps_checkpoint(ps_root_space(root), &error));
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  root = NULL;
+  ns = NULL;
+
+  child = fork();
+  CHECK(child >= 0);
+  if (!child) {
+    lc_allocator allocator = {0};
+    lc_pouch_state_entry entry, request = {0}, streamed = {0};
+    checkpoint_history_input input = {0};
+    ps_namespace_append *append = NULL;
+    char name[32];
+    uint64_t bytes;
+
+    OK(ps_root_open(path, 0, &options, &root, &error));
+    OK(ps_root_namespace_acquire(root, "covered", 0, &ns, &error));
+    checkpoint_fixture(&entry, name, 1);
+    OK(lc_pouch_state_record_measure_snapshot(&allocator, NULL, &entry, 0,
+                                              &bytes, &error));
+    OK(ps_namespace_append_begin(ns, 0, bytes + 3 * PS_CHUNK, PS_APPEND_PREFIX,
+                                 NULL, &append, &error));
+    CHECK(ps_namespace_append_segment(append) == before.active_segment);
+    OK(lc_pouch_state_record_write_snapshot(
+        &allocator, ps_namespace_append_output(append),
+        ps_namespace_append_leaf(append), &entry, NULL, NULL, 0, &error));
+    /* A following streamed body pushes the first record out of the bounded
+     * writer buffer. Its own final chunk remains unsettled at process exit. */
+    input.source.impl = &input;
+    input.source.read = checkpoint_history_read;
+    input.remaining = 2 * PS_CHUNK + 17;
+    request.key = "lease/2";
+    request.content_type = "application/octet-stream";
+    request.payload_context = "covered";
+    request.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
+    request.index_seq = request.version = request.lifetime = 3;
+    OK(lc_pouch_state_record_append(&allocator, ps_root_crypto(root),
+                                    ps_namespace_append_output(append),
+                                    ps_namespace_append_leaf(append), &request,
+                                    &input.source, 0, &streamed, &error));
+    lc_pouch_state_entry_cleanup(&allocator, &streamed);
+    CHECK(!input.remaining && input.calls > 1);
+    /* Model data reaching disk before the writer can publish its new tail. */
+    CHECK(fdatasync(ps_root_space(root)->fd) == 0);
+    _exit(0);
+  }
+  CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+        WEXITSTATUS(status) == 0);
+
+  /* The selected physical tail and the namespace checkpoint still agree.
+   * The complete canonical record beyond them nevertheless needs capacity. */
+  OK(ps_open(path, 0, &options.storage, &space, &error));
+  stream.owner = identity.owner;
+  stream.key = before.active_segment;
+  head = ps_internal_lookup(space, stream);
+  CHECK(head && head->bytes == before.covered_offset);
+  OK(ps_close(space, &error));
+  OK(ps_root_open(path, 0, &options, &root, &error));
+  OK(ps_status(ps_root_space(root), &stats, &error));
+  CHECK(stats.capacity == PS_DEFAULT_CAPACITY && stats.budgets == 1 &&
+        stats.reserved_payload_bytes);
+  OK(ps_root_namespace_acquire(root, "covered", 0, &ns, &error));
+  OK(ps_namespace_status_get(ns, &after, &error));
+  CHECK(after.active_segment == before.active_segment &&
+        after.covered_offset == before.covered_offset &&
+        after.tail > before.tail && after.pending_keys == 1 &&
+        after.checkpoint_keys == before.checkpoint_keys + 1);
+  OK(ps_namespace_checkpoint_flush(ns, &error));
+  OK(ps_namespace_status_get(ns, &after, &error));
+  CHECK(after.covered_offset == after.tail && !after.pending_keys);
+  OK(ps_status(ps_root_space(root), &stats, &error));
+  CHECK(!stats.budgets && !stats.reserved_payload_bytes);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  clean();
+}
 static void standing_deletion(int durable, size_t key_bytes) {
   ps_root_options options = {0};
   ps_root *root = NULL;
