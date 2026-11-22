@@ -180,6 +180,51 @@ static int checkpoint_walk_decode(void *context, ps_key key, ps_reader *reader,
       reader, NULL, walk->leaf,
       key.kind == PS_KEY_METADATA ? &walk->metadata : &walk->decision, e);
 }
+static void checkpoint_terminal_fields(ps_checkpoint_record *record,
+                                       const char *leaf) {
+  lc_allocator allocator = {0};
+  lc_pouch_state_entry decoded = {0};
+  lc_pouch_state_terminal view;
+  OK(lc_pouch_state_record_decode_span(record->bytes, record->length,
+                                       &allocator, leaf, &decoded, &error));
+  allocation_call = 0;
+  allocation_fail = (size_t)-1;
+  OK(lc_pouch_state_record_terminal_span(record->bytes, record->length, &view,
+                                         &error));
+  allocation_fail = 0;
+  CHECK(!allocation_call && view.type == decoded.record_type &&
+        view.key_bytes == strlen(decoded.key) &&
+        !memcmp(view.key, decoded.key, view.key_bytes) &&
+        view.etag_bytes == strlen(decoded.etag) &&
+        !memcmp(view.etag, decoded.etag, view.etag_bytes) &&
+        view.version == decoded.version &&
+        view.index_seq == decoded.index_seq &&
+        view.lifetime == decoded.lifetime &&
+        view.has_query_index_seq == decoded.has_query_index_seq &&
+        view.query_index_seq == decoded.query_index_seq &&
+        view.updated_at_unix == decoded.updated_at_unix &&
+        (view.decision ? !strcmp(view.decision, decoded.decision)
+                       : !decoded.decision));
+  CHECK(view.key_bytes && view.etag_bytes);
+  size_t text[] = {(size_t)(view.key - record->bytes),
+                   (size_t)(view.etag - record->bytes)};
+  for (size_t i = 0; i < sizeof(text) / sizeof(text[0]); ++i) {
+    unsigned char original = record->bytes[text[i]];
+    record->bytes[text[i]] = 0;
+    CHECK(lc_pouch_state_record_terminal_span(
+              record->bytes, record->length, &view, &error) == LC_ERR_PROTOCOL);
+    lc_error_cleanup(&error);
+    CHECK(lc_pouch_state_record_decode_span(record->bytes, record->length,
+                                            &allocator, leaf, &decoded,
+                                            &error) == LC_ERR_PROTOCOL);
+    lc_error_cleanup(&error);
+    record->bytes[text[i]] = original;
+  }
+  CHECK(lc_pouch_state_record_terminal_span(record->bytes, record->length - 1,
+                                            &view, &error) == LC_ERR_PROTOCOL);
+  lc_error_cleanup(&error);
+  lc_pouch_state_entry_cleanup(&allocator, &decoded);
+}
 static void checkpoint_records(int durable) {
   lc_allocator allocator = {0};
   ps_options options = {.durable_sync = durable, .shared = 1};
@@ -262,6 +307,22 @@ static void checkpoint_records(int durable) {
   note.version = 2;
   note.index_seq = 9;
   OK(ps_checkpoint_record_encode(&allocator, &note, &decision, &error));
+  checkpoint_terminal_fields(&decision, leaf);
+  ps_checkpoint_record tombstone = {0};
+  lc_pouch_state_entry removed = {0};
+  removed.key = note.key;
+  removed.etag = note.etag;
+  removed.seen = 1;
+  removed.version = 3;
+  removed.index_seq = 10;
+  removed.lifetime = 2;
+  removed.updated_at_unix = 509;
+  removed.record_type = LC_POUCH_STATE_RECORD_OBJECT_DELETE;
+  removed.has_query_index_seq = 1;
+  removed.query_index_seq = 7;
+  OK(ps_checkpoint_record_encode(&allocator, &removed, &tombstone, &error));
+  checkpoint_terminal_fields(&tombstone, leaf);
+  ps_checkpoint_record_close(&tombstone);
   OK(ps_budget_plan_key_slot(&plan, slot.kind, metadata.length, 0, &error));
   OK(ps_budget_plan_value(&plan, decision.length, &error));
   OK(ps_budget_open(s, &plan, &budget, &error));

@@ -37,7 +37,7 @@ struct source_count {
 };
 struct key_slot {
   char *key;
-  uint64_t id, bound, selected_incarnation;
+  uint64_t id, hash, bound, selected_incarnation;
   unsigned int kind;
   ps_reserve *reserve;
   uint64_t required_deletion, selected_deletion;
@@ -252,15 +252,18 @@ static uint64_t hash_key(const void *key, size_t n, unsigned int kind) {
   }
   return h;
 }
-static key_slot *find_key(ps_key_checkpoint *c, const char *key,
-                          unsigned int kind) {
+static key_slot *find_hashed_key(ps_key_checkpoint *c, const char *key,
+                                 unsigned int kind, uint64_t hash) {
   key_slot *s;
-  size_t bucket =
-      (size_t)(hash_key(key, strlen(key), kind) & (c->capacity - 1));
+  size_t bucket = (size_t)(hash & (c->capacity - 1));
   for (s = c->keys[bucket]; s; s = s->hash_next)
-    if (s->kind == kind && !strcmp(s->key, key))
+    if (s->hash == hash && s->kind == kind && !strcmp(s->key, key))
       return s;
   return NULL;
+}
+static key_slot *find_key(ps_key_checkpoint *c, const char *key,
+                          unsigned int kind) {
+  return find_hashed_key(c, key, kind, hash_key(key, strlen(key), kind));
 }
 static key_slot *find_id(ps_key_checkpoint *c, uint64_t id) {
   key_slot *s;
@@ -288,8 +291,7 @@ static int room(ps_key_checkpoint *c, size_t wanted, lc_error *e) {
     return failure(e, LC_ERR_NOMEM, "cannot grow checkpoint slot index");
   }
   for (s = c->slots; s; s = s->next) {
-    bucket =
-        (size_t)(hash_key(s->key, strlen(s->key), s->kind) & (capacity - 1));
+    bucket = (size_t)(s->hash & (capacity - 1));
     s->hash_next = keys[bucket];
     keys[bucket] = s;
     bucket = (size_t)(s->id & (capacity - 1));
@@ -304,8 +306,7 @@ static int room(ps_key_checkpoint *c, size_t wanted, lc_error *e) {
   return LC_OK;
 }
 static void insert_slot(ps_key_checkpoint *c, key_slot *s) {
-  size_t bucket =
-      (size_t)(hash_key(s->key, strlen(s->key), s->kind) & (c->capacity - 1));
+  size_t bucket = (size_t)(s->hash & (c->capacity - 1));
   s->hash_next = c->keys[bucket];
   c->keys[bucket] = s;
   bucket = (size_t)(s->id & (c->capacity - 1));
@@ -318,15 +319,17 @@ static void insert_slot(ps_key_checkpoint *c, key_slot *s) {
 static void close_slot(ps_key_checkpoint *c, key_slot *s) {
   ps_reserve_close(s->reserve);
   ps_checkpoint_record_close(&s->pending);
-  lc_free_with_allocator(&c->allocator, s->key);
+  if (s->key != (char *)(s + 1))
+    lc_free_with_allocator(&c->allocator, s->key);
   lc_free_with_allocator(&c->allocator, s);
 }
 static key_slot *new_slot(ps_key_checkpoint *c, const void *key, size_t bytes,
                           unsigned int kind, uint64_t id, lc_error *e) {
-  key_slot *s = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*s));
-  if (s && key)
-    s->key = lc_alloc_with_allocator(&c->allocator, bytes + 1);
-  if (!s || (key && !s->key) ||
+  key_slot *s = NULL;
+  if (bytes <= SIZE_MAX - sizeof(*s) - 1)
+    s = lc_calloc_with_allocator(&c->allocator, 1,
+                                 sizeof(*s) + (key ? bytes + 1 : 0));
+  if (!s ||
       !lc_pouch_namespace_format_snapshot_leaf(id, s->leaf, sizeof(s->leaf))) {
     if (s)
       close_slot(c, s);
@@ -334,8 +337,10 @@ static key_slot *new_slot(ps_key_checkpoint *c, const void *key, size_t bytes,
     return NULL;
   }
   if (key) {
+    s->key = (char *)(s + 1);
     memcpy(s->key, key, bytes);
     s->key[bytes] = 0;
+    s->hash = hash_key(s->key, bytes, kind);
   }
   s->kind = kind;
   s->id = id;
@@ -732,15 +737,40 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c,
 static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
                                 ps_key key, ps_ref ref, key_slot **out,
                                 lc_error *e) {
-  lc_pouch_state_entry entry, projected;
+  lc_pouch_state_entry entry = {0}, projected;
+  lc_pouch_state_terminal terminal = {0};
+  const unsigned char *span;
   key_slot *slot;
-  int rc;
+  int rc = ps_internal_checkpoint_span(reader, &span, e);
   *out = NULL;
-  memset(&entry, 0, sizeof(entry));
-  slot = new_slot(c, NULL, 0, key.kind, key.key, e);
+  if (rc == LC_OK && span)
+    rc = lc_pouch_state_record_terminal_span(span, (size_t)ps_read_size(reader),
+                                             &terminal, e);
+  if (rc != LC_OK)
+    return rc;
+  slot = new_slot(c, terminal.key, terminal.key_bytes, key.kind, key.key, e);
   if (!slot)
     return LC_ERR_NOMEM;
-  rc = ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
+  if (terminal.type) {
+    /* The ledger needs identity and the ordering fields. The canonical
+     * value retains its etag and decision for callers that need the record. */
+    entry.key = slot->key;
+    entry.seen = 1;
+    entry.control = terminal.decision != NULL;
+    entry.decision = (char *)terminal.decision;
+    entry.record_type = terminal.type;
+    entry.version = terminal.version;
+    entry.index_seq = terminal.index_seq;
+    entry.lifetime = terminal.lifetime;
+    entry.query_index_seq = terminal.query_index_seq;
+    entry.has_query_index_seq = terminal.has_query_index_seq;
+  } else if (span)
+    rc =
+        lc_pouch_state_record_decode_span(span, (size_t)ps_read_size(reader),
+                                          &c->allocator, slot->leaf, &entry, e);
+  else
+    rc =
+        ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
   if (rc == LC_OK &&
       ((!entry.key || !entry.seen) ||
        (key.kind == PS_KEY_DECISION ? !entry.control || !entry.decision
@@ -754,16 +784,20 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
         !lc_pouch_state_entry_project(NULL, &entry, &projected))
       rc = failure(e, LC_ERR_PROTOCOL,
                    "checkpoint has no canonical key projection");
-    if (rc == LC_OK && ps_reader_key_deletion(reader) !=
-                           lc_pouch_state_entry_delete_bytes(&projected))
-      rc = failure(e, LC_ERR_PROTOCOL,
-                   "checkpoint deletion requirement disagrees with its slot");
+    if (rc == LC_OK) {
+      summarize(&slot->summary, &projected);
+      if (ps_reader_key_deletion(reader) != slot->summary.deletion_bytes)
+        rc = failure(e, LC_ERR_PROTOCOL,
+                     "checkpoint deletion requirement disagrees with its slot");
+    }
   }
   if (rc == LC_OK) {
-    slot->key = entry.key;
-    entry.key = NULL;
+    if (!terminal.type) {
+      slot->key = entry.key;
+      slot->hash = hash_key(entry.key, strlen(entry.key), key.kind);
+      entry.key = NULL;
+    }
     slot->selected_incarnation = ref.incarnation;
-    summarize(&slot->summary, &projected);
     slot->body = source_get(c, &entry, &rc, e);
     if (slot->body)
       ++slot->body->prepared;
@@ -776,7 +810,8 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
     release_prepared_source(c, slot->body);
     close_slot(c, slot);
   }
-  lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+  if (!terminal.type)
+    lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   return rc;
 }
 static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {
@@ -829,8 +864,8 @@ static int read_unique_slot(ps_key_checkpoint *c, ps_key_checkpoint *slots,
     ps_read_reference(reader, &ref);
     rc = decode_selected_slot(c, reader, key, ref, &slot, e);
   }
-  if (rc == LC_OK &&
-      (find_key(slots, slot->key, key.kind) || find_id(slots, key.key)))
+  if (rc == LC_OK && (find_hashed_key(slots, slot->key, key.kind, slot->hash) ||
+                      find_id(slots, key.key)))
     rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a canonical key slot");
   if (rc == LC_OK)
     *out = slot;
@@ -977,8 +1012,7 @@ static void drop_selected_slot(ps_key_checkpoint *c, key_slot **link) {
   key_slot *slot = *link;
   key_slot **at;
   key_summary empty = {0};
-  size_t bucket = (size_t)(hash_key(slot->key, strlen(slot->key), slot->kind) &
-                           (c->capacity - 1));
+  size_t bucket = (size_t)(slot->hash & (c->capacity - 1));
   *link = slot->next;
   for (at = &c->keys[bucket]; *at != slot; at = &(*at)->hash_next) {
   }

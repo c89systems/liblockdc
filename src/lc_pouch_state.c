@@ -8161,134 +8161,98 @@ payload_ref_decoded:
   return LC_OK;
 }
 
-static int lc_pouch_state_decode_delete_meta(
-    const lc_allocator *allocator, const unsigned char *key, size_t key_len,
-    const unsigned char *meta, size_t meta_len, unsigned char record_type,
-    const char *container_leaf, uint64_t record_offset,
-    lc_pouch_state_entry *entry, lc_error *error) {
-  lc_pouch_generation version;
-  unsigned long etag_len;
-  int rc;
-  size_t trailer_offset;
-  int has_query;
+static int lc_pouch_state_terminal_fields(const lc_pouch_record_header *header,
+                                          const unsigned char *key,
+                                          const unsigned char *meta,
+                                          lc_pouch_state_terminal *terminal,
+                                          lc_error *error) {
+  int decision = header->type == LC_POUCH_STATE_RECORD_DECISION;
+  size_t fixed = decision ? 19U : 18U;
+  size_t trailer;
+  int has_query, rc;
 
-  version = 0UL;
-  etag_len = 0UL;
-  if (meta_len < 18U) {
+  memset(terminal, 0, sizeof(*terminal));
+  if (header->meta_len < fixed)
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state delete metadata is truncated", NULL, NULL,
-                        "pouch");
-  }
-  rc = lc_pouch_state_decode_generation(lc_pouch_state_get64(meta), &version,
-                                        error);
-  if (rc != LC_OK) {
-    return rc;
-  }
-  etag_len = lc_pouch_state_get16(meta + 16);
-  rc = lc_pouch_state_meta_trailer(meta, meta_len, &trailer_offset, &has_query,
+                        "pouch terminal record metadata is truncated", NULL,
+                        NULL, "pouch");
+  rc = lc_pouch_state_meta_trailer(meta, header->meta_len, &trailer, &has_query,
                                    error);
   if (rc != LC_OK)
     return rc;
-  if (18U + etag_len > trailer_offset) {
+  terminal->etag_bytes = lc_pouch_state_get16(meta + 16);
+  if (fixed + terminal->etag_bytes > (decision ? header->meta_len : trailer))
     return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state delete etag is truncated", NULL, NULL,
+                        "pouch terminal etag is truncated", NULL, NULL,
                         "pouch");
+  terminal->index_seq = lc_pouch_state_get64(meta + trailer + 12U);
+  if (!terminal->index_seq)
+    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "pouch state metadata index sequence is invalid", NULL,
+                        NULL, "pouch");
+  if (decision) {
+    if (meta[18] == 1U)
+      terminal->decision = LC_POUCH_STATE_DECISION_COMMITTED;
+    else if (meta[18] == 2U)
+      terminal->decision = LC_POUCH_STATE_DECISION_DISCARDED;
+    else
+      return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                          "pouch state decision value is invalid", NULL, NULL,
+                          "pouch");
+  } else {
+    terminal->lifetime = lc_pouch_state_get64(meta + trailer);
+    if (terminal->lifetime > terminal->index_seq)
+      return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                          "pouch key lifetime exceeds its index sequence", NULL,
+                          NULL, "pouch");
+    terminal->has_query_index_seq = has_query;
+    if (has_query)
+      terminal->query_index_seq = lc_pouch_state_get64(meta + trailer + 24U);
+    terminal->updated_at_unix =
+        lc_pouch_state_decode_unix_seconds(lc_pouch_state_get64(meta + 8U));
   }
-  lc_pouch_state_entry_cleanup(allocator, entry);
-  entry->key = lc_pouch_state_bytes_to_string(allocator, key, key_len, error);
-  entry->etag =
-      lc_pouch_state_bytes_to_string(allocator, meta + 18, etag_len, error);
-  if (entry->key == NULL || entry->etag == NULL) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
-  }
-  rc = lc_pouch_state_meta_index_seq(meta, meta_len, &entry->index_seq, error);
-  if (rc == LC_OK)
-    rc = lc_pouch_state_meta_lifetime(meta, meta_len, entry->index_seq,
-                                      &entry->lifetime, error);
-  if (rc != LC_OK) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return rc;
-  }
-  rc = lc_pouch_state_meta_query_index_seq(meta, meta_len,
-                                           &entry->query_index_seq,
-                                           &entry->has_query_index_seq, error);
-  if (rc != LC_OK) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return rc;
-  }
-  entry->version = version;
-  entry->updated_at_unix =
-      lc_pouch_state_decode_unix_seconds(lc_pouch_state_get64(meta + 8));
-  entry->seen = 1;
-  entry->found = 0;
-  entry->record_type = record_type;
-  rc = lc_pouch_state_record_ref_set(
-      allocator, &entry->record_container_leaf, &entry->record_offset,
-      &entry->has_record_ref, container_leaf, record_offset, error);
-  if (rc != LC_OK) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return rc;
-  }
+  terminal->key = key;
+  terminal->key_bytes = header->key_len;
+  terminal->etag = meta + fixed;
+  terminal->version = lc_pouch_state_get64(meta);
+  terminal->type = header->type;
   return LC_OK;
 }
 
-static int lc_pouch_state_decode_decision_meta(
-    const lc_allocator *allocator, const unsigned char *key, size_t key_len,
-    const unsigned char *meta, size_t meta_len, lc_pouch_state_entry *entry,
-    lc_error *error) {
-  lc_pouch_generation version;
-  unsigned long etag_len;
-  const char *decision;
-  int rc;
-
-  version = 0UL;
-  etag_len = 0UL;
-  decision = NULL;
-  if (meta_len < 19U) {
-    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state decision metadata is truncated", NULL,
-                        NULL, "pouch");
-  }
-  rc = lc_pouch_state_decode_generation(lc_pouch_state_get64(meta), &version,
-                                        error);
-  if (rc != LC_OK) {
+static int lc_pouch_state_decode_terminal(
+    const lc_allocator *allocator, const lc_pouch_record_header *header,
+    const unsigned char *key, const unsigned char *meta, const char *leaf,
+    uint64_t offset, lc_pouch_state_entry *entry, lc_error *error) {
+  lc_pouch_state_terminal terminal;
+  int rc = lc_pouch_state_terminal_fields(header, key, meta, &terminal, error);
+  if (rc != LC_OK)
     return rc;
-  }
-  etag_len = lc_pouch_state_get16(meta + 16);
-  if (19U + etag_len > meta_len) {
-    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state decision etag is truncated", NULL, NULL,
-                        "pouch");
-  }
-  if (meta[18] == 1U) {
-    decision = LC_POUCH_STATE_DECISION_COMMITTED;
-  } else if (meta[18] == 2U) {
-    decision = LC_POUCH_STATE_DECISION_DISCARDED;
-  } else {
-    return lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                        "pouch state decision value is invalid", NULL, NULL,
-                        "pouch");
-  }
   lc_pouch_state_entry_cleanup(allocator, entry);
-  entry->key = lc_pouch_state_bytes_to_string(allocator, key, key_len, error);
-  entry->etag =
-      lc_pouch_state_bytes_to_string(allocator, meta + 19, etag_len, error);
-  entry->decision = lc_strdup_with_allocator(allocator, decision);
-  if (entry->key == NULL || entry->etag == NULL || entry->decision == NULL) {
-    lc_pouch_state_entry_cleanup(allocator, entry);
-    return error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
-  }
-  rc = lc_pouch_state_meta_index_seq(meta, meta_len, &entry->index_seq, error);
+  entry->key = lc_pouch_state_bytes_to_string(allocator, terminal.key,
+                                              terminal.key_bytes, error);
+  entry->etag = lc_pouch_state_bytes_to_string(allocator, terminal.etag,
+                                               terminal.etag_bytes, error);
+  if (terminal.decision)
+    entry->decision = lc_strdup_with_allocator(allocator, terminal.decision);
+  if (!entry->key || !entry->etag || (terminal.decision && !entry->decision))
+    rc = error != NULL && error->code != LC_OK ? error->code : LC_ERR_NOMEM;
+  if (rc == LC_OK && !terminal.decision)
+    rc = lc_pouch_state_record_ref_set(
+        allocator, &entry->record_container_leaf, &entry->record_offset,
+        &entry->has_record_ref, leaf, offset, error);
   if (rc != LC_OK) {
     lc_pouch_state_entry_cleanup(allocator, entry);
     return rc;
   }
-  entry->version = version;
   entry->seen = 1;
-  entry->found = 0;
-  entry->control = 1;
-  entry->record_type = LC_POUCH_STATE_RECORD_DECISION;
+  entry->control = terminal.decision != NULL;
+  entry->record_type = terminal.type;
+  entry->version = terminal.version;
+  entry->index_seq = terminal.index_seq;
+  entry->lifetime = terminal.lifetime;
+  entry->query_index_seq = terminal.query_index_seq;
+  entry->has_query_index_seq = terminal.has_query_index_seq;
+  entry->updated_at_unix = terminal.updated_at_unix;
   return LC_OK;
 }
 
@@ -8362,12 +8326,10 @@ static int lc_pouch_state_decode_record(
         payload_crc, entry, error);
   case LC_POUCH_STATE_RECORD_STATE_DELETE:
   case LC_POUCH_STATE_RECORD_OBJECT_DELETE:
-    return lc_pouch_state_decode_delete_meta(
-        allocator, key, header->key_len, meta, header->meta_len, header->type,
-        container_leaf, record_offset, entry, error);
   case LC_POUCH_STATE_RECORD_DECISION:
-    return lc_pouch_state_decode_decision_meta(
-        allocator, key, header->key_len, meta, header->meta_len, entry, error);
+    return lc_pouch_state_decode_terminal(allocator, header, key, meta,
+                                          container_leaf, record_offset, entry,
+                                          error);
   case LC_POUCH_STATE_RECORD_HIGH_WATER:
     return lc_pouch_state_decode_high_water_meta(
         allocator, meta, header->meta_len, entry, error);
@@ -8428,6 +8390,24 @@ static int lc_pouch_state_record_select(
   return rc;
 }
 
+static int lc_pouch_state_record_span(const unsigned char *span, size_t bytes,
+                                      lc_pouch_record_header *header,
+                                      uint64_t *payload, lc_error *error) {
+  int rc;
+  *payload = 0;
+  if (bytes >= LC_POUCH_RECORD_HEADER_BYTES) {
+    rc = lc_pouch_state_record_fields(span, bytes, header, payload, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  if (!*payload || header->payload_len != bytes - *payload)
+    return lc_error_set(
+        error, LC_ERR_PROTOCOL, 0L,
+        "checkpoint metadata is not one complete canonical record", NULL, NULL,
+        "pouch");
+  return LC_OK;
+}
+
 int lc_pouch_state_record_decode_span(const unsigned char *span, size_t bytes,
                                       const lc_allocator *allocator,
                                       const char *leaf,
@@ -8435,27 +8415,48 @@ int lc_pouch_state_record_decode_span(const unsigned char *span, size_t bytes,
                                       lc_error *error) {
   lc_pouch_record_header header;
   const unsigned char *key, *meta;
-  uint64_t payload = 0;
+  uint64_t payload;
   int rc;
   if (!span || !allocator || !leaf || !entry || bytes > (uint64_t)LC_I64_MAX)
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state record decode requires bounded inputs",
                         NULL, NULL, "pouch");
-  if (bytes >= LC_POUCH_RECORD_HEADER_BYTES) {
-    rc = lc_pouch_state_record_fields(span, bytes, &header, &payload, error);
-    if (rc != LC_OK)
-      return rc;
-  }
-  if (!payload || header.payload_len != bytes - payload)
-    return lc_error_set(
-        error, LC_ERR_PROTOCOL, 0L,
-        "checkpoint metadata is not one complete canonical record", NULL, NULL,
-        "pouch");
+  rc = lc_pouch_state_record_span(span, bytes, &header, &payload, error);
+  if (rc != LC_OK)
+    return rc;
   key = header.key_len ? span + LC_POUCH_RECORD_HEADER_BYTES : NULL;
   meta = header.meta_len ? span + LC_POUCH_RECORD_HEADER_BYTES + header.key_len
                          : NULL;
   return lc_pouch_state_record_select(allocator, &header, key, meta, leaf, 0,
                                       payload, entry, error);
+}
+
+int lc_pouch_state_record_terminal_span(const unsigned char *span, size_t bytes,
+                                        lc_pouch_state_terminal *out,
+                                        lc_error *error) {
+  lc_pouch_record_header header;
+  const unsigned char *key;
+  uint64_t payload;
+  int rc;
+  if (!span || !out || bytes > (uint64_t)LC_I64_MAX)
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch terminal record requires bounded inputs", NULL,
+                        NULL, "pouch");
+  out->type = 0;
+  rc = lc_pouch_state_record_span(span, bytes, &header, &payload, error);
+  if (rc != LC_OK || (header.type != LC_POUCH_STATE_RECORD_DECISION &&
+                      header.type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
+                      header.type != LC_POUCH_STATE_RECORD_OBJECT_DELETE))
+    return rc;
+  key = span + LC_POUCH_RECORD_HEADER_BYTES;
+  rc = lc_pouch_state_terminal_fields(&header, key, key + header.key_len, out,
+                                      error);
+  if (rc == LC_OK && (memchr(out->key, '\0', out->key_bytes) ||
+                      memchr(out->etag, '\0', out->etag_bytes)))
+    rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                      "pouch state metadata string contains NUL", NULL, NULL,
+                      "pouch");
+  return rc;
 }
 
 int lc_pouch_state_record_read(

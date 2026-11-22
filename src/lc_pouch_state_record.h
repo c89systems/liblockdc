@@ -103,6 +103,21 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
 int lc_pouch_state_record_decode_span(const unsigned char *, size_t,
                                       const lc_allocator *, const char *leaf,
                                       lc_pouch_state_entry *, lc_error *);
+/* A decision or tombstone decoded from a checked span. Both strings are
+ * length-delimited and borrowed. Type zero selects the ordinary record
+ * decoder. All fields needed to reconstruct the terminal record are here. */
+typedef struct lc_pouch_state_terminal {
+  const unsigned char *key, *etag;
+  size_t key_bytes, etag_bytes;
+  const char *decision;
+  lc_pouch_generation version, index_seq, query_index_seq;
+  uint64_t lifetime;
+  lc_pouch_unix_seconds updated_at_unix;
+  unsigned char type;
+  int has_query_index_seq;
+} lc_pouch_state_terminal;
+int lc_pouch_state_record_terminal_span(const unsigned char *, size_t,
+                                        lc_pouch_state_terminal *, lc_error *);
 /* Streams an ordinary PUT (type 1 or 7), including plaintext SHA-256 and
  * optional compression/encryption. No whole-body staging. Failure asks the
  * owner to discard its private append, possibly containing earlier records in
