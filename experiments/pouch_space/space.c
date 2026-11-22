@@ -453,6 +453,18 @@ static ps_entry *lookup(ps_space *s, ps_key k) {
 static size_t key_index_limit(size_t capacity) {
   return capacity - capacity / 4;
 }
+/* Used after the directory walk has proved that all selected keys are distinct.
+ */
+static void key_index_add_distinct(ps_key_index *index, ps_entry *entry) {
+  uint64_t hash = key_hash(entry->key);
+  size_t mask = index->capacity - 1;
+  size_t at = (size_t)hash & mask;
+  while (index->slots[at].entry)
+    at = (at + 1) & mask;
+  index->slots[at].entry = entry;
+  index->slots[at].hash = hash;
+  ++index->count;
+}
 /* Reserve for selected keys, including current tombstones, before appending
  * or applying journal bytes. Keep a free slot at the end of every probe. */
 static int key_index_reserve(ps_space *s, size_t added, lc_error *error) {
@@ -616,7 +628,7 @@ static void owned_unlink(ps_space *s, ps_entry *p) {
 static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   ps_entry *head = stream_lookup(s, p->key.owner);
   if (!head)
-    return; /* recovery validation reports an orphan */
+    return; /* checkpoint installation rejects an unlinked run */
   if (old && old->stream->owned_linked) {
     head->stream->storage -= entry_storage(old);
     p->stream->owned_prev = old->stream->owned_prev;
@@ -4117,6 +4129,10 @@ typedef struct metadata_directory_entry {
   ps_directory_value value;
   ps_entry *resident, *decoded;
 } metadata_directory_entry;
+typedef struct checkpoint_slab {
+  ps_entry_allocation *block;
+  unsigned int next;
+} checkpoint_slab;
 typedef struct metadata_recovery {
   ps_space *space, *resident;
   payload_rebuild *payload;
@@ -4129,6 +4145,7 @@ typedef struct metadata_recovery {
   size_t next_slot, batch;
   metadata_directory_entry *entries;
   size_t count, capacity;
+  checkpoint_slab open_slab;
 } metadata_recovery;
 static void metadata_recovery_close(metadata_recovery *r) {
   size_t i;
@@ -4444,9 +4461,9 @@ static int check_packed_binding(ps_space *s, const ps_directory_value *value,
     return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
   return LC_OK;
 }
-static void unpack_binding(ps_entry *p, const metadata_directory_entry *item) {
-  const ps_directory_value *value = &item->value;
-  p->key = item->key;
+static void unpack_binding(ps_entry *p, ps_key key,
+                           const ps_directory_value *value) {
+  p->key = key;
   p->token = value->ref.incarnation;
   p->bytes = value->ref.bytes;
   p->count = p->capacity = 1;
@@ -4482,27 +4499,23 @@ static int decode_packed_binding(metadata_recovery *r,
   p = space_entry_new(s, item->key.kind, 1, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
-  unpack_binding(p, item);
+  unpack_binding(p, item->key, value);
   p->projection = old;
   item->decoded = p;
   return ps_internal_reserve_entry(p, value->deletion_bytes, error);
 }
-typedef struct checkpoint_slab {
-  ps_entry_allocation *block;
-  unsigned int next;
-} checkpoint_slab;
-/* The checked directory remains the packed representation until installation.
- * New owners build each slab in directory order before journal replay. A slot
- * can subsequently retire or be reused independently of the rest of its slab.
- */
-static int install_open_binding(ps_space *s, checkpoint_slab *batch,
-                                const metadata_directory_entry *item,
-                                lc_error *error) {
+/* Packed leaf values have no descriptor reads or stream dependencies. Load
+ * them straight into the new owner's slabs and size the key index after the
+ * walk. This owner is private until recovery has validated its selection. */
+static int load_open_binding(ps_space *s, checkpoint_slab *batch, ps_key key,
+                             const ps_directory_value *value, lc_error *error) {
   ps_entry_allocation *block = batch->block;
   ps_entry_slab_slot *slot;
   ps_entry *p;
   unsigned int index;
-  int rc;
+  int rc = check_packed_binding(s, value, error);
+  if (rc != LC_OK)
+    return rc;
   if (!block || batch->next == ENTRY_SLAB_SLOTS) {
     block = lc_calloc_with_allocator(
         NULL, 1, sizeof(*block) + ENTRY_SLAB_SLOTS * sizeof(*slot));
@@ -4520,42 +4533,54 @@ static int install_open_binding(ps_space *s, checkpoint_slab *batch,
   p->allocation = block;
   p->extents = &slot->extent;
   p->embedded_extents = 1;
-  unpack_binding(p, item);
-  if (item->value.deletion_bytes) {
-    rc = ps_internal_reserve_entry(p, item->value.deletion_bytes, error);
+  unpack_binding(p, key, value);
+  if (value->deletion_bytes) {
+    rc = ps_internal_reserve_entry(p, value->deletion_bytes, error);
     if (rc != LC_OK)
       return rc;
+    ps_internal_reserve_install(s, p, NULL);
   }
   register_entry(s, p);
-  install(s, p, NULL);
+  value_register(s, p);
+  p->state = 1;
+  s->metadata += entry_bytes(p);
+  ++s->live_entries;
   return LC_OK;
 }
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
-  checkpoint_slab batch = {0};
+  checkpoint_slab batch = r->open_slab;
   metadata_directory_entry **fetch;
-  ps_key_slot *slot;
   ps_entry *p;
-  uint64_t hash;
   size_t i, end, count = 0;
-  int rc = key_index_reserve(s, r->count, error);
+  int rc;
+  if (s->live_entries > SIZE_MAX - r->count)
+    return err(error, LC_ERR_NOMEM, "container key index exceeds local limit");
+  rc = key_index_reserve(s, r->count + (size_t)s->live_entries, error);
   if (rc != LC_OK)
     return rc;
+  /* No other entries are installed yet. Finish indexing the packed owners
+   * before descriptor installation and journal replay can look them up. */
+  for (p = s->entries; p; p = p->all_next)
+    key_index_add_distinct(&s->keys, p);
+  if (batch.block && batch.next < ENTRY_SLAB_SLOTS)
+    entry_available_link(batch.block);
+  if (!r->count)
+    return LC_OK;
   fetch = lc_alloc_with_allocator(NULL, r->count * sizeof(*fetch));
   if (!fetch)
     return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->value.packed) {
-      rc = r->resident ? decode_packed_binding(r, item, error)
-                       : check_packed_binding(s, &item->value, error);
-    } else if (item->resident) {
+    if (item->value.packed)
+      rc = decode_packed_binding(r, item, error);
+    else if (item->resident)
       rc = reuse_directory_entry(r, item, error);
-    } else
+    else
       fetch[count++] = item;
   }
-  /* Order only the reads still needed. Installation keeps directory order,
-   * including stream heads before their runs. */
+  /* Order only the reads still needed. The deferred bindings are installed in
+   * directory order, including stream heads before their runs. */
   if (rc == LC_OK && count > 1)
     qsort(fetch, count, sizeof(*fetch), metadata_physical_order);
   for (i = 0; rc == LC_OK && i < count;) {
@@ -4569,12 +4594,6 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   if (rc != LC_OK)
     return rc;
   for (i = 0; i < r->count; ++i) {
-    if (!r->resident && r->entries[i].value.packed) {
-      rc = install_open_binding(s, &batch, &r->entries[i], error);
-      if (rc != LC_OK)
-        return rc;
-      continue;
-    }
     p = r->entries[i].decoded;
     /* The directory walk checked that every binding key is distinct. */
     if (!p) {
@@ -4582,11 +4601,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
       rc = payload_claim_entry(s, p, r->payload, error);
       if (rc != LC_OK)
         return rc;
-      hash = key_hash(p->key);
-      slot = key_slot(&s->keys, p->key, hash);
-      slot->entry = p;
-      slot->hash = hash;
-      ++s->keys.count;
+      key_index_add_distinct(&s->keys, p);
       s->metadata += entry_bytes(p);
       ++s->live_entries;
       continue;
@@ -4602,10 +4617,9 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     r->entries[i].decoded = NULL;
     register_entry(s, p);
     install(s, p, NULL);
+    if (p->key.kind == PS_OWNED_RUN && !p->stream->owned_linked)
+      return err(error, LC_ERR_PROTOCOL, "owned run has no stream head");
   }
-  /* Only the final slab can have unused slots. Publish them after the scan. */
-  if (batch.block && batch.next < ENTRY_SLAB_SLOTS)
-    entry_available_link(batch.block);
   return LC_OK;
 }
 static int capture_directory_entry(void *v, ps_key key,
@@ -4616,6 +4630,8 @@ static int capture_directory_entry(void *v, ps_key key,
   ps_descriptor_ref ref = value->ref;
   ps_entry *old = NULL;
   size_t capacity;
+  if (value->packed && !r->resident)
+    return load_open_binding(r->space, &r->open_slab, key, value, error);
   if (r->count == r->capacity) {
     if (r->capacity > (size_t)-1 / sizeof(*item) / 2)
       return err(error, LC_ERR_NOMEM, "checkpoint binding list too large");
@@ -5111,34 +5127,29 @@ static int import_certified_journal(ps_space *s,
     memset(s->journal_image + s->journal, 0, journal_end_marker(s->journal));
   return rc;
 }
-static int validate_owned_directory(ps_space *s, lc_error *error) {
-  ps_entry *p, *run;
-  uint64_t count, end, stored, expected = 0, actual = 0;
-  for (p = s->entries; p; p = p->all_next) {
-    if (p->key.kind == PS_OWNED_RUN) {
-      ++actual;
-      if (!stream_lookup(s, p->key.owner))
-        return err(error, LC_ERR_PROTOCOL, "owned run has no stream head");
-    }
-    if (p->key.kind != PS_STREAM)
-      continue;
-    end = count = stored = 0;
-    for (run = p->stream->owned_first; run; run = run->stream->owned_next) {
-      if (run->deleted || run->key.key < end ||
-          run->key.key > p->stream->capacity ||
-          run->stream->capacity > p->stream->capacity - run->key.key)
-        return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
-      end = run->key.key + run->stream->capacity;
-      stored += entry_storage(run);
-      ++count;
-    }
-    if (count != p->stream->runs || stored != p->stream->storage)
-      return err(error, LC_ERR_PROTOCOL, "owned stream capacity mismatch");
-    expected += p->stream->runs;
+static int validate_owned_stream(const ps_stream_state *head, lc_error *error) {
+  const ps_entry *run;
+  uint64_t count = 0, end = 0, stored = 0;
+  for (run = head->owned_first; run; run = run->stream->owned_next) {
+    if (run->deleted || run->key.key < end || run->key.key > head->capacity ||
+        run->stream->capacity > head->capacity - run->key.key)
+      return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
+    end = run->key.key + run->stream->capacity;
+    stored += entry_storage(run);
+    ++count;
   }
-  return actual == expected
+  return count == head->runs && stored == head->storage
              ? LC_OK
-             : err(error, LC_ERR_PROTOCOL, "unreferenced owned run directory");
+             : err(error, LC_ERR_PROTOCOL, "owned stream capacity mismatch");
+}
+static int validate_owned_directory(ps_space *s, lc_error *error) {
+  const ps_entry *p;
+  size_t i;
+  int rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
+    for (p = s->stream_buckets[i]; rc == LC_OK && p; p = p->stream->next)
+      rc = validate_owned_stream(p->stream, error);
+  return rc;
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
@@ -5169,7 +5180,7 @@ static int recover_directory(ps_space *s, unsigned char *wire,
                             recover_directory_page, recovery, error);
   }
   ps_directory_close(directory);
-  if (rc == LC_OK && recovery && recovery->count)
+  if (rc == LC_OK && recovery)
     rc = recover_directory_bindings(recovery, error);
   if (recovery) {
     metadata_recovery_close(recovery);

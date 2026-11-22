@@ -2661,8 +2661,8 @@ static void checkpoint_open_slab_reuse(int durable) {
   ok(ps_open(path, 1, &options, &writer, &e), &e);
   /* Cross two full slabs and leave one partially filled. The second slab
    * also contains a predecessor that the initial journal replay retires. */
-  for (slot.key = 1; slot.key <= 65; ++slot.key)
-    capture_put_key(writer, slot, 65);
+  for (slot.key = 1; slot.key <= 66; ++slot.key)
+    capture_put_key(writer, slot, slot.key == 44 ? PS_PAGE : 65);
   ok(ps_checkpoint(writer, &e), &e);
   slot.key = 33;
   capture_put_key(writer, slot, 129);
@@ -2689,7 +2689,7 @@ static void checkpoint_open_slab_reuse(int durable) {
   ok(ps_read_open(joined, slot, NULL, &pinned, &e), &e);
   for (slot.key = 1; slot.key <= 32; ++slot.key)
     ok(ps_delete(joined, slot, &e), &e);
-  slot.key = 66;
+  slot.key = 67;
   capture_put_key(joined, slot, 193);
   ok(ps_checkpoint(joined, &e), &e);
   captured_expect(pinned, 1, 65);
@@ -2704,11 +2704,12 @@ static void checkpoint_open_slab_reuse(int durable) {
     ok(ps_value_info(joined, slot, &ref, &bytes, &present, &e), &e);
     REQUIRE(!present);
   }
-  for (slot.key = 33; slot.key <= 66; ++slot.key) {
+  for (slot.key = 33; slot.key <= 67; ++slot.key) {
     ok(ps_read_open(joined, slot, NULL, &reader, &e), &e);
     captured_expect(reader, (unsigned char)slot.key,
                     slot.key == 33   ? 129
-                    : slot.key == 66 ? 193
+                    : slot.key == 44 ? PS_PAGE
+                    : slot.key == 67 ? 193
                                      : 65);
     ps_reader_close(reader);
   }
@@ -2716,8 +2717,57 @@ static void checkpoint_open_slab_reuse(int durable) {
   ok(ps_close(joined, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void checkpoint_orphan_run(void) {
+  lc_error e = {0};
+  ps_space *writer = NULL, *peer = NULL, *join = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_run *run = NULL;
+  ps_owned_status status;
+  ps_key stream = {88, 900, PS_STREAM};
+  unsigned char original[PS_PAGE], damaged[PS_PAGE];
+  int found;
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_owned_open(writer, NULL, stream, 1, NULL, &head, &status, &e), &e);
+  ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+  REQUIRE(found);
+  ps_owned_run_close(run);
+  ps_owned_close(head);
+  ok(ps_checkpoint(writer, &e), &e);
+  off_t page = (off_t)writer->directory.offset;
+  REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  REQUIRE(original[4] == 0 && original[8] == 2 && original[64] == PS_STREAM &&
+          original[128] == PS_OWNED_RUN);
+  memcpy(damaged, original, sizeof(damaged));
+  damaged[8] = 1;
+  memcpy(damaged + 64, original + 128, 64);
+  memset(damaged + 128, 0, 64);
+  uint32_t crc =
+      (uint32_t)crc32(crc32(0, damaged, 12), damaged + 16, PS_PAGE - 16);
+  for (size_t i = 0; i < 4; ++i)
+    damaged[12 + i] = (unsigned char)(crc >> (8 * i));
+  REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
+          sizeof(damaged));
+  uint64_t generation = peer->generation;
+  REQUIRE(ps_refresh(peer, &e) == LC_ERR_PROTOCOL &&
+          peer->generation == generation && e.message &&
+          !strcmp(e.message, "owned run has no stream head"));
+  lc_error_cleanup(&e);
+  REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
+          e.message && !strcmp(e.message, "owned run has no stream head"));
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  ok(ps_refresh(peer, &e), &e);
+  ok(ps_check(peer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
+  checkpoint_orphan_run();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);
   checkpoint_packed_bindings(0);

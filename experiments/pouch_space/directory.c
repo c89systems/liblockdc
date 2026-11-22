@@ -129,13 +129,51 @@ static directory_node *new_node(ps_directory *d, unsigned int level,
   ++d->node_count;
   return node;
 }
+static int read_page(ps_directory *d, ps_directory_root ref,
+                     unsigned char *page, lc_error *error) {
+  int rc = d->io.read(d->io.context, ref.offset, page, error);
+  if (rc != LC_OK)
+    return rc;
+  if (load32(page) != DIRECTORY_MAGIC || load32(page + 4) > MAX_LEVEL ||
+      !load32(page + 8) || load32(page + 8) > LIMIT ||
+      load32(page + 12) != page_crc(page) ||
+      load64(page + 16) != ref.generation || load64(page + 24) != ref.offset ||
+      memcmp(page + 32, d->io.identity, 16) || load64(page + 48) ||
+      load64(page + 56))
+    return directory_error(error, LC_ERR_PROTOCOL,
+                           "invalid checkpoint directory page");
+  return LC_OK;
+}
+static ps_key slot_key(const unsigned char *slot) {
+  ps_key key;
+  key.owner = load64(slot + 8);
+  key.key = load64(slot + 16);
+  key.kind = load32(slot);
+  return key;
+}
+static int slot_child(const unsigned char *slot, ps_directory_root parent,
+                      ps_directory_root *child) {
+  child->offset = load64(slot + 24);
+  child->generation = load64(slot + 32);
+  return child->offset && valid_root(*child) &&
+         child->generation <= parent.generation && !load32(slot + 4) &&
+         !load64(slot + 40) && !load64(slot + 48) && !load64(slot + 56);
+}
+static int slot_value(const unsigned char *slot, ps_key key,
+                      ps_directory_value *value) {
+  value->packed = load32(slot + 4);
+  value->ref.offset = load64(slot + 24);
+  value->ref.bytes = load64(slot + 32);
+  value->ref.incarnation = load64(slot + 40);
+  value->crc = load32(slot + 48);
+  value->deletion_bytes = load64(slot + 56);
+  return !load32(slot + 52) && valid_value(key, value);
+}
 static int read_node(ps_directory *d, ps_directory_root ref,
                      directory_node **out, lc_error *error) {
   unsigned char *page;
   directory_node *node;
   directory_item *item;
-  ps_directory_root child;
-  ps_directory_value *value;
   const unsigned char *slot;
   unsigned int i;
   int rc;
@@ -143,19 +181,9 @@ static int read_node(ps_directory *d, ps_directory_root ref,
   if (!page)
     return directory_error(error, LC_ERR_NOMEM,
                            "cannot allocate directory read buffer");
-  rc = d->io.read(d->io.context, ref.offset, page, error);
+  rc = read_page(d, ref, page, error);
   if (rc != LC_OK)
     goto done;
-  if (load32(page) != DIRECTORY_MAGIC || load32(page + 4) > MAX_LEVEL ||
-      !load32(page + 8) || load32(page + 8) > LIMIT ||
-      load32(page + 12) != page_crc(page) ||
-      load64(page + 16) != ref.generation || load64(page + 24) != ref.offset ||
-      memcmp(page + 32, d->io.identity, 16) || load64(page + 48) ||
-      load64(page + 56)) {
-    rc = directory_error(error, LC_ERR_PROTOCOL,
-                         "invalid checkpoint directory page");
-    goto done;
-  }
   node = new_node(d, load32(page + 4), error);
   if (!node) {
     rc = LC_ERR_NOMEM;
@@ -166,31 +194,15 @@ static int read_node(ps_directory *d, ps_directory_root ref,
   for (i = 0; i < node->count; ++i) {
     item = &node->items[i];
     slot = page + HEADER + SLOT * i;
-    item->key.kind = load32(slot);
-    item->key.owner = load64(slot + 8);
-    item->key.key = load64(slot + 16);
+    item->key = slot_key(slot);
     if (!item->key.kind ||
         (i && ps_directory_key_compare(node->items[i - 1].key, item->key) >= 0))
       goto invalid_slot;
     if (node->level) {
-      child.offset = load64(slot + 24);
-      child.generation = load64(slot + 32);
-      if (!child.offset || !valid_root(child) ||
-          child.generation > ref.generation || load32(slot + 4) ||
-          load64(slot + 40) || load64(slot + 48) || load64(slot + 56))
+      if (!slot_child(slot, ref, &item->binding.child.ref))
         goto invalid_slot;
-      item->binding.child.ref = child;
-    } else {
-      value = &item->binding.value;
-      value->packed = load32(slot + 4);
-      value->ref.offset = load64(slot + 24);
-      value->ref.bytes = load64(slot + 32);
-      value->ref.incarnation = load64(slot + 40);
-      value->crc = load32(slot + 48);
-      value->deletion_bytes = load64(slot + 56);
-      if (load32(slot + 52) || !valid_value(item->key, value))
-        goto invalid_slot;
-    }
+    } else if (!slot_value(slot, item->key, &item->binding.value))
+      goto invalid_slot;
   }
   *out = node;
   goto done;
@@ -589,6 +601,15 @@ typedef struct visit_state {
   ps_key previous;
   int found;
 } visit_state;
+static int visit_binding(visit_state *state, ps_key key,
+                         const ps_directory_value *value, lc_error *error) {
+  if (state->found && ps_directory_key_compare(state->previous, key) >= 0)
+    return directory_error(error, LC_ERR_PROTOCOL,
+                           "checkpoint directory key ranges overlap");
+  state->previous = key;
+  state->found = 1;
+  return state->visit ? state->visit(state->context, key, value, error) : LC_OK;
+}
 static int visit_node(ps_directory *d, directory_node *node, visit_state *state,
                       lc_error *error) {
   directory_node *child;
@@ -604,27 +625,77 @@ static int visit_node(ps_directory *d, directory_node *node, visit_state *state,
       rc = child_node(d, node, i, &child, error);
       if (rc == LC_OK)
         rc = visit_node(d, child, state, error);
-    } else {
-      if (state->found &&
-          ps_directory_key_compare(state->previous, node->items[i].key) >= 0)
-        return directory_error(error, LC_ERR_PROTOCOL,
-                               "checkpoint directory key ranges overlap");
-      state->previous = node->items[i].key;
-      state->found = 1;
-      rc = state->visit ? state->visit(state->context, node->items[i].key,
-                                       &node->items[i].binding.value, error)
-                        : LC_OK;
-    }
+    } else
+      rc = visit_binding(state, node->items[i].key,
+                         &node->items[i].binding.value, error);
     if (rc != LC_OK)
       return rc;
   }
   return LC_OK;
+}
+/* A full scan of an untouched view only needs one wire page per level.
+ * Reuse that storage across siblings and decode each slot at its consumer. */
+static int scan_page(ps_directory *d, ps_directory_root ref,
+                     unsigned char *page, unsigned int parent_level,
+                     ps_key lower, ps_key upper, visit_state *state,
+                     lc_error *error) {
+  ps_directory_root child;
+  ps_directory_value value;
+  ps_key key, previous = {0}, next;
+  const unsigned char *slot;
+  unsigned int level, count, i;
+  int rc = read_page(d, ref, page, error);
+  if (rc != LC_OK)
+    return rc;
+  level = load32(page + 4);
+  count = load32(page + 8);
+  if (parent_level) {
+    if (count < MINIMUM || level + 1 != parent_level ||
+        ps_directory_key_compare(slot_key(page + HEADER), lower) ||
+        (upper.kind &&
+         ps_directory_key_compare(slot_key(page + HEADER + (count - 1) * SLOT),
+                                  upper) >= 0))
+      return directory_error(error, LC_ERR_PROTOCOL,
+                             "checkpoint directory child binding mismatch");
+  } else if (level && count < 2)
+    return directory_error(error, LC_ERR_PROTOCOL,
+                           "checkpoint directory root was not collapsed");
+  if (state->page) {
+    rc = state->page(state->context, ref, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  for (i = 0; i < count; ++i) {
+    slot = page + HEADER + i * SLOT;
+    key = slot_key(slot);
+    if (!key.kind)
+      break;
+    if (level) {
+      if (ps_directory_key_compare(previous, key) >= 0 ||
+          !slot_child(slot, ref, &child))
+        break;
+      previous = key;
+      next = i + 1 < count ? slot_key(slot + SLOT) : upper;
+      rc = scan_page(d, child, page + PS_PAGE, level, key, next, state, error);
+    } else {
+      if (!slot_value(slot, key, &value))
+        break;
+      rc = visit_binding(state, key, &value, error);
+    }
+    if (rc != LC_OK)
+      return rc;
+  }
+  return i == count ? LC_OK
+                    : directory_error(error, LC_ERR_PROTOCOL,
+                                      "invalid checkpoint directory slot");
 }
 int ps_directory_visit(ps_directory *d, ps_directory_visit_fn visit,
                        ps_directory_page_fn page, void *context,
                        lc_error *error) {
   visit_state state;
   directory_node *node;
+  unsigned char *scan;
+  ps_key unbounded = {0};
   int rc = available(d, error);
   if (rc == LC_OK && !visit && !page)
     rc = directory_error(error, LC_ERR_INVALID, "directory visitor required");
@@ -636,14 +707,23 @@ int ps_directory_visit(ps_directory *d, ps_directory_visit_fn visit,
             "page ownership walk requires unmodified directory");
         break;
       }
-  if (rc == LC_OK)
-    rc = root_node(d, error);
-  if (rc == LC_OK && d->root) {
+  if (rc == LC_OK) {
     memset(&state, 0, sizeof(state));
     state.visit = visit;
     state.page = page;
     state.context = context;
-    rc = visit_node(d, d->root, &state, error);
+    if (!d->root_loaded) {
+      scan = lc_alloc_with_allocator(NULL, (MAX_LEVEL + 1) * PS_PAGE);
+      if (!scan)
+        rc = directory_error(error, LC_ERR_NOMEM,
+                             "cannot allocate directory scan pages");
+      else {
+        rc = scan_page(d, d->original, scan, 0, unbounded, unbounded, &state,
+                       error);
+        lc_free_with_allocator(NULL, scan);
+      }
+    } else if (d->root)
+      rc = visit_node(d, d->root, &state, error);
   }
   return finish_operation(d, rc);
 }

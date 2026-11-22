@@ -253,11 +253,19 @@ static void growth_and_copy_on_write(void) {
   {
     scan ownership = {0};
     ownership.storage = &p;
+    ownership.expected = expected;
     ownership.seen = calloc(PAGES, 1);
     CHECK(ownership.seen != NULL);
     d = open_directory(&io, root);
-    OK(ps_directory_visit(d, NULL, scan_page, &ownership, &error));
+    p.reads = 0;
+    allocation_largest = allocation_calls = allocation_at = 0;
+    count_allocations = 1;
+    OK(ps_directory_visit(d, scan_entry, scan_page, &ownership, &error));
+    count_allocations = 0;
+    CHECK(ownership.count == KEYS);
     CHECK(ownership.pages == original_pages);
+    CHECK(p.reads == original_pages && allocation_calls == 1);
+    expect(d, 4111, expected[4111]);
     ps_directory_close(d);
     free(ownership.seen);
   }
