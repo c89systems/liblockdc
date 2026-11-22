@@ -4,6 +4,7 @@
 #include "lc_pouch_state_record.h"
 #include "owned.h"
 #include "root.h"
+#include "stream.h"
 
 typedef struct ps_namespace_append ps_namespace_append;
 typedef struct ps_namespace_window ps_namespace_window;
@@ -146,7 +147,7 @@ int ps_namespace_rotate(ps_namespace *, uint64_t expected, lc_error *);
  * mutation authority. An ineligible source leaves the retirement NULL. */
 int ps_namespace_unlink_active(ps_namespace *, uint64_t expected,
                                ps_namespace_retirement **, lc_error *);
-enum { PS_NAMESPACE_RETIRE_LIMIT = 4 };
+enum { PS_NAMESPACE_RETIRE_LIMIT = PS_STREAM_RETIRE_LIMIT };
 /* Unlink a batch of two or more covered inactive segments with no remaining
  * references under logical namespace authority. The caller consumes all
  * returned retirements even when an error follows a durable prefix. */
@@ -157,6 +158,12 @@ int ps_namespace_unlink_covered(ps_namespace *, uint64_t minimum_bytes,
  * is still busy, the namespace's regular reaper retains the pending work. */
 int ps_namespace_retire_unlinked(ps_namespace *, ps_namespace_retirement *,
                                  lc_error *);
+/* Consume all returned retirements. The mask reports the streams confirmed
+ * durable. Busy members stay on the namespace's retirement list. */
+int ps_namespace_retire_unlinked_batch(ps_namespace *,
+                                       ps_namespace_retirement *const *,
+                                       size_t count, unsigned int *retired,
+                                       lc_error *);
 int ps_namespace_parse_source_leaf(const char *, unsigned int *, uint64_t *);
 int ps_namespace_read_open(ps_namespace *, unsigned int kind, uint64_t id,
                            uint64_t offset, uint64_t bytes,

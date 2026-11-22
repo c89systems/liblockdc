@@ -3235,8 +3235,40 @@ static void shared_successor(const char *path, int mode) {
   shared_namespace = 0;
   lc_error_cleanup(&e);
 }
-static void rolled_sources(const char *path, int reopen_durable) {
+enum retire_fault { RETIRE_OK, RETIRE_BUSY, RETIRE_SECOND_WRITE, RETIRE_SYNC };
+typedef struct retire_io {
+  enum retire_fault fault;
+  size_t syncs, removes;
+} retire_io;
+static ssize_t retirement_write(void *context, int fd, const void *bytes,
+                                size_t count, off_t at) {
+  static const unsigned char removal[] = {PS_STREAM, 0, 0, 0,
+                                          PS_REMOVE, 0, 0, 0};
+  retire_io *io = context;
+  const unsigned char *wire = bytes;
+  if (io->fault == RETIRE_SECOND_WRITE && count >= 64 && at >= JOURNAL_OFFSET &&
+      at < PS_DATA && !memcmp(wire + 16, removal, sizeof(removal)) &&
+      ++io->removes == 2) {
+    errno = EIO;
+    return -1;
+  }
+  return pwrite(fd, bytes, count, at);
+}
+static int retirement_sync(void *context, int fd) {
+  retire_io *io = context;
+  ++io->syncs;
+  if (io->fault == RETIRE_SYNC) {
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static void rolled_sources(const char *path, int reopen_durable,
+                           enum retire_fault fault) {
   ps_root_options options = {0};
+  retire_io probe = {0};
+  ps_io io = {&probe,          successor_read, retirement_write,
+              retirement_sync, direct_reserve, NULL};
   ps_root *root = NULL, *peer = NULL;
   ps_namespace *ns, *joined;
   ps_namespace_info identity;
@@ -3248,7 +3280,8 @@ static void rolled_sources(const char *path, int reopen_durable) {
   ps_owned_status physical;
   shared_records observed = {0};
   ps_key key;
-  uint64_t offset;
+  uint64_t offset, closed, pending;
+  unsigned int confirmed;
   size_t completed;
   unsigned char bytes[64];
   struct iovec part = {bytes, sizeof(bytes)};
@@ -3271,6 +3304,7 @@ static void rolled_sources(const char *path, int reopen_durable) {
   ok(ps_root_close(root, &e), &e);
 
   options.storage.durable_sync = reopen_durable;
+  options.storage.io = &io;
   ok(ps_root_open(path, 0, &options, &root, &e), &e);
   ns = acquire(root, "roll", 0, &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
@@ -3292,8 +3326,57 @@ static void rolled_sources(const char *path, int reopen_durable) {
   ok(ps_namespace_checkpoint_flush(ns, &e), &e);
   ok(ps_namespace_unlink_covered(ns, 0, retired, &completed, &e), &e);
   REQUIRE(completed == 2);
-  for (size_t i = 0; i < completed; ++i)
-    ok(ps_namespace_retire_unlinked(ns, retired[i], &e), &e);
+  ps_coordination_guard *edit = NULL;
+  size_t busy = reopen_durable ? 0 : 1;
+  if (fault == RETIRE_BUSY) {
+    ok(ps_root_open(path, 0, &options, &peer, &e), &e);
+    key.key = busy + 1;
+    ok(ps_owned_inspect(ps_root_space(peer), key, NULL, &physical, &e), &e);
+    ok(ps_coordination_lock(ps_space_coordination(ps_root_space(peer)),
+                            PS_COORDINATION_STREAM, physical.ref.incarnation, 0,
+                            &edit, &e),
+       &e);
+  }
+  probe.syncs = 0;
+  probe.fault = fault;
+  int rc = ps_namespace_retire_unlinked_batch(ns, retired, completed,
+                                              &confirmed, &e);
+  if (fault == RETIRE_SECOND_WRITE || fault == RETIRE_SYNC) {
+    REQUIRE(rc == LC_ERR_TRANSPORT && !confirmed &&
+            probe.syncs == (fault == RETIRE_SYNC ? 1U : 0U));
+    clear(&e);
+    ps_namespace_read_close(window);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    probe.fault = RETIRE_OK;
+    ok(ps_root_open(path, 0, &options, &root, &e), &e);
+    ns = acquire(root, "roll", 0, &e);
+    ok(ps_namespace_status_get(ns, &status, &e), &e);
+    REQUIRE(status.active_segment == 3 && status.bound_segments == 1);
+    memset(&observed, 0, sizeof(observed));
+    ok(ps_namespace_view_open(ns, &view, &e), &e);
+    ok(ps_namespace_view_visit(view, 1, visit_shared, &observed, &e), &e);
+    REQUIRE(observed.keys == 1 && observed.version == 4);
+    ps_namespace_view_close(view);
+    ok(ps_root_reclaim_orphans(root, &closed, &pending, &e), &e);
+    REQUIRE(!pending);
+    ps_namespace_release(ns);
+    ok(ps_root_close(root, &e), &e);
+    REQUIRE(unlink(path) == 0);
+    shared_namespace = 0;
+    return;
+  }
+  ok(rc, &e);
+  REQUIRE(probe.syncs == 1);
+  if (fault == RETIRE_BUSY) {
+    REQUIRE(confirmed == (3U ^ (1U << busy)));
+    ps_coordination_unlock(edit);
+    ok(ps_root_close(peer, &e), &e);
+    ok(ps_namespace_reap(ns, &closed, &pending, &e), &e);
+    REQUIRE(closed + pending == 2);
+  } else
+    REQUIRE(confirmed == 3U);
+  key.key = 3;
   REQUIRE(ps_namespace_read_open(ns, PS_CATALOG_SEGMENT, 1, offset,
                                  sizeof(bytes), &missing,
                                  &e) == LC_ERR_INVALID &&
@@ -3402,8 +3485,12 @@ static void *worker(void *p) {
     for (int mode = 0; mode < 4; ++mode)
       shared_successor(r->path, mode);
   } else if (!strcmp(r->mode, "rolled-sources")) {
-    rolled_sources(r->path, 0);
-    rolled_sources(r->path, 1);
+    for (int durable = 0; durable <= 1; ++durable) {
+      rolled_sources(r->path, durable, RETIRE_OK);
+      rolled_sources(r->path, durable, RETIRE_BUSY);
+      rolled_sources(r->path, durable, RETIRE_SECOND_WRITE);
+      rolled_sources(r->path, durable, RETIRE_SYNC);
+    }
   } else
     concurrency(r->path);
   return NULL;

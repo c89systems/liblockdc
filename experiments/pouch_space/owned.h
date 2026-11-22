@@ -213,5 +213,9 @@ int ps_owned_seal(ps_owned_head *, lc_error *);
  * failed cleanup or process death. It writes no format or payload bytes. */
 int ps_owned_claim_orphan(ps_owned_head *, lc_error *);
 int ps_owned_retire(ps_owned_head *, lc_error *);
+/* A stream editor can record independent retirements before awaiting the
+ * largest local sequence. Keep each edit guard until the wait completes. */
+int ps_owned_retire_record(ps_owned_head *, uint64_t *, lc_error *);
+int ps_owned_retire_wait(ps_owned_head *, uint64_t, lc_error *);
 
 #endif

@@ -10372,11 +10372,13 @@ int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-int ps_owned_retire(ps_owned_head *head, lc_error *error) {
+int ps_owned_retire_record(ps_owned_head *head, uint64_t *recorded,
+                           lc_error *error) {
   ps_space *s;
   ps_coordination_guard *guard;
   uint64_t sequence = 0;
   int rc;
+  *recorded = 0;
   if (!head)
     return err(error, LC_ERR_INVALID, "owned retirement requires head");
   s = head->space;
@@ -10400,7 +10402,18 @@ int ps_owned_retire(ps_owned_head *head, lc_error *error) {
     sequence = head->entry->publication_sequence;
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  return rc == LC_OK ? wait_durable(s, sequence, error) : rc;
+  if (rc == LC_OK)
+    *recorded = sequence;
+  return rc;
+}
+int ps_owned_retire_wait(ps_owned_head *head, uint64_t sequence,
+                         lc_error *error) {
+  return wait_durable(head->space, sequence, error);
+}
+int ps_owned_retire(ps_owned_head *head, lc_error *error) {
+  uint64_t sequence;
+  int rc = ps_owned_retire_record(head, &sequence, error);
+  return rc == LC_OK ? ps_owned_retire_wait(head, sequence, error) : rc;
 }
 ps_entry *ps_internal_lookup(ps_space *s, ps_key key) { return lookup(s, key); }
 int ps_internal_healthy(ps_space *s, lc_error *e) { return healthy(s, e); }

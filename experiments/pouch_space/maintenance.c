@@ -312,8 +312,9 @@ static int compact_run(lc_pouch *pouch, const char *name,
   compact w;
   ps_root *root = ps_pouch_state_root(pouch);
   uint64_t orphaned, skipped;
+  unsigned int retired;
   size_t i;
-  int rc;
+  int rc, retirement_rc;
   memset(&w, 0, sizeof(w));
   if (out)
     memset(out, 0, sizeof(*out));
@@ -326,16 +327,14 @@ static int compact_run(lc_pouch *pouch, const char *name,
   w.maintenance = maintenance;
   w.background = options && options->background && !options->force;
   rc = compact_namespace(&w, compact_locked, &w, e);
-  for (i = 0; i < w.retirement_count; ++i) {
-    int retired = ps_namespace_retire_unlinked(w.ns, w.retirements[i],
-                                               rc == LC_OK ? e : NULL);
-    if (retired == LC_ERR_PENDING) {
-      if (rc == LC_OK)
-        lc_error_cleanup(e);
+  retirement_rc = ps_namespace_retire_unlinked_batch(
+      w.ns, w.retirements, w.retirement_count, &retired,
+      rc == LC_OK ? e : NULL);
+  if (rc == LC_OK)
+    rc = retirement_rc;
+  for (i = 0; i < w.retirement_count; ++i)
+    if (!(retired & (1U << i)))
       ++w.result.pending_sources;
-    } else if (rc == LC_OK)
-      rc = retired;
-  }
   /* A full batch may have left more sealed sources. Other candidates from
    * the planning pass, including partially live sources, also need a turn. */
   if (w.retirement_count && (w.retirement_count == PS_NAMESPACE_RETIRE_LIMIT ||

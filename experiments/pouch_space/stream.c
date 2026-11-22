@@ -652,9 +652,24 @@ int ps_stream_piece_repack(ps_stream *s, uint64_t base, ps_budget *budget,
   ps_owned_run_close(old);
   return rc;
 }
-static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
+static int stream_transition_end(ps_stream *s, ps_coordination_guard *edit,
+                                 int retirement, int rc, lc_error *error) {
+  pthread_mutex_lock(&s->mutex);
+  if (rc == LC_OK) {
+    if (retirement)
+      s->retired = 1;
+    else
+      s->sealed = 1;
+  }
+  rc = ps_owned_edit_end(s->head, edit, rc, error);
+  s->appending = 0;
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
+static int stream_transition_begin(ps_stream *s, int retirement,
+                                   ps_coordination_guard **edit,
+                                   lc_error *error) {
   ps_owned_status status;
-  ps_coordination_guard *edit = NULL;
   int rc = LC_OK, continued;
   if (!s)
     return stream_error(error, LC_ERR_INVALID,
@@ -669,23 +684,21 @@ static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
   pthread_mutex_unlock(&s->mutex);
   if (rc != LC_OK)
     return rc;
-  rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
-  if (rc == LC_OK && edit && !retirement)
+  rc = ps_owned_edit_begin(s->head, 0, edit, &status, &continued, error);
+  if (rc == LC_OK && *edit && !retirement)
     rc = stream_refresh_edit(s, &status, continued, 0, error);
-  if (rc == LC_OK)
-    rc = retirement ? ps_owned_retire(s->head, error)
-                    : ps_owned_seal(s->head, error);
-  pthread_mutex_lock(&s->mutex);
-  if (rc == LC_OK) {
-    if (retirement)
-      s->retired = 1;
-    else
-      s->sealed = 1;
-  }
-  rc = ps_owned_edit_end(s->head, edit, rc, error);
-  s->appending = 0;
-  pthread_mutex_unlock(&s->mutex);
+  if (rc != LC_OK)
+    rc = stream_transition_end(s, *edit, retirement, rc, error);
   return rc;
+}
+static int stream_transition(ps_stream *s, int retirement, lc_error *error) {
+  ps_coordination_guard *edit = NULL;
+  int rc = stream_transition_begin(s, retirement, &edit, error);
+  if (rc != LC_OK)
+    return rc;
+  rc = retirement ? ps_owned_retire(s->head, error)
+                  : ps_owned_seal(s->head, error);
+  return stream_transition_end(s, edit, retirement, rc, error);
 }
 int ps_stream_seal(ps_stream *s, lc_error *error) {
   return stream_transition(s, 0, error);
@@ -701,6 +714,65 @@ int ps_stream_has_sparse_runs(ps_stream *s) {
 }
 int ps_stream_retire(ps_stream *s, lc_error *error) {
   return stream_transition(s, 1, error);
+}
+int ps_stream_retire_batch(ps_stream *const *streams, size_t count,
+                           size_t *completed, lc_error *error) {
+  ps_coordination_guard *edits[PS_STREAM_RETIRE_LIMIT] = {0};
+  lc_error interrupted = {0};
+  uint64_t latest = 0, sequence;
+  size_t i, recorded = 0;
+  int rc, prepared = LC_OK, durable = LC_OK;
+  *completed = 0;
+  if (!count || count > PS_STREAM_RETIRE_LIMIT)
+    return stream_error(error, LC_ERR_INVALID, "invalid retirement count");
+  if (count == 1) {
+    rc = ps_stream_retire(streams[0], error);
+    *completed = rc == LC_OK;
+    return rc;
+  }
+  for (i = 0; i < count; ++i) {
+    if (!streams[i] || streams[i]->space != streams[0]->space)
+      return stream_error(error, LC_ERR_INVALID,
+                          "retirement requires streams in one container");
+  }
+  while (prepared == LC_OK && recorded < count) {
+    ps_stream *s = streams[recorded];
+    prepared = stream_transition_begin(s, 1, &edits[recorded], &interrupted);
+    if (prepared != LC_OK)
+      break;
+    prepared = ps_owned_retire_record(s->head, &sequence, &interrupted);
+    if (prepared != LC_OK) {
+      prepared =
+          stream_transition_end(s, edits[recorded], 1, prepared, &interrupted);
+      break;
+    }
+    if (sequence > latest)
+      latest = sequence;
+    ++recorded;
+  }
+  /* Each record follows its durable catalog unlink. The existing journal
+   * accepts a prefix of these independent removals after interruption. */
+  if (recorded)
+    durable = ps_owned_retire_wait(streams[0]->head, latest, error);
+  if (durable == LC_OK)
+    *completed = recorded;
+  rc = durable;
+  for (i = 0; i < recorded; ++i) {
+    int closed = stream_transition_end(streams[i], edits[i], 1, durable,
+                                       rc == LC_OK ? error : NULL);
+    if (rc == LC_OK)
+      rc = closed;
+  }
+  if (rc == LC_OK && prepared != LC_OK) {
+    rc = prepared;
+    if (error) {
+      lc_error_cleanup(error);
+      *error = interrupted;
+      lc_error_init(&interrupted);
+    }
+  }
+  lc_error_cleanup(&interrupted);
+  return rc;
 }
 int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
                             size_t n, lc_error *error) {

@@ -299,8 +299,9 @@ int ps_ns_reclaim_before_append(struct ps_namespace_data *d, lc_error *e) {
   ps_namespace_retirement *retirements[PS_NAMESPACE_RETIRE_LIMIT];
   ps_ns_resource **link = &d->retired;
   lc_error local = {0};
+  unsigned int retired;
   size_t i, count = 0;
-  int rc = LC_OK;
+  int rc = LC_OK, done;
   if (!e)
     e = &local;
   pthread_mutex_lock(&d->mutex);
@@ -328,23 +329,19 @@ int ps_ns_reclaim_before_append(struct ps_namespace_data *d, lc_error *e) {
   /* Confirmed unlinks were prepended under this same namespace authority.
    * Release completed owners directly. Captured windows own their mappings
    * independently, and unfinished retirements stay available to the reaper. */
+  done = ps_namespace_retire_unlinked_batch(d->ns, retirements, count, &retired,
+                                            rc == LC_OK ? e : NULL);
+  if (rc == LC_OK)
+    rc = done;
   while (count) {
     ps_ns_resource *source = retirements[--count];
-    int retired =
-        ps_namespace_retire_unlinked(d->ns, source, rc == LC_OK ? e : NULL);
-    if (retired == LC_OK) {
+    if (retired & (1U << count)) {
       pthread_mutex_lock(&d->mutex);
       *link = source->next;
       pthread_mutex_unlock(&d->mutex);
       ps_ns_resource_release(source);
     } else
       link = &source->next;
-    if (rc == LC_OK) {
-      if (retired == LC_ERR_PENDING)
-        lc_error_cleanup(e);
-      else
-        rc = retired;
-    }
   }
   lc_error_cleanup(&local);
   return rc;
@@ -481,17 +478,45 @@ int ps_namespace_unlink_active(ps_namespace *ns, uint64_t expected,
 int ps_namespace_retire_unlinked(ps_namespace *ns,
                                  ps_namespace_retirement *retirement,
                                  lc_error *e) {
-  int rc;
-  if (!ns || !retirement)
-    return failure(e, "retire requires an unlinked namespace source");
-  rc = ps_stream_retire(retirement->stream, e);
-  __atomic_store_n(&retirement->retiring, 0, __ATOMIC_RELEASE);
-  ps_namespace_release(ns);
-  if (rc == LC_ERR_INVALID) {
-    lc_error_cleanup(e);
+  unsigned int retired;
+  int rc = ps_namespace_retire_unlinked_batch(ns, &retirement, 1, &retired, e);
+  if (rc == LC_OK && !retired)
     rc = lc_error_set(e, LC_ERR_PENDING, 0,
                       "unlinked source still has an active owner", NULL, NULL,
                       "pouch");
+  return rc;
+}
+int ps_namespace_retire_unlinked_batch(ps_namespace *ns,
+                                       ps_namespace_retirement *const *items,
+                                       size_t count, unsigned int *retired,
+                                       lc_error *e) {
+  ps_stream *streams[PS_NAMESPACE_RETIRE_LIMIT];
+  size_t i, next = 0, completed;
+  int rc = LC_OK;
+  *retired = 0;
+  if (!count)
+    return LC_OK;
+  if (!ns || count > PS_NAMESPACE_RETIRE_LIMIT)
+    return failure(e, "invalid namespace retirements");
+  for (i = 0; i < count; ++i) {
+    if (!items[i])
+      return failure(e, "retire requires an unlinked namespace source");
+    streams[i] = items[i]->stream;
+  }
+  while (rc == LC_OK && next < count) {
+    rc = ps_stream_retire_batch(streams + next, count - next, &completed, e);
+    for (i = 0; i < completed; ++i)
+      *retired |= 1U << (next + i);
+    next += completed;
+    if ((rc == LC_ERR_PENDING || rc == LC_ERR_INVALID) && next < count) {
+      ++next;
+      lc_error_cleanup(e);
+      rc = LC_OK;
+    }
+  }
+  for (i = 0; i < count; ++i) {
+    __atomic_store_n(&items[i]->retiring, 0, __ATOMIC_RELEASE);
+    ps_namespace_release(ns);
   }
   return rc;
 }

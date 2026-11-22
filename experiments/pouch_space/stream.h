@@ -74,6 +74,11 @@ int ps_stream_seal(ps_stream *, lc_error *);
 /* Inspect complete mappings on a newly opened stream before parking it. */
 int ps_stream_has_sparse_runs(ps_stream *);
 int ps_stream_retire(ps_stream *, lc_error *);
+enum { PS_STREAM_RETIRE_LIMIT = 4 };
+/* Same-container retirements share a durability wait. If a member cannot
+ * proceed, completed still reports the preceding confirmed prefix. */
+int ps_stream_retire_batch(ps_stream *const *, size_t count, size_t *completed,
+                           lc_error *);
 int ps_stream_recovery_read(ps_stream *, uint64_t offset, void *, size_t,
                             lc_error *);
 /* During canonical recovery only: require intact completion footers for every
