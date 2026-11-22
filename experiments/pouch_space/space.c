@@ -1515,12 +1515,43 @@ static void payload_release(ps_space *s, ps_extent *extent) {
   s->packed_bytes -= extent_allocation(extent);
   payload_reconsider(s, p);
 }
-static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
+typedef struct recovery_range {
+  uint64_t offset, bytes;
+} recovery_range;
+typedef struct payload_rebuild {
+  recovery_range *ranges;
+  size_t count, capacity;
+} payload_rebuild;
+
+static int payload_exclude(ps_space *s, payload_rebuild *build, uint64_t offset,
+                           uint64_t bytes, lc_error *error) {
+  recovery_range *ranges;
+  size_t capacity;
+  if (!build)
+    return exclude_run(s, offset, bytes, error);
+  if (build->count == build->capacity) {
+    if (build->capacity > (size_t)-1 / sizeof(*ranges) / 2)
+      return err(error, LC_ERR_NOMEM, "payload ownership list too large");
+    capacity = build->capacity ? build->capacity * 2 : 64;
+    ranges = lc_realloc_with_allocator(NULL, build->ranges,
+                                       capacity * sizeof(*ranges));
+    if (!ranges)
+      return err(error, LC_ERR_NOMEM, "cannot collect payload ownership");
+    build->ranges = ranges;
+    build->capacity = capacity;
+  }
+  build->ranges[build->count].offset = offset;
+  build->ranges[build->count++].bytes = bytes;
+  return LC_OK;
+}
+static int payload_claim(ps_space *s, const ps_extent *extent,
+                         payload_rebuild *build, lc_error *error) {
   ps_payload_page *p;
   uint64_t mask;
   int rc;
   if (!(extent->flags & EXTENT_PACKED))
-    return exclude_run(s, extent->offset, aligned(extent->bytes), error);
+    return payload_exclude(s, build, extent->offset, aligned(extent->bytes),
+                           error);
   mask = extent_mask(extent);
   p = payload_find(s, extent->offset);
   if (!p) {
@@ -1529,7 +1560,7 @@ static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
       return err(error, LC_ERR_NOMEM, "cannot recover packed payload page");
     p->run.offset = extent->offset / PS_PAGE * PS_PAGE;
     p->run.bytes = PS_PAGE;
-    rc = exclude_run(s, p->run.offset, PS_PAGE, error);
+    rc = payload_exclude(s, build, p->run.offset, PS_PAGE, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(NULL, p);
       return rc;
@@ -1540,8 +1571,47 @@ static int payload_claim(ps_space *s, ps_extent *extent, lc_error *error) {
     return err(error, LC_ERR_PROTOCOL, "overlapping packed payload ownership");
   p->occupied |= mask;
   s->packed_bytes += extent_allocation(extent);
-  payload_available(s, p);
+  if (!build)
+    payload_available(s, p);
   return LC_OK;
+}
+static int payload_claim_entry(ps_space *s, const ps_entry *p,
+                               payload_rebuild *build, lc_error *error) {
+  size_t i;
+  int rc = LC_OK;
+  for (i = 0; rc == LC_OK && i < p->count; ++i)
+    rc = payload_claim(s, &p->extents[i], build, error);
+  return rc;
+}
+static int recovery_range_order(const void *a, const void *b) {
+  uint64_t left = ((const recovery_range *)a)->offset;
+  uint64_t right = ((const recovery_range *)b)->offset;
+  return left < right ? -1 : left != right;
+}
+/* Initial discovery has already subtracted directory and descriptor pages.
+ * Sweep the remaining common intervals once, leaving the gaps between owned
+ * ranges as free space. Each packed page contributes one range and one bin
+ * update, regardless of how many cells the selected entries own. */
+static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
+                                lc_error *error) {
+  ps_run **link = &s->free;
+  ps_payload_page *page;
+  size_t i;
+  int rc = LC_OK;
+  if (build->count > 1)
+    qsort(build->ranges, build->count, sizeof(*build->ranges),
+          recovery_range_order);
+  for (i = 0; rc == LC_OK && i < build->count; ++i) {
+    const recovery_range *range = &build->ranges[i];
+    while (*link && (*link)->offset + (*link)->bytes <= range->offset)
+      link = &(*link)->next;
+    rc = exclude_selected(link, &s->free_bytes, range->offset, range->bytes,
+                          error);
+  }
+  if (rc == LC_OK)
+    for (page = s->payload_pages; page; page = page->next)
+      payload_available(s, page);
+  return rc;
 }
 static int release_entry_runs(ps_space *s, ps_entry *p, int quarantine,
                               lc_error *error) {
@@ -4520,7 +4590,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             lc_error *error) {
   ps_entry **entries = NULL, *single = NULL;
   replay_change *changes = NULL;
-  size_t i, j, count = 1;
+  size_t i, count = 1;
   int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, rc, retried = 0;
   if (group)
     count = get32(wire + 16);
@@ -4550,8 +4620,7 @@ replay_extents:
   for (i = 0; rc == LC_OK && i < count; ++i) {
     if (staged) {
       /* The complete staged projection can be discarded on error. */
-      for (j = 0; rc == LC_OK && j < entries[i]->count; ++j)
-        rc = payload_claim(s, &entries[i]->extents[j], error);
+      rc = payload_claim_entry(s, entries[i], NULL, error);
     } else
       rc = replay_payload(s, entries[i], &changes, error);
   }
@@ -4890,12 +4959,13 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   unsigned char zero[PS_ROOT_BYTES] = {0};
   unsigned char superblocks[RECOVERY_HEADERS], *wire = NULL;
   recovery_values *values = NULL;
+  payload_rebuild build = {0};
   ps_readiness_certificate certificate;
   const unsigned char *roots[2], *root;
   ps_entry *p = NULL;
   struct stat st;
   uint64_t grant_limit;
-  size_t cursor = 0, bytes, i, first, last;
+  size_t cursor = 0, bytes, first, last;
   int a, b, event, rc, retire_sibling, retirement_needed, range_available;
   int pending_data = 0, grant_slot, moved = 0;
   roots[0] = superblocks;
@@ -5079,15 +5149,15 @@ restart:
    * Reopening must preserve that ownership until a new checkpoint retires the
    * journal; otherwise reuse can make the next replay discard a durable tail.
    */
-  for (p = s->entries; p; p = p->all_next) {
-    for (i = 0; i < p->count; ++i) {
-      rc = payload_claim(s, &p->extents[i], error);
-      if (rc != LC_OK)
-        goto done;
-    }
+  for (p = s->entries; rc == LC_OK && p; p = p->all_next) {
+    rc = payload_claim_entry(s, p, &build, error);
     p->previous = NULL;
   }
-  rc = pins_recover(s, s, error);
+  if (rc == LC_OK)
+    rc = payload_rebuild_free(s, &build, error);
+  lc_free_with_allocator(NULL, build.ranges);
+  if (rc == LC_OK)
+    rc = pins_recover(s, s, error);
   if (rc != LC_OK)
     goto done;
   /* Open built its free map from scratch and queried the physical witnesses
@@ -5448,19 +5518,21 @@ static int projection_stage(ps_space *s, ps_space *v,
                             const ps_readiness_certificate *certificate,
                             lc_error *error) {
   ps_entry *p, *old;
-  size_t i;
+  payload_rebuild build = {0};
   int rc = recover_directory(v, v->journal_image, certificate, s, error);
   if (rc != LC_OK)
     return rc;
   /* The checkpoint prefix covers the resident journal. Consequently only
    * checkpoint entries, including those superseded by the following tail,
    * can match an existing incarnation. Bind them before decoding that tail. */
-  for (p = v->entries; p; p = p->all_next) {
+  for (p = v->entries; rc == LC_OK && p; p = p->all_next) {
     old = p->projection;
     if (old) {
-      if (!projection_same(old, p))
-        return err(error, LC_ERR_PROTOCOL,
-                   "checkpoint changes an existing incarnation");
+      if (!projection_same(old, p)) {
+        rc = err(error, LC_ERR_PROTOCOL,
+                 "checkpoint changes an existing incarnation");
+        break;
+      }
       if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
         p->bytes = old->bytes;
         p->stream_admitted = 0;
@@ -5468,27 +5540,22 @@ static int projection_stage(ps_space *s, ps_space *v,
           dirty_entry(v, p, NULL);
       }
     }
-    for (i = 0; i < p->count; ++i) {
-      rc = payload_claim(v, &p->extents[i], error);
-      if (rc != LC_OK)
-        return rc;
-    }
+    rc = payload_claim_entry(v, p, &build, error);
   }
   /* Overlay only continuously retained ownership. Unpinned old canonical
    * ranges may already have been reused by peers; never retire them here. */
-  for (p = s->entries; p; p = p->all_next) {
+  for (p = s->entries; rc == LC_OK && p; p = p->all_next) {
     if (p->state != 0 && !p->pins && !p->catalog_pins)
       continue;
     old = lookup(v, p->key);
     if (old && old->projection == p)
       continue;
-    for (i = 0; i < p->count; ++i) {
-      rc = payload_claim(v, &p->extents[i], error);
-      if (rc != LC_OK)
-        return rc;
-    }
+    rc = payload_claim_entry(v, p, &build, error);
   }
-  if (s->credit_record)
+  if (rc == LC_OK)
+    rc = payload_rebuild_free(v, &build, error);
+  lc_free_with_allocator(NULL, build.ranges);
+  if (rc == LC_OK && s->credit_record)
     rc = exclude_run(v, s->credit_record->offset, PS_PAGE, error);
   return rc == LC_OK ? projection_pool(v, s->free, error) : rc;
 }

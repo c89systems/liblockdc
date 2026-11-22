@@ -13678,3 +13678,132 @@ single-file and 0.58 and 0.67 ms for multifile. The fixture uses
 
 Raw comparisons, traces, and test logs are under
 `build/pouch-space-concurrent/read-retirement/`.
+
+## Rebuild payload free space in physical order
+
+Checkpoint adoption and open reconstruct the allocator from selected
+ownership. The rebuild accumulates packed cells in one mask per page
+and collects one physical interval per packed page or full extent. It
+sorts those intervals by offset and subtracts them in a forward pass
+from the free intervals left by directory and descriptor discovery.
+Each packed page joins the appropriate allocation bin after its mask
+is complete. Temporary storage scales with the number of owned ranges.
+
+The same sweep rejects whole-range overlaps, including overlaps with
+packed pages and metadata. Packed masks reject duplicate cell ownership.
+Live adoption includes continuously retained readers and producers in
+the same rebuild, then restores private workspace and checks kernel
+witnesses before installation. Open includes superseded versions required
+to replay the accepted journal. Incremental replay still applies claims
+in journal order.
+
+XFS builds free-space records from the gaps between physically ordered
+reverse mappings. Applying that approach to Pouch lets the rebuild walk
+its free intervals once after collecting ownership. [XFS free-space reconstruction design](https://docs.kernel.org/filesystems/xfs/xfs-online-fsck-design.html#case-study-rebuilding-the-free-space-indices),
+[Linux implementation](https://linux.googlesource.com/linux/kernel/git/torvalds/linux/+/36ae1c45b2cede43ab2fc679b450060bbf119f1b/fs/xfs/scrub/alloc_repair.c)
+
+The checkpoint fixture introduces checksum-valid overlapping packed
+cells, overlapping full extents, and packed ownership on a full extent.
+Both reopen and live refresh reject each case. After restoring the
+descriptor, the old resident can adopt and read again. Allocation and
+I/O fault tests exercise rebuild failures with a retained reader and a
+private producer.
+
+In the instrumented 192 MiB NoSync runs, the payload reconstruction
+part of adoption used 1.29 CPU seconds over 840 adoptions for `5f1b47ef`
+and 0.86 seconds over 896 adoptions for the revised build. CPU per
+adoption fell from 1.54 to 0.96 ms. Free-list visits fell from 12.64
+million to 94,880 and packed bin updates fell from 2.99 million to
+213,395. At 96 MiB durable, CPU per adoption fell from 0.90 to 0.52 ms.
+Reconstructing the descriptor directory still took 2.49 CPU seconds in
+the revised 192 MiB run.
+
+All 40 matched workload runs verified. The indexed workloads used
+eight writers, 24 rows, 64 KiB values, and a fixed 10 MiB native root.
+The two native builds ran four pairs each at 96 MiB durable and
+192 MiB NoSync and two pairs each at 96 MiB NoSync and 192 MiB durable.
+One fresh multifile run used each indexed workload. Work and CPU are in
+seconds. Mutation and last-16-round p95 are in milliseconds. Values are
+medians within each build.
+
+| Workload | Build | Work | CPU | Mutation p95 | Late p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 6.73 | 7.02 | 88.56 | 92.17 |
+| 96 MiB NoSync | Ordered rebuild | 6.53 | 6.48 | 82.50 | 90.25 |
+| 96 MiB NoSync | Multifile | 11.81 | 4.96 | 59.55 | 62.57 |
+| 96 MiB durable | Prior | 12.77 | 8.49 | 100.78 | 115.28 |
+| 96 MiB durable | Ordered rebuild | 13.30 | 8.55 | 103.12 | 108.01 |
+| 96 MiB durable | Multifile | 34.62 | 6.14 | 202.49 | 196.78 |
+| 192 MiB NoSync | Prior | 14.83 | 17.13 | 99.07 | 117.63 |
+| 192 MiB NoSync | Ordered rebuild | 14.01 | 17.43 | 90.85 | 136.48 |
+| 192 MiB NoSync | Multifile | 20.11 | 8.99 | 50.10 | 52.49 |
+| 192 MiB durable | Prior | 26.32 | 22.54 | 114.14 | 142.03 |
+| 192 MiB durable | Ordered rebuild | 28.13 | 23.13 | 117.76 | 141.50 |
+| 192 MiB durable | Multifile | 63.99 | 12.09 | 182.90 | 170.77 |
+
+In the four 96 MiB durable pairs, the second run took longer every
+time in both run orders. Those runs also spent more cumulative time
+in sync calls. At 192 MiB NoSync the ordered rebuild reduced median
+elapsed work and index flush time. Median late p95 rose by 19 ms, and
+the largest late p95 coincided with a run that spent 20.04 s in sync
+calls, versus 10.46 s for its paired control. The comparison leaves
+uncertainty about workload-level tail latency.
+
+Index phases report the longest worker in seconds. First-owner open,
+eight live joins, post-open verification, and close are in milliseconds.
+
+| Workload | Build | Index flush | First query | Repeat query | First owner | Joins | Verify | Close |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 96 MiB NoSync | Prior | 1.58 | 0.23 | 0.08 | 15.19 | 26.22 | 17.11 | 18.99 |
+| 96 MiB NoSync | Ordered rebuild | 1.66 | 0.22 | 0.07 | 15.00 | 21.67 | 13.97 | 19.71 |
+| 96 MiB NoSync | Multifile | 3.18 | 2.15 | 2.60 | 0.26 | 1.33 | 27.68 | 2.82 |
+| 96 MiB durable | Prior | 1.59 | 0.12 | 0.03 | 15.06 | 24.03 | 12.97 | 17.34 |
+| 96 MiB durable | Ordered rebuild | 1.66 | 0.14 | 0.03 | 15.00 | 26.21 | 14.66 | 18.61 |
+| 96 MiB durable | Multifile | 3.83 | 5.32 | 7.47 | 0.30 | 1.62 | 28.97 | 2.94 |
+| 192 MiB NoSync | Prior | 3.20 | 0.50 | 0.16 | 29.89 | 34.58 | 20.81 | 26.99 |
+| 192 MiB NoSync | Ordered rebuild | 2.81 | 0.51 | 0.15 | 31.35 | 33.31 | 23.09 | 27.19 |
+| 192 MiB NoSync | Multifile | 5.41 | 3.44 | 4.38 | 0.24 | 1.59 | 42.04 | 3.83 |
+| 192 MiB durable | Prior | 3.04 | 0.33 | 0.06 | 32.83 | 38.91 | 21.49 | 31.03 |
+| 192 MiB durable | Ordered rebuild | 3.34 | 0.35 | 0.07 | 31.07 | 39.97 | 22.53 | 27.09 |
+| 192 MiB durable | Multifile | 7.50 | 10.68 | 13.86 | 0.24 | 1.61 | 41.45 | 3.83 |
+
+Both messaging workloads ran twice per build with two writers.
+Times are medians in milliseconds.
+
+| Workload | Prior work / CPU / p95 | Ordered rebuild work / CPU / p95 | Multifile work / CPU / p95 |
+| --- | ---: | ---: | ---: |
+| Warmed NoSync queue | 8.09 / 13.89 / 1.71 | 8.00 / 13.82 / 1.52 | 69.83 / 24.31 / 14.18 |
+| Durable outbox | 867.69 / 116.79 / 165.74 | 872.52 / 113.67 / 171.76 | 1224.19 / 194.13 / 232.96 |
+
+The eight-lease fixture verified 160 cases across four codec
+configurations, two durability policies, and warm and cold expiry.
+In the five cold plaintext runs per policy, median expiry took 191.36 ms
+NoSync and 216.95 ms durable for single-file, versus 421.69 ms and
+425.47 ms for multifile. Cold opening took 7.47 and 1.54 ms for
+single-file and 0.64 and 0.69 ms for multifile. The fixture uses
+`native=0` for single-file.
+
+The ordered rebuild passed 92 GNU Release groups and 56 each on ASan/UBSan
+and musl Release, including checkpoint and journal recovery, concurrent
+writers, lease authority, queue transactions, outbox recovery, and growth.
+
+A follow-up rotated three native builds at 192 MiB NoSync. The third
+build preserved the prior packed-bin insertion order while keeping the
+new range sweep. All nine runs verified. The regular ordered rebuild
+had the lowest median work, mutation p95, late p95, and index flush of
+the three.
+
+| Build | Work (s) | CPU (s) | Mutation p95 (ms) | Late p95 (ms) | Index flush (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Prior | 15.79 | 18.24 | 102.60 | 135.22 | 3.23 |
+| Ordered rebuild | 14.36 | 17.74 | 92.91 | 114.29 | 2.91 |
+| Prior packed-bin order | 15.19 | 17.39 | 97.48 | 121.83 | 3.06 |
+
+Across all seven 192 MiB NoSync runs per build, median work fell from
+15.73 to 14.17 s, CPU from 17.97 to 17.48 s, and mutation p95 from
+102.60 to 92.91 ms. Late p95 rose from 117.95 to 127.19 ms. It fell in
+three of the seven pairs. This leaves a sustained tail latency gap,
+along with the indexed reopen and CPU gaps against multifile.
+
+Raw comparisons, traces, and test logs are under
+`build/pouch-space-concurrent/ordered-recovery/`.

@@ -2340,6 +2340,11 @@ static void directory_reopen_locality(enum directory_layout layout) {
   }
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void checkpoint_page_checksum(unsigned char *page) {
+  uint32_t crc = (uint32_t)crc32(crc32(0, page, 48), page + 52, PS_PAGE - 52);
+  for (size_t i = 0; i < 4; ++i)
+    page[48 + i] = (unsigned char)(crc >> (8 * i));
+}
 static void reject_descriptor_checksum(ps_directory_value ref) {
   unsigned char original[PS_PAGE], damaged[PS_PAGE];
   off_t page = (off_t)(ref.offset / PS_PAGE * PS_PAGE);
@@ -2352,10 +2357,7 @@ static void reject_descriptor_checksum(ps_directory_value ref) {
   memcpy(damaged, original, sizeof(damaged));
   damaged[at + 60] ^= 1U;
   /* Keep the enclosing page valid. The descriptor has its own checksum. */
-  uint32_t crc =
-      (uint32_t)crc32(crc32(0, damaged, 48), damaged + 52, PS_PAGE - 52);
-  for (size_t i = 0; i < 4; ++i)
-    damaged[48 + i] = (unsigned char)(crc >> (8 * i));
+  checkpoint_page_checksum(damaged);
   REQUIRE(pwrite(fd, damaged, sizeof(damaged), page) == sizeof(damaged));
   REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join);
   REQUIRE(e.message &&
@@ -2364,7 +2366,66 @@ static void reject_descriptor_checksum(ps_directory_value ref) {
   REQUIRE(pwrite(fd, original, sizeof(original), page) == sizeof(original));
   REQUIRE(!fdatasync(fd) && !close(fd));
 }
+static void checkpoint_ownership_overlap(void) {
+  for (int form = 0; form < 3; ++form) {
+    ps_space *writer = NULL, *peer = NULL, *join = NULL;
+    lc_error e = {0};
+    size_t first_bytes = form ? PS_PAGE : 65;
+    size_t second_bytes = form == 1 ? PS_PAGE : 65;
+    ok(ps_open(path, 1, NULL, &writer, &e), &e);
+    ok(ps_open(path, 0, NULL, &peer, &e), &e);
+    uint64_t generation = peer->generation;
+    capture_put(writer, 1, first_bytes);
+    capture_put(writer, 2, second_bytes);
+    ok(ps_checkpoint(writer, &e), &e);
+    const ps_entry *first = ps_internal_lookup(writer, key(1));
+    const ps_entry *second = ps_internal_lookup(writer, key(2));
+    REQUIRE(first && second && first->count == 1 && second->count == 1);
+    uint64_t offset = first->extents[0].offset;
+    const ps_directory_value ref = second->checkpoint_ref;
+    size_t at = (size_t)(ref.offset % PS_PAGE);
+    off_t page = (off_t)(ref.offset - at);
+    unsigned char original[PS_PAGE], damaged[PS_PAGE];
+    REQUIRE(ref.bytes == 88 && at + ref.bytes <= sizeof(original) &&
+            offset != second->extents[0].offset);
+    REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
+            sizeof(original));
+    memcpy(damaged, original, sizeof(damaged));
+    /* Keep the descriptor and enclosing page valid while giving both
+     * descriptors the same physical start. */
+    for (size_t i = 0; i < 8; ++i)
+      damaged[at + 64 + i] = (unsigned char)(offset >> (8 * i));
+    uint32_t crc =
+        (uint32_t)crc32(crc32(0, damaged + at, 60), damaged + at + 64, 24);
+    for (size_t i = 0; i < 4; ++i)
+      damaged[at + 60 + i] = (unsigned char)(crc >> (8 * i));
+    checkpoint_page_checksum(damaged);
+    REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
+            sizeof(damaged));
+    const char *message = form ? "overlapping container ownership"
+                               : "overlapping packed payload ownership";
+    REQUIRE(ps_refresh(peer, &e) == LC_ERR_PROTOCOL &&
+            peer->generation == generation && e.message &&
+            !strcmp(e.message, message));
+    lc_error_cleanup(&e);
+    REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
+            e.message && !strcmp(e.message, message));
+    lc_error_cleanup(&e);
+    REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
+            sizeof(original));
+    ok(ps_refresh(peer, &e), &e);
+    ok(ps_check(peer, &e), &e);
+    ps_reader *reader = NULL;
+    ok(ps_read_open(peer, key(2), NULL, &reader, &e), &e);
+    captured_expect(reader, 2, second_bytes);
+    ps_reader_close(reader);
+    ok(ps_close(peer, &e), &e);
+    ok(ps_close(writer, &e), &e);
+    REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  }
+}
 static void checkpoint_decode(void) {
+  checkpoint_ownership_overlap();
   ps_space *writer = NULL, *join = NULL;
   ps_reader *small = NULL, *large = NULL, *current = NULL;
   lc_error e = {0};
