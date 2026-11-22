@@ -141,6 +141,10 @@ void ps_catalog_free_record(ps_entry *p) {
     p->catalog = NULL;
   }
 }
+int ps_catalog_decode_namespace(ps_entry *p, const void *name, size_t length,
+                                lc_error *e) {
+  return attach_record(p, PS_CATALOG_NAMESPACE, name, length, NULL, 0, e);
+}
 int ps_catalog_copy_record(ps_entry *p, const ps_entry *source, lc_error *e) {
   const ps_catalog_record *r = source->catalog;
   int rc = attach_record(p, r->kind, r->name, r->length, r->value,

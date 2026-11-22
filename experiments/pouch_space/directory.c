@@ -1,4 +1,5 @@
 #include "directory.h"
+#include "catalog.h"
 #include "crc.h"
 #include "lc_api_internal.h"
 #include "owned.h"
@@ -101,18 +102,52 @@ static int valid_root(ps_directory_root root) {
           root.offset <= (uint64_t)INT64_MAX - PS_PAGE && root.generation);
 }
 static int valid_value(ps_key key, const ps_directory_value *value) {
-  const ps_descriptor_ref *ref = &value->ref;
+  const ps_directory_extent *extent = &value->extent;
+  const ps_descriptor_ref *ref = &extent->ref;
+  if (value->tag.storage == PS_DIRECTORY_NAMESPACE)
+    return key.kind == PS_CATALOG && !key.owner && key.key &&
+           value->name.length <= PS_DIRECTORY_NAMESPACE_MAX;
+  if (value->tag.storage == PS_DIRECTORY_STREAM ||
+      value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
+    const ps_directory_stream *stream = &value->stream;
+    return key.kind == PS_STREAM && stream->incarnation &&
+           stream->tail <= stream->capacity && stream->capacity <= INT64_MAX &&
+           (value->tag.storage == PS_DIRECTORY_STREAM || !stream->admitted_at);
+  }
   if (!ref->offset || !ref->bytes || !ref->incarnation ||
       ref->offset > INT64_MAX || ref->bytes > (uint64_t)INT64_MAX - ref->offset)
     return 0;
-  if (value->storage == PS_DIRECTORY_DESCRIPTOR)
-    return !value->crc && !value->deletion_bytes;
-  if (value->storage == PS_DIRECTORY_PACKED_VALUE)
+  if (value->tag.storage == PS_DIRECTORY_DESCRIPTOR)
+    return !extent->crc && !extent->deletion_bytes;
+  if (value->tag.storage == PS_DIRECTORY_PACKED_VALUE)
     return ref->bytes < PS_PAGE && ps_internal_immutable_key(key) &&
-           (key.kind == PS_KEY_METADATA || !value->deletion_bytes);
-  return value->storage == PS_DIRECTORY_OWNED_RUN && key.kind == PS_OWNED_RUN &&
-         !value->deletion_bytes && ref->offset % PS_PAGE == 0 &&
-         ref->bytes % PS_PAGE == 0 && ref->bytes <= PS_MIB;
+           (key.kind == PS_KEY_METADATA || !extent->deletion_bytes);
+  return value->tag.storage == PS_DIRECTORY_OWNED_RUN &&
+         key.kind == PS_OWNED_RUN && !extent->deletion_bytes &&
+         ref->offset % PS_PAGE == 0 && ref->bytes % PS_PAGE == 0 &&
+         ref->bytes <= PS_MIB;
+}
+static int same_value(const ps_directory_value *a,
+                      const ps_directory_value *b) {
+  const ps_directory_extent *x = &a->extent, *y = &b->extent;
+  if (a->tag.storage != b->tag.storage)
+    return 0;
+  if (a->tag.storage == PS_DIRECTORY_NAMESPACE) {
+    const ps_directory_name *name = &a->name, *other = &b->name;
+    return name->length == other->length &&
+           !memcmp(name->bytes, other->bytes, name->length);
+  }
+  if (a->tag.storage == PS_DIRECTORY_STREAM ||
+      a->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
+    const ps_directory_stream *head = &a->stream;
+    const ps_directory_stream *other = &b->stream;
+    return head->tail == other->tail && head->capacity == other->capacity &&
+           head->incarnation == other->incarnation &&
+           head->runs == other->runs && head->admitted_at == other->admitted_at;
+  }
+  return x->ref.offset == y->ref.offset && x->ref.bytes == y->ref.bytes &&
+         x->ref.incarnation == y->ref.incarnation &&
+         x->deletion_bytes == y->deletion_bytes && x->crc == y->crc;
 }
 static int available(ps_directory *d, lc_error *error) {
   return d && !d->failed && !d->flushed
@@ -165,13 +200,40 @@ static int slot_child(const unsigned char *slot, ps_directory_root parent,
 }
 static int slot_value(const unsigned char *slot, ps_key key,
                       ps_directory_value *value) {
-  value->storage = load32(slot + 4);
-  value->ref.offset = load64(slot + 24);
-  value->ref.bytes = load64(slot + 32);
-  value->ref.incarnation = load64(slot + 40);
-  value->crc = load32(slot + 48);
-  value->deletion_bytes = load64(slot + 56);
-  return !load32(slot + 52) && valid_value(key, value);
+  size_t i;
+  uint32_t storage = load32(slot + 4);
+  ps_directory_extent *extent = &value->extent;
+  if (storage == PS_DIRECTORY_NAMESPACE) {
+    if (slot[24] > PS_DIRECTORY_NAMESPACE_MAX)
+      return 0;
+    value->name.storage = storage;
+    value->name.length = slot[24];
+    for (i = 25 + value->name.length; i < SLOT; ++i)
+      if (slot[i])
+        return 0;
+    memcpy(value->name.bytes, slot + 25, PS_DIRECTORY_NAMESPACE_MAX);
+  } else if (storage == PS_DIRECTORY_STREAM ||
+             storage == PS_DIRECTORY_SEALED_STREAM) {
+    ps_directory_stream *stream = &value->stream;
+    if (load32(slot + 52))
+      return 0;
+    stream->storage = storage;
+    stream->tail = load64(slot + 24);
+    stream->capacity = load64(slot + 32);
+    stream->incarnation = load64(slot + 40);
+    stream->runs = load32(slot + 48);
+    stream->admitted_at = load64(slot + 56);
+  } else {
+    if (load32(slot + 52))
+      return 0;
+    extent->storage = storage;
+    extent->ref.offset = load64(slot + 24);
+    extent->ref.bytes = load64(slot + 32);
+    extent->ref.incarnation = load64(slot + 40);
+    extent->crc = load32(slot + 48);
+    extent->deletion_bytes = load64(slot + 56);
+  }
+  return valid_value(key, value);
 }
 static int read_node(ps_directory *d, ps_directory_root ref,
                      directory_node **out, lc_error *error) {
@@ -412,7 +474,7 @@ static int put_node(ps_directory *d, directory_node *node, ps_key key,
   if (!node->level) {
     if (index < node->count &&
         !ps_directory_key_compare(node->items[index].key, key)) {
-      if (memcmp(&node->items[index].binding.value, value, sizeof(*value))) {
+      if (!same_value(&node->items[index].binding.value, value)) {
         node->items[index].binding.value = *value;
         node->dirty = 1;
       }
@@ -783,13 +845,26 @@ static int write_node(ps_directory *d, directory_node *node,
       store64(slot + 32, item->binding.child.ref.generation);
     } else {
       value = &item->binding.value;
-      store64(slot + 24, value->ref.offset);
-      store64(slot + 32, value->ref.bytes);
-      store64(slot + 40, value->ref.incarnation);
-      if (value->storage != PS_DIRECTORY_DESCRIPTOR) {
-        store32(slot + 4, value->storage);
-        store32(slot + 48, value->crc);
-        store64(slot + 56, value->deletion_bytes);
+      store32(slot + 4, value->tag.storage);
+      if (value->tag.storage == PS_DIRECTORY_NAMESPACE) {
+        const ps_directory_name *name = &value->name;
+        slot[24] = name->length;
+        memcpy(slot + 25, name->bytes, name->length);
+      } else if (value->tag.storage == PS_DIRECTORY_STREAM ||
+                 value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
+        const ps_directory_stream *stream = &value->stream;
+        store64(slot + 24, stream->tail);
+        store64(slot + 32, stream->capacity);
+        store64(slot + 40, stream->incarnation);
+        store32(slot + 48, stream->runs);
+        store64(slot + 56, stream->admitted_at);
+      } else {
+        const ps_directory_extent *extent = &value->extent;
+        store64(slot + 24, extent->ref.offset);
+        store64(slot + 32, extent->ref.bytes);
+        store64(slot + 40, extent->ref.incarnation);
+        store32(slot + 48, extent->crc);
+        store64(slot + 56, extent->deletion_bytes);
       }
     }
   }

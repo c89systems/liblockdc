@@ -138,7 +138,7 @@ static ps_key key(uint64_t number) {
 }
 static ps_directory_value value(uint64_t number, uint64_t incarnation) {
   ps_directory_value result = {
-      {PS_DATA + number * 128, 64, incarnation}, 0, 0, 0};
+      .extent.ref = {PS_DATA + number * 128, 64, incarnation}};
   return result;
 }
 static ps_directory *open_directory(ps_directory_io *io,
@@ -153,10 +153,10 @@ static void expect(ps_directory *d, uint64_t number, uint64_t incarnation) {
   OK(ps_directory_get(d, key(number), &actual, &found, &error));
   CHECK(found == (incarnation != 0));
   if (incarnation) {
-    CHECK(actual.ref.offset == wanted.ref.offset &&
-          actual.ref.bytes == wanted.ref.bytes);
-    CHECK(actual.ref.incarnation == incarnation &&
-          actual.storage == PS_DIRECTORY_DESCRIPTOR);
+    CHECK(actual.extent.ref.offset == wanted.extent.ref.offset &&
+          actual.extent.ref.bytes == wanted.extent.ref.bytes);
+    CHECK(actual.extent.ref.incarnation == incarnation &&
+          actual.tag.storage == PS_DIRECTORY_DESCRIPTOR);
   }
 }
 typedef struct scan {
@@ -185,10 +185,10 @@ static int scan_entry(void *v, ps_key k, const ps_directory_value *actual,
   CHECK(!s->count || s->previous < k.key);
   CHECK(s->expected[k.key] != 0);
   wanted = value(k.key, s->expected[k.key]);
-  CHECK(actual->ref.offset == wanted.ref.offset &&
-        actual->ref.bytes == wanted.ref.bytes &&
-        actual->ref.incarnation == wanted.ref.incarnation &&
-        actual->storage == PS_DIRECTORY_DESCRIPTOR);
+  CHECK(actual->extent.ref.offset == wanted.extent.ref.offset &&
+        actual->extent.ref.bytes == wanted.extent.ref.bytes &&
+        actual->extent.ref.incarnation == wanted.extent.ref.incarnation &&
+        actual->tag.storage == PS_DIRECTORY_DESCRIPTOR);
   s->previous = (size_t)k.key;
   ++s->count;
   return LC_OK;
@@ -504,11 +504,11 @@ static void corruption_and_identity(void) {
   root = flush(&p, d, 1, 1);
   d = open_directory(&io, root);
   OK(ps_directory_get(d, wide, &out, &found, &error));
-  CHECK(found && out.ref.incarnation == UINT64_MAX);
+  CHECK(found && out.extent.ref.incarnation == UINT64_MAX);
   OK(ps_directory_get(d, collection, &out, &found, &error));
-  CHECK(found && out.ref.incarnation == 2);
+  CHECK(found && out.extent.ref.incarnation == 2);
   OK(ps_directory_get(d, owner, &out, &found, &error));
-  CHECK(found && out.ref.incarnation == 3);
+  CHECK(found && out.extent.ref.incarnation == 3);
   ps_directory_close(d);
   foreign = io;
   foreign.identity[7] ^= 1;
@@ -648,13 +648,13 @@ static void api_boundaries(void) {
     d = open_directory(&io, empty);
     invalid_value = value(1, 1);
     if (i == 0)
-      invalid_value.ref.offset = 0;
+      invalid_value.extent.ref.offset = 0;
     else if (i == 1)
-      invalid_value.ref.bytes = 0;
+      invalid_value.extent.ref.bytes = 0;
     else if (i == 2)
-      invalid_value.ref.incarnation = 0;
+      invalid_value.extent.ref.incarnation = 0;
     else
-      invalid_value.ref.bytes = UINT64_MAX;
+      invalid_value.extent.ref.bytes = UINT64_MAX;
     BAD(ps_directory_put(d, key(1), invalid_value, &error));
     ps_directory_close(d);
   }

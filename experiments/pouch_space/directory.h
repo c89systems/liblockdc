@@ -3,8 +3,8 @@
 
 #include "space.h"
 
-/* Internal typed checkpoint index. Leaves name descriptors or carry all
- * physical ownership fields of a supported single-extent entry. */
+/* Internal typed checkpoint index. Leaves name descriptors or carry the
+ * complete binding for common ownership and namespace entries. */
 typedef struct ps_directory ps_directory;
 typedef struct ps_directory_root {
   uint64_t offset, generation;
@@ -15,13 +15,32 @@ typedef struct ps_descriptor_ref {
 enum ps_directory_storage {
   PS_DIRECTORY_DESCRIPTOR = 0,
   PS_DIRECTORY_PACKED_VALUE = 1,
-  PS_DIRECTORY_OWNED_RUN = 2
+  PS_DIRECTORY_OWNED_RUN = 2,
+  PS_DIRECTORY_STREAM = 3,
+  PS_DIRECTORY_SEALED_STREAM = 4,
+  PS_DIRECTORY_NAMESPACE = 5
 };
-typedef struct ps_directory_value {
+typedef struct ps_directory_extent {
+  uint32_t storage, crc;
   ps_descriptor_ref ref;
   uint64_t deletion_bytes;
-  uint32_t crc;
+} ps_directory_extent;
+typedef struct ps_directory_stream {
+  uint32_t storage, runs;
+  uint64_t tail, capacity, incarnation, admitted_at;
+} ps_directory_stream;
+#define PS_DIRECTORY_NAMESPACE_MAX 35U
+typedef struct ps_directory_name {
   uint32_t storage;
+  unsigned char length, bytes[PS_DIRECTORY_NAMESPACE_MAX];
+} ps_directory_name;
+typedef union ps_directory_value {
+  struct {
+    uint32_t storage;
+  } tag;
+  ps_directory_extent extent;
+  ps_directory_stream stream;
+  ps_directory_name name;
 } ps_directory_value;
 int ps_internal_immutable_key(ps_key);
 /* read/write transfer exactly one PS_PAGE block; the container handles short

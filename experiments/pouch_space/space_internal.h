@@ -259,6 +259,7 @@ typedef struct ps_catalog_record {
 } ps_catalog_record;
 int ps_catalog_decode_record(ps_entry *, const unsigned char *, size_t,
                              lc_error *);
+int ps_catalog_decode_namespace(ps_entry *, const void *, size_t, lc_error *);
 void ps_catalog_encode_record(unsigned char *, const ps_entry *);
 size_t ps_catalog_record_bytes(const ps_entry *);
 void ps_catalog_free_record(ps_entry *);

@@ -2777,29 +2777,35 @@ static void checkpoint_orphan_run(void) {
   REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
           sizeof(original));
   REQUIRE(original[4] == 0 && original[8] == 2 && original[64] == PS_STREAM &&
+          original[68] == PS_DIRECTORY_STREAM &&
           original[128] == PS_OWNED_RUN &&
           original[132] == PS_DIRECTORY_OWNED_RUN);
   uint64_t generation = peer->generation;
-  for (int invalid_tail = 0; invalid_tail < 2; ++invalid_tail) {
-    const char *message = invalid_tail ? "invalid inline owned run extent"
-                                       : "owned run has no stream head";
+  const char *messages[] = {
+      "owned run has no stream head", "invalid inline owned run extent",
+      "invalid inline stream head", "owned stream capacity mismatch"};
+  for (size_t fault = 0; fault < sizeof(messages) / sizeof(messages[0]);
+       ++fault) {
     memcpy(damaged, original, sizeof(damaged));
-    if (invalid_tail) {
+    if (fault == 1) {
       memset(damaged + 128 + 16, 0xff, 8);
-    } else {
+    } else if (fault == 0) {
       damaged[8] = 1;
       memcpy(damaged + 64, original + 128, 64);
       memset(damaged + 128, 0, 64);
-    }
+    } else if (fault == 2)
+      memset(damaged + 64 + 56, 0xff, 8);
+    else
+      memset(damaged + 64 + 48, 0, 8);
     checkpoint_leaf_checksum(damaged);
     REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
             sizeof(damaged));
     REQUIRE(ps_refresh(peer, &e) == LC_ERR_PROTOCOL &&
             peer->generation == generation && e.message &&
-            !strcmp(e.message, message));
+            !strcmp(e.message, messages[fault]));
     lc_error_cleanup(&e);
     REQUIRE(ps_open(path, 0, NULL, &join, &e) == LC_ERR_PROTOCOL && !join &&
-            e.message && !strcmp(e.message, message));
+            e.message && !strcmp(e.message, messages[fault]));
     lc_error_cleanup(&e);
   }
   REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
@@ -2808,6 +2814,66 @@ static void checkpoint_orphan_run(void) {
   ok(ps_check(peer, &e), &e);
   ok(ps_close(peer, &e), &e);
   ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void checkpoint_namespace_names(void) {
+  unsigned char name[PS_DIRECTORY_NAMESPACE_MAX + 1];
+  unsigned char original[PS_PAGE], damaged[PS_PAGE];
+  const size_t lengths[] = {0, sizeof(name) - 1, sizeof(name)};
+  ps_catalog_info created[3], found;
+  ps_catalog_view *held = NULL, *view = NULL;
+  ps_space *writer = NULL, *peer = NULL, *joint = NULL;
+  ps_key id = {0, 0, PS_CATALOG};
+  lc_error e = {0};
+  memset(name, 0x5a, sizeof(name));
+  name[2] = 0; /* The physical catalog accepts exact binary names. */
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  for (size_t i = 0; i < 3; ++i)
+    ok(ps_catalog_create_namespace(writer, name, lengths[i], &created[i], &e),
+       &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_catalog_get(peer, 0, PS_CATALOG_NAMESPACE, name, lengths[1], &held, &e),
+     &e);
+  REQUIRE(held);
+  ok(ps_checkpoint(writer, &e), &e);
+  off_t page = (off_t)writer->directory.offset;
+  REQUIRE(pread(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  REQUIRE(!original[4] && original[8] == 3 &&
+          original[68] == PS_DIRECTORY_NAMESPACE &&
+          original[132] == PS_DIRECTORY_NAMESPACE &&
+          original[196] == PS_DIRECTORY_DESCRIPTOR);
+  memcpy(damaged, original, sizeof(damaged));
+  damaged[128 + 24] = sizeof(name);
+  checkpoint_leaf_checksum(damaged);
+  REQUIRE(pwrite(writer->fd, damaged, sizeof(damaged), page) ==
+          sizeof(damaged));
+  REQUIRE(ps_open(path, 0, NULL, &joint, &e) == LC_ERR_PROTOCOL && !joint);
+  lc_error_cleanup(&e);
+  REQUIRE(pwrite(writer->fd, original, sizeof(original), page) ==
+          sizeof(original));
+  ok(ps_refresh(peer, &e), &e);
+  ok(ps_catalog_view_info(held, &found, &e), &e);
+  REQUIRE(found.revision.incarnation == created[1].revision.incarnation);
+  ps_catalog_view_close(held);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_open(path, 0, NULL, &joint, &e), &e);
+  for (size_t i = 0; i < 3; ++i) {
+    id.key = created[i].id;
+    REQUIRE((ps_internal_lookup(joint, id)->checkpoint_ref.offset != 0) ==
+            (i == 2));
+    ok(ps_catalog_get(joint, 0, PS_CATALOG_NAMESPACE, name, lengths[i], &view,
+                      &e),
+       &e);
+    REQUIRE(view);
+    ok(ps_catalog_view_info(view, &found, &e), &e);
+    REQUIRE(found.id == id.key &&
+            found.revision.incarnation == created[i].revision.incarnation &&
+            !found.target.incarnation);
+    ps_catalog_view_close(view);
+  }
+  ok(ps_close(joint, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static void checkpoint_prepared_bindings(void) {
@@ -2871,6 +2937,7 @@ static void checkpoint_prepared_bindings(void) {
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
   checkpoint_orphan_run();
+  checkpoint_namespace_names();
   checkpoint_prepared_bindings();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);

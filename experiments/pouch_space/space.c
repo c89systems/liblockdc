@@ -2250,6 +2250,10 @@ static int valid_packed_extent(uint64_t offset, uint64_t bytes) {
   return bytes && bytes < PS_PAGE && offset % PS_CELL == 0 &&
          cell_count(bytes) * PS_CELL <= PS_PAGE - offset % PS_PAGE;
 }
+static int valid_stream_span(uint64_t tail, uint64_t capacity, uint64_t runs) {
+  return tail <= capacity && capacity <= INT64_MAX &&
+         runs <= capacity / (PS_PAGE - PS_RUN_HEADER);
+}
 static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
                         int temporary, ps_entry **out, int *event,
                         lc_error *error) {
@@ -2311,9 +2315,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     p->stream->runs = get64(wire + 72);
     if (flags > STREAM_ADMITTED_FLAG ||
         (*event == PS_SEAL && !p->stream->sealed) ||
-        p->bytes > p->stream->capacity || p->stream->capacity > INT64_MAX ||
-        (!p->stream->capacity && p->stream->runs) ||
-        p->stream->runs > p->stream->capacity / (PS_PAGE - PS_RUN_HEADER))
+        !valid_stream_span(p->bytes, p->stream->capacity, p->stream->runs))
       goto invalid;
     *out = p;
     return LC_OK;
@@ -3354,19 +3356,41 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
   size_t bytes, capacity;
   int rc;
   memset(value, 0, sizeof(*value));
+  if (p->key.kind == PS_STREAM && p->stream->runs <= UINT32_MAX) {
+    ps_directory_stream *stream = &value->stream;
+    stream->storage =
+        p->stream->sealed ? PS_DIRECTORY_SEALED_STREAM : PS_DIRECTORY_STREAM;
+    stream->tail = p->bytes;
+    stream->capacity = p->stream->capacity;
+    stream->incarnation = p->token;
+    stream->runs = (uint32_t)p->stream->runs;
+    /* Match the descriptor's checkpoint sequence for cohort admission. */
+    if (p->stream->admitted && !p->stream->sealed)
+      stream->admitted_at = builder->space->sequence;
+    return LC_OK;
+  }
+  if (p->key.kind == PS_CATALOG && p->catalog->kind == PS_CATALOG_NAMESPACE &&
+      !p->catalog->stream.kind &&
+      p->catalog->length <= PS_DIRECTORY_NAMESPACE_MAX) {
+    ps_directory_name *name = &value->name;
+    name->storage = PS_DIRECTORY_NAMESPACE;
+    name->length = (unsigned char)p->catalog->length;
+    memcpy(name->bytes, p->catalog->name, name->length);
+    return LC_OK;
+  }
   if (p->count == 1) {
     if (ps_internal_immutable_key(p->key) &&
         p->extents[0].flags == EXTENT_PACKED)
-      value->storage = PS_DIRECTORY_PACKED_VALUE;
+      value->extent.storage = PS_DIRECTORY_PACKED_VALUE;
     else if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
-      value->storage = PS_DIRECTORY_OWNED_RUN;
+      value->extent.storage = PS_DIRECTORY_OWNED_RUN;
   }
-  if (value->storage != PS_DIRECTORY_DESCRIPTOR) {
-    value->ref.offset = p->extents[0].offset;
-    value->ref.bytes = p->bytes;
-    value->ref.incarnation = p->token;
-    value->deletion_bytes = p->deletion_bytes;
-    value->crc = p->extents[0].crc;
+  if (value->tag.storage != PS_DIRECTORY_DESCRIPTOR) {
+    value->extent.ref.offset = p->extents[0].offset;
+    value->extent.ref.bytes = p->bytes;
+    value->extent.ref.incarnation = p->token;
+    value->extent.deletion_bytes = p->deletion_bytes;
+    value->extent.crc = p->extents[0].crc;
     return LC_OK;
   }
   /* Inline extents and deletions need no new descriptor reference. Record
@@ -3391,11 +3415,12 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
     builder->wire_capacity = bytes;
   }
   encode_entry(builder->wire, p, builder->space->sequence, PS_PUT);
-  rc = metadata_append(builder, builder->wire, bytes, &value->ref, error);
+  rc =
+      metadata_append(builder, builder->wire, bytes, &value->extent.ref, error);
   if (rc == LC_OK) {
     checkpoint_binding *binding = &builder->bindings[builder->binding_count++];
     binding->entry = p;
-    binding->ref = value->ref;
+    binding->ref = value->extent.ref;
   }
   return rc;
 }
@@ -4320,8 +4345,10 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   return LC_OK;
 }
 static int metadata_physical_order(const void *a, const void *b) {
-  uint64_t left = (*(metadata_directory_entry *const *)a)->value.ref.offset;
-  uint64_t right = (*(metadata_directory_entry *const *)b)->value.ref.offset;
+  uint64_t left =
+      (*(metadata_directory_entry *const *)a)->value.extent.ref.offset;
+  uint64_t right =
+      (*(metadata_directory_entry *const *)b)->value.extent.ref.offset;
   return left < right ? -1 : left != right;
 }
 static int metadata_read_ahead(metadata_recovery *r,
@@ -4334,7 +4361,7 @@ static int metadata_read_ahead(metadata_recovery *r,
   int rc = LC_OK;
   ++r->batch;
   for (i = 0; i < n; ++i) {
-    offset = entries[i]->value.ref.offset / PS_PAGE * PS_PAGE;
+    offset = entries[i]->value.extent.ref.offset / PS_PAGE * PS_PAGE;
     if (count && offset == offsets[count - 1])
       continue;
     if (!metadata_offset(r->space, offset))
@@ -4462,7 +4489,7 @@ static int reuse_directory_entry(metadata_recovery *r,
                                  metadata_directory_entry *item,
                                  lc_error *error) {
   const ps_entry *old = item->resident;
-  ps_descriptor_ref ref = item->value.ref;
+  ps_descriptor_ref ref = item->value.extent.ref;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), remaining = (size_t)ref.bytes;
   ps_entry *p;
@@ -4508,7 +4535,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
                                   metadata_directory_entry *item,
                                   lc_error *error) {
   ps_space *s = recovery->space;
-  ps_descriptor_ref ref = item->value.ref;
+  ps_descriptor_ref ref = item->value.extent.ref;
   const unsigned char *wire = NULL;
   ps_entry *p = NULL;
   ps_entry *old =
@@ -4545,30 +4572,31 @@ static int directory_extent_in_bounds(const ps_space *s,
 }
 static int check_packed_binding(ps_space *s, const ps_directory_value *value,
                                 lc_error *error) {
-  ps_descriptor_ref ref = value->ref;
+  ps_descriptor_ref ref = value->extent.ref;
   if (!directory_extent_in_bounds(s, &ref) ||
       !valid_packed_extent(ref.offset, ref.bytes) ||
-      (value->deletion_bytes > ref.bytes &&
-       value->deletion_bytes - ref.bytes > 512))
+      (value->extent.deletion_bytes > ref.bytes &&
+       value->extent.deletion_bytes - ref.bytes > 512))
     return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
   return LC_OK;
 }
 static void unpack_binding(ps_entry *p, ps_key key,
                            const ps_directory_value *value) {
   p->key = key;
-  p->token = value->ref.incarnation;
-  p->bytes = value->ref.bytes;
+  p->token = value->extent.ref.incarnation;
+  p->bytes = value->extent.ref.bytes;
   p->count = 1;
-  p->extents[0].offset = value->ref.offset;
-  p->extents[0].bytes = value->ref.bytes;
-  p->extents[0].crc = value->crc;
-  p->extents[0].flags =
-      value->storage == PS_DIRECTORY_OWNED_RUN ? EXTENT_OWNED : EXTENT_PACKED;
+  p->extents[0].offset = value->extent.ref.offset;
+  p->extents[0].bytes = value->extent.ref.bytes;
+  p->extents[0].crc = value->extent.crc;
+  p->extents[0].flags = value->tag.storage == PS_DIRECTORY_OWNED_RUN
+                            ? EXTENT_OWNED
+                            : EXTENT_PACKED;
 }
 static int load_owned_binding(metadata_recovery *recovery,
                               metadata_directory_entry *item, lc_error *error) {
   ps_space *s = recovery->space;
-  const ps_descriptor_ref *ref = &item->value.ref;
+  const ps_descriptor_ref *ref = &item->value.extent.ref;
   ps_entry *p,
       *old = recovery->resident ? lookup(recovery->resident, item->key) : NULL;
   /* The directory checked the alignment and extent size. A plain run's
@@ -4586,6 +4614,52 @@ static int load_owned_binding(metadata_recovery *recovery,
   p->projection = old;
   item->decoded = p;
   return LC_OK;
+}
+static int load_stream_binding(metadata_recovery *r,
+                               metadata_directory_entry *item,
+                               lc_error *error) {
+  const ps_directory_stream *stream = &item->value.stream;
+  ps_space *s = r->space;
+  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
+  if (stream->incarnation > s->token_limit ||
+      stream->admitted_at > s->sequence ||
+      !valid_stream_span(stream->tail, stream->capacity, stream->runs))
+    return err(error, LC_ERR_PROTOCOL, "invalid inline stream head");
+  if (old && old->token != stream->incarnation)
+    old = NULL;
+  p = space_entry_new(s, PS_STREAM, 0, old != NULL);
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot recover inline stream head");
+  p->key = item->key;
+  p->token = stream->incarnation;
+  p->bytes = stream->tail;
+  p->stream->capacity = stream->capacity;
+  p->stream->runs = stream->runs;
+  p->stream->sealed = item->value.tag.storage == PS_DIRECTORY_SEALED_STREAM;
+  p->stream->admitted =
+      r->certified_root && stream->admitted_at > r->cohort_origin;
+  p->projection = old;
+  item->decoded = p;
+  return LC_OK;
+}
+static int load_namespace_binding(metadata_recovery *r,
+                                  metadata_directory_entry *item,
+                                  lc_error *error) {
+  const ps_directory_name *name = &item->value.name;
+  ps_space *s = r->space;
+  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
+  if (item->key.key > s->token_limit)
+    return err(error, LC_ERR_PROTOCOL, "invalid inline namespace identity");
+  if (old && old->token != item->key.key)
+    old = NULL;
+  p = space_entry_new(s, PS_CATALOG, 0, old != NULL);
+  if (!p)
+    return err(error, LC_ERR_NOMEM, "cannot recover inline namespace");
+  p->key = item->key;
+  p->token = item->key.key;
+  p->projection = old;
+  item->decoded = p;
+  return ps_catalog_decode_namespace(p, name->bytes, name->length, error);
 }
 static int register_packed_binding(ps_space *s, ps_entry *p,
                                    uint64_t deletion_bytes, lc_error *error) {
@@ -4608,7 +4682,7 @@ static int load_projection_binding(metadata_recovery *r,
   ps_space *s = r->space;
   ps_key key = binding->key;
   const ps_directory_value *value = &binding->value;
-  ps_descriptor_ref ref = value->ref;
+  ps_descriptor_ref ref = value->extent.ref;
   ps_entry *p, *old = binding->resident;
   int rc = check_packed_binding(s, value, error);
   if (rc != LC_OK)
@@ -4617,10 +4691,11 @@ static int load_projection_binding(metadata_recovery *r,
     old = NULL;
   /* The checked leaf gives both identity and content of this descriptor.
    * Borrow only a complete match with no mutable deletion-reserve node. */
-  if (old && projection_borrowed(s, old) && !value->deletion_bytes &&
+  if (old && projection_borrowed(s, old) && !value->extent.deletion_bytes &&
       !old->deletion_bytes && !old->deleted && old->count == 1 &&
       old->bytes == ref.bytes && old->extents[0].offset == ref.offset &&
-      old->extents[0].bytes == ref.bytes && old->extents[0].crc == value->crc &&
+      old->extents[0].bytes == ref.bytes &&
+      old->extents[0].crc == value->extent.crc &&
       old->extents[0].flags == EXTENT_PACKED) {
     rc = payload_claim(s, &old->extents[0], r->payload, error);
     if (rc == LC_OK) {
@@ -4637,7 +4712,7 @@ static int load_projection_binding(metadata_recovery *r,
     return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
   unpack_binding(p, key, value);
   p->projection = old;
-  rc = register_packed_binding(s, p, value->deletion_bytes, error);
+  rc = register_packed_binding(s, p, value->extent.deletion_bytes, error);
   if (rc == LC_OK)
     key_index_add_distinct(&s->keys, p, binding->hash);
   else
@@ -4721,7 +4796,7 @@ static int load_open_binding(ps_space *s, checkpoint_slab *batch, ps_key key,
   p->extents = &slot->extent;
   p->embedded_extents = 1;
   unpack_binding(p, key, value);
-  return register_packed_binding(s, p, value->deletion_bytes, error);
+  return register_packed_binding(s, p, value->extent.deletion_bytes, error);
 }
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
@@ -4755,8 +4830,13 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->value.storage == PS_DIRECTORY_OWNED_RUN)
+    if (item->value.tag.storage == PS_DIRECTORY_OWNED_RUN)
       rc = load_owned_binding(r, item, error);
+    else if (item->value.tag.storage == PS_DIRECTORY_STREAM ||
+             item->value.tag.storage == PS_DIRECTORY_SEALED_STREAM)
+      rc = load_stream_binding(r, item, error);
+    else if (item->value.tag.storage == PS_DIRECTORY_NAMESPACE)
+      rc = load_namespace_binding(r, item, error);
     else if (item->resident)
       rc = reuse_directory_entry(r, item, error);
     else
@@ -4799,10 +4879,9 @@ static int capture_directory_entry(void *v, ps_key key,
                                    lc_error *error) {
   metadata_recovery *r = v;
   metadata_directory_entry *item;
-  ps_descriptor_ref ref = value->ref;
   ps_entry *old = NULL;
   size_t capacity;
-  if (value->storage == PS_DIRECTORY_PACKED_VALUE)
+  if (value->tag.storage == PS_DIRECTORY_PACKED_VALUE)
     return r->resident
                ? collect_projection_binding(r, key, value, error)
                : load_open_binding(r->space, &r->open_slab, key, value, error);
@@ -4817,16 +4896,18 @@ static int capture_directory_entry(void *v, ps_key key,
     r->entries = item;
     r->capacity = capacity;
   }
-  if (value->storage == PS_DIRECTORY_DESCRIPTOR && r->shared_leaf &&
-      ref.incarnation <= r->space->token_limit &&
-      (ps_internal_immutable_key(key) || key.kind == PS_CATALOG)) {
-    old = lookup(r->resident, key);
-    if (old &&
-        (old->deleted || old->dirty_link || old->token != ref.incarnation ||
-         old->checkpoint_ref.incarnation != ref.incarnation ||
-         old->checkpoint_ref.offset != ref.offset ||
-         old->checkpoint_ref.bytes != ref.bytes))
-      old = NULL;
+  if (value->tag.storage == PS_DIRECTORY_DESCRIPTOR && r->shared_leaf) {
+    ps_descriptor_ref ref = value->extent.ref;
+    if (ref.incarnation <= r->space->token_limit &&
+        (ps_internal_immutable_key(key) || key.kind == PS_CATALOG)) {
+      old = lookup(r->resident, key);
+      if (old &&
+          (old->deleted || old->dirty_link || old->token != ref.incarnation ||
+           old->checkpoint_ref.incarnation != ref.incarnation ||
+           old->checkpoint_ref.offset != ref.offset ||
+           old->checkpoint_ref.bytes != ref.bytes))
+        old = NULL;
+    }
   }
   item = &r->entries[r->count++];
   item->key = key;
