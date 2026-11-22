@@ -1,3 +1,4 @@
-# Native Pouch implementation contract
+# Native Pouch implementation
 
-See the [current Pouch Space contract](pouch-space.md).
+- [Current Pouch Space contract](pouch-space.md)
+- [Archived implementation history, tests, and benchmark results](archive/pouch-space-implementation.md)
