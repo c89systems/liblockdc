@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/falloc.h>
+#include <openssl/evp.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -238,6 +239,7 @@ static int initialize_range(ps_space *s, uint64_t offset, uint64_t bytes,
   return LC_OK;
 }
 static int sync_file(ps_space *s, lc_error *error) {
+  uint64_t raw = 0;
   int rc;
   pthread_mutex_lock(&s->sync_io_mutex);
   rc = healthy(s, error);
@@ -245,12 +247,16 @@ static int sync_file(ps_space *s, lc_error *error) {
     pthread_mutex_unlock(&s->sync_io_mutex);
     return rc;
   }
+  if (!s->readiness)
+    raw = __atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE);
   do {
     rc = s->io.sync(s->io.context, s->fd);
   } while (rc < 0 && errno == EINTR);
   __atomic_fetch_add(&s->syncs, 1, __ATOMIC_RELAXED);
   if (rc != 0)
     rc = io_error(s, error, "container sync failed");
+  else if (!s->readiness)
+    __atomic_store_n(&s->exclusive_raw_durable, raw, __ATOMIC_RELEASE);
   pthread_mutex_unlock(&s->sync_io_mutex);
   return rc;
 }
@@ -4094,7 +4100,10 @@ int ps_internal_token_range(ps_space *s, lc_error *error) {
                     0, error);
     if (rc == LC_OK)
       rc = decode_token_limit(s, first, second, &limit, &slot, error);
-    if (rc == LC_OK && limit == certificate.grant_limit)
+    if (rc == LC_OK && !s->readiness && limit != s->token_limit)
+      rc =
+          err(error, LC_ERR_PROTOCOL, "exclusive incarnation frontier changed");
+    if (rc == LC_OK && (!s->readiness || limit == certificate.grant_limit))
       rc = grant_tokens(s, 1 - slot, limit, error);
     else if (rc == LC_OK && limit - certificate.grant_limit <= TOKEN_POOL) {
       s->token_next = certificate.grant_limit + 1;
@@ -4105,7 +4114,7 @@ int ps_internal_token_range(ps_space *s, lc_error *error) {
     if (rc == LC_OK)
       rc = sync_file(s, error);
   }
-  if (rc == LC_OK)
+  if (rc == LC_OK && s->readiness)
     rc = ps_readiness_assign_grant(s, error);
   return allocation_end(s, guard, rc, error);
 }
@@ -5748,6 +5757,127 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
   install(s, p, old);
   return LC_OK;
 }
+#define CLOSE_PROOF_BYTES (2U * PS_READINESS_SLOT_BYTES)
+/* The gap before the tail bounds leaves the second shared commit word zero. */
+#define CLOSE_PROOF_HEADER PS_READINESS_SLOT_BYTES
+#define CLOSE_PROOF_TAIL 16U
+#define CLOSE_PROOF_MAX_TAILS                                                  \
+  ((CLOSE_PROOF_BYTES - PS_CLOSE_PROOF_OFFSET - CLOSE_PROOF_HEADER) /          \
+   CLOSE_PROOF_TAIL)
+static uint32_t close_proof_crc(const unsigned char *record, size_t count) {
+  return (uint32_t)ps_crc32(checksum(record, 92), record + CLOSE_PROOF_HEADER,
+                            (uInt)(count * CLOSE_PROOF_TAIL));
+}
+static int close_proof_hash(const unsigned char *wire, size_t bytes,
+                            unsigned char *hash) {
+  unsigned int size = 0;
+  return EVP_Digest(wire, bytes, hash, &size, EVP_sha256(), NULL) == 1 &&
+         size == 32;
+}
+static int exclusive_raw_covered(const ps_space *s) {
+  return __atomic_load_n(&s->exclusive_raw_durable, __ATOMIC_ACQUIRE) ==
+         __atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE);
+}
+static int close_proof_matches(const ps_space *s, const unsigned char *proof) {
+  return get64(proof) == PS_CLOSE_PROOF_MAGIC &&
+         !memcmp(proof + 8, s->identity, 16) &&
+         get64(proof + 24) == s->generation &&
+         get64(proof + 32) == s->sequence &&
+         get64(proof + 40) == s->token_limit && get64(proof + 48) == s->journal;
+}
+/* Exclusive lifetime authority makes the wire prefix and stream ends stable
+ * at close. The optional proof follows their completed sync. It needs no
+ * barrier of its own and can be lost without losing any acknowledged data. */
+static void exclusive_record_close(ps_space *s) {
+  unsigned char page[CLOSE_PROOF_BYTES] = {0}, *wire = page;
+  const ps_entry *stream;
+  unsigned char *proof = page + PS_CLOSE_PROOF_OFFSET;
+  unsigned char *tail = proof + CLOSE_PROOF_HEADER;
+  size_t i, count = 0;
+  int rc;
+  if (s->readiness || healthy(s, NULL) != LC_OK || !exclusive_raw_covered(s))
+    return;
+  if (__atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) <
+      __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE)) {
+    /* Reinstating proven tails can advance the local clock. If the journal
+     * and raw stream bytes stayed put, the original receipt still applies. */
+    if (close_proof_matches(s, s->close_proof) &&
+        !__atomic_load_n(&s->exclusive_raw_writes, __ATOMIC_ACQUIRE)) {
+      count = get32(s->close_proof + 88);
+      memcpy(proof, s->close_proof,
+             CLOSE_PROOF_HEADER + count * CLOSE_PROOF_TAIL);
+      (void)transfer(s, page, (size_t)(tail - page) + count * CLOSE_PROOF_TAIL,
+                     PS_READINESS_OFFSET, 1, NULL);
+    }
+    return;
+  }
+  for (i = 0; i < BUCKETS; ++i)
+    for (stream = s->stream_buckets[i]; stream; stream = stream->stream->next) {
+      if (!stream->bytes || stream->stream->sealed)
+        continue;
+      if (count == CLOSE_PROOF_MAX_TAILS)
+        return; /* Keep one physical barrier for a larger stream set. */
+      put64(tail, stream->token);
+      put64(tail + 8, stream->bytes);
+      tail += CLOSE_PROOF_TAIL;
+      ++count;
+    }
+  if (s->journal) {
+    wire = lc_alloc_with_allocator(NULL, s->journal);
+    if (!wire)
+      return;
+  }
+  rc = journal_transfer(s, s->journal_start, wire, s->journal, 0, NULL);
+  if (rc == LC_OK && !close_proof_hash(wire, s->journal, proof + 56))
+    rc = LC_ERR_INVALID;
+  if (wire != page)
+    lc_free_with_allocator(NULL, wire);
+  if (rc != LC_OK)
+    return;
+  put64(proof, PS_CLOSE_PROOF_MAGIC);
+  memcpy(proof + 8, s->identity, 16);
+  put64(proof + 24, s->generation);
+  put64(proof + 32, s->sequence);
+  put64(proof + 40, s->token_limit);
+  put64(proof + 48, s->journal);
+  put32(proof + 88, (uint32_t)count);
+  put32(proof + 92, close_proof_crc(proof, count));
+  (void)transfer(s, page, (size_t)(tail - page), PS_READINESS_OFFSET, 1, NULL);
+}
+static int exclusive_open_proof(ps_space *s, const unsigned char *wire,
+                                int clean, int *covered, lc_error *error) {
+  unsigned char page[CLOSE_PROOF_BYTES], hash[32];
+  const unsigned char *proof = page + PS_CLOSE_PROOF_OFFSET;
+  size_t count, bytes;
+  int rc = transfer(s, page, sizeof(page), PS_READINESS_OFFSET, 0, error);
+  if (rc != LC_OK)
+    return rc;
+  count = get32(proof + 88);
+  if (clean && !get64(page) && !get64(page + PS_READINESS_SLOT_BYTES) &&
+      close_proof_matches(s, proof) && count <= CLOSE_PROOF_MAX_TAILS &&
+      get32(proof + 92) == close_proof_crc(proof, count) &&
+      close_proof_hash(wire, s->journal, hash) &&
+      !memcmp(proof + 56, hash, sizeof(hash))) {
+    bytes = CLOSE_PROOF_HEADER + count * CLOSE_PROOF_TAIL;
+    memcpy(s->close_proof, proof, bytes);
+    *covered = 1;
+    /* This opening owns a private copy. Revoke the on-disk receipt before
+     * any producer can touch bytes in a previously covered grant. */
+    memset(page, 0, 8);
+    return transfer(s, page, 8, PS_READINESS_OFFSET + PS_CLOSE_PROOF_OFFSET, 1,
+                    error);
+  }
+  /* A failed cleanup may leave zeros in the page cache. Revoke the old
+   * proof before making those changes so a retry still takes the barrier.
+   * An exclusive transition also revokes certificates from a shared cohort. */
+  if (get64(proof) || get64(page) || get64(page + PS_READINESS_SLOT_BYTES)) {
+    bytes = PS_READINESS_SLOT_BYTES + 8;
+    memset(page, 0, bytes);
+    return transfer(s, page, bytes, PS_READINESS_OFFSET, 1, error);
+  }
+  return LC_OK;
+}
+
 #define RECOVERY_HEADERS                                                       \
   (PS_PAGE + PS_TOKEN_RECORD_OFFSET + PS_TOKEN_RECORD_BYTES)
 
@@ -5829,6 +5959,7 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
   int a, b, event, rc, retire_sibling, retirement_needed, known_grant;
   int pending_data = 0, grant_slot, moved = 0, certified, cold_covered;
+  int exclusive_covered = 0;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
 restart:
@@ -6004,6 +6135,12 @@ restart:
   while (last > first && !wire[last - 1])
     --last;
   retirement_needed = first < last || retire_sibling;
+  if (!s->readiness) {
+    rc = exclusive_open_proof(s, wire, !retirement_needed, &exclusive_covered,
+                              error);
+    if (rc != LC_OK)
+      goto done;
+  }
   /* A process can die with the new selector readable but unsynced. Fence
    * it before erasing bytes needed by a still-valid predecessor. */
   if (a && b && certificate.root < s->generation &&
@@ -6044,9 +6181,10 @@ restart:
    * cohort's allocator ranges and readiness hints do not carry forward. */
   known_grant = ps_readiness_prior_durable(s, &prior) &&
                 prior.grant_limit == s->token_limit;
-  cold_covered = !retirement_needed && known_grant &&
-                 prior.root == s->generation && prior.ready == s->sequence &&
-                 prior.journal_bytes == s->journal && prior.durable >= effect;
+  cold_covered = exclusive_covered ||
+                 (!retirement_needed && known_grant &&
+                  prior.root == s->generation && prior.ready == s->sequence &&
+                  prior.journal_bytes == s->journal && prior.durable >= effect);
   s->peer_durable = certificate.durable;
   if (ps_readiness_joined(s) && certificate.grant_limit != grant_limit) {
     if (certificate.grant_used != certificate.grant_limit ||
@@ -6057,8 +6195,9 @@ restart:
     s->token_next = certificate.grant_limit + 1;
     s->token_end = certificate.grant_limit + TOKEN_RANGE;
   } else if (!ps_readiness_joined(s) && !cold_covered &&
-             (!s->readiness || known_grant ||
-              get64(root + 48) == grant_limit)) {
+             (known_grant || get64(root + 48) == grant_limit)) {
+    /* Only replace the preceding slot when this frontier crossed a known
+     * barrier. A cached refill may otherwise be the only readable slot. */
     rc = grant_tokens(s, 1 - grant_slot, grant_limit, error);
     if (rc != LC_OK)
       goto done;
@@ -6066,7 +6205,7 @@ restart:
   if (cold_covered) {
     /* Ignoring old hints is safe, but does not make their bytes durable.
      * A later crash may reuse their wire positions for canonical data. */
-    s->peer_durable = prior.durable;
+    s->peer_durable = exclusive_covered ? s->sequence : prior.durable;
     s->reused_open_barrier = 1;
   } else if (retirement_needed || certificate.pending ||
              certificate.root != s->generation ||
@@ -6942,6 +7081,7 @@ int ps_close(ps_space *s, lc_error *error) {
                "close container readers, writers, budgets, reserves and "
                "coordination guards first");
   }
+  exclusive_record_close(s);
   pthread_mutex_unlock(&s->mutex);
   destroy(s);
   return LC_OK;
@@ -9977,9 +10117,16 @@ int ps_owned_read(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
                   lc_error *error) {
   return owned_io(run, offset, bytes, n, 0, error);
 }
+static void note_owned_write(ps_space *s, uint64_t bytes, int rc) {
+  if (rc == LC_OK && bytes && !s->readiness)
+    (void)__atomic_add_fetch(&s->exclusive_raw_writes, 1, __ATOMIC_RELEASE);
+}
 int ps_owned_write(ps_owned_run *run, uint64_t offset, const void *bytes,
                    size_t n, lc_error *error) {
-  return owned_io(run, offset, (void *)bytes, n, 1, error);
+  int rc = owned_io(run, offset, (void *)bytes, n, 1, error);
+  if (run)
+    note_owned_write(run->space, n, rc);
+  return rc;
 }
 static int owned_piece_crc(ps_space *s, uint64_t offset, uint64_t length,
                            void *scratch, uint32_t *crc, lc_error *error) {
@@ -10358,9 +10505,11 @@ int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
   if (rc != LC_OK)
     return rc;
   memset(scratch, 0, PS_CHUNK);
-  return initialize_range(
-      run->space, run->entry->extents[0].offset + PS_RUN_HEADER + offset, bytes,
-      scratch, error);
+  rc = initialize_range(run->space,
+                        run->entry->extents[0].offset + PS_RUN_HEADER + offset,
+                        bytes, scratch, error);
+  note_owned_write(run->space, bytes, rc);
+  return rc;
 }
 static int owned_tail_allowed(ps_entry *p, uint64_t tail) {
   return !p->deleted && !p->stream->sealed && tail >= p->bytes &&
@@ -10479,6 +10628,19 @@ int ps_owned_barrier(ps_owned_head *head, lc_error *error) {
 }
 int ps_owned_restore_tail(ps_owned_head *head, uint64_t tail, int advanced,
                           lc_error *error) {
+  const unsigned char *proof = head->space->close_proof;
+  size_t count, i;
+  if (advanced && !head->space->readiness && head->space->reused_open_barrier) {
+    if (!exclusive_raw_covered(head->space))
+      return ps_owned_recovered(head, tail, error);
+    count = get32(proof + 88);
+    proof += CLOSE_PROOF_HEADER;
+    for (i = 0; i < count; ++i, proof += CLOSE_PROOF_TAIL)
+      if (get64(proof) == head->entry->token && get64(proof + 8) >= tail)
+        break;
+    if (i == count)
+      return ps_owned_recovered(head, tail, error);
+  }
   if (advanced && ps_readiness_reused_open_barrier(head->space))
     return ps_owned_recovered(head, tail, error);
   return ps_owned_commit(head, tail, PS_COMMIT_DEFER_SYNC, NULL, NULL, error);

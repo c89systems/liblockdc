@@ -42,9 +42,10 @@ boundaries before admitting complete canonical publication groups. Before
 admitting a cold namespace for writes, recovery checks for complete records past
 the selected stream tail and restores their outstanding capacity obligations.
 After validating the recovered prefix, the first owner can reuse proof from
-a previous durability barrier. Newly discovered stream records cross a
-barrier before the recovered tail becomes visible. Shared owners acquire an
-incarnation range when they first need a persistent identity.
+a previous durability barrier. A clean exclusive close can record that
+proof for the exact journal and a bounded set of stream tails. Newly
+discovered records outside the proof cross a barrier before visibility.
+Owners that reopen using a proof acquire an incarnation range on first use.
 
 Private preparation reserves payload and descriptor capacity before spending it.
 Publication revalidates its logical authority. Producers run outside

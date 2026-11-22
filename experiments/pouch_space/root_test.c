@@ -631,7 +631,7 @@ static void catalog(const char *path) {
 
 typedef struct model {
   unsigned char *stable;
-  size_t stable_bytes, calls, fail_at, reads, fail_read;
+  size_t stable_bytes, calls, fail_at, reads, fail_read, syncs;
   int tear, persist_torn, hold, entered, released, publications;
   int fail_held_sync;
   pthread_mutex_t mutex;
@@ -673,6 +673,7 @@ static int sync_file(void *v, int fd) {
   model *m = v;
   int failed = fail(m);
   struct stat st;
+  (void)__atomic_add_fetch(&m->syncs, 1, __ATOMIC_RELAXED);
   pthread_mutex_lock(&m->mutex);
   if (m->hold && !m->entered) {
     m->entered = 1;
@@ -1059,8 +1060,10 @@ static void concurrency(const char *path, int same_name, int durable,
   REQUIRE(m.calls == calls && m.reads == reads);
   ps_namespace_release(cached);
   m.fail_at = m.fail_read = 0;
+  size_t syncs = m.syncs;
   ok(ps_root_close(root, &e), &e);
-  REQUIRE(m.calls == calls && m.reads == reads);
+  /* A quiescent close can record one advisory proof of prior durability. */
+  REQUIRE(m.calls <= calls + 1 && m.reads <= reads + 1 && m.syncs == syncs);
   REQUIRE(unlink(path) == 0);
   model_close(&m);
   lc_error_cleanup(&e);

@@ -1086,7 +1086,7 @@ static void shared_pool_power_loss(void) {
 }
 
 /* Recovery must invalidate every rejected byte before reusing journal
- * sequences, while a clean open need only persist its incarnation grant.
+ * sequences. A proved clean open only consumes its close receipt.
  * Fixtures retain valid payloads for a stale event hidden behind a zero gap:
  * clearing just that gap would resurrect the event on the next reopen. */
 static ps_ref reopen_sanitize_fixture(model *m, const ps_io *io, int durable,
@@ -1181,11 +1181,11 @@ static size_t reopen_sanitize_case(int durable, int layout, size_t fail_at,
     OK(rc);
     /* This is an I/O bound, not an on-disk encoding assertion. Cleanup must
      * not dirty a clean 128 KiB journal or an already retired root. */
-    CHECK(m.syncs == (layout == 4 ? 2U : 1U));
+    CHECK(m.syncs == (layout == 4 ? 2U : layout != 0));
     if (layout == 0)
-      CHECK(m.writes == 1 && m.write_bytes <= PS_PAGE);
+      CHECK(m.writes == 1 && m.write_bytes == 8);
     else if (layout == 1 || layout == 4 || layout == 5)
-      CHECK(m.writes <= 2 && m.write_bytes <= PS_PAGE);
+      CHECK(m.writes <= 3 && m.write_bytes <= PS_PAGE);
     printf("reopen cleanup: durable=%d layout=%d writes=%zu bytes=%llu "
            "syncs=%zu\n",
            durable, layout, m.writes, (unsigned long long)m.write_bytes,
@@ -1233,7 +1233,7 @@ static void reopen_sanitization(void) {
   for (int durable = 0; durable < 2; ++durable)
     for (int layout = 0; layout < 6; ++layout) {
       size_t n = reopen_sanitize_case(durable, layout, 0, 0);
-      CHECK(n >= 2);
+      CHECK(n >= (layout == 0 ? 1U : 2U));
       sites += n;
       for (size_t nth = 1; nth <= n; ++nth)
         for (int torn = 0; torn < 2; ++torn)
@@ -1304,9 +1304,12 @@ static void reopen_cleanup_ordering(void) {
         }
         m.grants = 0;
         m.persist_grants = m.fail_grant_sync = 1;
+        if (hot_retry)
+          m.fail_sync_at = m.syncs + 1;
         CHECK(ps_open(path, 0, &options, &s, &error) == LC_ERR_TRANSPORT && !s);
-        CHECK(m.grants == 1);
+        CHECK(m.grants == (hot_retry ? 0U : 1U));
         lc_error_cleanup(&error);
+        m.fail_sync_at = 0;
         m.persist_grants = m.fail_grant_sync = 0;
         crash(&m);
         OK(ps_open(path, 0, &options, &s, &error));
@@ -1323,8 +1326,8 @@ static void reopen_cleanup_ordering(void) {
         free(m.stable);
         clean();
       }
-  puts("reopen ordering: 8 independently persisted grants preserve the "
-       "journal sequence across stale PUT/DELETE and cached-zero retries");
+  puts("reopen ordering: isolated grants and cached-zero retries preserve "
+       "the stable journal across abandoned PUT and DELETE records");
 }
 
 typedef struct commit_gate {
@@ -2953,6 +2956,107 @@ static void stream_expect(ps_stream *s, uint64_t start, const void *bytes,
   ps_stream_reader_close(r);
 }
 
+enum close_proof_case {
+  CLOSE_PROOF_COVERED,
+  CLOSE_PROOF_TORN,
+  CLOSE_PROOF_ADVANCED,
+  CLOSE_PROOF_SHARED_SWITCH
+};
+static void exclusive_close_recovery(enum close_proof_case mode) {
+  const char body[] = "covered";
+  model m;
+  ps_io io = model_init_capacity(&m, PS_DEFAULT_CAPACITY);
+  ps_options options = {0};
+  ps_space *space = create(PS_DEFAULT_CAPACITY, 1, &io);
+  ps_stream *stream = stream_open(space, 1, 1, NULL, NULL);
+  ps_stream_info info;
+  uint64_t start, id = 0, next;
+  size_t syncs;
+  options.io = &io;
+  options.durable_sync = 1;
+  OK(canonical_append(stream, body, sizeof(body), 3, 1, &start, &error));
+  OK(ps_stream_status(stream, &info, &error));
+  OK(ps_stream_close(stream, &error));
+  ps_key grant = {info.ref.incarnation, 0, PS_OWNED_RUN};
+  ps_entry *run = ps_internal_lookup(space, grant);
+  CHECK(run && run->count == 1 && run->extents[0].bytes >= 2 * info.tail);
+  uint64_t suffix = run->extents[0].offset + PS_RUN_HEADER + info.tail;
+  if (mode == CLOSE_PROOF_TORN) {
+    m.fail_at = m.operations + 1;
+    m.tear = m.persist_torn = 1;
+  }
+  syncs = m.syncs;
+  OK(ps_close(space, &error));
+  CHECK(m.syncs == syncs);
+  m.fail_at = 0;
+  if (mode == CLOSE_PROOF_TORN)
+    crash(&m);
+  if (mode == CLOSE_PROOF_ADVANCED) {
+    lc_pouch_record_header header = {0};
+    unsigned char frame[43 + sizeof(body)];
+    header.type = 1;
+    header.key_len = 3;
+    header.meta_len = 8;
+    header.payload_len = sizeof(body);
+    header.payload_crc = crc32(0, (const unsigned char *)body, sizeof(body));
+    lc_pouch_record_header_encode(&header, frame);
+    memcpy(frame + 32, "key", 3);
+    fixture_put(frame + 35, 2, 8);
+    memcpy(frame + 43, body, sizeof(body));
+    /* This complete record has reached the cache since the receipt's
+     * covered tail. The physical journal and its exact fingerprint match. */
+    int fd = open(path, O_RDWR);
+    CHECK(fd >= 0 &&
+          pwrite(fd, frame, sizeof(frame), (off_t)suffix) == sizeof(frame));
+    CHECK(close(fd) == 0);
+  }
+  options.shared = mode == CLOSE_PROOF_SHARED_SWITCH;
+  OK(ps_open(path, 0, &options, &space, &error));
+  CHECK(m.syncs == syncs + (mode == CLOSE_PROOF_TORN || options.shared));
+  if (mode == CLOSE_PROOF_ADVANCED) {
+    m.fail_sync_at = m.syncs + 1;
+    CHECK(ps_stream_open(space, NULL, stream_key(1), 0, &info.ref,
+                         canonical_recover, NULL, &stream,
+                         &error) == LC_ERR_TRANSPORT &&
+          !stream && m.syncs == syncs + 1);
+    lc_error_cleanup(&error);
+    m.fail_sync_at = 0;
+  } else {
+    stream = stream_open(space, 1, 0, &info.ref, NULL);
+    stream_expect(stream, start, body, sizeof(body), 1);
+    OK(ps_stream_close(stream, &error));
+    if (mode == CLOSE_PROOF_COVERED) {
+      CHECK(m.syncs == syncs);
+      m.fail_sync_at = m.syncs + 1;
+      CHECK(ps_catalog_allocate_id(space, &id, &error) == LC_ERR_TRANSPORT &&
+            !id && m.syncs == syncs + 1);
+      lc_error_cleanup(&error);
+      OK(ps_close(space, &error));
+      /* The new slot is readable in the cache and its sync failed. A
+       * failing retry must leave the preceding durable slot untouched. */
+      m.fail_sync_at = m.syncs + 1;
+      size_t writes = m.writes;
+      CHECK(ps_open(path, 0, &options, &space, &error) == LC_ERR_TRANSPORT &&
+            !space && m.writes == writes);
+      lc_error_cleanup(&error);
+      m.fail_sync_at = 0;
+    }
+  }
+  OK(ps_close(space, &error));
+  if (!options.shared)
+    crash(&m);
+  options.shared = 0;
+  OK(ps_open(path, 0, &options, &space, &error));
+  stream = stream_open(space, 1, 0, &info.ref, NULL);
+  stream_expect(stream, start, body, sizeof(body), 1);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_catalog_allocate_id(space, &next, &error));
+  CHECK(next > info.ref.incarnation);
+  OK(ps_close(space, &error));
+  free(m.stable);
+  clean();
+}
+
 static void canonical_stream_exact_reservations(void) {
   const size_t spans[] = {4031,  4032,  4033,  20351, 20352,
                           20353, 85823, 85824, 85825};
@@ -4075,7 +4179,7 @@ static void canonical_stream_invalid_metadata(void) {
   ps_stream *stream = NULL;
   unsigned char roots[PS_ROOT_BYTES], *page = malloc(PS_PAGE), body[64] = {0};
   unsigned char *record;
-  uint64_t start, ref, offset;
+  uint64_t start, offset;
   uint32_t crc;
   size_t phase;
   int fd;
@@ -4094,24 +4198,19 @@ static void canonical_stream_invalid_metadata(void) {
       CHECK(pread(fd, roots, sizeof(roots), 0) == (ssize_t)sizeof(roots));
       offset = fixture_get64(roots + 32);
       CHECK(pread(fd, page, PS_PAGE, (off_t)offset) == PS_PAGE);
-      ref = fixture_get64(page + 64 + 24); /* typed stream head, sorted first */
-      offset = ref / PS_PAGE * PS_PAGE;
-      CHECK(pread(fd, page, PS_PAGE, (off_t)offset) == PS_PAGE);
-      record = page + ref % PS_PAGE;
-      CHECK(record[16] == PS_STREAM);
+      record = page + 64; /* The checkpoint stores the stream head inline. */
+      CHECK(record[0] == PS_STREAM && record[4] == PS_DIRECTORY_STREAM);
       if (phase == 0)
-        fixture_put(record + 48, PS_MIB, 8); /* tail beyond owned capacity */
+        fixture_put(record + 24, PS_MIB, 8); /* tail beyond owned capacity */
       else if (phase == 1) {
-        fixture_put(record + 64, 2 * (PS_PAGE - PS_RUN_HEADER), 8);
-        fixture_put(record + 72, 2,
+        fixture_put(record + 32, 2 * (PS_PAGE - PS_RUN_HEADER), 8);
+        fixture_put(record + 48, 2,
                     8); /* valid scalars, nonexistent second grant */
       } else
-        fixture_put(record + 64, PS_PAGE - PS_RUN_HEADER - 1,
+        fixture_put(record + 32, PS_PAGE - PS_RUN_HEADER - 1,
                     8); /* a present run extends beyond the logical span */
-      crc = (uint32_t)crc32(0, record, 60);
-      fixture_put(record + 60, crc32(crc, record + 64, 16), 4);
-      crc = (uint32_t)crc32(0, page, 48);
-      fixture_put(page + 48, crc32(crc, page + 52, PS_PAGE - 52), 4);
+      crc = (uint32_t)crc32(0, page, 12);
+      fixture_put(page + 12, crc32(crc, page + 16, PS_PAGE - 16), 4);
       CHECK(pwrite(fd, page, PS_PAGE, (off_t)offset) == PS_PAGE);
     } else {
       CHECK(pread(fd, page, 1, PS_DATA) == 1);
@@ -7734,6 +7833,10 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[2], "reopen-ordering") == 0) {
       reopen_cleanup_ordering();
       shared_pool_power_loss();
+      exclusive_close_recovery(CLOSE_PROOF_COVERED);
+      exclusive_close_recovery(CLOSE_PROOF_TORN);
+      exclusive_close_recovery(CLOSE_PROOF_ADVANCED);
+      exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH);
     } else if (strcmp(argv[2], "reopen-sanitize") == 0)
       reopen_sanitization();
     else if (strcmp(argv[2], "reopen") == 0)

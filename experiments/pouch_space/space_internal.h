@@ -169,6 +169,8 @@ struct ps_space {
   uint64_t token_next, token_end, token_limit;
   uint64_t writer_id;
   int reused_open_barrier;
+  unsigned char close_proof[2U * PS_READINESS_SLOT_BYTES];
+  uint64_t exclusive_raw_writes, exclusive_raw_durable;
   /* Observed control journal for shared revision comparison, never bodies. */
   unsigned char *journal_image;
   /* Monotonic byte position selected by the root. The resident buffer and
