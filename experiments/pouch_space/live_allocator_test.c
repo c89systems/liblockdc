@@ -2651,12 +2651,79 @@ static void checkpoint_packed_bindings(int durable) {
   ok(ps_close(join, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void checkpoint_open_slab_reuse(int durable) {
+  lc_error e = {0};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *joined = NULL;
+  ps_reader *pinned = NULL, *reader = NULL;
+  ps_key slot = {123, 1, PS_KEY_METADATA};
+  size_t sites = 0;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  /* Cross two full slabs and leave one partially filled. The second slab
+   * also contains a predecessor that the initial journal replay retires. */
+  for (slot.key = 1; slot.key <= 65; ++slot.key)
+    capture_put_key(writer, slot, 65);
+  ok(ps_checkpoint(writer, &e), &e);
+  slot.key = 33;
+  capture_put_key(writer, slot, 129);
+  ok(ps_flush(writer, &e), &e);
+  for (size_t cut = 0; cut <= sites; ++cut) {
+    allocations = 0;
+    allocation_fail = cut;
+    measuring = 1;
+    int rc = ps_open(path, 0, &options, &joined, &e);
+    measuring = 0;
+    if (!cut) {
+      ok(rc, &e);
+      sites = allocations;
+      ok(ps_close(joined, &e), &e);
+      joined = NULL;
+    } else {
+      REQUIRE(rc == LC_ERR_NOMEM && !joined);
+      lc_error_cleanup(&e);
+    }
+  }
+  REQUIRE(sites);
+  ok(ps_open(path, 0, &options, &joined, &e), &e);
+  slot.key = 1;
+  ok(ps_read_open(joined, slot, NULL, &pinned, &e), &e);
+  for (slot.key = 1; slot.key <= 32; ++slot.key)
+    ok(ps_delete(joined, slot, &e), &e);
+  slot.key = 66;
+  capture_put_key(joined, slot, 193);
+  ok(ps_checkpoint(joined, &e), &e);
+  captured_expect(pinned, 1, 65);
+  ps_reader_close(pinned);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_close(joined, &e), &e);
+  ok(ps_open(path, 0, &options, &joined, &e), &e);
+  for (slot.key = 1; slot.key <= 32; ++slot.key) {
+    ps_ref ref;
+    uint64_t bytes;
+    int present;
+    ok(ps_value_info(joined, slot, &ref, &bytes, &present, &e), &e);
+    REQUIRE(!present);
+  }
+  for (slot.key = 33; slot.key <= 66; ++slot.key) {
+    ok(ps_read_open(joined, slot, NULL, &reader, &e), &e);
+    captured_expect(reader, (unsigned char)slot.key,
+                    slot.key == 33   ? 129
+                    : slot.key == 66 ? 193
+                                     : 65);
+    ps_reader_close(reader);
+  }
+  ok(ps_check(joined, &e), &e);
+  ok(ps_close(joined, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);
   checkpoint_packed_bindings(0);
   checkpoint_packed_bindings(1);
+  checkpoint_open_slab_reuse(0);
+  checkpoint_open_slab_reuse(1);
   checkpoint_startup_seed(0);
   checkpoint_startup_seed(1);
   ps_space *writer = NULL, *join = NULL;

@@ -4433,19 +4433,38 @@ static int decode_directory_entry(metadata_recovery *recovery,
     ps_internal_entry_free(p);
   return rc;
 }
-static int decode_packed_binding(metadata_recovery *r,
-                                 metadata_directory_entry *item,
-                                 lc_error *error) {
-  ps_space *s = r->space;
-  const ps_directory_value *value = &item->value;
+static int check_packed_binding(ps_space *s, const ps_directory_value *value,
+                                lc_error *error) {
   ps_descriptor_ref ref = value->ref;
-  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
   if (ref.incarnation > s->token_limit || ref.offset < PS_DATA ||
       ref.offset > s->capacity || ref.bytes > s->capacity - ref.offset ||
       !valid_packed_extent(ref.offset, ref.bytes) ||
       (value->deletion_bytes > ref.bytes &&
        value->deletion_bytes - ref.bytes > 512))
     return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
+  return LC_OK;
+}
+static void unpack_binding(ps_entry *p, const metadata_directory_entry *item) {
+  const ps_directory_value *value = &item->value;
+  p->key = item->key;
+  p->token = value->ref.incarnation;
+  p->bytes = value->ref.bytes;
+  p->count = p->capacity = 1;
+  p->extents[0].offset = value->ref.offset;
+  p->extents[0].bytes = value->ref.bytes;
+  p->extents[0].crc = value->crc;
+  p->extents[0].flags = EXTENT_PACKED;
+}
+static int decode_packed_binding(metadata_recovery *r,
+                                 metadata_directory_entry *item,
+                                 lc_error *error) {
+  ps_space *s = r->space;
+  const ps_directory_value *value = &item->value;
+  ps_descriptor_ref ref = value->ref;
+  ps_entry *p, *old = lookup(r->resident, item->key);
+  int rc = check_packed_binding(s, value, error);
+  if (rc != LC_OK)
+    return rc;
   if (old && old->token != ref.incarnation)
     old = NULL;
   /* The checked leaf gives both identity and content of this descriptor.
@@ -4463,20 +4482,57 @@ static int decode_packed_binding(metadata_recovery *r,
   p = space_entry_new(s, item->key.kind, 1, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot allocate packed directory entry");
-  p->key = item->key;
-  p->token = ref.incarnation;
-  p->bytes = ref.bytes;
-  p->count = p->capacity = 1;
-  p->extents[0].offset = ref.offset;
-  p->extents[0].bytes = ref.bytes;
-  p->extents[0].crc = value->crc;
-  p->extents[0].flags = EXTENT_PACKED;
+  unpack_binding(p, item);
   p->projection = old;
   item->decoded = p;
   return ps_internal_reserve_entry(p, value->deletion_bytes, error);
 }
+typedef struct checkpoint_slab {
+  ps_entry_allocation *block;
+  unsigned int next;
+} checkpoint_slab;
+/* The checked directory remains the packed representation until installation.
+ * New owners build each slab in directory order before journal replay. A slot
+ * can subsequently retire or be reused independently of the rest of its slab.
+ */
+static int install_open_binding(ps_space *s, checkpoint_slab *batch,
+                                const metadata_directory_entry *item,
+                                lc_error *error) {
+  ps_entry_allocation *block = batch->block;
+  ps_entry_slab_slot *slot;
+  ps_entry *p;
+  unsigned int index;
+  int rc;
+  if (!block || batch->next == ENTRY_SLAB_SLOTS) {
+    block = lc_calloc_with_allocator(
+        NULL, 1, sizeof(*block) + ENTRY_SLAB_SLOTS * sizeof(*slot));
+    if (!block)
+      return err(error, LC_ERR_NOMEM, "cannot allocate checkpoint entry slab");
+    block->owner = s;
+    entry_allocation_register(s, block);
+    batch->block = block;
+    batch->next = 0;
+  }
+  index = batch->next++;
+  block->used |= UINT64_C(1) << index;
+  slot = (ps_entry_slab_slot *)(block + 1) + index;
+  p = &slot->entry;
+  p->allocation = block;
+  p->extents = &slot->extent;
+  p->embedded_extents = 1;
+  unpack_binding(p, item);
+  if (item->value.deletion_bytes) {
+    rc = ps_internal_reserve_entry(p, item->value.deletion_bytes, error);
+    if (rc != LC_OK)
+      return rc;
+  }
+  register_entry(s, p);
+  install(s, p, NULL);
+  return LC_OK;
+}
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
+  checkpoint_slab batch = {0};
   metadata_directory_entry **fetch;
   ps_key_slot *slot;
   ps_entry *p;
@@ -4491,7 +4547,8 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
     if (item->value.packed) {
-      rc = decode_packed_binding(r, item, error);
+      rc = r->resident ? decode_packed_binding(r, item, error)
+                       : check_packed_binding(s, &item->value, error);
     } else if (item->resident) {
       rc = reuse_directory_entry(r, item, error);
     } else
@@ -4512,6 +4569,12 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   if (rc != LC_OK)
     return rc;
   for (i = 0; i < r->count; ++i) {
+    if (!r->resident && r->entries[i].value.packed) {
+      rc = install_open_binding(s, &batch, &r->entries[i], error);
+      if (rc != LC_OK)
+        return rc;
+      continue;
+    }
     p = r->entries[i].decoded;
     /* The directory walk checked that every binding key is distinct. */
     if (!p) {
@@ -4540,6 +4603,9 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     register_entry(s, p);
     install(s, p, NULL);
   }
+  /* Only the final slab can have unused slots. Publish them after the scan. */
+  if (batch.block && batch.next < ENTRY_SLAB_SLOTS)
+    entry_available_link(batch.block);
   return LC_OK;
 }
 static int capture_directory_entry(void *v, ps_key key,
