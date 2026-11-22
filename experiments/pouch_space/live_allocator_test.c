@@ -2765,9 +2765,67 @@ static void checkpoint_orphan_run(void) {
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+static void checkpoint_prepared_bindings(void) {
+  lc_error e = {0};
+  ps_space *writer = NULL, *peer = NULL;
+  ps_reader *old = NULL, *latest = NULL;
+  const ps_key packed = {88, 2, PS_KEY_DECISION};
+  size_t replacement = 3 * PS_CHUNK + 65;
+  int partial = 0;
+  ok(ps_open(path, 1, NULL, &writer, &e), &e);
+  for (uint64_t id = 1; id <= 68; ++id)
+    capture_put(writer, id, 65);
+  capture_put_key(writer, packed, 65);
+  ok(ps_metadata_repack(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_read_open(peer, key(1), NULL, &old, &e), &e);
+  ps_descriptor_ref prior = ps_internal_lookup(writer, key(1))->checkpoint_ref;
+  uint64_t generation = writer->generation;
+  capture_put(writer, 1, replacement);
+  ok(ps_delete(writer, key(2), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+  for (size_t cut = 1;; ++cut) {
+    uint64_t writes = writer->descriptor_page_writes;
+    allocations = 0;
+    allocation_fail = cut;
+    measuring = 1;
+    int rc = ps_metadata_repack(writer, &e);
+    measuring = 0;
+    if (rc == LC_OK)
+      break;
+    REQUIRE(rc == LC_ERR_NOMEM && writer->generation == generation);
+    ps_descriptor_ref retained =
+        ps_internal_lookup(writer, key(1))->checkpoint_ref;
+    REQUIRE(retained.offset == prior.offset && retained.bytes == prior.bytes &&
+            retained.incarnation == prior.incarnation);
+    partial |= writer->descriptor_page_writes > writes;
+    lc_error_cleanup(&e);
+  }
+  REQUIRE(partial && writer->generation == generation + 1);
+  captured_expect(old, 1, 65);
+  ps_reader_close(old);
+  ok(ps_close(peer, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  ok(ps_read_open(peer, key(1), NULL, &latest, &e), &e);
+  captured_expect(latest, 1, replacement);
+  ps_reader_close(latest);
+  ps_ref ref;
+  uint64_t bytes;
+  int present;
+  ok(ps_value_info(peer, key(2), &ref, &bytes, &present, &e), &e);
+  REQUIRE(!present);
+  ok(ps_read_open(peer, packed, NULL, &latest, &e), &e);
+  captured_expect(latest, 2, 65);
+  ps_reader_close(latest);
+  ok(ps_check(peer, &e), &e);
+  ok(ps_close(peer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
 static void checkpoint_decode(void) {
   checkpoint_ownership_overlap();
   checkpoint_orphan_run();
+  checkpoint_prepared_bindings();
   checkpoint_binding_reuse(0);
   checkpoint_binding_reuse(1);
   checkpoint_packed_bindings(0);

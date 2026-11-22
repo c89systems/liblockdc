@@ -54,10 +54,14 @@ typedef struct ps_extent {
 typedef struct ps_mapped_range {
   uint64_t offset, bytes, data;
 } ps_mapped_range;
+typedef struct ps_writer_stamp {
+  uint64_t token, generation;
+} ps_writer_stamp;
 /* Stream heads and owned runs need state that ordinary values never use.
  * This state shares an allocation and lifetime with its descriptor. */
 typedef struct ps_stream_state {
   uint64_t capacity, runs, ready, wire;
+  ps_writer_stamp writer;
   uint64_t edit_wire, complete_generation, structure_wire;
   uint64_t storage; /* derived selected mappings, excluding pinned old ones */
   ps_mapped_range *ranges;
@@ -80,28 +84,26 @@ typedef struct ps_entry {
   uint64_t publication_sequence;
   uint64_t
       peer_sequence; /* imported visibility uses the certified wire clock */
-  uint64_t writer_stamp, writer_generation;
+  uint8_t embedded_extents;
+  uint8_t durable_visibility; /* pending revision uses completed prefix */
+  int8_t value_checked; /* transient immutable-payload validation: 0 unknown */
+  uint8_t payload_claimed, reader_claimed;
+  uint8_t state, safe, deleted; /* state: 0 private, 1 live, 2 retired */
   ps_stream_state *stream;
-  int embedded_extents;
-  int durable_visibility; /* pending revision uses completed prefix */
-  int value_checked; /* transient immutable-payload validation: 0 unknown */
-  int payload_claimed;
-  int reader_claimed;
   uint64_t deletion_bytes;
   struct ps_reserve *deletion_reserve;
   /* Temporary checkpoint projection binding; never serialized. */
   struct ps_entry *projection;
   struct ps_entry_allocation *allocation;
   ps_extent *extents;
-  size_t count, capacity, pins;
-  int state, safe, deleted; /* 0 private, 1 live, 2 retired */
+  size_t count, pins;
   struct ps_entry *previous;
   struct ps_entry *all_next;
   struct ps_entry **all_link;
   struct ps_entry *value_next, **value_link;
-  struct ps_entry *retired_next, **retired_link;
+  struct ps_entry *retired_next;
   struct ps_entry *dirty_next, **dirty_link;
-  ps_descriptor_ref checkpoint_ref, pending_ref;
+  ps_descriptor_ref checkpoint_ref;
   struct ps_catalog_record *catalog;
 } ps_entry;
 typedef struct ps_run {
@@ -241,6 +243,7 @@ struct ps_reserve {
 
 typedef struct ps_catalog_record {
   unsigned int kind;
+  ps_writer_stamp writer;
   size_t length, value_length;
   unsigned char *name;
   const unsigned char *value;

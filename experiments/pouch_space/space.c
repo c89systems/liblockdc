@@ -22,7 +22,7 @@ struct ps_writer {
   ps_budget *budget;
   ps_entry *entry;
   ps_entry *expected_owned;
-  size_t used;
+  size_t used, extent_capacity;
   int failed, published;
   unsigned char buffer[PS_CHUNK];
 };
@@ -659,10 +659,7 @@ static void retire(ps_space *s, ps_entry *p) {
     stream_unregister(s, p);
   }
   p->state = 2;
-  p->retired_link = &s->retired;
   p->retired_next = s->retired;
-  if (p->retired_next)
-    p->retired_next->retired_link = &p->retired_next;
   s->retired = p;
   if (!p->deleted) {
     s->metadata -= entry_bytes(p);
@@ -784,7 +781,6 @@ static ps_entry *space_entry_new(ps_space *s, unsigned int kind, size_t count,
   slot->entry.key.kind = kind;
   slot->entry.allocation = block;
   slot->entry.extents = &slot->extent;
-  slot->entry.capacity = 1;
   slot->entry.embedded_extents = 1;
   return &slot->entry;
 }
@@ -2131,8 +2127,6 @@ static void collect_retired(ps_space *s) {
       continue;
     }
     *link = p->retired_next;
-    if (*link)
-      (*link)->retired_link = link;
     unregister_entry(p);
     ps_internal_reserve_forget(s, p);
     ps_internal_entry_free(p);
@@ -2292,7 +2286,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
           p->bytes < 64 || p->bytes > 64 + 9 * p->stream->capacity)))
       goto invalid;
   }
-  p->count = p->capacity = count;
+  p->count = count;
   for (i = 0; i < count; ++i) {
     offset = get64(wire + first + 24 * i);
     n = get64(wire + first + 8 + 24 * i);
@@ -3091,10 +3085,17 @@ static int directory_open(ps_space *s, ps_directory_root root,
 static uint32_t metadata_crc(const unsigned char *page) {
   return (uint32_t)ps_crc32(checksum(page, 48), page + 52, PS_PAGE - 52);
 }
+typedef struct checkpoint_binding {
+  ps_entry *entry;
+  ps_descriptor_ref ref;
+} checkpoint_binding;
 typedef struct metadata_builder {
   ps_space *space;
   ps_meta_page *page;
-  unsigned char *buffer;
+  unsigned char *buffer, *wire;
+  size_t wire_capacity;
+  checkpoint_binding *bindings;
+  size_t binding_count, binding_capacity;
 } metadata_builder;
 static int metadata_flush(metadata_builder *b, lc_error *error) {
   ps_space *s = b->space;
@@ -3303,6 +3304,8 @@ void ps_internal_budget_trim(ps_space *s, ps_run **spare) {
 static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
                                  ps_directory_value *value, lc_error *error) {
   unsigned char *wire;
+  checkpoint_binding *bindings;
+  size_t bytes, capacity;
   int rc;
   memset(value, 0, sizeof(*value));
   if ((p->key.kind == PS_KEY_METADATA || p->key.kind == PS_KEY_DECISION) &&
@@ -3315,14 +3318,34 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
     value->packed = 1;
     return LC_OK;
   }
-  wire = lc_alloc_with_allocator(NULL, entry_bytes(p));
-  if (!wire)
-    return err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
-  encode_entry(wire, p, builder->space->sequence, PS_PUT);
-  rc = metadata_append(builder, wire, entry_bytes(p), &p->pending_ref, error);
-  if (rc == LC_OK)
-    value->ref = p->pending_ref;
-  lc_free_with_allocator(NULL, wire);
+  /* Packed values and deletions need no new descriptor reference. Record
+   * only the descriptors written by this build, before selecting its root. */
+  if (builder->binding_count == builder->binding_capacity) {
+    if (builder->binding_capacity > SIZE_MAX / sizeof(*bindings) / 2)
+      return err(error, LC_ERR_NOMEM, "too many staged checkpoint bindings");
+    capacity = builder->binding_capacity ? 2 * builder->binding_capacity : 16;
+    bindings = lc_realloc_with_allocator(NULL, builder->bindings,
+                                         capacity * sizeof(*bindings));
+    if (!bindings)
+      return err(error, LC_ERR_NOMEM, "cannot stage checkpoint bindings");
+    builder->bindings = bindings;
+    builder->binding_capacity = capacity;
+  }
+  bytes = entry_bytes(p);
+  if (bytes > builder->wire_capacity) {
+    wire = lc_realloc_with_allocator(NULL, builder->wire, bytes);
+    if (!wire)
+      return err(error, LC_ERR_NOMEM, "cannot allocate checkpoint descriptor");
+    builder->wire = wire;
+    builder->wire_capacity = bytes;
+  }
+  encode_entry(builder->wire, p, builder->space->sequence, PS_PUT);
+  rc = metadata_append(builder, builder->wire, bytes, &value->ref, error);
+  if (rc == LC_OK) {
+    checkpoint_binding *binding = &builder->bindings[builder->binding_count++];
+    binding->entry = p;
+    binding->ref = value->ref;
+  }
   return rc;
 }
 typedef struct checkpoint_entries {
@@ -3356,7 +3379,6 @@ static int checkpoint_pack_directory(ps_space *s, ps_directory *directory,
       return err(error, LC_ERR_NOMEM, "cannot collect checkpoint keys");
   }
   for (p = s->dirty; p; p = p->dirty_next) {
-    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
     if (!p->deleted && count < s->live_entries)
       slots[count++] = p;
     else if (!p->deleted)
@@ -3417,7 +3439,8 @@ static size_t checkpoint_prepare_free(ps_space *s,
   }
   return count;
 }
-static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
+static int checkpoint_body(ps_space *s, metadata_builder *builder,
+                           int force_dense, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
   ps_meta_page *page, *next_page;
@@ -3431,7 +3454,6 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   ps_directory_root new_root = {0}, empty = {0};
   ps_directory_value value;
   ps_directory_pages changes;
-  metadata_builder builder;
   size_t i, zero_count = 0;
   int next = 1 - s->root, rc, removed, dense = 0;
   if (s->generation == UINT64_MAX)
@@ -3440,8 +3462,6 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   if (covered > UINT64_MAX - journal_start - PS_JOURNAL)
     return err(error, LC_ERR_INVALID, "container journal cursor exhausted");
   journal_start += covered;
-  memset(&builder, 0, sizeof(builder));
-  builder.space = s;
   if (force_dense)
     metadata_dirty_all(s);
   rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
@@ -3477,24 +3497,23 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   if (rc == LC_OK)
     rc = directory_open(s, dense ? empty : s->directory, &directory, error);
   if (rc == LC_OK && s->dirty) {
-    builder.buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
-    if (!builder.buffer)
+    builder->buffer = lc_alloc_with_allocator(NULL, PS_PAGE);
+    if (!builder->buffer)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate descriptor page buffer");
   }
   if (rc == LC_OK && dense)
-    rc = checkpoint_pack_directory(s, directory, &builder, error);
+    rc = checkpoint_pack_directory(s, directory, builder, error);
   for (p = s->dirty; !dense && p && rc == LC_OK; p = p->dirty_next) {
-    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
     if (p->deleted)
       rc = ps_directory_remove(directory, p->key, &removed, error);
     else {
-      rc = checkpoint_descriptor(&builder, p, &value, error);
+      rc = checkpoint_descriptor(builder, p, &value, error);
       if (rc == LC_OK)
         rc = ps_directory_put(directory, p->key, value, error);
     }
   }
   if (rc == LC_OK)
-    rc = metadata_flush(&builder, error);
+    rc = metadata_flush(builder, error);
   if (rc == LC_OK)
     rc = ps_directory_flush(directory, s->generation + 1, &new_root, error);
   if (rc == LC_OK) {
@@ -3535,7 +3554,6 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     prepared = ps_readiness_issued_tickets(s);
     rc = sync_file(s, error); /* obsolete root and covered journal retired */
   }
-  lc_free_with_allocator(NULL, builder.buffer);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PROTOCOL)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
@@ -3602,7 +3620,7 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     if (s->dirty)
       s->dirty->dirty_link = &s->dirty;
     p->dirty_link = NULL;
-    p->checkpoint_ref = p->pending_ref;
+    memset(&p->checkpoint_ref, 0, sizeof(p->checkpoint_ref));
     p->previous = NULL;
     if (p->deleted) {
       key_index_remove(&s->keys, p->key);
@@ -3613,6 +3631,10 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
     lc_free_with_allocator(NULL, trim);
     return rc;
+  }
+  for (i = 0; i < builder->binding_count; ++i) {
+    const checkpoint_binding *binding = &builder->bindings[i];
+    binding->entry->checkpoint_ref = binding->ref;
   }
   rc = metadata_retirement_done(s, error);
   if (rc != LC_OK) {
@@ -3640,12 +3662,18 @@ static int checkpoint_body(ps_space *s, int force_dense, lc_error *error) {
   return rc;
 }
 static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
+  metadata_builder builder = {0};
   ps_coordination_guard *guard = NULL;
   int rc = allocation_begin(s, &guard, error);
   if (rc == LC_OK && guard)
     rc = allocation_refresh(s, error);
-  if (rc == LC_OK)
-    rc = checkpoint_body(s, force_dense, error);
+  if (rc == LC_OK) {
+    builder.space = s;
+    rc = checkpoint_body(s, &builder, force_dense, error);
+  }
+  lc_free_with_allocator(NULL, builder.bindings);
+  lc_free_with_allocator(NULL, builder.wire);
+  lc_free_with_allocator(NULL, builder.buffer);
   metadata_return_workspace(s);
   return allocation_end(s, guard, rc, error);
 }
@@ -4404,7 +4432,7 @@ static int reuse_directory_entry(metadata_recovery *r,
   p->key = old->key;
   p->token = old->token;
   p->bytes = old->bytes;
-  p->count = p->capacity = old->count;
+  p->count = old->count;
   if (p->count)
     memcpy(p->extents, old->extents, p->count * sizeof(*p->extents));
   p->checkpoint_ref = ref;
@@ -4466,7 +4494,7 @@ static void unpack_binding(ps_entry *p, ps_key key,
   p->key = key;
   p->token = value->ref.incarnation;
   p->bytes = value->ref.bytes;
-  p->count = p->capacity = 1;
+  p->count = 1;
   p->extents[0].offset = value->ref.offset;
   p->extents[0].bytes = value->ref.bytes;
   p->extents[0].crc = value->crc;
@@ -4923,6 +4951,9 @@ static void stream_admitted(ps_space *s, ps_entry *p, int admitted) {
       dirty_entry(s, p, NULL);
   }
 }
+static ps_writer_stamp *entry_writer_stamp(const ps_entry *p) {
+  return p->key.kind == PS_STREAM ? &p->stream->writer : &p->catalog->writer;
+}
 static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                            int select, lc_error *error) {
   ps_key key;
@@ -4950,8 +4981,9 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
     if (!value || value > s->token_limit || value % TOKEN_RANGE)
       return err(error, LC_ERR_PROTOCOL, "invalid owned stream writer stamp");
     if (select) {
-      head->writer_stamp = value;
-      head->writer_generation = s->generation;
+      ps_writer_stamp *stamp = entry_writer_stamp(head);
+      stamp->token = value;
+      stamp->generation = s->generation;
       if (event == PS_STREAM_EDIT) {
         head->stream->edit_wire = get64(wire + 8);
         head->stream->complete_generation = 0;
@@ -5769,9 +5801,8 @@ static void projection_entries(ps_space *s, ps_space *v) {
         p->durable_visibility = p->safe = 0;
         p->previous = NULL;
         p->retired_next = p->dirty_next = NULL;
-        p->retired_link = p->dirty_link = NULL;
+        p->dirty_link = NULL;
         memset(&p->checkpoint_ref, 0, sizeof(p->checkpoint_ref));
-        memset(&p->pending_ref, 0, sizeof(p->pending_ref));
         p->all_next = borrowed;
         borrowed = p;
       }
@@ -5787,9 +5818,8 @@ static void projection_entries(ps_space *s, ps_space *v) {
     p->value_next = NULL;
     p->value_link = NULL;
     p->retired_next = p->dirty_next = NULL;
-    p->retired_link = p->dirty_link = NULL;
+    p->dirty_link = NULL;
     p->checkpoint_ref.offset = p->checkpoint_ref.bytes = 0;
-    memset(&p->pending_ref, 0, sizeof(p->pending_ref));
     if (p->stream) {
       ps_stream_state *state = p->stream;
       state->next = NULL;
@@ -5826,9 +5856,6 @@ static void projection_entries(ps_space *s, ps_space *v) {
       dest->safe = q->safe;
       dest->deleted = q->deleted;
       dest->checkpoint_ref = q->checkpoint_ref;
-      dest->pending_ref = q->pending_ref;
-      dest->writer_stamp = q->writer_stamp;
-      dest->writer_generation = q->writer_generation;
       /* The staged tree owns independent nodes, even when its selected
        * descriptor reuses an existing reader-visible incarnation. */
       lc_free_with_allocator(NULL, dest->deletion_reserve);
@@ -5840,6 +5867,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
         dest->stream->owned_linked = q->stream->owned_linked;
       if (dest->key.kind == PS_STREAM) {
         ps_stream_state *to = dest->stream, *from = q->stream;
+        to->writer = from->writer;
         to->catalog_refs = from->catalog_refs;
         to->catalog_release = 0;
         to->catalog_release_wire = from->catalog_release_wire;
@@ -5861,7 +5889,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
     dest->previous = projected(q->previous);
     dest->retired_next = projected(q->retired_next);
     dest->dirty_next = projected(q->dirty_next);
-    dest->retired_link = dest->dirty_link = NULL;
+    dest->dirty_link = NULL;
     if (dest->stream) {
       ps_stream_state *to = dest->stream, *from = q->stream;
       to->next = projected(from->next);
@@ -5871,6 +5899,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
       to->owned_next = projected(from->owned_next);
     }
     if ((record = dest->catalog) != NULL) {
+      record->writer = q->catalog->writer;
       record->target = projected(q->catalog->target);
       record->next = projected(q->catalog->next);
     }
@@ -5896,8 +5925,6 @@ static void projection_entries(ps_space *s, ps_space *v) {
   }
   {
     ps_entry **link;
-    for (link = &s->retired; *link; link = &(*link)->retired_next)
-      (*link)->retired_link = link;
     for (link = &s->dirty; *link; link = &(*link)->dirty_next)
       (*link)->dirty_link = link;
   }
@@ -5906,10 +5933,7 @@ static void projection_entries(ps_space *s, ps_space *v) {
     keep = p->all_next;
     register_entry(s, p);
     if (p->state == 2) {
-      p->retired_link = &s->retired;
       p->retired_next = s->retired;
-      if (p->retired_next)
-        p->retired_next->retired_link = &p->retired_next;
       s->retired = p;
     }
   }
@@ -6543,6 +6567,7 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
     register_entry(s, p);
     ++s->writers;
     w->entry = p;
+    w->extent_capacity = p->embedded_extents ? 1 : 0;
     w->space = s;
     w->budget = budget;
     if (budget)
@@ -6573,8 +6598,8 @@ static int reserve_writer_tail(ps_writer *w, lc_error *error) {
     if (p->count == (PS_JOURNAL - 64) / 24)
       return err(error, LC_ERR_INVALID,
                  "value extent metadata exceeds journal capacity");
-    if (p->count == p->capacity) {
-      n = p->capacity ? p->capacity * 2 : 4;
+    if (p->count == w->extent_capacity) {
+      n = w->extent_capacity ? w->extent_capacity * 2 : 4;
       grown =
           p->embedded_extents
               ? lc_alloc_with_allocator(NULL, n * sizeof(*grown))
@@ -6584,7 +6609,7 @@ static int reserve_writer_tail(ps_writer *w, lc_error *error) {
       if (p->embedded_extents)
         memcpy(grown, p->extents, p->count * sizeof(*grown));
       p->extents = grown;
-      p->capacity = n;
+      w->extent_capacity = n;
       p->embedded_extents = 0;
       ps_internal_entry_auxiliary(p);
     }
@@ -7927,7 +7952,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
       goto done;
     }
   }
-  p->count = p->capacity = (size_t)count;
+  p->count = (size_t)count;
   for (i = 0, at = TICKET_HEADER; i < p->count; ++i, at += 24) {
     ps_extent *x = &p->extents[i];
     x->offset = get64(wire + at);
@@ -8603,8 +8628,8 @@ int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
   return rc;
 }
 static int writer_stamp_current(const ps_space *s, const ps_entry *p) {
-  return p->writer_generation == s->generation &&
-         p->writer_stamp == s->token_end;
+  const ps_writer_stamp *stamp = entry_writer_stamp(p);
+  return stamp->generation == s->generation && stamp->token == s->token_end;
 }
 static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
                               int *continued, lc_error *error) {
@@ -8619,8 +8644,9 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
   stamp.bytes = s->token_end;
   rc = append_event_locked(s, &stamp, event, error);
   if (rc == LC_OK) {
-    p->writer_stamp = s->token_end;
-    p->writer_generation = s->generation;
+    ps_writer_stamp *writer = entry_writer_stamp(p);
+    writer->token = s->token_end;
+    writer->generation = s->generation;
     if (event == PS_STREAM_EDIT) {
       p->stream->edit_wire = s->sequence;
       p->stream->complete_generation = 0;
@@ -8942,7 +8968,7 @@ select_run:
   if (rc == LC_OK) {
     p->token = s->token_next++;
     p->bytes = p->extents[0].bytes = reserved; /* entire private preparation */
-    p->count = p->capacity = 1;
+    p->count = 1;
     p->payload_claimed = 1;
     p->extents[0].flags = EXTENT_OWNED;
     register_entry(s, p);
