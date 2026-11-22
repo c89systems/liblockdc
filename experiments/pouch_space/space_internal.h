@@ -203,6 +203,9 @@ struct ps_space {
   ps_entry *entries, *retired, *dirty;
   struct ps_entry_allocation *entry_allocations, *entry_available;
   struct ps_entry_allocation *entry_temporary;
+  /* A private checkpoint draft may point into the resident's entry slabs.
+   * The resident mutex protects those entries through adoption or discard. */
+  struct ps_space *projection_resident;
   ps_key_index keys;
   /* Current immutable keys, including tombstones that select older values
    * at a completed prefix. Each bucket groups keys by namespace owner. */

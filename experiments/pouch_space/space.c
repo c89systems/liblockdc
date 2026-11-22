@@ -776,6 +776,33 @@ static ps_entry *space_entry_new(ps_space *s, unsigned int kind, size_t count,
   slot->entry.embedded_extents = 1;
   return &slot->entry;
 }
+static int projection_borrowed(const ps_space *s, const ps_entry *p) {
+  return p && s->projection_resident &&
+         p->allocation->owner == s->projection_resident;
+}
+/* Borrowed entries are present only in the draft key index. Replay needs
+ * independent links for a predecessor it retires or makes visible again. */
+static int projection_copy_predecessor(ps_space *s, ps_key key,
+                                       lc_error *error) {
+  ps_key_slot *slot = key_slot(&s->keys, key, key_hash(key));
+  ps_entry *old = slot->entry, *copy;
+  if (!projection_borrowed(s, old))
+    return LC_OK;
+  copy = space_entry_new(s, key.kind, 1, 1);
+  if (!copy)
+    return err(error, LC_ERR_NOMEM, "cannot stage journal predecessor");
+  copy->key = key;
+  copy->token = old->token;
+  copy->bytes = old->bytes;
+  copy->count = 1;
+  copy->extents[0] = old->extents[0];
+  copy->projection = old;
+  copy->state = 1;
+  slot->entry = copy;
+  register_entry(s, copy);
+  value_register(s, copy);
+  return LC_OK;
+}
 static uint64_t entry_slab_bit(const ps_entry *p) {
   const ps_entry_slab_slot *first =
       (const ps_entry_slab_slot *)(p->allocation + 1);
@@ -4084,6 +4111,7 @@ typedef struct metadata_directory_entry {
 } metadata_directory_entry;
 typedef struct metadata_recovery {
   ps_space *space, *resident;
+  payload_rebuild *payload;
   unsigned char *wire;
   uint64_t cohort_origin;
   int certified_root, reuse, shared_leaf;
@@ -4412,6 +4440,16 @@ static int decode_packed_binding(metadata_recovery *r,
     return err(error, LC_ERR_PROTOCOL, "invalid packed directory extent");
   if (old && old->token != ref.incarnation)
     old = NULL;
+  /* The checked leaf gives both identity and content of this descriptor.
+   * Borrow only a complete match with no mutable deletion-reserve node. */
+  if (old && projection_borrowed(s, old) && !value->deletion_bytes &&
+      !old->deletion_bytes && !old->deleted && old->count == 1 &&
+      old->bytes == ref.bytes && old->extents[0].offset == ref.offset &&
+      old->extents[0].bytes == ref.bytes && old->extents[0].crc == value->crc &&
+      old->extents[0].flags == EXTENT_PACKED) {
+    item->resident = old;
+    return LC_OK;
+  }
   /* Draft copies that keep a resident incarnation release their slots after
    * remapping. Group those copies away from bindings that survive adoption. */
   p = space_entry_new(s, item->key.kind, 1, old != NULL);
@@ -4432,7 +4470,9 @@ static int decode_packed_binding(metadata_recovery *r,
 static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   ps_space *s = r->space;
   metadata_directory_entry **fetch;
+  ps_key_slot *slot;
   ps_entry *p;
+  uint64_t hash;
   size_t i, end, count = 0;
   int rc = key_index_reserve(s, r->count, error);
   if (rc != LC_OK)
@@ -4466,6 +4506,20 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
   for (i = 0; i < r->count; ++i) {
     p = r->entries[i].decoded;
     /* The directory walk checked that every binding key is distinct. */
+    if (!p) {
+      p = r->entries[i].resident;
+      rc = payload_claim_entry(s, p, r->payload, error);
+      if (rc != LC_OK)
+        return rc;
+      hash = key_hash(p->key);
+      slot = key_slot(&s->keys, p->key, hash);
+      slot->entry = p;
+      slot->hash = hash;
+      ++s->keys.count;
+      s->metadata += entry_bytes(p);
+      ++s->live_entries;
+      continue;
+    }
     if (p->key.kind == PS_CATALOG)
       rc = ps_catalog_prepare_record(s, p, 1, error);
     else if (p->key.kind == PS_OWNED_RUN && p->stream->mapped)
@@ -4866,6 +4920,9 @@ replay_extents:
     } else
       rc = replay_payload(s, entries[i], &changes, error);
   }
+  if (staged && s->projection_resident && s->keys.capacity)
+    for (i = 0; rc == LC_OK && i < count; ++i)
+      rc = projection_copy_predecessor(s, entries[i]->key, error);
   if (!staged && rc == LC_ERR_PROTOCOL && s->retired && !retried) {
     /* Retirement collection can defer a demotion on allocation failure.
      * Undo this frame before collection changes any recorded free links. */
@@ -5011,7 +5068,8 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
                              const ps_readiness_certificate *certificate,
-                             ps_space *resident, int reuse, lc_error *error) {
+                             ps_space *resident, int reuse,
+                             payload_rebuild *payload, lc_error *error) {
   ps_directory *directory = NULL;
   metadata_recovery *recovery = NULL;
   int rc = initial_free(s, error);
@@ -5027,6 +5085,7 @@ static int recover_directory(ps_space *s, unsigned char *wire,
     /* A live batch groups entries already bound to the same resident
      * incarnation. Only independent allocations can become new residents. */
     recovery->resident = resident;
+    recovery->payload = payload;
     recovery->wire = wire;
     recovery->certified_root = certificate->root == s->generation;
     recovery->cohort_origin = certificate->origin;
@@ -5209,8 +5268,8 @@ static int recover_live_directory(ps_space *s, ps_coordination_guard **guard,
   rc = allocation_end(s, *guard, LC_OK, error);
   *guard = NULL;
   if (rc == LC_OK) {
-    prepared =
-        recover_directory(draft, wire, certificate, NULL, 0, &draft_error);
+    prepared = recover_directory(draft, wire, certificate, NULL, 0, NULL,
+                                 &draft_error);
     rc = allocation_begin(s, guard, error);
   }
   if (rc == LC_OK)
@@ -5319,7 +5378,7 @@ restart:
     if (rc == LC_OK && moved)
       goto restart;
   } else
-    rc = recover_directory(s, wire, &certificate, NULL, 0, error);
+    rc = recover_directory(s, wire, &certificate, NULL, 0, NULL, error);
   if (rc != LC_OK)
     goto done;
   s->token_limit = grant_limit;
@@ -5600,16 +5659,37 @@ static int entry_catalog_pinned(const ps_entry *p) {
   return p->key.kind == PS_STREAM && p->stream->catalog_pins;
 }
 static void projection_entries(ps_space *s, ps_space *v) {
-  ps_entry *p, *next, *q, *keep = NULL, *consumed = NULL, *dest;
+  ps_entry *p, *next, *q, *keep = NULL, *consumed = NULL, *borrowed = NULL,
+                          *dest;
   ps_catalog_record *record;
   size_t i;
   /* Preparation is finished. Nothing below allocates or performs file I/O. */
+  for (i = 0; i < v->keys.capacity; ++i) {
+    p = v->keys.slots[i].entry;
+    if (projection_borrowed(v, p))
+      p->projection = p;
+    else
+      v->keys.slots[i].entry = projected(p);
+  }
   for (q = v->entries; q; q = q->all_next)
     if (q->projection)
       q->projection->projection = q;
   for (p = s->entries; p; p = next) {
     next = p->all_next;
     if (p->projection) {
+      if (p->projection == p) {
+        /* Rebase the publication onto the selected checkpoint. Payload and
+         * reader ownership stay intact while local selection is relinked. */
+        p->publication_sequence = p->peer_sequence = 0;
+        p->durable_visibility = p->safe = 0;
+        p->previous = NULL;
+        p->retired_next = p->dirty_next = NULL;
+        p->retired_link = p->dirty_link = NULL;
+        memset(&p->checkpoint_ref, 0, sizeof(p->checkpoint_ref));
+        memset(&p->pending_ref, 0, sizeof(p->pending_ref));
+        p->all_next = borrowed;
+        borrowed = p;
+      }
       p->projection = NULL;
       continue;
     }
@@ -5715,8 +5795,6 @@ static void projection_entries(ps_space *s, ps_space *v) {
     }
   }
   s->entries = projected(v->entries);
-  for (i = 0; i < v->keys.capacity; ++i)
-    v->keys.slots[i].entry = projected(v->keys.slots[i].entry);
   for (i = 0; i < BUCKETS; ++i) {
     ps_entry **link;
     s->value_buckets[i] = projected(v->value_buckets[i]);
@@ -5749,6 +5827,12 @@ static void projection_entries(ps_space *s, ps_space *v) {
         p->retired_next->retired_link = &p->retired_next;
       s->retired = p;
     }
+  }
+  while (borrowed) {
+    p = borrowed;
+    borrowed = p->all_next;
+    register_entry(s, p);
+    value_register(s, p);
   }
   /* Every link now points at its final entry. Reused staged entries are
    * kept until here because other links can still refer to their bindings. */
@@ -5844,9 +5928,10 @@ static int projection_stage(ps_space *s, ps_space *v,
                             int reuse, lc_error *error) {
   ps_entry *p, *old;
   payload_rebuild build = {0};
-  int rc = recover_directory(v, v->journal_image, certificate, s, reuse, error);
-  if (rc != LC_OK)
-    return rc;
+  int rc;
+  v->projection_resident = s;
+  rc = recover_directory(v, v->journal_image, certificate, s, reuse, &build,
+                         error);
   /* The checkpoint prefix covers the resident journal. Consequently only
    * checkpoint entries, including those superseded by the following tail,
    * can match an existing incarnation. Bind them before decoding that tail. */
@@ -5873,7 +5958,7 @@ static int projection_stage(ps_space *s, ps_space *v,
     if (p->state != 0 && !p->pins && !entry_catalog_pinned(p))
       continue;
     old = lookup(v, p->key);
-    if (old && old->projection == p)
+    if (old == p || (old && old->projection == p))
       continue;
     rc = payload_claim_entry(v, p, &build, error);
   }

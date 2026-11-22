@@ -2927,6 +2927,7 @@ static void projection_lifecycle(void) {
   REQUIRE(unlink(path) == 0);
 }
 static void projection_faults(void) {
+  ps_key decision = {0, 1, PS_KEY_DECISION};
   size_t sites = 0, operations = 0;
   for (int kind = 0; kind < 2; ++kind)
     for (size_t phase = 0; phase <= (kind ? operations : sites); ++phase) {
@@ -2944,15 +2945,16 @@ static void projection_faults(void) {
       ps_reader *held = NULL;
       ps_writer *producer = NULL;
       ok(ps_open(path, 1, &options, &a, &e), &e);
-      for (uint64_t id = 1; id <= 6; ++id)
+      capture_put_key(a, decision, 65);
+      for (uint64_t id = 2; id <= 6; ++id)
         capture_put(a, id, 65);
       ok(ps_checkpoint(a, &e), &e);
-      ok(ps_read_open(a, key(1), NULL, &held, &e), &e);
+      ok(ps_read_open(a, decision, NULL, &held, &e), &e);
       ok(ps_open(path, 0, NULL, &b, &e), &e);
       producer = private_value(a, NULL, 9000);
       capture_put(b, 7, 129);
       ok(ps_checkpoint(b, &e), &e);
-      capture_put(b, 1, 129);
+      capture_put_key(b, decision, 129);
       capture_put(b, 8, PS_CHUNK);
       uint64_t generation = a->generation, physical = coverage(NULL, 0);
       allocations = 0;
@@ -5236,7 +5238,7 @@ static void journal_replay_retired(void) {
     lc_error_cleanup(&e);
   }
 }
-static void projection_tail(void) {
+static void projection_tail(int packed) {
   lc_error e = {0};
   projection_io m = {0};
   ps_io io = {0};
@@ -5247,7 +5249,12 @@ static void projection_tail(void) {
   ps_budget *budget = NULL;
   ps_budget_plan plan = {PS_CHUNK * 2, 4096, 32, 0};
   unsigned char residue[64], zero[64] = {0};
+  ps_key replaced = key(1), removed = key(2), retained = key(5);
   uint64_t prefix;
+  if (packed) {
+    replaced.kind = retained.kind = PS_KEY_DECISION;
+    removed.kind = PS_KEY_METADATA;
+  }
   io.context = &m;
   io.read = projection_read;
   io.write = projection_write;
@@ -5256,11 +5263,13 @@ static void projection_tail(void) {
   observer.io = &io;
   publisher.durable_sync = 1;
   ok(ps_open(path, 1, &observer, &a, &e), &e);
-  capture_put(a, 1, 65);
-  capture_put(a, 2, 65);
+  capture_put_key(a, replaced, 65);
+  capture_put_key(a, removed, 65);
+  capture_put_key(a, retained, 65);
   ok(ps_checkpoint(a, &e), &e);
-  ok(ps_read_open(a, key(1), NULL, &old, &e), &e);
-  ps_entry *original = ps_internal_lookup(a, key(1));
+  ok(ps_read_open(a, replaced, NULL, &old, &e), &e);
+  ps_entry *original = ps_internal_lookup(a, replaced);
+  ps_entry *unchanged = ps_internal_lookup(a, retained);
   ok(ps_open(path, 0, &publisher, &b, &e), &e);
   ps_writer *residue_writer = replay_value(b, key(7), 0, 0, &e);
   ok(ps_publish(residue_writer, NULL, &e), &e);
@@ -5272,8 +5281,8 @@ static void projection_tail(void) {
   producer = private_value(a, budget, 9000);
   capture_put(b, 6, 65);
   ok(ps_checkpoint(b, &e), &e);
-  ok(ps_delete(b, key(2), &e), &e);
-  writers[0] = replay_value(b, key(1), 31, PS_CHUNK, &e);
+  ok(ps_delete(b, removed, &e), &e);
+  writers[0] = replay_value(b, replaced, 31, PS_CHUNK, &e);
   writers[1] = replay_value(b, key(3), 32, 65, &e);
   writers[2] = replay_value(b, key(4), 33, 64, &e);
   ok(ps_revision_publish(writers, 3, 0, PS_COMMIT_DEFER_SYNC, NULL, &prefix,
@@ -5281,7 +5290,7 @@ static void projection_tail(void) {
      &e);
   for (size_t i = 0; i < 3; ++i)
     ps_writer_close(writers[i]);
-  ps_entry *published = ps_internal_lookup(b, key(1));
+  ps_entry *published = ps_internal_lookup(b, replaced);
   REQUIRE(published && published->count == 1);
   m.ranges = 1;
   m.forbidden[0].first = published->extents[0].offset;
@@ -5300,8 +5309,8 @@ static void projection_tail(void) {
   lc_error_cleanup(&e);
   REQUIRE(a->generation == generation && a->sequence == sequence &&
           a->journal == journal && coverage(NULL, 0) == physical);
-  REQUIRE(ps_internal_lookup(a, key(1)) == original &&
-          !ps_internal_lookup(a, key(2))->deleted);
+  REQUIRE(ps_internal_lookup(a, replaced) == original &&
+          !ps_internal_lookup(a, removed)->deleted);
   REQUIRE(pwrite(b->fd, &last, 1, end) == 1);
   /* A valid previous-generation frame can only appear at the journal start.
    * It must never be accepted as the end of an adopted tail. */
@@ -5317,14 +5326,16 @@ static void projection_tail(void) {
   REQUIRE(a->generation > generation && a->generation == b->generation &&
           a->sequence == b->sequence && a->journal == b->journal);
   REQUIRE(!m.syncs && !m.payload_reads);
-  REQUIRE(ps_internal_lookup(a, key(1))->previous == original);
-  ok(ps_read_open(a, key(1), NULL, &prior, &e), &e);
-  expect_value(a, key(2), 0, 0);
+  REQUIRE(ps_internal_lookup(a, replaced)->previous == original &&
+          ps_internal_lookup(a, retained) == unchanged);
+  ok(ps_read_open(a, replaced, NULL, &prior, &e), &e);
+  expect_value(a, removed, 0, 0);
+  expect_value(a, retained, 65, 5);
   expect_value(a, key(3), 0, 0);
   expect_value(a, key(4), 0, 0);
   expect_value(a, key(6), 65, 6);
   ok(ps_flush(b, &e), &e);
-  expect_value(a, key(1), PS_CHUNK, 31);
+  expect_value(a, replaced, PS_CHUNK, 31);
   expect_value(a, key(3), 65, 32);
   expect_value(a, key(4), 64, 33);
   captured_expect(old, 1, 65);
@@ -5340,8 +5351,9 @@ static void projection_tail(void) {
   ok(ps_close(b, &e), &e);
   ok(ps_close(a, &e), &e);
   ok(ps_open(path, 0, NULL, &a, &e), &e);
-  expect_value(a, key(1), PS_CHUNK, 31);
-  expect_value(a, key(2), 0, 0);
+  expect_value(a, replaced, PS_CHUNK, 31);
+  expect_value(a, removed, 0, 0);
+  expect_value(a, retained, 65, 5);
   expect_value(a, key(4), 64, 33);
   expect_value(a, key(9000), PS_CHUNK, 9000 % 251);
   ok(ps_close(a, &e), &e);
@@ -7838,9 +7850,10 @@ int main(int argc, char **argv) {
       pressure_reclaim(1, sync);
       stream_capacity_reclaim(1, 1, sync);
     }
-  } else if (!strcmp(argv[2], "projection-tail"))
-    projection_tail();
-  else if (!strcmp(argv[2], "shared-durable"))
+  } else if (!strcmp(argv[2], "projection-tail")) {
+    projection_tail(0);
+    projection_tail(1);
+  } else if (!strcmp(argv[2], "shared-durable"))
     shared_durability();
   else if (!strcmp(argv[2], "shared-preparation")) {
     shared_preparation(READY_BEFORE_SYNC);
