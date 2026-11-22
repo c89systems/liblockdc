@@ -4782,7 +4782,6 @@ static int recover_revision(ps_space *s, const unsigned char *wire,
 /* Record only affected intervals and packed pages. Keep removed nodes alive
  * until commit so rollback can restore links even across adjacent cuts. */
 typedef struct replay_change {
-  struct replay_change *next;
   ps_run **link, *run, *split;
   ps_run **prior_probe;
   ps_run before;
@@ -4791,19 +4790,43 @@ typedef struct replay_change {
   uint64_t occupied;
   int removed, new_page;
 } replay_change;
-static replay_change *replay_record(replay_change **changes, lc_error *error) {
-  replay_change *c = lc_calloc_with_allocator(NULL, 1, sizeof(*c));
-  if (c) {
-    c->next = *changes;
-    *changes = c;
-  } else
-    err(error, LC_ERR_NOMEM, "cannot stage journal payload ownership");
+#define REPLAY_INLINE_CHANGES 8
+#define REPLAY_BLOCK_CHANGES 32
+typedef struct replay_block {
+  struct replay_block *previous;
+  size_t count;
+  replay_change records[REPLAY_BLOCK_CHANGES];
+} replay_block;
+typedef struct replay_log {
+  replay_block *block;
+  size_t count;
+  replay_change records[REPLAY_INLINE_CHANGES];
+} replay_log;
+static replay_change *replay_record(replay_log *log, lc_error *error) {
+  replay_block *block = log->block;
+  replay_change *c;
+  if (!block && log->count < REPLAY_INLINE_CHANGES)
+    c = &log->records[log->count++];
+  else {
+    if (!block || block->count == REPLAY_BLOCK_CHANGES) {
+      block = lc_alloc_with_allocator(NULL, sizeof(*block));
+      if (!block) {
+        err(error, LC_ERR_NOMEM, "cannot stage journal payload ownership");
+        return NULL;
+      }
+      block->previous = log->block;
+      block->count = 0;
+      log->block = block;
+    }
+    c = &block->records[block->count++];
+  }
+  memset(c, 0, sizeof(*c));
   return c;
 }
-static void replay_finish(ps_space *s, replay_change *change, int commit) {
-  while (change) {
-    replay_change *c = change;
-    change = c->next;
+static void replay_finish_changes(ps_space *s, replay_change *records,
+                                  size_t count, int commit) {
+  while (count) {
+    replay_change *c = &records[--count];
     if (c->page) {
       if (commit)
         payload_available(s, c->page);
@@ -4828,8 +4851,19 @@ static void replay_finish(ps_space *s, replay_change *change, int commit) {
         lc_free_with_allocator(NULL, c->split);
       }
     }
-    lc_free_with_allocator(NULL, c);
   }
+}
+static void replay_finish(ps_space *s, replay_log *log, int commit) {
+  replay_block *block;
+  /* Adjacent interval edits may refer to nodes split by earlier edits.
+   * Drain the entire log in reverse order on both rollback and commit. */
+  while ((block = log->block) != NULL) {
+    replay_finish_changes(s, block->records, block->count, commit);
+    log->block = block->previous;
+    lc_free_with_allocator(NULL, block);
+  }
+  replay_finish_changes(s, log->records, log->count, commit);
+  log->count = 0;
 }
 static ps_run **replay_find(ps_run **link, uint64_t offset) {
   for (; *link; link = &(*link)->next)
@@ -4838,7 +4872,7 @@ static ps_run **replay_find(ps_run **link, uint64_t offset) {
   return NULL;
 }
 static int replay_range(ps_space *s, uint64_t offset, uint64_t bytes,
-                        replay_change **changes, lc_error *error) {
+                        replay_log *changes, lc_error *error) {
   while (bytes) {
     uint64_t *available = &s->free_bytes, left, right, take;
     ps_run **link = replay_find(&s->free, offset), *run, *split = NULL;
@@ -4896,7 +4930,7 @@ static int replay_range(ps_space *s, uint64_t offset, uint64_t bytes,
   }
   return LC_OK;
 }
-static int replay_payload(ps_space *s, ps_entry *p, replay_change **changes,
+static int replay_payload(ps_space *s, ps_entry *p, replay_log *changes,
                           lc_error *error) {
   size_t i;
   int rc;
@@ -5007,7 +5041,7 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             size_t bytes, uint64_t certified, int staged,
                             lc_error *error) {
   ps_entry **entries = NULL, *single = NULL;
-  replay_change *changes = NULL;
+  replay_log changes;
   size_t i, count = 1;
   int group = get32(wire) == REVISION_MAGIC, event = PS_PUT, rc, retried = 0;
   if (group)
@@ -5034,6 +5068,8 @@ static int apply_peer_frame(ps_space *s, const unsigned char *wire,
   }
   if (rc != LC_OK)
     return rc;
+  changes.block = NULL;
+  changes.count = 0;
 replay_extents:
   for (i = 0; rc == LC_OK && i < count; ++i) {
     if (staged) {
@@ -5048,8 +5084,7 @@ replay_extents:
   if (!staged && rc == LC_ERR_PROTOCOL && s->retired && !retried) {
     /* Retirement collection can defer a demotion on allocation failure.
      * Undo this frame before collection changes any recorded free links. */
-    replay_finish(s, changes, 0);
-    changes = NULL;
+    replay_finish(s, &changes, 0);
     collect_retired(s);
     lc_error_cleanup(error);
     rc = healthy(s, error);
@@ -5068,7 +5103,7 @@ replay_extents:
       rc = apply_journal_event(s, single, event, 0, s->sequence + 1, error);
     }
   }
-  replay_finish(s, changes, rc == LC_OK);
+  replay_finish(s, &changes, rc == LC_OK);
   if (rc == LC_OK) {
     if (group)
       install_revision(s, entries, count, 1, get32(wire + 20));

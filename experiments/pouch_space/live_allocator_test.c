@@ -5534,24 +5534,25 @@ static void projection_tail(int packed) {
   ok(ps_close(a, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
-static void journal_replay_faults(void) {
+static void journal_replay_faults(size_t count) {
   size_t sites = 0;
   for (size_t failure = 0; failure <= sites; ++failure) {
     lc_error e = {0};
     ps_space *a = NULL, *b = NULL;
-    ps_writer *writers[4];
+    ps_writer *writers[72];
+    REQUIRE(count <= sizeof(writers) / sizeof(*writers));
     ok(ps_open(path, 1, NULL, &a, &e), &e);
     ok(ps_open(path, 0, NULL, &b, &e), &e);
     ok(ps_refresh(a, &e), &e);
-    capture_put(b, 21, 65);
+    capture_put(b, 101, 65);
     ok(ps_refresh(a, &e), &e);
-    writers[0] = replay_value(b, key(1), 23, 65, &e);
-    writers[1] = replay_value(b, key(2), 24, PS_CHUNK, &e);
-    writers[2] = replay_value(b, key(3), 25, 66, &e);
-    writers[3] = replay_value(b, key(4), 26, PS_CHUNK, &e);
-    ok(ps_revision_publish(writers, 4, 0, PS_COMMIT_DEFAULT, NULL, NULL, &e),
+    for (size_t i = 0; i < count; ++i)
+      writers[i] = replay_value(b, key(i + 1), (unsigned char)(i + 23),
+                                i % 2 ? PS_CHUNK : 65, &e);
+    ok(ps_revision_publish(writers, count, 0, PS_COMMIT_DEFAULT, NULL, NULL,
+                           &e),
        &e);
-    for (size_t i = 0; i < 4; ++i)
+    for (size_t i = 0; i < count; ++i)
       ps_writer_close(writers[i]);
     uint64_t latest = a->sequence, free_before = a->free_bytes;
     uint64_t packed = a->packed_bytes, pages = a->packed_pages;
@@ -5566,7 +5567,7 @@ static void journal_replay_faults(void) {
       lc_error_cleanup(&e);
       REQUIRE(a->sequence == latest && a->journal == cursor &&
               a->free_bytes == free_before && a->packed_bytes == packed);
-      for (size_t i = 1; i <= 4; ++i)
+      for (size_t i = 1; i <= count; ++i)
         REQUIRE(!ps_internal_lookup(a, key(i)));
       REQUIRE(pwrite(b->fd, &original, 1, last) == 1);
     }
@@ -5578,20 +5579,19 @@ static void journal_replay_faults(void) {
     if (!failure) {
       ok(rc, &e);
       sites = allocations;
-      REQUIRE(sites > 8);
+      REQUIRE(sites >= count);
     } else {
       REQUIRE(rc == LC_ERR_NOMEM && a->sequence == latest &&
               a->journal == cursor && a->free_bytes == free_before &&
               a->packed_bytes == packed && a->packed_pages == pages);
       lc_error_cleanup(&e);
-      for (size_t i = 1; i <= 4; ++i)
+      for (size_t i = 1; i <= count; ++i)
         REQUIRE(!ps_internal_lookup(a, key(i)));
       ok(ps_refresh(a, &e), &e);
     }
-    expect_value(a, key(1), 65, 23);
-    expect_value(a, key(2), PS_CHUNK, 24);
-    expect_value(a, key(3), 66, 25);
-    expect_value(a, key(4), PS_CHUNK, 26);
+    for (size_t i = 0; i < count; ++i)
+      expect_value(a, key(i + 1), i % 2 ? PS_CHUNK : 65,
+                   (unsigned char)(i + 23));
     ok(ps_checkpoint(a, &e), &e);
     ok(ps_close(a, &e), &e);
     ok(ps_close(b, &e), &e);
@@ -8063,9 +8063,11 @@ int main(int argc, char **argv) {
     journal_replay();
   } else if (!strcmp(argv[2], "journal-replay-retired"))
     journal_replay_retired();
-  else if (!strcmp(argv[2], "journal-replay-faults"))
-    journal_replay_faults();
-  else if (!strcmp(argv[2], "journal-replay-structural"))
+  else if (!strcmp(argv[2], "journal-replay-faults")) {
+    journal_replay_faults(4);
+    /* Cross multiple undo blocks with both packed cells and full extents. */
+    journal_replay_faults(72);
+  } else if (!strcmp(argv[2], "journal-replay-structural"))
     journal_replay_structural();
   else if (!strcmp(argv[2], "journal-replay-process"))
     journal_replay_process();
