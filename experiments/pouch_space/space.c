@@ -2000,7 +2000,7 @@ static int payload_rebuild_free(ps_space *s, payload_rebuild *build,
 /* Recovery prepends entries and retains their physical ownership even when
  * a later frame supersedes them. The checkpoint boundary can already own
  * every entry at and after end. */
-static int recover_payload_ownership(ps_space *s, const ps_entry *end,
+static int recover_payload_ownership(ps_space *s, const ps_entry *end, int live,
                                      lc_error *error) {
   payload_rebuild build = {0};
   ps_entry *p;
@@ -2009,7 +2009,8 @@ static int recover_payload_ownership(ps_space *s, const ps_entry *end,
     return LC_OK;
   for (p = s->entries; rc == LC_OK && p != end; p = p->all_next) {
     rc = payload_claim_entry(s, p, &build, error);
-    p->previous = NULL;
+    if (!live)
+      p->previous = NULL;
   }
   if (rc == LC_OK)
     rc = payload_rebuild_free(s, &build, error);
@@ -5283,12 +5284,13 @@ static void install_revision(ps_space *s, ps_entry **entries, size_t count,
   s->sequence += count;
 }
 static int recover_revision(ps_space *s, const unsigned char *wire,
-                            size_t bytes, recovery_values *values,
+                            size_t bytes, recovery_values *values, int live,
                             lc_error *error) {
   ps_entry **entries;
   int rc = decode_revision(s, wire, bytes, values, &entries, error);
   if (rc == LC_OK) {
-    install_revision(s, entries, ps_wire_get32(wire + 16), 0, 0);
+    install_revision(s, entries, ps_wire_get32(wire + 16), live,
+                     ps_wire_get32(wire + 20));
     lc_free_with_allocator(NULL, entries);
   }
   return rc;
@@ -5553,6 +5555,13 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   return LC_OK;
 }
+static int apply_peer_event(ps_space *s, ps_entry *p, int event,
+                            lc_error *error) {
+  uint64_t wire = s->sequence + 1;
+  if (ps_internal_immutable_key(p->key) || p->key.kind == PS_CATALOG)
+    p->peer_sequence = wire;
+  return apply_journal_event(s, p, event, 0, wire, error);
+}
 static int apply_peer_frame(ps_space *s, const unsigned char *wire,
                             size_t bytes, uint64_t certified, int staged,
                             lc_error *error) {
@@ -5614,12 +5623,8 @@ replay_extents:
       unsigned char header[PS_RUN_IDENTITY_BYTES];
       rc = verify_owned(s, single, header, error);
     }
-    if (rc == LC_OK) {
-      if (ps_internal_immutable_key(single->key) ||
-          single->key.kind == PS_CATALOG)
-        single->peer_sequence = s->sequence + 1;
-      rc = apply_journal_event(s, single, event, 0, s->sequence + 1, error);
-    }
+    if (rc == LC_OK)
+      rc = apply_peer_event(s, single, event, error);
   }
   replay_finish(s, &changes, rc == LC_OK);
   if (rc == LC_OK) {
@@ -6137,7 +6142,8 @@ static int recover(ps_space *s, ps_coordination_guard **guard,
   uint64_t grant_limit, effect;
   size_t cursor = 0, bytes, first, last, journal_bound = PS_JOURNAL, marker;
   int a, b, event, rc, retire_sibling, retirement_needed, known_grant;
-  int pending_data = 0, grant_slot, moved = 0, certified, cold_covered;
+  int needs_prefix_sync = 0, grant_slot, moved = 0, certified, cold_covered;
+  int live_prefix = 0;
   enum exclusive_proof exclusive = EXCLUSIVE_UNPROVED;
   roots[0] = superblocks;
   roots[1] = superblocks + PS_PAGE;
@@ -6212,8 +6218,14 @@ restart:
     rc = journal_transfer(s, s->journal_start, wire, bytes, 0, error);
     if (rc != LC_OK)
       goto done;
-    if (!memcmp(wire + certificate.journal_bytes, zero, marker))
+    if (!memcmp(wire + certificate.journal_bytes, zero, marker)) {
       journal_bound = certificate.journal_bytes;
+      /* A live NoSync owner can adopt the completed wire prefix with its
+       * existing durability watermark. Use the peer visibility clock for
+       * durable-only values and retain their predecessors until selection. */
+      live_prefix = !s->durable && ps_readiness_joined(s) &&
+                    certificate.ready > certificate.durable;
+    }
   }
   if (journal_bound == PS_JOURNAL && (!certified || bytes < PS_JOURNAL)) {
     first = certified ? bytes : 0;
@@ -6232,17 +6244,26 @@ restart:
     bytes = ps_wire_get32(wire + cursor + 4);
     if (bytes < 64 || bytes > journal_bound - cursor)
       break;
-    /* Stamp hints carry live ownership, with no data or tail visibility.
-     * Any later data or stream boundary keeps the admission barrier. */
     event = ps_wire_get32(wire + cursor + 20);
-    if (s->sequence >= certificate.durable &&
-        (ps_wire_get32(wire + cursor) == REVISION_MAGIC ||
-         !live_hint((uint32_t)event) ||
-         (s->sequence >= certificate.origin && event != PS_STREAM_OWNER &&
-          event != PS_NAMESPACE_OWNER && event != PS_STREAM_ADMITTED)))
-      pending_data = 1;
+    if (s->sequence >= certificate.durable) {
+      if (live_prefix) {
+        uint32_t kind = ps_wire_get32(wire + cursor + 16);
+        /* Root open can need these catalog and stream bindings to recover
+         * namespaces. Finish their structural barrier before admission. */
+        if (ps_wire_get32(wire + cursor) == EVENT_MAGIC &&
+            !live_hint((uint32_t)event) &&
+            (kind == PS_CATALOG || kind == PS_STREAM || kind == PS_OWNED_RUN))
+          needs_prefix_sync = 1;
+      } else if (ps_wire_get32(wire + cursor) == REVISION_MAGIC ||
+                 !live_hint((uint32_t)event) ||
+                 (s->sequence >= certificate.origin &&
+                  event != PS_STREAM_OWNER && event != PS_NAMESPACE_OWNER &&
+                  event != PS_STREAM_ADMITTED))
+        needs_prefix_sync = 1;
+    }
     if (ps_wire_get32(wire + cursor) == REVISION_MAGIC) {
-      rc = recover_revision(s, wire + cursor, bytes, values, error);
+      rc =
+          recover_revision(s, wire + cursor, bytes, values, live_prefix, error);
       if (rc == LC_ERR_NOMEM || __atomic_load_n(&s->poisoned, __ATOMIC_RELAXED))
         goto done;
       if (rc != LC_OK) {
@@ -6284,7 +6305,9 @@ restart:
         break;
       }
     }
-    rc = apply_journal_event(s, p, event, s->sequence + 1, 0, error);
+    rc = live_prefix
+             ? apply_peer_event(s, p, event, error)
+             : apply_journal_event(s, p, event, s->sequence + 1, 0, error);
     if (rc != LC_OK) {
       ps_internal_entry_free(p);
       goto done;
@@ -6347,7 +6370,7 @@ restart:
   }
   /* Keep the physical ownership of every accepted journal PUT until a
    * checkpoint retires its frame. */
-  rc = recover_payload_ownership(s, checkpoint_entries, error);
+  rc = recover_payload_ownership(s, checkpoint_entries, live_prefix, error);
   if (rc == LC_OK)
     rc = pins_recover(s, s, error);
   if (rc != LC_OK)
@@ -6396,7 +6419,7 @@ restart:
     __atomic_store_n(&s->deferred_recovery, 1, __ATOMIC_RELEASE);
   } else if (retirement_needed || certificate.pending ||
              certificate.root != s->generation ||
-             certificate.ready != s->sequence || pending_data ||
+             certificate.ready != s->sequence || needs_prefix_sync ||
              certificate.grant_limit != s->token_limit) {
     rc = sync_file(s, error);
     if (rc != LC_OK)

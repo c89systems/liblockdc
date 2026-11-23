@@ -61,6 +61,9 @@ Reclamation waits for durable retirement and release of outstanding physical
 ownership. Linux OFD range locks retain reader extents and private writer
 workspace across independent opens. Shared admission validates its view against
 the selected root and accepted journal bounds before installing it.
+A NoSync join of a fully certified live root inherits its durability watermark
+when structural publications are already durable. Records that require a
+durability barrier keep their preceding visible values until it completes.
 Namespace routing selects the sole append head. Dense NoSync predecessors can
 remain unsealed. Repacking a closed source records its final tail before removing
 grants. Unlinking an old segment requires its durable route and checkpoint coverage.

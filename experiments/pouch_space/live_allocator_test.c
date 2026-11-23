@@ -4356,6 +4356,9 @@ static void readiness_cohort(void) {
   REQUIRE(certificate.ready == a->sequence &&
           certificate.durable < certificate.ready);
   ok(ps_open(path, 0, NULL, &b, &e), &e);
+  REQUIRE(!status(b).syncs && readiness(b).durable == certificate.durable);
+  ok(ps_flush(b, &e), &e);
+  REQUIRE(status(b).syncs == 1);
   uint64_t syncs = status(a).syncs;
   ok(ps_flush(a, &e), &e);
   REQUIRE(status(a).syncs == syncs);
@@ -5029,11 +5032,17 @@ static void reopen_cohort(int already_synced) {
   ok(ps_close(join, &e), &e);
   join = NULL;
 
-  /* A failed attempt to stabilize published data cannot assign a range or
-   * certify that data. Successful recovery needs only that one barrier. */
+  /* NoSync admission observes the live publication. A durable join still
+   * needs one barrier and a failed barrier cannot advance the certificate. */
   cert = readiness(first);
   REQUIRE(cert.ready > cert.durable);
   disk = (reopen_disk){0, 1};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(!disk.syncs && readiness(join).durable == cert.durable);
+  expect_value(join, key(2), 65, 2);
+  ok(ps_close(join, &e), &e);
+  join = NULL;
+  options.durable_sync = 1;
   REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join);
   lc_error_cleanup(&e);
   REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.durable &&
@@ -5045,6 +5054,7 @@ static void reopen_cohort(int already_synced) {
   expect_value(join, key(2), 65, 2);
   ok(ps_close(join, &e), &e);
   join = NULL;
+  options.durable_sync = 0;
 
   /* A live opener consumes nothing until it needs a persistent identity.
    * Spending an already durable range needs no extra sync or journal frame. */
@@ -5169,21 +5179,22 @@ static void reopen_cohort(int already_synced) {
           after.incarnation > before.incarnation);
   ps_writer_close(writer);
 
-  /* Appended data needs one barrier even when the journal has stayed in the
-   * same scrubbed generation since the cold open. */
+  /* A live NoSync join after cold admission or checkpoint still sees a
+   * complete publication with the publisher's unchanged durability. */
   cert = readiness(join);
   REQUIRE(cert.ready > cert.durable);
   disk.syncs = 0;
   ok(ps_open(path, 0, &options, &first, &e), &e);
-  REQUIRE(disk.syncs == 1);
+  REQUIRE(!disk.syncs && readiness(first).durable == cert.durable);
   expect_value(first, key(3), 65, 3);
   ok(ps_close(join, &e), &e);
   join = NULL;
   ok(ps_checkpoint(first, &e), &e);
   capture_put(first, 4, 65);
+  cert = readiness(first);
   disk.syncs = 0;
   ok(ps_open(path, 0, &options, &join, &e), &e);
-  REQUIRE(disk.syncs == 1);
+  REQUIRE(!disk.syncs && readiness(join).durable == cert.durable);
   expect_value(join, key(4), 65, 4);
   ps_key stream = {88, 115, PS_STREAM};
   ps_owned_head *head = NULL;
@@ -5211,6 +5222,90 @@ static void reopen_cohort(int already_synced) {
   ps_owned_close(head);
   ok(ps_close(first, &e), &e);
   ok(ps_close(join, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void live_open_visibility(void) {
+  lc_error e = {0};
+  reopen_disk disk = {0};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_options durable = {.durable_sync = 1};
+  ps_space *first = NULL, *publisher = NULL, *join = NULL;
+  ps_writer *writer, *revision[2];
+  ps_key control = key(1);
+  uint64_t ready;
+  control.kind = PS_CONTROL;
+  ok(ps_open(path, 1, NULL, &first, &e), &e);
+  capture_put_key(first, control, 65);
+  capture_put(first, 2, 65);
+  capture_put(first, 3, 65);
+  ok(ps_checkpoint(first, &e), &e);
+  ok(ps_open(path, 0, &durable, &publisher, &e), &e);
+  writer = replay_value(publisher, control, 11, 65, &e);
+  ok(ps_internal_publish_deferred(writer, &ready, &e), &e);
+  ps_writer_close(writer);
+  revision[0] = replay_value(publisher, key(2), 12, 65, &e);
+  revision[1] = replay_value(publisher, key(3), 13, 65, &e);
+  ok(ps_revision_publish(revision, 2, 0, PS_COMMIT_DEFER_SYNC, NULL, NULL, &e),
+     &e);
+  ps_writer_close(revision[1]);
+  ps_writer_close(revision[0]);
+  capture_put(first, 4, 65);
+
+  ps_readiness_certificate cert = readiness(first);
+  REQUIRE(cert.durable < ready && ready < cert.ready);
+  disk.fail_sync = 1;
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(!disk.syncs && disk.journal_read == cert.journal_bytes + 64 &&
+          readiness(join).ready == cert.ready &&
+          readiness(join).durable == cert.durable);
+  expect_value(join, control, 65, 1);
+  expect_value(join, key(2), 65, 2);
+  expect_value(join, key(3), 65, 3);
+  expect_value(join, key(4), 65, 4);
+
+  disk.fail_sync = 0;
+  ok(ps_flush(join, &e), &e);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.ready);
+  expect_value(join, control, 65, 11);
+  expect_value(join, key(2), 65, 12);
+  expect_value(join, key(3), 65, 13);
+  ok(ps_close(join, &e), &e);
+  ok(ps_close(publisher, &e), &e);
+  ok(ps_close(first, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+}
+static void live_open_structural_barrier(void) {
+  lc_error e = {0};
+  reopen_disk disk = {0};
+  ps_io io = {&disk, reopen_read, durable_write, reopen_sync, reserve_io, NULL};
+  ps_options options = {.io = &io};
+  ps_space *first = NULL, *publisher = NULL, *join = NULL;
+  ps_catalog_info record;
+  ps_catalog_view *view = NULL;
+  ok(ps_open(path, 1, NULL, &first, &e), &e);
+  ok(ps_open(path, 0, &options, &publisher, &e), &e);
+  disk.fail_sync = 1;
+  REQUIRE(ps_catalog_create_namespace(publisher, "structural", 10, &record,
+                                      &e) == LC_ERR_TRANSPORT);
+  lc_error_cleanup(&e);
+  ok(ps_close(publisher, &e), &e);
+  ps_readiness_certificate cert = readiness(first);
+  REQUIRE(!cert.pending && cert.durable < cert.ready);
+
+  disk = (reopen_disk){0, 1};
+  REQUIRE(ps_open(path, 0, &options, &join, &e) == LC_ERR_TRANSPORT && !join &&
+          disk.syncs == 1 && readiness(first).durable == cert.durable);
+  lc_error_cleanup(&e);
+  disk = (reopen_disk){0};
+  ok(ps_open(path, 0, &options, &join, &e), &e);
+  REQUIRE(disk.syncs == 1 && readiness(first).durable == cert.ready);
+  ok(ps_catalog_get(join, 0, PS_CATALOG_NAMESPACE, "structural", 10, &view, &e),
+     &e);
+  REQUIRE(view);
+  ps_catalog_view_close(view);
+  ok(ps_close(join, &e), &e);
+  ok(ps_close(first, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static void cold_open_prior_durability(void) {
@@ -8736,6 +8831,8 @@ int main(int argc, char **argv) {
     reopen_after_checkpoint();
     reopen_cohort(0);
     reopen_cohort(1);
+    live_open_visibility();
+    live_open_structural_barrier();
     cold_open_prior_durability();
     cold_open_volatile_hint();
     cold_open_stream_suffix(0);
