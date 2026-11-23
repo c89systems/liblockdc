@@ -3991,20 +3991,69 @@ static int lc_outbox_job_renew_method(lc_outbox_job *self, long ttl_seconds,
   return rc;
 }
 
+typedef struct lc_outbox_terminal_cleanup {
+  lc_outbox_job_handle *job;
+  int checkpoint;
+  int committed;
+  int failed;
+} lc_outbox_terminal_cleanup;
+
+static void
+lc_outbox_terminal_cleanup_failed(lc_outbox_terminal_cleanup *cleanup,
+                                  lc_error *error) {
+  cleanup->failed = 1;
+  lc_outbox_record_error(cleanup->job->outbox, error);
+  if (error != NULL) {
+    lc_error_cleanup(error);
+    lc_error_init(error);
+  }
+}
+
+static int lc_outbox_cleanup_terminal(void *context, lc_error *error) {
+  lc_outbox_terminal_cleanup *cleanup = context;
+  lc_outbox_job_handle *job = cleanup->job;
+  lc_release_req release;
+  int rc;
+
+  if (cleanup->checkpoint) {
+    rc = lc_outbox_cleanup_completed_checkpoint(job, error);
+    if (rc != LC_OK && !cleanup->committed)
+      return rc;
+    if (rc != LC_OK)
+      lc_outbox_terminal_cleanup_failed(cleanup, error);
+  }
+  lc_release_req_init(&release);
+  if (job->state_lease != NULL) {
+    rc = lc_lease_release(job->state_lease, &release, error);
+    if (rc != LC_OK && !cleanup->committed)
+      return rc;
+    if (rc == LC_OK)
+      job->state_lease = NULL;
+    else
+      lc_outbox_terminal_cleanup_failed(cleanup, error);
+  }
+  rc = lc_lease_release(job->lease, &release, error);
+  if (rc != LC_OK && !cleanup->committed)
+    return rc;
+  if (rc == LC_OK)
+    job->lease = NULL;
+  else
+    lc_outbox_terminal_cleanup_failed(cleanup, error);
+  return LC_OK;
+}
+
 static int lc_outbox_job_terminal_impl(lc_outbox_job *self, const char *state,
                                        lc_unix_seconds not_before_unix,
                                        const char *diagnostic,
                                        const lc_outbox_completion *completion,
                                        lc_error *error) {
   lc_outbox_job_handle *job = (lc_outbox_job_handle *)self;
+  lc_outbox_terminal_cleanup cleanup;
   lc_outbox_record record;
-  lc_release_req release;
   char dead_letter_marker_id[LC_XID_STRING_SIZE];
   char completed_marker_id[LC_XID_STRING_SIZE];
   lc_unix_seconds dead_letter_due_at_unix;
   lc_unix_seconds dead_letter_now;
-  int checkpoint_cleanup_failed;
-  int completed_parent_durable;
   int dead_letter_scheduled;
   int rc;
 
@@ -4015,8 +4064,10 @@ static int lc_outbox_job_terminal_impl(lc_outbox_job *self, const char *state,
   dead_letter_marker_id[0] = '\0';
   dead_letter_due_at_unix = 0;
   dead_letter_now = 0;
-  checkpoint_cleanup_failed = 0;
-  completed_parent_durable = 0;
+  memset(&cleanup, 0, sizeof(cleanup));
+  cleanup.job = job;
+  cleanup.checkpoint =
+      strcmp(state, "completed") == 0 && job->record.checkpoint_present != 0;
   dead_letter_scheduled = 0;
   if (job->staged_terminal_state != NULL) {
     if (strcmp(job->staged_terminal_state, state) != 0) {
@@ -4075,17 +4126,13 @@ static int lc_outbox_job_terminal_impl(lc_outbox_job *self, const char *state,
       if (rc != LC_OK)
         return rc;
     }
-    if (strcmp(state, "completed") == 0 &&
-        job->record.checkpoint_present != 0) {
+    if (cleanup.checkpoint) {
       rc = lc_outbox_state_reclaim_marker_write(job, error);
       if (rc != LC_OK)
         return rc;
-    }
-    if (strcmp(state, "completed") == 0 &&
-        job->record.checkpoint_present != 0) {
       rc = lc_outbox_save_completed_parent(job, &record, error);
       if (rc == LC_OK)
-        completed_parent_durable = 1;
+        cleanup.committed = 1;
     } else {
       rc = lc_outbox_save_envelope(job->client, job->lease, &record, error);
     }
@@ -4098,58 +4145,21 @@ static int lc_outbox_job_terminal_impl(lc_outbox_job *self, const char *state,
     job->staged_terminal_state = state;
     job->staged_terminal_not_before_unix = not_before_unix;
   }
-  lc_release_req_init(&release);
-  /* A completed delivery can never be replayed, so its host-owned checkpoint
-   * no longer carries recovery value. Remove it while the parent claim is
-   * still held: a failure leaves the staged terminal record and both handles
-   * retryable, rather than publishing an uncollectable terminal outcome. */
-  if (strcmp(state, "completed") == 0 && job->record.checkpoint_present != 0) {
-    rc = lc_outbox_cleanup_completed_checkpoint(job, error);
-    if (rc != LC_OK && !completed_parent_durable)
-      return rc;
-    if (rc != LC_OK) {
-      lc_outbox_record_error(job->outbox, error);
-      if (error != NULL) {
-        lc_error_cleanup(error);
-        lc_error_init(error);
-      }
-      checkpoint_cleanup_failed = 1;
-    }
-  }
-  if (job->state_lease != NULL) {
-    rc = lc_lease_release(job->state_lease, &release, error);
-    if (rc != LC_OK && !completed_parent_durable)
-      return rc;
-    if (rc == LC_OK) {
-      job->state_lease = NULL;
-    } else {
-      lc_outbox_record_error(job->outbox, error);
-      if (error != NULL) {
-        lc_error_cleanup(error);
-        lc_error_init(error);
-      }
-      checkpoint_cleanup_failed = 1;
-    }
-  }
-  rc = lc_lease_release(job->lease, &release, error);
-  if (rc != LC_OK && !completed_parent_durable)
+  /* Any partial cleanup after the terminal decision is safe to replay. Cover
+   * the cleanup and lease releases before retiring their recovery marker. */
+  if (cleanup.committed && lc_outbox_coordinated(job->client))
+    rc = lc_pouch_state_finish_locked_durable_batch(
+        job->client->pouch, job->outbox->ns, lc_outbox_cleanup_terminal,
+        &cleanup, error);
+  else
+    rc = lc_outbox_cleanup_terminal(&cleanup, error);
+  if (rc != LC_OK && !cleanup.committed)
     return rc;
-  if (rc == LC_OK) {
-    job->lease = NULL;
-  } else {
-    lc_outbox_record_error(job->outbox, error);
-    if (error != NULL) {
-      lc_error_cleanup(error);
-      lc_error_init(error);
-    }
-    checkpoint_cleanup_failed = 1;
-  }
-  if (strcmp(state, "completed") == 0 && job->record.checkpoint_present != 0) {
-    if (!checkpoint_cleanup_failed) {
-      lc_outbox_state_reclaim_marker_remove_best_effort(job->outbox,
-                                                        job->outbox_key);
-    }
-  }
+  if (rc != LC_OK)
+    lc_outbox_terminal_cleanup_failed(&cleanup, error);
+  if (cleanup.checkpoint && !cleanup.failed)
+    lc_outbox_state_reclaim_marker_remove_best_effort(job->outbox,
+                                                      job->outbox_key);
   job->terminal = 1;
   lc_outbox_job_refresh(job);
   lc_outbox_cancel_delayed_notification(job->outbox, job->outbox_key);

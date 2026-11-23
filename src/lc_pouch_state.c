@@ -3291,6 +3291,28 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
   return lc_pouch_state_with_namespace_lock_mode(
       pouch, ns, LC_POUCH_NAMESPACE_FOREGROUND, 0, 1, callback, context, error);
 }
+
+int lc_pouch_state_finish_locked_durable_batch(
+    lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
+    void *context, lc_error *error) {
+  lc_pouch_state_commit_group *group = lc_pouch_state_commit_group_current();
+  int force_sync, rc, sync_rc;
+  if (!pouch->storage.ops || !pouch->durable_sync)
+    return callback(context, error);
+  if (group == NULL || group->pouch != pouch ||
+      !lc_pouch_state_namespace_lock_is_held(pouch, ns))
+    return lc_error_set(error, LC_ERR_INVALID, 0L,
+                        "pouch durability batch requires namespace authority",
+                        NULL, NULL, "pouch");
+  force_sync = group->force_sync;
+  group->force_sync = 1;
+  rc = callback(context, error);
+  sync_rc =
+      lc_pouch_state_durable_scope_barrier(group, rc == LC_OK ? error : NULL);
+  group->force_sync = force_sync;
+  return rc == LC_OK ? sync_rc : rc;
+}
+
 int lc_pouch_state_with_namespace_durable_batch(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error) {

@@ -591,6 +591,11 @@ int lc_pouch_state_with_namespace_lock(lc_pouch *pouch, const char *ns,
 int lc_pouch_state_with_namespace_durable_batch(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error);
+/* Cover a phase of independent typed metadata changes with one root sync.
+ * The caller holds namespace authority and has committed any dependencies. */
+int lc_pouch_state_finish_locked_durable_batch(
+    lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
+    void *context, lc_error *error);
 int lc_pouch_state_with_background_namespace_lock(
     lc_pouch *pouch, const char *ns, lc_pouch_state_precondition_fn callback,
     void *context, lc_error *error);

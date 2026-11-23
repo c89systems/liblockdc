@@ -151,7 +151,16 @@ The parent decision is committed before that irreversible cleanup. Therefore a
 cleanup I/O failure cannot make a completed foreign effect redeliver without
 its checkpoint: completion remains successful, leaves the marker durable, and
 a later bounded stateful pull completes the exact cleanup. Failures before the
-parent decision remains durable leave the job retryable as usual.
+parent decision is durable leave the job retryable as usual.
+
+On the durable single-file backend, checkpoint cleanup and claim release share
+a durability barrier while the outbox namespace is held. Either change can
+survive an interrupted cleanup phase. The marker remains until the barrier
+succeeds, so recovery can still finish cleanup if any change was lost. This
+uses the same ordering principle as retaining SQLite's rollback journal until
+the writes it protects are durable. [SQLite atomic commit][sqlite-commit]
+
+[sqlite-commit]: https://www.sqlite.org/atomiccommit.html#flushing_changes_to_mass_storage
 
 The marker closes the power-loss gap between terminal publication and sidecar
 removal. Every later stateful pull checks at most one marker, loads only its

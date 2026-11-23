@@ -2354,6 +2354,8 @@ static void *worker(void *context) {
     shared_outbox_handoff(r->directory);
   else if (!strcmp(r->mode, "shared-outbox-recovery"))
     shared_outbox_recovery(r->directory);
+  else if (!strcmp(r->mode, "shared-outbox-completion"))
+    shared_outbox_completion(r->directory);
   else if (!strcmp(r->mode, "shared-messaging-capacity"))
     shared_messaging_capacity(r->directory, r->io_mode, r->sync);
   else if (!strcmp(r->mode, "shared-autonomous-capacity") ||
