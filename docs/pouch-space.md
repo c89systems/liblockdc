@@ -3,9 +3,8 @@
 ## Scope
 
 The experimental backend stores a Pouch root in one persistent file. It runs
-on Linux x86_64, AArch64, and ARM hard-float with GNU libc and musl.
-The Apple Silicon build targets macOS 15.0 or later and is ready for native
-APFS verification. The private
+on Linux x86_64, AArch64, and ARM hard-float with GNU libc and musl, and on
+Apple Silicon with macOS 15.0 or later. The private
 `ps_pouch_client_open` factory supports independently opened owners sharing
 that root. Normal Pouch opens multifile roots. Production cutover requires an
 explicit deployment decision. Existing-root migration and large-machine
@@ -116,6 +115,11 @@ uses the same case list as native `ctest -L pouch-space` and records page size,
 available volume blocks, and per-case logs beneath the supplied directory.
 Record available volume space alongside any capacity failure so container
 pressure can be distinguished from filesystem exhaustion.
+
+The GitHub Actions workflow on `experiment/pouch-space` builds the native
+suite, runs it on Apple Silicon with APFS, and checks cold reopen with Linux
+in both directions. All 69 cases passed on macOS 15.8.2 with 16 KiB pages.
+[Native APFS run](https://github.com/c89systems/liblockdc/actions/runs/45243737998)
 
 For cold cross-platform file exchange, `pouch_space_test FILE wire-create`
 writes a checkpointed value and a later journal publication.
