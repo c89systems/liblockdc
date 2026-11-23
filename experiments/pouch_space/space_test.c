@@ -3808,6 +3808,7 @@ static void canonical_stream_read_recovery(int native_zero, int durable,
     OK(ps_checkpoint(space, &error));
   OK(ps_stream_read_open(stream, first, 107, &held, &error));
   if (!action) {
+#ifdef __linux__
     operations = m.operations;
     allocation_call = 0;
     allocation_fail = 1;
@@ -3815,6 +3816,7 @@ static void canonical_stream_read_recovery(int native_zero, int durable,
     allocation_fail = 0;
     lc_error_cleanup(&error);
     CHECK(m.operations == operations && m.zero_calls == zeros);
+#endif
     OK(ps_status(space, &before, &error));
     OK(ps_stream_begin(stream, &writer, &error));
     OK(ps_status(space, &after, &error));
@@ -7904,6 +7906,38 @@ static int run_portable_case(const char *mode) {
     value_budget_concurrency();
     return 1;
   }
+  if (!strcmp(mode, "value-budget-process")) {
+    value_budget_process();
+    return 1;
+  }
+  if (!strcmp(mode, "stream-recovery")) {
+    const int zero_modes = ps_native_io.zero ? 2 : 1;
+    for (int durable = 0; durable < 2; ++durable)
+      canonical_stream_clean_probe(durable);
+    for (int zero = 0; zero < zero_modes; ++zero)
+      for (int durable = 0; durable < 2; ++durable) {
+        for (int action = 0; action < 3; ++action)
+          canonical_stream_read_recovery(zero, durable, action);
+        canonical_stream_repair_concurrency(zero, durable);
+        canonical_stream_repair_groups(zero, durable);
+      }
+    return 1;
+  }
+  if (!strcmp(mode, "stream-piece-repair")) {
+    for (int durable = 0; durable < 2; ++durable)
+      for (int fault = 0; fault < 2; ++fault)
+        piece_recovery_partial(durable, fault);
+    return 1;
+  }
+  if (!strcmp(mode, "stream-pieces")) {
+    bounded_pieces(0, 0);
+    bounded_pieces(0, 1);
+    bounded_pieces(1, 1);
+    piece_incremental(0);
+    piece_incremental(1);
+    append_growth_high_water();
+    return 1;
+  }
   if (!strcmp(mode, "budget-capacity")) {
     budget_capacity(0);
     budget_capacity(1);
@@ -8087,8 +8121,6 @@ int main(int argc, char **argv) {
       value_budget_rejections();
       for (int durable = 0; durable < 2; ++durable)
         value_budget_lifecycle(durable);
-    } else if (strcmp(argv[2], "value-budget-process") == 0) {
-      value_budget_process();
     } else if (strcmp(argv[2], "value-budget-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         value_budget_faults(durable);
@@ -8163,16 +8195,6 @@ int main(int argc, char **argv) {
       stream_lifecycle_concurrency(1);
       stream_lifecycle_invalid_events();
       stream_lifecycle_rebind_rollover();
-    } else if (strcmp(argv[2], "stream-recovery") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        canonical_stream_clean_probe(durable);
-      for (int zero = 0; zero < 2; ++zero)
-        for (int durable = 0; durable < 2; ++durable) {
-          for (int action = 0; action < 3; ++action)
-            canonical_stream_read_recovery(zero, durable, action);
-          canonical_stream_repair_concurrency(zero, durable);
-          canonical_stream_repair_groups(zero, durable);
-        }
     } else if (strcmp(argv[2], "owned-repack") == 0) {
       owned_repack(0);
       owned_repack(1);
@@ -8185,17 +8207,6 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "owned-page-packing") == 0) {
       owned_page_packing(0);
       owned_page_packing(1);
-    } else if (strcmp(argv[2], "stream-piece-repair") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        for (int fault = 0; fault < 2; ++fault)
-          piece_recovery_partial(durable, fault);
-    } else if (strcmp(argv[2], "stream-pieces") == 0) {
-      bounded_pieces(0, 0);
-      bounded_pieces(0, 1);
-      bounded_pieces(1, 1);
-      piece_incremental(0);
-      piece_incremental(1);
-      append_growth_high_water();
     } else if (strcmp(argv[2], "streams") == 0) {
       canonical_stream_exact_reservations();
       canonical_stream_lifecycle();

@@ -96,8 +96,9 @@ independently opened owners, lease fencing, and durable queue and collection
 behavior. The coordination suite checks lock lifetimes, large offsets,
 concurrent threads and processes, and injected I/O and lock failures.
 The physical storage suite covers protected completion at fixed capacity,
-concurrent namespace repack, and recovery from modeled write loss using
-the native storage callbacks.
+concurrent namespace repack, canonical stream and piece repair after modeled
+write loss, and recovery of streamed values after owner exit. It uses the
+native storage callbacks.
 
 Configure the Darwin smoke build with `LOCKDC_BUILD_TESTS=ON` to include
 `pouch_space_lease_test`. It covers shared lease fencing and expiry, queue

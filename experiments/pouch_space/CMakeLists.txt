@@ -112,7 +112,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
         checkpoint-idempotence root-covered-admission root-obligations
         standing-capacity standing-deletion native-metadata-shared-reserve
-        budget-capacity value-budget-capacity value-budget-concurrency metadata-growth
+        budget-capacity value-budget-capacity value-budget-concurrency value-budget-process
+        stream-recovery stream-pieces stream-piece-repair metadata-growth
         namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
         namespace-repack-churn)
       pouch_space_darwin_case(pouch_space_${mode} pouch_space_test 240 ${mode})
