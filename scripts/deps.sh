@@ -562,7 +562,7 @@ download_cpkt_bundle() {
 
   rm -rf "$extract_root"
   mkdir -p "$extract_root"
-  tar -xzf "$archive_path" -C "$extract_root" --strip-components=1
+  tar -xpzf "$archive_path" -C "$extract_root" --strip-components=1
 }
 
 download_cpktdb_bundle() {
@@ -572,7 +572,7 @@ download_cpktdb_bundle() {
   acquire_verified_archive "cpktdb" "$cpktdb_download_url" "$cpktdb_asset_hash" "$cpktdb_asset_name" "$archive_path"
   rm -rf "$extract_root"
   mkdir -p "$extract_root"
-  tar -xzf "$archive_path" -C "$extract_root" --strip-components=1
+  tar -xpzf "$archive_path" -C "$extract_root" --strip-components=1
 }
 
 download_lonejson_bundle() {
@@ -592,7 +592,7 @@ download_lonejson_bundle() {
 
   rm -rf "$extract_root"
   mkdir -p "$extract_root"
-  tar -xzf "$archive_path" -C "$extract_root" --strip-components=1
+  tar -xpzf "$archive_path" -C "$extract_root" --strip-components=1
 }
 
 download_liblql_bundle() {
@@ -612,7 +612,7 @@ download_liblql_bundle() {
 
   rm -rf "$extract_root"
   mkdir -p "$extract_root"
-  tar -xzf "$archive_path" -C "$extract_root" --strip-components=1
+  tar -xpzf "$archive_path" -C "$extract_root" --strip-components=1
 }
 
 download_pslog_bundle() {
