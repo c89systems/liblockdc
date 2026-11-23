@@ -2,8 +2,8 @@
 
 ## Scope
 
-The experimental Linux backend builds for x86_64 and AArch64 with GNU libc
-and musl and stores a Pouch root in one persistent file. The private
+The experimental Linux backend builds for x86_64, AArch64, and ARM hard-float
+with GNU libc and musl and stores a Pouch root in one persistent file. The private
 `ps_pouch_client_open` factory supports independently opened owners sharing
 that root. Normal Pouch opens multifile roots. Production cutover requires an
 explicit deployment decision. Existing-root migration and large-machine
@@ -72,8 +72,10 @@ grants. Unlinking an old segment requires its durable route and checkpoint cover
 ## Verification and performance
 
 Test observable behavior through the production Pouch and lockd paths. Linux
-AArch64 functional checks use QEMU, including cold reopen in both directions
-with x86_64. Readiness tests exercise simulated 16 KiB and 64 KiB mapping
+ARM functional checks use QEMU, including cold reopen in both directions with
+x86_64. On ARM hard-float they also cover the futex retry timeout and OFD
+lock ranges above the 32-bit offset limit. Readiness tests exercise simulated
+16 KiB and 64 KiB mapping
 alignment without changing the container layout. Performance comparisons use
 native hardware. Cover process and I/O failure, concurrent owners, retained readers,
 durable and NoSync recovery, fixed-capacity reclamation, explicit growth, and

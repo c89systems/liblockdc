@@ -2,6 +2,7 @@
 #include "crc.h"
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include <string.h>
 #include <zlib.h>
 
@@ -35,8 +36,8 @@ int ps_record_frame_begin(ps_record_writer *out, uint64_t length, lc_error *e) {
   unsigned char bytes[PS_FRAME_BYTES] = {0};
   int rc;
   if (!out || !out->writer || out->failed || out->framed ||
-      out->tail != out->start || out->start > UINT64_MAX - PS_FRAME_BYTES ||
-      length > UINT64_MAX - PS_FRAME_BYTES - out->start)
+      out->tail != out->start || out->start > LC_U64_MAX - PS_FRAME_BYTES ||
+      length > LC_U64_MAX - PS_FRAME_BYTES - out->start)
     return record_error(e, "batch frame requires a new append");
   rc = ps_stream_write(out->writer, bytes, sizeof(bytes), e);
   if (rc == LC_OK) {
@@ -64,7 +65,7 @@ static int streaming_frame_crc(ps_record_writer *out, uint64_t length,
       return rc;
     prefix = sizeof(bytes) + (uint64_t)h.key_len + h.meta_len;
     if (h.flags || h.type == PS_FRAME_TYPE || prefix > end - offset ||
-        h.payload_len > end - offset - prefix || h.payload_len > INT64_MAX)
+        h.payload_len > end - offset - prefix || h.payload_len > LC_I64_MAX)
       return record_error(e, "streamed frame has an invalid record span");
     rc = ps_stream_writer_crc(out->writer, offset, prefix, &prefix_crc, e);
     if (rc != LC_OK)
@@ -148,12 +149,12 @@ static int append(void *context, const struct iovec *parts, int count,
         ((header.flags & ~LC_POUCH_RECORD_FLAG_PENDING) ||
          header.key_len != parts[1].iov_len ||
          header.meta_len != parts[2].iov_len ||
-         out->tail > (uint64_t)INT64_MAX - LC_POUCH_RECORD_HEADER_BYTES ||
+         out->tail > (uint64_t)LC_I64_MAX - LC_POUCH_RECORD_HEADER_BYTES ||
          header.key_len >
-             (uint64_t)INT64_MAX - out->tail - LC_POUCH_RECORD_HEADER_BYTES ||
-         header.meta_len > (uint64_t)INT64_MAX - out->tail -
+             (uint64_t)LC_I64_MAX - out->tail - LC_POUCH_RECORD_HEADER_BYTES ||
+         header.meta_len > (uint64_t)LC_I64_MAX - out->tail -
                                LC_POUCH_RECORD_HEADER_BYTES - header.key_len ||
-         header.payload_len > (uint64_t)INT64_MAX - out->tail -
+         header.payload_len > (uint64_t)LC_I64_MAX - out->tail -
                                   LC_POUCH_RECORD_HEADER_BYTES -
                                   header.key_len - header.meta_len))
       rc = record_error(e, "canonical admission prefix exceeds its bounds");
@@ -166,13 +167,13 @@ static int append(void *context, const struct iovec *parts, int count,
     }
     out->record_start = out->tail;
     out->record_end = header.flags & LC_POUCH_RECORD_FLAG_PENDING
-                          ? UINT64_MAX
+                          ? LC_U64_MAX
                           : out->tail + LC_POUCH_RECORD_HEADER_BYTES +
                                 header.key_len + header.meta_len +
                                 header.payload_len;
   }
   for (i = 0; i < count && rc == LC_OK; ++i) {
-    if (parts[i].iov_len > UINT64_MAX - out->tail)
+    if (parts[i].iov_len > LC_U64_MAX - out->tail)
       return record_error(e, "canonical append exceeds logical range");
     rc = ps_stream_write(out->writer, parts[i].iov_base, parts[i].iov_len, e);
     if (rc == LC_OK) {
@@ -221,7 +222,7 @@ static int patch(void *context, uint64_t offset, const struct iovec *parts,
     if (rc != LC_OK)
       return rc;
     record_end = header.flags & LC_POUCH_RECORD_FLAG_PENDING
-                     ? UINT64_MAX
+                     ? LC_U64_MAX
                      : offset + LC_POUCH_RECORD_HEADER_BYTES + header.key_len +
                            header.meta_len + header.payload_len;
   }

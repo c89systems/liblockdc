@@ -3,6 +3,7 @@
 #include "collections.h"
 #include "lc_api_internal.h"
 #include "lc_collection_storage.h"
+#include "lc_intcompat.h"
 #include "owned.h"
 #include "query_index.h"
 #include <string.h>
@@ -34,7 +35,8 @@ static int capture(void *context, const void *name, size_t length,
       (length == 8U &&
        list->kind != (id & LC_COLLECTION_SNAPSHOT_BIT ? PS_CATALOG_SNAPSHOT
                                                       : PS_CATALOG_SEGMENT)) ||
-      (length == 16U && (!marked || marked > UINT64_C(0x7fffffffffffffff))) ||
+      (length == 16U &&
+       (!marked || marked > LC_U64_WORDS(0x7fffffffUL, 0xffffffffUL))) ||
       !info->stream.owner || !info->stream.key ||
       info->stream.kind != PS_STREAM)
     return corrupt(e);

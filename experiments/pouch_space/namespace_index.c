@@ -1,4 +1,5 @@
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_namespace.h"
 #include "namespace_internal.h"
 #include <string.h>
@@ -29,7 +30,7 @@ int ps_namespace_parse_source_leaf(const char *leaf, unsigned int *kind,
     return 0;
   for (; i < length - 4; ++i) {
     unsigned int digit = (unsigned int)(unsigned char)leaf[i] - '0';
-    if (digit > 9 || value > (UINT64_MAX - digit) / 10)
+    if (digit > 9 || value > (LC_U64_MAX - digit) / 10)
       return 0;
     value = value * 10 + digit;
   }

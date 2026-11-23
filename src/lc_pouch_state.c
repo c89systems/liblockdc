@@ -11,6 +11,7 @@
 #include "lc_collection_json.h"
 #include "lc_collection_maintenance.h"
 #include "lc_collection_record_recode.h"
+#include "lc_intcompat.h"
 #include "lc_log.h"
 #include "lc_pouch_collection_record.h"
 #include "lc_pouch_crypto.h"
@@ -8492,7 +8493,7 @@ int lc_pouch_state_record_decode_span(const unsigned char *span, size_t bytes,
   const unsigned char *key, *meta;
   uint64_t payload;
   int rc;
-  if (!span || !allocator || !leaf || !entry || bytes > (uint64_t)LC_I64_MAX)
+  if (!span || !allocator || !leaf || !entry || (bytes & ~(size_t)LC_I64_MAX))
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch state record decode requires bounded inputs",
                         NULL, NULL, "pouch");
@@ -8513,7 +8514,7 @@ int lc_pouch_state_record_terminal_span(const unsigned char *span, size_t bytes,
   const unsigned char *key;
   uint64_t payload;
   int rc;
-  if (!span || !out || bytes > (uint64_t)LC_I64_MAX)
+  if (!span || !out || (bytes & ~(size_t)LC_I64_MAX))
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch terminal record requires bounded inputs", NULL,
                         NULL, "pouch");
@@ -16397,13 +16398,13 @@ static uint64_t lc_pouch_state_metadata_request_bytes(
   strings[6] = NULL;
   for (i = 0; i < 6; ++i) {
     amount = strings[i] ? strlen(strings[i]) : 0;
-    if (amount > UINT64_MAX - bytes)
-      return UINT64_MAX;
+    if (amount > LC_U64_MAX - bytes)
+      return LC_U64_MAX;
     bytes += amount;
   }
   amount = request->options.has_metadata ? request->options.metadata_length
                                          : current->metadata_length;
-  return amount > UINT64_MAX - bytes ? UINT64_MAX : bytes + amount;
+  return amount > LC_U64_MAX - bytes ? LC_U64_MAX : bytes + amount;
 }
 static void *lc_pouch_state_metadata_append_worker(void *context) {
   lc_pouch_state_metadata_append_batcher *batcher;
@@ -16432,7 +16433,7 @@ static void *lc_pouch_state_metadata_append_worker(void *context) {
       next = limit ? lc_pouch_state_metadata_request_bytes(batcher->head) : 0;
       if (count && limit && (next > limit || bytes > limit - next))
         break;
-      bytes = next > UINT64_MAX - bytes ? UINT64_MAX : bytes + next;
+      bytes = next > LC_U64_MAX - bytes ? LC_U64_MAX : bytes + next;
       requests[count] = batcher->head;
       batcher->head = batcher->head->next;
       requests[count]->next = NULL;

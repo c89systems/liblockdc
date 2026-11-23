@@ -4,6 +4,7 @@
 #include "coordination.h"
 #include "lc_api_internal.h"
 #include "lc_collection_head.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_record.h"
 #include "namespace.h"
 #include "owned.h"
@@ -327,11 +328,11 @@ int ps_root_crypto_matches(ps_root *root, lc_pouch_crypto *crypto,
   return rc;
 }
 uint64_t ps_namespace_name_hash(const char *name) {
-  uint64_t hash = UINT64_C(14695981039346656037);
+  uint64_t hash = LC_U64_WORDS(0xcbf29ce4UL, 0x84222325UL);
   const unsigned char *p = (const unsigned char *)name;
   while (*p) {
     hash ^= *p++;
-    hash *= UINT64_C(1099511628211);
+    hash *= LC_U64_WORDS(0x00000100UL, 0x000001b3UL);
   }
   return hash;
 }

@@ -123,6 +123,26 @@ static int storage_reserve(void *context, int fd, off_t at, off_t n) {
   (void)context;
   return fallocate(fd, 0, at, n);
 }
+static void large_offsets(void) {
+  lc_error e = {0};
+  uint64_t first, last;
+  const uint64_t offset = PS_MAX_CAPACITY + PS_DATA;
+  file_create();
+  ps_coordination *a = owner_open(1, NULL, &e);
+  ps_coordination *b = owner_open(1, NULL, &e);
+
+  ok(ps_coordination_range(a, offset, PS_PAGE, 1, &e), &e);
+  ok(ps_coordination_conflict(b, offset, PS_PAGE, &first, &last, &e), &e);
+  REQUIRE(first == offset && last == offset + PS_PAGE);
+  ok(ps_coordination_conflict(b, PS_DATA, PS_PAGE, &first, &last, &e), &e);
+  REQUIRE(!first && !last);
+  ok(ps_coordination_range(a, offset, PS_PAGE, 0, &e), &e);
+  ok(ps_coordination_conflict(b, offset, PS_PAGE, &first, &last, &e), &e);
+  REQUIRE(!first && !last);
+  ok(ps_coordination_close(b, &e), &e);
+  ok(ps_coordination_close(a, &e), &e);
+  lc_error_cleanup(&e);
+}
 static void lifecycle(void) {
   lc_error e;
   lc_error_init(&e);
@@ -1001,6 +1021,8 @@ int main(int argc, char **argv) {
     lifecycle();
   else if (!strcmp(argv[2], "root-lifetime"))
     root_lifetime();
+  else if (!strcmp(argv[2], "large-offsets"))
+    large_offsets();
   else if (!strcmp(argv[2], "threads")) {
     threads();
     namespace_handoff();

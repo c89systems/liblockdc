@@ -1,6 +1,7 @@
 #include "stream.h"
 #include "crc.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "owned.h"
 
 #include <pthread.h>
@@ -897,7 +898,8 @@ static int ensure_capacity(ps_stream *s, ps_budget *budget, uint64_t end,
 static int reserve(ps_stream_writer *w, ps_budget *budget, uint64_t bytes,
                    int exact, lc_error *error) {
   int rc;
-  if (!w || w->failed || w->published || bytes > (uint64_t)INT64_MAX - w->start)
+  if (!w || w->failed || w->published ||
+      bytes > (uint64_t)LC_I64_MAX - w->start)
     return stream_error(error, LC_ERR_INVALID,
                         "stream reservation arguments invalid");
   rc = ensure_capacity(w->stream, budget, w->start + bytes, exact, error);
@@ -936,7 +938,7 @@ int ps_stream_write(ps_stream_writer *w, const void *bytes, size_t n,
   size_t take;
   int rc = LC_OK;
   if (!w || (!bytes && n) || w->failed || w->published ||
-      n > (uint64_t)INT64_MAX - w->start - w->bytes)
+      n > (uint64_t)LC_I64_MAX - w->start - w->bytes)
     return stream_error(error, LC_ERR_INVALID,
                         "stream append arguments invalid");
   while (n && rc == LC_OK) {

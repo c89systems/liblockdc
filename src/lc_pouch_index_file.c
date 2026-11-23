@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_index_store.h"
 #include "lc_pouch_internal.h"
 #include "lc_pouch_namespace.h"
@@ -228,7 +229,7 @@ static int leaf_generation(const char *leaf, uint64_t *generation) {
     return 0;
   for (i = 6U; i < 26U; ++i) {
     unsigned int digit = (unsigned int)(unsigned char)leaf[i] - '0';
-    if (digit > 9U || value > (UINT64_MAX - digit) / 10U)
+    if (digit > 9U || value > (LC_U64_MAX - digit) / 10U)
       return 0;
     value = value * 10U + digit;
   }

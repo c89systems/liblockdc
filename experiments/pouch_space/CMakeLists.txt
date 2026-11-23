@@ -1,6 +1,6 @@
 # Experimental Linux targets, never installed or linked into the product.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-   NOT LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64)$" OR NOT TARGET lc_static)
+   NOT LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64|armhf)$" OR NOT TARGET lc_static)
   return()
 endif()
 
@@ -149,7 +149,8 @@ if(LOCKDC_BUILD_TESTS)
       captures capture-faults capture-owned capture-race resident-capture packed-replay-locality key-index-growth
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail capacity-checkpoint pressure-reclaim
-      shared-durable shared-preparation readiness-cohort readiness-page-alignment reopen-cohort certified-prefix quarantine checkpoint-decode
+      shared-durable shared-preparation readiness-cohort readiness-page-alignment readiness-sync-timeout
+      reopen-cohort certified-prefix quarantine checkpoint-decode
       readiness-faults journal-wrap journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants
@@ -204,7 +205,7 @@ if(LOCKDC_BUILD_TESTS)
     "LINKER:--wrap=lc_realloc_with_allocator"
     "LINKER:--wrap=lc_strdup_with_allocator")
   lc_configure_c_test_target(pouch_space_coordination_test)
-  foreach(mode lifecycle root-lifetime threads faults processes)
+  foreach(mode lifecycle root-lifetime large-offsets threads faults processes)
     add_test(NAME pouch_space_coordination_${mode}
       COMMAND pouch_space_coordination_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_coordination_${mode} PROPERTIES TIMEOUT 120

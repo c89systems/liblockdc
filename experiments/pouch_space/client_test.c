@@ -76,7 +76,7 @@ static void *allocate(void *context, size_t n) {
   (void)context;
   if (!h)
     return NULL;
-  h->value.cookie = (uintptr_t)h ^ UINT64_C(0x15263748abcd9876);
+  h->value.cookie = (uintptr_t)h ^ (uintptr_t)UINT64_C(0x15263748abcd9876);
   h->value.size = n;
   __atomic_add_fetch(&live, 1, __ATOMIC_RELAXED);
   return h + 1;
@@ -86,7 +86,8 @@ static void deallocate(void *context, void *p) {
   if (!p)
     return;
   header *h = (header *)p - 1;
-  REQUIRE(h->value.cookie == ((uintptr_t)h ^ UINT64_C(0x15263748abcd9876)));
+  REQUIRE(h->value.cookie ==
+          ((uintptr_t)h ^ (uintptr_t)UINT64_C(0x15263748abcd9876)));
   h->value.cookie = 0;
   __atomic_sub_fetch(&live, 1, __ATOMIC_RELAXED);
   free(h);

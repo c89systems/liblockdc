@@ -1,4 +1,5 @@
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "namespace_internal.h"
 #include <string.h>
 
@@ -222,8 +223,8 @@ static int prepared_body(ps_namespace *ns,
       !ps_namespace_parse_source_leaf(span->container_leaf, &kind, &id) ||
       kind != PS_CATALOG_BODY || span->payload_offset < span->record_offset ||
       span->payload_length != converted->cipher_bytes ||
-      span->payload_length > (uint64_t)INT64_MAX ||
-      span->payload_offset > (uint64_t)INT64_MAX - span->payload_length)
+      span->payload_length > (uint64_t)LC_I64_MAX ||
+      span->payload_offset > (uint64_t)LC_I64_MAX - span->payload_length)
     return lc_error_set(e, LC_ERR_INVALID, 0,
                         "physical handoff requires a final namespace body",
                         NULL, NULL, "pouch");

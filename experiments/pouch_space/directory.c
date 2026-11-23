@@ -2,6 +2,7 @@
 #include "catalog.h"
 #include "crc.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "owned.h"
 #include "wire.h"
 
@@ -80,7 +81,7 @@ int ps_directory_key_compare(ps_key a, ps_key b) {
 static int valid_root(ps_directory_root root) {
   return (!root.offset && !root.generation) ||
          (root.offset && root.offset % PS_PAGE == 0 &&
-          root.offset <= (uint64_t)INT64_MAX - PS_PAGE && root.generation);
+          root.offset <= (uint64_t)LC_I64_MAX - PS_PAGE && root.generation);
 }
 static int valid_value(ps_key key, const ps_directory_value *value) {
   const ps_directory_extent *extent = &value->extent;
@@ -92,11 +93,12 @@ static int valid_value(ps_key key, const ps_directory_value *value) {
       value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
     const ps_directory_stream *stream = &value->stream;
     return key.kind == PS_STREAM && stream->incarnation &&
-           stream->tail <= stream->capacity && stream->capacity <= INT64_MAX &&
+           stream->tail <= stream->capacity && stream->capacity <= LC_I64_MAX &&
            (value->tag.storage == PS_DIRECTORY_STREAM || !stream->admitted_at);
   }
   if (!ref->offset || !ref->bytes || !ref->incarnation ||
-      ref->offset > INT64_MAX || ref->bytes > (uint64_t)INT64_MAX - ref->offset)
+      ref->offset > LC_I64_MAX ||
+      ref->bytes > (uint64_t)LC_I64_MAX - ref->offset)
     return 0;
   if (value->tag.storage == PS_DIRECTORY_DESCRIPTOR)
     return !extent->crc && !extent->deletion_bytes;
@@ -706,7 +708,7 @@ static int scan_children(ps_directory *d, ps_directory_root ref,
     if (level == 1) {
       uint64_t offset = ps_wire_get64(slot + 24);
       while (batch < SCAN_LEAF_PAGES && batch < count - first &&
-             offset <= (uint64_t)INT64_MAX - batch * PS_PAGE &&
+             offset <= (uint64_t)LC_I64_MAX - batch * PS_PAGE &&
              ps_wire_get64(slot + batch * SLOT + 24) ==
                  offset + batch * PS_PAGE)
         ++batch;
@@ -859,7 +861,7 @@ static int write_node(ps_directory *d, directory_node *node,
   node->written.offset = offset;
   node->written.generation = generation;
   d->allocated[d->allocated_count++] = node->written;
-  if (!offset || offset % PS_PAGE || offset > (uint64_t)INT64_MAX - PS_PAGE)
+  if (!offset || offset % PS_PAGE || offset > (uint64_t)LC_I64_MAX - PS_PAGE)
     return directory_error(error, LC_ERR_PROTOCOL,
                            "directory allocator returned an unaligned page");
   memset(page, 0, PS_PAGE);

@@ -1,5 +1,6 @@
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_storage.h"
 #include "namespace_internal.h"
@@ -380,7 +381,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
     }
     if (s->kind == PS_CATALOG_SEGMENT) {
       if (s->id > d->active &&
-          (d->active == UINT64_MAX || s->id != d->active + 1)) {
+          (d->active == LC_U64_MAX || s->id != d->active + 1)) {
         rc = failure(e, LC_ERR_PROTOCOL,
                      "namespace has an unexpected successor");
         break;
@@ -1121,7 +1122,7 @@ static int plan_append(struct ps_namespace_data *d, uint64_t selected,
                  "namespace active append stream is missing");
   if (rc != LC_OK)
     return rc;
-  if (start > (uint64_t)INT64_MAX || bytes > (uint64_t)INT64_MAX - start ||
+  if (start > (uint64_t)LC_I64_MAX || bytes > (uint64_t)LC_I64_MAX - start ||
       info.capacity < start)
     return failure(e, LC_ERR_INVALID, "namespace append exceeds logical range");
   need = bytes > info.capacity - start ? bytes - (info.capacity - start) : 0;
@@ -1190,7 +1191,7 @@ int ps_ns_rotation_plan(struct ps_namespace_data *d, ps_budget_plan *out,
   ps_budget_plan plan = *out;
   uint64_t next;
   int rc;
-  if (d->active == UINT64_MAX)
+  if (d->active == LC_U64_MAX)
     return failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
   next = d->active + 1;
   /* The routing record may need a fresh packed page. A new successor needs
@@ -1357,8 +1358,8 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
     return failure(
         e, LC_ERR_INVALID,
         "namespace complete append requires a positive span and valid mode");
-  if (minimum > (uint64_t)INT64_MAX ||
-      (framed && minimum > (uint64_t)INT64_MAX - PS_FRAME_BYTES))
+  if (minimum > (uint64_t)LC_I64_MAX ||
+      (framed && minimum > (uint64_t)LC_I64_MAX - PS_FRAME_BYTES))
     return failure(e, LC_ERR_INVALID,
                    "namespace append minimum exceeds local offset limit");
   span = framed ? minimum + PS_FRAME_BYTES : minimum;
@@ -1388,12 +1389,12 @@ int ps_namespace_append_begin(ps_namespace *ns, uint64_t target,
   selected = d->active;
   if (rc == LC_OK) {
     if (!selected || (target && d->tail >= target)) {
-      if (selected == UINT64_MAX)
+      if (selected == LC_U64_MAX)
         rc = failure(e, LC_ERR_INVALID, "namespace segment IDs exhausted");
       else {
         ++selected;
       }
-    } else if (pressured && target && selected < UINT64_MAX) {
+    } else if (pressured && target && selected < LC_U64_MAX) {
       rc = pressure_rotation(d, target, &early, e);
       if (rc == LC_OK && early)
         ++selected;
@@ -1545,7 +1546,7 @@ int ps_namespace_rotate(ps_namespace *ns, uint64_t expected, lc_error *e) {
     return rc;
   if (d->active == expected) {
     rc = ps_ns_rotate(d, NULL, e);
-  } else if (expected != UINT64_MAX && d->active == expected + 1) {
+  } else if (expected != LC_U64_MAX && d->active == expected + 1) {
     rc = ps_ns_seal_predecessor(d, expected, e);
     if (rc == LC_OK && d->seal_pending == expected)
       d->seal_pending = 0;
@@ -2088,7 +2089,7 @@ static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
       segment = view->items[i].id;
       end = view->items[i].tail;
       span = end - view->items[i].start;
-      bytes = span > UINT64_MAX - bytes ? UINT64_MAX : bytes + span;
+      bytes = span > LC_U64_MAX - bytes ? LC_U64_MAX : bytes + span;
     }
   }
   if (rc == LC_OK) {
@@ -2273,7 +2274,7 @@ int ps_namespace_checkpoint_flush(ps_namespace *ns, lc_error *e) {
 uint64_t ps_namespace_source_refs(ps_namespace *ns, unsigned int kind,
                                   uint64_t id) {
   struct ps_namespace_data *d;
-  uint64_t refs = UINT64_MAX;
+  uint64_t refs = LC_U64_MAX;
   if (ps_ns_data_get(ns, &d, NULL) != LC_OK)
     return refs;
   pthread_mutex_lock(&d->mutex);
@@ -2285,7 +2286,7 @@ uint64_t ps_namespace_source_refs(ps_namespace *ns, unsigned int kind,
 uint64_t ps_namespace_source_bytes(ps_namespace *ns, unsigned int kind,
                                    uint64_t id) {
   struct ps_namespace_data *d;
-  uint64_t bytes = UINT64_MAX;
+  uint64_t bytes = LC_U64_MAX;
   if (ps_ns_data_lookup(ns, &d, NULL) != LC_OK)
     return bytes;
   pthread_mutex_lock(&d->mutex);

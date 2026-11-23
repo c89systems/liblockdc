@@ -11678,10 +11678,10 @@ extracted:
      * prepared signature can use the full width of every wire field. Admit
      * their conservative text bound before any encoded generation producer. */
     manifest_bound =
-        UINT64_C(256) +
+        ((lc_u64)256) +
         (uint64_t)(manifest.segment_count + 1) *
-            (UINT64_C(192) +
-             LC_POUCH_QUERY_INDEX_MANIFEST_ARTIFACT_COUNT * UINT64_C(256));
+            (((lc_u64)192) +
+             LC_POUCH_QUERY_INDEX_MANIFEST_ARTIFACT_COUNT * ((lc_u64)256));
     rc = lc_pouch_index_revision_prepare(
         packed_ref, packed_generation != NULL ? packed_generation : "",
         packed_generation_length, packed_path_unpublished, manifest_bound,

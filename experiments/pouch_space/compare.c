@@ -5,6 +5,7 @@
 #include "lc_api_internal.h"
 #include "lc_collection_internal.h"
 #include "lc_collection_json.h"
+#include "lc_intcompat.h"
 #include "lc_pouch.h"
 #include "lc_pouch_collection_record.h"
 #include "lc_pouch_internal.h"
@@ -41,7 +42,7 @@ static int timed_sync(int fd, int data_only) {
   rc = data_only ? __real_fdatasync(fd) : __real_fsync(fd);
   saved_errno = errno;
   if (measured && clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
-    elapsed = (int64_t)(end.tv_sec - begin.tv_sec) * INT64_C(1000000000) +
+    elapsed = (int64_t)(end.tv_sec - begin.tv_sec) * 1000000000L +
               (int64_t)end.tv_nsec - (int64_t)begin.tv_nsec;
     if (elapsed > 0)
       __atomic_fetch_add(&syscall_sync_ns, (uint64_t)elapsed, __ATOMIC_RELAXED);
@@ -562,7 +563,7 @@ static void open_stores(comparison *c, int create, lc_error *e) {
       check(ps_open(c->store, create, &space_options, &c->space, e), e);
     if (c->streams) {
       for (i = 0; i < c->rows; ++i)
-        c->offsets[i] = UINT64_MAX;
+        c->offsets[i] = LC_U64_MAX;
       for (i = 0; i < c->writers; ++i)
         if (c->existing_records || c->collection)
           check(stream_named_open(&c->workers[i], create, e), e);
@@ -983,7 +984,7 @@ static void verify_states(comparison *c, lc_error *e) {
       lc_pouch_record_io io;
       struct iovec part;
       crc = 0;
-      require(c->offsets[id] != UINT64_MAX, "canonical latest row exists");
+      require(c->offsets[id] != LC_U64_MAX, "canonical latest row exists");
       stream_reader = NULL;
       window = NULL;
       if (c->collection) {

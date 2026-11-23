@@ -2,6 +2,7 @@
 #define _FILE_OFFSET_BITS 64
 #include "crc.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "revision.h"
 #include "space_internal.h"
 #include "wire.h"
@@ -55,7 +56,7 @@ struct ps_reader {
 /* Read-only imports keep byte 2, including across a cohort reset. Member
  * claims are tracked separately and publish a page hint before acquisition. */
 #define MEMBER_PIN_PRESENCE_OFFSET 7U
-#define TICKET_MAGIC UINT64_C(0x3154454b435450)
+#define TICKET_MAGIC LC_U64_WORDS(0x00315445UL, 0x4b435450UL)
 #define TICKET_HEADER 112U
 static int allocation_refresh(ps_space *, lc_error *);
 static int allocation_ranges_refresh(ps_space *, lc_error *);
@@ -475,10 +476,10 @@ int ps_internal_immutable_key(ps_key k) {
          (k.kind >= PS_KEY_METADATA && k.kind <= PS_NAMESPACE_CHECKPOINT);
 }
 static uint64_t key_hash(ps_key k) {
-  uint64_t h = k.key ^ (k.owner * UINT64_C(0x9e3779b97f4a7c15)) ^
-               (k.kind * UINT64_C(0xc2b2ae3d27d4eb4f));
+  uint64_t h = k.key ^ (k.owner * LC_U64_WORDS(0x9e3779b9UL, 0x7f4a7c15UL)) ^
+               (k.kind * LC_U64_WORDS(0xc2b2ae3dUL, 0x27d4eb4fUL));
   h ^= h >> 33;
-  h *= UINT64_C(0xff51afd7ed558ccd);
+  h *= LC_U64_WORDS(0xff51afd7UL, 0xed558ccdUL);
   return h ^ (h >> 33);
 }
 static int same_key(ps_key a, ps_key b) {
@@ -749,7 +750,7 @@ static void install(ps_space *s, ps_entry *p, ps_entry *old) {
   }
 }
 #define ENTRY_SLAB_SLOTS 32U
-#define ENTRY_SLAB_MASK ((UINT64_C(1) << ENTRY_SLAB_SLOTS) - 1)
+#define ENTRY_SLAB_MASK ((((lc_u64)1) << ENTRY_SLAB_SLOTS) - 1)
 typedef struct ps_stream_entry {
   ps_entry entry;
   ps_stream_state stream;
@@ -874,7 +875,7 @@ static ps_entry *entry_slab_take(ps_space *s, unsigned int kind,
     entry_available_link(block);
   }
   index = (unsigned int)__builtin_ctzll(~block->used & ENTRY_SLAB_MASK);
-  block->used |= UINT64_C(1) << index;
+  block->used |= ((lc_u64)1) << index;
   if (block->used == ENTRY_SLAB_MASK)
     entry_available_unlink(block);
   entry = entry_slab_entry(block, index);
@@ -919,12 +920,12 @@ static int projection_copy_predecessor(ps_space *s, ps_key key,
 static uint64_t entry_slab_bit(const ps_entry *p) {
   const void *slots = p->allocation + 1;
   if (p->allocation->layout == PS_ENTRY_HEAD)
-    return UINT64_C(1) << ((const ps_stream_slab_slot *)p -
+    return ((lc_u64)1) << ((const ps_stream_slab_slot *)p -
                            (const ps_stream_slab_slot *)slots);
   if (p->allocation->layout == PS_ENTRY_RUN)
-    return UINT64_C(1) << ((const ps_owned_run_slab_slot *)p -
+    return ((lc_u64)1) << ((const ps_owned_run_slab_slot *)p -
                            (const ps_owned_run_slab_slot *)slots);
-  return UINT64_C(1) << ((const ps_entry_slab_slot *)p -
+  return ((lc_u64)1) << ((const ps_entry_slab_slot *)p -
                          (const ps_entry_slab_slot *)slots);
 }
 void ps_internal_entry_auxiliary(ps_entry *p) {
@@ -1451,7 +1452,7 @@ static int peer_credits_read(ps_space *s, uint64_t low, uint64_t high,
     rc = transfer(s, words, sizeof(words), offset, 0, error);
     if (rc != LC_OK)
       return rc;
-    if (words[0] > UINT64_MAX - *metadata || words[1] > UINT64_MAX - *entries)
+    if (words[0] > LC_U64_MAX - *metadata || words[1] > LC_U64_MAX - *entries)
       return err(error, LC_ERR_PROTOCOL,
                  "shared budget credit totals overflow");
     *metadata += words[0];
@@ -1592,7 +1593,7 @@ static size_t cell_count(uint64_t bytes) {
   return (size_t)((bytes + PS_CELL - 1) / PS_CELL);
 }
 static uint64_t cell_mask(size_t at, size_t count) {
-  return count == CELLS ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << at;
+  return count == CELLS ? LC_U64_MAX : ((((lc_u64)1) << count) - 1) << at;
 }
 /* Consume the lowest contiguous span in a nonempty free-cell mask. */
 static size_t cell_span(uint64_t *free_cells, size_t *at) {
@@ -1600,7 +1601,7 @@ static size_t cell_span(uint64_t *free_cells, size_t *at) {
   size_t count;
   *at = (size_t)__builtin_ctzll(*free_cells);
   tail = *free_cells >> *at;
-  count = tail == UINT64_MAX ? CELLS : (size_t)__builtin_ctzll(~tail);
+  count = tail == LC_U64_MAX ? CELLS : (size_t)__builtin_ctzll(~tail);
   *free_cells &= ~cell_mask(*at, count);
   return count;
 }
@@ -1834,7 +1835,7 @@ static int payload_mark_pages(payload_rebuild *build, uint64_t offset,
     count = 64U - bit;
     if (count > end - page)
       count = end - page;
-    mask = (UINT64_MAX >> (64U - count)) << bit;
+    mask = (LC_U64_MAX >> (64U - count)) << bit;
     word = &build->pages[page / 64U];
     if (*word & mask)
       return err(error, LC_ERR_PROTOCOL, "overlapping container ownership");
@@ -1924,12 +1925,12 @@ static int payload_subtract(ps_space *s, ps_run ***cursor, uint64_t offset,
   *cursor = link;
   return exclude_selected(link, &s->free_bytes, offset, bytes, error);
 }
-/* Locate a used page, or a free page with flip set to UINT64_MAX. The
+/* Locate a used page, or a free page with flip set to LC_U64_MAX. The
  * caller supplies a start strictly inside the compact bitmap. */
 static unsigned int payload_bitmap_next(const uint64_t *pages, unsigned int at,
                                         unsigned int limit, uint64_t flip) {
   unsigned int word = at / 64U;
-  uint64_t bits = (pages[word] ^ flip) & (UINT64_MAX << (at % 64U));
+  uint64_t bits = (pages[word] ^ flip) & (LC_U64_MAX << (at % 64U));
   while (!bits) {
     if (++word * 64U >= limit)
       return limit;
@@ -1949,7 +1950,7 @@ static int payload_build_initial_free(ps_space *s, const payload_rebuild *b,
   s->free = NULL;
   s->free_bytes = 0;
   while (first < limit) {
-    first = payload_bitmap_next(b->pages, first, limit, UINT64_MAX);
+    first = payload_bitmap_next(b->pages, first, limit, LC_U64_MAX);
     if (first == limit)
       break;
     last = payload_bitmap_next(b->pages, first, limit, 0);
@@ -1983,7 +1984,7 @@ static int payload_rebuild_bitmap(ps_space *s, const payload_rebuild *build,
       bit = (unsigned int)__builtin_ctzll(word);
       suffix = word >> bit;
       count =
-          suffix == UINT64_MAX ? 64U : (unsigned int)__builtin_ctzll(~suffix);
+          suffix == LC_U64_MAX ? 64U : (unsigned int)__builtin_ctzll(~suffix);
       offset = (uint64_t)(i * 64U + bit) * PS_PAGE;
       if (offset != end) {
         if (end) {
@@ -1994,7 +1995,7 @@ static int payload_rebuild_bitmap(ps_space *s, const payload_rebuild *build,
         first = offset;
       }
       end = offset + (uint64_t)count * PS_PAGE;
-      word &= ~((UINT64_MAX >> (64U - count)) << bit);
+      word &= ~((LC_U64_MAX >> (64U - count)) << bit);
     }
   }
   return end ? payload_subtract(s, &link, first, end - first, error) : LC_OK;
@@ -2462,7 +2463,7 @@ static int valid_packed_extent(uint64_t offset, uint64_t bytes) {
          cell_count(bytes) * PS_CELL <= PS_PAGE - offset % PS_PAGE;
 }
 static int valid_stream_span(uint64_t tail, uint64_t capacity, uint64_t runs) {
-  return tail <= capacity && capacity <= INT64_MAX &&
+  return tail <= capacity && capacity <= LC_I64_MAX &&
          runs <= capacity / (PS_PAGE - PS_RUN_HEADER);
 }
 static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
@@ -2538,7 +2539,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     p->stream.run->mapped = (int)ps_wire_get32(wire + 72);
     if (!p->stream.run->capacity ||
         p->stream.run->capacity > PS_MIB - PS_RUN_HEADER ||
-        p->key.key > (uint64_t)INT64_MAX - p->stream.run->capacity ||
+        p->key.key > (uint64_t)LC_I64_MAX - p->stream.run->capacity ||
         ps_wire_get32(wire + 72) > 1 || ps_wire_get32(wire + 76) ||
         (!p->stream.run->mapped &&
          (p->bytes < PS_RUN_HEADER ||
@@ -2564,7 +2565,7 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
          : p->extents[i].flags == EXTENT_PACKED
              ? !valid_packed_extent(offset, n)
              : (p->extents[i].flags || offset % PS_PAGE || n % PS_PAGE)) ||
-        UINT64_MAX - sum < n)
+        LC_U64_MAX - sum < n)
       goto invalid;
     p->extents[i].offset = offset;
     p->extents[i].bytes = n;
@@ -2841,12 +2842,12 @@ static int metadata_bound(uint64_t bytes, uint64_t entries, uint64_t *bound,
                           lc_error *error) {
   uint64_t pages;
   *bound = 0;
-  if (bytes > (uint64_t)INT64_MAX / 2 ||
-      entries > (uint64_t)INT64_MAX / PS_PAGE)
+  if (bytes > (uint64_t)LC_I64_MAX / 2 ||
+      entries > (uint64_t)LC_I64_MAX / PS_PAGE)
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   pages = (bytes + META_PAYLOAD - 1) / META_PAYLOAD;
   pages += ps_directory_packed_pages(entries);
-  if (pages > UINT64_MAX / (2 * PS_PAGE))
+  if (pages > LC_U64_MAX / (2 * PS_PAGE))
     return err(error, LC_ERR_INVALID, "container metadata capacity exhausted");
   *bound = pages * PS_PAGE;
   return LC_OK;
@@ -2856,14 +2857,14 @@ static int metadata_claimed_bound(ps_space *s, uint64_t bytes, uint64_t entries,
   int rc = peer_credits(s, error);
   if (rc != LC_OK)
     return rc;
-  if (bytes > UINT64_MAX - s->reserved_metadata ||
-      entries > UINT64_MAX - s->reserved_entries)
+  if (bytes > LC_U64_MAX - s->reserved_metadata ||
+      entries > LC_U64_MAX - s->reserved_entries)
     return err(error, LC_ERR_INVALID, "container metadata budget overflow");
   bytes += s->reserved_metadata;
   entries += s->reserved_entries;
   if (s->allocation_guard) {
-    if (bytes > UINT64_MAX - s->peer_metadata_credits ||
-        entries > UINT64_MAX - s->peer_entry_credits)
+    if (bytes > LC_U64_MAX - s->peer_metadata_credits ||
+        entries > LC_U64_MAX - s->peer_entry_credits)
       return err(error, LC_ERR_INVALID, "shared metadata budget overflow");
     bytes += s->peer_metadata_credits;
     entries += s->peer_entry_credits;
@@ -2929,14 +2930,14 @@ static uint64_t ordinary_shortfall(ps_space *s, uint64_t target,
   uint64_t total;
   if (available)
     *available = 0;
-  if (floor > UINT64_MAX - extra ||
-      s->reserved_payload > UINT64_MAX - floor - extra)
-    return UINT64_MAX;
+  if (floor > LC_U64_MAX - extra ||
+      s->reserved_payload > LC_U64_MAX - floor - extra)
+    return LC_U64_MAX;
   total = s->reserved_payload + floor + extra;
   if (available && total <= s->free_bytes)
     *available = s->free_bytes - total;
-  if (payload > UINT64_MAX - total)
-    return UINT64_MAX;
+  if (payload > LC_U64_MAX - total)
+    return LC_U64_MAX;
   total += payload;
   return total > s->free_bytes ? total - s->free_bytes : 0;
 }
@@ -3028,8 +3029,8 @@ static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
     bytes = s->metadata;
   if (entries < s->live_entries)
     entries = s->live_entries;
-  if (plan.metadata_bytes > UINT64_MAX - bytes ||
-      plan.entries > UINT64_MAX - entries)
+  if (plan.metadata_bytes > LC_U64_MAX - bytes ||
+      plan.entries > LC_U64_MAX - entries)
     return err(e, LC_ERR_INVALID, "maintenance reserve metadata overflows");
   rc = metadata_claimed_bound(s, bytes + plan.metadata_bytes,
                               entries + plan.entries, &future, e);
@@ -3040,8 +3041,8 @@ static int reserve_floor(ps_space *s, uint64_t bytes, uint64_t entries,
   target = metadata_target(s, bound);
   future = metadata_target(s, future);
   extra = future > target ? future - target : 0;
-  if (plan.payload_bytes > UINT64_MAX - extra ||
-      *floor > UINT64_MAX - extra - plan.payload_bytes)
+  if (plan.payload_bytes > LC_U64_MAX - extra ||
+      *floor > LC_U64_MAX - extra - plan.payload_bytes)
     return err(e, LC_ERR_INVALID, "maintenance reserve payload overflows");
   *floor += extra + plan.payload_bytes;
   return LC_OK;
@@ -3757,10 +3758,10 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   ps_directory_pages changes;
   size_t i, zero_count = 0;
   int next = 1 - s->root, rc, removed, dense = 0;
-  if (s->generation == UINT64_MAX)
+  if (s->generation == LC_U64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
-  if (covered > UINT64_MAX - journal_start - PS_JOURNAL)
+  if (covered > LC_U64_MAX - journal_start - PS_JOURNAL)
     return err(error, LC_ERR_INVALID, "container journal cursor exhausted");
   journal_start += covered;
   if (force_dense)
@@ -3779,7 +3780,7 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
              ps_directory_packed_pages(s->live_entries)) *
             PS_PAGE;
     incremental =
-        bound <= (UINT64_MAX - extra) / 2 ? 2 * bound + extra : UINT64_MAX;
+        bound <= (LC_U64_MAX - extra) / 2 ? 2 * bound + extra : LC_U64_MAX;
     if (!force_dense && s->metadata_free_bytes < incremental &&
         reserve_floor(s, s->metadata, s->live_entries, bound, &floor, NULL) ==
             LC_OK &&
@@ -4142,8 +4143,8 @@ static int append_event_locked(ps_space *s, ps_entry *p, int event,
   unsigned char hint_frame[128];
   unsigned char *wire;
   int rc;
-  if (s->sequence == UINT64_MAX ||
-      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX)
+  if (s->sequence == LC_U64_MAX ||
+      __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == LC_U64_MAX)
     return err(error, LC_ERR_INVALID,
                "container publication sequence exhausted");
   wire =
@@ -4381,7 +4382,7 @@ static int root_valid(const unsigned char *p) {
          ps_wire_get64(p + 48) && ps_wire_get64(p + 48) <= PS_MAX_INCARNATION &&
          ps_wire_get64(p + 48) % TOKEN_RANGE == 0 &&
          ps_wire_get32(p + 72) == PS_ROOT_LAYOUT &&
-         journal_start <= UINT64_MAX - PS_JOURNAL && covered <= PS_JOURNAL &&
+         journal_start <= LC_U64_MAX - PS_JOURNAL && covered <= PS_JOURNAL &&
          covered <= journal_start &&
          checksum(p, ROOT_CHECKSUM) == ps_wire_get32(p + ROOT_CHECKSUM);
 }
@@ -4899,7 +4900,7 @@ static int load_owned_binding(metadata_recovery *recovery, ps_key key,
   /* The directory checked the alignment and extent size. A plain run's
    * capacity is its extent minus the immutable identity and footer area. */
   if (!directory_extent_in_bounds(s, ref) || ref->bytes <= PS_RUN_HEADER ||
-      key.key > (uint64_t)INT64_MAX - (ref->bytes - PS_RUN_HEADER))
+      key.key > (uint64_t)LC_I64_MAX - (ref->bytes - PS_RUN_HEADER))
     return err(error, LC_ERR_PROTOCOL, "invalid inline owned run extent");
   if (old && old->token != ref->incarnation)
     old = NULL;
@@ -5086,7 +5087,7 @@ static int load_open_binding(metadata_recovery *r, ps_key key,
     batch->next = 0;
   }
   index = batch->next++;
-  block->used |= UINT64_C(1) << index;
+  block->used |= ((lc_u64)1) << index;
   slot = (ps_entry_slab_slot *)(block + 1) + index;
   p = &slot->entry;
   p->allocation = block;
@@ -5239,7 +5240,7 @@ static int decode_revision(ps_space *s, const unsigned char *wire, size_t bytes,
   count = ps_wire_get32(wire + 16);
   if (bytes < 64 || ps_wire_get32(wire) != REVISION_MAGIC ||
       ps_wire_get32(wire + 4) != bytes || !count || count > (bytes - 64) / 64 ||
-      count > UINT64_MAX - s->sequence ||
+      count > LC_U64_MAX - s->sequence ||
       ps_wire_get64(wire + 8) != s->sequence + 1 ||
       ps_wire_get32(wire + 20) > 1 || ps_wire_get64(wire + 24) ||
       ps_wire_get64(wire + 32) || ps_wire_get64(wire + 40) ||
@@ -5832,7 +5833,7 @@ static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
   if (!head || head->stream.head->sealed ||
       p->key.key != head->stream.head->capacity || p->stream.run->mapped ||
       p->stream.run->capacity >
-          (uint64_t)INT64_MAX - head->stream.head->capacity)
+          (uint64_t)LC_I64_MAX - head->stream.head->capacity)
     return err(error, LC_ERR_PROTOCOL, "owned run grant is not contiguous");
   head->stream.head->capacity += p->stream.run->capacity;
   ++head->stream.head->runs;
@@ -6273,7 +6274,7 @@ restart:
   cursor = 0;
   effect = s->sequence;
   while (!(certificate.pending & PS_READINESS_CHECKPOINT_RETIRE) &&
-         journal_bound - cursor >= 64 && s->sequence != UINT64_MAX &&
+         journal_bound - cursor >= 64 && s->sequence != LC_U64_MAX &&
          (ps_wire_get32(wire + cursor) == EVENT_MAGIC ||
           ps_wire_get32(wire + cursor) == REVISION_MAGIC) &&
          ps_wire_get64(wire + cursor + 8) == s->sequence + 1) {
@@ -7461,7 +7462,7 @@ static int flush_writer_batch(ps_writer *const *writers, size_t count,
                               lc_error *error) {
   ps_space *s = writers[0]->space;
   ps_coordination_guard *guard;
-  size_t i, j, at, first[WRITER_FLUSH_BATCH];
+  size_t i, j, at, first[WRITER_FLUSH_BATCH] = {0};
   int rc;
   for (i = 0; i < count && !writers[i]->used; ++i) {
   }
@@ -7711,8 +7712,8 @@ static int publish_revision(ps_writer *const *writers, size_t count,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, error);
   if (rc == LC_OK &&
-      (count + retire_count > UINT64_MAX - s->sequence ||
-       count + retire_count > UINT64_MAX - __atomic_load_n(&s->pending_sequence,
+      (count + retire_count > LC_U64_MAX - s->sequence ||
+       count + retire_count > LC_U64_MAX - __atomic_load_n(&s->pending_sequence,
                                                            __ATOMIC_RELAXED)))
     rc = err(error, LC_ERR_INVALID, "revision publication sequence exhausted");
   if (rc == LC_OK && bytes > PS_JOURNAL - s->journal)
@@ -8977,7 +8978,7 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
         (x->flags
              ? x->offset % PS_CELL || x->bytes > PS_PAGE - x->offset % PS_PAGE
              : x->offset % PS_PAGE) ||
-        total > UINT64_MAX - x->bytes) {
+        total > LC_U64_MAX - x->bytes) {
       rc = err(error, LC_ERR_INVALID, "captured ticket extent exceeds bounds");
       goto done;
     }
@@ -9873,7 +9874,7 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   if (rc == LC_OK && (head->entry->deleted || head->entry->stream.head->sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
   if (rc == LC_OK && (base != head->entry->stream.head->capacity ||
-                      base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
+                      base > (uint64_t)LC_I64_MAX - (desired - PS_RUN_HEADER)))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
   if (rc == LC_OK)
     rc = ps_internal_token_range(s, error);
@@ -10054,7 +10055,7 @@ select_run:
     pthread_mutex_lock(&s->mutex);
     rc = healthy(s, error);
     if (rc == LC_OK &&
-        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+        __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == LC_U64_MAX) {
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
       rc = err(error, LC_ERR_TRANSPORT,
                "preparation readiness exhausted; reopen");
@@ -10703,7 +10704,7 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
   ps_space *s;
   uint64_t offset;
   uint32_t crc;
-  uint64_t reconstructed = UINT64_C(1) << 63;
+  uint64_t reconstructed = ((lc_u64)1) << 63;
   int rc;
   if (!run || !bytes || bytes > ps_owned_run_capacity(run) ||
       ps_owned_run_capacity(run) > PS_STREAM_PIECE_BYTES ||
@@ -11070,7 +11071,7 @@ static int owned_tail_allowed(ps_entry *p, uint64_t tail) {
 }
 static int owned_ready_sequence(ps_space *s, uint64_t *sequence,
                                 lc_error *error) {
-  if (__atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == UINT64_MAX) {
+  if (__atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED) == LC_U64_MAX) {
     __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
     return err(error, LC_ERR_TRANSPORT, "owned readiness exhausted; reopen");
   }

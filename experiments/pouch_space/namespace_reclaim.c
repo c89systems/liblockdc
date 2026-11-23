@@ -1,4 +1,5 @@
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "namespace_internal.h"
 #include <string.h>
 static int failure(lc_error *, const char *);
@@ -406,7 +407,7 @@ int ps_namespace_reap(ps_namespace *ns, uint64_t *closed, uint64_t *pending,
     rc = ps_ns_enter(d, e);
     if (rc == LC_OK) {
       ps_ns_resource *unused =
-          d->active == UINT64_MAX
+          d->active == LC_U64_MAX
               ? NULL
               : ps_ns_find(d, PS_CATALOG_SEGMENT, d->active + 1);
       if (unused && unused->unselected) {

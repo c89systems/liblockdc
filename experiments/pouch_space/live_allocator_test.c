@@ -2378,6 +2378,21 @@ static double projection_milliseconds(void) {
   REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
   return now.tv_sec * 1000.0 + now.tv_nsec / 1000000.0;
 }
+static void readiness_sync_timeout(void) {
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ok(ps_open(path, 1, NULL, &s, &e), &e);
+  uint32_t observed = ps_readiness_sync_observe(s);
+  double started = projection_milliseconds();
+  for (unsigned i = 0; i < 4; ++i)
+    REQUIRE(ps_readiness_sync_wait(s, observed));
+  /* Four 4 ms waits should take at least 12 ms. A timeout decoded as zero
+   * returns immediately on each call. */
+  REQUIRE(projection_milliseconds() - started >= 12.0);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
 typedef struct descriptor_probe {
   uint64_t pages[256];
   size_t reads[256], count;
@@ -8978,6 +8993,8 @@ int main(int argc, char **argv) {
     simulated_page_size = 65536;
     readiness_cohort();
     simulated_page_size = 0;
+  } else if (!strcmp(argv[2], "readiness-sync-timeout")) {
+    readiness_sync_timeout();
   } else if (!strcmp(argv[2], "reopen-cohort")) {
     reopen_after_checkpoint();
     reopen_cohort(0);

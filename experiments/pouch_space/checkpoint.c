@@ -3,6 +3,7 @@
 #include "catalog.h"
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_namespace.h"
 #include "lc_pouch_storage.h"
 #include "revision.h"
@@ -247,10 +248,10 @@ static void source_index_ranges(source_count *source) {
 }
 static uint64_t hash_key(const void *key, size_t n, unsigned int kind) {
   const unsigned char *p = key;
-  uint64_t h = UINT64_C(1469598103934665603) ^ kind;
+  uint64_t h = LC_U64_WORDS(0x14650fb0UL, 0x739d0383UL) ^ kind;
   while (n--) {
     h ^= *p++;
-    h *= UINT64_C(1099511628211);
+    h *= LC_U64_WORDS(0x00000100UL, 0x000001b3UL);
   }
   return h;
 }
@@ -452,9 +453,9 @@ static source_count *source_get(ps_key_checkpoint *c,
   size_t bucket, i, capacity;
   if (!r->found || !r->payload_span.present)
     return NULL;
-  if (r->payload_span.payload_offset > (uint64_t)INT64_MAX ||
+  if (r->payload_span.payload_offset > (uint64_t)LC_I64_MAX ||
       r->payload_span.payload_length >
-          (uint64_t)INT64_MAX - r->payload_span.payload_offset) {
+          (uint64_t)LC_I64_MAX - r->payload_span.payload_offset) {
     *rc = failure(e, LC_ERR_PROTOCOL, "checkpoint body range exceeds bounds");
     return NULL;
   }
@@ -1152,8 +1153,8 @@ static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
       rc = failure(e, LC_ERR_PROTOCOL, "checkpoint repeats a retained slot");
   }
   if (rc == LC_OK &&
-      (c->count - kept > UINT64_MAX - c->body_epoch ||
-       staged.count > UINT64_MAX - c->body_epoch - (c->count - kept)))
+      (c->count - kept > LC_U64_MAX - c->body_epoch ||
+       staged.count > LC_U64_MAX - c->body_epoch - (c->count - kept)))
     rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
   if (rc == LC_OK)
     rc = room(c, kept + staged.count, e);
@@ -1165,7 +1166,7 @@ static int rebase_selected(ps_key_checkpoint *c, const ps_values *values,
     memset(&c->claim, 0, sizeof(c->claim));
     (void)ps_budget_close(c->budget, NULL);
     c->budget = NULL;
-    if (c->logical_epoch != UINT64_MAX)
+    if (c->logical_epoch != LC_U64_MAX)
       ++c->logical_epoch;
   }
   for (link = &c->slots; (s = *link) != NULL;) {
@@ -1286,7 +1287,7 @@ uint64_t ps_key_checkpoint_source_bytes(ps_key_checkpoint *c, unsigned int kind,
   pthread_mutex_lock(&c->mutex);
   source = source_find(c, kind, id);
   if (source)
-    bytes = source->byte_carries ? UINT64_MAX : source->bytes;
+    bytes = source->byte_carries ? LC_U64_MAX : source->bytes;
   pthread_mutex_unlock(&c->mutex);
   return bytes;
 }
@@ -1343,7 +1344,7 @@ int ps_key_checkpoint_ranges(ps_key_checkpoint *c, unsigned int kind,
   size_t capacity = 0;
   int rc = LC_OK;
   if (!c || !out || !bytes || bytes > PS_STREAM_PIECE_BYTES ||
-      base > (uint64_t)INT64_MAX - bytes)
+      base > (uint64_t)LC_I64_MAX - bytes)
     return failure(e, LC_ERR_INVALID, "body capture requires a bounded piece");
   memset(out, 0, sizeof(*out));
   pthread_mutex_lock(&c->mutex);
@@ -1401,9 +1402,9 @@ int ps_key_checkpoint_read(ps_key_checkpoint *c, uint64_t id, ps_reader **out,
 
 static int add_plan(ps_budget_plan *p, const ps_budget_plan *extra,
                     lc_error *e) {
-  if (extra->payload_bytes > UINT64_MAX - p->payload_bytes ||
-      extra->metadata_bytes > UINT64_MAX - p->metadata_bytes ||
-      extra->entries > UINT64_MAX - p->entries)
+  if (extra->payload_bytes > LC_U64_MAX - p->payload_bytes ||
+      extra->metadata_bytes > LC_U64_MAX - p->metadata_bytes ||
+      extra->entries > LC_U64_MAX - p->entries)
     return failure(e, LC_ERR_INVALID, "checkpoint capacity totals overflow");
   p->payload_bytes += extra->payload_bytes;
   p->metadata_bytes += extra->metadata_bytes;
@@ -1842,7 +1843,7 @@ int ps_checkpoint_delta_prepare(ps_checkpoint_delta *d, lc_error *e) {
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
   if (rc == LC_OK)
-    if (d->count > UINT64_MAX - c->body_epoch)
+    if (d->count > LC_U64_MAX - c->body_epoch)
       rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
   if (rc == LC_OK)
     d->prepared = 1;
@@ -1909,12 +1910,12 @@ static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
     c->query_index = d->query_index;
   c->latest_segment = d->segment;
   c->latest_offset = d->end;
-  if (bytes > UINT64_MAX - c->uncovered_bytes)
-    c->uncovered_bytes = UINT64_MAX;
+  if (bytes > LC_U64_MAX - c->uncovered_bytes)
+    c->uncovered_bytes = LC_U64_MAX;
   else
     c->uncovered_bytes += bytes;
   c->changed = 1;
-  if (c->logical_epoch != UINT64_MAX)
+  if (c->logical_epoch != LC_U64_MAX)
     ++c->logical_epoch;
   d->accepted = 1;
   pthread_mutex_unlock(&c->mutex);
@@ -2016,7 +2017,7 @@ int ps_checkpoint_delta_replay_commit(ps_checkpoint_delta *d, uint64_t segment,
   if (!d->claim.entries && bytes)
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint replay has bytes without records");
-  else if (d->count > UINT64_MAX - c->body_epoch)
+  else if (d->count > LC_U64_MAX - c->body_epoch)
     rc = failure(e, LC_ERR_INVALID, "checkpoint body epoch exhausted");
   if (rc == LC_OK && d->claim.entries)
     rc = fund(c, &d->claim, e);
@@ -2320,7 +2321,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     lc_pouch_state_entry_cleanup(&c->allocator, &entry);
   }
   if (rc == LC_OK &&
-      (total != d->metadata_bytes || d->count > UINT64_MAX - c->body_epoch))
+      (total != d->metadata_bytes || d->count > LC_U64_MAX - c->body_epoch))
     rc = failure(e, LC_ERR_PROTOCOL,
                  "native metadata preparation exceeds its plan");
   if (rc == LC_OK) {
@@ -2413,7 +2414,7 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
     c->selected = selected;
     c->state_index = selected.state_index;
     c->query_index = selected.query_index;
-    if (!d->body_replacement && c->logical_epoch != UINT64_MAX)
+    if (!d->body_replacement && c->logical_epoch != LC_U64_MAX)
       ++c->logical_epoch;
     d->accepted = 1;
     (void)settle_retired(c, NULL);
@@ -2678,7 +2679,7 @@ struct ps_key_cursor {
 static int cursor_valid(ps_key_cursor *cursor, lc_error *e) {
   ps_key_checkpoint *c = cursor->checkpoint;
   return c->observer.prepare || c->dirty || c->changed ||
-                 c->logical_epoch == UINT64_MAX ||
+                 c->logical_epoch == LC_U64_MAX ||
                  c->logical_epoch != cursor->epoch
              ? failure(e, LC_ERR_INVALID,
                        "offline key cursor invalidated by logical mutation")

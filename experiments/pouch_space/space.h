@@ -9,15 +9,15 @@
  * public ABI and normal Pouch open path. Handles must not be used after fork.
  * A writer/reader belongs to one caller; independent callers share a space.
  * Stop concurrent calls before closing the space itself. */
-#define PS_MIB UINT64_C(1048576)
+#define PS_MIB ((uint64_t)1048576)
 #define PS_DEFAULT_CAPACITY (10 * PS_MIB)
 /* The upper half of signed file offsets is reserved for stream,
  * credit-record and transaction witnesses. It has no physical pages. */
-#define PS_MAX_CAPACITY (UINT64_C(1) << 62)
-#define PS_TRANSACTION_GUARD_SLOTS (UINT64_C(1) << 60)
+#define PS_MAX_CAPACITY ((uint64_t)1 << 62)
+#define PS_TRANSACTION_GUARD_SLOTS ((uint64_t)1 << 60)
 #define PS_CREDIT_RECORD_SLOTS (PS_MAX_CAPACITY / PS_PAGE)
 #define PS_TRANSACTION_GUARD_BASE                                              \
-  ((uint64_t)INT64_MAX - PS_TRANSACTION_GUARD_SLOTS)
+  (((uint64_t)-1 >> 1U) - PS_TRANSACTION_GUARD_SLOTS)
 #define PS_CREDIT_RECORD_BASE                                                  \
   (PS_TRANSACTION_GUARD_BASE - PS_CREDIT_RECORD_SLOTS)
 /* The top page of advisory addresses below the credit records is reserved

@@ -1,5 +1,6 @@
 #include "catalog.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "space_internal.h"
 #include "wire.h"
 #include <string.h>
@@ -18,12 +19,12 @@ static int arguments(unsigned int kind, const void *name, size_t length) {
 static uint64_t name_hash(uint64_t owner, unsigned int kind, const void *name,
                           size_t length) {
   const unsigned char *p = name;
-  uint64_t h = UINT64_C(14695981039346656037) ^ owner;
+  uint64_t h = LC_U64_WORDS(0xcbf29ce4UL, 0x84222325UL) ^ owner;
   size_t i;
-  h ^= (uint64_t)kind * UINT64_C(0x9e3779b97f4a7c15);
+  h ^= (uint64_t)kind * LC_U64_WORDS(0x9e3779b9UL, 0x7f4a7c15UL);
   for (i = 0; i < length; ++i) {
     h ^= p[i];
-    h *= UINT64_C(1099511628211);
+    h *= LC_U64_WORDS(0x00000100UL, 0x000001b3UL);
   }
   h ^= h >> 33;
   return h;

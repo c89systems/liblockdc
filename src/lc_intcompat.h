@@ -12,6 +12,7 @@ typedef uint64_t lc_u64;
 #define LC_I64_MAX ((lc_i64)(((lc_u64) - 1) >> 1U))
 #define LC_I64_MIN (-LC_I64_MAX - 1L)
 #define LC_U64_MAX ((lc_u64) - 1)
+#define LC_U64_WORDS(high, low) (((lc_u64)(high) << 32U) | (lc_u64)(low))
 
 int lc_i64_parse_base10(const char *text, lc_i64 *out_value);
 int lc_i64_format_base10(lc_i64 value, char *buffer, size_t buffer_size);

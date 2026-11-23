@@ -4,6 +4,7 @@
 #include "catalog.h"
 #include "coordination.h"
 #include "directory.h"
+#include "lc_intcompat.h"
 #include "owned.h"
 #include "readiness.h"
 #include "space.h"
@@ -17,8 +18,8 @@ typedef struct ps_catalog_index {
   struct ps_entry **buckets;
   size_t capacity, count;
 } ps_catalog_index;
-#define ROOT_MAGIC UINT64_C(0x31544f4f525350)
-#define EVENT_MAGIC UINT64_C(0x31565350)
+#define ROOT_MAGIC LC_U64_WORDS(0x0031544fUL, 0x4f525350UL)
+#define EVENT_MAGIC ((lc_u64)0x31565350)
 #define REVISION_MAGIC UINT32_C(0x31525350)
 #define BUCKETS 257U
 #define JOURNAL_OFFSET PS_JOURNAL_OFFSET
@@ -29,7 +30,7 @@ typedef struct ps_catalog_index {
 #define META_MAGIC UINT32_C(0x3141544d)
 #define META_HEADER 64U
 #define META_PAYLOAD (PS_PAGE - META_HEADER)
-#define TOKEN_RANGE UINT64_C(4294967296)
+#define TOKEN_RANGE LC_U64_WORDS(0x00000001UL, 0x00000000UL)
 #define TOKEN_POOL (16 * TOKEN_RANGE)
 enum ps_event {
   PS_PUT,
@@ -44,7 +45,7 @@ enum ps_event {
 };
 #define EXTENT_PACKED 1U
 #define EXTENT_OWNED 2U
-#define OWNED_MAGIC UINT64_C(0x314e55524f5350)
+#define OWNED_MAGIC LC_U64_WORDS(0x00314e55UL, 0x524f5350UL)
 #define CELLS (PS_PAGE / PS_CELL)
 
 typedef struct ps_extent {

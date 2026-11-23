@@ -2,21 +2,22 @@
 #define _FILE_OFFSET_BITS 64
 #include "crc.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "space_internal.h"
 #include <errno.h>
 #include <limits.h>
 #include <linux/futex.h>
+#include <linux/time_types.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
 #include <zlib.h>
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
-#define READY_MAGIC UINT64_C(0x4359444145525350)
+#define READY_MAGIC LC_U64_WORDS(0x43594441UL, 0x45525350UL)
 #define MEMBER_OFFSET 3U
 #define WORDS PS_READINESS_WORDS
 #define PENDING_WORD (PS_PAGE / sizeof(uint64_t) - 1)
@@ -26,8 +27,8 @@
 #define CREDIT_SPILL (SYNC_WORD - 1)
 #define CREDIT_ACTIVE (CREDIT_SPILL - 1)
 #define CREDIT_RECORDS (CREDIT_ACTIVE - 2 * PS_READINESS_CREDIT_SLOTS)
-#define PRESSURE_BIT (UINT64_C(1) << 63)
-#define REUSED_OPEN_BARRIER_BIT (UINT64_C(1) << 62)
+#define PRESSURE_BIT (((lc_u64)1) << 63)
+#define REUSED_OPEN_BARRIER_BIT (((lc_u64)1) << 62)
 #define NONPENDING_BITS (PRESSURE_BIT | REUSED_OPEN_BARRIER_BIT)
 #define BITMAP_WORDS ((CREDIT_RECORDS - 2 * WORDS) / 2)
 #define ZERO_BITMAP (2 * WORDS)
@@ -90,7 +91,7 @@ int ps_readiness_credit_reserve(ps_space *s, lc_error *e) {
       return rc;
     /* Acquisition and peer sums share allocator authority. A previous OFD
      * can leave a positive bit on death, including during publication. */
-    (void)__atomic_fetch_and(r->page + CREDIT_ACTIVE, ~(UINT64_C(1) << i),
+    (void)__atomic_fetch_and(r->page + CREDIT_ACTIVE, ~(((lc_u64)1) << i),
                              __ATOMIC_RELEASE);
     r->credit_slot = i;
     break;
@@ -103,7 +104,7 @@ int ps_readiness_credit_publish(ps_space *s) {
   if (r->credit_metadata == s->reserved_metadata &&
       r->credit_entries == s->reserved_entries)
     return 1;
-  bit = UINT64_C(1) << r->credit_slot;
+  bit = ((lc_u64)1) << r->credit_slot;
   if (!s->reserved_metadata && !s->reserved_entries) {
     /* Peers that already observed our bit can still count the previous
      * promise. Only new positive promises need the allocator. */
@@ -130,12 +131,12 @@ int ps_readiness_credit_collect(ps_space *s, uint64_t *metadata,
   if (!r)
     return LC_OK;
   active = __atomic_load_n(r->page + CREDIT_ACTIVE, __ATOMIC_ACQUIRE) &
-           ((UINT64_C(1) << PS_READINESS_CREDIT_SLOTS) - 1);
+           ((((lc_u64)1) << PS_READINESS_CREDIT_SLOTS) - 1);
   if (ps_readiness_credit_registered(s))
-    active &= ~(UINT64_C(1) << r->credit_slot);
+    active &= ~(((lc_u64)1) << r->credit_slot);
   while (active) {
     slot = (unsigned int)__builtin_ctzll(active);
-    bit = UINT64_C(1) << slot;
+    bit = ((lc_u64)1) << slot;
     active &= ~bit;
     offset = PS_CREDIT_RECORD_BASE + slot;
     rc = ps_coordination_conflict(s->coordination, offset, 1, &first, &last, e);
@@ -148,7 +149,7 @@ int ps_readiness_credit_collect(ps_space *s, uint64_t *metadata,
     record = r->page + CREDIT_RECORDS + 2 * slot;
     bytes = __atomic_load_n(record, __ATOMIC_RELAXED);
     count = __atomic_load_n(record + 1, __ATOMIC_RELAXED);
-    if (bytes > UINT64_MAX - *metadata || count > UINT64_MAX - *entries)
+    if (bytes > LC_U64_MAX - *metadata || count > LC_U64_MAX - *entries)
       return lc_error_set(e, LC_ERR_PROTOCOL, 0,
                           "shared budget credit totals overflow", NULL, NULL,
                           "pouch-space");
@@ -180,7 +181,7 @@ int ps_readiness_prepare_ticket(ps_space *s, uint64_t *out, lc_error *e) {
   word = s->readiness->page + PREPARATION_WORD;
   issued = __atomic_load_n(word, __ATOMIC_RELAXED);
   do {
-    if (issued == UINT64_MAX)
+    if (issued == LC_U64_MAX)
       return failed(s, e, "shared preparation tickets exhausted; close cohort");
   } while (!__atomic_compare_exchange_n(word, &issued, issued + 1, 0,
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
@@ -316,8 +317,10 @@ uint32_t ps_readiness_sync_observe(ps_space *s) {
   return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
 }
 int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
-  /* Owner death releases the OFD lock without changing the wake word. */
-  const struct timespec retry = {0, 4000000L};
+  /* Owner death releases the OFD lock without changing the wake word.
+   * The legacy futex syscall takes the kernel layout even when libc's
+   * timespec uses 64-bit seconds on a 32-bit target. */
+  const struct __kernel_old_timespec retry = {0, 4000000L};
   return syscall(SYS_futex, sync_word(s), FUTEX_WAIT, observed, &retry, NULL,
                  0) == 0 ||
          errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
@@ -336,7 +339,7 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
                          lc_error *e) {
   uint64_t *slot = s->readiness->page + (size_t)(1 - previous) * WORDS;
   size_t i;
-  if (record[GENERATION] == UINT64_MAX)
+  if (record[GENERATION] == LC_U64_MAX)
     return failed(s, e, "shared readiness generation exhausted; close cohort");
   ++record[GENERATION];
   record[CRC] = record_crc(record);
@@ -726,7 +729,7 @@ static void bitmap_pages(ps_space *s, size_t bitmap, uint64_t offset,
     count = 64 - shift;
     if (end - page < count)
       count = (unsigned int)(end - page);
-    mask = count == 64 ? UINT64_MAX : ((UINT64_C(1) << count) - 1) << shift;
+    mask = count == 64 ? LC_U64_MAX : ((((lc_u64)1) << count) - 1) << shift;
     word = s->readiness->page + bitmap + page / 64;
     if (set)
       __atomic_fetch_or(word, mask, __ATOMIC_ACQ_REL);

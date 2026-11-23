@@ -1,4 +1,5 @@
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "lc_pouch_internal.h"
 #include "namespace.h"
 #include "namespace_work.h"
@@ -78,7 +79,7 @@ static int candidate(void *context, const ps_namespace_source *source,
       w->selected_id = source->id;
     }
   }
-  if (bytes > UINT64_MAX - w->bytes)
+  if (bytes > LC_U64_MAX - w->bytes)
     return fail(e, LC_ERR_PROTOCOL, "maintenance candidate size overflow");
   ++w->candidates;
   w->bytes += bytes;

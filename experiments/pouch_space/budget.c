@@ -1,5 +1,6 @@
 #include "frame.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include "space_internal.h"
 
 static int invalid(lc_error *e, const char *message) {
@@ -212,9 +213,9 @@ int ps_internal_reserve_recheck(ps_space *s, uint64_t deletion, lc_error *e) {
 }
 static int reserve_valid(const ps_budget_plan *p, int recover, lc_error *e) {
   if (!p || p->payload_bytes % PS_PAGE || p->maintenance ||
-      p->payload_bytes > (uint64_t)INT64_MAX ||
-      p->metadata_bytes > (uint64_t)INT64_MAX / 2 ||
-      p->entries > (uint64_t)INT64_MAX / PS_PAGE || recover < 0 || recover > 1)
+      p->payload_bytes > (uint64_t)LC_I64_MAX ||
+      p->metadata_bytes > (uint64_t)LC_I64_MAX / 2 ||
+      p->entries > (uint64_t)LC_I64_MAX / PS_PAGE || recover < 0 || recover > 1)
     return invalid(e, "maintenance reserve requires a bounded aligned plan");
   return LC_OK;
 }
@@ -262,7 +263,7 @@ int ps_reserve_open(ps_space *s, const ps_budget_plan *p, int recover,
   r->plan = *p;
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
-  if (rc == LC_OK && s->reserve_next == UINT64_MAX)
+  if (rc == LC_OK && s->reserve_next == LC_U64_MAX)
     rc = invalid(e, "maintenance reserve owner identity exhausted");
   if (rc == LC_OK && !recover)
     rc = ps_internal_admission_begin(s, &guard, e);
@@ -328,9 +329,9 @@ void ps_reserve_close(ps_reserve *r) {
 }
 static int plan_add(ps_budget_plan *p, uint64_t payload, uint64_t metadata,
                     uint64_t entries, lc_error *e) {
-  if (!p || payload > UINT64_MAX - p->payload_bytes ||
-      metadata > UINT64_MAX - p->metadata_bytes ||
-      entries > UINT64_MAX - p->entries)
+  if (!p || payload > LC_U64_MAX - p->payload_bytes ||
+      metadata > LC_U64_MAX - p->metadata_bytes ||
+      entries > LC_U64_MAX - p->entries)
     return invalid(e, "capacity plan totals overflow or plan is missing");
   p->payload_bytes += payload;
   p->metadata_bytes += metadata;
@@ -361,7 +362,7 @@ int ps_budget_plan_routing(ps_budget_plan *p, int create, lc_error *e) {
 }
 int ps_budget_plan_value(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   uint64_t pages, extents;
-  if (bytes > (uint64_t)INT64_MAX)
+  if (bytes > (uint64_t)LC_I64_MAX)
     return invalid(e, "capacity plan immutable value exceeds local bounds");
   pages = bytes / PS_PAGE + (bytes % PS_PAGE != 0);
   extents = pages + (bytes % PS_PAGE != 0);
@@ -371,12 +372,12 @@ int ps_budget_plan_value(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
 }
 int ps_budget_plan_span(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   uint64_t pages;
-  if (bytes > (uint64_t)INT64_MAX)
+  if (bytes > (uint64_t)LC_I64_MAX)
     return invalid(e, "capacity plan canonical span exceeds local bounds");
   pages = bytes / (PS_PAGE - PS_RUN_HEADER) +
           (bytes % (PS_PAGE - PS_RUN_HEADER) != 0);
-  if (pages > UINT64_MAX / PS_PAGE ||
-      pages > UINT64_MAX / PS_OWNED_DESCRIPTOR_BYTES)
+  if (pages > LC_U64_MAX / PS_PAGE ||
+      pages > LC_U64_MAX / PS_OWNED_DESCRIPTOR_BYTES)
     return invalid(e, "capacity plan canonical span overflows physical bounds");
   return plan_add(p, pages * PS_PAGE, pages * PS_OWNED_DESCRIPTOR_BYTES, pages,
                   e);
@@ -460,7 +461,7 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
                                lc_error *e) {
   ps_budget_plan next;
   int rc;
-  if (!p || deletion > (uint64_t)INT64_MAX - 512)
+  if (!p || deletion > (uint64_t)LC_I64_MAX - 512)
     return invalid(e, "maintenance plan deletion exceeds canonical bounds");
   next = *p;
   rc =
@@ -552,9 +553,9 @@ static int budget_open(ps_space *s, const ps_budget_plan *plan, int completion,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_healthy(s, e);
   if (rc == LC_OK &&
-      (plan->payload_bytes > UINT64_MAX - s->reserved_payload ||
-       plan->metadata_bytes > UINT64_MAX - s->reserved_metadata ||
-       plan->entries > UINT64_MAX - s->reserved_entries))
+      (plan->payload_bytes > LC_U64_MAX - s->reserved_payload ||
+       plan->metadata_bytes > LC_U64_MAX - s->reserved_metadata ||
+       plan->entries > LC_U64_MAX - s->reserved_entries))
     rc = invalid(e, "capacity budget totals overflow");
   if (rc == LC_OK && !receiver)
     rc = ps_internal_admission_begin(s, &guard, e);
@@ -646,9 +647,9 @@ int ps_budget_transfer(ps_budget *from, ps_budget *to,
                       amount->entries > from->remaining.entries))
     rc = invalid(e, "capacity transfer exceeds unspent source credits");
   if (rc == LC_OK &&
-      (amount->payload_bytes > UINT64_MAX - to->remaining.payload_bytes ||
-       amount->metadata_bytes > UINT64_MAX - to->remaining.metadata_bytes ||
-       amount->entries > UINT64_MAX - to->remaining.entries))
+      (amount->payload_bytes > LC_U64_MAX - to->remaining.payload_bytes ||
+       amount->metadata_bytes > LC_U64_MAX - to->remaining.metadata_bytes ||
+       amount->entries > LC_U64_MAX - to->remaining.entries))
     rc = invalid(e, "capacity transfer totals overflow");
   if (rc == LC_OK) {
     from->remaining.payload_bytes -= amount->payload_bytes;
@@ -701,9 +702,9 @@ int ps_budget_resize(ps_budget *b, const ps_budget_plan *plan, lc_error *e) {
   payload = s->reserved_payload - prior.payload_bytes;
   metadata = s->reserved_metadata - prior.metadata_bytes;
   entries = s->reserved_entries - prior.entries;
-  if (rc == LC_OK && (plan->payload_bytes > UINT64_MAX - payload ||
-                      plan->metadata_bytes > UINT64_MAX - metadata ||
-                      plan->entries > UINT64_MAX - entries))
+  if (rc == LC_OK && (plan->payload_bytes > LC_U64_MAX - payload ||
+                      plan->metadata_bytes > LC_U64_MAX - metadata ||
+                      plan->entries > LC_U64_MAX - entries))
     rc = invalid(e, "capacity resize totals overflow");
   if (rc == LC_OK && grows)
     rc = ps_internal_admission_begin(s, &guard, e);

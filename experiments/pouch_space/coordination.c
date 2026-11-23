@@ -2,6 +2,7 @@
 #define _FILE_OFFSET_BITS 64
 #include "coordination.h"
 #include "lc_api_internal.h"
+#include "lc_intcompat.h"
 #include <errno.h>
 #include <pthread.h>
 #include <string.h>
@@ -12,7 +13,7 @@
 #define FIXED (PS_COORDINATION_SYNC + 1U)
 #define BUCKETS 67U
 #define INITIALIZE_OFFSET 6U
-#define NS_BASE UINT64_C(512)
+#define NS_BASE ((lc_u64)512)
 #define COLLECTION_SLOTS 512U
 #define COLLECTION_BASE (2U * PS_PAGE - 6U * COLLECTION_SLOTS)
 #define NS_SLOTS (COLLECTION_BASE - NS_BASE)
@@ -102,8 +103,8 @@ int ps_coordination_conflict(ps_coordination *owner, uint64_t offset,
   struct flock lock;
   uint64_t end;
   int rc;
-  if (!first || !last || !bytes || offset > INT64_MAX ||
-      bytes > (uint64_t)INT64_MAX - offset)
+  if (!first || !last || !bytes || offset > LC_I64_MAX ||
+      bytes > (uint64_t)LC_I64_MAX - offset)
     return fail(e, LC_ERR_INVALID, 0, "invalid physical pin query");
   *first = *last = 0;
   rc = ps_coordination_check(owner, e);
@@ -122,8 +123,8 @@ int ps_coordination_conflict(ps_coordination *owner, uint64_t offset,
   if (rc == 0 && lock.l_whence == SEEK_SET && lock.l_start >= 0 &&
       lock.l_len >= 0 && (lock.l_type == F_RDLCK || lock.l_type == F_WRLCK)) {
     end = !lock.l_len || (uint64_t)lock.l_len >
-                             (uint64_t)INT64_MAX - (uint64_t)lock.l_start
-              ? (uint64_t)INT64_MAX
+                             (uint64_t)LC_I64_MAX - (uint64_t)lock.l_start
+              ? (uint64_t)LC_I64_MAX
               : (uint64_t)lock.l_start + (uint64_t)lock.l_len;
     *first = (uint64_t)lock.l_start < offset ? offset : (uint64_t)lock.l_start;
     *last = end > offset + bytes ? offset + bytes : end;
@@ -140,8 +141,8 @@ int ps_coordination_range(ps_coordination *owner, uint64_t offset,
                           uint64_t bytes, int acquire, lc_error *e) {
   struct flock lock;
   int rc;
-  if (!owner || !bytes || offset > INT64_MAX ||
-      bytes > (uint64_t)INT64_MAX - offset || (acquire != 0 && acquire != 1))
+  if (!owner || !bytes || offset > LC_I64_MAX ||
+      bytes > (uint64_t)LC_I64_MAX - offset || (acquire != 0 && acquire != 1))
     return fail(e, LC_ERR_INVALID, 0, "invalid physical ownership range");
   if (acquire && (rc = ps_coordination_check(owner, e)) != LC_OK)
     return rc;
@@ -287,7 +288,7 @@ static uint64_t keyed_offset(enum ps_coordination_domain domain,
            (identity ^ (identity >> 32)) % PS_COORDINATION_STREAM_CLAIM_SLOTS;
   }
   identity ^= identity >> 33;
-  identity *= UINT64_C(0xff51afd7ed558ccd);
+  identity *= LC_U64_WORDS(0xff51afd7UL, 0xed558ccdUL);
   identity ^= identity >> 33;
   if (domain == PS_COORDINATION_COLLECTION_CATALOG)
     return PS_READINESS_OFFSET + identity % COLLECTION_CATALOG_SLOTS;
