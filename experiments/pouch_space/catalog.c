@@ -213,7 +213,7 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
     return cat_error(e, LC_ERR_PROTOCOL, "invalid namespace owner record");
   if (!checkpoint && p->catalog->stream.kind) {
     p->catalog->target = target_entry(s, p->catalog);
-    if (!p->catalog->target || p->catalog->target->stream->orphan_claimed)
+    if (!p->catalog->target || p->catalog->target->stream.head->orphan_claimed)
       return cat_error(e, LC_ERR_PROTOCOL,
                        "catalog target is stale or retired");
   }
@@ -221,11 +221,11 @@ int ps_catalog_prepare_record(ps_space *s, ps_entry *p, int checkpoint,
 }
 static void release_target(ps_entry *target, uint64_t sequence, uint64_t wire) {
   if (target) {
-    --target->stream->catalog_refs;
-    if (sequence > target->stream->catalog_release)
-      target->stream->catalog_release = sequence;
-    if (wire > target->stream->catalog_release_wire)
-      target->stream->catalog_release_wire = wire;
+    --target->stream.head->catalog_refs;
+    if (sequence > target->stream.head->catalog_release)
+      target->stream.head->catalog_release = sequence;
+    if (wire > target->stream.head->catalog_release_wire)
+      target->stream.head->catalog_release_wire = wire;
   }
 }
 void ps_catalog_apply_record(ps_space *s, ps_entry *p, uint64_t sequence) {
@@ -237,7 +237,7 @@ void ps_catalog_apply_record(ps_space *s, ps_entry *p, uint64_t sequence) {
     ps_catalog_unlink(s, old);
   }
   if (p->catalog->target)
-    ++p->catalog->target->stream->catalog_refs;
+    ++p->catalog->target->stream.head->catalog_refs;
   link_name(s, p);
 }
 int ps_catalog_validate_directory(ps_space *s, lc_error *e) {
@@ -251,7 +251,7 @@ int ps_catalog_validate_directory(ps_space *s, lc_error *e) {
       if (!p->catalog->target)
         return cat_error(e, LC_ERR_PROTOCOL,
                          "checkpoint catalog target missing");
-      ++p->catalog->target->stream->catalog_refs;
+      ++p->catalog->target->stream.head->catalog_refs;
     }
   return LC_OK;
 }
@@ -262,9 +262,9 @@ void ps_catalog_drop_record(ps_space *s, ps_entry *p, uint64_t sequence,
   p->peer_sequence = wire;
 }
 static int target_retained(const ps_entry *p, uint64_t prefix, uint64_t peer) {
-  return p->stream->catalog_refs || p->stream->catalog_pins ||
-         p->stream->catalog_release > prefix ||
-         p->stream->catalog_release_wire > peer;
+  return p->stream.head->catalog_refs || p->stream.head->catalog_pins ||
+         p->stream.head->catalog_release > prefix ||
+         p->stream.head->catalog_release_wire > peer;
 }
 int ps_catalog_target_retained(ps_space *s, const ps_entry *p) {
   return target_retained(
@@ -388,7 +388,7 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog revision changed; reload binding");
     if (rc == LC_OK && target &&
-        (!ref_matches(s, head, target) || head->stream->orphan_claimed))
+        (!ref_matches(s, head, target) || head->stream.head->orphan_claimed))
       rc = cat_error(e, LC_ERR_INVALID,
                      "catalog stream reference or identity invalid");
     if (rc == LC_OK && old && !old->deleted && !old->catalog->stream.kind &&
@@ -396,8 +396,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
       rc = cat_error(e, LC_ERR_INVALID, "namespace ownership is immutable");
     if (rc == LC_OK)
       rc = ps_internal_token_range(s, e);
-    if (rc == LC_OK && head && !head->stream->catalog_refs &&
-        !head->stream->claim)
+    if (rc == LC_OK && head && !head->stream.head->catalog_refs &&
+        !head->stream.head->claim)
       rc = ps_internal_stream_claim(s, head->token, &claim, e);
     if (rc == LC_OK) {
       p->token = s->token_next++;
@@ -425,8 +425,8 @@ static int catalog_put(ps_space *s, ps_budget *budget, uint64_t owner,
        */
       ps_catalog_apply_record(s, p, sequence);
       if (head) {
-        preparation = head->stream->claim;
-        head->stream->claim = NULL;
+        preparation = head->stream.head->claim;
+        head->stream.head->claim = NULL;
       }
       p->publication_sequence = sequence;
       ps_internal_install(s, p);
@@ -556,7 +556,7 @@ static int catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
     ++p->pins;
     if (p->catalog->target) {
       ++p->catalog->target->pins;
-      ++p->catalog->target->stream->catalog_pins;
+      ++p->catalog->target->stream.head->catalog_pins;
     }
     ++s->readers;
     view->space = s;
@@ -568,7 +568,7 @@ static int catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   if (rc != LC_OK && view->entry) {
     if (view->target) {
       --view->target->pins;
-      --view->target->stream->catalog_pins;
+      --view->target->stream.head->catalog_pins;
     }
     --view->entry->pins;
     --s->readers;
@@ -624,7 +624,7 @@ void ps_catalog_view_close(ps_catalog_view *view) {
   --s->readers;
   if (view->target) {
     --view->target->pins;
-    --view->target->stream->catalog_pins;
+    --view->target->stream.head->catalog_pins;
   }
   --view->entry->pins;
   if (view->entry->state == 2 && view->entry->safe && !view->entry->pins)
@@ -669,7 +669,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
         ++v->pins;
         if (v->catalog->target) {
           ++v->catalog->target->pins;
-          ++v->catalog->target->stream->catalog_pins;
+          ++v->catalog->target->stream.head->catalog_pins;
         }
         ++s->readers;
       }
@@ -687,7 +687,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
       --p->pins;
       if (p->catalog->target) {
         --p->catalog->target->pins;
-        --p->catalog->target->stream->catalog_pins;
+        --p->catalog->target->stream.head->catalog_pins;
       }
       --s->readers;
       if (p->state == 2 && p->safe && !p->pins)
@@ -701,7 +701,7 @@ int ps_catalog_visit(ps_space *s, uint64_t owner, unsigned int kind,
   return rc;
 }
 static int orphan(const ps_entry *p, uint64_t prefix, uint64_t peer) {
-  return !p->stream->handles && !target_retained(p, prefix, peer);
+  return !p->stream.head->handles && !target_retained(p, prefix, peer);
 }
 int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
   ps_coordination_guard *guard;
@@ -714,8 +714,8 @@ int ps_catalog_orphans_pending(ps_space *s, int *out, lc_error *e) {
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
   for (i = 0U; rc == LC_OK && i < BUCKETS && !*out; ++i)
-    for (p = s->buckets->streams[i]; p; p = p->stream->next)
-      if (!p->stream->catalog_refs) {
+    for (p = s->buckets->streams[i]; p; p = p->stream.head->next)
+      if (!p->stream.head->catalog_refs) {
         *out = 1;
         break;
       }
@@ -740,7 +740,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   peer = s->peer_durable;
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->buckets->streams[i]; p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; p; p = p->stream.head->next)
       if (orphan(p, prefix, peer))
         ++count;
   if (rc == LC_OK && count) {
@@ -753,7 +753,7 @@ int ps_catalog_visit_orphans(ps_space *s, ps_catalog_orphan_fn callback,
     }
   }
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->buckets->streams[i]; p; p = p->stream->next)
+    for (p = s->buckets->streams[i]; p; p = p->stream.head->next)
       if (orphan(p, prefix, peer)) {
         entries[at++] = p;
         ++p->pins;

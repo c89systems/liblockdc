@@ -7687,11 +7687,11 @@ static void stream_header_capture(int durable) {
   for (ps_entry *p = writer->entries; p; p = p->all_next)
     if (p->state == 1 && !p->deleted && p->key.kind == PS_OWNED_RUN &&
         p->key.owner == info.ref.incarnation) {
-      REQUIRE(!p->stream->mapped && p->count == 1 &&
+      REQUIRE(!p->stream.run->mapped && p->count == 1 &&
               probe.count < sizeof(probe.offsets) / sizeof(probe.offsets[0]));
       probe.offsets[probe.count++] = (off_t)p->extents[0].offset;
       if (p->key.key < info.tail &&
-          p->stream->capacity > info.tail - p->key.key)
+          p->stream.run->capacity > info.tail - p->key.key)
         partial = (off_t)p->extents[0].offset;
     }
   REQUIRE(probe.count == info.runs && probe.count > 1 && partial);

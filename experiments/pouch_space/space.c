@@ -577,28 +577,30 @@ static size_t entry_bytes(const ps_entry *p) {
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
   ps_entry *p;
-  for (p = s->buckets->streams[token % BUCKETS]; p; p = p->stream->next)
+  for (p = s->buckets->streams[token % BUCKETS]; p; p = p->stream.head->next)
     if (p->token == token)
       return p;
   return NULL;
 }
 static void stream_register(ps_space *s, ps_entry *p) {
-  p->stream->next = s->buckets->streams[p->token % BUCKETS];
+  p->stream.head->next = s->buckets->streams[p->token % BUCKETS];
   s->buckets->streams[p->token % BUCKETS] = p;
 }
 static void stream_unregister(ps_space *s, ps_entry *p) {
   ps_entry **link = &s->buckets->streams[p->token % BUCKETS];
   while (*link != p)
-    link = &(*link)->stream->next;
-  *link = p->stream->next;
+    link = &(*link)->stream.head->next;
+  *link = p->stream.head->next;
 }
+enum ps_entry_layout { PS_ENTRY_VALUE, PS_ENTRY_HEAD, PS_ENTRY_RUN };
 typedef struct ps_entry_allocation {
   struct ps_entry_allocation *next, **link;
   /* Only slabs have an owner and can provide further entries. */
   ps_space *owner;
   struct ps_entry_allocation *available_next, **available_link;
   uint64_t used, auxiliary;
-  int temporary, stream;
+  int temporary;
+  enum ps_entry_layout layout;
 } ps_entry_allocation;
 
 static void entry_allocation_register(ps_space *s, ps_entry_allocation *block) {
@@ -667,43 +669,45 @@ static void dirty_entry(ps_space *s, ps_entry *p, ps_entry *old) {
 static uint64_t entry_storage(const ps_entry *);
 static void owned_unlink(ps_space *s, ps_entry *p) {
   ps_entry *head;
-  if (!p->stream->owned_linked)
+  if (!p->stream.run->owned_linked)
     return;
   head = stream_lookup(s, p->key.owner);
-  head->stream->storage -= entry_storage(p);
-  if (p->stream->owned_prev)
-    p->stream->owned_prev->stream->owned_next = p->stream->owned_next;
+  head->stream.head->storage -= entry_storage(p);
+  if (p->stream.run->owned_prev)
+    p->stream.run->owned_prev->stream.run->owned_next =
+        p->stream.run->owned_next;
   else
-    head->stream->owned_first = p->stream->owned_next;
-  if (p->stream->owned_next)
-    p->stream->owned_next->stream->owned_prev = p->stream->owned_prev;
+    head->stream.head->owned_first = p->stream.run->owned_next;
+  if (p->stream.run->owned_next)
+    p->stream.run->owned_next->stream.run->owned_prev =
+        p->stream.run->owned_prev;
   else
-    head->stream->owned_last = p->stream->owned_prev;
-  p->stream->owned_linked = 0;
+    head->stream.head->owned_last = p->stream.run->owned_prev;
+  p->stream.run->owned_linked = 0;
 }
 static void owned_link(ps_space *s, ps_entry *p, ps_entry *old) {
   ps_entry *head = stream_lookup(s, p->key.owner);
   if (!head)
     return; /* checkpoint installation rejects an unlinked run */
-  if (old && old->stream->owned_linked) {
-    head->stream->storage -= entry_storage(old);
-    p->stream->owned_prev = old->stream->owned_prev;
-    p->stream->owned_next = old->stream->owned_next;
-    old->stream->owned_linked = 0;
+  if (old && old->stream.run->owned_linked) {
+    head->stream.head->storage -= entry_storage(old);
+    p->stream.run->owned_prev = old->stream.run->owned_prev;
+    p->stream.run->owned_next = old->stream.run->owned_next;
+    old->stream.run->owned_linked = 0;
   } else {
-    p->stream->owned_prev = head->stream->owned_last;
-    p->stream->owned_next = NULL;
+    p->stream.run->owned_prev = head->stream.head->owned_last;
+    p->stream.run->owned_next = NULL;
   }
-  if (p->stream->owned_prev)
-    p->stream->owned_prev->stream->owned_next = p;
+  if (p->stream.run->owned_prev)
+    p->stream.run->owned_prev->stream.run->owned_next = p;
   else
-    head->stream->owned_first = p;
-  if (p->stream->owned_next)
-    p->stream->owned_next->stream->owned_prev = p;
+    head->stream.head->owned_first = p;
+  if (p->stream.run->owned_next)
+    p->stream.run->owned_next->stream.run->owned_prev = p;
   else
-    head->stream->owned_last = p;
-  p->stream->owned_linked = 1;
-  head->stream->storage += entry_storage(p);
+    head->stream.head->owned_last = p;
+  p->stream.run->owned_linked = 1;
+  head->stream.head->storage += entry_storage(p);
 }
 static void retire(ps_space *s, ps_entry *p) {
   value_unregister(s, p);
@@ -750,6 +754,10 @@ typedef struct ps_stream_entry {
   ps_entry entry;
   ps_stream_state stream;
 } ps_stream_entry;
+typedef struct ps_owned_run_entry {
+  ps_entry entry;
+  ps_owned_run_state run;
+} ps_owned_run_entry;
 typedef struct ps_entry_slab_slot {
   ps_entry entry;
   ps_extent extent;
@@ -758,12 +766,20 @@ typedef struct ps_stream_slab_slot {
   ps_stream_entry record;
   ps_extent extent;
 } ps_stream_slab_slot;
+typedef struct ps_owned_run_slab_slot {
+  ps_owned_run_entry record;
+  ps_extent extent;
+} ps_owned_run_slab_slot;
+static const size_t entry_base_bytes[] = {
+    sizeof(ps_entry), sizeof(ps_stream_entry), sizeof(ps_owned_run_entry)};
+static const size_t entry_slab_stride[] = {sizeof(ps_entry_slab_slot),
+                                           sizeof(ps_stream_slab_slot),
+                                           sizeof(ps_owned_run_slab_slot)};
 
 static ps_entry *entry_slab_entry(ps_entry_allocation *block,
                                   unsigned int index) {
-  if (block->stream)
-    return &((ps_stream_slab_slot *)(block + 1))[index].record.entry;
-  return &((ps_entry_slab_slot *)(block + 1))[index].entry;
+  unsigned char *slots = (unsigned char *)(block + 1);
+  return (ps_entry *)(slots + index * entry_slab_stride[block->layout]);
 }
 
 static void entry_allocation_unlink(ps_entry_allocation *block) {
@@ -773,14 +789,18 @@ static void entry_allocation_unlink(ps_entry_allocation *block) {
       block->next->link = block->link;
   }
 }
-static ps_entry_allocation **entry_available_head(ps_space *s, int stream,
-                                                  int temporary) {
-  ps_entry_slabs *slabs = stream ? &s->stream_entries : &s->value_entries;
+static ps_entry_allocation **
+entry_available_head(ps_space *s, enum ps_entry_layout layout, int temporary) {
+  ps_entry_slabs *slabs = &s->value_entries;
+  if (layout == PS_ENTRY_HEAD)
+    slabs = &s->stream_entries;
+  else if (layout == PS_ENTRY_RUN)
+    slabs = &s->owned_run_entries;
   return temporary ? &slabs->temporary : &slabs->available;
 }
 static void entry_available_link(ps_entry_allocation *block) {
   ps_entry_allocation **head =
-      entry_available_head(block->owner, block->stream, block->temporary);
+      entry_available_head(block->owner, block->layout, block->temporary);
   block->available_link = head;
   block->available_next = *head;
   if (*head)
@@ -795,44 +815,53 @@ static void entry_available_unlink(ps_entry_allocation *block) {
     block->available_next->available_link = block->available_link;
   block->available_link = NULL;
 }
-static int entry_has_stream(unsigned int kind) {
-  return kind == PS_STREAM || kind == PS_OWNED_RUN;
+static enum ps_entry_layout entry_layout(unsigned int kind) {
+  if (kind == PS_STREAM)
+    return PS_ENTRY_HEAD;
+  if (kind == PS_OWNED_RUN)
+    return PS_ENTRY_RUN;
+  return PS_ENTRY_VALUE;
+}
+static void entry_initialize(ps_entry *p, ps_entry_allocation *block,
+                             unsigned int kind, ps_extent *extent) {
+  if (block->layout == PS_ENTRY_HEAD)
+    p->stream.head = &((ps_stream_entry *)p)->stream;
+  else if (block->layout == PS_ENTRY_RUN)
+    p->stream.run = &((ps_owned_run_entry *)p)->run;
+  p->key.kind = kind;
+  p->allocation = block;
+  if (extent) {
+    p->extents = extent;
+    p->embedded_extents = 1;
+  }
 }
 ps_entry *ps_internal_entry_new(unsigned int kind, size_t extent_count) {
-  int extended = entry_has_stream(kind);
-  size_t base = extended ? sizeof(ps_stream_entry) : sizeof(ps_entry);
+  enum ps_entry_layout layout = entry_layout(kind);
+  size_t base = entry_base_bytes[layout];
   ps_entry_allocation *block = lc_calloc_with_allocator(
       NULL, 1, sizeof(*block) + base + extent_count * sizeof(ps_extent));
-  unsigned char *storage;
   ps_entry *p;
   if (!block)
     return NULL;
-  storage = (unsigned char *)(block + 1);
-  if (extended) {
-    ps_stream_entry *owner = (ps_stream_entry *)storage;
-    p = &owner->entry;
-    p->stream = &owner->stream;
-  } else
-    p = (ps_entry *)storage;
-  p->key.kind = kind;
-  p->allocation = block;
-  if (extent_count) {
-    p->extents = (ps_extent *)(storage + base);
-    p->embedded_extents = 1;
-  }
+  block->layout = layout;
+  p = (ps_entry *)(block + 1);
+  entry_initialize(p, block, kind,
+                   extent_count ? (ps_extent *)((unsigned char *)p + base)
+                                : NULL);
   return p;
 }
 /* The local allocator mutex, or private recovery ownership, protects slots.
  * A released slot can be reused while a sibling is retained by a reader.
  * Keep stream state out of the slots used by small values. */
-static ps_entry *entry_slab_take(ps_space *s, unsigned int kind, int temporary,
-                                 int stream) {
-  ps_entry_allocation *block = *entry_available_head(s, stream, temporary);
+static ps_entry *entry_slab_take(ps_space *s, unsigned int kind,
+                                 int temporary) {
+  enum ps_entry_layout layout = entry_layout(kind);
+  size_t base = entry_base_bytes[layout];
+  ps_entry_allocation *block = *entry_available_head(s, layout, temporary);
   ps_entry *entry;
   unsigned int index;
   if (!block) {
-    size_t stride =
-        stream ? sizeof(ps_stream_slab_slot) : sizeof(ps_entry_slab_slot);
+    size_t stride = entry_slab_stride[layout];
     block = lc_alloc_with_allocator(NULL,
                                     sizeof(*block) + ENTRY_SLAB_SLOTS * stride);
     if (!block)
@@ -840,7 +869,7 @@ static ps_entry *entry_slab_take(ps_space *s, unsigned int kind, int temporary,
     memset(block, 0, sizeof(*block));
     block->owner = s;
     block->temporary = temporary;
-    block->stream = stream;
+    block->layout = layout;
     entry_allocation_register(s, block);
     entry_available_link(block);
   }
@@ -849,26 +878,16 @@ static ps_entry *entry_slab_take(ps_space *s, unsigned int kind, int temporary,
   if (block->used == ENTRY_SLAB_MASK)
     entry_available_unlink(block);
   entry = entry_slab_entry(block, index);
-  if (stream) {
-    ps_stream_slab_slot *slot = (ps_stream_slab_slot *)entry;
-    memset(&slot->record, 0, sizeof(slot->record));
-    entry->stream = &slot->record.stream;
-    entry->extents = &slot->extent;
-  } else {
-    ps_entry_slab_slot *slot = (ps_entry_slab_slot *)entry;
-    memset(entry, 0, sizeof(*entry));
-    entry->extents = &slot->extent;
-  }
-  entry->key.kind = kind;
-  entry->allocation = block;
-  entry->embedded_extents = 1;
+  memset(entry, 0, base);
+  entry_initialize(entry, block, kind,
+                   (ps_extent *)((unsigned char *)entry + base));
   return entry;
 }
 static ps_entry *space_entry_new(ps_space *s, unsigned int kind, size_t count,
                                  int temporary) {
   if ((kind != PS_KEY_METADATA && kind != PS_KEY_DECISION) || count > 1)
     return ps_internal_entry_new(kind, count);
-  return entry_slab_take(s, kind, temporary, 0);
+  return entry_slab_take(s, kind, temporary);
 }
 static int projection_borrowed(const ps_space *s, const ps_entry *p) {
   return p && s->projection_resident &&
@@ -899,9 +918,12 @@ static int projection_copy_predecessor(ps_space *s, ps_key key,
 }
 static uint64_t entry_slab_bit(const ps_entry *p) {
   const void *slots = p->allocation + 1;
-  if (p->allocation->stream)
+  if (p->allocation->layout == PS_ENTRY_HEAD)
     return UINT64_C(1) << ((const ps_stream_slab_slot *)p -
                            (const ps_stream_slab_slot *)slots);
+  if (p->allocation->layout == PS_ENTRY_RUN)
+    return UINT64_C(1) << ((const ps_owned_run_slab_slot *)p -
+                           (const ps_owned_run_slab_slot *)slots);
   return UINT64_C(1) << ((const ps_entry_slab_slot *)p -
                          (const ps_entry_slab_slot *)slots);
 }
@@ -915,10 +937,10 @@ static void entry_fields_free(ps_entry *p) {
   if (p->catalog)
     ps_catalog_free_record(p);
   lc_free_with_allocator(NULL, p->deletion_reserve);
-  if (p->stream && p->stream->mapped) {
-    lc_free_with_allocator(NULL, p->stream->ranges);
-    lc_free_with_allocator(NULL, p->stream->range_bitmap);
-    lc_free_with_allocator(NULL, p->stream->range_rank);
+  if (p->allocation->layout == PS_ENTRY_RUN && p->stream.run->mapped) {
+    lc_free_with_allocator(NULL, p->stream.run->ranges);
+    lc_free_with_allocator(NULL, p->stream.run->range_bitmap);
+    lc_free_with_allocator(NULL, p->stream.run->range_rank);
   }
   if (!p->embedded_extents)
     lc_free_with_allocator(NULL, p->extents);
@@ -2396,8 +2418,8 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
     ps_wire_put32(wire + 56, (uint32_t)p->count);
     first = p->key.kind == PS_OWNED_RUN ? 80 : 64;
     if (p->key.kind == PS_OWNED_RUN) {
-      ps_wire_put64(wire + 64, p->stream->capacity);
-      ps_wire_put32(wire + 72, (uint32_t)p->stream->mapped);
+      ps_wire_put64(wire + 64, p->stream.run->capacity);
+      ps_wire_put32(wire + 72, (uint32_t)p->stream.run->mapped);
     }
     if (p->key.kind == PS_KEY_METADATA) {
       ps_wire_put64(wire + 64, p->deletion_bytes);
@@ -2410,11 +2432,11 @@ static void encode_entry(unsigned char *wire, const ps_entry *p, uint64_t seq,
       ps_wire_put32(wire + first + 20 + 24 * i, p->extents[i].flags);
     }
     if (p->key.kind == PS_STREAM) {
-      ps_wire_put32(wire + 56, p->stream->sealed     ? STREAM_SEALED_FLAG
-                               : p->stream->admitted ? STREAM_ADMITTED_FLAG
-                                                     : 0U);
-      ps_wire_put64(wire + 64, p->stream->capacity);
-      ps_wire_put64(wire + 72, p->stream->runs);
+      ps_wire_put32(wire + 56, p->stream.head->sealed     ? STREAM_SEALED_FLAG
+                               : p->stream.head->admitted ? STREAM_ADMITTED_FLAG
+                                                          : 0U);
+      ps_wire_put64(wire + 64, p->stream.head->capacity);
+      ps_wire_put64(wire + 72, p->stream.head->runs);
     }
     if (p->key.kind == PS_CATALOG)
       ps_catalog_encode_record(wire, p);
@@ -2499,29 +2521,31 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
   }
   if (p->key.kind == PS_STREAM && (*event == PS_PUT || *event == PS_SEAL)) {
     uint32_t flags = wire_count;
-    p->stream->sealed = (flags & STREAM_SEALED_FLAG) != 0;
-    p->stream->admitted = (flags & STREAM_ADMITTED_FLAG) != 0;
-    p->stream->capacity = ps_wire_get64(wire + 64);
-    p->stream->runs = ps_wire_get64(wire + 72);
+    p->stream.head->sealed = (flags & STREAM_SEALED_FLAG) != 0;
+    p->stream.head->admitted = (flags & STREAM_ADMITTED_FLAG) != 0;
+    p->stream.head->capacity = ps_wire_get64(wire + 64);
+    p->stream.head->runs = ps_wire_get64(wire + 72);
     if (flags > STREAM_ADMITTED_FLAG ||
-        (*event == PS_SEAL && !p->stream->sealed) ||
-        !valid_stream_span(p->bytes, p->stream->capacity, p->stream->runs))
+        (*event == PS_SEAL && !p->stream.head->sealed) ||
+        !valid_stream_span(p->bytes, p->stream.head->capacity,
+                           p->stream.head->runs))
       goto invalid;
     *out = p;
     return LC_OK;
   }
   if (p->key.kind == PS_OWNED_RUN && *event == PS_PUT) {
-    p->stream->capacity = ps_wire_get64(wire + 64);
-    p->stream->mapped = (int)ps_wire_get32(wire + 72);
-    if (!p->stream->capacity || p->stream->capacity > PS_MIB - PS_RUN_HEADER ||
-        p->key.key > (uint64_t)INT64_MAX - p->stream->capacity ||
+    p->stream.run->capacity = ps_wire_get64(wire + 64);
+    p->stream.run->mapped = (int)ps_wire_get32(wire + 72);
+    if (!p->stream.run->capacity ||
+        p->stream.run->capacity > PS_MIB - PS_RUN_HEADER ||
+        p->key.key > (uint64_t)INT64_MAX - p->stream.run->capacity ||
         ps_wire_get32(wire + 72) > 1 || ps_wire_get32(wire + 76) ||
-        (!p->stream->mapped &&
+        (!p->stream.run->mapped &&
          (p->bytes < PS_RUN_HEADER ||
-          p->stream->capacity != p->bytes - PS_RUN_HEADER)) ||
-        (p->stream->mapped &&
-         (p->stream->capacity > PS_STREAM_PIECE_BYTES || !count ||
-          p->bytes < 64 || p->bytes > 64 + 9 * p->stream->capacity)))
+          p->stream.run->capacity != p->bytes - PS_RUN_HEADER)) ||
+        (p->stream.run->mapped &&
+         (p->stream.run->capacity > PS_STREAM_PIECE_BYTES || !count ||
+          p->bytes < 64 || p->bytes > 64 + 9 * p->stream.run->capacity)))
       goto invalid;
   }
   p->count = count;
@@ -2530,10 +2554,11 @@ static int decode_entry(ps_space *s, const unsigned char *wire, size_t bytes,
     n = ps_wire_get64(wire + first + 8 + 24 * i);
     p->extents[i].flags = ps_wire_get32(wire + first + 20 + 24 * i);
     if (!n ||
-        n > (p->key.kind == PS_OWNED_RUN && !p->stream->mapped ? PS_MIB
-                                                               : PS_CHUNK) ||
+        n > (p->key.kind == PS_OWNED_RUN && !p->stream.run->mapped
+                 ? PS_MIB
+                 : PS_CHUNK) ||
         offset < PS_DATA || offset > s->capacity || n > s->capacity - offset ||
-        (p->key.kind == PS_OWNED_RUN && !p->stream->mapped
+        (p->key.kind == PS_OWNED_RUN && !p->stream.run->mapped
              ? (count != 1 || p->extents[i].flags != EXTENT_OWNED ||
                 offset % PS_PAGE || n % PS_PAGE)
          : p->extents[i].flags == EXTENT_PACKED
@@ -2594,8 +2619,8 @@ static int owned_encoded_read(ps_space *s, ps_entry *p, uint64_t at,
 static int mapped_range_add(ps_entry *p, ps_mapped_range *range, uint64_t start,
                             uint64_t bytes, uint64_t *data, uint64_t *end,
                             lc_error *e) {
-  if (!bytes || start < *end || start > p->stream->capacity ||
-      bytes > p->stream->capacity - start || bytes > p->bytes - *data)
+  if (!bytes || start < *end || start > p->stream.run->capacity ||
+      bytes > p->stream.run->capacity - start || bytes > p->bytes - *data)
     return err(e, LC_ERR_PROTOCOL, "invalid mapped piece range");
   range->offset = start;
   range->bytes = bytes;
@@ -2611,12 +2636,12 @@ static unsigned int bitmap_count(unsigned int value) {
 }
 static uint64_t bitmap_rank(const ps_entry *p, uint64_t offset) {
   size_t at = (size_t)(offset / 64 * 8), end = (size_t)(offset / 8);
-  uint64_t count = p->stream->range_rank[offset / 64];
+  uint64_t count = p->stream.run->range_rank[offset / 64];
   for (; at < end; ++at)
-    count += bitmap_count(p->stream->range_bitmap[at]);
+    count += bitmap_count(p->stream.run->range_bitmap[at]);
   if (offset % 8)
-    count +=
-        bitmap_count(p->stream->range_bitmap[at] & ((1U << (offset % 8)) - 1));
+    count += bitmap_count(p->stream.run->range_bitmap[at] &
+                          ((1U << (offset % 8)) - 1));
   return count;
 }
 static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
@@ -2626,19 +2651,20 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
   uint16_t *rank = NULL;
   uint64_t count, i, data, end = 0, start, bytes, table_bytes, pos;
   int rc, bitmap;
-  if (p->stream->ranges || p->stream->range_bitmap)
+  if (p->stream.run->ranges || p->stream.run->range_bitmap)
     return LC_OK;
   rc = owned_encoded_read(s, p, 0, header, sizeof(header), e);
   if (rc != LC_OK)
     return rc;
   count = ps_wire_get32(header + 32);
   bitmap = (int)ps_wire_get32(header + 60);
-  table_bytes = bitmap ? (p->stream->capacity + 7) / 8 : count * 8;
+  table_bytes = bitmap ? (p->stream.run->capacity + 7) / 8 : count * 8;
   if (memcmp(header, "LCPSMAPR", 8) ||
       ps_wire_get64(header + 8) != p->key.owner ||
       ps_wire_get64(header + 16) != p->key.key ||
-      ps_wire_get64(header + 24) != p->stream->capacity || !count ||
-      count > p->stream->capacity || ps_wire_get64(header + 40) != p->bytes ||
+      ps_wire_get64(header + 24) != p->stream.run->capacity || !count ||
+      count > p->stream.run->capacity ||
+      ps_wire_get64(header + 40) != p->bytes ||
       ps_wire_get64(header + 48) != p->token ||
       ps_wire_get32(header + 60) > 1 ||
       ps_wire_get32(header + 56) !=
@@ -2648,7 +2674,7 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
   table = lc_alloc_with_allocator(NULL, (size_t)table_bytes);
   if (bitmap)
     rank = lc_calloc_with_allocator(
-        NULL, (size_t)((p->stream->capacity + 63) / 64 + 1), sizeof(*rank));
+        NULL, (size_t)((p->stream.run->capacity + 63) / 64 + 1), sizeof(*rank));
   else
     ranges = lc_calloc_with_allocator(NULL, (size_t)count, sizeof(*ranges));
   if (!table || (bitmap ? !rank : !ranges))
@@ -2666,13 +2692,14 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
   }
   if (bitmap && rc == LC_OK) {
     i = pos = 0;
-    while (pos < p->stream->capacity && rc == LC_OK) {
+    while (pos < p->stream.run->capacity && rc == LC_OK) {
       if (!(table[pos / 8] & (1U << (pos % 8)))) {
         ++pos;
         continue;
       }
       start = pos++;
-      while (pos < p->stream->capacity && (table[pos / 8] & (1U << (pos % 8))))
+      while (pos < p->stream.run->capacity &&
+             (table[pos / 8] & (1U << (pos % 8))))
         ++pos;
       if (i == count)
         rc = err(e, LC_ERR_PROTOCOL, "mapped bitmap range count overflow");
@@ -2680,17 +2707,17 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
         rc = mapped_range_add(p, &checked, start, pos - start, &data, &end, e);
       ++i;
     }
-    if (rc == LC_OK &&
-        (i != count || (p->stream->capacity % 8 &&
-                        table[table_bytes - 1] >> (p->stream->capacity % 8))))
+    if (rc == LC_OK && (i != count || (p->stream.run->capacity % 8 &&
+                                       table[table_bytes - 1] >>
+                                           (p->stream.run->capacity % 8))))
       rc = err(e, LC_ERR_PROTOCOL, "mapped bitmap count or padding is invalid");
   }
   if (rc == LC_OK && data != p->bytes)
     rc = err(e, LC_ERR_PROTOCOL, "mapped piece has trailing bytes");
   if (rc == LC_OK) {
-    p->stream->ranges = ranges;
-    p->stream->range_count = (size_t)count;
-    p->stream->mapped_end = end;
+    p->stream.run->ranges = ranges;
+    p->stream.run->range_count = (size_t)count;
+    p->stream.run->mapped_end = end;
     if (bitmap) {
       pos = 0;
       for (i = 0; i < table_bytes; ++i) {
@@ -2700,8 +2727,8 @@ static int owned_map_load(ps_space *s, ps_entry *p, lc_error *e) {
       }
       if (!(table_bytes % 8))
         rank[table_bytes / 8] = (uint16_t)pos;
-      p->stream->range_bitmap = table;
-      p->stream->range_rank = rank;
+      p->stream.run->range_bitmap = table;
+      p->stream.run->range_rank = rank;
       table = NULL;
       rank = NULL;
     }
@@ -2729,7 +2756,7 @@ static int validate_owned_identity(ps_space *s, ps_entry *p,
 static int verify_owned(ps_space *s, ps_entry *p, unsigned char *header,
                         lc_error *error) {
   int rc;
-  if (p->stream->mapped)
+  if (p->stream.run->mapped)
     return owned_map_load(s, p, error);
   rc = transfer(s, header, PS_RUN_IDENTITY_BYTES, p->extents[0].offset, 0,
                 error);
@@ -2768,7 +2795,7 @@ static int verify_value_payloads(ps_space *s, ps_entry *p,
   const unsigned char *data;
   size_t i;
   int rc;
-  if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
+  if (p->key.kind == PS_OWNED_RUN && !p->stream.run->mapped)
     return verify_owned(s, p, buffer, error);
   for (i = 0; i < p->count; ++i) {
     rc = read_extent(s, &p->extents[i], buffer, packed, &data, NULL, error);
@@ -3554,16 +3581,16 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
   size_t bytes, capacity;
   int rc;
   memset(value, 0, sizeof(*value));
-  if (p->key.kind == PS_STREAM && p->stream->runs <= UINT32_MAX) {
+  if (p->key.kind == PS_STREAM && p->stream.head->runs <= UINT32_MAX) {
     ps_directory_stream *stream = &value->stream;
-    stream->storage =
-        p->stream->sealed ? PS_DIRECTORY_SEALED_STREAM : PS_DIRECTORY_STREAM;
+    stream->storage = p->stream.head->sealed ? PS_DIRECTORY_SEALED_STREAM
+                                             : PS_DIRECTORY_STREAM;
     stream->tail = p->bytes;
-    stream->capacity = p->stream->capacity;
+    stream->capacity = p->stream.head->capacity;
     stream->incarnation = p->token;
-    stream->runs = (uint32_t)p->stream->runs;
+    stream->runs = (uint32_t)p->stream.head->runs;
     /* Match the descriptor's checkpoint sequence for cohort admission. */
-    if (p->stream->admitted && !p->stream->sealed)
+    if (p->stream.head->admitted && !p->stream.head->sealed)
       stream->admitted_at = builder->space->sequence;
     return LC_OK;
   }
@@ -3580,7 +3607,7 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
     if (ps_internal_immutable_key(p->key) &&
         p->extents[0].flags == EXTENT_PACKED)
       value->extent.storage = PS_DIRECTORY_PACKED_VALUE;
-    else if (p->key.kind == PS_OWNED_RUN && !p->stream->mapped)
+    else if (p->key.kind == PS_OWNED_RUN && !p->stream.run->mapped)
       value->extent.storage = PS_DIRECTORY_OWNED_RUN;
   }
   if (value->tag.storage != PS_DIRECTORY_DESCRIPTOR) {
@@ -4826,7 +4853,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
     if (p->key.kind == PS_STREAM &&
         (!recovery->certified_root ||
          ps_wire_get64(wire + 8) <= recovery->cohort_origin))
-      p->stream->admitted = 0;
+      p->stream.head->admitted = 0;
     p->checkpoint_ref = ref;
     p->projection = old;
     item->decoded = p;
@@ -4876,11 +4903,11 @@ static int load_owned_binding(metadata_recovery *recovery, ps_key key,
     return err(error, LC_ERR_PROTOCOL, "invalid inline owned run extent");
   if (old && old->token != ref->incarnation)
     old = NULL;
-  p = entry_slab_take(s, PS_OWNED_RUN, old != NULL, 1);
+  p = entry_slab_take(s, PS_OWNED_RUN, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover inline owned run");
   unpack_binding(p, key, value);
-  p->stream->capacity = ref->bytes - PS_RUN_HEADER;
+  p->stream.run->capacity = ref->bytes - PS_RUN_HEADER;
   p->projection = old;
   *out = p;
   return LC_OK;
@@ -4896,16 +4923,16 @@ static int load_stream_binding(metadata_recovery *r, ps_key key,
     return err(error, LC_ERR_PROTOCOL, "invalid inline stream head");
   if (old && old->token != stream->incarnation)
     old = NULL;
-  p = entry_slab_take(s, PS_STREAM, old != NULL, 1);
+  p = entry_slab_take(s, PS_STREAM, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover inline stream head");
   p->key = key;
   p->token = stream->incarnation;
   p->bytes = stream->tail;
-  p->stream->capacity = stream->capacity;
-  p->stream->runs = stream->runs;
-  p->stream->sealed = stream->storage == PS_DIRECTORY_SEALED_STREAM;
-  p->stream->admitted =
+  p->stream.head->capacity = stream->capacity;
+  p->stream.head->runs = stream->runs;
+  p->stream.head->sealed = stream->storage == PS_DIRECTORY_SEALED_STREAM;
+  p->stream.head->admitted =
       r->certified_root && stream->admitted_at > r->cohort_origin;
   p->projection = old;
   *out = p;
@@ -5128,7 +5155,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     p = r->entries[i].decoded;
     if (p->key.kind == PS_CATALOG)
       rc = ps_catalog_prepare_record(s, p, 1, error);
-    else if (p->key.kind == PS_OWNED_RUN && p->stream->mapped)
+    else if (p->key.kind == PS_OWNED_RUN && p->stream.run->mapped)
       rc = owned_map_load(s, p, error);
     if (rc == LC_OK && !r->resident)
       rc = payload_claim_entry(s, p, r->payload, error);
@@ -5139,7 +5166,7 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
     r->entries[i].decoded = NULL;
     register_entry(s, p);
     install(s, p, NULL);
-    if (p->key.kind == PS_OWNED_RUN && !p->stream->owned_linked)
+    if (p->key.kind == PS_OWNED_RUN && !p->stream.run->owned_linked)
       return err(error, LC_ERR_PROTOCOL, "owned run has no stream head");
   }
   return LC_OK;
@@ -5502,14 +5529,15 @@ static int replay_payload(ps_space *s, ps_entry *p, replay_log *changes,
 /* Writer completion stays within one physical generation. An admission proof
  * can survive a checkpoint in the same cohort, until the next edit. */
 static void stream_admitted(ps_space *s, ps_entry *p, int admitted) {
-  if (p->stream->admitted != admitted) {
-    p->stream->admitted = admitted;
+  if (p->stream.head->admitted != admitted) {
+    p->stream.head->admitted = admitted;
     if (!p->dirty_link)
       dirty_entry(s, p, NULL);
   }
 }
 static ps_writer_stamp *entry_writer_stamp(const ps_entry *p) {
-  return p->key.kind == PS_STREAM ? &p->stream->writer : &p->catalog->writer;
+  return p->key.kind == PS_STREAM ? &p->stream.head->writer
+                                  : &p->catalog->writer;
 }
 static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
                            int select, lc_error *error) {
@@ -5528,10 +5556,10 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
       (event == PS_NAMESPACE_OWNER
            ? key.kind != PS_CATALOG || key.owner || !head->catalog ||
                  head->catalog->kind != PS_CATALOG_NAMESPACE
-           : key.kind != PS_STREAM || head->stream->sealed))
+           : key.kind != PS_STREAM || head->stream.head->sealed))
     return err(error, LC_ERR_PROTOCOL, "live owner hint does not match head");
   if (event == PS_STREAM_ADMITTED) {
-    if (value > head->stream->capacity || (select && value != head->bytes))
+    if (value > head->stream.head->capacity || (select && value != head->bytes))
       return err(error, LC_ERR_PROTOCOL, "admission proof has the wrong tail");
     if (select)
       stream_admitted(s, head, 1);
@@ -5543,17 +5571,17 @@ static int apply_live_hint(ps_space *s, const unsigned char *wire, size_t bytes,
       stamp->token = value;
       stamp->generation = s->generation;
       if (event == PS_STREAM_EDIT) {
-        head->stream->edit_wire = ps_wire_get64(wire + 8);
-        head->stream->complete_generation = 0;
+        head->stream.head->edit_wire = ps_wire_get64(wire + 8);
+        head->stream.head->complete_generation = 0;
         stream_admitted(s, head, 0);
       }
     }
-  } else if (value < head->bytes || value > head->stream->capacity)
+  } else if (value < head->bytes || value > head->stream.head->capacity)
     return err(error, LC_ERR_PROTOCOL, "owned tail outside granted range");
   else if (select) {
     head->bytes = value;
-    head->stream->wire = ps_wire_get64(wire + 8);
-    head->stream->complete_generation =
+    head->stream.head->wire = ps_wire_get64(wire + 8);
+    head->stream.head->complete_generation =
         event == PS_STREAM_COMPLETE ? s->generation : 0;
     stream_admitted(s, head, event == PS_STREAM_COMPLETE);
     if (!head->dirty_link)
@@ -5726,11 +5754,11 @@ static int import_certified_journal(ps_space *s,
 static int validate_owned_stream(const ps_stream_state *head, lc_error *error) {
   const ps_entry *run;
   uint64_t count = 0, end = 0, stored = 0;
-  for (run = head->owned_first; run; run = run->stream->owned_next) {
+  for (run = head->owned_first; run; run = run->stream.run->owned_next) {
     if (run->deleted || run->key.key < end || run->key.key > head->capacity ||
-        run->stream->capacity > head->capacity - run->key.key)
+        run->stream.run->capacity > head->capacity - run->key.key)
       return err(error, LC_ERR_PROTOCOL, "incomplete owned run directory");
-    end = run->key.key + run->stream->capacity;
+    end = run->key.key + run->stream.run->capacity;
     stored += entry_storage(run);
     ++count;
   }
@@ -5743,8 +5771,8 @@ static int validate_owned_directory(ps_space *s, lc_error *error) {
   size_t i;
   int rc = LC_OK;
   for (i = 0; rc == LC_OK && i < BUCKETS; ++i)
-    for (p = s->buckets->streams[i]; rc == LC_OK && p; p = p->stream->next)
-      rc = validate_owned_stream(p->stream, error);
+    for (p = s->buckets->streams[i]; rc == LC_OK && p; p = p->stream.head->next)
+      rc = validate_owned_stream(p->stream.head, error);
   return rc;
 }
 static int recover_directory(ps_space *s, unsigned char *wire,
@@ -5801,12 +5829,13 @@ recover_checkpoint_directory(ps_space *s, unsigned char *wire,
 }
 static int install_owned_grant(ps_space *s, ps_entry *p, lc_error *error) {
   ps_entry *head = stream_lookup(s, p->key.owner);
-  if (!head || head->stream->sealed || p->key.key != head->stream->capacity ||
-      p->stream->mapped ||
-      p->stream->capacity > (uint64_t)INT64_MAX - head->stream->capacity)
+  if (!head || head->stream.head->sealed ||
+      p->key.key != head->stream.head->capacity || p->stream.run->mapped ||
+      p->stream.run->capacity >
+          (uint64_t)INT64_MAX - head->stream.head->capacity)
     return err(error, LC_ERR_PROTOCOL, "owned run grant is not contiguous");
-  head->stream->capacity += p->stream->capacity;
-  ++head->stream->runs;
+  head->stream.head->capacity += p->stream.run->capacity;
+  ++head->stream.head->runs;
   if (!head->dirty_link)
     dirty_entry(s, head, NULL);
   return LC_OK;
@@ -5831,18 +5860,18 @@ static int remove_owned(ps_space *s, ps_entry *head, uint64_t sequence,
                         int apply, lc_error *error) {
   ps_entry *run, *next;
   uint64_t count = 0, end = 0;
-  for (run = head->stream->owned_first; run; run = next) {
-    next = run->stream->owned_next;
+  for (run = head->stream.head->owned_first; run; run = next) {
+    next = run->stream.run->owned_next;
     if (run->deleted || run->key.key < end ||
-        run->key.key > head->stream->capacity ||
-        run->stream->capacity > head->stream->capacity - run->key.key)
+        run->key.key > head->stream.head->capacity ||
+        run->stream.run->capacity > head->stream.head->capacity - run->key.key)
       return err(error, LC_ERR_PROTOCOL, "retired stream grant mismatch");
-    end = run->key.key + run->stream->capacity;
+    end = run->key.key + run->stream.run->capacity;
     ++count;
     if (apply)
       mark_removed(s, run, sequence);
   }
-  if (count != head->stream->runs)
+  if (count != head->stream.head->runs)
     return err(error, LC_ERR_PROTOCOL, "retired stream capacity mismatch");
   if (apply)
     mark_removed(s, head, sequence);
@@ -5863,10 +5892,10 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
         return rc;
     }
     if (p->key.kind == PS_OWNED_RUN) {
-      if (p->stream->mapped) {
+      if (p->stream.run->mapped) {
         head = stream_lookup(s, p->key.owner);
         if (!old || old->deleted || !head ||
-            p->stream->capacity != old->stream->capacity)
+            p->stream.run->capacity != old->stream.run->capacity)
           return err(error, LC_ERR_PROTOCOL, "mapped piece owner mismatch");
       } else {
         if (old && !old->deleted)
@@ -5887,21 +5916,22 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
           old && !old->deleted)
         return err(error, LC_ERR_PROTOCOL,
                    "journal overwrites typed ownership");
-      if (p->key.kind == PS_STREAM && (p->bytes || p->stream->capacity ||
-                                       p->stream->runs || p->stream->sealed))
+      if (p->key.kind == PS_STREAM &&
+          (p->bytes || p->stream.head->capacity || p->stream.head->runs ||
+           p->stream.head->sealed))
         return err(error, LC_ERR_PROTOCOL, "nonempty initial stream head");
     }
   } else {
     if (!old || old->deleted || old->token != p->token)
       return err(error, LC_ERR_PROTOCOL, "journal retirement owner mismatch");
     if (event == PS_SEAL) {
-      if (old->stream->sealed || p->bytes < old->bytes ||
-          p->stream->capacity != old->stream->capacity ||
-          p->stream->runs != old->stream->runs)
+      if (old->stream.head->sealed || p->bytes < old->bytes ||
+          p->stream.head->capacity != old->stream.head->capacity ||
+          p->stream.head->runs != old->stream.head->runs)
         return err(error, LC_ERR_PROTOCOL, "journal stream seal mismatch");
       old->bytes = p->bytes;
-      old->stream->sealed = 1;
-      old->stream->structure_wire = wire;
+      old->stream.head->sealed = 1;
+      old->stream.head->structure_wire = wire;
       if (!old->dirty_link)
         dirty_entry(s, old, NULL);
       ps_internal_entry_free(p);
@@ -5917,22 +5947,22 @@ static int apply_journal_event(ps_space *s, ps_entry *p, int event,
       return LC_OK;
     }
     if (p->key.kind == PS_STREAM) {
-      if (old->stream->catalog_refs)
+      if (old->stream.head->catalog_refs)
         return err(error, LC_ERR_PROTOCOL, "journal retires a catalog target");
       rc = remove_owned(s, old, release, 0, error);
       if (rc == LC_OK)
         rc = remove_owned(s, old, release, 1, error);
       if (rc == LC_OK) {
-        old->stream->structure_wire = wire;
+        old->stream.head->structure_wire = wire;
         ps_internal_entry_free(p);
       }
       return rc;
     }
     if (p->key.kind == PS_OWNED_RUN) {
       head = stream_lookup(s, p->key.owner);
-      if (!head || !head->stream->runs)
+      if (!head || !head->stream.head->runs)
         return err(error, LC_ERR_PROTOCOL, "piece removal has no head");
-      --head->stream->runs;
+      --head->stream.head->runs;
       if (!head->dirty_link)
         dirty_entry(s, head, NULL);
     }
@@ -6005,8 +6035,8 @@ static void exclusive_record_close(ps_space *s) {
   }
   for (i = 0; covered && i < BUCKETS; ++i)
     for (stream = s->buckets->streams[i]; stream;
-         stream = stream->stream->next) {
-      if (!stream->bytes || stream->stream->sealed)
+         stream = stream->stream.head->next) {
+      if (!stream->bytes || stream->stream.head->sealed)
         continue;
       if (count == CLOSE_PROOF_MAX_TAILS)
         return; /* Keep one physical barrier for a larger stream set. */
@@ -6453,8 +6483,8 @@ static int projection_same(const ps_entry *a, const ps_entry *b) {
       a->deletion_bytes != b->deletion_bytes ||
       (a->key.kind != PS_STREAM && a->bytes != b->bytes) ||
       (a->key.kind == PS_OWNED_RUN &&
-       (a->stream->mapped != b->stream->mapped ||
-        a->stream->capacity != b->stream->capacity)))
+       (a->stream.run->mapped != b->stream.run->mapped ||
+        a->stream.run->capacity != b->stream.run->capacity)))
     return 0;
   for (i = 0; i < a->count; ++i)
     if (a->extents[i].offset != b->extents[i].offset ||
@@ -6472,10 +6502,10 @@ static int projection_same(const ps_entry *a, const ps_entry *b) {
        memcmp(a->catalog->value, b->catalog->value, a->catalog->value_length)))
     return 0;
   return a->key.kind != PS_STREAM ||
-         (a->stream->capacity <= b->stream->capacity &&
-          (!a->stream->sealed || b->stream->sealed) &&
-          a->bytes <= b->stream->capacity &&
-          (!b->stream->sealed || a->bytes <= b->bytes));
+         (a->stream.head->capacity <= b->stream.head->capacity &&
+          (!a->stream.head->sealed || b->stream.head->sealed) &&
+          a->bytes <= b->stream.head->capacity &&
+          (!b->stream.head->sealed || a->bytes <= b->bytes));
 }
 static int projection_journal(ps_space *v, uint64_t checkpoint,
                               uint64_t certified, lc_error *error) {
@@ -6548,7 +6578,7 @@ static ps_entry *projected(ps_entry *p) {
   return p && p->projection ? p->projection : p;
 }
 static int entry_catalog_pinned(const ps_entry *p) {
-  return p->key.kind == PS_STREAM && p->stream->catalog_pins;
+  return p->key.kind == PS_STREAM && p->stream.head->catalog_pins;
 }
 static void projection_entries(ps_space *s, ps_space *v) {
   ps_entry *p, *next, *q, *keep = NULL, *consumed = NULL, *borrowed = NULL,
@@ -6595,12 +6625,14 @@ static void projection_entries(ps_space *s, ps_space *v) {
     p->retired_next = p->dirty_next = NULL;
     p->dirty_link = NULL;
     p->checkpoint_ref.offset = p->checkpoint_ref.bytes = 0;
-    if (p->stream) {
-      ps_stream_state *state = p->stream;
-      state->next = NULL;
-      state->owned_first = state->owned_last = NULL;
-      state->owned_prev = state->owned_next = NULL;
-      state->owned_linked = 0;
+    if (p->key.kind == PS_STREAM) {
+      ps_stream_state *head = p->stream.head;
+      head->next = NULL;
+      head->owned_first = head->owned_last = NULL;
+    } else if (p->key.kind == PS_OWNED_RUN) {
+      ps_owned_run_state *run = p->stream.run;
+      run->owned_prev = run->owned_next = NULL;
+      run->owned_linked = 0;
     }
     if (p->catalog)
       p->catalog->link = NULL;
@@ -6639,9 +6671,9 @@ static void projection_entries(ps_space *s, ps_space *v) {
       if (dest->deletion_reserve)
         ps_internal_entry_auxiliary(dest);
       if (dest->key.kind == PS_OWNED_RUN)
-        dest->stream->owned_linked = q->stream->owned_linked;
+        dest->stream.run->owned_linked = q->stream.run->owned_linked;
       if (dest->key.kind == PS_STREAM) {
-        ps_stream_state *to = dest->stream, *from = q->stream;
+        ps_stream_state *to = dest->stream.head, *from = q->stream.head;
         to->writer = from->writer;
         to->catalog_refs = from->catalog_refs;
         to->catalog_release = 0;
@@ -6665,11 +6697,13 @@ static void projection_entries(ps_space *s, ps_space *v) {
     dest->retired_next = projected(q->retired_next);
     dest->dirty_next = projected(q->dirty_next);
     dest->dirty_link = NULL;
-    if (dest->stream) {
-      ps_stream_state *to = dest->stream, *from = q->stream;
+    if (dest->key.kind == PS_STREAM) {
+      ps_stream_state *to = dest->stream.head, *from = q->stream.head;
       to->next = projected(from->next);
       to->owned_first = projected(from->owned_first);
       to->owned_last = projected(from->owned_last);
+    } else if (dest->key.kind == PS_OWNED_RUN) {
+      ps_owned_run_state *to = dest->stream.run, *from = q->stream.run;
       to->owned_prev = projected(from->owned_prev);
       to->owned_next = projected(from->owned_next);
     }
@@ -6824,7 +6858,7 @@ static int projection_stage(ps_space *s, ps_space *v,
       }
       if (p->key.kind == PS_STREAM && old->bytes > p->bytes) {
         p->bytes = old->bytes;
-        p->stream->admitted = 0;
+        p->stream.head->admitted = 0;
         if (!p->dirty_link)
           dirty_entry(v, p, NULL);
       }
@@ -7513,8 +7547,8 @@ static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
   prior = old && !old->deleted ? entry_bytes(old) : 0;
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN &&
       (!w->expected_owned || old != w->expected_owned || old->deleted ||
-       !stream_lookup(s, old->key.owner) || !w->entry->stream->mapped ||
-       w->entry->stream->capacity != old->stream->capacity))
+       !stream_lookup(s, old->key.owner) || !w->entry->stream.run->mapped ||
+       w->entry->stream.run->capacity != old->stream.run->capacity))
     rc = err(error, LC_ERR_PENDING, "captured piece mapping changed");
   if (rc == LC_OK && w->entry->key.kind == PS_OWNED_RUN)
     rc =
@@ -8111,7 +8145,7 @@ int ps_internal_namespace_seed_current(ps_space *s, uint64_t owner,
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   if (rc == LC_OK && active) {
     p = lookup(s, active->stream);
-    same = p && !p->deleted && !p->stream->sealed && p->bytes == tail &&
+    same = p && !p->deleted && !p->stream.head->sealed && p->bytes == tail &&
            p->token == active->target.incarnation &&
            !memcmp(s->identity, active->target.container, 16) &&
            stream_structure_ready(s, p, NULL) == LC_OK;
@@ -9330,21 +9364,21 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   memcpy(out->ref.container, head->space->identity, 16);
   out->ref.incarnation = head->entry->token;
   out->tail = head->entry->bytes;
-  out->capacity = head->entry->stream->capacity;
-  out->runs = head->entry->stream->runs;
-  out->stored_bytes = head->entry->stream->storage;
-  out->edit_wire = head->entry->stream->edit_wire;
-  out->sealed = head->entry->stream->sealed;
+  out->capacity = head->entry->stream.head->capacity;
+  out->runs = head->entry->stream.head->runs;
+  out->stored_bytes = head->entry->stream.head->storage;
+  out->edit_wire = head->entry->stream.head->edit_wire;
+  out->sealed = head->entry->stream.head->sealed;
   out->retired = head->entry->deleted;
   out->complete =
-      head->entry->stream->complete_generation &&
-      head->entry->stream->complete_generation == head->space->generation;
+      head->entry->stream.head->complete_generation &&
+      head->entry->stream.head->complete_generation == head->space->generation;
 }
 /* Existing run handles already own immutable mappings. New admissions fence
  * a seal or stream retirement until it is durable. */
 static int stream_structure_ready(ps_space *s, const ps_entry *head,
                                   lc_error *error) {
-  return head && head->stream->structure_wire > s->peer_durable
+  return head && head->stream.head->structure_wire > s->peer_durable
              ? err(error, LC_ERR_PENDING, "stream geometry awaits durability")
              : LC_OK;
 }
@@ -9372,7 +9406,7 @@ static int prepare_new_stream(ps_space *s, ps_entry *p, lc_error *e) {
   for (i = 0; i < PS_COORDINATION_STREAM_CLAIM_SLOTS && token <= s->token_end;
        ++i, ++token) {
     rc = ps_coordination_stream_prepare(s->coordination, token,
-                                        &p->stream->claim, e);
+                                        &p->stream.head->claim, e);
     if (rc == LC_OK) {
       p->token = token;
       s->token_next = token + 1;
@@ -9404,7 +9438,7 @@ int ps_internal_complete_tail(ps_space *s, ps_key key, const ps_ref *ref,
 int ps_internal_admitted_tail(ps_space *s, ps_key key, const ps_ref *ref,
                               uint64_t *tail) {
   ps_entry *p = lookup(s, key);
-  if (!p || p->deleted || p->stream->sealed || !p->stream->admitted ||
+  if (!p || p->deleted || p->stream.head->sealed || !p->stream.head->admitted ||
       p->token != ref->incarnation || memcmp(s->identity, ref->container, 16) ||
       stream_structure_ready(s, p, NULL) != LC_OK)
     return 0;
@@ -9421,8 +9455,8 @@ int ps_internal_certify_tail(ps_space *s, ps_key key, const ps_ref *ref,
   pthread_mutex_lock(&s->mutex);
   rc = ps_internal_capture_begin(s, &guard, e);
   p = lookup(s, key);
-  if (rc == LC_OK && p && !p->deleted && !p->stream->sealed &&
-      !p->stream->admitted && p->bytes == tail &&
+  if (rc == LC_OK && p && !p->deleted && !p->stream.head->sealed &&
+      !p->stream.head->admitted && p->bytes == tail &&
       p->token == ref->incarnation &&
       !memcmp(s->identity, ref->container, 16)) {
     ps_entry hint = {0};
@@ -9497,25 +9531,26 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
   }
   if (!create)
     p = lookup(s, key);
-  if (rc == LC_OK &&
-      (!p || p->deleted ||
-       (p->stream->handles && (!guarded || !p->stream->guarded ||
-                               (prepare && !p->stream->catalog_refs)))))
+  if (rc == LC_OK && (!p || p->deleted ||
+                      (p->stream.head->handles &&
+                       (!guarded || !p->stream.head->guarded ||
+                        (prepare && !p->stream.head->catalog_refs)))))
     rc = err(error, LC_ERR_INVALID,
              "owned stream missing or already has an open owner");
   if (rc == LC_OK && ref &&
       (memcmp(ref->container, s->identity, 16) || ref->incarnation != p->token))
     rc = err(error, LC_ERR_INVALID, "stale or foreign owned stream reference");
-  if (rc == LC_OK && prepare && !p->stream->catalog_refs &&
+  if (rc == LC_OK && prepare && !p->stream.head->catalog_refs &&
       ps_catalog_target_retained(s, p))
     rc = err(error, LC_ERR_PENDING, "prior stream binding still retained");
-  if (rc == LC_OK && prepare && !p->stream->catalog_refs && !p->stream->claim)
-    rc = ps_internal_stream_claim(s, p->token, &p->stream->claim, error);
+  if (rc == LC_OK && prepare && !p->stream.head->catalog_refs &&
+      !p->stream.head->claim)
+    rc = ps_internal_stream_claim(s, p->token, &p->stream.head->claim, error);
   if (rc == LC_OK) {
     head->space = s;
     head->entry = p;
-    p->stream->guarded = guarded;
-    ++p->stream->handles;
+    p->stream.head->guarded = guarded;
+    ++p->stream.head->handles;
     ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
@@ -9525,7 +9560,7 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
       rc = pin_runs_locked(s, p, key, ref, 0, 0, 0, NULL, &initial->runs,
                            &initial->count, error);
   } else if (create && p->state == 0) {
-    ps_coordination_unlock(p->stream->claim);
+    ps_coordination_unlock(p->stream.head->claim);
     ps_internal_entry_free(p);
   }
   rc = ps_internal_capture_end(s, guard, rc, error);
@@ -9577,10 +9612,10 @@ void ps_owned_close(ps_owned_head *head) {
     return;
   s = head->space;
   pthread_mutex_lock(&s->mutex);
-  if (!--head->entry->stream->handles) {
-    head->entry->stream->orphan_claimed = 0;
-    ps_coordination_unlock(head->entry->stream->claim);
-    head->entry->stream->claim = NULL;
+  if (!--head->entry->stream.head->handles) {
+    head->entry->stream.head->orphan_claimed = 0;
+    ps_coordination_unlock(head->entry->stream.head->claim);
+    head->entry->stream.head->claim = NULL;
   }
   ps_internal_entry_unpin(s, head->entry);
   --s->readers;
@@ -9663,8 +9698,8 @@ static int claim_writer_stamp(ps_space *s, ps_entry *p, int event,
     writer->token = s->writer_id;
     writer->generation = s->generation;
     if (event == PS_STREAM_EDIT) {
-      p->stream->edit_wire = s->sequence;
-      p->stream->complete_generation = 0;
+      p->stream.head->edit_wire = s->sequence;
+      p->stream.head->complete_generation = 0;
       stream_admitted(s, p, 0);
     }
   }
@@ -9726,7 +9761,7 @@ int ps_owned_edit_begin(ps_owned_head *head, int append,
   rc = owned_capture_begin(head, &allocator, error);
   if (rc == LC_OK) {
     owned_status(head, status);
-    if (!p->deleted && !p->stream->sealed)
+    if (!p->deleted && !p->stream.head->sealed)
       rc = s->readiness
                ? claim_writer_stamp(s, p,
                                     append ? PS_STREAM_EDIT : PS_STREAM_OWNER,
@@ -9749,7 +9784,7 @@ int ps_owned_mark_edit(ps_owned_head *head, lc_error *error) {
   int continued, rc;
   pthread_mutex_lock(&s->mutex);
   rc = owned_capture_begin(head, &guard, error);
-  if (rc == LC_OK && (head->entry->deleted || head->entry->stream->sealed))
+  if (rc == LC_OK && (head->entry->deleted || head->entry->stream.head->sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream is retired or sealed");
   if (rc == LC_OK)
     rc = claim_writer_stamp(s, head->entry, PS_STREAM_EDIT, &continued, error);
@@ -9835,9 +9870,9 @@ static int owned_allocate(ps_owned_head *head, ps_budget *budget, uint64_t base,
   rc = ps_internal_admission_begin(s, &guard, error);
   if (rc == LC_OK)
     rc = stream_structure_ready(s, head->entry, error);
-  if (rc == LC_OK && (head->entry->deleted || head->entry->stream->sealed))
+  if (rc == LC_OK && (head->entry->deleted || head->entry->stream.head->sealed))
     rc = err(error, LC_ERR_INVALID, "owned stream cannot accept grants");
-  if (rc == LC_OK && (base != head->entry->stream->capacity ||
+  if (rc == LC_OK && (base != head->entry->stream.head->capacity ||
                       base > (uint64_t)INT64_MAX - (desired - PS_RUN_HEADER)))
     rc = err(error, LC_ERR_INVALID, "owned grant base or incarnation invalid");
   if (rc == LC_OK)
@@ -10040,7 +10075,7 @@ select_run:
                           error);
   if (rc == LC_OK) {
     p->bytes = p->extents[0].bytes = bytes;
-    p->stream->capacity = bytes - PS_RUN_HEADER;
+    p->stream.run->capacity = bytes - PS_RUN_HEADER;
     if (spare) {
       spare->offset = p->extents[0].offset + bytes;
       spare->bytes = reserved - bytes;
@@ -10053,9 +10088,10 @@ select_run:
   /* Preparation released allocator authority. Revalidate the current
    * selection and the descriptor's allowance. The grant already owns its
    * physical bytes, so publication only spends metadata credits. */
-  if (rc == LC_OK && (head->entry->deleted || head->entry->stream->sealed ||
-                      stream_lookup(s, head->entry->token) != head->entry ||
-                      base != head->entry->stream->capacity))
+  if (rc == LC_OK &&
+      (head->entry->deleted || head->entry->stream.head->sealed ||
+       stream_lookup(s, head->entry->token) != head->entry ||
+       base != head->entry->stream.head->capacity))
     rc = err(error, LC_ERR_INVALID, "owned stream changed during preparation");
   if (rc == LC_OK)
     rc = owned_allowance(s, budget, 0, !budget ? &checkpointed : NULL, error);
@@ -10167,7 +10203,7 @@ int ps_owned_capture_piece(ps_owned_head *head, uint64_t base, int keep_bytes,
   return rc;
 }
 uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
-  return run ? run->entry->stream->capacity : 0;
+  return run ? run->entry->stream.run->capacity : 0;
 }
 uint64_t ps_owned_run_base(const ps_owned_run *run) {
   return run ? run->entry->key.key : 0;
@@ -10299,13 +10335,13 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
     rc = stream_structure_ready(s, head, error);
   if (rc == LC_OK &&
       (head->deleted ||
-       (end && (start >= end || end > head->stream->capacity)) ||
-       head->stream->runs > (uint64_t)((size_t)-1 / sizeof(*items))))
+       (end && (start >= end || end > head->stream.head->capacity)) ||
+       head->stream.head->runs > (uint64_t)((size_t)-1 / sizeof(*items))))
     rc = err(error, LC_ERR_INVALID,
              "mapping capture is unavailable or too large");
   if (rc == LC_OK) {
-    first = head->stream->owned_first;
-    capacity = (size_t)head->stream->runs;
+    first = head->stream.head->owned_first;
+    capacity = (size_t)head->stream.head->runs;
     if (status) {
       ps_owned_head selected;
       selected.space = s;
@@ -10313,22 +10349,22 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
       owned_status(&selected, status);
     }
   }
-  if (rc == LC_OK && end && end == head->stream->capacity) {
+  if (rc == LC_OK && end && end == head->stream.head->capacity) {
     /* A continued append usually needs only the last, partially used run. */
     first = NULL;
     capacity = 0;
-    for (p = head->stream->owned_last;
-         p && p->key.key + p->stream->capacity > start;
-         p = p->stream->owned_prev) {
+    for (p = head->stream.head->owned_last;
+         p && p->key.key + p->stream.run->capacity > start;
+         p = p->stream.run->owned_prev) {
       first = p;
       ++capacity;
     }
   } else if (rc == LC_OK && end) {
-    while (first && first->key.key + first->stream->capacity <= start)
-      first = first->stream->owned_next;
+    while (first && first->key.key + first->stream.run->capacity <= start)
+      first = first->stream.run->owned_next;
     capacity = 0;
     for (limit = first; limit && limit->key.key < end;
-         limit = limit->stream->owned_next)
+         limit = limit->stream.run->owned_next)
       ++capacity;
   }
   if (rc == LC_OK && capacity) {
@@ -10336,7 +10372,7 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
     if (!items)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
   }
-  for (p = first; rc == LC_OK && p != limit; p = p->stream->owned_next) {
+  for (p = first; rc == LC_OK && p != limit; p = p->stream.run->owned_next) {
     ps_owned_run *run;
     if (n == capacity) {
       rc = err(error, LC_ERR_PROTOCOL, "mapping count exceeds its head");
@@ -10364,7 +10400,7 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
     ++batch->remaining;
     items[n].handle = run;
     items[n].base = p->key.key;
-    items[n++].capacity = p->stream->capacity;
+    items[n++].capacity = p->stream.run->capacity;
   }
   if (batch && !batch->remaining)
     lc_free_with_allocator(NULL, batch);
@@ -10401,7 +10437,7 @@ int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
     ps_owned_run *run = items[i].handle;
     ps_entry *p = run->entry;
     ps_space *s = run->space;
-    if (footers && !p->stream->mapped) {
+    if (footers && !p->stream.run->mapped) {
       rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
       if (rc == LC_OK)
         rc = validate_owned_identity(s, p, header, error);
@@ -10530,7 +10566,7 @@ int ps_owned_runs_edit_range(ps_owned_head *head, uint64_t start, uint64_t end,
                       out, count, NULL, error);
 }
 int ps_owned_run_mapped(const ps_owned_run *run) {
-  return run && run->entry->stream->mapped;
+  return run && run->entry->stream.run->mapped;
 }
 void ps_owned_run_retain(ps_owned_run *run) {
   if (run)
@@ -10568,18 +10604,19 @@ static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
       n > ps_owned_run_capacity(run) - offset)
     return err(error, LC_ERR_INVALID, "owned run I/O outside granted range");
   rc = healthy(run->space, error);
-  if (rc == LC_OK && run->entry->stream->mapped) {
+  if (rc == LC_OK && run->entry->stream.run->mapped) {
     ps_entry *p = run->entry;
     ps_reader *reader;
     unsigned char *out = bytes;
-    size_t lo = 0, hi = p->stream->range_count, mid, take;
+    size_t lo = 0, hi = p->stream.run->range_count, mid, take;
     if (writing)
       return err(error, LC_ERR_INVALID, "mapped pieces are immutable");
     if (!n)
       return LC_OK;
-    while (!p->stream->range_bitmap && lo < hi) {
+    while (!p->stream.run->range_bitmap && lo < hi) {
       mid = lo + (hi - lo) / 2;
-      if (p->stream->ranges[mid].offset + p->stream->ranges[mid].bytes <=
+      if (p->stream.run->ranges[mid].offset +
+              p->stream.run->ranges[mid].bytes <=
           offset)
         lo = mid + 1;
       else
@@ -10591,20 +10628,20 @@ static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
       return err(error, LC_ERR_NOMEM, "cannot allocate mapped read scratch");
     while (n && rc == LC_OK) {
       uint64_t data;
-      if (p->stream->range_bitmap) {
+      if (p->stream.run->range_bitmap) {
         take = 0;
-        while (take < n && (p->stream->range_bitmap[(offset + take) / 8] &
+        while (take < n && (p->stream.run->range_bitmap[(offset + take) / 8] &
                             (1U << ((offset + take) % 8))))
           ++take;
-        data = 64 + (p->stream->capacity + 7) / 8 + bitmap_rank(p, offset);
-      } else if (lo < p->stream->range_count &&
-                 offset >= p->stream->ranges[lo].offset) {
-        take = (size_t)(p->stream->ranges[lo].offset +
-                        p->stream->ranges[lo].bytes - offset);
+        data = 64 + (p->stream.run->capacity + 7) / 8 + bitmap_rank(p, offset);
+      } else if (lo < p->stream.run->range_count &&
+                 offset >= p->stream.run->ranges[lo].offset) {
+        take = (size_t)(p->stream.run->ranges[lo].offset +
+                        p->stream.run->ranges[lo].bytes - offset);
         if (take > n)
           take = n;
-        data =
-            p->stream->ranges[lo].data + offset - p->stream->ranges[lo].offset;
+        data = p->stream.run->ranges[lo].data + offset -
+               p->stream.run->ranges[lo].offset;
       } else {
         take = 0;
         data = 0;
@@ -10676,10 +10713,10 @@ static int owned_piece(ps_owned_run *run, uint64_t bytes, void *scratch,
     return err(error, LC_ERR_INVALID,
                "piece completion requires bounded finalized bytes");
   s = run->space;
-  if (run->entry->stream->mapped) {
+  if (run->entry->stream.run->mapped) {
     if (operation == 2)
       return err(error, LC_ERR_INVALID, "mapped pieces cannot be extended");
-    if (run->entry->stream->mapped_end > bytes)
+    if (run->entry->stream.run->mapped_end > bytes)
       return err(error, LC_ERR_PROTOCOL,
                  "mapped piece exceeds its completed prefix");
     rc = operation ? verify_value_payloads(s, run->entry, scratch, NULL, error)
@@ -10776,13 +10813,13 @@ int ps_owned_run_matches(const ps_owned_run *run, const ps_owned_range *ranges,
   ps_entry *p = run->entry;
   uint64_t live = 0, end = 0;
   size_t i;
-  if (!p->stream->mapped || count != p->stream->range_count)
+  if (!p->stream.run->mapped || count != p->stream.run->range_count)
     return 0;
-  if (p->stream->range_bitmap) {
+  if (p->stream.run->range_bitmap) {
     for (i = 0; i < count; ++i) {
       if (!ranges[i].bytes || (i && ranges[i].offset <= end) ||
-          ranges[i].offset > p->stream->capacity ||
-          ranges[i].bytes > p->stream->capacity - ranges[i].offset)
+          ranges[i].offset > p->stream.run->capacity ||
+          ranges[i].bytes > p->stream.run->capacity - ranges[i].offset)
         return 0;
       end = ranges[i].offset + ranges[i].bytes;
       if (bitmap_rank(p, end) - bitmap_rank(p, ranges[i].offset) !=
@@ -10790,11 +10827,11 @@ int ps_owned_run_matches(const ps_owned_run *run, const ps_owned_range *ranges,
         return 0;
       live += ranges[i].bytes;
     }
-    return live == p->bytes - 64 - (p->stream->capacity + 7) / 8;
+    return live == p->bytes - 64 - (p->stream.run->capacity + 7) / 8;
   }
   for (i = 0; i < count; ++i)
-    if (ranges[i].offset != run->entry->stream->ranges[i].offset ||
-        ranges[i].bytes != run->entry->stream->ranges[i].bytes)
+    if (ranges[i].offset != run->entry->stream.run->ranges[i].offset ||
+        ranges[i].bytes != run->entry->stream.run->ranges[i].bytes)
       return 0;
   return 1;
 }
@@ -10816,13 +10853,13 @@ static int piece_publish(void *context, lc_error *error) {
   rc = owned_capture_begin(selection->head, &guard, error);
   if (rc == LC_OK && (lookup(s, old->key) != old || old->deleted ||
                       selection->head->entry->deleted ||
-                      !selection->head->entry->stream->runs))
+                      !selection->head->entry->stream.head->runs))
     rc = err(error, LC_ERR_PENDING, "captured piece mapping changed");
   if (rc == LC_OK)
     rc = append_event_locked(s, old, PS_REMOVE, error);
   if (rc == LC_OK) {
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
-    --selection->head->entry->stream->runs;
+    --selection->head->entry->stream.head->runs;
     if (!selection->head->entry->dirty_link)
       dirty_entry(s, selection->head->entry, NULL);
     tombstone->key = old->key;
@@ -10888,9 +10925,9 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   if (rc == LC_OK &&
       (head->entry->deleted || old->deleted || lookup(s, old->key) != old ||
        (old->key.key >= head->entry->bytes &&
-        (!head->entry->stream->sealed || count)) ||
-       (!head->entry->stream->sealed &&
-        old->stream->capacity > head->entry->bytes - old->key.key)))
+        (!head->entry->stream.head->sealed || count)) ||
+       (!head->entry->stream.head->sealed &&
+        old->stream.run->capacity > head->entry->bytes - old->key.key)))
     rc = err(error, LC_ERR_INVALID,
              "piece is changing, incomplete or no longer selected");
   if (rc == LC_OK) {
@@ -10899,8 +10936,8 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     valid = old->key.key < head->entry->bytes
                 ? head->entry->bytes - old->key.key
                 : 0;
-    if (valid > old->stream->capacity)
-      valid = old->stream->capacity;
+    if (valid > old->stream.run->capacity)
+      valid = old->stream.run->capacity;
   }
   pthread_mutex_unlock(&s->mutex);
   for (i = 0; rc == LC_OK && i < count; ++i) {
@@ -10924,9 +10961,9 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     return rc;
   }
   table_bytes = (uint64_t)count * 8;
-  bitmap = table_bytes > (old->stream->capacity + 7) / 8;
+  bitmap = table_bytes > (old->stream.run->capacity + 7) / 8;
   if (bitmap)
-    table_bytes = (old->stream->capacity + 7) / 8;
+    table_bytes = (old->stream.run->capacity + 7) / 8;
   scratch = lc_alloc_with_allocator(NULL, PS_CHUNK);
   table = lc_calloc_with_allocator(NULL, 1, (size_t)table_bytes);
   result = lc_calloc_with_allocator(NULL, 1, sizeof(*result));
@@ -10938,8 +10975,8 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     rc = begin_value(s, budget, old->key, 1, &writer, error);
   if (rc == LC_OK) {
     writer->expected_owned = old;
-    writer->entry->stream->mapped = 1;
-    writer->entry->stream->capacity = old->stream->capacity;
+    writer->entry->stream.run->mapped = 1;
+    writer->entry->stream.run->capacity = old->stream.run->capacity;
     for (i = 0; i < count; ++i) {
       if (bitmap) {
         for (pos = ranges[i].offset; pos < ranges[i].offset + ranges[i].bytes;
@@ -10953,7 +10990,7 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
     memcpy(header, "LCPSMAPR", 8);
     ps_wire_put64(header + 8, old->key.owner);
     ps_wire_put64(header + 16, old->key.key);
-    ps_wire_put64(header + 24, old->stream->capacity);
+    ps_wire_put64(header + 24, old->stream.run->capacity);
     ps_wire_put32(header + 32, (uint32_t)count);
     ps_wire_put32(header + 36, checksum(table, (size_t)table_bytes));
     ps_wire_put64(header + 40, 64 + table_bytes + live);
@@ -10966,7 +11003,7 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
       rc = ps_write(writer, table, (size_t)table_bytes, error);
   }
   for (i = 0; rc == LC_OK && i < count; ++i) {
-    if (!old->stream->mapped && valid <= PS_CHUNK)
+    if (!old->stream.run->mapped && valid <= PS_CHUNK)
       rc = ps_write(writer, scratch + ranges[i].offset, (size_t)ranges[i].bytes,
                     error);
     else {
@@ -11013,7 +11050,7 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
 int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
                    void *scratch, lc_error *error) {
   int rc;
-  if (!run || !scratch || run->entry->stream->mapped ||
+  if (!run || !scratch || run->entry->stream.run->mapped ||
       offset > ps_owned_run_capacity(run) ||
       bytes > ps_owned_run_capacity(run) - offset)
     return err(error, LC_ERR_INVALID, "owned clear outside granted range");
@@ -11028,8 +11065,8 @@ int ps_owned_clear(ps_owned_run *run, uint64_t offset, uint64_t bytes,
   return rc;
 }
 static int owned_tail_allowed(ps_entry *p, uint64_t tail) {
-  return !p->deleted && !p->stream->sealed && tail >= p->bytes &&
-         tail <= p->stream->capacity;
+  return !p->deleted && !p->stream.head->sealed && tail >= p->bytes &&
+         tail <= p->stream.head->capacity;
 }
 static int owned_ready_sequence(ps_space *s, uint64_t *sequence,
                                 lc_error *error) {
@@ -11056,18 +11093,18 @@ static int owned_publish_tail(ps_space *s, ps_entry *head, uint64_t tail,
         s, &hint, complete ? PS_STREAM_COMPLETE : PS_STREAM_TAIL, error);
     if (rc == LC_OK) {
       *sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
-      head->stream->wire = s->sequence;
+      head->stream.head->wire = s->sequence;
     }
   } else if (!*sequence)
     rc = owned_ready_sequence(s, sequence, error);
   if (rc == LC_OK) {
     head->bytes = tail;
-    head->stream->complete_generation =
+    head->stream.head->complete_generation =
         complete && s->readiness ? s->generation : 0;
     stream_admitted(s, head, complete && s->readiness);
     if (!head->dirty_link)
       dirty_entry(s, head, NULL);
-    head->stream->ready = *sequence;
+    head->stream.head->ready = *sequence;
   }
   return rc;
 }
@@ -11206,11 +11243,11 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
   s = head->space;
   pthread_mutex_lock(&s->mutex);
   rc = owned_capture_begin(head, &guard, error);
-  sealed = head->entry->stream->sealed;
+  sealed = head->entry->stream.head->sealed;
   tail = head->entry->bytes;
-  needs_sync = head->entry->stream->ready >
+  needs_sync = head->entry->stream.head->ready >
                    __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) ||
-               head->entry->stream->wire > s->peer_durable;
+               head->entry->stream.head->wire > s->peer_durable;
   if (rc == LC_OK && head->entry->deleted)
     rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
   rc = allocation_end(s, guard, rc, error);
@@ -11229,16 +11266,16 @@ int ps_owned_seal(ps_owned_head *head, lc_error *error) {
     rc = err(error, LC_ERR_INVALID, "retired stream cannot be sealed");
   if (rc == LC_OK && head->entry->bytes != tail)
     rc = err(error, LC_ERR_PENDING, "owned stream advanced during seal");
-  sealed = head->entry->stream->sealed;
+  sealed = head->entry->stream.head->sealed;
   if (rc == LC_OK && !sealed) {
     snapshot = *head->entry;
-    stream_snapshot = *snapshot.stream;
-    snapshot.stream = &stream_snapshot;
+    stream_snapshot = *snapshot.stream.head;
+    snapshot.stream.head = &stream_snapshot;
     stream_snapshot.sealed = 1;
     rc = append_event_locked(s, &snapshot, PS_SEAL, error);
   }
   if (rc == LC_OK && !sealed) {
-    head->entry->stream->sealed = 1;
+    head->entry->stream.head->sealed = 1;
     if (!head->entry->dirty_link)
       dirty_entry(s, head->entry, NULL);
     sequence = __atomic_load_n(&s->pending_sequence, __ATOMIC_RELAXED);
@@ -11261,11 +11298,11 @@ int ps_owned_claim_orphan(ps_owned_head *head, lc_error *error) {
       (head->entry->deleted || ps_catalog_target_retained(s, head->entry)))
     rc = err(error, LC_ERR_INVALID,
              "owned identity is retained by a catalog binding or view");
-  if (rc == LC_OK && !head->entry->stream->claim)
+  if (rc == LC_OK && !head->entry->stream.head->claim)
     rc = ps_internal_stream_claim(s, head->entry->token,
-                                  &head->entry->stream->claim, error);
+                                  &head->entry->stream.head->claim, error);
   if (rc == LC_OK)
-    head->entry->stream->orphan_claimed = 1;
+    head->entry->stream.head->orphan_claimed = 1;
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;

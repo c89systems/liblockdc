@@ -57,27 +57,29 @@ typedef struct ps_mapped_range {
 typedef struct ps_writer_stamp {
   uint64_t token, generation;
 } ps_writer_stamp;
-/* Stream heads and owned runs need state that ordinary values never use.
- * This state shares an allocation and lifetime with its descriptor. */
+/* Each stream descriptor keeps only the state for its kind. */
 typedef struct ps_stream_state {
   uint64_t capacity, runs, ready, wire;
   ps_writer_stamp writer;
   uint64_t edit_wire, complete_generation, structure_wire;
   uint64_t storage; /* derived selected mappings, excluding pinned old ones */
-  ps_mapped_range *ranges;
-  unsigned char *range_bitmap;
-  uint16_t *range_rank;
-  uint64_t mapped_end;
-  size_t range_count;
-  struct ps_entry *owned_first, *owned_last, *owned_prev, *owned_next;
+  struct ps_entry *owned_first, *owned_last;
   struct ps_entry *next;
-  int mapped, owned_linked;
   size_t handles;
   int guarded, sealed, admitted, orphan_claimed;
   ps_coordination_guard *claim; /* Local preparation or orphan pass. */
   uint64_t catalog_refs, catalog_release, catalog_release_wire;
   size_t catalog_pins;
 } ps_stream_state;
+typedef struct ps_owned_run_state {
+  uint64_t capacity, mapped_end;
+  struct ps_entry *owned_prev, *owned_next;
+  ps_mapped_range *ranges;
+  unsigned char *range_bitmap;
+  uint16_t *range_rank;
+  size_t range_count;
+  int mapped, owned_linked;
+} ps_owned_run_state;
 typedef struct ps_entry {
   ps_key key;
   uint64_t token, bytes;
@@ -89,7 +91,10 @@ typedef struct ps_entry {
   int8_t value_checked; /* transient immutable-payload validation: 0 unknown */
   uint8_t payload_claimed, reader_claimed;
   uint8_t state, safe, deleted; /* state: 0 private, 1 live, 2 retired */
-  ps_stream_state *stream;
+  union {
+    ps_stream_state *head;
+    ps_owned_run_state *run;
+  } stream;
   uint64_t deletion_bytes;
   struct ps_reserve *deletion_reserve;
   /* Temporary checkpoint projection binding; never serialized. */
@@ -226,7 +231,7 @@ struct ps_space {
   uint64_t packed_bytes;
   ps_entry *entries, *retired, *dirty;
   struct ps_entry_allocation *entry_allocations;
-  ps_entry_slabs value_entries, stream_entries;
+  ps_entry_slabs value_entries, stream_entries, owned_run_entries;
   /* A private checkpoint draft may point into the resident's entry slabs.
    * The resident mutex protects those entries through adoption or discard. */
   struct ps_space *projection_resident;
