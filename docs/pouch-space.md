@@ -133,6 +133,18 @@ starting together after first-owner recovery. It reports elapsed time,
 join-thread CPU, and the slowest individual join. Indexed verification reads
 and queries through each joined client.
 
+The regular compaction tests hold a collection reader pin while the real
+worker retries. They check retry cadence, progress in another namespace,
+and reclamation after release. One case holds a capacity claim in the
+fixed-size container.
+
+For a native Linux comparison, build `pouch_space_compaction_test` in
+Release and run it with an absolute scratch directory, a backend argument
+(`multifile` or `single-file`), and `soak` or `soak-durable`. Both backends
+use the same collection churn and one-second maintenance interval. The probe
+reports compactor thread CPU during writes and after they stop, append and
+delete pair latency, and drain CPU per net MiB released when measurable.
+
 Compare matched builds and multifile on representative lease, coordination,
 messaging, and indexed workloads. Record work time, CPU, mutation p95 and
 late-window latency, index readiness, first-owner and live-join reopen,

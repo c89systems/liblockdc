@@ -1077,6 +1077,11 @@ static int lc_pouch_compaction_take_collection_namespace(lc_pouch *pouch,
   return rc;
 }
 
+#ifdef LOCKDC_TEST_BUILD
+void (*lc_pouch_test_compaction_observe)(
+    const char *ns, const lc_pouch_maintenance_result *result, int rc);
+#endif
+
 static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
   char *ns;
   int terminal_reclaim;
@@ -1161,6 +1166,10 @@ static void lc_pouch_compaction_run_pass(lc_pouch *pouch) {
     options.background = 1;
     lc_error_init(&maintenance_error);
     rc = lc_pouch_maintenance_run(pouch, &options, &result, &maintenance_error);
+#ifdef LOCKDC_TEST_BUILD
+    if (lc_pouch_test_compaction_observe)
+      lc_pouch_test_compaction_observe(ns, &result, rc);
+#endif
     if (rc != LC_OK) {
       pslog_field fields[4];
 

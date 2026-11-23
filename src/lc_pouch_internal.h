@@ -425,6 +425,9 @@ size_t lc_pouch_test_resident_descriptor_count(lc_pouch *pouch);
 void lc_pouch_test_indexer_deadline(lc_pouch *pouch, struct timespec *deadline);
 void lc_pouch_test_compaction_run_pass(lc_pouch *pouch);
 size_t lc_pouch_test_compaction_queue_count(lc_pouch *pouch);
+/* Borrows a completed background attempt before the result is released. */
+extern void (*lc_pouch_test_compaction_observe)(
+    const char *ns, const lc_pouch_maintenance_result *result, int rc);
 char *lc_pouch_state_test_crypto_context(const lc_allocator *allocator,
                                          const char *ns, const char *key,
                                          lc_pouch_generation version,
