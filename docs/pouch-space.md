@@ -104,6 +104,9 @@ Configure the Darwin smoke build with `LOCKDC_BUILD_TESTS=ON` to include
 `pouch_space_lease_test`. It covers shared lease fencing and expiry, queue
 commit and rollback, outbox owner death and replay, and lease and messaging
 completion at the 10 MiB capacity in durable and NoSync modes.
+The SDK index suite verifies shared visibility, concurrent publication,
+recovery of derived indexes from canonical state, and retry at fixed capacity.
+It runs with both plain and encrypted, compressed payloads.
 
 With tests enabled, the Darwin `pouch_space_smoke_bundle` target builds
 `experiments/pouch_space/pouch-space-apfs-smoke.tar.gz` under the build

@@ -63,7 +63,7 @@ static void index_crashes(const char *directory) {
           lc_client_close(client);
           REQUIRE(!live);
           int fd = open(path, O_RDWR);
-          REQUIRE(fd >= 0 && !fdatasync(fd) && !close(fd));
+          REQUIRE(fd >= 0 && !ps_native_io.sync(NULL, fd) && !close(fd));
           if (!stop) {
             outbox_crash_io context = {0};
             index_crash_execute(path, sync, action, &context, &e);

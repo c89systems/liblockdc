@@ -36,7 +36,7 @@ static int outbox_crash_sync(void *context, int fd) {
   outbox_crash_io *io = context;
   int result;
   outbox_crash_boundary(io, 0);
-  result = fdatasync(fd);
+  result = ps_native_io.sync(NULL, fd);
   outbox_crash_boundary(io, 1);
   return result;
 }
@@ -45,7 +45,7 @@ static int outbox_crash_reserve(void *context, int fd, off_t offset,
   outbox_crash_io *io = context;
   int result;
   outbox_crash_boundary(io, 0);
-  result = fallocate(fd, 0, offset, size);
+  result = ps_native_io.reserve(NULL, fd, offset, size);
   outbox_crash_boundary(io, 1);
   return result;
 }

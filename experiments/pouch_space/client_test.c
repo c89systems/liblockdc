@@ -8,6 +8,7 @@
 #include "namespace.h"
 #include "pouch.h"
 #include "pouch_internal.h"
+#include "space_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -21,7 +22,8 @@
 #include <time.h>
 #include <unistd.h>
 
-static size_t checks, allocation, fail_at, live;
+static size_t checks, allocation, live;
+static size_t fail_at __attribute__((unused));
 static int armed;
 #define REQUIRE(x)                                                             \
   do {                                                                         \
@@ -31,6 +33,7 @@ static int armed;
       abort();                                                                 \
     }                                                                          \
   } while (0)
+#ifdef __linux__
 static int fails(void) {
   return __atomic_load_n(&armed, __ATOMIC_ACQUIRE) &&
          __atomic_add_fetch(&allocation, 1, __ATOMIC_RELAXED) == fail_at;
@@ -64,6 +67,7 @@ int __wrap_pthread_mutex_init(pthread_mutex_t *mutex,
     return EAGAIN;
   return __real_pthread_mutex_init(mutex, attributes);
 }
+#endif
 typedef union header {
   long double alignment;
   struct {
@@ -284,10 +288,11 @@ typedef struct closing_sink {
 } closing_sink;
 static int close_during_copy(lc_sink *pub, const void *bytes, size_t n,
                              lc_error *e) {
+  static const char expected[] = "{\"value\":1}";
   closing_sink *s = pub->impl;
   (void)e;
-  REQUIRE(s->bytes + n <= strlen("{\"value\":1}"));
-  REQUIRE(!memcmp(bytes, "{\"value\":1}" + s->bytes, n));
+  REQUIRE(s->bytes + n < sizeof(expected));
+  REQUIRE(!memcmp(bytes, expected + s->bytes, n));
   if (!s->calls++) {
     lc_client_close(*s->client);
     *s->client = NULL;
@@ -535,10 +540,10 @@ static ssize_t disk_write(void *context, int fd, const void *bytes, size_t n,
   return pwrite(fd, bytes, n, at);
 }
 static int disk_sync(void *context, int fd) {
-  return io_fails(context) ? -1 : fdatasync(fd);
+  return io_fails(context) ? -1 : ps_native_io.sync(NULL, fd);
 }
 static int disk_reserve(void *context, int fd, off_t at, off_t n) {
-  return io_fails(context) ? -1 : fallocate(fd, 0, at, n);
+  return io_fails(context) ? -1 : ps_native_io.reserve(NULL, fd, at, n);
 }
 static void unlocked(const char *path) {
   int fd = open(path, O_RDWR);
@@ -1483,7 +1488,7 @@ static int retention_disk_sync(void *context, int fd) {
   retention_disk *m = context;
   int fail = io_fails(&m->fault);
   if (!fail || m->persist) {
-    REQUIRE(fdatasync(fd) == 0);
+    REQUIRE(ps_native_io.sync(NULL, fd) == 0);
     for (size_t page = 0; !m->frozen && page < PS_DEFAULT_CAPACITY / PS_PAGE;
          ++page)
       if (m->dirty[page]) {
@@ -1501,14 +1506,14 @@ static int retention_disk_sync(void *context, int fd) {
 }
 static int retention_disk_reserve(void *context, int fd, off_t at, off_t n) {
   retention_disk *m = context;
-  return io_fails(&m->fault) ? -1 : fallocate(fd, 0, at, n);
+  return io_fails(&m->fault) ? -1 : ps_native_io.reserve(NULL, fd, at, n);
 }
 static void retention_disk_restore(retention_disk *m, const char *path) {
   int fd = open(path, O_RDWR);
   REQUIRE(fd >= 0);
   for (size_t at = 0; at < PS_DEFAULT_CAPACITY; at += PS_CHUNK)
     REQUIRE(pwrite(fd, m->stable + at, PS_CHUNK, (off_t)at) == PS_CHUNK);
-  REQUIRE(fdatasync(fd) == 0 && close(fd) == 0);
+  REQUIRE(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
 }
 /* Leave a peer claim holding the largest currently admissible payload.
@@ -1926,11 +1931,11 @@ static int retention_gate_sync(void *context, int fd) {
   if (g->enabled && !g->payload && !g->entered)
     retention_gate_wait(g);
   pthread_mutex_unlock(&g->mutex);
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int retention_gate_reserve(void *context, int fd, off_t at, off_t n) {
   (void)context;
-  return fallocate(fd, 0, at, n);
+  return ps_native_io.reserve(NULL, fd, at, n);
 }
 static void retention_bootstrap_cuts(const char *path, int sync,
                                      const ps_io *io, lc_error *e) {
@@ -2717,6 +2722,7 @@ static void guard_concurrency(const char *directory) {
   namespace_artifacts(directory, "guard-");
   lc_error_cleanup(&e);
 }
+#ifdef __linux__
 static void guard_faults(const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -2848,6 +2854,7 @@ static void guard_faults(const char *directory) {
        "retry, and no-I/O container acquire");
   lc_error_cleanup(&e);
 }
+#endif
 static void guard_public(const char *directory) {
   lc_error e;
   lc_error_init(&e);
@@ -2963,7 +2970,9 @@ static void guard_compare(const char *directory, int reverse) {
 #include "index_cases.h"
 #include "index_concurrency_cases.h"
 #include "index_crash_cases.h"
+#ifdef __linux__
 #include "index_open_cases.h"
+#endif
 #include "queue_outbox_concurrency_cases.h"
 #include "queue_outbox_crash_cases.h"
 #include "xa_capacity_cases.h"
@@ -2999,8 +3008,10 @@ static void *worker(void *context) {
     index_artifacts(r->directory);
   else if (!strcmp(r->mode, "index-shared"))
     index_shared(r->directory);
+#ifdef __linux__
   else if (!strcmp(r->mode, "index-open-faults"))
     index_open_faults(r->directory);
+#endif
   else if (!strcmp(r->mode, "index-durability"))
     index_faults(r->directory, 0);
   else if (!strcmp(r->mode, "index-io-faults"))
@@ -3071,8 +3082,10 @@ static void *worker(void *context) {
     guard_lifecycle(r->directory);
   else if (!strcmp(r->mode, "guard-concurrency"))
     guard_concurrency(r->directory);
+#ifdef __linux__
   else if (!strcmp(r->mode, "guard-faults"))
     guard_faults(r->directory);
+#endif
   else if (!strcmp(r->mode, "guard-public"))
     guard_public(r->directory);
   else if (!strcmp(r->mode, "guard-compare") ||
@@ -3085,7 +3098,9 @@ static void *worker(void *context) {
 int main(int argc, char **argv) {
   char prefix[1100], pattern[1200], directory[1200];
   pthread_t thread;
-  REQUIRE(argc == 3);
+  REQUIRE(argc == 3 || argc == 4);
+  if (argc == 4)
+    REQUIRE(!setenv("POUCH_INDEX_CODEC", argv[3], 1));
   if (!strcmp(argv[2], "xa-crash-child"))
     xa_crash_child();
   if (!strcmp(argv[2], "index-crash-child"))

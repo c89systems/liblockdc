@@ -382,7 +382,7 @@ typedef struct xa_batch_wait {
 
 static int xa_batch_wait_sync(void *context, int fd) {
   xa_batch_wait *wait = context;
-  int rc = fdatasync(fd);
+  int rc = ps_native_io.sync(NULL, fd);
   REQUIRE(!pthread_mutex_lock(&wait->mutex));
   if (wait->armed) {
     ++wait->syncs;

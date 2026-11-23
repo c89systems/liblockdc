@@ -23,7 +23,7 @@ static int xa_gated_sync(void *context, int fd) {
       pthread_cond_wait(&gate->changed, &gate->mutex);
   }
   pthread_mutex_unlock(&gate->mutex);
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int xa_sibling_write(lc_client *client, const char *value, lc_error *e) {
   lc_pouch *p = ((lc_client_handle *)client)->pouch;

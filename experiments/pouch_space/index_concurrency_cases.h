@@ -119,7 +119,7 @@ static int index_gated_sync(void *context, int fd) {
       pthread_cond_wait(&gate->changed, &gate->mutex);
   }
   pthread_mutex_unlock(&gate->mutex);
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static ssize_t index_gate_read(void *context, int fd, void *bytes, size_t size,
                                off_t offset) {
@@ -141,7 +141,7 @@ static ssize_t index_gate_write(void *context, int fd, const void *bytes,
 }
 static int index_gate_reserve(void *context, int fd, off_t offset, off_t size) {
   (void)context;
-  return posix_fallocate(fd, offset, size);
+  return ps_native_io.reserve(NULL, fd, offset, size);
 }
 static void index_raw_expect(ps_root *root,
                              const lc_pouch_index_artifact_id *id,

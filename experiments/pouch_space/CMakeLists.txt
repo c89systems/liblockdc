@@ -85,13 +85,24 @@ if(LOCKDC_BUILD_TESTS)
       "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
   endif()
   lc_configure_c_test_target(pouch_space_lease_test)
+
+  add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_client_test PRIVATE pouch_space_experiment)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(pouch_space_client_test PRIVATE
+      "LINKER:--wrap=pthread_mutex_init"
+      "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+      "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  endif()
+  lc_configure_c_test_target(pouch_space_client_test)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_custom_target(pouch_space_smoke
     DEPENDS pouch_space_platform_test pouch_space_coordination_test pouch_space_test)
   if(TARGET pouch_space_lease_test)
-    add_dependencies(pouch_space_smoke pouch_space_lease_test)
+    add_dependencies(pouch_space_smoke pouch_space_lease_test pouch_space_client_test)
     function(pouch_space_darwin_case name target timeout_seconds)
       if(NOT CMAKE_CROSSCOMPILING)
         add_test(NAME ${name} COMMAND ${target} ${CMAKE_CURRENT_BINARY_DIR} ${ARGN})
@@ -131,12 +142,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         endforeach()
       endforeach()
     endforeach()
+    foreach(codec 0 3)
+      foreach(mode index-artifacts index-shared index-durability index-recovery index-capacity index-concurrency)
+        pouch_space_darwin_case(pouch_space_client_${mode}_${codec}
+          pouch_space_client_test 900 ${mode} ${codec})
+      endforeach()
+    endforeach()
     if(NOT CMAKE_CROSSCOMPILING)
       lc_apply_test_defaults()
     endif()
 
     set(bundle_targets
-      pouch_space_platform_test pouch_space_coordination_test pouch_space_test pouch_space_lease_test)
+      pouch_space_platform_test pouch_space_coordination_test pouch_space_test
+      pouch_space_lease_test pouch_space_client_test)
     set(bundle_files)
     foreach(target IN LISTS bundle_targets)
       list(APPEND bundle_files "$<TARGET_FILE:${target}>")
@@ -702,14 +720,6 @@ if(LOCKDC_BUILD_TESTS)
       endforeach()
     endforeach()
   endforeach()
-  add_executable(pouch_space_client_test client_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-  target_include_directories(pouch_space_client_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(pouch_space_client_test PRIVATE pouch_space_experiment)
-  target_link_options(pouch_space_client_test PRIVATE
-    "LINKER:--wrap=pthread_mutex_init"
-    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
-  lc_configure_c_test_target(pouch_space_client_test)
   foreach(mode lifecycle validation faults io-faults namespaces namespace-concurrency namespace-compare retention-codec retention retention-faults retention-io-faults retention-capacity retention-capacity-faults retention-progress retention-concurrency retention-compare retention-discovery-compare guards guard-concurrency guard-faults guard-public guard-compare outbox-markers outbox-notifications outbox-marker-io-faults outbox-marker-allocation-faults outbox-marker-crash outbox-marker-concurrency)
     add_test(NAME pouch_space_client_${mode} COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_client_${mode} PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
