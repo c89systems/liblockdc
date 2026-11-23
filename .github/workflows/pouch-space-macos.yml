@@ -1,0 +1,104 @@
+name: Pouch Space macOS diagnostics
+
+on:
+  push:
+    branches: [experiment/pouch-space]
+
+permissions:
+  contents: read
+
+env:
+  LOCKDC_TMP_AUTO_CLEANUP_STALE_SECONDS: "-1"
+
+jobs:
+  linux-fixtures:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Write Linux Pouch files
+        run: |
+          bash scripts/deps.sh deps-x86_64-linux-gnu
+          cmake --preset x86_64-linux-gnu-release -DLOCKDC_BUILD_BENCHMARKS=OFF
+          cmake --build build/x86_64-linux-gnu-release --parallel 2 --target pouch_space_test pouch_space_platform_test
+          probes="$PWD/build/x86_64-linux-gnu-release/experiments/pouch_space"
+          mkdir -p build/linux-wire
+          "$probes/pouch_space_test" "$PWD/build/linux-wire/raw.pouch" wire-create
+          "$probes/pouch_space_platform_test" "$PWD/build/linux-wire/collection.pouch" --write-collection
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-wire
+          path: build/linux-wire/*.pouch
+          if-no-files-found: error
+          retention-days: 3
+
+  macos-apfs:
+    needs: linux-fixtures
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build native Apple Silicon tests
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          test "$(uname -m)" = arm64
+          brew list --versions bash >/dev/null || brew install bash
+          export PATH="$(brew --prefix bash)/bin:$PATH"
+          bash scripts/deps.sh deps-arm64-apple-darwin-native
+          cmake --preset arm64-apple-darwin-native
+          cmake --build build/arm64-apple-darwin-native --parallel 3 --target pouch_space_smoke
+      - name: Run Pouch Space tests on APFS
+        run: |
+          build="$PWD/build/arm64-apple-darwin-native"
+          sw_vers
+          volume=$("$build/experiments/pouch_space/pouch_space_platform_test" --describe-volume "$build")
+          printf '%s\n' "$volume"
+          case "$volume" in
+            'filesystem=apfs '*) ;;
+            *) echo 'The native test build directory must be on APFS' >&2; exit 1 ;;
+          esac
+          ctest --test-dir "$build" -L '^pouch-space$' --output-on-failure --no-tests=error --parallel 1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-wire
+          path: build/linux-wire
+      - name: Verify Linux files and write macOS files
+        run: |
+          probes="$PWD/build/arm64-apple-darwin-native/experiments/pouch_space"
+          "$probes/pouch_space_test" "$PWD/build/linux-wire/raw.pouch" wire-verify
+          "$probes/pouch_space_platform_test" "$PWD/build/linux-wire/collection.pouch" --verify-collection
+          mkdir -p build/macos-wire
+          "$probes/pouch_space_test" "$PWD/build/macos-wire/raw.pouch" wire-create
+          "$probes/pouch_space_platform_test" "$PWD/build/macos-wire/collection.pouch" --write-collection
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-wire
+          path: build/macos-wire/*.pouch
+          if-no-files-found: error
+          retention-days: 3
+
+  linux-reopen:
+    needs: macos-apfs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: macos-wire
+          path: build/macos-wire
+      - name: Verify macOS Pouch files on Linux
+        run: |
+          bash scripts/deps.sh deps-x86_64-linux-gnu
+          cmake --preset x86_64-linux-gnu-release -DLOCKDC_BUILD_BENCHMARKS=OFF
+          cmake --build build/x86_64-linux-gnu-release --parallel 2 --target pouch_space_test pouch_space_platform_test
+          probes="$PWD/build/x86_64-linux-gnu-release/experiments/pouch_space"
+          "$probes/pouch_space_test" "$PWD/build/macos-wire/raw.pouch" wire-verify
+          "$probes/pouch_space_platform_test" "$PWD/build/macos-wire/collection.pouch" --verify-collection

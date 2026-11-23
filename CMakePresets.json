@@ -164,6 +164,21 @@
       }
     },
     {
+      "name": "arm64-apple-darwin-native",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "15.0",
+        "LOCKDC_EXTERNAL_ROOT": "${sourceDir}/.cache/deps/arm64-apple-darwin-native",
+        "LOCKDC_DEPENDENCY_BUILD_ROOT": "${sourceDir}/.cache/deps-build/arm64-apple-darwin-native",
+        "LOCKDC_BUILD_SHARED": "OFF",
+        "LOCKDC_BUILD_BENCHMARKS": "OFF",
+        "LOCKDC_BUILD_LUA_BINDINGS": "OFF",
+        "LOCKDC_INSTALL": "OFF"
+      }
+    },
+    {
       "name": "asan",
       "inherits": "debug"
     },
@@ -254,6 +269,10 @@
     {
       "name": "arm64-apple-darwin-release",
       "configurePreset": "arm64-apple-darwin-release"
+    },
+    {
+      "name": "arm64-apple-darwin-native",
+      "configurePreset": "arm64-apple-darwin-native"
     },
     {
       "name": "asan",

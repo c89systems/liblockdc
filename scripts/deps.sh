@@ -28,6 +28,13 @@ liblql_abi_version=${LOCKDC_LIBLQL_ABI_VERSION:-0}
 # shellcheck source=assert_generated_path.sh
 source "$script_dir/assert_generated_path.sh"
 
+dependency_target_id=${preset#deps-}
+dependency_target_id=${dependency_target_id%-native}
+sha256=(sha256sum)
+if ! command -v sha256sum >/dev/null 2>&1; then
+  sha256=(shasum -a 256)
+fi
+
 case "$preset" in
   deps-x86_64-linux-gnu)
     cmake_preset="x86_64-linux-gnu-release"
@@ -101,10 +108,13 @@ case "$preset" in
       -DLOCKDC_BUILD_FUZZERS=OFF
     )
     ;;
-  deps-arm64-apple-darwin)
+  deps-arm64-apple-darwin|deps-arm64-apple-darwin-native)
     cmake_preset="arm64-apple-darwin-release"
-    deps_root="$repo_root/.cache/deps/arm64-apple-darwin"
-    deps_build_root="$repo_root/.cache/deps-build/arm64-apple-darwin"
+    if [ "$preset" = deps-arm64-apple-darwin-native ]; then
+      cmake_preset="arm64-apple-darwin-native"
+    fi
+    deps_root="$repo_root/.cache/deps/${preset#deps-}"
+    deps_build_root="$repo_root/.cache/deps-build/${preset#deps-}"
     cmake_extra_args=(
       -DLOCKDC_BUILD_DEPENDENCIES=ON
       -DLOCKDC_BUILD_TESTS=OFF
@@ -116,7 +126,7 @@ case "$preset" in
     )
     ;;
   *)
-    echo "usage: scripts/deps.sh [deps-x86_64-linux-gnu|deps-x86_64-linux-musl|deps-aarch64-linux-gnu|deps-aarch64-linux-musl|deps-armhf-linux-gnu|deps-armhf-linux-musl|deps-arm64-apple-darwin]" >&2
+    echo "usage: scripts/deps.sh [deps-x86_64-linux-gnu|deps-x86_64-linux-musl|deps-aarch64-linux-gnu|deps-aarch64-linux-musl|deps-armhf-linux-gnu|deps-armhf-linux-musl|deps-arm64-apple-darwin|deps-arm64-apple-darwin-native]" >&2
     echo "       append --with-postgres to provision the optional cpktdb SDK" >&2
     exit 2
     ;;
@@ -171,7 +181,7 @@ lonejson_version=$(resolve_cmake_cache_string LOCKDC_LONEJSON_VERSION "${LOCKDC_
 cmocka_version=$(resolve_cmake_cache_string LOCKDC_CMOCKA_VERSION "${LOCKDC_CMOCKA_VERSION:-}")
 pslog_version=$(resolve_cmake_cache_string LOCKDC_PSLOG_VERSION "${LOCKDC_PSLOG_VERSION:-}")
 
-cpkt_asset_name="cpkt-$cpkt_version-${preset#deps-}.tar.gz"
+cpkt_asset_name="cpkt-$cpkt_version-$dependency_target_id.tar.gz"
 cpkt_download_url="https://github.com/c89systems/cpkt/releases/download/v$cpkt_version/$cpkt_asset_name"
 case "$cpkt_asset_name" in
   cpkt-0.7.0-x86_64-linux-gnu.tar.gz)
@@ -203,7 +213,7 @@ esac
 
 if [ "$build_postgres" = ON ]; then
   cpktdb_version=$(resolve_cmake_cache_string LOCKDC_CPKTDB_VERSION "${LOCKDC_CPKTDB_VERSION:-}")
-  cpktdb_asset_name="cpktdb-$cpktdb_version-${preset#deps-}.tar.gz"
+  cpktdb_asset_name="cpktdb-$cpktdb_version-$dependency_target_id.tar.gz"
   cpktdb_download_url="https://github.com/c89systems/cpktdb/releases/download/v$cpktdb_version/$cpktdb_asset_name"
   case "$cpktdb_asset_name" in
     cpktdb-0.4.0-x86_64-linux-gnu.tar.gz)
@@ -234,7 +244,7 @@ if [ "$build_postgres" = ON ]; then
   esac
 fi
 
-lonejson_asset_name="liblonejson-$lonejson_version-${preset#deps-}.tar.gz"
+lonejson_asset_name="liblonejson-$lonejson_version-$dependency_target_id.tar.gz"
 lonejson_download_url="https://github.com/c89systems/lonejson/releases/download/v$lonejson_version/$lonejson_asset_name"
 case "$lonejson_asset_name" in
   liblonejson-0.50.0-x86_64-linux-gnu.tar.gz)
@@ -265,7 +275,7 @@ case "$lonejson_asset_name" in
 esac
 
 liblql_version=$(resolve_cmake_cache_string LOCKDC_LIBLQL_VERSION "${LOCKDC_LIBLQL_VERSION:-}")
-liblql_asset_name="liblql-$liblql_version-${preset#deps-}.tar.gz"
+liblql_asset_name="liblql-$liblql_version-$dependency_target_id.tar.gz"
 liblql_download_url="https://github.com/c89systems/liblql/releases/download/v$liblql_version/$liblql_asset_name"
 case "$liblql_asset_name" in
   liblql-0.4.1-x86_64-linux-gnu.tar.gz)
@@ -295,7 +305,7 @@ case "$liblql_asset_name" in
     ;;
 esac
 
-pslog_asset_name="libpslog-$pslog_version-${preset#deps-}.tar.gz"
+pslog_asset_name="libpslog-$pslog_version-$dependency_target_id.tar.gz"
 pslog_download_url="https://github.com/c89systems/libpslog/releases/download/v$pslog_version/$pslog_asset_name"
 case "$pslog_asset_name" in
   libpslog-0.13.0-x86_64-linux-gnu.tar.gz)
@@ -325,15 +335,13 @@ case "$pslog_asset_name" in
     ;;
 esac
 
-dependency_target_id=${preset#deps-}
-
 toolchain_value() {
   local key=$1
   printf '%s\n' "$toolchain_description" | sed -n "s/^${key}=//p" | head -n1
 }
 
-case "$dependency_target_id" in
-  *-linux-*)
+case "$preset" in
+  deps-*-linux-*)
     toolchain_description=$("$repo_root/scripts/cpkt-toolchains.sh" discover "$dependency_target_id")
     if ! printf '%s\n' "$toolchain_description" | grep -q '^status=ready$'; then
       "$repo_root/scripts/cpkt-toolchains.sh" ensure "$dependency_target_id" >/dev/null
@@ -354,7 +362,29 @@ case "$dependency_target_id" in
     compiler_version=$("$compiler_path" --version 2>/dev/null | head -n1 || echo unknown)
     compiler=$(basename -- "$compiler_path")
     ;;
-  *)
+  deps-arm64-apple-darwin-native)
+    if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+      printf 'The native Darwin preset requires Apple Silicon macOS\n' >&2
+      exit 1
+    fi
+    toolchain_source=xcode
+    toolchain_archive=
+    toolchain_root=$(xcode-select -p)
+    toolchain_prefix=
+    toolchain_sysroot=$(xcrun --sdk macosx --show-sdk-path)
+    compiler_path=$(xcrun --sdk macosx --find clang)
+    compiler_machine=$("$compiler_path" -dumpmachine)
+    compiler_version=$("$compiler_path" --version | sed -n '1p')
+    compiler=$(basename -- "$compiler_path")
+    toolchain_target_triple=$compiler_machine
+    cmake_extra_args+=(
+      "-DCMAKE_C_COMPILER=$compiler_path"
+      "-DCMAKE_OSX_SYSROOT=$toolchain_sysroot"
+      "-DLOCKDC_OTOOL=$(xcrun --sdk macosx --find otool)"
+      "-DCMAKE_INSTALL_NAME_TOOL=$(xcrun --sdk macosx --find install_name_tool)"
+    )
+    ;;
+  deps-arm64-apple-darwin)
     if [ -z "${CPKT_OSXCROSS_HOST:-}" ] && [ -n "${LOCKDC_OSXCROSS_HOST:-}" ]; then
       export CPKT_OSXCROSS_HOST=$LOCKDC_OSXCROSS_HOST
     fi
@@ -397,7 +427,7 @@ fingerprint=$(
         cat "$file"
       done
     fi
-  } | sha256sum | awk '{print $1}'
+  } | "${sha256[@]}" | awk '{print $1}'
 )
 
 manifest="compiler=$compiler
@@ -523,7 +553,7 @@ download_cpkt_bundle() {
   mkdir -p "$local_download_root" "$extract_root"
   acquire_verified_archive "cpkt" "$cpkt_download_url" "$cpkt_asset_hash" "$cpkt_asset_name" "$archive_path"
 
-  actual_hash=$(sha256sum "$archive_path" | awk '{print $1}')
+  actual_hash=$("${sha256[@]}" "$archive_path" | awk '{print $1}')
   if [ "$actual_hash" != "$cpkt_asset_hash" ]; then
     printf 'cpkt checksum mismatch for %s\nexpected %s\nactual   %s\n' \
       "$cpkt_asset_name" "$cpkt_asset_hash" "$actual_hash" >&2
@@ -553,7 +583,7 @@ download_lonejson_bundle() {
   mkdir -p "$local_download_root" "$extract_root"
   acquire_verified_archive "lonejson" "$lonejson_download_url" "$lonejson_asset_hash" "$lonejson_asset_name" "$archive_path"
 
-  actual_hash=$(sha256sum "$archive_path" | awk '{print $1}')
+  actual_hash=$("${sha256[@]}" "$archive_path" | awk '{print $1}')
   if [ "$actual_hash" != "$lonejson_asset_hash" ]; then
     printf 'lonejson checksum mismatch for %s\nexpected %s\nactual   %s\n' \
       "$lonejson_asset_name" "$lonejson_asset_hash" "$actual_hash" >&2
@@ -573,7 +603,7 @@ download_liblql_bundle() {
   mkdir -p "$local_download_root" "$extract_root"
   acquire_verified_archive "liblql" "$liblql_download_url" "$liblql_asset_hash" "$liblql_asset_name" "$archive_path"
 
-  actual_hash=$(sha256sum "$archive_path" | awk '{print $1}')
+  actual_hash=$("${sha256[@]}" "$archive_path" | awk '{print $1}')
   if [ "$actual_hash" != "$liblql_asset_hash" ]; then
     printf 'liblql checksum mismatch for %s\nexpected %s\nactual   %s\n' \
       "$liblql_asset_name" "$liblql_asset_hash" "$actual_hash" >&2
@@ -670,8 +700,8 @@ reset_dependency_build_root() {
   exit 1
 }
 
-case "$preset" in
-  deps-arm64-apple-darwin)
+case "$dependency_target_id" in
+  arm64-apple-darwin)
     shared_ext=dylib
     libssh2_shared_path="$deps_root/libssh2/install/lib/libssh2.1.${shared_ext}"
     libssh2_shared_soname_path="$deps_root/libssh2/install/lib/libssh2.1.${shared_ext}"
