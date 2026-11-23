@@ -35,6 +35,12 @@ typedef struct ps_owned_status {
   uint64_t edit_wire;
   int sealed, retired, complete;
 } ps_owned_status;
+typedef struct ps_owned_initial {
+  ps_coordination_guard *edit;
+  ps_owned_mapping *runs;
+  ps_owned_footer *footers;
+  size_t count;
+} ps_owned_initial;
 
 /* The optional budget funds creation only. Shared creation retains an orphan
  * liveness claim until first durable binding or final close. */
@@ -45,6 +51,10 @@ int ps_owned_open(ps_space *, ps_budget *, ps_key, int create, const ps_ref *,
 int ps_owned_open_guarded(ps_space *, ps_budget *, ps_key, int create,
                           const ps_ref *, ps_owned_head **, ps_owned_status *,
                           lc_error *);
+/* Select and pin an exact shared stream under its edit guard. On success
+ * the caller owns the head, edit guard, mappings and checked footers. */
+int ps_owned_open_initial(ps_space *, ps_key, const ps_ref *, ps_owned_head **,
+                          ps_owned_status *, ps_owned_initial *, lc_error *);
 /* Stage an empty head for a following durable catalog binding in this space.
  * The binding's barrier covers both records. Keep this handle until the
  * binding returns so the shared preparation claim protects the head. */

@@ -7543,17 +7543,40 @@ static void append_byte(ps_stream *s, uint64_t start, const char *body,
   ps_stream_writer_close(writer);
 }
 typedef struct header_probe {
+  ps_space *writer;
+  uint64_t token;
   off_t offsets[16];
-  size_t count, combined, identities, footers;
+  size_t count, combined, identities, footers, allocator_entries;
   int armed;
 } header_probe;
+static int header_lock(void *context, int fd, int command, struct flock *lock) {
+  header_probe *probe = context;
+  int rc = fcntl(fd, command, lock);
+  if (rc == 0 && probe->armed && lock->l_start == 4 &&
+      lock->l_type == F_WRLCK &&
+      (command == F_OFD_SETLK || command == F_OFD_SETLKW))
+    ++probe->allocator_entries;
+  return rc;
+}
 static ssize_t header_read(void *context, int fd, void *out, size_t n,
                            off_t at) {
   header_probe *probe = context;
   if (probe->armed)
     for (size_t i = 0; i < probe->count; ++i) {
-      if (at == probe->offsets[i] && n == PS_RUN_HEADER)
-        ++probe->combined;
+      if (at == probe->offsets[i] && n == PS_RUN_HEADER && !probe->combined++) {
+        ps_coordination *other = ps_space_coordination(probe->writer);
+        ps_coordination_guard *guard = NULL;
+        lc_error e = {0};
+        ok(ps_coordination_lock(other, PS_COORDINATION_ALLOCATION, 0, 0, &guard,
+                                &e),
+           &e);
+        ps_coordination_unlock(guard);
+        REQUIRE(ps_coordination_lock(other, PS_COORDINATION_STREAM,
+                                     probe->token, 0, &guard,
+                                     &e) == LC_ERR_PENDING &&
+                !guard);
+        lc_error_cleanup(&e);
+      }
       if (at == probe->offsets[i] && n == PS_RUN_IDENTITY_BYTES)
         ++probe->identities;
       if (at == probe->offsets[i] + PS_RUN_IDENTITY_BYTES)
@@ -7565,6 +7588,7 @@ static void stream_header_capture(int durable) {
   lc_error e = {0};
   header_probe probe = {0};
   ps_io io = {&probe, header_read, durable_write, sync_io, reserve_io, NULL};
+  ps_coordination_io coordination = {&probe, header_lock};
   ps_options options = {0};
   ps_space *writer = NULL, *peer = NULL;
   ps_stream *stream = NULL;
@@ -7603,19 +7627,59 @@ static void stream_header_capture(int durable) {
   ok(ps_stream_close(stream, &e), &e);
   ok(ps_checkpoint(writer, &e), &e);
 
+  probe.writer = writer;
+  probe.token = info.ref.incarnation;
   options.io = &io;
+  options.coordination_io = &coordination;
   ok(ps_open(path, 0, &options, &peer, &e), &e);
   probe.armed = 1;
   ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
                     &stream, &e),
      &e);
   REQUIRE(probe.combined == probe.count && !probe.identities && !probe.footers);
+  REQUIRE(probe.allocator_entries == 1);
   probe.armed = 0;
   ok(ps_stream_window_open(stream, 2 * PS_CHUNK - 1, 1, &view, &e), &e);
   ok(ps_stream_window_read(view, 2 * PS_CHUNK - 1, &last, 1, &e), &e);
   REQUIRE(last == 'a');
   ps_stream_window_close(view);
   ok(ps_stream_close(stream, &e), &e);
+
+  ps_ref stale = info.ref;
+  ++stale.incarnation;
+  REQUIRE(ps_stream_open(peer, NULL, tail_stream(), 0, &stale, NULL, NULL,
+                         &stream, &e) == LC_ERR_INVALID &&
+          !stream);
+  lc_error_cleanup(&e);
+
+  /* Every allocation cut must release the captured head, pins and edit
+   * guard. Retry still verifies the same sealed stream. */
+  allocation_fail = allocations = 0;
+  measuring = 1;
+  ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                    &stream, &e),
+     &e);
+  measuring = 0;
+  size_t sites = allocations;
+  REQUIRE(sites > 1);
+  ok(ps_stream_close(stream, &e), &e);
+  for (size_t site = 1; site <= sites; ++site) {
+    allocations = 0;
+    allocation_fail = site;
+    measuring = 1;
+    int rc = ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                            &stream, &e);
+    measuring = 0;
+    REQUIRE(rc == LC_ERR_NOMEM && !stream);
+    lc_error_cleanup(&e);
+    ok(ps_stream_open(peer, NULL, tail_stream(), 0, &info.ref, NULL, NULL,
+                      &stream, &e),
+       &e);
+    ok(ps_stream_close(stream, &e), &e);
+    REQUIRE(!peer->readers && !peer->reader_claim_bytes &&
+            !ps_coordination_users(ps_space_coordination(peer)));
+  }
+  allocation_fail = 0;
 
   /* Both checks still apply to a live join, including the sealed partial run.
    */

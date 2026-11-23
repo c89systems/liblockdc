@@ -232,6 +232,16 @@ static void stream_destroy(ps_stream *s) {
   (void)pthread_mutex_destroy(&s->mutex);
   lc_free_with_allocator(NULL, s);
 }
+static void install_mappings(ps_stream *s, ps_owned_mapping *runs, size_t count,
+                             enum stream_mappings mappings) {
+  size_t i;
+  for (i = 0; i < count; ++i)
+    note_grant(s, runs[i].capacity);
+  ps_owned_runs_close(s->runs, s->count);
+  s->runs = runs;
+  s->allocated = s->count = count;
+  s->mappings = mappings;
+}
 /* Namespace owners can keep validated scalar state independently of the
  * physical handles. Under the same edit owner, only the incomplete piece and
  * later grants are needed for an append. Full capture remains the recovery
@@ -239,7 +249,7 @@ static void stream_destroy(ps_stream *s) {
 static int capture_mappings(ps_stream *s, enum stream_mappings mappings,
                             ps_owned_footer **footers, lc_error *error) {
   ps_owned_mapping *runs = NULL;
-  size_t i, count = 0;
+  size_t count = 0;
   int rc = LC_OK;
   if (mappings == STREAM_FULL)
     rc = footers ? ps_owned_runs_capture_initial(s->head, &runs, &count,
@@ -248,29 +258,27 @@ static int capture_mappings(ps_stream *s, enum stream_mappings mappings,
   else if (s->checked < s->capacity)
     rc = ps_owned_runs_edit_range(s->head, s->checked, s->capacity, &runs,
                                   &count, error);
-  if (rc == LC_OK) {
-    for (i = 0; i < count; ++i)
-      note_grant(s, runs[i].capacity);
-    ps_owned_runs_close(s->runs, s->count);
-    s->runs = runs;
-    s->allocated = s->count = count;
-    s->mappings = mappings;
-  }
+  if (rc == LC_OK)
+    install_mappings(s, runs, count, mappings);
   return rc;
 }
 /* Load under the stream's edit guard for a shared space. The target either
  * has no callers yet or is a private view staged for a handoff. */
 static int stream_load(ps_stream *s, const ps_owned_status *status,
                        ps_stream_recover_fn recover, void *context,
-                       lc_error *error) {
+                       const ps_owned_initial *initial, lc_error *error) {
   ps_owned_footer *footers = NULL;
   uint64_t accepted;
-  int rc, repaired = 0, recover_tail = 0;
+  int rc = LC_OK, repaired = 0, recover_tail = 0;
   s->ref = status->ref;
   s->tail = s->recovery_floor = status->tail;
   s->sealed = status->sealed;
   s->edit_wire = status->edit_wire;
-  rc = capture_mappings(s, STREAM_FULL, &footers, error);
+  if (initial) {
+    install_mappings(s, initial->runs, initial->count, STREAM_FULL);
+    footers = initial->footers;
+  } else
+    rc = capture_mappings(s, STREAM_FULL, &footers, error);
   if (rc == LC_OK)
     s->capacity = status->capacity;
   if (rc == LC_OK)
@@ -323,9 +331,10 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
                    const ps_ref *ref, ps_stream_recover_fn recover,
                    void *context, ps_stream **out, lc_error *error) {
   ps_owned_status status;
+  ps_owned_initial initial;
   ps_coordination_guard *edit = NULL;
   ps_stream *s;
-  int rc, continued;
+  int rc, continued, selected;
   if (out)
     *out = NULL;
   if (!out)
@@ -340,9 +349,17 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
     return stream_error(error, LC_ERR_TRANSPORT,
                         "cannot initialize stream mutex");
   }
-  rc = ps_owned_open_guarded(space, budget, key, create, ref, &s->head, &status,
-                             error);
-  if (rc == LC_OK && ps_coordination_shared(ps_space_coordination(space))) {
+  selected =
+      !create && ref && ps_coordination_shared(ps_space_coordination(space));
+  if (selected) {
+    rc = ps_owned_open_initial(space, key, ref, &s->head, &status, &initial,
+                               error);
+    edit = initial.edit;
+  } else
+    rc = ps_owned_open_guarded(space, budget, key, create, ref, &s->head,
+                               &status, error);
+  if (rc == LC_OK && !selected &&
+      ps_coordination_shared(ps_space_coordination(space))) {
     /* Head creation is structural. Independent peers must be able to pass it
      * while this newly created stream has a long-running producer. */
     if (create)
@@ -351,7 +368,8 @@ int ps_stream_open(ps_space *space, ps_budget *budget, ps_key key, int create,
       rc = ps_owned_edit_begin(s->head, 0, &edit, &status, &continued, error);
   }
   if (rc == LC_OK)
-    rc = stream_load(s, &status, recover, context, error);
+    rc = stream_load(s, &status, recover, context, selected ? &initial : NULL,
+                     error);
   if (edit) {
     s->recover = recover;
     s->recovery_context = context;
@@ -398,7 +416,8 @@ static int stream_refresh_edit(ps_stream *s, const ps_owned_status *status,
     return stream_error(error, LC_ERR_TRANSPORT,
                         "cannot initialize refreshed stream view");
   staged.head = s->head;
-  rc = stream_load(&staged, status, s->recover, s->recovery_context, error);
+  rc = stream_load(&staged, status, s->recover, s->recovery_context, NULL,
+                   error);
   if (rc == LC_OK) {
     pthread_mutex_lock(&s->mutex);
     old = s->runs;

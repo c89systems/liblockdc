@@ -88,6 +88,10 @@ static int canonical_refresh(ps_space *, checkpoint_preview *, int verify_disk,
 static int allocation_begin(ps_space *, ps_coordination_guard **, lc_error *);
 static int allocation_end(ps_space *, ps_coordination_guard *, int, lc_error *);
 static int stream_structure_ready(ps_space *, const ps_entry *, lc_error *);
+static int claim_writer_stamp(ps_space *, ps_entry *, int, int *, lc_error *);
+static int pin_runs_locked(ps_space *, ps_entry *, ps_key, const ps_ref *,
+                           uint64_t, uint64_t, int, ps_owned_status *,
+                           ps_owned_mapping **, size_t *, lc_error *);
 typedef struct ps_value_slot {
   uint64_t key, token, bytes;
   ps_entry *retained;
@@ -9439,12 +9443,12 @@ int ps_internal_certify_tail(ps_space *s, ps_key key, const ps_ref *ref,
 static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                       const ps_ref *ref, int guarded, int prepare, int defer,
                       ps_owned_head **out, ps_owned_status *status,
-                      lc_error *error) {
+                      ps_owned_initial *initial, lc_error *error) {
   ps_owned_head *head;
   ps_coordination_guard *guard;
   ps_entry *p = NULL, *old;
   uint64_t sequence = 0;
-  int rc;
+  int rc, continued;
   if (out)
     *out = NULL;
   if (!s || !out || !status || key.kind != PS_STREAM || (create && ref))
@@ -9515,6 +9519,11 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
     ++p->pins; /* Stream heads own no payload extents. */
     ++s->readers;
     owned_status(head, status);
+    if (initial && !status->sealed)
+      rc = claim_writer_stamp(s, p, PS_STREAM_OWNER, &continued, error);
+    if (rc == LC_OK && initial)
+      rc = pin_runs_locked(s, p, key, ref, 0, 0, 0, NULL, &initial->runs,
+                           &initial->count, error);
   } else if (create && p->state == 0) {
     ps_coordination_unlock(p->stream->claim);
     ps_internal_entry_free(p);
@@ -9534,12 +9543,14 @@ static int owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
 int ps_owned_open(ps_space *s, ps_budget *budget, ps_key key, int create,
                   const ps_ref *ref, ps_owned_head **out,
                   ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 0, 0, 0, out, status, error);
+  return owned_open(s, budget, key, create, ref, 0, 0, 0, out, status, NULL,
+                    error);
 }
 int ps_owned_open_guarded(ps_space *s, ps_budget *budget, ps_key key,
                           int create, const ps_ref *ref, ps_owned_head **out,
                           ps_owned_status *status, lc_error *error) {
-  return owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, error);
+  return owned_open(s, budget, key, create, ref, 1, 0, 0, out, status, NULL,
+                    error);
 }
 int ps_owned_stage_empty(ps_space *s, ps_budget *budget, ps_key key,
                          ps_owned_head **out, ps_ref *ref, lc_error *error) {
@@ -9549,7 +9560,7 @@ int ps_owned_stage_empty(ps_space *s, ps_budget *budget, ps_key key,
     *out = NULL;
   if (!ref)
     return err(error, LC_ERR_INVALID, "staged stream requires a reference");
-  rc = owned_open(s, budget, key, 1, NULL, 1, 0, 1, out, &status, error);
+  rc = owned_open(s, budget, key, 1, NULL, 1, 0, 1, out, &status, NULL, error);
   if (rc == LC_OK)
     *ref = status.ref;
   return rc;
@@ -9557,7 +9568,8 @@ int ps_owned_stage_empty(ps_space *s, ps_budget *budget, ps_key key,
 int ps_owned_open_prepared(ps_space *s, ps_key key, ps_owned_head **out,
                            ps_owned_status *status, lc_error *error) {
   int shared = ps_coordination_shared(ps_space_coordination(s));
-  return owned_open(s, NULL, key, 0, NULL, shared, 1, 0, out, status, error);
+  return owned_open(s, NULL, key, 0, NULL, shared, 1, 0, out, status, NULL,
+                    error);
 }
 void ps_owned_close(ps_owned_head *head) {
   ps_space *s;
@@ -9611,16 +9623,20 @@ int ps_owned_status_capture(ps_owned_head *head, ps_owned_status *out,
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }
-int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
-                      lc_error *error) {
+static int owned_edit_end(ps_space *s, ps_coordination_guard *guard, int rc,
+                          lc_error *error) {
   if (guard) {
     ps_coordination_unlock(guard);
-    if (__atomic_load_n(&head->space->poisoned, __ATOMIC_RELAXED)) {
+    if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
       lc_error_cleanup(error);
-      return healthy(head->space, error);
+      return healthy(s, error);
     }
   }
   return rc;
+}
+int ps_owned_edit_end(ps_owned_head *head, ps_coordination_guard *guard, int rc,
+                      lc_error *error) {
+  return guard ? owned_edit_end(head->space, guard, rc, error) : rc;
 }
 static int writer_stamp_current(const ps_space *s, const ps_entry *p) {
   const ps_writer_stamp *stamp = entry_writer_stamp(p);
@@ -10311,6 +10327,51 @@ int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
   }
   return rc;
 }
+static int verify_captured_runs(ps_owned_mapping *items, size_t count,
+                                ps_owned_footer **footers, lc_error *error) {
+  ps_owned_footer *captured = NULL;
+  int rc;
+  if (footers && count) {
+    if (count <= SIZE_MAX / sizeof(*captured))
+      captured = lc_alloc_with_allocator(NULL, count * sizeof(*captured));
+    if (!captured)
+      return err(error, LC_ERR_NOMEM, "cannot allocate mapping footers");
+  }
+  rc = ps_owned_runs_verify(items, count, captured, error);
+  if (rc != LC_OK)
+    lc_free_with_allocator(NULL, captured);
+  else if (footers)
+    *footers = captured;
+  return rc;
+}
+int ps_owned_open_initial(ps_space *s, ps_key key, const ps_ref *ref,
+                          ps_owned_head **out, ps_owned_status *status,
+                          ps_owned_initial *initial, lc_error *error) {
+  int rc;
+  *out = NULL;
+  memset(initial, 0, sizeof(*initial));
+  if (key.kind != PS_STREAM || memcmp(ref->container, s->identity, 16))
+    return err(error, LC_ERR_INVALID,
+               "stale or foreign owned stream reference");
+  /* The exact reference names the edit guard before looking up the head.
+   * Validate that reference and pin its runs within one allocator hold.
+   * Keep the physical reads outside allocator authority. */
+  rc = ps_coordination_lock(s->coordination, PS_COORDINATION_STREAM,
+                            ref->incarnation, 0, &initial->edit, error);
+  if (rc == LC_OK)
+    rc = owned_open(s, NULL, key, 0, ref, 1, 0, 0, out, status, initial, error);
+  if (rc == LC_OK)
+    rc = verify_captured_runs(initial->runs, initial->count, &initial->footers,
+                              error);
+  if (rc != LC_OK) {
+    ps_owned_runs_close(initial->runs, initial->count);
+    rc = owned_edit_end(s, initial->edit, rc, error);
+    ps_owned_close(*out);
+    *out = NULL;
+    memset(initial, 0, sizeof(*initial));
+  }
+  return rc;
+}
 static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                         const ps_ref *ref, uint64_t start, uint64_t end,
                         ps_owned_status *status, ps_owned_mapping **out,
@@ -10318,7 +10379,6 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                         lc_error *error) {
   ps_coordination_guard *guard;
   ps_owned_mapping *items = NULL;
-  ps_owned_footer *captured = NULL;
   size_t n = 0;
   int rc;
   if (out)
@@ -10338,23 +10398,13 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                          error);
   rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
-  if (rc == LC_OK && footers && n) {
-    if (n <= SIZE_MAX / sizeof(*captured))
-      captured = lc_alloc_with_allocator(NULL, n * sizeof(*captured));
-    if (!captured)
-      rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping footers");
-  }
   if (rc == LC_OK)
-    rc = ps_owned_runs_verify(items, n, captured, error);
+    rc = verify_captured_runs(items, n, footers, error);
   if (rc == LC_OK) {
     *out = items;
     *count = n;
-    if (footers)
-      *footers = captured;
-  } else {
+  } else
     ps_owned_runs_close(items, n);
-    lc_free_with_allocator(NULL, captured);
-  }
   return rc;
 }
 int ps_owned_runs_capture(ps_owned_head *head, ps_owned_mapping **out,
