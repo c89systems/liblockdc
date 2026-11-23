@@ -84,8 +84,15 @@ Compare matched builds and multifile on representative lease, coordination,
 messaging, and indexed workloads. Record work time, CPU, mutation p95 and
 late-window latency, index readiness, first-owner and live-join reopen,
 post-open verification, and close. Preserve durable throughput and indexed
-readiness advantages. Indexed CPU, NoSync tail latency, and live-join reopen
-remain open performance work. Review material tradeoffs before deployment.
+readiness advantages.
+
+On native x86_64 with ext4, matched runs at 10 MiB showed lower elapsed work
+and CPU across the tested indexed and messaging profiles. At 192 MiB of
+indexed churn, median NoSync late-window p95 was 49 ms on both backends and
+durable work took 18 s on single-file and 66 s on multifile. Indexed reopen
+through verification was faster on single-file. Standalone opens and final
+maintenance can cost more, and sustained indexed runs used about 6 MiB more
+peak resident memory. Review these costs before deployment.
 
 ## Historical evidence
 
