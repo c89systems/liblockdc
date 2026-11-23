@@ -3289,12 +3289,14 @@ static int metadata_allocate(ps_space *s, int index, ps_meta_page **out,
   *out = p;
   return LC_OK;
 }
-static int directory_read(void *v, uint64_t offset, void *page,
+static int directory_read(void *v, uint64_t offset, void *pages, size_t bytes,
                           lc_error *error) {
   ps_space *s = v;
-  if (!metadata_offset(s, offset))
-    return err(error, LC_ERR_PROTOCOL, "directory page outside metadata space");
-  return transfer(s, page, PS_PAGE, offset, 0, error);
+  if (!metadata_offset(s, offset) || bytes > s->capacity - offset ||
+      (offset < JOURNAL_OFFSET && bytes > JOURNAL_OFFSET - offset))
+    return err(error, LC_ERR_PROTOCOL,
+               "directory pages outside metadata space");
+  return transfer(s, pages, bytes, offset, 0, error);
 }
 static int directory_allocate(void *v, uint64_t *offset, lc_error *error) {
   ps_meta_page *p = NULL;

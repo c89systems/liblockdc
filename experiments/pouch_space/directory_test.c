@@ -51,21 +51,26 @@ void *__wrap_lc_calloc_with_allocator(const lc_allocator *a, size_t n,
 
 typedef struct pager {
   unsigned char *image, *used;
-  size_t operations, fail_at, reads, writes, allocations;
+  size_t operations, fail_at, reads, read_calls, writes, allocations;
 } pager;
 static int storage_error(lc_error *e) {
   return lc_error_set(e, LC_ERR_TRANSPORT, 0, "injected directory page failure",
                       NULL, NULL, "directory-test");
 }
 static int io_fault(pager *p) { return ++p->operations == p->fail_at; }
-static int read_page(void *v, uint64_t offset, void *out, lc_error *e) {
+static int read_pages(void *v, uint64_t offset, void *out, size_t bytes,
+                      lc_error *e) {
   pager *p = v;
-  ++p->reads;
+  size_t first = (size_t)(offset / PS_PAGE), pages = bytes / PS_PAGE, i;
+  ++p->read_calls;
+  p->reads += pages;
   if (io_fault(p))
     return storage_error(e);
-  CHECK(offset && offset % PS_PAGE == 0 && offset / PS_PAGE < PAGES);
-  CHECK(p->used[offset / PS_PAGE]);
-  memcpy(out, p->image + offset, PS_PAGE);
+  CHECK(offset && offset % PS_PAGE == 0 && first < PAGES);
+  CHECK(pages && bytes % PS_PAGE == 0 && pages <= PAGES - first);
+  for (i = 0; i < pages; ++i)
+    CHECK(p->used[first + i]);
+  memcpy(out, p->image + offset, bytes);
   return LC_OK;
 }
 static int allocate_page(void *v, uint64_t *out, lc_error *e) {
@@ -104,7 +109,7 @@ static ps_directory_io pager_init(pager *p) {
   CHECK(p->image && p->used);
   io.context = p;
   memset(io.identity, 0x93, sizeof(io.identity));
-  io.read = read_page;
+  io.read = read_pages;
   io.allocate = allocate_page;
   io.write = write_page;
   return io;
@@ -113,6 +118,7 @@ static void pager_clear(pager *p) {
   memset(p->image, 0, PAGES * PS_PAGE);
   memset(p->used, 0, PAGES);
   p->operations = p->fail_at = p->reads = p->writes = p->allocations = 0;
+  p->read_calls = 0;
 }
 static void pager_close(pager *p) {
   free(p->image);
@@ -716,6 +722,57 @@ static int packed_next(void *v, ps_key *out_key, ps_directory_value *out_value,
   ++*ordinal;
   return LC_OK;
 }
+static void scan_leaf_batches(void) {
+  pager p;
+  ps_directory_io io = pager_init(&p);
+  ps_directory_root empty = {0};
+  ps_directory *d = open_directory(&io, empty);
+  uint64_t ordinal = 0;
+  uint64_t expected[630];
+  ps_directory_root root;
+  unsigned char *last_leaf;
+  scan state = {0};
+  size_t i;
+  for (i = 0; i < 630; ++i)
+    expected[i] = i + 1;
+  state.expected = expected;
+  OK(ps_directory_build(d, 630, packed_next, &ordinal, &error));
+  root = flush(&p, d, 1, 1);
+  d = open_directory(&io, root);
+  OK(ps_directory_visit(d, scan_entry, NULL, &state, &error));
+  CHECK(state.count == 630 && p.reads == 11 && p.read_calls == 3);
+  ps_directory_close(d);
+
+  /* A failed batch leaves subsequent leaves outside the accepted walk. */
+  d = open_directory(&io, root);
+  p.fail_at = p.operations + 3;
+  state.count = 0;
+  CHECK(ps_directory_visit(d, scan_entry, NULL, &state, &error) ==
+        LC_ERR_TRANSPORT);
+  CHECK(state.count == 8 * 63);
+  lc_error_cleanup(&error);
+  ps_directory_close(d);
+  p.fail_at = 0;
+
+  /* The second batch contains two leaves. The second still needs its own
+   * checksum and cannot emit any of its entries when it is damaged. */
+  last_leaf = p.image + ps_wire_get64(p.image + root.offset + 64 + 9 * 64 + 24);
+  last_leaf[PS_PAGE - 1] ^= 1;
+  d = open_directory(&io, root);
+  state.count = 0;
+  CHECK(ps_directory_visit(d, scan_entry, NULL, &state, &error) ==
+        LC_ERR_PROTOCOL);
+  CHECK(state.count == 9 * 63);
+  lc_error_cleanup(&error);
+  ps_directory_close(d);
+  last_leaf[PS_PAGE - 1] ^= 1;
+  d = open_directory(&io, root);
+  state.count = 0;
+  OK(ps_directory_visit(d, scan_entry, NULL, &state, &error));
+  CHECK(state.count == 630);
+  ps_directory_close(d);
+  pager_close(&p);
+}
 static void packed_tree(void) {
   static const uint64_t counts[] = {0, 1, 63, 64, 3969, 3970};
   static const size_t pages[] = {0, 1, 1, 3, 64, 67};
@@ -772,6 +829,7 @@ static void *default_stack_worker(void *unused) {
   failure_boundaries();
   corruption_and_identity();
   api_boundaries();
+  scan_leaf_batches();
   packed_tree();
   return NULL;
 }

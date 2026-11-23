@@ -43,15 +43,16 @@ typedef union ps_directory_value {
   ps_directory_name name;
 } ps_directory_value;
 int ps_internal_immutable_key(ps_key);
-/* read/write transfer exactly one PS_PAGE block; the container handles short
- * I/O and EINTR. allocate reserves a distinct aligned page on success and no
- * page on failure. Pages reachable from any recoverable root or active
+/* read transfers a contiguous span of referenced PS_PAGE blocks. write
+ * transfers one block. The container handles short I/O and EINTR. allocate
+ * reserves a distinct aligned page on success and no page on failure.
+ * Pages reachable from any recoverable root or active
  * directory view remain owned.
  * Callbacks report their own errors and run under one checkpoint owner. */
 typedef struct ps_directory_io {
   void *context;
   unsigned char identity[16];
-  int (*read)(void *, uint64_t, void *, lc_error *);
+  int (*read)(void *, uint64_t, void *, size_t, lc_error *);
   int (*allocate)(void *, uint64_t *, lc_error *);
   int (*write)(void *, uint64_t, const void *, lc_error *);
 } ps_directory_io;
