@@ -66,9 +66,35 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   lc_configure_c_test_target(pouch_space_test)
 endif()
 
+if(LOCKDC_BUILD_TESTS)
+  # Same owner sources against the existing logical-engine test library, so
+  # logical expiry clocks never alter filesystem writer-heartbeat clocks.
+  add_library(pouch_space_test_experiment STATIC ${pouch_space_sources})
+  target_include_directories(pouch_space_test_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
+  target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
+  lc_configure_c_target(pouch_space_test_experiment)
+
+  add_executable(pouch_space_lease_test lease_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
+  target_include_directories(pouch_space_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)
+  target_link_libraries(pouch_space_lease_test PRIVATE pouch_space_test_experiment)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(pouch_space_lease_test PRIVATE
+      "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync" "LINKER:--wrap=lc_xid_new"
+      "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
+      "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  endif()
+  lc_configure_c_test_target(pouch_space_lease_test)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_custom_target(pouch_space_smoke
     DEPENDS pouch_space_platform_test pouch_space_coordination_test pouch_space_test)
+  if(TARGET pouch_space_lease_test)
+    add_dependencies(pouch_space_smoke pouch_space_lease_test)
+  endif()
   if(LOCKDC_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     foreach(mode
         commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
@@ -80,6 +106,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
       add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
         LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+    foreach(mode shared-authority shared-queue-delivery shared-queue-transaction
+        shared-outbox-handoff shared-outbox-recovery shared-outbox-completion
+        release-barrier recovery-retirement stage-barrier stage-delete-renew)
+      add_test(NAME pouch_space_lease_${mode}
+        COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(pouch_space_lease_${mode} PROPERTIES
+        TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+    foreach(mode shared-messaging-capacity shared-lease-pressure shared-queue-pressure shared-outbox-pressure)
+      foreach(codec 0 3)
+        foreach(sync 0 1)
+          add_test(NAME pouch_space_lease_${mode}_${codec}_${sync}
+            COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${codec} ${sync})
+          set_tests_properties(pouch_space_lease_${mode}_${codec}_${sync} PROPERTIES
+            TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        endforeach()
+      endforeach()
     endforeach()
     lc_apply_test_defaults()
   endif()
@@ -286,14 +330,6 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   set_tests_properties(pouch_space_collection_transform-faults
     pouch_space_collection_transform-prepare-faults PROPERTIES TIMEOUT 1800)
-  # Same owner sources against the existing logical-engine test library, so
-  # logical expiry clocks never alter filesystem writer-heartbeat clocks.
-  add_library(pouch_space_test_experiment STATIC ${pouch_space_sources})
-  target_include_directories(pouch_space_test_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-    PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_compile_definitions(pouch_space_test_experiment PRIVATE LOCKDC_TEST_BUILD=1)
-  target_link_libraries(pouch_space_test_experiment PUBLIC lc_test_static lc::zlib_static)
-  lc_configure_c_target(pouch_space_test_experiment)
   foreach(surface queue outbox xa query collection-query)
     if(surface STREQUAL "queue")
       set(behavior_source ${CMAKE_SOURCE_DIR}/tests/unit/test_lc_pouch.c)
@@ -598,15 +634,6 @@ if(LOCKDC_BUILD_TESTS)
         TIMEOUT 1200 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
     endforeach()
   endforeach()
-  add_executable(pouch_space_lease_test lease_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
-  target_include_directories(pouch_space_lease_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_compile_definitions(pouch_space_lease_test PRIVATE LOCKDC_TEST_BUILD=1)
-  target_link_libraries(pouch_space_lease_test PRIVATE pouch_space_test_experiment)
-  target_link_options(pouch_space_lease_test PRIVATE
-    "LINKER:--wrap=fdatasync" "LINKER:--wrap=fsync" "LINKER:--wrap=lc_xid_new"
-    "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
-  lc_configure_c_test_target(pouch_space_lease_test)
   foreach(mode lifecycle phases policy protection fairness concurrency coordinated capacity-completion capacity-required attachment-windows release-barrier recovery-retirement stage-barrier stage-delete-renew shared-authority shared-queue-delivery shared-queue-transaction shared-outbox-handoff shared-outbox-recovery shared-outbox-completion)
     add_test(NAME pouch_space_lease_${mode} COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_lease_${mode} PROPERTIES TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)

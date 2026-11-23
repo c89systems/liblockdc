@@ -10,6 +10,7 @@
 #include "pouch.h"
 #include "pouch_internal.h"
 #include "readiness.h"
+#include "space_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -72,6 +73,7 @@ static void clear(lc_error *e) {
   lc_error_cleanup(e);
   lc_error_init(e);
 }
+#ifdef __linux__
 int __real_lc_xid_new(char[LC_XID_STRING_SIZE], lc_error *);
 int __wrap_lc_xid_new(char out[LC_XID_STRING_SIZE], lc_error *e) {
   const char *xid =
@@ -82,11 +84,13 @@ int __wrap_lc_xid_new(char out[LC_XID_STRING_SIZE], lc_error *e) {
   REQUIRE(!pthread_setspecific(next_acquire_xid, NULL));
   return LC_OK;
 }
+#endif
 static double real_clock(clockid_t id) {
   struct timespec t;
   REQUIRE(!clock_gettime(id, &t));
   return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
 }
+#ifdef __linux__
 int __real_fdatasync(int);
 int __real_fsync(int);
 int __wrap_fdatasync(int fd) {
@@ -99,6 +103,7 @@ int __wrap_fsync(int fd) {
     __atomic_add_fetch(&measured_syncs, 1, __ATOMIC_RELAXED);
   return __real_fsync(fd);
 }
+#endif
 typedef union allocation_header {
   long double alignment;
   struct {
@@ -152,6 +157,7 @@ static int allocation_cut(void) {
   }
   return 0;
 }
+#ifdef __linux__
 void *__real_lc_alloc_with_allocator(const lc_allocator *, size_t);
 void *__real_lc_calloc_with_allocator(const lc_allocator *, size_t, size_t);
 void *__real_lc_realloc_with_allocator(const lc_allocator *, void *, size_t);
@@ -170,6 +176,7 @@ void *__wrap_lc_realloc_with_allocator(const lc_allocator *a, void *p,
 char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *p) {
   return allocation_cut() ? NULL : __real_lc_strdup_with_allocator(a, p);
 }
+#endif
 
 /* The established logical clock hook leaves native heartbeat timers and all
  * operational clocks real. time()-based metadata timestamps are independent. */
@@ -826,11 +833,11 @@ static ssize_t progress_read(void *context, int fd, void *bytes, size_t n,
 }
 static int progress_sync(void *context, int fd) {
   (void)context;
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int progress_reserve(void *context, int fd, off_t at, off_t n) {
   (void)context;
-  return fallocate(fd, 0, at, n);
+  return ps_native_io.reserve(NULL, fd, at, n);
 }
 static ssize_t progress_write(void *context, int fd, const void *bytes,
                               size_t n, off_t at) {
@@ -1515,7 +1522,7 @@ static int disk_sync(void *context, int fd) {
   disk_model *m = context;
   int fail = disk_cut(m);
   if (!fail || m->mode >= 2) {
-    REQUIRE(!fdatasync(fd));
+    REQUIRE(!ps_native_io.sync(NULL, fd));
     if (!m->freeze)
       for (size_t page = 0; page < PS_DEFAULT_CAPACITY / PS_PAGE; ++page)
         if (m->dirty[page]) {
@@ -1537,7 +1544,7 @@ static int disk_reserve(void *context, int fd, off_t at, off_t n) {
     errno = EIO;
     return -1;
   }
-  return fallocate(fd, 0, at, n);
+  return ps_native_io.reserve(NULL, fd, at, n);
 }
 static void restore_disk(disk_model *m, const char *path) {
   int fd = open(path, O_RDWR);
@@ -1546,7 +1553,7 @@ static void restore_disk(disk_model *m, const char *path) {
     if (m->dirty[page])
       REQUIRE(pwrite(fd, m->stable + page * PS_PAGE, PS_PAGE,
                      (off_t)(page * PS_PAGE)) == PS_PAGE);
-  REQUIRE(!fdatasync(fd) && !close(fd));
+  REQUIRE(!ps_native_io.sync(NULL, fd) && !close(fd));
   memset(m->dirty, 0, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
   m->freeze = 0;
 }
@@ -1860,13 +1867,13 @@ static void recovery_retirement_case(const char *directory, int crypto,
 }
 typedef struct recovery_actor {
   fixture *owner;
-  pthread_barrier_t *start;
+  rendezvous start;
 } recovery_actor;
 static void *recover_with_peer(void *context) {
   recovery_actor *actor = context;
   lc_error e = {0};
-  int rc = pthread_barrier_wait(actor->start);
-  REQUIRE(rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD);
+  gate_signal(&actor->start, 0);
+  gate_wait(&actor->start, 1);
   ok(lc_pouch_client_recover_transactions(actor->owner->client, &e), &e);
   lc_error_cleanup(&e);
   return NULL;
@@ -1878,22 +1885,28 @@ static void recovery_retirement_peers(const char *directory) {
   char xids[count][LC_XID_STRING_SIZE];
   fixture *first = calloc(1, sizeof(*first));
   fixture *second = calloc(1, sizeof(*second));
-  pthread_barrier_t start;
   pthread_t workers[2];
-  recovery_actor actors[] = {{first, &start}, {second, &start}};
+  recovery_actor actors[] = {{first}, {second}};
   lc_error e = {0};
-  REQUIRE(first && second && !pthread_barrier_init(&start, NULL, 2));
+  REQUIRE(first && second);
   snprintf(scenario, sizeof(scenario), "live recovery peers");
   setup(first, directory, 0, 1, 0, &e);
   memcpy(second->path, first->path, sizeof(second->path));
   configure(second, 0, 1, 0);
   open_store(second, 0, &e);
   seed_completed_transactions(first, keys, xids, count, &e);
-  for (size_t i = 0; i < 2; ++i)
+  for (size_t i = 0; i < 2; ++i) {
+    gate_init(&actors[i].start);
     REQUIRE(!pthread_create(&workers[i], NULL, recover_with_peer, &actors[i]));
+  }
   for (size_t i = 0; i < 2; ++i)
+    gate_wait(&actors[i].start, 0);
+  for (size_t i = 0; i < 2; ++i)
+    gate_signal(&actors[i].start, 1);
+  for (size_t i = 0; i < 2; ++i) {
     REQUIRE(!pthread_join(workers[i], NULL));
-  REQUIRE(!pthread_barrier_destroy(&start));
+    gate_destroy(&actors[i].start);
+  }
   REQUIRE(recovery_decisions(store(first), xids, count, &e) == 0 &&
           recovery_decisions(store(second), xids, count, &e) == 0);
   for (size_t i = 0; i < count; ++i)
@@ -2328,15 +2341,8 @@ typedef struct run {
   int io_mode;
   uint64_t segment_bytes;
 } run;
-static void *worker(void *context) {
-  run *r = context;
-  if (!strcmp(r->mode, "lifecycle"))
-    lifecycle(r->directory);
-  else if (!strcmp(r->mode, "phases"))
-    phase_failures(r->directory);
-  else if (!strcmp(r->mode, "policy"))
-    lease_policy(r->directory);
-  else if (!strcmp(r->mode, "release-barrier"))
+static int run_portable_case(run *r) {
+  if (!strcmp(r->mode, "release-barrier"))
     release_barrier(r->directory);
   else if (!strcmp(r->mode, "recovery-retirement"))
     recovery_retirement(r->directory);
@@ -2359,6 +2365,24 @@ static void *worker(void *context) {
     shared_outbox_completion(r->directory);
   else if (!strcmp(r->mode, "shared-messaging-capacity"))
     shared_messaging_capacity(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-lease-pressure"))
+    shared_lease_pressure(r->directory, r->io_mode, r->sync);
+  else if (!strcmp(r->mode, "shared-queue-pressure") ||
+           !strcmp(r->mode, "shared-outbox-pressure"))
+    shared_messaging_pressure(r->directory, r->io_mode, r->sync,
+                              !strcmp(r->mode, "shared-outbox-pressure"));
+  else
+    return 0;
+  return 1;
+}
+#ifdef __linux__
+static void run_linux_case(run *r) {
+  if (!strcmp(r->mode, "lifecycle"))
+    lifecycle(r->directory);
+  else if (!strcmp(r->mode, "phases"))
+    phase_failures(r->directory);
+  else if (!strcmp(r->mode, "policy"))
+    lease_policy(r->directory);
   else if (!strcmp(r->mode, "shared-autonomous-capacity") ||
            !strcmp(r->mode, "shared-unpaced-capacity"))
     shared_autonomous_capacity(r->directory, r->io_mode, r->sync,
@@ -2366,12 +2390,6 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "shared-concurrent-capacity"))
     shared_concurrent_capacity(r->directory, r->io_mode, r->sync,
                                r->segment_bytes);
-  else if (!strcmp(r->mode, "shared-lease-pressure"))
-    shared_lease_pressure(r->directory, r->io_mode, r->sync);
-  else if (!strcmp(r->mode, "shared-queue-pressure") ||
-           !strcmp(r->mode, "shared-outbox-pressure"))
-    shared_messaging_pressure(r->directory, r->io_mode, r->sync,
-                              !strcmp(r->mode, "shared-outbox-pressure"));
   else if (!strcmp(r->mode, "protection"))
     protection(r->directory);
   else if (!strcmp(r->mode, "fairness"))
@@ -2412,6 +2430,18 @@ static void *worker(void *context) {
                 r->selected, r->io_mode, r->cold);
   else
     REQUIRE(0);
+}
+#endif
+static void *worker(void *context) {
+  run *r = context;
+  if (!run_portable_case(r)) {
+#ifdef __linux__
+    run_linux_case(r);
+#else
+    fprintf(stderr, "Unavailable Pouch lease test case: %s\n", r->mode);
+    REQUIRE(0);
+#endif
+  }
   REQUIRE(!live);
   artifacts(r->directory);
   return NULL;

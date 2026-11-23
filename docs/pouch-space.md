@@ -95,16 +95,21 @@ owner death before and after publication, retained reads, growth from
 independently opened owners, lease fencing, and durable queue and collection
 behavior. The coordination suite checks lock lifetimes, large offsets,
 concurrent threads and processes, and injected I/O and lock failures.
-The physical storage suite covers
-protected completion at fixed capacity, concurrent namespace repack, and
-recovery from modeled write loss using the native storage callbacks.
+The physical storage suite covers protected completion at fixed capacity,
+concurrent namespace repack, and recovery from modeled write loss using
+the native storage callbacks.
+
+Configure the Darwin smoke build with `LOCKDC_BUILD_TESTS=ON` to include
+`pouch_space_lease_test`. It covers shared lease fencing and expiry, queue
+commit and rollback, outbox owner death and replay, and lease and messaging
+completion at the 10 MiB capacity in durable and NoSync modes.
 
 The cross-built binaries can run directly on Apple Silicon. Pass the platform
 probe a writable directory on APFS. Pass the coordination executable the same
 directory and one of `lifecycle`, `root-lifetime`, `large-offsets`, `threads`,
 `faults`, or `processes`. The platform probe reports filesystem type, page
 size, and available volume blocks. With a native test build,
-`ctest -L pouch-space` runs all three suites. Record available volume space
+`ctest -L pouch-space` runs these suites. Record available volume space
 alongside any capacity failure so container pressure can be distinguished from
 filesystem exhaustion.
 
