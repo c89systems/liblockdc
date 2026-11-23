@@ -158,6 +158,30 @@ static ssize_t native_write(void *c, int fd, const void *p, size_t n, off_t o) {
   (void)c;
   return pwrite(fd, p, n, o);
 }
+void *ps_map_page(int fd, uint64_t offset, ps_mapping *mapping) {
+  size_t displacement, length;
+  void *base;
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    errno = EINVAL;
+    return MAP_FAILED;
+  }
+  /* File pages stay 4 KiB when kernel mapping alignment is larger. */
+  displacement = (size_t)(offset % (uint64_t)page_size);
+  length = displacement + PS_PAGE;
+  base = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+              (off_t)(offset - displacement));
+  if (base == MAP_FAILED)
+    return MAP_FAILED;
+  mapping->base = base;
+  mapping->length = length;
+  return (unsigned char *)base + displacement;
+}
+void ps_unmap_page(ps_mapping *mapping) {
+  (void)munmap(mapping->base, mapping->length);
+  mapping->base = NULL;
+  mapping->length = 0;
+}
 static int native_sync(void *c, int fd) {
   (void)c;
   return fdatasync(fd);
@@ -1367,8 +1391,7 @@ int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
   rc = metadata_claim_range(s, run->offset, run->bytes, error);
   if (rc == LC_OK) {
     ps_readiness_zero_pages(s, run->offset, run->bytes, 0);
-    mapping = mmap(NULL, PS_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd,
-                   (off_t)run->offset);
+    mapping = ps_map_page(s->fd, run->offset, &s->credit_mapping);
     if (mapping == MAP_FAILED)
       rc = err(error, LC_ERR_TRANSPORT, "cannot map budget credit record");
     else {
@@ -1382,7 +1405,7 @@ int ps_internal_budget_prepare_record(ps_space *s, lc_error *error) {
         ps_readiness_credit_note_spill(s);
         return LC_OK;
       }
-      (void)munmap(mapping, PS_PAGE);
+      ps_unmap_page(&s->credit_mapping);
     }
     (void)metadata_release_range(s, run->offset, run->bytes, NULL);
   }
@@ -1431,7 +1454,7 @@ void ps_internal_budget_publish_record(ps_space *s) {
                             0, NULL) != LC_OK ||
       metadata_release_range(s, run->offset, run->bytes, NULL) != LC_OK)
     return;
-  (void)munmap(s->credit_words, PS_PAGE);
+  ps_unmap_page(&s->credit_mapping);
   s->credit_words = NULL;
   s->credit_record = NULL;
   free_insert(s, run);
@@ -4332,7 +4355,7 @@ static void destroy(ps_space *s) {
   lc_free_with_allocator(NULL, s->buckets);
   lc_free_with_allocator(NULL, s->journal_image);
   if (s->credit_record) {
-    (void)munmap(s->credit_words, PS_PAGE);
+    ps_unmap_page(&s->credit_mapping);
     lc_free_with_allocator(NULL, s->credit_record);
   }
   ps_readiness_close(s);

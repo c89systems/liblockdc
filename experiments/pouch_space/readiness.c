@@ -58,8 +58,7 @@ enum readiness_word {
  */
 struct ps_readiness {
   uint64_t *page;
-  void *mapping;
-  size_t mapping_bytes;
+  ps_mapping mapping;
   uint64_t credit_metadata, credit_entries;
   unsigned int credit_slot;
   int existing, active;
@@ -355,8 +354,7 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
 int ps_readiness_attach(ps_space *s, lc_error *e) {
   ps_readiness *r;
   uint64_t first, last;
-  size_t i, displacement;
-  long page_size;
+  size_t i;
   struct stat st;
   int rc;
   if (!ps_coordination_shared(s->coordination))
@@ -365,12 +363,6 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
     return failed(s, e, "shared readiness requires native atomic words");
   if (fstat(s->fd, &st) || st.st_size < PS_METADATA_START)
     return failed(s, e, "container is too short for shared readiness");
-  page_size = sysconf(_SC_PAGESIZE);
-  if (page_size <= 0)
-    return failed(s, e, "cannot determine shared mapping page size");
-  /* The on-disk offset is fixed. Map from a host page boundary and address
-   * the readiness words at their original offset within that mapping. */
-  displacement = PS_READINESS_OFFSET % (size_t)page_size;
   r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
   if (!r)
     return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate shared readiness",
@@ -383,14 +375,11 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
   }
   r->existing = first != last;
   r->credit_slot = PS_READINESS_CREDIT_SLOTS;
-  r->mapping_bytes = displacement + PS_PAGE;
-  r->mapping = mmap(NULL, r->mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
-                    s->fd, PS_READINESS_OFFSET - displacement);
-  if (r->mapping == MAP_FAILED) {
+  r->page = ps_map_page(s->fd, PS_READINESS_OFFSET, &r->mapping);
+  if (r->page == MAP_FAILED) {
     lc_free_with_allocator(NULL, r);
     return failed(s, e, "cannot map shared readiness page");
   }
-  r->page = (uint64_t *)((unsigned char *)r->mapping + displacement);
   s->readiness = r;
   /* The first owner resets witnesses before claiming any dynamic workspace.
    * Unlike member handles, read-only imports can survive this reset. */
@@ -409,7 +398,7 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
 }
 void ps_readiness_close(ps_space *s) {
   if (s->readiness) {
-    (void)munmap(s->readiness->mapping, s->readiness->mapping_bytes);
+    ps_unmap_page(&s->readiness->mapping);
     lc_free_with_allocator(NULL, s->readiness);
   }
 }

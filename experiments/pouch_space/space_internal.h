@@ -10,6 +10,13 @@
 #include "space.h"
 #include <pthread.h>
 
+typedef struct ps_mapping {
+  void *base;
+  size_t length;
+} ps_mapping;
+void *ps_map_page(int, uint64_t, ps_mapping *);
+void ps_unmap_page(ps_mapping *);
+
 /* A creating root retains initialization authority until its root metadata has
  * committed. Ordinary physical opens release authority before returning. */
 int ps_internal_open(const char *, int create, const ps_options *,
@@ -209,6 +216,7 @@ struct ps_space {
    * one allocator capture. */
   ps_run *credit_record;
   uint64_t *credit_words;
+  ps_mapping credit_mapping;
   uint64_t peer_metadata_credits, peer_entry_credits;
   int credit_totals_checked;
   uint64_t physical_claim_bytes;
