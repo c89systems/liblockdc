@@ -729,11 +729,45 @@ int ps_key_checkpoint_capture(ps_key_checkpoint *c,
   pthread_mutex_unlock(&c->mutex);
   return rc;
 }
+typedef union checkpoint_decode_alignment {
+  void *pointer;
+  long double number;
+  uint64_t integer;
+} checkpoint_decode_alignment;
+typedef struct checkpoint_decode_scratch {
+  union {
+    checkpoint_decode_alignment alignment;
+    unsigned char bytes[2 * PS_PAGE];
+  } storage;
+  size_t used;
+  int full;
+} checkpoint_decode_scratch;
+static void *checkpoint_decode_allocate(void *context, size_t bytes) {
+  checkpoint_decode_scratch *scratch = context;
+  const size_t align = sizeof(checkpoint_decode_alignment);
+  size_t at = (scratch->used + align - 1) / align * align;
+  if (at > sizeof(scratch->storage.bytes) ||
+      bytes > sizeof(scratch->storage.bytes) - at) {
+    scratch->full = 1;
+    return NULL;
+  }
+  scratch->used = at + bytes;
+  return scratch->storage.bytes + at;
+}
+static void checkpoint_decode_release(void *context, void *bytes) {
+  /* A packed record finishes with the entire workspace at once. */
+  (void)context;
+  (void)bytes;
+}
 static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
                                 ps_key key, ps_ref ref, key_slot **out,
                                 lc_error *e) {
   lc_pouch_state_entry entry = {0}, projected;
   lc_pouch_state_terminal terminal = {0};
+  checkpoint_decode_scratch scratch;
+  lc_allocator transient = {checkpoint_decode_allocate, NULL,
+                            checkpoint_decode_release, NULL};
+  const lc_allocator *allocator = &c->allocator;
   const unsigned char *span;
   key_slot *slot;
   int rc = ps_internal_checkpoint_span(reader, &span, e);
@@ -759,11 +793,23 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
     entry.lifetime = terminal.lifetime;
     entry.query_index_seq = terminal.query_index_seq;
     entry.has_query_index_seq = terminal.has_query_index_seq;
-  } else if (span)
-    rc =
-        lc_pouch_state_record_decode_span(span, (size_t)ps_read_size(reader),
-                                          &c->allocator, slot->leaf, &entry, e);
-  else
+  } else if (span) {
+    /* The checked packed record fits one page. The workspace also covers
+     * string terminators, allocator headers and the synthesized record name.
+     * Only the key copied into the slot survives this visit. */
+    scratch.used = 0;
+    scratch.full = 0;
+    transient.context = &scratch;
+    allocator = &transient;
+    rc = lc_pouch_state_record_decode_span(span, (size_t)ps_read_size(reader),
+                                           allocator, slot->leaf, &entry, e);
+    if (rc == LC_ERR_NOMEM && scratch.full) {
+      lc_error_cleanup(e);
+      allocator = &c->allocator;
+      rc = lc_pouch_state_record_decode_span(span, (size_t)ps_read_size(reader),
+                                             allocator, slot->leaf, &entry, e);
+    }
+  } else
     rc =
         ps_checkpoint_record_read(reader, &c->allocator, slot->leaf, &entry, e);
   if (rc == LC_OK &&
@@ -787,7 +833,7 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
     }
   }
   if (rc == LC_OK) {
-    if (!terminal.type) {
+    if (!span) {
       slot->key = entry.key;
       slot->hash = hash_key(entry.key, strlen(entry.key), key.kind);
       entry.key = NULL;
@@ -806,7 +852,7 @@ static int decode_selected_slot(ps_key_checkpoint *c, ps_reader *reader,
     close_slot(c, slot);
   }
   if (!terminal.type)
-    lc_pouch_state_entry_cleanup(&c->allocator, &entry);
+    lc_pouch_state_entry_cleanup(allocator, &entry);
   return rc;
 }
 static void select_watermarks(ps_key_checkpoint *c, const key_slot *slot) {

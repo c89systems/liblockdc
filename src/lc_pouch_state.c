@@ -8102,25 +8102,14 @@ static int lc_pouch_state_decode_payload_meta(
                           "pouch state put payload metadata is invalid", NULL,
                           NULL, "pouch");
     }
-    rc = lc_pouch_state_payload_span_set(
-        allocator, &entry->payload_span, ref_container, ref_record_offset,
-        ref_offset, ref_length, ref_crc, error);
-    if (rc != LC_OK) {
-      lc_pouch_state_entry_cleanup(allocator, entry);
-      lc_free_with_allocator(allocator, ref_container);
-      return rc;
-    }
-  } else {
-    rc = lc_pouch_state_payload_span_set(
-        allocator, &entry->payload_span, ref_container, ref_record_offset,
-        ref_offset, ref_length, ref_crc, error);
-    if (rc != LC_OK) {
-      lc_pouch_state_entry_cleanup(allocator, entry);
-      lc_free_with_allocator(allocator, ref_container);
-      return rc;
-    }
   }
-  lc_free_with_allocator(allocator, ref_container);
+  /* Transfer the decoded, validated name into the owning entry. */
+  entry->payload_span.container_leaf = ref_container;
+  entry->payload_span.record_offset = ref_record_offset;
+  entry->payload_span.payload_offset = ref_offset;
+  entry->payload_span.payload_length = ref_length;
+  entry->payload_span.payload_crc = ref_crc;
+  entry->payload_span.present = 1;
   cursor += ref_container_len;
 payload_ref_decoded:
   entry->payload_context =
@@ -8508,11 +8497,16 @@ int lc_pouch_state_record_terminal_span(const unsigned char *span, size_t bytes,
                         NULL, "pouch");
   out->type = 0;
   rc = lc_pouch_state_record_span(span, bytes, &header, &payload, error);
-  if (rc != LC_OK || (header.type != LC_POUCH_STATE_RECORD_DECISION &&
-                      header.type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
-                      header.type != LC_POUCH_STATE_RECORD_OBJECT_DELETE))
+  if (rc != LC_OK)
     return rc;
   key = span + LC_POUCH_RECORD_HEADER_BYTES;
+  if (header.type != LC_POUCH_STATE_RECORD_DECISION &&
+      header.type != LC_POUCH_STATE_RECORD_STATE_DELETE &&
+      header.type != LC_POUCH_STATE_RECORD_OBJECT_DELETE) {
+    out->key = key;
+    out->key_bytes = header.key_len;
+    return LC_OK;
+  }
   rc = lc_pouch_state_terminal_fields(&header, key, key + header.key_len, out,
                                       error);
   if (rc == LC_OK && (memchr(out->key, '\0', out->key_bytes) ||

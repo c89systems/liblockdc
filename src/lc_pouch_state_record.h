@@ -103,9 +103,9 @@ int lc_pouch_state_record_read(lc_pouch_record_io, const lc_allocator *,
 int lc_pouch_state_record_decode_span(const unsigned char *, size_t,
                                       const lc_allocator *, const char *leaf,
                                       lc_pouch_state_entry *, lc_error *);
-/* A decision or tombstone decoded from a checked span. Both strings are
- * length-delimited and borrowed. Type zero selects the ordinary record
- * decoder. All fields needed to reconstruct the terminal record are here. */
+/* A key and, for a decision or tombstone, its terminal fields from a checked
+ * span. Strings are length-delimited and borrowed. Type zero leaves the key
+ * available while the ordinary decoder validates the rest of the record. */
 typedef struct lc_pouch_state_terminal {
   const unsigned char *key, *etag;
   size_t key_bytes, etag_bytes;

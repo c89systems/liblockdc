@@ -3650,6 +3650,46 @@ static void canonical_stream_concurrency(void) {
   puts("streams: held root barriers, independent ready producers, exact prefix "
        "visibility and mixed immutable/stream commit groups");
 }
+static void canonical_stream_clean_probe(int durable) {
+  model m;
+  ps_io io = model_init(&m);
+  ps_options options = {0};
+  ps_space *space;
+  ps_stream *stream;
+  ps_stream_info info;
+  recovery_trace trace = {0};
+  unsigned char body[64] = {0};
+  uint64_t first, second, read_before;
+  size_t writes_before;
+  clean();
+  options.io = &io;
+  options.durable_sync = durable;
+  space = create(PS_MIB, durable, &io);
+  stream = stream_open(space, 1, 1, NULL, NULL);
+  OK(canonical_append(stream, body, sizeof(body), 7, 1, &first, &error));
+  OK(ps_checkpoint(space, &error));
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  crash(&m);
+  OK(ps_open(path, 0, &options, &space, &error));
+  read_before = m.read_bytes;
+  writes_before = m.writes;
+  stream = stream_open(space, 1, 0, NULL, &trace);
+  OK(ps_stream_status(stream, &info, &error));
+  CHECK(trace.start == info.tail && !trace.records &&
+        trace.bytes == LC_POUCH_RECORD_HEADER_BYTES &&
+        info.capacity - info.tail > PS_PAGE / 2);
+  CHECK(m.read_bytes - read_before <= 3 * PS_RUN_HEADER + 64 &&
+        m.writes == writes_before);
+  stream_expect(stream, first, body, sizeof(body), 1);
+  OK(canonical_append(stream, body, sizeof(body), 7, 2, &second, &error));
+  CHECK(second == info.tail);
+  stream_expect(stream, second, body, sizeof(body), 2);
+  OK(ps_stream_close(stream, &error));
+  OK(ps_close(space, &error));
+  free(m.stable);
+  clean();
+}
 static void canonical_stream_read_recovery(int native_zero, int durable,
                                            int action) {
   model m;
@@ -7890,7 +7930,8 @@ int main(int argc, char **argv) {
           owned_repack_faults(durable, bitmap);
     } else if (strcmp(argv[2], "checkpoint-namespace") == 0) {
       for (int durable = 0; durable < 2; ++durable) {
-        checkpoint_namespace(durable);
+        checkpoint_namespace(durable, 0);
+        checkpoint_namespace(durable, 1);
         checkpoint_retirement(durable);
       }
     } else if (strcmp(argv[2], "checkpoint-faults") == 0) {
@@ -8035,6 +8076,8 @@ int main(int argc, char **argv) {
       stream_lifecycle_invalid_events();
       stream_lifecycle_rebind_rollover();
     } else if (strcmp(argv[2], "stream-recovery") == 0) {
+      for (int durable = 0; durable < 2; ++durable)
+        canonical_stream_clean_probe(durable);
       for (int zero = 0; zero < 2; ++zero)
         for (int durable = 0; durable < 2; ++durable) {
           for (int action = 0; action < 3; ++action)

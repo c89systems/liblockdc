@@ -281,6 +281,11 @@ static void checkpoint_records(int durable) {
   CHECK(!decoded.seen);
   OK(ps_checkpoint_record_encode(&allocator, &projected, &metadata, &error));
   CHECK(metadata.length < PS_PAGE); /* No application-body materialization. */
+  lc_pouch_state_terminal prefix = {0};
+  OK(lc_pouch_state_record_terminal_span(metadata.bytes, metadata.length,
+                                         &prefix, &error));
+  CHECK(!prefix.type && prefix.key_bytes == strlen(prior.key) &&
+        !memcmp(prefix.key, prior.key, prefix.key_bytes));
   ps_checkpoint_record high_water = {0};
   lc_pouch_state_entry high = {0};
   high.control = high.seen = 1;
@@ -653,7 +658,7 @@ static void checkpoint_owner(int durable) {
   clean();
 }
 typedef struct checkpoint_seen {
-  size_t count;
+  size_t count, first_metadata;
   uint64_t maximum, first_version;
 } checkpoint_seen;
 static int checkpoint_visit(void *context, uint64_t segment,
@@ -668,14 +673,20 @@ static int checkpoint_visit(void *context, uint64_t segment,
   ++seen->count;
   if (entry->index_seq > seen->maximum)
     seen->maximum = entry->index_seq;
-  if (!strcmp(entry->key, "lease/0"))
+  if (!strcmp(entry->key, "lease/0")) {
     seen->first_version = entry->version;
+    seen->first_metadata = entry->metadata_length;
+    for (size_t i = 0; i < entry->metadata_length; ++i)
+      CHECK(entry->metadata[i] == 0x7c);
+  }
   return LC_OK;
 }
-static void checkpoint_put(ps_root *root, ps_namespace *ns,
-                           const char *key_name, uint64_t index,
-                           uint64_t version, uint64_t lifetime, int commit,
-                           uint64_t target) {
+static void checkpoint_put_with_metadata(ps_root *root, ps_namespace *ns,
+                                         const char *key_name, uint64_t index,
+                                         uint64_t version, uint64_t lifetime,
+                                         int commit, uint64_t target,
+                                         unsigned char *metadata,
+                                         size_t metadata_bytes) {
   lc_allocator allocator = {0};
   lc_pouch_state_entry request = {0}, result = {0};
   ps_namespace_append *append = NULL;
@@ -683,6 +694,8 @@ static void checkpoint_put(ps_root *root, ps_namespace *ns,
   request.key = (char *)key_name;
   request.content_type = "application/test";
   request.payload_context = "checkpoint";
+  request.metadata = metadata;
+  request.metadata_length = metadata_bytes;
   request.index_seq = index;
   request.version = version;
   request.lifetime = lifetime;
@@ -699,7 +712,14 @@ static void checkpoint_put(ps_root *root, ps_namespace *ns,
   source->close(source);
   lc_pouch_state_entry_cleanup(&allocator, &result);
 }
-static void checkpoint_namespace(int durable) {
+static void checkpoint_put(ps_root *root, ps_namespace *ns,
+                           const char *key_name, uint64_t index,
+                           uint64_t version, uint64_t lifetime, int commit,
+                           uint64_t target) {
+  checkpoint_put_with_metadata(root, ns, key_name, index, version, lifetime,
+                               commit, target, NULL, 0);
+}
+static void checkpoint_namespace(int durable, int shared) {
   ps_root_options options = {0};
   ps_root *root = NULL;
   ps_namespace *ns = NULL;
@@ -707,10 +727,12 @@ static void checkpoint_namespace(int durable) {
   ps_namespace_status status;
   checkpoint_seen seen = {0};
   char name[32];
+  unsigned char metadata[PS_PAGE - 512];
   size_t i;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
+  options.storage.shared = shared;
   OK(ps_root_open(path, 1, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
   for (i = 0; i < 70; ++i) {
@@ -726,8 +748,22 @@ static void checkpoint_namespace(int durable) {
   checkpoint_put(root, ns, "aborted", 71, 1, 71, 0, 0);
   OK(ps_namespace_status_get(ns, &status, &error));
   CHECK(status.checkpoint_keys == 70 && status.pending_keys == 6);
-  checkpoint_put(root, ns, "lease/0", 71, 2, 1, 1, 1);
+  memset(metadata, 0x7c, sizeof(metadata));
+  checkpoint_put_with_metadata(root, ns, "lease/0", 71, 2, 1, 1, 1,
+                               shared ? metadata : NULL,
+                               shared ? sizeof(metadata) : 0);
   OK(ps_namespace_checkpoint_flush(ns, &error));
+  if (shared) {
+    const ps_entry *p;
+    int packed = 0, large = 0;
+    for (p = ps_root_space(root)->entries; p; p = p->all_next) {
+      if (p->key.kind != PS_KEY_METADATA || p->state != 1 || p->deleted)
+        continue;
+      packed |= p->count == 1 && p->extents[0].flags == EXTENT_PACKED;
+      large |= p->bytes > sizeof(metadata) && p->bytes < PS_PAGE;
+    }
+    CHECK(packed && large);
+  }
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1) == 69);
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 2) == 1);
   memset(&seen, 0, sizeof(seen));
@@ -744,6 +780,7 @@ static void checkpoint_namespace(int durable) {
   memset(&seen, 0, sizeof(seen));
   OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
   CHECK(seen.count == 70 && seen.maximum == 71 && seen.first_version == 2);
+  CHECK(seen.first_metadata == (shared ? sizeof(metadata) : 0));
   ps_namespace_view_close(view);
   OK(ps_namespace_checkpoint_flush(ns, &error));
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1) == 69);

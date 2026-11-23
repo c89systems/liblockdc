@@ -784,7 +784,11 @@ int ps_stream_recovery_read(ps_stream *s, uint64_t offset, void *bytes,
     if (offset < s->recovery_offset ||
         offset - s->recovery_offset >= s->recovery_bytes) {
       take = (size_t)(s->capacity - offset);
-      if (take > PS_CHUNK)
+      /* A clean open usually examines only the next header at the known
+       * tail. If it identifies a record, the next miss uses read-ahead. */
+      if (!s->recovery_bytes && offset >= s->tail && n <= 64U)
+        take = n;
+      else if (take > PS_CHUNK)
         take = PS_CHUNK;
       rc = stream_io(s, offset, s->recovery_buffer, take, 0, error);
       if (rc != LC_OK)
