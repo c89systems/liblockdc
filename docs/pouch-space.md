@@ -104,14 +104,14 @@ Configure the Darwin smoke build with `LOCKDC_BUILD_TESTS=ON` to include
 commit and rollback, outbox owner death and replay, and lease and messaging
 completion at the 10 MiB capacity in durable and NoSync modes.
 
-The cross-built binaries can run directly on Apple Silicon. Pass the platform
-probe a writable directory on APFS. Pass the coordination executable the same
-directory and one of `lifecycle`, `root-lifetime`, `large-offsets`, `threads`,
-`faults`, or `processes`. The platform probe reports filesystem type, page
-size, and available volume blocks. With a native test build,
-`ctest -L pouch-space` runs these suites. Record available volume space
-alongside any capacity failure so container pressure can be distinguished from
-filesystem exhaustion.
+With tests enabled, the Darwin `pouch_space_smoke_bundle` target builds
+`experiments/pouch_space/pouch-space-apfs-smoke.tar.gz` under the build
+directory. Extract it on Apple Silicon running macOS 15 or later and run
+`./run-apfs-smoke.sh DIRECTORY` with a writable directory on APFS. The runner
+uses the same case list as native `ctest -L pouch-space` and records page size,
+available volume blocks, and per-case logs beneath the supplied directory.
+Record available volume space alongside any capacity failure so container
+pressure can be distinguished from filesystem exhaustion.
 
 For cold cross-platform file exchange, `pouch_space_test FILE wire-create`
 writes a checkpointed value and a later journal publication.

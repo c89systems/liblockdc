@@ -308,8 +308,25 @@ static void queue_round_trip(const char *path) {
   check_capacity(path, PS_DEFAULT_CAPACITY);
 }
 
+#ifdef __APPLE__
+static void describe_volume(const char *directory) {
+  struct statfs volume;
+  REQUIRE(!statfs(directory, &volume));
+  printf("filesystem=%s page_bytes=%ld available_blocks=%llu block_bytes=%u\n",
+         volume.f_fstypename, sysconf(_SC_PAGESIZE),
+         (unsigned long long)volume.f_bavail, (unsigned int)volume.f_bsize);
+}
+#endif
+
 int main(int argc, char **argv) {
   lc_error_init(&error);
+#ifdef __APPLE__
+  if (argc == 3 && !strcmp(argv[1], "--describe-volume")) {
+    describe_volume(argv[2]);
+    lc_error_cleanup(&error);
+    return 0;
+  }
+#endif
   if (argc == 4 &&
       (!strcmp(argv[2], "--prepare") || !strcmp(argv[2], "--publish"))) {
     ps_space *space = open_shared(argv[1], 0);
@@ -334,11 +351,7 @@ int main(int argc, char **argv) {
                    argv[1]) < (int)sizeof(directory));
   REQUIRE(mkdtemp(directory));
 #ifdef __APPLE__
-  struct statfs volume;
-  REQUIRE(!statfs(directory, &volume));
-  printf("filesystem=%s page_bytes=%ld available_blocks=%llu block_bytes=%u\n",
-         volume.f_fstypename, sysconf(_SC_PAGESIZE),
-         (unsigned long long)volume.f_bavail, (unsigned int)volume.f_bsize);
+  describe_volume(directory);
 #endif
   REQUIRE(snprintf(path, sizeof(path), "%s/store", directory) <
           (int)sizeof(path));

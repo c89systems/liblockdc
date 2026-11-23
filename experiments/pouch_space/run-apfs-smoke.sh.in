@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+  printf 'Usage: %s WRITABLE_APFS_DIRECTORY\n' "$0" >&2
+  exit 2
+fi
+if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
+  printf 'This smoke suite requires native Apple Silicon.\n' >&2
+  exit 2
+fi
+
+bundle=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+root=$(CDPATH= cd -- "$1" && pwd -P)
+volume=$("$bundle/pouch_space_platform_test" --describe-volume "$root")
+case "$volume" in
+  'filesystem=apfs '*) ;;
+  *)
+    printf 'APFS is required for this run. Detected %s\n' "$volume" >&2
+    exit 2
+    ;;
+esac
+
+run_dir=$(mktemp -d "$root/pouch-space-smoke.XXXXXXXX")
+scratch="$run_dir/fixtures"
+mkdir "$scratch"
+export LOCKDC_TMP_AUTO_CLEANUP_STALE_SECONDS=-1
+printf 'macOS %s\n%s\nResults directory %s\n' "$(sw_vers -productVersion)" "$volume" "$run_dir"
+
+run_case() {
+  name=$1
+  binary=$2
+  shift 2
+  log="$run_dir/$name.log"
+  printf '\n%s\n' "$name"
+  if "$bundle/$binary" "$scratch" "$@" >"$log" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  cat "$log"
+  if [ "$status" -eq 0 ] && grep -q 'liblockdc allocator:' "$log"; then
+    status=1
+  fi
+  if [ "$status" -ne 0 ]; then
+    printf 'Failed %s. See %s\n' "$name" "$log" >&2
+    exit "$status"
+  fi
+}
+
+@pouch_space_darwin_commands@
+printf '\nPouch Space APFS smoke passed. Logs are in %s\n' "$run_dir"

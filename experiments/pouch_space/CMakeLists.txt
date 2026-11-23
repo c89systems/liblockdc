@@ -19,8 +19,7 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   target_include_directories(pouch_space_platform_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
   target_link_libraries(pouch_space_platform_test PRIVATE pouch_space_experiment)
   lc_configure_c_test_target(pouch_space_platform_test)
-  if(LOCKDC_BUILD_TESTS AND
-     (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR NOT CMAKE_CROSSCOMPILING))
+  if(LOCKDC_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     add_test(NAME pouch_space_platform
       COMMAND pouch_space_platform_test ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(pouch_space_platform PROPERTIES TIMEOUT 90
@@ -41,8 +40,7 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
       "LINKER:--wrap=lc_strdup_with_allocator")
   endif()
   lc_configure_c_test_target(pouch_space_coordination_test)
-  if(LOCKDC_BUILD_TESTS AND
-     (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR NOT CMAKE_CROSSCOMPILING))
+  if(LOCKDC_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     foreach(mode lifecycle root-lifetime large-offsets threads faults processes)
       add_test(NAME pouch_space_coordination_${mode}
         COMMAND pouch_space_coordination_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
@@ -94,8 +92,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     DEPENDS pouch_space_platform_test pouch_space_coordination_test pouch_space_test)
   if(TARGET pouch_space_lease_test)
     add_dependencies(pouch_space_smoke pouch_space_lease_test)
-  endif()
-  if(LOCKDC_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    function(pouch_space_darwin_case name target timeout_seconds)
+      if(NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME ${name} COMMAND ${target} ${CMAKE_CURRENT_BINARY_DIR} ${ARGN})
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${timeout_seconds}
+          LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      endif()
+      string(JOIN " " command run_case "${name}" "${target}" ${ARGN})
+      set(pouch_space_darwin_commands "${pouch_space_darwin_commands}${command}\n" PARENT_SCOPE)
+    endfunction()
+
+    set(pouch_space_darwin_commands "")
+    pouch_space_darwin_case(pouch_space_platform pouch_space_platform_test 90)
+    foreach(mode lifecycle root-lifetime large-offsets threads faults processes)
+      pouch_space_darwin_case(pouch_space_coordination_${mode}
+        pouch_space_coordination_test 120 ${mode})
+    endforeach()
     foreach(mode
         commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
         checkpoint-idempotence root-covered-admission root-obligations
@@ -103,29 +115,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
         budget-capacity value-budget-capacity value-budget-concurrency metadata-growth
         namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
         namespace-repack-churn)
-      add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-      set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
-        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      pouch_space_darwin_case(pouch_space_${mode} pouch_space_test 240 ${mode})
     endforeach()
     foreach(mode shared-authority shared-queue-delivery shared-queue-transaction
         shared-outbox-handoff shared-outbox-recovery shared-outbox-completion
         release-barrier recovery-retirement stage-barrier stage-delete-renew)
-      add_test(NAME pouch_space_lease_${mode}
-        COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-      set_tests_properties(pouch_space_lease_${mode} PROPERTIES
-        TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+      pouch_space_darwin_case(pouch_space_lease_${mode} pouch_space_lease_test 240 ${mode})
     endforeach()
     foreach(mode shared-messaging-capacity shared-lease-pressure shared-queue-pressure shared-outbox-pressure)
       foreach(codec 0 3)
         foreach(sync 0 1)
-          add_test(NAME pouch_space_lease_${mode}_${codec}_${sync}
-            COMMAND pouch_space_lease_test ${CMAKE_CURRENT_BINARY_DIR} ${mode} ${codec} ${sync})
-          set_tests_properties(pouch_space_lease_${mode}_${codec}_${sync} PROPERTIES
-            TIMEOUT 240 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          pouch_space_darwin_case(pouch_space_lease_${mode}_${codec}_${sync}
+            pouch_space_lease_test 240 ${mode} ${codec} ${sync})
         endforeach()
       endforeach()
     endforeach()
-    lc_apply_test_defaults()
+    if(NOT CMAKE_CROSSCOMPILING)
+      lc_apply_test_defaults()
+    endif()
+
+    set(bundle_targets
+      pouch_space_platform_test pouch_space_coordination_test pouch_space_test pouch_space_lease_test)
+    set(bundle_files)
+    foreach(target IN LISTS bundle_targets)
+      list(APPEND bundle_files "$<TARGET_FILE:${target}>")
+    endforeach()
+    set(bundle_dir "${CMAKE_CURRENT_BINARY_DIR}/apfs-smoke")
+    set(bundle_runner "${bundle_dir}/run-apfs-smoke.sh")
+    set(bundle_archive "${CMAKE_CURRENT_BINARY_DIR}/pouch-space-apfs-smoke.tar.gz")
+    configure_file(run-apfs-smoke.sh.in "${bundle_runner}" @ONLY
+      FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+        WORLD_READ WORLD_EXECUTE)
+    add_custom_command(OUTPUT "${bundle_archive}"
+      COMMAND "${CMAKE_COMMAND}" -E copy ${bundle_files} "${bundle_dir}"
+      COMMAND "${CMAKE_COMMAND}" -E tar czf "${bundle_archive}" run-apfs-smoke.sh ${bundle_targets}
+      DEPENDS "${bundle_runner}" ${bundle_targets}
+      WORKING_DIRECTORY "${bundle_dir}"
+      VERBATIM)
+    add_custom_target(pouch_space_smoke_bundle DEPENDS "${bundle_archive}")
   endif()
   return()
 endif()
