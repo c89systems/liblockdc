@@ -275,16 +275,6 @@ static void canonical(const char *directory, const char *key, int codec,
   lc_error_cleanup(&e);
   free(scratch);
 }
-static int scratch_create(void *context, lc_error *e) {
-  size_t *calls = context;
-  int fd;
-  ++*calls;
-  fd = memfd_create("collection-derived", MFD_CLOEXEC);
-  if (fd < 0)
-    lc_error_set(e, LC_ERR_TRANSPORT, 0, "cannot create projection scratch",
-                 NULL, NULL, "test");
-  return fd;
-}
 typedef struct private_upload {
   lc_collection_segment storage;
   lc_collection_unit unit;
@@ -527,18 +517,55 @@ static int id_match(void *context, const lc_collection_id_ref *ref, int *match,
   *match = ref->position == *(lc_u64 *)context;
   return LC_OK;
 }
+static void *scratch_malloc(void *context, size_t size) {
+  return *(int *)context ? NULL : malloc(size);
+}
+static void *scratch_realloc(void *context, void *bytes, size_t size) {
+  (void)context;
+  return realloc(bytes, size);
+}
+static void scratch_free(void *context, void *bytes) {
+  (void)context;
+  free(bytes);
+}
+static void scratch_allocation_failure(void) {
+  int fail = 0;
+  lc_allocator allocator = {scratch_malloc, scratch_realloc, scratch_free,
+                            &fail};
+  lc_collection_scratch *scratch = NULL;
+  lc_error e = {0};
+  unsigned char old = 'a', next[2] = {'b', 'c'}, seen[2];
+  lc_u64 size, used, initial;
+  ok(lc_collection_scratch_open(&allocator, &scratch, &e), &e);
+  lc_collection_scratch_size(scratch, &size, &initial);
+  lc_collection_scratch_extend(scratch, 1024U * 1024U);
+  lc_collection_scratch_size(scratch, &size, &used);
+  REQUIRE(size == 1024U * 1024U && used == initial);
+  ok(lc_collection_scratch_io(scratch, 4095, &old, 1, 1, &e), &e);
+  fail = 1;
+  REQUIRE(lc_collection_scratch_io(scratch, 4095, next, 2, 1, &e) ==
+          LC_ERR_NOMEM);
+  clear(&e);
+  ok(lc_collection_scratch_io(scratch, 4095, seen, 2, 0, &e), &e);
+  REQUIRE(seen[0] == old && seen[1] == 0);
+  fail = 0;
+  ok(lc_collection_scratch_io(scratch, 4095, next, 2, 1, &e), &e);
+  ok(lc_collection_scratch_io(scratch, 4095, seen, 2, 0, &e), &e);
+  REQUIRE(!memcmp(next, seen, sizeof(next)));
+  lc_collection_scratch_close(scratch);
+  lc_error_cleanup(&e);
+}
 static void projections(void) {
-  lc_collection_order order;
-  lc_collection_ids ids;
+  lc_collection_order order, captured_order;
+  lc_collection_ids ids, captured_ids;
   lc_collection_id_ref ref = {0}, found;
   lc_collection_order_row row = {0};
-  size_t calls = 0;
   int matched;
   lc_error e;
+  scratch_allocation_failure();
   lc_error_init(&e);
-  ok(lc_collection_order_adopt(scratch_create(&calls, &e), 1, &order, &e), &e);
-  ok(lc_collection_ids_scratch_open(scratch_create, &calls, NULL, &ids, &e),
-     &e);
+  ok(lc_collection_order_scratch_open(NULL, &order, &e), &e);
+  ok(lc_collection_ids_scratch_open(NULL, &ids, &e), &e);
   for (lc_u64 n = 1U; n <= 257U; ++n) {
     row.position = row.published_at = n;
     row.segment = 1;
@@ -552,8 +579,12 @@ static void projections(void) {
     ref.offset = row.record_offset;
     ok(lc_collection_ids_put(&ids, &ref, &e), &e);
     ok(lc_collection_ids_checkpoint(&ids, n, n, 1, n * 64U + 64U, &e), &e);
+    if (n == 1U) {
+      ok(lc_collection_order_capture(&order, &captured_order, &e), &e);
+      ok(lc_collection_ids_capture(&ids, &captured_ids, &e), &e);
+    }
   }
-  REQUIRE(calls >= 6U && ids.capacity >= 1024U && !ids.path);
+  REQUIRE(ids.capacity >= 1024U && ids.fd < 0 && order.fd < 0);
   ok(lc_collection_ids_refresh(&ids, &e), &e);
   ok(lc_collection_order_refresh(&order, &e), &e);
   REQUIRE(order.count == 257U && order.upper_position == 257U);
@@ -567,6 +598,17 @@ static void projections(void) {
   }
   lc_collection_ids_close(&ids);
   lc_collection_order_close(&order);
+  lc_u64 first = 1;
+  memset(ref.digest, 0, sizeof(ref.digest));
+  memcpy(ref.digest, &first, sizeof(first));
+  ok(lc_collection_ids_find(&captured_ids, ref.digest, id_match, &first, &found,
+                            &matched, &e),
+     &e);
+  REQUIRE(matched && found.position == first);
+  ok(lc_collection_order_find(&captured_order, first, &row, &matched, &e), &e);
+  REQUIRE(matched && row.position == first);
+  lc_collection_ids_close(&captured_ids);
+  lc_collection_order_close(&captured_order);
   lc_error_cleanup(&e);
 }
 #include "collection_codec_cases.h"

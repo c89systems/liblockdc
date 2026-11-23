@@ -617,12 +617,9 @@ int lc_collection_read_method(lc_collection *self,
                                       &reader->view_pin, error);
         }
         if (rc == LC_OK) {
-          reader->order = collection->order;
-          reader->order.fd = dup(collection->order.fd);
-          if (reader->order.fd < 0)
-            rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                       "failed to pin collection order view");
-          else
+          rc = lc_collection_order_capture(&collection->order, &reader->order,
+                                           error);
+          if (rc == LC_OK)
             rc = lc_collection_order_seek(&reader->order, after, reader->upper,
                                           reader->order.generation, 0,
                                           &reader->iter, error);

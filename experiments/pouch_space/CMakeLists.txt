@@ -1,6 +1,8 @@
-# Experimental Linux targets, never installed or linked into the product.
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-   NOT LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64|armhf)$" OR NOT TARGET lc_static)
+# Experimental targets, never installed or linked into the product.
+if(NOT TARGET lc_static OR
+   NOT ((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+         LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64|armhf)$") OR
+        (CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND LOCKDC_TARGET_ARCH STREQUAL "arm64")))
   return()
 endif()
 
@@ -11,6 +13,30 @@ target_include_directories(pouch_space_experiment PUBLIC ${CMAKE_CURRENT_SOURCE_
   PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(pouch_space_experiment PUBLIC lc_static)
 lc_configure_c_target(pouch_space_experiment)
+
+if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  add_executable(pouch_space_platform_test platform_test.c)
+  target_include_directories(pouch_space_platform_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_platform_test PRIVATE pouch_space_experiment)
+  lc_configure_c_test_target(pouch_space_platform_test)
+  if(LOCKDC_BUILD_TESTS AND
+     (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR NOT CMAKE_CROSSCOMPILING))
+    add_test(NAME pouch_space_platform
+      COMMAND pouch_space_platform_test ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(pouch_space_platform PROPERTIES TIMEOUT 90
+      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+  endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  # The portable probe can be copied to the native APFS test host. The
+  # remaining fixtures use GNU linker wrapping and Linux syscall interfaces.
+  add_custom_target(pouch_space_smoke DEPENDS pouch_space_platform_test)
+  if(LOCKDC_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    lc_apply_test_defaults()
+  endif()
+  return()
+endif()
 
 if(LOCKDC_BUILD_BENCHMARKS)
   add_executable(pouch_space_control_compare control_compare.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

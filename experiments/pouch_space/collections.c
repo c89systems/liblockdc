@@ -504,15 +504,6 @@ static void read_close(void *context, void *pin) {
   (void)context;
   ps_collection_segment_close(pin);
 }
-static int scratch(void *context, lc_error *e) {
-  int fd;
-  (void)context;
-  fd = memfd_create("pouch-collection-metadata", MFD_CLOEXEC);
-  if (fd < 0)
-    failure(e, LC_ERR_TRANSPORT, NULL,
-            "cannot create disposable collection metadata");
-  return fd;
-}
 static int order_refresh(void *context, lc_collection_order *order,
                          lc_error *e) {
   collection_receiver *binding = context;
@@ -520,12 +511,12 @@ static int order_refresh(void *context, lc_collection_order *order,
   lc_collection_handle *c = binding->receiver;
   ps_owned_status active;
   int shared = shared_collection(owner);
-  int rc = order->fd < 0
-               ? lc_collection_order_adopt(scratch(context, e), 1, order, e)
-               : lc_collection_order_refresh(order, e);
+  int rc = lc_collection_order_is_open(order)
+               ? lc_collection_order_refresh(order, e)
+               : lc_collection_order_scratch_open(&owner->allocator, order, e);
   /* A peer compactor may publish after prepare, or while a live upload makes
-   * prepare return the previous view. Receiver-local memfds do not follow the
-   * native projection's rename. Rebuild only disposable metadata under the
+   * prepare return the previous view. Receiver-local scratch does not follow
+   * the native projection's rename. Rebuild only disposable metadata under the
    * captured topology's metadata pin; never repair a producer's canonical tail.
    */
   if (rc == LC_OK && shared) {
@@ -556,9 +547,9 @@ static int order_refresh(void *context, lc_collection_order *order,
 }
 static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
   ps_collection_owner *owner = ((collection_receiver *)context)->owner;
-  return ids->fd < 0 ? lc_collection_ids_scratch_open(scratch, context,
-                                                      &owner->allocator, ids, e)
-                     : lc_collection_ids_refresh(ids, e);
+  return lc_collection_ids_is_open(ids)
+             ? lc_collection_ids_refresh(ids, e)
+             : lc_collection_ids_scratch_open(&owner->allocator, ids, e);
 }
 #define COLLECTION_QUERY_NAME_BYTES (LC_XID_STRING_SIZE - 1U + 8U)
 static int query_name(const char *epoch, lc_u64 ordinal, unsigned char *name,
@@ -674,7 +665,8 @@ static int projection_begin(void *context,
                             lc_collection_projection_build *build,
                             lc_error *e) {
   ps_collection_owner *owner = ((collection_receiver *)context)->owner;
-  int rc = lc_collection_order_adopt(scratch(context, e), 1, &build->order, e);
+  int rc =
+      lc_collection_order_scratch_open(&owner->allocator, &build->order, e);
   if (rc == LC_OK) {
     /* Disposable receivers share one recovery epoch while this physical
      * owner lives. Reconstructing a receiver is not a history rollback. */

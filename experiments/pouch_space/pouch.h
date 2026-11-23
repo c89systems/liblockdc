@@ -33,7 +33,7 @@ typedef struct ps_pouch_state_options {
  * edits/retry receipts, leases/takeover/private reads and drop/recreate now use
  * the production collection engine through typed container owners. Catalogs,
  * control heads and canonical bytes live in the container; order/ID metadata
- * is disposable memfd scratch. A physical-owner recovery changes the scratch
+ * is disposable memory-backed scratch. Physical-owner recovery changes its
  * epoch, invalidating prior cursors/head preconditions; receivers sharing a
  * live owner have the same epoch. Explicit and background collection
  * maintenance use the common compactor, retention and query-page engines.

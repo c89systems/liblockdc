@@ -141,8 +141,8 @@ typedef struct ps_stats {
 } ps_stats;
 
 /* Optional syscall seam for deterministic storage faults, not another backend.
- * NULL selects the real native Linux operations. Every callback has POSIX
- * error/short-I/O semantics; reserve is Linux fallocate, never zero filling. */
+ * NULL selects native operations. Every callback has POSIX error/short-I/O
+ * semantics. Reserve physically preallocates the backing range. */
 typedef struct ps_io {
   void *context;
   ssize_t (*read)(void *, int, void *, size_t, off_t);

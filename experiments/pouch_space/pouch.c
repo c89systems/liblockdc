@@ -777,11 +777,30 @@ static void queue_notify(void *context, const char *ns, const char *queue) {
     }
   pthread_mutex_unlock(&owner->root->mutex);
 }
+#ifdef __APPLE__
+static int queue_wait_until(pthread_cond_t *condition, pthread_mutex_t *mutex,
+                            const struct timespec *deadline) {
+  struct timespec remaining;
+  if (clock_gettime(CLOCK_MONOTONIC, &remaining) != 0)
+    return errno;
+  remaining.tv_sec = deadline->tv_sec - remaining.tv_sec;
+  remaining.tv_nsec = deadline->tv_nsec - remaining.tv_nsec;
+  if (remaining.tv_nsec < 0) {
+    --remaining.tv_sec;
+    remaining.tv_nsec += 1000000000L;
+  }
+  if (remaining.tv_sec < 0 || (!remaining.tv_sec && !remaining.tv_nsec))
+    return ETIMEDOUT;
+  return pthread_cond_timedwait_relative_np(condition, mutex, &remaining);
+}
+#endif
 static int queue_wait(void *context, const char *ns, const char *queue,
                       uint64_t timeout_ms) {
   ps_pouch_owner *owner = context;
   queue_waiter waiter, **link;
+#ifndef __APPLE__
   pthread_condattr_t attributes;
+#endif
   struct timespec deadline;
   int rc;
   if (!ns || !ns[0] || !queue || !queue[0] || check(context, NULL) != LC_OK ||
@@ -801,20 +820,28 @@ static int queue_wait(void *context, const char *ns, const char *queue,
   memset(&waiter, 0, sizeof(waiter));
   waiter.ns = ns;
   waiter.queue = queue;
+#ifdef __APPLE__
+  rc = pthread_cond_init(&waiter.changed, NULL);
+#else
   if (pthread_condattr_init(&attributes) != 0)
     return -1;
   rc = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
   if (rc == 0)
     rc = pthread_cond_init(&waiter.changed, &attributes);
   pthread_condattr_destroy(&attributes);
+#endif
   if (rc != 0)
     return -1;
   pthread_mutex_lock(&owner->root->mutex);
   waiter.next = owner->waiters;
   owner->waiters = &waiter;
   while (!waiter.signaled && rc == 0)
+#ifdef __APPLE__
+    rc = queue_wait_until(&waiter.changed, &owner->root->mutex, &deadline);
+#else
     rc =
         pthread_cond_timedwait(&waiter.changed, &owner->root->mutex, &deadline);
+#endif
   for (link = &owner->waiters; *link != &waiter; link = &(*link)->next) {
   }
   *link = waiter.next;

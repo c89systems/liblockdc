@@ -57,10 +57,14 @@ static int lc_ci_valid(const unsigned char *bytes, size_t length) {
   return memcmp(copy + length - 4U, bytes + length - 4U, 4U) == 0;
 }
 
-static int lc_ci_io(int fd, lc_u64 offset, unsigned char *bytes, size_t length,
-                    int writing, lc_error *error) {
+static int lc_ci_io(lc_collection_ids *ids, lc_u64 offset, unsigned char *bytes,
+                    size_t length, int writing, lc_error *error) {
   size_t done;
   ssize_t got;
+  int fd = ids->fd;
+  if (ids->scratch)
+    return lc_collection_scratch_io(ids->scratch, offset, bytes, length,
+                                    writing, error);
   if (offset > (lc_u64)LC_I64_MAX || length > (lc_u64)LC_I64_MAX - offset) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity index offset exceeds file range");
@@ -94,7 +98,7 @@ static int lc_ci_header_write(lc_collection_ids *ids, lc_error *error) {
   lc_ci_put64(bytes + 40U, ids->replay_offset);
   lc_ci_put64(bytes + 48U, ids->snapshot);
   lc_ci_seal(bytes, sizeof(bytes));
-  return lc_ci_io(ids->fd, 0U, bytes, sizeof(bytes), 1, error);
+  return lc_ci_io(ids, 0U, bytes, sizeof(bytes), 1, error);
 }
 
 static int lc_ci_capacity_valid(lc_u64 capacity) {
@@ -108,30 +112,35 @@ int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error) {
   unsigned char bytes[LC_CI_HEADER_BYTES];
   struct stat st;
   struct stat named;
+  lc_u64 length;
   int replacement;
   int rc;
-  if (ids == NULL || ids->fd < 0) {
+  if (!lc_collection_ids_is_open(ids)) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity index is closed");
   }
-  if (fstat(ids->fd, &st) != 0 || (ids->path && stat(ids->path, &named) != 0)) {
-    return lc_ci_error(error, LC_ERR_TRANSPORT,
-                       "failed to inspect collection identity index identity");
-  }
-  if (ids->path && (named.st_dev != st.st_dev || named.st_ino != st.st_ino)) {
-    replacement = open(ids->path, O_RDWR);
-    if (replacement < 0) {
-      return lc_ci_error(error, LC_ERR_TRANSPORT,
-                         "failed to reopen replaced collection identity index");
+  if (ids->scratch)
+    lc_collection_scratch_size(ids->scratch, &length, NULL);
+  else {
+    if (fstat(ids->fd, &st) != 0 || (ids->path && stat(ids->path, &named) != 0))
+      return lc_ci_error(
+          error, LC_ERR_TRANSPORT,
+          "failed to inspect collection identity index identity");
+    if (ids->path && (named.st_dev != st.st_dev || named.st_ino != st.st_ino)) {
+      replacement = open(ids->path, O_RDWR);
+      if (replacement < 0)
+        return lc_ci_error(
+            error, LC_ERR_TRANSPORT,
+            "failed to reopen replaced collection identity index");
+      (void)close(ids->fd);
+      ids->fd = replacement;
+      if (fstat(ids->fd, &st) != 0)
+        return lc_ci_error(error, LC_ERR_TRANSPORT,
+                           "failed to stat replaced collection identity index");
     }
-    (void)close(ids->fd);
-    ids->fd = replacement;
-    if (fstat(ids->fd, &st) != 0) {
-      return lc_ci_error(error, LC_ERR_TRANSPORT,
-                         "failed to stat replaced collection identity index");
-    }
+    length = S_ISREG(st.st_mode) && st.st_size >= 0 ? (lc_u64)st.st_size : 0U;
   }
-  rc = lc_ci_io(ids->fd, 0U, bytes, sizeof(bytes), 0, error);
+  rc = lc_ci_io(ids, 0U, bytes, sizeof(bytes), 0, error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -153,12 +162,22 @@ int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error) {
   }
   /* The caller holds metadata authority throughout refresh; reuse the stat of
    * this descriptor rather than issuing it again after the header read. */
-  if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
-      (lc_u64)st.st_size !=
-          LC_CI_HEADER_BYTES + ids->capacity * LC_CI_ENTRY_BYTES) {
+  if (length != LC_CI_HEADER_BYTES + ids->capacity * LC_CI_ENTRY_BYTES) {
     return lc_ci_error(error, LC_ERR_PROTOCOL,
                        "collection identity index length is inconsistent");
   }
+  return LC_OK;
+}
+
+static int lc_ci_extend(lc_collection_ids *ids, lc_error *error) {
+  lc_u64 bytes = LC_CI_HEADER_BYTES + ids->capacity * LC_CI_ENTRY_BYTES;
+  if (ids->scratch) {
+    lc_collection_scratch_extend(ids->scratch, bytes);
+    return LC_OK;
+  }
+  if (ids->fd < 0 || ftruncate(ids->fd, (off_t)bytes) != 0)
+    return lc_ci_error(error, LC_ERR_TRANSPORT,
+                       "failed to size collection identity index");
   return LC_OK;
 }
 
@@ -172,13 +191,9 @@ static int lc_ci_initialize(int create, lc_collection_ids *out,
                      "failed to stat collection identity index");
   } else if (create && st.st_size == 0) {
     out->capacity = LC_CI_INITIAL_CAPACITY;
-    if (ftruncate(out->fd, LC_CI_HEADER_BYTES +
-                               out->capacity * LC_CI_ENTRY_BYTES) != 0) {
-      rc = lc_ci_error(error, LC_ERR_TRANSPORT,
-                       "failed to size collection identity index");
-    } else {
+    rc = lc_ci_extend(out, error);
+    if (rc == LC_OK)
       rc = lc_ci_header_write(out, error);
-    }
   }
   if (rc == LC_OK) {
     rc = lc_collection_ids_refresh(out, error);
@@ -227,22 +242,40 @@ int lc_collection_ids_open(const char *path, int create,
   return lc_ci_initialize(create, out, error);
 }
 
-int lc_collection_ids_scratch_open(int (*create)(void *, lc_error *),
-                                   void *context, const lc_allocator *allocator,
+int lc_collection_ids_scratch_open(const lc_allocator *allocator,
                                    lc_collection_ids *out, lc_error *error) {
-  if (!out || !create)
+  int rc;
+  if (!out)
     return lc_ci_error(error, LC_ERR_INVALID,
-                       "collection identity projection requires a factory");
+                       "collection identity projection requires output");
   lc_ci_initialize_owner(out, allocator);
-  out->scratch_create = create;
-  out->scratch_context = context;
-  out->fd = create(context, error);
-  if (out->fd < 0)
-    return error && error->code != LC_OK
-               ? error->code
-               : lc_ci_error(error, LC_ERR_TRANSPORT,
-                             "failed to create identity projection scratch");
-  return lc_ci_initialize(1, out, error);
+  rc = lc_collection_scratch_open(allocator, &out->scratch, error);
+  if (rc == LC_OK) {
+    out->capacity = LC_CI_INITIAL_CAPACITY;
+    rc = lc_ci_extend(out, error);
+  }
+  if (rc == LC_OK)
+    rc = lc_ci_header_write(out, error);
+  if (rc == LC_OK)
+    rc = lc_collection_ids_refresh(out, error);
+  if (rc != LC_OK)
+    lc_collection_ids_close(out);
+  return rc;
+}
+
+int lc_collection_ids_capture(const lc_collection_ids *source,
+                              lc_collection_ids *out, lc_error *error) {
+  *out = *source;
+  out->path = NULL;
+  if (out->scratch)
+    lc_collection_scratch_retain(out->scratch);
+  else {
+    out->fd = dup(source->fd);
+    if (out->fd < 0)
+      return lc_ci_error(error, LC_ERR_TRANSPORT,
+                         "failed to capture collection identity index");
+  }
+  return LC_OK;
 }
 
 void lc_collection_ids_close(lc_collection_ids *ids) {
@@ -250,6 +283,7 @@ void lc_collection_ids_close(lc_collection_ids *ids) {
     if (ids->fd >= 0) {
       (void)close(ids->fd);
     }
+    lc_collection_scratch_close(ids->scratch);
     lc_free_with_allocator(&ids->allocator, ids->path);
     memset(ids, 0, sizeof(*ids));
     ids->fd = -1;
@@ -262,7 +296,7 @@ static int lc_ci_entry_read(lc_collection_ids *ids, lc_u64 slot,
   unsigned char bytes[LC_CI_ENTRY_BYTES];
   size_t i;
   int rc;
-  rc = lc_ci_io(ids->fd, LC_CI_HEADER_BYTES + slot * LC_CI_ENTRY_BYTES, bytes,
+  rc = lc_ci_io(ids, LC_CI_HEADER_BYTES + slot * LC_CI_ENTRY_BYTES, bytes,
                 sizeof(bytes), 0, error);
   if (rc != LC_OK) {
     return rc;
@@ -310,7 +344,7 @@ static int lc_ci_entry_write(lc_collection_ids *ids, lc_u64 slot,
   lc_ci_put64(bytes + 48U, ref->segment);
   lc_ci_put64(bytes + 56U, ref->offset);
   lc_ci_seal(bytes, sizeof(bytes));
-  return lc_ci_io(ids->fd, LC_CI_HEADER_BYTES + slot * LC_CI_ENTRY_BYTES, bytes,
+  return lc_ci_io(ids, LC_CI_HEADER_BYTES + slot * LC_CI_ENTRY_BYTES, bytes,
                   sizeof(bytes), 1, error);
 }
 
@@ -328,7 +362,7 @@ int lc_collection_ids_find(lc_collection_ids *ids,
   if (found != NULL) {
     *found = 0;
   }
-  if (ids == NULL || ids->fd < 0 || digest == NULL || match == NULL ||
+  if (!lc_collection_ids_is_open(ids) || digest == NULL || match == NULL ||
       out == NULL || found == NULL) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity lookup arguments are invalid");
@@ -418,6 +452,7 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
   }
   temporary = directory = NULL;
   created = 0;
+  rc = LC_OK;
   memset(&grown, 0, sizeof(grown));
   grown.fd = -1;
   if (ids->path) {
@@ -446,8 +481,8 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
     }
     grown.fd = open(temporary, O_RDWR | O_CREAT | O_EXCL, 0600);
     created = grown.fd >= 0;
-  } else if (ids->scratch_create) {
-    grown.fd = ids->scratch_create(ids->scratch_context, error);
+  } else if (ids->scratch) {
+    rc = lc_collection_scratch_open(&ids->allocator, &grown.scratch, error);
   }
   grown.capacity = ids->capacity * 2U;
   grown.generation = ids->generation;
@@ -455,17 +490,8 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
   grown.replay_offset = ids->replay_offset;
   grown.snapshot = ids->snapshot;
   renamed = 0;
-  if (grown.fd < 0 && ids->scratch_create && error && error->code != LC_OK) {
-    rc = error->code;
-  } else if (grown.fd < 0 ||
-             ftruncate(grown.fd, (off_t)(LC_CI_HEADER_BYTES +
-                                         grown.capacity * LC_CI_ENTRY_BYTES)) !=
-                 0) {
-    rc = lc_ci_error(error, LC_ERR_TRANSPORT,
-                     "failed to create collection identity rebuild");
-  } else {
-    rc = LC_OK;
-  }
+  if (rc == LC_OK)
+    rc = lc_ci_extend(&grown, error);
   for (slot = 0U; rc == LC_OK && slot < ids->capacity; ++slot) {
     rc = lc_ci_entry_read(ids, slot, &ref, &occupied, error);
     if (rc == LC_OK && occupied) {
@@ -484,11 +510,15 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
                      "failed to publish collection identity rebuild");
   } else if (rc == LC_OK) {
     renamed = 1;
-    (void)close(ids->fd);
+    if (ids->fd >= 0)
+      (void)close(ids->fd);
+    lc_collection_scratch_close(ids->scratch);
+    ids->scratch = grown.scratch;
     ids->fd = grown.fd;
     ids->capacity = grown.capacity;
     ids->count = grown.count;
     grown.fd = -1;
+    grown.scratch = NULL;
     if (ids->path)
       rc = lc_pouch_path_fsync_directory(
           directory, "failed to sync collection identity index directory",
@@ -497,6 +527,7 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
   if (grown.fd >= 0) {
     (void)close(grown.fd);
   }
+  lc_collection_scratch_close(grown.scratch);
   if (created && !renamed) {
     (void)unlink(temporary);
   }
@@ -508,7 +539,7 @@ static int lc_ci_grow(lc_collection_ids *ids, lc_error *error) {
 int lc_collection_ids_put(lc_collection_ids *ids,
                           const lc_collection_id_ref *ref, lc_error *error) {
   int rc;
-  if (ids == NULL || ids->fd < 0 || ref == NULL || ref->position == 0U ||
+  if (!lc_collection_ids_is_open(ids) || ref == NULL || ref->position == 0U ||
       ref->generation == 0U || ref->segment == 0U) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity update arguments are invalid");
@@ -531,7 +562,7 @@ int lc_collection_ids_put(lc_collection_ids *ids,
 int lc_collection_ids_checkpoint(lc_collection_ids *ids, lc_u64 count,
                                  lc_u64 generation, lc_u64 replay_segment,
                                  lc_u64 replay_offset, lc_error *error) {
-  if (ids == NULL || ids->fd < 0 || count > ids->capacity ||
+  if (!lc_collection_ids_is_open(ids) || count > ids->capacity ||
       generation < ids->generation || replay_segment == 0U) {
     return lc_ci_error(error, LC_ERR_INVALID,
                        "collection identity checkpoint arguments are invalid");

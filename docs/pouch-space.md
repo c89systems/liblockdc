@@ -2,8 +2,10 @@
 
 ## Scope
 
-The experimental Linux backend builds for x86_64, AArch64, and ARM hard-float
-with GNU libc and musl and stores a Pouch root in one persistent file. The private
+The experimental backend stores a Pouch root in one persistent file. It runs
+on Linux x86_64, AArch64, and ARM hard-float with GNU libc and musl.
+The Apple Silicon build targets macOS 15.0 or later and is ready for native
+APFS verification. The private
 `ps_pouch_client_open` factory supports independently opened owners sharing
 that root. Normal Pouch opens multifile roots. Production cutover requires an
 explicit deployment decision. Existing-root migration and large-machine
@@ -58,8 +60,12 @@ Protected maintenance capacity funds checkpoint and completion work when
 foreground admission exhausts common space. A failed capacity admission
 preserves the previous selection.
 
+Collection order and append-ID projections use process-local memory pages
+allocated on write. Captured views retain their backing while in use.
+Recovery rebuilds these projections from canonical records.
+
 Reclamation waits for durable retirement and release of outstanding physical
-ownership. Linux OFD range locks retain reader extents and private writer
+ownership. OFD range locks retain reader extents and private writer
 workspace across independent opens. Shared admission validates its view against
 the selected root and accepted journal bounds before installing it.
 A NoSync join of a fully certified live root inherits its durability watermark
@@ -75,18 +81,21 @@ Test observable behavior through the production Pouch and lockd paths. Linux
 ARM functional checks use QEMU, including cold reopen in both directions with
 x86_64. On ARM hard-float they also cover the futex retry timeout and OFD
 lock ranges above the 32-bit offset limit. Readiness tests exercise simulated
-16 KiB and 64 KiB mapping
-alignment without changing the container layout. Performance comparisons use
+16 KiB and 64 KiB mapping alignment. Performance comparisons use
 native hardware. Cover process and I/O failure, concurrent owners, retained readers,
 durable and NoSync recovery, fixed-capacity reclamation, explicit growth, and
 transaction completion. Use the applicable Pouch Space CTest groups and the
 [lifecycle comparison](../experiments/pouch_space/lifecycle_compare.c).
-The `pouch_space_smoke` build target builds all executables selected by the
-`pouch-space` CTest label.
-Its `--parallel-joins` option measures a cohort starting together after
-first-owner recovery. It reports elapsed time, join-thread CPU, and the
-slowest individual join. Indexed verification reads and queries through
-each joined client.
+On Linux, the `pouch_space_smoke` target builds all executables selected by
+the `pouch-space` CTest label. On Apple Silicon it builds
+`pouch_space_platform_test`, which checks process-death recovery, retained
+reader data, physical growth, and a durable collection retry after cold reopen.
+Pass the probe a writable directory on an APFS volume.
+
+The lifecycle comparison's `--parallel-joins` option measures a cohort
+starting together after first-owner recovery. It reports elapsed time,
+join-thread CPU, and the slowest individual join. Indexed verification reads
+and queries through each joined client.
 
 Compare matched builds and multifile on representative lease, coordination,
 messaging, and indexed workloads. Record work time, CPU, mutation p95 and

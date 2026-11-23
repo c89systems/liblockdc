@@ -69,10 +69,15 @@ static int lc_co_valid(const unsigned char *bytes, size_t size) {
   return crc == stored;
 }
 
-static int lc_co_io(int fd, lc_u64 offset, unsigned char *bytes, size_t length,
-                    int write_bytes, lc_error *error) {
+static int lc_co_io(lc_collection_order *order, lc_u64 offset,
+                    unsigned char *bytes, size_t length, int write_bytes,
+                    lc_error *error) {
   ssize_t n;
   size_t done;
+  int fd = order->fd;
+  if (order->scratch)
+    return lc_collection_scratch_io(order->scratch, offset, bytes, length,
+                                    write_bytes, error);
   if (offset > (lc_u64)LC_I64_MAX ||
       (lc_u64)length > (lc_u64)LC_I64_MAX - offset) {
     return lc_co_error(error, LC_ERR_INVALID,
@@ -95,6 +100,23 @@ static int lc_co_io(int fd, lc_u64 offset, unsigned char *bytes, size_t length,
     }
     done += (size_t)n;
   }
+  return LC_OK;
+}
+
+static int lc_co_size(lc_collection_order *order, lc_u64 *size,
+                      lc_error *error) {
+  struct stat st;
+  if (order->scratch) {
+    lc_collection_scratch_size(order->scratch, size, NULL);
+    return LC_OK;
+  }
+  if (fstat(order->fd, &st) != 0)
+    return lc_co_error(error, LC_ERR_TRANSPORT,
+                       "failed to stat collection ordered index");
+  if (!S_ISREG(st.st_mode) || st.st_size < 0)
+    return lc_co_error(error, LC_ERR_PROTOCOL,
+                       "collection ordered index is truncated");
+  *size = (lc_u64)st.st_size;
   return LC_OK;
 }
 
@@ -141,19 +163,18 @@ static int lc_co_root_write(lc_collection_order *order, lc_error *error) {
   lc_co_put64(bytes + 144U, order->edit_in_progress ? 1U : 0U);
   bytes[152] = LC_CO_ROW_BYTES;
   lc_co_seal(bytes, sizeof(bytes));
-  return lc_co_io(order->fd, 0U, bytes, sizeof(bytes), 1, error);
+  return lc_co_io(order, 0U, bytes, sizeof(bytes), 1, error);
 }
 
 int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
   unsigned char bytes[LC_CO_ROOT_BYTES];
   size_t i;
-  struct stat st;
-  lc_u64 end;
+  lc_u64 end, size;
   int rc;
-  if (order == NULL || order->fd < 0) {
+  if (!lc_collection_order_is_open(order)) {
     return lc_co_error(error, LC_ERR_INVALID, "collection index is closed");
   }
-  rc = lc_co_io(order->fd, 0U, bytes, sizeof(bytes), 0, error);
+  rc = lc_co_io(order, 0U, bytes, sizeof(bytes), 0, error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -206,10 +227,9 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
     return lc_co_error(error, LC_ERR_PROTOCOL,
                        "collection index header bounds are inconsistent");
   }
-  if (fstat(order->fd, &st) != 0) {
-    return lc_co_error(error, LC_ERR_TRANSPORT,
-                       "failed to stat collection ordered index");
-  }
+  rc = lc_co_size(order, &size, error);
+  if (rc != LC_OK)
+    return rc;
   end = LC_CO_ROOT_BYTES;
   if (order->count > 0U) {
     rc = lc_co_row_offset(order->count - 1U, &end, error);
@@ -218,33 +238,19 @@ int lc_collection_order_refresh(lc_collection_order *order, lc_error *error) {
     }
     end += LC_CO_ROW_BYTES;
   }
-  if (!S_ISREG(st.st_mode) || st.st_size < 0 || (lc_u64)st.st_size < end) {
+  if (size < end) {
     return lc_co_error(error, LC_ERR_PROTOCOL,
                        "collection ordered index is truncated");
   }
   return LC_OK;
 }
 
-int lc_collection_order_adopt(int fd, int create, lc_collection_order *out,
-                              lc_error *error) {
-  struct stat st;
+static int lc_co_initialize(lc_collection_order *out, int create,
+                            lc_error *error) {
+  lc_u64 size;
   int rc;
-  if (!out) {
-    if (fd >= 0)
-      (void)close(fd);
-    return lc_co_error(error, LC_ERR_INVALID,
-                       "collection ordered index requires output");
-  }
-  memset(out, 0, sizeof(*out));
-  out->fd = fd;
-  if (fd < 0)
-    return lc_co_error(error, LC_ERR_TRANSPORT,
-                       "failed to create collection ordered index");
-  rc = LC_OK;
-  if (fstat(out->fd, &st) != 0) {
-    rc = lc_co_error(error, LC_ERR_TRANSPORT,
-                     "failed to stat collection ordered index");
-  } else if (st.st_size == 0 && create) {
+  rc = lc_co_size(out, &size, error);
+  if (rc == LC_OK && !size && create) {
     rc = lc_xid_new(out->query_id, error);
     if (rc == LC_OK)
       rc = lc_co_root_write(out, error);
@@ -260,7 +266,6 @@ int lc_collection_order_adopt(int fd, int create, lc_collection_order *out,
 
 int lc_collection_order_open(const char *path, int create,
                              lc_collection_order *out, lc_error *error) {
-  int fd;
   if (!out)
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered index requires output");
@@ -269,8 +274,38 @@ int lc_collection_order_open(const char *path, int create,
   if (!path || !*path)
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered index requires path and output");
-  fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
-  return lc_collection_order_adopt(fd, create, out, error);
+  out->fd = open(path, O_RDWR | (create ? O_CREAT : 0), 0600);
+  if (out->fd < 0)
+    return lc_co_error(error, LC_ERR_TRANSPORT,
+                       "failed to create collection ordered index");
+  return lc_co_initialize(out, create, error);
+}
+
+int lc_collection_order_scratch_open(const lc_allocator *allocator,
+                                     lc_collection_order *out,
+                                     lc_error *error) {
+  int rc;
+  if (!out)
+    return lc_co_error(error, LC_ERR_INVALID,
+                       "collection ordered index requires output");
+  memset(out, 0, sizeof(*out));
+  out->fd = -1;
+  rc = lc_collection_scratch_open(allocator, &out->scratch, error);
+  return rc == LC_OK ? lc_co_initialize(out, 1, error) : rc;
+}
+
+int lc_collection_order_capture(const lc_collection_order *source,
+                                lc_collection_order *out, lc_error *error) {
+  *out = *source;
+  if (out->scratch)
+    lc_collection_scratch_retain(out->scratch);
+  else {
+    out->fd = dup(source->fd);
+    if (out->fd < 0)
+      return lc_co_error(error, LC_ERR_TRANSPORT,
+                         "failed to capture collection ordered index");
+  }
+  return LC_OK;
 }
 
 void lc_collection_order_close(lc_collection_order *order) {
@@ -278,6 +313,7 @@ void lc_collection_order_close(lc_collection_order *order) {
     if (order->fd >= 0) {
       (void)close(order->fd);
     }
+    lc_collection_scratch_close(order->scratch);
     memset(order, 0, sizeof(*order));
     order->fd = -1;
   }
@@ -286,7 +322,7 @@ void lc_collection_order_close(lc_collection_order *order) {
 int lc_collection_order_checkpoint(lc_collection_order *order,
                                    lc_u64 replay_segment, lc_u64 replay_offset,
                                    lc_error *error) {
-  if (order == NULL || order->fd < 0 || replay_segment == 0U) {
+  if (!lc_collection_order_is_open(order) || replay_segment == 0U) {
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered checkpoint requires context");
   }
@@ -351,7 +387,7 @@ static int lc_co_row_read(lc_collection_order *order, lc_u64 ordinal,
   }
   rc = lc_co_row_offset(ordinal, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order->fd, offset, bytes, sizeof(bytes), 0, error);
+    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 0, error);
   }
   return rc == LC_OK ? lc_co_row_decode(order, bytes, row, error) : rc;
 }
@@ -385,7 +421,7 @@ static int lc_co_row_write(lc_collection_order *order, lc_u64 ordinal,
   lc_co_seal(bytes, sizeof(bytes));
   rc = lc_co_row_offset(ordinal, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order->fd, offset, bytes, sizeof(bytes), 1, error);
+    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 1, error);
   }
   return rc;
 }
@@ -434,7 +470,7 @@ static int lc_co_page_read(lc_collection_order *order, lc_u64 number,
   int rc;
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order->fd, offset, bytes, sizeof(bytes), 0, error);
+    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 0, error);
   }
   return rc == LC_OK ? lc_co_page_decode(order, number, bytes, page, error)
                      : rc;
@@ -455,7 +491,7 @@ static int lc_co_page_write(lc_collection_order *order, lc_u64 number,
   lc_co_seal(bytes, sizeof(bytes));
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK) {
-    rc = lc_co_io(order->fd, offset, bytes, sizeof(bytes), 1, error);
+    rc = lc_co_io(order, offset, bytes, sizeof(bytes), 1, error);
   }
   return rc;
 }
@@ -468,7 +504,7 @@ static int lc_co_append(lc_collection_order *order,
   lc_collection_order_row previous;
   lc_u64 number;
   int rc;
-  if (order == NULL || order->fd < 0 || row == NULL ||
+  if (!lc_collection_order_is_open(order) || row == NULL ||
       row->position <= order->upper_position || row->published_at == 0U ||
       (!recovered && ((row->published_at <= order->generation &&
                        !(order->edit_in_progress &&
@@ -597,7 +633,7 @@ int lc_collection_order_find(lc_collection_order *order, lc_u64 position,
   if (found != NULL) {
     *found = 0;
   }
-  if (order == NULL || order->fd < 0 || position == 0U || row == NULL ||
+  if (!lc_collection_order_is_open(order) || position == 0U || row == NULL ||
       found == NULL) {
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered lookup arguments are invalid");
@@ -617,8 +653,8 @@ int lc_collection_order_metadata(lc_collection_order *order,
   lc_collection_order_row current;
   lc_u64 ordinal;
   int rc;
-  if (order == NULL || order->fd < 0 || row == NULL || row->position == 0U ||
-      row->deleted_at != 0U || row->segment == 0U ||
+  if (!lc_collection_order_is_open(order) || row == NULL ||
+      row->position == 0U || row->deleted_at != 0U || row->segment == 0U ||
       generation < row->published_at || replay_segment == 0U ||
       replay_segment < order->replay_segment ||
       (replay_segment == order->replay_segment &&
@@ -662,7 +698,7 @@ int lc_collection_order_delete(lc_collection_order *order, lc_u64 position,
   lc_u64 i;
   lc_u64 deleted_through;
   int rc;
-  if (order == NULL || order->fd < 0 || position == 0U ||
+  if (!lc_collection_order_is_open(order) || position == 0U ||
       generation <= order->generation || replay_segment == 0U ||
       replay_segment < order->replay_segment ||
       (replay_segment == order->replay_segment &&
@@ -746,7 +782,7 @@ int lc_collection_order_oldest(lc_collection_order *order,
   lc_u64 examined;
   size_t count;
   int rc;
-  if (order == NULL || order->fd < 0 || row == NULL || found == NULL)
+  if (!lc_collection_order_is_open(order) || row == NULL || found == NULL)
     return lc_co_error(error, LC_ERR_INVALID,
                        "oldest collection entry requires order and output");
   *found = 0;
@@ -776,7 +812,7 @@ int lc_collection_order_seek(lc_collection_order *order, lc_u64 after,
                              lc_u64 through, lc_u64 generation, int reverse,
                              lc_collection_order_iter *iter, lc_error *error) {
   int rc;
-  if (order == NULL || order->fd < 0 || iter == NULL ||
+  if (!lc_collection_order_is_open(order) || iter == NULL ||
       generation > order->generation) {
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection ordered seek arguments are invalid");
@@ -822,7 +858,7 @@ int lc_collection_order_batch(lc_collection_order *order,
     *count = 0U;
   if (examined != NULL)
     *examined = 0U;
-  if (order == NULL || order->fd < 0 || iter == NULL || rows == NULL ||
+  if (!lc_collection_order_is_open(order) || iter == NULL || rows == NULL ||
       capacity == 0U || count == NULL || examined == NULL ||
       iter->count > order->count) {
     return lc_co_error(error, LC_ERR_INVALID,
@@ -845,7 +881,7 @@ int lc_collection_order_batch(lc_collection_order *order,
         page_rows = LC_COLLECTION_ORDER_PAGE_ROWS;
       }
       length = LC_CO_PAGE_HEADER_BYTES + (size_t)page_rows * LC_CO_ROW_BYTES;
-      rc = lc_co_io(order->fd, offset, iter->page, length, 0, error);
+      rc = lc_co_io(order, offset, iter->page, length, 0, error);
       if (rc == LC_OK) {
         rc = lc_co_page_decode(order, number, iter->page, &page, error);
       }
@@ -945,7 +981,7 @@ int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
   size_t size;
   size_t i;
   int rc;
-  if (order == NULL || order->fd < 0 || rows == NULL || capacity == 0U ||
+  if (!lc_collection_order_is_open(order) || rows == NULL || capacity == 0U ||
       count == NULL)
     return lc_co_error(error, LC_ERR_INVALID,
                        "collection order batch requires output");
@@ -960,7 +996,7 @@ int lc_collection_order_rows(lc_collection_order *order, lc_u64 first,
   rc = lc_co_page_offset(number, &offset, error);
   if (rc == LC_OK)
     rc =
-        lc_co_io(order->fd, offset, bytes,
+        lc_co_io(order, offset, bytes,
                  LC_CO_PAGE_HEADER_BYTES + (size_t)page.count * LC_CO_ROW_BYTES,
                  0, error);
   if (rc != LC_OK)
@@ -1020,7 +1056,7 @@ static int lc_co_ranges(lc_collection_order *order,
       rows = LC_COLLECTION_ORDER_PAGE_ROWS;
     length = LC_CO_PAGE_HEADER_BYTES + (size_t)rows * LC_CO_ROW_BYTES;
     if (rc == LC_OK)
-      rc = lc_co_io(order->fd, offset, bytes, length, 0, error);
+      rc = lc_co_io(order, offset, bytes, length, 0, error);
     if (rc == LC_OK)
       rc = lc_co_page_decode(order, number, bytes, &page, error);
     if (rc != LC_OK)
@@ -1076,7 +1112,7 @@ static int lc_co_ranges(lc_collection_order *order,
       lc_co_put64(bytes + 32U, page.live);
       lc_co_put64(bytes + 40U, page.live ? 0 : through);
       lc_co_seal(bytes, LC_CO_PAGE_HEADER_BYTES);
-      rc = lc_co_io(order->fd, offset, bytes, length, 1, error);
+      rc = lc_co_io(order, offset, bytes, length, 1, error);
 #ifdef LOCKDC_TEST_BUILD
       if (rc == LC_OK)
         rc = lc_collection_edit_page_test(error);

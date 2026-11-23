@@ -109,20 +109,13 @@ static int lc_cm_capture(lc_compact *work, int force, int *selected,
     if (rc == LC_OK)
       rc = lc_collection_read_pin(collection, collection->head.snapshot,
                                   &work->view_pin, error);
+    if (rc == LC_OK)
+      rc = lc_collection_order_capture(&collection->order, &work->captured,
+                                       error);
+    if (rc == LC_OK)
+      rc = lc_collection_ids_capture(&collection->ids, &work->captured_ids,
+                                     error);
     if (rc == LC_OK) {
-      work->captured = collection->order;
-      work->captured.fd = dup(collection->order.fd);
-      if (work->captured.fd < 0)
-        rc = lc_collection_failure(
-            error, LC_ERR_TRANSPORT, NULL,
-            "failed to capture collection compaction order");
-    }
-    if (rc == LC_OK) {
-      work->captured_ids = collection->ids;
-      work->captured_ids.fd = dup(collection->ids.fd);
-      if (work->captured_ids.fd < 0)
-        rc = lc_collection_failure(error, LC_ERR_TRANSPORT, NULL,
-                                   "failed to pin edit receipts");
       work->count = collection->order.count;
       work->generation = collection->order.generation;
       work->metadata_generation = collection->order.metadata_generation;
@@ -553,8 +546,7 @@ static void lc_cm_release(lc_compact *work) {
   lc_collection_handle *c = work->collection;
   lc_error ignored;
   lc_u64 part;
-  if (work->captured_ids.fd >= 0)
-    (void)close(work->captured_ids.fd);
+  lc_collection_ids_close(&work->captured_ids);
   lc_collection_order_close(&work->captured);
   lc_collection_segment_close(&work->output);
   lc_collection_lock_leave(&work->view_pin);

@@ -2,6 +2,7 @@
 #define LC_COLLECTION_ORDER_H
 
 #include "lc/lc.h"
+#include "lc_collection_scratch.h"
 #include "lc_intcompat.h"
 
 /* Derived, seekable collection order. All calls require the owning collection's
@@ -28,6 +29,7 @@ typedef struct lc_collection_order_row {
 
 typedef struct lc_collection_order {
   int fd;
+  lc_collection_scratch *scratch;
   lc_u64 count;
   lc_u64 live_count;
   /* Conservative ordinal lower bound for the oldest live row. Canonical
@@ -79,10 +81,15 @@ int lc_collection_edit_page_test(lc_error *);
  * A corrupt existing index is reported, never silently replaced. */
 int lc_collection_order_open(const char *path, int create,
                              lc_collection_order *out, lc_error *error);
-/* Adopts disposable derived metadata storage, including on failure. The
- * canonical owner rebuilds this index; application bodies never enter it. */
-int lc_collection_order_adopt(int fd, int create, lc_collection_order *,
-                              lc_error *);
+/* Only encoded derived metadata is placed in disposable scratch. */
+int lc_collection_order_scratch_open(const lc_allocator *,
+                                     lc_collection_order *, lc_error *);
+int lc_collection_order_capture(const lc_collection_order *,
+                                lc_collection_order *, lc_error *);
+static __inline__ int
+lc_collection_order_is_open(const lc_collection_order *o) {
+  return o && (o->fd >= 0 || o->scratch);
+}
 void lc_collection_order_close(lc_collection_order *order);
 int lc_collection_order_refresh(lc_collection_order *order, lc_error *error);
 int lc_collection_order_checkpoint(lc_collection_order *order,

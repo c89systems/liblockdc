@@ -552,6 +552,7 @@ set(lc_sources
     src/lc_client_api.c
     src/lc_client_management_api.c
     src/lc_collection_order.c
+    src/lc_collection_scratch.c
     src/lc_collection_json.c
     src/lc_collection_ids.c
     src/lc_collection_index.c
@@ -1167,6 +1168,8 @@ endmacro()
 
 if(LOCKDC_BUILD_TESTS OR LOCKDC_BUILD_BENCHMARKS)
     add_subdirectory(experiments/pouch_space)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    add_subdirectory(experiments/pouch_space EXCLUDE_FROM_ALL)
 endif()
 
 if(LOCKDC_BUILD_TESTS)

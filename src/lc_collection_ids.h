@@ -2,6 +2,7 @@
 #define LC_COLLECTION_IDS_H
 
 #include "lc/lc.h"
+#include "lc_collection_scratch.h"
 #include "lc_intcompat.h"
 
 /* Derived append-ID lookup. SHA-256 selects candidates; callers compare the
@@ -16,12 +17,9 @@ typedef struct lc_collection_id_ref {
 
 typedef struct lc_collection_ids {
   int fd;
+  lc_collection_scratch *scratch;
   char *path;
   lc_allocator allocator;
-  /* Disposable projection storage factory, retained through growth. NULL
-   * selects the native named projection. The owning collection retains ctx. */
-  int (*scratch_create)(void *, lc_error *);
-  void *scratch_context;
   lc_u64 capacity;
   lc_u64 count;
   lc_u64 generation;
@@ -37,9 +35,13 @@ typedef int (*lc_collection_id_match_fn)(void *context,
 int lc_collection_ids_open(const char *path, int create,
                            const lc_allocator *allocator,
                            lc_collection_ids *out, lc_error *error);
-int lc_collection_ids_scratch_open(int (*)(void *, lc_error *), void *,
-                                   const lc_allocator *, lc_collection_ids *,
+int lc_collection_ids_scratch_open(const lc_allocator *, lc_collection_ids *,
                                    lc_error *);
+int lc_collection_ids_capture(const lc_collection_ids *, lc_collection_ids *,
+                              lc_error *);
+static __inline__ int lc_collection_ids_is_open(const lc_collection_ids *ids) {
+  return ids && (ids->fd >= 0 || ids->scratch);
+}
 void lc_collection_ids_close(lc_collection_ids *ids);
 int lc_collection_ids_refresh(lc_collection_ids *ids, lc_error *error);
 /* Bounded physical iteration for compaction of typed operation bindings. */

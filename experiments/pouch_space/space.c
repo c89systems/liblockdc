@@ -10,7 +10,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#ifndef __APPLE__
 #include <linux/falloc.h>
+#endif
 #include <openssl/evp.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -184,16 +186,47 @@ void ps_unmap_page(ps_mapping *mapping) {
 }
 static int native_sync(void *c, int fd) {
   (void)c;
+#ifdef __APPLE__
+  return fcntl(fd, F_FULLFSYNC);
+#else
   return fdatasync(fd);
+#endif
 }
 static int native_reserve(void *c, int fd, off_t o, off_t n) {
+#ifdef __APPLE__
+  struct stat status;
+  fstore_t request = {0};
+  const off_t end = o + n;
+  int rc;
+  (void)c;
+  if (fstat(fd, &status) != 0)
+    return -1;
+  if (status.st_size >= end)
+    return 0;
+  if (status.st_size < o) {
+    errno = EINVAL;
+    return -1;
+  }
+  request.fst_flags = F_ALLOCATEALL;
+  request.fst_posmode = F_PEOFPOSMODE;
+  request.fst_length = end - status.st_size;
+  if (fcntl(fd, F_PREALLOCATE, &request) < 0)
+    return -1;
+  do {
+    rc = ftruncate(fd, end);
+  } while (rc < 0 && errno == EINTR);
+  return rc;
+#else
   (void)c;
   return fallocate(fd, 0, o, n);
+#endif
 }
+#ifndef __APPLE__
 static int native_zero(void *c, int fd, off_t o, off_t n) {
   (void)c;
   return fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, o, n);
 }
+#endif
 static int sync_file_if(ps_space *, int recovery_only, lc_error *);
 static void mark_durable(ps_space *, uint64_t sequence);
 static int settle_recovery(ps_space *s, lc_error *error) {
@@ -4374,20 +4407,14 @@ static void destroy(ps_space *s) {
     (void)pthread_mutex_destroy(&s->mutex);
   lc_free_with_allocator(NULL, s);
 }
-static int random_bytes(void *bytes, size_t n, lc_error *error) {
-  unsigned char *p = bytes;
-  ssize_t got;
-  while (n) {
-    got = getrandom(p, n, 0);
-    if (got < 0 && errno == EINTR)
-      continue;
-    if (got <= 0)
-      return err(error, LC_ERR_TRANSPORT,
-                 "cannot obtain container identity entropy");
-    p += got;
-    n -= (size_t)got;
-  }
-  return LC_OK;
+static int random_identity(unsigned char *bytes, lc_error *error) {
+  int rc;
+  do {
+    rc = getentropy(bytes, 16);
+  } while (rc < 0 && errno == EINTR);
+  return rc == 0 ? LC_OK
+                 : err(error, LC_ERR_TRANSPORT,
+                       "cannot obtain container identity entropy");
 }
 static int root_valid(const unsigned char *p) {
   uint64_t capacity = ps_wire_get64(p + 16);
@@ -7241,7 +7268,9 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
   s->io.write = native_write;
   s->io.sync = native_sync;
   s->io.reserve = native_reserve;
+#ifndef __APPLE__
   s->io.zero = native_zero;
+#endif
   if (options->io) {
     s->io = *options->io;
     if (!s->io.read || !s->io.write || !s->io.sync || !s->io.reserve) {
@@ -7300,7 +7329,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     if (rc == LC_OK)
       rc = ps_readiness_attach(s, error);
     if (rc == LC_OK)
-      rc = random_bytes(s->identity, 16, error);
+      rc = random_identity(s->identity, error);
     s->token_next = 1;
     s->token_limit = opening ? TOKEN_POOL : TOKEN_RANGE;
     s->token_end = TOKEN_RANGE;
@@ -7312,6 +7341,11 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
       rc = checkpoint_locked(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
+#ifdef __APPLE__
+    /* Flush the directory entry to the device after syncing its parent. */
+    if (rc == LC_OK)
+      rc = sync_file(s, error);
+#endif
   } else if (rc == LC_OK) {
     rc = ps_readiness_attach(s, error);
     if (rc == LC_OK)

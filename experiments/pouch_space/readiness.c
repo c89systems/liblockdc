@@ -6,14 +6,18 @@
 #include "space_internal.h"
 #include <errno.h>
 #include <limits.h>
-#include <linux/futex.h>
-#include <linux/time_types.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 #include <zlib.h>
+#ifdef __APPLE__
+#include <os/os_sync_wait_on_address.h>
+#else
+#include <linux/futex.h>
+#include <linux/time_types.h>
+#include <sys/syscall.h>
+#endif
 
 /* Live participants must agree on lock addresses, bitmap geometry and how
  * the certified incarnation frontier advances. Cold admission resets this. */
@@ -316,18 +320,30 @@ uint32_t ps_readiness_sync_observe(ps_space *s) {
   return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
 }
 int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
-  /* Owner death releases the OFD lock without changing the wake word.
-   * The legacy futex syscall takes the kernel layout even when libc's
-   * timespec uses 64-bit seconds on a 32-bit target. */
+  /* Owner death releases the OFD lock without changing the wake word. */
+  int rc;
+#ifdef __APPLE__
+  rc = os_sync_wait_on_address_with_timeout(
+      sync_word(s), observed, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+      OS_CLOCK_MACH_ABSOLUTE_TIME, 4000000U);
+#else
+  /* The legacy syscall uses the kernel layout even when libc's timespec
+   * uses 64-bit seconds on a 32-bit target. */
   const struct __kernel_old_timespec retry = {0, 4000000L};
-  return syscall(SYS_futex, sync_word(s), FUTEX_WAIT, observed, &retry, NULL,
-                 0) == 0 ||
-         errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
+  rc = (int)syscall(SYS_futex, sync_word(s), FUTEX_WAIT, observed, &retry, NULL,
+                    0);
+#endif
+  return rc >= 0 || errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
 }
 void ps_readiness_sync_wake(ps_space *s) {
   uint32_t *word = sync_word(s);
   (void)__atomic_add_fetch(word, 1, __ATOMIC_RELEASE);
+#ifdef __APPLE__
+  (void)os_sync_wake_by_address_all(word, sizeof(*word),
+                                    OS_SYNC_WAKE_BY_ADDRESS_SHARED);
+#else
   (void)syscall(SYS_futex, word, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+#endif
 }
 static int identity(ps_space *s, const uint64_t *record, lc_error *e) {
   return memcmp(record + IDENTITY, s->identity, 16)

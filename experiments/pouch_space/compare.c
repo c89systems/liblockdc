@@ -1554,18 +1554,18 @@ int main(int argc, char **argv) {
   }
   count_files(c.store, &artifacts);
   if (c.runtime && c.collection) {
-    struct stat metadata;
+    lc_u64 length, allocated;
     lc_collection_handle *receiver;
     for (i = 0; i < c.writers; ++i) {
       receiver = c.workers[i].collection->impl;
-      require(fstat(receiver->order.fd, &metadata) == 0,
-              "inspect disposable ordered metadata");
-      scratch_bytes += (uint64_t)metadata.st_size;
-      scratch_allocated += (uint64_t)metadata.st_blocks * 512U;
-      require(fstat(receiver->ids.fd, &metadata) == 0,
-              "inspect disposable identity metadata");
-      scratch_bytes += (uint64_t)metadata.st_size;
-      scratch_allocated += (uint64_t)metadata.st_blocks * 512U;
+      require(receiver->order.scratch && receiver->ids.scratch,
+              "inspect disposable collection metadata");
+      lc_collection_scratch_size(receiver->order.scratch, &length, &allocated);
+      scratch_bytes += length;
+      scratch_allocated += allocated;
+      lc_collection_scratch_size(receiver->ids.scratch, &length, &allocated);
+      scratch_bytes += length;
+      scratch_allocated += allocated;
     }
   }
   if (c.container || c.runtime) {
