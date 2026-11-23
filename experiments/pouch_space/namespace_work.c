@@ -2,6 +2,7 @@
 #include "budget.h"
 #include "lc_api_internal.h"
 #include "root_internal.h"
+#include "space_internal.h"
 #include <string.h>
 #include <zlib.h>
 
@@ -67,22 +68,21 @@ int ps_namespace_work_get(ps_namespace *ns,
   *out = 1;
   return LC_OK;
 }
-int ps_namespace_work_ensure(ps_namespace *ns,
-                             enum lc_pouch_storage_work_kind kind,
-                             int maintenance, lc_error *e) {
+static int prepare_work_locked(ps_namespace *ns,
+                               enum lc_pouch_storage_work_kind kind,
+                               int maintenance, lc_error *e) {
   unsigned char bytes[32];
   ps_writer *writer = NULL;
   ps_budget *budget = NULL;
   ps_budget_plan plan = {0};
-  unsigned int bit;
-  int present = 0, rc = valid(ns, kind, e);
-  if (rc != LC_OK)
-    return rc;
+  unsigned int bit = 1U << (unsigned int)kind;
+  int ordinary = kind == LC_POUCH_STORAGE_WORK_ORDINARY;
+  int present = 0, rc = LC_OK;
   if (maintenance < 0 || maintenance > 1)
     return failure(e, LC_ERR_INVALID,
                    "invalid maintenance hint admission class");
-  bit = 1U << (unsigned int)kind;
-  pthread_mutex_lock(&ns->maintenance);
+  if (ordinary && ns->ordinary_work_ready)
+    return LC_OK;
   /* Shared collection name publication and hint removal take the namespace's
    * collection catalog authority. A peer may have cleared our cached hint. */
   if (!(ns->work_loaded & bit) ||
@@ -110,13 +110,59 @@ int ps_namespace_work_ensure(ps_namespace *ns,
       rc = ps_begin(ns->root->space, budget, key_for(ns, kind), &writer, e);
     if (rc == LC_OK)
       rc = ps_write(writer, bytes, sizeof(bytes), e);
-    if (rc == LC_OK)
-      rc = ps_publish(writer, NULL, e);
+    if (rc == LC_OK) {
+      if (ordinary)
+        rc = ps_internal_publish_deferred(writer, &ns->ordinary_work_ready, e);
+      else
+        rc = ps_publish(writer, NULL, e);
+    }
     ps_writer_close(writer);
     (void)ps_budget_close(budget, NULL);
-    if (rc == LC_OK)
+    if (rc == LC_OK && !ordinary)
       ns->work_present |= bit;
   }
+  return rc;
+}
+static int complete_ordinary_locked(ps_namespace *ns, lc_error *e) {
+  int rc;
+  if (!ns->ordinary_work_ready)
+    return LC_OK;
+  rc = ps_internal_durable(ns->root->space, ns->ordinary_work_ready, e);
+  if (rc == LC_OK) {
+    ns->ordinary_work_ready = 0;
+    ns->work_present |= 1U << LC_POUCH_STORAGE_WORK_ORDINARY;
+  }
+  return rc;
+}
+int ps_namespace_work_ensure(ps_namespace *ns,
+                             enum lc_pouch_storage_work_kind kind,
+                             int maintenance, lc_error *e) {
+  int rc = valid(ns, kind, e);
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&ns->maintenance);
+  rc = prepare_work_locked(ns, kind, maintenance, e);
+  if (rc == LC_OK && kind == LC_POUCH_STORAGE_WORK_ORDINARY)
+    rc = complete_ordinary_locked(ns, e);
+  pthread_mutex_unlock(&ns->maintenance);
+  return rc;
+}
+int ps_namespace_work_stage_ordinary(ps_namespace *ns, int maintenance,
+                                     int *pending, lc_error *e) {
+  int rc = valid(ns, LC_POUCH_STORAGE_WORK_ORDINARY, e);
+  *pending = 0;
+  if (rc != LC_OK)
+    return rc;
+  pthread_mutex_lock(&ns->maintenance);
+  rc = prepare_work_locked(ns, LC_POUCH_STORAGE_WORK_ORDINARY, maintenance, e);
+  *pending = rc == LC_OK && ns->ordinary_work_ready != 0;
+  pthread_mutex_unlock(&ns->maintenance);
+  return rc;
+}
+int ps_namespace_work_complete_ordinary(ps_namespace *ns, lc_error *e) {
+  int rc;
+  pthread_mutex_lock(&ns->maintenance);
+  rc = complete_ordinary_locked(ns, e);
   pthread_mutex_unlock(&ns->maintenance);
   return rc;
 }
@@ -129,7 +175,10 @@ int ps_namespace_work_remove(ps_namespace *ns,
     return rc;
   bit = 1U << (unsigned int)kind;
   pthread_mutex_lock(&ns->maintenance);
-  rc = ps_namespace_work_get(ns, kind, &present, e);
+  if (kind == LC_POUCH_STORAGE_WORK_ORDINARY)
+    rc = complete_ordinary_locked(ns, e);
+  if (rc == LC_OK)
+    rc = ps_namespace_work_get(ns, kind, &present, e);
   if (rc == LC_OK && present)
     rc = ps_delete(ns->root->space, key_for(ns, kind), e);
   if (rc == LC_OK) {

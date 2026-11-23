@@ -9,6 +9,11 @@
  * preserves it. The admission class does not change the hint identity. */
 int ps_namespace_work_ensure(ps_namespace *, enum lc_pouch_storage_work_kind,
                              int maintenance, lc_error *);
+/* Prepare an ordinary hint before append setup. Setup may synchronize its
+ * publication while binding a stream. Complete before exposing a producer. */
+int ps_namespace_work_stage_ordinary(ps_namespace *, int maintenance,
+                                     int *pending, lc_error *);
+int ps_namespace_work_complete_ordinary(ps_namespace *, lc_error *);
 int ps_namespace_work_get(ps_namespace *, enum lc_pouch_storage_work_kind,
                           int *, lc_error *);
 int ps_namespace_work_remove(ps_namespace *, enum lc_pouch_storage_work_kind,

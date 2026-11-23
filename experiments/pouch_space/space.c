@@ -7521,6 +7521,10 @@ static int publish_value(ps_writer *w, ps_ref *ref, uint64_t *ready,
 int ps_publish(ps_writer *w, ps_ref *ref, lc_error *error) {
   return publish_value(w, ref, NULL, error);
 }
+int ps_internal_publish_deferred(ps_writer *w, uint64_t *ready,
+                                 lc_error *error) {
+  return publish_value(w, NULL, ready, error);
+}
 int ps_writer_key_deletion(ps_writer *w, uint64_t bytes, lc_error *error) {
   uint64_t encoded;
   if (!w || w->failed || w->published || w->entry->key.kind != PS_KEY_METADATA)

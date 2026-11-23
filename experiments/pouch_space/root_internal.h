@@ -24,6 +24,7 @@ struct ps_namespace {
   pthread_cond_t outbox_changed;
   struct ps_outbox_marker_gate *outbox_writers;
   struct ps_query_index_generation *query_readers;
+  uint64_t ordinary_work_ready; /* protected by maintenance */
   unsigned int work_loaded, work_present;
   struct ps_namespace *next, *hash_next;
   struct ps_namespace **link;

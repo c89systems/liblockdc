@@ -227,7 +227,7 @@ static int append_begin(void *context, void *ns, uint64_t target,
                         lc_pouch_storage_append *out, lc_error *e) {
   ps_namespace_append *append = NULL;
   enum ps_namespace_append_mode physical;
-  int rc;
+  int rc, work_pending;
   (void)context;
   memset(out, 0, sizeof(*out));
   switch (mode) {
@@ -255,17 +255,21 @@ static int append_begin(void *context, void *ns, uint64_t target,
        mode == LC_POUCH_STORAGE_APPEND_FRAMED_PREFIX) &&
       target)
     target = target > PS_FRAME_BYTES ? target - PS_FRAME_BYTES : 1;
-  rc = ps_namespace_work_ensure(
-      ns, LC_POUCH_STORAGE_WORK_ORDINARY,
+  rc = ps_namespace_work_stage_ordinary(
+      ns,
       mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE ||
           mode == LC_POUCH_STORAGE_APPEND_MAINTENANCE_PREFIX,
-      e);
+      &work_pending, e);
   if (rc != LC_OK)
     return rc;
   rc = ps_namespace_append_begin(ns, target, minimum, physical, batch, &append,
                                  e);
-  if (rc != LC_OK)
+  if (rc == LC_OK && work_pending)
+    rc = ps_namespace_work_complete_ordinary(ns, e);
+  if (rc != LC_OK) {
+    ps_namespace_append_close(append);
     return rc;
+  }
   out->handle = append;
   out->io = ps_namespace_append_output(append);
   out->leaf = ps_namespace_append_leaf(append);

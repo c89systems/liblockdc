@@ -520,6 +520,98 @@ static uint64_t scope_syncs(lc_pouch *p, lc_error *e) {
   ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &stats, e), e);
   return stats.syncs;
 }
+typedef struct append_hint_io {
+  io_fault ordinary;
+  int fail_sync;
+} append_hint_io;
+static int append_hint_sync(void *context, int fd) {
+  append_hint_io *io = context;
+  if (io->fail_sync) {
+    io->fail_sync = 0;
+    errno = EIO;
+    return -1;
+  }
+  return fdatasync(fd);
+}
+static void append_hint(const char *path) {
+  lc_error e = {0};
+  for (int shared = 0; shared < 2; ++shared)
+    for (int fail = 0; fail < 2; ++fail) {
+      ps_pouch_state_options o = shared ? shared_options(0, 0) : options(0, 0);
+      append_hint_io model = {0};
+      ps_io io = {&model,           io_read,    io_write,
+                  append_hint_sync, io_reserve, NULL};
+      lc_pouch *p = NULL;
+      void *ns = NULL;
+      lc_pouch_storage_append append = {0};
+      lc_pouch_state_read_result absent = {0};
+      lc_pouch_state_write_result result = {0};
+      input in = source(47, 13);
+      int present;
+      o.io = &io;
+      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      ok(p->storage.ops->namespace_open(p->storage.context, "hint", 1, &ns, &e),
+         &e);
+      ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
+                               &e),
+         &e);
+      REQUIRE(!present);
+      uint64_t before = scope_syncs(p, &e);
+      if (!fail) {
+        REQUIRE(
+            p->storage.ops->append_begin(p->storage.context, ns, 0, UINT64_MAX,
+                                         LC_POUCH_STORAGE_APPEND_COMPLETE, NULL,
+                                         &append, &e) == LC_ERR_INVALID &&
+            !append.handle);
+        clear(&e);
+        ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
+                                 &e),
+           &e);
+        REQUIRE(!present && scope_syncs(p, &e) == before);
+      }
+      model.fail_sync = fail;
+      int rc = p->storage.ops->append_begin(p->storage.context, ns, 0, 48,
+                                            LC_POUCH_STORAGE_APPEND_COMPLETE,
+                                            NULL, &append, &e);
+      if (fail) {
+        REQUIRE(rc == LC_ERR_TRANSPORT && !append.handle && !model.fail_sync);
+        clear(&e);
+      } else {
+        ok(rc, &e);
+        /* The hint shares the binding's barrier. A shared stream also
+         * synchronizes its first grant before allowing writes. */
+        uint64_t synced = scope_syncs(p, &e) - before;
+        if (synced != 1U + (unsigned int)shared)
+          fprintf(stderr, "first append shared=%d barriers=%llu\n", shared,
+                  (unsigned long long)synced);
+        REQUIRE(append.handle && synced == 1U + (unsigned int)shared);
+        ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
+                                 &e),
+           &e);
+        REQUIRE(present);
+        p->storage.ops->append_close(p->storage.context, &append);
+      }
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      lc_pouch_close(p);
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+      ok(lc_pouch_state_read_metadata(p, "hint", "key", &absent, &e), &e);
+      REQUIRE(!absent.found);
+      lc_pouch_state_read_result_cleanup(&allocator, &absent);
+      ok(put(p, "hint", "key", &in, NULL, &result, &e), &e);
+      lc_pouch_state_write_result_cleanup(&allocator, &result);
+      ok(p->storage.ops->namespace_open(p->storage.context, "hint", 0, &ns, &e),
+         &e);
+      ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &present,
+                               &e),
+         &e);
+      REQUIRE(present);
+      p->storage.ops->namespace_close(p->storage.context, ns);
+      read_value(p, "hint", "key", 47, 13, 1, &e);
+      lc_pouch_close(p);
+      REQUIRE(!live && !unlink(path));
+    }
+  lc_error_cleanup(&e);
+}
 static void scope_put(lc_pouch *p, const char *ns, unsigned char seed,
                       lc_error *e) {
   input in = source(17, seed);
@@ -7066,6 +7158,8 @@ static void *worker(void *context) {
     concurrency(r->path, r->directory, 1);
   else if (!strcmp(r->mode, "io-faults"))
     io_faults(r->path);
+  else if (!strcmp(r->mode, "append-hint"))
+    append_hint(r->path);
   else if (!strcmp(r->mode, "crypto-init"))
     crypto_initialization(r->path);
   else if (!strcmp(r->mode, "durable-scope"))

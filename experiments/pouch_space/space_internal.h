@@ -410,6 +410,9 @@ void ps_internal_entry_auxiliary(ps_entry *);
 void ps_internal_install(ps_space *, ps_entry *);
 void ps_internal_remove(ps_space *, ps_entry *, uint64_t);
 int ps_internal_durable(ps_space *, uint64_t, lc_error *);
+/* Publish the value and return the local sequence that must become durable
+ * before a dependent operation can expose it. */
+int ps_internal_publish_deferred(ps_writer *, uint64_t *ready, lc_error *);
 int ps_internal_durable_prefix(ps_space *, uint64_t local, uint64_t peer,
                                lc_error *);
 void ps_internal_collect(ps_space *);
