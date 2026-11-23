@@ -120,8 +120,9 @@ static void checkpoint_idempotence(int durable) {
   before = after;
   OK(ps_metadata_repack(space, &error));
   OK(ps_status(space, &after, &error));
+  /* This small value is stored directly in a directory binding. */
   CHECK(after.checkpoints == before.checkpoints + 1 &&
-        after.descriptor_page_writes > before.descriptor_page_writes);
+        after.directory_page_writes > before.directory_page_writes);
   checkpoint_unchanged(space, &probe);
   OK(ps_close(space, &error));
   ps_options options = {0};
