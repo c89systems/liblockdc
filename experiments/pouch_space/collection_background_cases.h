@@ -202,6 +202,34 @@ static void background_peer_view(const char *directory, int codec, int sync) {
   close_store(&f);
   lc_error_cleanup(&f.error);
 }
+typedef struct background_namespace_attempt {
+  lc_pouch *pouch;
+  gate done;
+  int rc, entered;
+} background_namespace_attempt;
+static int background_namespace_entered(void *context, lc_error *e) {
+  background_namespace_attempt *attempt = context;
+  (void)e;
+  attempt->entered = 1;
+  return LC_OK;
+}
+static void *background_namespace_try(void *context) {
+  background_namespace_attempt *attempt = context;
+  attempt->rc = lc_pouch_state_with_background_namespace_lock(
+      attempt->pouch, "ordinary", background_namespace_entered, attempt, NULL);
+  gate_signal(&attempt->done, 0);
+  return NULL;
+}
+static int background_namespace_busy(void *context, lc_error *e) {
+  background_namespace_attempt *attempt = context;
+  pthread_t worker;
+  (void)e;
+  REQUIRE(!pthread_create(&worker, NULL, background_namespace_try, attempt));
+  gate_wait(&attempt->done, 0);
+  REQUIRE(!pthread_join(worker, NULL));
+  REQUIRE(attempt->rc == LC_ERR_PENDING && !attempt->entered);
+  return LC_OK;
+}
 static void background_discovery(const char *directory, int codec, int sync) {
   fixture f;
   lc_collection *cold = NULL, *hot = NULL;
@@ -242,6 +270,16 @@ static void background_discovery(const char *directory, int codec, int sync) {
   lc_free_with_allocator(NULL, name);
   lc_free_with_allocator(NULL, cursor);
   ps_namespace_release(ns);
+  background_namespace_attempt attempt = {0};
+  attempt.pouch = fixture_pouch(&f);
+  REQUIRE(!pthread_mutex_init(&attempt.done.mutex, NULL));
+  REQUIRE(!pthread_cond_init(&attempt.done.condition, NULL));
+  ok(lc_pouch_state_with_namespace_authority(
+         attempt.pouch, "ordinary", LC_POUCH_NAMESPACE_FOREGROUND,
+         background_namespace_busy, &attempt, &f.error),
+     &f.error);
+  REQUIRE(!pthread_cond_destroy(&attempt.done.condition));
+  REQUIRE(!pthread_mutex_destroy(&attempt.done.mutex));
   background_named(&f, "hot", "events", 0, &hot);
   /* Keep the volatile queue continuously hot. Durable ordinary discovery has
    * its own fair source, so it cannot be starved by that queue. */

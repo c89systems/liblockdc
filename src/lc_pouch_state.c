@@ -407,7 +407,7 @@ lc_pouch_state_manifest_materialize(lc_pouch *pouch, const char *ns,
                                     lc_pouch_namespace_manifest *manifest,
                                     int *from_cache, lc_error *error);
 static int lc_pouch_state_process_namespace_mutex_lock(
-    lc_pouch *pouch, const char *ns,
+    lc_pouch *pouch, const char *ns, int wait,
     lc_pouch_state_process_namespace_mutex **out, lc_error *error);
 static void lc_pouch_state_process_namespace_mutex_unlock(
     lc_pouch_state_process_namespace_mutex **mutex);
@@ -418,7 +418,7 @@ static void lc_pouch_state_shared_mutation_release(
     lc_pouch_state_shared_mutation_guard **guard);
 static int lc_pouch_state_shared_mutation_is_held(const lc_pouch *pouch);
 static int lc_pouch_state_exclusive_append_gate_lock(lc_pouch *pouch,
-                                                     const char *ns,
+                                                     const char *ns, int wait,
                                                      pthread_mutex_t **out,
                                                      lc_error *error);
 static void lc_pouch_state_exclusive_append_gate_unlock(pthread_mutex_t **gate);
@@ -1184,7 +1184,7 @@ static int lc_pouch_state_process_mutex_identity(lc_pouch *pouch,
 }
 
 static int lc_pouch_state_process_namespace_mutex_lock(
-    lc_pouch *pouch, const char *ns,
+    lc_pouch *pouch, const char *ns, int wait,
     lc_pouch_state_process_namespace_mutex **out, lc_error *error) {
   lc_pouch_state_process_namespace_mutex *entry;
   lc_pouch_state_process_namespace_mutex *created;
@@ -1244,14 +1244,16 @@ static int lc_pouch_state_process_namespace_mutex_lock(
   entry->refcount += 1UL;
   pthread_mutex_unlock(&lc_pouch_state_process_mutex_registry);
   lc_free_with_allocator(NULL, identity);
-  pthread_rc = pthread_mutex_lock(&entry->mutex);
+  pthread_rc = wait ? pthread_mutex_lock(&entry->mutex)
+                    : pthread_mutex_trylock(&entry->mutex);
   if (pthread_rc != 0) {
     pthread_mutex_lock(&lc_pouch_state_process_mutex_registry);
     entry->refcount -= 1UL;
     pthread_mutex_unlock(&lc_pouch_state_process_mutex_registry);
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to lock pouch namespace mutex",
-                        strerror(pthread_rc), NULL, NULL);
+    return lc_error_set(
+        error, !wait && pthread_rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT,
+        0L, "failed to lock pouch namespace mutex", strerror(pthread_rc), NULL,
+        NULL);
   }
   *out = entry;
   return LC_OK;
@@ -1302,7 +1304,7 @@ static int lc_pouch_state_projection_mutex_lock(lc_pouch *pouch, const char *ns,
       return LC_OK;
     }
     return lc_pouch_state_process_namespace_mutex_lock(
-        pouch, ns, &lock->process_mutex, error);
+        pouch, ns, 1, &lock->process_mutex, error);
   }
   pthread_rc = pthread_mutex_lock(&pouch->state_mutation_mutex);
   if (pthread_rc != 0) {
@@ -1361,7 +1363,7 @@ static int lc_pouch_state_cache_guard_lock(lc_pouch *pouch, const char *ns,
   }
   if (lc_pouch_single_writer_enabled(pouch)) {
     return lc_pouch_state_process_namespace_mutex_lock(
-        pouch, ns, &guard->namespace_mutex, error);
+        pouch, ns, 1, &guard->namespace_mutex, error);
   }
   /* In shared mode every cache refresh shares the root durable authority with
    * an append, eliminating a reader/writer filesystem lock cycle. */
@@ -1399,7 +1401,7 @@ lc_pouch_state_cache_guard_unlock(lc_pouch *pouch,
 }
 
 static int lc_pouch_state_process_namespace_guard_lock(
-    lc_pouch *pouch, const char *ns, int exclusive,
+    lc_pouch *pouch, const char *ns, int exclusive, int wait,
     lc_pouch_state_process_namespace_guard **out, lc_error *error) {
   lc_pouch_state_process_namespace_guard *entry;
   lc_pouch_state_process_namespace_guard *created;
@@ -1488,15 +1490,19 @@ static int lc_pouch_state_process_namespace_guard_lock(
     }
     (void)pthread_mutex_unlock(&entry->writer_mutex);
   }
-  pthread_rc = exclusive ? pthread_rwlock_wrlock(&entry->lock)
-                         : pthread_rwlock_rdlock(&entry->lock);
+  if (exclusive)
+    pthread_rc = wait ? pthread_rwlock_wrlock(&entry->lock)
+                      : pthread_rwlock_trywrlock(&entry->lock);
+  else
+    pthread_rc = pthread_rwlock_rdlock(&entry->lock);
   if (pthread_rc != 0) {
     pthread_mutex_lock(&lc_pouch_state_process_guard_registry);
     entry->refcount -= 1UL;
     pthread_mutex_unlock(&lc_pouch_state_process_guard_registry);
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to lock pouch maintenance guard",
-                        strerror(pthread_rc), NULL, "pouch");
+    return lc_error_set(
+        error, !wait && pthread_rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT,
+        0L, "failed to lock pouch maintenance guard", strerror(pthread_rc),
+        NULL, "pouch");
   }
   if (exclusive) {
     pthread_rc = pthread_mutex_lock(&entry->writer_mutex);
@@ -2609,6 +2615,8 @@ static int lc_pouch_state_namespace_lock_acquire(
   struct flock fl;
   int fd;
   int single_writer;
+  int wait = policy == LC_POUCH_NAMESPACE_FOREGROUND;
+  int rc;
 
   if (pouch == NULL || ns == NULL || ns[0] == '\0' || lock == NULL) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -2641,7 +2649,7 @@ static int lc_pouch_state_namespace_lock_acquire(
     return LC_OK;
   }
   if (pouch->storage.coordinated_namespaces) {
-    int rc = pouch->storage.ops->namespace_state_lock(
+    rc = pouch->storage.ops->namespace_state_lock(
         pouch->storage.context, ns, policy, &lock->storage_guard, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_namespace_lock_track(lock, pouch, ns, error);
@@ -2682,31 +2690,25 @@ static int lc_pouch_state_namespace_lock_acquire(
     }
     return LC_OK;
   }
-  if (lc_pouch_state_process_namespace_guard_lock(
-          pouch, ns, 1, &lock->maintenance_guard, error) != LC_OK) {
+  rc = lc_pouch_state_process_namespace_guard_lock(
+      pouch, ns, 1, wait, &lock->maintenance_guard, error);
+  if (rc != LC_OK) {
     lc_pouch_state_shared_mutation_release(&lock->shared_mutation);
-    return error != NULL && error->code != LC_OK ? error->code
-                                                 : LC_ERR_TRANSPORT;
+    return rc;
   }
   /* Namespace callbacks retain projection authority across multiple writes.
    * Claim the physical gate before that projection so a metadata worker cannot
    * hold the gate while waiting for this callback's namespace mutex. */
-  if (single_writer) {
-    if (lc_pouch_state_exclusive_append_gate_lock(
-            pouch, ns, &lock->exclusive_append_gate, error) != LC_OK) {
-      lc_pouch_state_process_namespace_guard_unlock(&lock->maintenance_guard);
-      lc_pouch_state_shared_mutation_release(&lock->shared_mutation);
-      return error != NULL && error->code != LC_OK ? error->code
-                                                   : LC_ERR_TRANSPORT;
-    }
-  }
-  if (lc_pouch_state_process_namespace_mutex_lock(
-          pouch, ns, &lock->process_mutex, error) != LC_OK) {
+  rc = lc_pouch_state_exclusive_append_gate_lock(
+      pouch, ns, wait, &lock->exclusive_append_gate, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_state_process_namespace_mutex_lock(
+        pouch, ns, wait, &lock->process_mutex, error);
+  if (rc != LC_OK) {
     lc_pouch_state_exclusive_append_gate_unlock(&lock->exclusive_append_gate);
     lc_pouch_state_process_namespace_guard_unlock(&lock->maintenance_guard);
     lc_pouch_state_shared_mutation_release(&lock->shared_mutation);
-    return error != NULL && error->code != LC_OK ? error->code
-                                                 : LC_ERR_TRANSPORT;
+    return rc;
   }
   if (single_writer) {
     if (lc_pouch_state_namespace_lock_track(lock, pouch, ns, error) != LC_OK) {
@@ -2861,7 +2863,7 @@ static int lc_pouch_state_append_lock_acquire(lc_pouch *pouch, const char *ns,
   }
   if (single_writer) {
     rc = lc_pouch_state_exclusive_append_gate_lock(
-        pouch, ns, &lock->exclusive_gate, error);
+        pouch, ns, 1, &lock->exclusive_gate, error);
     if (rc == LC_OK) {
       rc = lc_pouch_state_append_lock_track(lock, pouch, ns, error);
     }
@@ -3028,14 +3030,14 @@ static int lc_pouch_state_key_lock_acquire(lc_pouch *pouch, const char *ns,
      * waiting for the read guard.
      */
     rc = lc_pouch_state_process_namespace_guard_lock(
-        pouch, ns, 0, &lock->maintenance_guard, error);
+        pouch, ns, 0, 1, &lock->maintenance_guard, error);
     if (rc != LC_OK) {
       (void)pthread_mutex_unlock(lock->exclusive_key_mutex);
       lock->exclusive_key_mutex = NULL;
       return rc;
     }
     rc = lc_pouch_state_process_namespace_mutex_lock(
-        pouch, ns, &lock->process_mutex, error);
+        pouch, ns, 1, &lock->process_mutex, error);
     if (rc != LC_OK) {
       lc_pouch_state_process_namespace_guard_unlock(&lock->maintenance_guard);
       (void)pthread_mutex_unlock(lock->exclusive_key_mutex);
@@ -3209,7 +3211,7 @@ static int lc_pouch_state_finish_commit_group_after_mutation(
     if (lock->projection_uses_namespace_mutex) {
       if (projection_released) {
         if (lc_pouch_state_process_namespace_mutex_lock(
-                pouch, lock->ns, &lock->process_mutex, NULL) != LC_OK) {
+                pouch, lock->ns, 1, &lock->process_mutex, NULL) != LC_OK) {
           lc_pouch_state_projection_lock_untrack(lock);
           lc_pouch_state_key_lock_release(lock);
           if (writer_mode_operation_active) {
@@ -3373,7 +3375,8 @@ static int lc_pouch_state_lock_namespace_for_mutation(
   int rc;
 
   if (policy == LC_POUCH_NAMESPACE_BACKGROUND &&
-      !pouch->storage.coordinated_namespaces)
+      !pouch->storage.coordinated_namespaces &&
+      !(pouch->storage.ops && lc_pouch_single_writer_enabled(pouch)))
     return lc_error_set(error, LC_ERR_UNSUPPORTED, 0L,
                         "storage has no background namespace authority", NULL,
                         NULL, "pouch");
@@ -5314,7 +5317,7 @@ lc_pouch_namespace_logstore_find(lc_pouch *pouch, const char *ns, int create,
 }
 
 static int lc_pouch_state_exclusive_append_gate_lock(lc_pouch *pouch,
-                                                     const char *ns,
+                                                     const char *ns, int wait,
                                                      pthread_mutex_t **out,
                                                      lc_error *error) {
   lc_pouch_namespace_logstore *cache;
@@ -5352,11 +5355,12 @@ static int lc_pouch_state_exclusive_append_gate_lock(lc_pouch *pouch,
   if (rc != LC_OK) {
     return rc;
   }
-  pthread_rc = pthread_mutex_lock(gate);
+  pthread_rc = wait ? pthread_mutex_lock(gate) : pthread_mutex_trylock(gate);
   if (pthread_rc != 0) {
-    return lc_error_set(error, LC_ERR_TRANSPORT, 0L,
-                        "failed to lock pouch exclusive append gate",
-                        strerror(pthread_rc), NULL, "pouch");
+    return lc_error_set(
+        error, !wait && pthread_rc == EBUSY ? LC_ERR_PENDING : LC_ERR_TRANSPORT,
+        0L, "failed to lock pouch exclusive append gate", strerror(pthread_rc),
+        NULL, "pouch");
   }
   *out = gate;
   return LC_OK;
@@ -6865,8 +6869,8 @@ static int lc_pouch_state_reserve_index_records(
                         NULL, "pouch");
   }
   if (!shared_mutation_held) {
-    rc = lc_pouch_state_process_namespace_mutex_lock(pouch, ns, &sequence_mutex,
-                                                     error);
+    rc = lc_pouch_state_process_namespace_mutex_lock(pouch, ns, 1,
+                                                     &sequence_mutex, error);
     if (rc != LC_OK) {
       lc_free_with_allocator(&pouch->allocator, sequence_path);
       return rc;
@@ -16220,7 +16224,7 @@ static void lc_pouch_state_metadata_append_process(
   }
   if (!projection_held && rc == LC_OK && single_writer) {
     rc = lc_pouch_state_process_namespace_mutex_lock(
-        pouch, requests[0]->ns, &projection_mutex, &batch_error);
+        pouch, requests[0]->ns, 1, &projection_mutex, &batch_error);
     if (rc == LC_OK) {
       projection_locked = 1;
     }
