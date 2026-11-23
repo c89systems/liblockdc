@@ -133,6 +133,7 @@ int ps_owned_runs_verify(const ps_owned_mapping *, size_t, ps_owned_footer *,
                          lc_error *);
 /* Discard unpublished handles while still holding their space mutex. */
 void ps_owned_runs_discard_locked(ps_owned_mapping *, size_t);
+/* All mappings in a batch belong to the same open space. */
 void ps_owned_runs_close(ps_owned_mapping *, size_t);
 /* Capture the writable suffix, including grants beyond the published tail.
  * The caller owns stream edit authority through use of the mappings. */

@@ -10179,13 +10179,95 @@ static void owned_run_free_locked(ps_owned_run *run) {
   else if (!--batch->remaining)
     lc_free_with_allocator(NULL, batch);
 }
-void ps_owned_runs_discard_locked(ps_owned_mapping *items, size_t count) {
-  while (count) {
-    ps_owned_run *run = items[--count].handle;
-    ps_internal_entry_unpin(run->space, run->entry);
-    --run->space->readers;
+/* A merged OFD witness still belongs to the exact entries. The kernel can
+ * split the range when one entry loses its last pin before its neighbors. */
+static int extend_run_range(ps_owned_range *range, const ps_entry *p) {
+  uint64_t offset = p->extents[0].offset;
+  uint64_t bytes = extent_allocation(&p->extents[0]);
+  if (!range->bytes || offset + bytes == range->offset)
+    range->offset = offset;
+  else if (range->offset + range->bytes != offset)
+    return 0;
+  range->bytes += bytes;
+  return 1;
+}
+static int run_needs_witness(const ps_entry *p) {
+  return p->count == 1 && !p->pins && !p->payload_claimed;
+}
+static int pin_run_mappings(ps_space *s, ps_owned_mapping *items, size_t count,
+                            int provisional, size_t *pinned, lc_error *e) {
+  size_t first, next, i;
+  int shared = ps_coordination_shared(s->coordination);
+  int rc;
+  for (first = 0; first < count; first = next) {
+    ps_entry *p = items[first].handle->entry;
+    next = first + 1;
+    if (shared && run_needs_witness(p)) {
+      ps_owned_range range = {0};
+      (void)extend_run_range(&range, p);
+      for (; next < count; ++next) {
+        p = items[next].handle->entry;
+        if (!run_needs_witness(p) || !extend_run_range(&range, p))
+          break;
+      }
+      rc = provisional ? take_physical_witness(s, range.offset, range.bytes, e)
+                       : physical_claim(s, range.offset, range.bytes, e);
+      if (rc != LC_OK)
+        return rc;
+      s->reader_claim_bytes += range.bytes;
+      for (i = first; i < next; ++i) {
+        p = items[i].handle->entry;
+        p->reader_claimed = 1;
+        ++p->pins;
+      }
+    } else {
+      rc = entry_pin(s, p, provisional, e);
+      if (rc != LC_OK)
+        return rc;
+    }
+    s->readers += next - first;
+    *pinned = next;
+  }
+  return LC_OK;
+}
+static void release_run_range(ps_space *s, ps_owned_range *range) {
+  if (range->bytes) {
+    (void)reader_release_range(s, range->offset, range->bytes, NULL);
+    range->bytes = 0;
+  }
+}
+static int close_run_mappings_locked(ps_space *s, ps_owned_mapping *items,
+                                     size_t count, size_t pinned) {
+  ps_owned_range range = {0};
+  size_t i;
+  int collect = 0;
+  for (i = 0; i < count; ++i) {
+    ps_owned_run *run = items[i].handle;
+    ps_entry *p = run->entry;
+    if (__atomic_sub_fetch(&run->references, 1, __ATOMIC_ACQ_REL))
+      continue;
+    if (i < pinned) {
+      if (p->pins == 1 && p->reader_claimed && p->count == 1) {
+        if (!extend_run_range(&range, p)) {
+          release_run_range(s, &range);
+          (void)extend_run_range(&range, p);
+        }
+        p->pins = 0;
+        p->reader_claimed = 0;
+      } else
+        ps_internal_entry_unpin(s, p);
+      --s->readers;
+      collect |= p->state == 2 && p->safe && !p->pins;
+    }
     owned_run_free_locked(run);
   }
+  release_run_range(s, &range);
+  return collect;
+}
+void ps_owned_runs_discard_locked(ps_owned_mapping *items, size_t count) {
+  if (count)
+    (void)close_run_mappings_locked(items[0].handle->space, items, count,
+                                    count);
   lc_free_with_allocator(NULL, items);
 }
 static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
@@ -10196,7 +10278,7 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
   ps_entry *p, *first = NULL, *limit = NULL;
   ps_owned_mapping *items = NULL;
   ps_owned_run_batch *batch = NULL;
-  size_t n = 0, capacity = 0;
+  size_t n = 0, capacity = 0, pinned = 0;
   size_t in_batch = 0, batch_size = 0;
   int rc = LC_OK;
   if (out)
@@ -10274,16 +10356,12 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
       batch->remaining = 0;
       in_batch = 0;
     }
-    rc = entry_pin(s, p, provisional, error);
-    if (rc != LC_OK)
-      break;
     run = (ps_owned_run *)(batch + 1) + in_batch++;
     run->space = s;
     run->entry = p;
     run->references = 1;
     run->batch = batch;
     ++batch->remaining;
-    ++s->readers;
     items[n].handle = run;
     items[n].base = p->key.key;
     items[n++].capacity = p->stream->capacity;
@@ -10292,11 +10370,19 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
     lc_free_with_allocator(NULL, batch);
   if (rc == LC_OK && n != capacity)
     rc = err(error, LC_ERR_PROTOCOL, "mapping count differs from its head");
+  if (rc == LC_OK)
+    rc = pin_run_mappings(s, items, n, provisional, &pinned, error);
   if (rc == LC_OK) {
     *out = items;
     *count = n;
-  } else
-    ps_owned_runs_discard_locked(items, n);
+  } else {
+    (void)close_run_mappings_locked(s, items, n, pinned);
+    lc_free_with_allocator(NULL, items);
+    if (__atomic_load_n(&s->poisoned, __ATOMIC_RELAXED)) {
+      lc_error_cleanup(error);
+      rc = healthy(s, error);
+    }
+  }
   return rc;
 }
 int ps_owned_runs_pin_range(ps_space *s, ps_key key, const ps_ref *ref,
@@ -10466,9 +10552,13 @@ void ps_owned_run_close(ps_owned_run *run) {
   pthread_mutex_unlock(&s->mutex);
 }
 void ps_owned_runs_close(ps_owned_mapping *items, size_t count) {
-  size_t i;
-  for (i = 0; i < count; ++i)
-    ps_owned_run_close(items[i].handle);
+  if (count) {
+    ps_space *s = items[0].handle->space;
+    pthread_mutex_lock(&s->mutex);
+    if (close_run_mappings_locked(s, items, count, count))
+      collect_retired(s);
+    pthread_mutex_unlock(&s->mutex);
+  }
   lc_free_with_allocator(NULL, items);
 }
 static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,

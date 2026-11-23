@@ -1876,33 +1876,62 @@ static void capture_owned(void) {
 static void capture_owned_batches(void) {
   enum { runs = 34 };
   lc_error e = {0};
-  ps_space *s = NULL;
-  ps_owned_head *head = NULL;
+  ps_space *s = NULL, *peer = NULL;
+  ps_owned_head *head = NULL, *spacer = NULL;
   ps_owned_mapping *list = NULL;
-  ps_owned_run *run = NULL, *first, *last;
-  ps_key stream = {88, 1, PS_STREAM};
+  ps_owned_run *run = NULL, *first, *middle, *last;
+  ps_key stream = {88, 1, PS_STREAM}, spacer_key = {88, 2, PS_STREAM};
   ps_owned_status info;
   capture_fault f = {1, EAGAIN, 0, 0, 0, 0};
   ps_coordination_io io = {&f, capture_lock};
   ps_options options = {0};
   const uint64_t span = PS_PAGE - PS_RUN_HEADER;
-  const size_t failed_pins[] = {2, runs};
-  size_t count;
+  uint64_t offsets[runs], token, spacer_offset = 0, start, end;
+  size_t count, claims;
   int found;
   unsigned char byte;
 
   options.coordination_io = &io;
   ok(ps_open(path, 1, &options, &s, &e), &e);
   ok(ps_owned_open(s, NULL, stream, 1, NULL, &head, &info, &e), &e);
+  token = info.ref.incarnation;
+  ok(ps_owned_open(s, NULL, spacer_key, 1, NULL, &spacer, &info, &e), &e);
   for (size_t i = 0; i < runs; ++i) {
+    if (i == runs / 2) {
+      ps_key key = {info.ref.incarnation, 0, PS_OWNED_RUN};
+      ok(ps_owned_grant(spacer, NULL, 0, PS_PAGE, &run, &found, &e), &e);
+      REQUIRE(found);
+      ps_entry *entry = ps_internal_lookup(s, key);
+      REQUIRE(entry && entry->count == 1);
+      spacer_offset = entry->extents[0].offset;
+      ps_owned_run_close(run);
+    }
+    ps_key key = {token, i * span, PS_OWNED_RUN};
     ok(ps_owned_grant(head, NULL, i * span, PS_PAGE, &run, &found, &e), &e);
     REQUIRE(found);
+    ps_entry *entry = ps_internal_lookup(s, key);
+    REQUIRE(entry && entry->count == 1);
+    offsets[i] = entry->extents[0].offset;
     byte = (unsigned char)(i + 1);
     ok(ps_owned_write(run, 0, &byte, 1, &e), &e);
     ps_owned_run_close(run);
   }
-  for (size_t i = 0; i < sizeof(failed_pins) / sizeof(*failed_pins); ++i) {
-    f.nth = failed_pins[i];
+  ps_owned_close(spacer);
+  ok(ps_open(path, 0, NULL, &peer, &e), &e);
+  f.armed = 1;
+  ok(ps_owned_runs_capture(head, &list, &count, &e), &e);
+  claims = f.calls;
+  REQUIRE(claims > 1 && claims < runs);
+  REQUIRE(count == runs && status(s).retained_payload_bytes == runs * PS_PAGE);
+  REQUIRE(spacer_offset);
+  ok(ps_coordination_conflict(ps_space_coordination(peer), spacer_offset,
+                              PS_PAGE, &start, &end, &e),
+     &e);
+  REQUIRE(start == end);
+  ps_owned_runs_close(list, count);
+  f.armed = 0;
+  for (size_t site = 2; site <= claims; ++site) {
+    f.nth = site;
     f.calls = 0;
     f.armed = 1;
     REQUIRE(ps_owned_runs_capture(head, &list, &count, &e) == LC_ERR_PENDING &&
@@ -1910,7 +1939,13 @@ static void capture_owned_batches(void) {
     lc_error_cleanup(&e);
     f.armed = 0;
     REQUIRE(!status(s).retained_payload_bytes);
+    ok(ps_coordination_conflict(ps_space_coordination(peer), offsets[0],
+                                PS_PAGE, &start, &end, &e),
+       &e);
+    REQUIRE(start == end);
   }
+  ok(ps_owned_grant(head, NULL, (runs / 2) * span, 0, &middle, &found, &e), &e);
+  REQUIRE(found);
   ok(ps_owned_runs_capture(head, &list, &count, &e), &e);
   REQUIRE(count == runs && status(s).retained_payload_bytes == runs * PS_PAGE);
   for (size_t i = 0; i < count; ++i)
@@ -1919,17 +1954,53 @@ static void capture_owned_batches(void) {
   last = list[count - 1].handle;
   ps_owned_run_retain(first);
   ps_owned_run_retain(last);
+  f.kind = 2;
+  f.nth = f.calls = 0;
+  f.armed = 1;
   ps_owned_runs_close(list, count);
-  REQUIRE(status(s).retained_payload_bytes == 2 * PS_PAGE);
+  f.armed = 0;
+  REQUIRE(f.calls < runs - 3);
+  REQUIRE(status(s).retained_payload_bytes == 3 * PS_PAGE);
+  for (size_t i = 0; i < runs; ++i) {
+    ok(ps_coordination_conflict(ps_space_coordination(peer), offsets[i],
+                                PS_PAGE, &start, &end, &e),
+       &e);
+    REQUIRE(end - start ==
+            ((i == 0 || i == runs / 2 || i == runs - 1) ? PS_PAGE : 0));
+  }
   ok(ps_owned_read(first, 0, &byte, 1, &e), &e);
   REQUIRE(byte == 1);
   ps_owned_run_close(first);
   ok(ps_owned_read(last, 0, &byte, 1, &e), &e);
   REQUIRE(byte == runs);
   ps_owned_run_close(last);
+  ok(ps_owned_read(middle, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == runs / 2 + 1);
+  ps_owned_run_close(middle);
   REQUIRE(!status(s).retained_payload_bytes);
+
+  /* An uncertain merged release retains the witness on the failed OFD
+   * and prevents this owner from admitting another capture. */
+  ok(ps_owned_runs_capture(head, &list, &count, &e), &e);
+  f.reason = EIO;
+  f.nth = 1;
+  f.calls = 0;
+  f.armed = 1;
+  ps_owned_runs_close(list, count);
+  f.armed = 0;
+  REQUIRE(f.calls == 1 && ps_check(s, &e) == LC_ERR_TRANSPORT);
+  lc_error_cleanup(&e);
+  ok(ps_coordination_conflict(ps_space_coordination(peer), offsets[0], PS_PAGE,
+                              &start, &end, &e),
+     &e);
+  REQUIRE(end - start == PS_PAGE);
   ps_owned_close(head);
   ok(ps_close(s, &e), &e);
+  ok(ps_coordination_conflict(ps_space_coordination(peer), offsets[0], PS_PAGE,
+                              &start, &end, &e),
+     &e);
+  REQUIRE(start == end);
+  ok(ps_close(peer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static int pause_capture(void *context, int fd, int command,
