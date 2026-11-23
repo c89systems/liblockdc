@@ -1553,7 +1553,8 @@ enum barrier_outcome {
   BARRIER_DURABLE,
   BARRIER_LOST_SYNC,
   BARRIER_LOST_ACK,
-  BARRIER_INTERRUPTED_CLEAR
+  BARRIER_INTERRUPTED_CLEAR,
+  BARRIER_INTERRUPTED_REPLAY
 };
 typedef struct barrier_disk {
   disk_model disk;
@@ -1569,7 +1570,8 @@ static int barrier_sync(void *context, int fd) {
   if (disk->outcome != BARRIER_LOST_SYNC)
     REQUIRE(!disk_sync(&disk->disk, fd));
   if (disk->outcome == BARRIER_DURABLE ||
-      disk->outcome == BARRIER_INTERRUPTED_CLEAR)
+      disk->outcome == BARRIER_INTERRUPTED_CLEAR ||
+      disk->outcome == BARRIER_INTERRUPTED_REPLAY)
     return 0;
   errno = EIO;
   return -1;
@@ -1581,8 +1583,20 @@ static int interrupt_lease_clear(void *context, lc_error *e) {
   return lc_error_set(e, LC_ERR_TRANSPORT, 0, "interrupted lease clear", NULL,
                       NULL, "test");
 }
+static int interrupt_release_replay(void *context, lc_error *e) {
+  lc_pouch *pouch = store(context);
+  int rc = pouch->storage.ops->flush(pouch->storage.context, e);
+  if (rc != LC_OK)
+    return rc;
+  return lc_error_set(e, LC_ERR_TRANSPORT, 0, "interrupted release replay",
+                      NULL, NULL, "test");
+}
 static void release_barrier_case(const char *directory, int crypto,
-                                 int rollback, enum barrier_outcome outcome) {
+                                 int rollback, int retention,
+                                 enum barrier_outcome outcome) {
+  snprintf(scenario, sizeof(scenario),
+           "release barrier crypto=%d rollback=%d retention=%d outcome=%d",
+           crypto, rollback, retention, (int)outcome);
   barrier_disk disk = {0};
   disk.outcome = outcome;
   disk.disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
@@ -1593,9 +1607,12 @@ static void release_barrier_case(const char *directory, int crypto,
   ps_io io = {&disk, disk_read, disk_write, barrier_sync, disk_reserve, NULL};
   lc_error e = {0};
   now(1000);
-  setup_io(f, directory, 0, 1, crypto, &io, &e);
+  setup_io(f, directory, 0, !retention, crypto, &io, &e);
   lc_lease *lease = acquire(f, "order", NULL, &e);
-  payload(lease, NULL, &e);
+  lc_update_opts update = {0};
+  update.has_retention_seconds = retention;
+  update.retention_seconds = 50;
+  payload(lease, &update, &e);
   parent(f, "order", 0, 0, &e);
   if (crypto) {
     lc_attach_req attach;
@@ -1625,6 +1642,17 @@ static void release_barrier_case(const char *directory, int crypto,
     lc_pouch_test_after_metadata_batch_append_context = &disk;
     lc_pouch_test_after_metadata_batch_append_hook = interrupt_lease_clear;
   }
+  if (retention) {
+    /* Keep the prepare and private stage through the simulated power loss.
+     * The measured sync must certify the applied state before retirement. */
+    ok(lc_pouch_retention_hint_ensure(store(f), "orders", &e), &e);
+    ok(store(f)->storage.ops->flush(store(f)->storage.context, &e), &e);
+    now(1011);
+  }
+  if (outcome == BARRIER_INTERRUPTED_REPLAY) {
+    lc_pouch_test_before_txn_replay_context = f;
+    lc_pouch_test_before_txn_replay_hook = interrupt_release_replay;
+  }
   disk.armed = 1;
   int rc = lc_lease_release(lease, &options, &e);
   disk.armed = 0;
@@ -1633,6 +1661,11 @@ static void release_barrier_case(const char *directory, int crypto,
     lc_pouch_test_after_metadata_batch_append_context = NULL;
     REQUIRE(disk.revisions == 2 && e.message &&
             !strcmp(e.message, "interrupted lease clear"));
+  }
+  if (outcome == BARRIER_INTERRUPTED_REPLAY) {
+    lc_pouch_test_before_txn_replay_hook = NULL;
+    lc_pouch_test_before_txn_replay_context = NULL;
+    REQUIRE(e.message && !strcmp(e.message, "interrupted release replay"));
   }
   REQUIRE(disk.syncs == 1);
   if (outcome == BARRIER_DURABLE)
@@ -1645,9 +1678,13 @@ static void release_barrier_case(const char *directory, int crypto,
   disk.disk.freeze = 1;
   close_store(f);
   restore_disk(&disk.disk, f->path);
+  if (retention)
+    now(900);
   open_store(f, 0, &e);
+  if (retention)
+    now(1011);
   int applied = outcome != BARRIER_LOST_SYNC && !rollback;
-  parent(f, "order", applied, 0, &e);
+  parent(f, "order", applied, applied && retention ? 1061 : 0, &e);
   if (crypto)
     attachments(f, "order", applied, &e);
   int held =
@@ -1669,7 +1706,7 @@ static void release_barrier_case(const char *directory, int crypto,
   ok(lc_release(f->client, &retry, &result, &e), &e);
   REQUIRE(result.released);
   lc_release_res_cleanup(&result);
-  parent(f, "order", !rollback, 0, &e);
+  parent(f, "order", !rollback, !rollback && retention ? 1061 : 0, &e);
   if (crypto)
     attachments(f, "order", !rollback, &e);
   if (held)
@@ -1694,11 +1731,14 @@ static void release_barrier(const char *directory) {
   shared_lease_fixture = 1;
   for (int crypto = 0; crypto <= 3; crypto += 3)
     for (int rollback = 0; rollback < 2; ++rollback)
-      for (enum barrier_outcome outcome = BARRIER_DURABLE;
-           outcome <= BARRIER_LOST_ACK; ++outcome)
-        release_barrier_case(directory, crypto, rollback, outcome);
-  release_barrier_case(directory, 0, 0, BARRIER_INTERRUPTED_CLEAR);
-  release_barrier_case(directory, 0, 1, BARRIER_INTERRUPTED_CLEAR);
+      for (int retention = 0; retention < 2; ++retention)
+        for (enum barrier_outcome outcome = BARRIER_DURABLE;
+             outcome <= BARRIER_LOST_ACK; ++outcome)
+          release_barrier_case(directory, crypto, rollback, retention, outcome);
+  release_barrier_case(directory, 0, 0, 0, BARRIER_INTERRUPTED_CLEAR);
+  release_barrier_case(directory, 0, 1, 0, BARRIER_INTERRUPTED_CLEAR);
+  release_barrier_case(directory, 3, 0, 1, BARRIER_INTERRUPTED_REPLAY);
+  release_barrier_case(directory, 3, 1, 1, BARRIER_INTERRUPTED_REPLAY);
   shared_lease_fixture = 0;
 }
 static size_t expire_at_eof(lc_source *pub, void *bytes, size_t n,
