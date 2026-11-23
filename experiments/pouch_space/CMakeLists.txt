@@ -28,10 +28,33 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   endif()
 endif()
 
+if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  add_executable(pouch_space_coordination_test coordination_test.c)
+  target_include_directories(pouch_space_coordination_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_coordination_test PRIVATE pouch_space_experiment)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(pouch_space_coordination_test PRIVATE
+      "LINKER:--wrap=pthread_mutex_init"
+      "LINKER:--wrap=lc_alloc_with_allocator"
+      "LINKER:--wrap=lc_calloc_with_allocator"
+      "LINKER:--wrap=lc_realloc_with_allocator"
+      "LINKER:--wrap=lc_strdup_with_allocator")
+  endif()
+  lc_configure_c_test_target(pouch_space_coordination_test)
+  if(LOCKDC_BUILD_TESTS AND
+     (NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR NOT CMAKE_CROSSCOMPILING))
+    foreach(mode lifecycle root-lifetime large-offsets threads faults processes)
+      add_test(NAME pouch_space_coordination_${mode}
+        COMMAND pouch_space_coordination_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(pouch_space_coordination_${mode} PROPERTIES TIMEOUT 120
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
+  endif()
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  # The portable probe can be copied to the native APFS test host. The
-  # remaining fixtures use GNU linker wrapping and Linux syscall interfaces.
-  add_custom_target(pouch_space_smoke DEPENDS pouch_space_platform_test)
+  add_custom_target(pouch_space_smoke
+    DEPENDS pouch_space_platform_test pouch_space_coordination_test)
   if(LOCKDC_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
     lc_apply_test_defaults()
   endif()
@@ -219,22 +242,6 @@ if(LOCKDC_BUILD_TESTS)
     add_test(NAME pouch_space_reader-pins_${mode}
       COMMAND pouch_space_reader_pin_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_reader-pins_${mode} PROPERTIES TIMEOUT 240
-      LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
-  endforeach()
-  add_executable(pouch_space_coordination_test coordination_test.c)
-  target_include_directories(pouch_space_coordination_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  target_link_libraries(pouch_space_coordination_test PRIVATE pouch_space_experiment)
-  target_link_options(pouch_space_coordination_test PRIVATE
-    "LINKER:--wrap=pthread_mutex_init"
-    "LINKER:--wrap=lc_alloc_with_allocator"
-    "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator"
-    "LINKER:--wrap=lc_strdup_with_allocator")
-  lc_configure_c_test_target(pouch_space_coordination_test)
-  foreach(mode lifecycle root-lifetime large-offsets threads faults processes)
-    add_test(NAME pouch_space_coordination_${mode}
-      COMMAND pouch_space_coordination_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
-    set_tests_properties(pouch_space_coordination_${mode} PROPERTIES TIMEOUT 120
       LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   endforeach()
   add_executable(pouch_space_collection_test collection_test.c ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)

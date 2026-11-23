@@ -16,6 +16,7 @@ typedef struct ps_mapping {
 } ps_mapping;
 void *ps_map_page(int, uint64_t, ps_mapping *);
 void ps_unmap_page(ps_mapping *);
+extern const ps_io ps_native_io;
 
 /* A creating root retains initialization authority until its root metadata has
  * committed. Ordinary physical opens release authority before returning. */

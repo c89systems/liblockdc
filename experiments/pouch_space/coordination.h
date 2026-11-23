@@ -48,12 +48,11 @@ typedef struct ps_coordination_options {
 
 /* fd must be a fresh, writable open file description, not a dup or an inherited
  * handle. Success adopts it; failure leaves it with the caller, unlocked.
- * Native flock controls lifetime compatibility. Shared participants
- * additionally use Linux OFD byte locks, independent of PIDs and released on
- * the last close of their owning file description. These are coordination
- * capabilities only: shared allocator admission and cross-process
- * projection/reader recovery require their own integration. Fork before open,
- * or exec before using a child. CLOEXEC belongs to the caller.
+ * Lifetime admission uses flock on Linux and a dedicated OFD byte on Darwin.
+ * Shared participants use OFD byte locks for coordination, independent of
+ * PIDs and released on the last close of their owning file description.
+ * Fork before open, or exec before using a child. CLOEXEC belongs to the
+ * caller.
  */
 int ps_coordination_open(int, const ps_coordination_options *,
                          ps_coordination **, lc_error *);

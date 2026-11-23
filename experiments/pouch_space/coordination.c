@@ -13,6 +13,9 @@
 #define FIXED (PS_COORDINATION_SYNC + 1U)
 #define BUCKETS 67U
 #define INITIALIZE_OFFSET 6U
+/* Darwin shares the advisory lock range between flock and OFD locks.
+ * Dedicate a byte outside the existing coordination ranges to admission. */
+#define LIFETIME_OFFSET 9U
 #define NS_BASE ((lc_u64)512)
 #define COLLECTION_SLOTS 512U
 #define COLLECTION_BASE (2U * PS_PAGE - 6U * COLLECTION_SLOTS)
@@ -56,6 +59,27 @@ static int fail(lc_error *e, int code, int reason, const char *message) {
 static int native_lock(void *context, int fd, int command, struct flock *lock) {
   (void)context;
   return fcntl(fd, command, lock);
+}
+static int lock_lifetime(int fd, int shared, int wait) {
+  int rc;
+#ifdef __APPLE__
+  struct flock lock = {0};
+  lock.l_type = shared ? F_RDLCK : F_WRLCK;
+  lock.l_whence = SEEK_SET;
+  lock.l_start = LIFETIME_OFFSET;
+  lock.l_len = 1;
+  do {
+    rc = native_lock(NULL, fd, wait ? F_OFD_SETLKW : F_OFD_SETLK, &lock);
+  } while (rc < 0 && errno == EINTR);
+#else
+  int mode = shared ? LOCK_SH : LOCK_EX;
+  if (!wait)
+    mode |= LOCK_NB;
+  do {
+    rc = flock(fd, mode);
+  } while (rc < 0 && errno == EINTR);
+#endif
+  return rc;
 }
 int ps_coordination_check(ps_coordination *owner, lc_error *e) {
   if (!owner)
@@ -212,16 +236,12 @@ int ps_coordination_open(int fd, const ps_coordination_options *options,
       break;
   }
   if (!rc) {
-    int mode = owner->shared ? LOCK_SH : LOCK_EX;
-    if (!options->wait_lifetime)
-      mode |= LOCK_NB;
-    do {
-      rc = flock(fd, mode);
-    } while (rc < 0 && errno == EINTR);
+    rc = lock_lifetime(fd, owner->shared, options->wait_lifetime);
     if (rc < 0)
       rc = fail(e,
-                errno == EAGAIN || errno == EWOULDBLOCK ? LC_ERR_PENDING
-                                                        : LC_ERR_TRANSPORT,
+                errno == EAGAIN || errno == EWOULDBLOCK || errno == EACCES
+                    ? LC_ERR_PENDING
+                    : LC_ERR_TRANSPORT,
                 errno, "container already open; another owner is active");
   } else
     rc = fail(e, LC_ERR_TRANSPORT, rc,

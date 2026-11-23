@@ -4,6 +4,7 @@
 #include "coordination.h"
 #include "lc_api_internal.h"
 #include "namespace_metadata.h"
+#include "space_internal.h"
 #include <dirent.h>
 #include <errno.h>
 #include <pthread.h>
@@ -17,15 +18,19 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static size_t checks, allocations, allocation_fail;
+static size_t checks;
+#ifdef __linux__
+static size_t allocations, allocation_fail;
 static int measuring;
 static size_t mutex_calls, mutex_fail;
 static int mutex_armed;
+#endif
 static char path[1400];
 #define REQUIRE(x) do { \
   __atomic_add_fetch(&checks, 1, __ATOMIC_RELAXED); \
   if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); abort(); } \
 } while (0)
+#ifdef __linux__
 static int allocation_fails(void) {
   return measuring && ++allocations == allocation_fail;
 }
@@ -52,6 +57,7 @@ int __wrap_pthread_mutex_init(pthread_mutex_t *mutex,
     return EAGAIN;
   return __real_pthread_mutex_init(mutex, attributes);
 }
+#endif
 static void ok(int rc, lc_error *e) {
   if (rc != LC_OK)
     fprintf(stderr, "coordination %d: %s\n", rc, e->message ? e->message : "");
@@ -65,7 +71,8 @@ static int file_open(void) {
 static void file_create(void) {
   REQUIRE(unlink(path) == 0 || errno == ENOENT);
   int fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
-  REQUIRE(fd >= 0 && fallocate(fd, 0, 0, PS_DEFAULT_CAPACITY) == 0);
+  REQUIRE(fd >= 0 &&
+          ps_native_io.reserve(NULL, fd, 0, PS_DEFAULT_CAPACITY) == 0);
   REQUIRE(close(fd) == 0);
 }
 static ps_coordination *owner_open(int shared, const ps_coordination_io *io,
@@ -101,11 +108,6 @@ static int guarded_fcntl(void *context, int fd, int command, struct flock *lock)
   }
   return fcntl(fd, command, lock);
 }
-static ssize_t storage_read(void *context, int fd, void *bytes, size_t n,
-                               off_t at) {
-  (void)context;
-  return pread(fd, bytes, n, at);
-}
 static ssize_t storage_write(void *context, int fd, const void *bytes, size_t n,
                                 off_t at) {
   int *reject = context;
@@ -113,15 +115,7 @@ static ssize_t storage_write(void *context, int fd, const void *bytes, size_t n,
     errno = EIO;
     return -1;
   }
-  return pwrite(fd, bytes, n, at);
-}
-static int storage_sync(void *context, int fd) {
-  (void)context;
-  return fdatasync(fd);
-}
-static int storage_reserve(void *context, int fd, off_t at, off_t n) {
-  (void)context;
-  return fallocate(fd, 0, at, n);
+  return ps_native_io.write(NULL, fd, bytes, n, at);
 }
 static void large_offsets(void) {
   lc_error e = {0};
@@ -151,14 +145,19 @@ static void lifecycle(void) {
   ok(ps_open(path, 1, NULL, &space, &e), &e);
   ps_coordination *owner = ps_space_coordination(space);
   ps_coordination_guard *guard = NULL, *busy = NULL;
+#ifdef __linux__
   allocations = 0;
   allocation_fail = 1;
   measuring = 1;
+#endif
   int rc =
       ps_coordination_lock(owner, PS_COORDINATION_ALLOCATION, 0, 0, &guard, &e);
+#ifdef __linux__
   measuring = 0;
+  REQUIRE(!allocations);
+#endif
   ok(rc, &e);
-  REQUIRE(!allocations && ps_coordination_users(owner) == 1);
+  REQUIRE(ps_coordination_users(owner) == 1);
   REQUIRE(ps_close(space, &e) == LC_ERR_INVALID);
   lc_error_cleanup(&e);
   REQUIRE(ps_open(path, 0, NULL, &other, &e) == LC_ERR_INVALID && !other);
@@ -286,8 +285,9 @@ static void lifecycle(void) {
   REQUIRE(status.capacity == PS_DEFAULT_CAPACITY);
   ok(ps_close(space, &e), &e);
   int reject = 0;
-  ps_io io = {&reject, storage_read, storage_write, storage_sync,
-               storage_reserve, NULL};
+  ps_io io = ps_native_io;
+  io.context = &reject;
+  io.write = storage_write;
   ps_options options = {0};
   options.io = &io;
   ok(ps_open(path, 0, &options, &space, &e), &e);
@@ -637,6 +637,7 @@ static void faults(void) {
   file_create();
   lc_error e;
   lc_error_init(&e);
+#ifdef __linux__
   size_t sites = 0;
   for (size_t cut = 0; cut <= sites; ++cut) {
     int fd = file_open();
@@ -703,6 +704,7 @@ static void faults(void) {
       }
     }
   REQUIRE(mutex_sites > 4);
+#endif
   for (int reason_index = 0; reason_index < 4; ++reason_index) {
     static const int reasons[] = {EINTR, EAGAIN, EACCES, EIO};
     syscall_fault fault = {0, 1, reasons[reason_index]};
@@ -758,15 +760,20 @@ static void faults(void) {
   /* Exclusive guards must never call the shared-mode syscall seam. */
   fault = (syscall_fault){0, 1, EIO};
   a = owner_open(0, &io, &e);
+#ifdef __linux__
   allocations = 0;
   allocation_fail = 1;
   measuring = 1;
+#endif
   int rc =
       ps_coordination_lock(a, PS_COORDINATION_ALLOCATION, 0, 0, &guard, &e);
   ps_coordination_unlock(guard);
+#ifdef __linux__
   measuring = 0;
+  REQUIRE(!allocations);
+#endif
   ok(rc, &e);
-  REQUIRE(!allocations && !fault.calls);
+  REQUIRE(!fault.calls);
   ok(ps_coordination_lock(a, PS_COORDINATION_TRANSACTION, 0, 0, &guard, &e),
      &e);
   ps_coordination_unlock(guard);

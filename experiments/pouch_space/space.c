@@ -227,6 +227,14 @@ static int native_zero(void *c, int fd, off_t o, off_t n) {
   return fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, o, n);
 }
 #endif
+const ps_io ps_native_io = {
+    NULL, native_read, native_write, native_sync, native_reserve,
+#ifdef __APPLE__
+    NULL,
+#else
+    native_zero,
+#endif
+};
 static int sync_file_if(ps_space *, int recovery_only, lc_error *);
 static void mark_durable(ps_space *, uint64_t sequence);
 static int settle_recovery(ps_space *s, lc_error *error) {
@@ -7264,13 +7272,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
                "cannot initialize durability coordination");
   }
   s->locks_initialized = 4;
-  s->io.read = native_read;
-  s->io.write = native_write;
-  s->io.sync = native_sync;
-  s->io.reserve = native_reserve;
-#ifndef __APPLE__
-  s->io.zero = native_zero;
-#endif
+  s->io = ps_native_io;
   if (options->io) {
     s->io = *options->io;
     if (!s->io.read || !s->io.write || !s->io.sync || !s->io.reserve) {
@@ -9229,6 +9231,7 @@ static ps_run *metadata_ungrow(ps_space *s, uint64_t capacity, ps_run *spare) {
 int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   uint64_t capacity;
   ps_run *run, *rollback, *trim;
+  ps_coordination_guard *guard;
   int rc;
   if (!s || !bytes || bytes % PS_MIB)
     return err(error, LC_ERR_INVALID,
@@ -9249,8 +9252,10 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
                "cannot allocate growth rollback trim interval");
   }
   pthread_mutex_lock(&s->mutex);
+  /* Refresh capacity before expanding the file. Holding allocator authority
+   * through selection keeps peer growth from racing reserve or checkpoint. */
+  rc = ps_internal_admission_begin(s, &guard, error);
   capacity = s->capacity;
-  rc = healthy(s, error);
   if (rc == LC_OK && (bytes > PS_MAX_CAPACITY - capacity ||
                       (s->maximum && bytes > s->maximum - capacity)))
     rc =
@@ -9289,6 +9294,7 @@ int ps_grow(ps_space *s, uint64_t bytes, lc_error *error) {
   lc_free_with_allocator(NULL, run);
   lc_free_with_allocator(NULL, rollback);
   lc_free_with_allocator(NULL, trim);
+  rc = ps_internal_capture_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

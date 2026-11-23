@@ -6,6 +6,8 @@
 #include "lc_pouch_internal.h"
 #include "pouch.h"
 #include "readiness.h"
+#include "space_internal.h"
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,12 +39,40 @@ static ps_space *open_shared(const char *path, int create) {
   return space;
 }
 
-static void publish(ps_space *space, const char *bytes) {
+static void produce(ps_space *space, const char *body) {
   ps_writer *writer = NULL;
   OK(ps_begin(space, NULL, key, &writer, &error));
-  OK(ps_write(writer, bytes, strlen(bytes), &error));
+  OK(ps_write(writer, body, strlen(body), &error));
   OK(ps_publish(writer, NULL, &error));
   ps_writer_close(writer);
+}
+
+static void prepare_unpublished(ps_space *space) {
+  static const unsigned char chunk[2048] = {1};
+  ps_writer *writer = NULL;
+  OK(ps_begin(space, NULL, key, &writer, &error));
+  for (size_t at = 0; at < 3U * PS_CHUNK; at += sizeof(chunk))
+    OK(ps_write(writer, chunk, sizeof(chunk), &error));
+}
+
+static void kill_publisher(const char *self, const char *path,
+                           const char *mode) {
+  char ack_fd[32], ack;
+  int pipefd[2], status;
+  REQUIRE(!pipe(pipefd));
+  REQUIRE(snprintf(ack_fd, sizeof(ack_fd), "%d", pipefd[1]) <
+          (int)sizeof(ack_fd));
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    (void)close(pipefd[0]);
+    execl(self, self, path, mode, ack_fd, (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(!close(pipefd[1]) && read(pipefd[0], &ack, 1) == 1 && ack == '1');
+  REQUIRE(!close(pipefd[0]) && !kill(child, SIGKILL) &&
+          waitpid(child, &status, 0) == child && WIFSIGNALED(status) &&
+          WTERMSIG(status) == SIGKILL);
 }
 
 static void expect(ps_reader *reader, const char *expected) {
@@ -65,6 +95,46 @@ static void check_capacity(const char *path, uint64_t expected) {
   struct stat status;
   REQUIRE(!stat(path, &status) && (uint64_t)status.st_size == expected &&
           (uint64_t)status.st_blocks >= expected / 512U);
+}
+
+typedef struct growth_failure {
+  ps_coordination *peer;
+  unsigned int reserve_calls;
+} growth_failure;
+
+static int reject_growth(void *context, int fd, off_t offset, off_t length) {
+  growth_failure *failure = context;
+  ps_coordination_guard *guard = NULL;
+  (void)fd;
+  REQUIRE(offset == (off_t)PS_DEFAULT_CAPACITY && length == (off_t)PS_MIB);
+  REQUIRE(ps_coordination_lock(failure->peer, PS_COORDINATION_ALLOCATION, 0, 0,
+                               &guard, NULL) == LC_ERR_PENDING &&
+          !guard);
+  ++failure->reserve_calls;
+  errno = ENOSPC;
+  return -1;
+}
+
+static void check_failed_growth(const char *path) {
+  ps_space *peer = open_shared(path, 0);
+  growth_failure failure = {ps_space_coordination(peer), 0};
+  ps_io io = ps_native_io;
+  ps_options options = {0};
+  ps_space *space = NULL;
+  options.shared = 1;
+  options.durable_sync = 1;
+  options.io = &io;
+  io.context = &failure;
+  io.reserve = reject_growth;
+  OK(ps_open(path, 0, &options, &space, &error));
+  REQUIRE(ps_grow(space, PS_MIB, &error) == LC_ERR_TRANSPORT &&
+          failure.reserve_calls == 1);
+  lc_error_cleanup(&error);
+  lc_error_init(&error);
+  OK(ps_close(space, &error));
+  expect_current(peer, "durable successor");
+  OK(ps_close(peer, &error));
+  check_capacity(path, PS_DEFAULT_CAPACITY);
 }
 
 static uint64_t monotonic_ns(void) {
@@ -237,9 +307,13 @@ static void queue_round_trip(const char *path) {
 
 int main(int argc, char **argv) {
   lc_error_init(&error);
-  if (argc == 4 && !strcmp(argv[2], "--publish")) {
+  if (argc == 4 &&
+      (!strcmp(argv[2], "--prepare") || !strcmp(argv[2], "--publish"))) {
     ps_space *space = open_shared(argv[1], 0);
-    publish(space, "durable successor");
+    if (!strcmp(argv[2], "--prepare"))
+      prepare_unpublished(space);
+    else
+      produce(space, "durable successor");
     REQUIRE(write(atoi(argv[3]), "1", 1) == 1);
     for (;;)
       pause();
@@ -252,7 +326,7 @@ int main(int argc, char **argv) {
   }
   if (argc != 2)
     return 2;
-  char directory[1024], path[1100], ack_fd[32], ack;
+  char directory[1024], path[1100];
   REQUIRE(snprintf(directory, sizeof(directory), "%s/pouch-platform-XXXXXX",
                    argv[1]) < (int)sizeof(directory));
   REQUIRE(mkdtemp(directory));
@@ -267,41 +341,34 @@ int main(int argc, char **argv) {
   ps_readiness_sync_wake(space);
   REQUIRE(ps_readiness_sync_observe(space) != observed &&
           ps_readiness_sync_wait(space, observed));
-  publish(space, "checkpointed predecessor");
+  produce(space, "checkpointed predecessor");
   OK(ps_checkpoint(space, &error));
   ps_reader *held = NULL;
   OK(ps_read_open(space, key, NULL, &held, &error));
 
-  int pipefd[2], status;
-  REQUIRE(pipe(pipefd) == 0);
-  REQUIRE(snprintf(ack_fd, sizeof(ack_fd), "%d", pipefd[1]) <
-          (int)sizeof(ack_fd));
-  pid_t child = fork();
-  REQUIRE(child >= 0);
-  if (!child) {
-    (void)close(pipefd[0]);
-    execl(argv[0], argv[0], path, "--publish", ack_fd, (char *)NULL);
-    _exit(127);
-  }
-  REQUIRE(!close(pipefd[1]) && read(pipefd[0], &ack, 1) == 1 && ack == '1');
-  REQUIRE(!close(pipefd[0]) && !kill(child, SIGKILL) &&
-          waitpid(child, &status, 0) == child && WIFSIGNALED(status) &&
-          WTERMSIG(status) == SIGKILL);
-
+  kill_publisher(argv[0], path, "--publish");
   OK(ps_refresh(space, &error));
   expect_current(space, "durable successor");
   expect(held, "checkpointed predecessor");
   ps_reader_close(held);
   OK(ps_close(space, &error));
+
+  /* The child is the last owner. Reopen must discard its private payload. */
+  kill_publisher(argv[0], path, "--prepare");
+  check_failed_growth(path);
   space = open_shared(path, 0);
   expect_current(space, "durable successor");
+  ps_space *stale = open_shared(path, 0);
   OK(ps_grow(space, PS_MIB, &error));
   check_capacity(path, PS_DEFAULT_CAPACITY + PS_MIB);
+  OK(ps_grow(stale, PS_MIB, &error));
+  check_capacity(path, PS_DEFAULT_CAPACITY + 2U * PS_MIB);
+  OK(ps_close(stale, &error));
   OK(ps_close(space, &error));
 
   space = open_shared(path, 0);
   expect_current(space, "durable successor");
-  check_capacity(path, PS_DEFAULT_CAPACITY + PS_MIB);
+  check_capacity(path, PS_DEFAULT_CAPACITY + 2U * PS_MIB);
   OK(ps_close(space, &error));
   REQUIRE(!unlink(path));
   collection_round_trip(path, 1);

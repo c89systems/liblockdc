@@ -68,6 +68,8 @@ Reclamation waits for durable retirement and release of outstanding physical
 ownership. OFD range locks retain reader extents and private writer
 workspace across independent opens. Shared admission validates its view against
 the selected root and accepted journal bounds before installing it.
+Darwin uses a dedicated OFD byte for lifetime admission. Growth refreshes
+capacity and holds allocator authority through preallocation and root selection.
 A NoSync join of a fully certified live root inherits its durability watermark
 when structural publications are already durable. Records that require a
 durability barrier keep their preceding visible values until it completes.
@@ -87,11 +89,18 @@ durable and NoSync recovery, fixed-capacity reclamation, explicit growth, and
 transaction completion. Use the applicable Pouch Space CTest groups and the
 [lifecycle comparison](../experiments/pouch_space/lifecycle_compare.c).
 On Linux, the `pouch_space_smoke` target builds all executables selected by
-the `pouch-space` CTest label. On Apple Silicon it builds
-`pouch_space_platform_test`, which checks process-death recovery, retained
-reader data, physical growth, wait timeouts, lease fencing, and whether durable
-collection retries and queue acknowledgements survive cold reopen. Pass the
-probe a writable directory on an APFS volume.
+the `pouch-space` CTest label. On Apple Silicon it builds the platform and
+coordination executables. The platform probe checks owner death before and
+after publication, retained reads, growth from independently opened owners,
+lease fencing, and durable queue and collection behavior. The coordination
+suite checks lock lifetimes, large offsets, concurrent threads and processes,
+and injected I/O and lock failures.
+
+The cross-built binaries can run directly on Apple Silicon. Pass the platform
+probe a writable directory on APFS. Pass the coordination executable the same
+directory and one of `lifecycle`, `root-lifetime`, `large-offsets`, `threads`,
+`faults`, or `processes`. Native APFS verification also needs to establish how
+filesystem headroom affects maintenance after in-container space runs out.
 
 The lifecycle comparison's `--parallel-joins` option measures a cohort
 starting together after first-owner recovery. It reports elapsed time,
