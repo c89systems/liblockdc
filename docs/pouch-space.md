@@ -89,8 +89,9 @@ transaction completion. Use the applicable Pouch Space CTest groups and the
 On Linux, the `pouch_space_smoke` target builds all executables selected by
 the `pouch-space` CTest label. On Apple Silicon it builds
 `pouch_space_platform_test`, which checks process-death recovery, retained
-reader data, physical growth, and a durable collection retry after cold reopen.
-Pass the probe a writable directory on an APFS volume.
+reader data, physical growth, wait timeouts, lease fencing, and whether durable
+collection retries and queue acknowledgements survive cold reopen. Pass the
+probe a writable directory on an APFS volume.
 
 The lifecycle comparison's `--parallel-joins` option measures a cohort
 starting together after first-owner recovery. It reports elapsed time,
