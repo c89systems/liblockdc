@@ -112,10 +112,14 @@ struct ps_owned_head {
   ps_space *space;
   ps_entry *entry;
 };
+typedef struct ps_owned_run_batch {
+  size_t remaining;
+} ps_owned_run_batch;
 struct ps_owned_run {
   ps_space *space;
   ps_entry *entry;
   size_t references;
+  ps_owned_run_batch *batch;
 };
 
 static uint32_t checksum(const void *p, size_t n) {
@@ -4477,9 +4481,12 @@ typedef struct metadata_read_page {
   unsigned char bytes[PS_PAGE];
 } metadata_read_page;
 typedef struct metadata_directory_entry {
+  ps_entry *decoded;
+  /* Inline bindings go straight into their resident entry slots. Only
+   * deferred descriptor reads need a copy of the directory reference. */
   ps_key key;
-  ps_directory_value value;
-  ps_entry *resident, *decoded;
+  ps_descriptor_ref ref;
+  ps_entry *resident;
 } metadata_directory_entry;
 typedef struct projection_packed_binding {
   ps_key key;
@@ -4502,7 +4509,7 @@ typedef struct metadata_recovery {
   metadata_read_page *slots[META_READ_PAGES], *buckets[META_READ_PAGES];
   size_t next_slot, batch;
   metadata_directory_entry *entries;
-  size_t count, capacity;
+  size_t count, capacity, deferred;
   projection_packed_binding *packed;
   size_t packed_count;
   checkpoint_slab open_slab;
@@ -4595,10 +4602,8 @@ static int metadata_read_cache_page(metadata_recovery *r, uint64_t offset,
   return LC_OK;
 }
 static int metadata_physical_order(const void *a, const void *b) {
-  uint64_t left =
-      (*(metadata_directory_entry *const *)a)->value.extent.ref.offset;
-  uint64_t right =
-      (*(metadata_directory_entry *const *)b)->value.extent.ref.offset;
+  uint64_t left = (*(metadata_directory_entry *const *)a)->ref.offset;
+  uint64_t right = (*(metadata_directory_entry *const *)b)->ref.offset;
   return left < right ? -1 : left != right;
 }
 static int metadata_read_ahead(metadata_recovery *r,
@@ -4611,7 +4616,7 @@ static int metadata_read_ahead(metadata_recovery *r,
   int rc = LC_OK;
   ++r->batch;
   for (i = 0; i < n; ++i) {
-    offset = entries[i]->value.extent.ref.offset / PS_PAGE * PS_PAGE;
+    offset = entries[i]->ref.offset / PS_PAGE * PS_PAGE;
     if (count && offset == offsets[count - 1])
       continue;
     if (!metadata_offset(r->space, offset))
@@ -4746,7 +4751,7 @@ static int reuse_directory_entry(metadata_recovery *r,
                                  metadata_directory_entry *item,
                                  lc_error *error) {
   const ps_entry *old = item->resident;
-  ps_descriptor_ref ref = item->value.extent.ref;
+  ps_descriptor_ref ref = item->ref;
   uint64_t offset = ref.offset / PS_PAGE * PS_PAGE, generation = 0;
   size_t at = (size_t)(ref.offset % PS_PAGE), remaining = (size_t)ref.bytes;
   ps_entry *p;
@@ -4792,7 +4797,7 @@ static int decode_directory_entry(metadata_recovery *recovery,
                                   metadata_directory_entry *item,
                                   lc_error *error) {
   ps_space *s = recovery->space;
-  ps_descriptor_ref ref = item->value.extent.ref;
+  ps_descriptor_ref ref = item->ref;
   const unsigned char *wire = NULL;
   ps_entry *p = NULL;
   ps_entry *old =
@@ -4850,34 +4855,34 @@ static void unpack_binding(ps_entry *p, ps_key key,
                             ? EXTENT_OWNED
                             : EXTENT_PACKED;
 }
-static int load_owned_binding(metadata_recovery *recovery,
-                              metadata_directory_entry *item, lc_error *error) {
+static int load_owned_binding(metadata_recovery *recovery, ps_key key,
+                              const ps_directory_value *value, ps_entry **out,
+                              lc_error *error) {
   ps_space *s = recovery->space;
-  const ps_descriptor_ref *ref = &item->value.extent.ref;
+  const ps_descriptor_ref *ref = &value->extent.ref;
   ps_entry *p,
-      *old = recovery->resident ? lookup(recovery->resident, item->key) : NULL;
+      *old = recovery->resident ? lookup(recovery->resident, key) : NULL;
   /* The directory checked the alignment and extent size. A plain run's
    * capacity is its extent minus the immutable identity and footer area. */
   if (!directory_extent_in_bounds(s, ref) || ref->bytes <= PS_RUN_HEADER ||
-      item->key.key > (uint64_t)INT64_MAX - (ref->bytes - PS_RUN_HEADER))
+      key.key > (uint64_t)INT64_MAX - (ref->bytes - PS_RUN_HEADER))
     return err(error, LC_ERR_PROTOCOL, "invalid inline owned run extent");
   if (old && old->token != ref->incarnation)
     old = NULL;
   p = entry_slab_take(s, PS_OWNED_RUN, old != NULL, 1);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover inline owned run");
-  unpack_binding(p, item->key, &item->value);
+  unpack_binding(p, key, value);
   p->stream->capacity = ref->bytes - PS_RUN_HEADER;
   p->projection = old;
-  item->decoded = p;
+  *out = p;
   return LC_OK;
 }
-static int load_stream_binding(metadata_recovery *r,
-                               metadata_directory_entry *item,
-                               lc_error *error) {
-  const ps_directory_stream *stream = &item->value.stream;
+static int load_stream_binding(metadata_recovery *r, ps_key key,
+                               const ps_directory_stream *stream,
+                               ps_entry **out, lc_error *error) {
   ps_space *s = r->space;
-  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
+  ps_entry *p, *old = r->resident ? lookup(r->resident, key) : NULL;
   if (stream->incarnation > s->token_limit ||
       stream->admitted_at > s->sequence ||
       !valid_stream_span(stream->tail, stream->capacity, stream->runs))
@@ -4887,35 +4892,34 @@ static int load_stream_binding(metadata_recovery *r,
   p = entry_slab_take(s, PS_STREAM, old != NULL, 1);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover inline stream head");
-  p->key = item->key;
+  p->key = key;
   p->token = stream->incarnation;
   p->bytes = stream->tail;
   p->stream->capacity = stream->capacity;
   p->stream->runs = stream->runs;
-  p->stream->sealed = item->value.tag.storage == PS_DIRECTORY_SEALED_STREAM;
+  p->stream->sealed = stream->storage == PS_DIRECTORY_SEALED_STREAM;
   p->stream->admitted =
       r->certified_root && stream->admitted_at > r->cohort_origin;
   p->projection = old;
-  item->decoded = p;
+  *out = p;
   return LC_OK;
 }
-static int load_namespace_binding(metadata_recovery *r,
-                                  metadata_directory_entry *item,
+static int load_namespace_binding(metadata_recovery *r, ps_key key,
+                                  const ps_directory_name *name, ps_entry **out,
                                   lc_error *error) {
-  const ps_directory_name *name = &item->value.name;
   ps_space *s = r->space;
-  ps_entry *p, *old = r->resident ? lookup(r->resident, item->key) : NULL;
-  if (item->key.key > s->token_limit)
+  ps_entry *p, *old = r->resident ? lookup(r->resident, key) : NULL;
+  if (key.key > s->token_limit)
     return err(error, LC_ERR_PROTOCOL, "invalid inline namespace identity");
-  if (old && old->token != item->key.key)
+  if (old && old->token != key.key)
     old = NULL;
   p = space_entry_new(s, PS_CATALOG, 0, old != NULL);
   if (!p)
     return err(error, LC_ERR_NOMEM, "cannot recover inline namespace");
-  p->key = item->key;
-  p->token = item->key.key;
+  p->key = key;
+  p->token = key.key;
   p->projection = old;
-  item->decoded = p;
+  *out = p;
   return ps_catalog_decode_namespace(p, name->bytes, name->length, error);
 }
 static int register_packed_binding(ps_space *s, ps_entry *p,
@@ -5083,21 +5087,18 @@ static int recover_directory_bindings(metadata_recovery *r, lc_error *error) {
       key_index_add_distinct(&s->keys, p, key_hash(p->key));
   if (batch.block && batch.next < ENTRY_SLAB_SLOTS)
     entry_available_link(batch.block);
-  if (!r->count)
-    return LC_OK;
-  fetch = lc_alloc_with_allocator(NULL, r->count * sizeof(*fetch));
-  if (!fetch)
-    return err(error, LC_ERR_NOMEM, "cannot order checkpoint descriptor reads");
+  fetch = NULL;
+  if (r->deferred) {
+    fetch = lc_alloc_with_allocator(NULL, r->deferred * sizeof(*fetch));
+    if (!fetch)
+      return err(error, LC_ERR_NOMEM,
+                 "cannot order checkpoint descriptor reads");
+  }
   for (i = 0; rc == LC_OK && i < r->count; ++i) {
     metadata_directory_entry *item = &r->entries[i];
-    if (item->value.tag.storage == PS_DIRECTORY_OWNED_RUN)
-      rc = load_owned_binding(r, item, error);
-    else if (item->value.tag.storage == PS_DIRECTORY_STREAM ||
-             item->value.tag.storage == PS_DIRECTORY_SEALED_STREAM)
-      rc = load_stream_binding(r, item, error);
-    else if (item->value.tag.storage == PS_DIRECTORY_NAMESPACE)
-      rc = load_namespace_binding(r, item, error);
-    else if (item->resident)
+    if (item->decoded)
+      continue;
+    if (item->resident)
       rc = reuse_directory_entry(r, item, error);
     else
       fetch[count++] = item;
@@ -5171,10 +5172,22 @@ static int capture_directory_entry(void *v, ps_key key,
     }
   }
   item = &r->entries[r->count++];
-  item->key = key;
-  item->value = *value;
-  item->resident = old;
   item->decoded = NULL;
+  switch (value->tag.storage) {
+  case PS_DIRECTORY_OWNED_RUN:
+    return load_owned_binding(r, key, value, &item->decoded, error);
+  case PS_DIRECTORY_STREAM:
+  case PS_DIRECTORY_SEALED_STREAM:
+    return load_stream_binding(r, key, &value->stream, &item->decoded, error);
+  case PS_DIRECTORY_NAMESPACE:
+    return load_namespace_binding(r, key, &value->name, &item->decoded, error);
+  default:
+    break; /* Indirect descriptors are fetched in physical page order. */
+  }
+  item->key = key;
+  item->ref = value->extent.ref;
+  item->resident = old;
+  r->deferred += old == NULL;
   return LC_OK;
 }
 static int revision_retirement_matches(const ps_entry *entry,
@@ -10118,23 +10131,32 @@ uint64_t ps_owned_run_capacity(const ps_owned_run *run) {
 uint64_t ps_owned_run_base(const ps_owned_run *run) {
   return run ? run->entry->key.key : 0;
 }
-void ps_owned_runs_discard_locked(ps_owned_run **items, size_t count) {
+static void owned_run_free_locked(ps_owned_run *run) {
+  ps_owned_run_batch *batch = run->batch;
+  if (!batch)
+    lc_free_with_allocator(NULL, run);
+  else if (!--batch->remaining)
+    lc_free_with_allocator(NULL, batch);
+}
+void ps_owned_runs_discard_locked(ps_owned_mapping *items, size_t count) {
   while (count) {
-    ps_owned_run *run = items[--count];
+    ps_owned_run *run = items[--count].handle;
     ps_internal_entry_unpin(run->space, run->entry);
     --run->space->readers;
-    lc_free_with_allocator(NULL, run);
+    owned_run_free_locked(run);
   }
   lc_free_with_allocator(NULL, items);
 }
 static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
                            const ps_ref *ref, uint64_t start, uint64_t end,
                            int provisional, ps_owned_status *status,
-                           ps_owned_run ***out, size_t *count,
+                           ps_owned_mapping **out, size_t *count,
                            lc_error *error) {
   ps_entry *p, *first = NULL, *limit = NULL;
-  ps_owned_run **items = NULL;
+  ps_owned_mapping *items = NULL;
+  ps_owned_run_batch *batch = NULL;
   size_t n = 0, capacity = 0;
+  size_t in_batch = 0, batch_size = 0;
   int rc = LC_OK;
   if (out)
     *out = NULL;
@@ -10187,31 +10209,46 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
       ++capacity;
   }
   if (rc == LC_OK && capacity) {
-    items = lc_calloc_with_allocator(NULL, capacity, sizeof(*items));
+    items = lc_alloc_with_allocator(NULL, capacity * sizeof(*items));
     if (!items)
       rc = err(error, LC_ERR_NOMEM, "cannot allocate mapping capture");
   }
   for (p = first; rc == LC_OK && p != limit; p = p->stream->owned_next) {
+    ps_owned_run *run;
     if (n == capacity) {
       rc = err(error, LC_ERR_PROTOCOL, "mapping count exceeds its head");
       break;
     }
-    items[n] = lc_calloc_with_allocator(NULL, 1, sizeof(**items));
-    if (!items[n]) {
-      rc = err(error, LC_ERR_NOMEM, "cannot capture mapping handle");
-      break;
+    if (in_batch == batch_size) {
+      /* Retaining an individual handle should retain only a small batch. */
+      batch_size = capacity - n;
+      if (batch_size > ENTRY_SLAB_SLOTS)
+        batch_size = ENTRY_SLAB_SLOTS;
+      batch = lc_alloc_with_allocator(NULL, sizeof(*batch) +
+                                                batch_size * sizeof(*run));
+      if (!batch) {
+        rc = err(error, LC_ERR_NOMEM, "cannot capture mapping handles");
+        break;
+      }
+      batch->remaining = 0;
+      in_batch = 0;
     }
     rc = entry_pin(s, p, provisional, error);
-    if (rc != LC_OK) {
-      lc_free_with_allocator(NULL, items[n]);
+    if (rc != LC_OK)
       break;
-    }
-    items[n]->space = s;
-    items[n]->entry = p;
-    items[n]->references = 1;
+    run = (ps_owned_run *)(batch + 1) + in_batch++;
+    run->space = s;
+    run->entry = p;
+    run->references = 1;
+    run->batch = batch;
+    ++batch->remaining;
     ++s->readers;
-    ++n;
+    items[n].handle = run;
+    items[n].base = p->key.key;
+    items[n++].capacity = p->stream->capacity;
   }
+  if (batch && !batch->remaining)
+    lc_free_with_allocator(NULL, batch);
   if (rc == LC_OK && n != capacity)
     rc = err(error, LC_ERR_PROTOCOL, "mapping count differs from its head");
   if (rc == LC_OK) {
@@ -10223,18 +10260,20 @@ static int pin_runs_locked(ps_space *s, ps_entry *head, ps_key key,
 }
 int ps_owned_runs_pin_range(ps_space *s, ps_key key, const ps_ref *ref,
                             uint64_t start, uint64_t end, int provisional,
-                            ps_owned_run ***out, size_t *count, lc_error *e) {
+                            ps_owned_mapping **out, size_t *count,
+                            lc_error *e) {
   return pin_runs_locked(s, NULL, key, ref, start, end, provisional, NULL, out,
                          count, e);
 }
-int ps_owned_runs_verify(ps_owned_run *const *items, size_t count,
+int ps_owned_runs_verify(const ps_owned_mapping *items, size_t count,
                          ps_owned_footer *footers, lc_error *error) {
   size_t i;
   int rc = LC_OK;
   for (i = 0; rc == LC_OK && i < count; ++i) {
     unsigned char header[PS_RUN_HEADER];
-    ps_entry *p = items[i]->entry;
-    ps_space *s = items[i]->space;
+    ps_owned_run *run = items[i].handle;
+    ps_entry *p = run->entry;
+    ps_space *s = run->space;
     if (footers && !p->stream->mapped) {
       rc = transfer(s, header, sizeof(header), p->extents[0].offset, 0, error);
       if (rc == LC_OK)
@@ -10249,13 +10288,13 @@ int ps_owned_runs_verify(ps_owned_run *const *items, size_t count,
 }
 static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
                         const ps_ref *ref, uint64_t start, uint64_t end,
-                        ps_owned_status *status, ps_owned_run ***out,
+                        ps_owned_status *status, ps_owned_mapping **out,
                         size_t *count, ps_owned_footer **footers,
                         lc_error *error) {
   ps_coordination_guard *guard;
-  ps_owned_run **items = NULL;
+  ps_owned_mapping *items = NULL;
   ps_owned_footer *captured = NULL;
-  size_t n = 0, i;
+  size_t n = 0;
   int rc;
   if (out)
     *out = NULL;
@@ -10288,25 +10327,23 @@ static int capture_runs(ps_space *s, ps_entry *head, ps_key key,
     if (footers)
       *footers = captured;
   } else {
-    for (i = 0; i < n; ++i)
-      ps_owned_run_close(items[i]);
-    lc_free_with_allocator(NULL, items);
+    ps_owned_runs_close(items, n);
     lc_free_with_allocator(NULL, captured);
   }
   return rc;
 }
-int ps_owned_runs_capture(ps_owned_head *head, ps_owned_run ***out,
+int ps_owned_runs_capture(ps_owned_head *head, ps_owned_mapping **out,
                           size_t *count, lc_error *error) {
   return ps_owned_runs_capture_status(head, NULL, out, count, error);
 }
 int ps_owned_runs_capture_status(ps_owned_head *head, ps_owned_status *status,
-                                 ps_owned_run ***out, size_t *count,
+                                 ps_owned_mapping **out, size_t *count,
                                  lc_error *error) {
   const ps_key none = {0};
   return capture_runs(head ? head->space : NULL, head ? head->entry : NULL,
                       none, NULL, 0, 0, status, out, count, NULL, error);
 }
-int ps_owned_runs_capture_initial(ps_owned_head *head, ps_owned_run ***out,
+int ps_owned_runs_capture_initial(ps_owned_head *head, ps_owned_mapping **out,
                                   size_t *count, ps_owned_footer **footers,
                                   lc_error *error) {
   const ps_key none = {0};
@@ -10314,18 +10351,18 @@ int ps_owned_runs_capture_initial(ps_owned_head *head, ps_owned_run ***out,
                       none, NULL, 0, 0, NULL, out, count, footers, error);
 }
 int ps_owned_runs_key_status(ps_space *s, ps_key key, const ps_ref *ref,
-                             ps_owned_status *status, ps_owned_run ***out,
+                             ps_owned_status *status, ps_owned_mapping **out,
                              size_t *count, lc_error *error) {
   return capture_runs(s, NULL, key, ref, 0, 0, status, out, count, NULL, error);
 }
 int ps_owned_runs_range(ps_space *s, ps_key key, const ps_ref *ref,
-                        uint64_t start, uint64_t end, ps_owned_run ***out,
+                        uint64_t start, uint64_t end, ps_owned_mapping **out,
                         size_t *count, lc_error *error) {
   return capture_runs(s, NULL, key, ref, start, end, NULL, out, count, NULL,
                       error);
 }
 int ps_owned_runs_edit_range(ps_owned_head *head, uint64_t start, uint64_t end,
-                             ps_owned_run ***out, size_t *count,
+                             ps_owned_mapping **out, size_t *count,
                              lc_error *error) {
   const ps_key none = {0};
   return capture_runs(head->space, head->entry, none, NULL, start, end, NULL,
@@ -10350,8 +10387,14 @@ void ps_owned_run_close(ps_owned_run *run) {
   --s->readers;
   if (run->entry->state == 2 && run->entry->safe && !run->entry->pins)
     collect_retired(s);
+  owned_run_free_locked(run);
   pthread_mutex_unlock(&s->mutex);
-  lc_free_with_allocator(NULL, run);
+}
+void ps_owned_runs_close(ps_owned_mapping *items, size_t count) {
+  size_t i;
+  for (i = 0; i < count; ++i)
+    ps_owned_run_close(items[i].handle);
+  lc_free_with_allocator(NULL, items);
 }
 static int owned_io(ps_owned_run *run, uint64_t offset, void *bytes, size_t n,
                     int writing, lc_error *error) {

@@ -1790,7 +1790,8 @@ static void capture_owned(void) {
   lc_error e = {0};
   ps_space *a = NULL, *b = NULL;
   ps_owned_head *head = NULL;
-  ps_owned_run *original = NULL, *mapped = NULL, *again = NULL, **list = NULL;
+  ps_owned_run *original = NULL, *mapped = NULL, *again = NULL;
+  ps_owned_mapping *list = NULL;
   ps_key stream = {88, 1, PS_STREAM};
   ps_owned_status info;
   capture_fault f = {1, EAGAIN, 0, 0, 1, 0};
@@ -1859,7 +1860,7 @@ static void capture_owned(void) {
   ps_owned_run_close(mapped);
   ps_owned_run_close(again);
   REQUIRE(status(a).retained_payload_bytes == held);
-  ps_owned_run_close(list[0]);
+  ps_owned_run_close(list[0].handle);
   lc_free_with_allocator(NULL, list);
   REQUIRE(status(a).retained_payload_bytes == PS_PAGE);
   ps_owned_run_close(original);
@@ -1871,6 +1872,65 @@ static void capture_owned(void) {
   ok(ps_close(b, &e), &e);
   REQUIRE(!coverage(NULL, 0) && unlink(path) == 0);
   free(scratch);
+}
+static void capture_owned_batches(void) {
+  enum { runs = 34 };
+  lc_error e = {0};
+  ps_space *s = NULL;
+  ps_owned_head *head = NULL;
+  ps_owned_mapping *list = NULL;
+  ps_owned_run *run = NULL, *first, *last;
+  ps_key stream = {88, 1, PS_STREAM};
+  ps_owned_status info;
+  capture_fault f = {1, EAGAIN, 0, 0, 0, 0};
+  ps_coordination_io io = {&f, capture_lock};
+  ps_options options = {0};
+  const uint64_t span = PS_PAGE - PS_RUN_HEADER;
+  const size_t failed_pins[] = {2, runs};
+  size_t count;
+  int found;
+  unsigned char byte;
+
+  options.coordination_io = &io;
+  ok(ps_open(path, 1, &options, &s, &e), &e);
+  ok(ps_owned_open(s, NULL, stream, 1, NULL, &head, &info, &e), &e);
+  for (size_t i = 0; i < runs; ++i) {
+    ok(ps_owned_grant(head, NULL, i * span, PS_PAGE, &run, &found, &e), &e);
+    REQUIRE(found);
+    byte = (unsigned char)(i + 1);
+    ok(ps_owned_write(run, 0, &byte, 1, &e), &e);
+    ps_owned_run_close(run);
+  }
+  for (size_t i = 0; i < sizeof(failed_pins) / sizeof(*failed_pins); ++i) {
+    f.nth = failed_pins[i];
+    f.calls = 0;
+    f.armed = 1;
+    REQUIRE(ps_owned_runs_capture(head, &list, &count, &e) == LC_ERR_PENDING &&
+            f.calls == f.nth && !list && !count);
+    lc_error_cleanup(&e);
+    f.armed = 0;
+    REQUIRE(!status(s).retained_payload_bytes);
+  }
+  ok(ps_owned_runs_capture(head, &list, &count, &e), &e);
+  REQUIRE(count == runs && status(s).retained_payload_bytes == runs * PS_PAGE);
+  for (size_t i = 0; i < count; ++i)
+    REQUIRE(list[i].base == i * span && list[i].capacity == span);
+  first = list[0].handle;
+  last = list[count - 1].handle;
+  ps_owned_run_retain(first);
+  ps_owned_run_retain(last);
+  ps_owned_runs_close(list, count);
+  REQUIRE(status(s).retained_payload_bytes == 2 * PS_PAGE);
+  ok(ps_owned_read(first, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == 1);
+  ps_owned_run_close(first);
+  ok(ps_owned_read(last, 0, &byte, 1, &e), &e);
+  REQUIRE(byte == runs);
+  ps_owned_run_close(last);
+  REQUIRE(!status(s).retained_payload_bytes);
+  ps_owned_close(head);
+  ok(ps_close(s, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
 static int pause_capture(void *context, int fd, int command,
                          struct flock *lock) {
@@ -8591,9 +8651,10 @@ int main(int argc, char **argv) {
     capture_owner_collision();
   } else if (!strcmp(argv[2], "capture-faults"))
     capture_faults();
-  else if (!strcmp(argv[2], "capture-owned"))
+  else if (!strcmp(argv[2], "capture-owned")) {
     capture_owned();
-  else if (!strcmp(argv[2], "capture-race"))
+    capture_owned_batches();
+  } else if (!strcmp(argv[2], "capture-race"))
     capture_race();
   else if (!strcmp(argv[2], "resident-capture")) {
     resident_capture();

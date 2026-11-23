@@ -679,7 +679,8 @@ static void owned_repack_faults(int durable, int bitmap) {
   ps_space *s;
   ps_owned_head *head = NULL;
   ps_owned_status info;
-  ps_owned_run *raw = NULL, *mapped = NULL, **runs = NULL;
+  ps_owned_run *raw = NULL, *mapped = NULL;
+  ps_owned_mapping *runs = NULL;
   size_t keep_count = bitmap ? (PS_CHUNK - PS_RUN_HEADER) / 2 : 1;
   ps_owned_range *keep = calloc(keep_count, sizeof(*keep));
   ps_piece_checksum crc = {0};
@@ -746,16 +747,16 @@ static void owned_repack_faults(int durable, int bitmap) {
       s = piece_reopen(durable, &io);
       OK(ps_owned_open(s, NULL, stream_key(1), 0, NULL, &head, &info, &error));
       OK(ps_owned_runs_capture(head, &runs, &count, &error));
-      CHECK(count == 1 && ps_owned_run_mapped(runs[0]) == !cut);
-      OK(ps_owned_read(runs[0], keep[0].offset, scratch, (size_t)keep[0].bytes,
-                       &error));
+      CHECK(count == 1 && ps_owned_run_mapped(runs[0].handle) == !cut);
+      OK(ps_owned_read(runs[0].handle, keep[0].offset, scratch,
+                       (size_t)keep[0].bytes, &error));
       CHECK(!memcmp(bytes + keep[0].offset, scratch, (size_t)keep[0].bytes));
       if (cut) {
-        OK(ps_owned_read(runs[0], 0, scratch, sizeof(scratch) - PS_RUN_HEADER,
-                         &error));
+        OK(ps_owned_read(runs[0].handle, 0, scratch,
+                         sizeof(scratch) - PS_RUN_HEADER, &error));
         CHECK(!memcmp(bytes, scratch, sizeof(scratch) - PS_RUN_HEADER));
       }
-      ps_owned_run_close(runs[0]);
+      ps_owned_run_close(runs[0].handle);
       lc_free_with_allocator(NULL, runs);
       ps_owned_close(head);
       OK(ps_close(s, &error));
@@ -793,11 +794,11 @@ static void owned_repack_faults(int durable, int bitmap) {
   s = piece_reopen(durable, &io);
   OK(ps_owned_open(s, NULL, stream_key(1), 0, NULL, &head, &info, &error));
   OK(ps_owned_runs_capture(head, &runs, &count, &error));
-  CHECK(count == 1 && !ps_owned_run_mapped(runs[0]));
-  OK(ps_owned_read(runs[0], 0, scratch, sizeof(scratch) - PS_RUN_HEADER,
+  CHECK(count == 1 && !ps_owned_run_mapped(runs[0].handle));
+  OK(ps_owned_read(runs[0].handle, 0, scratch, sizeof(scratch) - PS_RUN_HEADER,
                    &error));
   CHECK(!memcmp(bytes, scratch, sizeof(scratch) - PS_RUN_HEADER));
-  ps_owned_run_close(runs[0]);
+  ps_owned_run_close(runs[0].handle);
   lc_free_with_allocator(NULL, runs);
   ps_owned_close(head);
   OK(ps_close(s, &error));
@@ -810,7 +811,8 @@ static void owned_repack(int durable) {
   ps_space *s;
   ps_owned_head *head = NULL;
   ps_owned_status info;
-  ps_owned_run *raw = NULL, *mapped = NULL, *next = NULL, **capture = NULL;
+  ps_owned_run *raw = NULL, *mapped = NULL, *next = NULL;
+  ps_owned_mapping *capture = NULL;
   const uint64_t first = PS_CHUNK + 17, second = PS_CHUNK + 9000;
   ps_owned_range keep[2] = {{2, first}, {second, 26}};
   ps_piece_checksum crc = {0};
@@ -860,9 +862,9 @@ static void owned_repack(int durable) {
   lc_error_cleanup(&error);
   BAD(ps_owned_write(mapped, 2, bytes, 1, &error));
   OK(ps_owned_runs_capture(head, &capture, &count, &error));
-  CHECK(count == 1 && ps_owned_run_mapped(capture[0]) &&
-        ps_owned_run_base(capture[0]) == 0);
-  ps_owned_run_close(capture[0]);
+  CHECK(count == 1 && ps_owned_run_mapped(capture[0].handle) &&
+        ps_owned_run_base(capture[0].handle) == 0);
+  ps_owned_run_close(capture[0].handle);
   lc_free_with_allocator(NULL, capture);
   OK(ps_checkpoint(s, &error));
   OK(ps_status(s, &before, &error));
@@ -937,14 +939,14 @@ static void owned_repack(int durable) {
   OK(ps_owned_open(s, NULL, stream_key(1), 0, NULL, &head, &info, &error));
   CHECK(info.runs == 1 && info.tail == base + 64);
   OK(ps_owned_runs_capture(head, &capture, &count, &error));
-  CHECK(count == 1 && ps_owned_run_base(capture[0]) == base);
-  OK(ps_owned_read(capture[0], 0, readback, 64, &error));
+  CHECK(count == 1 && ps_owned_run_base(capture[0].handle) == base);
+  OK(ps_owned_read(capture[0].handle, 0, readback, 64, &error));
   CHECK(!memcmp(bytes, readback, 64));
   OK(ps_owned_retire(head, &error));
   OK(ps_checkpoint(s, &error));
-  OK(ps_owned_read(capture[0], 0, readback, 64, &error));
+  OK(ps_owned_read(capture[0].handle, 0, readback, 64, &error));
   CHECK(!memcmp(bytes, readback, 64));
-  ps_owned_run_close(capture[0]);
+  ps_owned_run_close(capture[0].handle);
   lc_free_with_allocator(NULL, capture);
   ps_owned_close(head);
   OK(ps_close(s, &error));

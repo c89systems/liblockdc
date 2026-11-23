@@ -21,6 +21,10 @@
 #define PS_OWNED_DESCRIPTOR_BYTES 104U
 typedef struct ps_owned_head ps_owned_head;
 typedef struct ps_owned_run ps_owned_run;
+typedef struct ps_owned_mapping {
+  ps_owned_run *handle;
+  uint64_t base, capacity;
+} ps_owned_mapping;
 typedef struct ps_owned_footer {
   unsigned char bytes[PS_RUN_HEADER - PS_RUN_IDENTITY_BYTES];
 } ps_owned_footer;
@@ -95,33 +99,35 @@ void ps_owned_run_retain(ps_owned_run *);
  * allocator. Caller excludes mapping mutations until capture returns (stream
  * initialization owns that exclusion). Logical holes do not consume array
  * entries or read buffers. */
-int ps_owned_runs_capture(ps_owned_head *, ps_owned_run ***, size_t *,
+int ps_owned_runs_capture(ps_owned_head *, ps_owned_mapping **, size_t *,
                           lc_error *);
 /* Read raw identities and adjacent footers together for stream initialization.
  * The caller holds stream edit authority through the inspection and frees the
  * parallel footer array before repair or release of that authority. */
-int ps_owned_runs_capture_initial(ps_owned_head *, ps_owned_run ***, size_t *,
-                                  ps_owned_footer **, lc_error *);
+int ps_owned_runs_capture_initial(ps_owned_head *, ps_owned_mapping **,
+                                  size_t *, ps_owned_footer **, lc_error *);
 int ps_owned_runs_capture_status(ps_owned_head *, ps_owned_status *,
-                                 ps_owned_run ***, size_t *, lc_error *);
+                                 ps_owned_mapping **, size_t *, lc_error *);
 int ps_owned_runs_key_status(ps_space *, ps_key, const ps_ref *,
-                             ps_owned_status *, ps_owned_run ***, size_t *,
+                             ps_owned_status *, ps_owned_mapping **, size_t *,
                              lc_error *);
 int ps_owned_runs_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
-                        uint64_t end, ps_owned_run ***, size_t *, lc_error *);
+                        uint64_t end, ps_owned_mapping **, size_t *,
+                        lc_error *);
 /* Pin the selected range under the space mutex. Provisional pins require
  * certification by the caller. Verify identities before reading. */
 int ps_owned_runs_pin_range(ps_space *, ps_key, const ps_ref *, uint64_t start,
-                            uint64_t end, int provisional, ps_owned_run ***,
+                            uint64_t end, int provisional, ps_owned_mapping **,
                             size_t *, lc_error *);
-int ps_owned_runs_verify(ps_owned_run *const *, size_t, ps_owned_footer *,
+int ps_owned_runs_verify(const ps_owned_mapping *, size_t, ps_owned_footer *,
                          lc_error *);
 /* Discard unpublished handles while still holding their space mutex. */
-void ps_owned_runs_discard_locked(ps_owned_run **, size_t);
+void ps_owned_runs_discard_locked(ps_owned_mapping *, size_t);
+void ps_owned_runs_close(ps_owned_mapping *, size_t);
 /* Capture the writable suffix, including grants beyond the published tail.
  * The caller owns stream edit authority through use of the mappings. */
 int ps_owned_runs_edit_range(ps_owned_head *, uint64_t start, uint64_t end,
-                             ps_owned_run ***, size_t *, lc_error *);
+                             ps_owned_mapping **, size_t *, lc_error *);
 typedef struct ps_owned_range {
   uint64_t offset, bytes;
 } ps_owned_range;

@@ -4,16 +4,11 @@
 #include <pthread.h>
 #include <string.h>
 
-typedef struct ps_collection_run {
-  ps_owned_run *run;
-  uint64_t base, bytes;
-} ps_collection_run;
-
 struct ps_collection_segment {
   ps_space *space;
   ps_owned_head *head;
   pthread_mutex_t mutex;
-  ps_collection_run *runs;
+  ps_owned_mapping *runs;
   unsigned char *zero;
   size_t count, room;
   uint64_t tail, capacity, preferred;
@@ -29,7 +24,7 @@ static int cs_error(lc_error *e, int code, const char *message) {
 
 static int cs_room(ps_collection_segment *s, lc_error *e) {
   size_t room;
-  ps_collection_run *runs;
+  ps_owned_mapping *runs;
   if (s->count < s->room)
     return LC_OK;
   room = s->room ? s->room * 2U : 4U;
@@ -44,31 +39,33 @@ static int cs_room(ps_collection_segment *s, lc_error *e) {
   return LC_OK;
 }
 
-static void cs_add(ps_collection_segment *s, ps_owned_run *run) {
-  uint64_t bytes = ps_owned_run_capacity(run);
-  s->runs[s->count].run = run;
-  s->runs[s->count].base = ps_owned_run_base(run);
-  s->runs[s->count].bytes = bytes;
-  if (s->capacity < s->runs[s->count].base + bytes)
-    s->capacity = s->runs[s->count].base + bytes;
-  ++s->count;
-  bytes = (bytes + PS_RUN_HEADER) * 4U;
+static void cs_note_grant(ps_collection_segment *s, uint64_t capacity) {
+  uint64_t bytes = (capacity + PS_RUN_HEADER) * 4U;
   if (bytes > PS_MIB)
     bytes = PS_MIB;
   if (s->preferred < bytes)
     s->preferred = bytes;
 }
+static void cs_add(ps_collection_segment *s, ps_owned_run *run) {
+  ps_owned_mapping *mapping = &s->runs[s->count++];
+  mapping->handle = run;
+  mapping->base = ps_owned_run_base(run);
+  mapping->capacity = ps_owned_run_capacity(run);
+  if (s->capacity < mapping->base + mapping->capacity)
+    s->capacity = mapping->base + mapping->capacity;
+  cs_note_grant(s, mapping->capacity);
+}
 
 /* Copy immutable mapping facts while briefly holding the directory mutex.
  * The owner pin keeps each run alive after vector growth and during I/O. */
 static int cs_mapping(ps_collection_segment *s, uint64_t at,
-                      ps_collection_run *run, lc_error *e) {
+                      ps_owned_mapping *run, lc_error *e) {
   size_t lo = 0U, hi, mid;
   pthread_mutex_lock(&s->mutex);
   hi = s->count;
   while (lo < hi) {
     mid = lo + (hi - lo) / 2U;
-    if (s->runs[mid].base + s->runs[mid].bytes <= at)
+    if (s->runs[mid].base + s->runs[mid].capacity <= at)
       lo = mid + 1U;
     else
       hi = mid;
@@ -85,7 +82,7 @@ static int cs_mapping(ps_collection_segment *s, uint64_t at,
 
 static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
                        size_t n, int writing, lc_error *e) {
-  ps_collection_run run = {0};
+  ps_owned_mapping run = {0};
   unsigned char *p = bytes;
   size_t take;
   int rc;
@@ -93,11 +90,11 @@ static int cs_transfer(ps_collection_segment *s, uint64_t at, void *bytes,
     rc = cs_mapping(s, at, &run, e);
     if (rc != LC_OK)
       return rc;
-    take = run.bytes - (at - run.base) < (uint64_t)n
-               ? (size_t)(run.bytes - (at - run.base))
+    take = run.capacity - (at - run.base) < (uint64_t)n
+               ? (size_t)(run.capacity - (at - run.base))
                : n;
-    rc = writing ? ps_owned_write(run.run, at - run.base, p, take, e)
-                 : ps_owned_read(run.run, at - run.base, p, take, e);
+    rc = writing ? ps_owned_write(run.handle, at - run.base, p, take, e)
+                 : ps_owned_read(run.handle, at - run.base, p, take, e);
     if (rc != LC_OK)
       return rc;
     at += take;
@@ -135,12 +132,12 @@ static int cs_clear(ps_collection_segment *s, uint64_t start, uint64_t end,
   uint64_t from, through;
   int rc = LC_OK;
   for (i = 0U; i < s->count && rc == LC_OK; ++i) {
-    ps_collection_run *r = &s->runs[i];
-    if (end <= r->base || start >= r->base + r->bytes)
+    ps_owned_mapping *r = &s->runs[i];
+    if (end <= r->base || start >= r->base + r->capacity)
       continue;
     from = start > r->base ? start - r->base : 0U;
-    through = end < r->base + r->bytes ? end - r->base : r->bytes;
-    rc = ps_owned_clear(r->run, from, through - from, s->zero, e);
+    through = end < r->base + r->capacity ? end - r->base : r->capacity;
+    rc = ps_owned_clear(r->handle, from, through - from, s->zero, e);
   }
   return rc;
 }
@@ -275,39 +272,37 @@ static int cs_new(ps_space *space, int writable, ps_collection_segment **out,
 
 static int cs_load(ps_collection_segment *s, ps_key key, const ps_ref *ref,
                    ps_owned_status *status, lc_error *e) {
-  ps_owned_run **captured = NULL;
+  ps_owned_mapping *captured = NULL;
+  uint64_t capacity = 0;
   size_t count = 0U, i;
   int rc = s->head ? ps_owned_runs_capture_status(s->head, status, &captured,
                                                   &count, e)
                    : ps_owned_runs_key_status(s->space, key, ref, status,
                                               &captured, &count, e);
   for (i = 0U; rc == LC_OK && i < count; ++i) {
-    rc = cs_room(s, e);
-    if (rc == LC_OK &&
-        ((!status->sealed && ps_owned_run_base(captured[i]) != s->capacity) ||
-         ps_owned_run_base(captured[i]) < s->capacity ||
-         ps_owned_run_base(captured[i]) > status->capacity ||
-         ps_owned_run_capacity(captured[i]) >
-             status->capacity - ps_owned_run_base(captured[i])))
+    const ps_owned_mapping *mapping = &captured[i];
+    if ((!status->sealed && mapping->base != capacity) ||
+        mapping->base < capacity || mapping->base > status->capacity ||
+        mapping->capacity > status->capacity - mapping->base)
       rc = cs_error(e, LC_ERR_PROTOCOL,
                     "collection segment has an invalid owned range");
-    if (rc == LC_OK) {
-      cs_add(s, captured[i]);
-      captured[i] = NULL;
+    else {
+      capacity = mapping->base + mapping->capacity;
+      cs_note_grant(s, mapping->capacity);
     }
   }
-  for (i = 0U; i < count; ++i)
-    ps_owned_run_close(captured[i]);
-  lc_free_with_allocator(NULL, captured);
-  if (rc == LC_OK && ((!status->sealed && s->capacity != status->capacity) ||
-                      s->count != status->runs))
+  if (rc == LC_OK && ((!status->sealed && capacity != status->capacity) ||
+                      count != status->runs))
     rc = cs_error(e, LC_ERR_PROTOCOL,
                   "collection owned range directory is inconsistent");
   if (rc == LC_OK) {
+    s->runs = captured;
+    s->count = s->room = count;
     s->capacity = status->capacity;
     s->tail = status->tail;
     s->sealed = status->sealed;
-  }
+  } else
+    ps_owned_runs_close(captured, count);
   return rc;
 }
 
@@ -400,14 +395,11 @@ void ps_collection_segment_retain(ps_collection_segment *s) {
 }
 
 void ps_collection_segment_close(ps_collection_segment *s) {
-  size_t i;
   if (!s || __atomic_sub_fetch(&s->references, 1UL, __ATOMIC_ACQ_REL))
     return;
-  for (i = 0U; i < s->count; ++i)
-    ps_owned_run_close(s->runs[i].run);
+  ps_owned_runs_close(s->runs, s->count);
   ps_owned_close(s->head);
   pthread_mutex_destroy(&s->mutex);
-  lc_free_with_allocator(NULL, s->runs);
   lc_free_with_allocator(NULL, s->zero);
   lc_free_with_allocator(NULL, s);
 }
@@ -500,7 +492,7 @@ int ps_collection_segment_discard_prefix(ps_collection_segment *s,
                                          void *context, uint64_t *removed,
                                          lc_error *e) {
   ps_owned_run *replacement = NULL;
-  ps_collection_run *r;
+  ps_owned_mapping *r;
   uint64_t bytes = 0U;
   size_t i = 0U;
   int rc;
@@ -509,14 +501,14 @@ int ps_collection_segment_discard_prefix(ps_collection_segment *s,
                     "collection prefix disposal requires sealed liveness");
   while (i < s->count) {
     r = &s->runs[i];
-    if (through < s->tail && r->base + r->bytes > through)
+    if (through < s->tail && r->base + r->capacity > through)
       break;
-    rc = ps_owned_run_repack(s->head, r->run, NULL, NULL, 0U, select, context,
-                             &replacement, e);
+    rc = ps_owned_run_repack(s->head, r->handle, NULL, NULL, 0U, select,
+                             context, &replacement, e);
     if (rc != LC_OK)
       return rc;
-    bytes += ps_owned_run_storage(r->run);
-    ps_owned_run_close(r->run);
+    bytes += ps_owned_run_storage(r->handle);
+    ps_owned_run_close(r->handle);
     memmove(r, r + 1U, (s->count - i - 1U) * sizeof(*r));
     --s->count;
   }
