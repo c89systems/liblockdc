@@ -17531,6 +17531,55 @@ lc_pouch_state_delete_locked(lc_pouch *pouch, const char *ns, const char *key,
   return rc;
 }
 
+typedef struct lc_pouch_object_retirement {
+  lc_pouch *pouch;
+  const char *ns;
+  const lc_pouch_state_object_ref *objects;
+  size_t count;
+} lc_pouch_object_retirement;
+
+static int lc_pouch_state_retire_objects_locked(void *context,
+                                                lc_error *error) {
+  lc_pouch_object_retirement *work = context;
+  lc_pouch_state_write_options options = {0};
+  size_t i;
+  int rc = LC_OK;
+  options.object_record = 1;
+  options.has_expected_version = 1;
+  for (i = 0; rc == LC_OK && i < work->count; ++i) {
+    const lc_pouch_state_object_ref *object = &work->objects[i];
+    lc_pouch_state_read_result current = {0};
+    lc_pouch_state_write_result deleted = {0};
+    rc = lc_pouch_state_read_metadata_locked(work->pouch, work->ns, object->key,
+                                             &current, error);
+    if (rc == LC_OK && current.found && current.version == object->version &&
+        current.index_seq == object->index_seq) {
+      options.expected_version = object->version;
+      rc = lc_pouch_state_delete_locked(work->pouch, work->ns, object->key,
+                                        &options, &deleted, error);
+    }
+    lc_pouch_state_read_result_cleanup(&work->pouch->allocator, &current);
+    lc_pouch_state_write_result_cleanup(&work->pouch->allocator, &deleted);
+  }
+  return rc;
+}
+
+int lc_pouch_state_retire_objects(lc_pouch *pouch, const char *ns,
+                                  const lc_pouch_state_object_ref *objects,
+                                  size_t count, lc_error *error) {
+  lc_pouch_object_retirement work;
+  int rc;
+  work.pouch = pouch;
+  work.ns = ns;
+  work.objects = objects;
+  work.count = count;
+  rc = lc_pouch_state_with_namespace_durable_batch(
+      pouch, ns, lc_pouch_state_retire_objects_locked, &work, error);
+  if (rc == LC_OK)
+    lc_pouch_compaction_note_mutation(pouch, ns, 1);
+  return rc;
+}
+
 int lc_pouch_state_delete(lc_pouch *pouch, const char *ns, const char *key,
                           const lc_pouch_state_write_options *options,
                           lc_pouch_state_write_result *out, lc_error *error) {

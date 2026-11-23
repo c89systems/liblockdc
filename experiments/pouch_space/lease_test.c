@@ -1741,6 +1741,180 @@ static void release_barrier(const char *directory) {
   release_barrier_case(directory, 3, 1, 1, BARRIER_INTERRUPTED_REPLAY);
   shared_lease_fixture = 0;
 }
+static int interrupt_recovery_retirement(void *context, lc_error *e) {
+  barrier_disk *disk = context;
+  if (++disk->revisions != 2)
+    return LC_OK;
+  return lc_error_set(e, LC_ERR_TRANSPORT, 0,
+                      "interrupted transaction retirement", NULL, NULL, "test");
+}
+static size_t recovery_decisions(lc_pouch *pouch,
+                                 char (*xids)[LC_XID_STRING_SIZE], size_t count,
+                                 lc_error *e) {
+  size_t found = 0;
+  for (size_t i = 0; i < count; ++i) {
+    lc_pouch_state_read_result journal = {0};
+    ok(lc_pouch_state_read_metadata(pouch, ".txns", xids[i], &journal, e), e);
+    found += journal.found != 0;
+    lc_pouch_state_read_result_cleanup(&pouch->allocator, &journal);
+  }
+  return found;
+}
+static void seed_completed_transactions(fixture *f, const char *const *keys,
+                                        char (*xids)[LC_XID_STRING_SIZE],
+                                        size_t count, lc_error *e) {
+  for (size_t i = 0; i < count; ++i) {
+    ok(lc_xid_new(xids[i], e), e);
+    lc_lease *lease = acquire(f, keys[i], xids[i], e);
+    payload(lease, NULL, e);
+    lc_txn_participant participant = {.ns = "orders", .key = keys[i]};
+    lc_txn_decision_req decision;
+    lc_txn_decision_res result = {0};
+    lc_txn_decision_req_init(&decision);
+    decision.txn_id = xids[i];
+    decision.participants = &participant;
+    decision.participant_count = 1;
+    ok(i % 2 ? f->client->txn_rollback(f->client, &decision, &result, e)
+             : f->client->txn_commit(f->client, &decision, &result, e),
+       e);
+    lc_txn_decision_res_cleanup(&result);
+    lc_lease_close(lease);
+    parent(f, keys[i], i % 2 == 0, 0, e);
+  }
+  REQUIRE(recovery_decisions(store(f), xids, count, e) == count);
+}
+static void recovery_retirement_case(const char *directory, int crypto,
+                                     enum barrier_outcome outcome,
+                                     int interrupt) {
+  static const char *keys[] = {"first", "second", "third", "fourth"};
+  enum { count = sizeof(keys) / sizeof(keys[0]) };
+  char xids[count][LC_XID_STRING_SIZE];
+  fixture *f = calloc(1, sizeof(*f));
+  barrier_disk disk = {0};
+  lc_error e = {0};
+  snprintf(scenario, sizeof(scenario),
+           "recovery retirement crypto=%d outcome=%d interrupt=%d", crypto,
+           (int)outcome, interrupt);
+  disk.outcome = outcome;
+  disk.disk.stable = calloc(1, (size_t)PS_DEFAULT_CAPACITY);
+  disk.disk.dirty = calloc(1, (size_t)(PS_DEFAULT_CAPACITY / PS_PAGE));
+  disk.disk.scratch = malloc(PS_PAGE);
+  REQUIRE(f && disk.disk.stable && disk.disk.dirty && disk.disk.scratch);
+  ps_io io = {&disk, disk_read, disk_write, barrier_sync, disk_reserve, NULL};
+  now(1000);
+  setup_io(f, directory, 0, 1, crypto, &io, &e);
+  seed_completed_transactions(f, keys, xids, count, &e);
+  if (interrupt) {
+    lc_pouch_test_after_metadata_batch_append_context = &disk;
+    lc_pouch_test_after_metadata_batch_append_hook =
+        interrupt_recovery_retirement;
+  }
+  disk.armed = 1;
+  int rc = lc_pouch_client_recover_transactions(f->client, &e);
+  disk.armed = 0;
+  lc_pouch_test_after_metadata_batch_append_hook = NULL;
+  lc_pouch_test_after_metadata_batch_append_context = NULL;
+  REQUIRE(disk.syncs == 1);
+  if (outcome == BARRIER_DURABLE && !interrupt)
+    ok(rc, &e);
+  else {
+    REQUIRE(rc == LC_ERR_TRANSPORT);
+    if (interrupt)
+      REQUIRE(disk.revisions == 2 && e.message &&
+              !strcmp(e.message, "interrupted transaction retirement"));
+    clear(&e);
+  }
+  disk.disk.freeze = 1;
+  close_store(f);
+  restore_disk(&disk.disk, f->path);
+
+  /* Inspect the stable journal before the SDK has a chance to retry it. */
+  ps_pouch_state_options options = {0};
+  options.io = &io;
+  options.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.logical.single_writer_set = 1;
+  options.logical.durable_sync = 1;
+  options.logical.background_compaction_enabled_set = 1;
+  options.logical.query_indexing_enabled_set = 1;
+  options.logical.crypto_key = crypto & 1 ? crypto_key : NULL;
+  lc_pouch *pouch = NULL;
+  ok(ps_pouch_state_open(f->path, 0, &allocator, &options, &pouch, &e), &e);
+  size_t remaining = interrupt                      ? count - 1
+                     : outcome == BARRIER_LOST_SYNC ? count
+                                                    : 0;
+  REQUIRE(recovery_decisions(pouch, xids, count, &e) == remaining);
+  lc_pouch_close(pouch);
+  REQUIRE(!live);
+  open_store(f, 0, &e);
+  REQUIRE(recovery_decisions(store(f), xids, count, &e) == 0);
+  for (size_t i = 0; i < count; ++i)
+    parent(f, keys[i], i % 2 == 0, 0, &e);
+  close_store(f);
+  retire(f);
+  free(f);
+  free(disk.disk.stable);
+  free(disk.disk.dirty);
+  free(disk.disk.scratch);
+  lc_error_cleanup(&e);
+}
+typedef struct recovery_actor {
+  fixture *owner;
+  pthread_barrier_t *start;
+} recovery_actor;
+static void *recover_with_peer(void *context) {
+  recovery_actor *actor = context;
+  lc_error e = {0};
+  int rc = pthread_barrier_wait(actor->start);
+  REQUIRE(rc == 0 || rc == PTHREAD_BARRIER_SERIAL_THREAD);
+  ok(lc_pouch_client_recover_transactions(actor->owner->client, &e), &e);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void recovery_retirement_peers(const char *directory) {
+  static const char *keys[] = {"first", "second", "third",   "fourth",
+                               "fifth", "sixth",  "seventh", "eighth"};
+  enum { count = sizeof(keys) / sizeof(keys[0]) };
+  char xids[count][LC_XID_STRING_SIZE];
+  fixture *first = calloc(1, sizeof(*first));
+  fixture *second = calloc(1, sizeof(*second));
+  pthread_barrier_t start;
+  pthread_t workers[2];
+  recovery_actor actors[] = {{first, &start}, {second, &start}};
+  lc_error e = {0};
+  REQUIRE(first && second && !pthread_barrier_init(&start, NULL, 2));
+  snprintf(scenario, sizeof(scenario), "live recovery peers");
+  setup(first, directory, 0, 1, 0, &e);
+  memcpy(second->path, first->path, sizeof(second->path));
+  configure(second, 0, 1, 0);
+  open_store(second, 0, &e);
+  seed_completed_transactions(first, keys, xids, count, &e);
+  for (size_t i = 0; i < 2; ++i)
+    REQUIRE(!pthread_create(&workers[i], NULL, recover_with_peer, &actors[i]));
+  for (size_t i = 0; i < 2; ++i)
+    REQUIRE(!pthread_join(workers[i], NULL));
+  REQUIRE(!pthread_barrier_destroy(&start));
+  REQUIRE(recovery_decisions(store(first), xids, count, &e) == 0 &&
+          recovery_decisions(store(second), xids, count, &e) == 0);
+  for (size_t i = 0; i < count; ++i)
+    parent(second, keys[i], i % 2 == 0, 0, &e);
+  lc_client_close(second->client);
+  close_store(first);
+  retire(first);
+  free(first);
+  free(second);
+  lc_error_cleanup(&e);
+}
+static void recovery_retirement(const char *directory) {
+  shared_lease_fixture = 1;
+  for (int crypto = 0; crypto <= 3; crypto += 3) {
+    for (enum barrier_outcome outcome = BARRIER_DURABLE;
+         outcome <= BARRIER_LOST_ACK; ++outcome)
+      recovery_retirement_case(directory, crypto, outcome, 0);
+    recovery_retirement_case(directory, crypto, BARRIER_DURABLE, 1);
+  }
+  recovery_retirement_peers(directory);
+  shared_lease_fixture = 0;
+}
 static size_t expire_at_eof(lc_source *pub, void *bytes, size_t n,
                             lc_error *e) {
   size_t got = pull(pub, bytes, n, e);
@@ -2163,6 +2337,8 @@ static void *worker(void *context) {
     lease_policy(r->directory);
   else if (!strcmp(r->mode, "release-barrier"))
     release_barrier(r->directory);
+  else if (!strcmp(r->mode, "recovery-retirement"))
+    recovery_retirement(r->directory);
   else if (!strcmp(r->mode, "stage-barrier"))
     stage_barrier(r->directory);
   else if (!strcmp(r->mode, "stage-delete-renew"))

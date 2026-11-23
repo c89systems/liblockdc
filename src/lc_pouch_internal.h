@@ -609,6 +609,16 @@ int lc_pouch_state_read_metadata_locked(lc_pouch *pouch, const char *ns,
                                         const char *key,
                                         lc_pouch_state_read_result *out,
                                         lc_error *error);
+typedef struct lc_pouch_state_object_ref {
+  const char *key;
+  lc_pouch_generation version;
+  lc_pouch_generation index_seq;
+} lc_pouch_state_object_ref;
+/* Retire the selected versions of internal objects. Missing or replaced
+ * versions are left alone. The caller retains authority over each object. */
+int lc_pouch_state_retire_objects(lc_pouch *pouch, const char *ns,
+                                  const lc_pouch_state_object_ref *objects,
+                                  size_t count, lc_error *error);
 /**
  * Reads a full state record while the caller holds namespace mutation
  * authority. This avoids attempting to recursively acquire the namespace

@@ -19472,150 +19472,205 @@ int lc_pouch_client_txn_rollback_method(lc_client *self,
                                               error);
 }
 
+enum { LC_POUCH_RECOVERY_RETIRE_LIMIT = 16 };
+
+typedef struct lc_pouch_recovered_decision {
+  lc_pouch_state_object_ref object;
+  const char *participant_ns;
+  const char *participant_key;
+} lc_pouch_recovered_decision;
+
+static int lc_pouch_recovery_managed(lc_client_handle *client,
+                                     const char *txn_id, int *managed,
+                                     lc_error *error) {
+  int rc = lc_pouch_xa_managed(client, txn_id, managed, error);
+  if (rc == LC_OK && !*managed) {
+    lc_pouch_unix_seconds completed = 0;
+    rc = lc_pouch_xa_completed_read(client, txn_id, &completed, error);
+    *managed = completed != 0;
+  }
+  return rc;
+}
+
+static int
+lc_pouch_retire_recovered_batch(lc_client_handle *client,
+                                const lc_pouch_recovered_decision *retirements,
+                                size_t count, lc_error *error) {
+  lc_pouch_txn_guard guards[LC_POUCH_RECOVERY_RETIRE_LIMIT];
+  lc_pouch_state_object_ref ready[LC_POUCH_RECOVERY_RETIRE_LIMIT];
+  size_t next = 0;
+  int rc = LC_OK;
+  while (rc == LC_OK && next < count) {
+    size_t held = 0, ready_count = 0;
+    while (rc == LC_OK && next < count) {
+      const lc_pouch_recovered_decision *decision = &retirements[next];
+      const char *txn_id = decision->object.key;
+      int managed, retention_owned = 0;
+      size_t i;
+      for (i = 0; i < held; ++i)
+        if (lc_pouch_txn_guard_covers(&guards[i], txn_id))
+          break;
+      if (i == held) {
+        rc = lc_pouch_txn_guard_lock(client->pouch, txn_id, !held,
+                                     &guards[held], error);
+        if (rc == LC_ERR_PENDING && held) {
+          /* Finish the accepted prefix before waiting on another XID. */
+          lc_error_cleanup(error);
+          rc = LC_OK;
+          break;
+        }
+        if (rc != LC_OK)
+          break;
+        ++held;
+      }
+      /* A peer can claim the record between recovery and retirement. Check
+       * ownership before taking .txns mutation authority, then check the
+       * exact record identity when publishing each tombstone. */
+      rc = lc_pouch_recovery_managed(client, txn_id, &managed, error);
+      if (rc == LC_OK && !managed && decision->participant_ns != NULL)
+        rc = lc_pouch_retention_owns_journal(
+            client->pouch, decision->participant_ns, decision->participant_key,
+            txn_id, &retention_owned, error);
+      if (rc == LC_OK && !managed && !retention_owned)
+        ready[ready_count++] = decision->object;
+      ++next;
+    }
+    if (rc == LC_OK && ready_count)
+      rc = lc_pouch_state_retire_objects(client->pouch, LC_POUCH_TXN_NAMESPACE,
+                                         ready, ready_count, error);
+    while (held)
+      lc_pouch_txn_guard_release(&guards[--held]);
+  }
+  return rc;
+}
+
+static int
+lc_pouch_finish_recovered_batch(lc_client_handle *client,
+                                lc_pouch_recovered_decision *retirements,
+                                size_t *count, int rc, lc_error *error) {
+  size_t i;
+  if (rc == LC_OK && *count)
+    rc = lc_pouch_retire_recovered_batch(client, retirements, *count, error);
+  for (i = 0; i < *count; ++i) {
+    lc_free_with_allocator(NULL, (void *)retirements[i].participant_ns);
+    lc_free_with_allocator(NULL, (void *)retirements[i].participant_key);
+    memset(&retirements[i], 0, sizeof(retirements[i]));
+  }
+  *count = 0;
+  return rc;
+}
+
+static int lc_pouch_recover_transaction(lc_client_handle *client,
+                                        const char *txn_id,
+                                        lc_pouch_unix_seconds now,
+                                        lc_pouch_recovered_decision *retire,
+                                        lc_error *error) {
+  lc_pouch_txn_record record = {0};
+  lc_pouch_txn_record_ref ref = {0};
+  lc_txn_decision_req req;
+  lc_pouch_txn_guard guard;
+  int managed = 0, retention_owned = 0, completed = 0, terminal = 0;
+  int rc = lc_pouch_txn_guard_acquire(client->pouch, txn_id, &guard, error);
+  if (rc != LC_OK)
+    return rc;
+  lc_txn_decision_req_init(&req);
+  rc = lc_pouch_recovery_managed(client, txn_id, &managed, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_read_txn_record(client->pouch, txn_id, &record, &ref, error);
+  if (rc == LC_OK && record.state != NULL) {
+    lc_pouch_txn_decision_request(&req, txn_id, &record);
+    rc = lc_pouch_txn_validate_participants(&req, error);
+    if (rc == LC_OK)
+      rc = lc_pouch_txn_validate_target_backend(client->pouch,
+                                                req.target_backend_hash, error);
+    if (rc == LC_OK && record.participant_count == 1)
+      rc = lc_pouch_retention_owns_journal(
+          client->pouch, record.participants[0].ns, record.participants[0].key,
+          txn_id, &retention_owned, error);
+    if (rc == LC_OK && !retention_owned &&
+        (strcmp(record.state, "commit") == 0 ||
+         strcmp(record.state, "rollback") == 0)) {
+      terminal = 1;
+      rc = lc_pouch_txn_apply_participants(client, &req, record.state, 1,
+                                           record.commit_at_unix, error);
+      completed = rc == LC_OK;
+    } else if (rc == LC_OK && !retention_owned &&
+               strcmp(record.state, "prepare") == 0 &&
+               record.expires_at_unix > 0L && record.expires_at_unix <= now) {
+      lc_txn_decision_res rollback_res = {0};
+      rc = managed
+               ? LC_ERR_PENDING
+               : lc_pouch_client_txn_decision(&client->pub, &req, "rollback", 1,
+                                              NULL, 0, &rollback_res, error);
+      completed = rc == LC_OK;
+      lc_txn_decision_res_cleanup(&rollback_res);
+    }
+  }
+  /* XA keeps durable outcomes for external recovery and idempotent lookup. */
+  if (managed || lc_pouch_xa_has_participants(&req)) {
+    completed = 0;
+    if (rc == LC_ERR_PENDING) {
+      lc_error_cleanup(error);
+      rc = LC_OK;
+    }
+  }
+  if (rc == LC_OK && completed) {
+    if (retire != NULL && terminal && ref.index_seq) {
+      retire->object.key = txn_id;
+      retire->object.version = ref.version;
+      retire->object.index_seq = ref.index_seq;
+      if (record.participant_count == 1) {
+        retire->participant_ns = record.participants[0].ns;
+        retire->participant_key = record.participants[0].key;
+        record.participants[0].ns = NULL;
+        record.participants[0].key = NULL;
+      }
+    } else
+      rc = lc_pouch_txn_delete_recovered_record(client, txn_id, error);
+  }
+  lc_pouch_txn_record_cleanup(&record);
+  lc_pouch_txn_guard_release(&guard);
+  return rc;
+}
+
 int lc_pouch_client_recover_transactions(lc_client *self, lc_error *error) {
   lc_client_handle *client;
-  lc_pouch_txn_key_list keys;
-  lc_pouch_unix_seconds now;
-  size_t i;
-  int rc;
-
-  now = 0L;
-  if (self == NULL) {
+  lc_pouch_txn_key_list keys = {0};
+  lc_pouch_recovered_decision retirements[LC_POUCH_RECOVERY_RETIRE_LIMIT];
+  lc_pouch_unix_seconds now = 0;
+  size_t i, count = 0;
+  int group_retirements, rc;
+  memset(retirements, 0, sizeof(retirements));
+  if (self == NULL)
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "pouch transaction recovery requires self", NULL, NULL,
                         NULL);
-  }
   client = (lc_client_handle *)self;
-  memset(&keys, 0, sizeof(keys));
+  group_retirements = client->pouch->storage.ops && client->pouch->durable_sync;
   rc = lc_pouch_state_visit(client->pouch, LC_POUCH_TXN_NAMESPACE,
                             lc_pouch_txn_collect_key, &keys, error);
-  if (rc != LC_OK) {
-    lc_pouch_txn_key_list_cleanup(&keys);
-    return rc;
-  }
-  rc = lc_pouch_now_unix(&now, error);
-  for (i = 0U; rc == LC_OK && i < keys.count; ++i) {
-    lc_pouch_state_read_result read_result;
-    lc_pouch_txn_record record;
-    lc_txn_decision_req req;
-    lc_sink *sink;
-    const void *bytes;
-    size_t length;
-    char *body;
-    int cleanup_decision;
-    int managed;
-    int retention_owned;
-    lc_pouch_txn_guard guard;
-
-    memset(&read_result, 0, sizeof(read_result));
-    memset(&record, 0, sizeof(record));
-    lc_txn_decision_req_init(&req);
-    sink = NULL;
-    body = NULL;
-    cleanup_decision = 0;
-    managed = 0;
-    retention_owned = 0;
-    rc = lc_pouch_txn_guard_acquire(client->pouch, keys.keys[i], &guard, error);
-    if (rc != LC_OK)
-      break;
-    rc = lc_pouch_xa_managed(client, keys.keys[i], &managed, error);
-    if (rc == LC_OK && !managed) {
-      lc_pouch_unix_seconds completed = 0;
-      rc = lc_pouch_xa_completed_read(client, keys.keys[i], &completed, error);
-      managed = completed != 0;
-    }
-    if (rc == LC_OK)
-      rc = lc_pouch_state_read(client->pouch, LC_POUCH_TXN_NAMESPACE,
-                               keys.keys[i], &read_result, error);
-    if (rc == LC_OK && read_result.found) {
-      rc = lc_sink_to_memory(&sink, error);
-    }
-    if (rc == LC_OK && read_result.found) {
-      rc = lc_copy(read_result.body, sink, NULL, error);
-    }
-    if (rc == LC_OK && read_result.found) {
-      rc = lc_sink_memory_bytes(sink, &bytes, &length, error);
-    }
-    if (rc == LC_OK && read_result.found) {
-      body = (char *)lc_alloc_with_allocator(NULL, length + 1U);
-      if (body == NULL) {
-        rc = lc_error_set(error, LC_ERR_NOMEM, 0L,
-                          "failed to allocate pouch transaction recovery "
-                          "record",
-                          NULL, NULL, NULL);
-      }
-    }
-    if (rc == LC_OK && read_result.found) {
-      memcpy(body, bytes, length);
-      body[length] = '\0';
-      rc = lc_pouch_txn_parse_record(body, length, &record, error);
-    }
-    if (rc == LC_OK && read_result.found) {
-      req.txn_id = keys.keys[i];
-      req.participants = record.participants;
-      req.participant_count = record.participant_count;
-      req.expires_at_unix = record.expires_at_unix;
-      req.tc_term = record.tc_term;
-      req.target_backend_hash = record.target_backend_hash;
-      rc = lc_pouch_txn_validate_participants(&req, error);
-      if (rc == LC_OK) {
-        rc = lc_pouch_txn_validate_target_backend(
-            client->pouch, req.target_backend_hash, error);
-      }
-      if (rc == LC_OK && record.participant_count == 1)
-        rc = lc_pouch_retention_owns_journal(
-            client->pouch, record.participants[0].ns,
-            record.participants[0].key, keys.keys[i], &retention_owned, error);
-      if (rc == LC_OK && !retention_owned &&
-          (strcmp(record.state, "commit") == 0 ||
-           strcmp(record.state, "rollback") == 0)) {
-        rc = lc_pouch_txn_apply_participants(client, &req, record.state, 1,
-                                             record.commit_at_unix, error);
-        if (rc == LC_OK) {
-          cleanup_decision = 1;
-        }
-      } else if (rc == LC_OK && !retention_owned &&
-                 strcmp(record.state, "prepare") == 0 &&
-                 record.expires_at_unix > 0L && record.expires_at_unix <= now) {
-        lc_txn_decision_res rollback_res;
-
-        memset(&rollback_res, 0, sizeof(rollback_res));
-        if (managed)
-          rc = LC_ERR_PENDING;
-        else
-          rc = lc_pouch_client_txn_decision(self, &req, "rollback", 1, NULL, 0,
-                                            &rollback_res, error);
-        if (rc == LC_OK) {
-          cleanup_decision = 1;
-        }
-        lc_txn_decision_res_cleanup(&rollback_res);
-      }
-    }
-    /* An external resource may be unavailable when a client opens. Preserve its
-     * immutable decision and staging; registration/recovery can complete later.
-     * Completed XA decisions also remain for idempotent outcome lookup rather
-     * than using native-only recovery's immediate deletion policy.
-     */
-    if (rc == LC_ERR_PENDING &&
-        (managed || lc_pouch_xa_has_participants(&req))) {
+  if (rc == LC_OK)
+    rc = lc_pouch_now_unix(&now, error);
+  for (i = 0; rc == LC_OK && i < keys.count; ++i) {
+    rc = lc_pouch_recover_transaction(
+        client, keys.keys[i], now,
+        group_retirements ? &retirements[count] : NULL, error);
+    if (rc == LC_ERR_INVALID && count) {
+      /* A tight root may need the settled decisions' capacity before it
+       * can replay the next transaction. Retire them and retry once. */
       lc_error_cleanup(error);
-      lc_error_init(error);
-      rc = LC_OK;
-      cleanup_decision = 0;
+      rc = lc_pouch_finish_recovered_batch(client, retirements, &count, LC_OK,
+                                           error);
+      if (rc == LC_OK)
+        rc = lc_pouch_recover_transaction(client, keys.keys[i], now,
+                                          &retirements[0], error);
     }
-    if (managed || lc_pouch_xa_has_participants(&req))
-      cleanup_decision = 0;
-    if (rc == LC_OK && cleanup_decision) {
-      rc = lc_pouch_txn_delete_recovered_record(client, keys.keys[i], error);
-    }
-    if (sink != NULL) {
-      lc_sink_close(sink);
-    }
-    lc_free_with_allocator(NULL, body);
-    lc_pouch_txn_record_cleanup(&record);
-    lc_pouch_state_read_result_cleanup(&client->allocator, &read_result);
-    lc_pouch_txn_guard_release(&guard);
+    if (rc == LC_OK && retirements[count].object.key != NULL &&
+        ++count == LC_POUCH_RECOVERY_RETIRE_LIMIT)
+      rc = lc_pouch_finish_recovered_batch(client, retirements, &count, LC_OK,
+                                           error);
   }
+  rc = lc_pouch_finish_recovered_batch(client, retirements, &count, rc, error);
   lc_pouch_txn_key_list_cleanup(&keys);
   return rc;
 }
