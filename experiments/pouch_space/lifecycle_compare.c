@@ -20,12 +20,13 @@
 #include <unistd.h>
 
 typedef struct comparison comparison;
-enum { ROUNDS_PER_WINDOW = 16, MAX_ROUNDS = 128 };
+enum { ROUNDS_PER_WINDOW = 16, MAX_ROUNDS = 128, MAX_WRITERS = 16 };
 typedef struct work_window {
   double started, finished;
 } work_window;
 typedef struct open_phases {
-  double owner, joins;
+  double owner, joins, joins_cpu, slowest_join;
+  uint64_t parallel_sync_calls;
 } open_phases;
 typedef struct index_phase {
   double seconds, cpu_seconds, sync_seconds;
@@ -53,7 +54,7 @@ typedef struct worker {
 struct comparison {
   size_t rows, bytes, writers, rounds;
   int container, outbox, xa, index, sync, started, preopened, stable_index;
-  int shared, warm_queues, reclaim;
+  int shared, warm_queues, reclaim, parallel_joins;
   lc_client *client;
   worker *workers;
   double *latencies;
@@ -239,6 +240,63 @@ static void entry_init(worker *w, size_t row, lc_outbox_entry *entry,
   entry->content_type = "application/json";
   entry->payload_digest = w->run->digest;
 }
+static void open_client(const comparison *run, const lc_client_config *config,
+                        int create, lc_client **out, lc_error *e) {
+  check(run->container ? ps_pouch_client_open(config, create, NULL, out, e)
+                       : lc_client_open(config, out, e),
+        e);
+}
+typedef struct join_job {
+  const comparison *run;
+  const lc_client_config *config;
+  lc_client **out;
+  pthread_barrier_t *start;
+  index_phase measured;
+} join_job;
+static void index_phase_begin(index_phase *);
+static void index_phase_end(index_phase *);
+static void join_start(pthread_barrier_t *barrier) {
+  int rc = pthread_barrier_wait(barrier);
+  require(!rc || rc == PTHREAD_BARRIER_SERIAL_THREAD, "start live joins");
+}
+static void *run_join(void *context) {
+  join_job *job = context;
+  lc_error e = {0};
+  join_start(job->start);
+  index_phase_begin(&job->measured);
+  open_client(job->run, job->config, 0, job->out, &e);
+  index_phase_end(&job->measured);
+  lc_error_cleanup(&e);
+  return NULL;
+}
+static void open_parallel_joins(comparison *run, const lc_client_config *config,
+                                open_phases *phases) {
+  join_job jobs[MAX_WRITERS] = {0};
+  pthread_t threads[MAX_WRITERS];
+  pthread_barrier_t barrier;
+  require(!pthread_barrier_init(&barrier, NULL, (unsigned)run->writers + 1U),
+          "initialize live join start");
+  for (size_t i = 0; i < run->writers; ++i) {
+    jobs[i].run = run;
+    jobs[i].config = config;
+    jobs[i].out = &run->workers[i].producer_client;
+    jobs[i].start = &barrier;
+    require(!pthread_create(&threads[i], NULL, run_join, &jobs[i]),
+            "start live join worker");
+  }
+  double started = now(CLOCK_MONOTONIC);
+  join_start(&barrier);
+  for (size_t i = 0; i < run->writers; ++i) {
+    require(!pthread_join(threads[i], NULL), "finish live join worker");
+    const index_phase *measured = &jobs[i].measured;
+    phases->joins_cpu += measured->cpu_seconds;
+    phases->parallel_sync_calls += measured->sync_calls;
+    if (measured->seconds > phases->slowest_join)
+      phases->slowest_join = measured->seconds;
+  }
+  phases->joins = now(CLOCK_MONOTONIC) - started;
+  require(!pthread_barrier_destroy(&barrier), "close live join start");
+}
 static void open_store(comparison *run, int create, open_phases *phases,
                        lc_error *e) {
   lc_client_config config;
@@ -269,24 +327,31 @@ static void open_store(comparison *run, int create, open_phases *phases,
   config.default_namespace = "bench";
   config.pouch_settings = &settings;
   double started = phases ? now(CLOCK_MONOTONIC) : 0;
-  check(run->container
-            ? ps_pouch_client_open(&config, create, NULL, &run->client, e)
-            : lc_client_open(&config, &run->client, e),
-        e);
+  open_client(run, &config, create, &run->client, e);
   if (phases) {
     double finished = now(CLOCK_MONOTONIC);
     phases->owner = finished - started;
     started = finished;
   }
   settings.background_compaction_enabled = 0;
-  for (size_t i = 0U; run->shared && i < run->writers; ++i) {
-    lc_client **producer = &run->workers[i].producer_client;
-    check(run->container ? ps_pouch_client_open(&config, 0, NULL, producer, e)
-                         : lc_client_open(&config, producer, e),
-          e);
+  if (phases && run->parallel_joins) {
+    open_parallel_joins(run, &config, phases);
+  } else if (run->shared) {
+    double cpu = phases ? now(CLOCK_THREAD_CPUTIME_ID) : 0;
+    for (size_t i = 0U; i < run->writers; ++i) {
+      double opened_at = phases ? now(CLOCK_MONOTONIC) : 0;
+      open_client(run, &config, 0, &run->workers[i].producer_client, e);
+      if (phases) {
+        double elapsed = now(CLOCK_MONOTONIC) - opened_at;
+        if (elapsed > phases->slowest_join)
+          phases->slowest_join = elapsed;
+      }
+    }
+    if (phases) {
+      phases->joins = now(CLOCK_MONOTONIC) - started;
+      phases->joins_cpu = now(CLOCK_THREAD_CPUTIME_ID) - cpu;
+    }
   }
-  if (phases && run->shared)
-    phases->joins = now(CLOCK_MONOTONIC) - started;
   for (size_t i = 0U; run->outbox && i < run->writers; ++i) {
     lc_outbox_config outbox;
     lc_outbox_config_init(&outbox);
@@ -539,7 +604,7 @@ static void *run_worker(void *context) {
     if (w->result == LC_OK && run->index) {
       phase = "index readiness";
       double start = now(CLOCK_MONOTONIC);
-      w->result = index_queries(w, 1, &e);
+      w->result = index_queries(w, run->client, 1, &e);
       window->finished = now(CLOCK_MONOTONIC);
       w->index_seconds += window->finished - start;
     }
@@ -736,7 +801,7 @@ int main(int argc, char **argv) {
   struct rusage usage;
   require(argc >= 7,
           "MODE DIRECTORY ROWS BYTES SYNC WRITERS [--reopen] [--rounds N] "
-          "[--stable-index] [--warm-queues] [--reclaim]");
+          "[--stable-index] [--warm-queues] [--reclaim] [--parallel-joins]");
   require(
       !strcmp(argv[1], "pouch-queue") || !strcmp(argv[1], "runtime-queue") ||
           !strcmp(argv[1], "runtime-shared-queue") ||
@@ -767,6 +832,8 @@ int main(int argc, char **argv) {
       run.warm_queues = 1;
     else if (!strcmp(argv[i], "--reclaim") && !run.reclaim)
       run.reclaim = 1;
+    else if (!strcmp(argv[i], "--parallel-joins") && !run.parallel_joins)
+      run.parallel_joins = 1;
     else
       require(0, "unknown or incomplete comparison option");
   }
@@ -778,7 +845,9 @@ int main(int argc, char **argv) {
   run.rows = number(argv[3], 1U, 64U);
   run.bytes = number(argv[4], 64U, PS_MIB);
   run.sync = (int)number(argv[5], 0U, 1U);
-  run.writers = number(argv[6], 1U, 16U);
+  run.writers = number(argv[6], 1U, MAX_WRITERS);
+  require(!run.parallel_joins || (run.shared && run.writers > 1U),
+          "parallel-joins requires a shared workload with multiple writers");
   require(run.writers <= run.rows && run.rows * (run.bytes + 8192U) *
                                              (run.reclaim ? 1 : run.rounds) *
                                              4U <
@@ -903,6 +972,10 @@ int main(int argc, char **argv) {
   index_phase_end(&reopening);
   require(reopened.owner + reopened.joins <= reopening.seconds,
           "owner and join timers belong to the reopen interval");
+  require(!run.shared || (reopened.slowest_join > 0.0 &&
+                          reopened.slowest_join <= reopened.joins &&
+                          reopened.joins_cpu > 0.0),
+          "all live joins completed in the measured cohort");
   /* Reopened query passes have their own thread attribution. Their parent
    * interval deliberately uses wall time only so those phases do not nest. */
   start = now(CLOCK_MONOTONIC);
@@ -979,7 +1052,8 @@ int main(int argc, char **argv) {
       "index_first_pass_sync_ms=%.6f index_repeat_pass_sync_ms=%.6f "
       "reopen_first_pass_ms=%.6f reopen_repeat_pass_ms=%.6f "
       "indexed_queries=%zu reclaim=%d work_checkpoints=%llu "
-      "work_allocated_bytes=%llu verified=1\n",
+      "work_allocated_bytes=%llu parallel_joins=%d reopen_joins_cpu_ms=%.6f "
+      "reopen_slowest_join_ms=%.6f verified=1\n",
       argv[1], run.rows, run.bytes, run.writers, run.sync, run.preopened,
       run.rounds, run.stable_index, run.warm_queues, lifecycle_seconds * 1e3,
       cpu_seconds * 1e3, run.latencies[(run.rows * run.rounds - 1U) / 2U] * 1e3,
@@ -993,8 +1067,8 @@ int main(int argc, char **argv) {
       (unsigned long long)mutation_sync_calls, mutation_sync_seconds * 1e3,
       (unsigned long long)maintenance.sync_calls,
       (unsigned long long)closing.sync_calls,
-      (unsigned long long)reopening.sync_calls, usage.ru_maxrss,
-      max_index_seconds * 1e3, max_phase_seconds[0] * 1e3,
+      (unsigned long long)(reopening.sync_calls + reopened.parallel_sync_calls),
+      usage.ru_maxrss, max_index_seconds * 1e3, max_phase_seconds[0] * 1e3,
       max_phase_seconds[1] * 1e3, max_phase_seconds[2] * 1e3,
       phase_cpu_seconds[0] * 1e3, phase_cpu_seconds[1] * 1e3,
       phase_cpu_seconds[2] * 1e3, (unsigned long long)phase_sync_calls[0],
@@ -1004,7 +1078,8 @@ int main(int argc, char **argv) {
       reopen_phase_seconds[0] * 1e3, reopen_phase_seconds[1] * 1e3,
       run.index ? run.writers * 6U * run.rounds : 0U, run.reclaim,
       (unsigned long long)work_checkpoints,
-      (unsigned long long)native_work.allocated_bytes);
+      (unsigned long long)native_work.allocated_bytes, run.parallel_joins,
+      reopened.joins_cpu * 1e3, reopened.slowest_join * 1e3);
   lc_error_cleanup(&e);
   sync_phase_key_initialized = 0;
   require(!pthread_key_delete(sync_phase_key), "close sync attribution key");

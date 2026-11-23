@@ -79,7 +79,7 @@ static void index_phase_end(index_phase *phase) {
   phase->cpu_seconds += now(CLOCK_THREAD_CPUTIME_ID) - phase->started_cpu;
   require(!pthread_setspecific(sync_phase_key, NULL), "finish index phase");
 }
-static int index_queries(worker *w, int flush, lc_error *e) {
+static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
   static const char *const selectors[] = {
       "{\"exists\":\"/v\"}",
       "{\"prefix\":{\"field\":\"/v\",\"value\":\"ghij\"}}",
@@ -107,10 +107,10 @@ static int index_queries(worker *w, int flush, lc_error *e) {
      * canonical records; its explicit namespace handoff supplies that boundary.
      * Durable mutations have already supplied it in either owner. */
     if (w->run->stable_index && !w->run->container && !w->run->sync)
-      rc = lc_pouch_state_sync_namespace(
-          ((lc_client_handle *)w->run->client)->pouch, w->ns, e);
+      rc = lc_pouch_state_sync_namespace(((lc_client_handle *)client)->pouch,
+                                         w->ns, e);
     if (rc == LC_OK)
-      rc = lc_flush_index(w->run->client, &request, &result, e);
+      rc = lc_flush_index(client, &request, &result, e);
     if (rc == LC_OK)
       require(result.flushed && !result.pending, "completed index flush");
     if (rc == LC_OK) {
@@ -142,7 +142,7 @@ static int index_queries(worker *w, int flush, lc_error *e) {
         query.selector_lql = i == 1U ? current : previous;
       else
         query.selector_json = selectors[i];
-      rc = lc_query_keys(w->run->client, &query, &handler, &keys, &queried, e);
+      rc = lc_query_keys(client, &query, &handler, &keys, &queried, e);
       if (rc == LC_OK)
         require(keys.seen == (w->revision && i == 2U ? 0U : expected) &&
                     queried.metadata_json &&
@@ -159,14 +159,15 @@ static int index_queries(worker *w, int flush, lc_error *e) {
 static void index_verify_reopen(worker *w, lc_error *e) {
   comparison *run = w->run;
   lc_pouch_generation state = 0U, indexed = 0U;
-  lc_pouch *pouch = ((lc_client_handle *)run->client)->pouch;
+  lc_client *client = run->parallel_joins ? w->producer_client : run->client;
+  lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
   check(lc_pouch_state_query_index_seq(pouch, w->ns, &state, e), e);
   check(lc_pouch_query_index_manifest_seq(pouch, w->ns, &indexed, e), e);
   require(state == indexed && state > 0U,
           "published index survives cold reopen");
   if (w->revision)
     require(indexed == w->index_seq, "cold reopen retains last explicit flush");
-  check(index_queries(w, 0, e), e);
+  check(index_queries(w, client, 0, e), e);
   for (size_t row = w->ordinal; row < run->rows; row += run->writers) {
     lc_get_res result = {0};
     consumer sink = {0};
@@ -176,8 +177,7 @@ static void index_verify_reopen(worker *w, lc_error *e) {
     sink.sink.write = consume;
     sink.size = run->bytes;
     sink.revision = w->revision;
-    check(lc_get_in_namespace(run->client, w->ns, key, NULL, &sink.sink,
-                              &result, e),
+    check(lc_get_in_namespace(client, w->ns, key, NULL, &sink.sink, &result, e),
           e);
     require(sink.offset == run->bytes, "indexed value survives reopen");
     lc_get_res_cleanup(&result);

@@ -57,6 +57,12 @@ if(LOCKDC_BUILD_BENCHMARKS)
       set_tests_properties(pouch_space_compare_${mode}_extended_rounds
         PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
       foreach(sync 0 1)
+        add_test(NAME pouch_space_compare_${mode}_parallel_joins_${sync}
+          COMMAND pouch_space_lifecycle_compare ${mode}
+            ${CMAKE_CURRENT_BINARY_DIR} 8 8192 ${sync} 4 --rounds 3
+            --stable-index --parallel-joins)
+        set_tests_properties(pouch_space_compare_${mode}_parallel_joins_${sync}
+          PROPERTIES TIMEOUT 120 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
         add_test(NAME pouch_space_compare_${mode}_reclaim_${sync}
           COMMAND pouch_space_lifecycle_compare ${mode}
             ${CMAKE_CURRENT_BINARY_DIR} 16 65536 ${sync} 2 --reopen --rounds 12

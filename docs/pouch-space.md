@@ -75,6 +75,10 @@ x86_64. Cover process and I/O failure, concurrent owners, retained readers,
 durable and NoSync recovery, fixed-capacity reclamation, explicit growth, and
 transaction completion. Use the applicable Pouch Space CTest groups and the
 [lifecycle comparison](../experiments/pouch_space/lifecycle_compare.c).
+Its `--parallel-joins` option measures a cohort starting together after
+first-owner recovery. It reports elapsed time, join-thread CPU, and the
+slowest individual join. Indexed verification reads and queries through
+each joined client.
 
 Compare matched builds and multifile on representative lease, coordination,
 messaging, and indexed workloads. Record work time, CPU, mutation p95 and
