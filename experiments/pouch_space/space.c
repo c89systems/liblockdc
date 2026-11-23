@@ -9001,13 +9001,19 @@ int ps_flush(ps_space *s, lc_error *error) {
   return sequence ? wait_durable(s, sequence, error)
                   : settle_recovery(s, error);
 }
-int ps_checkpoint(ps_space *s, lc_error *error) {
+static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
+  ps_coordination_guard *guard;
   uint64_t bound;
   int rc;
   if (!s)
     return err(error, LC_ERR_INVALID, "checkpoint requires container");
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
+  if (rc == LC_OK && cleanup && s->readiness && !ps_readiness_resident(s)) {
+    /* A peer may have published canonical work since the cleanup scan. */
+    rc = ps_internal_capture_begin(s, &guard, error);
+    rc = ps_internal_capture_end(s, guard, rc, error);
+  }
   if (rc == LC_OK)
     rc = metadata_claimed_bound(s, s->metadata, s->live_entries, &bound, error);
   if (rc == LC_OK)
@@ -9020,10 +9026,15 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
      * Refresh the bound first: an aborted private producer can leave excess
      * workspace even though it never published a journal record.
      * Growth and explicit repacking call checkpoint_locked directly. */
-    if (s->journal || s->dirty ||
-        __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
-            __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE) ||
-        metadata_trim_needed(s))
+    /* Shared namespace visits can append ownership stamps without changing
+     * the directory. Each stamp-only checkpoint advances the root generation
+     * and invalidates those stamps. Canonical changes mark entries dirty,
+     * including stream tails and admission metadata. */
+    if (s->dirty || metadata_trim_needed(s) ||
+        ((!cleanup || !s->readiness) &&
+         (s->journal ||
+          __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
+              __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))))
       rc = checkpoint_locked(s, error);
     else {
       rc = pins_reclaim_current(s, error);
@@ -9035,6 +9046,12 @@ int ps_checkpoint(ps_space *s, lc_error *error) {
     rc = healthy(s, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
+}
+int ps_checkpoint(ps_space *s, lc_error *error) {
+  return checkpoint(s, 0, error);
+}
+int ps_checkpoint_cleanup(ps_space *s, lc_error *error) {
+  return checkpoint(s, 1, error);
 }
 int ps_metadata_repack(ps_space *s, lc_error *error) {
   int rc;

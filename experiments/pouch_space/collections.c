@@ -1814,7 +1814,9 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
     if (rc == LC_OK &&
         (scan_collections || reclaimed ||
          !ps_coordination_shared(ps_space_coordination(root->space))))
-      rc = ps_checkpoint(root->space, &local);
+      rc = options->cleanup_only && !options->force
+               ? ps_checkpoint_cleanup(root->space, &local)
+               : ps_checkpoint(root->space, &local);
     if (rc != LC_OK) {
       first_rc = rc;
       first = local;

@@ -4169,7 +4169,7 @@ static void maintenance_checkpoint_batch(const char *path, int sync) {
   lc_pouch *writer = NULL, *worker = NULL;
   ps_space *space, *background = NULL;
   ps_reader *old = NULL, *latest = NULL;
-  ps_stats before, after;
+  ps_stats before, after, checkpointed;
   unsigned char body;
   size_t got;
   lc_error e = {0};
@@ -4213,14 +4213,55 @@ static void maintenance_checkpoint_batch(const char *path, int sync) {
   REQUIRE(after.checkpoints == before.checkpoints &&
           after.journal_bytes == before.journal_bytes);
 
-  /* Forced collection maintenance selects the accumulated physical work.
-   * The previously captured incarnation remains readable across selection. */
+  maintain.background = 0;
+  maintain.cleanup_only = 1;
+  maintain.ns = names[0];
+  ok(lc_pouch_maintenance_run(worker, &maintain, NULL, &e), &e);
+  ok(ps_status(background, &checkpointed, &e), &e);
+  REQUIRE(checkpointed.checkpoints == before.checkpoints + 1 &&
+          !checkpointed.journal_bytes);
+
+  /* Cleanup still visits each namespace after checkpointing real work.
+   * Acquiring live ownership alone must not publish a succession of roots. */
+  for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+    maintain.ns = names[i];
+    ok(lc_pouch_maintenance_run(worker, &maintain, NULL, &e), &e);
+  }
+  ok(ps_status(background, &after, &e), &e);
+  REQUIRE(after.checkpoints == checkpointed.checkpoints &&
+          after.syncs == checkpointed.syncs && after.journal_bytes);
+
+  /* A forced maintenance pass also drains live stamps. The old incarnation
+   * remains readable across both forms of checkpoint. */
   maintain.force = 1;
   ok(ps_collection_maintenance_run(ps_pouch_state_root(worker), worker,
                                    &maintain, NULL, &e),
      &e);
   ok(ps_status(background, &after, &e), &e);
-  REQUIRE(after.checkpoints == before.checkpoints + 1 && !after.journal_bytes);
+  REQUIRE(after.checkpoints == checkpointed.checkpoints + 1 &&
+          !after.journal_bytes);
+
+  /* Publish from the other owner after the cleaner cached an empty journal.
+   * Cleanup must import the changed prefix and checkpoint the real work. */
+  {
+    ps_writer *value = NULL;
+    unsigned char version = 3;
+    ok(ps_begin(space, NULL, key, &value, &e), &e);
+    ok(ps_write(value, &version, sizeof(version), &e), &e);
+    ok(ps_publish(value, NULL, &e), &e);
+    ps_writer_close(value);
+  }
+  ok(ps_flush(space, &e), &e);
+  ok(ps_checkpoint_cleanup(background, &e), &e);
+  ok(ps_status(background, &after, &e), &e);
+  REQUIRE(after.checkpoints == checkpointed.checkpoints + 2 &&
+          !after.journal_bytes);
+
+  maintain.force = 0;
+  ok(lc_pouch_maintenance_run(worker, &maintain, NULL, &e), &e);
+  ok(ps_status(background, &after, &e), &e);
+  REQUIRE(after.checkpoints == checkpointed.checkpoints + 2 &&
+          after.journal_bytes);
   ok(ps_read(old, &body, sizeof(body), &got, &e), &e);
   REQUIRE(got == sizeof(body) && body == 1);
   ps_reader_close(old);
@@ -4234,7 +4275,7 @@ static void maintenance_checkpoint_batch(const char *path, int sync) {
   space = ps_root_space(ps_pouch_state_root(writer));
   ok(ps_read_open(space, key, NULL, &latest, &e), &e);
   ok(ps_read(latest, &body, sizeof(body), &got, &e), &e);
-  REQUIRE(got == sizeof(body) && body == 2);
+  REQUIRE(got == sizeof(body) && body == 3);
   ps_reader_close(latest);
   lc_pouch_close(writer);
   REQUIRE(!live && !unlink(path));
