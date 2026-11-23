@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __APPLE__
+#include <sys/mount.h>
+#endif
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -330,6 +333,13 @@ int main(int argc, char **argv) {
   REQUIRE(snprintf(directory, sizeof(directory), "%s/pouch-platform-XXXXXX",
                    argv[1]) < (int)sizeof(directory));
   REQUIRE(mkdtemp(directory));
+#ifdef __APPLE__
+  struct statfs volume;
+  REQUIRE(!statfs(directory, &volume));
+  printf("filesystem=%s page_bytes=%ld available_blocks=%llu block_bytes=%u\n",
+         volume.f_fstypename, sysconf(_SC_PAGESIZE),
+         (unsigned long long)volume.f_bavail, (unsigned int)volume.f_bsize);
+#endif
   REQUIRE(snprintf(path, sizeof(path), "%s/store", directory) <
           (int)sizeof(path));
   ps_space *space = open_shared(path, 1);

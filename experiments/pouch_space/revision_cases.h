@@ -544,7 +544,7 @@ static ssize_t revision_death_write(void *context, int fd, const void *p,
 static int revision_death_sync(void *context, int fd) {
   revision_death_io *io = context;
   revision_death_boundary(io, 0);
-  int rc = fdatasync(fd);
+  int rc = ps_native_io.sync(NULL, fd);
   revision_death_boundary(io, 1);
   return rc;
 }
@@ -552,7 +552,7 @@ static int revision_death_reserve(void *context, int fd, off_t offset,
                                   off_t bytes) {
   revision_death_io *io = context;
   revision_death_boundary(io, 0);
-  int rc = fallocate(fd, 0, offset, bytes);
+  int rc = ps_native_io.reserve(NULL, fd, offset, bytes);
   revision_death_boundary(io, 1);
   return rc;
 }

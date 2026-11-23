@@ -29,12 +29,12 @@ static int abandoned_disk_sync(void *context, int fd) {
   abandoned_io *audit = context;
   if (__atomic_load_n(&audit->enabled, __ATOMIC_ACQUIRE))
     __atomic_add_fetch(&audit->syncs, 1, __ATOMIC_RELAXED);
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int abandoned_disk_reserve(void *context, int fd, off_t offset,
                                   off_t bytes) {
   (void)context;
-  return fallocate(fd, 0, offset, bytes);
+  return ps_native_io.reserve(NULL, fd, offset, bytes);
 }
 static double abandoned_clock(clockid_t kind) {
   struct timespec now;

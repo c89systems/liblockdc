@@ -52,10 +52,35 @@ if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   endif()
 endif()
 
+if(LOCKDC_BUILD_TESTS OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  add_executable(pouch_space_test space_test.c)
+  target_include_directories(pouch_space_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+  target_link_libraries(pouch_space_test PRIVATE pouch_space_experiment)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(pouch_space_test PRIVATE
+      "LINKER:--wrap=lc_alloc_with_allocator"
+      "LINKER:--wrap=lc_calloc_with_allocator"
+      "LINKER:--wrap=lc_realloc_with_allocator"
+      "LINKER:--wrap=lc_strdup_with_allocator")
+  endif()
+  lc_configure_c_test_target(pouch_space_test)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   add_custom_target(pouch_space_smoke
-    DEPENDS pouch_space_platform_test pouch_space_coordination_test)
+    DEPENDS pouch_space_platform_test pouch_space_coordination_test pouch_space_test)
   if(LOCKDC_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING)
+    foreach(mode
+        commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
+        checkpoint-idempotence root-covered-admission root-obligations
+        standing-capacity standing-deletion native-metadata-shared-reserve
+        budget-capacity value-budget-capacity value-budget-concurrency metadata-growth
+        namespace-repack namespace-repack-concurrency namespace-repack-shared-refresh
+        namespace-repack-churn)
+      add_test(NAME pouch_space_${mode} COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+      set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 240
+        LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+    endforeach()
     lc_apply_test_defaults()
   endif()
   return()
@@ -795,15 +820,6 @@ if(LOCKDC_BUILD_TESTS)
   add_test(NAME pouch_space_directory COMMAND pouch_space_directory_test)
   set_tests_properties(pouch_space_directory PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
-  add_executable(pouch_space_test space_test.c)
-  target_link_libraries(pouch_space_test PRIVATE pouch_space_experiment)
-  target_link_options(pouch_space_test PRIVATE
-    "LINKER:--wrap=lc_alloc_with_allocator"
-    "LINKER:--wrap=lc_calloc_with_allocator"
-    "LINKER:--wrap=lc_realloc_with_allocator"
-    "LINKER:--wrap=lc_strdup_with_allocator")
-  target_include_directories(pouch_space_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
-  lc_configure_c_test_target(pouch_space_test)
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
   add_test(NAME pouch_space_checkpoint-idempotence

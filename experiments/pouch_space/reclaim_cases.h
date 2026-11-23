@@ -511,7 +511,7 @@ static void namespace_repack_churn(int durable) {
 }
 static int repack_sync(void *context, int fd) {
   (void)context;
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static void *repack_worker(void *context) {
   repack_actor *a = context;

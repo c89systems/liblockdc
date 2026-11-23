@@ -89,18 +89,31 @@ durable and NoSync recovery, fixed-capacity reclamation, explicit growth, and
 transaction completion. Use the applicable Pouch Space CTest groups and the
 [lifecycle comparison](../experiments/pouch_space/lifecycle_compare.c).
 On Linux, the `pouch_space_smoke` target builds all executables selected by
-the `pouch-space` CTest label. On Apple Silicon it builds the platform and
-coordination executables. The platform probe checks owner death before and
-after publication, retained reads, growth from independently opened owners,
-lease fencing, and durable queue and collection behavior. The coordination
-suite checks lock lifetimes, large offsets, concurrent threads and processes,
-and injected I/O and lock failures.
+the `pouch-space` CTest label. On Apple Silicon it builds the platform,
+coordination, and physical storage executables. The platform probe checks
+owner death before and after publication, retained reads, growth from
+independently opened owners, lease fencing, and durable queue and collection
+behavior. The coordination suite checks lock lifetimes, large offsets,
+concurrent threads and processes, and injected I/O and lock failures.
+The physical storage suite covers
+protected completion at fixed capacity, concurrent namespace repack, and
+recovery from modeled write loss using the native storage callbacks.
 
 The cross-built binaries can run directly on Apple Silicon. Pass the platform
 probe a writable directory on APFS. Pass the coordination executable the same
 directory and one of `lifecycle`, `root-lifetime`, `large-offsets`, `threads`,
-`faults`, or `processes`. Native APFS verification also needs to establish how
-filesystem headroom affects maintenance after in-container space runs out.
+`faults`, or `processes`. The platform probe reports filesystem type, page
+size, and available volume blocks. With a native test build,
+`ctest -L pouch-space` runs all three suites. Record available volume space
+alongside any capacity failure so container pressure can be distinguished from
+filesystem exhaustion.
+
+For cold cross-platform file exchange, `pouch_space_test FILE wire-create`
+writes a checkpointed value and a later journal publication.
+`pouch_space_test FILE wire-verify` cold-opens the copy and verifies
+both values. For an SDK collection image, run `pouch_space_platform_test FILE`
+with `--write-collection` on the source host and `--verify-collection` on the
+destination. Use a new image in each direction.
 
 The lifecycle comparison's `--parallel-joins` option measures a cohort
 starting together after first-owner recovery. It reports elapsed time,

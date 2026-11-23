@@ -11,7 +11,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/falloc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,17 +26,18 @@ static char path[1024], other[1024];
 static size_t checks;
 static size_t allocation_call, allocation_fail;
 static size_t allocation_max;
-static int measure_allocations;
+static int measure_allocations __attribute__((unused));
 static void fixture_put(unsigned char *, uint64_t, size_t);
 typedef struct allocation_pause {
   pthread_mutex_t mutex;
   pthread_cond_t cond;
   int entered, released;
 } allocation_pause;
-static allocation_pause *paused_allocation;
+static allocation_pause *paused_allocation __attribute__((unused));
 
 /* Linker fault seam: exercise real allocation failures without another mode in
  * the storage interface. Disabled during concurrency and error cleanup. */
+#ifdef __linux__
 void *__real_lc_alloc_with_allocator(const lc_allocator *, size_t);
 void *__real_lc_calloc_with_allocator(const lc_allocator *, size_t, size_t);
 void *__real_lc_realloc_with_allocator(const lc_allocator *, void *, size_t);
@@ -78,6 +78,7 @@ char *__wrap_lc_strdup_with_allocator(const lc_allocator *a, const char *s) {
              ? NULL
              : __real_lc_strdup_with_allocator(a, s);
 }
+#endif
 #define CHECK(x)                                                               \
   do {                                                                         \
     ++checks;                                                                  \
@@ -377,7 +378,7 @@ static int model_sync(void *v, int fd) {
     errno = EIO;
     return -1;
   }
-  CHECK(fdatasync(fd) == 0);
+  CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(fstat(fd, &st) == 0 && st.st_size <= (off_t)m->stable_capacity);
   m->stable_bytes = (size_t)st.st_size;
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
@@ -389,7 +390,7 @@ static int model_reserve(void *v, int fd, off_t offset, off_t n) {
     errno = ENOSPC;
     return -1;
   }
-  return fallocate(fd, 0, offset, n);
+  return ps_native_io.reserve(NULL, fd, offset, n);
 }
 static int model_zero(void *v, int fd, off_t offset, off_t n) {
   model *m = v;
@@ -401,14 +402,13 @@ static int model_zero(void *v, int fd, off_t offset, off_t n) {
     errno = EINTR;
     return -1;
   }
-  if (m->unsupported_zero) {
+  if (m->unsupported_zero || !ps_native_io.zero) {
     errno = EOPNOTSUPP;
     return -1;
   }
   if (fail(m)) {
     if (m->tear && n > 1) {
-      CHECK(fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, offset,
-                      n / 2) == 0);
+      CHECK(ps_native_io.zero(NULL, fd, offset, n / 2) == 0);
       if (m->persist_torn &&
           (uint64_t)offset + (uint64_t)n / 2 <= m->stable_bytes)
         memset(m->stable + offset, 0, (size_t)n / 2);
@@ -416,7 +416,7 @@ static int model_zero(void *v, int fd, off_t offset, off_t n) {
     errno = EIO;
     return -1;
   }
-  rc = fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, offset, n);
+  rc = ps_native_io.zero(NULL, fd, offset, n);
   if (rc == 0) {
     CHECK(fstat(fd, &st) == 0 && (uint64_t)st.st_size == m->stable_bytes);
     CHECK((uint64_t)st.st_blocks * 512 >= (uint64_t)st.st_size);
@@ -438,8 +438,8 @@ static void crash(model *m) {
   int fd = open(path, O_RDWR | O_TRUNC);
   CHECK(fd >= 0);
   CHECK(pwrite(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
-  CHECK(fallocate(fd, 0, 0, (off_t)m->stable_bytes) == 0);
-  CHECK(fdatasync(fd) == 0);
+  CHECK(ps_native_io.reserve(NULL, fd, 0, (off_t)m->stable_bytes) == 0);
+  CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(close(fd) == 0);
   m->fail_at = m->operations = 0;
 }
@@ -1168,7 +1168,7 @@ static ps_ref reopen_sanitize_fixture(model *m, const ps_io *io, int durable,
     CHECK(pwrite(fd, old_root, sizeof(old_root), (off_t)sibling) ==
           (ssize_t)sizeof(old_root));
   }
-  CHECK(fdatasync(fd) == 0);
+  CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);
   CHECK(close(fd) == 0);
   free(journal);
@@ -1421,11 +1421,11 @@ static int gate_sync(void *v, int fd) {
     errno = EIO;
     return -1;
   }
-  return fdatasync(fd);
+  return ps_native_io.sync(NULL, fd);
 }
 static int gate_reserve(void *v, int fd, off_t offset, off_t bytes) {
   (void)v;
-  return fallocate(fd, 0, offset, bytes);
+  return ps_native_io.reserve(NULL, fd, offset, bytes);
 }
 static int gate_zero(void *v, int fd, off_t offset, off_t bytes) {
   commit_gate *g = v;
@@ -1437,8 +1437,11 @@ static int gate_zero(void *v, int fd, off_t offset, off_t bytes) {
       pthread_cond_wait(&g->cond, &g->mutex);
   }
   pthread_mutex_unlock(&g->mutex);
-  return fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, offset,
-                   bytes);
+  if (!ps_native_io.zero) {
+    errno = EOPNOTSUPP;
+    return -1;
+  }
+  return ps_native_io.zero(NULL, fd, offset, bytes);
 }
 static void await_gate(commit_gate *g, int phase) {
   struct timespec deadline;
@@ -2871,7 +2874,7 @@ static void packing_invalid_ownership(void) {
       fixture_put(buffer + 48, crc32(crc, buffer + 52, PS_PAGE - 52), 4);
       CHECK(pwrite(fd, buffer, PS_PAGE, (off_t)offset) == PS_PAGE);
     }
-    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
     CHECK(ps_open(path, 0, NULL, &s, &error) == LC_ERR_PROTOCOL && s == NULL);
     lc_error_cleanup(&error);
   }
@@ -4422,7 +4425,7 @@ static void canonical_stream_invalid_metadata(void) {
       page[0] ^= 1; /* checkpointed run identity, not canonical tail damage */
       CHECK(pwrite(fd, page, 1, PS_DATA) == 1);
     }
-    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
     if (phase < 3) {
       CHECK(ps_open(path, 0, NULL, &space, &error) == LC_ERR_PROTOCOL);
       CHECK(space == NULL);
@@ -4629,10 +4632,10 @@ static void canonical_stream_grown_tail(int native_zero) {
   /* Extra file bytes are outside the committed capacity. Preallocation must
    * not turn their existing contents into a durable zero certificate. */
   fd = open(path, O_RDWR);
-  CHECK(fd >= 0 && fallocate(fd, 0, PS_MIB, PS_MIB) == 0);
+  CHECK(fd >= 0 && ps_native_io.reserve(NULL, fd, PS_MIB, PS_MIB) == 0);
   CHECK(pwrite(fd, frame, sizeof(frame), PS_MIB + PS_RUN_HEADER) ==
         (ssize_t)sizeof(frame));
-  CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+  CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
   space = reopen(&io);
   OK(ps_status(space, &before, &error));
   CHECK(before.capacity == PS_MIB);
@@ -5342,7 +5345,7 @@ static void stream_lifecycle_invalid_events(void) {
                   4); /* sealed creation cannot bypass dependency ordering */
     fixture_entry_crc(wire);
     CHECK(pwrite(fd, wire, sizeof(wire), at) == (ssize_t)sizeof(wire));
-    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
     if (phase == 4 || phase == 5 || phase == 7) {
       CHECK(ps_open(path, 0, NULL, &space, &error) == LC_ERR_PROTOCOL &&
             space == NULL);
@@ -6242,7 +6245,7 @@ static void catalog_invalid_records(void) {
     }
     fixture_entry_crc(wire);
     CHECK(pwrite(fd, wire, bytes, offset) == (ssize_t)bytes);
-    CHECK(fdatasync(fd) == 0 && close(fd) == 0);
+    CHECK(ps_native_io.sync(NULL, fd) == 0 && close(fd) == 0);
     if (phase == 3 || phase >= 5) {
       CHECK(ps_open(path, 0, NULL, &space, &error) == LC_ERR_PROTOCOL &&
             space == NULL);
@@ -7831,6 +7834,124 @@ static void bounded_pieces(int durable, int checkpointed) {
 #include "reclaim_cases.h"
 #include "revision_cases.h"
 #include "tail_cases.h"
+static int run_portable_case(const char *mode) {
+  if (!strcmp(mode, "native-metadata-shared-reserve")) {
+    for (int durable = 0; durable < 2; ++durable)
+      native_metadata_shared_reserve(durable);
+    return 1;
+  }
+  if (!strcmp(mode, "standing-capacity")) {
+    for (int durable = 0; durable < 2; ++durable)
+      standing_capacity(durable);
+    return 1;
+  }
+  if (!strcmp(mode, "standing-deletion")) {
+    for (int durable = 0; durable < 2; ++durable) {
+      /* The first case aligns the admitted checkpoint byte bound to a page.
+       */
+      standing_deletion(durable, 3491);
+      standing_deletion(durable, 60 * 1024);
+      standing_deletion(durable, (size_t)PS_MIB);
+    }
+    return 1;
+  }
+  if (!strcmp(mode, "root-covered-admission")) {
+    for (int durable = 0; durable < 2; ++durable) {
+      covered_root_admission(durable);
+      covered_root_process_tail(durable);
+    }
+    return 1;
+  }
+  if (!strcmp(mode, "root-obligations")) {
+    for (int durable = 0; durable < 2; ++durable)
+      for (int partial = 0; partial < 2; ++partial)
+        for (int full = 0; full < 2; ++full)
+          root_obligations(durable, partial, full);
+    return 1;
+  }
+  if (!strcmp(mode, "checkpoint-idempotence")) {
+    for (int durable = 0; durable < 2; ++durable)
+      checkpoint_idempotence(durable);
+    return 1;
+  }
+  if (!strcmp(mode, "namespace-repack")) {
+    for (int durable = 0; durable < 2; ++durable)
+      namespace_repack(durable);
+    return 1;
+  }
+  if (!strcmp(mode, "namespace-repack-concurrency")) {
+    for (int durable = 0; durable < 2; ++durable)
+      namespace_repack_concurrency(durable, 0);
+    return 1;
+  }
+  if (!strcmp(mode, "namespace-repack-shared-refresh")) {
+    for (int durable = 0; durable < 2; ++durable)
+      namespace_repack_concurrency(durable, 1);
+    return 1;
+  }
+  if (!strcmp(mode, "namespace-repack-churn")) {
+    for (int durable = 0; durable < 2; ++durable)
+      namespace_repack_churn(durable);
+    return 1;
+  }
+  if (!strcmp(mode, "value-budget-capacity")) {
+    for (int durable = 0; durable < 2; ++durable)
+      for (int fragmented = 0; fragmented < 2; ++fragmented)
+        value_budget_capacity(durable, fragmented);
+    return 1;
+  }
+  if (!strcmp(mode, "value-budget-concurrency")) {
+    value_budget_concurrency();
+    return 1;
+  }
+  if (!strcmp(mode, "budget-capacity")) {
+    budget_capacity(0);
+    budget_capacity(1);
+    return 1;
+  }
+  if (!strcmp(mode, "commit")) {
+    commit_coordination();
+    return 1;
+  }
+  if (!strcmp(mode, "reopen-ordering")) {
+    reopen_cleanup_ordering();
+    shared_pool_power_loss();
+    exclusive_close_recovery(CLOSE_PROOF_COVERED);
+    exclusive_close_recovery(CLOSE_PROOF_TORN);
+    exclusive_close_recovery(CLOSE_PROOF_ADVANCED);
+    exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH);
+    nosync_close_recovery(NOSYNC_RECOVERY_FLUSH);
+    nosync_close_recovery(NOSYNC_RECOVERY_MUTATE);
+    nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
+    nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
+    return 1;
+  }
+  if (!strcmp(mode, "reopen-sanitize")) {
+    reopen_sanitization();
+    return 1;
+  }
+  if (!strcmp(mode, "reopen-portable")) {
+    portable_image(path, 1);
+    portable_image(path, 0);
+    clean();
+    return 1;
+  }
+  if (!strcmp(mode, "reopen")) {
+    reopen_retirement();
+    return 1;
+  }
+  if (!strcmp(mode, "metadata-growth")) {
+    metadata_growth();
+    return 1;
+  }
+  if (!strcmp(mode, "crash-boundaries")) {
+    fault_boundaries();
+    reordered_nosync();
+    return 1;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
@@ -7846,15 +7967,14 @@ int main(int argc, char **argv) {
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
   if (argc == 3) {
-    if (strcmp(argv[2], "native-metadata") == 0) {
+    if (run_portable_case(argv[2])) {
+#ifdef __linux__
+    } else if (strcmp(argv[2], "native-metadata") == 0) {
       for (int durable = 0; durable < 2; ++durable) {
         native_metadata_lifecycle(durable);
         native_metadata_stage_peer(durable);
         native_metadata_retirement(durable);
       }
-    } else if (strcmp(argv[2], "native-metadata-shared-reserve") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        native_metadata_shared_reserve(durable);
     } else if (strcmp(argv[2], "native-metadata-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int kind = 0; kind < 3; ++kind)
@@ -7905,36 +8025,12 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "standing-owners") == 0) {
       standing_value_bound();
       standing_owners();
-    } else if (strcmp(argv[2], "standing-capacity") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        standing_capacity(durable);
     } else if (strcmp(argv[2], "standing-concurrency") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         standing_concurrency(durable);
-    } else if (strcmp(argv[2], "standing-deletion") == 0) {
-      for (int durable = 0; durable < 2; ++durable) {
-        /* The first case aligns the admitted checkpoint byte bound to a page.
-         */
-        standing_deletion(durable, 3491);
-        standing_deletion(durable, 60 * 1024);
-        standing_deletion(durable, (size_t)PS_MIB);
-      }
-    } else if (strcmp(argv[2], "root-covered-admission") == 0) {
-      for (int durable = 0; durable < 2; ++durable) {
-        covered_root_admission(durable);
-        covered_root_process_tail(durable);
-      }
-    } else if (strcmp(argv[2], "root-obligations") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        for (int partial = 0; partial < 2; ++partial)
-          for (int full = 0; full < 2; ++full)
-            root_obligations(durable, partial, full);
     } else if (strcmp(argv[2], "root-obligation-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         root_obligation_faults(durable);
-    } else if (strcmp(argv[2], "checkpoint-idempotence") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        checkpoint_idempotence(durable);
     } else if (strcmp(argv[2], "checkpoint-records") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_records(durable);
@@ -7944,18 +8040,6 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[2], "checkpoint-ranges") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_ranges(durable);
-    } else if (strcmp(argv[2], "namespace-repack") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        namespace_repack(durable);
-    } else if (strcmp(argv[2], "namespace-repack-concurrency") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        namespace_repack_concurrency(durable, 0);
-    } else if (strcmp(argv[2], "namespace-repack-shared-refresh") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        namespace_repack_concurrency(durable, 1);
-    } else if (strcmp(argv[2], "namespace-repack-churn") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        namespace_repack_churn(durable);
     } else if (strcmp(argv[2], "owned-repack-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int bitmap = 0; bitmap < 2; ++bitmap)
@@ -8005,15 +8089,9 @@ int main(int argc, char **argv) {
         value_budget_lifecycle(durable);
     } else if (strcmp(argv[2], "value-budget-process") == 0) {
       value_budget_process();
-    } else if (strcmp(argv[2], "value-budget-capacity") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        for (int fragmented = 0; fragmented < 2; ++fragmented)
-          value_budget_capacity(durable, fragmented);
     } else if (strcmp(argv[2], "value-budget-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         value_budget_faults(durable);
-    } else if (strcmp(argv[2], "value-budget-concurrency") == 0) {
-      value_budget_concurrency();
     } else if (strcmp(argv[2], "append-budget") == 0) {
       append_budget_planning();
       append_growth_high_water();
@@ -8037,31 +8115,7 @@ int main(int argc, char **argv) {
       budget_lifecycle(1);
       budget_concurrency();
       budget_allocation_faults();
-    } else if (strcmp(argv[2], "budget-capacity") == 0) {
-      budget_capacity(0);
-      budget_capacity(1);
-    } else if (strcmp(argv[2], "commit") == 0)
-      commit_coordination();
-    else if (strcmp(argv[2], "reopen-ordering") == 0) {
-      reopen_cleanup_ordering();
-      shared_pool_power_loss();
-      exclusive_close_recovery(CLOSE_PROOF_COVERED);
-      exclusive_close_recovery(CLOSE_PROOF_TORN);
-      exclusive_close_recovery(CLOSE_PROOF_ADVANCED);
-      exclusive_close_recovery(CLOSE_PROOF_SHARED_SWITCH);
-      nosync_close_recovery(NOSYNC_RECOVERY_FLUSH);
-      nosync_close_recovery(NOSYNC_RECOVERY_MUTATE);
-      nosync_close_recovery(NOSYNC_RECOVERY_WRITE_FAILURE);
-      nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
-    } else if (strcmp(argv[2], "reopen-sanitize") == 0)
-      reopen_sanitization();
-    else if (strcmp(argv[2], "reopen-portable") == 0) {
-      portable_image(path, 1);
-      portable_image(path, 0);
-      clean();
-    } else if (strcmp(argv[2], "reopen") == 0)
-      reopen_retirement();
-    else if (strcmp(argv[2], "metadata") == 0) {
+    } else if (strcmp(argv[2], "metadata") == 0) {
       metadata_lifecycle();
       metadata_faults(0);
       metadata_recovery_allocations();
@@ -8075,8 +8129,6 @@ int main(int argc, char **argv) {
       metadata_repack_surfaces();
     } else if (strcmp(argv[2], "metadata-repack-faults") == 0) {
       metadata_faults(1);
-    } else if (strcmp(argv[2], "metadata-growth") == 0) {
-      metadata_growth();
     } else if (strcmp(argv[2], "metadata-growth-faults") == 0) {
       metadata_growth_faults();
     } else if (strcmp(argv[2], "packing") == 0) {
@@ -8168,12 +8220,19 @@ int main(int argc, char **argv) {
       canonical_stream_prepared_pool(2);
       canonical_stream_preparation_faults(0, 0, 1);
       canonical_stream_preparation_faults(1, 0, 1);
-    } else
+    } else {
       return 2;
+#else
+    } else {
+      fprintf(stderr, "Unavailable Pouch Space test case: %s\n", argv[2]);
+      return 2;
+#endif
+    }
     lc_error_cleanup(&error);
     printf("pouch-space %s: %zu observable checks passed\n", argv[2], checks);
     return 0;
   }
+#ifdef __linux__
   basic();
   streaming_capacity();
   fault_boundaries();
@@ -8189,4 +8248,7 @@ int main(int argc, char **argv) {
   lc_error_cleanup(&error);
   printf("pouch-space: %zu observable checks passed\n", checks);
   return 0;
+#else
+  return 2;
+#endif
 }

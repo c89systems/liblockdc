@@ -27,11 +27,13 @@ static ssize_t checkpoint_probe_write(void *context, int fd, const void *bytes,
                                         : pwrite(fd, bytes, length, offset);
 }
 static int checkpoint_probe_sync(void *context, int fd) {
-  return checkpoint_probe_call(context) ? -1 : fdatasync(fd);
+  return checkpoint_probe_call(context) ? -1 : ps_native_io.sync(NULL, fd);
 }
 static int checkpoint_probe_reserve(void *context, int fd, off_t offset,
                                      off_t length) {
-  return checkpoint_probe_call(context) ? -1 : fallocate(fd, 0, offset, length);
+  return checkpoint_probe_call(context)
+             ? -1
+             : ps_native_io.reserve(NULL, fd, offset, length);
 }
 static void checkpoint_unchanged(ps_space *space, checkpoint_probe *probe) {
   ps_stats before, after;
@@ -903,7 +905,7 @@ static int checkpoint_model_sync(void *context, int fd) {
     errno = EIO;
     return -1;
   }
-  CHECK(fdatasync(fd) == 0);
+  CHECK(ps_native_io.sync(NULL, fd) == 0);
   CHECK(fstat(fd, &st) == 0 && st.st_size <= (off_t)PS_DEFAULT_CAPACITY);
   m->stable_bytes = (size_t)st.st_size;
   CHECK(pread(fd, m->stable, m->stable_bytes, 0) == (ssize_t)m->stable_bytes);

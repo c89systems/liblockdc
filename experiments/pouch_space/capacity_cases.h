@@ -638,7 +638,7 @@ static void covered_root_process_tail(int durable) {
     lc_pouch_state_entry_cleanup(&allocator, &streamed);
     CHECK(!input.remaining && input.calls > 1);
     /* Model data reaching disk before the writer can publish its new tail. */
-    CHECK(fdatasync(ps_root_space(root)->fd) == 0);
+    CHECK(ps_native_io.sync(NULL, ps_root_space(root)->fd) == 0);
     _exit(0);
   }
   CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
