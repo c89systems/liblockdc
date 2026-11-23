@@ -57,10 +57,12 @@ typedef struct namespace_admission {
   int private_failure;
 } namespace_admission;
 static int check_namespace(void *context, const void *name, size_t length,
-                           const ps_catalog_info *binding, lc_error *error) {
+                           const ps_catalog_info *binding, unsigned int kind,
+                           lc_error *error) {
   namespace_admission *admission = context;
   int proven = 0;
   int rc = namespace_catalog_binding(name, length, binding, error);
+  (void)kind;
   if (rc == LC_OK)
     rc = ps_namespace_admission_proven_locked(
         admission->space, binding->id, admission->prefix, &proven,
@@ -79,7 +81,7 @@ static int check_namespaces(ps_space *space, int *proven, lc_error *error) {
     admission.space = space;
     admission.prefix =
         __atomic_load_n(&space->durable_sequence, __ATOMIC_ACQUIRE);
-    rc = ps_internal_catalog_visit_locked(space, 0, PS_CATALOG_NAMESPACE,
+    rc = ps_internal_catalog_visit_locked(space, 0, 1U << PS_CATALOG_NAMESPACE,
                                           admission.prefix, check_namespace,
                                           &admission, error);
     /* A peer can advance the root and reuse control bytes during the pass.

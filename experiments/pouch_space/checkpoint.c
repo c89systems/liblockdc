@@ -1014,12 +1014,20 @@ int ps_key_checkpoint_open(ps_namespace *ns, ps_key_checkpoint **out,
     ps_key_checkpoint_close(c);
   return rc;
 }
+static int match_current_seed(void *context, ps_key key, uint64_t incarnation) {
+  ps_key_checkpoint *c = context;
+  key_slot *slot;
+  if (key.kind == PS_NAMESPACE_CHECKPOINT)
+    return key.key == 1 && incarnation == c->selected.control;
+  slot = find_id(c, key.key);
+  return slot && slot->kind == key.kind &&
+         slot->selected_incarnation == incarnation;
+}
 static int seed_matches(ps_key_checkpoint *c, const ps_values *values,
                         const ps_checkpoint_info *coverage, int *matches,
                         lc_error *e) {
   ps_key key;
   ps_ref ref;
-  key_slot *slot;
   uint64_t bytes;
   size_t i, count = 0;
   int rc = LC_OK, same;
@@ -1028,12 +1036,23 @@ static int seed_matches(ps_key_checkpoint *c, const ps_values *values,
     rc = ps_values_info(values, i, &key, &ref, &bytes, e);
     if (rc != LC_OK || key.kind == PS_NAMESPACE_CHECKPOINT)
       continue;
-    slot = find_id(c, key.key);
-    same = slot && slot->kind == key.kind &&
-           slot->selected_incarnation == ref.incarnation;
+    same = match_current_seed(c, key, ref.incarnation);
     ++count;
   }
   *matches = same && count == c->selected_count;
+  return rc;
+}
+int ps_key_checkpoint_confirm_current(ps_key_checkpoint *c,
+                                      const ps_catalog_info *active,
+                                      uint64_t tail, int *current,
+                                      lc_error *e) {
+  int rc;
+  pthread_mutex_lock(&c->mutex);
+  rc = ps_internal_namespace_seed_current(
+      c->ns->root->space, c->ns->identity.owner, active, tail,
+      c->selected_count + (c->selected.control != 0), match_current_seed, c,
+      current, e);
+  pthread_mutex_unlock(&c->mutex);
   return rc;
 }
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *c,

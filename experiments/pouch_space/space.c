@@ -8042,6 +8042,52 @@ static ps_entry *selected_value(ps_space *s, ps_entry *p, uint64_t prefix) {
       p = p->previous;
   return p && !p->deleted ? p : NULL;
 }
+static int checkpoint_value_pending(const ps_space *s, const ps_entry *p,
+                                    uint64_t prefix) {
+  return (s->durable || p->durable_visibility) &&
+         (p->peer_sequence ? p->peer_sequence > s->peer_durable
+                           : p->publication_sequence > prefix);
+}
+int ps_internal_namespace_seed_current(ps_space *s, uint64_t owner,
+                                       const ps_catalog_info *active,
+                                       uint64_t tail, size_t expected,
+                                       ps_value_retain_fn match, void *context,
+                                       int *current, lc_error *error) {
+  ps_coordination_guard *guard;
+  ps_entry *p;
+  size_t bucket = owner % BUCKETS, count = 0;
+  unsigned int group;
+  uint64_t prefix;
+  int rc, same = 1;
+  *current = 0;
+  pthread_mutex_lock(&s->mutex);
+  rc = ps_internal_observe_begin(s, &guard, error);
+  prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
+  if (rc == LC_OK && active) {
+    p = lookup(s, active->stream);
+    same = p && !p->deleted && !p->stream->sealed && p->bytes == tail &&
+           p->token == active->target.incarnation &&
+           !memcmp(s->identity, active->target.container, 16) &&
+           stream_structure_ready(s, p, NULL) == LC_OK;
+  }
+  for (group = 1; rc == LC_OK && same && group < PS_VALUE_GROUPS; ++group)
+    for (p = s->buckets->values[group][bucket].head; p; p = p->value_next) {
+      if (p->key.owner != owner)
+        continue;
+      if (checkpoint_value_pending(s, p, prefix) ||
+          (!p->deleted &&
+           (++count > expected || !match(context, p->key, p->token)))) {
+        same = 0;
+        break;
+      }
+    }
+  if (rc == LC_OK && same && count == expected &&
+      (!s->readiness || s->allocation_guard || ps_readiness_resident(s)))
+    *current = 1;
+  rc = ps_internal_capture_end(s, guard, rc, error);
+  pthread_mutex_unlock(&s->mutex);
+  return rc;
+}
 int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
                                                lc_error *error) {
   ps_coordination_guard *guard;
@@ -8058,13 +8104,12 @@ int ps_internal_namespace_checkpoint_stabilize(ps_space *s, uint64_t owner,
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   for (group = 1; rc == LC_OK && group < PS_VALUE_GROUPS; ++group)
     for (p = s->buckets->values[group][bucket].head; p; p = p->value_next) {
-      if (p->key.owner != owner || (!s->durable && !p->durable_visibility))
+      if (p->key.owner != owner || !checkpoint_value_pending(s, p, prefix))
         continue;
       if (p->peer_sequence) {
-        if (p->peer_sequence > s->peer_durable && p->peer_sequence > peer)
+        if (p->peer_sequence > peer)
           peer = p->peer_sequence;
-      } else if (p->publication_sequence > prefix &&
-                 p->publication_sequence > local) {
+      } else if (p->publication_sequence > local) {
         local = p->publication_sequence;
       }
     }

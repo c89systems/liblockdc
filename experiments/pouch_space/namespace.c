@@ -191,14 +191,26 @@ static int collect_resource(void *context, const void *name, size_t length,
   s->binding = *binding;
   return LC_OK;
 }
-static int collect_segment(void *context, const void *name, size_t length,
-                           const ps_catalog_info *binding, lc_error *e) {
-  return collect_resource(context, name, length, binding, PS_CATALOG_SEGMENT,
-                          e);
-}
-static int collect_body(void *context, const void *name, size_t length,
-                        const ps_catalog_info *binding, lc_error *e) {
-  return collect_resource(context, name, length, binding, PS_CATALOG_BODY, e);
+static int collect_sources(source_load *load, lc_error *e) {
+  ps_namespace *ns = load->candidate->ns;
+  ps_space *space = ns->root->space;
+  ps_coordination_guard *guard;
+  uint64_t prefix;
+  int rc;
+  /* Namespace authority protects these bindings. The scan copies data from
+   * resident descriptors only and can use one prefix for both source kinds. */
+  pthread_mutex_lock(&space->mutex);
+  rc = ps_internal_observe_begin(space, &guard, e);
+  if (rc == LC_OK) {
+    prefix = __atomic_load_n(&space->durable_sequence, __ATOMIC_ACQUIRE);
+    rc = ps_internal_catalog_visit_locked(space, ns->identity.owner,
+                                          (1U << PS_CATALOG_SEGMENT) |
+                                              (1U << PS_CATALOG_BODY),
+                                          prefix, collect_resource, load, e);
+  }
+  rc = ps_internal_capture_end(space, guard, rc, e);
+  pthread_mutex_unlock(&space->mutex);
+  return rc;
 }
 static int compare_segment(const void *a, const void *b) {
   const segment *left = *(segment *const *)a, *right = *(segment *const *)b;
@@ -356,11 +368,7 @@ static int load(ps_namespace *ns, struct ps_namespace_data *previous,
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint coverage exceeds namespace head");
   if (rc == LC_OK)
-    rc = ps_catalog_visit(ns->root->space, ns->identity.owner,
-                          PS_CATALOG_SEGMENT, collect_segment, &sources, e);
-  if (rc == LC_OK)
-    rc = ps_catalog_visit(ns->root->space, ns->identity.owner, PS_CATALOG_BODY,
-                          collect_body, &sources, e);
+    rc = collect_sources(&sources, e);
   if (rc == LC_OK && d->count)
     qsort(d->items, d->count, sizeof(*d->items), compare_segment);
   for (i = 0; rc == LC_OK && i < d->count; ++i) {
@@ -2009,11 +2017,30 @@ static int checkpoint_replay(void *context, uint64_t segment,
 static int checkpoint_ready(struct ps_namespace_data *d, lc_error *e) {
   ps_checkpoint_delta *replay = NULL;
   ps_namespace_view *view = NULL;
+  ps_checkpoint_info coverage;
   uint64_t segment = 0, end = 0, bytes = 0, span;
   size_t i;
-  int rc, attempt, unchanged = 0;
+  int rc, attempt, current, unchanged = 0;
   if (d->checkpoint_ready)
     return LC_OK;
+  if (d->ns->root->recovering_namespaces && !d->replay_segment) {
+    ps_key_checkpoint_info(d->checkpoint, &coverage);
+    if (coverage.segment == d->active && coverage.offset == d->tail) {
+      const ps_ns_resource *active =
+          d->active ? ps_ns_find(d, PS_CATALOG_SEGMENT, d->active) : NULL;
+      rc = ps_key_checkpoint_confirm_current(d->checkpoint,
+                                             active ? &active->binding : NULL,
+                                             d->tail, &current, e);
+      if (rc != LC_OK)
+        return rc;
+      if (current) {
+        pthread_mutex_lock(&d->mutex);
+        d->checkpoint_ready = 1;
+        pthread_mutex_unlock(&d->mutex);
+        return LC_OK;
+      }
+    }
+  }
   /* Observation can select the older durable seed while a release or a
    * partial checkpoint has already framed newer key slots. A writer must
    * adopt those identities before allocating slots from the stream suffix. */

@@ -311,6 +311,14 @@ int ps_internal_resident_read_valid(ps_space *, int private_failure);
 int ps_internal_values_startup_walk(ps_space *, uint64_t owner,
                                     ps_value_read_fn, void *, int *accepted,
                                     lc_error *);
+/* Compare the complete checkpoint selection and active stream at one
+ * completed prefix. The matcher runs under the space mutex. A pending
+ * publication or a changed prefix leaves the seed unconfirmed. */
+int ps_internal_namespace_seed_current(ps_space *, uint64_t owner,
+                                       const ps_catalog_info *active,
+                                       uint64_t tail, size_t expected,
+                                       ps_value_retain_fn match, void *,
+                                       int *current, lc_error *);
 /* Borrow checked metadata bytes for the startup walk callback. A null span
  * means the reader needs ordinary I/O. */
 int ps_internal_checkpoint_span(ps_reader *, const unsigned char **,
@@ -343,9 +351,15 @@ int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
                              const void *, size_t, uint64_t prefix,
                              ps_catalog_info *);
 /* The callback borrows metadata under the local mutex and must not reenter. */
+typedef int (*ps_catalog_visit_locked_fn)(void *, const void *, size_t,
+                                          const ps_catalog_info *,
+                                          unsigned int kind, lc_error *);
+/* Visit selected catalog bindings for the requested kinds at one prefix.
+ * The callback may copy the borrowed name and binding under the space mutex. */
 int ps_internal_catalog_visit_locked(ps_space *, uint64_t owner,
-                                     unsigned int kind, uint64_t prefix,
-                                     ps_catalog_visit_fn, void *, lc_error *);
+                                     unsigned int kinds, uint64_t prefix,
+                                     ps_catalog_visit_locked_fn, void *,
+                                     lc_error *);
 int ps_internal_complete_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
 int ps_internal_admitted_tail(ps_space *, ps_key, const ps_ref *, uint64_t *);
 /* A namespace owner verified this exact active tail under mutation authority.

@@ -136,6 +136,11 @@ int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
 /* A coverage token can stay fixed while forward checkpoint slots publish. */
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
                                    const ps_checkpoint_info *, lc_error *);
+/* Startup admission under namespace edit authority. Compare identities
+ * without capturing a replay view when it would have an empty suffix. */
+int ps_key_checkpoint_confirm_current(ps_key_checkpoint *,
+                                      const ps_catalog_info *active,
+                                      uint64_t tail, int *current, lc_error *);
 /* Adopt identities and read retained changed slots under namespace mutation
  * authority. A nonzero active segment certifies the same stream incarnation
  * and a nonregressing tail. The replay cursor is at or below the prior tail. */

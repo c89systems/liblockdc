@@ -2,6 +2,7 @@
 #define POUCH_SPACE_CHECKPOINT_CASES_H
 #include "checkpoint.h"
 #include "checkpoint_record.h"
+#include "lc_pouch_namespace.h"
 #include "lc_pouch_storage.h"
 #include "revision.h"
 
@@ -511,7 +512,7 @@ static void checkpoint_owner(int durable) {
   char name[32];
   size_t i;
   uint64_t offset;
-  int resumed;
+  int resumed, current;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
@@ -520,6 +521,8 @@ static void checkpoint_owner(int durable) {
   OK(ps_namespace_identity(ns, &identity, &error));
   OK(ps_key_checkpoint_open(ns, &checkpoint, &error));
   OK(ps_key_checkpoint_open(ns, &seed, &error));
+  OK(ps_key_checkpoint_confirm_current(seed, NULL, 0, &current, &error));
+  CHECK(current);
   OK(ps_key_checkpoint_observe(checkpoint, &observer, &error));
   /* More than one revision of independent logical keys. Metadata-only lease
    * placeholders must remain query-neutral, including after partial restart. */
@@ -554,6 +557,9 @@ static void checkpoint_owner(int durable) {
   CHECK(observation.published == 1);
   ps_key_checkpoint_info(checkpoint, &info);
   CHECK(!info.epoch && info.pending && info.pending < 130);
+  /* Slot identities can change before the coverage record advances. */
+  OK(ps_key_checkpoint_confirm_current(seed, NULL, 0, &current, &error));
+  CHECK(!current);
   OK(ps_key_checkpoint_capture(seed, PS_CHECKPOINT_CAPTURE_SEED, &values, &info,
                                &error));
   CHECK(!info.control && ps_values_count(values));
@@ -581,6 +587,11 @@ static void checkpoint_owner(int durable) {
                              &error));
   CHECK(!resumed);
   OK(ps_key_checkpoint_confirm_seed(seed, values, &info, &error));
+  allocation_call = 0;
+  allocation_fail = 1;
+  OK(ps_key_checkpoint_confirm_current(seed, NULL, 0, &current, &error));
+  allocation_fail = 0;
+  CHECK(current && !allocation_call);
   ps_key_checkpoint_info(seed, &info);
   CHECK(info.slots == ps_values_count(values) && !info.control &&
         !info.pending);
@@ -725,10 +736,16 @@ static void checkpoint_namespace(int durable, int shared) {
   ps_namespace *ns = NULL;
   ps_namespace_view *view = NULL;
   ps_namespace_status status;
+  ps_namespace_info identity;
+  ps_catalog_view *catalog = NULL;
+  ps_catalog_info active;
+  ps_key_checkpoint *seed = NULL;
   checkpoint_seen seen = {0};
   char name[32];
+  char leaf[40];
   unsigned char metadata[PS_PAGE - 512];
   size_t i;
+  int current;
   clean();
   options.storage.initial_capacity = PS_DEFAULT_CAPACITY;
   options.storage.durable_sync = durable;
@@ -776,6 +793,24 @@ static void checkpoint_namespace(int durable, int shared) {
   root = NULL;
   OK(ps_root_open(path, 0, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "checkpoint", 0, &ns, &error));
+  OK(ps_namespace_status_get(ns, &status, &error));
+  CHECK(status.tail && status.covered_segment == status.active_segment &&
+        status.covered_offset == status.tail && !status.pending_keys);
+  OK(ps_namespace_identity(ns, &identity, &error));
+  CHECK(lc_pouch_namespace_format_segment_leaf(status.active_segment, leaf,
+                                               sizeof(leaf)));
+  OK(ps_catalog_get(ps_root_space(root), identity.owner, PS_CATALOG_SEGMENT,
+                    leaf, strlen(leaf), &catalog, &error));
+  OK(ps_catalog_view_info(catalog, &active, &error));
+  ps_catalog_view_close(catalog);
+  OK(ps_key_checkpoint_open(ns, &seed, &error));
+  OK(ps_key_checkpoint_confirm_current(seed, &active, status.tail, &current,
+                                       &error));
+  CHECK(current);
+  OK(ps_key_checkpoint_confirm_current(seed, &active, status.tail - 1, &current,
+                                       &error));
+  CHECK(!current);
+  ps_key_checkpoint_close(seed);
   OK(ps_namespace_view_open(ns, &view, &error));
   memset(&seen, 0, sizeof(seen));
   OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
