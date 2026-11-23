@@ -2432,9 +2432,10 @@ int main(int argc, char **argv) {
   executable_path = argv[0];
   lc_pouch_test_queue_clock_gettime = logical_clock;
   lc_pouch_test_retention_hook = note_phase;
-  if (argc == 7 && !strcmp(argv[1], "--shared-outbox-crash-child")) {
+  if (argc == 8 && !strcmp(argv[1], "--shared-outbox-crash-child")) {
     crypto_key = argv[6];
-    shared_outbox_crash_child(argv[2], atoi(argv[3]), atoi(argv[4]), argv[5]);
+    shared_outbox_crash_child(argv[2], atoi(argv[3]), atoi(argv[4]), argv[5],
+                              !strcmp(argv[7], "claim"));
     return 3;
   }
   if (argc == 7 && !strcmp(argv[1], "--phase-child")) {

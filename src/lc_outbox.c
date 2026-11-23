@@ -4798,6 +4798,12 @@ static int lc_outbox_claim_outbox_impl(lc_outbox_handle *outbox,
     record.dispatch_state = "claimed";
     ++record.attempt_count;
     record.claim_expires_at_unix = (lonejson_int64)claim_expires_at_unix;
+    /* The coordinated handoff keeps the parent claim through state-lease
+     * acquisition. Commit the possibility of a sidecar with that claim,
+     * before the sidecar can be created or handed to a worker. A failed
+     * handoff can leave this conservative cleanup obligation in place. */
+    if (coordinated && with_state)
+      record.checkpoint_present = 1;
     job = (lc_outbox_job_handle *)lc_client_calloc(client, 1U, sizeof(*job));
     if (job == NULL) {
       rc = lc_error_set(error, LC_ERR_NOMEM, 0L,

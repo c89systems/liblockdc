@@ -151,8 +151,15 @@ static void shared_outbox_handoff(const char *directory) {
 static const char shared_outbox_checkpoint[] =
     "{\"delivered\":false,\"step\":2}";
 
+static int shared_outbox_crash_before_state(void *context, lc_error *e) {
+  int notify = *(int *)context;
+  (void)e;
+  REQUIRE(write(notify, "A", 1) == 1);
+  _exit(0);
+}
+
 static void shared_outbox_crash_child(const char *path, int sync, int notify,
-                                      const char *key) {
+                                      const char *key, int before_state) {
   fixture *f = calloc(1, sizeof(*f));
   lc_error e = {0};
   lc_outbox_dispatcher *dispatcher = NULL;
@@ -165,6 +172,11 @@ static void shared_outbox_crash_child(const char *path, int sync, int notify,
   lc_outbox *outbox = shared_outbox_open(f, "orders", "crashed", 2, &e);
   ok(lc_outbox_dispatcher_get_or_start(outbox, &dispatcher, &e), &e);
   ok(lc_outbox_dispatcher_notify_outbox_key(dispatcher, key, &e), &e);
+  if (before_state) {
+    lc_outbox_test_before_stateful_handoff_context = &notify;
+    lc_outbox_test_before_stateful_handoff_hook =
+        shared_outbox_crash_before_state;
+  }
   ok(lc_outbox_dispatcher_next_with_state(dispatcher, 5000, &job, &e), &e);
   REQUIRE(job && job->attempt == 1 && lc_outbox_job_state(job));
   producer checkpoint = source(shared_outbox_checkpoint);
@@ -175,46 +187,70 @@ static void shared_outbox_crash_child(const char *path, int sync, int notify,
   _exit(0);
 }
 
-static void shared_outbox_recovery(const char *directory) {
-  fixture *f = calloc(1, sizeof(*f));
-  REQUIRE(f);
-  shared_lease_fixture = 1;
-  for (int sync = 0; sync <= 1; ++sync) {
-    lc_error e = {0};
-    lc_outbox_receipt receipt = {0};
-    lc_outbox_dispatcher *dispatcher = NULL;
-    lc_outbox_job *job = NULL;
-    int ready[2], exited;
-    char fd[24], policy[2] = {(char)('0' + sync), 0}, byte;
-    setup(f, directory, 0, sync, sync ? 3 : 0, &e);
-    lc_outbox *outbox = shared_outbox_open(f, "orders", "publisher", 300, &e);
-    shared_outbox_append(outbox, "recover", &receipt, 0, &e);
-    lc_outbox_close(outbox);
-    REQUIRE(!pipe(ready));
-    snprintf(fd, sizeof(fd), "%d", ready[1]);
-    pid_t child = fork();
-    REQUIRE(child >= 0);
-    if (!child) {
-      close(ready[0]);
-      execl(executable_path, executable_path, "--shared-outbox-crash-child",
-            f->path, policy, fd, receipt.outbox_key, crypto_key, (char *)NULL);
-      _exit(127);
-    }
-    REQUIRE(!close(ready[1]));
-    REQUIRE(read(ready[0], &byte, 1) == 1 && byte == 'C' && !close(ready[0]));
-    REQUIRE(waitpid(child, &exited, 0) == child && WIFEXITED(exited) &&
-            WEXITSTATUS(exited) == 0);
-    close_store(f);
-    open_store(f, 0, &e);
-    outbox = shared_outbox_open(f, "orders", "replacement", 300, &e);
-    ok(lc_outbox_dispatcher_get_or_start(outbox, &dispatcher, &e), &e);
-    ok(lc_outbox_dispatcher_notify_outbox_key(dispatcher, receipt.outbox_key,
-                                              &e),
-       &e);
-    ok(lc_outbox_dispatcher_next_with_state(dispatcher, 10000, &job, &e), &e);
-    REQUIRE(job && job->attempt == 2 && lc_outbox_job_state(job) &&
-            !strcmp(job->outbox_key, receipt.outbox_key));
-    shared_outbox_check_body(job, &e);
+static void shared_outbox_check_possible_checkpoint(fixture *f, const char *key,
+                                                    lc_error *e) {
+  static const char possible[] = "\"checkpoint_present\":1";
+  static const char claimed[] = "\"dispatch_state\":\"claimed\"";
+  lc_pouch_state_read_result parent = {0};
+  lc_sink *sink = NULL;
+  const void *bytes;
+  size_t length;
+  ok(lc_pouch_state_read(store(f), "orders", key, &parent, e), e);
+  REQUIRE(parent.found && parent.body);
+  ok(lc_sink_to_memory(&sink, e), e);
+  ok(lc_copy(parent.body, sink, NULL, e), e);
+  ok(lc_sink_memory_bytes(sink, &bytes, &length, e), e);
+  REQUIRE(memmem(bytes, length, possible, sizeof(possible) - 1) &&
+          memmem(bytes, length, claimed, sizeof(claimed) - 1));
+  lc_sink_close(sink);
+  lc_pouch_state_read_result_cleanup(&store(f)->allocator, &parent);
+}
+
+static void shared_outbox_recovery_case(fixture *f, const char *directory,
+                                        int sync, int before_state) {
+  lc_error e = {0};
+  lc_outbox_receipt receipt = {0};
+  lc_outbox_dispatcher *dispatcher = NULL;
+  lc_outbox_job *job = NULL;
+  int ready[2], exited;
+  char fd[24], policy[2] = {(char)('0' + sync), 0}, byte;
+  const char *cut = before_state ? "claim" : "checkpoint";
+  setup(f, directory, 0, sync, sync ? 3 : 0, &e);
+  lc_outbox *outbox = shared_outbox_open(f, "orders", "publisher", 300, &e);
+  shared_outbox_append(outbox, "recover", &receipt, 0, &e);
+  lc_outbox_close(outbox);
+  REQUIRE(!pipe(ready));
+  snprintf(fd, sizeof(fd), "%d", ready[1]);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    close(ready[0]);
+    execl(executable_path, executable_path, "--shared-outbox-crash-child",
+          f->path, policy, fd, receipt.outbox_key, crypto_key, cut,
+          (char *)NULL);
+    _exit(127);
+  }
+  REQUIRE(!close(ready[1]));
+  REQUIRE(read(ready[0], &byte, 1) == 1 && byte == (before_state ? 'A' : 'C') &&
+          !close(ready[0]));
+  REQUIRE(waitpid(child, &exited, 0) == child && WIFEXITED(exited) &&
+          WEXITSTATUS(exited) == 0);
+  close_store(f);
+  open_store(f, 0, &e);
+  shared_outbox_check_possible_checkpoint(f, receipt.outbox_key, &e);
+  outbox = shared_outbox_open(f, "orders", "replacement", 300, &e);
+  ok(lc_outbox_dispatcher_get_or_start(outbox, &dispatcher, &e), &e);
+  ok(lc_outbox_dispatcher_notify_outbox_key(dispatcher, receipt.outbox_key, &e),
+     &e);
+  ok(before_state
+         ? lc_outbox_dispatcher_next(dispatcher, 10000, &job, &e)
+         : lc_outbox_dispatcher_next_with_state(dispatcher, 10000, &job, &e),
+     &e);
+  REQUIRE(job && job->attempt == 2 &&
+          !strcmp(job->outbox_key, receipt.outbox_key));
+  REQUIRE((lc_outbox_job_state(job) != NULL) == !before_state);
+  shared_outbox_check_body(job, &e);
+  if (!before_state) {
     lc_sink *sink = NULL;
     lc_get_res got = {0};
     const void *bytes;
@@ -226,14 +262,28 @@ static void shared_outbox_recovery(const char *directory) {
             !memcmp(bytes, shared_outbox_checkpoint, length));
     lc_sink_close(sink);
     lc_get_res_cleanup(&got);
-    ok(lc_outbox_job_complete(job, NULL, &e), &e);
-    ok(lc_outbox_dispatcher_stop(dispatcher, -1, &e), &e);
-    lc_outbox_dispatcher_close(dispatcher);
-    lc_outbox_close(outbox);
-    lc_outbox_receipt_cleanup(&receipt);
-    close_store(f);
-    retire(f);
   }
+  ok(lc_outbox_job_complete(job, NULL, &e), &e);
+  char *marker = NULL, *parent = NULL, *state = NULL;
+  ok(lc_pouch_outbox_state_reclaim_marker_take(store(f), "orders", NULL,
+                                               &marker, &parent, &state, &e),
+     &e);
+  REQUIRE(!marker && !parent && !state);
+  ok(lc_outbox_dispatcher_stop(dispatcher, -1, &e), &e);
+  lc_outbox_dispatcher_close(dispatcher);
+  lc_outbox_close(outbox);
+  lc_outbox_receipt_cleanup(&receipt);
+  close_store(f);
+  retire(f);
+}
+
+static void shared_outbox_recovery(const char *directory) {
+  fixture *f = calloc(1, sizeof(*f));
+  REQUIRE(f);
+  shared_lease_fixture = 1;
+  for (int sync = 0; sync <= 1; ++sync)
+    for (int before_state = 0; before_state <= 1; ++before_state)
+      shared_outbox_recovery_case(f, directory, sync, before_state);
   shared_lease_fixture = 0;
   free(f);
 }

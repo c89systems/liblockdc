@@ -137,9 +137,12 @@ State is retained across retry, expiry recovery, and dead-letter replay. A
 stateful handoff persistently marks the envelope as having a possible
 checkpoint before the handler receives it. That fact survives every retry, so
 even a later ordinary `next()` claimant retires the exact sidecar on
-completion. A successful completion does not need the private job state for
-another delivery: durable terminal command results belong in the command
-receipt and compact completion evidence belongs in `lc_outbox_completion`.
+completion. On coordinated Pouch the durable claim records this possibility
+before opening the sidecar. An interrupted handoff can therefore leave the
+cleanup obligation even when no sidecar was created. A successful completion
+does not need the private job state for another delivery: durable terminal
+command results belong in the command receipt and compact completion evidence
+belongs in `lc_outbox_completion`.
 Completion first writes one fsynced private cleanup marker, then publishes the
 terminal parent, then removes the sidecar and its attachments while it still
 owns the parent claim. This also handles a valid handler-side `state:remove()`:
