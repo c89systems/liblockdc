@@ -3020,6 +3020,8 @@ static void *worker(void *context) {
     xa_faults(r->directory, 2);
   else if (!strcmp(r->mode, "xa-managed-durability"))
     xa_managed_faults(r->directory, 0);
+  else if (!strcmp(r->mode, "xa-retirement-batch"))
+    xa_retirement_batch(r->directory);
   else if (!strcmp(r->mode, "xa-concurrency"))
     xa_concurrency(r->directory);
   else if (!strcmp(r->mode, "xa-scope"))

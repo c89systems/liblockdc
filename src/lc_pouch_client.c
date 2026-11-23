@@ -20458,6 +20458,200 @@ static int lc_pouch_xa_completed_compare(const void *a, const void *b) {
     return left->completed < right->completed ? -1 : 1;
   return strcmp(left->txn_id, right->txn_id);
 }
+
+enum { LC_POUCH_XA_RETIRE_LIMIT = 8 };
+
+typedef struct lc_pouch_xa_retirement {
+  const char *txn_id;
+  lc_pouch_txn_record record;
+  int owner_found;
+} lc_pouch_xa_retirement;
+
+static int lc_pouch_xa_prepare_retirement(
+    lc_client_handle *client, const char *txn_id, lc_pouch_unix_seconds now,
+    long retention_seconds, size_t max_records, size_t *remaining,
+    lc_pouch_xa_retirement *work, lc_error *error) {
+  lc_pouch_tc_lease_record owner = {0};
+  lc_pouch_unix_seconds completed = 0;
+  int rc = lc_pouch_xa_completed_read(client, txn_id, &completed, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_xa_owner_read(client, txn_id, &owner, error);
+  if (rc == LC_OK && completed &&
+      (!owner.found || owner.expires_at_unix <= now) &&
+      (!owner.found ||
+       (retention_seconds >= 0L && now >= completed &&
+        now - completed >= retention_seconds) ||
+       (max_records && *remaining > max_records))) {
+    rc = lc_pouch_xa_read_txn(client->pouch, txn_id, &work->record, error);
+    if (rc == LC_OK && owner.found && work->record.state == NULL)
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "XA completion lost its authoritative decision", NULL,
+                        NULL, "pouch-xa");
+    if (rc == LC_OK && work->record.state != NULL &&
+        strcmp(work->record.state, "commit") != 0 &&
+        strcmp(work->record.state, "rollback") != 0)
+      rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
+                        "unfinished XA history cannot retire", NULL, NULL,
+                        "pouch-xa");
+    if (rc == LC_OK && owner.found) {
+      lc_txn_decision_req request;
+      lc_txn_decision_req_init(&request);
+      request.txn_id = txn_id;
+      request.participants = work->record.participants;
+      request.participant_count = work->record.participant_count;
+      rc = lc_pouch_xa_application_gate(client->pouch, &request,
+                                        work->record.state, error);
+    }
+    if (rc == LC_OK) {
+      work->txn_id = txn_id;
+      work->owner_found = owner.found;
+      --*remaining;
+    } else
+      lc_pouch_txn_record_cleanup(&work->record);
+  } else if (rc == LC_OK && !completed && *remaining)
+    --*remaining;
+  lc_pouch_tc_lease_record_cleanup(&owner);
+  return rc;
+}
+
+static int lc_pouch_xa_retirement_barrier(lc_pouch *pouch, const char *ns,
+                                          lc_pouch_state_commit_group *scope,
+                                          lc_error *error) {
+  return scope ? lc_pouch_state_durable_scope_barrier(scope, error)
+               : lc_pouch_state_sync_namespace(pouch, ns, error);
+}
+
+/* Complete each recovery phase for the bounded prefix before starting the
+ * next phase. Once the owner is gone, lookups must report expired. The
+ * decision still identifies any branches that need cleanup. The completion
+ * record keeps the XID unavailable for replacement until both are gone. */
+static int lc_pouch_xa_retire_batch(lc_client_handle *client,
+                                    const lc_pouch_xa_retirement *work,
+                                    size_t count, size_t *retired_count,
+                                    lc_error *error) {
+  lc_pouch *pouch = client->pouch;
+  lc_pouch_state_commit_group *scope = NULL;
+  char key[sizeof("completed/") + LC_XID_STRING_SIZE];
+  size_t i, j, published = 0;
+  int rc = pouch->storage.ops
+               ? lc_pouch_state_durable_scope_begin(pouch, &scope, error)
+               : LC_OK;
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    (void)snprintf(key, sizeof(key), "owner/%s", work[i].txn_id);
+    rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
+                                error);
+  }
+  if (rc == LC_OK)
+    rc = lc_pouch_xa_retirement_barrier(pouch, LC_POUCH_XA_NAMESPACE, scope,
+                                        error);
+#ifdef LOCKDC_TEST_BUILD
+  for (i = 0; rc == LC_OK && i < count; ++i)
+    if (work[i].owner_found && lc_pouch_test_after_xa_retire_owner_hook != NULL)
+      rc = lc_pouch_test_after_xa_retire_owner_hook(
+          lc_pouch_test_after_xa_retire_owner_context, error);
+#endif
+  for (i = 0; rc == LC_OK && i < count; ++i)
+    for (j = 0; rc == LC_OK && j < work[i].record.participant_count; ++j) {
+      const lc_txn_participant *branch = &work[i].record.participants[j];
+      if (lc_pouch_xa_participant(branch))
+        rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, branch->key,
+                                    0, 0U, error);
+    }
+  if (rc == LC_OK)
+    rc = lc_pouch_xa_retirement_barrier(pouch, LC_POUCH_XA_NAMESPACE, scope,
+                                        error);
+  for (i = 0; rc == LC_OK && i < count; ++i)
+    rc = lc_pouch_tc_delete_key(client, LC_POUCH_TXN_NAMESPACE, work[i].txn_id,
+                                0, 0U, error);
+  if (rc == LC_OK)
+    rc = lc_pouch_xa_retirement_barrier(pouch, LC_POUCH_TXN_NAMESPACE, scope,
+                                        error);
+  for (i = 0; rc == LC_OK && i < count; ++i) {
+    (void)snprintf(key, sizeof(key), "completed/%s", work[i].txn_id);
+    rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
+                                error);
+    if (rc == LC_OK)
+      ++published;
+  }
+  if (scope) {
+    int barrier_rc = lc_pouch_state_durable_scope_end(
+        scope, LC_OK, rc == LC_OK ? error : NULL);
+    if (barrier_rc == LC_OK)
+      *retired_count += published;
+    if (rc == LC_OK)
+      rc = barrier_rc;
+  } else if (rc == LC_OK) {
+    rc = lc_pouch_state_sync_namespace(pouch, LC_POUCH_XA_NAMESPACE, error);
+    if (rc == LC_OK)
+      *retired_count += published;
+  }
+  return rc;
+}
+
+static int lc_pouch_xa_retire_history(
+    lc_client_handle *client, const lc_pouch_xa_completed_entry *entries,
+    size_t count, lc_pouch_unix_seconds now, long retention_seconds,
+    size_t max_records, size_t *retired_count, lc_error *error) {
+  size_t next = 0, remaining = count;
+  size_t limit = client->pouch->storage.ops ? LC_POUCH_XA_RETIRE_LIMIT : 1;
+  int rc = LC_OK;
+  while (rc == LC_OK && next < count) {
+    lc_pouch_xa_retirement work[LC_POUCH_XA_RETIRE_LIMIT] = {{0}};
+    lc_pouch_txn_guard guards[LC_POUCH_XA_RETIRE_LIMIT];
+    size_t held = 0, prepared = 0, i;
+    for (; rc == LC_OK && next < count && prepared < limit; ++next) {
+      const char *txn_id = entries[next].txn_id;
+      size_t before = held;
+      for (i = 0; i < held; ++i)
+        if (lc_pouch_txn_guard_covers(&guards[i], txn_id))
+          break;
+      if (i == held) {
+        rc = lc_pouch_txn_guard_lock(client->pouch, txn_id, !held,
+                                     &guards[held], error);
+        if (rc == LC_ERR_PENDING && held) {
+          /* Finish the guarded prefix before waiting on another XID. */
+          lc_error_cleanup(error);
+          rc = LC_OK;
+          break;
+        }
+        if (rc != LC_OK)
+          break;
+        ++held;
+      }
+      rc = lc_pouch_xa_prepare_retirement(client, txn_id, now,
+                                          retention_seconds, max_records,
+                                          &remaining, &work[prepared], error);
+      if (work[prepared].txn_id)
+        ++prepared;
+      else if (held > before)
+        lc_pouch_txn_guard_release(&guards[--held]);
+    }
+    if (prepared) {
+      /* A later candidate error still allows the earlier accepted prefix
+       * to complete, as in a sweep that retires each XID individually. */
+      lc_error prior = {0};
+      int prior_rc = rc;
+      if (rc != LC_OK && error) {
+        prior = *error;
+        lc_error_init(error);
+      }
+      rc = lc_pouch_xa_retire_batch(client, work, prepared, retired_count,
+                                    error);
+      if (rc == LC_OK) {
+        rc = prior_rc;
+        if (rc != LC_OK && error)
+          *error = prior;
+      } else
+        lc_error_cleanup(&prior);
+    }
+    for (i = 0; i < prepared; ++i)
+      lc_pouch_txn_record_cleanup(&work[i].record);
+    while (held)
+      lc_pouch_txn_guard_release(&guards[--held]);
+  }
+  return rc;
+}
+
 int lc_pouch_client_xa_retire(lc_client *self, long retention_seconds,
                               size_t max_records, size_t *retired_count,
                               lc_error *error) {
@@ -20465,7 +20659,7 @@ int lc_pouch_client_xa_retire(lc_client *self, long retention_seconds,
   lc_pouch_txn_key_list keys;
   lc_pouch_xa_completed_entry *entries = NULL;
   lc_pouch_unix_seconds now = 0;
-  size_t i, count = 0, remaining;
+  size_t i, count = 0;
   int rc;
   if (retired_count != NULL)
     *retired_count = 0U;
@@ -20496,99 +20690,10 @@ int lc_pouch_client_xa_retire(lc_client *self, long retention_seconds,
   }
   if (rc == LC_OK && count > 1U)
     qsort(entries, count, sizeof(*entries), lc_pouch_xa_completed_compare);
-  remaining = count;
-  for (i = 0U; rc == LC_OK && i < count; ++i) {
-    lc_pouch_txn_guard guard;
-    lc_pouch_tc_lease_record owner;
-    lc_pouch_txn_record record;
-    lc_pouch_unix_seconds completed = 0;
-    char key[sizeof("completed/") + LC_XID_STRING_SIZE];
-    size_t j;
-    int eligible;
-    rc = lc_pouch_txn_guard_acquire(client->pouch, entries[i].txn_id, &guard,
-                                    error);
-    if (rc != LC_OK)
-      break;
-    memset(&owner, 0, sizeof(owner));
-    memset(&record, 0, sizeof(record));
-    rc = lc_pouch_xa_completed_read(client, entries[i].txn_id, &completed,
-                                    error);
-    if (rc == LC_OK)
-      rc = lc_pouch_xa_owner_read(client, entries[i].txn_id, &owner, error);
-    eligible = rc == LC_OK && completed != 0 &&
-               (!owner.found || owner.expires_at_unix <= now) &&
-               (!owner.found ||
-                (retention_seconds >= 0L && now >= completed &&
-                 now - completed >= retention_seconds) ||
-                (max_records != 0U && remaining > max_records));
-    if (eligible) {
-      rc = lc_pouch_xa_read_txn(client->pouch, entries[i].txn_id, &record,
-                                error);
-      if (rc == LC_OK && owner.found && record.state == NULL)
-        rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                          "XA completion lost its authoritative decision", NULL,
-                          NULL, "pouch-xa");
-      if (rc == LC_OK && record.state != NULL &&
-          strcmp(record.state, "commit") != 0 &&
-          strcmp(record.state, "rollback") != 0)
-        rc = lc_error_set(error, LC_ERR_PROTOCOL, 0L,
-                          "unfinished XA history cannot retire", NULL, NULL,
-                          "pouch-xa");
-      if (rc == LC_OK && owner.found) {
-        lc_txn_decision_req request;
-        lc_txn_decision_req_init(&request);
-        request.txn_id = entries[i].txn_id;
-        request.participants = record.participants;
-        request.participant_count = record.participant_count;
-        rc = lc_pouch_xa_application_gate(client->pouch, &request, record.state,
-                                          error);
-      }
-      /* Owner deletion is the durable recovery barrier. A crash after it must
-       * report expired, never reconstruct ABORT from an absent .txns record.
-       * Keep the completion marker until every dependent record is removed. */
-      (void)snprintf(key, sizeof(key), "owner/%s", entries[i].txn_id);
-      if (rc == LC_OK)
-        rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
-                                    error);
-      if (rc == LC_OK)
-        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
-                                           error);
-#ifdef LOCKDC_TEST_BUILD
-      if (rc == LC_OK && owner.found &&
-          lc_pouch_test_after_xa_retire_owner_hook != NULL)
-        rc = lc_pouch_test_after_xa_retire_owner_hook(
-            lc_pouch_test_after_xa_retire_owner_context, error);
-#endif
-      for (j = 0U; rc == LC_OK && j < record.participant_count; ++j)
-        if (lc_pouch_xa_participant(&record.participants[j]))
-          rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE,
-                                      record.participants[j].key, 0, 0U, error);
-      if (rc == LC_OK)
-        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
-                                           error);
-      if (rc == LC_OK)
-        rc = lc_pouch_tc_delete_key(client, LC_POUCH_TXN_NAMESPACE,
-                                    entries[i].txn_id, 0, 0U, error);
-      if (rc == LC_OK)
-        rc = lc_pouch_state_sync_namespace(client->pouch,
-                                           LC_POUCH_TXN_NAMESPACE, error);
-      (void)snprintf(key, sizeof(key), "completed/%s", entries[i].txn_id);
-      if (rc == LC_OK)
-        rc = lc_pouch_tc_delete_key(client, LC_POUCH_XA_NAMESPACE, key, 0, 0U,
-                                    error);
-      if (rc == LC_OK)
-        rc = lc_pouch_state_sync_namespace(client->pouch, LC_POUCH_XA_NAMESPACE,
-                                           error);
-      if (rc == LC_OK) {
-        ++*retired_count;
-        --remaining;
-      }
-    } else if (rc == LC_OK && completed == 0 && remaining != 0U)
-      --remaining;
-    lc_pouch_tc_lease_record_cleanup(&owner);
-    lc_pouch_txn_record_cleanup(&record);
-    lc_pouch_txn_guard_release(&guard);
-  }
+  if (rc == LC_OK)
+    rc = lc_pouch_xa_retire_history(client, entries, count, now,
+                                    retention_seconds, max_records,
+                                    retired_count, error);
   lc_free_with_allocator(NULL, entries);
   lc_pouch_txn_key_list_cleanup(&keys);
   return rc;

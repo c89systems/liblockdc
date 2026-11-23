@@ -606,7 +606,7 @@ if(LOCKDC_BUILD_TESTS)
     endforeach()
     foreach(mode xa-durability xa-io-faults xa-allocation-faults
         xa-managed-durability xa-managed-io-faults xa-managed-allocation-faults
-        xa-concurrency xa-scope xa-capacity xa-crash)
+        xa-concurrency xa-scope xa-capacity xa-crash xa-retirement-batch)
       # The canonical codec owners already have their own four-codec fault
       # matrices. Exercise this handoff protocol's full failure sweeps on plain
       # and combined encryption/compression, and its behavior on every codec.
