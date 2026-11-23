@@ -6,9 +6,10 @@ mode=${1:-measure}
 storage=${2:-"$root/build/pouch-space-comparison"}
 runs=${POUCH_SPACE_RUNS:-5}
 preopen_args=()
+configure_args=()
 if [[ "$mode" == *-reopen ]]; then preopen_args=(--reopen); fi
 case "$mode" in
-  smoke) preset=debug ;;
+  smoke) preset=debug; configure_args+=(-DLOCKDC_BUILD_TESTS=ON) ;;
   measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen) preset=x86_64-linux-gnu-release ;;
   *) echo 'usage: compare_pouch_space.sh [smoke|measure|rollover|streams|streams-long|streams-reopen|streams-long-reopen] [ABSOLUTE_DIRECTORY]' >&2; exit 2 ;;
 esac
@@ -18,13 +19,14 @@ cd "$root"
 # Only native glibc dependencies; do not invoke the broader release matrix.
 bash scripts/deps.sh deps-x86_64-linux-gnu
 cmake --preset "$preset" -DLOCKDC_BUILD_BENCHMARKS=ON \
-  -DLOCKDC_BUILD_EXAMPLES=OFF -DLOCKDC_BUILD_E2E_TESTS=OFF
-cmake --build --preset "$preset" --target pouch_space_test pouch_space_directory_test pouch_space_compare
+  -DLOCKDC_BUILD_EXAMPLES=OFF -DLOCKDC_BUILD_E2E_TESTS=OFF "${configure_args[@]}"
 if [ "$mode" = smoke ]; then
+  cmake --build --preset "$preset" --target pouch_space_smoke
   ctest --test-dir "$root/build/$preset" -R '^pouch_space_' \
     --output-on-failure --no-tests=error --parallel 1
   exit 0
 fi
+cmake --build --preset "$preset" --target pouch_space_compare
 mkdir -p -- "$storage"
 probe="$root/build/$preset/experiments/pouch_space/pouch_space_compare"
 printf 'native=%s filesystem=%s directory=%s runs=%s\n' \

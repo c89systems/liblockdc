@@ -163,6 +163,32 @@ static void absent(ps_space *s, ps_key k) {
   CHECK(r == NULL);
 }
 
+/* Keep the checkpoint and a later durable journal publication in one image.
+ * The create and verify entry points allow different binaries to cold-open it.
+ */
+static void portable_image(const char *store, int create_image) {
+  ps_options options = {0};
+  ps_space *s = NULL;
+  ps_key checkpointed = state(UINT64_C(0x100000001));
+  ps_key journaled = state(UINT64_C(0x200000002));
+  const char first[] = "checkpointed value", second[] = "journaled value";
+  struct stat st;
+
+  options.shared = 1;
+  options.durable_sync = 1;
+  OK(ps_open(store, create_image, &options, &s, &error));
+  CHECK(stat(store, &st) == 0 && st.st_size == PS_DEFAULT_CAPACITY);
+  if (create_image) {
+    put(s, checkpointed, first, sizeof(first), 7);
+    OK(ps_checkpoint(s, &error));
+    put(s, journaled, second, sizeof(second), 5);
+  } else {
+    expect(s, checkpointed, NULL, first, sizeof(first));
+    expect(s, journaled, NULL, second, sizeof(second));
+  }
+  OK(ps_close(s, &error));
+}
+
 static void basic(void) {
   ps_space *s, *s2 = NULL;
   ps_options options = {0};
@@ -7809,6 +7835,12 @@ int main(int argc, char **argv) {
   if (argc != 2 && argc != 3)
     return 2;
   lc_error_init(&error);
+  if (argc == 3 &&
+      (!strcmp(argv[2], "wire-create") || !strcmp(argv[2], "wire-verify"))) {
+    portable_image(argv[1], !strcmp(argv[2], "wire-create"));
+    lc_error_cleanup(&error);
+    return 0;
+  }
   CHECK(snprintf(path, sizeof(path), "%s/space-test-%ld", argv[1],
                  (long)getpid()) > 0);
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
@@ -8023,7 +8055,11 @@ int main(int argc, char **argv) {
       nosync_close_recovery(NOSYNC_RECOVERY_DURABLE_OPEN);
     } else if (strcmp(argv[2], "reopen-sanitize") == 0)
       reopen_sanitization();
-    else if (strcmp(argv[2], "reopen") == 0)
+    else if (strcmp(argv[2], "reopen-portable") == 0) {
+      portable_image(path, 1);
+      portable_image(path, 0);
+      clean();
+    } else if (strcmp(argv[2], "reopen") == 0)
       reopen_retirement();
     else if (strcmp(argv[2], "metadata") == 0) {
       metadata_lifecycle();

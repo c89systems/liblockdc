@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#define _FILE_OFFSET_BITS 64
 #include "crc.h"
 #include "lc_api_internal.h"
 #include "space_internal.h"
@@ -56,6 +57,8 @@ enum readiness_word {
  */
 struct ps_readiness {
   uint64_t *page;
+  void *mapping;
+  size_t mapping_bytes;
   uint64_t credit_metadata, credit_entries;
   unsigned int credit_slot;
   int existing, active;
@@ -337,7 +340,10 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
     return failed(s, e, "shared readiness generation exhausted; close cohort");
   ++record[GENERATION];
   record[CRC] = record_crc(record);
-  __atomic_store_n(slot, 0, __ATOMIC_SEQ_CST);
+  /* A reader that sees any replacement word must also see invalidation
+   * when it rechecks the generation after its acquire fence. */
+  __atomic_store_n(slot, 0, __ATOMIC_RELAXED);
+  __atomic_thread_fence(__ATOMIC_RELEASE);
   for (i = 1; i < WORDS; ++i)
     __atomic_store_n(slot + i, record[i], __ATOMIC_RELAXED);
   __atomic_store_n(slot, record[GENERATION], __ATOMIC_RELEASE);
@@ -346,7 +352,8 @@ static int select_record(ps_space *s, uint64_t *record, int previous,
 int ps_readiness_attach(ps_space *s, lc_error *e) {
   ps_readiness *r;
   uint64_t first, last;
-  size_t i;
+  size_t i, displacement;
+  long page_size;
   struct stat st;
   int rc;
   if (!ps_coordination_shared(s->coordination))
@@ -355,6 +362,12 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
     return failed(s, e, "shared readiness requires native atomic words");
   if (fstat(s->fd, &st) || st.st_size < PS_METADATA_START)
     return failed(s, e, "container is too short for shared readiness");
+  page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0)
+    return failed(s, e, "cannot determine shared mapping page size");
+  /* The on-disk offset is fixed. Map from a host page boundary and address
+   * the readiness words at their original offset within that mapping. */
+  displacement = PS_READINESS_OFFSET % (size_t)page_size;
   r = lc_calloc_with_allocator(NULL, 1, sizeof(*r));
   if (!r)
     return lc_error_set(e, LC_ERR_NOMEM, 0, "cannot allocate shared readiness",
@@ -367,12 +380,14 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
   }
   r->existing = first != last;
   r->credit_slot = PS_READINESS_CREDIT_SLOTS;
-  r->page = mmap(NULL, PS_PAGE, PROT_READ | PROT_WRITE, MAP_SHARED, s->fd,
-                 PS_READINESS_OFFSET);
-  if (r->page == MAP_FAILED) {
+  r->mapping_bytes = displacement + PS_PAGE;
+  r->mapping = mmap(NULL, r->mapping_bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
+                    s->fd, PS_READINESS_OFFSET - displacement);
+  if (r->mapping == MAP_FAILED) {
     lc_free_with_allocator(NULL, r);
     return failed(s, e, "cannot map shared readiness page");
   }
+  r->page = (uint64_t *)((unsigned char *)r->mapping + displacement);
   s->readiness = r;
   /* The first owner resets witnesses before claiming any dynamic workspace.
    * Unlike member handles, read-only imports can survive this reset. */
@@ -391,7 +406,7 @@ int ps_readiness_attach(ps_space *s, lc_error *e) {
 }
 void ps_readiness_close(ps_space *s) {
   if (s->readiness) {
-    (void)munmap(s->readiness->page, PS_PAGE);
+    (void)munmap(s->readiness->mapping, s->readiness->mapping_bytes);
     lc_free_with_allocator(NULL, s->readiness);
   }
 }

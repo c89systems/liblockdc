@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
   file->directory = root;
   file->head_path = path;
   file->head_fd = -1;
+  file->control = lc_collection_file_control(file);
   memset(&options, 0, sizeof(options));
   memset(&h, 0, sizeof(h));
   h.active = h.tail_segment = 1;

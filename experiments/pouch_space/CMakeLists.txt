@@ -1,8 +1,6 @@
-# Native-only experimental target, never installed or linked into the product.
+# Experimental Linux targets, never installed or linked into the product.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-   NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" OR
-   NOT CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$" OR
-   NOT LOCKDC_TARGET_ARCH STREQUAL "x86_64" OR NOT TARGET lc_static)
+   NOT LOCKDC_TARGET_ARCH MATCHES "^(x86_64|aarch64)$" OR NOT TARGET lc_static)
   return()
 endif()
 
@@ -137,15 +135,21 @@ if(LOCKDC_BUILD_TESTS)
   target_link_libraries(pouch_space_live_allocator_test PRIVATE pouch_space_experiment)
   target_link_options(pouch_space_live_allocator_test PRIVATE
     "LINKER:--wrap=ps_coordination_open"
-    "LINKER:--wrap=mmap" "LINKER:--wrap=mmap64"
+    "LINKER:--wrap=sysconf"
     "LINKER:--wrap=lc_alloc_with_allocator" "LINKER:--wrap=lc_calloc_with_allocator"
     "LINKER:--wrap=lc_realloc_with_allocator" "LINKER:--wrap=lc_strdup_with_allocator")
+  if(LOCKDC_TARGET_LIBC STREQUAL "gnu")
+    target_compile_definitions(pouch_space_live_allocator_test PRIVATE MAPPING_LIBC64=1)
+    target_link_options(pouch_space_live_allocator_test PRIVATE "LINKER:--wrap=mmap64")
+  else()
+    target_link_options(pouch_space_live_allocator_test PRIVATE "LINKER:--wrap=mmap")
+  endif()
   lc_configure_c_test_target(pouch_space_live_allocator_test)
   foreach(mode threads faults fence processes serialized packed history
       captures capture-faults capture-owned capture-race resident-capture packed-replay-locality key-index-growth
       projection projection-faults projection-recovery projection-threads
       projection-boundaries projection-pressure projection-tail capacity-checkpoint pressure-reclaim
-      shared-durable shared-preparation readiness-cohort reopen-cohort certified-prefix quarantine checkpoint-decode
+      shared-durable shared-preparation readiness-cohort readiness-page-alignment reopen-cohort certified-prefix quarantine checkpoint-decode
       readiness-faults journal-wrap journal-replay journal-replay-retired journal-replay-faults
       journal-replay-structural journal-replay-process
       owned-stream-readiness owned-stream-cold owned-stream-faults prepared-grants
@@ -421,7 +425,7 @@ if(LOCKDC_BUILD_TESTS)
     lc_configure_c_test_target(pouch_space_${surface}_sdk_test)
     if(surface STREQUAL "queue")
       add_test(NAME pouch_space_native_queue_sdk
-        COMMAND $<TARGET_FILE:lc_unit_pouch> ${behavior_cases})
+        COMMAND lc_unit_pouch ${behavior_cases})
       set_tests_properties(pouch_space_native_queue_sdk PROPERTIES TIMEOUT 180
         LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
     endif()
@@ -432,11 +436,11 @@ if(LOCKDC_BUILD_TESTS)
           set(index_environment POUCH_SPACE_TEST_INDEX=1)
         endif()
         add_test(NAME pouch_space_${surface}_sdk_${codec}_${sync}
-          COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
-            POUCH_SPACE_TEST_SYNC=${sync} ${index_environment} $<TARGET_FILE:pouch_space_${surface}_sdk_test>
+          COMMAND pouch_space_${surface}_sdk_test
             ${behavior_cases})
         set_tests_properties(pouch_space_${surface}_sdk_${codec}_${sync}
-          PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+          PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+            ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};${index_environment}")
         set(conversion_cases)
         if(surface STREQUAL "queue")
           set(conversion_cases test_txn_recovery_applies_queue_side_effects
@@ -449,21 +453,19 @@ if(LOCKDC_BUILD_TESTS)
         endif()
         if(conversion_cases)
           add_test(NAME pouch_space_root_conversion_${surface}_${codec}_${sync}
-            COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
-              POUCH_SPACE_TEST_SYNC=${sync} POUCH_SPACE_TEST_CONVERT=1
-              $<TARGET_FILE:pouch_space_${surface}_sdk_test> ${conversion_cases})
+            COMMAND pouch_space_${surface}_sdk_test ${conversion_cases})
           set_tests_properties(pouch_space_root_conversion_${surface}_${codec}_${sync}
-            PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+            PROPERTIES TIMEOUT 180 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+              ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};POUCH_SPACE_TEST_CONVERT=1")
         endif()
         if(surface STREQUAL "queue")
           add_test(NAME pouch_space_queue_notifications_${codec}_${sync}
-            COMMAND ${CMAKE_COMMAND} -E env POUCH_SPACE_TEST_CODEC=${codec}
-              POUCH_SPACE_TEST_SYNC=${sync} POUCH_SPACE_TEST_WATCH=1
-              $<TARGET_FILE:pouch_space_queue_sdk_test>
+            COMMAND pouch_space_queue_sdk_test
               test_client_queue_watch_polling_detects_change
               test_client_queue_watch_detects_transaction_ack_commit)
           set_tests_properties(pouch_space_queue_notifications_${codec}_${sync}
-            PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+            PROPERTIES TIMEOUT 60 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+              ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=${sync};POUCH_SPACE_TEST_WATCH=1")
         endif()
       endforeach()
     endforeach()
@@ -605,10 +607,10 @@ if(LOCKDC_BUILD_TESTS)
         continue()
       endif()
       add_test(NAME pouch_space_client_${mode}_${codec}
-        COMMAND ${CMAKE_COMMAND} -E env POUCH_INDEX_CODEC=${codec}
-          $<TARGET_FILE:pouch_space_client_test> ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+        COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
-        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+        ENVIRONMENT "POUCH_INDEX_CODEC=${codec}")
     endforeach()
     foreach(mode xa-durability xa-io-faults xa-allocation-faults
         xa-managed-durability xa-managed-io-faults xa-managed-allocation-faults
@@ -621,10 +623,10 @@ if(LOCKDC_BUILD_TESTS)
         continue()
       endif()
       add_test(NAME pouch_space_client_${mode}_${codec}
-        COMMAND ${CMAKE_COMMAND} -E env POUCH_XA_CODEC=${codec}
-          $<TARGET_FILE:pouch_space_client_test> ${CMAKE_CURRENT_BINARY_DIR} ${mode})
+        COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
       set_tests_properties(pouch_space_client_${mode}_${codec} PROPERTIES
-        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+        TIMEOUT 900 LABELS "unit;local;pouch-space" RUN_SERIAL TRUE
+        ENVIRONMENT "POUCH_XA_CODEC=${codec}")
     endforeach()
   endforeach()
   set_tests_properties(pouch_space_client_faults pouch_space_client_io-faults PROPERTIES TIMEOUT 600)
@@ -806,6 +808,9 @@ if(LOCKDC_BUILD_TESTS)
   set_tests_properties(pouch_space_budget pouch_space_budget-capacity PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_test(NAME pouch_space_reopen COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen)
+  add_test(NAME pouch_space_reopen-portable COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-portable)
+  set_tests_properties(pouch_space_reopen-portable PROPERTIES TIMEOUT 30
+    LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   add_test(NAME pouch_space_reopen-sanitize COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} reopen-sanitize)
   set_tests_properties(pouch_space_reopen-sanitize PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
@@ -850,5 +855,22 @@ if(LOCKDC_BUILD_TESTS)
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
   set_tests_properties(pouch_space_foundation PROPERTIES TIMEOUT 120
     LABELS "unit;local;pouch-space" RUN_SERIAL TRUE)
+
+  # Every executable in this directory participates in the smoke test set.
+  # The multifile queue control uses the SDK test from the main test tree.
+  get_property(pouch_space_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  add_custom_target(pouch_space_smoke DEPENDS lc_unit_pouch)
+  foreach(target IN LISTS pouch_space_targets)
+    get_target_property(kind ${target} TYPE)
+    if(kind STREQUAL "EXECUTABLE")
+      add_dependencies(pouch_space_smoke ${target})
+    endif()
+  endforeach()
+  if(CMAKE_CROSSCOMPILING_EMULATOR)
+    # Self-exec fixtures also need the target loader when binfmt launches them.
+    get_property(pouch_space_tests DIRECTORY PROPERTY TESTS)
+    set_property(TEST ${pouch_space_tests} APPEND PROPERTY ENVIRONMENT
+      "QEMU_LD_PREFIX=${CMAKE_SYSROOT}")
+  endif()
   lc_apply_test_defaults()
 endif()

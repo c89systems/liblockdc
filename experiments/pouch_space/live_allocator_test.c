@@ -25,25 +25,35 @@ static __thread int (*packed_page_probe)(void *);
 static __thread void *packed_page_probe_context;
 static int cooperative_wait;
 static int mapping_fail;
-void *__real_mmap(void *, size_t, int, int, int, off_t);
-static int fail_mapping(int flags, off_t offset) {
-  if (mapping_fail && (flags & MAP_SHARED) && offset == PS_READINESS_OFFSET) {
-    errno = ENOMEM;
-    return 1;
+static long simulated_page_size;
+long __real_sysconf(int);
+long __wrap_sysconf(int name) {
+  if (name == _SC_PAGESIZE && simulated_page_size)
+    return simulated_page_size;
+  return __real_sysconf(name);
+}
+#ifdef MAPPING_LIBC64
+#define real_mapping __real_mmap64
+#define wrap_mapping __wrap_mmap64
+#else
+#define real_mapping __real_mmap
+#define wrap_mapping __wrap_mmap
+#endif
+void *real_mapping(void *, size_t, int, int, int, off_t);
+void *wrap_mapping(void *p, size_t n, int prot, int flags, int fd,
+                   off_t offset) {
+  if ((flags & MAP_SHARED) && simulated_page_size &&
+      offset % simulated_page_size) {
+    errno = EINVAL;
+    return MAP_FAILED;
   }
-  return 0;
-}
-void *__wrap_mmap(void *p, size_t n, int prot, int flags, int fd,
-                  off_t offset) {
-  return fail_mapping(flags, offset)
-             ? MAP_FAILED
-             : __real_mmap(p, n, prot, flags, fd, offset);
-}
-void *__wrap_mmap64(void *p, size_t n, int prot, int flags, int fd,
-                    off_t offset) {
-  /* Both entry points already take a 64-bit offset on x86_64. Musl
-   * exports mmap without the separate glibc mmap64 symbol. */
-  return __wrap_mmap(p, n, prot, flags, fd, offset);
+  if (mapping_fail && (flags & MAP_SHARED) && offset >= 0 &&
+      offset <= PS_READINESS_OFFSET &&
+      n >= (size_t)(PS_READINESS_OFFSET - offset) + PS_PAGE) {
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+  return real_mapping(p, n, prot, flags, fd, offset);
 }
 typedef struct test_adapter {
   ps_coordination_io original, selected;
@@ -8962,7 +8972,13 @@ int main(int argc, char **argv) {
     preparation_leaves_peer_headroom();
   } else if (!strcmp(argv[2], "readiness-cohort"))
     readiness_cohort();
-  else if (!strcmp(argv[2], "reopen-cohort")) {
+  else if (!strcmp(argv[2], "readiness-page-alignment")) {
+    simulated_page_size = 16384;
+    readiness_cohort();
+    simulated_page_size = 65536;
+    readiness_cohort();
+    simulated_page_size = 0;
+  } else if (!strcmp(argv[2], "reopen-cohort")) {
     reopen_after_checkpoint();
     reopen_cohort(0);
     reopen_cohort(1);
