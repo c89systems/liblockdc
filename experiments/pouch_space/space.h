@@ -297,9 +297,15 @@ int ps_grow(ps_space *, uint64_t, lc_error *);
 int ps_check(ps_space *, lc_error *);
 int ps_status(ps_space *, ps_stats *, lc_error *);
 int ps_maintenance_pressure_requested(ps_space *);
+enum ps_maintenance_pressure_level {
+  PS_PRESSURE_NONE = 0,
+  PS_PRESSURE_ADVISORY,
+  PS_PRESSURE_URGENT
+};
 /* A busy probe preserves the advisory level. A drain can request a sample
  * even while pressure is clear. At low headroom a pressured sample can
- * commit enough eligible retirements with one physical checkpoint. */
+ * commit enough eligible retirements with one physical checkpoint, then
+ * report urgent pressure if ordinary headroom is still low. */
 int ps_maintenance_pressure(ps_space *, int draining, int *, uint64_t *,
                             lc_error *);
 

@@ -184,6 +184,7 @@ typedef struct lc_pouch_storage_capacity {
   uint64_t available;
   uint64_t activity;
   int pressured;
+  int urgent; /* A successful sample found low ordinary headroom. */
 } lc_pouch_storage_capacity;
 /* Discovery/control metadata belongs to the physical owner. The existing
  * scheduler retains cadence, fairness, coalescing and worker lifetime. State

@@ -1263,14 +1263,17 @@ int lc_pouch_compaction_capacity_turn(lc_pouch *pouch,
     if (mutated)
       state->stalled = 0;
   } else {
+    int advisory = sample.pressured && !sample.urgent;
     state->busy = 0;
     /* New history can create reclaimable work while writers consume each
      * gain in headroom before the next sample. Back off only on idle stalls. */
-    if (!sample.pressured || mutated || sample.available > state->available)
+    if (!sample.pressured || advisory != state->advisory || mutated ||
+        sample.available > state->available)
       state->stalled = 0;
     else if (state->stalled < 32)
       ++state->stalled;
     state->available = run ? sample.available : 0;
+    state->advisory = advisory;
     if (!sample.pressured) {
       /* One observation after the final turn confirms that it made no
        * headroom gain and that a peer did not publish in the meantime. */
@@ -1280,9 +1283,15 @@ int lc_pouch_compaction_capacity_turn(lc_pouch *pouch,
         state->draining = 0;
     }
   }
+  /* An early hint admits work at the normal probe cadence. Use the fast
+   * retry burst only near exhaustion, or while waiting for the first
+   * verified sample of a newly raised hint. */
   if (sample.pressured) {
     unchanged = state->stalled > state->busy ? state->stalled : state->busy;
-    if (unchanged < 8)
+    if (state->advisory) {
+      if (unchanged >= lc_pouch_compaction_source_count(pouch))
+        *delay = 1000;
+    } else if (unchanged < 8)
       *delay = 5;
     else if (unchanged < 16)
       *delay = 25;
@@ -1298,7 +1307,7 @@ static void *lc_pouch_compaction_worker(void *arg) {
   const lc_pouch_storage_maintenance_ops *ops =
       pouch->storage.ops ? pouch->storage.ops->maintenance : NULL;
   int probes_pressure = ops && ops->capacity_pressure;
-  struct timespec regular = {0}, probe = {0};
+  struct timespec regular = {0}, probe = {0}, advisory = {0};
   lc_pouch_compaction_capacity capacity = {0};
   int armed = 0;
   if (probes_pressure)
@@ -1334,10 +1343,18 @@ static void *lc_pouch_compaction_worker(void *arg) {
     if (probe_due)
       capacity_due =
           lc_pouch_compaction_capacity_turn(pouch, &capacity, &pressure_delay);
-    if ((regular_due || capacity_due) && !lc_pouch_compaction_stopping(pouch))
+    /* Keep sampling headroom during the advisory window so an urgent
+     * observation can bypass it. Every pass services the same work sources. */
+    if ((regular_due ||
+         (capacity_due &&
+          (!capacity.advisory || compaction_due(&now, &advisory)))) &&
+        !lc_pouch_compaction_stopping(pouch)) {
       lc_pouch_compaction_run_pass(pouch);
-    if (regular_due)
-      lc_pouch_compaction_deadline(pouch, &regular);
+      if (armed)
+        lc_pouch_compaction_deadline(pouch, &regular);
+      if (probes_pressure)
+        compaction_pressure_deadline(&advisory, 1000);
+    }
     if (probe_due)
       compaction_pressure_deadline(&probe, pressure_delay);
     pthread_mutex_lock(&pouch->compaction_mutex);

@@ -4369,7 +4369,24 @@ static void maintenance_capacity_schedule(void) {
   REQUIRE(!probe.draining);
 
   probe.sample.pressured = 1;
+  probe.sample.available = 4 * PS_MIB;
+  for (i = 0; i < 10; ++i) {
+    ++probe.sample.activity;
+    delay = 250;
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+    REQUIRE(delay == 250);
+  }
+  for (i = 0; i < 5; ++i)
+    REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 1000);
+  ++probe.sample.activity;
+  delay = 250;
+  REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 250);
+  probe.sample.urgent = 1;
   probe.sample.available = PS_CHUNK;
+  REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
+  REQUIRE(delay == 5);
   for (i = 0; i < 33; ++i)
     REQUIRE(lc_pouch_compaction_capacity_turn(pouch, &state, &delay));
   REQUIRE(delay == 1000);

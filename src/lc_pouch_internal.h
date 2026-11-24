@@ -30,7 +30,7 @@ typedef struct lc_pouch_state_metadata_append_batcher
 typedef struct lc_pouch_writer_root_lock_entry lc_pouch_writer_root_lock_entry;
 typedef struct lc_pouch_compaction_capacity {
   uint64_t available, activity;
-  int draining, quiet_turns, stalled, busy;
+  int draining, quiet_turns, stalled, busy, advisory;
 } lc_pouch_compaction_capacity;
 typedef struct lc_pouch_indexer_pending_namespace
     lc_pouch_indexer_pending_namespace;

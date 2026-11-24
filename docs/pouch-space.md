@@ -138,6 +138,11 @@ worker retries. They check retry cadence, progress in another namespace,
 and reclamation after release. One case holds a capacity claim in the
 fixed-size container.
 
+Under advisory pressure the worker samples ordinary headroom independently
+of its maintenance cadence. Advisory passes occur at most once per second
+and share the regular worker's schedule. Low verified headroom enables
+urgent retries, with backoff when work stalls.
+
 Shared single-file background maintenance retains one metadata projection per
 open root and releases its receiver and physical pins after each pass. It
 validates the collection, snapshot, active stream incarnation, and ready tail

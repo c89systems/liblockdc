@@ -4205,7 +4205,8 @@ static void projection_pressure(void) {
   occupied.payload_bytes = 4 * PS_MIB;
   ok(ps_budget_resize(padding, &occupied, &e), &e);
   ok(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e), &e);
-  REQUIRE(pressure && headroom > 5 * PS_MIB && headroom < 6 * PS_MIB);
+  REQUIRE(pressure == PS_PRESSURE_ADVISORY && headroom > 5 * PS_MIB &&
+          headroom < 6 * PS_MIB);
   for (uint64_t step = 4 * PS_MIB; step >= PS_PAGE;) {
     ps_budget_plan attempt = occupied;
     attempt.payload_bytes += step;
@@ -4224,14 +4225,14 @@ static void projection_pressure(void) {
      &e);
   REQUIRE(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e) ==
               LC_ERR_PENDING &&
-          pressure && !headroom);
+          pressure == PS_PRESSURE_ADVISORY && !headroom);
   ps_readiness_note_mutation(a);
   ps_readiness_note_mutation(b);
   REQUIRE(ps_readiness_activity(a) == 2 && ps_readiness_activity(b) == 2);
   lc_error_cleanup(&e);
   ps_coordination_unlock(guard);
   ok(ps_maintenance_pressure(a, 0, &pressure, &headroom, &e), &e);
-  REQUIRE(pressure && headroom < 2 * PS_MIB);
+  REQUIRE(pressure == PS_PRESSURE_URGENT && headroom < 2 * PS_MIB);
   ok(ps_checkpoint(b, &e), &e);
   ok(ps_refresh(a, &e), &e);
   ps_writer *probe = NULL;

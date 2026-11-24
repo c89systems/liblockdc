@@ -208,7 +208,10 @@ static void regression(const char *path, int single_file, int pressure,
     ps_budget_plan plan = {.payload_bytes = 5 * PS_MIB};
     space = ps_root_space(ps_pouch_state_root(runtime(owner)));
     ok(ps_budget_open(space, &plan, &claim, error), error);
-    REQUIRE(ps_maintenance_pressure_requested(space));
+    int level;
+    uint64_t available;
+    ok(ps_maintenance_pressure(space, 0, &level, &available, error), error);
+    REQUIRE(level == PS_PRESSURE_ADVISORY);
   }
   lc_pouch_test_compaction_observe = observe;
   lc_client *worker = open_client(path, single_file, 0, 1, 1, 0, NULL, error);
@@ -219,19 +222,15 @@ static void regression(const char *path, int single_file, int pressure,
   lc_collection *other = collection(worker, "independent", 1, error);
   REQUIRE(append(other, 1, body, sizeof(body) - 1, error) == 1);
   expect_collection(other, 1, 1, error);
-  if (pressure)
-    pause_ms(
-        3500); /* Let the finite pressure burst reach its backed-off rate. */
-
   uint64_t started = ns_now(CLOCK_MONOTONIC);
   observations before = sample();
   pause_ms(2200);
   observations after = sample();
   unsigned int attempts = after.attempts - before.attempts;
   uint64_t seconds = (ns_now(CLOCK_MONOTONIC) - started) / UINT64_C(1000000000);
-  /* A steady pressure probe can add one pass per second. Allow a pass already
-   * in flight when sampling began. */
-  uint64_t limit = 1 + (pressure ? 2U : 1U) * (seconds + 1);
+  /* Advisory pressure shares the regular cadence from its initial pass.
+   * Allow a pass already in flight when sampling began. */
+  uint64_t limit = 1 + (seconds + 1);
   printf("Pinned window: %u passes, %u pending, %u errors, limit %llu\n",
          attempts, after.pending - before.pending, after.errors,
          (unsigned long long)limit);

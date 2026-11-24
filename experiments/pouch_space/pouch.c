@@ -748,8 +748,11 @@ static int capacity_pressure(void *context, int draining,
                              lc_pouch_storage_capacity *sample, lc_error *e) {
   ps_pouch_owner *owner = context;
   ps_space *space = ps_root_space(owner->root);
-  int rc = ps_maintenance_pressure(space, draining, &sample->pressured,
+  int pressure;
+  int rc = ps_maintenance_pressure(space, draining, &pressure,
                                    &sample->available, e);
+  sample->pressured = pressure != PS_PRESSURE_NONE;
+  sample->urgent = pressure == PS_PRESSURE_URGENT;
   sample->activity = ps_readiness_activity(space);
   return rc;
 }

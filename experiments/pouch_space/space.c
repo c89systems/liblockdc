@@ -9355,7 +9355,9 @@ int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
   }
   if (rc == LC_OK && *needed && *available >= s->capacity - PS_DATA - quarter) {
     ps_readiness_set_pressure(s, 0);
-    *needed = 0;
+    *needed = PS_PRESSURE_NONE;
+  } else if (rc == LC_OK && *needed && *available < quarter) {
+    *needed = PS_PRESSURE_URGENT;
   }
   rc = allocation_end(s, guard, rc, error);
   pthread_mutex_unlock(&s->mutex);
