@@ -34,6 +34,7 @@ typedef struct ps_owned_status {
   uint64_t stored_bytes; /* selected payload ownership, excluding old pins */
   uint64_t edit_wire;
   int sealed, retired, complete;
+  int admitted; /* This live cohort has certified the selected tail. */
 } ps_owned_status;
 typedef struct ps_owned_initial {
   ps_coordination_guard *edit;

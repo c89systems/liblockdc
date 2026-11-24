@@ -429,6 +429,98 @@ static void projection_recovery(const char *path, int durable, int phase,
   lc_client_close(worker);
 }
 
+static int stop_provisional_edit(void *context, lc_collection *events,
+                                 int phase, lc_error *error) {
+  (void)context;
+  (void)events;
+  (void)error;
+  if (phase == LC_COLLECTION_EDIT_BODY)
+    _exit(73);
+  return LC_OK;
+}
+
+static void append_admission(const char *path, int durable, lc_error *error) {
+  static const char body[] = "{\"n\":1}";
+  int start[2], exit_status;
+  char ready;
+  REQUIRE(!pipe(start));
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    REQUIRE(!close(start[1]));
+    REQUIRE(read(start[0], &ready, 1) == 1);
+    REQUIRE(!close(start[0]));
+    lc_client *editor = open_client(path, 1, 0, 0, 1, durable, NULL, error);
+    lc_collection *events = collection(editor, work_namespace, 0, error);
+    lc_collection_head_res head = {0};
+    ok(lc_collection_head(events, &head, error), error);
+    lc_collection_edit_range cut = {0, 1};
+    lc_collection_append_req replacement;
+    lc_collection_append_req_init(&replacement);
+    replacement.append_id = "interrupted-body";
+    lc_collection_edit_req edit = {.operation_id = "interrupted-edit",
+                                   .expected_head = head.etag,
+                                   .ranges = &cut,
+                                   .range_count = 1,
+                                   .replacement = &replacement};
+    lc_source *source = NULL;
+    lc_collection_edit_res result;
+    ok(lc_source_from_memory(body, sizeof(body) - 1, &source, error), error);
+    lc_collection_edit_test_hook = stop_provisional_edit;
+    ok(lc_collection_edit(events, &edit, source, &result, error), error);
+    _exit(74);
+  }
+  REQUIRE(!close(start[0]));
+  lc_client *owner = open_client(path, 1, 1, 0, 1, durable, NULL, error);
+  lc_collection *events = collection(owner, work_namespace, 1, error);
+  REQUIRE(append(events, 1, body, sizeof(body) - 1, error) == 1);
+  lc_collection_close(events);
+  lc_client *peer = open_client(path, 1, 0, 0, 1, durable, NULL, error);
+  ps_space *space = ps_root_space(ps_pouch_state_root(runtime(owner)));
+  ps_space *peer_space = ps_root_space(ps_pouch_state_root(runtime(peer)));
+  ps_stats before, after;
+  ok(ps_refresh(peer_space, error), error);
+  ok(ps_metadata_repack(peer_space, error), error);
+  ok(ps_status(space, &before, error), error);
+  events = collection(owner, work_namespace, 0, error);
+  expect_collection(events, 1, 1, error);
+  ok(ps_status(space, &after, error), error);
+  REQUIRE(after.syncs == before.syncs);
+  lc_collection_close(events);
+
+  REQUIRE(write(start[1], "r", 1) == 1);
+  REQUIRE(!close(start[1]));
+  REQUIRE(waitpid(child, &exit_status, 0) == child && WIFEXITED(exit_status) &&
+          WEXITSTATUS(exit_status) == 73);
+  /* Even a later peer checkpoint must preserve revocation by the edit. */
+  ok(ps_refresh(peer_space, error), error);
+  ok(ps_metadata_repack(peer_space, error), error);
+  ok(ps_status(space, &before, error), error);
+  events = collection(owner, work_namespace, 0, error);
+  ok(ps_status(space, &after, error), error);
+  REQUIRE(after.syncs > before.syncs);
+  expect_collection(events, 1, 1, error);
+  lc_collection_edit_status_res receipt = {0};
+  ok(lc_collection_edit_status(events, "interrupted-edit", &receipt, error),
+     error);
+  REQUIRE(!receipt.found);
+  REQUIRE(append(events, 2, body, sizeof(body) - 1, error) == 2);
+  ok(ps_flush(space, error), error);
+  lc_collection_close(events);
+  lc_client_close(peer);
+  lc_client_close(owner);
+
+  owner = open_client(path, 1, 0, 0, 1, durable, NULL, error);
+  space = ps_root_space(ps_pouch_state_root(runtime(owner)));
+  ok(ps_status(space, &before, error), error);
+  events = collection(owner, work_namespace, 0, error);
+  ok(ps_status(space, &after, error), error);
+  REQUIRE(after.syncs > before.syncs);
+  expect_collection(events, 2, 2, error);
+  lc_collection_close(events);
+  lc_client_close(owner);
+}
+
 #ifdef __linux__
 static uint64_t file_blocks;
 
@@ -581,8 +673,9 @@ int main(int argc, char **argv) {
   int pressure = !strcmp(argv[2], "single-file-pressure");
   int projection = !strcmp(argv[2], "single-file-projection");
   int recovery = !strcmp(argv[2], "single-file-projection-recovery");
-  int single_file =
-      pressure || projection || recovery || !strcmp(argv[2], "single-file");
+  int admission = !strcmp(argv[2], "single-file-append-admission");
+  int single_file = pressure || projection || recovery || admission ||
+                    !strcmp(argv[2], "single-file");
   REQUIRE(single_file || !strcmp(argv[2], "multifile"));
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/compaction-", argv[1]) <
           (int)sizeof(prefix));
@@ -603,6 +696,13 @@ int main(int argc, char **argv) {
           projection_recovery(case_path, durable, phases[i], &error);
         }
       }
+    } else if (admission) {
+      char case_path[1150];
+      for (int durable = 0; durable <= 1; ++durable) {
+        REQUIRE(snprintf(case_path, sizeof(case_path), "%s-%d", path, durable) <
+                (int)sizeof(case_path));
+        append_admission(case_path, durable, &error);
+      }
     } else if (projection)
       projection_reuse(path, &error);
     else
@@ -614,7 +714,7 @@ int main(int argc, char **argv) {
                 !strcmp(argv[3], "soak-mixed-durable");
     int durable = !strcmp(argv[3], "soak-durable") ||
                   !strcmp(argv[3], "soak-mixed-durable");
-    REQUIRE(!pressure && !projection && !recovery &&
+    REQUIRE(!pressure && !projection && !recovery && !admission &&
             (mixed || durable || !strcmp(argv[3], "soak")));
     soak(path, single_file, durable, mixed, &error);
 #else

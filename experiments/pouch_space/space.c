@@ -9439,6 +9439,7 @@ static void owned_status(ps_owned_head *head, ps_owned_status *out) {
   out->complete =
       head->entry->stream.head->complete_generation &&
       head->entry->stream.head->complete_generation == head->space->generation;
+  out->admitted = head->entry->stream.head->admitted;
 }
 /* Existing run handles already own immutable mappings. New admissions fence
  * a seal or stream retirement until it is durable. */

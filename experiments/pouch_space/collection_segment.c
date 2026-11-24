@@ -363,8 +363,10 @@ int ps_collection_segment_open(ps_space *space, ps_key key, int create,
     rc = cs_load(s, key, expected, &status, e);
   if (rc == LC_OK && s->shared && recover && status.sealed)
     rc = cs_error(e, LC_ERR_PROTOCOL, "selected collection writer is sealed");
+  /* Admission follows the live cohort across checkpoints. An edit revokes
+   * it before writing canonical bytes, and a cold cohort discards it. */
   if (rc == LC_OK && !create && !status.sealed && recover &&
-      (!s->shared || (status.capacity && !status.complete)))
+      (!s->shared || (status.capacity && !status.admitted)))
     rc = cs_recover(s, &status, recover, context, e);
   if (rc != LC_OK) {
     ps_collection_segment_close(s);

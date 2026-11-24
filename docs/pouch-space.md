@@ -61,7 +61,9 @@ preserves the previous selection.
 
 Collection order and append-ID projections use process-local memory pages
 allocated on write. Captured views retain their backing while in use.
-Recovery rebuilds these projections from canonical records.
+Recovery rebuilds these projections from canonical records. Within a live
+cohort, a certified collection tail stays admitted across physical
+checkpoints. An interrupted edit or a cold open still requires recovery.
 
 Reclamation waits for durable retirement and release of outstanding physical
 ownership. OFD range locks retain reader extents and private writer
