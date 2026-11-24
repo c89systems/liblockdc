@@ -12,6 +12,7 @@ int ps_collection_client_visit(ps_root *, lc_client *, const char *,
                                lc_collection_visit_fn, void *, lc_error *);
 /* Root close has excluded external namespace/receiver pins. No payload I/O. */
 void ps_collection_cache_destroy(struct ps_collection_owner *);
+void ps_collection_maintenance_cache_clear(ps_root *);
 /* A durable conversion workspace already blocks new admission. Release this
  * collection's cached byte owners only after all existing receivers drain.
  * Keep the owner's logical query/head-token epoch and sibling owners intact.

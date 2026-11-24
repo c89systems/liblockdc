@@ -138,6 +138,11 @@ worker retries. They check retry cadence, progress in another namespace,
 and reclamation after release. One case holds a capacity claim in the
 fixed-size container.
 
+Shared single-file background maintenance retains one metadata projection per
+open root and releases its receiver and physical pins after each pass. It
+validates the collection, snapshot, active stream incarnation, and ready tail
+before reuse.
+
 For a native Linux comparison, build `pouch_space_compaction_test` in
 Release and run it with an absolute scratch directory, a backend argument
 (`multifile` or `single-file`), and `soak` or `soak-durable`. Both backends

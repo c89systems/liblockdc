@@ -6,6 +6,7 @@
 
 struct ps_namespace_data;
 struct ps_collection_owner;
+struct ps_collection_maintenance_cache;
 struct ps_outbox_marker_gate;
 struct ps_query_index_generation;
 struct ps_namespace {
@@ -36,6 +37,7 @@ struct ps_root {
   pthread_mutex_t mutex;
   pthread_cond_t changed;
   ps_namespace *namespaces, **buckets;
+  struct ps_collection_maintenance_cache *collection_maintenance;
   size_t capacity, count, calls, pins;
   int recovering_namespaces;
 };

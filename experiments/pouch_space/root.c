@@ -704,6 +704,7 @@ int ps_root_close(ps_root *root, lc_error *error) {
         "release container private writers and budgets before root close");
   }
   pthread_mutex_unlock(&root->mutex);
+  ps_collection_maintenance_cache_clear(root);
   for (ns = root->namespaces; ns; ns = ns->next) {
     ps_collection_cache_destroy(ns->collections);
     ns->collections = NULL;

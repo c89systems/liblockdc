@@ -156,7 +156,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
           pouch_space_client_test 900 ${mode} ${codec})
       endforeach()
     endforeach()
-    foreach(backend multifile single-file single-file-pressure)
+    foreach(backend multifile single-file single-file-pressure single-file-projection)
       pouch_space_darwin_case(pouch_space_compaction_${backend}
         pouch_space_compaction_test 90 ${backend})
     endforeach()
@@ -306,7 +306,7 @@ if(LOCKDC_BUILD_BENCHMARKS)
 endif()
 
 if(LOCKDC_BUILD_TESTS)
-  foreach(backend multifile single-file single-file-pressure)
+  foreach(backend multifile single-file single-file-pressure single-file-projection)
     add_test(NAME pouch_space_compaction_${backend}
       COMMAND pouch_space_compaction_test ${CMAKE_CURRENT_BINARY_DIR} ${backend})
     set_tests_properties(pouch_space_compaction_${backend} PROPERTIES

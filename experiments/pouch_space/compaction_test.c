@@ -3,7 +3,9 @@
 #include "budget.h"
 #include "lc_api_internal.h"
 #include "lc_collection_internal.h"
+#include "lc_pouch_record.h"
 #include "pouch_internal.h"
+#include "space_internal.h"
 #include <errno.h>
 #ifdef __linux__
 #include <ftw.h>
@@ -77,6 +79,7 @@ static void pause_ms(unsigned int milliseconds) {
 typedef struct admission {
   int single_file, create;
   unsigned int interval;
+  const ps_io *io;
 } admission;
 
 static int admit(void *context, const char *path, const lc_allocator *allocator,
@@ -90,6 +93,7 @@ static int admit(void *context, const char *path, const lc_allocator *allocator,
   options.logical.compaction_min_reclaimable_bytes = 1;
   options.logical.compaction_throttling_disabled = 1;
   options.maximum_capacity = PS_DEFAULT_CAPACITY;
+  options.io = mode->io;
   return mode->single_file
              ? ps_pouch_state_open(path, mode->create, allocator, &options, out,
                                    error)
@@ -98,12 +102,12 @@ static int admit(void *context, const char *path, const lc_allocator *allocator,
 
 static lc_client *open_client(const char *path, int single_file, int create,
                               int worker, unsigned int interval, int durable,
-                              lc_error *error) {
+                              const ps_io *io, lc_error *error) {
   char endpoint[1400];
   lc_client_config config;
   lc_pouch_settings settings;
   lc_client *client = NULL;
-  admission mode = {single_file, create, interval};
+  admission mode = {single_file, create, interval, io};
   const char *endpoints[] = {endpoint};
   REQUIRE(snprintf(endpoint, sizeof(endpoint),
                    "pouch://%s?single_writer=false&background_compaction=%s&"
@@ -161,7 +165,7 @@ static void expect_collection(lc_collection *out, uint64_t live,
 static void regression(const char *path, int single_file, int pressure,
                        lc_error *error) {
   static const char body[] = "{\"n\":1}";
-  lc_client *owner = open_client(path, single_file, 1, 0, 1, 0, error);
+  lc_client *owner = open_client(path, single_file, 1, 0, 1, 0, NULL, error);
   lc_collection *pinned = collection(owner, work_namespace, 1, error);
   lc_collection_handle *handle = pinned->impl;
   REQUIRE(append(pinned, 1, body, sizeof(body) - 1, error) == 1);
@@ -189,7 +193,7 @@ static void regression(const char *path, int single_file, int pressure,
     REQUIRE(ps_maintenance_pressure_requested(space));
   }
   lc_pouch_test_compaction_observe = observe;
-  lc_client *worker = open_client(path, single_file, 0, 1, 1, 0, error);
+  lc_client *worker = open_client(path, single_file, 0, 1, 1, 0, NULL, error);
   uint64_t deadline = ns_now(CLOCK_MONOTONIC) + UINT64_C(10000000000);
   while (sample().pending == 0 && ns_now(CLOCK_MONOTONIC) < deadline)
     pause_ms(10);
@@ -243,6 +247,83 @@ static void regression(const char *path, int single_file, int pressure,
   lc_client_close(owner);
 }
 
+static ssize_t count_record_reads(void *context, int fd, void *bytes, size_t n,
+                                  off_t offset) {
+  size_t *count = context;
+  ssize_t rc = ps_native_io.read(NULL, fd, bytes, n, offset);
+  if (n == LC_POUCH_RECORD_HEADER_BYTES && rc == (ssize_t)n &&
+      !memcmp(bytes, "LHCP", 4))
+    ++*count;
+  return rc;
+}
+
+static void projection_reuse(const char *path, lc_error *error) {
+  static const char body[] = "{\"n\":1}";
+  size_t reads = 0;
+  ps_io io = ps_native_io;
+  io.context = &reads;
+  io.read = count_record_reads;
+  lc_client *worker = open_client(path, 1, 1, 0, 1, 1, &io, error);
+  lc_client *peer = open_client(path, 1, 0, 0, 1, 1, NULL, error);
+  lc_collection *events = collection(peer, work_namespace, 1, error);
+  lc_pouch_maintenance_options background = {.ns = work_namespace,
+                                             .background = 1};
+  lc_pouch_maintenance_options forced = {.ns = work_namespace, .force = 1};
+  lc_pouch_maintenance_result result = {0};
+  for (uint64_t i = 1; i <= 48; ++i)
+    REQUIRE(append(events, i, body, sizeof(body) - 1, error) == i);
+  /* A snapshot with an empty active segment isolates projection replay from
+   * the canonical recovery that a checkpoint generation change can require. */
+  ok(lc_pouch_maintenance_run(runtime(peer), &forced, &result, error), error);
+  REQUIRE(result.compacted_collection_count == 1);
+  lc_pouch_maintenance_result_cleanup(NULL, &result);
+  reads = 0;
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, NULL, error),
+     error);
+  size_t cold = reads;
+  reads = 0;
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, NULL, error),
+     error);
+  printf("Maintenance canonical header reads: cold=%zu warm=%zu\n", cold,
+         reads);
+  REQUIRE(cold >= 40 && reads < cold / 4);
+  ps_space *space = ps_root_space(ps_pouch_state_root(runtime(worker)));
+  ps_stats status;
+  ok(ps_status(space, &status, error), error);
+  REQUIRE(!status.retained_payload_bytes);
+
+  REQUIRE(append(events, 49, body, sizeof(body) - 1, error) == 49);
+  lc_collection_metadata_req policy = {.has_max_entries = 1, .max_entries = 48};
+  lc_collection_info info;
+  ok(lc_collection_metadata(events, &policy, &info, error), error);
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, &result, error),
+     error);
+  REQUIRE(result.retention_deleted_state_count == 1);
+  lc_pouch_maintenance_result_cleanup(NULL, &result);
+  expect_collection(events, 48, 49, error);
+
+  REQUIRE(append(events, 50, body, sizeof(body) - 1, error) == 50);
+  ok(lc_pouch_maintenance_run(runtime(peer), &forced, &result, error), error);
+  REQUIRE(result.compacted_collection_count == 1);
+  lc_pouch_maintenance_result_cleanup(NULL, &result);
+  reads = 0;
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, NULL, error),
+     error);
+  REQUIRE(reads >= 40);
+  expect_collection(events, 48, 50, error);
+
+  ok(lc_collection_drop(events, error), error);
+  lc_collection_close(events);
+  events = collection(peer, work_namespace, 1, error);
+  REQUIRE(append(events, 1, body, sizeof(body) - 1, error) == 1);
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, NULL, error),
+     error);
+  expect_collection(events, 1, 1, error);
+  lc_collection_close(events);
+  lc_client_close(peer);
+  lc_client_close(worker);
+}
+
 #ifdef __linux__
 static uint64_t file_blocks;
 
@@ -285,7 +366,8 @@ static void soak(const char *path, int single_file, int durable,
   memcpy(body + payload_size - 2, "\"}", 2);
 
   lc_pouch_test_compaction_observe = observe;
-  lc_client *client = open_client(path, single_file, 1, 1, 1, durable, error);
+  lc_client *client =
+      open_client(path, single_file, 1, 1, 1, durable, NULL, error);
   lc_collection *events = collection(client, work_namespace, 1, error);
   clockid_t compactor;
   REQUIRE(
@@ -357,7 +439,7 @@ static void soak(const char *path, int single_file, int durable,
   lc_collection_close(events);
   lc_client_close(client);
   lc_pouch_test_compaction_observe = NULL;
-  client = open_client(path, single_file, 0, 0, 1, durable, error);
+  client = open_client(path, single_file, 0, 0, 1, durable, NULL, error);
   events = collection(client, work_namespace, 0, error);
   expect_collection(events, kept, samples, error);
   lc_collection_close(events);
@@ -372,7 +454,8 @@ int main(int argc, char **argv) {
   lc_error error = {0};
   REQUIRE(argc == 3 || argc == 4);
   int pressure = !strcmp(argv[2], "single-file-pressure");
-  int single_file = pressure || !strcmp(argv[2], "single-file");
+  int projection = !strcmp(argv[2], "single-file-projection");
+  int single_file = pressure || projection || !strcmp(argv[2], "single-file");
   REQUIRE(single_file || !strcmp(argv[2], "multifile"));
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/compaction-", argv[1]) <
           (int)sizeof(prefix));
@@ -382,13 +465,15 @@ int main(int argc, char **argv) {
   REQUIRE(snprintf(path, sizeof(path), "%s/store", scratch) <
           (int)sizeof(path));
   if (argc == 3) {
-    regression(path, single_file, pressure, &error);
-    printf("%s background compaction cadence and reclamation passed\n",
-           argv[2]);
+    if (projection)
+      projection_reuse(path, &error);
+    else
+      regression(path, single_file, pressure, &error);
+    printf("%s background compaction checks passed\n", argv[2]);
   } else {
 #ifdef __linux__
     int durable = !strcmp(argv[3], "soak-durable");
-    REQUIRE(!pressure && (durable || !strcmp(argv[3], "soak")));
+    REQUIRE(!pressure && !projection && (durable || !strcmp(argv[3], "soak")));
     soak(path, single_file, durable, &error);
 #else
     REQUIRE(0 && "the soak requires a Linux worker CPU clock");

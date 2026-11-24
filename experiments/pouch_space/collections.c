@@ -64,7 +64,16 @@ typedef struct ps_collection_owner ps_collection_owner;
 typedef struct collection_receiver {
   ps_collection_owner *owner;
   lc_collection_handle *receiver;
+  ps_ref projected_active;
+  int maintenance, borrowed_projection;
 } collection_receiver;
+/* One disposable projection per open root. It owns no receiver, storage
+ * references, or topology pins. The root mutex protects slot transfers. */
+typedef struct ps_collection_maintenance_cache {
+  ps_ref collection, active;
+  lc_collection_order order;
+  lc_collection_ids ids;
+} maintenance_cache;
 
 static int failure(lc_error *e, int code, const char *reason,
                    const char *message) {
@@ -136,6 +145,61 @@ static ps_key key_for(ps_collection_owner *owner, uint64_t id) {
 static int same_ref(const ps_ref *a, const ps_ref *b) {
   return a->incarnation == b->incarnation &&
          !memcmp(a->container, b->container, sizeof(a->container));
+}
+static void maintenance_cache_free(maintenance_cache *cache) {
+  if (!cache)
+    return;
+  lc_collection_order_close(&cache->order);
+  lc_collection_ids_close(&cache->ids);
+  lc_free_with_allocator(NULL, cache);
+}
+void ps_collection_maintenance_cache_clear(ps_root *root) {
+  maintenance_cache_free(root->collection_maintenance);
+  root->collection_maintenance = NULL;
+}
+static void maintenance_cache_take(collection_receiver *binding) {
+  ps_root *root = binding->owner->ns->root;
+  lc_collection_handle *c = binding->receiver;
+  maintenance_cache *cache = NULL;
+  pthread_mutex_lock(&root->mutex);
+  if (root->collection_maintenance &&
+      same_ref(&root->collection_maintenance->collection,
+               &binding->owner->binding.target)) {
+    cache = root->collection_maintenance;
+    root->collection_maintenance = NULL;
+  }
+  pthread_mutex_unlock(&root->mutex);
+  if (cache) {
+    c->order = cache->order;
+    c->ids = cache->ids;
+    binding->projected_active = cache->active;
+    binding->borrowed_projection = 1;
+    c->trusted = 1;
+    lc_free_with_allocator(NULL, cache);
+  }
+}
+static void maintenance_cache_save(lc_collection_handle *c) {
+  collection_receiver *binding = c->owner.context;
+  ps_root *root = binding->owner->ns->root;
+  maintenance_cache *previous, *cache;
+  if (!c->trusted || c->order.edit_in_progress || !c->order.scratch ||
+      !c->ids.scratch || !binding->projected_active.incarnation)
+    return;
+  cache = lc_alloc_with_allocator(NULL, sizeof(*cache));
+  if (!cache)
+    return;
+  cache->collection = binding->owner->binding.target;
+  cache->active = binding->projected_active;
+  cache->order = c->order;
+  cache->ids = c->ids;
+  memset(&c->order, 0, sizeof(c->order));
+  memset(&c->ids, 0, sizeof(c->ids));
+  c->order.fd = c->ids.fd = -1;
+  pthread_mutex_lock(&root->mutex);
+  previous = root->collection_maintenance;
+  root->collection_maintenance = cache;
+  pthread_mutex_unlock(&root->mutex);
+  maintenance_cache_free(previous);
 }
 static unsigned int segment_kind(lc_u64 id) {
   return id & LC_COLLECTION_SNAPSHOT_BIT ? PS_CATALOG_SNAPSHOT
@@ -511,6 +575,7 @@ static int order_refresh(void *context, lc_collection_order *order,
   lc_collection_handle *c = binding->receiver;
   ps_owned_status active;
   int shared = shared_collection(owner);
+  int stale_projection = 0;
   int rc = lc_collection_order_is_open(order)
                ? lc_collection_order_refresh(order, e)
                : lc_collection_order_scratch_open(&owner->allocator, order, e);
@@ -534,15 +599,32 @@ static int order_refresh(void *context, lc_collection_order *order,
       rc = ps_collection_segment_status(segment, &active, NULL, e);
     ps_collection_segment_close(segment);
   }
+  if (rc == LC_OK && binding->borrowed_projection) {
+    binding->borrowed_projection = 0;
+    /* The append and metadata scopes already protect the selected head.
+     * A different active incarnation or a rewound tail invalidates the
+     * borrowed scratch, even when its logical segment number is reused. */
+    if (!same_ref(&binding->projected_active, &active.ref) ||
+        order->snapshot != c->head.snapshot ||
+        c->ids.snapshot != c->head.snapshot ||
+        order->replay_segment != c->head.active ||
+        c->ids.replay_segment != c->head.active ||
+        order->replay_offset > active.tail || c->ids.replay_offset > active.tail) {
+      c->trusted = 0;
+      stale_projection = 1;
+    }
+  }
   /* A peer can also complete a page without changing the snapshot. Its
    * canonical ready tail must be visible before validating a late index
    * publication against this receiver's disposable order. Private allocation
    * alone does not advance this watermark or require a replay. */
   if (rc == LC_OK && (order->snapshot != c->head.snapshot ||
                       order->replay_segment != c->head.active ||
-                      order->replay_offset < active.tail))
+                      order->replay_offset < active.tail || stale_projection))
     rc = shared ? lc_collection_projection_catchup(c, e)
                 : lc_collection_projection_capture(c, e);
+  if (rc == LC_OK && binding->maintenance)
+    binding->projected_active = active.ref;
   return rc;
 }
 static int ids_refresh(void *context, lc_collection_ids *ids, lc_error *e) {
@@ -1133,7 +1215,7 @@ static int remove_name(void *context, lc_error *e) {
   return rc;
 }
 static int receiver_open(ps_collection_owner *, lc_pouch *, lc_client_handle *,
-                         lc_collection **, lc_error *);
+                         int, lc_collection **, lc_error *);
 static int receiver_clone(void *context, lc_collection **out, lc_error *e) {
   collection_receiver *binding = context;
   ps_collection_owner *owner = binding->owner;
@@ -1141,7 +1223,7 @@ static int receiver_clone(void *context, lc_collection **out, lc_error *e) {
   pin_locked(owner);
   pthread_mutex_unlock(&owner->ns->root->mutex);
   return receiver_open(owner, binding->receiver->pouch,
-                       binding->receiver->client, out, e);
+                       binding->receiver->client, 0, out, e);
 }
 static int receiver_finish(void *context, lc_error *e) {
   collection_receiver *binding = context;
@@ -1217,12 +1299,14 @@ static int receiver_attach(void *context, lc_collection_handle *c,
   if (shared_collection(owner))
     c->layout.release_active = layout_release_active;
   c->layout.context = binding;
+  if (binding->maintenance)
+    maintenance_cache_take(binding);
   return ps_check(space(owner), e);
 }
 /* Consumes one owner reference on every result. */
 static int receiver_open(ps_collection_owner *owner, lc_pouch *pouch,
-                         lc_client_handle *client, lc_collection **out,
-                         lc_error *e) {
+                         lc_client_handle *client, int maintenance,
+                         lc_collection **out, lc_error *e) {
   static const lc_collection_owner_ops operations = {
       receiver_attach, receiver_clone,  bound,
       remove_name,     receiver_finish, receiver_release};
@@ -1235,6 +1319,7 @@ static int receiver_open(ps_collection_owner *owner, lc_pouch *pouch,
                    "cannot allocate collection receiver binding");
   }
   binding->owner = owner;
+  binding->maintenance = maintenance;
   access.ops = &operations;
   access.context = binding;
   return lc_collection_owned_open(pouch, client, owner->ns->name, owner->name,
@@ -1498,7 +1583,7 @@ int ps_collection_client_open(ps_root *root, lc_client *client,
     pthread_mutex_lock(&root->mutex);
     pin_locked(owner);
     pthread_mutex_unlock(&root->mutex);
-    rc = receiver_open(owner, logical->pouch, logical, out, e);
+    rc = receiver_open(owner, logical->pouch, logical, 0, out, e);
     if (rc == LC_OK && !found && config->lease)
       rc = lc_collection_lease_initialize((*out)->impl, config->lease, e);
     if (rc == LC_OK && !found)
@@ -1614,7 +1699,8 @@ int ps_collection_client_visit(ps_root *root, lc_client *client,
     collection = NULL;
     if (rc == LC_OK) {
       rc =
-          receiver_open(list.items[i], logical->pouch, logical, &collection, e);
+          receiver_open(list.items[i], logical->pouch, logical, 0, &collection,
+                        e);
       list.items[i] = NULL;
       if (rc == LC_OK)
         rc = collection->describe(collection, &info, e);
@@ -1669,7 +1755,8 @@ static int capture_maintenance(void *context, const void *name, size_t length,
   return LC_OK;
 }
 static int maintenance_admit(ps_namespace *ns, lc_pouch *pouch,
-                             const maintenance_item *item, lc_collection **out,
+                             const maintenance_item *item, int cache,
+                             lc_collection **out,
                              lc_error *e) {
   ps_catalog_view *view = NULL;
   ps_catalog_info current;
@@ -1691,7 +1778,7 @@ static int maintenance_admit(ps_namespace *ns, lc_pouch *pouch,
   ps_catalog_view_close(view);
   rc = catalog_end(ns, catalog, rc, e);
   if (rc == LC_OK && owner)
-    rc = receiver_open(owner, pouch, NULL, out, e);
+    rc = receiver_open(owner, pouch, NULL, cache, out, e);
   else if (owner)
     owner_release(owner);
   return rc;
@@ -1718,6 +1805,9 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   size_t i;
   void *catalog;
   int present = 0, pending = 0, scan_collections, dropped, rc, first_rc;
+  int reuse_projection =
+      options->background && !options->force &&
+      ps_coordination_shared(ps_space_coordination(root->space));
   memset(&list, 0, sizeof(list));
   list.allocator = &pouch->allocator;
   rc = ps_root_namespace_acquire(root, options->ns, 0, &ns, e);
@@ -1755,9 +1845,11 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
     lc_error_init(e);
   }
   for (i = 0U; i < list.count; ++i) {
+    /* Keep the same candidate across visits to a multi-collection namespace. */
+    int cache = reuse_projection && i == 0U;
     collection = NULL;
     dropped = 0;
-    rc = maintenance_admit(ns, pouch, &list.items[i], &collection, &local);
+    rc = maintenance_admit(ns, pouch, &list.items[i], cache, &collection, &local);
     if (rc == LC_OK && collection && !options->cleanup_only)
       rc = lc_collection_retention_maintain(collection, &dropped, out, &local);
     if (rc == LC_OK && collection && !dropped)
@@ -1767,6 +1859,8 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
       rc = lc_collection_query_cleanup(collection, out, &local);
     if (rc == LC_OK && collection && !dropped && !options->cleanup_only)
       rc = lc_collection_query_maintain(collection, &local);
+    if (rc == LC_OK && cache && collection && !dropped)
+      maintenance_cache_save(collection->impl);
     if (stale(rc, &local)) {
       clear(&local);
       rc = LC_OK;
