@@ -141,14 +141,17 @@ fixed-size container.
 Shared single-file background maintenance retains one metadata projection per
 open root and releases its receiver and physical pins after each pass. It
 validates the collection, snapshot, active stream incarnation, and ready tail
-before reuse.
+before reuse. The recovery case keeps that projection resident across peer
+exit before and after snapshot publication, then checks retention, append-ID
+receipts, and reclamation in both sync modes.
 
 For a native Linux comparison, build `pouch_space_compaction_test` in
 Release and run it with an absolute scratch directory, a backend argument
-(`multifile` or `single-file`), and `soak` or `soak-durable`. Both backends
-use the same collection churn and one-second maintenance interval. The probe
-reports compactor thread CPU during writes and after they stop, append and
-delete pair latency, and drain CPU per net MiB released when measurable.
+(`multifile` or `single-file`), and `soak` or `soak-durable`. Use
+`soak-mixed` or `soak-mixed-durable` for four collections across two
+namespaces. Both backends use the same collection churn and one-second
+maintenance interval. The probe reports compactor CPU during writes and
+drain, append and delete pair latency, peak RSS, and occupied storage.
 
 Compare matched builds and multifile on representative lease, coordination,
 messaging, and indexed workloads. Record work time, CPU, mutation p95 and

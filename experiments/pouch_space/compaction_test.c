@@ -9,11 +9,14 @@
 #include <errno.h>
 #ifdef __linux__
 #include <ftw.h>
+#include <sys/resource.h>
 #endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <unistd.h>
 
 #define REQUIRE(condition)                                                     \
   do {                                                                         \
@@ -36,13 +39,14 @@ typedef struct observations {
 
 static pthread_mutex_t observation_lock = PTHREAD_MUTEX_INITIALIZER;
 static observations observed;
+static int observe_all_namespaces;
 static const char work_namespace[] = "churn";
 
 static void observe(const char *ns, const lc_pouch_maintenance_result *result,
                     int rc) {
   REQUIRE(!pthread_mutex_lock(&observation_lock));
   ++observed.attempts;
-  if (rc == LC_OK && !strcmp(ns, work_namespace)) {
+  if (rc == LC_OK && (observe_all_namespaces || !strcmp(ns, work_namespace))) {
     if (result->cleanup_pending_count)
       ++observed.pending;
     else
@@ -129,9 +133,10 @@ static lc_pouch *runtime(lc_client *client) {
   return ((lc_client_handle *)client)->pouch;
 }
 
-static lc_collection *collection(lc_client *client, const char *ns, int create,
-                                 lc_error *error) {
-  lc_collection_config config = {ns, "events"};
+static lc_collection *named_collection(lc_client *client, const char *ns,
+                                       const char *name, int create,
+                                       lc_error *error) {
+  lc_collection_config config = {ns, name};
   lc_collection *out = NULL;
   ok(create ? lc_client_create_collection(client, &config, &out, error)
             : lc_client_open_collection(client, &config, &out, error),
@@ -139,8 +144,14 @@ static lc_collection *collection(lc_client *client, const char *ns, int create,
   return out;
 }
 
-static uint64_t append(lc_collection *out, uint64_t entry, const char *body,
-                       size_t bytes, lc_error *error) {
+static lc_collection *collection(lc_client *client, const char *ns, int create,
+                                 lc_error *error) {
+  return named_collection(client, ns, "events", create, error);
+}
+
+static lc_collection_append_res
+append_with_receipt(lc_collection *out, uint64_t entry, const char *body,
+                    size_t bytes, lc_error *error) {
   char id[32];
   lc_collection_append_req request;
   lc_collection_append_res result = {0};
@@ -151,6 +162,13 @@ static uint64_t append(lc_collection *out, uint64_t entry, const char *body,
   ok(lc_source_from_memory(body, bytes, &source, error), error);
   ok(lc_collection_append(out, &request, source, &result, error), error);
   lc_source_close(source);
+  return result;
+}
+
+static uint64_t append(lc_collection *out, uint64_t entry, const char *body,
+                       size_t bytes, lc_error *error) {
+  lc_collection_append_res result =
+      append_with_receipt(out, entry, body, bytes, error);
   REQUIRE(!result.duplicate && result.bytes == bytes);
   return result.position;
 }
@@ -324,6 +342,94 @@ static void projection_reuse(const char *path, lc_error *error) {
   lc_client_close(worker);
 }
 
+static int stop_compactor(void *context, lc_collection *events, int phase,
+                          lc_error *error) {
+  (void)events;
+  (void)error;
+  if (phase == *(const int *)context)
+    _exit(73);
+  return LC_OK;
+}
+
+static void projection_recovery(const char *path, int durable, int phase,
+                                lc_error *error) {
+  static const char body[] = "{\"n\":1}";
+  const size_t body_bytes = sizeof(body) - 1;
+  lc_pouch_maintenance_options background = {.ns = work_namespace,
+                                             .background = 1};
+  int start[2];
+  char ready;
+  REQUIRE(!pipe(start));
+  /* Fork before opening either client. The child opens an independent root
+   * after the parent has populated its resident maintenance projection. */
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    REQUIRE(!close(start[1]));
+    REQUIRE(read(start[0], &ready, 1) == 1);
+    REQUIRE(!close(start[0]));
+    lc_client *peer = open_client(path, 1, 0, 0, 1, durable, NULL, error);
+    lc_collection *events = collection(peer, work_namespace, 0, error);
+    REQUIRE(append(events, 2, body, body_bytes, error) == 2);
+    /* Promise the same append prefix at both compaction interruption points. */
+    ok(ps_flush(ps_root_space(ps_pouch_state_root(runtime(peer))), error),
+       error);
+    lc_collection_compact_test_hook = stop_compactor;
+    lc_collection_compact_test_context = &phase;
+    ok(lc_collection_compact(events, 1, 0, NULL, error), error);
+    _exit(74);
+  }
+  REQUIRE(!close(start[0]));
+  lc_client *worker = open_client(path, 1, 1, 0, 1, durable, NULL, error);
+  lc_collection *events = collection(worker, work_namespace, 1, error);
+  lc_collection_metadata_req policy = {.has_max_entries = 1, .max_entries = 1};
+  lc_collection_info info;
+  REQUIRE(append(events, 1, body, body_bytes, error) == 1);
+  ok(lc_collection_metadata(events, &policy, &info, error), error);
+  ok(lc_collection_compact(events, 1, 0, NULL, error), error);
+  for (int pass = 0; pass < 2; ++pass)
+    ok(lc_pouch_maintenance_run(runtime(worker), &background, NULL, error),
+       error);
+  REQUIRE(write(start[1], "r", 1) == 1);
+  REQUIRE(!close(start[1]));
+  int exit_status;
+  REQUIRE(waitpid(child, &exit_status, 0) == child && WIFEXITED(exit_status) &&
+          WEXITSTATUS(exit_status) == 73);
+
+  lc_pouch_maintenance_result result = {0};
+  ok(lc_pouch_maintenance_run(runtime(worker), &background, &result, error),
+     error);
+  REQUIRE(result.retention_deleted_state_count == 1);
+  unsigned long reclaimed = result.cleanup_deleted_count;
+  lc_pouch_maintenance_result_cleanup(NULL, &result);
+  expect_collection(events, 1, 2, error);
+  lc_collection_append_res old =
+      append_with_receipt(events, 1, body, body_bytes, error);
+  lc_collection_append_res latest =
+      append_with_receipt(events, 2, body, body_bytes, error);
+  REQUIRE(old.duplicate && old.deleted && old.position == 1);
+  REQUIRE(latest.duplicate && !latest.deleted && latest.position == 2);
+  ps_space *space = ps_root_space(ps_pouch_state_root(runtime(worker)));
+  uint64_t deadline = ns_now(CLOCK_MONOTONIC) + UINT64_C(8000000000);
+  ps_stats status;
+  do {
+    ok(lc_pouch_maintenance_run(runtime(worker), &background, &result, error),
+       error);
+    reclaimed += result.cleanup_deleted_count;
+    ok(ps_status(space, &status, error), error);
+    int settled = !result.cleanup_pending_count;
+    lc_pouch_maintenance_result_cleanup(NULL, &result);
+    if (settled && reclaimed && !status.retained_payload_bytes)
+      break;
+    REQUIRE(ns_now(CLOCK_MONOTONIC) < deadline);
+    pause_ms(100);
+  } while (1);
+  printf("Projection recovery durable=%d phase=%d reclaimed=%lu\n", durable,
+         phase, reclaimed);
+  lc_collection_close(events);
+  lc_client_close(worker);
+}
+
 #ifdef __linux__
 static uint64_t file_blocks;
 
@@ -354,9 +460,13 @@ static int compare_latency(const void *a, const void *b) {
   return (left > right) - (left < right);
 }
 
-static void soak(const char *path, int single_file, int durable,
+static void soak(const char *path, int single_file, int durable, int mixed,
                  lc_error *error) {
   enum { windows = 30, per_window = 16, kept = 32, payload_size = 8192 };
+  static const char *const namespaces[] = {work_namespace, "independent"};
+  static const char *const names[] = {"events", "more-events"};
+  lc_collection *events[4];
+  const size_t collections = mixed ? 4 : 1;
   const size_t samples = windows * per_window;
   char *body = malloc(payload_size);
   uint64_t *latencies = malloc(samples * sizeof(*latencies));
@@ -365,16 +475,21 @@ static void soak(const char *path, int single_file, int durable,
   memset(body + 6, 'x', payload_size - 8);
   memcpy(body + payload_size - 2, "\"}", 2);
 
+  observe_all_namespaces = 1;
   lc_pouch_test_compaction_observe = observe;
   lc_client *client =
       open_client(path, single_file, 1, 1, 1, durable, NULL, error);
-  lc_collection *events = collection(client, work_namespace, 1, error);
+  for (size_t i = 0; i < collections; ++i)
+    events[i] =
+        named_collection(client, namespaces[i / 2], names[i % 2], 1, error);
   clockid_t compactor;
   REQUIRE(
       !pthread_getcpuclockid(runtime(client)->compaction_thread, &compactor));
-  printf(
-      "backend=%s durable=%d interval_s=1 live_entries=%d payload_bytes=%d\n",
-      single_file ? "single-file" : "multifile", durable, kept, payload_size);
+  printf("backend=%s durable=%d interval_s=1 collections=%zu "
+         "live_per_collection=%d "
+         "payload_bytes=%d\n",
+         single_file ? "single-file" : "multifile", durable, collections, kept,
+         payload_size);
   uint64_t cpu_start = ns_now(compactor);
   uint64_t write_start = ns_now(CLOCK_MONOTONIC);
   for (size_t window = 0; window < windows; ++window) {
@@ -383,12 +498,15 @@ static void soak(const char *path, int single_file, int durable,
     observations before = sample();
     for (size_t i = 0; i < per_window; ++i) {
       size_t seq = window * per_window + i;
+      lc_collection *target = events[seq % collections];
+      size_t next_position = seq / collections + 1;
       uint64_t begin = ns_now(CLOCK_MONOTONIC);
-      uint64_t position = append(events, seq + 1, body, payload_size, error);
-      REQUIRE(position == seq + 1);
+      uint64_t position =
+          append(target, next_position, body, payload_size, error);
+      REQUIRE(position == next_position);
       if (position > kept) {
         lc_collection_delete_res deleted;
-        ok(lc_collection_delete_entry(events, position - kept, &deleted, error),
+        ok(lc_collection_delete_entry(target, position - kept, &deleted, error),
            error);
       }
       latencies[seq] = ns_now(CLOCK_MONOTONIC) - begin;
@@ -421,28 +539,36 @@ static void soak(const char *path, int single_file, int durable,
   }
   uint64_t drain_cpu = ns_now(compactor) - drain_start;
   uint64_t bytes_after = allocated_bytes(client, path, single_file, error);
+  struct rusage usage;
+  REQUIRE(!getrusage(RUSAGE_SELF, &usage));
   REQUIRE(sample().reclaimed > 0);
   qsort(latencies, samples, sizeof(*latencies), compare_latency);
-  printf(
-      "writer_wall_ms=%.3f writer_phase_compactor_cpu_ms=%.3f "
-      "append_delete_p95_ms=%.3f append_delete_p99_ms=%.3f "
-      "drain_compactor_cpu_ms=%.3f occupied_before=%llu occupied_after=%llu\n",
-      write_wall / 1e6, write_cpu / 1e6,
-      latencies[(95 * samples + 99) / 100 - 1] / 1e6,
-      latencies[(99 * samples + 99) / 100 - 1] / 1e6, drain_cpu / 1e6,
-      (unsigned long long)bytes_before, (unsigned long long)bytes_after);
+  printf("writer_wall_ms=%.3f writer_phase_compactor_cpu_ms=%.3f "
+         "append_delete_p95_ms=%.3f append_delete_p99_ms=%.3f "
+         "drain_compactor_cpu_ms=%.3f occupied_before=%llu occupied_after=%llu "
+         "peak_rss_kib=%ld\n",
+         write_wall / 1e6, write_cpu / 1e6,
+         latencies[(95 * samples + 99) / 100 - 1] / 1e6,
+         latencies[(99 * samples + 99) / 100 - 1] / 1e6, drain_cpu / 1e6,
+         (unsigned long long)bytes_before, (unsigned long long)bytes_after,
+         usage.ru_maxrss);
   if (bytes_after < bytes_before)
     printf("drain_cpu_ms_per_net_MiB_released=%.3f\n",
            (drain_cpu / 1e6) / ((bytes_before - bytes_after) / (double)PS_MIB));
 
-  expect_collection(events, kept, samples, error);
-  lc_collection_close(events);
+  for (size_t i = 0; i < collections; ++i) {
+    expect_collection(events[i], kept, samples / collections, error);
+    lc_collection_close(events[i]);
+  }
   lc_client_close(client);
   lc_pouch_test_compaction_observe = NULL;
   client = open_client(path, single_file, 0, 0, 1, durable, NULL, error);
-  events = collection(client, work_namespace, 0, error);
-  expect_collection(events, kept, samples, error);
-  lc_collection_close(events);
+  for (size_t i = 0; i < collections; ++i) {
+    events[i] =
+        named_collection(client, namespaces[i / 2], names[i % 2], 0, error);
+    expect_collection(events[i], kept, samples / collections, error);
+    lc_collection_close(events[i]);
+  }
   lc_client_close(client);
   free(latencies);
   free(body);
@@ -455,7 +581,9 @@ int main(int argc, char **argv) {
   REQUIRE(argc == 3 || argc == 4);
   int pressure = !strcmp(argv[2], "single-file-pressure");
   int projection = !strcmp(argv[2], "single-file-projection");
-  int single_file = pressure || projection || !strcmp(argv[2], "single-file");
+  int recovery = !strcmp(argv[2], "single-file-projection-recovery");
+  int single_file =
+      pressure || projection || recovery || !strcmp(argv[2], "single-file");
   REQUIRE(single_file || !strcmp(argv[2], "multifile"));
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/compaction-", argv[1]) <
           (int)sizeof(prefix));
@@ -465,16 +593,31 @@ int main(int argc, char **argv) {
   REQUIRE(snprintf(path, sizeof(path), "%s/store", scratch) <
           (int)sizeof(path));
   if (argc == 3) {
-    if (projection)
+    if (recovery) {
+      static const int phases[] = {LC_COLLECTION_COMPACT_COPIED,
+                                   LC_COLLECTION_COMPACT_HEAD_PUBLISHED};
+      char case_path[1150];
+      for (int durable = 0; durable <= 1; ++durable) {
+        for (size_t i = 0; i < sizeof(phases) / sizeof(phases[0]); ++i) {
+          REQUIRE(snprintf(case_path, sizeof(case_path), "%s-%d-%zu", path,
+                           durable, i) < (int)sizeof(case_path));
+          projection_recovery(case_path, durable, phases[i], &error);
+        }
+      }
+    } else if (projection)
       projection_reuse(path, &error);
     else
       regression(path, single_file, pressure, &error);
     printf("%s background compaction checks passed\n", argv[2]);
   } else {
 #ifdef __linux__
-    int durable = !strcmp(argv[3], "soak-durable");
-    REQUIRE(!pressure && !projection && (durable || !strcmp(argv[3], "soak")));
-    soak(path, single_file, durable, &error);
+    int mixed = !strcmp(argv[3], "soak-mixed") ||
+                !strcmp(argv[3], "soak-mixed-durable");
+    int durable = !strcmp(argv[3], "soak-durable") ||
+                  !strcmp(argv[3], "soak-mixed-durable");
+    REQUIRE(!pressure && !projection && !recovery &&
+            (mixed || durable || !strcmp(argv[3], "soak")));
+    soak(path, single_file, durable, mixed, &error);
 #else
     REQUIRE(0 && "the soak requires a Linux worker CPU clock");
 #endif
