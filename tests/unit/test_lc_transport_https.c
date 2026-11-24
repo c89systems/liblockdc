@@ -5261,8 +5261,8 @@ static void test_public_management_methods_emit_logs(void **state) {
   static const char *ns_response_headers[] = {"X-Correlation-Id: corr-ns-get",
                                               "Content-Type: application/json"};
   static const char *tc_body[] = {"\"candidate_id\":\"node-a\"",
-                                  "\"candidate_endpoint\":"
-                                  "\"https://node-a:9443\"",
+                                  ("\"candidate_endpoint\":"
+                                   "\"https://node-a:9443\""),
                                   "\"term\":3", "\"ttl_ms\":2000"};
   static const char *tc_response_headers[] = {
       "X-Correlation-Id: corr-tc-acquire", "Content-Type: application/json"};
@@ -5530,8 +5530,8 @@ static void test_public_enqueue_streams_payload_from_source(void **state) {
       "X-Correlation-Id: corr-enqueue", "Content-Type: application/json"};
   static const char *const required_headers[] = {
       "Accept: application/json",
-      "Content-Type: multipart/related; "
-      "boundary=lockdc-stream-boundary-7e4dbe2f",
+      ("Content-Type: multipart/related; "
+       "boundary=lockdc-stream-boundary-7e4dbe2f"),
       "Transfer-Encoding: chunked"};
   static const https_expectation expectations[] = {
       {"POST", "/v1/queue/enqueue", required_headers, 3U, NULL, 0U, 0, 200,
@@ -6352,8 +6352,8 @@ test_public_query_stream_captures_trailers_after_body(void **state) {
   static const char *response_headers[] = {
       "x-correlation-id: corr-query-stream-trailer",
       "x-lockd-query-return: documents",
-      "Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
-      "x-lockd-query-metadata",
+      ("Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
+       "x-lockd-query-metadata"),
       "Content-Type: application/x-ndjson"};
   static const char *response_trailers[] = {
       "x-lockd-query-cursor: cursor-from-trailer",
@@ -6439,8 +6439,8 @@ static void test_public_query_stream_trailers_override_headers(void **state) {
       "x-lockd-query-cursor: stale-header-cursor",
       "x-lockd-query-index-seq: 1",
       "x-lockd-query-metadata: {\"source\":\"header\"}",
-      "Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
-      "x-lockd-query-metadata, x-lockd-query-return",
+      ("Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
+       "x-lockd-query-metadata, x-lockd-query-return"),
       "Content-Type: application/x-ndjson"};
   static const char *response_trailers[] = {
       "x-lockd-query-cursor: final-trailer-cursor",
@@ -6522,8 +6522,8 @@ static void test_public_query_stream_retries_node_passive_and_cleans_trailers(
                                      "\"return\":\"documents\""};
   static const char *first_response_headers[] = {
       "X-Correlation-Id: corr-query-passive", "X-Lockd-Query-Return: documents",
-      "Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
-      "x-lockd-query-metadata",
+      ("Trailer: x-lockd-query-cursor, x-lockd-query-index-seq, "
+       "x-lockd-query-metadata"),
       "Content-Type: application/json"};
   static const char *first_response_trailers[] = {
       "x-lockd-query-cursor: stale-passive-cursor",
@@ -8082,8 +8082,8 @@ static void test_retention_remote_rejects_invalid_headers(void **state) {
       "X-State-Retention-Expires-At-Unix: 1.5",
       "X-State-Retention-Expires-At-Unix: 9223372036854775808",
       "X-State-Retention-Supported: 1\r\nX-State-Retention-Supported: 0",
-      "X-State-Retention-Expires-At-Unix: "
-      "1\r\nX-State-Retention-Expires-At-Unix: 2",
+      ("X-State-Retention-Expires-At-Unix: "
+       "1\r\nX-State-Retention-Expires-At-Unix: 2"),
       "X-State-Retention-Supported: 0\r\nX-State-Retention-Expires-At-Unix: 0",
       "X-State-Retention-Expires-At-Unix: 0\r\nX-State-Retention-Supported: 0",
   };

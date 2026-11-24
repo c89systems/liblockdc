@@ -6,6 +6,33 @@ if(NOT DEFINED LOCKDC_ROOT)
     message(FATAL_ERROR "LOCKDC_ROOT is required")
 endif()
 
+function(lockdc_import_cache_value var_name)
+    if(DEFINED ${var_name} AND NOT "${${var_name}}" STREQUAL "")
+        return()
+    endif()
+
+    file(STRINGS "${LOCKDC_BINARY_DIR}/CMakeCache.txt" cache_line
+        REGEX "^${var_name}(:[^=]+)?="
+        LIMIT_COUNT 1)
+    if(cache_line)
+        string(FIND "${cache_line}" "=" cache_value_offset)
+        if(cache_value_offset LESS 0)
+            message(FATAL_ERROR "malformed cache value for ${var_name}: ${cache_line}")
+        endif()
+        math(EXPR cache_value_offset "${cache_value_offset} + 1")
+        string(SUBSTRING "${cache_line}" ${cache_value_offset} -1 cache_value)
+        set(${var_name} "${cache_value}" PARENT_SCOPE)
+    endif()
+endfunction()
+
+# CTest prepares one shared fixture per E2E invocation. Each scenario runs in
+# its own Lua process with its own queue, key, or Pouch root.
+if(DEFINED LOCKDC_LUA_FIXTURE_ROOT AND NOT LOCKDC_LUA_FIXTURE_ROOT STREQUAL ""
+   AND "$ENV{LOCKDC_E2E_LUA_BUILD_TREE}" STREQUAL "1")
+    include("${CMAKE_CURRENT_LIST_DIR}/lua_e2e_build_tree.cmake")
+    return()
+endif()
+
 # CTest prepares a fresh shared rock once per E2E invocation. Each scenario
 # then runs in its own Lua process, with its own queue/key/Pouch fixture.
 if(DEFINED LOCKDC_LUA_FIXTURE_ROOT AND NOT LOCKDC_LUA_FIXTURE_ROOT STREQUAL ""
@@ -27,25 +54,6 @@ if(DEFINED LOCKDC_LUA_FIXTURE_ROOT AND NOT LOCKDC_LUA_FIXTURE_ROOT STREQUAL ""
     endif()
     return()
 endif()
-
-function(lockdc_import_cache_value var_name)
-    if(DEFINED ${var_name} AND NOT "${${var_name}}" STREQUAL "")
-        return()
-    endif()
-
-    file(STRINGS "${LOCKDC_BINARY_DIR}/CMakeCache.txt" cache_line
-        REGEX "^${var_name}(:[^=]+)?="
-        LIMIT_COUNT 1)
-    if(cache_line)
-        string(FIND "${cache_line}" "=" cache_value_offset)
-        if(cache_value_offset LESS 0)
-            message(FATAL_ERROR "malformed cache value for ${var_name}: ${cache_line}")
-        endif()
-        math(EXPR cache_value_offset "${cache_value_offset} + 1")
-        string(SUBSTRING "${cache_line}" ${cache_value_offset} -1 cache_value)
-        set(${var_name} "${cache_value}" PARENT_SCOPE)
-    endif()
-endfunction()
 
 lockdc_import_cache_value(CMAKE_C_COMPILER)
 lockdc_import_cache_value(CMAKE_C_FLAGS)
@@ -161,39 +169,13 @@ else()
     list(GET generated_rockspec 0 LOCKDC_LUA_PACKAGE_PATH)
 endif()
 
-set(lonejson_cache_dir "${LOCKDC_BINARY_DIR}/lua-rock-cache")
-set(lonejson_src_rock "${lonejson_cache_dir}/lonejson-0.50.0-1.src.rock")
-set(lonejson_src_rock_url "https://github.com/c89systems/lonejson/releases/download/v0.50.0/lonejson-0.50.0-1.src.rock")
-set(lonejson_src_rock_sha256 "4f329c797e7452ada6fd90bffa8a00f398b3cdcd20f0c6ad89f3fb3f7d664db3")
+include("${CMAKE_CURRENT_LIST_DIR}/acquire_lonejson_lua_rock.cmake")
+lockdc_acquire_lonejson_lua_rock(lonejson_src_rock)
 set(lua_tree_dir "${LOCKDC_BINARY_DIR}/lua-rock-tests/${LOCKDC_TEST_NAME}/tree")
 if(DEFINED LOCKDC_LUA_FIXTURE_ROOT AND NOT LOCKDC_LUA_FIXTURE_ROOT STREQUAL "")
     set(lua_tree_dir "${LOCKDC_LUA_FIXTURE_ROOT}/tree")
 endif()
 set(lua_rock_workdir "${LOCKDC_ROOT}")
-
-file(MAKE_DIRECTORY "${lonejson_cache_dir}")
-if(EXISTS "${lonejson_src_rock}")
-    file(SHA256 "${lonejson_src_rock}" existing_lonejson_src_rock_sha256)
-    if(NOT existing_lonejson_src_rock_sha256 STREQUAL lonejson_src_rock_sha256)
-        file(REMOVE "${lonejson_src_rock}")
-    endif()
-endif()
-if(NOT EXISTS "${lonejson_src_rock}")
-    file(DOWNLOAD
-        "${lonejson_src_rock_url}"
-        "${lonejson_src_rock}"
-        EXPECTED_HASH "SHA256=${lonejson_src_rock_sha256}"
-        STATUS download_status
-        SHOW_PROGRESS
-    )
-    list(GET download_status 0 download_code)
-    list(GET download_status 1 download_message)
-    if(NOT download_code EQUAL 0)
-        file(REMOVE "${lonejson_src_rock}")
-        message(FATAL_ERROR
-            "failed to download lonejson Lua rock from ${lonejson_src_rock_url}: ${download_message}")
-    endif()
-endif()
 
 set(lockdc_luarocks_cflags "${CMAKE_C_FLAGS} -fPIC")
 if(DEFINED CMAKE_BUILD_TYPE AND NOT CMAKE_BUILD_TYPE STREQUAL "")

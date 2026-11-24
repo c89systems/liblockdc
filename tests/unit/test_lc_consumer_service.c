@@ -136,7 +136,6 @@ typedef struct direct_subscribe_close_context {
 } direct_subscribe_close_context;
 
 static consumer_test_state *g_consumer_test_state = NULL;
-static lc_allocator g_test_allocator;
 static pslog_logger *g_test_client_logger = NULL;
 
 static void stop_test_service(consumer_test_state *state);
@@ -1301,7 +1300,6 @@ test_consumer_service_multi_worker_releases_tracked_allocations(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1340,7 +1338,6 @@ static void test_consumer_service_rejects_worker_count_overflow(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   memset(consumers, 0, sizeof(consumers));
@@ -1388,7 +1385,6 @@ test_consumer_service_pouch_dequeue_wait_is_shutdown_bounded(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   endpoints[0] = "pouch:///tmp/liblockdc-consumer-service-pouch-test";
@@ -1444,7 +1440,6 @@ test_consumer_service_multi_worker_runs_without_transport(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1515,7 +1510,6 @@ test_consumer_service_releases_each_delivery_in_single_subscribe_stream(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1577,7 +1571,6 @@ test_consumer_service_logs_restart_with_configured_logger(void **state) {
   logs = NULL;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1653,7 +1646,6 @@ static void test_consumer_service_logs_subscribe_lifecycle(void **state) {
   logs = NULL;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1803,7 +1795,6 @@ static void test_consumer_service_multi_worker_failure_cleans_up(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1857,7 +1848,6 @@ static void run_consumer_terminal_scenario_unit_test(
 
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -1956,7 +1946,6 @@ test_consumer_service_explicit_failure_nack_blocks_extender_race(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2053,7 +2042,6 @@ static void test_consumer_service_shutdown_stops_extender_before_message_close(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2113,7 +2101,6 @@ test_consumer_service_preserves_auto_ack_failure_details(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2182,7 +2169,6 @@ test_consumer_service_handler_failure_does_not_consume_failure_budget(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2254,7 +2240,6 @@ test_consumer_service_repeated_handler_failures_do_not_consume_failure_budget(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2319,7 +2304,6 @@ test_consumer_service_explicit_ack_then_handler_error_surfaces_without_nack(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2388,7 +2372,6 @@ test_consumer_service_explicit_ack_failure_marks_terminal_outcome_indeterminate(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2456,7 +2439,6 @@ test_consumer_service_subscribe_failures_consume_service_failure_budget(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2518,7 +2500,6 @@ test_consumer_service_handler_thread_start_failure_is_fatal(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2580,7 +2561,6 @@ test_consumer_service_worker_thread_start_failure_is_fatal(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2640,7 +2620,6 @@ test_consumer_service_extender_thread_start_failure_is_fatal(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2702,7 +2681,6 @@ test_consumer_service_message_factory_failure_is_fatal(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);
@@ -2763,7 +2741,6 @@ test_consumer_service_worker_clone_preserves_json_response_limit(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   client.http_json_response_limit_bytes = 123U;
@@ -2816,7 +2793,6 @@ test_outbox_dispatcher_clone_uses_standard_json_response_limit(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   client.http_json_response_limit_bytes = 1U;
@@ -2860,7 +2836,6 @@ test_consumer_service_worker_clone_preserves_pouch_compression(void **state) {
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   endpoints[0] = "pouch:///tmp/liblockdc-consumer-service-compression-test";
@@ -2915,7 +2890,6 @@ test_consumer_service_no_delivery_does_not_destroy_uninitialized_primitives(
   (void)state;
   tracked_allocator_state_init(&alloc_state);
   tracked_allocator_init(&allocator, &alloc_state);
-  g_test_allocator = allocator;
   g_test_client_logger = NULL;
   init_fake_root_client(&client, &allocator);
   lc_consumer_config_init(&consumer);

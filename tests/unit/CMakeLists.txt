@@ -195,6 +195,20 @@ function(lc_add_unit_test target_name)
   endif()
 endfunction()
 
+function(lc_wrap_unit_symbols target)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(launcher "${CMAKE_SOURCE_DIR}/tests/support/darwin-test-link.sh")
+    set_property(TARGET ${target} PROPERTY C_LINKER_LAUNCHER bash "${launcher}")
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${launcher}")
+    set(wrap_flag "-Wl,--wrap=")
+  else()
+    set(wrap_flag "LINKER:--wrap=")
+  endif()
+  foreach(symbol IN LISTS ARGN)
+    target_link_options(${target} PRIVATE "${wrap_flag}${symbol}")
+  endforeach()
+endfunction()
+
 lc_add_unit_test(lc_unit_streams test_lc_streams.c)
 lc_add_unit_test(lc_unit_stream_scratch test_lc_stream_scratch.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
@@ -352,9 +366,7 @@ set_tests_properties(lc_unit_tmp_cleanup_unmarked_global_prefix PROPERTIES
 lc_add_unit_test(lc_unit_engine_allocator test_lc_engine_allocator.c)
 lc_add_unit_test(lc_unit_contracts test_lc_contracts.c mock_lc_public.c)
 lc_add_unit_test(lc_unit_xid_atfork test_lc_xid_atfork.c)
-target_link_options(lc_unit_xid_atfork PRIVATE
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_atfork>
-)
+lc_wrap_unit_symbols(lc_unit_xid_atfork pthread_atfork)
 lc_add_unit_test(lc_unit_public_mock_usage test_lc_public_mock_usage.c mock_lc_public.c)
 lc_add_unit_test(lc_unit_consumer_service test_lc_consumer_service.c)
 lc_add_unit_test(lc_unit_outbox test_lc_outbox.c
@@ -364,22 +376,12 @@ target_compile_definitions(lc_unit_outbox PRIVATE LOCKDC_TEST_BUILD=1)
 # Its bounded waits can exceed the generic 60-second unit cap; use the
 # project-wide 120-second default rather than a 90-second near-boundary cutoff.
 set_tests_properties(lc_unit_outbox PROPERTIES TIMEOUT 120)
-target_link_options(lc_unit_consumer_service PRIVATE
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=lc_client_open>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=lc_engine_client_subscribe>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=lc_engine_client_subscribe_with_state>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=lc_message_new>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_create>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_join>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_mutex_init>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_mutex_destroy>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_cond_init>
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=pthread_cond_destroy>
-)
+lc_wrap_unit_symbols(lc_unit_consumer_service
+  lc_client_open lc_engine_client_subscribe lc_engine_client_subscribe_with_state
+  lc_message_new pthread_create pthread_join pthread_mutex_init
+  pthread_mutex_destroy pthread_cond_init pthread_cond_destroy)
 lc_add_unit_test(lc_unit_runtime test_lc_runtime.c)
-target_link_options(lc_unit_runtime PRIVATE
-  $<$<LINK_LANGUAGE:C>:-Wl,--wrap=lonejson_new>
-)
+lc_wrap_unit_symbols(lc_unit_runtime lonejson_new)
 lc_add_unit_test(lc_unit_mutate_stream test_lc_mutate_stream.c)
 target_sources(lc_unit_mutate_stream PRIVATE
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c
@@ -388,20 +390,19 @@ lc_add_unit_test(lc_unit_pouch test_lc_pouch.c)
 lc_add_unit_test(lc_unit_pouch_cleanup test_lc_pouch_cleanup.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_pouch_cleanup PRIVATE LOCKDC_TEST_BUILD=1)
-target_link_options(lc_unit_pouch_cleanup PRIVATE
-  "LINKER:--wrap=unlink" "LINKER:--wrap=fsync")
+lc_wrap_unit_symbols(lc_unit_pouch_cleanup unlink fsync)
 lc_add_unit_test(lc_unit_pouch_compression test_lc_pouch_compression.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_pouch_compression PRIVATE LOCKDC_TEST_BUILD=1
   LC_COLLECTION_TMP_PARENT="${CMAKE_CURRENT_BINARY_DIR}")
-target_link_options(lc_unit_pouch_compression PRIVATE "LINKER:--wrap=fsync")
+lc_wrap_unit_symbols(lc_unit_pouch_compression fsync)
 lc_add_unit_test(lc_unit_state_retention test_lc_state_retention.c
   ${CMAKE_SOURCE_DIR}/tests/support/lc_test_tmp.c)
 target_compile_definitions(lc_unit_state_retention PRIVATE LOCKDC_TEST_BUILD=1)
-target_link_options(lc_unit_state_retention PRIVATE "LINKER:--wrap=fsync")
+lc_wrap_unit_symbols(lc_unit_state_retention fsync)
 lc_add_unit_test(lc_unit_pouch_xa test_lc_pouch_xa.c)
 target_compile_definitions(lc_unit_pouch_xa PRIVATE LOCKDC_TEST_BUILD=1 LC_XA_NATIVE_SYNC_TEST=1)
-target_link_options(lc_unit_pouch_xa PRIVATE "LINKER:--wrap=fsync")
+lc_wrap_unit_symbols(lc_unit_pouch_xa fsync)
 lc_add_unit_test(lc_unit_xa_borrow test_lc_xa_borrow.c)
 function(lc_add_tracking_case name target filter)
   # Native cases reuse existing binaries. The production allocator probe
@@ -428,7 +429,7 @@ add_test(NAME lc_test_case_selection_test COMMAND "${CMAKE_COMMAND}"
   -P "${CMAKE_SOURCE_DIR}/tests/test_case_selection_test.cmake")
 set_tests_properties(lc_test_case_selection_test PROPERTIES
   LABELS "unit;lifecycle-host" TIMEOUT 30)
-target_link_options(lc_unit_pouch PRIVATE -Wl,--wrap=time)
+lc_wrap_unit_symbols(lc_unit_pouch time)
 if(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR)
   set(lc_pouch_cross_emulator ${CMAKE_CROSSCOMPILING_EMULATOR})
   list(GET lc_pouch_cross_emulator 0 lc_pouch_cross_emulator_program)
@@ -465,8 +466,7 @@ target_link_libraries(lc_unit_transport_https PRIVATE
   ${lc_test_link_target} lc::cmocka lc::openssl_ssl_shared lc::openssl_crypto_shared Threads::Threads)
 target_include_directories(lc_unit_transport_https PRIVATE
   ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
-target_link_options(lc_unit_transport_https PRIVATE
-  "LINKER:--wrap=lc_strdup_local" "LINKER:--wrap=lc_client_strdup")
+lc_wrap_unit_symbols(lc_unit_transport_https lc_strdup_local lc_client_strdup)
 lc_configure_c_test_target(lc_unit_transport_https)
 if(LOCKDC_ENABLE_COVERAGE)
   target_compile_options(lc_unit_transport_https PRIVATE

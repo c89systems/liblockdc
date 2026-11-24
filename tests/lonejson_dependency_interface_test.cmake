@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/dependency_library_test_support.cmake")
+
 if(NOT DEFINED LOCKDC_EXTERNAL_ROOT OR LOCKDC_EXTERNAL_ROOT STREQUAL "")
     message(FATAL_ERROR "LOCKDC_EXTERNAL_ROOT is required")
 endif()
@@ -17,7 +19,7 @@ endif()
 set(lonejson_root "${LOCKDC_EXTERNAL_ROOT}/lonejson/install")
 set(lonejson_build_root "${LOCKDC_DEPENDENCY_BUILD_ROOT}/lonejson/build")
 set(lonejson_static_archive "${lonejson_root}/lib/liblonejson.a")
-set(lonejson_shared_library "${lonejson_root}/lib/liblonejson.so.${LOCKDC_LONEJSON_ABI_VERSION}")
+lockdc_dependency_versioned_library(lonejson_shared_library "${lonejson_root}/lib/liblonejson" "${LOCKDC_LONEJSON_ABI_VERSION}")
 set(lonejson_header "${lonejson_root}/include/lonejson.h")
 
 foreach(path IN ITEMS
@@ -70,7 +72,7 @@ endif()
 find_program(NM_BIN NAMES nm REQUIRED)
 
 execute_process(
-    COMMAND "${NM_BIN}" -g --defined-only "${lonejson_static_archive}"
+    COMMAND "${NM_BIN}" ${dependency_static_nm_args} "${lonejson_static_archive}"
     RESULT_VARIABLE static_nm_result
     OUTPUT_VARIABLE static_symbols
     ERROR_VARIABLE static_nm_stderr
@@ -82,7 +84,7 @@ if(NOT static_nm_result EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${NM_BIN}" -D --defined-only "${lonejson_shared_library}"
+    COMMAND "${NM_BIN}" ${dependency_shared_nm_args} "${lonejson_shared_library}"
     RESULT_VARIABLE shared_nm_result
     OUTPUT_VARIABLE shared_symbols
     ERROR_VARIABLE shared_nm_stderr
@@ -178,7 +180,7 @@ foreach(symbol IN ITEMS
     lonejson_multipart_finish
     lonejson_multipart_close)
     assert_contains("${static_symbols}" "${symbol}" "${symbol} in liblonejson.a")
-    assert_contains("${shared_symbols}" "${symbol}" "${symbol} in liblonejson.so.${LOCKDC_LONEJSON_ABI_VERSION}")
+    assert_contains("${shared_symbols}" "${symbol}" "${symbol} in ${lonejson_shared_library}")
 endforeach()
 
 foreach(alias_symbol IN ITEMS
@@ -230,5 +232,5 @@ foreach(alias_symbol IN ITEMS
     lj_multipart_finish
     lj_multipart_close)
     assert_not_contains("${static_symbols}" "${alias_symbol}" "${alias_symbol} in liblonejson.a")
-    assert_not_contains("${shared_symbols}" "${alias_symbol}" "${alias_symbol} in liblonejson.so.${LOCKDC_LONEJSON_ABI_VERSION}")
+    assert_not_contains("${shared_symbols}" "${alias_symbol}" "${alias_symbol} in ${lonejson_shared_library}")
 endforeach()

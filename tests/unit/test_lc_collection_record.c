@@ -377,7 +377,7 @@ static size_t delayed_record_read(lc_source *self, void *bytes, size_t capacity,
   (void)error;
   if (count > capacity)
     count = capacity;
-  memcpy(bytes, "{}" + source->offset, count);
+  memcpy(bytes, &"{}"[source->offset], count);
   source->offset += count;
   if (source->offset == 2) {
     source->f->now = 2000;

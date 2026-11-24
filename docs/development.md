@@ -51,10 +51,10 @@ Normal development expects:
 - rootless Podman and Python 3.9 or newer for the local Podman Kube development
   environment
 
-Every Linux build uses its matching pinned Bootlin GCC collection, including the
-compiler, linker, binutils, sysroot, headers, and runtime. The Make and CMake
-configurations provision those collections automatically; do not substitute host
-or distro cross compilers. Toolchains are shared under
+The local Linux lifecycle uses its matching pinned Bootlin GCC collection,
+including the compiler, linker, binutils, sysroot, headers, and runtime. The
+Make and CMake configurations provision those collections automatically.
+Toolchains are shared under
 `${CPKT_TOOLCHAIN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/cpkt/toolchains}` and
 verified dependency archives under
 `${CPKT_DEPENDENCY_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/cpkt/deps}`.
@@ -210,6 +210,28 @@ All significant Make targets print total elapsed time on completion.
 
 `make format` runs `clang-format` over the C source/header tree and is also part
 of the clean-slate release pipeline.
+
+### Hosted native tests
+
+Run **Native correctness** from GitHub Actions and select the source ref. The
+workflow must be present on the default branch before GitHub can dispatch it.
+
+| Runner | Architecture | Test filesystem |
+| --- | --- | --- |
+| Ubuntu 24.04 | x86-64 | XFS |
+| Ubuntu 26.04 ARM | AArch64 | ext4 and XFS in separate jobs |
+| macOS 15 | Apple Silicon | APFS |
+
+Each job builds the unit, integration, and E2E executables for its own CPU and
+runs them directly. The build uses `RelWithDebInfo` to exercise the full native
+unit case tables. Linux jobs verify the filesystem of the mounted checkout.
+The macOS job verifies APFS with the Pouch platform probe and uses LLVM object
+tools to retain fault injection in unit tests that use GNU linker wrapping.
+The E2E jobs run lockd and MinIO as loopback services using the fixture versions
+declared for local development. Every job runs the Lua scenarios using build-tree modules.
+The x86-64 job also runs the Linux lifecycle tests. The AArch64 jobs select
+native GCC 15 and Ubuntu's glibc 2.43 for the current GNU dependency bundle.
+Release archives and Lua rocks are built and tested through the local lifecycle.
 
 ### Worker stack budget
 

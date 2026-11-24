@@ -17,7 +17,7 @@ if(asset_name_pos EQUAL -1)
 endif()
 
 set(expected_lonejson_asset_name
-    "lonejson_asset_name=\"liblonejson-$lonejson_version-\${preset#deps-}.tar.gz\"")
+    "lonejson_asset_name=\"liblonejson-$lonejson_version-$dependency_target_id.tar.gz\"")
 string(FIND "${deps_script_text}" "${expected_lonejson_asset_name}" lonejson_asset_name_pos)
 if(lonejson_asset_name_pos EQUAL -1)
   message(FATAL_ERROR

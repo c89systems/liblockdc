@@ -60,10 +60,13 @@ case "$preset" in
       -DLOCKDC_BUILD_FUZZERS=OFF
     )
     ;;
-  deps-aarch64-linux-gnu)
+  deps-aarch64-linux-gnu|deps-aarch64-linux-gnu-native)
     cmake_preset="aarch64-linux-gnu-release"
-    deps_root="$repo_root/.cache/deps/aarch64-linux-gnu"
-    deps_build_root="$repo_root/.cache/deps-build/aarch64-linux-gnu"
+    if [ "$preset" = deps-aarch64-linux-gnu-native ]; then
+      cmake_preset="aarch64-linux-gnu-native"
+    fi
+    deps_root="$repo_root/.cache/deps/${preset#deps-}"
+    deps_build_root="$repo_root/.cache/deps-build/${preset#deps-}"
     cmake_extra_args=(
       -DLOCKDC_BUILD_DEPENDENCIES=ON
       -DLOCKDC_BUILD_E2E_TESTS=OFF
@@ -126,7 +129,7 @@ case "$preset" in
     )
     ;;
   *)
-    echo "usage: scripts/deps.sh [deps-x86_64-linux-gnu|deps-x86_64-linux-musl|deps-aarch64-linux-gnu|deps-aarch64-linux-musl|deps-armhf-linux-gnu|deps-armhf-linux-musl|deps-arm64-apple-darwin|deps-arm64-apple-darwin-native]" >&2
+    echo "usage: scripts/deps.sh [deps-x86_64-linux-gnu|deps-x86_64-linux-musl|deps-aarch64-linux-gnu|deps-aarch64-linux-gnu-native|deps-aarch64-linux-musl|deps-armhf-linux-gnu|deps-armhf-linux-musl|deps-arm64-apple-darwin|deps-arm64-apple-darwin-native]" >&2
     echo "       append --with-postgres to provision the optional cpktdb SDK" >&2
     exit 2
     ;;
@@ -341,6 +344,23 @@ toolchain_value() {
 }
 
 case "$preset" in
+  deps-aarch64-linux-gnu-native)
+    compiler_path=/usr/bin/gcc-15
+    if [ "$(uname -s):$(uname -m)" != Linux:aarch64 ] ||
+       [ ! -x "$compiler_path" ] || [ "$("$compiler_path" -dumpmachine)" != aarch64-linux-gnu ]; then
+      echo 'deps-aarch64-linux-gnu-native requires native AArch64 Linux GCC 15' >&2
+      exit 2
+    fi
+    toolchain_source=native-gcc
+    toolchain_archive=
+    toolchain_root=/usr
+    toolchain_prefix=
+    toolchain_sysroot=/
+    toolchain_target_triple=aarch64-linux-gnu
+    compiler_machine=$toolchain_target_triple
+    compiler_version=$("$compiler_path" --version | sed -n '1p')
+    compiler=$(basename -- "$compiler_path")
+    ;;
   deps-*-linux-*)
     toolchain_description=$("$repo_root/scripts/cpkt-toolchains.sh" discover "$dependency_target_id")
     if ! printf '%s\n' "$toolchain_description" | grep -q '^status=ready$'; then

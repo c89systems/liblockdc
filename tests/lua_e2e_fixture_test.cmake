@@ -34,7 +34,7 @@ endif()
 set(root "${LOCKDC_BINARY_DIR}/lua-fixture-regression")
 file(REMOVE_RECURSE "${root}")
 file(MAKE_DIRECTORY "${root}/tree" "${root}/prefix")
-execute_process(COMMAND "${CMAKE_COMMAND}" -E env LOCKDC_LUA_BIN=true
+execute_process(COMMAND "${CMAKE_COMMAND}" -E env LOCKDC_LUA_BIN=true LOCKDC_LUAROCKS_BIN=true
     "LOCKDC_LUAROCKS_WORKDIR=${LOCKDC_ROOT}"
     bash "${LOCKDC_ROOT}/scripts/validate_luarocks.sh" --run
     "${root}/tree" "${root}/prefix" unused

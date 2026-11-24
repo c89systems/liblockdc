@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/dependency_library_test_support.cmake")
+
 if(NOT DEFINED LOCKDC_EXTERNAL_ROOT OR LOCKDC_EXTERNAL_ROOT STREQUAL "")
     message(FATAL_ERROR "LOCKDC_EXTERNAL_ROOT is required")
 endif()
@@ -17,7 +19,7 @@ endif()
 set(liblql_root "${LOCKDC_EXTERNAL_ROOT}/liblql/install")
 set(liblql_build_root "${LOCKDC_DEPENDENCY_BUILD_ROOT}/liblql/build")
 set(liblql_static_archive "${liblql_root}/lib/liblql.a")
-set(liblql_shared_library "${liblql_root}/lib/liblql.so.${LOCKDC_LIBLQL_ABI_VERSION}")
+lockdc_dependency_versioned_library(liblql_shared_library "${liblql_root}/lib/liblql" "${LOCKDC_LIBLQL_ABI_VERSION}")
 set(liblql_header "${liblql_root}/include/lql/lql.h")
 set(liblql_version_header "${liblql_root}/include/lql/version.h")
 
@@ -68,7 +70,7 @@ endif()
 find_program(NM_BIN NAMES nm REQUIRED)
 
 execute_process(
-    COMMAND "${NM_BIN}" -g --defined-only "${liblql_static_archive}"
+    COMMAND "${NM_BIN}" ${dependency_static_nm_args} "${liblql_static_archive}"
     RESULT_VARIABLE static_nm_result
     OUTPUT_VARIABLE static_symbols
     ERROR_VARIABLE static_nm_stderr
@@ -80,7 +82,7 @@ if(NOT static_nm_result EQUAL 0)
 endif()
 
 execute_process(
-    COMMAND "${NM_BIN}" -D --defined-only "${liblql_shared_library}"
+    COMMAND "${NM_BIN}" ${dependency_shared_nm_args} "${liblql_shared_library}"
     RESULT_VARIABLE shared_nm_result
     OUTPUT_VARIABLE shared_symbols
     ERROR_VARIABLE shared_nm_stderr
@@ -108,7 +110,7 @@ foreach(symbol IN ITEMS
     lql_filter_file_spooled
     lql_rewrite_file_inline_spooled)
     assert_contains("${static_symbols}" "${symbol}" "${symbol} in liblql.a")
-    assert_contains("${shared_symbols}" "${symbol}" "${symbol} in liblql.so.${LOCKDC_LIBLQL_ABI_VERSION}")
+    assert_contains("${shared_symbols}" "${symbol}" "${symbol} in ${liblql_shared_library}")
 endforeach()
 
 if(DEFINED LOCKDC_CROSSCOMPILING AND LOCKDC_CROSSCOMPILING)

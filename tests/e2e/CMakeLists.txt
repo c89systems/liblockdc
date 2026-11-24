@@ -1,3 +1,5 @@
+option(LOCKDC_E2E_LUA_BUILD_TREE "Run the Lua E2E scenarios against native build-tree modules." OFF)
+
 add_test(NAME lc_e2e_scratch_setup
   COMMAND ${CMAKE_COMMAND}
     -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
@@ -47,7 +49,7 @@ function(lc_add_lua_e2e_test test_name script_path)
   if(NOT LUA_E2E_PACKAGE_ONLY AND NOT TARGET lockdc_lua_core)
     return()
   endif()
-  if(NOT LOCKDC_LUA_RUNNABLE OR NOT LOCKDC_LUAROCKS_BIN)
+  if(NOT lockdc_lua_e2e)
     return()
   endif()
 
@@ -192,7 +194,15 @@ if(TARGET lc_example_startconsumer)
 endif()
 
 find_program(LOCKDC_LUAROCKS_BIN NAMES luarocks)
-if(TARGET lockdc_lua_core AND LOCKDC_LUA_RUNNABLE AND LOCKDC_LUAROCKS_BIN)
+set(lockdc_lua_e2e OFF)
+if(TARGET lockdc_lua_core AND LOCKDC_LUA_RUNNABLE AND
+   (LOCKDC_LUAROCKS_BIN OR LOCKDC_E2E_LUA_BUILD_TREE))
+  set(lockdc_lua_e2e ON)
+endif()
+if(LOCKDC_E2E_LUA_BUILD_TREE AND NOT lockdc_lua_e2e)
+  message(FATAL_ERROR "Lua E2E build-tree mode requires a native lockdc Lua runner and module")
+endif()
+if(lockdc_lua_e2e)
   add_test(NAME lc_e2e_lua_setup COMMAND ${CMAKE_COMMAND}
     -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR} -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
     -DLOCKDC_LUA_BIN=${LOCKDC_LUA_BIN}
@@ -291,8 +301,7 @@ lc_add_lua_e2e_test(
   POUCH_ROOT "${CMAKE_BINARY_DIR}/lua-pouch-e2e/lc_e2e_lua_terminal_retention"
 )
 
-if(TARGET lc_example_outbox_producer AND LOCKDC_LUA_RUNNABLE AND
-   LOCKDC_LUAROCKS_BIN)
+if(TARGET lc_example_outbox_producer AND lockdc_lua_e2e)
   add_test(NAME lc_e2e_outbox_examples
     COMMAND "${CMAKE_COMMAND}"
       -DLOCKDC_BINARY_DIR=${CMAKE_BINARY_DIR}
@@ -354,7 +363,7 @@ foreach(lifetime_target lc_library_unload_test lc_static_exit_test lc_tracking_g
     list(APPEND lockdc_e2e_example_targets ${lifetime_target})
   endif()
 endforeach()
-if(LOCKDC_LUA_RUNNABLE AND LOCKDC_LUAROCKS_BIN)
+if(lockdc_lua_e2e)
   list(APPEND lockdc_e2e_test_targets lockdc_lua_runner)
   list(APPEND lockdc_e2e_example_targets lockdc_lua_runner)
   if(TARGET lockdc_lua_core)
@@ -370,4 +379,8 @@ add_custom_target(lockdc_e2e_example_tests DEPENDS ${lockdc_e2e_example_targets}
 get_property(e2e_tests DIRECTORY PROPERTY TESTS)
 set_property(TEST ${e2e_tests} APPEND PROPERTY ENVIRONMENT
   "LOCKDC_TEST_ALLOCATOR_TRACKING=1")
+if(LOCKDC_E2E_LUA_BUILD_TREE)
+  set_property(TEST ${e2e_tests} APPEND PROPERTY ENVIRONMENT
+    "LOCKDC_E2E_LUA_BUILD_TREE=1")
+endif()
 lc_apply_test_defaults()

@@ -16,6 +16,15 @@ string(JSON test_count LENGTH "${ctest_json}" tests)
 if(test_count EQUAL 0)
     message(FATAL_ERROR "no CTest registrations found")
 endif()
+
+# CTest emits one TIMEOUT property per test. Count the property names in
+# one pass, then parse individual registrations only for failure diagnostics.
+string(REGEX MATCHALL "\"name\"[ \t\r\n]*:[ \t\r\n]*\"TIMEOUT\"" timeout_properties "${ctest_json}")
+list(LENGTH timeout_properties timeout_count)
+if(timeout_count EQUAL test_count)
+    return()
+endif()
+
 math(EXPR last_test_index "${test_count} - 1")
 foreach(test_index RANGE 0 ${last_test_index})
     string(JSON test_json GET "${ctest_json}" tests ${test_index})

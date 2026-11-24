@@ -109,6 +109,17 @@
       }
     },
     {
+      "name": "aarch64-linux-gnu-native",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "/usr/bin/gcc-15",
+        "LOCKDC_EXTERNAL_ROOT": "${sourceDir}/.cache/deps/aarch64-linux-gnu-native",
+        "LOCKDC_DEPENDENCY_BUILD_ROOT": "${sourceDir}/.cache/deps-build/aarch64-linux-gnu-native",
+        "LOCKDC_BUILD_BENCHMARKS": "OFF"
+      }
+    },
+    {
       "name": "aarch64-linux-musl-release",
       "inherits": "x86_64-linux-gnu-release",
       "toolchainFile": "${sourceDir}/cmake/toolchains/aarch64-linux-musl.cmake",
@@ -253,6 +264,10 @@
     {
       "name": "aarch64-linux-gnu-release",
       "configurePreset": "aarch64-linux-gnu-release"
+    },
+    {
+      "name": "aarch64-linux-gnu-native",
+      "configurePreset": "aarch64-linux-gnu-native"
     },
     {
       "name": "aarch64-linux-musl-release",

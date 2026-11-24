@@ -600,7 +600,7 @@ void lcdc_xa_resource_install(lua_State *L) {
   metatable(L, OP_MT, operation, operation_gc);
 }
 void lcdc_xa_constants(lua_State *L) {
-#define CONSTANT(name) number(L, #name + 3, name)
+#define CONSTANT(name) number(L, &(#name)[3], name)
   CONSTANT(LC_XA_ENROLLED);
   CONSTANT(LC_XA_PREPARE_SENT);
   CONSTANT(LC_XA_PREPARED);

@@ -11,9 +11,9 @@
 #include "lc_pouch_internal.h"
 #include "lc_pouch_outbox_store.h"
 
+#include "../support/lc_test_barrier.h"
 #include <errno.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

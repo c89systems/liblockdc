@@ -4,19 +4,31 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
 timed_bin="$script_dir/run_timed.sh"
-mode=${1:-all}
-e2e_preset=${LOCKDC_E2E_PRESET:-e2e}
-case "$e2e_preset" in debug|e2e) ;; *) echo 'LOCKDC_E2E_PRESET must be debug or e2e' >&2; exit 2 ;; esac
-e2e_build_dir="$repo_root/build/$e2e_preset"
-
-case "$mode" in
-  all|examples)
-    ;;
-  *)
-    printf '%s\n' "usage: scripts/test-e2e.sh [all|examples]" >&2
+workspace="$repo_root/build/devenv"
+native=false
+if [ "${1:-}" = --native ] && [ "$#" -eq 2 ]; then
+  native=true
+  mode=all
+  e2e_build_dir=$(CDPATH= cd -- "$2" && pwd -P)
+  fixture_bin="$repo_root/build/e2e-fixtures"
+  for fixture in lockd minio mc; do
+    if [ ! -x "$fixture_bin/$fixture" ]; then
+      echo "Missing $fixture_bin/$fixture. Run bash scripts/build-e2e-fixtures.sh first." >&2
+      exit 1
+    fi
+  done
+  # shellcheck source=test-e2e-native.sh
+  source "$script_dir/test-e2e-native.sh"
+else
+  mode=${1:-all}
+  if { [ "$mode" != all ] && [ "$mode" != examples ]; } || [ "$#" -gt 1 ]; then
+    echo 'usage: scripts/test-e2e.sh [all|examples|--native BUILD_DIR]' >&2
     exit 2
-    ;;
-esac
+  fi
+  e2e_preset=${LOCKDC_E2E_PRESET:-e2e}
+  case "$e2e_preset" in debug|e2e) ;; *) echo 'LOCKDC_E2E_PRESET must be debug or e2e' >&2; exit 2 ;; esac
+  e2e_build_dir="$repo_root/build/$e2e_preset"
+fi
 
 if [ "$mode" = "examples" ]; then
   e2e_build_target=lockdc_e2e_example_tests
@@ -142,16 +154,16 @@ select_active_disk_endpoint() {
 cd "$repo_root"
 # One checkout has one service graph. A second E2E runner must not stop the
 # first runner's services or rewrite its configuration or logs.
-command -v flock >/dev/null || { echo 'flock is required to serialize local E2E runs' >&2; exit 1; }
+command -v flock >/dev/null || { echo 'flock is required to serialize E2E runs' >&2; exit 1; }
 source "$script_dir/assert_generated_path.sh"
-lockdc_assert_generated_path "$repo_root" "$repo_root/build/devenv"
-[ ! -L "$repo_root/build/devenv" ] || { echo 'build/devenv must not be a symlink' >&2; exit 1; }
-mkdir -p -m 700 "$repo_root/build/devenv"
-exec 9> "$repo_root/build/devenv/e2e.lock"
+lockdc_assert_generated_path "$repo_root" "$workspace"
+[ ! -L "$workspace" ] || { echo 'build/devenv must not be a symlink' >&2; exit 1; }
+mkdir -p -m 700 "$workspace"
+exec 9> "$workspace/e2e.lock"
 flock -n 9 || { echo 'E2E is already running in this checkout' >&2; exit 1; }
 "$script_dir/devenv.sh" render
-source "$repo_root/build/devenv/env.sh"
-export TMPDIR="$repo_root/build/devenv/tmp"
+source "$workspace/env.sh"
+export TMPDIR="$workspace/tmp"
 failed_command=
 trap 'failed_command=$BASH_COMMAND' ERR
 cleanup() {
@@ -159,12 +171,18 @@ cleanup() {
   trap - EXIT
   if [ "$rc" -ne 0 ]; then
     printf 'E2E failed (%s): %s\nDisk: %s\nS3: %s\n' "$rc" "${failed_command:-$BASH_COMMAND}" "$LOCKDC_E2E_DISK_ENDPOINT" "$LOCKDC_E2E_S3_ENDPOINT" >&2
-    "$script_dir/devenv.sh" ps >&2 || true
-    "$script_dir/devenv.sh" logs > "$repo_root/build/devenv/logs/e2e-services.log" 2>&1 || true
-    tail -200 "$repo_root/build/devenv/logs/e2e-services.log" >&2
-    echo "Full service logs: $repo_root/build/devenv/logs/e2e-services.log" >&2
+    if "$native"; then
+      native_service_logs
+    else
+      "$script_dir/devenv.sh" ps >&2 || true
+      "$script_dir/devenv.sh" logs > "$workspace/logs/e2e-services.log" 2>&1 || true
+      tail -n 200 "$workspace/logs/e2e-services.log" >&2
+      echo "Full service logs: $workspace/logs/e2e-services.log" >&2
+    fi
   fi
-  if [ "${LOCKDC_E2E_KEEP_DEVSERVICES:-0}" = 1 ]; then
+  if "$native"; then
+    stop_native_services
+  elif [ "${LOCKDC_E2E_KEEP_DEVSERVICES:-0}" = 1 ]; then
     echo 'Keeping E2E services: LOCKDC_E2E_KEEP_DEVSERVICES=1' >&2
   elif ! "$script_dir/devenv.sh" down; then
     echo 'E2E service teardown failed; inspect make dev-ps and make dev-logs' >&2
@@ -177,11 +195,14 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-"$timed_bin" "e2e build" "$script_dir/build.sh" "$e2e_preset" "$e2e_build_target"
-if ! "$script_dir/devenv.sh" running; then
-  "$timed_bin" "e2e start" "$script_dir/devenv.sh" up
+if "$native"; then
+  start_native_services
+else
+  "$timed_bin" "e2e build" "$script_dir/build.sh" "$e2e_preset" "$e2e_build_target"
+  if ! "$script_dir/devenv.sh" running; then
+    "$timed_bin" "e2e start" "$script_dir/devenv.sh" up
+  fi
 fi
-export TMPDIR="$repo_root/build/devenv/tmp"
 
 wait_for_file "$LOCKDC_E2E_DISK_BUNDLE" "disk client bundle"
 wait_for_file "$LOCKDC_E2E_S3_BUNDLE" "s3 client bundle"
@@ -198,6 +219,11 @@ LOCKDC_E2E_DISK_ENDPOINT="$(select_active_disk_endpoint \
 export LOCKDC_E2E_DISK_ENDPOINT
 export LOCKDC_E2E_DISK_A_ENDPOINT="$LOCKDC_E2E_DISK_ENDPOINT"
 export LOCKDC_E2E_DISK_A_BUNDLE="$LOCKDC_E2E_DISK_BUNDLE"
+if [ "$LOCKDC_E2E_DISK_ENDPOINT" = "$LOCKDC_E2E_DISK_B_ENDPOINT" ]; then
+  export LOCKDC_FALLBACK_URL="https://localhost:$LOCKDC_DISK_A_PORT"
+else
+  export LOCKDC_FALLBACK_URL="$LOCKDC_E2E_DISK_B_ENDPOINT"
+fi
 export LOCKDC_URL="$LOCKDC_E2E_DISK_ENDPOINT"
 export LOCKDC_CLIENT_PEM="$LOCKDC_E2E_DISK_BUNDLE"
 
@@ -214,10 +240,12 @@ wait_for_lockd_probe \
 
 if [ "$mode" = "examples" ]; then
   "$timed_bin" "e2e examples" ctest --test-dir "$e2e_build_dir" --output-on-failure --progress --stop-on-failure \
-    --output-log "$repo_root/build/devenv/logs/ctest.log" \
+    --output-log "$workspace/logs/ctest.log" \
     --timeout "$ctest_timeout" --parallel "$ctest_parallel_level" --no-tests=error -L examples
 else
-  "$timed_bin" "e2e ctest" ctest --test-dir "$e2e_build_dir" --output-on-failure --progress --stop-on-failure \
-    --output-log "$repo_root/build/devenv/logs/ctest.log" \
+  ctest_args=()
+  if ! "$native"; then ctest_args+=(--stop-on-failure); fi
+  "$timed_bin" "e2e ctest" ctest --test-dir "$e2e_build_dir" --output-on-failure --progress \
+    "${ctest_args[@]}" --output-log "$workspace/logs/ctest.log" \
     --timeout "$ctest_timeout" --parallel "$ctest_parallel_level" --no-tests=error -L e2e
 fi

@@ -7,10 +7,19 @@ set(test_build_dir "${test_root}/build")
 
 file(REMOVE_RECURSE "${test_root}")
 
+set(configure_args)
+if(LOCKDC_EXTERNAL_ROOT)
+    list(APPEND configure_args "-DLOCKDC_EXTERNAL_ROOT=${LOCKDC_EXTERNAL_ROOT}")
+endif()
+if(LOCKDC_C_COMPILER)
+    list(APPEND configure_args "-DCMAKE_C_COMPILER=${LOCKDC_C_COMPILER}")
+endif()
+
 execute_process(
     COMMAND "${CMAKE_COMMAND}"
         -S "${LOCKDC_ROOT}"
         -B "${test_build_dir}"
+        ${configure_args}
         -DCMAKE_BUILD_TYPE=Debug
         -DLOCKDC_ENABLE_COVERAGE=ON
         -DLOCKDC_BUILD_TESTS=OFF

@@ -272,6 +272,8 @@ add_test(NAME package_source_dist_dir_test
 add_test(NAME coverage_pkgconfig_metadata_test
   COMMAND "${CMAKE_COMMAND}"
     -DLOCKDC_ROOT=${CMAKE_SOURCE_DIR}
+    -DLOCKDC_EXTERNAL_ROOT=${LOCKDC_EXTERNAL_ROOT}
+    -DLOCKDC_C_COMPILER=${CMAKE_C_COMPILER}
     -P "${CMAKE_SOURCE_DIR}/tests/coverage_pkgconfig_metadata_test.cmake"
 )
 add_test(NAME sdk_dist_dir_test COMMAND "${CMAKE_COMMAND}"

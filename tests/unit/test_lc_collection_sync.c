@@ -239,7 +239,11 @@ static int tracked_sync(int fd) {
     errno = EIO;
     return -1;
   }
+#if defined(__linux__)
   return fdatasync(fd);
+#else
+  return fsync(fd);
+#endif
 }
 
 static void parallel(fixture *f, int exclusive, int same_receiver,
@@ -618,7 +622,7 @@ static size_t callback_read(lc_source *source, void *bytes, size_t count,
   if (s->offset == 2 || count == 0)
     return 0;
   count = count > 2 - s->offset ? 2 - s->offset : count;
-  memcpy(bytes, "{}" + s->offset, count);
+  memcpy(bytes, &"{}"[s->offset], count);
   s->offset += count;
   return count;
 }

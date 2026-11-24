@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/dependency_library_test_support.cmake")
+
 if(NOT DEFINED LOCKDC_EXTERNAL_ROOT OR LOCKDC_EXTERNAL_ROOT STREQUAL "")
     message(FATAL_ERROR "LOCKDC_EXTERNAL_ROOT is required")
 endif()
@@ -7,7 +9,7 @@ set(cpkt_manifest "${LOCKDC_EXTERNAL_ROOT}/cpkt/install/share/cpkt/packages/core
 
 foreach(path IN ITEMS
     "${libssh2_root}/lib/libssh2.a"
-    "${libssh2_root}/lib/libssh2.so"
+    "${libssh2_root}/lib/libssh2.${dependency_shared_suffix}"
     "${libssh2_root}/include/libssh2.h")
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "missing libssh2 dependency artifact: ${path}")

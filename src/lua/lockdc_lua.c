@@ -610,10 +610,20 @@ static void lcdc_set_integer_field(lua_State *L, const char *name, long value) {
   lua_setfield(L, -2, name);
 }
 
+/* On Darwin LP64, Lua's signed long long has the same limits as long.
+ * The SDK's LLONG constants use a suffix rejected in C89 mode. */
+#if defined(__APPLE__) && defined(__LP64__) && LUA_INT_TYPE == LUA_INT_LONGLONG
+#define LCDC_LUA_MAXINTEGER LONG_MAX
+#define LCDC_LUA_MININTEGER LONG_MIN
+#else
+#define LCDC_LUA_MAXINTEGER LUA_MAXINTEGER
+#define LCDC_LUA_MININTEGER LUA_MININTEGER
+#endif
+
 static int lcdc_set_size_field(lua_State *L, const char *name, size_t value,
                                lc_error *error) {
-#if SIZE_MAX > LUA_MAXINTEGER
-  if ((uintmax_t)value > (uintmax_t)LUA_MAXINTEGER) {
+#if SIZE_MAX > LCDC_LUA_MAXINTEGER
+  if ((uintmax_t)value > (uintmax_t)LCDC_LUA_MAXINTEGER) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "outbox statistic exceeds Lua integer range", name,
                         NULL, NULL);
@@ -628,7 +638,7 @@ static int lcdc_set_size_field(lua_State *L, const char *name, size_t value,
 
 static int lcdc_set_uint64_field(lua_State *L, const char *name, uint64_t value,
                                  lc_error *error) {
-  if (value > (uint64_t)LUA_MAXINTEGER) {
+  if (value > (uint64_t)LCDC_LUA_MAXINTEGER) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "outbox statistic exceeds Lua integer range", name,
                         NULL, NULL);
@@ -640,7 +650,8 @@ static int lcdc_set_uint64_field(lua_State *L, const char *name, uint64_t value,
 
 static int lcdc_set_int64_field(lua_State *L, const char *name, int64_t value,
                                 lc_error *error) {
-  if (value < (int64_t)LUA_MININTEGER || value > (int64_t)LUA_MAXINTEGER) {
+  if (value < (int64_t)LCDC_LUA_MININTEGER ||
+      value > (int64_t)LCDC_LUA_MAXINTEGER) {
     return lc_error_set(error, LC_ERR_INVALID, 0L,
                         "outbox value exceeds Lua integer range", name, NULL,
                         NULL);
@@ -656,7 +667,8 @@ static int lcdc_set_unix_seconds_field(lua_State *L, const char *name,
 }
 
 void lcdc_set_version_field(lua_State *L, const char *name, lc_version value) {
-  if (value < (lc_version)LUA_MININTEGER || value > (lc_version)LUA_MAXINTEGER)
+  if (value < (lc_version)LCDC_LUA_MININTEGER ||
+      value > (lc_version)LCDC_LUA_MAXINTEGER)
     luaL_error(L, "%s exceeds the Lua integer range", name);
   lua_pushinteger(L, (lua_Integer)value);
   lua_setfield(L, -2, name);

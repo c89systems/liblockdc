@@ -1,10 +1,12 @@
+include("${CMAKE_CURRENT_LIST_DIR}/dependency_library_test_support.cmake")
+
 if(NOT DEFINED LOCKDC_EXTERNAL_ROOT OR LOCKDC_EXTERNAL_ROOT STREQUAL "")
     message(FATAL_ERROR "LOCKDC_EXTERNAL_ROOT is required")
 endif()
 
 set(zlib_root "${LOCKDC_EXTERNAL_ROOT}/zlib/install")
 set(zlib_static_archive "${zlib_root}/lib/libz.a")
-set(zlib_shared_library "${zlib_root}/lib/libz.so")
+set(zlib_shared_library "${zlib_root}/lib/libz.${dependency_shared_suffix}")
 set(zlib_header "${zlib_root}/include/zlib.h")
 set(cpkt_manifest "${LOCKDC_EXTERNAL_ROOT}/cpkt/install/share/cpkt/packages/core.json")
 

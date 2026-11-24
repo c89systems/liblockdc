@@ -1,6 +1,6 @@
+#include "../support/lc_test_barrier.h"
 #include <errno.h>
 #include <limits.h>
-#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -4743,12 +4743,12 @@ static void assert_query_index_manifest_current_segment(
   char segment_id[64];
   unsigned long base_index_seq;
   unsigned long index_seq;
-  unsigned long row_count;
+  unsigned long row_count = 0UL;
   unsigned long row_hash;
   unsigned long delete_count;
   unsigned long delete_hash;
-  unsigned long term_index_complete;
-  unsigned long presence_index_complete;
+  unsigned long term_index_complete = 0UL;
+  unsigned long presence_index_complete = 0UL;
   int found;
   int written;
 

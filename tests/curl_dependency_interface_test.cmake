@@ -1,3 +1,5 @@
+include("${CMAKE_CURRENT_LIST_DIR}/dependency_library_test_support.cmake")
+
 if(NOT DEFINED LOCKDC_EXTERNAL_ROOT OR LOCKDC_EXTERNAL_ROOT STREQUAL "")
     message(FATAL_ERROR "LOCKDC_EXTERNAL_ROOT is required")
 endif()
@@ -5,7 +7,7 @@ endif()
 set(curl_root "${LOCKDC_EXTERNAL_ROOT}/curl/install")
 set(curl_header "${curl_root}/include/curl/curl.h")
 set(curl_static_archive "${curl_root}/lib/libcurl.a")
-set(curl_shared_library "${curl_root}/lib/libcurl.so")
+set(curl_shared_library "${curl_root}/lib/libcurl.${dependency_shared_suffix}")
 set(cpkt_manifest "${LOCKDC_EXTERNAL_ROOT}/cpkt/install/share/cpkt/packages/core.json")
 
 foreach(path IN ITEMS "${curl_header}" "${curl_static_archive}" "${curl_shared_library}")

@@ -1,7 +1,7 @@
+#include "../support/lc_test_barrier.h"
 #include <cmocka.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stddef.h>
