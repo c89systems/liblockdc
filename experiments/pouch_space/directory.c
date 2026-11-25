@@ -89,6 +89,10 @@ static int valid_value(ps_key key, const ps_directory_value *value) {
   if (value->tag.storage == PS_DIRECTORY_NAMESPACE)
     return key.kind == PS_CATALOG && !key.owner && key.key &&
            value->name.length <= PS_DIRECTORY_NAMESPACE_MAX;
+  if (value->tag.storage == PS_DIRECTORY_CHECKPOINT)
+    return key.kind == PS_NAMESPACE_CHECKPOINT &&
+           value->checkpoint.incarnation &&
+           value->checkpoint.length <= PS_DIRECTORY_CHECKPOINT_MAX;
   if (value->tag.storage == PS_DIRECTORY_STREAM ||
       value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
     const ps_directory_stream *stream = &value->stream;
@@ -104,6 +108,7 @@ static int valid_value(ps_key key, const ps_directory_value *value) {
     return !extent->crc && !extent->deletion_bytes;
   if (value->tag.storage == PS_DIRECTORY_PACKED_VALUE)
     return ref->bytes < PS_PAGE && ps_internal_immutable_key(key) &&
+           key.kind != PS_NAMESPACE_CHECKPOINT &&
            (key.kind == PS_KEY_METADATA || !extent->deletion_bytes);
   return value->tag.storage == PS_DIRECTORY_OWNED_RUN &&
          key.kind == PS_OWNED_RUN && !extent->deletion_bytes &&
@@ -119,6 +124,11 @@ static int same_value(const ps_directory_value *a,
     const ps_directory_name *name = &a->name, *other = &b->name;
     return name->length == other->length &&
            !memcmp(name->bytes, other->bytes, name->length);
+  }
+  if (a->tag.storage == PS_DIRECTORY_CHECKPOINT) {
+    const ps_directory_checkpoint *x = &a->checkpoint, *y = &b->checkpoint;
+    return x->incarnation == y->incarnation && x->length == y->length &&
+           !memcmp(x->bytes, y->bytes, x->length);
   }
   if (a->tag.storage == PS_DIRECTORY_STREAM ||
       a->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
@@ -200,6 +210,17 @@ static int slot_value(const unsigned char *slot, ps_key key,
       if (slot[i])
         return 0;
     memcpy(value->name.bytes, slot + 25, PS_DIRECTORY_NAMESPACE_MAX);
+  } else if (storage == PS_DIRECTORY_CHECKPOINT) {
+    ps_directory_checkpoint *checkpoint = &value->checkpoint;
+    checkpoint->storage = storage;
+    checkpoint->incarnation = ps_wire_get64(slot + 24);
+    checkpoint->length = slot[32];
+    if (checkpoint->length > PS_DIRECTORY_CHECKPOINT_MAX)
+      return 0;
+    for (i = 33 + checkpoint->length; i < SLOT; ++i)
+      if (slot[i])
+        return 0;
+    memcpy(checkpoint->bytes, slot + 33, PS_DIRECTORY_CHECKPOINT_MAX);
   } else if (storage == PS_DIRECTORY_STREAM ||
              storage == PS_DIRECTORY_SEALED_STREAM) {
     ps_directory_stream *stream = &value->stream;
@@ -887,6 +908,11 @@ static int write_node(ps_directory *d, directory_node *node,
         const ps_directory_name *name = &value->name;
         slot[24] = name->length;
         memcpy(slot + 25, name->bytes, name->length);
+      } else if (value->tag.storage == PS_DIRECTORY_CHECKPOINT) {
+        const ps_directory_checkpoint *checkpoint = &value->checkpoint;
+        ps_wire_put64(slot + 24, checkpoint->incarnation);
+        slot[32] = (unsigned char)checkpoint->length;
+        memcpy(slot + 33, checkpoint->bytes, checkpoint->length);
       } else if (value->tag.storage == PS_DIRECTORY_STREAM ||
                  value->tag.storage == PS_DIRECTORY_SEALED_STREAM) {
         const ps_directory_stream *stream = &value->stream;

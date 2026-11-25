@@ -752,7 +752,7 @@ static int select_projection_locked(struct ps_namespace_data *d,
   }
   if (*found && !observed->window) {
     rc = ps_checkpoint_point(s, ns->identity.owner, prefix, memo_only,
-                             &d->observed_coverage, found, NULL, e);
+                             &d->observed_coverage, found, e);
     *coverage = d->observed_coverage;
   }
   if (rc != LC_OK || !*found)
@@ -2174,8 +2174,7 @@ int ps_namespace_admission_proven_locked(ps_space *s, uint64_t owner,
   if (rc == LC_OK && current && token)
     rc = decode_head(owner, head, &stream.key, e);
   if (rc == LC_OK && current)
-    rc = ps_checkpoint_point(s, owner, prefix, 0, &coverage, &current,
-                             private_failure, e);
+    rc = ps_checkpoint_point(s, owner, prefix, 0, &coverage, &current, e);
   if (rc == LC_OK && current && coverage.segment > stream.key)
     rc = failure(e, LC_ERR_PROTOCOL,
                  "checkpoint coverage exceeds namespace head");

@@ -2681,7 +2681,7 @@ static void shared_join_admission(const char *path, int durable,
   ps_space *space = ps_root_space(probe.peer);
   for (size_t i = 0; i < 2; ++i) {
     ps_namespace_info identity;
-    ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
+    ps_key key = {0, 1, PS_ROUTING};
     writers[i] = acquire(probe.peer, names[i], 1, &e);
     ok(append(probe.peer, writers[i], 1, 0, 64, &e), &e);
     ok(ps_namespace_checkpoint_flush(writers[i], &e), &e);

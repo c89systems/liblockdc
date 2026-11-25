@@ -369,6 +369,11 @@ int ps_internal_capture_end(ps_space *, ps_coordination_guard *, int,
 int ps_internal_fixed_value(ps_space *, ps_key, uint64_t prefix, void *, size_t,
                             uint64_t known, uint64_t *incarnation, int *current,
                             int *private_failure, lc_error *);
+/* The capture owns the current revision and the caller's buffer holds
+ * PS_CHECKPOINT_CONTROL_MAX bytes. No allocator or payload read is needed. */
+void ps_internal_checkpoint_control(ps_space *, uint64_t owner, uint64_t prefix,
+                                    void *, size_t *, uint64_t known,
+                                    uint64_t *incarnation, int *current);
 /* Scalar catalog and stream observations share the caller's capture. */
 int ps_internal_catalog_find(ps_space *, uint64_t owner, unsigned int kind,
                              const void *, size_t, uint64_t prefix,

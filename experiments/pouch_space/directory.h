@@ -18,7 +18,8 @@ enum ps_directory_storage {
   PS_DIRECTORY_OWNED_RUN = 2,
   PS_DIRECTORY_STREAM = 3,
   PS_DIRECTORY_SEALED_STREAM = 4,
-  PS_DIRECTORY_NAMESPACE = 5
+  PS_DIRECTORY_NAMESPACE = 5,
+  PS_DIRECTORY_CHECKPOINT = 6
 };
 typedef struct ps_directory_extent {
   uint32_t storage, crc;
@@ -34,6 +35,12 @@ typedef struct ps_directory_name {
   uint32_t storage;
   unsigned char length, bytes[PS_DIRECTORY_NAMESPACE_MAX];
 } ps_directory_name;
+#define PS_DIRECTORY_CHECKPOINT_MAX 24U
+typedef struct ps_directory_checkpoint {
+  uint32_t storage, length;
+  uint64_t incarnation;
+  unsigned char bytes[PS_DIRECTORY_CHECKPOINT_MAX];
+} ps_directory_checkpoint;
 typedef union ps_directory_value {
   struct {
     uint32_t storage;
@@ -41,6 +48,7 @@ typedef union ps_directory_value {
   ps_directory_extent extent;
   ps_directory_stream stream;
   ps_directory_name name;
+  ps_directory_checkpoint checkpoint;
 } ps_directory_value;
 int ps_internal_immutable_key(ps_key);
 /* read transfers a contiguous span of referenced PS_PAGE blocks. write

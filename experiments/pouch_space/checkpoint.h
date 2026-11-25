@@ -133,7 +133,7 @@ int ps_checkpoint_capture_selected_locked(ps_namespace *, uint64_t prefix,
 /* A memo-only miss reports noncurrent without reading the disk. */
 int ps_checkpoint_point(ps_space *, uint64_t owner, uint64_t prefix,
                         int memo_only, ps_checkpoint_info *, int *current,
-                        int *private_failure, lc_error *);
+                        lc_error *);
 /* A coverage token can stay fixed while forward checkpoint slots publish. */
 int ps_key_checkpoint_confirm_seed(ps_key_checkpoint *, const ps_values *,
                                    const ps_checkpoint_info *, lc_error *);

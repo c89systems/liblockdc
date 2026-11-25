@@ -3325,6 +3325,8 @@ static void projection_quarantine(int durable, int explicit_sweep) {
   ok(ps_close(writer, &e), &e);
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
 }
+enum { PROJECTION_CHECKPOINT_BYTES = 13 };
+
 static void expect_capture_kinds(ps_space *space, uint64_t owner,
                                  unsigned int first, unsigned int last,
                                  uint64_t expected) {
@@ -3337,7 +3339,10 @@ static void expect_capture_kinds(ps_space *space, uint64_t owner,
     uint64_t bytes;
     ok(ps_values_info(view, i, &key, &ref, &bytes, &e), &e);
     REQUIRE(key.owner == owner && key.kind <= PS_NAMESPACE_CHECKPOINT &&
-            ref.incarnation && bytes == 65);
+            ref.incarnation);
+    REQUIRE(bytes == (key.kind == PS_NAMESPACE_CHECKPOINT
+                          ? PROJECTION_CHECKPOINT_BYTES
+                          : 65));
     uint64_t kind = UINT64_C(1) << key.kind;
     REQUIRE(expected & kind);
     expected ^= kind;
@@ -3378,7 +3383,7 @@ static void projection_lifecycle(void) {
   capture_put_key(a, snapshot, 65);
   capture_put_key(a, slot, 65);
   capture_put_key(a, decision, 65);
-  capture_put_key(a, control, 65);
+  capture_put_key(a, control, PROJECTION_CHECKPOINT_BYTES);
   capture_put_key(a, collision, 65);
   ok(ps_owned_open(a, NULL, stream, 1, NULL, &head, &owned, &e), &e);
   ok(ps_owned_grant(head, NULL, 0, PS_PAGE, &run, &found, &e), &e);

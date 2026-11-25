@@ -1279,7 +1279,7 @@ static void reopen_sanitization(void) {
   size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
   memcpy(root, m.stable + offset, sizeof(root));
   fixture_put(root + ROOT_LAYOUT_OFFSET,
-              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_COMPACT_REVISIONS, 4);
+              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_INLINE_CHECKPOINT, 4);
   fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
   fd = open(path, O_RDWR);
   CHECK(fd >= 0 &&
@@ -8278,6 +8278,7 @@ int main(int argc, char **argv) {
         for (int control = 0; control < 2; ++control)
           revision_lifecycle(durable, control);
       revision_retire_metadata();
+      revision_inline_checkpoint();
       revision_admission();
       revision_candidate_images();
       revision_rollover();

@@ -100,6 +100,53 @@ static void revision_lifecycle(int durable, int control) {
   free(bytes);
   clean();
 }
+static void revision_inline_checkpoint(void) {
+  const unsigned char short_value[] = "coverage";
+  unsigned char long_value[PS_CHECKPOINT_CONTROL_MAX], sample[3];
+  ps_key control = key(PS_NAMESPACE_CHECKPOINT, 1, 1);
+  ps_options options = {0};
+  ps_space *a = NULL, *b = NULL;
+  ps_writer *w = NULL;
+  ps_reader *held = NULL;
+  ps_stats before, after;
+  clean();
+  memset(long_value, 0x63, sizeof(long_value));
+  options.shared = 1;
+  options.initial_capacity = PS_MIB;
+  OK(ps_open(path, 1, &options, &a, &error));
+  OK(ps_open(path, 0, &options, &b, &error));
+  OK(ps_status(a, &before, &error));
+  OK(ps_begin(a, NULL, control, &w, &error));
+  OK(ps_write(w, short_value, sizeof(short_value), &error));
+  OK(ps_revision_publish(&w, 1, PS_REVISION_FORCE_DURABLE, PS_COMMIT_DEFAULT,
+                         NULL, NULL, &error));
+  ps_writer_close(w);
+  OK(ps_status(a, &after, &error));
+  CHECK(after.journal_bytes == before.journal_bytes + REVISION_HEADER_BYTES +
+                                   REVISION_MEMBER_BYTES + sizeof(short_value));
+  CHECK(after.live_bytes == before.live_bytes + sizeof(short_value) &&
+        after.allocated_bytes == before.allocated_bytes &&
+        after.packed_bytes == before.packed_bytes);
+  OK(ps_read_open(b, control, NULL, &held, &error));
+  OK(ps_read_at(held, 2, sample, sizeof(sample), &error));
+  CHECK(!memcmp(sample, short_value + 2, sizeof(sample)));
+  OK(ps_checkpoint(a, &error));
+  OK(ps_status(a, &after, &error));
+  CHECK(after.descriptor_page_writes == before.descriptor_page_writes);
+  expect(b, control, NULL, short_value, sizeof(short_value));
+
+  put(a, control, long_value, sizeof(long_value), 7);
+  OK(ps_checkpoint(a, &error));
+  expect(b, control, NULL, long_value, sizeof(long_value));
+  read_value(held, short_value, sizeof(short_value));
+  ps_reader_close(held);
+  OK(ps_close(b, &error));
+  OK(ps_close(a, &error));
+  OK(ps_open(path, 0, &options, &a, &error));
+  expect(a, control, NULL, long_value, sizeof(long_value));
+  OK(ps_close(a, &error));
+  clean();
+}
 static void revision_retire_metadata(void) {
   ps_key stage = key(PS_KEY_METADATA, 1, 3);
   ps_revision_retirement retirement = {stage, 0};

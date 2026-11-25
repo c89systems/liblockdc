@@ -29,7 +29,7 @@ struct ps_writer {
   ps_entry *expected_owned;
   size_t used, extent_capacity;
   int failed, published;
-  unsigned char buffer[PS_CHUNK];
+  unsigned char *buffer;
 };
 typedef struct packed_read {
   uint64_t offset;
@@ -635,6 +635,8 @@ static size_t entry_bytes(const ps_entry *p) {
     return ps_catalog_record_bytes(p);
   if (p->key.kind == PS_STREAM)
     return 80;
+  if (p->key.kind == PS_NAMESPACE_CHECKPOINT)
+    return header + (size_t)p->bytes;
   if (p->key.kind == PS_OWNED_RUN)
     header = 80;
   if (p->key.kind == PS_KEY_METADATA)
@@ -658,7 +660,12 @@ static void stream_unregister(ps_space *s, ps_entry *p) {
     link = &(*link)->stream.head->next;
   *link = p->stream.head->next;
 }
-enum ps_entry_layout { PS_ENTRY_VALUE, PS_ENTRY_HEAD, PS_ENTRY_RUN };
+enum ps_entry_layout {
+  PS_ENTRY_VALUE,
+  PS_ENTRY_HEAD,
+  PS_ENTRY_RUN,
+  PS_ENTRY_CHECKPOINT
+};
 typedef struct ps_entry_allocation {
   struct ps_entry_allocation *next, **link;
   /* Only slabs have an owner and can provide further entries. */
@@ -824,6 +831,10 @@ typedef struct ps_owned_run_entry {
   ps_entry entry;
   ps_owned_run_state run;
 } ps_owned_run_entry;
+typedef struct ps_checkpoint_entry {
+  ps_entry entry;
+  unsigned char value[PS_CHECKPOINT_CONTROL_MAX];
+} ps_checkpoint_entry;
 typedef struct ps_entry_slab_slot {
   ps_entry entry;
   ps_extent extent;
@@ -837,7 +848,8 @@ typedef struct ps_owned_run_slab_slot {
   ps_extent extent;
 } ps_owned_run_slab_slot;
 static const size_t entry_base_bytes[] = {
-    sizeof(ps_entry), sizeof(ps_stream_entry), sizeof(ps_owned_run_entry)};
+    sizeof(ps_entry), sizeof(ps_stream_entry), sizeof(ps_owned_run_entry),
+    sizeof(ps_checkpoint_entry)};
 static const size_t entry_slab_stride[] = {sizeof(ps_entry_slab_slot),
                                            sizeof(ps_stream_slab_slot),
                                            sizeof(ps_owned_run_slab_slot)};
@@ -886,6 +898,8 @@ static enum ps_entry_layout entry_layout(unsigned int kind) {
     return PS_ENTRY_HEAD;
   if (kind == PS_OWNED_RUN)
     return PS_ENTRY_RUN;
+  if (kind == PS_NAMESPACE_CHECKPOINT)
+    return PS_ENTRY_CHECKPOINT;
   return PS_ENTRY_VALUE;
 }
 static void entry_initialize(ps_entry *p, ps_entry_allocation *block,
@@ -2477,6 +2491,10 @@ static void encode_entry_fields(unsigned char *fields, unsigned char *extra,
   if (event == PS_PUT || event == PS_SEAL) {
     ps_wire_put64(fields + 32, p->bytes);
     ps_wire_put32(fields + 40, (uint32_t)p->count);
+    if (p->key.kind == PS_NAMESPACE_CHECKPOINT) {
+      memcpy(extra, ((const ps_checkpoint_entry *)p)->value, (size_t)p->bytes);
+      return;
+    }
     if (p->key.kind == PS_OWNED_RUN) {
       ps_wire_put64(extra, p->stream.run->capacity);
       ps_wire_put32(extra + 8, (uint32_t)p->stream.run->mapped);
@@ -2553,7 +2571,7 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
   if (kind == PS_KEY_METADATA && type == PS_PUT)
     first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
   if (count > (PS_JOURNAL - 64) / 24 ||
-      (kind != PS_CATALOG &&
+      (kind != PS_CATALOG && kind != PS_NAMESPACE_CHECKPOINT &&
        bytes != (kind == PS_STREAM && (type == PS_PUT || type == PS_SEAL)
                      ? 16
                      : first + count * 24)) ||
@@ -2574,6 +2592,13 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
          p->key.kind != PS_STREAM && p->key.kind != PS_CATALOG))) ||
       (*event == PS_SEAL && p->key.kind != PS_STREAM))
     goto invalid;
+  if (kind == PS_NAMESPACE_CHECKPOINT) {
+    if (count || bytes != p->bytes || bytes > PS_CHECKPOINT_CONTROL_MAX)
+      goto invalid;
+    memcpy(((ps_checkpoint_entry *)p)->value, extra, bytes);
+    *out = p;
+    return LC_OK;
+  }
   if (p->key.kind == PS_CATALOG) {
     int rc;
     if (p->bytes || wire_count || (*event == PS_REMOVE && bytes))
@@ -3660,6 +3685,16 @@ static int checkpoint_descriptor(metadata_builder *builder, ps_entry *p,
   size_t bytes, capacity;
   int rc;
   memset(value, 0, sizeof(*value));
+  if (p->key.kind == PS_NAMESPACE_CHECKPOINT &&
+      p->bytes <= PS_DIRECTORY_CHECKPOINT_MAX) {
+    ps_directory_checkpoint *checkpoint = &value->checkpoint;
+    checkpoint->storage = PS_DIRECTORY_CHECKPOINT;
+    checkpoint->length = (uint32_t)p->bytes;
+    checkpoint->incarnation = p->token;
+    memcpy(checkpoint->bytes, ((const ps_checkpoint_entry *)p)->value,
+           checkpoint->length);
+    return LC_OK;
+  }
   if (p->key.kind == PS_STREAM && p->stream.head->runs <= UINT32_MAX) {
     ps_directory_stream *stream = &value->stream;
     stream->storage = p->stream.head->sealed ? PS_DIRECTORY_SEALED_STREAM
@@ -5011,6 +5046,9 @@ static int reuse_directory_entry(metadata_recovery *r,
   p->count = old->count;
   if (p->count)
     memcpy(p->extents, old->extents, p->count * sizeof(*p->extents));
+  if (p->key.kind == PS_NAMESPACE_CHECKPOINT)
+    memcpy(((ps_checkpoint_entry *)p)->value,
+           ((const ps_checkpoint_entry *)old)->value, (size_t)p->bytes);
   p->checkpoint_ref = ref;
   p->projection = item->resident;
   item->decoded = p;
@@ -5408,6 +5446,21 @@ static int capture_directory_entry(void *v, ps_key key,
     return load_stream_binding(r, key, &value->stream, &item->decoded, error);
   case PS_DIRECTORY_NAMESPACE:
     return load_namespace_binding(r, key, &value->name, &item->decoded, error);
+  case PS_DIRECTORY_CHECKPOINT: {
+    const ps_directory_checkpoint *checkpoint = &value->checkpoint;
+    ps_checkpoint_entry *entry;
+    if (checkpoint->incarnation > r->space->token_limit)
+      return err(error, LC_ERR_PROTOCOL, "invalid checkpoint control identity");
+    item->decoded = ps_internal_entry_new(key.kind, 0);
+    if (!item->decoded)
+      return err(error, LC_ERR_NOMEM, "cannot recover checkpoint control");
+    entry = (ps_checkpoint_entry *)item->decoded;
+    entry->entry.key = key;
+    entry->entry.token = checkpoint->incarnation;
+    entry->entry.bytes = checkpoint->length;
+    memcpy(entry->value, checkpoint->bytes, checkpoint->length);
+    return LC_OK;
+  }
   default:
     break; /* Indirect descriptors are fetched in physical page order. */
   }
@@ -7581,9 +7634,13 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
       (!ps_internal_immutable_key(key) && !(owned && key.kind == PS_OWNED_RUN)))
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
-  w = lc_calloc_with_allocator(NULL, 1, sizeof(*w));
+  w = lc_calloc_with_allocator(NULL, 1,
+                               sizeof(*w) + (key.kind == PS_NAMESPACE_CHECKPOINT
+                                                 ? PS_CHECKPOINT_CONTROL_MAX
+                                                 : PS_CHUNK));
   if (!w)
     return err(error, LC_ERR_NOMEM, "cannot allocate container writer");
+  w->buffer = (unsigned char *)(w + 1);
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK)
@@ -7628,6 +7685,11 @@ static int reserve_writer_tail(ps_writer *w, lc_error *error) {
   size_t n, done = 0, take;
   uint64_t run_bytes;
   int rc, split = 0;
+  if (p->key.kind == PS_NAMESPACE_CHECKPOINT) {
+    memcpy(((ps_checkpoint_entry *)p)->value, w->buffer, w->used);
+    p->bytes = w->used;
+    return LC_OK;
+  }
   while (done < w->used) {
     if (p->count == (PS_JOURNAL - 64) / 24)
       return err(error, LC_ERR_INVALID,
@@ -7727,6 +7789,10 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   if (!w || (!bytes && count) || w->failed || w->published)
     return err(error, LC_ERR_INVALID,
                "container writer is invalid, failed or published");
+  if (w->entry->key.kind == PS_NAMESPACE_CHECKPOINT &&
+      count > PS_CHECKPOINT_CONTROL_MAX - w->entry->bytes - w->used)
+    return err(error, LC_ERR_INVALID,
+               "container checkpoint control is too large");
   if ((w->entry->key.kind == PS_ROUTING ||
        (w->entry->key.kind == PS_CONTROL && !w->budget)) &&
       count > PS_PAGE - w->entry->bytes - w->used)
@@ -8274,6 +8340,17 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   if (!r || (!buffer && count) || !out)
     return err(error, LC_ERR_INVALID,
                "container read requires reader, buffer and byte count");
+  if (r->entry->key.kind == PS_NAMESPACE_CHECKPOINT) {
+    n = (size_t)r->entry->bytes - r->offset;
+    if (n > count)
+      n = count;
+    if (n)
+      memcpy(buffer, ((const ps_checkpoint_entry *)r->entry)->value + r->offset,
+             n);
+    r->offset += n;
+    *out = n;
+    return LC_OK;
+  }
   if (r->random_loaded) {
     r->random_loaded = 0;
     r->loaded = 0;
@@ -8311,6 +8388,12 @@ int ps_read_at(ps_reader *r, uint64_t offset, void *buffer, size_t count,
   if (!r || (!buffer && count) || offset > r->entry->bytes ||
       count > r->entry->bytes - offset)
     return err(error, LC_ERR_INVALID, "captured value read exceeds its range");
+  if (r->entry->key.kind == PS_NAMESPACE_CHECKPOINT) {
+    if (count)
+      memcpy(buffer, ((const ps_checkpoint_entry *)r->entry)->value + offset,
+             count);
+    return LC_OK;
+  }
   if (offset < r->random_base) {
     r->random_extent = 0;
     r->random_base = 0;
@@ -8518,6 +8601,31 @@ int ps_internal_fixed_value(ps_space *s, ps_key key, uint64_t prefix,
     return err(error, LC_ERR_PROTOCOL, "incomplete fixed control");
   *incarnation = p->token;
   return LC_OK;
+}
+void ps_internal_checkpoint_control(ps_space *s, uint64_t owner,
+                                    uint64_t prefix, void *buffer,
+                                    size_t *bytes, uint64_t known,
+                                    uint64_t *incarnation, int *current) {
+  ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
+  ps_entry *latest, *p;
+  key.owner = owner;
+  latest = lookup(s, key);
+  p = selected_value(s, latest, prefix);
+  *incarnation = 0;
+  *current = p == latest;
+  if (!p || !*current)
+    return;
+  if (p->token == known) {
+    *incarnation = known;
+    return;
+  }
+  if (!buffer) {
+    *current = 0;
+    return;
+  }
+  *bytes = (size_t)p->bytes;
+  memcpy(buffer, ((const ps_checkpoint_entry *)p)->value, *bytes);
+  *incarnation = p->token;
 }
 int ps_value_info(ps_space *s, ps_key key, ps_ref *ref, uint64_t *bytes,
                   int *present, lc_error *error) {
@@ -9067,7 +9175,8 @@ void ps_reader_close(ps_reader *r) {
   lc_free_with_allocator(NULL, r);
 }
 size_t ps_reader_ticket_bytes(const ps_reader *r) {
-  if (!r || r->entry->count > (PS_JOURNAL - 64U) / 24U)
+  if (!r || r->entry->key.kind == PS_NAMESPACE_CHECKPOINT ||
+      r->entry->count > (PS_JOURNAL - 64U) / 24U)
     return 0;
   return TICKET_HEADER + r->entry->count * 24U;
 }
@@ -9160,7 +9269,8 @@ int ps_reader_import(const char *path, const void *buffer, size_t bytes,
       ps_wire_get32(wire + 96) != ticket_checksum(wire, bytes))
     return err(error, LC_ERR_INVALID, "invalid captured reader ticket");
   count = ps_wire_get64(wire + 64);
-  if (count > (PS_JOURNAL - 64U) / 24U ||
+  if (ps_wire_get32(wire + 72) == PS_NAMESPACE_CHECKPOINT ||
+      count > (PS_JOURNAL - 64U) / 24U ||
       bytes != TICKET_HEADER + count * 24U || !ps_wire_get64(wire + 48) ||
       ps_wire_get64(wire + 24) < PS_MIB ||
       ps_wire_get64(wire + 24) > PS_MAX_CAPACITY ||

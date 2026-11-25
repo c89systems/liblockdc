@@ -830,7 +830,8 @@ static void root_obligations(int durable, int partial, int full) {
     budget_fill(ps_root_space(root), &next, filler);
   OK(ps_checkpoint(ps_root_space(root), &error));
   OK(ps_status(ps_root_space(root), &before, &error));
-  CHECK(before.budgets == 1 && before.reserved_payload_bytes >= 2 * PS_PAGE);
+  CHECK(before.budgets == 1 && before.reserved_payload_bytes >= PS_PAGE &&
+        before.reserved_metadata_bytes);
   if (!partial)
     CHECK(before.reserved_payload_bytes > PS_MIB);
   ps_namespace_release(cold);
@@ -922,7 +923,9 @@ static void root_obligation_faults(int durable) {
         OK(ps_root_open(path, 0, &options, &root, &error));
       }
       OK(ps_status(ps_root_space(root), &stats, &error));
-      CHECK(stats.budgets == 2 && stats.reserved_payload_bytes == 4 * PS_PAGE);
+      /* Each namespace needs one value page and metadata for its control. */
+      CHECK(stats.budgets == 2 && stats.reserved_payload_bytes == 2 * PS_PAGE &&
+            stats.reserved_metadata_bytes);
       for (size_t i = 0; i < 2; ++i) {
         checkpoint_seen seen = {0};
         OK(ps_root_namespace_acquire(root, names[i], 0, &ns, &error));

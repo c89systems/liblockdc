@@ -78,6 +78,7 @@ enum ps_kind {
   PS_KEY_DECISION = 41,
   PS_NAMESPACE_CHECKPOINT = 42
 };
+#define PS_CHECKPOINT_CONTROL_MAX 50U
 typedef struct ps_space ps_space;
 /* Completed journal publication and durable acknowledgement prefixes. Scalar
  * observation only; no I/O, allocation, waiting or publication authority. */
