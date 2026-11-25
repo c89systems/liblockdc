@@ -9318,7 +9318,7 @@ static int sample_headroom(ps_space *s, uint64_t *available, lc_error *e) {
 int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
                             uint64_t *available, lc_error *error) {
   ps_coordination_guard *guard = NULL;
-  uint64_t quarter, amount;
+  uint64_t quarter, recovered, amount;
   int rc, attempted = 0, reclaimed;
   if (!s || !needed || !available)
     return err(error, LC_ERR_INVALID, "capacity pressure requires outputs");
@@ -9342,18 +9342,24 @@ int ps_maintenance_pressure(ps_space *s, int draining, int *needed,
   if (rc == LC_OK)
     *needed = ps_readiness_pressure(s);
   quarter = (s->capacity - PS_DATA) / 4;
-  if (rc == LC_OK && *needed && *available < quarter) {
-    /* At low headroom, commit selected retirements before the next logical
-     * maintenance pass. Require at least one stream chunk, or an eighth of
-     * remaining headroom, to amortize the root selection barriers. */
-    amount = *available / 8;
+  recovered = s->capacity - PS_DATA - quarter;
+  if (rc == LC_OK && ((*needed && *available < quarter) ||
+                      (draining && *available < recovered))) {
+    /* Publish retirements in sizable batches while draining advisory
+     * pressure. A quiet root can otherwise stop above the urgent threshold
+     * with capacity still tied to the selected checkpoint. Quiet turns can
+     * have new retirements after the shared pressure hint has cleared. */
+    if (!*needed)
+      amount = PS_CHUNK;
+    else
+      amount = *available < quarter ? *available / 8 : quarter / 2;
     reclaimed = reclaim_capacity(s, amount > PS_CHUNK ? amount : PS_CHUNK,
                                  &attempted, error);
     if (attempted)
       rc =
           reclaimed == LC_OK ? sample_headroom(s, available, error) : reclaimed;
   }
-  if (rc == LC_OK && *needed && *available >= s->capacity - PS_DATA - quarter) {
+  if (rc == LC_OK && *needed && *available >= recovered) {
     ps_readiness_set_pressure(s, 0);
     *needed = PS_PRESSURE_NONE;
   } else if (rc == LC_OK && *needed && *available < quarter) {

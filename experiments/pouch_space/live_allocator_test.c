@@ -8348,6 +8348,49 @@ static void pressure_reclaim(int durable, size_t fail_sync) {
   REQUIRE(!coverage(NULL, 0) && !unlink(path));
   lc_error_cleanup(&e);
 }
+static void pressure_finishes_drain(int durable) {
+  lc_error e = {0};
+  ps_options options = {.durable_sync = durable};
+  ps_space *writer = NULL, *worker = NULL;
+  ps_reader *pin = NULL;
+  uint64_t available;
+  int needed;
+  const uint64_t retired = 3 * PS_MIB;
+  const uint64_t quarter = (PS_DEFAULT_CAPACITY - PS_DATA) / 4;
+  ok(ps_open(path, 1, &options, &writer, &e), &e);
+  capture_put(writer, 1, retired);
+  capture_put(writer, 2, 41);
+  ok(ps_checkpoint(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &worker, &e), &e);
+  ok(ps_read_open(writer, key(1), NULL, &pin, &e), &e);
+  ok(ps_delete(writer, key(1), &e), &e);
+  ok(ps_flush(writer, &e), &e);
+  /* A peer can retire more pages while the worker is finishing its quiet
+   * turns after clearing the shared hint. Keep them pinned for one turn. */
+  ps_readiness_set_pressure(writer, 0);
+  ok(ps_maintenance_pressure(worker, 1, &needed, &available, &e), &e);
+  ps_stats held = status(worker);
+  REQUIRE(!needed && available >= quarter &&
+          available < PS_DEFAULT_CAPACITY - PS_DATA - quarter &&
+          held.retired_bytes >= retired);
+  captured_expect(pin, 1, retired);
+  ps_reader_close(pin);
+  ok(ps_maintenance_pressure(worker, 0, &needed, &available, &e), &e);
+  REQUIRE(!needed && status(worker).checkpoints == held.checkpoints);
+  ok(ps_maintenance_pressure(worker, 1, &needed, &available, &e), &e);
+  ps_stats drained = status(worker);
+  REQUIRE(!needed && drained.checkpoints == held.checkpoints + 1 &&
+          drained.allocated_bytes + retired <= held.allocated_bytes &&
+          !drained.retired_bytes);
+  ok(ps_close(worker, &e), &e);
+  ok(ps_close(writer, &e), &e);
+  ok(ps_open(path, 0, &options, &writer, &e), &e);
+  expect_value(writer, key(1), 0, 0);
+  expect_value(writer, key(2), 41, 2);
+  ok(ps_close(writer, &e), &e);
+  REQUIRE(!coverage(NULL, 0) && !unlink(path));
+  lc_error_cleanup(&e);
+}
 static void packed_capacity_reclaim(int durable, int background) {
   lc_error e = {0};
   ps_options options = {.durable_sync = durable};
@@ -8963,6 +9006,8 @@ int main(int argc, char **argv) {
   } else if (!strcmp(argv[2], "pressure-reclaim")) {
     pressure_reclaim(0, 0);
     pressure_reclaim(1, 0);
+    pressure_finishes_drain(0);
+    pressure_finishes_drain(1);
     packed_capacity_reclaim(0, 1);
     packed_capacity_reclaim(1, 1);
     stream_capacity_reclaim(0, 1, 0);

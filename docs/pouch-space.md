@@ -142,8 +142,12 @@ fixed-size container.
 
 Under advisory pressure the worker samples ordinary headroom independently
 of its maintenance cadence. Advisory passes occur at most once per second
-and share the regular worker's schedule. Low verified headroom enables
-urgent retries, with backoff when work stalls.
+and share the regular worker's schedule. While draining advisory pressure,
+the allocator can checkpoint unpinned retirements that cover at least an
+eighth of usable capacity, with a one-stream-chunk minimum. The worker can
+still reclaim a stream chunk during its remaining drain turns after clearing
+the pressure hint. Low verified headroom enables smaller batches and urgent
+retries, with backoff when work stalls.
 
 Shared single-file background maintenance retains one metadata projection per
 open root and releases its receiver and physical pins after each pass. It
