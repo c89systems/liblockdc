@@ -1755,9 +1755,8 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
   size_t i;
   void *catalog;
   int present = 0, pending = 0, scan_collections, dropped, rc, first_rc;
-  int reuse_projection =
-      options->background && !options->force &&
-      ps_coordination_shared(ps_space_coordination(root->space));
+  int shared = ps_coordination_shared(ps_space_coordination(root->space));
+  int reuse_projection = options->background && !options->force && shared;
   memset(&list, 0, sizeof(list));
   list.allocator = &pouch->allocator;
   rc = ps_root_namespace_acquire(root, options->ns, 0, &ns, e);
@@ -1846,11 +1845,10 @@ int ps_collection_maintenance_run(ps_root *root, lc_pouch *pouch,
       ++out->cleanup_pending_count;
     /* On a shared root, discovery without collection work adds no checkpoint
      * obligation. Capacity admission and journal rollover settle unrelated
-     * work. Collection maintenance and orphan retirement drain their work. */
-    if (rc == LC_OK &&
-        (scan_collections || reclaimed ||
-         !ps_coordination_shared(ps_space_coordination(root->space))))
-      rc = options->cleanup_only && !options->force
+     * work. Exclusive maintenance uses the cleanup checkpoint for the same
+     * retirement work regardless of which operation selected it. */
+    if (rc == LC_OK && (scan_collections || reclaimed || !shared))
+      rc = !shared || (options->cleanup_only && !options->force)
                ? ps_checkpoint_cleanup(root->space, &local)
                : ps_checkpoint(root->space, &local);
     if (rc != LC_OK) {
