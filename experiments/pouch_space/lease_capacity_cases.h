@@ -305,50 +305,49 @@ static void lease_capacity_profile(const char *directory, int required) {
  * child and after entering the second window. Native cases hold an ordinary
  * peer throughout application/recovery; multifile remains a semantic reference.
  */
-static void lease_attachment_windows(const char *directory) {
+static void lease_attachment_windows(const char *directory, int sync,
+                                     int crypto) {
   lc_error e;
   lc_error_init(&e);
   fixture *f = calloc(1, sizeof(*f));
   REQUIRE(f);
-  for (int sync = 0; sync < 2; ++sync)
-    for (int crypto = 0; crypto < 4; ++crypto)
-      for (int cut = 0; cut < 3; ++cut) {
-        phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
-        attachment_cut_skip = cut == 2 ? 16 : 0;
-        lease_capacity_case(directory, sync, crypto, 1, 33,
-                            LC_POUCH_RETENTION_STAGED, !cut);
-        REQUIRE(!attachment_cut_skip);
-        now(1000);
-        setup(f, directory, 1, sync, crypto, &e);
-        lease_capacity_seed(f, "order", 33, &e);
-        write_parent(f, "other", 0, 1, &e);
-        now(1050);
-        phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
-        attachment_cut_skip = cut == 2 ? 16 : 0;
-        phase_hits = 0;
-        lc_pouch_maintenance_result result = {0};
-        int rc = lc_pouch_retention_run(store(f), "orders", 1, &result, &e);
-        if (cut) {
-          REQUIRE(rc == LC_ERR_TRANSPORT && phase_hits == 1 && !phase_fail &&
-                  !attachment_cut_skip);
-          clear(&e);
-          parent(f, "order", 0, 0, &e);
-          attachments(f, "order", cut == 1 ? 32 : 16, &e);
-        } else {
-          ok(rc, &e);
-          REQUIRE(result.retention_deleted_state_count == 1);
-        }
-        lc_pouch_maintenance_result_cleanup(&store(f)->allocator, &result);
-        close_store(f);
-        open_store(f, 0, &e);
-        now(900);
-        (void)clean(f, 1, &e);
-        settled(f, &e);
-        parent(f, "other", 1, 0, &e);
-        attachments(f, "other", 1, &e);
-        close_store(f);
-        retire(f);
-      }
+  for (int cut = 0; cut < 3; ++cut) {
+    phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
+    attachment_cut_skip = cut == 2 ? 16 : 0;
+    lease_capacity_case(directory, sync, crypto, 1, 33,
+                        LC_POUCH_RETENTION_STAGED, !cut);
+    REQUIRE(!attachment_cut_skip);
+    now(1000);
+    setup(f, directory, 1, sync, crypto, &e);
+    lease_capacity_seed(f, "order", 33, &e);
+    write_parent(f, "other", 0, 1, &e);
+    now(1050);
+    phase_fail = cut ? LC_POUCH_RETENTION_ATTACHMENT_APPLIED : 0;
+    attachment_cut_skip = cut == 2 ? 16 : 0;
+    phase_hits = 0;
+    lc_pouch_maintenance_result result = {0};
+    int rc = lc_pouch_retention_run(store(f), "orders", 1, &result, &e);
+    if (cut) {
+      REQUIRE(rc == LC_ERR_TRANSPORT && phase_hits == 1 && !phase_fail &&
+              !attachment_cut_skip);
+      clear(&e);
+      parent(f, "order", 0, 0, &e);
+      attachments(f, "order", cut == 1 ? 32 : 16, &e);
+    } else {
+      ok(rc, &e);
+      REQUIRE(result.retention_deleted_state_count == 1);
+    }
+    lc_pouch_maintenance_result_cleanup(&store(f)->allocator, &result);
+    close_store(f);
+    open_store(f, 0, &e);
+    now(900);
+    (void)clean(f, 1, &e);
+    settled(f, &e);
+    parent(f, "other", 1, 0, &e);
+    attachments(f, "other", 1, &e);
+    close_store(f);
+    retire(f);
+  }
   free(f);
   lc_error_cleanup(&e);
 }

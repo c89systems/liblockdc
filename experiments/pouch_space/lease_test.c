@@ -2427,7 +2427,7 @@ static void run_linux_case(run *r) {
   else if (!strcmp(r->mode, "capacity-completion"))
     lease_capacity_completion(r->directory);
   else if (!strcmp(r->mode, "attachment-windows"))
-    lease_attachment_windows(r->directory);
+    lease_attachment_windows(r->directory, r->sync, r->io_mode);
   else if (!strcmp(r->mode, "capacity-uncontended")) {
     for (int sync = 0; sync < 2; ++sync)
       for (int crypto = 0; crypto <= 3; crypto += 3)
@@ -2521,7 +2521,8 @@ int main(int argc, char **argv) {
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
   run r = {directory, argv[2]};
-  if (!strcmp(r.mode, "shared-messaging-capacity") ||
+  if (!strcmp(r.mode, "attachment-windows") ||
+      !strcmp(r.mode, "shared-messaging-capacity") ||
       !strcmp(r.mode, "shared-autonomous-capacity") ||
       !strcmp(r.mode, "shared-unpaced-capacity") ||
       !strcmp(r.mode, "shared-concurrent-capacity") ||

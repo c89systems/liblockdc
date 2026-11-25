@@ -3982,110 +3982,105 @@ static void lifetime_exhaustion(const char *path, int multifile,
     REQUIRE(!live);
   }
 }
-static void lifetimes(const char *path, const char *directory) {
+static void lifetimes(const char *path, const char *directory, int multifile,
+                      int crypto) {
   lc_error e;
   lc_error_init(&e);
-  for (int multifile = 0; multifile < 2; ++multifile)
-    for (int crypto = 0; crypto < 4; ++crypto)
-      for (int sync = 0; sync < 2; ++sync)
-        for (int object = 0; object < 2; ++object) {
-          ps_pouch_state_options o = options(crypto, sync);
-          lc_pouch *p = NULL;
-          char native[1400];
-          o.logical.segment_target_bytes = 1;
-          REQUIRE(snprintf(native, sizeof(native), "%s/native-%d-%d-%d",
-                           directory, crypto, sync,
-                           object) < (int)sizeof(native));
+  for (int sync = 0; sync < 2; ++sync)
+    for (int object = 0; object < 2; ++object) {
+      ps_pouch_state_options o = options(crypto, sync);
+      lc_pouch *p = NULL;
+      char native[1400];
+      o.logical.segment_target_bytes = 1;
+      REQUIRE(snprintf(native, sizeof(native), "%s/native-%d-%d-%d", directory,
+                       crypto, sync, object) < (int)sizeof(native));
+      if (multifile)
+        ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+      else
+        ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+      lifetime_ordering(p, &e);
+      lc_pouch_state_write_options meta = {0}, del = {0};
+      lc_pouch_state_write_result w = {0};
+      meta.object_record = del.object_record = object;
+      meta.has_metadata = 1;
+      meta.metadata = (const unsigned char *)"lease";
+      meta.metadata_length = 5;
+      ok(lc_pouch_state_update_metadata(p, "lifetimes", "key", &meta, &w, &e),
+         &e);
+      REQUIRE(w.version == 0 && w.index_seq == 1);
+      lc_pouch_state_write_result_cleanup(&allocator, &w);
+      lifetime_put(p, object, 0, 65569, 61, 1, 2, &e);
+      size_t old_length = 65569;
+      unsigned char old_seed = 61;
+      for (size_t cycle = 0; cycle < 4; ++cycle) {
+        lc_pouch_state_read_result held = {0}, placeholder = {0};
+        ok(lc_pouch_state_read(p, "lifetimes", "key", &held, &e), &e);
+        lifetime_put(p, object, !(cycle % 2), 17, 70, 2, 3 + 4 * cycle, &e);
+        ok(lc_pouch_state_delete(p, "lifetimes", "key", &del, &w, &e), &e);
+        REQUIRE(w.version == 3 && w.index_seq == 4 + 4 * cycle);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        ok(lc_pouch_state_read_metadata(p, "lifetimes", "key", &placeholder,
+                                        &e),
+           &e);
+        REQUIRE(!placeholder.found);
+        lc_pouch_state_read_result_cleanup(&allocator, &placeholder);
+        ok(lc_pouch_state_update_metadata(p, "lifetimes", "key", &meta, &w, &e),
+           &e);
+        REQUIRE(w.version == 0 && w.index_seq == 5 + 4 * cycle);
+        lc_pouch_state_write_result_cleanup(&allocator, &w);
+        sequence_recovery_compact(p, "lifetimes", multifile, &e);
+        ok(lc_pouch_state_read_metadata(p, "lifetimes", "key", &placeholder,
+                                        &e),
+           &e);
+        REQUIRE(placeholder.found && !placeholder.has_body &&
+                !placeholder.version && placeholder.metadata_length == 5);
+        lc_pouch_state_read_result_cleanup(&allocator, &placeholder);
+        drain(held.body, old_length, old_seed, &e);
+        ok(held.body->reset(held.body, &e), &e);
+        if (!(cycle % 2)) {
+          lc_pouch_state_read_result_cleanup(&allocator, &held);
+          lc_pouch_close(p);
+          REQUIRE(!live);
           if (multifile)
             ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
           else
-            ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
-          lifetime_ordering(p, &e);
-          lc_pouch_state_write_options meta = {0}, del = {0};
-          lc_pouch_state_write_result w = {0};
-          meta.object_record = del.object_record = object;
-          meta.has_metadata = 1;
-          meta.metadata = (const unsigned char *)"lease";
-          meta.metadata_length = 5;
-          ok(lc_pouch_state_update_metadata(p, "lifetimes", "key", &meta, &w,
-                                            &e),
-             &e);
-          REQUIRE(w.version == 0 && w.index_seq == 1);
-          lc_pouch_state_write_result_cleanup(&allocator, &w);
-          lifetime_put(p, object, 0, 65569, 61, 1, 2, &e);
-          size_t old_length = 65569;
-          unsigned char old_seed = 61;
-          for (size_t cycle = 0; cycle < 4; ++cycle) {
-            lc_pouch_state_read_result held = {0}, placeholder = {0};
-            ok(lc_pouch_state_read(p, "lifetimes", "key", &held, &e), &e);
-            lifetime_put(p, object, !(cycle % 2), 17, 70, 2, 3 + 4 * cycle, &e);
-            ok(lc_pouch_state_delete(p, "lifetimes", "key", &del, &w, &e), &e);
-            REQUIRE(w.version == 3 && w.index_seq == 4 + 4 * cycle);
-            lc_pouch_state_write_result_cleanup(&allocator, &w);
-            ok(lc_pouch_state_read_metadata(p, "lifetimes", "key", &placeholder,
-                                            &e),
-               &e);
-            REQUIRE(!placeholder.found);
-            lc_pouch_state_read_result_cleanup(&allocator, &placeholder);
-            ok(lc_pouch_state_update_metadata(p, "lifetimes", "key", &meta, &w,
-                                              &e),
-               &e);
-            REQUIRE(w.version == 0 && w.index_seq == 5 + 4 * cycle);
-            lc_pouch_state_write_result_cleanup(&allocator, &w);
-            sequence_recovery_compact(p, "lifetimes", multifile, &e);
-            ok(lc_pouch_state_read_metadata(p, "lifetimes", "key", &placeholder,
-                                            &e),
-               &e);
-            REQUIRE(placeholder.found && !placeholder.has_body &&
-                    !placeholder.version && placeholder.metadata_length == 5);
-            lc_pouch_state_read_result_cleanup(&allocator, &placeholder);
-            drain(held.body, old_length, old_seed, &e);
-            ok(held.body->reset(held.body, &e), &e);
-            if (!(cycle % 2)) {
-              lc_pouch_state_read_result_cleanup(&allocator, &held);
-              lc_pouch_close(p);
-              REQUIRE(!live);
-              if (multifile)
-                ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
-              else
-                ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
-            }
-            old_length = 31;
-            old_seed = (unsigned char)(80 + cycle);
-            lifetime_put(p, object, cycle % 2, old_length, old_seed, 1,
-                         6 + 4 * cycle, &e);
-            sequence_recovery_compact(p, "lifetimes", multifile, &e);
-            if (held.body) {
-              drain(held.body, 31, (unsigned char)(79 + cycle), &e);
-              lc_pouch_state_read_result_cleanup(&allocator, &held);
-            }
-            lc_pouch_close(p);
-            REQUIRE(!live);
-            if (multifile && cycle % 2)
-              o.logical.compression =
-                  !strcmp(o.logical.compression, "zlib") ? "none" : "zlib";
-            if (multifile)
-              ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
-            else
-              ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
-            read_value(p, "lifetimes", "key", old_length, old_seed, 1, &e);
-            lc_pouch_generation seq;
-            ok(lc_pouch_state_index_seq(p, "lifetimes", &seq, &e), &e);
-            REQUIRE(seq == 6 + 4 * cycle);
-            ok(lc_pouch_state_query_index_seq(p, "lifetimes", &seq, &e), &e);
-            REQUIRE(seq == (object ? 0 : 6 + 4 * cycle));
-          }
-          if (multifile)
-            lifetime_staging(p, object, &e);
-          lc_pouch_generation query;
-          ok(lc_pouch_state_query_index_seq(p, "lifetimes", &query, &e), &e);
-          lc_pouch_close(p);
-          REQUIRE(!live);
-          lifetime_exhaustion(multifile ? native : path, multifile, &o, query,
-                              &e);
-          if (!multifile)
-            REQUIRE(unlink(path) == 0);
+            ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
         }
+        old_length = 31;
+        old_seed = (unsigned char)(80 + cycle);
+        lifetime_put(p, object, cycle % 2, old_length, old_seed, 1,
+                     6 + 4 * cycle, &e);
+        sequence_recovery_compact(p, "lifetimes", multifile, &e);
+        if (held.body) {
+          drain(held.body, 31, (unsigned char)(79 + cycle), &e);
+          lc_pouch_state_read_result_cleanup(&allocator, &held);
+        }
+        lc_pouch_close(p);
+        REQUIRE(!live);
+        if (multifile && cycle % 2)
+          o.logical.compression =
+              !strcmp(o.logical.compression, "zlib") ? "none" : "zlib";
+        if (multifile)
+          ok(lc_pouch_open(native, &allocator, &o.logical, &p, &e), &e);
+        else
+          ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+        read_value(p, "lifetimes", "key", old_length, old_seed, 1, &e);
+        lc_pouch_generation seq;
+        ok(lc_pouch_state_index_seq(p, "lifetimes", &seq, &e), &e);
+        REQUIRE(seq == 6 + 4 * cycle);
+        ok(lc_pouch_state_query_index_seq(p, "lifetimes", &seq, &e), &e);
+        REQUIRE(seq == (object ? 0 : 6 + 4 * cycle));
+      }
+      if (multifile)
+        lifetime_staging(p, object, &e);
+      lc_pouch_generation query;
+      ok(lc_pouch_state_query_index_seq(p, "lifetimes", &query, &e), &e);
+      lc_pouch_close(p);
+      REQUIRE(!live);
+      lifetime_exhaustion(multifile ? native : path, multifile, &o, query, &e);
+      if (!multifile)
+        REQUIRE(unlink(path) == 0);
+    }
   lc_error_cleanup(&e);
 }
 static size_t lifetime_failure(const char *path, size_t nth, int crypto,
@@ -4791,7 +4786,8 @@ static void maintenance_physical_threshold(const char *path, int sync) {
   REQUIRE(!live && !unlink(path));
   lc_error_cleanup(&e);
 }
-static void maintenance_partial_tail(const char *path, const char *directory) {
+static void maintenance_partial_tail(const char *path, const char *directory,
+                                     int crypto, int sync) {
   lc_error e;
   lc_error_init(&e);
   const size_t key_bytes = 60 * 1024, body_bytes = (size_t)PS_MIB + 37;
@@ -4799,86 +4795,78 @@ static void maintenance_partial_tail(const char *path, const char *directory) {
   REQUIRE(key);
   memset(key, 'k', key_bytes);
   key[key_bytes] = 0;
-  for (int crypto = 0; crypto <= 3; crypto += 3)
-    for (int sync = 0; sync < 2; ++sync) {
-      ps_pouch_state_options o = options(crypto, sync);
-      o.logical.segment_target_bytes = 8 * PS_MIB;
-      lc_pouch *p = NULL;
-      lc_pouch_state_write_options write_options = {0};
-      lc_pouch_state_write_result written = {0};
-      lc_pouch_state_read_result pinned = {0}, metadata = {0};
-      ps_pouch_compaction_result result = {0};
-      ps_namespace_status status;
-      ps_stats held, released;
-      void *ns = NULL;
-      input in = source(body_bytes, 41);
-      write_options.disable_compression = 1;
-      ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
-      ok(put(p, "tail", key, &in, &write_options, &written, &e), &e);
-      REQUIRE(in.offset == body_bytes && in.calls > 1);
-      lc_pouch_state_write_result_cleanup(&allocator, &written);
-      ok(p->storage.ops->namespace_open(p->storage.context, "tail", 0, &ns, &e),
-         &e);
-      ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns,
-                                            &e),
-         &e);
-      ok(lc_pouch_state_read(p, "tail", key, &pinned, &e), &e);
-      maintenance_fill(p, &e);
-      ok(lc_pouch_state_delete(p, "tail", key, NULL, &written, &e), &e);
-      REQUIRE(written.version == 2);
-      lc_pouch_state_write_result_cleanup(&allocator, &written);
-      for (unsigned int pass = 0; pass < 32; ++pass) {
-        ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
-        REQUIRE(!result.skipped && !result.copied_bytes);
-        if (result.reclaimed_sources)
-          break;
-        REQUIRE(pass < 31);
-      }
-      ok(ps_namespace_status_get(ns, &status, &e), &e);
-      REQUIRE(status.active_segment == 2 && !status.tail &&
-              status.bound_segments == 1 && status.pending_retirements);
-      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &held, &e), &e);
-      REQUIRE(held.capacity == PS_DEFAULT_CAPACITY &&
-              held.retired_bytes >= PS_MIB);
-      drain(pinned.body, body_bytes, 41, &e);
-      lc_pouch_state_read_result_cleanup(&allocator, &pinned);
-      ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
-      REQUIRE(!result.pending_sources && !result.reclaimed_sources &&
-              !result.copied_bytes);
-      ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &released, &e), &e);
-      REQUIRE(released.allocated_bytes + PS_MIB <= held.allocated_bytes &&
-              released.capacity == PS_DEFAULT_CAPACITY);
-      lc_pouch_maintenance_options maintenance_options = {0};
-      lc_pouch_maintenance_result maintenance_result = {0};
-      maintenance_options.ns = "tail";
-      maintenance_options.force = maintenance_options.terminal_reclaim = 1;
-      ok(lc_pouch_maintenance_run(p, &maintenance_options, &maintenance_result,
-                                  &e),
-         &e);
-      REQUIRE(!maintenance_result.cleanup_pending_count);
-      lc_pouch_maintenance_result_cleanup(&allocator, &maintenance_result);
-      in = source(17, 57);
-      ok(put(p, "tail", "after", &in, NULL, &written, &e), &e);
-      lc_pouch_state_write_result_cleanup(&allocator, &written);
-      ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns,
-                                            &e),
-         &e);
-      p->storage.ops->namespace_close(p->storage.context, ns);
-      one_file(directory);
-      lc_pouch_close(p);
-      REQUIRE(live == 1);
-      ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
-      ok(lc_pouch_state_read_metadata(p, "tail", key, &metadata, &e), &e);
-      REQUIRE(!metadata.found);
-      lc_pouch_state_read_result_cleanup(&allocator, &metadata);
-      read_value(p, "tail", "after", 17, 57, 1, &e);
-      lc_pouch_close(p);
-      REQUIRE(live == 1 && !unlink(path));
-      printf("partial tail codec%d sync%d: %llu physical bytes released\n",
-             crypto, sync,
-             (unsigned long long)(held.allocated_bytes -
-                                  released.allocated_bytes));
-    }
+  ps_pouch_state_options o = options(crypto, sync);
+  o.logical.segment_target_bytes = 8 * PS_MIB;
+  lc_pouch *p = NULL;
+  lc_pouch_state_write_options write_options = {0};
+  lc_pouch_state_write_result written = {0};
+  lc_pouch_state_read_result pinned = {0}, metadata = {0};
+  ps_pouch_compaction_result result = {0};
+  ps_namespace_status status;
+  ps_stats held, released;
+  void *ns = NULL;
+  input in = source(body_bytes, 41);
+  write_options.disable_compression = 1;
+  ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+  ok(put(p, "tail", key, &in, &write_options, &written, &e), &e);
+  REQUIRE(in.offset == body_bytes && in.calls > 1);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(p->storage.ops->namespace_open(p->storage.context, "tail", 0, &ns, &e),
+     &e);
+  ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns, &e),
+     &e);
+  ok(lc_pouch_state_read(p, "tail", key, &pinned, &e), &e);
+  maintenance_fill(p, &e);
+  ok(lc_pouch_state_delete(p, "tail", key, NULL, &written, &e), &e);
+  REQUIRE(written.version == 2);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  for (unsigned int pass = 0; pass < 32; ++pass) {
+    ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
+    REQUIRE(!result.skipped && !result.copied_bytes);
+    if (result.reclaimed_sources)
+      break;
+    REQUIRE(pass < 31);
+  }
+  ok(ps_namespace_status_get(ns, &status, &e), &e);
+  REQUIRE(status.active_segment == 2 && !status.tail &&
+          status.bound_segments == 1 && status.pending_retirements);
+  ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &held, &e), &e);
+  REQUIRE(held.capacity == PS_DEFAULT_CAPACITY && held.retired_bytes >= PS_MIB);
+  drain(pinned.body, body_bytes, 41, &e);
+  lc_pouch_state_read_result_cleanup(&allocator, &pinned);
+  ok(ps_pouch_state_compact(p, "tail", &result, &e), &e);
+  REQUIRE(!result.pending_sources && !result.reclaimed_sources &&
+          !result.copied_bytes);
+  ok(ps_status(ps_root_space(ps_pouch_state_root(p)), &released, &e), &e);
+  REQUIRE(released.allocated_bytes + PS_MIB <= held.allocated_bytes &&
+          released.capacity == PS_DEFAULT_CAPACITY);
+  lc_pouch_maintenance_options maintenance_options = {0};
+  lc_pouch_maintenance_result maintenance_result = {0};
+  maintenance_options.ns = "tail";
+  maintenance_options.force = maintenance_options.terminal_reclaim = 1;
+  ok(lc_pouch_maintenance_run(p, &maintenance_options, &maintenance_result, &e),
+     &e);
+  REQUIRE(!maintenance_result.cleanup_pending_count);
+  lc_pouch_maintenance_result_cleanup(&allocator, &maintenance_result);
+  in = source(17, 57);
+  ok(put(p, "tail", "after", &in, NULL, &written, &e), &e);
+  lc_pouch_state_write_result_cleanup(&allocator, &written);
+  ok(lc_pouch_state_with_namespace_lock(p, "tail", checkpoint_locked, ns, &e),
+     &e);
+  p->storage.ops->namespace_close(p->storage.context, ns);
+  one_file(directory);
+  lc_pouch_close(p);
+  REQUIRE(live == 1);
+  ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+  ok(lc_pouch_state_read_metadata(p, "tail", key, &metadata, &e), &e);
+  REQUIRE(!metadata.found);
+  lc_pouch_state_read_result_cleanup(&allocator, &metadata);
+  read_value(p, "tail", "after", 17, 57, 1, &e);
+  lc_pouch_close(p);
+  REQUIRE(live == 1 && !unlink(path));
+  printf("partial tail codec%d sync%d: %llu physical bytes released\n", crypto,
+         sync,
+         (unsigned long long)(held.allocated_bytes - released.allocated_bytes));
   lc_free_with_allocator(&allocator, key);
   REQUIRE(!live);
   lc_error_cleanup(&e);
@@ -7477,6 +7465,7 @@ static void shared_state_crash(const char *path) {
 }
 typedef struct run {
   const char *path, *directory, *mode;
+  int codec, profile;
 } run;
 static void *worker(void *context) {
   run *r = context;
@@ -7550,7 +7539,7 @@ static void *worker(void *context) {
   else if (!strcmp(r->mode, "sequence-recovery"))
     sequence_recovery(r->path, r->directory);
   else if (!strcmp(r->mode, "lifetimes"))
-    lifetimes(r->path, r->directory);
+    lifetimes(r->path, r->directory, r->profile, r->codec);
   else if (!strcmp(r->mode, "lifetime-faults"))
     lifetime_faults(r->path);
   else if (!strcmp(r->mode, "staging")) {
@@ -7580,7 +7569,7 @@ static void *worker(void *context) {
     maintenance_checkpoint_batch(r->path, 0);
     maintenance_checkpoint_batch(r->path, 1);
   } else if (!strcmp(r->mode, "maintenance-tail"))
-    maintenance_partial_tail(r->path, r->directory);
+    maintenance_partial_tail(r->path, r->directory, r->codec, r->profile);
   else if (!strcmp(r->mode, "maintenance-abandoned"))
     maintenance_abandoned(r->path, r->directory);
   else if (!strcmp(r->mode, "maintenance-faults"))
@@ -7606,10 +7595,10 @@ int main(int argc, char **argv) {
   char directory[1200], template_path[1200], path[1300], prefix[1100];
   pthread_t thread;
   lc_error e;
-  run r;
+  run r = {0};
   if (argc == 4 && !strcmp(argv[1], "--shared-state-child"))
     shared_state_child(argv[2], atoi(argv[3]));
-  REQUIRE(argc == 3 || argc == 6);
+  REQUIRE(argc == 3 || argc == 5 || argc == 6);
   executable_path = argv[0];
   REQUIRE(snprintf(prefix, sizeof(prefix), "%s/pouch-runtime-", argv[1]) <
           (int)sizeof(prefix));
@@ -7623,6 +7612,16 @@ int main(int argc, char **argv) {
   r.path = path;
   r.directory = directory;
   r.mode = argv[2];
+  if (!strcmp(r.mode, "lifetimes") || !strcmp(r.mode, "maintenance-tail")) {
+    REQUIRE(argc == 5 && strlen(argv[3]) == 1 && argv[3][0] >= '0' &&
+            argv[3][0] <= '3' && strlen(argv[4]) == 1 && argv[4][0] >= '0' &&
+            argv[4][0] <= '1');
+    r.codec = argv[3][0] - '0';
+    r.profile = argv[4][0] - '0';
+    if (!strcmp(r.mode, "maintenance-tail"))
+      REQUIRE(r.codec == 0 || r.codec == 3);
+  } else if (strcmp(r.mode, "staging-crash-matrix"))
+    REQUIRE(argc == 3);
   for (size_t i = 0; i < sizeof(mutation_metadata); ++i)
     mutation_metadata[i] = byte_at(i, 37);
   lc_error_init(&e);

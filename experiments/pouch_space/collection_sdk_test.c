@@ -2220,12 +2220,14 @@ int main(int argc, char **argv) {
   char path[1024], directory[1024];
   lc_error e;
   REQUIRE(
-      argc == 2 ||
-      (argc == 3 &&
-       (!strcmp(argv[2], "live") || !strcmp(argv[2], "root-conversion"))) ||
-      (argc == 3 && !strcmp(argv[2], "root-conversion-growth")) ||
+      (argc == 3 && (!strcmp(argv[2], "root-conversion-growth") ||
+                     !strcmp(argv[2], "reclamation") ||
+                     !strcmp(argv[2], "checkpoint-corruption"))) ||
+      (argc == 4 && !strcmp(argv[2], "concurrency") && strlen(argv[3]) == 1 &&
+       argv[3][0] >= '0' && argv[3][0] <= '1') ||
       (argc == 5 &&
-       (!strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
+       (!strcmp(argv[2], "sdk") || !strcmp(argv[2], "root-conversion") ||
+        !strcmp(argv[2], "io") || !strcmp(argv[2], "allocation") ||
         !strcmp(argv[2], "shared-catalog") ||
         !strcmp(argv[2], "shared-orphans") ||
         !strcmp(argv[2], "shared-append") ||
@@ -2248,18 +2250,32 @@ int main(int argc, char **argv) {
   REQUIRE(lc_test_tmp_mkdtemp(path, directory, sizeof(directory), argv[1]));
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&key, &e), &e);
-  if (argc == 3 && !strcmp(argv[2], "root-conversion")) {
-    root_conversion_cases(directory);
-  } else if (argc == 3 && !strcmp(argv[2], "root-conversion-growth")) {
-    root_conversion_growth(directory);
+  if (argc == 3) {
+    if (!strcmp(argv[2], "root-conversion-growth"))
+      root_conversion_growth(directory);
+    else if (!strcmp(argv[2], "reclamation"))
+      reclamation(directory);
+    else
+      checkpoint_corruption(directory);
+  } else if (argc == 4) {
+    concurrency(directory, argv[3][0] - '0');
   } else if (argc == 8) {
     diagnostic = 1;
     (void)io_trial(directory, atoi(argv[3]), atoi(argv[4]), atoi(argv[5]),
                    atoi(argv[6]), (size_t)strtoul(argv[7], NULL, 10));
-  } else if (argc == 5) {
+  } else {
     int codec = atoi(argv[3]), sync = atoi(argv[4]);
     REQUIRE(codec >= 0 && codec < 4 && sync >= 0 && sync < 2);
-    if (!strcmp(argv[2], "shared-catalog")) {
+    if (!strcmp(argv[2], "sdk")) {
+      lifecycle(directory, codec, sync);
+      process_recovery(directory, codec, sync);
+      edit_recovery(directory, codec, sync);
+      conversion_plan(directory, codec, sync);
+      conversion_roundtrip(directory, codec, sync);
+      writer_handoff(directory, codec, sync);
+    } else if (!strcmp(argv[2], "root-conversion")) {
+      root_conversion_cases(directory, codec, sync);
+    } else if (!strcmp(argv[2], "shared-catalog")) {
       shared_catalog_mode = 1;
       shared_catalog(directory, codec, sync);
     } else if (!strcmp(argv[2], "shared-orphans")) {
@@ -2345,23 +2361,6 @@ int main(int argc, char **argv) {
       allocation_failures(directory, codec, sync);
     else
       io_failures(directory, codec, sync);
-  } else {
-    for (int codec = 0; codec < 4; ++codec)
-      for (int sync = 0; sync < 2; ++sync) {
-        lifecycle(directory, codec, sync);
-        if (argc != 3)
-          process_recovery(directory, codec, sync);
-        edit_recovery(directory, codec, sync);
-        conversion_plan(directory, codec, sync);
-        conversion_roundtrip(directory, codec, sync);
-      }
-    for (int sync = 0; sync < 2; ++sync) {
-      concurrency(directory, sync);
-      for (int codec = 0; codec < 4; ++codec)
-        writer_handoff(directory, codec, sync);
-    }
-    reclamation(directory);
-    checkpoint_corruption(directory);
   }
   lc_pouch_crypto_key_string_free(key);
   lc_error_cleanup(&e);

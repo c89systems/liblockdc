@@ -8127,7 +8127,7 @@ static int run_portable_case(const char *mode) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2 && argc != 3)
+  if (argc != 2 && argc != 3 && argc != 5)
     return 2;
   lc_error_init(&error);
   if (argc == 3 &&
@@ -8140,6 +8140,26 @@ int main(int argc, char **argv) {
                  (long)getpid()) > 0);
   CHECK(snprintf(other, sizeof(other), "%s/space-other-%ld", argv[1],
                  (long)getpid()) > 0);
+  if (argc == 5) {
+#ifdef __linux__
+    if (strlen(argv[3]) != 1 || argv[3][0] < '0' || argv[3][0] > '1' ||
+        strlen(argv[4]) != 1 || argv[4][0] < '0' || argv[4][0] > '1')
+      return 2;
+    int durable = argv[3][0] - '0', profile = argv[4][0] - '0';
+    if (!strcmp(argv[2], "checkpoint-faults"))
+      checkpoint_faults(durable, profile);
+    else if (!strcmp(argv[2], "grant-budget-faults"))
+      canonical_stream_preparation_faults(profile, 1, durable);
+    else
+      return 2;
+    lc_error_cleanup(&error);
+    printf("pouch-space %s %d %d: %zu observable checks passed\n", argv[2],
+           durable, profile, checks);
+    return 0;
+#else
+    return 2;
+#endif
+  }
   if (argc == 3) {
     if (run_portable_case(argv[2])) {
 #ifdef __linux__
@@ -8224,10 +8244,6 @@ int main(int argc, char **argv) {
         checkpoint_namespace(durable, 1);
         checkpoint_retirement(durable);
       }
-    } else if (strcmp(argv[2], "checkpoint-faults") == 0) {
-      for (int durable = 0; durable < 2; ++durable)
-        for (int heap = 0; heap < 2; ++heap)
-          checkpoint_faults(durable, heap);
     } else if (strcmp(argv[2], "checkpoint-large-group") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         checkpoint_large_group(durable);
@@ -8278,10 +8294,6 @@ int main(int argc, char **argv) {
         for (int fragmented = 0; fragmented < 2; ++fragmented)
           grant_budget_capacity(durable, fragmented, 0);
       grant_budget_concurrency();
-    } else if (strcmp(argv[2], "grant-budget-faults") == 0) {
-      for (int zero = 0; zero < 2; ++zero)
-        for (int durable = 0; durable < 2; ++durable)
-          canonical_stream_preparation_faults(zero, 1, durable);
     } else if (strcmp(argv[2], "budget") == 0) {
       budget_lifecycle(0);
       budget_lifecycle(1);
@@ -8366,10 +8378,6 @@ int main(int argc, char **argv) {
       canonical_stream_faults();
       canonical_stream_reused_grants();
       canonical_stream_concurrency();
-      canonical_stream_open_faults(0);
-      canonical_stream_open_faults(1);
-      canonical_stream_abort_faults(0);
-      canonical_stream_abort_faults(1);
       canonical_stream_private_grant(0);
       canonical_stream_private_grant(1);
       canonical_stream_private_capacity();
@@ -8377,11 +8385,18 @@ int main(int argc, char **argv) {
       canonical_stream_checkpoint_faults();
       canonical_stream_capacity();
       canonical_stream_fragmentation();
+    } else if (strcmp(argv[2], "stream-open-abort-faults") == 0) {
+      canonical_stream_open_faults(0);
+      canonical_stream_open_faults(1);
+      canonical_stream_abort_faults(0);
+      canonical_stream_abort_faults(1);
+    } else if (strcmp(argv[2], "stream-preparation") == 0) {
       canonical_stream_grown_tail(0);
       canonical_stream_grown_tail(1);
       canonical_stream_prepared_pool(0);
       canonical_stream_prepared_pool(1);
       canonical_stream_prepared_pool(2);
+    } else if (strcmp(argv[2], "stream-preparation-faults") == 0) {
       canonical_stream_preparation_faults(0, 0, 1);
       canonical_stream_preparation_faults(1, 0, 1);
     } else {

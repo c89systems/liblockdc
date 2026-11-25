@@ -167,42 +167,40 @@ static void root_check(fixture *f, size_t bytes, int policy,
      &f->error);
   REQUIRE(!found);
 }
-static void root_conversion_cases(const char *directory) {
+static void root_conversion_cases(const char *directory, int codec, int sync) {
   int original_query_mode = query_mode;
   query_mode = 1;
-  for (int codec = 0; codec < 4; ++codec)
-    for (int sync = 0; sync < 2; ++sync)
-      for (int compact = 0; compact < 2; ++compact) {
-        fixture f;
-        char etags[3][65];
-        root_seed(&f, directory, codec, sync, 262161, compact, NULL, etags);
-        close_store(&f);
-        f.settings.compression = codec & 2 ? "none" : "zlib";
-        open_client(&f, 0);
-        REQUIRE(!root_artifacts(&f, 0) && !root_artifacts(&f, 1));
-        root_check(&f, 262161, !(codec & 2), etags);
-        REQUIRE(append(f.collection, "after-root", 4097, &f.error).position ==
-                3);
-        reopen(&f);
-        read_entry(f.collection, 3, 4097, &f.error);
-        close_store(&f);
-        f.settings.set_mask &= ~LC_POUCH_SETTING_COMPRESSION;
-        open_client(&f, 0);
-        root_check(&f, 262161, !(codec & 2), etags);
-        close_store(&f);
-        f.settings.set_mask |= LC_POUCH_SETTING_COMPRESSION;
-        f.settings.compression = codec & 2 ? "zlib" : "none";
-        open_client(&f, 0);
-        REQUIRE(!root_artifacts(&f, 0) && !root_artifacts(&f, 1));
-        root_check(&f, 262161, !!(codec & 2), etags);
-        root_build_indexes(&f);
-        close_store(&f);
-        lc_error_cleanup(&f.error);
-        REQUIRE(!unlink(f.path));
-      }
+  for (int compact = 0; compact < 2; ++compact) {
+    fixture f;
+    char etags[3][65];
+    root_seed(&f, directory, codec, sync, 262161, compact, NULL, etags);
+    close_store(&f);
+    f.settings.compression = codec & 2 ? "none" : "zlib";
+    open_client(&f, 0);
+    REQUIRE(!root_artifacts(&f, 0) && !root_artifacts(&f, 1));
+    root_check(&f, 262161, !(codec & 2), etags);
+    REQUIRE(append(f.collection, "after-root", 4097, &f.error).position == 3);
+    reopen(&f);
+    read_entry(f.collection, 3, 4097, &f.error);
+    close_store(&f);
+    f.settings.set_mask &= ~LC_POUCH_SETTING_COMPRESSION;
+    open_client(&f, 0);
+    root_check(&f, 262161, !(codec & 2), etags);
+    close_store(&f);
+    f.settings.set_mask |= LC_POUCH_SETTING_COMPRESSION;
+    f.settings.compression = codec & 2 ? "zlib" : "none";
+    open_client(&f, 0);
+    REQUIRE(!root_artifacts(&f, 0) && !root_artifacts(&f, 1));
+    root_check(&f, 262161, !!(codec & 2), etags);
+    root_build_indexes(&f);
+    close_store(&f);
+    lc_error_cleanup(&f.error);
+    REQUIRE(!unlink(f.path));
+  }
   query_mode = original_query_mode;
-  printf(
-      "root codec conversion profiles=16 with reverse and inherited reopen\n");
+  printf("root conversion codec=%d durable=%d profiles=2 with reverse and "
+         "inherited reopen\n",
+         codec, sync);
 }
 typedef struct root_cut {
   disk_model *disk;
