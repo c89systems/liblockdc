@@ -1094,8 +1094,9 @@ static void queue_enqueue_crash(const char *path) {
   lc_error_init(&e);
   REQUIRE(snprintf(image_path, sizeof(image_path), "%s-image", path) <
           (int)sizeof(image_path));
-  for (int variant = 0; variant < 4; ++variant) {
-    int shared = variant / 2, fail_sync = variant % 2, status;
+  for (int variant = 0; variant < 8; ++variant) {
+    int shared = (variant / 2) % 2, fail_sync = variant % 2, status;
+    int acknowledge = variant >= 4;
     scope_image image = {0};
     ps_io io = {&image, io_read, io_write, scope_image_sync, io_reserve, NULL};
     image.fd = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
@@ -1114,10 +1115,33 @@ static void queue_enqueue_crash(const char *path) {
       ok(lc_enqueue(client, &req, input, &result, &e), &e);
       lc_source_close(input);
       lc_enqueue_res_cleanup(&result);
+      req.queue = "test";
+      if (acknowledge) {
+        lc_dequeue_req delivery = {0};
+        lc_message *message = NULL;
+        ok(lc_source_from_memory(body, sizeof(body) - 1, &input, &e), &e);
+        ok(lc_enqueue(client, &req, input, &result, &e), &e);
+        lc_source_close(input);
+        lc_enqueue_res_cleanup(&result);
+        delivery.queue = req.queue;
+        delivery.owner = "reader";
+        delivery.visibility_timeout_seconds = 120;
+        ok(lc_dequeue(client, &delivery, &message, &e), &e);
+        REQUIRE(message);
+        uint64_t synced = scope_syncs(pouch, &e);
+        image.fail_sync = fail_sync;
+        int rc = lc_message_ack(message, &e);
+        if (fail_sync)
+          REQUIRE(rc == LC_ERR_TRANSPORT);
+        else {
+          ok(rc, &e);
+          REQUIRE(scope_syncs(pouch, &e) == synced + 1);
+        }
+        _exit(0);
+      }
       uint64_t synced = scope_syncs(pouch, &e);
       uint32_t notice = lc_pouch_queue_watch_observe(pouch);
       image.fail_sync = fail_sync;
-      req.queue = "test";
       ok(lc_source_from_memory(body, sizeof(body) - 1, &input, &e), &e);
       int rc = lc_enqueue(client, &req, input, &result, &e);
       if (fail_sync) {
@@ -1138,8 +1162,16 @@ static void queue_enqueue_crash(const char *path) {
     lc_message *message = NULL;
     req.queue = "test";
     req.owner = "reader";
+    if (acknowledge) {
+      lc_queue_stats_req stats = {0};
+      lc_queue_stats_res depth = {0};
+      stats.queue = req.queue;
+      ok(lc_queue_stats(client, &stats, &depth, &e), &e);
+      REQUIRE(depth.pending_candidates == fail_sync && !depth.available);
+      lc_queue_stats_res_cleanup(&depth);
+    }
     ok(lc_dequeue(client, &req, &message, &e), &e);
-    REQUIRE((message != NULL) == !fail_sync);
+    REQUIRE((message != NULL) == (!acknowledge && !fail_sync));
     if (message) {
       lc_source *payload = message->payload_reader(message);
       char copy[sizeof(body)];

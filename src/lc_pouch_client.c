@@ -15268,6 +15268,13 @@ int lc_pouch_client_queue_stats_method(lc_client *self,
   return rc;
 }
 
+static int lc_pouch_queue_scoped(lc_client_handle *client, const char *txn_id) {
+  lc_pouch *pouch = client->pouch;
+  return pouch->storage.coordinated_namespaces ||
+         (pouch->storage.ops && pouch->durable_sync &&
+          !lc_pouch_txn_id_present(txn_id));
+}
+
 /* A terminal decision and a new transactional queue change must share the
  * same XID authority. The namespace scope then covers validation, publication
  * and cleanup of every record touched by a delivery or its completion. */
@@ -15277,9 +15284,10 @@ static int lc_pouch_queue_shared_scope(lc_client_handle *client, const char *ns,
                                        void *context, lc_error *error) {
   lc_pouch_txn_guard guard = {0};
   lc_pouch_txn_record record = {0};
+  int transactional = lc_pouch_txn_id_present(txn_id);
   int rc = LC_OK;
   guard.fd = -1;
-  if (lc_pouch_txn_id_present(txn_id)) {
+  if (transactional) {
     rc = lc_pouch_client_validate_optional_txn_id(txn_id, error);
     if (rc == LC_OK)
       rc = lc_pouch_txn_guard_lock(client->pouch, txn_id, 0, &guard, error);
@@ -15291,9 +15299,15 @@ static int lc_pouch_queue_shared_scope(lc_client_handle *client, const char *ns,
                         "pouch");
     lc_pouch_txn_record_cleanup(&record);
   }
-  if (rc == LC_OK)
-    rc = lc_pouch_state_with_namespace_lock(client->pouch, ns, operation,
-                                            context, error);
+  if (rc == LC_OK) {
+    /* A standalone delivery or completion keeps namespace authority through
+     * its one durable prefix. Transaction participants retain their own
+     * decision and completion barriers. */
+    rc = transactional ? lc_pouch_state_with_namespace_lock(
+                             client->pouch, ns, operation, context, error)
+                       : lc_pouch_state_with_namespace_durable_batch(
+                             client->pouch, ns, operation, context, error);
+  }
   lc_pouch_txn_guard_release(&guard);
   return rc;
 }
@@ -15315,7 +15329,7 @@ static int lc_pouch_queue_complete(lc_client *self,
   context.request = request;
   context.result = result;
   if (client && result && message && message->ns && message->ns[0] &&
-      client->pouch->storage.coordinated_namespaces)
+      lc_pouch_queue_scoped(client, message->txn_id))
     return lc_pouch_queue_shared_scope(client, message->ns, message->txn_id,
                                        operation, &context, error);
   return operation(&context, error);
@@ -16174,7 +16188,7 @@ static int lc_pouch_client_dequeue(lc_client *self, const lc_dequeue_req *req,
   delivery.out = out;
   delivery.with_state = with_state;
   do {
-    if (client->pouch->storage.coordinated_namespaces)
+    if (lc_pouch_queue_scoped(client, req->txn_id))
       rc = lc_pouch_queue_shared_scope(
           client, ns, req->txn_id, lc_pouch_queue_deliver, &delivery, error);
     else
@@ -16719,7 +16733,7 @@ int lc_pouch_client_dequeue_batch_method(lc_client *self,
   const char *ns = NULL;
   struct timespec deadline;
   int has_deadline, rc;
-  if (!client || !req || !out || !client->pouch->storage.coordinated_namespaces)
+  if (!client || !req || !out || !lc_pouch_queue_scoped(client, req->txn_id))
     return lc_pouch_client_dequeue_batch(self, req, out, error);
   memset(out, 0, sizeof(*out));
   rc = lc_pouch_client_public_namespace(client, req->ns, &ns, error);
