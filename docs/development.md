@@ -213,8 +213,8 @@ of the clean-slate release pipeline.
 
 ### Hosted native tests
 
-Run **Native correctness** from GitHub Actions and select the source ref. The
-workflow must be present on the default branch before GitHub can dispatch it.
+Pushing `experiment/pouch-space` runs **Native correctness** in GitHub Actions.
+Manual dispatch becomes available once the workflow reaches the default branch.
 
 | Runner | Architecture | Test filesystem |
 | --- | --- | --- |

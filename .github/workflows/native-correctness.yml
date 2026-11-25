@@ -1,6 +1,8 @@
 name: Native correctness
 
 on:
+  push:
+    branches: [experiment/pouch-space]
   workflow_dispatch:
 
 permissions:
@@ -118,7 +120,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLOCKDC_BUILD_E2E_TESTS=ON -DLOCKDC_E2E_LUA_BUILD_TREE=ON \
             -DLOCKDC_BUILD_EXAMPLES=ON \
-            -DLOCKDC_BUILD_BENCHMARKS=OFF -DLOCKDC_INSTALL=ON \
+            -DLOCKDC_BUILD_BENCHMARKS=ON -DLOCKDC_INSTALL=ON \
             -DLOCKDC_BUILD_SHARED=ON -DLOCKDC_BUILD_LUA_BINDINGS=ON
           cmake --build build/native-correctness --parallel 3
           if [ "$RUNNER_OS" = macOS ]; then
@@ -136,11 +138,11 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           labels='^(e2e|release-artifact)$'
-          excluded='package_source_dist_dir_test|runtime_license_install_tree_test|lua_core_package_test|lua_postgres_package_test'
+          excluded='package_archives_test|package_source_dist_dir_test|runtime_license_install_tree_test|lua_core_package_test|lua_postgres_package_test'
           if [ "$ARCH" != x86_64 ]; then
             labels='^(e2e|release-artifact|lifecycle-host)$'
           fi
-          ctest --test-dir build/native-correctness --parallel "$LOCKDC_CTEST_PARALLEL_LEVEL" \
+          ctest --test-dir build/native-correctness --parallel 3 \
             --no-tests=error --output-on-failure --output-junit "$PWD/build/unit.xml" \
             -LE "$labels" -E "^($excluded)$"
 

@@ -48,7 +48,8 @@ jobs:
         run: |
           test "$(uname -m)" = arm64
           brew list --versions bash >/dev/null || brew install bash
-          export PATH="$(brew --prefix bash)/bin:$PATH"
+          brew list --versions llvm >/dev/null || brew install llvm
+          export PATH="$(brew --prefix bash)/bin:$(brew --prefix llvm)/bin:$PATH"
           bash scripts/deps.sh deps-arm64-apple-darwin-native
           cmake --preset arm64-apple-darwin-native
           cmake --build build/arm64-apple-darwin-native --parallel 3 --target pouch_space_smoke
