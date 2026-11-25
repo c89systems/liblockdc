@@ -78,6 +78,12 @@ Namespace routing selects the sole append head. Dense NoSync predecessors can
 remain unsealed. Repacking a closed source records its final tail before removing
 grants. Unlinking an old segment requires its durable route and checkpoint coverage.
 
+Queue watchers on a shared root observe a sequence before reading queue
+statistics, then wait for the sequence to change. Publishers advance it and
+wake waiters through the mapped readiness page. Each wake prompts a fresh
+queue scan. The timed rescan also observes changes when a publisher exits
+before notifying or a visibility timeout expires.
+
 ## Verification and performance
 
 Test observable behavior through the production Pouch and lockd paths. Linux

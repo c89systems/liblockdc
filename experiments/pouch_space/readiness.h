@@ -87,6 +87,11 @@ int ps_readiness_durability_covers(ps_space *, uint64_t wire, uint64_t ticket);
 uint32_t ps_readiness_sync_observe(ps_space *);
 int ps_readiness_sync_wait(ps_space *, uint32_t observed);
 void ps_readiness_sync_wake(ps_space *);
+/* A shared root change prompts a queue rescan. The observed sequence must
+ * precede the scan so a publication between scan and wait cannot be missed. */
+uint32_t ps_readiness_queue_observe(ps_space *);
+int ps_readiness_queue_wait(ps_space *, uint32_t observed, uint64_t timeout_ms);
+void ps_readiness_queue_wake(ps_space *);
 /* Prepared pages are durably zeroed free payload capacity. The allocator
  * checks proofs under allocation authority and revokes them before spending
  * pages. A capacity reservation can retain the proof while bytes stay free. */

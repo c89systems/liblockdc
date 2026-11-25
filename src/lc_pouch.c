@@ -2157,13 +2157,20 @@ int lc_pouch_fsync_commit(lc_pouch *pouch, int fd, lc_error *error) {
 
 static int lc_pouch_queue_file_watch_wait(lc_pouch *, const char *,
                                           const char *, uint64_t);
+uint32_t lc_pouch_queue_watch_observe(lc_pouch *pouch) {
+  if (pouch && pouch->queue_watch_enabled && pouch->storage.ops &&
+      pouch->storage.ops->queue_observe)
+    return pouch->storage.ops->queue_observe(pouch->storage.context);
+  return 0;
+}
 int lc_pouch_queue_watch_wait(lc_pouch *pouch, const char *ns,
-                              const char *queue, uint64_t timeout_ms) {
+                              const char *queue, uint32_t observed,
+                              uint64_t timeout_ms) {
   if (pouch && pouch->storage.ops) {
     if (!pouch->queue_watch_enabled || !pouch->storage.ops->queue_wait)
       return -1;
     return pouch->storage.ops->queue_wait(pouch->storage.context, ns, queue,
-                                          timeout_ms);
+                                          observed, timeout_ms);
   }
   return lc_pouch_queue_file_watch_wait(pouch, ns, queue, timeout_ms);
 }

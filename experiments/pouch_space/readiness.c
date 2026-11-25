@@ -316,27 +316,26 @@ int ps_readiness_preview(ps_space *s, ps_readiness_certificate *out) {
 static uint32_t *sync_word(ps_space *s) {
   return (uint32_t *)(s->readiness->page + SYNC_WORD);
 }
-uint32_t ps_readiness_sync_observe(ps_space *s) {
-  return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
+/* The second half of the existing sync slot is live advisory state. Keep
+ * the durability word and the bitmap boundaries at their original offsets. */
+static uint32_t *queue_word(ps_space *s) {
+  return sync_word(s) + 1;
 }
-int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
-  /* Owner death releases the OFD lock without changing the wake word. */
-  int rc;
+static int wait_for_change(uint32_t *word, uint32_t observed, uint64_t ns) {
 #ifdef __APPLE__
-  rc = os_sync_wait_on_address_with_timeout(
-      sync_word(s), observed, sizeof(uint32_t), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
-      OS_CLOCK_MACH_ABSOLUTE_TIME, 4000000U);
+  return os_sync_wait_on_address_with_timeout(
+      word, observed, sizeof(*word), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+      OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
 #else
   /* The legacy syscall uses the kernel layout even when libc's timespec
    * uses 64-bit seconds on a 32-bit target. */
-  const struct __kernel_old_timespec retry = {0, 4000000L};
-  rc = (int)syscall(SYS_futex, sync_word(s), FUTEX_WAIT, observed, &retry, NULL,
-                    0);
+  struct __kernel_old_timespec retry;
+  retry.tv_sec = (long)(ns / 1000000000U);
+  retry.tv_nsec = (long)(ns % 1000000000U);
+  return (int)syscall(SYS_futex, word, FUTEX_WAIT, observed, &retry, NULL, 0);
 #endif
-  return rc >= 0 || errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
 }
-void ps_readiness_sync_wake(ps_space *s) {
-  uint32_t *word = sync_word(s);
+static void signal_change(uint32_t *word) {
   (void)__atomic_add_fetch(word, 1, __ATOMIC_RELEASE);
 #ifdef __APPLE__
   (void)os_sync_wake_by_address_all(word, sizeof(*word),
@@ -345,6 +344,32 @@ void ps_readiness_sync_wake(ps_space *s) {
   (void)syscall(SYS_futex, word, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
 #endif
 }
+uint32_t ps_readiness_sync_observe(ps_space *s) {
+  return __atomic_load_n(sync_word(s), __ATOMIC_ACQUIRE);
+}
+int ps_readiness_sync_wait(ps_space *s, uint32_t observed) {
+  /* Owner death releases the OFD lock without changing the wake word. */
+  int rc = wait_for_change(sync_word(s), observed, 4000000U);
+  return rc >= 0 || errno == EAGAIN || errno == EINTR || errno == ETIMEDOUT;
+}
+void ps_readiness_sync_wake(ps_space *s) { signal_change(sync_word(s)); }
+uint32_t ps_readiness_queue_observe(ps_space *s) {
+  return s->readiness ? __atomic_load_n(queue_word(s), __ATOMIC_ACQUIRE) : 0;
+}
+int ps_readiness_queue_wait(ps_space *s, uint32_t observed, uint64_t timeout_ms) {
+  int rc;
+  if (ps_readiness_queue_observe(s) != observed)
+    return 1;
+  if (!timeout_ms)
+    return 0;
+  if (timeout_ms > (uint64_t)INT_MAX)
+    timeout_ms = INT_MAX;
+  rc = wait_for_change(queue_word(s), observed, timeout_ms * 1000000U);
+  if (rc >= 0 || errno == EAGAIN)
+    return ps_readiness_queue_observe(s) != observed;
+  return errno == ETIMEDOUT || errno == EINTR ? 0 : -1;
+}
+void ps_readiness_queue_wake(ps_space *s) { signal_change(queue_word(s)); }
 static int identity(ps_space *s, const uint64_t *record, lc_error *e) {
   return memcmp(record + IDENTITY, s->identity, 16)
              ? failed(s, e, "shared readiness belongs to another container")
@@ -467,6 +492,7 @@ int ps_readiness_opened(ps_space *s, lc_error *e) {
     __atomic_store_n(s->readiness->page + PREPARATION_WORD, 0,
                      __ATOMIC_RELEASE);
     __atomic_store_n(sync_word(s), 0, __ATOMIC_RELEASE);
+    __atomic_store_n(queue_word(s), 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + ACTIVITY_WORD, 0, __ATOMIC_RELEASE);
     __atomic_store_n(s->readiness->page + PENDING_WORD,
                      s->reused_open_barrier ? REUSED_OPEN_BARRIER_BIT : 0,

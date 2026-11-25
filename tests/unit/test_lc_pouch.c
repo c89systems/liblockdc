@@ -6277,7 +6277,7 @@ static void test_pouch_disk_runtime_controls(void **state) {
                                     pouch_write_queue_notification, &write),
                      0);
     assert_int_equal(
-        lc_pouch_queue_watch_wait(writer, "default", "jobs", 1000U), 1);
+        lc_pouch_queue_watch_wait(writer, "default", "jobs", 0, 1000U), 1);
     assert_int_equal(pthread_join(writer_thread, NULL), 0);
     assert_int_equal(write.rc, LC_OK);
     lc_free_with_allocator(NULL, notify_path);

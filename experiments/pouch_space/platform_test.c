@@ -253,8 +253,12 @@ static void queue_round_trip(const char *path) {
   lease_round_trip(producer, consumer);
   lc_enqueue_req_init(&enqueue);
   enqueue.queue = "jobs";
+  lc_pouch *watched = ((lc_client_handle *)consumer)->pouch;
+  uint32_t observed = lc_pouch_queue_watch_observe(watched);
   OK(lc_source_from_memory(body, sizeof(body) - 1U, &source, &error));
   OK(lc_enqueue(producer, &enqueue, source, &published, &error));
+  REQUIRE(lc_pouch_queue_watch_wait(watched, "journal", enqueue.queue,
+                                   observed, 0U) == 1);
   lc_source_close(source);
   REQUIRE(published.payload_bytes == (long)sizeof(body) - 1L);
   OK(lc_xid_new(xid, &error));
@@ -301,8 +305,9 @@ static void queue_round_trip(const char *path) {
   OK(lc_dequeue(consumer, &dequeue, &message, &error));
   REQUIRE(!message);
   lc_pouch *pouch = ((lc_client_handle *)consumer)->pouch;
+  observed = lc_pouch_queue_watch_observe(pouch);
   uint64_t before = monotonic_ns();
-  REQUIRE(lc_pouch_queue_watch_wait(pouch, "journal", "jobs", 20U) == 0 &&
+  REQUIRE(lc_pouch_queue_watch_wait(pouch, "journal", "jobs", observed, 20U) == 0 &&
           monotonic_ns() - before >= 10000000U);
   lc_client_close(consumer);
   check_capacity(path, PS_DEFAULT_CAPACITY);

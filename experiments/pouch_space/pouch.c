@@ -771,7 +771,12 @@ static int outbox_markers_open(void *context, const char *ns, int kind,
 }
 static void queue_notify(void *context, const char *ns, const char *queue) {
   ps_pouch_owner *owner = context;
+  ps_space *space = ps_root_space(owner->root);
   queue_waiter *waiter;
+  if (ps_coordination_shared(ps_space_coordination(space))) {
+    ps_readiness_queue_wake(space);
+    return;
+  }
   pthread_mutex_lock(&owner->root->mutex);
   for (waiter = owner->waiters; waiter; waiter = waiter->next)
     if (!strcmp(waiter->ns, ns) && !strcmp(waiter->queue, queue)) {
@@ -779,6 +784,10 @@ static void queue_notify(void *context, const char *ns, const char *queue) {
       pthread_cond_signal(&waiter->changed);
     }
   pthread_mutex_unlock(&owner->root->mutex);
+}
+static uint32_t queue_observe(void *context) {
+  ps_pouch_owner *owner = context;
+  return ps_readiness_queue_observe(ps_root_space(owner->root));
 }
 #ifdef __APPLE__
 static int queue_wait_until(pthread_cond_t *condition, pthread_mutex_t *mutex,
@@ -798,16 +807,20 @@ static int queue_wait_until(pthread_cond_t *condition, pthread_mutex_t *mutex,
 }
 #endif
 static int queue_wait(void *context, const char *ns, const char *queue,
-                      uint64_t timeout_ms) {
+                      uint32_t observed, uint64_t timeout_ms) {
   ps_pouch_owner *owner = context;
+  ps_space *space = ps_root_space(owner->root);
   queue_waiter waiter, **link;
 #ifndef __APPLE__
   pthread_condattr_t attributes;
 #endif
   struct timespec deadline;
   int rc;
-  if (!ns || !ns[0] || !queue || !queue[0] || check(context, NULL) != LC_OK ||
-      clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+  if (!ns || !ns[0] || !queue || !queue[0] || check(context, NULL) != LC_OK)
+    return -1;
+  if (ps_coordination_shared(ps_space_coordination(space)))
+    return ps_readiness_queue_wait(space, observed, timeout_ms);
+  if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
     return -1;
   /* The common watcher waits in 100 ms slices and rescans canonical state.
    * Notifications are advisory; admission before the next slice has the same
@@ -888,6 +901,7 @@ static const lc_pouch_storage_ops storage_ops = {check,
                                                  &maintenance_ops,
                                                  outbox_markers_open,
                                                  queue_notify,
+                                                 queue_observe,
                                                  queue_wait,
                                                  query_indexes,
                                                  &metadata_ops,
@@ -976,8 +990,13 @@ int ps_pouch_state_open(const char *path, int create,
   pouch->storage.coordinated_namespaces =
       ps_coordination_shared(ps_space_coordination(ps_root_space(owner->root)));
   if (pouch->queue_watch_enabled) {
-    pouch->queue_watch_mode = "inprocess";
-    pouch->queue_watch_reason = "container_notifications";
+    if (pouch->storage.coordinated_namespaces) {
+      pouch->queue_watch_mode = "shared";
+      pouch->queue_watch_reason = "container_shared_notifications";
+    } else {
+      pouch->queue_watch_mode = "inprocess";
+      pouch->queue_watch_reason = "container_notifications";
+    }
   }
   pouch->crypto = ps_root_crypto(owner->root);
   if (stat(path, &identity) != 0) {

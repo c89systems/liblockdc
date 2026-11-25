@@ -220,7 +220,7 @@ typedef struct outbox_notification {
 static void *outbox_notification_wait(void *context) {
   outbox_notification *wait = context;
   wait->result =
-      lc_pouch_queue_watch_wait(wait->pouch, "work/a", wait->queue, 5000U);
+      lc_pouch_queue_watch_wait(wait->pouch, "work/a", wait->queue, 0, 5000U);
   __atomic_store_n(&wait->done, 1, __ATOMIC_RELEASE);
   return NULL;
 }
@@ -241,8 +241,8 @@ static void outbox_notifications(const char *directory) {
           (int)sizeof(path));
   ok(ps_pouch_state_open(path, 1, &allocator, &options, &p, &e), &e);
   REQUIRE(!strcmp(p->queue_watch_mode, "inprocess"));
-  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", 0U) == 0);
-  REQUIRE(lc_pouch_queue_watch_wait(p, "", "queue", 0U) == -1);
+  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", 0, 0U) == 0);
+  REQUIRE(lc_pouch_queue_watch_wait(p, "", "queue", 0, 0U) == -1);
   for (size_t i = 0U; i < 3U; ++i) {
     memset(&waits[i], 0, sizeof(waits[i]));
     waits[i].pouch = p;
@@ -268,6 +268,36 @@ static void outbox_notifications(const char *directory) {
   p->storage.ops->queue_notify(p->storage.context, "work/a", "other");
   REQUIRE(!pthread_join(threads[2], NULL) && waits[2].result == 1);
   REQUIRE(!ps_pouch_queue_waiter_count(p, "work/a", "queue"));
+  lc_pouch_close(p);
+  REQUIRE(!live);
+  one_file(path);
+
+  /* A separately opened process publishes a wake word on the same inode. A
+   * wake before the caller actually sleeps must also interrupt the wait. */
+  options.logical.single_writer = 0;
+  REQUIRE(snprintf(path, sizeof(path), "%s/notifications-shared", directory) <
+          (int)sizeof(path));
+  ok(ps_pouch_state_open(path, 1, &allocator, &options, &p, &e), &e);
+  REQUIRE(!strcmp(p->queue_watch_mode, "shared"));
+  uint32_t observed = lc_pouch_queue_watch_observe(p);
+  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", observed, 0U) == 0);
+  pid_t child = fork();
+  REQUIRE(child >= 0);
+  if (!child) {
+    lc_pouch *peer = NULL;
+    ok(ps_pouch_state_open(path, 0, NULL, &options, &peer, &e), &e);
+    peer->storage.ops->queue_notify(peer->storage.context, "work/a", "queue");
+    lc_pouch_close(peer);
+    _exit(0);
+  }
+  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", observed, 5000U) == 1);
+  int status;
+  REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+          WEXITSTATUS(status) == 0);
+  REQUIRE(lc_pouch_queue_watch_observe(p) != observed);
+  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", observed, 0U) == 1);
+  observed = lc_pouch_queue_watch_observe(p);
+  REQUIRE(lc_pouch_queue_watch_wait(p, "work/a", "queue", observed, 0U) == 0);
   lc_pouch_close(p);
   REQUIRE(!live);
   one_file(path);

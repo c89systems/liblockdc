@@ -307,7 +307,8 @@ typedef struct lc_pouch_storage_ops {
   int (*outbox_markers_open)(void *, const char *, int, int,
                              struct lc_pouch_outbox_store *, lc_error *);
   void (*queue_notify)(void *, const char *, const char *);
-  int (*queue_wait)(void *, const char *, const char *, uint64_t);
+  uint32_t (*queue_observe)(void *);
+  int (*queue_wait)(void *, const char *, const char *, uint32_t, uint64_t);
   const struct lc_pouch_index_store_ops *(*query_indexes)(void *, void **);
   const lc_pouch_storage_metadata_ops *metadata;
   /* Coordinated typed owners serialize state projections and decisions per

@@ -40,8 +40,8 @@ typedef struct ps_pouch_state_options {
  * Query pages are bounded derived metadata in the container, bound to the
  * recovered order epoch and canonical rows. Old epochs remain scan fallbacks.
  * Public queue delivery, batching, paired state, transaction recovery and
- * subscription/watch calls use the common engine. In-process advisory queue
- * notifications use no sidecar. Outbox delivery, stateful checkpoints,
+ * subscription/watch calls use the common engine. Shared owners use a mapped
+ * advisory wake word to prompt a queue rescan. Outbox delivery, stateful checkpoints,
  * completion/dead-letter/replay, inbox/command receipts and terminal retention
  * use the same owners, with bounded durable in-file cleanup markers.
  * Public XA resource registration, external branch progress, managed owner

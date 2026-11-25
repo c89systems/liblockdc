@@ -16866,12 +16866,11 @@ int lc_pouch_client_subscribe_with_state_method(lc_client *self,
 }
 
 static void lc_pouch_queue_watch_poll_delay(lc_client_handle *client,
-                                            const lc_watch_queue_req *req) {
+                                            const char *ns, const char *queue,
+                                            uint32_t observed) {
   struct timespec delay;
 
-  if (client != NULL && client->pouch != NULL && req != NULL &&
-      lc_pouch_queue_watch_wait(client->pouch, req->ns, req->queue, 100U) >=
-          0) {
+  if (lc_pouch_queue_watch_wait(client->pouch, ns, queue, observed, 100U) >= 0) {
     return;
   }
 
@@ -16943,6 +16942,8 @@ static int lc_pouch_client_watch_queue_method_impl(
   rc = LC_OK;
   while (rc == LC_OK) {
     int changed;
+    lc_client_handle *client = (lc_client_handle *)self;
+    uint32_t observed = lc_pouch_queue_watch_observe(client->pouch);
 
     memset(&stats, 0, sizeof(stats));
     rc = lc_pouch_client_queue_stats_method(self, &stats_req, &stats, error);
@@ -16979,10 +16980,10 @@ static int lc_pouch_client_watch_queue_method_impl(
       last_available = stats.available;
       have_signature = 1;
     }
-    lc_queue_stats_res_cleanup(&stats);
     if (rc == LC_OK) {
-      lc_pouch_queue_watch_poll_delay((lc_client_handle *)self, req);
+      lc_pouch_queue_watch_poll_delay(client, stats.ns, req->queue, observed);
     }
+    lc_queue_stats_res_cleanup(&stats);
   }
   lc_free_local(last_head_message_id);
   return rc;

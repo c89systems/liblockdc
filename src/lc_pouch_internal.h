@@ -738,8 +738,10 @@ void lc_pouch_state_scan_summaries_result_cleanup(
 int lc_pouch_fsync_commit(lc_pouch *pouch, int fd, lc_error *error);
 int lc_pouch_fsync_batcher_init(lc_pouch *pouch, lc_error *error);
 void lc_pouch_fsync_batcher_close(lc_pouch *pouch);
+uint32_t lc_pouch_queue_watch_observe(lc_pouch *pouch);
 int lc_pouch_queue_watch_wait(lc_pouch *pouch, const char *ns,
-                              const char *queue, uint64_t timeout_ms);
+                              const char *queue, uint32_t observed,
+                              uint64_t timeout_ms);
 /** Converts a durable Pouch byte count for generic C API response fields. */
 int lc_pouch_size_to_public_long(uint64_t size, long *out, lc_error *error);
 
