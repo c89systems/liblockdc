@@ -385,14 +385,33 @@ static void index_revision_selection(const char *directory) {
     actor.generation.segmented = 1;
     actor.generation.generation = 7U;
     actor.manifest.kind = LC_POUCH_INDEX_MANIFEST;
-    ok(ps_query_index_store_ops.replace(
-           root, "query/concurrent", &actor.generation, 3U,
-           index_small_producer, (void *)"old", 0, 0, &e),
+    ps_namespace *ns = NULL;
+    ps_stats before = {0}, after = {0};
+    int hint;
+    ok(ps_root_namespace_acquire(root, "query/concurrent", 1, &ns, &e), &e);
+    ok(ps_status(ps_root_space(root), &before, &e), &e);
+    ok(ps_query_index_store_ops.prepare(root, "query/concurrent",
+                                        &actor.generation, 3U,
+                                        index_small_producer, (void *)"old", 0,
+                                        5U, &actor.build, &actor.signature, &e),
        &e);
-    ok(ps_query_index_store_ops.replace(
-           root, "query/concurrent", &actor.manifest, 5U, index_small_producer,
-           (void *)"prior", 0, 0, &e),
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.syncs == before.syncs);
+    ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &hint, &e),
        &e);
+    REQUIRE(!hint);
+    ok(ps_query_index_store_ops.publish(
+           root, actor.build, "query/concurrent", &actor.manifest, 5U,
+           index_small_producer, (void *)"prior", &e),
+       &e);
+    ps_query_index_store_ops.dispose(root, actor.build);
+    actor.build = NULL;
+    ok(ps_status(ps_root_space(root), &after, &e), &e);
+    REQUIRE(after.syncs == before.syncs + 1U);
+    ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &hint, &e),
+       &e);
+    REQUIRE(hint);
+    ps_namespace_release(ns);
     lc_pouch_index_input old_generation = {0}, old_manifest = {0};
     ok(ps_query_index_store_ops.open(root, "query/concurrent",
                                      &actor.generation, &old_generation, &e),
@@ -433,7 +452,6 @@ static void index_revision_selection(const char *directory) {
     ok(ps_checkpoint(ps_root_space(root), &e), &e);
     index_raw_expect(root, &actor.generation, "old", &e);
     index_raw_expect(root, &actor.manifest, "prior", &e);
-    ps_stats before = {0}, after = {0};
     ok(ps_status(ps_root_space(root), &before, &e), &e);
     pthread_mutex_lock(&gate.mutex);
     gate.release = 1;

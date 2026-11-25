@@ -62,6 +62,11 @@ Protected maintenance capacity funds checkpoint and completion work when
 foreground admission exhausts common space. A failed capacity admission
 preserves the previous selection.
 
+A selected namespace key checkpoint makes metadata-only work discoverable by
+maintenance. The first namespace index publication can include a maintenance
+hint in the same durability barrier as its generation, manifest, and
+completed canonical prefix.
+
 Collection order and append-ID projections use process-local memory pages
 allocated on write. Captured views retain their backing while in use.
 Recovery rebuilds these projections from canonical records. Within a live

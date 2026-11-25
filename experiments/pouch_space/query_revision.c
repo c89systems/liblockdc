@@ -314,8 +314,6 @@ static int query_prepare(void *context, const char *name,
     *build = revision;
     ns = NULL;
     key.owner = revision->ns->identity.owner;
-    rc = ps_namespace_work_ensure(revision->ns, LC_POUCH_STORAGE_WORK_ORDINARY,
-                                  0, e);
   }
   if (rc == LC_OK)
     rc = ps_budget_plan_value(&plan, bound, e);
@@ -341,7 +339,7 @@ static int query_publish(void *context, void *build, const char *name,
   query_revision *revision = build;
   ps_root *root = context;
   ps_key key;
-  int rc;
+  int rc, work_pending;
   if (!revision || strcmp(name, revision->ns->name) ||
       id->kind != LC_POUCH_INDEX_MANIFEST || bound > revision->manifest_bound)
     return failure(e, LC_ERR_INVALID, "query manifest exceeds its revision");
@@ -351,11 +349,15 @@ static int query_publish(void *context, void *build, const char *name,
   if (rc == LC_OK)
     rc = produce_value(revision->writers[1], bound, produce, producer, e);
   if (rc == LC_OK)
+    rc = ps_namespace_work_stage_ordinary(revision->ns, 0, &work_pending, e);
+  if (rc == LC_OK)
     /* A completed index flush has always stabilized its canonical snapshot,
      * including on NoSync roots. Preserve that boundary with one shared
-     * barrier for generation, manifest and the completed readiness prefix. */
-    rc = ps_revision_publish(revision->writers, 2, 1, PS_COMMIT_DEFAULT, NULL,
-                             NULL, e);
+     * barrier for generation, manifest, and any first maintenance hint. */
+    rc = ps_revision_publish(revision->writers, 2, PS_REVISION_FORCE_DURABLE,
+                             PS_COMMIT_DEFAULT, NULL, NULL, e);
+  if (rc == LC_OK && work_pending)
+    rc = ps_namespace_work_complete_ordinary(revision->ns, e);
   return rc;
 }
 static int query_acquire(void *context, const char *name, void **out,

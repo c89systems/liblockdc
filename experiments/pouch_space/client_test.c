@@ -7,6 +7,7 @@
 #include "lc_pouch_retention_record.h"
 #include "lc_pouch_txn_guard.h"
 #include "namespace.h"
+#include "namespace_work.h"
 #include "pouch.h"
 #include "pouch_internal.h"
 #include "space_internal.h"

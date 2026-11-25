@@ -570,10 +570,22 @@ static void release_prepared_source(ps_key_checkpoint *c,
     --source->prepared;
   release_source(c, source);
 }
-static ps_key control_key(ps_namespace *ns) {
+static ps_key control_key(uint64_t owner) {
   ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
-  key.owner = ns->identity.owner;
+  key.owner = owner;
   return key;
+}
+int ps_key_checkpoint_present(ps_space *space, uint64_t owner, int *present,
+                              lc_error *e) {
+  ps_reader *reader = NULL;
+  int rc = ps_read_open(space, control_key(owner), NULL, &reader, e);
+  *present = rc == LC_OK;
+  ps_reader_close(reader);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    rc = LC_OK;
+  }
+  return rc;
 }
 static int decode_control(uint64_t owner, const unsigned char *bytes,
                           uint64_t token, ps_checkpoint_info *out,
@@ -622,11 +634,10 @@ int ps_checkpoint_point(ps_space *s, uint64_t owner, uint64_t prefix,
                         int memo_only, ps_checkpoint_info *out, int *current,
                         int *private_failure, lc_error *e) {
   unsigned char bytes[CHECKPOINT_CONTROL_BYTES];
-  ps_key key = {0, 1, PS_NAMESPACE_CHECKPOINT};
+  ps_key key = control_key(owner);
   uint64_t token;
   ps_checkpoint_info decoded;
   int rc;
-  key.owner = owner;
   rc = ps_internal_fixed_value(s, key, prefix, memo_only ? NULL : bytes,
                                sizeof(bytes), out->control, &token, current,
                                private_failure, e);
@@ -2123,7 +2134,8 @@ static int write_control_values(ps_key_checkpoint *c, ps_budget *budget,
   ps_wire_put64(bytes + 40, info->state_index);
   ps_wire_put64(bytes + 48, info->query_index);
   ps_wire_put64(bytes + 120, (uint64_t)crc32(0, bytes, 120));
-  rc = ps_begin(c->ns->root->space, budget, control_key(c->ns), out, e);
+  rc = ps_begin(c->ns->root->space, budget, control_key(c->ns->identity.owner),
+                out, e);
   if (rc == LC_OK)
     rc = ps_write(*out, bytes, sizeof(bytes), e);
   return rc;

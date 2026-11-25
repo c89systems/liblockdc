@@ -1,5 +1,6 @@
 #include "namespace_work.h"
 #include "budget.h"
+#include "checkpoint.h"
 #include "lc_api_internal.h"
 #include "root_internal.h"
 #include "space_internal.h"
@@ -21,10 +22,10 @@ static void put64(unsigned char *p, uint64_t n) {
   for (i = 0U; i < 8U; ++i)
     p[i] = (unsigned char)(n >> (8U * i));
 }
-static ps_key key_for(ps_namespace *ns, enum lc_pouch_storage_work_kind kind) {
+static ps_key key_for(uint64_t owner, enum lc_pouch_storage_work_kind kind) {
   ps_key key;
   /* Namespace control slots 4..6; retention's progress owns slot 7. */
-  key.owner = ns->identity.owner;
+  key.owner = owner;
   key.key = 4U + (unsigned int)kind;
   key.kind = PS_CONTROL;
   return key;
@@ -48,7 +49,8 @@ int ps_namespace_work_get(ps_namespace *ns,
   *out = 0;
   if (rc != LC_OK)
     return rc;
-  rc = ps_read_open(ns->root->space, key_for(ns, kind), NULL, &reader, e);
+  rc = ps_read_open(ns->root->space, key_for(ns->identity.owner, kind), NULL,
+                    &reader, e);
   if (rc == LC_ERR_INVALID) {
     lc_error_cleanup(e);
     return LC_OK;
@@ -95,6 +97,17 @@ static int prepare_work_locked(ps_namespace *ns,
     }
   }
   if (rc == LC_OK && !(ns->work_present & bit)) {
+    /* The selected checkpoint already makes typed metadata discoverable.
+     * Its lifetime covers subsequent ordinary work in this namespace. */
+    if (ordinary) {
+      rc = ps_key_checkpoint_present(ns->root->space, ns->identity.owner,
+                                     &present, e);
+      if (rc != LC_OK || present) {
+        if (present)
+          ns->work_present |= bit;
+        return rc;
+      }
+    }
     memset(bytes, 0, sizeof(bytes));
     memcpy(bytes, "LCPSWORK", 8U);
     put64(bytes + 8U, ns->identity.owner);
@@ -107,7 +120,8 @@ static int prepare_work_locked(ps_namespace *ns,
         rc = ps_budget_open(ns->root->space, &plan, &budget, e);
     }
     if (rc == LC_OK)
-      rc = ps_begin(ns->root->space, budget, key_for(ns, kind), &writer, e);
+      rc = ps_begin(ns->root->space, budget, key_for(ns->identity.owner, kind),
+                    &writer, e);
     if (rc == LC_OK)
       rc = ps_write(writer, bytes, sizeof(bytes), e);
     if (rc == LC_OK) {
@@ -180,7 +194,7 @@ int ps_namespace_work_remove(ps_namespace *ns,
   if (rc == LC_OK)
     rc = ps_namespace_work_get(ns, kind, &present, e);
   if (rc == LC_OK && present)
-    rc = ps_delete(ns->root->space, key_for(ns, kind), e);
+    rc = ps_delete(ns->root->space, key_for(ns->identity.owner, kind), e);
   if (rc == LC_OK) {
     ns->work_loaded |= bit;
     ns->work_present &= ~bit;
@@ -189,7 +203,7 @@ int ps_namespace_work_remove(ps_namespace *ns,
   return rc;
 }
 typedef struct discovery {
-  ps_root *root;
+  ps_space *space;
   const lc_allocator *allocator;
   const char *after;
   enum lc_pouch_storage_work_kind kind;
@@ -198,25 +212,20 @@ typedef struct discovery {
 static int select_work(const char *name, const ps_namespace_info *info,
                        void *context, lc_error *e) {
   discovery *d = context;
-  ps_namespace *ns = NULL;
   ps_reader *hint = NULL;
   char *copy;
-  int present = 0;
-  int rc = ps_root_namespace_acquire(d->root, name, 0, &ns, e);
-  (void)info;
-  if (rc == LC_OK) {
-    /* Select the durable metadata identity without decoding its value. The
-     * selected pass validates it. A malformed hint must not hide other names
-     * behind the same discovery source or force discovery to read payloads. */
-    rc = ps_read_open(ns->root->space, key_for(ns, d->kind), NULL, &hint, e);
-    if (rc == LC_ERR_INVALID) {
-      lc_error_cleanup(e);
-      rc = LC_OK;
-    } else if (rc == LC_OK)
-      present = 1;
-  }
+  /* Discover by selected identity. The maintenance pass validates the
+   * payload, so a malformed hint cannot hide work in another namespace. */
+  int rc =
+      ps_read_open(d->space, key_for(info->owner, d->kind), NULL, &hint, e);
+  int present = rc == LC_OK;
   ps_reader_close(hint);
-  ps_namespace_release(ns);
+  if (rc == LC_ERR_INVALID) {
+    lc_error_cleanup(e);
+    rc = d->kind == LC_POUCH_STORAGE_WORK_ORDINARY
+             ? ps_key_checkpoint_present(d->space, info->owner, &present, e)
+             : LC_OK;
+  }
   if (rc != LC_OK || !present)
     return rc;
   if (!d->first || strcmp(name, d->first) < 0) {
@@ -246,7 +255,6 @@ int ps_namespace_work_next(ps_root *root, const lc_allocator *allocator,
   char *selected;
   int rc;
   memset(&d, 0, sizeof(d));
-  d.root = root;
   d.allocator = allocator;
   d.after = after;
   d.kind = kind;
@@ -257,6 +265,7 @@ int ps_namespace_work_next(ps_root *root, const lc_allocator *allocator,
   if (!root || !name || !cursor || kind < LC_POUCH_STORAGE_WORK_ORDINARY ||
       kind > LC_POUCH_STORAGE_WORK_COLLECTION)
     return failure(e, LC_ERR_INVALID, "invalid maintenance discovery request");
+  d.space = root->space;
   *name = *cursor = NULL;
   rc = ps_root_namespace_visit(root, select_work, &d, e);
   selected = d.next ? d.next : d.first;

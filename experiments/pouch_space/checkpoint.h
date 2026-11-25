@@ -33,6 +33,7 @@ size_t ps_key_checkpoint_budgets(const ps_key_checkpoint *);
 int ps_key_checkpoint_observe(ps_key_checkpoint *,
                               const ps_checkpoint_observer *, lc_error *);
 void ps_key_checkpoint_info(ps_key_checkpoint *, ps_checkpoint_info *);
+int ps_key_checkpoint_present(ps_space *, uint64_t owner, int *, lc_error *);
 /* Installs checkpoint and future-deletion admission before the producer.
  * maintenance permits mandatory completion while the standing floor is in use;
  * ordinary prefixes must preserve that floor after funding their claims.

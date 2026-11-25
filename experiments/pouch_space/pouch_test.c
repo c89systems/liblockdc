@@ -616,6 +616,72 @@ static void append_hint(const char *path) {
     }
   lc_error_cleanup(&e);
 }
+static void metadata_hint_expect(lc_pouch *p, int expected, lc_error *e) {
+  ps_root *root = ps_pouch_state_root(p);
+  char *name = NULL, *cursor = NULL;
+  ok(ps_namespace_work_next(root, &allocator, LC_POUCH_STORAGE_WORK_ORDINARY,
+                            NULL, &name, &cursor, e),
+     e);
+  if (expected)
+    REQUIRE(name && cursor && !strcmp(name, "metadata") &&
+            !strcmp(cursor, "metadata"));
+  else
+    REQUIRE(!name && !cursor);
+  lc_free_with_allocator(&allocator, name);
+  lc_free_with_allocator(&allocator, cursor);
+}
+static void metadata_hint(const char *path) {
+  lc_error e = {0};
+  for (int shared = 0; shared < 2; ++shared) {
+    ps_pouch_state_options o = shared ? shared_options(0, 0) : options(0, 0);
+    lc_pouch *p = NULL, *peer = NULL;
+    void *ns = NULL;
+    lc_pouch_state_write_options write = {0};
+    lc_pouch_state_write_result result = {0};
+    lc_pouch_state_read_result read = {0};
+    int explicit_hint;
+    const unsigned char value[] = "ordinary work";
+    ok(ps_pouch_state_open(path, 1, &allocator, &o, &p, &e), &e);
+    ok(p->storage.ops->namespace_open(p->storage.context, "metadata", 1, &ns,
+                                      &e),
+       &e);
+    metadata_hint_expect(p, 0, &e);
+    if (shared) {
+      ok(ps_pouch_state_open(path, 0, &allocator, &o, &peer, &e), &e);
+      metadata_hint_expect(peer, 0, &e);
+    }
+    uint64_t before = scope_syncs(p, &e);
+    write.has_metadata = 1;
+    write.metadata = value;
+    write.metadata_length = sizeof(value) - 1;
+    ok(lc_pouch_state_update_metadata(p, "metadata", "key", &write, &result,
+                                      &e),
+       &e);
+    lc_pouch_state_write_result_cleanup(&allocator, &result);
+    REQUIRE(scope_syncs(p, &e) == before);
+    ok(ps_namespace_work_get(ns, LC_POUCH_STORAGE_WORK_ORDINARY, &explicit_hint,
+                             &e),
+       &e);
+    REQUIRE(!explicit_hint);
+    metadata_hint_expect(p, 1, &e);
+    if (peer)
+      metadata_hint_expect(peer, 1, &e);
+    ok(lc_pouch_state_sync_namespace(p, "metadata", &e), &e);
+    if (peer)
+      lc_pouch_close(peer);
+    p->storage.ops->namespace_close(p->storage.context, ns);
+    lc_pouch_close(p);
+    ok(ps_pouch_state_open(path, 0, &allocator, &o, &p, &e), &e);
+    metadata_hint_expect(p, 1, &e);
+    ok(lc_pouch_state_read_metadata(p, "metadata", "key", &read, &e), &e);
+    REQUIRE(read.found && read.metadata_length == sizeof(value) - 1 &&
+            !memcmp(read.metadata, value, read.metadata_length));
+    lc_pouch_state_read_result_cleanup(&allocator, &read);
+    lc_pouch_close(p);
+    REQUIRE(!live && !unlink(path));
+  }
+  lc_error_cleanup(&e);
+}
 static void scope_put(lc_pouch *p, const char *ns, unsigned char seed,
                       lc_error *e) {
   input in = source(17, seed);
@@ -7365,6 +7431,8 @@ static void *worker(void *context) {
     io_faults(r->path);
   else if (!strcmp(r->mode, "append-hint"))
     append_hint(r->path);
+  else if (!strcmp(r->mode, "metadata-hint"))
+    metadata_hint(r->path);
   else if (!strcmp(r->mode, "crypto-init"))
     crypto_initialization(r->path);
   else if (!strcmp(r->mode, "durable-scope"))
