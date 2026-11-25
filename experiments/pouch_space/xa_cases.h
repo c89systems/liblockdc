@@ -314,16 +314,6 @@ static void xa_verify(lc_client *client, int action, int completed,
 }
 /* Allocation cuts test ownership/retry. Successful sync is immediate in this
  * profile; separate stable-image and exec-death profiles prove persistence. */
-static int xa_selected(const char *name, int value, int maximum) {
-  const char *text = getenv(name);
-  char *end;
-  if (!text)
-    return 1;
-  errno = 0;
-  long selected = strtol(text, &end, 10);
-  REQUIRE(text[0] && !errno && !*end && selected >= 0 && selected <= maximum);
-  return selected == value;
-}
 static size_t xa_trial(const char *directory, int action, int sync, int kind,
                        int persist, size_t cut) {
   lc_error e;
@@ -405,8 +395,8 @@ static void xa_faults(const char *directory, int kind) {
   for (int sync = 0; sync < 2; ++sync)
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 11; ++action) {
-        if (!xa_selected("POUCH_XA_ACTION", action, 10) ||
-            !xa_selected("POUCH_XA_SYNC", sync, 1))
+        if (!fixture_selected("POUCH_XA_ACTION", action, 10) ||
+            !fixture_selected("POUCH_XA_SYNC", sync, 1))
           continue;
         ++cases;
         size_t sites = xa_trial(directory, action, sync, kind, persist, 0U);

@@ -87,10 +87,12 @@ static void xa_crashes(const char *directory) {
     for (int managed = 0; managed < 2; ++managed)
       for (size_t ordinal = 0; ordinal < (managed ? 4U : 5U); ++ordinal) {
         int action = actions[managed][ordinal];
-        if (!xa_selected("POUCH_XA_CRASH_PROFILE", 2 * sync + managed, 3))
+        if (!fixture_selected("POUCH_XA_CRASH_PROFILE", 2 * sync + managed,
+                              3) ||
+            !fixture_selected("POUCH_XA_CRASH_ORDINAL", (int)ordinal, 4))
           continue;
         if (getenv("POUCH_XA_ACTION") &&
-            (managed || !xa_selected("POUCH_XA_ACTION", action, 10)))
+            (managed || !fixture_selected("POUCH_XA_ACTION", action, 10)))
           continue;
         size_t sites = 0U;
         for (size_t stop = 0U; stop <= sites; ++stop)
@@ -176,6 +178,7 @@ static void xa_crashes(const char *directory) {
   free(seed->bytes);
   free(seed);
   lc_error_cleanup(&e);
+  REQUIRE(deaths);
   printf("XA process deaths=%zu passed\n", deaths);
 }
 #endif

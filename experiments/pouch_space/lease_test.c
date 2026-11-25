@@ -45,17 +45,18 @@ static int report_failed_authority;
       abort();                                                                 \
     }                                                                          \
   } while (0)
-static void ok(int rc, lc_error *e) {
+static void expect_ok(int rc, lc_error *e, const char *file, int line) {
   if (rc == LC_ERR_PENDING && report_failed_authority)
     fprintf(
         stderr, "last unavailable authority at byte %llu\n",
         (unsigned long long)(uintptr_t)pthread_getspecific(failed_authority));
   if (rc != LC_OK)
-    fprintf(stderr, "lease %d: %s (%s)\n", rc,
+    fprintf(stderr, "%s:%d: lease %d: %s (%s)\n", file, line, rc,
             e && e->message ? e->message : "?",
             e && e->detail ? e->detail : "?");
   REQUIRE(rc == LC_OK);
 }
+#define ok(rc, e) expect_ok((rc), (e), __FILE__, __LINE__)
 static int trace_authority(void *context, int fd, int command,
                            struct flock *lock) {
   int rc = fcntl(fd, command, lock);

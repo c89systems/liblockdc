@@ -258,10 +258,14 @@ static size_t xa_managed_trial(const char *directory, int action, int sync,
 }
 static void xa_managed_faults(const char *directory, int kind) {
   size_t cuts = 0U;
+  size_t cases = 0U;
   fixture_directory_sync_model(kind != 0);
-  for (int sync = 0; sync < 2; ++sync)
+  for (int sync = 0; sync < 2; ++sync) {
+    if (!fixture_selected("POUCH_XA_SYNC", sync, 1))
+      continue;
     for (int persist = 0; persist < (kind == 1 ? 3 : 1); ++persist)
       for (int action = 0; action < 8; ++action) {
+        ++cases;
         size_t sites =
             xa_managed_trial(directory, action, sync, kind, persist, 0U);
         fprintf(stderr,
@@ -273,7 +277,9 @@ static void xa_managed_faults(const char *directory, int kind) {
             ++cuts;
           }
       }
+  }
   fixture_directory_sync_model(0);
+  REQUIRE(cases);
   printf("XA managed %s cuts=%zu passed\n",
          kind == 0   ? "durability"
          : kind == 1 ? "I/O"

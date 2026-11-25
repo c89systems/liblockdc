@@ -1373,6 +1373,16 @@ static void retention_action_expect(lc_pouch *p, int action, lc_error *e) {
   retention_expect(p, "work/a", action != 4, phase,
                    action == 2 ? "new/\n%" : "old", fencing, version, e);
 }
+static int fixture_selected(const char *name, int value, int maximum) {
+  const char *text = getenv(name);
+  char *end;
+  if (!text)
+    return 1;
+  errno = 0;
+  long selected = strtol(text, &end, 10);
+  REQUIRE(text[0] && !errno && !*end && selected >= 0 && selected <= maximum);
+  return selected == value;
+}
 static void retention_allocation_faults(const char *directory) {
   char prefix[1400], pattern[1500], trial[1500], path[1600];
   size_t total = 0;
@@ -1382,7 +1392,10 @@ static void retention_allocation_faults(const char *directory) {
           (int)sizeof(prefix));
   fixture_barriers_model(1);
   for (int native = 0; native < 2; ++native)
-    for (int sync = 0; sync < 2; ++sync)
+    for (int sync = 0; sync < 2; ++sync) {
+      if (!fixture_selected("POUCH_RETENTION_FAULT_PROFILE", 2 * native + sync,
+                            3))
+        continue;
       for (int cold = 0; cold < 2; ++cold)
         for (int action = 0; action < 9; ++action)
           for (int no_error = 0; no_error < 2; ++no_error) {
@@ -1447,9 +1460,10 @@ static void retention_allocation_faults(const char *directory) {
               lc_test_tmp_cleanup_path(trial, prefix);
             }
           }
+    }
   fixture_barriers_model(0);
-  printf("retention controls: %lu warm/cold allocation cuts, both "
-         "owners/policies, "
+  REQUIRE(total);
+  printf("retention controls: %lu warm/cold allocation cuts, "
          "same-owner and close/reopen retry\n",
          (unsigned long)total);
   lc_error_cleanup(&e);
