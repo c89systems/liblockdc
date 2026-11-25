@@ -1,5 +1,22 @@
 #ifndef POUCH_SPACE_INDEX_COMPARE_H
 #define POUCH_SPACE_INDEX_COMPARE_H
+static int index_pressure_retry(worker *w, int rc, double *deadline,
+                                lc_error *e) {
+  const struct timespec delay = {0, 1000000L};
+  double current;
+  if (rc != LC_ERR_PENDING || !w->run->reclaim)
+    return 0;
+  current = now(CLOCK_MONOTONIC);
+  if (!*deadline)
+    *deadline = current + 5.0;
+  if (current >= *deadline)
+    return 0;
+  lc_error_cleanup(e);
+  lc_error_init(e);
+  (void)nanosleep(&delay, NULL);
+  return 1;
+}
+
 static int index_one(worker *w, size_t row, producer *source, consumer *sink,
                      lc_error *e) {
   lc_acquire_req request;
@@ -18,18 +35,38 @@ static int index_one(worker *w, size_t row, producer *source, consumer *sink,
   request.owner = "index-benchmark";
   request.ttl_seconds = 3600L;
   options.content_type = "application/json";
-  int rc = lc_acquire(producer, &request, &lease, e);
-  if (rc == LC_OK)
-    rc = lc_lease_update(lease, &source->source, &options, e);
+  double retry_until = 0;
+  int rc;
+  /* Reclaim can temporarily deny foreground authority. Retry the individual
+   * operation, preserving the lease and any progress through the payload. */
+  do {
+    rc = lc_acquire(producer, &request, &lease, e);
+  } while (index_pressure_retry(w, rc, &retry_until, e));
   if (rc == LC_OK) {
-    rc = lc_lease_release(lease, &release, e);
+    retry_until = 0;
+    do {
+      rc = lc_lease_update(lease, &source->source, &options, e);
+    } while (!source->offset && index_pressure_retry(w, rc, &retry_until, e));
+  }
+  if (rc == LC_OK) {
+    retry_until = 0;
+    do {
+      rc = lc_lease_release(lease, &release, e);
+    } while (index_pressure_retry(w, rc, &retry_until, e));
     if (rc == LC_OK)
       lease = NULL;
   }
   lc_lease_close(lease);
-  if (rc == LC_OK)
+  if (rc == LC_OK) {
+    retry_until = 0;
     rc = lc_get_in_namespace(w->run->client, w->ns, key, NULL, &sink->sink,
                              &result, e);
+    while (!sink->offset && index_pressure_retry(w, rc, &retry_until, e)) {
+      lc_get_res_cleanup(&result);
+      rc = lc_get_in_namespace(w->run->client, w->ns, key, NULL, &sink->sink,
+                               &result, e);
+    }
+  }
   lc_get_res_cleanup(&result);
   return rc;
 }
@@ -78,22 +115,6 @@ static void index_phase_end(index_phase *phase) {
   phase->seconds += now(CLOCK_MONOTONIC) - phase->started_seconds;
   phase->cpu_seconds += now(CLOCK_THREAD_CPUTIME_ID) - phase->started_cpu;
   require(!pthread_setspecific(sync_phase_key, NULL), "finish index phase");
-}
-static int index_pressure_retry(worker *w, int rc, double *deadline,
-                                lc_error *e) {
-  const struct timespec delay = {0, 1000000L};
-  double current;
-  if (rc != LC_ERR_PENDING || !w->run->reclaim)
-    return 0;
-  current = now(CLOCK_MONOTONIC);
-  if (!*deadline)
-    *deadline = current + 5.0;
-  if (current >= *deadline)
-    return 0;
-  lc_error_cleanup(e);
-  lc_error_init(e);
-  (void)nanosleep(&delay, NULL);
-  return 1;
 }
 static int index_queries(worker *w, lc_client *client, int flush, lc_error *e) {
   static const char *const selectors[] = {
