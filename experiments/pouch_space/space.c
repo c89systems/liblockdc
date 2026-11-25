@@ -3818,7 +3818,7 @@ static size_t checkpoint_prepare_free(ps_space *s,
   return count;
 }
 static int checkpoint_body(ps_space *s, metadata_builder *builder,
-                           int force_dense, lc_error *error) {
+                           int force_dense, int cleanup, lc_error *error) {
   unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
   ps_meta_page *page, *next_page;
@@ -3834,6 +3834,8 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   ps_directory_pages changes;
   size_t i, zero_count = 0;
   int next = 1 - s->root, rc, removed, dense = 0;
+  int select_on_retire = cleanup && s->generation && !s->journal_image &&
+                         !ps_coordination_shared(s->coordination);
   if (s->generation == LC_U64_MAX)
     return err(error, LC_ERR_INVALID,
                "container checkpoint generation exhausted");
@@ -3900,7 +3902,7 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   }
   if (rc == LC_OK)
     zero_count = checkpoint_prepare_free(s, zero_ranges);
-  if (rc == LC_OK)
+  if (rc == LC_OK && !select_on_retire)
     rc = sync_file(s, error); /* payloads, journal and new metadata pages */
   memset(root, 0, sizeof(root));
   ps_wire_put64(root, ROOT_MAGIC);
@@ -3911,7 +3913,9 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   ps_wire_put64(root + 40, new_root.generation);
   ps_wire_put64(root + 48, s->token_limit);
   memcpy(root + 56, s->identity, 16);
-  ps_wire_put32(root + 72, PS_ROOT_LAYOUT);
+  ps_wire_put32(root + ROOT_LAYOUT_OFFSET,
+                PS_ROOT_LAYOUT |
+                    (select_on_retire ? ROOT_LAYOUT_RETIRE_SELECT : 0));
   ps_wire_put32(root + ROOT_JOURNAL_COVERED, (uint32_t)covered);
   ps_wire_put64(root + ROOT_JOURNAL_START, journal_start);
   ps_wire_put32(root + ROOT_CHECKSUM, checksum(root, ROOT_CHECKSUM));
@@ -3921,19 +3925,27 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
   }
   if (rc == LC_OK)
     rc = sync_file(s, error);
+  /* With retirement-based selection, the predecessor and its full journal
+   * stay intact through the barrier that persists the successor's pages and
+   * selector. Once that barrier succeeds, the predecessor can be retired. */
   if (rc == LC_OK && covered)
     ps_readiness_begin(s, PS_READINESS_CHECKPOINT_RETIRE);
   if (rc == LC_OK)
     rc = transfer(s, zero, sizeof(zero), (uint64_t)s->root * PS_PAGE, 1, error);
   /* The new selector is durable. Retire the prefix at the existing
    * checkpoint barrier even when the exclusive journal reuses its start. */
-  if (rc == LC_OK && s->journal)
+  if (rc == LC_OK && s->journal && !select_on_retire)
     rc = clear_checkpoint_journal(s, s->journal_start, s->journal_image,
                                   s->journal, error);
   if (rc == LC_OK) {
     prepared = ps_readiness_issued_tickets(s);
-    rc = sync_file(s, error); /* obsolete root and covered journal retired */
+    rc = sync_file(s, error); /* obsolete root retired before reuse */
   }
+  /* After retirement, all old frames have sequence numbers below the new
+   * journal's first frame. Clearing them prepares live journal reuse. Cold
+   * open also sanitizes this suffix if the clear was lost. */
+  if (rc == LC_OK && s->journal && select_on_retire)
+    rc = clear_checkpoint_journal(s, s->journal_start, NULL, s->journal, error);
   if (rc != LC_OK) {
     if (rc == LC_ERR_PROTOCOL)
       __atomic_store_n(&s->poisoned, 1, __ATOMIC_RELAXED);
@@ -4041,7 +4053,8 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
                               1);
   return rc;
 }
-static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
+static int checkpoint_select(ps_space *s, int force_dense, int cleanup,
+                             lc_error *error) {
   metadata_builder builder = {0};
   ps_coordination_guard *guard = NULL;
   int rc = allocation_begin(s, &guard, error);
@@ -4049,7 +4062,7 @@ static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
     rc = allocation_refresh(s, error);
   if (rc == LC_OK) {
     builder.space = s;
-    rc = checkpoint_body(s, &builder, force_dense, error);
+    rc = checkpoint_body(s, &builder, force_dense, cleanup, error);
   }
   lc_free_with_allocator(NULL, builder.bindings);
   lc_free_with_allocator(NULL, builder.wire);
@@ -4058,7 +4071,7 @@ static int checkpoint_select(ps_space *s, int force_dense, lc_error *error) {
   return allocation_end(s, guard, rc, error);
 }
 static int checkpoint_locked(ps_space *s, lc_error *error) {
-  return checkpoint_select(s, 0, error);
+  return checkpoint_select(s, 0, 0, error);
 }
 static uint64_t retirement_shortfall(ps_space *s, const ps_entry *p,
                                      uint64_t missing, int foreign,
@@ -4511,6 +4524,7 @@ static int root_valid(const unsigned char *p) {
   uint64_t offset = ps_wire_get64(p + 32), generation = ps_wire_get64(p + 40);
   uint64_t journal_start = ps_wire_get64(p + ROOT_JOURNAL_START);
   uint32_t covered = ps_wire_get32(p + ROOT_JOURNAL_COVERED);
+  uint32_t layout = ps_wire_get32(p + ROOT_LAYOUT_OFFSET);
   return ps_wire_get64(p) == ROOT_MAGIC && ps_wire_get64(p + 8) &&
          capacity >= PS_MIB && capacity <= PS_MAX_CAPACITY &&
          capacity % PS_MIB == 0 &&
@@ -4521,7 +4535,9 @@ static int root_valid(const unsigned char *p) {
            generation <= ps_wire_get64(p + 8))) &&
          ps_wire_get64(p + 48) && ps_wire_get64(p + 48) <= PS_MAX_INCARNATION &&
          ps_wire_get64(p + 48) % TOKEN_RANGE == 0 &&
-         ps_wire_get32(p + 72) == PS_ROOT_LAYOUT &&
+         (layout == PS_ROOT_LAYOUT ||
+          (layout == (PS_ROOT_LAYOUT | ROOT_LAYOUT_RETIRE_SELECT) &&
+           !covered)) &&
          journal_start <= LC_U64_MAX - PS_JOURNAL && covered <= PS_JOURNAL &&
          covered <= journal_start &&
          checksum(p, ROOT_CHECKSUM) == ps_wire_get32(p + ROOT_CHECKSUM);
@@ -6340,6 +6356,15 @@ restart:
   if (a && b && !root_follows(root, roots[1 - s->root])) {
     rc = err(error, LC_ERR_PROTOCOL, "conflicting container roots");
     goto done;
+  }
+  /* An exclusive cleanup may have written the selector before its pages
+   * persisted. The predecessor and its journal remain authoritative while
+   * its selector survives. No writer may reuse either image before retiring
+   * that selector behind a second barrier. */
+  if (a && b &&
+      (ps_wire_get32(root + ROOT_LAYOUT_OFFSET) & ROOT_LAYOUT_RETIRE_SELECT)) {
+    s->root = 1 - s->root;
+    root = roots[s->root];
   }
   projection_select(s, root, s->root);
   rc = decode_token_limit(s, roots[0] + PS_TOKEN_RECORD_OFFSET,
@@ -9262,7 +9287,7 @@ static int checkpoint(ps_space *s, int cleanup, lc_error *error) {
          (s->journal ||
           __atomic_load_n(&s->pending_sequence, __ATOMIC_ACQUIRE) !=
               __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE))))
-      rc = checkpoint_locked(s, error);
+      rc = checkpoint_select(s, 0, cleanup, error);
     else {
       rc = pins_reclaim_current(s, error);
       if (rc == LC_OK)
@@ -9287,7 +9312,7 @@ int ps_metadata_repack(ps_space *s, lc_error *error) {
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK)
-    rc = checkpoint_select(s, 1, error);
+    rc = checkpoint_select(s, 1, 0, error);
   pthread_mutex_unlock(&s->mutex);
   return rc;
 }

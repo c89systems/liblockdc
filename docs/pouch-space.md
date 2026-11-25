@@ -68,6 +68,12 @@ Protected maintenance capacity funds checkpoint and completion work when
 foreground admission exhausts common space. A failed capacity admission
 preserves the previous selection.
 
+Exclusive cleanup syncs the replacement checkpoint pages and selector
+together. While the preceding selector is valid, recovery uses it and its
+intact journal. A second sync retires that selector before its pages can be
+reused. The live owner clears the old journal before reuse. Recovery discards
+those older frames if their clear was lost.
+
 A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance
 hint in the same durability barrier as its generation, manifest, and

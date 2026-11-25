@@ -172,6 +172,92 @@ static void checkpoint_idempotence(int durable) {
   OK(ps_close(space, &error));
   clean();
 }
+static void checkpoint_retire_select(int durable, int shared) {
+  enum { COMPLETE, SELECTOR_ONLY, KEEP_PRIOR, TORN_PRIOR, LOST_SELECTED };
+  for (int cut = COMPLETE; cut <= LOST_SELECTED; ++cut) {
+    model m;
+    ps_io io = model_init(&m);
+    ps_options options = {0};
+    ps_stats before, after;
+    clean();
+    ps_space *s = create(PS_MIB, durable, &io);
+    put(s, state(1), "prior", 5, 1);
+    put(s, state(2), "deleted", 7, 1);
+    /* Also exercise interrupted exchanges between two retirement-selected
+     * headers, in addition to exchanges from the original layout. */
+    if (durable)
+      OK(ps_checkpoint_cleanup(s, &error));
+    else
+      OK(ps_checkpoint(s, &error));
+    size_t prior = fixture_get64(m.stable) == ROOT_MAGIC ? 0 : PS_PAGE;
+    size_t next = PS_PAGE - prior;
+    put(s, state(1), "current", 7, 1);
+    OK(ps_delete(s, state(2), &error));
+    OK(ps_flush(s, &error));
+    OK(ps_status(s, &before, &error));
+    CHECK(before.journal_bytes > 0);
+    size_t syncs = m.syncs;
+    if (cut == SELECTOR_ONLY)
+      m.fail_sync_at = syncs + 1;
+    if (cut == KEEP_PRIOR || cut == TORN_PRIOR)
+      m.fail_sync_at = syncs + 2;
+    if (m.fail_sync_at) {
+      CHECK(ps_checkpoint_cleanup(s, &error) == LC_ERR_TRANSPORT);
+      lc_error_cleanup(&error);
+      CHECK(m.syncs == m.fail_sync_at);
+    } else {
+      OK(ps_checkpoint_cleanup(s, &error));
+      CHECK(m.syncs == syncs + 2);
+      CHECK(fixture_get64(m.stable + prior) == 0);
+      CHECK(fixture_get64(m.stable + JOURNAL_OFFSET) != 0);
+    }
+    m.fail_sync_at = 0;
+    if (cut == SELECTOR_ONLY) {
+      /* The selector landed first, without the pages it points to. */
+      int fd = open(path, O_RDONLY);
+      CHECK(fd >= 0);
+      CHECK(pread(fd, m.stable + next, PS_ROOT_BYTES, (off_t)next) ==
+            PS_ROOT_BYTES);
+      CHECK(close(fd) == 0);
+    } else if (cut == TORN_PRIOR) {
+      /* The first barrier completed. Loss of the prior header can now
+       * select the successor, even if none of the old journal was cleared. */
+      memset(m.stable + prior, 0, PS_ROOT_BYTES / 2);
+    } else if (cut == LOST_SELECTED) {
+      /* A finished checkpoint cannot recover an obsolete root after reuse. */
+      memset(m.stable + next, 0, PS_ROOT_BYTES);
+    }
+    OK(ps_close(s, &error));
+    crash(&m);
+    options.io = &io;
+    options.durable_sync = durable;
+    options.shared = shared;
+    s = NULL;
+    if (cut == LOST_SELECTED) {
+      CHECK(ps_open(path, 0, &options, &s, &error) == LC_ERR_PROTOCOL && !s);
+      lc_error_cleanup(&error);
+    } else {
+      OK(ps_open(path, 0, &options, &s, &error));
+      OK(ps_status(s, &after, &error));
+      CHECK(after.journal_bytes == (cut == SELECTOR_ONLY || cut == KEEP_PRIOR
+                                        ? before.journal_bytes
+                                        : 0));
+      expect(s, state(1), NULL, "current", 7);
+      absent(s, state(2));
+      put(s, state(3), "later", 5, 1);
+      OK(ps_checkpoint(s, &error));
+      OK(ps_close(s, &error));
+      crash(&m);
+      OK(ps_open(path, 0, &options, &s, &error));
+      expect(s, state(1), NULL, "current", 7);
+      absent(s, state(2));
+      expect(s, state(3), NULL, "later", 5);
+      OK(ps_close(s, &error));
+    }
+    free(m.stable);
+  }
+  clean();
+}
 
 typedef struct checkpoint_walk {
   const char *leaf;
