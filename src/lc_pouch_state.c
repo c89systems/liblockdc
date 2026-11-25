@@ -19359,12 +19359,11 @@ void lc_pouch_state_scan_summaries_result_cleanup(
   memset(result, 0, sizeof(*result));
 }
 
-int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
-                                  const char *start_after, size_t limit,
-                                  lc_pouch_state_scan_summary_visit_fn visitor,
-                                  void *context,
-                                  lc_pouch_state_scan_summaries_result *out,
-                                  lc_error *error) {
+int lc_pouch_state_scan_summaries_prefix(
+    lc_pouch *pouch, const char *ns, const char *prefix,
+    const char *start_after, size_t limit,
+    lc_pouch_state_scan_summary_visit_fn visitor, void *context,
+    lc_pouch_state_scan_summaries_result *out, lc_error *error) {
   lc_pouch_namespace_manifest manifest;
   lc_pouch_namespace_logstore *cache;
   lc_pouch_state_cache_record *record;
@@ -19372,6 +19371,7 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
   size_t snapshot_count;
   size_t snapshot_capacity;
   size_t index;
+  size_t prefix_length = prefix ? strlen(prefix) : 0U;
   lc_pouch_state_cache_guard cache_guard;
   int rc;
 
@@ -19395,10 +19395,17 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
     return rc;
   }
   rc = lc_pouch_state_manifest_view(pouch, ns, &manifest, &cache, error);
-  record =
-      rc == LC_OK ? lc_pouch_state_order_bound(cache, start_after, 1) : NULL;
+  record = NULL;
+  if (rc == LC_OK) {
+    if (prefix && (!start_after || strcmp(start_after, prefix) < 0))
+      record = lc_pouch_state_order_bound(cache, prefix, 0);
+    else
+      record = lc_pouch_state_order_bound(cache, start_after, 1);
+  }
   for (; rc == LC_OK && record && snapshot_count < limit;
        record = lc_pouch_state_order_next(record)) {
+    if (prefix && strncmp(record->key, prefix, prefix_length))
+      break;
     if (!record->found) {
       continue;
     }
@@ -19409,7 +19416,7 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
   if (rc == LC_OK && snapshot_count > 0U) {
     while (record && !record->found)
       record = lc_pouch_state_order_next(record);
-    if (record) {
+    if (record && (!prefix || !strncmp(record->key, prefix, prefix_length))) {
       out->truncated = 1;
       out->next_start_after = lc_strdup_with_allocator(
           &pouch->allocator, snapshots[snapshot_count - 1U].key);
@@ -19468,6 +19475,16 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
     lc_log_error(pouch->logger, "scan.summaries.error", fields, 4U);
   }
   return rc;
+}
+
+int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
+                                  const char *start_after, size_t limit,
+                                  lc_pouch_state_scan_summary_visit_fn visitor,
+                                  void *context,
+                                  lc_pouch_state_scan_summaries_result *out,
+                                  lc_error *error) {
+  return lc_pouch_state_scan_summaries_prefix(
+      pouch, ns, NULL, start_after, limit, visitor, context, out, error);
 }
 
 static int lc_pouch_state_visit_internal(lc_pouch *pouch, const char *ns,

@@ -506,6 +506,12 @@ int lc_pouch_client_query_keys_method(lc_client *self, const lc_query_req *req,
                                       const lc_query_key_handler *handler,
                                       void *context, lc_query_res *out,
                                       lc_error *error);
+int lc_pouch_client_query_keys_canonical(lc_client_handle *client,
+                                         const lc_query_req *req,
+                                         const char *prefix,
+                                         const lc_query_key_handler *handler,
+                                         void *context, lc_query_res *out,
+                                         lc_error *error);
 int lc_pouch_client_get_namespace_config_method(
     lc_client *self, const lc_namespace_config_req *req,
     lc_namespace_config_res *out, lc_error *error);

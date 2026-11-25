@@ -649,6 +649,7 @@ typedef struct lc_pouch_query_scan_context {
   /* Request-owned scratch, reused across candidates and released on return. */
   unsigned char *stream_buffer;
   const char *start_after_key;
+  const char *key_prefix;
   const char *candidate_key;
   char *last_emitted_key;
   size_t seen;
@@ -4908,7 +4909,7 @@ static int lc_pouch_query_run_scan_predicate(lc_pouch_query_scan_context *scan,
        * key-index candidate shortcut below depends on indexing being enabled.
        */
       scan->scan_scalar_plan = &plan;
-      if (scan->client->pouch->query_indexing_enabled &&
+      if (!scan->key_prefix && scan->client->pouch->query_indexing_enabled &&
           !scan->emit_documents) {
         lc_pouch_generation flushed_seq;
 
@@ -4930,9 +4931,9 @@ static int lc_pouch_query_run_scan_predicate(lc_pouch_query_scan_context *scan,
   page_limit = lc_pouch_query_scan_summary_page_limit(scan->limit);
   while (rc == LC_OK && !scan->page_full) {
     memset(&page, 0, sizeof(page));
-    rc = lc_pouch_state_scan_summaries(
-        scan->client->pouch, scan->ns, start_after, page_limit,
-        lc_pouch_query_scan_summary_visit, scan, &page, error);
+    rc = lc_pouch_state_scan_summaries_prefix(
+        scan->client->pouch, scan->ns, scan->key_prefix, start_after,
+        page_limit, lc_pouch_query_scan_summary_visit, scan, &page, error);
     if (rc == LC_POUCH_STATE_READ_MANY_STOP) {
       rc = LC_OK;
       scan->page_full = 1;
@@ -17183,11 +17184,10 @@ int lc_pouch_client_query_method(lc_client *self, const lc_query_req *req,
   return rc;
 }
 
-static int
-lc_pouch_client_query_keys_method_impl(lc_client *self, const lc_query_req *req,
-                                       const lc_query_key_handler *handler,
-                                       void *context, lc_query_res *out,
-                                       lc_error *error) {
+static int lc_pouch_client_query_keys_method_impl(
+    lc_client *self, const lc_query_req *req,
+    const lc_query_key_handler *handler, void *context, lc_query_res *out,
+    const char *canonical_prefix, lc_error *error) {
   lc_client_handle *client;
   lc_pouch_query_scan_context scan;
   lql *runtime;
@@ -17233,8 +17233,11 @@ lc_pouch_client_query_keys_method_impl(lc_client *self, const lc_query_req *req,
     return rc;
   }
   owned_engine = NULL;
-  rc = lc_pouch_client_query_engine(client, ns, req->engine, &effective_engine,
-                                    &owned_engine, error);
+  if (canonical_prefix)
+    effective_engine = "scan";
+  else
+    rc = lc_pouch_client_query_engine(client, ns, req->engine,
+                                      &effective_engine, &owned_engine, error);
   if (rc != LC_OK) {
     return rc;
   }
@@ -17265,6 +17268,7 @@ lc_pouch_client_query_keys_method_impl(lc_client *self, const lc_query_req *req,
   scan.limit = lc_pouch_query_effective_limit(req->limit);
   scan.handler = handler;
   scan.handler_context = context;
+  scan.key_prefix = canonical_prefix;
   scan.track_index_seq = use_index_summary || use_index_predicate;
   rc = lc_pouch_query_parse_cursor(req->cursor, &scan.start_after_key, error);
   if (rc != LC_OK) {
@@ -17391,25 +17395,44 @@ lc_pouch_client_query_keys_method_impl(lc_client *self, const lc_query_req *req,
   return rc;
 }
 
-int lc_pouch_client_query_keys_method(lc_client *self, const lc_query_req *req,
+static int lc_pouch_client_query_keys(lc_client *self, const lc_query_req *req,
                                       const lc_query_key_handler *handler,
                                       void *context, lc_query_res *out,
+                                      const char *canonical_prefix,
                                       lc_error *error) {
   lc_client_handle *client;
   int rc;
 
   if (self == NULL || req == NULL || handler == NULL || out == NULL) {
     return lc_pouch_client_query_keys_method_impl(self, req, handler, context,
-                                                  out, error);
+                                                  out, canonical_prefix, error);
   }
   /* Key handlers can close Pouch clients. Pin the concrete owner before any
    * scan can invoke one and release it after all scan state has unwound. */
   client = (lc_client_handle *)self;
   lc_client_handle_retain(client);
   rc = lc_pouch_client_query_keys_method_impl(self, req, handler, context, out,
-                                              error);
+                                              canonical_prefix, error);
   lc_client_handle_release(client);
   return rc;
+}
+
+int lc_pouch_client_query_keys_method(lc_client *self, const lc_query_req *req,
+                                      const lc_query_key_handler *handler,
+                                      void *context, lc_query_res *out,
+                                      lc_error *error) {
+  return lc_pouch_client_query_keys(self, req, handler, context, out, NULL,
+                                    error);
+}
+
+int lc_pouch_client_query_keys_canonical(lc_client_handle *client,
+                                         const lc_query_req *req,
+                                         const char *prefix,
+                                         const lc_query_key_handler *handler,
+                                         void *context, lc_query_res *out,
+                                         lc_error *error) {
+  return lc_pouch_client_query_keys(&client->pub, req, handler, context, out,
+                                    prefix, error);
 }
 
 int lc_pouch_client_get_namespace_config_method(

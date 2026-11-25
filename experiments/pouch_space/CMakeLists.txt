@@ -660,6 +660,22 @@ if(LOCKDC_BUILD_TESTS)
       target_link_options(pouch_space_${surface}_sdk_test PRIVATE "LINKER:--wrap=time")
     endif()
     lc_configure_c_test_target(pouch_space_${surface}_sdk_test)
+    if(surface STREQUAL "outbox")
+      foreach(codec 0 3)
+        foreach(case clean_reopen_reconciles_durable_index
+            reconciliation_pages_large_outbox
+            reconciliation_retains_overflow_request
+            reconciliation_skips_disappeared_outbox
+            reconciliation_preserves_earliest_claim_recovery)
+          set(name pouch_space_outbox_indexed_nosync_${codec}_${case})
+          add_test(NAME ${name}
+            COMMAND pouch_space_outbox_sdk_test test_pouch_${case})
+          set_tests_properties(${name} PROPERTIES TIMEOUT 60
+            LABELS "unit;local;pouch-space"
+            ENVIRONMENT "POUCH_SPACE_TEST_CODEC=${codec};POUCH_SPACE_TEST_SYNC=0;POUCH_SPACE_TEST_INDEX=1")
+        endforeach()
+      endforeach()
+    endif()
     if(surface STREQUAL "queue")
       add_test(NAME pouch_space_native_queue_sdk
         COMMAND lc_unit_pouch ${behavior_cases})

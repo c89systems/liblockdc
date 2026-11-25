@@ -5124,6 +5124,7 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
   char *cursor;
   size_t available;
   int consume_claim_recovery;
+  int canonical_scan;
   int use_index;
   int scan_mode;
   int rc;
@@ -5184,17 +5185,27 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
   pthread_mutex_unlock(&outbox->notification_mutex);
   use_index = outbox->dispatcher_client->pouch == NULL ||
               outbox->dispatcher_client->pouch->query_indexing_enabled;
-  /* A recovery sweep starts from a durable index boundary. Later pages keep
-   * that boundary: flushing every page would turn one large sweep into N
-   * global flushes and needlessly amplify reconciliation cost. Scan-only
-   * Pouch roots have no index boundary; their explicitly selected scan is
-   * already current and remains a supported outbox recovery path. */
-  if (use_index && outbox->recovery_cursor == NULL) {
-    flush_request.ns = outbox->ns;
-    flush_request.mode = "wait";
-    rc = lc_flush_index(&outbox->dispatcher_client->pub, &flush_request,
-                        &flush_result, error);
-    lc_index_flush_res_cleanup(&flush_result);
+  canonical_scan =
+      use_index && outbox->dispatcher_client->pouch &&
+      outbox->dispatcher_client->pouch->storage.ops &&
+      !outbox->dispatcher_client->pouch->durable_sync &&
+      lc_pouch_single_writer_enabled(outbox->dispatcher_client->pouch);
+  if (canonical_scan)
+    use_index = 0;
+  /* A recovery sweep starts from a durable boundary. An exclusive NoSync
+   * container can stabilize the canonical prefix and scan ordered outbox
+   * keys. Candidate lookup then needs no synchronous index publication. */
+  if ((use_index || canonical_scan) && outbox->recovery_cursor == NULL) {
+    if (canonical_scan) {
+      rc = lc_pouch_state_sync_namespace(outbox->dispatcher_client->pouch,
+                                         outbox->ns, error);
+    } else {
+      flush_request.ns = outbox->ns;
+      flush_request.mode = "wait";
+      rc = lc_flush_index(&outbox->dispatcher_client->pub, &flush_request,
+                          &flush_result, error);
+      lc_index_flush_res_cleanup(&flush_result);
+    }
     if (rc != LC_OK) {
       if (consume_claim_recovery) {
         pthread_mutex_lock(&outbox->notification_mutex);
@@ -5220,8 +5231,13 @@ static int lc_outbox_reconcile_pending(lc_outbox_handle *outbox,
         lc_outbox_test_before_recovery_query_context);
   }
 #endif
-  rc = lc_query_keys(&outbox->dispatcher_client->pub, &request, &handler,
-                     &capture, &result, error);
+  if (canonical_scan)
+    rc = lc_pouch_client_query_keys_canonical(
+        outbox->dispatcher_client, &request, "__lockdc_io/v1/outbox/", &handler,
+        &capture, &result, error);
+  else
+    rc = lc_query_keys(&outbox->dispatcher_client->pub, &request, &handler,
+                       &capture, &result, error);
   if (rc != LC_OK) {
     lc_query_res_cleanup(&result);
     if (consume_claim_recovery) {

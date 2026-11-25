@@ -728,6 +728,11 @@ int lc_pouch_state_scan_summaries(lc_pouch *pouch, const char *ns,
                                   void *context,
                                   lc_pouch_state_scan_summaries_result *out,
                                   lc_error *error);
+int lc_pouch_state_scan_summaries_prefix(
+    lc_pouch *pouch, const char *ns, const char *prefix,
+    const char *start_after, size_t limit,
+    lc_pouch_state_scan_summary_visit_fn visitor, void *context,
+    lc_pouch_state_scan_summaries_result *out, lc_error *error);
 int lc_pouch_state_scan_summary_read_body(
     lc_pouch *pouch, const char *ns,
     const lc_pouch_state_scan_summary_entry *entry, int cache_completed_body,
