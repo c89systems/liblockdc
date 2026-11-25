@@ -548,7 +548,9 @@ static int catalog_get(ps_space *s, uint64_t owner, unsigned int kind,
   if (!view)
     return cat_error(e, LC_ERR_NOMEM, "cannot allocate catalog view");
   pthread_mutex_lock(&s->mutex);
-  rc = ps_internal_capture_begin(s, &guard, e);
+  /* The view retains local metadata. Opening the target separately takes
+   * its physical witness against the captured incarnation. */
+  rc = ps_internal_observe_begin(s, &guard, e);
   prefix = __atomic_load_n(&s->durable_sequence, __ATOMIC_ACQUIRE);
   latest = named(s, owner, kind, name, length);
   p = visible(latest, prefix, s->peer_durable);
