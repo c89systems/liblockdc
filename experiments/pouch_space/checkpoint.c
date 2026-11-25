@@ -163,8 +163,11 @@ static key_slot *range_balance(key_slot *s) {
   return s;
 }
 static int range_before(key_slot *a, key_slot *b) {
-  return a->summary.body_start < b->summary.body_start ||
-         (a->summary.body_start == b->summary.body_start && a->id < b->id);
+  if (a->summary.body_start != b->summary.body_start)
+    return a->summary.body_start < b->summary.body_start;
+  if (a->kind != b->kind)
+    return a->kind < b->kind;
+  return strcmp(a->key, b->key) < 0;
 }
 static key_slot *range_insert(key_slot *root, key_slot *s) {
   if (!root) {
@@ -275,6 +278,14 @@ static key_slot *find_id(ps_key_checkpoint *c, uint64_t id) {
       return s;
   return NULL;
 }
+static void index_slot_id(key_slot **ids, size_t capacity, key_slot *s) {
+  size_t bucket;
+  if (!s->id)
+    return;
+  bucket = (size_t)(s->id & (capacity - 1));
+  s->id_next = ids[bucket];
+  ids[bucket] = s;
+}
 static int room(ps_key_checkpoint *c, size_t wanted, lc_error *e) {
   key_slot **keys, **ids, *s;
   size_t capacity = c->capacity ? c->capacity : 16, bucket;
@@ -297,9 +308,7 @@ static int room(ps_key_checkpoint *c, size_t wanted, lc_error *e) {
     bucket = (size_t)(s->hash & (capacity - 1));
     s->hash_next = keys[bucket];
     keys[bucket] = s;
-    bucket = (size_t)(s->id & (capacity - 1));
-    s->id_next = ids[bucket];
-    ids[bucket] = s;
+    index_slot_id(ids, capacity, s);
   }
   lc_free_with_allocator(&c->allocator, c->keys);
   lc_free_with_allocator(&c->allocator, c->ids);
@@ -312,9 +321,7 @@ static void insert_slot(ps_key_checkpoint *c, key_slot *s) {
   size_t bucket = (size_t)(s->hash & (c->capacity - 1));
   s->hash_next = c->keys[bucket];
   c->keys[bucket] = s;
-  bucket = (size_t)(s->id & (c->capacity - 1));
-  s->id_next = c->ids[bucket];
-  c->ids[bucket] = s;
+  index_slot_id(c->ids, c->capacity, s);
   s->next = c->slots;
   s->link = &c->slots;
   if (s->next)
@@ -335,8 +342,8 @@ static key_slot *new_slot(ps_key_checkpoint *c, const void *key, size_t bytes,
   if (bytes <= SIZE_MAX - sizeof(*s) - 1)
     s = lc_calloc_with_allocator(&c->allocator, 1,
                                  sizeof(*s) + (key ? bytes + 1 : 0));
-  if (!s ||
-      !lc_pouch_namespace_format_snapshot_leaf(id, s->leaf, sizeof(s->leaf))) {
+  if (!s || (id && !lc_pouch_namespace_format_snapshot_leaf(
+                      id, s->leaf, sizeof(s->leaf)))) {
     if (s)
       close_slot(c, s);
     failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint key slot");
@@ -351,6 +358,23 @@ static key_slot *new_slot(ps_key_checkpoint *c, const void *key, size_t bytes,
   s->kind = kind;
   s->id = id;
   return s;
+}
+/* Recovered tail entries are keyed by their canonical logical key until a
+ * writer needs a physical snapshot slot. Install that identity once under
+ * the checkpoint mutex so retries and indexed readers retain a stable leaf. */
+static int assign_slot_id(ps_key_checkpoint *c, key_slot *s, lc_error *e) {
+  uint64_t id;
+  int rc;
+  if (s->id)
+    return LC_OK;
+  rc = ps_catalog_allocate_id(c->ns->root->space, &id, e);
+  if (rc != LC_OK)
+    return rc;
+  if (!lc_pouch_namespace_format_snapshot_leaf(id, s->leaf, sizeof(s->leaf)))
+    return failure(e, LC_ERR_PROTOCOL, "invalid checkpoint slot identity");
+  s->id = id;
+  index_slot_id(c->ids, c->capacity, s);
+  return LC_OK;
 }
 static void summarize(key_summary *s, const lc_pouch_state_entry *r) {
   s->index = r->index_seq;
@@ -1079,10 +1103,12 @@ static void drop_selected_slot(ps_key_checkpoint *c, key_slot *slot) {
   for (at = &c->keys[bucket]; *at != slot; at = &(*at)->hash_next) {
   }
   *at = slot->hash_next;
-  for (at = &c->ids[slot->id & (c->capacity - 1)]; *at != slot;
-       at = &(*at)->id_next) {
+  if (slot->id) {
+    for (at = &c->ids[slot->id & (c->capacity - 1)]; *at != slot;
+         at = &(*at)->id_next) {
+    }
+    *at = slot->id_next;
   }
-  *at = slot->id_next;
   if (slot->dirty_link)
     dirty_remove(c, slot);
   retire_remove(slot);
@@ -1475,12 +1501,13 @@ static slot_change *delta_find(ps_checkpoint_delta *d, const void *key,
 /* The namespace appender owns exclusion. All allocations and capacity growth
  * here precede any application body bytes for the admitted record. */
 static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
-                     unsigned int kind, uint64_t bound, lc_error *e) {
+                     unsigned int kind, uint64_t bound, int replay,
+                     lc_error *e) {
   ps_key_checkpoint *c = d->checkpoint;
   ps_budget_plan plan = d->claim, before = {0}, after = {0};
   slot_change *change;
   key_slot *slot;
-  uint64_t id;
+  uint64_t id = 0;
   size_t bucket;
   int rc;
   if (!plan.entries) {
@@ -1509,7 +1536,7 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
         break;
     if (!slot) {
       rc = room(c, c->count + d->created + 1, e);
-      if (rc == LC_OK)
+      if (rc == LC_OK && !replay)
         rc = ps_catalog_allocate_id(c->ns->root->space, &id, e);
       if (rc == LC_OK) {
         slot = new_slot(c, key, bytes, kind, id, e);
@@ -1522,6 +1549,12 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
       }
       change->created = 1;
       ++d->created;
+    } else if (!replay) {
+      rc = assign_slot_id(c, slot, e);
+      if (rc != LC_OK) {
+        lc_free_with_allocator(&c->allocator, change);
+        return rc;
+      }
     }
     change->slot = slot;
     change->prior_deletion = slot->required_deletion;
@@ -1597,7 +1630,7 @@ static int admission(void *context, const lc_pouch_record_header *h,
     return rc;
   }
   rc = admit_key(d, key, (size_t)h->key_len, kind,
-                 LC_POUCH_RECORD_HEADER_BYTES + h->key_len + h->meta_len + 512,
+                 LC_POUCH_RECORD_HEADER_BYTES + h->key_len + h->meta_len + 512, 0,
                  e);
   if (rc == LC_OK && deletion) {
     slot_change *change = delta_find(d, key, (size_t)h->key_len, kind);
@@ -1993,7 +2026,8 @@ int ps_checkpoint_delta_replay(ps_checkpoint_delta *d,
     d->planning = 1;
     rc =
         admit_key(d, key, key ? strlen(key) : 0,
-                  entry->control ? PS_KEY_DECISION : PS_KEY_METADATA, bytes, e);
+                  entry->control ? PS_KEY_DECISION : PS_KEY_METADATA, bytes, 1,
+                  e);
     d->planning = 0;
   }
   if (rc == LC_OK) {
@@ -2556,7 +2590,7 @@ int ps_key_body_plan(ps_key_checkpoint *c, const lc_pouch_state_entry *expected,
     d->planning = 1;
     pthread_mutex_lock(&c->mutex);
     rc = admit_key(d, body->source.key, strlen(body->source.key),
-                   PS_KEY_METADATA, maximum + 512, e);
+                   PS_KEY_METADATA, maximum + 512, 0, e);
     pthread_mutex_unlock(&c->mutex);
     d->planning = 0;
     if (rc == LC_OK)
@@ -2804,10 +2838,14 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     count = ordinary = outputs = 0;
     descriptors = 88; /* Reserve final coverage even in a partial batch. */
     plan = NULL;
+    pthread_mutex_lock(&c->mutex);
     for (s = c->dirty; s && count < CHECKPOINT_BATCH; s = s->dirty_next) {
       memset(&cost, 0, sizeof(cost));
       rc = ps_budget_plan_key_slot(&cost, s->kind, s->pending.length, 0, e);
       if (rc != LC_OK || cost.metadata_bytes > PS_JOURNAL - 64 - descriptors)
+        break;
+      rc = assign_slot_id(c, s, e);
+      if (rc != LC_OK)
         break;
       descriptors += cost.metadata_bytes;
       slots[count++] = s;
@@ -2820,6 +2858,7 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
       }
     }
     final = s == NULL;
+    pthread_mutex_unlock(&c->mutex);
     if (rc == LC_OK && !count && !final)
       rc = failure(e, LC_ERR_INVALID, "checkpoint slot cannot fit a revision");
     for (i = 0; rc == LC_OK && i < count; ++i) {

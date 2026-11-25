@@ -823,6 +823,30 @@ static void checkpoint_namespace(int durable, int shared) {
   OK(ps_namespace_checkpoint_flush(ns, &error));
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1) == 69);
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 2) == 1);
+  if (!shared) {
+    ps_stats before, after;
+    /* A new logical key in the accepted tail needs a snapshot identity
+     * when materialized. Its clean reopen must not force a sync. */
+    checkpoint_put(root, ns, "lease/70", 72, 1, 72, 1, 0);
+    ps_namespace_release(ns);
+    OK(ps_root_close(root, &error));
+    OK(ps_root_open(path, 0, &options, &root, &error));
+    OK(ps_root_namespace_acquire(root, "checkpoint", 0, &ns, &error));
+    OK(ps_namespace_status_get(ns, &status, &error));
+    CHECK(status.pending_keys == 1 && status.checkpoint_keys == 71);
+    OK(ps_namespace_view_open(ns, &view, &error));
+    memset(&seen, 0, sizeof(seen));
+    OK(ps_namespace_view_visit(view, 1, checkpoint_visit, &seen, &error));
+    CHECK(seen.count == 71 && seen.maximum == 72);
+    ps_namespace_view_close(view);
+    OK(ps_status(ps_root_space(root), &before, &error));
+    CHECK(!before.syncs);
+    OK(ps_namespace_checkpoint_flush(ns, &error));
+    OK(ps_namespace_status_get(ns, &status, &error));
+    CHECK(!status.pending_keys && status.checkpoint_keys == 71);
+    OK(ps_status(ps_root_space(root), &after, &error));
+    CHECK(after.syncs > before.syncs);
+  }
   ps_namespace_release(ns);
   OK(ps_root_close(root, &error));
   clean();

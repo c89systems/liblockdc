@@ -51,6 +51,9 @@ coverage before exposing them.
 Owners that reopen using a proof acquire an incarnation range on first use.
 After a clean exclusive NoSync close, a checked journal can serve reads.
 The first persistent mutation or explicit flush stabilizes that recovered view.
+Replayed keys acquire a physical snapshot identity when a write or checkpoint
+needs it. Exclusive collection recovery verifies unused suffix bytes and repairs
+any that are nonzero. An unchanged suffix can reuse the existing tail proof.
 
 Private preparation reserves payload and descriptor capacity before spending it.
 Publication revalidates its logical authority. Producers run outside

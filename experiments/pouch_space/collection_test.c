@@ -161,6 +161,7 @@ static void canonical(const char *directory, const char *key, int codec,
   lc_pouch_record_io input, output;
   lc_collection_segment commit;
   ps_owned_status status;
+  ps_stats repair_before, repair_after;
   generated producer = {0};
   unsigned char *scratch = malloc(PS_CHUNK);
   uint64_t end, next;
@@ -233,9 +234,12 @@ static void canonical(const char *directory, const char *key, int codec,
   pouch->crypto = NULL;
   ok(ps_root_open(path, 0, &options, &root, &e), &e);
   pouch->crypto = ps_root_crypto(root);
+  ok(ps_status(ps_root_space(root), &repair_before, &e), &e);
   ok(ps_collection_segment_open(ps_root_space(root), segment_key, 0, NULL,
                                 recover, &recovery_calls, &segment, &e),
      &e);
+  ok(ps_status(ps_root_space(root), &repair_after, &e), &e);
+  REQUIRE(repair_after.syncs > repair_before.syncs);
   REQUIRE(recovery_calls == 1U);
   input = ps_collection_segment_io(segment);
   ok(lc_pouch_record_io_tail(input, &end, &e), &e);
@@ -245,6 +249,24 @@ static void canonical(const char *directory, const char *key, int codec,
      &e);
   REQUIRE(loaded.metadata_only && loaded.position == 7 &&
           loaded.generation == 2 && !strcmp(loaded.etag, written.etag));
+  /* The previous open cleared and forced the rejected suffix. Reopening
+   * that exact segment again can restore its tail without a repair fence. */
+  ps_collection_segment_close(segment);
+  segment = NULL;
+  pouch->crypto = NULL;
+  ok(ps_root_close(root, &e), &e);
+  root = NULL;
+  ok(ps_root_open(path, 0, &options, &root, &e), &e);
+  pouch->crypto = ps_root_crypto(root);
+  ok(ps_status(ps_root_space(root), &repair_before, &e), &e);
+  ok(ps_collection_segment_open(ps_root_space(root), segment_key, 0, NULL,
+                                recover, &recovery_calls, &segment, &e),
+     &e);
+  ok(ps_status(ps_root_space(root), &repair_after, &e), &e);
+  REQUIRE(recovery_calls == 2U && repair_after.syncs == repair_before.syncs);
+  input = ps_collection_segment_io(segment);
+  ok(lc_pouch_record_io_tail(input, &end, &e), &e);
+  REQUIRE(end == next);
   ok(ps_collection_segment_open(ps_root_space(root), copy_key, 1, NULL, NULL,
                                 NULL, &destination, &e),
      &e);

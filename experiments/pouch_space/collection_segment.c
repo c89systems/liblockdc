@@ -142,6 +142,29 @@ static int cs_clear(ps_collection_segment *s, uint64_t start, uint64_t end,
   return rc;
 }
 
+/* Exclusive recovery owns the entire segment. Inspect the rejected suffix
+ * before turning an already-clean range into a write and a durability fence. */
+static int cs_suffix_dirty(ps_collection_segment *s, uint64_t at, int *dirty,
+                            lc_error *e) {
+  static const unsigned char zero[PS_CHUNK] = {0};
+  int rc;
+  size_t take;
+  *dirty = 0;
+  while (at < s->capacity) {
+    take = s->capacity - at < sizeof(zero) ? (size_t)(s->capacity - at)
+                                           : sizeof(zero);
+    rc = cs_transfer(s, at, s->zero, take, 0, e);
+    if (rc != LC_OK)
+      return rc;
+    if (memcmp(s->zero, zero, take)) {
+      *dirty = 1;
+      break;
+    }
+    at += take;
+  }
+  return LC_OK;
+}
+
 static int cs_read(void *context, uint64_t at, const struct iovec *parts,
                    int count, lc_error *e) {
   ps_collection_segment *s = context;
@@ -310,7 +333,7 @@ static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
                       ps_collection_segment_recover_fn recover, void *context,
                       lc_error *e) {
   uint64_t accepted = status->tail;
-  int rc;
+  int rc, dirty = s->shared;
   pthread_mutex_lock(&s->mutex);
   s->recovering = 1;
   pthread_mutex_unlock(&s->mutex);
@@ -322,10 +345,14 @@ static int cs_recover(ps_collection_segment *s, const ps_owned_status *status,
   if (rc == LC_OK && (accepted < status->tail || accepted > status->capacity))
     rc = cs_error(e, LC_ERR_PROTOCOL,
                   "collection recovery returned an invalid boundary");
-  if (rc == LC_OK && accepted < status->capacity)
+  if (rc == LC_OK && !s->shared)
+    rc = cs_suffix_dirty(s, accepted, &dirty, e);
+  if (rc == LC_OK && dirty && accepted < status->capacity)
     rc = cs_clear(s, accepted, status->capacity, e);
   if (rc == LC_OK)
-    rc = ps_owned_recovered(s->head, accepted, e);
+    rc = dirty ? ps_owned_recovered(s->head, accepted, e)
+               : ps_owned_restore_tail(s->head, accepted,
+                                      accepted > status->tail, e);
   if (rc == LC_OK && s->shared)
     rc = ps_owned_commit_canonical(s->head, accepted, PS_COMMIT_DEFER_SYNC,
                                    NULL, NULL, e);
