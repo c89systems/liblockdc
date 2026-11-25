@@ -121,6 +121,12 @@ for ((sample = 1; sample <= runs; ++sample)); do
     for workload in queue shared-queue outbox shared-outbox xa index shared-index; do
       pair "$policy-$workload" lifecycle "$workload" 12 4096 "$sync" 2 --reopen
     done
+    if [[ "$policy" == nosync ]]; then
+      for workload in index shared-index; do
+        pair "$policy-$workload-stable" lifecycle "$workload" \
+          12 4096 "$sync" 2 --reopen --stable-index
+      done
+    fi
     pair "$policy-lease" sdk 32 pouch-lease
     pair "$policy-state-api" sdk 24 pouch-state-api
     pair "$policy-attachment" sdk 16 pouch-attachment
@@ -153,6 +159,9 @@ for ((sample = 1; sample <= runs; ++sample)); do
       pair "$policy-collection-encrypted-zlib" sdk 48 collections
     LOCKDC_COLLECTION_BENCH_MAX_ENTRIES=32 \
       pair "$policy-collection-retention" sdk 128 collections
+    LOCKDC_COLLECTION_BENCH_MAX_ENTRIES=32 LOCKDC_COLLECTION_BENCH_INDEX=1 \
+      LOCKDC_COLLECTION_BENCH_BUILD_INDEX=1 \
+      pair "$policy-collection-retention-indexed" sdk 128 collections
     for style in suffix scatter; do
       pair "$policy-collection-edit-$style" edit edit 256 32 4096 plain "$policy" "$style"
     done
