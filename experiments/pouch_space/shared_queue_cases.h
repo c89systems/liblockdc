@@ -223,6 +223,14 @@ static lc_ack_op shared_queue_ack(const lc_message *message) {
   ack.message.meta_etag = message->meta_etag;
   return ack;
 }
+typedef struct queue_application_stats {
+  ps_space *space;
+  ps_stats before;
+} queue_application_stats;
+static int sample_queue_application(void *context, lc_error *e) {
+  queue_application_stats *sample = context;
+  return ps_status(sample->space, &sample->before, e);
+}
 static void shared_queue_transaction(const char *directory) {
   fixture *a = calloc(1, sizeof(*a)), *b = calloc(1, sizeof(*b));
   REQUIRE(a && b);
@@ -303,7 +311,18 @@ static void shared_queue_transaction(const char *directory) {
     lc_ack_res_cleanup(&acknowledged);
     REQUIRE(snprintf(key, sizeof(key), "q/jobs/msg/%s", message->message_id) <
             (int)sizeof(key));
+    queue_application_stats sample = {
+        .space = ps_root_space(ps_pouch_state_root(store(b)))};
+    lc_pouch_test_after_txn_decision_context = &sample;
+    lc_pouch_test_after_txn_decision_hook = sample_queue_application;
     ok(b->client->txn_rollback(b->client, &decision, &decided, &e), &e);
+    lc_pouch_test_after_txn_decision_hook = NULL;
+    lc_pouch_test_after_txn_decision_context = NULL;
+    if (sync) {
+      ps_stats after;
+      ok(ps_status(sample.space, &after, &e), &e);
+      REQUIRE(after.syncs == sample.before.syncs + 1);
+    }
     REQUIRE(decided.state && !strcmp(decided.state, "rollback"));
     lc_txn_decision_res_cleanup(&decided);
     request.txn_id = NULL;

@@ -309,6 +309,7 @@ typedef struct lc_pouch_txn_queue_participant_context {
   const char *lease_key;
   const char *txn_id;
   const char *state;
+  char *notify_queue;
   int state_participant;
 } lc_pouch_txn_queue_participant_context;
 
@@ -9993,7 +9994,7 @@ static int lc_pouch_queue_open_record_source(lc_client_handle *client,
 
 static int lc_pouch_queue_write_record(lc_client_handle *client,
                                        lc_pouch_queue_record *record,
-                                       lc_error *error) {
+                                       int notify, lc_error *error) {
   lc_source *source;
   lc_source *payload_source;
   lc_pouch_state_write_options options;
@@ -10022,7 +10023,7 @@ static int lc_pouch_queue_write_record(lc_client_handle *client,
   if (payload_source != NULL) {
     lc_source_close(payload_source);
   }
-  if (rc == LC_OK) {
+  if (rc == LC_OK && notify) {
     lc_pouch_queue_touch_notification(client, record->ns, record->queue);
   }
   if (rc == LC_OK) {
@@ -10421,7 +10422,7 @@ static int lc_pouch_queue_write_or_stage_record(lc_client_handle *client,
   if (lc_pouch_txn_id_present(txn_id)) {
     return lc_pouch_queue_stage_record(client, record, txn_id, error);
   }
-  return lc_pouch_queue_write_record(client, record, error);
+  return lc_pouch_queue_write_record(client, record, 1, error);
 }
 
 static int lc_pouch_queue_replace_string(char **field, const char *value,
@@ -11542,6 +11543,7 @@ lc_pouch_txn_apply_attachment_participant(lc_pouch *pouch, const char *ns,
 static int lc_pouch_txn_commit_queue_stage(lc_client_handle *client,
                                            const char *ns, const char *base_key,
                                            const char *txn_id,
+                                           char **notify_queue,
                                            lc_error *error) {
   lc_pouch_state_read_result staged;
   lc_pouch_state_write_options options;
@@ -11593,7 +11595,8 @@ static int lc_pouch_txn_commit_queue_stage(lc_client_handle *client,
         client->pouch, ns, base_key, txn_id, &result, error);
   }
   if (rc == LC_OK && staged.found) {
-    lc_pouch_queue_touch_notification(client, record.ns, record.queue);
+    *notify_queue = record.queue;
+    record.queue = NULL;
   }
   lc_free_with_allocator(NULL, payload_key);
   lc_free_with_allocator(NULL, staged_key);
@@ -11637,11 +11640,9 @@ static int lc_pouch_queue_clear_lease_key_locked(lc_client_handle *client,
   return rc;
 }
 
-static int lc_pouch_txn_rollback_queue_message(lc_client_handle *client,
-                                               const char *ns,
-                                               const char *metadata_key,
-                                               const char *txn_id,
-                                               lc_error *error) {
+static int lc_pouch_txn_rollback_queue_message(
+    lc_client_handle *client, const char *ns, const char *metadata_key,
+    const char *txn_id, char **notify_queue, lc_error *error) {
   lc_pouch_state_read_result read_result;
   lc_pouch_queue_record record;
   int discarded;
@@ -11668,10 +11669,11 @@ static int lc_pouch_txn_rollback_queue_message(lc_client_handle *client,
       rc = lc_pouch_queue_clear_lease(&record, error);
     }
     if (rc == LC_OK) {
-      rc = lc_pouch_queue_write_record(client, &record, error);
+      rc = lc_pouch_queue_write_record(client, &record, 0, error);
     }
     if (rc == LC_OK) {
-      lc_pouch_queue_touch_notification(client, record.ns, record.queue);
+      *notify_queue = record.queue;
+      record.queue = NULL;
     }
   }
   lc_pouch_queue_record_cleanup(&record);
@@ -11834,13 +11836,15 @@ static int lc_pouch_txn_apply_queue_participant_locked(void *context,
   }
   if (rc == LC_OK && !ctx->state_participant &&
       queue_record.storage_key != NULL && strcmp(ctx->state, "commit") == 0) {
-    rc = lc_pouch_txn_commit_queue_stage(ctx->client, ctx->ns, metadata_key,
-                                         ctx->txn_id, error);
+    rc =
+        lc_pouch_txn_commit_queue_stage(ctx->client, ctx->ns, metadata_key,
+                                        ctx->txn_id, &ctx->notify_queue, error);
   } else if (rc == LC_OK && !ctx->state_participant &&
              queue_record.storage_key != NULL &&
              strcmp(ctx->state, "rollback") == 0) {
     rc = lc_pouch_txn_rollback_queue_message(ctx->client, ctx->ns, metadata_key,
-                                             ctx->txn_id, error);
+                                             ctx->txn_id, &ctx->notify_queue,
+                                             error);
   } else if (rc == LC_OK && !ctx->state_participant &&
              queue_record.storage_key != NULL) {
     rc = lc_error_set(error, LC_ERR_INVALID, 0L,
@@ -11884,48 +11888,31 @@ static int lc_pouch_txn_apply_queue_participant_locked(void *context,
   return rc;
 }
 
-static int lc_pouch_txn_apply_queue_message_participant(
-    lc_client_handle *client, const char *ns, const char *message_lease_key,
-    const char *txn_id, const char *state, lc_error *error) {
+static int
+lc_pouch_txn_apply_queue_participant(lc_client_handle *client, const char *ns,
+                                     const char *lease_key, const char *txn_id,
+                                     const char *state, int state_participant,
+                                     lc_error *error) {
   lc_pouch_txn_queue_participant_context context;
   int rc;
 
   memset(&context, 0, sizeof(context));
   context.client = client;
   context.ns = ns;
-  context.lease_key = message_lease_key;
+  context.lease_key = lease_key;
   context.txn_id = txn_id;
   context.state = state;
+  context.state_participant = state_participant;
 
-  rc = lc_pouch_state_with_namespace_lock(
+  rc = lc_pouch_state_with_namespace_durable_batch(
       client->pouch, ns, lc_pouch_txn_apply_queue_participant_locked, &context,
       error);
   if (rc == LC_OK) {
+    if (context.notify_queue != NULL)
+      lc_pouch_queue_touch_notification(client, ns, context.notify_queue);
     lc_pouch_compaction_note_mutation(client->pouch, ns, 1);
   }
-  return rc;
-}
-
-static int lc_pouch_txn_apply_queue_state_participant(
-    lc_client_handle *client, const char *ns, const char *state_lease_key,
-    const char *txn_id, const char *state, lc_error *error) {
-  lc_pouch_txn_queue_participant_context context;
-  int rc;
-
-  memset(&context, 0, sizeof(context));
-  context.client = client;
-  context.ns = ns;
-  context.lease_key = state_lease_key;
-  context.txn_id = txn_id;
-  context.state = state;
-  context.state_participant = 1;
-
-  rc = lc_pouch_state_with_namespace_lock(
-      client->pouch, ns, lc_pouch_txn_apply_queue_participant_locked, &context,
-      error);
-  if (rc == LC_OK) {
-    lc_pouch_compaction_note_mutation(client->pouch, ns, 1);
-  }
+  lc_free_with_allocator(NULL, context.notify_queue);
   return rc;
 }
 
@@ -12144,14 +12131,9 @@ static int lc_pouch_txn_apply_state_participant(
   context.state = state;
   context.commit_at_unix = commit_at_unix;
 
-  if (lease != NULL)
-    rc = lc_pouch_state_with_namespace_durable_batch(
-        client->pouch, ns, lc_pouch_txn_apply_state_participant_locked,
-        &context, error);
-  else
-    rc = lc_pouch_state_with_namespace_lock(
-        client->pouch, ns, lc_pouch_txn_apply_state_participant_locked,
-        &context, error);
+  rc = lc_pouch_state_with_namespace_durable_batch(
+      client->pouch, ns, lc_pouch_txn_apply_state_participant_locked, &context,
+      error);
   if (rc == LC_OK) {
     lc_pouch_compaction_note_mutation(client->pouch, ns, 1);
   }
@@ -12432,25 +12414,11 @@ static int lc_pouch_txn_apply_participants(lc_client_handle *client,
           client, req, local_backend_hash, requires_backend_hash, i);
       return rc;
     }
-    if (lc_pouch_queue_is_message_lease_key(req->participants[i].key)) {
-      rc = lc_pouch_txn_apply_queue_message_participant(
-          client, ns, req->participants[i].key, req->txn_id, state, error);
-      if (rc != LC_OK) {
-        if (tolerate_queue_lease_mismatch &&
-            lc_pouch_txn_is_queue_lease_mismatch(error)) {
-          lc_error_cleanup(error);
-          lc_error_init(error);
-          continue;
-        }
-        lc_pouch_txn_cancel_applied_operation_guards(
-            client, req, local_backend_hash, requires_backend_hash, i + 1U);
-        return rc;
-      }
-      continue;
-    }
-    if (lc_pouch_queue_is_state_lease_key(req->participants[i].key)) {
-      rc = lc_pouch_txn_apply_queue_state_participant(
-          client, ns, req->participants[i].key, req->txn_id, state, error);
+    if (lc_pouch_queue_is_message_lease_key(req->participants[i].key) ||
+        lc_pouch_queue_is_state_lease_key(req->participants[i].key)) {
+      rc = lc_pouch_txn_apply_queue_participant(
+          client, ns, req->participants[i].key, req->txn_id, state,
+          lc_pouch_queue_is_state_lease_key(req->participants[i].key), error);
       if (rc != LC_OK) {
         if (tolerate_queue_lease_mismatch &&
             lc_pouch_txn_is_queue_lease_mismatch(error)) {
@@ -16081,7 +16049,7 @@ static int lc_pouch_client_dequeue_once(lc_client_handle *client,
       lc_free_with_allocator(NULL, message_lease_key);
       break;
     }
-    rc = lc_pouch_queue_write_record(client, record, error);
+    rc = lc_pouch_queue_write_record(client, record, 1, error);
     if (rc != LC_OK) {
       rc = lc_pouch_queue_rollback_delivery_after_failure(
           client, &rollback_message, record->version != record_version_before,
@@ -16253,7 +16221,7 @@ static int lc_pouch_queue_rollback_published_delivery(
     record.not_visible_until_unix = 0L;
     record_version_before = record.version;
     rollback_record_write_attempted = 1;
-    rc = lc_pouch_queue_write_record(client, &record, error);
+    rc = lc_pouch_queue_write_record(client, &record, 1, error);
   }
   if (rollback_record_write_attempted && rc != LC_OK &&
       record.version != record_version_before) {
@@ -16581,7 +16549,7 @@ static int lc_pouch_client_dequeue_batch(lc_client *self,
         break;
       }
       if (rc == LC_OK) {
-        rc = lc_pouch_queue_write_record(client, record, error);
+        rc = lc_pouch_queue_write_record(client, record, 1, error);
       }
       if (rc != LC_OK) {
         rc = lc_pouch_queue_rollback_delivery_after_failure(
