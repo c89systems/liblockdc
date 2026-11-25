@@ -534,7 +534,7 @@ static ssize_t disk_write(void *context, int fd, const void *bytes, size_t n,
   io_fault *f = context;
   if (io_fails(f)) {
     if (f->partial && n > 1)
-      (void)pwrite(fd, bytes, n / 2, at);
+      REQUIRE(pwrite(fd, bytes, n / 2, at) == (ssize_t)(n / 2));
     errno = EIO;
     return -1;
   }

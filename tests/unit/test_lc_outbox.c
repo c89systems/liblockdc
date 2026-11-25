@@ -8745,7 +8745,9 @@ static void test_pouch_shared_process_dispatches_once(void **state) {
     (void)close(result_pipe[0]);
     result = outbox_shared_process_claim(root, "outbox-shared-process",
                                          start_pipe[0]);
-    (void)write(result_pipe[1], &result, sizeof(result));
+    if (write(result_pipe[1], &result, sizeof(result)) !=
+        (ssize_t)sizeof(result))
+      _exit(1);
     (void)close(result_pipe[1]);
     _exit(result.rc == LC_OK ? 0 : 1);
   }
@@ -8848,7 +8850,9 @@ test_pouch_shared_process_reconciles_each_outbox_once(void **state) {
                            (unsigned long)index) > 0);
       child_result = outbox_shared_process_drain(
           root, client_config.default_namespace, owner, start_pipes[index][0]);
-      (void)write(result_pipes[index][1], &child_result, sizeof(child_result));
+      if (write(result_pipes[index][1], &child_result, sizeof(child_result)) !=
+          (ssize_t)sizeof(child_result))
+        _exit(1);
       (void)close(result_pipes[index][1]);
       _exit(child_result.rc == LC_OK ? 0 : 1);
     }

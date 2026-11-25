@@ -506,7 +506,7 @@ static ssize_t io_write(void *context, int fd, const void *p, size_t n,
   if (io_fails(f)) {
     /* Some failed operations have already persisted a prefix. */
     if (f->partial && n > 1)
-      (void)pwrite(fd, p, n / 2, at);
+      REQUIRE(pwrite(fd, p, n / 2, at) == (ssize_t)(n / 2));
     errno = EIO;
     return -1;
   }
