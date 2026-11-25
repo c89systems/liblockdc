@@ -15774,9 +15774,6 @@ static int lc_pouch_client_enqueue_locked(lc_client_handle *client,
                       NULL, "pouch");
   }
   if (rc == LC_OK) {
-    lc_pouch_queue_touch_notification(client, ns, req->queue);
-  }
-  if (rc == LC_OK) {
     out->ns = lc_strdup_local(ns);
     out->queue = lc_strdup_local(req->queue);
     out->message_id = lc_strdup_local(record.message_id);
@@ -15869,9 +15866,17 @@ static int lc_pouch_client_enqueue_method_impl(lc_client *self,
   context.req = req;
   context.src = src;
   context.out = out;
-  return lc_pouch_state_with_namespace_lock(
+  memset(out, 0, sizeof(*out));
+  /* The payload precedes its delivery record in the canonical namespace
+   * prefix. Complete both under the same container durability barrier. */
+  rc = lc_pouch_state_with_namespace_durable_batch(
       client->pouch, ns, lc_pouch_client_enqueue_locked_callback, &context,
       error);
+  if (rc == LC_OK)
+    lc_pouch_queue_touch_notification(client, ns, req->queue);
+  else
+    lc_enqueue_res_cleanup(out);
+  return rc;
 }
 
 static int lc_pouch_queue_rollback_published_delivery(

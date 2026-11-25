@@ -937,7 +937,7 @@ static void durable_scope_faults(const char *path) {
 }
 typedef struct scope_image {
   io_fault fault;
-  int fd;
+  int fd, fail_sync;
   unsigned char *scratch;
 } scope_image;
 /* The test image changes only at successful root sync calls. Reopening it
@@ -946,6 +946,10 @@ static int scope_image_sync(void *context, int fd) {
   scope_image *image = context;
   struct stat st;
   off_t at = 0;
+  if (image->fail_sync) {
+    errno = EIO;
+    return -1;
+  }
   if (fdatasync(fd) != 0 || fstat(fd, &st) != 0 ||
       ftruncate(image->fd, st.st_size) != 0)
     return -1;
@@ -1053,6 +1057,101 @@ static void durable_scope_crash(const char *path) {
     scope_put(p, "continued", 3, &e);
     lc_pouch_close(p);
     REQUIRE(live == 0 && unlink(image_path) == 0 && unlink(path) == 0);
+  }
+  lc_error_cleanup(&e);
+}
+
+static lc_client *open_durable_queue(const char *path, int create, int shared,
+                                     const ps_io *io, lc_error *e) {
+  char endpoint[1600];
+  const char *endpoints[] = {endpoint};
+  lc_client_config cfg;
+  lc_pouch_settings settings;
+  ps_pouch_client_options options = {0};
+  lc_client *client = NULL;
+  REQUIRE(snprintf(endpoint, sizeof(endpoint),
+                   "pouch://%s?single_writer=%s&background_compaction=false&"
+                   "query_indexing=false&queue_watch=true",
+                   path, shared ? "false" : "true") < (int)sizeof(endpoint));
+  lc_client_config_init(&cfg);
+  lc_pouch_settings_init(&settings);
+  settings.set_mask = LC_POUCH_SETTING_DURABLE_SYNC;
+  settings.durable_sync = 1;
+  cfg.endpoints = endpoints;
+  cfg.endpoint_count = 1;
+  cfg.default_namespace = "journal";
+  cfg.pouch_settings = &settings;
+  options.initial_capacity = options.maximum_capacity = PS_MIB;
+  options.io = io;
+  ok(ps_pouch_client_open(&cfg, create, &options, &client, e), e);
+  return client;
+}
+
+static void queue_enqueue_crash(const char *path) {
+  static const char body[] = "durable queue body";
+  char image_path[1400];
+  lc_error e;
+  lc_error_init(&e);
+  REQUIRE(snprintf(image_path, sizeof(image_path), "%s-image", path) <
+          (int)sizeof(image_path));
+  for (int variant = 0; variant < 4; ++variant) {
+    int shared = variant / 2, fail_sync = variant % 2, status;
+    scope_image image = {0};
+    ps_io io = {&image, io_read, io_write, scope_image_sync, io_reserve, NULL};
+    image.fd = open(image_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    image.scratch = malloc(PS_PAGE);
+    REQUIRE(image.fd >= 0 && image.scratch);
+    pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (!child) {
+      lc_client *client = open_durable_queue(path, 1, shared, &io, &e);
+      lc_pouch *pouch = ((lc_client_handle *)client)->pouch;
+      lc_enqueue_req req = {0};
+      lc_enqueue_res result = {0};
+      lc_source *input = NULL;
+      req.queue = "warm";
+      ok(lc_source_from_memory(body, sizeof(body) - 1, &input, &e), &e);
+      ok(lc_enqueue(client, &req, input, &result, &e), &e);
+      lc_source_close(input);
+      lc_enqueue_res_cleanup(&result);
+      uint64_t synced = scope_syncs(pouch, &e);
+      uint32_t notice = lc_pouch_queue_watch_observe(pouch);
+      image.fail_sync = fail_sync;
+      req.queue = "test";
+      ok(lc_source_from_memory(body, sizeof(body) - 1, &input, &e), &e);
+      int rc = lc_enqueue(client, &req, input, &result, &e);
+      if (fail_sync) {
+        REQUIRE(rc == LC_ERR_TRANSPORT && !result.message_id);
+        REQUIRE(lc_pouch_queue_watch_observe(pouch) == notice);
+      } else {
+        ok(rc, &e);
+        REQUIRE(result.message_id && scope_syncs(pouch, &e) == synced + 1);
+      }
+      _exit(0);
+    }
+    REQUIRE(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0);
+    REQUIRE(close(image.fd) == 0);
+    free(image.scratch);
+    lc_client *client = open_durable_queue(image_path, 0, shared, NULL, &e);
+    lc_dequeue_req req = {0};
+    lc_message *message = NULL;
+    req.queue = "test";
+    req.owner = "reader";
+    ok(lc_dequeue(client, &req, &message, &e), &e);
+    REQUIRE((message != NULL) == !fail_sync);
+    if (message) {
+      lc_source *payload = message->payload_reader(message);
+      char copy[sizeof(body)];
+      REQUIRE(payload && payload->read(payload, copy, sizeof(copy), &e) ==
+                             sizeof(body) - 1U);
+      REQUIRE(!memcmp(copy, body, sizeof(body) - 1U));
+      REQUIRE(payload->read(payload, copy, sizeof(copy), &e) == 0 &&
+              e.code == LC_OK);
+      message->close(message);
+    }
+    lc_client_close(client);
+    REQUIRE(unlink(image_path) == 0 && unlink(path) == 0);
   }
   lc_error_cleanup(&e);
 }
@@ -7355,7 +7454,9 @@ int main(int argc, char **argv) {
     mutation_metadata[i] = byte_at(i, 37);
   lc_error_init(&e);
   ok(lc_pouch_crypto_generate_key_string(&crypto_key, &e), &e);
-  if (!strcmp(r.mode, "durable-scope-crash"))
+  if (!strcmp(r.mode, "queue-enqueue-crash"))
+    queue_enqueue_crash(r.path);
+  else if (!strcmp(r.mode, "durable-scope-crash"))
     durable_scope_crash(r.path);
   else if (!strcmp(r.mode, "staging-crash"))
     staging_crash(r.path);
