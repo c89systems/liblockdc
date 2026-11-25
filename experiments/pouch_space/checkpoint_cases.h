@@ -172,6 +172,67 @@ static void checkpoint_idempotence(int durable) {
   OK(ps_close(space, &error));
   clean();
 }
+static void checkpoint_initialization(int shared) {
+  enum { COMPLETE, ROOT_ONLY, GRANT_ONLY };
+  for (int cut = COMPLETE; cut <= GRANT_ONLY; ++cut) {
+    model m;
+    ps_io io = model_init(&m);
+    ps_options options = {0};
+    ps_space *space = NULL;
+    clean();
+    options.io = &io;
+    options.shared = shared;
+    options.initial_capacity = PS_MIB;
+    if (cut == COMPLETE) {
+      OK(ps_open(path, 1, &options, &space, &error));
+#ifdef __APPLE__
+      CHECK(m.syncs == 2); /* Includes the barrier after syncing the parent. */
+#else
+      CHECK(m.syncs == 1);
+#endif
+      OK(ps_close(space, &error));
+      space = NULL;
+    } else {
+      m.fail_sync_at = 1;
+      CHECK(ps_open(path, 1, &options, &space, &error) == LC_ERR_TRANSPORT &&
+            !space);
+      lc_error_cleanup(&error);
+      /* Independently persist either write from the unsynced initial pair. */
+      m.stable_bytes = PS_MIB;
+      memset(m.stable, 0, m.stable_bytes);
+      off_t offset = cut == ROOT_ONLY ? PS_PAGE : PS_TOKEN_RECORD_OFFSET;
+      size_t bytes = cut == ROOT_ONLY ? PS_ROOT_BYTES : PS_TOKEN_RECORD_BYTES;
+      int fd = open(path, O_RDONLY);
+      CHECK(fd >= 0);
+      CHECK(pread(fd, m.stable + offset, bytes, offset) == (ssize_t)bytes);
+      CHECK(fixture_get64(m.stable + offset) != 0);
+      CHECK(close(fd) == 0);
+    }
+    m.fail_sync_at = 0;
+    crash(&m);
+    if (cut == COMPLETE) {
+      ps_stats stats;
+      OK(ps_open(path, 0, &options, &space, &error));
+      OK(ps_status(space, &stats, &error));
+      CHECK(stats.capacity == PS_MIB && !stats.entries && !stats.journal_bytes);
+      put(space, state(1), "first", 5, 1);
+      OK(ps_flush(space, &error));
+      OK(ps_close(space, &error));
+      space = NULL;
+      crash(&m);
+      OK(ps_open(path, 0, &options, &space, &error));
+      expect(space, state(1), NULL, "first", 5);
+      OK(ps_close(space, &error));
+    } else {
+      m.syncs = m.writes = 0;
+      CHECK(ps_open(path, 0, &options, &space, &error) == LC_ERR_PROTOCOL &&
+            !space && !m.syncs && !m.writes);
+      lc_error_cleanup(&error);
+    }
+    free(m.stable);
+  }
+  clean();
+}
 static void checkpoint_retire_select(int durable, int shared) {
   enum { COMPLETE, SELECTOR_ONLY, KEEP_PRIOR, TORN_PRIOR, LOST_SELECTED };
   for (int cut = COMPLETE; cut <= LOST_SELECTED; ++cut) {

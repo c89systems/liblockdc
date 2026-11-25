@@ -146,7 +146,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     endforeach()
     foreach(mode
         commit crash-boundaries reopen reopen-ordering reopen-sanitize reopen-portable
-        checkpoint-idempotence checkpoint-retire-select
+        checkpoint-idempotence checkpoint-initialization checkpoint-retire-select
         root-covered-admission root-obligations
         standing-capacity standing-deletion native-metadata-shared-reserve
         budget-capacity value-budget-capacity value-budget-concurrency value-budget-process
@@ -1093,7 +1093,7 @@ if(LOCKDC_BUILD_TESTS)
     LABELS "unit;local;pouch-space")
   add_test(NAME pouch_space_foundation COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR})
   add_test(NAME pouch_space_commit COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} commit)
-  foreach(mode checkpoint-idempotence checkpoint-retire-select)
+  foreach(mode checkpoint-idempotence checkpoint-initialization checkpoint-retire-select)
     add_test(NAME pouch_space_${mode}
       COMMAND pouch_space_test ${CMAKE_CURRENT_BINARY_DIR} ${mode})
     set_tests_properties(pouch_space_${mode} PROPERTIES TIMEOUT 60

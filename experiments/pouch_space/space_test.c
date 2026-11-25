@@ -8014,6 +8014,11 @@ static int run_portable_case(const char *mode) {
       checkpoint_idempotence(durable);
     return 1;
   }
+  if (!strcmp(mode, "checkpoint-initialization")) {
+    checkpoint_initialization(0);
+    checkpoint_initialization(1);
+    return 1;
+  }
   if (!strcmp(mode, "checkpoint-retire-select")) {
     for (int durable = 0; durable < 2; ++durable)
       for (int shared = 0; shared < 2; ++shared)

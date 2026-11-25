@@ -3817,9 +3817,47 @@ static size_t checkpoint_prepare_free(ps_space *s,
   }
   return count;
 }
+static int write_checkpoint_root(ps_space *s,
+                                 const ps_directory_root *directory,
+                                 uint64_t journal_start, size_t covered,
+                                 int select_on_retire, lc_error *error) {
+  unsigned char root[PS_ROOT_BYTES] = {0};
+  ps_wire_put64(root, ROOT_MAGIC);
+  ps_wire_put64(root + 8, s->generation + 1);
+  ps_wire_put64(root + 16, s->capacity);
+  ps_wire_put64(root + 24, s->sequence);
+  ps_wire_put64(root + 32, directory->offset);
+  ps_wire_put64(root + 40, directory->generation);
+  ps_wire_put64(root + 48, s->token_limit);
+  memcpy(root + 56, s->identity, 16);
+  ps_wire_put32(root + ROOT_LAYOUT_OFFSET,
+                PS_ROOT_LAYOUT |
+                    (select_on_retire ? ROOT_LAYOUT_RETIRE_SELECT : 0));
+  ps_wire_put32(root + ROOT_JOURNAL_COVERED, (uint32_t)covered);
+  ps_wire_put64(root + ROOT_JOURNAL_START, journal_start);
+  ps_wire_put32(root + ROOT_CHECKSUM, checksum(root, ROOT_CHECKSUM));
+  ps_readiness_begin(s, PS_READINESS_ROOT);
+  return transfer(s, root, sizeof(root), (uint64_t)(1 - s->root) * PS_PAGE, 1,
+                  error);
+}
+
+static int initialize_checkpoint(ps_space *s, lc_error *error) {
+  /* Creation owns a new file with an empty directory and journal. The root
+   * and initial incarnation grant travel through one barrier. Cold open
+   * requires both records, and initialization authority excludes live opens. */
+  int rc = write_checkpoint_root(s, &s->directory, 0, 0, 0, error);
+  if (rc == LC_OK)
+    rc = sync_file(s, error);
+  if (rc == LC_OK) {
+    s->root = 1;
+    s->generation = s->checkpoints = 1;
+  }
+  return rc;
+}
+
 static int checkpoint_body(ps_space *s, metadata_builder *builder,
                            int force_dense, int cleanup, lc_error *error) {
-  unsigned char root[PS_ROOT_BYTES], zero[PS_ROOT_BYTES] = {0};
+  unsigned char zero[PS_ROOT_BYTES] = {0};
   ps_entry *p;
   ps_meta_page *page, *next_page;
   ps_run *trim = NULL;
@@ -3904,25 +3942,9 @@ static int checkpoint_body(ps_space *s, metadata_builder *builder,
     zero_count = checkpoint_prepare_free(s, zero_ranges);
   if (rc == LC_OK && !select_on_retire)
     rc = sync_file(s, error); /* payloads, journal and new metadata pages */
-  memset(root, 0, sizeof(root));
-  ps_wire_put64(root, ROOT_MAGIC);
-  ps_wire_put64(root + 8, s->generation + 1);
-  ps_wire_put64(root + 16, s->capacity);
-  ps_wire_put64(root + 24, s->sequence);
-  ps_wire_put64(root + 32, new_root.offset);
-  ps_wire_put64(root + 40, new_root.generation);
-  ps_wire_put64(root + 48, s->token_limit);
-  memcpy(root + 56, s->identity, 16);
-  ps_wire_put32(root + ROOT_LAYOUT_OFFSET,
-                PS_ROOT_LAYOUT |
-                    (select_on_retire ? ROOT_LAYOUT_RETIRE_SELECT : 0));
-  ps_wire_put32(root + ROOT_JOURNAL_COVERED, (uint32_t)covered);
-  ps_wire_put64(root + ROOT_JOURNAL_START, journal_start);
-  ps_wire_put32(root + ROOT_CHECKSUM, checksum(root, ROOT_CHECKSUM));
-  if (rc == LC_OK) {
-    ps_readiness_begin(s, PS_READINESS_ROOT);
-    rc = transfer(s, root, sizeof(root), (uint64_t)next * PS_PAGE, 1, error);
-  }
+  if (rc == LC_OK)
+    rc = write_checkpoint_root(s, &new_root, journal_start, covered,
+                               select_on_retire, error);
   if (rc == LC_OK)
     rc = sync_file(s, error);
   /* With retirement-based selection, the predecessor and its full journal
@@ -7447,7 +7469,7 @@ int ps_internal_open(const char *path, int create, const ps_options *options,
     if (rc == LC_OK)
       rc = initial_free(s, error);
     if (rc == LC_OK)
-      rc = checkpoint_locked(s, error);
+      rc = initialize_checkpoint(s, error);
     if (rc == LC_OK)
       rc = sync_parent(path, error);
 #ifdef __APPLE__

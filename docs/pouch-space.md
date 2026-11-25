@@ -68,6 +68,10 @@ Protected maintenance capacity funds checkpoint and completion work when
 foreground admission exhausts common space. A failed capacity admission
 preserves the previous selection.
 
+Creation persists the empty selector and initial incarnation grant together.
+Recovery requires both before it can open the container. The parent directory
+is synced before initialization releases ownership.
+
 Exclusive cleanup syncs the replacement checkpoint pages and selector
 together. While the preceding selector is valid, recovery uses it and its
 intact journal. A second sync retires that selector before its pages can be
