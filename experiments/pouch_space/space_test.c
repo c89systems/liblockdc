@@ -1279,7 +1279,7 @@ static void reopen_sanitization(void) {
   size_t offset = !memcmp(m.stable, "PSROOT1", 7) ? 0 : PS_PAGE;
   memcpy(root, m.stable + offset, sizeof(root));
   fixture_put(root + ROOT_LAYOUT_OFFSET,
-              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_SHARED_RETIRE, 4);
+              PS_ROOT_LAYOUT & ~PS_ROOT_LAYOUT_INLINE_KEY_RECORD, 4);
   fixture_put(root + ROOT_CHECKSUM, crc32(0, root, ROOT_CHECKSUM), 4);
   fd = open(path, O_RDWR);
   CHECK(fd >= 0 &&
@@ -8168,6 +8168,8 @@ int main(int argc, char **argv) {
           durable, !strcmp(argv[2], "checkpoint-retire-shared"), profile);
     else if (!strcmp(argv[2], "checkpoint-retire-live"))
       checkpoint_retire_live(durable, profile);
+    else if (!strcmp(argv[2], "checkpoint-inline-cleanup"))
+      checkpoint_inline_cleanup(durable, profile);
 #ifdef __linux__
     else if (!strcmp(argv[2], "checkpoint-faults"))
       checkpoint_faults(durable, profile);
@@ -8190,6 +8192,8 @@ int main(int argc, char **argv) {
         native_metadata_stage_peer(durable);
         native_metadata_retirement(durable);
       }
+    } else if (strcmp(argv[2], "native-metadata-wide") == 0) {
+      native_metadata_wide_revision();
     } else if (strcmp(argv[2], "native-metadata-faults") == 0) {
       for (int durable = 0; durable < 2; ++durable)
         for (int kind = 0; kind < 3; ++kind)

@@ -5,7 +5,8 @@
 
 static const char *sweep_keys[] = {"one", "two", "three"};
 static void sweep_put(ps_root *root, ps_namespace *ns, size_t index,
-                      size_t bytes, lc_error *e) {
+                      size_t bytes, size_t metadata_bytes, lc_error *e) {
+  static unsigned char extent_metadata[PS_KEY_RECORD_INLINE_MAX];
   lc_pouch_state_entry request = {0}, result = {0};
   ps_namespace_append *append = NULL;
   recode_generated g = {0};
@@ -22,8 +23,11 @@ static void sweep_put(ps_root *root, ps_namespace *ns, size_t index,
   request.version = 1;
   request.index_seq = request.lifetime = index;
   request.record_type = LC_POUCH_STATE_RECORD_STATE_PUT;
-  request.metadata = (unsigned char *)request.key;
-  request.metadata_length = strlen(request.key);
+  REQUIRE(metadata_bytes <= sizeof(extent_metadata));
+  request.metadata =
+      metadata_bytes ? extent_metadata : (unsigned char *)request.key;
+  request.metadata_length =
+      metadata_bytes ? metadata_bytes : strlen(request.key);
   ok(ps_namespace_append_begin(ns, 0, 0, PS_APPEND_PREFIX, NULL, &append, e),
      e);
   ok(lc_pouch_state_record_append(
@@ -158,7 +162,7 @@ static void sweep_pressure(const char *path, const char *key) {
       ok(ps_root_open(path, 1, &options, &root, &e), &e);
       ps_namespace *ns = acquire(root, "sweep", 1, &e);
       for (size_t index = 1; index <= 3; ++index)
-        sweep_put(root, ns, index, 2 * PS_MIB, &e);
+        sweep_put(root, ns, index, 2 * PS_MIB, 0, &e);
       ok(ps_namespace_checkpoint_flush(ns, &e), &e);
       ok(ps_flush(ps_root_space(root), &e), &e);
       lc_pouch_crypto_open_options target_options = options.crypto;
@@ -243,7 +247,7 @@ static size_t sweep_fault_trial(const char *path, const char *key, int codec,
   ok(ps_root_open(path, 1, &options, &root, &e), &e);
   ps_namespace *ns = acquire(root, "sweep", 1, &e);
   for (size_t index = 1; index <= 2; ++index)
-    sweep_put(root, ns, index, 257, &e);
+    sweep_put(root, ns, index, 257, 0, &e);
   ok(ps_namespace_checkpoint_flush(ns, &e), &e);
   ok(ps_flush(ps_root_space(root), &e), &e);
   lc_pouch_crypto_open_options target_options = options.crypto;
@@ -330,8 +334,9 @@ static void sweep_capture_key(ps_namespace *ns, const char *key,
 }
 typedef struct sweep_cursor_job {
   ps_key_cursor *cursor;
+  gate *pause;
   lc_pouch_state_entry entry;
-  int rc, found;
+  int rc, found, done;
 } sweep_cursor_job;
 static void *sweep_cursor_thread(void *context) {
   sweep_cursor_job *job = context;
@@ -339,6 +344,10 @@ static void *sweep_cursor_thread(void *context) {
   lc_error_init(&e);
   job->rc = ps_key_cursor_next(job->cursor, &job->entry, &job->found, &e);
   lc_error_cleanup(&e);
+  pthread_mutex_lock(&job->pause->mutex);
+  job->done = 1;
+  pthread_cond_broadcast(&job->pause->changed);
+  pthread_mutex_unlock(&job->pause->mutex);
   return NULL;
 }
 static void sweep_guards(const char *path, const char *key) {
@@ -368,8 +377,9 @@ static void sweep_guards(const char *path, const char *key) {
     ok(ps_root_open(path, 1, &options, &root, &e), &e);
     ps_namespace *ns = acquire(root, "sweep", 1, &e);
     ps_namespace *peer = acquire(root, "peer", 1, &e);
-    sweep_put(root, ns, 1, 257, &e);
-    sweep_put(root, ns, 2, 257, &e);
+    sweep_put(root, ns, 1, 257, 0, &e);
+    /* The first cursor entry must still perform a physical payload read. */
+    sweep_put(root, ns, 2, 257, PS_KEY_RECORD_INLINE_MAX, &e);
     ok(ps_namespace_checkpoint_flush(ns, &e), &e);
     lc_pouch_crypto_open_options target_options = options.crypto;
     target_options.compression_enabled = 1;
@@ -445,13 +455,15 @@ static void sweep_guards(const char *path, const char *key) {
     /* Pause an actual metadata read. A same-namespace publication must
      * complete without waiting for that I/O, then invalidate its result. */
     ok(ps_key_cursor_open(data->checkpoint, &cursor, &e), &e);
-    sweep_cursor_job job = {.cursor = cursor, .entry = {.version = 999}};
+    sweep_cursor_job job = {
+        .cursor = cursor, .pause = &pause.gate, .entry = {.version = 999}};
     pause.armed = 1;
     pthread_t thread;
     REQUIRE(!pthread_create(&thread, NULL, sweep_cursor_thread, &job));
     pthread_mutex_lock(&pause.gate.mutex);
-    while (!pause.gate.entered)
+    while (!pause.gate.entered && !job.done)
       pthread_cond_wait(&pause.gate.changed, &pause.gate.mutex);
+    REQUIRE(pause.gate.entered);
     pthread_mutex_unlock(&pause.gate.mutex);
     entry.index_seq = 4;
     select_metadata(ns, &entry, 1, &e);

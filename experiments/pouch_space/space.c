@@ -629,19 +629,30 @@ static void key_index_remove(ps_key_index *index, ps_key key) {
   index->slots[hole].entry = NULL;
   --index->count;
 }
+typedef struct ps_checkpoint_entry {
+  ps_entry entry;
+  unsigned char value[PS_CHECKPOINT_CONTROL_MAX];
+} ps_checkpoint_entry;
+
+static int key_record_kind(unsigned int kind) {
+  return kind == PS_KEY_METADATA || kind == PS_KEY_DECISION;
+}
+static const unsigned char *entry_inline_value(const ps_entry *p) {
+  if (p->key.kind == PS_NAMESPACE_CHECKPOINT)
+    return ((const ps_checkpoint_entry *)p)->value;
+  return key_record_kind(p->key.kind) ? p->stream.key_record : NULL;
+}
 static size_t entry_bytes(const ps_entry *p) {
   size_t header = 64;
   if (p->key.kind == PS_CATALOG)
     return ps_catalog_record_bytes(p);
   if (p->key.kind == PS_STREAM)
     return 80;
-  if (p->key.kind == PS_NAMESPACE_CHECKPOINT)
-    return header + (size_t)p->bytes;
   if (p->key.kind == PS_OWNED_RUN)
     header = 80;
   if (p->key.kind == PS_KEY_METADATA)
     header += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
-  return header + 24 * p->count;
+  return header + (entry_inline_value(p) ? (size_t)p->bytes : 24 * p->count);
 }
 static ps_entry *stream_lookup(ps_space *s, uint64_t token) {
   ps_entry *p;
@@ -831,10 +842,6 @@ typedef struct ps_owned_run_entry {
   ps_entry entry;
   ps_owned_run_state run;
 } ps_owned_run_entry;
-typedef struct ps_checkpoint_entry {
-  ps_entry entry;
-  unsigned char value[PS_CHECKPOINT_CONTROL_MAX];
-} ps_checkpoint_entry;
 typedef struct ps_entry_slab_slot {
   ps_entry entry;
   ps_extent extent;
@@ -1017,6 +1024,8 @@ static void entry_fields_free(ps_entry *p) {
   if (p->catalog)
     ps_catalog_free_record(p);
   lc_free_with_allocator(NULL, p->deletion_reserve);
+  if (key_record_kind(p->key.kind))
+    lc_free_with_allocator(NULL, p->stream.key_record);
   if (p->allocation->layout == PS_ENTRY_RUN && p->stream.run->mapped) {
     lc_free_with_allocator(NULL, p->stream.run->ranges);
     lc_free_with_allocator(NULL, p->stream.run->range_bitmap);
@@ -1024,6 +1033,16 @@ static void entry_fields_free(ps_entry *p) {
   }
   if (!p->embedded_extents)
     lc_free_with_allocator(NULL, p->extents);
+}
+static int set_inline_key_record(ps_entry *p, const void *bytes, size_t length,
+                                 lc_error *error) {
+  p->stream.key_record = lc_alloc_with_allocator(NULL, length);
+  if (!p->stream.key_record)
+    return err(error, LC_ERR_NOMEM, "cannot allocate inline key record");
+  memcpy(p->stream.key_record, bytes, length);
+  ps_internal_entry_auxiliary(p);
+  p->bytes = length;
+  return LC_OK;
 }
 void ps_internal_entry_free(ps_entry *p) {
   ps_entry_allocation *block;
@@ -2481,6 +2500,7 @@ static int live_hint(uint32_t event) {
 static void encode_entry_fields(unsigned char *fields, unsigned char *extra,
                                 const ps_entry *p, int event) {
   size_t i;
+  const unsigned char *inline_value;
   ps_wire_put32(fields, p->key.kind);
   ps_wire_put32(fields + 4, (uint32_t)event);
   ps_wire_put64(fields + 8, p->key.owner);
@@ -2491,10 +2511,6 @@ static void encode_entry_fields(unsigned char *fields, unsigned char *extra,
   if (event == PS_PUT || event == PS_SEAL) {
     ps_wire_put64(fields + 32, p->bytes);
     ps_wire_put32(fields + 40, (uint32_t)p->count);
-    if (p->key.kind == PS_NAMESPACE_CHECKPOINT) {
-      memcpy(extra, ((const ps_checkpoint_entry *)p)->value, (size_t)p->bytes);
-      return;
-    }
     if (p->key.kind == PS_OWNED_RUN) {
       ps_wire_put64(extra, p->stream.run->capacity);
       ps_wire_put32(extra + 8, (uint32_t)p->stream.run->mapped);
@@ -2503,6 +2519,11 @@ static void encode_entry_fields(unsigned char *fields, unsigned char *extra,
     if (p->key.kind == PS_KEY_METADATA) {
       ps_wire_put64(extra, p->deletion_bytes);
       extra += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
+    }
+    inline_value = entry_inline_value(p);
+    if (inline_value) {
+      memcpy(extra, inline_value, (size_t)p->bytes);
+      return;
     }
     for (i = 0; i < p->count; ++i, extra += 24) {
       ps_wire_put64(extra, p->extents[i].offset);
@@ -2558,8 +2579,8 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
                                const unsigned char *extra, size_t bytes,
                                int temporary, ps_entry **out, int *event,
                                lc_error *error) {
-  size_t count, i, first;
-  uint64_t sum = 0, offset, n;
+  size_t count, i, first, inline_bytes = 0;
+  uint64_t sum = 0, offset, n, length;
   ps_entry *p;
   uint32_t type, kind, wire_count;
   *out = NULL;
@@ -2570,11 +2591,17 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
   first = kind == PS_OWNED_RUN && type == PS_PUT ? 16 : 0;
   if (kind == PS_KEY_METADATA && type == PS_PUT)
     first += PS_KEY_SLOT_DESCRIPTOR_EXTRA;
+  length = ps_wire_get64(fields + 32);
+  if (key_record_kind(kind) && type == PS_PUT && !count && length) {
+    if (length > PS_KEY_RECORD_INLINE_MAX)
+      return err(error, LC_ERR_PROTOCOL, "invalid inline key record length");
+    inline_bytes = (size_t)length;
+  }
   if (count > (PS_JOURNAL - 64) / 24 ||
       (kind != PS_CATALOG && kind != PS_NAMESPACE_CHECKPOINT &&
        bytes != (kind == PS_STREAM && (type == PS_PUT || type == PS_SEAL)
                      ? 16
-                     : first + count * 24)) ||
+                     : first + count * 24 + inline_bytes)) ||
       (type != PS_PUT && type != PS_REMOVE && type != PS_SEAL))
     return err(error, LC_ERR_PROTOCOL, "invalid container extent count");
   p = space_entry_new(s, kind, count, temporary);
@@ -2583,7 +2610,7 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
   p->key.owner = ps_wire_get64(fields + 8);
   p->key.key = ps_wire_get64(fields + 16);
   p->token = ps_wire_get64(fields + 24);
-  p->bytes = ps_wire_get64(fields + 32);
+  p->bytes = length;
   *event = (int)type;
   if (!valid_key(p->key) || !p->token || p->token > s->token_limit ||
       (*event == PS_REMOVE &&
@@ -2664,7 +2691,7 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
     p->extents[i].crc = ps_wire_get32(extra + first + 16 + 24 * i);
     sum += n;
   }
-  if (sum != p->bytes)
+  if (sum + inline_bytes != p->bytes)
     goto invalid;
   if (p->key.kind == PS_KEY_METADATA && type == PS_PUT) {
     uint64_t deletion = ps_wire_get64(extra);
@@ -2672,6 +2699,13 @@ static int decode_entry_fields(ps_space *s, const unsigned char *fields,
     if (deletion > p->bytes && deletion - p->bytes > 512)
       goto invalid;
     rc = ps_internal_reserve_entry(p, deletion, error);
+    if (rc != LC_OK) {
+      ps_internal_entry_free(p);
+      return rc;
+    }
+  }
+  if (inline_bytes) {
+    int rc = set_inline_key_record(p, extra + first, inline_bytes, error);
     if (rc != LC_OK) {
       ps_internal_entry_free(p);
       return rc;
@@ -5061,6 +5095,14 @@ static int reuse_directory_entry(metadata_recovery *r,
   if (p->key.kind == PS_NAMESPACE_CHECKPOINT)
     memcpy(((ps_checkpoint_entry *)p)->value,
            ((const ps_checkpoint_entry *)old)->value, (size_t)p->bytes);
+  if (key_record_kind(p->key.kind) && old->stream.key_record) {
+    rc = set_inline_key_record(p, old->stream.key_record, (size_t)p->bytes,
+                               error);
+    if (rc != LC_OK) {
+      ps_internal_entry_free(p);
+      return rc;
+    }
+  }
   p->checkpoint_ref = ref;
   p->projection = item->resident;
   item->decoded = p;
@@ -7667,7 +7709,7 @@ int ps_space_private_active(ps_space *s, size_t cached_budgets) {
   return active;
 }
 static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
-                       ps_writer **out, lc_error *error) {
+                       size_t buffer_bytes, ps_writer **out, lc_error *error) {
   ps_writer *w;
   ps_entry *p = NULL;
   int rc;
@@ -7677,13 +7719,11 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
       (!ps_internal_immutable_key(key) && !(owned && key.kind == PS_OWNED_RUN)))
     return err(error, LC_ERR_INVALID,
                "container writer requires typed key and output");
-  w = lc_calloc_with_allocator(NULL, 1,
-                               sizeof(*w) + (key.kind == PS_NAMESPACE_CHECKPOINT
-                                                 ? PS_CHECKPOINT_CONTROL_MAX
-                                                 : PS_CHUNK));
+  w = lc_calloc_with_allocator(NULL, 1, sizeof(*w) + buffer_bytes);
   if (!w)
     return err(error, LC_ERR_NOMEM, "cannot allocate container writer");
-  w->buffer = (unsigned char *)(w + 1);
+  if (buffer_bytes)
+    w->buffer = (unsigned char *)(w + 1);
   pthread_mutex_lock(&s->mutex);
   rc = healthy(s, error);
   if (rc == LC_OK)
@@ -7716,7 +7756,28 @@ static int begin_value(ps_space *s, ps_budget *budget, ps_key key, int owned,
 }
 int ps_begin(ps_space *s, ps_budget *budget, ps_key key, ps_writer **out,
              lc_error *error) {
-  return begin_value(s, budget, key, 0, out, error);
+  return begin_value(s, budget, key, 0,
+                     key.kind == PS_NAMESPACE_CHECKPOINT
+                         ? PS_CHECKPOINT_CONTROL_MAX
+                         : PS_CHUNK,
+                     out, error);
+}
+int ps_internal_stage_key_record(ps_space *s, ps_budget *budget, ps_key key,
+                                 const void *value, size_t length,
+                                 ps_writer **out, lc_error *error) {
+  int rc;
+  if (!key_record_kind(key.kind) || !value || !length ||
+      length > PS_KEY_RECORD_INLINE_MAX || !out)
+    return err(error, LC_ERR_INVALID,
+               "key record requires typed slot and bytes");
+  rc = begin_value(s, budget, key, 0, 0, out, error);
+  if (rc == LC_OK)
+    rc = set_inline_key_record((*out)->entry, value, length, error);
+  if (rc != LC_OK) {
+    ps_writer_close(*out);
+    *out = NULL;
+  }
+  return rc;
 }
 /* Admit the buffered tail while the caller holds allocator authority.
  * Every admitted extent belongs to the unpublished writer, including on
@@ -7829,7 +7890,7 @@ int ps_write(ps_writer *w, const void *bytes, size_t count, lc_error *error) {
   const unsigned char *p = bytes;
   size_t n;
   int rc = LC_OK;
-  if (!w || (!bytes && count) || w->failed || w->published)
+  if (!w || !w->buffer || (!bytes && count) || w->failed || w->published)
     return err(error, LC_ERR_INVALID,
                "container writer is invalid, failed or published");
   if (w->entry->key.kind == PS_NAMESPACE_CHECKPOINT &&
@@ -8357,7 +8418,9 @@ int ps_internal_checkpoint_span(ps_reader *r, const unsigned char **out,
   const ps_extent *extent = p->extents;
   const unsigned char *bytes;
   int rc;
-  *out = NULL;
+  *out = entry_inline_value(p);
+  if (*out)
+    return LC_OK;
   if (!r->private_failure || p->count != 1 ||
       !(extent->flags & EXTENT_PACKED) || extent->bytes != p->bytes ||
       (p->key.kind != PS_KEY_METADATA && p->key.kind != PS_KEY_DECISION))
@@ -8378,18 +8441,19 @@ int ps_read(ps_reader *r, void *buffer, size_t count, size_t *out,
   const ps_extent *extent;
   size_t n;
   int rc;
+  const unsigned char *inline_value;
   if (out)
     *out = 0;
   if (!r || (!buffer && count) || !out)
     return err(error, LC_ERR_INVALID,
                "container read requires reader, buffer and byte count");
-  if (r->entry->key.kind == PS_NAMESPACE_CHECKPOINT) {
+  inline_value = entry_inline_value(r->entry);
+  if (inline_value) {
     n = (size_t)r->entry->bytes - r->offset;
     if (n > count)
       n = count;
     if (n)
-      memcpy(buffer, ((const ps_checkpoint_entry *)r->entry)->value + r->offset,
-             n);
+      memcpy(buffer, inline_value + r->offset, n);
     r->offset += n;
     *out = n;
     return LC_OK;
@@ -8428,13 +8492,14 @@ int ps_read_at(ps_reader *r, uint64_t offset, void *buffer, size_t count,
   const ps_extent *extent;
   size_t within, take;
   int rc;
+  const unsigned char *inline_value;
   if (!r || (!buffer && count) || offset > r->entry->bytes ||
       count > r->entry->bytes - offset)
     return err(error, LC_ERR_INVALID, "captured value read exceeds its range");
-  if (r->entry->key.kind == PS_NAMESPACE_CHECKPOINT) {
+  inline_value = entry_inline_value(r->entry);
+  if (inline_value) {
     if (count)
-      memcpy(buffer, ((const ps_checkpoint_entry *)r->entry)->value + offset,
-             count);
+      memcpy(buffer, inline_value + offset, count);
     return LC_OK;
   }
   if (offset < r->random_base) {
@@ -9218,7 +9283,7 @@ void ps_reader_close(ps_reader *r) {
   lc_free_with_allocator(NULL, r);
 }
 size_t ps_reader_ticket_bytes(const ps_reader *r) {
-  if (!r || r->entry->key.kind == PS_NAMESPACE_CHECKPOINT ||
+  if (!r || entry_inline_value(r->entry) ||
       r->entry->count > (PS_JOURNAL - 64U) / 24U)
     return 0;
   return TICKET_HEADER + r->entry->count * 24U;
@@ -9462,8 +9527,11 @@ int ps_flush(ps_space *s, lc_error *error) {
   return sequence ? wait_durable(s, sequence, error)
                   : settle_recovery(s, error);
 }
-/* An exclusive root can keep append-only work in its replayable prefix.
- * Whole stream removal marks owned entries deleted in place, so the retired
+static int journal_only_entry(const ps_entry *p) {
+  return !p->count && (entry_inline_value(p) || key_record_kind(p->key.kind) ||
+                       p->key.kind == PS_CATALOG);
+}
+/* Whole stream removal marks owned entries deleted in place, so the retired
  * list alone is insufficient to prove that no ownership needs retirement. */
 static int checkpoint_needs_retirement(ps_space *s,
                                        enum ps_cleanup_policy policy) {
@@ -9471,13 +9539,42 @@ static int checkpoint_needs_retirement(ps_space *s,
   if (ps_readiness_pressure(s))
     return 1;
   for (p = s->retired; p; p = p->retired_next)
-    if (policy != PS_CLEANUP_DEFER_QUERY_RECLAIM || s->durable ||
-        p->key.kind != PS_COLLECTION_QUERY)
+    if (!journal_only_entry(p) &&
+        (policy != PS_CLEANUP_DEFER_QUERY_RECLAIM || s->durable ||
+         p->key.kind != PS_COLLECTION_QUERY))
       return 1;
   for (p = s->dirty; p; p = p->dirty_next)
-    if (p->deleted)
+    if (p->deleted && !journal_only_entry(p))
       return 1;
   return 0;
+}
+/* Cohort-only stamps follow ordinary publication in the ring. They do not
+ * require a durability wait when the checkpoint and its pages stay put. */
+static uint64_t cleanup_wire(ps_space *s) {
+  uint64_t required = s->peer_durable;
+  size_t cursor = 0;
+  while (s->journal - cursor >= 64) {
+    const unsigned char *frame = s->journal_image + cursor;
+    uint32_t bytes = ps_wire_get32(frame + 4);
+    uint32_t magic = ps_wire_get32(frame), event = ps_wire_get32(frame + 20);
+    uint64_t wire = ps_wire_get64(frame + 8);
+    if (bytes < 64 || bytes > s->journal - cursor)
+      return s->sequence;
+    if (magic == REVISION_MAGIC) {
+      uint32_t count = ps_wire_get32(frame + 16);
+      if (!count || wire > s->sequence || count - 1 > s->sequence - wire)
+        return s->sequence;
+      wire += count - 1;
+    } else if (magic != EVENT_MAGIC)
+      return s->sequence;
+    else if (event == PS_STREAM_OWNER || event == PS_NAMESPACE_OWNER ||
+             event == PS_STREAM_ADMITTED)
+      wire = 0;
+    if (wire > required)
+      required = wire;
+    cursor += bytes;
+  }
+  return cursor == s->journal ? required : s->sequence;
 }
 static int checkpoint(ps_space *s, int cleanup, enum ps_cleanup_policy policy,
                       lc_error *error) {
@@ -9510,9 +9607,19 @@ static int checkpoint(ps_space *s, int cleanup, enum ps_cleanup_policy policy,
      * the directory. Each stamp-only checkpoint advances the root generation
      * and invalidates those stamps. Canonical changes mark entries dirty,
      * including stream tails and admission metadata. */
-    if (policy != PS_CLEANUP_CHECKPOINT && !s->readiness && !trim &&
+    if (policy != PS_CLEANUP_CHECKPOINT && !trim &&
+        (!s->readiness || policy == PS_CLEANUP_FLUSH) &&
         !checkpoint_needs_retirement(s, policy)) {
-      rc = ps_flush(s, error);
+      if (!s->readiness)
+        rc = ps_flush(s, error);
+      else if (s->dirty && s->peer_durable < s->sequence) {
+        uint64_t wire = cleanup_wire(s);
+        if (wire > s->peer_durable) {
+          pthread_mutex_unlock(&s->mutex);
+          rc = ps_internal_durable_prefix(s, 0, wire, error);
+          pthread_mutex_lock(&s->mutex);
+        }
+      }
       if (rc == LC_OK)
         rc = pins_reclaim_current(s, error);
     } else if (s->dirty || trim ||
@@ -11445,7 +11552,7 @@ int ps_owned_run_repack(ps_owned_head *head, ps_owned_run *source,
   if (rc == LC_OK)
     rc = ps_owned_piece_verify(source, valid, scratch, error);
   if (rc == LC_OK)
-    rc = begin_value(s, budget, old->key, 1, &writer, error);
+    rc = begin_value(s, budget, old->key, 1, PS_CHUNK, &writer, error);
   if (rc == LC_OK) {
     writer->expected_owned = old;
     writer->entry->stream.run->mapped = 1;

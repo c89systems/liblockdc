@@ -5475,8 +5475,18 @@ static void maintenance_concurrency(const char *path, const char *directory) {
     lc_pouch_state_read_result pinned = {0};
     ok(lc_pouch_state_read(p, "projection", "a-state", &pinned, &e), &e);
     projection_meta(p, "a-state", "tail", 0, 9, &e);
-    /* Leave real stream checkpoint debt after the direct metadata revision. */
-    projection_put(p, "n-state", 0, 5, 0, 10, &e);
+    /* Keep the link record out-of-line so its private write can be paused
+     * before journal publication takes allocator authority. */
+    unsigned char metadata[PS_KEY_RECORD_INLINE_MAX] = {0};
+    lc_pouch_state_write_options large = {.has_metadata = 1,
+                                          .metadata = metadata,
+                                          .metadata_length = sizeof(metadata)};
+    input pending = source(0, 5);
+    lc_pouch_state_write_result pending_result = {0};
+    ok(put(p, "projection", "n-state", &pending, &large, &pending_result, &e),
+       &e);
+    REQUIRE(pending_result.index_seq == 10);
+    lc_pouch_state_write_result_cleanup(&allocator, &pending_result);
     h.pouch = p;
     __atomic_store_n(&h.armed, 1, __ATOMIC_RELEASE);
     pthread_t thread;

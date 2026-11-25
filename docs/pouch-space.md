@@ -45,6 +45,9 @@ created experimental container with this layout. Namespace checkpoint controls
 carry five variable-width integers in the journal or checkpoint metadata.
 Controls that fit in a directory binding stay in the leaf. Larger controls use
 the existing packed descriptor pages.
+Small canonical key records are stored with their revision and checkpoint
+descriptors. Larger records and transactions that need the journal space
+retain separately allocated extents.
 Acknowledged durable operations survive recovery. NoSync work without a
 durability barrier can be lost. Recovery checks framing, ownership, and commit
 boundaries before admitting complete canonical publication groups. Before
@@ -94,8 +97,9 @@ metadata trimming, or allocation pressure. Maintenance still syncs that
 prefix before returning. Ordinary exclusive NoSync maintenance may also
 leave replaced collection index pages owned by the preceding checkpoint.
 Cleanup-only and forced maintenance reclaim them after retiring that
-checkpoint and releasing any readers. Capacity admission and journal
-rollover can checkpoint the prefix earlier.
+checkpoint and releasing any readers. A cleanup with no payload retirement
+can leave durable inline records and tombstones in the journal. Capacity
+admission and journal rollover can checkpoint the prefix earlier.
 
 A selected namespace key checkpoint makes metadata-only work discoverable by
 maintenance. The first namespace index publication can include a maintenance

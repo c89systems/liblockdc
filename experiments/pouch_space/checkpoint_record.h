@@ -18,8 +18,8 @@ void ps_checkpoint_record_close(ps_checkpoint_record *);
 /* Prepared output remains private; its owner selects it with the other slots
  * and checkpoint coverage through one physical publication. */
 int ps_checkpoint_record_write(ps_space *, ps_budget *, ps_key,
-                               const ps_checkpoint_record *, ps_writer **,
-                               lc_error *);
+                               const ps_checkpoint_record *,
+                               size_t inline_limit, ps_writer **, lc_error *);
 int ps_checkpoint_record_read(ps_reader *, const lc_allocator *,
                               const char *leaf, lc_pouch_state_entry *,
                               lc_error *);

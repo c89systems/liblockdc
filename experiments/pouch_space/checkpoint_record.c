@@ -89,7 +89,8 @@ int ps_checkpoint_record_encode(const lc_allocator *allocator,
 }
 int ps_checkpoint_record_write(ps_space *space, ps_budget *budget, ps_key key,
                                const ps_checkpoint_record *record,
-                               ps_writer **out, lc_error *e) {
+                               size_t inline_limit, ps_writer **out,
+                               lc_error *e) {
   ps_writer *writer = NULL;
   int rc;
   if (out)
@@ -98,9 +99,14 @@ int ps_checkpoint_record_write(ps_space *space, ps_budget *budget, ps_key key,
       (key.kind != PS_KEY_METADATA && key.kind != PS_KEY_DECISION))
     return invalid(e, LC_ERR_INVALID,
                    "checkpoint output requires canonical slot and bytes");
-  rc = ps_begin(space, budget, key, &writer, e);
-  if (rc == LC_OK)
-    rc = ps_write(writer, record->bytes, record->length, e);
+  if (record->length <= inline_limit)
+    rc = ps_internal_stage_key_record(space, budget, key, record->bytes,
+                                      record->length, &writer, e);
+  else {
+    rc = ps_begin(space, budget, key, &writer, e);
+    if (rc == LC_OK)
+      rc = ps_write(writer, record->bytes, record->length, e);
+  }
   if (rc == LC_OK && key.kind == PS_KEY_METADATA)
     rc = ps_writer_key_deletion(writer, record->deletion_bytes, e);
   if (rc == LC_OK)

@@ -108,6 +108,7 @@ typedef struct ps_entry {
   union {
     ps_stream_state *head;
     ps_owned_run_state *run;
+    unsigned char *key_record;
   } stream;
   uint64_t deletion_bytes;
   struct ps_reserve *deletion_reserve;
@@ -343,6 +344,8 @@ int ps_internal_namespace_seed_current(ps_space *, uint64_t owner,
  * means the reader needs ordinary I/O. */
 int ps_internal_checkpoint_span(ps_reader *, const unsigned char **,
                                 lc_error *);
+int ps_internal_stage_key_record(ps_space *, ps_budget *, ps_key, const void *,
+                                 size_t, ps_writer **, lc_error *);
 /* Drop an unreturned capture before allowing another local adoption. */
 void ps_internal_values_discard_locked(ps_values *);
 int ps_internal_healthy(ps_space *, lc_error *);

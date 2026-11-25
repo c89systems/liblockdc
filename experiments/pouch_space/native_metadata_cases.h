@@ -136,11 +136,12 @@ static int native_metadata_observe(ps_namespace *ns) {
 static const char native_stage[] = "alpha/.staging/txn";
 static const char native_other_stage[] = "bravo/.staging/txn";
 
-static void native_metadata_stage(native_metadata_batch *b, int complete) {
+static void native_metadata_stage(native_metadata_batch *b, int complete,
+                                  const char *etag) {
   lc_pouch_state_entry entry = {0};
   memset(b, 0, sizeof(*b));
   entry.key = "alpha";
-  entry.etag = "empty";
+  entry.etag = (char *)etag;
   entry.content_type = "application/test";
   entry.seen = entry.has_query_index_seq = 1;
   entry.found = !complete;
@@ -202,6 +203,76 @@ static int native_metadata_write(ps_namespace *ns, native_metadata_batch *b,
   ps_namespace_metadata_close(plan);
   return rc;
 }
+typedef struct native_metadata_wide {
+  ps_checkpoint_record record;
+  lc_pouch_record_header header;
+  char key[16];
+} native_metadata_wide;
+static int native_metadata_wide_prefix(void *context, size_t at,
+                                       lc_pouch_record_header *header,
+                                       const void **key_bytes,
+                                       const void **meta, lc_error *e) {
+  native_metadata_wide *fixture = context;
+  (void)e;
+  CHECK(snprintf(fixture->key, sizeof(fixture->key), "slot-%06zu", at) ==
+        (int)fixture->header.key_len);
+  *header = fixture->header;
+  *key_bytes = fixture->key;
+  *meta =
+      fixture->record.bytes + LC_POUCH_RECORD_HEADER_BYTES + header->key_len;
+  return LC_OK;
+}
+static void native_metadata_wide_revision(void) {
+  ps_root_options options = {0};
+  ps_root *root = NULL;
+  ps_namespace *ns = NULL;
+  ps_namespace_metadata *plan = NULL;
+  ps_namespace_info identity;
+  ps_values *values = NULL;
+  native_metadata_wide fixture = {0};
+  lc_pouch_storage_batch batch = {0};
+  lc_pouch_state_entry entry = {0};
+  char etag[129];
+  clean();
+  memset(etag, 'e', sizeof(etag) - 1);
+  etag[sizeof(etag) - 1] = 0;
+  entry.key = "slot-000000";
+  entry.etag = etag;
+  entry.content_type = "application/test";
+  entry.seen = entry.found = 1;
+  entry.index_seq = entry.version = 1;
+  entry.record_type = LC_POUCH_STATE_RECORD_STATE_META;
+  OK(ps_checkpoint_record_encode(NULL, &entry, &fixture.record, &error));
+  OK(lc_pouch_record_header_decode(fixture.record.bytes, &fixture.header,
+                                   &error));
+  CHECK(fixture.record.length < PS_KEY_RECORD_INLINE_MAX);
+  batch.count = 192;
+  batch.prefix = native_metadata_wide_prefix;
+  batch.context = &fixture;
+  uint64_t bytes = batch.count * fixture.record.length;
+  CHECK(bytes + batch.count * (512 + 64) > PS_JOURNAL);
+  options.storage.initial_capacity = options.storage.maximum_capacity =
+      4 * PS_MIB;
+  options.storage.durable_sync = 1;
+  OK(ps_root_open(path, 1, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "wide", 1, &ns, &error));
+  OK(ps_namespace_metadata_begin(ns, 0, &batch, bytes, &plan, &error));
+  OK(ps_namespace_metadata_commit(plan, &batch, PS_COMMIT_DEFAULT, &error));
+  ps_namespace_metadata_close(plan);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  OK(ps_root_open(path, 0, &options, &root, &error));
+  OK(ps_root_namespace_acquire(root, "wide", 0, &ns, &error));
+  OK(ps_namespace_identity(ns, &identity, &error));
+  OK(ps_values_capture(ps_root_space(root), identity.owner, PS_KEY_METADATA,
+                       PS_KEY_METADATA, &values, &error));
+  CHECK(ps_values_count(values) == batch.count);
+  ps_values_close(values);
+  ps_namespace_release(ns);
+  OK(ps_root_close(root, &error));
+  ps_checkpoint_record_close(&fixture.record);
+  clean();
+}
 static void native_metadata_stage_peer(int durable) {
   ps_root_options options = {0};
   ps_root *root = NULL, *peer = NULL;
@@ -216,8 +287,8 @@ static void native_metadata_stage_peer(int durable) {
   options.storage.shared = 1;
   OK(ps_root_open(path, 1, &options, &root, &error));
   OK(ps_root_namespace_acquire(root, "metadata", 1, &ns, &error));
-  native_metadata_stage(&original, 0);
-  native_metadata_stage(&changed, 1);
+  native_metadata_stage(&original, 0, "empty");
+  native_metadata_stage(&changed, 1, "empty");
   OK(native_metadata_write(ns, &original, PS_COMMIT_DEFAULT, &error));
   OK(ps_flush(ps_root_space(root), &error));
   OK(ps_root_open(path, 0, &options, &peer, &error));
@@ -325,8 +396,11 @@ static void native_metadata_faults(int durable, int kind) {
   options.storage.initial_capacity = options.storage.maximum_capacity = PS_MIB;
   options.storage.durable_sync = durable;
   options.storage.io = &io;
-  native_metadata_stage(&original, 0);
-  native_metadata_stage(&changed, 1);
+  char etag[PS_KEY_RECORD_INLINE_MAX + 1];
+  memset(etag, 'e', sizeof(etag) - 1);
+  etag[sizeof(etag) - 1] = 0;
+  native_metadata_stage(&original, 0, kind == 2 ? etag : "empty");
+  native_metadata_stage(&changed, 1, kind == 2 ? etag : "empty");
   for (size_t cut = 0; cut <= sites; ++cut) {
     int selected = 0;
     clean();

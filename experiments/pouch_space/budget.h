@@ -68,7 +68,7 @@ int ps_budget_plan_value(ps_budget_plan *, uint64_t bytes, lc_error *);
  * extra extent when a shorter value splits an existing packed tail. */
 int ps_budget_plan_value_bound(ps_budget_plan *, uint64_t bytes, lc_error *);
 int ps_budget_plan_key_slot(ps_budget_plan *, unsigned int kind, uint64_t bytes,
-                            int upper_bound, lc_error *);
+                            int upper_bound, size_t inline_limit, lc_error *);
 int ps_budget_plan_piece(ps_budget_plan *, uint64_t logical_bytes,
                          size_t ranges, uint64_t live_bytes, lc_error *);
 /* Compound namespace workspace: one bounded piece, optional successor and

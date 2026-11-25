@@ -100,7 +100,7 @@ struct ps_checkpoint_delta {
   int prepared, accepted, maintenance, planning, planned;
   int metadata_only;
   int body_replacement;
-  size_t metadata_count;
+  size_t metadata_count, inline_limit;
   uint64_t metadata_bytes;
 };
 
@@ -1587,11 +1587,12 @@ static int admit_key(ps_checkpoint_delta *d, const void *key, size_t bytes,
   }
   if (bound > change->bound) {
     if (change->bound) {
-      rc = ps_budget_plan_key_slot(&before, kind, change->bound, 1, e);
+      rc = ps_budget_plan_key_slot(&before, kind, change->bound, 1,
+                                   d->inline_limit, e);
       if (rc != LC_OK)
         return rc;
     }
-    rc = ps_budget_plan_key_slot(&after, kind, bound, 1, e);
+    rc = ps_budget_plan_key_slot(&after, kind, bound, 1, d->inline_limit, e);
     if (rc != LC_OK)
       return rc;
     subtract_plan(&plan, &before);
@@ -1676,6 +1677,7 @@ int ps_checkpoint_delta_open(ps_key_checkpoint *c, int maintenance,
   d = lc_calloc_with_allocator(&c->allocator, 1, sizeof(*d));
   if (!d)
     return failure(e, LC_ERR_NOMEM, "cannot allocate checkpoint append");
+  d->inline_limit = PS_KEY_RECORD_INLINE_MAX;
   pthread_mutex_lock(&c->mutex);
   {
     int rc = settle_retired(c, e);
@@ -1937,7 +1939,8 @@ static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
     }
     if (s->pending.bytes) {
       memset(&cost, 0, sizeof(cost));
-      (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
+      (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1,
+                                    PS_KEY_RECORD_INLINE_MAX, NULL);
       subtract_plan(&c->claim, &cost);
       c->dirty_bytes -= s->pending.length;
     }
@@ -1953,7 +1956,8 @@ static void accept_delta(ps_checkpoint_delta *d, uint64_t bytes) {
     dirty_add(c, s);
     c->dirty_bytes += s->pending.length;
     memset(&cost, 0, sizeof(cost));
-    (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
+    (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1,
+                                  PS_KEY_RECORD_INLINE_MAX, NULL);
     (void)add_plan(&c->claim, &cost, NULL);
   }
   if (d->state_index > c->state_index)
@@ -2187,7 +2191,7 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
                           const lc_pouch_storage_batch *batch, uint64_t bytes,
                           ps_checkpoint_delta **out, lc_error *e) {
   ps_checkpoint_delta *d = NULL;
-  ps_budget_plan cost;
+  ps_budget_plan cost, inline_cost = {0};
   lc_pouch_record_header h;
   const void *key, *meta;
   size_t i;
@@ -2203,6 +2207,8 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
                      "native metadata requires completed stream debt")
            : LC_OK;
   pthread_mutex_unlock(&c->mutex);
+  if (rc == LC_OK)
+    rc = plan_control(&inline_cost, e);
   for (i = 0; rc == LC_OK && i < batch->count; ++i) {
     memset(&h, 0, sizeof(h));
     key = meta = NULL;
@@ -2210,9 +2216,21 @@ int ps_key_metadata_begin(ps_key_checkpoint *c, int maintenance,
     if (rc == LC_OK && (h.payload_len || h.flags || h.payload_crc))
       rc = failure(e, LC_ERR_INVALID,
                    "native metadata cannot contain producer bytes");
+    if (rc == LC_OK && h.key_len &&
+        inline_cost.metadata_bytes <= PS_JOURNAL - 64)
+      rc = ps_budget_plan_key_slot(
+          &inline_cost,
+          h.type == LC_POUCH_STATE_RECORD_DECISION ? PS_KEY_DECISION
+                                                   : PS_KEY_METADATA,
+          LC_POUCH_RECORD_HEADER_BYTES + (uint64_t)h.key_len + h.meta_len + 512,
+          1, PS_KEY_RECORD_INLINE_MAX, e);
   }
   if (rc == LC_OK)
     rc = ps_checkpoint_delta_open(c, maintenance, &d, e);
+  /* Keep large metadata transactions atomic within the same descriptor window
+   * by allowing their records to use separately allocated extents. */
+  if (rc == LC_OK && inline_cost.metadata_bytes > PS_JOURNAL - 64)
+    d->inline_limit = 0;
   if (rc == LC_OK)
     rc = ps_checkpoint_delta_plan(d, batch, bytes, &cost, e);
   if (rc == LC_OK && cost.metadata_bytes > PS_JOURNAL - 64)
@@ -2427,7 +2445,8 @@ int ps_key_metadata_commit(ps_checkpoint_delta *d,
       continue;
     }
     rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, physical,
-                                    &change->record, &writers[count], e);
+                                    &change->record, d->inline_limit,
+                                    &writers[count], e);
     if (rc == LC_OK) {
       rc = ps_revision_writer_info(writers[count], &slot_ref, &bytes, e);
       ++count;
@@ -2869,7 +2888,8 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
     pthread_mutex_lock(&c->mutex);
     for (s = c->dirty; s && count < CHECKPOINT_BATCH; s = s->dirty_next) {
       memset(&cost, 0, sizeof(cost));
-      rc = ps_budget_plan_key_slot(&cost, s->kind, s->pending.length, 0, e);
+      rc = ps_budget_plan_key_slot(&cost, s->kind, s->pending.length, 0,
+                                   PS_KEY_RECORD_INLINE_MAX, e);
       if (rc != LC_OK || cost.metadata_bytes > PS_JOURNAL - 64 - descriptors)
         break;
       rc = assign_slot_id(c, s, e);
@@ -2894,8 +2914,9 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
       key.owner = c->ns->identity.owner;
       key.key = slots[i]->id;
       key.kind = slots[i]->kind;
-      rc = ps_checkpoint_record_write(c->ns->root->space, c->budget, key,
-                                      &slots[i]->pending, &writers[outputs], e);
+      rc = ps_checkpoint_record_write(
+          c->ns->root->space, c->budget, key, &slots[i]->pending,
+          PS_KEY_RECORD_INLINE_MAX, &writers[outputs], e);
       if (rc == LC_OK) {
         rc = ps_revision_writer_info(writers[outputs], &slot_ref,
                                      &control_bytes, e);
@@ -2931,7 +2952,8 @@ static int checkpoint_flush(ps_key_checkpoint *c, int force_durable,
         s = slots[i];
         select_incarnation(c, s, incarnations[i], s->summary.deletion_bytes);
         memset(&cost, 0, sizeof(cost));
-        (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1, NULL);
+        (void)ps_budget_plan_key_slot(&cost, s->kind, s->bound, 1,
+                                      PS_KEY_RECORD_INLINE_MAX, NULL);
         subtract_plan(&c->claim, &cost);
         c->dirty_bytes -= s->pending.length;
         dirty_remove(c, s);

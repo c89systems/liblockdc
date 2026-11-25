@@ -494,6 +494,49 @@ static void checkpoint_terminal_fields(ps_checkpoint_record *record,
   lc_error_cleanup(&error);
   lc_pouch_state_entry_cleanup(&allocator, &decoded);
 }
+static void checkpoint_inline_cleanup(int durable, int shared) {
+  ps_options options = {
+      .initial_capacity = PS_MIB, .durable_sync = durable, .shared = shared};
+  ps_space *s = NULL;
+  ps_writer *writer = NULL;
+  ps_reader *held = NULL;
+  ps_key slot = {9, 1, PS_KEY_METADATA};
+  unsigned char first[PS_KEY_RECORD_INLINE_MAX], second[sizeof(first)];
+  ps_stats before, after;
+  clean();
+  memset(first, 0xa5, sizeof(first));
+  memset(second, 0x5a, sizeof(second));
+  OK(ps_open(path, 1, &options, &s, &error));
+  OK(ps_internal_stage_key_record(s, NULL, slot, first, sizeof(first), &writer,
+                                  &error));
+  OK(ps_revision_publish(&writer, 1, 0, PS_COMMIT_DEFAULT, NULL, NULL, &error));
+  ps_writer_close(writer);
+  OK(ps_checkpoint(s, &error));
+  OK(ps_read_open(s, slot, NULL, &held, &error));
+  OK(ps_internal_stage_key_record(s, NULL, slot, second, sizeof(second),
+                                  &writer, &error));
+  OK(ps_revision_publish(&writer, 1, 0, PS_COMMIT_DEFAULT, NULL, NULL, &error));
+  ps_writer_close(writer);
+  OK(ps_flush(s, &error));
+  OK(ps_status(s, &before, &error));
+  OK(ps_checkpoint_cleanup(s, PS_CLEANUP_FLUSH, &error));
+  OK(ps_status(s, &after, &error));
+  CHECK(before.journal_bytes && after.journal_bytes == before.journal_bytes &&
+        after.checkpoints == before.checkpoints && after.syncs == before.syncs);
+  CHECK(after.allocated_bytes == before.allocated_bytes);
+  expect(s, slot, NULL, second, sizeof(second));
+  read_value(held, first, sizeof(first));
+  ps_reader_close(held);
+  OK(ps_close(s, &error));
+  OK(ps_open(path, 0, &options, &s, &error));
+  expect(s, slot, NULL, second, sizeof(second));
+  OK(ps_checkpoint(s, &error));
+  OK(ps_close(s, &error));
+  OK(ps_open(path, 0, &options, &s, &error));
+  expect(s, slot, NULL, second, sizeof(second));
+  OK(ps_close(s, &error));
+  clean();
+}
 static void checkpoint_records(int durable) {
   lc_allocator allocator = {0};
   ps_options options = {.durable_sync = durable, .shared = 1};
@@ -574,7 +617,10 @@ static void checkpoint_records(int durable) {
   ps_checkpoint_record_close(&high_water);
   lc_pouch_state_entry note = {0};
   note.key = ".staging/transaction/key";
-  note.etag = "decision-etag";
+  char decision_etag[PS_KEY_RECORD_INLINE_MAX + 1];
+  memset(decision_etag, 'e', sizeof(decision_etag) - 1);
+  decision_etag[sizeof(decision_etag) - 1] = 0;
+  note.etag = decision_etag;
   note.decision = "committed";
   note.control = note.seen = 1;
   note.record_type = LC_POUCH_STATE_RECORD_DECISION;
@@ -597,8 +643,10 @@ static void checkpoint_records(int durable) {
   OK(ps_checkpoint_record_encode(&allocator, &removed, &tombstone, &error));
   checkpoint_terminal_fields(&tombstone, leaf);
   ps_checkpoint_record_close(&tombstone);
-  OK(ps_budget_plan_key_slot(&plan, slot.kind, metadata.length, 0, &error));
-  OK(ps_budget_plan_value(&plan, decision.length, &error));
+  OK(ps_budget_plan_key_slot(&plan, slot.kind, metadata.length, 0,
+                             PS_KEY_RECORD_INLINE_MAX, &error));
+  OK(ps_budget_plan_key_slot(&plan, control.kind, decision.length, 0,
+                             PS_KEY_RECORD_INLINE_MAX, &error));
   OK(ps_budget_open(s, &plan, &budget, &error));
   OK(ps_begin(s, budget, slot, &writers[0], &error));
   grown = plan;
@@ -618,10 +666,10 @@ static void checkpoint_records(int durable) {
   CHECK(observed.payload_bytes == plan.payload_bytes &&
         observed.metadata_bytes == plan.metadata_bytes &&
         observed.entries == plan.entries);
-  OK(ps_checkpoint_record_write(s, budget, slot, &metadata, &writers[0],
-                                &error));
-  OK(ps_checkpoint_record_write(s, budget, control, &decision, &writers[1],
-                                &error));
+  OK(ps_checkpoint_record_write(s, budget, slot, &metadata,
+                                PS_KEY_RECORD_INLINE_MAX, &writers[0], &error));
+  OK(ps_checkpoint_record_write(s, budget, control, &decision,
+                                PS_KEY_RECORD_INLINE_MAX, &writers[1], &error));
   OK(ps_revision_publish(writers, 2, 1, PS_COMMIT_DEFAULT, NULL, NULL, &error));
   for (at = 0; at < 2; ++at) {
     ps_writer_close(writers[at]);
@@ -647,8 +695,10 @@ static void checkpoint_records(int durable) {
                                           &error) == LC_ERR_PROTOCOL);
   lc_error_cleanup(&error);
   CHECK(!strcmp(walk.metadata.key, prior.key));
-  const ps_entry *packed = ps_internal_lookup(s, slot);
+  const ps_entry *stored = ps_internal_lookup(s, slot);
+  const ps_entry *packed = ps_internal_lookup(s, control);
   unsigned char first, changed_byte;
+  CHECK(stored && !stored->count && stored->bytes == metadata.length);
   CHECK(packed && packed->count == 1 &&
         packed->extents[0].flags == EXTENT_PACKED);
   off_t offset = (off_t)packed->extents[0].offset;
@@ -1040,14 +1090,14 @@ static void checkpoint_namespace(int durable, int shared) {
   OK(ps_namespace_checkpoint_flush(ns, &error));
   if (shared) {
     const ps_entry *p;
-    int packed = 0, large = 0;
+    int inlined = 0, large = 0;
     for (p = ps_root_space(root)->entries; p; p = p->all_next) {
       if (p->key.kind != PS_KEY_METADATA || p->state != 1 || p->deleted)
         continue;
-      packed |= p->count == 1 && p->extents[0].flags == EXTENT_PACKED;
-      large |= p->bytes > sizeof(metadata) && p->bytes < PS_PAGE;
+      inlined |= !p->count && p->bytes && p->bytes <= PS_KEY_RECORD_INLINE_MAX;
+      large |= p->count && p->bytes > sizeof(metadata) && p->bytes < PS_PAGE;
     }
-    CHECK(packed && large);
+    CHECK(inlined && large);
   }
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 1) == 69);
   CHECK(ps_namespace_source_refs(ns, PS_CATALOG_SEGMENT, 2) == 1);
@@ -1226,6 +1276,7 @@ static void checkpoint_faults(int durable, int heap) {
     OK(ps_root_namespace_acquire(root, "checkpoint", 1, &ns, &error));
     checkpoint_group(ns, CHECKPOINT_FAULT_KEYS);
     OK(ps_flush(ps_root_space(root), &error));
+    size_t writes = m.writes, syncs = m.syncs;
     m.operations = allocation_call = 0;
     m.tear = m.persist_torn = 1;
     if (heap)
@@ -1233,8 +1284,10 @@ static void checkpoint_faults(int durable, int heap) {
     else
       m.fail_at = cut;
     rc = ps_namespace_checkpoint_flush(ns, &error);
-    if (!cut)
+    if (!cut) {
       operations = heap ? allocation_call : m.operations;
+      CHECK(m.writes > writes && m.syncs > syncs);
+    }
     m.fail_at = allocation_fail = 0;
     CHECK(!cut || heap || rc != LC_OK);
     CHECK(cut || rc == LC_OK);
@@ -1267,7 +1320,7 @@ static void checkpoint_faults(int durable, int heap) {
     OK(ps_root_close(root, &error));
     root = NULL;
   }
-  CHECK(operations > 10);
+  CHECK(operations);
   printf("checkpoint atomic-group cuts (durable=%d %s): %lu\n", durable,
          heap ? "allocation" : "write/sync", (unsigned long)operations);
   free(m.stable);

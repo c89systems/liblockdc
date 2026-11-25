@@ -1891,9 +1891,20 @@ typedef struct recovery_actor {
 static void *recover_with_peer(void *context) {
   recovery_actor *actor = context;
   lc_error e = {0};
+  int rc;
   gate_signal(&actor->start, 0);
   gate_wait(&actor->start, 1);
-  ok(lc_pouch_client_recover_transactions(actor->owner->client, &e), &e);
+  double deadline = real_clock(CLOCK_MONOTONIC) + 2;
+  /* Either peer can reach the transaction namespace while the other is
+   * retiring an already recovered decision. Revisit the remaining work. */
+  while ((rc = lc_pouch_client_recover_transactions(actor->owner->client,
+                                                    &e)) == LC_ERR_PENDING &&
+         real_clock(CLOCK_MONOTONIC) < deadline) {
+    const struct timespec pause = {0, 10000000};
+    clear(&e);
+    (void)nanosleep(&pause, NULL);
+  }
+  ok(rc, &e);
   lc_error_cleanup(&e);
   return NULL;
 }

@@ -399,14 +399,27 @@ int ps_budget_plan_value_bound(ps_budget_plan *p, uint64_t bytes, lc_error *e) {
   return rc;
 }
 int ps_budget_plan_key_slot(ps_budget_plan *p, unsigned int kind,
-                            uint64_t bytes, int upper_bound, lc_error *e) {
+                            uint64_t bytes, int upper_bound,
+                            size_t inline_limit, lc_error *e) {
   ps_budget_plan next;
+  uint64_t inline_descriptor;
   int rc;
   if (!p)
     return invalid(e, "capacity key slot requires a plan");
   next = *p;
   rc = upper_bound ? ps_budget_plan_value_bound(&next, bytes, e)
                    : ps_budget_plan_value(&next, bytes, e);
+  if (rc == LC_OK && inline_limit &&
+      (kind == PS_KEY_METADATA || kind == PS_KEY_DECISION) &&
+      (upper_bound || bytes <= inline_limit)) {
+    /* A bound for a larger record can later admit an inline replacement.
+     * Reserve the larger descriptor independently of the extent allowance. */
+    inline_descriptor = 64 + (bytes <= inline_limit ? bytes : inline_limit);
+    if (inline_descriptor > next.metadata_bytes - p->metadata_bytes)
+      rc = plan_add(
+          &next, 0,
+          inline_descriptor - (next.metadata_bytes - p->metadata_bytes), 0, e);
+  }
   if (rc == LC_OK && kind == PS_KEY_METADATA)
     rc = plan_add(&next, 0, PS_KEY_SLOT_DESCRIPTOR_EXTRA, 0, e);
   if (rc == LC_OK)
@@ -478,7 +491,8 @@ int ps_budget_plan_maintenance(ps_budget_plan *p, uint64_t deletion,
   if (rc == LC_OK && deletion)
     rc = ps_budget_plan_span(&next, deletion + PS_FRAME_BYTES, e);
   if (rc == LC_OK && deletion)
-    rc = ps_budget_plan_key_slot(&next, PS_KEY_METADATA, deletion + 512, 1, e);
+    rc = ps_budget_plan_key_slot(&next, PS_KEY_METADATA, deletion + 512, 1,
+                                 PS_KEY_RECORD_INLINE_MAX, e);
   /* Empty selected heads also need coverage before their obsolete catalog
    * bindings can retire. Cover the predecessor, then the empty successor at
    * retirement. Neither publication needs a logical tombstone. */

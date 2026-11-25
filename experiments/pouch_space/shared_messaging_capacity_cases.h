@@ -108,7 +108,7 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
 }
 
 static void churn_queue(fixture *writer, fixture *peer, const char *ns,
-                        uint64_t seed, lc_error *e) {
+                        uint64_t seed, int retry_pending, lc_error *e) {
   lc_enqueue_req request = {0};
   lc_enqueue_res result = {0};
   lc_dequeue_req dequeue = shared_queue_request();
@@ -119,7 +119,20 @@ static void churn_queue(fixture *writer, fixture *peer, const char *ns,
   request.queue = dequeue.queue;
   request.content_type = "application/octet-stream";
   churn_stream_init(&body, seed);
-  ok(lc_enqueue(writer->client, &request, &body.source, &result, e), e);
+  double deadline = retry_pending ? real_clock(CLOCK_MONOTONIC) + 2 : 0;
+  int rc;
+  /* The background owner can win namespace admission before enqueue reads
+   * its source. A pending call after body consumption must still fail. */
+  while (
+      (rc = lc_enqueue(writer->client, &request, &body.source, &result, e)) ==
+          LC_ERR_PENDING &&
+      retry_pending && !body.offset && real_clock(CLOCK_MONOTONIC) < deadline) {
+    const struct timespec pause = {0, 10000000};
+    REQUIRE(!result.message_id);
+    clear(e);
+    (void)nanosleep(&pause, NULL);
+  }
+  ok(rc, e);
   REQUIRE(body.offset == CHURN_BYTES && result.payload_bytes == CHURN_BYTES);
   ok(lc_dequeue(peer->client, &dequeue, &message, e), e);
   REQUIRE(message && !strcmp(message->message_id, result.message_id));
@@ -418,7 +431,7 @@ static void shared_messaging_capacity(const char *directory, int codec,
                  CHURN_EXPIRY_MANUAL, &fence, cycle == 1 ? &held : NULL, NULL,
                  &e);
     strcpy(scenario + phase, " queue");
-    churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
+    churn_queue(&owners[writer], &owners[peer], "queues", cycle, 0, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
     if (cycle == 1) {
@@ -582,7 +595,7 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES,
                  CHURN_EXPIRY_AUTONOMOUS, &fence, NULL, NULL, &e);
     strcpy(scenario + phase, " queue");
-    churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
+    churn_queue(&owners[writer], &owners[peer], "queues", cycle, 1, &e);
     strcpy(scenario + phase, " outbox");
     churn_outbox(outbox[writer], outbox[peer], cycle, &e);
     work_seconds += real_clock(CLOCK_MONOTONIC) - cycle_start;
@@ -684,7 +697,7 @@ static void *churn_lane_run(void *context) {
     if (trace)
       fprintf(stderr, "%s cycle=%llu queue\n", lane->ns,
               (unsigned long long)cycle);
-    churn_queue(writer, peer, lane->ns, seed, &e);
+    churn_queue(writer, peer, lane->ns, seed, 0, &e);
     if (trace)
       fprintf(stderr, "%s cycle=%llu outbox\n", lane->ns,
               (unsigned long long)cycle);

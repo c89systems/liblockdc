@@ -129,9 +129,11 @@ static size_t pull(lc_source *pub, void *p, size_t n, lc_error *e) {
   s->at += n;
   return n;
 }
-static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
-               size_t bytes, gate *g, uint64_t *segment,
-               lc_pouch_state_entry *result, lc_error *e) {
+static int put_with_content_type(ps_root *root, ps_namespace *ns,
+                                 size_t version, uint64_t target, size_t bytes,
+                                 gate *g, uint64_t *segment,
+                                 lc_pouch_state_entry *result,
+                                 const char *content_type, lc_error *e) {
   lc_pouch_state_entry request = {0};
   ps_namespace_append *append = NULL;
   input source = {0};
@@ -140,7 +142,7 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
   source.bytes = bytes;
   source.gate = g;
   request.key = "key";
-  request.content_type = "application/test";
+  request.content_type = (char *)content_type;
   request.payload_context = "namespace-test";
   request.version = version;
   request.index_seq = version;
@@ -159,6 +161,12 @@ static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
     rc = ps_namespace_append_commit(append, PS_COMMIT_DEFAULT, e);
   ps_namespace_append_close(append);
   return rc;
+}
+static int put(ps_root *root, ps_namespace *ns, size_t version, uint64_t target,
+               size_t bytes, gate *g, uint64_t *segment,
+               lc_pouch_state_entry *result, lc_error *e) {
+  return put_with_content_type(root, ns, version, target, bytes, g, segment,
+                               result, "application/test", e);
 }
 static int append(ps_root *root, ps_namespace *ns, size_t version,
                   uint64_t target, size_t bytes, lc_error *e) {
@@ -2582,7 +2590,14 @@ static void shared_startup_checkpoint(const char *path, int durable) {
   options.storage.durable_sync = durable;
   ok(ps_root_open(path, 1, &options, &root, &e), &e);
   ps_namespace *ns = acquire(root, "startup", 1, &e);
-  ok(append(root, ns, 1, 0, 64, &e), &e);
+  lc_pouch_state_entry result = {0};
+  char content_type[PS_KEY_RECORD_INLINE_MAX + 1];
+  memset(content_type, 't', sizeof(content_type) - 1);
+  content_type[sizeof(content_type) - 1] = 0;
+  ok(put_with_content_type(root, ns, 1, 0, 64, NULL, NULL, &result,
+                           content_type, &e),
+     &e);
+  lc_pouch_state_entry_cleanup(&allocator, &result);
   ok(ps_namespace_checkpoint_flush(ns, &e), &e);
   ok(ps_namespace_identity(ns, &identity, &e), &e);
   ps_space *space = ps_root_space(root);
