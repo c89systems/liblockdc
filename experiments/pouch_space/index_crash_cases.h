@@ -49,6 +49,9 @@ static void index_crashes(const char *directory) {
     for (size_t ordinal = 0U; ordinal < sizeof(actions) / sizeof(actions[0]);
          ++ordinal) {
       int action = actions[ordinal];
+      if (!fixture_selected("POUCH_INDEX_CRASH_DURABLE", sync, 1) ||
+          !fixture_selected("POUCH_INDEX_CRASH_OPERATION", action, 3))
+        continue;
       size_t sites = 0U;
       for (size_t stop = 0U; stop <= sites; ++stop)
         for (int after = 0; after < (stop ? 2 : 1); ++after) {
@@ -109,6 +112,7 @@ static void index_crashes(const char *directory) {
   REQUIRE(!unsetenv("POUCH_INDEX_CRASH_STOP"));
   REQUIRE(!unsetenv("POUCH_INDEX_CRASH_AFTER"));
   REQUIRE(!unsetenv("POUCH_INDEX_KEY"));
+  REQUIRE(deaths);
   printf("index process deaths=%zu passed\n", deaths);
   lc_error_cleanup(&e);
 }

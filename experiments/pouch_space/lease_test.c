@@ -404,9 +404,12 @@ static producer source(const char *bytes) {
   return p;
 }
 static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
-                                   long seconds, lc_error *e) {
+                                   long seconds, int retry_pending,
+                                   lc_error *e) {
   lc_acquire_req req;
   lc_lease *lease = NULL;
+  double deadline = retry_pending ? real_clock(CLOCK_MONOTONIC) + seconds : 0;
+  int rc;
   const char *expected =
       report_failed_authority ? pthread_getspecific(next_acquire_xid) : NULL;
   lc_acquire_req_init(&req);
@@ -415,7 +418,15 @@ static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
   req.ttl_seconds = 300;
   req.block_seconds = seconds;
   req.txn_id = xid;
-  ok(f->client->acquire(f->client, &req, &lease, e), e);
+  while ((rc = f->client->acquire(f->client, &req, &lease, e)) ==
+             LC_ERR_PENDING &&
+         retry_pending && real_clock(CLOCK_MONOTONIC) < deadline) {
+    const struct timespec pause = {0, 10000000};
+    REQUIRE(!lease);
+    clear(e);
+    (void)nanosleep(&pause, NULL);
+  }
+  ok(rc, e);
   REQUIRE(lease && lease->fencing_token > 0);
   if (expected)
     REQUIRE(!pthread_getspecific(next_acquire_xid) &&
@@ -424,7 +435,7 @@ static lc_lease *acquire_with_wait(fixture *f, const char *key, const char *xid,
 }
 static lc_lease *acquire(fixture *f, const char *key, const char *xid,
                          lc_error *e) {
-  return acquire_with_wait(f, key, xid, 0, e);
+  return acquire_with_wait(f, key, xid, 0, 0, e);
 }
 static void payload(lc_lease *lease, const lc_update_opts *options,
                     lc_error *e) {

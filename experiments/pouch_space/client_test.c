@@ -1399,6 +1399,8 @@ static void retention_allocation_faults(const char *directory) {
       for (int cold = 0; cold < 2; ++cold)
         for (int action = 0; action < 9; ++action)
           for (int no_error = 0; no_error < 2; ++no_error) {
+            if (!fixture_selected("POUCH_RETENTION_FAULT_COLD", cold, 1))
+              continue;
             if (action == 6)
               continue; /* larger replacement has its separate capacity sweep */
             size_t sites = 0;
@@ -1463,7 +1465,7 @@ static void retention_allocation_faults(const char *directory) {
     }
   fixture_barriers_model(0);
   REQUIRE(total);
-  printf("retention controls: %lu warm/cold allocation cuts, "
+  printf("retention controls: %lu allocation cuts, "
          "same-owner and close/reopen retry\n",
          (unsigned long)total);
   lc_error_cleanup(&e);

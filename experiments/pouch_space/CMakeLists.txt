@@ -899,16 +899,31 @@ if(LOCKDC_BUILD_TESTS)
   endforeach()
   set_tests_properties(pouch_space_client_outbox-marker-crash PROPERTIES TIMEOUT 300)
   foreach(profile RANGE 0 3)
-    set(name pouch_space_client_retention-faults_${profile})
-    add_test(NAME ${name}
-      COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} retention-faults)
-    set_tests_properties(${name} PROPERTIES TIMEOUT 180 COST 60
-      LABELS "unit;local;pouch-space"
-      ENVIRONMENT "POUCH_RETENTION_FAULT_PROFILE=${profile}")
+    foreach(cold RANGE 0 1)
+      set(name pouch_space_client_retention-faults_${profile}_${cold})
+      add_test(NAME ${name}
+        COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} retention-faults)
+      set_tests_properties(${name} PROPERTIES TIMEOUT 180 COST 40
+        LABELS "unit;local;pouch-space"
+        ENVIRONMENT "POUCH_RETENTION_FAULT_PROFILE=${profile};POUCH_RETENTION_FAULT_COLD=${cold}")
+    endforeach()
   endforeach()
   foreach(codec RANGE 0 3)
     foreach(mode index-artifacts index-shared index-open-faults index-durability index-recovery index-io-faults index-allocation-faults index-capacity index-concurrency index-crash)
       if((codec EQUAL 1 OR codec EQUAL 2) AND mode MATCHES "(faults|crash)$")
+        continue()
+      endif()
+      if(mode STREQUAL "index-crash")
+        foreach(sync RANGE 0 1)
+          foreach(action 0 1 3)
+            set(name pouch_space_client_index-crash_${codec}_${sync}_${action})
+            add_test(NAME ${name}
+              COMMAND pouch_space_client_test ${CMAKE_CURRENT_BINARY_DIR} index-crash)
+            set_tests_properties(${name} PROPERTIES TIMEOUT 180 COST 30
+              LABELS "unit;local;pouch-space"
+              ENVIRONMENT "POUCH_INDEX_CODEC=${codec};POUCH_INDEX_CRASH_DURABLE=${sync};POUCH_INDEX_CRASH_OPERATION=${action}")
+          endforeach()
+        endforeach()
         continue()
       endif()
       add_test(NAME pouch_space_client_${mode}_${codec}

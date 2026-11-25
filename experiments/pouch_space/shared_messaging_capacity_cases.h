@@ -68,12 +68,20 @@ static void churn_read_state(fixture *f, const char *key, uint64_t seed,
   lc_get_res_cleanup(&result);
 }
 
+enum churn_expiry_mode {
+  CHURN_EXPIRY_AUTONOMOUS,
+  CHURN_EXPIRY_MANUAL,
+  CHURN_EXPIRY_CONCURRENT
+};
+
 static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
-                         int last, int manual, long *fence,
+                         int last, enum churn_expiry_mode mode, long *fence,
                          lc_pouch_state_read_result *held,
                          rendezvous *first_read, lc_error *e) {
   lc_update_opts options = {0};
-  lc_lease *lease = acquire_with_wait(writer, "churn", NULL, 2, e);
+  /* The autonomous compactor can temporarily own the same namespace. */
+  lc_lease *lease = acquire_with_wait(writer, "churn", NULL, 2,
+                                      mode == CHURN_EXPIRY_AUTONOMOUS, e);
   churn_stream body;
   REQUIRE(*fence < lease->fencing_token);
   *fence = lease->fencing_token;
@@ -92,7 +100,7 @@ static void churn_expiry(fixture *writer, fixture *peer, uint64_t seed,
   }
   if (!last) {
     now(1000U + seed * 10U + 2U);
-    if (manual) {
+    if (mode == CHURN_EXPIRY_MANUAL) {
       REQUIRE(clean(peer, 1, e).retention_deleted_state_count == 1);
       parent(writer, "churn", 0, 0, e);
     }
@@ -407,7 +415,8 @@ static void shared_messaging_capacity(const char *directory, int codec,
     size_t phase = strlen(scenario);
     strcpy(scenario + phase, " lease");
     churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CHURN_CYCLES,
-                 1, &fence, cycle == 1 ? &held : NULL, NULL, &e);
+                 CHURN_EXPIRY_MANUAL, &fence, cycle == 1 ? &held : NULL, NULL,
+                 &e);
     strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
     strcpy(scenario + phase, " outbox");
@@ -570,8 +579,8 @@ static void shared_autonomous_capacity(const char *directory, int codec,
     size_t phase = strlen(scenario);
     now(1000U + cycle * 10U);
     strcpy(scenario + phase, " lease");
-    churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES, 0,
-                 &fence, NULL, NULL, &e);
+    churn_expiry(&owners[writer], &owners[peer], cycle, cycle == CYCLES,
+                 CHURN_EXPIRY_AUTONOMOUS, &fence, NULL, NULL, &e);
     strcpy(scenario + phase, " queue");
     churn_queue(&owners[writer], &owners[peer], "queues", cycle, &e);
     strcpy(scenario + phase, " outbox");
@@ -670,7 +679,7 @@ static void *churn_lane_run(void *context) {
               (unsigned long long)cycle);
     if (cycle == 1)
       REQUIRE(!pthread_setspecific(next_acquire_xid, lane->first_xid));
-    churn_expiry(writer, peer, seed, 1, 0, &fence, NULL,
+    churn_expiry(writer, peer, seed, 1, CHURN_EXPIRY_CONCURRENT, &fence, NULL,
                  cycle == 1 ? &lane->first_read : NULL, &e);
     if (trace)
       fprintf(stderr, "%s cycle=%llu queue\n", lane->ns,
